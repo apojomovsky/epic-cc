@@ -16,6 +16,7 @@
 # Build / test artifacts
 *.hex
 *.lst
+*.cod
 *.map
 *.o
 *.ll

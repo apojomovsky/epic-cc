@@ -288,15 +288,15 @@ impl Pic14 {
         let b = ((word >> 7) & 0x7) as u8;
         let f = (word & 0x7F) as usize;
         match (word >> 10) & 0x3 {
-            0 => self.ram[f] &= !(1 << b), // BCF
-            1 => self.ram[f] |= 1 << b,   // BSF
+            0 => self.write_f(f, self.read_f(f) & !(1 << b)), // BCF
+            1 => self.write_f(f, self.read_f(f) | (1 << b)),  // BSF
             2 => {
-                if self.ram[f] & (1 << b) == 0 {
+                if self.read_f(f) & (1 << b) == 0 {
                     return pc + 2; // BTFSC skip if clear
                 }
             }
             3 => {
-                if self.ram[f] & (1 << b) != 0 {
+                if self.read_f(f) & (1 << b) != 0 {
                     return pc + 2; // BTFSS skip if set
                 }
             }
@@ -306,12 +306,13 @@ impl Pic14 {
     }
     fn exec_call_goto(&mut self, pc: u16, word: u16) -> u16 {
         let k = word & 0x7FF;
-        self.ram[0x0A] = ((k >> 8) & 0x1F) as u8; // PCLATH
+        // PCLATH<4:3> -> PC<12:11>; PCLATH is NOT modified by CALL/GOTO.
+        let target = ((self.ram[0x0A] as u16 & 0x18) << 8) | k;
         if word & 0x0800 != 0 {
-            k // GOTO
+            target // GOTO
         } else {
             self.stack.push(pc + 1); // CALL
-            k
+            target
         }
     }
     fn exec_literal(&mut self, pc: u16, word: u16) -> u16 {
@@ -345,7 +346,6 @@ impl Pic14 {
             0x4..=0x7 => {
                 self.w = k; // RETLW
                 let ret = self.pop_return();
-                self.ram[0x0A] = ((ret >> 8) & 0x1F) as u8;
                 return ret;
             }
             _ => unreachable!(),
