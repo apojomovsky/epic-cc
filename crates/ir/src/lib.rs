@@ -35,7 +35,7 @@ pub struct Block { pub label: String, pub insts: Vec<Inst> }
 pub struct Func { pub name: String, pub ret: Option<Ty>, pub params: Vec<(Ty, String)>, pub blocks: Vec<Block> }
 
 #[derive(Clone, Debug)]
-pub struct Global { pub name: String, pub is_const: bool, pub addr: Option<u8> }
+pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub addr: Option<u8> }
 
 #[derive(Clone, Debug)]
 pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func> }
@@ -48,7 +48,7 @@ pub fn serialize(m: &Module) -> String {
     let mut out = String::new();
     for g in &m.globals {
         let kind = if g.is_const { "const" } else { "global" };
-        match g.addr { Some(a) => out.push_str(&format!("{kind} {} @0x{a:02X}\n", g.name)), None => out.push_str(&format!("{kind} {}\n", g.name)) }
+        match g.addr { Some(a) => out.push_str(&format!("{kind} {} {} @0x{a:02X}\n", g.name, ty_str(g.ty))), None => out.push_str(&format!("{kind} {} {}\n", g.name, ty_str(g.ty))) }
     }
     for f in &m.funcs {
         let params: Vec<String> = f.params.iter().map(|(t, n)| format!("{t:?} %{n}").replace("I8", "i8").replace("I16", "i16").replace("I1", "i1")).collect();
@@ -89,8 +89,11 @@ pub fn parse(text: &str) -> Module {
         if let Some(rest) = line.strip_prefix("global ").or_else(|| line.strip_prefix("const ")) {
             let is_const = line.starts_with("const ");
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            let (name, addr) = if parts.len() >= 2 { (parts[0], parse_addr(parts[1])) } else { (parts[0], None) };
-            globals.push(Global { name: name.to_string(), is_const, addr });
+            // format: <name> <ty> [@addr]
+            let name = parts[0].to_string();
+            let ty = parse_ty(parts[1]);
+            let addr = if parts.len() >= 3 { parse_addr(parts[2]) } else { None };
+            globals.push(Global { name, ty, is_const, addr });
         } else if line.starts_with("fn ") {
             let rest = &line[3..];
             let open = rest.find('(').unwrap();
@@ -125,6 +128,7 @@ pub fn parse(text: &str) -> Module {
 fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, other => panic!("unsupported type {other}") } }
 fn parse_addr(s: &str) -> Option<u8> { s.strip_prefix('@').map(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).unwrap()) }
 fn parse_val(s: &str) -> Val {
+    let s = s.trim_end_matches(',');
     if let Some(r) = s.strip_prefix('%') { Val::Reg(r.to_string()) }
     else if let Some(g) = s.strip_prefix('@') { Val::Global(g.to_string()) }
     else { Val::Const(s.parse().unwrap_or_else(|_| panic!("bad value {s}"))) }
