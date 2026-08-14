@@ -8,8 +8,13 @@ pub fn allocate(mut m: Module) -> Module {
     let mut addr = GLOBAL_START;
     for g in &mut m.globals {
         if !g.is_const {
+            let width = g.ty.bytes();
+            // Align to the type's width so i16 lands on a 2-byte boundary.
+            if addr % width != 0 {
+                addr += width - (addr % width);
+            }
             g.addr = Some(addr);
-            addr += 1; // i8 globals; i16 -> +2 (later milestone)
+            addr += width;
         }
     }
     m
