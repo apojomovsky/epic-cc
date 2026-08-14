@@ -2,6 +2,10 @@ use isel::select;
 use ir::parse;
 use std::collections::HashMap;
 
+fn addrs(pairs: &[(&str, u8)]) -> HashMap<String, u8> {
+    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
+
 #[test]
 fn emits_add_for_in_plus_one() {
     let m = parse("global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
@@ -38,8 +42,98 @@ fn add_const_lhs_uses_addlw() {
 }
 
 #[test]
-#[should_panic(expected = "only i8 loads supported")]
-fn panics_on_non_i8_load() {
-    let m = parse("global in i8\nfn main() -> void\n  block entry:\n    %1 = load i16 @in\n    ret void\n");
+#[should_panic(expected = "only i8/i16 loads supported")]
+fn panics_on_i1_load() {
+    let m = parse("global in i8\nfn main() -> void\n  block entry:\n    %1 = load i1 @in\n    ret void\n");
     select(&m, &HashMap::new());
+}
+
+#[test]
+fn add16_reg_reg_emits_carry_chain() {
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %r = add i16 %a, %b\n    store i16 %r @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x20), ("y", 0x22), ("out", 0x24)]);
+    let asm = select(&m, &addrs);
+    // %a=0x70/%b=0x72/%r=0x74: lo byte add then hi byte add with carry in.
+    assert!(asm.contains("MOVF 0x72, W"), "add b_lo:\n{asm}");
+    assert!(asm.contains("ADDWF 0x70, W"), "add a_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x74"), "store d_lo:\n{asm}");
+    assert!(asm.contains("MOVF 0x73, W"), "add b_hi:\n{asm}");
+    assert!(asm.contains("BTFSC STATUS, 0"), "carry test:\n{asm}");
+    assert!(asm.contains("ADDLW 0x01"), "carry in add:\n{asm}");
+    assert!(asm.contains("ADDWF 0x71, W"), "add a_hi:\n{asm}");
+    assert!(asm.contains("MOVWF 0x75"), "store d_hi:\n{asm}");
+}
+
+#[test]
+fn add16_reg_const_emits_carry_chain() {
+    // 258 = 0x0102 -> lo 0x02, hi 0x01.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @in\n    %r = add i16 %a, 258\n    store i16 %r @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x22)]);
+    let asm = select(&m, &addrs);
+    // %a=0x70/%r=0x72.
+    assert!(asm.contains("MOVF 0x70, W"), "load a_lo:\n{asm}");
+    assert!(asm.contains("ADDLW 0x02"), "add k_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x72"), "store d_lo:\n{asm}");
+    assert!(asm.contains("BTFSC STATUS, 0"), "carry test:\n{asm}");
+    assert!(asm.contains("ADDLW 0x01"), "carry in add:\n{asm}");
+    assert!(asm.contains("MOVWF 0x73"), "store d_hi:\n{asm}");
+}
+
+#[test]
+fn and16_reg_const_uses_andlw() {
+    // 4660 = 0x1234 -> lo 0x34, hi 0x12.
+    let m = parse(
+        "global in i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @in\n    %r = and i16 %a, 4660\n    store i16 %r @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x22)]);
+    let asm = select(&m, &addrs);
+    // %a=0x70/%r=0x72.
+    assert!(asm.contains("MOVF 0x70, W"), "load a_lo:\n{asm}");
+    assert!(asm.contains("ANDLW 0x34"), "and k_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x72"), "store d_lo:\n{asm}");
+    assert!(asm.contains("MOVF 0x71, W"), "load a_hi:\n{asm}");
+    assert!(asm.contains("ANDLW 0x12"), "and k_hi:\n{asm}");
+    assert!(asm.contains("MOVWF 0x73"), "store d_hi:\n{asm}");
+}
+
+#[test]
+fn zext_trunc_pair() {
+    let m = parse(
+        "global in i8\nglobal out16 i16\nglobal out8 i8\nfn main() -> void\n  block entry:\n    %v = load i8 @in\n    %z = zext i8 %v to i16\n    store i16 %z @out16\n    %t = trunc i16 %z to i8\n    store i8 %t @out8\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("out16", 0x21), ("out8", 0x23)]);
+    let asm = select(&m, &addrs);
+    // %v=0x70, %z lo=0x71 hi=0x72, %t=0x73.
+    assert!(asm.contains("MOVF 0x70, W"), "zext copies v:\n{asm}");
+    assert!(asm.contains("MOVWF 0x71"), "zext stores d_lo:\n{asm}");
+    assert!(asm.contains("CLRF 0x72"), "zext zeroes d_hi:\n{asm}");
+    assert!(asm.contains("MOVF 0x71, W"), "trunc reads z_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x73"), "trunc stores d:\n{asm}");
+}
+
+#[test]
+fn phi_copy_lands_before_terminator_of_each_predecessor() {
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    br merge\n  block thenb:\n    %b = load i16 @y\n    br merge\n  block merge:\n    %p = phi i16 %a entry %b thenb\n    store i16 %p @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x20), ("y", 0x22), ("out", 0x24)]);
+    let asm = select(&m, &addrs);
+    // %p reserved 0x70; %a=0x72 (hi 0x73), %b=0x74 (hi 0x75).
+    // In block `entry` the copy of %a (ending MOVWF 0x71) precedes its GOTO.
+    assert!(
+        asm.contains("MOVWF 0x71\n    GOTO main_Lmerge"),
+        "copy must land before the entry terminator:\n{asm}"
+    );
+    // In block `thenb` the copy of %b (ending MOVWF 0x71) precedes its GOTO.
+    assert!(
+        asm.contains("MOVF 0x74, W\n    MOVWF 0x70\n    MOVF 0x75, W\n    MOVWF 0x71\n    GOTO main_Lmerge"),
+        "copy must land before the thenb terminator:\n{asm}"
+    );
+    // The merge block reads the phi destination (0x70 lo / 0x71 hi).
+    assert!(asm.contains("MOVF 0x70, W"), "merge reads %p lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x24"), "merge stores %p lo to @out:\n{asm}");
 }
