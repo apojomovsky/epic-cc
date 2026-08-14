@@ -27,7 +27,7 @@ implement flow. The state of that flow:
 | Reference books obtained | ✅ done — Muchnick + lcc |
 | Documentation phase | ✅ done — this `docs/` tree |
 | Build environment (Nix flake) | ✅ done and verified — [ADR-007](03-decisions.md), [`09`](09-build-environment.md) |
-| Present design in sections, approve each | ⚠️ **Rust approved (ADR-005). The ten-stage pipeline is presented but NOT approved. Sections 2–4 never presented.** |
+| Present design in sections, approve each | ⚠️ **Ten-stage pipeline + repository shape approved; Rust approved (ADR-005). Design sections 2–4 (allocator/banking core, verification harness, phasing) still not presented.** |
 | Write design doc / spec | ⏸ superseded in part by this `docs/` tree |
 | Implementation plan | ❌ not started |
 | **Feasibility spike** | ✅ **done — all four questions answered, success criterion met. See [`10-spike-findings.md`](10-spike-findings.md)** |
@@ -53,10 +53,8 @@ These are settled. Do not re-litigate them without new evidence.
 
 ## What is presented but NOT yet approved
 
-- The **ten-stage pipeline** ([`04-pipeline-design.md`](04-pipeline-design.md)). Presented
-  to the user; they redirected to research, documentation, and build setup before
-  answering. **Ask before building to it.**
-- The **device-description-as-data** approach ([ADR-004](03-decisions.md)).
+- The **device-description-as-data** approach ([ADR-004](03-decisions.md)) — presented,
+  pending final design approval.
 
 ## What was never presented at all
 
@@ -79,8 +77,8 @@ are answered: `.ll` is a good substrate, the IR surface is tractable, common RAM
 **Next up (needs user decision, not yet approved):** the **pointer / `const`-in-flash
 design spike** — GEP lowering, `FSR`/`INDF` addressing, and RETLW-table codegen — since
 those are the two places the spike could not exercise. After that, or alongside it,
-present the ten-stage pipeline and the allocator/banking core (design sections 2–4) for
-approval before writing the implementation plan.
+present the allocator/banking core and the remaining design sections (2–4) for approval
+before writing the implementation plan.
 
 ---
 
