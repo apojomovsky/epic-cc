@@ -66,19 +66,22 @@ Design sections 2–4 were outlined internally but never shown to the user:
 
 ---
 
-## ✅ The feasibility spike is complete
+## ✅ Both de-risking spikes are complete
 
-The backend-spine spike ([`10-spike-findings.md`](10-spike-findings.md)) finished on
-2026-08-14. The probe (loop + `if` + function call + 16-bit arithmetic) compiles and runs
-correctly in a throwaway PIC14 simulator, cross-checked against `gpasm`. All four questions
-are answered: `.ll` is a good substrate, the IR surface is tractable, common RAM is tight
-(colouring + spill are first-version work), and Harvard `const` is the least-derisked part.
+The backend-spine spike ([`10-spike-findings.md`](10-spike-findings.md)) and the
+pointer/`const`-in-flash spike ([`11-pointer-const-findings.md`](11-pointer-const-findings.md))
+both finished on 2026-08-14. Their probes compile and run correctly in the throwaway PIC14
+simulator, cross-checked against `gpasm`. The two hardest unknowns are now answered:
 
-**Next up (needs user decision, not yet approved):** the **pointer / `const`-in-flash
-design spike** — GEP lowering, `FSR`/`INDF` addressing, and RETLW-table codegen — since
-those are the two places the spike could not exercise. After that, or alongside it,
-present the allocator/banking core and the remaining design sections (2–4) for approval
-before writing the implementation plan.
+- `.ll` is a good substrate; the IR surface (scalars, control flow, pointers, structs,
+  `const`) is tractable.
+- The pointer layer lowers cleanly via `FSR`/`INDF`; Harvard `const` lowers via `RETLW`
+  tables (with a known PCLATH/page-crossing caveat to design around).
+- Common RAM is tight: colouring + bank-0 spill are first-version allocator work.
+
+**Next up (needs user decision, not yet approved):** present the allocator/banking core and
+the remaining design sections (2–4) for approval, then write the implementation plan. The
+pointer/`const` risk is now de-risked rather than open.
 
 ---
 
