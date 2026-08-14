@@ -4,7 +4,7 @@
 //! (global and SSA pointer operands), `add`/`sub`/`and`/`or`/`xor`, and `ret`.
 //! Any other opcode panics loudly rather than silently misparsing.
 
-use ir::{Bin, BinOp, Block, Func, Global, Inst, Load, Module, Store, Ty, Val};
+use ir::{Bin, BinOp, Block, Br, BrCond, Call, Func, Global, Icmp, Inst, Load, Module, Phi, Select, Store, Trunc, Ty, Val, Zext};
 
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
@@ -189,6 +189,85 @@ fn parse_inst(line: &str) -> Inst {
                 _ => BinOp::Sub,
             };
             Inst::Bin(Bin { dst: dst.unwrap(), op: o, ty, a, b })
+        }
+        "zext" | "trunc" => {
+            let body = &rest[op.len()..];
+            let to_i = body.rfind(" to ").unwrap();
+            let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
+            let mut it = lhs.split_whitespace();
+            let from = ty_of(it.next().unwrap());
+            let val = parse_val(it.next().unwrap());
+            let to = ty_of(rhs);
+            if op == "zext" {
+                Inst::Zext(Zext { dst: dst.unwrap(), from, val, to })
+            } else {
+                Inst::Trunc(Trunc { dst: dst.unwrap(), from, val, to })
+            }
+        }
+        "icmp" => {
+            let body = rest["icmp".len()..].trim();
+            let mut it = body.split_whitespace();
+            let pred = it.next().unwrap().to_string();
+            let ty = ty_of(it.next().unwrap());
+            let a = parse_val(it.next().unwrap());
+            let b = parse_val(it.next().unwrap());
+            Inst::Icmp(Icmp { dst: dst.unwrap(), pred, ty, a, b })
+        }
+        "select" => {
+            let body = rest["select".len()..].trim();
+            let parts: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
+            let cond = parse_val(parts[0].split_whitespace().nth(1).unwrap());
+            let mut it1 = parts[1].split_whitespace();
+            let ty = ty_of(it1.next().unwrap());
+            let a = parse_val(it1.next().unwrap());
+            let b = parse_val(parts[2].split_whitespace().nth(1).unwrap());
+            Inst::Select(Select { dst: dst.unwrap(), cond, ty, a, b })
+        }
+        "call" => {
+            let body = rest["call".len()..].trim();
+            let paren = body.find('(').unwrap();
+            let head = &body[..paren];
+            let mut it = head.split_whitespace();
+            let ty_tok = it.next().unwrap();
+            let ty = if ty_tok == "void" { None } else { Some(ty_of(ty_tok)) };
+            let func = head[head.find('@').unwrap() + 1..].trim().to_string();
+            let args_str = &body[paren + 1..body.rfind(')').unwrap()];
+            let mut args = Vec::new();
+            for a in args_str.split(',') {
+                let a = a.trim();
+                if a.is_empty() {
+                    continue;
+                }
+                let mut it = a.split_whitespace();
+                let t = ty_of(it.next().unwrap());
+                args.push((t, parse_val(it.next().unwrap())));
+            }
+            Inst::Call(Call { dst, ty, func, args })
+        }
+        "br" => {
+            let body = rest["br".len()..].trim();
+            if body.starts_with("label") {
+                Inst::Br(Br { target: body.split_whitespace().nth(1).unwrap().trim_start_matches('%').to_string() })
+            } else {
+                let parts: Vec<&str> = body.split(',').map(|s| s.trim()).collect();
+                let cond = parse_val(parts[0].split_whitespace().nth(1).unwrap());
+                let t = parts[1].split_whitespace().nth(1).unwrap().trim_start_matches('%').to_string();
+                let f = parts[2].split_whitespace().nth(1).unwrap().trim_start_matches('%').to_string();
+                Inst::BrCond(BrCond { cond, t, f })
+            }
+        }
+        "phi" => {
+            let body = rest["phi".len()..].trim();
+            let ty = ty_of(body.split_whitespace().next().unwrap());
+            let mut incoming = Vec::new();
+            for part in body.split('[').skip(1) {
+                let inner = part.split(']').next().unwrap();
+                let mut it = inner.split(',');
+                let v = parse_val(it.next().unwrap());
+                let lbl = it.next().unwrap().trim().trim_start_matches('%').to_string();
+                incoming.push((v, lbl));
+            }
+            Inst::Phi(Phi { dst: dst.unwrap(), ty, incoming })
         }
         "ret" => {
             let body = rest["ret".len()..].trim();

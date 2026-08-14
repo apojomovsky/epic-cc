@@ -1,4 +1,5 @@
 use irparse::parse_ll;
+use ir::{Inst, Val};
 
 const LL: &str = r#"
 @in = dso_local global i8 0, align 1
@@ -18,4 +19,131 @@ fn parses_straight_line_ll() {
     assert_eq!(m.funcs.len(), 1);
     assert_eq!(m.funcs[0].blocks.len(), 1);
     assert_eq!(m.funcs[0].blocks[0].insts.len(), 4);
+}
+
+// Probe from spike/probe.ll (trimmed): control flow, calls, casts, phi.
+const PROBE: &str = r#"
+@in = dso_local global i8 0, align 1
+@out = dso_local global i8 0, align 1
+
+define dso_local void @main() local_unnamed_addr #0 {
+  %1 = load volatile i8, ptr @in, align 1, !tbaa !2
+  %2 = zext i8 %1 to i16
+  %3 = icmp eq i8 %1, 0
+  br i1 %3, label %6, label %8
+
+4:                                                ; preds = %8
+  %5 = trunc i16 %14 to i8
+  br label %6
+
+6:                                                ; preds = %4, %0
+  %7 = phi i8 [ 0, %0 ], [ %5, %4 ]
+  store volatile i8 %7, ptr @out, align 1, !tbaa !2
+  ret void
+
+8:                                                ; preds = %0, %8
+  %9 = phi i16 [ %15, %8 ], [ 0, %0 ]
+  %10 = phi i16 [ %14, %8 ], [ 0, %0 ]
+  %11 = and i16 %9, 1
+  %12 = icmp eq i16 %11, 0
+  %13 = select i1 %12, i16 100, i16 %9
+  %14 = tail call fastcc i16 @add(i16 noundef %10, i16 noundef %13) #2
+  %15 = add nuw nsw i16 %9, 1
+  %16 = icmp eq i16 %15, %2
+  br i1 %16, label %4, label %8, !llvm.loop !5
+}
+
+define internal fastcc i16 @add(i16 noundef %0, i16 noundef range(i16 -32768, 255) %1) unnamed_addr #1 {
+  %3 = add nsw i16 %1, %0
+  ret i16 %3
+}
+"#;
+
+#[test]
+fn parses_probe_control_flow_calls_and_casts() {
+    let m = parse_ll(PROBE);
+    assert_eq!(m.funcs.len(), 2);
+
+    let main = &m.funcs[0];
+    assert_eq!(main.name, "main");
+    let labels: Vec<&str> = main.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["0", "4", "6", "8"]);
+
+    // phi i8 in block 6: incoming (Const 0, "0"), (Reg 5, "4")
+    let phi = &main.blocks[2].insts[0];
+    match phi {
+        Inst::Phi(p) => {
+            assert_eq!(p.dst, "7");
+            assert_eq!(p.ty, ir::Ty::I8);
+            assert_eq!(p.incoming.len(), 2);
+            assert_eq!(p.incoming[0], (Val::Const(0), "0".to_string()));
+            assert_eq!(p.incoming[1], (Val::Reg("5".to_string()), "4".to_string()));
+        }
+        other => panic!("expected Phi, got {other:?}"),
+    }
+
+    // call i16 @add(i16 %10, i16 %13) in block 8: 2 args in order
+    let call = &main.blocks[3].insts[5];
+    match call {
+        Inst::Call(c) => {
+            assert_eq!(c.func, "add");
+            assert_eq!(c.ty, Some(ir::Ty::I16));
+            assert_eq!(c.args.len(), 2);
+            assert_eq!(c.args[0], (ir::Ty::I16, Val::Reg("10".to_string())));
+            assert_eq!(c.args[1], (ir::Ty::I16, Val::Reg("13".to_string())));
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+
+    // br i1 %16, label %4, label %8 in block 8
+    let br = &main.blocks[3].insts.last().unwrap();
+    match br {
+        Inst::BrCond(b) => {
+            assert_eq!(b.cond, Val::Reg("16".to_string()));
+            assert_eq!(b.t, "4");
+            assert_eq!(b.f, "8");
+        }
+        other => panic!("expected BrCond, got {other:?}"),
+    }
+
+    // zext in block 0 and trunc in block 4
+    match &main.blocks[0].insts[1] {
+        Inst::Zext(z) => {
+            assert_eq!(z.dst, "2");
+            assert_eq!(z.from, ir::Ty::I8);
+            assert_eq!(z.val, Val::Reg("1".to_string()));
+            assert_eq!(z.to, ir::Ty::I16);
+        }
+        other => panic!("expected Zext, got {other:?}"),
+    }
+    match &main.blocks[1].insts[0] {
+        Inst::Trunc(t) => {
+            assert_eq!(t.dst, "5");
+            assert_eq!(t.from, ir::Ty::I16);
+            assert_eq!(t.to, ir::Ty::I8);
+        }
+        other => panic!("expected Trunc, got {other:?}"),
+    }
+
+    // select i1 %12, i16 100, i16 %9
+    match &main.blocks[3].insts[4] {
+        Inst::Select(s) => {
+            assert_eq!(s.cond, Val::Reg("12".to_string()));
+            assert_eq!(s.ty, ir::Ty::I16);
+            assert_eq!(s.a, Val::Const(100));
+            assert_eq!(s.b, Val::Reg("9".to_string()));
+        }
+        other => panic!("expected Select, got {other:?}"),
+    }
+
+    // icmp eq i16 %11, 0
+    match &main.blocks[3].insts[3] {
+        Inst::Icmp(i) => {
+            assert_eq!(i.pred, "eq");
+            assert_eq!(i.ty, ir::Ty::I16);
+            assert_eq!(i.a, Val::Reg("11".to_string()));
+            assert_eq!(i.b, Val::Const(0));
+        }
+        other => panic!("expected Icmp, got {other:?}"),
+    }
 }
