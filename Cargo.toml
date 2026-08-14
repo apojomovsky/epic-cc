@@ -1,3 +1,3 @@
 [workspace]
 resolver = "2"
-members = ["crates/sim", "crates/ir", "crates/irparse", "crates/wholeprog", "crates/legalize", "crates/callgraph", "crates/alloc", "crates/isel", "crates/banking"]
+members = ["crates/sim", "crates/ir", "crates/irparse", "crates/wholeprog", "crates/legalize", "crates/callgraph", "crates/alloc", "crates/isel", "crates/banking", "crates/peephole"]
