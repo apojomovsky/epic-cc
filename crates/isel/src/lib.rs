@@ -45,28 +45,54 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
                     }
                     Inst::Store(s) => {
                         assert_eq!(s.ty, ir::Ty::I8, "isel: only i8 stores supported");
-                        let (dst, src) = (
-                            ptr_addr(&s.ptr, addrs, &slots),
-                            val_addr(&s.val, addrs, &slots),
-                        );
-                        out.push(format!("    MOVF 0x{src:02X}, W"));
-                        out.push(format!("    MOVWF 0x{dst:02X}"));
+                        let dst = ptr_addr(&s.ptr, addrs, &slots);
+                        match &s.val {
+                            Val::Const(k) => {
+                                assert!(
+                                    *k >= 0 && *k <= 255,
+                                    "isel: const {k} out of byte range"
+                                );
+                                out.push(format!("    MOVLW 0x{:02X}", *k as u8));
+                                out.push(format!("    MOVWF 0x{dst:02X}"));
+                            }
+                            _ => {
+                                let src = val_addr(&s.val, addrs, &slots);
+                                out.push(format!("    MOVF 0x{src:02X}, W"));
+                                out.push(format!("    MOVWF 0x{dst:02X}"));
+                            }
+                        }
                     }
                     Inst::Bin(b) => {
                         assert_eq!(b.ty, ir::Ty::I8, "isel: only i8 binops supported");
-                        let (da, aa, ba) = (
-                            slot(&mut slots, &mut next, &b.dst),
-                            val_addr(&b.a, addrs, &slots),
-                            val_addr(&b.b, addrs, &slots),
-                        );
-                        match (b.op, &b.b) {
+                        let da = slot(&mut slots, &mut next, &b.dst);
+                        // Normalize commutative add: a const LHS is swapped to the
+                        // RHS so the const-adder arm below is used, never reading a
+                        // const as a file-register address. Both-const add folds at
+                        // compile time; we don't fold yet.
+                        let (a, b_op) = match (b.op, &b.a, &b.b) {
+                            (BinOp::Add, Val::Const(_), Val::Const(_)) => {
+                                panic!("isel: constant folding not implemented")
+                            }
+                            (BinOp::Add, Val::Const(_), _) => (&b.b, &b.a),
+                            _ => (&b.a, &b.b),
+                        };
+                        match (b.op, b_op) {
                             (BinOp::Add, Val::Const(k)) => {
+                                assert!(
+                                    *k >= 0 && *k <= 255,
+                                    "isel: const {k} out of byte range"
+                                );
+                                let aa = val_addr(a, addrs, &slots);
                                 out.push(format!("    MOVF 0x{aa:02X}, W"));
-                                out.push(format!("    ADDLW 0x{:02X}", (*k as u8)));
+                                out.push(format!("    ADDLW 0x{:02X}", *k as u8));
                                 out.push(format!("    MOVWF 0x{da:02X}"));
                             }
                             (BinOp::Add, _) => {
-                                out.push(format!("    MOVF 0x{ba:02X}, W"));
+                                let (aa, bb) = (
+                                    val_addr(a, addrs, &slots),
+                                    val_addr(b_op, addrs, &slots),
+                                );
+                                out.push(format!("    MOVF 0x{bb:02X}, W"));
                                 out.push(format!("    ADDWF 0x{aa:02X}, W"));
                                 out.push(format!("    MOVWF 0x{da:02X}"));
                             }
