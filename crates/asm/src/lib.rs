@@ -63,7 +63,11 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let mne = parts[0].to_ascii_uppercase();
     let op = parts.get(1).copied().unwrap_or("");
-    let f = |s: &str| -> u16 { parse_num(s.trim_end_matches(',')) as u16 & 0x7F };
+    let f = |s: &str| -> u16 {
+        let v = parse_num(s.trim_end_matches(','));
+        assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
+        v as u16 & 0x7F
+    };
     match mne.as_str() {
         "NOP" => 0x0000,
         "RETURN" => 0x0008,

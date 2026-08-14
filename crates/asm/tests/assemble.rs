@@ -14,6 +14,13 @@ fn assembles_movf_add_movwf() {
 }
 
 #[test]
+#[should_panic(expected = "asm: file register 0x80 out of range")]
+fn panics_on_file_register_out_of_range() {
+    let src = "    org 0x0000\n    goto __start\n__start:\n    movwf 0x80\n    sleep\n    end\n";
+    let _ = assemble(src);
+}
+
+#[test]
 fn to_hex_roundtrips_through_parse_hex() {
     let src = "    org 0x0000\n    goto __start\n__start:\n    movf 0x20, W\n    movlw 0x01\n    addwf 0x20, W\n    movwf 0x21\n    sleep\n    end\n";
     let words = assemble(src);
