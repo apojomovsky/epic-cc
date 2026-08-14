@@ -30,7 +30,7 @@ implement flow. The state of that flow:
 | Present design in sections, approve each | ⚠️ **Rust approved (ADR-005). The ten-stage pipeline is presented but NOT approved. Sections 2–4 never presented.** |
 | Write design doc / spec | ⏸ superseded in part by this `docs/` tree |
 | Implementation plan | ❌ not started |
-| **Feasibility spike** | 🟡 **approved and STARTED, paused partway — 2 of 4 questions answered. See [`10-spike-findings.md`](10-spike-findings.md)** |
+| **Feasibility spike** | ✅ **done — all four questions answered, success criterion met. See [`10-spike-findings.md`](10-spike-findings.md)** |
 
 ## What the user has explicitly decided
 
@@ -68,51 +68,19 @@ Design sections 2–4 were outlined internally but never shown to the user:
 
 ---
 
-## ⏭️ The immediate next action: finish the feasibility spike
+## ✅ The feasibility spike is complete
 
-> **Approved and in progress. Paused 2026-08-14 partway through.**
-> Q2 (IR surface) and Q3 (storage pressure) have real answers; Q1 and Q4 do not.
-> **Read [`10-spike-findings.md`](10-spike-findings.md) — it has a step-by-step
-> "How to resume" section.** The remaining work is storage allocation, phi elimination,
-> instruction selection, and a simulator.
+The backend-spine spike ([`10-spike-findings.md`](10-spike-findings.md)) finished on
+2026-08-14. The probe (loop + `if` + function call + 16-bit arithmetic) compiles and runs
+correctly in a throwaway PIC14 simulator, cross-checked against `gpasm`. All four questions
+are answered: `.ll` is a good substrate, the IR surface is tractable, common RAM is tight
+(colouring + spill are first-version work), and Harvard `const` is the least-derisked part.
 
-The original scope, for reference:
-
-It is a **spike**: its output is an *answer*, not code we keep. Everything built is
-throwaway and must be labelled as such.
-
-### The probe
-
-Install clang and gputils. Compile a small program containing **a loop, an `if`, a function
-call, and 16-bit arithmetic** to `.ll` at a 16-bit-`int` datalayout. Hand-write a throwaway
-Rust pipeline that:
-
-1. parses that `.ll`
-2. statically allocates locals into the common RAM region 0x70–0x7F
-3. selects a minimal instruction set
-4. emits `.asm` + `.hex`
-
-Verify with a throwaway PIC14 simulator, and cross-check the HEX against `gpasm`'s
-assembly of our `.asm`.
-
-### The four questions it must answer
-
-1. **Is `.ll` text actually a good substrate?** Or does clang bake in ABI decisions
-   (`byval`, `sret`, varargs, alloca patterns) that fight a machine with no stack?
-2. **How much `.ll` surface must we parse** for a realistic program — is a hand-written
-   parser tractable, or a tarpit that grows without bound?
-3. **Does common-RAM-as-imaginary-registers survive contact with real IR?** We have 16
-   bytes; llvm-mos gives the 6502 thirty-two.
-4. **How bad is Harvard in practice?** `const` tables in program memory are the one problem
-   the 6502 never had, so llvm-mos offers no prior art.
-
-### Success criterion
-
-**One program containing all four constructs compiles and runs correctly in simulation.**
-
-Failure is equally informative and equally cheap. If the answer is "`.ll` is unworkable,"
-the fallback is Approach C (our own C front end) — **not** the LLVM backend route, which
-[`02-prior-art.md`](02-prior-art.md) rules out on evidence.
+**Next up (needs user decision, not yet approved):** the **pointer / `const`-in-flash
+design spike** — GEP lowering, `FSR`/`INDF` addressing, and RETLW-table codegen — since
+those are the two places the spike could not exercise. After that, or alongside it,
+present the ten-stage pipeline and the allocator/banking core (design sections 2–4) for
+approval before writing the implementation plan.
 
 ---
 
@@ -135,15 +103,16 @@ last.
 
 ## Open questions
 
-- **Datalayout:** use MSP430's wholesale (`-target msp430`), or declare a custom one? We
-  only consume IR, so we are free either way. Settle during the spike.
+- **Datalayout:** the spike used MSP430's wholesale (`-target msp430` —
+  `p:16:16`, byte alignment, native 8/16-bit) and it worked end-to-end. Treat MSP430's as
+  the working default; a custom datalayout remains an option but is no longer required.
 - **Which clang optimization passes to enable.** `-O2`/`-Oz` wholesale is wrong. Three
   known costs: SROA increases RAM pressure on a 368-byte machine; the optimizer normalises
   shifts-and-adds into multiplies we must re-expand; and — measured during environment
   setup, see [`09`](09-build-environment.md) — `-Oz` emits **arbitrary-precision integer
-  types** (an actual `mul i17`) and **intrinsics** (`@llvm.smax.i16`). Our legalizer
-  therefore cannot assume 8/16/32-bit widths. Needs a curated pass list, measured by the
-  spike.
+  therefore cannot assume 8/16/32-bit widths. Needs a curated pass list. The spike ran
+  successfully at `-O1` (allocas vanish, no arbitrary-width ints or intrinsics); `-Oz`
+  remains confirmed-problematic, so the curated list should sit at `-O1`/`-O2`, not `-Oz`.
 - **Legalizer generality.** Directly following from the above: how general does the
   widening/narrowing story need to be? A `mul i17` on a core with no hardware multiply is
   an unpleasant lowering, and it appeared in a two-function test program.
