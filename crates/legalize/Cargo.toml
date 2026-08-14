@@ -1,0 +1,12 @@
+[package]
+name = "legalize"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+
+[[bin]]
+name = "legalize"
+path = "src/bin/legalize.rs"
