@@ -20,3 +20,6 @@
 *.o
 *.ll
 /scratch/
+
+# Throwaway feasibility spike (docs/10-spike-findings.md). Not part of the product.
+/spike/

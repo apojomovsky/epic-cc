@@ -1,10 +1,9 @@
 # 04 — Compiler pipeline design
 
-> **Approval status:** Section 1 (pipeline and repository shape) was presented to the user
-> and is awaiting explicit approval — the user redirected to a research survey and this
-> documentation phase before answering. Sections 2–4 (the allocator/banking core;
-> verification harness; phasing) were **outlined but never presented in full**.
-> Do not treat this document as signed off. See
+> **Approval status:** the ten-stage pipeline and repository shape were **approved by the
+> user on 2026-08-14**. The detailed content of stages 5–8 (the allocator/banking core) is
+> design intent, not yet validated by implementation — treat specifics there as subject to
+> change once the feasibility spike reports. See
 > [`08-status-and-next-steps.md`](08-status-and-next-steps.md).
 
 ## Ten stages, each a crate, each with a text boundary
