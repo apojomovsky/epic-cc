@@ -68,19 +68,39 @@ fn add16_reg_reg_emits_carry_chain() {
 
 #[test]
 fn add16_reg_const_emits_carry_chain() {
-    // 258 = 0x0102 -> lo 0x02, hi 0x01.
+    // 515 = 0x0203 -> lo 0x03, hi 0x02 (hi differs from the carry ADDLW 0x01,
+    // so the k_hi add line is distinguishable).
     let m = parse(
-        "global in i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @in\n    %r = add i16 %a, 258\n    store i16 %r @out\n    ret void\n",
+        "global in i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @in\n    %r = add i16 %a, 515\n    store i16 %r @out\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x22)]);
     let asm = select(&m, &addrs);
     // %a=0x70/%r=0x72.
     assert!(asm.contains("MOVF 0x70, W"), "load a_lo:\n{asm}");
-    assert!(asm.contains("ADDLW 0x02"), "add k_lo:\n{asm}");
+    assert!(asm.contains("ADDLW 0x03"), "add k_lo:\n{asm}");
     assert!(asm.contains("MOVWF 0x72"), "store d_lo:\n{asm}");
     assert!(asm.contains("BTFSC STATUS, 0"), "carry test:\n{asm}");
     assert!(asm.contains("ADDLW 0x01"), "carry in add:\n{asm}");
+    assert!(asm.contains("ADDLW 0x02"), "add k_hi:\n{asm}");
     assert!(asm.contains("MOVWF 0x73"), "store d_hi:\n{asm}");
+}
+
+#[test]
+fn i16_slot_avoids_straddling_common_boundary() {
+    // Consume all of common RAM (0x70..=0x7F) with i8 values, then allocate
+    // an i16: it must land entirely in bank-0 GPRs (>= 0x25), not straddle
+    // 0x7F/0x80 (0x80 would alias bank-1 INDF).
+    let globals: String = (0..16).map(|i| format!("global g{i} i8\n")).collect();
+    let loads: String = (0..16).map(|i| format!("    %a{i} = load i8 @g{i}\n")).collect();
+    let m = parse(&format!(
+        "{globals}global out i16\nfn main() -> void\n  block entry:\n{loads}    %r = load i16 @out\n    store i16 %r @out\n    ret void\n"
+    ));
+    let mut addrs: HashMap<String, u8> = (0..16).map(|i| (format!("g{i}"), 0x20 + i)).collect();
+    addrs.insert("out".to_string(), 0x30u8);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("MOVWF 0x25"), "i16 lo should land at bank-0 0x25:\n{asm}");
+    assert!(asm.contains("MOVWF 0x26"), "i16 hi should land at bank-0 0x26:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x80"), "must not emit a write to 0x80 (bank-1 INDF):\n{asm}");
 }
 
 #[test]

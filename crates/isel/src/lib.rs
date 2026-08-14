@@ -35,11 +35,17 @@ impl<'m> Gen<'m> {
         if let Some(&a) = self.slots.get(name) {
             return a;
         }
-        let a = self.next;
-        self.next = self.next.wrapping_add(ty.bytes());
-        if self.next > 0x80 {
+        // A multi-byte value must fit entirely in common RAM (0x70..=0x7F).
+        // If it would straddle the boundary (e.g. an i16 with its lo at
+        // 0x7F would place the hi at 0x80, aliasing bank-1 INDF), spill the
+        // whole value to bank-0 GPRs first. Mirrors spike alloc_slot's
+        // `common + n - 1 <= COMMON_END` fit check.
+        let n = ty.bytes();
+        if self.next + n - 1 > 0x7F {
             self.next = BANK0_START;
         }
+        let a = self.next;
+        self.next = self.next.wrapping_add(n);
         self.slots.insert(name.to_string(), a);
         a
     }
