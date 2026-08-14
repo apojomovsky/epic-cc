@@ -141,6 +141,20 @@ impl Pic14 {
         self.set_c((a as u16 + b as u16) > 0xFF);
         self.set_dc(((a & 0x0F) as u16 + (b & 0x0F) as u16) > 0x0F);
     }
+    fn rlf(&mut self, v: u8) -> u8 {
+        let cin = if self.ram[3] & 0b001 != 0 { 1 } else { 0 };
+        let cout = v >> 7;
+        let r = (v << 1) | cin;
+        self.set_c(cout != 0);
+        r
+    }
+    fn rrf(&mut self, v: u8) -> u8 {
+        let cin = if self.ram[3] & 0b001 != 0 { 0x80 } else { 0 };
+        let cout = v & 1;
+        let r = (v >> 1) | cin;
+        self.set_c(cout != 0);
+        r
+    }
     fn pop_return(&mut self) -> u16 {
         self.stack.pop().unwrap_or(0)
     }
@@ -198,17 +212,130 @@ impl Pic14 {
                 self.set_dc((v & 0x0F) >= (self.w & 0x0F));
                 self.write_d(d, f, r);
             }
+            0x09 => {
+                let r = !self.read_f(f); // COMF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x03 => {
+                let r = self.read_f(f).wrapping_sub(1); // DECF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0B => {
+                let r = self.read_f(f).wrapping_sub(1); // DECFSZ
+                self.set_z(r);
+                self.write_d(d, f, r);
+                if r == 0 {
+                    return pc + 2;
+                }
+            }
+            0x0A => {
+                let r = self.read_f(f).wrapping_add(1); // INCF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0F => {
+                let r = self.read_f(f).wrapping_add(1); // INCFSZ
+                self.set_z(r);
+                self.write_d(d, f, r);
+                if r == 0 {
+                    return pc + 2;
+                }
+            }
+            0x04 => {
+                let r = self.w | self.read_f(f); // IORWF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0D => {
+                let r = self.rlf(self.read_f(f)); // RLF
+                self.write_d(d, f, r);
+            }
+            0x0C => {
+                let r = self.rrf(self.read_f(f)); // RRF
+                self.write_d(d, f, r);
+            }
+            0x06 => {
+                let r = self.w ^ self.read_f(f); // XORWF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0E => {
+                let v = self.read_f(f); // SWAPF
+                let r = (v << 4) | (v >> 4);
+                self.write_d(d, f, r);
+            }
             other => panic!("byte opcode {other:#x} not yet implemented"),
         }
         pc + 1
     }
-    fn exec_bit(&mut self, pc: u16, _word: u16) -> u16 {
-        pc + 1 // Task 4
+    fn exec_bit(&mut self, pc: u16, word: u16) -> u16 {
+        let b = ((word >> 7) & 0x7) as u8;
+        let f = (word & 0x7F) as usize;
+        match (word >> 10) & 0x3 {
+            0 => self.ram[f] &= !(1 << b), // BCF
+            1 => self.ram[f] |= 1 << b,   // BSF
+            2 => {
+                if self.ram[f] & (1 << b) == 0 {
+                    return pc + 2; // BTFSC skip if clear
+                }
+            }
+            3 => {
+                if self.ram[f] & (1 << b) != 0 {
+                    return pc + 2; // BTFSS skip if set
+                }
+            }
+            _ => unreachable!(),
+        }
+        pc + 1
     }
-    fn exec_call_goto(&mut self, pc: u16, _word: u16) -> u16 {
-        pc + 1 // Task 4
+    fn exec_call_goto(&mut self, pc: u16, word: u16) -> u16 {
+        let k = word & 0x7FF;
+        self.ram[0x0A] = ((k >> 8) & 0x1F) as u8; // PCLATH
+        if word & 0x0800 != 0 {
+            k // GOTO
+        } else {
+            self.stack.push(pc + 1); // CALL
+            k
+        }
     }
-    fn exec_literal(&mut self, pc: u16, _word: u16) -> u16 {
-        pc + 1 // Task 4
+    fn exec_literal(&mut self, pc: u16, word: u16) -> u16 {
+        let k = (word & 0xFF) as u8;
+        match (word >> 8) & 0xF {
+            0xE | 0xF => {
+                let r = self.w.wrapping_add(k);
+                self.add_flags(self.w, k, r);
+                self.w = r;
+            }
+            0x9 => {
+                self.w &= k;
+                self.set_z(self.w);
+            }
+            0x8 => {
+                self.w |= k;
+                self.set_z(self.w);
+            }
+            0xA => {
+                self.w ^= k;
+                self.set_z(self.w);
+            }
+            0xC | 0xD => {
+                let r = k.wrapping_sub(self.w);
+                self.set_z(r);
+                self.set_c(k >= self.w);
+                self.set_dc((k & 0x0F) >= (self.w & 0x0F));
+                self.w = r;
+            }
+            0x0..=0x3 => self.w = k, // MOVLW
+            0x4..=0x7 => {
+                self.w = k; // RETLW
+                let ret = self.pop_return();
+                self.ram[0x0A] = ((ret >> 8) & 0x1F) as u8;
+                return ret;
+            }
+            _ => unreachable!(),
+        }
+        pc + 1
     }
 }
