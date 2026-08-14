@@ -19,6 +19,22 @@ pub struct Load { pub dst: String, pub ty: Ty, pub ptr: String } // ptr = "@name
 pub struct Store { pub ty: Ty, pub val: Val, pub ptr: String }
 #[derive(Clone, Debug)]
 pub struct Bin { pub dst: String, pub op: BinOp, pub ty: Ty, pub a: Val, pub b: Val }
+#[derive(Clone, Debug)]
+pub struct Zext { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
+#[derive(Clone, Debug)]
+pub struct Trunc { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
+#[derive(Clone, Debug)]
+pub struct Icmp { pub dst: String, pub pred: String, pub ty: Ty, pub a: Val, pub b: Val }
+#[derive(Clone, Debug)]
+pub struct Select { pub dst: String, pub cond: Val, pub ty: Ty, pub a: Val, pub b: Val }
+#[derive(Clone, Debug)]
+pub struct Call { pub dst: Option<String>, pub ty: Option<Ty>, pub func: String, pub args: Vec<(Ty, Val)> }
+#[derive(Clone, Debug)]
+pub struct Br { pub target: String }
+#[derive(Clone, Debug)]
+pub struct BrCond { pub cond: Val, pub t: String, pub f: String }
+#[derive(Clone, Debug)]
+pub struct Phi { pub dst: String, pub ty: Ty, pub incoming: Vec<(Val, String)> }
 
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -26,6 +42,14 @@ pub enum Inst {
     Store(Store),
     Bin(Bin),
     Ret(Option<(Ty, Val)>),
+    Zext(Zext),
+    Trunc(Trunc),
+    Icmp(Icmp),
+    Select(Select),
+    Call(Call),
+    Br(Br),
+    BrCond(BrCond),
+    Phi(Phi),
 }
 
 #[derive(Clone, Debug)]
@@ -73,7 +97,22 @@ fn inst_str(i: &Inst) -> String {
         Inst::Bin(b) => format!("%{} = {} {} {} {}", b.dst, op_str(b.op), ty_str(b.ty), val_str(&b.a), val_str(&b.b)),
         Inst::Ret(None) => "ret void".into(),
         Inst::Ret(Some((t, v))) => format!("ret {} {}", ty_str(*t), val_str(v)),
+        Inst::Zext(z) => format!("%{} = zext {} {} to {}", z.dst, ty_str(z.from), val_str(&z.val), ty_str(z.to)),
+        Inst::Trunc(t) => format!("%{} = trunc {} {} to {}", t.dst, ty_str(t.from), val_str(&t.val), ty_str(t.to)),
+        Inst::Icmp(i) => format!("%{} = icmp {} {} {} {}", i.dst, i.pred, ty_str(i.ty), val_str(&i.a), val_str(&i.b)),
+        Inst::Select(s) => format!("%{} = select i1 {} {} {} {} {}", s.dst, val_str(&s.cond), ty_str(s.ty), val_str(&s.a), ty_str(s.ty), val_str(&s.b)),
+        Inst::Call(c) => match (&c.ty, &c.dst) {
+            (Some(t), Some(d)) => format!("%{d} = call {} @{}({})", ty_str(*t), c.func, call_args_str(&c.args)),
+            _ => format!("call void @{}({})", c.func, call_args_str(&c.args)),
+        },
+        Inst::Br(b) => format!("br {}", b.target),
+        Inst::BrCond(b) => format!("br i1 {} {} {}", val_str(&b.cond), b.t, b.f),
+        Inst::Phi(p) => format!("%{} = phi {} {}", p.dst, ty_str(p.ty), p.incoming.iter().map(|(v, l)| format!("{} {}", val_str(v), l)).collect::<Vec<_>>().join(" ")),
     }
+}
+
+fn call_args_str(args: &[(Ty, Val)]) -> String {
+    args.iter().map(|(t, v)| format!("{} {}", ty_str(*t), val_str(v))).collect::<Vec<_>>().join(", ")
 }
 
 fn op_str(o: BinOp) -> &'static str { match o { BinOp::Add => "add", BinOp::Sub => "sub", BinOp::And => "and", BinOp::Or => "or", BinOp::Xor => "xor" } }
@@ -133,6 +172,23 @@ fn parse_val(s: &str) -> Val {
     else if let Some(g) = s.strip_prefix('@') { Val::Global(g.to_string()) }
     else { Val::Const(s.parse().unwrap_or_else(|_| panic!("bad value {s}"))) }
 }
+fn parse_call(rest: &str) -> (Option<Ty>, String, Vec<(Ty, Val)>) {
+    let at = rest.find('@').unwrap();
+    let ty_part = rest[..at].trim();
+    let ty = if ty_part == "void" { None } else { Some(parse_ty(ty_part)) };
+    let open = rest.find('(').unwrap();
+    let func = rest[at + 1..open].trim().to_string();
+    let close = rest.rfind(')').unwrap();
+    let args = if open + 1 == close { vec![] } else {
+        rest[open + 1..close].split(',').map(|a| {
+            let mut it = a.trim().split_whitespace();
+            let t = parse_ty(it.next().unwrap());
+            let v = parse_val(it.next().unwrap());
+            (t, v)
+        }).collect()
+    };
+    (ty, func, args)
+}
 fn parse_inst(line: &str) -> Inst {
     if let Some(rest) = line.strip_prefix("store ") {
         let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -144,6 +200,20 @@ fn parse_inst(line: &str) -> Inst {
         let t = parse_ty(it.next().unwrap());
         return Inst::Ret(Some((t, parse_val(it.next().unwrap()))));
     }
+    if let Some(rest) = line.strip_prefix("br ") {
+        if let Some(r) = rest.strip_prefix("i1 ") {
+            let mut it = r.split_whitespace();
+            let cond = parse_val(it.next().unwrap());
+            let t = it.next().unwrap().to_string();
+            let f = it.next().unwrap().to_string();
+            return Inst::BrCond(BrCond { cond, t, f });
+        }
+        return Inst::Br(Br { target: rest.to_string() });
+    }
+    if let Some(rest) = line.strip_prefix("call ") {
+        let (ty, func, args) = parse_call(rest);
+        return Inst::Call(Call { dst: None, ty, func, args });
+    }
     // defining instruction: %d = op ...
     let eq = line.find(" = ").unwrap();
     let dst = line[..eq].trim_start_matches('%').to_string();
@@ -153,6 +223,57 @@ fn parse_inst(line: &str) -> Inst {
         let t = parse_ty(it.next().unwrap());
         let ptr = it.next().unwrap().to_string();
         return Inst::Load(Load { dst, ty: t, ptr });
+    }
+    if let Some(rest) = body.strip_prefix("call ") {
+        let (ty, func, args) = parse_call(rest);
+        return Inst::Call(Call { dst: Some(dst), ty, func, args });
+    }
+    if let Some(rest) = body.strip_prefix("zext ") {
+        let mut it = rest.split_whitespace();
+        let from = parse_ty(it.next().unwrap());
+        let val = parse_val(it.next().unwrap());
+        it.next(); // "to"
+        let to = parse_ty(it.next().unwrap());
+        return Inst::Zext(Zext { dst, from, val, to });
+    }
+    if let Some(rest) = body.strip_prefix("trunc ") {
+        let mut it = rest.split_whitespace();
+        let from = parse_ty(it.next().unwrap());
+        let val = parse_val(it.next().unwrap());
+        it.next(); // "to"
+        let to = parse_ty(it.next().unwrap());
+        return Inst::Trunc(Trunc { dst, from, val, to });
+    }
+    if let Some(rest) = body.strip_prefix("icmp ") {
+        let mut it = rest.split_whitespace();
+        let pred = it.next().unwrap().to_string();
+        if pred != "eq" && pred != "ne" { panic!("unsupported icmp predicate {pred}"); }
+        let t = parse_ty(it.next().unwrap());
+        let a = parse_val(it.next().unwrap());
+        let b = parse_val(it.next().unwrap());
+        return Inst::Icmp(Icmp { dst, pred, ty: t, a, b });
+    }
+    if let Some(rest) = body.strip_prefix("select ") {
+        let mut it = rest.split_whitespace();
+        it.next(); // "i1"
+        let cond = parse_val(it.next().unwrap());
+        let t = parse_ty(it.next().unwrap());
+        let a = parse_val(it.next().unwrap());
+        let t2 = parse_ty(it.next().unwrap());
+        if t != t2 { panic!("select operand type mismatch {:?} vs {:?}", t, t2); }
+        let b = parse_val(it.next().unwrap());
+        return Inst::Select(Select { dst, cond, ty: t, a, b });
+    }
+    if let Some(rest) = body.strip_prefix("phi ") {
+        let mut it = rest.split_whitespace();
+        let t = parse_ty(it.next().unwrap());
+        let mut incoming = Vec::new();
+        while let Some(v) = it.next() {
+            let val = parse_val(v);
+            let pred = it.next().unwrap().to_string();
+            incoming.push((val, pred));
+        }
+        return Inst::Phi(Phi { dst, ty: t, incoming });
     }
     let mut it = body.split_whitespace();
     let op = it.next().unwrap();
