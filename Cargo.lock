@@ -10,6 +10,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "asm"
+version = "0.1.0"
+dependencies = [
+ "pic14-sim",
+]
+
+[[package]]
+name = "banking"
+version = "0.1.0"
+
+[[package]]
 name = "callgraph"
 version = "0.1.0"
 dependencies = [
@@ -28,11 +39,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "isel"
+version = "0.1.0"
+dependencies = [
+ "ir",
+]
+
+[[package]]
 name = "legalize"
 version = "0.1.0"
 dependencies = [
  "ir",
 ]
+
+[[package]]
+name = "peephole"
+version = "0.1.0"
 
 [[package]]
 name = "pic14-sim"
