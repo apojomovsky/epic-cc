@@ -23,3 +23,44 @@ fn global_type_and_addr_roundtrip() {
     // stable fixed point
     assert_eq!(serialize(&parse(&out)), out);
 }
+
+#[test]
+fn roundtrips_control_flow_call_and_cast() {
+    let text = "fn main() -> void\n\
+  block main:\n\
+    %1 = load i8 @in\n\
+    %2 = zext i8 %1 to i16\n\
+    %3 = icmp eq i16 %2 0\n\
+    br i1 %3 6 8\n\
+  block 6:\n\
+    %5 = trunc i16 %14 to i8\n\
+    br 8\n\
+  block 8:\n\
+    %9 = phi i16 0 main %15 main_L8\n\
+    %10 = load i16 @out\n\
+    %11 = icmp eq i16 %10 0\n\
+    %12 = icmp eq i16 %11 0\n\
+    %13 = select i1 %12 i16 100 i16 %9\n\
+    %14 = call i16 @add(i16 %10, i16 %13)\n\
+    %15 = icmp ne i16 %14 0\n\
+    call void @f()\n\
+    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    // stable fixed point: parse -> serialize -> parse -> serialize
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    // key canonical lines survive verbatim
+    for line in [
+        "%9 = phi i16 0 main %15 main_L8",
+        "br i1 %3 6 8",
+        "%14 = call i16 @add(i16 %10, i16 %13)",
+        "call void @f()",
+        "%2 = zext i8 %1 to i16",
+        "%5 = trunc i16 %14 to i8",
+        "%12 = icmp eq i16 %11 0",
+        "%13 = select i1 %12 i16 100 i16 %9",
+    ] {
+        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+    }
+}
