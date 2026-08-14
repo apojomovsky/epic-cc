@@ -157,3 +157,60 @@ fn phi_copy_lands_before_terminator_of_each_predecessor() {
     assert!(asm.contains("MOVF 0x70, W"), "merge reads %p lo:\n{asm}");
     assert!(asm.contains("MOVWF 0x24"), "merge stores %p lo to @out:\n{asm}");
 }
+
+#[test]
+fn icmp_eq_i8_materializes_i1() {
+    let m = parse(
+        "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    store i8 %c @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
+    let asm = select(&m, &addrs);
+    // %1=0x70, %c=0x71, scratch=0x2A (after the driver's in/out globals 0x20/0x21).
+    assert!(asm.contains("MOVF 0x70, W"), "load a:\n{asm}");
+    assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2A"), "store xor to scratch:\n{asm}");
+    assert!(asm.contains("MOVLW 0x00"), "materialize 0:\n{asm}");
+    assert!(asm.contains("BTFSC STATUS, 2"), "Z test:\n{asm}");
+    assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
+    assert!(asm.contains("MOVWF 0x71"), "store d:\n{asm}");
+}
+
+#[test]
+fn icmp_eq_i16_uses_scratch_accumulation() {
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp eq i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x20), ("y", 0x22), ("out", 0x24)]);
+    let asm = select(&m, &addrs);
+    // %a=0x70/71, %b=0x72/73, %c=0x74, scratch=0x2A.
+    assert!(asm.contains("MOVF 0x70, W"), "load a_lo:\n{asm}");
+    assert!(asm.contains("XORWF 0x72, W"), "xor b_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2A"), "store lo xor to scratch:\n{asm}");
+    assert!(asm.contains("MOVF 0x71, W"), "load a_hi:\n{asm}");
+    assert!(asm.contains("XORWF 0x73, W"), "xor b_hi:\n{asm}");
+    assert!(asm.contains("IORWF 0x2A, W"), "or hi into scratch:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2A"), "store accumulated scratch:\n{asm}");
+    assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
+    assert!(asm.contains("MOVWF 0x74"), "store d:\n{asm}");
+}
+
+#[test]
+fn brcond_and_select_emit_skip_lines() {
+    let m = parse(
+        "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    %s = select i1 %c i8 10 i8 20\n    br i1 %c then end\n  block then:\n    store i8 %s @out\n    br end\n  block end:\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
+    let asm = select(&m, &addrs);
+    // %1=0x70, %c=0x71, %s=0x72, scratch=0x2A.
+    // brcond: cond==0 -> main_Lend (f), cond!=0 -> main_Lthen (t).
+    assert!(asm.contains("MOVF 0x71, W"), "brcond reads cond:\n{asm}");
+    assert!(asm.contains("BTFSC STATUS, 2"), "brcond Z test:\n{asm}");
+    assert!(asm.contains("GOTO main_Lend"), "brcond f:\n{asm}");
+    assert!(asm.contains("GOTO main_Lthen"), "brcond t:\n{asm}");
+    // select: test cond, jump to else, copy a=10 then b=20.
+    assert!(asm.contains("GOTO tmp0"), "select else jump:\n{asm}");
+    assert!(asm.contains("MOVLW 0x0A"), "select copy a:\n{asm}");
+    assert!(asm.contains("MOVWF 0x72"), "select dst:\n{asm}");
+    assert!(asm.contains("GOTO tmp1"), "select end jump:\n{asm}");
+    assert!(asm.contains("MOVLW 0x14"), "select copy b:\n{asm}");
+}
