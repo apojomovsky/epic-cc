@@ -1,0 +1,15 @@
+# Rust
+/target/
+**/*.rs.bk
+Cargo.lock
+
+# Reference PDFs must never be committed — copyrighted, see docs/06-environment.md
+*.pdf
+
+# Build / test artifacts
+*.hex
+*.lst
+*.map
+*.o
+*.ll
+/scratch/
