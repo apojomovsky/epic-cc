@@ -30,7 +30,7 @@ implement flow. The state of that flow:
 | Present design in sections, approve each | ⚠️ **Rust approved (ADR-005). The ten-stage pipeline is presented but NOT approved. Sections 2–4 never presented.** |
 | Write design doc / spec | ⏸ superseded in part by this `docs/` tree |
 | Implementation plan | ❌ not started |
-| **Feasibility spike** | ❌ **scoped and presented, awaiting user go-ahead** |
+| **Feasibility spike** | 🟡 **approved and STARTED, paused partway — 2 of 4 questions answered. See [`10-spike-findings.md`](10-spike-findings.md)** |
 
 ## What the user has explicitly decided
 
@@ -68,10 +68,15 @@ Design sections 2–4 were outlined internally but never shown to the user:
 
 ---
 
-## ⏭️ The immediate next action: the feasibility spike
+## ⏭️ The immediate next action: finish the feasibility spike
 
-**This has been scoped and presented to the user. It is awaiting an explicit go-ahead.
-Do not start it without confirming.**
+> **Approved and in progress. Paused 2026-08-14 partway through.**
+> Q2 (IR surface) and Q3 (storage pressure) have real answers; Q1 and Q4 do not.
+> **Read [`10-spike-findings.md`](10-spike-findings.md) — it has a step-by-step
+> "How to resume" section.** The remaining work is storage allocation, phi elimination,
+> instruction selection, and a simulator.
+
+The original scope, for reference:
 
 It is a **spike**: its output is an *answer*, not code we keep. Everything built is
 throwaway and must be labelled as such.

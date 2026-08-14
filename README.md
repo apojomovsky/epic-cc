@@ -30,6 +30,7 @@ including the prior project that died attempting the LLVM route, is in
 | [`docs/07-references.md`](docs/07-references.md) | Books, papers, datasheets, URLs |
 | [`docs/08-status-and-next-steps.md`](docs/08-status-and-next-steps.md) | **Start here if you are resuming cold.** Where we are, what is next, open questions |
 | [`docs/09-build-environment.md`](docs/09-build-environment.md) | Nix flake dev shell, pinned versions, environment gotchas |
+| [`docs/10-spike-findings.md`](docs/10-spike-findings.md) | Feasibility spike — interim findings and how to resume |
 | [`vendor/README.md`](vendor/README.md) | Where to put user-supplied Microchip material and reference books |
 
 ## Getting a working environment
