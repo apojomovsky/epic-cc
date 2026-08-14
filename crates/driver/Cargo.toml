@@ -1,0 +1,20 @@
+[package]
+name = "driver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+irparse = { path = "../irparse" }
+wholeprog = { path = "../wholeprog" }
+legalize = { path = "../legalize" }
+callgraph = { path = "../callgraph" }
+alloc = { path = "../alloc" }
+isel = { path = "../isel" }
+banking = { path = "../banking" }
+peephole = { path = "../peephole" }
+asm = { path = "../asm" }
+
+[dev-dependencies]
+pic14-sim = { path = "../sim" }
