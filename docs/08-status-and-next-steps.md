@@ -8,8 +8,12 @@ Last updated: 2026-08-14
 
 ## Where we are
 
-**Nothing is implemented.** The repository contains documentation only. There is no source
-code, no `Cargo.toml`, and no build.
+**No compiler code is implemented.** The repository contains documentation plus a working
+build environment. There is no `Cargo.toml` and no crates yet.
+
+The Nix dev shell **is** built and verified — see
+[`09-build-environment.md`](09-build-environment.md). `direnv allow`, then you have pinned
+clang 20.1.8, rustc 1.97.1, gpasm 1.5.2, cvise, creduce, and csmith.
 
 We are at the end of a design conversation, following a brainstorm → design → approve →
 implement flow. The state of that flow:
@@ -22,7 +26,8 @@ implement flow. The state of that flow:
 | Online prior-art survey | ✅ done — [`02-prior-art.md`](02-prior-art.md) |
 | Reference books obtained | ✅ done — Muchnick + lcc |
 | Documentation phase | ✅ done — this `docs/` tree |
-| Present design in sections, approve each | ⚠️ **Section 1 presented, not yet approved. Sections 2–4 never presented.** |
+| Build environment (Nix flake) | ✅ done and verified — [ADR-007](03-decisions.md), [`09`](09-build-environment.md) |
+| Present design in sections, approve each | ⚠️ **Rust approved (ADR-005). The ten-stage pipeline is presented but NOT approved. Sections 2–4 never presented.** |
 | Write design doc / spec | ⏸ superseded in part by this `docs/` tree |
 | Implementation plan | ❌ not started |
 | **Feasibility spike** | ❌ **scoped and presented, awaiting user go-ahead** |
@@ -40,12 +45,17 @@ These are settled. Do not re-litigate them without new evidence.
    custom whole-program PIC14 backend. Not an LLVM backend.
 5. **De-risking:** spike the backend spine **before** writing the full plan.
 6. **Commits:** conventional commits, single line, at most 3 lines.
+7. **Implementation language:** Rust ([ADR-005](03-decisions.md)).
+8. **Build isolation:** Nix flake + direnv, nothing installed system-wide; clang pinned to
+   20.1.8 ([ADR-007](03-decisions.md)).
+9. **Vendored material:** user supplies Microchip installers, datasheets, and the reference
+   books under `vendor/`, gitignored ([`../vendor/README.md`](../vendor/README.md)).
 
 ## What is presented but NOT yet approved
 
-- The **ten-stage pipeline** and **Rust** as the implementation language
-  ([`04-pipeline-design.md`](04-pipeline-design.md), [ADR-005](03-decisions.md)). Presented
-  to the user; they redirected to research and documentation before answering. **Ask.**
+- The **ten-stage pipeline** ([`04-pipeline-design.md`](04-pipeline-design.md)). Presented
+  to the user; they redirected to research, documentation, and build setup before
+  answering. **Ask before building to it.**
 - The **device-description-as-data** approach ([ADR-004](03-decisions.md)).
 
 ## What was never presented at all
@@ -122,9 +132,16 @@ last.
 
 - **Datalayout:** use MSP430's wholesale (`-target msp430`), or declare a custom one? We
   only consume IR, so we are free either way. Settle during the spike.
-- **Which clang optimization passes to enable.** `-O2` wholesale is wrong — SROA increases
-  RAM pressure on a 368-byte machine, and the optimizer normalises shifts-and-adds into
-  multiplies that we must re-expand. Needs a curated list.
+- **Which clang optimization passes to enable.** `-O2`/`-Oz` wholesale is wrong. Three
+  known costs: SROA increases RAM pressure on a 368-byte machine; the optimizer normalises
+  shifts-and-adds into multiplies we must re-expand; and — measured during environment
+  setup, see [`09`](09-build-environment.md) — `-Oz` emits **arbitrary-precision integer
+  types** (an actual `mul i17`) and **intrinsics** (`@llvm.smax.i16`). Our legalizer
+  therefore cannot assume 8/16/32-bit widths. Needs a curated pass list, measured by the
+  spike.
+- **Legalizer generality.** Directly following from the above: how general does the
+  widening/narrowing story need to be? A `mul i17` on a core with no hardware multiply is
+  an unpleasant lowering, and it appeared in a two-function test program.
 - **Every `[VERIFY]` item in [`01-target-pic14.md`](01-target-pic14.md)** — memory map, bank
   ranges, common RAM extent, flash size, `const`-in-flash access mechanism. Confirm against
   DS39582 and DS33023 before hard-coding into the device file.

@@ -1,10 +1,17 @@
 # Rust
 /target/
 **/*.rs.bk
-Cargo.lock
+
+# Vendored material: proprietary installers, copyrighted docs and books.
+# Only the README describing the layout is tracked.
+/vendor/*
+!/vendor/README.md
 
 # Reference PDFs must never be committed — copyrighted, see docs/06-environment.md
 *.pdf
+
+# direnv
+/.direnv/
 
 # Build / test artifacts
 *.hex

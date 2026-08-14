@@ -172,7 +172,7 @@ being actively maintained makes its `.inc` files a durable upstream source.
 
 ## ADR-005 — Implement in Rust
 
-**Status:** Accepted 2026-08-14 (presented, pending final design approval)
+**Status:** Accepted 2026-08-14 (user-approved)
 
 ### Decision
 
@@ -215,3 +215,60 @@ permanent regression oracle, which is exactly what unsupervised agent work needs
 
 Everything genuinely load-bearing is public: datasheets, the ISA, the XC8 user guide's ABI
 chapter, and SDCC/gputils source.
+
+---
+
+## ADR-007 — Nix flake + direnv for isolated, reproducible builds
+
+**Status:** Accepted 2026-08-14 (user-approved)
+
+### Decision
+
+All build and test dependencies come from a Nix flake dev shell. Nothing is installed
+system-wide. `direnv` activates it on `cd`. Full detail in
+[`09-build-environment.md`](09-build-environment.md).
+
+**clang is pinned to 20.1.8**, deliberately *not* tracking the nixpkgs default (currently
+21).
+
+### Rationale
+
+The decisive argument is specific to this project: **we parse LLVM IR text, so the clang
+version is part of our input format.** A silent clang bump can change what our parser sees.
+Nix pins it exactly in `flake.lock`. `apt` and conda-forge both drift; a Docker tag drifts
+unless pinned by digest with rebuild discipline. Of the options considered, only Nix closes
+this properly.
+
+Secondary: `nix develop --command <cmd>` is a one-line, daemon-free, scriptable entry
+point, which serves the autonomy requirement in [`00-charter.md`](00-charter.md).
+
+The host already had `nix` (2.34.8, flakes enabled) and `direnv` (2.37.1) installed, and
+nixpkgs carries `gputils` at exactly 1.5.2 — the current upstream release — plus `cvise`,
+`creduce`, and `csmith`.
+
+### Rejected alternatives
+
+All were already installed on the host, so availability was not the differentiator:
+
+- **Docker / podman** — familiar, and trivially handles proprietary vendor blobs. Rejected
+  as primary: reproducibility is only as good as base-image and `apt` pinning, which drift.
+  The flake can still emit an OCI image via `dockerTools` if CI portability is ever needed,
+  keeping one source of truth.
+- **Pixi / conda-forge** — good lockfile story and much gentler than Nix. Rejected:
+  `gputils` and `gpsim` are not on conda-forge, and conda is a poor fit for GTK-linked
+  system tooling like gpsim.
+
+### Consequences
+
+- **XC8 must not become a flake input.** It is proprietary; making it a build dependency
+  would break `nix develop` for anyone without a licensed install, including CI. It is
+  detected at runtime via `$PIC8_XC8_ROOT` and its tests skip when absent.
+- Two packages are missing from nixpkgs and need their own derivations eventually:
+  **gpsim** and **YARPGen**. Both are deferred to the fuzzing phase; neither blocks the
+  spike.
+- New files must be `git add`ed before `nix develop` can see them.
+
+### Revisit if
+
+Nix evaluation becomes a recurring obstacle for unsupervised agent work, or a dependency
+we need proves genuinely impractical to package.

@@ -2,13 +2,14 @@
 
 ## Books — held locally
 
-In `/home/alexis/Downloads/` (see [`06-environment.md`](06-environment.md) for reading
-instructions and the Muchnick NFKC gotcha). **Not in this repo — copyrighted.**
+In `vendor/books/` — **gitignored, copyrighted, never commit them.** See
+[`06-environment.md`](06-environment.md) for reading instructions and the Muchnick NFKC
+gotcha.
 
-| Book | Pages | Role |
-|---|---|---|
-| **Muchnick, _Advanced Compiler Design and Implementation_** (Morgan Kaufmann, 1997, ISBN 9781558603202) | 887 | Primary reference. Dataflow analysis, redundancy elimination, register allocation, interprocedural analysis — i.e. BANKSEL/PAGESEL placement and overlay allocation |
-| **Fraser & Hanson, _A Retargetable C Compiler: Design and Implementation_ (lcc)** (Addison-Wesley, 1995, ISBN 9780805316704) | 578 | Complete burg-style tree-pattern code generators as working source. The isel technique for PIC14. Also the fallback reference if we ever drop clang for our own front end |
+| Book | File | Pages | Role |
+|---|---|---|---|
+| **Muchnick, _Advanced Compiler Design and Implementation_** (Morgan Kaufmann, 1997, ISBN 9781558603202) | `muchnick-advanced-compiler-design-1997.pdf` | 887 | Primary reference. Dataflow analysis, redundancy elimination, register allocation, interprocedural analysis — i.e. BANKSEL/PAGESEL placement and overlay allocation |
+| **Fraser & Hanson, _A Retargetable C Compiler: Design and Implementation_ (lcc)** (Addison-Wesley, 1995, ISBN 9780805316704) | `fraser-hanson-retargetable-c-compiler-lcc-1995.pdf` | 578 | Complete burg-style tree-pattern code generators as working source. The isel technique for PIC14. Also the fallback reference if we ever drop clang for our own front end |
 
 ## Books — worth requesting if needed
 

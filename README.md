@@ -29,10 +29,24 @@ including the prior project that died attempting the LLVM route, is in
 | [`docs/06-environment.md`](docs/06-environment.md) | Toolchain setup, the XC8 install, **how to read the reference PDFs** |
 | [`docs/07-references.md`](docs/07-references.md) | Books, papers, datasheets, URLs |
 | [`docs/08-status-and-next-steps.md`](docs/08-status-and-next-steps.md) | **Start here if you are resuming cold.** Where we are, what is next, open questions |
+| [`docs/09-build-environment.md`](docs/09-build-environment.md) | Nix flake dev shell, pinned versions, environment gotchas |
+| [`vendor/README.md`](vendor/README.md) | Where to put user-supplied Microchip material and reference books |
+
+## Getting a working environment
+
+Everything is provided by a Nix flake — **install nothing system-wide**.
+
+```bash
+direnv allow                      # one time; the shell then activates on `cd`
+nix develop --command cargo test  # or one-shot, for automation
+```
+
+Pinned: clang 20.1.8, rustc/cargo 1.97.1, gpasm 1.5.2, cvise, creduce, csmith.
+Details and gotchas in [`docs/09-build-environment.md`](docs/09-build-environment.md).
 
 ## Quick orientation for a resuming agent
 
 1. Read [`docs/08-status-and-next-steps.md`](docs/08-status-and-next-steps.md) first.
-2. Nothing is implemented. The repo contains documentation only.
+2. Nothing is implemented. The repo contains documentation and build scaffolding only.
 3. The user's approval gates are real: the next step (a spike) has been scoped and
    presented but **not yet started**. Do not begin implementation without confirming.
