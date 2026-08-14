@@ -1,0 +1,12 @@
+[package]
+name = "wholeprog"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+
+[[bin]]
+name = "wholeprog"
+path = "src/bin/wholeprog.rs"
