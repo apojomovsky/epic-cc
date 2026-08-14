@@ -13,3 +13,10 @@ fn emits_add_for_in_plus_one() {
     assert!(asm.contains("ADDLW 0x01"));
     assert!(asm.contains("MOVWF 0x21"));
 }
+
+#[test]
+#[should_panic(expected = "only i8 loads supported")]
+fn panics_on_non_i8_load() {
+    let m = parse("global in i8\nfn main() -> void\n  block entry:\n    %1 = load i16 @in\n    ret void\n");
+    select(&m, &HashMap::new());
+}
