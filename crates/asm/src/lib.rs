@@ -103,11 +103,14 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
 /// Intel HEX from 14-bit words: little-endian pairs at word*2.
 pub fn to_hex(words: &[u16]) -> String {
     let mut hex = String::new();
+    // gpasm emits a leading 04 extended-linear-address record (upper 16 bits = 0).
+    hex.push_str(":020000040000FA\n");
     // trim trailing zeros to the highest set word
     let hi = words.iter().rposition(|&w| w != 0).map(|i| i + 1).unwrap_or(0);
     let mut addr = 0usize;
     while addr < hi {
-        let n = (hi - addr).min(16);
+        // gpasm chunks at 16 data bytes (8 words) per record.
+        let n = (hi - addr).min(8);
         let mut body = vec![0u8; 2 * n];
         for (i, w) in words[addr..addr + n].iter().enumerate() {
             body[2 * i] = (w & 0xFF) as u8;
