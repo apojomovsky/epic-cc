@@ -124,10 +124,20 @@ impl Pic14 {
         }
     }
     fn read_f(&self, f: usize) -> u8 {
-        self.ram[f] // Task 5 adds INDF/PCL aliasing
+        match f {
+            0x00 => self.ram[self.ram[0x04] as usize], // INDF -> RAM[FSR]
+            0x02 => (self.pc & 0xFF) as u8,            // PCL
+            _ => self.ram[f],
+        }
     }
     fn write_f(&mut self, f: usize, v: u8) {
-        self.ram[f] = v; // Task 5 adds INDF/PCL aliasing
+        match f {
+            0x00 => {
+                let fsr = self.ram[0x04] as usize;
+                self.ram[fsr] = v; // INDF -> RAM[FSR]
+            }
+            _ => self.ram[f] = v,
+        }
     }
     fn write_d(&mut self, d: u16, f: usize, r: u8) {
         if d == 1 {
@@ -201,6 +211,10 @@ impl Pic14 {
             }
             0x00 => {
                 if d == 1 {
+                    if f == 0x02 {
+                        let pclath = (self.ram[0x0A] as u16) & 0x1F;
+                        return (pclath << 8) | (self.w as u16);
+                    }
                     self.write_f(f, self.w);
                 }
             }
