@@ -12,11 +12,14 @@ const COMMON_START: u8 = 0x70;
 const BANK0_START: u8 = 0x25;
 
 /// Per-function codegen state: the SSA slot map, the next free GPR address,
-/// and the lines emitted for the current function.
+/// the fixed icmp scratch byte, a fresh-label counter, and the lines emitted
+/// for the current function.
 struct Gen<'m> {
     addrs: &'m HashMap<String, u8>,
     slots: HashMap<String, u8>,
     next: u8,
+    scratch: u8,
+    tmp: u32,
     out: Vec<String>,
 }
 
@@ -102,12 +105,101 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// W ^= byte `idx` of `val`.
+    fn emit_xor_byte(&mut self, val: &Val, idx: u8) {
+        match val {
+            Val::Const(k) => {
+                let b = ((k >> (idx as u32 * 8)) & 0xFF) as u8;
+                self.emit(format!("    XORLW 0x{b:02X}"));
+            }
+            Val::Reg(r) => {
+                let a = self.val_addr(&Val::Reg(r.clone()));
+                self.emit(format!("    XORWF 0x{:02X}, W", a + idx));
+            }
+            Val::Global(g) => {
+                let a = self.val_addr(&Val::Global(g.clone()));
+                self.emit(format!("    XORWF 0x{:02X}, W", a + idx));
+            }
+        }
+    }
+
     /// Copy `val` (width `ty`) into the slot starting at `dst`.
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u8) {
         for i in 0..ty.bytes() {
             self.emit_load_byte(val, i);
             self.emit(format!("    MOVWF 0x{:02X}", dst + i));
         }
+    }
+
+    /// Set the Z flag to (a == b) without disturbing other flags. For i16,
+    /// the XORs of both bytes are accumulated in the fixed `scratch` byte,
+    /// leaving Z set exactly when every byte pair was equal.
+    fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
+        let n = ty.bytes();
+        self.emit_load_byte(a, 0);
+        self.emit_xor_byte(b, 0);
+        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        for i in 1..n {
+            self.emit_load_byte(a, i);
+            self.emit_xor_byte(b, i);
+            self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
+            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        }
+    }
+
+    /// Branch on `cond`: Z = (cond == 0); if Z is set (cond == 0) go to `f`,
+    /// otherwise (cond != 0) go to `t`. Mirrors spike emit_cond_branch.
+    fn emit_cond_branch(&mut self, cond: &Val, t: &str, f: &str) {
+        match cond {
+            Val::Reg(r) => {
+                let ca = self.val_addr(&Val::Reg(r.clone()));
+                self.emit(format!("    MOVF 0x{ca:02X}, W"));
+                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                self.emit(format!("    GOTO {f}"));
+                self.emit(format!("    GOTO {t}"));
+            }
+            Val::Const(k) => {
+                let l = if *k != 0 { t } else { f };
+                self.emit(format!("    GOTO {l}"));
+            }
+            Val::Global(_) => panic!("isel: conditional branch on a global"),
+        }
+    }
+
+    /// `d = cond ? a : b` via an if/else jump over two copies. Mirrors spike
+    /// emit_select.
+    fn emit_select(&mut self, dst: &str, cond: &Val, ty: Ty, a: &Val, b: &Val) {
+        let da = self.slot(dst, ty);
+        match cond {
+            Val::Const(k) => {
+                let v = if *k != 0 { a } else { b };
+                self.emit_move_val_to_slot(v, ty, da);
+                return;
+            }
+            Val::Global(_) => panic!("isel: select condition is a global"),
+            Val::Reg(_) => {}
+        }
+        let l_else = self.fresh_label();
+        let l_end = self.fresh_label();
+        let ca = match cond {
+            Val::Reg(r) => self.val_addr(&Val::Reg(r.clone())),
+            _ => unreachable!(),
+        };
+        self.emit(format!("    MOVF 0x{ca:02X}, W"));
+        self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+        self.emit(format!("    GOTO {l_else}"));
+        self.emit_move_val_to_slot(a, ty, da);
+        self.emit(format!("    GOTO {l_end}"));
+        self.emit(format!("{l_else}:"));
+        self.emit_move_val_to_slot(b, ty, da);
+        self.emit(format!("{l_end}:"));
+    }
+
+    /// A fresh local label for intra-block jumps (select branches).
+    fn fresh_label(&mut self) -> String {
+        let s = format!("tmp{}", self.tmp);
+        self.tmp += 1;
+        s
     }
 
     /// `d = a + b` for i16 (either operand may be a register; at most one a
@@ -259,6 +351,23 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{:02X}", da + i));
                 }
             }
+            Inst::Icmp(ic) => {
+                assert!(
+                    ic.pred == "eq",
+                    "isel: only eq icmp supported (got {:?})",
+                    ic.pred
+                );
+                // XOR-based compare sets Z = (a == b); materialize the i1.
+                self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                let da = self.slot(&ic.dst, Ty::I1);
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit(format!("    MOVWF 0x{da:02X}"));
+            }
+            Inst::Select(s) => {
+                self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
+            }
             _ => panic!("isel: unsupported instruction for milestone 2"),
         }
     }
@@ -268,6 +377,11 @@ impl<'m> Gen<'m> {
             Inst::Br(br) => {
                 let l = &labels[&br.target];
                 self.emit(format!("    GOTO {l}"));
+            }
+            Inst::BrCond(b) => {
+                let lt = &labels[&b.t];
+                let lf = &labels[&b.f];
+                self.emit_cond_branch(&b.cond, lt, lf);
             }
             Inst::Ret(None) => self.emit("    RETURN".to_string()),
             _ => panic!("isel: unsupported terminator for milestone 2"),
@@ -281,6 +395,14 @@ impl<'m> Gen<'m> {
 /// SSA destinations are assigned fresh addresses per function: common RAM
 /// (`0x70`→`0x7F`) first, then bank-0 GPRs from `0x25`.
 pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
+    // Fixed icmp scratch byte, placed after the address map's globals so it
+    // never collides with them. `alloc` assigns globals from 0x20 (the driver's
+    // in/out live at 0x20/0x21), so 0x2A is the floor; if any global is larger,
+    // the scratch moves just past the map's end. Slots live in common RAM
+    // (0x70+) and are unaffected.
+    let scratch = addrs
+        .values()
+        .fold(0x2Au8, |s, &a| s.max(a.wrapping_add(2)));
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
         "    list p=16f877a".to_string(),
@@ -296,6 +418,8 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
             addrs,
             slots: HashMap::new(),
             next: COMMON_START,
+            scratch,
+            tmp: 0,
             out: Vec::new(),
         };
         g.emit(format!("{0}:", f.name));
