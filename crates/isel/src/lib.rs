@@ -35,6 +35,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
             for i in &b.insts {
                 match i {
                     Inst::Load(l) => {
+                        assert_eq!(l.ty, ir::Ty::I8, "isel: only i8 loads supported");
                         let (src, dst) = (
                             ptr_addr(&l.ptr, addrs, &slots),
                             slot(&mut slots, &mut next, &l.dst),
@@ -43,6 +44,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
                         out.push(format!("    MOVWF 0x{dst:02X}"));
                     }
                     Inst::Store(s) => {
+                        assert_eq!(s.ty, ir::Ty::I8, "isel: only i8 stores supported");
                         let (dst, src) = (
                             ptr_addr(&s.ptr, addrs, &slots),
                             val_addr(&s.val, addrs, &slots),
@@ -51,6 +53,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
                         out.push(format!("    MOVWF 0x{dst:02X}"));
                     }
                     Inst::Bin(b) => {
+                        assert_eq!(b.ty, ir::Ty::I8, "isel: only i8 binops supported");
                         let (da, aa, ba) = (
                             slot(&mut slots, &mut next, &b.dst),
                             val_addr(&b.a, addrs, &slots),
