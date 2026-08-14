@@ -8,3 +8,11 @@ fn globals_get_bank0_addresses() {
     assert_eq!(out.globals[0].addr, Some(0x20));
     assert_eq!(out.globals[1].addr, Some(0x21));
 }
+
+#[test]
+fn i16_global_advances_two_bytes() {
+    let m = parse("global a i8\nglobal b i16\nfn main() -> void\n  block entry:\n    ret void\n");
+    let out = allocate(m);
+    assert_eq!(out.globals[0].addr, Some(0x20));
+    assert_eq!(out.globals[1].addr, Some(0x22));
+}
