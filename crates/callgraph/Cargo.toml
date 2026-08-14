@@ -1,0 +1,12 @@
+[package]
+name = "callgraph"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+
+[[bin]]
+name = "callgraph"
+path = "src/bin/callgraph.rs"
