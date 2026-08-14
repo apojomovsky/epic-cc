@@ -1,0 +1,7 @@
+[toolchain]
+# "stable" is resolved and pinned by the rust-overlay entry in flake.lock, so this
+# is reproducible without hard-coding a version we then have to chase. To move the
+# toolchain deliberately, run `nix flake update rust-overlay`.
+channel = "stable"
+components = ["rustfmt", "clippy", "rust-src"]
+profile = "default"

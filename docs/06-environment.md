@@ -2,33 +2,25 @@
 
 Machine: **Ubuntu 26.04**, x86-64. Repo: `/home/alexis/projects/pic8_compiler`.
 
-## Current tool inventory (as of 2026-08-14)
+## Tooling — do not install anything system-wide
 
-| Tool | Status |
-|---|---|
-| `cmake`, `python3`, `pdftotext`, `pdfinfo`, `git`, `gh`, `curl` | **installed** |
-| `cargo` / `rustc` | **MISSING** — needed (ADR-005) |
-| `clang` / `llvm-config` | **MISSING** — needed (ADR-001) |
-| `gpasm` / `gputils` | **MISSING** — needed for the assembler cross-check oracle |
-| `gpsim` | **MISSING** — wanted as an independent simulator oracle |
-| `sdcc` | MISSING — not needed, we rejected the SDCC route |
-| `ninja` | MISSING — only needed if something wants it |
-
-### Installing what's missing
+**All build and test dependencies come from the Nix flake dev shell.** See
+[`09-build-environment.md`](09-build-environment.md) for the full picture; the short
+version:
 
 ```bash
-# Rust
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# clang (stock — see the XC8 warning below)
-sudo apt install clang lld
-
-# PIC tooling
-sudo apt install gputils gpsim
+direnv allow                     # one time, then the shell activates on `cd`
+nix develop --command cargo test # or one-shot for automation
 ```
 
-> **Verify the `clang` version's LLVM IR text format is stable enough for our parser.**
-> This is a spike concern — see [`08-status-and-next-steps.md`](08-status-and-next-steps.md).
+This provides pinned `clang` 20.1.8, `rustc`/`cargo`, `gpasm`, `cvise`, `creduce`,
+`csmith`, and `pdftotext`. Do **not** `apt install` these — a host-installed version
+shadowing the pinned one is exactly the drift the flake exists to prevent.
+
+Host-provided and used as-is: `git`, `gh`, `curl`, `nix`, `direnv`.
+
+Two things are **not** yet packaged and need their own derivations later: `gpsim` and
+`yarpgen`. Both are deferred; see [`09-build-environment.md`](09-build-environment.md).
 
 ## The XC8 install
 
@@ -67,16 +59,18 @@ oracle ([`05-verification.md`](05-verification.md)).
 
 ## Reading the reference PDFs
 
-The two books live in **`/home/alexis/Downloads/`** with long Anna's Archive filenames.
-Glob for them rather than typing the names:
+The two books live in **`vendor/books/`** (gitignored — see
+[`../vendor/README.md`](../vendor/README.md)):
 
-```bash
-ls ~/Downloads/Advanced\ Compiler\ Design*.pdf     # Muchnick, 887 pp
-ls ~/Downloads/A\ retargetable\ C\ compiler*.pdf   # Fraser & Hanson (lcc), 578 pp
+```
+vendor/books/muchnick-advanced-compiler-design-1997.pdf          887 pp
+vendor/books/fraser-hanson-retargetable-c-compiler-lcc-1995.pdf  578 pp
 ```
 
-> **Do NOT copy these into the repo.** They are copyrighted and this repo is git-tracked.
-> Reference them in place.
+> **These are gitignored deliberately.** They are copyrighted; never commit them, and never
+> move them somewhere tracked.
+
+`pdftotext` and `pdfinfo` come from the Nix shell, so run these inside `nix develop`.
 
 ### Method 1 — the `Read` tool (best for figures, tables, diagrams)
 
@@ -84,7 +78,8 @@ The `Read` tool renders PDF pages visually. Use the `pages` parameter, **max 20 
 call**:
 
 ```
-Read(file_path="/home/alexis/Downloads/Advanced Compiler Design ... .pdf", pages="380-395")
+Read(file_path="<repo>/vendor/books/muchnick-advanced-compiler-design-1997.pdf",
+     pages="380-395")
 ```
 
 Use this when the content is a figure, an algorithm listing with meaningful layout, or a
@@ -105,7 +100,7 @@ pdftotext "$BOOK" /tmp/book.txt       # extract everything
 wrongly conclude the PDF has no text layer. Normalize first:
 
 ```bash
-pdftotext ~/Downloads/Advanced\ Compiler\ Design*.pdf /tmp/muchnick.txt
+pdftotext vendor/books/muchnick-advanced-compiler-design-1997.pdf /tmp/muchnick.txt
 python3 -c "
 import unicodedata
 t = open('/tmp/muchnick.txt', encoding='utf-8', errors='replace').read()
