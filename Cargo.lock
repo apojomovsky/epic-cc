@@ -3,9 +3,44 @@
 version = 4
 
 [[package]]
+name = "alloc"
+version = "0.1.0"
+dependencies = [
+ "ir",
+]
+
+[[package]]
+name = "callgraph"
+version = "0.1.0"
+dependencies = [
+ "ir",
+]
+
+[[package]]
 name = "ir"
 version = "0.1.0"
 
 [[package]]
+name = "irparse"
+version = "0.1.0"
+dependencies = [
+ "ir",
+]
+
+[[package]]
+name = "legalize"
+version = "0.1.0"
+dependencies = [
+ "ir",
+]
+
+[[package]]
 name = "pic14-sim"
 version = "0.1.0"
+
+[[package]]
+name = "wholeprog"
+version = "0.1.0"
+dependencies = [
+ "ir",
+]
