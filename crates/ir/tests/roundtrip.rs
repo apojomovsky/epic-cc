@@ -57,6 +57,34 @@ fn gep_and_sized_globals_roundtrip() {
 }
 
 #[test]
+fn roundtrips_all_icmp_predicates_and_sext() {
+    let preds = ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"];
+    let mut insts = String::new();
+    for (i, p) in preds.iter().enumerate() {
+        insts.push_str(&format!("    %c{i} = icmp {p} i8 %a %b\n"));
+    }
+    insts.push_str("    %s = sext i8 %v to i16\n");
+    let text = format!("fn main() -> void\n  block entry:\n{insts}    ret void\n");
+    let m = parse(&text);
+    let out = serialize(&m);
+    // stable fixed point: parse -> serialize -> parse -> serialize
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    // every predicate serializes verbatim
+    for (i, p) in preds.iter().enumerate() {
+        assert!(out.contains(&format!("%c{i} = icmp {p} i8 %a %b")), "missing {p}\n---\n{out}");
+    }
+    // sext serializes canonically
+    assert!(out.contains("%s = sext i8 %v to i16"), "missing sext\n---\n{out}");
+}
+
+#[test]
+#[should_panic(expected = "unsupported icmp predicate")]
+fn rejects_unknown_icmp_predicate() {
+    parse("fn main() -> void\n  block entry:\n    %c = icmp foo i8 %a %b\n    ret void\n");
+}
+
+#[test]
 fn roundtrips_control_flow_call_and_cast() {
     let text = "fn main() -> void\n\
   block main:\n\

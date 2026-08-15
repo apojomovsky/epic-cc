@@ -212,3 +212,69 @@ fn parses_probe_control_flow_calls_and_casts() {
         other => panic!("expected Icmp, got {other:?}"),
     }
 }
+
+#[test]
+fn parses_all_icmp_predicates_and_sext() {
+    let ll = r#"
+define i16 @main() {
+  %a = sext i8 0 to i16
+  %1 = icmp eq i8 0, 1
+  %2 = icmp ne i8 0, 1
+  %3 = icmp ult i8 0, 1
+  %4 = icmp ule i8 0, 1
+  %5 = icmp ugt i8 0, 1
+  %6 = icmp uge i8 0, 1
+  %7 = icmp slt i8 0, 1
+  %8 = icmp sle i8 0, 1
+  %9 = icmp sgt i8 0, 1
+  %10 = icmp sge i8 0, 1
+  ret i16 %a
+}
+"#;
+    let m = parse_ll(ll);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert_eq!(body.len(), 12); // sext + 10 icmps + ret
+
+    match &body[0] {
+        Inst::Sext(s) => {
+            assert_eq!(s.dst, "a");
+            assert_eq!(s.from, ir::Ty::I8);
+            assert_eq!(s.val, Val::Const(0));
+            assert_eq!(s.to, ir::Ty::I16);
+        }
+        other => panic!("expected Sext, got {other:?}"),
+    }
+
+    for (idx, p) in ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"]
+        .iter()
+        .enumerate()
+    {
+        match &body[idx + 1] {
+            Inst::Icmp(i) => {
+                assert_eq!(&i.pred, p);
+                assert_eq!(i.ty, ir::Ty::I8);
+            }
+            other => panic!("expected Icmp, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn parses_sext_with_nneg_attribute() {
+    let ll = r#"
+define i16 @main() {
+  %a = sext nneg i8 0 to i16
+  ret i16 %a
+}
+"#;
+    let m = parse_ll(ll);
+    match &m.funcs[0].blocks[0].insts[0] {
+        Inst::Sext(s) => {
+            assert_eq!(s.dst, "a");
+            assert_eq!(s.from, ir::Ty::I8);
+            assert_eq!(s.val, Val::Const(0));
+            assert_eq!(s.to, ir::Ty::I16);
+        }
+        other => panic!("expected Sext, got {other:?}"),
+    }
+}

@@ -8,7 +8,7 @@
 //! `[N x i8] c"..."`). Any other opcode, or any structurally malformed input,
 //! panics loudly rather than silently misparsing.
 
-use ir::{Bin, BinOp, Block, Br, BrCond, Call, Func, Gep, Global, Icmp, Inst, Load, Module, Phi, Select, Store, Trunc, Ty, Val, Zext};
+use ir::{Bin, BinOp, Block, Br, BrCond, Call, Func, Gep, Global, Icmp, Inst, Load, Module, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
 
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
@@ -246,7 +246,7 @@ fn parse_inst(line: &str) -> Inst {
             };
             Inst::Bin(Bin { dst: dst.unwrap(), op: o, ty, a, b })
         }
-        "zext" | "trunc" => {
+        "zext" | "sext" | "trunc" => {
             let body = &rest[op.len()..];
             let to_i = body.rfind(" to ").unwrap();
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
@@ -254,16 +254,18 @@ fn parse_inst(line: &str) -> Inst {
             let from = ty_of(it.next().unwrap());
             let val = parse_val(it.next().unwrap());
             let to = ty_of(rhs);
-            if op == "zext" {
-                Inst::Zext(Zext { dst: dst.unwrap(), from, val, to })
-            } else {
-                Inst::Trunc(Trunc { dst: dst.unwrap(), from, val, to })
+            match op {
+                "zext" => Inst::Zext(Zext { dst: dst.unwrap(), from, val, to }),
+                "sext" => Inst::Sext(Sext { dst: dst.unwrap(), from, val, to }),
+                _ => Inst::Trunc(Trunc { dst: dst.unwrap(), from, val, to }),
             }
         }
         "icmp" => {
             let body = rest["icmp".len()..].trim();
             let mut it = body.split_whitespace();
             let pred = it.next().unwrap().to_string();
+            const PREDS: [&str; 10] = ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"];
+            if !PREDS.contains(&pred.as_str()) { panic!("SPIKE: unsupported icmp predicate {pred:?} in line: {line}"); }
             let ty = ty_of(it.next().unwrap());
             let a = parse_val(it.next().unwrap());
             let b = parse_val(it.next().unwrap());
