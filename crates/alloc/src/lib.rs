@@ -138,7 +138,13 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
             const_globals.insert(g.name.clone());
             continue;
         }
+        // RAM globals are byte-addressed: `place_at` takes a u8 width. Const
+        // globals are skipped above, so only RAM sizes reach here — a RAM
+        // array past 255 bytes is a parse-time error, but assert loudly
+        // anyway (defense in depth against a hand-built Module).
         let width = g.size;
+        assert!(width <= 255, "alloc: RAM global @{} too large ({width} bytes; RAM is byte-addressed, max 255)", g.name);
+        let width = width as u8;
         let start = place_at(addr, width);
         globals.insert(g.name.clone(), start);
         addr = start + u16::from(width);

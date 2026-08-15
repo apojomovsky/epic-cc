@@ -604,8 +604,14 @@ pub fn parse_ll(src: &str) -> Module {
                 let n: usize = pit.next().unwrap().parse().unwrap();
                 let elem = ty_of(pit.next().unwrap());
                 let size = n * elem.bytes() as usize;
-                assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
-                let size = size as u8;
+                // Const (flash) tables may span two 256-byte chunks (<= 511
+                // bytes); RAM globals are byte-addressed, so they stay <= 255.
+                if is_const {
+                    assert!(size <= 511, "irparse: const array @{name} too large ({size} bytes; max 511)");
+                } else {
+                    assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
+                }
+                let size = size as u16;
                 let init = rest[close + 1..].trim();
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
@@ -619,7 +625,7 @@ pub fn parse_ll(src: &str) -> Module {
                 // struct global: "%struct.S zeroinitializer, align 2" — size
                 // from the type table, bytes = zeros.
                 let info = types.get(struct_tok.trim_start_matches('%')).unwrap_or_else(|| panic!("irparse: unknown struct type {struct_tok} for @{name}"));
-                let size = info.size;
+                let size = u16::from(info.size);
                 let init = rest[struct_tok.len()..].trim().split(',').next().unwrap().trim();
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
@@ -630,7 +636,7 @@ pub fn parse_ll(src: &str) -> Module {
             } else {
                 // scalar global: "<ty> <init>[, align N]" -> type is the first token
                 let ty = ty_of(rest.split_whitespace().next().unwrap());
-                (ty, ty.bytes(), Vec::new())
+                (ty, u16::from(ty.bytes()), Vec::new())
             };
             globals.push(Global { name, ty, is_const, size, bytes, addr: None });
             continue;

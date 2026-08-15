@@ -357,6 +357,37 @@ fn sized_array_global_does_not_break_frame_overlay() {
 }
 
 #[test]
+fn const_300_byte_table_gets_no_ram_address_and_layout_unchanged() {
+    // A 300-byte const table (u16 size) gets NO RAM address (its bytes live
+    // in flash) but is recorded in const_globals; the surrounding RAM globals
+    // keep their layout exactly as if the const didn't exist.
+    let src = "global a i8\n\
+         global after i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             ret void\n";
+    let mut m = parse(src);
+    m.globals.insert(
+        1, // between `a` and `after`
+        ir::Global {
+            name: "table".into(),
+            ty: ir::Ty::I8,
+            is_const: true,
+            size: 300, // [300 x i8] const table (u16 size)
+            bytes: vec![0u8; 300],
+            addr: None,
+        },
+    );
+    let out = allocate(&m, "depth 1\n");
+    // const table: no RAM address, but listed in const_globals.
+    assert!(!out.globals.contains_key("table"), "const table must not get a RAM address");
+    assert!(out.const_globals.contains("table"), "const table must be in const_globals");
+    // RAM layout unchanged: a at 0x20, after at 0x21 (const skipped).
+    assert_eq!(out.globals["a"], 0x20);
+    assert_eq!(out.globals["after"], 0x21);
+}
+
+#[test]
 fn alloca_byval_and_sret_params_get_full_widths_params_first() {
     // A frame carrying a 4-byte alloca, a 4-byte byval param, and a 2-byte
     // sret param must size each slot to its full width (params first, then
