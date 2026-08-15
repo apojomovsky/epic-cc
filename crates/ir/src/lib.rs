@@ -232,7 +232,7 @@ fn parse_inst(line: &str) -> Inst {
         let mut it = rest.split_whitespace();
         let from = parse_ty(it.next().unwrap());
         let val = parse_val(it.next().unwrap());
-        it.next(); // "to"
+        assert_eq!(it.next().unwrap(), "to", "zext must be '%d = zext <t> <v> to <t2>'");
         let to = parse_ty(it.next().unwrap());
         return Inst::Zext(Zext { dst, from, val, to });
     }
@@ -240,7 +240,7 @@ fn parse_inst(line: &str) -> Inst {
         let mut it = rest.split_whitespace();
         let from = parse_ty(it.next().unwrap());
         let val = parse_val(it.next().unwrap());
-        it.next(); // "to"
+        assert_eq!(it.next().unwrap(), "to", "trunc must be '%d = trunc <t> <v> to <t2>'");
         let to = parse_ty(it.next().unwrap());
         return Inst::Trunc(Trunc { dst, from, val, to });
     }
@@ -255,7 +255,11 @@ fn parse_inst(line: &str) -> Inst {
     }
     if let Some(rest) = body.strip_prefix("select ") {
         let mut it = rest.split_whitespace();
-        it.next(); // "i1"
+        assert_eq!(
+            it.next().unwrap(),
+            "i1",
+            "select must be '%d = select i1 <cond> <t> <a> <t> <b>'"
+        );
         let cond = parse_val(it.next().unwrap());
         let t = parse_ty(it.next().unwrap());
         let a = parse_val(it.next().unwrap());
