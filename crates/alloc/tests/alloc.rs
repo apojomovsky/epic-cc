@@ -60,6 +60,21 @@ fn sibling_frames_share_a_base() {
 }
 
 #[test]
+fn skips_fn_lines_interspersed_with_edges() {
+    // The callgraph binary appends one `fn <name>` line per function after
+    // `depth`. The alloc parser must skip them so the documented binary-to-
+    // binary workflow keeps working.
+    let m = overlay_module();
+    let out = allocate(
+        &m,
+        "depth 2\nfn main\nfn a\nedge main a\nfn b\nedge main b\n",
+    );
+    // Same overlay result as without the fn lines: a and b share a base.
+    assert_eq!(out.locals["a::a0"], out.locals["b::b0"]);
+    assert_eq!(out.locals["a::a1"], out.locals["b::b1"]);
+}
+
+#[test]
 fn map_text_emits_global_and_local_lines() {
     let m = overlay_module();
     let out = allocate(&m, "edge main a\nedge main b\ndepth 2\n");
