@@ -2151,3 +2151,309 @@ fn byval_call_with_global_arg_simulates() {
     let seed = [(0x20u16, 3u8), (0x21, 0x00), (0x22, 0x34), (0x23, 0x12)];
     assert_eq!(sim_run(ir, &map, &seed, 0x24), 0x37, "sum(g) with g = {{3, 0x1234}}");
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 8, Task 3: mul/div/rem runtime routine bodies (isel recipes).
+// ---------------------------------------------------------------------------
+//
+// The routine Funcs are injected by legalize: params (`a`/`b`, `num`/`den`),
+// one `%__scr = alloca N` entry block, and NO `ret` — isel must emit the
+// recipe body (adapted from the machine-verified epicurus PIC16 asm) plus the
+// RETURN. Args arrive in `{func}::{param}` slots (emit_call copies them), the
+// result goes to the fixed retval slots (0x71/0x72), and working state lives
+// in `{func}::__scr` at the Task-2 contract offsets. All slot addresses must
+// stay ≤ 0xFF (bank-0, loud) — the loops are skip-sensitive.
+
+/// The injected routine signatures (ret, params, `__scr` size), mirroring
+/// legalize's injection exactly (the Task-2 contract).
+fn routine_sig(name: &str) -> (&'static str, &'static [(&'static str, &'static str)], u16) {
+    match name {
+        "__mul_u8" => ("i8", &[("a", "i8"), ("b", "i8")], 6),
+        "__mul_u16" => ("i16", &[("a", "i16"), ("b", "i16")], 14),
+        "__udiv_u8" | "__urem_u8" => ("i8", &[("num", "i8"), ("den", "i8")], 4),
+        "__udiv_u16" | "__urem_u16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
+        "__sdiv_i8" | "__srem_i8" => ("i8", &[("num", "i8"), ("den", "i8")], 5),
+        "__sdiv_i16" | "__srem_i16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
+        other => panic!("test: unknown routine {other}"),
+    }
+}
+
+/// Build the module for `name`: `main` loads two globals, calls the routine
+/// (the injected Func def is written out exactly as legalize produces it),
+/// stores the result. The address map places globals at 0x20.., main's
+/// locals at 0x25.., and the routine's params + `__scr` at 0x30.. (i8) /
+/// 0x40.. (i16) — all ≤ 0x7F, so the raw emitted asm assembles directly
+/// (bank-0 file registers only, pre-banking).
+fn routine_module(name: &str) -> (String, Vec<(String, u16)>) {
+    let (ret, params, scr) = routine_sig(name);
+    let pstr = params
+        .iter()
+        .map(|(n, t)| format!("{n}={t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ir = format!(
+        "global ina {ret}\n\
+         global inb {ret}\n\
+         global out {ret}\n\
+         fn {name}({ret}) ({pstr})\n\
+           block entry:\n\
+             %__scr = alloca {scr}\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load {ret} @ina\n\
+             %y = load {ret} @inb\n\
+             %r = call {ret} @{name}({ret} %x, {ret} %y)\n\
+             store {ret} %r @out\n\
+             ret void\n"
+    );
+    let wide = ret == "i16";
+    let (ina, inb, out, x, y, r) = if wide {
+        (0x20u16, 0x22, 0x24, 0x28, 0x2A, 0x2C)
+    } else {
+        (0x20, 0x21, 0x22, 0x25, 0x26, 0x27)
+    };
+    let mut map = vec![
+        ("ina".to_string(), ina),
+        ("inb".to_string(), inb),
+        ("out".to_string(), out),
+        ("main::x".to_string(), x),
+        ("main::y".to_string(), y),
+        ("main::r".to_string(), r),
+    ];
+    let mut base = if wide { 0x40u16 } else { 0x30 };
+    for (pn, _) in params {
+        map.push((format!("{name}::{pn}"), base));
+        base += if wide { 2 } else { 1 };
+    }
+    map.push((format!("{name}::__scr"), base));
+    (ir, map)
+}
+
+fn map_refs(map: &[(String, u16)]) -> Vec<(&str, u16)> {
+    map.iter().map(|(k, v)| (k.as_str(), *v)).collect()
+}
+
+/// Simulate the full emitted asm for a routine module with fixed operand
+/// bytes; returns the `n` result bytes at `out`.
+fn sim_run_bytes(
+    ir_text: &str,
+    map: &[(String, u16)],
+    seed: &[(u16, u8)],
+    out: u16,
+    n: usize,
+) -> Vec<u8> {
+    use pic14_sim::Pic14;
+    let m = parse(ir_text);
+    let asm = select(&m, &addrs(&map_refs(map)));
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (a, v) in seed {
+        p.ram_mut()[*a as usize] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    (0..n).map(|i| p.ram()[out as usize + i]).collect()
+}
+
+/// Every routine emits a real body — the label, recipe instructions, and a
+/// RETURN (not an empty label that would fall through into the next
+/// function). The `pats` are the load-bearing idiom strings at the contract
+/// addresses (e.g. `__mul_u8`'s `INCFSZ` carry step at t_hi = __scr+5).
+#[test]
+fn mul_div_rem_routines_emit_recipe_bodies() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "__mul_u8",
+            &[
+                "BTFSS 0x32, 0",  // bk = __scr+0, multiplier bit test
+                "ADDWF 0x34, F",  // r_lo = __scr+2
+                "INCFSZ 0x37, W", // t_hi = __scr+5: the carry idiom
+                "ADDWF 0x35, F",  // r_hi = __scr+3
+                "RLF 0x36, F",    // t_lo = __scr+4, tmp <<= 1
+                "RRF 0x32, F",    // bk >>= 1
+                "DECFSZ 0x33, F", // cnt = __scr+1, 8 iterations
+            ],
+        ),
+        (
+            "__mul_u16",
+            &[
+                "BTFSS 0x44, 0",  // bk_lo = __scr+0
+                "INCFSZ 0x4E, W", // t3 = __scr+10: 32-bit carry idiom
+                "ADDWF 0x4A, F",  // r3 = __scr+6
+                "RLF 0x4B, F",    // t0 = __scr+7
+                "RRF 0x45, F",    // bk_hi = __scr+1
+                "DECFSZ 0x46, F", // cnt = __scr+2, 16 iterations
+            ],
+        ),
+        (
+            "__udiv_u8",
+            &[
+                "RLF 0x30, F",   // num <<= 1 (dividend param = quotient accumulator)
+                "SUBWF 0x32, F", // rem_lo = __scr+0
+                "ADDLW 0x01",    // borrow fold
+                "SUBWF 0x33, F", // rem_hi = __scr+1
+                "BSF 0x30, 0",   // quotient bit into num
+                "DECFSZ 0x34, F", // cnt = __scr+2, 8 iterations
+            ],
+        ),
+        (
+            "__urem_u8",
+            &[
+                "RLF 0x30, F",
+                "SUBWF 0x32, F",
+                "ADDLW 0x01",
+                "SUBWF 0x33, F",
+                "BSF 0x30, 0", // the loop computes quotient + remainder
+                "DECFSZ 0x34, F",
+            ],
+        ),
+        (
+            "__udiv_u16",
+            &[
+                "RLF 0x40, F",   // num_lo <<= 1
+                "SUBWF 0x44, F", // rem_lo = __scr+0
+                "INCFSZ 0x43, W", // den_hi + borrow: the borrow idiom
+                "SUBWF 0x45, F", // rem_hi = __scr+1
+                "BSF 0x40, 0",   // quotient bit
+                "DECFSZ 0x46, F", // cnt = __scr+2, 16 iterations
+            ],
+        ),
+        (
+            "__urem_u16",
+            &[
+                "RLF 0x40, F",
+                "SUBWF 0x44, F",
+                "INCFSZ 0x43, W",
+                "SUBWF 0x45, F",
+                "BSF 0x40, 0",
+                "DECFSZ 0x46, F",
+            ],
+        ),
+        (
+            "__sdiv_i8",
+            &[
+                "BTFSS 0x30, 7", // num sign test
+                "COMF 0x30, F",  // |num| in the param slot
+                "BSF 0x32, 1",   // flags = __scr+0, bit1: remainder negate
+                "BSF 0x32, 0",   // bit0: quotient negate
+                "BTFSS 0x32, 0", // tail: negate the quotient
+            ],
+        ),
+        (
+            "__srem_i8",
+            &[
+                "BTFSS 0x30, 7",
+                "COMF 0x30, F",
+                "BSF 0x32, 1",
+                "BTFSS 0x32, 1", // tail: remainder sign follows dividend
+                "COMF 0x33, F",  // rem_lo = __scr+1 negated
+            ],
+        ),
+        (
+            "__sdiv_i16",
+            &[
+                "BTFSS 0x41, 7", // num_hi sign test
+                "COMF 0x40, F",  // |num| (16-bit) in place
+                "COMF 0x41, F",
+                "BSF 0x44, 1",   // flags = __scr+0
+                "BTFSS 0x44, 0",
+            ],
+        ),
+        (
+            "__srem_i16",
+            &[
+                "BTFSS 0x41, 7",
+                "COMF 0x40, F",
+                "COMF 0x41, F",
+                "BSF 0x44, 1",
+                "BTFSS 0x44, 1",
+                "COMF 0x45, F", // rem_lo = __scr+1 negated
+            ],
+        ),
+    ];
+    for &(name, pats) in cases {
+        let (ir, map) = routine_module(name);
+        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
+        assert!(
+            asm.contains(&format!("    CALL {name}")),
+            "{name} call:\n{asm}"
+        );
+        let start = asm.find(&format!("{name}:")).expect("routine label");
+        let body = &asm[start..];
+        let body = body.split("main:").next().expect("main label after routine");
+        assert!(
+            body.contains("    RETURN"),
+            "{name} body must end in RETURN, not fall through:\n{asm}"
+        );
+        for p in pats {
+            assert!(asm.contains(p), "{name} must contain `{p}`:\n{asm}");
+        }
+        assert!(
+            body.contains("INCFSZ") || body.contains("RLF") || body.contains("COMF"),
+            "{name} body looks like an empty label:\n{asm}"
+        );
+    }
+}
+
+/// The load-bearing simulation tests: each routine's emitted asm is
+/// assembled and run in pic14_sim with fixed inputs; the result bytes are
+/// asserted. A wrong carry/borrow idiom or sign-wrapper step flips a result.
+#[test]
+fn mul_div_rem_routines_simulate_correctly() {
+    // (routine, operand bytes lo..hi for a and b, expected result bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        // unsigned mul: 35*7 = 245; 200*200 lo byte = 0x40 (16-bit product 0x9C40).
+        ("__mul_u8", &[35], &[7], &[245]),
+        ("__mul_u8", &[200], &[200], &[0x40]),
+        // 16-bit mul: 300*7 = 2100 = 0x0834; 0x0105*7 = 0x0723.
+        ("__mul_u16", &[0x2C, 0x01], &[0x07, 0x00], &[0x34, 0x08]),
+        ("__mul_u16", &[0x05, 0x01], &[0x07, 0x00], &[0x23, 0x07]),
+        // unsigned divmod: 200/3 = 66 r 2; 301/7 = 43 r 0.
+        ("__udiv_u8", &[200], &[3], &[66]),
+        ("__urem_u8", &[200], &[3], &[2]),
+        ("__udiv_u16", &[0x2D, 0x01], &[0x07, 0x00], &[0x2B, 0x00]),
+        ("__urem_u16", &[0x2D, 0x01], &[0x07, 0x00], &[0x00, 0x00]),
+        // signed: -128/-2 = 64; -5%3 = -2 = 0xFE; -19/-3 = 6; -19%3 = -1.
+        ("__sdiv_i8", &[0x80], &[0xFE], &[0x40]),
+        ("__srem_i8", &[0xFB], &[0x03], &[0xFE]),
+        ("__sdiv_i16", &[0xED, 0xFF], &[0xFD, 0xFF], &[0x06, 0x00]),
+        ("__srem_i16", &[0xED, 0xFF], &[0x03, 0x00], &[0xFF, 0xFF]),
+        // Div-by-zero is LLVM poison (documented, no guard): den = 0 makes
+        // every subtract succeed, so the quotient accumulates all-ones
+        // (0xFFFF) and the remainder is never reduced — it ends up equal to
+        // the dividend (the shifted-out bits accumulate back into rem). Any
+        // value is legal; the observed deterministic results are pinned.
+        ("__udiv_u16", &[0x05, 0x00], &[0x00, 0x00], &[0xFF, 0xFF]),
+        ("__urem_u16", &[0x05, 0x00], &[0x00, 0x00], &[0x05, 0x00]),
+    ];
+    for &(name, x, y, want) in cases {
+        let (ir, map) = routine_module(name);
+        let (ret, _, _) = routine_sig(name);
+        let wide = ret == "i16";
+        let (ina, inb, out) = if wide { (0x20, 0x22, 0x24) } else { (0x20, 0x21, 0x22) };
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((ina + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((inb + i as u16, *b));
+        }
+        let got = sim_run_bytes(&ir, &map, &seed, out, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) must be {want:?}");
+    }
+}
+
+/// A routine slot past 0xFF would need BANKSELs inserted inside the
+/// skip-sensitive recipe loops — loud assert, never a silent miscompile.
+#[test]
+#[should_panic(expected = "bank-0")]
+fn panics_on_banked_routine_slot() {
+    let (ir, mut map) = routine_module("__mul_u8");
+    for (k, v) in map.iter_mut() {
+        if k == "__mul_u8::__scr" {
+            *v = 0x120;
+        }
+    }
+    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+}

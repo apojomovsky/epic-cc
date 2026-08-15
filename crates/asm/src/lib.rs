@@ -103,6 +103,13 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
         v as u16 & 0x7F
     };
+    // Destination bit for the two-operand file ops (`f, W` / `f, F`): W = 0,
+    // F = 1. An absent destination defaults to W, matching the encoding this
+    // assembler always produced before destinations were parsed.
+    let d = match parts.get(2).map(|s| s.trim().to_ascii_uppercase()).as_deref() {
+        Some("F") => 1,
+        _ => 0,
+    };
     match mne.as_str() {
         "NOP" => 0x0000,
         "RETURN" => 0x0008,
@@ -110,12 +117,18 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         "CLRWDT" => 0x0064,
         "MOVWF" => 0x0080 | f(op),
         "CLRF" => 0x0180 | f(op),
-        "MOVF" => 0x0800 | f(op),
-        "ADDWF" => 0x0700 | f(op),
-        "SUBWF" => 0x0200 | f(op),
-        "ANDWF" => 0x0500 | f(op),
-        "IORWF" => 0x0400 | f(op),
-        "XORWF" => 0x0600 | f(op),
+        "MOVF" => 0x0800 | (d << 7) | f(op),
+        "ADDWF" => 0x0700 | (d << 7) | f(op),
+        "SUBWF" => 0x0200 | (d << 7) | f(op),
+        "ANDWF" => 0x0500 | (d << 7) | f(op),
+        "IORWF" => 0x0400 | (d << 7) | f(op),
+        "XORWF" => 0x0600 | (d << 7) | f(op),
+        "COMF" => 0x0900 | (d << 7) | f(op),
+        "INCF" => 0x0A00 | (d << 7) | f(op),
+        "DECFSZ" => 0x0B00 | (d << 7) | f(op),
+        "RRF" => 0x0C00 | (d << 7) | f(op),
+        "RLF" => 0x0D00 | (d << 7) | f(op),
+        "INCFSZ" => 0x0F00 | (d << 7) | f(op),
         "MOVLW" => 0x3000 | parse_lit(op, sym) as u16,
         "ADDLW" => 0x3E00 | parse_lit(op, sym) as u16,
         "ANDLW" => 0x3900 | parse_lit(op, sym) as u16,
