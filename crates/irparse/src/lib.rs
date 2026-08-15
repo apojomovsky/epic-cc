@@ -126,7 +126,9 @@ pub fn parse_ll(src: &str) -> Module {
                 let mut pit = inner.split('x').map(|s| s.trim());
                 let n: usize = pit.next().unwrap().parse().unwrap();
                 let elem = ty_of(pit.next().unwrap());
-                let size = n as u8 * elem.bytes();
+                let size = n * elem.bytes() as usize;
+                assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
+                let size = size as u8;
                 let init = rest[close + 1..].trim();
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
