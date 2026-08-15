@@ -26,7 +26,7 @@ fn strip_attrs(s: &str) -> String {
             continue;
         }
         match tok {
-            "noundef" | "nsw" | "nuw" | "nneg" | "volatile" | "tail" | "fastcc" | "inbounds"
+            "noundef" | "nsw" | "nuw" | "nneg" | "samesign" | "volatile" | "tail" | "fastcc" | "inbounds"
             | "dso_local" | "local_unnamed_addr" | "internal" | "unnamed_addr" | "zeroext"
             | "signext" | "disjoint" => continue,
             _ => {}
