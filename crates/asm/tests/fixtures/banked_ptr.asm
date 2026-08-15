@@ -1,0 +1,206 @@
+; pic8 -- integer spine milestone 2 (isel)
+    list p=16f877a
+    radix hex
+STATUS equ 0x03
+FSR    equ 0x04
+INDF   equ 0x00
+PCL    equ 0x02
+
+    org 0x0000
+    goto __start
+
+mk:
+    BSF STATUS, 5
+    BSF STATUS, 6
+    BTFSC 0x51, 0
+    BSF STATUS, 7
+    BTFSS 0x51, 0
+    BCF STATUS, 7
+    MOVF 0x50, W
+    ADDLW 0x00
+    MOVWF FSR
+    MOVLW 0x05
+    MOVWF INDF
+    BTFSC 0x51, 0
+    BSF STATUS, 7
+    BTFSS 0x51, 0
+    BCF STATUS, 7
+    MOVF 0x50, W
+    ADDLW 0x01
+    MOVWF FSR
+    MOVLW 0x06
+    MOVWF INDF
+    RETURN
+
+main:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x20, W
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x33
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x21, W
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x34
+    MOVF 0x33, W
+    ANDLW 0x03
+    MOVWF 0x35
+    MOVF 0x34, W
+    ANDLW 0x00
+    MOVWF 0x36
+    MOVLW 0x01
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x22
+    BCF STATUS, 7
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVF 0x35, W
+    ADDLW 0xA0
+    MOVWF FSR
+    MOVLW 0x11
+    MOVWF INDF
+    MOVLW 0x02
+    BCF STATUS, 6
+    MOVWF 0x30
+    BSF STATUS, 7
+    BSF STATUS, 6
+    MOVF 0x35, W
+    ADDLW 0x20
+    MOVWF FSR
+    MOVLW 0x22
+    MOVWF INDF
+    MOVLW 0x04
+    BCF STATUS, 5
+    MOVWF 0x30
+    BSF STATUS, 7
+    BSF STATUS, 5
+    MOVF 0x35, W
+    ADDLW 0xA0
+    MOVWF FSR
+    MOVLW 0x33
+    MOVWF INDF
+    BCF STATUS, 7
+    MOVF 0x35, W
+    ADDLW 0xA0
+    MOVWF FSR
+    MOVF INDF, W
+    MOVWF 0x37
+    BSF STATUS, 7
+    MOVF 0x35, W
+    ADDLW 0x20
+    MOVWF FSR
+    MOVF INDF, W
+    MOVWF 0x38
+    MOVF 0x37, W
+    ADDWF 0x38, W
+    MOVWF 0x39
+    BSF STATUS, 7
+    MOVF 0x35, W
+    ADDLW 0xA0
+    MOVWF FSR
+    MOVF INDF, W
+    MOVWF 0x3A
+    MOVF 0x3A, W
+    ADDWF 0x39, W
+    MOVWF 0x3B
+    MOVF 0x3B, W
+    MOVWF 0x30
+    BCF STATUS, 7
+    MOVF 0x35, W
+    ADDLW 0xA0
+    MOVWF FSR
+    MOVF INDF, W
+    MOVWF 0x3C
+    BSF STATUS, 7
+    MOVF 0x35, W
+    ADDLW 0x20
+    MOVWF FSR
+    MOVF INDF, W
+    MOVWF 0x3D
+    MOVF 0x3C, W
+    ADDWF 0x3D, W
+    MOVWF 0x3E
+    BSF STATUS, 7
+    MOVF 0x35, W
+    ADDLW 0xA0
+    MOVWF FSR
+    MOVF INDF, W
+    MOVWF 0x3F
+    MOVF 0x3F, W
+    ADDWF 0x3E, W
+    MOVWF 0x40
+    MOVF 0x40, W
+    MOVWF 0x30
+    MOVLW 0x07
+    BCF STATUS, 6
+    MOVWF 0x21
+    MOVF 0x21, W
+    BSF STATUS, 6
+    MOVWF 0x41
+    MOVF 0x41, W
+    BCF STATUS, 5
+    MOVWF 0x25
+    BSF STATUS, 5
+    MOVF 0x30, W
+    MOVWF 0x42
+    BCF STATUS, 5
+    MOVF 0x25, W
+    BSF STATUS, 5
+    MOVWF 0x43
+    MOVF 0x42, W
+    ADDWF 0x43, W
+    MOVWF 0x44
+    MOVF 0x44, W
+    MOVWF 0x30
+    MOVLW 0xB1
+    MOVWF 0x50
+    MOVLW 0x01
+    MOVWF 0x51
+    CALL mk
+    MOVF 0x31, W
+    MOVWF 0x45
+    MOVF 0x32, W
+    MOVWF 0x46
+    MOVF 0x30, W
+    MOVWF 0x47
+    MOVF 0x45, W
+    ADDWF 0x46, W
+    MOVWF 0x48
+    MOVF 0x47, W
+    ADDWF 0x48, W
+    MOVWF 0x49
+    MOVF 0x49, W
+    MOVWF 0x30
+    BCF STATUS, 5
+    MOVF 0x22, W
+    BSF STATUS, 5
+    MOVWF 0x4A
+    MOVF 0x4A, W
+    MOVWF 0x4B
+    CLRF 0x4C
+    BSF STATUS, 7
+    MOVF 0x4B, W
+    ADDLW 0xA0
+    MOVWF FSR
+    MOVLW 0x40
+    MOVWF INDF
+    MOVF 0x30, W
+    MOVWF 0x4D
+    MOVF 0x20, W
+    MOVWF 0x4E
+    MOVF 0x4D, W
+    ADDWF 0x4E, W
+    MOVWF 0x4F
+    MOVF 0x4F, W
+    MOVWF 0x30
+    RETURN
+
+__start:
+    CALL main
+    SLEEP
+
+    end
