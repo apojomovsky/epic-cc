@@ -33,6 +33,7 @@ fn alloc_slot(
     key: &str,
     ty: Ty,
     scratch: u8,
+    retval_lo: u8,
     bank0_start: u8,
 ) -> u8 {
     if let Some(&a) = slots.get(key) {
@@ -47,11 +48,15 @@ fn alloc_slot(
     if *next + n - 1 > 0x7F {
         *next = bank0_start;
     }
-    // The fixed icmp scratch byte lives just past the globals. Never let a
-    // slot's lo or hi byte land on it, or an icmp in the same function would
-    // silently corrupt that slot.
+    // The fixed icmp scratch byte and the two retval bytes live just past
+    // the globals. Never let a slot's lo or hi byte land on any of them, or
+    // an icmp / a callee's Ret in the same function would silently corrupt
+    // that slot.
     if scratch >= *next && scratch < *next + n {
         *next = scratch.wrapping_add(1);
+    }
+    if retval_lo >= *next && retval_lo < *next + n {
+        *next = retval_lo.wrapping_add(2);
     }
     let a = *next;
     *next = next.wrapping_add(n);
@@ -92,6 +97,7 @@ impl<'m> Gen<'m> {
             &key,
             ty,
             self.scratch,
+            self.retval_lo,
             self.bank0_start,
         )
     }
@@ -520,7 +526,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
     for f in &m.funcs {
         for (ty, name) in &f.params {
             let key = ssa_key(&f.name, name);
-            alloc_slot(&mut slots, &mut next, &key, *ty, scratch, bank0_start);
+            alloc_slot(&mut slots, &mut next, &key, *ty, scratch, retval_lo, bank0_start);
         }
     }
     for f in &m.funcs {
