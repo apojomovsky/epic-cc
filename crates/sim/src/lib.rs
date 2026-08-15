@@ -127,8 +127,8 @@ impl Pic14 {
     // the common region 0x70-0x7F is mirrored in all banks and ignores IRP.
     fn indirect_addr(&self) -> usize {
         let fsr = self.ram[0x04] as usize;
-        if fsr >= 0x70 {
-            fsr // common region
+        if (0x70..=0x7F).contains(&fsr) {
+            fsr // common region (0x70-0x7F), mirrored in all banks
         } else {
             let base = if self.ram[3] & 0x80 != 0 { 0x100 } else { 0 };
             base + fsr
