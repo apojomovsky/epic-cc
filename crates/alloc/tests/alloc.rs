@@ -146,6 +146,53 @@ fn frame_spans_across_banks() {
 }
 
 #[test]
+fn callee_base_follows_callers_physical_frame_end() {
+    // main (1 i8 local) calls a, which carries 90 i8 locals that spill across
+    // the bank-0/1 gap (0x21..0x6F then 0xA0..0xAA); a calls b. b's overlay
+    // base must be a's PHYSICAL frame end (0xAB, just past a's last local) —
+    // not the virtual sum base(a) + locals_size(a) = 0x7B, which lands in the
+    // common-RAM gap and would place b at 0xA0, exactly where a's spill
+    // locals live while both frames are live during the call.
+    let mut src = String::from(
+        "fn main() -> void\n\
+           block entry:\n\
+             %m0 = add i8 1, 2\n\
+             call void @a()\n\
+             ret void\n\
+         fn a() -> void\n\
+           block entry:\n",
+    );
+    for i in 0..90 {
+        src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
+    }
+    src.push_str(
+        "    call void @b()\n\
+           ret void\n\
+         fn b() -> void\n\
+           block entry:\n\
+             %b0 = add i8 1, 2\n\
+             ret void\n",
+    );
+    let m = parse(&src);
+    let out = allocate(&m, "edge main a\nedge a b\n");
+    // main's frame: base 0x20, its local at 0x20, physical end 0x21.
+    assert_eq!(out.locals["main::m0"], 0x20);
+    // a's frame starts right after main's physical end and crosses the bank
+    // gap: v0..v78 in bank 0 (0x21..0x6F), v79..v89 in bank 1 (0xA0..0xAA).
+    assert_eq!(out.locals["a::v0"], 0x21);
+    assert_eq!(out.locals["a::v78"], 0x6F);
+    assert_eq!(out.locals["a::v79"], 0xA0);
+    assert_eq!(out.locals["a::v89"], 0xAA);
+    // b's base is a's physical frame end (0xAB): b's local starts strictly
+    // after a's last placed local, not at 0xA0 where a's spill locals live.
+    assert_eq!(out.locals["b::b0"], 0xAB);
+    assert!(
+        out.locals["b::b0"] > out.locals["a::v89"],
+        "b's frame overlaps a's spill locals in bank 1"
+    );
+}
+
+#[test]
 fn i16_globals_stay_even_aligned_across_banks() {
     // 80 i8 globals fill bank 0 (0x20-0x6F); the next i16 must land on an
     // even address in bank 1 (0xA0, not 0xA1).

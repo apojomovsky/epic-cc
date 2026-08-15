@@ -2,9 +2,10 @@
 //!
 //! Globals get sequential, even-aligned (i16) addresses starting at
 //! `GLOBAL_START`. Every local of every function lives in a frame assigned
-//! from the call graph: `base(f) = max over callers of (base(caller) +
-//! locals_size(caller))`, roots start after the globals, so sibling functions
-//! (never co-live) share RAM.
+//! from the call graph: `base(f) = max over callers of the caller's
+//! **physical** frame end` (the address just past its last placed local,
+//! bank crossings included — see `frame_end`), roots start after the
+//! globals, so sibling functions (never co-live) share RAM.
 //!
 //! Both allocators assign **physical** addresses and step through the four
 //! banks: bank 0 GPR `0x20-0x6F`, bank 1 `0xA0-0xEF`, bank 2 `0x120-0x16F`,
@@ -67,11 +68,11 @@ fn place_at(addr: u16, width: u8) -> u16 {
 /// The start address for a `width`-byte local placed contiguously at the next
 /// free frame byte `addr`: step across banks when `addr` has passed a
 /// region's end, and panic past `0x1EF`. Locals are NOT even-aligned — the
-/// overlay frame math (M3) is a plain byte sum `base(f) = max(callers) of
-/// base + locals_size`, so placing locals contiguously keeps a frame's actual
-/// footprint exactly equal to `locals_size(f)`. The bank progression starts
-/// every region on an even address, so i16s placed there are naturally
-/// even-aligned within each bank.
+/// overlay frame math (M3) is a plain byte sum, so placing locals contiguously
+/// keeps a frame's virtual footprint exactly equal to `locals_size(f)`, and a
+/// caller's physical end (see `frame_end`) is the address its callees' bases
+/// are derived from. The bank progression starts every region on an even
+/// address, so i16s placed there are naturally even-aligned within each bank.
 fn place_contiguous(addr: u16, width: u8) -> u16 {
     let mut a = addr;
     loop {
@@ -81,6 +82,30 @@ fn place_contiguous(addr: u16, width: u8) -> u16 {
             return base;
         }
         // The local doesn't fit in this region; continue past its end.
+        a = end + 1;
+    }
+}
+
+/// The physical address just past a frame of `size` local bytes placed
+/// contiguously at `base` (stepping through the bank regions the same way
+/// `place_contiguous` does). A frame whose locals spill past a region end
+/// occupies every byte up to that end *plus* the spill bytes in the next
+/// bank, so its physical end is beyond the virtual sum `base + size` — and a
+/// callee overlaid on that virtual sum could land inside a bank gap at the
+/// start of the next region, exactly where the caller's spill locals live
+/// while both frames are live. The overlay constraint must therefore be
+/// expressed on this physical end.
+fn frame_end(base: u16, size: u16) -> u16 {
+    let mut a = base;
+    let mut remaining = size;
+    loop {
+        let (start, end) = region_for(a);
+        let here = a.max(start);
+        let space = u16::from(end + 1 - here);
+        if remaining <= space {
+            return here + remaining;
+        }
+        remaining -= space;
         a = end + 1;
     }
 }
@@ -232,8 +257,14 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         depth_end.insert(f.clone(), locals_size[f] + deepest);
     }
 
-    // 6. base(f) = max over direct callers of (base + locals_size); roots at
-    // bank0_start. Forward topo order: every caller precedes its callees.
+    // 6. base(f) = max over direct callers of the caller's PHYSICAL frame
+    // end (the address just past its last placed local, bank crossings
+    // included); roots at bank0_start. Forward topo order: every caller
+    // precedes its callees. The virtual sum base(p) + locals_size[p] is NOT
+    // used: a caller whose frame spills past a bank region end ends beyond
+    // that sum, and a callee based on it could land in the gap at the next
+    // region's start — exactly where the caller's spill locals live while
+    // both frames are live.
     let mut callers: HashMap<String, Vec<String>> = HashMap::new();
     for (p, cs) in &edges {
         for c in cs {
@@ -245,7 +276,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         let b = match callers.get(f) {
             Some(ps) => ps
                 .iter()
-                .map(|p| base[p] + locals_size[p])
+                .map(|p| frame_end(base[p], locals_size[p]))
                 .max()
                 .expect("alloc: empty caller list"),
             None => bank0_start,
