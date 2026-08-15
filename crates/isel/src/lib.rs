@@ -29,7 +29,10 @@
 //! windows `[0x20,0x80)` `[0xA0,0xF0)` `[0x120,0x170)` `[0x1A0,0x1F0)` —
 //! crossing an SFR hole would silently mis-address, so it panics loudly at
 //! emission (the object span comes from the global size / param width /
-//! alloca size).
+//! alloca size). An *indirect* (sret) base sets IRP from the stored
+//! address's high byte (`BTFSC/BTFSS <slot+1>,0; BSF/BCF STATUS,7`) before
+//! computing `FSR = [slot] + k + off`, so sret targets may sit in any bank
+//! (the caller's sret store checks the target's window the same way).
 //!
 //! Every value's address comes from the caller-supplied address map: globals
 //! by name, locals by `{func}::{name}` (IR value names without `%`). isel
@@ -385,15 +388,26 @@ impl<'m> Gen<'m> {
     }
 
     /// Indirect (sret) FSR setup: `FSR = [slot] + k + byte_off + Σ terms`.
-    /// The slot holds the target address (the caller's sret ABI asserts it
-    /// ≤ 0xFF when it is stored); the static k + off must fit the ADDLW
-    /// literal.
+    /// The slot holds the target address (the caller stores LOW then HIGH
+    /// of it into the two slot bytes), so IRP is set from the stored HIGH
+    /// byte BEFORE the FSR computation: bit 0 of `<slot+1>` is the
+    /// address's bit 8 — 1 -> IRP=1 (banks 2/3), 0 -> IRP=0 (banks 0/1).
+    /// Exactly one of the pair fires: BTFSC skips the BSF when the bit is
+    /// 0, BTFSS skips the BCF when it is 1, so IRP always matches the
+    /// stored address. IRP is set on EVERY indirect FSR setup (a prior
+    /// bank-2/3 target leaves STATUS bit 7 = 1). The static k + off must
+    /// fit the ADDLW literal.
     fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
             "isel: indirect offset k {k} + off {byte_off} out of byte range"
         );
+        let hi = slot_addr + 1;
+        self.emit(format!("    BTFSC 0x{hi:02X}, 0"));
+        self.emit("    BSF STATUS, 7".to_string());
+        self.emit(format!("    BTFSS 0x{hi:02X}, 0"));
+        self.emit("    BCF STATUS, 7".to_string());
         if terms.is_empty() {
             self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
             self.emit(format!("    ADDLW 0x{kk:02X}"));
@@ -836,35 +850,39 @@ impl<'m> Gen<'m> {
             } else if arg.sret {
                 // sret: store the target address into the callee's sret param
                 // slot (2 bytes). The target is a global or a plain alloca
-                // slot; FSR reaches only the low 256 bytes (bank 0 — IRP is a
-                // later milestone), so a target past 0xFF fails loudly rather
-                // than emitting an address FSR cannot reach.
+                // slot; the callee reaches it through FSR+IRP, so the target
+                // object must fit entirely inside one GPR window — a span
+                // crossing an SFR hole would silently mis-address (the same
+                // loud rule as static FSR bases). The MOVLW LOW/HIGH store
+                // emits both address bytes unchanged.
                 assert!(
                     callee.params[i].sret,
                     "isel: sret arg for a non-sret param"
                 );
-                let addr = match &arg.val {
-                    Val::Global(g) => self.global_addr(g),
+                let (addr, span) = match &arg.val {
+                    Val::Global(g) => (
+                        self.global_addr(g),
+                        self.object_span(&Base::Global(g.clone())),
+                    ),
                     Val::Reg(r) => {
                         let (base, k, terms) = self.resolved_for(r);
                         assert!(
                             k == 0 && terms.is_empty(),
                             "isel: sret target must be a plain global or alloca slot (no offset)"
                         );
-                        match base {
-                            Base::Global(name) => self.global_addr(&name),
-                            Base::Slot(sname, false) => self.slot_addr(self.cur_func, &sname),
+                        let addr = match &base {
+                            Base::Global(name) => self.global_addr(name),
+                            Base::Slot(sname, false) => self.slot_addr(self.cur_func, sname),
                             Base::Slot(_, true) => {
                                 panic!("isel: sret target cannot be an indirect (sret) slot")
                             }
-                        }
+                        };
+                        let span = self.object_span(&base);
+                        (addr, span)
                     }
                     Val::Const(_) => panic!("isel: sret target must be a global or an alloca slot"),
                 };
-                assert!(
-                    addr <= 0xFF,
-                    "isel: sret target 0x{addr:02X} out of bank-0 FSR range (IRP follow-up)"
-                );
+                fsr_window(addr, span);
                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                 self.emit(format!("    MOVWF 0x{:02X}", pa));
                 self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));

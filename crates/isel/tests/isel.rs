@@ -821,7 +821,9 @@ fn gep_scaled_multi_term_reloads_w_per_repetition() {
 fn sret_param_store_is_indirect_via_slot_contents() {
     // An sret param slot holds the *target address*; a store through it
     // must set FSR from the slot's contents — never treat the slot itself
-    // as the destination.
+    // as the destination. M9: IRP is set from the stored HIGH byte first
+    // (slot+1 = 0x27 here), so INDF lands in the right half of memory even
+    // for a bank-2/3 target.
     let m = parse(
         "global v i8\nfn make(i8) (r=sret)\n  block entry:\n\
            %x = load i8 @v\n    %p = gep %r +0\n    store i8 %x %p\n    ret void\n",
@@ -830,8 +832,11 @@ fn sret_param_store_is_indirect_via_slot_contents() {
     let addrs = addrs(&[("v", 0x20), ("make::x", 0x25), ("make::r", 0x26)]);
     let asm = select(&m, &addrs);
     assert!(
-        asm.contains("MOVF 0x26, W\n    ADDLW 0x00\n    MOVWF FSR\n    MOVF 0x25, W\n    MOVWF INDF"),
-        "FSR comes from the slot contents [r_lo] + k:\n{asm}"
+        asm.contains(
+            "BTFSC 0x27, 0\n    BSF STATUS, 7\n    BTFSS 0x27, 0\n    BCF STATUS, 7\n    \
+             MOVF 0x26, W\n    ADDLW 0x00\n    MOVWF FSR\n    MOVF 0x25, W\n    MOVWF INDF"
+        ),
+        "IRP from the stored hi byte, then FSR from the slot contents [r_lo] + k:\n{asm}"
     );
 }
 
@@ -2159,17 +2164,73 @@ fn sret_call_with_global_target_stores_global_address() {
 }
 
 #[test]
-#[should_panic(expected = "bank-0")]
-fn panics_on_banked_sret_target() {
-    // The sret target must be FSR-reachable (low 256 bytes; IRP is a later
-    // milestone): a target past 0xFF fails loudly rather than emitting an
-    // address FSR cannot reach.
+#[should_panic(expected = "outside GPR space")]
+fn panics_on_sret_target_outside_gpr() {
+    // M9: the sret target may sit in any bank — the callee reaches it via
+    // FSR+IRP — but it must still be a GPR address inside one of the four
+    // windows. A target past bank 3 (0x200) fails loudly rather than
+    // emitting an address FSR/IRP cannot reach.
     let m = parse(
         "fn make(void) (r=sret)\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n\
            %1 = alloca 4\n    call void @make(sret %1)\n    ret void\n",
     );
-    let addrs = addrs(&[("main::1", 0x120), ("make::r", 0x2F)]);
+    let addrs = addrs(&[("main::1", 0x200), ("make::r", 0x2F)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn sret_banked_target_emits_low_high_store_and_irp_dance() {
+    // M9: an sret target in bank 2 (alloca at 0x120). The caller stores
+    // BOTH address bytes (MOVLW 0x20; MOVWF r; MOVLW 0x01; MOVWF r+1) and
+    // the callee's indirect stores set IRP from the stored HIGH byte
+    // (BTFSC r+1,0; BSF STATUS,7; BTFSS r+1,0; BCF STATUS,7) before
+    // computing FSR = [r] + k — 0x120 -> IRP=1, FSR=0x20.
+    let m = parse(
+        "fn make(void) (r=sret)\n  block entry:\n\
+           store i8 18 %r\n\
+           %p = gep %r +2\n\
+           store i16 4660 %p\n\
+           ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           %buf = alloca 4\n\
+           call void @make(sret %buf)\n\
+           ret void\n",
+    );
+    // make's frame: r (sret, 2 bytes)=0x2E; main's frame: %buf=0x120.
+    let addrs = addrs(&[("make::r", 0x2E), ("main::buf", 0x120)]);
+    let asm = select(&m, &addrs);
+    assert!(
+        asm.contains("MOVLW 0x20\n    MOVWF 0x2E\n    MOVLW 0x01\n    MOVWF 0x2F"),
+        "caller stores LOW then HIGH of the 0x120 target:\n{asm}"
+    );
+    assert!(
+        asm.contains("BTFSC 0x2F, 0\n    BSF STATUS, 7\n    BTFSS 0x2F, 0\n    BCF STATUS, 7"),
+        "callee sets IRP from the stored hi byte (0x01 -> IRP=1):\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0x2E, W\n    ADDLW 0x00\n    MOVWF FSR"),
+        "FSR = [r] + k unchanged:\n{asm}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "crosses window end 0x170")]
+fn panics_on_sret_target_crossing_window() {
+    // M9: the sret target object must fit entirely inside one GPR window —
+    // the callee reaches it through FSR+IRP and a span crossing an SFR hole
+    // would silently mis-address, so the caller's window check fails
+    // loudly. A 32-byte alloca at 0x160 (the last GPR byte of bank 2 is
+    // 0x16F) reaches 0x180, crossing the 0x170 hole. (The plan brief's
+    // "alloca at 0x130 size 16" example does not actually cross — 0x130 +
+    // 16 = 0x140 fits inside bank 2 — so this uses a base whose span
+    // genuinely crosses the window end.)
+    let m = parse(
+        "fn make(void) (r=sret)\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = alloca 32\n    call void @make(sret %1)\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::1", 0x160), ("make::r", 0x2F)]);
     let _ = select(&m, &addrs);
 }
 
@@ -2278,6 +2339,62 @@ fn sret_call_make_simulates() {
     assert_eq!(p.ram()[0x20], 0x12, "oa = r.a");
     assert_eq!(p.ram()[0x21], 0x34, "ob lo = r.b lo");
     assert_eq!(p.ram()[0x22], 0x12, "ob hi = r.b hi");
+}
+
+#[test]
+fn sret_call_into_banked_alloca_simulates() {
+    // M9 load-bearing: a full sret call whose target alloca sits in bank 2
+    // (0x120) or bank 3 (0x1A0). The caller stores LOW+HIGH of the target
+    // into the callee's sret slot; the callee writes both struct bytes
+    // through the indirect pointer (IRP set from the stored hi byte), and
+    // the caller reads them back through FSR — a dynamic GEP keeps the
+    // read side on FSR/INDF too, since a direct read of banked RAM would
+    // need BANKSEL (a later milestone; the Task-1 SIM tests keep the same
+    // FSR-only discipline). Assert both struct bytes: r.a = 0x12,
+    // r.b = 0x1234. With the IRP-from-hi-byte path missing, the callee's
+    // INDF writes hit 0x20/0x22 (bank 0) and the reads come back 0x00.
+    let ir = "global in i8\nglobal oa i8\nglobal ob i16\n\
+         fn make(void) (r=sret)\n  block entry:\n\
+           store i8 18 %r\n\
+           %p = gep %r +2\n\
+           store i16 4660 %p\n\
+           ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           %buf = alloca 4\n\
+           call void @make(sret %buf)\n\
+           %i = load i8 @in\n\
+           %pa = gep %buf +0 +1*%i\n\
+           %a = load i8 %pa\n\
+           %q = gep %buf +2 +1*%i\n\
+           %b = load i16 %q\n\
+           store i8 %a @oa\n\
+           store i16 %b @ob\n\
+           ret void\n";
+    // in=0x20 (seeded 0), oa=0x21, ob=0x22 (i16); make::r=0x25 (2 bytes);
+    // main's frame: %buf=target (bank 2/3), %i=0x29, %a=0x2A, %b=0x2B.
+    for (target, name) in [(0x120u16, "bank 2"), (0x1A0, "bank 3")] {
+        let map = [
+            ("in", 0x20u16),
+            ("oa", 0x21),
+            ("ob", 0x22),
+            ("make::r", 0x25),
+            ("main::buf", target),
+            ("main::i", 0x29),
+            ("main::a", 0x2A),
+            ("main::b", 0x2B),
+        ];
+        use pic14_sim::Pic14;
+        let m = parse(ir);
+        let asm = select(&m, &addrs(&map));
+        let words = asm::assemble(&asm);
+        let mut p = Pic14::new(words);
+        p.ram_mut()[0x20] = 0; // %i = 0: read the struct at its base
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt ({name}):\n{asm}");
+        assert_eq!(p.ram()[0x21], 0x12, "oa = r.a ({name})");
+        assert_eq!(p.ram()[0x22], 0x34, "ob lo = r.b lo ({name})");
+        assert_eq!(p.ram()[0x23], 0x12, "ob hi = r.b hi ({name})");
+    }
 }
 
 #[test]
