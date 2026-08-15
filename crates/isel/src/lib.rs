@@ -298,35 +298,94 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `d = a & b` for i16: an AND per byte.
-    fn emit_and16(&mut self, a: &Val, b: &Val, dst: u16) {
+    /// `d = a OP b` bytewise, for the commutative binops and/or/xor at i8 or
+    /// i16. One operand is a register (the file operand), the other a
+    /// register or const; a const LHS is swapped to the RHS so the literal
+    /// path (`opw`) is used, never reading a const as a file-register
+    /// address. `op` is the reg-file mnemonic (`ANDWF`/`IORWF`/`XORWF`),
+    /// `opw` the literal mnemonic (`ANDLW`/`IORLW`/`XORLW`).
+    fn emit_commutative(&mut self, a: &Val, b: &Val, ty: Ty, dst: u16, op: &str, opw: &str) {
+        let n = ty.bytes();
         let (reg, other) = match (a, b) {
             (Val::Reg(r), o) => (r.clone(), o),
             (o, Val::Reg(r)) => (r.clone(), o),
-            _ => panic!("isel: and16 needs a register operand"),
+            _ => panic!("isel: {op} needs a register operand"),
         };
         let ra = self.val_addr(&Val::Reg(reg));
         match other {
             Val::Reg(rb) => {
                 let bb = self.val_addr(&Val::Reg(rb.clone()));
-                self.emit(format!("    MOVF 0x{bb:02X}, W"));
-                self.emit(format!("    ANDWF 0x{ra:02X}, W"));
-                self.emit(format!("    MOVWF 0x{dst:02X}"));
-                self.emit(format!("    MOVF 0x{:02X}, W", bb + 1));
-                self.emit(format!("    ANDWF 0x{:02X}, W", ra + 1));
-                self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+                for i in 0..n {
+                    self.emit(format!("    MOVF 0x{:02X}, W", bb + u16::from(i)));
+                    self.emit(format!("    {op} 0x{:02X}, W", ra + u16::from(i)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                }
             }
+            Val::Const(k) => {
+                for i in 0..n {
+                    let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVF 0x{:02X}, W", ra + u16::from(i)));
+                    self.emit(format!("    {opw} 0x{byte:02X}"));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                }
+            }
+            Val::Global(_) => panic!("isel: {op} with a global operand"),
+        }
+    }
+
+    /// `d = a - b` for i8: the subtrahend (reg or const) goes in W and SUBWF
+    /// subtracts it from the minuend — SUBWF f,W always computes f - W, so
+    /// `a` is the file operand. A const LHS is rejected by the caller (sub
+    /// is not commutative).
+    fn emit_sub8(&mut self, a: &Val, b: &Val, dst: u16) {
+        let aa = self.val_addr(a);
+        match b {
+            Val::Const(k) => {
+                assert!(*k >= 0 && *k <= 255, "isel: const {k} out of byte range");
+                self.emit(format!("    MOVLW 0x{:02X}", *k as u8));
+                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    MOVWF 0x{dst:02X}"));
+            }
+            Val::Reg(_) => {
+                let bb = self.val_addr(b);
+                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    MOVWF 0x{dst:02X}"));
+            }
+            Val::Global(_) => panic!("isel: sub8 with a global operand"),
+        }
+    }
+
+    /// `d = a - b` for i16: low byte SUBWF, then the high byte with the
+    /// borrow from the low byte folded in — if C is clear (borrow), ADDLW 1
+    /// bumps the subtrahend byte before the high SUBWF.
+    fn emit_sub16(&mut self, a: &Val, b: &Val, dst: u16) {
+        let aa = self.val_addr(a);
+        match b {
             Val::Const(k) => {
                 let lo = (k & 0xFF) as u8;
                 let hi = ((k >> 8) & 0xFF) as u8;
-                self.emit(format!("    MOVF 0x{ra:02X}, W"));
-                self.emit(format!("    ANDLW 0x{lo:02X}"));
+                self.emit(format!("    MOVLW 0x{lo:02X}"));
+                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
-                self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
-                self.emit(format!("    ANDLW 0x{hi:02X}"));
+                self.emit(format!("    MOVLW 0x{hi:02X}"));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit("    ADDLW 0x01".to_string());
+                self.emit(format!("    SUBWF 0x{:02X}, W", aa + 1));
                 self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
             }
-            Val::Global(_) => panic!("isel: and16 with a global operand"),
+            Val::Reg(rb) => {
+                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    MOVWF 0x{dst:02X}"));
+                self.emit(format!("    MOVF 0x{:02X}, W", bb + 1));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit("    ADDLW 0x01".to_string());
+                self.emit(format!("    SUBWF 0x{:02X}, W", aa + 1));
+                self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+            }
+            Val::Global(_) => panic!("isel: sub16 with a global operand"),
         }
     }
 
@@ -405,7 +464,6 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &b.dst);
                 match (b.op, b.ty) {
                     (BinOp::Add, Ty::I16) => self.emit_add16(&b.a, &b.b, da),
-                    (BinOp::And, Ty::I16) => self.emit_and16(&b.a, &b.b, da),
                     (BinOp::Add, Ty::I8) => {
                         // Normalize commutative add: a const LHS is swapped to
                         // the RHS so the const-adder arm is used, never reading
@@ -435,6 +493,32 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVWF 0x{da:02X}"));
                             }
                         }
+                    }
+                    // Commutative bytewise binops (and/or/xor) share one
+                    // emitter for both widths; a const LHS is swapped to the
+                    // RHS by emit_commutative.
+                    (BinOp::And, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
+                    (BinOp::And, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
+                    (BinOp::Or, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
+                    (BinOp::Or, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
+                    (BinOp::Xor, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
+                    (BinOp::Xor, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
+                    // sub is NOT commutative: a const LHS (d = k - a) cannot
+                    // reuse the reg-const lowering (which computes a - k), so
+                    // it must fail loudly rather than silently miscompile.
+                    (BinOp::Sub, Ty::I8) => {
+                        assert!(
+                            !matches!(&b.a, Val::Const(_)),
+                            "isel: sub with const LHS not supported (not commutative)"
+                        );
+                        self.emit_sub8(&b.a, &b.b, da);
+                    }
+                    (BinOp::Sub, Ty::I16) => {
+                        assert!(
+                            !matches!(&b.a, Val::Const(_)),
+                            "isel: sub with const LHS not supported (not commutative)"
+                        );
+                        self.emit_sub16(&b.a, &b.b, da);
                     }
                     _ => panic!("isel: unsupported binop for milestone 2"),
                 }
