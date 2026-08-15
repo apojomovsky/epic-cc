@@ -504,6 +504,10 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
             Some(&a) => end.max(a.wrapping_add(g.ty.bytes())),
             None => end,
         });
+    // bank0_start must stay within bank-0 GPR range (<= 0x7F). A degenerate
+    // address map with a global ending at >= 0xFC would wrap the u8 add in
+    // release builds and silently miscompile; guard it loudly.
+    debug_assert!(end_of_globals <= 0x7C, "isel: globals exceed bank-0 layout");
     let scratch = end_of_globals;
     let retval_lo = end_of_globals + 1;
     let bank0_start = end_of_globals + 3;
@@ -642,9 +646,53 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
             }
             if let Some(copies) = phi_copies.get(&b.label) {
                 g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                for (dst, ty, val) in copies {
-                    let da = g.slot(dst, *ty);
-                    g.emit_move_val_to_slot(val, *ty, da);
+                // Emit the predecessor's copies in dependency order so a copy
+                // never overwrites a slot a later copy still needs to read.
+                // Chains (%a <- %b, %b <- %c) emit c->b then b->a. If the
+                // copies form a cycle (%a = phi [%b,P], %b = phi [%a,P] —
+                // clang -O1 emits this for loop-carried swaps), no ordering
+                // works without a temp register, so panic loudly rather than
+                // silently miscompile.
+                let pending: Vec<(u8, Option<u8>, Ty, Val)> = copies
+                    .iter()
+                    .map(|(dst, ty, val)| {
+                        let da = g.slot(dst, *ty);
+                        let src = match val {
+                            Val::Reg(r) => Some(g.slot_addr(g.cur_func, r)),
+                            _ => None,
+                        };
+                        (da, src, *ty, val.clone())
+                    })
+                    .collect();
+                let n = pending.len();
+                let mut emitted = vec![false; n];
+                let mut emitted_count = 0usize;
+                while emitted_count < n {
+                    let mut progress = false;
+                    for i in 0..n {
+                        if emitted[i] {
+                            continue;
+                        }
+                        let (da, src, ty, val) = &pending[i];
+                        // Blocked while an un-emitted sibling (j != i) writes
+                        // this copy's source slot (sibling destination ==
+                        // this copy's source).
+                        let blocked = match src {
+                            Some(s) => {
+                                (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s)
+                            }
+                            None => false,
+                        };
+                        if !blocked {
+                            g.emit_move_val_to_slot(val, *ty, *da);
+                            emitted[i] = true;
+                            emitted_count += 1;
+                            progress = true;
+                        }
+                    }
+                    if !progress {
+                        panic!("isel: cyclic phi copies not supported");
+                    }
                 }
             }
             if let Some(t) = terminator {

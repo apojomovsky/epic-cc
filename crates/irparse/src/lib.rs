@@ -1,8 +1,10 @@
 //! Parser for LLVM IR text (`.ll`) into the canonical `ir::Module`.
 //!
-//! Supports the milestone-1 subset the PIC8 backend consumes: `load`/`store`
-//! (global and SSA pointer operands), `add`/`sub`/`and`/`or`/`xor`, and `ret`.
-//! Any other opcode panics loudly rather than silently misparsing.
+//! Supports the milestone-2 integer-spine subset the PIC8 backend consumes:
+//! `load`/`store` (global and SSA pointer operands), `add`/`sub`/`and`/`or`/
+//! `xor`, `ret`, `zext`/`trunc`, `icmp`, `select`, `br`/`brcond`, `call`, and
+//! `phi`. Any other opcode, or any structurally malformed input, panics loudly
+//! rather than silently misparsing.
 
 use ir::{Bin, BinOp, Block, Br, BrCond, Call, Func, Global, Icmp, Inst, Load, Module, Phi, Select, Store, Trunc, Ty, Val, Zext};
 

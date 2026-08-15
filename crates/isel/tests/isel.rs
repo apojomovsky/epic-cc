@@ -161,6 +161,38 @@ fn phi_copy_lands_before_terminator_of_each_predecessor() {
 }
 
 #[test]
+fn phi_copy_chain_emits_dependent_copies_in_order() {
+    // Two phis in the same merge block where one feeds the other: %p <- %a
+    // and %q <- %p. The %q copy reads %p's slot, so isel must emit %p's copy
+    // (MOVF 0x72 -> MOVWF 0x70) before %q's (MOVF 0x70 -> MOVWF 0x71) — never
+    // the reverse, which would clobber %a's value in flight.
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    br merge\n  block merge:\n    %p = phi i8 %a entry\n    %q = phi i8 %p entry\n    store i8 %q @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x20), ("y", 0x21), ("out", 0x22)]);
+    let asm = select(&m, &addrs);
+    // %p=0x70, %q=0x71, %a=0x72 (phi dsts reserved first, then the load).
+    assert!(
+        asm.contains("MOVF 0x72, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    MOVWF 0x71"),
+        "dependent copies must emit %p before %q:\n{asm}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "cyclic phi copies")]
+fn panics_on_cyclic_phi_copies() {
+    // A swap carried across a loop (clang -O1): %p = phi [%q], %q = phi [%p]
+    // from the same predecessor. Each copy reads the other's destination
+    // slot, so no emit order works without a temp register; isel must panic
+    // loudly instead of silently miscompiling.
+    let m = parse(
+        "global x i8\nglobal y i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    br merge\n  block merge:\n    %p = phi i8 %q entry\n    %q = phi i8 %p entry\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x20), ("y", 0x21)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
 fn icmp_eq_i8_materializes_i1() {
     let m = parse(
         "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    store i8 %c @out\n    ret void\n",
