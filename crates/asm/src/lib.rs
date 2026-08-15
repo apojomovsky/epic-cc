@@ -47,8 +47,21 @@ pub fn assemble(src: &str) -> Vec<u16> {
 }
 
 /// Assemble source and render the result as Intel HEX.
+///
+/// The whole program (code + tables) must fit page 0: a program whose
+/// highest word address is ≥ 0x800 (the 2KB page size) panics loudly —
+/// multi-page programs (function-to-page assignment, PCLATH before every
+/// CALL) are a later milestone. `assemble` itself is layout-only and stays
+/// unasserted so isel's unit tests can inspect words of any size.
 pub fn assemble_file_to_hex(src: &str) -> String {
-    to_hex(&assemble(src))
+    let words = assemble(src);
+    assert!(
+        words.len() <= 0x800,
+        "asm: program of {} words exceeds page 0 (highest address 0x{:03X} >= 0x800; multi-page not yet supported)",
+        words.len(),
+        words.len().saturating_sub(1)
+    );
+    to_hex(&words)
 }
 
 fn parse_num(s: &str) -> usize {

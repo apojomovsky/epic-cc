@@ -5,6 +5,7 @@ STATUS equ 0x03
 FSR    equ 0x04
 INDF   equ 0x00
 PCL    equ 0x02
+PCLATH equ 0x0A
 
     org 0x0000
     goto __start
@@ -42,6 +43,10 @@ main:
     RETURN
 
 __read_table:
+    MOVWF 0x70
+    MOVLW HIGH(table)
+    MOVWF PCLATH
+    MOVF 0x70, W
     ADDLW LOW(table)
     MOVWF PCL
 table:
