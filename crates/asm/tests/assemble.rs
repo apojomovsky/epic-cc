@@ -14,6 +14,19 @@ fn assembles_movf_add_movwf() {
 }
 
 #[test]
+fn low_high_label_operands_resolve_via_symbol_table() {
+    // Pass-2 literal resolution: `LOW(label)`/`HIGH(label)` operands resolve
+    // through the symbol table (labels are word addresses): LOW = addr & 0xFF,
+    // HIGH = (addr >> 8) & 0xFF. mytable sits at word 0x103: LOW = 0x03,
+    // HIGH = 0x01.
+    let src = "    org 0x0100\n    nop\n    nop\n    nop\nmytable:\n    addlw LOW(mytable)\n    addlw HIGH(mytable)\n    end\n";
+    let words = assemble(src);
+    // mytable sits at word 0x103 (org 0x100 + 3 nops).
+    assert_eq!(words[0x103], 0x3E00 | 0x03, "ADDLW LOW(mytable)");
+    assert_eq!(words[0x104], 0x3E00 | 0x01, "ADDLW HIGH(mytable)");
+}
+
+#[test]
 #[should_panic(expected = "asm: file register 0x80 out of range")]
 fn panics_on_file_register_out_of_range() {
     let src = "    org 0x0000\n    goto __start\n__start:\n    movwf 0x80\n    sleep\n    end\n";
