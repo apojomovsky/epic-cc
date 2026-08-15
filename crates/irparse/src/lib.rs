@@ -177,18 +177,10 @@ fn tokenize_parens(s: &str) -> Vec<String> {
     toks
 }
 
-/// A struct field: its byte `offset` in the struct and its type string
-/// (used for nested-struct GEP descent).
-#[derive(Clone, Debug)]
-struct FieldInfo {
-    offset: u8,
-    ty: String,
-}
 #[derive(Clone, Debug)]
 struct StructInfo {
     size: u8,
     align: u8,
-    fields: Vec<FieldInfo>,
 }
 type StructTypes = HashMap<String, StructInfo>;
 
@@ -248,18 +240,16 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
 fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> {
     let mut off: u16 = 0;
     let mut max_align: u8 = 0;
-    let mut infos = Vec::new();
     for f in fields {
         let (fsize, falign) = ty_size_align_opt(f, types)?;
         off = round_up(off, falign);
         assert!(off <= 255, "irparse: struct field offset {off} exceeds 255 (byte-addressed)");
-        infos.push(FieldInfo { offset: off as u8, ty: f.clone() });
         off += fsize;
         max_align = max_align.max(falign);
     }
     let size = round_up(off, max_align);
     assert!(size <= 255, "irparse: struct size {size} exceeds 255 (byte-addressed)");
-    Some(StructInfo { size: size as u8, align: max_align, fields: infos })
+    Some(StructInfo { size: size as u8, align: max_align })
 }
 
 /// Collect `%struct.X = type { ... }` declarations into a resolved size/
@@ -382,9 +372,10 @@ fn parse_ptr_operand(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &mu
 
 /// Compute the byte stride contributed by one GEP index and the type to
 /// descend into. Level 0 treats the source type as an array-of-itself
-/// (stride = its size). A struct level contributes the selected field's
-/// byte offset and descends into that field's type.
-fn stride_and_next(cur: &str, idx: &Val, types: &StructTypes) -> (i64, String) {
+/// (stride = its size); a scalar (i1/i8/i16) strides by its size with no
+/// further descent. Struct-typed sources never reach here: `fold_gep`
+/// rejects them up front.
+fn stride_and_next(cur: &str, types: &StructTypes) -> (i64, String) {
     let cur = cur.trim();
     if cur.starts_with('[') {
         let close = cur.find(']').unwrap();
@@ -392,14 +383,6 @@ fn stride_and_next(cur: &str, idx: &Val, types: &StructTypes) -> (i64, String) {
         let (sz, _) = ty_size_align(cur, types);
         let elem = inner.splitn(2, "x").nth(1).unwrap().trim().to_string();
         (i64::from(sz), elem)
-    } else if let Some(n) = cur.strip_prefix('%') {
-        let info = types.get(n).unwrap_or_else(|| panic!("irparse: unknown struct in gep"));
-        let c = match idx {
-            Val::Const(c) => *c as usize,
-            _ => panic!("irparse: dynamic struct field index"),
-        };
-        let f = &info.fields[c];
-        (i64::from(f.offset), f.ty.clone())
     } else {
         // scalar (i1/i8/i16): stride = its size, no further descent
         let (sz, _) = ty_size_align(cur, types);
@@ -423,7 +406,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
             // supported, so panic loudly instead of mis-folding.
             panic!("irparse: gep on struct-typed source {cur} unsupported (struct descent not implemented)");
         }
-        let (stride, next) = stride_and_next(&cur, &idx, types);
+        let (stride, next) = stride_and_next(&cur, types);
         match &idx {
             Val::Const(c) => k += c * stride,
             Val::Reg(r) => terms.push((stride as u8, r.clone())),

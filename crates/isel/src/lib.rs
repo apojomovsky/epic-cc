@@ -730,6 +730,10 @@ impl<'m> Gen<'m> {
                 // slot; FSR reaches only the low 256 bytes (bank 0 — IRP is a
                 // later milestone), so a target past 0xFF fails loudly rather
                 // than emitting an address FSR cannot reach.
+                assert!(
+                    callee.params[i].sret,
+                    "isel: sret arg for a non-sret param"
+                );
                 let addr = match &arg.val {
                     Val::Global(g) => self.global_addr(g),
                     Val::Reg(r) => {

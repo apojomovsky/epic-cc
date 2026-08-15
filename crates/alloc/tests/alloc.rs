@@ -116,7 +116,7 @@ fn map_text_emits_global_and_local_lines() {
 #[test]
 fn params_are_frame_locals_too() {
     let m = parse(
-        "fn f(void) (p0=byval2, p1)\n\
+        "fn f(void) (p0=byval2, p1=i8)\n\
            block entry:\n\
              %q = add i16 %p0, 1\n\
              ret void\n",

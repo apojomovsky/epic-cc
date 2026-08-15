@@ -106,7 +106,13 @@ fn param_str(p: &Param) -> String {
     } else if p.sret {
         format!("{}=sret", p.name)
     } else {
-        p.name.clone()
+        // scalar: encode the width so the text round-trips it (bare names
+        // re-parse as width 1, silently undersizing i16 slots)
+        match p.width {
+            1 => format!("{}=i8", p.name),
+            2 => format!("{}=i16", p.name),
+            w => panic!("ir: cannot serialize scalar param {} with width {w}", p.name),
+        }
     }
 }
 
@@ -249,7 +255,9 @@ fn parse_val(s: &str) -> Val {
     else { Val::Const(s.parse().unwrap_or_else(|_| panic!("bad value {s}"))) }
 }
 
-/// Parse one canonical param token: `<name>` | `<name>=byval<N>` | `<name>=sret`.
+/// Parse one canonical param token: `<name>=i8` | `<name>=i16` |
+/// `<name>=byval<N>` | `<name>=sret`. Bare `<name>` (width-1 shorthand,
+/// retained for backward compatibility) also parses.
 fn parse_param(s: &str) -> Param {
     let s = s.trim();
     let (name, rest) = match s.find('=') {
@@ -262,6 +270,8 @@ fn parse_param(s: &str) -> Param {
         Param { name, width: n, byval: Some(n), sret: false }
     } else if rest == "sret" {
         Param { name, width: 2, byval: None, sret: true }
+    } else if matches!(rest, "i1" | "i8" | "i16") {
+        Param { name, width: parse_ty(rest).bytes(), byval: None, sret: false }
     } else if rest.is_empty() {
         Param { name, width: 1, byval: None, sret: false }
     } else {
