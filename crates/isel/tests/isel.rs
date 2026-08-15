@@ -2175,6 +2175,8 @@ fn routine_sig(name: &str) -> (&'static str, &'static [(&'static str, &'static s
         "__udiv_u16" | "__urem_u16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
         "__sdiv_i8" | "__srem_i8" => ("i8", &[("num", "i8"), ("den", "i8")], 5),
         "__sdiv_i16" | "__srem_i16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
+        "__shl_u8" | "__lshr_u8" | "__ashr_i8" => ("i8", &[("val", "i8"), ("cnt", "i8")], 3),
+        "__shl_u16" | "__lshr_u16" | "__ashr_i16" => ("i16", &[("val", "i16"), ("cnt", "i16")], 4),
         other => panic!("test: unknown routine {other}"),
     }
 }
@@ -2474,6 +2476,359 @@ fn panics_on_routine_slot_past_ram() {
     for (k, v) in map.iter_mut() {
         if k == "__mul_u8::__scr" {
             *v = 0x120;
+        }
+    }
+    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+}
+
+// ---------------------------------------------------------------------------
+// Task 4: shifts — inline const counts + the six variable-count routines.
+// ---------------------------------------------------------------------------
+
+/// A module where `main` shifts a loaded value by a **constant** count:
+/// `%s = {op} {ty} %a, {count}` (legalize keeps const-count shifts as Bin,
+/// isel inlines the fixed RLF/RRF sequence).
+fn shift_module(op: &str, ty: &str, count: &str) -> String {
+    format!(
+        "global x {ty}\nglobal out {ty}\nfn main(void) ()\n  block entry:\n    %a = load {ty} @x\n    %s = {op} {ty} %a, {count}\n    store {ty} %s @out\n    ret void\n"
+    )
+}
+
+/// i8 map: x=0x20, out=0x21, main::a=0x25, main::s=0x26.
+fn shift_map8() -> Vec<(String, u16)> {
+    vec![
+        ("x".to_string(), 0x20),
+        ("out".to_string(), 0x21),
+        ("main::a".to_string(), 0x25),
+        ("main::s".to_string(), 0x26),
+    ]
+}
+
+/// i16 map: x=0x20(lo)/0x21(hi), out=0x22/0x23, main::a=0x25/0x26, main::s=0x27/0x28.
+fn shift_map16() -> Vec<(String, u16)> {
+    vec![
+        ("x".to_string(), 0x20),
+        ("out".to_string(), 0x22),
+        ("main::a".to_string(), 0x25),
+        ("main::s".to_string(), 0x27),
+    ]
+}
+
+/// Inline const-count shifts emit exactly the mandated RLF/RRF sequences:
+/// shl = `bcf C; rlf lo; rlf hi` × k; lshr = `bcf C; rrf hi; rrf lo` × k
+/// (HIGH byte FIRST — the byte order matters); ashr = C-from-sign + the rrf
+/// chain × k; k == 0 is a plain copy; i8 is a single-byte chain.
+#[test]
+fn inline_const_shifts_emit_rlf_rrf_sequences() {
+    // shl i16 %a, 3 -> 3 x (BCF C / RLF lo / RLF hi), no RRF anywhere. The
+    // value is copied into the dst slot (main::s = 0x27/0x28) and rotated
+    // there, so the RLFs target 0x27/0x28 — never the source slot.
+    let asm = select(&parse(&shift_module("shl", "i16", "3")), &addrs(&map_refs(&shift_map16())));
+    assert_eq!(asm.matches("    BCF STATUS, 0").count(), 3, "one BCF per step:\n{asm}");
+    assert_eq!(asm.matches("    RLF 0x27, F").count(), 3, "lo byte rotated each step:\n{asm}");
+    assert_eq!(asm.matches("    RLF 0x28, F").count(), 3, "hi byte rotated each step:\n{asm}");
+    assert!(!asm.contains("RRF"), "shl must not emit rrf:\n{asm}");
+
+    // lshr i16 %a, 2 -> 2 x (BCF C / RRF hi / RRF lo): the high byte MUST
+    // rotate before the low byte, or the shifted-out bit lands in the wrong
+    // place.
+    let asm = select(&parse(&shift_module("lshr", "i16", "2")), &addrs(&map_refs(&shift_map16())));
+    assert_eq!(asm.matches("    BCF STATUS, 0").count(), 2, "one BCF per step:\n{asm}");
+    assert_eq!(asm.matches("    RRF 0x28, F").count(), 2, "hi byte first:\n{asm}");
+    assert_eq!(asm.matches("    RRF 0x27, F").count(), 2, "lo byte second:\n{asm}");
+    let hi = asm.find("    RRF 0x28, F").expect("hi rrf");
+    let lo = asm.find("    RRF 0x27, F").expect("lo rrf");
+    assert!(hi < lo, "lshr must shift the high byte first:\n{asm}");
+    assert!(!asm.contains("RLF"), "lshr must not emit rlf:\n{asm}");
+
+    // ashr i8 %a, 2 -> C set from the sign bit (BTFSC/BSF + BTFSS/BCF) before
+    // each RRF; the rrf chain is a single byte for i8 (dst = main::s = 0x26).
+    let asm = select(&parse(&shift_module("ashr", "i8", "2")), &addrs(&map_refs(&shift_map8())));
+    assert_eq!(asm.matches("    RRF 0x26, F").count(), 2, "one rrf per step:\n{asm}");
+    assert_eq!(asm.matches("    RRF").count(), 2, "i8 ashr must have no second byte:\n{asm}");
+    let btfsc = asm.find("    BTFSC 0x26, 7").expect("sign-bit test");
+    let btfss = asm.find("    BTFSS 0x26, 7").expect("sign-bit test 2");
+    let rrf = asm.find("    RRF 0x26, F").expect("rrf");
+    assert!(
+        btfsc < btfss && btfss < rrf,
+        "C must be set from the sign bit before each rrf:\n{asm}"
+    );
+
+    // shl i16 %a, 0 -> a plain copy (MOVF/MOVWF pairs), no rotation at all.
+    let asm = select(&parse(&shift_module("shl", "i16", "0")), &addrs(&map_refs(&shift_map16())));
+    assert!(!asm.contains("RLF") && !asm.contains("RRF"), "k=0 must be a plain copy:\n{asm}");
+    assert!(asm.contains("    MOVF 0x25, W"), "copy lo:\n{asm}");
+    assert!(asm.contains("    MOVWF 0x27"), "store lo:\n{asm}");
+    assert!(asm.contains("    MOVF 0x26, W"), "copy hi:\n{asm}");
+    assert!(asm.contains("    MOVWF 0x28"), "store hi:\n{asm}");
+
+    // i8 single-byte chains: shl i8 %a, 1 -> one RLF on the only byte;
+    // lshr i8 %a, 1 -> one RRF on the only byte.
+    let asm = select(&parse(&shift_module("shl", "i8", "1")), &addrs(&map_refs(&shift_map8())));
+    assert_eq!(asm.matches("    RLF 0x26, F").count(), 1, "i8 shl is one byte:\n{asm}");
+    assert_eq!(asm.matches("    RLF").count(), 1, "i8 shl must have no second byte:\n{asm}");
+    let asm = select(&parse(&shift_module("lshr", "i8", "1")), &addrs(&map_refs(&shift_map8())));
+    assert_eq!(asm.matches("    RRF 0x26, F").count(), 1, "i8 lshr is one byte:\n{asm}");
+    assert_eq!(asm.matches("    RRF").count(), 1, "i8 lshr must have no second byte:\n{asm}");
+}
+
+/// k >= width is LLVM poison: the result is defined as no value, so a loud
+/// panic beats emitting a wrong-but-deterministic result.
+#[test]
+#[should_panic(expected = "const shift count 16 out of range")]
+fn panics_on_inline_shift_count_ge_width_i16() {
+    let m = parse(&shift_module("shl", "i16", "16"));
+    select(&m, &addrs(&map_refs(&shift_map16())));
+}
+
+#[test]
+#[should_panic(expected = "const shift count 8 out of range")]
+fn panics_on_inline_shift_count_ge_width_i8() {
+    let m = parse(&shift_module("lshr", "i8", "8"));
+    select(&m, &addrs(&map_refs(&shift_map8())));
+}
+
+/// A reg-count shift must never reach isel: legalize rewrites it to the
+/// routine call. If one does (legalize regression), panic loudly rather than
+/// silently emit anything.
+#[test]
+#[should_panic(expected = "variable-count")]
+fn panics_on_variable_count_shift_reaching_isel() {
+    let m = parse(
+        "global x i16\nglobal n i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %c = load i16 @n\n    %s = shl i16 %a, %c\n    store i16 %s @out\n    ret void\n",
+    );
+    select(
+        &m,
+        &addrs(&[
+            ("x", 0x20),
+            ("n", 0x22),
+            ("out", 0x24),
+            ("main::a", 0x28),
+            ("main::c", 0x2A),
+            ("main::s", 0x2C),
+        ]),
+    );
+}
+
+/// The load-bearing inline-shift sims: (5 << 3) >> 1 = 20; ashr of a
+/// negative i16 0x8005 >> 2 = 0xE001; i8 ashr 0x80 >> 3 = 0xF0.
+#[test]
+fn inline_shifts_simulate_correctly() {
+    // (5 << 3) >> 1 = 40 >> 1 = 20 = 0x0014 (lo, hi).
+    let ir = "global x i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = shl i16 %a, 3\n    %r = lshr i16 %b, 1\n    store i16 %r @out\n    ret void\n";
+    let map: Vec<(String, u16)> = [
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x25),
+        ("main::b", 0x27),
+        ("main::r", 0x29),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), *v))
+    .collect();
+    let got = sim_run_bytes(&ir, &map, &[(0x20, 0x05), (0x21, 0x00)], 0x22, 2);
+    assert_eq!(&got[..], &[0x14, 0x00], "(5 << 3) >> 1 must be 20");
+
+    // ashr i16: 0x8005 >> 2 = 0xE001 (sign-fill).
+    let ir = shift_module("ashr", "i16", "2");
+    let got = sim_run_bytes(&ir, &shift_map16(), &[(0x20, 0x05), (0x21, 0x80)], 0x22, 2);
+    assert_eq!(&got[..], &[0x01, 0xE0], "0x8005 >> 2 must be 0xE001");
+
+    // ashr i8: 0x80 >> 3 = 0xF0 (sign-fill).
+    let ir = shift_module("ashr", "i8", "3");
+    let got = sim_run_bytes(&ir, &shift_map8(), &[(0x20, 0x80)], 0x21, 1);
+    assert_eq!(got[0], 0xF0, "0x80 >> 3 must be 0xF0");
+}
+
+/// The six shift routines emit real recipe bodies: the label, the count
+/// mask (ANDLW width-1), the loop (DECFSZ counter, bounded <= 15), the
+/// shift idiom on the `val` param slot, and a RETURN. `pats` are the
+/// load-bearing strings at the contract addresses (i8: val=0x30, cnt=0x31,
+/// __scr=0x32; i16: val=0x40, cnt=0x42, __scr=0x44).
+#[test]
+fn shift_routines_emit_recipe_bodies() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "__shl_u8",
+            &[
+                "ANDLW 0x07",     // count & (8-1)
+                "MOVWF 0x32",     // __scr::cnt@0 = masked count
+                "MOVF 0x32, F",   // zero test
+                "BTFSC STATUS, 2",
+                "RLF 0x30, F",    // val shifts in the param slot
+                "DECFSZ 0x32, F", // bounded loop counter
+            ],
+        ),
+        (
+            "__shl_u16",
+            &[
+                "ANDLW 0x0F", // count & (16-1)
+                "MOVWF 0x44",
+                "CLRF 0x45",  // high byte of the masked count
+                "RLF 0x40, F", // val_lo
+                "RLF 0x41, F", // val_hi (shl: lo then hi)
+                "DECFSZ 0x44, F",
+            ],
+        ),
+        (
+            "__lshr_u8",
+            &["ANDLW 0x07", "RRF 0x30, F", "DECFSZ 0x32, F"],
+        ),
+        (
+            "__lshr_u16",
+            &[
+                "ANDLW 0x0F",
+                "RRF 0x41, F", // val_hi FIRST
+                "RRF 0x40, F", // then val_lo (lshr byte order)
+                "DECFSZ 0x44, F",
+            ],
+        ),
+        (
+            "__ashr_i8",
+            &[
+                "ANDLW 0x07",
+                "BTFSC 0x30, 7", // C = sign bit
+                "BSF STATUS, 0",
+                "BTFSS 0x30, 7",
+                "BCF STATUS, 0",
+                "RRF 0x30, F",
+                "DECFSZ 0x32, F",
+            ],
+        ),
+        (
+            "__ashr_i16",
+            &[
+                "ANDLW 0x0F",
+                "BTFSC 0x41, 7", // C = sign bit (val_hi)
+                "BSF STATUS, 0",
+                "BTFSS 0x41, 7",
+                "BCF STATUS, 0",
+                "RRF 0x41, F",
+                "RRF 0x40, F",
+                "DECFSZ 0x44, F",
+            ],
+        ),
+    ];
+    for &(name, pats) in cases {
+        let (ir, map) = routine_module(name);
+        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
+        assert!(
+            asm.contains(&format!("    CALL {name}")),
+            "{name} call:\n{asm}"
+        );
+        let start = asm.find(&format!("{name}:")).expect("routine label");
+        let body = &asm[start..];
+        let body = body.split("main:").next().expect("main label after routine");
+        assert!(
+            body.contains("    RETURN"),
+            "{name} body must end in RETURN, not fall through:\n{asm}"
+        );
+        for p in pats {
+            assert!(asm.contains(p), "{name} must contain `{p}`:\n{asm}");
+        }
+        assert!(
+            body.contains("RLF") || body.contains("RRF"),
+            "{name} body looks like an empty label:\n{asm}"
+        );
+    }
+}
+
+/// The load-bearing routine sims: fixed operands seeded in RAM (the count
+/// arrives UNMASKED — the "volatile input"), the routine masks to width-1
+/// and loops. A wrong byte order, a missing sign-fill, or a wrong mask
+/// flips a result.
+#[test]
+fn shift_routines_simulate_correctly() {
+    // (routine, val bytes lo..hi, cnt bytes lo..hi, expected result bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        // __shl_u8: 5<<1 = 10; 0xFF<<3 = 0xF8 (bits out the top); 5<<0 = 5;
+        // masked poison range: 5<<15 == 5<<7 = 0x80 (15 & 7 = 7).
+        ("__shl_u8", &[5], &[1], &[10]),
+        ("__shl_u8", &[0xFF], &[3], &[0xF8]),
+        ("__shl_u8", &[5], &[0], &[5]),
+        ("__shl_u8", &[5], &[15], &[0x80]),
+        // __shl_u16: 5<<3 = 40; 0x8000<<4 = 0; masked poison range:
+        // 5<<17 == 5<<1 = 10; 5<<16 == 5<<0 = 5 (16 & 15 = 0).
+        ("__shl_u16", &[0x05, 0x00], &[0x03, 0x00], &[0x28, 0x00]),
+        ("__shl_u16", &[0x00, 0x80], &[0x04, 0x00], &[0x00, 0x00]),
+        ("__shl_u16", &[0x05, 0x00], &[0x11, 0x00], &[0x0A, 0x00]),
+        ("__shl_u16", &[0x05, 0x00], &[0x10, 0x00], &[0x05, 0x00]),
+        // __lshr_u8: 0x80>>3 = 0x10; 0xFF>>4 = 0x0F.
+        ("__lshr_u8", &[0x80], &[3], &[0x10]),
+        ("__lshr_u8", &[0xFF], &[4], &[0x0F]),
+        // __lshr_u16: 0x8000>>4 = 0x0800; 0x1234>>8 = 0x0012; masked:
+        // 0x8000>>17 == 0x8000>>1 = 0x4000.
+        ("__lshr_u16", &[0x00, 0x80], &[0x04, 0x00], &[0x00, 0x08]),
+        ("__lshr_u16", &[0x34, 0x12], &[0x08, 0x00], &[0x12, 0x00]),
+        ("__lshr_u16", &[0x00, 0x80], &[0x11, 0x00], &[0x00, 0x40]),
+        // __ashr_i8: 0x80>>3 = 0xF0 (sign-fill); 0x7F>>2 = 0x1F.
+        ("__ashr_i8", &[0x80], &[3], &[0xF0]),
+        ("__ashr_i8", &[0x7F], &[2], &[0x1F]),
+        // __ashr_i16: 0x8005>>2 = 0xE001; 0x7F00>>4 = 0x07F0; masked:
+        // 0x8005>>17 == 0x8005>>1 = 0xC002.
+        ("__ashr_i16", &[0x05, 0x80], &[0x02, 0x00], &[0x01, 0xE0]),
+        ("__ashr_i16", &[0x00, 0x7F], &[0x04, 0x00], &[0xF0, 0x07]),
+        ("__ashr_i16", &[0x05, 0x80], &[0x11, 0x00], &[0x02, 0xC0]),
+    ];
+    for &(name, x, n, want) in cases {
+        let (ir, map) = routine_module(name);
+        let (ret, _, _) = routine_sig(name);
+        let wide = ret == "i16";
+        let (ina, inb, out) = if wide { (0x20, 0x22, 0x24) } else { (0x20, 0x21, 0x22) };
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((ina + i as u16, *b));
+        }
+        for (i, b) in n.iter().enumerate() {
+            seed.push((inb + i as u16, *b));
+        }
+        let got = sim_run_bytes(&ir, &map, &seed, out, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?} <<>> {n:?}) must be {want:?}");
+    }
+}
+
+/// The brief's variable-shift pin, made explicit: n comes from RAM (the
+/// "volatile input"), the routine masks it to width-1, so the poison-range
+/// results are deterministic: x << 17 == x << 1, x << 16 == x, and the same
+/// for right shifts (logical and arithmetic).
+#[test]
+fn variable_count_shifts_mask_wide_counts() {
+    // (routine, x_lo, x_hi, n_lo, n_hi, want_lo, want_hi)
+    let cases: &[(&str, u8, u8, u8, u8, u8, u8)] = &[
+        ("__shl_u16", 0x05, 0x00, 0x11, 0x00, 0x0A, 0x00), // x<<17 == x<<1
+        ("__shl_u16", 0x05, 0x00, 0x10, 0x00, 0x05, 0x00), // x<<16 == x
+        ("__lshr_u16", 0x00, 0x80, 0x11, 0x00, 0x00, 0x40), // x>>17 == x>>1
+        ("__ashr_i16", 0x05, 0x80, 0x11, 0x00, 0x02, 0xC0), // x>>17 == x>>1 (sign-fill)
+    ];
+    for &(name, xlo, xhi, nlo, nhi, wlo, whi) in cases {
+        let (ir, map) = routine_module(name);
+        let (ina, inb, out) = (0x20, 0x22, 0x24);
+        let got = sim_run_bytes(
+            &ir,
+            &map,
+            &[(ina, xlo), (ina + 1, xhi), (inb, nlo), (inb + 1, nhi)],
+            out,
+            2,
+        );
+        assert_eq!(
+            &got[..],
+            &[wlo, whi],
+            "{name} with count 0x{nhi:02X}{nlo:02X} (masked) must be 0x{whi:02X}{wlo:02X}"
+        );
+    }
+}
+
+/// A shift-routine slot that the banking pass would relocate (bank 1) would
+/// need BANKSELs inside the skip-sensitive loop — loud assert, same as the
+/// mul/div/rem recipes.
+#[test]
+#[should_panic(expected = "bank-0")]
+fn panics_on_banked_shift_routine_slot() {
+    let (ir, mut map) = routine_module("__shl_u16");
+    for (k, v) in map.iter_mut() {
+        if k == "__shl_u16::__scr" {
+            *v = 0xA0; // bank 1 (0x80-0xEF)
         }
     }
     let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
