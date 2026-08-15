@@ -97,7 +97,7 @@ pub struct Param { pub name: String, pub width: u8, pub byval: Option<u8>, pub s
 pub struct Func { pub name: String, pub ret: Option<Ty>, pub params: Vec<Param>, pub blocks: Vec<Block> }
 
 #[derive(Clone, Debug)]
-pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u8, pub bytes: Vec<u8>, pub addr: Option<u8> }
+pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u16, pub bytes: Vec<u8>, pub addr: Option<u8> }
 
 #[derive(Clone, Debug)]
 pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func> }
@@ -233,7 +233,7 @@ pub fn parse(text: &str) -> Module {
             let name = parts[0].to_string();
             let ty = parse_ty(parts[1]);
             let addr = if parts.len() >= 3 { parse_addr(parts[2]) } else { None };
-            globals.push(Global { name, ty, is_const, size: ty.bytes(), bytes: Vec::new(), addr });
+            globals.push(Global { name, ty, is_const, size: u16::from(ty.bytes()), bytes: Vec::new(), addr });
         } else if line.starts_with("fn ") {
             let rest = &line[3..];
             let open = rest.find('(').unwrap();

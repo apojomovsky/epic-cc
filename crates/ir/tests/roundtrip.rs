@@ -39,9 +39,9 @@ fn gep_and_sized_globals_roundtrip() {
     // const global carries no @addr in the canonical text
     assert!(out.contains("const table i8\n"), "missing const line\n---\n{out}");
     assert!(!out.contains("const table i8 @"), "const must serialize without an address\n---\n{out}");
-    // parsed scalar global sizes default from the type
-    assert_eq!(m.globals[0].size, ir::Ty::I8.bytes());
-    assert_eq!(m.globals[1].size, ir::Ty::I8.bytes());
+    // parsed scalar global sizes default from the type (widened to u16)
+    assert_eq!(m.globals[0].size, u16::from(ir::Ty::I8.bytes()));
+    assert_eq!(m.globals[1].size, u16::from(ir::Ty::I8.bytes()));
     assert_eq!(m.globals[0].bytes, Vec::<u8>::new());
     // size/bytes are struct-only metadata: a Global constructed with them keeps them
     let g = ir::Global {

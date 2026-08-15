@@ -655,3 +655,52 @@ fn parses_m3_m4_binops_and_freeze() {
         );
     }
 }
+
+// Milestone 10: 16-bit const table sizes. A `[N x i8] constant` table with
+// 256 <= N <= 511 parses (bytes = the literal, size = N); a const table > 511
+// bytes panics loudly; a RAM `[N x i8] global` array keeps N <= 255 (loud).
+
+/// Build a `c"..."` literal hex-escaped for the byte pattern
+/// `i -> (i * 37 + 11) & 0xFF` (length `n`), so every byte is distinct-ish
+/// and the escaped literal is exactly `n` bytes.
+fn escaped_literal(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("\\{:02X}", ((i as u8).wrapping_mul(37).wrapping_add(11))))
+        .collect()
+}
+
+#[test]
+fn const_array_300_bytes_parses() {
+    let lit = escaped_literal(300);
+    let src = format!("@table = dso_local constant [300 x i8] c\"{lit}\", align 1\n");
+    let m = parse_ll(&src);
+    assert_eq!(m.globals.len(), 1);
+    match &m.globals[0] {
+        Global { name, ty, is_const, size, bytes, addr } => {
+            assert_eq!(name, "table");
+            assert_eq!(*ty, ir::Ty::I8);
+            assert!(*is_const, "const table must be flagged const");
+            assert_eq!(*size, 300, "const table size must be the byte count");
+            assert_eq!(bytes.len(), 300, "bytes must be the full literal");
+            assert_eq!(*addr, None);
+        }
+    }
+    // spot-check: bytes decode back through the pattern
+    assert_eq!(m.globals[0].bytes[0], 0x0B); // (0*37 + 11) & 0xFF
+    assert_eq!(m.globals[0].bytes[299], 66); // (299*37 + 11) & 0xFF
+}
+
+#[test]
+#[should_panic(expected = "const array @big too large")]
+fn const_array_512_bytes_panics() {
+    let lit = escaped_literal(512);
+    let src = format!("@big = dso_local constant [512 x i8] c\"{lit}\", align 1\n");
+    let _ = parse_ll(&src);
+}
+
+#[test]
+#[should_panic(expected = "array @ram too large")]
+fn ram_array_300_bytes_panics() {
+    let src = "@ram = dso_local global [300 x i8] zeroinitializer, align 1\n";
+    let _ = parse_ll(&src);
+}
