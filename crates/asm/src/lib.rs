@@ -86,16 +86,15 @@ pub fn assemble(src: &str) -> Vec<u16> {
 
 /// Assemble source and render the result as Intel HEX.
 ///
-/// The whole program (code + tables) must fit page 0: a program whose
-/// highest word address is ≥ 0x800 (the 2KB page size) panics loudly —
-/// multi-page programs (function-to-page assignment, PCLATH before every
-/// CALL) are a later milestone. `assemble` itself is layout-only and stays
-/// unasserted so isel's unit tests can inspect words of any size.
+/// The whole program (code + tables) must fit the PIC16F877A's device flash:
+/// a program whose highest word address is ≥ 0x2000 (8K words) panics loudly.
+/// `assemble` itself is layout-only and stays unasserted so isel's unit tests
+/// can inspect words of any size.
 pub fn assemble_file_to_hex(src: &str) -> String {
     let words = assemble(src);
     assert!(
-        words.len() <= 0x800,
-        "asm: program of {} words exceeds page 0 (highest address 0x{:03X} >= 0x800; multi-page not yet supported)",
+        words.len() <= 0x2000,
+        "asm: program of {} words exceeds device flash (highest address 0x{:04X} >= 0x2000; 8K words)",
         words.len(),
         words.len().saturating_sub(1)
     );
@@ -124,7 +123,9 @@ fn strip_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 /// Resolve a literal operand. Plain numbers parse as-is; `LOW(<label>)` and
 /// `HIGH(<label>)` resolve through the pass-2 symbol table to the low or high
 /// byte of the label's word address (a RETLW table's base, e.g. the
-/// `ADDLW LOW(table); MOVWF PCL` computed jump).
+/// `ADDLW LOW(table); MOVWF PCL` computed jump). `PAGE(<label>)` resolves to
+/// `(addr >> 11) << 3` — the PCLATH<4:3> page bits (bits 2:0 clear), the
+/// literal loaded into PCLATH before a cross-page CALL.
 fn parse_lit(s: &str, sym: &std::collections::HashMap<String, usize>) -> usize {
     if let Some(name) = strip_fn(s, "LOW(") {
         let v = *sym
@@ -137,6 +138,12 @@ fn parse_lit(s: &str, sym: &std::collections::HashMap<String, usize>) -> usize {
             .get(name)
             .unwrap_or_else(|| panic!("asm: HIGH({name}) label not found"));
         return (v >> 8) & 0xFF;
+    }
+    if let Some(name) = strip_fn(s, "PAGE(") {
+        let v = *sym
+            .get(name)
+            .unwrap_or_else(|| panic!("asm: PAGE({name}) label not found"));
+        return (v >> 11) << 3;
     }
     parse_num(s)
 }

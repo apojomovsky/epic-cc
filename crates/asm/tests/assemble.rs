@@ -95,35 +95,67 @@ fn to_hex_spans_records_and_roundtrips_large_program() {
     }
 }
 
-// ---- Milestone 10: the page-0 bound ----
+// ---- Milestone 11: the device-flash bound ----
 
 #[test]
-#[should_panic(expected = "exceeds page 0")]
-fn panics_when_program_exceeds_page_zero() {
-    // 0x800 words fill page 0 exactly (addresses 0x000-0x7FF); a 0x801-word
-    // program crosses into page 1, where the highest word address is 0x800 —
-    // the page-0 assert (multi-page is a later milestone) must fire loudly.
-    let mut src = String::from("    org 0x0000\n");
-    for _ in 0..0x801 {
-        src.push_str("    nop\n");
-    }
-    src.push_str("    end\n");
+#[should_panic(expected = "exceeds device flash")]
+fn panics_when_program_exceeds_device_flash() {
+    // 0x2000 words fill the PIC16F877A's flash exactly (addresses
+    // 0x000-0x1FFF); a program whose highest word address is ≥ 0x2000 (8K
+    // words) cannot be stored and must panic loudly. `nop` is 0x0000 (to_hex
+    // would trim it) but the bound assert fires before rendering.
+    let mut src = String::from("    org 0x2000\n    nop\n    end\n");
     let _ = assemble_file_to_hex(&src);
 }
 
 #[test]
-fn page_zero_exact_fill_does_not_panic() {
-    // Boundary: exactly 0x800 words (highest word address 0x7FF) is still
-    // page 0 and must assemble to a full HEX image. `movlw 0x00` (0x3000)
-    // is nonzero so to_hex does not trim the trailing words.
+fn device_flash_exact_fill_does_not_panic() {
+    // Boundary: exactly 0x2000 words (highest word address 0x1FFF) fills the
+    // device flash and must assemble to a full HEX image. `movlw 0x00`
+    // (0x3000) is nonzero so to_hex does not trim the trailing words.
     let mut src = String::from("    org 0x0000\n");
-    for _ in 0..0x800 {
+    for _ in 0..0x2000 {
         src.push_str("    movlw 0x00\n");
     }
     src.push_str("    end\n");
     let hex = assemble_file_to_hex(&src);
     assert!(hex.contains(":00000001FF\n"), "missing EOF record: {hex:?}");
-    assert!(hex.lines().count() > 2, "full-page image must span records");
+    assert!(hex.lines().count() > 2, "full-flash image must span records");
+}
+
+#[test]
+fn program_at_word_0x1000_assembles() {
+    // The M10 page-0 assert (highest word address < 0x800) must NOT fire for
+    // a program located at 0x1000 — M11 replaces it with the device-flash
+    // bound (< 0x2000). A single instruction placed at 0x1000 is legal now.
+    let src = "    org 0x1000\n    movlw 0x2A\n    end\n";
+    let words = assemble_file_to_hex(&src);
+    assert!(words.contains(":00000001FF\n"), "missing EOF record: {words:?}");
+}
+
+// ---- Milestone 11: PAGE(label) resolution ----
+
+#[test]
+fn page_label_operands_resolve_via_symbol_table() {
+    // `PAGE(label)` resolves through the symbol table to `(addr >> 11) << 3`
+    // — the PCLATH<4:3> page bits (bits 2:0 clear). Labels placed at each
+    // page base via `.org` give 0x00/0x08/0x10/0x18 for pages 0-3.
+    let src = "    org 0x0000\np0:\n    movlw PAGE(p0)\n\
+                org 0x0800\np1:\n    movlw PAGE(p1)\n\
+                org 0x1000\np2:\n    movlw PAGE(p2)\n\
+                org 0x1800\np3:\n    movlw PAGE(p3)\n    end\n";
+    let words = assemble(src);
+    assert_eq!(words[0x000], 0x3000 | 0x00, "PAGE(p0) at 0x000 -> page 0");
+    assert_eq!(words[0x800], 0x3000 | 0x08, "PAGE(p1) at 0x800 -> page 1");
+    assert_eq!(words[0x1000], 0x3000 | 0x10, "PAGE(p2) at 0x1000 -> page 2");
+    assert_eq!(words[0x1800], 0x3000 | 0x18, "PAGE(p3) at 0x1800 -> page 3");
+}
+
+#[test]
+#[should_panic(expected = "asm: PAGE(nonexistent) label not found")]
+fn panics_when_page_label_missing() {
+    let src = "    org 0x0000\n    movlw PAGE(nonexistent)\n    end\n";
+    let _ = assemble(src);
 }
 
 // ---- Milestone 10: const-table window-fit directives ----
