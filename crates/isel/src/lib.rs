@@ -9,11 +9,22 @@
 //! predecessor block, before its terminator. Any other instruction or binop
 //! panics.
 //!
-//! Phase-3 pointers/const: `gep` defines a virtual pointer, lowered at each
-//! `load`/`store` use. A pointer into a RAM array accesses `FSR`/`INDF`
-//! (`base_lo + offset`); a pointer into a const (flash) global loads via
-//! `CALL __read_<name>` — a RETLW table emitted after the functions. A store
-//! through a pointer into a const global panics (ROM is not writable).
+//! Phase-3 pointers/const (M5-M7): `gep` defines a *virtual* pointer
+//! (emits nothing), lowered at each `load`/`store`/`memcpy` use. Every GEP
+//! chain is resolved eagerly to a `(Base, k, terms)` triple: `Base::Global`
+//! (RAM or const-flash), `Base::Slot(name, indirect)` — a byval param copy,
+//! an alloca, or an sret slot holding a target address (indirect). A
+//! constant offset (no terms) reads/writes the plain file register; dynamic
+//! terms set `FSR` to `base + k + Σ s×%r` (single scale-1 term keeps the M5
+//! `MOVF %r,W; ADDLW base+k; MOVWF FSR` fast path; general sums accumulate
+//! in the fixed scratch byte); an indirect base takes the target address
+//! from the slot's contents. Pointers into const (flash) globals load via
+//! `CALL __read_<name>` — a RETLW table emitted after the functions — and a
+//! store through a const base panics (ROM is not writable). `memcpy`
+//! lowers to a byte loop of the same pointer machinery; `alloca` is virtual
+//! like `gep` (the slot is sized by alloc). Every FSR base must sit in the
+//! low 256 bytes (bank 0 — IRP multi-bank FSR is a later milestone),
+//! asserted loudly at emission.
 //!
 //! Every value's address comes from the caller-supplied address map: globals
 //! by name, locals by `{func}::{name}` (IR value names without `%`). isel
@@ -30,17 +41,35 @@ fn ssa_key(func: &str, name: &str) -> String {
     format!("{func}::{name}")
 }
 
+/// A resolved GEP base: a named global (`@g`) or a local slot. A slot may
+/// be *indirect* (an sret param): it holds the target address, so FSR is
+/// taken from its contents rather than the slot itself being the base.
+#[derive(Clone, Debug)]
+enum Base {
+    Global(String),
+    Slot(String, bool),
+}
+
+/// How a single-byte pointer access completes after `emit_ptr_setup`.
+enum Addr {
+    /// A plain file register (the address is statically known).
+    Direct(u16),
+    /// FSR is set up; the access goes through INDF.
+    Indirect,
+}
+
 /// Per-function codegen state. All addresses come from the module-wide map;
 /// `cur_func` selects the current function's local entries.
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
-    /// Every GEP in the module, keyed `{func}::{dst}`. `gep` itself emits
-    /// nothing; each `load`/`store` through a pointer reg lowers the pointer
-    /// at its use. The reworked Gep (base/k/terms) is resolved by
-    /// `gep_to_base_offset` (Task 1 stub — the full chain/FSR lowering is
-    /// Task 3).
-    geps: &'m HashMap<String, Gep>,
+    /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
+    /// its folded `(base, k, terms)` — GEP chains fully collapsed (base
+    /// `Reg` replaced by the base's own entry), plus the seeded pointer
+    /// bases (byval/sret params and allocas). `gep`/`alloca` themselves
+    /// emit nothing; each `load`/`store`/`memcpy` through a pointer reg
+    /// lowers the pointer at its use.
+    resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
     scratch: u16,
     retval_lo: u16,
     cur_func: &'m str,
@@ -98,71 +127,214 @@ impl<'m> Gen<'m> {
             .is_const
     }
 
-    /// A GEP-created pointer `%r` -> its (base global, offset). Pointers
-    /// come only from `gep` in this milestone; anything else is a missing
-    /// slot and panics loudly.
-    fn gep_for(&self, r: &str) -> Gep {
+    /// The resolved `(base, k, terms)` for a pointer reg `%r` — a GEP dst,
+    /// or a seeded byval/sret param / alloca. Anything else is a missing
+    /// pointer and panics loudly.
+    fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
         let key = ssa_key(self.cur_func, r);
-        self.geps
+        self.resolved
             .get(&key)
             .cloned()
             .unwrap_or_else(|| panic!("isel: no gep for pointer %{r} ({key})"))
     }
 
-    /// Task-1 stub: translate the reworked Gep (base + const k + scaled
-    /// terms) back to the M5 `(base global name, offset Val)` pair the
-    /// FSR/RETLW helpers consume. Only a Global base whose offset is either
-    /// a pure const `k` or a single scale-1 term is expressible as one
-    /// `Val`; chained/reg bases, const+term combos, and multi-term geeps are
-    /// Task 3 and panic loudly.
-    fn gep_to_base_offset(g: &Gep) -> (String, Val) {
-        match &g.base {
-            GepBase::Global(name) => match &g.terms[..] {
-                [] => (name.clone(), Val::Const(i64::from(g.k))),
-                [(1, r)] if g.k == 0 => (name.clone(), Val::Reg(r.clone())),
-                _ => panic!("isel stub: gep {:?} (reg base / multi-term / const+term) is Task 3", g),
-            },
-            GepBase::Reg(_) => panic!("isel stub: chained/reg-base gep {:?} is Task 3", g),
+    /// How a byte access at `ptr + byte_off` completes: `Direct(a)` reads or
+    /// writes the plain file register `a`; `Indirect` means FSR is already
+    /// set up and the access goes through INDF. Emits the address setup for
+    /// dynamic/indirect pointers. Const (flash) bases are rejected (loads
+    /// take the RETLW path before this; stores panic).
+    fn emit_ptr_setup(&mut self, ptr: &Val, byte_off: u8) -> Addr {
+        match ptr {
+            Val::Global(g) => {
+                assert!(
+                    !self.global_is_const(g),
+                    "isel: store to const (flash) global @{g}"
+                );
+                Addr::Direct(self.global_addr(g) + u16::from(byte_off))
+            }
+            Val::Reg(r) => {
+                let (base, k, terms) = self.resolved_for(r);
+                match base {
+                    Base::Global(name) => {
+                        assert!(
+                            !self.global_is_const(&name),
+                            "isel: store to const (flash) global @{name}"
+                        );
+                        if terms.is_empty() {
+                            // Constant offset only: the address is statically
+                            // known — a plain file-register access, no FSR.
+                            Addr::Direct(
+                                self.global_addr(&name) + u16::from(k) + u16::from(byte_off),
+                            )
+                        } else {
+                            self.emit_fsr_to(self.global_addr(&name), k, &terms, byte_off);
+                            Addr::Indirect
+                        }
+                    }
+                    Base::Slot(sname, indirect) => {
+                        let sa = self.slot_addr(self.cur_func, &sname);
+                        if !indirect && terms.is_empty() {
+                            Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
+                        } else if !indirect {
+                            self.emit_fsr_to(sa, k, &terms, byte_off);
+                            Addr::Indirect
+                        } else {
+                            self.emit_fsr_indirect(sa, k, &terms, byte_off);
+                            Addr::Indirect
+                        }
+                    }
+                }
+            }
+            Val::Const(_) => panic!("isel: pointer operand must be a register or global"),
         }
     }
 
-    /// `FSR = base_lo + offset`: W = offset low byte, W += the RAM global's
-    /// byte address, then FSR = W. Bank-0 arrays only — the base must fit
-    /// the 8-bit ADDLW literal.
-    fn emit_fsr_setup(&mut self, base: &str, offset: &Val) {
-        let base_lo = self.global_addr(base);
+    /// `W = RAM[ptr + byte_off]` — one byte of a pointer load or a memcpy
+    /// source. Direct bases read the plain file register; dynamic bases set
+    /// FSR first and read INDF; a const (flash) base reads via
+    /// `CALL __read_<name>` (the RETLW table leaves the byte in W).
+    fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
+        match ptr {
+            Val::Reg(r) => {
+                if let (Base::Global(name), k, terms) = self.resolved_for(r) {
+                    if self.global_is_const(&name) {
+                        // RETLW table read: W = index = k + Σ s×%reg + off.
+                        self.emit_ptr_index_w(k, &terms, byte_off);
+                        self.emit(format!("    CALL __read_{name}"));
+                        return;
+                    }
+                }
+            }
+            Val::Global(g) => {
+                if self.global_is_const(g) {
+                    // A const global used directly as a pointer (memcpy src):
+                    // W = byte index, CALL the RETLW table reader.
+                    self.emit(format!("    MOVLW 0x{byte_off:02X}"));
+                    self.emit(format!("    CALL __read_{g}"));
+                    return;
+                }
+            }
+            Val::Const(_) => panic!("isel: load through a constant pointer"),
+        }
+        match self.emit_ptr_setup(ptr, byte_off) {
+            Addr::Direct(a) => self.emit(format!("    MOVF 0x{a:02X}, W")),
+            Addr::Indirect => self.emit("    MOVF INDF, W".to_string()),
+        }
+    }
+
+    /// `RAM[ptr + byte_off] = W` — the store side of a byte access (memcpy
+    /// destinations; `emit_ptr_store_byte` composes a val load before it).
+    fn emit_ptr_store_w(&mut self, ptr: &Val, byte_off: u8) {
+        match self.emit_ptr_setup(ptr, byte_off) {
+            Addr::Direct(a) => self.emit(format!("    MOVWF 0x{a:02X}")),
+            Addr::Indirect => self.emit("    MOVWF INDF".to_string()),
+        }
+    }
+
+    /// `RAM[ptr + byte_off] = byte byte_off of val`.
+    fn emit_ptr_store_byte(&mut self, ptr: &Val, byte_off: u8, val: &Val) {
+        // The address setup comes first — its FSR/scratch computation
+        // clobbers W, so the value is loaded only after FSR is final.
+        match self.emit_ptr_setup(ptr, byte_off) {
+            Addr::Direct(a) => {
+                self.emit_load_byte(val, byte_off);
+                self.emit(format!("    MOVWF 0x{a:02X}"));
+            }
+            Addr::Indirect => {
+                self.emit_load_byte(val, byte_off);
+                self.emit("    MOVWF INDF".to_string());
+            }
+        }
+    }
+
+    /// `FSR = base_addr + k + byte_off + Σ scale×%reg`. A single scale-1
+    /// term keeps the M5 fast shape (`MOVF %r,W; ADDLW base+k; MOVWF FSR`);
+    /// general sums accumulate in the fixed scratch byte first. The static
+    /// FSR base (before the runtime terms) must sit in bank 0 (≤ 0xFF) —
+    /// IRP multi-bank FSR is a later milestone, so anything past it fails
+    /// loudly rather than emitting an unrepresentable ADDLW literal.
+    fn emit_fsr_to(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        let base_k = base_addr + u16::from(k) + u16::from(byte_off);
         assert!(
-            base_lo <= 0xFF,
-            "isel: indirect base @{base} at 0x{base_lo:02X} needs a banked FSR setup"
+            base_k <= 0xFF,
+            "isel: FSR base 0x{base_k:02X} (base 0x{base_addr:02X} + k {k} + off {byte_off}) out of bank-0 range (IRP follow-up)"
         );
-        self.emit_load_byte(offset, 0); // W = offset low byte
-        self.emit(format!("    ADDLW 0x{base_lo:02X}")); // W = base + offset
-        self.emit("    MOVWF FSR".to_string());
+        match terms {
+            [(1, r)] => {
+                let a = self.val_addr(&Val::Reg(r.clone()));
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                self.emit(format!("    ADDLW 0x{base_k:02X}"));
+                self.emit("    MOVWF FSR".to_string());
+            }
+            _ => {
+                self.emit_accum_terms(terms);
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    ADDLW 0x{base_k:02X}"));
+                self.emit("    MOVWF FSR".to_string());
+            }
+        }
     }
 
-    /// `dst = ram[base + offset]` via FSR/INDF (i8 only, like the spike).
-    fn emit_ram_indirect_load(&mut self, base: &str, offset: &Val, dst: u16, ty: Ty) {
-        assert!(ty.bytes() == 1, "isel: multi-byte indirect load not supported");
-        self.emit_fsr_setup(base, offset);
-        self.emit("    MOVF INDF, W".to_string());
-        self.emit(format!("    MOVWF 0x{dst:02X}"));
+    /// Indirect (sret) FSR setup: `FSR = [slot] + k + byte_off + Σ terms`.
+    /// The slot holds the target address (the caller's sret ABI asserts it
+    /// ≤ 0xFF when it is stored); the static k + off must fit the ADDLW
+    /// literal.
+    fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        let kk = u16::from(k) + u16::from(byte_off);
+        assert!(
+            kk <= 0xFF,
+            "isel: indirect offset k {k} + off {byte_off} out of byte range"
+        );
+        if terms.is_empty() {
+            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
+            self.emit(format!("    ADDLW 0x{kk:02X}"));
+            self.emit("    MOVWF FSR".to_string());
+        } else {
+            self.emit_accum_terms(terms);
+            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
+            self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
+            self.emit(format!("    ADDLW 0x{kk:02X}"));
+            self.emit("    MOVWF FSR".to_string());
+        }
     }
 
-    /// `ram[base + offset] = val` via FSR/INDF (i8 only, like the spike).
-    fn emit_ram_indirect_store(&mut self, base: &str, offset: &Val, val: &Val, ty: Ty) {
-        assert!(ty.bytes() == 1, "isel: multi-byte indirect store not supported");
-        self.emit_fsr_setup(base, offset);
-        self.emit_load_byte(val, 0);
-        self.emit("    MOVWF INDF".to_string());
+    /// `scratch = Σ scale×%reg`: W = 0, then per term W = %r once and
+    /// `ADDWF scratch,W; MOVWF scratch` `scale` times (×2 repeats the add).
+    fn emit_accum_terms(&mut self, terms: &[(u8, String)]) {
+        self.emit("    MOVLW 0x00".to_string());
+        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        for (scale, r) in terms {
+            let a = self.val_addr(&Val::Reg(r.clone()));
+            self.emit(format!("    MOVF 0x{a:02X}, W"));
+            for _ in 0..*scale {
+                self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+            }
+        }
     }
 
-    /// `dst = flash_table[offset]`: W = index, CALL __read_<base> (a RETLW
-    /// table), W = the selected byte -> dst. i8 only, like the spike.
-    fn emit_const_read(&mut self, base: &str, offset: &Val, dst: u16, ty: Ty) {
-        assert!(ty.bytes() == 1, "isel: multi-byte const load not supported");
-        self.emit_load_byte(offset, 0); // W = offset (index)
-        self.emit(format!("    CALL __read_{base}"));
-        self.emit(format!("    MOVWF 0x{dst:02X}"));
+    /// `W = k + byte_off + Σ scale×%reg` — the byte index into a const
+    /// (flash) table before `CALL __read_<name>`. A single scale-1 term
+    /// keeps the M5 `MOVF %r,W` shape (ADDLW only when k + off is nonzero);
+    /// general sums accumulate in scratch.
+    fn emit_ptr_index_w(&mut self, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        let kk = u16::from(k) + u16::from(byte_off);
+        assert!(kk <= 0xFF, "isel: const index k {k} + off {byte_off} out of byte range");
+        match terms {
+            [] => self.emit(format!("    MOVLW 0x{kk:02X}")),
+            [(1, r)] => {
+                let a = self.val_addr(&Val::Reg(r.clone()));
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                if kk != 0 {
+                    self.emit(format!("    ADDLW 0x{kk:02X}"));
+                }
+            }
+            _ => {
+                self.emit_accum_terms(terms);
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    ADDLW 0x{kk:02X}"));
+            }
+        }
     }
 
     /// W = byte `idx` of `val`.
@@ -561,17 +733,22 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
                     }
                 } else {
-                    // A GEP-created pointer: const bases read via a RETLW
-                    // table; RAM bases via FSR/INDF.
+                    // A GEP-created pointer: const (flash) bases keep the
+                    // RETLW path (i8 only); RAM bases go through the shared
+                    // byte machinery (direct or FSR/INDF).
                     let r = l.ptr.strip_prefix('%').unwrap_or_else(|| {
                         panic!("isel: pointer {:?} is not @global or %reg", l.ptr)
                     });
-                    let g = self.gep_for(r);
-                    let (base, offset) = Self::gep_to_base_offset(&g);
-                    if self.global_is_const(&base) {
-                        self.emit_const_read(&base, &offset, dst, l.ty);
-                    } else {
-                        self.emit_ram_indirect_load(&base, &offset, dst, l.ty);
+                    let ptr = Val::Reg(r.to_string());
+                    if let (Base::Global(name), _, _) = self.resolved_for(r) {
+                        assert!(
+                            !self.global_is_const(&name) || l.ty.bytes() == 1,
+                            "isel: multi-byte const load not supported"
+                        );
+                    }
+                    for k in 0..l.ty.bytes() {
+                        self.emit_ptr_load_byte(&ptr, k);
+                        self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
                     }
                 }
             }
@@ -584,16 +761,30 @@ impl<'m> Gen<'m> {
                     let r = s.ptr.strip_prefix('%').unwrap_or_else(|| {
                         panic!("isel: pointer {:?} is not @global or %reg", s.ptr)
                     });
-                    let g = self.gep_for(r);
-                    let (base, offset) = Self::gep_to_base_offset(&g);
-                    assert!(
-                        !self.global_is_const(&base),
-                        "isel: store to const (flash) global @{base}"
-                    );
-                    self.emit_ram_indirect_store(&base, &offset, &s.val, s.ty);
+                    let (base, _, _) = self.resolved_for(r);
+                    if let Base::Global(name) = &base {
+                        assert!(
+                            !self.global_is_const(name),
+                            "isel: store to const (flash) global @{name}"
+                        );
+                    }
+                    let ptr = Val::Reg(r.to_string());
+                    for k in 0..s.ty.bytes() {
+                        self.emit_ptr_store_byte(&ptr, k, &s.val);
+                    }
                 }
             }
             Inst::Gep(_) => {} // virtual: lowered at each load/store use
+            Inst::Alloca(_) => {} // virtual: the slot is sized by alloc; lowered at each use
+            Inst::Memcpy(m) => {
+                // Byte loop over the same pointer machinery: src[i] -> dst[i].
+                // Each byte re-resolves both pointers (dst itself may be a
+                // base+k+i expression), exactly like a per-byte load/store.
+                for i in 0..m.len {
+                    self.emit_ptr_load_byte(&m.src, i);
+                    self.emit_ptr_store_w(&m.dst, i);
+                }
+            }
             Inst::Bin(b) => {
                 assert!(b.ty != Ty::I1, "isel: only i8/i16 binops supported");
                 let da = self.slot_addr(self.cur_func, &b.dst);
@@ -818,16 +1009,100 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         "    goto __start".to_string(),
         "".to_string(),
     ];
-    // Phase-3 pointers: collect every GEP so a load/store through a pointer
-    // reg can find its (base global, offset). Keyed `{func}::{dst}` like
-    // every other local. Gep itself is virtual — it emits nothing.
+    // Phase-3 pointers: collect every GEP and resolve its chain eagerly to a
+    // folded `(base, k, terms)`, keyed `{func}::{reg}` like every other
+    // local. Seeds first: a byval param slot IS the struct copy
+    // (Slot(name, false)); an sret param slot holds the target address
+    // (Slot(name, true)); an alloca defines its own buffer slot
+    // (Slot(name, false)). Gep itself is virtual — it emits nothing.
     let mut geps: HashMap<String, Gep> = HashMap::new();
+    let mut resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
     for f in &m.funcs {
+        for p in &f.params {
+            if p.byval.is_some() {
+                resolved.insert(
+                    ssa_key(&f.name, &p.name),
+                    (Base::Slot(p.name.clone(), false), 0, Vec::new()),
+                );
+            } else if p.sret {
+                resolved.insert(
+                    ssa_key(&f.name, &p.name),
+                    (Base::Slot(p.name.clone(), true), 0, Vec::new()),
+                );
+            }
+        }
         for b in &f.blocks {
             for i in &b.insts {
-                if let Inst::Gep(g) = i {
-                    geps.insert(ssa_key(&f.name, &g.dst), g.clone());
+                match i {
+                    Inst::Gep(g) => {
+                        geps.insert(ssa_key(&f.name, &g.dst), g.clone());
+                    }
+                    Inst::Alloca(a) => {
+                        resolved.insert(
+                            ssa_key(&f.name, &a.dst),
+                            (Base::Slot(a.dst.clone(), false), 0, Vec::new()),
+                        );
+                    }
+                    _ => {}
                 }
+            }
+        }
+    }
+    // Chain folding (fixpoint scan): a GEP whose base is a `Reg` folds in
+    // that reg's own resolved entry — `k` adds, terms concatenate
+    // (inner-first: terms_inner + terms_outer) — until the base is a Global
+    // or a seeded Slot. A base that is neither a gep nor a seed panics; a
+    // pass that makes no progress with unresolved geeps left is a cycle and
+    // panics loudly.
+    for f in &m.funcs {
+        let fname = f.name.clone();
+        let mut pending: Vec<(String, Gep)> = geps
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
+            .map(|(k, g)| (k.clone(), g.clone()))
+            .collect();
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            let mut rest = Vec::new();
+            for (key, g) in pending {
+                match &g.base {
+                    GepBase::Global(name) => {
+                        assert!(
+                            !resolved.contains_key(&key),
+                            "isel: duplicate definition of pointer reg {key}"
+                        );
+                        resolved.insert(key, (Base::Global(name.clone()), g.k, g.terms.clone()));
+                        progressed = true;
+                    }
+                    GepBase::Reg(r) => {
+                        let rkey = ssa_key(&fname, r);
+                        if let Some((b, kk, tt)) = resolved.get(&rkey).cloned() {
+                            assert!(
+                                !resolved.contains_key(&key),
+                                "isel: duplicate definition of pointer reg {key}"
+                            );
+                            let mut terms = tt.clone();
+                            terms.extend(g.terms.clone());
+                            let k = g.k.checked_add(kk).unwrap_or_else(|| {
+                                panic!("isel: gep offset overflow in {key}")
+                            });
+                            resolved.insert(key, (b, k, terms));
+                            progressed = true;
+                        } else if geps.contains_key(&rkey) {
+                            rest.push((key, g)); // may resolve on a later pass
+                        } else {
+                            panic!(
+                                "isel: no gep for pointer %{r} (chain base missing, key {rkey})"
+                            );
+                        }
+                    }
+                }
+            }
+            pending = rest;
+            if !progressed && !pending.is_empty() {
+                let names: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
+                panic!("isel: cyclic gep chain involving {names:?}");
             }
         }
     }
@@ -838,7 +1113,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         let mut g = Gen {
             m,
             addrs,
-            geps: &geps,
+            resolved: &resolved,
             scratch,
             retval_lo,
             cur_func: &f.name,

@@ -11,7 +11,7 @@ fn emits_add_for_in_plus_one() {
     // Milestone 3: locals come from the map too, keyed `{func}::{name}`.
     // alloc: globals in=0x20/out=0x21 -> end_of_globals 0x22 -> the root
     // frame starts at 0x25, so main's locals land at 0x25/0x26.
-    let m = parse("global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::1", 0x25), ("main::2", 0x26)]);
     let asm = select(&m, &addrs);
     assert!(asm.contains("MOVF 0x20, W"));
@@ -23,7 +23,7 @@ fn emits_add_for_in_plus_one() {
 
 #[test]
 fn store_const_emits_movlw_not_movf() {
-    let m = parse("global out i8\nfn main() -> void\n  block entry:\n    store i8 5 @out\n    ret void\n");
+    let m = parse("global out i8\nfn main(void) ()\n  block entry:\n    store i8 5 @out\n    ret void\n");
     let mut addrs = HashMap::new();
     addrs.insert("out".to_string(), 0x21u16);
     let asm = select(&m, &addrs);
@@ -34,7 +34,7 @@ fn store_const_emits_movlw_not_movf() {
 
 #[test]
 fn add_const_lhs_uses_addlw() {
-    let m = parse("global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %x = add i8 5, %1\n    store i8 %x @out\n    ret void\n");
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %x = add i8 5, %1\n    store i8 %x @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::1", 0x25), ("main::x", 0x26)]);
     let asm = select(&m, &addrs);
     assert!(asm.contains("ADDLW 0x05"), "const-LHS add should use the ADDLW path:\n{asm}");
@@ -46,7 +46,7 @@ fn add_const_lhs_uses_addlw() {
 #[test]
 #[should_panic(expected = "only i8/i16 loads supported")]
 fn panics_on_i1_load() {
-    let m = parse("global in i8\nfn main() -> void\n  block entry:\n    %1 = load i1 @in\n    ret void\n");
+    let m = parse("global in i8\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    ret void\n");
     select(&m, &HashMap::new());
 }
 
@@ -55,7 +55,7 @@ fn panics_on_i1_load() {
 fn panics_when_local_address_missing_from_map() {
     // Every local address comes from the map; a missing entry must fail
     // loudly instead of allocating a slot internally.
-    let m = parse("global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let _ = select(&m, &addrs);
 }
@@ -63,7 +63,7 @@ fn panics_when_local_address_missing_from_map() {
 #[test]
 fn add16_reg_reg_emits_carry_chain() {
     let m = parse(
-        "global x i16\nglobal y i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %r = add i16 %a, %b\n    store i16 %r @out\n    ret void\n",
+        "global x i16\nglobal y i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %r = add i16 %a, %b\n    store i16 %r @out\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B,
     // %r=0x2D in IR order.
@@ -92,7 +92,7 @@ fn add16_reg_const_emits_carry_chain() {
     // 515 = 0x0203 -> lo 0x03, hi 0x02 (hi differs from the carry ADDLW 0x01,
     // so the k_hi add line is distinguishable).
     let m = parse(
-        "global in i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @in\n    %r = add i16 %a, 515\n    store i16 %r @out\n    ret void\n",
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @in\n    %r = add i16 %a, 515\n    store i16 %r @out\n    ret void\n",
     );
     // alloc: globals end at 0x24 -> root frame at 0x27; %a=0x27, %r=0x29.
     let addrs = addrs(&[
@@ -122,7 +122,7 @@ fn i16_local_uses_consecutive_map_addresses() {
     let globals: String = (0..16).map(|i| format!("global g{i} i8\n")).collect();
     let loads: String = (0..16).map(|i| format!("    %a{i} = load i8 @g{i}\n")).collect();
     let m = parse(&format!(
-        "{globals}global out i16\nfn main() -> void\n  block entry:\n{loads}    %r = load i16 @out\n    store i16 %r @out\n    ret void\n"
+        "{globals}global out i16\nfn main(void) ()\n  block entry:\n{loads}    %r = load i16 @out\n    store i16 %r @out\n    ret void\n"
     ));
     let mut addrs: HashMap<String, u16> = (0..16).map(|i| (format!("g{i}"), 0x20 + i)).collect();
     addrs.insert("out".to_string(), 0x30u16);
@@ -140,7 +140,7 @@ fn i16_local_uses_consecutive_map_addresses() {
 fn and16_reg_const_uses_andlw() {
     // 4660 = 0x1234 -> lo 0x34, hi 0x12.
     let m = parse(
-        "global in i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @in\n    %r = and i16 %a, 4660\n    store i16 %r @out\n    ret void\n",
+        "global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @in\n    %r = and i16 %a, 4660\n    store i16 %r @out\n    ret void\n",
     );
     // alloc: root frame at 0x27; %a=0x27, %r=0x29.
     let addrs = addrs(&[
@@ -162,7 +162,7 @@ fn and16_reg_const_uses_andlw() {
 #[test]
 fn zext_trunc_pair() {
     let m = parse(
-        "global in i8\nglobal out16 i16\nglobal out8 i8\nfn main() -> void\n  block entry:\n    %v = load i8 @in\n    %z = zext i8 %v to i16\n    store i16 %z @out16\n    %t = trunc i16 %z to i8\n    store i8 %t @out8\n    ret void\n",
+        "global in i8\nglobal out16 i16\nglobal out8 i8\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %z = zext i8 %v to i16\n    store i16 %z @out16\n    %t = trunc i16 %z to i8\n    store i8 %t @out8\n    ret void\n",
     );
     // alloc: in=0x20, out16 (i16, even-aligned)=0x22, out8=0x24 ->
     // end_of_globals 0x24 -> root frame at 0x27; %v=0x27, %z=0x28, %t=0x2A.
@@ -186,7 +186,7 @@ fn zext_trunc_pair() {
 #[test]
 fn sext_i8_to_i16_copies_low_and_sign_fills_high() {
     let m = parse(
-        "global in i8\nglobal out16 i16\nfn main() -> void\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out16\n    ret void\n",
+        "global in i8\nglobal out16 i16\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out16\n    ret void\n",
     );
     // alloc: in=0x20, out16 (i16, even-aligned)=0x22 -> end_of_globals 0x24
     // -> root frame at 0x27; %v=0x27, %s=0x28 (hi 0x29).
@@ -212,7 +212,7 @@ fn sext_i8_to_i16_copies_low_and_sign_fills_high() {
 fn sext_i8_to_i16_simulates_sign_extension() {
     use pic14_sim::Pic14;
     let m = parse(
-        "global in i8\nglobal out i16\nfn main() -> void\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out\n    ret void\n",
+        "global in i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out\n    ret void\n",
     );
     let map = addrs(&[
         ("in", 0x20u16),
@@ -245,7 +245,7 @@ fn sext_i8_to_i16_simulates_sign_extension() {
 #[test]
 fn phi_copy_lands_before_terminator_of_each_predecessor() {
     let m = parse(
-        "global x i16\nglobal y i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    br merge\n  block thenb:\n    %b = load i16 @y\n    br merge\n  block merge:\n    %p = phi i16 %a entry %b thenb\n    store i16 %p @out\n    ret void\n",
+        "global x i16\nglobal y i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    br merge\n  block thenb:\n    %b = load i16 @y\n    br merge\n  block merge:\n    %p = phi i16 %a entry %b thenb\n    store i16 %p @out\n    ret void\n",
     );
     // alloc: root frame at 0x29; %a=0x29, %b=0x2B, %p=0x2D in IR order.
     let addrs = addrs(&[
@@ -280,7 +280,7 @@ fn phi_copy_chain_emits_dependent_copies_in_order() {
     // before %q's — never the reverse, which would clobber %a's value in
     // flight.
     let m = parse(
-        "global x i8\nglobal y i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    br merge\n  block merge:\n    %p = phi i8 %a entry\n    %q = phi i8 %p entry\n    store i8 %q @out\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    br merge\n  block merge:\n    %p = phi i8 %a entry\n    %q = phi i8 %p entry\n    store i8 %q @out\n    ret void\n",
     );
     // alloc: root frame at 0x26; %a=0x26, %p=0x27, %q=0x28 (IR order).
     let addrs = addrs(&[
@@ -307,7 +307,7 @@ fn panics_on_cyclic_phi_copies() {
     // slot, so no emit order works without a temp register; isel must panic
     // loudly instead of silently miscompiling.
     let m = parse(
-        "global x i8\nglobal y i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    br merge\n  block merge:\n    %p = phi i8 %q entry\n    %q = phi i8 %p entry\n    ret void\n",
+        "global x i8\nglobal y i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    br merge\n  block merge:\n    %p = phi i8 %q entry\n    %q = phi i8 %p entry\n    ret void\n",
     );
     // alloc: root frame at 0x25; %a=0x25, %p=0x26, %q=0x27.
     let addrs = addrs(&[
@@ -323,7 +323,7 @@ fn panics_on_cyclic_phi_copies() {
 #[test]
 fn icmp_eq_i8_materializes_i1() {
     let m = parse(
-        "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    store i8 %c @out\n    ret void\n",
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    store i8 %c @out\n    ret void\n",
     );
     // alloc: root frame at 0x25; %1=0x25, %c=0x26.
     let addrs = addrs(&[
@@ -346,7 +346,7 @@ fn icmp_eq_i8_materializes_i1() {
 #[test]
 fn icmp_eq_i16_uses_scratch_accumulation() {
     let m = parse(
-        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp eq i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+        "global x i16\nglobal y i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp eq i16 %a, %b\n    store i8 %c @out\n    ret void\n",
     );
     // alloc: globals end at 0x25 -> root frame at 0x28; %a=0x28, %b=0x2A,
     // %c=0x2C.
@@ -374,7 +374,7 @@ fn icmp_eq_i16_uses_scratch_accumulation() {
 #[test]
 fn brcond_and_select_emit_skip_lines() {
     let m = parse(
-        "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    %s = select i1 %c i8 10 i8 20\n    br i1 %c then end\n  block then:\n    store i8 %s @out\n    br end\n  block end:\n    ret void\n",
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    %s = select i1 %c i8 10 i8 20\n    br i1 %c then end\n  block then:\n    store i8 %s @out\n    br end\n  block end:\n    ret void\n",
     );
     // alloc: root frame at 0x25; %1=0x25, %c=0x26, %s=0x27.
     let addrs = addrs(&[
@@ -406,10 +406,10 @@ fn select_labels_are_unique_across_functions() {
     // the second function's labels must differ from the first's.
     let m = parse(
         "global a i8\nglobal b i8\nglobal o1 i8\nglobal o2 i8\n\
-         fn main() -> void\n  block entry:\n\
+         fn main(void) ()\n  block entry:\n\
            %1 = load i8 @a\n    %c1 = icmp eq i8 %1, 0\n\
            %s1 = select i1 %c1 i8 1 i8 2\n    store i8 %s1 @o1\n    ret void\n\
-         fn f2() -> void\n  block entry:\n\
+         fn f2(void) ()\n  block entry:\n\
            %2 = load i8 @b\n    %c2 = icmp eq i8 %2, 0\n\
            %s2 = select i1 %c2 i8 3 i8 4\n    store i8 %s2 @o2\n    ret void\n",
     );
@@ -447,7 +447,7 @@ fn locals_use_map_addresses_around_scratch_and_retval() {
     // more, so a local is used at exactly the map address alloc provides —
     // here 0x73/0x74, past the fixed scratch/retval bytes.
     let m = parse(
-        "global in i8\nfn main() -> void\n  block entry:\n\
+        "global in i8\nfn main(void) ()\n  block entry:\n\
            %a0 = load i8 @in\n    %c = icmp eq i8 %a0, 0\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x6F), ("main::a0", 0x73), ("main::c", 0x74)]);
@@ -468,9 +468,9 @@ fn call_copies_args_to_callee_params_and_reads_retval() {
     // frame is 0x29..0x2E (6 bytes), add's frame follows at 0x2F.
     let m = parse(
         "global a i16\nglobal b i16\nglobal out i16\n\
-         fn add(i16 %x, i16 %y) -> i16\n  block entry:\n\
+         fn add(i16) (x, y)\n  block entry:\n\
            %r = add i16 %x, %y\n    ret i16 %r\n\
-         fn main() -> void\n  block entry:\n\
+         fn main(void) ()\n  block entry:\n\
            %1 = load i16 @a\n    %2 = load i16 @b\n\
            %3 = call i16 @add(i16 %1, i16 %2)\n    store i16 %3 @out\n    ret void\n",
     );
@@ -510,7 +510,7 @@ fn ret_i16_copies_value_to_retval_and_returns() {
     // ret i16 %v: copy %v into the fixed retval slots (0x71/0x72) then
     // RETURN.
     let m = parse(
-        "global x i16\nfn main() -> i16\n  block entry:\n\
+        "global x i16\nfn main(i16) ()\n  block entry:\n\
            %v = load i16 @x\n    ret i16 %v\n",
     );
     // alloc: root frame at 0x25; %v=0x25.
@@ -532,9 +532,9 @@ fn call_arg_copies_target_callee_param_slots_from_map() {
     // never clobbers the caller's operands before CALL.
     let m = parse(
         "global a i16\nglobal b i16\nglobal out i16\n\
-         fn add(i16 %x, i16 %y) -> i16\n  block entry:\n\
+         fn add(i16) (x, y)\n  block entry:\n\
            %r = add i16 %x, %y\n    ret i16 %r\n\
-         fn main() -> void\n  block entry:\n\
+         fn main(void) ()\n  block entry:\n\
            %1 = load i16 @a\n    %2 = load i16 @b\n\
            %3 = call i16 @add(i16 %1, i16 %2)\n    store i16 %3 @out\n    ret void\n",
     );
@@ -617,8 +617,8 @@ fn gep_ram_indirect_and_const_retlw() {
     // nothing, so `%p`/`%t` need no slots.
     let m = pointer_module(
         "global in i8\nglobal ram i8\nconst table i8\n\
-         fn main() -> void\n  block entry:\n\
-           %i = load i8 @in\n    %p = gep @ram %i\n    %t = gep @table %i\n\
+         fn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @ram +0 +1*%i\n    %t = gep @table +0 +1*%i\n\
            %v = load i8 %t\n    %w = load i8 %p\n    store i8 %v %p\n    ret void\n",
     );
     // alloc: in=0x20, ram (8 bytes) 0x21..0x28 -> end_of_globals 0x29;
@@ -671,11 +671,233 @@ fn panics_on_store_to_const_gep() {
     // into one is a write to ROM and must fail loudly, never silently emit
     // a FSR/INDF store to a nonexistent RAM address.
     let m = pointer_module(
-        "global in i8\nconst table i8\nfn main() -> void\n  block entry:\n\
-           %i = load i8 @in\n    %t = gep @table %i\n    store i8 %i %t\n    ret void\n",
+        "global in i8\nconst table i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %t = gep @table +0 +1*%i\n    store i8 %i %t\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x20), ("main::i", 0x29)]);
     let _ = select(&m, &addrs);
+}
+
+// ---- Task 3: pointer machinery (bases, chains, FSR sums, indirect, memcpy) ----
+
+#[test]
+fn gep_const_offset_loads_direct_no_fsr() {
+    // %p = gep @g +2: a constant byte offset into a RAM global is a plain
+    // file-register read — no FSR setup for a statically-known address.
+    let m = parse(
+        "global g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %p = gep @g +2\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    // g=0x20 (a 3+ byte array), out=0x24; locals: %v=0x29 (%p is virtual).
+    let addrs = addrs(&[("g", 0x20), ("out", 0x24), ("main::v", 0x29)]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("MOVF 0x22, W"), "direct byte-offset load at g+2:\n{asm}");
+    assert!(!asm.contains("MOVWF FSR"), "no FSR setup for a constant offset:\n{asm}");
+    assert!(asm.contains("MOVWF 0x24"), "store to @out:\n{asm}");
+}
+
+#[test]
+fn gep_single_term_uses_fsr_fast_path() {
+    // %p = gep @a +1 +1*%i: one scale-1 term keeps the M5 fast shape —
+    // MOVF %i,W; ADDLW <a_lo + k>; MOVWF FSR — with the constant k folded
+    // into the ADDLW literal.
+    let m = parse(
+        "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @a +1 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    // in=0x20, a=0x21 (array), out=0x25; locals: %i=0x29, %v=0x2A.
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("a", 0x21),
+        ("out", 0x25),
+        ("main::i", 0x29),
+        ("main::v", 0x2A),
+    ]);
+    let asm = select(&m, &addrs);
+    assert!(
+        asm.contains("MOVF 0x29, W\n    ADDLW 0x22\n    MOVWF FSR\n    MOVF INDF, W\n    MOVWF 0x2A"),
+        "fast path: FSR = a_lo + k + i (0x21 + 1):\n{asm}"
+    );
+}
+
+#[test]
+fn gep_scaled_sum_accumulates_in_scratch() {
+    // %p = gep @a +1 +2*%i: a ×2-scaled term cannot fold into the fast
+    // path's ADDLW — the sum accumulates in the fixed scratch byte, then
+    // FSR = base + k + scratch. A two-register sum (+1*%i +1*%j) uses the
+    // same accumulation in term order.
+    let m = parse(
+        "global in i8\nglobal jn i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %j = load i8 @jn\n    %p = gep @a +1 +2*%i\n    %v = load i8 %p\n    store i8 %v @out\n    %q = gep @a +1 +1*%i +1*%j\n    %w = load i8 %q\n    store i8 %w @out\n    ret void\n",
+    );
+    // in=0x20, jn=0x21, a=0x22 (array), out=0x26; locals: %i=0x29, %j=0x2A,
+    // %v=0x2B, %w=0x2C. scratch = fixed 0x70.
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("jn", 0x21),
+        ("a", 0x22),
+        ("out", 0x26),
+        ("main::i", 0x29),
+        ("main::j", 0x2A),
+        ("main::v", 0x2B),
+        ("main::w", 0x2C),
+    ]);
+    let asm = select(&m, &addrs);
+    // scale-2 term: scratch = 2×%i via a repeated ADDWF, then FSR = scratch + a_lo + k.
+    assert!(
+        asm.contains("MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
+        "scaled term accumulates in scratch:\n{asm}"
+    );
+    // two distinct terms accumulate in order (i then j), same FSR finish.
+    assert!(
+        asm.contains("MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
+        "two-term sum accumulates both terms:\n{asm}"
+    );
+}
+
+#[test]
+fn sret_param_store_is_indirect_via_slot_contents() {
+    // An sret param slot holds the *target address*; a store through it
+    // must set FSR from the slot's contents — never treat the slot itself
+    // as the destination.
+    let m = parse(
+        "global v i8\nfn make(i8) (r=sret)\n  block entry:\n\
+           %x = load i8 @v\n    %p = gep %r +0\n    store i8 %x %p\n    ret void\n",
+    );
+    // v=0x20; make's frame: %x=0x25, sret slot r=0x26 (2 bytes).
+    let addrs = addrs(&[("v", 0x20), ("make::x", 0x25), ("make::r", 0x26)]);
+    let asm = select(&m, &addrs);
+    assert!(
+        asm.contains("MOVF 0x26, W\n    ADDLW 0x00\n    MOVWF FSR\n    MOVF 0x25, W\n    MOVWF INDF"),
+        "FSR comes from the slot contents [r_lo] + k:\n{asm}"
+    );
+}
+
+#[test]
+fn memcpy_emits_byte_pairs() {
+    // memcpy @g1 @g2 4: four MOVF src+i,W / MOVWF dst+i byte copies — no
+    // loop and no FSR for direct global addresses.
+    let m = parse(
+        "global g1 i8\nglobal g2 i8\nfn main(void) ()\n  block entry:\n    memcpy @g1 @g2 4\n    ret void\n",
+    );
+    // g1=0x20 (4 bytes), g2=0x24 (4 bytes).
+    let addrs = addrs(&[("g1", 0x20), ("g2", 0x24)]);
+    let asm = select(&m, &addrs);
+    for i in 0..4u16 {
+        assert!(
+            asm.contains(&format!("MOVF 0x{:02X}, W\n    MOVWF 0x{:02X}", 0x24 + i, 0x20 + i)),
+            "byte {i} copy:\n{asm}"
+        );
+    }
+    assert!(!asm.contains("MOVWF FSR"), "direct globals need no FSR setup:\n{asm}");
+}
+
+#[test]
+fn alloca_based_pointer_accesses_direct_slot() {
+    // %buf = alloca 4 defines a local buffer slot; %p = gep %buf +2 points
+    // into it at a constant offset, so accesses are plain file-register
+    // reads/writes — no FSR for a statically-known local address.
+    let m = parse(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %buf = alloca 4\n    %p = gep %buf +2\n    %v = load i8 @in\n    store i8 %v %p\n    %w = load i8 %p\n    store i8 %w @out\n    ret void\n",
+    );
+    // in=0x20, out=0x21; main's frame: %buf=0x25 (4 bytes), %v=0x29,
+    // %w=0x2A; %p is virtual (no slot).
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::buf", 0x25),
+        ("main::v", 0x29),
+        ("main::w", 0x2A),
+    ]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("MOVWF 0x27"), "store into buf+2:\n{asm}");
+    assert!(asm.contains("MOVF 0x27, W"), "load from buf+2:\n{asm}");
+    assert!(!asm.contains("MOVWF FSR"), "constant alloca offset needs no FSR setup:\n{asm}");
+}
+
+#[test]
+fn byval_param_base_accesses_direct_slot() {
+    // A byval param slot holds the struct copy; %p = gep %0 +2 addresses a
+    // field at a constant byte offset inside it — a plain file-register
+    // read from the param slot.
+    let m = parse(
+        "global out i8\nfn f(i8) (0=byval4)\n  block entry:\n\
+           %p = gep %0 +2\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    // f's frame: param slot 0=0x25 (4 bytes), %v=0x29.
+    let addrs = addrs(&[("out", 0x21), ("f::0", 0x25), ("f::v", 0x29)]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("MOVF 0x27, W"), "byval field byte at slot+2:\n{asm}");
+    assert!(!asm.contains("MOVWF FSR"), "direct byval slot needs no FSR setup:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "bank-0")]
+fn panics_on_banked_fsr_base() {
+    // FSR reaches only the low 256 bytes (IRP is a later milestone): a
+    // dynamic-index base past bank 0 must fail loudly rather than emit an
+    // ADDLW literal that cannot express the address.
+    let m = parse(
+        "global in i8\nglobal far i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @far +0 +1*%i\n    %v = load i8 %p\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("far", 0x120), ("main::i", 0x29), ("main::v", 0x2A)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "cyclic")]
+fn panics_on_cyclic_gep_chain() {
+    // %p = gep %q +0; %q = gep %p +0: neither chain can fold to a base —
+    // isel must panic loudly instead of looping forever or miscompiling.
+    let m = parse(
+        "global a i8\nfn main(void) ()\n  block entry:\n\
+           %p = gep %q +0\n    %q = gep %p +0\n    ret void\n",
+    );
+    let _ = select(&m, &HashMap::new());
+}
+
+#[test]
+fn gep_chain_s8_pattern_simulates() {
+    // The s8 pattern: %p = gep @a +1; %q = gep %p +1 +1*%i — a GEP whose
+    // base is another GEP. The chain folds to @a + 2 + i; the sim must
+    // read exactly that byte. in=0x20, a=0x21..0x24, out=0x25; locals
+    // %i=0x29, %v=0x2A.
+    let ir = "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %p = gep @a +1\n    %q = gep %p +1 +1*%i\n    %v = load i8 %q\n    store i8 %v @out\n    ret void\n";
+    let map = [
+        ("in", 0x20u16),
+        ("a", 0x21),
+        ("out", 0x25),
+        ("main::i", 0x29),
+        ("main::v", 0x2A),
+    ];
+    let m = parse(ir);
+    let asm = select(&m, &addrs(&map));
+    // The chain folds k = 1 + 1 = 2 into the fast path's ADDLW literal.
+    assert!(
+        asm.contains("MOVF 0x29, W\n    ADDLW 0x23\n    MOVWF FSR\n    MOVF INDF, W"),
+        "chained gep folds to @a + 2 + i (a_lo 0x21 + 2 = 0x23):\n{asm}"
+    );
+    // in = 1 -> a[2+1] = a[3] = 0x44; in = 0 -> a[2] = 0x33.
+    let seed = [
+        (0x20u16, 1u8),
+        (0x21, 0x11),
+        (0x22, 0x22),
+        (0x23, 0x33),
+        (0x24, 0x44),
+    ];
+    assert_eq!(sim_run(ir, &map, &seed, 0x25), 0x44, "a[2+1] with i=1");
+    assert_eq!(
+        sim_run(
+            ir,
+            &map,
+            &[(0x20, 0), (0x21, 0x11), (0x22, 0x22), (0x23, 0x33), (0x24, 0x44)],
+            0x25,
+        ),
+        0x33,
+        "a[2+0] with i=0"
+    );
 }
 
 #[test]
@@ -693,7 +915,7 @@ fn parse_map_accepts_const_lines() {
 fn sub_i8_reg_reg_emits_subwf() {
     // d = a - b: MOVF b,W (W=b); SUBWF a,W (W = a - W = a - b); MOVWF d.
     let m = parse(
-        "global x i8\nglobal y i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = sub i8 %a, %b\n    store i8 %r @out\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = sub i8 %a, %b\n    store i8 %r @out\n    ret void\n",
     );
     // alloc: globals end at 0x23 -> root frame at 0x26; %a=0x26, %b=0x27, %r=0x28.
     let addrs = addrs(&[
@@ -717,7 +939,7 @@ fn sub_i8_reg_const_emits_subwf_in_correct_direction() {
     // SUBWF f,W always computes f - W, so the const goes in W via MOVLW and
     // the register is the file operand — never SUBLW (which would be k - a).
     let m = parse(
-        "global x i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 %a, 5\n    store i8 %r @out\n    ret void\n",
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 %a, 5\n    store i8 %r @out\n    ret void\n",
     );
     // alloc: globals end at 0x22 -> root frame at 0x25; %a=0x25, %r=0x26.
     let addrs = addrs(&[
@@ -740,7 +962,7 @@ fn sub_i16_reg_reg_emits_borrow_chain() {
     // d = a - b (i16): lo byte SUBWF, then hi byte with a borrow folded in
     // via BTFSS STATUS,0 / ADDLW 1 before the hi SUBWF.
     let m = parse(
-        "global x i16\nglobal y i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %r = sub i16 %a, %b\n    store i16 %r @out\n    ret void\n",
+        "global x i16\nglobal y i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %r = sub i16 %a, %b\n    store i16 %r @out\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B, %r=0x2D.
     let addrs = addrs(&[
@@ -768,7 +990,7 @@ fn sub_i16_reg_const_emits_borrow_chain() {
     // 515 = 0x0203 -> lo 0x03, hi 0x02 (hi differs from the borrow ADDLW
     // 0x01, so the k_hi MOVLW line is distinguishable).
     let m = parse(
-        "global x i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %r = sub i16 %a, 515\n    store i16 %r @out\n    ret void\n",
+        "global x i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %r = sub i16 %a, 515\n    store i16 %r @out\n    ret void\n",
     );
     // alloc: globals end at 0x24 -> root frame at 0x27; %a=0x27, %r=0x29.
     let addrs = addrs(&[
@@ -795,7 +1017,7 @@ fn panics_on_sub_const_lhs() {
     // sub is NOT commutative: d = k - a cannot reuse the reg-const lowering
     // (which computes a - k) and must not read a const as a file register.
     let m = parse(
-        "global x i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 5, %a\n    store i8 %r @out\n    ret void\n",
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 5, %a\n    store i8 %r @out\n    ret void\n",
     );
     let addrs = addrs(&[
         ("x", 0x20),
@@ -810,7 +1032,7 @@ fn panics_on_sub_const_lhs() {
 fn and_i8_uses_andwf_andlw() {
     // reg-reg: MOVF b,W; ANDWF a,W; MOVWF d. reg-const: MOVF a,W; ANDLW k.
     let m = parse(
-        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = and i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = and i8 %a, 5\n    store i8 %r2 @o2\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = and i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = and i8 %a, 5\n    store i8 %r2 @o2\n    ret void\n",
     );
     // alloc: x=0x20,y=0x21,o1=0x22,o2=0x23 -> end 0x24 -> root 0x27;
     // %a=0x27, %b=0x28, %r1=0x29, %r2=0x2A.
@@ -837,7 +1059,7 @@ fn and_i8_uses_andwf_andlw() {
 #[test]
 fn or_i8_and_i16_use_ior() {
     let m = parse(
-        "global x i8\nglobal y i8\nglobal o8 i8\nglobal p i16\nglobal q i16\nglobal o16 i16\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = or i8 %a, %b\n    store i8 %r @o8\n    %c = load i16 @p\n    %d = load i16 @q\n    %s = or i16 %c, %d\n    store i16 %s @o16\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal o8 i8\nglobal p i16\nglobal q i16\nglobal o16 i16\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = or i8 %a, %b\n    store i8 %r @o8\n    %c = load i16 @p\n    %d = load i16 @q\n    %s = or i16 %c, %d\n    store i16 %s @o16\n    ret void\n",
     );
     // alloc: x=0x20,y=0x21,o8=0x22,p(i16)=0x24,q=0x26,o16=0x28 -> end 0x2A ->
     // root 0x2D; %a=0x2D, %b=0x2E, %r=0x2F, %c=0x30, %d=0x32, %s=0x34.
@@ -871,7 +1093,7 @@ fn or_const_lhs_swaps_to_iorlw() {
     // Commutative or: a const LHS is swapped to the RHS so the IORLW path is
     // used, never reading a const as a file-register address.
     let m = parse(
-        "global x i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %r = or i8 5, %a\n    store i8 %r @out\n    ret void\n",
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r = or i8 5, %a\n    store i8 %r @out\n    ret void\n",
     );
     // alloc: globals end at 0x22 -> root frame at 0x25; %a=0x25, %r=0x26.
     let addrs = addrs(&[
@@ -889,7 +1111,7 @@ fn or_const_lhs_swaps_to_iorlw() {
 #[test]
 fn xor_i8_and_i16_use_xor() {
     let m = parse(
-        "global x i8\nglobal y i8\nglobal o8 i8\nglobal p i16\nglobal q i16\nglobal o16 i16\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = xor i8 %a, %b\n    store i8 %r @o8\n    %c = load i16 @p\n    %d = load i16 @q\n    %s = xor i16 %c, %d\n    store i16 %s @o16\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal o8 i8\nglobal p i16\nglobal q i16\nglobal o16 i16\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = xor i8 %a, %b\n    store i8 %r @o8\n    %c = load i16 @p\n    %d = load i16 @q\n    %s = xor i16 %c, %d\n    store i16 %s @o16\n    ret void\n",
     );
     // alloc: x=0x20,y=0x21,o8=0x22,p(i16)=0x24,q=0x26,o16=0x28 -> end 0x2A ->
     // root 0x2D; %a=0x2D, %b=0x2E, %r=0x2F, %c=0x30, %d=0x32, %s=0x34.
@@ -991,7 +1213,7 @@ fn sub_direction_simulates_correctly() {
 #[test]
 fn icmp_unsigned_i8_materializes_flag_predicates() {
     let m = parse(
-        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp ult i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = icmp uge i8 %a, %b\n    store i8 %r2 @o2\n    %r3 = icmp ugt i8 %a, %b\n    store i8 %r3 @o3\n    %r4 = icmp ule i8 %a, %b\n    store i8 %r4 @o4\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp ult i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = icmp uge i8 %a, %b\n    store i8 %r2 @o2\n    %r3 = icmp ugt i8 %a, %b\n    store i8 %r3 @o3\n    %r4 = icmp ule i8 %a, %b\n    store i8 %r4 @o4\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2A,
     // %r1=0x2B, %r2=0x2C, %r3=0x2D, %r4=0x2E.
@@ -1041,7 +1263,7 @@ fn icmp_unsigned_i8_materializes_flag_predicates() {
 #[test]
 fn icmp_signed_i8_complements_sign_bit() {
     let m = parse(
-        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp slt i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = icmp sge i8 %a, %b\n    store i8 %r2 @o2\n    %r3 = icmp sgt i8 %a, %b\n    store i8 %r3 @o3\n    %r4 = icmp sle i8 %a, %b\n    store i8 %r4 @o4\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp slt i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = icmp sge i8 %a, %b\n    store i8 %r2 @o2\n    %r3 = icmp sgt i8 %a, %b\n    store i8 %r3 @o3\n    %r4 = icmp sle i8 %a, %b\n    store i8 %r4 @o4\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2A,
     // %r1=0x2B, %r2=0x2C, %r3=0x2D, %r4=0x2E. scratch = fixed 0x70.
@@ -1092,7 +1314,7 @@ fn icmp_ne_i8_inverts_eq_materialization() {
     // ne = !Z: the same XOR accumulation as eq, but BTFSS instead of BTFSC
     // so the i1 is 1 exactly when the accumulator is non-zero (a != b).
     let m = parse(
-        "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %c = icmp ne i8 %1, 1\n    store i8 %c @out\n    ret void\n",
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %c = icmp ne i8 %1, 1\n    store i8 %c @out\n    ret void\n",
     );
     // alloc: root frame at 0x25; %1=0x25, %c=0x26.
     let addrs = addrs(&[
@@ -1121,7 +1343,7 @@ fn icmp_ult_i16_emits_borrow_chain() {
     // !C. The chain's final Z is a byte-level flag, so C-only predicates
     // never need the equality accumulation.
     let m = parse(
-        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp ult i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+        "global x i16\nglobal y i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp ult i16 %a, %b\n    store i8 %c @out\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B,
     // %c=0x2D.
@@ -1151,7 +1373,7 @@ fn icmp_ugt_i16_accumulates_equality_for_z() {
     // accumulation (which preserves C), because the chain's final Z only
     // reflects the high byte.
     let m = parse(
-        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp ugt i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+        "global x i16\nglobal y i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp ugt i16 %a, %b\n    store i8 %c @out\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B,
     // %c=0x2D.
@@ -1182,7 +1404,7 @@ fn icmp_slt_i16_complements_sign_bit_in_scratch() {
     // operand), b_hi ^ 0x80 goes in W, and the borrow chain runs against
     // them — C = (a16 >= b16) signed. slt = !C.
     let m = parse(
-        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp slt i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+        "global x i16\nglobal y i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp slt i16 %a, %b\n    store i8 %c @out\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B,
     // %c=0x2D.
@@ -1212,7 +1434,7 @@ fn icmp_const_operands_use_literal_paths() {
     // (k - W), since a const can never be read as a file register. Signed
     // consts fold the 0x80 sign complement into the literal.
     let m = parse(
-        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp ult i8 %a, 9\n    store i8 %r1 @o1\n    %r2 = icmp ult i8 5, %b\n    store i8 %r2 @o2\n    %r3 = icmp slt i8 %a, -1\n    store i8 %r3 @o3\n    %r4 = icmp sge i8 5, %b\n    store i8 %r4 @o4\n    ret void\n",
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp ult i8 %a, 9\n    store i8 %r1 @o1\n    %r2 = icmp ult i8 5, %b\n    store i8 %r2 @o2\n    %r3 = icmp slt i8 %a, -1\n    store i8 %r3 @o3\n    %r4 = icmp sge i8 5, %b\n    store i8 %r4 @o4\n    ret void\n",
     );
     // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2A,
     // %r1=0x2B, %r2=0x2C, %r3=0x2D, %r4=0x2E.
@@ -1566,7 +1788,7 @@ fn assembled_cmp_predicates_run_in_sim() {
     // i8: a=0x20, b=0x21, out=0x22; locals 0x25..0x27.
     let ir8 = |pred: &str| {
         format!(
-            "global a i8\nglobal b i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %x = load i8 @a\n    %y = load i8 @b\n    %c = icmp {pred} i8 %x, %y\n    store i8 %c @out\n    ret void\n"
+            "global a i8\nglobal b i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %x = load i8 @a\n    %y = load i8 @b\n    %c = icmp {pred} i8 %x, %y\n    store i8 %c @out\n    ret void\n"
         )
     };
     let a8 = [
@@ -1603,7 +1825,7 @@ fn assembled_cmp_predicates_run_in_sim() {
     // i16: a=0x20/21, b=0x22/23, out=0x24; locals 0x28..0x2C.
     let ir16 = |pred: &str| {
         format!(
-            "global a i16\nglobal b i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %x = load i16 @a\n    %y = load i16 @b\n    %c = icmp {pred} i16 %x, %y\n    store i8 %c @out\n    ret void\n"
+            "global a i16\nglobal b i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %x = load i16 @a\n    %y = load i16 @b\n    %c = icmp {pred} i16 %x, %y\n    store i8 %c @out\n    ret void\n"
         )
     };
     let a16 = [
