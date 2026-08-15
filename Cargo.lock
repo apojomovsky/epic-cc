@@ -68,6 +68,7 @@ dependencies = [
 name = "legalize"
 version = "0.1.0"
 dependencies = [
+ "alloc",
  "ir",
 ]
 

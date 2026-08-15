@@ -7,6 +7,9 @@ publish = false
 [dependencies]
 ir = { path = "../ir" }
 
+[dev-dependencies]
+alloc = { path = "../alloc" }
+
 [[bin]]
 name = "legalize"
 path = "src/bin/legalize.rs"
