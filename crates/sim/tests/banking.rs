@@ -76,6 +76,22 @@ fn rp1_selects_bank_2() {
 }
 
 #[test]
+fn rp0_rp1_select_bank_3() {
+    // RP0=1 + RP1=1 (bank 3): write f=0x20 -> physical 0x1A0.
+    let mut p = Pic14::new(vec![
+        BSF_RP1,
+        BSF_RP0,
+        0x3044, // MOVLW 0x44
+        0x00A0, // MOVWF 0x20
+    ]);
+    p.run(1000);
+    assert_eq!(p.ram()[0x1A0], 0x44);
+    assert_eq!(p.ram()[0x20], 0x00); // bank 0 cell untouched
+    assert_eq!(p.ram()[0xA0], 0x00); // bank 1 cell untouched
+    assert_eq!(p.ram()[0x120], 0x00); // bank 2 cell untouched
+}
+
+#[test]
 fn indf_uses_irp_for_upper_half() {
     // FSR=0x20. With IRP=1, MOVWF INDF hits physical 0x120; with IRP=0 it hits
     // physical 0x20.
