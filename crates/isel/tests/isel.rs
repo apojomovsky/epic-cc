@@ -918,3 +918,658 @@ fn sub_direction_simulates_correctly() {
         assert_eq!(p.ram()[0x25], 0x00, "i16 const sub hi with borrow");
     }
 }
+
+// ---- Task 3: all icmp predicates ----
+
+// The compare prefix for "a op b" is MOVF b,W; SUBWF a,W: SUBWF f,W computes
+// f - W, so C = (a >= b) and Z = (a == b) unsigned. The predicate
+// materializations then read C/Z directly:
+//   ult = !C    uge = C    ugt = C && !Z    ule = !C || Z
+// Signed compares first XOR the sign byte with 0x80 (signed order ==
+// unsigned order of (v ^ 0x80)), so the same C/Z logic applies to the
+// complemented operands.
+
+#[test]
+fn icmp_unsigned_i8_materializes_flag_predicates() {
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp ult i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = icmp uge i8 %a, %b\n    store i8 %r2 @o2\n    %r3 = icmp ugt i8 %a, %b\n    store i8 %r3 @o3\n    %r4 = icmp ule i8 %a, %b\n    store i8 %r4 @o4\n    ret void\n",
+    );
+    // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2A,
+    // %r1=0x2B, %r2=0x2C, %r3=0x2D, %r4=0x2E.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("o1", 0x22),
+        ("o2", 0x23),
+        ("o3", 0x24),
+        ("o4", 0x25),
+        ("main::a", 0x29),
+        ("main::b", 0x2A),
+        ("main::r1", 0x2B),
+        ("main::r2", 0x2C),
+        ("main::r3", 0x2D),
+        ("main::r4", 0x2E),
+    ]);
+    let asm = select(&m, &addrs);
+    // Compare prefix: %a=0x29, %b=0x2A.
+    assert_eq!(
+        asm.matches("MOVF 0x2A, W\n    SUBWF 0x29, W").count(),
+        4,
+        "four compares must share the MOVF b,W; SUBWF a,W prefix:\n{asm}"
+    );
+    // ult = !C: MOVLW 0; BTFSS STATUS,0; MOVLW 1.
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x2B"),
+        "ult = !C:\n{asm}"
+    );
+    // uge = C: MOVLW 0; BTFSC STATUS,0; MOVLW 1.
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x2C"),
+        "uge = C:\n{asm}"
+    );
+    // ugt = C && !Z: MOVLW 0; BTFSC C; MOVLW 1; BTFSC Z; MOVLW 0.
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    MOVLW 0x01\n    BTFSC STATUS, 2 ; Z\n    MOVLW 0x00\n    MOVWF 0x2D"),
+        "ugt = C && !Z:\n{asm}"
+    );
+    // ule = !C || Z: MOVLW 0; BTFSS C; MOVLW 1; BTFSC Z; MOVLW 1.
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    BTFSC STATUS, 2 ; Z\n    MOVLW 0x01\n    MOVWF 0x2E"),
+        "ule = !C || Z:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_signed_i8_complements_sign_bit() {
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp slt i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = icmp sge i8 %a, %b\n    store i8 %r2 @o2\n    %r3 = icmp sgt i8 %a, %b\n    store i8 %r3 @o3\n    %r4 = icmp sle i8 %a, %b\n    store i8 %r4 @o4\n    ret void\n",
+    );
+    // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2A,
+    // %r1=0x2B, %r2=0x2C, %r3=0x2D, %r4=0x2E. scratch = fixed 0x70.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("o1", 0x22),
+        ("o2", 0x23),
+        ("o3", 0x24),
+        ("o4", 0x25),
+        ("main::a", 0x29),
+        ("main::b", 0x2A),
+        ("main::r1", 0x2B),
+        ("main::r2", 0x2C),
+        ("main::r3", 0x2D),
+        ("main::r4", 0x2E),
+    ]);
+    let asm = select(&m, &addrs);
+    // Signed prefix: scratch = a ^ 0x80, W = b ^ 0x80, SUBWF scratch,W.
+    assert_eq!(
+        asm.matches("MOVLW 0x80\n    XORWF 0x29, W\n    MOVWF 0x70\n    MOVLW 0x80\n    XORWF 0x2A, W\n    SUBWF 0x70, W")
+            .count(),
+        4,
+        "signed compares must complement both sign bits before SUBWF:\n{asm}"
+    );
+    // slt = !C, sge = C, sgt = C && !Z, sle = !C || Z (same materialization
+    // as the unsigned forms, driven by the sign-complemented C).
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x2B"),
+        "slt = !C:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x2C"),
+        "sge = C:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    MOVLW 0x01\n    BTFSC STATUS, 2 ; Z\n    MOVLW 0x00\n    MOVWF 0x2D"),
+        "sgt = C && !Z:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    BTFSC STATUS, 2 ; Z\n    MOVLW 0x01\n    MOVWF 0x2E"),
+        "sle = !C || Z:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_ne_i8_inverts_eq_materialization() {
+    // ne = !Z: the same XOR accumulation as eq, but BTFSS instead of BTFSC
+    // so the i1 is 1 exactly when the accumulator is non-zero (a != b).
+    let m = parse(
+        "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %c = icmp ne i8 %1, 1\n    store i8 %c @out\n    ret void\n",
+    );
+    // alloc: root frame at 0x25; %1=0x25, %c=0x26.
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::c", 0x26),
+    ]);
+    let asm = select(&m, &addrs);
+    // %1=0x25, %c=0x26, scratch=0x70.
+    assert!(asm.contains("MOVF 0x25, W"), "load a:\n{asm}");
+    assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
+    assert!(asm.contains("MOVWF 0x70"), "store xor to scratch:\n{asm}");
+    assert!(asm.contains("BTFSS STATUS, 2"), "ne tests Z inverted (BTFSS):\n{asm}");
+    assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
+    assert!(asm.contains("MOVWF 0x26"), "store d:\n{asm}");
+    assert!(
+        !asm.contains("BTFSC STATUS, 2"),
+        "ne must not use the eq-direction Z test:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_ult_i16_emits_borrow_chain() {
+    // i16 unsigned: the SUBWF borrow chain leaves C = (a16 >= b16); ult =
+    // !C. The chain's final Z is a byte-level flag, so C-only predicates
+    // never need the equality accumulation.
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp ult i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B,
+    // %c=0x2D.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x22),
+        ("out", 0x24),
+        ("main::a", 0x29),
+        ("main::b", 0x2B),
+        ("main::c", 0x2D),
+    ]);
+    let asm = select(&m, &addrs);
+    // %a=0x29/2A, %b=0x2B/2C, %c=0x2D.
+    assert!(
+        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x2A, W"),
+        "i16 borrow chain:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x2D"),
+        "ult = !C on the chain C:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_ugt_i16_accumulates_equality_for_z() {
+    // ugt = C && !Z at i16: C from the borrow chain, Z from the XOR
+    // accumulation (which preserves C), because the chain's final Z only
+    // reflects the high byte.
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp ugt i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B,
+    // %c=0x2D.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x22),
+        ("out", 0x24),
+        ("main::a", 0x29),
+        ("main::b", 0x2B),
+        ("main::c", 0x2D),
+    ]);
+    let asm = select(&m, &addrs);
+    // Chain first (C), then the eq accumulation (Z = a == b), then
+    // C && !Z. %a=0x29/2A, %b=0x2B/2C, scratch=0x70.
+    assert!(
+        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x2A, W\n    MOVF 0x29, W\n    XORWF 0x2B, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    XORWF 0x2C, W\n    IORWF 0x70, W\n    MOVWF 0x70"),
+        "chain then equality accumulation:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    MOVLW 0x01\n    BTFSC STATUS, 2 ; Z\n    MOVLW 0x00\n    MOVWF 0x2D"),
+        "ugt = C && !Z:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_slt_i16_complements_sign_bit_in_scratch() {
+    // i16 signed: a_hi ^ 0x80 is stored in the scratch byte (the SUBWF file
+    // operand), b_hi ^ 0x80 goes in W, and the borrow chain runs against
+    // them — C = (a16 >= b16) signed. slt = !C.
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %c = icmp slt i16 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B,
+    // %c=0x2D.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x22),
+        ("out", 0x24),
+        ("main::a", 0x29),
+        ("main::b", 0x2B),
+        ("main::c", 0x2D),
+    ]);
+    let asm = select(&m, &addrs);
+    // %a=0x29/2A, %b=0x2B/2C, scratch=0x70.
+    assert!(
+        asm.contains("MOVLW 0x80\n    XORWF 0x2A, W\n    MOVWF 0x70\n    MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVLW 0x80\n    XORWF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x70, W"),
+        "signed i16 chain with a_hi ^ 0x80 in scratch:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x2D"),
+        "slt = !C:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_const_operands_use_literal_paths() {
+    // A const RHS is the SUBWF subtrahend via MOVLW; a const LHS uses SUBLW
+    // (k - W), since a const can never be read as a file register. Signed
+    // consts fold the 0x80 sign complement into the literal.
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nglobal o4 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = icmp ult i8 %a, 9\n    store i8 %r1 @o1\n    %r2 = icmp ult i8 5, %b\n    store i8 %r2 @o2\n    %r3 = icmp slt i8 %a, -1\n    store i8 %r3 @o3\n    %r4 = icmp sge i8 5, %b\n    store i8 %r4 @o4\n    ret void\n",
+    );
+    // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2A,
+    // %r1=0x2B, %r2=0x2C, %r3=0x2D, %r4=0x2E.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("o1", 0x22),
+        ("o2", 0x23),
+        ("o3", 0x24),
+        ("o4", 0x25),
+        ("main::a", 0x29),
+        ("main::b", 0x2A),
+        ("main::r1", 0x2B),
+        ("main::r2", 0x2C),
+        ("main::r3", 0x2D),
+        ("main::r4", 0x2E),
+    ]);
+    let asm = select(&m, &addrs);
+    // const RHS: MOVLW 9; SUBWF a,W.
+    assert!(
+        asm.contains("MOVLW 0x09\n    SUBWF 0x29, W"),
+        "const RHS via MOVLW/SUBWF:\n{asm}"
+    );
+    // const LHS: MOVF b,W; SUBLW 5.
+    assert!(
+        asm.contains("MOVF 0x2A, W\n    SUBLW 0x05"),
+        "const LHS via SUBLW:\n{asm}"
+    );
+    // signed const RHS: sign complement folded into the literal:
+    // MOVLW (0xFF ^ 0x80) = 0x7F; SUBWF scratch,W (the signed file-LHS
+    // compares against the complemented a stored in scratch).
+    assert!(
+        asm.contains("MOVLW 0x7F\n    SUBWF 0x70, W"),
+        "signed const RHS folds ^0x80 into the literal:\n{asm}"
+    );
+    // signed const LHS: MOVLW 0x80; XORWF b,W; SUBLW (5 ^ 0x80) = 0x85.
+    assert!(
+        asm.contains("MOVLW 0x80\n    XORWF 0x2A, W\n    SUBLW 0x85"),
+        "signed const LHS folds ^0x80 into SUBLW:\n{asm}"
+    );
+}
+
+#[test]
+fn cmp_predicates_simulate_correctly() {
+    // End-to-end flag check: the exact word sequences isel emits for each
+    // i8 predicate, run in pic14_sim with seeded operands, must produce the
+    // right i1. RAM: a=0x20, b=0x22, out=0x24; scratch=0x70. This is what
+    // validates a wrong flag direction — e.g. ult must come out 1 for
+    // a=5,b=9 and 0 for a=9,b=5.
+    use pic14_sim::Pic14;
+    // Compare prefix: MOVF b,W(0x0822) SUBWF a,W(0x0220).
+    let pre = vec![0x0822, 0x0220];
+    // ult = !C: MOVLW 0(0x3000) BTFSS C(0x1C03) MOVLW 1(0x3001) MOVWF out(0x00A4).
+    let ult = |pre: &[u16]| {
+        let mut v = pre.to_vec();
+        v.extend([0x3000, 0x1C03, 0x3001, 0x00A4]);
+        v
+    };
+    // uge = C: MOVLW 0 BTFSC C(0x1803) MOVLW 1.
+    let uge = |pre: &[u16]| {
+        let mut v = pre.to_vec();
+        v.extend([0x3000, 0x1803, 0x3001, 0x00A4]);
+        v
+    };
+    // ugt = C && !Z: MOVLW 0 BTFSC C MOVLW 1 BTFSC Z(0x1903) MOVLW 0.
+    let ugt = |pre: &[u16]| {
+        let mut v = pre.to_vec();
+        v.extend([0x3000, 0x1803, 0x3001, 0x1903, 0x3000, 0x00A4]);
+        v
+    };
+    // ule = !C || Z: MOVLW 0 BTFSS C MOVLW 1 BTFSC Z MOVLW 1.
+    let ule = |pre: &[u16]| {
+        let mut v = pre.to_vec();
+        v.extend([0x3000, 0x1C03, 0x3001, 0x1903, 0x3001, 0x00A4]);
+        v
+    };
+    // ne = !Z: MOVF a,W(0x0820) XORWF b,W(0x0622) MOVWF scratch(0x00F0)
+    // MOVLW 0 BTFSS Z(0x1D03) MOVLW 1 MOVWF out.
+    let ne = || vec![0x0820, 0x0622, 0x00F0, 0x3000, 0x1D03, 0x3001, 0x00A4];
+    // Signed prefix: MOVLW 0x80(0x3080) XORWF a,W(0x0620) MOVWF scratch(0x00F0)
+    // MOVLW 0x80 XORWF b,W(0x0622) SUBWF scratch,W(0x0270).
+    let spre = || vec![0x3080, 0x0620, 0x00F0, 0x3080, 0x0622, 0x0270];
+    // slt = !C, sge = C, sgt = C && !Z, sle = !C || Z on the signed prefix.
+    let slt = || {
+        let mut v = spre();
+        v.extend([0x3000, 0x1C03, 0x3001, 0x00A4]);
+        v
+    };
+    let sgt = || {
+        let mut v = spre();
+        v.extend([0x3000, 0x1803, 0x3001, 0x1903, 0x3000, 0x00A4]);
+        v
+    };
+
+    // ult: 5 < 9 -> 1; 9 < 5 -> 0.
+    {
+        let mut p = Pic14::new(ult(&pre));
+        p.ram_mut()[0x20] = 5;
+        p.ram_mut()[0x22] = 9;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "ult(5,9) must be 1");
+    }
+    {
+        let mut p = Pic14::new(ult(&pre));
+        p.ram_mut()[0x20] = 9;
+        p.ram_mut()[0x22] = 5;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "ult(9,5) must be 0");
+    }
+
+    // uge: 9 >= 5 -> 1; 5 >= 9 -> 0.
+    {
+        let mut p = Pic14::new(uge(&pre));
+        p.ram_mut()[0x20] = 9;
+        p.ram_mut()[0x22] = 5;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "uge(9,5) must be 1");
+    }
+    {
+        let mut p = Pic14::new(uge(&pre));
+        p.ram_mut()[0x20] = 5;
+        p.ram_mut()[0x22] = 9;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "uge(5,9) must be 0");
+    }
+
+    // ugt: 9 > 5 -> 1; 9 > 9 -> 0 (equality must clear Z-driven result).
+    {
+        let mut p = Pic14::new(ugt(&pre));
+        p.ram_mut()[0x20] = 9;
+        p.ram_mut()[0x22] = 5;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "ugt(9,5) must be 1");
+    }
+    {
+        let mut p = Pic14::new(ugt(&pre));
+        p.ram_mut()[0x20] = 9;
+        p.ram_mut()[0x22] = 9;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "ugt(9,9) must be 0");
+    }
+
+    // ule: 5 <= 9 -> 1; 9 <= 5 -> 0; 9 <= 9 -> 1.
+    {
+        let mut p = Pic14::new(ule(&pre));
+        p.ram_mut()[0x20] = 5;
+        p.ram_mut()[0x22] = 9;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "ule(5,9) must be 1");
+    }
+    {
+        let mut p = Pic14::new(ule(&pre));
+        p.ram_mut()[0x20] = 9;
+        p.ram_mut()[0x22] = 5;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "ule(9,5) must be 0");
+    }
+    {
+        let mut p = Pic14::new(ule(&pre));
+        p.ram_mut()[0x20] = 9;
+        p.ram_mut()[0x22] = 9;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "ule(9,9) must be 1");
+    }
+
+    // ne: 5 != 9 -> 1; 5 == 5 -> 0.
+    {
+        let mut p = Pic14::new(ne());
+        p.ram_mut()[0x20] = 5;
+        p.ram_mut()[0x22] = 9;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "ne(5,9) must be 1");
+    }
+    {
+        let mut p = Pic14::new(ne());
+        p.ram_mut()[0x20] = 5;
+        p.ram_mut()[0x22] = 5;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "ne(5,5) must be 0");
+    }
+
+    // slt signed: -1 < 1 -> 1; 1 < -1 -> 0.
+    {
+        let mut p = Pic14::new(slt());
+        p.ram_mut()[0x20] = 0xFF; // a = -1
+        p.ram_mut()[0x22] = 0x01; // b = 1
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "slt(-1,1) must be 1");
+    }
+    {
+        let mut p = Pic14::new(slt());
+        p.ram_mut()[0x20] = 0x01; // a = 1
+        p.ram_mut()[0x22] = 0xFF; // b = -1
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "slt(1,-1) must be 0");
+    }
+
+    // sgt signed: 1 > -1 -> 1; -1 > 1 -> 0.
+    {
+        let mut p = Pic14::new(sgt());
+        p.ram_mut()[0x20] = 0x01;
+        p.ram_mut()[0x22] = 0xFF;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "sgt(1,-1) must be 1");
+    }
+    {
+        let mut p = Pic14::new(sgt());
+        p.ram_mut()[0x20] = 0xFF;
+        p.ram_mut()[0x22] = 0x01;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "sgt(-1,1) must be 0");
+    }
+}
+
+#[test]
+fn cmp_i16_simulates_correctly() {
+    // i16 flag logic end-to-end. RAM: a=0x20(lo)/0x21(hi), b=0x22/0x23,
+    // out=0x24; scratch=0x70.
+    use pic14_sim::Pic14;
+    // Unsigned i16 chain: MOVF b_lo(0x0822) SUBWF a_lo(0x0220)
+    // MOVF b_hi(0x0823) BTFSS C(0x1C03) ADDLW 1(0x3E01) SUBWF a_hi(0x0221).
+    let u16 = vec![0x0822, 0x0220, 0x0823, 0x1C03, 0x3E01, 0x0221];
+    // ult16 = chain + !C materialization.
+    let ult16 = {
+        let mut v = u16.clone();
+        v.extend([0x3000, 0x1C03, 0x3001, 0x00A4]);
+        v
+    };
+    // uge16 = chain + C materialization.
+    let uge16 = {
+        let mut v = u16.clone();
+        v.extend([0x3000, 0x1803, 0x3001, 0x00A4]);
+        v
+    };
+    // ugt16 = chain + eq accumulation (MOVF a_lo 0x0820, XORWF b_lo 0x0622,
+    // MOVWF scratch 0x00F0, MOVF a_hi 0x0821, XORWF b_hi 0x0623,
+    // IORWF scratch,W 0x0470, MOVWF scratch) + C && !Z materialization.
+    let ugt16 = {
+        let mut v = u16.clone();
+        v.extend([
+            0x0820, 0x0622, 0x00F0, 0x0821, 0x0623, 0x0470, 0x00F0, // Z = (a == b)
+            0x3000, 0x1803, 0x3001, 0x1903, 0x3000, 0x00A4, // C && !Z
+        ]);
+        v
+    };
+    // Signed i16 chain: MOVLW 0x80(0x3080) XORWF a_hi(0x0621) MOVWF scratch
+    // MOVF b_lo SUBWF a_lo MOVLW 0x80 XORWF b_hi(0x0623) BTFSS C ADDLW 1
+    // SUBWF scratch,W(0x0270).
+    let slt16 = {
+        let mut v = vec![0x3080, 0x0621, 0x00F0, 0x0822, 0x0220, 0x3080, 0x0623, 0x1C03, 0x3E01, 0x0270];
+        v.extend([0x3000, 0x1C03, 0x3001, 0x00A4]); // !C
+        v
+    };
+
+    // ult16: 0x0105 < 0x0106 -> 1; 0x0106 < 0x0105 -> 0 (high bytes equal,
+    // the low-byte borrow must decide).
+    {
+        let mut p = Pic14::new(ult16.clone());
+        p.ram_mut()[0x20] = 0x05; // a_lo
+        p.ram_mut()[0x21] = 0x01; // a_hi
+        p.ram_mut()[0x22] = 0x06; // b_lo
+        p.ram_mut()[0x23] = 0x01; // b_hi
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "ult16(0x0105,0x0106) must be 1");
+    }
+    {
+        let mut p = Pic14::new(ult16);
+        p.ram_mut()[0x20] = 0x06;
+        p.ram_mut()[0x21] = 0x01;
+        p.ram_mut()[0x22] = 0x05;
+        p.ram_mut()[0x23] = 0x01;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "ult16(0x0106,0x0105) must be 0");
+    }
+
+    // uge16: 0x0105 >= 0x0105 -> 1 (full equality, C from the chain).
+    {
+        let mut p = Pic14::new(uge16);
+        p.ram_mut()[0x20] = 0x05;
+        p.ram_mut()[0x21] = 0x01;
+        p.ram_mut()[0x22] = 0x05;
+        p.ram_mut()[0x23] = 0x01;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "uge16(0x0105,0x0105) must be 1");
+    }
+
+    // ugt16: 0x0106 > 0x0105 -> 1; 0x0105 > 0x0105 -> 0 (the equality
+    // accumulation must clear the result even though C is set).
+    {
+        let mut p = Pic14::new(ugt16.clone());
+        p.ram_mut()[0x20] = 0x06;
+        p.ram_mut()[0x21] = 0x01;
+        p.ram_mut()[0x22] = 0x05;
+        p.ram_mut()[0x23] = 0x01;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "ugt16(0x0106,0x0105) must be 1");
+    }
+    {
+        let mut p = Pic14::new(ugt16);
+        p.ram_mut()[0x20] = 0x05;
+        p.ram_mut()[0x21] = 0x01;
+        p.ram_mut()[0x22] = 0x05;
+        p.ram_mut()[0x23] = 0x01;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "ugt16(0x0105,0x0105) must be 0");
+    }
+
+    // slt16 signed: 0xFFFF (-1) < 0x0001 (1) -> 1; 0x0001 < 0xFFFF -> 0.
+    {
+        let mut p = Pic14::new(slt16.clone());
+        p.ram_mut()[0x20] = 0xFF; // a_lo
+        p.ram_mut()[0x21] = 0xFF; // a_hi (-1)
+        p.ram_mut()[0x22] = 0x01; // b_lo
+        p.ram_mut()[0x23] = 0x00; // b_hi (1)
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 1, "slt16(-1,1) must be 1");
+    }
+    {
+        let mut p = Pic14::new(slt16);
+        p.ram_mut()[0x20] = 0x01;
+        p.ram_mut()[0x21] = 0x00;
+        p.ram_mut()[0x22] = 0xFF;
+        p.ram_mut()[0x23] = 0xFF;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0, "slt16(1,-1) must be 0");
+    }
+}
+
+/// Full end-to-end predicate check: `select()` emits the module's asm, the
+/// `asm` crate assembles the *actual emitted text* (labels/equ/org and all)
+/// into words, and pic14_sim runs the program against seeded operand
+/// globals. This validates that what isel emits — not just hand-encoded
+/// words — computes the right i1 for the whole pipeline. `out` is asserted
+/// via the fixed global address passed in.
+fn sim_run(ir_text: &str, map: &[(&str, u16)], seed: &[(u16, u8)], out: u16) -> u8 {
+    use pic14_sim::Pic14;
+    let m = parse(ir_text);
+    let asm = select(&m, &addrs(map));
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    for (a, v) in seed {
+        p.ram_mut()[*a as usize] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    p.ram()[out as usize]
+}
+
+#[test]
+fn assembled_cmp_predicates_run_in_sim() {
+    // i8: a=0x20, b=0x21, out=0x22; locals 0x25..0x27.
+    let ir8 = |pred: &str| {
+        format!(
+            "global a i8\nglobal b i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %x = load i8 @a\n    %y = load i8 @b\n    %c = icmp {pred} i8 %x, %y\n    store i8 %c @out\n    ret void\n"
+        )
+    };
+    let a8 = [
+        ("a", 0x20u16),
+        ("b", 0x21),
+        ("out", 0x22),
+        ("main::x", 0x25),
+        ("main::y", 0x26),
+        ("main::c", 0x27),
+    ];
+    for (pred, x, y, want) in [
+        ("ult", 5u8, 9u8, 1u8),
+        ("ult", 9, 5, 0),
+        ("ugt", 9, 5, 1),
+        ("ugt", 9, 9, 0),
+        ("uge", 9, 5, 1),
+        ("uge", 5, 9, 0),
+        ("ule", 5, 9, 1),
+        ("ule", 9, 5, 0),
+        ("ule", 9, 9, 1),
+        ("ne", 5, 9, 1),
+        ("ne", 5, 5, 0),
+        ("slt", 0xFF, 0x01, 1), // -1 < 1
+        ("slt", 0x01, 0xFF, 0), // 1 < -1
+        ("sgt", 0x01, 0xFF, 1), // 1 > -1
+        ("sgt", 0xFF, 0x01, 0), // -1 > 1
+        ("sge", 0x01, 0x01, 1),
+        ("sle", 0xFF, 0xFF, 1), // -1 <= -1
+    ] {
+        let got = sim_run(&ir8(pred), &a8, &[(0x20, x), (0x21, y)], 0x22);
+        assert_eq!(got, want, "assembled {pred}({x},{y}) must be {want}");
+    }
+
+    // i16: a=0x20/21, b=0x22/23, out=0x24; locals 0x28..0x2C.
+    let ir16 = |pred: &str| {
+        format!(
+            "global a i16\nglobal b i16\nglobal out i8\nfn main() -> void\n  block entry:\n    %x = load i16 @a\n    %y = load i16 @b\n    %c = icmp {pred} i16 %x, %y\n    store i8 %c @out\n    ret void\n"
+        )
+    };
+    let a16 = [
+        ("a", 0x20u16),
+        ("b", 0x22),
+        ("out", 0x24),
+        ("main::x", 0x28),
+        ("main::y", 0x2A),
+        ("main::c", 0x2C),
+    ];
+    for (pred, xlo, xhi, ylo, yhi, want) in [
+        ("ult", 0x05, 0x01, 0x06, 0x01, 1u8), // 0x0105 < 0x0106
+        ("ult", 0x06, 0x01, 0x05, 0x01, 0),   // 0x0106 < 0x0105
+        ("ugt", 0x06, 0x01, 0x05, 0x01, 1),   // 0x0106 > 0x0105
+        ("ugt", 0x05, 0x01, 0x05, 0x01, 0),   // equal
+        ("uge", 0x05, 0x01, 0x05, 0x01, 1),   // equal
+        ("slt", 0xFF, 0xFF, 0x01, 0x00, 1),   // -1 < 1
+        ("slt", 0x01, 0x00, 0xFF, 0xFF, 0),   // 1 < -1
+    ] {
+        let got = sim_run(
+            &ir16(pred),
+            &a16,
+            &[(0x20, xlo), (0x21, xhi), (0x22, ylo), (0x23, yhi)],
+            0x24,
+        );
+        assert_eq!(got, want, "assembled {pred}16(0x{xhi:02X}{xlo:02X},0x{yhi:02X}{ylo:02X}) must be {want}");
+    }
+}
