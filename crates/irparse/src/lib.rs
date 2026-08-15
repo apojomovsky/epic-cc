@@ -252,11 +252,13 @@ fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> 
     for f in fields {
         let (fsize, falign) = ty_size_align_opt(f, types)?;
         off = round_up(off, falign);
+        assert!(off <= 255, "irparse: struct field offset {off} exceeds 255 (byte-addressed)");
         infos.push(FieldInfo { offset: off as u8, ty: f.clone() });
         off += fsize;
         max_align = max_align.max(falign);
     }
     let size = round_up(off, max_align);
+    assert!(size <= 255, "irparse: struct size {size} exceeds 255 (byte-addressed)");
     Some(StructInfo { size: size as u8, align: max_align, fields: infos })
 }
 
@@ -415,6 +417,12 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
     for ip in index_parts {
         let ip = ip.trim();
         let idx = parse_val(ip.split_whitespace().last().unwrap());
+        if cur.starts_with('%') {
+            // A %struct.X source's first index is an array-of-struct element
+            // index, not a field selector; real struct descent isn't
+            // supported, so panic loudly instead of mis-folding.
+            panic!("irparse: gep on struct-typed source {cur} unsupported (struct descent not implemented)");
+        }
         let (stride, next) = stride_and_next(&cur, &idx, types);
         match &idx {
             Val::Const(c) => k += c * stride,
@@ -553,8 +561,14 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
                     sret = true;
                 } else if t.starts_with('%') {
                     name = t.trim_start_matches('%').to_string();
-                } else if t.starts_with("initializes") || t.starts_with('#') {
+                } else if t.starts_with("initializes")
+                    || t.starts_with("range(")
+                    || t.starts_with("align(")
+                    || t.starts_with('#')
+                {
                     // paren group / attr-group ref
+                } else {
+                    panic!("irparse: unsupported param type token {t:?} in {p:?}");
                 }
             }
         }
@@ -759,9 +773,10 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 let a = split_top_level(args_str, ',');
                 let dst = parse_call_ptr_val(a[0], types, fresh, &mut out);
                 let src = parse_call_ptr_val(a[1], types, fresh, &mut out);
-                let len: u8 = a[2].split_whitespace().last().unwrap().parse().unwrap();
-                let vol_tok = a[3].split_whitespace().last().unwrap();
-                assert!(!vol_tok.contains("true"), "irparse: volatile memcpy unsupported (loudly)");
+                // const-len <= 255 assert + non-const-len panic: len is u8
+                let len: u8 = a[2].split_whitespace().last().unwrap().parse().expect("irparse: memcpy len must be a const u8 <= 255");
+                // isvolatile (a[3] = `i1 true`/`i1 false`) is an LLVM
+                // optimization hint; our byte copy is identical either way.
                 out.push(Inst::Memcpy(Memcpy { dst, src, len }));
             } else if func.starts_with("llvm.lifetime.start") || func.starts_with("llvm.lifetime.end") {
                 // lifetime markers produce no IR
