@@ -42,20 +42,14 @@ fn main() {
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, 8);
 
-    // 6. alloc: GPR addresses for globals
-    m = alloc::allocate(m);
-    let map = alloc::address_map(&m);
+    // 6. alloc: complete overlay address map (globals + locals per function)
+    let layout = alloc::allocate(&m, &callgraph::edges_text(&cg));
 
-    // 7. isel: IR -> PIC14 assembly (address map lines: "global NAME 0xAA")
-    let addrs: HashMap<String, u8> = map
-        .lines()
-        .map(|l| {
-            let toks: Vec<&str> = l.split_whitespace().collect();
-            let n = toks[1].to_string();
-            let a = u8::from_str_radix(toks[2].trim_start_matches("0x"), 16).unwrap();
-            (n, a)
-        })
-        .collect();
+    // 7. isel: IR -> PIC14 assembly. Locals are keyed `{func}::{name}` in
+    // the map, matching what isel looks up for every value.
+    let mut addrs: HashMap<String, u8> = HashMap::new();
+    addrs.extend(layout.globals);
+    addrs.extend(layout.locals);
     let asm = isel::select(&m, &addrs);
 
     // 8-9. banking -> peephole
