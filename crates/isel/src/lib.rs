@@ -547,9 +547,11 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
             tmp: &mut tmp,
             out: Vec::new(),
         };
-        g.emit(format!("{0}:", f.name));
-        // Block label scheme: the entry block uses the bare function name;
-        // every other block is `{func}_L{label}`.
+        // Block label scheme: the entry block uses the bare function name
+        // (so CALLs and GOTOs resolve to it); every other block is
+        // `{func}_L{label}`. The entry block's label is emitted by the block
+        // loop below — no standalone function label here, or `main:` /
+        // `add:` would be defined twice and gpasm would reject the file.
         let mut labels: HashMap<String, String> = HashMap::new();
         for (i, b) in f.blocks.iter().enumerate() {
             let lbl = if i == 0 {
@@ -559,13 +561,57 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
             };
             labels.insert(b.label.clone(), lbl);
         }
-        // Reserve slots for every phi destination up front so the elimination
-        // copies land at stable, non-overlapping addresses regardless of the
-        // order in which the predecessor blocks are lowered.
+        // Reserve slots for every instruction destination up front so the
+        // elimination copies and forward references (a value defined in a
+        // later block but read by an earlier one, e.g. a call result feeding
+        // a trunc in the merge block) land at stable, non-overlapping
+        // addresses regardless of the order in which the blocks are lowered.
+        // Phi destinations are reserved first — that preserves the layout
+        // the unit tests document (phi dst first at 0x70, then loads etc. in
+        // block order). The `Ty` used for each destination must match the
+        // emit path below exactly, since it fixes the reserved width.
         for b in &f.blocks {
             for i in &b.insts {
                 if let Inst::Phi(p) = i {
                     g.slot(&p.dst, p.ty);
+                }
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Load(l) => {
+                        g.slot(&l.dst, l.ty);
+                        ()
+                    }
+                    Inst::Bin(b) => {
+                        g.slot(&b.dst, b.ty);
+                        ()
+                    }
+                    Inst::Zext(z) => {
+                        g.slot(&z.dst, z.to);
+                        ()
+                    }
+                    Inst::Trunc(t) => {
+                        g.slot(&t.dst, t.to);
+                        ()
+                    }
+                    Inst::Icmp(ic) => {
+                        g.slot(&ic.dst, Ty::I1);
+                        ()
+                    }
+                    Inst::Select(s) => {
+                        g.slot(&s.dst, s.ty);
+                        ()
+                    }
+                    Inst::Call(c) => {
+                        if let Some(d) = &c.dst {
+                            let t = c.ty.expect("isel: valued call must carry a type");
+                            g.slot(d, t);
+                        }
+                        ()
+                    }
+                    _ => {}
                 }
             }
         }

@@ -64,7 +64,11 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
     let mne = parts[0].to_ascii_uppercase();
     let op = parts.get(1).copied().unwrap_or("");
     let f = |s: &str| -> u16 {
-        let v = parse_num(s.trim_end_matches(','));
+        let t = s.trim_end_matches(',');
+        let v = match sym.get(t) {
+            Some(&v) => v,
+            None => parse_num(t),
+        };
         assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
         v as u16 & 0x7F
     };
@@ -89,7 +93,10 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         "SUBLW" => 0x3C00 | parse_num(op) as u16,
         "RETLW" => 0x3400 | parse_num(op) as u16,
         "BTFSC" | "BTFSS" | "BCF" | "BSF" => {
-            let (freg, b) = op.split_once(',').unwrap();
+            // Operands may be split across whitespace ("STATUS, 2"): join the
+            // remaining tokens back into one operand string before splitting.
+            let full = parts[1..].join(" ");
+            let (freg, b) = full.split_once(',').unwrap();
             let base = match mne.as_str() {
                 "BTFSC" => 0x1800,
                 "BTFSS" => 0x1C00,
