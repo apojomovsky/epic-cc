@@ -41,12 +41,12 @@ fn ssa_key(func: &str, name: &str) -> String {
     format!("{func}::{name}")
 }
 
-/// The runtime routine names legalize injects for mul/div/rem/shift. The ten
-/// mul/div/rem routines have recipe bodies (Task 3); the six shift routines
-/// are Task 4. An injected routine's entry block holds only a scratch alloca,
-/// so emitting it as-is would produce an empty label that silently falls
-/// through into the next function — a routine name with no recipe yet must
-/// panic loudly instead.
+/// The runtime routine names legalize injects for mul/div/rem/shift. All
+/// sixteen have recipe bodies (Task 3: mul/div/rem; Task 4: shifts). An
+/// injected routine's entry block holds only a scratch alloca, so emitting
+/// it as-is would produce an empty label that silently falls through into
+/// the next function — a routine name with no recipe yet must panic loudly
+/// instead.
 const ROUTINE_NAMES: [&str; 16] = [
     "__mul_u8",
     "__mul_u16",
@@ -939,9 +939,69 @@ impl<'m> Gen<'m> {
                     (BinOp::URem, _) => panic!("isel: urem not yet lowered (Task 3)"),
                     (BinOp::SDiv, _) => panic!("isel: sdiv not yet lowered (Task 3)"),
                     (BinOp::SRem, _) => panic!("isel: srem not yet lowered (Task 3)"),
-                    (BinOp::Shl, _) => panic!("isel: shl not yet lowered (Task 4)"),
-                    (BinOp::LShr, _) => panic!("isel: lshr not yet lowered (Task 4)"),
-                    (BinOp::AShr, _) => panic!("isel: ashr not yet lowered (Task 4)"),
+                    // Milestone-8 shifts: a const count inlines as a fixed
+                    // RLF/RRF sequence; k == 0 is a plain copy; k >= width
+                    // is LLVM poison and panics loudly. A variable (reg)
+                    // count must never reach isel — legalize rewrites it to
+                    // the routine call — so one arriving here is a legalize
+                    // regression and panics loudly too.
+                    (BinOp::Shl, _) | (BinOp::LShr, _) | (BinOp::AShr, _) => {
+                        let width = b.ty.bytes() as i64 * 8;
+                        let k = match &b.b {
+                            Val::Const(k) => *k,
+                            other => panic!(
+                                "isel: variable-count {:?} shift reached isel (count {other:?}); legalize must rewrite it to a routine call",
+                                b.op
+                            ),
+                        };
+                        assert!(
+                            (0..width).contains(&k),
+                            "isel: const shift count {k} out of range [0, {width}) (LLVM poison)"
+                        );
+                        // Copy the value into the dst slot, then rotate the
+                        // dst in place k times. shl: lo then hi (carry goes
+                        // up); lshr: hi then lo (bits come down); ashr: set C
+                        // from the sign bit before each rrf so the sign fills
+                        // every vacated bit.
+                        self.emit_move_val_to_slot(&b.a, b.ty, da);
+                        let n = b.ty.bytes();
+                        for _ in 0..k {
+                            match b.op {
+                                BinOp::Shl => {
+                                    self.emit("    BCF STATUS, 0");
+                                    for i in 0..n {
+                                        self.emit(format!(
+                                            "    RLF 0x{:02X}, F",
+                                            da + u16::from(i)
+                                        ));
+                                    }
+                                }
+                                BinOp::LShr => {
+                                    self.emit("    BCF STATUS, 0");
+                                    for i in (0..n).rev() {
+                                        self.emit(format!(
+                                            "    RRF 0x{:02X}, F",
+                                            da + u16::from(i)
+                                        ));
+                                    }
+                                }
+                                BinOp::AShr => {
+                                    let hi = da + u16::from(n - 1);
+                                    self.emit(format!("    BTFSC 0x{hi:02X}, 7"));
+                                    self.emit("    BSF STATUS, 0");
+                                    self.emit(format!("    BTFSS 0x{hi:02X}, 7"));
+                                    self.emit("    BCF STATUS, 0");
+                                    for i in (0..n).rev() {
+                                        self.emit(format!(
+                                            "    RRF 0x{:02X}, F",
+                                            da + u16::from(i)
+                                        ));
+                                    }
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                    }
                     _ => panic!("isel: unsupported binop for milestone 2"),
                 }
             }
@@ -1126,12 +1186,28 @@ impl<'m> Gen<'m> {
     /// and working state lives in `{func}::__scr` at the Task-2 contract
     /// offsets. Plain addresses only — the banking pass inserts BANKSELs.
     /// Div-by-zero is LLVM poison: the loop runs (den = 0 ⇒ quotient 0xFFFF,
-    /// remainder 0), any value is legal — no guard, documented.
+    /// remainder 0), any value is legal — no guard, documented. The six
+    /// shift routines (variable count) share `emit_shift_body`.
     fn emit_routine(&mut self) {
         let name = self.cur_func;
         let scr = self.slot_addr(name, "__scr");
         self.emit(format!("{name}:"));
         match name {
+            // Variable-count shifts: mask the count to width-1, bounded
+            // loop over the val param slot (see emit_shift_body).
+            "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
+            | "__lshr_u16" | "__ashr_i16" => {
+                let (is16, op) = match name {
+                    "__shl_u8" => (false, BinOp::Shl),
+                    "__shl_u16" => (true, BinOp::Shl),
+                    "__lshr_u8" => (false, BinOp::LShr),
+                    "__lshr_u16" => (true, BinOp::LShr),
+                    "__ashr_i8" => (false, BinOp::AShr),
+                    "__ashr_i16" => (true, BinOp::AShr),
+                    _ => unreachable!(),
+                };
+                self.emit_shift_body(is16, op, scr);
+            }
             // 8x8 -> 16 shift-add (AN526): t = a shifted left one bit per
             // multiplier bit; for each set bit of bk, r += t. Store the low
             // byte of the product (the i8 result).
@@ -1476,6 +1552,71 @@ impl<'m> Gen<'m> {
             other => panic!("isel: no recipe for runtime routine @{other}"),
         }
     }
+
+    /// The recipe body for the six variable-count shift routines. The count
+    /// arrives UNMASKED (a full i8/i16 — clang emits it raw); LLVM says
+    /// counts >= width are poison, so masking to width-1 keeps the loop
+    /// bounded (<= 15 iterations) and yields the defined-range result:
+    /// deterministic, documented, never a hang. The value shifts **in
+    /// place in the `val` param slot** (the caller's copy); the masked
+    /// count runs the loop from `__scr::cnt@0` (Task-2 contract). ashr
+    /// sets C from the sign bit before each rrf so the sign fills every
+    /// vacated bit.
+    fn emit_shift_body(&mut self, is16: bool, op: BinOp, scr: u16) {
+        let name = self.cur_func;
+        let val = self.slot_addr(name, "val");
+        let cnt = self.slot_addr(name, "cnt");
+        let bytes: u16 = if is16 { 2 } else { 1 };
+        let hi = val + bytes - 1;
+        self.assert_bank0(
+            &[val, hi, cnt, cnt + bytes - 1, scr, scr + 1],
+            name,
+        );
+        let mask: u8 = if is16 { 0x0F } else { 0x07 }; // width - 1
+        self.emit(format!("    MOVF 0x{cnt:02X}, W"));
+        self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
+        self.emit(format!("    MOVWF 0x{scr:02X}")); // __scr::cnt@0 = masked count
+        if is16 {
+            self.emit(format!("    CLRF 0x{:02X}", scr + 1)); // loop counter is 1 byte
+        }
+        let l_loop = self.fresh_label();
+        let l_done = self.fresh_label();
+        // count == 0 shifts nothing: skip the loop entirely (a bare
+        // DECFSZ-at-bottom loop would run once on a zero counter).
+        self.emit(format!("    MOVF 0x{scr:02X}, F")); // Z = (cnt == 0)
+        self.emit("    BTFSC STATUS, 2".to_string()); // skip the GOTO when cnt != 0
+        self.emit(format!("    GOTO {l_done}"));
+        self.emit(format!("{l_loop}:"));
+        match op {
+            BinOp::Shl => {
+                self.emit("    BCF STATUS, 0".to_string());
+                for i in 0..bytes {
+                    self.emit(format!("    RLF 0x{:02X}, F", val + i));
+                }
+            }
+            BinOp::LShr => {
+                self.emit("    BCF STATUS, 0".to_string());
+                for i in (0..bytes).rev() {
+                    self.emit(format!("    RRF 0x{:02X}, F", val + i));
+                }
+            }
+            BinOp::AShr => {
+                self.emit(format!("    BTFSC 0x{hi:02X}, 7"));
+                self.emit("    BSF STATUS, 0".to_string());
+                self.emit(format!("    BTFSS 0x{hi:02X}, 7"));
+                self.emit("    BCF STATUS, 0".to_string());
+                for i in (0..bytes).rev() {
+                    self.emit(format!("    RRF 0x{:02X}, F", val + i));
+                }
+            }
+            _ => unreachable!(),
+        }
+        self.emit(format!("    DECFSZ 0x{scr:02X}, F"));
+        self.emit(format!("    GOTO {l_loop}"));
+        self.emit(format!("{l_done}:"));
+        self.store_retval(val, bytes as u8);
+        self.emit("    RETURN".to_string());
+    }
 }
 
 /// Select instructions for the whole module, producing PIC14 assembly text.
@@ -1626,15 +1767,8 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             match &f.name[..] {
                 "__mul_u8" | "__mul_u16" | "__udiv_u8" | "__urem_u8"
                 | "__udiv_u16" | "__urem_u16" | "__sdiv_i8" | "__srem_i8"
-                | "__sdiv_i16" | "__srem_i16" => {}
-                // The six shift routines land in Task 4; until then they
-                // must panic loudly, never fall through into the next
-                // function.
-                "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
-                | "__lshr_u16" | "__ashr_i16" => panic!(
-                    "isel: runtime routine @{} not implemented (shift recipes land in Task 4)",
-                    f.name
-                ),
+                | "__sdiv_i16" | "__srem_i16" | "__shl_u8" | "__lshr_u8"
+                | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16" => {}
                 other => panic!("isel: unknown runtime routine @{other}"),
             }
             g.emit_routine();
