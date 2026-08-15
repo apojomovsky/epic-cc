@@ -650,6 +650,15 @@ fn gep_ram_indirect_and_const_retlw() {
     assert!(asm.contains("MOVWF 0x2A"), "const load dst %v:\n{asm}");
     // The RETLW table itself, after the functions.
     assert!(asm.contains("__read_table:"), "table reader label:\n{asm}");
+    // M10: every reader sets PCLATH to the table's 256-byte window before
+    // the computed PCL jump (fixes the latent window bug — a table past
+    // 0x100 needs PCLATH != 0 to land the jump).
+    assert!(asm.contains("MOVLW HIGH(table)"), "reader must set PCLATH:\n{asm}");
+    assert!(asm.contains("MOVWF PCLATH"), "reader must write PCLATH:\n{asm}");
+    assert!(
+        asm.find("MOVLW HIGH(table)").unwrap() < asm.find("ADDLW LOW(table)").unwrap(),
+        "PCLATH must be set before the computed jump:\n{asm}"
+    );
     assert!(asm.contains("ADDLW LOW(table)"), "index += table base:\n{asm}");
     assert!(asm.contains("MOVWF PCL"), "jump into the table:\n{asm}");
     assert!(asm.contains("table:"), "table label:\n{asm}");
@@ -3116,4 +3125,313 @@ fn panics_on_banked_shift_routine_slot() {
         }
     }
     let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+}
+
+// ---- Milestone 10: const-table PCLATH readers and the page-0 bound ----
+
+/// A const table of `size` bytes: bytes 0..min(size,256) = 0x00..0xFF,
+/// bytes 256+n = 0x11+n — distinctive per-byte values, so a wrong
+/// chunk/window lands on the wrong RETLW (a readable wrong-answer, not a
+/// crash).
+fn const_table_global(name: &str, size: usize) -> ir::Global {
+    let bytes: Vec<u8> = (0..size)
+        .map(|i| if i < 256 { i as u8 } else { 0x11 + (i - 256) as u8 })
+        .collect();
+    ir::Global {
+        name: name.into(),
+        ty: ir::Ty::I8,
+        is_const: true,
+        size: size as u16,
+        bytes,
+        addr: None,
+    }
+}
+
+/// Patch `parse`'d globals with the given set (the IR text format records
+/// scalar `global`/`const` lines only — sizes/bytes come from the C
+/// frontend, so tests inject them directly, like `pointer_module`).
+fn module_with_globals(ir_text: &str, globals: Vec<ir::Global>) -> ir::Module {
+    let mut m = parse(ir_text);
+    m.globals = globals;
+    m
+}
+
+/// Word address of a label in isel-emitted asm: walk the lines the same way
+/// the asm crate's pass 1 does (org/labels/instructions only — equ and
+/// list/radix lines emit no words).
+fn label_addr(asm: &str, label: &str) -> usize {
+    let mut org = 0usize;
+    for raw in asm.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("org ") {
+            org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
+            continue;
+        }
+        if line.starts_with("end") {
+            break;
+        }
+        if let Some(l) = line.strip_suffix(':') {
+            if l.trim() == label {
+                return org;
+            }
+            continue;
+        }
+        if line.contains(" equ ") {
+            continue;
+        }
+        org += 1;
+    }
+    panic!("label {label} not found");
+}
+
+/// Assemble and simulate one module: seed RAM, run to SLEEP halt, return
+/// the byte at `out`.
+fn sim_run_asm(asm: &str, seed: &[(u16, u8)], out: u16) -> u8 {
+    use pic14_sim::Pic14;
+    let words = asm::assemble(asm);
+    let mut p = Pic14::new(words);
+    for (a, v) in seed {
+        p.ram_mut()[*a as usize] = *v;
+    }
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    p.ram()[out as usize]
+}
+
+#[test]
+fn large_const_table_emits_two_entry_reader_and_16bit_caller() {
+    // M10: a > 255-byte const table emits two chunked reader entries
+    // (`__read_t` for bytes 0..255 at chunk label `t`, `__read_t_hi` for
+    // 256..size-1 at the fresh chunk label `t_1`), and the caller computes
+    // the in-chunk index (0x71 lo temp) + the chunk bit (0x70 hi temp),
+    // CALLing the right entry. The index reg is the 16-bit zext of the byte
+    // index (clang's `zext i8 %idx to i16` + `gep @t +k +1*%i`).
+    let m = module_with_globals(
+        "global in i16\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i16 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I16,
+                is_const: false,
+                size: 2,
+                bytes: vec![0; 2],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("t", 300),
+        ],
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
+    let asm = select(&m, &addrs);
+    // Caller: lo-temp 0x71, hi-temp 0x70, chunk-bit test, both entry CALLs.
+    assert!(asm.contains("MOVWF 0x71"), "lo index temp (retval_lo):\n{asm}");
+    assert!(asm.contains("MOVWF 0x70"), "hi temp / chunk bit (scratch):\n{asm}");
+    assert!(asm.contains("BTFSC 0x70, 0"), "chunk-bit test:\n{asm}");
+    assert!(asm.contains("    CALL __read_t\n"), "chunk-0 entry call:\n{asm}");
+    assert!(asm.contains("    CALL __read_t_hi"), "chunk-1 entry call:\n{asm}");
+    assert!(asm.contains("GOTO tmp"), "fresh .hi/.done labels:\n{asm}");
+    // Reader entry 0: PCLATH = window of t, computed jump into t. The
+    // index (W) is stashed in the fixed scratch byte across the PCLATH set
+    // (MOVLW HIGH would clobber it otherwise).
+    assert!(asm.contains("__read_t:\n    MOVWF 0x70"), "chunk-0 reader stashes the index:\n{asm}");
+    assert!(asm.contains("MOVLW HIGH(t)"), "chunk-0 PCLATH set:\n{asm}");
+    assert!(asm.contains("ADDLW LOW(t)"), "chunk-0 index add:\n{asm}");
+    // Reader entry 1: window of the fresh `t_1` chunk label (t + 256).
+    assert!(asm.contains("__read_t_hi:\n    MOVWF 0x70"), "chunk-1 reader stashes the index:\n{asm}");
+    assert!(asm.contains("MOVLW HIGH(t_1)"), "chunk-1 PCLATH set:\n{asm}");
+    assert!(asm.contains("ADDLW LOW(t_1)"), "chunk-1 index add:\n{asm}");
+    // Exactly size RETLWs, split 256 + (size-256) across the two chunks.
+    assert_eq!(asm.matches("RETLW").count(), 300, "one RETLW per byte:\n{asm}");
+    let chunk0 = &asm[asm.find("\nt:").unwrap()..asm.find("__read_t_hi:").unwrap()];
+    assert_eq!(chunk0.matches("RETLW").count(), 256, "chunk 0 = 256 bytes:\n{asm}");
+    let chunk1 = &asm[asm.find("\nt_1:").unwrap()..asm.find("__start:").unwrap()];
+    assert_eq!(chunk1.matches("RETLW").count(), 44, "chunk 1 = size-256 bytes:\n{asm}");
+    // The chunk-1 reader follows the chunk-0 table.
+    assert!(
+        asm.find("__read_t_hi:").unwrap() > asm.find("\nt:").unwrap(),
+        "chunks must be ordered chunk 0 then chunk 1:\n{asm}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "multi-term index into large const table")]
+fn multi_term_large_table_index_panics() {
+    let m = module_with_globals(
+        "global in i16\nglobal j i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i16 @in\n    %j = load i8 @j\n    %p = gep @t +0 +1*%i +2*%j\n\
+           %v = load i8 %p\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I16,
+                is_const: false,
+                size: 2,
+                bytes: vec![0; 2],
+                addr: None,
+            },
+            ir::Global {
+                name: "j".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("t", 300),
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("j", 0x22),
+        ("main::i", 0x24),
+        ("main::j", 0x26),
+        ("main::v", 0x27),
+    ]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "constant index into large const table")]
+fn const_only_large_table_index_panics() {
+    let m = module_with_globals(
+        "const t i8\nfn main(void) ()\n  block entry:\n\
+           %p = gep @t +5\n    %v = load i8 %p\n    ret void\n",
+        vec![const_table_global("t", 300)],
+    );
+    let mut addrs = HashMap::new();
+    addrs.insert("main::v".to_string(), 0x24u16);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn small_const_table_in_nonzero_window_reads_correctly() {
+    // M10 load-bearing: a const table placed past 0x100 (window 1) must be
+    // read through its reader's PCLATH set — without it the computed PCL
+    // jump would land in window 0 and return a wrong byte. A 244-byte
+    // filler table (`aaa_fill` sorts before `table`) pushes `table` past
+    // 0x100: layout = goto (1) + main (7) + filler reader/table (6+244) +
+    // table reader (6) -> table at 0x108.
+    let m = module_with_globals(
+        "global in i8\nglobal out i8\nconst aaa_fill i8\nconst table i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @table +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("aaa_fill", 244),
+            ir::Global {
+                name: "table".into(),
+                ty: ir::Ty::I8,
+                is_const: true,
+                size: 4,
+                bytes: vec![10, 20, 30, 40],
+                addr: None,
+            },
+        ],
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::i", 0x25), ("main::v", 0x26)]);
+    let asm = select(&m, &addrs);
+    // Load-bearing precondition: the table lands in a NONZERO 256-byte
+    // window and fits it (LOW + 4 <= 0x100) — a reader without the PCLATH
+    // set would jump into window 0 and return the wrong byte.
+    let base = label_addr(&asm, "table");
+    assert!(
+        base >= 0x100,
+        "table must sit past 0x100 for the PCLATH set to be load-bearing (base 0x{base:03X}):\n{asm}"
+    );
+    assert!(base & 0xFF <= 0xFC, "table must fit its window (base 0x{base:03X}):\n{asm}");
+    // in = 1 -> table[1] = 20, read via the window-1 reader.
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 1)], 0x21),
+        20,
+        "table[1] = 20 through the window-1 reader:\n{asm}"
+    );
+}
+
+#[test]
+fn large_const_table_reads_simulate_correctly() {
+    // M10 load-bearing: a 300-byte table split into two 256-byte chunks. A
+    // 222-byte filler table (`aaa_fill` sorts first) aligns the main table
+    // at 0x100: layout = goto (1) + main (21) + filler reader/table (6+222)
+    // + t reader (6) -> t at 0x100, chunk label t_1 at 0x200. Runtime reads
+    // at idx 2
+    // (chunk 0), 256 (chunk-1 first), 299 (chunk-1 last), 290, and the
+    // lo+carry case (idx 0xF0 + k 0x20 -> in-chunk 0x10, hi 1 -> table[272])
+    // must return the right bytes. Bytes: 0..255 = 0x00..0xFF; 256+n = 0x11+n.
+    let globals = || {
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I16,
+                is_const: false,
+                size: 2,
+                bytes: vec![0; 2],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("aaa_fill", 222),
+            const_table_global("t", 300),
+        ]
+    };
+    let ir = |k: u8| {
+        format!(
+            "global in i16\nglobal out i8\nconst aaa_fill i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+             %i = load i16 @in\n    %p = gep @t +{k} +1*%i\n    %v = load i8 %p\n\
+             store i8 %v @out\n    ret void\n"
+        )
+    };
+    let map = [("in", 0x20u16), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)];
+    let asm0 = select(&module_with_globals(&ir(0), globals()), &addrs(&map));
+    let base = label_addr(&asm0, "t");
+    assert!(
+        base & 0xFF == 0,
+        "chunk 0 must start 256-aligned for the computed jumps to cover all 300 bytes (base 0x{base:03X}):\n{asm0}"
+    );
+    // (in, k, expected byte)
+    let cases: &[(u16, u8, u8)] = &[
+        (2, 0, 0x02),     // chunk 0
+        (256, 0, 0x11),   // chunk-1 first byte
+        (299, 0, 0x3C),   // chunk-1 last byte (0x11 + 43)
+        (290, 0, 0x33),   // chunk-1 (0x11 + 34)
+        (0xF0, 0x20, 0x21), // lo 0xF0 + k 0x20 = 0x110 -> in-chunk 0x10, hi 1 -> table[272] = 0x11 + 16
+    ];
+    for (in_val, k, want) in cases {
+        let m = module_with_globals(&ir(*k), globals());
+        let asm = select(&m, &addrs(&map));
+        let got = sim_run_asm(&asm, &[(0x20, *in_val as u8), (0x21, (*in_val >> 8) as u8)], 0x22);
+        assert_eq!(got, *want, "table[{in_val}] with k 0x{k:02X} must read 0x{want:02X}:\n{asm}");
+    }
 }

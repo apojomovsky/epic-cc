@@ -190,6 +190,54 @@ impl<'m> Gen<'m> {
             .is_const
     }
 
+    /// The byte size of a global — a const table's size selects the reader
+    /// shape (≤ 255 single entry; > 255 two chunked entries).
+    fn global_size(&self, name: &str) -> u16 {
+        self.m
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
+            .size
+    }
+
+    /// The byte width of an SSA value reg in the current function, from its
+    /// defining param or instruction. Used to verify the large-table GEP
+    /// index is the 16-bit reg clang zexts — reading the hi slot of a
+    /// 1-byte index would silently touch a neighbour's slot.
+    fn reg_bytes(&self, name: &str) -> u8 {
+        let f = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .unwrap_or_else(|| panic!("isel: unknown function {}", self.cur_func));
+        if let Some(p) = f.params.iter().find(|p| p.name == name) {
+            return p.width;
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                let w = match i {
+                    Inst::Load(l) if l.dst == name => l.ty.bytes(),
+                    Inst::Bin(b) if b.dst == name => b.ty.bytes(),
+                    Inst::Zext(z) if z.dst == name => z.to.bytes(),
+                    Inst::Sext(x) if x.dst == name => x.to.bytes(),
+                    Inst::Trunc(t) if t.dst == name => t.to.bytes(),
+                    Inst::Icmp(c) if c.dst == name => 1,
+                    Inst::Select(s) if s.dst == name => s.ty.bytes(),
+                    Inst::Phi(p) if p.dst == name => p.ty.bytes(),
+                    Inst::Freeze(fr) if fr.dst == name => fr.ty.bytes(),
+                    Inst::Call(c) if c.dst.as_deref() == Some(name) => {
+                        c.ty.map(|t| t.bytes()).unwrap_or(1)
+                    }
+                    _ => continue,
+                };
+                return w;
+            }
+        }
+        panic!("isel: no definition of %{name} in {}", self.cur_func);
+    }
+
     /// The byte span of a resolved FSR base — the whole object a pointer
     /// into it can legally touch (the runtime terms are bounded by span−1).
     /// `Base::Global` spans its `Global.size`; `Base::Slot` spans the byval
@@ -297,15 +345,24 @@ impl<'m> Gen<'m> {
     /// `W = RAM[ptr + byte_off]` — one byte of a pointer load or a memcpy
     /// source. Direct bases read the plain file register; dynamic bases set
     /// FSR first and read INDF; a const (flash) base reads via
-    /// `CALL __read_<name>` (the RETLW table leaves the byte in W).
+    /// `CALL __read_<name>` (the RETLW table leaves the byte in W). A table
+    /// larger than 255 bytes takes the 16-bit index path — the caller
+    /// splits the index into an in-chunk byte (W) and the chunk bit, then
+    /// CALLs `__read_<name>` (chunk 0) or `__read_<name>_hi` (chunk 1).
     fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
         match ptr {
             Val::Reg(r) => {
                 if let (Base::Global(name), k, terms) = self.resolved_for(r) {
                     if self.global_is_const(&name) {
-                        // RETLW table read: W = index = k + Σ s×%reg + off.
-                        self.emit_ptr_index_w(k, &terms, byte_off);
-                        self.emit(format!("    CALL __read_{name}"));
+                        if self.global_size(&name) > 255 {
+                            // Large table: W = in-chunk index, hi bit in
+                            // 0x70, branch to the right chunk entry.
+                            self.emit_const_read_large(&name, k, &terms, byte_off);
+                        } else {
+                            // RETLW table read: W = index = k + Σ s×%reg + off.
+                            self.emit_ptr_index_w(k, &terms, byte_off);
+                            self.emit(format!("    CALL __read_{name}"));
+                        }
                         return;
                     }
                 }
@@ -313,7 +370,14 @@ impl<'m> Gen<'m> {
             Val::Global(g) => {
                 if self.global_is_const(g) {
                     // A const global used directly as a pointer (memcpy src):
-                    // W = byte index, CALL the RETLW table reader.
+                    // W = byte index, CALL the RETLW table reader. The index
+                    // is a compile-time constant, so a large table (whose
+                    // chunk must be selected) panics loudly for now.
+                    assert!(
+                        self.global_size(g) <= 255,
+                        "isel: constant index into large const table @{g} not supported (size {} > 255); only a single 16-bit reg index is",
+                        self.global_size(g)
+                    );
                     self.emit(format!("    MOVLW 0x{byte_off:02X}"));
                     self.emit(format!("    CALL __read_{g}"));
                     return;
@@ -460,6 +524,61 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("    ADDLW 0x{kk:02X}"));
             }
+        }
+    }
+
+    /// Large const table (> 255 bytes) read. The 16-bit GEP index — a
+    /// single scale-1 term (clang: `zext i8 %idx to i16`, then `gep @t +k
+    /// +1*%i`) — splits into the in-chunk index (W) and the chunk bit (hi
+    /// temp, fixed scratch 0x70): `MOVF r_lo,W; ADDLW k+off` sets C on the
+    /// carry into bit 8, and `BTFSC STATUS,0; ADDLW 0x01` folds it into the
+    /// hi byte, so e.g. idx 0x00F0 + k 0x20 -> in-chunk 0x10, hi 1. W is
+    /// restored from the lo temp (0x71, retval_lo — no live retval at a
+    /// const read) and bit 0 of the hi temp selects `__read_<name>` (chunk
+    /// 0) or `__read_<name>_hi` (chunk 1). The read leaves the byte in W,
+    /// exactly like the small-table path. Const-only and multi-term
+    /// 16-bit indices into large tables panic loudly for now.
+    fn emit_const_read_large(&mut self, name: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        let kk = u16::from(k) + u16::from(byte_off);
+        assert!(
+            kk <= 0xFF,
+            "isel: const index k {k} + off {byte_off} out of byte range"
+        );
+        match terms {
+            [(1, r)] => {
+                assert_eq!(
+                    self.reg_bytes(r),
+                    2,
+                    "isel: large-table index %{r} must be a 16-bit reg (clang zexts the byte index)"
+                );
+                let a_lo = self.val_addr(&Val::Reg(r.clone()));
+                let l_hi = self.fresh_label();
+                let l_done = self.fresh_label();
+                // W = lo + k + off; C = carry into bit 8.
+                self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
+                self.emit(format!("    ADDLW 0x{kk:02X}"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo)); // lo temp
+                // W = hi + carry.
+                self.emit(format!("    MOVF 0x{:02X}, W", a_lo + 1));
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit("    ADDLW 0x01".to_string());
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch)); // hi temp (chunk bit)
+                // W = in-chunk index; bit 0 of the hi temp selects the entry.
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
+                self.emit(format!("    GOTO {l_hi}"));
+                self.emit(format!("    CALL __read_{name}"));
+                self.emit(format!("    GOTO {l_done}"));
+                self.emit(format!("{l_hi}:"));
+                self.emit(format!("    CALL __read_{name}_hi"));
+                self.emit(format!("{l_done}:"));
+            }
+            [] => panic!(
+                "isel: constant index into large const table @{name} not supported (size > 255); only a single 16-bit reg index is"
+            ),
+            _ => panic!(
+                "isel: multi-term index into large const table @{name} not supported: {terms:?}"
+            ),
         }
     }
 
@@ -1744,6 +1863,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         "FSR    equ 0x04".to_string(),
         "INDF   equ 0x00".to_string(),
         "PCL    equ 0x02".to_string(),
+        "PCLATH equ 0x0A".to_string(),
         "".to_string(),
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
@@ -1976,23 +2096,55 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         out.extend(g.out);
     }
     // Const (flash) globals become RETLW tables, emitted after the
-    // functions so the CALLs above resolve. `__read_<name>` adds the
-    // table's low address to the index in W and jumps into it via PCL; the
-    // RETLW of the selected byte returns with W = the byte.
+    // functions so the CALLs above resolve. Every `__read_<name>` reader
+    // sets PCLATH = HIGH(<name>) first — the computed `ADDLW LOW(<name>);
+    // MOVWF PCL` jump lands at PCLATH:PCL, so a table in a nonzero 256-byte
+    // window needs the window set (the M5 reader left PCLATH stale — the
+    // latent window bug). A table > 255 bytes is emitted as two 256-byte
+    // chunks with two entries (`__read_<name>` chunk 0 at label `<name>`,
+    // `__read_<name>_hi` chunk 1 at the fresh label `<name>_1`, emitted
+    // exactly `name` + 256 in the address space by sequential placement);
+    // the caller selects the entry with the in-chunk index in W. Tables
+    // beyond 511 bytes (three chunks) panic loudly — out of scope.
     let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
     consts.sort_by_key(|g| g.name.clone());
     for g in consts {
-        out.push(format!("__read_{}:", g.name));
-        out.push(format!("    ADDLW LOW({})", g.name));
-        out.push("    MOVWF PCL".to_string());
-        out.push(format!("{}:", g.name));
         assert!(
             !g.bytes.is_empty(),
             "isel: const @{} has no table bytes",
             g.name
         );
-        for b in &g.bytes {
+        let size = g.bytes.len();
+        assert!(
+            size <= 511,
+            "isel: const @{} table of {size} bytes exceeds the 511-byte two-chunk bound",
+            g.name
+        );
+        // `MOVLW HIGH` clobbers W, so the incoming index (W = byte index)
+        // is stashed in the fixed scratch byte (0x70 — free at a const
+        // read) across the PCLATH set, then reloaded for the computed jump.
+        let reader = |out: &mut Vec<String>, base: &str| {
+            out.push(format!("    MOVWF 0x{:02X}", scratch));
+            out.push(format!("    MOVLW HIGH({base})"));
+            out.push("    MOVWF PCLATH".to_string());
+            out.push(format!("    MOVF 0x{:02X}, W", scratch));
+            out.push(format!("    ADDLW LOW({base})"));
+            out.push("    MOVWF PCL".to_string());
+        };
+        out.push(format!("__read_{}:", g.name));
+        reader(&mut out, &g.name);
+        out.push(format!("{}:", g.name));
+        for b in &g.bytes[..size.min(256)] {
             out.push(format!("    RETLW 0x{b:02X}"));
+        }
+        if size > 256 {
+            let name_1 = format!("{}_1", g.name);
+            out.push(format!("__read_{}_hi:", g.name));
+            reader(&mut out, &name_1);
+            out.push(format!("{name_1}:"));
+            for b in &g.bytes[256..] {
+                out.push(format!("    RETLW 0x{b:02X}"));
+            }
         }
         out.push("".to_string());
     }

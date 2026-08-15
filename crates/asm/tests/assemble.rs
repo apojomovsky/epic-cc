@@ -1,4 +1,4 @@
-use asm::{assemble, to_hex};
+use asm::{assemble, assemble_file_to_hex, to_hex};
 use pic14_sim::parse_hex;
 
 #[test]
@@ -93,4 +93,35 @@ fn to_hex_spans_records_and_roundtrips_large_program() {
     for (i, w) in words.iter().enumerate() {
         assert_eq!(decoded[i], *w, "word {i} mismatch");
     }
+}
+
+// ---- Milestone 10: the page-0 bound ----
+
+#[test]
+#[should_panic(expected = "exceeds page 0")]
+fn panics_when_program_exceeds_page_zero() {
+    // 0x800 words fill page 0 exactly (addresses 0x000-0x7FF); a 0x801-word
+    // program crosses into page 1, where the highest word address is 0x800 —
+    // the page-0 assert (multi-page is a later milestone) must fire loudly.
+    let mut src = String::from("    org 0x0000\n");
+    for _ in 0..0x801 {
+        src.push_str("    nop\n");
+    }
+    src.push_str("    end\n");
+    let _ = assemble_file_to_hex(&src);
+}
+
+#[test]
+fn page_zero_exact_fill_does_not_panic() {
+    // Boundary: exactly 0x800 words (highest word address 0x7FF) is still
+    // page 0 and must assemble to a full HEX image. `movlw 0x00` (0x3000)
+    // is nonzero so to_hex does not trim the trailing words.
+    let mut src = String::from("    org 0x0000\n");
+    for _ in 0..0x800 {
+        src.push_str("    movlw 0x00\n");
+    }
+    src.push_str("    end\n");
+    let hex = assemble_file_to_hex(&src);
+    assert!(hex.contains(":00000001FF\n"), "missing EOF record: {hex:?}");
+    assert!(hex.lines().count() > 2, "full-page image must span records");
 }
