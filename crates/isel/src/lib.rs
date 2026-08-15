@@ -648,6 +648,35 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    CLRF 0x{:02X}", da + u16::from(i)));
                 }
             }
+            Inst::Sext(x) => {
+                assert!(
+                    x.from.bytes() == 1 && x.to.bytes() == 2,
+                    "isel: sext only supports i8 -> i16"
+                );
+                let da = self.slot_addr(self.cur_func, &x.dst);
+                // Copy the low bytes unchanged.
+                for i in 0..x.from.bytes() {
+                    self.emit_load_byte(&x.val, i);
+                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                }
+                // Fill the high bytes with the source's sign bit: test the
+                // MSB of the source's high byte, then MOVLW 0xFF (set) or
+                // 0x00 (clear) once and store it into every high byte.
+                let src_hi = x.from.bytes() - 1;
+                let a = self.val_addr(&x.val);
+                let l_pos = self.fresh_label();
+                let l_fill = self.fresh_label();
+                self.emit(format!("    BTFSS 0x{:02X}, 7", a + u16::from(src_hi)));
+                self.emit(format!("    GOTO {l_pos}"));
+                self.emit("    MOVLW 0xFF".to_string());
+                self.emit(format!("    GOTO {l_fill}"));
+                self.emit(format!("{l_pos}:"));
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit(format!("{l_fill}:"));
+                for i in x.from.bytes()..x.to.bytes() {
+                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                }
+            }
             Inst::Trunc(t) => {
                 assert!(
                     t.from.bytes() > t.to.bytes(),

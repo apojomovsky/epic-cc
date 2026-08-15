@@ -184,6 +184,65 @@ fn zext_trunc_pair() {
 }
 
 #[test]
+fn sext_i8_to_i16_copies_low_and_sign_fills_high() {
+    let m = parse(
+        "global in i8\nglobal out16 i16\nfn main() -> void\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out16\n    ret void\n",
+    );
+    // alloc: in=0x20, out16 (i16, even-aligned)=0x22 -> end_of_globals 0x24
+    // -> root frame at 0x27; %v=0x27, %s=0x28 (hi 0x29).
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out16", 0x22),
+        ("main::v", 0x27),
+        ("main::s", 0x28),
+    ]);
+    let asm = select(&m, &addrs);
+    // %v=0x27, %s lo=0x28 hi=0x29.
+    assert!(asm.contains("MOVF 0x27, W"), "sext copies v:\n{asm}");
+    assert!(asm.contains("MOVWF 0x28"), "sext stores d_lo:\n{asm}");
+    // Sign-fill: test the source's MSB (byte 0 of the i8 lives at 0x27),
+    // then fill the high byte with 0xFF (negative) or 0x00 (positive).
+    assert!(asm.contains("BTFSS 0x27, 7"), "sext tests v's sign bit:\n{asm}");
+    assert!(asm.contains("MOVLW 0xFF"), "sext fills 0xFF when negative:\n{asm}");
+    assert!(asm.contains("MOVLW 0x00"), "sext fills 0x00 when positive:\n{asm}");
+    assert!(asm.contains("MOVWF 0x29"), "sext stores d_hi:\n{asm}");
+}
+
+#[test]
+fn sext_i8_to_i16_simulates_sign_extension() {
+    use pic14_sim::Pic14;
+    let m = parse(
+        "global in i8\nglobal out i16\nfn main() -> void\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out\n    ret void\n",
+    );
+    let map = addrs(&[
+        ("in", 0x20u16),
+        ("out", 0x22),
+        ("main::v", 0x27),
+        ("main::s", 0x28),
+    ]);
+    let asm = select(&m, &map);
+    let words = asm::assemble(&asm);
+    // -1 -> 0xFFFF.
+    {
+        let mut p = Pic14::new(words.clone());
+        p.ram_mut()[0x20] = 0xFF;
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        assert_eq!(p.ram()[0x22], 0xFF, "sext(-1) lo byte");
+        assert_eq!(p.ram()[0x23], 0xFF, "sext(-1) hi byte");
+    }
+    // +1 -> 0x0001.
+    {
+        let mut p = Pic14::new(words);
+        p.ram_mut()[0x20] = 0x01;
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        assert_eq!(p.ram()[0x22], 0x01, "sext(+1) lo byte");
+        assert_eq!(p.ram()[0x23], 0x00, "sext(+1) hi byte");
+    }
+}
+
+#[test]
 fn phi_copy_lands_before_terminator_of_each_predecessor() {
     let m = parse(
         "global x i16\nglobal y i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    br merge\n  block thenb:\n    %b = load i16 @y\n    br merge\n  block merge:\n    %p = phi i16 %a entry %b thenb\n    store i16 %p @out\n    ret void\n",
