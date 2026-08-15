@@ -200,7 +200,7 @@ fn scalar_param_widths_roundtrip() {
 
 #[test]
 fn roundtrips_new_binops_and_freeze() {
-    // Milestone 8: the seven mul/div/rem/shift binops + freeze must
+    // Milestone 8: the eight mul/div/rem/shift binops + freeze must
     // round-trip their canonical text exactly.
     let text = "global in i16\nfn main(void) ()\n  block entry:\n\
     %0 = load i16 @in\n\

@@ -8,7 +8,10 @@
 //! `in`, `out`, `gate` are globals; their addresses are read from the same
 //! alloc layout the driver used (see the trace in fixtures/muldiv.c).
 //!
-//! Hand computation from the EXACT emitted IR (in = 301; the C in
+//! Hand computation from the emitted IR (in = 301; abridged: the volatile
+//! reloads and their zexts, e.g. %7, %9, %16, %20, %23, %24, %27 and the
+//! store/trunc intermediates, are elided — only the value-bearing ops are
+//! traced; the C in
 //! fixtures/muldiv.c is shaped so clang -O1 keeps every op — see the
 //! comments there):
 //!   %1  = load volatile i16 @in                      301

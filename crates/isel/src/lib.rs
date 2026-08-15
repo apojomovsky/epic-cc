@@ -931,14 +931,15 @@ impl<'m> Gen<'m> {
                         );
                         self.emit_sub16(&b.a, &b.b, da);
                     }
-                    // Milestone-8 binops: real lowerings land in Task 3; until
-                    // then any occurrence must fail loudly, never silently
-                    // miscompile.
-                    (BinOp::Mul, _) => panic!("isel: mul not yet lowered (Task 3)"),
-                    (BinOp::UDiv, _) => panic!("isel: udiv not yet lowered (Task 3)"),
-                    (BinOp::URem, _) => panic!("isel: urem not yet lowered (Task 3)"),
-                    (BinOp::SDiv, _) => panic!("isel: sdiv not yet lowered (Task 3)"),
-                    (BinOp::SRem, _) => panic!("isel: srem not yet lowered (Task 3)"),
+                    // Milestone-8 binops: legalize rewrites every mul/div/rem
+                    // into a runtime routine call, so these ops reach isel only
+                    // via hand-written IR. Panic loudly — the invariant that a
+                    // legalize miss never silently miscompiles.
+                    (BinOp::Mul, _) => panic!("isel: mul reached isel; legalize must rewrite it to a routine call"),
+                    (BinOp::UDiv, _) => panic!("isel: udiv reached isel; legalize must rewrite it to a routine call"),
+                    (BinOp::URem, _) => panic!("isel: urem reached isel; legalize must rewrite it to a routine call"),
+                    (BinOp::SDiv, _) => panic!("isel: sdiv reached isel; legalize must rewrite it to a routine call"),
+                    (BinOp::SRem, _) => panic!("isel: srem reached isel; legalize must rewrite it to a routine call"),
                     // Milestone-8 shifts: a const count inlines as a fixed
                     // RLF/RRF sequence; k == 0 is a plain copy; k >= width
                     // is LLVM poison and panics loudly. A variable (reg)
@@ -1577,7 +1578,11 @@ impl<'m> Gen<'m> {
         self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
         self.emit(format!("    MOVWF 0x{scr:02X}")); // __scr::cnt@0 = masked count
         if is16 {
-            self.emit(format!("    CLRF 0x{:02X}", scr + 1)); // loop counter is 1 byte
+            // __scr::cnt@1 (the high byte of the masked 2-byte cnt slot)
+            // stays 0: the masked count is < 16, so the DECFSZ loop counter
+            // lives entirely in the low byte. Clear it once so a stale high
+            // byte from an earlier call can't be misread as part of the count.
+            self.emit(format!("    CLRF 0x{:02X}", scr + 1));
         }
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
