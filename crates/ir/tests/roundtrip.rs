@@ -127,16 +127,16 @@ fn roundtrips_control_flow_call_and_cast() {
 
 #[test]
 fn roundtrips_reworked_gep_alloca_memcpy_and_params() {
-    let text = "global a i8\nfn f(i16) (x, s=sret)\n  block entry:\n    %p = gep %s +2 +2*%x\n    %1 = alloca 4\n    memcpy @a %1 4\n    ret void\n";
+    let text = "global a i8\nfn f(i16) (x=i8, s=sret)\n  block entry:\n    %p = gep %s +2 +2*%x\n    %1 = alloca 4\n    memcpy @a %1 4\n    ret void\n";
     let m = parse(text);
     assert_eq!(m.funcs[0].params.len(), 2);
     assert_eq!(m.funcs[0].params[0].name, "x");
-    assert_eq!(m.funcs[0].params[0].width, 1); // scalar default width on canonical text
+    assert_eq!(m.funcs[0].params[0].width, 1); // i8 scalar width on canonical text
     assert_eq!(m.funcs[0].params[1].name, "s");
     assert!(m.funcs[0].params[1].sret);
 
     let out = serialize(&m);
-    assert!(out.contains("fn f(i16) (x, s=sret)"), "params header\n---\n{out}");
+    assert!(out.contains("fn f(i16) (x=i8, s=sret)"), "params header\n---\n{out}");
     assert!(out.contains("%p = gep %s +2 +2*%x"), "gep\n---\n{out}");
     assert!(out.contains("%1 = alloca 4"), "alloca\n---\n{out}");
     assert!(out.contains("memcpy @a %1 4"), "memcpy\n---\n{out}");
@@ -178,6 +178,24 @@ fn roundtrips_byval_param_and_call_arg() {
         }
         other => panic!("expected Call, got {other:?}"),
     }
+}
+
+#[test]
+fn scalar_param_widths_roundtrip() {
+    // Regression: canonical fn-header text used to drop scalar widths — an
+    // i16 param re-parsed as width 1, silently undersizing its slot in the
+    // stage-bin pipeline (irparse -> wholeprog -> legalize -> alloc -> isel).
+    // Scalar params must round-trip their width.
+    let text = "fn f(i16) (x=i16, y=i8, p=byval4, s=sret)\n  block entry:\n    ret void\n";
+    let m = parse(text);
+    assert_eq!(m.funcs[0].params[0].width, 2); // i16 -> width 2
+    assert_eq!(m.funcs[0].params[1].width, 1); // i8 -> width 1
+    let out = serialize(&m);
+    assert_eq!(out, text, "scalar widths must serialize back to typed params\n---\n{out}");
+    // re-parse: the i16 scalar keeps width 2 (re-parsed as 1 before the fix)
+    let m2 = parse(&out);
+    assert_eq!(m2.funcs[0].params[0].width, 2, "i16 scalar param must re-parse with width 2");
+    assert_eq!(serialize(&m2), out);
 }
 
 #[test]

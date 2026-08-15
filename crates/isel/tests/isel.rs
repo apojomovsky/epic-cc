@@ -2007,6 +2007,21 @@ fn panics_on_banked_sret_target() {
 }
 
 #[test]
+#[should_panic(expected = "sret arg for a non-sret param")]
+fn panics_on_sret_arg_for_non_sret_param() {
+    // An sret call arg must target an sret callee param (the byval arm has
+    // the mirror check); a mismatch is a phase-3 ABI inconsistency and must
+    // fail loudly instead of stashing the address in a scalar slot.
+    let m = parse(
+        "fn make(void) (p=i8)\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = alloca 4\n    call void @make(sret %1)\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::1", 0x25), ("make::p", 0x2F)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
 fn byval_call_sum_pair_simulates() {
     // Caller builds a Pair {i8 a, i16 b} in an alloca (a=0x03 at +0,
     // b=0x1234 at +2), calls sum(byval4): the caller copies the 4 bytes into
