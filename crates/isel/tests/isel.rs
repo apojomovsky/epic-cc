@@ -269,6 +269,27 @@ fn slots_skip_icmp_scratch_and_retval_at_end_of_globals() {
 }
 
 #[test]
+fn first_slot_never_lands_on_retval_hi_when_common_start_is_retval_hi() {
+    // Regression for a boundary the >=-only skip missed: end_of_globals = 0x6E
+    // (i8 global at 0x6D) puts scratch at 0x6E, retval 0x6F/0x70, bank0_start
+    // at 0x71. The allocator's initial counter COMMON_START = 0x70 is exactly
+    // retval_hi, so the very first slot's *next is already inside the retval
+    // region — `retval_lo >= *next` is false and the old check never fired,
+    // placing the slot at 0x70 where a callee's ret i16 would clobber it. The
+    // overlap test must bump it past the retval bytes to 0x71+.
+    let m = parse(
+        "global in i8\nfn main() -> void\n  block entry:\n\
+           %a0 = load i8 @in\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x6D)]);
+    let asm = select(&m, &addrs);
+    // end_of_globals = 0x6D + 1 = 0x6E: scratch 0x6E, retval 0x6F/0x70,
+    // bank0_start 0x71. The first slot must not land on retval_hi (0x70).
+    assert!(!asm.contains("MOVWF 0x70"), "no slot may land on retval_hi 0x70:\n{asm}");
+    assert!(asm.contains("MOVWF 0x71"), "first slot must skip past the retval bytes to 0x71:\n{asm}");
+}
+
+#[test]
 fn call_copies_args_to_callee_params_and_reads_retval() {
     // %3 = call i16 @add(i16 %1, i16 %2): each arg byte is copied into the
     // callee's `{func}::{param}` slot, then CALL, then the retval slots

@@ -51,11 +51,16 @@ fn alloc_slot(
     // The fixed icmp scratch byte and the two retval bytes live just past
     // the globals. Never let a slot's lo or hi byte land on any of them, or
     // an icmp / a callee's Ret in the same function would silently corrupt
-    // that slot.
-    if scratch >= *next && scratch < *next + n {
+    // that slot. These are true overlap tests, not >=-only boundary checks:
+    // the allocator's initial counter (COMMON_START) can already sit inside a
+    // reserved region (e.g. end_of_globals = 0x6E puts retval_hi at 0x70 ==
+    // COMMON_START), in which case the candidate slot overlaps the region even
+    // though its start is past the reserved lo. wrapping_add keeps near-0xFF
+    // u8 counters from wrapping in debug builds.
+    if *next < scratch.wrapping_add(1) && next.wrapping_add(n) > scratch {
         *next = scratch.wrapping_add(1);
     }
-    if retval_lo >= *next && retval_lo < *next + n {
+    if *next < retval_lo.wrapping_add(2) && next.wrapping_add(n) > retval_lo {
         *next = retval_lo.wrapping_add(2);
     }
     let a = *next;
