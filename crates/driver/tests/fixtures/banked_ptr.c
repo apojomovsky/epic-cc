@@ -55,7 +55,6 @@ void main(void) {
     fill2[0] = 0x04;                             // touch fill2 (bank 2)
     arrB3[i] = 0x33;                             // FSR+IRP write (bank 3)
     out = arrB1[i] + arrB2[i] + arrB3[i];                // 0x66 — FSR+IRP reads
-    out = arrB1[i] + arrB2[i] + arrB3[i];                // 0x66 — FSR+IRP reads
     arrB1[1] = 0x07;
     arrB2[5] = arrB1[1];                                 // banked direct copy (BANKSEL)
     out = (unsigned char)(out + arrB2[5]);               // 0x66 + 0x07 = 0x6D

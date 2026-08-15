@@ -12,20 +12,20 @@ PCL    equ 0x02
 mk:
     BSF STATUS, 5
     BSF STATUS, 6
-    BTFSC 0x51, 0
+    BTFSC 0x4C, 0
     BSF STATUS, 7
-    BTFSS 0x51, 0
+    BTFSS 0x4C, 0
     BCF STATUS, 7
-    MOVF 0x50, W
+    MOVF 0x4B, W
     ADDLW 0x00
     MOVWF FSR
     MOVLW 0x05
     MOVWF INDF
-    BTFSC 0x51, 0
+    BTFSC 0x4C, 0
     BSF STATUS, 7
-    BTFSS 0x51, 0
+    BTFSS 0x4C, 0
     BCF STATUS, 7
-    MOVF 0x50, W
+    MOVF 0x4B, W
     ADDLW 0x01
     MOVWF FSR
     MOVLW 0x06
@@ -109,93 +109,67 @@ main:
     MOVWF 0x3B
     MOVF 0x3B, W
     MOVWF 0x30
-    BCF STATUS, 7
-    MOVF 0x35, W
-    ADDLW 0xA0
-    MOVWF FSR
-    MOVF INDF, W
-    MOVWF 0x3C
-    BSF STATUS, 7
-    MOVF 0x35, W
-    ADDLW 0x20
-    MOVWF FSR
-    MOVF INDF, W
-    MOVWF 0x3D
-    MOVF 0x3C, W
-    ADDWF 0x3D, W
-    MOVWF 0x3E
-    BSF STATUS, 7
-    MOVF 0x35, W
-    ADDLW 0xA0
-    MOVWF FSR
-    MOVF INDF, W
-    MOVWF 0x3F
-    MOVF 0x3F, W
-    ADDWF 0x3E, W
-    MOVWF 0x40
-    MOVF 0x40, W
-    MOVWF 0x30
     MOVLW 0x07
     BCF STATUS, 6
     MOVWF 0x21
     MOVF 0x21, W
     BSF STATUS, 6
-    MOVWF 0x41
-    MOVF 0x41, W
+    MOVWF 0x3C
+    MOVF 0x3C, W
     BCF STATUS, 5
     MOVWF 0x25
     BSF STATUS, 5
     MOVF 0x30, W
-    MOVWF 0x42
+    MOVWF 0x3D
     BCF STATUS, 5
     MOVF 0x25, W
     BSF STATUS, 5
+    MOVWF 0x3E
+    MOVF 0x3D, W
+    ADDWF 0x3E, W
+    MOVWF 0x3F
+    MOVF 0x3F, W
+    MOVWF 0x30
+    MOVLW 0xB1
+    MOVWF 0x4B
+    MOVLW 0x01
+    MOVWF 0x4C
+    CALL mk
+    MOVF 0x31, W
+    MOVWF 0x40
+    MOVF 0x32, W
+    MOVWF 0x41
+    MOVF 0x30, W
+    MOVWF 0x42
+    MOVF 0x40, W
+    ADDWF 0x41, W
     MOVWF 0x43
     MOVF 0x42, W
     ADDWF 0x43, W
     MOVWF 0x44
     MOVF 0x44, W
     MOVWF 0x30
-    MOVLW 0xB1
-    MOVWF 0x50
-    MOVLW 0x01
-    MOVWF 0x51
-    CALL mk
-    MOVF 0x31, W
-    MOVWF 0x45
-    MOVF 0x32, W
-    MOVWF 0x46
-    MOVF 0x30, W
-    MOVWF 0x47
-    MOVF 0x45, W
-    ADDWF 0x46, W
-    MOVWF 0x48
-    MOVF 0x47, W
-    ADDWF 0x48, W
-    MOVWF 0x49
-    MOVF 0x49, W
-    MOVWF 0x30
     BCF STATUS, 5
     MOVF 0x22, W
     BSF STATUS, 5
-    MOVWF 0x4A
-    MOVF 0x4A, W
-    MOVWF 0x4B
-    CLRF 0x4C
+    MOVWF 0x45
+    MOVF 0x45, W
+    MOVWF 0x46
+    CLRF 0x47
     BSF STATUS, 7
-    MOVF 0x4B, W
+    MOVF 0x46, W
     ADDLW 0xA0
     MOVWF FSR
     MOVLW 0x40
     MOVWF INDF
     MOVF 0x30, W
-    MOVWF 0x4D
+    MOVWF 0x48
     MOVF 0x20, W
-    MOVWF 0x4E
-    MOVF 0x4D, W
-    ADDWF 0x4E, W
-    MOVWF 0x4F
-    MOVF 0x4F, W
+    MOVWF 0x49
+    MOVF 0x48, W
+    ADDWF 0x49, W
+    MOVWF 0x4A
+    MOVF 0x4A, W
     MOVWF 0x30
     RETURN
 
