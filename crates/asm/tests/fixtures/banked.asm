@@ -1,0 +1,842 @@
+; pic8 -- integer spine milestone 2 (isel)
+    list p=16f877a
+    radix hex
+STATUS equ 0x03
+
+    org 0x0000
+    goto __start
+
+main:
+    MOVLW 0x01
+    MOVWF 0x20
+    MOVLW 0x02
+    MOVWF 0x21
+    MOVLW 0x03
+    MOVWF 0x22
+    MOVLW 0x04
+    MOVWF 0x23
+    MOVLW 0x05
+    MOVWF 0x24
+    MOVLW 0x06
+    MOVWF 0x25
+    MOVLW 0x07
+    MOVWF 0x26
+    MOVLW 0x08
+    MOVWF 0x27
+    MOVLW 0x09
+    MOVWF 0x28
+    MOVLW 0x0A
+    MOVWF 0x29
+    MOVLW 0x0B
+    MOVWF 0x2A
+    MOVLW 0x0C
+    MOVWF 0x2B
+    MOVLW 0x0D
+    MOVWF 0x2C
+    MOVLW 0x0E
+    MOVWF 0x2D
+    MOVLW 0x0F
+    MOVWF 0x2E
+    MOVLW 0x10
+    MOVWF 0x2F
+    MOVLW 0x11
+    MOVWF 0x30
+    MOVLW 0x12
+    MOVWF 0x31
+    MOVLW 0x13
+    MOVWF 0x32
+    MOVLW 0x14
+    MOVWF 0x33
+    MOVLW 0x15
+    MOVWF 0x34
+    MOVLW 0x16
+    MOVWF 0x35
+    MOVLW 0x17
+    MOVWF 0x36
+    MOVLW 0x18
+    MOVWF 0x37
+    MOVLW 0x19
+    MOVWF 0x38
+    MOVLW 0x1A
+    MOVWF 0x39
+    MOVLW 0x1B
+    MOVWF 0x3A
+    MOVLW 0x1C
+    MOVWF 0x3B
+    MOVLW 0x1D
+    MOVWF 0x3C
+    MOVLW 0x1E
+    MOVWF 0x3D
+    MOVLW 0x1F
+    MOVWF 0x3E
+    MOVLW 0x20
+    MOVWF 0x3F
+    MOVLW 0x21
+    MOVWF 0x40
+    MOVLW 0x22
+    MOVWF 0x41
+    MOVLW 0x23
+    MOVWF 0x42
+    MOVLW 0x24
+    MOVWF 0x43
+    MOVLW 0x25
+    MOVWF 0x44
+    MOVLW 0x26
+    MOVWF 0x45
+    MOVLW 0x27
+    MOVWF 0x46
+    MOVLW 0x28
+    MOVWF 0x47
+    MOVLW 0x29
+    MOVWF 0x48
+    MOVLW 0x2A
+    MOVWF 0x49
+    MOVLW 0x2B
+    MOVWF 0x4A
+    MOVLW 0x2C
+    MOVWF 0x4B
+    MOVLW 0x2D
+    MOVWF 0x4C
+    MOVLW 0x2E
+    MOVWF 0x4D
+    MOVLW 0x2F
+    MOVWF 0x4E
+    MOVLW 0x30
+    MOVWF 0x4F
+    MOVLW 0x31
+    MOVWF 0x50
+    MOVLW 0x32
+    MOVWF 0x51
+    MOVLW 0x33
+    MOVWF 0x52
+    MOVLW 0x34
+    MOVWF 0x53
+    MOVLW 0x35
+    MOVWF 0x54
+    MOVLW 0x36
+    MOVWF 0x55
+    MOVLW 0x37
+    MOVWF 0x56
+    MOVLW 0x38
+    MOVWF 0x57
+    MOVLW 0x39
+    MOVWF 0x58
+    MOVLW 0x3A
+    MOVWF 0x59
+    MOVLW 0x3B
+    MOVWF 0x5A
+    MOVLW 0x3C
+    MOVWF 0x5B
+    MOVLW 0x3D
+    MOVWF 0x5C
+    MOVLW 0x3E
+    MOVWF 0x5D
+    MOVLW 0x3F
+    MOVWF 0x5E
+    MOVLW 0x40
+    MOVWF 0x5F
+    MOVLW 0x41
+    MOVWF 0x60
+    MOVLW 0x42
+    MOVWF 0x61
+    MOVLW 0x43
+    MOVWF 0x62
+    MOVLW 0x44
+    MOVWF 0x63
+    MOVLW 0x45
+    MOVWF 0x64
+    MOVLW 0x46
+    MOVWF 0x65
+    MOVLW 0x47
+    MOVWF 0x66
+    MOVLW 0x48
+    MOVWF 0x67
+    MOVLW 0x49
+    MOVWF 0x68
+    MOVLW 0x4A
+    MOVWF 0x69
+    MOVLW 0x4B
+    MOVWF 0x6A
+    MOVLW 0x4C
+    MOVWF 0x6B
+    MOVLW 0x4D
+    MOVWF 0x6C
+    MOVLW 0x4E
+    MOVWF 0x6D
+    MOVLW 0x4F
+    MOVWF 0x6E
+    MOVLW 0x50
+    MOVWF 0x6F
+    MOVLW 0x51
+    BSF STATUS, 5
+    MOVWF 0x20
+    MOVLW 0x52
+    MOVWF 0x21
+    MOVLW 0x53
+    MOVWF 0x22
+    MOVLW 0x54
+    MOVWF 0x23
+    MOVLW 0x55
+    MOVWF 0x24
+    MOVLW 0x56
+    MOVWF 0x25
+    MOVLW 0x57
+    MOVWF 0x26
+    MOVLW 0x58
+    MOVWF 0x27
+    MOVLW 0x59
+    MOVWF 0x28
+    MOVLW 0x5A
+    MOVWF 0x29
+    BCF STATUS, 5
+    MOVF 0x20, W
+    BSF STATUS, 5
+    MOVWF 0x2B
+    BCF STATUS, 5
+    MOVF 0x21, W
+    BSF STATUS, 5
+    MOVWF 0x2C
+    MOVF 0x2B, W
+    ADDWF 0x2C, W
+    MOVWF 0x2D
+    BCF STATUS, 5
+    MOVF 0x22, W
+    BSF STATUS, 5
+    MOVWF 0x2E
+    MOVF 0x2E, W
+    ADDWF 0x2D, W
+    MOVWF 0x2F
+    BCF STATUS, 5
+    MOVF 0x23, W
+    BSF STATUS, 5
+    MOVWF 0x30
+    MOVF 0x30, W
+    ADDWF 0x2F, W
+    MOVWF 0x31
+    BCF STATUS, 5
+    MOVF 0x24, W
+    BSF STATUS, 5
+    MOVWF 0x32
+    MOVF 0x32, W
+    ADDWF 0x31, W
+    MOVWF 0x33
+    BCF STATUS, 5
+    MOVF 0x25, W
+    BSF STATUS, 5
+    MOVWF 0x34
+    MOVF 0x34, W
+    ADDWF 0x33, W
+    MOVWF 0x35
+    BCF STATUS, 5
+    MOVF 0x26, W
+    BSF STATUS, 5
+    MOVWF 0x36
+    MOVF 0x36, W
+    ADDWF 0x35, W
+    MOVWF 0x37
+    BCF STATUS, 5
+    MOVF 0x27, W
+    BSF STATUS, 5
+    MOVWF 0x38
+    MOVF 0x38, W
+    ADDWF 0x37, W
+    MOVWF 0x39
+    BCF STATUS, 5
+    MOVF 0x28, W
+    BSF STATUS, 5
+    MOVWF 0x3A
+    MOVF 0x3A, W
+    ADDWF 0x39, W
+    MOVWF 0x3B
+    BCF STATUS, 5
+    MOVF 0x29, W
+    BSF STATUS, 5
+    MOVWF 0x3C
+    MOVF 0x3C, W
+    ADDWF 0x3B, W
+    MOVWF 0x3D
+    BCF STATUS, 5
+    MOVF 0x2A, W
+    BSF STATUS, 5
+    MOVWF 0x3E
+    MOVF 0x3E, W
+    ADDWF 0x3D, W
+    MOVWF 0x3F
+    BCF STATUS, 5
+    MOVF 0x2B, W
+    BSF STATUS, 5
+    MOVWF 0x40
+    MOVF 0x40, W
+    ADDWF 0x3F, W
+    MOVWF 0x41
+    BCF STATUS, 5
+    MOVF 0x2C, W
+    BSF STATUS, 5
+    MOVWF 0x42
+    MOVF 0x42, W
+    ADDWF 0x41, W
+    MOVWF 0x43
+    BCF STATUS, 5
+    MOVF 0x2D, W
+    BSF STATUS, 5
+    MOVWF 0x44
+    MOVF 0x44, W
+    ADDWF 0x43, W
+    MOVWF 0x45
+    BCF STATUS, 5
+    MOVF 0x2E, W
+    BSF STATUS, 5
+    MOVWF 0x46
+    MOVF 0x46, W
+    ADDWF 0x45, W
+    MOVWF 0x47
+    BCF STATUS, 5
+    MOVF 0x2F, W
+    BSF STATUS, 5
+    MOVWF 0x48
+    MOVF 0x48, W
+    ADDWF 0x47, W
+    MOVWF 0x49
+    BCF STATUS, 5
+    MOVF 0x30, W
+    BSF STATUS, 5
+    MOVWF 0x4A
+    MOVF 0x4A, W
+    ADDWF 0x49, W
+    MOVWF 0x4B
+    BCF STATUS, 5
+    MOVF 0x31, W
+    BSF STATUS, 5
+    MOVWF 0x4C
+    MOVF 0x4C, W
+    ADDWF 0x4B, W
+    MOVWF 0x4D
+    BCF STATUS, 5
+    MOVF 0x32, W
+    BSF STATUS, 5
+    MOVWF 0x4E
+    MOVF 0x4E, W
+    ADDWF 0x4D, W
+    MOVWF 0x4F
+    BCF STATUS, 5
+    MOVF 0x33, W
+    BSF STATUS, 5
+    MOVWF 0x50
+    MOVF 0x50, W
+    ADDWF 0x4F, W
+    MOVWF 0x51
+    BCF STATUS, 5
+    MOVF 0x34, W
+    BSF STATUS, 5
+    MOVWF 0x52
+    MOVF 0x52, W
+    ADDWF 0x51, W
+    MOVWF 0x53
+    BCF STATUS, 5
+    MOVF 0x35, W
+    BSF STATUS, 5
+    MOVWF 0x54
+    MOVF 0x54, W
+    ADDWF 0x53, W
+    MOVWF 0x55
+    BCF STATUS, 5
+    MOVF 0x36, W
+    BSF STATUS, 5
+    MOVWF 0x56
+    MOVF 0x56, W
+    ADDWF 0x55, W
+    MOVWF 0x57
+    BCF STATUS, 5
+    MOVF 0x37, W
+    BSF STATUS, 5
+    MOVWF 0x58
+    MOVF 0x58, W
+    ADDWF 0x57, W
+    MOVWF 0x59
+    BCF STATUS, 5
+    MOVF 0x38, W
+    BSF STATUS, 5
+    MOVWF 0x5A
+    MOVF 0x5A, W
+    ADDWF 0x59, W
+    MOVWF 0x5B
+    BCF STATUS, 5
+    MOVF 0x39, W
+    BSF STATUS, 5
+    MOVWF 0x5C
+    MOVF 0x5C, W
+    ADDWF 0x5B, W
+    MOVWF 0x5D
+    BCF STATUS, 5
+    MOVF 0x3A, W
+    BSF STATUS, 5
+    MOVWF 0x5E
+    MOVF 0x5E, W
+    ADDWF 0x5D, W
+    MOVWF 0x5F
+    BCF STATUS, 5
+    MOVF 0x3B, W
+    BSF STATUS, 5
+    MOVWF 0x60
+    MOVF 0x60, W
+    ADDWF 0x5F, W
+    MOVWF 0x61
+    BCF STATUS, 5
+    MOVF 0x3C, W
+    BSF STATUS, 5
+    MOVWF 0x62
+    MOVF 0x62, W
+    ADDWF 0x61, W
+    MOVWF 0x63
+    BCF STATUS, 5
+    MOVF 0x3D, W
+    BSF STATUS, 5
+    MOVWF 0x64
+    MOVF 0x64, W
+    ADDWF 0x63, W
+    MOVWF 0x65
+    BCF STATUS, 5
+    MOVF 0x3E, W
+    BSF STATUS, 5
+    MOVWF 0x66
+    MOVF 0x66, W
+    ADDWF 0x65, W
+    MOVWF 0x67
+    BCF STATUS, 5
+    MOVF 0x3F, W
+    BSF STATUS, 5
+    MOVWF 0x68
+    MOVF 0x68, W
+    ADDWF 0x67, W
+    MOVWF 0x69
+    BCF STATUS, 5
+    MOVF 0x40, W
+    BSF STATUS, 5
+    MOVWF 0x6A
+    MOVF 0x6A, W
+    ADDWF 0x69, W
+    MOVWF 0x6B
+    BCF STATUS, 5
+    MOVF 0x41, W
+    BSF STATUS, 5
+    MOVWF 0x6C
+    MOVF 0x6C, W
+    ADDWF 0x6B, W
+    MOVWF 0x6D
+    BCF STATUS, 5
+    MOVF 0x42, W
+    BSF STATUS, 5
+    MOVWF 0x6E
+    MOVF 0x6E, W
+    ADDWF 0x6D, W
+    MOVWF 0x6F
+    BCF STATUS, 5
+    MOVF 0x43, W
+    BSF STATUS, 6
+    MOVWF 0x20
+    MOVF 0x20, W
+    BSF STATUS, 5
+    BCF STATUS, 6
+    ADDWF 0x6F, W
+    BCF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x21
+    BCF STATUS, 6
+    MOVF 0x44, W
+    BSF STATUS, 6
+    MOVWF 0x22
+    MOVF 0x22, W
+    ADDWF 0x21, W
+    MOVWF 0x23
+    BCF STATUS, 6
+    MOVF 0x45, W
+    BSF STATUS, 6
+    MOVWF 0x24
+    MOVF 0x24, W
+    ADDWF 0x23, W
+    MOVWF 0x25
+    BCF STATUS, 6
+    MOVF 0x46, W
+    BSF STATUS, 6
+    MOVWF 0x26
+    MOVF 0x26, W
+    ADDWF 0x25, W
+    MOVWF 0x27
+    BCF STATUS, 6
+    MOVF 0x47, W
+    BSF STATUS, 6
+    MOVWF 0x28
+    MOVF 0x28, W
+    ADDWF 0x27, W
+    MOVWF 0x29
+    BCF STATUS, 6
+    MOVF 0x48, W
+    BSF STATUS, 6
+    MOVWF 0x2A
+    MOVF 0x2A, W
+    ADDWF 0x29, W
+    MOVWF 0x2B
+    BCF STATUS, 6
+    MOVF 0x49, W
+    BSF STATUS, 6
+    MOVWF 0x2C
+    MOVF 0x2C, W
+    ADDWF 0x2B, W
+    MOVWF 0x2D
+    BCF STATUS, 6
+    MOVF 0x4A, W
+    BSF STATUS, 6
+    MOVWF 0x2E
+    MOVF 0x2E, W
+    ADDWF 0x2D, W
+    MOVWF 0x2F
+    BCF STATUS, 6
+    MOVF 0x4B, W
+    BSF STATUS, 6
+    MOVWF 0x30
+    MOVF 0x30, W
+    ADDWF 0x2F, W
+    MOVWF 0x31
+    BCF STATUS, 6
+    MOVF 0x4C, W
+    BSF STATUS, 6
+    MOVWF 0x32
+    MOVF 0x32, W
+    ADDWF 0x31, W
+    MOVWF 0x33
+    BCF STATUS, 6
+    MOVF 0x4D, W
+    BSF STATUS, 6
+    MOVWF 0x34
+    MOVF 0x34, W
+    ADDWF 0x33, W
+    MOVWF 0x35
+    BCF STATUS, 6
+    MOVF 0x4E, W
+    BSF STATUS, 6
+    MOVWF 0x36
+    MOVF 0x36, W
+    ADDWF 0x35, W
+    MOVWF 0x37
+    BCF STATUS, 6
+    MOVF 0x4F, W
+    BSF STATUS, 6
+    MOVWF 0x38
+    MOVF 0x38, W
+    ADDWF 0x37, W
+    MOVWF 0x39
+    BCF STATUS, 6
+    MOVF 0x50, W
+    BSF STATUS, 6
+    MOVWF 0x3A
+    MOVF 0x3A, W
+    ADDWF 0x39, W
+    MOVWF 0x3B
+    BCF STATUS, 6
+    MOVF 0x51, W
+    BSF STATUS, 6
+    MOVWF 0x3C
+    MOVF 0x3C, W
+    ADDWF 0x3B, W
+    MOVWF 0x3D
+    BCF STATUS, 6
+    MOVF 0x52, W
+    BSF STATUS, 6
+    MOVWF 0x3E
+    MOVF 0x3E, W
+    ADDWF 0x3D, W
+    MOVWF 0x3F
+    BCF STATUS, 6
+    MOVF 0x53, W
+    BSF STATUS, 6
+    MOVWF 0x40
+    MOVF 0x40, W
+    ADDWF 0x3F, W
+    MOVWF 0x41
+    BCF STATUS, 6
+    MOVF 0x54, W
+    BSF STATUS, 6
+    MOVWF 0x42
+    MOVF 0x42, W
+    ADDWF 0x41, W
+    MOVWF 0x43
+    BCF STATUS, 6
+    MOVF 0x55, W
+    BSF STATUS, 6
+    MOVWF 0x44
+    MOVF 0x44, W
+    ADDWF 0x43, W
+    MOVWF 0x45
+    BCF STATUS, 6
+    MOVF 0x56, W
+    BSF STATUS, 6
+    MOVWF 0x46
+    MOVF 0x46, W
+    ADDWF 0x45, W
+    MOVWF 0x47
+    BCF STATUS, 6
+    MOVF 0x57, W
+    BSF STATUS, 6
+    MOVWF 0x48
+    MOVF 0x48, W
+    ADDWF 0x47, W
+    MOVWF 0x49
+    BCF STATUS, 6
+    MOVF 0x58, W
+    BSF STATUS, 6
+    MOVWF 0x4A
+    MOVF 0x4A, W
+    ADDWF 0x49, W
+    MOVWF 0x4B
+    BCF STATUS, 6
+    MOVF 0x59, W
+    BSF STATUS, 6
+    MOVWF 0x4C
+    MOVF 0x4C, W
+    ADDWF 0x4B, W
+    MOVWF 0x4D
+    BCF STATUS, 6
+    MOVF 0x5A, W
+    BSF STATUS, 6
+    MOVWF 0x4E
+    MOVF 0x4E, W
+    ADDWF 0x4D, W
+    MOVWF 0x4F
+    BCF STATUS, 6
+    MOVF 0x5B, W
+    BSF STATUS, 6
+    MOVWF 0x50
+    MOVF 0x50, W
+    ADDWF 0x4F, W
+    MOVWF 0x51
+    BCF STATUS, 6
+    MOVF 0x5C, W
+    BSF STATUS, 6
+    MOVWF 0x52
+    MOVF 0x52, W
+    ADDWF 0x51, W
+    MOVWF 0x53
+    BCF STATUS, 6
+    MOVF 0x5D, W
+    BSF STATUS, 6
+    MOVWF 0x54
+    MOVF 0x54, W
+    ADDWF 0x53, W
+    MOVWF 0x55
+    BCF STATUS, 6
+    MOVF 0x5E, W
+    BSF STATUS, 6
+    MOVWF 0x56
+    MOVF 0x56, W
+    ADDWF 0x55, W
+    MOVWF 0x57
+    BCF STATUS, 6
+    MOVF 0x5F, W
+    BSF STATUS, 6
+    MOVWF 0x58
+    MOVF 0x58, W
+    ADDWF 0x57, W
+    MOVWF 0x59
+    BCF STATUS, 6
+    MOVF 0x60, W
+    BSF STATUS, 6
+    MOVWF 0x5A
+    MOVF 0x5A, W
+    ADDWF 0x59, W
+    MOVWF 0x5B
+    BCF STATUS, 6
+    MOVF 0x61, W
+    BSF STATUS, 6
+    MOVWF 0x5C
+    MOVF 0x5C, W
+    ADDWF 0x5B, W
+    MOVWF 0x5D
+    BCF STATUS, 6
+    MOVF 0x62, W
+    BSF STATUS, 6
+    MOVWF 0x5E
+    MOVF 0x5E, W
+    ADDWF 0x5D, W
+    MOVWF 0x5F
+    BCF STATUS, 6
+    MOVF 0x63, W
+    BSF STATUS, 6
+    MOVWF 0x60
+    MOVF 0x60, W
+    ADDWF 0x5F, W
+    MOVWF 0x61
+    BCF STATUS, 6
+    MOVF 0x64, W
+    BSF STATUS, 6
+    MOVWF 0x62
+    MOVF 0x62, W
+    ADDWF 0x61, W
+    MOVWF 0x63
+    BCF STATUS, 6
+    MOVF 0x65, W
+    BSF STATUS, 6
+    MOVWF 0x64
+    MOVF 0x64, W
+    ADDWF 0x63, W
+    MOVWF 0x65
+    BCF STATUS, 6
+    MOVF 0x66, W
+    BSF STATUS, 6
+    MOVWF 0x66
+    MOVF 0x66, W
+    ADDWF 0x65, W
+    MOVWF 0x67
+    BCF STATUS, 6
+    MOVF 0x67, W
+    BSF STATUS, 6
+    MOVWF 0x68
+    MOVF 0x68, W
+    ADDWF 0x67, W
+    MOVWF 0x69
+    BCF STATUS, 6
+    MOVF 0x68, W
+    BSF STATUS, 6
+    MOVWF 0x6A
+    MOVF 0x6A, W
+    ADDWF 0x69, W
+    MOVWF 0x6B
+    BCF STATUS, 6
+    MOVF 0x69, W
+    BSF STATUS, 6
+    MOVWF 0x6C
+    MOVF 0x6C, W
+    ADDWF 0x6B, W
+    MOVWF 0x6D
+    BCF STATUS, 6
+    MOVF 0x6A, W
+    BSF STATUS, 6
+    MOVWF 0x6E
+    MOVF 0x6E, W
+    ADDWF 0x6D, W
+    MOVWF 0x6F
+    BCF STATUS, 6
+    MOVF 0x6B, W
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x10
+    MOVF 0x10, W
+    BCF STATUS, 5
+    ADDWF 0x6F, W
+    BSF STATUS, 5
+    MOVWF 0x11
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x6C, W
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x12
+    MOVF 0x12, W
+    ADDWF 0x11, W
+    MOVWF 0x13
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x6D, W
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x14
+    MOVF 0x14, W
+    ADDWF 0x13, W
+    MOVWF 0x15
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x6E, W
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x16
+    MOVF 0x16, W
+    ADDWF 0x15, W
+    MOVWF 0x17
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x6F, W
+    BSF STATUS, 5
+    BSF STATUS, 6
+    MOVWF 0x18
+    MOVF 0x18, W
+    ADDWF 0x17, W
+    MOVWF 0x19
+    BCF STATUS, 6
+    MOVF 0x20, W
+    BSF STATUS, 6
+    MOVWF 0x1A
+    MOVF 0x1A, W
+    ADDWF 0x19, W
+    MOVWF 0x1B
+    BCF STATUS, 6
+    MOVF 0x21, W
+    BSF STATUS, 6
+    MOVWF 0x1C
+    MOVF 0x1C, W
+    ADDWF 0x1B, W
+    MOVWF 0x1D
+    BCF STATUS, 6
+    MOVF 0x22, W
+    BSF STATUS, 6
+    MOVWF 0x1E
+    MOVF 0x1E, W
+    ADDWF 0x1D, W
+    MOVWF 0x1F
+    BCF STATUS, 6
+    MOVF 0x23, W
+    BSF STATUS, 6
+    MOVWF 0x20
+    MOVF 0x20, W
+    ADDWF 0x1F, W
+    MOVWF 0x21
+    BCF STATUS, 6
+    MOVF 0x24, W
+    BSF STATUS, 6
+    MOVWF 0x22
+    MOVF 0x22, W
+    ADDWF 0x21, W
+    MOVWF 0x23
+    BCF STATUS, 6
+    MOVF 0x25, W
+    BSF STATUS, 6
+    MOVWF 0x24
+    MOVF 0x24, W
+    ADDWF 0x23, W
+    MOVWF 0x25
+    BCF STATUS, 6
+    MOVF 0x26, W
+    BSF STATUS, 6
+    MOVWF 0x26
+    MOVF 0x26, W
+    ADDWF 0x25, W
+    MOVWF 0x27
+    BCF STATUS, 6
+    MOVF 0x27, W
+    BSF STATUS, 6
+    MOVWF 0x28
+    MOVF 0x28, W
+    ADDWF 0x27, W
+    MOVWF 0x29
+    BCF STATUS, 6
+    MOVF 0x28, W
+    BSF STATUS, 6
+    MOVWF 0x2A
+    MOVF 0x2A, W
+    ADDWF 0x29, W
+    MOVWF 0x2B
+    BCF STATUS, 6
+    MOVF 0x29, W
+    BSF STATUS, 6
+    MOVWF 0x2C
+    MOVF 0x2C, W
+    ADDWF 0x2B, W
+    MOVWF 0x2D
+    MOVF 0x2D, W
+    BCF STATUS, 6
+    MOVWF 0x2A
+    RETURN
+
+__start:
+    CALL main
+    SLEEP
+
+    end
