@@ -33,7 +33,7 @@
 // at base 0x96 — pad is sized to fit its own window (0x96 + 104 = 0xFE <=
 // 0x100) while still pushing table's natural base past 0x100; `.align 256`
 // lifts the table to 0x200 (window 2): chunks at table/table_1 (LOW == 0
-// both), total ends ~0x32C < 0x800.
+// both), total is 820 words (ends 0x334) < 0x800.
 //
 // Expected for in == 290: out = (0x33 + 0x02 + 0x3C + 0x11) & 0xFF = 0x82
 // (hand-traced against the emitted IR in const_table_e2e.rs).
