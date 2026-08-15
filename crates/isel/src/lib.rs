@@ -1,24 +1,76 @@
 //! `isel` — instruction selection for the integer spine.
 //!
 //! Milestone-2 subset: lowers `load`/`store`, `add` and `and` (i8 and i16),
-//! `zext`/`trunc`, and eliminates `phi` by copying each predecessor's
-//! incoming value into the phi destination at the end of the predecessor
-//! block, before its terminator. Any other instruction or binop panics.
+//! `zext`/`trunc`, `call` (arg copies into the callee's param slots + retval
+//! copy), `ret` with and without a value, and eliminates `phi` by copying each
+//! predecessor's incoming value into the phi destination at the end of the
+//! predecessor block, before its terminator. Any other instruction or binop
+//! panics.
 
 use ir::{BinOp, Inst, Module, Ty, Val};
 use std::collections::HashMap;
 
 const COMMON_START: u8 = 0x70;
-const BANK0_START: u8 = 0x25;
 
-/// Per-function codegen state: the SSA slot map, the next free GPR address,
-/// the fixed icmp scratch byte, a fresh-label counter, and the lines emitted
-/// for the current function.
-struct Gen<'m> {
-    addrs: &'m HashMap<String, u8>,
-    slots: HashMap<String, u8>,
-    next: u8,
+/// Module-wide SSA slot key: `{func}::{name}`. Every value of every function
+/// lives in one shared map with one shared allocator counter, so a callee's
+/// param slots can never collide with the caller's live slots (the
+/// milestone-1 per-function maps restarted at 0x70 for each function and did
+/// collide across CALL boundaries).
+fn ssa_key(func: &str, name: &str) -> String {
+    format!("{func}::{name}")
+}
+
+/// Assign (or return the existing) GPR base address for SSA value `key` of
+/// `ty` in the module-wide slot map. An i16 occupies two consecutive slots
+/// (lo at `a`, hi at `a+1`), so two bytes are reserved. Common RAM
+/// `0x70`→`0x7F` is consumed first; once exhausted, bank-0 GPRs from
+/// `bank0_start` are used. This is a milestone-2 approximation; overlay
+/// allocation and spill handling land in a later milestone.
+fn alloc_slot(
+    slots: &mut HashMap<String, u8>,
+    next: &mut u8,
+    key: &str,
+    ty: Ty,
     scratch: u8,
+    bank0_start: u8,
+) -> u8 {
+    if let Some(&a) = slots.get(key) {
+        return a;
+    }
+    // A multi-byte value must fit entirely in common RAM (0x70..=0x7F).
+    // If it would straddle the boundary (e.g. an i16 with its lo at
+    // 0x7F would place the hi at 0x80, aliasing bank-1 INDF), spill the
+    // whole value to bank-0 GPRs first. Mirrors spike alloc_slot's
+    // `common + n - 1 <= COMMON_END` fit check.
+    let n = ty.bytes();
+    if *next + n - 1 > 0x7F {
+        *next = bank0_start;
+    }
+    // The fixed icmp scratch byte lives just past the globals. Never let a
+    // slot's lo or hi byte land on it, or an icmp in the same function would
+    // silently corrupt that slot.
+    if scratch >= *next && scratch < *next + n {
+        *next = scratch.wrapping_add(1);
+    }
+    let a = *next;
+    *next = next.wrapping_add(n);
+    slots.insert(key.to_string(), a);
+    a
+}
+
+/// Per-function codegen state. The SSA slot map and its allocator counter are
+/// shared across the whole module (behind `&mut`), so slots are keyed
+/// `{func}::{name}`; `cur_func` selects the current function's entries.
+struct Gen<'m> {
+    m: &'m Module,
+    addrs: &'m HashMap<String, u8>,
+    slots: &'m mut HashMap<String, u8>,
+    next: &'m mut u8,
+    scratch: u8,
+    retval_lo: u8,
+    bank0_start: u8,
+    cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
     tmp: &'m mut u32,
@@ -30,44 +82,32 @@ impl<'m> Gen<'m> {
         self.out.push(s.into());
     }
 
-    /// Assign (or return the existing) GPR base address for an SSA value of
-    /// `ty`. An i16 occupies two consecutive slots (lo at `a`, hi at `a+1`),
-    /// so two bytes are reserved. Common RAM `0x70`→`0x7F` is consumed first;
-    /// once exhausted, bank-0 GPRs from `0x25` are used. This is a
-    /// milestone-2 approximation; overlay allocation and spill handling land
-    /// in a later milestone.
+    /// Assign (or return the existing) GPR base address for the current
+    /// function's SSA value `name` of `ty`, via the module-wide shared map.
     fn slot(&mut self, name: &str, ty: Ty) -> u8 {
-        if let Some(&a) = self.slots.get(name) {
-            return a;
-        }
-        // A multi-byte value must fit entirely in common RAM (0x70..=0x7F).
-        // If it would straddle the boundary (e.g. an i16 with its lo at
-        // 0x7F would place the hi at 0x80, aliasing bank-1 INDF), spill the
-        // whole value to bank-0 GPRs first. Mirrors spike alloc_slot's
-        // `common + n - 1 <= COMMON_END` fit check.
-        let n = ty.bytes();
-        if self.next + n - 1 > 0x7F {
-            self.next = BANK0_START;
-        }
-        // The fixed icmp scratch byte lives in bank-0 GPR space (>= 0x2A, or
-        // just past the globals). Never let a slot's lo or hi byte land on it,
-        // or an icmp in the same function would silently corrupt that slot.
-        if self.scratch >= self.next && self.scratch < self.next + n {
-            self.next = self.scratch.wrapping_add(1);
-        }
-        let a = self.next;
-        self.next = self.next.wrapping_add(n);
-        self.slots.insert(name.to_string(), a);
-        a
+        let key = ssa_key(self.cur_func, name);
+        alloc_slot(
+            self.slots,
+            self.next,
+            &key,
+            ty,
+            self.scratch,
+            self.bank0_start,
+        )
+    }
+
+    /// Resolve `{func}::{name}` to its base byte address (lo for multi-byte).
+    fn slot_addr(&self, func: &str, name: &str) -> u8 {
+        *self
+            .slots
+            .get(&ssa_key(func, name))
+            .unwrap_or_else(|| panic!("isel: no slot for {func}::{name}"))
     }
 
     /// Resolve an operand value to its base byte address (lo for multi-byte).
     fn val_addr(&self, v: &Val) -> u8 {
         match v {
-            Val::Reg(r) => *self
-                .slots
-                .get(r)
-                .unwrap_or_else(|| panic!("isel: no slot for %{r}")),
+            Val::Reg(r) => self.slot_addr(self.cur_func, r),
             Val::Global(g) => *self
                 .addrs
                 .get(g)
@@ -88,10 +128,7 @@ impl<'m> Gen<'m> {
                 .unwrap_or_else(|| panic!("isel: no address for @{g}"))
         } else {
             let name = p.trim_start_matches('%');
-            *self
-                .slots
-                .get(name)
-                .unwrap_or_else(|| panic!("isel: no slot for %{name}"))
+            self.slot_addr(self.cur_func, name)
         }
     }
 
@@ -281,6 +318,33 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// `dst = call func(args)`: copy each arg into the callee's
+    /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
+    /// (`retval_lo`/`retval_lo+1`) into `dst`. Void calls skip the retval
+    /// copy. Mirrors spike emit_call.
+    fn emit_call(&mut self, dst: &Option<String>, ty: Option<Ty>, func: &str, args: &[(Ty, Val)]) {
+        let callee = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == func)
+            .unwrap_or_else(|| panic!("isel: call to unknown function @{func}"));
+        for (i, (aty, val)) in args.iter().enumerate() {
+            let pname = &callee.params[i].1;
+            let pa = self.slot_addr(func, pname);
+            self.emit_move_val_to_slot(val, *aty, pa);
+        }
+        self.emit(format!("    CALL {func}"));
+        if let Some(d) = dst {
+            let t = ty.expect("isel: valued call must carry a type");
+            let da = self.slot(d, t);
+            for i in 0..t.bytes() {
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + i));
+                self.emit(format!("    MOVWF 0x{:02X}", da + i));
+            }
+        }
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         match i {
             Inst::Load(l) => {
@@ -377,6 +441,7 @@ impl<'m> Gen<'m> {
             Inst::Select(s) => {
                 self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
             }
+            Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args),
             _ => panic!("isel: unsupported instruction for milestone 2"),
         }
     }
@@ -393,6 +458,14 @@ impl<'m> Gen<'m> {
                 self.emit_cond_branch(&b.cond, lt, lf);
             }
             Inst::Ret(None) => self.emit("    RETURN".to_string()),
+            Inst::Ret(Some((ty, v))) => {
+                // Copy the value into the fixed retval slots, then RETURN.
+                for i in 0..ty.bytes() {
+                    self.emit_load_byte(v, i);
+                    self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo + i));
+                }
+                self.emit("    RETURN".to_string());
+            }
             _ => panic!("isel: unsupported terminator for milestone 2"),
         }
     }
@@ -401,17 +474,28 @@ impl<'m> Gen<'m> {
 /// Select instructions for the whole module, producing PIC14 assembly text.
 ///
 /// `addrs` maps global names to their bank-0 GPR addresses (from `alloc`).
-/// SSA destinations are assigned fresh addresses per function: common RAM
-/// (`0x70`→`0x7F`) first, then bank-0 GPRs from `0x25`.
+/// The layout follows the spike: the icmp scratch byte sits at
+/// `end_of_globals` (max global addr + size), the retval slots at
+/// `end_of_globals+1/+2`, and bank-0 GPR overflow starts at
+/// `end_of_globals+3` (probe: globals 0x20/0x21 → scratch 0x22, retval
+/// 0x23/0x24, bank0 0x25). SSA destinations are assigned fresh addresses in a
+/// single module-wide map keyed `{func}::{name}`: common RAM (`0x70`→`0x7F`)
+/// first, then bank-0 GPRs.
 pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
-    // Fixed icmp scratch byte, placed after the address map's globals so it
-    // never collides with them. `alloc` assigns globals from 0x20 (the driver's
-    // in/out live at 0x20/0x21), so 0x2A is the floor; if any global is larger,
-    // the scratch moves just past the map's end. Slots live in common RAM
-    // (0x70+) and are unaffected.
-    let scratch = addrs
-        .values()
-        .fold(0x2Au8, |s, &a| s.max(a.wrapping_add(2)));
+    // end_of_globals = max over the address map of (global addr + size). The
+    // scratch and retval slots live immediately after it so a large global
+    // array can never collide with them. Globals absent from the map (e.g.
+    // const/failed modules) don't move the end.
+    let end_of_globals = m
+        .globals
+        .iter()
+        .fold(0x20u8, |end, g| match addrs.get(&g.name) {
+            Some(&a) => end.max(a.wrapping_add(g.ty.bytes())),
+            None => end,
+        });
+    let scratch = end_of_globals;
+    let retval_lo = end_of_globals + 1;
+    let bank0_start = end_of_globals + 3;
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
         "    list p=16f877a".to_string(),
@@ -425,12 +509,30 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
     let mut tmp = 0u32;
+    // Module-wide SSA slot map and allocator counter, shared by every
+    // function: each value gets a distinct address, so the callee's param
+    // slots can never overlap the caller's live slots (the milestone-1
+    // per-function maps collided across CALL boundaries).
+    let mut slots: HashMap<String, u8> = HashMap::new();
+    let mut next: u8 = COMMON_START;
+    // Reserve every function's params first (spike order) so a CALL's arg
+    // copies always find a stable callee param address.
+    for f in &m.funcs {
+        for (ty, name) in &f.params {
+            let key = ssa_key(&f.name, name);
+            alloc_slot(&mut slots, &mut next, &key, *ty, scratch, bank0_start);
+        }
+    }
     for f in &m.funcs {
         let mut g = Gen {
+            m,
             addrs,
-            slots: HashMap::new(),
-            next: COMMON_START,
+            slots: &mut slots,
+            next: &mut next,
             scratch,
+            retval_lo,
+            bank0_start,
+            cur_func: &f.name,
             tmp: &mut tmp,
             out: Vec::new(),
         };

@@ -88,8 +88,9 @@ fn add16_reg_const_emits_carry_chain() {
 #[test]
 fn i16_slot_avoids_straddling_common_boundary() {
     // Consume all of common RAM (0x70..=0x7F) with i8 values, then allocate
-    // an i16: it must land entirely in bank-0 GPRs (>= 0x25), not straddle
-    // 0x7F/0x80 (0x80 would alias bank-1 INDF).
+    // an i16: it must land entirely in bank-0 GPRs (from bank0_start = 0x35,
+    // after the globals), not straddle 0x7F/0x80 (0x80 would alias bank-1
+    // INDF).
     let globals: String = (0..16).map(|i| format!("global g{i} i8\n")).collect();
     let loads: String = (0..16).map(|i| format!("    %a{i} = load i8 @g{i}\n")).collect();
     let m = parse(&format!(
@@ -98,8 +99,9 @@ fn i16_slot_avoids_straddling_common_boundary() {
     let mut addrs: HashMap<String, u8> = (0..16).map(|i| (format!("g{i}"), 0x20 + i)).collect();
     addrs.insert("out".to_string(), 0x30u8);
     let asm = select(&m, &addrs);
-    assert!(asm.contains("MOVWF 0x25"), "i16 lo should land at bank-0 0x25:\n{asm}");
-    assert!(asm.contains("MOVWF 0x26"), "i16 hi should land at bank-0 0x26:\n{asm}");
+    // end_of_globals = max(0x2F+1, 0x30+2) = 0x32 -> bank0_start = 0x35.
+    assert!(asm.contains("MOVWF 0x35"), "i16 lo should land at bank-0 0x35:\n{asm}");
+    assert!(asm.contains("MOVWF 0x36"), "i16 hi should land at bank-0 0x36:\n{asm}");
     assert!(!asm.contains("MOVWF 0x80"), "must not emit a write to 0x80 (bank-1 INDF):\n{asm}");
 }
 
@@ -165,10 +167,10 @@ fn icmp_eq_i8_materializes_i1() {
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let asm = select(&m, &addrs);
-    // %1=0x70, %c=0x71, scratch=0x2A (after the driver's in/out globals 0x20/0x21).
+    // %1=0x70, %c=0x71, scratch=0x22 (end_of_globals: 0x20+1, 0x21+1 -> 0x22).
     assert!(asm.contains("MOVF 0x70, W"), "load a:\n{asm}");
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
-    assert!(asm.contains("MOVWF 0x2A"), "store xor to scratch:\n{asm}");
+    assert!(asm.contains("MOVWF 0x22"), "store xor to scratch:\n{asm}");
     assert!(asm.contains("MOVLW 0x00"), "materialize 0:\n{asm}");
     assert!(asm.contains("BTFSC STATUS, 2"), "Z test:\n{asm}");
     assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
@@ -182,14 +184,15 @@ fn icmp_eq_i16_uses_scratch_accumulation() {
     );
     let addrs = addrs(&[("x", 0x20), ("y", 0x22), ("out", 0x24)]);
     let asm = select(&m, &addrs);
-    // %a=0x70/71, %b=0x72/73, %c=0x74, scratch=0x2A.
+    // %a=0x70/71, %b=0x72/73, %c=0x74, scratch=0x25 (end_of_globals:
+    // max(0x20+2, 0x22+2, 0x24+1) = 0x25).
     assert!(asm.contains("MOVF 0x70, W"), "load a_lo:\n{asm}");
     assert!(asm.contains("XORWF 0x72, W"), "xor b_lo:\n{asm}");
-    assert!(asm.contains("MOVWF 0x2A"), "store lo xor to scratch:\n{asm}");
+    assert!(asm.contains("MOVWF 0x25"), "store lo xor to scratch:\n{asm}");
     assert!(asm.contains("MOVF 0x71, W"), "load a_hi:\n{asm}");
     assert!(asm.contains("XORWF 0x73, W"), "xor b_hi:\n{asm}");
-    assert!(asm.contains("IORWF 0x2A, W"), "or hi into scratch:\n{asm}");
-    assert!(asm.contains("MOVWF 0x2A"), "store accumulated scratch:\n{asm}");
+    assert!(asm.contains("IORWF 0x25, W"), "or hi into scratch:\n{asm}");
+    assert!(asm.contains("MOVWF 0x25"), "store accumulated scratch:\n{asm}");
     assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
     assert!(asm.contains("MOVWF 0x74"), "store d:\n{asm}");
 }
@@ -244,19 +247,116 @@ fn select_labels_are_unique_across_functions() {
 }
 
 #[test]
-fn slot_skips_icmp_scratch_0x2a() {
-    // 16 i8 loads fill common RAM (0x70..=0x7F); bank-0 GPRs then continue
-    // from 0x25. The 22nd byte-slot would land on 0x2A, the fixed icmp
-    // scratch byte. slot() must skip it so an icmp in the same function never
-    // silently corrupts that slot.
-    let loads: String = (0..21).map(|i| format!("    %a{i} = load i8 @in\n")).collect();
-    let m = parse(&format!(
-        "global in i8\nfn main() -> void\n  block entry:\n{loads}    %a21 = add i8 %a20, 1\n    ret void\n"
-    ));
-    let addrs = addrs(&[("in", 0x20)]);
+fn slots_skip_icmp_scratch_at_end_of_globals() {
+    // The icmp scratch byte sits at end_of_globals. When the globals end
+    // inside common-RAM territory (here 0x6F+1 = 0x70), slot() must skip the
+    // scratch byte so an icmp in the same function never silently corrupts
+    // that slot.
+    let m = parse(
+        "global in i8\nfn main() -> void\n  block entry:\n\
+           %a0 = load i8 @in\n    %c = icmp eq i8 %a0, 0\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x6F)]);
     let asm = select(&m, &addrs);
-    // a0..a15 -> 0x70..0x7F, a16..a20 -> 0x25..0x29; the 22nd slot (a21) must
-    // skip the scratch 0x2A and land at 0x2B.
-    assert!(asm.contains("MOVWF 0x2B"), "22nd slot should land at 0x2B, not the scratch:\n{asm}");
-    assert!(!asm.contains("MOVWF 0x2A"), "no slot may write the icmp scratch 0x2A:\n{asm}");
+    // end_of_globals = 0x6F + 1 = 0x70: scratch 0x70, retval 0x71/0x72.
+    // %a0 would land on the scratch (0x70), so it must skip to 0x71; the
+    // icmp result lands at 0x72.
+    assert!(asm.contains("MOVWF 0x70"), "icmp writes the scratch at end_of_globals:\n{asm}");
+    assert!(asm.contains("MOVWF 0x71"), "first slot must skip the scratch byte:\n{asm}");
+    assert!(asm.contains("MOVWF 0x72"), "icmp dst:\n{asm}");
+}
+
+#[test]
+fn call_copies_args_to_callee_params_and_reads_retval() {
+    // %3 = call i16 @add(i16 %1, i16 %2): each arg byte is copied into the
+    // callee's `{func}::{param}` slot, then CALL, then the retval slots
+    // (2 bytes after the globals) are copied into the destination.
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal out i16\n\
+         fn add(i16 %x, i16 %y) -> i16\n  block entry:\n\
+           %r = add i16 %x, %y\n    ret i16 %r\n\
+         fn main() -> void\n  block entry:\n\
+           %1 = load i16 @a\n    %2 = load i16 @b\n\
+           %3 = call i16 @add(i16 %1, i16 %2)\n    store i16 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x22), ("out", 0x24)]);
+    let asm = select(&m, &addrs);
+    // end_of_globals = max(0x20+2, 0x22+2, 0x24+2) = 0x26: scratch 0x26,
+    // retval 0x27/0x28, bank0 0x29.
+    // Shared slots: add::x=0x70, add::y=0x72, add::%r=0x74, main::%1=0x76,
+    // main::%2=0x78, main::%3=0x7A.
+    // Arg copies: %1 -> add::x, %2 -> add::y (lo then hi).
+    assert!(
+        asm.contains("MOVF 0x76, W\n    MOVWF 0x70\n    MOVF 0x77, W\n    MOVWF 0x71"),
+        "copy %1 into add::x:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0x78, W\n    MOVWF 0x72\n    MOVF 0x79, W\n    MOVWF 0x73"),
+        "copy %2 into add::y:\n{asm}"
+    );
+    assert!(asm.contains("    CALL add"), "CALL add:\n{asm}");
+    // Retval copy: retval_lo/hi (0x27/0x28) -> %3 (0x7A/0x7B).
+    assert!(
+        asm.contains("MOVF 0x27, W\n    MOVWF 0x7A\n    MOVF 0x28, W\n    MOVWF 0x7B"),
+        "copy retval into %3:\n{asm}"
+    );
+}
+
+#[test]
+fn ret_i16_copies_value_to_retval_and_returns() {
+    // ret i16 %v: copy %v into the retval slots (end_of_globals+1/+2) then
+    // RETURN.
+    let m = parse(
+        "global x i16\nfn main() -> i16\n  block entry:\n\
+           %v = load i16 @x\n    ret i16 %v\n",
+    );
+    let addrs = addrs(&[("x", 0x20)]);
+    let asm = select(&m, &addrs);
+    // end_of_globals = 0x20+2 = 0x22: retval 0x23/0x24. %v = 0x70 (hi 0x71).
+    assert!(
+        asm.contains("MOVF 0x70, W\n    MOVWF 0x23\n    MOVF 0x71, W\n    MOVWF 0x24"),
+        "retval writes:\n{asm}"
+    );
+    assert!(asm.contains("    RETURN"), "RETURN:\n{asm}");
+}
+
+#[test]
+fn callee_params_do_not_collide_with_caller_live_slots() {
+    // The module-wide shared slot map must give every value a distinct
+    // address: the callee's params (add::x/add::y) and the caller's live
+    // values (%1/%2) must not share slots, or the arg-copy would clobber
+    // the caller's operands before CALL. The milestone-1 per-function
+    // allocator restarted at 0x70 for every function and put add::x and
+    // main::%1 at the same address.
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal out i16\n\
+         fn add(i16 %x, i16 %y) -> i16\n  block entry:\n\
+           %r = add i16 %x, %y\n    ret i16 %r\n\
+         fn main() -> void\n  block entry:\n\
+           %1 = load i16 @a\n    %2 = load i16 @b\n\
+           %3 = call i16 @add(i16 %1, i16 %2)\n    store i16 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x22), ("out", 0x24)]);
+    let asm = select(&m, &addrs);
+    // Shared slots: add::x=0x70, add::y=0x72, main::%1=0x76, main::%2=0x78.
+    // The caller's loads must land in their own slots, not the callee's
+    // param slots that a per-function allocator would have reused.
+    assert!(
+        asm.contains("MOVF 0x20, W\n    MOVWF 0x76"),
+        "main %1 lo must live at its own slot 0x76:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0x22, W\n    MOVWF 0x78"),
+        "main %2 lo must live at its own slot 0x78:\n{asm}"
+    );
+    // The arg-copies must read the caller's slots and write the callee's
+    // distinct param slots.
+    assert!(
+        asm.contains("MOVF 0x76, W\n    MOVWF 0x70"),
+        "copy %1 -> add::x (distinct addresses):\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0x78, W\n    MOVWF 0x72"),
+        "copy %2 -> add::y (distinct addresses):\n{asm}"
+    );
 }
