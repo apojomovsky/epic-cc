@@ -13,7 +13,8 @@
 //! the table; the caller splits each runtime index into the in-chunk byte
 //! (W) and the chunk bit (0x70) and CALLs the right entry. `in` is the i16
 //! global at 0x20 (low byte holds the input); `out` is the global at 0x22.
-//! Total program: 820 words < 0x800 (the page-0 bound).
+//! Total program: 818 words (the M11 PCLATH pairs at every CALL site are
+//! offset by the smaller `pad` filler; still a single page).
 //!
 //! gpasm does not know our two assembly directives, so `to_gpasm_src`
 //! translates them to source that assembles to the SAME words: `.table`

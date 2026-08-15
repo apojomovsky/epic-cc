@@ -5,9 +5,16 @@ STATUS equ 0x03
 FSR    equ 0x04
 INDF   equ 0x00
 PCL    equ 0x02
+PCLATH equ 0x0A
 
     org 0x0000
     goto __start
+
+__start:
+    MOVLW 0x00
+    MOVWF PCLATH
+    CALL main
+    SLEEP
 
 sum:
     BCF STATUS, 5
@@ -48,16 +55,28 @@ pick:
 mk:
     BCF STATUS, 5
     BCF STATUS, 6
+    BTFSC 0x4D, 0
+    BSF STATUS, 7
+    BTFSS 0x4D, 0
+    BCF STATUS, 7
     MOVF 0x4C, W
     ADDLW 0x00
     MOVWF FSR
     MOVF 0x4E, W
     MOVWF INDF
+    BTFSC 0x4D, 0
+    BSF STATUS, 7
+    BTFSS 0x4D, 0
+    BCF STATUS, 7
     MOVF 0x4C, W
     ADDLW 0x02
     MOVWF FSR
     MOVF 0x4F, W
     MOVWF INDF
+    BTFSC 0x4D, 0
+    BSF STATUS, 7
+    BTFSS 0x4D, 0
+    BCF STATUS, 7
     MOVF 0x4C, W
     ADDLW 0x03
     MOVWF FSR
@@ -78,7 +97,11 @@ main:
     MOVWF 0x4F
     MOVLW 0x12
     MOVWF 0x50
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL mk
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x32, W
     MOVWF 0x20
     MOVF 0x33, W
@@ -95,7 +118,11 @@ main:
     MOVWF 0x4E
     MOVF 0x23, W
     MOVWF 0x4F
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL sum
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x36
     MOVF 0x36, W
@@ -127,7 +154,11 @@ main:
     MOVWF 0x4F
     MOVF 0x2A, W
     MOVWF 0x50
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL pick
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x3B
     MOVF 0x3A, W
@@ -183,9 +214,5 @@ main:
     MOVF 0x4B, W
     MOVWF 0x24
     RETURN
-
-__start:
-    CALL main
-    SLEEP
 
     end

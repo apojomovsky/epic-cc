@@ -361,8 +361,21 @@ impl<'m> Gen<'m> {
                             self.emit_const_read_large(&name, k, &terms, byte_off);
                         } else {
                             // RETLW table read: W = index = k + Σ s×%reg + off.
+                            // The reader's input is W itself, so the set (whose
+                            // MOVLW clobbers W) goes BEFORE the index
+                            // computation; the index is computed into W after,
+                            // and nothing between touches PCLATH. The restore
+                            // right after the CALL saves the returned byte in
+                            // the fixed scratch (free at a const read) across
+                            // its own MOVLW, then reloads it into W.
+                            self.emit(format!("    MOVLW PAGE(__read_{name})"));
+                            self.emit("    MOVWF PCLATH".to_string());
                             self.emit_ptr_index_w(k, &terms, byte_off);
                             self.emit(format!("    CALL __read_{name}"));
+                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                            self.emit(format!("    MOVLW PAGE({})", self.cur_func));
+                            self.emit("    MOVWF PCLATH".to_string());
+                            self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                         }
                         return;
                     }
@@ -379,8 +392,14 @@ impl<'m> Gen<'m> {
                         "isel: constant index into large const table @{g} not supported (size {} > 255); only a single 16-bit reg index is",
                         self.global_size(g)
                     );
+                    self.emit(format!("    MOVLW PAGE(__read_{g})"));
+                    self.emit("    MOVWF PCLATH".to_string());
                     self.emit(format!("    MOVLW 0x{byte_off:02X}"));
                     self.emit(format!("    CALL __read_{g}"));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit(format!("    MOVLW PAGE({})", self.cur_func));
+                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                     return;
                 }
             }
@@ -565,13 +584,33 @@ impl<'m> Gen<'m> {
                 self.emit("    ADDLW 0x01".to_string());
                 self.emit(format!("    MOVWF 0x{:02X}", self.scratch)); // hi temp (chunk bit)
                 // W = in-chunk index; bit 0 of the hi temp selects the entry.
+                // The GOTO below is intra-function — it must run with the
+                // CALLER's page, so each reader CALL's set comes after it.
+                // The set's MOVLW clobbers W (the index), which is then
+                // reloaded from the lo temp (0x71 — no live retval at a
+                // const read); the returned byte survives the restore via
+                // the hi temp (0x70, dead after the chunk-bit test).
                 self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                 self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
                 self.emit(format!("    GOTO {l_hi}"));
+                self.emit(format!("    MOVLW PAGE(__read_{name})"));
+                self.emit("    MOVWF PCLATH".to_string());
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                 self.emit(format!("    CALL __read_{name}"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                self.emit(format!("    MOVLW PAGE({})", self.cur_func));
+                self.emit("    MOVWF PCLATH".to_string());
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("    GOTO {l_done}"));
                 self.emit(format!("{l_hi}:"));
+                self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
+                self.emit("    MOVWF PCLATH".to_string());
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                 self.emit(format!("    CALL __read_{name}_hi"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                self.emit(format!("    MOVLW PAGE({})", self.cur_func));
+                self.emit("    MOVWF PCLATH".to_string());
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("{l_done}:"));
             }
             [] => panic!(
@@ -1013,7 +1052,16 @@ impl<'m> Gen<'m> {
                 self.emit_move_val_to_slot(&arg.val, aty, pa);
             }
         }
+        // M11 PCLATH discipline: every CALL runs with PCLATH<4:3> = the
+        // target's page. The set's MOVLW clobbers W, so it must come AFTER
+        // the last arg copy (which uses W) and immediately before the CALL;
+        // the caller's own page is restored right after, so its
+        // intra-function GOTOs keep branching in its page.
+        self.emit(format!("    MOVLW PAGE({func})"));
+        self.emit("    MOVWF PCLATH".to_string());
         self.emit(format!("    CALL {func}"));
+        self.emit(format!("    MOVLW PAGE({})", self.cur_func));
+        self.emit("    MOVWF PCLATH".to_string());
         if let Some(d) = dst {
             let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d);
@@ -1842,6 +1890,70 @@ impl<'m> Gen<'m> {
     }
 }
 
+/// The word size of a function's emitted lines: 1 word per instruction line
+/// (labels, `.align`/`.table` directives, `equ` lines, comments, and blanks
+/// are 0), mirroring the asm crate's pass-1 counting so the page-fit
+/// decisions match the addresses the assembler will assign.
+fn word_size(lines: &[String]) -> usize {
+    lines.iter().filter(|raw| {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            return false;
+        }
+        if line.starts_with("list") || line.starts_with("radix") {
+            return false;
+        }
+        if line.starts_with("org ") {
+            return false;
+        }
+        if line.starts_with("end") {
+            return false;
+        }
+        if line.ends_with(':') {
+            return false;
+        }
+        if line.contains(" equ ") {
+            return false;
+        }
+        if line.starts_with(".align ") {
+            return false;
+        }
+        if line.starts_with(".table ") {
+            return false;
+        }
+        true
+    })
+    .count()
+}
+
+/// Greedy page assignment (M11): pad with `.org <next base>` before a
+/// function that would cross the current 2048-word page's end, and advance
+/// the running word address. A function larger than one page can never fit
+/// (its intra-function GOTOs need a single stable page) and panics loudly;
+/// a program past page 3 (0x2000 — the device flash) panics loudly too. The
+/// `.org` pads with 0x0000 words (the assembler supports it), so the final
+/// layout's addresses are exactly what the tracker predicts.
+fn page_assign(out: &mut Vec<String>, addr: &mut usize, size: usize, name: &str) {
+    if size > 0x800 {
+        panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
+    }
+    if *addr >= 0x2000 {
+        panic!(
+            "isel: function @{name} would start at 0x{addr:04X}, beyond page 3 (device flash is 8K words)"
+        );
+    }
+    let page_end = (*addr & !0x7FF) + 0x800;
+    if *addr + size > page_end {
+        if page_end >= 0x2000 {
+            panic!(
+                "isel: function @{name} would start at 0x{page_end:04X}, beyond page 3 (device flash is 8K words)"
+            );
+        }
+        out.push(format!("    org 0x{page_end:04X}"));
+        *addr = page_end;
+    }
+}
+
 /// Select instructions for the whole module, producing PIC14 assembly text.
 ///
 /// `addrs` is the complete address map from `alloc`: globals by name, locals
@@ -1850,6 +1962,12 @@ impl<'m> Gen<'m> {
 /// byte and the two retval bytes live in fixed common RAM (scratch `0x70`,
 /// retval `0x71`/`0x72`): bank-independent, never used by locals (M3), so no
 /// BANKSEL is ever needed for them.
+///
+/// M11: every CALL runs with PCLATH<4:3> = the target's page (set
+/// immediately before, restored immediately after), functions are assigned
+/// to 2048-word pages greedily (a function that would cross a page's end
+/// gets a `.org <next base>` pad), and the program's highest word address
+/// is bounded by the device's 8K-word flash.
 pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // The icmp scratch byte and the two retval bytes are fixed common-RAM
     // constants (bank-independent, common RAM 0x70-0x7F is never used by
@@ -1869,7 +1987,18 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
         "".to_string(),
+        "__start:".to_string(),
+        "    MOVLW PAGE(main)".to_string(),
+        "    MOVWF PCLATH".to_string(),
+        "    CALL main".to_string(),
+        "    SLEEP".to_string(),
+        "".to_string(),
     ];
+    // Running word address: the reset vector (1 word: `goto __start`) plus
+    // the `__start` body (4 words). `__start` sits at the top so the reset
+    // vector's GOTO (PCLATH = 0 at reset) always reaches it — a multi-page
+    // program would strand it past 0x800 otherwise.
+    let mut addr: usize = 5;
     // Phase-3 pointers: collect every GEP and resolve its chain eagerly to a
     // folded `(base, k, terms)`, keyed `{func}::{reg}` like every other
     // local. Seeds first: a byval param slot IS the struct copy
@@ -1996,6 +2125,9 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
                 other => panic!("isel: unknown runtime routine @{other}"),
             }
             g.emit_routine();
+            let size = word_size(&g.out);
+            page_assign(&mut out, &mut addr, size, &f.name);
+            addr += size;
             out.extend(g.out);
             continue;
         }
@@ -2094,6 +2226,9 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             }
         }
         g.emit("".to_string());
+        let size = word_size(&g.out);
+        page_assign(&mut out, &mut addr, size, &f.name);
+        addr += size;
         out.extend(g.out);
     }
     // Const (flash) globals become RETLW tables, emitted after the
@@ -2217,12 +2352,20 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
                 out.push(format!("    RETLW 0x{b:02X}"));
             }
         }
+        // Track the tables' `.align`/RETLW words so the running address
+        // stays consistent (tables are unconstrained — their addresses
+        // don't affect function placement, which is already decided).
+        addr += 6; // reader entry (MOVWF/MOVLW/MOVWF/MOVF/ADDLW/MOVWF PCL)
+        if size >= 256 {
+            addr = (addr + 255) & !255; // `.align 256`
+            addr += 256; // chunk 0 RETLWs
+            addr += size - 256; // chunk 1 RETLWs
+            addr += 6; // chunk-1 reader entry
+        } else {
+            addr += size; // single-entry RETLWs
+        }
         out.push("".to_string());
     }
-    out.push("__start:".to_string());
-    out.push("    CALL main".to_string());
-    out.push("    SLEEP".to_string());
-    out.push("".to_string());
     out.push("    end".to_string());
     out.join("\n")
 }

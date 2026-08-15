@@ -1,6 +1,6 @@
 //! Milestone-10 const-table acceptance: a 300-byte const (flash) table read
 //! through the two-entry chunked readers (`__read_table` / `__read_table_hi`
-//! with `table` / `table_1` chunk labels), pushed past 0x100 by a 104-byte
+//! with `table` / `table_1` chunk labels), pushed past 0x100 by a 40-byte
 //! `pad` filler so the readers' `MOVLW HIGH(...); MOVWF PCLATH` sets are
 //! load-bearing — without them the computed `ADDLW LOW(...); MOVWF PCL`
 //! jumps would land in window 0 and every read would return a wrong byte.

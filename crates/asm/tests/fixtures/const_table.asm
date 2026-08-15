@@ -10,6 +10,12 @@ PCLATH equ 0x0A
     org 0x0000
     goto __start
 
+__start:
+    MOVLW 0x00
+    MOVWF PCLATH
+    CALL main
+    SLEEP
+
 main:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -23,8 +29,14 @@ main:
     MOVF 0x24, W
     ANDLW 0x00
     MOVWF 0x26
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x25, W
     CALL __read_pad
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
     MOVWF 0x27
     MOVF 0x27, W
     MOVWF 0x22
@@ -42,10 +54,24 @@ main:
     MOVF 0x71, W
     BTFSC 0x70, 0
     GOTO tmp0
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
     GOTO tmp1
 tmp0:
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table_hi
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
 tmp1:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -74,10 +100,24 @@ tmp1:
     MOVF 0x71, W
     BTFSC 0x70, 0
     GOTO tmp2
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
     GOTO tmp3
 tmp2:
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table_hi
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
 tmp3:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -111,10 +151,24 @@ tmp3:
     MOVF 0x71, W
     BTFSC 0x70, 0
     GOTO tmp4
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
     GOTO tmp5
 tmp4:
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table_hi
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
 tmp5:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -148,10 +202,24 @@ tmp5:
     MOVF 0x71, W
     BTFSC 0x70, 0
     GOTO tmp6
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
     GOTO tmp7
 tmp6:
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x71, W
     CALL __read_table_hi
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
 tmp7:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -170,72 +238,8 @@ __read_pad:
     MOVF 0x70, W
     ADDLW LOW(pad)
     MOVWF PCL
-    .table pad 104
+    .table pad 40
 pad:
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
-    RETLW 0xAA
     RETLW 0xAA
     RETLW 0xAA
     RETLW 0xAA
@@ -595,9 +599,5 @@ __read_table_hi:
     MOVF 0x70, W
     ADDLW LOW(table_1)
     MOVWF PCL
-
-__start:
-    CALL main
-    SLEEP
 
     end
