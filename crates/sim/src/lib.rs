@@ -52,7 +52,7 @@ fn hex_nibble(c: u8) -> u8 {
 
 pub struct Pic14 {
     prog: Vec<u16>,
-    ram: [u8; 256],
+    ram: [u8; 512],
     w: u8,
     pc: u16,
     stack: Vec<u16>,
@@ -61,12 +61,12 @@ pub struct Pic14 {
 
 impl Pic14 {
     pub fn new(prog: Vec<u16>) -> Self {
-        Pic14 { prog, ram: [0; 256], w: 0, pc: 0, stack: Vec::new(), halted: false }
+        Pic14 { prog, ram: [0; 512], w: 0, pc: 0, stack: Vec::new(), halted: false }
     }
-    pub fn ram(&self) -> &[u8; 256] {
+    pub fn ram(&self) -> &[u8; 512] {
         &self.ram
     }
-    pub fn ram_mut(&mut self) -> &mut [u8; 256] {
+    pub fn ram_mut(&mut self) -> &mut [u8; 512] {
         &mut self.ram
     }
     pub fn w(&self) -> u8 {
@@ -123,20 +123,37 @@ impl Pic14 {
             self.ram[3] &= !0b010;
         }
     }
+    // Resolve INDF's target: IRP (STATUS bit 7) selects the upper/lower 256;
+    // the common region 0x70-0x7F is mirrored in all banks and ignores IRP.
+    fn indirect_addr(&self) -> usize {
+        let fsr = self.ram[0x04] as usize;
+        if fsr >= 0x70 {
+            fsr // common region
+        } else {
+            let base = if self.ram[3] & 0x80 != 0 { 0x100 } else { 0 };
+            base + fsr
+        }
+    }
+    // Bank base for direct operands in 0x20-0x6F: bank = STATUS<7:5> (RP1:RP0).
+    fn bank_base(&self) -> usize {
+        ((self.ram[3] >> 5) & 0x3) as usize * 0x80
+    }
     fn read_f(&self, f: usize) -> u8 {
         match f {
-            0x00 => self.ram[self.ram[0x04] as usize], // INDF -> RAM[FSR]
-            0x02 => (self.pc & 0xFF) as u8,            // PCL
-            _ => self.ram[f],
+            0x00 => self.ram[self.indirect_addr()], // INDF -> RAM[FSR] via IRP
+            0x02 => (self.pc & 0xFF) as u8,         // PCL
+            0x20..=0x6F => self.ram[f + self.bank_base()],
+            _ => self.ram[f], // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
         }
     }
     fn write_f(&mut self, f: usize, v: u8) {
         match f {
             0x00 => {
-                let fsr = self.ram[0x04] as usize;
-                self.ram[fsr] = v; // INDF -> RAM[FSR]
+                let addr = self.indirect_addr();
+                self.ram[addr] = v; // INDF -> RAM[FSR] via IRP
             }
-            _ => self.ram[f] = v,
+            0x20..=0x6F => self.ram[f + self.bank_base()] = v,
+            _ => self.ram[f] = v, // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
         }
     }
     fn write_d(&mut self, d: u16, f: usize, r: u8) {
