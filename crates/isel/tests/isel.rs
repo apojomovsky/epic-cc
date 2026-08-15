@@ -629,3 +629,292 @@ fn parse_map_accepts_const_lines() {
     assert_eq!(addrs.get("main::i"), Some(&0x29u16));
     assert!(!addrs.contains_key("table"), "const globals have no RAM address");
 }
+
+#[test]
+fn sub_i8_reg_reg_emits_subwf() {
+    // d = a - b: MOVF b,W (W=b); SUBWF a,W (W = a - W = a - b); MOVWF d.
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = sub i8 %a, %b\n    store i8 %r @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x23 -> root frame at 0x26; %a=0x26, %b=0x27, %r=0x28.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("out", 0x22),
+        ("main::a", 0x26),
+        ("main::b", 0x27),
+        ("main::r", 0x28),
+    ]);
+    let asm = select(&m, &addrs);
+    // %a=0x26, %b=0x27, %r=0x28.
+    assert!(asm.contains("MOVF 0x27, W"), "load b:\n{asm}");
+    assert!(asm.contains("SUBWF 0x26, W"), "a - b:\n{asm}");
+    assert!(asm.contains("MOVWF 0x28"), "store d:\n{asm}");
+}
+
+#[test]
+fn sub_i8_reg_const_emits_subwf_in_correct_direction() {
+    // d = a - k: MOVLW k (W=k); SUBWF a,W (W = a - W = a - k); MOVWF d.
+    // SUBWF f,W always computes f - W, so the const goes in W via MOVLW and
+    // the register is the file operand — never SUBLW (which would be k - a).
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 %a, 5\n    store i8 %r @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x22 -> root frame at 0x25; %a=0x25, %r=0x26.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::r", 0x26),
+    ]);
+    let asm = select(&m, &addrs);
+    // %a=0x25, %r=0x26.
+    assert!(asm.contains("MOVLW 0x05"), "load k into W:\n{asm}");
+    assert!(asm.contains("SUBWF 0x25, W"), "a - k via SUBWF a,W:\n{asm}");
+    assert!(asm.contains("MOVWF 0x26"), "store d:\n{asm}");
+    // Direction guard: SUBLW would compute k - a (wrong direction).
+    assert!(!asm.contains("SUBLW"), "reg-const sub must not use SUBLW:\n{asm}");
+}
+
+#[test]
+fn sub_i16_reg_reg_emits_borrow_chain() {
+    // d = a - b (i16): lo byte SUBWF, then hi byte with a borrow folded in
+    // via BTFSS STATUS,0 / ADDLW 1 before the hi SUBWF.
+    let m = parse(
+        "global x i16\nglobal y i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %b = load i16 @y\n    %r = sub i16 %a, %b\n    store i16 %r @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x26 -> root frame at 0x29; %a=0x29, %b=0x2B, %r=0x2D.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x22),
+        ("out", 0x24),
+        ("main::a", 0x29),
+        ("main::b", 0x2B),
+        ("main::r", 0x2D),
+    ]);
+    let asm = select(&m, &addrs);
+    // %a=0x29 (hi 0x2A), %b=0x2B (hi 0x2C), %r=0x2D (hi 0x2E).
+    assert!(asm.contains("MOVF 0x2B, W"), "load b_lo:\n{asm}");
+    assert!(asm.contains("SUBWF 0x29, W"), "a_lo - b_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2D"), "store d_lo:\n{asm}");
+    assert!(asm.contains("MOVF 0x2C, W"), "load b_hi:\n{asm}");
+    assert!(asm.contains("BTFSS STATUS, 0"), "borrow test:\n{asm}");
+    assert!(asm.contains("ADDLW 0x01"), "borrow-in add:\n{asm}");
+    assert!(asm.contains("SUBWF 0x2A, W"), "a_hi - b_hi:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2E"), "store d_hi:\n{asm}");
+}
+
+#[test]
+fn sub_i16_reg_const_emits_borrow_chain() {
+    // 515 = 0x0203 -> lo 0x03, hi 0x02 (hi differs from the borrow ADDLW
+    // 0x01, so the k_hi MOVLW line is distinguishable).
+    let m = parse(
+        "global x i16\nglobal out i16\nfn main() -> void\n  block entry:\n    %a = load i16 @x\n    %r = sub i16 %a, 515\n    store i16 %r @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x24 -> root frame at 0x27; %a=0x27, %r=0x29.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x27),
+        ("main::r", 0x29),
+    ]);
+    let asm = select(&m, &addrs);
+    // %a=0x27 (hi 0x28), %r=0x29 (hi 0x2A).
+    assert!(asm.contains("MOVLW 0x03"), "load k_lo:\n{asm}");
+    assert!(asm.contains("SUBWF 0x27, W"), "a_lo - k_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x29"), "store d_lo:\n{asm}");
+    assert!(asm.contains("MOVLW 0x02"), "load k_hi:\n{asm}");
+    assert!(asm.contains("BTFSS STATUS, 0"), "borrow test:\n{asm}");
+    assert!(asm.contains("ADDLW 0x01"), "borrow-in add:\n{asm}");
+    assert!(asm.contains("SUBWF 0x28, W"), "a_hi - k_hi:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2A"), "store d_hi:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "const LHS")]
+fn panics_on_sub_const_lhs() {
+    // sub is NOT commutative: d = k - a cannot reuse the reg-const lowering
+    // (which computes a - k) and must not read a const as a file register.
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 5, %a\n    store i8 %r @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::r", 0x26),
+    ]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn and_i8_uses_andwf_andlw() {
+    // reg-reg: MOVF b,W; ANDWF a,W; MOVWF d. reg-const: MOVF a,W; ANDLW k.
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = and i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = and i8 %a, 5\n    store i8 %r2 @o2\n    ret void\n",
+    );
+    // alloc: x=0x20,y=0x21,o1=0x22,o2=0x23 -> end 0x24 -> root 0x27;
+    // %a=0x27, %b=0x28, %r1=0x29, %r2=0x2A.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("o1", 0x22),
+        ("o2", 0x23),
+        ("main::a", 0x27),
+        ("main::b", 0x28),
+        ("main::r1", 0x29),
+        ("main::r2", 0x2A),
+    ]);
+    let asm = select(&m, &addrs);
+    // reg-reg: %a=0x27, %b=0x28, %r1=0x29.
+    assert!(asm.contains("MOVF 0x28, W"), "load b:\n{asm}");
+    assert!(asm.contains("ANDWF 0x27, W"), "a & b:\n{asm}");
+    assert!(asm.contains("MOVWF 0x29"), "store d1:\n{asm}");
+    // reg-const: %a=0x27, %r2=0x2A.
+    assert!(asm.contains("ANDLW 0x05"), "a & 5:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2A"), "store d2:\n{asm}");
+}
+
+#[test]
+fn or_i8_and_i16_use_ior() {
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal o8 i8\nglobal p i16\nglobal q i16\nglobal o16 i16\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = or i8 %a, %b\n    store i8 %r @o8\n    %c = load i16 @p\n    %d = load i16 @q\n    %s = or i16 %c, %d\n    store i16 %s @o16\n    ret void\n",
+    );
+    // alloc: x=0x20,y=0x21,o8=0x22,p(i16)=0x24,q=0x26,o16=0x28 -> end 0x2A ->
+    // root 0x2D; %a=0x2D, %b=0x2E, %r=0x2F, %c=0x30, %d=0x32, %s=0x34.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("o8", 0x22),
+        ("p", 0x24),
+        ("q", 0x26),
+        ("o16", 0x28),
+        ("main::a", 0x2D),
+        ("main::b", 0x2E),
+        ("main::r", 0x2F),
+        ("main::c", 0x30),
+        ("main::d", 0x32),
+        ("main::s", 0x34),
+    ]);
+    let asm = select(&m, &addrs);
+    // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F.
+    assert!(asm.contains("IORWF 0x2D, W"), "i8 or:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2F"), "i8 or dst:\n{asm}");
+    // i16 reg-reg: %c=0x30/31, %d=0x32/33, %s=0x34/35.
+    assert!(asm.contains("IORWF 0x30, W"), "i16 or lo:\n{asm}");
+    assert!(asm.contains("IORWF 0x31, W"), "i16 or hi:\n{asm}");
+    assert!(asm.contains("MOVWF 0x34"), "i16 or dst_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x35"), "i16 or dst_hi:\n{asm}");
+}
+
+#[test]
+fn or_const_lhs_swaps_to_iorlw() {
+    // Commutative or: a const LHS is swapped to the RHS so the IORLW path is
+    // used, never reading a const as a file-register address.
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %r = or i8 5, %a\n    store i8 %r @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x22 -> root frame at 0x25; %a=0x25, %r=0x26.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::r", 0x26),
+    ]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("IORLW 0x05"), "const-LHS or should use the IORLW path:\n{asm}");
+    assert!(asm.contains("MOVWF 0x26"), "the result lands at its map address:\n{asm}");
+    assert!(!asm.contains("IORWF 0x05"), "const must not be read as a file register:\n{asm}");
+}
+
+#[test]
+fn xor_i8_and_i16_use_xor() {
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal o8 i8\nglobal p i16\nglobal q i16\nglobal o16 i16\nfn main() -> void\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r = xor i8 %a, %b\n    store i8 %r @o8\n    %c = load i16 @p\n    %d = load i16 @q\n    %s = xor i16 %c, %d\n    store i16 %s @o16\n    ret void\n",
+    );
+    // alloc: x=0x20,y=0x21,o8=0x22,p(i16)=0x24,q=0x26,o16=0x28 -> end 0x2A ->
+    // root 0x2D; %a=0x2D, %b=0x2E, %r=0x2F, %c=0x30, %d=0x32, %s=0x34.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("o8", 0x22),
+        ("p", 0x24),
+        ("q", 0x26),
+        ("o16", 0x28),
+        ("main::a", 0x2D),
+        ("main::b", 0x2E),
+        ("main::r", 0x2F),
+        ("main::c", 0x30),
+        ("main::d", 0x32),
+        ("main::s", 0x34),
+    ]);
+    let asm = select(&m, &addrs);
+    // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F.
+    assert!(asm.contains("XORWF 0x2D, W"), "i8 xor:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2F"), "i8 xor dst:\n{asm}");
+    // i16 reg-reg: %c=0x30/31, %d=0x32/33, %s=0x34/35.
+    assert!(asm.contains("XORWF 0x30, W"), "i16 xor lo:\n{asm}");
+    assert!(asm.contains("XORWF 0x31, W"), "i16 xor hi:\n{asm}");
+    assert!(asm.contains("MOVWF 0x34"), "i16 xor dst_lo:\n{asm}");
+    assert!(asm.contains("MOVWF 0x35"), "i16 xor dst_hi:\n{asm}");
+}
+
+#[test]
+fn sub_direction_simulates_correctly() {
+    // Semantic check of the exact sequences isel emits for sub — confirming
+    // the direction (d = a - b / a - k) and the i16 borrow chain, since the
+    // PIC14 SUBWF/SUBLW/BTFSS semantics are the load-bearing part. Words are
+    // hand-encoded to mirror isel's emitted code (SIM: SUBWF f,W = f - W;
+    // BTFSS STATUS,0 skips the ADDLW when C is set, i.e. no borrow).
+    // RAM: a=0x20(lo)/0x21(hi), b=0x22(lo)/0x23(hi), d=0x24(lo)/0x25(hi).
+    use pic14_sim::Pic14;
+    // RAM: a=0x20(lo)/0x21(hi), b=0x22(lo)/0x23(hi), d=0x24(lo)/0x25(hi).
+    // RAM must be seeded before run — the sim halts once pc passes the end.
+
+    // sub i8 reg-reg: MOVF b,W(0x0822) SUBWF a,W(0x0220) MOVWF d(0x00A4).
+    // a=0x20=10, b=0x22=3 -> d = 7.
+    {
+        let mut p = Pic14::new(vec![0x0822, 0x0220, 0x00A4]);
+        p.ram_mut()[0x20] = 10;
+        p.ram_mut()[0x22] = 3;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 7, "reg-reg sub must compute a - b");
+    }
+
+    // sub i8 reg-const: MOVLW 3(0x3003) SUBWF a,W(0x0220) MOVWF d(0x00A4).
+    // a=0x20=10 -> d = 10 - 3 = 7 (NOT 3 - 10 = 249).
+    {
+        let mut p = Pic14::new(vec![0x3003, 0x0220, 0x00A4]);
+        p.ram_mut()[0x20] = 10;
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 7, "reg-const sub must compute a - k, not k - a");
+    }
+
+    // sub i16 reg-reg with borrow: a=0x0105, b=0x0007 -> d = 0x00FE.
+    // MOVF b_lo(0x0822) SUBWF a_lo(0x0220) MOVWF d_lo(0x00A4)
+    // MOVF b_hi(0x0823) BTFSS STATUS,0(0x1C03) ADDLW 1(0x3E01)
+    // SUBWF a_hi(0x0221) MOVWF d_hi(0x00A5)
+    {
+        let mut p = Pic14::new(vec![0x0822, 0x0220, 0x00A4, 0x0823, 0x1C03, 0x3E01, 0x0221, 0x00A5]);
+        p.ram_mut()[0x20] = 0x05; // a_lo
+        p.ram_mut()[0x21] = 0x01; // a_hi
+        p.ram_mut()[0x22] = 0x07; // b_lo
+        p.ram_mut()[0x23] = 0x00; // b_hi
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0xFE, "i16 sub lo with borrow");
+        assert_eq!(p.ram()[0x25], 0x00, "i16 sub hi with borrow");
+    }
+
+    // sub i16 reg-const with borrow: a=0x0105, k=0x0007 -> d = 0x00FE.
+    // MOVLW 7(0x3007) SUBWF a_lo(0x0220) MOVWF d_lo(0x00A4)
+    // MOVLW 0(0x3000) BTFSS STATUS,0(0x1C03) ADDLW 1(0x3E01)
+    // SUBWF a_hi(0x0221) MOVWF d_hi(0x00A5)
+    {
+        let mut p = Pic14::new(vec![0x3007, 0x0220, 0x00A4, 0x3000, 0x1C03, 0x3E01, 0x0221, 0x00A5]);
+        p.ram_mut()[0x20] = 0x05; // a_lo
+        p.ram_mut()[0x21] = 0x01; // a_hi
+        p.run(1000);
+        assert_eq!(p.ram()[0x24], 0xFE, "i16 const sub lo with borrow");
+        assert_eq!(p.ram()[0x25], 0x00, "i16 const sub hi with borrow");
+    }
+}

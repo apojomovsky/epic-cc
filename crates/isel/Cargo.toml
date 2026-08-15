@@ -7,6 +7,9 @@ publish = false
 [dependencies]
 ir = { path = "../ir" }
 
+[dev-dependencies]
+pic14-sim = { path = "../sim" }
+
 [[bin]]
 name = "isel"
 path = "src/bin/isel.rs"
