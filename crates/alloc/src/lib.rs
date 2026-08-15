@@ -166,9 +166,9 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
     for f in &m.funcs {
         let mut widths: Vec<u8> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
-        for (ty, name) in &f.params {
-            if seen.insert(name.clone()) {
-                widths.push(ty.bytes());
+        for p in &f.params {
+            if seen.insert(p.name.clone()) {
+                widths.push(p.width);
             }
         }
         for b in &f.blocks {
@@ -323,8 +323,8 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
                 addr = start + u16::from(width);
             }
         };
-        for (ty, name) in &f.params {
-            place(name, ty.bytes());
+        for p in &f.params {
+            place(&p.name, p.width);
         }
         for blk in &f.blocks {
             for inst in &blk.insts {
@@ -373,6 +373,10 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         // Gep computes a virtual pointer address (isel turns it into FSR/INDF
         // or a RETLW table read); it defines no value needing a RAM slot.
         Inst::Gep(_) => None,
+        // Alloca defines a size-byte local buffer (the slot is sized below
+        // and in alloc); Memcpy defines nothing.
+        Inst::Alloca(a) => Some((a.dst.clone(), a.size)),
+        Inst::Memcpy(_) => None,
     }
 }
 

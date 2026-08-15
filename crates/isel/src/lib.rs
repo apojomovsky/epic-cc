@@ -20,7 +20,7 @@
 //! performs no slot allocation; it trusts the map (from `alloc`'s overlay
 //! layout) and panics loudly if a value is missing from it.
 
-use ir::{BinOp, Inst, Module, Ty, Val};
+use ir::{BinOp, Gep, GepBase, Inst, Module, Ty, Val};
 use std::collections::HashMap;
 
 /// Map key for a local value: `{func}::{name}` (IR value names without `%`).
@@ -35,10 +35,12 @@ fn ssa_key(func: &str, name: &str) -> String {
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
-    /// Every GEP in the module, keyed `{func}::{dst}` -> (base global,
-    /// offset). `gep` itself emits nothing; each `load`/`store` through a
-    /// pointer reg lowers the pointer at its use.
-    geps: &'m HashMap<String, (String, Val)>,
+    /// Every GEP in the module, keyed `{func}::{dst}`. `gep` itself emits
+    /// nothing; each `load`/`store` through a pointer reg lowers the pointer
+    /// at its use. The reworked Gep (base/k/terms) is resolved by
+    /// `gep_to_base_offset` (Task 1 stub — the full chain/FSR lowering is
+    /// Task 3).
+    geps: &'m HashMap<String, Gep>,
     scratch: u16,
     retval_lo: u16,
     cur_func: &'m str,
@@ -99,12 +101,29 @@ impl<'m> Gen<'m> {
     /// A GEP-created pointer `%r` -> its (base global, offset). Pointers
     /// come only from `gep` in this milestone; anything else is a missing
     /// slot and panics loudly.
-    fn gep_for(&self, r: &str) -> (String, Val) {
+    fn gep_for(&self, r: &str) -> Gep {
         let key = ssa_key(self.cur_func, r);
         self.geps
             .get(&key)
             .cloned()
             .unwrap_or_else(|| panic!("isel: no gep for pointer %{r} ({key})"))
+    }
+
+    /// Task-1 stub: translate the reworked Gep (base + const k + scaled
+    /// terms) back to the M5 `(base global name, offset Val)` pair the
+    /// FSR/RETLW helpers consume. Only a Global base whose offset is either
+    /// a pure const `k` or a single scale-1 term is expressible as one
+    /// `Val`; chained/reg bases, const+term combos, and multi-term geeps are
+    /// Task 3 and panic loudly.
+    fn gep_to_base_offset(g: &Gep) -> (String, Val) {
+        match &g.base {
+            GepBase::Global(name) => match &g.terms[..] {
+                [] => (name.clone(), Val::Const(i64::from(g.k))),
+                [(1, r)] if g.k == 0 => (name.clone(), Val::Reg(r.clone())),
+                _ => panic!("isel stub: gep {:?} (reg base / multi-term / const+term) is Task 3", g),
+            },
+            GepBase::Reg(_) => panic!("isel stub: chained/reg-base gep {:?} is Task 3", g),
+        }
     }
 
     /// `FSR = base_lo + offset`: W = offset low byte, W += the RAM global's
@@ -506,17 +525,18 @@ impl<'m> Gen<'m> {
     /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
     /// (`retval_lo`/`retval_lo+1`) into `dst`. Void calls skip the retval
     /// copy. Mirrors spike emit_call.
-    fn emit_call(&mut self, dst: &Option<String>, ty: Option<Ty>, func: &str, args: &[(Ty, Val)]) {
+    fn emit_call(&mut self, dst: &Option<String>, ty: Option<Ty>, func: &str, args: &[ir::CallArg]) {
         let callee = self
             .m
             .funcs
             .iter()
             .find(|f| f.name == func)
             .unwrap_or_else(|| panic!("isel: call to unknown function @{func}"));
-        for (i, (aty, val)) in args.iter().enumerate() {
-            let pname = &callee.params[i].1;
+        for (i, arg) in args.iter().enumerate() {
+            let pname = &callee.params[i].name;
             let pa = self.slot_addr(func, pname);
-            self.emit_move_val_to_slot(val, *aty, pa);
+            let aty = arg.ty.expect("isel stub: pointer (byval/sret) call args are Task 4");
+            self.emit_move_val_to_slot(&arg.val, aty, pa);
         }
         self.emit(format!("    CALL {func}"));
         if let Some(d) = dst {
@@ -546,7 +566,8 @@ impl<'m> Gen<'m> {
                     let r = l.ptr.strip_prefix('%').unwrap_or_else(|| {
                         panic!("isel: pointer {:?} is not @global or %reg", l.ptr)
                     });
-                    let (base, offset) = self.gep_for(r);
+                    let g = self.gep_for(r);
+                    let (base, offset) = Self::gep_to_base_offset(&g);
                     if self.global_is_const(&base) {
                         self.emit_const_read(&base, &offset, dst, l.ty);
                     } else {
@@ -563,7 +584,8 @@ impl<'m> Gen<'m> {
                     let r = s.ptr.strip_prefix('%').unwrap_or_else(|| {
                         panic!("isel: pointer {:?} is not @global or %reg", s.ptr)
                     });
-                    let (base, offset) = self.gep_for(r);
+                    let g = self.gep_for(r);
+                    let (base, offset) = Self::gep_to_base_offset(&g);
                     assert!(
                         !self.global_is_const(&base),
                         "isel: store to const (flash) global @{base}"
@@ -799,15 +821,12 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // Phase-3 pointers: collect every GEP so a load/store through a pointer
     // reg can find its (base global, offset). Keyed `{func}::{dst}` like
     // every other local. Gep itself is virtual — it emits nothing.
-    let mut geps: HashMap<String, (String, Val)> = HashMap::new();
+    let mut geps: HashMap<String, Gep> = HashMap::new();
     for f in &m.funcs {
         for b in &f.blocks {
             for i in &b.insts {
                 if let Inst::Gep(g) = i {
-                    geps.insert(
-                        ssa_key(&f.name, &g.dst),
-                        (g.base.clone(), g.offset.clone()),
-                    );
+                    geps.insert(ssa_key(&f.name, &g.dst), g.clone());
                 }
             }
         }

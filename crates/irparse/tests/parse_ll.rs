@@ -1,5 +1,5 @@
 use irparse::parse_ll;
-use ir::{Global, Inst, Val};
+use ir::{CallArg, GepBase, Global, Inst, Val};
 
 // Array/`constant` globals + getelementptr (phase-3 pointers/const).
 const GEP_ARRAY: &str = r#"
@@ -45,22 +45,25 @@ fn parses_array_and_const_globals_and_gep() {
     let body = &m.funcs[0].blocks[0].insts;
     assert_eq!(body.len(), 4);
 
-    // %p = getelementptr i8, ptr @ram, i16 %3  -> base ram, offset %3
+    // %p = getelementptr i8, ptr @ram, i16 %3 -> base ram, k 0, term 1*%3
     match &body[1] {
         Inst::Gep(g) => {
             assert_eq!(g.dst, "p");
-            assert_eq!(g.base, "ram");
-            assert_eq!(g.offset, Val::Reg("3".to_string()));
+            assert_eq!(g.base, GepBase::Global("ram".to_string()));
+            assert_eq!(g.k, 0);
+            assert_eq!(g.terms, vec![(1, "3".to_string())]);
         }
         other => panic!("expected Gep, got {other:?}"),
     }
 
-    // %q = getelementptr [4 x i8], ptr @table, i16 0, i16 %3 -> base table, offset %3
+    // %q = getelementptr [4 x i8], ptr @table, i16 0, i16 %3
+    //  -> base table, const 0 folds to k 0, last index %3 * i8 stride = 1*%3
     match &body[2] {
         Inst::Gep(g) => {
             assert_eq!(g.dst, "q");
-            assert_eq!(g.base, "table");
-            assert_eq!(g.offset, Val::Reg("3".to_string()));
+            assert_eq!(g.base, GepBase::Global("table".to_string()));
+            assert_eq!(g.k, 0);
+            assert_eq!(g.terms, vec![(1, "3".to_string())]);
         }
         other => panic!("expected Gep, got {other:?}"),
     }
@@ -154,8 +157,8 @@ fn parses_probe_control_flow_calls_and_casts() {
             assert_eq!(c.func, "add");
             assert_eq!(c.ty, Some(ir::Ty::I16));
             assert_eq!(c.args.len(), 2);
-            assert_eq!(c.args[0], (ir::Ty::I16, Val::Reg("10".to_string())));
-            assert_eq!(c.args[1], (ir::Ty::I16, Val::Reg("13".to_string())));
+            assert_eq!(c.args[0], CallArg { ty: Some(ir::Ty::I16), val: Val::Reg("10".to_string()), byval: None, sret: false });
+            assert_eq!(c.args[1], CallArg { ty: Some(ir::Ty::I16), val: Val::Reg("13".to_string()), byval: None, sret: false });
         }
         other => panic!("expected Call, got {other:?}"),
     }
@@ -261,9 +264,6 @@ define i16 @main() {
 
 #[test]
 fn parses_icmp_with_samesign_flag() {
-    // clang 20 emits `icmp samesign <pred>` when the operands' sign bit is
-    // known clear; the flag is a hint (signed/unsigned agree), so it is
-    // stripped and the predicate parsed as usual.
     let ll = r#"
 define i8 @main() {
   %1 = icmp samesign ugt i8 5, 2
@@ -299,5 +299,210 @@ define i16 @main() {
             assert_eq!(s.to, ir::Ty::I16);
         }
         other => panic!("expected Sext, got {other:?}"),
+    }
+}
+
+// Milestone-7 struct surface: type table + layout, struct globals, alloca,
+// memcpy, lifetime, paren + multi-index GEPs, inlined-GEP synthesis, byval/
+// sret params.
+const STRUCTS: &str = r#"
+%struct.S = type { i8, i16 }
+
+@g = dso_local global %struct.S zeroinitializer, align 2
+@g1 = dso_local global %struct.S zeroinitializer, align 2
+@g2 = dso_local global %struct.S zeroinitializer, align 2
+
+define dso_local zeroext i8 @f(ptr nocapture noundef readonly byval(%struct.S) align 2 %0) local_unnamed_addr #0 {
+  %2 = load i8, ptr %0, align 2, !tbaa !2
+  %3 = getelementptr inbounds nuw i8, ptr %0, i16 2
+  %4 = load i16, ptr %3, align 2, !tbaa !7
+  ret i8 %2
+}
+
+define dso_local void @main() local_unnamed_addr #1 {
+  %1 = alloca %struct.S, align 2
+  call void @llvm.lifetime.start.p0(i64 4, ptr nonnull %1) #3
+  store i8 1, ptr getelementptr inbounds nuw (i8, ptr @g, i16 2), align 2, !tbaa !2
+  %2 = getelementptr inbounds nuw i8, ptr %1, i16 2
+  %3 = tail call zeroext i8 @f(ptr noundef nonnull byval(%struct.S) align 2 %1) #4
+  tail call void @llvm.memcpy.p0.p0.i16(ptr align 2 @g1, ptr align 2 @g2, i16 4, i1 false), !tbaa.struct !2
+  call void @llvm.lifetime.end.p0(i64 4, ptr nonnull %1) #3
+  ret void
+}
+"#;
+
+#[test]
+fn parses_structs_type_table_globals_alloca_memcpy_gep_and_params() {
+    let m = parse_ll(STRUCTS);
+
+    // type table: {i8, i16} -> size 4, the two scalar globals each hold it
+    assert_eq!(m.globals.len(), 3);
+    for g in &m.globals {
+        assert_eq!(g.size, 4, "struct global @{} size", g.name);
+        assert_eq!(g.bytes, vec![0u8; 4]);
+    }
+
+    let f = &m.funcs[0]; // @f: byval param
+    assert_eq!(f.params.len(), 1);
+    assert_eq!(f.params[0].name, "0");
+    assert_eq!(f.params[0].width, 4);
+    assert_eq!(f.params[0].byval, Some(4));
+    assert!(!f.params[0].sret);
+
+    let body = &f.blocks[0].insts;
+    assert_eq!(body.len(), 4); // load, gep %0, load, ret
+    match &body[1] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Reg("0".to_string()));
+            assert_eq!(g.k, 2);
+            assert!(g.terms.is_empty());
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+
+    let main = &m.funcs[1];
+    let body = &main.blocks[0].insts;
+    // alloca, [inlined-gep @g+2 synth] + store, gep %1+2, call, memcpy, ret = 7
+    assert_eq!(body.len(), 7);
+
+    match &body[0] {
+        Inst::Alloca(a) => {
+            assert_eq!(a.dst, "1");
+            assert_eq!(a.size, 4);
+        }
+        other => panic!("expected Alloca, got {other:?}"),
+    }
+
+    // the inlined GEP became a synthetic Gep inst before the store
+    match &body[1] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("g".to_string()));
+            assert_eq!(g.k, 2);
+        }
+        other => panic!("expected synthesized Gep, got {other:?}"),
+    }
+    match &body[2] {
+        Inst::Store(s) => {
+            assert_eq!(s.ty, ir::Ty::I8);
+            assert!(s.ptr.starts_with("%__gep"), "store ptr must reference the synthesized gep reg: {}", s.ptr);
+        }
+        other => panic!("expected Store, got {other:?}"),
+    }
+
+    match &body[3] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Reg("1".to_string()));
+            assert_eq!(g.k, 2);
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+    match &body[4] {
+        Inst::Call(c) => {
+            assert_eq!(c.func, "f");
+            assert_eq!(c.args.len(), 1);
+            assert_eq!(c.args[0].ty, None); // ptr arg
+            assert_eq!(c.args[0].byval, Some(4));
+            assert_eq!(c.args[0].val, Val::Reg("1".to_string()));
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+
+    // @g1 = memcpy @g2, 4 bytes (i16 4), non-volatile
+    assert!(
+        body.iter().any(|i| matches!(i, Inst::Memcpy(m) if m.dst == Val::Global("g1".to_string())
+            && m.src == Val::Global("g2".to_string()) && m.len == 4)),
+        "memcpy must appear: {body:?}"
+    );
+    // lifetime.start/end produce no instructions
+    assert!(
+        !body.iter().any(|i| matches!(i, Inst::Call(c) if c.func.starts_with("llvm.lifetime"))),
+        "lifetime calls must be skipped"
+    );
+}
+
+// s8: chained multi-index GEP with an inlined base GEP (dynamic struct-array).
+const CHAINED: &str = r#"
+%struct.A = type { i8, [4 x i8] }
+@a = dso_local global %struct.A zeroinitializer, align 1
+define dso_local void @main() local_unnamed_addr #0 {
+  %1 = load volatile i8, ptr @a, align 1, !tbaa !2
+  %2 = zext i8 %1 to i16
+  %3 = getelementptr inbounds nuw [4 x i8], ptr getelementptr inbounds nuw (i8, ptr @a, i16 1), i16 0, i16 %2
+  store volatile i8 7, ptr %3, align 1, !tbaa !6
+  ret void
+}
+"#;
+
+#[test]
+fn parses_chained_multi_index_gep_with_inlined_base() {
+    let m = parse_ll(CHAINED);
+    assert_eq!(m.globals[0].size, 5, "{{i8,[4xi8]}} -> 5");
+
+    let body = &m.funcs[0].blocks[0].insts;
+    // load, zext, [synth gep @a+1], gep %__gep +0 +1*%2, store, ret = 6
+    assert_eq!(body.len(), 6);
+
+    // inner inlined base GEP materialized first: gep @a +1
+    let synth_dst;
+    match &body[2] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("a".to_string()));
+            assert_eq!(g.k, 1);
+            assert!(g.terms.is_empty());
+            assert!(g.dst.starts_with("__gep"), "synthetic reg: {}", g.dst);
+            synth_dst = g.dst.clone();
+        }
+        other => panic!("expected synthesized base Gep, got {other:?}"),
+    }
+
+    // outer GEP: base = the synthetic reg, k 0, dynamic term 1*%2
+    match &body[3] {
+        Inst::Gep(g) => match &g.base {
+            GepBase::Reg(r) => {
+                assert_eq!(r, &synth_dst);
+                assert_eq!(g.k, 0);
+                assert_eq!(g.terms, vec![(1, "2".to_string())]);
+            }
+            other => panic!("expected Reg base, got {other:?}"),
+        },
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
+// s7: sret param.
+const SRET: &str = r#"
+%struct.S = type { i8, i16 }
+define dso_local void @make(ptr dead_on_unwind noalias nocapture writable writeonly sret(%struct.S) align 2 initializes((0, 1), (2, 4)) %0) local_unnamed_addr #0 {
+  store i8 1, ptr %0, align 2, !tbaa !2
+  ret void
+}
+define dso_local void @main() local_unnamed_addr #1 {
+  %1 = alloca %struct.S, align 2
+  call void @make(ptr dead_on_unwind nonnull writable sret(%struct.S) align 2 %1) #5
+  ret void
+}
+"#;
+
+#[test]
+fn parses_sret_param_and_call_arg() {
+    let m = parse_ll(SRET);
+
+    let make = &m.funcs[0];
+    assert_eq!(make.params.len(), 1);
+    assert_eq!(make.params[0].name, "0");
+    assert_eq!(make.params[0].width, 2); // sret slot holds an address
+    assert!(make.params[0].sret);
+    assert_eq!(make.params[0].byval, None);
+
+    let main_body = &m.funcs[1].blocks[0].insts;
+    match &main_body[1] {
+        Inst::Call(c) => {
+            assert_eq!(c.func, "make");
+            assert_eq!(c.args.len(), 1);
+            assert!(c.args[0].sret);
+            assert_eq!(c.args[0].ty, None);
+            assert_eq!(c.args[0].val, Val::Reg("1".to_string()));
+        }
+        other => panic!("expected Call, got {other:?}"),
     }
 }
