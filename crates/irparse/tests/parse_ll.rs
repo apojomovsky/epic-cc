@@ -69,6 +69,26 @@ fn parses_array_and_const_globals_and_gep() {
     }
 }
 
+// LLVM prints a table byte 0x5C (`\`) as the `\\` escape (not `\5C`), so a
+// const table spanning the printable range (e.g. bytes 0..255 = 0x00..0xFF)
+// contains `\\` in its `c"..."` initializer. The string-literal decoder must
+// turn each `\\` back into a single 0x5C byte — the old hex-only decoder
+// panicked on the `\` (to_digit(16) -> None).
+const BACKSLASH_LITERAL: &str = r#"
+@t = dso_local constant [4 x i8] c"\00\\\\\FF", align 1
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn parses_backslash_escapes_in_const_literals() {
+    let m = parse_ll(BACKSLASH_LITERAL);
+    let g = m.globals.iter().find(|g| g.name == "t").expect("const @t");
+    assert!(g.is_const);
+    assert_eq!(g.bytes, vec![0x00, 0x5C, 0x5C, 0xFF], "`\\\\` must decode to one 0x5C byte each");
+}
+
 const LL: &str = r#"
 @in = dso_local global i8 0, align 1
 @out = dso_local global i8 0, align 1
