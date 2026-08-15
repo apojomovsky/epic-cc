@@ -108,6 +108,10 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
             callees.insert(callee);
         } else if line.starts_with("depth ") {
             // Informational; ignored.
+        } else if line.starts_with("fn ") {
+            // The callgraph binary emits one `fn <name>` line per function
+            // (after `depth`). It carries no info needed for allocation, so
+            // skip it.
         } else {
             panic!("alloc: unrecognized callgraph line: {line}");
         }
