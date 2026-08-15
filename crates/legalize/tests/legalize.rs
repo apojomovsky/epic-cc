@@ -85,3 +85,76 @@ fn injected_routines_get_param_and_scratch_slots_allocated() {
     assert_eq!(out.locals["__shl_u16::cnt"], out.locals["__shl_u16::val"] + 2);
     assert_eq!(out.locals["__shl_u16::__scr"], out.locals["__shl_u16::cnt"] + 2);
 }
+
+/// Table-driven: every mul/div/rem binop and every reg-count shift on i8/i16
+/// lowers to a call to the matching runtime routine, and the injected Func
+/// (signature: ret + 2 params) carries the exact scratch alloca size from the
+/// Task-2 layout contract. Also asserts a const-count shift stays a `Bin`
+/// (isel inlines it, so legalize must not rewrite it).
+#[test]
+fn pins_all_runtime_routine_mappings() {
+    use ir::Ty;
+    // (op, ty text, ty, routine, param names, __scr size)
+    let cases: &[(&str, &str, Ty, &str, &[&str], u8)] = &[
+        ("mul",  "i8",  Ty::I8,  "__mul_u8",  &["a", "b"], 6),
+        ("mul",  "i16", Ty::I16, "__mul_u16", &["a", "b"], 14),
+        ("udiv", "i8",  Ty::I8,  "__udiv_u8",  &["num", "den"], 4),
+        ("udiv", "i16", Ty::I16, "__udiv_u16", &["num", "den"], 7),
+        ("urem", "i8",  Ty::I8,  "__urem_u8",  &["num", "den"], 4),
+        ("urem", "i16", Ty::I16, "__urem_u16", &["num", "den"], 7),
+        ("sdiv", "i8",  Ty::I8,  "__sdiv_i8",  &["num", "den"], 5),
+        ("sdiv", "i16", Ty::I16, "__sdiv_i16", &["num", "den"], 7),
+        ("srem", "i8",  Ty::I8,  "__srem_i8",  &["num", "den"], 5),
+        ("srem", "i16", Ty::I16, "__srem_i16", &["num", "den"], 7),
+        ("shl",  "i8",  Ty::I8,  "__shl_u8",   &["val", "cnt"], 3),
+        ("shl",  "i16", Ty::I16, "__shl_u16",  &["val", "cnt"], 4),
+        ("lshr", "i8",  Ty::I8,  "__lshr_u8",  &["val", "cnt"], 3),
+        ("lshr", "i16", Ty::I16, "__lshr_u16", &["val", "cnt"], 4),
+        ("ashr", "i8",  Ty::I8,  "__ashr_i8",  &["val", "cnt"], 3),
+        ("ashr", "i16", Ty::I16, "__ashr_i16", &["val", "cnt"], 4),
+    ];
+    for (op, ty, ty_enum, routine, params, size) in cases {
+        let src = format!(
+            "global in {ty}\nfn main(void) ()\n  block entry:\n    %a = load {ty} @in\n    %b = load {ty} @in\n    %r = {op} {ty} %a, %b\n    ret void\n"
+        );
+        let m = legalize(parse(&src));
+        let text = ir::serialize(&m);
+        // (a) The Bin was rewritten to a Call of the correct routine, dst/ty
+        // preserved and both operands passed as typed args.
+        assert!(
+            text.contains(&format!("%r = call {ty} @{routine}({ty} %a, {ty} %b)")),
+            "{op} {ty}: expected call to {routine}, got:\n{text}"
+        );
+        // (b) The injected Func has the right signature: ret + 2 params with
+        // the routine's parameter names and byte widths.
+        let f = m
+            .funcs
+            .iter()
+            .find(|f| f.name == *routine)
+            .unwrap_or_else(|| panic!("{routine} not injected for {op} {ty}"));
+        assert_eq!(f.ret, Some(*ty_enum), "{routine} return type");
+        assert_eq!(f.params.len(), 2, "{routine} param count");
+        for (i, pname) in params.iter().enumerate() {
+            assert_eq!(f.params[i].name, *pname, "{routine} param {i} name");
+            assert_eq!(f.params[i].width, ty_enum.bytes(), "{routine} param {i} width");
+        }
+        // (c) The injected scratch alloca matches the Task-2 layout contract.
+        assert_eq!(f.blocks.len(), 1, "{routine} block count");
+        match &f.blocks[0].insts[0] {
+            Inst::Alloca(a) => {
+                assert_eq!(a.dst, "__scr", "{routine} scratch dst");
+                assert_eq!(a.size, *size, "{routine} scratch size");
+            }
+            other => panic!("{routine}: expected scratch alloca, got {other:?}"),
+        }
+    }
+    // A const-count shift stays a Bin (isel inlines the fixed sequence) — it
+    // must not be rewritten to a call, and no routine is injected.
+    let const_shift = legalize(parse(
+        "global in i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %k = shl i8 %a, 3\n    ret void\n",
+    ));
+    let ct = ir::serialize(&const_shift);
+    assert!(ct.contains("%k = shl i8 %a 3"));
+    assert!(!ct.contains("call"));
+    assert!(!ct.contains("__shl_u8"));
+}
