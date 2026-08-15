@@ -5,9 +5,16 @@ STATUS equ 0x03
 FSR    equ 0x04
 INDF   equ 0x00
 PCL    equ 0x02
+PCLATH equ 0x0A
 
     org 0x0000
     goto __start
+
+__start:
+    MOVLW 0x00
+    MOVWF PCLATH
+    CALL main
+    SLEEP
 
 mk:
     BSF STATUS, 5
@@ -134,7 +141,11 @@ main:
     MOVWF 0x4B
     MOVLW 0x01
     MOVWF 0x4C
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL mk
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x31, W
     MOVWF 0x40
     MOVF 0x32, W
@@ -172,9 +183,5 @@ main:
     MOVF 0x4A, W
     MOVWF 0x30
     RETURN
-
-__start:
-    CALL main
-    SLEEP
 
     end

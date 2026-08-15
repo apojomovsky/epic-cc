@@ -5,9 +5,16 @@ STATUS equ 0x03
 FSR    equ 0x04
 INDF   equ 0x00
 PCL    equ 0x02
+PCLATH equ 0x0A
 
     org 0x0000
     goto __start
+
+__start:
+    MOVLW 0x00
+    MOVWF PCLATH
+    CALL main
+    SLEEP
 
 main:
     BCF STATUS, 5
@@ -24,7 +31,11 @@ main:
     MOVWF 0x5F
     MOVLW 0x00
     MOVWF 0x60
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __udiv_u16
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x27
     MOVF 0x72, W
@@ -45,7 +56,11 @@ main:
     MOVWF 0x5F
     MOVLW 0x00
     MOVWF 0x60
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __mul_u16
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x2B
     MOVF 0x72, W
@@ -58,7 +73,11 @@ main:
     MOVWF 0x5F
     MOVLW 0x00
     MOVWF 0x60
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __urem_u16
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x2D
     MOVF 0x72, W
@@ -152,7 +171,11 @@ main:
     MOVWF 0x5F
     MOVLW 0xFF
     MOVWF 0x60
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __sdiv_i16
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x3F
     MOVF 0x72, W
@@ -169,7 +192,11 @@ main:
     MOVWF 0x5F
     MOVLW 0x00
     MOVWF 0x60
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __srem_i16
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x41
     MOVF 0x72, W
@@ -203,14 +230,22 @@ main:
     MOVWF 0x5D
     MOVLW 0x07
     MOVWF 0x5E
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __mul_u8
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x4B
     MOVF 0x4B, W
     MOVWF 0x5D
     MOVLW 0x03
     MOVWF 0x5E
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __udiv_u8
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x4C
     MOVF 0x22, W
@@ -236,7 +271,11 @@ main:
     MOVWF 0x5F
     MOVLW 0x00
     MOVWF 0x60
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __mul_u16
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x53
     MOVF 0x72, W
@@ -263,7 +302,11 @@ main:
     MOVWF 0x5F
     MOVF 0x58, W
     MOVWF 0x60
+    MOVLW 0x00
+    MOVWF PCLATH
     CALL __shl_u16
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x59
     MOVF 0x72, W
@@ -692,8 +735,4 @@ tmp26:
     MOVF 0x5E, W
     MOVWF 0x72
     RETURN
-__start:
-    CALL main
-    SLEEP
-
     end

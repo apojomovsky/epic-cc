@@ -10,6 +10,12 @@ PCLATH equ 0x0A
     org 0x0000
     goto __start
 
+__start:
+    MOVLW 0x00
+    MOVWF PCLATH
+    CALL main
+    SLEEP
+
 main:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -23,8 +29,14 @@ main:
     MOVF 0x2C, W
     ANDLW 0x00
     MOVWF 0x2E
+    MOVLW 0x00
+    MOVWF PCLATH
     MOVF 0x2D, W
     CALL __read_table
+    MOVWF 0x70
+    MOVLW 0x00
+    MOVWF PCLATH
+    MOVF 0x70, W
     MOVWF 0x2F
     BCF STATUS, 7
     MOVF 0x2D, W
@@ -49,14 +61,11 @@ __read_table:
     MOVF 0x70, W
     ADDLW LOW(table)
     MOVWF PCL
+    .table table 4
 table:
     RETLW 0x0A
     RETLW 0x14
     RETLW 0x1E
     RETLW 0x28
-
-__start:
-    CALL main
-    SLEEP
 
     end

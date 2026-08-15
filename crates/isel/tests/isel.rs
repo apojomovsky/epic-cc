@@ -3409,12 +3409,14 @@ fn panics_when_user_const_collides_with_generated_reader_label() {
 fn small_const_table_in_nonzero_window_reads_correctly() {
     // M10 load-bearing: a const table placed past 0x100 (window 1) must be
     // read through its reader's PCLATH set — without it the computed PCL
-    // jump would land in window 0 and return a wrong byte. A 241-byte
+    // jump would land in window 0 and return a wrong byte. A 231-byte
     // filler table (`aaa_fill` sorts before `table`) pushes `table` past
-    // 0x100: layout = goto (1) + main (8) + filler reader/table (6+241) +
-    // table reader (6) -> table at 0x106. (241 is the largest filler that
-    // still fits its own 256-byte window — base 0x0F + 241 == 0x100 exactly;
-    // the assembler's `.table` directive now rejects a filler that crosses.)
+    // 0x100: layout = goto (1) + __start (4) + main (14) + filler
+    // reader/table (6+231) + table reader (6) -> table at 0x106. (231 is the
+    // largest filler that still fits its own 256-byte window — base 0x19 +
+    // 231 == 0x100 exactly; the assembler's `.table` directive now rejects a
+    // filler that crosses. The M11 PCLATH pairs add 6 words to main and
+    // `__start` moves to the top (+4), so the filler shrank from M10's 241.)
     //
     let m = module_with_globals(
         "global in i8\nglobal out i8\nconst aaa_fill i8\nconst table i8\nfn main(void) ()\n  block entry:\n\
@@ -3437,7 +3439,7 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
                 bytes: vec![0],
                 addr: None,
             },
-            const_table_global("aaa_fill", 241),
+            const_table_global("aaa_fill", 231),
             ir::Global {
                 name: "table".into(),
                 ty: ir::Ty::I8,
@@ -3470,11 +3472,13 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
 #[test]
 fn large_const_table_reads_simulate_correctly() {
     // M10 load-bearing: a 300-byte table split into two 256-byte chunks. A
-    // 222-byte filler table (`aaa_fill` sorts first) pushes the main table
-    // to exactly 0x100: layout = goto (1) + main (21) + filler reader/table
-    // (6+222) + t reader (6) = 0x100, so `.align 256` is a no-op and t sits
-    // at 0x100 with chunk label t_1 immediately after chunk 0 at 0x200 and
-    // `__read_t_hi` after the table. Runtime reads at idx 2
+    // 206-byte filler table (`aaa_fill` sorts first) pushes the main table
+    // to exactly 0x100: layout = goto (1) + __start (4) + main (33) + filler
+    // reader/table (6+206) + t reader (6) = 0x100, so `.align 256` is a
+    // no-op and t sits at 0x100 with chunk label t_1 immediately after chunk
+    // 0 at 0x200 and `__read_t_hi` after the table. (The M11 PCLATH pairs
+    // add 12 words to main's two reader CALLs and `__start` moves to the top
+    // (+4), so the filler shrank from M10's 222.) Runtime reads at idx 2
     // (chunk 0), 256 (chunk-1 first), 299 (chunk-1 last), 290, and the
     // lo+carry case (idx 0xF0 + k 0x20 -> in-chunk 0x10, hi 1 -> table[272])
     // must return the right bytes. Bytes: 0..255 = 0x00..0xFF; 256+n = 0x11+n.
@@ -3496,7 +3500,7 @@ fn large_const_table_reads_simulate_correctly() {
                 bytes: vec![0],
                 addr: None,
             },
-            const_table_global("aaa_fill", 222),
+            const_table_global("aaa_fill", 206),
             const_table_global("t", 300),
         ]
     };
@@ -3595,4 +3599,202 @@ fn exactly_256_byte_table_uses_chunked_shape_and_assembles() {
     // layout alignment irrelevant. Reads land in chunk 0 only (0..255).
     assert_eq!(sim_run_asm(&asm, &[(0x20, 0x00), (0x21, 0x00)], 0x22), 0x00, "table[0] = 0x00:\n{asm}");
     assert_eq!(sim_run_asm(&asm, &[(0x20, 0xFF), (0x21, 0x00)], 0x22), 0xFF, "table[255] = 0xFF:\n{asm}");
+}
+
+// ---- Milestone 11: multi-page functions and the PCLATH call discipline ----
+
+/// Build IR text for a function padded to `n` words with self-referencing
+/// `%a = add i8 %a, 1` chains (3 words each) — the map needs only one entry.
+fn pad_body(n: usize) -> String {
+    let mut body = String::new();
+    for _ in 0..n {
+        body.push_str("    %a = add i8 %a, 1\n");
+    }
+    body
+}
+
+#[test]
+fn call_emits_pclath_set_and_restore() {
+    // main calls helper: the emitted asm must wrap the CALL in
+    // `MOVLW PAGE(helper); MOVWF PCLATH; CALL helper; MOVLW PAGE(main);
+    // MOVWF PCLATH` — the restore literal is the CALLER's page (its
+    // intra-function GOTOs run with it). `__start` sets PAGE(main) before
+    // CALL main and omits the restore (the program ends with SLEEP).
+    let m = parse(
+        "global a i8\nglobal out i8\n\
+         fn helper(i8) (x)\n  block entry:\n\
+           %r = add i8 %x, 1\n    ret i8 %r\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = load i8 @a\n    %2 = call i8 @helper(i8 %1)\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x26),
+        ("helper::x", 0x2A),
+        ("helper::r", 0x2B),
+    ]);
+    let asm = select(&m, &addrs);
+    assert!(
+        asm.contains("MOVLW PAGE(helper)\n    MOVWF PCLATH\n    CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "set/CALL/restore pairs around CALL helper:\n{asm}"
+    );
+    // __start: PAGE(main) set before CALL main, then SLEEP — no restore.
+    assert!(
+        asm.contains("__start:\n    MOVLW PAGE(main)\n    MOVWF PCLATH\n    CALL main\n    SLEEP"),
+        "__start PCLATH set with no restore:\n{asm}"
+    );
+}
+
+#[test]
+fn const_read_emits_pclath_discipline() {
+    // A const-table read (`CALL __read_t`) gets the same discipline: the
+    // caller sets PAGE(__read_t) before the CALL and restores PAGE(main)
+    // right after (the returned byte survives via the fixed scratch byte).
+    let m = module_with_globals(
+        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n    ret void\n",
+        vec![const_table_global("t", 4)],
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::i", 0x25), ("main::v", 0x26)]);
+    let asm = select(&m, &addrs);
+    // The set goes before the index computation (W = index is the reader's
+    // input — the set's MOVLW must not clobber it); the restore preserves
+    // the returned byte in scratch (0x70) across its own MOVLW.
+    assert!(
+        asm.contains("MOVLW PAGE(__read_t)\n    MOVWF PCLATH"),
+        "set before CALL __read_t:\n{asm}"
+    );
+    assert!(
+        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH\n    MOVF 0x70, W"),
+        "restore after CALL __read_t, byte preserved:\n{asm}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "exceeds a 2048-word page")]
+fn panics_on_function_larger_than_a_page() {
+    // A function of 2100+ words can never fit one 2048-word page: isel must
+    // panic loudly instead of emitting a `.org` that cannot help.
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n{}    store i8 %1 @out\n    ret void\n",
+        pad_body(700)
+    ));
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::1", 0x25), ("main::a", 0x26)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn org_pads_function_across_page_boundary() {
+    // main padded to fill page 0's remainder; the greedy assignment emits
+    // `.org 0x800` before helper so it lands in page 1.
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n{}    %2 = call i8 @helper(i8 %1)\n    store i8 %2 @out\n    ret void\n\
+         fn helper(i8) (x)\n  block entry:\n    %r = add i8 %x, 1\n    ret i8 %r\n",
+        pad_body(676)
+    ));
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x26),
+        ("main::a", 0x27),
+        ("helper::x", 0x2A),
+        ("helper::r", 0x2B),
+    ]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("    org 0x0800"), ".org 0x800 before helper:\n{asm}");
+    assert_eq!(label_addr(&asm, "helper"), 0x800, "helper in page 1:\n{asm}");
+    assert!(label_addr(&asm, "main") < 0x800, "main stays in page 0:\n{asm}");
+}
+
+#[test]
+fn multi_page_module_runs_in_sim() {
+    // M11 load-bearing SIM: main (padded to fill page 0) calls helper which
+    // the greedy assignment moves to page 1 via `.org 0x800`; the CALL is
+    // cross-page, so both halves of the discipline are exercised — helper's
+    // intra-function GOTO proves the SET (PCLATH = PAGE(helper) on entry)
+    // and main's post-call GOTO proves the RESTORE (PCLATH back to
+    // PAGE(main)). A const table lands in page 1 too: its `CALL __read_t`
+    // gets PAGE(__read_t) and the reader's computed goto crosses into the
+    // table's window. helper(x) = x == 0 ? 100 : x; main: r = helper(in);
+    // r2 = r == 0 ? r+1 : r; out = r2 + t[in].
+    let mut pad = String::new();
+    for _ in 0..665 {
+        pad.push_str("    %a = add i8 %a, 1\n");
+    }
+    let m = module_with_globals(
+        &format!(
+            "global in i8\nglobal out i8\nconst t i8\n\
+             fn main(void) ()\n  block entry:\n{}    %1 = load i8 @in\n    %2 = call i8 @helper(i8 %1)\n\
+             \x20   %c = icmp eq i8 %2, 0\n    br i1 %c thenb endb\n\
+             block thenb:\n    %3 = add i8 %2, 1\n    br endb\n\
+             block endb:\n    %p = phi i8 %2 entry %3 thenb\n\
+             \x20   %q = gep @t +0 +1*%1\n    %v = load i8 %q\n    %s = add i8 %p, %v\n\
+             \x20   store i8 %s @out\n    ret void\n\
+             fn helper(i8) (x)\n  block entry:\n    %c = icmp eq i8 %x, 0\n    br i1 %c then else\n\
+             block then:\n    %v = add i8 %x, 100\n    br end\n\
+             block else:\n    br end\n\
+             block end:\n    %p = phi i8 %v then %x else\n    ret i8 %p\n",
+            pad
+        ),
+        vec![const_table_global("t", 4)],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::1", 0x26),
+        ("main::2", 0x27),
+        ("main::c", 0x28),
+        ("main::3", 0x29),
+        ("main::p", 0x2A),
+        ("main::v", 0x2B),
+        ("main::s", 0x2C),
+        ("helper::x", 0x30),
+        ("helper::c", 0x31),
+        ("helper::v", 0x32),
+        ("helper::p", 0x33),
+    ]);
+    let asm = select(&m, &addrs);
+    // Load-bearing preconditions: helper and the table land in page 1.
+    assert!(asm.contains("    org 0x0800"), ".org 0x800 must be emitted:\n{asm}");
+    assert_eq!(label_addr(&asm, "helper"), 0x800, "helper must land in page 1:\n{asm}");
+    let t = label_addr(&asm, "t");
+    assert!(t >= 0x800 && t < 0x1000, "table must land in page 1 (base 0x{t:03X}):\n{asm}");
+    // Hand-computed results (see the doc comment).
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 0)], 0x21), 100, "in=0: helper=100, t[0]=0:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 1)], 0x21), 2, "in=1: helper=1, t[1]=1:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 2)], 0x21), 4, "in=2: helper=2, t[2]=2:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 3)], 0x21), 6, "in=3: helper=3, t[3]=3:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "beyond page 3")]
+fn panics_when_function_would_start_past_page_3() {
+    // Four functions each filling most of a page (676 self-adds = 2028 words
+    // each) leave the next one needing 0x2000 — past page 3 (device flash).
+    // The greedy assignment must panic loudly rather than emit a
+    // `.org 0x2000` the assembler would reject.
+    let mut ir = String::from("global in i8\n");
+    for i in 0..4 {
+        ir.push_str(&format!(
+            "fn f{i}(void) ()\n  block entry:\n{}    ret void\n",
+            pad_body(676)
+        ));
+    }
+    // The four big functions end at 0x1FED (page 3's last word is 0x1FFF);
+    // a fifth of 31+ words cannot fit the remainder and would need 0x2000.
+    ir.push_str(&format!("fn f4(void) ()\n  block entry:\n{}    ret void\n", pad_body(10)));
+    let m = parse(&ir);
+    let mut pairs: Vec<(String, u16)> = vec![("in".to_string(), 0x20)];
+    for i in 0..4 {
+        pairs.push((format!("f{i}::a"), 0x25));
+    }
+    pairs.push(("f4::a".to_string(), 0x25));
+    let refs: Vec<(&str, u16)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    let _ = select(&m, &addrs(&refs));
 }
