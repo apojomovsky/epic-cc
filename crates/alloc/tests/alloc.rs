@@ -193,6 +193,50 @@ fn callee_base_follows_callers_physical_frame_end() {
 }
 
 #[test]
+fn callee_base_clears_region_tail_hole_left_by_i16_local() {
+    // 79 i8 globals fill 0x20..0x6E, so end_of_globals = 0x6F and main's root
+    // frame starts at 0x6F — the last byte of bank 0. main's i16 local does
+    // not fit in the single remaining bank-0 byte, so place_contiguous moves
+    // it *wholesale* to 0xA0 (leaving the 0x6F byte as an unused hole), then
+    // the i8 local lands at 0xA2: main's TRUE physical end is 0xA3. A
+    // contiguous-blob frame_end(0x6F, 3) would count the hole byte and stop
+    // at 0xA2, and a callee b based on that would land exactly on main's
+    // live v1 (silent miscompile). The frame end must come from the actually
+    // placed locals: b's base is 0xA3, strictly after main::v1.
+    let mut gsrc = String::new();
+    for i in 0..79 {
+        gsrc.push_str(&format!("global g{i} i8\n"));
+    }
+    let src = format!(
+        "{gsrc}fn main() -> void\n\
+           block entry:\n\
+             %v0 = add i16 1, 2\n\
+             %v1 = add i8 3, 4\n\
+             call void @b()\n\
+             ret void\n\
+         fn b() -> void\n\
+           block entry:\n\
+             %b0 = add i8 1, 2\n\
+             ret void\n"
+    );
+    let m = parse(&src);
+    let out = allocate(&m, "edge main b\n");
+    // 79 i8 globals: the last one at 0x6E, so the root frame starts at 0x6F.
+    assert_eq!(out.globals["g78"], 0x6E);
+    // main's frame: i16 at 0xA0-0xA1 (bank 1, since 0x6F cannot hold it),
+    // i8 at 0xA2 — true physical end 0xA3.
+    assert_eq!(out.locals["main::v0"], 0xA0);
+    assert_eq!(out.locals["main::v1"], 0xA2);
+    // b's base is main's true physical end, not the blob-model 0xA2 that
+    // overlays main::v1.
+    assert_eq!(out.locals["b::b0"], 0xA3);
+    assert!(
+        out.locals["b::b0"] > out.locals["main::v1"],
+        "b's frame overlaps main's live local v1 at 0xA2"
+    );
+}
+
+#[test]
 fn i16_globals_stay_even_aligned_across_banks() {
     // 80 i8 globals fill bank 0 (0x20-0x6F); the next i16 must land on an
     // even address in bank 1 (0xA0, not 0xA1).
