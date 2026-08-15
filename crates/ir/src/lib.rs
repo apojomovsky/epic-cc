@@ -22,6 +22,8 @@ pub struct Bin { pub dst: String, pub op: BinOp, pub ty: Ty, pub a: Val, pub b: 
 #[derive(Clone, Debug)]
 pub struct Zext { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
 #[derive(Clone, Debug)]
+pub struct Sext { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
+#[derive(Clone, Debug)]
 pub struct Trunc { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
 #[derive(Clone, Debug)]
 pub struct Icmp { pub dst: String, pub pred: String, pub ty: Ty, pub a: Val, pub b: Val }
@@ -45,6 +47,7 @@ pub enum Inst {
     Bin(Bin),
     Ret(Option<(Ty, Val)>),
     Zext(Zext),
+    Sext(Sext),
     Trunc(Trunc),
     Icmp(Icmp),
     Select(Select),
@@ -101,6 +104,7 @@ fn inst_str(i: &Inst) -> String {
         Inst::Ret(None) => "ret void".into(),
         Inst::Ret(Some((t, v))) => format!("ret {} {}", ty_str(*t), val_str(v)),
         Inst::Zext(z) => format!("%{} = zext {} {} to {}", z.dst, ty_str(z.from), val_str(&z.val), ty_str(z.to)),
+        Inst::Sext(s) => format!("%{} = sext {} {} to {}", s.dst, ty_str(s.from), val_str(&s.val), ty_str(s.to)),
         Inst::Trunc(t) => format!("%{} = trunc {} {} to {}", t.dst, ty_str(t.from), val_str(&t.val), ty_str(t.to)),
         Inst::Icmp(i) => format!("%{} = icmp {} {} {} {}", i.dst, i.pred, ty_str(i.ty), val_str(&i.a), val_str(&i.b)),
         Inst::Select(s) => format!("%{} = select i1 {} {} {} {} {}", s.dst, val_str(&s.cond), ty_str(s.ty), val_str(&s.a), ty_str(s.ty), val_str(&s.b)),
@@ -251,11 +255,20 @@ fn parse_inst(line: &str) -> Inst {
     if let Some(rest) = body.strip_prefix("icmp ") {
         let mut it = rest.split_whitespace();
         let pred = it.next().unwrap().to_string();
-        if pred != "eq" && pred != "ne" { panic!("unsupported icmp predicate {pred}"); }
+        const PREDS: [&str; 10] = ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"];
+        if !PREDS.contains(&pred.as_str()) { panic!("unsupported icmp predicate {pred}"); }
         let t = parse_ty(it.next().unwrap());
         let a = parse_val(it.next().unwrap());
         let b = parse_val(it.next().unwrap());
         return Inst::Icmp(Icmp { dst, pred, ty: t, a, b });
+    }
+    if let Some(rest) = body.strip_prefix("sext ") {
+        let mut it = rest.split_whitespace();
+        let from = parse_ty(it.next().unwrap());
+        let val = parse_val(it.next().unwrap());
+        assert_eq!(it.next().unwrap(), "to", "sext must be '%d = sext <t> <v> to <t2>'");
+        let to = parse_ty(it.next().unwrap());
+        return Inst::Sext(Sext { dst, from, val, to });
     }
     if let Some(rest) = body.strip_prefix("select ") {
         let mut it = rest.split_whitespace();

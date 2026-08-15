@@ -360,6 +360,7 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         Inst::Load(l) => Some((l.dst.clone(), l.ty.bytes())),
         Inst::Bin(b) => Some((b.dst.clone(), b.ty.bytes())),
         Inst::Zext(z) => Some((z.dst.clone(), z.to.bytes())),
+        Inst::Sext(s) => Some((s.dst.clone(), s.to.bytes())),
         Inst::Trunc(t) => Some((t.dst.clone(), t.to.bytes())),
         Inst::Icmp(i) => Some((i.dst.clone(), 1)),
         Inst::Select(s) => Some((s.dst.clone(), s.ty.bytes())),
