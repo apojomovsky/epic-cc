@@ -7,6 +7,12 @@
 //! predecessor block, before its terminator. Any other instruction or binop
 //! panics.
 //!
+//! Phase-3 pointers/const: `gep` defines a virtual pointer, lowered at each
+//! `load`/`store` use. A pointer into a RAM array accesses `FSR`/`INDF`
+//! (`base_lo + offset`); a pointer into a const (flash) global loads via
+//! `CALL __read_<name>` — a RETLW table emitted after the functions. A store
+//! through a pointer into a const global panics (ROM is not writable).
+//!
 //! Every value's address comes from the caller-supplied address map: globals
 //! by name, locals by `{func}::{name}` (IR value names without `%`). isel
 //! performs no slot allocation; it trusts the map (from `alloc`'s overlay
@@ -27,6 +33,10 @@ fn ssa_key(func: &str, name: &str) -> String {
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
+    /// Every GEP in the module, keyed `{func}::{dst}` -> (base global,
+    /// offset). `gep` itself emits nothing; each `load`/`store` through a
+    /// pointer reg lowers the pointer at its use.
+    geps: &'m HashMap<String, (String, Val)>,
     scratch: u16,
     retval_lo: u16,
     cur_func: &'m str,
@@ -66,17 +76,72 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Resolve a memory pointer ("@name" global or "%name" slot) to an address.
-    fn ptr_addr(&self, p: &str) -> u16 {
-        if let Some(g) = p.strip_prefix('@') {
-            *self
-                .addrs
-                .get(g)
-                .unwrap_or_else(|| panic!("isel: no address for @{g}"))
-        } else {
-            let name = p.trim_start_matches('%');
-            self.slot_addr(self.cur_func, name)
-        }
+    /// The byte address of a RAM global (from the map).
+    fn global_addr(&self, name: &str) -> u16 {
+        *self
+            .addrs
+            .get(name)
+            .unwrap_or_else(|| panic!("isel: no address for @{name}"))
+    }
+
+    /// Whether `name` is a const (flash) global — read via RETLW tables.
+    fn global_is_const(&self, name: &str) -> bool {
+        self.m
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
+            .is_const
+    }
+
+    /// A GEP-created pointer `%r` -> its (base global, offset). Pointers
+    /// come only from `gep` in this milestone; anything else is a missing
+    /// slot and panics loudly.
+    fn gep_for(&self, r: &str) -> (String, Val) {
+        let key = ssa_key(self.cur_func, r);
+        self.geps
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| panic!("isel: no gep for pointer %{r} ({key})"))
+    }
+
+    /// `FSR = base_lo + offset`: W = offset low byte, W += the RAM global's
+    /// byte address, then FSR = W. Bank-0 arrays only — the base must fit
+    /// the 8-bit ADDLW literal.
+    fn emit_fsr_setup(&mut self, base: &str, offset: &Val) {
+        let base_lo = self.global_addr(base);
+        assert!(
+            base_lo <= 0xFF,
+            "isel: indirect base @{base} at 0x{base_lo:02X} needs a banked FSR setup"
+        );
+        self.emit_load_byte(offset, 0); // W = offset low byte
+        self.emit(format!("    ADDLW 0x{base_lo:02X}")); // W = base + offset
+        self.emit("    MOVWF FSR".to_string());
+    }
+
+    /// `dst = ram[base + offset]` via FSR/INDF (i8 only, like the spike).
+    fn emit_ram_indirect_load(&mut self, base: &str, offset: &Val, dst: u16, ty: Ty) {
+        assert!(ty.bytes() == 1, "isel: multi-byte indirect load not supported");
+        self.emit_fsr_setup(base, offset);
+        self.emit("    MOVF INDF, W".to_string());
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
+    }
+
+    /// `ram[base + offset] = val` via FSR/INDF (i8 only, like the spike).
+    fn emit_ram_indirect_store(&mut self, base: &str, offset: &Val, val: &Val, ty: Ty) {
+        assert!(ty.bytes() == 1, "isel: multi-byte indirect store not supported");
+        self.emit_fsr_setup(base, offset);
+        self.emit_load_byte(val, 0);
+        self.emit("    MOVWF INDF".to_string());
+    }
+
+    /// `dst = flash_table[offset]`: W = index, CALL __read_<base> (a RETLW
+    /// table), W = the selected byte -> dst. i8 only, like the spike.
+    fn emit_const_read(&mut self, base: &str, offset: &Val, dst: u16, ty: Ty) {
+        assert!(ty.bytes() == 1, "isel: multi-byte const load not supported");
+        self.emit_load_byte(offset, 0); // W = offset (index)
+        self.emit(format!("    CALL __read_{base}"));
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
     }
 
     /// W = byte `idx` of `val`.
@@ -296,17 +361,45 @@ impl<'m> Gen<'m> {
         match i {
             Inst::Load(l) => {
                 assert!(l.ty != Ty::I1, "isel: only i8/i16 loads supported");
-                let (src, dst) = (self.ptr_addr(&l.ptr), self.slot_addr(self.cur_func, &l.dst));
-                for k in 0..l.ty.bytes() {
-                    self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
-                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
+                let dst = self.slot_addr(self.cur_func, &l.dst);
+                if let Some(g) = l.ptr.strip_prefix('@') {
+                    let src = self.global_addr(g);
+                    for k in 0..l.ty.bytes() {
+                        self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
+                        self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
+                    }
+                } else {
+                    // A GEP-created pointer: const bases read via a RETLW
+                    // table; RAM bases via FSR/INDF.
+                    let r = l.ptr.strip_prefix('%').unwrap_or_else(|| {
+                        panic!("isel: pointer {:?} is not @global or %reg", l.ptr)
+                    });
+                    let (base, offset) = self.gep_for(r);
+                    if self.global_is_const(&base) {
+                        self.emit_const_read(&base, &offset, dst, l.ty);
+                    } else {
+                        self.emit_ram_indirect_load(&base, &offset, dst, l.ty);
+                    }
                 }
             }
             Inst::Store(s) => {
                 assert!(s.ty != Ty::I1, "isel: only i8/i16 stores supported");
-                let dst = self.ptr_addr(&s.ptr);
-                self.emit_move_val_to_slot(&s.val, s.ty, dst);
+                if let Some(g) = s.ptr.strip_prefix('@') {
+                    let dst = self.global_addr(g);
+                    self.emit_move_val_to_slot(&s.val, s.ty, dst);
+                } else {
+                    let r = s.ptr.strip_prefix('%').unwrap_or_else(|| {
+                        panic!("isel: pointer {:?} is not @global or %reg", s.ptr)
+                    });
+                    let (base, offset) = self.gep_for(r);
+                    assert!(
+                        !self.global_is_const(&base),
+                        "isel: store to const (flash) global @{base}"
+                    );
+                    self.emit_ram_indirect_store(&base, &offset, &s.val, s.ty);
+                }
             }
+            Inst::Gep(_) => {} // virtual: lowered at each load/store use
             Inst::Bin(b) => {
                 assert!(b.ty != Ty::I1, "isel: only i8/i16 binops supported");
                 let da = self.slot_addr(self.cur_func, &b.dst);
@@ -437,11 +530,30 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         "    list p=16f877a".to_string(),
         "    radix hex".to_string(),
         "STATUS equ 0x03".to_string(),
+        "FSR    equ 0x04".to_string(),
+        "INDF   equ 0x00".to_string(),
+        "PCL    equ 0x02".to_string(),
         "".to_string(),
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
         "".to_string(),
     ];
+    // Phase-3 pointers: collect every GEP so a load/store through a pointer
+    // reg can find its (base global, offset). Keyed `{func}::{dst}` like
+    // every other local. Gep itself is virtual — it emits nothing.
+    let mut geps: HashMap<String, (String, Val)> = HashMap::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Gep(g) = i {
+                    geps.insert(
+                        ssa_key(&f.name, &g.dst),
+                        (g.base.clone(), g.offset.clone()),
+                    );
+                }
+            }
+        }
+    }
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
     let mut tmp = 0u32;
@@ -449,6 +561,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         let mut g = Gen {
             m,
             addrs,
+            geps: &geps,
             scratch,
             retval_lo,
             cur_func: &f.name,
@@ -552,10 +665,76 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         g.emit("".to_string());
         out.extend(g.out);
     }
+    // Const (flash) globals become RETLW tables, emitted after the
+    // functions so the CALLs above resolve. `__read_<name>` adds the
+    // table's low address to the index in W and jumps into it via PCL; the
+    // RETLW of the selected byte returns with W = the byte.
+    let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
+    consts.sort_by_key(|g| g.name.clone());
+    for g in consts {
+        out.push(format!("__read_{}:", g.name));
+        out.push(format!("    ADDLW LOW({})", g.name));
+        out.push("    MOVWF PCL".to_string());
+        out.push(format!("{}:", g.name));
+        for b in &g.bytes {
+            out.push(format!("    RETLW 0x{b:02X}"));
+        }
+        out.push("".to_string());
+    }
     out.push("__start:".to_string());
     out.push("    CALL main".to_string());
     out.push("    SLEEP".to_string());
     out.push("".to_string());
     out.push("    end".to_string());
     out.join("\n")
+}
+
+/// Parse an alloc-produced address-map text into `HashMap<String, u16>`:
+/// `global <name> 0xNN` and `local <func> <name> 0xNN` lines become map
+/// entries (locals keyed `{func}::{name}`); `const <name>` lines list flash
+/// globals, which have no RAM address, so they are accepted and skipped —
+/// isel reads their bytes from the `Module`, never from a RAM slot.
+pub fn parse_map(text: &str) -> HashMap<String, u16> {
+    let mut addrs = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        let kw = it.next().expect("map entry");
+        match kw {
+            "const" => {
+                // Flash global: no RAM address; nothing to record.
+            }
+            "global" => {
+                let name = it
+                    .next()
+                    .unwrap_or_else(|| panic!("isel: malformed map line: {line}"))
+                    .to_string();
+                let addr = it
+                    .next()
+                    .and_then(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or_else(|| panic!("isel: bad address in map line: {line}"));
+                addrs.insert(name, addr);
+            }
+            "local" => {
+                let func = it
+                    .next()
+                    .unwrap_or_else(|| panic!("isel: malformed map line: {line}"))
+                    .to_string();
+                let name = it
+                    .next()
+                    .unwrap_or_else(|| panic!("isel: malformed map line: {line}"))
+                    .to_string();
+                let addr = it
+                    .next()
+                    .and_then(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                    .unwrap_or_else(|| panic!("isel: bad address in map line: {line}"));
+                addrs.insert(format!("{func}::{name}"), addr);
+            }
+            _ => panic!("isel: unexpected map line: {line}"),
+        }
+    }
+    addrs
 }
