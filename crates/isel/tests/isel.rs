@@ -3529,3 +3529,70 @@ fn large_const_table_reads_simulate_correctly() {
         assert_eq!(got, *want, "table[{in_val}] with k 0x{k:02X} must read 0x{want:02X}:\n{asm}");
     }
 }
+
+#[test]
+fn exactly_256_byte_table_uses_chunked_shape_and_assembles() {
+    // P3 boundary fix: a 256-byte table is a legal two-chunk table (chunk 0
+    // = all 256 bytes, chunk 1 = 0 bytes — empty, and unreachable: indices
+    // 0..255 always select chunk 0). The old `size > 256` cut sent it down
+    // the single-entry branch, which emits `.table t 256` — and the
+    // assembler requires LOW(base) == 0 for size > 255, so a 256-byte table
+    // whose natural layout base isn't 256-aligned failed assembly (the
+    // layout's alignment, not the table, was the arbiter). With the
+    // `>= 256` cut the chunked branch's `.align 256` guarantees LOW == 0
+    // regardless of the layout, and the empty chunk 1 (`t_1:` with no
+    // RETLWs, `__read_t_hi` immediately after) is emitted but never jumped
+    // into — the caller's chunk bit is 0 for every index this table accepts.
+    let m = module_with_globals(
+        "global in i16\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i16 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I16,
+                is_const: false,
+                size: 2,
+                bytes: vec![0; 2],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("t", 256),
+        ],
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
+    let asm = select(&m, &addrs);
+    // Chunked shape: `.align 256`, `.table t 256`, the `t_1` chunk label,
+    // and the `__read_t_hi` entry — a 256-byte table is two chunks, not one.
+    assert!(
+        asm.contains("    .align 256"),
+        "256-byte table must take the chunked branch:\n{asm}"
+    );
+    assert!(asm.contains("    .table t 256"), "window-fit directive with the full size:\n{asm}");
+    assert!(asm.contains("\nt_1:"), "empty chunk-1 label must be emitted:\n{asm}");
+    assert!(asm.contains("__read_t_hi:"), "chunk-1 reader entry must be emitted:\n{asm}");
+    // 256 RETLWs total, all in chunk 0; chunk 1 is empty (t_1 == t + 256,
+    // __read_t_hi immediately after the label).
+    assert_eq!(asm.matches("RETLW").count(), 256, "one RETLW per byte:\n{asm}");
+    let t = asm.find("\nt:").unwrap();
+    let t1 = asm.find("\nt_1:").unwrap();
+    let hi = asm.find("__read_t_hi:").unwrap();
+    assert_eq!(&asm[t..t1].matches("RETLW").count(), &256, "chunk 0 = 256 bytes:\n{asm}");
+    assert_eq!(&asm[t1..hi].matches("RETLW").count(), &0, "chunk 1 = 0 bytes:\n{asm}");
+    let base = label_addr(&asm, "t");
+    assert_eq!(label_addr(&asm, "t_1"), base + 256, "t_1 = t + 256:\n{asm}");
+    assert_eq!(base & 0xFF, 0, "chunk-0 base must be 256-aligned:\n{asm}");
+    // And it assembles + simulates. The table's natural base (goto + main +
+    // reader) is NOT 256-aligned here, so the old single-entry cut would
+    // fail assembly with the `.table` window assert — the fix must make the
+    // layout alignment irrelevant. Reads land in chunk 0 only (0..255).
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 0x00), (0x21, 0x00)], 0x22), 0x00, "table[0] = 0x00:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 0xFF), (0x21, 0x00)], 0x22), 0xFF, "table[255] = 0xFF:\n{asm}");
+}

@@ -191,7 +191,8 @@ impl<'m> Gen<'m> {
     }
 
     /// The byte size of a global — a const table's size selects the reader
-    /// shape (≤ 255 single entry; > 255 two chunked entries).
+    /// shape (≤ 255 single entry; ≥ 256 two chunked entries, chunk 1 empty
+    /// for exactly 256 bytes).
     fn global_size(&self, name: &str) -> u16 {
         self.m
             .globals
@@ -2100,12 +2101,14 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // sets PCLATH = HIGH(<name>) first — the computed `ADDLW LOW(<name>);
     // MOVWF PCL` jump lands at PCLATH:PCL, so a table in a nonzero 256-byte
     // window needs the window set (the M5 reader left PCLATH stale — the
-    // latent window bug). A table > 255 bytes is emitted as two 256-byte
+    // latent window bug). A table of 256+ bytes is emitted as two 256-byte
     // chunks: chunk 0's 256 RETLWs at the base label `<name>` (`.align 256`
     // pads it to a 256-word boundary so LOW(<name>) == 0), then chunk 1's
     // RETLWs at the fresh label `<name>_1` IMMEDIATELY after — `<name>` +
     // 256 in the address space, so LOW(<name>_1) == 0 too and the true
-    // bound is 511 bytes — then the `__read_<name>_hi` entry AFTER the
+    // bound is 511 bytes (a table of exactly 256 bytes has an empty chunk
+    // 1, unreachable since its valid indices are 0..255) — then the
+    // `__read_<name>_hi` entry AFTER the
     // table (its computed-goto jumps into the table; the entry instructions
     // are dead after MOVWF PCL). A `.table <name> <size>` directive is
     // emitted immediately before every table's base label; the assembler
@@ -2137,7 +2140,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
                 format!("reader entry of const {}", g.name),
             );
             claim(g.name.clone(), format!("base label of const {}", g.name));
-            if g.bytes.len() > 256 {
+            if g.bytes.len() >= 256 {
                 claim(
                     format!("{}_1", g.name),
                     format!("chunk-1 label of const {}", g.name),
@@ -2172,7 +2175,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             out.push(format!("    ADDLW LOW({base})"));
             out.push("    MOVWF PCL".to_string());
         };
-        if size > 256 {
+        if size >= 256 {
             // Chunked table: chunk 0's reader, then `.align 256` (the
             // assembler pads to the next 256-word boundary, so LOW(name) ==
             // 0), then the `.table` directive, then chunk 0's 256 RETLWs at
@@ -2181,6 +2184,13 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             // chunk-1 reader entry — AFTER the table. (The entry's computed
             // goto jumps into the table; the entry instructions are dead
             // after MOVWF PCL, so their placement cannot shift the chunks.)
+            // A table of exactly 256 bytes gets this branch too (size >=
+            // 256): chunk 1 is empty (`name_1:` with no RETLWs, its reader
+            // immediately after) and unreachable — every valid index
+            // 0..255 selects chunk 0. The old `> 256` cut sent 256-byte
+            // tables down the single-entry branch, whose `.table` asserts
+            // LOW == 0 for size > 255 — assembly failed unless the layout
+            // happened to be aligned; `.align 256` makes it unconditional.
             out.push(format!("__read_{}:", g.name));
             reader(&mut out, &g.name);
             out.push("    .align 256".to_string());
