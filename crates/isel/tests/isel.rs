@@ -204,7 +204,7 @@ fn brcond_and_select_emit_skip_lines() {
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
     let asm = select(&m, &addrs);
-    // %1=0x70, %c=0x71, %s=0x72, scratch=0x2A.
+    // %1=0x70, %c=0x71, %s=0x72, scratch=0x22 (end_of_globals: 0x20+1, 0x21+1 -> 0x22).
     // brcond: cond==0 -> main_Lend (f), cond!=0 -> main_Lthen (t).
     assert!(asm.contains("MOVF 0x71, W"), "brcond reads cond:\n{asm}");
     assert!(asm.contains("BTFSC STATUS, 2"), "brcond Z test:\n{asm}");
@@ -247,11 +247,12 @@ fn select_labels_are_unique_across_functions() {
 }
 
 #[test]
-fn slots_skip_icmp_scratch_at_end_of_globals() {
-    // The icmp scratch byte sits at end_of_globals. When the globals end
-    // inside common-RAM territory (here 0x6F+1 = 0x70), slot() must skip the
-    // scratch byte so an icmp in the same function never silently corrupts
-    // that slot.
+fn slots_skip_icmp_scratch_and_retval_at_end_of_globals() {
+    // The icmp scratch byte sits at end_of_globals, with the two retval
+    // bytes just after it. When the globals end inside common-RAM territory
+    // (here 0x6F+1 = 0x70), slot() must skip the scratch byte and the retval
+    // bytes so an icmp or a callee's Ret in the same function never silently
+    // corrupts that slot.
     let m = parse(
         "global in i8\nfn main() -> void\n  block entry:\n\
            %a0 = load i8 @in\n    %c = icmp eq i8 %a0, 0\n    ret void\n",
@@ -259,11 +260,12 @@ fn slots_skip_icmp_scratch_at_end_of_globals() {
     let addrs = addrs(&[("in", 0x6F)]);
     let asm = select(&m, &addrs);
     // end_of_globals = 0x6F + 1 = 0x70: scratch 0x70, retval 0x71/0x72.
-    // %a0 would land on the scratch (0x70), so it must skip to 0x71; the
-    // icmp result lands at 0x72.
+    // %a0 would land on the scratch (0x70), so it must skip past both it and
+    // the retval bytes to 0x73; the icmp result lands at 0x74.
     assert!(asm.contains("MOVWF 0x70"), "icmp writes the scratch at end_of_globals:\n{asm}");
-    assert!(asm.contains("MOVWF 0x71"), "first slot must skip the scratch byte:\n{asm}");
-    assert!(asm.contains("MOVWF 0x72"), "icmp dst:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x71") && !asm.contains("MOVWF 0x72"), "no slot on retval bytes:\n{asm}");
+    assert!(asm.contains("MOVWF 0x73"), "first slot must skip scratch and retval bytes:\n{asm}");
+    assert!(asm.contains("MOVWF 0x74"), "icmp dst:\n{asm}");
 }
 
 #[test]
