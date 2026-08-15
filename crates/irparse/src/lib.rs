@@ -850,7 +850,8 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let b = parse_val(parts[2].split_whitespace().nth(1).unwrap());
             out.push(Inst::Select(Select { dst: dst.unwrap(), cond, ty, a, b }));
         }
-        "add" | "and" | "or" | "xor" | "sub" => {
+        "add" | "and" | "or" | "xor" | "sub" | "mul" | "udiv" | "urem" | "sdiv" | "srem"
+        | "shl" | "lshr" | "ashr" => {
             let body = strip_attrs(&rest[op.len()..]);
             let mut it = body.split_whitespace();
             let ty = ty_of(it.next().unwrap());
@@ -861,9 +862,24 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 "and" => BinOp::And,
                 "or" => BinOp::Or,
                 "xor" => BinOp::Xor,
+                "mul" => BinOp::Mul,
+                "udiv" => BinOp::UDiv,
+                "urem" => BinOp::URem,
+                "sdiv" => BinOp::SDiv,
+                "srem" => BinOp::SRem,
+                "shl" => BinOp::Shl,
+                "lshr" => BinOp::LShr,
+                "ashr" => BinOp::AShr,
                 _ => BinOp::Sub,
             };
             out.push(Inst::Bin(Bin { dst: dst.unwrap(), op: o, ty, a, b }));
+        }
+        "freeze" => {
+            let body = strip_attrs(&rest[op.len()..]);
+            let mut it = body.split_whitespace();
+            let ty = ty_of(it.next().unwrap());
+            let val = parse_val(it.next().unwrap());
+            out.push(Inst::Freeze(ir::Freeze { dst: dst.unwrap(), ty, val }));
         }
         other => panic!("SPIKE LIMIT: unsupported opcode {other:?} in line: {line}"),
     }

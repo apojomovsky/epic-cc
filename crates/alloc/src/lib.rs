@@ -377,6 +377,8 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         // and in alloc); Memcpy defines nothing.
         Inst::Alloca(a) => Some((a.dst.clone(), a.size)),
         Inst::Memcpy(_) => None,
+        // Freeze defines the dst slot, sized by the operand type.
+        Inst::Freeze(f) => Some((f.dst.clone(), f.ty.bytes())),
     }
 }
 

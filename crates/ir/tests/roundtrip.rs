@@ -199,6 +199,43 @@ fn scalar_param_widths_roundtrip() {
 }
 
 #[test]
+fn roundtrips_new_binops_and_freeze() {
+    // Milestone 8: the seven mul/div/rem/shift binops + freeze must
+    // round-trip their canonical text exactly.
+    let text = "global in i16\nfn main(void) ()\n  block entry:\n\
+    %0 = load i16 @in\n\
+    %1 = mul i16 %0, 7\n\
+    %2 = udiv i16 %1, 7\n\
+    %3 = urem i16 %2, 5\n\
+    %4 = sdiv i16 %3, -3\n\
+    %5 = srem i16 %4, 3\n\
+    %6 = shl i16 %5, 3\n\
+    %7 = lshr i16 %6, 1\n\
+    %8 = ashr i16 %7, 2\n\
+    %9 = freeze i16 %8\n\
+    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    // stable fixed point: parse -> serialize -> parse -> serialize
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    // each new opcode serializes to its canonical opcode name
+    for line in [
+        "%1 = mul i16 %0 7",
+        "%2 = udiv i16 %1 7",
+        "%3 = urem i16 %2 5",
+        "%4 = sdiv i16 %3 -3",
+        "%5 = srem i16 %4 3",
+        "%6 = shl i16 %5 3",
+        "%7 = lshr i16 %6 1",
+        "%8 = ashr i16 %7 2",
+        "%9 = freeze i16 %8",
+    ] {
+        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+    }
+}
+
+#[test]
 fn gep_base_global_roundtrips() {
     let text = "global a i8\nfn main(void) ()\n  block entry:\n    %p = gep @a +3\n    ret void\n";
     let m = parse(text);
