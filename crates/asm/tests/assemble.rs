@@ -34,6 +34,32 @@ fn panics_on_file_register_out_of_range() {
 }
 
 #[test]
+fn assembles_runtime_routine_instructions_with_destinations() {
+    // The mul/div/rem routine recipes (isel M8 Task 3) use the F-destination
+    // file ops and the carry/borrow loop instructions; the destination token
+    // must select the d bit (W = 0, F = 1).
+    let src = "    org 0x0000\n\
+    rlf 0x20, F\n\
+    rrf 0x21, F\n\
+    incf 0x22, F\n\
+    incfsz 0x23, W\n\
+    decfsz 0x24, F\n\
+    comf 0x25, F\n\
+    addwf 0x26, F\n\
+    subwf 0x27, W\n\
+    end\n";
+    let words = assemble(src);
+    assert_eq!(words[0], 0x0DA0, "rlf 0x20, F");
+    assert_eq!(words[1], 0x0CA1, "rrf 0x21, F");
+    assert_eq!(words[2], 0x0AA2, "incf 0x22, F");
+    assert_eq!(words[3], 0x0F23, "incfsz 0x23, W");
+    assert_eq!(words[4], 0x0BA4, "decfsz 0x24, F");
+    assert_eq!(words[5], 0x09A5, "comf 0x25, F");
+    assert_eq!(words[6], 0x07A6, "addwf 0x26, F");
+    assert_eq!(words[7], 0x0227, "subwf 0x27, W");
+}
+
+#[test]
 fn to_hex_roundtrips_through_parse_hex() {
     let src = "    org 0x0000\n    goto __start\n__start:\n    movf 0x20, W\n    movlw 0x01\n    addwf 0x20, W\n    movwf 0x21\n    sleep\n    end\n";
     let words = assemble(src);
