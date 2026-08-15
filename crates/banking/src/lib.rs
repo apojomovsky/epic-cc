@@ -37,8 +37,12 @@ pub fn assign_banks(asm: &str) -> String {
     let mut rp0 = false; // STATUS, bit 5
     let mut rp1 = false; // STATUS, bit 6
     for line in asm.lines() {
-        let mut toks = line.trim_start().split_whitespace();
-        let Some(mne) = toks.next() else {
+        // Collect into a Vec so the BANKSEL-recognition branch below can look
+        // ahead without consuming tokens: a BCF/BSF on a banked GPR (not
+        // STATUS) must still reach the generic operand-processing path with
+        // its operand intact.
+        let toks: Vec<&str> = line.trim_start().split_whitespace().collect();
+        let Some(mne) = toks.first().copied() else {
             out.push_str(line);
             out.push('\n');
             continue;
@@ -47,8 +51,8 @@ pub fn assign_banks(asm: &str) -> String {
         // `BCF/BSF STATUS, RP0/RP1` — whether emitted here or already present
         // — update the tracked bank.
         if mne == "BCF" || mne == "BSF" {
-            let reg = toks.next().unwrap_or("").trim_end_matches([',', ';', ')']);
-            let bit = toks.next().unwrap_or("").trim_end_matches([',', ';', ')']);
+            let reg = toks.get(1).copied().unwrap_or("").trim_end_matches([',', ';', ')']);
+            let bit = toks.get(2).copied().unwrap_or("").trim_end_matches([',', ';', ')']);
             if reg == "STATUS" && (bit == "RP0" || bit == "RP1") {
                 let on = mne == "BSF";
                 if bit == "RP0" {
@@ -70,7 +74,7 @@ pub fn assign_banks(asm: &str) -> String {
         }
 
         // Byte- and bit-oriented ops: the file-register operand is the first.
-        let Some(op) = toks.next() else {
+        let Some(op) = toks.get(1).copied() else {
             out.push_str(line);
             out.push('\n');
             continue;

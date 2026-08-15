@@ -69,3 +69,31 @@ fn rejects_unbanked_sfr_operand() {
     // GPR operand and panics loudly.
     assign_banks("    MOVF 0xF0, W\n");
 }
+
+#[test]
+fn banks_bcf_on_banked_gpr() {
+    // A BCF on a banked GPR is NOT a STATUS-bank op: it must get the same
+    // BANKSEL + rewrite treatment as any other file-register operand (this
+    // regressed when the BANKSEL-recognition branch consumed the tokens before
+    // the STATUS check, silently emitting the line verbatim).
+    let asm = "    BCF 0xA0, 7\n";
+    let expected = "    BSF STATUS, RP0\n    BCF 0x20, 7\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn banks_bsf_on_banked_gpr() {
+    // Bank 2 from bank 0: RP1 only, then the operand rewritten to 0x20.
+    let asm = "    BSF 0x120, 0\n";
+    let expected = "    BSF STATUS, RP1\n    BSF 0x20, 0\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn status_banksel_and_gpr_bit_op_in_sequence() {
+    // A genuine STATUS-bank op still updates the tracked bank, and a following
+    // bit op on a same-bank GPR needs no new BANKSEL.
+    let asm = "    BSF STATUS, RP0\n    BSF 0xA0, 7\n";
+    let expected = "    BSF STATUS, RP0\n    BSF 0x20, 7\n";
+    assert_eq!(assign_banks(asm), expected);
+}
