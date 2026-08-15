@@ -214,3 +214,49 @@ fn brcond_and_select_emit_skip_lines() {
     assert!(asm.contains("GOTO tmp1"), "select end jump:\n{asm}");
     assert!(asm.contains("MOVLW 0x14"), "select copy b:\n{asm}");
 }
+
+#[test]
+fn select_labels_are_unique_across_functions() {
+    // Two functions, each containing a select. Fresh labels are file-scoped
+    // in the single .asm output, so the counter must span the whole module:
+    // the second function's labels must differ from the first's.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal o1 i8\nglobal o2 i8\n\
+         fn main() -> void\n  block entry:\n\
+           %1 = load i8 @a\n    %c1 = icmp eq i8 %1, 0\n\
+           %s1 = select i1 %c1 i8 1 i8 2\n    store i8 %s1 @o1\n    ret void\n\
+         fn f2() -> void\n  block entry:\n\
+           %2 = load i8 @b\n    %c2 = icmp eq i8 %2, 0\n\
+           %s2 = select i1 %c2 i8 3 i8 4\n    store i8 %s2 @o2\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x21), ("o1", 0x22), ("o2", 0x23)]);
+    let asm = select(&m, &addrs);
+    // Collect every emitted label *definition* (e.g. "tmp0:", not "GOTO tmp0").
+    let defs: Vec<&str> = asm
+        .lines()
+        .filter(|l| l.trim_start().starts_with("tmp") && l.ends_with(':'))
+        .collect();
+    assert_eq!(defs.len(), 4, "two selects -> 4 labels, got {defs:?}:\n{asm}");
+    let mut unique = defs.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), 4, "fresh labels must be unique across functions, got {defs:?}:\n{asm}");
+}
+
+#[test]
+fn slot_skips_icmp_scratch_0x2a() {
+    // 16 i8 loads fill common RAM (0x70..=0x7F); bank-0 GPRs then continue
+    // from 0x25. The 22nd byte-slot would land on 0x2A, the fixed icmp
+    // scratch byte. slot() must skip it so an icmp in the same function never
+    // silently corrupts that slot.
+    let loads: String = (0..21).map(|i| format!("    %a{i} = load i8 @in\n")).collect();
+    let m = parse(&format!(
+        "global in i8\nfn main() -> void\n  block entry:\n{loads}    %a21 = add i8 %a20, 1\n    ret void\n"
+    ));
+    let addrs = addrs(&[("in", 0x20)]);
+    let asm = select(&m, &addrs);
+    // a0..a15 -> 0x70..0x7F, a16..a20 -> 0x25..0x29; the 22nd slot (a21) must
+    // skip the scratch 0x2A and land at 0x2B.
+    assert!(asm.contains("MOVWF 0x2B"), "22nd slot should land at 0x2B, not the scratch:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x2A"), "no slot may write the icmp scratch 0x2A:\n{asm}");
+}
