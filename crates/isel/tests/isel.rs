@@ -1912,3 +1912,227 @@ fn assembled_cmp_predicates_run_in_sim() {
         assert_eq!(got, want, "assembled {pred}16(0x{xhi:02X}{xlo:02X},0x{yhi:02X}{ylo:02X}) must be {want}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 7, Task 4: byval / sret call ABI (caller side).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn byval_call_copies_struct_bytes_into_param_slot() {
+    // %2 = call i8 @sum(byval4 %1): the caller copies `size` bytes from the
+    // arg's pointer (an alloca slot) into the callee's byval param slot via
+    // emit_ptr_load_byte — four MOVF buf+i,W / MOVWF sum::p+i pairs — then
+    // CALL, then the retval byte into the destination. Scalar args are
+    // unchanged (covered by the earlier call tests).
+    let m = parse(
+        "global out i8\n\
+         fn sum(i8) (p=byval4)\n  block entry:\n\
+           %a = load i8 %p\n    ret i8 %a\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = alloca 4\n    %2 = call i8 @sum(byval4 %1)\n    store i8 %2 @out\n    ret void\n",
+    );
+    // out=0x21; main's frame: %1 (alloca, 4 bytes)=0x25, %2=0x29; sum's
+    // frame: p (byval, 4 bytes)=0x2B, %a=0x2F.
+    let addrs = addrs(&[
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x29),
+        ("sum::p", 0x2B),
+        ("sum::a", 0x2F),
+    ]);
+    let asm = select(&m, &addrs);
+    // The size-byte copy: alloca bytes 0x25..0x28 -> param slot 0x2B..0x2E.
+    for i in 0..4u16 {
+        assert!(
+            asm.contains(&format!("MOVF 0x{:02X}, W\n    MOVWF 0x{:02X}", 0x25 + i, 0x2B + i)),
+            "byval byte {i} copy (buf+{i} -> sum::p+{i}):\n{asm}"
+        );
+    }
+    assert!(asm.contains("    CALL sum"), "CALL sum:\n{asm}");
+    // Retval copy: fixed retval 0x71 -> %2 (0x29).
+    assert!(
+        asm.contains("MOVF 0x71, W\n    MOVWF 0x29"),
+        "retval copy into %2:\n{asm}"
+    );
+}
+
+#[test]
+fn sret_call_stores_target_address_into_param_slot() {
+    // call void @make(sret %1): the callee's sret param slot (2 bytes)
+    // holds the target address — MOVLW LOW(addr); MOVWF r; MOVLW HIGH(addr);
+    // MOVWF r+1, with the target asserted <= 0xFF (bank-0 FSR reachability).
+    let m = parse(
+        "fn make(void) (r=sret)\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = alloca 4\n    call void @make(sret %1)\n    ret void\n",
+    );
+    // main's frame: %1 (alloca)=0x25; make's frame: r (sret, 2 bytes)=0x2F.
+    let addrs = addrs(&[("main::1", 0x25), ("make::r", 0x2F)]);
+    let asm = select(&m, &addrs);
+    assert!(
+        asm.contains("MOVLW 0x25\n    MOVWF 0x2F\n    MOVLW 0x00\n    MOVWF 0x30"),
+        "address store into sret param slot:\n{asm}"
+    );
+}
+
+#[test]
+fn sret_call_with_global_target_stores_global_address() {
+    // The sret target may be a global; the callee's sret param slot then
+    // holds @g's address.
+    let m = parse(
+        "global g i8\nfn make(void) (r=sret)\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    call void @make(sret @g)\n    ret void\n",
+    );
+    let addrs = addrs(&[("g", 0x20), ("make::r", 0x2F)]);
+    let asm = select(&m, &addrs);
+    assert!(
+        asm.contains("MOVLW 0x20\n    MOVWF 0x2F\n    MOVLW 0x00\n    MOVWF 0x30"),
+        "global address store into sret param slot:\n{asm}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "bank-0")]
+fn panics_on_banked_sret_target() {
+    // The sret target must be FSR-reachable (low 256 bytes; IRP is a later
+    // milestone): a target past 0xFF fails loudly rather than emitting an
+    // address FSR cannot reach.
+    let m = parse(
+        "fn make(void) (r=sret)\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = alloca 4\n    call void @make(sret %1)\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::1", 0x120), ("make::r", 0x2F)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn byval_call_sum_pair_simulates() {
+    // Caller builds a Pair {i8 a, i16 b} in an alloca (a=0x03 at +0,
+    // b=0x1234 at +2), calls sum(byval4): the caller copies the 4 bytes into
+    // sum's param slot and the callee reads the copy back through a GEP.
+    // Result a + b = 3 + 0x34 = 0x37.
+    let ir = "global out i8\n\
+         fn sum(i8) (p=byval4)\n  block entry:\n\
+           %a = load i8 %p\n\
+           %q = gep %p +2\n\
+           %b = load i16 %q\n\
+           %x = zext i8 %a to i16\n\
+           %s = add i16 %x, %b\n\
+           %t = trunc i16 %s to i8\n\
+           ret i8 %t\n\
+         fn main(void) ()\n  block entry:\n\
+           %buf = alloca 4\n\
+           store i8 3 %buf\n\
+           %p2 = gep %buf +2\n\
+           store i16 4660 %p2\n\
+           %r = call i8 @sum(byval4 %buf)\n\
+           store i8 %r @out\n\
+           ret void\n";
+    let map = [
+        ("out", 0x20u16),
+        ("main::buf", 0x25),
+        ("main::r", 0x29),
+        ("sum::p", 0x2B),
+        ("sum::a", 0x2F),
+        ("sum::b", 0x30),
+        ("sum::x", 0x32),
+        ("sum::s", 0x34),
+        ("sum::t", 0x36),
+    ];
+    let m = parse(ir);
+    let asm = select(&m, &addrs(&map));
+    // The caller's 4-byte copy: buf(0x25..0x28) -> sum::p(0x2B..0x2E).
+    assert!(
+        asm.contains(
+            "MOVF 0x25, W\n    MOVWF 0x2B\n    MOVF 0x26, W\n    MOVWF 0x2C\n    \
+             MOVF 0x27, W\n    MOVWF 0x2D\n    MOVF 0x28, W\n    MOVWF 0x2E"
+        ),
+        "4-byte byval copy:\n{asm}"
+    );
+    assert_eq!(sim_run(ir, &map, &[], 0x20), 0x37, "sum(3, 0x1234)");
+}
+
+#[test]
+fn sret_call_make_simulates() {
+    // make() writes the struct fields through the sret pointer (r.a = 0x12,
+    // r.b = 0x1234); the caller passes its alloca as the target, then reads
+    // the fields back — both bytes of the i16 asserted.
+    let ir = "global oa i8\nglobal ob i16\n\
+         fn make(void) (r=sret)\n  block entry:\n\
+           store i8 18 %r\n\
+           %p = gep %r +2\n\
+           store i16 4660 %p\n\
+           ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           %buf = alloca 4\n\
+           call void @make(sret %buf)\n\
+           %a = load i8 %buf\n\
+           %q = gep %buf +2\n\
+           %b = load i16 %q\n\
+           store i8 %a @oa\n\
+           store i16 %b @ob\n\
+           ret void\n";
+    let map = [
+        ("oa", 0x20u16),
+        ("ob", 0x21),
+        ("make::r", 0x25),
+        ("main::buf", 0x27),
+        ("main::a", 0x2B),
+        ("main::b", 0x2C),
+    ];
+    use pic14_sim::Pic14;
+    let m = parse(ir);
+    let asm = select(&m, &addrs(&map));
+    // The address store: main::buf (0x27) -> make::r (0x25/0x26).
+    assert!(
+        asm.contains("MOVLW 0x27\n    MOVWF 0x25\n    MOVLW 0x00\n    MOVWF 0x26"),
+        "sret address store:\n{asm}"
+    );
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(p.ram()[0x20], 0x12, "oa = r.a");
+    assert_eq!(p.ram()[0x21], 0x34, "ob lo = r.b lo");
+    assert_eq!(p.ram()[0x22], 0x12, "ob hi = r.b hi");
+}
+
+#[test]
+fn byval_call_with_global_arg_simulates() {
+    // The s6 f(g) pattern: sum(byval4 @g) — the byval arg is a global
+    // struct; the caller copies the 4 bytes @g..@g+3 into sum's param slot
+    // and the callee reads the copy.
+    let ir = "global g i8\nglobal out i8\n\
+         fn sum(i8) (p=byval4)\n  block entry:\n\
+           %a = load i8 %p\n\
+           %q = gep %p +2\n\
+           %b = load i16 %q\n\
+           %x = zext i8 %a to i16\n\
+           %s = add i16 %x, %b\n\
+           %t = trunc i16 %s to i8\n\
+           ret i8 %t\n\
+         fn main(void) ()\n  block entry:\n\
+           %r = call i8 @sum(byval4 @g)\n\
+           store i8 %r @out\n\
+           ret void\n";
+    let map = [
+        ("g", 0x20u16),
+        ("out", 0x24),
+        ("main::r", 0x29),
+        ("sum::p", 0x2B),
+        ("sum::a", 0x2F),
+        ("sum::b", 0x30),
+        ("sum::x", 0x32),
+        ("sum::s", 0x34),
+        ("sum::t", 0x36),
+    ];
+    let m = parse(ir);
+    let asm = select(&m, &addrs(&map));
+    assert!(
+        asm.contains("MOVF 0x20, W\n    MOVWF 0x2B"),
+        "copy @g byte 0 into sum::p:\n{asm}"
+    );
+    let seed = [(0x20u16, 3u8), (0x21, 0x00), (0x22, 0x34), (0x23, 0x12)];
+    assert_eq!(sim_run(ir, &map, &seed, 0x24), 0x37, "sum(g) with g = {{3, 0x1234}}");
+}

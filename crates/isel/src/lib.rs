@@ -710,8 +710,57 @@ impl<'m> Gen<'m> {
         for (i, arg) in args.iter().enumerate() {
             let pname = &callee.params[i].name;
             let pa = self.slot_addr(func, pname);
-            let aty = arg.ty.expect("isel stub: pointer (byval/sret) call args are Task 4");
-            self.emit_move_val_to_slot(&arg.val, aty, pa);
+            if let Some(size) = arg.byval {
+                // byval: copy `size` bytes from the arg's pointer (global /
+                // alloca slot / GEP reg) into the callee's param slot — the
+                // param slot IS the callee's struct copy (Slot(name, false)),
+                // byte by byte through the shared pointer machinery.
+                assert_eq!(
+                    size,
+                    callee.params[i].byval.expect("isel: byval arg for a non-byval param"),
+                    "isel: byval size mismatch for arg {i} of @{func}"
+                );
+                for b in 0..size {
+                    self.emit_ptr_load_byte(&arg.val, b);
+                    self.emit(format!("    MOVWF 0x{:02X}", pa + u16::from(b)));
+                }
+            } else if arg.sret {
+                // sret: store the target address into the callee's sret param
+                // slot (2 bytes). The target is a global or a plain alloca
+                // slot; FSR reaches only the low 256 bytes (bank 0 — IRP is a
+                // later milestone), so a target past 0xFF fails loudly rather
+                // than emitting an address FSR cannot reach.
+                let addr = match &arg.val {
+                    Val::Global(g) => self.global_addr(g),
+                    Val::Reg(r) => {
+                        let (base, k, terms) = self.resolved_for(r);
+                        assert!(
+                            k == 0 && terms.is_empty(),
+                            "isel: sret target must be a plain global or alloca slot (no offset)"
+                        );
+                        match base {
+                            Base::Global(name) => self.global_addr(&name),
+                            Base::Slot(sname, false) => self.slot_addr(self.cur_func, &sname),
+                            Base::Slot(_, true) => {
+                                panic!("isel: sret target cannot be an indirect (sret) slot")
+                            }
+                        }
+                    }
+                    Val::Const(_) => panic!("isel: sret target must be a global or an alloca slot"),
+                };
+                assert!(
+                    addr <= 0xFF,
+                    "isel: sret target 0x{addr:02X} out of bank-0 FSR range (IRP follow-up)"
+                );
+                self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+            } else {
+                // Scalar args: unchanged.
+                let aty = arg.ty.expect("isel: scalar call arg must carry a type");
+                self.emit_move_val_to_slot(&arg.val, aty, pa);
+            }
         }
         self.emit(format!("    CALL {func}"));
         if let Some(d) = dst {
