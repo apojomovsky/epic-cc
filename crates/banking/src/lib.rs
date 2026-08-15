@@ -1,34 +1,115 @@
 /// Assign GPR banks to file-register operands.
 ///
-/// Milestone 1: bank-0-only. Every file-register operand must be in the
-/// `0x00..=0x7F` range (bank 0 / common), so no `BANKSEL` is required.
-/// The assembly text is returned unchanged.
+/// Milestone 4: the isel stage emits physical (fully-paged) addresses. This
+/// pass scans the assembly, infers each file-register operand's memory bank
+/// from its address, inserts a `BANKSEL` when the tracked current bank
+/// differs, and rewrites the operand to the 7-bit bank-relative address
+/// (`physical & 0x7F`). SFRs (`0x00..=0x1F`) and the common GPR block
+/// (`0x70..=0x7F`) need no banking. Literal-immediate ops are skipped.
+///
+/// `BANKSEL <n>` selects bank `n` by setting/clearing the two RP bits of
+/// `STATUS` (RP0 = bit 5, RP1 = bit 6); only the bits that change are
+/// emitted (`BCF`/`BSF STATUS, RP0/RP1`).
 ///
 /// # Panics
 ///
-/// Panics if any file-register `0x...` operand is `>= 0x80` (outside the
-/// bank-0/1/2/3 GPR range supported by milestone 1). Literal-immediate
-/// operands (`MOVLW`/`ADDLW`/`ANDLW`/`IORLW`/`XORLW`/`SUBLW`/`RETLW`) are
-/// 8-bit constants, not addresses, and are not range-checked.
+/// Panics if any file-register operand lies in an SFR/unused range
+/// (`0x80..=0x9F`, `0xF0..=0xFF`, `0x170..=0x18F`, ...) that must never be
+/// emitted as a GPR address.
+fn bank_of(v: u16) -> Option<u8> {
+    match v {
+        0x00..=0x1F => None, // SFR
+        0x20..=0x6F => Some(0),
+        0x70..=0x7F => None, // common
+        0xA0..=0xEF => Some(1),
+        0x120..=0x16F => Some(2),
+        0x190..=0x1EF => Some(3),
+        other => panic!("banking: operand 0x{other:03X} is not a banked GPR address"),
+    }
+}
+
+const LITERAL_OPS: [&str; 7] = ["MOVLW", "ADDLW", "ANDLW", "IORLW", "XORLW", "SUBLW", "RETLW"];
+
+/// Insert `BANKSEL` before file-register operands whose bank differs from the
+/// tracked current bank, and rewrite banked operands to `physical & 0x7F`.
 pub fn assign_banks(asm: &str) -> String {
+    let mut out = String::new();
+    let mut rp0 = false; // STATUS, bit 5
+    let mut rp1 = false; // STATUS, bit 6
     for line in asm.lines() {
-        let mne = line.split_whitespace().next().unwrap_or("");
-        if matches!(
-            mne,
-            "MOVLW" | "ADDLW" | "ANDLW" | "IORLW" | "XORLW" | "SUBLW" | "RETLW"
-        ) {
-            continue; // operand is a literal immediate, not a file register
+        let mut toks = line.trim_start().split_whitespace();
+        let Some(mne) = toks.next() else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+
+        // `BCF/BSF STATUS, RP0/RP1` — whether emitted here or already present
+        // — update the tracked bank.
+        if mne == "BCF" || mne == "BSF" {
+            let reg = toks.next().unwrap_or("").trim_end_matches([',', ';', ')']);
+            let bit = toks.next().unwrap_or("").trim_end_matches([',', ';', ')']);
+            if reg == "STATUS" && (bit == "RP0" || bit == "RP1") {
+                let on = mne == "BSF";
+                if bit == "RP0" {
+                    rp0 = on;
+                } else {
+                    rp1 = on;
+                }
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
         }
-        for tok in line.split_whitespace() {
-            if let Some(hex) = tok.strip_prefix("0x") {
-                // operands carry trailing punctuation (e.g. `0x20,`)
-                let hex = hex.trim_end_matches([',', ';', ')']);
-                let v = u16::from_str_radix(hex, 16).unwrap();
-                if v >= 0x80 {
-                    panic!("banking: operand 0x{v:02X} is outside bank 0/1/2/3 GPR range (milestone 1: bank 0 only)");
+
+        // Literal-immediate ops take an 8-bit constant, not a file register.
+        if LITERAL_OPS.contains(&mne) {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        // Byte- and bit-oriented ops: the file-register operand is the first.
+        let Some(op) = toks.next() else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if let Some(hex) = op.trim_end_matches([',', ';', ')']).strip_prefix("0x") {
+            if let Ok(v) = u16::from_str_radix(hex, 16) {
+                if let Some(bank) = bank_of(v) {
+                    let cur = u8::from(rp0) | (u8::from(rp1) << 1);
+                    if bank != cur {
+                        emit_banksel(&mut out, &mut rp0, &mut rp1, bank);
+                    }
+                    let rewritten = v & 0x7F;
+                    if rewritten != v {
+                        out.push_str(&line.replacen(
+                            &format!("0x{v:02X}"),
+                            &format!("0x{rewritten:02X}"),
+                            1,
+                        ));
+                        out.push('\n');
+                        continue;
+                    }
                 }
             }
         }
+        out.push_str(line);
+        out.push('\n');
     }
-    asm.to_string()
+    out
+}
+
+fn emit_banksel(out: &mut String, rp0: &mut bool, rp1: &mut bool, bank: u8) {
+    for (name, cur, target) in [
+        ("RP0", rp0, bank & 1 == 1),
+        ("RP1", rp1, bank & 2 == 2),
+    ] {
+        if *cur != target {
+            let op = if target { "BSF" } else { "BCF" };
+            out.push_str(&format!("    {op} STATUS, {name}\n"));
+            *cur = target;
+        }
+    }
 }
