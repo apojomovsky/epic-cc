@@ -41,6 +41,35 @@ fn ssa_key(func: &str, name: &str) -> String {
     format!("{func}::{name}")
 }
 
+/// The runtime routine names legalize injects for mul/div/rem/shift. The ten
+/// mul/div/rem routines have recipe bodies (Task 3); the six shift routines
+/// are Task 4. An injected routine's entry block holds only a scratch alloca,
+/// so emitting it as-is would produce an empty label that silently falls
+/// through into the next function — a routine name with no recipe yet must
+/// panic loudly instead.
+const ROUTINE_NAMES: [&str; 16] = [
+    "__mul_u8",
+    "__mul_u16",
+    "__udiv_u8",
+    "__urem_u8",
+    "__udiv_u16",
+    "__urem_u16",
+    "__sdiv_i8",
+    "__srem_i8",
+    "__sdiv_i16",
+    "__srem_i16",
+    "__shl_u8",
+    "__lshr_u8",
+    "__ashr_i8",
+    "__shl_u16",
+    "__lshr_u16",
+    "__ashr_i16",
+];
+
+fn is_routine_name(name: &str) -> bool {
+    ROUTINE_NAMES.contains(&name)
+}
+
 /// A resolved GEP base: a named global (`@g`) or a local slot. A slot may
 /// be *indirect* (an sret param): it holds the target address, so FSR is
 /// taken from its contents rather than the slot itself being the base.
@@ -1193,6 +1222,16 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             tmp: &mut tmp,
             out: Vec::new(),
         };
+        // Runtime routines (legalize-injected): the entry block holds only
+        // the scratch alloca, so emitting it as-is would silently fall
+        // through into the next function — an empty routine label is a
+        // no-op CALL. Panic loudly until the recipe bodies land.
+        if is_routine_name(&f.name) {
+            panic!(
+                "isel: runtime routine @{} not implemented (recipe missing; empty label would silently fall through)",
+                f.name
+            );
+        }
         // Block label scheme: the entry block uses the bare function name
         // (so CALLs and GOTOs resolve to it); every other block is
         // `{func}_L{label}`. The entry block's label is emitted by the block
