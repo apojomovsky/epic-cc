@@ -1,5 +1,5 @@
 use std::fs;
-use callgraph::{build, check_depth};
+use callgraph::{build, check_depth, edges_text};
 use ir::parse;
 
 fn main() {
@@ -8,11 +8,7 @@ fn main() {
     let m = parse(&src);
     let g = build(&m);
     check_depth(&g, 8);
-    let mut out = String::new();
-    for (from, to) in &g.edges {
-        out.push_str(&format!("{from} -> {to}\n"));
-    }
-    out.push_str(&format!("depth {}\n", g.max_depth));
+    let mut out = edges_text(&g);
     for f in &m.funcs {
         out.push_str(&format!("fn {}\n", f.name));
     }

@@ -1,4 +1,4 @@
-use callgraph::{build, check_depth};
+use callgraph::{build, check_depth, edges_text};
 use ir::parse;
 
 #[test]
@@ -41,4 +41,18 @@ fn long_chain_depth_check() {
     assert_eq!(g.max_depth, 3);
     check_depth(&g, 8);
     assert!(std::panic::catch_unwind(|| check_depth(&g, 2)).is_err());
+}
+
+#[test]
+fn edges_text_parseable_format() {
+    let m = parse(
+        "fn main() -> void\n  block entry:\n    call void @a()\n    call void @b()\n    ret void\n\
+         fn a() -> void\n  block entry:\n    ret void\n\
+         fn b() -> void\n  block entry:\n    ret void\n",
+    );
+    let g = build(&m);
+    let text = edges_text(&g);
+    assert!(text.contains("edge main a\n"));
+    assert!(text.contains("edge main b\n"));
+    assert!(text.contains("depth 2\n"));
 }

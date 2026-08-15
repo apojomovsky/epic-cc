@@ -58,6 +58,17 @@ fn dfs_depth(
     deepest
 }
 
+/// Render the call graph as a parseable edge list: one `edge <caller> <callee>`
+/// line per edge, then `depth <max_depth>`. Consumed by the alloc stage.
+pub fn edges_text(g: &CallGraph) -> String {
+    let mut out = String::new();
+    for (from, to) in &g.edges {
+        out.push_str(&format!("edge {from} {to}\n"));
+    }
+    out.push_str(&format!("depth {}\n", g.max_depth));
+    out
+}
+
 pub fn check_depth(g: &CallGraph, limit: usize) {
     assert!(g.max_depth <= limit, "callgraph: depth {} exceeds hardware stack {limit}", g.max_depth);
 }
