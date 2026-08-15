@@ -595,3 +595,63 @@ define dso_local void @main() {
 "#;
     let _ = parse_ll(ll);
 }
+
+// Milestone 8: mul/udiv/shl/lshr (m3) and sdiv/srem/ashr (m4) probe shapes,
+// plus `freeze`. `volatile` is stripped like any other attr.
+const M3_M4_BINOPS: &str = r#"
+@in = dso_local global i16 0, align 2
+@out = dso_local global i16 0, align 2
+define dso_local void @main() {
+  %1 = load volatile i16, ptr @in, align 2
+  %2 = freeze i16 %1
+  %3 = udiv i16 %2, 7
+  %4 = mul i16 %3, 7
+  %7 = shl i16 %4, 3
+  %9 = lshr i16 %7, 1
+  %10 = sdiv i16 %9, -3
+  %11 = srem i16 %10, 3
+  %12 = ashr i16 %11, 2
+  store volatile i16 %12, ptr @out, align 2
+  ret void
+}
+"#;
+
+#[test]
+fn parses_m3_m4_binops_and_freeze() {
+    let m = parse_ll(M3_M4_BINOPS);
+    let body = &m.funcs[0].blocks[0].insts;
+
+    // freeze: canonical `%d = freeze <ty> <val>`
+    match &body[1] {
+        Inst::Freeze(f) => {
+            assert_eq!(f.dst, "2");
+            assert_eq!(f.ty, ir::Ty::I16);
+            assert_eq!(f.val, Val::Reg("1".to_string()));
+        }
+        other => panic!("expected Freeze, got {other:?}"),
+    }
+
+    // each new binop opcode maps to the matching BinOp
+    let binned: Vec<(String, ir::BinOp)> = body
+        .iter()
+        .filter_map(|i| match i {
+            Inst::Bin(b) => Some((b.dst.clone(), b.op)),
+            _ => None,
+        })
+        .collect();
+    let expected = [
+        ("3", ir::BinOp::UDiv),
+        ("4", ir::BinOp::Mul),
+        ("7", ir::BinOp::Shl),
+        ("9", ir::BinOp::LShr),
+        ("10", ir::BinOp::SDiv),
+        ("11", ir::BinOp::SRem),
+        ("12", ir::BinOp::AShr),
+    ];
+    for (dst, op) in expected {
+        assert!(
+            binned.contains(&(dst.to_string(), op)),
+            "missing {dst} {op:?} in {body:?}"
+        );
+    }
+}

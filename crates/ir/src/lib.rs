@@ -11,7 +11,7 @@ impl Ty {
 pub enum Val { Reg(String), Const(i64), Global(String) }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BinOp { Add, Sub, And, Or, Xor }
+pub enum BinOp { Add, Sub, And, Or, Xor, Mul, UDiv, URem, SDiv, SRem, Shl, LShr, AShr }
 
 /// A GEP base: a named global (`@g`) or a pointer SSA register (`%r` — the
 /// result of an alloca, a byval/sret param, or another GEP).
@@ -58,6 +58,11 @@ pub struct Alloca { pub dst: String, pub size: u8 }
 /// `memcpy`: byte-copy `len` bytes from `src` to `dst` (defines nothing).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Memcpy { pub dst: Val, pub src: Val, pub len: u8 }
+/// `freeze`: LLVM freeze (`%d = freeze <ty> <val>`). A no-op in the backend —
+/// it exists so the IR round-trips the source; isel lowers it as a plain byte
+/// copy of `val` into the `dst` slot.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Freeze { pub dst: String, pub ty: Ty, pub val: Val }
 
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -77,6 +82,7 @@ pub enum Inst {
     Gep(Gep),
     Alloca(Alloca),
     Memcpy(Memcpy),
+    Freeze(Freeze),
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +173,7 @@ fn inst_str(i: &Inst) -> String {
         }
         Inst::Alloca(a) => format!("%{} = alloca {}", a.dst, a.size),
         Inst::Memcpy(m) => format!("memcpy {} {} {}", val_str(&m.dst), val_str(&m.src), m.len),
+        Inst::Freeze(f) => format!("%{} = freeze {} {}", f.dst, ty_str(f.ty), val_str(&f.val)),
     }
 }
 
@@ -183,7 +190,23 @@ fn call_args_str(args: &[CallArg]) -> String {
     args.iter().map(call_arg_str).collect::<Vec<_>>().join(", ")
 }
 
-fn op_str(o: BinOp) -> &'static str { match o { BinOp::Add => "add", BinOp::Sub => "sub", BinOp::And => "and", BinOp::Or => "or", BinOp::Xor => "xor" } }
+fn op_str(o: BinOp) -> &'static str {
+    match o {
+        BinOp::Add => "add",
+        BinOp::Sub => "sub",
+        BinOp::And => "and",
+        BinOp::Or => "or",
+        BinOp::Xor => "xor",
+        BinOp::Mul => "mul",
+        BinOp::UDiv => "udiv",
+        BinOp::URem => "urem",
+        BinOp::SDiv => "sdiv",
+        BinOp::SRem => "srem",
+        BinOp::Shl => "shl",
+        BinOp::LShr => "lshr",
+        BinOp::AShr => "ashr",
+    }
+}
 
 /// Index of the `)` matching the `(` at `open` in `s`.
 fn matching_paren(s: &str, open: usize) -> usize {
@@ -449,11 +472,32 @@ fn parse_inst(line: &str) -> Inst {
         let (base, k, terms) = parse_gep_expr(rest);
         return Inst::Gep(Gep { dst, base, k, terms });
     }
+    if let Some(rest) = body.strip_prefix("freeze ") {
+        let mut it = rest.split_whitespace();
+        let t = parse_ty(it.next().unwrap());
+        let val = parse_val(it.next().unwrap());
+        return Inst::Freeze(Freeze { dst, ty: t, val });
+    }
     let mut it = body.split_whitespace();
     let op = it.next().unwrap();
     let t = parse_ty(it.next().unwrap());
     let a = parse_val(it.next().unwrap());
     let b = parse_val(it.next().unwrap());
-    let op = match op { "add" => BinOp::Add, "sub" => BinOp::Sub, "and" => BinOp::And, "or" => BinOp::Or, "xor" => BinOp::Xor, other => panic!("unsupported op {other}") };
+    let op = match op {
+        "add" => BinOp::Add,
+        "sub" => BinOp::Sub,
+        "and" => BinOp::And,
+        "or" => BinOp::Or,
+        "xor" => BinOp::Xor,
+        "mul" => BinOp::Mul,
+        "udiv" => BinOp::UDiv,
+        "urem" => BinOp::URem,
+        "sdiv" => BinOp::SDiv,
+        "srem" => BinOp::SRem,
+        "shl" => BinOp::Shl,
+        "lshr" => BinOp::LShr,
+        "ashr" => BinOp::AShr,
+        other => panic!("unsupported op {other}"),
+    };
     Inst::Bin(Bin { dst, op, ty: t, a, b })
 }

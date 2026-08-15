@@ -902,8 +902,25 @@ impl<'m> Gen<'m> {
                         );
                         self.emit_sub16(&b.a, &b.b, da);
                     }
+                    // Milestone-8 binops: real lowerings land in Task 3; until
+                    // then any occurrence must fail loudly, never silently
+                    // miscompile.
+                    (BinOp::Mul, _) => panic!("isel: mul not yet lowered (Task 3)"),
+                    (BinOp::UDiv, _) => panic!("isel: udiv not yet lowered (Task 3)"),
+                    (BinOp::URem, _) => panic!("isel: urem not yet lowered (Task 3)"),
+                    (BinOp::SDiv, _) => panic!("isel: sdiv not yet lowered (Task 3)"),
+                    (BinOp::SRem, _) => panic!("isel: srem not yet lowered (Task 3)"),
+                    (BinOp::Shl, _) => panic!("isel: shl not yet lowered (Task 3)"),
+                    (BinOp::LShr, _) => panic!("isel: lshr not yet lowered (Task 3)"),
+                    (BinOp::AShr, _) => panic!("isel: ashr not yet lowered (Task 3)"),
                     _ => panic!("isel: unsupported binop for milestone 2"),
                 }
+            }
+            // freeze is a no-op in the backend: copy `val` byte-for-byte into
+            // the dst slot (same shape as emit_move_val_to_slot).
+            Inst::Freeze(f) => {
+                let da = self.slot_addr(self.cur_func, &f.dst);
+                self.emit_move_val_to_slot(&f.val, f.ty, da);
             }
             Inst::Zext(z) => {
                 assert!(
