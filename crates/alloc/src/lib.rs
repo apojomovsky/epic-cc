@@ -1,62 +1,121 @@
 //! Overlay address allocation for the PIC8 pipeline.
 //!
-//! Globals get sequential, even-aligned (i16) bank-0 addresses starting at
+//! Globals get sequential, even-aligned (i16) addresses starting at
 //! `GLOBAL_START`. Every local of every function lives in a frame assigned
 //! from the call graph: `base(f) = max over callers of (base(caller) +
-//! locals_size(caller))`, roots start at `bank0_start`, so sibling functions
-//! (never co-live) share RAM. Frames are checked to fit in bank 0.
+//! locals_size(caller))`, roots start after the globals, so sibling functions
+//! (never co-live) share RAM.
+//!
+//! Both allocators assign **physical** addresses and step through the four
+//! banks: bank 0 GPR `0x20-0x6F`, bank 1 `0xA0-0xEF`, bank 2 `0x120-0x16F`,
+//! bank 3 `0x190-0x1EF`; demand past `0x1EF` panics. Common RAM (`0x70-0x7F`)
+//! is never used by locals (M3 decision) — the bank progression jumps past
+//! it — and holds the fixed scratch/retval bytes instead.
 
 use std::collections::{HashMap, HashSet};
 
 use ir::{Inst, Module};
 
 pub const GLOBAL_START: u8 = 0x20;
-/// Bank-0 GPRs run 0x00..0x6F; common RAM starts at 0x70. Frames must end
-/// before 0x70 (`base + locals_size <= 0x70`).
-const BANK0_END: u16 = 0x70;
 
 /// Complete address map: globals keyed by name, locals keyed `{func}::{name}`,
-/// plus the total bank-0 span the overlay needs.
+/// plus the total overlay span (in bytes) across all banks.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct AllocLayout {
-    pub globals: HashMap<String, u8>,
-    pub locals: HashMap<String, u8>,
+    pub globals: HashMap<String, u16>,
+    pub locals: HashMap<String, u16>,
     pub total_bank0: u16,
 }
 
-/// Assign every address: globals as milestone-2 (sequential, even-aligned i16),
-/// locals per the overlay algorithm over the call graph parsed from
-/// `edges_text` (`edge <caller> <callee>` lines, order-agnostic; `depth` lines
-/// are informational). Panics loudly on a cyclic or unknown-function call
-/// graph, and if any frame exceeds bank 0.
+/// Inclusive physical-address range of the GPR region that contains `addr`,
+/// advancing to the next bank when `addr` has spilled past the current one.
+/// Common RAM (`0x70-0x7F`) and SFRs fall into the next bank's range, so
+/// locals never land in common RAM.
+fn region_for(addr: u16) -> (u16, u16) {
+    if addr <= 0x6F {
+        (0x20, 0x6F)
+    } else if addr <= 0xEF {
+        (0xA0, 0xEF)
+    } else if addr <= 0x16F {
+        (0x120, 0x16F)
+    } else if addr <= 0x1EF {
+        (0x190, 0x1EF)
+    } else {
+        panic!("alloc: GPR demand exceeds 0x1EF ({addr:#06x})");
+    }
+}
+
+/// The start address for a `width`-byte value placed at the next free address
+/// `addr`: step across banks when `addr` has passed a region's end, keep the
+/// value even-aligned within its bank region, and panic past `0x1EF`.
+fn place_at(addr: u16, width: u8) -> u16 {
+    let mut a = addr;
+    loop {
+        let (start, end) = region_for(a);
+        let mut base = a.max(start);
+        if base % u16::from(width) != 0 {
+            base += u16::from(width) - (base % u16::from(width));
+        }
+        if base + u16::from(width) - 1 <= end {
+            return base;
+        }
+        // The value doesn't fit in this region; continue just past its end.
+        a = end + 1;
+    }
+}
+
+/// The start address for a `width`-byte local placed contiguously at the next
+/// free frame byte `addr`: step across banks when `addr` has passed a
+/// region's end, and panic past `0x1EF`. Locals are NOT even-aligned — the
+/// overlay frame math (M3) is a plain byte sum `base(f) = max(callers) of
+/// base + locals_size`, so placing locals contiguously keeps a frame's actual
+/// footprint exactly equal to `locals_size(f)`. The bank progression starts
+/// every region on an even address, so i16s placed there are naturally
+/// even-aligned within each bank.
+fn place_contiguous(addr: u16, width: u8) -> u16 {
+    let mut a = addr;
+    loop {
+        let (start, end) = region_for(a);
+        let base = a.max(start);
+        if base + u16::from(width) - 1 <= end {
+            return base;
+        }
+        // The local doesn't fit in this region; continue past its end.
+        a = end + 1;
+    }
+}
+
+/// Assign every address: globals sequential (even-aligned i16, stepping
+/// through banks), locals per the overlay algorithm over the call graph parsed
+/// from `edges_text` (`edge <caller> <callee>` lines, order-agnostic; `depth`
+/// lines are informational). Panics loudly on a cyclic or unknown-function
+/// call graph, and if total demand exceeds `0x1EF`.
 pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
-    // 1. Globals: sequential, aligned to the type width (i16 -> even address).
-    let mut globals: HashMap<String, u8> = HashMap::new();
-    let mut addr = GLOBAL_START;
+    // 1. Globals: sequential, aligned to the type width (i16 -> even address),
+    // stepping through the banks as bank 0 GPR fills up.
+    let mut globals: HashMap<String, u16> = HashMap::new();
+    let mut addr: u16 = u16::from(GLOBAL_START);
     for g in &m.globals {
         if g.is_const {
             continue;
         }
         let width = g.ty.bytes();
-        if addr % width != 0 {
-            addr += width - (addr % width);
-        }
-        globals.insert(g.name.clone(), addr);
-        addr += width;
+        let start = place_at(addr, width);
+        globals.insert(g.name.clone(), start);
+        addr = start + u16::from(width);
     }
 
     // end_of_globals = max over the address map of (addr + width), floored at
-    // GLOBAL_START (mirrors isel's layout computation); the scratch byte, the
-    // two retval bytes and the first frame base follow it.
-    let end_of_globals = m.globals.iter().fold(GLOBAL_START, |end, g| {
+    // GLOBAL_START (mirrors isel's layout computation). The scratch/retval
+    // bytes now live in fixed common RAM (0x70-0x72), so the first frame base
+    // follows the globals directly.
+    let end_of_globals = m.globals.iter().fold(u16::from(GLOBAL_START), |end, g| {
         match globals.get(&g.name) {
-            Some(&a) => end.max(a.wrapping_add(g.ty.bytes())),
+            Some(&a) => end.max(a + u16::from(g.ty.bytes())),
             None => end,
         }
     });
-    let bank0_start = end_of_globals
-        .checked_add(3)
-        .expect("alloc: globals end too close to the top of RAM");
+    let bank0_start = end_of_globals;
 
     // 2. locals_size(f) = sum of Ty::bytes() over f's params and defined
     // values, each name counted once (phi destinations are defined values;
@@ -189,31 +248,24 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
                 .map(|p| base[p] + locals_size[p])
                 .max()
                 .expect("alloc: empty caller list"),
-            None => u16::from(bank0_start),
+            None => bank0_start,
         };
         base.insert(f.clone(), b);
     }
 
-    // 7. Frame check + local addresses: each local at base(f) + offset, in IR
-    // order (params first, then defined values in instruction order).
-    let mut locals: HashMap<String, u8> = HashMap::new();
+    // 7. Local addresses: each local at the next free frame byte, in IR
+    // order (params first, then defined values in instruction order), stepping
+    // through the banks. `place_at` panics if a frame exceeds 0x1EF.
+    let mut locals: HashMap<String, u16> = HashMap::new();
     for f in &m.funcs {
         let b = base[&f.name];
-        let size = locals_size[&f.name];
-        assert!(
-            b + size <= BANK0_END,
-            "alloc: frame for {} spans 0x{:02X}..0x{:02X}, exceeds bank 0 (past 0x{:02X})",
-            f.name,
-            b,
-            b + size,
-            BANK0_END - 1
-        );
-        let mut off: u16 = 0;
+        let mut addr = b;
         let mut seen: HashSet<String> = HashSet::new();
         let mut place = |name: &str, width: u8| {
             if seen.insert(name.to_string()) {
-                locals.insert(format!("{}::{name}", f.name), (b + off) as u8);
-                off += u16::from(width);
+                let start = place_contiguous(addr, width);
+                locals.insert(format!("{}::{name}", f.name), start);
+                addr = start + u16::from(width);
             }
         };
         for (ty, name) in &f.params {

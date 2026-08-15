@@ -47,7 +47,7 @@ fn main() {
 
     // 7. isel: IR -> PIC14 assembly. Locals are keyed `{func}::{name}` in
     // the map, matching what isel looks up for every value.
-    let mut addrs: HashMap<String, u8> = HashMap::new();
+    let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals);
     addrs.extend(layout.locals);
     let asm = isel::select(&m, &addrs);

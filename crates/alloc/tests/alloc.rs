@@ -51,8 +51,10 @@ fn sibling_frames_share_a_base() {
     assert_eq!(out.locals["a::a0"], out.locals["b::b0"]);
     assert_eq!(out.locals["a::a1"], out.locals["b::b1"]);
     // (b) main's local sits just before a's frame: the regions don't overlap.
-    assert_eq!(out.locals["main::m0"], 0x24);
-    assert_eq!(out.locals["a::a0"], 0x25);
+    // Frames start at end_of_globals (0x21) since scratch/retval live in
+    // fixed common RAM (0x70-0x72), not after the globals.
+    assert_eq!(out.locals["main::m0"], 0x21);
+    assert_eq!(out.locals["a::a0"], 0x22);
     assert!(out.locals["main::m0"] < out.locals["a::a0"]);
     // (c) overlay wins: total bank-0 demand < sum of the three demands.
     assert_eq!(out.total_bank0, 5);
@@ -81,11 +83,11 @@ fn map_text_emits_global_and_local_lines() {
     assert_eq!(
         map_text(&out),
         "global in 0x20\n\
-         local a a0 0x25\n\
-         local a a1 0x27\n\
-         local b b0 0x25\n\
-         local b b1 0x27\n\
-         local main m0 0x24\n",
+         local a a0 0x22\n\
+         local a a1 0x24\n\
+         local b b0 0x22\n\
+         local b b1 0x24\n\
+         local main m0 0x21\n",
     );
 }
 
@@ -98,19 +100,95 @@ fn params_are_frame_locals_too() {
              ret void\n",
     );
     let out = allocate(&m, "depth 1\n");
-    // No globals: end_of_globals = 0x20, so bank0_start = 0x23.
-    assert_eq!(out.locals["f::p0"], 0x23);
-    assert_eq!(out.locals["f::p1"], 0x25);
-    assert_eq!(out.locals["f::q"], 0x26);
+    // No globals: end_of_globals = 0x20, so bank0_start = 0x20 (scratch/retval
+    // live in fixed common RAM, not after the globals). Locals are placed
+    // contiguously (M3 overlay math): p0 i16 at 0x20, p1 i8 at 0x22, q i16 at
+    // 0x23 — no intra-frame i16 alignment.
+    assert_eq!(out.locals["f::p0"], 0x20);
+    assert_eq!(out.locals["f::p1"], 0x22);
+    assert_eq!(out.locals["f::q"], 0x23);
     assert_eq!(out.total_bank0, 2 + 1 + 2);
 }
 
 #[test]
-#[should_panic(expected = "bank 0")]
-fn frame_exceeding_bank0_panics() {
-    // 60 i16 locals = 120 bytes, more than bank 0 holds.
+fn globals_span_across_banks() {
+    // 90 i8 globals = 90 bytes: bank 0 GPR holds 80 (0x20-0x6F), so the 81st
+    // global lands at the start of bank 1 (0xA0).
+    let mut gsrc = String::new();
+    for i in 0..90 {
+        gsrc.push_str(&format!("global g{i} i8\n"));
+    }
+    let src = format!("{gsrc}fn main() -> void\n  block entry:\n    ret void\n");
+    let m = parse(&src);
+    let out = allocate(&m, "depth 1\n");
+    assert_eq!(out.globals["g0"], 0x20);
+    assert_eq!(out.globals["g79"], 0x6F); // last bank-0 GPR byte
+    assert!(out.globals["g80"] >= 0xA0, "81st global crosses into bank 1");
+    assert_eq!(out.globals["g80"], 0xA0);
+    assert!(out.globals["g89"] >= 0xA0);
+}
+
+#[test]
+fn frame_spans_across_banks() {
+    // One function with 90 i8 locals: its frame crosses bank 0 into 0xA0+.
+    let mut src = String::from("fn f() -> void\n  block entry:\n");
+    for i in 0..90 {
+        src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
+    }
+    src.push_str("    ret void\n");
+    let m = parse(&src);
+    let out = allocate(&m, "depth 1\n");
+    // No globals: the root frame starts at 0x20; v79 at 0x6F, v80 at 0xA0.
+    assert_eq!(out.locals["f::v0"], 0x20);
+    assert_eq!(out.locals["f::v79"], 0x6F);
+    assert!(out.locals["f::v80"] >= 0xA0, "80th local crosses into bank 1");
+    assert_eq!(out.locals["f::v80"], 0xA0);
+}
+
+#[test]
+fn i16_globals_stay_even_aligned_across_banks() {
+    // 80 i8 globals fill bank 0 (0x20-0x6F); the next i16 must land on an
+    // even address in bank 1 (0xA0, not 0xA1).
+    let mut gsrc = String::new();
+    for i in 0..80 {
+        gsrc.push_str(&format!("global g{i} i8\n"));
+    }
+    let src = format!("{gsrc}global w i16\nfn main() -> void\n  block entry:\n    ret void\n");
+    let m = parse(&src);
+    let out = allocate(&m, "depth 1\n");
+    assert_eq!(out.globals["g79"], 0x6F);
+    assert!(out.globals["w"] >= 0xA0, "i16 spills into bank 1");
+    assert_eq!(out.globals["w"] % 2, 0, "i16 stays even-aligned within the bank");
+}
+
+#[test]
+fn i16_frame_stays_even_aligned_across_banks() {
+    // A frame of 50 i16 locals (100 bytes) crosses bank 0 into bank 1. From
+    // the even root base 0x20 the i16s land on even addresses, and the bank
+    // progression (0x6F -> 0xA0) keeps them even-aligned within each bank.
+    let mut src = String::from("fn f() -> void\n  block entry:\n");
+    for i in 0..50 {
+        src.push_str(&format!("    %v{i} = add i16 1, 2\n"));
+    }
+    src.push_str("    ret void\n");
+    let m = parse(&src);
+    let out = allocate(&m, "depth 1\n");
+    for i in 0..50 {
+        let a = out.locals[&format!("f::v{i}")];
+        assert_eq!(a % 2, 0, "i16 local v{i} at {a:#04x} must be even");
+    }
+    // v40 is the 41st i16 (80 bytes in), the first to spill into bank 1.
+    assert_eq!(out.locals["f::v40"], 0xA0);
+    assert!(out.locals["f::v40"] >= 0xA0);
+}
+
+#[test]
+#[should_panic(expected = "0x1EF")]
+fn frame_exceeding_all_banks_panics() {
+    // 250 i16 locals = 500 bytes, more than the 464 GPR bytes across all four
+    // banks (0x20..0x1EF), so allocation panics past 0x1EF.
     let mut src = String::from("fn main() -> void\n  block entry:\n");
-    for i in 0..60 {
+    for i in 0..250 {
         src.push_str(&format!("    %v{i} = add i16 1, 2\n"));
     }
     src.push_str("    ret void\n");

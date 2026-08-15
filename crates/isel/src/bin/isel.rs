@@ -16,7 +16,7 @@ fn main() {
     fs::write(&args[3], asm).expect("write output");
 }
 
-fn parse_map(text: &str) -> HashMap<String, u8> {
+fn parse_map(text: &str) -> HashMap<String, u16> {
     let mut addrs = HashMap::new();
     for line in text.lines() {
         let line = line.trim();
@@ -27,7 +27,7 @@ fn parse_map(text: &str) -> HashMap<String, u8> {
         let kw = it.next().expect("map entry");
         let addr = it
             .next_back()
-            .and_then(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+            .and_then(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).ok())
             .unwrap_or_else(|| panic!("isel: bad address in map line: {line}"));
         match kw {
             "global" => {

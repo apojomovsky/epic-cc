@@ -2,7 +2,7 @@ use isel::select;
 use ir::parse;
 use std::collections::HashMap;
 
-fn addrs(pairs: &[(&str, u8)]) -> HashMap<String, u8> {
+fn addrs(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
     pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
 }
 
@@ -25,7 +25,7 @@ fn emits_add_for_in_plus_one() {
 fn store_const_emits_movlw_not_movf() {
     let m = parse("global out i8\nfn main() -> void\n  block entry:\n    store i8 5 @out\n    ret void\n");
     let mut addrs = HashMap::new();
-    addrs.insert("out".to_string(), 0x21u8);
+    addrs.insert("out".to_string(), 0x21u16);
     let asm = select(&m, &addrs);
     assert!(asm.contains("MOVLW 0x05"), "expected MOVLW for const store:\n{asm}");
     assert!(asm.contains("MOVWF 0x21"), "expected MOVWF to @out:\n{asm}");
@@ -124,12 +124,12 @@ fn i16_local_uses_consecutive_map_addresses() {
     let m = parse(&format!(
         "{globals}global out i16\nfn main() -> void\n  block entry:\n{loads}    %r = load i16 @out\n    store i16 %r @out\n    ret void\n"
     ));
-    let mut addrs: HashMap<String, u8> = (0..16).map(|i| (format!("g{i}"), 0x20 + i)).collect();
-    addrs.insert("out".to_string(), 0x30u8);
+    let mut addrs: HashMap<String, u16> = (0..16).map(|i| (format!("g{i}"), 0x20 + i)).collect();
+    addrs.insert("out".to_string(), 0x30u16);
     for i in 0..16 {
         addrs.insert(format!("main::a{i}"), 0x35 + i);
     }
-    addrs.insert("main::r".to_string(), 0x45u8);
+    addrs.insert("main::r".to_string(), 0x45u16);
     let asm = select(&m, &addrs);
     assert!(asm.contains("MOVWF 0x45"), "i16 lo should land at map address 0x45:\n{asm}");
     assert!(asm.contains("MOVWF 0x46"), "i16 hi should land at map address 0x46:\n{asm}");
@@ -274,10 +274,10 @@ fn icmp_eq_i8_materializes_i1() {
         ("main::c", 0x26),
     ]);
     let asm = select(&m, &addrs);
-    // %1=0x25, %c=0x26, scratch=0x22 (end_of_globals: 0x20+1, 0x21+1 -> 0x22).
+    // %1=0x25, %c=0x26, scratch=0x70 (fixed common RAM).
     assert!(asm.contains("MOVF 0x25, W"), "load a:\n{asm}");
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
-    assert!(asm.contains("MOVWF 0x22"), "store xor to scratch:\n{asm}");
+    assert!(asm.contains("MOVWF 0x70"), "store xor to scratch:\n{asm}");
     assert!(asm.contains("MOVLW 0x00"), "materialize 0:\n{asm}");
     assert!(asm.contains("BTFSC STATUS, 2"), "Z test:\n{asm}");
     assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
@@ -300,15 +300,14 @@ fn icmp_eq_i16_uses_scratch_accumulation() {
         ("main::c", 0x2C),
     ]);
     let asm = select(&m, &addrs);
-    // %a=0x28/29, %b=0x2A/2B, %c=0x2C, scratch=0x25 (end_of_globals:
-    // max(0x20+2, 0x22+2, 0x24+1) = 0x25).
+    // %a=0x28/29, %b=0x2A/2B, %c=0x2C, scratch=0x70 (fixed common RAM).
     assert!(asm.contains("MOVF 0x28, W"), "load a_lo:\n{asm}");
     assert!(asm.contains("XORWF 0x2A, W"), "xor b_lo:\n{asm}");
-    assert!(asm.contains("MOVWF 0x25"), "store lo xor to scratch:\n{asm}");
+    assert!(asm.contains("MOVWF 0x70"), "store lo xor to scratch:\n{asm}");
     assert!(asm.contains("MOVF 0x29, W"), "load a_hi:\n{asm}");
     assert!(asm.contains("XORWF 0x2B, W"), "xor b_hi:\n{asm}");
-    assert!(asm.contains("IORWF 0x25, W"), "or hi into scratch:\n{asm}");
-    assert!(asm.contains("MOVWF 0x25"), "store accumulated scratch:\n{asm}");
+    assert!(asm.contains("IORWF 0x70, W"), "or hi into scratch:\n{asm}");
+    assert!(asm.contains("MOVWF 0x70"), "store accumulated scratch:\n{asm}");
     assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
     assert!(asm.contains("MOVWF 0x2C"), "store d:\n{asm}");
 }
@@ -384,19 +383,18 @@ fn select_labels_are_unique_across_functions() {
 
 #[test]
 fn locals_use_map_addresses_around_scratch_and_retval() {
-    // The icmp scratch byte sits at end_of_globals, with the two retval
-    // bytes just after it. isel does not allocate slots any more, so a local
-    // is used at exactly the map address alloc provides — here 0x73/0x74,
-    // past the scratch and retval bytes (alloc's frame starts at
-    // bank0_start = end_of_globals + 3).
+    // The icmp scratch byte sits in fixed common RAM (0x70), with the two
+    // retval bytes just after (0x71/0x72). isel does not allocate slots any
+    // more, so a local is used at exactly the map address alloc provides —
+    // here 0x73/0x74, past the fixed scratch/retval bytes.
     let m = parse(
         "global in i8\nfn main() -> void\n  block entry:\n\
            %a0 = load i8 @in\n    %c = icmp eq i8 %a0, 0\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x6F), ("main::a0", 0x73), ("main::c", 0x74)]);
     let asm = select(&m, &addrs);
-    // end_of_globals = 0x6F + 1 = 0x70: scratch 0x70, retval 0x71/0x72.
-    assert!(asm.contains("MOVWF 0x70"), "icmp writes the scratch at end_of_globals:\n{asm}");
+    // Fixed common RAM: scratch 0x70, retval 0x71/0x72.
+    assert!(asm.contains("MOVWF 0x70"), "icmp writes the fixed scratch 0x70:\n{asm}");
     assert!(!asm.contains("MOVWF 0x71") && !asm.contains("MOVWF 0x72"), "no writes to the retval bytes:\n{asm}");
     assert!(asm.contains("MOVWF 0x73"), "the load lands at the map address 0x73:\n{asm}");
     assert!(asm.contains("MOVWF 0x74"), "icmp dst at the map address 0x74:\n{asm}");
@@ -441,16 +439,16 @@ fn call_copies_args_to_callee_params_and_reads_retval() {
         "copy %2 into add::y:\n{asm}"
     );
     assert!(asm.contains("    CALL add"), "CALL add:\n{asm}");
-    // Retval copy: retval_lo/hi (0x27/0x28) -> %3 (0x2D/0x2E).
+    // Retval copy: fixed retval slots 0x71/0x72 -> %3 (0x2D/0x2E).
     assert!(
-        asm.contains("MOVF 0x27, W\n    MOVWF 0x2D\n    MOVF 0x28, W\n    MOVWF 0x2E"),
+        asm.contains("MOVF 0x71, W\n    MOVWF 0x2D\n    MOVF 0x72, W\n    MOVWF 0x2E"),
         "copy retval into %3:\n{asm}"
     );
 }
 
 #[test]
 fn ret_i16_copies_value_to_retval_and_returns() {
-    // ret i16 %v: copy %v into the retval slots (end_of_globals+1/+2) then
+    // ret i16 %v: copy %v into the fixed retval slots (0x71/0x72) then
     // RETURN.
     let m = parse(
         "global x i16\nfn main() -> i16\n  block entry:\n\
@@ -459,9 +457,9 @@ fn ret_i16_copies_value_to_retval_and_returns() {
     // alloc: root frame at 0x25; %v=0x25.
     let addrs = addrs(&[("x", 0x20), ("main::v", 0x25)]);
     let asm = select(&m, &addrs);
-    // end_of_globals = 0x20+2 = 0x22: retval 0x23/0x24. %v = 0x25 (hi 0x26).
+    // %v = 0x25 (hi 0x26), retval = fixed 0x71/0x72.
     assert!(
-        asm.contains("MOVF 0x25, W\n    MOVWF 0x23\n    MOVF 0x26, W\n    MOVWF 0x24"),
+        asm.contains("MOVF 0x25, W\n    MOVWF 0x71\n    MOVF 0x26, W\n    MOVWF 0x72"),
         "retval writes:\n{asm}"
     );
     assert!(asm.contains("    RETURN"), "RETURN:\n{asm}");
