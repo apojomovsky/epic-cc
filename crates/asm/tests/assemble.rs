@@ -125,3 +125,71 @@ fn page_zero_exact_fill_does_not_panic() {
     assert!(hex.contains(":00000001FF\n"), "missing EOF record: {hex:?}");
     assert!(hex.lines().count() > 2, "full-page image must span records");
 }
+
+// ---- Milestone 10: const-table window-fit directives ----
+
+#[test]
+#[should_panic(expected = "crosses its 256-byte window")]
+fn panics_when_small_table_crosses_its_window() {
+    // M10 fix: a table whose base + size leaves its 256-byte window would
+    // silently misread through the computed `ADDLW LOW(base); MOVWF PCL`
+    // jump (reads past 0xFF wrap into the next window with the wrong
+    // PCLATH). `.table t 200` at base 0x40: LOW 0x40 + 200 = 0x108 > 0x100 —
+    // the assembler must reject it loudly, not assemble a misread.
+    let src = "    org 0x0040\n    .table t 200\nt:\n    retlw 0x00\n    end\n";
+    let _ = assemble(src);
+}
+
+#[test]
+#[should_panic(expected = "must be 256-aligned")]
+fn panics_when_chunked_table_base_is_misaligned() {
+    // M10 fix: a chunked (> 255 byte) table's chunk-0 base must be
+    // 256-aligned so chunk 1 (immediately after chunk 0) also has LOW == 0;
+    // a misaligned chunk base silently wraps reads past the window end.
+    let src = "    org 0x0040\n    .table t 300\nt:\n    retlw 0x00\n    end\n";
+    let _ = assemble(src);
+}
+
+#[test]
+fn small_table_in_nonzero_window_assembles_and_resolves() {
+    // A single-entry table that FITS its window is legal: `.table t 40` at
+    // base 0x40 (LOW 0x40 + 40 = 0x68 <= 0x100) assembles, and the labels
+    // resolve for the reader's PCLATH set and computed jump.
+    let mut src = String::from("    org 0x0040\n    .table t 40\nt:\n");
+    for i in 0..40 {
+        src.push_str(&format!("    retlw 0x{i:02X}\n"));
+    }
+    src.push_str("    movlw LOW(t)\n    movlw HIGH(t)\n    end\n");
+    let words = assemble(&src);
+    assert_eq!(words[0x40 + 40], 0x3000 | 0x40, "LOW(t) = 0x40");
+    assert_eq!(words[0x40 + 41], 0x3000 | 0x00, "HIGH(t) = 0 (window 0)");
+}
+
+#[test]
+fn align_and_table_keep_chunked_labels_at_low_zero() {
+    // `.align 256` pads with NOP words to the next 256-word boundary, so a
+    // chunked table's base and its immediately-following chunk-1 label both
+    // sit at LOW == 0 — the window-fit rule for a > 255-byte table. The
+    // `movlw LOW(t)` / `movlw LOW(t_1)` / `movlw HIGH(t_1)` operands
+    // resolve through the symbol table.
+    let mut src = String::from("    org 0x002A\n    nop\n    .align 256\n    .table t 300\nt:\n");
+    for i in 0..256 {
+        src.push_str(&format!("    retlw 0x{i:02X}\n"));
+    }
+    src.push_str("t_1:\n");
+    for i in 256..300 {
+        src.push_str(&format!("    retlw 0x{i:02X}\n"));
+    }
+    src.push_str("    movlw LOW(t)\n    movlw LOW(t_1)\n    movlw HIGH(t_1)\n    end\n");
+    let words = assemble(&src);
+    // org 0x2A + nop -> 0x2B, `.align 256` pads to 0x100: t at 0x100, t_1
+    // immediately after chunk 0 at 0x200, then the three movlw probes.
+    let probe = 0x100 + 256 + 44;
+    assert_eq!(words[probe], 0x3000, "LOW(t) = 0 (aligned base)");
+    assert_eq!(
+        words[probe + 1],
+        0x3000,
+        "LOW(t_1) = 0 (chunk 1 right after chunk 0)"
+    );
+    assert_eq!(words[probe + 2], 0x3002, "HIGH(t_1) = 2 (t_1 at 0x200)");
+}
