@@ -22,9 +22,14 @@
 //! `CALL __read_<name>` — a RETLW table emitted after the functions — and a
 //! store through a const base panics (ROM is not writable). `memcpy`
 //! lowers to a byte loop of the same pointer machinery; `alloca` is virtual
-//! like `gep` (the slot is sized by alloc). Every FSR base must sit in the
-//! low 256 bytes (bank 0 — IRP multi-bank FSR is a later milestone),
-//! asserted loudly at emission.
+//! like `gep` (the slot is sized by alloc). Static FSR bases reach all four
+//! GPR banks via the IRP bit (M9): every FSR setup emits `BCF/BSF STATUS, 7`
+//! (IRP = base bit 8) first, then loads FSR with `(base + k + off) & 0xFF`.
+//! The FSR-accessed object must fit entirely inside one of the four GPR
+//! windows `[0x20,0x80)` `[0xA0,0xF0)` `[0x120,0x170)` `[0x1A0,0x1F0)` —
+//! crossing an SFR hole would silently mis-address, so it panics loudly at
+//! emission (the object span comes from the global size / param width /
+//! alloca size).
 //!
 //! Every value's address comes from the caller-supplied address map: globals
 //! by name, locals by `{func}::{name}` (IR value names without `%`). isel
@@ -77,6 +82,32 @@ fn is_routine_name(name: &str) -> bool {
 enum Base {
     Global(String),
     Slot(String, bool),
+}
+
+/// The four GPR windows reachable through FSR+IRP: bank 0 `[0x20,0x80)`,
+/// bank 1 `[0xA0,0xF0)`, bank 2 `[0x120,0x170)`, bank 3 `[0x1A0,0x1F0)`
+/// (the common region 0x70-0x7F sits inside the first window). The SFR
+/// holes 0x80-0x9F and 0x170-0x19F are not addressable GPR, so an object
+/// that does not fit entirely inside its base's window would silently
+/// mis-address through INDF — it panics loudly instead.
+///
+/// Returns `(irp, base_lo)`: `IRP = bit 8 of the base` (STATUS bit 7) and
+/// `FSR = base & 0xFF` (0x120 -> 0x20, 0x1A0 -> 0xA0).
+fn fsr_window(base_addr: u16, span: u16) -> (bool, u8) {
+    let win_end = match base_addr {
+        0x20..=0x7F => 0x80,
+        0xA0..=0xEF => 0xF0,
+        0x120..=0x16F => 0x170,
+        0x1A0..=0x1EF => 0x1F0,
+        _ => panic!(
+            "isel: FSR base 0x{base_addr:03X} outside GPR space (windows [0x20,0x80) [0xA0,0xF0) [0x120,0x170) [0x1A0,0x1F0))"
+        ),
+    };
+    assert!(
+        base_addr + span <= win_end,
+        "isel: FSR object at 0x{base_addr:03X} span {span} crosses window end 0x{win_end:X} (SFR hole)"
+    );
+    (((base_addr >> 8) & 1) == 1, (base_addr & 0xFF) as u8)
 }
 
 /// How a single-byte pointer access completes after `emit_ptr_setup`.
@@ -156,6 +187,46 @@ impl<'m> Gen<'m> {
             .is_const
     }
 
+    /// The byte span of a resolved FSR base — the whole object a pointer
+    /// into it can legally touch (the runtime terms are bounded by span−1).
+    /// `Base::Global` spans its `Global.size`; `Base::Slot` spans the byval
+    /// param's `width` or the alloca's `size` in the current function. A
+    /// missing object panics loudly.
+    fn object_span(&self, base: &Base) -> u16 {
+        match base {
+            Base::Global(name) => self
+                .m
+                .globals
+                .iter()
+                .find(|g| g.name == *name)
+                .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
+                .size as u16,
+            Base::Slot(sname, _) => {
+                let f = self
+                    .m
+                    .funcs
+                    .iter()
+                    .find(|f| f.name == self.cur_func)
+                    .unwrap_or_else(|| {
+                        panic!("isel: no span for slot {sname}: unknown function {}", self.cur_func)
+                    });
+                if let Some(p) = f.params.iter().find(|p| p.name == *sname) {
+                    p.width as u16
+                } else if let Some(a) = f.blocks.iter().flat_map(|b| &b.insts).find_map(|i| {
+                    if let Inst::Alloca(a) = i {
+                        (a.dst == *sname).then_some(a)
+                    } else {
+                        None
+                    }
+                }) {
+                    a.size as u16
+                } else {
+                    panic!("isel: no span for slot {sname} in {}", self.cur_func);
+                }
+            }
+        }
+    }
+
     /// The resolved `(base, k, terms)` for a pointer reg `%r` — a GEP dst,
     /// or a seeded byval/sret param / alloca. Anything else is a missing
     /// pointer and panics loudly.
@@ -183,29 +254,31 @@ impl<'m> Gen<'m> {
             }
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
-                match base {
+                match &base {
                     Base::Global(name) => {
                         assert!(
-                            !self.global_is_const(&name),
+                            !self.global_is_const(name),
                             "isel: store to const (flash) global @{name}"
                         );
                         if terms.is_empty() {
                             // Constant offset only: the address is statically
                             // known — a plain file-register access, no FSR.
                             Addr::Direct(
-                                self.global_addr(&name) + u16::from(k) + u16::from(byte_off),
+                                self.global_addr(name) + u16::from(k) + u16::from(byte_off),
                             )
                         } else {
-                            self.emit_fsr_to(self.global_addr(&name), k, &terms, byte_off);
+                            let span = self.object_span(&base);
+                            self.emit_fsr_to(self.global_addr(name), k, &terms, byte_off, span);
                             Addr::Indirect
                         }
                     }
                     Base::Slot(sname, indirect) => {
-                        let sa = self.slot_addr(self.cur_func, &sname);
+                        let sa = self.slot_addr(self.cur_func, sname);
                         if !indirect && terms.is_empty() {
                             Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
                         } else if !indirect {
-                            self.emit_fsr_to(sa, k, &terms, byte_off);
+                            let span = self.object_span(&base);
+                            self.emit_fsr_to(sa, k, &terms, byte_off, span);
                             Addr::Indirect
                         } else {
                             self.emit_fsr_indirect(sa, k, &terms, byte_off);
@@ -276,29 +349,36 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `FSR = base_addr + k + byte_off + Σ scale×%reg`. A single scale-1
-    /// term keeps the M5 fast shape (`MOVF %r,W; ADDLW base+k; MOVWF FSR`);
-    /// general sums accumulate in the fixed scratch byte first. The static
-    /// FSR base (before the runtime terms) must sit in bank 0 (≤ 0xFF) —
-    /// IRP multi-bank FSR is a later milestone, so anything past it fails
-    /// loudly rather than emitting an unrepresentable ADDLW literal.
-    fn emit_fsr_to(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
-        let base_k = base_addr + u16::from(k) + u16::from(byte_off);
-        assert!(
-            base_k <= 0xFF,
-            "isel: FSR base 0x{base_k:02X} (base 0x{base_addr:02X} + k {k} + off {byte_off}) out of bank-0 range (IRP follow-up)"
-        );
+    /// `FSR = base_addr + k + byte_off + Σ scale×%reg`, for an object of
+    /// `span` bytes at `base_addr`. The window check runs first: the whole
+    /// object must fit inside its base's GPR window (an unrepresentable
+    /// cross-hole address would silently mis-address through INDF, so it
+    /// panics loudly). IRP is then set on EVERY FSR setup — a prior
+    /// bank-2/3 access leaves STATUS bit 7 = 1, so skipping the set on a
+    /// bank-0/1 base would mis-address into bank 2/3. A single scale-1
+    /// term keeps the M5 fast shape (`MOVF %r,W; ADDLW lit; MOVWF FSR`);
+    /// general sums accumulate in the fixed scratch byte first. The ADDLW
+    /// literal is `(base_addr + k + byte_off) & 0xFF` — FSR holds the low
+    /// byte; IRP carries bit 8.
+    fn emit_fsr_to(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8, span: u16) {
+        let (irp, base_lo) = fsr_window(base_addr, span);
+        let lit = (u16::from(base_lo) + u16::from(k) + u16::from(byte_off)) & 0xFF;
+        self.emit(if irp {
+            "    BSF STATUS, 7".to_string()
+        } else {
+            "    BCF STATUS, 7".to_string()
+        });
         match terms {
             [(1, r)] => {
                 let a = self.val_addr(&Val::Reg(r.clone()));
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDLW 0x{base_k:02X}"));
+                self.emit(format!("    ADDLW 0x{lit:02X}"));
                 self.emit("    MOVWF FSR".to_string());
             }
             _ => {
                 self.emit_accum_terms(terms);
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-                self.emit(format!("    ADDLW 0x{base_k:02X}"));
+                self.emit(format!("    ADDLW 0x{lit:02X}"));
                 self.emit("    MOVWF FSR".to_string());
             }
         }

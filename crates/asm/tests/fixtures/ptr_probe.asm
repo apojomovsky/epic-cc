@@ -25,11 +25,13 @@ main:
     MOVF 0x2D, W
     CALL __read_table
     MOVWF 0x2F
+    BCF STATUS, 7
     MOVF 0x2D, W
     ADDLW 0x22
     MOVWF FSR
     MOVF 0x2F, W
     MOVWF INDF
+    BCF STATUS, 7
     MOVF 0x2D, W
     ADDLW 0x22
     MOVWF FSR

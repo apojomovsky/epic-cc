@@ -632,12 +632,13 @@ fn gep_ram_indirect_and_const_retlw() {
         ("main::w", 0x2B),
     ]);
     let asm = select(&m, &addrs);
-    // RAM indirect load (%w = load i8 %p): W = %i; W += 0x21 (base_lo);
-    // FSR = W; W = INDF; %w = W.
-    assert!(asm.contains("MOVF 0x29, W"), "offset %i:\n{asm}");
-    assert!(asm.contains("ADDLW 0x21"), "base_lo of @ram:\n{asm}");
-    assert!(asm.contains("MOVWF FSR"), "FSR = base + offset:\n{asm}");
-    assert!(asm.contains("MOVF INDF, W"), "load through FSR:\n{asm}");
+    // RAM indirect load (%w = load i8 %p): IRP cleared first (bank-0 base
+    // 0x21 — a prior bank-2/3 access would leave IRP=1), then
+    // W = %i; W += 0x21 (base_lo); FSR = W; W = INDF; %w = W.
+    assert!(
+        asm.contains("BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x21\n    MOVWF FSR\n    MOVF INDF, W"),
+        "IRP cleared + FSR = base_lo + i for @ram:\n{asm}"
+    );
     assert!(asm.contains("MOVWF 0x2B"), "RAM load dst %w:\n{asm}");
     // RAM indirect store (store i8 %v %p): same FSR setup, then W = %v;
     // INDF = W.
@@ -700,7 +701,8 @@ fn gep_const_offset_loads_direct_no_fsr() {
 fn gep_single_term_uses_fsr_fast_path() {
     // %p = gep @a +1 +1*%i: one scale-1 term keeps the M5 fast shape —
     // MOVF %i,W; ADDLW <a_lo + k>; MOVWF FSR — with the constant k folded
-    // into the ADDLW literal.
+    // into the ADDLW literal. The IRP set (BCF STATUS, 7 for the bank-0
+    // base 0x21) comes first, on every FSR setup.
     let m = parse(
         "global in i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %p = gep @a +1 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
@@ -715,8 +717,8 @@ fn gep_single_term_uses_fsr_fast_path() {
     ]);
     let asm = select(&m, &addrs);
     assert!(
-        asm.contains("MOVF 0x29, W\n    ADDLW 0x22\n    MOVWF FSR\n    MOVF INDF, W\n    MOVWF 0x2A"),
-        "fast path: FSR = a_lo + k + i (0x21 + 1):\n{asm}"
+        asm.contains("BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x22\n    MOVWF FSR\n    MOVF INDF, W\n    MOVWF 0x2A"),
+        "fast path: IRP cleared + FSR = a_lo + k + i (0x21 + 1):\n{asm}"
     );
 }
 
@@ -745,14 +747,15 @@ fn gep_scaled_sum_accumulates_in_scratch() {
     let asm = select(&m, &addrs);
     // scale-2 term: scratch = 2×%i — %i is reloaded into W before each
     // ADDWF (ADDWF f,W computes W = f + W), then FSR = scratch + a_lo + k.
+    // The IRP set (BCF STATUS, 7) precedes the whole accumulation.
     assert!(
-        asm.contains("MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
-        "scaled term accumulates in scratch:\n{asm}"
+        asm.contains("BCF STATUS, 7\n    MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
+        "scaled term accumulates in scratch after the IRP clear:\n{asm}"
     );
     // two distinct terms accumulate in order (i then j), same FSR finish.
     assert!(
-        asm.contains("MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
-        "two-term sum accumulates both terms:\n{asm}"
+        asm.contains("BCF STATUS, 7\n    MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
+        "two-term sum accumulates both terms after the IRP clear:\n{asm}"
     );
 }
 
@@ -785,10 +788,11 @@ fn gep_scaled_multi_term_reloads_w_per_repetition() {
         2,
         "scale-2 term must reload %j into W before each ADDWF:\n{asm}"
     );
-    // Full sequence: scratch = i + 2*j = i + j + j, then FSR = a_lo + 1 + scratch.
+    // Full sequence: IRP cleared (bank-0 base 0x40), then
+    // scratch = i + 2*j = i + j + j, then FSR = a_lo + 1 + scratch.
     assert!(
-        asm.contains("MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x41\n    MOVWF FSR"),
-        "scaled multi-term sum accumulates i + 2*j:\n{asm}"
+        asm.contains("BCF STATUS, 7\n    MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x41\n    MOVWF FSR"),
+        "scaled multi-term sum accumulates i + 2*j after the IRP clear:\n{asm}"
     );
     // End-to-end: i=2, j=2 -> a[1+2+4] = a[7] = 0x17. The buggy sequence
     // (W not reloaded) computes 2*i + 2*j -> a[9] = 0x19 instead.
@@ -891,17 +895,85 @@ fn byval_param_base_accesses_direct_slot() {
 }
 
 #[test]
-#[should_panic(expected = "bank-0")]
-fn panics_on_banked_fsr_base() {
-    // FSR reaches only the low 256 bytes (IRP is a later milestone): a
-    // dynamic-index base past bank 0 must fail loudly rather than emit an
-    // ADDLW literal that cannot express the address.
-    let m = parse(
-        "global in i8\nglobal far i8\nfn main(void) ()\n  block entry:\n\
-           %i = load i8 @in\n    %p = gep @far +0 +1*%i\n    %v = load i8 %p\n    ret void\n",
+fn fsr_setup_in_each_of_the_four_banks() {
+    // M9: FSR reaches all four banks via the IRP bit. A dynamic-index base
+    // in bank 0 (0x20) or bank 1 (0xA0) clears IRP (BCF STATUS, 7); bank 2
+    // (0x120) or bank 3 (0x1A0) sets it (BSF STATUS, 7). The ADDLW literal
+    // is always (base + k) & 0xFF: 0x120 -> 0x20, 0x1A0 -> 0xA0.
+    for (base, irp_line, lit) in [
+        (0x20u16, "BCF STATUS, 7", "ADDLW 0x20"),
+        (0xA0, "BCF STATUS, 7", "ADDLW 0xA0"),
+        (0x120, "BSF STATUS, 7", "ADDLW 0x20"),
+        (0x1A0, "BSF STATUS, 7", "ADDLW 0xA0"),
+    ] {
+        let m = parse(
+            "global in i8\nglobal g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+               %i = load i8 @in\n    %p = gep @g +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        );
+        // in=0x24, g=base (1 byte), out=0x28; locals %i=0x29, %v=0x2A.
+        let addrs = addrs(&[
+            ("in", 0x24),
+            ("g", base),
+            ("out", 0x28),
+            ("main::i", 0x29),
+            ("main::v", 0x2A),
+        ]);
+        let asm = select(&m, &addrs);
+        assert!(
+            asm.contains(&format!("{irp_line}\n    MOVF 0x29, W\n    {lit}\n    MOVWF FSR")),
+            "base 0x{base:03X}: {irp_line} then FSR = (base + i) & 0xFF:\n{asm}"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "crosses window end 0x80")]
+fn panics_on_fsr_object_crossing_the_0x80_hole() {
+    // A 16-byte object at 0x78 spans 0x78..0x87: byte 0x80 is the first SFR
+    // hole byte. An FSR/INDF access would silently mis-address into the
+    // SFRs, so the window check fails loudly. (The object's span comes from
+    // the global's size — 16 here, patched in as irparse fills it.)
+    let mut m = parse(
+        "global in i8\nglobal g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @g +0 +1*%i\n    %v = load i8 %p\n    ret void\n",
     );
-    let addrs = addrs(&[("in", 0x20), ("far", 0x120), ("main::i", 0x29), ("main::v", 0x2A)]);
+    m.globals[1].size = 16;
+    let addrs = addrs(&[("in", 0x24), ("g", 0x78), ("main::i", 0x29), ("main::v", 0x2A)]);
     let _ = select(&m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "crosses window end 0x170")]
+fn panics_on_fsr_object_crossing_the_0x170_hole() {
+    // A 33-byte object at 0x150 spans 0x150..0x170 inclusive of the first
+    // SFR-hole byte 0x170. (Note 0x150 + 32 = 0x170 would FIT exactly — the
+    // last GPR byte is 0x16F — so 33 is the smallest crossing span.)
+    let mut m = parse(
+        "global in i8\nglobal g i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @g +0 +1*%i\n    %v = load i8 %p\n    ret void\n",
+    );
+    m.globals[1].size = 33;
+    let addrs = addrs(&[("in", 0x24), ("g", 0x150), ("main::i", 0x29), ("main::v", 0x2A)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn byval_param_slot_in_bank_2_sets_irp() {
+    // A byval param slot at 0x120 (width 16) dynamically indexed: the FSR
+    // setup must set IRP (BSF STATUS, 7) and use the low byte of the base
+    // (ADDLW 0x20). The span comes from the param's width.
+    let m = parse(
+        "global in i8\nglobal out i8\nfn f(i8) (0=byval16)\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep %0 +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    // in=0x20, out=0x21; f's frame: %i=0x25, param slot 0=0x120 (16 bytes),
+    // %v=0x29.
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("f::i", 0x25), ("f::0", 0x120), ("f::v", 0x29)]);
+    let asm = select(&m, &addrs);
+    assert!(
+        asm.contains("BSF STATUS, 7\n    MOVF 0x25, W\n    ADDLW 0x20\n    MOVWF FSR"),
+        "bank-2 byval slot: IRP set + FSR = (0x120 + i) & 0xFF:\n{asm}"
+    );
 }
 
 #[test]
@@ -932,9 +1004,10 @@ fn gep_chain_s8_pattern_simulates() {
     ];
     let m = parse(ir);
     let asm = select(&m, &addrs(&map));
-    // The chain folds k = 1 + 1 = 2 into the fast path's ADDLW literal.
+    // The chain folds k = 1 + 1 = 2 into the fast path's ADDLW literal;
+    // the IRP clear (bank-0 base) precedes the FSR setup.
     assert!(
-        asm.contains("MOVF 0x29, W\n    ADDLW 0x23\n    MOVWF FSR\n    MOVF INDF, W"),
+        asm.contains("BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x23\n    MOVWF FSR\n    MOVF INDF, W"),
         "chained gep folds to @a + 2 + i (a_lo 0x21 + 2 = 0x23):\n{asm}"
     );
     // in = 1 -> a[2+1] = a[3] = 0x44; in = 0 -> a[2] = 0x33.
@@ -955,6 +1028,100 @@ fn gep_chain_s8_pattern_simulates() {
         ),
         0x33,
         "a[2+0] with i=0"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 9, Task 1: multi-bank FSR via IRP — dynamic-indexed arrays in
+// banks 1-3 write + read back in the simulator, plus an interleaved
+// bank-0/bank-2 sequence proving IRP is re-set on EVERY FSR setup.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn banked_arrays_write_and_read_back_in_sim() {
+    // M9 acceptance: `%p = gep @aN +0 +1*%i` with @aN in bank 1 (0xA0),
+    // bank 2 (0x120) and bank 3 (0x1A0). Each store's FSR setup sets IRP
+    // (BSF for banks 2/3, BCF for bank 1) so INDF lands in the right bank;
+    // each load's FSR setup re-sets it. out = a1[3] + a2[3] + a3[3] =
+    // 0x11 + 0x22 + 0x33 = 0x66. (IR consts are decimal: 17/34/51.)
+    let ir = "global in i8\nglobal a1 i8\nglobal a2 i8\nglobal a3 i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n\
+           %p1 = gep @a1 +0 +1*%i\n\
+           %p2 = gep @a2 +0 +1*%i\n\
+           %p3 = gep @a3 +0 +1*%i\n\
+           store i8 17 %p1\n\
+           store i8 34 %p2\n\
+           store i8 51 %p3\n\
+           %r1 = load i8 %p1\n\
+           %r2 = load i8 %p2\n\
+           %r3 = load i8 %p3\n\
+           %s1 = add i8 %r1, %r2\n\
+           %s2 = add i8 %s1, %r3\n\
+           store i8 %s2 @out\n\
+           ret void\n";
+    // in=0x20, a1=0xA0 (bank 1), a2=0x120 (bank 2), a3=0x1A0 (bank 3),
+    // out=0x24; locals 0x25+ (all bank 0 — the raw emitted asm needs no
+    // banking since only FSR/INDF touches the banked arrays).
+    let map = [
+        ("in", 0x20u16),
+        ("a1", 0xA0),
+        ("a2", 0x120),
+        ("a3", 0x1A0),
+        ("out", 0x24),
+        ("main::i", 0x25),
+        ("main::r1", 0x26),
+        ("main::r2", 0x27),
+        ("main::r3", 0x28),
+        ("main::s1", 0x29),
+        ("main::s2", 0x2A),
+    ];
+    assert_eq!(
+        sim_run(ir, &map, &[(0x20, 3)], 0x24),
+        0x66,
+        "writes+reads across banks 1/2/3: 0x11 + 0x22 + 0x33"
+    );
+}
+
+#[test]
+fn interleaved_bank0_bank2_accesses_reset_irp() {
+    // The load-bearing IRP hazard: a bank-2 FSR access leaves IRP=1, so a
+    // following bank-0 access MUST re-clear it (BCF STATUS, 7) or INDF
+    // silently hits 0x120 again. Sequence: b0[2]=0xAA (IRP 0), b2[2]=0xBB
+    // (IRP 1), b0[2]=0xCC (IRP re-cleared), then read b2[2] (IRP re-set)
+    // and b0[2] (IRP re-cleared): out = 0xBB + 0xCC = 0x87. With the re-set
+    // bug, the 0xCC write lands at 0x122 (clobbering b2[2]) and both reads
+    // hit 0x122: out = 0xCC + 0xCC = 0x98. (IR consts are decimal:
+    // 0xAA=170, 0xBB=187, 0xCC=204; expected out 0x87 = 135.)
+    let ir = "global in i8\nglobal b0 i8\nglobal b2 i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n\
+           %q0 = gep @b0 +0 +1*%i\n\
+           %q2 = gep @b2 +0 +1*%i\n\
+           store i8 170 %q0\n\
+           store i8 187 %q2\n\
+           store i8 204 %q0\n\
+           %v = load i8 %q2\n\
+           %w = load i8 %q0\n\
+           %s = add i8 %v, %w\n\
+           store i8 %s @out\n\
+           ret void\n";
+    // b0=0x20 (8 bytes), b2=0x120 (8 bytes); in=0x28, out=0x29; locals
+    // 0x2A+.
+    let map = [
+        ("in", 0x28u16),
+        ("b0", 0x20),
+        ("b2", 0x120),
+        ("out", 0x29),
+        ("main::i", 0x2A),
+        ("main::v", 0x2B),
+        ("main::w", 0x2C),
+        ("main::s", 0x2D),
+    ];
+    assert_eq!(
+        sim_run(ir, &map, &[(0x28, 2)], 0x29),
+        0x87,
+        "interleaved bank-0/bank-2: IRP re-set per access (0xBB + 0xCC)"
     );
 }
 

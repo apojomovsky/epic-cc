@@ -35,6 +35,7 @@ pick:
     MOVF 0x51, W
     MOVWF 0x52
     CLRF 0x53
+    BCF STATUS, 7
     MOVF 0x52, W
     ADDLW 0x4D
     MOVWF FSR
@@ -108,6 +109,7 @@ main:
     MOVF 0x37, W
     MOVWF 0x38
     CLRF 0x39
+    BCF STATUS, 7
     MOVF 0x38, W
     ADDLW 0x27
     MOVWF FSR
