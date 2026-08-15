@@ -274,6 +274,67 @@ fn i16_frame_stays_even_aligned_across_banks() {
 }
 
 #[test]
+fn const_globals_get_no_address_and_sized_globals_span() {
+    // `global ram i8` with size 8 spans 8 addresses (0x20..0x27); `const
+    // table i8` (size 4) gets NO RAM address. The map lists the RAM global
+    // with its address and the const global without one, so isel can see both.
+    let mut m = parse(
+        "global ram i8\n\
+         const table i8\n\
+         global after i8\n\
+         fn main() -> void\n\
+           block entry:\n\
+             ret void\n",
+    );
+    // Array sizes come from irparse (LLVM `[N x T]`); the simple parser
+    // sizes by type, so set them explicitly to mirror a real module.
+    m.globals[0].size = 8; // ram: [8 x i8]
+    m.globals[1].size = 4; // table: [4 x i8]
+    let out = allocate(&m, "depth 1\n");
+    // ram is sized by Global.size (8), not ty.bytes() (1): it spans 8 bytes.
+    assert_eq!(out.globals["ram"], 0x20);
+    // The next RAM global starts after ram's 8 bytes.
+    assert_eq!(out.globals["after"], 0x28);
+    // table is const: no RAM address.
+    assert!(!out.globals.contains_key("table"));
+    let text = map_text(&out);
+    assert!(
+        text.contains("global ram 0x20\n"),
+        "map must address ram:\n{text}"
+    );
+    assert!(
+        text.contains("const table\n"),
+        "map must list const table without an address:\n{text}"
+    );
+}
+
+#[test]
+fn sized_array_global_does_not_break_frame_overlay() {
+    // An 8-byte array global consumes 8 addresses; the root frame's locals
+    // must start after it (0x28), not after a 1-byte type, and a callee
+    // overlaid on that frame must respect the sized end_of_globals.
+    let mut m = parse(
+        "global ram i8\n\
+         fn main() -> void\n\
+           block entry:\n\
+             %m0 = add i8 1, 2\n\
+             call void @a()\n\
+             ret void\n\
+         fn a() -> void\n\
+           block entry:\n\
+             %a0 = add i8 1, 2\n\
+             ret void\n",
+    );
+    m.globals[0].size = 8; // ram: [8 x i8]
+    let out = allocate(&m, "edge main a\n");
+    // ram spans 0x20..0x27; main's local starts at 0x28.
+    assert_eq!(out.globals["ram"], 0x20);
+    assert_eq!(out.locals["main::m0"], 0x28);
+    // a overlays main's frame at main's physical end (0x29).
+    assert_eq!(out.locals["a::a0"], 0x29);
+}
+
+#[test]
 #[should_panic(expected = "0x1EF")]
 fn frame_exceeding_all_banks_panics() {
     // 250 i16 locals = 500 bytes, more than the 320 GPR bytes across all four

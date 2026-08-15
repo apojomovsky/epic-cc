@@ -21,12 +21,15 @@ use ir::{Inst, Module};
 pub const GLOBAL_START: u8 = 0x20;
 
 /// Complete address map: globals keyed by name, locals keyed `{func}::{name}`,
-/// plus the total overlay span (in bytes) across all banks.
+/// plus the total overlay span (in bytes) across all banks. `const_globals`
+/// lists the names of const globals (no RAM address; their bytes live in
+/// flash), so the map text can emit `const <name>` lines for them.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct AllocLayout {
     pub globals: HashMap<String, u16>,
     pub locals: HashMap<String, u16>,
     pub total_bank0: u16,
+    pub const_globals: HashSet<String>,
 }
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
@@ -117,14 +120,20 @@ fn frame_end(base: u16, widths: &[u8]) -> u16 {
 /// call graph, and if total demand exceeds `0x1EF`.
 pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
     // 1. Globals: sequential, aligned to the type width (i16 -> even address),
-    // stepping through the banks as bank 0 GPR fills up.
+    // stepping through the banks as bank 0 GPR fills up. Each global spans
+    // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
+    // sized array advances the free pointer by its byte count. Const globals
+    // get no RAM address (their bytes live in flash) but are still recorded
+    // so the map text can list them.
     let mut globals: HashMap<String, u16> = HashMap::new();
+    let mut const_globals: HashSet<String> = HashSet::new();
     let mut addr: u16 = u16::from(GLOBAL_START);
     for g in &m.globals {
         if g.is_const {
+            const_globals.insert(g.name.clone());
             continue;
         }
-        let width = g.ty.bytes();
+        let width = g.size;
         let start = place_at(addr, width);
         globals.insert(g.name.clone(), start);
         addr = start + u16::from(width);
@@ -136,7 +145,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
     // follows the globals directly.
     let end_of_globals = m.globals.iter().fold(u16::from(GLOBAL_START), |end, g| {
         match globals.get(&g.name) {
-            Some(&a) => end.max(a + u16::from(g.ty.bytes())),
+            Some(&a) => end.max(a + u16::from(g.size)),
             None => end,
         }
     });
@@ -334,6 +343,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         globals,
         locals,
         total_bank0,
+        const_globals,
     }
 }
 
@@ -354,18 +364,28 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         },
         Inst::Phi(p) => Some((p.dst.clone(), p.ty.bytes())),
         Inst::Store(_) | Inst::Ret(_) | Inst::Br(_) | Inst::BrCond(_) => None,
+        // Gep computes a virtual pointer address (isel turns it into FSR/INDF
+        // or a RETLW table read); it defines no value needing a RAM slot.
+        Inst::Gep(_) => None,
     }
 }
 
-/// Render the layout as `global <name> 0xNN` and `local <func> <name> 0xNN`
-/// lines, deterministically sorted by key. Consumed by the driver, which keys
-/// locals `{func}::{name}`.
+/// Render the layout as `global <name> 0xNN`, `const <name>` (no address —
+/// the global lives in flash), and `local <func> <name> 0xNN` lines,
+/// deterministically sorted by key. Consumed by the driver, which keys
+/// locals `{func}::{name}` and distinguishes const globals via the `const`
+/// prefix (isel reads their bytes from flash, never from a RAM slot).
 pub fn map_text(l: &AllocLayout) -> String {
     let mut out = String::new();
     let mut globals: Vec<&String> = l.globals.keys().collect();
     globals.sort();
     for name in globals {
         out.push_str(&format!("global {name} 0x{:02X}\n", l.globals[name]));
+    }
+    let mut consts: Vec<&String> = l.const_globals.iter().collect();
+    consts.sort();
+    for name in consts {
+        out.push_str(&format!("const {name}\n"));
     }
     let mut locals: Vec<&String> = l.locals.keys().collect();
     locals.sort();
