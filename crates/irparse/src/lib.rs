@@ -3,10 +3,12 @@
 //! Supports the milestone-2 integer-spine subset the PIC8 backend consumes:
 //! `load`/`store` (global and SSA pointer operands), `add`/`sub`/`and`/`or`/
 //! `xor`, `ret`, `zext`/`trunc`, `icmp`, `select`, `br`/`brcond`, `call`, and
-//! `phi`. Any other opcode, or any structurally malformed input, panics loudly
-//! rather than silently misparsing.
+//! `phi`. Phase-3 pointers/const adds `getelementptr` (reduced to base + last
+//! index) and array/`constant` globals (`[N x i8] zeroinitializer` and
+//! `[N x i8] c"..."`). Any other opcode, or any structurally malformed input,
+//! panics loudly rather than silently misparsing.
 
-use ir::{Bin, BinOp, Block, Br, BrCond, Call, Func, Global, Icmp, Inst, Load, Module, Phi, Select, Store, Trunc, Ty, Val, Zext};
+use ir::{Bin, BinOp, Block, Br, BrCond, Call, Func, Gep, Global, Icmp, Inst, Load, Module, Phi, Select, Store, Trunc, Ty, Val, Zext};
 
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
@@ -61,6 +63,27 @@ fn parse_val(s: &str) -> Val {
     }
 }
 
+/// Decode an LLVM string literal `c"..."` into bytes (`\XX` = hex escape).
+fn parse_string_literal(s: &str) -> Vec<u8> {
+    let start = s.find('"').unwrap() + 1;
+    let end = start + s[start..].find('"').unwrap();
+    let chars: Vec<char> = s[start..end].chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 2 < chars.len() {
+            let hi = chars[i + 1].to_digit(16).unwrap();
+            let lo = chars[i + 2].to_digit(16).unwrap();
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(chars[i] as u8);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// A pointer operand on load/store: `"@name"` (global) or `"%name"` (SSA reg).
 fn parse_ptr(s: &str) -> String {
     let tok = s.split_whitespace().nth(1).unwrap();
@@ -96,9 +119,29 @@ pub fn parse_ll(src: &str) -> Module {
                 continue; // not a global definition we care about
             };
             let rest = rest.trim();
-            // scalar global: "<ty> <init>[, align N]" -> type is the first token
-            let ty = ty_of(rest.split_whitespace().next().unwrap());
-            globals.push(Global { name, ty, is_const, addr: None });
+            let (ty, size, bytes) = if rest.starts_with('[') {
+                // array global: "[N x i8] zeroinitializer" / "[N x i8] c\"...\""
+                let close = rest.find(']').unwrap();
+                let inner = &rest[1..close]; // e.g. "8 x i8"
+                let mut pit = inner.split('x').map(|s| s.trim());
+                let n: usize = pit.next().unwrap().parse().unwrap();
+                let elem = ty_of(pit.next().unwrap());
+                let size = n as u8 * elem.bytes();
+                let init = rest[close + 1..].trim();
+                let bytes = if init.starts_with("zeroinitializer") {
+                    vec![0u8; size as usize]
+                } else if init.starts_with("c\"") {
+                    parse_string_literal(init)
+                } else {
+                    panic!("SPIKE LIMIT: array global initializer {init:?}");
+                };
+                (elem, size, bytes)
+            } else {
+                // scalar global: "<ty> <init>[, align N]" -> type is the first token
+                let ty = ty_of(rest.split_whitespace().next().unwrap());
+                (ty, ty.bytes(), Vec::new())
+            };
+            globals.push(Global { name, ty, is_const, size, bytes, addr: None });
             continue;
         }
 
@@ -176,6 +219,15 @@ fn parse_inst(line: &str) -> Inst {
             let ty = ty_of(it.next().unwrap());
             let val = parse_val(it.next().unwrap());
             Inst::Store(Store { ty, val, ptr: parse_ptr(args[1]) })
+        }
+        "getelementptr" => {
+            // getelementptr <ty>, ptr @base, <ty> <idx>, ... — reduce to base + last index
+            let body = rest["getelementptr".len()..].trim();
+            let parts: Vec<&str> = body.split(", ptr ").collect();
+            let tail: Vec<&str> = parts[1].split(',').map(|s| s.trim()).collect();
+            let base = tail[0].trim_start_matches('@').to_string();
+            let offset = parse_val(tail.last().unwrap().split_whitespace().nth(1).unwrap());
+            Inst::Gep(Gep { dst: dst.unwrap(), base, offset })
         }
         "add" | "and" | "or" | "xor" | "sub" => {
             let body = rest[op.len()..].trim();
