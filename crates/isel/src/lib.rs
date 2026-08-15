@@ -939,9 +939,9 @@ impl<'m> Gen<'m> {
                     (BinOp::URem, _) => panic!("isel: urem not yet lowered (Task 3)"),
                     (BinOp::SDiv, _) => panic!("isel: sdiv not yet lowered (Task 3)"),
                     (BinOp::SRem, _) => panic!("isel: srem not yet lowered (Task 3)"),
-                    (BinOp::Shl, _) => panic!("isel: shl not yet lowered (Task 3)"),
-                    (BinOp::LShr, _) => panic!("isel: lshr not yet lowered (Task 3)"),
-                    (BinOp::AShr, _) => panic!("isel: ashr not yet lowered (Task 3)"),
+                    (BinOp::Shl, _) => panic!("isel: shl not yet lowered (Task 4)"),
+                    (BinOp::LShr, _) => panic!("isel: lshr not yet lowered (Task 4)"),
+                    (BinOp::AShr, _) => panic!("isel: ashr not yet lowered (Task 4)"),
                     _ => panic!("isel: unsupported binop for milestone 2"),
                 }
             }
@@ -1627,10 +1627,15 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
                 "__mul_u8" | "__mul_u16" | "__udiv_u8" | "__urem_u8"
                 | "__udiv_u16" | "__urem_u16" | "__sdiv_i8" | "__srem_i8"
                 | "__sdiv_i16" | "__srem_i16" => {}
-                _ => panic!(
+                // The six shift routines land in Task 4; until then they
+                // must panic loudly, never fall through into the next
+                // function.
+                "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
+                | "__lshr_u16" | "__ashr_i16" => panic!(
                     "isel: runtime routine @{} not implemented (shift recipes land in Task 4)",
                     f.name
                 ),
+                other => panic!("isel: unknown runtime routine @{other}"),
             }
             g.emit_routine();
             out.extend(g.out);
