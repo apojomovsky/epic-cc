@@ -2101,13 +2101,54 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // MOVWF PCL` jump lands at PCLATH:PCL, so a table in a nonzero 256-byte
     // window needs the window set (the M5 reader left PCLATH stale — the
     // latent window bug). A table > 255 bytes is emitted as two 256-byte
-    // chunks with two entries (`__read_<name>` chunk 0 at label `<name>`,
-    // `__read_<name>_hi` chunk 1 at the fresh label `<name>_1`, emitted
-    // exactly `name` + 256 in the address space by sequential placement);
-    // the caller selects the entry with the in-chunk index in W. Tables
-    // beyond 511 bytes (three chunks) panic loudly — out of scope.
+    // chunks: chunk 0's 256 RETLWs at the base label `<name>` (`.align 256`
+    // pads it to a 256-word boundary so LOW(<name>) == 0), then chunk 1's
+    // RETLWs at the fresh label `<name>_1` IMMEDIATELY after — `<name>` +
+    // 256 in the address space, so LOW(<name>_1) == 0 too and the true
+    // bound is 511 bytes — then the `__read_<name>_hi` entry AFTER the
+    // table (its computed-goto jumps into the table; the entry instructions
+    // are dead after MOVWF PCL). A `.table <name> <size>` directive is
+    // emitted immediately before every table's base label; the assembler
+    // enforces the window fit loudly (LOW + size <= 0x100 for single-entry
+    // tables, LOW == 0 for chunked bases) — a table that crosses its window
+    // or a misaligned chunk base would silently misread, so it must fail
+    // assembly, not miscompile. Tables beyond 511 bytes (three chunks)
+    // panic loudly — out of scope.
     let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
     consts.sort_by_key(|g| g.name.clone());
+    // Label-collision guard: every label a table emits — its base label, its
+    // reader entry, and for chunked tables the fresh `{name}_1` chunk label
+    // and `__read_{name}_hi` entry — must be unique across all consts. A
+    // user `const t_1` (or `const __read_t_hi`) next to a chunked `const t`
+    // would emit a duplicate label the assembler's symbol insert silently
+    // overwrites (wrong reads, no error) — panic loudly instead.
+    {
+        let mut labels: HashMap<String, String> = HashMap::new();
+        for g in &consts {
+            let mut claim = |label: String, what: String| {
+                if let Some(prev) = labels.insert(label.clone(), what.clone()) {
+                    panic!(
+                        "isel: const-table label collision: `{label}` is both {prev} and {what}"
+                    );
+                }
+            };
+            claim(
+                format!("__read_{}", g.name),
+                format!("reader entry of const {}", g.name),
+            );
+            claim(g.name.clone(), format!("base label of const {}", g.name));
+            if g.bytes.len() > 256 {
+                claim(
+                    format!("{}_1", g.name),
+                    format!("chunk-1 label of const {}", g.name),
+                );
+                claim(
+                    format!("__read_{}_hi", g.name),
+                    format!("chunk-1 reader entry of const {}", g.name),
+                );
+            }
+        }
+    }
     for g in consts {
         assert!(
             !g.bytes.is_empty(),
@@ -2131,18 +2172,38 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             out.push(format!("    ADDLW LOW({base})"));
             out.push("    MOVWF PCL".to_string());
         };
-        out.push(format!("__read_{}:", g.name));
-        reader(&mut out, &g.name);
-        out.push(format!("{}:", g.name));
-        for b in &g.bytes[..size.min(256)] {
-            out.push(format!("    RETLW 0x{b:02X}"));
-        }
         if size > 256 {
+            // Chunked table: chunk 0's reader, then `.align 256` (the
+            // assembler pads to the next 256-word boundary, so LOW(name) ==
+            // 0), then the `.table` directive, then chunk 0's 256 RETLWs at
+            // `name`, chunk 1's RETLWs at `name_1` immediately after
+            // (name_1 = name + 256, so LOW(name_1) == 0), and only then the
+            // chunk-1 reader entry — AFTER the table. (The entry's computed
+            // goto jumps into the table; the entry instructions are dead
+            // after MOVWF PCL, so their placement cannot shift the chunks.)
+            out.push(format!("__read_{}:", g.name));
+            reader(&mut out, &g.name);
+            out.push("    .align 256".to_string());
+            out.push(format!("    .table {} {size}", g.name));
+            out.push(format!("{}:", g.name));
+            for b in &g.bytes[..256] {
+                out.push(format!("    RETLW 0x{b:02X}"));
+            }
             let name_1 = format!("{}_1", g.name);
-            out.push(format!("__read_{}_hi:", g.name));
-            reader(&mut out, &name_1);
             out.push(format!("{name_1}:"));
             for b in &g.bytes[256..] {
+                out.push(format!("    RETLW 0x{b:02X}"));
+            }
+            out.push(format!("__read_{}_hi:", g.name));
+            reader(&mut out, &name_1);
+        } else {
+            // Single-entry table (<= 255 bytes): `.table` immediately before
+            // the base label; the assembler asserts LOW(name) + size <= 0x100.
+            out.push(format!("__read_{}:", g.name));
+            reader(&mut out, &g.name);
+            out.push(format!("    .table {} {size}", g.name));
+            out.push(format!("{}:", g.name));
+            for b in &g.bytes[..size] {
                 out.push(format!("    RETLW 0x{b:02X}"));
             }
         }

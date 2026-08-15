@@ -35,6 +35,44 @@ pub fn assemble(src: &str) -> Vec<u16> {
             symbols.insert(name.trim().to_string(), parse_num(val[" equ ".len()..].trim()));
             continue;
         }
+        // `.align N`: pad with NOP words (zeros) to the next N-word
+        // boundary — isel emits `.align 256` before a chunked (> 255 byte)
+        // const table's base label so LOW(base) == 0 and chunk 1, emitted
+        // immediately after chunk 0, also sits at LOW == 0.
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n = parse_num(n.trim());
+            assert!(
+                n >= 2 && n.is_power_of_two(),
+                "asm: .align needs a power-of-two word count, got {n}"
+            );
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        // `.table <name> <size>`: emitted immediately before a const table's
+        // base label; `org` here IS the base address (labels take no words).
+        // The computed `ADDLW LOW(base); MOVWF PCL` jump wraps within the
+        // 256-byte window selected by the reader's PCLATH set, so the whole
+        // table must fit one window — accepting one that doesn't (reads past
+        // the boundary return the wrong window's bytes) is the exact
+        // miscompile this directive exists to prevent, so we panic loudly.
+        if let Some(rest) = line.strip_prefix(".table ") {
+            let mut it = rest.split_whitespace();
+            let name = it.next().expect("asm: .table needs a table name");
+            let size = parse_num(it.next().expect("asm: .table needs a table size"));
+            let lo = org & 0xFF;
+            if size <= 255 {
+                assert!(
+                    lo + size <= 0x100,
+                    "asm: const table {name} of {size} bytes at base 0x{org:03X} crosses its 256-byte window (LOW 0x{lo:02X} + {size} > 0x100) — reads past the window would silently wrap"
+                );
+            } else {
+                assert!(
+                    lo == 0,
+                    "asm: const table {name} of {size} bytes must be 256-aligned (base 0x{org:03X}, LOW 0x{lo:02X}) — a chunked table's chunks must sit at LOW == 0 or reads silently wrap"
+                );
+            }
+            continue;
+        }
         lines.push((org, line.to_string()));
         org += 1;
     }

@@ -3157,8 +3157,9 @@ fn module_with_globals(ir_text: &str, globals: Vec<ir::Global>) -> ir::Module {
 }
 
 /// Word address of a label in isel-emitted asm: walk the lines the same way
-/// the asm crate's pass 1 does (org/labels/instructions only — equ and
-/// list/radix lines emit no words).
+/// the asm crate's pass 1 does (org/labels/instructions only — equ,
+/// list/radix, and `.table` lines emit no words; `.align N` pads with NOPs
+/// to the next N-word boundary).
 fn label_addr(asm: &str, label: &str) -> usize {
     let mut org = 0usize;
     for raw in asm.lines() {
@@ -3180,6 +3181,14 @@ fn label_addr(asm: &str, label: &str) -> usize {
             continue;
         }
         if line.contains(" equ ") {
+            continue;
+        }
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n: usize = n.trim().parse().unwrap();
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        if line.starts_with(".table ") {
             continue;
         }
         org += 1;
@@ -3252,17 +3261,28 @@ fn large_const_table_emits_two_entry_reader_and_16bit_caller() {
     assert!(asm.contains("__read_t_hi:\n    MOVWF 0x70"), "chunk-1 reader stashes the index:\n{asm}");
     assert!(asm.contains("MOVLW HIGH(t_1)"), "chunk-1 PCLATH set:\n{asm}");
     assert!(asm.contains("ADDLW LOW(t_1)"), "chunk-1 index add:\n{asm}");
-    // Exactly size RETLWs, split 256 + (size-256) across the two chunks.
+    // Window-fit directives: `.align 256` 256-aligns the chunk-0 base and
+    // `.table t 300` lets the assembler enforce the window fit loudly.
+    assert!(asm.contains("    .align 256"), "chunked base must be aligned:\n{asm}");
+    assert!(asm.contains("    .table t 300"), "window-fit directive before the base label:\n{asm}");
+    // Exactly size RETLWs, split 256 + (size-256) across the two chunks,
+    // chunk 1 IMMEDIATELY after chunk 0 (no reader entry between — the
+    // chunk-1 reader comes after the whole table).
     assert_eq!(asm.matches("RETLW").count(), 300, "one RETLW per byte:\n{asm}");
-    let chunk0 = &asm[asm.find("\nt:").unwrap()..asm.find("__read_t_hi:").unwrap()];
+    let t = asm.find("\nt:").unwrap();
+    let t1 = asm.find("\nt_1:").unwrap();
+    let hi = asm.find("__read_t_hi:").unwrap();
+    let chunk0 = &asm[t..t1];
     assert_eq!(chunk0.matches("RETLW").count(), 256, "chunk 0 = 256 bytes:\n{asm}");
-    let chunk1 = &asm[asm.find("\nt_1:").unwrap()..asm.find("__start:").unwrap()];
+    let chunk1 = &asm[t1..hi];
     assert_eq!(chunk1.matches("RETLW").count(), 44, "chunk 1 = size-256 bytes:\n{asm}");
-    // The chunk-1 reader follows the chunk-0 table.
-    assert!(
-        asm.find("__read_t_hi:").unwrap() > asm.find("\nt:").unwrap(),
-        "chunks must be ordered chunk 0 then chunk 1:\n{asm}"
-    );
+    // Reordered layout: chunk 1 sits exactly 256 words after chunk 0 (so
+    // both chunk bases have LOW == 0 and the true bound is 511, not 505),
+    // and the chunk-1 reader follows the whole table.
+    let base = label_addr(&asm, "t");
+    assert_eq!(label_addr(&asm, "t_1"), base + 256, "t_1 = t + 256:\n{asm}");
+    assert_eq!(base & 0xFF, 0, "chunk-0 base must be 256-aligned:\n{asm}");
+    assert!(hi > t1, "chunk-1 reader must follow the table:\n{asm}");
 }
 
 #[test]
@@ -3316,13 +3336,86 @@ fn const_only_large_table_index_panics() {
 }
 
 #[test]
+#[should_panic(expected = "const-table label collision")]
+fn panics_when_user_const_collides_with_generated_chunk_label() {
+    // M10 fix: a user `const t_1` next to a chunked `const t` would emit a
+    // duplicate `t_1:` label — the assembler's symbol insert silently
+    // overwrites one of them and the table misreads with no error. Guard:
+    // panic loudly at const emission time.
+    let m = module_with_globals(
+        "global in i16\nglobal out i8\nconst t i8\nconst t_1 i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i16 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I16,
+                is_const: false,
+                size: 2,
+                bytes: vec![0; 2],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("t", 300),
+            const_table_global("t_1", 1),
+        ],
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "const-table label collision")]
+fn panics_when_user_const_collides_with_generated_reader_label() {
+    // Same guard for the chunked table's generated `__read_t_hi:` reader
+    // namespace: a user const named `__read_t_hi` collides with it.
+    let m = module_with_globals(
+        "global in i16\nglobal out i8\nconst t i8\nconst __read_t_hi i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i16 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n    ret void\n",
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I16,
+                is_const: false,
+                size: 2,
+                bytes: vec![0; 2],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("t", 300),
+            const_table_global("__read_t_hi", 1),
+        ],
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
 fn small_const_table_in_nonzero_window_reads_correctly() {
     // M10 load-bearing: a const table placed past 0x100 (window 1) must be
     // read through its reader's PCLATH set — without it the computed PCL
-    // jump would land in window 0 and return a wrong byte. A 244-byte
+    // jump would land in window 0 and return a wrong byte. A 241-byte
     // filler table (`aaa_fill` sorts before `table`) pushes `table` past
-    // 0x100: layout = goto (1) + main (7) + filler reader/table (6+244) +
-    // table reader (6) -> table at 0x108.
+    // 0x100: layout = goto (1) + main (8) + filler reader/table (6+241) +
+    // table reader (6) -> table at 0x106. (241 is the largest filler that
+    // still fits its own 256-byte window — base 0x0F + 241 == 0x100 exactly;
+    // the assembler's `.table` directive now rejects a filler that crosses.)
+    //
     let m = module_with_globals(
         "global in i8\nglobal out i8\nconst aaa_fill i8\nconst table i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %p = gep @table +0 +1*%i\n    %v = load i8 %p\n\
@@ -3344,7 +3437,7 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
                 bytes: vec![0],
                 addr: None,
             },
-            const_table_global("aaa_fill", 244),
+            const_table_global("aaa_fill", 241),
             ir::Global {
                 name: "table".into(),
                 ty: ir::Ty::I8,
@@ -3377,10 +3470,11 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
 #[test]
 fn large_const_table_reads_simulate_correctly() {
     // M10 load-bearing: a 300-byte table split into two 256-byte chunks. A
-    // 222-byte filler table (`aaa_fill` sorts first) aligns the main table
-    // at 0x100: layout = goto (1) + main (21) + filler reader/table (6+222)
-    // + t reader (6) -> t at 0x100, chunk label t_1 at 0x200. Runtime reads
-    // at idx 2
+    // 222-byte filler table (`aaa_fill` sorts first) pushes the main table
+    // to exactly 0x100: layout = goto (1) + main (21) + filler reader/table
+    // (6+222) + t reader (6) = 0x100, so `.align 256` is a no-op and t sits
+    // at 0x100 with chunk label t_1 immediately after chunk 0 at 0x200 and
+    // `__read_t_hi` after the table. Runtime reads at idx 2
     // (chunk 0), 256 (chunk-1 first), 299 (chunk-1 last), 290, and the
     // lo+carry case (idx 0xF0 + k 0x20 -> in-chunk 0x10, hi 1 -> table[272])
     // must return the right bytes. Bytes: 0..255 = 0x00..0xFF; 256+n = 0x11+n.
