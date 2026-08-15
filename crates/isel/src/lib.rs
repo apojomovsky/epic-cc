@@ -26,9 +26,9 @@ fn ssa_key(func: &str, name: &str) -> String {
 /// `cur_func` selects the current function's local entries.
 struct Gen<'m> {
     m: &'m Module,
-    addrs: &'m HashMap<String, u8>,
-    scratch: u8,
-    retval_lo: u8,
+    addrs: &'m HashMap<String, u16>,
+    scratch: u16,
+    retval_lo: u16,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
@@ -44,7 +44,7 @@ impl<'m> Gen<'m> {
     /// Resolve `{func}::{name}` to its base byte address (lo for multi-byte).
     /// Every address comes from the caller-supplied map; a missing value
     /// panics loudly rather than being allocated internally.
-    fn slot_addr(&self, func: &str, name: &str) -> u8 {
+    fn slot_addr(&self, func: &str, name: &str) -> u16 {
         *self
             .addrs
             .get(&ssa_key(func, name))
@@ -52,7 +52,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Resolve an operand value to its base byte address (lo for multi-byte).
-    fn val_addr(&self, v: &Val) -> u8 {
+    fn val_addr(&self, v: &Val) -> u16 {
         match v {
             Val::Reg(r) => self.slot_addr(self.cur_func, r),
             Val::Global(g) => *self
@@ -61,13 +61,13 @@ impl<'m> Gen<'m> {
                 .unwrap_or_else(|| panic!("isel: no address for @{g}")),
             Val::Const(k) => {
                 assert!(*k >= 0 && *k <= 255, "isel: const {k} out of byte range");
-                *k as u8
+                *k as u16
             }
         }
     }
 
     /// Resolve a memory pointer ("@name" global or "%name" slot) to an address.
-    fn ptr_addr(&self, p: &str) -> u8 {
+    fn ptr_addr(&self, p: &str) -> u16 {
         if let Some(g) = p.strip_prefix('@') {
             *self
                 .addrs
@@ -88,11 +88,11 @@ impl<'m> Gen<'m> {
             }
             Val::Reg(r) => {
                 let a = self.val_addr(&Val::Reg(r.clone()));
-                self.emit(format!("    MOVF 0x{:02X}, W", a + idx));
+                self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
             Val::Global(g) => {
                 let a = self.val_addr(&Val::Global(g.clone()));
-                self.emit(format!("    MOVF 0x{:02X}, W", a + idx));
+                self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
         }
     }
@@ -106,20 +106,20 @@ impl<'m> Gen<'m> {
             }
             Val::Reg(r) => {
                 let a = self.val_addr(&Val::Reg(r.clone()));
-                self.emit(format!("    XORWF 0x{:02X}, W", a + idx));
+                self.emit(format!("    XORWF 0x{:02X}, W", a + u16::from(idx)));
             }
             Val::Global(g) => {
                 let a = self.val_addr(&Val::Global(g.clone()));
-                self.emit(format!("    XORWF 0x{:02X}, W", a + idx));
+                self.emit(format!("    XORWF 0x{:02X}, W", a + u16::from(idx)));
             }
         }
     }
 
     /// Copy `val` (width `ty`) into the slot starting at `dst`.
-    fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u8) {
+    fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
         for i in 0..ty.bytes() {
             self.emit_load_byte(val, i);
-            self.emit(format!("    MOVWF 0x{:02X}", dst + i));
+            self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
         }
     }
 
@@ -198,7 +198,7 @@ impl<'m> Gen<'m> {
     /// `d = a + b` for i16 (either operand may be a register; at most one a
     /// const). Low byte adds, then the high byte adds with the carry from the
     /// low byte folded in via BTFSC/ADDLW.
-    fn emit_add16(&mut self, a: &Val, b: &Val, dst: u8) {
+    fn emit_add16(&mut self, a: &Val, b: &Val, dst: u16) {
         let (reg, other) = match (a, b) {
             (Val::Reg(r), o) => (r.clone(), o),
             (o, Val::Reg(r)) => (r.clone(), o),
@@ -234,7 +234,7 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = a & b` for i16: an AND per byte.
-    fn emit_and16(&mut self, a: &Val, b: &Val, dst: u8) {
+    fn emit_and16(&mut self, a: &Val, b: &Val, dst: u16) {
         let (reg, other) = match (a, b) {
             (Val::Reg(r), o) => (r.clone(), o),
             (o, Val::Reg(r)) => (r.clone(), o),
@@ -286,8 +286,8 @@ impl<'m> Gen<'m> {
             let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d);
             for i in 0..t.bytes() {
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + i));
-                self.emit(format!("    MOVWF 0x{:02X}", da + i));
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + u16::from(i)));
+                self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
             }
         }
     }
@@ -298,8 +298,8 @@ impl<'m> Gen<'m> {
                 assert!(l.ty != Ty::I1, "isel: only i8/i16 loads supported");
                 let (src, dst) = (self.ptr_addr(&l.ptr), self.slot_addr(self.cur_func, &l.dst));
                 for k in 0..l.ty.bytes() {
-                    self.emit(format!("    MOVF 0x{:02X}, W", src + k));
-                    self.emit(format!("    MOVWF 0x{:02X}", dst + k));
+                    self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
                 }
             }
             Inst::Store(s) => {
@@ -354,10 +354,10 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &z.dst);
                 for i in 0..z.from.bytes() {
                     self.emit_load_byte(&z.val, i);
-                    self.emit(format!("    MOVWF 0x{:02X}", da + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
                 }
                 for i in z.from.bytes()..z.to.bytes() {
-                    self.emit(format!("    CLRF 0x{:02X}", da + i));
+                    self.emit(format!("    CLRF 0x{:02X}", da + u16::from(i)));
                 }
             }
             Inst::Trunc(t) => {
@@ -368,7 +368,7 @@ impl<'m> Gen<'m> {
                 let da = self.slot_addr(self.cur_func, &t.dst);
                 for i in 0..t.to.bytes() {
                     self.emit_load_byte(&t.val, i);
-                    self.emit(format!("    MOVWF 0x{:02X}", da + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
                 }
             }
             Inst::Icmp(ic) => {
@@ -409,7 +409,7 @@ impl<'m> Gen<'m> {
                 // Copy the value into the fixed retval slots, then RETURN.
                 for i in 0..ty.bytes() {
                     self.emit_load_byte(v, i);
-                    self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo + u16::from(i)));
                 }
                 self.emit("    RETURN".to_string());
             }
@@ -422,28 +422,16 @@ impl<'m> Gen<'m> {
 ///
 /// `addrs` is the complete address map from `alloc`: globals by name, locals
 /// by `{func}::{name}` (IR value names without `%`). isel does no slot
-/// allocation — every value's address is read from the map. The layout
-/// follows the spike: the icmp scratch byte sits at `end_of_globals` (max
-/// global addr + size) and the retval slots at `end_of_globals+1/+2`
-/// (probe: globals 0x20/0x21 → scratch 0x22, retval 0x23/0x24).
-pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
-    // end_of_globals = max over the address map of (global addr + size). The
-    // scratch and retval slots live immediately after it so a large global
-    // array can never collide with them. Globals absent from the map (e.g.
-    // const/failed modules) don't move the end.
-    let end_of_globals = m
-        .globals
-        .iter()
-        .fold(0x20u8, |end, g| match addrs.get(&g.name) {
-            Some(&a) => end.max(a.wrapping_add(g.ty.bytes())),
-            None => end,
-        });
-    // end_of_globals must stay within bank-0 GPR range (<= 0x7C): a global
-    // ending at >= 0xFC would wrap the u8 scratch/retval arithmetic in
-    // release builds and silently miscompile; guard it loudly.
-    debug_assert!(end_of_globals <= 0x7C, "isel: globals exceed bank-0 layout");
-    let scratch = end_of_globals;
-    let retval_lo = end_of_globals + 1;
+/// allocation — every value's address is read from the map. The icmp scratch
+/// byte and the two retval bytes live in fixed common RAM (scratch `0x70`,
+/// retval `0x71`/`0x72`): bank-independent, never used by locals (M3), so no
+/// BANKSEL is ever needed for them.
+pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
+    // The icmp scratch byte and the two retval bytes are fixed common-RAM
+    // constants (bank-independent, common RAM 0x70-0x7F is never used by
+    // locals, so no collision).
+    let scratch: u16 = 0x70;
+    let retval_lo: u16 = 0x71;
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
         "    list p=16f877a".to_string(),
@@ -515,7 +503,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
                 // clang -O1 emits this for loop-carried swaps), no ordering
                 // works without a temp register, so panic loudly rather than
                 // silently miscompile.
-                let pending: Vec<(u8, Option<u8>, Ty, Val)> = copies
+                let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
                     .iter()
                     .map(|(dst, ty, val)| {
                         let da = g.slot_addr(g.cur_func, dst);
