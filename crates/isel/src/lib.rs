@@ -1085,15 +1085,16 @@ impl<'m> Gen<'m> {
 
     // ---- M8 Task 3: mul/div/rem runtime routine recipes ----
 
-    /// Every recipe slot must sit in bank 0 (≤ 0xFF): the loops are
-    /// skip-sensitive (BTFSS + GOTO, DECFSZ + GOTO), and a BANKSEL the
-    /// banking pass would insert for a banked slot would change the skip
-    /// targets — loud, documented limitation (multi-bank runtime routines
-    /// are a follow-up).
+    /// Every recipe slot must sit in bank 0 (≤ 0x7F): 0x80-0xEF maps to
+    /// bank 1, and the loops are skip-sensitive (BTFSS + GOTO, DECFSZ +
+    /// GOTO) — a BANKSEL the banking pass would insert for a banked slot
+    /// would change the skip targets. Loud, documented limitation
+    /// (multi-bank runtime routines are a follow-up); the bound matches the
+    /// asm encoder's own ≤ 0x7F file-register range.
     fn assert_bank0(&self, addrs: &[u16], routine: &str) {
         for &a in addrs {
             assert!(
-                a <= 0xFF,
+                a <= 0x7F,
                 "isel: {routine} slot 0x{a:02X} out of bank-0 range (recipe loops are skip-sensitive; a BANKSEL would change skip targets)"
             );
         }
@@ -1344,6 +1345,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BTFSS 0x{num:02X}, 7"));
                 self.emit(format!("    GOTO {l_den}"));
                 self.emit(format!("    BSF 0x{flags:02X}, 1")); // remainder sign follows dividend
+                self.emit(format!("    BSF 0x{flags:02X}, 0")); // quotient negate: num<0
                 self.emit(format!("    COMF 0x{num:02X}, F"));
                 self.emit(format!("    INCF 0x{num:02X}, F")); // num = |num|
                 self.emit(format!("{l_den}:"));
@@ -1351,9 +1353,8 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    GOTO {l_go}"));
                 self.emit(format!("    COMF 0x{den:02X}, F"));
                 self.emit(format!("    INCF 0x{den:02X}, F")); // den = |den|
-                self.emit(format!("    BTFSC 0x{flags:02X}, 1"));
-                self.emit(format!("    GOTO {l_go}"));
-                self.emit(format!("    BSF 0x{flags:02X}, 0")); // negate quotient
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit(format!("    XORWF 0x{flags:02X}, F")); // bit0 ^= den<0: neg_q = num<0 XOR den<0
                 self.emit(format!("{l_go}:"));
                 self.emit(format!("    CLRF 0x{rem_lo:02X}"));
                 self.emit(format!("    CLRF 0x{rem_hi:02X}"));
@@ -1417,15 +1418,15 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    CLRF 0x{flags:02X}"));
                 self.emit(format!("    BTFSS 0x{:02X}, 7", num + 1));
                 self.emit(format!("    GOTO {l_den}"));
-                self.emit(format!("    BSF 0x{flags:02X}, 1"));
+                self.emit(format!("    BSF 0x{flags:02X}, 1")); // remainder sign follows dividend
+                self.emit(format!("    BSF 0x{flags:02X}, 0")); // quotient negate: num<0
                 self.neg16_in_place(num); // num = |num|
                 self.emit(format!("{l_den}:"));
                 self.emit(format!("    BTFSS 0x{:02X}, 7", den + 1));
                 self.emit(format!("    GOTO {l_go}"));
                 self.neg16_in_place(den); // den = |den|
-                self.emit(format!("    BTFSC 0x{flags:02X}, 1"));
-                self.emit(format!("    GOTO {l_go}"));
-                self.emit(format!("    BSF 0x{flags:02X}, 0"));
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit(format!("    XORWF 0x{flags:02X}, F")); // bit0 ^= den<0: neg_q = num<0 XOR den<0
                 self.emit(format!("{l_go}:"));
                 self.emit(format!("    CLRF 0x{rem_lo:02X}"));
                 self.emit(format!("    CLRF 0x{rem_hi:02X}"));

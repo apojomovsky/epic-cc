@@ -2162,7 +2162,8 @@ fn byval_call_with_global_arg_simulates() {
 // RETURN. Args arrive in `{func}::{param}` slots (emit_call copies them), the
 // result goes to the fixed retval slots (0x71/0x72), and working state lives
 // in `{func}::__scr` at the Task-2 contract offsets. All slot addresses must
-// stay ≤ 0xFF (bank-0, loud) — the loops are skip-sensitive.
+// stay ≤ 0x7F (bank 0, loud) — the loops are skip-sensitive and a BANKSEL
+// would change the skip targets.
 
 /// The injected routine signatures (ret, params, `__scr` size), mirroring
 /// legalize's injection exactly (the Task-2 contract).
@@ -2419,6 +2420,10 @@ fn mul_div_rem_routines_simulate_correctly() {
         ("__srem_i8", &[0xFB], &[0x03], &[0xFE]),
         ("__sdiv_i16", &[0xED, 0xFF], &[0xFD, 0xFF], &[0x06, 0x00]),
         ("__srem_i16", &[0xED, 0xFF], &[0x03, 0x00], &[0xFF, 0xFF]),
+        // signed: exactly one operand negative — -5/3 = -1 = 0xFF;
+        // -19/3 = -6 = 0xFFFA (neg_q = num<0 XOR den<0, both arms).
+        ("__sdiv_i8", &[0xFB], &[0x03], &[0xFF]),
+        ("__sdiv_i16", &[0xED, 0xFF], &[0x03, 0x00], &[0xFA, 0xFF]),
         // Div-by-zero is LLVM poison (documented, no guard): den = 0 makes
         // every subtract succeed, so the quotient accumulates all-ones
         // (0xFFFF) and the remainder is never reduced — it ends up equal to
@@ -2444,11 +2449,27 @@ fn mul_div_rem_routines_simulate_correctly() {
     }
 }
 
-/// A routine slot past 0xFF would need BANKSELs inserted inside the
-/// skip-sensitive recipe loops — loud assert, never a silent miscompile.
+/// A routine slot that the banking pass would relocate (0xA0-0xEF is bank
+/// 1) would need BANKSELs inserted inside the skip-sensitive recipe loops —
+/// loud assert, never a silent miscompile. 0xA0 slid under the old ≤0xFF
+/// bound even though the asm encoder rejects file registers past 0x7F.
 #[test]
 #[should_panic(expected = "bank-0")]
 fn panics_on_banked_routine_slot() {
+    let (ir, mut map) = routine_module("__mul_u8");
+    for (k, v) in map.iter_mut() {
+        if k == "__mul_u8::__scr" {
+            *v = 0xA0; // bank 1 (0x80-0xEF): pre-fix this passed silently
+        }
+    }
+    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+}
+
+/// A routine slot past the 0x7F bound entirely (beyond RAM) must also fail
+/// loudly.
+#[test]
+#[should_panic(expected = "bank-0")]
+fn panics_on_routine_slot_past_ram() {
     let (ir, mut map) = routine_module("__mul_u8");
     for (k, v) in map.iter_mut() {
         if k == "__mul_u8::__scr" {
