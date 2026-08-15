@@ -506,3 +506,92 @@ fn parses_sret_param_and_call_arg() {
         other => panic!("expected Call, got {other:?}"),
     }
 }
+
+// Fix (1): unknown param type tokens must panic loudly, not silently
+// mis-parse into a width-2 slot.
+#[test]
+#[should_panic(expected = "i32")]
+fn param_unknown_type_token_panics() {
+    let ll = r#"
+define dso_local void @f(i32 %x) {
+  ret void
+}
+"#;
+    let _ = parse_ll(ll);
+}
+
+// Fix (4): nonzero const GEP prefix folds into k (regression guard for the
+// latent M5 fix): `getelementptr [4 x i8], ptr @x, i16 1, i16 %2` -> k=4 +
+// term (%2, 1).
+#[test]
+fn folds_nonzero_const_gep_prefix() {
+    let ll = r#"
+@x = dso_local global [4 x i8] zeroinitializer, align 1
+define dso_local void @main() {
+  %p = getelementptr [4 x i8], ptr @x, i16 1, i16 %2
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    match &m.funcs[0].blocks[0].insts[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("x".to_string()));
+            assert_eq!(g.k, 4);
+            assert_eq!(g.terms, vec![(1, "2".to_string())]);
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
+// Fix (5): volatile memcpy (`i1 true`) is accepted as an identical byte copy
+// (isvolatile is an LLVM optimization hint). s2.ll shape.
+const S2_VOLATILE_MEMCPY: &str = r#"
+%struct.S = type { i8, i16 }
+@g1 = dso_local global %struct.S zeroinitializer, align 2
+@g2 = dso_local global %struct.S zeroinitializer, align 2
+define dso_local void @main() local_unnamed_addr #0 {
+  tail call void @llvm.memcpy.p0.p0.i16(ptr align 2 @g1, ptr align 2 @g2, i16 4, i1 true), !tbaa.struct !2
+  ret void
+}
+"#;
+
+#[test]
+fn parses_volatile_memcpy() {
+    let m = parse_ll(S2_VOLATILE_MEMCPY);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert!(
+        body.iter().any(|i| matches!(i, Inst::Memcpy(mm)
+            if mm.len == 4 && mm.dst == Val::Global("g1".to_string())
+                && mm.src == Val::Global("g2".to_string()))),
+        "volatile memcpy must parse to Memcpy{{len:4}}: {body:?}"
+    );
+}
+
+// Fix (2): struct-typed GEP sources must panic loudly (not mis-fold the first
+// index as a field selector) until real struct descent is implemented.
+#[test]
+#[should_panic(expected = "struct-typed source")]
+fn struct_gep_source_panics() {
+    let ll = r#"
+%struct.S = type { i8, i16 }
+@s = dso_local global %struct.S zeroinitializer, align 2
+define dso_local void @main() {
+  %p = getelementptr %struct.S, ptr @s, i16 0, i16 1
+  ret void
+}
+"#;
+    let _ = parse_ll(ll);
+}
+
+// Fix (3): struct sizes/offsets exceeding 255 must assert.
+#[test]
+#[should_panic(expected = "255")]
+fn oversized_struct_panics() {
+    let ll = r#"
+%struct.Big = type { [300 x i8] }
+define dso_local void @main() {
+  ret void
+}
+"#;
+    let _ = parse_ll(ll);
+}
