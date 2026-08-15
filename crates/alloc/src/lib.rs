@@ -53,14 +53,19 @@ fn region_for(addr: u16) -> (u16, u16) {
 
 /// The start address for a `width`-byte value placed at the next free address
 /// `addr`: step across banks when `addr` has passed a region's end, keep the
-/// value even-aligned within its bank region, and panic past `0x1EF`.
+/// value even-aligned within its bank region (only 2-byte values need even
+/// alignment; larger arrays advance sequentially), and panic past `0x1EF`.
 fn place_at(addr: u16, width: u8) -> u16 {
+    // Only i16/2-byte globals need even alignment; larger arrays advance
+    // sequentially (min(size, 2) keeps a multi-byte value from being padded
+    // out to a multiple of its own width, which would waste RAM).
+    let align = width.min(2);
     let mut a = addr;
     loop {
         let (start, end) = region_for(a);
         let mut base = a.max(start);
-        if base % u16::from(width) != 0 {
-            base += u16::from(width) - (base % u16::from(width));
+        if base % u16::from(align) != 0 {
+            base += u16::from(align) - (base % u16::from(align));
         }
         if base + u16::from(width) - 1 <= end {
             return base;
@@ -119,8 +124,8 @@ fn frame_end(base: u16, widths: &[u8]) -> u16 {
 /// lines are informational). Panics loudly on a cyclic or unknown-function
 /// call graph, and if total demand exceeds `0x1EF`.
 pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
-    // 1. Globals: sequential, aligned to the type width (i16 -> even address),
-    // stepping through the banks as bank 0 GPR fills up. Each global spans
+    // 1. Globals: sequential, aligned to at most two bytes (i16 -> even
+    // address; larger arrays advance sequentially), stepping through the banks as bank 0 GPR fills up. Each global spans
     // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
     // sized array advances the free pointer by its byte count. Const globals
     // get no RAM address (their bytes live in flash) but are still recorded

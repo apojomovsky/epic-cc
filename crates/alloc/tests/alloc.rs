@@ -44,6 +44,28 @@ fn i16_global_advances_two_bytes() {
 }
 
 #[test]
+fn large_array_after_i16_lands_at_next_even_and_spans_sequentially() {
+    // An i16 global at 0x20-0x21 advances the free pointer to 0x22; an 8-byte
+    // array placed after it must land at the next even address (0x22), NOT
+    // be 8-byte-aligned to 0x28 (which would waste 0x22-0x27). The array's
+    // span is sequential, so the following global starts at 0x2A.
+    let mut m = parse(
+        "global a i16\n\
+         global arr i8\n\
+         global after i8\n\
+         fn main() -> void\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[1].size = 8; // arr: [8 x i8]
+    let out = allocate(&m, "depth 1\n");
+    assert_eq!(out.globals["a"], 0x20);
+    assert_eq!(out.globals["arr"], 0x22, "array must reuse the even slot");
+    // a spans 0x20-0x21, arr spans 0x22-0x29: the next global is sequential.
+    assert_eq!(out.globals["after"], 0x2A);
+}
+
+#[test]
 fn sibling_frames_share_a_base() {
     let m = overlay_module();
     let out = allocate(&m, "edge main a\nedge main b\ndepth 2\n");

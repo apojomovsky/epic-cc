@@ -6,10 +6,10 @@
 //! irparse -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
 //! banking -> peephole) on `crates/driver/tests/fixtures/ptr_probe.c`. It
 //! exercises both milestone-5 lowerings end to end: the FSR/INDF RAM
-//! indirect path (`ADDLW 0x28; MOVWF FSR; MOVF INDF, W` / `MOVWF INDF`) and
+//! indirect path (`ADDLW 0x22; MOVWF FSR; MOVF INDF, W` / `MOVWF INDF`) and
 //! the RETLW const-table reader (`CALL __read_table` -> `ADDLW LOW(table);
 //! MOVWF PCL` -> four `RETLW`s). `in` is the 16-bit global at 0x20-0x21;
-//! `out` is physical 0x30; the const `table` lives in flash.
+//! `out` is physical 0x2A; the const `table` lives in flash.
 use asm::assemble_file_to_hex;
 use pic14_sim::{parse_hex, Pic14};
 use std::process::Command;
@@ -36,6 +36,6 @@ fn ptr_probe_hex_matches_gpasm_and_runs() {
     let mut p = Pic14::new(parse_hex(&ours));
     p.ram_mut()[0x20] = 1; // in low byte = 1 (high byte stays 0)
     p.run(200_000);
-    assert_eq!(p.ram()[0x30], 20, "out == table[1] == 20");
+    assert_eq!(p.ram()[0x2A], 20, "out == table[1] == 20");
     assert!(p.halted());
 }
