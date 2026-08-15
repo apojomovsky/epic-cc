@@ -9,6 +9,7 @@ ir = { path = "../ir" }
 
 [dev-dependencies]
 pic14-sim = { path = "../sim" }
+asm = { path = "../asm" }
 
 [[bin]]
 name = "isel"

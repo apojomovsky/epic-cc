@@ -204,6 +204,117 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// W = byte `i` of `v`, with the sign bit complemented (XOR 0x80) when
+    /// `signed` and `i` is the high (sign) byte. Complementing the sign bit
+    /// maps signed order onto unsigned order — signed(a >= b) ==
+    /// unsigned((a ^ 0x80) >= (b ^ 0x80)) — so one flag recipe serves both.
+    fn emit_load_cmp_byte(&mut self, v: &Val, i: u8, signed: bool, high: u8) {
+        match v {
+            Val::Const(k) => {
+                let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                let b = if signed && i == high { byte ^ 0x80 } else { byte };
+                self.emit(format!("    MOVLW 0x{b:02X}"));
+            }
+            _ => {
+                let addr = self.val_addr(v) + u16::from(i);
+                if signed && i == high {
+                    self.emit("    MOVLW 0x80".to_string());
+                    self.emit(format!("    XORWF 0x{addr:02X}, W"));
+                } else {
+                    self.emit(format!("    MOVF 0x{addr:02X}, W"));
+                }
+            }
+        }
+    }
+
+    /// Set C = (a >= b) — unsigned or signed (sign-bit complement). For i8
+    /// the SUBWF/SUBLW also leaves Z = (a == b); for i16 the borrow chain's
+    /// final Z is only a byte-level flag, so predicates needing equality
+    /// append `emit_cmp_eq` (which preserves C). A const RHS becomes the
+    /// MOVLW/SUBWF subtrahend; a const LHS uses SUBLW (k - W) since a const
+    /// can never be read as a file register.
+    fn emit_cmp_c(&mut self, a: &Val, b: &Val, ty: Ty, signed: bool) {
+        let n = ty.bytes();
+        let high = n - 1;
+        match (a, b) {
+            (Val::Const(_), Val::Const(_)) => panic!("isel: constant folding not implemented"),
+            (Val::Const(k), _) => {
+                // SUBLW chain: W holds the b byte (+ borrow); SUBLW subtracts
+                // it from the const byte, so C = (a >= b).
+                self.emit_load_cmp_byte(b, 0, signed, high);
+                let k0 = (k & 0xFF) as u8;
+                // The low byte is the sign byte for i8: fold the complement
+                // in when signed.
+                let k0 = if signed && high == 0 { k0 ^ 0x80 } else { k0 };
+                self.emit(format!("    SUBLW 0x{k0:02X}"));
+                for i in 1..n {
+                    self.emit_load_cmp_byte(b, i, signed, high);
+                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                    self.emit("    ADDLW 0x01".to_string());
+                    let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    let kb = if signed && i == high { kb ^ 0x80 } else { kb };
+                    self.emit(format!("    SUBLW 0x{kb:02X}"));
+                }
+            }
+            _ => {
+                let aa = self.val_addr(a);
+                let use_scratch = signed; // signed file-LHS: SUBWF's file operand must be a ^ 0x80
+                if use_scratch {
+                    // Pre-store the complemented sign byte; MOVLW/XORWF/MOVWF
+                    // do not touch C, and the low-byte SUBWF below sets it.
+                    self.emit("    MOVLW 0x80".to_string());
+                    self.emit(format!("    XORWF 0x{:02X}, W", aa + high as u16));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                }
+                self.emit_load_cmp_byte(b, 0, signed, high);
+                self.emit(format!(
+                    "    SUBWF 0x{:02X}, W",
+                    if use_scratch && n == 1 { self.scratch } else { aa }
+                ));
+                for i in 1..n {
+                    self.emit_load_cmp_byte(b, i, signed, high);
+                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                    self.emit("    ADDLW 0x01".to_string());
+                    let f = if i == high && use_scratch {
+                        self.scratch
+                    } else {
+                        aa + i as u16
+                    };
+                    self.emit(format!("    SUBWF 0x{f:02X}, W"));
+                }
+            }
+        }
+    }
+
+    /// Materialize a flag predicate into `dst` as an i1. `cond` reads the C
+    /// and/or Z flags left by the immediately preceding compare/accumulation
+    /// (only MOVF/MOVLW/MOVWF/XORWF/XORLW/IORWF between, which never touch
+    /// C). `Z` is the eq materialization; `!Z` (ne) inverts it; `C`/`!C`
+    /// materialize uge/ult (and sge/slt); `C&&!Z`/`!C||Z` materialize
+    /// ugt/ule (and sgt/sle).
+    fn emit_materialize(&mut self, cond: &str, dst: u16) {
+        let (skip, adj2) = match cond {
+            "Z" => ("BTFSC STATUS, 2 ; Z", ""),
+            "!Z" => ("BTFSS STATUS, 2 ; Z", ""),
+            "C" => ("BTFSC STATUS, 0 ; C", ""),
+            "!C" => ("BTFSS STATUS, 0 ; C", ""),
+            "C&&!Z" => ("BTFSC STATUS, 0 ; C", "MOVLW 0x00"),
+            "!C||Z" => ("BTFSS STATUS, 0 ; C", "MOVLW 0x01"),
+            _ => panic!("isel: bad materialize cond {cond}"),
+        };
+        self.emit("    MOVLW 0x00".to_string());
+        self.emit(format!("    {skip}"));
+        self.emit("    MOVLW 0x01".to_string());
+        if !adj2.is_empty() {
+            // Second condition: C&&!Z clears the 1 when Z is set (equal);
+            // !C||Z sets it when Z is set. BTFSC STATUS,2 skips the
+            // adjustment when Z is clear.
+            self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+            self.emit(format!("    {adj2}"));
+        }
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
+    }
+
     /// Branch on `cond`: Z = (cond == 0); if Z is set (cond == 0) go to `f`,
     /// otherwise (cond != 0) go to `t`. Mirrors spike emit_cond_branch.
     fn emit_cond_branch(&mut self, cond: &Val, t: &str, f: &str) {
@@ -549,18 +660,46 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Icmp(ic) => {
-                assert!(
-                    ic.pred == "eq",
-                    "isel: only eq icmp supported (got {:?})",
-                    ic.pred
-                );
-                // XOR-based compare sets Z = (a == b); materialize the i1.
-                self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
                 let da = self.slot_addr(self.cur_func, &ic.dst);
-                self.emit("    MOVLW 0x00".to_string());
-                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
-                self.emit("    MOVLW 0x01".to_string());
-                self.emit(format!("    MOVWF 0x{da:02X}"));
+                match ic.pred.as_str() {
+                    "eq" => {
+                        // XOR-based compare sets Z = (a == b); materialize
+                        // the i1. Kept byte-identical.
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_materialize("Z", da);
+                    }
+                    "ne" => {
+                        // !Z: the eq compare with the inverted
+                        // materialization (BTFSS instead of BTFSC).
+                        self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        self.emit_materialize("!Z", da);
+                    }
+                    pred => {
+                        let (signed, need_z) = match pred {
+                            "ult" | "uge" => (false, false),
+                            "ugt" | "ule" => (false, true),
+                            "slt" | "sge" => (true, false),
+                            "sgt" | "sle" => (true, true),
+                            _ => panic!("isel: unknown icmp predicate {pred:?}"),
+                        };
+                        // C = (a >= b), unsigned or signed (sign-bit
+                        // complement). i8 leaves Z = (a == b) too.
+                        self.emit_cmp_c(&ic.a, &ic.b, ic.ty, signed);
+                        // The i16 borrow chain ends with a byte-level Z;
+                        // full equality needs the XOR accumulation, which
+                        // preserves C.
+                        if need_z && ic.ty.bytes() == 2 {
+                            self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
+                        }
+                        let mat = match pred {
+                            "ult" | "slt" => "!C",
+                            "uge" | "sge" => "C",
+                            "ugt" | "sgt" => "C&&!Z",
+                            _ => "!C||Z", // ule | sle
+                        };
+                        self.emit_materialize(mat, da);
+                    }
+                }
             }
             Inst::Select(s) => {
                 self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
