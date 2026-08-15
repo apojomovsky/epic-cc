@@ -47,9 +47,32 @@ fn no_redundant_banksel_within_same_bank() {
 
 #[test]
 fn banks_2_and_3_emit_rp1_and_rewrite() {
-    // Bank 2 (0x125): RP1 only. Bank 3 (0x195): RP0 additionally, RP1 kept.
-    let asm = "    MOVF 0x125, W\n    MOVF 0x195, W\n";
-    let expected = "    BSF STATUS, 6\n    MOVF 0x25, W\n    BSF STATUS, 5\n    MOVF 0x15, W\n";
+    // Bank 2 (0x125): RP1 only. Bank 3 (0x1A5): RP0 additionally, RP1 kept.
+    // 0x190-0x19F is unimplemented RAM (not bank-3 GPR), so the bank-3 test
+    // address starts at 0x1A0.
+    let asm = "    MOVF 0x125, W\n    MOVF 0x1A5, W\n";
+    let expected = "    BSF STATUS, 6\n    MOVF 0x25, W\n    BSF STATUS, 5\n    MOVF 0x25, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn branch_targets_reset_bank_each_arm_gets_full_banksel() {
+    // A label is a branch target: the runtime bank can arrive from any arm,
+    // so the linear predecessor's bank is not reliable. Each arm's first
+    // banked operand must re-establish BOTH RP bits with a full BANKSEL —
+    // never a partial diff against the fall-through bank.
+    let asm = "    MOVF 0xA0, W\narm1:\n    MOVF 0xA5, W\narm2:\n    MOVF 0x125, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\narm1:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\narm2:\n    BCF STATUS, 5\n    BSF STATUS, 6\n    MOVF 0x25, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn tracking_resumes_after_label_full_banksel() {
+    // After the label-triggered full BANKSEL the bank is known again:
+    // same-bank operands on that arm share it (no redundant BANKSEL), and a
+    // later bank change emits only the differing bit.
+    let asm = "    MOVF 0xA0, W\nL:\n    MOVF 0xA5, W\n    MOVWF 0xE5\n    MOVF 0x20, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\nL:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n    MOVWF 0x65\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
     assert_eq!(assign_banks(asm), expected);
 }
 

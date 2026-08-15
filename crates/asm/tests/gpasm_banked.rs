@@ -5,7 +5,7 @@
 //! The fixture was captured from the driver's full pipeline (clang ->
 //! irparse -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
 //! banking -> peephole) on `crates/driver/tests/fixtures/banked.c`. It
-//! exercises the milestone-4 banking output end to end: 197 `BCF/BSF STATUS,
+//! exercises the milestone-4 banking output end to end: 199 `BCF/BSF STATUS,
 //! 5/6` BANKSELs (numeric RP-bit operands — no RP0/RP1 symbol definitions
 //! needed) plus bank-relative 7-bit file-register operands. `out` is physical
 //! 0xAA (bank 1); sum 1..90 = 4095, low byte 0xFF = 255.

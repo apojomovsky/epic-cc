@@ -276,8 +276,9 @@ fn i16_frame_stays_even_aligned_across_banks() {
 #[test]
 #[should_panic(expected = "0x1EF")]
 fn frame_exceeding_all_banks_panics() {
-    // 250 i16 locals = 500 bytes, more than the 464 GPR bytes across all four
-    // banks (0x20..0x1EF), so allocation panics past 0x1EF.
+    // 250 i16 locals = 500 bytes, more than the 320 GPR bytes across all four
+    // banks (4 x 80-byte regions, bank 3 at 0x1A0-0x1EF), so allocation
+    // panics past 0x1EF.
     let mut src = String::from("fn main() -> void\n  block entry:\n");
     for i in 0..250 {
         src.push_str(&format!("    %v{i} = add i16 1, 2\n"));

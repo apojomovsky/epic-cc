@@ -22,10 +22,10 @@
 
 ## The bank model (the load-bearing design)
 
-- Physical address space: 512 bytes (`0x000–0x1FF`). Bank 0 GPR `0x20–0x6F`, bank 1 `0xA0–0xEF`, bank 2 `0x120–0x16F`, bank 3 `0x190–0x1EF`; common `0x70–0x7F` in all banks; SFRs `0x00–0x1F` bank-independent (our emitted SFRs — STATUS/FSR/PCL/PCLATH/INDF — are all mirrored).
+- Physical address space: 512 bytes (`0x000–0x1FF`). Bank 0 GPR `0x20–0x6F`, bank 1 `0xA0–0xEF`, bank 2 `0x120–0x16F`, bank 3 `0x1A0–0x1EF` (0x190–0x19F is unimplemented RAM); common `0x70–0x7F` in all banks; SFRs `0x00–0x1F` bank-independent (our emitted SFRs — STATUS/FSR/PCL/PCLATH/INDF — are all mirrored).
 - `bank = (STATUS >> 5) & 0x3` (RP1:RP0). `resolve(f) = if f in 0x70–0x7F { f } else if f in 0x20–0x6F { f + bank*0x80 } else { f }`.
-- `alloc` assigns bank 0 first (`0x20–0x6F` after globals/scratch/retval/frames, then common `0x70–0x7F` for the overlay frames when bank 0 GPR is exhausted? **No — keep it simple: bank 0 GPR 0x20–0x6F, then bank 1 0xA0–0xEF, then bank 2, then bank 3; common RAM stays unused by locals (as in M3)**), and panics if total demand exceeds 368 bytes of GPR.
-- `banking` (the rewritten `assign_banks`): scan the `.asm`; for each file-register operand (byte-oriented and bit-oriented ops; **not** literal ops — the M3 skip list stays), infer bank from the operand value (`0x00–0x1F`/`0x70–0x7F` → no bank needed; `0x20–0x6F` → bank 0; `0xA0–0xEF` → bank 1; `0x120–0x16F` → bank 2; `0x190–0x1EF` → bank 3); if the needed bank differs from the tracked current bank, emit `BANKSEL <bank>` (as `BCF/BSF STATUS, RP0` and `BCF/BSF STATUS, RP1` for the two bits), update the tracked bank, and rewrite the operand to `physical & 0x7F`. Literal immediates are never banked.
+- `alloc` assigns bank 0 first (`0x20–0x6F` after globals/scratch/retval/frames, then common `0x70–0x7F` for the overlay frames when bank 0 GPR is exhausted? **No — keep it simple: bank 0 GPR 0x20–0x6F, then bank 1 0xA0–0xEF, then bank 2, then bank 3; common RAM stays unused by locals (as in M3)**), and panics if total demand exceeds 320 bytes of GPR (4 × 80-byte regions).
+- `banking` (the rewritten `assign_banks`): scan the `.asm`; for each file-register operand (byte-oriented and bit-oriented ops; **not** literal ops — the M3 skip list stays), infer bank from the operand value (`0x00–0x1F`/`0x70–0x7F` → no bank needed; `0x20–0x6F` → bank 0; `0xA0–0xEF` → bank 1; `0x120–0x16F` → bank 2; `0x1A0–0x1EF` → bank 3); if the needed bank differs from the tracked current bank, emit `BANKSEL <bank>` (as `BCF/BSF STATUS, RP0` and `BCF/BSF STATUS, RP1` for the two bits), update the tracked bank, and rewrite the operand to `physical & 0x7F`. The tracked bank is reset to UNKNOWN at every label (branch target), so the next banked operand there emits a full `BANKSEL` re-establishing both RP bits. Literal immediates are never banked.
 
 ---
 
@@ -58,11 +58,11 @@
 - Test: `crates/alloc/tests/alloc.rs` (extend)
 
 **Interfaces:**
-- Produces: physical addresses in the map — globals and local frames fill bank 0 GPR (`0x20–0x6F`, after scratch/retval for locals), then bank 1 (`0xA0–0xEF`), bank 2 (`0x120–0x16F`), bank 3 (`0x190–0x1EF`); common RAM still unused by locals (M3 decision stands). Panic loudly if demand exceeds 368 bytes (`0x1EF` end).
+- Produces: physical addresses in the map — globals and local frames fill bank 0 GPR (`0x20–0x6F`, after scratch/retval for locals), then bank 1 (`0xA0–0xEF`), bank 2 (`0x120–0x16F`), bank 3 (`0x1A0–0x1EF`); common RAM still unused by locals (M3 decision stands). Panic loudly if demand exceeds 320 bytes (`0x1EF` end).
 
 - [ ] **Step 1: Extend the failing test** — a module with enough global bytes to overflow bank 0 (e.g. 90 i8 globals): assert the 81st global gets a physical address ≥ `0xA0`; and a module whose local frames overflow bank 0 (e.g. a function with ≥ 90 bytes of locals): assert the frame crosses into `0xA0+`. Assert the even-alignment for i16 still holds within each bank.
 - [ ] **Step 2: Run to verify it fails** (currently everything packs into 0x20+ with no bank break).
-- [ ] **Step 3: Implement** — two allocators (globals, frames) that each step through banks: `next` address; when `next` passes `0x6F`, jump to `0xA0`; when past `0xEF`, `0x120`; when past `0x16F`, `0x190`; panic past `0x1EF`. (Physical addresses; i16 even-aligned within each bank region.)
+- [ ] **Step 3: Implement** — two allocators (globals, frames) that each step through banks: `next` address; when `next` passes `0x6F`, jump to `0xA0`; when past `0xEF`, `0x120`; when past `0x16F`, `0x1A0`; panic past `0x1EF`. (Physical addresses; i16 even-aligned within each bank region.)
 - [ ] **Step 4: Run to verify it passes**.
 - [ ] **Step 5: Commit** — `git commit -m "feat(alloc): assign addresses across all four banks"`.
 
