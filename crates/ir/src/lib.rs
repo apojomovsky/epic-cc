@@ -35,6 +35,8 @@ pub struct Br { pub target: String }
 pub struct BrCond { pub cond: Val, pub t: String, pub f: String }
 #[derive(Clone, Debug)]
 pub struct Phi { pub dst: String, pub ty: Ty, pub incoming: Vec<(Val, String)> }
+#[derive(Clone, Debug)]
+pub struct Gep { pub dst: String, pub base: String, pub offset: Val } // base = global name, no '@'
 
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -50,6 +52,7 @@ pub enum Inst {
     Br(Br),
     BrCond(BrCond),
     Phi(Phi),
+    Gep(Gep),
 }
 
 #[derive(Clone, Debug)]
@@ -59,7 +62,7 @@ pub struct Block { pub label: String, pub insts: Vec<Inst> }
 pub struct Func { pub name: String, pub ret: Option<Ty>, pub params: Vec<(Ty, String)>, pub blocks: Vec<Block> }
 
 #[derive(Clone, Debug)]
-pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub addr: Option<u8> }
+pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u8, pub bytes: Vec<u8>, pub addr: Option<u8> }
 
 #[derive(Clone, Debug)]
 pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func> }
@@ -108,6 +111,7 @@ fn inst_str(i: &Inst) -> String {
         Inst::Br(b) => format!("br {}", b.target),
         Inst::BrCond(b) => format!("br i1 {} {} {}", val_str(&b.cond), b.t, b.f),
         Inst::Phi(p) => format!("%{} = phi {} {}", p.dst, ty_str(p.ty), p.incoming.iter().map(|(v, l)| format!("{} {}", val_str(v), l)).collect::<Vec<_>>().join(" ")),
+        Inst::Gep(g) => format!("%{} = gep @{} {}", g.dst, g.base, val_str(&g.offset)),
     }
 }
 
@@ -132,7 +136,7 @@ pub fn parse(text: &str) -> Module {
             let name = parts[0].to_string();
             let ty = parse_ty(parts[1]);
             let addr = if parts.len() >= 3 { parse_addr(parts[2]) } else { None };
-            globals.push(Global { name, ty, is_const, addr });
+            globals.push(Global { name, ty, is_const, size: ty.bytes(), bytes: Vec::new(), addr });
         } else if line.starts_with("fn ") {
             let rest = &line[3..];
             let open = rest.find('(').unwrap();
@@ -278,6 +282,12 @@ fn parse_inst(line: &str) -> Inst {
             incoming.push((val, pred));
         }
         return Inst::Phi(Phi { dst, ty: t, incoming });
+    }
+    if let Some(rest) = body.strip_prefix("gep ") {
+        let mut it = rest.split_whitespace();
+        let base = it.next().unwrap().trim_start_matches('@').to_string();
+        let offset = parse_val(it.next().unwrap());
+        return Inst::Gep(Gep { dst, base, offset });
     }
     let mut it = body.split_whitespace();
     let op = it.next().unwrap();

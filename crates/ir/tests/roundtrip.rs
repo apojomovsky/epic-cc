@@ -25,6 +25,38 @@ fn global_type_and_addr_roundtrip() {
 }
 
 #[test]
+fn gep_and_sized_globals_roundtrip() {
+    let text = "global ram i8 @0x25\nconst table i8\nfn main() -> void\n  block entry:\n    %p = gep @ram %3\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    // stable fixed point: parse -> serialize -> parse -> serialize
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    // gep line round-trips verbatim
+    assert!(out.contains("%p = gep @ram %3"), "missing gep line\n---\n{out}");
+    // sized global keeps its address
+    assert!(out.contains("global ram i8 @0x25"), "missing global addr\n---\n{out}");
+    // const global carries no @addr in the canonical text
+    assert!(out.contains("const table i8\n"), "missing const line\n---\n{out}");
+    assert!(!out.contains("const table i8 @"), "const must serialize without an address\n---\n{out}");
+    // parsed scalar global sizes default from the type
+    assert_eq!(m.globals[0].size, ir::Ty::I8.bytes());
+    assert_eq!(m.globals[1].size, ir::Ty::I8.bytes());
+    assert_eq!(m.globals[0].bytes, Vec::<u8>::new());
+    // size/bytes are struct-only metadata: a Global constructed with them keeps them
+    let g = ir::Global {
+        name: "ram".into(),
+        ty: ir::Ty::I8,
+        is_const: false,
+        addr: Some(0x25),
+        size: 8,
+        bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+    };
+    assert_eq!(g.size, 8);
+    assert_eq!(g.bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+}
+
+#[test]
 fn roundtrips_control_flow_call_and_cast() {
     let text = "fn main() -> void\n\
   block main:\n\
