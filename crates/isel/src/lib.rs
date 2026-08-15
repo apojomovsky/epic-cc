@@ -676,6 +676,11 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         out.push(format!("    ADDLW LOW({})", g.name));
         out.push("    MOVWF PCL".to_string());
         out.push(format!("{}:", g.name));
+        assert!(
+            !g.bytes.is_empty(),
+            "isel: const @{} has no table bytes",
+            g.name
+        );
         for b in &g.bytes {
             out.push(format!("    RETLW 0x{b:02X}"));
         }

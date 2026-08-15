@@ -13,30 +13,30 @@ main:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x20, W
-    MOVWF 0x31
+    MOVWF 0x2B
     MOVF 0x21, W
-    MOVWF 0x32
-    MOVF 0x31, W
+    MOVWF 0x2C
+    MOVF 0x2B, W
     ANDLW 0x03
-    MOVWF 0x33
-    MOVF 0x32, W
+    MOVWF 0x2D
+    MOVF 0x2C, W
     ANDLW 0x00
-    MOVWF 0x34
-    MOVF 0x33, W
+    MOVWF 0x2E
+    MOVF 0x2D, W
     CALL __read_table
-    MOVWF 0x35
-    MOVF 0x33, W
-    ADDLW 0x28
+    MOVWF 0x2F
+    MOVF 0x2D, W
+    ADDLW 0x22
     MOVWF FSR
-    MOVF 0x35, W
+    MOVF 0x2F, W
     MOVWF INDF
-    MOVF 0x33, W
-    ADDLW 0x28
+    MOVF 0x2D, W
+    ADDLW 0x22
     MOVWF FSR
     MOVF INDF, W
-    MOVWF 0x36
-    MOVF 0x36, W
     MOVWF 0x30
+    MOVF 0x30, W
+    MOVWF 0x2A
     RETURN
 
 __read_table:
