@@ -9,9 +9,10 @@
 //!
 //! Both allocators assign **physical** addresses and step through the four
 //! banks: bank 0 GPR `0x20-0x6F`, bank 1 `0xA0-0xEF`, bank 2 `0x120-0x16F`,
-//! bank 3 `0x190-0x1EF`; demand past `0x1EF` panics. Common RAM (`0x70-0x7F`)
-//! is never used by locals (M3 decision) — the bank progression jumps past
-//! it — and holds the fixed scratch/retval bytes instead.
+//! bank 3 `0x1A0-0x1EF` (`0x190-0x19F` is unimplemented RAM); demand past
+//! `0x1EF` panics. Common RAM (`0x70-0x7F`) is never used by locals (M3
+//! decision) — the bank progression jumps past it — and holds the fixed
+//! scratch/retval bytes instead.
 
 use std::collections::{HashMap, HashSet};
 
@@ -30,8 +31,9 @@ pub struct AllocLayout {
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
 /// advancing to the next bank when `addr` has spilled past the current one.
-/// Common RAM (`0x70-0x7F`) and SFRs fall into the next bank's range, so
-/// locals never land in common RAM.
+/// Common RAM (`0x70-0x7F`), SFRs, and the unimplemented gap
+/// (`0x170-0x19F`) fall into the next bank's range, so locals never land
+/// there.
 fn region_for(addr: u16) -> (u16, u16) {
     if addr <= 0x6F {
         (0x20, 0x6F)
@@ -40,7 +42,7 @@ fn region_for(addr: u16) -> (u16, u16) {
     } else if addr <= 0x16F {
         (0x120, 0x16F)
     } else if addr <= 0x1EF {
-        (0x190, 0x1EF)
+        (0x1A0, 0x1EF)
     } else {
         panic!("alloc: GPR demand exceeds 0x1EF ({addr:#06x})");
     }

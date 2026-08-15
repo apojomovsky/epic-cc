@@ -8,6 +8,8 @@ STATUS equ 0x03
 
 main:
     MOVLW 0x01
+    BCF STATUS, 5
+    BCF STATUS, 6
     MOVWF 0x20
     MOVLW 0x02
     MOVWF 0x21
@@ -718,119 +720,119 @@ main:
     MOVF 0x6B, W
     BSF STATUS, 5
     BSF STATUS, 6
-    MOVWF 0x10
-    MOVF 0x10, W
+    MOVWF 0x20
+    MOVF 0x20, W
     BCF STATUS, 5
     ADDWF 0x6F, W
     BSF STATUS, 5
-    MOVWF 0x11
+    MOVWF 0x21
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x6C, W
     BSF STATUS, 5
     BSF STATUS, 6
-    MOVWF 0x12
-    MOVF 0x12, W
-    ADDWF 0x11, W
-    MOVWF 0x13
+    MOVWF 0x22
+    MOVF 0x22, W
+    ADDWF 0x21, W
+    MOVWF 0x23
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x6D, W
     BSF STATUS, 5
     BSF STATUS, 6
-    MOVWF 0x14
-    MOVF 0x14, W
-    ADDWF 0x13, W
-    MOVWF 0x15
+    MOVWF 0x24
+    MOVF 0x24, W
+    ADDWF 0x23, W
+    MOVWF 0x25
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x6E, W
     BSF STATUS, 5
     BSF STATUS, 6
-    MOVWF 0x16
-    MOVF 0x16, W
-    ADDWF 0x15, W
-    MOVWF 0x17
-    BCF STATUS, 5
-    BCF STATUS, 6
-    MOVF 0x6F, W
-    BSF STATUS, 5
-    BSF STATUS, 6
-    MOVWF 0x18
-    MOVF 0x18, W
-    ADDWF 0x17, W
-    MOVWF 0x19
-    BCF STATUS, 6
-    MOVF 0x20, W
-    BSF STATUS, 6
-    MOVWF 0x1A
-    MOVF 0x1A, W
-    ADDWF 0x19, W
-    MOVWF 0x1B
-    BCF STATUS, 6
-    MOVF 0x21, W
-    BSF STATUS, 6
-    MOVWF 0x1C
-    MOVF 0x1C, W
-    ADDWF 0x1B, W
-    MOVWF 0x1D
-    BCF STATUS, 6
-    MOVF 0x22, W
-    BSF STATUS, 6
-    MOVWF 0x1E
-    MOVF 0x1E, W
-    ADDWF 0x1D, W
-    MOVWF 0x1F
-    BCF STATUS, 6
-    MOVF 0x23, W
-    BSF STATUS, 6
-    MOVWF 0x20
-    MOVF 0x20, W
-    ADDWF 0x1F, W
-    MOVWF 0x21
-    BCF STATUS, 6
-    MOVF 0x24, W
-    BSF STATUS, 6
-    MOVWF 0x22
-    MOVF 0x22, W
-    ADDWF 0x21, W
-    MOVWF 0x23
-    BCF STATUS, 6
-    MOVF 0x25, W
-    BSF STATUS, 6
-    MOVWF 0x24
-    MOVF 0x24, W
-    ADDWF 0x23, W
-    MOVWF 0x25
-    BCF STATUS, 6
-    MOVF 0x26, W
-    BSF STATUS, 6
     MOVWF 0x26
     MOVF 0x26, W
     ADDWF 0x25, W
     MOVWF 0x27
+    BCF STATUS, 5
     BCF STATUS, 6
-    MOVF 0x27, W
+    MOVF 0x6F, W
+    BSF STATUS, 5
     BSF STATUS, 6
     MOVWF 0x28
     MOVF 0x28, W
     ADDWF 0x27, W
     MOVWF 0x29
     BCF STATUS, 6
-    MOVF 0x28, W
+    MOVF 0x20, W
     BSF STATUS, 6
     MOVWF 0x2A
     MOVF 0x2A, W
     ADDWF 0x29, W
     MOVWF 0x2B
     BCF STATUS, 6
-    MOVF 0x29, W
+    MOVF 0x21, W
     BSF STATUS, 6
     MOVWF 0x2C
     MOVF 0x2C, W
     ADDWF 0x2B, W
     MOVWF 0x2D
-    MOVF 0x2D, W
+    BCF STATUS, 6
+    MOVF 0x22, W
+    BSF STATUS, 6
+    MOVWF 0x2E
+    MOVF 0x2E, W
+    ADDWF 0x2D, W
+    MOVWF 0x2F
+    BCF STATUS, 6
+    MOVF 0x23, W
+    BSF STATUS, 6
+    MOVWF 0x30
+    MOVF 0x30, W
+    ADDWF 0x2F, W
+    MOVWF 0x31
+    BCF STATUS, 6
+    MOVF 0x24, W
+    BSF STATUS, 6
+    MOVWF 0x32
+    MOVF 0x32, W
+    ADDWF 0x31, W
+    MOVWF 0x33
+    BCF STATUS, 6
+    MOVF 0x25, W
+    BSF STATUS, 6
+    MOVWF 0x34
+    MOVF 0x34, W
+    ADDWF 0x33, W
+    MOVWF 0x35
+    BCF STATUS, 6
+    MOVF 0x26, W
+    BSF STATUS, 6
+    MOVWF 0x36
+    MOVF 0x36, W
+    ADDWF 0x35, W
+    MOVWF 0x37
+    BCF STATUS, 6
+    MOVF 0x27, W
+    BSF STATUS, 6
+    MOVWF 0x38
+    MOVF 0x38, W
+    ADDWF 0x37, W
+    MOVWF 0x39
+    BCF STATUS, 6
+    MOVF 0x28, W
+    BSF STATUS, 6
+    MOVWF 0x3A
+    MOVF 0x3A, W
+    ADDWF 0x39, W
+    MOVWF 0x3B
+    BCF STATUS, 6
+    MOVF 0x29, W
+    BSF STATUS, 6
+    MOVWF 0x3C
+    MOVF 0x3C, W
+    ADDWF 0x3B, W
+    MOVWF 0x3D
+    MOVF 0x3D, W
     BCF STATUS, 6
     MOVWF 0x2A
     RETURN
