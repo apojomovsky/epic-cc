@@ -25,7 +25,7 @@ fn inserts_banksel_when_bank_changes() {
     // Bank 1 then bank 0: BSF RP0 before the 0xA0 operand (rewritten to 0x20),
     // then BCF RP0 before returning to a bank-0 operand.
     let asm = "    MOVF 0xA0, W\n    MOVF 0x20, W\n";
-    let expected = "    BSF STATUS, RP0\n    MOVF 0x20, W\n    BCF STATUS, RP0\n    MOVF 0x20, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
     assert_eq!(assign_banks(asm), expected);
 }
 
@@ -41,7 +41,7 @@ fn common_and_sfr_operands_need_no_banksel() {
 fn no_redundant_banksel_within_same_bank() {
     // Two bank-1 operands in a row share one BANKSEL.
     let asm = "    MOVF 0xA0, W\n    MOVWF 0xE5\n";
-    let expected = "    BSF STATUS, RP0\n    MOVF 0x20, W\n    MOVWF 0x65\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    MOVWF 0x65\n";
     assert_eq!(assign_banks(asm), expected);
 }
 
@@ -49,7 +49,7 @@ fn no_redundant_banksel_within_same_bank() {
 fn banks_2_and_3_emit_rp1_and_rewrite() {
     // Bank 2 (0x125): RP1 only. Bank 3 (0x195): RP0 additionally, RP1 kept.
     let asm = "    MOVF 0x125, W\n    MOVF 0x195, W\n";
-    let expected = "    BSF STATUS, RP1\n    MOVF 0x25, W\n    BSF STATUS, RP0\n    MOVF 0x15, W\n";
+    let expected = "    BSF STATUS, 6\n    MOVF 0x25, W\n    BSF STATUS, 5\n    MOVF 0x15, W\n";
     assert_eq!(assign_banks(asm), expected);
 }
 
@@ -57,8 +57,8 @@ fn banks_2_and_3_emit_rp1_and_rewrite() {
 fn tracks_encountered_banksel_instructions() {
     // A hand-written BANKSEL to bank 1 means the following bank-1 operand
     // needs no new BANKSEL; the bank-0 operand that follows needs BCF RP0.
-    let asm = "    BSF STATUS, RP0\n    MOVF 0xA5, W\n    MOVF 0x20, W\n";
-    let expected = "    BSF STATUS, RP0\n    MOVF 0x25, W\n    BCF STATUS, RP0\n    MOVF 0x20, W\n";
+    let asm = "    BSF STATUS, 5\n    MOVF 0xA5, W\n    MOVF 0x20, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x25, W\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
     assert_eq!(assign_banks(asm), expected);
 }
 
@@ -77,7 +77,7 @@ fn banks_bcf_on_banked_gpr() {
     // regressed when the BANKSEL-recognition branch consumed the tokens before
     // the STATUS check, silently emitting the line verbatim).
     let asm = "    BCF 0xA0, 7\n";
-    let expected = "    BSF STATUS, RP0\n    BCF 0x20, 7\n";
+    let expected = "    BSF STATUS, 5\n    BCF 0x20, 7\n";
     assert_eq!(assign_banks(asm), expected);
 }
 
@@ -85,7 +85,7 @@ fn banks_bcf_on_banked_gpr() {
 fn banks_bsf_on_banked_gpr() {
     // Bank 2 from bank 0: RP1 only, then the operand rewritten to 0x20.
     let asm = "    BSF 0x120, 0\n";
-    let expected = "    BSF STATUS, RP1\n    BSF 0x20, 0\n";
+    let expected = "    BSF STATUS, 6\n    BSF 0x20, 0\n";
     assert_eq!(assign_banks(asm), expected);
 }
 
@@ -93,7 +93,7 @@ fn banks_bsf_on_banked_gpr() {
 fn status_banksel_and_gpr_bit_op_in_sequence() {
     // A genuine STATUS-bank op still updates the tracked bank, and a following
     // bit op on a same-bank GPR needs no new BANKSEL.
-    let asm = "    BSF STATUS, RP0\n    BSF 0xA0, 7\n";
-    let expected = "    BSF STATUS, RP0\n    BSF 0x20, 7\n";
+    let asm = "    BSF STATUS, 5\n    BSF 0xA0, 7\n";
+    let expected = "    BSF STATUS, 5\n    BSF 0x20, 7\n";
     assert_eq!(assign_banks(asm), expected);
 }

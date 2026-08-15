@@ -9,7 +9,8 @@
 ///
 /// `BANKSEL <n>` selects bank `n` by setting/clearing the two RP bits of
 /// `STATUS` (RP0 = bit 5, RP1 = bit 6); only the bits that change are
-/// emitted (`BCF`/`BSF STATUS, RP0/RP1`).
+/// emitted (`BCF`/`BSF STATUS, 5/6` — numeric bit operands, so no
+/// `RP0`/`RP1` symbol definitions are needed anywhere).
 ///
 /// # Panics
 ///
@@ -48,14 +49,14 @@ pub fn assign_banks(asm: &str) -> String {
             continue;
         };
 
-        // `BCF/BSF STATUS, RP0/RP1` — whether emitted here or already present
-        // — update the tracked bank.
+        // `BCF/BSF STATUS, 5/6` — whether emitted here or already present —
+        // update the tracked bank.
         if mne == "BCF" || mne == "BSF" {
             let reg = toks.get(1).copied().unwrap_or("").trim_end_matches([',', ';', ')']);
             let bit = toks.get(2).copied().unwrap_or("").trim_end_matches([',', ';', ')']);
-            if reg == "STATUS" && (bit == "RP0" || bit == "RP1") {
+            if reg == "STATUS" && (bit == "5" || bit == "6") {
                 let on = mne == "BSF";
-                if bit == "RP0" {
+                if bit == "5" {
                     rp0 = on;
                 } else {
                     rp1 = on;
@@ -106,13 +107,10 @@ pub fn assign_banks(asm: &str) -> String {
 }
 
 fn emit_banksel(out: &mut String, rp0: &mut bool, rp1: &mut bool, bank: u8) {
-    for (name, cur, target) in [
-        ("RP0", rp0, bank & 1 == 1),
-        ("RP1", rp1, bank & 2 == 2),
-    ] {
+    for (bit, cur, target) in [(5, rp0, bank & 1 == 1), (6, rp1, bank & 2 == 2)] {
         if *cur != target {
             let op = if target { "BSF" } else { "BCF" };
-            out.push_str(&format!("    {op} STATUS, {name}\n"));
+            out.push_str(&format!("    {op} STATUS, {bit}\n"));
             *cur = target;
         }
     }
