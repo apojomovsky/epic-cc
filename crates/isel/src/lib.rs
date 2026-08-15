@@ -1,8 +1,10 @@
 //! `isel` — instruction selection for the integer spine.
 //!
-//! Milestone-2 subset: lowers `load`/`store`, `add` and `and` (i8 and i16),
-//! `zext`/`trunc`, `call` (arg copies into the callee's param slots + retval
-//! copy), `ret` with and without a value, and eliminates `phi` by copying each
+//! Scalar surface (milestones 2-6): lowers `load`/`store`, the full binop
+//! set `add`/`sub`/`and`/`or`/`xor` (i8 and i16), `zext`/`sext`/`trunc`,
+//! all ten `icmp` predicates (eq/ne/ult/ule/ugt/uge/slt/sle/sgt/sge),
+//! `call` (arg copies into the callee's param slots + retval copy), `ret`
+//! with and without a value, and eliminates `phi` by copying each
 //! predecessor's incoming value into the phi destination at the end of the
 //! predecessor block, before its terminator. Any other instruction or binop
 //! panics.
@@ -652,6 +654,10 @@ impl<'m> Gen<'m> {
                 assert!(
                     x.from.bytes() == 1 && x.to.bytes() == 2,
                     "isel: sext only supports i8 -> i16"
+                );
+                assert!(
+                    !matches!(&x.val, Val::Const(_)),
+                    "isel: sext of a constant not supported (constant folding not implemented)"
                 );
                 let da = self.slot_addr(self.cur_func, &x.dst);
                 // Copy the low bytes unchanged.
