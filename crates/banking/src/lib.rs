@@ -6,10 +6,19 @@
 ///
 /// # Panics
 ///
-/// Panics if any `0x...` operand is `>= 0x80` (outside the bank-0/1/2/3 GPR
-/// range supported by milestone 1).
+/// Panics if any file-register `0x...` operand is `>= 0x80` (outside the
+/// bank-0/1/2/3 GPR range supported by milestone 1). Literal-immediate
+/// operands (`MOVLW`/`ADDLW`/`ANDLW`/`IORLW`/`XORLW`/`SUBLW`/`RETLW`) are
+/// 8-bit constants, not addresses, and are not range-checked.
 pub fn assign_banks(asm: &str) -> String {
     for line in asm.lines() {
+        let mne = line.split_whitespace().next().unwrap_or("");
+        if matches!(
+            mne,
+            "MOVLW" | "ADDLW" | "ANDLW" | "IORLW" | "XORLW" | "SUBLW" | "RETLW"
+        ) {
+            continue; // operand is a literal immediate, not a file register
+        }
         for tok in line.split_whitespace() {
             if let Some(hex) = tok.strip_prefix("0x") {
                 // operands carry trailing punctuation (e.g. `0x20,`)
