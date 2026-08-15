@@ -72,7 +72,11 @@ fn parse_val(s: &str) -> Val {
     }
 }
 
-/// Decode an LLVM string literal `c"..."` into bytes (`\XX` = hex escape).
+/// Decode an LLVM string literal `c"..."` into bytes. LLVM prints every
+/// byte outside the printable range (plus `"` and `\`) as a `\XX` hex
+/// escape, and a literal backslash byte 0x5C as the `\\` escape — so a
+/// const table spanning the printable range contains `\\` runs, which the
+/// hex-only decoder used to choke on.
 fn parse_string_literal(s: &str) -> Vec<u8> {
     let start = s.find('"').unwrap() + 1;
     let end = start + s[start..].find('"').unwrap();
@@ -80,7 +84,10 @@ fn parse_string_literal(s: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < chars.len() {
-        if chars[i] == '\\' && i + 2 < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '\\' {
+            out.push(b'\\');
+            i += 2;
+        } else if chars[i] == '\\' && i + 2 < chars.len() {
             let hi = chars[i + 1].to_digit(16).unwrap();
             let lo = chars[i + 2].to_digit(16).unwrap();
             out.push(((hi << 4) | lo) as u8);
