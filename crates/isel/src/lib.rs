@@ -298,15 +298,18 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `scratch = Σ scale×%reg`: W = 0, then per term W = %r once and
-    /// `ADDWF scratch,W; MOVWF scratch` `scale` times (×2 repeats the add).
+    /// `scratch = Σ scale×%reg`: W = 0, then per term
+    /// `MOVF %r,W; ADDWF scratch,W; MOVWF scratch` repeated `scale` times.
+    /// ADDWF f,W computes W = f + W, so W holds %r only until the first
+    /// ADDWF — it MUST be reloaded before each repetition or a scaled term
+    /// accumulates 2×scratch + %r (silent wrong-address miscompile).
     fn emit_accum_terms(&mut self, terms: &[(u8, String)]) {
         self.emit("    MOVLW 0x00".to_string());
         self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
         for (scale, r) in terms {
             let a = self.val_addr(&Val::Reg(r.clone()));
-            self.emit(format!("    MOVF 0x{a:02X}, W"));
             for _ in 0..*scale {
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
                 self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
                 self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
             }

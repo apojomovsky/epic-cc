@@ -743,9 +743,10 @@ fn gep_scaled_sum_accumulates_in_scratch() {
         ("main::w", 0x2C),
     ]);
     let asm = select(&m, &addrs);
-    // scale-2 term: scratch = 2×%i via a repeated ADDWF, then FSR = scratch + a_lo + k.
+    // scale-2 term: scratch = 2×%i — %i is reloaded into W before each
+    // ADDWF (ADDWF f,W computes W = f + W), then FSR = scratch + a_lo + k.
     assert!(
-        asm.contains("MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
+        asm.contains("MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
         "scaled term accumulates in scratch:\n{asm}"
     );
     // two distinct terms accumulate in order (i then j), same FSR finish.
@@ -753,6 +754,63 @@ fn gep_scaled_sum_accumulates_in_scratch() {
         asm.contains("MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x23\n    MOVWF FSR"),
         "two-term sum accumulates both terms:\n{asm}"
     );
+}
+
+#[test]
+fn gep_scaled_multi_term_reloads_w_per_repetition() {
+    // %p = gep @a +1 +1*%i +2*%j: a scaled term in non-first position.
+    // PIC14 ADDWF f,W computes W = f + W, so W no longer holds the term
+    // value after the first ADDWF — the term must be reloaded (MOVF %j,W)
+    // before *each* repetition, or scale-2 computes 2*scratch + j instead
+    // of scratch + 2*j (silent wrong-address miscompile).
+    let m = parse(
+        "global in i8\nglobal jn i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %j = load i8 @jn\n    %p = gep @a +1 +1*%i +2*%j\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    // in=0x20, jn=0x21, out=0x22, a=0x40 (array); locals: %i=0x29, %j=0x2A,
+    // %v=0x2B. scratch = fixed 0x70.
+    let map = [
+        ("in", 0x20u16),
+        ("jn", 0x21),
+        ("out", 0x22),
+        ("a", 0x40),
+        ("main::i", 0x29),
+        ("main::j", 0x2A),
+        ("main::v", 0x2B),
+    ];
+    let asm = select(&m, &addrs(&map));
+    // MOVF %j,W must appear once per scale-2 repetition — twice in total.
+    assert_eq!(
+        asm.matches("MOVF 0x2A, W").count(),
+        2,
+        "scale-2 term must reload %j into W before each ADDWF:\n{asm}"
+    );
+    // Full sequence: scratch = i + 2*j = i + j + j, then FSR = a_lo + 1 + scratch.
+    assert!(
+        asm.contains("MOVLW 0x00\n    MOVWF 0x70\n    MOVF 0x29, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    ADDWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x70, W\n    ADDLW 0x41\n    MOVWF FSR"),
+        "scaled multi-term sum accumulates i + 2*j:\n{asm}"
+    );
+    // End-to-end: i=2, j=2 -> a[1+2+4] = a[7] = 0x17. The buggy sequence
+    // (W not reloaded) computes 2*i + 2*j -> a[9] = 0x19 instead.
+    let ir = "global in i8\nglobal jn i8\nglobal a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %i = load i8 @in\n    %j = load i8 @jn\n    %p = gep @a +1 +1*%i +2*%j\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n";
+    let seed = |iv: u8, jv: u8| {
+        [
+            (0x20u16, iv),
+            (0x21, jv),
+            (0x40, 0x10),
+            (0x41, 0x11),
+            (0x42, 0x12),
+            (0x43, 0x13),
+            (0x44, 0x14),
+            (0x45, 0x15),
+            (0x46, 0x16),
+            (0x47, 0x17),
+            (0x48, 0x18),
+            (0x49, 0x19),
+        ]
+    };
+    assert_eq!(sim_run(ir, &map, &seed(2, 2), 0x22), 0x17, "a[1+2+4] with i=2, j=2");
+    assert_eq!(sim_run(ir, &map, &seed(3, 1), 0x22), 0x16, "a[1+3+2] with i=3, j=1");
 }
 
 #[test]
