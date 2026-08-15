@@ -260,6 +260,29 @@ define i16 @main() {
 }
 
 #[test]
+fn parses_icmp_with_samesign_flag() {
+    // clang 20 emits `icmp samesign <pred>` when the operands' sign bit is
+    // known clear; the flag is a hint (signed/unsigned agree), so it is
+    // stripped and the predicate parsed as usual.
+    let ll = r#"
+define i8 @main() {
+  %1 = icmp samesign ugt i8 5, 2
+  ret i8 0
+}
+"#;
+    let m = parse_ll(ll);
+    match &m.funcs[0].blocks[0].insts[0] {
+        Inst::Icmp(i) => {
+            assert_eq!(i.pred, "ugt");
+            assert_eq!(i.ty, ir::Ty::I8);
+            assert_eq!(i.a, Val::Const(5));
+            assert_eq!(i.b, Val::Const(2));
+        }
+        other => panic!("expected Icmp, got {other:?}"),
+    }
+}
+
+#[test]
 fn parses_sext_with_nneg_attribute() {
     let ll = r#"
 define i16 @main() {
