@@ -1,5 +1,70 @@
 use irparse::parse_ll;
-use ir::{Inst, Val};
+use ir::{Global, Inst, Val};
+
+// Array/`constant` globals + getelementptr (phase-3 pointers/const).
+const GEP_ARRAY: &str = r#"
+@ram = dso_local global [8 x i8] zeroinitializer, align 1
+@table = dso_local constant [4 x i8] c"\0A\14\1E(", align 1
+define dso_local void @main() {
+  %3 = add nsw i16 0, 1
+  %p = getelementptr i8, ptr @ram, i16 %3
+  %q = getelementptr [4 x i8], ptr @table, i16 0, i16 %3
+  ret void
+}
+"#;
+
+#[test]
+fn parses_array_and_const_globals_and_gep() {
+    let m = parse_ll(GEP_ARRAY);
+    assert_eq!(m.globals.len(), 2);
+
+    // @ram = global [8 x i8] zeroinitializer
+    match &m.globals[0] {
+        Global { name, ty, is_const, size, bytes, addr } => {
+            assert_eq!(name, "ram");
+            assert_eq!(*ty, ir::Ty::I8);
+            assert!(!is_const);
+            assert_eq!(*size, 8);
+            assert_eq!(bytes, &vec![0u8; 8]);
+            assert_eq!(*addr, None);
+        }
+    }
+
+    // @table = constant [4 x i8] c"\0A\14\1E("
+    match &m.globals[1] {
+        Global { name, ty, is_const, size, bytes, addr } => {
+            assert_eq!(name, "table");
+            assert_eq!(*ty, ir::Ty::I8);
+            assert!(is_const);
+            assert_eq!(*size, 4);
+            assert_eq!(bytes, &vec![0x0A, 0x14, 0x1E, 0x28]);
+            assert_eq!(*addr, None);
+        }
+    }
+
+    let body = &m.funcs[0].blocks[0].insts;
+    assert_eq!(body.len(), 4);
+
+    // %p = getelementptr i8, ptr @ram, i16 %3  -> base ram, offset %3
+    match &body[1] {
+        Inst::Gep(g) => {
+            assert_eq!(g.dst, "p");
+            assert_eq!(g.base, "ram");
+            assert_eq!(g.offset, Val::Reg("3".to_string()));
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+
+    // %q = getelementptr [4 x i8], ptr @table, i16 0, i16 %3 -> base table, offset %3
+    match &body[2] {
+        Inst::Gep(g) => {
+            assert_eq!(g.dst, "q");
+            assert_eq!(g.base, "table");
+            assert_eq!(g.offset, Val::Reg("3".to_string()));
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
 
 const LL: &str = r#"
 @in = dso_local global i8 0, align 1
