@@ -19,7 +19,9 @@ struct Gen<'m> {
     slots: HashMap<String, u8>,
     next: u8,
     scratch: u8,
-    tmp: u32,
+    /// Module-scoped fresh-label counter, shared across every function so the
+    /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
+    tmp: &'m mut u32,
     out: Vec<String>,
 }
 
@@ -46,6 +48,12 @@ impl<'m> Gen<'m> {
         let n = ty.bytes();
         if self.next + n - 1 > 0x7F {
             self.next = BANK0_START;
+        }
+        // The fixed icmp scratch byte lives in bank-0 GPR space (>= 0x2A, or
+        // just past the globals). Never let a slot's lo or hi byte land on it,
+        // or an icmp in the same function would silently corrupt that slot.
+        if self.scratch >= self.next && self.scratch < self.next + n {
+            self.next = self.scratch.wrapping_add(1);
         }
         let a = self.next;
         self.next = self.next.wrapping_add(n);
@@ -195,10 +203,11 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_end}:"));
     }
 
-    /// A fresh local label for intra-block jumps (select branches).
+    /// A fresh local label for intra-block jumps (select branches). The
+    /// counter lives at module scope so labels are unique across functions.
     fn fresh_label(&mut self) -> String {
-        let s = format!("tmp{}", self.tmp);
-        self.tmp += 1;
+        let s = format!("tmp{}", *self.tmp);
+        *self.tmp += 1;
         s
     }
 
@@ -413,13 +422,16 @@ pub fn select(m: &Module, addrs: &HashMap<String, u8>) -> String {
         "    goto __start".to_string(),
         "".to_string(),
     ];
+    // Fresh-label counter at module scope: labels are file-scoped in the
+    // single `.asm` output, so it must not reset per function.
+    let mut tmp = 0u32;
     for f in &m.funcs {
         let mut g = Gen {
             addrs,
             slots: HashMap::new(),
             next: COMMON_START,
             scratch,
-            tmp: 0,
+            tmp: &mut tmp,
             out: Vec::new(),
         };
         g.emit(format!("{0}:", f.name));
