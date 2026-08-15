@@ -15,8 +15,8 @@ use ir::{Inst, Module};
 fn local_widths(m: &Module, fname: &str) -> HashMap<String, u8> {
     let f = m.funcs.iter().find(|f| f.name == fname).expect("function");
     let mut widths: HashMap<String, u8> = HashMap::new();
-    for (ty, name) in &f.params {
-        widths.insert(name.clone(), ty.bytes());
+    for p in &f.params {
+        widths.insert(p.name.clone(), p.width);
     }
     for b in &f.blocks {
         for inst in &b.insts {

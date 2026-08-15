@@ -1,8 +1,8 @@
-use ir::{parse, serialize};
+use ir::{parse, serialize, GepBase};
 
 #[test]
 fn roundtrips_a_straight_line_program() {
-    let text = "global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n";
+    let text = "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n";
     let m = parse(text);
     let out = serialize(&m);
     let m2 = parse(&out);
@@ -12,7 +12,7 @@ fn roundtrips_a_straight_line_program() {
 
 #[test]
 fn global_type_and_addr_roundtrip() {
-    let m = parse("global in i8\nconst out i16 @0x20\nfn main() -> void\n");
+    let m = parse("global in i8\nconst out i16 @0x20\nfn main(void) ()\n");
     assert_eq!(m.globals[0].ty, ir::Ty::I8);
     assert_eq!(m.globals[0].addr, None);
     assert_eq!(m.globals[1].ty, ir::Ty::I16);
@@ -26,14 +26,14 @@ fn global_type_and_addr_roundtrip() {
 
 #[test]
 fn gep_and_sized_globals_roundtrip() {
-    let text = "global ram i8 @0x25\nconst table i8\nfn main() -> void\n  block entry:\n    %p = gep @ram %3\n    ret void\n";
+    let text = "global ram i8 @0x25\nconst table i8\nfn main(void) ()\n  block entry:\n    %p = gep @ram +0 +1*%3\n    ret void\n";
     let m = parse(text);
     let out = serialize(&m);
     // stable fixed point: parse -> serialize -> parse -> serialize
     let m2 = parse(&out);
     assert_eq!(serialize(&m2), out);
     // gep line round-trips verbatim
-    assert!(out.contains("%p = gep @ram %3"), "missing gep line\n---\n{out}");
+    assert!(out.contains("%p = gep @ram +0 +1*%3"), "missing gep line\n---\n{out}");
     // sized global keeps its address
     assert!(out.contains("global ram i8 @0x25"), "missing global addr\n---\n{out}");
     // const global carries no @addr in the canonical text
@@ -64,7 +64,7 @@ fn roundtrips_all_icmp_predicates_and_sext() {
         insts.push_str(&format!("    %c{i} = icmp {p} i8 %a %b\n"));
     }
     insts.push_str("    %s = sext i8 %v to i16\n");
-    let text = format!("fn main() -> void\n  block entry:\n{insts}    ret void\n");
+    let text = format!("fn main(void) ()\n  block entry:\n{insts}    ret void\n");
     let m = parse(&text);
     let out = serialize(&m);
     // stable fixed point: parse -> serialize -> parse -> serialize
@@ -81,12 +81,12 @@ fn roundtrips_all_icmp_predicates_and_sext() {
 #[test]
 #[should_panic(expected = "unsupported icmp predicate")]
 fn rejects_unknown_icmp_predicate() {
-    parse("fn main() -> void\n  block entry:\n    %c = icmp foo i8 %a %b\n    ret void\n");
+    parse("fn main(void) ()\n  block entry:\n    %c = icmp foo i8 %a %b\n    ret void\n");
 }
 
 #[test]
 fn roundtrips_control_flow_call_and_cast() {
-    let text = "fn main() -> void\n\
+    let text = "fn main(void) ()\n\
   block main:\n\
     %1 = load i8 @in\n\
     %2 = zext i8 %1 to i16\n\
@@ -122,5 +122,78 @@ fn roundtrips_control_flow_call_and_cast() {
         "%13 = select i1 %12 i16 100 i16 %9",
     ] {
         assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+    }
+}
+
+#[test]
+fn roundtrips_reworked_gep_alloca_memcpy_and_params() {
+    let text = "global a i8\nfn f(i16) (x, s=sret)\n  block entry:\n    %p = gep %s +2 +2*%x\n    %1 = alloca 4\n    memcpy @a %1 4\n    ret void\n";
+    let m = parse(text);
+    assert_eq!(m.funcs[0].params.len(), 2);
+    assert_eq!(m.funcs[0].params[0].name, "x");
+    assert_eq!(m.funcs[0].params[0].width, 1); // scalar default width on canonical text
+    assert_eq!(m.funcs[0].params[1].name, "s");
+    assert!(m.funcs[0].params[1].sret);
+
+    let out = serialize(&m);
+    assert!(out.contains("fn f(i16) (x, s=sret)"), "params header\n---\n{out}");
+    assert!(out.contains("%p = gep %s +2 +2*%x"), "gep\n---\n{out}");
+    assert!(out.contains("%1 = alloca 4"), "alloca\n---\n{out}");
+    assert!(out.contains("memcpy @a %1 4"), "memcpy\n---\n{out}");
+
+    // stable fixed point
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+
+    // struct: fields round-trip
+    let m3 = parse(&out);
+    match &m3.funcs[0].blocks[0].insts[0] {
+        ir::Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Reg("s".to_string()));
+            assert_eq!(g.k, 2);
+            assert_eq!(g.terms, vec![(2, "x".to_string())]);
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
+#[test]
+fn roundtrips_byval_param_and_call_arg() {
+    let text = "global a i8\nfn f(i8) (p=byval4)\n  block entry:\n    %r = call i8 @g(i8 %1, byval4 %p)\n    ret void\n";
+    let m = parse(text);
+    assert_eq!(m.funcs[0].params[0].name, "p");
+    assert_eq!(m.funcs[0].params[0].byval, Some(4));
+    assert_eq!(m.funcs[0].params[0].width, 4);
+    let out = serialize(&m);
+    assert!(out.contains("fn f(i8) (p=byval4)"), "byval param header\n---\n{out}");
+    assert!(out.contains("%r = call i8 @g(i8 %1, byval4 %p)"), "call args\n---\n{out}");
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    match &m2.funcs[0].blocks[0].insts[0] {
+        ir::Inst::Call(c) => {
+            assert_eq!(c.args.len(), 2);
+            assert_eq!(c.args[0].ty, Some(ir::Ty::I8));
+            assert_eq!(c.args[1].byval, Some(4));
+            assert_eq!(c.args[1].val, ir::Val::Reg("p".to_string()));
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+}
+
+#[test]
+fn gep_base_global_roundtrips() {
+    let text = "global a i8\nfn main(void) ()\n  block entry:\n    %p = gep @a +3\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    assert!(out.contains("%p = gep @a +3"), "const-offset gep\n---\n{out}");
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    match &m2.funcs[0].blocks[0].insts[0] {
+        ir::Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("a".to_string()));
+            assert_eq!(g.k, 3);
+            assert!(g.terms.is_empty());
+        }
+        other => panic!("expected Gep, got {other:?}"),
     }
 }
