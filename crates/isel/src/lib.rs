@@ -575,7 +575,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_done}:"));
             }
             [] => panic!(
-                "isel: constant index into large const table @{name} not supported (size > 255); only a single 16-bit reg index is"
+                "isel: constant index into large const table @{name} not supported (size > 255); only a single 16-bit reg index is supported"
             ),
             _ => panic!(
                 "isel: multi-term index into large const table @{name} not supported: {terms:?}"
