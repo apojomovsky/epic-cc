@@ -8,18 +8,18 @@ use ir::parse;
 fn overlay_module() -> ir::Module {
     parse(
         "global in i8\n\
-         fn main() -> void\n\
+         fn main(void) ()\n\
            block entry:\n\
              %m0 = load i8 @in\n\
              call void @a()\n\
              call void @b()\n\
              ret void\n\
-         fn a() -> void\n\
+         fn a(void) ()\n\
            block entry:\n\
              %a0 = add i16 1, 2\n\
              %a1 = add i16 3, 4\n\
              ret void\n\
-         fn b() -> void\n\
+         fn b(void) ()\n\
            block entry:\n\
              %b0 = add i16 5, 6\n\
              %b1 = add i16 7, 8\n\
@@ -29,7 +29,7 @@ fn overlay_module() -> ir::Module {
 
 #[test]
 fn globals_get_bank0_addresses() {
-    let m = parse("global in i8\nglobal out i8\nfn main() -> void\n  block entry:\n    ret void\n");
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    ret void\n");
     let out = allocate(&m, "depth 1\n");
     assert_eq!(out.globals["in"], 0x20);
     assert_eq!(out.globals["out"], 0x21);
@@ -37,7 +37,7 @@ fn globals_get_bank0_addresses() {
 
 #[test]
 fn i16_global_advances_two_bytes() {
-    let m = parse("global a i8\nglobal b i16\nfn main() -> void\n  block entry:\n    ret void\n");
+    let m = parse("global a i8\nglobal b i16\nfn main(void) ()\n  block entry:\n    ret void\n");
     let out = allocate(&m, "depth 1\n");
     assert_eq!(out.globals["a"], 0x20);
     assert_eq!(out.globals["b"], 0x22);
@@ -53,7 +53,7 @@ fn large_array_after_i16_lands_at_next_even_and_spans_sequentially() {
         "global a i16\n\
          global arr i8\n\
          global after i8\n\
-         fn main() -> void\n\
+         fn main(void) ()\n\
            block entry:\n\
              ret void\n",
     );
@@ -116,7 +116,7 @@ fn map_text_emits_global_and_local_lines() {
 #[test]
 fn params_are_frame_locals_too() {
     let m = parse(
-        "fn f(i16 %p0, i8 %p1) -> void\n\
+        "fn f(void) (p0=byval2, p1)\n\
            block entry:\n\
              %q = add i16 %p0, 1\n\
              ret void\n",
@@ -140,7 +140,7 @@ fn globals_span_across_banks() {
     for i in 0..90 {
         gsrc.push_str(&format!("global g{i} i8\n"));
     }
-    let src = format!("{gsrc}fn main() -> void\n  block entry:\n    ret void\n");
+    let src = format!("{gsrc}fn main(void) ()\n  block entry:\n    ret void\n");
     let m = parse(&src);
     let out = allocate(&m, "depth 1\n");
     assert_eq!(out.globals["g0"], 0x20);
@@ -153,7 +153,7 @@ fn globals_span_across_banks() {
 #[test]
 fn frame_spans_across_banks() {
     // One function with 90 i8 locals: its frame crosses bank 0 into 0xA0+.
-    let mut src = String::from("fn f() -> void\n  block entry:\n");
+    let mut src = String::from("fn f(void) ()\n  block entry:\n");
     for i in 0..90 {
         src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
     }
@@ -176,12 +176,12 @@ fn callee_base_follows_callers_physical_frame_end() {
     // common-RAM gap and would place b at 0xA0, exactly where a's spill
     // locals live while both frames are live during the call.
     let mut src = String::from(
-        "fn main() -> void\n\
+        "fn main(void) ()\n\
            block entry:\n\
              %m0 = add i8 1, 2\n\
              call void @a()\n\
              ret void\n\
-         fn a() -> void\n\
+         fn a(void) ()\n\
            block entry:\n",
     );
     for i in 0..90 {
@@ -190,7 +190,7 @@ fn callee_base_follows_callers_physical_frame_end() {
     src.push_str(
         "    call void @b()\n\
            ret void\n\
-         fn b() -> void\n\
+         fn b(void) ()\n\
            block entry:\n\
              %b0 = add i8 1, 2\n\
              ret void\n",
@@ -230,13 +230,13 @@ fn callee_base_clears_region_tail_hole_left_by_i16_local() {
         gsrc.push_str(&format!("global g{i} i8\n"));
     }
     let src = format!(
-        "{gsrc}fn main() -> void\n\
+        "{gsrc}fn main(void) ()\n\
            block entry:\n\
              %v0 = add i16 1, 2\n\
              %v1 = add i8 3, 4\n\
              call void @b()\n\
              ret void\n\
-         fn b() -> void\n\
+         fn b(void) ()\n\
            block entry:\n\
              %b0 = add i8 1, 2\n\
              ret void\n"
@@ -266,7 +266,7 @@ fn i16_globals_stay_even_aligned_across_banks() {
     for i in 0..80 {
         gsrc.push_str(&format!("global g{i} i8\n"));
     }
-    let src = format!("{gsrc}global w i16\nfn main() -> void\n  block entry:\n    ret void\n");
+    let src = format!("{gsrc}global w i16\nfn main(void) ()\n  block entry:\n    ret void\n");
     let m = parse(&src);
     let out = allocate(&m, "depth 1\n");
     assert_eq!(out.globals["g79"], 0x6F);
@@ -279,7 +279,7 @@ fn i16_frame_stays_even_aligned_across_banks() {
     // A frame of 50 i16 locals (100 bytes) crosses bank 0 into bank 1. From
     // the even root base 0x20 the i16s land on even addresses, and the bank
     // progression (0x6F -> 0xA0) keeps them even-aligned within each bank.
-    let mut src = String::from("fn f() -> void\n  block entry:\n");
+    let mut src = String::from("fn f(void) ()\n  block entry:\n");
     for i in 0..50 {
         src.push_str(&format!("    %v{i} = add i16 1, 2\n"));
     }
@@ -304,7 +304,7 @@ fn const_globals_get_no_address_and_sized_globals_span() {
         "global ram i8\n\
          const table i8\n\
          global after i8\n\
-         fn main() -> void\n\
+         fn main(void) ()\n\
            block entry:\n\
              ret void\n",
     );
@@ -337,12 +337,12 @@ fn sized_array_global_does_not_break_frame_overlay() {
     // overlaid on that frame must respect the sized end_of_globals.
     let mut m = parse(
         "global ram i8\n\
-         fn main() -> void\n\
+         fn main(void) ()\n\
            block entry:\n\
              %m0 = add i8 1, 2\n\
              call void @a()\n\
              ret void\n\
-         fn a() -> void\n\
+         fn a(void) ()\n\
            block entry:\n\
              %a0 = add i8 1, 2\n\
              ret void\n",
@@ -357,12 +357,37 @@ fn sized_array_global_does_not_break_frame_overlay() {
 }
 
 #[test]
+fn alloca_byval_and_sret_params_get_full_widths_params_first() {
+    // A frame carrying a 4-byte alloca, a 4-byte byval param, and a 2-byte
+    // sret param must size each slot to its full width (params first, then
+    // the alloca), with no overlap. No globals: the root frame starts at
+    // 0x20 (scratch/retval live in fixed common RAM, not after the globals).
+    let m = parse(
+        "fn f(void) (p=byval4, r=sret)\n\
+           block entry:\n\
+             %buf = alloca 4\n\
+             ret void\n",
+    );
+    let out = allocate(&m, "depth 1\n");
+    // Params come first, in declaration order: p (byval, 4 bytes) at 0x20,
+    // r (sret, 2 bytes) right after p's 4 bytes at 0x24.
+    assert_eq!(out.locals["f::p"], 0x20);
+    assert_eq!(out.locals["f::r"], 0x24);
+    // The alloca lands after the params, at its full 4-byte size.
+    assert_eq!(out.locals["f::buf"], 0x26);
+    // No overlap: each slot strictly follows the previous slot's end.
+    assert!(out.locals["f::r"] >= out.locals["f::p"] + 4, "sret overlaps byval param");
+    assert!(out.locals["f::buf"] >= out.locals["f::r"] + 2, "alloca overlaps sret param");
+    assert_eq!(out.total_bank0, 4 + 2 + 4);
+}
+
+#[test]
 #[should_panic(expected = "0x1EF")]
 fn frame_exceeding_all_banks_panics() {
     // 250 i16 locals = 500 bytes, more than the 320 GPR bytes across all four
     // banks (4 x 80-byte regions, bank 3 at 0x1A0-0x1EF), so allocation
     // panics past 0x1EF.
-    let mut src = String::from("fn main() -> void\n  block entry:\n");
+    let mut src = String::from("fn main(void) ()\n  block entry:\n");
     for i in 0..250 {
         src.push_str(&format!("    %v{i} = add i16 1, 2\n"));
     }
