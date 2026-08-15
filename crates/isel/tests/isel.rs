@@ -512,3 +512,120 @@ fn call_arg_copies_target_callee_param_slots_from_map() {
         "copy %2 -> add::y (distinct addresses):\n{asm}"
     );
 }
+
+/// Build a module whose RAM array `@ram` is 8 bytes and whose const global
+/// `@table` carries the flash bytes [10, 20, 30, 40]. The IR text format
+/// records `global`/`const` scalars only (sizes/bytes come from the C
+/// frontend), so the globals are patched in directly, exactly as irparse
+/// fills them for the e2e path.
+fn pointer_module(ir_text: &str) -> ir::Module {
+    let mut m = parse(ir_text);
+    m.globals = vec![
+        ir::Global {
+            name: "in".into(),
+            ty: ir::Ty::I8,
+            is_const: false,
+            size: 1,
+            bytes: vec![0],
+            addr: None,
+        },
+        ir::Global {
+            name: "ram".into(),
+            ty: ir::Ty::I8,
+            is_const: false,
+            size: 8,
+            bytes: vec![0; 8],
+            addr: None,
+        },
+        ir::Global {
+            name: "table".into(),
+            ty: ir::Ty::I8,
+            is_const: true,
+            size: 4,
+            bytes: vec![10, 20, 30, 40],
+            addr: None,
+        },
+    ];
+    m
+}
+
+#[test]
+fn gep_ram_indirect_and_const_retlw() {
+    // Phase-3 pointers/const: `gep` defines a *virtual* pointer, lowered at
+    // each use. A pointer into a RAM array loads/stores via FSR/INDF
+    // (base_lo + offset); a pointer into a const global loads via
+    // `CALL __read_table` — a RETLW table in flash. `gep` itself emits
+    // nothing, so `%p`/`%t` need no slots.
+    let m = pointer_module(
+        "global in i8\nglobal ram i8\nconst table i8\n\
+         fn main() -> void\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @ram %i\n    %t = gep @table %i\n\
+           %v = load i8 %t\n    %w = load i8 %p\n    store i8 %v %p\n    ret void\n",
+    );
+    // alloc: in=0x20, ram (8 bytes) 0x21..0x28 -> end_of_globals 0x29;
+    // locals in IR order: %i=0x29, %v=0x2A, %w=0x2B. `table` is const
+    // (flash) — no RAM address, absent from the map.
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("ram", 0x21),
+        ("main::i", 0x29),
+        ("main::v", 0x2A),
+        ("main::w", 0x2B),
+    ]);
+    let asm = select(&m, &addrs);
+    // RAM indirect load (%w = load i8 %p): W = %i; W += 0x21 (base_lo);
+    // FSR = W; W = INDF; %w = W.
+    assert!(asm.contains("MOVF 0x29, W"), "offset %i:\n{asm}");
+    assert!(asm.contains("ADDLW 0x21"), "base_lo of @ram:\n{asm}");
+    assert!(asm.contains("MOVWF FSR"), "FSR = base + offset:\n{asm}");
+    assert!(asm.contains("MOVF INDF, W"), "load through FSR:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2B"), "RAM load dst %w:\n{asm}");
+    // RAM indirect store (store i8 %v %p): same FSR setup, then W = %v;
+    // INDF = W.
+    assert!(asm.contains("MOVF 0x2A, W"), "store value %v:\n{asm}");
+    assert!(asm.contains("MOVWF INDF"), "store through FSR:\n{asm}");
+    // Const load (%v = load i8 %t): W = %i (index); CALL __read_table;
+    // W -> %v.
+    assert!(asm.contains("CALL __read_table"), "const load calls the table reader:\n{asm}");
+    assert!(asm.contains("MOVWF 0x2A"), "const load dst %v:\n{asm}");
+    // The RETLW table itself, after the functions.
+    assert!(asm.contains("__read_table:"), "table reader label:\n{asm}");
+    assert!(asm.contains("ADDLW LOW(table)"), "index += table base:\n{asm}");
+    assert!(asm.contains("MOVWF PCL"), "jump into the table:\n{asm}");
+    assert!(asm.contains("table:"), "table label:\n{asm}");
+    assert!(asm.contains("RETLW 0x0A"), "byte 0 (10):\n{asm}");
+    assert!(asm.contains("RETLW 0x14"), "byte 1 (20):\n{asm}");
+    assert!(asm.contains("RETLW 0x1E"), "byte 2 (30):\n{asm}");
+    assert!(asm.contains("RETLW 0x28"), "byte 3 (40):\n{asm}");
+    // The table follows main's RETURN (functions first, then tables, then
+    // the __start stub).
+    assert!(
+        asm.find("__read_table:").unwrap() > asm.find("RETURN").unwrap(),
+        "table must follow the functions:\n{asm}"
+    );
+}
+
+#[test]
+#[should_panic(expected = "store to const")]
+fn panics_on_store_to_const_gep() {
+    // Const globals live in flash (RETLW tables); a store through a pointer
+    // into one is a write to ROM and must fail loudly, never silently emit
+    // a FSR/INDF store to a nonexistent RAM address.
+    let m = pointer_module(
+        "global in i8\nconst table i8\nfn main() -> void\n  block entry:\n\
+           %i = load i8 @in\n    %t = gep @table %i\n    store i8 %i %t\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("main::i", 0x29)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn parse_map_accepts_const_lines() {
+    // alloc's map text lists const globals as `const <name>` (no address —
+    // their bytes live in flash). parse_map must accept the line without
+    // recording an address, and keep parsing the lines after it.
+    let addrs = isel::parse_map("global in 0x20\nconst table\nlocal main i 0x29\n");
+    assert_eq!(addrs.get("in"), Some(&0x20u16));
+    assert_eq!(addrs.get("main::i"), Some(&0x29u16));
+    assert!(!addrs.contains_key("table"), "const globals have no RAM address");
+}
