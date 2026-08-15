@@ -59,6 +59,37 @@ fn parse_num(s: &str) -> usize {
     }
 }
 
+/// Case-insensitive strip of a `LOW(`/`HIGH(` prefix, dropping the trailing
+/// `)`; returns the label name inside the parens.
+fn strip_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
+    let (a, b) = (s.as_bytes(), name.as_bytes());
+    if a.len() > b.len() && a[..b.len()].eq_ignore_ascii_case(b) {
+        Some(s[b.len()..].trim_end_matches(')'))
+    } else {
+        None
+    }
+}
+
+/// Resolve a literal operand. Plain numbers parse as-is; `LOW(<label>)` and
+/// `HIGH(<label>)` resolve through the pass-2 symbol table to the low or high
+/// byte of the label's word address (a RETLW table's base, e.g. the
+/// `ADDLW LOW(table); MOVWF PCL` computed jump).
+fn parse_lit(s: &str, sym: &std::collections::HashMap<String, usize>) -> usize {
+    if let Some(name) = strip_fn(s, "LOW(") {
+        let v = *sym
+            .get(name)
+            .unwrap_or_else(|| panic!("asm: LOW({name}) label not found"));
+        return v & 0xFF;
+    }
+    if let Some(name) = strip_fn(s, "HIGH(") {
+        let v = *sym
+            .get(name)
+            .unwrap_or_else(|| panic!("asm: HIGH({name}) label not found"));
+        return (v >> 8) & 0xFF;
+    }
+    parse_num(s)
+}
+
 fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let mne = parts[0].to_ascii_uppercase();
@@ -85,13 +116,13 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         "ANDWF" => 0x0500 | f(op),
         "IORWF" => 0x0400 | f(op),
         "XORWF" => 0x0600 | f(op),
-        "MOVLW" => 0x3000 | parse_num(op) as u16,
-        "ADDLW" => 0x3E00 | parse_num(op) as u16,
-        "ANDLW" => 0x3900 | parse_num(op) as u16,
-        "IORLW" => 0x3800 | parse_num(op) as u16,
-        "XORLW" => 0x3A00 | parse_num(op) as u16,
-        "SUBLW" => 0x3C00 | parse_num(op) as u16,
-        "RETLW" => 0x3400 | parse_num(op) as u16,
+        "MOVLW" => 0x3000 | parse_lit(op, sym) as u16,
+        "ADDLW" => 0x3E00 | parse_lit(op, sym) as u16,
+        "ANDLW" => 0x3900 | parse_lit(op, sym) as u16,
+        "IORLW" => 0x3800 | parse_lit(op, sym) as u16,
+        "XORLW" => 0x3A00 | parse_lit(op, sym) as u16,
+        "SUBLW" => 0x3C00 | parse_lit(op, sym) as u16,
+        "RETLW" => 0x3400 | parse_lit(op, sym) as u16,
         "BTFSC" | "BTFSS" | "BCF" | "BSF" => {
             // Operands may be split across whitespace ("STATUS, 2"): join the
             // remaining tokens back into one operand string before splitting.
