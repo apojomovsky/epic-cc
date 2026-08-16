@@ -34,8 +34,6 @@ main:
     MOVF 0x25, W
     CALL __read_pad
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
     MOVWF 0x27
     MOVF 0x27, W
@@ -59,8 +57,6 @@ main:
     MOVF 0x71, W
     CALL __read_table
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
     GOTO tmp1
 tmp0:
@@ -69,8 +65,6 @@ tmp0:
     MOVF 0x71, W
     CALL __read_table_hi
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
 tmp1:
     BCF STATUS, 5
@@ -105,8 +99,6 @@ tmp1:
     MOVF 0x71, W
     CALL __read_table
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
     GOTO tmp3
 tmp2:
@@ -115,8 +107,6 @@ tmp2:
     MOVF 0x71, W
     CALL __read_table_hi
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
 tmp3:
     BCF STATUS, 5
@@ -156,8 +146,6 @@ tmp3:
     MOVF 0x71, W
     CALL __read_table
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
     GOTO tmp5
 tmp4:
@@ -166,8 +154,6 @@ tmp4:
     MOVF 0x71, W
     CALL __read_table_hi
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
 tmp5:
     BCF STATUS, 5
@@ -207,8 +193,6 @@ tmp5:
     MOVF 0x71, W
     CALL __read_table
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
     GOTO tmp7
 tmp6:
@@ -217,8 +201,6 @@ tmp6:
     MOVF 0x71, W
     CALL __read_table_hi
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
 tmp7:
     BCF STATUS, 5

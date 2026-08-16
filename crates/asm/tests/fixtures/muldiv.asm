@@ -34,8 +34,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __udiv_u16
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x27
     MOVF 0x72, W
@@ -59,8 +57,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __mul_u16
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x2B
     MOVF 0x72, W
@@ -76,8 +72,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __urem_u16
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x2D
     MOVF 0x72, W
@@ -174,8 +168,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __sdiv_i16
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x3F
     MOVF 0x72, W
@@ -195,8 +187,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __srem_i16
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x41
     MOVF 0x72, W
@@ -233,8 +223,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __mul_u8
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x4B
     MOVF 0x4B, W
@@ -244,8 +232,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __udiv_u8
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x4C
     MOVF 0x22, W
@@ -274,8 +260,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __mul_u16
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x53
     MOVF 0x72, W
@@ -305,8 +289,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL __shl_u16
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x59
     MOVF 0x72, W

@@ -34,8 +34,6 @@ main:
     MOVF 0x2D, W
     CALL __read_table
     MOVWF 0x70
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x70, W
     MOVWF 0x2F
     BCF STATUS, 7

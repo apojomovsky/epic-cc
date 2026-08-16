@@ -13,6 +13,16 @@ fn rejects_bank_operand() {
 }
 
 #[test]
+fn org_directives_pass_through_unrewritten() {
+    // `.org`/`.align`/`end` take addresses/literals, not file-register
+    // operands: an M11 page pad (`.org 0x0800`) or a pinned table-section
+    // start (`.org 0x00D2`) must pass through untouched, never BANKSEL-
+    // rewritten (relocating the program) nor range-rejected.
+    let asm = "    org 0x0000\n    org 0x0800\n    org 0x00D2\n    .align 256\n    end\n";
+    assert_eq!(assign_banks(asm), asm);
+}
+
+#[test]
 fn literal_immediates_may_exceed_0x7f() {
     // ADDLW/MOVLW/... take an 8-bit literal, not a file-register address:
     // 0xFC (= -4) is legal in a literal slot and must not be range-checked.

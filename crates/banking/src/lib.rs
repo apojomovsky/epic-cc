@@ -68,6 +68,18 @@ pub fn assign_banks(asm: &str) -> String {
             continue;
         }
 
+        // Directives (`org`, `.align`, `.table`, `end`, ...) are not
+        // instructions: their numeric arguments are addresses or literals,
+        // never file-register operands. An `.org` target in a GPR/SFR range
+        // (an M11 page pad like `.org 0x0800`, or a pinned table-section
+        // start) must pass through untouched — BANKSEL-rewriting it would
+        // relocate the program.
+        if mne == "org" || mne == "end" || mne.starts_with('.') {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
         // `BCF/BSF STATUS, 5/6` — whether emitted here or already present —
         // update the tracked bank.
         if mne == "BCF" || mne == "BSF" {

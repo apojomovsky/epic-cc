@@ -139,12 +139,41 @@ struct Gen<'m> {
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
     tmp: &'m mut u32,
+    /// Page map (M11, two-phase emission): every CALL target and const-reader
+    /// entry -> the page PCLATH<4:3> holds AFTER the CALL returns (a
+    /// function callee never clobbers it; a reader leaves `HIGH(<base>)`,
+    /// whose bits 4:3 are the table base's page). `None` in pass A, where
+    /// pages are not yet known and every restore is emitted (the measured
+    /// sizes drive the greedy assignment); `Some` in pass B, where a
+    /// same-page restore is skipped.
+    page_of: Option<&'m HashMap<String, usize>>,
     out: Vec<String>,
 }
 
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.out.push(s.into());
+    }
+
+    /// The M11 restore pair — `MOVLW PAGE(<cur_func>); MOVWF PCLATH` — right
+    /// after a CALL. Skipped when the called target runs in the current
+    /// function's own page: the set already wrote that page and nothing since
+    /// changed PCLATH<4:3> (a function callee restores itself; a const
+    /// reader leaves `HIGH(<base>)` whose bits 4:3 are the table base's page,
+    /// equal to the target's page). In pass A (`page_of` is `None`) the
+    /// pages are not known yet, so the restore is always emitted — pass A's
+    /// sizes (with every restore) drive the greedy page assignment, and the
+    /// pass-B skip only shrinks functions, which never moves a function off
+    /// its assigned page (the `.org` pads pin the page bases).
+    fn emit_pclath_restore(&mut self, target: &str) {
+        let same_page = match self.page_of {
+            Some(pages) => pages.get(target) == pages.get(self.cur_func),
+            None => false,
+        };
+        if !same_page {
+            self.emit(format!("    MOVLW PAGE({})", self.cur_func));
+            self.emit("    MOVWF PCLATH".to_string());
+        }
     }
 
     /// Resolve `{func}::{name}` to its base byte address (lo for multi-byte).
@@ -373,8 +402,7 @@ impl<'m> Gen<'m> {
                             self.emit_ptr_index_w(k, &terms, byte_off);
                             self.emit(format!("    CALL __read_{name}"));
                             self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                            self.emit(format!("    MOVLW PAGE({})", self.cur_func));
-                            self.emit("    MOVWF PCLATH".to_string());
+                            self.emit_pclath_restore(&format!("__read_{name}"));
                             self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                         }
                         return;
@@ -397,8 +425,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVLW 0x{byte_off:02X}"));
                     self.emit(format!("    CALL __read_{g}"));
                     self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                    self.emit(format!("    MOVLW PAGE({})", self.cur_func));
-                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit_pclath_restore(&format!("__read_{g}"));
                     self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                     return;
                 }
@@ -598,8 +625,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                 self.emit(format!("    CALL __read_{name}"));
                 self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                self.emit(format!("    MOVLW PAGE({})", self.cur_func));
-                self.emit("    MOVWF PCLATH".to_string());
+                self.emit_pclath_restore(&format!("__read_{name}"));
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("    GOTO {l_done}"));
                 self.emit(format!("{l_hi}:"));
@@ -608,8 +634,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                 self.emit(format!("    CALL __read_{name}_hi"));
                 self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                self.emit(format!("    MOVLW PAGE({})", self.cur_func));
-                self.emit("    MOVWF PCLATH".to_string());
+                self.emit_pclath_restore(&format!("__read_{name}_hi"));
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("{l_done}:"));
             }
@@ -1055,13 +1080,14 @@ impl<'m> Gen<'m> {
         // M11 PCLATH discipline: every CALL runs with PCLATH<4:3> = the
         // target's page. The set's MOVLW clobbers W, so it must come AFTER
         // the last arg copy (which uses W) and immediately before the CALL;
-        // the caller's own page is restored right after, so its
-        // intra-function GOTOs keep branching in its page.
+        // the caller's own page is restored right after — unless the target
+        // is in the caller's own page, where the restore is skipped (PCLATH
+        // still holds the caller's page after the call, so its
+        // intra-function GOTOs keep branching in its page).
         self.emit(format!("    MOVLW PAGE({func})"));
         self.emit("    MOVWF PCLATH".to_string());
         self.emit(format!("    CALL {func}"));
-        self.emit(format!("    MOVLW PAGE({})", self.cur_func));
-        self.emit("    MOVWF PCLATH".to_string());
+        self.emit_pclath_restore(func);
         if let Some(d) = dst {
             let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d);
@@ -1890,6 +1916,126 @@ impl<'m> Gen<'m> {
     }
 }
 
+/// Emit one function's body into `g.out`: runtime routines get their recipe
+/// body; ordinary functions get the block labels, phi copies, and
+/// terminators. Shared by both emission passes — pass A measures the body
+/// (every PCLATH restore present) to drive the greedy page assignment, pass
+/// B re-emits it with same-page restores skipped.
+fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
+    // Runtime routines (legalize-injected): the entry block holds only the
+    // scratch alloca, so instead of the (empty) block emission the recipe
+    // body goes here — the label, the adapted epicurus asm, and the RETURN
+    // the injected Func has no `ret` for. A routine with no recipe yet
+    // panics loudly rather than emitting an empty label that would silently
+    // fall through into the next function.
+    if is_routine_name(&f.name) {
+        match &f.name[..] {
+            "__mul_u8" | "__mul_u16" | "__udiv_u8" | "__urem_u8"
+            | "__udiv_u16" | "__urem_u16" | "__sdiv_i8" | "__srem_i8"
+            | "__sdiv_i16" | "__srem_i16" | "__shl_u8" | "__lshr_u8"
+            | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16" => {}
+            other => panic!("isel: unknown runtime routine @{other}"),
+        }
+        g.emit_routine();
+        return;
+    }
+    // Block label scheme: the entry block uses the bare function name
+    // (so CALLs and GOTOs resolve to it); every other block is
+    // `{func}_L{label}`. The entry block's label is emitted by the block
+    // loop below — no standalone function label here, or `main:` /
+    // `add:` would be defined twice and gpasm would reject the file.
+    let mut labels: HashMap<String, String> = HashMap::new();
+    for (i, b) in f.blocks.iter().enumerate() {
+        let lbl = if i == 0 {
+            f.name.clone()
+        } else {
+            format!("{}_L{}", f.name, b.label)
+        };
+        labels.insert(b.label.clone(), lbl);
+    }
+    // phi elimination: for each predecessor block, the copies that must
+    // run before it branches into the merge block.
+    let mut phi_copies: HashMap<String, Vec<(String, Ty, Val)>> = HashMap::new();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Phi(p) = i {
+                for (val, pred) in &p.incoming {
+                    phi_copies
+                        .entry(pred.clone())
+                        .or_default()
+                        .push((p.dst.clone(), p.ty, val.clone()));
+                }
+            }
+        }
+    }
+    for b in &f.blocks {
+        g.emit(format!("{}:", labels[&b.label]));
+        let mut terminator = None;
+        for i in &b.insts {
+            match i {
+                Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
+                Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(i),
+                _ => g.emit_inst(i),
+            }
+        }
+        if let Some(copies) = phi_copies.get(&b.label) {
+            g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+            // Emit the predecessor's copies in dependency order so a copy
+            // never overwrites a slot a later copy still needs to read.
+            // Chains (%a <- %b, %b <- %c) emit c->b then b->a. If the
+            // copies form a cycle (%a = phi [%b,P], %b = phi [%a,P] —
+            // clang -O1 emits this for loop-carried swaps), no ordering
+            // works without a temp register, so panic loudly rather than
+            // silently miscompile.
+            let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
+                .iter()
+                .map(|(dst, ty, val)| {
+                    let da = g.slot_addr(g.cur_func, dst);
+                    let src = match val {
+                        Val::Reg(r) => Some(g.slot_addr(g.cur_func, r)),
+                        _ => None,
+                    };
+                    (da, src, *ty, val.clone())
+                })
+                .collect();
+            let n = pending.len();
+            let mut emitted = vec![false; n];
+            let mut emitted_count = 0usize;
+            while emitted_count < n {
+                let mut progress = false;
+                for i in 0..n {
+                    if emitted[i] {
+                        continue;
+                    }
+                    let (da, src, ty, val) = &pending[i];
+                    // Blocked while an un-emitted sibling (j != i) writes
+                    // this copy's source slot (sibling destination ==
+                    // this copy's source).
+                    let blocked = match src {
+                        Some(s) => {
+                            (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s)
+                        }
+                        None => false,
+                    };
+                    if !blocked {
+                        g.emit_move_val_to_slot(val, *ty, *da);
+                        emitted[i] = true;
+                        emitted_count += 1;
+                        progress = true;
+                    }
+                }
+                if !progress {
+                    panic!("isel: cyclic phi copies not supported");
+                }
+            }
+        }
+        if let Some(t) = terminator {
+            g.emit_terminator(t, &labels);
+        }
+    }
+    g.emit("".to_string());
+}
+
 /// The word size of a function's emitted lines: 1 word per instruction line
 /// (labels, `.align`/`.table` directives, `equ` lines, comments, and blanks
 /// are 0), mirroring the asm crate's pass-1 counting so the page-fit
@@ -1926,32 +2072,77 @@ fn word_size(lines: &[String]) -> usize {
     .count()
 }
 
-/// Greedy page assignment (M11): pad with `.org <next base>` before a
-/// function that would cross the current 2048-word page's end, and advance
-/// the running word address. A function larger than one page can never fit
-/// (its intra-function GOTOs need a single stable page) and panics loudly;
-/// a program past page 3 (0x2000 — the device flash) panics loudly too. The
-/// `.org` pads with 0x0000 words (the assembler supports it), so the final
-/// layout's addresses are exactly what the tracker predicts.
-fn page_assign(out: &mut Vec<String>, addr: &mut usize, size: usize, name: &str) {
+/// Greedy page assignment (M11), one function: pad with `.org <next base>`
+/// before a function that would cross the current 2048-word page's end, and
+/// return the `(pad, page, next_addr)`. A function larger than one page can
+/// never fit (its intra-function GOTOs need a single stable page) and panics
+/// loudly; a program past page 3 (0x2000 — the device flash) panics loudly
+/// too. The `.org` pads with 0x0000 words (the assembler supports it), so
+/// the final layout's addresses are exactly what the tracker predicts.
+///
+/// M11 two-phase emission: pass A measures every function body with all
+/// PCLATH restores present and runs this over ALL functions, so a call to a
+/// not-yet-emitted target still knows its page; pass B re-emits with
+/// same-page restores skipped. The skip only shrinks bodies, and the pads
+/// pin the page bases, so every function stays on the page pass A assigned
+/// (elision is page-membership-stable).
+fn page_step(addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usize) {
     if size > 0x800 {
         panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
     }
-    if *addr >= 0x2000 {
+    if addr >= 0x2000 {
         panic!(
             "isel: function @{name} would start at 0x{addr:04X}, beyond page 3 (device flash is 8K words)"
         );
     }
-    let page_end = (*addr & !0x7FF) + 0x800;
-    if *addr + size > page_end {
+    let page_end = (addr & !0x7FF) + 0x800;
+    let pad = if addr + size > page_end {
         if page_end >= 0x2000 {
             panic!(
                 "isel: function @{name} would start at 0x{page_end:04X}, beyond page 3 (device flash is 8K words)"
             );
         }
-        out.push(format!("    org 0x{page_end:04X}"));
-        *addr = page_end;
+        Some(page_end)
+    } else {
+        None
+    };
+    let start = pad.unwrap_or(addr);
+    (pad, start / 0x800, start + size)
+}
+
+/// The const-table section's reader entries and the page PCLATH<4:3> holds
+/// after each CALL returns: a reader writes `MOVLW HIGH(<base>); MOVWF
+/// PCLATH` before its computed jump, so PCLATH's page bits are the TABLE
+/// BASE's page (`<name>` for single/chunk-0 reads, `<name>_1` for chunk-1
+/// reads) — not `PAGE(__read_<name>)`, the page the caller set (the entry
+/// itself can sit in a different page than its base, e.g. a reader at
+/// 0x7FA with a 256-aligned base at 0x800). The caller's restore after the
+/// call is needed iff that page differs from its own, so this is the map
+/// `emit_pclath_restore` consults. The section's pass-A placement is used:
+/// it sits right after the last function, and the pass-B elision only
+/// shrinks bodies, so no reader base can cross a page boundary between the
+/// passes (see the pass-B note in `select`) — the pages hold in the final
+/// text.
+fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usize)> {
+    let mut pages = Vec::new();
+    let mut addr = table_start;
+    for g in consts {
+        let size = g.bytes.len();
+        if size >= 256 {
+            // Reader entry (6 words), `.align 256`, chunk 0 base at the
+            // aligned address, chunk 1 base exactly +256 later.
+            let aligned = ((addr + 6) + 255) & !255;
+            pages.push((format!("__read_{}", g.name), aligned / 0x800));
+            pages.push((format!("__read_{}_hi", g.name), (aligned + 256) / 0x800));
+            addr = aligned + 256 + (size - 256) + 6;
+        } else {
+            // Single table: base sits 6 words (the reader entry) after the
+            // section's running address.
+            pages.push((format!("__read_{}", g.name), (addr + 6) / 0x800));
+            addr += 6 + size;
+        }
     }
+    pages
 }
 
 /// Select instructions for the whole module, producing PIC14 assembly text.
@@ -1964,10 +2155,15 @@ fn page_assign(out: &mut Vec<String>, addr: &mut usize, size: usize, name: &str)
 /// BANKSEL is ever needed for them.
 ///
 /// M11: every CALL runs with PCLATH<4:3> = the target's page (set
-/// immediately before, restored immediately after), functions are assigned
-/// to 2048-word pages greedily (a function that would cross a page's end
-/// gets a `.org <next base>` pad), and the program's highest word address
-/// is bounded by the device's 8K-word flash.
+/// immediately before, restored immediately after — the restore is skipped
+/// when the target is in the caller's own page), functions are assigned to
+/// 2048-word pages greedily (a function that would cross a page's end gets a
+/// `.org <next base>` pad), and the program's highest word address is
+/// bounded by the device's 8K-word flash. Emission is two-phase: pass A
+/// measures every body (all restores present) and assigns pages for ALL
+/// functions so a forward call target's page is known; pass B re-emits with
+/// same-page restores skipped (the pads pin the page bases, so the elision
+/// never moves a function off its assigned page).
 pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // The icmp scratch byte and the two retval bytes are fixed common-RAM
     // constants (bank-independent, common RAM 0x70-0x7F is never used by
@@ -1994,11 +2190,6 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         "    SLEEP".to_string(),
         "".to_string(),
     ];
-    // Running word address: the reset vector (1 word: `goto __start`) plus
-    // the `__start` body (4 words). `__start` sits at the top so the reset
-    // vector's GOTO (PCLATH = 0 at reset) always reaches it — a multi-page
-    // program would strand it past 0x800 otherwise.
-    let mut addr: usize = 5;
     // Phase-3 pointers: collect every GEP and resolve its chain eagerly to a
     // folded `(base, k, terms)`, keyed `{func}::{reg}` like every other
     // local. Seeds first: a byval param slot IS the struct copy
@@ -2098,138 +2289,94 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     }
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
-    let mut tmp = 0u32;
-    for f in &m.funcs {
-        let mut g = Gen {
-            m,
-            addrs,
-            resolved: &resolved,
-            scratch,
-            retval_lo,
-            cur_func: &f.name,
-            tmp: &mut tmp,
-            out: Vec::new(),
-        };
-        // Runtime routines (legalize-injected): the entry block holds only
-        // the scratch alloca, so instead of the (empty) block emission the
-        // recipe body goes here — the label, the adapted epicurus asm, and
-        // the RETURN the injected Func has no `ret` for. A routine with no
-        // recipe yet panics loudly rather than emitting an empty label that
-        // would silently fall through into the next function.
-        if is_routine_name(&f.name) {
-            match &f.name[..] {
-                "__mul_u8" | "__mul_u16" | "__udiv_u8" | "__urem_u8"
-                | "__udiv_u16" | "__urem_u16" | "__sdiv_i8" | "__srem_i8"
-                | "__sdiv_i16" | "__srem_i16" | "__shl_u8" | "__lshr_u8"
-                | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16" => {}
-                other => panic!("isel: unknown runtime routine @{other}"),
-            }
-            g.emit_routine();
-            let size = word_size(&g.out);
-            page_assign(&mut out, &mut addr, size, &f.name);
-            addr += size;
-            out.extend(g.out);
-            continue;
-        }
-        // Block label scheme: the entry block uses the bare function name
-        // (so CALLs and GOTOs resolve to it); every other block is
-        // `{func}_L{label}`. The entry block's label is emitted by the block
-        // loop below — no standalone function label here, or `main:` /
-        // `add:` would be defined twice and gpasm would reject the file.
-        let mut labels: HashMap<String, String> = HashMap::new();
-        for (i, b) in f.blocks.iter().enumerate() {
-            let lbl = if i == 0 {
-                f.name.clone()
-            } else {
-                format!("{}_L{}", f.name, b.label)
+    // ---- PASS A: emit every function body with every PCLATH restore
+    // present, measure word sizes, and run the greedy page assignment over
+    // ALL functions. A single-pass emission cannot know a forward call
+    // target's page while the caller is being emitted (the target's
+    // placement depends on sizes measured later), so pass A measures and
+    // assigns first; pass B (below) emits the final text with every
+    // function's page known.
+    let mut bodies: Vec<(String, usize)> = Vec::new();
+    {
+        let mut tmp = 0u32;
+        for f in &m.funcs {
+            let mut g = Gen {
+                m,
+                addrs,
+                resolved: &resolved,
+                scratch,
+                retval_lo,
+                cur_func: &f.name,
+                tmp: &mut tmp,
+                page_of: None,
+                out: Vec::new(),
             };
-            labels.insert(b.label.clone(), lbl);
+            emit_func_body(&mut g, f);
+            bodies.push((f.name.clone(), word_size(&g.out)));
         }
-        // phi elimination: for each predecessor block, the copies that must
-        // run before it branches into the merge block.
-        let mut phi_copies: HashMap<String, Vec<(String, Ty, Val)>> = HashMap::new();
-        for b in &f.blocks {
-            for i in &b.insts {
-                if let Inst::Phi(p) = i {
-                    for (val, pred) in &p.incoming {
-                        phi_copies
-                            .entry(pred.clone())
-                            .or_default()
-                            .push((p.dst.clone(), p.ty, val.clone()));
-                    }
-                }
-            }
+    }
+    // Greedy page assignment over every function's pass-A size, in module
+    // order: the `.org` pads and the page each function lands on. The
+    // running word address starts at 5 — the reset vector (1 word: `goto
+    // __start`) plus the `__start` body (4 words). `__start` sits at the top
+    // so the reset vector's GOTO (PCLATH = 0 at reset) always reaches it — a
+    // multi-page program would strand it past 0x800 otherwise.
+    let mut pages: HashMap<String, usize> = HashMap::new();
+    let mut pads: HashMap<String, usize> = HashMap::new();
+    let mut addr: usize = 5;
+    for (name, size) in &bodies {
+        let (pad, page, next) = page_step(addr, *size, name);
+        addr = next;
+        pages.insert(name.clone(), page);
+        if let Some(p) = pad {
+            pads.insert(name.clone(), p);
         }
-        for b in &f.blocks {
-            g.emit(format!("{}:", labels[&b.label]));
-            let mut terminator = None;
-            for i in &b.insts {
-                match i {
-                    Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
-                    Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(i),
-                    _ => g.emit_inst(i),
-                }
+    }
+    // Const-table readers: the page PCLATH holds after each `__read_*` CALL
+    // (see `reader_pages`). The section sits right after the last function —
+    // pass B pins it to this same start, so the pages hold in the final text.
+    let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
+    consts.sort_by_key(|g| g.name.clone());
+    let table_start = addr;
+    for (entry, page) in reader_pages(&consts, table_start) {
+        pages.insert(entry, page);
+    }
+    // ---- PASS B: emit the final text with every function's page known.
+    // Same-page calls (and same-page const reads) skip the restore pair; the
+    // pages are pass A's, and the `.org` pads pin the page bases, so the
+    // elision cannot move a function off its assigned page (it only shrinks
+    // bodies — page-membership-stable).
+    {
+        let mut tmp = 0u32;
+        let mut addr_b: usize = 5;
+        for (f, (name, _)) in m.funcs.iter().zip(&bodies) {
+            let mut g = Gen {
+                m,
+                addrs,
+                resolved: &resolved,
+                scratch,
+                retval_lo,
+                cur_func: &f.name,
+                tmp: &mut tmp,
+                page_of: Some(&pages),
+                out: Vec::new(),
+            };
+            emit_func_body(&mut g, f);
+            if let Some(pad) = pads.get(name) {
+                out.push(format!("    org 0x{pad:04X}"));
+                addr_b = *pad;
             }
-            if let Some(copies) = phi_copies.get(&b.label) {
-                g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                // Emit the predecessor's copies in dependency order so a copy
-                // never overwrites a slot a later copy still needs to read.
-                // Chains (%a <- %b, %b <- %c) emit c->b then b->a. If the
-                // copies form a cycle (%a = phi [%b,P], %b = phi [%a,P] —
-                // clang -O1 emits this for loop-carried swaps), no ordering
-                // works without a temp register, so panic loudly rather than
-                // silently miscompile.
-                let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
-                    .iter()
-                    .map(|(dst, ty, val)| {
-                        let da = g.slot_addr(g.cur_func, dst);
-                        let src = match val {
-                            Val::Reg(r) => Some(g.slot_addr(g.cur_func, r)),
-                            _ => None,
-                        };
-                        (da, src, *ty, val.clone())
-                    })
-                    .collect();
-                let n = pending.len();
-                let mut emitted = vec![false; n];
-                let mut emitted_count = 0usize;
-                while emitted_count < n {
-                    let mut progress = false;
-                    for i in 0..n {
-                        if emitted[i] {
-                            continue;
-                        }
-                        let (da, src, ty, val) = &pending[i];
-                        // Blocked while an un-emitted sibling (j != i) writes
-                        // this copy's source slot (sibling destination ==
-                        // this copy's source).
-                        let blocked = match src {
-                            Some(s) => {
-                                (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s)
-                            }
-                            None => false,
-                        };
-                        if !blocked {
-                            g.emit_move_val_to_slot(val, *ty, *da);
-                            emitted[i] = true;
-                            emitted_count += 1;
-                            progress = true;
-                        }
-                    }
-                    if !progress {
-                        panic!("isel: cyclic phi copies not supported");
-                    }
-                }
-            }
-            if let Some(t) = terminator {
-                g.emit_terminator(t, &labels);
-            }
+            addr_b += word_size(&g.out);
+            out.extend(g.out);
         }
-        g.emit("".to_string());
-        let size = word_size(&g.out);
-        page_assign(&mut out, &mut addr, size, &f.name);
-        addr += size;
-        out.extend(g.out);
+        // The tables are NOT pinned: pass-B bodies are no larger (the
+        // elision only shrinks), so the section shifts earlier by the
+        // elided words. That cannot move a reader base across a page
+        // boundary — the section sits after the last `.org` pad (or after
+        // the fixed 5-word header when there are no pads), the functions
+        // after that pad fit within one page, and the elision only removes
+        // words — so the pass-A reader pages above hold in the final text.
+        addr = addr_b;
     }
     // Const (flash) globals become RETLW tables, emitted after the
     // functions so the CALLs above resolve. Every `__read_<name>` reader
@@ -2252,8 +2399,6 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // or a misaligned chunk base would silently misread, so it must fail
     // assembly, not miscompile. Tables beyond 511 bytes (three chunks)
     // panic loudly — out of scope.
-    let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
-    consts.sort_by_key(|g| g.name.clone());
     // Label-collision guard: every label a table emits — its base label, its
     // reader entry, and for chunked tables the fresh `{name}_1` chunk label
     // and `__read_{name}_hi` entry — must be unique across all consts. A

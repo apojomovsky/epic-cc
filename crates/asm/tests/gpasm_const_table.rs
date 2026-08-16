@@ -5,16 +5,17 @@
 //! The fixture is the driver's full-pipeline output (clang -> irparse ->
 //! wholeprog -> legalize -> callgraph -> alloc -> isel -> banking ->
 //! peephole) on `crates/driver/tests/fixtures/const_table.c`. It exercises
-//! the milestone-10 chunked const-table surface end to end: the 104-byte
-//! `pad` filler pushes `table` past 0x100 (base 0x200, window 2), so the
-//! readers' `MOVLW HIGH(...); MOVWF PCLATH` sets are load-bearing; the
-//! 300-byte table is split into two 256-byte chunks at `table` (0x200) and
-//! `table_1` (0x300, LOW == 0 both) with the `__read_table_hi` entry after
-//! the table; the caller splits each runtime index into the in-chunk byte
-//! (W) and the chunk bit (0x70) and CALLs the right entry. `in` is the i16
-//! global at 0x20 (low byte holds the input); `out` is the global at 0x22.
-//! Total program: 818 words (the M11 PCLATH pairs at every CALL site are
-//! offset by the smaller `pad` filler; still a single page).
+//! the milestone-10 chunked const-table surface end to end: the 40-byte
+//! `pad` filler keeps the section far enough past main that `table` lands
+//! past 0x100 (base 0x100, window 1 — M11 now skips same-page PCLATH
+//! restores, so main is smaller), so the readers' `MOVLW HIGH(...); MOVWF
+//! PCLATH` sets are load-bearing; the 300-byte table is split into two
+//! 256-byte chunks at `table` (0x100) and `table_1` (0x200, LOW == 0 both)
+//! with the `__read_table_hi` entry after the table; the caller splits each
+//! runtime index into the in-chunk byte (W) and the chunk bit (0x70) and
+//! CALLs the right entry. `in` is the i16 global at 0x20 (low byte holds
+//! the input); `out` is the global at 0x22. Total program: 562 words
+//! (still a single page).
 //!
 //! gpasm does not know our two assembly directives, so `to_gpasm_src`
 //! translates them to source that assembles to the SAME words: `.table`
