@@ -12,10 +12,24 @@
 //! the culprit, and the reduced program must still fail the differential
 //! with the SAME failure kind.
 
+use std::path::PathBuf;
+
 use fuzz::{
     generate, reduce, run_differential, write_fixture, FailureKind, Input, Program,
     REDUCTION_CAP, TYPEDEF_PROLOGUE,
 };
+
+/// Removes a fixture file on drop. Synthetic fixtures must not survive the
+/// test — on success OR on failure: the old code removed the file only on
+/// the success path, leaving `reduced_<seed>.c` behind when an assert
+/// panicked mid-test.
+struct FixtureGuard(PathBuf);
+
+impl Drop for FixtureGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
 
 /// The synthetic program's fixture seed (a marker — the program is
 /// hand-written, not generated; the seed only names the fixture file).
@@ -120,8 +134,11 @@ fn reducer_removes_benign_statements_and_keeps_the_culprit() {
     );
 
     // The reduced program is saved as the reduced_<seed>.c fixture and the
-    // saved file is exactly the reduced source.
+    // saved file is exactly the reduced source. The FixtureGuard removes it
+    // on every exit path (success or a panicking assert) — a synthetic
+    // fixture (not a real bug) must never survive the test.
     let path = write_fixture(&reduced.program).expect("save the reduced fixture");
+    let _guard = FixtureGuard(path.clone());
     assert!(
         path.ends_with(&format!("fixtures/reduced_{SYNTHETIC_SEED}.c")),
         "fixture path: {}",
@@ -129,7 +146,63 @@ fn reducer_removes_benign_statements_and_keeps_the_culprit() {
     );
     let saved = std::fs::read_to_string(&path).expect("read the saved fixture back");
     assert_eq!(saved, reduced.program.c_source, "the fixture is the reduced program");
-    std::fs::remove_file(&path).expect("remove the synthetic fixture (not a real bug)");
+    drop(_guard);
+    assert!(
+        !path.exists(),
+        "the synthetic fixture must not survive the test (success path)"
+    );
+}
+
+/// A second mismatch program whose failure MESSAGE differs from the
+/// synthetic one — `(int)in0 * 300 < 40000` with in0 = 200: on the PIC the
+/// product wraps to -5536 (negative, so the comparison yields 1); on the
+/// host it stays 60000 (> 40000, so 0) — `mismatch: pic 1, host 0` vs the
+/// synthetic's `mismatch: pic 0, host 1`. (`< 0` would NOT mismatch: clang
+/// folds it to 0 under the signed-overflow UB assumption — the comparison
+/// must be one the optimizer cannot constant-fold.)
+fn other_mismatch_program() -> Program {
+    let c_source = "volatile unsigned char in0;\n\
+                   volatile unsigned char checksum;\n\
+                   void main(void){ checksum = (unsigned char)((int)in0 * 300 < 40000); }\n"
+        .to_string();
+    Program {
+        c_source: c_source.clone(),
+        inputs: vec![Input { name: "in0".into(), value: 200, width: 8 }],
+        checksum_name: "checksum".into(),
+        seed: 9996,
+        statements: Vec::new(),
+        prologue: c_source,
+    }
+}
+
+#[test]
+fn reduce_captures_the_fresh_failure_message() {
+    // reduce() re-derives the failure kind from a fresh verification run of
+    // `program`; it must take the MESSAGE from that same run too — a stale
+    // caller failure (same kind, a different program's message) must not
+    // leak its message into the reduced failure.
+    let prog = synthetic_mismatch_program();
+    let fresh = match run_differential(&prog) {
+        Err(f) => f,
+        Ok(v) => panic!("the synthetic program must fail the differential, got Ok({v})"),
+    };
+    let stale = match run_differential(&other_mismatch_program()) {
+        Err(f) => f,
+        Ok(v) => panic!("the other program must fail the differential, got Ok({v})"),
+    };
+    assert_eq!(stale.kind, fresh.kind, "both failures are mismatches");
+    assert_ne!(
+        stale.to_string(),
+        fresh.to_string(),
+        "the two failure messages must differ (otherwise the stale one cannot be detected)"
+    );
+
+    let reduced = reduce(&prog, &stale).expect("reduce the synthetic mismatch");
+    assert_eq!(
+        reduced.failure,
+        fresh,
+        "the reduced failure must be the FRESH verification failure, not the caller's stale one"
+    );
 }
 
 #[test]
