@@ -1,0 +1,13 @@
+[package]
+name = "fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+irparse = { path = "../irparse" }
+wholeprog = { path = "../wholeprog" }
+legalize = { path = "../legalize" }
+callgraph = { path = "../callgraph" }
+alloc = { path = "../alloc" }
+pic14-sim = { path = "../sim" }
