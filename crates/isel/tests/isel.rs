@@ -184,6 +184,36 @@ fn zext_trunc_pair() {
 }
 
 #[test]
+fn zext_i1_to_i8_copies_the_icmp_byte() {
+    // `zext i1 %c to i8` is legal and common (`u8 b = (a < b);`): i1 and
+    // i8 are both 1 byte in the byte model, and an icmp result is
+    // materialized as a byte holding exactly 0/1, so the zext is a 1-byte
+    // copy (equal-width zext identity). Pins the i1->i8 path independently
+    // of the fuzz corpus.
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %c = icmp eq i8 %a, %b\n    %z = zext i1 %c to i8\n    store i8 %z @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x23 -> root frame at 0x26; %a=0x26, %b=0x27,
+    // %c=0x28, %z=0x29.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("y", 0x21),
+        ("out", 0x22),
+        ("main::a", 0x26),
+        ("main::b", 0x27),
+        ("main::c", 0x28),
+        ("main::z", 0x29),
+    ]);
+    let asm = select(&m, &addrs);
+    // The zext copies the icmp result byte into %z: MOVF 0x28, W; MOVWF 0x29.
+    assert!(asm.contains("MOVF 0x28, W"), "load the icmp byte:\n{asm}");
+    assert!(
+        asm.contains("MOVWF 0x29"),
+        "copy into %z (i1 is 1 byte, so the zext IS the copy):\n{asm}"
+    );
+}
+
+#[test]
 fn sext_i8_to_i16_copies_low_and_sign_fills_high() {
     let m = parse(
         "global in i8\nglobal out16 i16\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i16\n    store i16 %s @out16\n    ret void\n",
@@ -1251,20 +1281,81 @@ fn sub_i16_reg_const_emits_borrow_chain() {
 }
 
 #[test]
-#[should_panic(expected = "const LHS")]
-fn panics_on_sub_const_lhs() {
+fn sub_const_lhs_emits_sublw_chain() {
     // sub is NOT commutative: d = k - a cannot reuse the reg-const lowering
-    // (which computes a - k) and must not read a const as a file register.
+    // (which computes a - k) and must never read a const as a file register.
+    // The const-LHS path lowers per byte as `MOVF a,W; SUBLW k; MOVWF d`
+    // (SUBLW computes k - W), with each higher byte bumping the subtrahend
+    // byte by the low byte's borrow (BTFSS C / ADDLW 1, mirroring the
+    // reg-const `a - k` chain with the roles swapped).
+    //
+    // i8: d = 5 - a.
     let m = parse(
         "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %r = sub i8 5, %a\n    store i8 %r @out\n    ret void\n",
     );
-    let addrs = addrs(&[
+    let addrs8 = addrs(&[
         ("x", 0x20),
         ("out", 0x21),
         ("main::a", 0x25),
         ("main::r", 0x26),
     ]);
-    let _ = select(&m, &addrs);
+    let asm8 = select(&m, &addrs8);
+    // %a=0x25, %r=0x26.
+    assert!(asm8.contains("MOVF 0x25, W"), "load a:\n{asm8}");
+    assert!(asm8.contains("SUBLW 0x05"), "k - a via SUBLW k:\n{asm8}");
+    assert!(asm8.contains("MOVWF 0x26"), "store d:\n{asm8}");
+    assert!(!asm8.contains("SUBWF"), "const-LHS sub must not use SUBWF (a - k is the wrong direction):\n{asm8}");
+
+    // i16: d = 0x1234 - a. 0x1234 -> lo 0x34, hi 0x12.
+    let m = parse(
+        "global x i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %r = sub i16 4660, %a\n    store i16 %r @out\n    ret void\n",
+    );
+    // alloc: globals end at 0x24 -> root frame at 0x27; %a=0x27, %r=0x29.
+    let addrs16 = addrs(&[
+        ("x", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x27),
+        ("main::r", 0x29),
+    ]);
+    let asm16 = select(&m, &addrs16);
+    // %a=0x27 (hi 0x28), %r=0x29 (hi 0x2A).
+    assert!(asm16.contains("MOVF 0x27, W"), "load a_lo:\n{asm16}");
+    assert!(asm16.contains("SUBLW 0x34"), "k_lo - a_lo:\n{asm16}");
+    assert!(asm16.contains("MOVWF 0x29"), "store d_lo:\n{asm16}");
+    assert!(asm16.contains("MOVF 0x28, W"), "load a_hi:\n{asm16}");
+    assert!(asm16.contains("BTFSS STATUS, 0"), "borrow test:\n{asm16}");
+    assert!(asm16.contains("ADDLW 0x01"), "borrow-in add:\n{asm16}");
+    assert!(asm16.contains("SUBLW 0x12"), "k_hi - a_hi:\n{asm16}");
+    assert!(asm16.contains("MOVWF 0x2A"), "store d_hi:\n{asm16}");
+    assert!(!asm16.contains("SUBWF"), "const-LHS sub must not use SUBWF:\n{asm16}");
+
+    // i32: d = 0x12345678 - a, a four-byte SUBLW borrow chain.
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 305419896, %a\n    store i32 %r @out\n    ret void\n",
+    );
+    let addrs32 = addrs(&[
+        ("x", 0x20),
+        ("out", 0x24),
+        ("main::a", 0x30),
+        ("main::r", 0x34),
+    ]);
+    let asm32 = select(&m, &addrs32);
+    // %a=0x30..0x33, %r=0x34..0x37; 0x12345678 -> bytes 0x78, 0x56, 0x34, 0x12.
+    assert!(asm32.contains("MOVF 0x30, W"), "load a_b0:\n{asm32}");
+    assert!(asm32.contains("SUBLW 0x78"), "k_b0 - a_b0:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x34"), "store d_b0:\n{asm32}");
+    assert!(asm32.contains("MOVF 0x31, W"), "load a_b1:\n{asm32}");
+    assert!(asm32.contains("BTFSS STATUS, 0"), "borrow test:\n{asm32}");
+    assert!(asm32.contains("ADDLW 0x01"), "borrow-in add:\n{asm32}");
+    assert!(asm32.contains("SUBLW 0x56"), "k_b1 - a_b1:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x35"), "store d_b1:\n{asm32}");
+    assert!(asm32.contains("MOVF 0x32, W"), "load a_b2:\n{asm32}");
+    assert!(asm32.contains("SUBLW 0x34"), "k_b2 - a_b2:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x36"), "store d_b2:\n{asm32}");
+    assert!(asm32.contains("MOVF 0x33, W"), "load a_b3:\n{asm32}");
+    assert!(asm32.contains("SUBLW 0x12"), "k_b3 - a_b3:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x37"), "store d_b3:\n{asm32}");
+    assert!(!asm32.contains("SUBWF"), "const-LHS sub must not use SUBWF:\n{asm32}");
 }
 
 #[test]
