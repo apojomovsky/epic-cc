@@ -1732,15 +1732,125 @@ impl<'m> Gen<'m> {
         self.emit(format!("    INCF 0x{:02X}, F", addr + 1));
     }
 
-    /// The recipe body for one of the ten mul/div/rem runtime routines,
-    /// adapted from the machine-verified epicurus PIC16 asm
+    /// Two's-complement negate of a 32-bit value in place (the INCF carry
+    /// propagates byte-by-byte through the Z chain).
+    fn neg32_in_place(&mut self, addr: u16) {
+        for i in 0..4 {
+            self.emit(format!("    COMF 0x{:02X}, F", addr + i));
+        }
+        self.emit(format!("    INCF 0x{addr:02X}, F"));
+        for i in 1..4 {
+            self.emit("    BTFSC STATUS, 2".to_string());
+            self.emit(format!("    INCF 0x{:02X}, F", addr + i));
+        }
+    }
+
+    /// One 16-iteration chunk of the 32-iteration `__mul_u32` AN526 loop:
+    /// test `bk`'s LSB, add `t` to `r` across all 4 bytes (the incfsz
+    /// carry idiom), shift `t` left with wraparound (the shifted-out high
+    /// bits are discarded — i32 `mul` wraps), shift `bk` right, count 16.
+    fn emit_mul32_loop(
+        &mut self,
+        l_loop: String,
+        l_skip: String,
+        bk_lo: u16,
+        bk_hi: u16,
+        cnt: u16,
+        r: [u16; 4],
+        t: [u16; 4],
+    ) {
+        self.emit(format!("{l_loop}:"));
+        self.emit(format!("    BTFSS 0x{bk_lo:02X}, 0")); // test multiplier LSB
+        self.emit(format!("    GOTO {l_skip}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", t[0]));
+        self.emit(format!("    ADDWF 0x{:02X}, F", r[0]));
+        for i in 1..4 {
+            self.emit(format!("    MOVF 0x{:02X}, W", t[i]));
+            self.emit("    BTFSC STATUS, 0".to_string());
+            self.emit(format!("    INCFSZ 0x{:02X}, W", t[i]));
+            self.emit(format!("    ADDWF 0x{:02X}, F", r[i]));
+        }
+        self.emit(format!("{l_skip}:"));
+        self.emit("    BCF STATUS, 0".to_string());
+        for t_i in t {
+            self.emit(format!("    RLF 0x{t_i:02X}, F")); // t <<= 1 (wrapping)
+        }
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RRF 0x{bk_hi:02X}, F"));
+        self.emit(format!("    RRF 0x{bk_lo:02X}, F")); // bk >>= 1
+        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+        self.emit(format!("    GOTO {l_loop}"));
+    }
+
+    /// The 32-iteration restoring-division loop shared by the i32 divmod
+    /// routines: `num` (the param slot) shifts left one bit per iteration
+    /// (the quotient builds in its vacated bits), `rem`@0-3 accumulates the
+    /// partial remainder, `den`@4-7 holds the denominator copy the
+    /// subtract/restore chains read, `cnt`@8 counts 32 iterations. The
+    /// full-width remainder never carries out of its 4 bytes for a 32/32
+    /// divide (rem <= 2^k - 1 before the k-th shift), so the plain 4-byte
+    /// borrow chain is exact — no extended-bit special case. C after the
+    /// last SUBWF is 1 iff rem >= den (the quotient-bit discriminator).
+    fn emit_divmod32(&mut self, num: u16, scr: u16) {
+        let (rem0, den0, cnt) = (scr, scr + 4, scr + 8);
+        let l_loop = self.fresh_label();
+        let l_restore = self.fresh_label();
+        let l_next = self.fresh_label();
+        for i in 0..4 {
+            self.emit(format!("    CLRF 0x{:02X}", rem0 + i));
+        }
+        self.emit("    MOVLW 0x20".to_string());
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("{l_loop}:"));
+        self.emit("    BCF STATUS, 0".to_string());
+        for i in 0..4 {
+            self.emit(format!("    RLF 0x{:02X}, F", num + i));
+        }
+        for i in 0..4 {
+            self.emit(format!("    RLF 0x{:02X}, F", rem0 + i));
+        }
+        // rem -= den across 4 bytes (the INCFSZ wrap-correct borrow folds);
+        // C = (rem >= den) after the last byte.
+        for i in 0..4 {
+            self.emit(format!("    MOVF 0x{:02X}, W", den0 + i));
+            if i == 0 {
+                self.emit(format!("    SUBWF 0x{:02X}, F", rem0 + i));
+            } else {
+                self.emit("    BTFSS STATUS, 0".to_string());
+                self.emit(format!("    INCFSZ 0x{:02X}, W", den0 + i));
+                self.emit(format!("    SUBWF 0x{:02X}, F", rem0 + i));
+            }
+        }
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_restore}"));
+        self.emit(format!("    BSF 0x{num:02X}, 0"));
+        self.emit(format!("    GOTO {l_next}"));
+        self.emit(format!("{l_restore}:"));
+        // rem += den (the exact add-back restore, carry folds).
+        for i in 0..4 {
+            self.emit(format!("    MOVF 0x{:02X}, W", den0 + i));
+            if i == 0 {
+                self.emit(format!("    ADDWF 0x{:02X}, F", rem0 + i));
+            } else {
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit(format!("    INCFSZ 0x{:02X}, W", den0 + i));
+                self.emit(format!("    ADDWF 0x{:02X}, F", rem0 + i));
+            }
+        }
+        self.emit(format!("{l_next}:"));
+        self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+        self.emit(format!("    GOTO {l_loop}"));
+    }
+
+    /// The recipe body for one of the fifteen mul/div/rem runtime routines
+    /// (i8/i16/i32), adapted from the machine-verified epicurus PIC16 asm
     /// (`epic_math_mul.c` AN526 shift-add; `epic_math_div.c` restoring
     /// shift-subtract). Args arrive in the routine's `{func}::{param}` slots
     /// (copied by `emit_call`), the result goes to the fixed retval slots,
-    /// and working state lives in `{func}::__scr` at the Task-2 contract
+    /// and working state lives in `{func}::__scr` at the layout-contract
     /// offsets. Plain addresses only — the banking pass inserts BANKSELs.
     /// Div-by-zero is LLVM poison: the loop runs (den = 0 ⇒ quotient 0xFFFF,
-    /// remainder 0), any value is legal — no guard, documented. The six
+    /// remainder 0), any value is legal — no guard, documented. The nine
     /// shift routines (variable count) share `emit_shift_body`.
     fn emit_routine(&mut self) {
         let name = self.cur_func;
@@ -1750,17 +1860,21 @@ impl<'m> Gen<'m> {
             // Variable-count shifts: mask the count to width-1, bounded
             // loop over the val param slot (see emit_shift_body).
             "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
-            | "__lshr_u16" | "__ashr_i16" => {
-                let (is16, op) = match name {
-                    "__shl_u8" => (false, BinOp::Shl),
-                    "__shl_u16" => (true, BinOp::Shl),
-                    "__lshr_u8" => (false, BinOp::LShr),
-                    "__lshr_u16" => (true, BinOp::LShr),
-                    "__ashr_i8" => (false, BinOp::AShr),
-                    "__ashr_i16" => (true, BinOp::AShr),
+            | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32"
+            | "__ashr_i32" => {
+                let (bytes, op) = match name {
+                    "__shl_u8" => (1, BinOp::Shl),
+                    "__shl_u16" => (2, BinOp::Shl),
+                    "__shl_u32" => (4, BinOp::Shl),
+                    "__lshr_u8" => (1, BinOp::LShr),
+                    "__lshr_u16" => (2, BinOp::LShr),
+                    "__lshr_u32" => (4, BinOp::LShr),
+                    "__ashr_i8" => (1, BinOp::AShr),
+                    "__ashr_i16" => (2, BinOp::AShr),
+                    "__ashr_i32" => (4, BinOp::AShr),
                     _ => unreachable!(),
                 };
-                self.emit_shift_body(is16, op, scr);
+                self.emit_shift_body(bytes, op, scr);
             }
             // 8x8 -> 16 shift-add (AN526): t = a shifted left one bit per
             // multiplier bit; for each set bit of bk, r += t. Store the low
@@ -2103,34 +2217,152 @@ impl<'m> Gen<'m> {
                 }
                 self.emit("    RETURN".to_string());
             }
+            // 32x32 -> 32 shift-add (AN526), 32 iterations: t = a (4 bytes,
+            // shifted left one bit per iteration — the shifted-out high
+            // bits are DISCARDED, so i32 mul wraps mod 2^32); for each set
+            // bit of the multiplier, r += t across all 4 bytes with the
+            // incfsz carry idiom. bk is 2 bytes: the low 16 multiplier bits
+            // first, then reloaded from b's high half for the second 16
+            // iterations (the b param slot is untouched). Store the low 32
+            // bits (the i32 result).
+            "__mul_u32" => {
+                let a = self.slot_addr(name, "a");
+                let b = self.slot_addr(name, "b");
+                self.assert_bank0(&[a, a + 3, b, b + 3, scr, scr + 10], name);
+                let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
+                let r = [scr + 3, scr + 4, scr + 5, scr + 6];
+                let t = [scr + 7, scr + 8, scr + 9, scr + 10];
+                for i in 0..4 {
+                    self.emit(format!("    CLRF 0x{:02X}", r[i]));
+                    self.emit(format!("    CLRF 0x{:02X}", t[i]));
+                }
+                for i in 0..4u16 {
+                    self.emit(format!("    MOVF 0x{:02X}, W", a + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", t[usize::from(i)])); // t = a (32-bit)
+                }
+                self.emit(format!("    MOVF 0x{:02X}, W", b));
+                self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
+                self.emit(format!("    MOVF 0x{:02X}, W", b + 1));
+                self.emit(format!("    MOVWF 0x{bk_hi:02X}")); // bk = b low 16
+                self.emit("    MOVLW 0x10".to_string());
+                self.emit(format!("    MOVWF 0x{cnt:02X}")); // cnt = 16
+                let l_loop1 = self.fresh_label();
+                let l_skip1 = self.fresh_label();
+                self.emit_mul32_loop(l_loop1, l_skip1, bk_lo, bk_hi, cnt, r, t);
+                // reload bk from b's high half for the second 16 iterations
+                self.emit(format!("    MOVF 0x{:02X}, W", b + 2));
+                self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
+                self.emit(format!("    MOVF 0x{:02X}, W", b + 3));
+                self.emit(format!("    MOVWF 0x{bk_hi:02X}"));
+                self.emit("    MOVLW 0x10".to_string());
+                self.emit(format!("    MOVWF 0x{cnt:02X}"));
+                let l_loop2 = self.fresh_label();
+                let l_skip2 = self.fresh_label();
+                self.emit_mul32_loop(l_loop2, l_skip2, bk_lo, bk_hi, cnt, r, t);
+                self.store_retval(scr + 3, 4);
+                self.emit("    RETURN".to_string());
+            }
+            // 32/32 restoring division (32 iterations): num <<= 1 (C = old
+            // MSB, brought down into rem's LSB); rem = (rem << 1) | C; if
+            // rem >= den set the quotient bit else restore (add den back).
+            // The full-width 4-byte remainder never carries out (rem <=
+            // 2^k - 1 before the k-th shift), so the 4-byte borrow chain
+            // with the INCFSZ wrap-correct folds is exact. den is copied
+            // into __scr@4-7 (the divmod reads it repeatedly).
+            "__udiv_u32" | "__urem_u32" => {
+                let num = self.slot_addr(name, "num");
+                let den = self.slot_addr(name, "den");
+                self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 9], name);
+                for i in 0..4 {
+                    self.emit(format!("    MOVF 0x{:02X}, W", den + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", scr + 4 + i)); // den copy
+                }
+                self.emit_divmod32(num, scr);
+                if name == "__udiv_u32" {
+                    self.store_retval(num, 4);
+                } else {
+                    self.store_retval(scr, 4);
+                }
+                self.emit("    RETURN".to_string());
+            }
+            // Signed 32-bit wrappers: abs both operands in place in the
+            // param slots (unsigned abs — INT_MIN safe: |INT_MIN| wraps to
+            // itself, deterministic), run the unsigned divmod, negate the
+            // quotient if the signs differed (bit0 = num<0 XOR den<0) / the
+            // remainder if the dividend was negative (bit1).
+            "__sdiv_i32" | "__srem_i32" => {
+                let num = self.slot_addr(name, "num");
+                let den = self.slot_addr(name, "den");
+                self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 11], name);
+                let (rem, den_s, flags) = (scr, scr + 4, scr + 10);
+                let l_den = self.fresh_label();
+                let l_go = self.fresh_label();
+                let l_store = self.fresh_label();
+                self.emit(format!("    CLRF 0x{flags:02X}"));
+                self.emit(format!("    BTFSS 0x{:02X}, 7", num + 3));
+                self.emit(format!("    GOTO {l_den}"));
+                self.emit(format!("    BSF 0x{flags:02X}, 1")); // remainder sign follows dividend
+                self.emit(format!("    BSF 0x{flags:02X}, 0")); // quotient negate: num<0
+                self.neg32_in_place(num); // num = |num|
+                self.emit(format!("{l_den}:"));
+                self.emit(format!("    BTFSS 0x{:02X}, 7", den + 3));
+                self.emit(format!("    GOTO {l_go}"));
+                self.neg32_in_place(den); // den = |den|
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit(format!("    XORWF 0x{flags:02X}, F")); // bit0 ^= den<0: neg_q = num<0 XOR den<0
+                self.emit(format!("{l_go}:"));
+                for i in 0..4 {
+                    self.emit(format!("    MOVF 0x{:02X}, W", den + i));
+                    self.emit(format!("    MOVWF 0x{:02X}", den_s + i)); // |den| copy
+                }
+                self.emit_divmod32(num, scr);
+                if name == "__sdiv_i32" {
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg32_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 4);
+                } else {
+                    self.emit(format!("    BTFSS 0x{flags:02X}, 1"));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg32_in_place(rem); // -remainder
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(rem, 4);
+                }
+                self.emit("    RETURN".to_string());
+            }
             other => panic!("isel: no recipe for runtime routine @{other}"),
         }
     }
 
-    /// The recipe body for the six variable-count shift routines. The count
-    /// arrives UNMASKED (a full i8/i16 — clang emits it raw); LLVM says
-    /// counts >= width are poison, so masking to width-1 keeps the loop
-    /// bounded (<= 15 iterations) and yields the defined-range result:
-    /// deterministic, documented, never a hang. The value shifts **in
-    /// place in the `val` param slot** (the caller's copy); the masked
-    /// count runs the loop from `__scr::cnt@0` (Task-2 contract). ashr
-    /// sets C from the sign bit before each rrf so the sign fills every
-    /// vacated bit.
-    fn emit_shift_body(&mut self, is16: bool, op: BinOp, scr: u16) {
+    /// The recipe body for the nine variable-count shift routines (i8/i16/
+    /// i32). The count arrives UNMASKED (a full i8/i16/i32 — clang emits
+    /// it raw); LLVM says counts >= width are poison, so masking to
+    /// width-1 keeps the loop bounded (<= 7/15/31 iterations) and yields
+    /// the defined-range result: deterministic, documented, never a hang.
+    /// The value shifts **in place in the `val` param slot** (the caller's
+    /// copy); the masked count runs the loop from `__scr::cnt@0` (the
+    /// layout-contract offset). ashr sets C from the sign bit before each
+    /// rrf so the sign fills every vacated bit.
+    fn emit_shift_body(&mut self, bytes: u16, op: BinOp, scr: u16) {
         let name = self.cur_func;
         let val = self.slot_addr(name, "val");
         let cnt = self.slot_addr(name, "cnt");
-        let bytes: u16 = if is16 { 2 } else { 1 };
         let hi = val + bytes - 1;
         self.assert_bank0(
             &[val, hi, cnt, cnt + bytes - 1, scr, scr + 1],
             name,
         );
-        let mask: u8 = if is16 { 0x0F } else { 0x07 }; // width - 1
+        let mask: u8 = match bytes {
+            1 => 0x07,
+            2 => 0x0F,
+            4 => 0x1F,
+            _ => unreachable!("isel: shift body width"),
+        }; // width - 1
         self.emit(format!("    MOVF 0x{cnt:02X}, W"));
         self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
         self.emit(format!("    MOVWF 0x{scr:02X}")); // __scr::cnt@0 = masked count
-        if is16 {
+        if bytes == 2 {
             // __scr::cnt@1 (the high byte of the masked 2-byte cnt slot)
             // stays 0: the masked count is < 16, so the DECFSZ loop counter
             // lives entirely in the low byte. Clear it once so a stale high

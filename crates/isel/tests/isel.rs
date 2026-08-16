@@ -4676,12 +4676,170 @@ fn routine_module32(name: &str) -> (String, Vec<(String, u16)>) {
     (ir, map)
 }
 
-/// Before the recipes land, an injected i32 routine must panic loudly
-/// (never an empty label that silently falls through into the next
-/// function).
+/// Every i32 routine emits a real recipe body — the label, the recipe
+/// instructions, and a RETURN (never an empty label falling through into
+/// the next function). `pats` are the load-bearing idiom strings at the
+/// contract addresses (routine params at 0x40-0x47, `__scr` at 0x48+).
 #[test]
-#[should_panic(expected = "no recipe for runtime routine @__mul_u32")]
-fn panics_on_unimplemented_i32_routine() {
-    let (ir, map) = routine_module32("__mul_u32");
+fn i32_routines_emit_recipe_bodies() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "__mul_u32",
+            &[
+                "BTFSS 0x48, 0",  // bk_lo = __scr+0, multiplier bit test
+                "INCFSZ 0x52, W", // t3 = __scr+10: the 32-bit carry idiom
+                "ADDWF 0x4B, F",  // r0 = __scr+3
+                "RLF 0x4F, F",    // t0 = __scr+7, tmp <<= 1
+                "RRF 0x49, F",    // bk_hi = __scr+1, bk >>= 1
+                "DECFSZ 0x4A, F", // cnt = __scr+2
+            ],
+        ),
+        (
+            "__udiv_u32",
+            &[
+                "RLF 0x40, F",   // num_lo <<= 1 (dividend param = quotient accumulator)
+                "SUBWF 0x48, F", // rem_lo = __scr+0
+                "INCFSZ 0x4D, W", // den1 + borrow: the 4-byte borrow idiom
+                "SUBWF 0x4B, F", // rem_hi = __scr+3
+                "BSF 0x40, 0",   // quotient bit into num
+                "DECFSZ 0x50, F", // cnt = __scr+8, 32 iterations
+            ],
+        ),
+        (
+            "__urem_u32",
+            &[
+                "RLF 0x40, F",
+                "SUBWF 0x48, F",
+                "INCFSZ 0x4D, W",
+                "SUBWF 0x4B, F",
+                "BSF 0x40, 0", // the loop computes quotient + remainder
+                "DECFSZ 0x50, F",
+            ],
+        ),
+        (
+            "__sdiv_i32",
+            &[
+                "BTFSS 0x43, 7", // num_hi sign test
+                "COMF 0x40, F",  // |num| (32-bit) in place
+                "BSF 0x52, 1",   // flags = __scr+10, bit1: remainder negate
+                "BSF 0x52, 0",   // bit0: quotient negate
+                "XORWF 0x52, F", // bit0 ^= den<0: neg_q = num<0 XOR den<0
+                "BTFSS 0x52, 0", // tail: negate the quotient
+            ],
+        ),
+        (
+            "__srem_i32",
+            &[
+                "BTFSS 0x43, 7",
+                "COMF 0x40, F",
+                "BSF 0x52, 1",
+                "BTFSS 0x52, 1", // tail: remainder sign follows dividend
+                "COMF 0x48, F",  // rem_lo = __scr+0 negated
+            ],
+        ),
+        (
+            "__shl_u32",
+            &["ANDLW 0x1F", "RLF 0x40, F", "DECFSZ 0x48, F"],
+        ),
+        (
+            "__lshr_u32",
+            &["ANDLW 0x1F", "RRF 0x43, F", "DECFSZ 0x48, F"],
+        ),
+        (
+            "__ashr_i32",
+            &["ANDLW 0x1F", "BTFSC 0x43, 7", "RRF 0x43, F", "DECFSZ 0x48, F"],
+        ),
+    ];
+    for &(name, pats) in cases {
+        let (ir, map) = routine_module32(name);
+        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
+        assert!(
+            asm.contains(&format!("    CALL {name}")),
+            "{name} call:\n{asm}"
+        );
+        let start = asm.find(&format!("{name}:")).expect("routine label");
+        let body = &asm[start..];
+        let body = body.split("main:").next().expect("main label after routine");
+        assert!(
+            body.contains("    RETURN"),
+            "{name} body must end in RETURN, not fall through:\n{asm}"
+        );
+        for p in pats {
+            assert!(asm.contains(p), "{name} must contain `{p}`:\n{asm}");
+        }
+        assert!(
+            body.contains("INCFSZ") || body.contains("RLF") || body.contains("COMF")
+                || body.contains("ANDLW"),
+            "{name} body looks like an empty label:\n{asm}"
+        );
+    }
+}
+
+/// The load-bearing i32 routine simulations: each routine's emitted asm is
+/// assembled and run in pic14_sim with fixed inputs; the result bytes are
+/// asserted. A wrong carry/borrow idiom, a wrong sign-wrapper step, or a
+/// wrong shift mask flips a result.
+#[test]
+fn i32_routines_simulate_correctly() {
+    // (routine, x bytes lo..hi, y bytes lo..hi, expected result bytes)
+    let cases: &[(&str, &[u8], &[u8], &[u8])] = &[
+        // 0x00010001 * 0x00010001 = 0x00020001 (bits 0 and 16 of b set).
+        ("__mul_u32", &[1, 0, 1, 0], &[1, 0, 1, 0], &[1, 0, 2, 0]),
+        // 0xFFFFFFFF * 2 = 0xFFFFFFFE: the shifted-out high bits are
+        // DISCARDED (the 4-byte tmp wraps) — i32 mul wraps mod 2^32.
+        ("__mul_u32", &[0xFF, 0xFF, 0xFF, 0xFF], &[2, 0, 0, 0], &[0xFE, 0xFF, 0xFF, 0xFF]),
+        // 0x12345678 / 0x100 = 0x123456 r 0x78 (the brief's "0x12345" was an
+        // arithmetic slip: 0x12345678 = 0x123456*0x100 + 0x78).
+        ("__udiv_u32", &[0x78, 0x56, 0x34, 0x12], &[0, 1, 0, 0], &[0x56, 0x34, 0x12, 0]),
+        ("__urem_u32", &[0x78, 0x56, 0x34, 0x12], &[0, 1, 0, 0], &[0x78, 0, 0, 0]),
+        // 0x12345678 / 0x1000 = 0x12345 r 0x678 — the brief's quotient figure,
+        // with the divisor that actually produces it.
+        ("__udiv_u32", &[0x78, 0x56, 0x34, 0x12], &[0, 0x10, 0, 0], &[0x45, 0x23, 1, 0]),
+        ("__urem_u32", &[0x78, 0x56, 0x34, 0x12], &[0, 0x10, 0, 0], &[0x78, 6, 0, 0]),
+        // -19 / 3 = -6 (neg_q = num<0 XOR den<0).
+        ("__sdiv_i32", &[0xED, 0xFF, 0xFF, 0xFF], &[3, 0, 0, 0], &[0xFA, 0xFF, 0xFF, 0xFF]),
+        // 0x80000000 / -1 = 0x80000000: LLVM calls this poison, but the
+        // routine's unsigned-abs path is deterministic — |INT_MIN| wraps to
+        // itself, the abs'd den is 1, and the sign XOR cancels (num<0 and
+        // den<0 both set bit0). Documented, deterministic, never a hang.
+        ("__sdiv_i32", &[0, 0, 0, 0x80], &[0xFF, 0xFF, 0xFF, 0xFF], &[0, 0, 0, 0x80]),
+        // -19 % 3 = -1 (the remainder sign follows the dividend).
+        ("__srem_i32", &[0xED, 0xFF, 0xFF, 0xFF], &[3, 0, 0, 0], &[0xFF, 0xFF, 0xFF, 0xFF]),
+        // 1 << 31 = 0x80000000; 1 << 33 = 2 (count masked to 31); 1 << 3 = 8.
+        ("__shl_u32", &[1, 0, 0, 0], &[31, 0, 0, 0], &[0, 0, 0, 0x80]),
+        ("__shl_u32", &[1, 0, 0, 0], &[33, 0, 0, 0], &[2, 0, 0, 0]),
+        ("__shl_u32", &[1, 0, 0, 0], &[3, 0, 0, 0], &[8, 0, 0, 0]),
+        // 0x12345678 >> 17 = 0x91A (count 17 needs no mask wrap).
+        ("__lshr_u32", &[0x78, 0x56, 0x34, 0x12], &[17, 0, 0, 0], &[0x1A, 9, 0, 0]),
+        // 0x80000000 >> 4 = 0x08000000 (logical); ashr sign-fills = 0xF8000000.
+        ("__lshr_u32", &[0, 0, 0, 0x80], &[4, 0, 0, 0], &[0, 0, 0, 8]),
+        ("__ashr_i32", &[0, 0, 0, 0x80], &[4, 0, 0, 0], &[0, 0, 0, 0xF8]),
+    ];
+    for &(name, x, y, want) in cases {
+        let (ir, map) = routine_module32(name);
+        let mut seed = Vec::new();
+        for (i, b) in x.iter().enumerate() {
+            seed.push((0x20 + i as u16, *b));
+        }
+        for (i, b) in y.iter().enumerate() {
+            seed.push((0x24 + i as u16, *b));
+        }
+        let got = sim_run_bytes(&ir, &map, &seed, 0x28, want.len());
+        assert_eq!(&got[..], want, "{name}({x:?}, {y:?}) must be {want:?}");
+    }
+}
+
+/// A bank-1 i32 routine slot must fail loudly (same skip-sensitivity rule
+/// as the i8/i16 recipes).
+#[test]
+#[should_panic(expected = "bank-0")]
+fn panics_on_banked_i32_routine_slot() {
+    let (ir, mut map) = routine_module32("__mul_u32");
+    for (k, v) in map.iter_mut() {
+        if k == "__mul_u32::__scr" {
+            *v = 0xA0; // bank 1
+        }
+    }
     let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
 }
