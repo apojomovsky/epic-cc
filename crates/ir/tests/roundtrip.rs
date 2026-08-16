@@ -254,6 +254,42 @@ fn gep_base_global_roundtrips() {
 }
 
 #[test]
+fn roundtrips_isr_marker() {
+    // Milestone 13: the interrupt marker `[isr]` sits between the ret group
+    // and the params group: `fn isr(void) [isr] ()`. It must round-trip and
+    // be absent on ordinary functions.
+    let text = "fn isr(void) [isr] ()\n  block entry:\n    ret void\n";
+    let m = parse(text);
+    assert!(m.funcs[0].isr, "isr marker must parse to Func.isr == true");
+    let out = serialize(&m);
+    assert!(out.contains("fn isr(void) [isr] ()"), "isr marker header\n---\n{out}");
+    let m2 = parse(&out);
+    assert!(m2.funcs[0].isr, "isr marker must round-trip");
+    assert_eq!(serialize(&m2), out, "stable fixed point");
+    // a plain function carries no marker
+    let m3 = parse("fn main(void) ()\n  block entry:\n    ret void\n");
+    assert!(!m3.funcs[0].isr);
+    assert!(!serialize(&m3).contains("[isr]"), "no marker on a non-isr fn");
+}
+
+#[test]
+fn roundtrips_literal_ptr_load_store() {
+    // Milestone 13: inttoptr constant pointers serialize as the literal ptr
+    // form `0x<K>` (distinct from `@global` / `%reg`).
+    let text = "fn main(void) ()\n  block entry:\n    %1 = load i8 0x06\n    store i8 85 0x06\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    assert!(out.contains("%1 = load i8 0x06"), "literal ptr load\n---\n{out}");
+    assert!(out.contains("store i8 85 0x06"), "literal ptr store\n---\n{out}");
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out, "stable fixed point");
+    match &m2.funcs[0].blocks[0].insts[0] {
+        ir::Inst::Load(l) => assert_eq!(l.ptr, "0x06"),
+        other => panic!("expected Load, got {other:?}"),
+    }
+}
+
+#[test]
 fn roundtrips_i32_ops() {
     // Milestone 12: i32 type flows through every type position the serializer
     // and parser touch — binop, icmp, casts, and a sized scalar param.
