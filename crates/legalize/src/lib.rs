@@ -25,9 +25,18 @@
 //! `{func}::__scr` + offset. Only the routines actually used are injected
 //! (cleaner text artifacts).
 
+use std::collections::{HashMap, HashSet};
+
 use ir::{Alloca, BinOp, Block, Call, CallArg, Func, Inst, Module, Param, Ty, Val};
 
 pub fn legalize(m: Module) -> Module {
+    // Interrupt shared-function duplication first: the runtime routines are
+    // injected below, and isel emits a routine body only for the exact
+    // routine names (crates/isel ROUTINE_NAMES), so a duplicated routine
+    // (`__mul_u8_isr`) could not be emitted. Duplicating the user functions
+    // first keeps the injected routines shared — their frames are placed at
+    // max over their callers, which lands in the ISR's disjoint region.
+    let m = duplicate_isr_shared(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
     for f in m.funcs {
@@ -49,6 +58,136 @@ pub fn legalize(m: Module) -> Module {
     }
     for name in &used {
         funcs.push(routine_func(name));
+    }
+    Module { globals: m.globals, funcs }
+}
+
+/// Every function transitively reachable from `roots` over the caller ->
+/// callee map `adj` (the roots included). A visited set keeps a call cycle
+/// (rejected loudly later by callgraph/alloc) from looping forever.
+fn reachable(roots: &[&str], adj: &HashMap<String, Vec<String>>) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<&str> = roots.to_vec();
+    while let Some(f) = stack.pop() {
+        if !seen.insert(f.to_string()) {
+            continue;
+        }
+        if let Some(cs) = adj.get(f) {
+            for c in cs {
+                if !seen.contains(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    seen
+}
+
+/// The interrupt shared-function duplication (the M13 ruling): every function
+/// reachable from BOTH the ISR context (the ISR + its transitive callees) and
+/// the main context (main + its transitive callees) gets an `_isr` copy — a
+/// DEEP clone of the Func, renamed `{name}_isr`, with the `isr` flag cleared
+/// (the copy is an ordinary function, not a second vector entry) — and every
+/// call inside the ISR context whose target is a duplicated function is
+/// rewritten to the `_isr` name (a copy's own calls to another shared
+/// function become its `_isr` copy too; a non-shared ISR-context callee's
+/// calls are rewritten as well — the whole ISR context runs against the
+/// copies). The original shared functions stay main-context-only with their
+/// calls untouched. Gated on the ISR's existence: a module with no ISR
+/// passes through byte-identical, and so does a module whose ISR shares
+/// nothing with main.
+///
+/// The call graph is re-derived locally from the module's CALL insts rather
+/// than depending on the callgraph crate — it is a tiny, stable scan and
+/// legalize already owns the module (no new dependency).
+fn duplicate_isr_shared(m: Module) -> Module {
+    let isr_names: HashSet<&str> = m.funcs.iter().filter(|f| f.isr).map(|f| f.name.as_str()).collect();
+    if isr_names.is_empty() {
+        return m;
+    }
+
+    // Caller -> callee edges from the CALL insts.
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &m.funcs {
+        adj.entry(f.name.clone()).or_default();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Call(c) = inst {
+                    adj.entry(f.name.clone()).or_default().push(c.func.clone());
+                }
+            }
+        }
+    }
+
+    // The ISR context = the ISR + its transitive callees; the main context =
+    // main + its transitive callees. Every function in BOTH (never the ISR
+    // itself, never main) is duplicated.
+    let isr_ctx = isr_names.iter().flat_map(|r| reachable(&[r], &adj)).collect::<HashSet<String>>();
+    let main_ctx = reachable(&["main"], &adj);
+    let shared: Vec<String> = m
+        .funcs
+        .iter()
+        .filter(|f| !f.isr && f.name != "main")
+        .filter(|f| isr_ctx.contains(&f.name) && main_ctx.contains(&f.name))
+        .map(|f| f.name.clone())
+        .collect();
+    if shared.is_empty() {
+        return m;
+    }
+
+    // Deep-clone each shared func as `{name}_isr` (renamed, isr flag
+    // cleared). A name collision with an existing function panics loudly.
+    let mut funcs = m.funcs;
+    let mut copies: Vec<Func> = Vec::with_capacity(shared.len());
+    for name in &shared {
+        let copy_name = format!("{name}_isr");
+        assert!(
+            !funcs.iter().any(|f| f.name == copy_name),
+            "legalize: duplicate-interrupt name collision: {copy_name} already exists"
+        );
+        let f = funcs
+            .iter()
+            .find(|f| &f.name == name)
+            .expect("legalize: shared function vanished");
+        let mut c = f.clone();
+        c.name = copy_name;
+        c.isr = false;
+        copies.push(c);
+    }
+
+    // Rewrite every call inside the ISR context whose target is a duplicated
+    // function to the `_isr` copy. The rewrite set is the ISR context minus
+    // the original shared functions (now main-context-only — their calls stay
+    // on the originals) plus the copies (their internal calls become the
+    // `_isr` names transitively). The ISR root itself and non-shared ISR
+    // callees are in the set, so the whole ISR context runs against copies.
+    let shared_set: HashSet<&str> = shared.iter().map(String::as_str).collect();
+    let mut rewrite_set: HashSet<String> = isr_ctx
+        .iter()
+        .filter(|n| n.as_str() != "main" && !shared_set.contains(n.as_str()))
+        .cloned()
+        .collect();
+    for c in &copies {
+        rewrite_set.insert(c.name.clone());
+    }
+    // The copies go into the module before the rewrite so their internal
+    // calls are rewritten too (a copy's call to another shared function ->
+    // its `_isr` copy, transitively).
+    funcs.extend(copies);
+    for f in &mut funcs {
+        if !rewrite_set.contains(&f.name) {
+            continue;
+        }
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::Call(c) = inst {
+                    let target = c.func.clone();
+                    if shared_set.contains(target.as_str()) {
+                        c.func = format!("{target}_isr");
+                    }
+                }
+            }
+        }
     }
     Module { globals: m.globals, funcs }
 }
