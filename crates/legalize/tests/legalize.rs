@@ -112,6 +112,14 @@ fn pins_all_runtime_routine_mappings() {
         ("lshr", "i16", Ty::I16, "__lshr_u16", &["val", "cnt"], 4),
         ("ashr", "i8",  Ty::I8,  "__ashr_i8",  &["val", "cnt"], 3),
         ("ashr", "i16", Ty::I16, "__ashr_i16", &["val", "cnt"], 4),
+        ("mul",  "i32", Ty::I32, "__mul_u32",  &["a", "b"], 11),
+        ("udiv", "i32", Ty::I32, "__udiv_u32", &["num", "den"], 10),
+        ("urem", "i32", Ty::I32, "__urem_u32", &["num", "den"], 10),
+        ("sdiv", "i32", Ty::I32, "__sdiv_i32", &["num", "den"], 12),
+        ("srem", "i32", Ty::I32, "__srem_i32", &["num", "den"], 12),
+        ("shl",  "i32", Ty::I32, "__shl_u32",  &["val", "cnt"], 2),
+        ("lshr", "i32", Ty::I32, "__lshr_u32", &["val", "cnt"], 2),
+        ("ashr", "i32", Ty::I32, "__ashr_i32", &["val", "cnt"], 2),
     ];
     for (op, ty, ty_enum, routine, params, size) in cases {
         let src = format!(
