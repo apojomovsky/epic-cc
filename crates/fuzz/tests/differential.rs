@@ -221,7 +221,7 @@ fn generate_is_deterministic_and_disciplined() {
     let b = generate(42);
     assert_eq!(a.c_source, b.c_source, "same seed must give the same source");
     assert!(a.c_source.contains("volatile u8 in0;"), "volatile u8 input decl");
-    assert!(a.c_source.contains("checksum = (u8)((u16)checksum * 7u + "), "the checksum fold");
+    assert!(a.c_source.contains("checksum = (u8)(checksum ^ "), "the checksum fold");
     assert!(a.c_source.ends_with("}\n"), "the generated main ends the file");
     assert_eq!(a.checksum_name, "checksum");
     assert!(!a.inputs.is_empty());

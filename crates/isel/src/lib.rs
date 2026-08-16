@@ -215,8 +215,10 @@ impl<'m> Gen<'m> {
                 .get(g)
                 .unwrap_or_else(|| panic!("isel: no address for @{g}")),
             Val::Const(k) => {
-                assert!(*k >= 0 && *k <= 255, "isel: const {k} out of byte range");
-                *k as u16
+                // Mask to the byte: clang prints i8 constants >= 128 as
+                // negative i8 (found by the fuzz corpus); the value is the
+                // same mod 256.
+                (*k & 0xFF) as u16
             }
         }
     }
@@ -1103,8 +1105,10 @@ impl<'m> Gen<'m> {
         let aa = self.val_addr(a);
         match b {
             Val::Const(k) => {
-                assert!(*k >= 0 && *k <= 255, "isel: const {k} out of byte range");
-                self.emit(format!("    MOVLW 0x{:02X}", *k as u8));
+                // Mask the byte: clang prints an i8 constant >= 128 as a
+                // negative i8 (e.g. `sub i8 %a, -42` for `a - 214u`), which
+                // is the same value mod 256 (found by the fuzz corpus).
+                self.emit(format!("    MOVLW 0x{:02X}", (*k & 0xFF) as u8));
                 self.emit(format!("    SUBWF 0x{aa:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
             }
@@ -1115,6 +1119,25 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
             }
             Val::Global(_) => panic!("isel: sub8 with a global operand"),
+        }
+    }
+
+    /// `d = k - a` (const LHS) for `bytes`-wide values: SUBLW k computes
+    /// W = k - W per byte. Byte 0 leaves C = 1 iff no borrow; each higher
+    /// byte bumps the subtrahend byte by the borrow (BTFSS C / ADDLW 1,
+    /// mirroring the reg-const `a - k` chain) before its SUBLW.
+    fn emit_sub_const_lhs(&mut self, k: &i64, a: &Val, dst: u16, bytes: u8) {
+        let aa = self.val_addr(a);
+        self.emit(format!("    MOVF 0x{aa:02X}, W"));
+        self.emit(format!("    SUBLW 0x{:02X}", (k & 0xFF) as u8));
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
+        for i in 1..bytes {
+            let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+            self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
+            self.emit("    BTFSS STATUS, 0 ; C".to_string());
+            self.emit("    ADDLW 0x01".to_string());
+            self.emit(format!("    SUBLW 0x{kb:02X}"));
+            self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
         }
     }
 
@@ -1457,13 +1480,12 @@ impl<'m> Gen<'m> {
                         };
                         match b_op {
                             Val::Const(k) => {
-                                assert!(
-                                    *k >= 0 && *k <= 255,
-                                    "isel: const {k} out of byte range"
-                                );
+                                // Mask to the byte (negative i8 constants,
+                                // found by the fuzz corpus).
+                                let kb = (*k & 0xFF) as u8;
                                 let aa = self.val_addr(a);
                                 self.emit(format!("    MOVF 0x{aa:02X}, W"));
-                                self.emit(format!("    ADDLW 0x{:02X}", *k as u8));
+                                self.emit(format!("    ADDLW 0x{kb:02X}"));
                                 self.emit(format!("    MOVWF 0x{da:02X}"));
                             }
                             _ => {
@@ -1487,28 +1509,30 @@ impl<'m> Gen<'m> {
                     (BinOp::Xor, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
                     (BinOp::Xor, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
                     // sub is NOT commutative: a const LHS (d = k - a) cannot
-                    // reuse the reg-const lowering (which computes a - k), so
-                    // it must fail loudly rather than silently miscompile.
+                    // reuse the reg-const lowering (which computes a - k) —
+                    // SUBLW k computes k - W, so the const-LHS path mirrors
+                    // the reg-const borrow chain with the roles swapped
+                    // (found by the fuzz corpus; a generated `k - a` shape).
                     (BinOp::Sub, Ty::I8) => {
-                        assert!(
-                            !matches!(&b.a, Val::Const(_)),
-                            "isel: sub with const LHS not supported (not commutative)"
-                        );
-                        self.emit_sub8(&b.a, &b.b, da);
+                        if let Val::Const(k) = &b.a {
+                            self.emit_sub_const_lhs(k, &b.b, da, 1);
+                        } else {
+                            self.emit_sub8(&b.a, &b.b, da);
+                        }
                     }
                     (BinOp::Sub, Ty::I16) => {
-                        assert!(
-                            !matches!(&b.a, Val::Const(_)),
-                            "isel: sub with const LHS not supported (not commutative)"
-                        );
-                        self.emit_sub16(&b.a, &b.b, da);
+                        if let Val::Const(k) = &b.a {
+                            self.emit_sub_const_lhs(k, &b.b, da, 2);
+                        } else {
+                            self.emit_sub16(&b.a, &b.b, da);
+                        }
                     }
                     (BinOp::Sub, Ty::I32) => {
-                        assert!(
-                            !matches!(&b.a, Val::Const(_)),
-                            "isel: sub with const LHS not supported (not commutative)"
-                        );
-                        self.emit_sub32(&b.a, &b.b, da);
+                        if let Val::Const(k) = &b.a {
+                            self.emit_sub_const_lhs(k, &b.b, da, 4);
+                        } else {
+                            self.emit_sub32(&b.a, &b.b, da);
+                        }
                     }
                     // Milestone-8 binops: legalize rewrites every mul/div/rem
                     // into a runtime routine call, so these ops reach isel only
@@ -1592,9 +1616,14 @@ impl<'m> Gen<'m> {
                 self.emit_move_val_to_slot(&f.val, f.ty, da);
             }
             Inst::Zext(z) => {
+                // `zext i1 to i8` is legal and common (`u8 b = (a < b);`):
+                // i1 and i8 are both 1 byte in the byte model, and an icmp
+                // result is materialized as a byte holding exactly 0/1, so
+                // a 1-byte copy IS the zext. Equal-width iN -> iN is zext
+                // identity; only narrowing (i16/i32 -> i8) is a real error.
                 assert!(
-                    z.from.bytes() < z.to.bytes(),
-                    "isel: zext must widen"
+                    z.from.bytes() <= z.to.bytes(),
+                    "isel: zext must not narrow"
                 );
                 let da = self.slot_addr(self.cur_func, &z.dst);
                 for i in 0..z.from.bytes() {

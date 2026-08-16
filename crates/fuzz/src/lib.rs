@@ -130,49 +130,831 @@ pub struct Program {
 }
 
 // ---------------------------------------------------------------------------
-// Generator (Task 1: a few scalar expression shapes)
+// Generator (Task 2: the full surface + the fixed corpus)
 // ---------------------------------------------------------------------------
+
+/// A scalar binary op the generator can emit, with its width guard.
+#[derive(Clone, Copy)]
+enum BinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+}
+
+/// A generated noinline helper's signature.
+struct Helper {
+    name: String,
+    params: Vec<u8>, // param widths, 0..=3 entries (8 | 16 | 32)
+}
+
+/// The in-progress generation state (deterministic: every random choice
+/// comes from `rng`, in a fixed order, so `generate(seed)` reproduces).
+struct Gen {
+    rng: SplitMix64,
+    /// `(name, width)` of every scalar local emitted so far (t0, t1, …).
+    /// Statements reference only the most recent live ones, keeping main's
+    /// live set — and therefore its frame, which the runtime routines'
+    /// bank-0 slots must fit under — small (the long_e2e budget: ≤ 9 i32
+    /// locals).
+    locals: Vec<(String, u8)>,
+    /// `(start, end)` index ranges of locals that died with their C block
+    /// (if/else arms, loop bodies) — out of scope for later statements.
+    dead: Vec<(usize, usize)>,
+    /// The generated `main` body statements, one per line where possible
+    /// (a flat, structurally-known shape for the Task-3 reducer).
+    body: Vec<String>,
+    /// The noinline fold helpers (`fold16`/`fold32`) the body needs.
+    helpers_src: String,
+    used_fold16: bool,
+    used_fold32: bool,
+    /// Whether the array/struct globals are actually used (declared only
+    /// then — every unused global byte costs main's frame budget).
+    used_array: bool,
+    used_struct: bool,
+    /// Estimated main-frame bytes emitted so far (see `frame_budget`).
+    frame_est: u32,
+    /// The biggest runtime-routine frame (bytes) the program needs so far.
+    worst_routine: u32,
+}
+
+impl Gen {
+    fn new(seed: u64) -> Self {
+        Gen {
+            rng: SplitMix64::new(seed),
+            locals: Vec::new(),
+            dead: Vec::new(),
+            body: Vec::new(),
+            helpers_src: String::new(),
+            used_fold16: false,
+            used_fold32: false,
+            used_array: false,
+            used_struct: false,
+            frame_est: 0,
+            worst_routine: 0,
+        }
+    }
+
+    fn below(&mut self, n: u32) -> u32 {
+        self.rng.below(n)
+    }
+
+    fn pick_width(&mut self) -> u8 {
+        [8u8, 16, 32][self.below(3) as usize]
+    }
+
+    fn new_local(&mut self, w: u8) -> String {
+        let name = format!("t{}", self.locals.len());
+        self.locals.push((name.clone(), w));
+        name
+    }
+
+    /// A `(width)`-cast operand: an input, a recent local, or a constant
+    /// (always inside `width`'s range — constants never truncate).
+    fn operand(&mut self, w: u8) -> String {
+        let ct = ctype(w);
+        let roll = self.below(10);
+        if roll < 4 {
+            let i = self.below(3);
+            return format!("({ct}){INPUT_PREFIX}{i}");
+        }
+        if roll < 7 {
+            if let Some(o) = self.recent_local(ct) {
+                return o;
+            }
+        }
+        let v = match w {
+            8 => self.rng.next_u64() as u8 as u32,
+            16 => self.rng.next_u64() as u16 as u32,
+            _ => self.rng.next_u64() as u32,
+        };
+        format!("{v}u")
+    }
+
+    /// An operand that is NEVER a constant (inputs/locals only). Used for
+    /// i8/i16 division/modulo divisors: clang strength-reduces a CONSTANT
+    /// divisor into a magic-number multiply in i9/i17 arithmetic, which the
+    /// IR pipeline cannot parse (found by the corpus at seed 2). u32
+    /// constant divisors stay legal (clang emits a plain `udiv i32`).
+    fn operand_reg(&mut self, w: u8) -> String {
+        let ct = ctype(w);
+        if self.below(2) == 0 {
+            let i = self.below(3);
+            format!("({ct}){INPUT_PREFIX}{i}")
+        } else if let Some(o) = self.recent_local(ct) {
+            o
+        } else {
+            let i = self.below(3);
+            format!("({ct}){INPUT_PREFIX}{i}")
+        }
+    }
+
+    /// The 1st/2nd live local back (skipping block-dead ones), if any.
+    fn recent_local(&mut self, ct: &str) -> Option<String> {
+        if self.locals.is_empty() {
+            return None;
+        }
+        let want = 1 + self.below(2) as usize;
+        let mut seen = 0usize;
+        for k in 1..=self.locals.len() {
+            let idx = self.locals.len() - k;
+            if self.dead.iter().any(|&(s, e)| idx >= s && idx < e) {
+                continue;
+            }
+            seen += 1;
+            if seen == want {
+                let (name, _) = &self.locals[idx];
+                return Some(format!("({ct}){name}"));
+            }
+        }
+        None
+    }
+
+    /// A comparison condition for `if` (width-explicit, unsigned).
+    fn condition(&mut self) -> String {
+        let w = self.pick_width();
+        let ct = ctype(w);
+        let rel = ["<", "<=", ">", ">=", "==", "!="][self.below(6) as usize];
+        let a = self.operand(w);
+        let b = self.operand(w);
+        format!("(({ct}){a} {rel} ({ct}){b})")
+    }
+
+    /// The checksum fold expression for a `width`-bit value: every byte of
+    /// the value mixes in (via explicit casts), so a miscompile in ANY byte
+    /// of a u16/u32 value changes the checksum. This is the BODY of the
+    /// noinline `fold16`/`fold32` helpers — its shift/xor defs live in the
+    /// helpers' frames (which have no bank constraint), NOT in main's
+    /// (whose frame the runtime routines' bank-0 slots must fit under; the
+    /// whole-program backend gives every SSA def its own RAM slot, so the
+    /// byte-mix of a u32 would otherwise cost ~27 bytes of main frame).
+    fn fold_expr(w: u8, v: &str) -> String {
+        match w {
+            8 => format!("(u8){v}"),
+            16 => format!("(u8)((u8){v} ^ (u8)(((u16){v}) >> 8u))"),
+            _ => format!(
+                "(u8)((u8){v} ^ (u8)(((u32){v}) >> 8u) ^ (u8)(((u32){v}) >> 16u) ^ (u8)(((u32){v}) >> 24u))"
+            ),
+        }
+    }
+
+    /// The volatile fold store after every statement pins the statement's
+    /// ops in the IR on both sides and keeps live values to the
+    /// just-computed one. u8 folds inline (1 xor); u16/u32 fold through the
+    /// noinline `fold16`/`fold32` helpers so the byte-mix defs stay out of
+    /// main's frame (the call itself also exercises the call/ret surface).
+    fn push_fold(&mut self, w: u8, v: &str) {
+        let line = self.fold_line(w, v);
+        self.body.push(line);
+    }
+
+    /// The fold statement line for a value, marking the fold helpers used.
+    fn fold_line(&mut self, w: u8, v: &str) -> String {
+        match w {
+            8 => format!("  checksum = (u8)(checksum ^ (u8){v});"),
+            16 => {
+                self.used_fold16 = true;
+                format!("  checksum = (u8)(checksum ^ fold16({v}));")
+            }
+            _ => {
+                self.used_fold32 = true;
+                format!("  checksum = (u8)(checksum ^ fold32({v}));")
+            }
+        }
+    }
+
+    /// The backend gives every SSA def (volatile loads included) its own
+    /// RAM slot, so main's frame size = the sum of its defs' widths. The
+    /// runtime routines are main's callees: their frames start at main's
+    /// frame end and their LAST slot must stay before the common-RAM jump
+    /// at 0x70 (the loud isel bank-0 assert; 0x70-0x7F is never used by
+    /// locals), so main's frame is capped by the biggest routine the
+    /// program uses. Measured routine frames (params + scratch):
+    ///   u8 mul/div/rem/shift: 3, u16 shift: 6, u16 div/rem: 8,
+    ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 18 (14-byte scratch),
+    ///   u32 mul: 22.
+    fn frame_budget(&self) -> u32 {
+        let globals = 0x28
+            + if self.used_array { 8 } else { 0 }
+            + if self.used_struct { 6 } else { 0 };
+        0x70 - self.worst_routine - globals
+    }
+
+    /// Does a statement costing `frame` main bytes and requiring a
+    /// `routine`-byte runtime frame still fit? (`uses_array`/`uses_struct`
+    /// are the post-statement globals.)
+    fn fit(&self, frame: u32, routine: u32, uses_array: bool, uses_struct: bool) -> bool {
+        let globals = 0x28
+            + if self.used_array || uses_array { 8 } else { 0 }
+            + if self.used_struct || uses_struct { 6 } else { 0 };
+        let routine = self.worst_routine.max(routine);
+        self.frame_est + frame <= 0x70 - routine - globals
+    }
+
+    /// The noinline byte-mix fold helpers (emitted only when used).
+    fn fold_helpers_src(used16: bool, used32: bool) -> String {
+        let mut s = String::new();
+        // The trailing `+ (u8)in0` is a volatile read: without it the body
+        // is pure arithmetic on the arg, so a constant-foldable arg makes
+        // clang specialize the helper and dead-arg the original call into
+        // `poison` (seed 2 — the IR pipeline cannot parse poison). in0 is
+        // seeded identically on both sides, so the fold stays deterministic.
+        if used16 {
+            s.push_str(
+                "__attribute__((noinline)) u8 fold16(u16 v) {\n    return (u8)((u8)v ^ (u8)(v >> 8u) + (u8)in0);\n}\n",
+            );
+        }
+        if used32 {
+            s.push_str(
+                "__attribute__((noinline)) u8 fold32(u32 v) {\n    return (u8)((u8)v ^ (u8)(v >> 8u) ^ (u8)(v >> 16u) ^ (u8)(v >> 24u) + (u8)in0);\n}\n",
+            );
+        }
+        s
+    }
+
+    /// Emit `{ct} tK = expr;` (declare-and-initialize — every generated
+    /// local is single-assignment) + the fold, and return the local name.
+    fn push_compute(&mut self, w: u8, expr: String) -> String {
+        let t = self.new_local(w);
+        self.body.push(format!("  {ct} {t} = {expr};", ct = ctype(w)));
+        self.push_fold(w, &t);
+        t
+    }
+
+    /// A scalar arithmetic statement at a random width and op, with the
+    /// discipline's guards: shifts by a const < width (or a masked count),
+    /// divisors forced nonzero (`| 1u`), mul computed in the next wider
+    /// space so the host's promotion to `int` cannot overflow (u8/u16
+    /// values truncate back identically on both sides).
+    ///
+    /// Width/op budget: the whole-program backend gives every SSA def its
+    /// own RAM slot, so main's frame (and the runtime routines' bank-0
+    /// slots derived from it) caps how many expensive defs a program may
+    /// hold. u8 ops are cheapest; u16/u32 byte-mix folds go through the
+    /// fold helpers; u32 mul/div/rem (the big runtime routines) are a
+    /// deliberate minority.
+    fn emit_arith(&mut self) -> bool {
+        self.emit_arith_inner(None)
+    }
+
+    /// Emit a specific op (the feature-flag guarantees); `None` picks by
+    /// the weighted mix.
+    fn emit_forced_arith(&mut self, op: BinOp) -> bool {
+        self.emit_arith_inner(Some(op))
+    }
+
+    fn emit_arith_inner(&mut self, forced: Option<BinOp>) -> bool {
+        let r = self.below(100);
+        let w = if r < 50 { 8 } else if r < 80 { 16 } else { 32 };
+        let op = match forced {
+            Some(op) => op,
+            None if w == 32 => match self.below(10) {
+                0..=1 => BinOp::Mul,
+                2 => BinOp::Div,
+                3 => BinOp::Rem,
+                4 => BinOp::Shl,
+                5 => BinOp::Shr,
+                _ => [BinOp::Add, BinOp::Sub, BinOp::And, BinOp::Or, BinOp::Xor]
+                    [self.below(5) as usize],
+            },
+            None => {
+                // Div/Rem/Sub/Mul/Shl/Shr weighted up so the corpus
+                // reliably exercises the whole op surface (the frame budget
+                // rejects the expensive ones often enough on its own).
+                match self.below(10) {
+                    0..=1 => BinOp::Div,
+                    2..=3 => BinOp::Rem,
+                    4..=5 => BinOp::Mul,
+                    6 => BinOp::Shl,
+                    7 => BinOp::Shr,
+                    8 => BinOp::Add,
+                    9 => BinOp::Sub,
+                    _ => unreachable!(),
+                }
+            }
+        };
+        // (main-frame cost, runtime-routine frame the statement needs).
+        // Note w=8 mul lowers as mul i16 (__mul_u16, 18 bytes) and w=16 mul
+        // as mul i32 (__mul_u32, 22 bytes): the width-space widening for
+        // host-overflow safety pulls in the big routines.
+        let (cost, routine) = match (w, op) {
+            (8, BinOp::Mul) => (8, 18),
+            (8, BinOp::Div | BinOp::Rem) => (10, 14),
+            (8, BinOp::Shl | BinOp::Shr) => (8, 3), // variable count maybe
+            (8, _) => (7, 0),
+            (16, BinOp::Mul) => (14, 22),
+            (16, BinOp::Div | BinOp::Rem) => (12, 14),
+            (16, BinOp::Shl | BinOp::Shr) => (10, 6),
+            (16, _) => (10, 0),
+            (32, BinOp::Mul) => (16, 22),
+            (32, BinOp::Div | BinOp::Rem) => (14, 12),
+            (32, BinOp::Shl | BinOp::Shr) => (13, 12),
+            (32, _) => (12, 0),
+            _ => unreachable!(),
+        };
+        if !self.fit(cost, routine, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        self.worst_routine = self.worst_routine.max(routine);
+        let a = self.operand(w);
+        // i8/i16 div/rem need a RUNTIME divisor (a constant divisor makes
+        // clang strength-reduce into magic-number i9/i17 multiplies the IR
+        // pipeline cannot parse; u32 keeps `udiv i32` — see `operand_reg`).
+        let b = if w < 32 && matches!(op, BinOp::Div | BinOp::Rem) {
+            self.operand_reg(w)
+        } else {
+            self.operand(w)
+        };
+        let expr = match op {
+            BinOp::Shl | BinOp::Shr => {
+                // Shift count: const < width, or a masked runtime count.
+                let r = self.below(3);
+                let (l, r_op) = (format!("({}){a}", ctype(w)), format!("({}){b}", ctype(w)));
+                if r < 2 {
+                    let c = self.below(u32::from(w));
+                    format!("({ct})({l} {s} {c}u)", ct = ctype(w), s = if matches!(op, BinOp::Shl) { "<<" } else { ">>" })
+                } else {
+                    let m = w - 1;
+                    format!(
+                        "({ct})({l} {s} ({ct})(({ct}){r_op} & {m}u))",
+                        ct = ctype(w),
+                        s = if matches!(op, BinOp::Shl) { "<<" } else { ">>" }
+                    )
+                }
+            }
+            _ => {
+                let s = match op {
+                    BinOp::Add => "+",
+                    BinOp::Sub => "-",
+                    BinOp::Mul => "*",
+                    BinOp::Div => "/",
+                    BinOp::Rem => "%",
+                    BinOp::And => "&",
+                    BinOp::Or => "|",
+                    BinOp::Xor => "^",
+                    _ => unreachable!(),
+                };
+                // The width-space choice: + - & | ^ at w (promotion is
+                // value-safe); * and / % widen so the host's int promotion
+                // cannot overflow and divisors stay nonzero.
+                let (wa, wb, guard) = match (op, w) {
+                    (BinOp::Mul, 8) => (16u8, 16u8, ""),
+                    (BinOp::Mul, 16) => (32, 32, ""),
+                    (BinOp::Mul, _) => (32, 32, ""),
+                    (BinOp::Div | BinOp::Rem, 8) => (16, 16, "| 1u"),
+                    (BinOp::Div | BinOp::Rem, 16) => (16, 16, "| 1u"),
+                    (BinOp::Div | BinOp::Rem, _) => (32, 32, "| 1u"),
+                    _ => (w, w, ""),
+                };
+                format!(
+                    "({ct})(({twa}){a} {s} (({twb}){b}{guard}))",
+                    ct = ctype(w),
+                    twa = ctype(wa),
+                    twb = ctype(wb)
+                )
+            }
+        };
+        self.push_compute(w, expr);
+        true
+    }
+
+    /// A comparison statement: the i1 result stored as u8 and folded.
+    fn emit_cmp(&mut self) -> bool {
+        if !self.fit(7, 0, false, false) {
+            return false;
+        }
+        self.frame_est += 7;
+        let w = self.pick_width();
+        let ct = ctype(w);
+        let rel = ["<", "<=", ">", ">=", "==", "!="][self.below(6) as usize];
+        let a = self.operand(w);
+        let b = self.operand(w);
+        self.push_compute(8, format!("(u8)(({ct}){a} {rel} ({ct}){b})"));
+        true
+    }
+
+    /// An if/else: both branches compute a width-w value and fold it into
+    /// the checksum (branch-conditional folding; the same seeded inputs run
+    /// the same branch on both sides, and both arms' code survives).
+    fn emit_ifelse(&mut self) -> bool {
+        let w = self.pick_width();
+        let ct = ctype(w);
+        let cost = match w {
+            8 => 13,
+            16 => 16,
+            _ => 20,
+        };
+        if !self.fit(cost, 0, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        let cond = self.condition();
+        let mut arm = |g: &mut Self| -> String {
+            let op = ["+", "-", "^", "|", "&"][g.below(5) as usize];
+            let a = g.operand(w);
+            let b = g.operand(w);
+            let v = match op {
+                "-" => format!("({ct})(({ct}){a} - ({ct}){b})"),
+                _ => format!("({ct})(({ct}){a} {op} ({ct}){b})"),
+            };
+            let t = g.new_local(w);
+            let line = format!("    {ct} {t} = {v};");
+            let fold = g.fold_line(w, &t).replace("  ", "    ");
+            format!("{line}\n{fold}")
+        };
+        // The then-arm's locals die at the end of their block — mark them
+        // dead BEFORE generating the else arm, so the else arm (and later
+        // statements) can never reference them.
+        let then = arm(self);
+        self.dead.push((self.locals.len() - 1, self.locals.len()));
+        let els = arm(self);
+        self.body.push(format!("  if ({cond}) {{\n{then}\n  }} else {{\n{els}\n  }}"));
+        self.dead.push((self.locals.len() - 1, self.locals.len()));
+        true
+    }
+
+    /// A bounded loop: `for (i = 0; i < n; i++)` with n <= 8 (a masked
+    /// input), body = 1–2 cheap inline ops on the accumulator (no runtime
+    /// routines inside the trip loop), then fold the accumulator.
+    fn emit_loop(&mut self) -> bool {
+        // Bias the accumulator to u8 (a u32 loop's phi web costs ~4x a u8
+        // one in main's frame and starves the mul/div statements of budget
+        // — u32 math is covered by arith/struct/cmp instead).
+        let w = [8u8, 8, 8, 16][self.below(4) as usize];
+        let ct = ctype(w);
+        let cost = match w {
+            8 => 15,
+            _ => 20,
+        };
+        // The `in0 % 5u` bound calls __urem_u8 (3 bytes); a variable-shift
+        // body op calls __shl/__lshr at the accumulator width.
+        let routine = [3u32, 6][match w {
+            8 => 0,
+            _ => 1,
+        }]
+        .max(3);
+        if !self.fit(cost, routine, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        self.worst_routine = self.worst_routine.max(routine);
+        // Bounds: a mask or a constant (a const `%` on i8/i16 becomes a
+        // magic-number i9/i17 multiply the IR pipeline cannot parse).
+        let n_expr = match self.below(3) {
+            0 => "(u8)(in0 & 7u)".to_string(),
+            1 => format!("{}u", 2 + self.below(4)),
+            _ => format!("{}u", 2 + self.below(4)),
+        };
+        let mut body = String::new();
+        // 1-2 body ops (each is a def in the phi web — keep the loop cheap).
+        let nops = 1 + self.below(2);
+        for _ in 0..nops {
+            let op = ["+", "^", "-", "&", "|"][self.below(5) as usize];
+            body.push_str(&format!(
+                "    acc = ({ct})(({ct})acc {op} ({ct})i);\n"
+            ));
+        }
+        if self.below(2) == 0 {
+            // A masked variable shift (count < width) inside the loop.
+            let m = w - 1;
+            let s = if self.below(2) == 0 { "<<" } else { ">>" };
+            body.push_str(&format!(
+                "    acc = ({ct})(({ct})acc {s} ({ct})(({ct})i & {m}u));\n"
+            ));
+        }
+        let m = self.locals.len();
+        let t = self.new_local(w);
+        let fold = self.fold_line(w, &t).replace("  ", "    ");
+        let block = format!(
+            "  {{\n    u8 i;\n    u8 n = {n_expr};\n    {ct} acc = 0u;\n    for (i = 0u; i < n; i++) {{\n{body}    }}\n    {ct} {t} = acc;\n{fold}\n  }}"
+        );
+        self.body.push(block);
+        self.dead.push((m, self.locals.len()));
+        true
+    }
+
+    /// A noinline call: `t = helper(args);` (0–3 unsigned params), folded.
+    fn emit_call(&mut self, helpers: &[Helper]) -> bool {
+        if !self.fit(8, 0, false, false) {
+            return false;
+        }
+        self.frame_est += 8;
+        let h = &helpers[self.below(helpers.len() as u32) as usize];
+        // Constant args only: clang -O1 was observed replacing a
+        // volatile-derived call arg (a zext of a loaded value, local or
+        // input) with `poison` (seed 2 of the corpus), which the IR
+        // pipeline cannot parse. Constant args are always clean and still
+        // exercise the full call/param/return machinery.
+        let args: Vec<String> = h
+            .params
+            .iter()
+            .map(|&pw| {
+                let v = match pw {
+                    8 => self.rng.next_u64() as u8 as u32,
+                    16 => self.rng.next_u64() as u16 as u32,
+                    _ => self.rng.next_u64() as u32,
+                };
+                format!("{v}u")
+            })
+            .collect();
+        let t = self.new_local(8);
+        self.body
+            .push(format!("  u8 {t} = {}({});", h.name, args.join(", ")));
+        self.push_fold(8, &t);
+        true
+    }
+
+    /// An array statement: a dynamic in-bounds index `i % N` (N small;
+    /// power-of-two N lowers to a mask, 3/5 to a real urem), a write, a
+    /// read-back folded into the checksum.
+    fn emit_array(&mut self) -> bool {
+        // `i % 3`/`i % 5` lower to a real __urem_u16 call (8-byte frame);
+        // pow2 N lowers to an `and`.
+        if !self.fit(11, 14, true, false) {
+            return false;
+        }
+        self.frame_est += 11;
+        self.worst_routine = self.worst_routine.max(14);
+        self.used_array = true;
+        // Power-of-two sizes only: `i % 8u`/`i % 4u` lower to an `and`;
+        // a non-pow2 const modulus would strength-reduce into an i17
+        // magic multiply (see `operand_reg`). The real urem surface is
+        // covered by the runtime-divisor arith statements.
+        let n = [8u32, 4, 8, 4][self.below(4) as usize];
+        // Operands FIRST — a local created before them would self-reference.
+        let x = self.operand(16);
+        let y = self.operand(8);
+        let ix = self.new_local(8);
+        self.body.push(format!("  u8 {ix} = (u8)((u16){x} % {n}u);"));
+        self.body.push(format!("  arr[{ix}] = (u8){y};"));
+        self.body.push(format!("  checksum = (u8)(checksum ^ (u8)arr[{ix}]);"));
+        true
+    }
+
+    /// A struct statement: field-wise stores into the volatile global
+    /// struct `s` (u8/u16/u32 fields), then a width-mixing fold over the
+    /// fields (explicit casts; no layout dependence — names only).
+    fn emit_struct(&mut self) -> bool {
+        if !self.fit(13, 0, false, true) {
+            return false;
+        }
+        self.frame_est += 13;
+        self.used_struct = true;
+        let a = self.operand(8);
+        let b = self.operand(16);
+        let c = self.operand(32);
+        self.body.push(format!("  s.a = (u8){a};"));
+        self.body.push(format!("  s.b = (u16){b};"));
+        self.body.push(format!("  s.c = (u32){c};"));
+        // Field-wise reads folded back with explicit width-mixing casts (the
+        // fold "can mix widths": each field folds through its own width).
+        let mode = self.below(2);
+        let line = if mode == 0 {
+            self.used_fold16 = true;
+            self.used_fold32 = true;
+            "  checksum = (u8)(checksum ^ (u8)s.a ^ fold16((u16)s.b) ^ fold32((u32)s.c));".to_string()
+        } else {
+            self.used_fold16 = true;
+            "  checksum = (u8)(checksum ^ (u8)s.a ^ fold16((u16)s.b) ^ (u8)((u32)s.c >> 24u));"
+                .to_string()
+        };
+        self.body.push(line);
+        true
+    }
+
+    /// Emit the helper functions (1–3): noinline, 0–3 unsigned params,
+    /// u8 return. Bodies use only INLINE ops (add/sub/and/or/xor/const
+    /// shifts/icmps — no mul/div/rem, whose runtime-routine frames would
+    /// stack on main's frame) so helper frames never hit the bank-0 limit.
+    fn emit_helpers(&mut self) -> (Vec<Helper>, String) {
+        let n = 1 + self.below(3) as usize; // 1..=3
+        let mut helpers = Vec::with_capacity(n);
+        let mut src = String::new();
+        for k in 0..n {
+            let np = self.below(4) as usize; // 0..=3 params
+            let params: Vec<u8> = (0..np).map(|_| self.pick_width()).collect();
+            let mut sig = String::new();
+            for (i, &pw) in params.iter().enumerate() {
+                if i > 0 {
+                    sig.push_str(", ");
+                }
+                sig.push_str(&format!("{} p{}", ctype(pw), i));
+            }
+            let name = format!("helper{k}");
+            src.push_str(&format!(
+                "__attribute__((noinline)) u8 {name}({sig}) {{\n"
+            ));
+            let mut prev: Vec<(String, u8)> = Vec::new();
+            // One op PER PARAM first: every param must be referenced in the
+            // body, or clang replaces the unused call arg with `poison`
+            // (found by the corpus at seed 19 — the IR pipeline cannot
+            // parse poison, so it panics loudly). The op's second operand is
+            // a VOLATILE INPUT read: that makes the body impossible to
+            // constant-fold/specialize, so clang cannot dead-arg the call
+            // into `poison` either (seen at seed 2, where a foldable helper
+            // body was specialized and its original call left with a poison
+            // arg).
+            for (pi, &pw) in params.iter().enumerate() {
+                let ct = ctype(pw);
+                let v = format!("v{}", prev.len());
+                let i = self.below(3);
+                let op = ["+", "-", "&", "|", "^"][self.below(5) as usize];
+                src.push_str(&format!(
+                    "    {ct} {v} = ({ct})(({ct})p{pi} {op} ({ct}){INPUT_PREFIX}{i});\n"
+                ));
+                prev.push((v, pw));
+            }
+            // Then 1-2 extra ops over params/prev locals/constants (inline
+            // ops only — no mul/div/rem, whose runtime-routine frames
+            // would stack on main's frame; helpers stay self-contained).
+            let nops = 1 + self.below(2) as usize;
+            for _ in 0..nops {
+                let w = self.pick_width();
+                let ct = ctype(w);
+                let pick = |g: &mut Self, w: u8, prev: &[(String, u8)]| -> String {
+                    let roll = g.below(6);
+                    if roll < 3 && !params.is_empty() {
+                        let pi = g.below(params.len() as u32) as usize;
+                        format!("({ct2})p{pi}", ct2 = ctype(params[pi]))
+                    } else if roll < 5 && !prev.is_empty() {
+                        let (name, _) = &prev[prev.len() - 1];
+                        format!("({ct2}){name}", ct2 = ctype(w))
+                    } else {
+                        let v = match w {
+                            8 => g.rng.next_u64() as u8 as u32,
+                            16 => g.rng.next_u64() as u16 as u32,
+                            _ => g.rng.next_u64() as u32,
+                        };
+                        format!("{v}u")
+                    }
+                };
+                let a = pick(self, w, &prev);
+                let b = pick(self, w, &prev);
+                // No shifts inside helpers: clang matches a const-shift
+                // followed by the byte-mix return as a rotate idiom and
+                // emits `llvm.fshl.i8`, an intrinsic the whole-program
+                // compiler cannot resolve (found by the corpus at seed 1).
+                let op = ["+", "-", "&", "|", "^"][self.below(5) as usize];
+                let expr = format!("({ct})(({ct}){a} {op} ({ct}){b})");
+                let v = format!("v{}", prev.len());
+                src.push_str(&format!("    {ct} {v} = {expr};\n"));
+                prev.push((v, w));
+            }
+            let (last, _lw) = prev.last().unwrap().clone();
+            // The return mixes in a volatile input: a pure byte-mix of the
+            // params lets clang collapse the body to `ret %0` (identity
+            // folds) and mark the param `returned`, which the IR parser
+            // cannot handle (found by the corpus at seed 2). in0 is seeded
+            // identically on both sides, so the mix is deterministic.
+            src.push_str(&format!("    return (u8)((u8){last} + (u8)in0);\n}}\n"));
+            helpers.push(Helper { name, params });
+        }
+        (helpers, src)
+    }
+}
+
+fn ctype(w: u8) -> &'static str {
+    match w {
+        8 => "u8",
+        16 => "u16",
+        32 => "u32",
+        w => panic!("bad width {w}"),
+    }
+}
 
 /// Generate a deterministic program from `seed`.
 ///
-/// Task-1 surface: 2–3 `volatile u8` inputs and one scalar expression over
-/// them, computed in `u32` space (genuinely 32-bit on both msp430 and the
-/// host — see `TYPEDEF_PROLOGUE`; never `unsigned long`, which is 64-bit on
-/// LP64 hosts) and folded into the `u8` checksum with an explicit narrowing
-/// cast. The expression shape and its constants come from the seeded RNG, so
-/// output varies across seeds yet reproduces exactly.
+/// The full Task-2 surface: scalar arithmetic (+ - * / % & | ^ << >> on
+/// u8/u16/u32 with the discipline's guards), comparisons (< <= > >= == !=),
+/// if/else, bounded loops, noinline calls (0–3 unsigned params), arrays
+/// (small, dynamic `i % N` index), structs (simple u8/u16/u32 fields,
+/// field-wise access), all folded into the volatile `u8` checksum with
+/// explicit width casts. 3 fixed-width volatile inputs (in0 u8, in1 u16,
+/// in2 u32) are seeded identically on both sides of the differential. Every
+/// random choice comes from the seeded RNG in a fixed order, so `seed`
+/// fully determines the program (the corpus contract).
 pub fn generate(seed: u64) -> Program {
-    let mut rng = SplitMix64::new(seed);
-    let n = 2 + rng.below(2) as usize; // 2..=3 inputs
-    let mut inputs = Vec::with_capacity(n);
+    let mut g = Gen::new(seed);
+    let mut rng = SplitMix64::new(seed ^ 0x51_7C_C1_B7_27_22_0A_95);
+
+    // Per-seed feature flags: each construct/op is guaranteed to appear in
+    // a program when its flag is set (the RNG mix varies which programs are
+    // rich; the fixed 8-seed fast corpus and the 200-seed corpus span the
+    // surface — pinned by the tests' coverage sanity checks). The heavy ops
+    // (mul/div/rem pull in the big runtime routines) are flags too: forced
+    // FIRST, while the frame budget is empty, so the random fill cannot
+    // starve them.
+    let feats = rng.next_u64();
+    let want_mul = feats & 1 != 0;
+    let want_div = feats & 2 != 0;
+    let want_rem = feats & 4 != 0;
+    let want_if = feats & 8 != 0;
+    let want_loop = feats & 16 != 0;
+    let want_call = feats & 32 != 0;
+    let want_array = feats & 64 != 0;
+    let want_struct = feats & 128 != 0;
+
+    // Inputs: a fixed u8/u16/u32 mix so every program exercises all three
+    // widths (and u32 values beyond 2^16 in every run).
+    let mut inputs = Vec::new();
     let mut decls = String::new();
-    for i in 0..n {
+    for (i, w) in [(0usize, 8u8), (1, 16), (2, 32)] {
         let name = format!("{INPUT_PREFIX}{i}");
-        decls.push_str(&format!("volatile u8 {name};\n"));
-        inputs.push(Input {
-            name,
-            value: rng.next_u64() as u32,
-            width: 8,
-        });
+        decls.push_str(&format!("volatile {} {name};\n", ctype(w)));
+        let value = match w {
+            8 => rng.next_u64() as u8 as u32,
+            16 => rng.next_u64() as u16 as u32,
+            _ => rng.next_u64() as u32,
+        };
+        inputs.push(Input { name, value, width: w });
     }
-    let a = &inputs[0].name;
-    let b = &inputs[1].name;
-    let shape = rng.below(4);
-    let k1 = [2u32, 3, 5, 7][rng.below(4) as usize];
-    let k2 = rng.below(16) as u32;
-    let s = rng.below(8) as u32; // < 8: the shift stays inside the u8 value
-    let expr = match shape {
-        // All four keep every intermediate in u32 (32-bit on both targets),
-        // so the wrap and the final (u8) truncation are defined on both.
-        0 => format!("((u32){a} * {k1}u + {k2}u)"),
-        1 => format!("(((u32){a} << {s}u) ^ (u32){b})"),
-        2 => format!("((u32){a} + (u32){b} * {k1}u)"),
-        _ => format!("((((u32){a} * {k1}u) + (u32){b}) >> {s}u)"),
+    decls.push_str(&format!("volatile u8 {checksum};\n", checksum = CHECKSUM_NAME));
+
+    let (helpers, helper_src) = g.emit_helpers();
+
+    // Feature-flagged statements FIRST (frame budget empty, so the heavy
+    // mul/div/rem and the structured constructs all fit), then a weighted
+    // random fill bounded by the frame budget — the backend gives every
+    // SSA def, volatile loads included, its own RAM slot, so main's frame,
+    // and the runtime routines' bank-0 slots derived from it, cap the
+    // program's size.
+    let mut force = |g: &mut Gen, k: usize| -> bool {
+        match k {
+            0 => g.emit_forced_arith(BinOp::Mul),
+            1 => g.emit_forced_arith(BinOp::Div),
+            2 => g.emit_forced_arith(BinOp::Rem),
+            3 => g.emit_ifelse(),
+            4 => g.emit_loop(),
+            5 => g.emit_call(&helpers),
+            6 => g.emit_array(),
+            _ => g.emit_struct(),
+        }
     };
+    for (k, want) in [
+        want_mul,
+        want_div,
+        want_rem,
+        want_if,
+        want_loop,
+        want_call,
+        want_array,
+        want_struct,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if *want {
+            force(&mut g, k);
+        }
+    }
+    let mut stmt_kind = |g: &mut Gen| -> usize {
+        // returns 0..4 (if/loop/call/array/struct) or 5/6 (arith/cmp)
+        let r = g.below(100);
+        match r {
+            0..=9 => 0,   // ifelse 10%
+            10..=21 => 1, // loop 12%
+            22..=33 => 2, // call 12%
+            34..=40 => 3, // array 7%
+            41..=47 => 4, // struct 7%
+            48..=81 => 5, // arith 34%
+            _ => 6,       // cmp 18%
+        }
+    };
+    for _ in 0..14 {
+        let ok = match stmt_kind(&mut g) {
+            0 => g.emit_ifelse(),
+            1 => g.emit_loop(),
+            2 => g.emit_call(&helpers),
+            3 => g.emit_array(),
+            4 => g.emit_struct(),
+            5 => g.emit_arith(),
+            _ => g.emit_cmp(),
+        };
+        if !ok {
+            break; // the frame budget is exhausted
+        }
+    }
+
+    // The array/struct globals only when used (every global byte costs
+    // main's frame budget; the fold helpers only when u16/u32 folds occur).
+    if g.used_array {
+        decls.push_str("volatile u8 arr[8];\n");
+    }
+    if g.used_struct {
+        decls.push_str("volatile struct S { u8 a; u16 b; u32 c; } s;\n");
+    }
+
+    let body = g.body.join("\n");
     let c_source = format!(
-        "{TYPEDEF_PROLOGUE}{decls}volatile u8 {checksum};\n\
-         void main(void) {{\n  {checksum} = (u8)({expr});\n}}\n",
-        checksum = CHECKSUM_NAME
+        "{TYPEDEF_PROLOGUE}{decls}{helper_src}{fold_src}void main(void) {{\n{body}\n}}\n",
+        fold_src = Gen::fold_helpers_src(g.used_fold16, g.used_fold32)
     );
     Program {
         c_source,
@@ -424,10 +1206,16 @@ fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), String> {
 /// which Cargo sets only for the package that owns the binary; this crate
 /// instead finds the driver next to the running test executable in
 /// `target/<profile>/` (the driver is a workspace member), honoring a
-/// `PIC8_DRIVER` env override first. A bare `cargo test -p fuzz` that skipped
-/// building other members builds the driver on demand — the nested `cargo`
-/// cannot deadlock on the build lock because tests run only after the outer
-/// build has finished (verified empirically).
+/// `PIC8_DRIVER` env override first.
+///
+/// The nested `cargo build -p driver` runs on EVERY first use (cheap when
+/// up to date) — NOT only when the binary is missing: `cargo test -p fuzz`
+/// does not rebuild the driver (fuzz does not depend on it), so a stale
+/// binary from an earlier compiler build would otherwise silently run the
+/// differential against outdated code (found when the corpus kept failing
+/// with an already-fixed isel panic). The nested cargo cannot deadlock on
+/// the build lock because tests run only after the outer build has finished
+/// (verified empirically).
 fn driver_binary() -> Result<PathBuf, String> {
     static CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     CACHE
@@ -445,9 +1233,6 @@ fn driver_binary() -> Result<PathBuf, String> {
                 dir.pop(); // integration-test binaries live in target/<profile>/deps
             }
             let candidate = dir.join("driver");
-            if candidate.exists() {
-                return Ok(candidate);
-            }
             let mut cmd = Command::new("cargo");
             cmd.args(["build", "-p", "driver", "--quiet"]);
             if let Ok(profile) = std::env::var("PROFILE") {
