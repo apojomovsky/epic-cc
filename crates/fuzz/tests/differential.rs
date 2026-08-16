@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use fuzz::{generate, run_differential, Input, Program, TYPEDEF_PROLOGUE};
+use fuzz::{generate, run_differential, FailureKind, Input, Program, TYPEDEF_PROLOGUE};
 
 /// The brief's tiny program: one u8 volatile input, one scalar expression.
 const TINY: &str = "volatile unsigned char in0;\n\
@@ -201,11 +201,41 @@ fn fast_corpus_spans_the_generation_surface() {
 #[test]
 #[ignore = "full 200-seed corpus (slow)"]
 fn full_corpus_differential_clean() {
+    // The acceptance gate: all 200 committed seeds must run
+    // differential-clean. The per-kind counts are printed (--nocapture) so
+    // the acceptance run documents the outcome distribution; any non-clean
+    // seed panics with its classified failure.
+    let mut clean = 0usize;
+    let mut mismatch = 0usize;
+    let mut panic_kind = 0usize;
+    let mut nohalt = 0usize;
+    let mut compile = 0usize;
+    let mut harness = 0usize;
     for seed in 0..200u64 {
         let prog = generate(seed);
-        run_differential(&prog)
-            .unwrap_or_else(|e| panic!("generated seed {seed} not differential-clean: {e}"));
+        match run_differential(&prog) {
+            Ok(_) => clean += 1,
+            Err(f) => {
+                match f.kind {
+                    FailureKind::Mismatch => mismatch += 1,
+                    FailureKind::Panic => panic_kind += 1,
+                    FailureKind::NoHalt => nohalt += 1,
+                    FailureKind::Compile => compile += 1,
+                    FailureKind::Harness => harness += 1,
+                }
+                println!(
+                    "corpus failure at seed {seed}: {f} (running: clean {clean}, mismatch \
+                     {mismatch}, panic {panic_kind}, nohalt {nohalt}, compile {compile}, \
+                     harness {harness})"
+                );
+                panic!("generated seed {seed} not differential-clean: {f}");
+            }
+        }
     }
+    println!(
+        "corpus (200 seeds): clean {clean}, mismatch {mismatch}, panic {panic_kind}, \
+         nohalt {nohalt}, compile {compile}, harness {harness}"
+    );
 }
 
 #[test]
@@ -224,8 +254,10 @@ fn full_corpus_spans_the_generation_surface() {
             }
         }
     }
+    println!("surface coverage across the 200-seed corpus:");
     for (what, marker) in SURFACE {
         let n = counts.get(what).copied().unwrap_or(0);
+        println!("  {what}: {n}/200 seeds");
         assert!(
             n >= 40,
             "{what} (marker {marker:?}) appears in only {n}/200 corpus seeds"

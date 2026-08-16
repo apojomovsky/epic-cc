@@ -242,3 +242,113 @@ fn reducer_minimizes_a_generated_program_with_a_planted_bug() {
         reduced.program.statements.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 4: the panic-catching demonstration (the loud-panic contract)
+// ---------------------------------------------------------------------------
+
+/// The panic program's fixture seed (a marker — the program is hand-written;
+/// the seed only names the fixture file).
+const PANIC_SEED: u64 = 9997;
+
+/// The unsupported surface: an IEEE `float` computation. msp430 clang emits
+/// `uitofp i32 to float` / `fmul float` / `fptoui float to i8`, and irparse
+/// panics on the first float OPCODE ("SPIKE LIMIT: unsupported opcode
+/// \"uitofp\"") — the loud-panic contract for a construct the whole-program
+/// compiler does not support (the plan defers soft-float fuzzing).
+///
+/// NOTE (checked for Task 4): the brief's "a signed op" suggestion is no
+/// longer an unsupported surface — the Task-2 fix wave implemented the
+/// signed runtime routines (sdiv/srem) and the signed icmp predicates
+/// (slt/sle/sgt/sge), so a signed program is differential-clean. Float (and
+/// i64) are the stable panics: the emitted IR always contains an
+/// unsupported type, so the parse panics deterministically.
+const PANIC_CULPRIT: &str = "float x = (float)in2;";
+
+/// A synthetic panic program: two benign (differential-clean) statements +
+/// a float computation the PIC pipeline cannot parse. The benign statements
+/// are independent of the culprit, so the reducer can peel them.
+fn synthetic_panic_program() -> Program {
+    let prologue = format!(
+        "{TYPEDEF_PROLOGUE}\n\
+         volatile u32 in2;\n\
+         volatile u8 checksum;\n\
+         void main(void) {{\n"
+    );
+    let statements = vec![
+        "  u8 t0 = (u8)((u8)in2 ^ (u8)(in2 >> 16u));".to_string(),
+        "  checksum = (u8)(checksum ^ (u8)t0);".to_string(),
+        PANIC_CULPRIT.to_string(),
+        "  checksum = (u8)(checksum ^ (u8)(x * x));".to_string(),
+    ];
+    let c_source = format!("{prologue}{}\n}}\n", statements.join("\n"));
+    Program {
+        c_source,
+        prologue,
+        statements,
+        inputs: vec![Input {
+            name: "in2".into(),
+            value: 0x1234_5678,
+            width: 32,
+        }],
+        checksum_name: "checksum".into(),
+        seed: PANIC_SEED,
+    }
+}
+
+#[test]
+fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
+    // The loud-panic contract end to end: a program with an unsupported
+    // construct must FAIL the differential (kind Panic — the PIC pipeline
+    // panic is caught, not propagated), and the reducer must minimize it
+    // while preserving the panic.
+    let prog = synthetic_panic_program();
+    let failure = match run_differential(&prog) {
+        Err(f) => f,
+        Ok(v) => panic!("the float program must panic the PIC pipeline, got Ok({v})"),
+    };
+    assert_eq!(
+        failure.kind,
+        FailureKind::Panic,
+        "an unsupported construct must be a Panic failure: {failure}"
+    );
+    assert!(
+        failure.to_string().contains("float"),
+        "the panic message should name the unsupported float op: {failure}"
+    );
+
+    let reduced = reduce(&prog, &failure).expect("reduce the panic");
+    assert!(reduced.re_runs <= REDUCTION_CAP, "the reduction must respect the cap");
+    match run_differential(&reduced.program) {
+        Err(f) => assert_eq!(
+            f.kind,
+            FailureKind::Panic,
+            "the reduced program must still panic: {f}"
+        ),
+        Ok(v) => panic!("the reduced program must still panic, got Ok({v})"),
+    }
+    assert!(
+        reduced.program.c_source.contains("float"),
+        "the reduced program must keep the unsupported construct:\n{}",
+        reduced.program.c_source
+    );
+    assert!(
+        reduced.program.statements.len() < prog.statements.len(),
+        "the reduction must shrink the program: {} -> {} statements",
+        prog.statements.len(),
+        reduced.program.statements.len()
+    );
+
+    // The reduced program is saved as the reduced_<seed>.c fixture (the
+    // panic-catching evidence) and the guard removes it on every path — the
+    // float surface is a documented limitation, not a NEW bug to commit.
+    let path = write_fixture(&reduced.program).expect("save the reduced fixture");
+    let _guard = FixtureGuard(path.clone());
+    let saved = std::fs::read_to_string(&path).expect("read the saved fixture back");
+    assert_eq!(saved, reduced.program.c_source, "the fixture is the reduced program");
+    drop(_guard);
+    assert!(
+        !path.exists(),
+        "the synthetic panic fixture must not survive the test (success path)"
+    );
+}
