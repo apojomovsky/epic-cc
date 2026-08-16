@@ -60,6 +60,7 @@ name = "isel"
 version = "0.1.0"
 dependencies = [
  "asm",
+ "banking",
  "ir",
  "pic14-sim",
 ]
