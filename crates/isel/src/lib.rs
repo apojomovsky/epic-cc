@@ -2506,14 +2506,21 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             // PCLATH and FSR into 0x77/0x78, then the preempted main's
             // in-flight return value (0x71-0x74) into 0x79-0x7C — the ISR
             // body's value-returning calls write the retval region, so
-            // without this save they would clobber it — then PCLATH = 0 so
-            // the ISR body's GOTOs stay in page 0 (the M11 restore literal
-            // is PAGE(isr) = 0). The save area is fixed common RAM
-            // (0x75-0x7C: W/STATUS/PCLATH/FSR/retval x4 = 8 bytes),
+            // without this save they would clobber it — and finally the
+            // fixed scratch byte 0x70 into 0x7D. The scratch is LIVE across
+            // interrupt windows in the preempted main: const reads stash
+            // their byte/index in 0x70 across the PCLATH restore, GEP
+            // offsets accumulate there, and the icmp/add/sub chains fold
+            // through it — an ISR that itself uses the scratch (a const
+            // read, a compare, an i16/i32 op) would silently corrupt that
+            // in-flight value without this save. Then PCLATH = 0 so the
+            // ISR body's GOTOs stay in page 0 (the M11 restore literal is
+            // PAGE(isr) = 0). The save area is fixed common RAM
+            // (0x75-0x7D: W/STATUS/PCLATH/FSR/retval x4/scratch = 9 bytes),
             // disjoint from the scratch byte (0x70) and the retval region
-            // (0x71-0x74); 0x7D-0x7F stays free. The retval MOVFs clobber
-            // the CURRENT Z, which is harmless — the interrupted STATUS is
-            // already safe in 0x76.
+            // (0x71-0x74); 0x7E-0x7F stays free. The retval/scratch MOVFs
+            // clobber the CURRENT Z, which is harmless — the interrupted
+            // STATUS is already safe in 0x76.
             g.emit("    MOVWF 0x75");
             g.emit("    SWAPF 0x75, F");
             g.emit("    SWAPF STATUS, W");
@@ -2530,6 +2537,8 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             g.emit("    MOVWF 0x7B");
             g.emit("    MOVF 0x74, W");
             g.emit("    MOVWF 0x7C");
+            g.emit("    MOVF 0x70, W");
+            g.emit("    MOVWF 0x7D");
             g.emit("    MOVLW 0x00");
             g.emit("    MOVWF PCLATH");
         }
@@ -2597,13 +2606,14 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                 match t {
                     // The restore epilogue replaces the ISR's `ret`. Order
                     // is load-bearing: the retval region (0x79-0x7C ->
-                    // 0x71-0x74) and PCLATH/FSR (MOVF — their Z clobbers
-                    // are fine, STATUS is not yet restored), then STATUS
-                    // via the nibble swap-back (SWAPF is flag-safe), and W
-                    // LAST via its swap-back (also flag-safe — MOVF would
-                    // set Z from the moved value after STATUS was already
-                    // restored, corrupting the interrupted main's Z).
-                    // RETFIE pops the hardware-pushed return.
+                    // 0x71-0x74), then the scratch byte (0x7D -> 0x70), then
+                    // PCLATH/FSR (MOVF — their Z clobbers are fine, STATUS
+                    // is not yet restored), then STATUS via the nibble
+                    // swap-back (SWAPF is flag-safe), and W LAST via its
+                    // swap-back (also flag-safe — MOVF would set Z from the
+                    // moved value after STATUS was already restored,
+                    // corrupting the interrupted main's Z). RETFIE pops the
+                    // hardware-pushed return.
                     Inst::Ret(None) => {
                         g.emit("    MOVF 0x79, W");
                         g.emit("    MOVWF 0x71");
@@ -2613,6 +2623,8 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                         g.emit("    MOVWF 0x73");
                         g.emit("    MOVF 0x7C, W");
                         g.emit("    MOVWF 0x74");
+                        g.emit("    MOVF 0x7D, W");
+                        g.emit("    MOVWF 0x70");
                         g.emit("    MOVF 0x77, W");
                         g.emit("    MOVWF PCLATH");
                         g.emit("    MOVF 0x78, W");
@@ -2808,8 +2820,9 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // constants (bank-independent, common RAM 0x70-0x7F is never used by
     // locals, so no collision). The widened i32 region (0x71-0x74) must not
     // overrun common RAM nor overlap the scratch byte — and the ISR save
-    // area (0x75-0x7C: W, STATUS, PCLATH, FSR, retval x4) must sit right
-    // after the retval region, disjoint from it and from scratch.
+    // area (0x75-0x7D: W, STATUS, PCLATH, FSR, retval x4, scratch) must sit
+    // right after the retval region, disjoint from it and from scratch,
+    // leaving 0x7E-0x7F free.
     let scratch: u16 = 0x70;
     let retval_lo: u16 = 0x71;
     assert!(
@@ -2819,12 +2832,12 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     );
     assert!(
         retval_lo + 4 <= 0x75,
-        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must not overlap the ISR save area 0x75-0x7C",
+        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must not overlap the ISR save area 0x75-0x7D",
         retval_lo + 3
     );
     assert!(
-        0x7C + 1 <= 0x80,
-        "isel: ISR save area 0x75-0x7C must fit in common RAM"
+        0x7D + 1 <= 0x7E,
+        "isel: ISR save area 0x75-0x7D must leave 0x7E-0x7F free"
     );
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),

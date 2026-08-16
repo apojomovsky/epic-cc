@@ -28,6 +28,8 @@ isr:
     MOVWF 0x7B
     MOVF 0x74, W
     MOVWF 0x7C
+    MOVF 0x70, W
+    MOVWF 0x7D
     MOVLW 0x00
     MOVWF PCLATH
     MOVLW 0x55
@@ -55,6 +57,8 @@ isr:
     MOVWF 0x73
     MOVF 0x7C, W
     MOVWF 0x74
+    MOVF 0x7D, W
+    MOVWF 0x70
     MOVF 0x77, W
     MOVWF PCLATH
     MOVF 0x78, W
