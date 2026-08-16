@@ -1373,19 +1373,21 @@ pub struct ReducedProgram {
 /// exhausted.
 ///
 /// `program` is verified to still exhibit `failure` first; its ACTUAL kind
-/// is the preservation target (robust against a stale caller argument) and
-/// a differential-clean program is an error (nothing to reduce). The
-/// reduced program is NOT written here — `write_fixture` persists it as the
-/// `reduced_<seed>.c` artifact.
+/// AND message are taken from that verification run (robust against a stale
+/// caller argument — the caller's message must not leak into the reduced
+/// failure) and a differential-clean program is an error (nothing to
+/// reduce). The reduced program is NOT written here — `write_fixture`
+/// persists it as the `reduced_<seed>.c` artifact.
 pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, String> {
-    let target = match run_differential(program) {
-        Err(f) => f.kind,
+    let fresh = match run_differential(program) {
+        Err(f) => f,
         Ok(_) => {
             return Err(format!(
                 "reduce: the program is differential-clean (no {failure} to preserve)"
             ))
         }
     };
+    let target = fresh.kind;
     let original_len = program.statements.len();
     let mut statements = program.statements.clone();
     let mut re_runs = 1usize; // the verification run above
@@ -1445,7 +1447,7 @@ pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, St
         statements_kept: statements.len(),
         failure: Failure {
             kind: target,
-            message: failure.message.clone(),
+            message: fresh.message.clone(),
         },
     })
 }
