@@ -20,21 +20,23 @@
 // indices the plan wanted (the 299 read lands on the last byte, the
 // boundary read on byte 256).
 //
-// The `pad` filler (40 bytes) exists to push `table` past 0x100 into a
-// nonzero 256-byte window — the reader's `MOVLW HIGH(table); MOVWF PCLATH`
-// is then load-bearing (without it the computed PCL jump lands in window 0
-// and every read returns a wrong byte). pad sorts before table (name
-// order) so its table is emitted first. It is "used once" (`out =
-// pad[in & 15]`) as a runtime read so clang -O1 cannot drop the global;
-// its value (0xAA) is immediately overwritten by the next statement, so it
-// does not affect the final `out`.
+// The `pad` filler (40 bytes) keeps the table section far enough past
+// main that the chunked table's `.align 256` lands on 0x100 — a nonzero
+// 256-byte window — so the reader's `MOVLW HIGH(table); MOVWF PCLATH` is
+// load-bearing (without it the computed PCL jump lands in window 0 and
+// every read returns a wrong byte). pad sorts before table (name order)
+// so its table is emitted first. It is "used once" (`out = pad[in & 15]`)
+// as a runtime read so clang -O1 cannot drop the global; its value (0xAA)
+// is immediately overwritten by the next statement, so it does not affect
+// the final `out`.
 //
-// Layout: main is 205 words (the M11 PCLATH discipline adds a set/restore
-// pair to every CALL), so goto (1) + __start (4) + main + __read_pad (6)
-// puts pad at base 0xD8 — pad is sized to fit its own window (0xD8 + 40 ==
-// 0x100 exactly) while still pushing table's natural base past 0x100;
-// `.align 256` lifts the table to 0x200 (window 2): chunks at
-// table/table_1 (LOW == 0 both), total < 0x800.
+// Layout: main is 187 words (M11 skips the PCLATH restore after a
+// same-page CALL — all of main's reader calls are same-page, so only the
+// sets remain), so goto (1) + __start (4) + main + __read_pad (6) puts pad
+// at base 0xC6 — pad fits its own window (0xC6 + 40 = 0xEE <= 0x100); the
+// chunked table's `.align 256` lifts the table to 0x100 (window 1 — the
+// reader's `MOVLW HIGH(table)` is load-bearing): chunks at table/table_1
+// (LOW == 0 both), total 562 words < 0x800.
 //
 // Expected for in == 290: out = (0x33 + 0x02 + 0x3C + 0x11) & 0xFF = 0x82
 // (hand-traced against the emitted IR in const_table_e2e.rs).

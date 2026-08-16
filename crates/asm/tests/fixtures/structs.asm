@@ -100,8 +100,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL mk
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x32, W
     MOVWF 0x20
     MOVF 0x33, W
@@ -121,8 +119,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL sum
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x36
     MOVF 0x36, W
@@ -157,8 +153,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL pick
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x3B
     MOVF 0x3A, W

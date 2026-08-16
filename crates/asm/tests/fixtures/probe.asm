@@ -110,8 +110,6 @@ tmp1:
     MOVLW 0x00
     MOVWF PCLATH
     CALL add
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x31
     MOVF 0x72, W

@@ -144,8 +144,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL mk
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x31, W
     MOVWF 0x40
     MOVF 0x32, W

@@ -31,8 +31,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL big_a
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x27
     MOVF 0x72, W
@@ -57,8 +55,6 @@ main:
     MOVLW 0x00
     MOVWF PCLATH
     CALL big_b
-    MOVLW 0x00
-    MOVWF PCLATH
     MOVF 0x71, W
     MOVWF 0x2E
     MOVF 0x72, W

@@ -3614,12 +3614,14 @@ fn pad_body(n: usize) -> String {
 }
 
 #[test]
-fn call_emits_pclath_set_and_restore() {
-    // main calls helper: the emitted asm must wrap the CALL in
-    // `MOVLW PAGE(helper); MOVWF PCLATH; CALL helper; MOVLW PAGE(main);
-    // MOVWF PCLATH` — the restore literal is the CALLER's page (its
-    // intra-function GOTOs run with it). `__start` sets PAGE(main) before
-    // CALL main and omits the restore (the program ends with SLEEP).
+fn same_page_call_skips_restore() {
+    // main calls helper and both land in page 0: the emitted asm is just
+    // `MOVLW PAGE(helper); MOVWF PCLATH; CALL helper` — the restore is
+    // skipped because PCLATH already holds the caller's page. This is the
+    // two-phase forward-call case too: helper is emitted AFTER main, yet
+    // pass A's assignment knows its page by the time pass B emits main's
+    // call. `__start` sets PAGE(main) before CALL main and omits the
+    // restore (the program ends with SLEEP).
     let m = parse(
         "global a i8\nglobal out i8\n\
          fn helper(i8) (x)\n  block entry:\n\
@@ -3637,8 +3639,14 @@ fn call_emits_pclath_set_and_restore() {
     ]);
     let asm = select(&m, &addrs);
     assert!(
-        asm.contains("MOVLW PAGE(helper)\n    MOVWF PCLATH\n    CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
-        "set/CALL/restore pairs around CALL helper:\n{asm}"
+        asm.contains("MOVLW PAGE(helper)\n    MOVWF PCLATH\n    CALL helper\n"),
+        "same-page set/CALL with no restore:\n{asm}"
+    );
+    // No restore pair after the CALL — the set is immediately followed by
+    // the next instruction of main's body, never by `MOVLW PAGE(main)`.
+    assert!(
+        !asm.contains("CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "same-page restore must be skipped:\n{asm}"
     );
     // __start: PAGE(main) set before CALL main, then SLEEP — no restore.
     assert!(
@@ -3648,10 +3656,12 @@ fn call_emits_pclath_set_and_restore() {
 }
 
 #[test]
-fn const_read_emits_pclath_discipline() {
+fn same_page_const_read_skips_restore() {
     // A const-table read (`CALL __read_t`) gets the same discipline: the
-    // caller sets PAGE(__read_t) before the CALL and restores PAGE(main)
-    // right after (the returned byte survives via the fixed scratch byte).
+    // caller sets PAGE(__read_t) before the CALL. main and the table both
+    // land in page 0, so the restore is skipped — the returned byte is
+    // stashed in the fixed scratch (0x70) across the reader's PCLATH write
+    // and reloaded into W (no restore pair between).
     let m = module_with_globals(
         "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
@@ -3661,15 +3671,19 @@ fn const_read_emits_pclath_discipline() {
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::i", 0x25), ("main::v", 0x26)]);
     let asm = select(&m, &addrs);
     // The set goes before the index computation (W = index is the reader's
-    // input — the set's MOVLW must not clobber it); the restore preserves
-    // the returned byte in scratch (0x70) across its own MOVLW.
+    // input — the set's MOVLW must not clobber it).
     assert!(
         asm.contains("MOVLW PAGE(__read_t)\n    MOVWF PCLATH"),
         "set before CALL __read_t:\n{asm}"
     );
+    // Same-page read: CALL, stash the byte, reload — no restore pair.
     assert!(
-        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH\n    MOVF 0x70, W"),
-        "restore after CALL __read_t, byte preserved:\n{asm}"
+        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVF 0x70, W"),
+        "same-page read with no restore, byte preserved:\n{asm}"
+    );
+    assert!(
+        !asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "same-page reader restore must be skipped:\n{asm}"
     );
 }
 
@@ -3709,18 +3723,27 @@ fn org_pads_function_across_page_boundary() {
     assert!(asm.contains("    org 0x0800"), ".org 0x800 before helper:\n{asm}");
     assert_eq!(label_addr(&asm, "helper"), 0x800, "helper in page 1:\n{asm}");
     assert!(label_addr(&asm, "main") < 0x800, "main stays in page 0:\n{asm}");
+    // The main -> helper CALL is cross-page (page 0 -> page 1), so this
+    // call KEEPS the restore — the caller's intra-function GOTOs need its
+    // own page back.
+    assert!(
+        asm.contains("CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page call keeps the restore:\n{asm}"
+    );
 }
 
 #[test]
 fn multi_page_module_runs_in_sim() {
     // M11 load-bearing SIM: main (padded to fill page 0) calls helper which
-    // the greedy assignment moves to page 1 via `.org 0x800`; the CALL is
-    // cross-page, so both halves of the discipline are exercised — helper's
-    // intra-function GOTO proves the SET (PCLATH = PAGE(helper) on entry)
-    // and main's post-call GOTO proves the RESTORE (PCLATH back to
-    // PAGE(main)). A const table lands in page 1 too: its `CALL __read_t`
-    // gets PAGE(__read_t) and the reader's computed goto crosses into the
-    // table's window. helper(x) = x == 0 ? 100 : x; main: r = helper(in);
+    // the greedy assignment moves to page 1 via `.org 0x800`. The discipline
+    // is exercised in BOTH directions: the cross-page calls (main -> helper,
+    // main -> `__read_t` — the table lands in page 1 too) keep the restore —
+    // main's post-call GOTO proves PCLATH is back on PAGE(main) — while the
+    // same-page calls inside helper (helper -> `__read_t`, helper -> helper2,
+    // all of page 1) SKIP the restore — helper's post-call GOTO proves
+    // PCLATH still holds page 1, so the elision cannot break the caller's
+    // intra-function branches. helper(x) = x == 0 ? 100 : x, plus
+    // t[x] + 1 (helper2(x) = x + 1); main: r = helper(in);
     // r2 = r == 0 ? r+1 : r; out = r2 + t[in].
     let mut pad = String::new();
     for _ in 0..665 {
@@ -3738,7 +3761,11 @@ fn multi_page_module_runs_in_sim() {
              fn helper(i8) (x)\n  block entry:\n    %c = icmp eq i8 %x, 0\n    br i1 %c then else\n\
              block then:\n    %v = add i8 %x, 100\n    br end\n\
              block else:\n    br end\n\
-             block end:\n    %p = phi i8 %v then %x else\n    ret i8 %p\n",
+             block end:\n    %p = phi i8 %v then %x else\n\
+             \x20   %q = gep @t +0 +1*%x\n    %b = load i8 %q\n    %w = add i8 %p, %b\n\
+             \x20   %w2 = call i8 @helper2(i8 %w)\n    br fin\n\
+             block fin:\n    ret i8 %w2\n\
+             fn helper2(i8) (x)\n  block entry:\n    %r = add i8 %x, 1\n    ret i8 %r\n",
             pad
         ),
         vec![const_table_global("t", 4)],
@@ -3758,18 +3785,47 @@ fn multi_page_module_runs_in_sim() {
         ("helper::c", 0x31),
         ("helper::v", 0x32),
         ("helper::p", 0x33),
+        ("helper::b", 0x34),
+        ("helper::w", 0x35),
+        ("helper::w2", 0x36),
+        ("helper2::x", 0x3A),
+        ("helper2::r", 0x3B),
     ]);
     let asm = select(&m, &addrs);
-    // Load-bearing preconditions: helper and the table land in page 1.
+    // Load-bearing preconditions: helper, helper2, and the table land in
+    // page 1; main stays in page 0.
     assert!(asm.contains("    org 0x0800"), ".org 0x800 must be emitted:\n{asm}");
     assert_eq!(label_addr(&asm, "helper"), 0x800, "helper must land in page 1:\n{asm}");
+    assert!(
+        label_addr(&asm, "helper2") >= 0x800 && label_addr(&asm, "helper2") < 0x1000,
+        "helper2 must land in page 1:\n{asm}"
+    );
     let t = label_addr(&asm, "t");
     assert!(t >= 0x800 && t < 0x1000, "table must land in page 1 (base 0x{t:03X}):\n{asm}");
-    // Hand-computed results (see the doc comment).
-    assert_eq!(sim_run_asm(&asm, &[(0x20, 0)], 0x21), 100, "in=0: helper=100, t[0]=0:\n{asm}");
-    assert_eq!(sim_run_asm(&asm, &[(0x20, 1)], 0x21), 2, "in=1: helper=1, t[1]=1:\n{asm}");
-    assert_eq!(sim_run_asm(&asm, &[(0x20, 2)], 0x21), 4, "in=2: helper=2, t[2]=2:\n{asm}");
-    assert_eq!(sim_run_asm(&asm, &[(0x20, 3)], 0x21), 6, "in=3: helper=3, t[3]=3:\n{asm}");
+    // Same-page calls inside helper (page 1 -> page 1) lose the restore...
+    assert!(
+        asm.contains("CALL helper2\n    MOVF 0x71, W"),
+        "same-page helper2 call must not restore before the retval copy:\n{asm}"
+    );
+    assert!(
+        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVF 0x70, W"),
+        "same-page table read must not restore:\n{asm}"
+    );
+    // ...while main's cross-page calls (page 0 -> page 1) keep it.
+    assert!(
+        asm.contains("CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page helper call keeps the restore:\n{asm}"
+    );
+    assert!(
+        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page table read keeps the restore:\n{asm}"
+    );
+    // Hand-computed results (see the doc comment): helper returns
+    // (x == 0 ? 100 : x) + t[x] + 1; out = helper(in) + t[in].
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 0)], 0x21), 101, "in=0: helper=101, t[0]=0:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 1)], 0x21), 4, "in=1: helper=3, t[1]=1:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 2)], 0x21), 7, "in=2: helper=5, t[2]=2:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 3)], 0x21), 10, "in=3: helper=7, t[3]=3:\n{asm}");
 }
 
 #[test]
