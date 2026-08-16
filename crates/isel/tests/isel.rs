@@ -4435,6 +4435,76 @@ fn slt_i32_complements_sign_byte_and_simulates() {
     assert_eq!(got[0], 0, "(0x7FFFFFFF < INT_MIN) must be 0");
 }
 
+/// The const-operand i32 compare chains (`emit_cmp_c_file_lhs_wide`'s
+/// Val::Const branch and `emit_cmp_c_const_lhs_wide`) are otherwise
+/// unreachable — a const operand folds into the SUBWF/SUBLW literal. These
+/// pin the same wrap discriminators as the file-vs-file i32 compares, so a
+/// wrong fold idiom in either const path flips a result. The IR const
+/// literals are decimal (the IR parser accepts no 0x prefix); the seed
+/// bytes are hex. Maps: x=0x20, y=0x20, out=0x24, main::a=0x30,
+/// main::b=0x30, main::c=0x38.
+#[test]
+fn const_operand_i32_icmp_simulates_correctly() {
+    // --- Const RHS (`icmp ult i32 %a, 5`): the small literal folds into
+    // the SUBWF subtrahend; the high byte decides. 0xFFFFFFFB > 5 -> 0.
+    let ir = "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %c = icmp ult i32 %a, 5\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::c", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFB), (0x21, 0xFF), (0x22, 0xFF), (0x23, 0xFF)], 0x24, 1);
+    assert_eq!(got[0], 0, "(0xFFFFFFFB < 5) must be 0");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x04), (0x21, 0x00), (0x22, 0x00), (0x23, 0x00)], 0x24, 1);
+    assert_eq!(got[0], 1, "(4 < 5) must be 1");
+
+    // --- Const RHS `icmp ult i32 %a, 0x80000000`: byte 3 decides at
+    // b_hi = 0x80 (unsigned). 0x7FFFFFFF < 0x80000000 -> 1, equality -> 0.
+    let ir = "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %c = icmp ult i32 %a, 2147483648\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::c", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFF), (0x21, 0xFF), (0x22, 0xFF), (0x23, 0x7F)], 0x24, 1);
+    assert_eq!(got[0], 1, "(0x7FFFFFFF < 0x80000000) must be 1");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x80)], 0x24, 1);
+    assert_eq!(got[0], 0, "(0x80000000 < 0x80000000) must be 0");
+
+    // --- Const RHS unsigned borrow wrap: b_1 = 0xFF with a borrow-in from
+    // byte 0 (0 < 0x0000FFFF). A naive ADDLW 1 fold would leave C = 1 and
+    // mis-report. 0x00010000 > 0x0000FFFF -> 0.
+    let ir = "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %c = icmp ult i32 %a, 65535\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::c", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x00)], 0x24, 1);
+    assert_eq!(got[0], 1, "(0 < 0x0000FFFF) must be 1");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x01), (0x23, 0x00)], 0x24, 1);
+    assert_eq!(got[0], 0, "(0x00010000 < 0x0000FFFF) must be 0");
+
+    // --- Const RHS signed complemented-fold wrap: b_hi = 0x7F (^0x80 =
+    // 0xFF) with a borrow-in — INT_MIN < 0x7FFFFFFF must be 1 (a fold on
+    // the uncomplemented byte would wrap invisibly and report 0).
+    let ir = "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %c = icmp slt i32 %a, 2147483647\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::c", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x80)], 0x24, 1);
+    assert_eq!(got[0], 1, "(INT_MIN < 0x7FFFFFFF) must be 1");
+
+    // --- Const LHS (`emit_cmp_c_const_lhs_wide`, SUBLW): `icmp slt i32
+    // 5, %b` — 5 < INT_MIN -> 0, 5 < -1 -> 0 (byte 3 / sign decide).
+    let ir = "global y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %b = load i32 @y\n    %c = icmp slt i32 5, %b\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("y", 0x20), ("out", 0x24), ("main::b", 0x30), ("main::c", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x80)], 0x24, 1);
+    assert_eq!(got[0], 0, "(5 < INT_MIN) must be 0");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFF), (0x21, 0xFF), (0x22, 0xFF), (0x23, 0xFF)], 0x24, 1);
+    assert_eq!(got[0], 0, "(5 < -1) must be 0");
+    // Const LHS signed complemented-fold wrap: b_hi = 0x7F (^0x80 = 0xFF)
+    // with a borrow-in — 5 < 0x7FFFFFFF must be 1 (the skip keeps
+    // C = borrow-in, the true borrow-out).
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFF), (0x21, 0xFF), (0x22, 0xFF), (0x23, 0x7F)], 0x24, 1);
+    assert_eq!(got[0], 1, "(5 < 0x7FFFFFFF) must be 1");
+
+    // --- Const LHS unsigned borrow wrap: b_1 = 0xFF with a borrow-in from
+    // byte 0 — 0x0000FF00 < 0x0000FFFF must be 1; equality -> 0.
+    let ir = "global y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %b = load i32 @y\n    %c = icmp ult i32 65280, %b\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("y", 0x20), ("out", 0x24), ("main::b", 0x30), ("main::c", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFF), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)], 0x24, 1);
+    assert_eq!(got[0], 1, "(0x0000FF00 < 0x0000FFFF) must be 1");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)], 0x24, 1);
+    assert_eq!(got[0], 0, "(0x0000FF00 < 0x0000FF00) must be 0");
+}
+
 #[test]
 fn sext_i16_and_i8_to_i32_simulate() {
     // i16 0x8000 -> 0xFFFF8000 (sign-fill from byte 1's bit 7).
