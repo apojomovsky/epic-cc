@@ -813,10 +813,13 @@ impl<'m> Gen<'m> {
     /// (a cmp leaves only flags; a and b are never written, so INCFSZ can
     /// fold directly on the operand byte). The signed sign-complement
     /// applies to the HIGH byte only: the a-side is XORed 0x80 into the
-    /// scratch (the SUBWF file operand), the b-side is folded on the
-    /// *uncomplemented* byte and then XORLW 0x80 — an exact mod-256 repair
-    /// — because folding the complemented byte would wrap at
-    /// b_hi = 0x7F + borrow instead, corrupting the final C.
+    /// scratch (the SUBWF file operand), and the b-side is complemented
+    /// into the 0x71 temp and folded *complemented* via INCFSZ's skip —
+    /// the complemented fold wraps at b_hi ^ 0x80 = 0xFF (b_hi = 0x7F +
+    /// borrow), where the skip keeps C = borrow-in = 0, the true
+    /// borrow-out. A fold on the uncomplemented byte would repair only the
+    /// b_hi = 0xFF wrap; b_hi = 0x7F + borrow would wrap invisibly and
+    /// corrupt the final C.
     fn emit_cmp_c_file_lhs_wide(&mut self, a: &Val, b: &Val, n: u8, high: u8, signed: bool) {
         let aa = self.val_addr(a);
         // Byte 0 has no borrow-in; a single SUBWF leaves C exact.
@@ -877,8 +880,11 @@ impl<'m> Gen<'m> {
     /// The wide const-LHS (SUBLW) borrow chain: W holds the b byte
     /// (+ borrow), SUBLW subtracts it from the const byte. Same
     /// wrap-correct folds as `emit_cmp_c_file_lhs_wide`; the signed
-    /// high byte's literal is pre-complemented and the b-side gets the
-    /// fold-then-XORLW repair.
+    /// high byte's literal is pre-complemented (folded into the SUBLW
+    /// operand) and the b-side is complemented into the 0x71 temp and
+    /// folded COMPLEMENTED via INCFSZ's skip — the complemented fold
+    /// wraps at b_hi ^ 0x80 = 0xFF (b_hi = 0x7F + borrow), where the
+    /// skip keeps C = borrow-in, the true borrow-out.
     fn emit_cmp_c_const_lhs_wide(&mut self, k: &i64, b: &Val, n: u8, high: u8, signed: bool) {
         // Byte 0 has no borrow-in; a single SUBLW leaves C exact.
         self.emit_load_cmp_byte(b, 0, signed, high);
@@ -1701,7 +1707,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Copy `bytes` bytes from a routine slot into the fixed retval slots
-    /// (0x71/0x72) — `emit_call` on the caller side reads them after CALL.
+    /// (0x71-0x74) — `emit_call` on the caller side reads them after CALL.
     fn store_retval(&mut self, src: u16, bytes: u8) {
         for i in 0..bytes {
             self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(i)));
