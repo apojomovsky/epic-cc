@@ -15,13 +15,18 @@
 /// that re-sets an already-held literal) while never dropping a pair it
 /// cannot prove redundant — sound for any input.
 ///
-/// The tracked literal persists across CALL/GOTO/labels/directives; only
-/// `MOVWF PCLATH` updates it. Operands are compared canonically: numeric
-/// literals are normalized to `0xXX` hex (so `0x08 == 0x08`), symbolic
-/// operands (`PAGE(main)`, `HIGH(table)`) are compared as strings — an
-/// identical token resolves to an identical literal, so eliding it is sound;
-/// differing tokens are conservatively kept. A standalone `MOVWF PCLATH`
-/// (writing the unknown value currently in W) forgets the tracked literal.
+/// The tracked literal is forgotten at every LABEL (a branch target's
+/// runtime PCLATH depends on the path taken, not the text order) and at any
+/// standalone `MOVWF PCLATH`; only `MOVLW k; MOVWF PCLATH` pairs update it.
+/// This label reset is load-bearing for multi-page programs: a function's
+/// CALL set must never be elided because the *previous function's* restore
+/// (a different runtime context) wrote the same literal earlier in the text.
+/// Operands are compared canonically: numeric literals are normalized to
+/// `0xXX` hex (so `0x08 == 0x08`), symbolic operands (`PAGE(main)`,
+/// `HIGH(table)`) are compared as strings — an identical token resolves to
+/// an identical literal, so eliding it is sound; differing tokens are
+/// conservatively kept. A standalone `MOVWF PCLATH` (writing the unknown
+/// value currently in W) forgets the tracked literal.
 pub fn optimize(asm: &str) -> String {
     let lines: Vec<&str> = asm.lines().collect();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
@@ -30,6 +35,18 @@ pub fn optimize(asm: &str) -> String {
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        // A label is a branch target: the runtime PCLATH there depends on
+        // the path taken, not the linear text order. The tracked literal is
+        // only a sound predictor of PCLATH on straight-line code, so it is
+        // forgotten at every label — most importantly at function-boundary
+        // labels, where the previous function's restore (a *different*
+        // runtime context) must never elide the next function's CALL set.
+        if is_label(line) {
+            out.push(line);
+            tracked = None;
+            i += 1;
+            continue;
+        }
         if is_movlw(line) && i + 1 < lines.len() && is_movwf_pclath(lines[i + 1]) {
             let literal = canonical_literal(movlw_operand(line));
             if tracked.as_deref() == Some(literal.as_str()) {
@@ -67,6 +84,11 @@ fn is_movlw(line: &str) -> bool {
 
 fn is_movwf_pclath(line: &str) -> bool {
     line.trim_start().starts_with("MOVWF PCLATH")
+}
+
+fn is_label(line: &str) -> bool {
+    let t = line.trim_start();
+    t.ends_with(':') && !t.starts_with('.')
 }
 
 fn movlw_operand(line: &str) -> &str {

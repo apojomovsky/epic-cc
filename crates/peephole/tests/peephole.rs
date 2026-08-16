@@ -55,12 +55,16 @@ fn symbolic_reader_window_set_kept_after_restore() {
 }
 
 #[test]
-fn tracked_value_persists_across_goto_and_label() {
-    // GOTO and a label do not write PCLATH, so the tracked literal survives
-    // them and the second equal pair is dropped.
+fn tracked_value_resets_at_labels() {
+    // A label is a branch target whose runtime PCLATH depends on the path
+    // taken — the linear text order is not a sound predictor there. A
+    // function-boundary label in particular separates two DIFFERENT runtime
+    // contexts: the previous function's restore must never elide the next
+    // function's CALL set (a real multi-page miscompile this rule fixes), so
+    // the tracked literal is forgotten at every label and the second pair is
+    // kept.
     let asm = "    MOVLW 0x08\n    MOVWF PCLATH\n    GOTO lbl\nlbl:\n    MOVLW 0x08\n    MOVWF PCLATH\n";
-    let expected = "    MOVLW 0x08\n    MOVWF PCLATH\n    GOTO lbl\nlbl:\n";
-    assert_eq!(optimize(asm), expected);
+    assert_eq!(optimize(asm), asm);
 }
 
 #[test]
