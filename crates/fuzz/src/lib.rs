@@ -2,11 +2,13 @@
 //!
 //! Task 1 of milestone 14: the generator skeleton and the differential
 //! harness. The generator emits a tiny, deterministic C program in the
-//! milestone's "discipline" (unsigned-only arithmetic in explicit widths,
-//! guarded shifts, a volatile `unsigned char` checksum); the differential
-//! runner compiles it twice — through the PIC8 driver into `pic14-sim`, and
-//! through host clang into a native binary — seeds the volatile inputs
-//! identically on both sides, and compares the resulting checksums.
+//! milestone's "discipline" (unsigned-only arithmetic in genuinely
+//! explicit-width types — `u8`/`u16`/`u32` from `TYPEDEF_PROLOGUE`, never
+//! bare `unsigned long`, which is 64-bit on LP64 hosts — guarded shifts, a
+//! volatile `u8` checksum); the differential runner compiles it twice —
+//! through the PIC8 driver into `pic14-sim`, and through host clang into a
+//! native binary — seeds the volatile inputs identically on both sides, and
+//! compares the resulting checksums.
 //!
 //! The harness contracts (see docs/27-phase6-random-testing-plan.md):
 //! - `generate(seed)` is deterministic (seeded RNG, no entropy);
@@ -29,6 +31,43 @@ use std::sync::OnceLock;
 
 /// The volatile checksum global's name (fixed by the C discipline).
 pub const CHECKSUM_NAME: &str = "checksum";
+
+/// The explicit-width typedef prologue emitted at the top of every generated
+/// program.
+///
+/// WHY (the milestone's "Important" fix): Task 1 documented `unsigned long`
+/// as "32-bit on both msp430 and the host" — that equivalence is FALSE. On
+/// LP64 hosts `unsigned long` is 64-bit, so a u32 computation whose result
+/// exceeds 2^32 (e.g. `x * x` for x = 0xFFFFFFFF, or a 64-bit quotient)
+/// diverges: msp430 wraps at 2^32, the host does not. `stdint.h` was the
+/// first choice (`uint8_t`/`uint16_t`/`uint32_t` are exactly this), but it
+/// does NOT resolve under the driver's fixed flags — `-nostdinc` drops the
+/// builtin resource-dir include path (verified empirically; adding an
+/// explicit `-isystem` fixes it, but the driver's flags are not ours to
+/// change). So the robust option is self-contained typedefs guarded on the
+/// target macro clang defines for the msp430 triple:
+///
+/// - u8  = unsigned char  (8 bits on both targets)
+/// - u16 = unsigned short (16 bits on both targets)
+/// - u32 = msp430: `unsigned long` (msp430 int is 16-bit, so its 32-bit
+///        type is long) / host: `unsigned int` (32-bit on the pinned
+///        x86-64-linux host) — genuinely 32-bit on BOTH sides.
+///
+/// With these, u8/u16/u32 arithmetic wraps identically on both sides and
+/// the differential is meaningful for values beyond 2^16 (pinned by
+/// `u32_arithmetic_wraps_identically_on_both_sides` in tests/differential.rs
+/// and by `unsigned_long_u32_arithmetic_mismatches`, which shows the old
+/// discipline failing).
+pub const TYPEDEF_PROLOGUE: &str = "\
+#ifdef __MSP430__\n\
+typedef unsigned char u8;\n\
+typedef unsigned short u16;\n\
+typedef unsigned long u32;\n\
+#else\n\
+typedef unsigned char u8;\n\
+typedef unsigned short u16;\n\
+typedef unsigned int u32;\n\
+#endif\n";
 
 /// The volatile input globals' name prefix (`in0`, `in1`, …).
 const INPUT_PREFIX: &str = "in";
@@ -96,12 +135,12 @@ pub struct Program {
 
 /// Generate a deterministic program from `seed`.
 ///
-/// Task-1 surface: 2–3 `volatile unsigned char` inputs and one scalar
-/// expression over them, computed in `unsigned long` space (32-bit on both
-/// msp430 and the host, so every intermediate is defined identically on both
-/// sides) and folded into the `unsigned char` checksum with an explicit
-/// narrowing cast. The expression shape and its constants come from the
-/// seeded RNG, so output varies across seeds yet reproduces exactly.
+/// Task-1 surface: 2–3 `volatile u8` inputs and one scalar expression over
+/// them, computed in `u32` space (genuinely 32-bit on both msp430 and the
+/// host — see `TYPEDEF_PROLOGUE`; never `unsigned long`, which is 64-bit on
+/// LP64 hosts) and folded into the `u8` checksum with an explicit narrowing
+/// cast. The expression shape and its constants come from the seeded RNG, so
+/// output varies across seeds yet reproduces exactly.
 pub fn generate(seed: u64) -> Program {
     let mut rng = SplitMix64::new(seed);
     let n = 2 + rng.below(2) as usize; // 2..=3 inputs
@@ -109,7 +148,7 @@ pub fn generate(seed: u64) -> Program {
     let mut decls = String::new();
     for i in 0..n {
         let name = format!("{INPUT_PREFIX}{i}");
-        decls.push_str(&format!("volatile unsigned char {name};\n"));
+        decls.push_str(&format!("volatile u8 {name};\n"));
         inputs.push(Input {
             name,
             value: rng.next_u64() as u32,
@@ -123,17 +162,16 @@ pub fn generate(seed: u64) -> Program {
     let k2 = rng.below(16) as u32;
     let s = rng.below(8) as u32; // < 8: the shift stays inside the u8 value
     let expr = match shape {
-        // All four keep every intermediate in unsigned long (u32), so the
-        // wrap and the final (unsigned char) truncation are defined on both
-        // msp430 and the host.
-        0 => format!("((unsigned long){a} * {k1}u + {k2}u)"),
-        1 => format!("(((unsigned long){a} << {s}u) ^ (unsigned long){b})"),
-        2 => format!("((unsigned long){a} + (unsigned long){b} * {k1}u)"),
-        _ => format!("((((unsigned long){a} * {k1}u) + (unsigned long){b}) >> {s}u)"),
+        // All four keep every intermediate in u32 (32-bit on both targets),
+        // so the wrap and the final (u8) truncation are defined on both.
+        0 => format!("((u32){a} * {k1}u + {k2}u)"),
+        1 => format!("(((u32){a} << {s}u) ^ (u32){b})"),
+        2 => format!("((u32){a} + (u32){b} * {k1}u)"),
+        _ => format!("((((u32){a} * {k1}u) + (u32){b}) >> {s}u)"),
     };
     let c_source = format!(
-        "{decls}volatile unsigned char {checksum};\n\
-         void main(void) {{\n  {checksum} = (unsigned char)({expr});\n}}\n",
+        "{TYPEDEF_PROLOGUE}{decls}volatile u8 {checksum};\n\
+         void main(void) {{\n  {checksum} = (u8)({expr});\n}}\n",
         checksum = CHECKSUM_NAME
     );
     Program {
@@ -258,7 +296,11 @@ fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Stri
 /// sim-side RAM seeding byte-for-byte), calls the renamed `pic_main`, and
 /// prints the checksum as a bare unsigned decimal.
 fn host_main_source(program: &Program) -> Result<String, String> {
+    // host_main.c is a separate translation unit: it needs the typedef
+    // prologue itself so `extern volatile u32 in0;` matches the generated
+    // globals' typedef'd types.
     let mut s = String::from("#include <stdio.h>\n");
+    s.push_str(TYPEDEF_PROLOGUE);
     for input in &program.inputs {
         s.push_str(&format!(
             "extern volatile {} {};\n",
@@ -437,11 +479,13 @@ fn run_ok(cmd: &mut Command, what: &str) -> Result<(), String> {
     }
 }
 
+/// The C type name for a width under the typedef discipline (the host_main.c
+/// externs must match the generated globals' typedef'd types exactly).
 fn width_type(width: u8) -> Result<&'static str, String> {
     match width {
-        8 => Ok("unsigned char"),
-        16 => Ok("unsigned short"),
-        32 => Ok("unsigned long"),
+        8 => Ok("u8"),
+        16 => Ok("u16"),
+        32 => Ok("u32"),
         w => Err(format!("bad input width {w}")),
     }
 }
