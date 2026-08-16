@@ -32,7 +32,7 @@
 //   - No i32 const tables and no const-const i32 ops (deferred — both still
 //     panic loudly).
 //
-// Expected: in = 0x12345678, sin = -19 -> out = 0x16348B46 (traced in
+// Expected: in = 0x12345678, sin = -19 -> out = 0x1634943A (traced in
 // crates/driver/tests/long_e2e.rs against the exact emitted IR).
 struct P { unsigned char a; unsigned long b; };   // {i8,i32}: a@0, b@2, size 6
 
