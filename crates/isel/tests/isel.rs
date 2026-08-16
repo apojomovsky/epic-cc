@@ -4843,3 +4843,216 @@ fn panics_on_banked_i32_routine_slot() {
     }
     let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 13, Task 2: interrupt entry/prologue/epilogue + literal (SFR)
+// pointers. The F877A's interrupt vector is word 0x0004 — the ISR's code
+// starts there (no GOTO — a GOTO's target page would depend on the
+// interrupted PCLATH, which is unknowable), so the ISR is placed FIRST, with
+// a `.org 4` pad after the 2-word reset entry, and its `ret` becomes the
+// restore epilogue + RETFIE. Literal (`inttoptr`) pointers are bank-mirrored
+// SFRs: a direct MOVF/MOVWF with no FSR and no BANKSEL.
+
+#[test]
+fn isr_emits_vector_entry_prologue_epilogue() {
+    let m = parse(
+        "global in i8\nglobal out i8\n\
+         fn isr(void) [isr] ()\n  block entry:\n    %v = load i8 @in\n    store i8 %v @out\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("isr::v", 0x25)]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("    org 0x0004"), "the vector pad to word 4:\n{asm}");
+    assert!(
+        asm.contains(
+            "    org 0x0004\nisr:\n    MOVWF 0x75\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78\n    MOVLW 0x00\n    MOVWF PCLATH"
+        ),
+        "the 9-line save prologue, right after the vector pad:\n{asm}"
+    );
+    assert!(
+        asm.contains(
+            "    MOVF 0x77, W\n    MOVWF PCLATH\n    SWAPF 0x76, W\n    MOVWF STATUS\n    MOVF 0x78, W\n    MOVWF FSR\n    MOVF 0x75, W\n    RETFIE"
+        ),
+        "the restore epilogue + RETFIE (replacing the ISR's ret):\n{asm}"
+    );
+    // The ISR is placed FIRST: its vector pad precedes main's label, and
+    // __start moves after the ISR.
+    let org = asm.find("    org 0x0004").unwrap();
+    let main = asm.find("main:").unwrap();
+    let start = asm.find("__start:").unwrap();
+    assert!(org < start && start < main, "ISR first, then __start, then main:\n{asm}");
+    // Non-ISR functions keep the plain RETURN terminator.
+    assert!(asm.contains("    RETURN"), "main's ret is unchanged:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "does not fit page 0")]
+fn panics_on_isr_larger_than_page_0() {
+    // The ISR is pinned at the vector (word 4); a body that cannot fit page
+    // 0 (0x004-0x7FF) with room for the reset __start can never be padded
+    // (the vector IS the entry), so it must panic loudly.
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn isr(void) [isr] ()\n  block entry:\n    %a = load i8 @in\n{}    store i8 %a @out\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+        pad_body(700)
+    ));
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("isr::a", 0x25)]);
+    let _ = select(&m, &addrs);
+}
+
+#[test]
+fn literal_ptr_store_emits_direct_movwf() {
+    // `store i8 %v 0x06` — an inttoptr (SFR) pointer: the register is
+    // bank-mirrored, so the access is a direct MOVWF with no FSR setup (and
+    // isel emits no BANKSEL anywhere — the banking pass has nothing to add).
+    let m = parse("global in i8\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    store i8 %v 0x06\n    ret void\n");
+    let addrs = addrs(&[("in", 0x20), ("main::v", 0x25)]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("    MOVWF 0x06"), "direct SFR store:\n{asm}");
+    assert!(!asm.contains("MOVWF FSR"), "no FSR for a literal (SFR) store:\n{asm}");
+    assert!(!asm.contains("MOVWF INDF"), "no INDF for a literal (SFR) store:\n{asm}");
+}
+
+#[test]
+fn literal_ptr_load_emits_direct_movf() {
+    // `%v = load i8 0x06` — direct MOVF from the SFR, no FSR setup.
+    let m = parse("global out i8\nfn main(void) ()\n  block entry:\n    %v = load i8 0x06\n    store i8 %v @out\n    ret void\n");
+    let addrs = addrs(&[("out", 0x21), ("main::v", 0x25)]);
+    let asm = select(&m, &addrs);
+    assert!(asm.contains("    MOVF 0x06, W"), "direct SFR load:\n{asm}");
+    assert!(!asm.contains("MOVWF FSR"), "no FSR for a literal (SFR) load:\n{asm}");
+    assert!(!asm.contains("MOVF INDF, W"), "no INDF for a literal (SFR) load:\n{asm}");
+}
+
+#[test]
+fn banking_leaves_sfr_and_isr_save_area_untouched() {
+    // SFRs (0x00-0x1F) and the common GPR block (0x70-0x7F) need no
+    // banking: the literal-pointer accesses and the ISR save area must pass
+    // through `assign_banks` unchanged — no BANKSEL inserted for them, no
+    // operand rewritten. (Bank-0 body operands DO get a full BANKSEL after
+    // each label — that is correct: the interrupted program's bank is
+    // unknown at an ISR entry.)
+    let m = parse(
+        "global in i8\nglobal out i8\n\
+         fn isr(void) [isr] ()\n  block entry:\n    %v = load i8 @in\n    store i8 %v 0x06\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    %m = load i8 0x06\n    store i8 %m @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("isr::v", 0x25), ("main::m", 0x26)]);
+    let asm = select(&m, &addrs);
+    let banked = banking::assign_banks(&asm);
+    // The SFR store follows the value load directly — no BANKSEL can be
+    // inserted between them (0x06 is an SFR, never banked).
+    assert!(
+        banked.contains("    MOVF 0x25, W\n    MOVWF 0x06"),
+        "SFR store is direct with no BANKSEL:\n{banked}"
+    );
+    // The SFR load is the first instruction after main's label — a banked
+    // operand would get a full BANKSEL there; an SFR gets none.
+    assert!(
+        banked.contains("main:\n    MOVF 0x06, W"),
+        "SFR load is direct with no BANKSEL:\n{banked}"
+    );
+    // The save area (common RAM 0x75-0x78) passes through untouched.
+    assert!(
+        banked.contains("    MOVWF 0x75\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78"),
+        "the ISR save area survives banking untouched:\n{banked}"
+    );
+}
+
+#[test]
+fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
+    // The full interrupt path (vector fire -> PC = 4) needs the sim's
+    // fire_interrupt hook (milestone 13, task 3); until then the test
+    // reaches the vector the way the hardware would leave it: the main
+    // context CALLs word 4, so the emitted prologue/body/epilogue + RETFIE
+    // all execute, and RETFIE returns to the exact instruction after the
+    // CALL — the interrupted computation completes with the correct result.
+    //
+    // The internal asm crate does not yet encode SWAPF/RETFIE, and task 2
+    // must not touch crates/asm (gpasm covers the real assembly in task 5),
+    // so this test hand-encodes the exact words isel emits (the emitted
+    // TEXT is asserted verbatim by isr_emits_vector_entry_prologue_epilogue
+    // and banking_leaves_sfr_and_isr_save_area_untouched; every word below
+    // is the encoding of the corresponding emitted instruction).
+    //
+    // Layout: word 0 = reset GOTO __start (word 35); words 1-3 = the
+    // `.org 4` pad; words 4-31 = the ISR (save prologue 4-12, body 13-23,
+    // restore epilogue 24-30, RETFIE 31); word 32-34 = the same-page
+    // helper; words 35-46 = __start (the "main" context).
+    //
+    // The interrupted context is built in __start: W = 0x41 (0x42 +
+    // 0xFF), STATUS = 0x03 (C+DC from the ADDLW), PCLATH = 0, FSR = 0x12
+    // (pre-seeded). The ISR body writes in -> isr_g (0x21), calls the
+    // helper (in+1 -> hlp_g 0x22), then clobbers W/STATUS/FSR/PCLATH; the
+    // epilogue must restore every one of them from 0x75-0x78.
+    use pic14_sim::Pic14;
+    let words: Vec<u16> = vec![
+        0x2823, //  0: GOTO 35 (__start)
+        0x0000, //  1: .org 4 pad
+        0x0000, //  2
+        0x0000, //  3
+        0x00F5, //  4: MOVWF 0x75        save W
+        0x0E03, //  5: SWAPF STATUS, W   STATUS -> W without touching it
+        0x00F6, //  6: MOVWF 0x76        save SWAPF(STATUS)
+        0x080A, //  7: MOVF PCLATH, W
+        0x00F7, //  8: MOVWF 0x77        save PCLATH
+        0x0804, //  9: MOVF FSR, W
+        0x00F8, // 10: MOVWF 0x78        save FSR
+        0x3000, // 11: MOVLW 0x00
+        0x008A, // 12: MOVWF PCLATH     ISR body runs in page 0
+        0x0820, // 13: MOVF 0x20, W      body: W = in
+        0x00A1, // 14: MOVWF 0x21        isr_g = in (the ISR's global write)
+        0x00AA, // 15: MOVWF 0x2A        helper's param slot = in
+        0x3000, // 16: MOVLW 0x00        PAGE(helper)
+        0x008A, // 17: MOVWF PCLATH
+        0x2020, // 18: CALL 32           same-page helper
+        0x00A2, // 19: MOVWF 0x22        hlp_g = helper(in) = in + 1
+        0x30FF, // 20: MOVLW 0xFF        clobber W
+        0x0084, // 21: MOVWF FSR         clobber FSR
+        0x3018, // 22: MOVLW 0x18        clobber PCLATH
+        0x008A, // 23: MOVWF PCLATH
+        0x0877, // 24: MOVF 0x77, W      epilogue: W = saved PCLATH
+        0x008A, // 25: MOVWF PCLATH      restore PCLATH
+        0x0E76, // 26: SWAPF 0x76, W     W = swap(saved STATUS)
+        0x0083, // 27: MOVWF STATUS      restore STATUS
+        0x0878, // 28: MOVF 0x78, W      W = saved FSR
+        0x0084, // 29: MOVWF FSR         restore FSR
+        0x0875, // 30: MOVF 0x75, W      W = saved W (last: MOVF clobbers W)
+        0x0009, // 31: RETFIE
+        0x082A, // 32: helper: MOVF 0x2A, W
+        0x3E01, // 33: ADDLW 0x01        W = in + 1
+        0x0008, // 34: RETURN
+        0x3042, // 35: __start: MOVLW 0x42
+        0x3EFF, // 36: ADDLW 0xFF        W = 0x41, STATUS = 0x03 (interrupted ctx)
+        0x2004, // 37: CALL 4            "interrupt" — push 38, jump to vector
+        0x00A3, // 38: MOVWF 0x23        out_w = restored W (0x41)
+        0x080A, // 39: MOVF PCLATH, W
+        0x00A4, // 40: MOVWF 0x24        out_pclath = restored PCLATH (0)
+        0x0804, // 41: MOVF FSR, W
+        0x00A5, // 42: MOVWF 0x25        out_fsr = restored FSR (0x12)
+        0x0803, // 43: MOVF STATUS, W
+        0x00A6, // 44: MOVWF 0x26        out_status = restored STATUS (0x03)
+        0x282E, // 45: GOTO 46           needs the restored PCLATH = 0
+        0x0063, // 46: SLEEP
+    ];
+    let mut p = Pic14::new(words);
+    p.ram_mut()[0x20] = 0x42; // in
+    p.ram_mut()[0x04] = 0x12; // the interrupted context's FSR
+    p.run(1000);
+    assert!(p.halted(), "program must SLEEP-halt");
+    // The ISR body's writes: its own global and the same-page helper result.
+    assert_eq!(p.ram()[0x21], 0x42, "isr_g = in (the ISR ran)");
+    assert_eq!(p.ram()[0x22], 0x43, "hlp_g = helper(in) = in + 1 (same-page call from the ISR)");
+    // The interrupted computation completes: every restored register lands.
+    assert_eq!(p.ram()[0x23], 0x41, "out_w = restored W (body left W = 0xFF)");
+    assert_eq!(p.ram()[0x24], 0x00, "out_pclath = restored PCLATH (body left 0x18)");
+    assert_eq!(p.ram()[0x25], 0x12, "out_fsr = restored FSR (body left 0xFF)");
+    assert_eq!(p.ram()[0x26], 0x03, "out_status = restored STATUS (body left 0x00)");
+    // The save area (fixed common RAM 0x75-0x78, disjoint from scratch 0x70
+    // and retval 0x71-0x74): W, SWAPF(STATUS), PCLATH, FSR at vector entry.
+    assert_eq!(p.ram()[0x75], 0x41, "saved W");
+    assert_eq!(p.ram()[0x76], 0x30, "saved STATUS nibble-swapped (0x03 -> 0x30)");
+    assert_eq!(p.ram()[0x77], 0x00, "saved PCLATH");
+    assert_eq!(p.ram()[0x78], 0x12, "saved FSR");
+}

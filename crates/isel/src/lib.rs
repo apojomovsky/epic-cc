@@ -86,6 +86,18 @@ fn is_routine_name(name: &str) -> bool {
     ROUTINE_NAMES.contains(&name)
 }
 
+/// The byte address of a literal-pointer operand (`"0x<K>"` — the
+/// `inttoptr (<ty> <k> to ptr)` constant-pointer form parsed by irparse).
+/// Used for direct (SFR) load/store: the register is bank-mirrored
+/// (0x00-0x1F) or common RAM (0x70-0x7F), so no FSR setup and no BANKSEL.
+fn literal_ptr_addr(ptr: &str) -> u16 {
+    let lit = ptr
+        .strip_prefix("0x")
+        .unwrap_or_else(|| panic!("isel: malformed literal pointer {ptr:?}"));
+    u16::from_str_radix(lit, 16)
+        .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
+}
+
 /// A resolved GEP base: a named global (`@g`) or a local slot. A slot may
 /// be *indirect* (an sret param): it holds the target address, so FSR is
 /// taken from its contents rather than the slot itself being the base.
@@ -1353,10 +1365,17 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
                         self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
                     }
-                } else if let Some(_lit) = l.ptr.strip_prefix("0x") {
-                    // A literal (SFR) pointer from `inttoptr` — the direct
-                    // SFR load lands in a later milestone.
-                    panic!("isel: literal-pointer (SFR) load from {} not yet supported (milestone 13, task 2)", l.ptr);
+                } else if l.ptr.starts_with("0x") {
+                    // A literal (SFR) pointer from `inttoptr`: the register
+                    // is bank-mirrored (SFR 0x00-0x1F) or common RAM
+                    // (0x70-0x7F) — a direct MOVF with no FSR setup and no
+                    // BANKSEL. (A literal into a GPR window keeps the plain
+                    // direct access too; the banking pass handles it.)
+                    let base = literal_ptr_addr(&l.ptr);
+                    for k in 0..l.ty.bytes() {
+                        self.emit(format!("    MOVF 0x{:02X}, W", base + u16::from(k)));
+                        self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
+                    }
                 } else {
                     // A GEP-created pointer: const (flash) bases keep the
                     // RETLW path (i8 only); RAM bases go through the shared
@@ -1382,10 +1401,15 @@ impl<'m> Gen<'m> {
                 if let Some(g) = s.ptr.strip_prefix('@') {
                     let dst = self.global_addr(g);
                     self.emit_move_val_to_slot(&s.val, s.ty, dst);
-                } else if let Some(_lit) = s.ptr.strip_prefix("0x") {
-                    // A literal (SFR) pointer from `inttoptr` — the direct
-                    // SFR store lands in a later milestone.
-                    panic!("isel: literal-pointer (SFR) store to {} not yet supported (milestone 13, task 2)", s.ptr);
+                } else if s.ptr.starts_with("0x") {
+                    // A literal (SFR) pointer from `inttoptr` — a direct
+                    // MOVWF, no FSR setup, no BANKSEL (bank-mirrored SFR or
+                    // common RAM).
+                    let base = literal_ptr_addr(&s.ptr);
+                    for k in 0..s.ty.bytes() {
+                        self.emit_load_byte(&s.val, k);
+                        self.emit(format!("    MOVWF 0x{:02X}", base + u16::from(k)));
+                    }
                 } else {
                     let r = s.ptr.strip_prefix('%').unwrap_or_else(|| {
                         panic!("isel: pointer {:?} is not @global, %reg or a literal", s.ptr)
@@ -2471,8 +2495,27 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             }
         }
     }
-    for b in &f.blocks {
+    for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
+        if i == 0 && f.isr {
+            // The ISR save prologue, right after the vector entry (word 4):
+            // W into 0x75 (MOVWF doesn't clobber W), STATUS into 0x76
+            // nibble-swapped (SWAPF reads STATUS without touching it),
+            // PCLATH and FSR into 0x77/0x78, then PCLATH = 0 so the ISR
+            // body's GOTOs stay in page 0 (the M11 restore literal is
+            // PAGE(isr) = 0). The save area is fixed common RAM
+            // (0x75-0x78), disjoint from the scratch byte (0x70) and the
+            // retval region (0x71-0x74).
+            g.emit("    MOVWF 0x75");
+            g.emit("    SWAPF STATUS, W");
+            g.emit("    MOVWF 0x76");
+            g.emit("    MOVF PCLATH, W");
+            g.emit("    MOVWF 0x77");
+            g.emit("    MOVF FSR, W");
+            g.emit("    MOVWF 0x78");
+            g.emit("    MOVLW 0x00");
+            g.emit("    MOVWF PCLATH");
+        }
         let mut terminator = None;
         for i in &b.insts {
             match i {
@@ -2533,7 +2576,32 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             }
         }
         if let Some(t) = terminator {
-            g.emit_terminator(t, &labels);
+            if f.isr {
+                match t {
+                    // The restore epilogue replaces the ISR's `ret`:
+                    // PCLATH first (the resumed code's next CALL/GOTO must
+                    // see the interrupted page), STATUS via the swap-back,
+                    // then FSR, then W — W last, since MOVF clobbers W —
+                    // and RETFIE, which pops the hardware-pushed return.
+                    Inst::Ret(None) => {
+                        g.emit("    MOVF 0x77, W");
+                        g.emit("    MOVWF PCLATH");
+                        g.emit("    SWAPF 0x76, W");
+                        g.emit("    MOVWF STATUS");
+                        g.emit("    MOVF 0x78, W");
+                        g.emit("    MOVWF FSR");
+                        g.emit("    MOVF 0x75, W");
+                        g.emit("    RETFIE");
+                    }
+                    Inst::Ret(Some(_)) => panic!(
+                        "isel: interrupt handler @{} must be void (cannot return a value)",
+                        f.name
+                    ),
+                    _ => g.emit_terminator(t, &labels),
+                }
+            } else {
+                g.emit_terminator(t, &labels);
+            }
         }
     }
     g.emit("".to_string());
@@ -2687,21 +2755,47 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 /// same-page restores skipped (the pads pin the page bases, so the elision
 /// never moves a function off its assigned page).
 pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
-    // Interrupt handlers are not yet lowered (the vector entry, save
-    // prologue, restore epilogue and RETFIE land in a later milestone).
-    for f in &m.funcs {
-        assert!(!f.isr, "isel: interrupt (isr) function @{} not yet supported (milestone 13, task 2)", f.name);
-    }
+    // The F877A has ONE interrupt vector at word 0x0004 (the hardware pushes
+    // the return PC and clears GIE; PCLATH is untouched). The vector IS the
+    // ISR entry — no GOTO, since a GOTO's target page would depend on the
+    // interrupted PCLATH (unknowable) — so the ISR is emitted FIRST with a
+    // `.org 4` pad (words 2-3 after the reset entry), and `__start` moves
+    // after it. A second ISR would fight over the single vector: panic
+    // loudly.
+    let isr_names: Vec<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
+    assert!(
+        isr_names.len() <= 1,
+        "isel: {} interrupt handlers ({}) — the PIC16F877A has a single vector at word 4",
+        isr_names.len(),
+        isr_names.join(", ")
+    );
+    let has_isr = !isr_names.is_empty();
     // The icmp scratch byte and the four retval bytes are fixed common-RAM
     // constants (bank-independent, common RAM 0x70-0x7F is never used by
     // locals, so no collision). The widened i32 region (0x71-0x74) must not
-    // overrun common RAM nor overlap the scratch byte.
+    // overrun common RAM nor overlap the scratch byte — and the ISR save
+    // area (0x75-0x78: W, STATUS, PCLATH, FSR) must sit right after the
+    // retval region, disjoint from it and from scratch.
     let scratch: u16 = 0x70;
     let retval_lo: u16 = 0x71;
     assert!(
         retval_lo + 4 <= 0x80,
         "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must fit in common RAM",
         retval_lo + 3
+    );
+    assert!(
+        retval_lo + 4 <= 0x75,
+        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must not overlap the ISR save area 0x75-0x78",
+        retval_lo + 3
+    );
+    assert!(
+        0x78 + 1 <= 0x80,
+        "isel: ISR save area 0x75-0x78 must fit in common RAM"
     );
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
@@ -2716,13 +2810,21 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
         "".to_string(),
-        "__start:".to_string(),
-        "    MOVLW PAGE(main)".to_string(),
-        "    MOVWF PCLATH".to_string(),
-        "    CALL main".to_string(),
-        "    SLEEP".to_string(),
-        "".to_string(),
     ];
+    if !has_isr {
+        // No ISR: `__start` sits at the top (word 2) so the reset vector's
+        // GOTO (PCLATH = 0 at reset) always reaches it — byte-identical to
+        // the pre-interrupt layout. With an ISR the vector owns word 4, so
+        // `__start` is emitted after the ISR body instead (see pass B).
+        out.extend([
+            "__start:".to_string(),
+            "    MOVLW PAGE(main)".to_string(),
+            "    MOVWF PCLATH".to_string(),
+            "    CALL main".to_string(),
+            "    SLEEP".to_string(),
+            "".to_string(),
+        ]);
+    }
     // Phase-3 pointers: collect every GEP and resolve its chain eagerly to a
     // folded `(base, k, terms)`, keyed `{func}::{reg}` like every other
     // local. Seeds first: a byval param slot IS the struct copy
@@ -2829,10 +2931,15 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // placement depends on sizes measured later), so pass A measures and
     // assigns first; pass B (below) emits the final text with every
     // function's page known.
+    // Emission order: the ISR first (it owns the vector at word 4), then
+    // every other function in module order.
+    let mut order: Vec<&ir::Func> = Vec::with_capacity(m.funcs.len());
+    order.extend(m.funcs.iter().filter(|f| f.isr));
+    order.extend(m.funcs.iter().filter(|f| !f.isr));
     let mut bodies: Vec<(String, usize)> = Vec::new();
     {
         let mut tmp = 0u32;
-        for f in &m.funcs {
+        for f in &order {
             let mut g = Gen {
                 m,
                 addrs,
@@ -2848,21 +2955,36 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             bodies.push((f.name.clone(), word_size(&g.out)));
         }
     }
-    // Greedy page assignment over every function's pass-A size, in module
+    // Greedy page assignment over every function's pass-A size, in emission
     // order: the `.org` pads and the page each function lands on. The
-    // running word address starts at 5 — the reset vector (1 word: `goto
-    // __start`) plus the `__start` body (4 words). `__start` sits at the top
-    // so the reset vector's GOTO (PCLATH = 0 at reset) always reaches it — a
-    // multi-page program would strand it past 0x800 otherwise.
+    // running word address starts at 5 without an ISR — the reset vector (1
+    // word: `goto __start`) plus the `__start` body (4 words), with
+    // `__start` at the top so the reset vector's GOTO (PCLATH = 0 at reset)
+    // always reaches it. With an ISR the vector owns word 4: the ISR is
+    // pinned there (no page pad — the vector IS the entry), `__start` moves
+    // right after it, and the rest of the program follows. The ISR must fit
+    // page 0 (0x004-0x7FF) AND leave `__start` inside page 0 — the reset
+    // GOTO runs with PCLATH = 0, so a `__start` at 0x800+ would be
+    // unreachable; it panics loudly (ISRs are usually small).
     let mut pages: HashMap<String, usize> = HashMap::new();
     let mut pads: HashMap<String, usize> = HashMap::new();
-    let mut addr: usize = 5;
+    let mut addr: usize = if has_isr { 4 } else { 5 };
     for (name, size) in &bodies {
-        let (pad, page, next) = page_step(addr, *size, name);
-        addr = next;
-        pages.insert(name.clone(), page);
-        if let Some(p) = pad {
-            pads.insert(name.clone(), p);
+        if has_isr && name == isr_names[0] {
+            assert!(
+                4 + size <= 0x7FF,
+                "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
+            );
+            pages.insert(name.clone(), 0);
+            pads.insert(name.clone(), 4);
+            addr = 4 + size + 4; // the ISR body + the 4-word __start body
+        } else {
+            let (pad, page, next) = page_step(addr, *size, name);
+            addr = next;
+            pages.insert(name.clone(), page);
+            if let Some(p) = pad {
+                pads.insert(name.clone(), p);
+            }
         }
     }
     // Const-table readers: the page PCLATH holds after each `__read_*` CALL
@@ -2881,8 +3003,8 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // bodies — page-membership-stable).
     {
         let mut tmp = 0u32;
-        let mut addr_b: usize = 5;
-        for (f, (name, _)) in m.funcs.iter().zip(&bodies) {
+        let mut addr_b: usize = if has_isr { 4 } else { 5 };
+        for (f, (name, _)) in order.iter().zip(&bodies) {
             let mut g = Gen {
                 m,
                 addrs,
@@ -2901,6 +3023,20 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             }
             addr_b += word_size(&g.out);
             out.extend(g.out);
+            if f.isr {
+                // `__start` moves after the ISR (the vector owns word 4):
+                // the reset GOTO at word 0 still reaches it — page 0, by
+                // the ISR fit check above.
+                out.extend([
+                    "__start:".to_string(),
+                    "    MOVLW PAGE(main)".to_string(),
+                    "    MOVWF PCLATH".to_string(),
+                    "    CALL main".to_string(),
+                    "    SLEEP".to_string(),
+                    "".to_string(),
+                ]);
+                addr_b += 4;
+            }
         }
         // Pin the const-table section to its pass-A `table_start` whenever
         // the pass-B elision would move a reader base across a page
