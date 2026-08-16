@@ -338,3 +338,27 @@ fn no_shared_function_means_no_duplication() {
     assert_eq!(call_targets(func("isr", &m2)), ["isr_private"]);
     assert_eq!(call_targets(func("main", &m2)), ["helper"]);
 }
+
+/// main is excluded from the shared-function duplication, so an ISR that
+/// (transitively) calls main would leave the ISR's call on the original
+/// `main` — re-entering the main context and silently collapsing the
+/// disjoint-region guarantee. duplicate_isr_shared must panic loudly
+/// instead of miscompiling.
+#[test]
+#[should_panic(expected = "re-entrant main is unsupported")]
+fn isr_context_reaching_main_panics_loudly() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @main()\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    let _ = legalize(m);
+}

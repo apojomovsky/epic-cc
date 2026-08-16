@@ -124,6 +124,14 @@ fn duplicate_isr_shared(m: Module) -> Module {
     // itself, never main) is duplicated.
     let isr_ctx = isr_names.iter().flat_map(|r| reachable(&[r], &adj)).collect::<HashSet<String>>();
     let main_ctx = reachable(&["main"], &adj);
+    // main is excluded from the duplication above, so an ISR that
+    // (transitively) calls main would leave the ISR's call on the original
+    // `main` — re-entering the main context and silently collapsing the
+    // disjoint-region guarantee. Panic loudly rather than miscompile.
+    assert!(
+        !isr_ctx.contains("main"),
+        "isel/legalize: the ISR context must not reach main — re-entrant main is unsupported"
+    );
     let shared: Vec<String> = m
         .funcs
         .iter()
