@@ -3854,3 +3854,136 @@ fn panics_when_function_would_start_past_page_3() {
     let refs: Vec<(&str, u16)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     let _ = select(&m, &addrs(&refs));
 }
+
+// ---- Milestone 11 final wave: page-aligned anchors and the table pin ----
+
+#[test]
+fn exact_boundary_function_stays_anchored_after_elision() {
+    // F1 regression: `main`'s pass-A size lands EXACTLY on the page-1
+    // boundary (5-word header + 1-word f0 + 1-word f1 + 22 non-pad words +
+    // 673 self-add chains = 2048 words), so `helper` would start at 0x800
+    // as an exact-boundary CONTINUATION — the strict
+    // `addr + size > page_end` overflow check alone emits no pad for it.
+    // Pass B elides `main`'s same-page f0 restore (2 words), which would
+    // otherwise slide `helper` below the boundary into a straddle: its
+    // label would resolve to page 0 while its body straddles into page 1,
+    // and its intra-function GOTOs (PAGE(helper) from the label) would
+    // misbranch. The page-aligned-start anchor must still emit `.org 0x800`
+    // and pin the final addresses to pass A's.
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn f0(void) ()\n  block entry:\n    ret void\n\
+         fn f1(void) ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    call void @f0()\n{}\
+         \x20   %2 = call i8 @helper(i8 %1)\n    %3 = add i8 %2, 0\n    store i8 %3 @out\n    ret void\n\
+         fn helper(i8) (x)\n  block entry:\n    %c = icmp eq i8 %x, 0\n    br i1 %c then else\n\
+         block then:\n    %v = add i8 %x, 100\n    br end\n\
+         block else:\n    br end\n\
+         block end:\n    %p = phi i8 %v then %x else\n    ret i8 %p\n",
+        pad_body(673)
+    ));
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x26),
+        ("main::3", 0x27),
+        ("main::a", 0x28),
+        ("helper::x", 0x30),
+        ("helper::c", 0x31),
+        ("helper::v", 0x32),
+        ("helper::p", 0x33),
+    ]);
+    let asm = select(&m, &addrs);
+    // The anchor: `.org 0x800` before helper, pinning it to the boundary.
+    assert!(asm.contains("    org 0x0800"), "exact-boundary anchor missing:\n{asm}");
+    assert_eq!(label_addr(&asm, "helper"), 0x800, "helper must be pinned to 0x800:\n{asm}");
+    assert!(label_addr(&asm, "main") < 0x800, "main stays in page 0:\n{asm}");
+    // The elision really happens (main's same-page f0 call loses its
+    // restore) — that is the drift that would unanchor helper without the
+    // fix. `MOVLW PAGE(main)` appears exactly twice: __start's set and the
+    // cross-page helper-call restore; f0's restore would be a third.
+    assert!(
+        !asm.contains("CALL f0\n    MOVLW PAGE(main)"),
+        "same-page f0 restore must be elided:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVLW PAGE(main)").count(),
+        2,
+        "exactly __start's set + the helper restore:\n{asm}"
+    );
+    // The cross-page helper call keeps the restore (page 0 -> page 1).
+    assert!(
+        asm.contains("CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page helper call keeps the restore:\n{asm}"
+    );
+    // Load-bearing sim: helper's intra-function GOTO (after the cross-page
+    // CALL) branches in page 1. in == 0 -> helper(0) = 100 (then arm) and
+    // in == 5 -> helper(5) = 5 (else arm) — both branch paths exercised
+    // with PCLATH = page 1 held across them.
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 0)], 0x21), 100, "in=0 -> helper(0)=100:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 5)], 0x21), 5, "in=5 -> helper(5)=5:\n{asm}");
+}
+
+#[test]
+fn table_section_pinned_to_pass_a_start_after_elision() {
+    // F2 regression: `reader_pages` maps every reader entry's page from the
+    // pass-A `table_start`, but pass B emits the tables at the post-elision
+    // position. Here the pass-A section starts at 0x7FA — a few words short
+    // of the 0x800 boundary — so the small table's base (reader entry + 6
+    // words, no align) sits EXACTLY at 0x800 (page 1): the mapped page.
+    // main and last both elide their same-page h0 restores (4 words), which
+    // pulls the base back to 0x7FC (page 0) without the pin — the final
+    // layout no longer matches the map (a caller that trusted it would skip
+    // a needed restore). The `.org 0x7FA` pin must hold the section at the
+    // pass-A start so the assembled reader base's page matches
+    // `reader_pages`.
+    let m = module_with_globals(
+        &format!(
+            "global in i8\nglobal out i8\nconst t i8\n\
+             fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = call i8 @h0(i8 %1)\n\
+             \x20   %p = gep @t +0 +1*%1\n    %v = load i8 %p\n    %s = add i8 %2, %v\n\
+             \x20   store i8 %s @out\n    ret void\n\
+             fn h0(i8) (x)\n  block entry:\n    %r = xor i8 %x, %x\n    ret i8 %r\n\
+             fn last(void) ()\n  block entry:\n{}    %1 = call i8 @h0(i8 7)\n    ret void\n",
+            pad_body(665)
+        ),
+        vec![const_table_global("t", 200)],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x26),
+        ("main::v", 0x27),
+        ("main::s", 0x28),
+        ("h0::x", 0x2A),
+        ("h0::r", 0x2B),
+        ("last::1", 0x30),
+        ("last::a", 0x31),
+    ]);
+    let asm = select(&m, &addrs);
+    // The pin: `.org 0x7FA` immediately before the reader entry — the
+    // pass-A table start, not the drifted post-elision position.
+    assert!(asm.contains("    org 0x07FA"), "table-section pin missing:\n{asm}");
+    assert_eq!(label_addr(&asm, "__read_t"), 0x7FA, "reader pinned to the pass-A start:\n{asm}");
+    // The table base stays exactly at the page boundary, so its page
+    // matches the reader_pages map (page 1).
+    assert_eq!(label_addr(&asm, "t"), 0x800, "table base pinned to 0x800:\n{asm}");
+    assert_eq!(label_addr(&asm, "t") >> 11, 1, "base page matches the reader_pages map:\n{asm}");
+    // The elision really happens in the last function (the drift source).
+    assert!(
+        !asm.contains("CALL h0\n    MOVLW PAGE(last)"),
+        "last's same-page h0 restore must be elided:\n{asm}"
+    );
+    // main's const read is cross-page (0 -> 1) and keeps its restore.
+    assert!(
+        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page table read keeps the restore:\n{asm}"
+    );
+    // Load-bearing sim: the pinned table reads correctly (h0(x) = 0, so
+    // out == t[in]).
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 0)], 0x21), 0x00, "t[0]=0:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 3)], 0x21), 0x03, "t[3]=3:\n{asm}");
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 199)], 0x21), 0xC7, "t[199]=0xC7:\n{asm}");
+}
