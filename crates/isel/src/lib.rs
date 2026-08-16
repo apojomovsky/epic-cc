@@ -2808,8 +2808,8 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     // constants (bank-independent, common RAM 0x70-0x7F is never used by
     // locals, so no collision). The widened i32 region (0x71-0x74) must not
     // overrun common RAM nor overlap the scratch byte — and the ISR save
-    // area (0x75-0x78: W, STATUS, PCLATH, FSR) must sit right after the
-    // retval region, disjoint from it and from scratch.
+    // area (0x75-0x7C: W, STATUS, PCLATH, FSR, retval x4) must sit right
+    // after the retval region, disjoint from it and from scratch.
     let scratch: u16 = 0x70;
     let retval_lo: u16 = 0x71;
     assert!(
@@ -2819,12 +2819,12 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
     );
     assert!(
         retval_lo + 4 <= 0x75,
-        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must not overlap the ISR save area 0x75-0x78",
+        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must not overlap the ISR save area 0x75-0x7C",
         retval_lo + 3
     );
     assert!(
-        0x78 + 1 <= 0x80,
-        "isel: ISR save area 0x75-0x78 must fit in common RAM"
+        0x7C + 1 <= 0x80,
+        "isel: ISR save area 0x75-0x7C must fit in common RAM"
     );
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
