@@ -616,6 +616,14 @@ pub fn parse_ll(src: &str) -> Module {
         if line.starts_with('@') {
             let eq = line.find('=').unwrap();
             let name = line[1..eq].trim().to_string();
+            // LLVM bookkeeping globals (`@llvm.used`, `@llvm.compiler.used`,
+            // ...) carry `[N x ptr]` types we do not model — clang emits
+            // them for address-taken symbols like the interrupt handler.
+            // They are metadata for the backend, never PIC8 data, so skip
+            // them like the `llvm.lifetime.*` call skip.
+            if name.starts_with("llvm.") {
+                continue;
+            }
             let after = line[eq + 1..].trim();
             let (is_const, rest) = if let Some(i) = after.find("global ") {
                 (false, &after[i + "global ".len()..])
