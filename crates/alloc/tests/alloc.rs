@@ -413,6 +413,26 @@ fn alloca_byval_and_sret_params_get_full_widths_params_first() {
 }
 
 #[test]
+fn i32_param_and_def_get_four_bytes() {
+    // Milestone 12: alloc is ty.bytes()-driven — an i32 scalar param and an
+    // i32 def must each consume a full 4-byte slot (no intra-frame alignment,
+    // exactly like the i16 slots in params_are_frame_locals_too).
+    let m = parse(
+        "fn f(i32) (p=i32)\n\
+           block entry:\n\
+             %q = add i32 %p, 1\n\
+             %r = add i32 %q, 2\n\
+             ret void\n",
+    );
+    let out = allocate(&m, "depth 1\n");
+    // p i32 at 0x20, q at 0x24, r at 0x28 — contiguous 4-byte slots.
+    assert_eq!(out.locals["f::p"], 0x20);
+    assert_eq!(out.locals["f::q"], 0x24);
+    assert_eq!(out.locals["f::r"], 0x28);
+    assert_eq!(out.total_bank0, 4 + 4 + 4);
+}
+
+#[test]
 #[should_panic(expected = "0x1EF")]
 fn frame_exceeding_all_banks_panics() {
     // 250 i16 locals = 500 bytes, more than the 320 GPR bytes across all four

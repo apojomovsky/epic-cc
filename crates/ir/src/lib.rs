@@ -2,9 +2,9 @@
 //! every stage reads IR text in and writes IR text out.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ty { I1, I8, I16 }
+pub enum Ty { I1, I8, I16, I32 }
 impl Ty {
-    pub fn bytes(self) -> u8 { match self { Ty::I1 | Ty::I8 => 1, Ty::I16 => 2 } }
+    pub fn bytes(self) -> u8 { match self { Ty::I1 | Ty::I8 => 1, Ty::I16 => 2, Ty::I32 => 4 } }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -117,6 +117,7 @@ fn param_str(p: &Param) -> String {
         match p.width {
             1 => format!("{}=i8", p.name),
             2 => format!("{}=i16", p.name),
+            4 => format!("{}=i32", p.name),
             w => panic!("ir: cannot serialize scalar param {} with width {w}", p.name),
         }
     }
@@ -142,7 +143,7 @@ pub fn serialize(m: &Module) -> String {
     out
 }
 
-fn ty_str(t: Ty) -> String { match t { Ty::I1 => "i1".into(), Ty::I8 => "i8".into(), Ty::I16 => "i16".into() } }
+fn ty_str(t: Ty) -> String { match t { Ty::I1 => "i1".into(), Ty::I8 => "i8".into(), Ty::I16 => "i16".into(), Ty::I32 => "i32".into() } }
 
 fn inst_str(i: &Inst) -> String {
     match i {
@@ -269,7 +270,7 @@ pub fn parse(text: &str) -> Module {
     Module { globals, funcs }
 }
 
-fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, other => panic!("unsupported type {other}") } }
+fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, other => panic!("unsupported type {other}") } }
 fn parse_addr(s: &str) -> Option<u8> { s.strip_prefix('@').map(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).unwrap()) }
 fn parse_val(s: &str) -> Val {
     let s = s.trim_end_matches(',');
@@ -293,7 +294,7 @@ fn parse_param(s: &str) -> Param {
         Param { name, width: n, byval: Some(n), sret: false }
     } else if rest == "sret" {
         Param { name, width: 2, byval: None, sret: true }
-    } else if matches!(rest, "i1" | "i8" | "i16") {
+    } else if matches!(rest, "i1" | "i8" | "i16" | "i32") {
         Param { name, width: parse_ty(rest).bytes(), byval: None, sret: false }
     } else if rest.is_empty() {
         Param { name, width: 1, byval: None, sret: false }
@@ -310,7 +311,7 @@ fn parse_call_arg(s: &str) -> CallArg {
     let mut val_tok = None;
     for tok in s.trim().split_whitespace() {
         match tok {
-            "i1" | "i8" | "i16" => ty = Some(parse_ty(tok)),
+            "i1" | "i8" | "i16" | "i32" => ty = Some(parse_ty(tok)),
             _ => {
                 if let Some(n) = tok.strip_prefix("byval") {
                     byval = Some(n.parse().unwrap());

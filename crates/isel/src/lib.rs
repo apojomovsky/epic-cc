@@ -1090,6 +1090,14 @@ impl<'m> Gen<'m> {
         self.emit_pclath_restore(func);
         if let Some(d) = dst {
             let t = ty.expect("isel: valued call must carry a type");
+            // The fixed retval region is 2 bytes (0x71/0x72) until Task 2
+            // widens it to 0x71-0x74; an i32 return cannot be copied without
+            // overrunning the region, so panic loudly rather than silently
+            // truncating (Task 2's emit_call lands the 4-byte copy).
+            assert!(
+                t.bytes() != 4,
+                "isel: i32 call return not implemented (Task 2 widens the 2-byte retval region)"
+            );
             let da = self.slot_addr(self.cur_func, d);
             for i in 0..t.bytes() {
                 self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + u16::from(i)));
@@ -1164,6 +1172,14 @@ impl<'m> Gen<'m> {
             }
             Inst::Bin(b) => {
                 assert!(b.ty != Ty::I1, "isel: only i8/i16 binops supported");
+                // Task 1 lands the type; i32 binops need the 4-byte carry
+                // chains (Task 2). Panic loudly rather than fall through to a
+                // 16-bit recipe that would silently miscompile.
+                assert!(
+                    b.ty != Ty::I32,
+                    "isel: i32 binop {:?} not implemented (Task 2 lands the 4-byte chains)",
+                    b.op
+                );
                 let da = self.slot_addr(self.cur_func, &b.dst);
                 match (b.op, b.ty) {
                     (BinOp::Add, Ty::I16) => self.emit_add16(&b.a, &b.b, da),
@@ -1363,6 +1379,13 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Icmp(ic) => {
+                // Task 1 lands the type; the i32 ordering's Z-accumulation
+                // (the 16-bit special case at the need_z test) is Task 2.
+                // Panic loudly rather than silently miscompile ugt/ule/sgt/sle.
+                assert!(
+                    ic.ty != Ty::I32,
+                    "isel: i32 icmp not implemented (Task 2 generalizes the Z special case)"
+                );
                 let da = self.slot_addr(self.cur_func, &ic.dst);
                 match ic.pred.as_str() {
                     "eq" => {
@@ -1426,6 +1449,12 @@ impl<'m> Gen<'m> {
             Inst::Ret(None) => self.emit("    RETURN".to_string()),
             Inst::Ret(Some((ty, v))) => {
                 // Copy the value into the fixed retval slots, then RETURN.
+                // The retval region is 2 bytes (0x71/0x72) until Task 2
+                // widens it; an i32 return would overrun it, so panic loudly.
+                assert!(
+                    ty.bytes() != 4,
+                    "isel: i32 ret not implemented (Task 2 widens the 2-byte retval region)"
+                );
                 for i in 0..ty.bytes() {
                     self.emit_load_byte(v, i);
                     self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo + u16::from(i)));

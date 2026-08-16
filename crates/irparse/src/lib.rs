@@ -53,6 +53,7 @@ fn ty_of(s: &str) -> Ty {
         "i1" => Ty::I1,
         "i8" => Ty::I8,
         "i16" => Ty::I16,
+        "i32" => Ty::I32,
         other => panic!("SPIKE: unsupported type {other:?}"),
     }
 }
@@ -214,6 +215,7 @@ fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
         match t {
             "i1" | "i8" => (1, 1),
             "i16" => (2, 2),
+            "i32" => (4, 2),
             other => panic!("irparse: unsupported type {other:?}"),
         }
     }
@@ -237,6 +239,7 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
         match t {
             "i1" | "i8" => Some((1, 1)),
             "i16" => Some((2, 2)),
+            "i32" => Some((4, 2)),
             _ => None,
         }
     }
@@ -498,7 +501,7 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
             }
             match t.as_str() {
                 "ptr" => {}
-                "i1" | "i8" | "i16" => ty = Some(ty_of(t)),
+                "i1" | "i8" | "i16" | "i32" => ty = Some(ty_of(t)),
                 "align" => skip_next = true,
                 "noundef" | "nonnull" | "noalias" | "nocapture" | "readonly" | "writeonly"
                 | "writable" | "dead_on_unwind" | "immarg" | "zeroext" | "signext" => {}
@@ -541,7 +544,7 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
             "ptr" | "dead_on_unwind" | "noalias" | "nocapture" | "writable" | "writeonly"
             | "readonly" | "nonnull" | "noundef" | "zeroext" | "signext" | "immarg" | "sret" | "byval" => {}
             "align" => skip_next = true,
-            "i1" | "i8" | "i16" => scalar = Some(ty_of(t)),
+            "i1" | "i8" | "i16" | "i32" => scalar = Some(ty_of(t)),
             _ => {
                 if let Some(rest) = t.strip_prefix("byval(") {
                     let inner = rest.trim_end_matches(')');
