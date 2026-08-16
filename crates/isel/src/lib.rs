@@ -1353,12 +1353,16 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
                         self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
                     }
+                } else if let Some(_lit) = l.ptr.strip_prefix("0x") {
+                    // A literal (SFR) pointer from `inttoptr` — the direct
+                    // SFR load lands in a later milestone.
+                    panic!("isel: literal-pointer (SFR) load from {} not yet supported (milestone 13, task 2)", l.ptr);
                 } else {
                     // A GEP-created pointer: const (flash) bases keep the
                     // RETLW path (i8 only); RAM bases go through the shared
                     // byte machinery (direct or FSR/INDF).
                     let r = l.ptr.strip_prefix('%').unwrap_or_else(|| {
-                        panic!("isel: pointer {:?} is not @global or %reg", l.ptr)
+                        panic!("isel: pointer {:?} is not @global, %reg or a literal", l.ptr)
                     });
                     let ptr = Val::Reg(r.to_string());
                     if let (Base::Global(name), _, _) = self.resolved_for(r) {
@@ -1378,9 +1382,13 @@ impl<'m> Gen<'m> {
                 if let Some(g) = s.ptr.strip_prefix('@') {
                     let dst = self.global_addr(g);
                     self.emit_move_val_to_slot(&s.val, s.ty, dst);
+                } else if let Some(_lit) = s.ptr.strip_prefix("0x") {
+                    // A literal (SFR) pointer from `inttoptr` — the direct
+                    // SFR store lands in a later milestone.
+                    panic!("isel: literal-pointer (SFR) store to {} not yet supported (milestone 13, task 2)", s.ptr);
                 } else {
                     let r = s.ptr.strip_prefix('%').unwrap_or_else(|| {
-                        panic!("isel: pointer {:?} is not @global or %reg", s.ptr)
+                        panic!("isel: pointer {:?} is not @global, %reg or a literal", s.ptr)
                     });
                     let (base, _, _) = self.resolved_for(r);
                     if let Base::Global(name) = &base {
@@ -2679,6 +2687,11 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 /// same-page restores skipped (the pads pin the page bases, so the elision
 /// never moves a function off its assigned page).
 pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
+    // Interrupt handlers are not yet lowered (the vector entry, save
+    // prologue, restore epilogue and RETFIE land in a later milestone).
+    for f in &m.funcs {
+        assert!(!f.isr, "isel: interrupt (isr) function @{} not yet supported (milestone 13, task 2)", f.name);
+    }
     // The icmp scratch byte and the four retval bytes are fixed common-RAM
     // constants (bank-independent, common RAM 0x70-0x7F is never used by
     // locals, so no collision). The widened i32 region (0x71-0x74) must not

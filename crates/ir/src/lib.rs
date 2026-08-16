@@ -94,7 +94,16 @@ pub struct Block { pub label: String, pub insts: Vec<Inst> }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Param { pub name: String, pub width: u8, pub byval: Option<u8>, pub sret: bool }
 #[derive(Clone, Debug)]
-pub struct Func { pub name: String, pub ret: Option<Ty>, pub params: Vec<Param>, pub blocks: Vec<Block> }
+pub struct Func {
+    pub name: String,
+    pub ret: Option<Ty>,
+    pub params: Vec<Param>,
+    pub blocks: Vec<Block>,
+    /// True for an interrupt handler (`msp430_intrcc` in the .ll return
+    /// position). Serialized as a `[isr]` marker between the ret group and
+    /// the params group: `fn isr(void) [isr] ()`.
+    pub isr: bool,
+}
 
 #[derive(Clone, Debug)]
 pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u16, pub bytes: Vec<u8>, pub addr: Option<u8> }
@@ -132,7 +141,8 @@ pub fn serialize(m: &Module) -> String {
     for f in &m.funcs {
         let ret = match f.ret { Some(t) => ty_str(t), None => "void".to_string() };
         let params: Vec<String> = f.params.iter().map(param_str).collect();
-        out.push_str(&format!("fn {}({ret}) ({})\n", f.name, params.join(", ")));
+        let marker = if f.isr { " [isr]" } else { "" };
+        out.push_str(&format!("fn {}({ret}){marker} ({})\n", f.name, params.join(", ")));
         for b in &f.blocks {
             out.push_str(&format!("  block {}:\n", b.label));
             for i in &b.insts {
@@ -243,6 +253,9 @@ pub fn parse(text: &str) -> Module {
             let ret_str = rest[open + 1..ret_close].trim();
             let after = &rest[ret_close + 1..];
             let p_open = after.find('(').expect("fn header must have a params group: fn <name>(<ret>) (<params>)");
+            // the optional `[isr]` marker lives between the ret group and
+            // the params group
+            let isr = after[..p_open].contains("[isr]");
             let p_close = matching_paren(after, p_open);
             let p_str = &after[p_open + 1..p_close];
             let ret = if ret_str == "void" { None } else { Some(parse_ty(ret_str)) };
@@ -251,7 +264,7 @@ pub fn parse(text: &str) -> Module {
             };
             if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
             if let Some(f) = cur_func.take() { funcs.push(f); }
-            cur_func = Some(Func { name, ret, params, blocks: Vec::new() });
+            cur_func = Some(Func { name, ret, params, blocks: Vec::new(), isr });
         } else if line.starts_with("block ") {
             if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
             let label = line["block ".len()..].trim_end_matches(':').to_string();

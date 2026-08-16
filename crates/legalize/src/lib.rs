@@ -45,7 +45,7 @@ pub fn legalize(m: Module) -> Module {
             }
             blocks.push(Block { label: b.label, insts });
         }
-        funcs.push(Func { name: f.name, ret: f.ret, params: f.params, blocks });
+        funcs.push(Func { name: f.name, ret: f.ret, params: f.params, blocks, isr: f.isr });
     }
     for name in &used {
         funcs.push(routine_func(name));
@@ -172,5 +172,6 @@ fn routine_func(name: &str) -> Func {
             label: "entry".into(),
             insts: vec![Inst::Alloca(Alloca { dst: "__scr".into(), size: scr })],
         }],
+        isr: false, // runtime routines are never interrupt handlers
     }
 }

@@ -359,12 +359,31 @@ fn parse_call_ptr_val(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &m
     }
 }
 
-/// Parse a load/store pointer operand (`ptr @g`, `ptr %r`, or an inlined
-/// GEP that gets materialized as a fresh Gep inst). Returns `"@name"` or
-/// `"%name"`.
+/// Parse a load/store pointer operand (`ptr @g`, `ptr %r`, an inlined GEP
+/// that gets materialized as a fresh Gep inst, or an `inttoptr (<ty> <k> to
+/// ptr)` constant pointer). Returns `"@name"`, `"%name"`, or the literal ptr
+/// form `"0x<K>"` (SFR access — distinct from `@global`/`%reg`).
 fn parse_ptr_operand(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec<Inst>) -> String {
     let b = arg.trim().strip_prefix("ptr").map(|x| x.trim()).unwrap_or(arg.trim());
-    if b.starts_with("getelementptr") {
+    if b.starts_with("inttoptr") {
+        // inttoptr (<ty> <k> to ptr) -> literal ptr form "0x<K>"
+        let open = b.find('(').unwrap_or_else(|| panic!("irparse: malformed inttoptr {b:?}"));
+        let inner = balanced_inner(&b[open + 1..]).unwrap_or_else(|| panic!("irparse: unbalanced inttoptr parens in {b:?}"));
+        let mut prev = "";
+        let mut k = None;
+        for t in inner.split_whitespace() {
+            if t == "to" {
+                k = Some(prev);
+                break;
+            }
+            prev = t;
+        }
+        let k: u8 = k
+            .unwrap_or_else(|| panic!("irparse: malformed inttoptr {b:?}"))
+            .parse()
+            .unwrap_or_else(|_| panic!("irparse: inttoptr address not a byte constant: {b:?}"));
+        format!("0x{k:02x}")
+    } else if b.starts_with("getelementptr") {
         let gsrc = &b["getelementptr".len()..];
         let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
         let n = fresh.reg();
@@ -659,7 +678,12 @@ pub fn parse_ll(src: &str) -> Module {
             let params_str = balanced_inner(&line[open + 1..]).unwrap();
             // Return type: strip attrs from everything before @name; the
             // last token is the type (zeroext/signext returns stripped here).
+            // The ISR hook is clang's `msp430_intrcc` calling-convention
+            // token in the return position (`define ... msp430_intrcc void
+            // @isr()`); the ret type stays void and `Func.isr` is set. It is
+            // not in strip_attrs' skip list, so it survives into `head`.
             let head = strip_attrs(&line[..at]);
+            let isr = head.split_whitespace().any(|t| t == "msp430_intrcc");
             let ret_tok = head.split_whitespace().last().unwrap().to_string();
             let ret = if ret_tok == "void" { None } else { Some(ty_of(&ret_tok)) };
 
@@ -694,7 +718,7 @@ pub fn parse_ll(src: &str) -> Module {
                 let insts = parse_inst(l, &types, &mut fresh);
                 blocks.last_mut().unwrap().insts.extend(insts);
             }
-            funcs.push(Func { name, ret, params, blocks });
+            funcs.push(Func { name, ret, params, blocks, isr });
         }
     }
     Module { globals, funcs }

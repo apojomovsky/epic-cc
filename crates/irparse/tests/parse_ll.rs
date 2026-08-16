@@ -790,6 +790,62 @@ fn parses_m3_m4_binops_and_freeze() {
     }
 }
 
+// Probe from /tmp/m7probe/i2.ll (trimmed): the interrupt marker
+// (`msp430_intrcc` in the return position) and SFR access via
+// `inttoptr (<ty> <k> to ptr)` constant pointers.
+const ISR_INTTOPTR: &str = r#"
+define dso_local msp430_intrcc void @isr() #0 {
+  store volatile i8 85, ptr inttoptr (i16 6 to ptr), align 2, !tbaa !2
+  ret void
+}
+
+define dso_local void @main() local_unnamed_addr #1 {
+  store volatile i8 17, ptr inttoptr (i16 6 to ptr), align 2, !tbaa !2
+  ret void
+}
+"#;
+
+#[test]
+fn parses_isr_marker_and_inttoptr() {
+    let m = parse_ll(ISR_INTTOPTR);
+    assert_eq!(m.funcs.len(), 2);
+    // the msp430_intrcc return token -> Func.isr == true, ret stays void
+    let isr = m.funcs.iter().find(|f| f.name == "isr").unwrap();
+    assert!(isr.isr, "msp430_intrcc must set Func.isr == true");
+    assert_eq!(isr.ret, None, "the ISR's ret type stays void");
+    // main is not an ISR
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    assert!(!main.isr);
+    assert_eq!(main.ret, None);
+    // the store's ptr is the literal inttoptr form
+    match &main.blocks[0].insts[0] {
+        Inst::Store(s) => assert_eq!(s.ptr, "0x06", "inttoptr (i16 6 to ptr) -> literal ptr '0x06'"),
+        other => panic!("expected Store, got {other:?}"),
+    }
+    match &isr.blocks[0].insts[0] {
+        Inst::Store(s) => assert_eq!(s.ptr, "0x06"),
+        other => panic!("expected Store, got {other:?}"),
+    }
+    // the canonical text round-trips: serialize -> parse -> serialize stable
+    let out = ir::serialize(&m);
+    assert!(out.contains("fn isr(void) [isr] ()"), "isr marker header\n---\n{out}");
+    assert!(out.contains("store i8 85 0x06"), "literal ptr store\n---\n{out}");
+    let m2 = ir::parse(&out);
+    assert_eq!(ir::serialize(&m2), out, "stable fixed point");
+    let m2isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    assert!(m2isr.isr, "isr marker must round-trip");
+}
+
+#[test]
+fn parses_inttoptr_load() {
+    let src = "define dso_local void @main() {\n  %1 = load volatile i8, ptr inttoptr (i16 6 to ptr), align 2\n  ret void\n}\n";
+    let m = parse_ll(src);
+    match &m.funcs[0].blocks[0].insts[0] {
+        Inst::Load(l) => assert_eq!(l.ptr, "0x06", "inttoptr load ptr -> literal '0x06'"),
+        other => panic!("expected Load, got {other:?}"),
+    }
+}
+
 // Milestone 10: 16-bit const table sizes. A `[N x i8] constant` table with
 // 256 <= N <= 511 parses (bytes = the literal, size = N); a const table > 511
 // bytes panics loudly; a RAM `[N x i8] global` array keeps N <= 255 (loud).
