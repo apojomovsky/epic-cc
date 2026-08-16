@@ -1849,8 +1849,8 @@ impl<'m> Gen<'m> {
     /// (copied by `emit_call`), the result goes to the fixed retval slots,
     /// and working state lives in `{func}::__scr` at the layout-contract
     /// offsets. Plain addresses only — the banking pass inserts BANKSELs.
-    /// Div-by-zero is LLVM poison: the loop runs (den = 0 ⇒ quotient 0xFFFF,
-    /// remainder 0), any value is legal — no guard, documented. The nine
+    /// Div-by-zero is LLVM poison: the loop runs (den = 0 ⇒ deterministic
+    /// but arbitrary (poison)), any value is legal — no guard, documented. The nine
     /// shift routines (variable count) share `emit_shift_body`.
     fn emit_routine(&mut self) {
         let name = self.cur_func;
