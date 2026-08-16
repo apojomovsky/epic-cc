@@ -19,13 +19,13 @@
 // never enters main's copy). bump() is add-only (no mul/div), so the ISR
 // stays clear of the runtime routines' scratch.
 //
-// The e2e fires the interrupt at main's word 58 (`%2 = load out` for
-// `out = bump(out)`, right after the `PORTB = 0x11` store lands) — the ISR
-// preempts main before the shared helper's argument is read. Hand
-// computation (in = 0x10):
-//   main: out = in                        -> 0x10
-//   main: PORTB = 0x11
-//   <- ISR fires here (pc == 58; W = 0x11, out = 0x10)
+// The e2e fires the interrupt at main's word 79 (`%2 = load out` for
+// `out = bump(out)`, right after the `PORTB = 0x11` store at word 78
+// lands) — the ISR preempts main before the shared helper's argument is
+// read. Hand computation (in = 0x10):
+//   main: out = in                        -> 0x10   (word 76 store)
+//   main: PORTB = 0x11                    (word 78 store)
+//   <- ISR fires here (pc == 79; W = 0x11, out = 0x10)
 //   ISR:  PORTB = 0x55; out = bump_isr(out = 0x10) -> 0x11
 //   main: out = bump(out = 0x11)          -> 0x12
 //   main: out = out + 1                   -> 0x13

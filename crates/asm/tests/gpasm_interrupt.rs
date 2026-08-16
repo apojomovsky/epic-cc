@@ -9,18 +9,19 @@
 //! exercises the milestone-13 surface end to end: the `.org 4` vector entry
 //! (the ISR's code starts AT word 4 — no GOTO), the save prologue
 //! (`MOVWF 0x75` / `SWAPF 0x75, F` / `SWAPF STATUS, W` / `MOVWF 0x76` /
-//! PCLATH/FSR -> 0x77/0x78 / retval 0x71-0x74 -> 0x79-0x7C / PCLATH = 0),
-//! the ISR body (a direct SFR store `MOVWF 0x06` from the `inttoptr`
-//! literal pointer, a call to the duplicated shared helper `bump_isr`),
-//! the restore epilogue (retval first, then PCLATH/FSR, `SWAPF 0x76, W`
-//! back into STATUS, W last via `SWAPF 0x75, W` — all flag-safe) and
-//! `RETFIE` — the SWAPF/RETFIE encodings gpasm verifies.
+//! PCLATH/FSR -> 0x77/0x78 / retval 0x71-0x74 -> 0x79-0x7C / scratch
+//! 0x70 -> 0x7D / PCLATH = 0), the ISR body (a direct SFR store
+//! `MOVWF 0x06` from the `inttoptr` literal pointer, a call to the
+//! duplicated shared helper `bump_isr`), the restore epilogue (retval
+//! first, then the scratch 0x7D -> 0x70, PCLATH/FSR, `SWAPF 0x76, W` back
+//! into STATUS, W last via `SWAPF 0x75, W` — all flag-safe) and `RETFIE`
+//! — the SWAPF/RETFIE encodings gpasm verifies.
 //!
 //! `in` is the volatile i8 global at 0x21, `out` at 0x20; PORTB is the
 //! F877A SFR at RAM[0x06] (the same alloc layout the driver used).
 //!
 //! The sim run drives the same scenario as the e2e (crates/driver/tests/
-//! interrupt_e2e.rs): fire the interrupt at main's word 75 (the `%2 = load
+//! interrupt_e2e.rs): fire the interrupt at main's word 79 (the `%2 = load
 //! out` for `out = bump(out)`, right after the `PORTB = 0x11` store), so
 //! the ISR bumps out 0x10 -> 0x11 before main's bump reads it; main
 //! completes 0x11 -> 0x12 -> 0x13 -> 0x16 and PORTB = 0x22, then the
@@ -30,10 +31,10 @@ use pic14_sim::{parse_hex, Pic14};
 use std::collections::HashMap;
 use std::process::Command;
 
-/// The interrupt vector (word 4) and the injection point (word 75) as
+/// The interrupt vector (word 4) and the injection point (word 79) as
 /// documented in crates/driver/tests/interrupt_e2e.rs.
 const VECTOR: u16 = 4;
-const INJECT_PC: u16 = 75;
+const INJECT_PC: u16 = 79;
 
 fn gpasm() -> String {
     std::env::var("PIC8_GPASM").unwrap_or_else(|_| "gpasm".into())
@@ -150,7 +151,7 @@ fn interrupt_hex_matches_gpasm_and_runs() {
     let theirs = std::fs::read_to_string(format!("{dir}/interrupt_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator exactly like the e2e: in = 0x10, fire at
-    // word 75 -> out = 0x16, PORTB = 0x22, halted.
+    // word 79 -> out = 0x16, PORTB = 0x22, halted.
     let mut p = Pic14::new(parse_hex(&ours));
     p.ram_mut()[0x21] = 0x10; // in
     let mut steps = 0usize;
