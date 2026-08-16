@@ -95,6 +95,28 @@ fn to_hex_spans_records_and_roundtrips_large_program() {
     }
 }
 
+// ---- Milestone 13: SWAPF and RETFIE (the ISR save/restore path) ----
+
+#[test]
+fn assembles_swapf_and_retfie() {
+    // The interrupt prologue/epilogue (isel M13 Task 2) nibble-swaps STATUS
+    // through SWAPF (both directions: `SWAPF STATUS, W` to save without
+    // touching STATUS, `SWAPF 0x76, W` to swap back) and ends with RETFIE
+    // instead of RETURN. Both encodings are 14-bit core opcodes: SWAPF is
+    // `0x0E00 | d<<7 | f` (d = 0 -> W, 1 -> F), RETFIE is `0x0009`.
+    let src = "STATUS equ 0x03\n    org 0x0000\n\
+    swapf STATUS, W\n\
+    swapf 0x76, W\n\
+    swapf 0x21, F\n\
+    retfie\n\
+    end\n";
+    let words = assemble(src);
+    assert_eq!(words[0], 0x0E03, "swapf STATUS, W (d = 0)");
+    assert_eq!(words[1], 0x0E76, "swapf 0x76, W (d = 0)");
+    assert_eq!(words[2], 0x0EA1, "swapf 0x21, F (d = 1)");
+    assert_eq!(words[3], 0x0009, "retfie");
+}
+
 // ---- Milestone 11: the device-flash bound ----
 
 #[test]

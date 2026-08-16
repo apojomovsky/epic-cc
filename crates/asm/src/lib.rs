@@ -182,6 +182,7 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
     match mne.as_str() {
         "NOP" => 0x0000,
         "RETURN" => 0x0008,
+        "RETFIE" => 0x0009,
         "SLEEP" => 0x0063,
         "CLRWDT" => 0x0064,
         "MOVWF" => 0x0080 | f(op),
@@ -197,6 +198,7 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         "DECFSZ" => 0x0B00 | (d << 7) | f(op),
         "RRF" => 0x0C00 | (d << 7) | f(op),
         "RLF" => 0x0D00 | (d << 7) | f(op),
+        "SWAPF" => 0x0E00 | (d << 7) | f(op),
         "INCFSZ" => 0x0F00 | (d << 7) | f(op),
         "MOVLW" => 0x3000 | parse_lit(op, sym) as u16,
         "ADDLW" => 0x3E00 | parse_lit(op, sym) as u16,
