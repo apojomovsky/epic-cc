@@ -3987,3 +3987,565 @@ fn table_section_pinned_to_pass_a_start_after_elision() {
     assert_eq!(sim_run_asm(&asm, &[(0x20, 3)], 0x21), 0x03, "t[3]=3:\n{asm}");
     assert_eq!(sim_run_asm(&asm, &[(0x20, 199)], 0x21), 0xC7, "t[199]=0xC7:\n{asm}");
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 12, Task 2: i32 arithmetic, compares, casts, shifts + the
+// widened 0x71-0x74 retval region.
+// ---------------------------------------------------------------------------
+
+/// i32 map: x=0x20 (4 bytes), y=0x24, out=0x28, main::a=0x30, main::b=0x34,
+/// main::r=0x38 (all bank-0; the fixed scratch is 0x70, retval 0x71-0x74).
+fn i32_map() -> Vec<(&'static str, u16)> {
+    vec![
+        ("x", 0x20),
+        ("y", 0x24),
+        ("out", 0x28),
+        ("main::a", 0x30),
+        ("main::b", 0x34),
+        ("main::r", 0x38),
+    ]
+}
+
+fn i32_ab_module(op: &str) -> String {
+    format!(
+        "global x i32\nglobal y i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %r = {op} i32 %a, %b\n    store i32 %r @out\n    ret void\n"
+    )
+}
+
+#[test]
+fn add32_reg_reg_emits_four_byte_carry_chain() {
+    let m = parse(&i32_ab_module("add"));
+    let asm = select(&m, &addrs(&i32_map()));
+    // Byte 0 is a plain ADDWF (C = carry out exact); bytes 1-3 fold the
+    // carry into a scratch copy of b via INCFSZ's skip — the wrap (b_i =
+    // 0xFF + carry) must keep C = carry-in (the true carry-out), so the
+    // naive ADDLW 1 fold would corrupt byte i+1. a=0x30, b=0x34, r=0x38.
+    assert!(
+        asm.contains("    MOVF 0x34, W\n    ADDWF 0x30, W\n    MOVWF 0x38"),
+        "byte 0 add:\n{asm}"
+    );
+    assert_eq!(asm.matches("    INCFSZ 0x70, W").count(), 3, "one carry fold per high byte:\n{asm}");
+    assert_eq!(asm.matches("    ADDWF 0x39, F").count(), 1, "byte 1 accumulate:\n{asm}");
+    assert_eq!(asm.matches("    ADDWF 0x3A, F").count(), 1, "byte 2 accumulate:\n{asm}");
+    assert_eq!(asm.matches("    ADDWF 0x3B, F").count(), 1, "byte 3 accumulate:\n{asm}");
+    assert!(
+        asm.contains("    MOVF 0x35, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x70, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x39, F"),
+        "byte 1 carry chain:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0x37, W\n    MOVWF 0x70\n    MOVF 0x33, W\n    MOVWF 0x3B\n    MOVF 0x70, W\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3B, F"),
+        "byte 3 carry chain:\n{asm}"
+    );
+}
+
+#[test]
+fn add32_reg_const_emits_four_byte_carry_chain() {
+    // 0x04030201: each literal byte differs from the carry INCFSZ 0x01, so
+    // the k_i MOVLW lines are distinguishable.
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 67305985\n    store i32 %r @out\n    ret void\n",
+    );
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::r", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    // a=0x30, r=0x38.
+    assert!(
+        asm.contains("    MOVF 0x30, W\n    ADDLW 0x01\n    MOVWF 0x38"),
+        "byte 0 const add:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0x31, W\n    MOVWF 0x39\n    MOVLW 0x02\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x39, F"),
+        "byte 1 const carry chain:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0x33, W\n    MOVWF 0x3B\n    MOVLW 0x04\n    MOVWF 0x70\n    BTFSC STATUS, 0 ; C\n    INCFSZ 0x70, W\n    ADDWF 0x3B, F"),
+        "byte 3 const carry chain:\n{asm}"
+    );
+}
+
+#[test]
+fn sub32_reg_reg_emits_four_byte_borrow_chain() {
+    let m = parse(&i32_ab_module("sub"));
+    let asm = select(&m, &addrs(&i32_map()));
+    // Byte 0 is a plain SUBWF (C = borrow out exact); bytes 1-3 fold the
+    // borrow into a scratch copy of b via INCFSZ's skip (the wrap b_i =
+    // 0xFF + borrow keeps C = borrow-in = 0, the true borrow-out).
+    assert!(
+        asm.contains("    MOVF 0x34, W\n    SUBWF 0x30, W\n    MOVWF 0x38"),
+        "byte 0 sub:\n{asm}"
+    );
+    assert_eq!(asm.matches("    INCFSZ 0x70, W").count(), 3, "one borrow fold per high byte:\n{asm}");
+    assert_eq!(asm.matches("    SUBWF 0x39, F").count(), 1, "byte 1 subtract:\n{asm}");
+    assert_eq!(asm.matches("    SUBWF 0x3B, F").count(), 1, "byte 3 subtract:\n{asm}");
+    assert!(
+        asm.contains("    MOVF 0x35, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    MOVWF 0x39\n    MOVF 0x70, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x70, W\n    SUBWF 0x39, F"),
+        "byte 1 borrow chain:\n{asm}"
+    );
+}
+
+#[test]
+fn sub32_reg_const_emits_four_byte_borrow_chain() {
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 67305985\n    store i32 %r @out\n    ret void\n",
+    );
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::r", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVLW 0x01\n    SUBWF 0x30, W\n    MOVWF 0x38"),
+        "byte 0 const sub:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0x31, W\n    MOVWF 0x39\n    MOVLW 0x02\n    MOVWF 0x70\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x70, W\n    SUBWF 0x39, F"),
+        "byte 1 const borrow chain:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_ult_i32_emits_four_byte_borrow_chain() {
+    let m = parse(
+        "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp ult i32 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    // The 4-byte SUBWF borrow chain: byte 0 plain, bytes 1-3 fold the
+    // borrow via INCFSZ on b itself (cmp never writes a/b). The wrap
+    // b_i = 0xFF + borrow must keep C = borrow-in = 0 (the true
+    // borrow-out); the naive ADDLW 1 fold would leave C = (a_i >= 0) = 1
+    // and corrupt the next byte.
+    assert!(
+        asm.contains("    MOVF 0x34, W\n    SUBWF 0x30, W\n    MOVF 0x35, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x35, W\n    SUBWF 0x31, W"),
+        "chain bytes 0-1:\n{asm}"
+    );
+    assert_eq!(asm.matches("    INCFSZ 0x35, W").count(), 1, "byte 1 fold on b_lo+1:\n{asm}");
+    assert_eq!(asm.matches("    INCFSZ 0x36, W").count(), 1, "byte 2 fold on b_lo+2:\n{asm}");
+    assert_eq!(asm.matches("    INCFSZ 0x37, W").count(), 1, "byte 3 fold on b_lo+3:\n{asm}");
+    // ult = !C materialization.
+    assert!(
+        asm.contains("    MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x38"),
+        "ult = !C:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_ugt_i32_accumulates_four_byte_equality_for_z() {
+    let m = parse(
+        "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp ugt i32 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    // The 4-byte chain first (C), then the 4-byte equality accumulation
+    // (Z = a == b) — the chain's final Z reflects only byte 3 — then
+    // C && !Z. a=0x30/31/32/33, b=0x34/35/36/37, scratch=0x70.
+    assert!(
+        asm.contains("    MOVF 0x30, W\n    XORWF 0x34, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    XORWF 0x35, W\n    IORWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x32, W\n    XORWF 0x36, W\n    IORWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x33, W\n    XORWF 0x37, W\n    IORWF 0x70, W\n    MOVWF 0x70"),
+        "4-byte equality accumulation:\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVLW 0x00\n    BTFSC STATUS, 0 ; C\n    MOVLW 0x01\n    BTFSC STATUS, 2 ; Z\n    MOVLW 0x00\n    MOVWF 0x38"),
+        "ugt = C && !Z:\n{asm}"
+    );
+}
+
+#[test]
+fn icmp_slt_i32_complements_sign_bit_at_byte_3() {
+    let m = parse(
+        "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp slt i32 %a, %b\n    store i8 %c @out\n    ret void\n",
+    );
+    let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    // The sign complement applies ONLY to byte 3 (0x33 / 0x37): the b-side
+    // is complemented into the 0x71 temp (free at a compare) and folded via
+    // INCFSZ's skip — the complemented fold wraps at b_hi ^ 0x80 = 0xFF
+    // (b_hi = 0x7F + borrow), where the skip keeps C = borrow-in = 0, the
+    // true borrow-out. The a-side complement goes into scratch (the SUBWF
+    // file operand).
+    assert!(
+        asm.contains("    MOVLW 0x80\n    XORWF 0x37, W\n    MOVWF 0x71\n    MOVLW 0x80\n    XORWF 0x33, W\n    MOVWF 0x70\n    MOVF 0x71, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x71, W\n    SUBWF 0x70, W"),
+        "byte 3 signed complement chain:\n{asm}"
+    );
+    // The low bytes are plain unsigned chain bytes (no 0x80 anywhere else).
+    assert!(!asm.contains("XORWF 0x30, W"), "byte 0 must not be complemented:\n{asm}");
+    assert!(!asm.contains("XORWF 0x31, W"), "byte 1 must not be complemented:\n{asm}");
+    assert!(!asm.contains("XORWF 0x32, W"), "byte 2 must not be complemented:\n{asm}");
+    assert!(
+        asm.contains("    MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x38"),
+        "slt = !C:\n{asm}"
+    );
+}
+
+#[test]
+fn sext_i16_to_i32_sign_fills_bytes_2_and_3() {
+    let m = parse(
+        "global in i16\nglobal out i32\nfn main(void) ()\n  block entry:\n    %v = load i16 @in\n    %s = sext i16 %v to i32\n    store i32 %s @out\n    ret void\n",
+    );
+    // in=0x20/0x21, out=0x22..0x25, main::v=0x30/0x31, main::s=0x38..0x3B.
+    let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::s", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    // Copy both source bytes, then sign-fill bytes 2-3 from byte 1's bit 7
+    // (the SOURCE's sign byte — never byte 3).
+    assert!(
+        asm.contains("    MOVF 0x30, W\n    MOVWF 0x38\n    MOVF 0x31, W\n    MOVWF 0x39"),
+        "sext copies both source bytes:\n{asm}"
+    );
+    assert!(asm.contains("BTFSS 0x31, 7"), "sext tests the source hi byte's sign bit:\n{asm}");
+    assert!(asm.contains("    MOVLW 0xFF\n"), "negative fill:\n{asm}");
+    assert!(asm.contains("    MOVLW 0x00\n"), "positive fill:\n{asm}");
+    assert_eq!(asm.matches("    MOVWF 0x3A\n    MOVWF 0x3B").count(), 1, "fill bytes 2 and 3:\n{asm}");
+}
+
+#[test]
+fn zext_i8_to_i32_clears_high_bytes() {
+    let m = parse(
+        "global in i8\nglobal out i32\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %z = zext i8 %v to i32\n    store i32 %z @out\n    ret void\n",
+    );
+    let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::z", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVF 0x30, W\n    MOVWF 0x38\n    CLRF 0x39\n    CLRF 0x3A\n    CLRF 0x3B"),
+        "zext copies byte 0 and clears bytes 1-3:\n{asm}"
+    );
+}
+
+#[test]
+fn trunc_i32_to_i8_copies_low_byte() {
+    let m = parse(
+        "global in i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %v = load i32 @in\n    %t = trunc i32 %v to i8\n    store i8 %t @out\n    ret void\n",
+    );
+    let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::t", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    assert!(
+        asm.contains("    MOVF 0x30, W\n    MOVWF 0x38"),
+        "trunc copies only the low byte:\n{asm}"
+    );
+    assert!(!asm.contains("MOVF 0x31, W"), "trunc must not read the high bytes:\n{asm}");
+}
+
+#[test]
+fn shl_i32_inline_rotates_four_bytes() {
+    // shl i32 %a, 3 -> 3 x (BCF C / RLF lo..hi): the 4 rlf chain rotates the
+    // carry up through all four bytes of the dst slot (main::s = 0x38).
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = shl i32 %a, 3\n    store i32 %s @out\n    ret void\n",
+    );
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    assert_eq!(asm.matches("    BCF STATUS, 0").count(), 3, "one BCF per step:\n{asm}");
+    for b in [0x38, 0x39, 0x3A, 0x3B] {
+        assert_eq!(
+            asm.matches(&format!("    RLF 0x{b:02X}, F")).count(),
+            3,
+            "byte {b:#x} rotated each step:\n{asm}"
+        );
+    }
+    assert!(!asm.contains("RRF"), "shl must not emit rrf:\n{asm}");
+}
+
+#[test]
+fn ashr_i32_sign_fills_from_byte_3() {
+    // ashr i32 %a, 2 -> per step: C from byte 3 bit 7, then RRF hi..lo.
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = ashr i32 %a, 2\n    store i32 %s @out\n    ret void\n",
+    );
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)];
+    let asm = select(&m, &addrs(&map));
+    assert_eq!(asm.matches("    BTFSC 0x3B, 7").count(), 2, "sign-bit test on byte 3 per step:\n{asm}");
+    assert_eq!(asm.matches("    RRF 0x3B, F").count(), 2, "hi byte first:\n{asm}");
+    assert_eq!(asm.matches("    RRF 0x38, F").count(), 2, "lo byte last:\n{asm}");
+}
+
+#[test]
+fn i32_call_copies_four_arg_and_retval_bytes() {
+    // addm(i32, i32): each arg copies 4 bytes into the callee's param slots,
+    // CALL, then the retval region (0x71-0x74) is copied into %3.
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i32\n\
+         fn addm(i32) (x, y)\n  block entry:\n\
+           %r = add i32 %x, %y\n    ret i32 %r\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = load i32 @a\n    %2 = load i32 @b\n\
+           %3 = call i32 @addm(i32 %1, i32 %2)\n    store i32 %3 @out\n    ret void\n",
+    );
+    let map = vec![
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::3", 0x38),
+        ("addm::x", 0x3C),
+        ("addm::y", 0x40),
+        ("addm::r", 0x44),
+    ];
+    let asm = select(&m, &addrs(&map));
+    // Arg copies: %1 (0x30..0x33) -> addm::x (0x3C..0x3F), all 4 bytes.
+    assert!(
+        asm.contains("    MOVF 0x30, W\n    MOVWF 0x3C\n    MOVF 0x31, W\n    MOVWF 0x3D\n    MOVF 0x32, W\n    MOVWF 0x3E\n    MOVF 0x33, W\n    MOVWF 0x3F"),
+        "copy %1 into addm::x (4 bytes):\n{asm}"
+    );
+    assert!(
+        asm.contains("    MOVF 0x37, W\n    MOVWF 0x43"),
+        "copy %2 hi byte into addm::y:\n{asm}"
+    );
+    assert!(asm.contains("    CALL addm"), "CALL addm:\n{asm}");
+    // Retval copy: 0x71/0x72/0x73/0x74 -> %3 (0x38..0x3B).
+    assert!(
+        asm.contains("    MOVF 0x71, W\n    MOVWF 0x38\n    MOVF 0x72, W\n    MOVWF 0x39\n    MOVF 0x73, W\n    MOVWF 0x3A\n    MOVF 0x74, W\n    MOVWF 0x3B"),
+        "copy 4 retval bytes into %3:\n{asm}"
+    );
+}
+
+#[test]
+fn ret_i32_copies_value_to_four_retval_bytes() {
+    let m = parse(
+        "global x i32\nfn main(i32) ()\n  block entry:\n\
+           %v = load i32 @x\n    ret i32 %v\n",
+    );
+    let map = vec![("x", 0x20), ("main::v", 0x25)];
+    let asm = select(&m, &addrs(&map));
+    // %v = 0x25..0x28, retval = fixed 0x71..0x74.
+    assert!(
+        asm.contains("    MOVF 0x25, W\n    MOVWF 0x71\n    MOVF 0x26, W\n    MOVWF 0x72\n    MOVF 0x27, W\n    MOVWF 0x73\n    MOVF 0x28, W\n    MOVWF 0x74"),
+        "4 retval writes:\n{asm}"
+    );
+    assert!(asm.contains("    RETURN"), "RETURN:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "const shift count 32 out of range")]
+fn panics_on_inline_shift_count_ge_width_i32() {
+    let m = parse(
+        "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = shl i32 %a, 32\n    store i32 %s @out\n    ret void\n",
+    );
+    select(&m, &addrs(&[("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)]));
+}
+
+#[test]
+#[should_panic(expected = "sext only supports")]
+fn panics_on_sext_i1_to_i32() {
+    // i1 -> i32: bit 7 of the i1's storage byte is not the sign of the i1
+    // (a 0/1 value), so a bit-7 sign-fill would miscompile — loud panic.
+    // (An i1 value arrives as an icmp result, never as a load.)
+    let m = parse(
+        "global x i8\nglobal y i8\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %v = icmp eq i8 %a, %b\n    %s = sext i1 %v to i32\n    store i32 %s @out\n    ret void\n",
+    );
+    select(
+        &m,
+        &addrs(&[
+            ("x", 0x20),
+            ("y", 0x21),
+            ("out", 0x22),
+            ("main::a", 0x30),
+            ("main::b", 0x31),
+            ("main::v", 0x32),
+            ("main::s", 0x38),
+        ]),
+    );
+}
+
+// ---- The load-bearing i32 simulations ----
+
+/// i32 SIM map: x=0x20 (4B), y=0x24, out=0x28, main::a=0x30, main::b=0x34,
+/// main::r=0x38.
+fn sim32_map() -> Vec<(String, u16)> {
+    i32_map().iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
+
+/// Convert a `&[(&str, u16)]` map to the `(String, u16)` form `sim_run_bytes` wants.
+fn str_map(pairs: &[(&str, u16)]) -> Vec<(String, u16)> {
+    pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+}
+
+#[test]
+fn add32_simulates_with_carry_chain() {
+    // 0x12345678 + 5 = 0x1234567D (brief's case: plain add).
+    let ir = i32_ab_module("add");
+    let got = sim_run_bytes(&ir, &sim32_map(), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x05)], 0x28, 4);
+    assert_eq!(&got[..], &[0x7D, 0x56, 0x34, 0x12], "0x12345678 + 5 must be 0x1234567D");
+
+    // Carry chain across all four bytes: 0xFFFFFFFF + 1 = 0x00000000.
+    let got = sim_run_bytes(&ir, &sim32_map(), &[(0x20, 0xFF), (0x21, 0xFF), (0x22, 0xFF), (0x23, 0xFF), (0x24, 0x01)], 0x28, 4);
+    assert_eq!(&got[..], &[0x00, 0x00, 0x00, 0x00], "0xFFFFFFFF + 1 must wrap to 0");
+
+    // The wrap case the naive ADDLW 1 fold gets wrong: b_1 = 0xFF with a
+    // carry-in from byte 0 — 0x0000FF80 + 0x00000080 = 0x00010000 (a naive
+    // chain leaves byte 2 at 0x00, giving 0x0000FF00).
+    let got = sim_run_bytes(&ir, &sim32_map(), &[(0x20, 0x80), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00), (0x24, 0x80)], 0x28, 4);
+    assert_eq!(&got[..], &[0x00, 0x00, 0x01, 0x00], "0x0000FF80 + 0x80 must be 0x00010000");
+}
+
+#[test]
+fn sub32_simulates_with_borrow_chain() {
+    let ir = i32_ab_module("sub");
+    // 0x00010000 - 1 = 0x0000FFFF (borrow through bytes 0-2).
+    let got = sim_run_bytes(&ir, &sim32_map(), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x01), (0x23, 0x00), (0x24, 0x01)], 0x28, 4);
+    assert_eq!(&got[..], &[0xFF, 0xFF, 0x00, 0x00], "0x00010000 - 1 must be 0x0000FFFF");
+
+    // The wrap case: b_1 = 0xFF with a borrow-in — 0x0000FF00 - 0x0000FFFF
+    // = 0xFFFFFF01 (a naive chain loses the borrow at byte 1).
+    let got = sim_run_bytes(&ir, &sim32_map(), &[(0x20, 0x00), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00), (0x24, 0xFF), (0x25, 0xFF), (0x26, 0x00), (0x27, 0x00)], 0x28, 4);
+    assert_eq!(&got[..], &[0x01, 0xFF, 0xFF, 0xFF], "0x0000FF00 - 0x0000FFFF must be 0xFFFFFF01");
+}
+
+#[test]
+fn cmp_i32_simulates_correctly() {
+    let ir = "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp ult i32 %a, %b\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x00), (0x25, 0x00), (0x26, 0x00), (0x27, 0x20)], 0x28, 1);
+    assert_eq!(got[0], 1, "(0x12345678 < 0x20000000) must be 1");
+
+    // The wrap case the naive chain gets wrong: b_1 = 0xFF with a
+    // borrow-in — 0xFF00FF00 < 0xFF00FF01 must be 1 (a naive chain
+    // reports 0, miscomparing at byte 1).
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0xFF), (0x22, 0x00), (0x23, 0xFF), (0x24, 0x01), (0x25, 0xFF), (0x26, 0x00), (0x27, 0xFF)], 0x28, 1);
+    assert_eq!(got[0], 1, "(0xFF00FF00 < 0xFF00FF01) must be 1");
+}
+
+#[test]
+fn ugt_i32_z_accumulation_simulates() {
+    let ir = "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp ugt i32 %a, %b\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
+    // 0x12345679 > 0x12345678: byte 3 equal, so only the 4-byte equality
+    // accumulation clears Z — a byte-3-only Z would wrongly report 0.
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x79), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x78), (0x25, 0x56), (0x26, 0x34), (0x27, 0x12)], 0x28, 1);
+    assert_eq!(got[0], 1, "(0x12345679 > 0x12345678) must be 1");
+    // Equal values: C set, Z set -> ugt = 0.
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x78), (0x25, 0x56), (0x26, 0x34), (0x27, 0x12)], 0x28, 1);
+    assert_eq!(got[0], 0, "(0x12345678 > 0x12345678) must be 0");
+    // a < b: C clear -> ugt = 0.
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x77), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x78), (0x25, 0x56), (0x26, 0x34), (0x27, 0x12)], 0x28, 1);
+    assert_eq!(got[0], 0, "(0x12345677 > 0x12345678) must be 0");
+}
+
+#[test]
+fn slt_i32_complements_sign_byte_and_simulates() {
+    // slt = !C with the byte-3 sign complement on both sides. The
+    // load-bearing wrap: b_hi = 0x7F (0x7F ^ 0x80 = 0xFF) with a borrow-in
+    // from the lower bytes — 0x00000000 < 0x7FFFFFFF must be 1 (a naive
+    // complemented fold would corrupt the borrow-out and report 0).
+    let ir = "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp slt i32 %a, %b\n    store i8 %c @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
+    // 0 < 0x7FFFFFFF -> 1 (borrow chain runs through bytes 0-2, then the
+    // complemented high-byte fold wraps at b_hi = 0x7F + borrow).
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x00), (0x24, 0xFF), (0x25, 0xFF), (0x26, 0xFF), (0x27, 0x7F)], 0x28, 1);
+    assert_eq!(got[0], 1, "(0 < 0x7FFFFFFF) must be 1");
+    // INT_MIN < 0 -> 1 (byte 3 decides).
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x80), (0x24, 0x00), (0x25, 0x00), (0x26, 0x00), (0x27, 0x00)], 0x28, 1);
+    assert_eq!(got[0], 1, "(INT_MIN < 0) must be 1");
+    // 0x7FFFFFFF < INT_MIN -> 0.
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFF), (0x21, 0xFF), (0x22, 0xFF), (0x23, 0x7F), (0x24, 0x00), (0x25, 0x00), (0x26, 0x00), (0x27, 0x80)], 0x28, 1);
+    assert_eq!(got[0], 0, "(0x7FFFFFFF < INT_MIN) must be 0");
+}
+
+#[test]
+fn sext_i16_and_i8_to_i32_simulate() {
+    // i16 0x8000 -> 0xFFFF8000 (sign-fill from byte 1's bit 7).
+    let ir = "global in i16\nglobal out i32\nfn main(void) ()\n  block entry:\n    %v = load i16 @in\n    %s = sext i16 %v to i32\n    store i32 %s @out\n    ret void\n";
+    let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::s", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x80)], 0x22, 4);
+    assert_eq!(&got[..], &[0x00, 0x80, 0xFF, 0xFF], "sext i16 0x8000 must be 0xFFFF8000");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x34), (0x21, 0x12)], 0x22, 4);
+    assert_eq!(&got[..], &[0x34, 0x12, 0x00, 0x00], "sext i16 0x1234 must be 0x00001234");
+
+    // i8 0x80 -> 0xFFFFFF80 (sign-fill from byte 0's bit 7).
+    let ir = "global in i8\nglobal out i32\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %s = sext i8 %v to i32\n    store i32 %s @out\n    ret void\n";
+    let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::s", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x80)], 0x22, 4);
+    assert_eq!(&got[..], &[0x80, 0xFF, 0xFF, 0xFF], "sext i8 0x80 must be 0xFFFFFF80");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x7F)], 0x22, 4);
+    assert_eq!(&got[..], &[0x7F, 0x00, 0x00, 0x00], "sext i8 0x7F must be 0x0000007F");
+}
+
+#[test]
+fn zext_and_trunc_i32_simulate() {
+    // zext i8 0xFF -> 0x000000FF; zext i16 0xFFFF -> 0x0000FFFF.
+    let ir = "global in i8\nglobal out i32\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %z = zext i8 %v to i32\n    store i32 %z @out\n    ret void\n";
+    let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::z", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFF)], 0x22, 4);
+    assert_eq!(&got[..], &[0xFF, 0x00, 0x00, 0x00], "zext i8 0xFF must be 0x000000FF");
+
+    let ir = "global in i16\nglobal out i32\nfn main(void) ()\n  block entry:\n    %v = load i16 @in\n    %z = zext i16 %v to i32\n    store i32 %z @out\n    ret void\n";
+    let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::z", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0xFF), (0x21, 0xFF)], 0x22, 4);
+    assert_eq!(&got[..], &[0xFF, 0xFF, 0x00, 0x00], "zext i16 0xFFFF must be 0x0000FFFF");
+
+    // trunc i32 0x12345678 -> i8 0x78 and -> i16 0x5678.
+    let ir = "global in i32\nglobal out8 i8\nglobal out16 i16\nfn main(void) ()\n  block entry:\n    %v = load i32 @in\n    %t8 = trunc i32 %v to i8\n    store i8 %t8 @out8\n    %t16 = trunc i32 %v to i16\n    store i16 %t16 @out16\n    ret void\n";
+    let map = vec![("in", 0x20), ("out8", 0x24), ("out16", 0x26), ("main::v", 0x30), ("main::t8", 0x38), ("main::t16", 0x3A)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12)], 0x24, 1);
+    assert_eq!(got[0], 0x78, "trunc i32 -> i8 must give 0x78");
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12)], 0x26, 2);
+    assert_eq!(&got[..], &[0x78, 0x56], "trunc i32 -> i16 must give 0x5678");
+}
+
+#[test]
+fn inline_i32_shifts_simulate() {
+    // shl: 0x12345678 << 3 = 0x91A2B3C0.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = shl i32 %a, 3\n    store i32 %s @out\n    ret void\n";
+    let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12)], 0x24, 4);
+    assert_eq!(&got[..], &[0xC0, 0xB3, 0xA2, 0x91], "0x12345678 << 3 must be 0x91A2B3C0");
+
+    // lshr: 0x80000000 >> 2 = 0x20000000 (logical: the vacated top bits
+    // are 0, not the sign).
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = lshr i32 %a, 2\n    store i32 %s @out\n    ret void\n";
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x80)], 0x24, 4);
+    assert_eq!(&got[..], &[0x00, 0x00, 0x00, 0x20], "0x80000000 >> 2 must be 0x20000000");
+
+    // ashr: 0x80000000 >> 2 = 0xE0000000 (the brief's case — sign-fill from
+    // byte 3).
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = ashr i32 %a, 2\n    store i32 %s @out\n    ret void\n";
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x80)], 0x24, 4);
+    assert_eq!(&got[..], &[0x00, 0x00, 0x00, 0xE0], "0x80000000 >> 2 (ashr) must be 0xE0000000");
+
+    // ashr: 0x80000000 >> 4 = 0xF8000000 (sign-fill from byte 3).
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = ashr i32 %a, 4\n    store i32 %s @out\n    ret void\n";
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x00), (0x23, 0x80)], 0x24, 4);
+    assert_eq!(&got[..], &[0x00, 0x00, 0x00, 0xF8], "0x80000000 >> 4 must be 0xF8000000");
+}
+
+#[test]
+fn commutative_i32_binops_simulate() {
+    // and/or/xor at i32 ride the byte-generic emit_commutative; the
+    // dispatch arms are new (Task 2), so exercise all three.
+    let ir = "global x i32\nglobal y i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %r = and i32 %a, %b\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(ir, &sim32_map(), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x0F), (0x25, 0x00), (0x26, 0x00), (0x27, 0x80)], 0x28, 4);
+    assert_eq!(&got[..], &[0x08, 0x00, 0x00, 0x00], "0x12345678 & 0x8000000F must be 0x00000008");
+
+    let ir = "global x i32\nglobal y i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %r = or i32 %a, %b\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(ir, &sim32_map(), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x0F), (0x25, 0x00), (0x26, 0x00), (0x27, 0x80)], 0x28, 4);
+    assert_eq!(&got[..], &[0x7F, 0x56, 0x34, 0x92], "0x12345678 | 0x8000000F must be 0x9234567F");
+
+    let ir = "global x i32\nglobal y i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %r = xor i32 %a, %b\n    store i32 %r @out\n    ret void\n";
+    let got = sim_run_bytes(ir, &sim32_map(), &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x0F), (0x25, 0x00), (0x26, 0x00), (0x27, 0x80)], 0x28, 4);
+    assert_eq!(&got[..], &[0x77, 0x56, 0x34, 0x92], "0x12345678 ^ 0x8000000F must be 0x92345677");
+}
+
+#[test]
+fn i32_call_with_four_byte_param_and_return_simulates() {
+    // addm(0x12345678, 5) = 0x1234567D: 4-byte args into the callee's param
+    // slots, 4-byte add, 4-byte retval through 0x71-0x74.
+    let ir = "global a i32\nglobal b i32\nglobal out i32\n\
+              fn addm(i32) (x, y)\n  block entry:\n\
+                %r = add i32 %x, %y\n    ret i32 %r\n\
+              fn main(void) ()\n  block entry:\n\
+                %1 = load i32 @a\n    %2 = load i32 @b\n\
+                %3 = call i32 @addm(i32 %1, i32 %2)\n    store i32 %3 @out\n    ret void\n";
+    let map = vec![
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::3", 0x38),
+        ("addm::x", 0x3C),
+        ("addm::y", 0x40),
+        ("addm::r", 0x44),
+    ];
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x78), (0x21, 0x56), (0x22, 0x34), (0x23, 0x12), (0x24, 0x05)],
+        0x28,
+        4,
+    );
+    assert_eq!(&got[..], &[0x7D, 0x56, 0x34, 0x12], "addm(0x12345678, 5) must be 0x1234567D");
+}
