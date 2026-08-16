@@ -894,3 +894,33 @@ fn ram_array_300_bytes_panics() {
     let src = "@ram = dso_local global [300 x i8] zeroinitializer, align 1\n";
     let _ = parse_ll(&src);
 }
+
+#[test]
+fn skips_llvm_bookkeeping_globals() {
+    // clang emits @llvm.used / @llvm.compiler.used metadata globals for
+    // address-taken symbols — e.g. the interrupt handler:
+    // `@llvm.compiler.used = appending global [1 x ptr] [ptr @isr]`. They
+    // are backend bookkeeping, not data the PIC8 backend consumes, so they
+    // must be skipped (like the llvm.lifetime calls) instead of panicking
+    // on the unsupported `ptr` element type.
+    let src = r#"
+@llvm.compiler.used = appending global [1 x ptr] [ptr @isr] section "llvm.metadata"
+@llvm.used = appending global [1 x ptr] [ptr @main] section "llvm.metadata"
+
+define dso_local msp430_intrcc void @isr() #0 {
+  ret void
+}
+
+define dso_local void @main() #1 {
+  ret void
+}
+"#;
+    let m = parse_ll(src);
+    assert_eq!(m.globals.len(), 0, "llvm.* globals must be skipped");
+    assert_eq!(m.funcs.len(), 2);
+    assert!(
+        m.funcs.iter().any(|f| f.isr && f.name == "isr"),
+        "the isr function must still parse"
+    );
+    assert!(m.funcs.iter().any(|f| !f.isr && f.name == "main"));
+}
