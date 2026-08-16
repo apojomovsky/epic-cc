@@ -118,6 +118,27 @@ fn frame_end(base: u16, widths: &[u8]) -> u16 {
     addr
 }
 
+/// Every function transitively reachable from `roots` over the caller ->
+/// callee map `edges` (the roots included). A visited set keeps a call cycle
+/// (rejected loudly earlier by the topological sort) from looping forever.
+fn reachable<'a>(roots: &[&'a str], edges: &'a HashMap<String, Vec<String>>) -> HashSet<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut stack: Vec<&str> = roots.to_vec();
+    while let Some(f) = stack.pop() {
+        if !seen.insert(f.to_string()) {
+            continue;
+        }
+        if let Some(cs) = edges.get(f) {
+            for c in cs {
+                if !seen.contains(c) {
+                    stack.push(c);
+                }
+            }
+        }
+    }
+    seen
+}
+
 /// Assign every address: globals sequential (even-aligned i16, stepping
 /// through banks), locals per the overlay algorithm over the call graph parsed
 /// from `edges_text` (`edge <caller> <callee>` lines, order-agnostic; `depth`
@@ -314,6 +335,61 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         base.insert(f.clone(), b);
     }
 
+    // 6b. The disjoint ISR region: an ISR root's frame base is AFTER the
+    // main context's total (the max physical frame end over the NON-ISR
+    // roots' contexts), not `bank0_start` — the ISR can preempt main at any
+    // point, so a preempted main's live frames must never overlap the ISR
+    // context's frames. The plan states this as "max depth_end over the
+    // NON-ISR roots"; the physical variant equals that when no local crosses
+    // a bank gap and is strictly larger (hence safer) when an i16 at a
+    // region tail leaves a hole, exactly the frame_end vs depth_end
+    // distinction the overlay already makes for callee bases. The main loop
+    // above is exact for every non-ISR context (no ISR-side function is
+    // reachable from them), so the disjoint base is computed from its
+    // results; the ISR contexts are then re-derived from that base in topo
+    // order (callers precede callees, and every caller of an ISR-context
+    // function is itself in the ISR context after the legalize duplication).
+    let isr_names: HashSet<&str> = m.funcs.iter().filter(|f| f.isr).map(|f| f.name.as_str()).collect();
+    if !isr_names.is_empty() {
+        let isr_roots: Vec<&String> = topo
+            .iter()
+            .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
+            .collect();
+        let non_isr_roots: Vec<&String> = topo
+            .iter()
+            .filter(|f| !callers.contains_key(*f) && !isr_names.contains(f.as_str()))
+            .collect();
+        // The disjoint base = max physical frame end over the non-ISR roots'
+        // contexts (the main context's total). No non-ISR root: the ISR is
+        // the only root, so it simply starts at bank0_start.
+        let isr_base = non_isr_roots
+            .iter()
+            .flat_map(|r| reachable(&[r.as_str()], &edges))
+            .map(|f| frame_end(base[&f], &locals_widths[&f]))
+            .max()
+            .unwrap_or(bank0_start);
+        // Re-derive the ISR contexts from the disjoint base (topo order: an
+        // ISR root's base is fixed first, then each callee's base derives
+        // from its already-fixed callers).
+        let isr_ctx: HashSet<String> =
+            isr_roots.iter().flat_map(|r| reachable(&[r.as_str()], &edges)).collect();
+        for f in &topo {
+            if !isr_ctx.contains(f) {
+                continue;
+            }
+            let b = if isr_names.contains(f.as_str()) {
+                isr_base
+            } else {
+                callers[f]
+                    .iter()
+                    .map(|p| frame_end(base[p], &locals_widths[p]))
+                    .max()
+                    .expect("alloc: empty caller list")
+            };
+            base.insert(f.clone(), b);
+        }
+    }
+
     // 7. Local addresses: each local at the next free frame byte, in IR
     // order (params first, then defined values in instruction order), stepping
     // through the banks. `place_at` panics if a frame exceeds 0x1EF.
@@ -341,12 +417,14 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         }
     }
 
-    // 8. Total bank-0 demand = max over roots of depth_end(root).
+    // 8. Total bank-0 demand = max over roots of depth_end(root), with an
+    // ISR root's disjoint base offset included (its region starts after the
+    // main context's total, not at bank0_start).
     let total_bank0 = m
         .funcs
         .iter()
         .filter(|f| !callees.contains(&f.name))
-        .map(|f| depth_end[&f.name])
+        .map(|f| depth_end[&f.name] + base[&f.name] - bank0_start)
         .max()
         .unwrap_or(0);
 

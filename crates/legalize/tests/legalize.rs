@@ -166,3 +166,175 @@ fn pins_all_runtime_routine_mappings() {
     assert!(!ct.contains("call"));
     assert!(!ct.contains("__shl_u8"));
 }
+
+/// The `func` targets of every CALL in `f`, in instruction order.
+fn call_targets(f: &ir::Func) -> Vec<String> {
+    let mut v = Vec::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            if let Inst::Call(c) = inst {
+                v.push(c.func.clone());
+            }
+        }
+    }
+    v
+}
+
+fn func<'a>(name: &str, m: &'a ir::Module) -> &'a ir::Func {
+    m.funcs
+        .iter()
+        .find(|f| f.name == name)
+        .unwrap_or_else(|| panic!("module has no function {name}"))
+}
+
+/// A module with main + isr both calling `helper`: the rewritten module has
+/// `helper` (main's copy, untouched) AND `helper_isr` (a deep clone, renamed,
+/// with the `isr` flag cleared); the ISR's call targets `helper_isr` while
+/// main's call keeps targeting `helper`.
+#[test]
+fn duplicates_shared_functions_for_the_isr() {
+    let m = parse(
+        "global in i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             %h = add i8 1, 2\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    // Both the original and the _isr copy exist.
+    assert!(names.contains(&"helper"), "helper must remain: {names:?}");
+    assert!(names.contains(&"helper_isr"), "helper_isr must be added: {names:?}");
+    // The copy is a deep clone: same body, `isr` flag cleared.
+    let helper_isr = func("helper_isr", &m2);
+    assert!(!helper_isr.isr, "the _isr copy must not be marked isr");
+    match &helper_isr.blocks[0].insts[0] {
+        Inst::Bin(b) => assert_eq!(b.dst, "h", "the copy must carry helper's body"),
+        other => panic!("helper_isr must carry helper's body, got {other:?}"),
+    }
+    // The ISR's call targets the copy; main's call stays on the original.
+    assert_eq!(call_targets(func("isr", &m2)), ["helper_isr"]);
+    assert_eq!(call_targets(func("main", &m2)), ["helper"]);
+    assert_eq!(call_targets(func("helper", &m2)), [] as [&str; 0]);
+}
+
+/// Transitivity: helper calls helper2 (both shared) — the copy's internal
+/// call is rewritten to helper2_isr, while the original helper keeps calling
+/// the original helper2. A non-shared ISR-context callee (isr_only) is NOT
+/// duplicated, but its call to a shared function is rewritten to the copy
+/// (the whole ISR context runs against the copies).
+#[test]
+fn rewrites_transitive_calls_and_skips_non_shared_callees() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             call void @helper2()\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             call void @isr_only()\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             call void @helper2()\n\
+             ret void\n\
+         fn helper2(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn isr_only(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    // Both shared functions got copies; the non-shared callee did not.
+    assert!(names.contains(&"helper_isr"), "helper_isr missing: {names:?}");
+    assert!(names.contains(&"helper2_isr"), "helper2_isr missing: {names:?}");
+    assert!(names.contains(&"isr_only"), "isr_only must remain: {names:?}");
+    assert!(
+        !names.contains(&"isr_only_isr"),
+        "non-shared callee must NOT be duplicated: {names:?}"
+    );
+    // The copy's internal call to another shared function -> its _isr copy.
+    assert_eq!(call_targets(func("helper_isr", &m2)), ["helper2_isr"]);
+    // The original helper keeps calling the original helper2 (main's chain).
+    assert_eq!(call_targets(func("helper", &m2)), ["helper2"]);
+    // The non-shared ISR-context callee's call to a shared function is
+    // rewritten to the copy.
+    assert_eq!(call_targets(func("isr_only", &m2)), ["helper_isr"]);
+    // Direct calls: main stays on the originals, the isr runs the copies.
+    assert_eq!(call_targets(func("main", &m2)), ["helper", "helper2"]);
+    assert_eq!(call_targets(func("isr", &m2)), ["helper_isr", "isr_only"]);
+}
+
+/// The rewritten module's canonical text round-trips (parse -> serialize is
+/// a stable fixed point), and the copies show up in the text deliberately.
+#[test]
+fn duplicated_module_roundtrips_canonical_text() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("fn helper_isr(void) ()"), "missing copy:\n{text}");
+    assert!(text.contains("fn isr(void) [isr] ()"), "isr marker lost:\n{text}");
+    let m2 = parse(&text);
+    assert_eq!(ir::serialize(&m2), text); // stable fixed point
+}
+
+/// The duplication is gated on the ISR's existence: without an ISR the
+/// transform is a pass-through (byte-identical), and with an ISR whose
+/// callees are all private there is nothing to duplicate.
+#[test]
+fn no_shared_function_means_no_duplication() {
+    // No ISR at all: pass-through, byte-identical.
+    let src = "fn main(void) ()\n  block entry:\n    call void @helper()\n    ret void\nfn helper(void) ()\n  block entry:\n    ret void\n";
+    let m = parse(src);
+    let text = ir::serialize(&legalize(m));
+    assert!(!text.contains("_isr"), "no ISR: must not duplicate:\n{text}");
+    assert_eq!(text, ir::serialize(&parse(src)), "no ISR: must be byte-identical");
+    // An ISR with only private callees: nothing is shared, so nothing is
+    // duplicated and the ISR's calls stay untouched.
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @isr_private()\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn isr_private(void) ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(!names.contains(&"helper_isr"), "helper is not shared: {names:?}");
+    assert!(!names.contains(&"isr_private_isr"), "isr_private is not shared: {names:?}");
+    assert_eq!(call_targets(func("isr", &m2)), ["isr_private"]);
+    assert_eq!(call_targets(func("main", &m2)), ["helper"]);
+}

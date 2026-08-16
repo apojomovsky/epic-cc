@@ -453,3 +453,101 @@ fn layout_is_debug_printable_and_default() {
     assert!(l.globals.is_empty() && l.locals.is_empty() && l.total_bank0 == 0);
     let _ = format!("{l:?}");
 }
+
+/// main's context (main -> m1 -> m2, one i8 local each) occupies
+/// 0x20..0x23; the ISR root's frame base is AFTER the main context's total,
+/// and the `_isr` copies (isr -> m1_isr -> m2_isr) live entirely in that
+/// disjoint region — no _isr frame overlaps any main-context frame, so a
+/// preempted main's live frames are never clobbered by the ISR context.
+#[test]
+fn isr_root_region_is_disjoint_from_the_main_context() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             %v0 = add i8 1, 2\n\
+             call void @m1()\n\
+             ret void\n\
+         fn m1(void) ()\n\
+           block entry:\n\
+             %v1 = add i8 1, 2\n\
+             call void @m2()\n\
+             ret void\n\
+         fn m2(void) ()\n\
+           block entry:\n\
+             %v2 = add i8 1, 2\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %i0 = add i8 1, 2\n\
+             call void @m1_isr()\n\
+             ret void\n\
+         fn m1_isr(void) ()\n\
+           block entry:\n\
+             %i1 = add i8 1, 2\n\
+             call void @m2_isr()\n\
+             ret void\n\
+         fn m2_isr(void) ()\n\
+           block entry:\n\
+             %i2 = add i8 1, 2\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &m,
+        "edge main m1\nedge m1 m2\nedge isr m1_isr\nedge m1_isr m2_isr\n",
+    );
+    // main's context: main at 0x20, m1 at 0x21, m2 at 0x22 (depth_end = 3).
+    assert_eq!(out.locals["main::v0"], 0x20);
+    assert_eq!(out.locals["m1::v1"], 0x21);
+    assert_eq!(out.locals["m2::v2"], 0x22);
+    // The ISR root's base is after the main context's total: isr starts at
+    // bank0_start + depth_end(main) = 0x23, and the copies follow its chain.
+    assert_eq!(out.locals["isr::i0"], 0x23);
+    assert_eq!(out.locals["m1_isr::i1"], 0x24);
+    assert_eq!(out.locals["m2_isr::i2"], 0x25);
+    // Disjointness: no _isr frame overlaps a main-context frame (which
+    // occupy 0x20..0x23).
+    assert!(out.locals["isr::i0"] >= 0x23, "isr frame overlaps the main context");
+    assert!(out.locals["m2_isr::i2"] >= 0x23, "m2_isr frame overlaps the main context");
+}
+
+/// The ISR root's disjoint base clears the main context's PHYSICAL frame end
+/// — not just the virtual depth_end offset. 79 i8 globals fill bank 0 GPR
+/// (0x20..0x6E), so the main root frame starts at 0x6F; main's i16 local
+/// does not fit the single remaining bank-0 byte and moves wholesale to 0xA0
+/// (leaving a 1-byte hole at 0x6F), and the i8 local lands at 0xA2: the
+/// physical end is 0xA3, past the virtual depth_end (3 bytes from 0x6F =
+/// 0x72). The ISR region must start after the physical end (0xA3), so a
+/// preempted main's live spill locals are never overlapped.
+#[test]
+fn isr_region_clears_the_main_context_physical_frame_end() {
+    let mut gsrc = String::new();
+    for i in 0..79 {
+        gsrc.push_str(&format!("global g{i} i8\n"));
+    }
+    let src = format!(
+        "{gsrc}fn main(void) ()\n\
+           block entry:\n\
+             %v0 = add i16 1, 2\n\
+             %v1 = add i8 3, 4\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %i0 = add i8 1, 2\n\
+             ret void\n"
+    );
+    let m = parse(&src);
+    let out = allocate(&m, "depth 1\n");
+    // 79 i8 globals: the last at 0x6E, so the root frame starts at 0x6F.
+    assert_eq!(out.globals["g78"], 0x6E);
+    // main's frame: i16 at 0xA0-0xA1 (moved wholesale past the 0x6F hole),
+    // i8 at 0xA2 — true physical end 0xA3.
+    assert_eq!(out.locals["main::v0"], 0xA0);
+    assert_eq!(out.locals["main::v1"], 0xA2);
+    // The ISR base clears the PHYSICAL end (0xA3), not the virtual depth_end
+    // offset (0x72, which would land the ISR right on main's live locals).
+    assert_eq!(out.locals["isr::i0"], 0xA3);
+    assert!(
+        out.locals["isr::i0"] > out.locals["main::v1"],
+        "isr frame overlaps main's live spill locals"
+    );
+}
