@@ -78,6 +78,13 @@ impl Pic14 {
     pub fn halted(&self) -> bool {
         self.halted
     }
+    /// Fire the F877A's single interrupt: push `pc + 1` (the return address) and
+    /// jump to the interrupt vector (word 4). GIE is unmodeled — the caller
+    /// controls the injection. RETFIE (0x0009) pops the return.
+    pub fn fire_interrupt(&mut self) {
+        self.stack.push(self.pc + 1);
+        self.pc = 4;
+    }
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         while !self.halted && steps < max_steps {
