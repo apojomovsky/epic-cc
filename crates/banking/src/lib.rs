@@ -68,6 +68,19 @@ pub fn assign_banks(asm: &str) -> String {
             continue;
         }
 
+        // A CALL is a runtime boundary just like a label: the callee's body
+        // (its own BANKSELs and banked operands) can leave the RP bits in any
+        // state, and its prologue/epilogue are not visible in the caller's
+        // text. The tracked bank must not cross a CALL — a caller's next
+        // banked operand gets a FULL BANKSEL, so it is correct no matter what
+        // the callee left behind.
+        if mne == "CALL" {
+            known = false;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
         // Directives (`org`, `.align`, `.table`, `end`, ...) are not
         // instructions: their numeric arguments are addresses or literals,
         // never file-register operands. An `.org` target in a GPR/SFR range
