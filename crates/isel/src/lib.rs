@@ -2073,19 +2073,24 @@ fn word_size(lines: &[String]) -> usize {
 }
 
 /// Greedy page assignment (M11), one function: pad with `.org <next base>`
-/// before a function that would cross the current 2048-word page's end, and
-/// return the `(pad, page, next_addr)`. A function larger than one page can
-/// never fit (its intra-function GOTOs need a single stable page) and panics
-/// loudly; a program past page 3 (0x2000 — the device flash) panics loudly
-/// too. The `.org` pads with 0x0000 words (the assembler supports it), so
-/// the final layout's addresses are exactly what the tracker predicts.
+/// before a function that would cross the current 2048-word page's end — and
+/// before ANY function whose start is page-aligned (an overflow continuation
+/// or an exact-boundary one) — and return the `(pad, page, next_addr)`. A
+/// function larger than one page can never fit (its intra-function GOTOs
+/// need a single stable page) and panics loudly; a program past page 3
+/// (0x2000 — the device flash) panics loudly too. The `.org` pads with
+/// 0x0000 words (the assembler supports it), so the final layout's addresses
+/// are exactly what the tracker predicts.
 ///
 /// M11 two-phase emission: pass A measures every function body with all
 /// PCLATH restores present and runs this over ALL functions, so a call to a
 /// not-yet-emitted target still knows its page; pass B re-emits with
 /// same-page restores skipped. The skip only shrinks bodies, and the pads
-/// pin the page bases, so every function stays on the page pass A assigned
-/// (elision is page-membership-stable).
+/// pin the page bases (a function whose start is page-aligned is anchored
+/// even when it only continues exactly at the boundary — the strict
+/// overflow check alone would leave it unanchored, and the elision would
+/// slide it below the boundary into a straddle), so every function stays on
+/// the page pass A assigned (elision is page-membership-stable).
 fn page_step(addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usize) {
     if size > 0x800 {
         panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
@@ -2096,7 +2101,20 @@ fn page_step(addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usi
         );
     }
     let page_end = (addr & !0x7FF) + 0x800;
-    let pad = if addr + size > page_end {
+    // A function whose start is page-aligned gets an explicit `.org` anchor —
+    // even when it merely CONTINUES exactly at the boundary (the previous
+    // function's pass-A size hit the boundary precisely, so the strict
+    // `addr + size > page_end` overflow check alone would emit no pad). The
+    // anchor covers both the overflow case (the pad target IS the
+    // page-aligned continuation) and the exact-boundary case, so every
+    // page-membership boundary is pinned. Without it, pass B's same-page
+    // restore elision shrinks the previous function and slides this one
+    // below the boundary into a straddle: its label resolves to the LOWER
+    // page while its later words sit in the upper one, so intra-function
+    // GOTOs (PAGE(<func>) from the label) misbranch.
+    let pad = if addr & 0x7FF == 0 {
+        Some(addr)
+    } else if addr + size > page_end {
         if page_end >= 0x2000 {
             panic!(
                 "isel: function @{name} would start at 0x{page_end:04X}, beyond page 3 (device flash is 8K words)"
@@ -2119,10 +2137,11 @@ fn page_step(addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usi
 /// 0x7FA with a 256-aligned base at 0x800). The caller's restore after the
 /// call is needed iff that page differs from its own, so this is the map
 /// `emit_pclath_restore` consults. The section's pass-A placement is used:
-/// it sits right after the last function, and the pass-B elision only
-/// shrinks bodies, so no reader base can cross a page boundary between the
-/// passes (see the pass-B note in `select`) — the pages hold in the final
-/// text.
+/// it sits right after the last function, and pass B re-pins the section to
+/// this exact start with a leading `.org` whenever the pass-B elision would
+/// move a reader base across a page boundary (see the pass-B note in
+/// `select`) — so no reader base can drift across a page boundary between
+/// the passes — the pages hold in the final text.
 fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usize)> {
     let mut pages = Vec::new();
     let mut addr = table_start;
@@ -2369,14 +2388,35 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             addr_b += word_size(&g.out);
             out.extend(g.out);
         }
-        // The tables are NOT pinned: pass-B bodies are no larger (the
-        // elision only shrinks), so the section shifts earlier by the
-        // elided words. That cannot move a reader base across a page
-        // boundary — the section sits after the last `.org` pad (or after
-        // the fixed 5-word header when there are no pads), the functions
-        // after that pad fit within one page, and the elision only removes
-        // words — so the pass-A reader pages above hold in the final text.
-        addr = addr_b;
+        // Pin the const-table section to its pass-A `table_start` whenever
+        // the pass-B elision would move a reader base across a page
+        // boundary. `reader_pages` maps every reader entry's page from the
+        // pass-A position, but pass B emits the tables at the post-elision
+        // position (bodies only shrink, so the section shifts earlier) — a
+        // chunked table's `.align 256` can then round a base across a page
+        // boundary (a base pass A aligned to exactly k*0x800 re-aligns into
+        // page k-1 after a 2-word elision), silently invalidating the
+        // restore-skip map: a caller that skipped its restore on the mapped
+        // page is left with the reader's HIGH(<base>) page — the drifted one
+        // — and its next GOTO misbranches. The `.org` re-pins the section so
+        // the final addresses are exactly the pass-A ones and the map stays
+        // exact — but only when a base's page actually changes (the common
+        // case, a small drift that stays within the mapped page, needs no
+        // pin). It is always forward (or equal): pass-B bodies are no
+        // larger, so `addr_b <= table_start`. A module without consts has no
+        // section to pin.
+        if !consts.is_empty() {
+            let pages_a = reader_pages(&consts, table_start);
+            let pages_b = reader_pages(&consts, addr_b);
+            let drift = pages_a
+                .iter()
+                .zip(&pages_b)
+                .any(|((_, pa), (_, pb))| pa != pb);
+            if drift {
+                out.push(format!("    org 0x{table_start:04X}"));
+                addr = table_start;
+            }
+        }
     }
     // Const (flash) globals become RETLW tables, emitted after the
     // functions so the CALLs above resolve. Every `__read_<name>` reader
