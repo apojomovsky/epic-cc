@@ -123,6 +123,30 @@ fn banks_bsf_on_banked_gpr() {
 }
 
 #[test]
+fn call_resets_tracked_bank_next_operand_gets_full_banksel() {
+    // A CALL is a runtime boundary just like a label: the callee's body (its
+    // own BANKSELs and banked operands) can leave the RP bits in any state,
+    // and the callee's text is not visible in the caller's. The tracked bank
+    // must not cross a CALL — a caller's next banked operand (even one in
+    // the SAME bank as before the CALL) re-establishes BOTH RP bits with a
+    // full BANKSEL, never a partial diff against the pre-CALL bank.
+    let asm = "    MOVF 0xA0, W\n    CALL f\n    MOVF 0xA5, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL f\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn tracking_resumes_after_call_full_banksel() {
+    // After the CALL-triggered full BANKSEL the bank is known again:
+    // same-bank operands on that straight-line stretch share it (no
+    // redundant BANKSEL), and a later bank change emits only the differing
+    // bit — exactly like the label-reset behavior.
+    let asm = "    MOVF 0xA0, W\n    CALL f\n    MOVF 0xA5, W\n    MOVWF 0xE5\n    MOVF 0x20, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL f\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n    MOVWF 0x65\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
 fn status_banksel_and_gpr_bit_op_in_sequence() {
     // A genuine STATUS-bank op still updates the tracked bank, and a following
     // bit op on a same-bank GPR needs no new BANKSEL.

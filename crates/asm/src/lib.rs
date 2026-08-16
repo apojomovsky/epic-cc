@@ -20,7 +20,18 @@ pub fn assemble(src: &str) -> Vec<u16> {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
-            org = parse_num(rest.trim());
+            let target = parse_num(rest.trim());
+            // `.org` can only pad FORWARD (the isel page pads and the pinned
+            // table-section start are always at or ahead of the running
+            // address). A backward `.org` would overwrite already-emitted
+            // words, silently relocating code — a post-layout drift (e.g. a
+            // banking pass inserting words) pushing a page base backwards
+            // would otherwise go unnoticed, so it must fail loudly.
+            assert!(
+                target >= org,
+                "asm: backward .org to 0x{target:04X} from 0x{org:04X} — an .org can only pad forward; a backward target would overwrite emitted words"
+            );
+            org = target;
             continue;
         }
         if let Some(_rest) = line.strip_prefix("end") {

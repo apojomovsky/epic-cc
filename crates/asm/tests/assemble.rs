@@ -158,6 +158,35 @@ fn panics_when_page_label_missing() {
     let _ = assemble(src);
 }
 
+// ---- Milestone 11 final wave: .org monotonicity ----
+
+#[test]
+#[should_panic(expected = "backward .org")]
+fn panics_on_backward_org() {
+    // An `.org` can only pad FORWARD: the isel page pads and the pinned
+    // table-section start always sit at or ahead of the running address. A
+    // backward `.org` (here 0x0000 from a running address of 0x0003) would
+    // overwrite already-emitted words, silently relocating code — e.g. a
+    // later pass (banking) inserting words could push a page base
+    // backwards, and the silent overwrite would misbranch. It must panic
+    // loudly instead.
+    let src = "    org 0x0000\n    movlw 0x01\n    movlw 0x02\n    movlw 0x03\n    org 0x0000\n    end\n";
+    let _ = assemble(src);
+}
+
+#[test]
+fn forward_org_and_same_address_org_assemble() {
+    // Forward pads (the M11 `.org 0x0800` page pads) and a no-op `.org` at
+    // the CURRENT address (an exact-boundary continuation anchor — the same
+    // `.org` the overflow pad already emitted) are both monotone and must
+    // assemble; only a strictly backward target panics.
+    let src = "    org 0x0000\n    movlw 0x01\n    org 0x0800\n    movlw 0x02\n    org 0x0801\n    movlw 0x03\n    end\n";
+    let words = assemble(src);
+    assert_eq!(words[0x000], 0x3001);
+    assert_eq!(words[0x800], 0x3002);
+    assert_eq!(words[0x801], 0x3003, "same-address .org emits the next word in place");
+}
+
 // ---- Milestone 10: const-table window-fit directives ----
 
 #[test]

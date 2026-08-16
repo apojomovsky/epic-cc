@@ -17,6 +17,19 @@
 //! coverage gap (a main at 0x0005 would load PAGE(main) = 0x00 and never
 //! exercise the PCLATH set).
 //!
+//! Main-padding/recipe-frame overlap: `main`'s six `(p + 3) * K / M` padding
+//! steps (before the three real statements) each call the `__mul_u8`/
+//! `__udiv_u8` recipes. The overlay allocator bases every callee at its
+//! caller's physical frame end, so the recipe slots sit right after `main`'s
+//! frame — at 0x52, exactly where `f3`'s frame also starts (f3 is another
+//! main callee). The two regions overlap but are NEVER simultaneously live:
+//! main's padding (and its recipe calls) runs before the `f3` call, so the
+//! recipe slots and f3's frame are used at disjoint times. This is safe by
+//! construction (padding is pure dead code that must run before the real
+//! statements), but it is load-bearing: moving the padding after the f3
+//! call, or letting main call f3 before the padding, would corrupt f3's
+//! frame — documented here per the task-4 review.
+//!
 //! Final assembled layout (label address -> page, verified below from the
 //! assembled text exactly as `asm::assemble` walks it; the addresses come
 //! from the `.org` pads + `.align 256` of the final post-banking,
