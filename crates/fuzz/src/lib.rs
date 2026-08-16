@@ -1,12 +1,13 @@
 //! Seeded C generator + differential runner (PIC driver+sim vs host clang)
 //! + greedy cvise-style reducer.
 //!
-//! Task 1 of milestone 14: the generator skeleton and the differential
-//! harness. The generator emits a tiny, deterministic C program in the
-//! milestone's "discipline" (unsigned-only arithmetic in genuinely
-//! explicit-width types — `u8`/`u16`/`u32` from `TYPEDEF_PROLOGUE`, never
-//! bare `unsigned long`, which is 64-bit on LP64 hosts — guarded shifts, a
-//! volatile `u8` checksum); the differential runner compiles it twice —
+//! Milestone 14's random-testing crate: the whole pipeline — a seeded
+//! generator, a differential runner, a greedy reducer, and a corpus gate.
+//! The generator emits a tiny, deterministic C program in the milestone's
+//! "discipline" (unsigned-only arithmetic in genuinely explicit-width types
+//! — `u8`/`u16`/`u32` from `TYPEDEF_PROLOGUE`, never bare `unsigned long`,
+//! which is 64-bit on LP64 hosts — guarded shifts, a volatile `u8`
+//! checksum); the differential runner compiles it twice —
 //! through the PIC8 driver into `pic14-sim`, and through host clang into a
 //! native binary — seeds the volatile inputs identically on both sides, and
 //! compares the resulting checksums.
@@ -236,8 +237,6 @@ struct Gen {
     /// The generated `main` body statements, one per line where possible
     /// (a flat, structurally-known shape for the Task-3 reducer).
     body: Vec<String>,
-    /// The noinline fold helpers (`fold16`/`fold32`) the body needs.
-    helpers_src: String,
     used_fold16: bool,
     used_fold32: bool,
     /// Whether the array/struct globals are actually used (declared only
@@ -261,7 +260,6 @@ impl Gen {
             locals: Vec::new(),
             dead: Vec::new(),
             body: Vec::new(),
-            helpers_src: String::new(),
             used_fold16: false,
             used_fold32: false,
             used_array: false,
@@ -375,24 +373,6 @@ impl Gen {
         let a = self.operand(w);
         let b = self.operand(w);
         format!("(({ct}){a} {rel} ({ct}){b})")
-    }
-
-    /// The checksum fold expression for a `width`-bit value: every byte of
-    /// the value mixes in (via explicit casts), so a miscompile in ANY byte
-    /// of a u16/u32 value changes the checksum. This is the BODY of the
-    /// noinline `fold16`/`fold32` helpers — its shift/xor defs live in the
-    /// helpers' frames (which have no bank constraint), NOT in main's
-    /// (whose frame the runtime routines' bank-0 slots must fit under; the
-    /// whole-program backend gives every SSA def its own RAM slot, so the
-    /// byte-mix of a u32 would otherwise cost ~27 bytes of main frame).
-    fn fold_expr(w: u8, v: &str) -> String {
-        match w {
-            8 => format!("(u8){v}"),
-            16 => format!("(u8)((u8){v} ^ (u8)(((u16){v}) >> 8u))"),
-            _ => format!(
-                "(u8)((u8){v} ^ (u8)(((u32){v}) >> 8u) ^ (u8)(((u32){v}) >> 16u) ^ (u8)(((u32){v}) >> 24u))"
-            ),
-        }
     }
 
     /// The volatile fold store after every statement pins the statement's

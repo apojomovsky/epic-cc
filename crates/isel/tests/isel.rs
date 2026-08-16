@@ -1227,6 +1227,48 @@ fn sub_i8_reg_const_emits_subwf_in_correct_direction() {
 }
 
 #[test]
+fn negative_i8_const_is_masked_to_byte() {
+    // clang prints an i8 constant >= 128 as a negative i8 (`sub i8 %a, -42`
+    // for `a - 214u`); the literal lowering must mask it to the byte
+    // (0xD6 = 214 = -42 mod 256) rather than sign-extend to a 16-bit value
+    // or panic (found by the fuzz corpus; parity with the other
+    // corpus-found constant-masking fixes).
+    let m = parse(
+        "global x i8\nglobal o1 i8\nglobal o2 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %s = sub i8 %a, -42\n    store i8 %s @o1\n    %t = add i8 %a, -42\n    store i8 %t @o2\n    ret void\n",
+    );
+    // alloc: x=0x20, o1=0x21, o2=0x22 -> end 0x23 -> root frame at 0x26;
+    // %a=0x26, %s=0x27, %t=0x28.
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("o1", 0x21),
+        ("o2", 0x22),
+        ("main::a", 0x26),
+        ("main::s", 0x27),
+        ("main::t", 0x28),
+    ]);
+    let asm = select(&m, &addrs);
+    // sub: MOVLW 0xD6 (W = -42 & 0xFF); SUBWF a,W (W = a - 214); MOVWF s.
+    assert!(asm.contains("MOVLW 0xD6\n    SUBWF 0x26, W"), "sub masks -42 to 0xD6:\n{asm}");
+    assert!(asm.contains("MOVWF 0x27"), "sub dst:\n{asm}");
+    // add: MOVF a,W; ADDLW 0xD6; MOVWF t.
+    assert!(asm.contains("MOVF 0x26, W\n    ADDLW 0xD6"), "add masks -42 to 0xD6:\n{asm}");
+    assert!(asm.contains("MOVWF 0x28"), "add dst:\n{asm}");
+    // No sign-extended high literal leaks in: an i8 -42 must not emit a
+    // 0xFF fill (that would be a 16-bit constant, not a masked i8).
+    assert!(!asm.contains("MOVLW 0xFF"), "no sign-extension leak:\n{asm}");
+
+    // Borrow semantics: SUBWF f,W sets C=0 on borrow (f < W), and the
+    // single-byte result wraps mod 256. a=10, k=214 (-42) -> 10 - 214 =
+    // -204 mod 256 = 0x34. WORDS: MOVLW 0xD6(0x30D6) SUBWF a,W(0x0220)
+    // MOVWF d(0x00A4). RAM: a=0x20, d=0x24.
+    use pic14_sim::Pic14;
+    let mut p = Pic14::new(vec![0x30D6, 0x0220, 0x00A4]);
+    p.ram_mut()[0x20] = 10;
+    p.run(1000);
+    assert_eq!(p.ram()[0x24], 0x34, "negative-const sub must borrow/wrap correctly");
+}
+
+#[test]
 fn sub_i16_reg_reg_emits_borrow_chain() {
     // d = a - b (i16): lo byte SUBWF, then hi byte with a borrow folded in
     // via BTFSS STATUS,0 / ADDLW 1 before the hi SUBWF.
