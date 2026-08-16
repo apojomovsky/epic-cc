@@ -1,12 +1,19 @@
 /// Peephole-optimize PIC-8 assembly.
 ///
-/// Milestone 11: the tracked-literal PCLATH elision. The M11 isel always
-/// emits a `MOVLW PAGE(<target>); MOVWF PCLATH` set before every CALL and a
+/// Milestone 11: the tracked-literal PCLATH elision. The M11 isel emits a
+/// `MOVLW PAGE(<target>); MOVWF PCLATH` set before every CALL and — except
+/// for same-page calls, which isel now skips itself — a
 /// `MOVLW PAGE(<cur_func>); MOVWF PCLATH` restore right after. Nothing else
 /// writes PCLATH: CALL/GOTO/RETURN leave it unchanged, and `MOVWF PCL`
 /// (a reader's computed goto) only reads it. So a new
 /// `MOVLW <k>; MOVWF PCLATH` pair is redundant whenever `k` equals the last
 /// PCLATH literal written — dropping it cannot change the behavior.
+///
+/// The elision is now a defensive/standalone pass for the driver path: isel
+/// already omits same-page restores, so the peephole's job is to collapse
+/// any residual redundant pair (e.g. a hand-written or later-pass assembly
+/// that re-sets an already-held literal) while never dropping a pair it
+/// cannot prove redundant — sound for any input.
 ///
 /// The tracked literal persists across CALL/GOTO/labels/directives; only
 /// `MOVWF PCLATH` updates it. Operands are compared canonically: numeric

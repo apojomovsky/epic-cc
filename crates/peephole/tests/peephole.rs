@@ -35,8 +35,22 @@ fn readers_window_set_elided_when_equal_to_tracked() {
 #[test]
 fn readers_window_set_kept_when_different_from_tracked() {
     // A reader needing window HIGH(t) == 0x09 after a tracked 0x08 must keep
-    // its set (the window differs).
+    // its set (the window differs). The numeric literals stand in for the
+    // brief's symbolic HIGH(t)/PAGE(cur) operands — the achievable symbolic
+    // case is pinned below (`symbolic_reader_window_set_kept_after_restore`):
+    // the reader's own MOVLW clobbers W, so HIGH(t) cannot be tracked
+    // numerically here, and two distinct symbolic tokens must be kept anyway.
     let asm = "    MOVLW 0x08\n    MOVWF PCLATH\n    MOVLW 0x09\n    MOVWF PCLATH\n";
+    assert_eq!(optimize(asm), asm);
+}
+
+#[test]
+fn symbolic_reader_window_set_kept_after_restore() {
+    // A reader's `MOVLW HIGH(t)` after a function's `MOVLW PAGE(cur)`
+    // restore writes a different window — the tokens differ, so the set is
+    // kept (conservative: the peephole cannot prove they resolve to the same
+    // literal). This is the symbolic sibling of the numeric test above.
+    let asm = "    MOVLW PAGE(main)\n    MOVWF PCLATH\n    MOVLW HIGH(t)\n    MOVWF PCLATH\n";
     assert_eq!(optimize(asm), asm);
 }
 
@@ -58,8 +72,10 @@ fn non_pclath_lines_are_unchanged() {
 
 #[test]
 fn identical_symbolic_operands_elide() {
-    // The real pipeline emits `MOVLW PAGE(main)`; an identical operand writes
-    // the same resolved literal, so the duplicate pair is dropped.
+    // Defensive/standalone: isel now skips same-page restores itself, so the
+    // driver path no longer emits this pair — but the peephole still elides
+    // an identical symbolic pair when it sees one (an identical token
+    // resolves to an identical literal, so dropping the duplicate is sound).
     let asm = "    MOVLW PAGE(main)\n    MOVWF PCLATH\n    CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH\n";
     let expected = "    MOVLW PAGE(main)\n    MOVWF PCLATH\n    CALL helper\n";
     assert_eq!(optimize(asm), expected);
