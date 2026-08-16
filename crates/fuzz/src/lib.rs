@@ -354,7 +354,11 @@ impl Gen {
             + if self.used_array || uses_array { 8 } else { 0 }
             + if self.used_struct || uses_struct { 6 } else { 0 };
         let routine = self.worst_routine.max(routine);
-        self.frame_est + frame <= 0x70 - routine - globals
+        // An 8-byte safety margin: the per-statement estimates run low for
+        // u32-containing statements (clang keeps more SSA defs live than
+        // modeled), and the runtime routines' bank-0 slots are a hard
+        // limit (the loud isel assert).
+        self.frame_est + frame + 8 <= 0x70 - routine - globals
     }
 
     /// The noinline byte-mix fold helpers (emitted only when used).
