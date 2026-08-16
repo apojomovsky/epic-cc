@@ -22,6 +22,9 @@ fn tiny_program(in0: u32) -> Program {
         c_source: TINY.to_string(),
         inputs: vec![Input { name: "in0".into(), value: in0, width: 8 }],
         checksum_name: "checksum".into(),
+        seed: 0,
+        statements: Vec::new(),
+        prologue: TINY.to_string(),
     }
 }
 
@@ -42,16 +45,20 @@ fn mismatching_variant_fails() {
     // host, so `(int)in0 * 300` wraps to -5536 on the PIC (and clang folds
     // the comparison `-5536 > 40000` to constant 0) while the host keeps
     // 60000 (60000 > 40000 == 1). The harness MUST report the difference.
-    let prog = Program {
-        c_source: "volatile unsigned char in0;\n\
+    let c_source = "volatile unsigned char in0;\n\
                    volatile unsigned char checksum;\n\
                    void main(void){ checksum = (unsigned char)((int)in0 * 300 > 40000); }\n"
-            .to_string(),
+        .to_string();
+    let prog = Program {
+        c_source: c_source.clone(),
         inputs: vec![Input { name: "in0".into(), value: 200, width: 8 }],
         checksum_name: "checksum".into(),
+        seed: 0,
+        statements: Vec::new(),
+        prologue: c_source,
     };
     match run_differential(&prog) {
-        Err(e) => assert!(e.contains("mismatch"), "expected a mismatch, got: {e}"),
+        Err(e) => assert!(e.to_string().contains("mismatch"), "expected a mismatch, got: {e}"),
         Ok(v) => panic!("expected a mismatch, got Ok({v})"),
     }
 }
@@ -91,24 +98,28 @@ fn u32_arithmetic_wraps_identically_on_both_sides() {
     // makes u32 arithmetic genuinely 32-bit on both sides, so the checksum
     // agrees with the hand-computed 32-bit semantics: fold(x) = 0,
     // x*x wraps to 1, 1 > 0xFFFFFFFFu is 0 -> checksum = 0.
+    let c_source = format!(
+        "{TYPEDEF_PROLOGUE}\n\
+         volatile u32 in0;\n\
+         volatile u8 checksum;\n\
+         void main(void) {{\n\
+           u32 x = in0;\n\
+           u8 w = (u8)(x * x > 0xFFFFFFFFu);\n\
+           checksum = (u8)((u16)checksum * 7u + (u16)((u8)x ^ (u8)(x >> 8u) ^ (u8)(x >> 16u) ^ (u8)(x >> 24u)));\n\
+           checksum = (u8)((u16)checksum * 7u + (u16)w);\n\
+         }}\n"
+    );
     let prog = Program {
-        c_source: format!(
-            "{TYPEDEF_PROLOGUE}\n\
-             volatile u32 in0;\n\
-             volatile u8 checksum;\n\
-             void main(void) {{\n\
-               u32 x = in0;\n\
-               u8 w = (u8)(x * x > 0xFFFFFFFFu);\n\
-               checksum = (u8)((u16)checksum * 7u + (u16)((u8)x ^ (u8)(x >> 8u) ^ (u8)(x >> 16u) ^ (u8)(x >> 24u)));\n\
-               checksum = (u8)((u16)checksum * 7u + (u16)w);\n\
-             }}\n"
-        ),
+        c_source: c_source.clone(),
         inputs: vec![Input {
             name: "in0".into(),
             value: 0xFFFF_FFFF,
             width: 32,
         }],
         checksum_name: "checksum".into(),
+        seed: 0,
+        statements: Vec::new(),
+        prologue: c_source,
     };
     let got = run_differential(&prog)
         .unwrap_or_else(|e| panic!("u32 program not differential-clean: {e}"));
@@ -122,23 +133,30 @@ fn unsigned_long_u32_arithmetic_mismatches() {
     // differential-clean once u32 values exceed 2^16 — the host computes
     // `x * x` in 64 bits (0xFFFFFFFE00000001 > 0xFFFFFFFFu -> 1), msp430 in
     // 32 (wraps to 1, 1 > 0xFFFFFFFFu -> 0). The harness MUST report it.
-    let prog = Program {
-        c_source: "volatile unsigned long in0;\n\
+    let c_source = "volatile unsigned long in0;\n\
                    volatile unsigned char checksum;\n\
                    void main(void) {\n\
                      unsigned long x = in0;\n\
                      checksum = (unsigned char)(x * x > 0xFFFFFFFFu);\n\
                    }\n"
-            .to_string(),
+        .to_string();
+    let prog = Program {
+        c_source: c_source.clone(),
         inputs: vec![Input {
             name: "in0".into(),
             value: 0xFFFF_FFFF,
             width: 32,
         }],
         checksum_name: "checksum".into(),
+        seed: 0,
+        statements: Vec::new(),
+        prologue: c_source,
     };
     match run_differential(&prog) {
-        Err(e) => assert!(e.contains("mismatch"), "expected a mismatch, got: {e}"),
+        Err(e) => assert!(
+            e.to_string().contains("mismatch"),
+            "expected a mismatch (host unsigned long is 64-bit), got: {e}"
+        ),
         Ok(v) => panic!("expected a mismatch (host unsigned long is 64-bit), got Ok({v})"),
     }
 }

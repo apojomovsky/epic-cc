@@ -1,4 +1,5 @@
-//! Seeded C generator + differential runner (PIC driver+sim vs host clang).
+//! Seeded C generator + differential runner (PIC driver+sim vs host clang)
+//! + greedy cvise-style reducer.
 //!
 //! Task 1 of milestone 14: the generator skeleton and the differential
 //! harness. The generator emits a tiny, deterministic C program in the
@@ -125,12 +126,73 @@ pub struct Input {
 }
 
 /// A generated program: the C source plus the metadata the differential
-/// harness needs to seed and observe it.
+/// harness needs to seed and observe it, and the generator's structural
+/// knowledge (the main-body statements) the Task-3 reducer operates on.
 #[derive(Debug, Clone)]
 pub struct Program {
     pub c_source: String,
     pub inputs: Vec<Input>,
     pub checksum_name: String,
+    /// The seed the program was generated from (provenance: the reduced
+    /// fixture is named `reduced_<seed>.c`). Hand-written programs use a
+    /// marker seed.
+    pub seed: u64,
+    /// The generator's structural knowledge: the main-body statements in
+    /// source order. Scalar statements are single lines; block statements
+    /// (if/else, loops) are one multi-line entry. The reducer's unit of
+    /// deletion/rewrite.
+    pub statements: Vec<String>,
+    /// The source before the main body (the typedef prologue, the globals,
+    /// the helper functions, `void main(void) {`). Invariant for generated
+    /// programs: `c_source == prologue + statements.join("\n") + "\n}\n"`.
+    pub prologue: String,
+}
+
+// ---------------------------------------------------------------------------
+// Differential failures (Task 3: classified so the reducer can preserve
+// the ORIGINAL failure)
+// ---------------------------------------------------------------------------
+
+/// The kind of a differential failure. The reducer accepts a candidate
+/// deletion only when the failure it observed PERSISTS — the same kind — so
+/// a candidate that merely breaks the build (e.g. a deletion that orphaned
+/// a local) is rejected as a NEW failure, not the original one surviving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The PIC and host checksums disagree (a miscompile — the
+    /// differential's core detection).
+    Mismatch,
+    /// The PIC compiler pipeline panicked or the driver failed (the
+    /// loud-panic contract — a compiler bug).
+    Panic,
+    /// The simulator did not halt within the step budget.
+    NoHalt,
+    /// The program does not build/run on one side (the reducer's reject
+    /// class: an invalid candidate is a NEW failure).
+    Compile,
+    /// The harness itself broke (IO, a missing global in the alloc map).
+    Harness,
+}
+
+/// A differential failure: its kind (for the reducer's preservation check)
+/// plus the human-readable message (the diagnostics the Task-1/2 tests
+/// assert on).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    pub kind: FailureKind,
+    message: String,
+}
+
+impl Failure {
+    fn new(kind: FailureKind, message: String) -> Self {
+        Failure { kind, message }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,14 +1147,19 @@ pub fn generate(seed: u64) -> Program {
     }
 
     let body = g.body.join("\n");
-    let c_source = format!(
-        "{TYPEDEF_PROLOGUE}{decls}{helper_src}{fold_src}void main(void) {{\n{body}\n}}\n",
+    let prologue = format!(
+        "{TYPEDEF_PROLOGUE}{decls}{helper_src}{fold_src}void main(void) {{\n",
         fold_src = Gen::fold_helpers_src(g.used_fold16, g.used_fold32)
     );
+    let statements = g.body;
+    let c_source = format!("{prologue}{body}\n}}\n");
     Program {
         c_source,
         inputs,
         checksum_name: CHECKSUM_NAME.to_string(),
+        seed,
+        statements,
+        prologue,
     }
 }
 
@@ -1101,14 +1168,15 @@ pub fn generate(seed: u64) -> Program {
 // ---------------------------------------------------------------------------
 
 /// Run the program on both sides and return the agreed checksum, or a
-/// description of the failure: a compile/driver error (including a compiler
-/// panic, which surfaces as a failed process or a caught pipeline panic), a
-/// non-halting sim run, or a host/PIC checksum mismatch.
-pub fn run_differential(program: &Program) -> Result<u32, String> {
+/// classified failure: a compile/driver error (including a compiler panic,
+/// which surfaces as a failed process or a caught pipeline panic), a
+/// non-halting sim run, or a host/PIC checksum mismatch. The classification
+/// (`FailureKind`) is what the Task-3 reducer preserves.
+pub fn run_differential(program: &Program) -> Result<u32, Failure> {
     let dir = WorkDir::new();
     let c_path = dir.path.join("prog.c");
     std::fs::write(&c_path, &program.c_source)
-        .map_err(|e| format!("write prog.c: {e}"))?;
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("write prog.c: {e}")))?;
 
     let pic = run_pic(program, &c_path, &dir)?;
     let host = run_host(program, &c_path, &dir)?;
@@ -1116,46 +1184,65 @@ pub fn run_differential(program: &Program) -> Result<u32, String> {
     if pic == host {
         Ok(pic)
     } else {
-        Err(format!("mismatch: pic checksum {pic}, host checksum {host}"))
+        Err(Failure::new(
+            FailureKind::Mismatch,
+            format!("mismatch: pic checksum {pic}, host checksum {host}"),
+        ))
     }
 }
 
 /// PIC side: alloc layout (in-process, mirroring the driver's e2e) for the
 /// input/checksum addresses, the driver binary for the hex, `pic14-sim`
 /// seeded at those addresses, run, checksum read, `halted()` required.
-fn run_pic(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, String> {
+fn run_pic(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Failure> {
     let layout = pic_layout(c_path)?;
     let checksum_addr = *layout
         .globals
         .get(&program.checksum_name)
-        .ok_or_else(|| format!("no global '{}' in the alloc map", program.checksum_name))?;
+        .ok_or_else(|| {
+            Failure::new(
+                FailureKind::Compile,
+                format!("no global '{}' in the alloc map", program.checksum_name),
+            )
+        })?;
 
     let hex_path = dir.path.join("prog.hex");
     run_driver(c_path, &hex_path)?;
 
-    let hex =
-        std::fs::read_to_string(&hex_path).map_err(|e| format!("read {}: {e}", hex_path.display()))?;
+    let hex = std::fs::read_to_string(&hex_path)
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("read {}: {e}", hex_path.display())))?;
     let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
     for input in &program.inputs {
         let addr = *layout
             .globals
             .get(&input.name)
-            .ok_or_else(|| format!("no global '{}' in the alloc map", input.name))?;
+            .ok_or_else(|| {
+                Failure::new(
+                    FailureKind::Compile,
+                    format!("no global '{}' in the alloc map", input.name),
+                )
+            })?;
         seed_le(&mut p, addr, input.width, input.value);
     }
     p.run(MAX_SIM_STEPS);
     if !p.halted() {
-        return Err(format!("simulator did not halt within {MAX_SIM_STEPS} steps"));
+        return Err(Failure::new(
+            FailureKind::NoHalt,
+            format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+        ));
     }
     Ok(read_le(p.ram(), checksum_addr, 1) as u32)
 }
 
 /// Host side: compile `prog.c` + a generated `host_main.c` with host clang
 /// (no `-target`), run the native binary, parse the printed checksum.
-fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, String> {
+fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Failure> {
     let hm_path = dir.path.join("host_main.c");
-    std::fs::write(&hm_path, host_main_source(program)?)
-        .map_err(|e| format!("write host_main.c: {e}"))?;
+    std::fs::write(
+        &hm_path,
+        host_main_source(program).map_err(|e| Failure::new(FailureKind::Compile, e))?,
+    )
+    .map_err(|e| Failure::new(FailureKind::Harness, format!("write host_main.c: {e}")))?;
 
     let clang = host_clang();
     let obj_prog = dir.path.join("prog_pic.o");
@@ -1172,7 +1259,8 @@ fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Stri
             .arg("-o")
             .arg(&obj_prog),
         "host clang (prog.c)",
-    )?;
+    )
+    .map_err(|e| Failure::new(FailureKind::Compile, e))?;
     run_ok(
         Command::new(&clang)
             .args(["-O1", "-c"])
@@ -1180,7 +1268,8 @@ fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Stri
             .arg("-o")
             .arg(&obj_host),
         "host clang (host_main.c)",
-    )?;
+    )
+    .map_err(|e| Failure::new(FailureKind::Compile, e))?;
     run_ok(
         Command::new(&clang)
             .args(["-O1"])
@@ -1189,22 +1278,31 @@ fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Stri
             .arg("-o")
             .arg(&exe),
         "host clang (link)",
-    )?;
+    )
+    .map_err(|e| Failure::new(FailureKind::Compile, e))?;
 
     let out = Command::new(&exe)
         .output()
-        .map_err(|e| format!("run the host binary: {e}"))?;
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("run the host binary: {e}")))?;
     if !out.status.success() {
-        return Err(format!(
-            "host binary failed: {}",
-            String::from_utf8_lossy(&out.stderr)
+        return Err(Failure::new(
+            FailureKind::Compile,
+            format!("host binary failed: {}", String::from_utf8_lossy(&out.stderr)),
         ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout.lines().next().ok_or("host binary printed nothing")?;
+    let line = stdout
+        .lines()
+        .next()
+        .ok_or_else(|| Failure::new(FailureKind::Compile, "host binary printed nothing".to_string()))?;
     line.trim()
         .parse::<u32>()
-        .map_err(|_| format!("host binary printed a non-checksum line: {stdout:?}"))
+        .map_err(|_| {
+            Failure::new(
+                FailureKind::Compile,
+                format!("host binary printed a non-checksum line: {stdout:?}"),
+            )
+        })
 }
 
 /// The generated `host_main.c`: seeds each input global by name (matching the
@@ -1243,6 +1341,275 @@ fn host_main_source(program: &Program) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Reducer (Task 3: the greedy cvise-style reduction)
+// ---------------------------------------------------------------------------
+
+/// The reduction budget: at most this many differential re-runs per
+/// `reduce` call (the plan's cap; the greedy fixed point normally converges
+/// far below it).
+pub const REDUCTION_CAP: usize = 5000;
+
+/// The outcome of a reduction.
+#[derive(Debug, Clone)]
+pub struct ReducedProgram {
+    /// The reduced program (same inputs/seed/checksum; fewer statements).
+    pub program: Program,
+    /// Differential re-runs performed (the verification run included).
+    pub re_runs: usize,
+    /// Statements deleted by the reduction.
+    pub statements_removed: usize,
+    /// Statements remaining.
+    pub statements_kept: usize,
+    /// The failure the reduction preserved.
+    pub failure: Failure,
+}
+
+/// Greedily reduce `program` while `failure` persists: iterate over the
+/// main-body statements (the generator's structural knowledge), try
+/// deleting each statement — or replacing its expression with a constant /
+/// one of its operands — re-run the differential, and keep the deletion
+/// only when the SAME failure kind survives. Stop at a fixed point (a full
+/// pass with no accepted change) or when `REDUCTION_CAP` re-runs are
+/// exhausted.
+///
+/// `program` is verified to still exhibit `failure` first; its ACTUAL kind
+/// is the preservation target (robust against a stale caller argument) and
+/// a differential-clean program is an error (nothing to reduce). The
+/// reduced program is NOT written here — `write_fixture` persists it as the
+/// `reduced_<seed>.c` artifact.
+pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, String> {
+    let target = match run_differential(program) {
+        Err(f) => f.kind,
+        Ok(_) => {
+            return Err(format!(
+                "reduce: the program is differential-clean (no {failure} to preserve)"
+            ))
+        }
+    };
+    let original_len = program.statements.len();
+    let mut statements = program.statements.clone();
+    let mut re_runs = 1usize; // the verification run above
+
+    'reduce: loop {
+        let mut i = 0usize;
+        while i < statements.len() {
+            for cand in candidates(&statements[i]) {
+                if re_runs >= REDUCTION_CAP {
+                    break 'reduce;
+                }
+                re_runs += 1;
+                let candidate = match cand {
+                    Some(text) => {
+                        let mut stmts = statements.clone();
+                        stmts[i] = text;
+                        stmts
+                    }
+                    None => {
+                        let mut stmts = statements.clone();
+                        stmts.remove(i);
+                        stmts
+                    }
+                };
+                let probe = Program {
+                    c_source: rebuild_source(&program.prologue, &candidate),
+                    inputs: program.inputs.clone(),
+                    checksum_name: program.checksum_name.clone(),
+                    seed: program.seed,
+                    statements: candidate,
+                    prologue: program.prologue.clone(),
+                };
+                match run_differential(&probe) {
+                    Err(f) if f.kind == target => {
+                        statements = probe.statements;
+                        continue 'reduce; // restart the pass from the top
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        break; // a full pass with no accepted change: fixed point
+    }
+
+    Ok(ReducedProgram {
+        program: Program {
+            c_source: rebuild_source(&program.prologue, &statements),
+            inputs: program.inputs.clone(),
+            checksum_name: program.checksum_name.clone(),
+            seed: program.seed,
+            statements: statements.clone(),
+            prologue: program.prologue.clone(),
+        },
+        re_runs,
+        statements_removed: original_len.saturating_sub(statements.len()),
+        statements_kept: statements.len(),
+        failure: Failure {
+            kind: target,
+            message: failure.message.clone(),
+        },
+    })
+}
+
+/// The reduction candidates for one statement, in preference order: `None`
+/// = delete it; `Some(text)` = replace it with `text`. Deletion is always
+/// tried first; expression replacement (with the constant `0u` or one of
+/// the expression's top-level operands) applies to single-line assignments,
+/// and ONLY when the replacement is strictly shorter — the well-founded
+/// measure that makes the greedy terminate (without it, two equally-valid
+/// short forms keep replacing each other and the pass never reaches the
+/// fixed point).
+fn candidates(stmt: &str) -> Vec<Option<String>> {
+    let mut out = vec![None];
+    if let Some((lhs, rhs)) = split_assignment(stmt) {
+        let constant = format!("{lhs}0u;");
+        if constant.len() < stmt.len() {
+            out.push(Some(constant));
+        }
+        for op in top_level_operands(&rhs) {
+            let repl = format!("{lhs}{op};");
+            if repl.len() < stmt.len() {
+                out.push(Some(repl));
+            }
+        }
+    }
+    out
+}
+
+/// Split a single-line assignment statement `… = …;` into its LHS prefix
+/// (up to and including the `= `) and RHS (before the trailing `;`). Block
+/// statements (if/else, loops) and non-assignment lines return None.
+fn split_assignment(stmt: &str) -> Option<(String, String)> {
+    if stmt.contains('\n') {
+        return None;
+    }
+    let s = stmt.trim_end();
+    if !s.ends_with(';') {
+        return None;
+    }
+    let body = &s[..s.len() - 1];
+    let bytes = body.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b'=' if depth == 0 => {
+                // The relational forms (`==`, `!=`, `<=`, `>=`) contain
+                // `=` too, but in these statements they live inside
+                // parenthesized operands — a depth-0 `=` is the assignment.
+                // Guard the two-char forms anyway.
+                let prev = if i > 0 { bytes[i - 1] } else { 0 };
+                if matches!(prev, b'=' | b'!' | b'<' | b'>') {
+                    i += 1;
+                    continue;
+                }
+                let lhs = format!("{} ", &body[..=i]);
+                let rhs = body[i + 1..].trim();
+                if rhs.is_empty() {
+                    return None;
+                }
+                return Some((lhs, rhs.to_string()));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The top-level operands of an expression: strip a leading result-cast
+/// `(uN)( … )` (the generator's `({ct})(…)` shape), then split at the FIRST
+/// binary operator at paren depth 0. Returns [] when there is no such
+/// operator (a bare operand/constant — only constant replacement applies).
+fn top_level_operands(expr: &str) -> Vec<String> {
+    let mut inner = expr.trim();
+    let b = inner.as_bytes();
+    let cast = b.len() > 5
+        && b[0] == b'('
+        && b[1] == b'u'
+        && matches!(b[2], b'8' | b'1' | b'3')
+        && b[3] == b')'
+        && b[4] == b'(';
+    if cast {
+        let mut depth = 0i32;
+        let mut close = None;
+        for (k, &c) in b.iter().enumerate().skip(4) {
+            match c {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = Some(k);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(k) = close {
+            if k == b.len() - 1 {
+                inner = &inner[5..k]; // the whole expr is one cast: unwrap it
+            }
+        }
+    }
+    let bytes = inner.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0
+                && matches!(
+                    bytes[i],
+                    b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'<' | b'>'
+                        | b'=' | b'!'
+                ) =>
+            {
+                let two = bytes.get(i + 1).copied();
+                let op_len = match (bytes[i], two) {
+                    (b'<', Some(b'<'))
+                    | (b'>', Some(b'>'))
+                    | (b'<', Some(b'='))
+                    | (b'>', Some(b'='))
+                    | (b'=', Some(b'='))
+                    | (b'!', Some(b'=')) => 2,
+                    _ => 1,
+                };
+                let left = inner[..i].trim();
+                let right = inner[i + op_len..].trim();
+                if !left.is_empty() && !right.is_empty() {
+                    return vec![left.to_string(), right.to_string()];
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Vec::new()
+}
+
+/// Rebuild the full C source from the prologue + statements (the inverse of
+/// `generate`'s assembly: `prologue + statements.join("\n") + "\n}\n"`).
+fn rebuild_source(prologue: &str, statements: &[String]) -> String {
+    format!("{prologue}{}\n}}\n", statements.join("\n"))
+}
+
+/// Save `program` as the `reduced_<seed>.c` fixture under `fixtures/`
+/// (creating the directory), returning the saved path. The fixture is the
+/// reduction artifact Task 4 commits for real bugs; synthetic reductions
+/// (tests) clean it up after asserting.
+pub fn write_fixture(program: &Program) -> Result<PathBuf, String> {
+    let dir = Path::new("fixtures");
+    std::fs::create_dir_all(dir).map_err(|e| format!("create fixtures/: {e}"))?;
+    let path = dir.join(format!("reduced_{}.c", program.seed));
+    std::fs::write(&path, &program.c_source)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+// ---------------------------------------------------------------------------
 // Plumbing
 // ---------------------------------------------------------------------------
 
@@ -1267,10 +1634,10 @@ fn host_clang() -> String {
 
 /// The volatile globals' addresses: run the same pipeline the driver runs
 /// (mirroring `crates/driver/tests/long_e2e.rs`). Panics in the pipeline
-/// (a compiler bug) are caught and reported as a failure, so the fuzz loop
-/// survives them.
-fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, String> {
-    let (clang, resdir) = pic_clang()?;
+/// (a compiler bug) are caught and reported as a `Panic` failure, so the
+/// fuzz loop survives them.
+fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, Failure> {
+    let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let ll = Command::new(&clang)
         .args([
             "-target",
@@ -1287,14 +1654,15 @@ fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, String> {
         ])
         .arg(c_path)
         .output()
-        .map_err(|e| format!("run clang for the layout: {e}"))?;
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("run clang for the layout: {e}")))?;
     if !ll.status.success() {
-        return Err(format!(
-            "clang (layout) failed: {}",
-            String::from_utf8_lossy(&ll.stderr)
+        return Err(Failure::new(
+            FailureKind::Compile,
+            format!("clang (layout) failed: {}", String::from_utf8_lossy(&ll.stderr)),
         ));
     }
-    let ll_text = String::from_utf8(ll.stdout).map_err(|e| format!("clang stdout: {e}"))?;
+    let ll_text =
+        String::from_utf8(ll.stdout).map_err(|e| Failure::new(FailureKind::Harness, format!("clang stdout: {e}")))?;
     std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut m = irparse::parse_ll(&ll_text);
         m = wholeprog::merge(m);
@@ -1308,26 +1676,30 @@ fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, String> {
             .copied()
             .or_else(|| p.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("unknown panic");
-        format!("compiler pipeline panic: {msg}")
+        Failure::new(FailureKind::Panic, format!("compiler pipeline panic: {msg}"))
     })
 }
 
 /// Run the driver binary (a workspace member) over the C file to produce the
-/// hex, passing the PIC clang env vars it expects.
-fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), String> {
-    let (clang, resdir) = pic_clang()?;
-    let driver = driver_binary()?;
+/// hex, passing the PIC clang env vars it expects. A failed driver is the
+/// loud-panic contract: a compiler panic or an unsupported construct.
+fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), Failure> {
+    let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
+    let driver = driver_binary().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let out = Command::new(&driver)
         .arg(c_path)
         .arg(hex_path)
         .env("PIC8_CLANG_UNWRAPPED", &clang)
         .env("PIC8_CLANG_RESOURCE_DIR", &resdir)
         .output()
-        .map_err(|e| format!("run the driver: {e}"))?;
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("run the driver: {e}")))?;
     if !out.status.success() {
-        return Err(format!(
-            "driver failed (a compiler panic or an unsupported construct): {}",
-            String::from_utf8_lossy(&out.stderr)
+        return Err(Failure::new(
+            FailureKind::Panic,
+            format!(
+                "driver failed (a compiler panic or an unsupported construct): {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
         ));
     }
     Ok(())
