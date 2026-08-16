@@ -691,9 +691,10 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Set the Z flag to (a == b) without disturbing other flags. For i16,
-    /// the XORs of both bytes are accumulated in the fixed `scratch` byte,
-    /// leaving Z set exactly when every byte pair was equal.
+    /// Set the Z flag to (a == b) without disturbing other flags. For
+    /// multi-byte widths (i16/i32), the XORs of every byte pair are
+    /// accumulated in the fixed `scratch` byte, leaving Z set exactly when
+    /// every byte was equal.
     fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
         let n = ty.bytes();
         self.emit_load_byte(a, 0);
@@ -742,6 +743,14 @@ impl<'m> Gen<'m> {
         match (a, b) {
             (Val::Const(_), Val::Const(_)) => panic!("isel: constant folding not implemented"),
             (Val::Const(k), _) => {
+                if n > 2 {
+                    // The 4-byte chain needs the wrap-correct borrow folds
+                    // (the naive ADDLW 1 fold corrupts the borrow-out at
+                    // b_i = 0xFF + borrow-in); the i8/i16 paths below stay
+                    // byte-identical.
+                    self.emit_cmp_c_const_lhs_wide(k, b, n, high, signed);
+                    return;
+                }
                 // SUBLW chain: W holds the b byte (+ borrow); SUBLW subtracts
                 // it from the const byte, so C = (a >= b).
                 self.emit_load_cmp_byte(b, 0, signed, high);
@@ -760,6 +769,10 @@ impl<'m> Gen<'m> {
                 }
             }
             _ => {
+                if n > 2 {
+                    self.emit_cmp_c_file_lhs_wide(a, b, n, high, signed);
+                    return;
+                }
                 let aa = self.val_addr(a);
                 let use_scratch = signed; // signed file-LHS: SUBWF's file operand must be a ^ 0x80
                 if use_scratch {
@@ -785,6 +798,115 @@ impl<'m> Gen<'m> {
                     };
                     self.emit(format!("    SUBWF 0x{f:02X}, W"));
                 }
+            }
+        }
+    }
+
+    /// The wide (n > 2, i.e. i32) borrow chain for `C = (a >= b)` with a
+    /// file-LHS `a`. The 4-byte chain's intermediate borrow-outs are
+    /// load-bearing, and the 2-byte chain's `ADDLW 1` fold corrupts the
+    /// borrow-out exactly when the folded subtrahend wraps (b_i = 0xFF +
+    /// borrow-in = 0x100): the SUBWF then sees W = 0 and leaves
+    /// C = (a_i >= 0) = 1 — a false "no borrow" that mis-compares every
+    /// higher byte. Folding via INCFSZ's skip keeps C = borrow-in, the true
+    /// borrow-out, and the skipped SUBWF's garbage W result is discarded
+    /// (a cmp leaves only flags; a and b are never written, so INCFSZ can
+    /// fold directly on the operand byte). The signed sign-complement
+    /// applies to the HIGH byte only: the a-side is XORed 0x80 into the
+    /// scratch (the SUBWF file operand), the b-side is folded on the
+    /// *uncomplemented* byte and then XORLW 0x80 — an exact mod-256 repair
+    /// — because folding the complemented byte would wrap at
+    /// b_hi = 0x7F + borrow instead, corrupting the final C.
+    fn emit_cmp_c_file_lhs_wide(&mut self, a: &Val, b: &Val, n: u8, high: u8, signed: bool) {
+        let aa = self.val_addr(a);
+        // Byte 0 has no borrow-in; a single SUBWF leaves C exact.
+        self.emit_load_cmp_byte(b, 0, signed, high);
+        self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+        for i in 1..n {
+            if signed && i == high {
+                // Both sides are complemented at the high byte. The b-side
+                // is folded COMPLEMENTED via INCFSZ's skip (0x71 as a
+                // second temp — no live retval during a compare), because
+                // the complemented fold wraps at b_hi ^ 0x80 = 0xFF
+                // (b_hi = 0x7F + borrow): the skip keeps C = borrow-in = 0,
+                // the true borrow-out. A fold on the *uncomplemented* byte
+                // would repair only the b_hi = 0xFF wrap; b_hi = 0x7F +
+                // borrow would wrap invisibly and corrupt the final C.
+                match b {
+                    Val::Const(k) => {
+                        let kb = ((k >> (high as u32 * 8)) & 0xFF) as u8 ^ 0x80;
+                        self.emit(format!("    MOVLW 0x{kb:02X}"));
+                    }
+                    _ => {
+                        let addr = self.val_addr(b) + u16::from(high);
+                        self.emit("    MOVLW 0x80".to_string());
+                        self.emit(format!("    XORWF 0x{addr:02X}, W"));
+                    }
+                }
+                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
+                self.emit("    MOVLW 0x80".to_string());
+                self.emit(format!("    XORWF 0x{:02X}, W", aa + u16::from(high)));
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                // The a-side complement clobbered W; reload the complemented
+                // b-side before the fold.
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+            } else {
+                match b {
+                    Val::Const(k) => {
+                        let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                        self.emit(format!("    MOVLW 0x{kb:02X}"));
+                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                    }
+                    _ => {
+                        self.emit_load_cmp_byte(b, i, signed, high);
+                        let addr = self.val_addr(b) + u16::from(i);
+                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                        self.emit(format!("    INCFSZ 0x{addr:02X}, W"));
+                    }
+                }
+                self.emit(format!("    SUBWF 0x{:02X}, W", aa + u16::from(i)));
+            }
+        }
+    }
+
+    /// The wide const-LHS (SUBLW) borrow chain: W holds the b byte
+    /// (+ borrow), SUBLW subtracts it from the const byte. Same
+    /// wrap-correct folds as `emit_cmp_c_file_lhs_wide`; the signed
+    /// high byte's literal is pre-complemented and the b-side gets the
+    /// fold-then-XORLW repair.
+    fn emit_cmp_c_const_lhs_wide(&mut self, k: &i64, b: &Val, n: u8, high: u8, signed: bool) {
+        // Byte 0 has no borrow-in; a single SUBLW leaves C exact.
+        self.emit_load_cmp_byte(b, 0, signed, high);
+        let k0 = (k & 0xFF) as u8;
+        let k0 = if signed && high == 0 { k0 ^ 0x80 } else { k0 };
+        self.emit(format!("    SUBLW 0x{k0:02X}"));
+        for i in 1..n {
+            if signed && i == high {
+                // b is a reg/global here: complement it, stash in the 0x71
+                // temp, and fold COMPLEMENTED via INCFSZ's skip (see
+                // emit_cmp_c_file_lhs_wide — the complemented fold wraps at
+                // b_hi = 0x7F + borrow, where the skip keeps the true
+                // borrow-out).
+                let addr = self.val_addr(b) + u16::from(high);
+                self.emit("    MOVLW 0x80".to_string());
+                self.emit(format!("    XORWF 0x{addr:02X}, W"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ 0x{:02X}, W", self.retval_lo));
+                let kb = ((k >> (high as u32 * 8)) & 0xFF) as u8 ^ 0x80;
+                self.emit(format!("    SUBLW 0x{kb:02X}"));
+            } else {
+                let addr = self.val_addr(b) + u16::from(i);
+                self.emit(format!("    MOVF 0x{addr:02X}, W"));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ 0x{addr:02X}, W"));
+                let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                self.emit(format!("    SUBLW 0x{kb:02X}"));
             }
         }
     }
@@ -1003,10 +1125,116 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// `d = a + b` for i32: byte 0 adds with the carry out exact (ADDWF),
+    /// then each higher byte folds the carry into a scratch copy of the
+    /// addend and accumulates into the destination in place. The fold uses
+    /// INCFSZ's skip rather than the i16 chain's `ADDLW 1`: when the fold
+    /// wraps (b_i = 0xFF + carry-in = 0x100) the skip leaves the
+    /// destination at `a_i` — the correct mod-256 result — with C =
+    /// carry-in, the true carry-out. The i16 fold's C would be corrupted at
+    /// an intermediate byte (`SUBWF`-style re-derivation gives
+    /// C = (a_i >= 0) = 1 there), silently mis-adding every higher byte.
+    fn emit_add32(&mut self, a: &Val, b: &Val, dst: u16) {
+        let (reg, other) = match (a, b) {
+            (Val::Reg(r), o) => (r.clone(), o),
+            (o, Val::Reg(r)) => (r.clone(), o),
+            _ => panic!("isel: add32 needs a register operand"),
+        };
+        let ra = self.val_addr(&Val::Reg(reg));
+        // Byte 0: no carry-in; the ADDWF's C is exact.
+        match other {
+            Val::Reg(rb) => {
+                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                self.emit(format!("    MOVWF 0x{dst:02X}"));
+                for i in 1..4u8 {
+                    // b_i is copied to scratch first (the dst preload may
+                    // overlay b), then W is reloaded from it after the
+                    // preload's MOVF clobbers W.
+                    self.emit(format!("    MOVF 0x{:02X}, W", bb + u16::from(i)));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit(format!("    MOVF 0x{:02X}, W", ra + u16::from(i)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                    self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
+                }
+            }
+            Val::Const(k) => {
+                self.emit(format!("    MOVF 0x{ra:02X}, W"));
+                self.emit(format!("    ADDLW 0x{:02X}", (k & 0xFF) as u8));
+                self.emit(format!("    MOVWF 0x{dst:02X}"));
+                for i in 1..4u8 {
+                    let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVF 0x{:02X}, W", ra + u16::from(i)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                    self.emit(format!("    MOVLW 0x{kb:02X}"));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                    self.emit(format!("    ADDWF 0x{:02X}, F", dst + u16::from(i)));
+                }
+            }
+            Val::Global(_) => panic!("isel: add32 with a global operand"),
+        }
+    }
+
+    /// `d = a - b` for i32: byte 0 subtracts with the borrow out exact
+    /// (SUBWF), then each higher byte folds the borrow into a scratch copy
+    /// of the subtrahend and subtracts from the destination in place. The
+    /// fold uses INCFSZ's skip rather than the i16 chain's `ADDLW 1`: when
+    /// the fold wraps (b_i = 0xFF + borrow-in = 0x100) the skip leaves the
+    /// destination at `a_i` — the correct mod-256 result — with C =
+    /// borrow-in = 0, the true borrow-out. The i16 fold's C would be
+    /// corrupted at an intermediate byte (C = (a_i >= 0) = 1), silently
+    /// mis-subtracting every higher byte.
+    fn emit_sub32(&mut self, a: &Val, b: &Val, dst: u16) {
+        let aa = self.val_addr(a);
+        match b {
+            Val::Const(k) => {
+                self.emit(format!("    MOVLW 0x{:02X}", (k & 0xFF) as u8));
+                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    MOVWF 0x{dst:02X}"));
+                for i in 1..4u8 {
+                    let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                    self.emit(format!("    MOVLW 0x{kb:02X}"));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                    self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
+                }
+            }
+            Val::Reg(rb) => {
+                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    MOVWF 0x{dst:02X}"));
+                for i in 1..4u8 {
+                    // b_i is copied to scratch first (the dst preload may
+                    // overlay b), then W is reloaded from it after the
+                    // preload's MOVF clobbers W.
+                    self.emit(format!("    MOVF 0x{:02X}, W", bb + u16::from(i)));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                    self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
+                }
+            }
+            Val::Global(_) => panic!("isel: sub32 with a global operand"),
+        }
+    }
+
     /// `dst = call func(args)`: copy each arg into the callee's
     /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
-    /// (`retval_lo`/`retval_lo+1`) into `dst`. Void calls skip the retval
-    /// copy. Mirrors spike emit_call.
+    /// (`retval_lo` .. `retval_lo + bytes - 1` — 0x71-0x74 for i32) into
+    /// `dst`. Void calls skip the retval copy. Mirrors spike emit_call.
     fn emit_call(&mut self, dst: &Option<String>, ty: Option<Ty>, func: &str, args: &[ir::CallArg]) {
         let callee = self
             .m
@@ -1090,14 +1318,8 @@ impl<'m> Gen<'m> {
         self.emit_pclath_restore(func);
         if let Some(d) = dst {
             let t = ty.expect("isel: valued call must carry a type");
-            // The fixed retval region is 2 bytes (0x71/0x72) until Task 2
-            // widens it to 0x71-0x74; an i32 return cannot be copied without
-            // overrunning the region, so panic loudly rather than silently
-            // truncating (Task 2's emit_call lands the 4-byte copy).
-            assert!(
-                t.bytes() != 4,
-                "isel: i32 call return not implemented (Task 2 widens the 2-byte retval region)"
-            );
+            // Copy the retval region (0x71..0x71+bytes-1, up to 0x74 for
+            // i32) into dst.
             let da = self.slot_addr(self.cur_func, d);
             for i in 0..t.bytes() {
                 self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + u16::from(i)));
@@ -1171,18 +1393,11 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Bin(b) => {
-                assert!(b.ty != Ty::I1, "isel: only i8/i16 binops supported");
-                // Task 1 lands the type; i32 binops need the 4-byte carry
-                // chains (Task 2). Panic loudly rather than fall through to a
-                // 16-bit recipe that would silently miscompile.
-                assert!(
-                    b.ty != Ty::I32,
-                    "isel: i32 binop {:?} not implemented (Task 2 lands the 4-byte chains)",
-                    b.op
-                );
+                assert!(b.ty != Ty::I1, "isel: only i8/i16/i32 binops supported");
                 let da = self.slot_addr(self.cur_func, &b.dst);
                 match (b.op, b.ty) {
                     (BinOp::Add, Ty::I16) => self.emit_add16(&b.a, &b.b, da),
+                    (BinOp::Add, Ty::I32) => self.emit_add32(&b.a, &b.b, da),
                     (BinOp::Add, Ty::I8) => {
                         // Normalize commutative add: a const LHS is swapped to
                         // the RHS so the const-adder arm is used, never reading
@@ -1218,10 +1433,13 @@ impl<'m> Gen<'m> {
                     // RHS by emit_commutative.
                     (BinOp::And, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
                     (BinOp::And, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
+                    (BinOp::And, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
                     (BinOp::Or, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
                     (BinOp::Or, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
+                    (BinOp::Or, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
                     (BinOp::Xor, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
                     (BinOp::Xor, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
+                    (BinOp::Xor, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
                     // sub is NOT commutative: a const LHS (d = k - a) cannot
                     // reuse the reg-const lowering (which computes a - k), so
                     // it must fail loudly rather than silently miscompile.
@@ -1238,6 +1456,13 @@ impl<'m> Gen<'m> {
                             "isel: sub with const LHS not supported (not commutative)"
                         );
                         self.emit_sub16(&b.a, &b.b, da);
+                    }
+                    (BinOp::Sub, Ty::I32) => {
+                        assert!(
+                            !matches!(&b.a, Val::Const(_)),
+                            "isel: sub with const LHS not supported (not commutative)"
+                        );
+                        self.emit_sub32(&b.a, &b.b, da);
                     }
                     // Milestone-8 binops: legalize rewrites every mul/div/rem
                     // into a runtime routine call, so these ops reach isel only
@@ -1335,9 +1560,13 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Sext(x) => {
+                // i8/i16 -> i16/i32, sign-filling from the SOURCE's high
+                // byte (the loop below reads `x.from.bytes() - 1`). i1 has
+                // no meaningful sign bit (a 0/1 value), so i1 -> iN panics
+                // loudly rather than bit-7 sign-filling a non-sign.
                 assert!(
-                    x.from.bytes() == 1 && x.to.bytes() == 2,
-                    "isel: sext only supports i8 -> i16"
+                    x.from != Ty::I1 && x.from.bytes() < x.to.bytes(),
+                    "isel: sext only supports i8/i16 -> i16/i32 (i1 sign-fill is undefined)"
                 );
                 assert!(
                     !matches!(&x.val, Val::Const(_)),
@@ -1379,13 +1608,6 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Icmp(ic) => {
-                // Task 1 lands the type; the i32 ordering's Z-accumulation
-                // (the 16-bit special case at the need_z test) is Task 2.
-                // Panic loudly rather than silently miscompile ugt/ule/sgt/sle.
-                assert!(
-                    ic.ty != Ty::I32,
-                    "isel: i32 icmp not implemented (Task 2 generalizes the Z special case)"
-                );
                 let da = self.slot_addr(self.cur_func, &ic.dst);
                 match ic.pred.as_str() {
                     "eq" => {
@@ -1411,10 +1633,11 @@ impl<'m> Gen<'m> {
                         // C = (a >= b), unsigned or signed (sign-bit
                         // complement). i8 leaves Z = (a == b) too.
                         self.emit_cmp_c(&ic.a, &ic.b, ic.ty, signed);
-                        // The i16 borrow chain ends with a byte-level Z;
-                        // full equality needs the XOR accumulation, which
+                        // A multi-byte borrow chain ends with a byte-level
+                        // Z; full equality needs the XOR accumulation
+                        // (byte-generic across every width), which
                         // preserves C.
-                        if need_z && ic.ty.bytes() == 2 {
+                        if need_z && ic.ty.bytes() > 1 {
                             self.emit_cmp_eq(&ic.a, &ic.b, ic.ty);
                         }
                         let mat = match pred {
@@ -1448,13 +1671,8 @@ impl<'m> Gen<'m> {
             }
             Inst::Ret(None) => self.emit("    RETURN".to_string()),
             Inst::Ret(Some((ty, v))) => {
-                // Copy the value into the fixed retval slots, then RETURN.
-                // The retval region is 2 bytes (0x71/0x72) until Task 2
-                // widens it; an i32 return would overrun it, so panic loudly.
-                assert!(
-                    ty.bytes() != 4,
-                    "isel: i32 ret not implemented (Task 2 widens the 2-byte retval region)"
-                );
+                // Copy the value into the fixed retval slots (0x71..0x74 for
+                // i32), then RETURN.
                 for i in 0..ty.bytes() {
                     self.emit_load_byte(v, i);
                     self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo + u16::from(i)));
@@ -2198,8 +2416,8 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 /// `addrs` is the complete address map from `alloc`: globals by name, locals
 /// by `{func}::{name}` (IR value names without `%`). isel does no slot
 /// allocation — every value's address is read from the map. The icmp scratch
-/// byte and the two retval bytes live in fixed common RAM (scratch `0x70`,
-/// retval `0x71`/`0x72`): bank-independent, never used by locals (M3), so no
+/// byte and the four retval bytes live in fixed common RAM (scratch `0x70`,
+/// retval `0x71`-`0x74`): bank-independent, never used by locals (M3), so no
 /// BANKSEL is ever needed for them.
 ///
 /// M11: every CALL runs with PCLATH<4:3> = the target's page (set
@@ -2213,11 +2431,17 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 /// same-page restores skipped (the pads pin the page bases, so the elision
 /// never moves a function off its assigned page).
 pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
-    // The icmp scratch byte and the two retval bytes are fixed common-RAM
+    // The icmp scratch byte and the four retval bytes are fixed common-RAM
     // constants (bank-independent, common RAM 0x70-0x7F is never used by
-    // locals, so no collision).
+    // locals, so no collision). The widened i32 region (0x71-0x74) must not
+    // overrun common RAM nor overlap the scratch byte.
     let scratch: u16 = 0x70;
     let retval_lo: u16 = 0x71;
+    assert!(
+        retval_lo + 4 <= 0x80,
+        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must fit in common RAM",
+        retval_lo + 3
+    );
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
         "    list p=16f877a".to_string(),
