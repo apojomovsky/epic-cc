@@ -924,3 +924,38 @@ define dso_local void @main() #1 {
     );
     assert!(m.funcs.iter().any(|f| !f.isr && f.name == "main"));
 }
+
+#[test]
+fn parses_poison_call_arg_as_zero() {
+    // clang -O1 emits `poison` for a dead call arg (a value that is never
+    // observed: the optimizer specialized a noinline helper and left the
+    // original call with a poison arg). A poison operand is consumed only
+    // by UB, so a conforming program never reads it — materializing it as
+    // 0 is sound, and the parser must accept it (found by the fuzz corpus).
+    let src = r#"
+define dso_local void @main() {
+  %1 = call i8 @f(i8 poison)
+  ret void
+}
+
+define dso_local i8 @f(i8 %x) {
+  ret i8 0
+}
+"#;
+    let m = parse_ll(src);
+    assert_eq!(m.funcs.len(), 2);
+    let call = &m.funcs[0].blocks[0].insts[0];
+    match call {
+        Inst::Call(c) => {
+            assert_eq!(c.func, "f");
+            assert_eq!(c.dst.as_deref(), Some("1"));
+            assert_eq!(c.args.len(), 1);
+            assert_eq!(
+                c.args[0],
+                CallArg { ty: Some(ir::Ty::I8), val: Val::Const(0), byval: None, sret: false },
+                "a poison arg is never observed, so Const(0) is the correct materialization"
+            );
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+}

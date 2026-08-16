@@ -1359,6 +1359,37 @@ fn sub_const_lhs_emits_sublw_chain() {
 }
 
 #[test]
+fn loop_with_cross_referencing_phis_simulates() {
+    // clang -O1 folds `for (i = 0; i < n; i++) acc = i;` (its SCEV proves
+    // `acc` IS the induction) into two loop phis where one's incoming is
+    // the other's register: %5 (acc) <- %4 (i), %4 (i) <- %6 (i+1). The
+    // phi copies for the back edge must run ONLY on the back edge and read
+    // the OLD i first — running them on the exit edge (or copying after i
+    // is updated) clobbers the accumulator the exit block reads (found by
+    // the fuzz corpus: PIC 228 vs host 230). acc = n-1 for n >= 1.
+    let ir = "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = and i8 %1, 7\n    br loop\n  block loop:\n    %4 = phi i8 0 entry %6 loop\n    %5 = phi i8 0 entry %4 loop\n    %6 = add i8 %4, 1\n    %7 = icmp eq i8 %4, %2\n    br i1 %7 exit loop\n  block exit:\n    store i8 %5 @out\n    ret void\n";
+    let map = vec![
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x26),
+        ("main::4", 0x27),
+        ("main::5", 0x28),
+        ("main::6", 0x29),
+        ("main::7", 0x2A),
+    ];
+    for (seed_byte, expect) in [
+        (0u8, 0u8),   // n = 0: the loop body never runs, acc = 0
+        (105, 0),     // n = 1: acc = 0 (the old i of the only body run)
+        (2, 1),       // n = 2: acc = 1
+        (7, 6),       // n = 7: acc = 6
+    ] {
+        let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, seed_byte)], 0x21, 1);
+        assert_eq!(got[0], expect, "acc for n = {} (in0 = {seed_byte})", seed_byte & 7);
+    }
+}
+
+#[test]
 fn and_i8_uses_andwf_andlw() {
     // reg-reg: MOVF b,W; ANDWF a,W; MOVWF d. reg-const: MOVF a,W; ANDLW k.
     let m = parse(

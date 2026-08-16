@@ -2509,15 +2509,20 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         };
         labels.insert(b.label.clone(), lbl);
     }
-    // phi elimination: for each predecessor block, the copies that must
-    // run before it branches into the merge block.
-    let mut phi_copies: HashMap<String, Vec<(String, Ty, Val)>> = HashMap::new();
+    // phi elimination: for each (predecessor, merge) edge, the copies that
+    // must run when that edge is taken. Keyed by the edge, NOT just the
+    // predecessor: the copies must run ONLY on the edge to their merge
+    // block — running them unconditionally clobbers the phi slots with
+    // next-iteration values that the other branch's target reads (found by
+    // the fuzz corpus: clang folds `acc = i` loops into cross-referencing
+    // phis, and the exit block read the clobbered accumulator).
+    let mut phi_copies: HashMap<(String, String), Vec<(String, Ty, Val)>> = HashMap::new();
     for b in &f.blocks {
         for i in &b.insts {
             if let Inst::Phi(p) = i {
                 for (val, pred) in &p.incoming {
                     phi_copies
-                        .entry(pred.clone())
+                        .entry((pred.clone(), b.label.clone()))
                         .or_default()
                         .push((p.dst.clone(), p.ty, val.clone()));
                 }
@@ -2579,102 +2584,188 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                 _ => g.emit_inst(i),
             }
         }
-        if let Some(copies) = phi_copies.get(&b.label) {
-            g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-            // Emit the predecessor's copies in dependency order so a copy
-            // never overwrites a slot a later copy still needs to read.
-            // Chains (%a <- %b, %b <- %c) emit c->b then b->a. If the
-            // copies form a cycle (%a = phi [%b,P], %b = phi [%a,P] —
-            // clang -O1 emits this for loop-carried swaps), no ordering
-            // works without a temp register, so panic loudly rather than
-            // silently miscompile.
-            let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
-                .iter()
-                .map(|(dst, ty, val)| {
-                    let da = g.slot_addr(g.cur_func, dst);
-                    let src = match val {
-                        Val::Reg(r) => Some(g.slot_addr(g.cur_func, r)),
-                        _ => None,
-                    };
-                    (da, src, *ty, val.clone())
-                })
-                .collect();
-            let n = pending.len();
-            let mut emitted = vec![false; n];
-            let mut emitted_count = 0usize;
-            while emitted_count < n {
-                let mut progress = false;
-                for i in 0..n {
-                    if emitted[i] {
-                        continue;
-                    }
-                    let (da, src, ty, val) = &pending[i];
-                    // Blocked while an un-emitted sibling (j != i) writes
-                    // this copy's source slot (sibling destination ==
-                    // this copy's source).
-                    let blocked = match src {
-                        Some(s) => {
-                            (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s)
-                        }
-                        None => false,
-                    };
-                    if !blocked {
-                        g.emit_move_val_to_slot(val, *ty, *da);
-                        emitted[i] = true;
-                        emitted_count += 1;
-                        progress = true;
-                    }
-                }
-                if !progress {
-                    panic!("isel: cyclic phi copies not supported");
-                }
-            }
-        }
         if let Some(t) = terminator {
-            if f.isr {
-                match t {
-                    // The restore epilogue replaces the ISR's `ret`. Order
-                    // is load-bearing: the retval region (0x79-0x7C ->
-                    // 0x71-0x74), then the scratch byte (0x7D -> 0x70), then
-                    // PCLATH/FSR (MOVF — their Z clobbers are fine, STATUS
-                    // is not yet restored), then STATUS via the nibble
-                    // swap-back (SWAPF is flag-safe), and W LAST via its
-                    // swap-back (also flag-safe — MOVF would set Z from the
-                    // moved value after STATUS was already restored,
-                    // corrupting the interrupted main's Z). RETFIE pops the
-                    // hardware-pushed return.
-                    Inst::Ret(None) => {
-                        g.emit("    MOVF 0x79, W");
-                        g.emit("    MOVWF 0x71");
-                        g.emit("    MOVF 0x7A, W");
-                        g.emit("    MOVWF 0x72");
-                        g.emit("    MOVF 0x7B, W");
-                        g.emit("    MOVWF 0x73");
-                        g.emit("    MOVF 0x7C, W");
-                        g.emit("    MOVWF 0x74");
-                        g.emit("    MOVF 0x7D, W");
-                        g.emit("    MOVWF 0x70");
-                        g.emit("    MOVF 0x77, W");
-                        g.emit("    MOVWF PCLATH");
-                        g.emit("    MOVF 0x78, W");
-                        g.emit("    MOVWF FSR");
-                        g.emit("    SWAPF 0x76, W");
-                        g.emit("    MOVWF STATUS");
-                        g.emit("    SWAPF 0x75, W");
-                        g.emit("    RETFIE");
+            match t {
+                Inst::Br(br) => {
+                    let merge = br.target.clone();
+                    if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
+                        g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                        emit_phi_copies(g, c, b.label == merge);
                     }
-                    Inst::Ret(Some(_)) => panic!(
-                        "isel: interrupt handler @{} must be void (cannot return a value)",
-                        f.name
-                    ),
-                    _ => g.emit_terminator(t, &labels),
+                    g.emit(format!("    GOTO {}", labels[&merge]));
                 }
-            } else {
-                g.emit_terminator(t, &labels);
+                Inst::BrCond(bc) => {
+                    let lt = labels[&bc.t].clone();
+                    let lf = labels[&bc.f].clone();
+                    let t_copies = phi_copies.get(&(b.label.clone(), bc.t.clone()));
+                    let f_copies = phi_copies.get(&(b.label.clone(), bc.f.clone()));
+                    match &bc.cond {
+                        Val::Reg(r) => {
+                            let ca = g.val_addr(&Val::Reg(r.clone()));
+                            g.emit(format!("    MOVF 0x{ca:02X}, W"));
+                            match (t_copies, f_copies) {
+                                // Plain branch: the classic BTFSC skip shape.
+                                (None, None) => {
+                                    g.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                                    g.emit(format!("    GOTO {lf}"));
+                                    g.emit(format!("    GOTO {lt}"));
+                                }
+                                // Both targets are merges: f falls through to
+                                // its copies, t jumps to a copy block.
+                                (Some(ct), Some(cf)) => {
+                                    let lcop = g.fresh_label();
+                                    g.emit("    BTFSS STATUS, 2 ; Z".to_string());
+                                    g.emit(format!("    GOTO {lcop}"));
+                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    emit_phi_copies(g, cf, b.label == bc.f);
+                                    g.emit(format!("    GOTO {lf}"));
+                                    g.emit(format!("{lcop}:"));
+                                    emit_phi_copies(g, ct, b.label == bc.t);
+                                    g.emit(format!("    GOTO {lt}"));
+                                }
+                                // The copies feed the f (cond==0 fall-through)
+                                // edge: skip over them to t when cond != 0.
+                                (_, Some(c)) => {
+                                    g.emit("    BTFSS STATUS, 2 ; Z".to_string());
+                                    g.emit(format!("    GOTO {lt}"));
+                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    emit_phi_copies(g, c, b.label == bc.f);
+                                    g.emit(format!("    GOTO {lf}"));
+                                }
+                                // The copies feed the t (cond!=0 jump) edge:
+                                // skip over f to them when cond == 0.
+                                (Some(c), None) => {
+                                    g.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                                    g.emit(format!("    GOTO {lf}"));
+                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    emit_phi_copies(g, c, b.label == bc.t);
+                                    g.emit(format!("    GOTO {lt}"));
+                                }
+                            }
+                        }
+                        Val::Const(k) => {
+                            if *k != 0 {
+                                if let Some(c) = t_copies {
+                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    emit_phi_copies(g, c, b.label == bc.t);
+                                }
+                                g.emit(format!("    GOTO {lt}"));
+                            } else {
+                                if let Some(c) = f_copies {
+                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    emit_phi_copies(g, c, b.label == bc.f);
+                                }
+                                g.emit(format!("    GOTO {lf}"));
+                            }
+                        }
+                        Val::Global(_) => panic!("isel: conditional branch on a global"),
+                    }
+                }
+                _ if f.isr => {
+                    match t {
+                        // The restore epilogue replaces the ISR's `ret`. Order
+                        // is load-bearing: the retval region (0x79-0x7C ->
+                        // 0x71-0x74), then the scratch byte (0x7D -> 0x70), then
+                        // PCLATH/FSR (MOVF — their Z clobbers are fine, STATUS
+                        // is not yet restored), then STATUS via the nibble
+                        // swap-back (SWAPF is flag-safe), and W LAST via its
+                        // swap-back (also flag-safe — MOVF would set Z from the
+                        // moved value after STATUS was already restored,
+                        // corrupting the interrupted main's Z). RETFIE pops the
+                        // hardware-pushed return.
+                        Inst::Ret(None) => {
+                            g.emit("    MOVF 0x79, W");
+                            g.emit("    MOVWF 0x71");
+                            g.emit("    MOVF 0x7A, W");
+                            g.emit("    MOVWF 0x72");
+                            g.emit("    MOVF 0x7B, W");
+                            g.emit("    MOVWF 0x73");
+                            g.emit("    MOVF 0x7C, W");
+                            g.emit("    MOVWF 0x74");
+                            g.emit("    MOVF 0x7D, W");
+                            g.emit("    MOVWF 0x70");
+                            g.emit("    MOVF 0x77, W");
+                            g.emit("    MOVWF PCLATH");
+                            g.emit("    MOVF 0x78, W");
+                            g.emit("    MOVWF FSR");
+                            g.emit("    SWAPF 0x76, W");
+                            g.emit("    MOVWF STATUS");
+                            g.emit("    SWAPF 0x75, W");
+                            g.emit("    RETFIE");
+                        }
+                        Inst::Ret(Some(_)) => panic!(
+                            "isel: interrupt handler @{} must be void (cannot return a value)",
+                            f.name
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+                _ => g.emit_terminator(t, &labels),
             }
         }
     }
     g.emit("".to_string());
+}
+
+/// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
+/// copy never overwrites a slot a later copy still needs to read.
+///
+/// The ordering depends on whether the edge is a SELF-loop (pred == merge):
+/// - Self-loop back-edge: the phi slots hold the CURRENT iteration's
+///   values, so a copy reading a slot another copy writes must run BEFORE
+///   the overwrite (reader first). The folded-induction loop
+///   `%acc <- %i, %i <- %i+1` needs acc before i, or the accumulator
+///   reads the NEW induction value (found by the fuzz corpus).
+/// - Other edges: a phi slot is only defined by THIS edge's copies, so a
+///   copy reading a slot another copy writes must run AFTER its definer
+///   (writer first; the %p <- %a, %q <- %p chain).
+/// A true cycle (%a <- %b, %b <- %a — a loop-carried swap) needs a temp
+/// register, so it panics loudly rather than silently miscompile.
+fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], self_loop: bool) {
+    let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
+        .iter()
+        .map(|(dst, ty, val)| {
+            let da = g.slot_addr(g.cur_func, dst);
+            let src = match val {
+                Val::Reg(r) => Some(g.slot_addr(g.cur_func, r)),
+                _ => None,
+            };
+            (da, src, *ty, val.clone())
+        })
+        .collect();
+    let n = pending.len();
+    let mut emitted = vec![false; n];
+    let mut emitted_count = 0usize;
+    while emitted_count < n {
+        let mut progress = false;
+        for i in 0..n {
+            if emitted[i] {
+                continue;
+            }
+            let (da, src, ty, val) = &pending[i];
+            let blocked = if self_loop {
+                // Reader first: blocked while an un-emitted sibling READS
+                // this copy's destination (sibling source == my dst).
+                (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
+            } else {
+                // Writer first: blocked while an un-emitted sibling WRITES
+                // this copy's source (sibling dst == my src).
+                match src {
+                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s),
+                    None => false,
+                }
+            };
+            if !blocked {
+                g.emit_move_val_to_slot(val, *ty, *da);
+                emitted[i] = true;
+                emitted_count += 1;
+                progress = true;
+            }
+        }
+        if !progress {
+            panic!("isel: cyclic phi copies not supported");
+        }
+    }
 }
 
 /// The word size of a function's emitted lines: 1 word per instruction line

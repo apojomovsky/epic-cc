@@ -68,6 +68,14 @@ fn parse_val(s: &str) -> Val {
         Val::Const(1)
     } else if s == "false" {
         Val::Const(0)
+    } else if s == "poison" {
+        // A `poison` operand is never observed: any instruction that
+        // consumes poison has undefined behavior, so a conforming program
+        // cannot read the value. clang -O1 emits `poison` for ordinary
+        // programs (e.g. a dead call arg the optimizer replaced after
+        // specializing a noinline helper). Any materialization is therefore
+        // correct; 0 keeps the IR pipeline simple.
+        Val::Const(0)
     } else {
         Val::Const(s.parse::<i64>().unwrap_or_else(|_| panic!("SPIKE: cannot parse value {s:?}")))
     }
@@ -532,6 +540,10 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                     } else if t.starts_with("sret(") {
                         sret = true;
                     } else if t.starts_with('%') || t.starts_with('@') {
+                        val_tok = Some(t.clone());
+                    } else if t == "poison" {
+                        // see parse_val: a poison arg is never observed, so
+                        // materializing it as Const(0) is sound.
                         val_tok = Some(t.clone());
                     } else if t.parse::<i64>().is_ok() {
                         val_tok = Some(t.clone());

@@ -72,6 +72,10 @@ typedef unsigned int u32;\n\
 /// The volatile input globals' name prefix (`in0`, `in1`, …).
 const INPUT_PREFIX: &str = "in";
 
+/// The fixed input widths, in declaration order (`in0` u8, `in1` u16,
+/// `in2` u32).
+const INPUT_WIDTHS: [u8; 3] = [8, 16, 32];
+
 /// Sim step budget per differential run (the long e2e uses the same).
 const MAX_SIM_STEPS: usize = 5_000_000;
 
@@ -182,6 +186,10 @@ struct Gen {
     frame_est: u32,
     /// The biggest runtime-routine frame (bytes) the program needs so far.
     worst_routine: u32,
+    /// True while the feature-flagged (forced) statements are being emitted
+    /// (the flag-guaranteed phase): structured statements pick their
+    /// cheapest width so every flagged construct fits the frame budget.
+    forced: bool,
 }
 
 impl Gen {
@@ -198,6 +206,7 @@ impl Gen {
             used_struct: false,
             frame_est: 0,
             worst_routine: 0,
+            forced: false,
         }
     }
 
@@ -217,15 +226,22 @@ impl Gen {
 
     /// A `(width)`-cast operand: an input, a recent local, or a constant
     /// (always inside `width`'s range — constants never truncate).
+    ///
+    /// Only SAME-WIDTH inputs/locals are drawn: a cross-width cast would
+    /// make clang materialize a zext/trunc def in main's frame, and the
+    /// frame-budget model counts the statement's own defs, not the casts —
+    /// the corpus found the resulting bank-0 overflow (seeds 34/169/176).
     fn operand(&mut self, w: u8) -> String {
         let ct = ctype(w);
         let roll = self.below(10);
         if roll < 4 {
-            let i = self.below(3);
-            return format!("({ct}){INPUT_PREFIX}{i}");
+            let i = self.below(3) as usize;
+            if INPUT_WIDTHS[i] == w {
+                return format!("({ct}){INPUT_PREFIX}{i}");
+            }
         }
         if roll < 7 {
-            if let Some(o) = self.recent_local(ct) {
+            if let Some(o) = self.recent_local_width(w) {
                 return o;
             }
         }
@@ -241,22 +257,26 @@ impl Gen {
     /// i8/i16 division/modulo divisors: clang strength-reduces a CONSTANT
     /// divisor into a magic-number multiply in i9/i17 arithmetic, which the
     /// IR pipeline cannot parse (found by the corpus at seed 2). u32
-    /// constant divisors stay legal (clang emits a plain `udiv i32`).
+    /// constant divisors stay legal (clang emits a plain `udiv i32`). Like
+    /// `operand`, only same-width sources (no cast defs in main's frame).
     fn operand_reg(&mut self, w: u8) -> String {
         let ct = ctype(w);
+        // The input of the same width (each width has exactly one input:
+        // in0 u8, in1 u16, in2 u32).
+        let same_input = format!("({ct}){INPUT_PREFIX}{}", w / 8 - 1);
         if self.below(2) == 0 {
-            let i = self.below(3);
-            format!("({ct}){INPUT_PREFIX}{i}")
-        } else if let Some(o) = self.recent_local(ct) {
+            same_input
+        } else if let Some(o) = self.recent_local_width(w) {
             o
         } else {
-            let i = self.below(3);
-            format!("({ct}){INPUT_PREFIX}{i}")
+            same_input
         }
     }
 
-    /// The 1st/2nd live local back (skipping block-dead ones), if any.
-    fn recent_local(&mut self, ct: &str) -> Option<String> {
+    /// The 1st/2nd live local back (skipping block-dead ones), if any, of
+    /// EXACTLY width `w` (a different-width local would need a cast def).
+    fn recent_local_width(&mut self, w: u8) -> Option<String> {
+        let ct = ctype(w);
         if self.locals.is_empty() {
             return None;
         }
@@ -267,9 +287,12 @@ impl Gen {
             if self.dead.iter().any(|&(s, e)| idx >= s && idx < e) {
                 continue;
             }
+            let (name, lw) = &self.locals[idx];
+            if *lw != w {
+                continue;
+            }
             seen += 1;
             if seen == want {
-                let (name, _) = &self.locals[idx];
                 return Some(format!("({ct}){name}"));
             }
         }
@@ -339,10 +362,17 @@ impl Gen {
     ///   u8 mul/div/rem/shift: 3, u16 shift: 6, u16 div/rem: 8,
     ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 18 (14-byte scratch),
     ///   u32 mul: 22.
+    ///
+    /// Globals end (measured from the allocator): the fixed inputs
+    /// (in0 u8 @0x20, in1 u16 @0x22, in2 u32 @0x24) + checksum u8 end at
+    /// 0x29; `arr[8]` adds 8, the struct (u8 a / u16 b / u32 c, even-
+    /// aligned) adds 8. The old 0x28/6-byte-struct estimate ran low by up
+    /// to 4 bytes when both globals were used, silently eating into the
+    /// bank-0 headroom the model thinks it has.
     fn frame_budget(&self) -> u32 {
-        let globals = 0x28
+        let globals = 0x29
             + if self.used_array { 8 } else { 0 }
-            + if self.used_struct { 6 } else { 0 };
+            + if self.used_struct { 8 } else { 0 };
         0x70 - self.worst_routine - globals
     }
 
@@ -350,15 +380,18 @@ impl Gen {
     /// `routine`-byte runtime frame still fit? (`uses_array`/`uses_struct`
     /// are the post-statement globals.)
     fn fit(&self, frame: u32, routine: u32, uses_array: bool, uses_struct: bool) -> bool {
-        let globals = 0x28
+        let globals = 0x29
             + if self.used_array || uses_array { 8 } else { 0 }
-            + if self.used_struct || uses_struct { 6 } else { 0 };
+            + if self.used_struct || uses_struct { 8 } else { 0 };
         let routine = self.worst_routine.max(routine);
-        // An 8-byte safety margin: the per-statement estimates run low for
-        // u32-containing statements (clang keeps more SSA defs live than
-        // modeled), and the runtime routines' bank-0 slots are a hard
-        // limit (the loud isel assert).
-        self.frame_est + frame + 8 <= 0x70 - routine - globals
+        // The 8-byte safety margin applies to the FILL phase only: the
+        // per-statement estimates are measured upper bounds (>= real), so
+        // forced statements must fit by estimate alone — the margin would
+        // reject real-fit flagged combos (e.g. array+struct: 35 est of a
+        // 41 budget). The fill statements' cumulative real cost is still
+        // bounded by est + 8 <= the hard bank-0 limit.
+        let margin = if self.forced { 0 } else { 8 };
+        self.frame_est + frame + margin <= 0x70 - routine - globals
     }
 
     /// The noinline byte-mix fold helpers (emitted only when used).
@@ -415,7 +448,7 @@ impl Gen {
 
     fn emit_arith_inner(&mut self, forced: Option<BinOp>) -> bool {
         let r = self.below(100);
-        let w = if r < 50 { 8 } else if r < 80 { 16 } else { 32 };
+        let mut w = if r < 50 { 8 } else if r < 80 { 16 } else { 32 };
         let op = match forced {
             Some(op) => op,
             None if w == 32 => match self.below(10) {
@@ -428,40 +461,37 @@ impl Gen {
                     [self.below(5) as usize],
             },
             None => {
-                // Div/Rem/Sub/Mul/Shl/Shr weighted up so the corpus
-                // reliably exercises the whole op surface (the frame budget
-                // rejects the expensive ones often enough on its own).
+                // Div/Rem/Mul/Shl/Shr weighted up so the corpus reliably
+                // exercises the whole op surface (the frame budget rejects
+                // the expensive ones often enough on its own). Add/Sub
+                // stay covered by the if/loop/helper bodies. Shl/Shr get
+                // 5 of the 10 slots: the 8 fast seeds must jointly
+                // exercise every op and the 200-seed corpus needs >= 40
+                // shifts (the pinned coverage sanity checks).
                 match self.below(10) {
-                    0..=1 => BinOp::Div,
-                    2..=3 => BinOp::Rem,
-                    4..=5 => BinOp::Mul,
-                    6 => BinOp::Shl,
-                    7 => BinOp::Shr,
-                    8 => BinOp::Add,
-                    9 => BinOp::Sub,
-                    _ => unreachable!(),
+                    0 => BinOp::Div,
+                    1..=2 => BinOp::Rem,
+                    3..=4 => BinOp::Mul,
+                    5..=7 => BinOp::Shl,
+                    _ => BinOp::Shr,
                 }
             }
         };
+        // A FORCED (flag-guaranteed) op must fit, and the later forced
+        // statements' globals (array/struct) shrink the budget, so a heavy
+        // forced op always runs at u8 — the cheapest width. The guarantee
+        // is on the OP, not the width: a u8 mul still pulls in the mul
+        // runtime routine (mul i16), and u16/u32 arith stays covered by
+        // the fill statements. Fill statements keep the random width and
+        // simply return false when the budget rejects them (best-effort).
+        if forced.is_some() {
+            w = 8;
+        }
         // (main-frame cost, runtime-routine frame the statement needs).
         // Note w=8 mul lowers as mul i16 (__mul_u16, 18 bytes) and w=16 mul
         // as mul i32 (__mul_u32, 22 bytes): the width-space widening for
         // host-overflow safety pulls in the big routines.
-        let (cost, routine) = match (w, op) {
-            (8, BinOp::Mul) => (8, 18),
-            (8, BinOp::Div | BinOp::Rem) => (10, 14),
-            (8, BinOp::Shl | BinOp::Shr) => (8, 3), // variable count maybe
-            (8, _) => (7, 0),
-            (16, BinOp::Mul) => (14, 22),
-            (16, BinOp::Div | BinOp::Rem) => (12, 14),
-            (16, BinOp::Shl | BinOp::Shr) => (10, 6),
-            (16, _) => (10, 0),
-            (32, BinOp::Mul) => (16, 22),
-            (32, BinOp::Div | BinOp::Rem) => (14, 12),
-            (32, BinOp::Shl | BinOp::Shr) => (13, 12),
-            (32, _) => (12, 0),
-            _ => unreachable!(),
-        };
+        let (cost, routine) = arith_cost(w, op);
         if !self.fit(cost, routine, false, false) {
             return false;
         }
@@ -531,11 +561,19 @@ impl Gen {
 
     /// A comparison statement: the i1 result stored as u8 and folded.
     fn emit_cmp(&mut self) -> bool {
-        if !self.fit(7, 0, false, false) {
+        // Main-frame cost = the two operands + the i1 result, MEASURED
+        // from clang -O1 IR: u8 6, u16 ~8, u32 12 bytes of defs (rounded
+        // up; the flat-7 estimate under-ran u32 by 5).
+        let w = self.pick_width();
+        let cost = match w {
+            8 => 7,
+            16 => 9,
+            _ => 13,
+        };
+        if !self.fit(cost, 0, false, false) {
             return false;
         }
-        self.frame_est += 7;
-        let w = self.pick_width();
+        self.frame_est += cost;
         let ct = ctype(w);
         let rel = ["<", "<=", ">", ">=", "==", "!="][self.below(6) as usize];
         let a = self.operand(w);
@@ -548,19 +586,25 @@ impl Gen {
     /// the checksum (branch-conditional folding; the same seeded inputs run
     /// the same branch on both sides, and both arms' code survives).
     fn emit_ifelse(&mut self) -> bool {
-        let w = self.pick_width();
+        // A forced (flag-guaranteed) if always runs at u8 — the cheapest —
+        // so it fits alongside the other forced statements; the fill phase
+        // keeps the random width (u32 ifs are expensive, ~30 main bytes).
+        let w = if self.forced { 8 } else { self.pick_width() };
         let ct = ctype(w);
+        // Main-frame cost = the condition's operands/result + one local
+        // per arm, MEASURED from clang -O1 IR: u8 ~8-9, u16 ~16, u32 ~30
+        // bytes of defs.
         let cost = match w {
-            8 => 13,
+            8 => 9,
             16 => 16,
-            _ => 20,
+            _ => 30,
         };
         if !self.fit(cost, 0, false, false) {
             return false;
         }
         self.frame_est += cost;
         let cond = self.condition();
-        let mut arm = |g: &mut Self| -> String {
+        let arm = |g: &mut Self| -> String {
             let op = ["+", "-", "^", "|", "&"][g.below(5) as usize];
             let a = g.operand(w);
             let b = g.operand(w);
@@ -590,12 +634,19 @@ impl Gen {
     fn emit_loop(&mut self) -> bool {
         // Bias the accumulator to u8 (a u32 loop's phi web costs ~4x a u8
         // one in main's frame and starves the mul/div statements of budget
-        // — u32 math is covered by arith/struct/cmp instead).
-        let w = [8u8, 8, 8, 16][self.below(4) as usize];
+        // — u32 math is covered by arith/struct/cmp instead). A forced
+        // (flag-guaranteed) loop always runs at u8.
+        let w = if self.forced {
+            8
+        } else {
+            [8u8, 8, 8, 16][self.below(4) as usize]
+        };
         let ct = ctype(w);
+        // Main-frame cost = i + n + acc + t + 1-2 body temps, MEASURED
+        // from clang -O1 IR: u8 11, u16 ~15 bytes of defs (rounded up).
         let cost = match w {
-            8 => 15,
-            _ => 20,
+            8 => 12,
+            _ => 16,
         };
         // The `in0 % 5u` bound calls __urem_u8 (3 bytes); a variable-shift
         // body op calls __shl/__lshr at the accumulator width.
@@ -618,9 +669,14 @@ impl Gen {
         };
         let mut body = String::new();
         // 1-2 body ops (each is a def in the phi web — keep the loop cheap).
+        // NO `+`/`-` on the induction var: clang -O1 strength-reduces
+        // `acc += i` over the masked bound into a closed-form sum in i9
+        // magic arithmetic, which the IR pipeline cannot parse (found by
+        // the corpus at seed 78). `^`/`&`/`|` are not sum idioms, so the
+        // loop stays a real loop.
         let nops = 1 + self.below(2);
         for _ in 0..nops {
-            let op = ["+", "^", "-", "&", "|"][self.below(5) as usize];
+            let op = ["^", "&", "|"][self.below(3) as usize];
             body.push_str(&format!(
                 "    acc = ({ct})(({ct})acc {op} ({ct})i);\n"
             ));
@@ -646,10 +702,12 @@ impl Gen {
 
     /// A noinline call: `t = helper(args);` (0–3 unsigned params), folded.
     fn emit_call(&mut self, helpers: &[Helper]) -> bool {
-        if !self.fit(8, 0, false, false) {
+        // Main-frame cost = the single u8 result local (+ fold), MEASURED
+        // at 3 defs from clang -O1 IR.
+        if !self.fit(5, 0, false, false) {
             return false;
         }
-        self.frame_est += 8;
+        self.frame_est += 5;
         let h = &helpers[self.below(helpers.len() as u32) as usize];
         // Constant args only: clang -O1 was observed replacing a
         // volatile-derived call arg (a zext of a loaded value, local or
@@ -679,8 +737,10 @@ impl Gen {
     /// power-of-two N lowers to a mask, 3/5 to a real urem), a write, a
     /// read-back folded into the checksum.
     fn emit_array(&mut self) -> bool {
-        // `i % 3`/`i % 5` lower to a real __urem_u16 call (8-byte frame);
-        // pow2 N lowers to an `and`.
+        // Main-frame cost = the x/y operands + the ix local + the index
+        // casts, MEASURED at 8-10 defs from clang -O1 IR (seed 169: the
+        // index zext pushes it to 10). `i % 3`/`i % 5` lower to a real
+        // __urem_u16 call (8-byte frame); pow2 N lowers to an `and`.
         if !self.fit(11, 14, true, false) {
             return false;
         }
@@ -706,10 +766,15 @@ impl Gen {
     /// struct `s` (u8/u16/u32 fields), then a width-mixing fold over the
     /// fields (explicit casts; no layout dependence — names only).
     fn emit_struct(&mut self) -> bool {
-        if !self.fit(13, 0, false, true) {
+        // Main-frame cost = the three operand locals + the field loads +
+        // the s.c u32 shift/xor chain, MEASURED at 21-23 defs from clang
+        // -O1 IR (the u32 fold is expensive in main's frame — the old
+        // 13-byte estimate under-ran by ~10 and overflowed bank 0 once
+        // the routine frames were stacked on main's end).
+        if !self.fit(24, 0, false, true) {
             return false;
         }
-        self.frame_est += 13;
+        self.frame_est += 24;
         self.used_struct = true;
         let a = self.operand(8);
         let b = self.operand(16);
@@ -833,6 +898,31 @@ fn ctype(w: u8) -> &'static str {
     }
 }
 
+/// (main-frame cost, runtime-routine frame) for an arith statement at a
+/// width. The main-frame costs are MEASURED from clang -O1 IR for the
+/// generated statement shapes (volatile loads + the op + the fold call),
+/// rounded up: u8 5, u16 9, u32 15 bytes of defs. Note w=8 mul lowers as
+/// mul i16 (__mul_u16, 18 bytes) and w=16 mul as mul i32 (__mul_u32, 22
+/// bytes): the width-space widening for host-overflow safety pulls in the
+/// big routines.
+fn arith_cost(w: u8, op: BinOp) -> (u32, u32) {
+    match (w, op) {
+        (8, BinOp::Mul) => (8, 18),
+        (8, BinOp::Div | BinOp::Rem) => (10, 14),
+        (8, BinOp::Shl | BinOp::Shr) => (8, 3), // variable count maybe
+        (8, _) => (7, 0),
+        (16, BinOp::Mul) => (14, 22),
+        (16, BinOp::Div | BinOp::Rem) => (12, 14),
+        (16, BinOp::Shl | BinOp::Shr) => (10, 6),
+        (16, _) => (10, 0),
+        (32, BinOp::Mul) => (16, 22),
+        (32, BinOp::Div | BinOp::Rem) => (19, 12),
+        (32, BinOp::Shl | BinOp::Shr) => (13, 12),
+        (32, _) => (15, 0),
+        _ => unreachable!(),
+    }
+}
+
 /// Generate a deterministic program from `seed`.
 ///
 /// The full Task-2 surface: scalar arithmetic (+ - * / % & | ^ << >> on
@@ -855,15 +945,32 @@ pub fn generate(seed: u64) -> Program {
     // (mul/div/rem pull in the big runtime routines) are flags too: forced
     // FIRST, while the frame budget is empty, so the random fill cannot
     // starve them.
-    let feats = rng.next_u64();
-    let want_mul = feats & 1 != 0;
-    let want_div = feats & 2 != 0;
-    let want_rem = feats & 4 != 0;
-    let want_if = feats & 8 != 0;
-    let want_loop = feats & 16 != 0;
-    let want_call = feats & 32 != 0;
-    let want_array = feats & 64 != 0;
-    let want_struct = feats & 128 != 0;
+    //
+    // The flags are a BOUNDED random subset — exactly 2 of the 8, not
+    // independent bits: main's frame (and the runtime routines' bank-0
+    // slots derived from it) is a hard hardware limit, so one program can
+    // only hold a couple of heavy constructs. An unbounded bit-draw let a
+    // seed's forced tail exceed the budget and was SILENTLY DROPPED
+    // (review finding — 'guaranteed when flagged' was false); force() now
+    // panics if a flagged construct cannot fit, so the draw must stay
+    // inside the budget by construction. The RNG mix still varies which
+    // programs are rich (which 2 of the 8), and the fill statements cover
+    // the rest of the surface.
+    let nflags = 2; // exactly 2 flags per seed (see force()'s panic)
+    let mut flags = [false; 8];
+    let mut pool: Vec<u8> = (0..8).collect();
+    for _ in 0..nflags {
+        let i = (rng.next_u64() as usize) % pool.len();
+        flags[pool.remove(i) as usize] = true;
+    }
+    let want_mul = flags[0];
+    let want_div = flags[1];
+    let want_rem = flags[2];
+    let want_if = flags[3];
+    let want_loop = flags[4];
+    let want_call = flags[5];
+    let want_array = flags[6];
+    let want_struct = flags[7];
 
     // Inputs: a fixed u8/u16/u32 mix so every program exercises all three
     // widths (and u32 values beyond 2^16 in every run).
@@ -888,8 +995,9 @@ pub fn generate(seed: u64) -> Program {
     // random fill bounded by the frame budget — the backend gives every
     // SSA def, volatile loads included, its own RAM slot, so main's frame,
     // and the runtime routines' bank-0 slots derived from it, cap the
-    // program's size.
-    let mut force = |g: &mut Gen, k: usize| -> bool {
+    // program's size. While `forced` is set, the structured statements
+    // pick their cheapest width so every flagged construct fits.
+    let force = |g: &mut Gen, k: usize| -> bool {
         match k {
             0 => g.emit_forced_arith(BinOp::Mul),
             1 => g.emit_forced_arith(BinOp::Div),
@@ -901,6 +1009,7 @@ pub fn generate(seed: u64) -> Program {
             _ => g.emit_struct(),
         }
     };
+    g.forced = true;
     for (k, want) in [
         want_mul,
         want_div,
@@ -914,11 +1023,25 @@ pub fn generate(seed: u64) -> Program {
     .iter()
     .enumerate()
     {
-        if *want {
-            force(&mut g, k);
+        if *want && !force(&mut g, k) {
+            // A flagged construct is GUARANTEED to appear (the tests pin
+            // the corpus's per-seed feature coverage). Silently dropping it
+            // on a budget rejection would lose that coverage without a
+            // trace, so fail loudly instead — the frame-budget model must
+            // be recalibrated (cheaper forced variants, fewer simultaneous
+            // flags) until every flagged construct fits.
+            panic!(
+                "fuzz: seed {seed}: flagged construct #{k} rejected by the frame budget \
+                 (frame_est {}, worst_routine {}, budget {}) — the 'guaranteed when \
+                 flagged' contract is broken; recalibrate the budget model",
+                g.frame_est,
+                g.worst_routine,
+                g.frame_budget()
+            );
         }
     }
-    let mut stmt_kind = |g: &mut Gen| -> usize {
+    g.forced = false;
+    let stmt_kind = |g: &mut Gen| -> usize {
         // returns 0..4 (if/loop/call/array/struct) or 5/6 (arith/cmp)
         let r = g.below(100);
         match r {
