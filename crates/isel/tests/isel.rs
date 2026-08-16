@@ -2470,6 +2470,10 @@ fn routine_sig(name: &str) -> (&'static str, &'static [(&'static str, &'static s
         "__sdiv_i16" | "__srem_i16" => ("i16", &[("num", "i16"), ("den", "i16")], 7),
         "__shl_u8" | "__lshr_u8" | "__ashr_i8" => ("i8", &[("val", "i8"), ("cnt", "i8")], 3),
         "__shl_u16" | "__lshr_u16" | "__ashr_i16" => ("i16", &[("val", "i16"), ("cnt", "i16")], 4),
+        "__mul_u32" => ("i32", &[("a", "i32"), ("b", "i32")], 11),
+        "__udiv_u32" | "__urem_u32" => ("i32", &[("num", "i32"), ("den", "i32")], 10),
+        "__sdiv_i32" | "__srem_i32" => ("i32", &[("num", "i32"), ("den", "i32")], 12),
+        "__shl_u32" | "__lshr_u32" | "__ashr_i32" => ("i32", &[("val", "i32"), ("cnt", "i32")], 2),
         other => panic!("test: unknown routine {other}"),
     }
 }
@@ -4618,4 +4622,66 @@ fn i32_call_with_four_byte_param_and_return_simulates() {
         4,
     );
     assert_eq!(&got[..], &[0x7D, 0x56, 0x34, 0x12], "addm(0x12345678, 5) must be 0x1234567D");
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 12, Task 3: the i32 mul/div/rem/shift runtime routines.
+// ---------------------------------------------------------------------------
+//
+// The 8 i32 routines (legalize-injected Funcs with 4-byte params + the
+// scratch alloca per the layout contract) get recipe bodies in isel —
+// panic-first on the names, then the recipes. SIM tests are the load-bearing
+// checks: fixed inputs assembled + run in pic14_sim, result bytes asserted.
+
+/// Build the module for an i32 routine: `main` loads two globals, calls the
+/// routine, stores the result. Globals at 0x20-0x2B, main's locals at
+/// 0x2C-0x37, the routine's params at 0x40-0x47, `__scr` at 0x48+ — all
+/// ≤ 0x7F so the emitted asm assembles directly (bank 0, pre-banking).
+fn routine_module32(name: &str) -> (String, Vec<(String, u16)>) {
+    let (ret, params, scr) = routine_sig(name);
+    let pstr = params
+        .iter()
+        .map(|(n, t)| format!("{n}={t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ir = format!(
+        "global ina {ret}\n\
+         global inb {ret}\n\
+         global out {ret}\n\
+         fn {name}({ret}) ({pstr})\n\
+           block entry:\n\
+             %__scr = alloca {scr}\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load {ret} @ina\n\
+             %y = load {ret} @inb\n\
+             %r = call {ret} @{name}({ret} %x, {ret} %y)\n\
+             store {ret} %r @out\n\
+             ret void\n"
+    );
+    let mut map = vec![
+        ("ina".to_string(), 0x20),
+        ("inb".to_string(), 0x24),
+        ("out".to_string(), 0x28),
+        ("main::x".to_string(), 0x2C),
+        ("main::y".to_string(), 0x30),
+        ("main::r".to_string(), 0x34),
+    ];
+    let mut base = 0x40u16;
+    for (pn, _) in params {
+        map.push((format!("{name}::{pn}"), base));
+        base += 4;
+    }
+    map.push((format!("{name}::__scr"), base));
+    (ir, map)
+}
+
+/// Before the recipes land, an injected i32 routine must panic loudly
+/// (never an empty label that silently falls through into the next
+/// function).
+#[test]
+#[should_panic(expected = "no recipe for runtime routine @__mul_u32")]
+fn panics_on_unimplemented_i32_routine() {
+    let (ir, map) = routine_module32("__mul_u32");
+    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
 }

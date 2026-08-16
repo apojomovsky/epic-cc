@@ -4,15 +4,18 @@
 //! `legalize` is where scalar ops that need runtime-library support leave the
 //! IR's `Bin` form and become calls to injected routine functions:
 //!
-//! - `mul`/`udiv`/`urem`/`sdiv`/`srem` on i8/i16 (the PIC16F877A has no
+//! - `mul`/`udiv`/`urem`/`sdiv`/`srem` on i8/i16/i32 (the PIC16F877A has no
 //!   hardware multiply/divide) become `Inst::Call` to the matching routine
-//!   (`__mul_u8`/`__mul_u16`, `__udiv_u8`/`__udiv_u16`, `__urem_u8`/
-//!   `__urem_u16`, `__sdiv_i8`/`__sdiv_i16`, `__srem_i8`/`__srem_i16`) with
-//!   the dst/ty preserved and both operands copied as typed args.
+//!   (`__mul_u8`/`__mul_u16`/`__mul_u32`, `__udiv_u8`/`__udiv_u16`/
+//!   `__udiv_u32`, `__urem_u8`/`__urem_u16`/`__urem_u32`,
+//!   `__sdiv_i8`/`__sdiv_i16`/`__sdiv_i32`, `__srem_i8`/`__srem_i16`/
+//!   `__srem_i32`) with the dst/ty preserved and both operands copied as
+//!   typed args.
 //! - `shl`/`lshr`/`ashr` with a **const count stay as `Bin`** — isel inlines
 //!   the fixed RLF/RRF sequence; with a **reg count** they become a call to
-//!   the shift routine (`__shl_u8`/`__shl_u16`, `__lshr_u8`/`__lshr_u16`,
-//!   `__ashr_i8`/`__ashr_i16`), which masks the count and loops.
+//!   the shift routine (`__shl_u8`/`__shl_u16`/`__shl_u32`,
+//!   `__lshr_u8`/`__lshr_u16`/`__lshr_u32`,
+//!   `__ashr_i8`/`__ashr_i16`/`__ashr_i32`), which masks the count and loops.
 //! - `freeze` stays (isel lowers it as a byte copy).
 //!
 //! The used routine `Func`s are then injected into the module: ordinary
@@ -56,20 +59,28 @@ fn routine_name(op: BinOp, ty: Ty) -> Option<&'static str> {
     match (op, ty) {
         (BinOp::Mul, Ty::I8) => Some("__mul_u8"),
         (BinOp::Mul, Ty::I16) => Some("__mul_u16"),
+        (BinOp::Mul, Ty::I32) => Some("__mul_u32"),
         (BinOp::UDiv, Ty::I8) => Some("__udiv_u8"),
         (BinOp::UDiv, Ty::I16) => Some("__udiv_u16"),
+        (BinOp::UDiv, Ty::I32) => Some("__udiv_u32"),
         (BinOp::URem, Ty::I8) => Some("__urem_u8"),
         (BinOp::URem, Ty::I16) => Some("__urem_u16"),
+        (BinOp::URem, Ty::I32) => Some("__urem_u32"),
         (BinOp::SDiv, Ty::I8) => Some("__sdiv_i8"),
         (BinOp::SDiv, Ty::I16) => Some("__sdiv_i16"),
+        (BinOp::SDiv, Ty::I32) => Some("__sdiv_i32"),
         (BinOp::SRem, Ty::I8) => Some("__srem_i8"),
         (BinOp::SRem, Ty::I16) => Some("__srem_i16"),
+        (BinOp::SRem, Ty::I32) => Some("__srem_i32"),
         (BinOp::Shl, Ty::I8) => Some("__shl_u8"),
         (BinOp::Shl, Ty::I16) => Some("__shl_u16"),
+        (BinOp::Shl, Ty::I32) => Some("__shl_u32"),
         (BinOp::LShr, Ty::I8) => Some("__lshr_u8"),
         (BinOp::LShr, Ty::I16) => Some("__lshr_u16"),
+        (BinOp::LShr, Ty::I32) => Some("__lshr_u32"),
         (BinOp::AShr, Ty::I8) => Some("__ashr_i8"),
         (BinOp::AShr, Ty::I16) => Some("__ashr_i16"),
+        (BinOp::AShr, Ty::I32) => Some("__ashr_i32"),
         _ => None,
     }
 }
@@ -127,6 +138,10 @@ fn param(name: &str, width: u8) -> Param {
 /// | `__sdiv_i16`, `__srem_i16` | 7 | `flags`@0 (as i8), `rem`@1-2, `cnt`@3, `restore`@4-5, `spare`@6 |
 /// | `__shl_u8`, `__lshr_u8`, `__ashr_i8` | 3 | `cnt`@0 (masked count / loop counter — the value shifts in the `val` param slot), `spare`@1-2 (recipe scratch) |
 /// | `__shl_u16`, `__lshr_u16`, `__ashr_i16` | 4 | `cnt`@0-1 (masked count / loop counter), `spare`@2-3 (recipe scratch) |
+/// | `__mul_u32` | 11 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup — 2 bytes: the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product — the low 32 bits of the full product), `t`@7-10 (shifted multiplicand — 4 bytes, shifting left with wraparound: the shifted-out high bits are DISCARDED, i32 `mul` wraps) |
+/// | `__udiv_u32`, `__urem_u32` | 10 | `rem`@0-3 (partial remainder — full 32 bits, never carries out for a 32/32 divide), `den`@4-7 (denominator copy — the divmod subtracts/restores against this, so the param slot is untouched), `cnt`@8 (loop counter, 32), `spare`@9 (recipe scratch) |
+/// | `__sdiv_i32`, `__srem_i32` | 12 | the divmod part at the unsigned offsets — `rem`@0-3, `den`@4-7, `cnt`@8, `spare`@9 — plus `flags`@10 (sign state: bit0 = negate quotient = num<0 XOR den<0, bit1 = negate remainder = num<0), `spare`@11 |
+/// | `__shl_u32`, `__lshr_u32`, `__ashr_i32` | 2 | `cnt`@0 (masked count / loop counter — the value shifts in the `val` param slot), `spare`@1 (recipe scratch) |
 ///
 /// Notes: div-by-zero is LLVM poison — the loop runs (den = 0 ⇒ quotient
 /// 0xFFFF, remainder 0), any value is legal, no guard. Variable-shift counts
@@ -137,12 +152,16 @@ fn routine_func(name: &str) -> Func {
     let (ret, params, scr) = match name {
         "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 6),
         "__mul_u16" => (Ty::I16, vec![param("a", 2), param("b", 2)], 14),
+        "__mul_u32" => (Ty::I32, vec![param("a", 4), param("b", 4)], 11),
         "__udiv_u8" | "__urem_u8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 4),
         "__udiv_u16" | "__urem_u16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
+        "__udiv_u32" | "__urem_u32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 10),
         "__sdiv_i8" | "__srem_i8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 5),
         "__sdiv_i16" | "__srem_i16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
+        "__sdiv_i32" | "__srem_i32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 12),
         "__shl_u8" | "__lshr_u8" | "__ashr_i8" => (Ty::I8, vec![param("val", 1), param("cnt", 1)], 3),
         "__shl_u16" | "__lshr_u16" | "__ashr_i16" => (Ty::I16, vec![param("val", 2), param("cnt", 2)], 4),
+        "__shl_u32" | "__lshr_u32" | "__ashr_i32" => (Ty::I32, vec![param("val", 4), param("cnt", 4)], 2),
         other => panic!("legalize: unknown runtime routine {other}"),
     };
     Func {

@@ -50,28 +50,36 @@ fn ssa_key(func: &str, name: &str) -> String {
 }
 
 /// The runtime routine names legalize injects for mul/div/rem/shift. All
-/// sixteen have recipe bodies (Task 3: mul/div/rem; Task 4: shifts). An
-/// injected routine's entry block holds only a scratch alloca, so emitting
-/// it as-is would produce an empty label that silently falls through into
-/// the next function — a routine name with no recipe yet must panic loudly
-/// instead.
-const ROUTINE_NAMES: [&str; 16] = [
+/// twenty-four have recipe bodies (Task 3: the i32 mul/div/rem + shifts;
+/// M8: the i8/i16 set). An injected routine's entry block holds only a
+/// scratch alloca, so emitting it as-is would produce an empty label that
+/// silently falls through into the next function — a routine name with no
+/// recipe yet must panic loudly instead.
+const ROUTINE_NAMES: [&str; 24] = [
     "__mul_u8",
     "__mul_u16",
+    "__mul_u32",
     "__udiv_u8",
     "__urem_u8",
     "__udiv_u16",
     "__urem_u16",
+    "__udiv_u32",
+    "__urem_u32",
     "__sdiv_i8",
     "__srem_i8",
     "__sdiv_i16",
     "__srem_i16",
+    "__sdiv_i32",
+    "__srem_i32",
     "__shl_u8",
     "__lshr_u8",
     "__ashr_i8",
     "__shl_u16",
     "__lshr_u16",
     "__ashr_i16",
+    "__shl_u32",
+    "__lshr_u32",
+    "__ashr_i32",
 ];
 
 fn is_routine_name(name: &str) -> bool {
@@ -2183,10 +2191,12 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // fall through into the next function.
     if is_routine_name(&f.name) {
         match &f.name[..] {
-            "__mul_u8" | "__mul_u16" | "__udiv_u8" | "__urem_u8"
-            | "__udiv_u16" | "__urem_u16" | "__sdiv_i8" | "__srem_i8"
-            | "__sdiv_i16" | "__srem_i16" | "__shl_u8" | "__lshr_u8"
-            | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16" => {}
+            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8"
+            | "__udiv_u16" | "__urem_u16" | "__udiv_u32" | "__urem_u32"
+            | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
+            | "__sdiv_i32" | "__srem_i32" | "__shl_u8" | "__lshr_u8"
+            | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
+            | "__shl_u32" | "__lshr_u32" | "__ashr_i32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
         g.emit_routine();
