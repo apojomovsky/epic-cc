@@ -262,8 +262,14 @@ impl Gen {
     fn operand_reg(&mut self, w: u8) -> String {
         let ct = ctype(w);
         // The input of the same width (each width has exactly one input:
-        // in0 u8, in1 u16, in2 u32).
-        let same_input = format!("({ct}){INPUT_PREFIX}{}", w / 8 - 1);
+        // in0 u8, in1 u16, in2 u32), found by position in INPUT_WIDTHS like
+        // `operand` does — a w / 8 - 1 formula would yield the undeclared
+        // in3 for w = 32.
+        let i = INPUT_WIDTHS
+            .iter()
+            .position(|&x| x == w)
+            .expect("operand_reg: no input of this width");
+        let same_input = format!("({ct}){INPUT_PREFIX}{i}");
         if self.below(2) == 0 {
             same_input
         } else if let Some(o) = self.recent_local_width(w) {
