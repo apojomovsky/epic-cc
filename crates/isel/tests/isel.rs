@@ -1390,6 +1390,38 @@ fn loop_with_cross_referencing_phis_simulates() {
 }
 
 #[test]
+fn separate_latch_back_edge_cross_referencing_phis_simulates() {
+    // A TWO-BLOCK loop (a latch block + the merge header) with
+    // cross-referencing phis: %acc = phi [0, entry] [%i, latch] feeds off
+    // the header's %i phi, so on the latch -> header back edge the %acc
+    // copy must read the OLD i before the %i copy overwrites the slot. The
+    // pred != merge here (unlike the folded self-loop above), so the old
+    // pred == merge discriminator picked writer-first: `%i <- %i.next` then
+    // `%acc <- %i` made the accumulator read the NEW induction value —
+    // acc = n instead of n-1. acc = n-1 for n >= 1.
+    let ir = "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = and i8 %1, 7\n    br header\n  block header:\n    %i = phi i8 0 entry %i.next latch\n    %acc = phi i8 0 entry %i latch\n    %7 = icmp eq i8 %i, %2\n    br i1 %7 exit latch\n  block latch:\n    %i.next = add i8 %i, 1\n    br header\n  block exit:\n    store i8 %acc @out\n    ret void\n";
+    let map = vec![
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x26),
+        ("main::i", 0x27),
+        ("main::acc", 0x28),
+        ("main::7", 0x29),
+        ("main::i.next", 0x2A),
+    ];
+    for (seed_byte, expect) in [
+        (0u8, 0u8),   // n = 0: the loop body never runs, acc = 0
+        (105, 0),     // n = 1: acc = 0 (the old i of the only latch run)
+        (2, 1),       // n = 2: acc = 1
+        (7, 6),       // n = 7: acc = 6
+    ] {
+        let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, seed_byte)], 0x21, 1);
+        assert_eq!(got[0], expect, "acc for n = {} (in0 = {seed_byte})", seed_byte & 7);
+    }
+}
+
+#[test]
 fn and_i8_uses_andwf_andlw() {
     // reg-reg: MOVF b,W; ANDWF a,W; MOVWF d. reg-const: MOVF a,W; ANDLW k.
     let m = parse(

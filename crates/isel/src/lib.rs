@@ -40,7 +40,7 @@
 //! layout) and panics loudly if a value is missing from it.
 
 use ir::{BinOp, Gep, GepBase, Inst, Module, Ty, Val};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Map key for a local value: `{func}::{name}` (IR value names without `%`).
 /// Matches the keys `alloc` emits in its overlay layout, so a callee's param
@@ -2470,6 +2470,60 @@ impl<'m> Gen<'m> {
     }
 }
 
+/// The classic iterative dominator sets for a function's CFG: `doms[b]` is
+/// the set of blocks that dominate block `b`. Used to classify the phi-copy
+/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred` — the
+/// pred is inside the merge's loop, so on that edge the merge's phi slots
+/// hold the CURRENT iteration's values. This covers self-loops
+/// (pred == merge) AND separate-latch back edges (pred is a latch block).
+fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
+    let entry = &f.blocks[0].label;
+    let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
+    // Predecessor lists from the terminators' targets (the terminator is
+    // the last inst of every block).
+    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in &f.blocks {
+        let targets: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            _ => vec![],
+        };
+        for t in targets {
+            preds.entry(t).or_default().push(b.label.as_str());
+        }
+    }
+    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
+    dom.insert(entry.clone(), HashSet::from([entry.clone()]));
+    for b in &f.blocks {
+        if b.label != *entry {
+            dom.insert(b.label.clone(), all.clone());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            if b.label == *entry {
+                continue;
+            }
+            let mut new: HashSet<String> = match preds.get(b.label.as_str()) {
+                Some(ps) => ps
+                    .iter()
+                    .map(|p| dom[*p].clone())
+                    .reduce(|a, c| a.intersection(&c).cloned().collect())
+                    .unwrap_or_else(|| all.clone()),
+                None => all.clone(),
+            };
+            new.insert(b.label.clone());
+            if new != dom[&b.label] {
+                dom.insert(b.label.clone(), new);
+                changed = true;
+            }
+        }
+    }
+    dom
+}
+
 /// Emit one function's body into `g.out`: runtime routines get their recipe
 /// body; ordinary functions get the block labels, phi copies, and
 /// terminators. Shared by both emission passes — pass A measures the body
@@ -2529,6 +2583,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             }
         }
     }
+    // Back-edge classifier for the phi-copy ordering: `merge` dominates the
+    // pred (self-loop OR separate-latch back edge) => the merge's phi slots
+    // hold the current iteration's values and readers run first.
+    let doms = block_dominators(f);
     for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
         if i == 0 && f.isr {
@@ -2590,7 +2648,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                     let merge = br.target.clone();
                     if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
                         g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                        emit_phi_copies(g, c, b.label == merge);
+                        emit_phi_copies(g, c, doms[&b.label].contains(&merge));
                     }
                     g.emit(format!("    GOTO {}", labels[&merge]));
                 }
@@ -2617,10 +2675,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lcop}"));
                                     g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                                    emit_phi_copies(g, cf, b.label == bc.f);
+                                    emit_phi_copies(g, cf, doms[&b.label].contains(&bc.f));
                                     g.emit(format!("    GOTO {lf}"));
                                     g.emit(format!("{lcop}:"));
-                                    emit_phi_copies(g, ct, b.label == bc.t);
+                                    emit_phi_copies(g, ct, doms[&b.label].contains(&bc.t));
                                     g.emit(format!("    GOTO {lt}"));
                                 }
                                 // The copies feed the f (cond==0 fall-through)
@@ -2629,7 +2687,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lt}"));
                                     g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                                    emit_phi_copies(g, c, b.label == bc.f);
+                                    emit_phi_copies(g, c, doms[&b.label].contains(&bc.f));
                                     g.emit(format!("    GOTO {lf}"));
                                 }
                                 // The copies feed the t (cond!=0 jump) edge:
@@ -2638,7 +2696,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                     g.emit("    BTFSC STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lf}"));
                                     g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                                    emit_phi_copies(g, c, b.label == bc.t);
+                                    emit_phi_copies(g, c, doms[&b.label].contains(&bc.t));
                                     g.emit(format!("    GOTO {lt}"));
                                 }
                             }
@@ -2647,13 +2705,13 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                             if *k != 0 {
                                 if let Some(c) = t_copies {
                                     g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                                    emit_phi_copies(g, c, b.label == bc.t);
+                                    emit_phi_copies(g, c, doms[&b.label].contains(&bc.t));
                                 }
                                 g.emit(format!("    GOTO {lt}"));
                             } else {
                                 if let Some(c) = f_copies {
                                     g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
-                                    emit_phi_copies(g, c, b.label == bc.f);
+                                    emit_phi_copies(g, c, doms[&b.label].contains(&bc.f));
                                 }
                                 g.emit(format!("    GOTO {lf}"));
                             }
@@ -2710,18 +2768,31 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
 /// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
 /// copy never overwrites a slot a later copy still needs to read.
 ///
-/// The ordering depends on whether the edge is a SELF-loop (pred == merge):
-/// - Self-loop back-edge: the phi slots hold the CURRENT iteration's
-///   values, so a copy reading a slot another copy writes must run BEFORE
-///   the overwrite (reader first). The folded-induction loop
-///   `%acc <- %i, %i <- %i+1` needs acc before i, or the accumulator
-///   reads the NEW induction value (found by the fuzz corpus).
-/// - Other edges: a phi slot is only defined by THIS edge's copies, so a
+/// The ordering depends on whether the edge is a BACK edge into the merge
+/// (`back_edge`, computed by `block_dominators` — the merge block dominates
+/// the pred, so the pred is inside the merge's loop):
+/// - Back edge (a self-loop OR a separate-latch back edge): the merge's phi
+///   slots hold the CURRENT iteration's values, so a copy reading a slot
+///   another copy writes must run BEFORE the overwrite (reader first). The
+///   folded-induction loop `%acc <- %i, %i <- %i+1` needs acc before i, and
+///   a two-block loop's cross-referencing phis (`%i <- %i.next,
+///   %acc <- %i` on the latch edge) need the OLD i: writer-first emits
+///   `%i <- %i.next` then `%acc <- %i`, so the accumulator reads the NEW
+///   induction value — acc = n instead of n-1 (the same seed-75 off-by-one
+///   class the fuzz corpus found on the self-loop form; the generated
+///   for-loops are single-block, so the separate-latch edge went wrong
+///   silently).
+/// - Forward edge: a phi slot is only defined by THIS edge's copies, so a
 ///   copy reading a slot another copy writes must run AFTER its definer
-///   (writer first; the %p <- %a, %q <- %p chain).
+///   (writer first; the %p <- %a, %q <- %p chain). This is why the
+///   discriminator is the edge's CFG position (dominance), not merely
+///   whether a copy's source is one of the merge's phi destinations: the
+///   same slot-aliasing shape needs writer-first on a forward edge (the
+///   source slot is not live yet) and reader-first on a back edge (it
+///   holds the current iteration's value).
 /// A true cycle (%a <- %b, %b <- %a — a loop-carried swap) needs a temp
 /// register, so it panics loudly rather than silently miscompile.
-fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], self_loop: bool) {
+fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
     let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
         .iter()
         .map(|(dst, ty, val)| {
@@ -2743,13 +2814,17 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], self_loop:
                 continue;
             }
             let (da, src, ty, val) = &pending[i];
-            let blocked = if self_loop {
+            let blocked = if back_edge {
                 // Reader first: blocked while an un-emitted sibling READS
-                // this copy's destination (sibling source == my dst).
+                // this copy's destination (sibling source == my dst) — that
+                // sibling reads a merge phi slot holding the current
+                // iteration's live value and must run before the overwrite.
                 (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
             } else {
                 // Writer first: blocked while an un-emitted sibling WRITES
-                // this copy's source (sibling dst == my src).
+                // this copy's source (sibling dst == my src) — on a forward
+                // edge the source slot is only defined by this edge's
+                // copies, so a reader runs after its definer.
                 match src {
                     Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s),
                     None => false,
