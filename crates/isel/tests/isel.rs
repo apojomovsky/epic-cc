@@ -4865,13 +4865,13 @@ fn isr_emits_vector_entry_prologue_epilogue() {
     assert!(asm.contains("    org 0x0004"), "the vector pad to word 4:\n{asm}");
     assert!(
         asm.contains(
-            "    org 0x0004\nisr:\n    MOVWF 0x75\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78\n    MOVLW 0x00\n    MOVWF PCLATH"
+            "    org 0x0004\nisr:\n    MOVWF 0x75\n    SWAPF 0x75, F\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78\n    MOVF 0x71, W\n    MOVWF 0x79\n    MOVF 0x72, W\n    MOVWF 0x7A\n    MOVF 0x73, W\n    MOVWF 0x7B\n    MOVF 0x74, W\n    MOVWF 0x7C\n    MOVLW 0x00\n    MOVWF PCLATH"
         ),
-        "the 9-line save prologue, right after the vector pad:\n{asm}"
+        "the 18-line save prologue, right after the vector pad:\n{asm}"
     );
     assert!(
         asm.contains(
-            "    MOVF 0x77, W\n    MOVWF PCLATH\n    SWAPF 0x76, W\n    MOVWF STATUS\n    MOVF 0x78, W\n    MOVWF FSR\n    MOVF 0x75, W\n    RETFIE"
+            "    MOVF 0x79, W\n    MOVWF 0x71\n    MOVF 0x7A, W\n    MOVWF 0x72\n    MOVF 0x7B, W\n    MOVWF 0x73\n    MOVF 0x7C, W\n    MOVWF 0x74\n    MOVF 0x77, W\n    MOVWF PCLATH\n    MOVF 0x78, W\n    MOVWF FSR\n    SWAPF 0x76, W\n    MOVWF STATUS\n    SWAPF 0x75, W\n    RETFIE"
         ),
         "the restore epilogue + RETFIE (replacing the ISR's ret):\n{asm}"
     );
@@ -4953,9 +4953,9 @@ fn banking_leaves_sfr_and_isr_save_area_untouched() {
         banked.contains("main:\n    MOVF 0x06, W"),
         "SFR load is direct with no BANKSEL:\n{banked}"
     );
-    // The save area (common RAM 0x75-0x78) passes through untouched.
+    // The save area (common RAM 0x75-0x7C) passes through untouched.
     assert!(
-        banked.contains("    MOVWF 0x75\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78"),
+        banked.contains("    MOVWF 0x75\n    SWAPF 0x75, F\n    SWAPF STATUS, W\n    MOVWF 0x76\n    MOVF PCLATH, W\n    MOVWF 0x77\n    MOVF FSR, W\n    MOVWF 0x78\n    MOVF 0x71, W\n    MOVWF 0x79\n    MOVF 0x72, W\n    MOVWF 0x7A\n    MOVF 0x73, W\n    MOVWF 0x7B\n    MOVF 0x74, W\n    MOVWF 0x7C"),
         "the ISR save area survives banking untouched:\n{banked}"
     );
 }
@@ -4976,69 +4976,97 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
     // and banking_leaves_sfr_and_isr_save_area_untouched; every word below
     // is the encoding of the corresponding emitted instruction).
     //
-    // Layout: word 0 = reset GOTO __start (word 35); words 1-3 = the
-    // `.org 4` pad; words 4-31 = the ISR (save prologue 4-12, body 13-23,
-    // restore epilogue 24-30, RETFIE 31); word 32-34 = the same-page
-    // helper; words 35-46 = __start (the "main" context).
+    // Layout: word 0 = reset GOTO __start (word 55); words 1-3 = the
+    // `.org 4` pad; words 4-50 = the ISR (save prologue 4-21, body 22-34,
+    // restore epilogue 35-49, RETFIE 50); words 51-54 = the same-page
+    // helper (returns through the retval region: 0x71 = in + 1); words
+    // 55-66 = __start (the "main" context).
     //
     // The interrupted context is built in __start: W = 0x41 (0x42 +
     // 0xFF), STATUS = 0x03 (C+DC from the ADDLW), PCLATH = 0, FSR = 0x12
-    // (pre-seeded). The ISR body writes in -> isr_g (0x21), calls the
-    // helper (in+1 -> hlp_g 0x22), then clobbers W/STATUS/FSR/PCLATH; the
-    // epilogue must restore every one of them from 0x75-0x78.
+    // (pre-seeded), and an in-flight return value 0x11/0x22/0x33/0x44 in
+    // the retval region 0x71-0x74 (also pre-seeded — main was "inside" a
+    // call whose result it had not yet consumed). The ISR body writes in
+    // -> isr_g (0x21), calls the helper (in+1 -> hlp_g 0x22, 0x71), then
+    // clobbers W/STATUS/FSR/PCLATH and the retval bytes 0x72-0x74; the
+    // epilogue must restore every one of them from 0x75-0x7C.
     use pic14_sim::Pic14;
     let words: Vec<u16> = vec![
-        0x2823, //  0: GOTO 35 (__start)
+        0x2837, //  0: GOTO 55 (__start)
         0x0000, //  1: .org 4 pad
         0x0000, //  2
         0x0000, //  3
         0x00F5, //  4: MOVWF 0x75        save W
-        0x0E03, //  5: SWAPF STATUS, W   STATUS -> W without touching it
-        0x00F6, //  6: MOVWF 0x76        save SWAPF(STATUS)
-        0x080A, //  7: MOVF PCLATH, W
-        0x00F7, //  8: MOVWF 0x77        save PCLATH
-        0x0804, //  9: MOVF FSR, W
-        0x00F8, // 10: MOVWF 0x78        save FSR
-        0x3000, // 11: MOVLW 0x00
-        0x008A, // 12: MOVWF PCLATH     ISR body runs in page 0
-        0x0820, // 13: MOVF 0x20, W      body: W = in
-        0x00A1, // 14: MOVWF 0x21        isr_g = in (the ISR's global write)
-        0x00AA, // 15: MOVWF 0x2A        helper's param slot = in
-        0x3000, // 16: MOVLW 0x00        PAGE(helper)
-        0x008A, // 17: MOVWF PCLATH
-        0x2020, // 18: CALL 32           same-page helper
-        0x00A2, // 19: MOVWF 0x22        hlp_g = helper(in) = in + 1
-        0x30FF, // 20: MOVLW 0xFF        clobber W
-        0x0084, // 21: MOVWF FSR         clobber FSR
-        0x3018, // 22: MOVLW 0x18        clobber PCLATH
-        0x008A, // 23: MOVWF PCLATH
-        0x0877, // 24: MOVF 0x77, W      epilogue: W = saved PCLATH
-        0x008A, // 25: MOVWF PCLATH      restore PCLATH
-        0x0E76, // 26: SWAPF 0x76, W     W = swap(saved STATUS)
-        0x0083, // 27: MOVWF STATUS      restore STATUS
-        0x0878, // 28: MOVF 0x78, W      W = saved FSR
-        0x0084, // 29: MOVWF FSR         restore FSR
-        0x0875, // 30: MOVF 0x75, W      W = saved W (last: MOVF clobbers W)
-        0x0009, // 31: RETFIE
-        0x082A, // 32: helper: MOVF 0x2A, W
-        0x3E01, // 33: ADDLW 0x01        W = in + 1
-        0x0008, // 34: RETURN
-        0x3042, // 35: __start: MOVLW 0x42
-        0x3EFF, // 36: ADDLW 0xFF        W = 0x41, STATUS = 0x03 (interrupted ctx)
-        0x2004, // 37: CALL 4            "interrupt" — push 38, jump to vector
-        0x00A3, // 38: MOVWF 0x23        out_w = restored W (0x41)
-        0x080A, // 39: MOVF PCLATH, W
-        0x00A4, // 40: MOVWF 0x24        out_pclath = restored PCLATH (0)
-        0x0804, // 41: MOVF FSR, W
-        0x00A5, // 42: MOVWF 0x25        out_fsr = restored FSR (0x12)
-        0x0803, // 43: MOVF STATUS, W
-        0x00A6, // 44: MOVWF 0x26        out_status = restored STATUS (0x03)
-        0x282E, // 45: GOTO 46           needs the restored PCLATH = 0
-        0x0063, // 46: SLEEP
+        0x0EF5, //  5: SWAPF 0x75, F     swap W in place (no STATUS side effects)
+        0x0E03, //  6: SWAPF STATUS, W   STATUS -> W without touching it
+        0x00F6, //  7: MOVWF 0x76        save SWAPF(STATUS)
+        0x080A, //  8: MOVF PCLATH, W
+        0x00F7, //  9: MOVWF 0x77        save PCLATH
+        0x0804, // 10: MOVF FSR, W
+        0x00F8, // 11: MOVWF 0x78        save FSR
+        0x0871, // 12: MOVF 0x71, W      save the in-flight retval bytes
+        0x00F9, // 13: MOVWF 0x79
+        0x0872, // 14: MOVF 0x72, W
+        0x00FA, // 15: MOVWF 0x7A
+        0x0873, // 16: MOVF 0x73, W
+        0x00FB, // 17: MOVWF 0x7B
+        0x0874, // 18: MOVF 0x74, W
+        0x00FC, // 19: MOVWF 0x7C
+        0x3000, // 20: MOVLW 0x00
+        0x008A, // 21: MOVWF PCLATH     ISR body runs in page 0
+        0x0820, // 22: MOVF 0x20, W      body: W = in
+        0x00A1, // 23: MOVWF 0x21        isr_g = in (the ISR's global write)
+        0x00AA, // 24: MOVWF 0x2A        helper's param slot = in
+        0x3000, // 25: MOVLW 0x00        PAGE(helper)
+        0x008A, // 26: MOVWF PCLATH
+        0x2033, // 27: CALL 51           same-page helper
+        0x00A2, // 28: MOVWF 0x22        hlp_g = helper(in) = in + 1
+        0x30FF, // 29: MOVLW 0xFF        clobber W
+        0x0084, // 30: MOVWF FSR         clobber FSR
+        0x008A, // 31: MOVWF PCLATH      clobber PCLATH
+        0x00F2, // 32: MOVWF 0x72        clobber retval byte 1
+        0x00F3, // 33: MOVWF 0x73        clobber retval byte 2
+        0x00F4, // 34: MOVWF 0x74        clobber retval byte 3
+        0x0879, // 35: MOVF 0x79, W      epilogue: retval first (MOVF Z
+        0x00F1, // 36: MOVWF 0x71        clobbers are fine: STATUS not yet
+        0x087A, // 37: MOVF 0x7A, W      restored)
+        0x00F2, // 38: MOVWF 0x72
+        0x087B, // 39: MOVF 0x7B, W
+        0x00F3, // 40: MOVWF 0x73
+        0x087C, // 41: MOVF 0x7C, W
+        0x00F4, // 42: MOVWF 0x74
+        0x0877, // 43: MOVF 0x77, W      W = saved PCLATH
+        0x008A, // 44: MOVWF PCLATH      restore PCLATH
+        0x0878, // 45: MOVF 0x78, W      W = saved FSR
+        0x0084, // 46: MOVWF FSR         restore FSR
+        0x0E76, // 47: SWAPF 0x76, W     W = swap(saved STATUS)
+        0x0083, // 48: MOVWF STATUS      restore STATUS (flag-safe)
+        0x0E75, // 49: SWAPF 0x75, W     W = saved W (swap-back, flag-safe — last)
+        0x0009, // 50: RETFIE
+        0x082A, // 51: helper: MOVF 0x2A, W
+        0x3E01, // 52: ADDLW 0x01        W = in + 1
+        0x00F1, // 53: MOVWF 0x71        result through the retval region
+        0x0008, // 54: RETURN
+        0x3042, // 55: __start: MOVLW 0x42
+        0x3EFF, // 56: ADDLW 0xFF        W = 0x41, STATUS = 0x03 (interrupted ctx)
+        0x2004, // 57: CALL 4            "interrupt" — push 58, jump to vector
+        0x00A3, // 58: MOVWF 0x23        out_w = restored W (0x41)
+        0x080A, // 59: MOVF PCLATH, W
+        0x00A4, // 60: MOVWF 0x24        out_pclath = restored PCLATH (0)
+        0x0804, // 61: MOVF FSR, W
+        0x00A5, // 62: MOVWF 0x25        out_fsr = restored FSR (0x12)
+        0x0803, // 63: MOVF STATUS, W
+        0x00A6, // 64: MOVWF 0x26        out_status = restored STATUS (0x03)
+        0x2842, // 65: GOTO 66           needs the restored PCLATH = 0
+        0x0063, // 66: SLEEP
     ];
     let mut p = Pic14::new(words);
     p.ram_mut()[0x20] = 0x42; // in
     p.ram_mut()[0x04] = 0x12; // the interrupted context's FSR
+    p.ram_mut()[0x71] = 0x11; // the interrupted context's in-flight retval
+    p.ram_mut()[0x72] = 0x22;
+    p.ram_mut()[0x73] = 0x33;
+    p.ram_mut()[0x74] = 0x44;
     p.run(1000);
     assert!(p.halted(), "program must SLEEP-halt");
     // The ISR body's writes: its own global and the same-page helper result.
@@ -5046,13 +5074,139 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
     assert_eq!(p.ram()[0x22], 0x43, "hlp_g = helper(in) = in + 1 (same-page call from the ISR)");
     // The interrupted computation completes: every restored register lands.
     assert_eq!(p.ram()[0x23], 0x41, "out_w = restored W (body left W = 0xFF)");
-    assert_eq!(p.ram()[0x24], 0x00, "out_pclath = restored PCLATH (body left 0x18)");
+    assert_eq!(p.ram()[0x24], 0x00, "out_pclath = restored PCLATH (body left 0xFF)");
     assert_eq!(p.ram()[0x25], 0x12, "out_fsr = restored FSR (body left 0xFF)");
     assert_eq!(p.ram()[0x26], 0x03, "out_status = restored STATUS (body left 0x00)");
-    // The save area (fixed common RAM 0x75-0x78, disjoint from scratch 0x70
-    // and retval 0x71-0x74): W, SWAPF(STATUS), PCLATH, FSR at vector entry.
-    assert_eq!(p.ram()[0x75], 0x41, "saved W");
+    // The in-flight retval survives the ISR: the helper wrote 0x71 = 0x43
+    // and the body wrote 0xFF into 0x72-0x74, but the epilogue restored
+    // main's 0x11/0x22/0x33/0x44 from the extended save area.
+    assert_eq!(p.ram()[0x71], 0x11, "restored retval byte 0 (helper wrote 0x43)");
+    assert_eq!(p.ram()[0x72], 0x22, "restored retval byte 1 (body wrote 0xFF)");
+    assert_eq!(p.ram()[0x73], 0x33, "restored retval byte 2 (body wrote 0xFF)");
+    assert_eq!(p.ram()[0x74], 0x44, "restored retval byte 3 (body wrote 0xFF)");
+    // The save area (fixed common RAM 0x75-0x7C, disjoint from scratch
+    // 0x70 and the retval region 0x71-0x74): SWAPF(W), SWAPF(STATUS),
+    // PCLATH, FSR, retval x4 at vector entry.
+    assert_eq!(p.ram()[0x75], 0x14, "saved W nibble-swapped (0x41 -> 0x14)");
     assert_eq!(p.ram()[0x76], 0x30, "saved STATUS nibble-swapped (0x03 -> 0x30)");
     assert_eq!(p.ram()[0x77], 0x00, "saved PCLATH");
     assert_eq!(p.ram()[0x78], 0x12, "saved FSR");
+    assert_eq!(p.ram()[0x79], 0x11, "saved retval byte 0");
+    assert_eq!(p.ram()[0x7A], 0x22, "saved retval byte 1");
+    assert_eq!(p.ram()[0x7B], 0x33, "saved retval byte 2");
+    assert_eq!(p.ram()[0x7C], 0x44, "saved retval byte 3");
+}
+
+#[test]
+fn isr_epilogue_preserves_preempted_z_for_main_branch() {
+    // The M13-T5 regression: the OLD epilogue restored STATUS (flag-safe
+    // SWAPF) but then restored FSR and W with MOVF — which SETS Z from the
+    // moved value AFTER STATUS was already restored, corrupting the
+    // interrupted main's Z. Here main sets Z = 1 (`ADDWF 0x20, F` -> 0x00)
+    // with W = 0xFF non-zero, the ISR fires between the Z-setting ADDWF
+    // and the Z-consuming BTFSS, the ISR body leaves
+    // W/STATUS/FSR/PCLATH clobbered (W = 0x5A, Z = 0, FSR = 0x00,
+    // PCLATH = 0x18), and main's branch must still take the preempted
+    // Z = 1 path (out = 0xAA). Pre-fix, the epilogue's final MOVF 0x75, W
+    // clears Z (saved W = 0xFF != 0), so main falls into the wrong branch
+    // (out = 0xBB).
+    //
+    // fire_interrupt pushes pc+1 and jumps to the vector: firing at the
+    // NOP at word 51 (between the ADDWF at 50 and the BTFSS at 52) resumes
+    // main at 52, so the Z test runs against the restored STATUS.
+    //
+    // Words are the exact encodings of the emitted prologue/epilogue (the
+    // TEXT is asserted verbatim by isr_emits_vector_entry_prologue_epilogue).
+    use pic14_sim::Pic14;
+    let words: Vec<u16> = vec![
+        0x282D, //  0: GOTO 45 (__start)
+        0x0000, //  1: .org 4 pad
+        0x0000, //  2
+        0x0000, //  3
+        0x00F5, //  4: MOVWF 0x75        prologue: save W
+        0x0EF5, //  5: SWAPF 0x75, F     swap W in place (flag-safe)
+        0x0E03, //  6: SWAPF STATUS, W
+        0x00F6, //  7: MOVWF 0x76        save SWAPF(STATUS)
+        0x080A, //  8: MOVF PCLATH, W
+        0x00F7, //  9: MOVWF 0x77        save PCLATH
+        0x0804, // 10: MOVF FSR, W
+        0x00F8, // 11: MOVWF 0x78        save FSR
+        0x0871, // 12: MOVF 0x71, W      save the in-flight retval bytes
+        0x00F9, // 13: MOVWF 0x79
+        0x0872, // 14: MOVF 0x72, W
+        0x00FA, // 15: MOVWF 0x7A
+        0x0873, // 16: MOVF 0x73, W
+        0x00FB, // 17: MOVWF 0x7B
+        0x0874, // 18: MOVF 0x74, W
+        0x00FC, // 19: MOVWF 0x7C
+        0x3000, // 20: MOVLW 0x00
+        0x008A, // 21: MOVWF PCLATH     ISR body runs in page 0
+        0x305A, // 22: MOVLW 0x5A        body: clobber W (non-zero)
+        0x00C0, // 23: MOVWF 0x40        isr_g = 0x5A (the ISR ran)
+        0x0850, // 24: MOVF 0x50, W      clobber Z (RAM[0x50] = 0x5A -> Z = 0)
+        0x3000, // 25: MOVLW 0x00
+        0x0084, // 26: MOVWF FSR         clobber FSR
+        0x3018, // 27: MOVLW 0x18
+        0x008A, // 28: MOVWF PCLATH     clobber PCLATH
+        0x0879, // 29: MOVF 0x79, W      epilogue: retval first (MOVF Z
+        0x00F1, // 30: MOVWF 0x71        clobbers are fine: STATUS not yet
+        0x087A, // 31: MOVF 0x7A, W      restored)
+        0x00F2, // 32: MOVWF 0x72
+        0x087B, // 33: MOVF 0x7B, W
+        0x00F3, // 34: MOVWF 0x73
+        0x087C, // 35: MOVF 0x7C, W
+        0x00F4, // 36: MOVWF 0x74
+        0x0877, // 37: MOVF 0x77, W      then PCLATH and FSR
+        0x008A, // 38: MOVWF PCLATH
+        0x0878, // 39: MOVF 0x78, W
+        0x0084, // 40: MOVWF FSR
+        0x0E76, // 41: SWAPF 0x76, W     then STATUS (flag-safe)
+        0x0083, // 42: MOVWF STATUS
+        0x0E75, // 43: SWAPF 0x75, W     W last (swap-back, flag-safe)
+        0x0009, // 44: RETFIE
+        0x3012, // 45: __start: MOVLW 0x12
+        0x0084, // 46: MOVWF FSR         interrupted ctx FSR = 0x12
+        0x3001, // 47: MOVLW 0x01
+        0x00A0, // 48: MOVWF 0x20        RAM[0x20] = 1
+        0x30FF, // 49: MOVLW 0xFF
+        0x07A0, // 50: ADDWF 0x20, F     Z = 1 (0x01 + 0xFF = 0x00), C/DC set; W = 0xFF
+        0x0000, // 51: NOP               <- fire here: push 52, jump to the vector
+        0x1D03, // 52: BTFSS STATUS, 2   the Z-consuming instruction
+        0x2839, // 53: GOTO 57 (wrong)   taken only when Z == 0
+        0x30AA, // 54: MOVLW 0xAA
+        0x00B0, // 55: MOVWF 0x30        out = 0xAA (the preempted Z = 1 path)
+        0x283B, // 56: GOTO 59 (done)
+        0x30BB, // 57: wrong: MOVLW 0xBB
+        0x00B0, // 58: MOVWF 0x30        out = 0xBB
+        0x0804, // 59: done: MOVF FSR, W
+        0x00B1, // 60: MOVWF 0x31        out_fsr = restored FSR (0x12)
+        0x080A, // 61: MOVF PCLATH, W
+        0x00B2, // 62: MOVWF 0x32        out_pclath = restored PCLATH (0)
+        0x0063, // 63: SLEEP
+    ];
+    let mut p = Pic14::new(words);
+    p.ram_mut()[0x50] = 0x5A; // the ISR body's MOVF source: W = 0x5A, Z = 0
+    // Run main up to the Z test: the ADDWF at word 50 just set Z = 1 with
+    // W = 0xFF (non-zero — pre-fix the epilogue's MOVF 0x75, W clears Z
+    // from exactly this saved W).
+    let mut steps = 0usize;
+    while p.pc() != 51 {
+        p.step();
+        steps += 1;
+        assert!(steps < 100, "never reached the NOP (pc = {})", p.pc());
+    }
+    assert_eq!(p.ram()[0x03] & 0x04, 0x04, "the ADDWF must have set Z = 1");
+    assert_eq!(p.w(), 0xFF, "W must be non-zero at the fire (the pre-fix MOVF restore clears Z from it)");
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 4, "the ISR starts at the vector");
+    p.run(500_000);
+    assert!(p.halted(), "program must SLEEP-halt");
+    assert_eq!(p.ram()[0x40], 0x5A, "isr_g = 0x5A (the ISR ran)");
+    assert_eq!(
+        p.ram()[0x30],
+        0xAA,
+        "main's branch must take the preempted Z = 1 path (a Z-clobbering epilogue lands 0xBB)"
+    );
+    assert_eq!(p.ram()[0x31], 0x12, "out_fsr = restored FSR (body left 0x00)");
+    assert_eq!(p.ram()[0x32], 0x00, "out_pclath = restored PCLATH (body left 0x18)");
 }

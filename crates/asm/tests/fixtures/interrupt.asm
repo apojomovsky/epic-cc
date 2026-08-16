@@ -13,12 +13,21 @@ PCLATH equ 0x0A
     org 0x0004
 isr:
     MOVWF 0x75
+    SWAPF 0x75, F
     SWAPF STATUS, W
     MOVWF 0x76
     MOVF PCLATH, W
     MOVWF 0x77
     MOVF FSR, W
     MOVWF 0x78
+    MOVF 0x71, W
+    MOVWF 0x79
+    MOVF 0x72, W
+    MOVWF 0x7A
+    MOVF 0x73, W
+    MOVWF 0x7B
+    MOVF 0x74, W
+    MOVWF 0x7C
     MOVLW 0x00
     MOVWF PCLATH
     MOVLW 0x55
@@ -38,13 +47,21 @@ isr:
     MOVWF 0x2D
     MOVF 0x2D, W
     MOVWF 0x20
+    MOVF 0x79, W
+    MOVWF 0x71
+    MOVF 0x7A, W
+    MOVWF 0x72
+    MOVF 0x7B, W
+    MOVWF 0x73
+    MOVF 0x7C, W
+    MOVWF 0x74
     MOVF 0x77, W
     MOVWF PCLATH
-    SWAPF 0x76, W
-    MOVWF STATUS
     MOVF 0x78, W
     MOVWF FSR
-    MOVF 0x75, W
+    SWAPF 0x76, W
+    MOVWF STATUS
+    SWAPF 0x75, W
     RETFIE
 
 __start:

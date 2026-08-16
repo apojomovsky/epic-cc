@@ -2499,20 +2499,37 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         g.emit(format!("{}:", labels[&b.label]));
         if i == 0 && f.isr {
             // The ISR save prologue, right after the vector entry (word 4):
-            // W into 0x75 (MOVWF doesn't clobber W), STATUS into 0x76
+            // W into 0x75, nibble-swapped IN PLACE (SWAPF 0x75, F has no
+            // STATUS side effects and no W dependency — the epilogue's
+            // swap-back is the flag-safe W restore), STATUS into 0x76
             // nibble-swapped (SWAPF reads STATUS without touching it),
-            // PCLATH and FSR into 0x77/0x78, then PCLATH = 0 so the ISR
-            // body's GOTOs stay in page 0 (the M11 restore literal is
-            // PAGE(isr) = 0). The save area is fixed common RAM
-            // (0x75-0x78), disjoint from the scratch byte (0x70) and the
-            // retval region (0x71-0x74).
+            // PCLATH and FSR into 0x77/0x78, then the preempted main's
+            // in-flight return value (0x71-0x74) into 0x79-0x7C — the ISR
+            // body's value-returning calls write the retval region, so
+            // without this save they would clobber it — then PCLATH = 0 so
+            // the ISR body's GOTOs stay in page 0 (the M11 restore literal
+            // is PAGE(isr) = 0). The save area is fixed common RAM
+            // (0x75-0x7C: W/STATUS/PCLATH/FSR/retval x4 = 8 bytes),
+            // disjoint from the scratch byte (0x70) and the retval region
+            // (0x71-0x74); 0x7D-0x7F stays free. The retval MOVFs clobber
+            // the CURRENT Z, which is harmless — the interrupted STATUS is
+            // already safe in 0x76.
             g.emit("    MOVWF 0x75");
+            g.emit("    SWAPF 0x75, F");
             g.emit("    SWAPF STATUS, W");
             g.emit("    MOVWF 0x76");
             g.emit("    MOVF PCLATH, W");
             g.emit("    MOVWF 0x77");
             g.emit("    MOVF FSR, W");
             g.emit("    MOVWF 0x78");
+            g.emit("    MOVF 0x71, W");
+            g.emit("    MOVWF 0x79");
+            g.emit("    MOVF 0x72, W");
+            g.emit("    MOVWF 0x7A");
+            g.emit("    MOVF 0x73, W");
+            g.emit("    MOVWF 0x7B");
+            g.emit("    MOVF 0x74, W");
+            g.emit("    MOVWF 0x7C");
             g.emit("    MOVLW 0x00");
             g.emit("    MOVWF PCLATH");
         }
@@ -2578,19 +2595,31 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         if let Some(t) = terminator {
             if f.isr {
                 match t {
-                    // The restore epilogue replaces the ISR's `ret`:
-                    // PCLATH first (the resumed code's next CALL/GOTO must
-                    // see the interrupted page), STATUS via the swap-back,
-                    // then FSR, then W — W last, since MOVF clobbers W —
-                    // and RETFIE, which pops the hardware-pushed return.
+                    // The restore epilogue replaces the ISR's `ret`. Order
+                    // is load-bearing: the retval region (0x79-0x7C ->
+                    // 0x71-0x74) and PCLATH/FSR (MOVF — their Z clobbers
+                    // are fine, STATUS is not yet restored), then STATUS
+                    // via the nibble swap-back (SWAPF is flag-safe), and W
+                    // LAST via its swap-back (also flag-safe — MOVF would
+                    // set Z from the moved value after STATUS was already
+                    // restored, corrupting the interrupted main's Z).
+                    // RETFIE pops the hardware-pushed return.
                     Inst::Ret(None) => {
+                        g.emit("    MOVF 0x79, W");
+                        g.emit("    MOVWF 0x71");
+                        g.emit("    MOVF 0x7A, W");
+                        g.emit("    MOVWF 0x72");
+                        g.emit("    MOVF 0x7B, W");
+                        g.emit("    MOVWF 0x73");
+                        g.emit("    MOVF 0x7C, W");
+                        g.emit("    MOVWF 0x74");
                         g.emit("    MOVF 0x77, W");
                         g.emit("    MOVWF PCLATH");
-                        g.emit("    SWAPF 0x76, W");
-                        g.emit("    MOVWF STATUS");
                         g.emit("    MOVF 0x78, W");
                         g.emit("    MOVWF FSR");
-                        g.emit("    MOVF 0x75, W");
+                        g.emit("    SWAPF 0x76, W");
+                        g.emit("    MOVWF STATUS");
+                        g.emit("    SWAPF 0x75, W");
                         g.emit("    RETFIE");
                     }
                     Inst::Ret(Some(_)) => panic!(
