@@ -440,6 +440,119 @@ fn parses_structs_type_table_globals_alloca_memcpy_gep_and_params() {
     );
 }
 
+// Milestone 12: the l1.ll i32 shapes — add/icmp/zext/trunc/sext binops and
+// casts, volatile load/store, and a call with i32 params/return. clang's
+// i32 calls/returns pass through irparse untouched.
+#[test]
+fn parses_i32_shapes() {
+    let ll = r#"
+@in = dso_local global i32 0, align 2
+@out = dso_local global i32 0, align 2
+define dso_local noundef i32 @f(i32 noundef %0, i32 noundef %1) local_unnamed_addr #0 {
+  %3 = add i32 %1, %0
+  ret i32 %3
+}
+define dso_local void @main() local_unnamed_addr #1 {
+  %1 = load volatile i32, ptr @in, align 2
+  %2 = call i32 @f(i32 noundef %1, i32 noundef 5)
+  store volatile i32 %2, ptr @out, align 2
+  %10 = icmp ult i32 %1, 100
+  %11 = zext i1 %10 to i32
+  store volatile i32 %11, ptr @out, align 2
+  %12 = trunc i32 %1 to i16
+  %13 = sext i16 %12 to i32
+  store volatile i32 %13, ptr @out, align 2
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    assert_eq!(m.globals.len(), 2);
+    assert_eq!(m.globals[0].ty, ir::Ty::I32);
+    assert_eq!(m.globals[0].size, 4, "i32 global is 4 bytes");
+    assert_eq!(m.globals[1].size, 4);
+
+    // @f: two i32 params (width 4), i32 return.
+    let f = &m.funcs[0];
+    assert_eq!(f.ret, Some(ir::Ty::I32));
+    assert_eq!(f.params.len(), 2);
+    assert_eq!(f.params[0].width, 4);
+    assert_eq!(f.params[1].width, 4);
+    let fbody = &f.blocks[0].insts;
+    match &fbody[0] {
+        Inst::Bin(b) => {
+            assert_eq!(b.op, ir::BinOp::Add);
+            assert_eq!(b.ty, ir::Ty::I32);
+        }
+        other => panic!("expected i32 add, got {other:?}"),
+    }
+    match &fbody[1] {
+        Inst::Ret(Some((ty, _))) => assert_eq!(*ty, ir::Ty::I32),
+        other => panic!("expected i32 ret, got {other:?}"),
+    }
+
+    let main = &m.funcs[1];
+    let body = &main.blocks[0].insts;
+    // load i32, call i32, store i32, icmp ult i32, zext i1->i32, store,
+    // trunc i32->i16, sext i16->i32, store, ret = 10
+    assert_eq!(body.len(), 10);
+    assert!(matches!(body.last(), Some(Inst::Ret(None))));
+    assert!(matches!(&body[0], Inst::Load(l) if l.ty == ir::Ty::I32));
+    match &body[1] {
+        Inst::Call(c) => {
+            assert_eq!(c.ty, Some(ir::Ty::I32));
+            assert_eq!(c.args.len(), 2);
+            assert_eq!(c.args[0].ty, Some(ir::Ty::I32));
+            assert_eq!(c.args[1].ty, Some(ir::Ty::I32));
+        }
+        other => panic!("expected i32 call, got {other:?}"),
+    }
+    assert!(matches!(&body[2], Inst::Store(s) if s.ty == ir::Ty::I32));
+    assert!(matches!(&body[3], Inst::Icmp(i) if i.pred == "ult" && i.ty == ir::Ty::I32));
+    match &body[4] {
+        Inst::Zext(z) => {
+            assert_eq!(z.from, ir::Ty::I1);
+            assert_eq!(z.to, ir::Ty::I32);
+        }
+        other => panic!("expected zext i1 to i32, got {other:?}"),
+    }
+    assert!(matches!(&body[5], Inst::Store(s) if s.ty == ir::Ty::I32));
+    match &body[6] {
+        Inst::Trunc(t) => {
+            assert_eq!(t.from, ir::Ty::I32);
+            assert_eq!(t.to, ir::Ty::I16);
+        }
+        other => panic!("expected trunc i32 to i16, got {other:?}"),
+    }
+    match &body[7] {
+        Inst::Sext(x) => {
+            assert_eq!(x.from, ir::Ty::I16);
+            assert_eq!(x.to, ir::Ty::I32);
+        }
+        other => panic!("expected sext i16 to i32, got {other:?}"),
+    }
+}
+
+// Milestone 12: struct layout — an i32 field is size 4, align 2, so both
+// `{ i8, i32 }` and `{ i32, i8 }` come out 6 bytes (i8 @0, i32 @2 in the
+// first; i32 @0, i8 @4 in the second, round_up(5, 2) = 6).
+#[test]
+fn struct_layout_sizes_i32_fields() {
+    let ll = r#"
+%struct.A = type { i8, i32 }
+%struct.B = type { i32, i8 }
+@a = dso_local global %struct.A zeroinitializer, align 2
+@b = dso_local global %struct.B zeroinitializer, align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    assert_eq!(m.globals[0].size, 6, "{{i8, i32}} -> i8@0, i32@2, size 6");
+    assert_eq!(m.globals[0].bytes.len(), 6);
+    assert_eq!(m.globals[1].size, 6, "{{i32, i8}} -> i32@0, i8@4, size 6");
+    assert_eq!(m.globals[1].bytes.len(), 6);
+}
+
 // s8: chained multi-index GEP with an inlined base GEP (dynamic struct-array).
 const CHAINED: &str = r#"
 %struct.A = type { i8, [4 x i8] }
@@ -528,12 +641,13 @@ fn parses_sret_param_and_call_arg() {
 }
 
 // Fix (1): unknown param type tokens must panic loudly, not silently
-// mis-parse into a width-2 slot.
+// mis-parse into a width-2 slot. i32 is now supported (M12), so use an
+// unsupported type token (i24) to exercise the loud panic.
 #[test]
-#[should_panic(expected = "i32")]
+#[should_panic(expected = "i24")]
 fn param_unknown_type_token_panics() {
     let ll = r#"
-define dso_local void @f(i32 %x) {
+define dso_local void @f(i24 %x) {
   ret void
 }
 "#;

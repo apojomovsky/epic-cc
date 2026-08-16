@@ -252,3 +252,28 @@ fn gep_base_global_roundtrips() {
         other => panic!("expected Gep, got {other:?}"),
     }
 }
+
+#[test]
+fn roundtrips_i32_ops() {
+    // Milestone 12: i32 type flows through every type position the serializer
+    // and parser touch — binop, icmp, casts, and a sized scalar param.
+    let text = "global in i32\nfn f(i32) (x=i32)\n  block entry:\n    %1 = add i32 %x, 2\n    %2 = icmp ult i32 %1, 10\n    %3 = zext i8 %1 to i32\n    %4 = trunc i32 %1 to i8\n    %5 = sext i16 %1 to i32\n    store i32 %5 @in\n    ret void\n";
+    let m = parse(text);
+    assert_eq!(m.funcs[0].params[0].width, 4, "i32 scalar param must carry width 4");
+    let out = serialize(&m);
+    // stable fixed point
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    for line in [
+        "%1 = add i32 %x 2",
+        "%2 = icmp ult i32 %1 10",
+        "%3 = zext i8 %1 to i32",
+        "%4 = trunc i32 %1 to i8",
+        "%5 = sext i16 %1 to i32",
+        "fn f(i32) (x=i32)",
+        "store i32 %5 @in",
+        "global in i32",
+    ] {
+        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+    }
+}
