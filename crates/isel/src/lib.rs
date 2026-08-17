@@ -55,7 +55,7 @@ fn ssa_key(func: &str, name: &str) -> String {
 /// scratch alloca, so emitting it as-is would produce an empty label that
 /// silently falls through into the next function — a routine name with no
 /// recipe yet must panic loudly instead.
-const ROUTINE_NAMES: [&str; 24] = [
+const ROUTINE_NAMES: [&str; 33] = [
     "__mul_u8",
     "__mul_u16",
     "__mul_u32",
@@ -80,6 +80,19 @@ const ROUTINE_NAMES: [&str; 24] = [
     "__shl_u32",
     "__lshr_u32",
     "__ashr_i32",
+    // The nine soft-float routines (Milestone 15). The gate is what makes
+    // the M14 fuzz reduce test's loud-panic contract hold: a float program
+    // whose injected routine has no recipe yet must panic loudly, never
+    // emit an empty label that silently falls through.
+    "__add_f32",
+    "__sub_f32",
+    "__mul_f32",
+    "__div_f32",
+    "__cmp_f32",
+    "__uitofp_f32",
+    "__sitofp_f32",
+    "__fptoui_f32",
+    "__fptosi_f32",
 ];
 
 fn is_routine_name(name: &str) -> bool {
@@ -2398,6 +2411,15 @@ impl<'m> Gen<'m> {
                 }
                 self.emit("    RETURN".to_string());
             }
+            // The nine soft-float routines get their recipe bodies here
+            // (the arms above this match). A float routine name with no
+            // recipe yet must panic loudly — the message names "float" so
+            // the M14 fuzz reduce test's panic-kind assertion holds.
+            "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32"
+            | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32"
+            | "__fptoui_f32" | "__fptosi_f32" => {
+                panic!("isel: no recipe for the float runtime routine @{name}")
+            }
             other => panic!("isel: no recipe for runtime routine @{other}"),
         }
     }
@@ -2549,7 +2571,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
             | "__sdiv_i32" | "__srem_i32" | "__shl_u8" | "__lshr_u8"
             | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
-            | "__shl_u32" | "__lshr_u32" | "__ashr_i32" => {}
+            | "__shl_u32" | "__lshr_u32" | "__ashr_i32"
+            | "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32"
+            | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32"
+            | "__fptoui_f32" | "__fptosi_f32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
         g.emit_routine();

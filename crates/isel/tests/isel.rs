@@ -5549,3 +5549,128 @@ fn isr_scratch_use_does_not_corrupt_preempted_main() {
         "main's i16 eq must still report 0x1212 != 0x1200 (pre-fix the ISR's scratch clobber flips it to 1)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Milestone 15, Task 3: the soft-float runtime routines (isel recipes).
+// ---------------------------------------------------------------------------
+// Milestone 15, Task 3: the soft-float runtime routines (isel recipes).
+// ---------------------------------------------------------------------------
+//
+// The routine Funcs are injected by legalize with i32 params (4-byte slots —
+// the f32-ness rides on the call types, per the Task-2 contract), one
+// `%__scr = alloca N` entry block, and NO `ret` — isel emits the recipe body
+// plus the RETURN. The float format: 4 bytes LE: b0 = mantissa LSB, b1, b2 =
+// mantissa MSB + the exponent's LSB (bit 7 of b2), b3 = sign | exponent[7:1];
+// the 24-bit mantissa = (b2 & 0x7F) << 16 | b1 << 8 | b0, plus the implicit
+// 0x800000 when the 8-bit biased exponent ((b3 & 0x7F) << 1 | (b2 >> 7)) is
+// nonzero. All slots stay ≤ 0x7F (bank 0, loud) — the loops are
+// skip-sensitive.
+
+/// The injected routine signatures (ret, params, `__scr` size) for the nine
+/// float routines, mirroring legalize's injection exactly (the Task-2
+/// contract). Params are i32 (4-byte slots) regardless of the f32-ness.
+fn float_routine_sig(name: &str) -> (&'static str, &'static [(&'static str, &'static str)], u16) {
+    match name {
+        "__add_f32" | "__sub_f32" | "__mul_f32" => ("float", &[("a", "i32"), ("b", "i32")], 14),
+        "__div_f32" => ("float", &[("a", "i32"), ("b", "i32")], 12),
+        "__cmp_f32" => ("i8", &[("a", "i32"), ("b", "i32")], 6),
+        "__uitofp_f32" | "__sitofp_f32" => ("float", &[("val", "i32")], 8),
+        "__fptoui_f32" | "__fptosi_f32" => ("i32", &[("val", "i32")], 8),
+        other => panic!("test: unknown routine {other}"),
+    }
+}
+
+/// The binary float routine module: `main` loads two f32 globals, calls the
+/// routine (the injected Func def written out exactly as legalize produces
+/// it), stores the result. Globals at 0x20/0x24/0x28, main's locals at
+/// 0x2C/0x30/0x34, the routine's params at 0x40/0x44, `__scr` at 0x48+ — all
+/// ≤ 0x7F so the raw emitted asm assembles directly (bank 0, pre-banking).
+fn float_routine_module(name: &str) -> (String, Vec<(String, u16)>) {
+    let (ret, params, scr) = float_routine_sig(name);
+    let pstr = params
+        .iter()
+        .map(|(n, t)| format!("{n}={t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ir = format!(
+        "global ina float\n\
+         global inb float\n\
+         global out {ret}\n\
+         fn {name}({ret}) ({pstr})\n\
+           block entry:\n\
+             %__scr = alloca {scr}\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load float @ina\n\
+             %y = load float @inb\n\
+             %r = call {ret} @{name}(float %x, float %y)\n\
+             store {ret} %r @out\n\
+             ret void\n"
+    );
+    let mut map = vec![
+        ("ina".to_string(), 0x20u16),
+        ("inb".to_string(), 0x24),
+        ("out".to_string(), 0x28),
+        ("main::x".to_string(), 0x2C),
+        ("main::y".to_string(), 0x30),
+        ("main::r".to_string(), 0x34),
+    ];
+    let mut base = 0x40u16;
+    for (pn, _) in params {
+        map.push((format!("{name}::{pn}"), base));
+        base += 4;
+    }
+    map.push((format!("{name}::__scr"), base));
+    (ir, map)
+}
+
+/// The unary float routine module: `main` loads one 4-byte global, calls the
+/// routine, stores the result. inv=0x20, out=0x24, main::v=0x2C, main::r=0x30,
+/// the routine's val param at 0x40, `__scr` at 0x44+ — all ≤ 0x7F.
+fn float_routine_unary_module(name: &str) -> (String, Vec<(String, u16)>) {
+    let (ret, params, scr) = float_routine_sig(name);
+    let pstr = params
+        .iter()
+        .map(|(n, t)| format!("{n}={t}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ir = format!(
+        "global inv i32\n\
+         global out {ret}\n\
+         fn {name}({ret}) ({pstr})\n\
+           block entry:\n\
+             %__scr = alloca {scr}\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = load i32 @inv\n\
+             %r = call {ret} @{name}(i32 %v)\n\
+             store {ret} %r @out\n\
+             ret void\n"
+    );
+    let map = vec![
+        ("inv".to_string(), 0x20u16),
+        ("out".to_string(), 0x24),
+        ("main::v".to_string(), 0x2C),
+        ("main::r".to_string(), 0x30),
+        (format!("{name}::val"), 0x40),
+        (format!("{name}::__scr"), 0x44),
+    ];
+    (ir, map)
+}
+
+/// The f32 bit pattern of a Rust f32, little-endian (the routine's byte
+/// order: b0 = mantissa LSB ... b3 = sign|exp).
+fn f32_le(x: f32) -> [u8; 4] {
+    x.to_bits().to_le_bytes()
+}
+
+/// The panic-first gate: a float routine with no recipe yet must panic
+/// loudly (the message names "float"), never emit an empty label that
+/// silently falls through into the next function. The M14 fuzz reduce test
+/// depends on exactly this loud panic.
+#[test]
+#[should_panic(expected = "float")]
+fn panics_on_float_routine_without_recipe() {
+    let (ir, map) = float_routine_module("__add_f32");
+    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+}
