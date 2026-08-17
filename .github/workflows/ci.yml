@@ -35,7 +35,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Pinned to the installer's own version tag (v3 is determinate-nix
       # 3.x); upgrades are Dependabot-tracked. nix-installer-action's
@@ -44,16 +44,18 @@ jobs:
       - uses: DeterminateSystems/determinate-nix-action@v3
 
       # Shared build cache for the flake evaluation/build (the toolchain
-      # derivation is ~2 GB of store paths). Requires a public or
-      # org-configured cache for pull requests from forks; without access
-      # it just builds locally.
+      # derivation is ~2 GB of store paths). use-flakehub=false: the repo
+      # has no FlakeHub account, so the opportunistic auth attempt is pure
+      # noise; the GitHub Actions cache is the cache.
       - uses: DeterminateSystems/magic-nix-cache-action@v14
+        with:
+          use-flakehub: "false"
 
       # Warm the per-commit cargo build cache across runs. The cache key is
       # per-branch HEAD, so the first commit after a merge misses and every
       # push of the same branch (CI reruns) hits.
       - name: Cache cargo target dir
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: target
           key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ github.sha }}
