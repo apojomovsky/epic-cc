@@ -1067,7 +1067,9 @@ fn parses_f32_constant_forms() {
 define float @g() {
   %1 = fadd float 0x3F800000, 1.000000e+00
   %2 = fadd float %1, 5.000000e-01
-  ret float %2
+  %3 = fadd float 0x3FB99999A0000000, 0x3FF8000000000000
+  %4 = fadd float %3, 0x3FF0000000000000
+  ret float %4
 }
 "#;
     let m = parse_ll(C);
@@ -1086,6 +1088,24 @@ define float @g() {
     // decimal 0.5f -> 0x3F000000.
     match &g.blocks[0].insts[1] {
         Inst::FloatBin(b) => assert_eq!(b.b, Val::Const(0.5f32.to_bits() as i64)),
+        other => panic!("expected FloatBin, got {other:?}"),
+    }
+    // clang prints f32 constants that do not fit 8 hex digits as their
+    // DOUBLE-precision promotion (the M15 float differential's seed-2 bug:
+    // `store volatile float 0x3FB99999A0000000` stored the low 32 bits
+    // 0xA0000000 instead of 0.1f's 0x3DCCCCCD). The >8-digit hex on an f32
+    // operand must round the f64 VALUE back to the f32 bit pattern:
+    // 0x3FB99999A0000000 = 0.1f promoted, 0x3FF8000000000000 = 1.5f
+    // promoted, 0x3FF0000000000000 = 1.0f (its promotion is exact).
+    match &g.blocks[0].insts[2] {
+        Inst::FloatBin(b) => {
+            assert_eq!(b.a, Val::Const(0.1f32.to_bits() as i64), "0.1f promoted hex");
+            assert_eq!(b.b, Val::Const(1.5f32.to_bits() as i64), "1.5f promoted hex");
+        }
+        other => panic!("expected FloatBin, got {other:?}"),
+    }
+    match &g.blocks[0].insts[3] {
+        Inst::FloatBin(b) => assert_eq!(b.b, Val::Const(1.0f32.to_bits() as i64), "1.0f promoted hex"),
         other => panic!("expected FloatBin, got {other:?}"),
     }
 }
