@@ -74,6 +74,7 @@ dependencies = [
  "asm",
  "banking",
  "ir",
+ "legalize",
  "pic14-sim",
 ]
 
