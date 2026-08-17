@@ -60,6 +60,18 @@ fn ty_of(s: &str) -> Ty {
 }
 
 fn parse_val(s: &str) -> Val {
+    parse_val_typed(s, None)
+}
+
+/// Type-aware constant parse. For a `float` operand clang prints constants
+/// that cannot be represented in 8 hex digits as their DOUBLE-precision
+/// promotion — `store volatile float 0x3FB99999A0000000` is the f64 bit
+/// pattern of 0.1f, NOT a 64-bit integer to truncate (the M15 float
+/// differential found the old low-32-bits truncation storing 0xA0000000
+/// instead of 0x3DCCCCCD). A >8-digit hex on an f32 operand is converted
+/// back to the f32 bit pattern; the 8-digit hex form (`0x3F800000`) is
+/// already the f32 bits; non-float types keep the full integer.
+fn parse_val_typed(s: &str, ty: Option<Ty>) -> Val {
     let s = s.trim().trim_end_matches(',');
     if let Some(r) = s.strip_prefix('%') {
         Val::Reg(r.to_string())
@@ -77,19 +89,22 @@ fn parse_val(s: &str) -> Val {
         // specializing a noinline helper). Any materialization is therefore
         // correct; 0 keeps the IR pipeline simple.
         Val::Const(0)
-    } else {
-        // Integer, hex integer (covers the f32 hex form `0x3F800000` — the
-        // value is the bit pattern), or a decimal f32 constant materialized
-        // as its 32-bit bit pattern (e.g. `1.000000e+00` -> 0x3F800000).
-        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-            Val::Const(u64::from_str_radix(hex, 16).unwrap_or_else(|_| panic!("SPIKE: cannot parse hex value {s:?}")) as i64)
-        } else if let Ok(k) = s.parse::<i64>() {
-            Val::Const(k)
-        } else if let Ok(f) = s.parse::<f32>() {
-            Val::Const(f.to_bits() as i64)
+    } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        let v = u64::from_str_radix(hex, 16)
+            .unwrap_or_else(|_| panic!("SPIKE: cannot parse hex value {s:?}"));
+        if ty == Some(Ty::F32) && hex.len() > 8 {
+            Val::Const((f64::from_bits(v) as f32).to_bits() as i64)
         } else {
-            panic!("SPIKE: cannot parse value {s:?}")
+            Val::Const(v as i64)
         }
+    } else if let Ok(k) = s.parse::<i64>() {
+        Val::Const(k)
+    } else if let Ok(f) = s.parse::<f32>() {
+        // Decimal f32 constant materialized as its 32-bit bit pattern
+        // (e.g. `1.000000e+00` -> 0x3F800000).
+        Val::Const(f.to_bits() as i64)
+    } else {
+        panic!("SPIKE: cannot parse value {s:?}")
     }
 }
 
@@ -818,7 +833,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let a0 = strip_attrs(args[0]);
             let mut it = a0.trim().split_whitespace();
             let ty = ty_of(it.next().unwrap());
-            let val = parse_val(it.next().unwrap());
+            let val = parse_val_typed(it.next().unwrap(), Some(ty));
             let ptr = parse_ptr_operand(args[1], types, fresh, &mut out);
             out.push(Inst::Store(Store { ty, val, ptr }));
         }
@@ -954,7 +969,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let body = strip_attrs(&rest[op.len()..]);
             let mut it = body.split_whitespace();
             let ty = ty_of(it.next().unwrap());
-            let val = parse_val(it.next().unwrap());
+            let val = parse_val_typed(it.next().unwrap(), Some(ty));
             out.push(Inst::Freeze(ir::Freeze { dst: dst.unwrap(), ty, val }));
         }
         "fadd" | "fsub" | "fmul" | "fdiv" => {
@@ -962,8 +977,8 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let mut it = body.split_whitespace();
             let ty = ty_of(it.next().unwrap());
             assert!(ty == Ty::F32, "irparse: float binop {op} must be f32, got {ty:?}");
-            let a = parse_val(it.next().unwrap());
-            let b = parse_val(it.next().unwrap());
+            let a = parse_val_typed(it.next().unwrap(), Some(ty));
+            let b = parse_val_typed(it.next().unwrap(), Some(ty));
             let o = match op.as_str() {
                 "fadd" => FBinOp::FAdd,
                 "fsub" => FBinOp::FSub,
@@ -985,8 +1000,8 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             }
             let ty = ty_of(it.next().unwrap());
             assert!(ty == Ty::F32, "irparse: fcmp must be f32, got {ty:?}");
-            let a = parse_val(it.next().unwrap());
-            let b = parse_val(it.next().unwrap());
+            let a = parse_val_typed(it.next().unwrap(), Some(ty));
+            let b = parse_val_typed(it.next().unwrap(), Some(ty));
             out.push(Inst::Fcmp(Fcmp { dst: dst.unwrap(), pred, a, b }));
         }
         "fptosi" | "fptoui" | "sitofp" | "uitofp" | "fpext" | "fptrunc" => {
@@ -995,7 +1010,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
             let mut it = lhs.split_whitespace();
             let from = ty_of(it.next().unwrap());
-            let val = parse_val(it.next().unwrap());
+            let val = parse_val_typed(it.next().unwrap(), Some(from));
             let to = ty_of(rhs);
             let o = match op.as_str() {
                 "fptosi" => FloatConvOp::FpToSi,
