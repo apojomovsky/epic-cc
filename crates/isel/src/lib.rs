@@ -3625,9 +3625,9 @@ impl<'m> Gen<'m> {
 
     /// The __cmp_f32 body (scratch: tmp@0-1; the params are compared in
     /// place with the sign bits cleared for the magnitude compare). NaN
-    /// (exp 0xFF, mantissa nonzero) -> 3; both zero (any signs) -> 0; the
-    /// sign-magnitude ordering with the sign of the larger deciding lt/gt
-    /// (negative values reverse the magnitude order).
+    /// (exp 0xFF, mantissa nonzero) -> 3; both zero (full 8-bit exp == 0,
+    /// any signs) -> 0; the sign-magnitude ordering with the sign of the
+    /// larger deciding lt/gt (negative values reverse the magnitude order).
     fn emit_f32_cmp_body(&mut self, pa: u16, pb: u16, scr: u16) {
         let (tmp0, tmp1) = (scr, scr + 1);
         let r = self.retval_lo;
@@ -3670,14 +3670,22 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_ret3}"));
         self.emit(format!("{l_nan_b_done}:"));
-        // both zero (exp 0, any signs) -> equal
+        // both zero (full 8-bit exp == 0, any signs) -> equal. The exponent's
+        // LSB lives in b2 bit 7, so the (b3 & 0x7F) test alone swallows the
+        // smallest NORMALs (8-bit exp 1: 0x00800000..0x00FFFFFF) — skip the
+        // zero path when b2 bit 7 is set, mirroring the mul/div zero checks.
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
         self.emit("    ANDLW 0x7F".to_string());
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_az_done}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_az_done}"));
         self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
         self.emit("    ANDLW 0x7F".to_string());
-        self.emit("    BTFSC STATUS, 2".to_string()); // b zero too -> equal
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_az_done}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_az_done}"));
         self.emit(format!("    GOTO {l_ret0}"));
         self.emit(format!("{l_az_done}:"));
         // signs differ? a negative, b positive -> a < b (1); else a > b (2).
