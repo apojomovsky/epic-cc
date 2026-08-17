@@ -5683,6 +5683,11 @@ fn float_arith_routines_simulate_against_rust_reference() {
         ("__mul_f32", 2.5, 2.0, "2.5*2.0"),
         // 3.0 * 0.33333334: the 24x24 product's low bits round up to 1.0.
         ("__mul_f32", 3.0, 0.33333334, "3.0*0.33333334"),
+        // 0x3C53CE8B * 0x3C53CE8B: the low sum crosses 2^23 mid-product, so
+        // the bit-23 carry into the high part (m) fires — the carry path
+        // the two cases above never set (their low sums stay below 2^23).
+        // Expected 0x392F3E20 from Rust's f32.
+        ("__mul_f32", f32::from_bits(0x3C53_CE8B), f32::from_bits(0x3C53_CE8B), "mul low sum crosses 2^23"),
         ("__div_f32", 1.0, 4.0, "1.0/4.0"),
         // The load-bearing RNE: 1.0/3.0 = 0x3EAAAAAB (the guard bit 1 with
         // the sticky rounds the 0xAAAAAA mantissa up).
@@ -5694,13 +5699,14 @@ fn float_arith_routines_simulate_against_rust_reference() {
         ("__sub_f32", 0.5, 0.5, "0.5-0.5"), // exact zero, signs equal
         // 1.0 + (-1.0) = +0 (the sa & sb zero sign rule).
         ("__add_f32", 1.0, -1.0, "1.0-1.0"),
-        // The M15 float-differential regression (the 50-seed corpus, seed 0):
-        // the SUBTRACT path's RNE must account for the alignment's lost bits
-        // SUBTRACTING from the difference — the exact result is (ma - mb) -
-        // frac, so the rounding mirrors the add path's (round DOWN under
-        // round && (sticky || LSB)). Before the fix -2.25 - (-0.0015344163)
-        // returned 0xC00FE6DE instead of the RNE 0xC00FE6DC, and
-        // 1.0 - 0.99999994 returned 2^-23 instead of 2^-24.
+        // The M15 float-differential regression (a hand-picked case, not a
+        // seed-0 corpus program): the SUBTRACT path's RNE must account for
+        // the alignment's lost bits SUBTRACTING from the difference — the
+        // exact result is (ma - mb) - frac, so the rounding mirrors the add
+        // path's (round DOWN under round && (sticky || LSB)). Before the
+        // fix -2.25 - (-0.0015344163) returned 0xC00FE6DE instead of the
+        // RNE 0xC00FE6DC, and 1.0 - 0.99999994 returned 2^-23 instead of
+        // 2^-24.
         ("__sub_f32", -2.25, -0.0015344163, "sub aligned sticky frac > 1/2"),
         ("__sub_f32", 1.0, f32::from_bits(0x3F7F_FFFF), "sub aligned frac = 1/2"),
         ("__sub_f32", 1.0, f32::from_bits(0x3EFF_FFFD), "sub aligned frac = 1/4"),

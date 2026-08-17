@@ -582,7 +582,7 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                 }
             }
         }
-        CallArg { ty, val: parse_val(&val_tok.expect("call arg must carry a value")), byval, sret }
+        CallArg { ty: ty.clone(), val: parse_val_typed(&val_tok.expect("call arg must carry a value"), ty), byval, sret }
     }
 }
 
@@ -890,7 +890,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             } else {
                 let mut it = body.split_whitespace();
                 let ty = ty_of(it.next().unwrap());
-                out.push(Inst::Ret(Some((ty, parse_val(it.next().unwrap())))));
+                out.push(Inst::Ret(Some((ty, parse_val_typed(it.next().unwrap(), Some(ty))))));
             }
         }
         "phi" => {
@@ -900,7 +900,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             for part in body.split('[').skip(1) {
                 let inner = part.split(']').next().unwrap();
                 let mut it = inner.split(',');
-                let v = parse_val(it.next().unwrap());
+                let v = parse_val_typed(it.next().unwrap(), Some(ty));
                 let lbl = it.next().unwrap().trim().trim_start_matches('%').to_string();
                 incoming.push((v, lbl));
             }
@@ -912,7 +912,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
             let mut it = lhs.split_whitespace();
             let from = ty_of(it.next().unwrap());
-            let val = parse_val(it.next().unwrap());
+            let val = parse_val_typed(it.next().unwrap(), Some(from));
             let to = ty_of(rhs);
             match op.as_str() {
                 "zext" => out.push(Inst::Zext(Zext { dst: dst.unwrap(), from, val, to })),
@@ -927,8 +927,8 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             const PREDS: [&str; 10] = ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"];
             if !PREDS.contains(&pred.as_str()) { panic!("SPIKE: unsupported icmp predicate {pred:?} in line: {line}"); }
             let ty = ty_of(it.next().unwrap());
-            let a = parse_val(it.next().unwrap());
-            let b = parse_val(it.next().unwrap());
+            let a = parse_val_typed(it.next().unwrap(), Some(ty));
+            let b = parse_val_typed(it.next().unwrap(), Some(ty));
             out.push(Inst::Icmp(Icmp { dst: dst.unwrap(), pred, ty, a, b }));
         }
         "select" => {
@@ -937,8 +937,8 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let cond = parse_val(parts[0].split_whitespace().nth(1).unwrap());
             let mut it1 = parts[1].split_whitespace();
             let ty = ty_of(it1.next().unwrap());
-            let a = parse_val(it1.next().unwrap());
-            let b = parse_val(parts[2].split_whitespace().nth(1).unwrap());
+            let a = parse_val_typed(it1.next().unwrap(), Some(ty));
+            let b = parse_val_typed(parts[2].split_whitespace().nth(1).unwrap(), Some(ty));
             out.push(Inst::Select(Select { dst: dst.unwrap(), cond, ty, a, b }));
         }
         "add" | "and" | "or" | "xor" | "sub" | "mul" | "udiv" | "urem" | "sdiv" | "srem"
