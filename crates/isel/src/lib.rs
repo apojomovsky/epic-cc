@@ -1368,6 +1368,52 @@ impl<'m> Gen<'m> {
                 // Scalar args: unchanged.
                 let aty = arg.ty.expect("isel: scalar call arg must carry a type");
                 self.emit_move_val_to_slot(&arg.val, aty, pa);
+                // M15 conversion ABI: the four conversion routines take
+                // their value in a fixed 4-byte `val` slot, but i8/i16
+                // sources are copied by their own width — the leftover
+                // high bytes are STALE and corrupt the recipe's leading-1
+                // search / sign logic (an i16 `sitofp` reading leftover
+                // high bytes produced exp 157 instead of 130 in the M15
+                // acceptance). Fill them so the slot holds a proper i32:
+                // __sitofp_f32 sign-extends (i16: the top value byte IS
+                // the sign byte, copied up; i8: 0xFF/0x00 by bit 7),
+                // __uitofp_f32 zero-extends.
+                if aty.bytes() < callee.params[i].width {
+                    assert_eq!(
+                        callee.params[i].width,
+                        4,
+                        "isel: narrow scalar arg {i} of @{func} into a non-4-byte param"
+                    );
+                    let aw = aty.bytes() as u16;
+                    match func {
+                        "__uitofp_f32" => {
+                            for j in aw..4 {
+                                self.emit(format!("    CLRF 0x{:02X}", pa + j));
+                            }
+                        }
+                        "__sitofp_f32" => {
+                            let sign = pa + aw - 1;
+                            if aw == 2 {
+                                self.emit(format!("    MOVF 0x{sign:02X}, W"));
+                                self.emit(format!("    MOVWF 0x{:02X}", pa + 2));
+                                self.emit(format!("    MOVWF 0x{:02X}", pa + 3));
+                            } else {
+                                assert_eq!(
+                                    aw,
+                                    1,
+                                    "isel: unexpected narrow source width for @{func}"
+                                );
+                                self.emit("    MOVLW 0x00".to_string());
+                                self.emit(format!("    BTFSC 0x{sign:02X}, 7"));
+                                self.emit("    MOVLW 0xFF".to_string());
+                                for j in 1..4 {
+                                    self.emit(format!("    MOVWF 0x{:02X}", pa + j));
+                                }
+                            }
+                        }
+                        other => panic!("isel: narrow scalar arg into the wide param of @{other}"),
+                    }
+                }
             }
         }
         // M11 PCLATH discipline: every CALL runs with PCLATH<4:3> = the
