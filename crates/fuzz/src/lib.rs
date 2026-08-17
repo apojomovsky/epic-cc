@@ -55,9 +55,15 @@ pub const CHECKSUM_NAME: &str = "checksum";
 ///        type is long) / host: `unsigned int` (32-bit on the pinned
 ///        x86-64-linux host) — genuinely 32-bit on BOTH sides.
 ///
-/// With these, u8/u16/u32 arithmetic wraps identically on both sides and
-/// the differential is meaningful for values beyond 2^16 (pinned by
-/// `u32_arithmetic_wraps_identically_on_both_sides` in tests/differential.rs
+/// Milestone 15 added the signed widths `s16`/`s32` for the float
+/// conversions (`sitofp` needs a signed source, `fptosi` a signed target;
+/// bare `int` is 16-bit on msp430 but 32-bit on the host): s16 = msp430
+/// `int` / host `short`, s32 = msp430 `long` / host `int` — genuinely
+/// 16/32-bit on both sides, same guard pattern.
+///
+/// With these, u8/u16/u32/s16/s32 arithmetic wraps identically on both
+/// sides and the differential is meaningful for values beyond 2^16 (pinned
+/// by `u32_arithmetic_wraps_identically_on_both_sides` in tests/differential.rs
 /// and by `unsigned_long_u32_arithmetic_mismatches`, which shows the old
 /// discipline failing).
 pub const TYPEDEF_PROLOGUE: &str = "\
@@ -65,10 +71,14 @@ pub const TYPEDEF_PROLOGUE: &str = "\
 typedef unsigned char u8;\n\
 typedef unsigned short u16;\n\
 typedef unsigned long u32;\n\
+typedef int s16;\n\
+typedef long s32;\n\
 #else\n\
 typedef unsigned char u8;\n\
 typedef unsigned short u16;\n\
 typedef unsigned int u32;\n\
+typedef short s16;\n\
+typedef int s32;\n\
 #endif\n";
 
 /// The volatile input globals' name prefix (`in0`, `in1`, …).
@@ -117,13 +127,18 @@ impl SplitMix64 {
 // Program model
 // ---------------------------------------------------------------------------
 
-/// One volatile input global: `volatile unsigned <width> <name>;`, seeded
-/// with `value` (the low `width` bits) on both sides of the differential.
+/// One volatile input global: `volatile unsigned <width> <name>;` (or
+/// `volatile float <name>;` when `is_float`), seeded with `value` — for a
+/// float input, the 4-byte IEEE-754 bit pattern — on both sides of the
+/// differential (the sim seeds the RAM bytes; the host writes the bits
+/// through a union, see `host_main_source`).
 #[derive(Debug, Clone)]
 pub struct Input {
     pub name: String,
     pub value: u32,
-    pub width: u8, // 8 | 16 | 32
+    pub width: u8, // 8 | 16 | 32 (a float input is width 32 + is_float)
+    /// True for a `volatile float` input (its `value` is the bit pattern).
+    pub is_float: bool,
 }
 
 /// A generated program: the C source plus the metadata the differential
@@ -215,6 +230,84 @@ enum BinOp {
     Shr,
 }
 
+// ---------------------------------------------------------------------------
+// Milestone 15: the float surface (float mode)
+// ---------------------------------------------------------------------------
+
+/// A float binary op the float generator can emit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FBin {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+/// A float conversion the float generator can emit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FConvKind {
+    UiToFp,
+    SiToFp,
+    FpToUi,
+    FpToSi,
+}
+
+/// The float constant pool (float-mode operands). All values are
+/// normal-range (biases 120..133) and nonzero except `0.0f`/`-0.0f`, which
+/// are safe as fadd/fsub/fmul operands and fcmp comparands (0 op x is
+/// exact) but excluded from the divisor pool. The constant pool is what
+/// makes the -0.0 == +0.0 cmp case reachable (in6's single value cannot
+/// be both signs).
+const FCONSTS: &[&str] = &[
+    "0.0f", "-0.0f", "1.0f", "-1.0f", "0.5f", "2.0f", "3.0f", "0.25f", "100.0f", "0.1f",
+    "0.33333334f", "10.0f", "0.75f",
+];
+
+/// The divisor pool: FCONSTS minus the zeros.
+const FCONSTS_NONZERO: &[&str] = &[
+    "1.0f", "-1.0f", "0.5f", "2.0f", "3.0f", "0.25f", "100.0f", "0.1f", "0.33333334f", "10.0f",
+    "0.75f",
+];
+
+/// The RNG-mix constants separating the float generator's streams from the
+/// integer generator's (the corpus is deterministic either way; the mix
+/// keeps adjacent int/float seeds visibly distinct).
+const FLOAT_MIX: u64 = 0xF10A_7E5C_0000_0001;
+const FLOAT_MIX2: u64 = 0xA5A5_1234_5678_9ABC;
+
+/// A random NORMAL f32 bit pattern with the biased exponent in `lo..=hi`.
+/// The band [100, 150] (values ~2^-27..2^23) is the safe arithmetic range
+/// — the corpus's documented filter: NaN/inf/denormals are excluded, and
+/// the operand pools keep every statement RESULT in the normal range too,
+/// so the differential verifies RNE rounding without IEEE edge-case noise.
+fn normal_bits(rng: &mut SplitMix64, lo: u32, hi: u32) -> u32 {
+    let exp = lo + (rng.next_u64() as u32) % (hi - lo + 1);
+    let mant = (rng.next_u64() as u32) & 0x7F_FFFF;
+    let sign = ((rng.next_u64() as u32) & 1) << 31;
+    sign | (exp << 23) | mant
+}
+
+/// The edge input in6: ±0, the smallest normals (0x00800000-ish — the
+/// Task-3 cmp fix's boundary values), the RNE classics 1/3 and 0.1, or a
+/// random normal with exponent 80..140 (still safe as an fadd/fsub
+/// B-operand and as a cmp comparand).
+fn edge_bits(rng: &mut SplitMix64) -> u32 {
+    const EDGE: [u32; 8] = [
+        0x0000_0000, // +0
+        0x8000_0000, // -0
+        0x0080_0000, // the smallest positive normal
+        0x8080_0000, // the smallest negative normal
+        0x3F80_0000, // 1.0
+        0xBF80_0000, // -1.0
+        0x3EAA_AAAB, // 1/3 (RNE)
+        0x3DCC_CCCD, // 0.1 (RNE)
+    ];
+    match rng.next_u64() % 10 {
+        0..=3 => EDGE[(rng.next_u64() as usize) % EDGE.len()],
+        _ => normal_bits(rng, 80, 140),
+    }
+}
+
 /// A generated noinline helper's signature.
 struct Helper {
     name: String,
@@ -251,6 +344,17 @@ struct Gen {
     /// (the flag-guaranteed phase): structured statements pick their
     /// cheapest width so every flagged construct fits the frame budget.
     forced: bool,
+    /// Milestone 15 float mode: the program is a float differential program
+    /// (`generate_float`): float inputs in3..in6, float statements
+    /// (fadd/fsub/fmul/fdiv/fcmp/conversions) folded through the volatile
+    /// `fout` bits global, and its own globals-end (no array/struct, no int
+    /// locals). Frame-budget estimates in this mode are exact def counts
+    /// (measured from clang IR), so the fill margin is 0.
+    float_mode: bool,
+    /// Float locals (`float tN`) emitted so far — the float operand pool
+    /// (a local's value is a normal-range float by construction, see
+    /// `emit_fbin`; int locals never exist in float mode).
+    flocals: Vec<String>,
 }
 
 impl Gen {
@@ -267,6 +371,8 @@ impl Gen {
             frame_est: 0,
             worst_routine: 0,
             forced: false,
+            float_mode: false,
+            flocals: Vec::new(),
         }
     }
 
@@ -418,6 +524,13 @@ impl Gen {
     /// to 4 bytes when both globals were used, silently eating into the
     /// bank-0 headroom the model thinks it has.
     fn frame_budget(&self) -> u32 {
+        if self.float_mode {
+            // Float-mode globals end (measured from the allocator, which
+            // places even-aligned): in0 u8 @0x20, in3 float @0x22, in6 float
+            // @0x26, checksum u8 @0x2A, fout float @0x2C — end 0x30. (No
+            // array/struct in float mode.)
+            return 0x70 - self.worst_routine - 0x30;
+        }
         let globals = 0x29
             + if self.used_array { 8 } else { 0 }
             + if self.used_struct { 8 } else { 0 };
@@ -428,17 +541,23 @@ impl Gen {
     /// `routine`-byte runtime frame still fit? (`uses_array`/`uses_struct`
     /// are the post-statement globals.)
     fn fit(&self, frame: u32, routine: u32, uses_array: bool, uses_struct: bool) -> bool {
-        let globals = 0x29
-            + if self.used_array || uses_array { 8 } else { 0 }
-            + if self.used_struct || uses_struct { 8 } else { 0 };
+        let globals = if self.float_mode {
+            0x30 // the float-mode globals end (see `frame_budget`)
+        } else {
+            0x29
+                + if self.used_array || uses_array { 8 } else { 0 }
+                + if self.used_struct || uses_struct { 8 } else { 0 }
+        };
         let routine = self.worst_routine.max(routine);
         // The 8-byte safety margin applies to the FILL phase only: the
         // per-statement estimates are measured upper bounds (>= real), so
         // forced statements must fit by estimate alone — the margin would
         // reject real-fit flagged combos (e.g. array+struct: 35 est of a
         // 41 budget). The fill statements' cumulative real cost is still
-        // bounded by est + 8 <= the hard bank-0 limit.
-        let margin = if self.forced { 0 } else { 8 };
+        // bounded by est + 8 <= the hard bank-0 limit. Float mode's
+        // estimates are exact def counts (measured from clang IR for the
+        // fixed statement shapes), so no margin is needed there either.
+        let margin = if self.forced || self.float_mode { 0 } else { 8 };
         self.frame_est + frame + margin <= 0x70 - routine - globals
     }
 
@@ -846,6 +965,228 @@ impl Gen {
         true
     }
 
+    // ---- Milestone 15: the float surface (float mode only) ----
+
+    /// A float operand from the BAND pool: the band input in3 (the
+    /// generated normal with the exponent in 100..150, value ~2^-27..2^23),
+    /// a normal-range constant, or a recent float local. The band pool is
+    /// the safe source for every arithmetic slot: values are normal and
+    /// their arithmetic stays normal (the corpus's documented filter — no
+    /// NaN/denormal/inf INPUTS, and the operand pools keep the RESULTS
+    /// normal too, so the differential verifies RNE rounding without IEEE
+    /// edge-case noise). Returns `(text, main-frame bytes the load costs)`.
+    fn foperand_band(&mut self) -> (String, u32) {
+        match self.below(4) {
+            0 => ("in3".to_string(), 4),
+            1 => (
+                FCONSTS[self.below(FCONSTS.len() as u32) as usize].to_string(),
+                0,
+            ),
+            _ => match self.recent_flocal() {
+                Some(t) => (t, 0),
+                None => ("in3".to_string(), 4),
+            },
+        }
+    }
+
+    /// A float operand from the ANY pool: the band pool plus the edge input
+    /// in6 (±0, the smallest normals, and normals with exponents 80..140 —
+    /// the Task-3 cmp fix's boundary values). The edge input is safe as a
+    /// fcmp operand (comparisons are exact) and as an fadd/fsub B-operand
+    /// (the band A-operand dominates, so A ± B stays in the normal range),
+    /// but NOT for fmul/fdiv — the smallest normals would underflow to a
+    /// denormal and zero would divide by zero.
+    fn foperand_any(&mut self) -> (String, u32) {
+        match self.below(5) {
+            0 => ("in3".to_string(), 4),
+            1 => ("in6".to_string(), 4),
+            2 => (
+                FCONSTS[self.below(FCONSTS.len() as u32) as usize].to_string(),
+                0,
+            ),
+            _ => match self.recent_flocal() {
+                Some(t) => (t, 0),
+                None => ("in3".to_string(), 4),
+            },
+        }
+    }
+
+    /// A KNOWN-NONZERO divisor for fdiv: the band input in3 (exponent
+    /// 100..150 — never zero) or a nonzero constant. Locals are excluded:
+    /// their value is unknown to the generator, and a runtime zero divisor
+    /// would diverge — the host computes IEEE ±inf (sign of the dividend)
+    /// while the routine returns the deterministic +0x7F800000.
+    fn fdivisor(&mut self) -> (String, u32) {
+        match self.below(3) {
+            0 => ("in3".to_string(), 4),
+            _ => (
+                FCONSTS_NONZERO[self.below(FCONSTS_NONZERO.len() as u32) as usize].to_string(),
+                0,
+            ),
+        }
+    }
+
+    /// The 1st/2nd most recent float local (float mode has no blocks, so
+    /// every float local stays live).
+    fn recent_flocal(&mut self) -> Option<String> {
+        if self.flocals.is_empty() {
+            return None;
+        }
+        let want = 1 + self.below(2) as usize;
+        let i = self.flocals.len().checked_sub(want)?;
+        Some(self.flocals[i].clone())
+    }
+
+    fn new_flocal(&mut self) -> String {
+        let name = format!("t{}", self.flocals.len());
+        self.flocals.push(name.clone());
+        name
+    }
+
+    /// The bits fold for a float RESULT: store it to the volatile `fout`
+    /// global, re-read the four bytes as a u32 (the type-punned
+    /// `*(volatile u32*)&fout` — LLVM opaque pointers make this a plain
+    /// `load i32` of the float global's bytes, no bitcast inst), and fold
+    /// through the shared fold32 helper. The fold is over the float's EXACT
+    /// bits — a single wrong RNE bit changes the checksum.
+    fn fpush_fold(&mut self, t: &str) {
+        self.used_fold32 = true;
+        self.body.push(format!("  fout = {t};"));
+        self.body.push("  checksum = (u8)(checksum ^ fold32(*(volatile u32*)&fout));".to_string());
+    }
+
+    /// A float arithmetic statement: `float tN = a op b;` folded through the
+    /// fout bits. The operand pools (see `foperand_band`/`foperand_any`/
+    /// `fdivisor`) keep every RESULT in the normal range, so the routine
+    /// only ever sees in-range RNE rounding. Main-frame cost = the operand
+    /// loads + the fop def (4) + the bits fold (checksum load 1 + the i32
+    /// bits load 4 + the fold32 call 1 + the xor 1 = 7), measured from
+    /// clang IR.
+    fn emit_fbin(&mut self, op: FBin, force_input: bool) -> bool {
+        // The forced (first) statement must exercise the routine: with two
+        // constant operands clang folds the op away (no call). Pin the
+        // A-operand to the band input when forced.
+        let (a, ac) = if force_input {
+            ("in3".to_string(), 4)
+        } else {
+            self.foperand_band()
+        };
+        let (b, bc) = match op {
+            FBin::Div => self.fdivisor(),
+            FBin::Mul => self.foperand_band(),
+            _ => self.foperand_any(), // add/sub: the edge input is safe as B
+        };
+        let cost = ac + bc + 4 + 7;
+        // The routine's FULL frame (params + scratch) measured from the
+        // alloc layout: __add_f32/__sub_f32/__mul_f32 = 4+4+14 = 22 bytes,
+        // __div_f32 = 4+4+12 = 20. main_end + this must stay <= 0x70 (the
+        // recipe slots are skip-sensitive and must not cross the bank-0
+        // locals region end) — the M14 budget model's `worst_routine`.
+        let routine = if matches!(op, FBin::Div) { 20 } else { 22 };
+        if !self.fit(cost, routine, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        self.worst_routine = self.worst_routine.max(routine);
+        let s = match op {
+            FBin::Add => "+",
+            FBin::Sub => "-",
+            FBin::Mul => "*",
+            FBin::Div => "/",
+        };
+        let t = self.new_flocal();
+        self.body.push(format!("  float {t} = {a} {s} {b};"));
+        self.fpush_fold(&t);
+        true
+    }
+
+    /// A float comparison statement: `checksum = (u8)(checksum ^ (u8)(a rel
+    /// b));` — the fcmp predicate materialized by legalize's __cmp_f32
+    /// tri-state tree (the C ordered operators cover olt/ole/ogt/oge/oeq/
+    /// one). Main-frame cost = the operand loads + the tree's worst shape
+    /// (call 1 + 2 icmps 2 + select 1 + the zext 1 + the checksum load 1 +
+    /// the xor 1 = 7), measured from clang IR.
+    fn emit_fcmp_f(&mut self, force_input: bool) -> bool {
+        // The forced (first) statement must exercise __cmp_f32: pin one
+        // operand to an input (two constants would fold to a constant).
+        let (a, ac) = if force_input {
+            ("in3".to_string(), 4)
+        } else {
+            self.foperand_any()
+        };
+        let (b, bc) = self.foperand_any();
+        let cost = ac + bc + 7;
+        // __cmp_f32's full frame = params 8 + scratch 6 = 14 bytes.
+        if !self.fit(cost, 14, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        self.worst_routine = self.worst_routine.max(14);
+        let rel = ["<", "<=", ">", ">=", "==", "!="][self.below(6) as usize];
+        self.body.push(format!("  checksum = (u8)(checksum ^ (u8)({a} {rel} {b}));"));
+        true
+    }
+
+    /// A float conversion statement. The sources are the bits of the band
+    /// input in3 read through the type-punned load (any u32 — always
+    /// defined), and the fptoui/fptosi targets are masked to ≤ 32767.5 so
+    /// the conversion is ALWAYS in range (an out-of-range fptoui/fptosi is
+    /// LLVM poison — the host could materialize anything, diverging from
+    /// the routine's clamp). The `* 0.5f` makes odd masks fractional,
+    /// exercising the truncation. Costs measured from clang IR.
+    fn emit_fconv(&mut self, kind: FConvKind) -> bool {
+        let src = "in3";
+        match kind {
+            FConvKind::UiToFp | FConvKind::SiToFp => {
+                // load i32 (4) + the conv def (4) + the bits fold (7).
+                let cost = 15;
+                // The conversion routines' full frame = param 4 + scratch 8
+                // = 12 bytes.
+                if !self.fit(cost, 12, false, false) {
+                    return false;
+                }
+                self.frame_est += cost;
+                self.worst_routine = self.worst_routine.max(12);
+                let expr = match kind {
+                    FConvKind::UiToFp => format!("(float)(*(volatile u32*)&{src})"),
+                    _ => format!("(float)(s32)(*(volatile u32*)&{src})"),
+                };
+                let t = self.new_flocal();
+                self.body.push(format!("  float {t} = {expr};"));
+                self.fpush_fold(&t);
+            }
+            FConvKind::FpToUi | FConvKind::FpToSi => {
+                // load i32 (4) + and (4) + uitofp (4) + fmul (4) + the
+                // conversion (4) + the fold (checksum 1 + call 1 + xor 1).
+                let cost = 23;
+                // The shape contains an fmul (`* 0.5f`): __mul_f32's FULL
+                // frame (params 8 + scratch 14 = 22) dominates the
+                // conversion routines' 12-byte frames — counting 12 let
+                // seed 4's conv overflow bank 0 (the __mul_f32 slots at
+                // 0xA0, found by the M15 float corpus).
+                if !self.fit(cost, 22, false, false) {
+                    return false;
+                }
+                self.frame_est += cost;
+                self.worst_routine = self.worst_routine.max(22);
+                // (float)(bits & 0xFFFF) * 0.5f <= 32767.5 — in range for
+                // both the u32 and the s32 target (defined conversions).
+                let line = match kind {
+                    FConvKind::FpToUi => {
+                        "  checksum = (u8)(checksum ^ fold32((u32)((float)((*(volatile u32*)&in3) & 0xFFFFu) * 0.5f)));"
+                            .to_string()
+                    }
+                    _ => {
+                        "  checksum = (u8)(checksum ^ fold32((u32)((s32)((float)(s32)((*(volatile u32*)&in3) & 0xFFFFu) * 0.5f))));"
+                            .to_string()
+                    }
+                };
+                self.body.push(line);
+            }
+        }
+        true
+    }
+
     /// Emit the helper functions (1–3): noinline, 0–3 unsigned params,
     /// u8 return. Bodies use only INLINE ops (add/sub/and/or/xor/const
     /// shifts/icmps — no mul/div/rem, whose runtime-routine frames would
@@ -1032,7 +1373,12 @@ pub fn generate(seed: u64) -> Program {
             16 => rng.next_u64() as u16 as u32,
             _ => rng.next_u64() as u32,
         };
-        inputs.push(Input { name, value, width: w });
+        inputs.push(Input {
+            name,
+            value,
+            width: w,
+            is_float: false,
+        });
     }
     decls.push_str(&format!("volatile u8 {checksum};\n", checksum = CHECKSUM_NAME));
 
@@ -1140,6 +1486,179 @@ pub fn generate(seed: u64) -> Program {
         seed,
         statements,
         prologue,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Milestone 15: the float differential (Task 5)
+// ---------------------------------------------------------------------------
+
+/// Generate a deterministic FLOAT differential program from `seed` — the
+/// milestone's RNE verification at scale. The float inputs are random
+/// IEEE-754 BIT PATTERNS under the documented corpus filter: NaN,
+/// infinities, and denormals are EXCLUDED (the routines' IEEE edge-case
+/// handling is deterministic-but-minimal and deferred — see the plan's
+/// self-review notes); in3 is a normal with the exponent in the safe band
+/// 100..150 (value ~2^-27..2^23, whose arithmetic stays in the normal
+/// range), and in6 is the edge value (±0, the smallest normals
+/// 0x00800000-ish, and normals with exponents 80..140 — covering the
+/// Task-3 cmp fix: the sign-magnitude ordering, the zero equality, and the
+/// smallest-normals boundary).
+///
+/// The statements cover the whole float surface — fadd/fsub/fmul/fdiv
+/// (the four soft-float arithmetic routines), fcmp (the ordered C
+/// predicates through legalize's __cmp_f32 tri-state tree), and the four
+/// int↔float conversions (uitofp/sitofp/fptoui/fptosi) — with the operand
+/// pools chosen so every RESULT also stays in the normal range (no
+/// overflow/underflow/denormal noise; the differential then purely verifies
+/// RNE rounding at scale). Every float result is folded over its BITS: the
+/// volatile `fout` global is re-read as u32 (the type-punned load — a
+/// single wrong RNE bit changes the fold), and the fold32 byte-mix feeds
+/// the volatile u8 checksum. `in0` (u8) stays as the fold helper's
+/// determinism anchor (same role as in the integer generator).
+///
+/// Every random choice comes from the seeded RNG in a fixed order, so
+/// `seed` fully determines the program. The first (forced) statement's kind
+/// rotates over the 6 families (add/sub/mul/div/cmp/conv), so across the
+/// 50-seed corpus every float kind is guaranteed to appear (pinned by the
+/// tests' coverage sanity check); the fill statements are best-effort
+/// against the frame budget.
+pub fn generate_float(seed: u64) -> Program {
+    let mut g = Gen::new(seed ^ FLOAT_MIX);
+    g.float_mode = true;
+    g.used_fold32 = true; // every float program folds through fold32
+    let mut rng = SplitMix64::new(seed ^ FLOAT_MIX2);
+
+    // Inputs: in0 u8 (the fold anchor), in3 the band normal (exponent
+    // 100..150 — the safe arithmetic source), in6 the edge value (±0, the
+    // smallest normals, normals with exponents 80..140 — the cmp coverage).
+    let mut inputs = Vec::new();
+    inputs.push(Input {
+        name: "in0".into(),
+        value: (rng.next_u64() as u8) as u32,
+        width: 8,
+        is_float: false,
+    });
+    inputs.push(Input {
+        name: "in3".into(),
+        value: normal_bits(&mut rng, 100, 150),
+        width: 32,
+        is_float: true,
+    });
+    inputs.push(Input {
+        name: "in6".into(),
+        value: edge_bits(&mut rng),
+        width: 32,
+        is_float: true,
+    });
+
+    let mut decls = String::new();
+    decls.push_str("volatile u8 in0;\n");
+    for n in ["in3", "in6"] {
+        decls.push_str(&format!("volatile float {n};\n"));
+    }
+    decls.push_str(&format!("volatile u8 {checksum};\n", checksum = CHECKSUM_NAME));
+    decls.push_str("volatile float fout;\n");
+
+    // The float statement families: 6 kinds (the fptoui/fptosi conversions
+    // are part of Conv, drawn 4-way inside the dispatch).
+    // The forced first statement rotates over the families (seed % 6), so
+    // the corpus spans the surface by construction; the Conv sub-kind also
+    // rotates ((seed / 6) % 4), so uitofp/sitofp/fptoui/fptosi each get
+    // forced seeds in the corpus. Its operands come from the
+    // inputs/constants (no locals yet) and its cost (<= 23) fits the empty
+    // frame — a rejection means the budget model is broken.
+    let forced: FloatKind = match seed % 6 {
+        0 => FloatKind::Add,
+        1 => FloatKind::Sub,
+        2 => FloatKind::Mul,
+        3 => FloatKind::Div,
+        4 => FloatKind::Cmp,
+        _ => FloatKind::Conv,
+    };
+    let forced_ok = if forced == FloatKind::Conv {
+        let c = [
+            FConvKind::UiToFp,
+            FConvKind::SiToFp,
+            FConvKind::FpToUi,
+            FConvKind::FpToSi,
+        ][(seed / 6) as usize % 4];
+        g.emit_fconv(c)
+    } else {
+        emit_float_kind(&mut g, forced, true)
+    };
+    if !forced_ok {
+        panic!(
+            "fuzz: float seed {seed}: the forced statement was rejected by the frame budget \
+             (frame_est {}, worst_routine {}, budget {}) — recalibrate the float budget model",
+            g.frame_est,
+            g.worst_routine,
+            g.frame_budget()
+        );
+    }
+    // Best-effort fill: weighted toward the arithmetic (the RNE heart of
+    // the corpus), with cmp and the conversions as the supporting surface.
+    for _ in 0..8 {
+        let k = match g.below(100) {
+            0..=9 => FloatKind::Add,
+            10..=19 => FloatKind::Sub,
+            20..=29 => FloatKind::Mul,
+            30..=39 => FloatKind::Div,
+            40..=55 => FloatKind::Cmp,
+            _ => FloatKind::Conv,
+        };
+        if !emit_float_kind(&mut g, k, false) {
+            break; // the frame budget is exhausted
+        }
+    }
+
+    let body = g.body.join("\n");
+    let prologue = format!(
+        "{TYPEDEF_PROLOGUE}{decls}{fold_src}void main(void) {{\n",
+        fold_src = Gen::fold_helpers_src(false, true)
+    );
+    let statements = g.body;
+    let c_source = format!("{prologue}{body}\n}}\n");
+    Program {
+        c_source,
+        inputs,
+        checksum_name: CHECKSUM_NAME.to_string(),
+        seed,
+        statements,
+        prologue,
+    }
+}
+
+/// The float statement families the float generator can emit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FloatKind {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Cmp,
+    Conv,
+}
+
+/// Emit one float statement of `k`; false = the frame budget rejected it
+/// (the fill loop stops; the forced statement panics instead — see
+/// `generate_float`).
+fn emit_float_kind(g: &mut Gen, k: FloatKind, force_input: bool) -> bool {
+    match k {
+        FloatKind::Add => g.emit_fbin(FBin::Add, force_input),
+        FloatKind::Sub => g.emit_fbin(FBin::Sub, force_input),
+        FloatKind::Mul => g.emit_fbin(FBin::Mul, force_input),
+        FloatKind::Div => g.emit_fbin(FBin::Div, force_input),
+        FloatKind::Cmp => g.emit_fcmp_f(force_input),
+        FloatKind::Conv => {
+            let c = [
+                FConvKind::UiToFp,
+                FConvKind::SiToFp,
+                FConvKind::FpToUi,
+                FConvKind::FpToSi,
+            ][g.below(4) as usize];
+            g.emit_fconv(c)
+        }
     }
 }
 
@@ -1295,11 +1814,15 @@ fn host_main_source(program: &Program) -> Result<String, String> {
     let mut s = String::from("#include <stdio.h>\n");
     s.push_str(TYPEDEF_PROLOGUE);
     for input in &program.inputs {
-        s.push_str(&format!(
-            "extern volatile {} {};\n",
-            width_type(input.width)?,
-            input.name
-        ));
+        if input.is_float {
+            s.push_str(&format!("extern volatile float {};\n", input.name));
+        } else {
+            s.push_str(&format!(
+                "extern volatile {} {};\n",
+                width_type(input.width)?,
+                input.name
+            ));
+        }
     }
     s.push_str(&format!(
         "extern volatile unsigned char {};\n",
@@ -1307,11 +1830,22 @@ fn host_main_source(program: &Program) -> Result<String, String> {
     ));
     s.push_str("void pic_main(void);\nint main(void) {\n");
     for input in &program.inputs {
-        s.push_str(&format!(
-            "  {} = 0x{:X}u;\n",
-            input.name,
-            input.value & width_mask(input.width)
-        ));
+        if input.is_float {
+            // Seed the float's BITS through a union — an assignment would
+            // ROUND the bit pattern to the nearest float (0x3F800000 as an
+            // unsigned int is not 1.0f). The union is host-side only.
+            s.push_str(&format!(
+                "  {{ union {{ unsigned int u; float f; }} cv; cv.u = 0x{:X}u; {} = cv.f; }}\n",
+                input.value & 0xFFFF_FFFF,
+                input.name
+            ));
+        } else {
+            s.push_str(&format!(
+                "  {} = 0x{:X}u;\n",
+                input.name,
+                input.value & width_mask(input.width)
+            ));
+        }
     }
     s.push_str(&format!(
         "  pic_main();\n  printf(\"%u\\n\", (unsigned){});\n  return 0;\n}}\n",

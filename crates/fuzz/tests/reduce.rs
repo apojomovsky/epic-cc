@@ -69,6 +69,7 @@ fn synthetic_mismatch_program() -> Program {
             name: "in0".into(),
             value: 200,
             width: 8,
+            is_float: false,
         }],
         checksum_name: "checksum".into(),
         seed: SYNTHETIC_SEED,
@@ -167,7 +168,12 @@ fn other_mismatch_program() -> Program {
         .to_string();
     Program {
         c_source: c_source.clone(),
-        inputs: vec![Input { name: "in0".into(), value: 200, width: 8 }],
+        inputs: vec![Input {
+            name: "in0".into(),
+            value: 200,
+            width: 8,
+            is_float: false,
+        }],
         checksum_name: "checksum".into(),
         seed: 9996,
         statements: Vec::new(),
@@ -290,6 +296,7 @@ fn synthetic_panic_program() -> Program {
             name: "in2".into(),
             value: 0x1234_5678,
             width: 32,
+            is_float: false,
         }],
         checksum_name: "checksum".into(),
         seed: PANIC_SEED,
