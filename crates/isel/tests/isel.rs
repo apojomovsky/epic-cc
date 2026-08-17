@@ -5688,6 +5688,9 @@ fn float_arith_routines_simulate_against_rust_reference() {
         // the sticky rounds the 0xAAAAAA mantissa up).
         ("__div_f32", 1.0, 3.0, "1.0/3.0"),
         ("__div_f32", 3.0, 2.0, "3.0/2.0"),
+        // 1.0/2^126 = 2^-126 = 0x00800000 exactly — the smallest NORMAL, the
+        // exp-1 bit pattern the cmp both-zero check must not read as zero.
+        ("__div_f32", 1.0, 2f32.powi(126), "1.0/2^126"),
         ("__sub_f32", 0.5, 0.5, "0.5-0.5"), // exact zero, signs equal
         // 1.0 + (-1.0) = +0 (the sa & sb zero sign rule).
         ("__add_f32", 1.0, -1.0, "1.0-1.0"),
@@ -5766,6 +5769,11 @@ fn cmp_f32_simulates_tristate_byte() {
         ("neg gt", -1.0, -2.0, 2),
         ("neg eq", -3.0, -3.0, 0),
         ("pos vs neg", 1.0, -2.0, 2),
+        // The smallest NORMALs (full 8-bit exp 1, the LSB in b2 bit 7): the
+        // both-zero shortcut must NOT swallow them (pre-fix these returned 0).
+        ("smallest normal gt +0", f32::from_bits(0x00800000), 0.0, 2),
+        ("-smallest normal lt +smallest normal", f32::from_bits(0x80800000), f32::from_bits(0x00800000), 1),
+        ("smallest normal lt next normal", f32::from_bits(0x00800000), f32::from_bits(0x00C00000), 1),
         ("NaN a", f32::NAN, 1.0, 3),
         ("NaN b", 1.0, f32::NAN, 3),
         ("NaN both", f32::NAN, f32::NAN, 3),
@@ -5782,6 +5790,40 @@ fn cmp_f32_simulates_tristate_byte() {
         let got = sim_run_bytes(&ir, &map, &seed, 0x28, 1)[0];
         assert_eq!(got, want, "{label}: cmp_f32({a}, {b}) must be {want}");
     }
+}
+
+/// The end-to-end reachability: __div_f32(1.0, 2^126) lands bit-exactly on
+/// the smallest normal 0x00800000, and a following __cmp_f32 of that quotient
+/// against +0.0 must report a > b (2). Pre-fix the both-zero shortcut read
+/// the exp-1 pattern as zero and returned 0.
+#[test]
+fn cmp_f32_sees_smallest_normal_produced_by_div() {
+    // div first: 1.0 / 2^126 = 2^-126 = 0x00800000 (exact).
+    let (ir, map) = float_routine_module("__div_f32");
+    let mut seed = Vec::new();
+    for (i, by) in f32_le(1.0).iter().enumerate() {
+        seed.push((0x20 + i as u16, *by));
+    }
+    for (i, by) in f32_le(2f32.powi(126)).iter().enumerate() {
+        seed.push((0x24 + i as u16, *by));
+    }
+    let q = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+    assert_eq!(
+        q,
+        f32_le(f32::from_bits(0x00800000)),
+        "div_f32(1.0, 2^126) must be 0x00800000: {q:02X?}"
+    );
+    // cmp the quotient against +0.0 -> a > b (2).
+    let (ir, map) = float_routine_module("__cmp_f32");
+    let mut seed = Vec::new();
+    for (i, by) in q.iter().enumerate() {
+        seed.push((0x20 + i as u16, *by));
+    }
+    for (i, by) in f32_le(0.0).iter().enumerate() {
+        seed.push((0x24 + i as u16, *by));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x28, 1)[0];
+    assert_eq!(got, 2, "cmp_f32(2^-126, 0.0) must be 2 (a > b)");
 }
 
 /// Every float routine emits a real recipe body — the label, the recipe
