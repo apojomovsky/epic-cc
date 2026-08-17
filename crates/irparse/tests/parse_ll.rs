@@ -959,3 +959,172 @@ define dso_local i8 @f(i8 %x) {
         other => panic!("expected Call, got {other:?}"),
     }
 }
+
+// Milestone 15: the f1.ll float shapes — fadd, fcmp olt, fptosi, sitofp,
+// a float select, and a float-typed global/param/ret.
+const F1: &str = r#"
+@in = dso_local global float 0.000000e+00, align 2
+@out = dso_local global float 0.000000e+00, align 2
+@outi = dso_local global i16 0, align 2
+
+define dso_local noundef float @fadd(float noundef %0, float noundef %1) {
+  %3 = fadd float %0, %1
+  ret float %3
+}
+
+define dso_local void @main() {
+  %1 = load volatile float, ptr @in, align 2
+  %6 = fcmp olt float %1, 1.000000e+00
+  %7 = select i1 %6, float 1.000000e+00, float 0.000000e+00
+  store volatile float %7, ptr @out, align 2
+  %8 = fptosi float %1 to i16
+  store volatile i16 %8, ptr @outi, align 2
+  %9 = load volatile i16, ptr @outi, align 2
+  %10 = sitofp i16 %9 to float
+  store volatile float %10, ptr @out, align 2
+  ret void
+}
+"#;
+
+#[test]
+fn parses_f1_float_shapes() {
+    let m = parse_ll(F1);
+    // float globals are 4 bytes; @in/@out are float, @outi is i16.
+    assert_eq!(m.globals[0].ty, ir::Ty::F32);
+    assert_eq!(m.globals[0].size, 4);
+    assert_eq!(m.globals[2].ty, ir::Ty::I16);
+    // @fadd: float ret + two float (width-4) params.
+    let fadd = m.funcs.iter().find(|f| f.name == "fadd").unwrap();
+    assert_eq!(fadd.ret, Some(ir::Ty::F32));
+    assert_eq!(fadd.params[0].width, 4);
+    assert_eq!(fadd.params[1].width, 4);
+    match &fadd.blocks[0].insts[0] {
+        Inst::FloatBin(b) => {
+            assert_eq!(b.dst, "3");
+            assert_eq!(b.op, ir::FBinOp::FAdd);
+            assert_eq!(b.a, Val::Reg("0".to_string()));
+            assert_eq!(b.b, Val::Reg("1".to_string()));
+        }
+        other => panic!("expected FloatBin, got {other:?}"),
+    }
+    // @main: the f1.ll shapes in order.
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    let i = &main.blocks[0].insts;
+    match &i[0] {
+        Inst::Load(l) => assert_eq!(l.ty, ir::Ty::F32),
+        other => panic!("expected Load, got {other:?}"),
+    }
+    // fcmp olt float %1, 1.0 -> b materialized as the f32 bit pattern.
+    match &i[1] {
+        Inst::Fcmp(c) => {
+            assert_eq!(c.dst, "6");
+            assert_eq!(c.pred, "olt");
+            assert_eq!(c.a, Val::Reg("1".to_string()));
+            assert_eq!(c.b, Val::Const(1.0f32.to_bits() as i64));
+        }
+        other => panic!("expected Fcmp, got {other:?}"),
+    }
+    // select i1 %6, float 1.0, float 0.0 -> F32-typed select with bit patterns.
+    match &i[2] {
+        Inst::Select(s) => {
+            assert_eq!(s.ty, ir::Ty::F32);
+            assert_eq!(s.a, Val::Const(1.0f32.to_bits() as i64));
+            assert_eq!(s.b, Val::Const(0.0f32.to_bits() as i64));
+        }
+        other => panic!("expected Select, got {other:?}"),
+    }
+    // fptosi float %1 to i16.
+    match &i[4] {
+        Inst::FloatConv(c) => {
+            assert_eq!(c.op, ir::FloatConvOp::FpToSi);
+            assert_eq!(c.from, ir::Ty::F32);
+            assert_eq!(c.val, Val::Reg("1".to_string()));
+            assert_eq!(c.to, ir::Ty::I16);
+        }
+        other => panic!("expected FloatConv, got {other:?}"),
+    }
+    // sitofp i16 %9 to float.
+    match &i[7] {
+        Inst::FloatConv(c) => {
+            assert_eq!(c.op, ir::FloatConvOp::SiToFp);
+            assert_eq!(c.from, ir::Ty::I16);
+            assert_eq!(c.val, Val::Reg("9".to_string()));
+            assert_eq!(c.to, ir::Ty::F32);
+        }
+        other => panic!("expected FloatConv, got {other:?}"),
+    }
+}
+
+#[test]
+fn parses_f32_constant_forms() {
+    // Both .ll f32 constant forms materialize as the 32-bit bit pattern in
+    // `Val::Const`: the hex form `f32 0x3F800000` and the decimal forms
+    // `float 1.000000e+00` / `float 5.000000e-01` (via f32::from_str +
+    // to_bits).
+    const C: &str = r#"
+@c = global f32 0x3F800000
+@d = global float 1.000000e+00
+define float @g() {
+  %1 = fadd float 0x3F800000, 1.000000e+00
+  %2 = fadd float %1, 5.000000e-01
+  ret float %2
+}
+"#;
+    let m = parse_ll(C);
+    assert_eq!(m.globals[0].ty, ir::Ty::F32);
+    assert_eq!(m.globals[0].size, 4);
+    assert_eq!(m.globals[1].ty, ir::Ty::F32);
+    let g = &m.funcs[0];
+    // hex operand 0x3F800000 == decimal operand 1.0f == same bit pattern.
+    match &g.blocks[0].insts[0] {
+        Inst::FloatBin(b) => {
+            assert_eq!(b.a, Val::Const(0x3F800000u32 as i64), "hex f32 form");
+            assert_eq!(b.b, Val::Const(1.0f32.to_bits() as i64), "decimal 1.0f");
+        }
+        other => panic!("expected FloatBin, got {other:?}"),
+    }
+    // decimal 0.5f -> 0x3F000000.
+    match &g.blocks[0].insts[1] {
+        Inst::FloatBin(b) => assert_eq!(b.b, Val::Const(0.5f32.to_bits() as i64)),
+        other => panic!("expected FloatBin, got {other:?}"),
+    }
+}
+
+#[test]
+fn float_struct_layout() {
+    // f32 is size 4, align 2 — so `{ i8, float }` is i8@0, f32@2, size 6
+    // (round_up(1 + 4, 2) = 6), exactly like the i32 case.
+    const S: &str = r#"
+%struct.S = type { i8, float }
+@out = global %struct.S zeroinitializer, align 2
+"#;
+    let m = parse_ll(S);
+    assert_eq!(m.globals[0].size, 6, "{{ i8, float }} must be 6 bytes");
+}
+
+#[test]
+fn parses_float_call_arg_constant() {
+    // A float call arg constant (`float noundef 5.000000e-01`) must parse
+    // (the real f1.ll tail-call shape — regression: parse_call_arg used to
+    // reject non-integer constants).
+    const S: &str = r#"
+define void @main() {
+  %1 = tail call float @fadd(float noundef 5.000000e-01)
+  ret void
+}
+define float @fadd(float %0) {
+  %2 = fadd float %0, 0x3F800000
+  ret float %2
+}
+"#;
+    let m = parse_ll(S);
+    let main = &m.funcs[0];
+    match &main.blocks[0].insts[0] {
+        Inst::Call(c) => {
+            assert_eq!(c.ty, Some(ir::Ty::F32));
+            assert_eq!(c.args[0].ty, Some(ir::Ty::F32));
+            assert_eq!(c.args[0].val, Val::Const(0.5f32.to_bits() as i64));
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+}

@@ -313,3 +313,54 @@ fn roundtrips_i32_ops() {
         assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
     }
 }
+
+#[test]
+fn roundtrips_float_insts_and_constants() {
+    // Milestone 15: the float instruction family round-trips its canonical
+    // text. An f32 constant serializes as its 32-bit bit pattern as a
+    // decimal integer (e.g. 1.0f = 0x3F800000 = 1065353216), which re-parses
+    // back to the same `Val::Const`.
+    let text = "global in float\nfn f(float) (a=float)\n  block entry:\n\
+    %1 = fadd float %a %b\n\
+    %2 = fsub float %1 1065353216\n\
+    %3 = fmul float %2 %a\n\
+    %4 = fdiv float %3 %1\n\
+    %5 = fcmp olt float %4 %a\n\
+    %6 = fptosi float %a to i16\n\
+    %7 = fptoui float %a to i32\n\
+    %8 = sitofp i16 %6 to float\n\
+    %9 = uitofp i32 %7 to float\n\
+    %10 = fpext float %8 to float\n\
+    %11 = fptrunc float %9 to float\n\
+    ret float %11\n";
+    let m = parse(text);
+    assert_eq!(m.globals[0].ty, ir::Ty::F32, "float global type");
+    assert_eq!(m.globals[0].size, 4, "float global is 4 bytes");
+    assert_eq!(m.funcs[0].params[0].width, 4, "float scalar param is width 4");
+    let out = serialize(&m);
+    // stable fixed point: parse -> serialize -> parse -> serialize
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out, "stable fixed point\n---\n{out}");
+    for line in [
+        "global in float",
+        "fn f(float) (",
+        // a width-4 scalar param serializes as `i32` (the Param type carries
+        // only the width, so float is not distinguished — the slot is 4 bytes
+        // either way, matching the i32 precedent).
+        "a=i32",
+        "%1 = fadd float %a %b",
+        "%2 = fsub float %1 1065353216",
+        "%3 = fmul float %2 %a",
+        "%4 = fdiv float %3 %1",
+        "%5 = fcmp olt float %4 %a",
+        "%6 = fptosi float %a to i16",
+        "%7 = fptoui float %a to i32",
+        "%8 = sitofp i16 %6 to float",
+        "%9 = uitofp i32 %7 to float",
+        "%10 = fpext float %8 to float",
+        "%11 = fptrunc float %9 to float",
+        "ret float %11",
+    ] {
+        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+    }
+}
