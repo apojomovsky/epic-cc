@@ -17,6 +17,16 @@
 //!   `__lshr_u8`/`__lshr_u16`/`__lshr_u32`,
 //!   `__ashr_i8`/`__ashr_i16`/`__ashr_i32`), which masks the count and loops.
 //! - `freeze` stays (isel lowers it as a byte copy).
+//! - Every f32 op (Milestone 15) lowers to a soft-float runtime call:
+//!   `fadd`/`fsub`/`fmul`/`fdiv` → `__add_f32`/`__sub_f32`/`__mul_f32`/
+//!   `__div_f32` (dst/ty preserved, both operands copied as float args);
+//!   `fcmp <pred>` → `%c = call i8 @__cmp_f32(a, b)` + the per-predicate
+//!   icmp/select materialization tree over the tri-state byte
+//!   (0 = equal, 1 = a < b, 2 = a > b, 3 = unordered) — an OR predicate
+//!   is `select i1 <c==k1>, i1 true, i1 <c==k2>`, never an i1 binop (isel
+//!   rejects those); `fptosi`/`fptoui`/`sitofp`/`uitofp` → the four
+//!   conversion routines; `fpext`/`fptrunc` (f32→f32 — double == float on
+//!   msp430) → a plain `freeze` copy, no call.
 //!
 //! The used routine `Func`s are then injected into the module: ordinary
 //! functions (name/ret/params per the ABI table below) with one empty block
@@ -27,7 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ir::{Alloca, BinOp, Block, Call, CallArg, Func, Inst, Module, Param, Ty, Val};
+use ir::{Alloca, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Inst, Module, Param, Ty, Val};
 
 pub fn legalize(m: Module) -> Module {
     // Interrupt shared-function duplication first: the runtime routines are
@@ -39,6 +49,10 @@ pub fn legalize(m: Module) -> Module {
     let m = duplicate_isr_shared(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
+    // Fresh SSA names for the fcmp materialization intermediates (the call
+    // dst and the icmp temps), seeded with every name the module defines so
+    // the trees can never collide with a user reg.
+    let mut names = FreshNames::from_module(&m);
     for f in m.funcs {
         let mut blocks = Vec::with_capacity(f.blocks.len());
         for b in f.blocks {
@@ -49,6 +63,9 @@ pub fn legalize(m: Module) -> Module {
                         Some(call) => insts.push(call),
                         None => insts.push(Inst::Bin(bin)),
                     },
+                    Inst::FloatBin(fb) => insts.push(lower_fbin(&fb, &mut used)),
+                    Inst::Fcmp(fc) => insts.extend(lower_fcmp(&fc, &mut used, &mut names)),
+                    Inst::FloatConv(fc) => insts.push(lower_fconv(&fc, &mut used)),
                     other => insts.push(other),
                 }
             }
@@ -60,6 +77,240 @@ pub fn legalize(m: Module) -> Module {
         funcs.push(routine_func(name));
     }
     Module { globals: m.globals, funcs }
+}
+
+/// Fresh SSA name supply for the fcmp materialization trees. Seeded with
+/// every name the module defines (params + inst dsts, module-wide — names
+/// only need uniqueness inside a function, so the conservative seed merely
+/// skips a few candidates), then hands out `c0`, `c1`, … skipping anything
+/// already taken. Deterministic, so the lowered text round-trips.
+struct FreshNames {
+    used: HashSet<String>,
+    next: u64,
+}
+
+impl FreshNames {
+    fn from_module(m: &Module) -> FreshNames {
+        let mut used: HashSet<String> = HashSet::new();
+        for f in &m.funcs {
+            for p in &f.params {
+                used.insert(p.name.clone());
+            }
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let Some(dst) = inst_dst(inst) {
+                        used.insert(dst.to_string());
+                    }
+                }
+            }
+        }
+        FreshNames { used, next: 0 }
+    }
+
+    fn fresh(&mut self) -> String {
+        loop {
+            let n = format!("c{}", self.next);
+            self.next += 1;
+            if self.used.insert(n.clone()) {
+                return n;
+            }
+        }
+    }
+}
+
+/// The dst register defined by `inst`, if any.
+fn inst_dst(inst: &Inst) -> Option<&str> {
+    match inst {
+        Inst::Load(l) => Some(&l.dst),
+        Inst::Bin(b) => Some(&b.dst),
+        Inst::Zext(z) => Some(&z.dst),
+        Inst::Sext(s) => Some(&s.dst),
+        Inst::Trunc(t) => Some(&t.dst),
+        Inst::Icmp(i) => Some(&i.dst),
+        Inst::Select(s) => Some(&s.dst),
+        Inst::Call(c) => c.dst.as_deref(),
+        Inst::Phi(p) => Some(&p.dst),
+        Inst::Gep(g) => Some(&g.dst),
+        Inst::Alloca(a) => Some(&a.dst),
+        Inst::Freeze(f) => Some(&f.dst),
+        Inst::FloatBin(b) => Some(&b.dst),
+        Inst::Fcmp(c) => Some(&c.dst),
+        Inst::FloatConv(c) => Some(&c.dst),
+        Inst::Ret(_) | Inst::Store(_) | Inst::Br(_) | Inst::BrCond(_) | Inst::Memcpy(_) => None,
+    }
+}
+
+/// The soft-float arithmetic routine for an f32 binop.
+fn fbin_routine(op: FBinOp) -> &'static str {
+    match op {
+        FBinOp::FAdd => "__add_f32",
+        FBinOp::FSub => "__sub_f32",
+        FBinOp::FMul => "__mul_f32",
+        FBinOp::FDiv => "__div_f32",
+    }
+}
+
+/// Rewrite one `Inst::FloatBin` into the runtime call: dst/ty preserved,
+/// both operands copied as f32 args.
+fn lower_fbin(b: &ir::FloatBin, used: &mut Vec<String>) -> Inst {
+    let func = fbin_routine(b.op);
+    if !used.iter().any(|u| u == func) {
+        used.push(func.to_string());
+    }
+    Inst::Call(Call {
+        dst: Some(b.dst.clone()),
+        ty: Some(Ty::F32),
+        func: func.to_string(),
+        args: vec![
+            CallArg { ty: Some(Ty::F32), val: b.a.clone(), byval: None, sret: false },
+            CallArg { ty: Some(Ty::F32), val: b.b.clone(), byval: None, sret: false },
+        ],
+    })
+}
+
+/// Rewrite one `Inst::Fcmp` into `%c = call i8 @__cmp_f32(a, b)` followed by
+/// the per-predicate icmp/select tree that materializes the i1 result from
+/// the tri-state byte. Returns the whole replacement sequence.
+fn lower_fcmp(c: &ir::Fcmp, used: &mut Vec<String>, names: &mut FreshNames) -> Vec<Inst> {
+    let func = "__cmp_f32";
+    if !used.iter().any(|u| u == func) {
+        used.push(func.to_string());
+    }
+    let call_dst = names.fresh();
+    let mut insts = vec![Inst::Call(Call {
+        dst: Some(call_dst.clone()),
+        ty: Some(Ty::I8),
+        func: func.to_string(),
+
+        args: vec![
+            CallArg { ty: Some(Ty::F32), val: c.a.clone(), byval: None, sret: false },
+            CallArg { ty: Some(Ty::F32), val: c.b.clone(), byval: None, sret: false },
+        ],
+    })];
+    insts.extend(fcmp_tree(&c.pred, &call_dst, &c.dst, names));
+    insts
+}
+
+fn fcmp_icmp(pred: &str, c: &str, k: i64, dst: &str) -> Inst {
+    Inst::Icmp(ir::Icmp {
+        dst: dst.into(),
+        pred: pred.into(),
+        ty: Ty::I8,
+        a: Val::Reg(c.into()),
+        b: Val::Const(k),
+    })
+}
+
+/// The per-predicate materialization tree over the `__cmp_f32` tri-state
+/// byte (0 = equal, 1 = a < b, 2 = a > b, 3 = unordered). Every tree is
+/// either a single `icmp eq/ne i8 %c, <k>` or the OR of two equality
+/// icmps materialized as `select i1 <c==k1>, i1 true, i1 <c==k2>` — no i1
+/// binops (isel rejects them). The trees are documented in the legalize
+/// tests and are the Task-3 isel contract.
+///
+/// | predicate | tree |
+/// |---|---|
+/// | `oeq` | `(c==0)` |
+/// | `ogt` | `(c==2)` |
+/// | `oge` | `(c==2)\|\|(c==0)` |
+/// | `olt` | `(c==1)` |
+/// | `ole` | `(c==1)\|\|(c==0)` |
+/// | `one` | `(c==1)\|\|(c==2)` |
+/// | `ord` | `(c!=3)` |
+/// | `ueq` | `(c==0)\|\|(c==3)` |
+/// | `ugt` | `(c==2)\|\|(c==3)` |
+/// | `uge` | `(c!=1)` |
+/// | `ult` | `(c==1)\|\|(c==3)` |
+/// | `ule` | `(c!=2)` |
+/// | `une` | `(c!=0)` |
+/// | `uno` | `(c==3)` |
+///
+/// `fcmp true`/`fcmp false` are compile-time constants (clang never emits
+/// them) and panic loudly instead of materializing a call the isel cannot
+/// remove.
+fn fcmp_tree(pred: &str, c: &str, dst: &str, names: &mut FreshNames) -> Vec<Inst> {
+    fn or(c: &str, k1: i64, k2: i64, dst: &str, names: &mut FreshNames, out: &mut Vec<Inst>) {
+        let t1 = names.fresh();
+        let t2 = names.fresh();
+        out.push(fcmp_icmp("eq", c, k1, &t1));
+        out.push(fcmp_icmp("eq", c, k2, &t2));
+        out.push(Inst::Select(ir::Select {
+            dst: dst.into(),
+            cond: Val::Reg(t1),
+            ty: Ty::I1,
+            a: Val::Const(1), // i1 true
+            b: Val::Reg(t2),
+        }));
+    }
+    let mut out = Vec::new();
+    match pred {
+        "oeq" => out.push(fcmp_icmp("eq", c, 0, dst)),
+        "ogt" => out.push(fcmp_icmp("eq", c, 2, dst)),
+        "oge" => or(c, 2, 0, dst, names, &mut out),
+        "olt" => out.push(fcmp_icmp("eq", c, 1, dst)),
+        "ole" => or(c, 1, 0, dst, names, &mut out),
+        "one" => or(c, 1, 2, dst, names, &mut out),
+        "ord" => out.push(fcmp_icmp("ne", c, 3, dst)),
+        "ueq" => or(c, 0, 3, dst, names, &mut out),
+        "ugt" => or(c, 2, 3, dst, names, &mut out),
+        "uge" => out.push(fcmp_icmp("ne", c, 1, dst)),
+        "ult" => or(c, 1, 3, dst, names, &mut out),
+        "ule" => out.push(fcmp_icmp("ne", c, 2, dst)),
+        "une" => out.push(fcmp_icmp("ne", c, 0, dst)),
+        "uno" => out.push(fcmp_icmp("eq", c, 3, dst)),
+        "true" | "false" => panic!("legalize: fcmp {pred} is a compile-time constant (clang never emits it)"),
+        other => panic!("legalize: unknown fcmp predicate {other:?}"),
+    }
+    out
+}
+
+/// Rewrite one `Inst::FloatConv`. The int<->float conversions become calls
+/// to the four conversion routines — the source/target width rides on the
+/// call's types (the routine's slot is always 4 bytes; an i8/i16 source or
+/// result uses the low bytes). `fpext`/`fptrunc` are f32→f32 (double ==
+/// float on msp430) and become a plain `freeze` copy, no call. Anything
+/// touching a non-f32 type is an f64 attempt and panics loudly.
+fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
+    fn mark(func: &'static str, used: &mut Vec<String>) -> String {
+        if !used.iter().any(|u| u == func) {
+            used.push(func.to_string());
+        }
+        func.to_string()
+    }
+
+    let dst = Some(c.dst.clone());
+    match (c.op, c.from, c.to) {
+        (FloatConvOp::FpToSi, Ty::F32, to @ (Ty::I8 | Ty::I16 | Ty::I32)) => Inst::Call(Call {
+            dst,
+            ty: Some(to),
+            func: mark("__fptosi_f32", used),
+            args: vec![CallArg { ty: Some(Ty::F32), val: c.val.clone(), byval: None, sret: false }],
+        }),
+        (FloatConvOp::FpToUi, Ty::F32, to @ (Ty::I8 | Ty::I16 | Ty::I32)) => Inst::Call(Call {
+            dst,
+            ty: Some(to),
+            func: mark("__fptoui_f32", used),
+            args: vec![CallArg { ty: Some(Ty::F32), val: c.val.clone(), byval: None, sret: false }],
+        }),
+        (FloatConvOp::SiToFp, from @ (Ty::I8 | Ty::I16 | Ty::I32), Ty::F32) => Inst::Call(Call {
+            dst,
+            ty: Some(Ty::F32),
+            func: mark("__sitofp_f32", used),
+            args: vec![CallArg { ty: Some(from), val: c.val.clone(), byval: None, sret: false }],
+        }),
+        (FloatConvOp::UiToFp, from @ (Ty::I8 | Ty::I16 | Ty::I32), Ty::F32) => Inst::Call(Call {
+            dst,
+            ty: Some(Ty::F32),
+            func: mark("__uitofp_f32", used),
+            args: vec![CallArg { ty: Some(from), val: c.val.clone(), byval: None, sret: false }],
+        }),
+        (FloatConvOp::Fpext | FloatConvOp::Fptrunc, Ty::F32, Ty::F32) => {
+            Inst::Freeze(ir::Freeze { dst: c.dst.clone(), ty: Ty::F32, val: c.val.clone() })
+        }
+        other => panic!(
+            "legalize: unsupported float conversion {other:?} (msp430 has no f64; fpext/fptrunc are f32->f32 only)"
+        ),
+    }
 }
 
 /// Every function transitively reachable from `roots` over the caller ->
@@ -289,12 +540,22 @@ fn param(name: &str, width: u8) -> Param {
 /// | `__udiv_u32`, `__urem_u32` | 10 | `rem`@0-3 (partial remainder — full 32 bits, never carries out for a 32/32 divide), `den`@4-7 (denominator copy — the divmod subtracts/restores against this, so the param slot is untouched), `cnt`@8 (loop counter, 32), `spare`@9 (recipe scratch) |
 /// | `__sdiv_i32`, `__srem_i32` | 12 | the divmod part at the unsigned offsets — `rem`@0-3, `den`@4-7, `cnt`@8, `spare`@9 — plus `flags`@10 (sign state: bit0 = negate quotient = num<0 XOR den<0, bit1 = negate remainder = num<0), `spare`@11 |
 /// | `__shl_u32`, `__lshr_u32`, `__ashr_i32` | 2 | `cnt`@0 (masked count / loop counter — the value shifts in the `val` param slot), `spare`@1 (recipe scratch) |
+/// | `__add_f32`, `__sub_f32` | 14 | `sa`@0 (sign of a), `ea`@1 (biased exponent of a), `ma`@2-4 (24-bit mantissa of a with the implicit bit), `sb`@5, `eb`@6, `mb`@7-9 (same for b), `stick`@10 (sticky collector for the right-alignment shift), `cnt`@11 (alignment/normalize shift counter), `spare`@12-13 (rounding scratch) |
+/// | `__mul_f32` | 14 | `sign`@0 (result sign = sa XOR sb), `e`@1-2 (biased result exponent: e1+e2-127, 16-bit intermediate), `bk`@3-5 (multiplier backup — shifted to test bits), `cnt`@6 (loop counter, 24), `m`@7-10 (running product — the top 25 bits of the 24x24 product accumulate here), `spare`@11-13 (rounding scratch) |
+/// | `__div_f32` | 12 | `sign`@0 (result sign = sa XOR sb), `e`@1-2 (biased result exponent: e1-e2+127, 16-bit intermediate), `rem`@3-6 (partial remainder — 4 bytes: the 24-bit rem shift can carry a bit), `den`@7-9 (denominator copy — the restoring subtract/restore reads this, the param slot stays untouched), `cnt`@10 (loop counter, 24), `spare`@11 (rounding scratch) |
+/// | `__cmp_f32` | 6 | `tmp`@0-1 (byte-compare scratch), `flags`@2 (sign-state / NaN-check flags), `spare`@3-5 |
+/// | `__uitofp_f32`, `__sitofp_f32` | 8 | `cnt`@0 (leading-1 shift counter), `e`@1-2 (biased result exponent: 127+31-shifts), `guard`@3 (the round/guard bit), `stick`@4 (sticky), `spare`@5-7 |
+/// | `__fptoui_f32`, `__fptosi_f32` | 8 | `e`@0 (biased exponent), `cnt`@1 (right-shift count: 127-e+23), `m`@2-4 (mantissa working copy — shifted right in place), `sign`@5 (fptosi only), `spare`@6-7 |
 ///
 /// Notes: div-by-zero is LLVM poison — the loop runs (den = 0 ⇒ quotient
 /// 0xFFFF, remainder 0), any value is legal, no guard. Variable-shift counts
 /// arrive unmasked and are masked to `width - 1` inside the routine. The
 /// signed wrappers abs in place in the param slots (unsigned abs, so INT_MIN
-/// is safe), run the unsigned divmod, then negate per the flags byte.
+/// is safe), run the unsigned divmod, then negate per the flags byte. The
+/// soft-float routines take their operands in 4-byte slots (`a`/`b` are the
+/// f32 bytes; `val` is the 4-byte int slot — an i8/i16 source or result uses
+/// the low bytes), write the result to the retval slots, and use `__scr`
+/// strictly by offset (Task-3 recipe contract).
 fn routine_func(name: &str) -> Func {
     let (ret, params, scr) = match name {
         "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 6),
@@ -309,6 +570,14 @@ fn routine_func(name: &str) -> Func {
         "__shl_u8" | "__lshr_u8" | "__ashr_i8" => (Ty::I8, vec![param("val", 1), param("cnt", 1)], 3),
         "__shl_u16" | "__lshr_u16" | "__ashr_i16" => (Ty::I16, vec![param("val", 2), param("cnt", 2)], 4),
         "__shl_u32" | "__lshr_u32" | "__ashr_i32" => (Ty::I32, vec![param("val", 4), param("cnt", 4)], 2),
+        // Milestone 15: the soft-float routines (f32 slots are 4 bytes).
+        "__add_f32" | "__sub_f32" | "__mul_f32" => {
+            (Ty::F32, vec![param("a", 4), param("b", 4)], 14)
+        }
+        "__div_f32" => (Ty::F32, vec![param("a", 4), param("b", 4)], 12),
+        "__cmp_f32" => (Ty::I8, vec![param("a", 4), param("b", 4)], 6),
+        "__uitofp_f32" | "__sitofp_f32" => (Ty::F32, vec![param("val", 4)], 8),
+        "__fptoui_f32" | "__fptosi_f32" => (Ty::I32, vec![param("val", 4)], 8),
         other => panic!("legalize: unknown runtime routine {other}"),
     };
     Func {

@@ -362,3 +362,289 @@ fn isr_context_reaching_main_panics_loudly() {
     );
     let _ = legalize(m);
 }
+
+// ===== Milestone 15: the float lowering (the soft-float runtime calls) =====
+
+/// The f1.ll float shapes: every f32 arithmetic op becomes a call to the
+/// matching runtime routine with the dst/ty preserved and both operands
+/// passed as float args; no `fadd`/`fdiv` Bin remains.
+#[test]
+fn lowers_float_arith_to_runtime_calls() {
+    let m = parse(
+        "global in float\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load float @in\n\
+             %b = load float @in\n\
+             %r1 = fadd float %a %b\n\
+             %r2 = fsub float %a %b\n\
+             %r3 = fmul float %a %b\n\
+             %r4 = fdiv float %a %b\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    // dst/ty preserved; both operands copied as float args.
+    assert!(text.contains("%r1 = call float @__add_f32(float %a, float %b)"));
+    assert!(text.contains("%r2 = call float @__sub_f32(float %a, float %b)"));
+    assert!(text.contains("%r3 = call float @__mul_f32(float %a, float %b)"));
+    assert!(text.contains("%r4 = call float @__div_f32(float %a, float %b)"));
+    // The arithmetic insts are gone.
+    assert!(!text.contains("fadd float"));
+    assert!(!text.contains("fsub float"));
+    assert!(!text.contains("fmul float"));
+    assert!(!text.contains("fdiv float"));
+}
+
+/// `fcmp` becomes `%c = call i8 @__cmp_f32(a, b)` + the per-predicate
+/// icmp/select tree over the tri-state byte (0=eq/1=lt/2=gt/3=unordered),
+/// with the OR predicates materialized as `select i1 <c==k1>, i1 true,
+/// i1 <c==k2>` — no i1 binops (the isel rejects them). Assert the exact
+/// tree shapes for olt, oeq, one, ugt, ord, uno.
+#[test]
+fn lowers_fcmp_to_cmp_call_and_materialization_tree() {
+    let m = parse(
+        "global in float\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load float @in\n\
+             %b = load float @in\n\
+             %x1 = fcmp olt float %a %b\n\
+             %x2 = fcmp oeq float %a %b\n\
+             %x3 = fcmp one float %a %b\n\
+             %x4 = fcmp ugt float %a %b\n\
+             %x5 = fcmp ord float %a %b\n\
+             %x6 = fcmp uno float %a %b\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    // olt = (c==1): a single icmp on the call result.
+    assert!(text.contains("%c0 = call i8 @__cmp_f32(float %a, float %b)\n    %x1 = icmp eq i8 %c0 1"));
+    // oeq = (c==0).
+    assert!(text.contains("%c1 = call i8 @__cmp_f32(float %a, float %b)\n    %x2 = icmp eq i8 %c1 0"));
+    // one = (c==1) || (c==2): two icmps + a select (the OR materialization).
+    assert!(text.contains("%c2 = call i8 @__cmp_f32(float %a, float %b)"));
+    assert!(text.contains("%c3 = icmp eq i8 %c2 1"));
+    assert!(text.contains("%c4 = icmp eq i8 %c2 2"));
+    assert!(text.contains("%x3 = select i1 %c3 i1 1 i1 %c4"));
+    // ugt = (c==2) || (c==3).
+    assert!(text.contains("%c5 = call i8 @__cmp_f32(float %a, float %b)"));
+    assert!(text.contains("%c6 = icmp eq i8 %c5 2"));
+    assert!(text.contains("%c7 = icmp eq i8 %c5 3"));
+    assert!(text.contains("%x4 = select i1 %c6 i1 1 i1 %c7"));
+    // ord = (c!=3): a single icmp.
+    assert!(text.contains("%c8 = call i8 @__cmp_f32(float %a, float %b)\n    %x5 = icmp ne i8 %c8 3"));
+    // uno = (c==3).
+    assert!(text.contains("%c9 = call i8 @__cmp_f32(float %a, float %b)\n    %x6 = icmp eq i8 %c9 3"));
+    // No i1 binops anywhere — the ORs are selects, never `or i1`.
+    assert!(!text.contains("or i1"), "i1 binops are forbidden:\n{text}");
+    assert!(!text.contains("and i1"), "i1 binops are forbidden:\n{text}");
+}
+
+/// Table-driven: every one of the 14 fcmp predicates materializes as the
+/// documented icmp/select tree over the `__cmp_f32` tri-state byte —
+/// either one `icmp eq/ne i8 %c, <k>` or an OR `(c==k1)||(c==k2)` via two
+/// icmps + a select. The trees are the Task-3 isel contract.
+#[test]
+fn pins_all_fcmp_predicate_trees() {
+    // (pred, single icmp (op, k) | OR of two eqs (k1, k2))
+    enum Tree { Icmp(&'static str, i64), Or(i64, i64) }
+    use Tree::*;
+    let cases: &[(&str, Tree)] = &[
+        ("oeq", Icmp("eq", 0)),
+        ("ogt", Icmp("eq", 2)),
+        ("oge", Or(2, 0)),
+        ("olt", Icmp("eq", 1)),
+        ("ole", Or(1, 0)),
+        ("one", Or(1, 2)),
+        ("ord", Icmp("ne", 3)),
+        ("ueq", Or(0, 3)),
+        ("ugt", Or(2, 3)),
+        ("uge", Icmp("ne", 1)),
+        ("ult", Or(1, 3)),
+        ("ule", Icmp("ne", 2)),
+        ("une", Icmp("ne", 0)),
+        ("uno", Icmp("eq", 3)),
+    ];
+    for (pred, tree) in cases {
+        let src = format!(
+            "global in float\nfn main(void) ()\n  block entry:\n    %a = load float @in\n    %b = load float @in\n    %r = fcmp {pred} float %a %b\n    ret void\n"
+        );
+        let text = ir::serialize(&legalize(parse(&src)));
+        // The call comes first, into a fresh i8 dst.
+        assert!(
+            text.contains("%c0 = call i8 @__cmp_f32(float %a, float %b)"),
+            "{pred}: missing __cmp_f32 call:\n{text}"
+        );
+        match tree {
+            Icmp(op, k) => {
+                assert!(
+                    text.contains(&format!("%r = icmp {op} i8 %c0 {k}")),
+                    "{pred}: expected single icmp {op} {k}:\n{text}"
+                );
+            }
+            Or(k1, k2) => {
+                assert!(
+                    text.contains(&format!("%c1 = icmp eq i8 %c0 {k1}\n    %c2 = icmp eq i8 %c0 {k2}\n    %r = select i1 %c1 i1 1 i1 %c2")),
+                    "{pred}: expected OR tree ((c=={k1})||(c=={k2})):\n{text}"
+                );
+            }
+        }
+        assert!(!text.contains("or i1"), "{pred}: i1 binop forbidden:\n{text}");
+    }
+}
+
+/// The nine float routine Funcs are injected with the EXACT signatures and
+/// scratch alloca sizes from the Task-2 layout contract (the Task-3 isel
+/// recipes read their working state from `{func}::__scr` + offset).
+#[test]
+fn injects_float_routines_with_exact_scratch_sizes() {
+    use ir::Ty;
+    // (name, ret, param names, param width, __scr size)
+    let cases: &[(&str, Option<Ty>, &[&str], u8, u8)] = &[
+        ("__add_f32", Some(Ty::F32), &["a", "b"], 4, 14),
+        ("__sub_f32", Some(Ty::F32), &["a", "b"], 4, 14),
+        ("__mul_f32", Some(Ty::F32), &["a", "b"], 4, 14),
+        ("__div_f32", Some(Ty::F32), &["a", "b"], 4, 12),
+        ("__cmp_f32", Some(Ty::I8), &["a", "b"], 4, 6),
+        ("__uitofp_f32", Some(Ty::F32), &["val"], 4, 8),
+        ("__sitofp_f32", Some(Ty::F32), &["val"], 4, 8),
+        ("__fptoui_f32", Some(Ty::I32), &["val"], 4, 8),
+        ("__fptosi_f32", Some(Ty::I32), &["val"], 4, 8),
+    ];
+    let m = parse(
+        "global in float\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load float @in\n\
+             %b = load float @in\n\
+             %r1 = fadd float %a %b\n\
+             %r2 = fsub float %a %b\n\
+             %r3 = fmul float %a %b\n\
+             %r4 = fdiv float %a %b\n\
+             %r5 = fcmp olt float %a %b\n\
+             %r6 = fptosi float %a to i16\n\
+             %r7 = fptoui float %a to i32\n\
+             %r8 = sitofp i16 %r6 to float\n\
+             %r9 = uitofp i32 %r7 to float\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    for (name, ret, params, width, size) in cases {
+        let f = m2
+            .funcs
+            .iter()
+            .find(|f| f.name == *name)
+            .unwrap_or_else(|| panic!("{name} not injected"));
+        assert_eq!(&f.ret, ret, "{name} return type");
+        assert_eq!(f.params.len(), params.len(), "{name} param count");
+        for (i, pname) in params.iter().enumerate() {
+            assert_eq!(f.params[i].name, *pname, "{name} param {i} name");
+            assert_eq!(f.params[i].width, *width, "{name} param {i} width");
+        }
+        assert_eq!(f.blocks.len(), 1, "{name} block count");
+        match &f.blocks[0].insts[0] {
+            Inst::Alloca(a) => {
+                assert_eq!(a.dst, "__scr", "{name} scratch dst");
+                assert_eq!(a.size, *size, "{name} scratch size");
+            }
+            other => panic!("{name}: expected scratch alloca, got {other:?}"),
+        }
+    }
+    // The injected defs carry the canonical text form too.
+    let text = ir::serialize(&m2);
+    assert!(text.contains("fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14"));
+    assert!(text.contains("fn __cmp_f32(i8) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 6"));
+    assert!(text.contains("fn __fptosi_f32(i32) (val=i32)\n  block entry:\n    %__scr = alloca 8"));
+    assert!(text.contains("fn __uitofp_f32(float) (val=i32)\n  block entry:\n    %__scr = alloca 8"));
+    // Only the used routines are injected (no integer routines here).
+    assert!(!text.contains("__mul_u8"));
+    assert!(!text.contains("__udiv_u16"));
+}
+
+/// The int<->float conversions become calls to the four conversion
+/// routines (the source/target width rides on the call's ty — i8/i16/i32
+/// sources use the low bytes of the 4-byte param slot); fpext/fptrunc
+/// (f32->f32 — double == float on msp430) become plain freeze copies with
+/// no call.
+#[test]
+fn lowers_float_conversions_and_casts() {
+    let m = parse(
+        "global in float\n\
+         global ini i16\n\
+         global ini32 i32\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load float @in\n\
+             %v16 = load i16 @ini\n\
+             %v32 = load i32 @ini32\n\
+             %r1 = fptosi float %a to i16\n\
+             %r2 = fptoui float %a to i32\n\
+             %r3 = sitofp i16 %v16 to float\n\
+             %r4 = uitofp i32 %v32 to float\n\
+             %r5 = fpext float %r3 to float\n\
+             %r6 = fptrunc float %r4 to float\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    // fptosi/fptoui: the float operand is the routine's arg, the int width
+    // is the call's return type.
+    assert!(text.contains("%r1 = call i16 @__fptosi_f32(float %a)"));
+    assert!(text.contains("%r2 = call i32 @__fptoui_f32(float %a)"));
+    // sitofp/uitofp: the int operand is the routine's arg (typed, so the
+    // isel copies only its width into the 4-byte val slot), the result float.
+    assert!(text.contains("%r3 = call float @__sitofp_f32(i16 %v16)"));
+    assert!(text.contains("%r4 = call float @__uitofp_f32(i32 %v32)"));
+    // fpext/fptrunc are plain copies — freeze, never a call.
+    assert!(text.contains("%r5 = freeze float %r3"));
+    assert!(text.contains("%r6 = freeze float %r4"));
+    assert!(!text.contains("fpext"));
+    assert!(!text.contains("fptrunc"));
+    assert!(!text.contains("call float @__fpext"));
+}
+
+/// The lowered module's canonical text round-trips (parse -> serialize is a
+/// stable fixed point) — the injected routine defs and the fcmp trees show
+/// up in the text deliberately.
+#[test]
+fn float_lowering_roundtrips_canonical_text() {
+    let m = parse(
+        "global in float\n\
+         fn fadd(float) (a=float, b=float)\n\
+           block entry:\n\
+             %1 = fadd float %a %b\n\
+             ret float %1\n\
+         fn fcmp1(float) (a=float, b=float)\n\
+           block entry:\n\
+             %2 = fcmp oeq float %a %b\n\
+             %3 = fcmp one float %a %b\n\
+             %4 = fcmp ugt float %a %b\n\
+             %5 = fcmp ord float %a %b\n\
+             %6 = fcmp uno float %a %b\n\
+             ret void\n\
+         fn fconv(float) (a=float)\n\
+           block entry:\n\
+             %7 = fptosi float %a to i16\n\
+             %8 = fptoui float %a to i32\n\
+             %9 = sitofp i16 %7 to float\n\
+             %10 = uitofp i32 %8 to float\n\
+             %11 = fpext float %9 to float\n\
+             %12 = fptrunc float %10 to float\n\
+             ret float %11\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    let m2 = parse(&text);
+    assert_eq!(ir::serialize(&m2), text, "stable fixed point\n---\n{text}");
+    for line in [
+        "fn __add_f32(float) (a=i32, b=i32)",
+        "%1 = call float @__add_f32(float %a, float %b)",
+        "%c0 = call i8 @__cmp_f32(float %a, float %b)",
+        "%2 = icmp eq i8 %c0 0",
+        "%7 = call i16 @__fptosi_f32(float %a)",
+        "%9 = call float @__sitofp_f32(i16 %7)",
+        "%11 = freeze float %9",
+        "fn __cmp_f32(i8) (a=i32, b=i32)",
+        "fn __fptosi_f32(i32) (val=i32)",
+    ] {
+        assert!(text.contains(line), "missing canonical line: {line}\n---\n{text}");
+    }
+}
