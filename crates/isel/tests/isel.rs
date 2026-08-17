@@ -1326,10 +1326,13 @@ fn sub_i16_reg_const_emits_borrow_chain() {
 fn sub_const_lhs_emits_sublw_chain() {
     // sub is NOT commutative: d = k - a cannot reuse the reg-const lowering
     // (which computes a - k) and must never read a const as a file register.
-    // The const-LHS path lowers per byte as `MOVF a,W; SUBLW k; MOVWF d`
-    // (SUBLW computes k - W), with each higher byte bumping the subtrahend
-    // byte by the low byte's borrow (BTFSS C / ADDLW 1, mirroring the
-    // reg-const `a - k` chain with the roles swapped).
+    // The const-LHS path lowers byte 0 as `MOVF a,W; SUBLW k; MOVWF d`
+    // (SUBLW computes k - W), then each higher byte preloads k_i into the
+    // destination and folds the borrow with the wrap-correct INCFSZ idiom
+    // (issue #1): a_i is stashed in the scratch, `INCFSZ scratch, W` skips
+    // the in-place `SUBWF d_i, F` when a_i + borrow wraps to 0x100, leaving
+    // d_i = k_i — the correct mod-256 result — with C = borrow-in, the
+    // true borrow-out.
     //
     // i8: d = 5 - a.
     let m = parse(
@@ -1360,16 +1363,18 @@ fn sub_const_lhs_emits_sublw_chain() {
         ("main::r", 0x29),
     ]);
     let asm16 = select(&m, &addrs16);
-    // %a=0x27 (hi 0x28), %r=0x29 (hi 0x2A).
+    // %a=0x27 (hi 0x28), %r=0x29 (hi 0x2A), scratch=0x70.
     assert!(asm16.contains("MOVF 0x27, W"), "load a_lo:\n{asm16}");
     assert!(asm16.contains("SUBLW 0x34"), "k_lo - a_lo:\n{asm16}");
     assert!(asm16.contains("MOVWF 0x29"), "store d_lo:\n{asm16}");
     assert!(asm16.contains("MOVF 0x28, W"), "load a_hi:\n{asm16}");
+    assert!(asm16.contains("MOVWF 0x70"), "a_hi stashed in the scratch:\n{asm16}");
+    assert!(asm16.contains("MOVLW 0x12"), "preload k_hi:\n{asm16}");
+    assert!(asm16.contains("MOVWF 0x2A"), "preload d_hi:\n{asm16}");
     assert!(asm16.contains("BTFSS STATUS, 0"), "borrow test:\n{asm16}");
-    assert!(asm16.contains("ADDLW 0x01"), "borrow-in add:\n{asm16}");
-    assert!(asm16.contains("SUBLW 0x12"), "k_hi - a_hi:\n{asm16}");
-    assert!(asm16.contains("MOVWF 0x2A"), "store d_hi:\n{asm16}");
-    assert!(!asm16.contains("SUBWF"), "const-LHS sub must not use SUBWF:\n{asm16}");
+    assert!(asm16.contains("INCFSZ 0x70, W"), "wrap-correct borrow fold:\n{asm16}");
+    assert!(asm16.contains("SUBWF 0x2A, F"), "k_hi - a_hi in place:\n{asm16}");
+    assert!(!asm16.contains("SUBWF 0x27") && !asm16.contains("SUBWF 0x28"), "const-LHS sub must never subtract from the source a (a - k is the wrong direction):\n{asm16}");
 
     // i32: d = 0x12345678 - a, a four-byte SUBLW borrow chain.
     let m = parse(
@@ -1382,22 +1387,29 @@ fn sub_const_lhs_emits_sublw_chain() {
         ("main::r", 0x34),
     ]);
     let asm32 = select(&m, &addrs32);
-    // %a=0x30..0x33, %r=0x34..0x37; 0x12345678 -> bytes 0x78, 0x56, 0x34, 0x12.
+    // %a=0x30..0x33, %r=0x34..0x37, scratch=0x70; 0x12345678 -> bytes
+    // 0x78, 0x56, 0x34, 0x12. Each higher byte: a_i -> scratch, k_i
+    // preloaded into d_i, then the wrap-correct INCFSZ fold + in-place
+    // SUBWF d_i, F.
     assert!(asm32.contains("MOVF 0x30, W"), "load a_b0:\n{asm32}");
     assert!(asm32.contains("SUBLW 0x78"), "k_b0 - a_b0:\n{asm32}");
     assert!(asm32.contains("MOVWF 0x34"), "store d_b0:\n{asm32}");
     assert!(asm32.contains("MOVF 0x31, W"), "load a_b1:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x70"), "a_b1 stashed in the scratch:\n{asm32}");
+    assert!(asm32.contains("MOVLW 0x56"), "preload k_b1:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x35"), "preload d_b1:\n{asm32}");
     assert!(asm32.contains("BTFSS STATUS, 0"), "borrow test:\n{asm32}");
-    assert!(asm32.contains("ADDLW 0x01"), "borrow-in add:\n{asm32}");
-    assert!(asm32.contains("SUBLW 0x56"), "k_b1 - a_b1:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x35"), "store d_b1:\n{asm32}");
+    assert!(asm32.contains("INCFSZ 0x70, W"), "wrap-correct borrow fold:\n{asm32}");
+    assert!(asm32.contains("SUBWF 0x35, F"), "k_b1 - a_b1 in place:\n{asm32}");
     assert!(asm32.contains("MOVF 0x32, W"), "load a_b2:\n{asm32}");
-    assert!(asm32.contains("SUBLW 0x34"), "k_b2 - a_b2:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x36"), "store d_b2:\n{asm32}");
+    assert!(asm32.contains("MOVLW 0x34"), "preload k_b2:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x36"), "preload d_b2:\n{asm32}");
+    assert!(asm32.contains("SUBWF 0x36, F"), "k_b2 - a_b2 in place:\n{asm32}");
     assert!(asm32.contains("MOVF 0x33, W"), "load a_b3:\n{asm32}");
-    assert!(asm32.contains("SUBLW 0x12"), "k_b3 - a_b3:\n{asm32}");
-    assert!(asm32.contains("MOVWF 0x37"), "store d_b3:\n{asm32}");
-    assert!(!asm32.contains("SUBWF"), "const-LHS sub must not use SUBWF:\n{asm32}");
+    assert!(asm32.contains("MOVLW 0x12"), "preload k_b3:\n{asm32}");
+    assert!(asm32.contains("MOVWF 0x37"), "preload d_b3:\n{asm32}");
+    assert!(asm32.contains("SUBWF 0x37, F"), "k_b3 - a_b3 in place:\n{asm32}");
+    assert!(!asm32.contains("SUBWF 0x30") && !asm32.contains("SUBWF 0x31") && !asm32.contains("SUBWF 0x32") && !asm32.contains("SUBWF 0x33"), "const-LHS sub must never subtract from the source a:\n{asm32}");
 }
 
 #[test]
@@ -1793,8 +1805,8 @@ fn icmp_ult_i16_emits_borrow_chain() {
     let asm = select(&m, &addrs);
     // %a=0x29/2A, %b=0x2B/2C, %c=0x2D.
     assert!(
-        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x2A, W"),
-        "i16 borrow chain:\n{asm}"
+        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x2C, W\n    SUBWF 0x2A, W"),
+        "i16 borrow chain (wrap-correct INCFSZ fold):\n{asm}"
     );
     assert!(
         asm.contains("MOVLW 0x00\n    BTFSS STATUS, 0 ; C\n    MOVLW 0x01\n    MOVWF 0x2D"),
@@ -1824,7 +1836,7 @@ fn icmp_ugt_i16_accumulates_equality_for_z() {
     // Chain first (C), then the eq accumulation (Z = a == b), then
     // C && !Z. %a=0x29/2A, %b=0x2B/2C, scratch=0x70.
     assert!(
-        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x2A, W\n    MOVF 0x29, W\n    XORWF 0x2B, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    XORWF 0x2C, W\n    IORWF 0x70, W\n    MOVWF 0x70"),
+        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x2C, W\n    SUBWF 0x2A, W\n    MOVF 0x29, W\n    XORWF 0x2B, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    XORWF 0x2C, W\n    IORWF 0x70, W\n    MOVWF 0x70"),
         "chain then equality accumulation:\n{asm}"
     );
     assert!(
@@ -1854,7 +1866,7 @@ fn icmp_slt_i16_complements_sign_bit_in_scratch() {
     let asm = select(&m, &addrs);
     // %a=0x29/2A, %b=0x2B/2C, scratch=0x70.
     assert!(
-        asm.contains("MOVLW 0x80\n    XORWF 0x2A, W\n    MOVWF 0x70\n    MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVLW 0x80\n    XORWF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    ADDLW 0x01\n    SUBWF 0x70, W"),
+        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVLW 0x80\n    XORWF 0x2C, W\n    MOVWF 0x71\n    MOVLW 0x80\n    XORWF 0x2A, W\n    MOVWF 0x70\n    MOVF 0x71, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x71, W\n    SUBWF 0x70, W"),
         "signed i16 chain with a_hi ^ 0x80 in scratch:\n{asm}"
     );
     assert!(
@@ -2089,9 +2101,11 @@ fn cmp_i16_simulates_correctly() {
     // i16 flag logic end-to-end. RAM: a=0x20(lo)/0x21(hi), b=0x22/0x23,
     // out=0x24; scratch=0x70.
     use pic14_sim::Pic14;
-    // Unsigned i16 chain: MOVF b_lo(0x0822) SUBWF a_lo(0x0220)
-    // MOVF b_hi(0x0823) BTFSS C(0x1C03) ADDLW 1(0x3E01) SUBWF a_hi(0x0221).
-    let u16 = vec![0x0822, 0x0220, 0x0823, 0x1C03, 0x3E01, 0x0221];
+    // Unsigned i16 chain (issue #1, wrap-correct INCFSZ fold): MOVF b_lo
+    // (0x0822) SUBWF a_lo (0x0220) MOVF b_hi (0x0823) BTFSS C (0x1C03)
+    // INCFSZ b_hi,W (0x0F23) SUBWF a_hi (0x0221). The INCFSZ skip keeps
+    // C = borrow-in when b_hi + borrow wraps to 0x100.
+    let u16 = vec![0x0822, 0x0220, 0x0823, 0x1C03, 0x0F23, 0x0221];
     // ult16 = chain + !C materialization.
     let ult16 = {
         let mut v = u16.clone();
@@ -2115,11 +2129,14 @@ fn cmp_i16_simulates_correctly() {
         ]);
         v
     };
-    // Signed i16 chain: MOVLW 0x80(0x3080) XORWF a_hi(0x0621) MOVWF scratch
-    // MOVF b_lo SUBWF a_lo MOVLW 0x80 XORWF b_hi(0x0623) BTFSS C ADDLW 1
-    // SUBWF scratch,W(0x0270).
+    // Signed i16 chain (issue #1): MOVF b_lo(0x0822) SUBWF a_lo(0x0220)
+    // MOVLW 0x80(0x3080) XORWF b_hi(0x0623) MOVWF 0x71(0x00F1)
+    // MOVLW 0x80(0x3080) XORWF a_hi(0x0621) MOVWF scratch(0x00F0)
+    // MOVF 0x71,W(0x0871) BTFSS C(0x1C03) INCFSZ 0x71,W(0x0F71)
+    // SUBWF scratch,W(0x0270). The complemented b_hi is folded via the
+    // INCFSZ skip so the wrap at b_hi ^ 0x80 = 0xFF keeps C = borrow-in.
     let slt16 = {
-        let mut v = vec![0x3080, 0x0621, 0x00F0, 0x0822, 0x0220, 0x3080, 0x0623, 0x1C03, 0x3E01, 0x0270];
+        let mut v = vec![0x0822, 0x0220, 0x3080, 0x0623, 0x00F1, 0x3080, 0x0621, 0x00F0, 0x0871, 0x1C03, 0x0F71, 0x0270];
         v.extend([0x3000, 0x1C03, 0x3001, 0x00A4]); // !C
         v
     };
@@ -2288,6 +2305,97 @@ fn assembled_cmp_predicates_run_in_sim() {
         );
         assert_eq!(got, want, "assembled {pred}16(0x{xhi:02X}{xlo:02X},0x{yhi:02X}{ylo:02X}) must be {want}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #1: the i16 borrow-chain wrap bug.
+//
+// The i8/i16 cmp chains used to fold the borrow with `BTFSS C / ADDLW 1`.
+// When the folded byte is 0xFF with a pending borrow, W = 0xFF + 1 wraps to
+// 0x00 and sets C = 1, so the SUBWF/SUBLW computes against 0x00 and
+// leaves C = 1 — a false "no borrow". For a compare, C IS the answer, so
+// the predicate silently flips. The i32 chains were fixed in milestone 12
+// with the INCFSZ skip idiom (the skip keeps C = borrow-in, the true
+// borrow-out); these tests pin the same wrap discriminators at i16, where
+// the naive fold was still in use.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn icmp_uge_i16_wrap_case_simulates() {
+    // The issue's reproducer: 0x0000 >= 0xFF01 must be 0. The low byte
+    // borrows (0x00 < 0x01); the high-byte fold then wraps at b_hi = 0xFF
+    // + borrow-in — a naive ADDLW 1 fold leaves C = 1 and reports 1.
+    let ir = "global b i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %y = load i16 @b\n    %c = icmp uge i16 0, %y\n    store i8 %c @out\n    ret void\n";
+    let map = [
+        ("b", 0x20u16),
+        ("out", 0x24),
+        ("main::y", 0x28),
+        ("main::c", 0x2C),
+    ];
+    let got = sim_run(ir, &map, &[(0x20, 0x01), (0x21, 0xFF)], 0x24);
+    assert_eq!(got, 0, "uge16(0x0000, 0xFF01) must be 0 (the issue's reproducer)");
+    // The inverse predicate on the same operands: 0x0000 < 0xFF01 -> 1.
+    let ir = "global b i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %y = load i16 @b\n    %c = icmp ult i16 0, %y\n    store i8 %c @out\n    ret void\n";
+    let got = sim_run(ir, &map, &[(0x20, 0x01), (0x21, 0xFF)], 0x24);
+    assert_eq!(got, 1, "ult16(0x0000, 0xFF01) must be 1");
+
+    // File-vs-file: same wrap through the SUBWF chain.
+    let ir = "global a i16\nglobal b i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %x = load i16 @a\n    %y = load i16 @b\n    %c = icmp uge i16 %x, %y\n    store i8 %c @out\n    ret void\n";
+    let map = [
+        ("a", 0x20u16),
+        ("b", 0x22),
+        ("out", 0x24),
+        ("main::x", 0x28),
+        ("main::y", 0x2A),
+        ("main::c", 0x2C),
+    ];
+    let got = sim_run(ir, &map, &[(0x20, 0x00), (0x21, 0x00), (0x22, 0x01), (0x23, 0xFF)], 0x24);
+    assert_eq!(got, 0, "uge16(0x0000, 0xFF01) file-vs-file must be 0");
+    // And the non-wrap control: 0xFF01 >= 0xFF01 -> 1 (equality, C set).
+    let got = sim_run(ir, &map, &[(0x20, 0x01), (0x21, 0xFF), (0x22, 0x01), (0x23, 0xFF)], 0x24);
+    assert_eq!(got, 1, "uge16(0xFF01, 0xFF01) must be 1");
+
+    // Signed complemented-fold wrap: 0x0000 < 0x7FFF must be 1. The high
+    // byte's sign complement maps b_hi = 0x7F to 0xFF; with a borrow-in
+    // from the low byte the complemented fold wraps — a fold on the
+    // uncomplemented byte would wrap invisibly and report 0.
+    let ir = "global a i16\nglobal b i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %x = load i16 @a\n    %y = load i16 @b\n    %c = icmp slt i16 %x, %y\n    store i8 %c @out\n    ret void\n";
+    let got = sim_run(ir, &map, &[(0x20, 0x00), (0x21, 0x00), (0x22, 0xFF), (0x23, 0x7F)], 0x24);
+    assert_eq!(got, 1, "slt16(0x0000, 0x7FFF) must be 1");
+    // Control: 0x7FFF < 0x0000 -> 0 (byte 3 decides, no wrap).
+    let got = sim_run(ir, &map, &[(0x20, 0xFF), (0x21, 0x7F), (0x22, 0x00), (0x23, 0x00)], 0x24);
+    assert_eq!(got, 0, "slt16(0x7FFF, 0x0000) must be 0");
+}
+
+#[test]
+fn sub_const_lhs_wrap_simulates() {
+    // The const-LHS sub chain (d = k - a) shares the naive ADDLW 1 fold
+    // with the cmp chains; at 4 bytes the corrupted intermediate borrow
+    // propagates into wrong values. 0 - 0x0000FF01 = 0xFFFF00FF: byte 1's
+    // fold wraps at a_1 = 0xFF + borrow-in, and a naive chain then
+    // mis-subtracts bytes 2-3 (giving 0xFF000000).
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 0, %a\n    store i32 %r @out\n    ret void\n";
+    let map = [
+        ("x", 0x20u16),
+        ("out", 0x24),
+        ("main::a", 0x30),
+        ("main::r", 0x34),
+    ];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x01), (0x21, 0xFF), (0x22, 0x00), (0x23, 0x00)], 0x24, 4);
+    assert_eq!(&got[..], &[0xFF, 0x00, 0xFF, 0xFF], "0 - 0x0000FF01 must be 0xFFFF00FF");
+
+    // i16 const-LHS sub: 0 - 0xFF01 = 0x00FF. The value is correct even
+    // with the naive fold (the wrap only corrupts C, which the 2-byte
+    // chain discards), but the ported idiom must keep it correct.
+    let ir = "global x i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %r = sub i16 0, %a\n    store i16 %r @out\n    ret void\n";
+    let map = [
+        ("x", 0x20u16),
+        ("out", 0x22),
+        ("main::a", 0x27),
+        ("main::r", 0x29),
+    ];
+    let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, 0x01), (0x21, 0xFF)], 0x22, 2);
+    assert_eq!(&got[..], &[0xFF, 0x00], "0 - 0xFF01 must be 0x00FF");
 }
 
 // ---------------------------------------------------------------------------
