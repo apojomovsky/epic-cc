@@ -463,6 +463,10 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         Inst::Memcpy(_) => None,
         // Freeze defines the dst slot, sized by the operand type.
         Inst::Freeze(f) => Some((f.dst.clone(), f.ty.bytes())),
+        // Float: binops/conv casts define an f32 (4-byte) dst; fcmp an i1.
+        Inst::FloatBin(b) => Some((b.dst.clone(), 4)),
+        Inst::Fcmp(c) => Some((c.dst.clone(), 1)),
+        Inst::FloatConv(c) => Some((c.dst.clone(), c.to.bytes())),
     }
 }
 

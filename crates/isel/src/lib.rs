@@ -282,6 +282,9 @@ impl<'m> Gen<'m> {
                     Inst::Call(c) if c.dst.as_deref() == Some(name) => {
                         c.ty.map(|t| t.bytes()).unwrap_or(1)
                     }
+                    Inst::FloatBin(fb) if fb.dst == name => 4,
+                    Inst::Fcmp(fc) if fc.dst == name => 1,
+                    Inst::FloatConv(fc) if fc.dst == name => fc.to.bytes(),
                     _ => continue,
                 };
                 return w;
@@ -1729,6 +1732,9 @@ impl<'m> Gen<'m> {
                 self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
             }
             Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args),
+            Inst::FloatBin(_) | Inst::Fcmp(_) | Inst::FloatConv(_) => panic!(
+                "isel: float instructions are not code-generated yet (Task 3 soft-float runtime routines)"
+            ),
             _ => panic!("isel: unsupported instruction for milestone 2"),
         }
     }

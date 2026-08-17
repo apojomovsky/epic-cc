@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ir::{Alloca, Bin, BinOp, Block, Br, BrCond, Call, CallArg, Func, Gep, GepBase, Global, Icmp, Inst, Load, Memcpy, Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
+use ir::{Alloca, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin, FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, Memcpy, Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
 
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
@@ -54,6 +54,7 @@ fn ty_of(s: &str) -> Ty {
         "i8" => Ty::I8,
         "i16" => Ty::I16,
         "i32" => Ty::I32,
+        "float" | "f32" => Ty::F32,
         other => panic!("SPIKE: unsupported type {other:?}"),
     }
 }
@@ -77,7 +78,18 @@ fn parse_val(s: &str) -> Val {
         // correct; 0 keeps the IR pipeline simple.
         Val::Const(0)
     } else {
-        Val::Const(s.parse::<i64>().unwrap_or_else(|_| panic!("SPIKE: cannot parse value {s:?}")))
+        // Integer, hex integer (covers the f32 hex form `0x3F800000` — the
+        // value is the bit pattern), or a decimal f32 constant materialized
+        // as its 32-bit bit pattern (e.g. `1.000000e+00` -> 0x3F800000).
+        if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+            Val::Const(u64::from_str_radix(hex, 16).unwrap_or_else(|_| panic!("SPIKE: cannot parse hex value {s:?}")) as i64)
+        } else if let Ok(k) = s.parse::<i64>() {
+            Val::Const(k)
+        } else if let Ok(f) = s.parse::<f32>() {
+            Val::Const(f.to_bits() as i64)
+        } else {
+            panic!("SPIKE: cannot parse value {s:?}")
+        }
     }
 }
 
@@ -223,7 +235,7 @@ fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
         match t {
             "i1" | "i8" => (1, 1),
             "i16" => (2, 2),
-            "i32" => (4, 2),
+            "i32" | "float" | "f32" => (4, 2),
             other => panic!("irparse: unsupported type {other:?}"),
         }
     }
@@ -247,7 +259,7 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
         match t {
             "i1" | "i8" => Some((1, 1)),
             "i16" => Some((2, 2)),
-            "i32" => Some((4, 2)),
+            "i32" | "float" | "f32" => Some((4, 2)),
             _ => None,
         }
     }
@@ -528,7 +540,7 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
             }
             match t.as_str() {
                 "ptr" => {}
-                "i1" | "i8" | "i16" | "i32" => ty = Some(ty_of(t)),
+                "i1" | "i8" | "i16" | "i32" | "float" | "f32" => ty = Some(ty_of(t)),
                 "align" => skip_next = true,
                 "noundef" | "nonnull" | "noalias" | "nocapture" | "readonly" | "writeonly"
                 | "writable" | "dead_on_unwind" | "immarg" | "zeroext" | "signext" => {}
@@ -546,6 +558,10 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                         // materializing it as Const(0) is sound.
                         val_tok = Some(t.clone());
                     } else if t.parse::<i64>().is_ok() {
+                        val_tok = Some(t.clone());
+                    } else if t.parse::<f32>().is_ok() || t.starts_with("0x") || t.starts_with("0X") {
+                        // an f32 constant (decimal `5.000000e-01` or hex bit
+                        // pattern `0x3F800000`) — parse_val materializes the bits.
                         val_tok = Some(t.clone());
                     }
                 }
@@ -575,7 +591,7 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
             "ptr" | "dead_on_unwind" | "noalias" | "nocapture" | "writable" | "writeonly"
             | "readonly" | "nonnull" | "noundef" | "zeroext" | "signext" | "immarg" | "sret" | "byval" => {}
             "align" => skip_next = true,
-            "i1" | "i8" | "i16" | "i32" => scalar = Some(ty_of(t)),
+            "i1" | "i8" | "i16" | "i32" | "float" | "f32" => scalar = Some(ty_of(t)),
             _ => {
                 if let Some(rest) = t.strip_prefix("byval(") {
                     let inner = rest.trim_end_matches(')');
@@ -940,6 +956,56 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let ty = ty_of(it.next().unwrap());
             let val = parse_val(it.next().unwrap());
             out.push(Inst::Freeze(ir::Freeze { dst: dst.unwrap(), ty, val }));
+        }
+        "fadd" | "fsub" | "fmul" | "fdiv" => {
+            let body = strip_attrs(&rest[op.len()..]);
+            let mut it = body.split_whitespace();
+            let ty = ty_of(it.next().unwrap());
+            assert!(ty == Ty::F32, "irparse: float binop {op} must be f32, got {ty:?}");
+            let a = parse_val(it.next().unwrap());
+            let b = parse_val(it.next().unwrap());
+            let o = match op.as_str() {
+                "fadd" => FBinOp::FAdd,
+                "fsub" => FBinOp::FSub,
+                "fmul" => FBinOp::FMul,
+                _ => FBinOp::FDiv,
+            };
+            out.push(Inst::FloatBin(FloatBin { dst: dst.unwrap(), op: o, a, b }));
+        }
+        "fcmp" => {
+            let body = strip_attrs(&rest["fcmp".len()..]);
+            let mut it = body.split_whitespace();
+            let pred = it.next().unwrap().to_string();
+            const FPREDS: [&str; 16] = [
+                "false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord",
+                "ueq", "ugt", "uge", "ult", "ule", "une", "uno", "true",
+            ];
+            if !FPREDS.contains(&pred.as_str()) {
+                panic!("SPIKE: unsupported fcmp predicate {pred:?} in line: {line}");
+            }
+            let ty = ty_of(it.next().unwrap());
+            assert!(ty == Ty::F32, "irparse: fcmp must be f32, got {ty:?}");
+            let a = parse_val(it.next().unwrap());
+            let b = parse_val(it.next().unwrap());
+            out.push(Inst::Fcmp(Fcmp { dst: dst.unwrap(), pred, a, b }));
+        }
+        "fptosi" | "fptoui" | "sitofp" | "uitofp" | "fpext" | "fptrunc" => {
+            let body = strip_attrs(&rest[op.len()..]);
+            let to_i = body.rfind(" to ").unwrap_or_else(|| panic!("irparse: malformed {op} (missing 'to') in line: {line}"));
+            let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
+            let mut it = lhs.split_whitespace();
+            let from = ty_of(it.next().unwrap());
+            let val = parse_val(it.next().unwrap());
+            let to = ty_of(rhs);
+            let o = match op.as_str() {
+                "fptosi" => FloatConvOp::FpToSi,
+                "fptoui" => FloatConvOp::FpToUi,
+                "sitofp" => FloatConvOp::SiToFp,
+                "uitofp" => FloatConvOp::UiToFp,
+                "fpext" => FloatConvOp::Fpext,
+                _ => FloatConvOp::Fptrunc,
+            };
+            out.push(Inst::FloatConv(FloatConv { dst: dst.unwrap(), op: o, from, val, to }));
         }
         other => panic!("SPIKE LIMIT: unsupported opcode {other:?} in line: {line}"),
     }

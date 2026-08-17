@@ -2,9 +2,9 @@
 //! every stage reads IR text in and writes IR text out.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ty { I1, I8, I16, I32 }
+pub enum Ty { I1, I8, I16, I32, F32 }
 impl Ty {
-    pub fn bytes(self) -> u8 { match self { Ty::I1 | Ty::I8 => 1, Ty::I16 => 2, Ty::I32 => 4 } }
+    pub fn bytes(self) -> u8 { match self { Ty::I1 | Ty::I8 => 1, Ty::I16 => 2, Ty::I32 | Ty::F32 => 4 } }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,6 +64,23 @@ pub struct Memcpy { pub dst: Val, pub src: Val, pub len: u8 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct Freeze { pub dst: String, pub ty: Ty, pub val: Val }
 
+/// The four float arithmetic ops (always f32 — msp430's float == f32).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FBinOp { FAdd, FSub, FMul, FDiv }
+/// `%d = fadd float %a %b` — both operands and the dst are f32 (implicit).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloatBin { pub dst: String, pub op: FBinOp, pub a: Val, pub b: Val }
+/// `%d = fcmp <pred> float %a %b` — the 16 LLVM float predicates; dst is i1.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Fcmp { pub dst: String, pub pred: String, pub a: Val, pub b: Val }
+/// The int<->float conversions and the f32->f32 casts (fpext/fptrunc are
+/// no-ops on msp430 — double == float — but round-trip for the text).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloatConvOp { FpToSi, FpToUi, SiToFp, UiToFp, Fpext, Fptrunc }
+/// `%d = fptosi <from> <val> to <to>` (and the other five ops).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FloatConv { pub dst: String, pub op: FloatConvOp, pub from: Ty, pub val: Val, pub to: Ty }
+
 #[derive(Clone, Debug)]
 pub enum Inst {
     Load(Load),
@@ -83,6 +100,9 @@ pub enum Inst {
     Alloca(Alloca),
     Memcpy(Memcpy),
     Freeze(Freeze),
+    FloatBin(FloatBin),
+    Fcmp(Fcmp),
+    FloatConv(FloatConv),
 }
 
 #[derive(Clone, Debug)]
@@ -153,7 +173,7 @@ pub fn serialize(m: &Module) -> String {
     out
 }
 
-fn ty_str(t: Ty) -> String { match t { Ty::I1 => "i1".into(), Ty::I8 => "i8".into(), Ty::I16 => "i16".into(), Ty::I32 => "i32".into() } }
+fn ty_str(t: Ty) -> String { match t { Ty::I1 => "i1".into(), Ty::I8 => "i8".into(), Ty::I16 => "i16".into(), Ty::I32 => "i32".into(), Ty::F32 => "float".into() } }
 
 fn inst_str(i: &Inst) -> String {
     match i {
@@ -185,6 +205,29 @@ fn inst_str(i: &Inst) -> String {
         Inst::Alloca(a) => format!("%{} = alloca {}", a.dst, a.size),
         Inst::Memcpy(m) => format!("memcpy {} {} {}", val_str(&m.dst), val_str(&m.src), m.len),
         Inst::Freeze(f) => format!("%{} = freeze {} {}", f.dst, ty_str(f.ty), val_str(&f.val)),
+        Inst::FloatBin(b) => format!("%{} = {} float {} {}", b.dst, fbinop_str(b.op), val_str(&b.a), val_str(&b.b)),
+        Inst::Fcmp(c) => format!("%{} = fcmp {} float {} {}", c.dst, c.pred, val_str(&c.a), val_str(&c.b)),
+        Inst::FloatConv(c) => format!("%{} = {} {} {} to {}", c.dst, fconvop_str(c.op), ty_str(c.from), val_str(&c.val), ty_str(c.to)),
+    }
+}
+
+fn fbinop_str(o: FBinOp) -> &'static str {
+    match o {
+        FBinOp::FAdd => "fadd",
+        FBinOp::FSub => "fsub",
+        FBinOp::FMul => "fmul",
+        FBinOp::FDiv => "fdiv",
+    }
+}
+
+fn fconvop_str(o: FloatConvOp) -> &'static str {
+    match o {
+        FloatConvOp::FpToSi => "fptosi",
+        FloatConvOp::FpToUi => "fptoui",
+        FloatConvOp::SiToFp => "sitofp",
+        FloatConvOp::UiToFp => "uitofp",
+        FloatConvOp::Fpext => "fpext",
+        FloatConvOp::Fptrunc => "fptrunc",
     }
 }
 
@@ -283,7 +326,7 @@ pub fn parse(text: &str) -> Module {
     Module { globals, funcs }
 }
 
-fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, other => panic!("unsupported type {other}") } }
+fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "float" | "f32" => Ty::F32, other => panic!("unsupported type {other}") } }
 fn parse_addr(s: &str) -> Option<u8> { s.strip_prefix('@').map(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).unwrap()) }
 fn parse_val(s: &str) -> Val {
     let s = s.trim_end_matches(',');
@@ -307,7 +350,7 @@ fn parse_param(s: &str) -> Param {
         Param { name, width: n, byval: Some(n), sret: false }
     } else if rest == "sret" {
         Param { name, width: 2, byval: None, sret: true }
-    } else if matches!(rest, "i1" | "i8" | "i16" | "i32") {
+    } else if matches!(rest, "i1" | "i8" | "i16" | "i32" | "float" | "f32") {
         Param { name, width: parse_ty(rest).bytes(), byval: None, sret: false }
     } else if rest.is_empty() {
         Param { name, width: 1, byval: None, sret: false }
@@ -324,7 +367,7 @@ fn parse_call_arg(s: &str) -> CallArg {
     let mut val_tok = None;
     for tok in s.trim().split_whitespace() {
         match tok {
-            "i1" | "i8" | "i16" | "i32" => ty = Some(parse_ty(tok)),
+            "i1" | "i8" | "i16" | "i32" | "float" | "f32" => ty = Some(parse_ty(tok)),
             _ => {
                 if let Some(n) = tok.strip_prefix("byval") {
                     byval = Some(n.parse().unwrap());
@@ -494,6 +537,46 @@ fn parse_inst(line: &str) -> Inst {
     }
     let mut it = body.split_whitespace();
     let op = it.next().unwrap();
+    // float binops: `%d = fadd float %a %b` (f32 is implicit — both operands
+    // and the dst are float).
+    if matches!(op, "fadd" | "fsub" | "fmul" | "fdiv") {
+        let t = parse_ty(it.next().unwrap());
+        assert!(t == Ty::F32, "float binop must be f32, got {t:?}");
+        let a = parse_val(it.next().unwrap());
+        let b = parse_val(it.next().unwrap());
+        let o = match op {
+            "fadd" => FBinOp::FAdd,
+            "fsub" => FBinOp::FSub,
+            "fmul" => FBinOp::FMul,
+            _ => FBinOp::FDiv,
+        };
+        return Inst::FloatBin(FloatBin { dst, op: o, a, b });
+    }
+    // fcmp: `%d = fcmp <pred> float %a %b` (dst is i1).
+    if op == "fcmp" {
+        let pred = it.next().unwrap().to_string();
+        let t = parse_ty(it.next().unwrap());
+        assert!(t == Ty::F32, "fcmp must be f32, got {t:?}");
+        let a = parse_val(it.next().unwrap());
+        let b = parse_val(it.next().unwrap());
+        return Inst::Fcmp(Fcmp { dst, pred, a, b });
+    }
+    // conversions/casts: `%d = fptosi <from> <val> to <to>` etc.
+    if matches!(op, "fptosi" | "fptoui" | "sitofp" | "uitofp" | "fpext" | "fptrunc") {
+        let from = parse_ty(it.next().unwrap());
+        let val = parse_val(it.next().unwrap());
+        assert_eq!(it.next().unwrap(), "to", "{op} must be '%d = {op} <t> <v> to <t2>'");
+        let to = parse_ty(it.next().unwrap());
+        let o = match op {
+            "fptosi" => FloatConvOp::FpToSi,
+            "fptoui" => FloatConvOp::FpToUi,
+            "sitofp" => FloatConvOp::SiToFp,
+            "uitofp" => FloatConvOp::UiToFp,
+            "fpext" => FloatConvOp::Fpext,
+            _ => FloatConvOp::Fptrunc,
+        };
+        return Inst::FloatConv(FloatConv { dst, op: o, from, val, to });
+    }
     let t = parse_ty(it.next().unwrap());
     let a = parse_val(it.next().unwrap());
     let b = parse_val(it.next().unwrap());
