@@ -860,7 +860,7 @@ tmp24:
     MOVF 0x62, W
     MOVWF 0x5D
     CLRF 0x63
-    GOTO tmp40
+    GOTO tmp45
 tmp23:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -870,11 +870,13 @@ tmp23:
     BTFSS STATUS, 2
     GOTO tmp26
     CLRF 0x63
-    GOTO tmp40
+    GOTO tmp45
 tmp26:
     BCF STATUS, 5
     BCF STATUS, 6
     CLRF 0x63
+    CLRF 0x65
+    CLRF 0x66
     MOVF 0x5F, W
     SUBWF 0x5A, W
     BTFSS STATUS, 0
@@ -917,6 +919,7 @@ tmp27:
     MOVWF 0x64
     MOVF 0x5F, W
     MOVWF 0x5A
+    CLRF 0x5F
     MOVLW 0x1F
     SUBWF 0x64, W
     BTFSS STATUS, 0
@@ -931,17 +934,21 @@ tmp28:
     GOTO tmp29
     GOTO tmp30
 tmp29:
+    BCF STATUS, 0
     BCF STATUS, 5
     BCF STATUS, 6
-    BTFSC 0x63, 0
-    BSF 0x63, 1
-    BCF STATUS, 0
     RRF 0x5D, F
     RRF 0x5C, F
     RRF 0x5B, F
-    BCF 0x63, 0
+    RRF 0x66, F
+    RRF 0x65, F
+    RRF 0x5F, F
     BTFSC STATUS, 0
+    BSF 0x63, 1
+    BTFSC 0x66, 7
     BSF 0x63, 0
+    BTFSS 0x66, 7
+    BCF 0x63, 0
     DECFSZ 0x64, F
     GOTO tmp29
 tmp30:
@@ -963,7 +970,7 @@ tmp30:
     ADDWF 0x5D, F
     BTFSC STATUS, 0
     GOTO tmp32
-    GOTO tmp38
+    GOTO tmp43
 tmp32:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -979,38 +986,57 @@ tmp32:
     BSF 0x5D, 7
     MOVLW 0x01
     ADDWF 0x5A, F
-    GOTO tmp38
+    GOTO tmp43
 tmp31:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x62, W
     SUBWF 0x5D, W
     BTFSS STATUS, 0
-    GOTO tmp35
+    GOTO tmp37
     BTFSC STATUS, 2
     GOTO tmp33
-    GOTO tmp36
+    GOTO tmp38
 tmp33:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x61, W
     SUBWF 0x5C, W
     BTFSS STATUS, 0
-    GOTO tmp35
+    GOTO tmp37
     BTFSC STATUS, 2
     GOTO tmp34
-    GOTO tmp36
+    GOTO tmp38
 tmp34:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x60, W
     SUBWF 0x5B, W
     BTFSS STATUS, 0
-    GOTO tmp35
+    GOTO tmp37
     BTFSC STATUS, 2
-    GOTO tmp25
-    GOTO tmp36
+    GOTO tmp35
+    GOTO tmp38
 tmp35:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x5F, W
+    IORWF 0x65, W
+    IORWF 0x66, W
+    BTFSS STATUS, 2
+    GOTO tmp36
+    BTFSS 0x63, 1
+    GOTO tmp25
+tmp36:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    BTFSC 0x63, 1
+    BSF 0x5F, 0
+    CLRF 0x5B
+    CLRF 0x5C
+    CLRF 0x5D
+    GOTO tmp41
+tmp37:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x60, W
@@ -1033,7 +1059,36 @@ tmp35:
     XORWF 0x5D, F
     MOVF 0x5E, W
     MOVWF 0x59
-tmp36:
+tmp38:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    BTFSC 0x63, 1
+    BSF 0x5F, 0
+    MOVF 0x5F, W
+    IORWF 0x65, W
+    IORWF 0x66, W
+    BTFSC STATUS, 2
+    GOTO tmp39
+    COMF 0x5F, F
+    COMF 0x65, F
+    COMF 0x66, F
+    INCF 0x5F, F
+    BTFSC STATUS, 2
+    INCF 0x65, F
+    BTFSC STATUS, 2
+    INCF 0x66, F
+    MOVLW 0x01
+    SUBWF 0x5B, F
+    BTFSC STATUS, 0
+    GOTO tmp40
+    MOVLW 0x01
+    SUBWF 0x5C, F
+    BTFSC STATUS, 0
+    GOTO tmp40
+    MOVLW 0x01
+    SUBWF 0x5D, F
+tmp40:
+tmp39:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x60, W
@@ -1046,42 +1101,51 @@ tmp36:
     BTFSS STATUS, 0
     INCFSZ 0x62, W
     SUBWF 0x5D, F
-tmp37:
+    GOTO tmp41
+tmp41:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x5D, W
     ANDLW 0x80
     BTFSS STATUS, 2
-    GOTO tmp38
+    GOTO tmp42
     MOVF 0x5A, W
     BTFSC STATUS, 2
-    GOTO tmp38
+    GOTO tmp42
     BCF STATUS, 0
-    BTFSC 0x63, 0
-    BSF STATUS, 0
-    BTFSS 0x63, 0
-    BCF STATUS, 0
+    RLF 0x5F, F
+    RLF 0x65, F
+    RLF 0x66, F
     RLF 0x5B, F
     RLF 0x5C, F
     RLF 0x5D, F
-    BTFSC 0x63, 1
-    BSF 0x63, 0
-    BTFSS 0x63, 1
-    BCF 0x63, 0
     MOVLW 0x01
     SUBWF 0x5A, F
-    GOTO tmp37
-tmp38:
+    GOTO tmp41
+tmp42:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    BTFSC 0x66, 7
+    BSF 0x63, 0
+    BTFSS 0x66, 7
+    BCF 0x63, 0
+tmp43:
     BCF STATUS, 5
     BCF STATUS, 6
     BTFSS 0x63, 0
-    GOTO tmp40
+    GOTO tmp45
+    MOVF 0x5F, W
+    IORWF 0x65, W
+    IORWF 0x66, W
+    ANDLW 0x7F
+    BTFSS STATUS, 2
+    GOTO tmp44
     BTFSC 0x63, 1
-    GOTO tmp39
+    GOTO tmp44
     BTFSC 0x5B, 0
-    GOTO tmp39
-    GOTO tmp40
-tmp39:
+    GOTO tmp44
+    GOTO tmp45
+tmp44:
     BCF STATUS, 5
     BCF STATUS, 6
     INCF 0x5B, F
@@ -1090,9 +1154,9 @@ tmp39:
     BTFSC STATUS, 2
     INCF 0x5D, F
     BTFSC STATUS, 2
-    GOTO tmp43
-    GOTO tmp44
-tmp43:
+    GOTO tmp48
+    GOTO tmp49
+tmp48:
     MOVLW 0x80
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1101,8 +1165,8 @@ tmp43:
     CLRF 0x5B
     MOVLW 0x01
     ADDWF 0x5A, F
-tmp44:
-tmp40:
+tmp49:
+tmp45:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x5B, W
@@ -1125,22 +1189,22 @@ tmp25:
     BCF STATUS, 5
     BCF STATUS, 6
     BTFSS 0x59, 7
-    GOTO tmp42
+    GOTO tmp47
     BTFSS 0x5E, 7
-    GOTO tmp41
-    GOTO tmp42
-tmp41:
+    GOTO tmp46
+    GOTO tmp47
+tmp46:
     BCF STATUS, 5
     BCF STATUS, 6
     BCF 0x59, 7
-tmp42:
+tmp47:
     BCF STATUS, 5
     BCF STATUS, 6
     CLRF 0x5A
     CLRF 0x5B
     CLRF 0x5C
     CLRF 0x5D
-    GOTO tmp40
+    GOTO tmp45
 __mul_f32:
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1173,38 +1237,38 @@ __mul_f32:
     MOVWF 0x5A
     MOVLW 0x00
     BTFSS STATUS, 0
-    GOTO tmp50
+    GOTO tmp57
     BTFSC 0x63, 0
     MOVLW 0x01
-    GOTO tmp51
-tmp50:
+    GOTO tmp58
+tmp57:
     BCF STATUS, 5
     BCF STATUS, 6
     BTFSC 0x63, 0
-    GOTO tmp51
+    GOTO tmp58
     MOVLW 0xFF
-tmp51:
+tmp58:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVWF 0x5B
     MOVF 0x54, W
     ANDLW 0x7F
     BTFSS STATUS, 2
-    GOTO tmp52
+    GOTO tmp59
     BTFSC 0x53, 7
-    GOTO tmp52
-    GOTO tmp54
-tmp52:
+    GOTO tmp59
+    GOTO tmp61
+tmp59:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x58, W
     ANDLW 0x7F
     BTFSS STATUS, 2
-    GOTO tmp53
+    GOTO tmp60
     BTFSC 0x57, 7
-    GOTO tmp53
-    GOTO tmp54
-tmp53:
+    GOTO tmp60
+    GOTO tmp61
+tmp60:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x53, W
@@ -1219,9 +1283,9 @@ tmp53:
     ANDLW 0x7F
     IORLW 0x80
     MOVWF 0x5E
-    MOVF 0x57, W
-    ANDLW 0x7F
-    MOVWF 0x57
+    CLRF 0x55
+    CLRF 0x56
+    CLRF 0x57
     CLRF 0x60
     CLRF 0x61
     CLRF 0x62
@@ -1231,7 +1295,7 @@ tmp53:
     CLRF 0x66
     MOVLW 0x18
     MOVWF 0x5F
-tmp45:
+tmp50:
     BCF STATUS, 0
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1239,7 +1303,7 @@ tmp45:
     RLF 0x5D, F
     RLF 0x5E, F
     BTFSS STATUS, 0
-    GOTO tmp46
+    GOTO tmp51
     MOVF 0x55, W
     ADDWF 0x64, F
     MOVF 0x56, W
@@ -1250,6 +1314,23 @@ tmp45:
     BTFSC STATUS, 0
     INCFSZ 0x57, W
     ADDWF 0x66, F
+    BTFSC 0x66, 7
+    GOTO tmp55
+    GOTO tmp56
+tmp55:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    BCF 0x66, 7
+    INCF 0x60, F
+    BTFSC STATUS, 2
+    INCF 0x61, F
+    BTFSC STATUS, 2
+    INCF 0x62, F
+    BTFSC STATUS, 2
+    INCF 0x63, F
+tmp56:
+    BCF STATUS, 5
+    BCF STATUS, 6
     MOVF 0x51, W
     ADDWF 0x60, F
     MOVF 0x52, W
@@ -1264,33 +1345,35 @@ tmp45:
     BTFSC STATUS, 0
     ADDLW 0x01
     ADDWF 0x63, F
-tmp46:
+tmp51:
     BCF STATUS, 0
     BCF STATUS, 5
     BCF STATUS, 6
+    RRF 0x57, F
+    RRF 0x56, F
+    RRF 0x55, F
+    BTFSC 0x51, 0
+    BSF 0x57, 6
+    BCF STATUS, 0
     RRF 0x53, F
     RRF 0x52, F
     RRF 0x51, F
-    BCF STATUS, 0
-    RLF 0x55, F
-    RLF 0x56, F
-    RLF 0x57, F
     DECFSZ 0x5F, F
-    GOTO tmp45
+    GOTO tmp50
     BTFSC 0x63, 0
-    GOTO tmp47
+    GOTO tmp52
     BTFSS 0x66, 6
-    GOTO tmp49
+    GOTO tmp54
     MOVF 0x64, W
     IORWF 0x65, W
     IORWF 0x66, W
     ANDLW 0x3F
     BTFSS STATUS, 2
-    GOTO tmp48
+    GOTO tmp53
     BTFSC 0x60, 0
-    GOTO tmp48
-    GOTO tmp49
-tmp47:
+    GOTO tmp53
+    GOTO tmp54
+tmp52:
     BCF STATUS, 0
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1305,17 +1388,17 @@ tmp47:
     MOVLW 0x01
     ADDWF 0x5A, F
     BTFSS 0x66, 7
-    GOTO tmp49
-    MOVLW 0xBF
+    GOTO tmp54
+    MOVLW 0x7F
     ANDWF 0x66, W
     IORWF 0x65, W
     IORWF 0x64, W
     BTFSS STATUS, 2
-    GOTO tmp48
+    GOTO tmp53
     BTFSC 0x60, 0
-    GOTO tmp48
-    GOTO tmp49
-tmp48:
+    GOTO tmp53
+    GOTO tmp54
+tmp53:
     BCF STATUS, 5
     BCF STATUS, 6
     INCF 0x60, F
@@ -1324,9 +1407,9 @@ tmp48:
     BTFSC STATUS, 2
     INCF 0x62, F
     BTFSC STATUS, 2
-    GOTO tmp55
-    GOTO tmp56
-tmp55:
+    GOTO tmp62
+    GOTO tmp63
+tmp62:
     MOVLW 0x80
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1335,8 +1418,8 @@ tmp55:
     CLRF 0x60
     MOVLW 0x01
     ADDWF 0x5A, F
-tmp56:
-tmp49:
+tmp63:
+tmp54:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x60, W
@@ -1355,7 +1438,7 @@ tmp49:
     BTFSC 0x59, 7
     BSF 0x74, 7
     RETURN
-tmp54:
+tmp61:
     CLRF 0x71
     CLRF 0x72
     CLRF 0x73
@@ -1380,13 +1463,13 @@ __fptosi_f32:
     MOVWF 0x5A
     MOVF 0x55, W
     BTFSS STATUS, 2
-    GOTO tmp57
+    GOTO tmp64
     CLRF 0x57
     CLRF 0x58
     CLRF 0x59
     CLRF 0x5B
-    GOTO tmp63
-tmp57:
+    GOTO tmp70
+tmp64:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x51, W
@@ -1401,22 +1484,22 @@ tmp57:
     MOVF 0x55, W
     SUBLW 0x96
     BTFSS STATUS, 0
-    GOTO tmp58
+    GOTO tmp65
     MOVWF 0x56
     MOVLW 0x1F
     SUBWF 0x56, W
     BTFSS STATUS, 0
-    GOTO tmp59
+    GOTO tmp66
     MOVLW 0x1F
     MOVWF 0x56
-tmp59:
+tmp66:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x56, W
     BTFSS STATUS, 2
-    GOTO tmp60
-    GOTO tmp63
-tmp60:
+    GOTO tmp67
+    GOTO tmp70
+tmp67:
     BCF STATUS, 0
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1424,9 +1507,9 @@ tmp60:
     RRF 0x58, F
     RRF 0x57, F
     DECFSZ 0x56, F
-    GOTO tmp60
-    GOTO tmp63
-tmp58:
+    GOTO tmp67
+    GOTO tmp70
+tmp65:
     SUBLW 0x00
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1434,16 +1517,16 @@ tmp58:
     MOVLW 0x08
     SUBWF 0x56, W
     BTFSS STATUS, 0
-    GOTO tmp61
+    GOTO tmp68
     BTFSS 0x5A, 7
-    GOTO tmp62
+    GOTO tmp69
     CLRF 0x57
     CLRF 0x58
     CLRF 0x59
     MOVLW 0x80
     MOVWF 0x5B
-    GOTO tmp63
-tmp62:
+    GOTO tmp70
+tmp69:
     MOVLW 0xFF
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1452,8 +1535,8 @@ tmp62:
     MOVWF 0x59
     MOVLW 0x7F
     MOVWF 0x5B
-    GOTO tmp63
-tmp61:
+    GOTO tmp70
+tmp68:
     BCF STATUS, 0
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1462,12 +1545,12 @@ tmp61:
     RLF 0x59, F
     RLF 0x5B, F
     DECFSZ 0x56, F
-    GOTO tmp61
-tmp63:
+    GOTO tmp68
+tmp70:
     BCF STATUS, 5
     BCF STATUS, 6
     BTFSS 0x5A, 7
-    GOTO tmp64
+    GOTO tmp71
     COMF 0x57, F
     COMF 0x58, F
     COMF 0x59, F
@@ -1479,7 +1562,7 @@ tmp63:
     INCF 0x59, F
     BTFSC STATUS, 2
     INCF 0x5B, F
-tmp64:
+tmp71:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x57, W
@@ -1498,7 +1581,7 @@ __sitofp_f32:
     ANDLW 0x80
     MOVWF 0x5A
     BTFSS 0x54, 7
-    GOTO tmp65
+    GOTO tmp72
     COMF 0x51, F
     COMF 0x52, F
     COMF 0x53, F
@@ -1510,7 +1593,7 @@ __sitofp_f32:
     INCF 0x53, F
     BTFSC STATUS, 2
     INCF 0x54, F
-tmp65:
+tmp72:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x51, W
@@ -1518,7 +1601,7 @@ tmp65:
     IORWF 0x53, W
     IORWF 0x54, W
     BTFSS STATUS, 2
-    GOTO tmp67
+    GOTO tmp74
     CLRF 0x71
     CLRF 0x72
     CLRF 0x73
@@ -1526,23 +1609,23 @@ tmp65:
     BTFSC 0x5A, 7
     BSF 0x74, 7
     RETURN
-tmp67:
+tmp74:
     BCF STATUS, 5
     BCF STATUS, 6
     CLRF 0x55
-tmp68:
+tmp75:
     BCF STATUS, 5
     BCF STATUS, 6
     BTFSC 0x54, 7
-    GOTO tmp66
+    GOTO tmp73
     BCF STATUS, 0
     RLF 0x51, F
     RLF 0x52, F
     RLF 0x53, F
     RLF 0x54, F
     INCF 0x55, F
-    GOTO tmp68
-tmp66:
+    GOTO tmp75
+tmp73:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x55, W
@@ -1556,14 +1639,14 @@ tmp66:
     ANDLW 0x7F
     MOVWF 0x59
     BTFSS 0x58, 7
-    GOTO tmp70
+    GOTO tmp77
     MOVF 0x59, W
     BTFSS STATUS, 2
-    GOTO tmp69
+    GOTO tmp76
     BTFSC 0x52, 0
-    GOTO tmp69
-    GOTO tmp70
-tmp69:
+    GOTO tmp76
+    GOTO tmp77
+tmp76:
     BCF STATUS, 5
     BCF STATUS, 6
     INCF 0x52, F
@@ -1572,9 +1655,9 @@ tmp69:
     BTFSC STATUS, 2
     INCF 0x54, F
     BTFSC STATUS, 2
-    GOTO tmp71
-    GOTO tmp72
-tmp71:
+    GOTO tmp78
+    GOTO tmp79
+tmp78:
     MOVLW 0x80
     BCF STATUS, 5
     BCF STATUS, 6
@@ -1583,8 +1666,8 @@ tmp71:
     CLRF 0x52
     MOVLW 0x01
     ADDWF 0x56, F
-tmp72:
-tmp70:
+tmp79:
+tmp77:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x52, W
@@ -1610,55 +1693,55 @@ __cmp_f32:
     ANDLW 0x7F
     SUBLW 0x7F
     BTFSS STATUS, 2
-    GOTO tmp73
+    GOTO tmp80
     BTFSS 0x53, 7
-    GOTO tmp73
+    GOTO tmp80
     MOVF 0x53, W
     ANDLW 0x7F
     IORWF 0x52, W
     IORWF 0x51, W
     BTFSS STATUS, 2
-    GOTO tmp75
-tmp73:
+    GOTO tmp82
+tmp80:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x58, W
     ANDLW 0x7F
     SUBLW 0x7F
     BTFSS STATUS, 2
-    GOTO tmp74
+    GOTO tmp81
     BTFSS 0x57, 7
-    GOTO tmp74
+    GOTO tmp81
     MOVF 0x57, W
     ANDLW 0x7F
     IORWF 0x56, W
     IORWF 0x55, W
     BTFSS STATUS, 2
-    GOTO tmp75
-tmp74:
+    GOTO tmp82
+tmp81:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x54, W
     ANDLW 0x7F
     BTFSS STATUS, 2
-    GOTO tmp76
+    GOTO tmp83
     BTFSC 0x53, 7
-    GOTO tmp76
+    GOTO tmp83
     MOVF 0x58, W
     ANDLW 0x7F
     BTFSS STATUS, 2
-    GOTO tmp76
+    GOTO tmp83
     BTFSC 0x57, 7
-    GOTO tmp76
-    GOTO tmp77
-tmp76:
+    GOTO tmp83
+    GOTO tmp84
+tmp83:
     BCF STATUS, 5
     BCF STATUS, 6
     MOVF 0x54, W
     XORWF 0x58, W
     ANDLW 0x80
     BTFSS STATUS, 2
-    GOTO tmp78
+    GOTO tmp85
     MOVF 0x54, W
     ANDLW 0x80
     MOVWF 0x5A
@@ -1695,36 +1778,36 @@ tmp76:
     SUBWF 0x54, W
     MOVF 0x59, W
     BTFSC STATUS, 2
-    GOTO tmp77
+    GOTO tmp84
     BTFSS STATUS, 0
-    GOTO tmp81
+    GOTO tmp88
     BTFSS 0x5A, 7
-    GOTO tmp80
-    GOTO tmp79
-tmp81:
+    GOTO tmp87
+    GOTO tmp86
+tmp88:
     BCF STATUS, 5
     BCF STATUS, 6
     BTFSS 0x5A, 7
-    GOTO tmp79
-    GOTO tmp80
-tmp78:
+    GOTO tmp86
+    GOTO tmp87
+tmp85:
     BCF STATUS, 5
     BCF STATUS, 6
     BTFSS 0x54, 7
-    GOTO tmp80
-    GOTO tmp79
-tmp77:
+    GOTO tmp87
+    GOTO tmp86
+tmp84:
     CLRF 0x71
     RETURN
-tmp79:
+tmp86:
     MOVLW 0x01
     MOVWF 0x71
     RETURN
-tmp80:
+tmp87:
     MOVLW 0x02
     MOVWF 0x71
     RETURN
-tmp75:
+tmp82:
     MOVLW 0x03
     MOVWF 0x71
     RETURN
