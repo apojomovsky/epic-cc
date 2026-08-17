@@ -251,22 +251,22 @@ fn reducer_minimizes_a_generated_program_with_a_planted_bug() {
 /// the seed only names the fixture file).
 const PANIC_SEED: u64 = 9997;
 
-/// The unsupported surface: an IEEE `float` computation. msp430 clang emits
-/// `uitofp i32 to float` / `fmul float` / `fptoui float to i8`, and irparse
-/// panics on the first float OPCODE ("SPIKE LIMIT: unsupported opcode
-/// \"uitofp\"") — the loud-panic contract for a construct the whole-program
-/// compiler does not support (the plan defers soft-float fuzzing).
+/// The unsupported surface: an `i64` (`long long`) computation. msp430 clang
+/// emits 64-bit types/ops, and irparse panics on the i64 ("SPIKE LIMIT:
+/// unsupported type \"i64\"") — the loud-panic contract for a construct the
+/// whole-program compiler does not support.
 ///
-/// NOTE (checked for Task 4): the brief's "a signed op" suggestion is no
-/// longer an unsupported surface — the Task-2 fix wave implemented the
-/// signed runtime routines (sdiv/srem) and the signed icmp predicates
-/// (slt/sle/sgt/sge), so a signed program is differential-clean. Float (and
-/// i64) are the stable panics: the emitted IR always contains an
-/// unsupported type, so the parse panics deterministically.
-const PANIC_CULPRIT: &str = "float x = (float)in2;";
+/// NOTE (updated for Milestone 15): the `float` surface WAS the panic
+/// culprit through Milestone 14 — Tasks 1-3 implement it (Ty::F32, the
+/// lowering, and the soft-float runtime routines), so a float program is
+/// now differential-clean and the panic demonstration moved to `i64`, the
+/// last unsupported type. The signed-op note below is still true (the
+/// signed runtime routines/predicates are implemented, so a signed program
+/// is differential-clean too).
+const PANIC_CULPRIT: &str = "volatile long long x = (long long)in2;";
 
 /// A synthetic panic program: two benign (differential-clean) statements +
-/// a float computation the PIC pipeline cannot parse. The benign statements
+/// an i64 computation the PIC pipeline cannot parse. The benign statements
 /// are independent of the culprit, so the reducer can peel them.
 fn synthetic_panic_program() -> Program {
     let prologue = format!(
@@ -279,7 +279,7 @@ fn synthetic_panic_program() -> Program {
         "  u8 t0 = (u8)((u8)in2 ^ (u8)(in2 >> 16u));".to_string(),
         "  checksum = (u8)(checksum ^ (u8)t0);".to_string(),
         PANIC_CULPRIT.to_string(),
-        "  checksum = (u8)(checksum ^ (u8)(x * x));".to_string(),
+        "  checksum = (u8)(checksum ^ (u8)(x >> 32));".to_string(),
     ];
     let c_source = format!("{prologue}{}\n}}\n", statements.join("\n"));
     Program {
@@ -305,7 +305,7 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
     let prog = synthetic_panic_program();
     let failure = match run_differential(&prog) {
         Err(f) => f,
-        Ok(v) => panic!("the float program must panic the PIC pipeline, got Ok({v})"),
+        Ok(v) => panic!("the i64 program must panic the PIC pipeline, got Ok({v})"),
     };
     assert_eq!(
         failure.kind,
@@ -313,8 +313,8 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
         "an unsupported construct must be a Panic failure: {failure}"
     );
     assert!(
-        failure.to_string().contains("float"),
-        "the panic message should name the unsupported float op: {failure}"
+        failure.to_string().contains("i64"),
+        "the panic message should name the unsupported i64 op: {failure}"
     );
 
     let reduced = reduce(&prog, &failure).expect("reduce the panic");
@@ -328,7 +328,7 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
         Ok(v) => panic!("the reduced program must still panic, got Ok({v})"),
     }
     assert!(
-        reduced.program.c_source.contains("float"),
+        reduced.program.c_source.contains("long long"),
         "the reduced program must keep the unsupported construct:\n{}",
         reduced.program.c_source
     );
@@ -341,7 +341,7 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
 
     // The reduced program is saved as the reduced_<seed>.c fixture (the
     // panic-catching evidence) and the guard removes it on every path — the
-    // float surface is a documented limitation, not a NEW bug to commit.
+    // i64 surface is a documented limitation, not a NEW bug to commit.
     let path = write_fixture(&reduced.program).expect("save the reduced fixture");
     let _guard = FixtureGuard(path.clone());
     let saved = std::fs::read_to_string(&path).expect("read the saved fixture back");
