@@ -2710,19 +2710,41 @@ impl<'m> Gen<'m> {
 
     /// The __add_f32 / __sub_f32 body (both operands already extracted at the
     /// contract offsets: sa@0, ea@1, ma@2-4, sb@5, eb@6, mb@7-9, stick@10
-    /// (bit 0 = round, bit 1 = sticky), cnt@11). Extract, align the smaller
-    /// exponent's mantissa right by the difference (clamped to 31, collecting
-    /// the guard + sticky), add/sub the 24-bit mantissas (the sign of the
-    /// larger; a sum carry bumps the exponent), normalize (shift left until
-    /// bit 23 set, adjusting the exponent), round RNE, assemble. Zero
-    /// operands (exp 0) short-circuit; a zero result carries the sign
-    /// sa & sb (x + (-x) = +0, (-0) + (-0) = -0).
+    /// (bit 0 = round, bit 1 = the OR of the bits below the 24-bit fraction
+    /// window), cnt@11, ta1@12, ta2@13; `ta0` reuses the dead `eb` slot).
+    /// Extract, align the smaller exponent's mantissa right by the
+    /// difference (clamped to 31), then add or subtract at the larger
+    /// exponent's scale (the result exponent register becomes eb).
+    ///
+    /// The alignment builds the lost fraction EXACTLY: each shifted-out bit
+    /// is inserted at the top of a 24-bit window `ta` (an RRF chain — the
+    /// last bit out, the round bit, lands at ta2 bit 7), and the bits that
+    /// overflow the window's bottom are OR'd into `stick` bit 1. The value
+    /// is the 6-byte integer `ma:ta` at the result scale.
+    ///
+    /// The ADD path is exact: the sum never normalizes (a carry shifts
+    /// right once, promoting the old round bit into the sticky), so RNE
+    /// reads round = ta2 bit 7 and sticky = OR(ta below the top bit) |
+    /// stick bit 1.
+    ///
+    /// The SUBTRACT path is exact in the same 6-byte value: the result is
+    /// |a| - |b| = (ma - mb) - frac, computed as a fractional borrow
+    /// (ma -= 1 and ta = 2^24 - ta, the deep OR folded into ta's LSB)
+    /// followed by the plain 3-byte subtract. The 6-byte value then
+    /// normalizes with a 6-byte left shift — the fraction's bits move into
+    /// the mantissa one at a time — and RNE reads the guard from ta2 bit 7,
+    /// the sticky from ta's low bits | stick bit 1. A single wrong RNE bit
+    /// is impossible. (The earlier two-bit round/sticky model was inexact
+    /// once the fraction's tail drained to a power of two: the M15 float
+    /// differential found 6/2000 SIM sub mismatches, e.g. 1.0 - 0x3EFFFFFF
+    /// over-rounded to 0x3F000001 instead of the RNE 0x3F000000.)
     fn emit_f32_add_body(&mut self, scr: u16) {
         let (sa, ea) = (scr, scr + 1);
         let (ma0, ma1, ma2) = (scr + 2, scr + 3, scr + 4);
         let (sb, eb) = (scr + 5, scr + 6);
         let (mb0, mb1, mb2) = (scr + 7, scr + 8, scr + 9);
         let (stick, cnt) = (scr + 10, scr + 11);
+        let (ta0, ta1, ta2) = (scr + 6, scr + 12, scr + 13); // ta0 reuses eb
         let l_ma_nz = self.fresh_label();
         let l_copy_b = self.fresh_label();
         let l_zero = self.fresh_label();
@@ -2735,9 +2757,14 @@ impl<'m> Gen<'m> {
         let l_add_carry = self.fresh_label();
         let l_cmp_b1 = self.fresh_label();
         let l_cmp_b0 = self.fresh_label();
+        let l_cmp_frac = self.fresh_label();
+        let l_sub_equal_frac = self.fresh_label();
         let l_sub_swap = self.fresh_label();
         let l_sub_done = self.fresh_label();
+        let l_sub_no_frac = self.fresh_label();
+        let l_sub_borrow_done = self.fresh_label();
         let l_normalize = self.fresh_label();
+        let l_sub_guard = self.fresh_label();
         let l_round_step = self.fresh_label();
         let l_round_up = self.fresh_label();
         let l_assemble = self.fresh_label();
@@ -2774,6 +2801,8 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_assemble}"));
         self.emit(format!("{l_ma_nz2}:"));
         self.emit(format!("    CLRF 0x{stick:02X}"));
+        self.emit(format!("    CLRF 0x{ta1:02X}"));
+        self.emit(format!("    CLRF 0x{ta2:02X}"));
         // ---- swap so that a is the smaller-exponent operand ----
         self.emit(format!("    MOVF 0x{eb:02X}, W"));
         self.emit(format!("    SUBWF 0x{ea:02X}, W"));
@@ -2792,6 +2821,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{cnt:02X}"));
         self.emit(format!("    MOVF 0x{eb:02X}, W"));
         self.emit(format!("    MOVWF 0x{ea:02X}"));
+        self.emit(format!("    CLRF 0x{ta0:02X}")); // eb is dead; ta0 = 0
         self.emit("    MOVLW 0x1F".to_string());
         self.emit(format!("    SUBWF 0x{cnt:02X}, W"));
         self.emit("    BTFSS STATUS, 0".to_string());
@@ -2804,16 +2834,22 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_align_loop}"));
         self.emit(format!("    GOTO {l_align_done}"));
         self.emit(format!("{l_align_loop}:"));
-        // sticky |= round; ma >>= 1; round = the shifted-out bit
-        self.emit(format!("    BTFSC 0x{stick:02X}, 0"));
-        self.emit(format!("    BSF 0x{stick:02X}, 1"));
+        // ma >>= 1; the shifted-out bit enters the TOP of the 24-bit
+        // fraction window ta (the last bit out = the round, at ta2 bit 7);
+        // bits pushed out the window's bottom accumulate in stick bit 1.
         self.emit("    BCF STATUS, 0".to_string());
         self.emit(format!("    RRF 0x{ma2:02X}, F"));
         self.emit(format!("    RRF 0x{ma1:02X}, F"));
         self.emit(format!("    RRF 0x{ma0:02X}, F"));
-        self.emit(format!("    BCF 0x{stick:02X}, 0"));
+        self.emit(format!("    RRF 0x{ta2:02X}, F"));
+        self.emit(format!("    RRF 0x{ta1:02X}, F"));
+        self.emit(format!("    RRF 0x{ta0:02X}, F"));
         self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    BSF 0x{stick:02X}, 1"));
+        self.emit(format!("    BTFSC 0x{ta2:02X}, 7"));
         self.emit(format!("    BSF 0x{stick:02X}, 0"));
+        self.emit(format!("    BTFSS 0x{ta2:02X}, 7"));
+        self.emit(format!("    BCF 0x{stick:02X}, 0"));
         self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
         self.emit(format!("    GOTO {l_align_loop}"));
         self.emit(format!("{l_align_done}:"));
@@ -2873,8 +2909,25 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSS STATUS, 0".to_string());
         self.emit(format!("    GOTO {l_sub_swap}"));
         self.emit("    BTFSC STATUS, 2".to_string());
-        self.emit(format!("    GOTO {l_zero}"));
+        self.emit(format!("    GOTO {l_cmp_frac}"));
         self.emit(format!("    GOTO {l_sub_done}"));
+        // ma == mb: |a| == |b| iff the fraction is 0, else a is larger by
+        // exactly the fraction (the value is frac, sign = sa).
+        self.emit(format!("{l_cmp_frac}:"));
+        self.emit(format!("    MOVF 0x{ta0:02X}, W"));
+        self.emit(format!("    IORWF 0x{ta1:02X}, W"));
+        self.emit(format!("    IORWF 0x{ta2:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_sub_equal_frac}"));
+        self.emit(format!("    BTFSS 0x{stick:02X}, 1"));
+        self.emit(format!("    GOTO {l_zero}"));
+        self.emit(format!("{l_sub_equal_frac}:"));
+        self.emit(format!("    BTFSC 0x{stick:02X}, 1"));
+        self.emit(format!("    BSF 0x{ta0:02X}, 0"));
+        self.emit(format!("    CLRF 0x{ma0:02X}"));
+        self.emit(format!("    CLRF 0x{ma1:02X}"));
+        self.emit(format!("    CLRF 0x{ma2:02X}"));
+        self.emit(format!("    GOTO {l_normalize}"));
         self.emit(format!("{l_sub_swap}:"));
         for (x, y) in [(ma0, mb0), (ma1, mb1), (ma2, mb2)] {
             self.emit_xor_swap(x, y);
@@ -2882,6 +2935,38 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVF 0x{sb:02X}, W"));
         self.emit(format!("    MOVWF 0x{sa:02X}"));
         self.emit(format!("{l_sub_done}:"));
+        // ---- fractional borrow: the exact result is (ma - mb) - frac, so
+        //      for frac != 0 the integer part borrows (ma -= 1) and the
+        //      fraction becomes 2^24 - ta (the deep OR folded into ta's
+        //      LSB first — it is below the 24-bit window, sticky-typed).
+        //      frac == 0 skips straight to the plain 3-byte subtract. ----
+        self.emit(format!("    BTFSC 0x{stick:02X}, 1"));
+        self.emit(format!("    BSF 0x{ta0:02X}, 0"));
+        self.emit(format!("    MOVF 0x{ta0:02X}, W"));
+        self.emit(format!("    IORWF 0x{ta1:02X}, W"));
+        self.emit(format!("    IORWF 0x{ta2:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_sub_no_frac}"));
+        self.emit(format!("    COMF 0x{ta0:02X}, F"));
+        self.emit(format!("    COMF 0x{ta1:02X}, F"));
+        self.emit(format!("    COMF 0x{ta2:02X}, F"));
+        self.emit(format!("    INCF 0x{ta0:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{ta1:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{ta2:02X}, F"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{ma0:02X}, F"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_sub_borrow_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{ma1:02X}, F"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_sub_borrow_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{ma2:02X}, F"));
+        self.emit(format!("{l_sub_borrow_done}:"));
+        self.emit(format!("{l_sub_no_frac}:"));
         // ma -= mb (3-byte borrow chain)
         self.emit(format!("    MOVF 0x{mb0:02X}, W"));
         self.emit(format!("    SUBWF 0x{ma0:02X}, F"));
@@ -2893,35 +2978,49 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSS STATUS, 0".to_string());
         self.emit(format!("    INCFSZ 0x{mb2:02X}, W"));
         self.emit(format!("    SUBWF 0x{ma2:02X}, F"));
-        // ---- normalize: while !(ma2 bit 7) && ea > 0: ma <<= 1, ea--,
-        //      round = sticky (the guard shifts into the mantissa) ----
+        self.emit(format!("    GOTO {l_normalize}"));
+        // ---- normalize the 6-byte value: while !(ma2 bit 7) && ea > 0:
+        //      (ta:ma) <<= 1 (the fraction's bits move into the mantissa),
+        //      ea--. Only the subtract path reaches this (a sum never
+        //      normalizes). ----
         self.emit(format!("{l_normalize}:"));
         self.emit(format!("    MOVF 0x{ma2:02X}, W"));
         self.emit("    ANDLW 0x80".to_string());
         self.emit("    BTFSS STATUS, 2".to_string());
-        self.emit(format!("    GOTO {l_round_step}"));
+        self.emit(format!("    GOTO {l_sub_guard}"));
         self.emit(format!("    MOVF 0x{ea:02X}, W"));
         self.emit("    BTFSC STATUS, 2".to_string()); // ea == 0 -> stop
-        self.emit(format!("    GOTO {l_round_step}"));
+        self.emit(format!("    GOTO {l_sub_guard}"));
         self.emit("    BCF STATUS, 0".to_string());
-        self.emit(format!("    BTFSC 0x{stick:02X}, 0"));
-        self.emit("    BSF STATUS, 0".to_string());
-        self.emit(format!("    BTFSS 0x{stick:02X}, 0"));
-        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RLF 0x{ta0:02X}, F"));
+        self.emit(format!("    RLF 0x{ta1:02X}, F"));
+        self.emit(format!("    RLF 0x{ta2:02X}, F"));
         self.emit(format!("    RLF 0x{ma0:02X}, F"));
         self.emit(format!("    RLF 0x{ma1:02X}, F"));
         self.emit(format!("    RLF 0x{ma2:02X}, F"));
-        self.emit(format!("    BTFSC 0x{stick:02X}, 1"));
-        self.emit(format!("    BSF 0x{stick:02X}, 0"));
-        self.emit(format!("    BTFSS 0x{stick:02X}, 1"));
-        self.emit(format!("    BCF 0x{stick:02X}, 0"));
         self.emit("    MOVLW 0x01".to_string());
         self.emit(format!("    SUBWF 0x{ea:02X}, F"));
         self.emit(format!("    GOTO {l_normalize}"));
-        // ---- RNE: round up iff round && (sticky || mantissa LSB) ----
+        // ---- subtract-path guard: the top fraction bit (ta2 bit 7) ----
+        self.emit(format!("{l_sub_guard}:"));
+        self.emit(format!("    BTFSC 0x{ta2:02X}, 7"));
+        self.emit(format!("    BSF 0x{stick:02X}, 0"));
+        self.emit(format!("    BTFSS 0x{ta2:02X}, 7"));
+        self.emit(format!("    BCF 0x{stick:02X}, 0"));
+        // ---- RNE: round up iff round && (sticky || mantissa LSB), with
+        //      sticky = OR(ta below the top bit) | stick bit 1 (the deep
+        //      OR) — the add path's round/sticky are equivalent (round =
+        //      ta2 bit 7 = the last shifted-out bit; a sum carry promotes
+        //      the old round into stick bit 1). ----
         self.emit(format!("{l_round_step}:"));
         self.emit(format!("    BTFSS 0x{stick:02X}, 0"));
         self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    MOVF 0x{ta0:02X}, W"));
+        self.emit(format!("    IORWF 0x{ta1:02X}, W"));
+        self.emit(format!("    IORWF 0x{ta2:02X}, W"));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_round_up}"));
         self.emit(format!("    BTFSC 0x{stick:02X}, 1"));
         self.emit(format!("    GOTO {l_round_up}"));
         self.emit(format!("    BTFSC 0x{ma0:02X}, 0"));
@@ -2968,6 +3067,8 @@ impl<'m> Gen<'m> {
         let l_renorm = self.fresh_label();
         let l_round_up = self.fresh_label();
         let l_assemble = self.fresh_label();
+        let l_carry_in = self.fresh_label();
+        let l_no_carry = self.fresh_label();
         let l_ehi_c1clear = self.fresh_label();
         let l_ehi_done = self.fresh_label();
         let l_a_nz = self.fresh_label();
@@ -3050,10 +3151,15 @@ impl<'m> Gen<'m> {
         self.emit("    ANDLW 0x7F".to_string());
         self.emit("    IORLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{bk2:02X}"));
-        // lp = ma mod 2^23 in the b param slot: pb2 = pb2 & 0x7F
-        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
-        self.emit("    ANDLW 0x7F".to_string());
-        self.emit(format!("    MOVWF 0x{:02X}", pb + 2));
+        // la = the low-part addend, maintained as la_{i+1} = (la_i >> 1) |
+        // (ma bit i << 22) — the correct low contribution (ma mod 2^i) <<
+        // (23-i) at iteration i (testing mb bit 23-i). Starts at 0 (i=0:
+        // (ma mod 1) << 23 = 0). (The M15 float probe: an earlier attempt
+        // copied ma into the slot — (ma mod 2^23) << i — which is a
+        // different, wrong addend that broke every inexact product.)
+        self.emit(format!("    CLRF 0x{:02X}", pb));
+        self.emit(format!("    CLRF 0x{:02X}", pb + 1));
+        self.emit(format!("    CLRF 0x{:02X}", pb + 2));
         for addr in [m0, m1, m2, m3, low0, low1, low2] {
             self.emit(format!("    CLRF 0x{addr:02X}"));
         }
@@ -3067,7 +3173,12 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLF 0x{bk2:02X}, F"));
         self.emit("    BTFSS STATUS, 0".to_string());
         self.emit(format!("    GOTO {l_skip}"));
-        // low += lp (3-byte); the carry-out feeds m
+        // low += la (3-byte): the FIRST byte adds WITHOUT a carry-in — the
+        // C at this point is the tested multiplier bit (set by the RLF bk
+        // chain), not a carry, so the BTFSC/INCFSZ carry-in would add a
+        // spurious +1 per set-bit iteration (the M15 float probe found the
+        // low sum came out one per set bit too high). Bytes 1-2 take the
+        // carry from the previous byte's add.
         self.emit(format!("    MOVF 0x{:02X}, W", pb));
         self.emit(format!("    ADDWF 0x{low0:02X}, F"));
         self.emit(format!("    MOVF 0x{:02X}, W", pb + 1));
@@ -3078,7 +3189,26 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSC STATUS, 0".to_string());
         self.emit(format!("    INCFSZ 0x{:02X}, W", pb + 2));
         self.emit(format!("    ADDWF 0x{low2:02X}, F"));
-        // m += addend (4-byte, carry in from low)
+        // m += addend (4-byte) + the low's carry-out: the carry into m is
+        // BIT 23 of the 24-bit low sum (the top byte's bit 7), NOT the
+        // byte carry-out (bit 24) — the M15 float probe found the original
+        // tested STATUS C, so a sum with bit 23 set but no byte overflow
+        // (e.g. 0x700003 + 0x160000 = 0x860003) lost its carry into m and
+        // every inexact product came out one 2^23 short. The carry path
+        // also masks bit 23 out of low (low is mod 2^23).
+        self.emit(format!("    BTFSC 0x{low2:02X}, 7"));
+        self.emit(format!("    GOTO {l_carry_in}"));
+        self.emit(format!("    GOTO {l_no_carry}"));
+        self.emit(format!("{l_carry_in}:"));
+        self.emit(format!("    BCF 0x{low2:02X}, 7"));
+        self.emit(format!("    INCF 0x{m0:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{m1:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{m2:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{m3:02X}, F"));
+        self.emit(format!("{l_no_carry}:"));
         self.emit(format!("    MOVF 0x{:02X}, W", pa));
         self.emit(format!("    ADDWF 0x{m0:02X}, F"));
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 1));
@@ -3094,15 +3224,19 @@ impl<'m> Gen<'m> {
         self.emit("    ADDLW 0x01".to_string());
         self.emit(format!("    ADDWF 0x{m3:02X}, F"));
         self.emit(format!("{l_skip}:"));
-        // addend >>= 1; lp <<= 1 (mod 2^23 — the top bit drops)
+        // la = (la >> 1) | (ma bit i << 22): pa bit 0 is ma bit i (pa has
+        // been shifted right i times), so the new bit enters at la bit 22.
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RRF 0x{:02X}, F", pb + 2));
+        self.emit(format!("    RRF 0x{:02X}, F", pb + 1));
+        self.emit(format!("    RRF 0x{:02X}, F", pb));
+        self.emit(format!("    BTFSC 0x{:02X}, 0", pa));
+        self.emit(format!("    BSF 0x{:02X}, 6", pb + 2));
+        // addend >>= 1 (pa = ma >> (i+1))
         self.emit("    BCF STATUS, 0".to_string());
         self.emit(format!("    RRF 0x{:02X}, F", pa + 2));
         self.emit(format!("    RRF 0x{:02X}, F", pa + 1));
         self.emit(format!("    RRF 0x{:02X}, F", pa));
-        self.emit("    BCF STATUS, 0".to_string());
-        self.emit(format!("    RLF 0x{:02X}, F", pb));
-        self.emit(format!("    RLF 0x{:02X}, F", pb + 1));
-        self.emit(format!("    RLF 0x{:02X}, F", pb + 2));
         self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
         self.emit(format!("    GOTO {l_loop}"));
         // bit 47 of the product (m3 bit 0) set -> renorm (exp+1)
@@ -3136,7 +3270,11 @@ impl<'m> Gen<'m> {
         self.emit(format!("    ADDWF 0x{e:02X}, F"));
         self.emit(format!("    BTFSS 0x{low2:02X}, 7"));
         self.emit(format!("    GOTO {l_assemble}"));
-        self.emit("    MOVLW 0xBF".to_string());
+        // sticky = low bits 22..0 = (low2 & 0x7F) | low1 | low0 (the mask
+        // must keep bit 6 — P bit 22 — a lone 0x40 low would otherwise read
+        // sticky 0 and tie-to-even instead of round up; the M15 probe's
+        // renorm-path verdict).
+        self.emit("    MOVLW 0x7F".to_string());
         self.emit(format!("    ANDWF 0x{low2:02X}, W"));
         self.emit(format!("    IORWF 0x{low1:02X}, W"));
         self.emit(format!("    IORWF 0x{low0:02X}, W"));
