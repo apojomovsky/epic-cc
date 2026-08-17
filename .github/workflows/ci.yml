@@ -1,0 +1,66 @@
+name: ci
+
+# The repo's one CI workflow: run the full Rust workspace test suite inside
+# the Nix dev shell. The flake (flake.nix + rust-toolchain.toml + flake.lock)
+# is the single source of truth for the toolchain — pinned clang 20.1.8 (the
+# IR producer, deliberately pinned, see docs/09-build-environment.md), rustc
+# 1.97.1, gpasm 1.5.2 — so CI never installs a toolchain of its own and
+# cannot drift from what `nix develop` gives locally.
+#
+# Single job, deliberate: the suite is one `cargo test` invocation's worth
+# of work (~30s on a runner), there is nothing to split, and a one-job
+# workflow keeps the PR check list to a single entry. The per-crate PASS/FAIL
+# table inside the job (scripts/ci-test.sh) is what makes failures
+# attributable. When real split points exist (XC8 oracles, release bundles,
+# a simulator gate), split here the way epic-hal's family-check.yml does.
+#
+# Toolchain install: Determinate Nix (determinate-nix-action, version-pinned
+# to the installer's own major tag) + the Magic Nix Cache (a shared build
+# cache so the pinned flake's toolchain derivation is not rebuilt from
+# source on every run). actions/cache as a fallback for the cargo target dir
+# (see the cache step's comment). checkout needs the default fetch-depth
+# only: `nix develop` requires git-tracked files, not history.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # Manual re-run (e.g. after a cache hit investigation), no code change needed.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Pinned to the installer's own version tag (v3 is determinate-nix
+      # 3.x); upgrades are Dependabot-tracked. nix-installer-action's
+      # floating "latest" is the alternative but tilts the toolchain across
+      # runs for no benefit.
+      - uses: DeterminateSystems/determinate-nix-action@v3
+
+      # Shared build cache for the flake evaluation/build (the toolchain
+      # derivation is ~2 GB of store paths). use-flakehub=false: the repo
+      # has no FlakeHub account, so the opportunistic auth attempt is pure
+      # noise; the GitHub Actions cache is the cache.
+      - uses: DeterminateSystems/magic-nix-cache-action@v14
+        with:
+          use-flakehub: "false"
+
+      # Warm the per-commit cargo build cache across runs. The cache key is
+      # per-branch HEAD, so the first commit after a merge misses and every
+      # push of the same branch (CI reruns) hits.
+      - name: Cache cargo target dir
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ github.workflow }}-
+
+      - name: Test every workspace crate
+        run: nix develop --command bash scripts/ci-test.sh

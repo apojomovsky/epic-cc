@@ -144,6 +144,15 @@ It is therefore detected at runtime via `$PIC8_XC8_ROOT`. **Differential tests m
 with a clear message when it is absent**, and the build plus the core test suite must pass
 without it. The same rule applies to anything else under `vendor/`.
 
+## CI
+
+GitHub Actions runs the full workspace test suite on every push/PR
+([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): one job, `nix develop --command
+bash scripts/ci-test.sh`, so CI uses exactly this flake's toolchain — the flake is the
+single source of truth, nothing is installed on the runner. The loop itself lives in
+[`scripts/ci-test.sh`](../scripts/ci-test.sh) (per-crate `cargo test` with a PASS/FAIL
+summary table), the same script you can run locally to reproduce a CI result exactly.
+
 ## Vendored material
 
 See [`../vendor/README.md`](../vendor/README.md) for the layout and what to put where.
