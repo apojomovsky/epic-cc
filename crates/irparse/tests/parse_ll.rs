@@ -1111,6 +1111,104 @@ define float @g() {
 }
 
 #[test]
+fn parses_f64_promoted_constants_at_untyped_sites() {
+    // clang prints an f32 constant that does not fit 8 hex digits as its
+    // DOUBLE-precision promotion in EVERY operand position, not just the
+    // typed float-binop/store/freeze/fcmp/conversion operands. The untyped
+    // sites (ret/select/phi/call args/icmp/zext/sext/trunc) must apply the
+    // same f64->f32 round-trip: `ret float 0x3FB99999A0000000` (0.1f
+    // promoted) must materialize 0x3DCCCCCD, not the low-32 truncation
+    // 0xA0000000 (the M15 float differential's seed-2 bug shape).
+    const S: &str = r#"
+define float @ret_promoted() {
+  ret float 0x3FB99999A0000000
+}
+define float @select_promoted(i1 %c) {
+  %1 = select i1 %c, float 0x3FB99999A0000000, float 0x3FF8000000000000
+  ret float %1
+}
+define float @phi_promoted(i1 %c) {
+entry:
+  br i1 %c, label %t, label %f
+t:
+  br label %m
+f:
+  br label %m
+m:
+  %1 = phi float [ 0x3FB99999A0000000, %t ], [ 0x3FF8000000000000, %f ]
+  ret float %1
+}
+define i1 @icmp_promoted() {
+  %1 = icmp eq float 0x3FB99999A0000000, 0x3FF8000000000000
+  ret i1 %1
+}
+define i32 @zext_promoted() {
+  %1 = zext float 0x3FB99999A0000000 to i32
+  ret i32 %1
+}
+define void @call_promoted() {
+  %1 = tail call float @ret_promoted(float noundef 0x3FB99999A0000000)
+  ret void
+}
+"#;
+    let m = parse_ll(S);
+    let f = |name: &str| m.funcs.iter().find(|f| f.name == name).unwrap();
+    // ret float 0x3FB99999A0000000 -> Const(0.1f bits), not the low-32
+    // truncation 0xA0000000.
+    match &f("ret_promoted").blocks[0].insts[0] {
+        Inst::Ret(Some((ty, val))) => {
+            assert_eq!(*ty, ir::Ty::F32);
+            assert_eq!(*val, Val::Const(0.1f32.to_bits() as i64), "ret promoted hex");
+        }
+        other => panic!("expected Ret, got {other:?}"),
+    }
+    // select with a float constant: both arms decode the f64 promotion.
+    match &f("select_promoted").blocks[0].insts[0] {
+        Inst::Select(s) => {
+            assert_eq!(s.ty, ir::Ty::F32);
+            assert_eq!(s.a, Val::Const(0.1f32.to_bits() as i64), "select a promoted hex");
+            assert_eq!(s.b, Val::Const(1.5f32.to_bits() as i64), "select b promoted hex");
+        }
+        other => panic!("expected Select, got {other:?}"),
+    }
+    // phi incoming values decode the f64 promotion.
+    let phi_blk = f("phi_promoted").blocks.iter().find(|b| b.label == "m").unwrap();
+    match &phi_blk.insts[0] {
+        Inst::Phi(p) => {
+            assert_eq!(p.ty, ir::Ty::F32);
+            assert_eq!(p.incoming[0].0, Val::Const(0.1f32.to_bits() as i64), "phi promoted hex");
+            assert_eq!(p.incoming[1].0, Val::Const(1.5f32.to_bits() as i64), "phi promoted hex");
+        }
+        other => panic!("expected Phi, got {other:?}"),
+    }
+    // icmp float operands decode the f64 promotion.
+    match &f("icmp_promoted").blocks[0].insts[0] {
+        Inst::Icmp(c) => {
+            assert_eq!(c.ty, ir::Ty::F32);
+            assert_eq!(c.a, Val::Const(0.1f32.to_bits() as i64), "icmp a promoted hex");
+            assert_eq!(c.b, Val::Const(1.5f32.to_bits() as i64), "icmp b promoted hex");
+        }
+        other => panic!("expected Icmp, got {other:?}"),
+    }
+    // zext float operand decodes the f64 promotion.
+    match &f("zext_promoted").blocks[0].insts[0] {
+        Inst::Zext(z) => {
+            assert_eq!(z.from, ir::Ty::F32);
+            assert_eq!(z.val, Val::Const(0.1f32.to_bits() as i64), "zext promoted hex");
+        }
+        other => panic!("expected Zext, got {other:?}"),
+    }
+    // call float arg decodes the f64 promotion.
+    match &f("call_promoted").blocks[0].insts[0] {
+        Inst::Call(c) => {
+            assert_eq!(c.args[0].ty, Some(ir::Ty::F32));
+            assert_eq!(c.args[0].val, Val::Const(0.1f32.to_bits() as i64), "call arg promoted hex");
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+}
+
+#[test]
 fn float_struct_layout() {
     // f32 is size 4, align 2 — so `{ i8, float }` is i8@0, f32@2, size 6
     // (round_up(1 + 4, 2) = 6), exactly like the i32 case.
