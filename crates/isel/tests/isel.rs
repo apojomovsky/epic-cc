@@ -5664,13 +5664,327 @@ fn f32_le(x: f32) -> [u8; 4] {
     x.to_bits().to_le_bytes()
 }
 
-/// The panic-first gate: a float routine with no recipe yet must panic
-/// loudly (the message names "float"), never emit an empty label that
-/// silently falls through into the next function. The M14 fuzz reduce test
-/// depends on exactly this loud panic.
+/// The load-bearing soft-float arithmetic simulations: each routine's emitted
+/// asm is assembled and run in pic14_sim with fixed inputs; the 4-byte result
+/// is asserted bit-for-bit against the value computed by Rust's OWN f32
+/// arithmetic (round-to-nearest-even — a wrong round/sticky/alignment flips
+/// a result byte).
 #[test]
-#[should_panic(expected = "float")]
-fn panics_on_float_routine_without_recipe() {
-    let (ir, map) = float_routine_module("__add_f32");
-    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+fn float_arith_routines_simulate_against_rust_reference() {
+    // (routine, a, b, label) — the reference is Rust's f32 op.
+    let cases: &[(&str, f32, f32, &str)] = &[
+        ("__add_f32", 0.5, 0.25, "0.5+0.25"),
+        ("__add_f32", 1.0, 1.0, "1.0+1.0"),
+        ("__sub_f32", 2.0, 1.0, "2.0-1.0"),
+        // The RNE case: 0.1f32 + 0.2f32 = 0x3E99999A (not 0.3's exact
+        // neighbors — the round bit + sticky decide the 0x99999A).
+        ("__add_f32", 0.1, 0.2, "0.1+0.2"),
+        ("__sub_f32", 1.0, 0.5, "1.0-0.5"),
+        ("__mul_f32", 2.5, 2.0, "2.5*2.0"),
+        // 3.0 * 0.33333334: the 24x24 product's low bits round up to 1.0.
+        ("__mul_f32", 3.0, 0.33333334, "3.0*0.33333334"),
+        ("__div_f32", 1.0, 4.0, "1.0/4.0"),
+        // The load-bearing RNE: 1.0/3.0 = 0x3EAAAAAB (the guard bit 1 with
+        // the sticky rounds the 0xAAAAAA mantissa up).
+        ("__div_f32", 1.0, 3.0, "1.0/3.0"),
+        ("__div_f32", 3.0, 2.0, "3.0/2.0"),
+        ("__sub_f32", 0.5, 0.5, "0.5-0.5"), // exact zero, signs equal
+        // 1.0 + (-1.0) = +0 (the sa & sb zero sign rule).
+        ("__add_f32", 1.0, -1.0, "1.0-1.0"),
+        // 0.0 + x = x; x * 0.0 = +/-0 (the zero-operand shortcuts).
+        ("__add_f32", 0.0, 5.0, "0.0+5.0"),
+        ("__mul_f32", 0.0, 5.0, "0.0*5.0"),
+        ("__mul_f32", -0.0, 5.0, "-0.0*5.0"),
+        // div-by-zero -> the deterministic +/-infinity (0x7F800000).
+        ("__div_f32", 1.0, 0.0, "1.0/0.0"),
+        ("__div_f32", -1.0, 0.0, "-1.0/0.0"),
+    ];
+    for &(name, a, b, label) in cases {
+        let (ir, map) = float_routine_module(name);
+        let mut seed = Vec::new();
+        for (i, by) in f32_le(a).iter().enumerate() {
+            seed.push((0x20 + i as u16, *by));
+        }
+        for (i, by) in f32_le(b).iter().enumerate() {
+            seed.push((0x24 + i as u16, *by));
+        }
+        let want = match name {
+            "__add_f32" => f32_le(a + b),
+            "__sub_f32" => f32_le(a - b),
+            "__mul_f32" => f32_le(a * b),
+            "__div_f32" => f32_le(a / b),
+            _ => unreachable!(),
+        };
+        let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+        assert_eq!(got, want, "{label} ({name}): {got:02X?} must be {want:02X?}");
+    }
+}
+
+/// The conversion routines: round trips u32/i32 <-> f32 and the truncating
+/// fptoui/fptosi. The reference is Rust's f32/int conversions.
+#[test]
+fn float_conversion_routines_simulate_against_rust_reference() {
+    // (routine, input bytes, expected result bytes, label)
+    let cases: &[(&str, [u8; 4], [u8; 4], &str)] = &[
+        // 12345 -> 12345.0f32 = 0x4640E400.
+        ("__uitofp_f32", 12345u32.to_le_bytes(), f32_le(12345.0), "uitofp 12345"),
+        ("__uitofp_f32", 0u32.to_le_bytes(), f32_le(0.0), "uitofp 0"),
+        ("__uitofp_f32", 1u32.to_le_bytes(), f32_le(1.0), "uitofp 1"),
+        // -7 -> -7.0f32 = 0xC0E00000.
+        ("__sitofp_f32", (-7i32).to_le_bytes(), f32_le(-7.0), "sitofp -7"),
+        ("__sitofp_f32", 0u32.to_le_bytes(), f32_le(0.0), "sitofp 0"),
+        // 12345.0 -> 12345; 100.0 -> 100 (truncating).
+        ("__fptoui_f32", f32_le(12345.0), 12345u32.to_le_bytes(), "fptoui 12345.0"),
+        ("__fptoui_f32", f32_le(0.5), 0u32.to_le_bytes(), "fptoui 0.5 truncates"),
+        ("__fptosi_f32", f32_le(-7.0), (-7i32).to_le_bytes(), "fptosi -7.0"),
+        ("__fptosi_f32", f32_le(100.0), 100i32.to_le_bytes(), "fptosi 100.0"),
+        ("__fptosi_f32", f32_le(-0.5), 0i32.to_le_bytes(), "fptosi -0.5 truncates to 0"),
+    ];
+    for &(name, inv, want, label) in cases {
+        let (ir, map) = float_routine_unary_module(name);
+        let mut seed = Vec::new();
+        for (i, by) in inv.iter().enumerate() {
+            seed.push((0x20 + i as u16, *by));
+        }
+        let got = sim_run_bytes(&ir, &map, &seed, 0x24, 4);
+        assert_eq!(got, want, "{label} ({name}): {got:02X?} must be {want:02X?}");
+    }
+}
+
+/// `__cmp_f32` returns the tri-state byte 0=equal / 1=a<b / 2=a>b /
+/// 3=unordered — including the -0 == +0 case and the sign-magnitude
+/// ordering.
+#[test]
+fn cmp_f32_simulates_tristate_byte() {
+    let cases: &[(&str, f32, f32, u8)] = &[
+        ("eq", 1.0, 1.0, 0),
+        ("lt", 1.0, 2.0, 1),
+        ("gt", 2.0, 1.0, 2),
+        ("-0 == +0", -0.0, 0.0, 0),
+        ("+0 == -0", 0.0, -0.0, 0),
+        ("neg lt", -2.0, 1.0, 1),
+        ("neg gt", -1.0, -2.0, 2),
+        ("neg eq", -3.0, -3.0, 0),
+        ("pos vs neg", 1.0, -2.0, 2),
+        ("NaN a", f32::NAN, 1.0, 3),
+        ("NaN b", 1.0, f32::NAN, 3),
+        ("NaN both", f32::NAN, f32::NAN, 3),
+    ];
+    for &(label, a, b, want) in cases {
+        let (ir, map) = float_routine_module("__cmp_f32");
+        let mut seed = Vec::new();
+        for (i, by) in f32_le(a).iter().enumerate() {
+            seed.push((0x20 + i as u16, *by));
+        }
+        for (i, by) in f32_le(b).iter().enumerate() {
+            seed.push((0x24 + i as u16, *by));
+        }
+        let got = sim_run_bytes(&ir, &map, &seed, 0x28, 1)[0];
+        assert_eq!(got, want, "{label}: cmp_f32({a}, {b}) must be {want}");
+    }
+}
+
+/// Every float routine emits a real recipe body — the label, the recipe
+/// instructions, and a RETURN (never an empty label falling through into
+/// the next function — the M14 loud-panic gate the empty-label hazard used
+/// to guard). The `pats` are load-bearing idioms at the contract addresses.
+#[test]
+fn float_routines_emit_recipe_bodies() {
+    let cases: &[(&str, &[&str])] = &[
+        (
+            "__add_f32",
+            &[
+                "RRF 0x4C, F", // ma2 = __scr+4: the alignment right shift
+                "ADDWF 0x4A, F", // ma0 = __scr+2: the 24-bit add
+                "SUBWF 0x53, W", // cnt = __scr+11: the alignment clamp (31)
+                "MOVWF 0x74",  // the retval b3 byte
+            ],
+        ),
+        (
+            "__sub_f32",
+            &[
+                "XORLW 0x80", // the sign flip
+                "SUBWF 0x4A, F", // the 24-bit subtract
+                "MOVWF 0x74",
+            ],
+        ),
+        (
+            "__mul_f32",
+            &[
+                "RLF 0x4B, F", // bk0 = __scr+3: the multiplier test shift
+                "ADDWF 0x4F, F", // m0 = __scr+7: the product accumulation
+                "RRF 0x40, F", // the addend right shift in the a param slot
+                "MOVWF 0x74",
+            ],
+        ),
+        (
+            "__div_f32",
+            &[
+                "RLF 0x40, F", // num <<= 1 (the dividend = the a param slot)
+                "SUBWF 0x4B, F", // rem0 = __scr+3: the restoring subtract
+                "BSF 0x40, 0", // the quotient bit
+                "MOVWF 0x74",
+            ],
+        ),
+        (
+            "__uitofp_f32",
+            &[
+                "RLF 0x40, F", // the leading-1 shift
+                "SUBLW 0x9E",  // e = 158 - cnt
+                "MOVWF 0x74",
+            ],
+        ),
+        (
+            "__sitofp_f32",
+            &[
+                "ANDLW 0x80", // the sign save
+                "COMF 0x40, F", // the abs (negate in place)
+                "SUBLW 0x9E",
+                "MOVWF 0x74",
+            ],
+        ),
+        (
+            "__fptoui_f32",
+            &[
+                "SUBLW 0x96", // cnt = 150 - e
+                "RRF 0x48, F", // m2 = __scr+4 (unary layout: __scr at 0x44)
+                "MOVWF 0x74",
+            ],
+        ),
+        (
+            "__fptosi_f32",
+            &[
+                "SUBLW 0x96",
+                "COMF 0x48, F", // the sign negate (m2 = __scr+4, unary layout)
+                "MOVWF 0x74",
+            ],
+        ),
+        (
+            "__cmp_f32",
+            &[
+                "SUBLW 0x7F", // the NaN exp check
+                "SUBWF 0x40, W", // the 4-byte magnitude compare
+                "MOVLW 0x03", // the unordered result
+            ],
+        ),
+    ];
+    for &(name, pats) in cases {
+        let (ir, map) = if name == "__cmp_f32" {
+            float_routine_module(name)
+        } else if name.ends_with("_f32") && !matches!(name, "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32") {
+            // unary conversion routines
+            let (ir, map) = float_routine_unary_module(name);
+            (ir, map)
+        } else {
+            float_routine_module(name)
+        };
+        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
+        let start = asm.find(&format!("{name}:")).expect("routine label");
+        let body = &asm[start..];
+        let body = body.split("main:").next().expect("main label after routine");
+        assert!(
+            body.contains("    RETURN"),
+            "{name} body must end in RETURN, not fall through:\n{asm}"
+        );
+        for p in pats {
+            assert!(asm.contains(p), "{name} must contain `{p}`:\n{asm}");
+        }
+    }
+}
+
+/// The fcmp end-to-end: a module with `fcmp` predicates is parsed, lowered
+/// by legalize into `call i8 @__cmp_f32` + the per-predicate icmp/select
+/// tree, selected, assembled, and run in pic14_sim — the tri-state byte
+/// feeds the tree and the final i1 lands in `out`. The address map is built
+/// from the legalized module (globals at 0x20+, then each function's params
+/// and inst dsts in order), so the lowered fresh names need no hardcoding.
+#[test]
+fn fcmp_predicates_materialize_end_to_end() {
+    use ir::Inst;
+    fn inst_dst_ty(i: &Inst) -> Option<(String, ir::Ty)> {
+        match i {
+            Inst::Load(l) => Some((l.dst.clone(), l.ty)),
+            Inst::Bin(b) => Some((b.dst.clone(), b.ty)),
+            Inst::Zext(z) => Some((z.dst.clone(), z.to)),
+            Inst::Sext(s) => Some((s.dst.clone(), s.to)),
+            Inst::Trunc(t) => Some((t.dst.clone(), t.to)),
+            Inst::Icmp(c) => Some((c.dst.clone(), ir::Ty::I1)),
+            Inst::Select(s) => Some((s.dst.clone(), s.ty)),
+            Inst::Call(c) => c.dst.clone().map(|d| (d, c.ty.expect("isel: valued call ty"))),
+            Inst::Phi(p) => Some((p.dst.clone(), p.ty)),
+            Inst::Freeze(f) => Some((f.dst.clone(), f.ty)),
+            Inst::Alloca(a) => Some((a.dst.clone(), ir::Ty::I8)), // __scr
+            _ => None,
+        }
+    }
+    fn module_map(m: &ir::Module) -> Vec<(String, u16)> {
+        let mut map = Vec::new();
+        let mut addr = 0x20u16;
+        for g in &m.globals {
+            map.push((g.name.clone(), addr));
+            addr += g.ty.bytes() as u16;
+        }
+        for f in &m.funcs {
+            for p in &f.params {
+                map.push((format!("{}::{}", f.name, p.name), addr));
+                addr += u16::from(p.width);
+            }
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Some((d, t)) = inst_dst_ty(i) {
+                        map.push((format!("{}::{d}", f.name), addr));
+                        addr += t.bytes() as u16;
+                    }
+                }
+            }
+        }
+        map
+    }
+    let cases: &[(&str, f32, f32, u8)] = &[
+        // oeq = (c==0)
+        ("oeq", 1.0, 1.0, 1),
+        ("oeq", 1.0, 2.0, 0),
+        // olt = (c==1)
+        ("olt", 1.0, 2.0, 1),
+        ("olt", 2.0, 1.0, 0),
+        // one = (c==1) || (c==2) — the OR select materialization
+        ("one", 1.0, 2.0, 1),
+        ("one", 2.0, 1.0, 1),
+        ("one", 1.0, 1.0, 0),
+        // ord = (c!=3)
+        ("ord", 1.0, 2.0, 1),
+        ("ord", f32::NAN, 1.0, 0),
+        // uno = (c==3)
+        ("uno", f32::NAN, 1.0, 1),
+        ("uno", 1.0, 2.0, 0),
+    ];
+    for &(pred, a, b, want) in cases {
+        let src = format!(
+            "global ina float\n\
+             global inb float\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %x = load float @ina\n\
+                 %y = load float @inb\n\
+                 %r = fcmp {pred} float %x %y\n\
+                 store i8 %r @out\n\
+                 ret void\n"
+        );
+        let m = legalize::legalize(parse(&src));
+        let map = module_map(&m);
+        let asm = select(&m, &addrs(&map_refs(&map)));
+        let words = asm::assemble(&asm);
+        let mut p = pic14_sim::Pic14::new(words);
+        for (i, by) in f32_le(a).iter().enumerate() {
+            p.ram_mut()[0x20 + i] = *by;
+        }
+        for (i, by) in f32_le(b).iter().enumerate() {
+            p.ram_mut()[0x24 + i] = *by;
+        }
+        p.run(200_000);
+        assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+        assert_eq!(p.ram()[0x28], want, "fcmp {pred}({a}, {b}) must be {want}:\n{asm}");
+    }
 }

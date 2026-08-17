@@ -11,6 +11,7 @@ ir = { path = "../ir" }
 pic14-sim = { path = "../sim" }
 asm = { path = "../asm" }
 banking = { path = "../banking" }
+legalize = { path = "../legalize" }
 
 [[bin]]
 name = "isel"
