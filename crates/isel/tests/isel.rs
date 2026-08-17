@@ -5553,8 +5553,6 @@ fn isr_scratch_use_does_not_corrupt_preempted_main() {
 // ---------------------------------------------------------------------------
 // Milestone 15, Task 3: the soft-float runtime routines (isel recipes).
 // ---------------------------------------------------------------------------
-// Milestone 15, Task 3: the soft-float runtime routines (isel recipes).
-// ---------------------------------------------------------------------------
 //
 // The routine Funcs are injected by legalize with i32 params (4-byte slots —
 // the f32-ness rides on the call types, per the Task-2 contract), one
