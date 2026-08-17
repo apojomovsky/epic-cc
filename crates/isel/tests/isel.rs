@@ -5694,6 +5694,17 @@ fn float_arith_routines_simulate_against_rust_reference() {
         ("__sub_f32", 0.5, 0.5, "0.5-0.5"), // exact zero, signs equal
         // 1.0 + (-1.0) = +0 (the sa & sb zero sign rule).
         ("__add_f32", 1.0, -1.0, "1.0-1.0"),
+        // The M15 float-differential regression (the 50-seed corpus, seed 0):
+        // the SUBTRACT path's RNE must account for the alignment's lost bits
+        // SUBTRACTING from the difference — the exact result is (ma - mb) -
+        // frac, so the rounding mirrors the add path's (round DOWN under
+        // round && (sticky || LSB)). Before the fix -2.25 - (-0.0015344163)
+        // returned 0xC00FE6DE instead of the RNE 0xC00FE6DC, and
+        // 1.0 - 0.99999994 returned 2^-23 instead of 2^-24.
+        ("__sub_f32", -2.25, -0.0015344163, "sub aligned sticky frac > 1/2"),
+        ("__sub_f32", 1.0, f32::from_bits(0x3F7F_FFFF), "sub aligned frac = 1/2"),
+        ("__sub_f32", 1.0, f32::from_bits(0x3EFF_FFFD), "sub aligned frac = 1/4"),
+        ("__sub_f32", 1.0, f32::from_bits(0x3EFF_FFFF), "sub aligned frac = 3/4 (tie to even)"),
         // 0.0 + x = x; x * 0.0 = +/-0 (the zero-operand shortcuts).
         ("__add_f32", 0.0, 5.0, "0.0+5.0"),
         ("__mul_f32", 0.0, 5.0, "0.0*5.0"),
