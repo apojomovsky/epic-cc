@@ -5754,6 +5754,114 @@ fn float_conversion_routines_simulate_against_rust_reference() {
     }
 }
 
+/// The narrow-source conversion CALL ABI: `sitofp`/`uitofp` of i8/i16
+/// sources go through `call @__sitofp_f32`/`@__uitofp_f32`, whose `val`
+/// param is a fixed 4-byte slot — but the caller copies only the source's
+/// own width (2/1 bytes), leaving the high bytes STALE. Pre-fix, an i16
+/// `sitofp` reading leftover high bytes (e.g. 0x41, 0x1C from an earlier
+/// fptosi) started its leading-1 search at bit 30 and produced exp 157
+/// instead of 130 (the M15 acceptance caught this: out2 was 0x4E823800
+/// instead of 0x41100000). The ABI now fills the remainder — sign-extend
+/// for __sitofp_f32, zero-extend for __uitofp_f32 — so the recipe always
+/// sees a proper i32. The sim seeds garbage into the slot's high bytes
+/// before the call to prove the caller overwrites them.
+#[test]
+fn narrow_conversion_sources_sign_and_zero_extend_through_the_call_abi() {
+    use ir::Inst;
+    fn inst_dst_ty(i: &Inst) -> Option<(String, ir::Ty)> {
+        match i {
+            Inst::Load(l) => Some((l.dst.clone(), l.ty)),
+            Inst::Bin(b) => Some((b.dst.clone(), b.ty)),
+            Inst::Zext(z) => Some((z.dst.clone(), z.to)),
+            Inst::Sext(s) => Some((s.dst.clone(), s.to)),
+            Inst::Trunc(t) => Some((t.dst.clone(), t.to)),
+            Inst::Icmp(c) => Some((c.dst.clone(), ir::Ty::I1)),
+            Inst::Select(s) => Some((s.dst.clone(), s.ty)),
+            Inst::Call(c) => c.dst.clone().map(|d| (d, c.ty.expect("isel: valued call ty"))),
+            Inst::Phi(p) => Some((p.dst.clone(), p.ty)),
+            Inst::Freeze(f) => Some((f.dst.clone(), f.ty)),
+            Inst::Alloca(a) => Some((a.dst.clone(), ir::Ty::I8)), // __scr
+            _ => None,
+        }
+    }
+    fn module_map(m: &ir::Module) -> Vec<(String, u16)> {
+        let mut map = Vec::new();
+        let mut addr = 0x20u16;
+        for g in &m.globals {
+            map.push((g.name.clone(), addr));
+            addr += g.ty.bytes() as u16;
+        }
+        for f in &m.funcs {
+            for p in &f.params {
+                map.push((format!("{}::{}", f.name, p.name), addr));
+                addr += u16::from(p.width);
+            }
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Some((d, t)) = inst_dst_ty(i) {
+                        map.push((format!("{}::{d}", f.name), addr));
+                        addr += t.bytes() as u16;
+                    }
+                }
+            }
+        }
+        map
+    }
+    // (source width, op, input bytes, expected float bytes, label) — the
+    // expected values are Rust's own f32 conversions (the arithmetic
+    // authority). The i16/i8 negatives exercise the sign extension; the
+    // unsigned values the zero extension.
+    let cases: &[(&str, &str, [u8; 2], [u8; 4], &str)] = &[
+        ("i16", "sitofp", (-7i16).to_le_bytes(), f32_le(-7.0), "sitofp i16 -7"),
+        ("i16", "sitofp", 9i16.to_le_bytes(), f32_le(9.0), "sitofp i16 9"),
+        ("i16", "uitofp", 65529u16.to_le_bytes(), f32_le(65529.0), "uitofp i16 65529"),
+        ("i8", "sitofp", [0xF9, 0x00], f32_le(-7.0), "sitofp i8 -7 (0xF9)"),
+        ("i8", "uitofp", [0xF9, 0x00], f32_le(249.0), "uitofp i8 249 (0xF9)"),
+        ("i8", "sitofp", [0x7F, 0x00], f32_le(127.0), "sitofp i8 127"),
+    ];
+    for &(width, op, inv, want, label) in cases {
+        let src = format!(
+            "global inv {width}\n\
+             global out float\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %v = load {width} @inv\n\
+                 %r = {op} {width} %v to float\n\
+                 store float %r @out\n\
+                 ret void\n"
+        );
+        let m = legalize::legalize(parse(&src));
+        let map = module_map(&m);
+        let asm = select(&m, &addrs(&map_refs(&map)));
+        let words = asm::assemble(&asm);
+        let mut p = pic14_sim::Pic14::new(words);
+        for (i, by) in inv.iter().enumerate() {
+            p.ram_mut()[0x20 + i] = *by;
+        }
+        // Garbage in the routine's val-slot high bytes (the pre-fix stale
+        // data): a wrong exp (157 vs 130) must NOT come back.
+        let val = *map
+            .iter()
+            .find(|(k, _)| k == &format!("__{op}_f32::val"))
+            .map(|(_, v)| v)
+            .unwrap_or_else(|| panic!("no val slot for __{op}_f32 in map"));
+        p.ram_mut()[val as usize + 2] = 0x1C;
+        p.ram_mut()[val as usize + 3] = 0x41;
+        let out_addr = *map
+            .iter()
+            .find(|(k, _)| k == "out")
+            .map(|(_, v)| v)
+            .expect("out global in map");
+        p.run(200_000);
+        assert!(p.halted(), "{label}: program must SLEEP-halt:\n{asm}");
+        let mut got = [0u8; 4];
+        for i in 0..4 {
+            got[i] = p.ram()[out_addr as usize + i];
+        }
+        assert_eq!(got, want, "{label}: {got:02X?} must be {want:02X?}:\n{asm}");
+    }
+}
+
 /// `__cmp_f32` returns the tri-state byte 0=equal / 1=a<b / 2=a>b /
 /// 3=unordered — including the -0 == +0 case and the sign-magnitude
 /// ordering.
