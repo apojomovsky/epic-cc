@@ -1,4 +1,5 @@
 use alloc::{allocate, map_text, AllocLayout};
+use device::PIC16F877A;
 use ir::parse;
 
 /// main calls a and b; each of a and b carries two i16 locals, main carries
@@ -30,7 +31,7 @@ fn overlay_module() -> ir::Module {
 #[test]
 fn globals_get_bank0_addresses() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    ret void\n");
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_eq!(out.globals["in"], 0x20);
     assert_eq!(out.globals["out"], 0x21);
 }
@@ -38,7 +39,7 @@ fn globals_get_bank0_addresses() {
 #[test]
 fn i16_global_advances_two_bytes() {
     let m = parse("global a i8\nglobal b i16\nfn main(void) ()\n  block entry:\n    ret void\n");
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_eq!(out.globals["a"], 0x20);
     assert_eq!(out.globals["b"], 0x22);
 }
@@ -58,7 +59,7 @@ fn large_array_after_i16_lands_at_next_even_and_spans_sequentially() {
              ret void\n",
     );
     m.globals[1].size = 8; // arr: [8 x i8]
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_eq!(out.globals["a"], 0x20);
     assert_eq!(out.globals["arr"], 0x22, "array must reuse the even slot");
     // a spans 0x20-0x21, arr spans 0x22-0x29: the next global is sequential.
@@ -68,7 +69,7 @@ fn large_array_after_i16_lands_at_next_even_and_spans_sequentially() {
 #[test]
 fn sibling_frames_share_a_base() {
     let m = overlay_module();
-    let out = allocate(&m, "edge main a\nedge main b\ndepth 2\n");
+    let out = allocate(&PIC16F877A, &m, "edge main a\nedge main b\ndepth 2\n");
     // (a) a and b overlay: their i16 locals land on the same addresses.
     assert_eq!(out.locals["a::a0"], out.locals["b::b0"]);
     assert_eq!(out.locals["a::a1"], out.locals["b::b1"]);
@@ -90,6 +91,7 @@ fn skips_fn_lines_interspersed_with_edges() {
     // binary workflow keeps working.
     let m = overlay_module();
     let out = allocate(
+        &PIC16F877A,
         &m,
         "depth 2\nfn main\nfn a\nedge main a\nfn b\nedge main b\n",
     );
@@ -101,7 +103,7 @@ fn skips_fn_lines_interspersed_with_edges() {
 #[test]
 fn map_text_emits_global_and_local_lines() {
     let m = overlay_module();
-    let out = allocate(&m, "edge main a\nedge main b\ndepth 2\n");
+    let out = allocate(&PIC16F877A, &m, "edge main a\nedge main b\ndepth 2\n");
     assert_eq!(
         map_text(&out),
         "global in 0x20\n\
@@ -121,7 +123,7 @@ fn params_are_frame_locals_too() {
              %q = add i16 %p0, 1\n\
              ret void\n",
     );
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // No globals: end_of_globals = 0x20, so bank0_start = 0x20 (scratch/retval
     // live in fixed common RAM, not after the globals). Locals are placed
     // contiguously (M3 overlay math): p0 i16 at 0x20, p1 i8 at 0x22, q i16 at
@@ -142,7 +144,7 @@ fn globals_span_across_banks() {
     }
     let src = format!("{gsrc}fn main(void) ()\n  block entry:\n    ret void\n");
     let m = parse(&src);
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_eq!(out.globals["g0"], 0x20);
     assert_eq!(out.globals["g79"], 0x6F); // last bank-0 GPR byte
     assert!(out.globals["g80"] >= 0xA0, "81st global crosses into bank 1");
@@ -159,7 +161,7 @@ fn frame_spans_across_banks() {
     }
     src.push_str("    ret void\n");
     let m = parse(&src);
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // No globals: the root frame starts at 0x20; v79 at 0x6F, v80 at 0xA0.
     assert_eq!(out.locals["f::v0"], 0x20);
     assert_eq!(out.locals["f::v79"], 0x6F);
@@ -196,7 +198,7 @@ fn callee_base_follows_callers_physical_frame_end() {
              ret void\n",
     );
     let m = parse(&src);
-    let out = allocate(&m, "edge main a\nedge a b\n");
+    let out = allocate(&PIC16F877A, &m, "edge main a\nedge a b\n");
     // main's frame: base 0x20, its local at 0x20, physical end 0x21.
     assert_eq!(out.locals["main::m0"], 0x20);
     // a's frame starts right after main's physical end and crosses the bank
@@ -242,7 +244,7 @@ fn callee_base_clears_region_tail_hole_left_by_i16_local() {
              ret void\n"
     );
     let m = parse(&src);
-    let out = allocate(&m, "edge main b\n");
+    let out = allocate(&PIC16F877A, &m, "edge main b\n");
     // 79 i8 globals: the last one at 0x6E, so the root frame starts at 0x6F.
     assert_eq!(out.globals["g78"], 0x6E);
     // main's frame: i16 at 0xA0-0xA1 (bank 1, since 0x6F cannot hold it),
@@ -268,7 +270,7 @@ fn i16_globals_stay_even_aligned_across_banks() {
     }
     let src = format!("{gsrc}global w i16\nfn main(void) ()\n  block entry:\n    ret void\n");
     let m = parse(&src);
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_eq!(out.globals["g79"], 0x6F);
     assert!(out.globals["w"] >= 0xA0, "i16 spills into bank 1");
     assert_eq!(out.globals["w"] % 2, 0, "i16 stays even-aligned within the bank");
@@ -285,7 +287,7 @@ fn i16_frame_stays_even_aligned_across_banks() {
     }
     src.push_str("    ret void\n");
     let m = parse(&src);
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     for i in 0..50 {
         let a = out.locals[&format!("f::v{i}")];
         assert_eq!(a % 2, 0, "i16 local v{i} at {a:#04x} must be even");
@@ -312,7 +314,7 @@ fn const_globals_get_no_address_and_sized_globals_span() {
     // sizes by type, so set them explicitly to mirror a real module.
     m.globals[0].size = 8; // ram: [8 x i8]
     m.globals[1].size = 4; // table: [4 x i8]
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // ram is sized by Global.size (8), not ty.bytes() (1): it spans 8 bytes.
     assert_eq!(out.globals["ram"], 0x20);
     // The next RAM global starts after ram's 8 bytes.
@@ -348,7 +350,7 @@ fn sized_array_global_does_not_break_frame_overlay() {
              ret void\n",
     );
     m.globals[0].size = 8; // ram: [8 x i8]
-    let out = allocate(&m, "edge main a\n");
+    let out = allocate(&PIC16F877A, &m, "edge main a\n");
     // ram spans 0x20..0x27; main's local starts at 0x28.
     assert_eq!(out.globals["ram"], 0x20);
     assert_eq!(out.locals["main::m0"], 0x28);
@@ -378,7 +380,7 @@ fn const_300_byte_table_gets_no_ram_address_and_layout_unchanged() {
             addr: None,
         },
     );
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // const table: no RAM address, but listed in const_globals.
     assert!(!out.globals.contains_key("table"), "const table must not get a RAM address");
     assert!(out.const_globals.contains("table"), "const table must be in const_globals");
@@ -399,7 +401,7 @@ fn alloca_byval_and_sret_params_get_full_widths_params_first() {
              %buf = alloca 4\n\
              ret void\n",
     );
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // Params come first, in declaration order: p (byval, 4 bytes) at 0x20,
     // r (sret, 2 bytes) right after p's 4 bytes at 0x24.
     assert_eq!(out.locals["f::p"], 0x20);
@@ -424,7 +426,7 @@ fn i32_param_and_def_get_four_bytes() {
              %r = add i32 %q, 2\n\
              ret void\n",
     );
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // p i32 at 0x20, q at 0x24, r at 0x28 — contiguous 4-byte slots.
     assert_eq!(out.locals["f::p"], 0x20);
     assert_eq!(out.locals["f::q"], 0x24);
@@ -444,7 +446,7 @@ fn frame_exceeding_all_banks_panics() {
     }
     src.push_str("    ret void\n");
     let m = parse(&src);
-    let _ = allocate(&m, "depth 1\n");
+    let _ = allocate(&PIC16F877A, &m, "depth 1\n");
 }
 
 #[test]
@@ -492,6 +494,7 @@ fn isr_root_region_is_disjoint_from_the_main_context() {
              ret void\n",
     );
     let out = allocate(
+        &PIC16F877A,
         &m,
         "edge main m1\nedge m1 m2\nedge isr m1_isr\nedge m1_isr m2_isr\n",
     );
@@ -536,7 +539,7 @@ fn isr_region_clears_the_main_context_physical_frame_end() {
              ret void\n"
     );
     let m = parse(&src);
-    let out = allocate(&m, "depth 1\n");
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // 79 i8 globals: the last at 0x6E, so the root frame starts at 0x6F.
     assert_eq!(out.globals["g78"], 0x6E);
     // main's frame: i16 at 0xA0-0xA1 (moved wholesale past the 0x6F hole),
