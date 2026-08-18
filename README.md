@@ -3,6 +3,7 @@
 **A whole-program C compiler for 8-bit Microchip PIC microcontrollers, written in Rust.**
 
 [![CI](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust 1.97.1](https://img.shields.io/badge/rust-1.97.1-b7410e.svg)](rust-toolchain.toml)
 [![clang 20.1.8](https://img.shields.io/badge/clang-20.1.8%20%28pinned%29-262d3a.svg)](docs/09-build-environment.md)
 [![target PIC16F877A](https://img.shields.io/badge/target-PIC16F877A%20%28PIC14%29-c0392b.svg)](docs/01-target-pic14.md)
@@ -39,6 +40,7 @@ $ cargo run -p driver -- add.c add.hex && cat add.hex
 - [Repository layout](#repository-layout)
 - [Design documentation](#design-documentation)
 - [Non-goals](#non-goals)
+- [License](#license)
 
 ---
 
@@ -357,3 +359,20 @@ Working notes for contributors and agents are in [`CLAUDE.md`](CLAUDE.md).
   not a design target. Beating XC8 free-mode optimization is a nice-to-have.
 - **Reverse-engineering XC8.** Prohibited by its licence, and unnecessary
   ([ADR-006](docs/03-decisions.md)).
+
+---
+
+## License
+
+MIT, see [LICENSE](LICENSE).
+
+Two boundaries worth stating explicitly, because this project is a compiler that sits next
+to other people's tools:
+
+- **`gputils` and `gpsim` are GPL.** They are invoked as external processes from the test
+  harness and never linked into the compiler, so they do not affect this project's
+  licensing. Keep them behind that process boundary.
+- **Microchip's datasheets, application notes and XC8 are Microchip's property**, are not
+  vendored here, and XC8 is used only as a black-box oracle
+  ([ADR-006](docs/03-decisions.md)). User-supplied Microchip material and reference books
+  live under [`vendor/`](vendor/README.md), whose contents are gitignored.
