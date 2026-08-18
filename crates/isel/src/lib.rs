@@ -39,6 +39,7 @@
 //! performs no slot allocation; it trusts the map (from `alloc`'s overlay
 //! layout) and panics loudly if a value is missing from it.
 
+use device::Device;
 use ir::{BinOp, Gep, GepBase, Inst, Module, Ty, Val};
 use std::collections::{HashMap, HashSet};
 
@@ -4386,10 +4387,10 @@ fn word_size(lines: &[String]) -> usize {
 /// before ANY function whose start is page-aligned (an overflow continuation
 /// or an exact-boundary one) — and return the `(pad, page, next_addr)`. A
 /// function larger than one page can never fit (its intra-function GOTOs
-/// need a single stable page) and panics loudly; a program past page 3
-/// (0x2000 — the device flash) panics loudly too. The `.org` pads with
-/// 0x0000 words (the assembler supports it), so the final layout's addresses
-/// are exactly what the tracker predicts.
+/// need a single stable page) and panics loudly; a program past the
+/// device's flash panics loudly too. The `.org` pads with 0x0000 words (the
+/// assembler supports it), so the final layout's addresses are exactly what
+/// the tracker predicts.
 ///
 /// M11 two-phase emission: pass A measures every function body with all
 /// PCLATH restores present and runs this over ALL functions, so a call to a
@@ -4400,13 +4401,16 @@ fn word_size(lines: &[String]) -> usize {
 /// overflow check alone would leave it unanchored, and the elision would
 /// slide it below the boundary into a straddle), so every function stays on
 /// the page pass A assigned (elision is page-membership-stable).
-fn page_step(addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usize) {
+fn page_step(flash_words: u32, addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usize) {
+    // The device's last page index — flash_words / 0x800 words per page,
+    // 0-indexed (e.g. 0x2000/0x800 = 4 pages, so the last is page 3).
+    let last_page = flash_words / 0x800 - 1;
     if size > 0x800 {
         panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
     }
-    if addr >= 0x2000 {
+    if addr as u32 >= flash_words {
         panic!(
-            "isel: function @{name} would start at 0x{addr:04X}, beyond page 3 (device flash is 8K words)"
+            "isel: function @{name} would start at 0x{addr:04X}, beyond page {last_page} (device flash is {flash_words:#06x} words)"
         );
     }
     let page_end = (addr & !0x7FF) + 0x800;
@@ -4424,9 +4428,9 @@ fn page_step(addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usi
     let pad = if addr & 0x7FF == 0 {
         Some(addr)
     } else if addr + size > page_end {
-        if page_end >= 0x2000 {
+        if page_end as u32 >= flash_words {
             panic!(
-                "isel: function @{name} would start at 0x{page_end:04X}, beyond page 3 (device flash is 8K words)"
+                "isel: function @{name} would start at 0x{page_end:04X}, beyond page {last_page} (device flash is {flash_words:#06x} words)"
             );
         }
         Some(page_end)
@@ -4604,14 +4608,14 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 /// functions so a forward call target's page is known; pass B re-emits with
 /// same-page restores skipped (the pads pin the page bases, so the elision
 /// never moves a function off its assigned page).
-pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
-    // The F877A has ONE interrupt vector at word 0x0004 (the hardware pushes
-    // the return PC and clears GIE; PCLATH is untouched). The vector IS the
-    // ISR entry — no GOTO, since a GOTO's target page would depend on the
-    // interrupted PCLATH (unknowable) — so the ISR is emitted FIRST with a
-    // `.org 4` pad (words 2-3 after the reset entry), and `__start` moves
-    // after it. A second ISR would fight over the single vector: panic
-    // loudly.
+pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
+    // The device's interrupt vector(s) (the hardware pushes the return PC
+    // and clears GIE; PCLATH is untouched). The vector IS the ISR entry —
+    // no GOTO, since a GOTO's target page would depend on the interrupted
+    // PCLATH (unknowable) — so the ISR is emitted FIRST with a `.org 4` pad
+    // (words 2-3 after the reset entry), and `__start` moves after it. More
+    // interrupt handlers than the device has vectors would fight over one
+    // vector: panic loudly.
     let isr_names: Vec<&str> = m
         .funcs
         .iter()
@@ -4619,38 +4623,46 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
         .map(|f| f.name.as_str())
         .collect();
     assert!(
-        isr_names.len() <= 1,
-        "isel: {} interrupt handlers ({}) — the PIC16F877A has a single vector at word 4",
+        isr_names.len() <= device.interrupt_vectors.len(),
+        "isel: {} interrupt handlers ({}) — {} has {} interrupt vector(s)",
         isr_names.len(),
-        isr_names.join(", ")
+        isr_names.join(", "),
+        device.name,
+        device.interrupt_vectors.len(),
     );
     let has_isr = !isr_names.is_empty();
     // The icmp scratch byte and the four retval bytes are fixed common-RAM
-    // constants (bank-independent, common RAM 0x70-0x7F is never used by
-    // locals, so no collision). The widened i32 region (0x71-0x74) must not
-    // overrun common RAM nor overlap the scratch byte — and the ISR save
-    // area (0x75-0x7D: W, STATUS, PCLATH, FSR, retval x4, scratch) must sit
-    // right after the retval region, disjoint from it and from scratch,
-    // leaving 0x7E-0x7F free.
-    let scratch: u16 = 0x70;
-    let retval_lo: u16 = 0x71;
+    // constants (bank-independent, the device's common RAM is never used by
+    // locals, so no collision). The widened i32 region must not overrun
+    // common RAM nor overlap the scratch byte — and the ISR save area (W,
+    // STATUS, PCLATH, FSR, retval x4, scratch — 9 bytes) must sit right
+    // after the retval region, disjoint from it and from scratch, leaving
+    // the last 2 bytes of common RAM free.
+    let (common_lo, common_hi) = device
+        .common_ram
+        .expect("isel's fixed scratch/retval/ISR-save layout needs a common-RAM region");
+    let scratch: u16 = common_lo;
+    let retval_lo: u16 = common_lo + 1;
+    let isr_save_lo: u16 = common_lo + 5;
+    let isr_save_hi: u16 = common_lo + 13;
     assert!(
-        retval_lo + 4 <= 0x80,
+        retval_lo + 4 <= common_hi + 1,
         "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must fit in common RAM",
         retval_lo + 3
     );
     assert!(
-        retval_lo + 4 <= 0x75,
-        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must not overlap the ISR save area 0x75-0x7D",
+        retval_lo + 4 <= isr_save_lo,
+        "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must not overlap the ISR save area 0x{isr_save_lo:02X}-0x{isr_save_hi:02X}",
         retval_lo + 3
     );
     assert!(
-        0x7D + 1 <= 0x7E,
-        "isel: ISR save area 0x75-0x7D must leave 0x7E-0x7F free"
+        isr_save_hi + 1 <= common_hi,
+        "isel: ISR save area 0x{isr_save_lo:02X}-0x{isr_save_hi:02X} must leave 0x{:02X}-0x{common_hi:02X} free",
+        isr_save_hi + 1,
     );
     let mut out = vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
-        "    list p=16f877a".to_string(),
+        format!("    list p={}", device.name),
         "    radix hex".to_string(),
         "STATUS equ 0x03".to_string(),
         "FSR    equ 0x04".to_string(),
@@ -4830,7 +4842,7 @@ pub fn select(m: &Module, addrs: &HashMap<String, u16>) -> String {
             pads.insert(name.clone(), 4);
             addr = 4 + size + 4; // the ISR body + the 4-word __start body
         } else {
-            let (pad, page, next) = page_step(addr, *size, name);
+            let (pad, page, next) = page_step(device.flash_words, addr, *size, name);
             addr = next;
             pages.insert(name.clone(), page);
             if let Some(p) = pad {

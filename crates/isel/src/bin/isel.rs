@@ -12,6 +12,6 @@ fn main() {
     let src = fs::read_to_string(&args[1]).expect("read input");
     let map = fs::read_to_string(&args[2]).expect("read map");
     let addrs = parse_map(&map);
-    let asm = select(&ir::parse(&src), &addrs);
+    let asm = select(&device::PIC16F877A, &ir::parse(&src), &addrs);
     fs::write(&args[3], asm).expect("write output");
 }

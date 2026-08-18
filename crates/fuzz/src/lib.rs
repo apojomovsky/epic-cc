@@ -2465,7 +2465,7 @@ fn run_ir_pic(prog: &IrProgram) -> Result<u32, Failure> {
         let mut addrs: HashMap<String, u16> = HashMap::new();
         addrs.extend(layout.globals.clone());
         addrs.extend(layout.locals.clone());
-        let asm = isel::select(&m, &addrs);
+        let asm = isel::select(&device::PIC16F877A, &m, &addrs);
         let asm = banking::assign_banks(&device::PIC16F877A, &asm);
         let asm = peephole::optimize(&asm);
         let hex = asm::assemble_file_to_hex(&device::PIC16F877A, &asm);
