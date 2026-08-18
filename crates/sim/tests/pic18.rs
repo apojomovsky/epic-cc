@@ -270,3 +270,47 @@ fn tstfsz_skips_when_f_is_zero() {
     p.run(10);
     assert_eq!(p.pc(), 12);
 }
+
+#[test]
+fn bsf_sets_a_bit_without_touching_others() {
+    let words = vec![0x0E0F, 0x6E20, 0x8A20]; // MOVLW 0x0F; MOVWF 0x20,A; BSF 0x20,5,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0x2F);
+}
+
+#[test]
+fn bcf_clears_a_bit_without_touching_others() {
+    let words = vec![0x0EFF, 0x6E20, 0x9820]; // MOVLW 0xFF; MOVWF 0x20,A; BCF 0x20,4,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xEF);
+}
+
+#[test]
+fn btfsc_skips_when_the_bit_is_clear() {
+    // MOVLW 0; MOVWF 0x20,A; BTFSC 0x20,0,A; GOTO fail; NOP
+    let words = vec![0x0E00, 0x6E20, 0xB020, 0xEF10, 0xF000, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.pc(), 12);
+}
+
+#[test]
+fn btfss_skips_when_the_bit_is_set() {
+    // MOVLW 1; MOVWF 0x20,A; BTFSS 0x20,0,A; GOTO fail; NOP
+    let words = vec![0x0E01, 0x6E20, 0xA020, 0xEF10, 0xF000, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.pc(), 12);
+}
+
+#[test]
+fn btg_toggles_a_bit() {
+    let words = vec![0x0E00, 0x6E20, 0x7820, 0x7820]; // MOVLW 0; MOVWF 0x20,A; BTG 0x20,4,A twice
+    let mut p = Pic18::new(words);
+    p.run(3);
+    assert_eq!(p.ram()[0x20], 0x10);
+    p.run(1);
+    assert_eq!(p.ram()[0x20], 0x00);
+}

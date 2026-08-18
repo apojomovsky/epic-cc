@@ -536,6 +536,7 @@ impl Pic18 {
                 panic!("sim(pic18): literal opcode {word:#06x} not yet implemented (Task 14)")
             }
             _ if (0x0200..=0x6FFF).contains(&word) => self.exec_byte(pc, word),
+            _ if (0x7000..=0xBFFF).contains(&word) => self.exec_bit(pc, word),
             _ => panic!("sim(pic18): opcode {word:#06x} not yet implemented"),
         };
         self.pc = next;
@@ -778,6 +779,29 @@ impl Pic18 {
             other => panic!(
                 "sim(pic18): byte opcode base {other:#06x} (word {word:#06x}) not yet implemented"
             ),
+        }
+        pc + 2
+    }
+
+    fn exec_bit(&mut self, pc: u32, word: u16) -> u32 {
+        let a = (word >> 8) & 1;
+        let f = word & 0xFF;
+        let b = (word >> 9) & 0x7;
+        match (word >> 12) & 0xF {
+            0x7 => self.write_f(a, f, self.read_f(a, f) ^ (1 << b)), // BTG
+            0x8 => self.write_f(a, f, self.read_f(a, f) | (1 << b)), // BSF
+            0x9 => self.write_f(a, f, self.read_f(a, f) & !(1 << b)), // BCF
+            0xA => {
+                if self.read_f(a, f) & (1 << b) != 0 {
+                    return self.skip_pc(pc + 2); // BTFSS: skip if set
+                }
+            }
+            0xB => {
+                if self.read_f(a, f) & (1 << b) == 0 {
+                    return self.skip_pc(pc + 2); // BTFSC: skip if clear
+                }
+            }
+            other => panic!("sim(pic18): bit opcode group {other:#03x} unreachable"),
         }
         pc + 2
     }
