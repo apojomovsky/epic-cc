@@ -191,3 +191,120 @@ fn bank0_only_with_movwf_status_keeps_resets() {
     let expected = "    MOVWF STATUS\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
     assert_eq!(assign_banks(asm), expected);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #13: reclaim redundant BANKSEL sequences
+// ---------------------------------------------------------------------------
+
+// ---- Item 2: the CALL reset is redundant when the callee provably exits
+// ---- with a fixed bank (the caller can keep tracking that bank).
+
+#[test]
+fn call_to_bank0_callee_skips_redundant_banksel() {
+    // The caller is in bank 1, calls a bank-0-only callee (its body has no
+    // banked operand, so it provably exits bank 0), then touches a bank-0
+    // operand. The callee's exit bank is provable, so the full BANKSEL after
+    // the CALL is redundant — the tracked bank is 0 already.
+    let asm = "    MOVF 0xA0, W\n    CALL helper\n    MOVF 0x20, W\nhelper:\n    MOVF 0x21, W\n    RETURN\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL helper\n    MOVF 0x20, W\nhelper:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn call_to_bank1_callee_keeps_bank() {
+    // The callee's last banked operand is bank 1, so it provably exits bank
+    // 1; the caller's next operand is bank 1 too — no BANKSEL after the
+    // CALL (before the fix, every CALL reset the tracked bank and the next
+    // banked operand got a full BANKSEL).
+    let asm = "    MOVF 0xA0, W\n    CALL helper\n    MOVF 0xA5, W\nhelper:\n    MOVF 0xA1, W\n    RETURN\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL helper\n    MOVF 0x25, W\nhelper:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn call_exit_bank_is_transitive() {
+    // outer calls inner (which exits bank 0), so outer provably exits bank
+    // 0 too — the caller's next bank-0 operand needs no BANKSEL after
+    // `CALL outer`.
+    let asm = "    MOVF 0xA0, W\n    CALL outer\n    MOVF 0x20, W\nouter:\n    CALL inner\n    RETURN\ninner:\n    MOVF 0x21, W\n    RETURN\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL outer\n    MOVF 0x20, W\nouter:\n    CALL inner\n    RETURN\ninner:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn call_to_unknown_bank_callee_keeps_full_reset() {
+    // A callee whose exit bank is not provable keeps the full BANKSEL after
+    // the CALL — the optimization must never skip a needed reset. The
+    // callee's only banked operand sits under a BTFSC: if the skip is taken
+    // the bank stays 0 (the caller's bank), if not it becomes 1 — the two
+    // paths diverge, so the exit bank is not provable.
+    let asm = "    MOVF 0x20, W\n    CALL helper\n    MOVF 0xA5, W\nhelper:\n    BTFSC STATUS, 2\n    MOVF 0xA1, W\n    RETURN\n";
+    let expected = "    MOVF 0x20, W\n    CALL helper\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\nhelper:\n    BTFSC STATUS, 2\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+// ---- Item 3: bank-select ops in bit-number forms are recognized.
+
+#[test]
+fn tracks_banksel_with_attached_comma() {
+    // `BCF STATUS,5` (the comma attached to the register token) is a
+    // STATUS bank op: it must update the tracked bank, so the following
+    // bank-1 operand gets its own BANKSEL (before the fix the op was not
+    // recognized and the bank-1 operand silently ran with the bank the
+    // hand-written BCF left).
+    let asm = "    MOVF 0xA0, W\n    BCF STATUS,5\n    MOVF 0xA5, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF STATUS,5\n    BSF STATUS, 5\n    MOVF 0x25, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn tracks_banksel_by_status_address() {
+    // `BCF 0x03, 5` — STATUS by its register address — is a STATUS bank
+    // op too (0x03 IS STATUS on the PIC16F877A).
+    let asm = "    MOVF 0xA0, W\n    BCF 0x03, 5\n    MOVF 0xA5, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF 0x03, 5\n    BSF STATUS, 5\n    MOVF 0x25, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn movwf_status_resets_tracked_bank() {
+    // `MOVWF STATUS` writes all of STATUS from W, including the RP bits:
+    // the tracked bank becomes unknowable, so the next banked operand gets
+    // a FULL BANKSEL (before the fix the pass kept tracking the pre-write
+    // bank and emitted only a partial diff).
+    let asm = "    MOVF 0xA0, W\n    MOVWF STATUS\n    MOVF 0xA5, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    MOVWF STATUS\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn movwf_status_by_address_resets_tracked_bank() {
+    // The address form `MOVWF 0x03` is the same STATUS write.
+    let asm = "    MOVF 0xA0, W\n    MOVWF 0x03\n    MOVF 0xA5, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    MOVWF 0x03\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn bank0_only_with_attached_comma_bank_op_keeps_resets() {
+    // The bit-number forms disqualify a program from the bank-0-only skip
+    // (they touch the bank bits, so the pass cannot prove the bank stays 0
+    // at every label/CALL).
+    let asm = "    BCF STATUS,5\nL:\n    MOVF 0x20, W\n";
+    let expected = "    BCF STATUS,5\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn bank0_only_with_status_address_bank_op_keeps_resets() {
+    let asm = "    BCF 0x03, 5\nL:\n    MOVF 0x20, W\n";
+    let expected = "    BCF 0x03, 5\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn bank0_only_with_movwf_status_address_keeps_resets() {
+    let asm = "    MOVWF 0x03\nL:\n    MOVF 0x20, W\n";
+    let expected = "    MOVWF 0x03\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
