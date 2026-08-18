@@ -26,8 +26,10 @@ struct Gen<'m> {
     /// on the next banked access rather than assumed).
     bsr: Option<u8>,
     cur_func: &'m str,
-    /// Module-scoped fresh-label counter (mirrors `isel`'s `tmp` field).
-    tmp: u32,
+    /// Module-scoped fresh-label counter, shared across every function so
+    /// the emitted `tmp{n}:` labels stay unique in the single `.asm`
+    /// output (mirrors `isel`'s `tmp` field, `crates/isel/src/lib.rs:177`).
+    tmp: &'m mut u32,
     out: Vec<String>,
 }
 
@@ -37,8 +39,8 @@ impl<'m> Gen<'m> {
     }
 
     fn fresh_label(&mut self) -> String {
-        let s = format!("tmp{}", self.tmp);
-        self.tmp += 1;
+        let s = format!("tmp{}", *self.tmp);
+        *self.tmp += 1;
         s
     }
 
@@ -115,6 +117,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "    goto __start".to_string(),
         "".to_string(),
     ];
+    // Shared across every `Gen` below so `fresh_label()` never repeats a
+    // `tmp{n}:` label across two different functions in the same output.
+    let mut tmp = 0u32;
     for f in &m.funcs {
         let mut g = Gen {
             m,
@@ -122,9 +127,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             retval_lo: common_lo,
             bsr: None,
             cur_func: &f.name,
-            tmp: 0,
+            tmp: &mut tmp,
             out: Vec::new(),
         };
+        // Block/label emission arrives in Task 12 (the index-based scheme
+        // `isel::select` uses: the first block gets the bare function name,
+        // every other block gets `{func}_L{label}`); this skeleton only
+        // walks each block's instructions, so no label is emitted yet —
+        // including for the entry block.
         for b in &f.blocks {
             for inst in &b.insts {
                 g.emit_inst(inst);
@@ -138,4 +148,52 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     out.push("    call main".to_string());
     out.push("    sleep".to_string());
     out.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for the `tmp` field's shared-borrow requirement:
+    /// `Gen::tmp` must be `&'m mut u32` backed by one counter that outlives
+    /// every function's `Gen`, not an owned `u32` reset per function — an
+    /// owned counter would let two functions' `fresh_label()` calls both
+    /// emit `tmp0`, a duplicate label that fails to assemble once Task 12
+    /// starts calling `fresh_label()` for real. `fresh_label()` itself has
+    /// no caller yet in Task 3's scope (Select/Icmp/Br land later), so this
+    /// constructs two `Gen`s directly — the way `select()` constructs one
+    /// per function — sharing one backing `tmp: &mut u32`, exactly as
+    /// `select()` does across its `for f in &m.funcs` loop.
+    #[test]
+    fn fresh_label_counter_is_shared_across_gens() {
+        let m = ir::parse("fn f(void) ()\n  block entry:\n    ret void\n");
+        let addrs: HashMap<String, u16> = HashMap::new();
+        let mut tmp = 0u32;
+        let l1 = {
+            let mut g = Gen {
+                m: &m,
+                addrs: &addrs,
+                retval_lo: 0,
+                bsr: None,
+                cur_func: "f",
+                tmp: &mut tmp,
+                out: Vec::new(),
+            };
+            g.fresh_label()
+        };
+        let l2 = {
+            let mut g = Gen {
+                m: &m,
+                addrs: &addrs,
+                retval_lo: 0,
+                bsr: None,
+                cur_func: "f",
+                tmp: &mut tmp,
+                out: Vec::new(),
+            };
+            g.fresh_label()
+        };
+        assert_eq!(l1, "tmp0");
+        assert_eq!(l2, "tmp1", "a second Gen sharing the same backing counter must continue, not restart, the sequence");
+    }
 }
