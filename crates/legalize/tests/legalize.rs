@@ -205,7 +205,7 @@ fn duplicates_shared_functions_for_the_isr() {
              ret void\n\
          fn helper(void) ()\n\
            block entry:\n\
-             %h = add i8 1, 2\n\
+             %h = load i8 @in\n\
              ret void\n",
     );
     let m2 = legalize(m);
@@ -217,7 +217,7 @@ fn duplicates_shared_functions_for_the_isr() {
     let helper_isr = func("helper_isr", &m2);
     assert!(!helper_isr.isr, "the _isr copy must not be marked isr");
     match &helper_isr.blocks[0].insts[0] {
-        Inst::Bin(b) => assert_eq!(b.dst, "h", "the copy must carry helper's body"),
+        Inst::Load(l) => assert_eq!(l.dst, "h", "the copy must carry helper's body"),
         other => panic!("helper_isr must carry helper's body, got {other:?}"),
     }
     // The ISR's call targets the copy; main's call stays on the original.
@@ -733,4 +733,92 @@ fn does_not_duplicate_isr_only_runtime_routines() {
         "an ISR-only routine must NOT be duplicated: {names:?}"
     );
     assert_eq!(call_targets(func("isr", &m2)), ["__mul_u8"]);
+}
+
+// Issue #10: hand-written IR (or a compiler-generated shape clang didn't
+// fold) can reach legalize with a Bin/Icmp whose operands are both
+// Val::Const. isel has no path for this shape — several ops panic outright
+// ("constant folding not implemented" / "needs a register operand"), and
+// `sub` silently miscompiles by reading the second constant as a bogus file
+// address. Folding at legalize means isel never sees the shape at all.
+
+#[test]
+fn leaves_i1_bin_unfolded_for_isels_existing_type_guard() {
+    // i1 is icmp/fcmp's output type only. isel asserts `b.ty != Ty::I1` for
+    // Bin because arithmetic bit-widths make no sense on a 1-bit value;
+    // folding must not manufacture an out-of-range "i1" constant like 2 by
+    // treating i1 as an 8-bit width the way Ty::bytes() does.
+    let m = parse("fn main(void) ()\n  block entry:\n    %a = add i1 1, 1\n    ret void\n");
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%a = add i1 1 1"),
+        "must stay a Bin so isel's type guard still fires\n---\n{text}"
+    );
+}
+
+#[test]
+fn adds_two_constants_without_reaching_isel() {
+    let m = parse("fn main(void) ()\n  block entry:\n    %a = add i8 200, 100\n    ret void\n");
+    let text = ir::serialize(&legalize(m));
+    // 200 + 100 = 300, wraps to 44 in 8 bits.
+    assert!(text.contains("%a = freeze i8 44"), "expected folded add\n---\n{text}");
+}
+
+#[test]
+fn subtracts_two_constants_without_reaching_isel() {
+    // Previously a silent miscompile: emit_sub_const_lhs read the second
+    // constant as a file-register address instead of computing k1 - k2.
+    let m = parse("fn main(void) ()\n  block entry:\n    %a = sub i8 5, 3\n    ret void\n");
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("%a = freeze i8 2"), "expected folded sub\n---\n{text}");
+}
+
+#[test]
+fn folds_signed_division_with_truncation_toward_zero() {
+    let m = parse("fn main(void) ()\n  block entry:\n    %a = sdiv i8 -7, 2\n    ret void\n");
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("%a = freeze i8 -3"), "expected -7/2 truncated to -3\n---\n{text}");
+}
+
+#[test]
+fn folds_mul_directly_instead_of_calling_the_runtime_routine() {
+    let m = parse("fn main(void) ()\n  block entry:\n    %a = mul i8 6, 7\n    ret void\n");
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("%a = freeze i8 42"), "expected folded mul\n---\n{text}");
+    assert!(!text.contains("__mul_u8"), "must not call the runtime routine for a constant fold\n---\n{text}");
+}
+
+#[test]
+fn folds_icmp_predicates_on_two_constants() {
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n\
+         %a = icmp ult i8 3, 5\n\
+         %b = icmp sgt i8 -1, 0\n\
+         ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("%a = freeze i1 1"), "3 ult 5 is true\n---\n{text}");
+    assert!(text.contains("%b = freeze i1 0"), "-1 sgt 0 (signed) is false\n---\n{text}");
+}
+
+#[test]
+fn leaves_division_by_a_zero_constant_as_the_existing_poison_call() {
+    // Div-by-zero is LLVM poison; the runtime routine already defines the
+    // documented poison behavior, so folding must not invent a new one.
+    let m = parse("fn main(void) ()\n  block entry:\n    %a = udiv i8 5, 0\n    ret void\n");
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%a = call i8 @__udiv_u8(i8 5, i8 0)"),
+        "must fall back to the routine call, unfolded\n---\n{text}"
+    );
+}
+
+#[test]
+fn leaves_an_out_of_range_shift_count_unfolded_for_isels_existing_poison_check() {
+    let m = parse("fn main(void) ()\n  block entry:\n    %a = shl i8 5, 10\n    ret void\n");
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("%a = shl i8 5 10"),
+        "must stay a Bin so isel's poison assert still fires\n---\n{text}"
+    );
 }
