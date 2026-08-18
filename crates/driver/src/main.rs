@@ -56,6 +56,15 @@ fn main() {
     let asm = banking::assign_banks(&asm);
     let asm = peephole::optimize(&asm);
 
+    // Issue #17: the page assignment ran on pre-banking sizes; the banking
+    // pass inserts BANKSEL words that grow the text. Verify the FINAL
+    // layout's page fit — a function that grew across a page boundary has
+    // no `.org` anchor, so the assembler's backward-.org panic would never
+    // fire and it would silently straddle (label in the lower page, tail in
+    // the upper page, intra-function GOTOs misbranching). Panic loudly
+    // instead, before assembling.
+    isel::verify_page_fit(&m, &asm);
+
     // 10. asm: PIC14 assembly -> Intel HEX
     let hex = asm::assemble_file_to_hex(&asm);
     std::fs::write(hex_out, hex).expect("write hex");

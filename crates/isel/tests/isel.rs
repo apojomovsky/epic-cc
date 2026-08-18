@@ -1,4 +1,4 @@
-use isel::select;
+use isel::{select, verify_page_fit};
 use ir::parse;
 use std::collections::HashMap;
 
@@ -4294,6 +4294,88 @@ fn table_section_pinned_to_pass_a_start_after_elision() {
     assert_eq!(sim_run_asm(&asm, &[(0x20, 0)], 0x21), 0x00, "t[0]=0:\n{asm}");
     assert_eq!(sim_run_asm(&asm, &[(0x20, 3)], 0x21), 0x03, "t[3]=3:\n{asm}");
     assert_eq!(sim_run_asm(&asm, &[(0x20, 199)], 0x21), 0xC7, "t[199]=0xC7:\n{asm}");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #17: the post-banking page-fit guarantee.
+//
+// The greedy page assignment (page_step) runs on PASS-A sizes — before the
+// banking pass inserts BANKSEL words. A function that fit its page
+// pre-banking has no `.org` anchor, so when the BANKSEL growth pushes its
+// tail across a page boundary the assembler's backward-`.org` panic never
+// fires and the function silently straddles: its label resolves to the
+// lower page while its tail sits in the upper page, and its intra-function
+// GOTOs (PAGE(<func>) from the label) misbranch. `verify_page_fit` walks
+// the FINAL post-banking text and panics loudly on any straddle — exact on
+// the final layout, not the pre-banking estimate.
+// ---------------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "spans pages")]
+fn banked_growth_across_page_boundary_panics() {
+    // main's body's last word is 0x7FE (page 0, one spare word) pre-banking
+    // — a clean fit with NO `.org` anchor. The chain
+    // accumulator `main::a` sits at 0xA0 (bank 1), so banking inserts
+    // BANKSEL words that push the tail across 0x800 into page 1: the
+    // post-banking page-fit check must panic loudly (the pre-banking
+    // assignment and the backward-`.org` guard both miss it).
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %b = add i8 %1, 0\n{}\
+         \x20   store i8 %b @out\n    ret void\n",
+        pad_body(678)
+    ));
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::b", 0x26),
+        ("main::a", 0xA0), // bank 1: every chain access needs a BANKSEL
+    ]);
+    let asm = select(&m, &addrs);
+    // Pre-banking extent: start 5 (no ISR header), 8 fixed words + 678 x 3
+    // chain words = 2042 -> last occupied 0x7FE, page 0, no pad.
+    assert_eq!(label_addr(&asm, "main"), 5, "main starts after the 5-word header:\n{asm}");
+    assert_eq!(
+        asm.matches("    org ").count(),
+        1,
+        "only the header .org 0x0000 — the pre-banking fit emits no page pad:\n{asm}"
+    );
+    // The pre-banking text fits its page — the straddle is introduced by
+    // the BANKSEL growth, exactly the gap the check closes.
+    verify_page_fit(&m, &asm);
+    // Post-banking: the banked chain accesses add BANKSEL words, pushing
+    // the last occupied word to 0x802 (page 1). Must panic loudly.
+    let banked = banking::assign_banks(&asm);
+    verify_page_fit(&m, &banked);
+}
+
+#[test]
+fn banked_growth_within_page_passes() {
+    // Control: the same module with 676 pad chains — pre-banking last
+    // occupied word 0x7F8, post-banking (5 BANKSEL words of growth) 0x7FD,
+    // still page 0. The check must not false-positive on a banked program
+    // that stays in its page, and the banked program must still assemble
+    // and run.
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %b = add i8 %1, 0\n{}\
+         \x20   store i8 %b @out\n    ret void\n",
+        pad_body(676)
+    ));
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::b", 0x26),
+        ("main::a", 0xA0),
+    ]);
+    let asm = select(&m, &addrs);
+    let banked = banking::assign_banks(&asm);
+    // No panic: the extent stays inside page 0.
+    verify_page_fit(&m, &banked);
+    // The banked program really runs: out = in + 0 = in.
+    assert_eq!(sim_run_asm(&banked, &[(0x20, 7)], 0x21), 7, "banked program must run:\n{banked}");
 }
 
 // ---------------------------------------------------------------------------

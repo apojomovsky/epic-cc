@@ -4437,6 +4437,118 @@ fn page_step(addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usi
     (pad, start / 0x800, start + size)
 }
 
+/// Verify the FINAL post-banking layout's page fit (issue #17): every
+/// function must lie entirely inside one 2048-word page, or its label
+/// resolves to the lower page while its later words sit in the upper one
+/// and its intra-function GOTOs (`PAGE(<func>)` from the label) misbranch.
+///
+/// The greedy assignment (`page_step`) runs on pass-A sizes — before the
+/// banking pass inserts BANKSEL words that grow the text — and its `.org`
+/// pads only pin page bases, so a function that grew across a boundary has
+/// no anchor and the assembler's backward-`.org` panic never fires. This
+/// check walks the final text (the exact layout the assembler will place)
+/// with the same pass-1 semantics `asm::assemble` uses — `.org` jumps,
+/// `.align N` pads to N-word boundaries, labels take no words, `equ`/
+/// `.table`/`list`/`radix`/`end` emit none — tracks each function's actual
+/// extent from its label to the next function's label (or the program end),
+/// and panics loudly on any straddle or page overflow. `__start` and the
+/// const-table reader entries are checked the same way (a reader is the
+/// target of `PAGE(__read_<name>)` sets, so it must not straddle either).
+///
+/// The extent measure is conservative in the safe direction: the next
+/// function's label is the FIRST word the current function cannot own, and
+/// nothing in between (an `.org` pad, a `.align`) belongs to the function
+/// whose label precedes it — so a function that ends exactly at a page
+/// boundary (its last word is the boundary page's last word) passes, and
+/// only a true straddle panics. The check runs on the post-peephole text
+/// in the driver pipeline, so every pass that can move words is covered.
+pub fn verify_page_fit(m: &Module, asm: &str) {
+    let funcs: Vec<&str> = m.funcs.iter().map(|f| f.name.as_str()).collect();
+    // `__read_<name>` / `__read_<name>_hi` reader entries: CALL targets of
+    // `PAGE(__read_*)` sets, so each must lie inside one page too.
+    let mut readers: Vec<String> = Vec::new();
+    for g in &m.globals {
+        if g.is_const {
+            readers.push(format!("__read_{}", g.name));
+            if g.bytes.len() >= 256 {
+                readers.push(format!("__read_{}_hi", g.name));
+            }
+        }
+    }
+    let mut org = 0usize;
+    let mut cur: Option<(String, usize)> = None;
+    let mut check = |name: &str, s: usize, e: usize| {
+        if e <= s {
+            return; // empty extent (a label with no words before the next target)
+        }
+        let last = e - 1;
+        if last / 0x800 != s / 0x800 {
+            panic!(
+                "isel: post-banking page-fit failure: {name} spans pages (0x{s:04X}-0x{last:04X}) — the banking pass grew it across a page boundary; its label resolves to page {} while its tail sits in page {}",
+                s / 0x800,
+                last / 0x800
+            );
+        }
+    };
+    for raw in asm.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("org ") {
+            let target = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
+            if let Some((name, s)) = &cur {
+                check(name, *s, target);
+            }
+            cur = None;
+            org = target;
+            continue;
+        }
+        if line.starts_with("end") {
+            break;
+        }
+        if let Some(l) = line.strip_suffix(':') {
+            let name = l.trim().to_string();
+            let is_target = funcs.contains(&name.as_str())
+                || name == "__start"
+                || readers.contains(&name);
+            if is_target {
+                if let Some((prev, s)) = &cur {
+                    check(prev, *s, org);
+                }
+                cur = Some((name, org));
+            }
+            // Internal (block) labels keep the current target's extent open:
+            // the words after them still belong to the function whose label
+            // opened the extent.
+            continue;
+        }
+        if line.contains(" equ ") {
+            continue;
+        }
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n: usize = n.trim().parse().unwrap();
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        if line.starts_with(".table ") {
+            // The const-table DATA begins here. Table bytes may legitimately
+            // straddle a page boundary (reads are 256-byte-window based, not
+            // page based — the reader's computed jump reaches across), so the
+            // reader entry's extent must END here, not include the table.
+            if let Some((name, s)) = &cur {
+                check(name, *s, org);
+            }
+            cur = None;
+            continue;
+        }
+        org += 1;
+    }
+    if let Some((name, s)) = &cur {
+        check(name, *s, org);
+    }
+}
+
 /// The const-table section's reader entries and the page PCLATH<4:3> holds
 /// after each CALL returns: a reader writes `MOVLW HIGH(<base>); MOVWF
 /// PCLATH` before its computed jump, so PCLATH's page bits are the TABLE
