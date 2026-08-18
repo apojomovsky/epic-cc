@@ -111,3 +111,24 @@ fn literal_instructions_encode_correctly() {
         assert_eq!(words, vec![*expected], "encoding {src}");
     }
 }
+
+#[test]
+fn fixed_encoding_control_instructions() {
+    let cases: &[(&str, u16)] = &[
+        ("CLRWDT", 0x0004),
+        ("PUSH", 0x0005),
+        ("POP", 0x0006),
+        ("DAW", 0x0007),
+        ("RETFIE", 0x0010),
+        ("RETFIE FAST", 0x0011),
+        ("RETURN", 0x0012),
+        ("RETURN FAST", 0x0013),
+        ("SLEEP", 0x0003),
+        ("RESET", 0x00FF),
+        ("MOVLB 5", 0x0105),
+    ];
+    for (src, expected) in cases {
+        let words = assemble_pic18(&format!("    {src}\n"));
+        assert_eq!(words, vec![*expected], "encoding {src}");
+    }
+}

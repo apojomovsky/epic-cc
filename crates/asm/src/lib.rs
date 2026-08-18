@@ -277,6 +277,21 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             };
             vec![base | k]
         }
+        "CLRWDT" => vec![0x0004],
+        "PUSH" => vec![0x0005],
+        "POP" => vec![0x0006],
+        "DAW" => vec![0x0007],
+        "SLEEP" => vec![0x0003],
+        "RESET" => vec![0x00FF],
+        "RETFIE" | "RETURN" => {
+            let s: u16 = if rest.eq_ignore_ascii_case("FAST") { 1 } else { 0 };
+            let base: u16 = if mne == "RETFIE" { 0x0010 } else { 0x0012 };
+            vec![base | s]
+        }
+        "MOVLB" => {
+            let k = (parse_lit(rest, symbols) & 0xF) as u16;
+            vec![0x0100 | k]
+        }
         other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
     }
 }
