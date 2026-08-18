@@ -21,7 +21,7 @@
 //! F877A SFR at RAM[0x06] (the same alloc layout the driver used).
 //!
 //! The sim run drives the same scenario as the e2e (crates/driver/tests/
-//! interrupt_e2e.rs): fire the interrupt at main's word 79 (the `%2 = load
+//! interrupt_e2e.rs): fire the interrupt at main's word 77 (the `%2 = load
 //! out` for `out = bump(out)`, right after the `PORTB = 0x11` store), so
 //! the ISR bumps out 0x10 -> 0x11 before main's bump reads it; main
 //! completes 0x11 -> 0x12 -> 0x13 -> 0x16 and PORTB = 0x22, then the
@@ -31,10 +31,10 @@ use pic14_sim::{parse_hex, Pic14};
 use std::collections::HashMap;
 use std::process::Command;
 
-/// The interrupt vector (word 4) and the injection point (word 79) as
+/// The interrupt vector (word 4) and the injection point (word 77) as
 /// documented in crates/driver/tests/interrupt_e2e.rs.
 const VECTOR: u16 = 4;
-const INJECT_PC: u16 = 79;
+const INJECT_PC: u16 = 77;
 
 fn gpasm() -> String {
     std::env::var("PIC8_GPASM").unwrap_or_else(|_| "gpasm".into())
@@ -151,7 +151,7 @@ fn interrupt_hex_matches_gpasm_and_runs() {
     let theirs = std::fs::read_to_string(format!("{dir}/interrupt_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator exactly like the e2e: in = 0x10, fire at
-    // word 79 -> out = 0x16, PORTB = 0x22, halted.
+    // word 77 -> out = 0x16, PORTB = 0x22, halted.
     let mut p = Pic14::new(parse_hex(&ours));
     p.ram_mut()[0x21] = 0x10; // in
     let mut steps = 0usize;

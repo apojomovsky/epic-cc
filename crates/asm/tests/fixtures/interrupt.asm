@@ -44,8 +44,6 @@ isr:
     MOVWF PCLATH
     CALL bump_isr
     MOVF 0x71, W
-    BCF STATUS, 5
-    BCF STATUS, 6
     MOVWF 0x2D
     MOVF 0x2D, W
     MOVWF 0x20
@@ -101,8 +99,6 @@ main:
     MOVWF PCLATH
     CALL bump
     MOVF 0x71, W
-    BCF STATUS, 5
-    BCF STATUS, 6
     MOVWF 0x24
     MOVF 0x24, W
     MOVWF 0x20
@@ -119,8 +115,6 @@ main:
     MOVWF 0x2A
     CALL bump
     MOVF 0x71, W
-    BCF STATUS, 5
-    BCF STATUS, 6
     MOVWF 0x28
     MOVF 0x27, W
     ADDWF 0x28, W
