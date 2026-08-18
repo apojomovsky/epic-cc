@@ -262,6 +262,21 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             };
             vec![base | b << 9 | a << 8 | f]
         }
+        "SUBLW" | "IORLW" | "XORLW" | "ANDLW" | "RETLW" | "MULLW" | "MOVLW" | "ADDLW" => {
+            let k = (parse_lit(rest, symbols) & 0xFF) as u16;
+            let base: u16 = match mne.as_str() {
+                "SUBLW" => 0x0800,
+                "IORLW" => 0x0900,
+                "XORLW" => 0x0A00,
+                "ANDLW" => 0x0B00,
+                "RETLW" => 0x0C00,
+                "MULLW" => 0x0D00,
+                "MOVLW" => 0x0E00,
+                "ADDLW" => 0x0F00,
+                _ => unreachable!(),
+            };
+            vec![base | k]
+        }
         other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
     }
 }

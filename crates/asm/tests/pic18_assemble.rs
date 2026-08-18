@@ -93,3 +93,21 @@ fn bit_oriented_instructions_encode_correctly() {
         assert_eq!(words, vec![*expected], "encoding {src}");
     }
 }
+
+#[test]
+fn literal_instructions_encode_correctly() {
+    let cases: &[(&str, u16)] = &[
+        ("SUBLW 0x42", 0x0842),
+        ("IORLW 0x42", 0x0942),
+        ("XORLW 0x42", 0x0A42),
+        ("ANDLW 0x42", 0x0B42),
+        ("RETLW 0x42", 0x0C42),
+        ("MULLW 0x42", 0x0D42),
+        ("MOVLW 0x42", 0x0E42),
+        ("ADDLW 0x42", 0x0F42),
+    ];
+    for (src, expected) in cases {
+        let words = assemble_pic18(&format!("    {src}\n"));
+        assert_eq!(words, vec![*expected], "encoding {src}");
+    }
+}
