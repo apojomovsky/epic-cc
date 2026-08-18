@@ -525,12 +525,22 @@ impl Pic18 {
         let next = match word {
             0x0000 => pc + 2,
             // MUST precede the byte-oriented arm below: 0x0800..=0x0FFF is
-            // numerically inside 0x0200..=0x6FFF. Only MOVLW is implemented
-            // here so far (needed to set up test state ahead of Task 14,
-            // which completes the rest of this group with its own tests).
+            // numerically inside 0x0200..=0x6FFF.
             _ if (0x0800..=0x0FFF).contains(&word) => self.exec_literal(pc, word),
             _ if (0x0200..=0x6FFF).contains(&word) => self.exec_byte(pc, word),
             _ if (0x7000..=0xBFFF).contains(&word) => self.exec_bit(pc, word),
+            _ if (0xE000..=0xE7FF).contains(&word) => self.exec_cond_branch(pc, word),
+            _ if (0xD000..=0xDFFF).contains(&word) => self.exec_bra_rcall(pc, word),
+            0xC000..=0xCFFF => {
+                let w2 = self.prog[(pc / 2) as usize + 1];
+                self.exec_movff(pc, word, w2)
+            }
+            0xEC00..=0xEFFF => {
+                let w2 = self.prog[(pc / 2) as usize + 1];
+                self.exec_goto_call_lfsr(pc, word, w2)
+            }
+            0x0010 | 0x0011 => self.exec_retfie(),
+            0x0012 | 0x0013 => self.pop_return(),
             _ => panic!("sim(pic18): opcode {word:#06x} not yet implemented"),
         };
         self.pc = next;
@@ -838,8 +848,103 @@ impl Pic18 {
         }
         pc + 2
     }
+    /// `TOSU`/`TOSH`/`TOSL`/`STKPTR` (`0xFFF`/`0xFFE`/`0xFFD`/`0xFFC`) are
+    /// real physical SFRs on hardware (not just a simulator convenience),
+    /// so `push_return`/`pop_return` keep them in sync in `self.ram` on
+    /// every call — `self.stack` is only the internal push/pop mechanism.
+    fn sync_stack_sfrs(&mut self) {
+        self.ram[0xFFC] = self.stack.len() as u8;
+        let top = self.stack.last().copied().unwrap_or(0);
+        self.ram[0xFFD] = (top & 0xFF) as u8;
+        self.ram[0xFFE] = ((top >> 8) & 0xFF) as u8;
+        self.ram[0xFFF] = ((top >> 16) & 0xFF) as u8;
+    }
+    fn push_return(&mut self, addr: u32) {
+        assert!(self.stack.len() < 31, "sim(pic18): call stack overflow (depth 31)");
+        self.stack.push(addr);
+        self.sync_stack_sfrs();
+    }
     fn pop_return(&mut self) -> u32 {
-        self.stack.pop().unwrap_or(0)
+        let addr = self.stack.pop().unwrap_or(0);
+        self.sync_stack_sfrs();
+        addr
+    }
+
+    fn exec_cond_branch(&mut self, pc: u32, word: u16) -> u32 {
+        let n = (word & 0xFF) as i8 as i32;
+        let status = self.ram[self.status_addr()];
+        let taken = match (word >> 8) & 0x7 {
+            0 => status & 0x04 != 0, // BZ: Z set
+            1 => status & 0x04 == 0, // BNZ
+            2 => status & 0x01 != 0, // BC
+            3 => status & 0x01 == 0, // BNC
+            4 => status & 0x08 != 0, // BOV
+            5 => status & 0x08 == 0, // BNOV
+            6 => status & 0x10 != 0, // BN
+            7 => status & 0x10 == 0, // BNN
+            _ => unreachable!(),
+        };
+        if taken {
+            let next_word = (pc / 2) as i32 + 1 + n;
+            (next_word as u32) * 2
+        } else {
+            pc + 2
+        }
+    }
+
+    fn exec_bra_rcall(&mut self, pc: u32, word: u16) -> u32 {
+        let raw = word & 0x7FF;
+        let n = if raw & 0x400 != 0 { (raw as i32) - 0x800 } else { raw as i32 }; // sign-extend 11 bits
+        let is_call = word & 0x0800 != 0;
+        let next_word = (pc / 2) as i32 + 1 + n;
+        if is_call {
+            self.push_return(pc + 2);
+        }
+        (next_word as u32) * 2
+    }
+
+    fn exec_goto_call_lfsr(&mut self, pc: u32, word: u16, word2: u16) -> u32 {
+        let k12 = (word2 & 0xFFF) as u32;
+        match word & 0xFF00 {
+            0xEF00 => {
+                let k = (k12 << 8) | (word & 0xFF) as u32;
+                k * 2 // word address -> byte address
+            }
+            0xEC00 | 0xED00 => {
+                let k = (k12 << 8) | (word & 0xFF) as u32;
+                self.push_return(pc + 4);
+                k * 2
+            }
+            0xEE00 => {
+                let fsr = ((word >> 4) & 0x3) as usize;
+                let k = ((word & 0xF) as u16) << 8 | (word2 & 0xFF);
+                let (lo_addr, hi_addr) = match fsr {
+                    0 => (0xFE9, 0xFEA),
+                    1 => (0xFE1, 0xFE2),
+                    2 => (0xFD9, 0xFDA),
+                    _ => unreachable!(),
+                };
+                self.ram[lo_addr] = (k & 0xFF) as u8;
+                self.ram[hi_addr] = (k >> 8) as u8;
+                pc + 4
+            }
+            _ => panic!("sim(pic18): unrecognized two-word opcode {word:#06x}"),
+        }
+    }
+
+    fn exec_movff(&mut self, pc: u32, word: u16, word2: u16) -> u32 {
+        let src = (word & 0xFFF) as usize;
+        let dst = (word2 & 0xFFF) as usize;
+        self.ram[dst] = self.ram[src];
+        pc + 4
+    }
+
+    /// RETFIE also restores GIE/GIEH from the shadow saved on interrupt
+    /// entry — no interrupt-entry modelling exists yet in this plan (P1
+    /// has no ISR support requirement), so for now RETFIE behaves like
+    /// RETURN. Revisit when interrupt modelling is added for PIC18.
+    fn exec_retfie(&mut self) -> u32 {
+        self.pop_return()
     }
 
     fn status_addr(&self) -> usize {

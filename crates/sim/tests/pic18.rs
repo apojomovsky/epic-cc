@@ -364,5 +364,49 @@ fn andlw_ands_into_w() {
     assert_eq!(p.w(), 0x0F);
 }
 
-// RETLW's test is deferred to Task 15 — meaningfully testing "return and
-// load W" needs a real CALL/stack first, which doesn't exist until then.
+#[test]
+fn call_pushes_return_address_and_goto_jumps_unconditionally() {
+    let src = "    CALL sub\n    NOP\n    GOTO fin\nsub:\n    RETURN\nfin:\n    NOP\n";
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(20);
+    assert!(p.halted());
+}
+
+#[test]
+fn rcall_and_bra_and_conditional_branches_execute() {
+    let src = "here:\n    MOVLW 0\n    BTFSC 0xFD8,2,A\n    BRA here\n    RCALL sub\n    BRA fin\nsub:\n    RETURN\nfin:\n    NOP\n";
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(20);
+    assert!(p.halted());
+}
+
+#[test]
+fn retlw_returns_and_loads_w() {
+    // `sub:` sits right after the main flow with no separating halt, so
+    // this only runs exactly the two real steps (CALL, then RETLW) rather
+    // than relying on `halted()` — falling through past RETLW would just
+    // re-enter `sub` with an empty stack, which isn't what this test is
+    // about.
+    let src = "    CALL sub\n    NOP\nsub:\n    RETLW 0x42\n";
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.w(), 0x42);
+}
+
+#[test]
+fn stkptr_and_tos_registers_reflect_the_call_stack() {
+    let src = "    CALL sub\n    NOP\nsub:\n    NOP\n";
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(1); // execute the CALL only
+    assert_eq!(p.ram()[0xFFC], 1, "STKPTR == 1 after one CALL");
+    // CALL is a 2-word (4-byte) instruction, so the return address pushed
+    // is CALL's own address + 4, not +2. TOSL/TOSH/TOSU hold it split into
+    // bytes.
+    assert_eq!(p.ram()[0xFFD], 4);
+    assert_eq!(p.ram()[0xFFE], 0);
+    assert_eq!(p.ram()[0xFFF], 0);
+}
