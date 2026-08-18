@@ -78,6 +78,54 @@ fn i8_binop_dest_at_banked_address_routes_through_operand_with_bank_suffix() {
 }
 
 #[test]
+fn i16_add_uses_addwfc_for_the_high_byte() {
+    let m = parse("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = add i16 %1, %2\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("main::1", 0x14), ("main::2", 0x16), ("main::3", 0x18)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("ADDWF") && asm.contains("ADDWFC"), "low byte plain add, high byte with carry:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    // seed a=0x00FF, b=0x0001 -> 0x0100, exercises the carry chain.
+    p.ram_mut()[0x10] = 0xFF;
+    p.ram_mut()[0x11] = 0x00;
+    p.ram_mut()[0x12] = 0x01;
+    p.ram_mut()[0x13] = 0x00;
+    p.run(200);
+    assert_eq!(p.ram()[0x18], 0x00);
+    assert_eq!(p.ram()[0x19], 0x01);
+}
+
+#[test]
+fn i16_sub_uses_subfwb_for_the_high_byte() {
+    let m = parse("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = sub i16 %1, %2\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("main::1", 0x14), ("main::2", 0x16), ("main::3", 0x18)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    // 0x0100 - 0x0001 = 0x00FF, exercises the borrow chain.
+    p.ram_mut()[0x10] = 0x00;
+    p.ram_mut()[0x11] = 0x01;
+    p.ram_mut()[0x12] = 0x01;
+    p.ram_mut()[0x13] = 0x00;
+    p.run(200);
+    assert_eq!(p.ram()[0x18], 0xFF);
+    assert_eq!(p.ram()[0x19], 0x00);
+}
+
+#[test]
+fn i16_bitwise_ops_apply_independently_per_byte() {
+    for (op, mne) in [("and", "ANDWF"), ("or", "IORWF"), ("xor", "XORWF")] {
+        let m = parse(&format!(
+            "global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = {op} i16 %1, %2\n    ret void\n"
+        ));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("main::1", 0x14), ("main::2", 0x16), ("main::3", 0x18)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        // Both bytes use the same plain (non-carry) mnemonic, applied twice.
+        assert_eq!(asm.matches(mne).count(), 2, "{op}:\n{asm}");
+    }
+}
+
+#[test]
 #[should_panic(expected = "const-LHS")]
 fn i8_binop_const_lhs_is_rejected_not_silently_miscompiled() {
     // `val_addr` maps `Val::Const(k)` to `Slot::Direct(k & 0xFF)` — treating

@@ -142,7 +142,8 @@ impl<'m> Gen<'m> {
                 self.emit_move_val_to_slot(&s.val, s.ty, dst);
             }
             Inst::Bin(b) => {
-                assert_eq!(b.ty.bytes(), 1, "isel-pic18: only i8 Bin ops implemented so far (Task 6 adds i16)");
+                let n = b.ty.bytes();
+                assert!(n == 1 || n == 2, "isel-pic18: only i8/i16 Bin ops implemented (n={n})");
                 // `b.a` is resolved via `val_addr`, which treats a
                 // `Val::Const` as a RAM ADDRESS (`Slot::Direct(k & 0xFF)`)
                 // rather than a literal to load — a constant on the LHS
@@ -161,38 +162,52 @@ impl<'m> Gen<'m> {
                     !matches!(b.a, Val::Const(_)),
                     "isel-pic18: const-LHS Bin (constant as the first operand) not yet supported — needs the isel::emit_sub_const_lhs-equivalent handling"
                 );
-                let mne = match b.op {
-                    ir::BinOp::Add => "ADDWF",
-                    ir::BinOp::Sub => "SUBWF",
-                    ir::BinOp::And => "ANDWF",
-                    ir::BinOp::Or => "IORWF",
-                    ir::BinOp::Xor => "XORWF",
-                    other => panic!("isel-pic18: Bin op {other:?} not yet implemented (Task 6+)"),
-                };
-                // SUBWF computes f - W; the IR's `sub a, b` is `a - b`, so
-                // `a` must be `f` and `b` must go into `W` first.
-                self.emit_load_w(&b.b);
                 let av = self.val_addr(&b.a).direct();
-                let (aacc, af) = self.operand(av);
-                let abank = if aacc == 0 { "A" } else { "B" };
-                self.emit(format!("    {mne} 0x{af:03X},W,{abank}"));
                 let dst = self.slot_addr(self.cur_func, &b.dst).direct();
-                let (dacc, df) = self.operand(dst);
-                let dbank = if dacc == 0 { "A" } else { "B" };
-                self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                for i in 0..n {
+                    // SUBWF computes f - W; the IR's `sub a, b` is `a - b`,
+                    // so `a` must be `f` and `b` must go into `W` first.
+                    self.emit_load_w(&b.b, i);
+                    // Byte 0 of add/sub is a plain ADDWF/SUBWF; every byte
+                    // past it must fold in the carry/borrow from the
+                    // previous byte via ADDWFC/SUBFWB. and/or/xor apply
+                    // independently per byte and never use the carry form.
+                    let carry = i > 0 && matches!(b.op, ir::BinOp::Add | ir::BinOp::Sub);
+                    let mne = match (b.op, carry) {
+                        (ir::BinOp::Add, false) => "ADDWF",
+                        (ir::BinOp::Add, true) => "ADDWFC",
+                        (ir::BinOp::Sub, false) => "SUBWF",
+                        (ir::BinOp::Sub, true) => "SUBFWB",
+                        (ir::BinOp::And, _) => "ANDWF",
+                        (ir::BinOp::Or, _) => "IORWF",
+                        (ir::BinOp::Xor, _) => "XORWF",
+                        (other, _) => panic!("isel-pic18: Bin op {other:?} not yet implemented (Task 6+)"),
+                    };
+                    let (aacc, af) = self.operand(av + u16::from(i));
+                    let abank = if aacc == 0 { "A" } else { "B" };
+                    self.emit(format!("    {mne} 0x{af:03X},W,{abank}"));
+                    let (dacc, df) = self.operand(dst + u16::from(i));
+                    let dbank = if dacc == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                }
             }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }
 
-    /// Load any `Val` into `W` — a constant via `MOVLW`, a register/global
-    /// via `MOVF ...,W` (which needs the access bit, same as any other
+    /// Load byte `offset` of any `Val` into `W` — a constant via `MOVLW`
+    /// (shifting the literal right by `offset*8` bytes first), a
+    /// register/global via `MOVF ...,W` at the resolved address plus
+    /// `offset` (which needs the access bit, same as any other
     /// `W`-routing instruction).
-    fn emit_load_w(&mut self, v: &Val) {
+    fn emit_load_w(&mut self, v: &Val, offset: u8) {
         match v {
-            Val::Const(k) => self.emit(format!("    MOVLW 0x{:02X}", (*k & 0xFF) as u8)),
+            Val::Const(k) => {
+                let byte = ((*k >> (u32::from(offset) * 8)) & 0xFF) as u8;
+                self.emit(format!("    MOVLW 0x{byte:02X}"));
+            }
             _ => {
-                let addr = self.val_addr(v).direct();
+                let addr = self.val_addr(v).direct() + u16::from(offset);
                 let (a, f) = self.operand(addr);
                 let bank = if a == 0 { "A" } else { "B" };
                 self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
@@ -227,12 +242,20 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             tmp: &mut tmp,
             out: Vec::new(),
         };
-        // Block/label emission arrives in Task 12 (the index-based scheme
-        // `isel::select` uses: the first block gets the bare function name,
-        // every other block gets `{func}_L{label}`); this skeleton only
-        // walks each block's instructions, so no label is emitted yet —
-        // including for the entry block.
-        for b in &f.blocks {
+        // Full multi-block label emission (every non-entry block getting
+        // `{func}_L{label}`) arrives in Task 12. But `__start` already
+        // unconditionally emits `call main` above, and Task 6 is the first
+        // task whose tests actually assemble+simulate the generated code
+        // (rather than just checking the asm text), which exposed that gap:
+        // without a `main:` label, `call main` is an unresolved symbol and
+        // assembly fails outright. So the entry (first) block gets its
+        // label — the bare function name — here now, matching the target
+        // scheme's rule for the first block; the "every other block" half
+        // of the scheme is still deferred to Task 12.
+        for (bi, b) in f.blocks.iter().enumerate() {
+            if bi == 0 {
+                g.emit(format!("{}:", f.name));
+            }
             for inst in &b.insts {
                 g.emit_inst(inst);
             }
