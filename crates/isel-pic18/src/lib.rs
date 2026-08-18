@@ -143,6 +143,24 @@ impl<'m> Gen<'m> {
             }
             Inst::Bin(b) => {
                 assert_eq!(b.ty.bytes(), 1, "isel-pic18: only i8 Bin ops implemented so far (Task 6 adds i16)");
+                // `b.a` is resolved via `val_addr`, which treats a
+                // `Val::Const` as a RAM ADDRESS (`Slot::Direct(k & 0xFF)`)
+                // rather than a literal to load — a constant on the LHS
+                // (e.g. `sub i8 5, %x`, which clang can emit directly from
+                // `5 - x`, and which the differential fuzzer generates) would
+                // silently read whatever byte lives at that address instead
+                // of using the literal. `b.b`'s RHS is fine: it always goes
+                // through `emit_load_w`, which loads a `Val::Const` via
+                // `MOVLW`. This mirrors the const-LHS hazard PIC14's `isel`
+                // already had to guard against (see `emit_sub_const_lhs`,
+                // `crates/isel/src/lib.rs:1598-1609`, and `emit_commutative`,
+                // `crates/isel/src/lib.rs:1100-1106`) — full canonicalization
+                // isn't this task's job, so fail loudly instead of
+                // miscompiling silently, until a later task adds it.
+                assert!(
+                    !matches!(b.a, Val::Const(_)),
+                    "isel-pic18: const-LHS Bin (constant as the first operand) not yet supported — needs the isel::emit_sub_const_lhs-equivalent handling"
+                );
                 let mne = match b.op {
                     ir::BinOp::Add => "ADDWF",
                     ir::BinOp::Sub => "SUBWF",
