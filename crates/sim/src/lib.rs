@@ -541,6 +541,10 @@ impl Pic18 {
             }
             0x0010 | 0x0011 => self.exec_retfie(),
             0x0012 | 0x0013 => self.pop_return(),
+            0x0100..=0x010F => {
+                self.ram[0xFE0] = (word & 0xF) as u8; // MOVLB: loads BSR
+                pc + 2
+            }
             _ => panic!("sim(pic18): opcode {word:#06x} not yet implemented"),
         };
         self.pc = next;
@@ -630,6 +634,13 @@ impl Pic18 {
                 if self.read_f(a, f) == 0 {
                     return self.skip_pc(pc + 2);
                 }
+                return pc + 2;
+            }
+            0x0200 => {
+                // MULWF: unsigned 8x8 -> 16-bit product in PRODH:PRODL
+                let prod = (self.w as u16) * (self.read_f(a, f) as u16);
+                self.ram[0xFF3] = (prod & 0xFF) as u8; // PRODL
+                self.ram[0xFF4] = (prod >> 8) as u8; // PRODH
                 return pc + 2;
             }
             _ => {}
@@ -792,9 +803,18 @@ impl Pic18 {
         let f = word & 0xFF;
         let b = (word >> 9) & 0x7;
         match (word >> 12) & 0xF {
-            0x7 => self.write_f(a, f, self.read_f(a, f) ^ (1 << b)), // BTG
-            0x8 => self.write_f(a, f, self.read_f(a, f) | (1 << b)), // BSF
-            0x9 => self.write_f(a, f, self.read_f(a, f) & !(1 << b)), // BCF
+            0x7 => {
+                let v = self.read_f(a, f);
+                self.write_f(a, f, v ^ (1 << b)); // BTG
+            }
+            0x8 => {
+                let v = self.read_f(a, f);
+                self.write_f(a, f, v | (1 << b)); // BSF
+            }
+            0x9 => {
+                let v = self.read_f(a, f);
+                self.write_f(a, f, v & !(1 << b)); // BCF
+            }
             0xA => {
                 if self.read_f(a, f) & (1 << b) != 0 {
                     return self.skip_pc(pc + 2); // BTFSS: skip if set
@@ -836,7 +856,12 @@ impl Pic18 {
                 self.w = k;
                 return self.pop_return();
             }
-            0xD => panic!("sim(pic18): MULLW deferred to Task 16 (needs PRODH/PRODL)"),
+            0xD => {
+                // MULLW: unsigned 8x8 -> 16-bit product in PRODH:PRODL
+                let prod = (self.w as u16) * (k as u16);
+                self.ram[0xFF3] = (prod & 0xFF) as u8; // PRODL
+                self.ram[0xFF4] = (prod >> 8) as u8; // PRODH
+            }
             0xE => self.w = k, // MOVLW
             0xF => {
                 // ADDLW: W + k
@@ -947,7 +972,7 @@ impl Pic18 {
         self.pop_return()
     }
 
-    fn status_addr(&self) -> usize {
+    fn status_addr(&mut self) -> usize {
         self.resolve_f(0, 0xD8)
     }
     fn set_z(&mut self, v: u8) {
@@ -1001,7 +1026,7 @@ impl Pic18 {
         self.set_dc(((a & 0x0F) as u16 + (b & 0x0F) as u16) > 0x0F);
         self.set_ov(((a ^ r) & (b ^ r) & 0x80) != 0);
     }
-    fn get_c(&self) -> bool {
+    fn get_c(&mut self) -> bool {
         self.ram[self.status_addr()] & 0x01 != 0
     }
     /// `a + b + cin`, setting C/DC/OV for the 3-operand add and returning
@@ -1025,23 +1050,63 @@ impl Pic18 {
     }
 
     /// Resolve a byte/bit-oriented `(a, f)` pair to its physical 12-bit
-    /// address. `a=0` (access bank): `f<=0x5F` -> `f` (low access,
-    /// `0x000-0x05F`); `f>0x5F` -> `0xF00+f` (high access/SFR,
+    /// address. Indirect addressing registers (`INDFn`/`POSTINCn`/
+    /// `POSTDECn`/`PREINCn`/`PLUSWn`) are checked first — each reads/writes
+    /// through the matching `FSRn`, with the side effect (advance/retreat
+    /// FSRn) happening here so every caller (`read_f`, `write_f`) gets it
+    /// for free. Otherwise: `a=0` (access bank): `f<=0x5F` -> `f` (low
+    /// access, `0x000-0x05F`); `f>0x5F` -> `0xF00+f` (high access/SFR,
     /// `0xF60-0xFFF`). `a=1` (banked): `(BSR<<8)|f`. This split is a core
     /// PIC18 architecture invariant (see the plan's reference section),
     /// hard-coded here exactly as `Pic14::bank_base` hard-codes RP1:RP0.
-    fn resolve_f(&self, a: u16, f: u16) -> usize {
-        if a == 0 {
-            if f <= 0x5F {
-                f as usize
-            } else {
-                0xF00 + f as usize
+    fn resolve_f(&mut self, a: u16, f: u16) -> usize {
+        let (fsrn_lo, fsrn_hi, indf, postinc, postdec, preinc) = match f {
+            0xEF | 0xEE | 0xED | 0xEC | 0xEB => (0xE9, 0xEA, 0xEF, 0xEE, 0xED, 0xEC), // FSR0
+            0xE7 | 0xE6 | 0xE5 | 0xE4 | 0xE3 => (0xE1, 0xE2, 0xE7, 0xE6, 0xE5, 0xE4), // FSR1
+            0xDF | 0xDE | 0xDD | 0xDC | 0xDB => (0xD9, 0xDA, 0xDF, 0xDE, 0xDD, 0xDC), // FSR2
+            _ => {
+                return if a == 0 {
+                    if f <= 0x5F {
+                        f as usize
+                    } else {
+                        0xF00 + f as usize
+                    }
+                } else {
+                    ((self.ram[0xFE0] as usize) << 8) | f as usize
+                };
             }
-        } else {
-            ((self.ram[0xFE0] as usize) << 8) | f as usize
+        };
+        let lo_addr = 0xF00 + fsrn_lo;
+        let hi_addr = 0xF00 + fsrn_hi;
+        let cur = ((self.ram[hi_addr] as u16) << 8) | self.ram[lo_addr] as u16;
+        match f {
+            _ if f == indf => cur as usize,
+            _ if f == postinc => {
+                let next = cur.wrapping_add(1);
+                self.ram[lo_addr] = (next & 0xFF) as u8;
+                self.ram[hi_addr] = (next >> 8) as u8;
+                cur as usize
+            }
+            _ if f == postdec => {
+                let next = cur.wrapping_sub(1);
+                self.ram[lo_addr] = (next & 0xFF) as u8;
+                self.ram[hi_addr] = (next >> 8) as u8;
+                cur as usize
+            }
+            _ if f == preinc => {
+                let next = cur.wrapping_add(1);
+                self.ram[lo_addr] = (next & 0xFF) as u8;
+                self.ram[hi_addr] = (next >> 8) as u8;
+                next as usize
+            }
+            _ => {
+                // PLUSWn: cur + (signed W), no side effect on FSRn.
+                let offset = self.w as i8 as i32;
+                ((cur as i32) + offset) as usize
+            }
         }
     }
-    fn read_f(&self, a: u16, f: u16) -> u8 {
+    fn read_f(&mut self, a: u16, f: u16) -> u8 {
         self.ram[self.resolve_f(a, f)]
     }
     fn write_f(&mut self, a: u16, f: u16, v: u8) {

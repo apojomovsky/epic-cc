@@ -410,3 +410,81 @@ fn stkptr_and_tos_registers_reflect_the_call_stack() {
     assert_eq!(p.ram()[0xFFE], 0);
     assert_eq!(p.ram()[0xFFF], 0);
 }
+
+#[test]
+fn indf0_reads_and_writes_through_fsr0() {
+    let src = "    LFSR 0, 0x55\n    MOVLW 0x42\n    MOVWF 0xFEF,A\n"; // MOVWF INDF0
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x55], 0x42);
+}
+
+#[test]
+fn postinc0_writes_then_advances_fsr0() {
+    let src = "    LFSR 0, 0x55\n    MOVLW 0x42\n    MOVWF 0xFEE,A\n"; // MOVWF POSTINC0
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x55], 0x42);
+    assert_eq!(p.ram()[0xFE9], 0x56, "FSR0L advanced to 0x56");
+}
+
+#[test]
+fn preinc0_advances_then_writes() {
+    let src = "    LFSR 0, 0x55\n    MOVLW 0x42\n    MOVWF 0xFEC,A\n"; // MOVWF PREINC0
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x56], 0x42);
+    assert_eq!(p.ram()[0x55], 0);
+}
+
+#[test]
+fn postdec0_writes_then_decrements() {
+    let src = "    LFSR 0, 0x55\n    MOVLW 0x42\n    MOVWF 0xFED,A\n"; // MOVWF POSTDEC0
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x55], 0x42);
+    assert_eq!(p.ram()[0xFE9], 0x54);
+}
+
+#[test]
+fn plusw0_reads_fsr0_plus_signed_w_without_side_effect() {
+    let src = "    LFSR 0, 0x55\n    MOVLW 0x42\n    MOVWF 0x56,A\n    MOVLW 1\n    MOVF 0xFEB,W,A\n"; // MOVF PLUSW0,W
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.w(), 0x42, "read ram[0x55+1]=ram[0x56]");
+    assert_eq!(p.ram()[0xFE9], 0x55, "FSR0L unchanged by PLUSW0");
+}
+
+#[test]
+fn mulwf_produces_an_unsigned_16_bit_product_in_prodh_prodl() {
+    let src = "    MOVLW 0x10\n    MOVWF 0x20,A\n    MOVLW 0x10\n    MULWF 0x20,A\n"; // 0x10*0x10=0x100
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0xFF3], 0x00, "PRODL");
+    assert_eq!(p.ram()[0xFF4], 0x01, "PRODH");
+}
+
+#[test]
+fn mullw_produces_an_unsigned_16_bit_product_in_prodh_prodl() {
+    let src = "    MOVLW 0x20\n    MULLW 0x03\n"; // 0x20*0x03=0x60
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0xFF3], 0x60, "PRODL");
+    assert_eq!(p.ram()[0xFF4], 0x00, "PRODH");
+}
+
+#[test]
+fn movlb_selects_the_bank_for_a_subsequent_banked_access() {
+    let src = "    MOVLB 1\n    MOVLW 0x42\n    MOVWF 0x20,B\n"; // writes physical 0x120
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x120], 0x42);
+}
