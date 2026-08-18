@@ -40,12 +40,12 @@ fn structs_layout() -> alloc::AllocLayout {
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&m, &callgraph::edges_text(&cg));
+    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
-    let asm = isel::select(&m, &addrs);
-    let asm = banking::assign_banks(&asm);
+    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
+    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
     let _ = peephole::optimize(&asm);
     layout
 }

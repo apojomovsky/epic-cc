@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+device = { path = "../device" }
 ir = { path = "../ir" }
 irparse = { path = "../irparse" }
 wholeprog = { path = "../wholeprog" }
