@@ -521,17 +521,342 @@ impl Pic18 {
     }
     pub fn step(&mut self) {
         let word = self.prog[(self.pc / 2) as usize];
-        // Every recognized opcode is added task-by-task from here; a
-        // program of just NOPs already exercises the fetch/pc-advance
-        // loop end-to-end.
-        if word == 0x0000 {
-            self.pc += 2;
-        } else {
-            panic!("sim(pic18): opcode {word:#06x} not yet implemented");
-        }
+        let pc = self.pc;
+        let next = match word {
+            0x0000 => pc + 2,
+            // MUST precede the byte-oriented arm below: 0x0800..=0x0FFF is
+            // numerically inside 0x0200..=0x6FFF. Only MOVLW is implemented
+            // here so far (needed to set up test state ahead of Task 14,
+            // which completes the rest of this group with its own tests).
+            0x0E00..=0x0EFF => {
+                self.w = (word & 0xFF) as u8;
+                pc + 2
+            }
+            _ if (0x0800..=0x0FFF).contains(&word) => {
+                panic!("sim(pic18): literal opcode {word:#06x} not yet implemented (Task 14)")
+            }
+            _ if (0x0200..=0x6FFF).contains(&word) => self.exec_byte(pc, word),
+            _ => panic!("sim(pic18): opcode {word:#06x} not yet implemented"),
+        };
+        self.pc = next;
         if (self.pc / 2) as usize >= self.prog.len() {
             self.halted = true;
         }
+    }
+
+    /// The byte address just after a skip instruction's own effect where
+    /// execution resumes on a SKIP. Real PIC18 hardware skips an extra word
+    /// when the instruction being skipped is a two-word form
+    /// (`GOTO`/`CALL`/`LFSR`/`MOVFF`) — `after_pc` is the address right
+    /// after the skip instruction itself (where the skipped instruction
+    /// starts); peek its opcode to decide.
+    fn skip_pc(&self, after_pc: u32) -> u32 {
+        let word = self.prog[(after_pc / 2) as usize];
+        let is_two_word = matches!(word & 0xFF00, 0xEF00 | 0xEE00)
+            || word & 0xFE00 == 0xEC00
+            || word >> 12 == 0xC;
+        after_pc + if is_two_word { 4 } else { 2 }
+    }
+
+    /// Byte-oriented dispatch: mask off the variable fields and match the
+    /// fixed "base" bits directly against the encoding table's hex
+    /// constants — do not recover an opcode via shift-then-narrow-mask
+    /// arithmetic; the two groups have different-width fixed fields (the
+    /// d+a+f group's fixed bits are `word & 0xFC00`, clearing d=bit9/
+    /// a=bit8/f=bits7-0; the a+f-only group's fixed bits are
+    /// `word & 0xFE00`, clearing only a=bit8/f, because bit9 is part of
+    /// ITS fixed identifier, not a variable field) — a narrower mask
+    /// silently collides unrelated opcodes.
+    fn exec_byte(&mut self, pc: u32, word: u16) -> u32 {
+        let a = (word >> 8) & 1;
+        let d = (word >> 9) & 1;
+        let f = word & 0xFF;
+        // No-destination-select group first (`word & 0xFE00`): CLRF/
+        // CPFSEQ/CPFSGT/CPFSLT/MOVWF/MULWF/NEGF/SETF/TSTFSZ.
+        match word & 0xFE00 {
+            0x6A00 => {
+                // CLRF
+                self.write_f(a, f, 0);
+                self.set_z(0);
+                return pc + 2;
+            }
+            0x6200 => {
+                // CPFSEQ: skip if f == W, no flags
+                if self.read_f(a, f) == self.w {
+                    return self.skip_pc(pc + 2);
+                }
+                return pc + 2;
+            }
+            0x6E00 => {
+                // MOVWF: W -> f, no flags
+                self.write_f(a, f, self.w);
+                return pc + 2;
+            }
+            0x6400 => {
+                // CPFSGT: skip if f > W (unsigned), no flags
+                if self.read_f(a, f) > self.w {
+                    return self.skip_pc(pc + 2);
+                }
+                return pc + 2;
+            }
+            0x6000 => {
+                // CPFSLT: skip if f < W (unsigned), no flags
+                if self.read_f(a, f) < self.w {
+                    return self.skip_pc(pc + 2);
+                }
+                return pc + 2;
+            }
+            0x6C00 => {
+                // NEGF: f = 0 - f, full flags
+                let fv = self.read_f(a, f);
+                let r = 0u8.wrapping_sub(fv);
+                self.sub_flags(0, fv, r);
+                self.set_zn(r);
+                self.write_f(a, f, r);
+                return pc + 2;
+            }
+            0x6800 => {
+                // SETF: f = 0xFF, no flags
+                self.write_f(a, f, 0xFF);
+                return pc + 2;
+            }
+            0x6600 => {
+                // TSTFSZ: skip if f == 0, no flags
+                if self.read_f(a, f) == 0 {
+                    return self.skip_pc(pc + 2);
+                }
+                return pc + 2;
+            }
+            _ => {}
+        }
+        // Destination-select group (`word & 0xFC00`).
+        match word & 0xFC00 {
+            0x2400 => {
+                // ADDWF: f + W
+                let fv = self.read_f(a, f);
+                let r = fv.wrapping_add(self.w);
+                self.add_flags(fv, self.w, r);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x5C00 => {
+                // SUBWF: f - W
+                let fv = self.read_f(a, f);
+                let r = fv.wrapping_sub(self.w);
+                self.sub_flags(fv, self.w, r);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x3800 => {
+                // SWAPF: nibble swap, no flags
+                let v = self.read_f(a, f);
+                let r = (v << 4) | (v >> 4);
+                self.write_d(d, a, f, r);
+            }
+            0x2C00 => {
+                // DECFSZ
+                let r = self.read_f(a, f).wrapping_sub(1);
+                self.write_d(d, a, f, r);
+                if r == 0 {
+                    return self.skip_pc(pc + 2);
+                }
+            }
+            0x2000 => {
+                // ADDWFC: f + W + C
+                let fv = self.read_f(a, f);
+                let cin = self.get_c() as u8;
+                let r = self.addc_flags(fv, self.w, cin);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x1400 => {
+                // ANDWF: f & W
+                let r = self.read_f(a, f) & self.w;
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x1C00 => {
+                // COMF: !f
+                let r = !self.read_f(a, f);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x4C00 => {
+                // DCFSNZ: f - 1, skip if NOT zero
+                let r = self.read_f(a, f).wrapping_sub(1);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+                if r != 0 {
+                    return self.skip_pc(pc + 2);
+                }
+            }
+            0x2800 => {
+                // INCF: f + 1
+                let fv = self.read_f(a, f);
+                let r = fv.wrapping_add(1);
+                self.add_flags(fv, 1, r);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x3C00 => {
+                // INCFSZ: f + 1, skip if zero
+                let fv = self.read_f(a, f);
+                let r = fv.wrapping_add(1);
+                self.write_d(d, a, f, r);
+                if r == 0 {
+                    return self.skip_pc(pc + 2);
+                }
+            }
+            0x4800 => {
+                // INFSNZ: f + 1, skip if NOT zero
+                let fv = self.read_f(a, f);
+                let r = fv.wrapping_add(1);
+                self.write_d(d, a, f, r);
+                if r != 0 {
+                    return self.skip_pc(pc + 2);
+                }
+            }
+            0x1000 => {
+                // IORWF: f | W
+                let r = self.read_f(a, f) | self.w;
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x5000 => {
+                // MOVF: f (copy), no ALU op
+                let r = self.read_f(a, f);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x3400 => {
+                // RLCF: rotate left through C
+                let v = self.read_f(a, f);
+                let cin = self.get_c() as u8;
+                let r = (v << 1) | cin;
+                self.set_c(v & 0x80 != 0);
+                self.write_d(d, a, f, r);
+            }
+            0x4400 => {
+                // RLNCF: rotate left, bit7 wraps to bit0, no carry
+                let v = self.read_f(a, f);
+                let r = v.rotate_left(1);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x3000 => {
+                // RRCF: rotate right through C
+                let v = self.read_f(a, f);
+                let cin = self.get_c() as u8;
+                let r = (v >> 1) | (cin << 7);
+                self.set_c(v & 0x01 != 0);
+                self.write_d(d, a, f, r);
+            }
+            0x4000 => {
+                // RRNCF: rotate right, bit0 wraps to bit7, no carry
+                let v = self.read_f(a, f);
+                let r = v.rotate_right(1);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x5400 | 0x5800 => {
+                // SUBFWB / SUBWFB: f - W - !C, computed as f + !W + C (the
+                // ALU adder with W inverted — see the plan's note that
+                // these two mnemonics share this exact computation; no
+                // empirical evidence distinguishes them, so both use it).
+                let fv = self.read_f(a, f);
+                let cin = self.get_c() as u8;
+                let r = self.addc_flags(fv, !self.w, cin);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            0x1800 => {
+                // XORWF: f ^ W
+                let r = self.read_f(a, f) ^ self.w;
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
+            other => panic!(
+                "sim(pic18): byte opcode base {other:#06x} (word {word:#06x}) not yet implemented"
+            ),
+        }
+        pc + 2
+    }
+
+    fn status_addr(&self) -> usize {
+        self.resolve_f(0, 0xD8)
+    }
+    fn set_z(&mut self, v: u8) {
+        let addr = self.status_addr();
+        if v == 0 {
+            self.ram[addr] |= 0x04
+        } else {
+            self.ram[addr] &= !0x04
+        }
+    }
+    fn set_c(&mut self, c: bool) {
+        let addr = self.status_addr();
+        if c {
+            self.ram[addr] |= 0x01
+        } else {
+            self.ram[addr] &= !0x01
+        }
+    }
+    fn set_dc(&mut self, c: bool) {
+        let addr = self.status_addr();
+        if c {
+            self.ram[addr] |= 0x02
+        } else {
+            self.ram[addr] &= !0x02
+        }
+    }
+    fn set_n(&mut self, r: u8) {
+        let addr = self.status_addr();
+        if r & 0x80 != 0 {
+            self.ram[addr] |= 0x10
+        } else {
+            self.ram[addr] &= !0x10
+        }
+    }
+    fn set_ov(&mut self, ov: bool) {
+        let addr = self.status_addr();
+        if ov {
+            self.ram[addr] |= 0x08
+        } else {
+            self.ram[addr] &= !0x08
+        }
+    }
+    /// Z, N always follow the result; call after every byte-oriented op.
+    fn set_zn(&mut self, r: u8) {
+        self.set_z(r);
+        self.set_n(r);
+    }
+    /// Add flags (C/DC/OV) for `a + b = r` (used by ADDWF/ADDWFC/ADDLW).
+    fn add_flags(&mut self, a: u8, b: u8, r: u8) {
+        self.set_c((a as u16 + b as u16) > 0xFF);
+        self.set_dc(((a & 0x0F) as u16 + (b & 0x0F) as u16) > 0x0F);
+        self.set_ov(((a ^ r) & (b ^ r) & 0x80) != 0);
+    }
+    fn get_c(&self) -> bool {
+        self.ram[self.status_addr()] & 0x01 != 0
+    }
+    /// `a + b + cin`, setting C/DC/OV for the 3-operand add and returning
+    /// the wrapped result. Used by ADDWFC and (with `b` inverted) by
+    /// SUBFWB/SUBWFB, which PIC18's ALU computes as an add-with-carry.
+    fn addc_flags(&mut self, a: u8, b: u8, cin: u8) -> u8 {
+        let sum: u16 = a as u16 + b as u16 + cin as u16;
+        let r = sum as u8;
+        self.set_c(sum > 0xFF);
+        let dc_sum: u16 = (a & 0x0F) as u16 + (b & 0x0F) as u16 + cin as u16;
+        self.set_dc(dc_sum > 0x0F);
+        self.set_ov(((a ^ r) & (b ^ r) & 0x80) != 0);
+        r
+    }
+    /// Subtract flags (C/DC/OV) for `a - b = r` (PIC "no borrow" convention:
+    /// C=1 means a>=b, i.e. no borrow). Used by SUBWF/SUBLW/CPFS*/DECF etc.
+    fn sub_flags(&mut self, a: u8, b: u8, r: u8) {
+        self.set_c(a >= b);
+        self.set_dc((a & 0x0F) >= (b & 0x0F));
+        self.set_ov(((a ^ b) & (a ^ r) & 0x80) != 0);
     }
 
     /// Resolve a byte/bit-oriented `(a, f)` pair to its physical 12-bit

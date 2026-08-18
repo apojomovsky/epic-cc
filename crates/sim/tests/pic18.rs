@@ -21,3 +21,252 @@ fn parse_hex_pic18_decodes_intel_hex_into_words() {
     let words = parse_hex_pic18(&hex);
     assert_eq!(words[0], 0x55AA);
 }
+
+#[test]
+fn addwf_adds_and_sets_flags() {
+    // MOVLW 0x7F; MOVWF 0x20,A; ADDWF 0x20,F,A -- 0x7F + 0x7F = 0xFE,
+    // no carry, no digit-carry, N set (bit7), Z clear, OV set (signed
+    // 127+127 overflows into negative).
+    let words = vec![0x0E7F, 0x6E20, 0x2620];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xFE);
+    let status = p.ram()[0xFD8]; // STATUS is access-bank SFR: f=0xD8, a=0 -> 0xF00+0xD8=0xFD8
+    assert_eq!(status & 0x01, 0, "C clear");
+    assert_eq!(status & 0x08, 0x08, "OV set");
+    assert_eq!(status & 0x10, 0x10, "N set");
+    assert_eq!(status & 0x04, 0, "Z clear");
+}
+
+#[test]
+fn subwf_computes_f_minus_w_with_no_borrow_convention() {
+    // MOVLW 0x01; MOVWF 0x20,A; MOVLW 0x03; SUBWF 0x20,F,A -> 0x01 - 0x03
+    // wraps to 0xFE with C=0 (borrow occurred, PIC "no borrow" convention).
+    // SUBWF's d=F bit is bit9 (0x200): base 0x5C00 | 0x200 | f=0x20 = 0x5E20.
+    let words = vec![0x0E01, 0x6E20, 0x0E03, 0x5E20];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xFE);
+    assert_eq!(p.ram()[0xFD8] & 0x01, 0, "C clear: a borrow occurred");
+}
+
+#[test]
+fn decfsz_skips_the_next_instruction_when_it_reaches_zero() {
+    // MOVLW 1; MOVWF 0x20,A; DECFSZ 0x20,F,A; GOTO fail; NOP(ok)
+    let words = vec![0x0E01, 0x6E20, 0x2E20, 0xEF10, 0xF000, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0); // decremented to 0
+    // The skip lands on the trailing NOP at word 5 = byte 10 (correctly
+    // skipping the whole 2-word GOTO, not landing mid-GOTO on its second
+    // word); `run` then executes that NOP too, ending at byte 12. Reaching
+    // 12 cleanly (no decode panic on a stray 0xF000 continuation word, no
+    // jump to `fail`'s bogus target) is the proof the skip worked.
+    assert_eq!(p.pc(), 12);
+}
+
+#[test]
+fn swapf_swaps_nibbles() {
+    // SWAPF's d=F bit is bit9 (0x200): base 0x3800 | 0x200 | f=0x20 = 0x3A20.
+    let words = vec![0x0EAB, 0x6E20, 0x3A20]; // MOVLW 0xAB; MOVWF 0x20,A; SWAPF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xBA);
+}
+
+#[test]
+fn clrf_zeroes_and_sets_z() {
+    let words = vec![0x0E42, 0x6E20, 0x6A20]; // MOVLW 0x42; MOVWF 0x20,A; CLRF 0x20,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0);
+    assert_eq!(p.ram()[0xFD8] & 0x04, 0x04, "Z set");
+}
+
+#[test]
+fn cpfseq_skips_when_equal() {
+    // MOVLW 5; MOVWF 0x20,A; MOVLW 5; CPFSEQ 0x20,A; GOTO fail; NOP(ok)
+    let words = vec![0x0E05, 0x6E20, 0x0E05, 0x6220, 0xEF10, 0xF000, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    // Skip lands on the trailing NOP at word 6 = byte 12; `run` executes it
+    // too, ending at byte 14 (see decfsz's test for why this is the right
+    // way to prove the skip landed correctly).
+    assert_eq!(p.pc(), 14);
+}
+
+#[test]
+fn addwfc_adds_with_incoming_carry() {
+    // MOVLW 0xFF; MOVWF 0x20,A; MOVLW 1; ADDWF 0x20,F,A (0xFF+1=0, C=1);
+    // MOVLW 1; ADDWFC 0x20,F,A (0+1+1=2).
+    let words = vec![0x0EFF, 0x6E20, 0x0E01, 0x2620, 0x0E01, 0x2220];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 2);
+}
+
+#[test]
+fn andwf_computes_bitwise_and() {
+    let words = vec![0x0EFF, 0x6E20, 0x0E0F, 0x1620]; // MOVLW 0xFF;MOVWF 0x20,A;MOVLW 0x0F;ANDWF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0x0F);
+}
+
+#[test]
+fn comf_complements_the_byte() {
+    let words = vec![0x0E0F, 0x6E20, 0x1E20]; // MOVLW 0x0F; MOVWF 0x20,A; COMF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xF0);
+}
+
+#[test]
+fn dcfsnz_skips_when_result_is_not_zero() {
+    // MOVLW 2; MOVWF 0x20,A; DCFSNZ 0x20,F,A (2-1=1, not zero, skip);
+    // GOTO fail; NOP(ok)
+    let words = vec![0x0E02, 0x6E20, 0x4E20, 0xEF10, 0xF000, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 1);
+    assert_eq!(p.pc(), 12); // landed on NOP (byte 10) then ran it
+}
+
+#[test]
+fn incf_increments_and_sets_flags() {
+    let words = vec![0x0EFF, 0x6E20, 0x2A20]; // MOVLW 0xFF; MOVWF 0x20,A; INCF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0);
+    assert_eq!(p.ram()[0xFD8] & 0x01, 0x01, "C set: 0xFF+1 wraps");
+    assert_eq!(p.ram()[0xFD8] & 0x04, 0x04, "Z set");
+}
+
+#[test]
+fn incfsz_skips_when_it_wraps_to_zero() {
+    let words = vec![0x0EFF, 0x6E20, 0x3E20, 0xEF10, 0xF000, 0x0000]; // ...;INCFSZ 0x20,F,A;GOTO fail;NOP
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0);
+    assert_eq!(p.pc(), 12);
+}
+
+#[test]
+fn infsnz_skips_when_result_is_not_zero() {
+    let words = vec![0x0E01, 0x6E20, 0x4A20, 0xEF10, 0xF000, 0x0000]; // ...;INFSNZ 0x20,F,A;GOTO fail;NOP
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 2);
+    assert_eq!(p.pc(), 12);
+}
+
+#[test]
+fn iorwf_computes_bitwise_or() {
+    let words = vec![0x0E0F, 0x6E20, 0x0EF0, 0x1220]; // MOVLW 0x0F;MOVWF 0x20,A;MOVLW 0xF0;IORWF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xFF);
+}
+
+#[test]
+fn movf_copies_f_and_sets_flags() {
+    let words = vec![0x0E00, 0x6E20, 0x5220]; // MOVLW 0; MOVWF 0x20,A; MOVF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0xFD8] & 0x04, 0x04, "Z set");
+}
+
+#[test]
+fn rlcf_rotates_left_through_carry() {
+    // MOVLW 0x80; MOVWF 0x20,A -> ram=0x80, C starts clear.
+    // RLCF 0x20,F,A: result = (0x80<<1)|0 = 0, C becomes 1 (old bit7).
+    let words = vec![0x0E80, 0x6E20, 0x3620];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0);
+    assert_eq!(p.ram()[0xFD8] & 0x01, 0x01, "C set from the rotated-out bit7");
+}
+
+#[test]
+fn rlncf_rotates_left_without_carry() {
+    let words = vec![0x0E80, 0x6E20, 0x4620]; // MOVLW 0x80; MOVWF 0x20,A; RLNCF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 1, "bit7 wraps to bit0");
+}
+
+#[test]
+fn rrcf_rotates_right_through_carry() {
+    let words = vec![0x0E01, 0x6E20, 0x3220]; // MOVLW 1; MOVWF 0x20,A; RRCF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0);
+    assert_eq!(p.ram()[0xFD8] & 0x01, 0x01, "C set from the rotated-out bit0");
+}
+
+#[test]
+fn rrncf_rotates_right_without_carry() {
+    let words = vec![0x0E01, 0x6E20, 0x4220]; // MOVLW 1; MOVWF 0x20,A; RRNCF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0x80, "bit0 wraps to bit7");
+}
+
+#[test]
+fn subfwb_subtracts_with_borrow() {
+    // MOVLW 5; MOVWF 0x20,A -> ram=5. MOVLW 2. SUBFWB 0x20,F,A with C
+    // initially clear (borrow-in=1): 5 - 2 - 1 = 2.
+    let words = vec![0x0E05, 0x6E20, 0x0E02, 0x5620];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 2);
+}
+
+#[test]
+fn xorwf_computes_bitwise_xor() {
+    let words = vec![0x0EFF, 0x6E20, 0x0E0F, 0x1A20]; // MOVLW 0xFF;MOVWF 0x20,A;MOVLW 0x0F;XORWF 0x20,F,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xF0);
+}
+
+#[test]
+fn cpfsgt_skips_when_f_greater_than_w() {
+    // MOVLW 5;MOVWF 0x20,A;MOVLW 3;CPFSGT 0x20,A (5>3, skip);GOTO fail;NOP
+    let words = vec![0x0E05, 0x6E20, 0x0E03, 0x6420, 0xEF10, 0xF000, 0x0000];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.pc(), 14);
+}
+
+#[test]
+fn cpfslt_skips_when_f_less_than_w() {
+    let words = vec![0x0E03, 0x6E20, 0x0E05, 0x6020, 0xEF10, 0xF000, 0x0000]; // f=3 < W=5
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.pc(), 14);
+}
+
+#[test]
+fn negf_negates_in_place() {
+    let words = vec![0x0E05, 0x6E20, 0x6C20]; // MOVLW 5; MOVWF 0x20,A; NEGF 0x20,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xFB); // -5 as u8
+}
+
+#[test]
+fn setf_sets_all_bits() {
+    let words = vec![0x0E00, 0x6E20, 0x6820]; // MOVLW 0; MOVWF 0x20,A; SETF 0x20,A
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xFF);
+}
+
+#[test]
+fn tstfsz_skips_when_f_is_zero() {
+    let words = vec![0x0E00, 0x6E20, 0x6620, 0xEF10, 0xF000, 0x0000]; // ...;TSTFSZ 0x20,A;GOTO fail;NOP
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.pc(), 12);
+}
