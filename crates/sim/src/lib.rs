@@ -50,6 +50,17 @@ fn hex_nibble(c: u8) -> u8 {
     }
 }
 
+/// INTCON, the interrupt control register: bank-independent at 0x0B.
+pub const INTCON: usize = 0x0B;
+/// INTCON bit 7, the global interrupt enable.
+pub const GIE: u8 = 1 << 7;
+/// INTCON bit 4, the RB0/INT external interrupt enable.
+pub const INTE: u8 = 1 << 4;
+/// INTCON bit 1, the RB0/INT external interrupt flag.
+pub const INTF: u8 = 1 << 1;
+/// The 14-bit core's single interrupt vector.
+pub const VECTOR: u16 = 4;
+
 pub struct Pic14 {
     prog: Vec<u16>,
     ram: [u8; 512],
@@ -57,11 +68,22 @@ pub struct Pic14 {
     pc: u16,
     stack: Vec<u16>,
     halted: bool,
+    /// A latched interrupt request awaiting GIE + INTE. Set by
+    /// `request_interrupt`, consumed when the interrupt is taken.
+    pending: bool,
 }
 
 impl Pic14 {
     pub fn new(prog: Vec<u16>) -> Self {
-        Pic14 { prog, ram: [0; 512], w: 0, pc: 0, stack: Vec::new(), halted: false }
+        Pic14 {
+            prog,
+            ram: [0; 512],
+            w: 0,
+            pc: 0,
+            stack: Vec::new(),
+            halted: false,
+            pending: false,
+        }
     }
     pub fn ram(&self) -> &[u8; 512] {
         &self.ram
@@ -78,12 +100,41 @@ impl Pic14 {
     pub fn halted(&self) -> bool {
         self.halted
     }
-    /// Fire the F877A's single interrupt: push `pc + 1` (the return address) and
-    /// jump to the interrupt vector (word 4). GIE is unmodeled — the caller
-    /// controls the injection. RETFIE (0x0009) pops the return.
+    /// Fire the F877A's single interrupt immediately, bypassing GIE and the
+    /// enable bits: push the return address and jump to the vector. The
+    /// unconditional test hook — use it to place an interrupt at an exact
+    /// program counter without modelling INTCON.
+    ///
+    /// `fire_interrupt` is called BETWEEN steps, so `pc` addresses an
+    /// instruction that has not executed yet: the return address is `pc`
+    /// itself, and RETFIE resumes by running it. (Pushing `pc + 1` would
+    /// silently drop that instruction.)
     pub fn fire_interrupt(&mut self) {
-        self.stack.push(self.pc + 1);
-        self.pc = 4;
+        self.enter_isr();
+    }
+    /// Request the interrupt through the modelled path: latch it and set
+    /// INTF. It is taken at the next step boundary at which GIE and INTE are
+    /// both set, so a program that masks interrupts keeps it pending until
+    /// it unmasks. The latch is consumed on entry, so a handler that never
+    /// clears INTF still runs once rather than looping.
+    pub fn request_interrupt(&mut self) {
+        self.ram[INTCON] |= INTF;
+        self.pending = true;
+    }
+    /// Whether a requested interrupt is still latched and not yet taken.
+    pub fn interrupt_pending(&self) -> bool {
+        self.pending
+    }
+    /// Push the return address, clear GIE (hardware does this on entry so
+    /// the handler is not immediately re-entered) and vector.
+    fn enter_isr(&mut self) {
+        self.stack.push(self.pc);
+        self.ram[INTCON] &= !GIE;
+        self.pc = VECTOR;
+    }
+    /// A latched request whose source and global enables are both set.
+    fn interrupt_ready(&self) -> bool {
+        self.pending && self.ram[INTCON] & GIE != 0 && self.ram[INTCON] & INTE != 0
     }
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
@@ -94,6 +145,14 @@ impl Pic14 {
         steps
     }
     pub fn step(&mut self) {
+        // Interrupts are recognised at an instruction boundary: a latched,
+        // enabled request vectors instead of executing this instruction,
+        // which then runs on return.
+        if self.interrupt_ready() {
+            self.pending = false;
+            self.enter_isr();
+            return; // vectoring costs its own cycle; the handler runs next
+        }
         let word = self.prog[self.pc as usize];
         let pc = self.pc;
         let next = match (word >> 12) & 0x3 {
@@ -197,7 +256,10 @@ impl Pic14 {
         match word {
             0x0000 => return pc + 1, // NOP
             0x0008 => return self.pop_return(), // RETURN
-            0x0009 => return self.pop_return(), // RETFIE
+            0x0009 => {
+                self.ram[INTCON] |= GIE; // RETFIE re-enables interrupts
+                return self.pop_return();
+            }
             0x0064 => return pc + 1, // CLRWDT
             0x0063 => {
                 self.halted = true; // SLEEP
