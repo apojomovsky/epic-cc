@@ -49,9 +49,14 @@ name = "fuzz"
 version = "0.1.0"
 dependencies = [
  "alloc",
+ "asm",
+ "banking",
  "callgraph",
+ "ir",
  "irparse",
+ "isel",
  "legalize",
+ "peephole",
  "pic14-sim",
  "wholeprog",
 ]

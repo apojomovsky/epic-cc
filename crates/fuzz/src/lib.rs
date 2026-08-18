@@ -25,6 +25,7 @@
 //!   WITHOUT `-target`; the unwrapped `$PIC8_CLANG_UNWRAPPED` cannot find the
 //!   host's stdio.h) and reads the printed checksum.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -61,7 +62,11 @@ pub const CHECKSUM_NAME: &str = "checksum";
 /// `int` / host `short`, s32 = msp430 `long` / host `int` — genuinely
 /// 16/32-bit on both sides, same guard pattern.
 ///
-/// With these, u8/u16/u32/s16/s32 arithmetic wraps identically on both
+/// Issue #14 added `s8` for the signed differential generator (signed
+/// arithmetic/comparisons at 8 bits need an explicit s8 — `signed char` is
+/// 8-bit on both targets).
+///
+/// With these, u8/u16/u32/s8/s16/s32 arithmetic wraps identically on both
 /// sides and the differential is meaningful for values beyond 2^16 (pinned
 /// by `u32_arithmetic_wraps_identically_on_both_sides` in tests/differential.rs
 /// and by `unsigned_long_u32_arithmetic_mismatches`, which shows the old
@@ -71,12 +76,14 @@ pub const TYPEDEF_PROLOGUE: &str = "\
 typedef unsigned char u8;\n\
 typedef unsigned short u16;\n\
 typedef unsigned long u32;\n\
+typedef signed char s8;\n\
 typedef int s16;\n\
 typedef long s32;\n\
 #else\n\
 typedef unsigned char u8;\n\
 typedef unsigned short u16;\n\
 typedef unsigned int u32;\n\
+typedef signed char s8;\n\
 typedef short s16;\n\
 typedef int s32;\n\
 #endif\n";
@@ -164,6 +171,29 @@ pub struct Program {
     pub prologue: String,
 }
 
+/// An IR-level differential program (issue #14): canonical IR text in the
+/// `ir::parse` dialect (`global <name> <ty>` / `fn <name>(<ret>) (<params>)`
+/// / `block <label>:` / `%d = <op> <ty> <a> <b>` — no LLVM `@`-global
+/// definitions, no commas) fed DIRECTLY to the in-process pipeline —
+/// `ir::parse` -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
+/// banking -> peephole -> asm — bypassing clang. The PIC side runs the
+/// canonical IR; the host side runs the `c_twin` C source (the same
+/// computation in the C discipline) so the differential still compares
+/// checksums.
+#[derive(Debug, Clone)]
+pub struct IrProgram {
+    /// Canonical IR text (`ir::parse` dialect).
+    pub ir_text: String,
+    /// The volatile input globals, seeded identically on both sides.
+    pub inputs: Vec<Input>,
+    /// The volatile checksum global's name.
+    pub checksum_name: String,
+    /// Provenance seed (the corpus contract).
+    pub seed: u64,
+    /// The C twin: the host-side oracle for the same computation.
+    pub c_twin: String,
+}
+
 // ---------------------------------------------------------------------------
 // Differential failures (Task 3: classified so the reducer can preserve
 // the ORIGINAL failure)
@@ -228,6 +258,31 @@ enum BinOp {
     Xor,
     Shl,
     Shr,
+}
+
+/// The signed arith binops the signed generator can emit (mul needs the
+/// width-space widening; add/sub/and/or/xor are plain unsigned-domain).
+#[derive(Clone, Copy)]
+enum SignedBin {
+    Add,
+    Sub,
+    Mul,
+    And,
+    Or,
+    Xor,
+}
+
+/// The signed statement kinds (the forced rotation's pool).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SignedKind {
+    Div,
+    Rem,
+    Ashr,
+    Cmp,
+    Mul,
+    Add,
+    Sub,
+    Arith,
 }
 
 // ---------------------------------------------------------------------------
@@ -965,7 +1020,181 @@ impl Gen {
         true
     }
 
-    // ---- Milestone 15: the float surface (float mode only) ----
+    // ---- Issue #14: the signed surface (signed mode only) ----
+
+    /// A signed width (s8/s16/s32 — the same byte widths as u8/u16/u32, so
+    /// the frame-budget model and the local slots are shared).
+    fn spick_width(&mut self) -> u8 {
+        [8u8, 16, 32][self.below(3) as usize]
+    }
+
+    /// A signed arithmetic statement: `(sW)((uW)a op (uW)b)` — computed in
+    /// the unsigned domain so wrapping is defined on BOTH sides (C's usual
+    /// arithmetic conversions: on msp430 u16/u32 promote to the unsigned
+    /// int/long of the same width and wrap mod 2^W; on the host the wider
+    /// int holds the exact product and the cast truncates identically).
+    /// `forced` pins the op (the flag-guaranteed first statement); the fill
+    /// picks by the weighted mix. Main-frame costs mirror the unsigned
+    /// arith table (same statement shapes); mul pulls the big routines.
+    fn emit_sarith(&mut self, forced: Option<SignedBin>) -> bool {
+        let mut w = self.spick_width();
+        if self.forced {
+            w = 8; // a flag-guaranteed statement runs at the cheapest width
+        }
+        let op = match forced {
+            Some(op) => op,
+            None => match self.below(6) {
+                0 => SignedBin::Add,
+                1 => SignedBin::Sub,
+                2 => SignedBin::Mul,
+                3 => SignedBin::And,
+                4 => SignedBin::Or,
+                _ => SignedBin::Xor,
+            },
+        };
+        let (cost, routine) = match (w, op) {
+            (_, SignedBin::Mul) => match w {
+                8 => (8, 18),
+                16 => (14, 22),
+                _ => (16, 22),
+            },
+            (8, _) => (7, 0),
+            (16, _) => (10, 0),
+            _ => (15, 0),
+        };
+        if !self.fit(cost, routine, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        self.worst_routine = self.worst_routine.max(routine);
+        let ct = ctype(w); // the unsigned type of the same width
+        let s = match op {
+            SignedBin::Add => "+",
+            SignedBin::Sub => "-",
+            SignedBin::And => "&",
+            SignedBin::Or => "|",
+            _ => "^",
+        };
+        // Forced statements draw volatile/local operands only (a const
+        // operand would let clang fold the op away — no coverage).
+        let pick = |g: &mut Self, w: u8| -> String {
+            if g.forced {
+                g.operand_reg(w)
+            } else {
+                g.operand(w)
+            }
+        };
+        let a = pick(self, w);
+        let b = pick(self, w);
+        // Mul widens to the next unsigned width so the host's promotion
+        // cannot overflow (same discipline as the unsigned generator).
+        let expr = match (op, w) {
+            (SignedBin::Mul, 8) => format!("(s8)((u16)((u8){a}) * (u16)((u8){b}))"),
+            (SignedBin::Mul, 16) => format!("(s16)((u32)((u16){a}) * (u32)((u16){b}))"),
+            (SignedBin::Mul, _) => format!("(s32)(({a}) * ({b}))"),
+            _ => format!("(s{w})(({ct}){a} {s} ({ct}){b})"),
+        };
+        let t = self.new_local(w);
+        self.body.push(format!("  s{w} {t} = {expr};"));
+        self.push_fold(w, &t);
+        true
+    }
+
+    /// A signed div/rem statement with a CONSTANT divisor in 2..=9: the
+    /// only signed-division UB pair is INT_MIN / -1, and the divisor is
+    /// neither 0 nor -1, so no dividend guard is needed (signed const
+    /// divisors stay plain `sdiv`/`srem` — clang does NOT magic-number
+    /// strength-reduce signed division, verified; the unsigned generator's
+    /// runtime-divisor rule is a udiv-only quirk). The dividend is a
+    /// volatile input / local (never a constant — a const would fold).
+    fn emit_sdivrem(&mut self, rem: bool) -> bool {
+        let mut w = self.spick_width();
+        if self.forced {
+            w = 8; // a flag-guaranteed statement runs at the cheapest width
+        }
+        // Frames: __sdiv/__srem_i8 = 5, i16 = 7, i32 = 12 (the unsigned
+        // table's 14/14/12 over-estimates — conservative, so reuse it).
+        let (cost, routine) = match w {
+            8 => (10, 14),
+            16 => (12, 14),
+            _ => (19, 12),
+        };
+        if !self.fit(cost, routine, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        self.worst_routine = self.worst_routine.max(routine);
+        let a = self.operand_reg(w); // volatile input / local dividend
+        let k = 2 + self.below(8) as u32; // 2..=9: nonzero, never -1
+        let op = if rem { "%" } else { "/" };
+        let expr = format!("(s{w})((s{w}){a} {op} (s{w}){k})");
+        let t = self.new_local(w);
+        self.body.push(format!("  s{w} {t} = {expr};"));
+        self.push_fold(w, &t);
+        true
+    }
+
+    /// A signed arithmetic-shift statement: `(sW)((sW)v >> c)` — a const
+    /// count in 1..=W-1, or a masked runtime count (volatile/local — a
+    /// const count would fold the shift). ashr sign-fills, exercising the
+    /// __ashr routines' sign extension.
+    fn emit_sshift(&mut self) -> bool {
+        let mut w = self.spick_width();
+        if self.forced {
+            w = 8; // a flag-guaranteed statement runs at the cheapest width
+        }
+        let (cost, routine) = match w {
+            8 => (8, 3),
+            16 => (10, 6),
+            _ => (13, 12),
+        };
+        if !self.fit(cost, routine, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        self.worst_routine = self.worst_routine.max(routine);
+        let v = self.operand_reg(w);
+        let expr = if self.below(3) < 2 {
+            let c = 1 + self.below(u32::from(w) - 1);
+            format!("(s{w})((s{w}){v} >> {c})")
+        } else {
+            let m = w - 1;
+            let c = self.operand_reg(w);
+            format!("(s{w})((s{w}){v} >> (s{w})((u{w}){c} & {m}u))")
+        };
+        let t = self.new_local(w);
+        self.body.push(format!("  s{w} {t} = {expr};"));
+        self.push_fold(w, &t);
+        true
+    }
+
+    /// A signed comparison folded straight into the checksum:
+    /// `checksum ^= (u8)((sW)a rel (sW)b)` — icmp slt/sle/sgt/sge/eq/ne.
+    /// Volatile/local operands only (a const pair would fold the icmp).
+    fn emit_scmp(&mut self) -> bool {
+        let mut w = self.spick_width();
+        if self.forced {
+            w = 8; // a flag-guaranteed statement runs at the cheapest width
+        }
+        let cost = match w {
+            8 => 7,
+            16 => 9,
+            _ => 13,
+        };
+        if !self.fit(cost, 0, false, false) {
+            return false;
+        }
+        self.frame_est += cost;
+        let rel = ["<", "<=", ">", ">=", "==", "!="][self.below(6) as usize];
+        let a = self.operand_reg(w);
+        let b = self.operand_reg(w);
+        self.body.push(format!(
+            "  checksum = (u8)(checksum ^ (u8)((s{w}){a} {rel} (s{w}){b}));"
+        ));
+        true
+    }
+
+    // ---- Milestone 15: the float surface (float mode) ----
 
     /// A float operand from the BAND pool: the band input in3 (the
     /// generated normal with the exponent in 100..150, value ~2^-27..2^23),
@@ -1663,6 +1892,501 @@ fn emit_float_kind(g: &mut Gen, k: FloatKind, force_input: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #14: the signed differential (wrap-safe signed arithmetic)
+// ---------------------------------------------------------------------------
+
+/// The RNG-mix constants separating the signed generator's streams from the
+/// integer/float generators' (the corpus is deterministic either way; the
+/// mix keeps adjacent int/float/signed seeds visibly distinct).
+const SIGNED_MIX: u64 = 0x51ED_0000_0000_0001;
+const SIGNED_MIX2: u64 = 0x51ED_0000_0000_0002;
+
+/// Generate a deterministic SIGNED differential program from `seed` — issue
+/// #14's signed surface. The inputs are the same fixed u8/u16/u32 volatile
+/// globals as the integer generator (in0/in1/in2), read through `(sW)`
+/// casts; the statements are the signed ops — sdiv/srem (const divisors
+/// 2..=9, so the only signed-division UB pair INT_MIN / -1 is excluded by
+/// construction), ashr (const or masked counts), the signed comparisons
+/// (icmp slt/sle/sgt/sge/eq/ne folded straight into the checksum), and the
+/// signed binops — all computed in the wrap-safe discipline:
+///
+/// - arithmetic computes in the UNSIGNED domain and re-casts
+///   (`(sW)((uW)a op (uW)b)`), so wrapping is defined on BOTH sides (C's
+///   usual arithmetic conversions: on msp430 u16/u32 promote to the
+///   unsigned int/long of the same width and wrap mod 2^W; on the host the
+///   wider int holds the exact result and the cast truncates identically);
+/// - mul widens to the next unsigned width (u8 -> u16, u16 -> u32) so the
+///   host's int promotion cannot overflow;
+/// - div/rem use const divisors 2..=9 (never 0, never -1 — the only
+///   host-UB pair is INT_MIN / -1, excluded by construction; signed const
+///   divisors stay plain `sdiv`/`srem` — clang does NOT magic-number
+///   strength-reduce signed division, verified);
+/// - ashr results are folded width-preservingly (a signed shift truncated
+///   to u8 would let clang prove the sign-fill irrelevant and lower it as
+///   `lshr` — the fold reads the full width, so the ashr stays).
+///
+/// Every random choice comes from the seeded RNG in a fixed order, so
+/// `seed` fully determines the program. The first (forced) statement's
+/// kind rotates over the 8 signed families (seed % 8), so across the
+/// corpus every signed kind is guaranteed to appear; the fill statements
+/// are best-effort against the frame budget (the same bank-0 model as the
+/// integer generator — the signed routines' frames are smaller than the
+/// unsigned ones, so the budget is conservative).
+pub fn generate_signed(seed: u64) -> Program {
+    let mut g = Gen::new(seed ^ SIGNED_MIX);
+    let mut rng = SplitMix64::new(seed ^ SIGNED_MIX2);
+
+    // Inputs: the same fixed u8/u16/u32 mix as the integer generator (the
+    // signed statements read them through `(sW)` casts; the wrap edges
+    // 0x80/0x8000/0x80000000 are reachable when the RNG draws them).
+    let mut inputs = Vec::new();
+    let mut decls = String::new();
+    for (i, w) in [(0usize, 8u8), (1, 16), (2, 32)] {
+        let name = format!("{INPUT_PREFIX}{i}");
+        decls.push_str(&format!("volatile {} {name};\n", ctype(w)));
+        let value = match w {
+            8 => rng.next_u64() as u8 as u32,
+            16 => rng.next_u64() as u16 as u32,
+            _ => rng.next_u64() as u32,
+        };
+        inputs.push(Input {
+            name,
+            value,
+            width: w,
+            is_float: false,
+        });
+    }
+    decls.push_str(&format!("volatile u8 {checksum};\n", checksum = CHECKSUM_NAME));
+
+    // The forced first statement rotates over the 8 signed families
+    // (seed % 8), so the corpus spans the signed surface by construction.
+    // Each forced statement runs at s8 (the cheapest width — the guarantee
+    // is on the KIND, not the width) and fits the empty frame; a rejection
+    // means the budget model is broken.
+    let forced: SignedKind = match seed % 8 {
+        0 => SignedKind::Div,
+        1 => SignedKind::Rem,
+        2 => SignedKind::Ashr,
+        3 => SignedKind::Cmp,
+        4 => SignedKind::Mul,
+        5 => SignedKind::Add,
+        6 => SignedKind::Sub,
+        _ => SignedKind::Arith,
+    };
+    g.forced = true;
+    let forced_ok = match forced {
+        SignedKind::Div => g.emit_sdivrem(false),
+        SignedKind::Rem => g.emit_sdivrem(true),
+        SignedKind::Ashr => g.emit_sshift(),
+        SignedKind::Cmp => g.emit_scmp(),
+        SignedKind::Mul => g.emit_sarith(Some(SignedBin::Mul)),
+        SignedKind::Add => g.emit_sarith(Some(SignedBin::Add)),
+        SignedKind::Sub => g.emit_sarith(Some(SignedBin::Sub)),
+        SignedKind::Arith => g.emit_sarith(None),
+    };
+    if !forced_ok {
+        panic!(
+            "fuzz: signed seed {seed}: the forced statement was rejected by the frame budget \
+             (frame_est {}, worst_routine {}, budget {}) — recalibrate the signed budget model",
+            g.frame_est,
+            g.worst_routine,
+            g.frame_budget()
+        );
+    }
+    g.forced = false;
+
+    // Best-effort fill: weighted toward div/rem/ashr/cmp (the signed
+    // surface's heart), with the binops as the supporting surface.
+    for _ in 0..10 {
+        let k = match g.below(100) {
+            0..=9 => SignedKind::Div,
+            10..=19 => SignedKind::Rem,
+            20..=34 => SignedKind::Ashr,
+            35..=49 => SignedKind::Cmp,
+            50..=59 => SignedKind::Mul,
+            60..=74 => SignedKind::Arith,
+            _ => {
+                if g.below(2) == 0 {
+                    SignedKind::Add
+                } else {
+                    SignedKind::Sub
+                }
+            }
+        };
+        let ok = match k {
+            SignedKind::Div => g.emit_sdivrem(false),
+            SignedKind::Rem => g.emit_sdivrem(true),
+            SignedKind::Ashr => g.emit_sshift(),
+            SignedKind::Cmp => g.emit_scmp(),
+            SignedKind::Mul => g.emit_sarith(Some(SignedBin::Mul)),
+            SignedKind::Add => g.emit_sarith(Some(SignedBin::Add)),
+            SignedKind::Sub => g.emit_sarith(Some(SignedBin::Sub)),
+            SignedKind::Arith => g.emit_sarith(None),
+        };
+        if !ok {
+            break; // the frame budget is exhausted
+        }
+    }
+
+    let body = g.body.join("\n");
+    let prologue = format!(
+        "{TYPEDEF_PROLOGUE}{decls}{fold_src}void main(void) {{\n",
+        fold_src = Gen::fold_helpers_src(g.used_fold16, g.used_fold32)
+    );
+    let statements = g.body;
+    let c_source = format!("{prologue}{body}\n}}\n");
+    Program {
+        c_source,
+        inputs,
+        checksum_name: CHECKSUM_NAME.to_string(),
+        seed,
+        statements,
+        prologue,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14: the IR-level differential (canonical IR straight to the
+// in-process pipeline — no clang, no driver binary)
+// ---------------------------------------------------------------------------
+
+/// The RNG-mix constants separating the IR generator's streams from the
+/// integer/float/signed generators' (the corpus is deterministic either
+/// way; the mix keeps adjacent seeds visibly distinct).
+const IR_MIX: u64 = 0x1A5E_0000_0000_0001;
+const IR_MIX2: u64 = 0x1A5E_0000_0000_0002;
+
+/// Generate a deterministic IR-level differential program from `seed` —
+/// issue #14's IR mode. The PIC side runs the canonical IR text (the
+/// `ir::parse` dialect: `global <name> <ty>` / `fn <name>(<ret>) (<params>)`
+/// / `block <label>:` / `%d = <op> <ty> <a> <b>` — no LLVM `@`-global
+/// definitions, no commas) DIRECTLY through the in-process pipeline —
+/// `ir::parse` -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
+/// banking -> peephole -> asm — bypassing clang and the driver binary. The
+/// host side runs the `c_twin` C source (the same computation in the C
+/// discipline) through host clang, so the differential still compares
+/// checksums.
+///
+/// The statement pool covers the signed IR surface: `sdiv`/`srem` (const
+/// divisors 2..=9 — the only signed-division UB pair INT_MIN / -1 is
+/// excluded by construction), `ashr` (const counts), `icmp slt` (zext to
+/// i8), plus `add`/`trunc` as the supporting surface and a rare i32 `sdiv`.
+/// Every statement's result is folded into the volatile i8 `checksum`
+/// global byte-wise (lo ^ hi for i16, lo ^ hi ^ next ^ top for i32), and
+/// the C twin mirrors each statement and fold exactly.
+///
+/// Every random choice comes from the seeded RNG in a fixed order, so
+/// `seed` fully determines the program (the corpus contract).
+pub fn generate_ir(seed: u64) -> IrProgram {
+    let mut rng = SplitMix64::new(seed ^ IR_MIX);
+    let mut rng2 = SplitMix64::new(seed ^ IR_MIX2);
+
+    // Inputs: in i16, in2 i32 (the signed surface's two widths; the wrap
+    // edges 0x8000/0x80000000 are reachable when the RNG draws them).
+    let in_val = rng.next_u64() as u16 as u32;
+    let in2_val = rng.next_u64() as u32;
+    let inputs = vec![
+        Input {
+            name: "in".into(),
+            value: in_val,
+            width: 16,
+            is_float: false,
+        },
+        Input {
+            name: "in2".into(),
+            value: in2_val,
+            width: 32,
+            is_float: false,
+        },
+    ];
+
+    let mut ir = String::new();
+    let mut c = String::new();
+    ir.push_str("global in i16\nglobal in2 i32\nglobal checksum i8\n");
+    ir.push_str("fn main(void) ()\n  block entry:\n");
+    c.push_str(TYPEDEF_PROLOGUE);
+    c.push_str("volatile u16 in;\nvolatile u32 in2;\nvolatile u8 checksum;\nvoid main(void) {\n");
+
+    // The two input loads (the only loads; every later operand is a
+    // previous statement's result or a constant).
+    let mut reg = 1u32;
+    ir.push_str(&format!("%{reg} = load i16 @in\n"));
+    reg += 1;
+    ir.push_str(&format!("%{reg} = load i32 @in2\n"));
+    reg += 1;
+    let in_reg = "%1".to_string();
+    let in2_reg = "%2".to_string();
+
+    // 2..=4 statements (the frame budget: every SSA def gets its own RAM
+    // slot, and the signed routines' frames must stay before the bank-0
+    // jump at 0x70 — the fixed shapes are small enough that 4 statements
+    // fit comfortably; the i32 sdiv (the biggest routine, 20 bytes) is
+    // drawn at most once).
+    let n = 2 + (rng2.next_u64() % 3) as usize;
+    let mut last16: Option<String> = None; // IR reg of the last i16 result
+    let mut last16_c: Option<String> = None; // its C local
+    let mut used_i32 = false;
+    let mut c_local = 0u32;
+
+    for _ in 0..n {
+        // Statement kind: 0 sdiv, 1 srem, 2 ashr, 3 add, 4 icmp slt,
+        // 5 trunc, 6 i32 sdiv (rare).
+        let kind = rng2.next_u64() % 7;
+        let (ir_lines, c_line, res_reg, res_c, res_w): (Vec<String>, String, String, String, u8) =
+            match kind {
+                0 | 1 => {
+                    // sdiv/srem i16 by a const 2..=9 (never 0, never -1).
+                    let k = 2 + (rng2.next_u64() % 8);
+                    let a = last16.clone().unwrap_or_else(|| in_reg.clone());
+                    let a_c = last16_c.clone().unwrap_or_else(|| "in".to_string());
+                    let d = format!("%{reg}");
+                    reg += 1;
+                    let t = format!("t{c_local}");
+                    c_local += 1;
+                    let op = if kind == 0 { "sdiv" } else { "srem" };
+                    let cop = if kind == 0 { "/" } else { "%" };
+                    (
+                        vec![format!("{d} = {op} i16 {a} {k}")],
+                        format!("  s16 {t} = (s16)((s16){a_c} {cop} {k});"),
+                        d,
+                        t,
+                        16u8,
+                    )
+                }
+                2 => {
+                    // ashr i16 by a const 1..=15 (sign-fill).
+                    let k = 1 + (rng2.next_u64() % 15);
+                    let a = last16.clone().unwrap_or_else(|| in_reg.clone());
+                    let a_c = last16_c.clone().unwrap_or_else(|| "in".to_string());
+                    let d = format!("%{reg}");
+                    reg += 1;
+                    let t = format!("t{c_local}");
+                    c_local += 1;
+                    (
+                        vec![format!("{d} = ashr i16 {a} {k}")],
+                        format!("  s16 {t} = (s16)((s16){a_c} >> {k});"),
+                        d,
+                        t,
+                        16u8,
+                    )
+                }
+                3 => {
+                    // add i16 (unsigned wrap — matches the C unsigned-domain
+                    // discipline).
+                    let a = last16.clone().unwrap_or_else(|| in_reg.clone());
+                    let a_c = last16_c.clone().unwrap_or_else(|| "in".to_string());
+                    // Draw the b operand ONCE so the IR and the C twin pick
+                    // the same source (a re-roll would diverge them).
+                    let use_last = last16.is_some() && rng2.next_u64() % 2 == 0;
+                    let (b, b_c) = if use_last {
+                        (last16.clone().unwrap(), last16_c.clone().unwrap())
+                    } else {
+                        (in_reg.clone(), "in".to_string())
+                    };
+                    let d = format!("%{reg}");
+                    reg += 1;
+                    let t = format!("t{c_local}");
+                    c_local += 1;
+                    (
+                        vec![format!("{d} = add i16 {a} {b}")],
+                        format!("  s16 {t} = (s16)((u16){a_c} + (u16){b_c});"),
+                        d,
+                        t,
+                        16u8,
+                    )
+                }
+                4 => {
+                    // icmp slt i16 vs 0, zext to i8.
+                    let a = last16.clone().unwrap_or_else(|| in_reg.clone());
+                    let a_c = last16_c.clone().unwrap_or_else(|| "in".to_string());
+                    let d = format!("%{reg}");
+                    reg += 1;
+                    let e = format!("%{reg}");
+                    reg += 1;
+                    let t = format!("t{c_local}");
+                    c_local += 1;
+                    (
+                        vec![
+                            format!("{d} = icmp slt i16 {a} 0"),
+                            format!("{e} = zext i1 {d} to i8"),
+                        ],
+                        format!("  u8 {t} = (u8)((s16){a_c} < (s16)0);"),
+                        e,
+                        t,
+                        8u8,
+                    )
+                }
+                5 => {
+                    // trunc i16 to i8 (the low byte).
+                    let a = last16.clone().unwrap_or_else(|| in_reg.clone());
+                    let a_c = last16_c.clone().unwrap_or_else(|| "in".to_string());
+                    let d = format!("%{reg}");
+                    reg += 1;
+                    let t = format!("t{c_local}");
+                    c_local += 1;
+                    (
+                        vec![format!("{d} = trunc i16 {a} to i8")],
+                        format!("  u8 {t} = (u8){a_c};"),
+                        d,
+                        t,
+                        8u8,
+                    )
+                }
+                _ => {
+                    // i32 sdiv by a const 2..=9 (at most once — the biggest
+                    // routine frame).
+                    if used_i32 {
+                        // Fall back to an i16 sdiv (the i32 slot is spent).
+                        let k = 2 + (rng2.next_u64() % 8);
+                        let a = last16.clone().unwrap_or_else(|| in_reg.clone());
+                        let a_c = last16_c.clone().unwrap_or_else(|| "in".to_string());
+                        let d = format!("%{reg}");
+                        reg += 1;
+                        let t = format!("t{c_local}");
+                        c_local += 1;
+                        (
+                            vec![format!("{d} = sdiv i16 {a} {k}")],
+                            format!("  s16 {t} = (s16)((s16){a_c} / {k});"),
+                            d,
+                            t,
+                            16u8,
+                        )
+                    } else {
+                        used_i32 = true;
+                        let k = 2 + (rng2.next_u64() % 8);
+                        let d = format!("%{reg}");
+                        reg += 1;
+                        let t = format!("t{c_local}");
+                        c_local += 1;
+                        (
+                            vec![format!("{d} = sdiv i32 {in2_reg} {k}")],
+                            format!("  s32 {t} = (s32)((s32)in2 / {k});"),
+                            d,
+                            t,
+                            32u8,
+                        )
+                    }
+                }
+            };
+        for line in &ir_lines {
+            ir.push_str(line);
+            ir.push('\n');
+        }
+        c.push_str(&c_line);
+        c.push('\n');
+
+        // Fold the result into the checksum (byte-wise, matching the C
+        // twin's fold exactly).
+        let (fold_ir, fold_c) = ir_fold_lines(&res_reg, &res_c, res_w, &mut reg);
+        for line in &fold_ir {
+            ir.push_str(line);
+            ir.push('\n');
+        }
+        c.push_str(&fold_c);
+        c.push('\n');
+
+        match res_w {
+            8 => {}
+            _ => {
+                last16 = Some(res_reg);
+                last16_c = Some(res_c);
+            }
+        }
+    }
+
+    ir.push_str("    ret void\n");
+    c.push_str("}\n");
+
+    IrProgram {
+        ir_text: ir,
+        inputs,
+        checksum_name: CHECKSUM_NAME.to_string(),
+        seed,
+        c_twin: c,
+    }
+}
+
+/// The checksum fold for an IR statement result: xor the result's bytes
+/// into the volatile i8 `checksum` global. Returns (IR lines, C twin
+/// line). The C twin's `(u8)(t >> 8u)` etc. match the IR's `lshr`+`trunc`
+/// byte extraction: the low byte of an arithmetic shift equals the low
+/// byte of the logical shift (the sign-fill bits land in the dropped high
+/// byte).
+fn ir_fold_lines(ir_reg: &str, c_local: &str, width: u8, reg: &mut u32) -> (Vec<String>, String) {
+    let mut ir_lines = Vec::new();
+    let c = match width {
+        8 => {
+            let c_reg = format!("%{reg}");
+            *reg += 1;
+            let x = format!("%{reg}");
+            *reg += 1;
+            ir_lines.push(format!("{c_reg} = load i8 @checksum"));
+            ir_lines.push(format!("{x} = xor i8 {c_reg} {ir_reg}"));
+            ir_lines.push(format!("store i8 {x} @checksum"));
+            format!("  checksum = (u8)(checksum ^ (u8){c_local});")
+        }
+        16 => {
+            let lo = format!("%{reg}");
+            *reg += 1;
+            let hi = format!("%{reg}");
+            *reg += 1;
+            let hi8 = format!("%{reg}");
+            *reg += 1;
+            let c_reg = format!("%{reg}");
+            *reg += 1;
+            let x = format!("%{reg}");
+            *reg += 1;
+            let y = format!("%{reg}");
+            *reg += 1;
+            ir_lines.push(format!("{lo} = trunc i16 {ir_reg} to i8"));
+            ir_lines.push(format!("{hi} = lshr i16 {ir_reg} 8"));
+            ir_lines.push(format!("{hi8} = trunc i16 {hi} to i8"));
+            ir_lines.push(format!("{c_reg} = load i8 @checksum"));
+            ir_lines.push(format!("{x} = xor i8 {c_reg} {lo}"));
+            ir_lines.push(format!("{y} = xor i8 {x} {hi8}"));
+            ir_lines.push(format!("store i8 {y} @checksum"));
+            format!("  checksum = (u8)(checksum ^ (u8){c_local} ^ (u8)({c_local} >> 8u));")
+        }
+        _ => {
+            // i32: four bytes.
+            let mut bytes = Vec::new();
+            for shift in [0u32, 8, 16, 24] {
+                if shift == 0 {
+                    let b = format!("%{reg}");
+                    *reg += 1;
+                    ir_lines.push(format!("{b} = trunc i32 {ir_reg} to i8"));
+                    bytes.push(b);
+                } else {
+                    let s = format!("%{reg}");
+                    *reg += 1;
+                    let b = format!("%{reg}");
+                    *reg += 1;
+                    ir_lines.push(format!("{s} = lshr i32 {ir_reg} {shift}"));
+                    ir_lines.push(format!("{b} = trunc i32 {s} to i8"));
+                    bytes.push(b);
+                }
+            }
+            let c_reg = format!("%{reg}");
+            *reg += 1;
+            ir_lines.push(format!("{c_reg} = load i8 @checksum"));
+            let mut acc = c_reg;
+            for b in &bytes {
+                let x = format!("%{reg}");
+                *reg += 1;
+                ir_lines.push(format!("{x} = xor i8 {acc} {b}"));
+                acc = x;
+            }
+            ir_lines.push(format!("store i8 {acc} @checksum"));
+            format!(
+                "  checksum = (u8)(checksum ^ (u8){c_local} ^ (u8)({c_local} >> 8u) \
+                 ^ (u8)({c_local} >> 16u) ^ (u8)({c_local} >> 24u));"
+            )
+        }
+    };
+    (ir_lines, c)
+}
+
+// ---------------------------------------------------------------------------
 // Differential runner
 // ---------------------------------------------------------------------------
 
@@ -1688,6 +2412,105 @@ pub fn run_differential(program: &Program) -> Result<u32, Failure> {
             format!("mismatch: pic checksum {pic}, host checksum {host}"),
         ))
     }
+}
+
+/// Run an IR-level program on both sides and return the agreed checksum
+/// (issue #14's IR mode): the PIC side runs the canonical IR through the
+/// in-process pipeline — `ir::parse` -> wholeprog -> legalize -> callgraph
+/// -> alloc -> isel -> banking -> peephole -> asm — bypassing clang and
+/// the driver binary; the host side compiles the C twin with host clang
+/// (the same computation in the C discipline). A pipeline panic is a
+/// `Panic` failure (the loud-panic contract); a checksum disagreement a
+/// `Mismatch`.
+pub fn run_ir_differential(prog: &IrProgram) -> Result<u32, Failure> {
+    let dir = WorkDir::new();
+    let pic = run_ir_pic(prog)?;
+
+    let twin_path = dir.path.join("twin.c");
+    std::fs::write(&twin_path, &prog.c_twin)
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("write twin.c: {e}")))?;
+    let host_prog = Program {
+        c_source: prog.c_twin.clone(),
+        inputs: prog.inputs.clone(),
+        checksum_name: prog.checksum_name.clone(),
+        seed: prog.seed,
+        statements: Vec::new(),
+        prologue: prog.c_twin.clone(),
+    };
+    let host = run_host(&host_prog, &twin_path, &dir)?;
+
+    if pic == host {
+        Ok(pic)
+    } else {
+        Err(Failure::new(
+            FailureKind::Mismatch,
+            format!("mismatch: pic checksum {pic}, host checksum {host}"),
+        ))
+    }
+}
+
+/// PIC side of the IR mode: the canonical IR through the in-process
+/// pipeline (mirroring the driver's stage chain, minus clang), the hex
+/// assembled in-process, `pic14-sim` seeded at the alloc addresses, run,
+/// checksum read, `halted()` required. A pipeline panic (a compiler bug)
+/// is caught and reported as a `Panic` failure, so the fuzz loop survives
+/// them.
+fn run_ir_pic(prog: &IrProgram) -> Result<u32, Failure> {
+    let (hex, layout) = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let mut m = ir::parse(&prog.ir_text);
+        m = wholeprog::merge(m);
+        m = legalize::legalize(m);
+        let cg = callgraph::build(&m);
+        let layout = alloc::allocate(&m, &callgraph::edges_text(&cg));
+        let mut addrs: HashMap<String, u16> = HashMap::new();
+        addrs.extend(layout.globals.clone());
+        addrs.extend(layout.locals.clone());
+        let asm = isel::select(&m, &addrs);
+        let asm = banking::assign_banks(&asm);
+        let asm = peephole::optimize(&asm);
+        let hex = asm::assemble_file_to_hex(&asm);
+        (hex, layout)
+    }))
+    .map_err(|p| {
+        let msg = p
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| p.downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("unknown panic");
+        Failure::new(FailureKind::Panic, format!("compiler pipeline panic: {msg}"))
+    })?;
+
+    let checksum_addr = *layout
+        .globals
+        .get(&prog.checksum_name)
+        .ok_or_else(|| {
+            Failure::new(
+                FailureKind::Compile,
+                format!("no global '{}' in the alloc map", prog.checksum_name),
+            )
+        })?;
+
+    let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
+    for input in &prog.inputs {
+        let addr = *layout
+            .globals
+            .get(&input.name)
+            .ok_or_else(|| {
+                Failure::new(
+                    FailureKind::Compile,
+                    format!("no global '{}' in the alloc map", input.name),
+                )
+            })?;
+        seed_le(&mut p, addr, input.width, input.value);
+    }
+    p.run(MAX_SIM_STEPS);
+    if !p.halted() {
+        return Err(Failure::new(
+            FailureKind::NoHalt,
+            format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+        ));
+    }
+    Ok(read_le(p.ram(), checksum_addr, 1) as u32)
 }
 
 /// PIC side: alloc layout (in-process, mirroring the driver's e2e) for the
