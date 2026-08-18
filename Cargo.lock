@@ -91,9 +91,14 @@ dependencies = [
  "banking",
  "device",
  "ir",
+ "iselcore",
  "legalize",
  "pic14-sim",
 ]
+
+[[package]]
+name = "iselcore"
+version = "0.1.0"
 
 [[package]]
 name = "legalize"

@@ -41,14 +41,8 @@
 
 use device::Device;
 use ir::{BinOp, Gep, GepBase, Inst, Module, Ty, Val};
+use iselcore::{ssa_key, Slot};
 use std::collections::{HashMap, HashSet};
-
-/// Map key for a local value: `{func}::{name}` (IR value names without `%`).
-/// Matches the keys `alloc` emits in its overlay layout, so a callee's param
-/// slots and the caller's live slots never collide across CALL boundaries.
-fn ssa_key(func: &str, name: &str) -> String {
-    format!("{func}::{name}")
-}
 
 /// The runtime routine names legalize injects for mul/div/rem/shift. All
 /// twenty-four have recipe bodies (Task 3: the i32 mul/div/rem + shifts;
@@ -163,30 +157,6 @@ enum Addr {
     Direct(u16),
     /// FSR is set up; the access goes through INDF.
     Indirect,
-}
-
-/// Where a local's bytes live. v1 only ever constructs `Direct` — introduced
-/// now (docs/29-pic18-port-design.md §2 D-2) so a later frame-pointer phase
-/// (recursion/reentrancy) never has to touch the call sites that resolve a
-/// local's address, only add a real `Frame` case here and wherever
-/// `Slot` values get constructed.
-enum Slot {
-    /// Statically allocated: a direct file address.
-    Direct(u16),
-    /// Frame-relative, FSR2 + offset. Reserved for the later reentrancy
-    /// phase; nothing constructs this yet.
-    #[allow(dead_code)]
-    Frame(i8),
-}
-
-impl Slot {
-    /// v1 only ever constructs `Direct`.
-    fn direct(&self) -> u16 {
-        match self {
-            Slot::Direct(a) => *a,
-            Slot::Frame(_) => unimplemented!("frame-relative slots arrive with the reentrancy phase"),
-        }
-    }
 }
 
 /// Per-function codegen state. All addresses come from the module-wide map;
@@ -5254,14 +5224,4 @@ pub fn parse_map(text: &str) -> HashMap<String, u16> {
         }
     }
     addrs
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slot_direct_returns_the_address() {
-        assert_eq!(Slot::Direct(0x42).direct(), 0x42);
-    }
 }
