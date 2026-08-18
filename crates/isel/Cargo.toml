@@ -7,11 +7,11 @@ publish = false
 [dependencies]
 ir = { path = "../ir" }
 device = { path = "../device" }
+banking = { path = "../banking" }
 
 [dev-dependencies]
 pic14-sim = { path = "../sim" }
 asm = { path = "../asm" }
-banking = { path = "../banking" }
 legalize = { path = "../legalize" }
 
 [[bin]]

@@ -212,7 +212,7 @@ struct Gen<'m> {
     /// function callee never clobbers it; a reader leaves `HIGH(<base>)`,
     /// whose bits 4:3 are the table base's page). `None` in pass A, where
     /// pages are not yet known and every restore is emitted (the measured
-    /// sizes drive the greedy assignment); `Some` in pass B, where a
+    /// sizes drive the page assignment); `Some` in pass B, where a
     /// same-page restore is skipped.
     page_of: Option<&'m HashMap<String, usize>>,
     out: Vec<String>,
@@ -230,7 +230,7 @@ impl<'m> Gen<'m> {
     /// reader leaves `HIGH(<base>)` whose bits 4:3 are the table base's page,
     /// equal to the target's page). In pass A (`page_of` is `None`) the
     /// pages are not known yet, so the restore is always emitted — pass A's
-    /// sizes (with every restore) drive the greedy page assignment, and the
+    /// sizes (with every restore) drive the page assignment, and the
     /// pass-B skip only shrinks functions, which never moves a function off
     /// its assigned page (the `.org` pads pin the page bases).
     fn emit_pclath_restore(&mut self, target: &str) {
@@ -4055,7 +4055,7 @@ fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
 /// Emit one function's body into `g.out`: runtime routines get their recipe
 /// body; ordinary functions get the block labels, phi copies, and
 /// terminators. Shared by both emission passes — pass A measures the body
-/// (every PCLATH restore present) to drive the greedy page assignment, pass
+/// (every PCLATH restore present) to drive the page assignment, pass
 /// B re-emits it with same-page restores skipped.
 fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // Runtime routines (legalize-injected): the entry block holds only the
@@ -4415,69 +4415,20 @@ fn word_size(lines: &[String]) -> usize {
 /// before ANY function whose start is page-aligned (an overflow continuation
 /// or an exact-boundary one) — and return the `(pad, page, next_addr)`. A
 /// function larger than one page can never fit (its intra-function GOTOs
-/// need a single stable page) and panics loudly; a program past the
-/// device's flash panics loudly too. The `.org` pads with 0x0000 words (the
-/// assembler supports it), so the final layout's addresses are exactly what
-/// the tracker predicts.
-///
-/// M11 two-phase emission: pass A measures every function body with all
-/// PCLATH restores present and runs this over ALL functions, so a call to a
-/// not-yet-emitted target still knows its page; pass B re-emits with
-/// same-page restores skipped. The skip only shrinks bodies, and the pads
-/// pin the page bases (a function whose start is page-aligned is anchored
-/// even when it only continues exactly at the boundary — the strict
-/// overflow check alone would leave it unanchored, and the elision would
-/// slide it below the boundary into a straddle), so every function stays on
-/// the page pass A assigned (elision is page-membership-stable).
-fn page_step(flash_words: u32, addr: usize, size: usize, name: &str) -> (Option<usize>, usize, usize) {
-    // The device's last page index — flash_words / 0x800 words per page,
-    // 0-indexed (e.g. 0x2000/0x800 = 4 pages, so the last is page 3).
-    let last_page = flash_words / 0x800 - 1;
-    if size > 0x800 {
-        panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
-    }
-    if addr as u32 >= flash_words {
-        panic!(
-            "isel: function @{name} would start at 0x{addr:04X}, beyond page {last_page} (device flash is {flash_words:#06x} words)"
-        );
-    }
-    let page_end = (addr & !0x7FF) + 0x800;
-    // A function whose start is page-aligned gets an explicit `.org` anchor —
-    // even when it merely CONTINUES exactly at the boundary (the previous
-    // function's pass-A size hit the boundary precisely, so the strict
-    // `addr + size > page_end` overflow check alone would emit no pad). The
-    // anchor covers both the overflow case (the pad target IS the
-    // page-aligned continuation) and the exact-boundary case, so every
-    // page-membership boundary is pinned. Without it, pass B's same-page
-    // restore elision shrinks the previous function and slides this one
-    // below the boundary into a straddle: its label resolves to the LOWER
-    // page while its later words sit in the upper one, so intra-function
-    // GOTOs (PAGE(<func>) from the label) misbranch.
-    let pad = if addr & 0x7FF == 0 {
-        Some(addr)
-    } else if addr + size > page_end {
-        if page_end as u32 >= flash_words {
-            panic!(
-                "isel: function @{name} would start at 0x{page_end:04X}, beyond page {last_page} (device flash is {flash_words:#06x} words)"
-            );
-        }
-        Some(page_end)
-    } else {
-        None
-    };
-    let start = pad.unwrap_or(addr);
-    (pad, start / 0x800, start + size)
-}
-
+/// need a single stable page) and panics loudly; a program past page 3
+/// (0x2000 — the device flash) panics loudly too. The `.org` pads with
+/// 0x0000 words (the assembler supports it), so the final layout's addresses
+/// are exactly what the tracker predicts.
 /// Verify the FINAL post-banking layout's page fit (issue #17): every
 /// function must lie entirely inside one 2048-word page, or its label
 /// resolves to the lower page while its later words sit in the upper one
 /// and its intra-function GOTOs (`PAGE(<func>)` from the label) misbranch.
 ///
-/// The greedy assignment (`page_step`) runs on pass-A sizes — before the
-/// banking pass inserts BANKSEL words that grow the text — and its `.org`
-/// pads only pin page bases, so a function that grew across a boundary has
-/// no anchor and the assembler's backward-`.org` panic never fires. This
+/// The bin-packing assignment (issue #12) runs on POST-banking sizes — the
+/// banking pass's BANKSEL growth is measured before packing, so a function
+/// that would straddle a boundary is packed into the next page with an
+/// anchor instead. The `.org` pads pin page bases, so the elision cannot
+/// move a function off its assigned page. This
 /// check walks the final text (the exact layout the assembler will place)
 /// with the same pass-1 semantics `asm::assemble` uses — `.org` jumps,
 /// `.align N` pads to N-word boundaries, labels take no words, `equ`/
@@ -4629,10 +4580,12 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 /// M11: every CALL runs with PCLATH<4:3> = the target's page (set
 /// immediately before, restored immediately after — the restore is skipped
 /// when the target is in the caller's own page), functions are assigned to
-/// 2048-word pages greedily (a function that would cross a page's end gets a
+/// 2048-word pages by first-fit bin packing over their post-banking sizes
+/// (a function that would cross a page's end gets a
 /// `.org <next base>` pad), and the program's highest word address is
 /// bounded by the device's 8K-word flash. Emission is two-phase: pass A
-/// measures every body (all restores present) and assigns pages for ALL
+/// measures every body (all restores present), measures the post-banking
+/// growth, and assigns pages for ALL
 /// functions so a forward call target's page is known; pass B re-emits with
 /// same-page restores skipped (the pads pin the page bases, so the elision
 /// never moves a function off its assigned page).
@@ -4816,7 +4769,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
     // ---- PASS A: emit every function body with every PCLATH restore
-    // present, measure word sizes, and run the greedy page assignment over
+    // present, measure word sizes, and run the page assignment over
     // ALL functions. A single-pass emission cannot know a forward call
     // target's page while the caller is being emitted (the target's
     // placement depends on sizes measured later), so pass A measures and
@@ -4828,6 +4781,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     order.extend(m.funcs.iter().filter(|f| f.isr));
     order.extend(m.funcs.iter().filter(|f| !f.isr));
     let mut bodies: Vec<(String, usize)> = Vec::new();
+    let mut body_texts: Vec<String> = Vec::new();
     {
         let mut tmp = 0u32;
         for f in &order {
@@ -4844,12 +4798,105 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             };
             emit_func_body(&mut g, f);
             bodies.push((f.name.clone(), word_size(&g.out)));
+            body_texts.push(g.out.join("\n"));
         }
     }
-    // Greedy page assignment over every function's pass-A size, in emission
-    // order: the `.org` pads and the page each function lands on. The
-    // running word address starts at 5 without an ISR — the reset vector (1
-    // word: `goto __start`) plus the `__start` body (4 words), with
+    // The banking pass inserts BANKSEL words that grow the text (issue #17).
+    // The bin packing must fit the FINAL post-banking sizes, or a function
+    // packed into a tight page tail can straddle the boundary after banking
+    // (the greedy layout had slack; first-fit's tighter packing does not).
+    // Per-function BANKSEL counts are placement-independent — every label
+    // resets the tracked bank, and callee exit banks are callee-local — so
+    // measuring once on the pass-A text (all PCLATH restores present) is
+    // exact, and pass B's same-page restore elision only shrinks bodies, so
+    // the packed layout is elision-stable.
+    let mut measure: Vec<String> = vec![
+        "    org 0x0000".to_string(),
+        "    goto __start".to_string(),
+        "".to_string(),
+    ];
+    if !has_isr {
+        measure.extend([
+            "__start:".to_string(),
+            "    MOVLW PAGE(main)".to_string(),
+            "    MOVWF PCLATH".to_string(),
+            "    CALL main".to_string(),
+            "    SLEEP".to_string(),
+            "".to_string(),
+        ]);
+    }
+    for (i, (name, _)) in bodies.iter().enumerate() {
+        measure.push(body_texts[i].clone());
+        if has_isr && name == isr_names[0] {
+            measure.extend([
+                "__start:".to_string(),
+                "    MOVLW PAGE(main)".to_string(),
+                "    MOVWF PCLATH".to_string(),
+                "    CALL main".to_string(),
+                "    SLEEP".to_string(),
+                "".to_string(),
+            ]);
+        }
+    }
+    let banked = banking::assign_banks(device, &measure.join("\n"));
+    // Measure each function's post-banking extent (function label to the
+    // NEXT function label, or the end) with the same pass-1 semantics
+    // `asm::assemble` uses. Internal block labels keep the current
+    // function's extent open — only function labels (and `__start`) close
+    // it, exactly like `verify_page_fit`.
+    let func_names: HashSet<&str> = order.iter().map(|f| f.name.as_str()).collect();
+    let mut post: HashMap<String, usize> = HashMap::new();
+    {
+        let mut org = 0usize;
+        let mut cur: Option<(String, usize)> = None;
+        for raw in banked.lines() {
+            let line = raw.split(';').next().unwrap_or("").trim();
+            if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("org ") {
+                org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
+                continue;
+            }
+            if line.starts_with("end") {
+                break;
+            }
+            if let Some(l) = line.strip_suffix(':') {
+                let name = l.trim().to_string();
+                if func_names.contains(name.as_str()) || name == "__start" {
+                    if let Some((prev, s)) = &cur {
+                        post.insert(prev.clone(), org - s);
+                    }
+                    cur = Some((name, org));
+                }
+                continue;
+            }
+            if line.contains(" equ ") {
+                continue;
+            }
+            if let Some(n) = line.strip_prefix(".align ") {
+                let n: usize = n.trim().parse().unwrap();
+                org = (org + n - 1) & !(n - 1);
+                continue;
+            }
+            if line.starts_with(".table ") {
+                continue;
+            }
+            org += 1;
+        }
+        if let Some((prev, s)) = &cur {
+            post.insert(prev.clone(), org - s);
+        }
+    }
+    // Bin-packing page assignment over every function's post-banking size,
+    // in emission order: first-fit — each function goes to the LOWEST-numbered
+    // page with room for it. The greedy next-fit only considered the current
+    // page, so a page tail was wasted whenever the next function was even
+    // slightly too large, even when a later small function could fill it;
+    // first-fit reuses those tails (a small function later in the module
+    // lands in an earlier page's tail, and the program uses fewer pages).
+    // The running word address starts at 5 without an ISR — the reset vector
+    // (1 word: `goto __start`) plus the `__start` body (4 words), with
     // `__start` at the top so the reset vector's GOTO (PCLATH = 0 at reset)
     // always reaches it. With an ISR the vector owns word 4: the ISR is
     // pinned there (no page pad — the vector IS the entry), `__start` moves
@@ -4859,22 +4906,69 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // unreachable; it panics loudly (ISRs are usually small).
     let mut pages: HashMap<String, usize> = HashMap::new();
     let mut pads: HashMap<String, usize> = HashMap::new();
-    let mut addr: usize = if has_isr { 4 } else { 5 };
-    for (name, size) in &bodies {
+    // `page_next[i]` = the next free word in page i (the running address of
+    // the page's last placed function). Pages are opened in order, so the
+    // last entry is the program's end — the const-table section's start.
+    // Page 0 starts after the 5-word header (reset `goto __start` + the
+    // 4-word `__start` body); with an ISR the vector owns word 4 and the
+    // ISR branch below sets page 0's next free word after the ISR + `__start`.
+    let mut page_next: Vec<usize> = vec![if has_isr { 4 } else { 5 }];
+    for (name, _) in &bodies {
+        let size = post[name];
         if has_isr && name == isr_names[0] {
             assert!(
-                4 + size <= 0x7FF,
+                4 + size + 4 <= 0x800,
                 "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
             );
             pages.insert(name.clone(), 0);
             pads.insert(name.clone(), 4);
-            addr = 4 + size + 4; // the ISR body + the 4-word __start body
+            // `size` is the ISR's post-banking body extent (label to the
+            // `__start` label); the 4-word `__start` body follows it.
+            page_next[0] = 4 + size + 4;
         } else {
-            let (pad, page, next) = page_step(device.flash_words, addr, *size, name);
-            addr = next;
+            if size > 0x800 {
+                panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
+            }
+            // First-fit: the lowest page whose tail fits this function.
+            let mut placed: Option<(usize, usize)> = None;
+            for (pi, next) in page_next.iter_mut().enumerate() {
+                if *next + size <= (pi + 1) * 0x800 {
+                    placed = Some((pi, *next));
+                    *next += size;
+                    break;
+                }
+            }
+            let (page, start) = match placed {
+                Some(p) => p,
+                None => {
+                    // No open page has room: open the next page. The device
+                    // bound (flash_words) is enforced loudly.
+                    let pi = page_next.len();
+                    let last_page = device.flash_words / 0x800 - 1;
+                    if pi as u32 >= device.flash_words / 0x800 {
+                        panic!(
+                            "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
+                            pi * 0x800,
+                            device.flash_words
+                        );
+                    }
+                    let start = pi * 0x800;
+                    page_next.push(start + size);
+                    (pi, start)
+                }
+            };
             pages.insert(name.clone(), page);
-            if let Some(p) = pad {
-                pads.insert(name.clone(), p);
+            // The anchor: a function whose start is page-aligned gets an
+            // explicit `.org` pad — both the new-page case and the
+            // exact-boundary continuation (the previous function's size
+            // hit the boundary precisely, so the strict fit check alone
+            // would emit no pad). Without it, pass B's same-page restore
+            // elision shrinks the previous function and slides this one
+            // below the boundary into a straddle: its label resolves to the
+            // LOWER page while its later words sit in the upper one, so
+            // intra-function GOTOs (PAGE(<func>) from the label) misbranch.
+            if start & 0x7FF == 0 {
+                pads.insert(name.clone(), start);
             }
         }
     }
@@ -4883,38 +4977,53 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // pass B pins it to this same start, so the pages hold in the final text.
     let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
     consts.sort_by_key(|g| g.name.clone());
-    let table_start = addr;
+    let table_start = page_next.last().copied().unwrap_or(if has_isr { 4 } else { 5 });
     for (entry, page) in reader_pages(&consts, table_start) {
         pages.insert(entry, page);
     }
     // ---- PASS B: emit the final text with every function's page known.
     // Same-page calls (and same-page const reads) skip the restore pair; the
-    // pages are pass A's, and the `.org` pads pin the page bases, so the
-    // elision cannot move a function off its assigned page (it only shrinks
-    // bodies — page-membership-stable).
+    // pages are the assignment's, and the `.org` pads pin the page bases, so
+    // the elision cannot move a function off its assigned page (it only
+    // shrinks bodies — page-membership-stable).
+    //
+    // Emission is in PAGE order, not module order: bin packing can place a
+    // later function in an earlier page's tail, so module-order emission
+    // would emit a backward `.org` (a page-0 function after a page-1 one) —
+    // the assembler panics on backward `.org`. Within a page, functions keep
+    // their emission order (the page's running address is monotonic).
+    let mut page_order: Vec<Vec<(&ir::Func, &str)>> = Vec::new();
+    for (f, (name, _)) in order.iter().zip(&bodies) {
+        let page = pages[name];
+        while page_order.len() <= page {
+            page_order.push(Vec::new());
+        }
+        page_order[page].push((*f, name.as_str()));
+    }
     {
         let mut tmp = 0u32;
         let mut addr_b: usize = if has_isr { 4 } else { 5 };
-        for (f, (name, _)) in order.iter().zip(&bodies) {
-            let mut g = Gen {
-                m,
-                addrs,
-                resolved: &resolved,
-                scratch,
-                retval_lo,
-                cur_func: &f.name,
-                tmp: &mut tmp,
-                page_of: Some(&pages),
-                out: Vec::new(),
-            };
-            emit_func_body(&mut g, f);
-            if let Some(pad) = pads.get(name) {
-                out.push(format!("    org 0x{pad:04X}"));
-                addr_b = *pad;
-            }
-            addr_b += word_size(&g.out);
-            out.extend(g.out);
-            if f.isr {
+        for funcs_on_page in &page_order {
+            for (f, name) in funcs_on_page {
+                let mut g = Gen {
+                    m,
+                    addrs,
+                    resolved: &resolved,
+                    scratch,
+                    retval_lo,
+                    cur_func: &f.name,
+                    tmp: &mut tmp,
+                    page_of: Some(&pages),
+                    out: Vec::new(),
+                };
+                emit_func_body(&mut g, f);
+                if let Some(pad) = pads.get(*name) {
+                    out.push(format!("    org 0x{pad:04X}"));
+                    addr_b = *pad;
+                }
+                addr_b += word_size(&g.out);
+                out.extend(g.out);
+                if f.isr {
                 // `__start` moves after the ISR (the vector owns word 4):
                 // the reset GOTO at word 0 still reaches it — page 0, by
                 // the ISR fit check above.
@@ -4927,6 +5036,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     "".to_string(),
                 ]);
                 addr_b += 4;
+            }
             }
         }
         // Pin the const-table section to its pass-A `table_start` whenever
@@ -4955,7 +5065,6 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 .any(|((_, pa), (_, pb))| pa != pb);
             if drift {
                 out.push(format!("    org 0x{table_start:04X}"));
-                addr = table_start;
             }
         }
     }
@@ -5013,6 +5122,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
         }
     }
+    let mut addr = table_start;
     for g in consts {
         assert!(
             !g.bytes.is_empty(),
