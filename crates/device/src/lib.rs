@@ -4,7 +4,7 @@
 //! the design this implements. P1 adds the PIC18F4550 profile;
 //! `has_hardware_multiply`/`has_tblrd`/`sfrs` still aren't added (unused so
 //! far) and `access_bank` never will be — it's a core PIC18 invariant, not
-//! a per-device fact (see docs/superpowers/plans/2026-08-18-pic18-port-p1.md).
+//! a per-device fact (see docs/superpowers/plans/2026-08-18-pic18-port-p1.md). P2 populates `PIC18F4550`'s `ram_banks`/`common_ram` for real (P0/P1 left them as placeholders since nothing consumed them yet).
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Core {
@@ -41,19 +41,25 @@ pub const PIC16F877A: Device = Device {
 };
 
 /// The PIC18F2455/2550/4455/4550 family (the 4550 profile specifically —
-/// the others share the core with less flash/RAM). `ram_banks`/`common_ram`
-/// are the PIC14 banked-GPR-region model, which PIC18's Access Bank + BSR
-/// scheme doesn't use — left empty/`None` here since nothing consumes them
-/// for a Pic18 device yet (P1 has no allocator; the access-bank/BSR
-/// addressing model itself is a core PIC18 architecture invariant, not a
-/// per-device fact, so it isn't a `Device` field at all — see
-/// docs/superpowers/plans/2026-08-18-pic18-port-p1.md).
+/// the others share the core with less flash/RAM).
 pub const PIC18F4550: Device = Device {
     name: "p18f4550",
     core: Core::Pic18,
     flash_words: 0x4000,
-    ram_banks: &[],
-    common_ram: None,
+    // One contiguous GPR range (0x0004-0x07FF) — PIC18's Access Bank
+    // (0x000-0x05F) plus BSR-selected banks 0-7 (0x060-0x7FF) form
+    // unbroken GPR, unlike PIC14's four banks separated by SFR holes, so a
+    // single-entry table is correct here (see `Device::region_for`, which
+    // already handles an arbitrary bank list generically — no PIC18-
+    // specific allocator code is needed anywhere, only this data).
+    // 0x0000-0x0003 is reserved (see `common_ram` below), so GPR starts at
+    // 0x0004.
+    ram_banks: &[(0x0004, 0x07FF)],
+    // Reserved for isel-pic18's fixed `retval` region (up to 4 bytes, for
+    // an i32 return value even though P2's own scope only needs i8/i16) —
+    // bank-independent (always reachable via the Access Bank's `a=0`, no
+    // `BSR` dependency), mirroring PIC14's `common_ram` rationale exactly.
+    common_ram: Some((0x0000, 0x0003)),
     stack_depth: 31,
     interrupt_vectors: &[0x0008, 0x0018],
 };
