@@ -24,7 +24,7 @@ fn gpasm() -> String {
 #[test]
 fn banked_ptr_hex_matches_gpasm_and_runs() {
     let src = include_str!("fixtures/banked_ptr.asm");
-    let ours = assemble_file_to_hex(src);
+    let ours = assemble_file_to_hex(&device::PIC16F877A, src);
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::write(format!("{dir}/banked_ptr_ours.hex"), &ours).unwrap();
     let out = Command::new(gpasm())

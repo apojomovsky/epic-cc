@@ -127,7 +127,7 @@ fn panics_when_program_exceeds_device_flash() {
     // words) cannot be stored and must panic loudly. `nop` is 0x0000 (to_hex
     // would trim it) but the bound assert fires before rendering.
     let mut src = String::from("    org 0x2000\n    nop\n    end\n");
-    let _ = assemble_file_to_hex(&src);
+    let _ = assemble_file_to_hex(&device::PIC16F877A, &src);
 }
 
 #[test]
@@ -140,7 +140,7 @@ fn device_flash_exact_fill_does_not_panic() {
         src.push_str("    movlw 0x00\n");
     }
     src.push_str("    end\n");
-    let hex = assemble_file_to_hex(&src);
+    let hex = assemble_file_to_hex(&device::PIC16F877A, &src);
     assert!(hex.contains(":00000001FF\n"), "missing EOF record: {hex:?}");
     assert!(hex.lines().count() > 2, "full-flash image must span records");
 }
@@ -151,7 +151,7 @@ fn program_at_word_0x1000_assembles() {
     // a program located at 0x1000 — M11 replaces it with the device-flash
     // bound (< 0x2000). A single instruction placed at 0x1000 is legal now.
     let src = "    org 0x1000\n    movlw 0x2A\n    end\n";
-    let words = assemble_file_to_hex(&src);
+    let words = assemble_file_to_hex(&device::PIC16F877A, &src);
     assert!(words.contains(":00000001FF\n"), "missing EOF record: {words:?}");
 }
 

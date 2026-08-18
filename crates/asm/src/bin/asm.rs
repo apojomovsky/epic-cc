@@ -17,7 +17,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let hex = asm::assemble_file_to_hex(&src);
+    let hex = asm::assemble_file_to_hex(&device::PIC16F877A, &src);
     if let Err(e) = std::fs::write(&out_path, hex) {
         eprintln!("asm: cannot write {out_path}: {e}");
         return ExitCode::FAILURE;

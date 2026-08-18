@@ -9,7 +9,7 @@ fn gpasm() -> String {
 #[test]
 fn probe_hex_matches_gpasm_and_runs() {
     let src = include_str!("fixtures/probe.asm");
-    let ours = assemble_file_to_hex(src);
+    let ours = assemble_file_to_hex(&device::PIC16F877A, src);
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::write(format!("{dir}/probe_ours.hex"), &ours).unwrap();
     let out = Command::new(gpasm())

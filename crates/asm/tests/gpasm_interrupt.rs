@@ -136,7 +136,7 @@ fn to_gpasm_src(src: &str) -> String {
 #[test]
 fn interrupt_hex_matches_gpasm_and_runs() {
     let src = include_str!("fixtures/interrupt.asm");
-    let ours = assemble_file_to_hex(src);
+    let ours = assemble_file_to_hex(&device::PIC16F877A, src);
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::write(format!("{dir}/interrupt_ours.hex"), &ours).unwrap();
     let gpasm_src = to_gpasm_src(src);

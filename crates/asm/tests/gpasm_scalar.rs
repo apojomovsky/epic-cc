@@ -21,7 +21,7 @@ fn gpasm() -> String {
 #[test]
 fn scalar_hex_matches_gpasm_and_runs() {
     let src = include_str!("fixtures/scalar.asm");
-    let ours = assemble_file_to_hex(src);
+    let ours = assemble_file_to_hex(&device::PIC16F877A, src);
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::write(format!("{dir}/scalar_ours.hex"), &ours).unwrap();
     let out = Command::new(gpasm())
