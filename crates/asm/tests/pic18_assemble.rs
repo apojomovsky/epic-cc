@@ -78,3 +78,18 @@ fn byte_oriented_without_dest_select_encode_correctly() {
         assert_eq!(words, vec![*expected], "encoding {src}");
     }
 }
+
+#[test]
+fn bit_oriented_instructions_encode_correctly() {
+    let cases: &[(&str, u16)] = &[
+        ("BCF 0x55,3,A", 0x9655),
+        ("BSF 0x55,5,A", 0x8A55),
+        ("BTFSC 0x55,6,A", 0xBC55),
+        ("BTFSS 0x55,2,A", 0xA455),
+        ("BTG 0x55,4,A", 0x7855),
+    ];
+    for (src, expected) in cases {
+        let words = assemble_pic18(&format!("    {src}\n"));
+        assert_eq!(words, vec![*expected], "encoding {src}");
+    }
+}

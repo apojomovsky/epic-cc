@@ -245,6 +245,23 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             };
             vec![base | a << 8 | f]
         }
+        "BCF" | "BSF" | "BTFSC" | "BTFSS" | "BTG" => {
+            let f = parse_f_field(rest, symbols);
+            let b: u16 = ops[1]
+                .parse()
+                .unwrap_or_else(|_| panic!("asm(pic18): bad bit number {}", ops[1]));
+            assert!(b <= 7, "asm(pic18): bit number {b} out of range 0-7");
+            let a = parse_a_bit(ops[2]);
+            let base: u16 = match mne.as_str() {
+                "BCF" => 0x9000,
+                "BSF" => 0x8000,
+                "BTFSC" => 0xB000,
+                "BTFSS" => 0xA000,
+                "BTG" => 0x7000,
+                _ => unreachable!(),
+            };
+            vec![base | b << 9 | a << 8 | f]
+        }
         other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
     }
 }
