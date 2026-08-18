@@ -34,18 +34,22 @@
 //! Tasks 3/4's recipe emitters read their working state from
 //! `{func}::__scr` + offset. Only the routines actually used are injected
 //! (cleaner text artifacts).
+//!
+//! A routine both the main and the interrupt context reach is injected
+//! TWICE — `__mul_u8` and `__mul_u8_isr` — so the two contexts never share
+//! one frame. Without the split, an interrupt taken partway through main's
+//! multiply re-enters the same scratch bytes and main resumes against the
+//! ISR's state, with no diagnostic. See `split_isr_routines`.
 
 use std::collections::{HashMap, HashSet};
 
 use ir::{Alloca, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Inst, Module, Param, Ty, Val};
 
 pub fn legalize(m: Module) -> Module {
-    // Interrupt shared-function duplication first: the runtime routines are
-    // injected below, and isel emits a routine body only for the exact
-    // routine names (crates/isel ROUTINE_NAMES), so a duplicated routine
-    // (`__mul_u8_isr`) could not be emitted. Duplicating the user functions
-    // first keeps the injected routines shared — their frames are placed at
-    // max over their callers, which lands in the ISR's disjoint region.
+    // Interrupt duplication happens in two layers. User functions split
+    // here, before the lowering loop, because their calls already exist.
+    // The runtime routines split after it (`split_isr_routines`), because
+    // the loop is what creates their calls.
     let m = duplicate_isr_shared(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
@@ -73,10 +77,86 @@ pub fn legalize(m: Module) -> Module {
         }
         funcs.push(Func { name: f.name, ret: f.ret, params: f.params, blocks, isr: f.isr });
     }
+    // Runtime-routine duplication for the interrupt context. The user-level
+    // duplication ran before the loop above, but the routine CALLs are
+    // created BY that loop, so the routines can only be split here. A
+    // routine both contexts reach gets an `_isr` copy with its own frame;
+    // without it, an ISR that preempts main inside `__mul_u8` re-enters the
+    // one shared frame and clobbers main's in-flight state.
+    let isr_used = split_isr_routines(&mut funcs, &used);
     for name in &used {
         funcs.push(routine_func(name));
     }
+    for name in &isr_used {
+        let base = name
+            .strip_suffix("_isr")
+            .expect("legalize: isr routine name must end in _isr");
+        let mut f = routine_func(base);
+        f.name = name.clone();
+        funcs.push(f);
+    }
     Module { globals: m.globals, funcs }
+}
+
+/// Split the runtime routines that BOTH the main and interrupt contexts
+/// reach: each gets an `_isr` copy and every routine call inside the ISR
+/// context is rewritten to it. Returns the `_isr` names to inject, in
+/// `used` order so the emitted module text stays deterministic.
+///
+/// A routine only the ISR reaches is left shared: there is no main-context
+/// caller whose frame it could clobber, and a second copy would spend flash
+/// and RAM for nothing. This mirrors `duplicate_isr_shared`'s policy for
+/// user functions, one layer down.
+fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
+    if used.is_empty() || !funcs.iter().any(|f| f.isr) {
+        return Vec::new();
+    }
+    // Caller -> callee edges over the POST-lowering module, so the routine
+    // calls the loop above just created are visible.
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for f in funcs.iter() {
+        let edges = adj.entry(f.name.clone()).or_default();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Call(c) = inst {
+                    edges.push(c.func.clone());
+                }
+            }
+        }
+    }
+    let isr_roots: Vec<&str> =
+        funcs.iter().filter(|f| f.isr).map(|f| f.name.as_str()).collect();
+    let isr_ctx = reachable(&isr_roots, &adj);
+    let main_ctx = reachable(&["main"], &adj);
+    let shared: HashSet<&str> = used
+        .iter()
+        .map(String::as_str)
+        .filter(|r| isr_ctx.contains(*r) && main_ctx.contains(*r))
+        .collect();
+    if shared.is_empty() {
+        return Vec::new();
+    }
+    // Rewrite the shared routines' calls inside the ISR context only. The
+    // main-context callers (including a shared user function's ORIGINAL,
+    // which duplicate_isr_shared left main-only) keep the base name.
+    for f in funcs.iter_mut() {
+        if !isr_ctx.contains(&f.name) {
+            continue;
+        }
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::Call(c) = inst {
+                    if shared.contains(c.func.as_str()) {
+                        c.func = format!("{}_isr", c.func);
+                    }
+                }
+            }
+        }
+    }
+    used.iter()
+        .filter(|u| shared.contains(u.as_str()))
+        .map(|u| format!("{u}_isr"))
+        .collect()
 }
 
 /// Fresh SSA name supply for the fcmp materialization trees. Seeded with

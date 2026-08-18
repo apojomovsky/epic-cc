@@ -95,8 +95,18 @@ const ROUTINE_NAMES: [&str; 33] = [
     "__fptosi_f32",
 ];
 
-fn is_routine_name(name: &str) -> bool {
-    ROUTINE_NAMES.contains(&name)
+/// The recipe a routine function emits, or `None` if the name is not a
+/// runtime routine at all.
+///
+/// An interrupt-context copy (`__mul_u8_isr`, legalize's routine
+/// duplication) shares the base routine's recipe but keeps its own name for
+/// its label and — the load-bearing part — its own slots, so the ISR's frame
+/// never overlaps the copy main is executing in. A duplicated USER function
+/// (`helper_isr`) strips to `helper`, which is not a routine, so it takes
+/// the ordinary block-emission path.
+fn routine_recipe(name: &str) -> Option<&str> {
+    let base = name.strip_suffix("_isr").unwrap_or(name);
+    ROUTINE_NAMES.contains(&base).then_some(base)
 }
 
 /// The byte address of a literal-pointer operand (`"0x<K>"` — the
@@ -1995,16 +2005,20 @@ impl<'m> Gen<'m> {
     /// but arbitrary (poison)), any value is legal — no guard, documented. The nine
     /// shift routines (variable count) share `emit_shift_body`.
     fn emit_routine(&mut self) {
+        // `name` addresses this function's OWN slots and label (an `_isr`
+        // copy has its own frame); `recipe` selects the shared body.
         let name = self.cur_func;
+        let recipe = routine_recipe(name)
+            .unwrap_or_else(|| panic!("isel: @{name} is not a runtime routine"));
         let scr = self.slot_addr(name, "__scr");
         self.emit(format!("{name}:"));
-        match name {
+        match recipe {
             // Variable-count shifts: mask the count to width-1, bounded
             // loop over the val param slot (see emit_shift_body).
             "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
             | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32"
             | "__ashr_i32" => {
-                let (bytes, op) = match name {
+                let (bytes, op) = match recipe {
                     "__shl_u8" => (1, BinOp::Shl),
                     "__shl_u16" => (2, BinOp::Shl),
                     "__shl_u32" => (4, BinOp::Shl),
@@ -2158,7 +2172,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_next}:"));
                 self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
                 self.emit(format!("    GOTO {l_loop}"));
-                if name == "__udiv_u8" {
+                if recipe == "__udiv_u8" {
                     self.store_retval(num, 1);
                 } else {
                     self.store_retval(rem_lo, 1);
@@ -2205,7 +2219,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_next}:"));
                 self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
                 self.emit(format!("    GOTO {l_loop}"));
-                if name == "__udiv_u16" {
+                if recipe == "__udiv_u16" {
                     self.store_retval(num, 2);
                 } else {
                     self.store_retval(rem_lo, 2);
@@ -2271,7 +2285,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_next}:"));
                 self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
                 self.emit(format!("    GOTO {l_loop}"));
-                if name == "__sdiv_i8" {
+                if recipe == "__sdiv_i8" {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
                     self.emit(format!("    GOTO {l_store}"));
                     self.emit(format!("    COMF 0x{num:02X}, F"));
@@ -2344,7 +2358,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_next}:"));
                 self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
                 self.emit(format!("    GOTO {l_loop}"));
-                if name == "__sdiv_i16" {
+                if recipe == "__sdiv_i16" {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
                     self.emit(format!("    GOTO {l_store}"));
                     self.neg16_in_place(num); // -quotient
@@ -2420,7 +2434,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{:02X}", scr + 4 + i)); // den copy
                 }
                 self.emit_divmod32(num, scr);
-                if name == "__udiv_u32" {
+                if recipe == "__udiv_u32" {
                     self.store_retval(num, 4);
                 } else {
                     self.store_retval(scr, 4);
@@ -2458,7 +2472,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{:02X}", den_s + i)); // |den| copy
                 }
                 self.emit_divmod32(num, scr);
-                if name == "__sdiv_i32" {
+                if recipe == "__sdiv_i32" {
                     self.emit(format!("    BTFSS 0x{flags:02X}, 0"));
                     self.emit(format!("    GOTO {l_store}"));
                     self.neg32_in_place(num); // -quotient
@@ -2490,7 +2504,7 @@ impl<'m> Gen<'m> {
                 self.assert_bank0(&[pa, pa + 3, pb, pb + 3, scr, scr + 13], name);
                 // __sub_f32 = flip b's sign bit, then the add path.
                 self.emit_f32_extract(pa, scr, scr + 1, scr + 2, false);
-                self.emit_f32_extract(pb, scr + 5, scr + 6, scr + 7, name == "__sub_f32");
+                self.emit_f32_extract(pb, scr + 5, scr + 6, scr + 7, recipe == "__sub_f32");
                 self.emit_f32_add_body(scr);
             }
             "__mul_f32" => {
@@ -2529,7 +2543,7 @@ impl<'m> Gen<'m> {
             "__fptoui_f32" | "__fptosi_f32" => {
                 let val = self.slot_addr(name, "val");
                 self.assert_bank0(&[val, val + 3, scr, scr + 7], name);
-                self.emit_f32_fptoi_body(val, scr, name == "__fptosi_f32");
+                self.emit_f32_fptoi_body(val, scr, recipe == "__fptosi_f32");
             }
             "__cmp_f32" => {
                 let a = self.slot_addr(name, "a");
@@ -4021,8 +4035,8 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // the injected Func has no `ret` for. A routine with no recipe yet
     // panics loudly rather than emitting an empty label that would silently
     // fall through into the next function.
-    if is_routine_name(&f.name) {
-        match &f.name[..] {
+    if let Some(recipe) = routine_recipe(&f.name) {
+        match recipe {
             "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8"
             | "__udiv_u16" | "__urem_u16" | "__udiv_u32" | "__urem_u32"
             | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
