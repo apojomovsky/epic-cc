@@ -132,3 +132,56 @@ fn fixed_encoding_control_instructions() {
         assert_eq!(words, vec![*expected], "encoding {src}");
     }
 }
+
+#[test]
+fn conditional_branch_encodes_forward_offset() {
+    // BZ at word 0 branching to a label at word 8: next-instruction word is
+    // 1, so n8 = 8 - 1 = 7.
+    let words = assemble_pic18(
+        "    BZ target\n    NOP\n    NOP\n    NOP\n    NOP\n    NOP\n    NOP\n    NOP\ntarget:\n    NOP\n",
+    );
+    assert_eq!(words[0], 0xE007);
+}
+
+#[test]
+fn conditional_branch_encodes_backward_offset() {
+    // target: at word 0, BZ at word 9 (after 9 NOPs) branching back:
+    // next-instruction word is 10, n8 = 0 - 10 = -10 = 0xF6.
+    let mut src = String::from("target:\n");
+    for _ in 0..9 {
+        src.push_str("    NOP\n");
+    }
+    src.push_str("    BZ target\n");
+    let words = assemble_pic18(&src);
+    assert_eq!(words[9], 0xE0F6);
+}
+
+#[test]
+fn bra_and_rcall_use_the_11_bit_offset() {
+    let words = assemble_pic18("target:\n    NOP\n    BRA target\n    RCALL target\n");
+    // BRA at word 1: n11 = 0 - 2 = -2 = 0x7FE
+    assert_eq!(words[1], 0xD7FE);
+    // RCALL at word 2: n11 = 0 - 3 = -3 = 0x7FD, base 0xD800 (not BRA's
+    // 0xD000 — bit 11 distinguishes RCALL from BRA)
+    assert_eq!(words[2], 0xDFFD);
+}
+
+#[test]
+fn every_conditional_branch_mnemonic_uses_its_own_base_opcode() {
+    let cases: &[(&str, u16)] = &[
+        ("BZ", 0xE000),
+        ("BNZ", 0xE100),
+        ("BC", 0xE200),
+        ("BNC", 0xE300),
+        ("BOV", 0xE400),
+        ("BNOV", 0xE500),
+        ("BN", 0xE600),
+        ("BNN", 0xE700),
+    ];
+    for (mne, base) in cases {
+        // Branch to self: next-instruction word is 1, target word is 0, so
+        // n8 = 0 - 1 = -1 = 0xFF for every one of these.
+        let words = assemble_pic18(&format!("here:\n    {mne} here\n"));
+        assert_eq!(words[0], base | 0xFF, "encoding {mne}");
+    }
+}

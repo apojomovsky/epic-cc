@@ -192,7 +192,6 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
     let mne = it.next().expect("asm: empty instruction line").to_ascii_uppercase();
     let rest = it.next().unwrap_or("").trim();
     let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
-    let _ = addr; // used starting Task 8 (relative branches)
     match mne.as_str() {
         "NOP" => vec![0x0000],
         "ADDWF" | "ADDWFC" | "ANDWF" | "COMF" | "DECF" | "DECFSZ" | "DCFSNZ" | "INCF"
@@ -291,6 +290,42 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
         "MOVLB" => {
             let k = (parse_lit(rest, symbols) & 0xF) as u16;
             vec![0x0100 | k]
+        }
+        "BZ" | "BNZ" | "BC" | "BNC" | "BOV" | "BNOV" | "BN" | "BNN" => {
+            let target = *symbols
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
+            let n = target as i32 - (addr as i32 + 1);
+            assert!(
+                (-128..=127).contains(&n),
+                "asm(pic18): {mne} offset {n} out of range [-128,127]"
+            );
+            let n8 = (n as i8 as u8) as u16;
+            let base: u16 = match mne.as_str() {
+                "BZ" => 0xE000,
+                "BNZ" => 0xE100,
+                "BC" => 0xE200,
+                "BNC" => 0xE300,
+                "BOV" => 0xE400,
+                "BNOV" => 0xE500,
+                "BN" => 0xE600,
+                "BNN" => 0xE700,
+                _ => unreachable!(),
+            };
+            vec![base | n8]
+        }
+        "BRA" | "RCALL" => {
+            let target = *symbols
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
+            let n = target as i32 - (addr as i32 + 1);
+            assert!(
+                (-1024..=1023).contains(&n),
+                "asm(pic18): {mne} offset {n} out of range [-1024,1023]"
+            );
+            let n11 = (n as i16 as u16) & 0x7FF;
+            let base: u16 = if mne == "BRA" { 0xD000 } else { 0xD800 };
+            vec![base | n11]
         }
         other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
     }
