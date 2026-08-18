@@ -43,7 +43,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ir::{Alloca, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Inst, Module, Param, Ty, Val};
+use ir::{Alloca, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Icmp, Inst, Module, Param, Ty, Val};
 
 pub fn legalize(m: Module) -> Module {
     // Interrupt duplication happens in two layers. User functions split
@@ -63,9 +63,13 @@ pub fn legalize(m: Module) -> Module {
             let mut insts = Vec::with_capacity(b.insts.len());
             for inst in b.insts {
                 match inst {
-                    Inst::Bin(bin) => match lower_bin(&bin, &mut used) {
-                        Some(call) => insts.push(call),
+                    Inst::Bin(bin) => match fold_const_bin(&bin).or_else(|| lower_bin(&bin, &mut used)) {
+                        Some(folded_or_call) => insts.push(folded_or_call),
                         None => insts.push(Inst::Bin(bin)),
+                    },
+                    Inst::Icmp(icmp) => match fold_const_icmp(&icmp) {
+                        Some(frozen) => insts.push(frozen),
+                        None => insts.push(Inst::Icmp(icmp)),
                     },
                     Inst::FloatBin(fb) => insts.push(lower_fbin(&fb, &mut used)),
                     Inst::Fcmp(fc) => insts.extend(lower_fcmp(&fc, &mut used, &mut names)),
@@ -566,6 +570,132 @@ fn routine_name(op: BinOp, ty: Ty) -> Option<&'static str> {
 /// Rewrite one `Inst::Bin` into the runtime call, recording the routine as
 /// used. Returns `None` when the binop stays as-is: non-lowered ops, and
 /// const-count shifts (isel inlines those — the count arrives as a `Const`).
+/// Fold a `Bin` whose operands are both `Val::Const` into an `Inst::Freeze`
+/// carrying the literal result. isel has no path for a const-const shape
+/// (clang folds these upstream; only hand-written IR or a compiler-generated
+/// corner reaches here with both sides constant) — several ops panic
+/// outright and `sub` silently miscompiles by reading the second constant as
+/// a file address. `Freeze` already copies a `Val::Const` into `dst`'s slot
+/// via a plain `MOVLW`, so this needs no isel changes.
+///
+/// Returns `None` (leave the `Bin` unfolded) when either operand isn't
+/// constant, or when folding would have to invent a result for something
+/// that's already defined as LLVM poison: division/remainder by a
+/// zero constant (the runtime routine already documents that behavior) or a
+/// shift count outside `[0, width)` (isel's existing assert is the poison
+/// check).
+fn fold_const_bin(b: &ir::Bin) -> Option<Inst> {
+    // i1 is icmp/fcmp's output type only; isel asserts against a Bin typed
+    // i1 (`b.ty != Ty::I1`, arithmetic bit-widths make no sense on a 1-bit
+    // value). Ty::bytes() maps I1 to 1 byte like I8, so folding it here
+    // would manufacture an out-of-range "i1" constant instead of hitting
+    // that guard — leave it unfolded so isel's existing check still fires.
+    if b.ty == Ty::I1 { return None }
+    let (Val::Const(a), Val::Const(k)) = (&b.a, &b.b) else { return None };
+    let width = u32::from(b.ty.bytes()) * 8;
+    let result = eval_binop(b.op, width, *a, *k)?;
+    Some(Inst::Freeze(ir::Freeze { dst: b.dst.clone(), ty: b.ty, val: Val::Const(result) }))
+}
+
+/// Same fold for `Icmp`; the result is always `i1`.
+fn fold_const_icmp(c: &Icmp) -> Option<Inst> {
+    let (Val::Const(a), Val::Const(k)) = (&c.a, &c.b) else { return None };
+    let width = u32::from(c.ty.bytes()) * 8;
+    let result = eval_icmp(&c.pred, width, *a, *k);
+    Some(Inst::Freeze(ir::Freeze { dst: c.dst.clone(), ty: Ty::I1, val: Val::Const(i64::from(result)) }))
+}
+
+fn const_mask(width: u32) -> u64 {
+    if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }
+}
+
+/// Interpret the low `width` bits of `v` as a two's-complement signed value.
+fn sign_extend(v: u64, width: u32) -> i64 {
+    let shift = 64 - width;
+    ((v << shift) as i64) >> shift
+}
+
+/// Canonicalize a raw `width`-bit result as the unsigned form (`0..2^width`),
+/// matching how a plain arithmetic/bitwise/shift op's result reads when the
+/// operation itself carries no sign (only `sdiv`/`srem`/`ashr` do).
+fn canon_unsigned(v: u64, width: u32) -> i64 {
+    (v & const_mask(width)) as i64
+}
+
+/// Canonicalize a raw `width`-bit result as its signed form, for the ops
+/// (`sdiv`/`srem`/`ashr`) whose whole point is a signed interpretation.
+fn canon_signed(v: u64, width: u32) -> i64 {
+    sign_extend(v & const_mask(width), width)
+}
+
+/// Evaluate a binop on two constants, masked/interpreted at `width` bits to
+/// match isel's own per-byte truncation convention (`(k >> idx*8) & 0xFF`).
+/// The result is re-masked to `width` bits too — the IR text has no type
+/// tag on a bare constant, so a folded `add i8 200, 100` must read as `44`,
+/// not the unmasked `300`, to be the "obvious" result the width implies.
+fn eval_binop(op: BinOp, width: u32, a: i64, b: i64) -> Option<i64> {
+    let m = const_mask(width);
+    let au = (a as u64) & m;
+    let bu = (b as u64) & m;
+    Some(match op {
+        BinOp::Add => canon_unsigned(au.wrapping_add(bu), width),
+        BinOp::Sub => canon_unsigned(au.wrapping_sub(bu), width),
+        BinOp::And => canon_unsigned(au & bu, width),
+        BinOp::Or => canon_unsigned(au | bu, width),
+        BinOp::Xor => canon_unsigned(au ^ bu, width),
+        BinOp::Mul => canon_unsigned(au.wrapping_mul(bu), width),
+        BinOp::UDiv => {
+            if bu == 0 { return None };
+            canon_unsigned(au / bu, width)
+        }
+        BinOp::URem => {
+            if bu == 0 { return None };
+            canon_unsigned(au % bu, width)
+        }
+        BinOp::SDiv => {
+            if bu == 0 { return None };
+            let q = sign_extend(au, width).wrapping_div(sign_extend(bu, width));
+            canon_signed(q as u64, width)
+        }
+        BinOp::SRem => {
+            if bu == 0 { return None };
+            let r = sign_extend(au, width).wrapping_rem(sign_extend(bu, width));
+            canon_signed(r as u64, width)
+        }
+        BinOp::Shl | BinOp::LShr | BinOp::AShr => {
+            if !(0..i64::from(width)).contains(&b) { return None };
+            let shift = b as u32;
+            match op {
+                BinOp::Shl => canon_unsigned(au.wrapping_shl(shift), width),
+                BinOp::LShr => canon_unsigned(au >> shift, width),
+                BinOp::AShr => canon_signed((sign_extend(au, width) >> shift) as u64, width),
+                _ => unreachable!(),
+            }
+        }
+    })
+}
+
+fn eval_icmp(pred: &str, width: u32, a: i64, b: i64) -> bool {
+    let m = const_mask(width);
+    let au = (a as u64) & m;
+    let bu = (b as u64) & m;
+    match pred {
+        "eq" => au == bu,
+        "ne" => au != bu,
+        "ult" => au < bu,
+        "ule" => au <= bu,
+        "ugt" => au > bu,
+        "uge" => au >= bu,
+        "slt" => sign_extend(au, width) < sign_extend(bu, width),
+        "sle" => sign_extend(au, width) <= sign_extend(bu, width),
+        "sgt" => sign_extend(au, width) > sign_extend(bu, width),
+        "sge" => sign_extend(au, width) >= sign_extend(bu, width),
+        // ir::parse validates the predicate against this exact 10-entry set
+        // before an Icmp can exist, so anything else here is unreachable.
+        other => unreachable!("legalize: unknown icmp predicate {other}"),
+    }
+}
+
 fn lower_bin(b: &ir::Bin, used: &mut Vec<String>) -> Option<Inst> {
     if matches!(b.op, BinOp::Shl | BinOp::LShr | BinOp::AShr) {
         if matches!(b.b, Val::Const(_)) {
