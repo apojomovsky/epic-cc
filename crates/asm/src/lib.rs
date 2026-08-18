@@ -97,14 +97,95 @@ pub fn assemble(src: &str) -> Vec<u16> {
     out
 }
 
+/// Word count of one PIC18 instruction line's mnemonic — 2 for the
+/// two-word forms (`GOTO`/`CALL`/`LFSR`/`MOVFF`), 1 for everything else.
+/// Directives never reach this (handled in `assemble_pic18`'s pass 1
+/// before this is called).
+fn instruction_words_pic18(line: &str) -> usize {
+    let mne = line.split_whitespace().next().unwrap_or("");
+    match mne.to_ascii_uppercase().as_str() {
+        "GOTO" | "CALL" | "LFSR" | "MOVFF" => 2,
+        _ => 1,
+    }
+}
+
+/// Assemble PIC18 assembly source into 16-bit words indexed by word
+/// address. Two-pass like `assemble`: pass 1 resolves labels/`org`/`equ`
+/// and measures each line's word count (1 or 2); pass 2 encodes. No
+/// `.align`/`.table` — P1 has no const-table codegen to emit them (that
+/// machinery arrives with `TBLRD` support in a later phase).
+pub fn assemble_pic18(src: &str) -> Vec<u16> {
+    let mut symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut org = 0usize;
+    let mut lines: Vec<(usize, String)> = Vec::new();
+    for raw in src.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("org ") {
+            let target = parse_num(rest.trim());
+            assert!(
+                target >= org,
+                "asm: backward .org to 0x{target:04X} from 0x{org:04X} — an .org can only pad forward"
+            );
+            org = target;
+            continue;
+        }
+        if line.strip_prefix("end").is_some() {
+            break;
+        }
+        if let Some(label) = line.strip_suffix(':') {
+            symbols.insert(label.trim().to_string(), org);
+            continue;
+        }
+        if let Some(eq) = line.find(" equ ") {
+            let (name, val) = line.split_at(eq);
+            symbols.insert(name.trim().to_string(), parse_num(val[" equ ".len()..].trim()));
+            continue;
+        }
+        let words = instruction_words_pic18(line);
+        lines.push((org, line.to_string()));
+        org += words;
+    }
+    let mut out = vec![0u16; org];
+    for (addr, line) in &lines {
+        let encoded = encode_pic18(*addr, line, &symbols);
+        out[*addr] = encoded[0];
+        if encoded.len() == 2 {
+            out[*addr + 1] = encoded[1];
+        }
+    }
+    out
+}
+
+/// Encode one PIC18 instruction line to 1 or 2 words. `addr` is this
+/// instruction's own word address (needed by the relative-branch forms).
+fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<String, usize>) -> Vec<u16> {
+    let mut it = line.splitn(2, char::is_whitespace);
+    let mne = it.next().expect("asm: empty instruction line").to_ascii_uppercase();
+    let rest = it.next().unwrap_or("").trim();
+    let _ = addr; // used starting Task 8 (relative branches)
+    match mne.as_str() {
+        "NOP" => vec![0x0000],
+        other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
+    }
+}
+
 /// Assemble source and render the result as Intel HEX.
 ///
 /// The whole program (code + tables) must fit the device's flash: a program
 /// whose highest word address is beyond `device.flash_words` panics loudly.
-/// `assemble` itself is layout-only and stays unasserted so isel's unit tests
-/// can inspect words of any size.
+/// `assemble`/`assemble_pic18` are layout-only and stay unasserted so
+/// isel's unit tests can inspect words of any size.
 pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
-    let words = assemble(src);
+    let words = match device.core {
+        device::Core::Pic14 => assemble(src),
+        device::Core::Pic18 => assemble_pic18(src),
+    };
     assert!(
         words.len() as u32 <= device.flash_words,
         "asm: program of {} words exceeds device flash (highest address 0x{:04X} >= {:#06x}; {}-word flash)",
