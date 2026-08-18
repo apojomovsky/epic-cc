@@ -10,7 +10,10 @@
 
 use std::collections::HashMap;
 
-use fuzz::{generate, generate_float, run_differential, FailureKind, Input, Program, TYPEDEF_PROLOGUE};
+use fuzz::{
+    generate, generate_float, generate_ir, generate_signed, run_differential,
+    run_ir_differential, FailureKind, Input, IrProgram, Program, TYPEDEF_PROLOGUE,
+};
 
 /// The brief's tiny program: one u8 volatile input, one scalar expression.
 const TINY: &str = "volatile unsigned char in0;\n\
@@ -602,5 +605,212 @@ fn float_corpus_spans_the_float_surface() {
             n >= min,
             "{what} (marker {marker:?}) appears in only {n}/50 float corpus seeds"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #14: signed and IR-level fuzzing
+// ---------------------------------------------------------------------------
+
+/// A fixed signed statement body over the unsigned inputs in0/in1/in2.
+/// The wrap-safe discipline: arithmetic computes in the unsigned domain
+/// (`(sW)((uW)a op (uW)b)` — wrapping is defined on both sides), div/rem
+/// use CONST divisors 2..=9 (never 0, never -1 — the only signed-division
+/// UB pair INT_MIN / -1 is excluded by construction; signed const divisors
+/// stay plain `sdiv`/`srem`, clang does NOT magic-number strength-reduce
+/// signed division), shifts are const-count (ashr sign-fills), and the
+/// signed comparisons fold through the volatile checksum.
+const SIGNED_BODY: &str = "\
+  s8 t0 = (s8)((u8)in0 + 1u);\n\
+  s16 t1 = (s16)((s16)in1 / 3);\n\
+  s16 t2 = (s16)((s16)in1 % 5);\n\
+  s16 t3 = (s16)((s16)in1 >> 3);\n\
+  s32 t4 = (s32)((u32)in2 + 5u);\n\
+  checksum = (u8)(checksum ^ (u8)t0 ^ (u8)t1 ^ (u8)t2 ^ (u8)t3 ^ (u8)t4);\n\
+  checksum = (u8)(checksum ^ (u8)((s16)in1 < (s16)0) ^ (u8)((s32)in2 >= (s32)0));\n";
+
+/// A fixed signed program with the standard globals (u8/u16/u32 inputs +
+/// checksum). `in1 = 0x8000` seeds the wrap edge: `t3 = -32768 >> 3`
+/// exercises ashr sign-fill, and the negative comparisons (slt/sge) run
+/// against the sign-bit set. The body is kept lean (const divisors, no
+/// runtime-divisor guards) so main's frame leaves bank-0 room for the
+/// sdiv/srem i16 routine slots (the isel's loud assert).
+fn signed_prog() -> Program {
+    let prologue = format!(
+        "{TYPEDEF_PROLOGUE}\
+         volatile u8 in0;\n\
+         volatile u16 in1;\n\
+         volatile u32 in2;\n\
+         volatile u8 checksum;\n\
+         void main(void) {{\n"
+    );
+    let c_source = format!("{prologue}{SIGNED_BODY}}}\n");
+    Program {
+        c_source: c_source.clone(),
+        inputs: vec![
+            Input { name: "in0".into(), value: 200, width: 8, is_float: false },
+            Input { name: "in1".into(), value: 0x8000, width: 16, is_float: false },
+            Input { name: "in2".into(), value: 0x8000_0000, width: 32, is_float: false },
+        ],
+        checksum_name: "checksum".into(),
+        seed: 0,
+        statements: Vec::new(),
+        prologue: c_source,
+    }
+}
+
+#[test]
+fn signed_fixed_program_differential_clean() {
+    // The wrap-safe signed surface (sdiv/srem/ashr/slt/sge across
+    // s8/s16/s32) must be differential-clean — the compiler's signed
+    // routines agree with the host's for the edge-seeded inputs. in1 =
+    // 0x8000 exercises the INT_MIN guard and ashr sign-fill; in2 =
+    // 0x80000000 the i32 wrap.
+    let got = run_differential(&signed_prog())
+        .unwrap_or_else(|e| panic!("signed fixed program not differential-clean: {e}"));
+    assert!(got < 256, "checksum is a u8");
+}
+
+#[test]
+fn generate_signed_is_deterministic_and_disciplined() {
+    // The signed generator must be seed-deterministic and stay inside the
+    // wrap-safe discipline: no bare `int` arithmetic (16-bit on msp430,
+    // 32-bit on the host), every signed expression an explicit-width cast.
+    let a = generate_signed(42);
+    let b = generate_signed(42);
+    assert_eq!(a.c_source, b.c_source, "same seed must give the same source");
+    assert!(
+        a.c_source.contains("(s16)") || a.c_source.contains("(s32)") || a.c_source.contains("(s8)"),
+        "signed casts present"
+    );
+    // The s8 typedef exists on both sides.
+    assert!(a.c_source.contains("typedef signed char s8;"), "s8 typedef (msp430 arm)");
+    assert!(a.c_source.contains("typedef signed char s8;"), "s8 typedef (host arm)");
+    assert_eq!(a.checksum_name, "checksum");
+}
+
+#[test]
+fn generate_signed_fast_corpus_differential_clean() {
+    // The signed generator's fast seeds must all be differential-clean.
+    for seed in 0..8u64 {
+        let prog = generate_signed(seed);
+        run_differential(&prog)
+            .unwrap_or_else(|e| panic!("signed seed {seed} not differential-clean: {e}"));
+    }
+}
+
+#[test]
+#[ignore = "full 50-seed signed corpus (slow)"]
+fn signed_corpus_differential_clean() {
+    // The acceptance gate: all 50 signed seeds must run differential-clean.
+    let mut clean = 0usize;
+    let mut mismatch = 0usize;
+    let mut panic_kind = 0usize;
+    let mut nohalt = 0usize;
+    let mut compile = 0usize;
+    let mut harness = 0usize;
+    for seed in 0..50u64 {
+        let prog = generate_signed(seed);
+        match run_differential(&prog) {
+            Ok(_) => clean += 1,
+            Err(f) => {
+                match f.kind {
+                    FailureKind::Mismatch => mismatch += 1,
+                    FailureKind::Panic => panic_kind += 1,
+                    FailureKind::NoHalt => nohalt += 1,
+                    FailureKind::Compile => compile += 1,
+                    FailureKind::Harness => harness += 1,
+                }
+                println!("signed corpus failure at seed {seed}: {f}");
+                panic!("generated signed seed {seed} not differential-clean: {f}");
+            }
+        }
+    }
+    println!(
+        "signed corpus (50 seeds): clean {clean}, mismatch {mismatch}, panic {panic_kind}, \
+         nohalt {nohalt}, compile {compile}, harness {harness}"
+    );
+}
+
+// ---- IR-level mode ----
+
+/// A canonical IR program: `global`/`fn`/`block` text in the `ir::parse`
+/// dialect, fed straight to the in-process pipeline (no clang). The C twin
+/// below is the host oracle for the same computation (the checksum fold
+/// matches: lo byte ^ hi byte of out, ^ out2).
+const IR_TEXT: &str = "\
+global in i16\nglobal out i16\nglobal out2 i8\nglobal checksum i8\nfn main(void) ()\n  block entry:\n\
+    %1 = load i16 @in\n\
+    %2 = sdiv i16 %1 3\n\
+    %3 = srem i16 %1 5\n\
+    %4 = add i16 %2 %3\n\
+    %5 = ashr i16 %4 1\n\
+    %6 = icmp slt i16 %1 0\n\
+    %7 = zext i1 %6 to i8\n\
+    %8 = select i1 %6 i16 %5 i16 %1\n\
+    store i16 %8 @out\n\
+    store i8 %7 @out2\n\
+    %9 = trunc i16 %8 to i8\n\
+    %10 = lshr i16 %8 8\n\
+    %11 = trunc i16 %10 to i8\n\
+    %12 = xor i8 %9 %11\n\
+    %13 = xor i8 %12 %7\n\
+    store i8 %13 @checksum\n\
+    ret void\n";
+
+/// The C twin of `IR_TEXT` (host oracle; the PIC side runs the IR directly).
+const IR_TWIN_C: &str = "\
+#ifdef __MSP430__\ntypedef unsigned char u8;\ntypedef unsigned short u16;\ntypedef unsigned long u32;\ntypedef int s16;\ntypedef long s32;\n#else\ntypedef unsigned char u8;\ntypedef unsigned short u16;\ntypedef unsigned int u32;\ntypedef short s16;\ntypedef int s32;\n#endif\n\
+volatile u16 in;\nvolatile u16 out;\nvolatile u8 out2;\nvolatile u8 checksum;\nvoid main(void) {\n\
+  s16 t0 = (s16)((s16)((s16)in / 3));\n\
+  s16 t1 = (s16)((s16)((s16)in % 5));\n\
+  s16 t2 = (s16)(t0 + t1);\n\
+  s16 t3 = (s16)((s16)t2 >> 1);\n\
+  u8 c = (u8)((s16)in < (s16)0);\n\
+  out = (u16)((s16)(c ? t3 : (s16)in));\n\
+  out2 = c;\n\
+  checksum = (u8)((u8)out ^ (u8)(out >> 8u) ^ (u8)out2);\n\
+}\n";
+
+fn ir_prog() -> IrProgram {
+    IrProgram {
+        ir_text: IR_TEXT.to_string(),
+        inputs: vec![Input { name: "in".into(), value: 0x8000, width: 16, is_float: false }],
+        checksum_name: "checksum".into(),
+        seed: 0,
+        c_twin: IR_TWIN_C.to_string(),
+    }
+}
+
+#[test]
+fn ir_mode_fixed_program_differential_clean() {
+    // The canonical-IR path (sdiv/srem/ashr/icmp slt/zext/select) must be
+    // differential-clean against the C twin for the edge input in = 0x8000
+    // (-32768: sdiv by 3, srem 5, ashr sign-fill, slt true).
+    let got = run_ir_differential(&ir_prog())
+        .unwrap_or_else(|e| panic!("IR-mode fixed program not differential-clean: {e}"));
+    assert!(got < 256, "checksum is a u8");
+}
+
+#[test]
+fn generate_ir_is_deterministic() {
+    // The IR generator must be seed-deterministic (the corpus contract) and
+    // emit the canonical dialect with a matching C twin.
+    let a = generate_ir(42);
+    let b = generate_ir(42);
+    assert_eq!(a.ir_text, b.ir_text, "same seed must give the same IR");
+    assert!(a.ir_text.contains("fn main"), "the IR defines main");
+    assert!(!a.c_twin.is_empty(), "the C twin exists");
+    assert!(!a.inputs.is_empty());
+}
+
+#[test]
+fn generate_ir_fast_corpus_differential_clean() {
+    // The IR generator's fast seeds must all be differential-clean (the
+    // PIC side runs canonical IR, the host side the C twin).
+    for seed in 0..8u64 {
+        let prog = generate_ir(seed);
+        run_ir_differential(&prog)
+            .unwrap_or_else(|e| panic!("IR seed {seed} not differential-clean: {e}"));
     }
 }
