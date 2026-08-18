@@ -136,27 +136,43 @@ fn strip_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 /// byte of the label's word address (a RETLW table's base, e.g. the
 /// `ADDLW LOW(table); MOVWF PCL` computed jump). `PAGE(<label>)` resolves to
 /// `(addr >> 11) << 3` — the PCLATH<4:3> page bits (bits 2:0 clear), the
-/// literal loaded into PCLATH before a cross-page CALL.
+/// literal loaded into PCLATH before a cross-page CALL. A numeric operand
+/// inside the parens — `LOW(0x2A)`, `HIGH(0x123)`, `LOW(35)`, padded or
+/// unpadded hex — resolves as the plain literal itself (LOW = n & 0xFF,
+/// HIGH = (n >> 8) & 0xFF, PAGE = (n >> 11) << 3), the same semantics as
+/// the label form; gpasm accepts `LOW(<n>)`/`HIGH(<n>)`, so a numeric
+/// operand is valid assembler input and must not be treated as a missing
+/// label.
 fn parse_lit(s: &str, sym: &std::collections::HashMap<String, usize>) -> usize {
-    if let Some(name) = strip_fn(s, "LOW(") {
-        let v = *sym
-            .get(name)
-            .unwrap_or_else(|| panic!("asm: LOW({name}) label not found"));
-        return v & 0xFF;
-    }
-    if let Some(name) = strip_fn(s, "HIGH(") {
-        let v = *sym
-            .get(name)
-            .unwrap_or_else(|| panic!("asm: HIGH({name}) label not found"));
-        return (v >> 8) & 0xFF;
-    }
-    if let Some(name) = strip_fn(s, "PAGE(") {
-        let v = *sym
-            .get(name)
-            .unwrap_or_else(|| panic!("asm: PAGE({name}) label not found"));
-        return (v >> 11) << 3;
+    for (name, mask, shift) in [
+        ("LOW(", 0xFFusize, 0usize),
+        ("HIGH(", 0xFF, 8),
+        ("PAGE(", 0x38, 8),
+    ] {
+        if let Some(inner) = strip_fn(s, name) {
+            // A label operand resolves through the symbol table; a number
+            // operand (`0x` hex or decimal) evaluates on the value itself. A
+            // name that is neither (a typo'd label) keeps the loud "label not
+            // found" panic.
+            if let Some(&v) = sym.get(inner) {
+                return (v >> shift) & mask;
+            }
+            if let Some(n) = parse_num_opt(inner) {
+                return (n >> shift) & mask;
+            }
+            panic!("asm: {name}{inner}) label not found");
+        }
     }
     parse_num(s)
+}
+
+/// Parse a decimal or `0x`-prefixed hex number; `None` if it is neither.
+fn parse_num_opt(s: &str) -> Option<usize> {
+    if let Some(h) = s.strip_prefix("0x") {
+        usize::from_str_radix(h, 16).ok()
+    } else {
+        s.parse().ok()
+    }
 }
 
 fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {

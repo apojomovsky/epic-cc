@@ -154,3 +154,40 @@ fn status_banksel_and_gpr_bit_op_in_sequence() {
     let expected = "    BSF STATUS, 5\n    BSF 0x20, 7\n";
     assert_eq!(assign_banks(asm), expected);
 }
+
+#[test]
+fn bank0_only_program_skips_all_banksels() {
+    // Issue #16 (left over from #13): a program that provably never leaves
+    // bank 0 — no banked GPR operand (0xA0-0xEF / 0x120-0x16F / 0x1A0-0x1EF)
+    // and no hand-written `BCF/BSF STATUS, 5/6` — runs entirely in bank 0,
+    // so every label/CALL reset can be skipped instead of emitting the dead
+    // full BANKSEL (`BCF STATUS, 5` + `BCF STATUS, 6`) preamble. The reset
+    // is only ever reached via the reset vector (bank 0) or a fall-through
+    // that never changed the bank, and nothing in the text can change it.
+    let asm = "    MOVF 0x20, W\nL:\n    MOVF 0x21, W\n    CALL f\n    MOVF 0x22, W\n    MOVWF 0x23\nf:\n    MOVF 0x24, W\n    RETURN\n";
+    let expected = "    MOVF 0x20, W\nL:\n    MOVF 0x21, W\n    CALL f\n    MOVF 0x22, W\n    MOVWF 0x23\nf:\n    MOVF 0x24, W\n    RETURN\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn bank0_only_with_handwritten_bank_op_keeps_resets() {
+    // A hand-written `BCF/BSF STATUS, 5/6` means the program touches the
+    // bank bits itself, so the pass cannot prove the bank stays 0 at every
+    // label/CALL: the resets stay (each arm's first banked operand gets the
+    // full BANKSEL, exactly as before issue #16).
+    let asm = "    BSF STATUS, 5\n    BCF STATUS, 5\nL:\n    MOVF 0x20, W\n";
+    let expected = "    BSF STATUS, 5\n    BCF STATUS, 5\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}
+
+#[test]
+fn bank0_only_with_movwf_status_keeps_resets() {
+    // `MOVWF STATUS` writes all of STATUS from W, including the RP bits:
+    // after it the tracked bank is unknowable, so the pass must fall back to
+    // the label/CALL resets (an ISR's restore ends with `MOVWF STATUS`, so
+    // every interrupt program stays on this path and its layout is
+    // unchanged).
+    let asm = "    MOVWF STATUS\nL:\n    MOVF 0x20, W\n";
+    let expected = "    MOVWF STATUS\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(asm), expected);
+}

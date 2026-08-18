@@ -180,6 +180,32 @@ fn panics_when_page_label_missing() {
     let _ = assemble(src);
 }
 
+#[test]
+fn low_high_page_accept_numeric_operands() {
+    // `LOW(<n>)`/`HIGH(<n>)`/`PAGE(<n>)` with a NUMBER operand — hex
+    // (padded or not: `LOW(0x2A)` and `LOW(0x4)`), or decimal — resolve as
+    // plain literals (LOW = n & 0xFF, HIGH = (n >> 8) & 0xFF, PAGE =
+    // (n >> 11) << 3), the same semantics as the label form. gpasm accepts
+    // `LOW(0x2A)`/`HIGH(0x123)`/`LOW(35)` (verified), so a numeric operand
+    // is valid assembler input; the pre-issue-16 code panicked
+    // `LOW(0x2A) label not found` instead of resolving.
+    let src = "    org 0x0000\n\
+        movlw LOW(0x2A)\n\
+        movlw HIGH(0x123)\n\
+        movlw PAGE(0x1234)\n\
+        movlw LOW(0x4)\n\
+        movlw LOW(35)\n\
+        movlw LOW(0x2a)\n\
+        end\n";
+    let words = assemble(src);
+    assert_eq!(words[0], 0x3000 | 0x2A, "LOW(0x2A)");
+    assert_eq!(words[1], 0x3000 | 0x01, "HIGH(0x123)");
+    assert_eq!(words[2], 0x3000 | 0x10, "PAGE(0x1234) = (0x1234 >> 11) << 3");
+    assert_eq!(words[3], 0x3000 | 0x04, "LOW(0x4) — unpadded hex operand");
+    assert_eq!(words[4], 0x3000 | 0x23, "LOW(35) — decimal operand");
+    assert_eq!(words[5], 0x3000 | 0x2A, "LOW(0x2a) — lowercase hex operand");
+}
+
 // ---- Milestone 11 final wave: .org monotonicity ----
 
 #[test]
