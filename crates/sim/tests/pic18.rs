@@ -488,3 +488,48 @@ fn movlb_selects_the_bank_for_a_subsequent_banked_access() {
     p.run(10);
     assert_eq!(p.ram()[0x120], 0x42);
 }
+
+#[test]
+fn sleep_halts_the_simulator() {
+    let mut p = Pic18::new(vec![0x0003, 0x0000]); // SLEEP; NOP (never reached)
+    p.run(10);
+    assert!(p.halted());
+    assert_eq!(p.pc(), 0, "SLEEP does not advance pc");
+}
+
+#[test]
+fn clrwdt_advances_pc_with_no_other_effect() {
+    let mut p = Pic18::new(vec![0x0004]); // CLRWDT
+    p.run(1);
+    assert_eq!(p.pc(), 2);
+}
+
+#[test]
+fn push_and_pop_the_hardware_stack_without_jumping() {
+    let mut p = Pic18::new(vec![0x0005, 0x0006, 0x0000]); // PUSH; POP; NOP
+    p.run(1);
+    assert_eq!(p.ram()[0xFFC], 1, "STKPTR after PUSH");
+    p.run(1);
+    assert_eq!(p.ram()[0xFFC], 0, "STKPTR after POP");
+    assert_eq!(p.pc(), 4, "POP does not jump");
+}
+
+#[test]
+fn daw_adjusts_w_to_valid_bcd() {
+    // MOVLW 0x0B; DAW -> low nibble (0xB=11) > 9, so W += 6 = 0x11.
+    let words = vec![0x0E0B, 0x0007];
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.w(), 0x11);
+}
+
+#[test]
+fn reset_reinitializes_pc_and_w() {
+    let words = vec![0x0E42, 0x00FF, 0x0003]; // MOVLW 0x42; RESET; SLEEP
+    let mut p = Pic18::new(words);
+    p.run(1);
+    assert_eq!(p.w(), 0x42);
+    p.run(1);
+    assert_eq!(p.w(), 0, "RESET clears W");
+    assert_eq!(p.pc(), 0, "RESET jumps to the reset vector");
+}

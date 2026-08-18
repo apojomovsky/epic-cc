@@ -524,6 +524,44 @@ impl Pic18 {
         let pc = self.pc;
         let next = match word {
             0x0000 => pc + 2,
+            0x0003 => {
+                // SLEEP: matches Pic14's convention (see `Pic14::exec_byte`)
+                // of `halted = true` as the simulator's stop condition —
+                // real programs end on this, since `parse_hex_pic18`
+                // returns the full flash-sized buffer (zero-padded NOPs
+                // all the way out), so "ran off the end of `prog`" never
+                // happens for a realistic program within a normal step
+                // budget.
+                self.halted = true;
+                pc
+            }
+            0x0004 => pc + 2, // CLRWDT: no observable effect in this simulator
+            0x0005 => {
+                // PUSH: pushes PC+2 (the address of the next instruction)
+                // without jumping — same stack effect as CALL, minus the
+                // jump.
+                self.push_return(pc + 2);
+                pc + 2
+            }
+            0x0006 => {
+                // POP: discards the top of stack without jumping (unlike
+                // RETURN, which also jumps to it).
+                self.pop_return();
+                pc + 2
+            }
+            0x0007 => {
+                self.exec_daw();
+                pc + 2
+            }
+            0x00FF => {
+                // RESET: reinitializes the core. This simulator only
+                // models what's observable to a test: PC to 0, W cleared,
+                // the call stack emptied (its SFR view synced to match).
+                self.w = 0;
+                self.stack.clear();
+                self.sync_stack_sfrs();
+                0
+            }
             // MUST precede the byte-oriented arm below: 0x0800..=0x0FFF is
             // numerically inside 0x0200..=0x6FFF.
             _ if (0x0800..=0x0FFF).contains(&word) => self.exec_literal(pc, word),
@@ -883,6 +921,25 @@ impl Pic18 {
         self.ram[0xFFD] = (top & 0xFF) as u8;
         self.ram[0xFFE] = ((top >> 8) & 0xFF) as u8;
         self.ram[0xFFF] = ((top >> 16) & 0xFF) as u8;
+    }
+    /// Decimal-adjust W after a BCD addition: if the low nibble is > 9 or
+    /// DC is set, add 6; if the (possibly-adjusted) high nibble is > 9 or C
+    /// is set, add 0x60 and set C (C is only ever set by DAW, never
+    /// cleared, matching the datasheet's "sticky" carry-out convention).
+    fn exec_daw(&mut self) {
+        let dc = self.ram[self.status_addr()] & 0x02 != 0;
+        let mut w = self.w;
+        if (w & 0x0F) > 9 || dc {
+            w = w.wrapping_add(6);
+        }
+        let c = self.get_c();
+        let mut carry = c;
+        if (w & 0xF0) > 0x90 || c {
+            w = w.wrapping_add(0x60);
+            carry = true;
+        }
+        self.w = w;
+        self.set_c(carry);
     }
     fn push_return(&mut self, addr: u32) {
         assert!(self.stack.len() < 31, "sim(pic18): call stack overflow (depth 31)");
