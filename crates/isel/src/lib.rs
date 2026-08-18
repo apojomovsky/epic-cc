@@ -165,6 +165,30 @@ enum Addr {
     Indirect,
 }
 
+/// Where a local's bytes live. v1 only ever constructs `Direct` — introduced
+/// now (docs/29-pic18-port-design.md §2 D-2) so a later frame-pointer phase
+/// (recursion/reentrancy) never has to touch the call sites that resolve a
+/// local's address, only add a real `Frame` case here and wherever
+/// `Slot` values get constructed.
+enum Slot {
+    /// Statically allocated: a direct file address.
+    Direct(u16),
+    /// Frame-relative, FSR2 + offset. Reserved for the later reentrancy
+    /// phase; nothing constructs this yet.
+    #[allow(dead_code)]
+    Frame(i8),
+}
+
+impl Slot {
+    /// v1 only ever constructs `Direct`.
+    fn direct(&self) -> u16 {
+        match self {
+            Slot::Direct(a) => *a,
+            Slot::Frame(_) => unimplemented!("frame-relative slots arrive with the reentrancy phase"),
+        }
+    }
+}
+
 /// Per-function codegen state. All addresses come from the module-wide map;
 /// `cur_func` selects the current function's local entries.
 struct Gen<'m> {
@@ -223,26 +247,30 @@ impl<'m> Gen<'m> {
     /// Resolve `{func}::{name}` to its base byte address (lo for multi-byte).
     /// Every address comes from the caller-supplied map; a missing value
     /// panics loudly rather than being allocated internally.
-    fn slot_addr(&self, func: &str, name: &str) -> u16 {
-        *self
-            .addrs
-            .get(&ssa_key(func, name))
-            .unwrap_or_else(|| panic!("isel: no slot for {func}::{name}"))
+    fn slot_addr(&self, func: &str, name: &str) -> Slot {
+        Slot::Direct(
+            *self
+                .addrs
+                .get(&ssa_key(func, name))
+                .unwrap_or_else(|| panic!("isel: no slot for {func}::{name}")),
+        )
     }
 
     /// Resolve an operand value to its base byte address (lo for multi-byte).
-    fn val_addr(&self, v: &Val) -> u16 {
+    fn val_addr(&self, v: &Val) -> Slot {
         match v {
             Val::Reg(r) => self.slot_addr(self.cur_func, r),
-            Val::Global(g) => *self
-                .addrs
-                .get(g)
-                .unwrap_or_else(|| panic!("isel: no address for @{g}")),
+            Val::Global(g) => Slot::Direct(
+                *self
+                    .addrs
+                    .get(g)
+                    .unwrap_or_else(|| panic!("isel: no address for @{g}")),
+            ),
             Val::Const(k) => {
                 // Mask to the byte: clang prints i8 constants >= 128 as
                 // negative i8 (found by the fuzz corpus); the value is the
                 // same mod 256.
-                (*k & 0xFF) as u16
+                Slot::Direct((*k & 0xFF) as u16)
             }
         }
     }
@@ -403,7 +431,7 @@ impl<'m> Gen<'m> {
                         }
                     }
                     Base::Slot(sname, indirect) => {
-                        let sa = self.slot_addr(self.cur_func, sname);
+                        let sa = self.slot_addr(self.cur_func, sname).direct();
                         if !indirect && terms.is_empty() {
                             Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
                         } else if !indirect {
@@ -533,7 +561,7 @@ impl<'m> Gen<'m> {
         });
         match terms {
             [(1, r)] => {
-                let a = self.val_addr(&Val::Reg(r.clone()));
+                let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
                 self.emit(format!("    ADDLW 0x{lit:02X}"));
                 self.emit("    MOVWF FSR".to_string());
@@ -590,7 +618,7 @@ impl<'m> Gen<'m> {
         self.emit("    MOVLW 0x00".to_string());
         self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
         for (scale, r) in terms {
-            let a = self.val_addr(&Val::Reg(r.clone()));
+            let a = self.val_addr(&Val::Reg(r.clone())).direct();
             for _ in 0..*scale {
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
                 self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
@@ -609,7 +637,7 @@ impl<'m> Gen<'m> {
         match terms {
             [] => self.emit(format!("    MOVLW 0x{kk:02X}")),
             [(1, r)] => {
-                let a = self.val_addr(&Val::Reg(r.clone()));
+                let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
                 if kk != 0 {
                     self.emit(format!("    ADDLW 0x{kk:02X}"));
@@ -647,7 +675,7 @@ impl<'m> Gen<'m> {
                     2,
                     "isel: large-table index %{r} must be a 16-bit reg (clang zexts the byte index)"
                 );
-                let a_lo = self.val_addr(&Val::Reg(r.clone()));
+                let a_lo = self.val_addr(&Val::Reg(r.clone())).direct();
                 let l_hi = self.fresh_label();
                 let l_done = self.fresh_label();
                 // W = lo + k + off; C = carry into bit 8.
@@ -704,11 +732,11 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVLW 0x{b:02X}"));
             }
             Val::Reg(r) => {
-                let a = self.val_addr(&Val::Reg(r.clone()));
+                let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
             Val::Global(g) => {
-                let a = self.val_addr(&Val::Global(g.clone()));
+                let a = self.val_addr(&Val::Global(g.clone())).direct();
                 self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
         }
@@ -722,11 +750,11 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    XORLW 0x{b:02X}"));
             }
             Val::Reg(r) => {
-                let a = self.val_addr(&Val::Reg(r.clone()));
+                let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    XORWF 0x{:02X}, W", a + u16::from(idx)));
             }
             Val::Global(g) => {
-                let a = self.val_addr(&Val::Global(g.clone()));
+                let a = self.val_addr(&Val::Global(g.clone())).direct();
                 self.emit(format!("    XORWF 0x{:02X}, W", a + u16::from(idx)));
             }
         }
@@ -769,7 +797,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVLW 0x{b:02X}"));
             }
             _ => {
-                let addr = self.val_addr(v) + u16::from(i);
+                let addr = self.val_addr(v).direct() + u16::from(i);
                 if signed && i == high {
                     self.emit("    MOVLW 0x80".to_string());
                     self.emit(format!("    XORWF 0x{addr:02X}, W"));
@@ -826,7 +854,7 @@ impl<'m> Gen<'m> {
                     self.emit_cmp_c_file_lhs_wide(a, b, n, high, signed);
                     return;
                 }
-                let aa = self.val_addr(a);
+                let aa = self.val_addr(a).direct();
                 let use_scratch = signed; // signed file-LHS: SUBWF's file operand must be a ^ 0x80
                 if use_scratch {
                     // Pre-store the complemented sign byte; MOVLW/XORWF/MOVWF
@@ -874,7 +902,7 @@ impl<'m> Gen<'m> {
     /// b_hi = 0xFF wrap; b_hi = 0x7F + borrow would wrap invisibly and
     /// corrupt the final C.
     fn emit_cmp_c_file_lhs_wide(&mut self, a: &Val, b: &Val, n: u8, high: u8, signed: bool) {
-        let aa = self.val_addr(a);
+        let aa = self.val_addr(a).direct();
         // Byte 0 has no borrow-in; a single SUBWF leaves C exact.
         self.emit_load_cmp_byte(b, 0, signed, high);
         self.emit(format!("    SUBWF 0x{aa:02X}, W"));
@@ -894,7 +922,7 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    MOVLW 0x{kb:02X}"));
                     }
                     _ => {
-                        let addr = self.val_addr(b) + u16::from(high);
+                        let addr = self.val_addr(b).direct() + u16::from(high);
                         self.emit("    MOVLW 0x80".to_string());
                         self.emit(format!("    XORWF 0x{addr:02X}, W"));
                     }
@@ -920,7 +948,7 @@ impl<'m> Gen<'m> {
                     }
                     _ => {
                         self.emit_load_cmp_byte(b, i, signed, high);
-                        let addr = self.val_addr(b) + u16::from(i);
+                        let addr = self.val_addr(b).direct() + u16::from(i);
                         self.emit("    BTFSS STATUS, 0 ; C".to_string());
                         self.emit(format!("    INCFSZ 0x{addr:02X}, W"));
                     }
@@ -951,7 +979,7 @@ impl<'m> Gen<'m> {
                 // emit_cmp_c_file_lhs_wide — the complemented fold wraps at
                 // b_hi = 0x7F + borrow, where the skip keeps the true
                 // borrow-out).
-                let addr = self.val_addr(b) + u16::from(high);
+                let addr = self.val_addr(b).direct() + u16::from(high);
                 self.emit("    MOVLW 0x80".to_string());
                 self.emit(format!("    XORWF 0x{addr:02X}, W"));
                 self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
@@ -960,7 +988,7 @@ impl<'m> Gen<'m> {
                 let kb = ((k >> (high as u32 * 8)) & 0xFF) as u8 ^ 0x80;
                 self.emit(format!("    SUBLW 0x{kb:02X}"));
             } else {
-                let addr = self.val_addr(b) + u16::from(i);
+                let addr = self.val_addr(b).direct() + u16::from(i);
                 self.emit(format!("    MOVF 0x{addr:02X}, W"));
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
                 self.emit(format!("    INCFSZ 0x{addr:02X}, W"));
@@ -1004,7 +1032,7 @@ impl<'m> Gen<'m> {
     fn emit_cond_branch(&mut self, cond: &Val, t: &str, f: &str) {
         match cond {
             Val::Reg(r) => {
-                let ca = self.val_addr(&Val::Reg(r.clone()));
+                let ca = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{ca:02X}, W"));
                 self.emit("    BTFSC STATUS, 2 ; Z".to_string());
                 self.emit(format!("    GOTO {f}"));
@@ -1021,7 +1049,7 @@ impl<'m> Gen<'m> {
     /// `d = cond ? a : b` via an if/else jump over two copies. Mirrors spike
     /// emit_select.
     fn emit_select(&mut self, dst: &str, cond: &Val, ty: Ty, a: &Val, b: &Val) {
-        let da = self.slot_addr(self.cur_func, dst);
+        let da = self.slot_addr(self.cur_func, dst).direct();
         match cond {
             Val::Const(k) => {
                 let v = if *k != 0 { a } else { b };
@@ -1034,7 +1062,7 @@ impl<'m> Gen<'m> {
         let l_else = self.fresh_label();
         let l_end = self.fresh_label();
         let ca = match cond {
-            Val::Reg(r) => self.val_addr(&Val::Reg(r.clone())),
+            Val::Reg(r) => self.val_addr(&Val::Reg(r.clone())).direct(),
             _ => unreachable!(),
         };
         self.emit(format!("    MOVF 0x{ca:02X}, W"));
@@ -1064,10 +1092,10 @@ impl<'m> Gen<'m> {
             (o, Val::Reg(r)) => (r.clone(), o),
             _ => panic!("isel: add16 needs a register operand"),
         };
-        let ra = self.val_addr(&Val::Reg(reg));
+        let ra = self.val_addr(&Val::Reg(reg)).direct();
         match other {
             Val::Reg(rb) => {
-                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 self.emit(format!("    MOVF 0x{bb:02X}, W"));
                 self.emit(format!("    ADDWF 0x{ra:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
@@ -1106,10 +1134,10 @@ impl<'m> Gen<'m> {
             (o, Val::Reg(r)) => (r.clone(), o),
             _ => panic!("isel: {op} needs a register operand"),
         };
-        let ra = self.val_addr(&Val::Reg(reg));
+        let ra = self.val_addr(&Val::Reg(reg)).direct();
         match other {
             Val::Reg(rb) => {
-                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 for i in 0..n {
                     self.emit(format!("    MOVF 0x{:02X}, W", bb + u16::from(i)));
                     self.emit(format!("    {op} 0x{:02X}, W", ra + u16::from(i)));
@@ -1133,7 +1161,7 @@ impl<'m> Gen<'m> {
     /// `a` is the file operand. A const LHS is rejected by the caller (sub
     /// is not commutative).
     fn emit_sub8(&mut self, a: &Val, b: &Val, dst: u16) {
-        let aa = self.val_addr(a);
+        let aa = self.val_addr(a).direct();
         match b {
             Val::Const(k) => {
                 // Mask the byte: clang prints an i8 constant >= 128 as a
@@ -1144,7 +1172,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
             }
             Val::Reg(_) => {
-                let bb = self.val_addr(b);
+                let bb = self.val_addr(b).direct();
                 self.emit(format!("    MOVF 0x{bb:02X}, W"));
                 self.emit(format!("    SUBWF 0x{aa:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
@@ -1165,7 +1193,7 @@ impl<'m> Gen<'m> {
     /// replaces corrupted the borrow-out at the wrap (W = 0x00, C = 1), so
     /// every higher byte mis-subtracted.
     fn emit_sub_const_lhs(&mut self, k: &i64, a: &Val, dst: u16, bytes: u8) {
-        let aa = self.val_addr(a);
+        let aa = self.val_addr(a).direct();
         self.emit(format!("    MOVF 0x{aa:02X}, W"));
         self.emit(format!("    SUBLW 0x{:02X}", (k & 0xFF) as u8));
         self.emit(format!("    MOVWF 0x{dst:02X}"));
@@ -1188,7 +1216,7 @@ impl<'m> Gen<'m> {
     /// borrow from the low byte folded in — if C is clear (borrow), ADDLW 1
     /// bumps the subtrahend byte before the high SUBWF.
     fn emit_sub16(&mut self, a: &Val, b: &Val, dst: u16) {
-        let aa = self.val_addr(a);
+        let aa = self.val_addr(a).direct();
         match b {
             Val::Const(k) => {
                 let lo = (k & 0xFF) as u8;
@@ -1203,7 +1231,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
             }
             Val::Reg(rb) => {
-                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 self.emit(format!("    MOVF 0x{bb:02X}, W"));
                 self.emit(format!("    SUBWF 0x{aa:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
@@ -1232,11 +1260,11 @@ impl<'m> Gen<'m> {
             (o, Val::Reg(r)) => (r.clone(), o),
             _ => panic!("isel: add32 needs a register operand"),
         };
-        let ra = self.val_addr(&Val::Reg(reg));
+        let ra = self.val_addr(&Val::Reg(reg)).direct();
         // Byte 0: no carry-in; the ADDWF's C is exact.
         match other {
             Val::Reg(rb) => {
-                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 self.emit(format!("    MOVF 0x{bb:02X}, W"));
                 self.emit(format!("    ADDWF 0x{ra:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
@@ -1283,7 +1311,7 @@ impl<'m> Gen<'m> {
     /// corrupted at an intermediate byte (C = (a_i >= 0) = 1), silently
     /// mis-subtracting every higher byte.
     fn emit_sub32(&mut self, a: &Val, b: &Val, dst: u16) {
-        let aa = self.val_addr(a);
+        let aa = self.val_addr(a).direct();
         match b {
             Val::Const(k) => {
                 self.emit(format!("    MOVLW 0x{:02X}", (k & 0xFF) as u8));
@@ -1301,7 +1329,7 @@ impl<'m> Gen<'m> {
                 }
             }
             Val::Reg(rb) => {
-                let bb = self.val_addr(&Val::Reg(rb.clone()));
+                let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 self.emit(format!("    MOVF 0x{bb:02X}, W"));
                 self.emit(format!("    SUBWF 0x{aa:02X}, W"));
                 self.emit(format!("    MOVWF 0x{dst:02X}"));
@@ -1336,7 +1364,7 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel: call to unknown function @{func}"));
         for (i, arg) in args.iter().enumerate() {
             let pname = &callee.params[i].name;
-            let pa = self.slot_addr(func, pname);
+            let pa = self.slot_addr(func, pname).direct();
             if let Some(size) = arg.byval {
                 // byval: copy `size` bytes from the arg's pointer (global /
                 // alloca slot / GEP reg) into the callee's param slot — the
@@ -1376,7 +1404,7 @@ impl<'m> Gen<'m> {
                         );
                         let addr = match &base {
                             Base::Global(name) => self.global_addr(name),
-                            Base::Slot(sname, false) => self.slot_addr(self.cur_func, sname),
+                            Base::Slot(sname, false) => self.slot_addr(self.cur_func, sname).direct(),
                             Base::Slot(_, true) => {
                                 panic!("isel: sret target cannot be an indirect (sret) slot")
                             }
@@ -1458,7 +1486,7 @@ impl<'m> Gen<'m> {
             let t = ty.expect("isel: valued call must carry a type");
             // Copy the retval region (0x71..0x71+bytes-1, up to 0x74 for
             // i32) into dst.
-            let da = self.slot_addr(self.cur_func, d);
+            let da = self.slot_addr(self.cur_func, d).direct();
             for i in 0..t.bytes() {
                 self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + u16::from(i)));
                 self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
@@ -1470,7 +1498,7 @@ impl<'m> Gen<'m> {
         match i {
             Inst::Load(l) => {
                 assert!(l.ty != Ty::I1, "isel: only i8/i16 loads supported");
-                let dst = self.slot_addr(self.cur_func, &l.dst);
+                let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 if let Some(g) = l.ptr.strip_prefix('@') {
                     let src = self.global_addr(g);
                     for k in 0..l.ty.bytes() {
@@ -1552,7 +1580,7 @@ impl<'m> Gen<'m> {
             }
             Inst::Bin(b) => {
                 assert!(b.ty != Ty::I1, "isel: only i8/i16/i32 binops supported");
-                let da = self.slot_addr(self.cur_func, &b.dst);
+                let da = self.slot_addr(self.cur_func, &b.dst).direct();
                 match (b.op, b.ty) {
                     (BinOp::Add, Ty::I16) => self.emit_add16(&b.a, &b.b, da),
                     (BinOp::Add, Ty::I32) => self.emit_add32(&b.a, &b.b, da),
@@ -1572,13 +1600,13 @@ impl<'m> Gen<'m> {
                                 // Mask to the byte (negative i8 constants,
                                 // found by the fuzz corpus).
                                 let kb = (*k & 0xFF) as u8;
-                                let aa = self.val_addr(a);
+                                let aa = self.val_addr(a).direct();
                                 self.emit(format!("    MOVF 0x{aa:02X}, W"));
                                 self.emit(format!("    ADDLW 0x{kb:02X}"));
                                 self.emit(format!("    MOVWF 0x{da:02X}"));
                             }
                             _ => {
-                                let (aa, bb) = (self.val_addr(a), self.val_addr(b_op));
+                                let (aa, bb) = (self.val_addr(a).direct(), self.val_addr(b_op).direct());
                                 self.emit(format!("    MOVF 0x{bb:02X}, W"));
                                 self.emit(format!("    ADDWF 0x{aa:02X}, W"));
                                 self.emit(format!("    MOVWF 0x{da:02X}"));
@@ -1701,7 +1729,7 @@ impl<'m> Gen<'m> {
             // freeze is a no-op in the backend: copy `val` byte-for-byte into
             // the dst slot (same shape as emit_move_val_to_slot).
             Inst::Freeze(f) => {
-                let da = self.slot_addr(self.cur_func, &f.dst);
+                let da = self.slot_addr(self.cur_func, &f.dst).direct();
                 self.emit_move_val_to_slot(&f.val, f.ty, da);
             }
             Inst::Zext(z) => {
@@ -1714,7 +1742,7 @@ impl<'m> Gen<'m> {
                     z.from.bytes() <= z.to.bytes(),
                     "isel: zext must not narrow"
                 );
-                let da = self.slot_addr(self.cur_func, &z.dst);
+                let da = self.slot_addr(self.cur_func, &z.dst).direct();
                 for i in 0..z.from.bytes() {
                     self.emit_load_byte(&z.val, i);
                     self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
@@ -1736,7 +1764,7 @@ impl<'m> Gen<'m> {
                     !matches!(&x.val, Val::Const(_)),
                     "isel: sext of a constant not supported (constant folding not implemented)"
                 );
-                let da = self.slot_addr(self.cur_func, &x.dst);
+                let da = self.slot_addr(self.cur_func, &x.dst).direct();
                 // Copy the low bytes unchanged.
                 for i in 0..x.from.bytes() {
                     self.emit_load_byte(&x.val, i);
@@ -1746,7 +1774,7 @@ impl<'m> Gen<'m> {
                 // MSB of the source's high byte, then MOVLW 0xFF (set) or
                 // 0x00 (clear) once and store it into every high byte.
                 let src_hi = x.from.bytes() - 1;
-                let a = self.val_addr(&x.val);
+                let a = self.val_addr(&x.val).direct();
                 let l_pos = self.fresh_label();
                 let l_fill = self.fresh_label();
                 self.emit(format!("    BTFSS 0x{:02X}, 7", a + u16::from(src_hi)));
@@ -1765,14 +1793,14 @@ impl<'m> Gen<'m> {
                     t.from.bytes() > t.to.bytes(),
                     "isel: trunc must narrow"
                 );
-                let da = self.slot_addr(self.cur_func, &t.dst);
+                let da = self.slot_addr(self.cur_func, &t.dst).direct();
                 for i in 0..t.to.bytes() {
                     self.emit_load_byte(&t.val, i);
                     self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
                 }
             }
             Inst::Icmp(ic) => {
-                let da = self.slot_addr(self.cur_func, &ic.dst);
+                let da = self.slot_addr(self.cur_func, &ic.dst).direct();
                 match ic.pred.as_str() {
                     "eq" => {
                         // XOR-based compare sets Z = (a == b); materialize
@@ -2011,7 +2039,7 @@ impl<'m> Gen<'m> {
         let name = self.cur_func;
         let recipe = routine_recipe(name)
             .unwrap_or_else(|| panic!("isel: @{name} is not a runtime routine"));
-        let scr = self.slot_addr(name, "__scr");
+        let scr = self.slot_addr(name, "__scr").direct();
         self.emit(format!("{name}:"));
         match recipe {
             // Variable-count shifts: mask the count to width-1, bounded
@@ -2037,8 +2065,8 @@ impl<'m> Gen<'m> {
             // multiplier bit; for each set bit of bk, r += t. Store the low
             // byte of the product (the i8 result).
             "__mul_u8" => {
-                let a = self.slot_addr(name, "a");
-                let b = self.slot_addr(name, "b");
+                let a = self.slot_addr(name, "a").direct();
+                let b = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[a, b, scr, scr + 5], name);
                 let (bk, cnt, r_lo, r_hi, t_lo, t_hi) =
                     (scr, scr + 1, scr + 2, scr + 3, scr + 4, scr + 5);
@@ -2077,8 +2105,8 @@ impl<'m> Gen<'m> {
             // left), for each set bit of bk, r += t across all 4 bytes with
             // the incfsz carry idiom. Store the low 16 bits (the i16 result).
             "__mul_u16" => {
-                let a = self.slot_addr(name, "a");
-                let b = self.slot_addr(name, "b");
+                let a = self.slot_addr(name, "a").direct();
+                let b = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[a, a + 1, b, b + 1, scr, scr + 10], name);
                 let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
                 let (r0, r1, r2, r3) = (scr + 3, scr + 4, scr + 5, scr + 6);
@@ -2137,8 +2165,8 @@ impl<'m> Gen<'m> {
             // shift can carry. Borrow idiom: den_hi is implicitly 0, so the
             // fold is `movlw 0; btfss C; addlw 1; subwf rem_hi`.
             "__udiv_u8" | "__urem_u8" => {
-                let num = self.slot_addr(name, "num");
-                let den = self.slot_addr(name, "den");
+                let num = self.slot_addr(name, "num").direct();
+                let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, den, scr, scr + 3], name);
                 let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
                 let l_loop = self.fresh_label();
@@ -2183,8 +2211,8 @@ impl<'m> Gen<'m> {
             // 16/16 restoring division (16 iterations), the borrow idiom
             // `movf den_hi,w; btfss C; incfsz den_hi,w; subwf rem_hi,f`.
             "__udiv_u16" | "__urem_u16" => {
-                let num = self.slot_addr(name, "num");
-                let den = self.slot_addr(name, "den");
+                let num = self.slot_addr(name, "num").direct();
+                let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 1, den, den + 1, scr, scr + 6], name);
                 let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
                 let l_loop = self.fresh_label();
@@ -2232,8 +2260,8 @@ impl<'m> Gen<'m> {
             // negate the quotient if the signs differed (bit0) / the
             // remainder if the dividend was negative (bit1).
             "__sdiv_i8" | "__srem_i8" => {
-                let num = self.slot_addr(name, "num");
-                let den = self.slot_addr(name, "den");
+                let num = self.slot_addr(name, "num").direct();
+                let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, den, scr, scr + 4], name);
                 let (flags, rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2, scr + 3);
                 let l_den = self.fresh_label();
@@ -2306,8 +2334,8 @@ impl<'m> Gen<'m> {
             // Signed 16-bit wrappers: same structure, 16-bit abs/negate and
             // the 16-bit divmod with the incfsz borrow idiom.
             "__sdiv_i16" | "__srem_i16" => {
-                let num = self.slot_addr(name, "num");
-                let den = self.slot_addr(name, "den");
+                let num = self.slot_addr(name, "num").direct();
+                let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 1, den, den + 1, scr, scr + 6], name);
                 let (flags, rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2, scr + 3);
                 let l_den = self.fresh_label();
@@ -2383,8 +2411,8 @@ impl<'m> Gen<'m> {
             // iterations (the b param slot is untouched). Store the low 32
             // bits (the i32 result).
             "__mul_u32" => {
-                let a = self.slot_addr(name, "a");
-                let b = self.slot_addr(name, "b");
+                let a = self.slot_addr(name, "a").direct();
+                let b = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[a, a + 3, b, b + 3, scr, scr + 10], name);
                 let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
                 let r = [scr + 3, scr + 4, scr + 5, scr + 6];
@@ -2427,8 +2455,8 @@ impl<'m> Gen<'m> {
             // with the INCFSZ wrap-correct folds is exact. den is copied
             // into __scr@4-7 (the divmod reads it repeatedly).
             "__udiv_u32" | "__urem_u32" => {
-                let num = self.slot_addr(name, "num");
-                let den = self.slot_addr(name, "den");
+                let num = self.slot_addr(name, "num").direct();
+                let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 9], name);
                 for i in 0..4 {
                     self.emit(format!("    MOVF 0x{:02X}, W", den + i));
@@ -2448,8 +2476,8 @@ impl<'m> Gen<'m> {
             // quotient if the signs differed (bit0 = num<0 XOR den<0) / the
             // remainder if the dividend was negative (bit1).
             "__sdiv_i32" | "__srem_i32" => {
-                let num = self.slot_addr(name, "num");
-                let den = self.slot_addr(name, "den");
+                let num = self.slot_addr(name, "num").direct();
+                let den = self.slot_addr(name, "den").direct();
                 self.assert_bank0(&[num, num + 3, den, den + 3, scr, scr + 11], name);
                 let (rem, den_s, flags) = (scr, scr + 4, scr + 10);
                 let l_den = self.fresh_label();
@@ -2500,8 +2528,8 @@ impl<'m> Gen<'m> {
             // contract offsets. All slots stay <= 0x7F (bank 0, loud) — the
             // loops are skip-sensitive.
             "__add_f32" | "__sub_f32" => {
-                let pa = self.slot_addr(name, "a");
-                let pb = self.slot_addr(name, "b");
+                let pa = self.slot_addr(name, "a").direct();
+                let pb = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[pa, pa + 3, pb, pb + 3, scr, scr + 13], name);
                 // __sub_f32 = flip b's sign bit, then the add path.
                 self.emit_f32_extract(pa, scr, scr + 1, scr + 2, false);
@@ -2509,24 +2537,24 @@ impl<'m> Gen<'m> {
                 self.emit_f32_add_body(scr);
             }
             "__mul_f32" => {
-                let a = self.slot_addr(name, "a");
-                let b = self.slot_addr(name, "b");
+                let a = self.slot_addr(name, "a").direct();
+                let b = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[a, a + 3, b, b + 3, scr, scr + 13], name);
                 self.emit_f32_mul_body(a, b, scr);
             }
             "__div_f32" => {
-                let a = self.slot_addr(name, "a");
-                let b = self.slot_addr(name, "b");
+                let a = self.slot_addr(name, "a").direct();
+                let b = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[a, a + 3, b, b + 3, scr, scr + 11], name);
                 self.emit_f32_div_body(a, b, scr);
             }
             "__uitofp_f32" => {
-                let val = self.slot_addr(name, "val");
+                let val = self.slot_addr(name, "val").direct();
                 self.assert_bank0(&[val, val + 3, scr, scr + 7], name);
                 self.emit_f32_uitofp_body(val, scr, None);
             }
             "__sitofp_f32" => {
-                let val = self.slot_addr(name, "val");
+                let val = self.slot_addr(name, "val").direct();
                 self.assert_bank0(&[val, val + 3, scr, scr + 7], name);
                 // Save the sign, abs in place (unsigned abs — INT_MIN wraps
                 // to itself, deterministic), then the uitofp path.
@@ -2542,13 +2570,13 @@ impl<'m> Gen<'m> {
                 self.emit_f32_uitofp_body(val, scr, Some(sign));
             }
             "__fptoui_f32" | "__fptosi_f32" => {
-                let val = self.slot_addr(name, "val");
+                let val = self.slot_addr(name, "val").direct();
                 self.assert_bank0(&[val, val + 3, scr, scr + 7], name);
                 self.emit_f32_fptoi_body(val, scr, recipe == "__fptosi_f32");
             }
             "__cmp_f32" => {
-                let a = self.slot_addr(name, "a");
-                let b = self.slot_addr(name, "b");
+                let a = self.slot_addr(name, "a").direct();
+                let b = self.slot_addr(name, "b").direct();
                 self.assert_bank0(&[a, a + 3, b, b + 3, scr, scr + 5], name);
                 self.emit_f32_cmp_body(a, b, scr);
             }
@@ -2567,8 +2595,8 @@ impl<'m> Gen<'m> {
     /// rrf so the sign fills every vacated bit.
     fn emit_shift_body(&mut self, bytes: u16, op: BinOp, scr: u16) {
         let name = self.cur_func;
-        let val = self.slot_addr(name, "val");
-        let cnt = self.slot_addr(name, "cnt");
+        let val = self.slot_addr(name, "val").direct();
+        let cnt = self.slot_addr(name, "cnt").direct();
         let hi = val + bytes - 1;
         self.assert_bank0(
             &[val, hi, cnt, cnt + bytes - 1, scr, scr + 1],
@@ -4162,7 +4190,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                     let f_copies = phi_copies.get(&(b.label.clone(), bc.f.clone()));
                     match &bc.cond {
                         Val::Reg(r) => {
-                            let ca = g.val_addr(&Val::Reg(r.clone()));
+                            let ca = g.val_addr(&Val::Reg(r.clone())).direct();
                             g.emit(format!("    MOVF 0x{ca:02X}, W"));
                             match (t_copies, f_copies) {
                                 // Plain branch: the classic BTFSC skip shape.
@@ -4299,9 +4327,9 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
     let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
         .iter()
         .map(|(dst, ty, val)| {
-            let da = g.slot_addr(g.cur_func, dst);
+            let da = g.slot_addr(g.cur_func, dst).direct();
             let src = match val {
-                Val::Reg(r) => Some(g.slot_addr(g.cur_func, r)),
+                Val::Reg(r) => Some(g.slot_addr(g.cur_func, r).direct()),
                 _ => None,
             };
             (da, src, *ty, val.clone())
@@ -5116,4 +5144,14 @@ pub fn parse_map(text: &str) -> HashMap<String, u16> {
         }
     }
     addrs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_direct_returns_the_address() {
+        assert_eq!(Slot::Direct(0x42).direct(), 0x42);
+    }
 }
