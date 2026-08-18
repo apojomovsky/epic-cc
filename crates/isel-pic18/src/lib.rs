@@ -96,9 +96,51 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
     }
 
+    /// Copy `val` (width `ty.bytes()`) into the slot starting at `dst`. A
+    /// register/global source uses `MOVFF` (no access bit needed); a
+    /// constant has no `MOVFF` literal form, so it goes through `W` via
+    /// `MOVLW`/`MOVWF` (which DOES need the access bit — this is the one
+    /// place a plain copy still touches `operand`/`BSR`).
+    fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
+        match val {
+            Val::Const(k) => {
+                for i in 0..ty.bytes() {
+                    let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVLW 0x{byte:02X}"));
+                    let (a, f) = self.operand(dst + u16::from(i));
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                }
+            }
+            _ => {
+                let src = self.val_addr(val).direct();
+                for i in 0..ty.bytes() {
+                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+            }
+        }
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         match i {
             Inst::Ret(None) => self.emit("    RETURN".to_string()),
+            Inst::Load(l) => {
+                assert!(l.ty != Ty::I1, "isel-pic18: only i8/i16 loads supported");
+                let dst = self.slot_addr(self.cur_func, &l.dst).direct();
+                let src = self.global_addr(l.ptr.strip_prefix('@').unwrap_or_else(|| {
+                    panic!("isel-pic18: P2 only supports loads from @global (no pointers yet)")
+                }));
+                for k in 0..l.ty.bytes() {
+                    self.emit_copy_byte(src + u16::from(k), dst + u16::from(k));
+                }
+            }
+            Inst::Store(s) => {
+                assert!(s.ty != Ty::I1, "isel-pic18: only i8/i16 stores supported");
+                let dst = self.global_addr(s.ptr.strip_prefix('@').unwrap_or_else(|| {
+                    panic!("isel-pic18: P2 only supports stores to @global (no pointers yet)")
+                }));
+                self.emit_move_val_to_slot(&s.val, s.ty, dst);
+            }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }
