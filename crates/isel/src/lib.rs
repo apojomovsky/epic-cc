@@ -770,9 +770,13 @@ impl<'m> Gen<'m> {
     }
 
     /// Set C = (a >= b) — unsigned or signed (sign-bit complement). For i8
-    /// the SUBWF/SUBLW also leaves Z = (a == b); for i16 the borrow chain's
-    /// final Z is only a byte-level flag, so predicates needing equality
-    /// append `emit_cmp_eq` (which preserves C). A const RHS becomes the
+    /// the SUBWF/SUBLW also leaves Z = (a == b); for i16/i32 the borrow
+    /// chain's final Z is only a byte-level flag, so predicates needing
+    /// equality append `emit_cmp_eq` (which preserves C). Every multi-byte
+    /// width (i16 and i32) routes through the byte-generic wide emitters
+    /// (`emit_cmp_c_file_lhs_wide` / `emit_cmp_c_const_lhs_wide`), which
+    /// fold the borrow with the wrap-correct INCFSZ skip (issue #1); only
+    /// the single-byte i8 path stays here. A const RHS becomes the
     /// MOVLW/SUBWF subtrahend; a const LHS uses SUBLW (k - W) since a const
     /// can never be read as a file register.
     fn emit_cmp_c(&mut self, a: &Val, b: &Val, ty: Ty, signed: bool) {
@@ -781,11 +785,11 @@ impl<'m> Gen<'m> {
         match (a, b) {
             (Val::Const(_), Val::Const(_)) => panic!("isel: constant folding not implemented"),
             (Val::Const(k), _) => {
-                if n > 2 {
-                    // The 4-byte chain needs the wrap-correct borrow folds
-                    // (the naive ADDLW 1 fold corrupts the borrow-out at
-                    // b_i = 0xFF + borrow-in); the i8/i16 paths below stay
-                    // byte-identical.
+                if n > 1 {
+                    // The multi-byte chains need the wrap-correct borrow
+                    // folds (the naive ADDLW 1 fold corrupts the borrow-out
+                    // at b_i = 0xFF + borrow-in); the i8 path below stays
+                    // byte-identical (a single byte has no borrow chain).
                     self.emit_cmp_c_const_lhs_wide(k, b, n, high, signed);
                     return;
                 }
@@ -807,7 +811,7 @@ impl<'m> Gen<'m> {
                 }
             }
             _ => {
-                if n > 2 {
+                if n > 1 {
                     self.emit_cmp_c_file_lhs_wide(a, b, n, high, signed);
                     return;
                 }
@@ -840,9 +844,9 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// The wide (n > 2, i.e. i32) borrow chain for `C = (a >= b)` with a
-    /// file-LHS `a`. The 4-byte chain's intermediate borrow-outs are
-    /// load-bearing, and the 2-byte chain's `ADDLW 1` fold corrupts the
+    /// The multi-byte (n > 1, i16 and i32) borrow chain for `C = (a >= b)`
+    /// with a file-LHS `a`. The chain's intermediate borrow-outs are
+    /// load-bearing, and the naive `ADDLW 1` fold corrupts the
     /// borrow-out exactly when the folded subtrahend wraps (b_i = 0xFF +
     /// borrow-in = 0x100): the SUBWF then sees W = 0 and leaves
     /// C = (a_i >= 0) = 1 — a false "no borrow" that mis-compares every
@@ -915,11 +919,11 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// The wide const-LHS (SUBLW) borrow chain: W holds the b byte
-    /// (+ borrow), SUBLW subtracts it from the const byte. Same
-    /// wrap-correct folds as `emit_cmp_c_file_lhs_wide`; the signed
-    /// high byte's literal is pre-complemented (folded into the SUBLW
-    /// operand) and the b-side is complemented into the 0x71 temp and
+    /// The multi-byte (n > 1, i16 and i32) const-LHS (SUBLW) borrow chain:
+    /// W holds the b byte (+ borrow), SUBLW subtracts it from the const
+    /// byte. Same wrap-correct folds as `emit_cmp_c_file_lhs_wide`; the
+    /// signed high byte's literal is pre-complemented (folded into the
+    /// SUBLW operand) and the b-side is complemented into the 0x71 temp and
     /// folded COMPLEMENTED via INCFSZ's skip — the complemented fold
     /// wraps at b_hi ^ 0x80 = 0xFF (b_hi = 0x7F + borrow), where the
     /// skip keeps C = borrow-in, the true borrow-out.
@@ -1138,10 +1142,17 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `d = k - a` (const LHS) for `bytes`-wide values: SUBLW k computes
-    /// W = k - W per byte. Byte 0 leaves C = 1 iff no borrow; each higher
-    /// byte bumps the subtrahend byte by the borrow (BTFSS C / ADDLW 1,
-    /// mirroring the reg-const `a - k` chain) before its SUBLW.
+    /// `d = k - a` (const LHS) for `bytes`-wide values. Byte 0 uses SUBLW
+    /// (W = k - W, C exact — no borrow-in). Each higher byte folds the
+    /// borrow with the wrap-correct INCFSZ idiom (ported from the i32
+    /// chains, issue #1): the minuend byte `k_i` is preloaded into the
+    /// destination, the subtrahend byte `a_i` is copied to the scratch, and
+    /// `SUBWF dst_i, F` computes `k_i - (a_i + borrow)` in place. When the
+    /// fold wraps (a_i = 0xFF + borrow-in = 0x100) the INCFSZ skip leaves
+    /// the destination at `k_i` — the correct mod-256 result — with C =
+    /// borrow-in, the true borrow-out. The naive `ADDLW 1` fold this
+    /// replaces corrupted the borrow-out at the wrap (W = 0x00, C = 1), so
+    /// every higher byte mis-subtracted.
     fn emit_sub_const_lhs(&mut self, k: &i64, a: &Val, dst: u16, bytes: u8) {
         let aa = self.val_addr(a);
         self.emit(format!("    MOVF 0x{aa:02X}, W"));
@@ -1149,11 +1160,16 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{dst:02X}"));
         for i in 1..bytes {
             let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+            // The subtrahend byte is copied to the scratch first (the dst
+            // preload may overlay a), then the minuend byte is preloaded
+            // into the destination, then the fold runs against the scratch.
             self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
-            self.emit("    BTFSS STATUS, 0 ; C".to_string());
-            self.emit("    ADDLW 0x01".to_string());
-            self.emit(format!("    SUBLW 0x{kb:02X}"));
+            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+            self.emit(format!("    MOVLW 0x{kb:02X}"));
             self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+            self.emit("    BTFSS STATUS, 0 ; C".to_string());
+            self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+            self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
         }
     }
 
