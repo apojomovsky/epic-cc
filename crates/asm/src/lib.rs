@@ -227,6 +227,24 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             };
             vec![base | d << 9 | a << 8 | f]
         }
+        "CLRF" | "CPFSEQ" | "CPFSGT" | "CPFSLT" | "MOVWF" | "MULWF" | "NEGF" | "SETF"
+        | "TSTFSZ" => {
+            let f = parse_f_field(rest, symbols);
+            let a = parse_a_bit(ops[1]);
+            let base: u16 = match mne.as_str() {
+                "CLRF" => 0x6A00,
+                "CPFSEQ" => 0x6200,
+                "CPFSGT" => 0x6400,
+                "CPFSLT" => 0x6000,
+                "MOVWF" => 0x6E00,
+                "MULWF" => 0x0200,
+                "NEGF" => 0x6C00,
+                "SETF" => 0x6800,
+                "TSTFSZ" => 0x6600,
+                _ => unreachable!(),
+            };
+            vec![base | a << 8 | f]
+        }
         other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
     }
 }
