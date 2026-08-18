@@ -4313,14 +4313,14 @@ fn table_section_pinned_to_pass_a_start_after_elision() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[should_panic(expected = "spans pages")]
-fn banked_growth_across_page_boundary_panics() {
-    // main's body's last word is 0x7FE (page 0, one spare word) pre-banking
-    // — a clean fit with NO `.org` anchor. The chain
-    // accumulator `main::a` sits at 0xA0 (bank 1), so banking inserts
-    // BANKSEL words that push the tail across 0x800 into page 1: the
-    // post-banking page-fit check must panic loudly (the pre-banking
-    // assignment and the backward-`.org` guard both miss it).
+fn banked_growth_packed_into_next_page() {
+    // Issue #17 + #12: the bin packing measures POST-banking sizes, so a
+    // function whose banking growth would straddle a page boundary is
+    // packed into the next page with an anchor instead of straddling.
+    // main's body is 2042 words pre-banking (last word 0x7FE, page 0) and
+    // grows ~5 BANKSEL words to 2047 — past page 0's 2043-word tail — so
+    // it lands in page 1 with a `.org 0x800` anchor, and the post-banking
+    // page-fit check passes (no straddle).
     let m = parse(&format!(
         "global in i8\nglobal out i8\n\
          fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %b = add i8 %1, 0\n{}\
@@ -4335,21 +4335,13 @@ fn banked_growth_across_page_boundary_panics() {
         ("main::a", 0xA0), // bank 1: every chain access needs a BANKSEL
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // Pre-banking extent: start 5 (no ISR header), 8 fixed words + 678 x 3
-    // chain words = 2042 -> last occupied 0x7FE, page 0, no pad.
-    assert_eq!(label_addr(&asm, "main"), 5, "main starts after the 5-word header:\n{asm}");
-    assert_eq!(
-        asm.matches("    org ").count(),
-        1,
-        "only the header .org 0x0000 — the pre-banking fit emits no page pad:\n{asm}"
-    );
-    // The pre-banking text fits its page — the straddle is introduced by
-    // the BANKSEL growth, exactly the gap the check closes.
-    verify_page_fit(&m, &asm);
-    // Post-banking: the banked chain accesses add BANKSEL words, pushing
-    // the last occupied word to 0x802 (page 1). Must panic loudly.
-    let banked = banking::assign_banks(&device::PIC16F877A, &asm);
+    // main is packed into page 1 (its post-banking size doesn't fit page 0).
+    assert_eq!(label_addr(&asm, "main"), 0x800, "main packed into page 1:\n{asm}");
+    let banked = banking::assign_banks(&PIC16F877A, &asm);
+    // No panic: the final layout is anchored and page-fit.
     verify_page_fit(&m, &banked);
+    // The banked program really runs: out = in + 0 = in.
+    assert_eq!(sim_run_asm(&banked, &[(0x20, 7)], 0x21), 7, "banked program must run:\n{banked}");
 }
 
 #[test]
@@ -4378,6 +4370,58 @@ fn banked_growth_within_page_passes() {
     verify_page_fit(&m, &banked);
     // The banked program really runs: out = in + 0 = in.
     assert_eq!(sim_run_asm(&banked, &[(0x20, 7)], 0x21), 7, "banked program must run:\n{banked}");
+}
+
+// ---------------------------------------------------------------------------
+// Issue #12: bin packing over measured function sizes.
+//
+// The greedy next-fit pads to a new page whenever the next function does
+// not fit the current page's tail, wasting the tail even when a LATER
+// small function could fill it. Bin packing (first-fit in emission order)
+// places each function in the lowest-numbered page with room, so a small
+// function later in the module fills an earlier page's tail.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bin_packing_fills_earlier_page_tail() {
+    // f1 fills most of page 0 (~1750 words, ~290 left), f2 is too big for
+    // the tail (~1840 words -> page 1), f3 is small (~250 words) and fits
+    // the page-0 tail. Greedy: f3 lands in page 1 (the tail is wasted).
+    // Bin packing: f3 lands in page 0 at the tail, and the program uses 2
+    // pages instead of 3.
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn f1(void) ()\n  block entry:\n{}    ret void\n\
+         fn f2(void) ()\n  block entry:\n{}    ret void\n\
+         fn f3(void) ()\n  block entry:\n{}    ret void\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    call void @f1()\n    call void @f2()\n    call void @f3()\n    store i8 %1 @out\n    ret void\n",
+        pad_body(580), pad_body(610), pad_body(80)
+    ));
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("f1::a", 0x25),
+        ("f2::a", 0x26),
+        ("f3::a", 0x27),
+        ("main::1", 0x28),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    // f3 fills the page-0 tail: it must land in page 0, not page 1.
+    assert!(
+        label_addr(&asm, "f3") < 0x800,
+        "f3 must fill the page-0 tail:\n{asm}"
+    );
+    // f2 is too big for the tail and stays in page 1.
+    assert!(
+        label_addr(&asm, "f2") >= 0x800 && label_addr(&asm, "f2") < 0x1000,
+        "f2 must land in page 1:\n{asm}"
+    );
+    // Only 2 pages are used — no `.org 0x1000` pad.
+    assert!(!asm.contains("    org 0x1000"), "no page-2 pad:\n{asm}");
+    // Load-bearing sim: main calls f1, f2, f3 (all void) and stores in.
+    // The main -> f2 call is cross-page (0 -> 1) and keeps its restore;
+    // main -> f1 and main -> f3 are same-page and skip it.
+    assert_eq!(sim_run_asm(&asm, &[(0x20, 7)], 0x21), 7, "out = in:\n{asm}");
 }
 
 // ---------------------------------------------------------------------------
