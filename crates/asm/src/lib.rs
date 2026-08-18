@@ -97,14 +97,298 @@ pub fn assemble(src: &str) -> Vec<u16> {
     out
 }
 
+/// Word count of one PIC18 instruction line's mnemonic — 2 for the
+/// two-word forms (`GOTO`/`CALL`/`LFSR`/`MOVFF`), 1 for everything else.
+/// Directives never reach this (handled in `assemble_pic18`'s pass 1
+/// before this is called).
+fn instruction_words_pic18(line: &str) -> usize {
+    let mne = line.split_whitespace().next().unwrap_or("");
+    match mne.to_ascii_uppercase().as_str() {
+        "GOTO" | "CALL" | "LFSR" | "MOVFF" => 2,
+        _ => 1,
+    }
+}
+
+/// Assemble PIC18 assembly source into 16-bit words indexed by word
+/// address. Two-pass like `assemble`: pass 1 resolves labels/`org`/`equ`
+/// and measures each line's size; pass 2 encodes. No `.align`/`.table` —
+/// P1 has no const-table codegen to emit them (that machinery arrives with
+/// `TBLRD` support in a later phase).
+///
+/// **`org` and labels are BYTE addresses here, unlike PIC14's `assemble`**
+/// (confirmed against `gpasm -p p18f4550`: `org 0x0020` places the next
+/// instruction at *word* address 0x10, not 0x20) — this matches PIC18's
+/// byte-oriented program counter. The output `Vec<u16>` stays word-indexed
+/// (byte address / 2), so callers see the same shape as `assemble`;
+/// `encode_pic18` receives each instruction's own BYTE address and divides
+/// by 2 wherever the ISA's `k`/`n` fields need a *word* address/offset
+/// (`GOTO`/`CALL`'s absolute target, every relative branch's offset).
+pub fn assemble_pic18(src: &str) -> Vec<u16> {
+    let mut symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut org = 0usize; // byte address
+    let mut lines: Vec<(usize, String)> = Vec::new(); // (byte address, line)
+    for raw in src.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("org ") {
+            let target = parse_num(rest.trim());
+            assert!(
+                target >= org,
+                "asm: backward .org to 0x{target:04X} from 0x{org:04X} — an .org can only pad forward"
+            );
+            org = target;
+            continue;
+        }
+        if line.strip_prefix("end").is_some() {
+            break;
+        }
+        if let Some(label) = line.strip_suffix(':') {
+            symbols.insert(label.trim().to_string(), org);
+            continue;
+        }
+        if let Some(eq) = line.find(" equ ") {
+            let (name, val) = line.split_at(eq);
+            symbols.insert(name.trim().to_string(), parse_num(val[" equ ".len()..].trim()));
+            continue;
+        }
+        let words = instruction_words_pic18(line);
+        lines.push((org, line.to_string()));
+        org += words * 2; // advance by BYTES
+    }
+    let mut out = vec![0u16; org / 2];
+    for (addr, line) in &lines {
+        let word_addr = addr / 2;
+        let encoded = encode_pic18(*addr, line, &symbols);
+        out[word_addr] = encoded[0];
+        if encoded.len() == 2 {
+            out[word_addr + 1] = encoded[1];
+        }
+    }
+    out
+}
+
+/// Parse a PIC18 byte/bit-oriented operand's `f` field (the first
+/// comma-separated token after the mnemonic).
+fn parse_f_field(rest: &str, symbols: &std::collections::HashMap<String, usize>) -> u16 {
+    let f = parse_lit(rest.split(',').next().unwrap().trim(), symbols);
+    (f & 0xFF) as u16
+}
+
+fn parse_a_bit(rest: &str) -> u16 {
+    match rest.to_ascii_uppercase().as_str() {
+        "A" => 0,
+        "B" => 1,
+        other => panic!("asm(pic18): expected A or B, got {other}"),
+    }
+}
+
+fn parse_d_bit(rest: &str) -> u16 {
+    match rest.to_ascii_uppercase().as_str() {
+        "W" => 0,
+        "F" => 1,
+        other => panic!("asm(pic18): expected W or F, got {other}"),
+    }
+}
+
+/// Encode one PIC18 instruction line to 1 or 2 words. `addr` is this
+/// instruction's own BYTE address (matching `symbols`, which `assemble_pic18`
+/// also stores as byte addresses); the relative-branch/`GOTO`/`CALL` arms
+/// divide by 2 to get the *word* address/offset the ISA's `k`/`n` fields need.
+fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<String, usize>) -> Vec<u16> {
+    let mut it = line.splitn(2, char::is_whitespace);
+    let mne = it.next().expect("asm: empty instruction line").to_ascii_uppercase();
+    let rest = it.next().unwrap_or("").trim();
+    let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
+    match mne.as_str() {
+        "NOP" => vec![0x0000],
+        "ADDWF" | "ADDWFC" | "ANDWF" | "COMF" | "DECF" | "DECFSZ" | "DCFSNZ" | "INCF"
+        | "INCFSZ" | "INFSNZ" | "IORWF" | "MOVF" | "RLCF" | "RLNCF" | "RRCF" | "RRNCF"
+        | "SUBFWB" | "SUBWF" | "SUBWFB" | "SWAPF" | "XORWF" => {
+            let f = parse_f_field(rest, symbols);
+            let d = parse_d_bit(ops[1]);
+            let a = parse_a_bit(ops[2]);
+            let base: u16 = match mne.as_str() {
+                "ADDWF" => 0x2400,
+                "ADDWFC" => 0x2000,
+                "ANDWF" => 0x1400,
+                "COMF" => 0x1C00,
+                "DECF" => 0x0400,
+                "DECFSZ" => 0x2C00,
+                "DCFSNZ" => 0x4C00,
+                "INCF" => 0x2800,
+                "INCFSZ" => 0x3C00,
+                "INFSNZ" => 0x4800,
+                "IORWF" => 0x1000,
+                "MOVF" => 0x5000,
+                "RLCF" => 0x3400,
+                "RLNCF" => 0x4400,
+                "RRCF" => 0x3000,
+                "RRNCF" => 0x4000,
+                "SUBFWB" => 0x5400,
+                "SUBWF" => 0x5C00,
+                "SUBWFB" => 0x5800,
+                "SWAPF" => 0x3800,
+                "XORWF" => 0x1800,
+                _ => unreachable!(),
+            };
+            vec![base | d << 9 | a << 8 | f]
+        }
+        "CLRF" | "CPFSEQ" | "CPFSGT" | "CPFSLT" | "MOVWF" | "MULWF" | "NEGF" | "SETF"
+        | "TSTFSZ" => {
+            let f = parse_f_field(rest, symbols);
+            let a = parse_a_bit(ops[1]);
+            let base: u16 = match mne.as_str() {
+                "CLRF" => 0x6A00,
+                "CPFSEQ" => 0x6200,
+                "CPFSGT" => 0x6400,
+                "CPFSLT" => 0x6000,
+                "MOVWF" => 0x6E00,
+                "MULWF" => 0x0200,
+                "NEGF" => 0x6C00,
+                "SETF" => 0x6800,
+                "TSTFSZ" => 0x6600,
+                _ => unreachable!(),
+            };
+            vec![base | a << 8 | f]
+        }
+        "BCF" | "BSF" | "BTFSC" | "BTFSS" | "BTG" => {
+            let f = parse_f_field(rest, symbols);
+            let b: u16 = ops[1]
+                .parse()
+                .unwrap_or_else(|_| panic!("asm(pic18): bad bit number {}", ops[1]));
+            assert!(b <= 7, "asm(pic18): bit number {b} out of range 0-7");
+            let a = parse_a_bit(ops[2]);
+            let base: u16 = match mne.as_str() {
+                "BCF" => 0x9000,
+                "BSF" => 0x8000,
+                "BTFSC" => 0xB000,
+                "BTFSS" => 0xA000,
+                "BTG" => 0x7000,
+                _ => unreachable!(),
+            };
+            vec![base | b << 9 | a << 8 | f]
+        }
+        "SUBLW" | "IORLW" | "XORLW" | "ANDLW" | "RETLW" | "MULLW" | "MOVLW" | "ADDLW" => {
+            let k = (parse_lit(rest, symbols) & 0xFF) as u16;
+            let base: u16 = match mne.as_str() {
+                "SUBLW" => 0x0800,
+                "IORLW" => 0x0900,
+                "XORLW" => 0x0A00,
+                "ANDLW" => 0x0B00,
+                "RETLW" => 0x0C00,
+                "MULLW" => 0x0D00,
+                "MOVLW" => 0x0E00,
+                "ADDLW" => 0x0F00,
+                _ => unreachable!(),
+            };
+            vec![base | k]
+        }
+        "CLRWDT" => vec![0x0004],
+        "PUSH" => vec![0x0005],
+        "POP" => vec![0x0006],
+        "DAW" => vec![0x0007],
+        "SLEEP" => vec![0x0003],
+        "RESET" => vec![0x00FF],
+        "RETFIE" | "RETURN" => {
+            let s: u16 = if rest.eq_ignore_ascii_case("FAST") { 1 } else { 0 };
+            let base: u16 = if mne == "RETFIE" { 0x0010 } else { 0x0012 };
+            vec![base | s]
+        }
+        "MOVLB" => {
+            let k = (parse_lit(rest, symbols) & 0xF) as u16;
+            vec![0x0100 | k]
+        }
+        "BZ" | "BNZ" | "BC" | "BNC" | "BOV" | "BNOV" | "BN" | "BNN" => {
+            let target = *symbols
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
+            // Branch offsets are word offsets; convert both byte addresses
+            // to word addresses before taking the difference.
+            let n = (target >> 1) as i32 - ((addr >> 1) as i32 + 1);
+            assert!(
+                (-128..=127).contains(&n),
+                "asm(pic18): {mne} offset {n} out of range [-128,127]"
+            );
+            let n8 = (n as i8 as u8) as u16;
+            let base: u16 = match mne.as_str() {
+                "BZ" => 0xE000,
+                "BNZ" => 0xE100,
+                "BC" => 0xE200,
+                "BNC" => 0xE300,
+                "BOV" => 0xE400,
+                "BNOV" => 0xE500,
+                "BN" => 0xE600,
+                "BNN" => 0xE700,
+                _ => unreachable!(),
+            };
+            vec![base | n8]
+        }
+        "BRA" | "RCALL" => {
+            let target = *symbols
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
+            let n = (target >> 1) as i32 - ((addr >> 1) as i32 + 1);
+            assert!(
+                (-1024..=1023).contains(&n),
+                "asm(pic18): {mne} offset {n} out of range [-1024,1023]"
+            );
+            let n11 = (n as i16 as u16) & 0x7FF;
+            let base: u16 = if mne == "BRA" { 0xD000 } else { 0xD800 };
+            vec![base | n11]
+        }
+        "GOTO" => {
+            let target = *symbols
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
+            let k = (target >> 1) as u32; // byte address -> word address
+            vec![0xEF00 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
+        }
+        "CALL" => {
+            let (label, fast) = match ops.as_slice() {
+                [l] => (*l, false),
+                [l, f] if f.eq_ignore_ascii_case("FAST") => (*l, true),
+                _ => panic!("asm(pic18): CALL takes <label> or <label>,FAST"),
+            };
+            let target = *symbols
+                .get(label)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {label}"));
+            let k = (target >> 1) as u32; // byte address -> word address
+            let s: u16 = if fast { 1 } else { 0 };
+            vec![0xEC00 | s << 8 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
+        }
+        "LFSR" => {
+            let fsr: u16 = ops[0]
+                .parse()
+                .unwrap_or_else(|_| panic!("asm(pic18): bad FSR number {}", ops[0]));
+            assert!(fsr <= 2, "asm(pic18): FSR number {fsr} out of range 0-2");
+            let k = (parse_lit(ops[1], symbols) & 0xFFF) as u16;
+            vec![0xEE00 | fsr << 4 | (k >> 8), 0xF000 | (k & 0xFF)]
+        }
+        "MOVFF" => {
+            let src_addr = (parse_lit(ops[0], symbols) & 0xFFF) as u16;
+            let dst_addr = (parse_lit(ops[1], symbols) & 0xFFF) as u16;
+            vec![0xC000 | src_addr, 0xF000 | dst_addr]
+        }
+        other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
+    }
+}
+
 /// Assemble source and render the result as Intel HEX.
 ///
 /// The whole program (code + tables) must fit the device's flash: a program
 /// whose highest word address is beyond `device.flash_words` panics loudly.
-/// `assemble` itself is layout-only and stays unasserted so isel's unit tests
-/// can inspect words of any size.
+/// `assemble`/`assemble_pic18` are layout-only and stay unasserted so
+/// isel's unit tests can inspect words of any size.
 pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
-    let words = assemble(src);
+    let words = match device.core {
+        device::Core::Pic14 => assemble(src),
+        device::Core::Pic18 => assemble_pic18(src),
+    };
     assert!(
         words.len() as u32 <= device.flash_words,
         "asm: program of {} words exceeds device flash (highest address 0x{:04X} >= {:#06x}; {}-word flash)",

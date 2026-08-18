@@ -5,3 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+
+[dev-dependencies]
+asm = { path = "../asm" }
+device = { path = "../device" }
