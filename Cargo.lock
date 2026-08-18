@@ -97,6 +97,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "isel-pic18"
+version = "0.1.0"
+dependencies = [
+ "asm",
+ "device",
+ "ir",
+ "isel",
+ "iselcore",
+ "pic14-sim",
+]
+
+[[package]]
 name = "iselcore"
 version = "0.1.0"
 

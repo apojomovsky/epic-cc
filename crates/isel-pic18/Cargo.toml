@@ -1,0 +1,19 @@
+[package]
+name = "isel-pic18"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+device = { path = "../device" }
+iselcore = { path = "../iselcore" }
+isel = { path = "../isel" }
+
+[dev-dependencies]
+pic14-sim = { path = "../sim" }
+asm = { path = "../asm" }
+
+[[bin]]
+name = "isel-pic18"
+path = "src/bin/isel-pic18.rs"
