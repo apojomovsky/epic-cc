@@ -26,21 +26,11 @@
 ///
 /// # Panics
 ///
-/// Panics if any file-register operand lies in an SFR/unused range
-/// (`0x80..=0x9F`, `0xF0..=0xFF`, `0x170..=0x19F`, ...) that must never be
-/// emitted as a GPR address.
+/// `Device::bank_of` panics if any file-register operand lies in an
+/// SFR/unused range that must never be emitted as a GPR address.
 use std::collections::{HashMap, HashSet};
-fn bank_of(v: u16) -> Option<u8> {
-    match v {
-        0x00..=0x1F => None, // SFR
-        0x20..=0x6F => Some(0),
-        0x70..=0x7F => None, // common
-        0xA0..=0xEF => Some(1),
-        0x120..=0x16F => Some(2),
-        0x1A0..=0x1EF => Some(3),
-        other => panic!("banking: operand 0x{other:03X} is not a banked GPR address"),
-    }
-}
+
+use device::Device;
 
 const LITERAL_OPS: [&str; 7] = ["MOVLW", "ADDLW", "ANDLW", "IORLW", "XORLW", "SUBLW", "RETLW"];
 
@@ -102,14 +92,14 @@ fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
 /// The bank a file-register operand selects, or `None` when the operand is
 /// not a banked GPR (SFR/common/literal). The operand token is the first
 /// after the mnemonic, with any trailing comma/semicolon stripped.
-fn operand_bank(mne: &str, toks: &[&str]) -> Option<u8> {
+fn operand_bank(device: &Device, mne: &str, toks: &[&str]) -> Option<u8> {
     if LITERAL_OPS.contains(&mne) {
         return None;
     }
     let op = toks.get(1).copied()?;
     let hex = op.trim_end_matches([',', ';', ')']).strip_prefix("0x")?;
     let v = u16::from_str_radix(hex, 16).ok()?;
-    bank_of(v)
+    device.bank_of(v)
 }
 
 // ---------------------------------------------------------------------------
@@ -180,6 +170,7 @@ fn function_regions(asm: &str) -> (HashSet<String>, HashMap<String, Vec<&str>>) 
 /// (recursion is rejected by `callgraph::check_depth`), so the recursion
 /// through `walk_region` terminates.
 fn func_exit_bank(
+    device: &Device,
     func: &str,
     entry: BankSet,
     call_targets: &HashSet<String>,
@@ -193,7 +184,7 @@ fn func_exit_bank(
         // No region (not a CALL target / not in the text): conservative.
         return BankSet::UNKNOWN;
     };
-    let v = walk_region(region, entry, call_targets, regions, memo);
+    let v = walk_region(device, region, entry, call_targets, regions, memo);
     memo.insert((func.to_string(), entry), v);
     v
 }
@@ -206,6 +197,7 @@ fn func_exit_bank(
 /// jumps, and RETURN/RETLW/RETFIE record an exit. A path that falls off the
 /// region's end without returning is not a provable exit (UNKNOWN).
 fn walk_region(
+    device: &Device,
     region: &[&str],
     entry: BankSet,
     call_targets: &HashSet<String>,
@@ -261,7 +253,7 @@ fn walk_region(
         if mne == "CALL" {
             if let Some(target) = toks.get(1) {
                 let callee = target.trim_end_matches([',', ';', ')']);
-                let eb = func_exit_bank(callee, banks, call_targets, regions, memo);
+                let eb = func_exit_bank(device, callee, banks, call_targets, regions, memo);
                 work.push((i + 1, eb));
             }
             continue;
@@ -286,7 +278,7 @@ fn walk_region(
             work.push((i + 1, nb));
             continue;
         }
-        if let Some(b) = operand_bank(mne, &toks) {
+        if let Some(b) = operand_bank(device, mne, &toks) {
             work.push((i + 1, BankSet::single(b)));
             continue;
         }
@@ -305,7 +297,7 @@ fn walk_region(
 /// `MOVWF STATUS` restore is excluded by the STATUS-write check. `MOVWF
 /// STATUS` programs therefore keep the resets and their layouts are
 /// unchanged.
-fn is_bank0_only(asm: &str) -> bool {
+fn is_bank0_only(device: &Device, asm: &str) -> bool {
     for line in asm.lines() {
         let toks: Vec<&str> = line.trim_start().split_whitespace().collect();
         let Some(mne) = toks.first().copied() else {
@@ -323,7 +315,7 @@ fn is_bank0_only(asm: &str) -> bool {
         if mne == "org" || mne == "end" || mne.starts_with('.') {
             continue;
         }
-        if let Some(bank) = operand_bank(mne, &toks) {
+        if let Some(bank) = operand_bank(device, mne, &toks) {
             // Bank 0 is fine; any NONZERO bank disqualifies.
             if bank != 0 {
                 return false;
@@ -336,13 +328,13 @@ fn is_bank0_only(asm: &str) -> bool {
 /// Insert `BANKSEL` before file-register operands whose bank differs from the
 /// tracked current bank — or whenever the tracked bank is unknown (just after
 /// a label) — and rewrite banked operands to `physical & 0x7F`.
-pub fn assign_banks(asm: &str) -> String {
+pub fn assign_banks(device: &Device, asm: &str) -> String {
     // Issue #16 (left over from #13): a bank-0-only program provably never
     // leaves bank 0, so the label/CALL resets below can be skipped entirely
     // instead of emitting the dead full BANKSEL preamble after every label
     // and CALL. The scan is conservative — any banked operand, hand-written
     // bank select (any form), or `MOVWF STATUS` disables the skip.
-    let bank0_only = is_bank0_only(asm);
+    let bank0_only = is_bank0_only(device, asm);
     // Issue #13 item 2: a CALL to a callee whose exit bank is provable keeps
     // tracking that bank instead of resetting to unknown — the full BANKSEL
     // after the CALL is redundant when the caller's next operand is in the
@@ -399,7 +391,7 @@ pub fn assign_banks(asm: &str) -> String {
             } else if let Some(target) = toks.get(1) {
                 let callee = target.trim_end_matches([',', ';', ')']);
                 let cur = BankSet::single(u8::from(rp0) | (u8::from(rp1) << 1));
-                let eb = func_exit_bank(callee, cur, &call_targets, &regions, &mut exit_memo);
+                let eb = func_exit_bank(device, callee, cur, &call_targets, &regions, &mut exit_memo);
                 if eb.is_single() {
                     known = true;
                     rp0 = eb.single_bank() & 1 == 1;
@@ -460,7 +452,7 @@ pub fn assign_banks(asm: &str) -> String {
         };
         if let Some(hex) = op.trim_end_matches([',', ';', ')']).strip_prefix("0x") {
             if let Ok(v) = u16::from_str_radix(hex, 16) {
-                if let Some(bank) = bank_of(v) {
+                if let Some(bank) = device.bank_of(v) {
                     let cur = u8::from(rp0) | (u8::from(rp1) << 1);
                     if !known || bank != cur {
                         emit_banksel(&mut out, &mut rp0, &mut rp1, bank, !known);

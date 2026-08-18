@@ -1,15 +1,16 @@
 use banking::assign_banks;
+use device::PIC16F877A;
 
 #[test]
 fn passes_bank0_asm_through() {
     let asm = "    MOVF 0x20, W\n    MOVWF 0x21\n";
-    assert_eq!(assign_banks(asm), asm);
+    assert_eq!(assign_banks(&PIC16F877A, asm), asm);
 }
 
 #[test]
 #[should_panic]
 fn rejects_bank_operand() {
-    assign_banks("    MOVF 0x80, W\n");
+    assign_banks(&PIC16F877A, "    MOVF 0x80, W\n");
 }
 
 #[test]
@@ -19,7 +20,7 @@ fn org_directives_pass_through_unrewritten() {
     // start (`.org 0x00D2`) must pass through untouched, never BANKSEL-
     // rewritten (relocating the program) nor range-rejected.
     let asm = "    org 0x0000\n    org 0x0800\n    org 0x00D2\n    .align 256\n    end\n";
-    assert_eq!(assign_banks(asm), asm);
+    assert_eq!(assign_banks(&PIC16F877A, asm), asm);
 }
 
 #[test]
@@ -27,7 +28,7 @@ fn literal_immediates_may_exceed_0x7f() {
     // ADDLW/MOVLW/... take an 8-bit literal, not a file-register address:
     // 0xFC (= -4) is legal in a literal slot and must not be range-checked.
     let asm = "    MOVLW 0xFF\n    ADDLW 0xFC\n    MOVWF 0x21\n";
-    assert_eq!(assign_banks(asm), asm);
+    assert_eq!(assign_banks(&PIC16F877A, asm), asm);
 }
 
 #[test]
@@ -36,7 +37,7 @@ fn inserts_banksel_when_bank_changes() {
     // then BCF RP0 before returning to a bank-0 operand.
     let asm = "    MOVF 0xA0, W\n    MOVF 0x20, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -44,7 +45,7 @@ fn common_and_sfr_operands_need_no_banksel() {
     // 0x70 (common) and STATUS (SFR) need no BANKSEL; the following bank-0
     // operand stays in the tracked bank 0, so nothing is inserted.
     let asm = "    MOVF 0x70, W\n    BTFSC STATUS, 2\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), asm);
+    assert_eq!(assign_banks(&PIC16F877A, asm), asm);
 }
 
 #[test]
@@ -52,7 +53,7 @@ fn no_redundant_banksel_within_same_bank() {
     // Two bank-1 operands in a row share one BANKSEL.
     let asm = "    MOVF 0xA0, W\n    MOVWF 0xE5\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    MOVWF 0x65\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -62,7 +63,7 @@ fn banks_2_and_3_emit_rp1_and_rewrite() {
     // address starts at 0x1A0.
     let asm = "    MOVF 0x125, W\n    MOVF 0x1A5, W\n";
     let expected = "    BSF STATUS, 6\n    MOVF 0x25, W\n    BSF STATUS, 5\n    MOVF 0x25, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -73,7 +74,7 @@ fn branch_targets_reset_bank_each_arm_gets_full_banksel() {
     // never a partial diff against the fall-through bank.
     let asm = "    MOVF 0xA0, W\narm1:\n    MOVF 0xA5, W\narm2:\n    MOVF 0x125, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\narm1:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\narm2:\n    BCF STATUS, 5\n    BSF STATUS, 6\n    MOVF 0x25, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -83,7 +84,7 @@ fn tracking_resumes_after_label_full_banksel() {
     // later bank change emits only the differing bit.
     let asm = "    MOVF 0xA0, W\nL:\n    MOVF 0xA5, W\n    MOVWF 0xE5\n    MOVF 0x20, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\nL:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n    MOVWF 0x65\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -92,7 +93,7 @@ fn tracks_encountered_banksel_instructions() {
     // needs no new BANKSEL; the bank-0 operand that follows needs BCF RP0.
     let asm = "    BSF STATUS, 5\n    MOVF 0xA5, W\n    MOVF 0x20, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x25, W\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -100,7 +101,7 @@ fn tracks_encountered_banksel_instructions() {
 fn rejects_unbanked_sfr_operand() {
     // 0xF0-0xFF is the SFR range of bank 1; it must never be emitted as a
     // GPR operand and panics loudly.
-    assign_banks("    MOVF 0xF0, W\n");
+    assign_banks(&PIC16F877A, "    MOVF 0xF0, W\n");
 }
 
 #[test]
@@ -111,7 +112,7 @@ fn banks_bcf_on_banked_gpr() {
     // the STATUS check, silently emitting the line verbatim).
     let asm = "    BCF 0xA0, 7\n";
     let expected = "    BSF STATUS, 5\n    BCF 0x20, 7\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -119,7 +120,7 @@ fn banks_bsf_on_banked_gpr() {
     // Bank 2 from bank 0: RP1 only, then the operand rewritten to 0x20.
     let asm = "    BSF 0x120, 0\n";
     let expected = "    BSF STATUS, 6\n    BSF 0x20, 0\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -132,7 +133,7 @@ fn call_resets_tracked_bank_next_operand_gets_full_banksel() {
     // full BANKSEL, never a partial diff against the pre-CALL bank.
     let asm = "    MOVF 0xA0, W\n    CALL f\n    MOVF 0xA5, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL f\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -143,7 +144,7 @@ fn tracking_resumes_after_call_full_banksel() {
     // bit — exactly like the label-reset behavior.
     let asm = "    MOVF 0xA0, W\n    CALL f\n    MOVF 0xA5, W\n    MOVWF 0xE5\n    MOVF 0x20, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL f\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n    MOVWF 0x65\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -152,7 +153,7 @@ fn status_banksel_and_gpr_bit_op_in_sequence() {
     // bit op on a same-bank GPR needs no new BANKSEL.
     let asm = "    BSF STATUS, 5\n    BSF 0xA0, 7\n";
     let expected = "    BSF STATUS, 5\n    BSF 0x20, 7\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -166,7 +167,7 @@ fn bank0_only_program_skips_all_banksels() {
     // that never changed the bank, and nothing in the text can change it.
     let asm = "    MOVF 0x20, W\nL:\n    MOVF 0x21, W\n    CALL f\n    MOVF 0x22, W\n    MOVWF 0x23\nf:\n    MOVF 0x24, W\n    RETURN\n";
     let expected = "    MOVF 0x20, W\nL:\n    MOVF 0x21, W\n    CALL f\n    MOVF 0x22, W\n    MOVWF 0x23\nf:\n    MOVF 0x24, W\n    RETURN\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -177,7 +178,7 @@ fn bank0_only_with_handwritten_bank_op_keeps_resets() {
     // full BANKSEL, exactly as before issue #16).
     let asm = "    BSF STATUS, 5\n    BCF STATUS, 5\nL:\n    MOVF 0x20, W\n";
     let expected = "    BSF STATUS, 5\n    BCF STATUS, 5\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -189,7 +190,7 @@ fn bank0_only_with_movwf_status_keeps_resets() {
     // unchanged).
     let asm = "    MOVWF STATUS\nL:\n    MOVF 0x20, W\n";
     let expected = "    MOVWF STATUS\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +208,7 @@ fn call_to_bank0_callee_skips_redundant_banksel() {
     // the CALL is redundant — the tracked bank is 0 already.
     let asm = "    MOVF 0xA0, W\n    CALL helper\n    MOVF 0x20, W\nhelper:\n    MOVF 0x21, W\n    RETURN\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL helper\n    MOVF 0x20, W\nhelper:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -218,7 +219,7 @@ fn call_to_bank1_callee_keeps_bank() {
     // banked operand got a full BANKSEL).
     let asm = "    MOVF 0xA0, W\n    CALL helper\n    MOVF 0xA5, W\nhelper:\n    MOVF 0xA1, W\n    RETURN\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL helper\n    MOVF 0x25, W\nhelper:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -228,7 +229,7 @@ fn call_exit_bank_is_transitive() {
     // `CALL outer`.
     let asm = "    MOVF 0xA0, W\n    CALL outer\n    MOVF 0x20, W\nouter:\n    CALL inner\n    RETURN\ninner:\n    MOVF 0x21, W\n    RETURN\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    CALL outer\n    MOVF 0x20, W\nouter:\n    CALL inner\n    RETURN\ninner:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -240,7 +241,7 @@ fn call_to_unknown_bank_callee_keeps_full_reset() {
     // paths diverge, so the exit bank is not provable.
     let asm = "    MOVF 0x20, W\n    CALL helper\n    MOVF 0xA5, W\nhelper:\n    BTFSC STATUS, 2\n    MOVF 0xA1, W\n    RETURN\n";
     let expected = "    MOVF 0x20, W\n    CALL helper\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\nhelper:\n    BTFSC STATUS, 2\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x21, W\n    RETURN\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 // ---- Item 3: bank-select ops in bit-number forms are recognized.
@@ -254,7 +255,7 @@ fn tracks_banksel_with_attached_comma() {
     // hand-written BCF left).
     let asm = "    MOVF 0xA0, W\n    BCF STATUS,5\n    MOVF 0xA5, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF STATUS,5\n    BSF STATUS, 5\n    MOVF 0x25, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -263,7 +264,7 @@ fn tracks_banksel_by_status_address() {
     // op too (0x03 IS STATUS on the PIC16F877A).
     let asm = "    MOVF 0xA0, W\n    BCF 0x03, 5\n    MOVF 0xA5, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF 0x03, 5\n    BSF STATUS, 5\n    MOVF 0x25, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -274,7 +275,7 @@ fn movwf_status_resets_tracked_bank() {
     // bank and emitted only a partial diff).
     let asm = "    MOVF 0xA0, W\n    MOVWF STATUS\n    MOVF 0xA5, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    MOVWF STATUS\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -282,7 +283,7 @@ fn movwf_status_by_address_resets_tracked_bank() {
     // The address form `MOVWF 0x03` is the same STATUS write.
     let asm = "    MOVF 0xA0, W\n    MOVWF 0x03\n    MOVF 0xA5, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    MOVWF 0x03\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x25, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -292,19 +293,19 @@ fn bank0_only_with_attached_comma_bank_op_keeps_resets() {
     // at every label/CALL).
     let asm = "    BCF STATUS,5\nL:\n    MOVF 0x20, W\n";
     let expected = "    BCF STATUS,5\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
 fn bank0_only_with_status_address_bank_op_keeps_resets() {
     let asm = "    BCF 0x03, 5\nL:\n    MOVF 0x20, W\n";
     let expected = "    BCF 0x03, 5\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
 fn bank0_only_with_movwf_status_address_keeps_resets() {
     let asm = "    MOVWF 0x03\nL:\n    MOVF 0x20, W\n";
     let expected = "    MOVWF 0x03\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
-    assert_eq!(assign_banks(asm), expected);
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }

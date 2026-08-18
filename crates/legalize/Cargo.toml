@@ -9,6 +9,7 @@ ir = { path = "../ir" }
 
 [dev-dependencies]
 alloc = { path = "../alloc" }
+device = { path = "../device" }
 
 [[bin]]
 name = "legalize"

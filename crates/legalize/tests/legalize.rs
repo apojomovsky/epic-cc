@@ -79,7 +79,7 @@ fn injected_routines_get_param_and_scratch_slots_allocated() {
         other => panic!("__shl_u16 must inject the scratch alloca, got {other:?}"),
     }
     // Overlay placement: params first (2+2 bytes), then the __scr buffer.
-    let out = alloc::allocate(&m2, "edge main __mul_u16\nedge main __shl_u16\n");
+    let out = alloc::allocate(&device::PIC16F877A, &m2, "edge main __mul_u16\nedge main __shl_u16\n");
     assert_eq!(out.locals["__mul_u16::b"], out.locals["__mul_u16::a"] + 2);
     assert_eq!(out.locals["__mul_u16::__scr"], out.locals["__mul_u16::b"] + 2);
     assert_eq!(out.locals["__shl_u16::cnt"], out.locals["__shl_u16::val"] + 2);

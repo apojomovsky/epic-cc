@@ -1,24 +1,22 @@
 //! Overlay address allocation for the PIC8 pipeline.
 //!
-//! Globals get sequential, even-aligned (i16) addresses starting at
-//! `GLOBAL_START`. Every local of every function lives in a frame assigned
-//! from the call graph: `base(f) = max over callers of the caller's
-//! **physical** frame end` (the address just past its last placed local,
-//! bank crossings included — see `frame_end`), roots start after the
+//! Globals get sequential, even-aligned (i16) addresses starting at the
+//! device's first GPR bank. Every local of every function lives in a frame
+//! assigned from the call graph: `base(f) = max over callers of the
+//! caller's **physical** frame end` (the address just past its last placed
+//! local, bank crossings included — see `frame_end`), roots start after the
 //! globals, so sibling functions (never co-live) share RAM.
 //!
-//! Both allocators assign **physical** addresses and step through the four
-//! banks: bank 0 GPR `0x20-0x6F`, bank 1 `0xA0-0xEF`, bank 2 `0x120-0x16F`,
-//! bank 3 `0x1A0-0x1EF` (`0x190-0x19F` is unimplemented RAM); demand past
-//! `0x1EF` panics. Common RAM (`0x70-0x7F`) is never used by locals (M3
-//! decision) — the bank progression jumps past it — and holds the fixed
-//! scratch/retval bytes instead.
+//! Both allocators assign **physical** addresses and step through the
+//! device's GPR banks (`Device::region_for`); demand past the last bank
+//! panics. The device's common RAM is never used by locals (M3 decision) —
+//! the bank progression jumps past it — and holds the fixed scratch/retval
+//! bytes instead (see `isel`).
 
 use std::collections::{HashMap, HashSet};
 
+use device::Device;
 use ir::{Inst, Module};
-
-pub const GLOBAL_START: u8 = 0x20;
 
 /// Complete address map: globals keyed by name, locals keyed `{func}::{name}`,
 /// plus the total overlay span (in bytes) across all banks. `const_globals`
@@ -34,35 +32,28 @@ pub struct AllocLayout {
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
 /// advancing to the next bank when `addr` has spilled past the current one.
-/// Common RAM (`0x70-0x7F`), SFRs, and the unimplemented gap
-/// (`0x170-0x19F`) fall into the next bank's range, so locals never land
-/// there.
-fn region_for(addr: u16) -> (u16, u16) {
-    if addr <= 0x6F {
-        (0x20, 0x6F)
-    } else if addr <= 0xEF {
-        (0xA0, 0xEF)
-    } else if addr <= 0x16F {
-        (0x120, 0x16F)
-    } else if addr <= 0x1EF {
-        (0x1A0, 0x1EF)
-    } else {
-        panic!("alloc: GPR demand exceeds 0x1EF ({addr:#06x})");
-    }
+/// Common RAM, SFRs, and any unimplemented gap fall into the next bank's
+/// range, so locals never land there. Panics past the device's last bank.
+fn region_for(device: &Device, addr: u16) -> (u16, u16) {
+    device.region_for(addr).unwrap_or_else(|| {
+        let last_end = device.ram_banks.last().expect("a device has at least one GPR bank").1;
+        panic!("alloc: GPR demand exceeds 0x{last_end:X} ({addr:#06x})")
+    })
 }
 
 /// The start address for a `width`-byte value placed at the next free address
 /// `addr`: step across banks when `addr` has passed a region's end, keep the
 /// value even-aligned within its bank region (only 2-byte values need even
-/// alignment; larger arrays advance sequentially), and panic past `0x1EF`.
-fn place_at(addr: u16, width: u8) -> u16 {
+/// alignment; larger arrays advance sequentially), and panic past the
+/// device's last bank.
+fn place_at(device: &Device, addr: u16, width: u8) -> u16 {
     // Only i16/2-byte globals need even alignment; larger arrays advance
     // sequentially (min(size, 2) keeps a multi-byte value from being padded
     // out to a multiple of its own width, which would waste RAM).
     let align = width.min(2);
     let mut a = addr;
     loop {
-        let (start, end) = region_for(a);
+        let (start, end) = region_for(device, a);
         let mut base = a.max(start);
         if base % u16::from(align) != 0 {
             base += u16::from(align) - (base % u16::from(align));
@@ -77,16 +68,17 @@ fn place_at(addr: u16, width: u8) -> u16 {
 
 /// The start address for a `width`-byte local placed contiguously at the next
 /// free frame byte `addr`: step across banks when `addr` has passed a
-/// region's end, and panic past `0x1EF`. Locals are NOT even-aligned — the
-/// overlay frame math (M3) is a plain byte sum, so placing locals contiguously
-/// keeps a frame's virtual footprint exactly equal to `locals_size(f)`, and a
-/// caller's physical end (see `frame_end`) is the address its callees' bases
-/// are derived from. The bank progression starts every region on an even
-/// address, so i16s placed there are naturally even-aligned within each bank.
-fn place_contiguous(addr: u16, width: u8) -> u16 {
+/// region's end, and panic past the device's last bank. Locals are NOT
+/// even-aligned — the overlay frame math (M3) is a plain byte sum, so placing
+/// locals contiguously keeps a frame's virtual footprint exactly equal to
+/// `locals_size(f)`, and a caller's physical end (see `frame_end`) is the
+/// address its callees' bases are derived from. The bank progression starts
+/// every region on an even address, so i16s placed there are naturally
+/// even-aligned within each bank.
+fn place_contiguous(device: &Device, addr: u16, width: u8) -> u16 {
     let mut a = addr;
     loop {
-        let (start, end) = region_for(a);
+        let (start, end) = region_for(device, a);
         let base = a.max(start);
         if base + u16::from(width) - 1 <= end {
             return base;
@@ -110,10 +102,10 @@ fn place_contiguous(addr: u16, width: u8) -> u16 {
 /// layout step that assigns the locals, so the result is the true physical
 /// end. When no local crosses a gap the walk reduces to `base + total_size`,
 /// keeping existing non-crossing layouts unchanged.
-fn frame_end(base: u16, widths: &[u8]) -> u16 {
+fn frame_end(device: &Device, base: u16, widths: &[u8]) -> u16 {
     let mut addr = base;
     for &w in widths {
-        addr = place_contiguous(addr, w) + u16::from(w);
+        addr = place_contiguous(device, addr, w) + u16::from(w);
     }
     addr
 }
@@ -143,8 +135,8 @@ fn reachable<'a>(roots: &[&'a str], edges: &'a HashMap<String, Vec<String>>) -> 
 /// through banks), locals per the overlay algorithm over the call graph parsed
 /// from `edges_text` (`edge <caller> <callee>` lines, order-agnostic; `depth`
 /// lines are informational). Panics loudly on a cyclic or unknown-function
-/// call graph, and if total demand exceeds `0x1EF`.
-pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
+/// call graph, and if total demand exceeds the device's GPR space.
+pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // 1. Globals: sequential, aligned to at most two bytes (i16 -> even
     // address; larger arrays advance sequentially), stepping through the banks as bank 0 GPR fills up. Each global spans
     // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
@@ -153,7 +145,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
     // so the map text can list them.
     let mut globals: HashMap<String, u16> = HashMap::new();
     let mut const_globals: HashSet<String> = HashSet::new();
-    let mut addr: u16 = u16::from(GLOBAL_START);
+    let mut addr: u16 = device.gpr_start();
     for g in &m.globals {
         if g.is_const {
             const_globals.insert(g.name.clone());
@@ -166,16 +158,16 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         let width = g.size;
         assert!(width <= 255, "alloc: RAM global @{} too large ({width} bytes; RAM is byte-addressed, max 255)", g.name);
         let width = width as u8;
-        let start = place_at(addr, width);
+        let start = place_at(device, addr, width);
         globals.insert(g.name.clone(), start);
         addr = start + u16::from(width);
     }
 
     // end_of_globals = max over the address map of (addr + width), floored at
-    // GLOBAL_START (mirrors isel's layout computation). The scratch/retval
-    // bytes now live in fixed common RAM (0x70-0x72), so the first frame base
-    // follows the globals directly.
-    let end_of_globals = m.globals.iter().fold(u16::from(GLOBAL_START), |end, g| {
+    // the device's GPR start (mirrors isel's layout computation). The
+    // scratch/retval bytes live in the device's fixed common RAM, so the
+    // first frame base follows the globals directly.
+    let end_of_globals = m.globals.iter().fold(device.gpr_start(), |end, g| {
         match globals.get(&g.name) {
             Some(&a) => end.max(a + u16::from(g.size)),
             None => end,
@@ -327,7 +319,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         let b = match callers.get(f) {
             Some(ps) => ps
                 .iter()
-                .map(|p| frame_end(base[p], &locals_widths[p]))
+                .map(|p| frame_end(device, base[p], &locals_widths[p]))
                 .max()
                 .expect("alloc: empty caller list"),
             None => bank0_start,
@@ -365,7 +357,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         let isr_base = non_isr_roots
             .iter()
             .flat_map(|r| reachable(&[r.as_str()], &edges))
-            .map(|f| frame_end(base[&f], &locals_widths[&f]))
+            .map(|f| frame_end(device, base[&f], &locals_widths[&f]))
             .max()
             .unwrap_or(bank0_start);
         // Re-derive the ISR contexts from the disjoint base (topo order: an
@@ -382,7 +374,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
             } else {
                 callers[f]
                     .iter()
-                    .map(|p| frame_end(base[p], &locals_widths[p]))
+                    .map(|p| frame_end(device, base[p], &locals_widths[p]))
                     .max()
                     .expect("alloc: empty caller list")
             };
@@ -400,7 +392,7 @@ pub fn allocate(m: &Module, edges_text: &str) -> AllocLayout {
         let mut seen: HashSet<String> = HashSet::new();
         let mut place = |name: &str, width: u8| {
             if seen.insert(name.to_string()) {
-                let start = place_contiguous(addr, width);
+                let start = place_contiguous(device, addr, width);
                 locals.insert(format!("{}::{name}", f.name), start);
                 addr = start + u16::from(width);
             }

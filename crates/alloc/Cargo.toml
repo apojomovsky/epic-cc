@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 ir = { path = "../ir" }
+device = { path = "../device" }
 
 [[bin]]
 name = "alloc"

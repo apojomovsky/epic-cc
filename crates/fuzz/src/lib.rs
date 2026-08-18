@@ -2461,14 +2461,14 @@ fn run_ir_pic(prog: &IrProgram) -> Result<u32, Failure> {
         m = wholeprog::merge(m);
         m = legalize::legalize(m);
         let cg = callgraph::build(&m);
-        let layout = alloc::allocate(&m, &callgraph::edges_text(&cg));
+        let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
         let mut addrs: HashMap<String, u16> = HashMap::new();
         addrs.extend(layout.globals.clone());
         addrs.extend(layout.locals.clone());
-        let asm = isel::select(&m, &addrs);
-        let asm = banking::assign_banks(&asm);
+        let asm = isel::select(&device::PIC16F877A, &m, &addrs);
+        let asm = banking::assign_banks(&device::PIC16F877A, &asm);
         let asm = peephole::optimize(&asm);
-        let hex = asm::assemble_file_to_hex(&asm);
+        let hex = asm::assemble_file_to_hex(&device::PIC16F877A, &asm);
         (hex, layout)
     }))
     .map_err(|p| {
@@ -3007,7 +3007,7 @@ fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, Failure> {
         m = wholeprog::merge(m);
         m = legalize::legalize(m);
         let cg = callgraph::build(&m);
-        alloc::allocate(&m, &callgraph::edges_text(&cg))
+        alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg))
     }))
     .map_err(|p| {
         let msg = p

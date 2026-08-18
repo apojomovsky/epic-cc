@@ -1,9 +1,11 @@
-//! Two-pass PIC14 (PIC16F877A) assembler to 14-bit words and Intel HEX.
+//! Two-pass PIC14 assembler to 14-bit words and Intel HEX.
 //!
 //! No external assembler: `assemble` resolves labels/org/equ in a first pass and
 //! encodes instructions in a second pass; `to_hex` emits Intel HEX in the exact
 //! byte order decoded by `pic14_sim::parse_hex` (two little-endian bytes per
 //! 14-bit word at `word*2`, `04` extended-linear-address header, `01` EOF).
+
+use device::Device;
 
 /// Assemble PIC14 assembly source into 14-bit words indexed by word address.
 pub fn assemble(src: &str) -> Vec<u16> {
@@ -97,17 +99,19 @@ pub fn assemble(src: &str) -> Vec<u16> {
 
 /// Assemble source and render the result as Intel HEX.
 ///
-/// The whole program (code + tables) must fit the PIC16F877A's device flash:
-/// a program whose highest word address is ≥ 0x2000 (8K words) panics loudly.
+/// The whole program (code + tables) must fit the device's flash: a program
+/// whose highest word address is beyond `device.flash_words` panics loudly.
 /// `assemble` itself is layout-only and stays unasserted so isel's unit tests
 /// can inspect words of any size.
-pub fn assemble_file_to_hex(src: &str) -> String {
+pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
     let words = assemble(src);
     assert!(
-        words.len() <= 0x2000,
-        "asm: program of {} words exceeds device flash (highest address 0x{:04X} >= 0x2000; 8K words)",
+        words.len() as u32 <= device.flash_words,
+        "asm: program of {} words exceeds device flash (highest address 0x{:04X} >= {:#06x}; {}-word flash)",
         words.len(),
-        words.len().saturating_sub(1)
+        words.len().saturating_sub(1),
+        device.flash_words,
+        device.flash_words,
     );
     to_hex(&words)
 }

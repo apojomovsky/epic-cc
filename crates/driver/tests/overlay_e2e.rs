@@ -97,7 +97,7 @@ fn overlay_layout() -> (Module, alloc::AllocLayout) {
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&m, &callgraph::edges_text(&cg));
+    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
     (m, layout)
 }
 

@@ -1,3 +1,4 @@
+use device::PIC16F877A;
 use isel::{select, verify_page_fit};
 use ir::parse;
 use std::collections::HashMap;
@@ -13,7 +14,7 @@ fn emits_add_for_in_plus_one() {
     // frame starts at 0x25, so main's locals land at 0x25/0x26.
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1, 1\n    store i8 %2 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::1", 0x25), ("main::2", 0x26)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("MOVF 0x20, W"));
     assert!(asm.contains("MOVWF 0x25"), "%1 must live at its map address 0x25:\n{asm}");
     assert!(asm.contains("ADDLW 0x01"));
@@ -26,7 +27,7 @@ fn store_const_emits_movlw_not_movf() {
     let m = parse("global out i8\nfn main(void) ()\n  block entry:\n    store i8 5 @out\n    ret void\n");
     let mut addrs = HashMap::new();
     addrs.insert("out".to_string(), 0x21u16);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("MOVLW 0x05"), "expected MOVLW for const store:\n{asm}");
     assert!(asm.contains("MOVWF 0x21"), "expected MOVWF to @out:\n{asm}");
     assert!(!asm.contains("MOVF 0x05"), "const must not be read as a file register:\n{asm}");
@@ -36,7 +37,7 @@ fn store_const_emits_movlw_not_movf() {
 fn add_const_lhs_uses_addlw() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %x = add i8 5, %1\n    store i8 %x @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::1", 0x25), ("main::x", 0x26)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("ADDLW 0x05"), "const-LHS add should use the ADDLW path:\n{asm}");
     assert!(asm.contains("MOVWF 0x26"), "the result lands at its map address:\n{asm}");
     assert!(!asm.contains("ADDWF 0x05"), "const must not be read as a file register:\n{asm}");
@@ -47,7 +48,7 @@ fn add_const_lhs_uses_addlw() {
 #[should_panic(expected = "only i8/i16 loads supported")]
 fn panics_on_i1_load() {
     let m = parse("global in i8\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    ret void\n");
-    select(&m, &HashMap::new());
+    select(&PIC16F877A, &m, &HashMap::new());
 }
 
 #[test]
@@ -57,7 +58,7 @@ fn panics_when_local_address_missing_from_map() {
     // loudly instead of allocating a slot internally.
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x20), ("out", 0x21)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -75,7 +76,7 @@ fn add16_reg_reg_emits_carry_chain() {
         ("main::b", 0x2B),
         ("main::r", 0x2D),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x29/%b=0x2B/%r=0x2D (lo bytes): lo byte add then hi byte add with carry in.
     assert!(asm.contains("MOVF 0x2B, W"), "add b_lo:\n{asm}");
     assert!(asm.contains("ADDWF 0x29, W"), "add a_lo:\n{asm}");
@@ -101,7 +102,7 @@ fn add16_reg_const_emits_carry_chain() {
         ("main::a", 0x27),
         ("main::r", 0x29),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x27/%r=0x29.
     assert!(asm.contains("MOVF 0x27, W"), "load a_lo:\n{asm}");
     assert!(asm.contains("ADDLW 0x03"), "add k_lo:\n{asm}");
@@ -130,7 +131,7 @@ fn i16_local_uses_consecutive_map_addresses() {
         addrs.insert(format!("main::a{i}"), 0x35 + i);
     }
     addrs.insert("main::r".to_string(), 0x45u16);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("MOVWF 0x45"), "i16 lo should land at map address 0x45:\n{asm}");
     assert!(asm.contains("MOVWF 0x46"), "i16 hi should land at map address 0x46:\n{asm}");
     assert!(asm.contains("MOVF 0x46, W"), "store reads the i16 hi from 0x46:\n{asm}");
@@ -149,7 +150,7 @@ fn and16_reg_const_uses_andlw() {
         ("main::a", 0x27),
         ("main::r", 0x29),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x27/%r=0x29.
     assert!(asm.contains("MOVF 0x27, W"), "load a_lo:\n{asm}");
     assert!(asm.contains("ANDLW 0x34"), "and k_lo:\n{asm}");
@@ -174,7 +175,7 @@ fn zext_trunc_pair() {
         ("main::z", 0x28),
         ("main::t", 0x2A),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %v=0x27, %z lo=0x28 hi=0x29, %t=0x2A.
     assert!(asm.contains("MOVF 0x27, W"), "zext copies v:\n{asm}");
     assert!(asm.contains("MOVWF 0x28"), "zext stores d_lo:\n{asm}");
@@ -204,7 +205,7 @@ fn zext_i1_to_i8_copies_the_icmp_byte() {
         ("main::c", 0x28),
         ("main::z", 0x29),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // The zext copies the icmp result byte into %z: MOVF 0x28, W; MOVWF 0x29.
     assert!(asm.contains("MOVF 0x28, W"), "load the icmp byte:\n{asm}");
     assert!(
@@ -226,7 +227,7 @@ fn sext_i8_to_i16_copies_low_and_sign_fills_high() {
         ("main::v", 0x27),
         ("main::s", 0x28),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %v=0x27, %s lo=0x28 hi=0x29.
     assert!(asm.contains("MOVF 0x27, W"), "sext copies v:\n{asm}");
     assert!(asm.contains("MOVWF 0x28"), "sext stores d_lo:\n{asm}");
@@ -250,7 +251,7 @@ fn sext_i8_to_i16_simulates_sign_extension() {
         ("main::v", 0x27),
         ("main::s", 0x28),
     ]);
-    let asm = select(&m, &map);
+    let asm = select(&PIC16F877A, &m, &map);
     let words = asm::assemble(&asm);
     // -1 -> 0xFFFF.
     {
@@ -286,7 +287,7 @@ fn phi_copy_lands_before_terminator_of_each_predecessor() {
         ("main::b", 0x2B),
         ("main::p", 0x2D),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x29 (hi 0x2A), %b=0x2B (hi 0x2C), %p=0x2D (hi 0x2E).
     // In block `entry` the copy of %a (ending MOVWF 0x2E) precedes its GOTO.
     assert!(
@@ -321,7 +322,7 @@ fn phi_copy_chain_emits_dependent_copies_in_order() {
         ("main::p", 0x27),
         ("main::q", 0x28),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %p=0x27, %q=0x28, %a=0x26.
     assert!(
         asm.contains("MOVF 0x26, W\n    MOVWF 0x27\n    MOVF 0x27, W\n    MOVWF 0x28"),
@@ -347,7 +348,7 @@ fn panics_on_cyclic_phi_copies() {
         ("main::p", 0x26),
         ("main::q", 0x27),
     ]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -362,7 +363,7 @@ fn icmp_eq_i8_materializes_i1() {
         ("main::1", 0x25),
         ("main::c", 0x26),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %1=0x25, %c=0x26, scratch=0x70 (fixed common RAM).
     assert!(asm.contains("MOVF 0x25, W"), "load a:\n{asm}");
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
@@ -388,7 +389,7 @@ fn icmp_eq_i16_uses_scratch_accumulation() {
         ("main::b", 0x2A),
         ("main::c", 0x2C),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x28/29, %b=0x2A/2B, %c=0x2C, scratch=0x70 (fixed common RAM).
     assert!(asm.contains("MOVF 0x28, W"), "load a_lo:\n{asm}");
     assert!(asm.contains("XORWF 0x2A, W"), "xor b_lo:\n{asm}");
@@ -414,7 +415,7 @@ fn brcond_and_select_emit_skip_lines() {
         ("main::c", 0x26),
         ("main::s", 0x27),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %1=0x25, %c=0x26, %s=0x27, scratch=0x22 (end_of_globals: 0x20+1, 0x21+1 -> 0x22).
     // brcond: cond==0 -> main_Lend (f), cond!=0 -> main_Lthen (t).
     assert!(asm.contains("MOVF 0x26, W"), "brcond reads cond:\n{asm}");
@@ -457,7 +458,7 @@ fn select_labels_are_unique_across_functions() {
         ("f2::c2", 0x28),
         ("f2::s2", 0x29),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Collect every emitted label *definition* (e.g. "tmp0:", not "GOTO tmp0").
     let defs: Vec<&str> = asm
         .lines()
@@ -481,7 +482,7 @@ fn locals_use_map_addresses_around_scratch_and_retval() {
            %a0 = load i8 @in\n    %c = icmp eq i8 %a0, 0\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x6F), ("main::a0", 0x73), ("main::c", 0x74)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Fixed common RAM: scratch 0x70, retval 0x71/0x72.
     assert!(asm.contains("MOVWF 0x70"), "icmp writes the fixed scratch 0x70:\n{asm}");
     assert!(!asm.contains("MOVWF 0x71") && !asm.contains("MOVWF 0x72"), "no writes to the retval bytes:\n{asm}");
@@ -515,7 +516,7 @@ fn call_copies_args_to_callee_params_and_reads_retval() {
         ("add::y", 0x31),
         ("add::r", 0x33),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // end_of_globals = max(0x20+2, 0x22+2, 0x24+2) = 0x26: scratch 0x26,
     // retval 0x27/0x28.
     // Arg copies: %1 -> add::x, %2 -> add::y (lo then hi).
@@ -545,7 +546,7 @@ fn ret_i16_copies_value_to_retval_and_returns() {
     );
     // alloc: root frame at 0x25; %v=0x25.
     let addrs = addrs(&[("x", 0x20), ("main::v", 0x25)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %v = 0x25 (hi 0x26), retval = fixed 0x71/0x72.
     assert!(
         asm.contains("MOVF 0x25, W\n    MOVWF 0x71\n    MOVF 0x26, W\n    MOVWF 0x72"),
@@ -579,7 +580,7 @@ fn call_arg_copies_target_callee_param_slots_from_map() {
         ("add::y", 0x31),
         ("add::r", 0x33),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // The caller's loads must land in main's frame slots, not the callee's
     // param slots.
     assert!(
@@ -661,7 +662,7 @@ fn gep_ram_indirect_and_const_retlw() {
         ("main::v", 0x2A),
         ("main::w", 0x2B),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // RAM indirect load (%w = load i8 %p): IRP cleared first (bank-0 base
     // 0x21 — a prior bank-2/3 access would leave IRP=1), then
     // W = %i; W += 0x21 (base_lo); FSR = W; W = INDF; %w = W.
@@ -715,7 +716,7 @@ fn panics_on_store_to_const_gep() {
            %i = load i8 @in\n    %t = gep @table +0 +1*%i\n    store i8 %i %t\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x20), ("main::i", 0x29)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 // ---- Task 3: pointer machinery (bases, chains, FSR sums, indirect, memcpy) ----
@@ -730,7 +731,7 @@ fn gep_const_offset_loads_direct_no_fsr() {
     );
     // g=0x20 (a 3+ byte array), out=0x24; locals: %v=0x29 (%p is virtual).
     let addrs = addrs(&[("g", 0x20), ("out", 0x24), ("main::v", 0x29)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("MOVF 0x22, W"), "direct byte-offset load at g+2:\n{asm}");
     assert!(!asm.contains("MOVWF FSR"), "no FSR setup for a constant offset:\n{asm}");
     assert!(asm.contains("MOVWF 0x24"), "store to @out:\n{asm}");
@@ -754,7 +755,7 @@ fn gep_single_term_uses_fsr_fast_path() {
         ("main::i", 0x29),
         ("main::v", 0x2A),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("BCF STATUS, 7\n    MOVF 0x29, W\n    ADDLW 0x22\n    MOVWF FSR\n    MOVF INDF, W\n    MOVWF 0x2A"),
         "fast path: IRP cleared + FSR = a_lo + k + i (0x21 + 1):\n{asm}"
@@ -783,7 +784,7 @@ fn gep_scaled_sum_accumulates_in_scratch() {
         ("main::v", 0x2B),
         ("main::w", 0x2C),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // scale-2 term: scratch = 2×%i — %i is reloaded into W before each
     // ADDWF (ADDWF f,W computes W = f + W), then FSR = scratch + a_lo + k.
     // The IRP set (BCF STATUS, 7) precedes the whole accumulation.
@@ -820,7 +821,7 @@ fn gep_scaled_multi_term_reloads_w_per_repetition() {
         ("main::j", 0x2A),
         ("main::v", 0x2B),
     ];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // MOVF %j,W must appear once per scale-2 repetition — twice in total.
     assert_eq!(
         asm.matches("MOVF 0x2A, W").count(),
@@ -869,7 +870,7 @@ fn sret_param_store_is_indirect_via_slot_contents() {
     );
     // v=0x20; make's frame: %x=0x25, sret slot r=0x26 (2 bytes).
     let addrs = addrs(&[("v", 0x20), ("make::x", 0x25), ("make::r", 0x26)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains(
             "BTFSC 0x27, 0\n    BSF STATUS, 7\n    BTFSS 0x27, 0\n    BCF STATUS, 7\n    \
@@ -888,7 +889,7 @@ fn memcpy_emits_byte_pairs() {
     );
     // g1=0x20 (4 bytes), g2=0x24 (4 bytes).
     let addrs = addrs(&[("g1", 0x20), ("g2", 0x24)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     for i in 0..4u16 {
         assert!(
             asm.contains(&format!("MOVF 0x{:02X}, W\n    MOVWF 0x{:02X}", 0x24 + i, 0x20 + i)),
@@ -916,7 +917,7 @@ fn alloca_based_pointer_accesses_direct_slot() {
         ("main::v", 0x29),
         ("main::w", 0x2A),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("MOVWF 0x27"), "store into buf+2:\n{asm}");
     assert!(asm.contains("MOVF 0x27, W"), "load from buf+2:\n{asm}");
     assert!(!asm.contains("MOVWF FSR"), "constant alloca offset needs no FSR setup:\n{asm}");
@@ -933,7 +934,7 @@ fn byval_param_base_accesses_direct_slot() {
     );
     // f's frame: param slot 0=0x25 (4 bytes), %v=0x29.
     let addrs = addrs(&[("out", 0x21), ("f::0", 0x25), ("f::v", 0x29)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("MOVF 0x27, W"), "byval field byte at slot+2:\n{asm}");
     assert!(!asm.contains("MOVWF FSR"), "direct byval slot needs no FSR setup:\n{asm}");
 }
@@ -962,7 +963,7 @@ fn fsr_setup_in_each_of_the_four_banks() {
             ("main::i", 0x29),
             ("main::v", 0x2A),
         ]);
-        let asm = select(&m, &addrs);
+        let asm = select(&PIC16F877A, &m, &addrs);
         assert!(
             asm.contains(&format!("{irp_line}\n    MOVF 0x29, W\n    {lit}\n    MOVWF FSR")),
             "base 0x{base:03X}: {irp_line} then FSR = (base + i) & 0xFF:\n{asm}"
@@ -983,7 +984,7 @@ fn panics_on_fsr_object_crossing_the_0x80_hole() {
     );
     m.globals[1].size = 16;
     let addrs = addrs(&[("in", 0x24), ("g", 0x78), ("main::i", 0x29), ("main::v", 0x2A)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -998,7 +999,7 @@ fn panics_on_fsr_object_crossing_the_0x170_hole() {
     );
     m.globals[1].size = 33;
     let addrs = addrs(&[("in", 0x24), ("g", 0x150), ("main::i", 0x29), ("main::v", 0x2A)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -1013,7 +1014,7 @@ fn byval_param_slot_in_bank_2_sets_irp() {
     // in=0x20, out=0x21; f's frame: %i=0x25, param slot 0=0x120 (16 bytes),
     // %v=0x29.
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("f::i", 0x25), ("f::0", 0x120), ("f::v", 0x29)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("BSF STATUS, 7\n    MOVF 0x25, W\n    ADDLW 0x20\n    MOVWF FSR"),
         "bank-2 byval slot: IRP set + FSR = (0x120 + i) & 0xFF:\n{asm}"
@@ -1029,7 +1030,7 @@ fn panics_on_cyclic_gep_chain() {
         "global a i8\nfn main(void) ()\n  block entry:\n\
            %p = gep %q +0\n    %q = gep %p +0\n    ret void\n",
     );
-    let _ = select(&m, &HashMap::new());
+    let _ = select(&PIC16F877A, &m, &HashMap::new());
 }
 
 #[test]
@@ -1047,7 +1048,7 @@ fn gep_chain_s8_pattern_simulates() {
         ("main::v", 0x2A),
     ];
     let m = parse(ir);
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // The chain folds k = 1 + 1 = 2 into the fast path's ADDLW literal;
     // the IRP clear (bank-0 base) precedes the FSR setup.
     assert!(
@@ -1195,7 +1196,7 @@ fn sub_i8_reg_reg_emits_subwf() {
         ("main::b", 0x27),
         ("main::r", 0x28),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x26, %b=0x27, %r=0x28.
     assert!(asm.contains("MOVF 0x27, W"), "load b:\n{asm}");
     assert!(asm.contains("SUBWF 0x26, W"), "a - b:\n{asm}");
@@ -1217,7 +1218,7 @@ fn sub_i8_reg_const_emits_subwf_in_correct_direction() {
         ("main::a", 0x25),
         ("main::r", 0x26),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x25, %r=0x26.
     assert!(asm.contains("MOVLW 0x05"), "load k into W:\n{asm}");
     assert!(asm.contains("SUBWF 0x25, W"), "a - k via SUBWF a,W:\n{asm}");
@@ -1246,7 +1247,7 @@ fn negative_i8_const_is_masked_to_byte() {
         ("main::s", 0x27),
         ("main::t", 0x28),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // sub: MOVLW 0xD6 (W = -42 & 0xFF); SUBWF a,W (W = a - 214); MOVWF s.
     assert!(asm.contains("MOVLW 0xD6\n    SUBWF 0x26, W"), "sub masks -42 to 0xD6:\n{asm}");
     assert!(asm.contains("MOVWF 0x27"), "sub dst:\n{asm}");
@@ -1284,7 +1285,7 @@ fn sub_i16_reg_reg_emits_borrow_chain() {
         ("main::b", 0x2B),
         ("main::r", 0x2D),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x29 (hi 0x2A), %b=0x2B (hi 0x2C), %r=0x2D (hi 0x2E).
     assert!(asm.contains("MOVF 0x2B, W"), "load b_lo:\n{asm}");
     assert!(asm.contains("SUBWF 0x29, W"), "a_lo - b_lo:\n{asm}");
@@ -1310,7 +1311,7 @@ fn sub_i16_reg_const_emits_borrow_chain() {
         ("main::a", 0x27),
         ("main::r", 0x29),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x27 (hi 0x28), %r=0x29 (hi 0x2A).
     assert!(asm.contains("MOVLW 0x03"), "load k_lo:\n{asm}");
     assert!(asm.contains("SUBWF 0x27, W"), "a_lo - k_lo:\n{asm}");
@@ -1344,7 +1345,7 @@ fn sub_const_lhs_emits_sublw_chain() {
         ("main::a", 0x25),
         ("main::r", 0x26),
     ]);
-    let asm8 = select(&m, &addrs8);
+    let asm8 = select(&PIC16F877A, &m, &addrs8);
     // %a=0x25, %r=0x26.
     assert!(asm8.contains("MOVF 0x25, W"), "load a:\n{asm8}");
     assert!(asm8.contains("SUBLW 0x05"), "k - a via SUBLW k:\n{asm8}");
@@ -1362,7 +1363,7 @@ fn sub_const_lhs_emits_sublw_chain() {
         ("main::a", 0x27),
         ("main::r", 0x29),
     ]);
-    let asm16 = select(&m, &addrs16);
+    let asm16 = select(&PIC16F877A, &m, &addrs16);
     // %a=0x27 (hi 0x28), %r=0x29 (hi 0x2A), scratch=0x70.
     assert!(asm16.contains("MOVF 0x27, W"), "load a_lo:\n{asm16}");
     assert!(asm16.contains("SUBLW 0x34"), "k_lo - a_lo:\n{asm16}");
@@ -1386,7 +1387,7 @@ fn sub_const_lhs_emits_sublw_chain() {
         ("main::a", 0x30),
         ("main::r", 0x34),
     ]);
-    let asm32 = select(&m, &addrs32);
+    let asm32 = select(&PIC16F877A, &m, &addrs32);
     // %a=0x30..0x33, %r=0x34..0x37, scratch=0x70; 0x12345678 -> bytes
     // 0x78, 0x56, 0x34, 0x12. Each higher byte: a_i -> scratch, k_i
     // preloaded into d_i, then the wrap-correct INCFSZ fold + in-place
@@ -1493,7 +1494,7 @@ fn and_i8_uses_andwf_andlw() {
         ("main::r1", 0x29),
         ("main::r2", 0x2A),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // reg-reg: %a=0x27, %b=0x28, %r1=0x29.
     assert!(asm.contains("MOVF 0x28, W"), "load b:\n{asm}");
     assert!(asm.contains("ANDWF 0x27, W"), "a & b:\n{asm}");
@@ -1524,7 +1525,7 @@ fn or_i8_and_i16_use_ior() {
         ("main::d", 0x32),
         ("main::s", 0x34),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F.
     assert!(asm.contains("IORWF 0x2D, W"), "i8 or:\n{asm}");
     assert!(asm.contains("MOVWF 0x2F"), "i8 or dst:\n{asm}");
@@ -1549,7 +1550,7 @@ fn or_const_lhs_swaps_to_iorlw() {
         ("main::a", 0x25),
         ("main::r", 0x26),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("IORLW 0x05"), "const-LHS or should use the IORLW path:\n{asm}");
     assert!(asm.contains("MOVWF 0x26"), "the result lands at its map address:\n{asm}");
     assert!(!asm.contains("IORWF 0x05"), "const must not be read as a file register:\n{asm}");
@@ -1576,7 +1577,7 @@ fn xor_i8_and_i16_use_xor() {
         ("main::d", 0x32),
         ("main::s", 0x34),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F.
     assert!(asm.contains("XORWF 0x2D, W"), "i8 xor:\n{asm}");
     assert!(asm.contains("MOVWF 0x2F"), "i8 xor dst:\n{asm}");
@@ -1678,7 +1679,7 @@ fn icmp_unsigned_i8_materializes_flag_predicates() {
         ("main::r3", 0x2D),
         ("main::r4", 0x2E),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Compare prefix: %a=0x29, %b=0x2A.
     assert_eq!(
         asm.matches("MOVF 0x2A, W\n    SUBWF 0x29, W").count(),
@@ -1728,7 +1729,7 @@ fn icmp_signed_i8_complements_sign_bit() {
         ("main::r3", 0x2D),
         ("main::r4", 0x2E),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Signed prefix: scratch = a ^ 0x80, W = b ^ 0x80, SUBWF scratch,W.
     assert_eq!(
         asm.matches("MOVLW 0x80\n    XORWF 0x29, W\n    MOVWF 0x70\n    MOVLW 0x80\n    XORWF 0x2A, W\n    SUBWF 0x70, W")
@@ -1770,7 +1771,7 @@ fn icmp_ne_i8_inverts_eq_materialization() {
         ("main::1", 0x25),
         ("main::c", 0x26),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %1=0x25, %c=0x26, scratch=0x70.
     assert!(asm.contains("MOVF 0x25, W"), "load a:\n{asm}");
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
@@ -1802,7 +1803,7 @@ fn icmp_ult_i16_emits_borrow_chain() {
         ("main::b", 0x2B),
         ("main::c", 0x2D),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x29/2A, %b=0x2B/2C, %c=0x2D.
     assert!(
         asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x2C, W\n    SUBWF 0x2A, W"),
@@ -1832,7 +1833,7 @@ fn icmp_ugt_i16_accumulates_equality_for_z() {
         ("main::b", 0x2B),
         ("main::c", 0x2D),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Chain first (C), then the eq accumulation (Z = a == b), then
     // C && !Z. %a=0x29/2A, %b=0x2B/2C, scratch=0x70.
     assert!(
@@ -1863,7 +1864,7 @@ fn icmp_slt_i16_complements_sign_bit_in_scratch() {
         ("main::b", 0x2B),
         ("main::c", 0x2D),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // %a=0x29/2A, %b=0x2B/2C, scratch=0x70.
     assert!(
         asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVLW 0x80\n    XORWF 0x2C, W\n    MOVWF 0x71\n    MOVLW 0x80\n    XORWF 0x2A, W\n    MOVWF 0x70\n    MOVF 0x71, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x71, W\n    SUBWF 0x70, W"),
@@ -1899,7 +1900,7 @@ fn icmp_const_operands_use_literal_paths() {
         ("main::r3", 0x2D),
         ("main::r4", 0x2E),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // const RHS: MOVLW 9; SUBWF a,W.
     assert!(
         asm.contains("MOVLW 0x09\n    SUBWF 0x29, W"),
@@ -2224,7 +2225,7 @@ fn cmp_i16_simulates_correctly() {
 fn sim_run(ir_text: &str, map: &[(&str, u16)], seed: &[(u16, u8)], out: u16) -> u8 {
     use pic14_sim::Pic14;
     let m = parse(ir_text);
-    let asm = select(&m, &addrs(map));
+    let asm = select(&PIC16F877A, &m, &addrs(map));
     let words = asm::assemble(&asm);
     let mut p = Pic14::new(words);
     for (a, v) in seed {
@@ -2425,7 +2426,7 @@ fn byval_call_copies_struct_bytes_into_param_slot() {
         ("sum::p", 0x2B),
         ("sum::a", 0x2F),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // The size-byte copy: alloca bytes 0x25..0x28 -> param slot 0x2B..0x2E.
     for i in 0..4u16 {
         assert!(
@@ -2453,7 +2454,7 @@ fn sret_call_stores_target_address_into_param_slot() {
     );
     // main's frame: %1 (alloca)=0x25; make's frame: r (sret, 2 bytes)=0x2F.
     let addrs = addrs(&[("main::1", 0x25), ("make::r", 0x2F)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("MOVLW 0x25\n    MOVWF 0x2F\n    MOVLW 0x00\n    MOVWF 0x30"),
         "address store into sret param slot:\n{asm}"
@@ -2469,7 +2470,7 @@ fn sret_call_with_global_target_stores_global_address() {
          fn main(void) ()\n  block entry:\n    call void @make(sret @g)\n    ret void\n",
     );
     let addrs = addrs(&[("g", 0x20), ("make::r", 0x2F)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("MOVLW 0x20\n    MOVWF 0x2F\n    MOVLW 0x00\n    MOVWF 0x30"),
         "global address store into sret param slot:\n{asm}"
@@ -2489,7 +2490,7 @@ fn panics_on_sret_target_outside_gpr() {
            %1 = alloca 4\n    call void @make(sret %1)\n    ret void\n",
     );
     let addrs = addrs(&[("main::1", 0x200), ("make::r", 0x2F)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -2512,7 +2513,7 @@ fn sret_banked_target_emits_low_high_store_and_irp_dance() {
     );
     // make's frame: r (sret, 2 bytes)=0x2E; main's frame: %buf=0x120.
     let addrs = addrs(&[("make::r", 0x2E), ("main::buf", 0x120)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("MOVLW 0x20\n    MOVWF 0x2E\n    MOVLW 0x01\n    MOVWF 0x2F"),
         "caller stores LOW then HIGH of the 0x120 target:\n{asm}"
@@ -2544,7 +2545,7 @@ fn panics_on_sret_target_crossing_window() {
            %1 = alloca 32\n    call void @make(sret %1)\n    ret void\n",
     );
     let addrs = addrs(&[("main::1", 0x160), ("make::r", 0x2F)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -2559,7 +2560,7 @@ fn panics_on_sret_arg_for_non_sret_param() {
            %1 = alloca 4\n    call void @make(sret %1)\n    ret void\n",
     );
     let addrs = addrs(&[("main::1", 0x25), ("make::p", 0x2F)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -2597,7 +2598,7 @@ fn byval_call_sum_pair_simulates() {
         ("sum::t", 0x36),
     ];
     let m = parse(ir);
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // The caller's 4-byte copy: buf(0x25..0x28) -> sum::p(0x2B..0x2E).
     assert!(
         asm.contains(
@@ -2639,7 +2640,7 @@ fn sret_call_make_simulates() {
     ];
     use pic14_sim::Pic14;
     let m = parse(ir);
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // The address store: main::buf (0x27) -> make::r (0x25/0x26).
     assert!(
         asm.contains("MOVLW 0x27\n    MOVWF 0x25\n    MOVLW 0x00\n    MOVWF 0x26"),
@@ -2698,7 +2699,7 @@ fn sret_call_into_banked_alloca_simulates() {
         ];
         use pic14_sim::Pic14;
         let m = parse(ir);
-        let asm = select(&m, &addrs(&map));
+        let asm = select(&PIC16F877A, &m, &addrs(&map));
         let words = asm::assemble(&asm);
         let mut p = Pic14::new(words);
         p.ram_mut()[0x20] = 0; // %i = 0: read the struct at its base
@@ -2740,7 +2741,7 @@ fn byval_call_with_global_arg_simulates() {
         ("sum::t", 0x36),
     ];
     let m = parse(ir);
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert!(
         asm.contains("MOVF 0x20, W\n    MOVWF 0x2B"),
         "copy @g byte 0 into sum::p:\n{asm}"
@@ -2848,7 +2849,7 @@ fn sim_run_bytes(
 ) -> Vec<u8> {
     use pic14_sim::Pic14;
     let m = parse(ir_text);
-    let asm = select(&m, &addrs(&map_refs(map)));
+    let asm = select(&PIC16F877A, &m, &addrs(&map_refs(map)));
     let words = asm::assemble(&asm);
     let mut p = Pic14::new(words);
     for (a, v) in seed {
@@ -2977,7 +2978,7 @@ fn mul_div_rem_routines_emit_recipe_bodies() {
     ];
     for &(name, pats) in cases {
         let (ir, map) = routine_module(name);
-        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        let asm = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
         assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
         assert!(
             asm.contains(&format!("    CALL {name}")),
@@ -3065,7 +3066,7 @@ fn panics_on_banked_routine_slot() {
             *v = 0xA0; // bank 1 (0x80-0xEF): pre-fix this passed silently
         }
     }
-    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+    let _ = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
 }
 
 /// A routine slot past the 0x7F bound entirely (beyond RAM) must also fail
@@ -3079,7 +3080,7 @@ fn panics_on_routine_slot_past_ram() {
             *v = 0x120;
         }
     }
-    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+    let _ = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
 }
 
 // ---------------------------------------------------------------------------
@@ -3124,7 +3125,7 @@ fn inline_const_shifts_emit_rlf_rrf_sequences() {
     // shl i16 %a, 3 -> 3 x (BCF C / RLF lo / RLF hi), no RRF anywhere. The
     // value is copied into the dst slot (main::s = 0x27/0x28) and rotated
     // there, so the RLFs target 0x27/0x28 — never the source slot.
-    let asm = select(&parse(&shift_module("shl", "i16", "3")), &addrs(&map_refs(&shift_map16())));
+    let asm = select(&PIC16F877A, &parse(&shift_module("shl", "i16", "3")), &addrs(&map_refs(&shift_map16())));
     assert_eq!(asm.matches("    BCF STATUS, 0").count(), 3, "one BCF per step:\n{asm}");
     assert_eq!(asm.matches("    RLF 0x27, F").count(), 3, "lo byte rotated each step:\n{asm}");
     assert_eq!(asm.matches("    RLF 0x28, F").count(), 3, "hi byte rotated each step:\n{asm}");
@@ -3133,7 +3134,7 @@ fn inline_const_shifts_emit_rlf_rrf_sequences() {
     // lshr i16 %a, 2 -> 2 x (BCF C / RRF hi / RRF lo): the high byte MUST
     // rotate before the low byte, or the shifted-out bit lands in the wrong
     // place.
-    let asm = select(&parse(&shift_module("lshr", "i16", "2")), &addrs(&map_refs(&shift_map16())));
+    let asm = select(&PIC16F877A, &parse(&shift_module("lshr", "i16", "2")), &addrs(&map_refs(&shift_map16())));
     assert_eq!(asm.matches("    BCF STATUS, 0").count(), 2, "one BCF per step:\n{asm}");
     assert_eq!(asm.matches("    RRF 0x28, F").count(), 2, "hi byte first:\n{asm}");
     assert_eq!(asm.matches("    RRF 0x27, F").count(), 2, "lo byte second:\n{asm}");
@@ -3144,7 +3145,7 @@ fn inline_const_shifts_emit_rlf_rrf_sequences() {
 
     // ashr i8 %a, 2 -> C set from the sign bit (BTFSC/BSF + BTFSS/BCF) before
     // each RRF; the rrf chain is a single byte for i8 (dst = main::s = 0x26).
-    let asm = select(&parse(&shift_module("ashr", "i8", "2")), &addrs(&map_refs(&shift_map8())));
+    let asm = select(&PIC16F877A, &parse(&shift_module("ashr", "i8", "2")), &addrs(&map_refs(&shift_map8())));
     assert_eq!(asm.matches("    RRF 0x26, F").count(), 2, "one rrf per step:\n{asm}");
     assert_eq!(asm.matches("    RRF").count(), 2, "i8 ashr must have no second byte:\n{asm}");
     let btfsc = asm.find("    BTFSC 0x26, 7").expect("sign-bit test");
@@ -3156,7 +3157,7 @@ fn inline_const_shifts_emit_rlf_rrf_sequences() {
     );
 
     // shl i16 %a, 0 -> a plain copy (MOVF/MOVWF pairs), no rotation at all.
-    let asm = select(&parse(&shift_module("shl", "i16", "0")), &addrs(&map_refs(&shift_map16())));
+    let asm = select(&PIC16F877A, &parse(&shift_module("shl", "i16", "0")), &addrs(&map_refs(&shift_map16())));
     assert!(!asm.contains("RLF") && !asm.contains("RRF"), "k=0 must be a plain copy:\n{asm}");
     assert!(asm.contains("    MOVF 0x25, W"), "copy lo:\n{asm}");
     assert!(asm.contains("    MOVWF 0x27"), "store lo:\n{asm}");
@@ -3165,10 +3166,10 @@ fn inline_const_shifts_emit_rlf_rrf_sequences() {
 
     // i8 single-byte chains: shl i8 %a, 1 -> one RLF on the only byte;
     // lshr i8 %a, 1 -> one RRF on the only byte.
-    let asm = select(&parse(&shift_module("shl", "i8", "1")), &addrs(&map_refs(&shift_map8())));
+    let asm = select(&PIC16F877A, &parse(&shift_module("shl", "i8", "1")), &addrs(&map_refs(&shift_map8())));
     assert_eq!(asm.matches("    RLF 0x26, F").count(), 1, "i8 shl is one byte:\n{asm}");
     assert_eq!(asm.matches("    RLF").count(), 1, "i8 shl must have no second byte:\n{asm}");
-    let asm = select(&parse(&shift_module("lshr", "i8", "1")), &addrs(&map_refs(&shift_map8())));
+    let asm = select(&PIC16F877A, &parse(&shift_module("lshr", "i8", "1")), &addrs(&map_refs(&shift_map8())));
     assert_eq!(asm.matches("    RRF 0x26, F").count(), 1, "i8 lshr is one byte:\n{asm}");
     assert_eq!(asm.matches("    RRF").count(), 1, "i8 lshr must have no second byte:\n{asm}");
 }
@@ -3179,14 +3180,14 @@ fn inline_const_shifts_emit_rlf_rrf_sequences() {
 #[should_panic(expected = "const shift count 16 out of range")]
 fn panics_on_inline_shift_count_ge_width_i16() {
     let m = parse(&shift_module("shl", "i16", "16"));
-    select(&m, &addrs(&map_refs(&shift_map16())));
+    select(&PIC16F877A, &m, &addrs(&map_refs(&shift_map16())));
 }
 
 #[test]
 #[should_panic(expected = "const shift count 8 out of range")]
 fn panics_on_inline_shift_count_ge_width_i8() {
     let m = parse(&shift_module("lshr", "i8", "8"));
-    select(&m, &addrs(&map_refs(&shift_map8())));
+    select(&PIC16F877A, &m, &addrs(&map_refs(&shift_map8())));
 }
 
 /// A reg-count shift must never reach isel: legalize rewrites it to the
@@ -3199,6 +3200,7 @@ fn panics_on_variable_count_shift_reaching_isel() {
         "global x i16\nglobal n i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @x\n    %c = load i16 @n\n    %s = shl i16 %a, %c\n    store i16 %s @out\n    ret void\n",
     );
     select(
+        &PIC16F877A,
         &m,
         &addrs(&[
             ("x", 0x20),
@@ -3312,7 +3314,7 @@ fn shift_routines_emit_recipe_bodies() {
     ];
     for &(name, pats) in cases {
         let (ir, map) = routine_module(name);
-        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        let asm = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
         assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
         assert!(
             asm.contains(&format!("    CALL {name}")),
@@ -3432,7 +3434,7 @@ fn panics_on_banked_shift_routine_slot() {
             *v = 0xA0; // bank 1 (0x80-0xEF)
         }
     }
-    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+    let _ = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
 }
 
 // ---- Milestone 10: const-table PCLATH readers and the page-0 bound ----
@@ -3551,7 +3553,7 @@ fn large_const_table_emits_two_entry_reader_and_16bit_caller() {
         ],
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Caller: lo-temp 0x71, hi-temp 0x70, chunk-bit test, both entry CALLs.
     assert!(asm.contains("MOVWF 0x71"), "lo index temp (retval_lo):\n{asm}");
     assert!(asm.contains("MOVWF 0x70"), "hi temp / chunk bit (scratch):\n{asm}");
@@ -3627,7 +3629,7 @@ fn multi_term_large_table_index_panics() {
         ("main::j", 0x26),
         ("main::v", 0x27),
     ]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -3640,7 +3642,7 @@ fn const_only_large_table_index_panics() {
     );
     let mut addrs = HashMap::new();
     addrs.insert("main::v".to_string(), 0x24u16);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -3676,7 +3678,7 @@ fn panics_when_user_const_collides_with_generated_chunk_label() {
         ],
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -3710,7 +3712,7 @@ fn panics_when_user_const_collides_with_generated_reader_label() {
         ],
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -3759,7 +3761,7 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
         ],
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::i", 0x25), ("main::v", 0x26)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Load-bearing precondition: the table lands in a NONZERO 256-byte
     // window and fits it (LOW + 4 <= 0x100) — a reader without the PCLATH
     // set would jump into window 0 and return the wrong byte.
@@ -3820,7 +3822,7 @@ fn large_const_table_reads_simulate_correctly() {
         )
     };
     let map = [("in", 0x20u16), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)];
-    let asm0 = select(&module_with_globals(&ir(0), globals()), &addrs(&map));
+    let asm0 = select(&PIC16F877A, &module_with_globals(&ir(0), globals()), &addrs(&map));
     let base = label_addr(&asm0, "t");
     assert!(
         base & 0xFF == 0,
@@ -3836,7 +3838,7 @@ fn large_const_table_reads_simulate_correctly() {
     ];
     for (in_val, k, want) in cases {
         let m = module_with_globals(&ir(*k), globals());
-        let asm = select(&m, &addrs(&map));
+        let asm = select(&PIC16F877A, &m, &addrs(&map));
         let got = sim_run_asm(&asm, &[(0x20, *in_val as u8), (0x21, (*in_val >> 8) as u8)], 0x22);
         assert_eq!(got, *want, "table[{in_val}] with k 0x{k:02X} must read 0x{want:02X}:\n{asm}");
     }
@@ -3880,7 +3882,7 @@ fn exactly_256_byte_table_uses_chunked_shape_and_assembles() {
         ],
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x22), ("main::i", 0x24), ("main::v", 0x26)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Chunked shape: `.align 256`, `.table t 256`, the `t_1` chunk label,
     // and the `__read_t_hi` entry — a 256-byte table is two chunks, not one.
     assert!(
@@ -3945,7 +3947,7 @@ fn same_page_call_skips_restore() {
         ("helper::x", 0x2A),
         ("helper::r", 0x2B),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(
         asm.contains("MOVLW PAGE(helper)\n    MOVWF PCLATH\n    CALL helper\n"),
         "same-page set/CALL with no restore:\n{asm}"
@@ -3977,7 +3979,7 @@ fn same_page_const_read_skips_restore() {
         vec![const_table_global("t", 4)],
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::i", 0x25), ("main::v", 0x26)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // The set goes before the index computation (W = index is the reader's
     // input — the set's MOVLW must not clobber it).
     assert!(
@@ -4005,7 +4007,7 @@ fn panics_on_function_larger_than_a_page() {
         pad_body(700)
     ));
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::1", 0x25), ("main::a", 0x26)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -4027,7 +4029,7 @@ fn org_pads_function_across_page_boundary() {
         ("helper::x", 0x2A),
         ("helper::r", 0x2B),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("    org 0x0800"), ".org 0x800 before helper:\n{asm}");
     assert_eq!(label_addr(&asm, "helper"), 0x800, "helper in page 1:\n{asm}");
     assert!(label_addr(&asm, "main") < 0x800, "main stays in page 0:\n{asm}");
@@ -4099,7 +4101,7 @@ fn multi_page_module_runs_in_sim() {
         ("helper2::x", 0x3A),
         ("helper2::r", 0x3B),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Load-bearing preconditions: helper, helper2, and the table land in
     // page 1; main stays in page 0.
     assert!(asm.contains("    org 0x0800"), ".org 0x800 must be emitted:\n{asm}");
@@ -4160,7 +4162,7 @@ fn panics_when_function_would_start_past_page_3() {
     }
     pairs.push(("f4::a".to_string(), 0x25));
     let refs: Vec<(&str, u16)> = pairs.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-    let _ = select(&m, &addrs(&refs));
+    let _ = select(&PIC16F877A, &m, &addrs(&refs));
 }
 
 // ---- Milestone 11 final wave: page-aligned anchors and the table pin ----
@@ -4202,7 +4204,7 @@ fn exact_boundary_function_stays_anchored_after_elision() {
         ("helper::v", 0x32),
         ("helper::p", 0x33),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // The anchor: `.org 0x800` before helper, pinning it to the boundary.
     assert!(asm.contains("    org 0x0800"), "exact-boundary anchor missing:\n{asm}");
     assert_eq!(label_addr(&asm, "helper"), 0x800, "helper must be pinned to 0x800:\n{asm}");
@@ -4270,7 +4272,7 @@ fn table_section_pinned_to_pass_a_start_after_elision() {
         ("last::1", 0x30),
         ("last::a", 0x31),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // The pin: `.org 0x7FA` immediately before the reader entry — the
     // pass-A table start, not the drifted post-elision position.
     assert!(asm.contains("    org 0x07FA"), "table-section pin missing:\n{asm}");
@@ -4332,7 +4334,7 @@ fn banked_growth_across_page_boundary_panics() {
         ("main::b", 0x26),
         ("main::a", 0xA0), // bank 1: every chain access needs a BANKSEL
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // Pre-banking extent: start 5 (no ISR header), 8 fixed words + 678 x 3
     // chain words = 2042 -> last occupied 0x7FE, page 0, no pad.
     assert_eq!(label_addr(&asm, "main"), 5, "main starts after the 5-word header:\n{asm}");
@@ -4346,7 +4348,7 @@ fn banked_growth_across_page_boundary_panics() {
     verify_page_fit(&m, &asm);
     // Post-banking: the banked chain accesses add BANKSEL words, pushing
     // the last occupied word to 0x802 (page 1). Must panic loudly.
-    let banked = banking::assign_banks(&asm);
+    let banked = banking::assign_banks(&device::PIC16F877A, &asm);
     verify_page_fit(&m, &banked);
 }
 
@@ -4370,8 +4372,8 @@ fn banked_growth_within_page_passes() {
         ("main::b", 0x26),
         ("main::a", 0xA0),
     ]);
-    let asm = select(&m, &addrs);
-    let banked = banking::assign_banks(&asm);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    let banked = banking::assign_banks(&device::PIC16F877A, &asm);
     // No panic: the extent stays inside page 0.
     verify_page_fit(&m, &banked);
     // The banked program really runs: out = in + 0 = in.
@@ -4405,7 +4407,7 @@ fn i32_ab_module(op: &str) -> String {
 #[test]
 fn add32_reg_reg_emits_four_byte_carry_chain() {
     let m = parse(&i32_ab_module("add"));
-    let asm = select(&m, &addrs(&i32_map()));
+    let asm = select(&PIC16F877A, &m, &addrs(&i32_map()));
     // Byte 0 is a plain ADDWF (C = carry out exact); bytes 1-3 fold the
     // carry into a scratch copy of b via INCFSZ's skip — the wrap (b_i =
     // 0xFF + carry) must keep C = carry-in (the true carry-out), so the
@@ -4436,7 +4438,7 @@ fn add32_reg_const_emits_four_byte_carry_chain() {
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = add i32 %a, 67305985\n    store i32 %r @out\n    ret void\n",
     );
     let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::r", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // a=0x30, r=0x38.
     assert!(
         asm.contains("    MOVF 0x30, W\n    ADDLW 0x01\n    MOVWF 0x38"),
@@ -4455,7 +4457,7 @@ fn add32_reg_const_emits_four_byte_carry_chain() {
 #[test]
 fn sub32_reg_reg_emits_four_byte_borrow_chain() {
     let m = parse(&i32_ab_module("sub"));
-    let asm = select(&m, &addrs(&i32_map()));
+    let asm = select(&PIC16F877A, &m, &addrs(&i32_map()));
     // Byte 0 is a plain SUBWF (C = borrow out exact); bytes 1-3 fold the
     // borrow into a scratch copy of b via INCFSZ's skip (the wrap b_i =
     // 0xFF + borrow keeps C = borrow-in = 0, the true borrow-out).
@@ -4478,7 +4480,7 @@ fn sub32_reg_const_emits_four_byte_borrow_chain() {
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 %a, 67305985\n    store i32 %r @out\n    ret void\n",
     );
     let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::r", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert!(
         asm.contains("    MOVLW 0x01\n    SUBWF 0x30, W\n    MOVWF 0x38"),
         "byte 0 const sub:\n{asm}"
@@ -4495,7 +4497,7 @@ fn icmp_ult_i32_emits_four_byte_borrow_chain() {
         "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp ult i32 %a, %b\n    store i8 %c @out\n    ret void\n",
     );
     let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // The 4-byte SUBWF borrow chain: byte 0 plain, bytes 1-3 fold the
     // borrow via INCFSZ on b itself (cmp never writes a/b). The wrap
     // b_i = 0xFF + borrow must keep C = borrow-in = 0 (the true
@@ -4521,7 +4523,7 @@ fn icmp_ugt_i32_accumulates_four_byte_equality_for_z() {
         "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp ugt i32 %a, %b\n    store i8 %c @out\n    ret void\n",
     );
     let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // The 4-byte chain first (C), then the 4-byte equality accumulation
     // (Z = a == b) — the chain's final Z reflects only byte 3 — then
     // C && !Z. a=0x30/31/32/33, b=0x34/35/36/37, scratch=0x70.
@@ -4541,7 +4543,7 @@ fn icmp_slt_i32_complements_sign_bit_at_byte_3() {
         "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp slt i32 %a, %b\n    store i8 %c @out\n    ret void\n",
     );
     let map = vec![("x", 0x20), ("y", 0x24), ("out", 0x28), ("main::a", 0x30), ("main::b", 0x34), ("main::c", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // The sign complement applies ONLY to byte 3 (0x33 / 0x37): the b-side
     // is complemented into the 0x71 temp (free at a compare) and folded via
     // INCFSZ's skip — the complemented fold wraps at b_hi ^ 0x80 = 0xFF
@@ -4569,7 +4571,7 @@ fn sext_i16_to_i32_sign_fills_bytes_2_and_3() {
     );
     // in=0x20/0x21, out=0x22..0x25, main::v=0x30/0x31, main::s=0x38..0x3B.
     let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::s", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // Copy both source bytes, then sign-fill bytes 2-3 from byte 1's bit 7
     // (the SOURCE's sign byte — never byte 3).
     assert!(
@@ -4588,7 +4590,7 @@ fn zext_i8_to_i32_clears_high_bytes() {
         "global in i8\nglobal out i32\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %z = zext i8 %v to i32\n    store i32 %z @out\n    ret void\n",
     );
     let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::z", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert!(
         asm.contains("    MOVF 0x30, W\n    MOVWF 0x38\n    CLRF 0x39\n    CLRF 0x3A\n    CLRF 0x3B"),
         "zext copies byte 0 and clears bytes 1-3:\n{asm}"
@@ -4601,7 +4603,7 @@ fn trunc_i32_to_i8_copies_low_byte() {
         "global in i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %v = load i32 @in\n    %t = trunc i32 %v to i8\n    store i8 %t @out\n    ret void\n",
     );
     let map = vec![("in", 0x20), ("out", 0x22), ("main::v", 0x30), ("main::t", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert!(
         asm.contains("    MOVF 0x30, W\n    MOVWF 0x38"),
         "trunc copies only the low byte:\n{asm}"
@@ -4617,7 +4619,7 @@ fn shl_i32_inline_rotates_four_bytes() {
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = shl i32 %a, 3\n    store i32 %s @out\n    ret void\n",
     );
     let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert_eq!(asm.matches("    BCF STATUS, 0").count(), 3, "one BCF per step:\n{asm}");
     for b in [0x38, 0x39, 0x3A, 0x3B] {
         assert_eq!(
@@ -4636,7 +4638,7 @@ fn ashr_i32_sign_fills_from_byte_3() {
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = ashr i32 %a, 2\n    store i32 %s @out\n    ret void\n",
     );
     let map = vec![("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     assert_eq!(asm.matches("    BTFSC 0x3B, 7").count(), 2, "sign-bit test on byte 3 per step:\n{asm}");
     assert_eq!(asm.matches("    RRF 0x3B, F").count(), 2, "hi byte first:\n{asm}");
     assert_eq!(asm.matches("    RRF 0x38, F").count(), 2, "lo byte last:\n{asm}");
@@ -4665,7 +4667,7 @@ fn i32_call_copies_four_arg_and_retval_bytes() {
         ("addm::y", 0x40),
         ("addm::r", 0x44),
     ];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // Arg copies: %1 (0x30..0x33) -> addm::x (0x3C..0x3F), all 4 bytes.
     assert!(
         asm.contains("    MOVF 0x30, W\n    MOVWF 0x3C\n    MOVF 0x31, W\n    MOVWF 0x3D\n    MOVF 0x32, W\n    MOVWF 0x3E\n    MOVF 0x33, W\n    MOVWF 0x3F"),
@@ -4690,7 +4692,7 @@ fn ret_i32_copies_value_to_four_retval_bytes() {
            %v = load i32 @x\n    ret i32 %v\n",
     );
     let map = vec![("x", 0x20), ("main::v", 0x25)];
-    let asm = select(&m, &addrs(&map));
+    let asm = select(&PIC16F877A, &m, &addrs(&map));
     // %v = 0x25..0x28, retval = fixed 0x71..0x74.
     assert!(
         asm.contains("    MOVF 0x25, W\n    MOVWF 0x71\n    MOVF 0x26, W\n    MOVWF 0x72\n    MOVF 0x27, W\n    MOVWF 0x73\n    MOVF 0x28, W\n    MOVWF 0x74"),
@@ -4705,7 +4707,7 @@ fn panics_on_inline_shift_count_ge_width_i32() {
     let m = parse(
         "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = shl i32 %a, 32\n    store i32 %s @out\n    ret void\n",
     );
-    select(&m, &addrs(&[("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)]));
+    select(&PIC16F877A, &m, &addrs(&[("x", 0x20), ("out", 0x24), ("main::a", 0x30), ("main::s", 0x38)]));
 }
 
 #[test]
@@ -4718,6 +4720,7 @@ fn panics_on_sext_i1_to_i32() {
         "global x i8\nglobal y i8\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %v = icmp eq i8 %a, %b\n    %s = sext i1 %v to i32\n    store i32 %s @out\n    ret void\n",
     );
     select(
+        &PIC16F877A,
         &m,
         &addrs(&[
             ("x", 0x20),
@@ -5138,7 +5141,7 @@ fn i32_routines_emit_recipe_bodies() {
     ];
     for &(name, pats) in cases {
         let (ir, map) = routine_module32(name);
-        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        let asm = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
         assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
         assert!(
             asm.contains(&format!("    CALL {name}")),
@@ -5227,7 +5230,7 @@ fn panics_on_banked_i32_routine_slot() {
             *v = 0xA0; // bank 1
         }
     }
-    let _ = select(&parse(&ir), &addrs(&map_refs(&map)));
+    let _ = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
 }
 
 // ---------------------------------------------------------------------------
@@ -5247,7 +5250,7 @@ fn isr_emits_vector_entry_prologue_epilogue() {
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("isr::v", 0x25)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("    org 0x0004"), "the vector pad to word 4:\n{asm}");
     assert!(
         asm.contains(
@@ -5284,7 +5287,7 @@ fn panics_on_isr_larger_than_page_0() {
         pad_body(700)
     ));
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("isr::a", 0x25)]);
-    let _ = select(&m, &addrs);
+    let _ = select(&PIC16F877A, &m, &addrs);
 }
 
 #[test]
@@ -5294,7 +5297,7 @@ fn literal_ptr_store_emits_direct_movwf() {
     // isel emits no BANKSEL anywhere — the banking pass has nothing to add).
     let m = parse("global in i8\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    store i8 %v 0x06\n    ret void\n");
     let addrs = addrs(&[("in", 0x20), ("main::v", 0x25)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("    MOVWF 0x06"), "direct SFR store:\n{asm}");
     assert!(!asm.contains("MOVWF FSR"), "no FSR for a literal (SFR) store:\n{asm}");
     assert!(!asm.contains("MOVWF INDF"), "no INDF for a literal (SFR) store:\n{asm}");
@@ -5305,7 +5308,7 @@ fn literal_ptr_load_emits_direct_movf() {
     // `%v = load i8 0x06` — direct MOVF from the SFR, no FSR setup.
     let m = parse("global out i8\nfn main(void) ()\n  block entry:\n    %v = load i8 0x06\n    store i8 %v @out\n    ret void\n");
     let addrs = addrs(&[("out", 0x21), ("main::v", 0x25)]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     assert!(asm.contains("    MOVF 0x06, W"), "direct SFR load:\n{asm}");
     assert!(!asm.contains("MOVWF FSR"), "no FSR for a literal (SFR) load:\n{asm}");
     assert!(!asm.contains("MOVF INDF, W"), "no INDF for a literal (SFR) load:\n{asm}");
@@ -5325,8 +5328,8 @@ fn banking_leaves_sfr_and_isr_save_area_untouched() {
          fn main(void) ()\n  block entry:\n    %m = load i8 0x06\n    store i8 %m @out\n    ret void\n",
     );
     let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("isr::v", 0x25), ("main::m", 0x26)]);
-    let asm = select(&m, &addrs);
-    let banked = banking::assign_banks(&asm);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    let banked = banking::assign_banks(&device::PIC16F877A, &asm);
     // The SFR store follows the value load directly — no BANKSEL can be
     // inserted between them (0x06 is an SFR, never banked).
     assert!(
@@ -5698,7 +5701,7 @@ fn isr_scratch_use_does_not_corrupt_preempted_main() {
         ("isr::dv", 0x36),
         ("isr::eq", 0x37),
     ]);
-    let asm = select(&m, &addrs);
+    let asm = select(&PIC16F877A, &m, &addrs);
     // main's i16 eq folds through the scratch: the low-byte XOR is stashed
     // in 0x70 and ORed with the high-byte XOR on the way out.
     assert!(
@@ -6037,7 +6040,7 @@ fn narrow_conversion_sources_sign_and_zero_extend_through_the_call_abi() {
         );
         let m = legalize::legalize(parse(&src));
         let map = module_map(&m);
-        let asm = select(&m, &addrs(&map_refs(&map)));
+        let asm = select(&PIC16F877A, &m, &addrs(&map_refs(&map)));
         let words = asm::assemble(&asm);
         let mut p = pic14_sim::Pic14::new(words);
         for (i, by) in inv.iter().enumerate() {
@@ -6233,7 +6236,7 @@ fn float_routines_emit_recipe_bodies() {
         } else {
             float_routine_module(name)
         };
-        let asm = select(&parse(&ir), &addrs(&map_refs(&map)));
+        let asm = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
         assert!(asm.contains(&format!("{name}:")), "{name} label:\n{asm}");
         let start = asm.find(&format!("{name}:")).expect("routine label");
         let body = &asm[start..];
@@ -6329,7 +6332,7 @@ fn fcmp_predicates_materialize_end_to_end() {
         );
         let m = legalize::legalize(parse(&src));
         let map = module_map(&m);
-        let asm = select(&m, &addrs(&map_refs(&map)));
+        let asm = select(&PIC16F877A, &m, &addrs(&map_refs(&map)));
         let words = asm::assemble(&asm);
         let mut p = pic14_sim::Pic14::new(words);
         for (i, by) in f32_le(a).iter().enumerate() {
