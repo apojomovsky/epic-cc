@@ -162,15 +162,71 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
     out
 }
 
+/// Parse a PIC18 byte/bit-oriented operand's `f` field (the first
+/// comma-separated token after the mnemonic).
+fn parse_f_field(rest: &str, symbols: &std::collections::HashMap<String, usize>) -> u16 {
+    let f = parse_lit(rest.split(',').next().unwrap().trim(), symbols);
+    (f & 0xFF) as u16
+}
+
+fn parse_a_bit(rest: &str) -> u16 {
+    match rest.to_ascii_uppercase().as_str() {
+        "A" => 0,
+        "B" => 1,
+        other => panic!("asm(pic18): expected A or B, got {other}"),
+    }
+}
+
+fn parse_d_bit(rest: &str) -> u16 {
+    match rest.to_ascii_uppercase().as_str() {
+        "W" => 0,
+        "F" => 1,
+        other => panic!("asm(pic18): expected W or F, got {other}"),
+    }
+}
+
 /// Encode one PIC18 instruction line to 1 or 2 words. `addr` is this
 /// instruction's own word address (needed by the relative-branch forms).
 fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<String, usize>) -> Vec<u16> {
     let mut it = line.splitn(2, char::is_whitespace);
     let mne = it.next().expect("asm: empty instruction line").to_ascii_uppercase();
     let rest = it.next().unwrap_or("").trim();
+    let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
     let _ = addr; // used starting Task 8 (relative branches)
     match mne.as_str() {
         "NOP" => vec![0x0000],
+        "ADDWF" | "ADDWFC" | "ANDWF" | "COMF" | "DECF" | "DECFSZ" | "DCFSNZ" | "INCF"
+        | "INCFSZ" | "INFSNZ" | "IORWF" | "MOVF" | "RLCF" | "RLNCF" | "RRCF" | "RRNCF"
+        | "SUBFWB" | "SUBWF" | "SUBWFB" | "SWAPF" | "XORWF" => {
+            let f = parse_f_field(rest, symbols);
+            let d = parse_d_bit(ops[1]);
+            let a = parse_a_bit(ops[2]);
+            let base: u16 = match mne.as_str() {
+                "ADDWF" => 0x2400,
+                "ADDWFC" => 0x2000,
+                "ANDWF" => 0x1400,
+                "COMF" => 0x1C00,
+                "DECF" => 0x0400,
+                "DECFSZ" => 0x2C00,
+                "DCFSNZ" => 0x4C00,
+                "INCF" => 0x2800,
+                "INCFSZ" => 0x3C00,
+                "INFSNZ" => 0x4800,
+                "IORWF" => 0x1000,
+                "MOVF" => 0x5000,
+                "RLCF" => 0x3400,
+                "RLNCF" => 0x4400,
+                "RRCF" => 0x3000,
+                "RRNCF" => 0x4000,
+                "SUBFWB" => 0x5400,
+                "SUBWF" => 0x5C00,
+                "SUBWFB" => 0x5800,
+                "SWAPF" => 0x3800,
+                "XORWF" => 0x1800,
+                _ => unreachable!(),
+            };
+            vec![base | d << 9 | a << 8 | f]
+        }
         other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
     }
 }
