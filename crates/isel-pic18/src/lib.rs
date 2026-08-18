@@ -141,7 +141,44 @@ impl<'m> Gen<'m> {
                 }));
                 self.emit_move_val_to_slot(&s.val, s.ty, dst);
             }
+            Inst::Bin(b) => {
+                assert_eq!(b.ty.bytes(), 1, "isel-pic18: only i8 Bin ops implemented so far (Task 6 adds i16)");
+                let mne = match b.op {
+                    ir::BinOp::Add => "ADDWF",
+                    ir::BinOp::Sub => "SUBWF",
+                    ir::BinOp::And => "ANDWF",
+                    ir::BinOp::Or => "IORWF",
+                    ir::BinOp::Xor => "XORWF",
+                    other => panic!("isel-pic18: Bin op {other:?} not yet implemented (Task 6+)"),
+                };
+                // SUBWF computes f - W; the IR's `sub a, b` is `a - b`, so
+                // `a` must be `f` and `b` must go into `W` first.
+                self.emit_load_w(&b.b);
+                let av = self.val_addr(&b.a).direct();
+                let (aacc, af) = self.operand(av);
+                let abank = if aacc == 0 { "A" } else { "B" };
+                self.emit(format!("    {mne} 0x{af:03X},W,{abank}"));
+                let dst = self.slot_addr(self.cur_func, &b.dst).direct();
+                let (dacc, df) = self.operand(dst);
+                let dbank = if dacc == 0 { "A" } else { "B" };
+                self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+            }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
+        }
+    }
+
+    /// Load any `Val` into `W` — a constant via `MOVLW`, a register/global
+    /// via `MOVF ...,W` (which needs the access bit, same as any other
+    /// `W`-routing instruction).
+    fn emit_load_w(&mut self, v: &Val) {
+        match v {
+            Val::Const(k) => self.emit(format!("    MOVLW 0x{:02X}", (*k & 0xFF) as u8)),
+            _ => {
+                let addr = self.val_addr(v).direct();
+                let (a, f) = self.operand(addr);
+                let bank = if a == 0 { "A" } else { "B" };
+                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+            }
         }
     }
 }

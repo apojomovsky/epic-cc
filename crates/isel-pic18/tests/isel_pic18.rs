@@ -43,3 +43,36 @@ fn store_a_constant_uses_movlw_then_movwf() {
     assert!(asm.contains("MOVLW 0x05"));
     assert!(asm.contains("MOVWF 0x011,A") || asm.contains("MOVWF 0x11,A"), "asm:\n{asm}");
 }
+
+#[test]
+fn i8_binops_load_b_into_w_then_operate_against_a() {
+    let cases: &[(&str, &str)] = &[
+        ("add", "ADDWF"), ("sub", "SUBWF"), ("and", "ANDWF"), ("or", "IORWF"), ("xor", "XORWF"),
+    ];
+    for (op, mne) in cases {
+        let m = parse(&format!(
+            "global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = {op} i8 %1, %2\n    ret void\n"
+        ));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        assert!(asm.contains(&format!("{mne} 0x012,W,A")) || asm.contains(&format!("{mne} 0x12,W,A")), "{op}:\n{asm}");
+    }
+}
+
+#[test]
+fn i8_binop_dest_at_banked_address_routes_through_operand_with_bank_suffix() {
+    // The destination slot (main::3) lands at 0x180 (bank 1, f=0x80) — an
+    // address >= 0x60 that requires an explicit access-bank suffix (and a
+    // MOVLB) — this is the banked-destination case the brief's first
+    // example (all addrs < 0x60) would not have caught.
+    let m = parse(
+        "global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = add i8 %1, %2\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x180)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(
+        asm.contains("MOVWF 0x80,B") || asm.contains("MOVWF 0x080,B"),
+        "banked dest must go through operand() with an explicit ,B suffix:\n{asm}"
+    );
+    assert!(asm.contains("MOVLB 0x1"), "banked dest must emit a MOVLB for bank 1:\n{asm}");
+}
