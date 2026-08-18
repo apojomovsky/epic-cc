@@ -25,6 +25,18 @@ fn global_type_and_addr_roundtrip() {
 }
 
 #[test]
+fn explicit_global_addr_past_0xff_roundtrips() {
+    // Issue #9: Global.addr used to be a u8, so an explicit .ll address past
+    // 0xFF (e.g. a bank-2 GPR address like 0x150) panicked in parse_addr
+    // instead of round-tripping like any other explicit address.
+    let m = parse("global g i16 @0x150\n");
+    assert_eq!(m.globals[0].addr, Some(0x150));
+    let out = serialize(&m);
+    assert!(out.contains("global g i16 @0x150"), "missing wide addr\n---\n{out}");
+    assert_eq!(serialize(&parse(&out)), out, "stable fixed point");
+}
+
+#[test]
 fn gep_and_sized_globals_roundtrip() {
     let text = "global ram i8 @0x25\nconst table i8\nfn main(void) ()\n  block entry:\n    %p = gep @ram +0 +1*%3\n    ret void\n";
     let m = parse(text);

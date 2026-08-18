@@ -126,7 +126,7 @@ pub struct Func {
 }
 
 #[derive(Clone, Debug)]
-pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u16, pub bytes: Vec<u8>, pub addr: Option<u8> }
+pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u16, pub bytes: Vec<u8>, pub addr: Option<u16> }
 
 #[derive(Clone, Debug)]
 pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func> }
@@ -327,7 +327,7 @@ pub fn parse(text: &str) -> Module {
 }
 
 fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "float" | "f32" => Ty::F32, other => panic!("unsupported type {other}") } }
-fn parse_addr(s: &str) -> Option<u8> { s.strip_prefix('@').map(|h| u8::from_str_radix(h.trim_start_matches("0x"), 16).unwrap()) }
+fn parse_addr(s: &str) -> Option<u16> { s.strip_prefix('@').map(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).unwrap()) }
 fn parse_val(s: &str) -> Val {
     let s = s.trim_end_matches(',');
     if let Some(r) = s.strip_prefix('%') { Val::Reg(r.to_string()) }
