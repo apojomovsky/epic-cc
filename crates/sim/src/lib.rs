@@ -439,3 +439,130 @@ impl Pic14 {
         pc + 1
     }
 }
+
+/// Decode Intel HEX into 16-bit words for a PIC18F4550-sized program
+/// (`0x4000` words = 32768 bytes of flash). Same wire format as
+/// `parse_hex` (`asm::to_hex` emits identical HEX regardless of core), just
+/// sized for PIC18's larger flash.
+pub fn parse_hex_pic18(data: &str) -> Vec<u16> {
+    let mut words = vec![0u16; 0x4000];
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        assert!(line.starts_with(':'), "not Intel HEX: {line}");
+        let bytes = hex_decode(&line[1..]);
+        let len = bytes[0] as usize;
+        let addr = ((bytes[1] as usize) << 8) | (bytes[2] as usize);
+        let rectype = bytes[3];
+        let data = &bytes[4..4 + len];
+        match rectype {
+            0x00 => {
+                for (i, chunk) in data.chunks(2).enumerate() {
+                    let w = (chunk[0] as u16) | ((chunk[1] as u16) << 8);
+                    words[addr / 2 + i] = w;
+                }
+            }
+            0x01 => break,
+            0x04 => {}
+            other => panic!("unsupported HEX record type {other:#x}"),
+        }
+    }
+    words
+}
+
+/// PIC18F4550 (16-bit-word core) instruction-set simulator. `pc` is a
+/// **byte** address (PIC18's PC natively counts bytes, incrementing by 2
+/// per one-word instruction), unlike `Pic14::pc` which is a word address —
+/// this matches the real hardware and lets the interrupt vectors
+/// (0x000008/0x000018) and `GOTO`/`CALL`'s encoded targets be used
+/// directly without a unit conversion at every call site.
+pub struct Pic18 {
+    prog: Vec<u16>,
+    ram: [u8; 4096],
+    w: u8,
+    pc: u32,
+    /// Hardware call stack: up to 31 return byte-addresses. `TOSU`/`TOSH`/
+    /// `TOSL`/`STKPTR` (SFRs 0xFFF/0xFFE/0xFFD/0xFFC) are computed views
+    /// over this, not separate storage — mirrors how `Pic14::read_f`
+    /// special-cases the `PCL` SFR address over the `pc` field instead of
+    /// storing it twice.
+    stack: Vec<u32>,
+    halted: bool,
+}
+
+impl Pic18 {
+    pub fn new(prog: Vec<u16>) -> Self {
+        Pic18 { prog, ram: [0; 4096], w: 0, pc: 0, stack: Vec::new(), halted: false }
+    }
+    pub fn ram(&self) -> &[u8; 4096] {
+        &self.ram
+    }
+    pub fn ram_mut(&mut self) -> &mut [u8; 4096] {
+        &mut self.ram
+    }
+    pub fn w(&self) -> u8 {
+        self.w
+    }
+    pub fn pc(&self) -> u32 {
+        self.pc
+    }
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+    pub fn run(&mut self, max_steps: usize) -> usize {
+        let mut steps = 0;
+        while !self.halted && steps < max_steps {
+            self.step();
+            steps += 1;
+        }
+        steps
+    }
+    pub fn step(&mut self) {
+        let word = self.prog[(self.pc / 2) as usize];
+        // Every recognized opcode is added task-by-task from here; a
+        // program of just NOPs already exercises the fetch/pc-advance
+        // loop end-to-end.
+        if word == 0x0000 {
+            self.pc += 2;
+        } else {
+            panic!("sim(pic18): opcode {word:#06x} not yet implemented");
+        }
+        if (self.pc / 2) as usize >= self.prog.len() {
+            self.halted = true;
+        }
+    }
+
+    /// Resolve a byte/bit-oriented `(a, f)` pair to its physical 12-bit
+    /// address. `a=0` (access bank): `f<=0x5F` -> `f` (low access,
+    /// `0x000-0x05F`); `f>0x5F` -> `0xF00+f` (high access/SFR,
+    /// `0xF60-0xFFF`). `a=1` (banked): `(BSR<<8)|f`. This split is a core
+    /// PIC18 architecture invariant (see the plan's reference section),
+    /// hard-coded here exactly as `Pic14::bank_base` hard-codes RP1:RP0.
+    fn resolve_f(&self, a: u16, f: u16) -> usize {
+        if a == 0 {
+            if f <= 0x5F {
+                f as usize
+            } else {
+                0xF00 + f as usize
+            }
+        } else {
+            ((self.ram[0xFE0] as usize) << 8) | f as usize
+        }
+    }
+    fn read_f(&self, a: u16, f: u16) -> u8 {
+        self.ram[self.resolve_f(a, f)]
+    }
+    fn write_f(&mut self, a: u16, f: u16, v: u8) {
+        let addr = self.resolve_f(a, f);
+        self.ram[addr] = v;
+    }
+    fn write_d(&mut self, d: u16, a: u16, f: u16, r: u8) {
+        if d == 1 {
+            self.write_f(a, f, r);
+        } else {
+            self.w = r;
+        }
+    }
+}
