@@ -6,6 +6,7 @@ version = 4
 name = "alloc"
 version = "0.1.0"
 dependencies = [
+ "device",
  "ir",
 ]
 
@@ -13,12 +14,16 @@ dependencies = [
 name = "asm"
 version = "0.1.0"
 dependencies = [
+ "device",
  "pic14-sim",
 ]
 
 [[package]]
 name = "banking"
 version = "0.1.0"
+dependencies = [
+ "device",
+]
 
 [[package]]
 name = "callgraph"
@@ -28,6 +33,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "device"
+version = "0.1.0"
+
+[[package]]
 name = "driver"
 version = "0.1.0"
 dependencies = [
@@ -35,6 +44,7 @@ dependencies = [
  "asm",
  "banking",
  "callgraph",
+ "device",
  "ir",
  "irparse",
  "isel",
@@ -52,6 +62,7 @@ dependencies = [
  "asm",
  "banking",
  "callgraph",
+ "device",
  "ir",
  "irparse",
  "isel",
@@ -78,6 +89,7 @@ version = "0.1.0"
 dependencies = [
  "asm",
  "banking",
+ "device",
  "ir",
  "legalize",
  "pic14-sim",
@@ -88,6 +100,7 @@ name = "legalize"
 version = "0.1.0"
 dependencies = [
  "alloc",
+ "device",
  "ir",
 ]
 
