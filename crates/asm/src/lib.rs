@@ -111,13 +111,22 @@ fn instruction_words_pic18(line: &str) -> usize {
 
 /// Assemble PIC18 assembly source into 16-bit words indexed by word
 /// address. Two-pass like `assemble`: pass 1 resolves labels/`org`/`equ`
-/// and measures each line's word count (1 or 2); pass 2 encodes. No
-/// `.align`/`.table` — P1 has no const-table codegen to emit them (that
-/// machinery arrives with `TBLRD` support in a later phase).
+/// and measures each line's size; pass 2 encodes. No `.align`/`.table` —
+/// P1 has no const-table codegen to emit them (that machinery arrives with
+/// `TBLRD` support in a later phase).
+///
+/// **`org` and labels are BYTE addresses here, unlike PIC14's `assemble`**
+/// (confirmed against `gpasm -p p18f4550`: `org 0x0020` places the next
+/// instruction at *word* address 0x10, not 0x20) — this matches PIC18's
+/// byte-oriented program counter. The output `Vec<u16>` stays word-indexed
+/// (byte address / 2), so callers see the same shape as `assemble`;
+/// `encode_pic18` receives each instruction's own BYTE address and divides
+/// by 2 wherever the ISA's `k`/`n` fields need a *word* address/offset
+/// (`GOTO`/`CALL`'s absolute target, every relative branch's offset).
 pub fn assemble_pic18(src: &str) -> Vec<u16> {
     let mut symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut org = 0usize;
-    let mut lines: Vec<(usize, String)> = Vec::new();
+    let mut org = 0usize; // byte address
+    let mut lines: Vec<(usize, String)> = Vec::new(); // (byte address, line)
     for raw in src.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -149,14 +158,15 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         }
         let words = instruction_words_pic18(line);
         lines.push((org, line.to_string()));
-        org += words;
+        org += words * 2; // advance by BYTES
     }
-    let mut out = vec![0u16; org];
+    let mut out = vec![0u16; org / 2];
     for (addr, line) in &lines {
+        let word_addr = addr / 2;
         let encoded = encode_pic18(*addr, line, &symbols);
-        out[*addr] = encoded[0];
+        out[word_addr] = encoded[0];
         if encoded.len() == 2 {
-            out[*addr + 1] = encoded[1];
+            out[word_addr + 1] = encoded[1];
         }
     }
     out
@@ -186,7 +196,9 @@ fn parse_d_bit(rest: &str) -> u16 {
 }
 
 /// Encode one PIC18 instruction line to 1 or 2 words. `addr` is this
-/// instruction's own word address (needed by the relative-branch forms).
+/// instruction's own BYTE address (matching `symbols`, which `assemble_pic18`
+/// also stores as byte addresses); the relative-branch/`GOTO`/`CALL` arms
+/// divide by 2 to get the *word* address/offset the ISA's `k`/`n` fields need.
 fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<String, usize>) -> Vec<u16> {
     let mut it = line.splitn(2, char::is_whitespace);
     let mne = it.next().expect("asm: empty instruction line").to_ascii_uppercase();
@@ -295,7 +307,9 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             let target = *symbols
                 .get(rest)
                 .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
-            let n = target as i32 - (addr as i32 + 1);
+            // Branch offsets are word offsets; convert both byte addresses
+            // to word addresses before taking the difference.
+            let n = (target >> 1) as i32 - ((addr >> 1) as i32 + 1);
             assert!(
                 (-128..=127).contains(&n),
                 "asm(pic18): {mne} offset {n} out of range [-128,127]"
@@ -318,7 +332,7 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             let target = *symbols
                 .get(rest)
                 .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
-            let n = target as i32 - (addr as i32 + 1);
+            let n = (target >> 1) as i32 - ((addr >> 1) as i32 + 1);
             assert!(
                 (-1024..=1023).contains(&n),
                 "asm(pic18): {mne} offset {n} out of range [-1024,1023]"
@@ -331,7 +345,7 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             let target = *symbols
                 .get(rest)
                 .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
-            let k = target as u32; // symbols already store word addresses
+            let k = (target >> 1) as u32; // byte address -> word address
             vec![0xEF00 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
         }
         "CALL" => {
@@ -343,7 +357,7 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             let target = *symbols
                 .get(label)
                 .unwrap_or_else(|| panic!("asm(pic18): undefined label {label}"));
-            let k = target as u32;
+            let k = (target >> 1) as u32; // byte address -> word address
             let s: u16 = if fast { 1 } else { 0 };
             vec![0xEC00 | s << 8 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
         }
