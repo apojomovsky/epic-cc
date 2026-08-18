@@ -528,13 +528,7 @@ impl Pic18 {
             // numerically inside 0x0200..=0x6FFF. Only MOVLW is implemented
             // here so far (needed to set up test state ahead of Task 14,
             // which completes the rest of this group with its own tests).
-            0x0E00..=0x0EFF => {
-                self.w = (word & 0xFF) as u8;
-                pc + 2
-            }
-            _ if (0x0800..=0x0FFF).contains(&word) => {
-                panic!("sim(pic18): literal opcode {word:#06x} not yet implemented (Task 14)")
-            }
+            _ if (0x0800..=0x0FFF).contains(&word) => self.exec_literal(pc, word),
             _ if (0x0200..=0x6FFF).contains(&word) => self.exec_byte(pc, word),
             _ if (0x7000..=0xBFFF).contains(&word) => self.exec_bit(pc, word),
             _ => panic!("sim(pic18): opcode {word:#06x} not yet implemented"),
@@ -804,6 +798,48 @@ impl Pic18 {
             other => panic!("sim(pic18): bit opcode group {other:#03x} unreachable"),
         }
         pc + 2
+    }
+
+    fn exec_literal(&mut self, pc: u32, word: u16) -> u32 {
+        let k = (word & 0xFF) as u8;
+        match (word >> 8) & 0xF {
+            0x8 => {
+                // SUBLW: k - W
+                let r = self.addc_flags(k, !self.w, 1);
+                self.set_zn(r);
+                self.w = r;
+            }
+            0x9 => {
+                self.w |= k; // IORLW
+                self.set_zn(self.w);
+            }
+            0xA => {
+                self.w ^= k; // XORLW
+                self.set_zn(self.w);
+            }
+            0xB => {
+                self.w &= k; // ANDLW
+                self.set_zn(self.w);
+            }
+            0xC => {
+                // RETLW: W = k, then return
+                self.w = k;
+                return self.pop_return();
+            }
+            0xD => panic!("sim(pic18): MULLW deferred to Task 16 (needs PRODH/PRODL)"),
+            0xE => self.w = k, // MOVLW
+            0xF => {
+                // ADDLW: W + k
+                let r = self.addc_flags(self.w, k, 0);
+                self.set_zn(r);
+                self.w = r;
+            }
+            other => unreachable!("literal opcode nibble {other:#x}"),
+        }
+        pc + 2
+    }
+    fn pop_return(&mut self) -> u32 {
+        self.stack.pop().unwrap_or(0)
     }
 
     fn status_addr(&self) -> usize {

@@ -314,3 +314,55 @@ fn btg_toggles_a_bit() {
     p.run(1);
     assert_eq!(p.ram()[0x20], 0x00);
 }
+
+#[test]
+fn movlw_loads_w_with_no_flags() {
+    let mut p = Pic18::new(vec![0x0E42]);
+    p.run(1);
+    assert_eq!(p.w(), 0x42);
+}
+
+#[test]
+fn addlw_adds_to_w_with_flags() {
+    let words = vec![0x0E7F, 0x0F01]; // MOVLW 0x7F; ADDLW 0x01
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.w(), 0x80);
+    assert_eq!(p.ram()[0xFD8] & 0x08, 0x08, "OV set: 127+1 signed-overflows");
+}
+
+#[test]
+fn sublw_computes_k_minus_w() {
+    let words = vec![0x0E03, 0x0801]; // MOVLW 3; SUBLW 1 -> 1 - 3 = 0xFE, C clear (borrow)
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.w(), 0xFE);
+    assert_eq!(p.ram()[0xFD8] & 0x01, 0);
+}
+
+#[test]
+fn iorlw_ors_into_w() {
+    let words = vec![0x0E0F, 0x09F0]; // MOVLW 0x0F; IORLW 0xF0
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.w(), 0xFF);
+}
+
+#[test]
+fn xorlw_xors_into_w() {
+    let words = vec![0x0EFF, 0x0A0F]; // MOVLW 0xFF; XORLW 0x0F
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.w(), 0xF0);
+}
+
+#[test]
+fn andlw_ands_into_w() {
+    let words = vec![0x0EFF, 0x0B0F]; // MOVLW 0xFF; ANDLW 0x0F
+    let mut p = Pic18::new(words);
+    p.run(2);
+    assert_eq!(p.w(), 0x0F);
+}
+
+// RETLW's test is deferred to Task 15 — meaningfully testing "return and
+// load W" needs a real CALL/stack first, which doesn't exist until then.
