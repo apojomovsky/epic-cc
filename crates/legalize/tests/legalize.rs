@@ -648,3 +648,89 @@ fn float_lowering_roundtrips_canonical_text() {
         assert!(text.contains(line), "missing canonical line: {line}\n---\n{text}");
     }
 }
+
+/// Issue #2: a runtime routine reachable from BOTH main and the ISR must be
+/// duplicated the same way a shared user function is. Without the copy, an
+/// ISR that preempts main inside `__mul_u8` re-enters the one shared frame
+/// and clobbers main's in-flight state.
+#[test]
+fn duplicates_shared_runtime_routines_for_the_isr() {
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i8 @a\n\
+             %y = load i8 @b\n\
+             %p = mul i8 %x, %y\n\
+             store i8 %p @out\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %u = load i8 @a\n\
+             %v = load i8 @b\n\
+             %q = mul i8 %u, %v\n\
+             store i8 %q @out\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"__mul_u8"), "main's routine must remain: {names:?}");
+    assert!(
+        names.contains(&"__mul_u8_isr"),
+        "the ISR needs its own routine copy: {names:?}"
+    );
+    // The ISR calls its copy; main keeps the original.
+    assert_eq!(call_targets(func("isr", &m2)), ["__mul_u8_isr"]);
+    assert_eq!(call_targets(func("main", &m2)), ["__mul_u8"]);
+    // The copy carries the same ABI as the original (params + scratch), so
+    // alloc sizes it an independent frame.
+    let orig = func("__mul_u8", &m2);
+    let copy = func("__mul_u8_isr", &m2);
+    assert!(!copy.isr, "the routine copy must not be marked isr");
+    assert_eq!(copy.ret, orig.ret, "the copy keeps the routine's return type");
+    assert_eq!(
+        copy.params.len(),
+        orig.params.len(),
+        "the copy keeps the routine's params"
+    );
+    match (&copy.blocks[0].insts[0], &orig.blocks[0].insts[0]) {
+        (Inst::Alloca(c), Inst::Alloca(o)) => {
+            assert_eq!(c.dst, "__scr");
+            assert_eq!(c.size, o.size, "the copy keeps the routine's scratch size");
+        }
+        other => panic!("the routine copy must hold a scratch alloca, got {other:?}"),
+    }
+}
+
+/// A routine used ONLY by the ISR is not duplicated: there is no main-context
+/// caller to clobber, so a second copy would waste flash and RAM.
+#[test]
+fn does_not_duplicate_isr_only_runtime_routines() {
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i8 @a\n\
+             store i8 %x @out\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %u = load i8 @a\n\
+             %v = load i8 @b\n\
+             %q = mul i8 %u, %v\n\
+             store i8 %q @out\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"__mul_u8"), "the routine must be injected: {names:?}");
+    assert!(
+        !names.contains(&"__mul_u8_isr"),
+        "an ISR-only routine must NOT be duplicated: {names:?}"
+    );
+    assert_eq!(call_targets(func("isr", &m2)), ["__mul_u8"]);
+}
