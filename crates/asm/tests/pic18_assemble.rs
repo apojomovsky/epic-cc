@@ -185,3 +185,29 @@ fn every_conditional_branch_mnemonic_uses_its_own_base_opcode() {
         assert_eq!(words[0], base | 0xFF, "encoding {mne}");
     }
 }
+
+#[test]
+fn goto_encodes_the_word_address_across_two_words() {
+    // target at word 0, GOTO at word 1: k = target word address = 0.
+    let words = assemble_pic18("target:\n    NOP\n    GOTO target\n");
+    assert_eq!(&words[1..3], &[0xEF00, 0xF000]);
+}
+
+#[test]
+fn call_encodes_normal_and_fast_forms() {
+    let words = assemble_pic18("target:\n    NOP\n    CALL target\n    CALL target,FAST\n");
+    assert_eq!(&words[1..3], &[0xEC00, 0xF000]); // normal: s=0
+    assert_eq!(&words[3..5], &[0xED00, 0xF000]); // fast: s=1
+}
+
+#[test]
+fn lfsr_loads_a_12_bit_literal() {
+    let words = assemble_pic18("    LFSR 2, 0xFFF\n");
+    assert_eq!(words, vec![0xEE2F, 0xF0FF]);
+}
+
+#[test]
+fn movff_moves_between_two_full_12_bit_addresses() {
+    let words = assemble_pic18("    MOVFF 0x55, 0xF80\n");
+    assert_eq!(words, vec![0xC055, 0xFF80]);
+}

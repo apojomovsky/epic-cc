@@ -327,6 +327,39 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             let base: u16 = if mne == "BRA" { 0xD000 } else { 0xD800 };
             vec![base | n11]
         }
+        "GOTO" => {
+            let target = *symbols
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
+            let k = target as u32; // symbols already store word addresses
+            vec![0xEF00 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
+        }
+        "CALL" => {
+            let (label, fast) = match ops.as_slice() {
+                [l] => (*l, false),
+                [l, f] if f.eq_ignore_ascii_case("FAST") => (*l, true),
+                _ => panic!("asm(pic18): CALL takes <label> or <label>,FAST"),
+            };
+            let target = *symbols
+                .get(label)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {label}"));
+            let k = target as u32;
+            let s: u16 = if fast { 1 } else { 0 };
+            vec![0xEC00 | s << 8 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
+        }
+        "LFSR" => {
+            let fsr: u16 = ops[0]
+                .parse()
+                .unwrap_or_else(|_| panic!("asm(pic18): bad FSR number {}", ops[0]));
+            assert!(fsr <= 2, "asm(pic18): FSR number {fsr} out of range 0-2");
+            let k = (parse_lit(ops[1], symbols) & 0xFFF) as u16;
+            vec![0xEE00 | fsr << 4 | (k >> 8), 0xF000 | (k & 0xFF)]
+        }
+        "MOVFF" => {
+            let src_addr = (parse_lit(ops[0], symbols) & 0xFFF) as u16;
+            let dst_addr = (parse_lit(ops[1], symbols) & 0xFFF) as u16;
+            vec![0xC000 | src_addr, 0xF000 | dst_addr]
+        }
         other => panic!("asm(pic18): unsupported mnemonic {other} (operand: {rest})"),
     }
 }
