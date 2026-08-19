@@ -554,3 +554,67 @@ fn isr_region_clears_the_main_context_physical_frame_end() {
         "isr frame overlaps main's live spill locals"
     );
 }
+
+#[test]
+fn a_global_layout_sequential_placement_cannot_fit_succeeds_via_bin_packing() {
+    // Three 76-byte globals, one 78-byte global, then one 4-byte global (310
+    // bytes total, under the device's 320-byte capacity) — declared in an
+    // order where the single sequential cursor abandons a 4-byte leftover in
+    // each of the first three banks it uses, then the 78-byte global leaves
+    // only 2 bytes in the fourth (last) bank — too little for the trailing
+    // 4-byte global, which then has no fifth bank to step into. This is the
+    // exact reproduction Task 1's and Task 2's unit tests use in isolation;
+    // this test proves the fix through the full public `allocate()` entry
+    // point.
+    let mut src = String::new();
+    for i in 0..5 {
+        src.push_str(&format!("global g{i} i8\n"));
+    }
+    src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
+    let mut m = parse(&src);
+    let sizes = [76u16, 76, 76, 78, 4];
+    for i in 0..5 {
+        m.globals[i].size = sizes[i];
+    }
+
+    // Before this plan, this call panics ("alloc: GPR demand exceeds
+    // 0x1EF..."). After Task 3, it must succeed, and every global must be
+    // placed within exactly one bank with no two overlapping.
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.globals.len(), 5);
+    let mut spans: Vec<(u16, u16)> = (0..5)
+        .map(|i| {
+            let name = format!("g{i}");
+            let start = out.globals[&name];
+            (start, start + sizes[i] - 1)
+        })
+        .collect();
+    for &(start, end) in &spans {
+        assert!(
+            PIC16F877A.ram_banks.iter().any(|&(bs, be)| start >= bs && end <= be),
+            "global at 0x{start:03X}..=0x{end:03X} does not fit inside a single bank"
+        );
+    }
+    spans.sort();
+    for w in spans.windows(2) {
+        assert!(w[0].1 < w[1].0, "overlapping placements: {:?} and {:?}", w[0], w[1]);
+    }
+}
+
+#[test]
+#[should_panic(expected = "no arrangement")]
+fn globals_truly_exceeding_total_capacity_still_panic_with_a_clear_message() {
+    // 5 x 70-byte globals = 350 bytes > the device's 320-byte total GPR
+    // capacity: no arrangement fits, so this must still panic, now with a
+    // message naming the real constraint instead of a bare hex address.
+    let mut src = String::new();
+    for i in 0..5 {
+        src.push_str(&format!("global g{i} i8\n"));
+    }
+    src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
+    let mut m = parse(&src);
+    for i in 0..5 {
+        m.globals[i].size = 70;
+    }
+    let _ = allocate(&PIC16F877A, &m, "depth 1\n");
+}

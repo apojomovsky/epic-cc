@@ -1,7 +1,10 @@
 //! Overlay address allocation for the PIC8 pipeline.
 //!
 //! Globals get sequential, even-aligned (i16) addresses starting at the
-//! device's first GPR bank. Every local of every function lives in a frame
+//! device's first GPR bank. A bin-packing fallback (largest-first,
+//! independent per-bank cursors) activates only when sequential placement
+//! would otherwise fail, so every program that already succeeds keeps
+//! unchanged addresses. Every local of every function lives in a frame
 //! assigned from the call graph: `base(f) = max over callers of the
 //! caller's **physical** frame end` (the address just past its last placed
 //! local, bank crossings included — see `frame_end`), roots start after the
@@ -230,9 +233,20 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         }
     }
     let globals: HashMap<String, u16> = try_place_globals_sequential(device, &non_const)
+        .or_else(|| place_globals_bin_packed(device, &non_const))
         .unwrap_or_else(|| {
-            let last_end = device.ram_banks.last().expect("a device has at least one GPR bank").1;
-            panic!("alloc: GPR demand exceeds 0x{last_end:X}")
+            let demand: u32 = non_const.iter().map(|g| u32::from(g.size)).sum();
+            let capacity: u32 =
+                device.ram_banks.iter().map(|&(s, e)| u32::from(e) - u32::from(s) + 1).sum();
+            let bank_count = device.ram_banks.len();
+            panic!(
+                "alloc: no arrangement of {} global(s) fits {}'s {bank_count} GPR bank window(s) \
+                 (total demand {demand} bytes, total capacity {capacity} bytes — every arrangement, \
+                 including largest-first bin-packing, leaves at least one global with no single bank \
+                 window big enough for it)",
+                non_const.len(),
+                device.name,
+            );
         });
 
     // end_of_globals = max over the address map of (addr + width), floored at
