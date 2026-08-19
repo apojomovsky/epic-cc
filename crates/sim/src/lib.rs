@@ -1015,9 +1015,23 @@ impl Pic18 {
     }
 
     fn exec_movff(&mut self, pc: u32, word: u16, word2: u16) -> u32 {
-        let src = (word & 0xFFF) as usize;
-        let dst = (word2 & 0xFFF) as usize;
-        self.ram[dst] = self.ram[src];
+        // MOVFF's two 12-bit operands are already full physical addresses
+        // (see isel-pic18's `operand` doc comment: MOVFF bypasses the `a`
+        // bit and `BSR` entirely and addresses the whole linear data
+        // space directly) -- so they go through `resolve_phys`, not
+        // `resolve_f`. `resolve_f` would re-derive a physical address
+        // from what it assumes is an 8-bit register-file field, which
+        // double-adds `0xF00` for anything already in the SFR page and
+        // is out of range entirely for a banked GPR address above 0x5F.
+        //
+        // Resolve `src` and read its value BEFORE resolving `dst`: a
+        // `POSTINCn`-to-`POSTINCm` copy needs both FSRs to advance exactly
+        // once each, and `resolve_phys` performs the post-increment as a
+        // side effect of resolving the address, not as a separate step.
+        let src = self.resolve_phys((word & 0xFFF) as usize);
+        let val = self.ram[src];
+        let dst = self.resolve_phys((word2 & 0xFFF) as usize);
+        self.ram[dst] = val;
         pc + 4
     }
 
@@ -1138,6 +1152,27 @@ impl Pic18 {
         } else {
             ((self.ram[0xFE0] as usize) << 8) | f as usize
         };
+        self.resolve_phys(phys)
+    }
+
+    /// Shared back half of indirect-address resolution: given an
+    /// ALREADY-FULLY-FORMED physical address (`resolve_f`'s `phys`, or an
+    /// `exec_movff` operand — MOVFF's 12-bit operands are full physical
+    /// addresses in their own right, with no `a`/`BSR` reconstruction step
+    /// of their own), detect whether it lands on one of the
+    /// `INDFn`/`POSTINCn`/`POSTDECn`/`PREINCn`/`PLUSWn` pseudo-registers
+    /// and, if so, dereference through the `FSRn` it names (applying the
+    /// post-increment/-decrement/pre-increment side effect where
+    /// applicable). Otherwise `phys` is already the answer.
+    ///
+    /// Matching is keyed on `phys & 0xFF` alone, exactly as `resolve_f`
+    /// does — never on a separately-threaded raw register-file byte — for
+    /// the same reason documented above `resolve_f`: a `BSR`-banked GPR
+    /// access can have a low byte that coincidentally equals e.g. `0xE7`
+    /// (INDF1) while its real physical address lands nowhere near the SFR
+    /// page, so only the resolved, guaranteed-in-page `phys` value may be
+    /// used to decide "is this actually an indirect register".
+    fn resolve_phys(&mut self, phys: usize) -> usize {
         if phys < 0xF00 {
             return phys;
         }
@@ -1150,16 +1185,8 @@ impl Pic18 {
         let lo_addr = 0xF00 + fsrn_lo;
         let hi_addr = 0xF00 + fsrn_hi;
         let cur = ((self.ram[hi_addr] as u16) << 8) | self.ram[lo_addr] as u16;
-        // Dispatch on `(phys & 0xFF) as u16`, not the raw `f` byte, for
-        // consistency with the arm-selection `match` just above — the two
-        // are provably equal on every path that reaches here today (the
-        // `phys < 0xF00` return above already filters out any case where
-        // they'd diverge), but matching the same derived value the arm
-        // selection uses keeps that invariant local and structural instead
-        // of a fact this function has to independently stay true to, and
-        // avoids a latent trap if the `phys < 0xF00` gate above is ever
-        // loosened.
-        match (phys & 0xFF) as u16 {
+        let f = (phys & 0xFF) as u16;
+        match f {
             _ if f == indf => cur as usize,
             _ if f == postinc => {
                 let next = cur.wrapping_add(1);

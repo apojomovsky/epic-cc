@@ -533,3 +533,26 @@ fn reset_reinitializes_pc_and_w() {
     assert_eq!(p.w(), 0, "RESET clears W");
     assert_eq!(p.pc(), 0, "RESET jumps to the reset vector");
 }
+
+#[test]
+fn movff_dereferences_indf_and_postinc_operands() {
+    // FSR0 -> 0x020 (a GPR byte holding 0x42, poked in directly); FSR1 ->
+    // 0x021 (initially 0x00). `MOVFF INDF0, POSTINC1` (operands 0xFEF,
+    // 0xFE6) must copy the byte FSR0 points to (0x42) into the byte FSR1
+    // points to, then increment FSR1 -- not literally treat the SFR
+    // addresses 0xFEF/0xFE6 as if they were ordinary RAM locations.
+    let src = "    LFSR 0, 0x020\n    LFSR 1, 0x021\n    MOVFF 0xFEF, 0xFE6\n";
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.ram_mut()[0x020] = 0x42;
+    p.run(10);
+    assert_eq!(
+        p.ram()[0x021],
+        0x42,
+        "the byte at 0x021 must be overwritten via POSTINC1's dereference of FSR1"
+    );
+    // FSR1L lives at 0xF00 + 0xE1 = 0xFE1 (resolve_f's FSR1 match arm:
+    // fsrn_lo = 0xE1). FSR1 must have advanced past 0x021 after the
+    // post-increment.
+    assert_eq!(p.ram()[0xFE1], 0x22, "FSR1L must read 0x22 after POSTINC1's increment");
+}
