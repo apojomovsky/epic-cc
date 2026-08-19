@@ -553,6 +553,67 @@ define dso_local void @main() {
     assert_eq!(m.globals[1].bytes.len(), 6);
 }
 
+// Issue #5: clang -O1 prints const struct globals with EXPANDED literal
+// types (explicit padding) — `{ i8, i8, i16 }` for `struct { char; short }`.
+// The decode must flatten the initializer into the table's byte blob using
+// the same alignment layout as the type table.
+const CONST_STRUCTS: &str = r#"
+%struct.Pair = type { i8, i16 }
+@C1 = dso_local constant { i8, i8, i16 } { i8 65, i8 0, i16 4660 }, align 2
+@C2 = dso_local constant { { i8, i8, i16 }, i8, i8 } { { i8, i8, i16 } { i8 66, i8 0, i16 22136 }, i8 67, i8 0 }, align 2
+@CA = dso_local constant { [3 x i8], i8, i16 } { [3 x i8] c"abc", i8 0, i16 4951 }, align 2
+@CF = dso_local constant { float, i8, i8 } { float 1.500000e+00, i8 81, i8 0 }, align 2
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+@CZ = dso_local constant { i8, i8, i16 } zeroinitializer, align 2
+@gr = dso_local global { i8, i8, i16 } { i8 71, i8 0, i16 0x0102 }, align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_literal_struct_initializers_to_flat_bytes() {
+    let m = parse_ll(CONST_STRUCTS);
+    let g = |n: &str| m.globals.iter().find(|g| g.name == n).unwrap();
+
+    // C1 = { 'A', pad 0, 0x1234 } -> [0x41, 0x00, 0x34, 0x12]
+    let c1 = g("C1");
+    assert!(c1.is_const);
+    assert_eq!(c1.size, 4);
+    assert_eq!(c1.bytes, vec![0x41, 0x00, 0x34, 0x12]);
+
+    // C2 = { { 'B', pad, 0x5678 }, 'C', pad } -> size 6
+    let c2 = g("C2");
+    assert_eq!(c2.size, 6);
+    assert_eq!(c2.bytes, vec![0x42, 0x00, 0x78, 0x56, 0x43, 0x00]);
+
+    // CA = { "abc", pad, 0x1357 } -> size 6
+    let ca = g("CA");
+    assert_eq!(ca.size, 6);
+    assert_eq!(ca.bytes, vec![0x61, 0x62, 0x63, 0x00, 0x57, 0x13]);
+
+    // CF = { 1.5f (0x3FC00000 LE), 'Q', pad } -> size 6
+    let cf = g("CF");
+    assert_eq!(cf.size, 6);
+    assert_eq!(cf.bytes, vec![0x00, 0x00, 0xC0, 0x3F, 0x51, 0x00]);
+
+    // CARR = two { i8, i8, i16 } elements -> size 8, concatenated
+    let carr = g("CARR");
+    assert_eq!(carr.size, 8);
+    assert_eq!(carr.bytes, vec![0x44, 0x00, 0x11, 0x11, 0x45, 0x00, 0x22, 0x22]);
+
+    // zeroinitializer literal struct -> zeros of the layout size
+    let cz = g("CZ");
+    assert_eq!(cz.size, 4);
+    assert_eq!(cz.bytes, vec![0u8; 4]);
+
+    // RAM struct with an initializer keeps the same decode (and is not const)
+    let gr = g("gr");
+    assert!(!gr.is_const);
+    assert_eq!(gr.size, 4);
+    assert_eq!(gr.bytes, vec![0x47, 0x00, 0x02, 0x01]);
+}
+
 // s8: chained multi-index GEP with an inlined base GEP (dynamic struct-array).
 const CHAINED: &str = r#"
 %struct.A = type { i8, [4 x i8] }

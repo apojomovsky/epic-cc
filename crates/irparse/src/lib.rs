@@ -150,6 +150,165 @@ fn parse_array_elements(init: &str, elem: Ty) -> Vec<u8> {
     out
 }
 
+/// Size/alignment of a literal struct type string (`{ i8, i8, i16 }`,
+/// nested `{ ... }` fields, `[N x T]` fields) — same layout rules as
+/// `compute_struct`: fields at aligned offsets, size rounded up to the max
+/// field alignment. `types` resolves any named `%struct.X` field.
+fn literal_ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
+    let t = t.trim();
+    let inner = brace_inner(t).expect("literal struct type must be `{ ... }`");
+    let mut off: u16 = 0;
+    let mut max_align: u8 = 0;
+    for f in split_top_level(inner, ',') {
+        let f = f.trim();
+        if f.is_empty() {
+            continue;
+        }
+        let (fsize, falign) = ty_size_align(f, types);
+        off = round_up(off, falign);
+        off += fsize;
+        max_align = max_align.max(falign);
+    }
+    (round_up(off, max_align), max_align)
+}
+
+/// Strip a clang self-type prefix from a nested value. clang prints every
+/// non-scalar initializer with its own type: `{ T } { v }` for struct
+/// values, `[N x T] c"..."` / `[N x T] [...]` for array values. The value's
+/// first brace/bracket group is that self-type — strip it when present so
+/// the remainder is the bare value the decoder expects.
+fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
+    let value = value.trim();
+    if value.starts_with('{') {
+        // `{ i8, i8, i16 } { i8 66, ... }` — the first brace group is the
+        // self-type; `brace_inner` stops at its closing brace, and the
+        // remainder starts with the value's own `{`.
+        let inner = brace_inner(value).unwrap_or("");
+        let rest = value[inner.len() + 2..].trim();
+        return if rest.starts_with('{') { rest } else { value };
+    }
+    if ty.trim().starts_with('[') && value.starts_with('[') {
+        // `[3 x i8] c"abc"` / `[2 x T] [ ... ]` — the first bracket group
+        // is the self-type.
+        if let Some(i) = matching_bracket(value) {
+            let rest = value[i + 1..].trim();
+            if rest.starts_with('c') || rest.starts_with('[') {
+                return rest;
+            }
+        }
+    }
+    value
+}
+
+/// Decode one constant of a literal/named type into its flat little-endian
+/// byte blob. `value` forms: `zeroinitializer`, a scalar (`i8 65`,
+/// `i16 4660`, `float 0x...`), a `c"..."` or `[...]` array value, or a
+/// nested `{ ... }` struct value (possibly self-type-prefixed). Unknown
+/// shapes panic loudly.
+fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
+    let ty = ty.trim();
+    let value = strip_self_type(ty, value).trim();
+    if value.starts_with("zeroinitializer") {
+        let (size, _) = ty_size_align(ty, types);
+        return vec![0u8; size as usize];
+    }
+    if let Some(inner) = ty.strip_prefix('[') {
+        // Array value: `c"..."` (i8), a `[...]` element list, or (struct
+        // elements) a brace list.
+        let close = ty.find(']').unwrap();
+        let inner = &ty[1..close];
+        let mut pit = inner.splitn(2, "x").map(|s| s.trim());
+        let n: usize = pit.next().unwrap().parse().unwrap();
+        let elem = pit.next().unwrap();
+        let bytes = if elem == "i8" && value.starts_with('c') && value.contains('"') {
+            parse_string_literal(value)
+        } else if value.starts_with('[') {
+            if elem.starts_with('{') {
+                let inner_list = value
+                    .strip_prefix('[')
+                    .and_then(|s| matching_bracket(value).map(|i| &s[..i.saturating_sub(1)]))
+                    .unwrap_or_else(|| panic!("SPIKE LIMIT: struct array value {value:?}"));
+                let mut out = Vec::new();
+                for elt in split_top_level(inner_list, ',') {
+                    let elt = elt.trim();
+                    if elt.is_empty() {
+                        continue;
+                    }
+                    out.extend(decode_typed_value(elem, elt, types));
+                }
+                out
+            } else {
+                parse_array_elements(value, ty_of(elem))
+            }
+        } else {
+            panic!("SPIKE LIMIT: array value {value:?} for type {ty:?}");
+        };
+        let expect = n * usize::from(ty_size_align(elem, types).0);
+        assert_eq!(
+            bytes.len(),
+            expect,
+            "SPIKE LIMIT: array value {value:?} decodes to {} bytes, expected {expect} for {ty:?}",
+            bytes.len()
+        );
+        return bytes;
+    }
+    if ty.starts_with('{') {
+        return decode_literal_struct(ty, value, types);
+    }
+    // Scalar value: `i8 65`, `i16 -5`, `float 1.500000e+00`.
+    let (_, v) = value.split_once(' ').unwrap_or(("", value));
+    let w = ty_of(ty).bytes() as usize;
+    match parse_val_typed(v.trim(), Some(ty_of(ty))) {
+        Val::Const(k) => {
+            let uv = k as u64;
+            (0..w).map(|i| ((uv >> (8 * i)) & 0xFF) as u8).collect()
+        }
+        _ => panic!("SPIKE LIMIT: non-constant struct field value {value:?}"),
+    }
+}
+
+/// Decode a literal struct initializer (`{ i8 65, i8 0, i16 4660 }`) into
+/// the flat little-endian blob, placing each field at its aligned offset
+/// (the same rules as the type table). clang prints every field including
+/// padding, but missing trailing fields decode as zeros for robustness.
+fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
+    let inner = brace_inner(ty).expect("literal struct type must be `{ ... }`");
+    let ty_fields: Vec<&str> = split_top_level(inner, ',').into_iter().map(|s| s.trim()).collect();
+    let (size, _) = literal_ty_size_align(ty, types);
+    let mut blob = vec![0u8; size as usize];
+    if init.starts_with("zeroinitializer") {
+        return blob;
+    }
+    let v_inner = brace_inner(init)
+        .unwrap_or_else(|| panic!("SPIKE LIMIT: struct initializer {init:?} for type {ty:?}"));
+    let values: Vec<&str> = split_top_level(v_inner, ',').into_iter().map(|s| s.trim()).collect();
+    assert!(
+        values.len() <= ty_fields.len(),
+        "SPIKE LIMIT: struct initializer {init:?} has more values than type {ty:?} has fields"
+    );
+    let mut off: u16 = 0;
+    for (i, f) in ty_fields.iter().enumerate() {
+        if f.is_empty() {
+            continue;
+        }
+        let (fsize, falign) = ty_size_align(f, types);
+        off = round_up(off, falign);
+        if let Some(v) = values.get(i) {
+            if !v.is_empty() {
+                let fbytes = decode_typed_value(f, v, types);
+                assert_eq!(
+                    fbytes.len(),
+                    fsize as usize,
+                    "SPIKE LIMIT: field value {v:?} of {f:?} decodes to the wrong width"
+                );
+                blob[off as usize..(off + fsize) as usize].copy_from_slice(&fbytes);
+            }
+        }
+        off += fsize;
+    }
+    blob
+}
+
 /// Decode an LLVM string literal `c"..."` into bytes. LLVM prints every
 /// byte outside the printable range (plus `"` and `\`) as a `\XX` hex
 /// escape, and a literal backslash byte 0x5C as the `\\` escape — so a
@@ -306,6 +465,11 @@ fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
     } else if let Some(n) = t.strip_prefix('%') {
         let info = types.get(n).unwrap_or_else(|| panic!("irparse: unknown struct type {t}"));
         (u16::from(info.size), info.align)
+    } else if t.starts_with('{') {
+        // Literal struct type (`{ i8, i8, i16 }`): layout by the same
+        // rules as `compute_struct`. Literal structs are value types
+        // (no cycles), so plain recursion terminates.
+        literal_ty_size_align(t, types)
     } else {
         match t {
             "i1" | "i8" => (1, 1),
@@ -738,35 +902,76 @@ pub fn parse_ll(src: &str) -> Module {
             let rest = rest.trim();
             let (ty, size, bytes) = if rest.starts_with('[') {
                 // array global: "[N x i8] zeroinitializer" / "[N x i8] c\"...\""
+                // / "[N x { ... }] { {...}, {...} }" (array of literal
+                // structs — clang's expanded form for struct arrays)
                 let close = rest.find(']').unwrap();
                 let inner = &rest[1..close]; // e.g. "8 x i8"
                 let mut pit = inner.split('x').map(|s| s.trim());
                 let n: usize = pit.next().unwrap().parse().unwrap();
-                let elem = ty_of(pit.next().unwrap());
-                let size = n * elem.bytes() as usize;
-                // Const (flash) tables may span any number of 256-byte
-                // chunks (up to the 16-bit index space, 65535 bytes — the
-                // device flash bound is enforced later by the assembler);
-                // RAM globals are byte-addressed, so they stay <= 255.
-                if is_const {
-                    assert!(size <= 65535, "irparse: const array @{name} too large ({size} bytes; max 65535)");
+                let elem_str = pit.next().unwrap();
+                if elem_str.starts_with('{') {
+                    // "[N x { ... }] { ... }" — decode each element through
+                    // the literal-struct decoder.
+                    let (es, _) = literal_ty_size_align(elem_str, &types);
+                    let size = n * es as usize;
+                    if is_const {
+                        assert!(size <= 65535, "irparse: const array @{name} too large ({size} bytes; max 65535)");
+                    } else {
+                        assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
+                    }
+                    let size = size as u16;
+                    let init = rest[close + 1..].trim();
+                    let bytes = if init.starts_with("zeroinitializer") {
+                        vec![0u8; size as usize]
+                    } else {
+                        decode_typed_value(&rest[..close + 1], init, &types)
+                    };
+                    (Ty::I8, size, bytes)
                 } else {
-                    assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
+                    let elem = ty_of(elem_str);
+                    let size = n * elem.bytes() as usize;
+                    // Const (flash) tables may span any number of 256-byte
+                    // chunks (up to the 16-bit index space, 65535 bytes — the
+                    // device flash bound is enforced later by the assembler);
+                    // RAM globals are byte-addressed, so they stay <= 255.
+                    if is_const {
+                        assert!(size <= 65535, "irparse: const array @{name} too large ({size} bytes; max 65535)");
+                    } else {
+                        assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
+                    }
+                    let size = size as u16;
+                    let init = rest[close + 1..].trim();
+                    let bytes = if init.starts_with("zeroinitializer") {
+                        vec![0u8; size as usize]
+                    } else if init.starts_with("c\"") {
+                        parse_string_literal(init)
+                    } else if init.starts_with('[') {
+                        // Multi-byte element list — decode elements (LE) into
+                        // the table's byte blob. See parse_array_elements.
+                        parse_array_elements(init, elem)
+                    } else {
+                        panic!("SPIKE LIMIT: array global initializer {init:?}");
+                    };
+                    (elem, size, bytes)
                 }
-                let size = size as u16;
+            } else if rest.starts_with('{') {
+                // Literal struct global: "{ i8, i8, i16 } { i8 65, i8 0, i16 4660 }"
+                // — clang expands named structs to literal types (explicit
+                // padding) whenever a global carries an initializer.
+                let close = brace_inner(rest).expect("literal struct type must be `{ ... }`").len() + 1;
+                let ty_str = &rest[..close + 1];
+                let (size, _) = literal_ty_size_align(ty_str, &types);
+                // The value is everything after the type's closing `}` —
+                // do NOT split on `,` (a brace-list initializer contains
+                // top-level commas; the scalar named-struct branch above
+                // can split because its init is `zeroinitializer, align 2`).
                 let init = rest[close + 1..].trim();
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
-                } else if init.starts_with("c\"") {
-                    parse_string_literal(init)
-                } else if init.starts_with('[') {
-                    // Multi-byte element list — decode elements (LE) into
-                    // the table's byte blob. See parse_array_elements.
-                    parse_array_elements(init, elem)
                 } else {
-                    panic!("SPIKE LIMIT: array global initializer {init:?}");
+                    decode_typed_value(ty_str, init, &types)
                 };
-                (elem, size, bytes)
+                (Ty::I8, size, bytes)
             } else if let Some(struct_tok) = rest.split_whitespace().next().filter(|t| t.starts_with('%')) {
                 // struct global: "%struct.S zeroinitializer, align 2" — size
                 // from the type table, bytes = zeros.
