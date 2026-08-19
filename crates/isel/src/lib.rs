@@ -621,23 +621,77 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Large const table (> 255 bytes) read. The 16-bit GEP index — a
-    /// single scale-1 term (clang: `zext i8 %idx to i16`, then `gep @t +k
-    /// +1*%i`) — splits into the in-chunk index (W) and the chunk bit (hi
-    /// temp, fixed scratch 0x70): `MOVF r_lo,W; ADDLW k+off` sets C on the
-    /// carry into bit 8, and `BTFSC STATUS,0; ADDLW 0x01` folds it into the
-    /// hi byte, so e.g. idx 0x00F0 + k 0x20 -> in-chunk 0x10, hi 1. W is
-    /// restored from the lo temp (0x71, retval_lo — no live retval at a
-    /// const read) and bit 0 of the hi temp selects `__read_<name>` (chunk
-    /// 0) or `__read_<name>_hi` (chunk 1). The read leaves the byte in W,
-    /// exactly like the small-table path. Const-only and multi-term
-    /// 16-bit indices into large tables panic loudly for now.
+    /// Large const table (> 255 bytes) read. The 16-bit GEP index splits
+    /// into the in-chunk index (W) and the chunk number (hi temp, fixed
+    /// scratch 0x70). For up to two chunks the chunk number is a single bit
+    /// tested with `BTFSC 0x70,0` — the exact M10/M13 sequences, kept
+    /// byte-identical so the committed fixtures hold (a 256-byte table
+    /// emits an empty, unreachable chunk 1 the same way). For 3+ chunks
+    /// (issue #8) the hi temp is the full chunk number and a descending
+    /// `scratch >= c` chain selects the reader: `MOVLW 0x100-c; ADDWF
+    /// scratch,W` sets C iff scratch >= c, so testing c = n-1 down to 1 in
+    /// that order branches to the matching entry and falls through to
+    /// chunk 0. W is the in-chunk index; the reader CALL's PCLATH set
+    /// clobbers W, reloaded from the lo temp (0x71, retval_lo — no live
+    /// retval at a const read); the returned byte is parked in the hi temp
+    /// (0x70, dead after the chunk tests) across the restore. The reads
+    /// leave the byte in W, exactly like the small-table path. Const-only
+    /// and multi-term 16-bit indices panic loudly.
     fn emit_const_read_large(&mut self, name: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
             "isel: const index k {k} + off {byte_off} out of byte range"
         );
+        let size = self.global_size(name) as usize;
+        let chunks = (size + 255) / 256; // 256-byte tables: 1 (empty chunk 1)
+        let disp = chunks.max(2); // dispatch shape: bit-0 test or >= c chain
+        // The reader entry for chunk c: `__read_<name>`, `__read_<name>_hi`,
+        // `__read_<name>_hi{c}` — matching the table emitter.
+        let entry = |c: usize| {
+            if c == 0 {
+                format!("__read_{name}")
+            } else if c == 1 {
+                format!("__read_{name}_hi")
+            } else {
+                format!("__read_{name}_hi{c}")
+            }
+        };
+        // `CALL __read_...; MOVWF <hi temp>; restore; MOVF <hi temp>,W;
+        // GOTO l_done` — W holds the in-chunk index (the PCLATH set's
+        // MOVLW clobbers it, reloaded from the lo temp); the returned byte
+        // survives the restore via the hi temp.
+        let mut chunk_call = |g: &mut Self, c: usize, l_done: &str| {
+            let e = entry(c);
+            g.emit(format!("    MOVLW PAGE({e})"));
+            g.emit("    MOVWF PCLATH".to_string());
+            g.emit(format!("    MOVF 0x{:02X}, W", g.retval_lo));
+            g.emit(format!("    CALL {e}"));
+            g.emit(format!("    MOVWF 0x{:02X}", g.scratch));
+            g.emit_pclath_restore(&e);
+            g.emit(format!("    MOVF 0x{:02X}, W", g.scratch));
+            g.emit(format!("    GOTO {l_done}"));
+        };
+        // The 3+ chunk dispatch chain: descending `scratch >= c` tests
+        // (`MOVLW 0x100-c; ADDWF scratch,W` sets C iff scratch >= c). Each
+        // test branches to the c-th chunk's call; the fall-through after the
+        // lowest test is chunk 0's call, and every call lands on `l_done`.
+        let mut emit_chain = |g: &mut Self, l_done: &str| {
+            let mut l_calls: Vec<(String, usize)> = Vec::new();
+            for c in (1..disp).rev() {
+                let l = g.fresh_label();
+                l_calls.push((l.clone(), c));
+                g.emit(format!("    MOVLW 0x{:02X}", 0x100 - c as u16));
+                g.emit(format!("    ADDWF 0x{:02X}, W", g.scratch));
+                g.emit("    BTFSC STATUS, 0".to_string());
+                g.emit(format!("    GOTO {l}"));
+            }
+            chunk_call(g, 0, l_done);
+            for (l, c) in l_calls {
+                g.emit(format!("{l}:"));
+                chunk_call(g, c, l_done);
+            }
+        };
         match terms {
             [(1, r)] => {
                 assert_eq!(
@@ -646,7 +700,6 @@ impl<'m> Gen<'m> {
                     "isel: large-table index %{r} must be a 16-bit reg (clang zexts the byte index)"
                 );
                 let a_lo = self.val_addr(&Val::Reg(r.clone())).direct();
-                let l_hi = self.fresh_label();
                 let l_done = self.fresh_label();
                 // W = lo + k + off; C = carry into bit 8.
                 self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
@@ -656,46 +709,44 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVF 0x{:02X}, W", a_lo + 1));
                 self.emit("    BTFSC STATUS, 0".to_string());
                 self.emit("    ADDLW 0x01".to_string());
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch)); // hi temp (chunk bit)
-                // W = in-chunk index; bit 0 of the hi temp selects the entry.
-                // The GOTO below is intra-function — it must run with the
-                // CALLER's page, so each reader CALL's set comes after it.
-                // The set's MOVLW clobbers W (the index), which is then
-                // reloaded from the lo temp (0x71 — no live retval at a
-                // const read); the returned byte survives the restore via
-                // the hi temp (0x70, dead after the chunk-bit test).
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
-                self.emit(format!("    GOTO {l_hi}"));
-                self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                self.emit("    MOVWF PCLATH".to_string());
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                self.emit(format!("    CALL __read_{name}"));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                self.emit_pclath_restore(&format!("__read_{name}"));
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-                self.emit(format!("    GOTO {l_done}"));
-                self.emit(format!("{l_hi}:"));
-                self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
-                self.emit("    MOVWF PCLATH".to_string());
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                self.emit(format!("    CALL __read_{name}_hi"));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch)); // hi temp (chunk)
+                if disp == 2 {
+                    // M10 exact: bit 0 of the hi temp selects the entry.
+                    let l_hi = self.fresh_label();
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                    self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
+                    self.emit(format!("    GOTO {l_hi}"));
+                    self.emit(format!("    MOVLW PAGE(__read_{name})"));
+                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                    self.emit(format!("    CALL __read_{name}"));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_pclath_restore(&format!("__read_{name}"));
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit(format!("    GOTO {l_done}"));
+                    self.emit(format!("{l_hi}:"));
+                    self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
+                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                    self.emit(format!("    CALL __read_{name}_hi"));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_pclath_restore(&format!("__read_{name}_hi"));
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                } else {
+                    emit_chain(self, &l_done);
+                }
                 self.emit(format!("{l_done}:"));
             }
             [(scale, r)] => {
                 // Multi-byte elements (i16/f32 scale 2, i32/f32 scale 4 —
                 // classic mid-range has no MULLW): byte index = s×idx + k +
-                // off, computed 16-bit style like the scale-1 arm: the lo
-                // byte is left-shifted log2(s) times (one RLF pair doubles
-                // the index, two quadruple it) with each shift's carry
-                // rotated into the hi byte, so after the pairs the hi byte
-                // is `s·idx_lo >> 8` exactly; then `ADDLW kk` folds the
-                // bit-8 carry of the + kk add into it — the chunk bit is hi
-                // bit 0, W the in-chunk index, matching the scale-1 flow
-                // (which, for a 2-chunk table, has idx_hi == 0 in bounds).
+                // off. For a 2-chunk table (idx_hi == 0 in bounds) the lo
+                // byte is shifted and the carry folded — the exact M13
+                // sequence. For 3+ chunks the hi byte participates: the
+                // shift pair accumulated `s*idx_lo >> 8` into the hi temp,
+                // then `s*idx_hi` is added (in bounds
+                // s*idx_hi + (s*idx_lo >> 8) + carry <= 255), so the hi
+                // temp is then the exact chunk number.
                 assert_eq!(
                     self.reg_bytes(r),
                     2,
@@ -706,20 +757,12 @@ impl<'m> Gen<'m> {
                     "isel: large-table element scale {scale} not supported (i16/i32/float only)"
                 );
                 let a_lo = self.val_addr(&Val::Reg(r.clone())).direct();
-                let l_hi = self.fresh_label();
                 let l_done = self.fresh_label();
-                // Pairs = log2(scale): one shift pair doubles the byte
-                // index (scale 2), two quadruple it (scale 4).
                 let pairs = match *scale {
                     2 => 1,
                     4 => 2,
                     _ => unreachable!(),
                 };
-                // lo = idx_lo; hi = 0; shift pair `pairs` times: lo <<= 1,
-                // hi gets the carry, so after all pairs lo = (s·idx_lo) &
-                // 0xFF and hi = (s·idx_lo) >> 8. C is cleared first — RLF
-                // shifts the incoming carry into bit 0, so a stale C would
-                // corrupt the scaled index's low bits.
                 self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
                 self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo)); // lo temp
                 self.emit(format!("    CLRF 0x{:02X}", self.scratch)); // hi temp
@@ -728,36 +771,48 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    RLF 0x{:02X}, F", self.retval_lo));
                     self.emit(format!("    RLF 0x{:02X}, F", self.scratch));
                 }
+                if chunks >= 3 {
+                    // scratch += s*idx_hi (scale ADDWF of idx_hi — one per
+                    // element byte of the scale, e.g. 2 adds for i16).
+                    self.emit(format!("    MOVF 0x{:02X}, W", a_lo + 1));
+                    for _ in 0..*scale {
+                        self.emit(format!("    ADDWF 0x{:02X}, F", self.scratch));
+                    }
+                }
                 // W = lo + kk; C = carry into bit 8.
                 self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                 self.emit(format!("    ADDLW 0x{kk:02X}"));
                 self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
-                // hi += carry; chunk bit = hi bit 0.
+                // hi += carry; the hi temp is the chunk.
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit("    BTFSC STATUS, 0".to_string());
                 self.emit("    ADDLW 0x01".to_string());
                 self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                // W = in-chunk index; bit 0 of the hi temp selects the entry
-                // (identical tail to the scale-1 arm).
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
-                self.emit(format!("    GOTO {l_hi}"));
-                self.emit(format!("    MOVLW PAGE(__read_{name})"));
-                self.emit("    MOVWF PCLATH".to_string());
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                self.emit(format!("    CALL __read_{name}"));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                self.emit_pclath_restore(&format!("__read_{name}"));
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-                self.emit(format!("    GOTO {l_done}"));
-                self.emit(format!("{l_hi}:"));
-                self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
-                self.emit("    MOVWF PCLATH".to_string());
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
-                self.emit(format!("    CALL __read_{name}_hi"));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                if disp == 2 {
+                    // M13 exact: bit 0 of the hi temp selects the entry.
+                    let l_hi = self.fresh_label();
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                    self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
+                    self.emit(format!("    GOTO {l_hi}"));
+                    self.emit(format!("    MOVLW PAGE(__read_{name})"));
+                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                    self.emit(format!("    CALL __read_{name}"));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_pclath_restore(&format!("__read_{name}"));
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit(format!("    GOTO {l_done}"));
+                    self.emit(format!("{l_hi}:"));
+                    self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
+                    self.emit("    MOVWF PCLATH".to_string());
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                    self.emit(format!("    CALL __read_{name}_hi"));
+                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_pclath_restore(&format!("__read_{name}_hi"));
+                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                } else {
+                    emit_chain(self, &l_done);
+                }
                 self.emit(format!("{l_done}:"));
             }
             [] => panic!(
@@ -5126,7 +5181,14 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
         if g.is_const {
             readers.push(format!("__read_{}", g.name));
             if g.bytes.len() >= 256 {
-                readers.push(format!("__read_{}_hi", g.name));
+                let n_chunks = ((g.bytes.len() + 255) / 256).max(2);
+                for c in 1..n_chunks {
+                    readers.push(if c == 1 {
+                        format!("__read_{}_hi", g.name)
+                    } else {
+                        format!("__read_{}_hi{c}", g.name)
+                    });
+                }
             }
         }
     }
@@ -5225,11 +5287,21 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
         let size = g.bytes.len();
         if size >= 256 {
             // Reader entry (6 words), `.align 256`, chunk 0 base at the
-            // aligned address, chunk 1 base exactly +256 later.
+            // aligned address; chunks c >= 1 sit exactly +256c later, and
+            // their reader entries are emitted AFTER the table (6 words
+            // each, in chunk order).
+            let n_chunks = ((size + 255) / 256).max(2);
             let aligned = ((addr + 6) + 255) & !255;
             pages.push((format!("__read_{}", g.name), aligned / 0x800));
-            pages.push((format!("__read_{}_hi", g.name), (aligned + 256) / 0x800));
-            addr = aligned + 256 + (size - 256) + 6;
+            for c in 1..n_chunks {
+                let entry = if c == 1 {
+                    format!("__read_{}_hi", g.name)
+                } else {
+                    format!("__read_{}_hi{c}", g.name)
+                };
+                pages.push((entry, (aligned + 256 * c) / 0x800));
+            }
+            addr = aligned + 256 * (n_chunks - 1) + (size - 256) + 6 * (n_chunks - 1);
         } else {
             // Single table: base sits 6 words (the reader entry) after the
             // section's running address.
@@ -5782,14 +5854,29 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 format!("reader entry of const {}", g.name),
             );
             claim(g.name.clone(), format!("base label of const {}", g.name));
-            if g.bytes.len() >= 256 {
+            // Chunk count matches the emitter: a 256-byte table still emits
+            // the M10 empty chunk 1 + `_hi` reader.
+            let n_chunks = if g.bytes.len() >= 256 {
+                ((g.bytes.len() + 255) / 256).max(2)
+            } else {
+                1
+            };
+            for c in 1..n_chunks {
                 claim(
-                    format!("{}_1", g.name),
-                    format!("chunk-1 label of const {}", g.name),
+                    if c == 1 {
+                        format!("{}_1", g.name)
+                    } else {
+                        format!("{}_{}", g.name, c)
+                    },
+                    format!("chunk-{c} label of const {}", g.name),
                 );
                 claim(
-                    format!("__read_{}_hi", g.name),
-                    format!("chunk-1 reader entry of const {}", g.name),
+                    if c == 1 {
+                        format!("__read_{}_hi", g.name)
+                    } else {
+                        format!("__read_{}_hi{}", g.name, c)
+                    },
+                    format!("chunk-{c} reader entry of const {}", g.name),
                 );
             }
         }
@@ -5802,9 +5889,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             g.name
         );
         let size = g.bytes.len();
+        // Chunks emitted: 256-byte tables keep the M10 empty chunk-1 +
+        // `_hi` reader (the dispatch's bit-0 test references them, and the
+        // old layout is documented); larger tables get ceil(size/256)
+        // chunks.
+        let n_chunks = if size >= 256 { ((size + 255) / 256).max(2) } else { 1 };
         assert!(
-            size <= 511,
-            "isel: const @{} table of {size} bytes exceeds the 511-byte two-chunk bound",
+            size <= 65535,
+            "isel: const @{} table of {size} bytes exceeds the 65535-byte 16-bit index bound",
             g.name
         );
         // `MOVLW HIGH` clobbers W, so the incoming index (W = byte index)
@@ -5821,19 +5913,18 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         if size >= 256 {
             // Chunked table: chunk 0's reader, then `.align 256` (the
             // assembler pads to the next 256-word boundary, so LOW(name) ==
-            // 0), then the `.table` directive, then chunk 0's 256 RETLWs at
-            // `name`, chunk 1's RETLWs at `name_1` immediately after
-            // (name_1 = name + 256, so LOW(name_1) == 0), and only then the
-            // chunk-1 reader entry — AFTER the table. (The entry's computed
-            // goto jumps into the table; the entry instructions are dead
+            // 0), then the `.table` directive, then each chunk's RETLWs at
+            // `name` (chunk 0), `name_1` (chunk 1), `name_2`, ... — every
+            // chunk base is exactly 256 words after the previous, so every
+            // LOW() == 0. The reader entries come AFTER the table — chunk
+            // c's reader at `__read_<name>_hi[c]` (chunk 1 keeps the M10
+            // `_hi` name for fixture stability). (The entries' computed
+            // gotos jump into the table; the entry instructions are dead
             // after MOVWF PCL, so their placement cannot shift the chunks.)
             // A table of exactly 256 bytes gets this branch too (size >=
             // 256): chunk 1 is empty (`name_1:` with no RETLWs, its reader
             // immediately after) and unreachable — every valid index
-            // 0..255 selects chunk 0. The old `> 256` cut sent 256-byte
-            // tables down the single-entry branch, whose `.table` asserts
-            // LOW == 0 for size > 255 — assembly failed unless the layout
-            // happened to be aligned; `.align 256` makes it unconditional.
+            // 0..255 selects chunk 0.
             out.push(format!("__read_{}:", g.name));
             reader(&mut out, &g.name);
             out.push("    .align 256".to_string());
@@ -5842,13 +5933,34 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             for b in &g.bytes[..256] {
                 out.push(format!("    RETLW 0x{b:02X}"));
             }
-            let name_1 = format!("{}_1", g.name);
-            out.push(format!("{name_1}:"));
-            for b in &g.bytes[256..] {
-                out.push(format!("    RETLW 0x{b:02X}"));
+            for c in 1..n_chunks {
+                let start = c * 256;
+                let end = (c + 1) * 256;
+                let chunk_label = if c == 1 {
+                    format!("{}_1", g.name)
+                } else {
+                    format!("{}_{}", g.name, c)
+                };
+                out.push(format!("{chunk_label}:"));
+                for b in &g.bytes[start..end.min(size)] {
+                    out.push(format!("    RETLW 0x{b:02X}"));
+                }
             }
-            out.push(format!("__read_{}_hi:", g.name));
-            reader(&mut out, &name_1);
+            // reader entries after the table
+            for c in 1..n_chunks {
+                let chunk_label = if c == 1 {
+                    format!("{}_1", g.name)
+                } else {
+                    format!("{}_{}", g.name, c)
+                };
+                let entry = if c == 1 {
+                    format!("__read_{}_hi", g.name)
+                } else {
+                    format!("__read_{}_hi{c}", g.name)
+                };
+                out.push(format!("{entry}:"));
+                reader(&mut out, &chunk_label);
+            }
         } else {
             // Single-entry table (<= 255 bytes): `.table` immediately before
             // the base label; the assembler asserts LOW(name) + size <= 0x100.
@@ -5867,8 +5979,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         if size >= 256 {
             addr = (addr + 255) & !255; // `.align 256`
             addr += 256; // chunk 0 RETLWs
-            addr += size - 256; // chunk 1 RETLWs
-            addr += 6; // chunk-1 reader entry
+            addr += size - 256; // chunks 1.. RETLWs
+            addr += 6 * (n_chunks - 1); // chunk reader entries
         } else {
             addr += size; // single-entry RETLWs
         }

@@ -744,10 +744,12 @@ pub fn parse_ll(src: &str) -> Module {
                 let n: usize = pit.next().unwrap().parse().unwrap();
                 let elem = ty_of(pit.next().unwrap());
                 let size = n * elem.bytes() as usize;
-                // Const (flash) tables may span two 256-byte chunks (<= 511
-                // bytes); RAM globals are byte-addressed, so they stay <= 255.
+                // Const (flash) tables may span any number of 256-byte
+                // chunks (up to the 16-bit index space, 65535 bytes — the
+                // device flash bound is enforced later by the assembler);
+                // RAM globals are byte-addressed, so they stay <= 255.
                 if is_const {
-                    assert!(size <= 511, "irparse: const array @{name} too large ({size} bytes; max 511)");
+                    assert!(size <= 65535, "irparse: const array @{name} too large ({size} bytes; max 65535)");
                 } else {
                     assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
                 }

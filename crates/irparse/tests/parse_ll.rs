@@ -846,9 +846,12 @@ fn parses_inttoptr_load() {
     }
 }
 
-// Milestone 10: 16-bit const table sizes. A `[N x i8] constant` table with
-// 256 <= N <= 511 parses (bytes = the literal, size = N); a const table > 511
-// bytes panics loudly; a RAM `[N x i8] global` array keeps N <= 255 (loud).
+// Milestone 10 + issue #8: 16-bit const table sizes. A `[N x i8] constant`
+// table with 256 <= N <= 65535 parses (bytes = the literal, size = N) — the
+// reader generalizes to as many 256-byte chunks as needed (the 511-byte
+// two-chunk bound was the issue-#8 scope limit); a RAM `[N x i8] global`
+// array keeps N <= 255 (loud). The device flash bound is enforced later by
+// the assembler (code + tables must fit `device.flash_words`).
 
 /// Build a `c"..."` literal hex-escaped for the byte pattern
 /// `i -> (i * 37 + 11) & 0xFF` (length `n`), so every byte is distinct-ish
@@ -945,11 +948,38 @@ fn const_array_float_elements_parse_to_le_bytes() {
 }
 
 #[test]
-#[should_panic(expected = "const array @big too large")]
-fn const_array_512_bytes_panics() {
-    let lit = escaped_literal(512);
-    let src = format!("@big = dso_local constant [512 x i8] c\"{lit}\", align 1\n");
-    let _ = parse_ll(&src);
+fn const_array_600_bytes_parses() {
+    // Issue #8: past the old 511-byte two-chunk bound — 600 bytes needs
+    // three 256-byte chunks (chunks 0, 1, 2 covering 0..255, 256..511,
+    // 512..599).
+    let lit = escaped_literal(600);
+    let src = format!("@big = dso_local constant [600 x i8] c\"{lit}\", align 1\n");
+    let m = parse_ll(&src);
+    assert_eq!(m.globals.len(), 1);
+    match &m.globals[0] {
+        Global { name, ty, is_const, size, bytes, addr } => {
+            assert_eq!(name, "big");
+            assert_eq!(*ty, ir::Ty::I8);
+            assert!(*is_const);
+            assert_eq!(*size, 600, "const table size must be the byte count");
+            assert_eq!(bytes.len(), 600, "bytes must be the full literal");
+            assert_eq!(*addr, None);
+        }
+    }
+    assert_eq!(m.globals[0].bytes[511], (511u32.wrapping_mul(37).wrapping_add(11)) as u8, "chunk-boundary byte");
+    assert_eq!(m.globals[0].bytes[512], (512u32.wrapping_mul(37).wrapping_add(11)) as u8, "first byte past the old bound");
+    assert_eq!(m.globals[0].bytes[599], (599u32.wrapping_mul(37).wrapping_add(11)) as u8, "last byte");
+}
+
+#[test]
+fn const_array_65535_bytes_parses() {
+    // The 16-bit index space's ceiling: 256 chunks exactly.
+    let lit = escaped_literal(65535);
+    let src = format!("@big = dso_local constant [65535 x i8] c\"{lit}\", align 1\n");
+    let m = parse_ll(&src);
+    assert_eq!(m.globals.len(), 1);
+    assert_eq!(m.globals[0].size, 65535);
+    assert_eq!(m.globals[0].bytes.len(), 65535);
 }
 
 #[test]
