@@ -763,6 +763,41 @@ define dso_local void @f(i24 %x) {
     let _ = parse_ll(ll);
 }
 
+// Issue #5: by-value struct-element args carry BOTH the byval attr and an
+// inlined GEP (`ptr ... byval(%struct.S) align 2 getelementptr ...`). The
+// inlined-GEP branch must preserve the attr or isel's byval copy is
+// skipped and the callee ABI silently breaks.
+const BYVAL_GEP_ARG: &str = r#"
+%struct.Pair = type { i8, i16 }
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+define dso_local void @take_byval(ptr nocapture noundef readonly byval(%struct.Pair) align 2 %0) local_unnamed_addr #0 {
+  ret void
+}
+define dso_local void @main() local_unnamed_addr #1 {
+  tail call void @take_byval(ptr noundef nonnull byval(%struct.Pair) align 2 getelementptr inbounds nuw (i8, ptr @CARR, i16 4))
+  ret void
+}
+"#;
+
+#[test]
+fn preserves_byval_on_inlined_gep_call_arg() {
+    let m = parse_ll(BYVAL_GEP_ARG);
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    // The inlined GEP is synthesized BEFORE the Call (insts[0] = gep).
+    assert!(matches!(main.blocks[0].insts[0], Inst::Gep(_)), "synth GEP first");
+    match &main.blocks[0].insts[1] {
+        Inst::Call(c) => {
+            assert_eq!(c.func, "take_byval");
+            assert_eq!(c.args.len(), 1);
+            let arg = &c.args[0];
+            assert_eq!(arg.byval, Some(4), "byval(%struct.Pair) -> size 4");
+            assert!(!arg.sret);
+            assert!(matches!(arg.val, Val::Reg(_)), "inlined GEP is synthesized into a reg: {:?}", arg.val);
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
+}
+
 // Fix (4): nonzero const GEP prefix folds into k (regression guard for the
 // latent M5 fix): `getelementptr [4 x i8], ptr @x, i16 1, i16 %2` -> k=4 +
 // term (%2, 1).

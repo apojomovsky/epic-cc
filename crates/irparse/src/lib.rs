@@ -788,7 +788,24 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
         let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
         let n = fresh.reg();
         out.push(Inst::Gep(Gep { dst: n.clone(), base, k, terms }));
-        CallArg { ty, val: Val::Reg(n), byval: None, sret: false }
+        // The attr prefix before the inlined GEP can carry byval/sret
+        // (`ptr ... byval(%struct.S) align 2 getelementptr ...` — clang's
+        // shape for passing a struct element by value). Preserve them or
+        // the callee ABI silently breaks.
+        let mut byval = None;
+        let mut sret = false;
+        for t in tokenize_parens(&a[..gpos]) {
+            if let Some(rest) = t.strip_prefix("byval(") {
+                let inner = rest.trim_end_matches(')');
+                let info = types.get(inner.trim_start_matches('%')).unwrap_or_else(|| {
+                    panic!("irparse: unknown byval type {inner}")
+                });
+                byval = Some(info.size);
+            } else if t.starts_with("sret(") {
+                sret = true;
+            }
+        }
+        CallArg { ty, val: Val::Reg(n), byval, sret }
     } else {
         let toks = tokenize_parens(a);
         let mut ty = None;
