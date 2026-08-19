@@ -29,6 +29,7 @@ on:
 
 permissions:
   contents: read
+  packages: write
 
 jobs:
   test:
@@ -53,7 +54,7 @@ jobs:
           load: true
           tags: epic-cc-ci:latest
           cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain
-          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
       - name: Cache cargo target dir
         uses: actions/cache@v5
@@ -70,4 +71,4 @@ jobs:
           key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Test every workspace crate
-        run: docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/usr/local/cargo epic-cc-ci:latest bash scripts/ci-test.sh
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/ci-test.sh
