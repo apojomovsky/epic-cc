@@ -553,6 +553,151 @@ define dso_local void @main() {
     assert_eq!(m.globals[1].bytes.len(), 6);
 }
 
+// Issue #5: clang -O1 prints const struct globals with EXPANDED literal
+// types (explicit padding) — `{ i8, i8, i16 }` for `struct { char; short }`.
+// The decode must flatten the initializer into the table's byte blob using
+// the same alignment layout as the type table.
+const CONST_STRUCTS: &str = r#"
+%struct.Pair = type { i8, i16 }
+@C1 = dso_local constant { i8, i8, i16 } { i8 65, i8 0, i16 4660 }, align 2
+@C2 = dso_local constant { { i8, i8, i16 }, i8, i8 } { { i8, i8, i16 } { i8 66, i8 0, i16 22136 }, i8 67, i8 0 }, align 2
+@CA = dso_local constant { [3 x i8], i8, i16 } { [3 x i8] c"abc", i8 0, i16 4951 }, align 2
+@CF = dso_local constant { float, i8, i8 } { float 1.500000e+00, i8 81, i8 0 }, align 2
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+@CZ = dso_local constant { i8, i8, i16 } zeroinitializer, align 2
+@gr = dso_local global { i8, i8, i16 } { i8 71, i8 0, i16 0x0102 }, align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_literal_struct_initializers_to_flat_bytes() {
+    let m = parse_ll(CONST_STRUCTS);
+    let g = |n: &str| m.globals.iter().find(|g| g.name == n).unwrap();
+
+    // C1 = { 'A', pad 0, 0x1234 } -> [0x41, 0x00, 0x34, 0x12]
+    let c1 = g("C1");
+    assert!(c1.is_const);
+    assert_eq!(c1.size, 4);
+    assert_eq!(c1.bytes, vec![0x41, 0x00, 0x34, 0x12]);
+
+    // C2 = { { 'B', pad, 0x5678 }, 'C', pad } -> size 6
+    let c2 = g("C2");
+    assert_eq!(c2.size, 6);
+    assert_eq!(c2.bytes, vec![0x42, 0x00, 0x78, 0x56, 0x43, 0x00]);
+
+    // CA = { "abc", pad, 0x1357 } -> size 6
+    let ca = g("CA");
+    assert_eq!(ca.size, 6);
+    assert_eq!(ca.bytes, vec![0x61, 0x62, 0x63, 0x00, 0x57, 0x13]);
+
+    // CF = { 1.5f (0x3FC00000 LE), 'Q', pad } -> size 6
+    let cf = g("CF");
+    assert_eq!(cf.size, 6);
+    assert_eq!(cf.bytes, vec![0x00, 0x00, 0xC0, 0x3F, 0x51, 0x00]);
+
+    // CARR = two { i8, i8, i16 } elements -> size 8, concatenated
+    let carr = g("CARR");
+    assert_eq!(carr.size, 8);
+    assert_eq!(carr.bytes, vec![0x44, 0x00, 0x11, 0x11, 0x45, 0x00, 0x22, 0x22]);
+
+    // zeroinitializer literal struct -> zeros of the layout size
+    let cz = g("CZ");
+    assert_eq!(cz.size, 4);
+    assert_eq!(cz.bytes, vec![0u8; 4]);
+
+    // RAM struct with an initializer keeps the same decode (and is not const)
+    let gr = g("gr");
+    assert!(!gr.is_const);
+    assert_eq!(gr.size, 4);
+    assert_eq!(gr.bytes, vec![0x47, 0x00, 0x02, 0x01]);
+}
+
+// Issue #5 regressions (code review): clang 20.1.8 prints a zero-initialized
+// nested struct field as `{ T } zeroinitializer` inside the parent's brace
+// list, and array-of-literal-struct element types may themselves contain
+// array fields (`[2 x { [2 x { i8, i8, i16 }], i8, i8 }]`). Both shapes must
+// decode, not panic.
+const CONST_STRUCT_REGRESSIONS: &str = r#"
+@W = dso_local constant { { i8, i8, i16 }, i8, i8 } { { i8, i8, i16 } zeroinitializer, i8 120, i8 0 }, align 2
+@O2 = dso_local constant [2 x { [2 x { i8, i8, i16 }], i8, i8 }] [{ [2 x { i8, i8, i16 }], i8, i8 } { [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 1, i8 0, i16 2 }, { i8, i8, i16 } { i8 3, i8 0, i16 4 }], i8 97, i8 0 }, { [2 x { i8, i8, i16 }], i8, i8 } { [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 5, i8 0, i16 6 }, { i8, i8, i16 } { i8 7, i8 0, i16 8 }], i8 98, i8 0 }], align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_nested_zeroinit_and_array_field_structs() {
+    let m = parse_ll(CONST_STRUCT_REGRESSIONS);
+    let g = |n: &str| m.globals.iter().find(|g| g.name == n).unwrap();
+
+    // W = { { 0, 0 }, 'x', pad } — nested Pair zeroinitializer, size 6
+    let w = g("W");
+    assert_eq!(w.size, 6);
+    assert_eq!(w.bytes, vec![0x00, 0x00, 0x00, 0x00, 0x78, 0x00]);
+
+    // O2 = two elements; each { Pair[2], 'a'/'b', pad } — size 10 each.
+    // Element 0: Pairs (1,2),(3,4) then 'a'; element 1: (5,6),(7,8) then 'b'.
+    let o2 = g("O2");
+    assert_eq!(o2.size, 20);
+    let mut expect = Vec::new();
+    for e in [&[1u8, 0, 2, 0, 3, 0, 4, 0][..], &[5, 0, 6, 0, 7, 0, 8, 0]] {
+        expect.extend_from_slice(e);
+        expect.push(if e[0] == 1 { b'a' } else { b'b' });
+        expect.push(0);
+    }
+    assert_eq!(o2.bytes, expect);
+}
+
+// Issue #5: clang -O1 lowers `&CARR[i]` on a const struct array to
+// `getelementptr [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i` — the index
+// after an array-of-struct descent is the ELEMENT selector, striding by
+// sizeof(%struct.Pair). Field offsets ride as separate i8-offset GEPs, so
+// no further struct descent is needed.
+const STRUCT_ARRAY_GEP: &str = r#"
+%struct.Pair = type { i8, i16 }
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+define dso_local void @main(i16 %i) {
+  %p = getelementptr inbounds nuw [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i
+  ret void
+}
+"#;
+
+#[test]
+fn folds_struct_array_element_gep_to_struct_stride() {
+    let m = parse_ll(STRUCT_ARRAY_GEP);
+    let body = &m.funcs[0].blocks[0].insts;
+    match &body[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("CARR".to_string()));
+            assert_eq!(g.k, 0);
+            assert_eq!(g.terms, vec![(4, "i".to_string())], "element stride = sizeof(%struct.Pair) = 4");
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
+#[test]
+fn folds_struct_array_constant_element_gep_to_byte_offset() {
+    let ll = r#"
+%struct.Pair = type { i8, i16 }
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+define dso_local void @main() {
+  %p = getelementptr inbounds nuw [2 x %struct.Pair], ptr @CARR, i16 0, i16 1
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    match &m.funcs[0].blocks[0].insts[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.k, 4, "constant element 1 -> byte offset 4");
+            assert!(g.terms.is_empty());
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
 // s8: chained multi-index GEP with an inlined base GEP (dynamic struct-array).
 const CHAINED: &str = r#"
 %struct.A = type { i8, [4 x i8] }
@@ -652,6 +797,41 @@ define dso_local void @f(i24 %x) {
 }
 "#;
     let _ = parse_ll(ll);
+}
+
+// Issue #5: by-value struct-element args carry BOTH the byval attr and an
+// inlined GEP (`ptr ... byval(%struct.S) align 2 getelementptr ...`). The
+// inlined-GEP branch must preserve the attr or isel's byval copy is
+// skipped and the callee ABI silently breaks.
+const BYVAL_GEP_ARG: &str = r#"
+%struct.Pair = type { i8, i16 }
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+define dso_local void @take_byval(ptr nocapture noundef readonly byval(%struct.Pair) align 2 %0) local_unnamed_addr #0 {
+  ret void
+}
+define dso_local void @main() local_unnamed_addr #1 {
+  tail call void @take_byval(ptr noundef nonnull byval(%struct.Pair) align 2 getelementptr inbounds nuw (i8, ptr @CARR, i16 4))
+  ret void
+}
+"#;
+
+#[test]
+fn preserves_byval_on_inlined_gep_call_arg() {
+    let m = parse_ll(BYVAL_GEP_ARG);
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    // The inlined GEP is synthesized BEFORE the Call (insts[0] = gep).
+    assert!(matches!(main.blocks[0].insts[0], Inst::Gep(_)), "synth GEP first");
+    match &main.blocks[0].insts[1] {
+        Inst::Call(c) => {
+            assert_eq!(c.func, "take_byval");
+            assert_eq!(c.args.len(), 1);
+            let arg = &c.args[0];
+            assert_eq!(arg.byval, Some(4), "byval(%struct.Pair) -> size 4");
+            assert!(!arg.sret);
+            assert!(matches!(arg.val, Val::Reg(_)), "inlined GEP is synthesized into a reg: {:?}", arg.val);
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
 }
 
 // Fix (4): nonzero const GEP prefix folds into k (regression guard for the
