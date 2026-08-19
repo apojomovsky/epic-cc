@@ -1119,7 +1119,7 @@ impl Pic18 {
     /// registers actually live at (`0xFD9-0xFEF`) — never against the raw
     /// `f` byte in isolation. `f`'s low byte alone is ambiguous: a
     /// `BSR`-banked (`a=1`) ordinary GPR access can have a low byte that
-    /// coincidentally equals e.g. `0xE1` (FSR1L) while its real physical
+    /// coincidentally equals e.g. `0xE7` (INDF1) while its real physical
     /// address (`BSR<<8 | f`) lands nowhere near the SFR page — matching on
     /// raw `f` treated every such GPR write as an indirect-register access
     /// instead, corrupting unrelated FSRs and, once `cur`/`W` combined into
@@ -1150,7 +1150,16 @@ impl Pic18 {
         let lo_addr = 0xF00 + fsrn_lo;
         let hi_addr = 0xF00 + fsrn_hi;
         let cur = ((self.ram[hi_addr] as u16) << 8) | self.ram[lo_addr] as u16;
-        match f {
+        // Dispatch on `(phys & 0xFF) as u16`, not the raw `f` byte, for
+        // consistency with the arm-selection `match` just above — the two
+        // are provably equal on every path that reaches here today (the
+        // `phys < 0xF00` return above already filters out any case where
+        // they'd diverge), but matching the same derived value the arm
+        // selection uses keeps that invariant local and structural instead
+        // of a fact this function has to independently stay true to, and
+        // avoids a latent trap if the `phys < 0xF00` gate above is ever
+        // loosened.
+        match (phys & 0xFF) as u16 {
             _ if f == indf => cur as usize,
             _ if f == postinc => {
                 let next = cur.wrapping_add(1);
