@@ -2686,7 +2686,10 @@ impl<'m> Gen<'m> {
     /// exponent into `exp`, and the 24-bit mantissa with the implicit bit
     /// into `mant`..`mant+2`. A zero exponent means the value is +/-0 (or a
     /// denormal — treated as 0): the mantissa clears. `flip` XORs the sign
-    /// (__sub_f32).
+    /// (__sub_f32). A DENORMAL (exp 0, nonzero fraction) keeps its fraction
+    /// WITHOUT the implicit bit (issue #11) — the old code cleared the
+    /// whole mantissa, so denormal + denormal summed to 0 instead of the
+    /// denormal sum.
     fn emit_f32_extract(&mut self, slot: u16, sign: u16, exp: u16, mant: u16, flip: bool) {
         self.emit(format!("    MOVF 0x{:02X}, W", slot + 3));
         self.emit("    ANDLW 0x80".to_string());
@@ -2702,28 +2705,38 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLF 0x{exp:02X}, F"));
         self.emit(format!("    BTFSC 0x{:02X}, 7", slot + 2));
         self.emit(format!("    BSF 0x{exp:02X}, 0"));
-        // mant = b0, b1, (b2 & 0x7F) | 0x80
+        // mant = b0, b1, (b2 & 0x7F) | 0x80 (the implicit bit — except for
+        // a denormal, exp 0, which has no implicit bit).
         self.emit(format!("    MOVF 0x{:02X}, W", slot));
         self.emit(format!("    MOVWF 0x{:02X}", mant));
         self.emit(format!("    MOVF 0x{:02X}, W", slot + 1));
         self.emit(format!("    MOVWF 0x{:02X}", mant + 1));
-        self.emit(format!("    MOVF 0x{:02X}, W", slot + 2));
-        self.emit("    ANDLW 0x7F".to_string());
-        self.emit("    IORLW 0x80".to_string());
+        self.emit_f32_mant_hi(slot);
         self.emit(format!("    MOVWF 0x{:02X}", mant + 2));
-        // exp == 0 -> no implicit bit (the value is +/-0).
-        let l_nz = self.fresh_label();
+        // A denormal (exp 0, fraction nonzero) aligns at the exp-1 scale:
+        // its value is frac x 2^-149 = frac x 2^(1-127-23), so the
+        // alignment treats it as exp 1 with the raw fraction (no implicit
+        // bit). ±0 (exp 0, fraction 0) stays exp 0.
+        let l_den = self.fresh_label();
+        let l_den_done = self.fresh_label();
         self.emit(format!("    MOVF 0x{exp:02X}, W"));
         self.emit("    BTFSS STATUS, 2".to_string());
-        self.emit(format!("    GOTO {l_nz}"));
-        self.emit(format!("    CLRF 0x{:02X}", mant));
-        self.emit(format!("    CLRF 0x{:02X}", mant + 1));
-        self.emit(format!("    CLRF 0x{:02X}", mant + 2));
-        self.emit(format!("{l_nz}:"));
+        self.emit(format!("    GOTO {l_den_done}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", mant));
+        self.emit(format!("    IORWF 0x{:02X}, W", mant + 1));
+        self.emit(format!("    IORWF 0x{:02X}, W", mant + 2));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_den_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    MOVWF 0x{exp:02X}"));
+        self.emit(format!("{l_den_done}:"));
     }
 
     /// RNE round-up: mantissa += 1 across the 3 bytes; on a 24-bit carry the
-    /// mantissa renormalizes to 0x800000 with `e += 1`.
+    /// mantissa renormalizes to 0x800000 with `e += 1`. The carry can only
+    /// fire on a full mantissa (m2 == 0xFF, top bit set — a normal), so at
+    /// e == 1 it renormalizes into e == 2 (the smallest-normal binade),
+    /// which is correct: 0xFFFFFF x 2^-149 + half-ulp rounds to 2^-125.
     fn emit_f32_round_up(&mut self, m0: u16, m1: u16, m2: u16, e: u16) {
         let l_renorm = self.fresh_label();
         let l_done = self.fresh_label();
@@ -2762,6 +2775,60 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{:02X}", r + 3));
         self.emit("    BCF STATUS, 0".to_string());
         self.emit(format!("    RRF 0x{:02X}, F", r + 3));
+        self.emit(format!("    BTFSC 0x{sign:02X}, 7"));
+        self.emit(format!("    BSF 0x{:02X}, 7", r + 3));
+        self.emit("    RETURN".to_string());
+    }
+
+    /// Load `slot+2`'s fraction into W and OR the implicit bit unless the
+    /// operand is a denormal (full 8-bit exponent 0 — no implicit bit,
+    /// issue #11). The caller stores W into the mantissa's high byte.
+    fn emit_f32_mant_hi(&mut self, slot: u16) {
+        let l_imp = self.fresh_label();
+        let l_done = self.fresh_label();
+        // denormal check: exp 0 = (b3 & 0x7F) == 0 && !(b2 bit 7)
+        self.emit(format!("    MOVF 0x{:02X}, W", slot + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_imp}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", slot + 2));
+        self.emit(format!("    GOTO {l_imp}"));
+        // exp 0 (denormal): fraction only, no implicit bit.
+        self.emit(format!("    MOVF 0x{:02X}, W", slot + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    GOTO {l_done}"));
+        self.emit(format!("{l_imp}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", slot + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    IORLW 0x80".to_string());
+        self.emit(format!("{l_done}:"));
+    }
+
+    /// Emit the fixed quiet-NaN result (0x7FC00000 | sign) and RETURN.
+    /// The sign is the caller's computed result sign (IEEE leaves the NaN
+    /// sign unspecified; the class is what matters).
+    fn emit_f32_nan(&mut self, sign: u16) {
+        let r = self.retval_lo;
+        self.emit(format!("    CLRF 0x{:02X}", r));
+        self.emit(format!("    CLRF 0x{:02X}", r + 1));
+        self.emit("    MOVLW 0xC0".to_string());
+        self.emit(format!("    MOVWF 0x{:02X}", r + 2));
+        self.emit("    MOVLW 0x7F".to_string());
+        self.emit(format!("    MOVWF 0x{:02X}", r + 3));
+        self.emit(format!("    BTFSC 0x{sign:02X}, 7"));
+        self.emit(format!("    BSF 0x{:02X}, 7", r + 3));
+        self.emit("    RETURN".to_string());
+    }
+
+    /// Emit the fixed infinity result (0x7F800000 | sign) and RETURN.
+    fn emit_f32_inf(&mut self, sign: u16) {
+        let r = self.retval_lo;
+        self.emit(format!("    CLRF 0x{:02X}", r));
+        self.emit(format!("    CLRF 0x{:02X}", r + 1));
+        self.emit("    MOVLW 0x80".to_string());
+        self.emit(format!("    MOVWF 0x{:02X}", r + 2));
+        self.emit("    MOVLW 0x7F".to_string());
+        self.emit(format!("    MOVWF 0x{:02X}", r + 3));
         self.emit(format!("    BTFSC 0x{sign:02X}, 7"));
         self.emit(format!("    BSF 0x{:02X}, 7", r + 3));
         self.emit("    RETURN".to_string());
@@ -2829,6 +2896,78 @@ impl<'m> Gen<'m> {
         let l_assemble = self.fresh_label();
         let l_zs_clear = self.fresh_label();
         let l_zs_done = self.fresh_label();
+        let l_nan = self.fresh_label();
+        let l_inf = self.fresh_label();
+        let l_a_not_inf = self.fresh_label();
+        let l_b_not_inf = self.fresh_label();
+        let l_a_nan_done = self.fresh_label();
+        let l_b_nan_done = self.fresh_label();
+        let l_inf_done = self.fresh_label();
+        // ---- IEEE specials (issue #11): NaN and infinity operands ----
+        // NaN a: exp 0xFF (ea == 0xFF) && FRACTION nonzero (the extracted
+        // mantissa carries the implicit bit, so inf's 0x800000 must not
+        // read as a NaN — test ma2 & 0x7F | ma1 | ma0). `cnt` is dead at
+        // this point (the alignment sets it later).
+        self.emit(format!("    MOVF 0x{ea:02X}, W"));
+        self.emit("    SUBLW 0xFF".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_nan_done}"));
+        self.emit(format!("    MOVF 0x{ma0:02X}, W"));
+        self.emit(format!("    IORWF 0x{ma1:02X}, W"));
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("    MOVF 0x{ma2:02X}, W"));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{cnt:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_a_nan_done}:"));
+        // NaN b
+        self.emit(format!("    MOVF 0x{eb:02X}, W"));
+        self.emit("    SUBLW 0xFF".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_nan_done}"));
+        self.emit(format!("    MOVF 0x{mb0:02X}, W"));
+        self.emit(format!("    IORWF 0x{mb1:02X}, W"));
+        self.emit(format!("    MOVWF 0x{cnt:02X}"));
+        self.emit(format!("    MOVF 0x{mb2:02X}, W"));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{cnt:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_b_nan_done}:"));
+        // inf a? (exp 0xFF, mantissa 0 — the NaN checks above already
+        // routed mantissa-nonzero exp-0xFF operands to l_nan).
+        self.emit(format!("    MOVF 0x{ea:02X}, W"));
+        self.emit("    SUBLW 0xFF".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_not_inf}"));
+        // a is inf: b inf? both inf -> same sign inf, opposite NaN.
+        self.emit(format!("    MOVF 0x{eb:02X}, W"));
+        self.emit("    SUBLW 0xFF".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_not_inf}"));
+        self.emit(format!("    MOVF 0x{sa:02X}, W"));
+        self.emit(format!("    XORWF 0x{sb:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("{l_b_not_inf}:"));
+        // a inf, b finite: result inf (a's sign).
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("{l_a_not_inf}:"));
+        // a finite: b inf? result inf (b's sign).
+        self.emit(format!("    MOVF 0x{eb:02X}, W"));
+        self.emit("    SUBLW 0xFF".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_inf_done}"));
+        self.emit(format!("    MOVF 0x{sb:02X}, W"));
+        self.emit(format!("    MOVWF 0x{sa:02X}"));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("{l_inf}:"));
+        self.emit_f32_inf(sa);
+        self.emit(format!("{l_nan}:"));
+        self.emit_f32_nan(sa);
+        self.emit(format!("{l_inf_done}:"));
         // ---- zero operand handling ----
         self.emit(format!("    MOVF 0x{ma0:02X}, W"));
         self.emit(format!("    IORWF 0x{ma1:02X}, W"));
@@ -3038,17 +3177,22 @@ impl<'m> Gen<'m> {
         self.emit(format!("    INCFSZ 0x{mb2:02X}, W"));
         self.emit(format!("    SUBWF 0x{ma2:02X}, F"));
         self.emit(format!("    GOTO {l_normalize}"));
-        // ---- normalize the 6-byte value: while !(ma2 bit 7) && ea > 0:
+        // ---- normalize the 6-byte value: while !(ma2 bit 7) && ea > 1:
         //      (ta:ma) <<= 1 (the fraction's bits move into the mantissa),
         //      ea--. Only the subtract path reaches this (a sum never
-        //      normalizes). ----
+        //      normalizes). The loop stops at ea == 1, NOT 0: a denormal
+        //      result is the raw fraction at the exp-1 scale (value =
+        //      frac x 2^-149), and the denormal conversion below drops it
+        //      to exp 0. Stopping at 0 would leave ma = 2 x frac, doubling
+        //      the stored value. ----
         self.emit(format!("{l_normalize}:"));
         self.emit(format!("    MOVF 0x{ma2:02X}, W"));
         self.emit("    ANDLW 0x80".to_string());
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_sub_guard}"));
         self.emit(format!("    MOVF 0x{ea:02X}, W"));
-        self.emit("    BTFSC STATUS, 2".to_string()); // ea == 0 -> stop
+        self.emit("    SUBLW 0x01".to_string()); // ea == 1 -> stop
+        self.emit("    BTFSC STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_sub_guard}"));
         self.emit("    BCF STATUS, 0".to_string());
         self.emit(format!("    RLF 0x{ta0:02X}, F"));
@@ -3071,9 +3215,19 @@ impl<'m> Gen<'m> {
         //      OR) — the add path's round/sticky are equivalent (round =
         //      ta2 bit 7 = the last shifted-out bit; a sum carry promotes
         //      the old round into stick bit 1). ----
+        // ---- denormal result: exp 1 with the top mantissa bit clear (the
+        //      sum/difference of denormals, or a normal that underflowed)
+        //      converts to exp 0 — the mantissa is already the raw
+        //      fraction (no implicit bit), and the assemble emits it as-is
+        //      for e == 0. A rounded-up 0x800000 (the smallest normal)
+        //      keeps exp 1. Both paths reach here: the add path directly
+        //      (a denormal sum never normalizes), the sub path after its
+        //      normalize loop stops at ea == 1. ----
+        let l_den_conv = self.fresh_label();
+        let l_den_done = self.fresh_label();
         self.emit(format!("{l_round_step}:"));
         self.emit(format!("    BTFSS 0x{stick:02X}, 0"));
-        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    GOTO {l_den_conv}"));
         self.emit(format!("    MOVF 0x{ta0:02X}, W"));
         self.emit(format!("    IORWF 0x{ta1:02X}, W"));
         self.emit(format!("    IORWF 0x{ta2:02X}, W"));
@@ -3084,9 +3238,20 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_round_up}"));
         self.emit(format!("    BTFSC 0x{ma0:02X}, 0"));
         self.emit(format!("    GOTO {l_round_up}"));
-        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    GOTO {l_den_conv}"));
         self.emit(format!("{l_round_up}:"));
         self.emit_f32_round_up(ma0, ma1, ma2, ea);
+        self.emit(format!("{l_den_conv}:"));
+        self.emit(format!("    MOVF 0x{ma2:02X}, W"));
+        self.emit("    ANDLW 0x80".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_den_done}"));
+        self.emit(format!("    MOVF 0x{ea:02X}, W"));
+        self.emit("    SUBLW 0x01".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_den_done}"));
+        self.emit(format!("    CLRF 0x{ea:02X}"));
+        self.emit(format!("{l_den_done}:"));
         self.emit(format!("{l_assemble}:"));
         self.emit_f32_assemble(sa, ea, ma0, ma1, ma2);
         // ---- zero result: sign = sa & sb, exp 0, mantissa 0 ----
@@ -3124,15 +3289,35 @@ impl<'m> Gen<'m> {
         let l_loop = self.fresh_label();
         let l_skip = self.fresh_label();
         let l_renorm = self.fresh_label();
+        let l_norm_check = self.fresh_label();
+        let l_norm_left = self.fresh_label();
+        let l_norm_left_shift = self.fresh_label();
+        let l_norm_right = self.fresh_label();
+        let l_extract = self.fresh_label();
+        let l_den_conv = self.fresh_label();
         let l_round_up = self.fresh_label();
         let l_assemble = self.fresh_label();
         let l_carry_in = self.fresh_label();
         let l_no_carry = self.fresh_label();
         let l_ehi_c1clear = self.fresh_label();
         let l_ehi_done = self.fresh_label();
+        let l_a_exp_done = self.fresh_label();
+        let l_b_exp_done = self.fresh_label();
         let l_a_nz = self.fresh_label();
         let l_b_nz = self.fresh_label();
+        let l_a_not_ff = self.fresh_label();
+        let l_a_inf = self.fresh_label();
+        let l_b_not_ff = self.fresh_label();
+        let l_b_inf = self.fresh_label();
+        let l_a_inf_b_finite = self.fresh_label();
+        let l_b_inf_a_finite = self.fresh_label();
+        let l_a_mant_implicit = self.fresh_label();
+        let l_a_mant_done = self.fresh_label();
+        let l_b_mant_implicit = self.fresh_label();
+        let l_b_mant_done = self.fresh_label();
         let l_zero = self.fresh_label();
+        let l_nan = self.fresh_label();
+        let l_inf = self.fresh_label();
         // sign = (a3 ^ b3) & 0x80
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
         self.emit(format!("    XORWF 0x{:02X}, W", pb + 3));
@@ -3155,6 +3340,39 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLF 0x{low1:02X}, F"));
         self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
         self.emit(format!("    BSF 0x{low1:02X}, 0")); // eb8
+        // A nonzero exp-zero operand aligns at exp 1 with its raw fraction.
+        self.emit(format!("    MOVF 0x{low0:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_exp_done}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 1));
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_exp_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    MOVWF 0x{low0:02X}"));
+        self.emit(format!("{l_a_exp_done}:"));
+        self.emit(format!("    MOVF 0x{low1:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_exp_done}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_exp_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    MOVWF 0x{low1:02X}"));
+        self.emit(format!("{l_b_exp_done}:"));
         self.emit(format!("    MOVF 0x{low1:02X}, W"));
         self.emit(format!("    ADDWF 0x{low0:02X}, W"));
         self.emit(format!("    MOVWF 0x{low0:02X}"));
@@ -3176,15 +3394,119 @@ impl<'m> Gen<'m> {
         self.emit("    MOVLW 0xFF".to_string());
         self.emit(format!("{l_ehi_done}:"));
         self.emit(format!("    MOVWF 0x{:02X}", e + 1));
-        // Either operand zero (full 8-bit exponent == 0) -> +/-0 (the sign
-        // XOR); the mantissa math would otherwise give the zero exponent a
-        // garbage result. Tested on the raw bytes BEFORE the addend build
-        // (the implicit-bit OR would mask the zero).
+        // NaN and infinity classification uses the raw exponent/fraction.
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    XORLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_not_ff}"));
+        self.emit(format!("    BTFSS 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_a_not_ff}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa));
+        self.emit(format!("    IORWF 0x{:02X}, W", pa + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_inf}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_a_not_ff}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    XORLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_not_ff}"));
+        self.emit(format!("    BTFSS 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_b_not_ff}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_inf}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_a_inf}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    XORLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_inf_b_finite}"));
+        self.emit(format!("    BTFSS 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_a_inf_b_finite}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("{l_a_inf_b_finite}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_b_inf}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_inf_a_finite}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_b_inf_a_finite}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa));
+        self.emit(format!("    IORWF 0x{:02X}, W", pa + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_b_inf_a_finite}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa));
+        self.emit(format!("    IORWF 0x{:02X}, W", pa + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_b_not_ff}:"));
+        // Finite zero operands produce signed zero; check the complete raw
+        // fraction so denormals are not mistaken for zero.
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
         self.emit("    ANDLW 0x7F".to_string());
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_a_nz}"));
-        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa));
+        self.emit(format!("    IORWF 0x{:02X}, W", pa + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_a_nz}"));
         self.emit(format!("    GOTO {l_zero}"));
         self.emit(format!("{l_a_nz}:"));
@@ -3192,15 +3514,39 @@ impl<'m> Gen<'m> {
         self.emit("    ANDLW 0x7F".to_string());
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_b_nz}"));
-        self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{low2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{low2:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_b_nz}"));
         self.emit(format!("    GOTO {l_zero}"));
+        self.emit(format!("{l_nan}:"));
+        self.emit_f32_nan(sign);
+        self.emit(format!("{l_inf}:"));
+        self.emit_f32_inf(sign);
         self.emit(format!("{l_b_nz}:"));
-        // addend = ma in the a param slot: pa2 = (pa2 & 0x7F) | 0x80
+        // Normal operands receive the implicit bit; denormals retain raw
+        // fractions (their exponents were bumped to one above).
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_mant_implicit}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_a_mant_implicit}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    MOVWF 0x{:02X}", pa + 2));
+        self.emit(format!("    GOTO {l_a_mant_done}"));
+        self.emit(format!("{l_a_mant_implicit}:"));
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
         self.emit("    ANDLW 0x7F".to_string());
         self.emit("    IORLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{:02X}", pa + 2));
+        self.emit(format!("{l_a_mant_done}:"));
+        // bk = mb copy (the multiplier, shifted to test bits)
         // bk = mb copy (the multiplier, shifted to test bits)
         self.emit(format!("    MOVF 0x{:02X}, W", pb));
         self.emit(format!("    MOVWF 0x{bk0:02X}"));
@@ -3208,8 +3554,20 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{bk1:02X}"));
         self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
         self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    MOVWF 0x{bk2:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_mant_implicit}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_b_mant_implicit}"));
+        self.emit(format!("    GOTO {l_b_mant_done}"));
+        self.emit(format!("{l_b_mant_implicit}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
         self.emit("    IORLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{bk2:02X}"));
+        self.emit(format!("{l_b_mant_done}:"));
         // la = the low-part addend, maintained as la_{i+1} = (la_i >> 1) |
         // (ma bit i << 22) — the correct low contribution (ma mod 2^i) <<
         // (23-i) at iteration i (testing mb bit 23-i). Starts at 0 (i=0:
@@ -3298,24 +3656,20 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RRF 0x{:02X}, F", pa));
         self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
         self.emit(format!("    GOTO {l_loop}"));
-        // bit 47 of the product (m3 bit 0) set -> renorm (exp+1)
+        // Convert the product into a unified 47-bit register. A renormalized
+        // product already has the correct scale after m >>= 1; otherwise the
+        // leading zero m3 is dropped by shifting P left once.
         self.emit(format!("    BTFSC 0x{m3:02X}, 0"));
         self.emit(format!("    GOTO {l_renorm}"));
-        // no renorm: guard = P bit 22 (low2 bit 6), sticky = low & 0x3FFFFF
-        self.emit(format!("    BTFSS 0x{low2:02X}, 6"));
-        self.emit(format!("    GOTO {l_assemble}"));
-        self.emit(format!("    MOVF 0x{low0:02X}, W"));
-        self.emit(format!("    IORWF 0x{low1:02X}, W"));
-        self.emit(format!("    IORWF 0x{low2:02X}, W"));
-        self.emit("    ANDLW 0x3F".to_string());
-        self.emit("    BTFSS STATUS, 2".to_string());
-        self.emit(format!("    GOTO {l_round_up}"));
-        self.emit(format!("    BTFSC 0x{m0:02X}, 0"));
-        self.emit(format!("    GOTO {l_round_up}"));
-        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit("    BCF STATUS, 0".to_string());
+        // The m bytes already occupy P bits 46..23; shift only the low
+        // 23-bit portion so P bit 22 becomes the unified guard bit.
+        self.emit(format!("    RLF 0x{low0:02X}, F"));
+        self.emit(format!("    RLF 0x{low1:02X}, F"));
+        self.emit(format!("    RLF 0x{low2:02X}, F"));
+        self.emit(format!("    GOTO {l_norm_check}"));
         self.emit(format!("{l_renorm}:"));
-        // mantissa = m >> 1 (bit 24 -> bit 23); guard = old m bit 0 (stashed
-        // in low2 bit 7); sticky = low (bits 22..0) nonzero; e += 1
+        // m >>= 1; the old m bit 0 is the unified register's guard bit.
         self.emit("    BCF STATUS, 0".to_string());
         self.emit(format!("    BTFSC 0x{m3:02X}, 0"));
         self.emit("    BSF STATUS, 0".to_string());
@@ -3327,23 +3681,87 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BSF 0x{low2:02X}, 7"));
         self.emit("    MOVLW 0x01".to_string());
         self.emit(format!("    ADDWF 0x{e:02X}, F"));
+        self.emit(format!("{l_norm_check}:"));
+        // First handle e < 1 (including the negative 16-bit exponents of
+        // tiny products), then left-normalize while e > 1.
+        self.emit(format!("    BTFSC 0x{:02X}, 7", e + 1));
+        self.emit(format!("    GOTO {l_norm_right}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", e + 1));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_norm_left}"));
+        self.emit(format!("    MOVF 0x{e:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_norm_right}"));
+        self.emit(format!("    GOTO {l_norm_left}"));
+        self.emit(format!("{l_norm_left}:"));
+        self.emit(format!("    BTFSC 0x{m2:02X}, 7"));
+        self.emit(format!("    GOTO {l_extract}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", e + 1));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_norm_left_shift}"));
+        self.emit(format!("    MOVF 0x{e:02X}, W"));
+        self.emit("    SUBLW 0x01".to_string());
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_extract}"));
+        self.emit(format!("{l_norm_left_shift}:"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RLF 0x{low0:02X}, F"));
+        self.emit(format!("    RLF 0x{low1:02X}, F"));
+        self.emit(format!("    RLF 0x{low2:02X}, F"));
+        self.emit(format!("    RLF 0x{m0:02X}, F"));
+        self.emit(format!("    RLF 0x{m1:02X}, F"));
+        self.emit(format!("    RLF 0x{m2:02X}, F"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{e:02X}, F"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_norm_check}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{:02X}, F", e + 1));
+        self.emit(format!("    GOTO {l_norm_check}"));
+        self.emit(format!("{l_norm_right}:"));
+        self.emit(format!("    BTFSC 0x{low0:02X}, 0"));
+        self.emit(format!("    BSF 0x{m3:02X}, 1"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RRF 0x{m2:02X}, F"));
+        self.emit(format!("    RRF 0x{m1:02X}, F"));
+        self.emit(format!("    RRF 0x{m0:02X}, F"));
+        self.emit(format!("    RRF 0x{low2:02X}, F"));
+        self.emit(format!("    RRF 0x{low1:02X}, F"));
+        self.emit(format!("    RRF 0x{low0:02X}, F"));
+        self.emit(format!("    INCF 0x{e:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{:02X}, F", e + 1));
+        self.emit(format!("    GOTO {l_norm_check}"));
+        self.emit(format!("{l_extract}:"));
+        // guard = unified bit 23; sticky = unified bits 0..22 plus any bits
+        // shifted out while producing a denormal.
         self.emit(format!("    BTFSS 0x{low2:02X}, 7"));
-        self.emit(format!("    GOTO {l_assemble}"));
-        // sticky = low bits 22..0 = (low2 & 0x7F) | low1 | low0 (the mask
-        // must keep bit 6 — P bit 22 — a lone 0x40 low would otherwise read
-        // sticky 0 and tie-to-even instead of round up; the M15 probe's
-        // renorm-path verdict).
+        self.emit(format!("    GOTO {l_den_conv}"));
         self.emit("    MOVLW 0x7F".to_string());
         self.emit(format!("    ANDWF 0x{low2:02X}, W"));
         self.emit(format!("    IORWF 0x{low1:02X}, W"));
         self.emit(format!("    IORWF 0x{low0:02X}, W"));
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_round_up}"));
+        self.emit(format!("    BTFSC 0x{m3:02X}, 1"));
+        self.emit(format!("    GOTO {l_round_up}"));
         self.emit(format!("    BTFSC 0x{m0:02X}, 0"));
         self.emit(format!("    GOTO {l_round_up}"));
         self.emit(format!("    GOTO {l_assemble}"));
         self.emit(format!("{l_round_up}:"));
         self.emit_f32_round_up(m0, m1, m2, e);
+        self.emit(format!("{l_den_conv}:"));
+        // exp 1 with a clear mantissa top is the denormal encoding.
+        self.emit(format!("    BTFSC 0x{m2:02X}, 7"));
+        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", e + 1));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    MOVF 0x{e:02X}, W"));
+        self.emit("    SUBLW 0x01".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    CLRF 0x{e:02X}"));
         self.emit(format!("{l_assemble}:"));
         self.emit_f32_assemble(sign, e, m0, m1, m2);
         // the +/-0 result (zero operand): sign | 0
@@ -3417,6 +3835,7 @@ impl<'m> Gen<'m> {
         let r = self.retval_lo;
         let l_zero = self.fresh_label();
         let l_inf = self.fresh_label();
+        let l_nan = self.fresh_label();
         let l_loop = self.fresh_label();
         let l_restore = self.fresh_label();
         let l_next = self.fresh_label();
@@ -3426,12 +3845,32 @@ impl<'m> Gen<'m> {
         let l_frestore = self.fresh_label();
         let l_fnext = self.fresh_label();
         let l_round = self.fresh_label();
+        let l_round_test = self.fresh_label();
         let l_round_up = self.fresh_label();
         let l_assemble = self.fresh_label();
+        let l_den_conv = self.fresh_label();
+        let l_den_shift = self.fresh_label();
+        let l_norm_a = self.fresh_label();
+        let l_norm_a_done = self.fresh_label();
+        let l_norm_b = self.fresh_label();
+        let l_norm_b_done = self.fresh_label();
         let l_ehi_B = self.fresh_label();
         let l_ehi_done = self.fresh_label();
-        let l_ma_nz = self.fresh_label();
-        let l_den_nz = self.fresh_label();
+        let l_a_not_ff = self.fresh_label();
+        let l_a_inf = self.fresh_label();
+        let l_b_not_ff = self.fresh_label();
+        let l_b_inf = self.fresh_label();
+        let l_a_inf_b_finite = self.fresh_label();
+        let l_b_inf_a_finite = self.fresh_label();
+        let l_a_nz = self.fresh_label();
+        let l_a_imp = self.fresh_label();
+        let l_a_ready = self.fresh_label();
+        let l_b_imp = self.fresh_label();
+        let l_b_ready = self.fresh_label();
+        let l_b_nz = self.fresh_label();
+        let l_exp_a_done = self.fresh_label();
+        let l_exp_b_done = self.fresh_label();
+        let l_e_sub_done = self.fresh_label();
         // sign = (a3 ^ b3) & 0x80
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
         self.emit(format!("    XORWF 0x{:02X}, W", pb + 3));
@@ -3475,15 +3914,114 @@ impl<'m> Gen<'m> {
         self.emit("    MOVLW 0xFF".to_string());
         self.emit(format!("{l_ehi_done}:"));
         self.emit(format!("    MOVWF 0x{:02X}", e + 1));
-        // ma == 0 (full 8-bit exponent == 0) -> +/-0; den == 0 -> +/-inf
-        // (0x7F800000, deterministic). Checked on the raw bytes BEFORE the
-        // implicit-bit ORs below would mask the zero.
+        // IEEE class dispatch, using the raw exponent and complete fraction.
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    XORLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_not_ff}"));
+        self.emit(format!("    BTFSS 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_a_not_ff}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa));
+        self.emit(format!("    IORWF 0x{:02X}, W", pa + 1));
+        self.emit(format!("    MOVWF 0x{spare:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{spare:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_inf}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_a_not_ff}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    XORLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_not_ff}"));
+        self.emit(format!("    BTFSS 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_b_not_ff}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{spare:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{spare:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_inf}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_a_inf}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    XORLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_inf_b_finite}"));
+        self.emit(format!("    BTFSS 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_a_inf_b_finite}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{spare:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{spare:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("{l_a_inf_b_finite}:"));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("{l_b_inf}:"));
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
         self.emit("    ANDLW 0x7F".to_string());
         self.emit("    BTFSS STATUS, 2".to_string());
-        self.emit(format!("    GOTO {l_ma_nz}"));
+        self.emit(format!("    GOTO {l_b_inf_a_finite}"));
         self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
-        self.emit(format!("    GOTO {l_ma_nz}"));
+        self.emit(format!("    GOTO {l_b_inf_a_finite}"));
+        self.emit(format!("    GOTO {l_zero}"));
+        self.emit(format!("{l_b_inf_a_finite}:"));
+        self.emit(format!("    GOTO {l_zero}"));
+        self.emit(format!("{l_b_not_ff}:"));
+        // finite zero checks include the complete fraction
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_nz}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa));
+        self.emit(format!("    IORWF 0x{:02X}, W", pa + 1));
+        self.emit(format!("    MOVWF 0x{spare:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{spare:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_nz}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_zero}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{spare:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{spare:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_zero}"));
+        self.emit(format!("    GOTO {l_nan}"));
+        self.emit(format!("{l_a_nz}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_nz}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb));
+        self.emit(format!("    IORWF 0x{:02X}, W", pb + 1));
+        self.emit(format!("    MOVWF 0x{spare:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    IORWF 0x{spare:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_nz}"));
+        self.emit(format!("    GOTO {l_inf}"));
+        self.emit(format!("{l_nan}:"));
+        self.emit_f32_nan(sign);
+        self.emit(format!("{l_inf}:"));
+        self.emit_f32_inf(sign);
         self.emit(format!("{l_zero}:"));
         self.emit(format!("    CLRF 0x{r:02X}"));
         self.emit(format!("    CLRF 0x{:02X}", r + 1));
@@ -3492,37 +4030,97 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BTFSC 0x{sign:02X}, 7"));
         self.emit(format!("    BSF 0x{:02X}, 7", r + 3));
         self.emit("    RETURN".to_string());
-        self.emit(format!("{l_ma_nz}:"));
+        self.emit(format!("{l_b_nz}:"));
+        // Denormals begin at the exp-1 alignment scale (effective e8 = 1).
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_exp_a_done}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_exp_a_done}"));
+        self.emit(format!("    INCF 0x{e:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{:02X}, F", e + 1));
+        self.emit(format!("{l_exp_a_done}:"));
         self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
         self.emit("    ANDLW 0x7F".to_string());
         self.emit("    BTFSS STATUS, 2".to_string());
-        self.emit(format!("    GOTO {l_den_nz}"));
+        self.emit(format!("    GOTO {l_exp_b_done}"));
         self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
-        self.emit(format!("    GOTO {l_den_nz}"));
-        self.emit(format!("{l_inf}:"));
-        self.emit(format!("    CLRF 0x{r:02X}"));
-        self.emit(format!("    CLRF 0x{:02X}", r + 1));
-        // 0x7F800000: exp 0xFF -> b3 = 0x7F and b2 bit 7 = 1 (the exp LSB).
-        self.emit("    MOVLW 0x80".to_string());
-        self.emit(format!("    MOVWF 0x{:02X}", r + 2));
-        self.emit(format!("    MOVLW 0x7F"));
-        self.emit(format!("    MOVWF 0x{:02X}", r + 3));
-        self.emit(format!("    BTFSC 0x{sign:02X}, 7"));
-        self.emit(format!("    BSF 0x{:02X}, 7", r + 3));
-        self.emit("    RETURN".to_string());
-        self.emit(format!("{l_den_nz}:"));
-        // numerator ma in the a param slot; den = mb copy
+        self.emit(format!("    GOTO {l_exp_b_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{e:02X}, F"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_exp_b_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{:02X}, F", e + 1));
+        self.emit(format!("{l_exp_b_done}:"));
+        // Build raw/implicit mantissas, then normalize denormals to bit 23.
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 2));
         self.emit("    ANDLW 0x7F".to_string());
-        self.emit("    IORLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{:02X}", pa + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_a_imp}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_a_imp}"));
+        self.emit(format!("    GOTO {l_a_ready}"));
+        self.emit(format!("{l_a_imp}:"));
+        self.emit(format!("    BSF 0x{:02X}, 7", pa + 2));
+        self.emit(format!("{l_a_ready}:"));
+        self.emit(format!("    CLRF 0x{rem3:02X}"));
+        self.emit(format!("{l_norm_a}:"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_norm_a_done}"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RLF 0x{:02X}, F", pa));
+        self.emit(format!("    RLF 0x{:02X}, F", pa + 1));
+        self.emit(format!("    RLF 0x{:02X}, F", pa + 2));
+        self.emit(format!("    INCF 0x{rem3:02X}, F"));
+        self.emit(format!("    GOTO {l_norm_a}"));
+        self.emit(format!("{l_norm_a_done}:"));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit(format!("    MOVWF 0x{:02X}", pb + 2));
+        self.emit(format!("    MOVF 0x{:02X}, W", pb + 3));
+        self.emit("    ANDLW 0x7F".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_b_imp}"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_b_imp}"));
+        self.emit(format!("    GOTO {l_b_ready}"));
+        self.emit(format!("{l_b_imp}:"));
+        self.emit(format!("    BSF 0x{:02X}, 7", pb + 2));
+        self.emit(format!("{l_b_ready}:"));
+        self.emit(format!("    CLRF 0x{cnt:02X}"));
+        self.emit(format!("{l_norm_b}:"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
+        self.emit(format!("    GOTO {l_norm_b_done}"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RLF 0x{:02X}, F", pb));
+        self.emit(format!("    RLF 0x{:02X}, F", pb + 1));
+        self.emit(format!("    RLF 0x{:02X}, F", pb + 2));
+        self.emit(format!("    INCF 0x{cnt:02X}, F"));
+        self.emit(format!("    GOTO {l_norm_b}"));
+        self.emit(format!("{l_norm_b_done}:"));
+        self.emit(format!("    MOVF 0x{rem3:02X}, W"));
+        self.emit(format!("    SUBWF 0x{e:02X}, F"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    GOTO {l_e_sub_done}"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{:02X}, F", e + 1));
+        self.emit(format!("{l_e_sub_done}:"));
+        self.emit(format!("    MOVF 0x{cnt:02X}, W"));
+        self.emit(format!("    ADDWF 0x{e:02X}, F"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    INCF 0x{:02X}, F", e + 1));
+        // denominator copy, now normalized to [2^23, 2^24).
         self.emit(format!("    MOVF 0x{:02X}, W", pb));
         self.emit(format!("    MOVWF 0x{den0:02X}"));
         self.emit(format!("    MOVF 0x{:02X}, W", pb + 1));
         self.emit(format!("    MOVWF 0x{den1:02X}"));
         self.emit(format!("    MOVF 0x{:02X}, W", pb + 2));
-        self.emit("    ANDLW 0x7F".to_string());
-        self.emit("    IORLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{den2:02X}"));
         // ---- 24 restoring iterations: num <<= 1; rem = rem << 1 | C;
         //      if rem >= den set the quotient bit else restore ----
@@ -3630,8 +4228,31 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BSF 0x{spare:02X}, 1")); // sticky |= rem
         // RNE: guard (spare bit 0) && (sticky (spare bit 1) || mantissa LSB)
         self.emit(format!("{l_round}:"));
+        // Shift a subnormal result right while e < 1, preserving guard and
+        // sticky for the final round-to-nearest-even decision.
+        self.emit(format!("    BTFSC 0x{:02X}, 7", e + 1));
+        self.emit(format!("    GOTO {l_den_shift}"));
+        self.emit(format!("    MOVF 0x{e:02X}, W"));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_round_test}"));
+        self.emit(format!("    GOTO {l_den_shift}"));
+        self.emit(format!("{l_den_shift}:"));
+        self.emit(format!("    BTFSC 0x{spare:02X}, 0"));
+        self.emit(format!("    BSF 0x{spare:02X}, 1"));
+        self.emit("    BCF STATUS, 0".to_string());
+        self.emit(format!("    RRF 0x{:02X}, F", pa + 2));
+        self.emit(format!("    RRF 0x{:02X}, F", pa + 1));
+        self.emit(format!("    RRF 0x{:02X}, F", pa));
+        self.emit(format!("    BCF 0x{spare:02X}, 0"));
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit(format!("    BSF 0x{spare:02X}, 0"));
+        self.emit(format!("    INCF 0x{e:02X}, F"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    INCF 0x{:02X}, F", e + 1));
+        self.emit(format!("    GOTO {l_round}"));
+        self.emit(format!("{l_round_test}:"));
         self.emit(format!("    BTFSS 0x{spare:02X}, 0"));
-        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    GOTO {l_den_conv}"));
         self.emit(format!("    BTFSC 0x{spare:02X}, 1"));
         self.emit(format!("    GOTO {l_round_up}"));
         self.emit(format!("    BTFSC 0x{:02X}, 0", pa));
@@ -3639,6 +4260,17 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_assemble}"));
         self.emit(format!("{l_round_up}:"));
         self.emit_f32_round_up(pa, pa + 1, pa + 2, e);
+        self.emit(format!("{l_den_conv}:"));
+        self.emit(format!("    BTFSC 0x{:02X}, 7", pa + 2));
+        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", e + 1));
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    MOVF 0x{e:02X}, W"));
+        self.emit("    SUBLW 0x01".to_string());
+        self.emit("    BTFSS STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_assemble}"));
+        self.emit(format!("    CLRF 0x{e:02X}"));
         self.emit(format!("{l_assemble}:"));
         self.emit_f32_assemble(sign, e, pa, pa + 1, pa + 2);
     }
