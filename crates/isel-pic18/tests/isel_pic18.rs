@@ -139,3 +139,63 @@ fn i8_binop_const_lhs_is_rejected_not_silently_miscompiled() {
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
     let _ = select(&PIC18F4550, &m, &addrs);
 }
+
+#[test]
+fn icmp_eq_materializes_1_when_equal_and_0_when_not() {
+    let m = parse("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp eq i8 %1, %2\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = av;
+        p.ram_mut()[0x11] = bv;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "eq({av},{bv})");
+    }
+}
+
+#[test]
+fn icmp_ult_and_uge_use_the_carry_flag() {
+    for (pred, a, b, expect) in [("ult", 3u8, 5u8, 1u8), ("ult", 5, 3, 0), ("uge", 5, 3, 1), ("uge", 3, 5, 0)] {
+        let m = parse(&format!("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, %2\n    ret void\n"));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = a;
+        p.ram_mut()[0x11] = b;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "{pred}({a},{b})");
+    }
+}
+
+#[test]
+fn icmp_ugt_and_ule_combine_c_and_z() {
+    for (pred, a, b, expect) in [("ugt", 5u8, 3u8, 1u8), ("ugt", 3, 5, 0), ("ugt", 5, 5, 0), ("ule", 3, 5, 1), ("ule", 5, 5, 1), ("ule", 5, 3, 0)] {
+        let m = parse(&format!("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, %2\n    ret void\n"));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = a;
+        p.ram_mut()[0x11] = b;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "{pred}({a},{b})");
+    }
+}
+
+#[test]
+#[should_panic(expected = "const-LHS")]
+fn icmp_const_lhs_is_rejected_not_silently_miscompiled() {
+    // `val_addr` maps `Val::Const(k)` to `Slot::Direct(k & 0xFF)` — treating
+    // a literal as a RAM ADDRESS. Without the guard, `icmp ult i8 5, %x`
+    // would silently emit `SUBWF 0x005,W,A`, reading whatever byte lives at
+    // address 0x05 instead of using the literal 5. This must fail loudly
+    // instead, matching the `Inst::Bin` const-LHS guard.
+    let m = parse(
+        "global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = icmp ult i8 5, %1\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}

@@ -191,8 +191,66 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
                 }
             }
+            Inst::Icmp(c) => {
+                assert_eq!(c.ty.bytes(), 1, "isel-pic18: only i8 Icmp implemented so far (Task 9 adds i16)");
+                self.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+            }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
+    }
+
+    /// `dst = (a <pred> b) ? 1 : 0` for one byte, via `a - b` (SUBWF: f=a,
+    /// W=b beforehand, d=W so `a`'s slot is untouched) and a flag-based
+    /// branch. C/Z/N/OV follow PIC18's standard (ARM-style) condition-code
+    /// semantics — C=1 means "no borrow" (a>=b unsigned) — already relied
+    /// on by P1's `Pic18::sub_flags`.
+    fn emit_icmp_byte(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
+        // `val_addr` maps `Val::Const(k)` to a RAM ADDRESS (`k & 0xFF`),
+        // not a literal — a constant on the LHS (e.g. `icmp ult i8 5, %x`)
+        // would silently compare against whatever byte lives at address
+        // 0x05 instead of the literal 5. Same hazard as `Inst::Bin`'s LHS
+        // (see the `assert!` there); fail loudly until a later task adds
+        // real const-LHS canonicalization.
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        self.emit_load_w(&b, 0);
+        let av = self.val_addr(&a).direct();
+        let (acc, af) = self.operand(av);
+        let bank = if acc == 0 { "A" } else { "B" };
+        self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
+
+        let l_true = self.fresh_label();
+        let l_done = self.fresh_label();
+        match pred {
+            "eq" => self.emit(format!("    BZ {l_true}")),
+            "ne" => self.emit(format!("    BNZ {l_true}")),
+            "ult" => self.emit(format!("    BNC {l_true}")),
+            "uge" => self.emit(format!("    BC {l_true}")),
+            "ugt" => {
+                // C=1 AND Z=0
+                let l_false = self.fresh_label();
+                self.emit(format!("    BNC {l_false}"));
+                self.emit(format!("    BNZ {l_true}"));
+                self.emit(format!("{l_false}:"));
+            }
+            "ule" => {
+                // C=0 OR Z=1
+                self.emit(format!("    BNC {l_true}"));
+                self.emit(format!("    BZ {l_true}"));
+            }
+            other => panic!("isel-pic18: icmp predicate {other} not yet implemented (Task 8)"),
+        }
+        self.emit("    MOVLW 0x00".to_string());
+        self.emit(format!("    BRA {l_done}"));
+        self.emit(format!("{l_true}:"));
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("{l_done}:"));
+        let d = self.slot_addr(self.cur_func, dst).direct();
+        let (da, df) = self.operand(d);
+        let dbank = if da == 0 { "A" } else { "B" };
+        self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
     }
 
     /// Load byte `offset` of any `Val` into `W` — a constant via `MOVLW`
