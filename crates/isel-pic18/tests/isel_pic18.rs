@@ -403,3 +403,34 @@ fn trunc_i16_to_i8_keeps_the_low_byte() {
     p.run(50);
     assert_eq!(p.ram()[0x14], 0x34);
 }
+
+#[test]
+#[should_panic(expected = "const source Zext")]
+fn zext_const_source_is_rejected_not_silently_miscompiled() {
+    // `val_addr` maps `Val::Const(k)` to `Slot::Direct(k & 0xFF)` — treating
+    // a literal as a RAM ADDRESS. Without the guard, `zext i8 5 to i16`
+    // would silently `MOVFF` from whatever byte lives at address 0x05
+    // instead of using the literal 5. This must fail loudly instead,
+    // matching the `Inst::Bin`/`Inst::Icmp` const-LHS guards.
+    let m = parse("fn main(void) ()\n  block entry:\n    %1 = zext i8 5 to i16\n    ret void\n");
+    let addrs = addrs(&[("main::1", 0x12)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "const source Sext")]
+fn sext_const_source_is_rejected_not_silently_miscompiled() {
+    // Same hazard as `zext_const_source_is_rejected_not_silently_miscompiled`.
+    let m = parse("fn main(void) ()\n  block entry:\n    %1 = sext i8 5 to i16\n    ret void\n");
+    let addrs = addrs(&[("main::1", 0x12)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "const source Trunc")]
+fn trunc_const_source_is_rejected_not_silently_miscompiled() {
+    // Same hazard as `zext_const_source_is_rejected_not_silently_miscompiled`.
+    let m = parse("fn main(void) ()\n  block entry:\n    %1 = trunc i16 5 to i8\n    ret void\n");
+    let addrs = addrs(&[("main::1", 0x11)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
