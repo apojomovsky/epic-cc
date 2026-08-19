@@ -60,15 +60,15 @@ RUN curl -fsSL -o /tmp/llvm.tar.xz \
 
 # Static LLVM libraries (the Linux default): the produced clang links only
 # platform runtimes — no libLLVM.so, nothing to bundle or rpath-patch.
-# MSP430-only targets: we only need the datalayout-proxy target registered
-# for `-S -emit-llvm`. If the spike in Step 5 fails, drop
-# -DLLVM_TARGETS_TO_BUILD (default = all targets).
+# All targets (no -DLLVM_TARGETS_TO_BUILD): this clang is also the fuzz
+# harness's HOST reference — it compiles the generated program for x86-64
+# and runs it (docs/27-phase6-random-testing-plan.md). MSP430-only would
+# break the differential tests' host side.
 RUN --mount=type=cache,target=/ccache \
     cmake -S /src/llvm/llvm -B /build/llvm -G Ninja \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX=/opt/clang \
         -DLLVM_ENABLE_PROJECTS=clang \
-        -DLLVM_TARGETS_TO_BUILD=MSP430 \
         -DLLVM_INCLUDE_TESTS=OFF \
         -DLLVM_INCLUDE_BENCHMARKS=OFF \
         -DLLVM_INCLUDE_EXAMPLES=OFF \
@@ -89,8 +89,12 @@ RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
     && rustup component add rustfmt clippy rust-src \
     && rm /tmp/rustup.sh
 
+# PIC8_HOST_CLANG: the fuzz differential harness's host-reference compiler
+# (crates/fuzz/src/lib.rs host_clang()) — this same clang, no -target,
+# compiling and running native x86-64 programs.
 ENV PIC8_CLANG_UNWRAPPED=/opt/clang/bin/clang \
     PIC8_CLANG_RESOURCE_DIR=/opt/clang/lib/clang/20 \
+    PIC8_HOST_CLANG=/opt/clang/bin/clang \
     PIC8_GPASM=/usr/local/bin/gpasm \
     PIC8_VENDOR_DIR=/workspace/vendor \
     PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00
