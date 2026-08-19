@@ -38,6 +38,28 @@ impl<'m> Gen<'m> {
         self.out.push(s.into());
     }
 
+    /// Emit a label line AND reset the tracked `BSR` (`self.bsr = None`).
+    /// Every label in this file — a real block label, a fresh
+    /// `Select`/`Icmp` branch target, or a synthesized phi-copy label —
+    /// is a place code from more than one preceding path can land, and
+    /// each of those paths may have executed a different subset of the
+    /// `MOVLB`s that led here (or none at all). `operand()`'s `MOVLB`
+    /// elision is only sound when `self.bsr` reflects what's ACTUALLY
+    /// true on every path reaching the current point, so any label must
+    /// reset it — trusting a stale tracked value across a branch target
+    /// has been the exact root cause of three separate miscompile bugs
+    /// found across this task's review rounds (`Select`'s `l_else` and
+    /// `l_end`, `BrCond`'s synthesized `l_fcopies`, and — narrower, but
+    /// the same class — `emit_icmp_i16`'s shared `l_true`/`l_false`).
+    /// This helper makes the reset structural instead of a fact every
+    /// label call site has to individually remember: every
+    /// `self.emit(format!("{{...}}:"))`/`g.emit(format!("{{...}}:"))` in
+    /// this file routes through this instead.
+    fn emit_label(&mut self, label: &str) {
+        self.emit(format!("{label}:"));
+        self.bsr = None;
+    }
+
     fn fresh_label(&mut self) -> String {
         let s = format!("tmp{}", *self.tmp);
         *self.tmp += 1;
@@ -297,10 +319,9 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
                 self.emit_move_val_to_slot(&s.a, s.ty, dst);
                 self.emit(format!("    BRA {l_end}"));
-                self.emit(format!("{l_else}:"));
-                self.bsr = None; // branch target reached via BZ: BSR is unknown here, same as any block label
+                self.emit_label(&l_else);
                 self.emit_move_val_to_slot(&s.b, s.ty, dst);
-                self.emit(format!("{l_end}:"));
+                self.emit_label(&l_end);
             }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
@@ -385,7 +406,7 @@ impl<'m> Gen<'m> {
         // the overall order either way) so "equal" always defers to the
         // low-byte tie-break, regardless of predicate.
         self.emit_cmp_branch(&a, &b, 1, pred, &l_true, &l_false, &l_check_low);
-        self.emit(format!("{l_check_low}:"));
+        self.emit_label(&l_check_low);
         // Low byte, unsigned tie-break. Here "equal" means the two
         // 16-bit values are fully identical, so — unlike the high byte —
         // it DOES have a final answer: true for the non-strict tie-break
@@ -488,7 +509,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BOV {l_true}")); // N=0: true only if OV=1
                 self.emit(format!("    BRA {l_false}"));
-                self.emit(format!("{l_check_ov}:"));
+                self.emit_label(&l_check_ov);
                 self.emit(format!("    BNOV {l_true}")); // N=1: true only if OV=0
                 self.emit(format!("    BRA {l_false}"));
             }
@@ -499,7 +520,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BNOV {l_true}")); // N=0: true only if OV=0
                 self.emit(format!("    BRA {l_false}"));
-                self.emit(format!("{l_check_ov}:"));
+                self.emit_label(&l_check_ov);
                 self.emit(format!("    BOV {l_true}")); // N=1: true only if OV=1
                 self.emit(format!("    BRA {l_false}"));
             }
@@ -510,7 +531,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BNOV {l_true}"));
                 self.emit(format!("    BRA {l_false}"));
-                self.emit(format!("{l_check_ov}:"));
+                self.emit_label(&l_check_ov);
                 self.emit(format!("    BOV {l_true}"));
                 self.emit(format!("    BRA {l_false}"));
             }
@@ -521,7 +542,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BOV {l_true}"));
                 self.emit(format!("    BRA {l_false}"));
-                self.emit(format!("{l_check_ov}:"));
+                self.emit_label(&l_check_ov);
                 self.emit(format!("    BNOV {l_true}"));
                 self.emit(format!("    BRA {l_false}"));
             }
@@ -536,12 +557,12 @@ impl<'m> Gen<'m> {
     /// `emit_icmp_i16_eq_ne` — the only difference between the three is
     /// how they arrive at `l_true`/`l_false`.
     fn emit_materialize_bool(&mut self, l_true: &str, l_false: &str, l_done: &str, dst: &str) {
-        self.emit(format!("{l_false}:"));
+        self.emit_label(l_false);
         self.emit("    MOVLW 0x00".to_string());
         self.emit(format!("    BRA {l_done}"));
-        self.emit(format!("{l_true}:"));
+        self.emit_label(l_true);
         self.emit("    MOVLW 0x01".to_string());
-        self.emit(format!("{l_done}:"));
+        self.emit_label(l_done);
         let d = self.slot_addr(self.cur_func, dst).direct();
         let (da, df) = self.operand(d);
         let dbank = if da == 0 { "A" } else { "B" };
@@ -748,8 +769,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         }
         let doms = block_dominators(f);
         for b in &f.blocks {
-            g.emit(format!("{}:", labels[&b.label]));
-            g.bsr = None; // conservative: BSR is unknown at any branch target
+            g.emit_label(&labels[&b.label]);
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
                 match inst {
@@ -822,8 +842,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                             g.emit(format!("    BZ {l_fcopies}"));
                             emit_phi_copies(&mut g, &ct, doms[&b.label].contains(&bc.t));
                             g.emit(format!("    BRA {lt}"));
-                            g.emit(format!("{l_fcopies}:"));
-                            g.bsr = None; // branch target reached via BZ: BSR is unknown here, same as any block label
+                            g.emit_label(&l_fcopies);
                             emit_phi_copies(&mut g, &cf, doms[&b.label].contains(&bc.f));
                             g.emit(format!("    BRA {lf}"));
                         }

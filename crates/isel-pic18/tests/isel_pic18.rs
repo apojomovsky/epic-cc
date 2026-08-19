@@ -692,6 +692,59 @@ fn brcond_both_edges_phi_copies_get_correct_bsr_after_the_synthesized_fcopies_la
 }
 
 #[test]
+fn select_l_end_resets_bsr_so_a_later_same_block_instruction_is_not_misbanked() {
+    // Regression for a third instance of the same BSR-tracking hazard,
+    // this time at `Select`'s MERGE label (`l_end`), found during the
+    // systemic audit that added `Gen::emit_label`. `l_end` is reached two
+    // ways: `BRA l_end` from the `a`-arm, and plain fallthrough from the
+    // `b`-arm — and the two arms don't necessarily touch `bsr` the same
+    // way. Here `s.a` is a REGISTER value (copied via `MOVFF`, which never
+    // calls `operand()`/touches `bsr` at all), while `s.b` is a CONSTANT
+    // (copied via `MOVLW`+`MOVWF`, which does call `operand()` for the
+    // (shared) destination's bank). So after generating the whole
+    // `Select`, the tracked `bsr` reflects the `b`-arm's bank
+    // unconditionally — correct if the `b`-arm is the one that actually
+    // ran, wrong if the `a`-arm ran instead (real BSR there is whatever
+    // it was before the `Select`, since the `a`-arm's `MOVFF` never
+    // touched it).
+    //
+    // `@out` is placed in the SAME bank as the `Select`'s destination
+    // (bank 2) so the stale tracked value from the `b`-arm coincidentally
+    // "matches" what `@out`'s store needs — exactly the condition needed
+    // to make `operand()` wrongly skip the `MOVLB` on the `a`-path.
+    let m = parse(
+        "global cond i8\nglobal r i8\nglobal out i8\nfn main(void) ()\n\
+         block entry:\n\
+           %1 = load i8 @cond\n\
+           %2 = load i8 @r\n\
+           %3 = select i1 %1 i8 %2 i8 9\n\
+           store i8 5 @out\n\
+           ret void\n",
+    );
+    let addrs = addrs(&[
+        ("cond", 0x10),
+        ("r", 0x11),
+        ("out", 0x211),  // bank 2, same bank as main::3 below
+        ("main::1", 0x101), // bank 1: the cond load's own MOVLB
+        ("main::2", 0x12),
+        ("main::3", 0x210), // bank 2: the Select's dst (b-arm's MOVLB target)
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    for c in [1u8, 0] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = c;
+        p.ram_mut()[0x11] = 0x55;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(
+            p.ram()[0x211], 5,
+            "store after the Select (cond={c}) must land in @out's real bank-2 address, not get silently misbanked by a stale tracked BSR left over from Select's b-arm"
+        );
+    }
+}
+
+#[test]
 #[should_panic(expected = "const cond BrCond")]
 fn brcond_const_cond_is_rejected_not_silently_miscompiled() {
     // Same hazard as `select_const_cond_is_rejected_not_silently_miscompiled`:
