@@ -156,8 +156,26 @@ fn icmp_eq_materializes_1_when_equal_and_0_when_not() {
 }
 
 #[test]
+fn icmp_ne_distinguishes_equal_from_not_equal() {
+    for (a, b, expect) in [(5u8, 5u8, 0u8), (5, 6, 1)] {
+        let m = parse("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp ne i8 %1, %2\n    ret void\n");
+        let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = a;
+        p.ram_mut()[0x11] = b;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "ne({a},{b})");
+    }
+}
+
+#[test]
 fn icmp_ult_and_uge_use_the_carry_flag() {
-    for (pred, a, b, expect) in [("ult", 3u8, 5u8, 1u8), ("ult", 5, 3, 0), ("uge", 5, 3, 1), ("uge", 3, 5, 0)] {
+    for (pred, a, b, expect) in [
+        ("ult", 3u8, 5u8, 1u8), ("ult", 5, 3, 0), ("ult", 5, 5, 0),
+        ("uge", 5, 3, 1), ("uge", 3, 5, 0), ("uge", 5, 5, 1),
+    ] {
         let m = parse(&format!("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, %2\n    ret void\n"));
         let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
         let asm = select(&PIC18F4550, &m, &addrs);
@@ -194,8 +212,10 @@ fn icmp_slt_and_sge_use_n_xor_ov() {
     for (pred, a, b, expect) in [
         ("slt", 0xFFu8, 1u8, 1u8),      // -1 < 1
         ("slt", 1, 0xFF, 0),             // 1 < -1 is false
+        ("slt", 5, 5, 0),                 // equal: strict predicate is false
         ("sge", 1, 0xFF, 1),
         ("sge", 0xFF, 1, 0),
+        ("sge", 5, 5, 1),                 // equal: non-strict predicate is true
         ("slt", 0x7F, 0x80, 0),          // 127 < -128: false, but a-b overflows (OV=1), N must still resolve correctly
     ] {
         let m = parse(&format!("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, %2\n    ret void\n"));
@@ -286,6 +306,34 @@ fn icmp_i16_full_equality_resolves_correctly_for_every_predicate() {
         p.ram_mut()[0x13] = 0x01; // b hi
         p.run(300);
         assert_eq!(p.ram()[0x18], expect, "{pred}(0x0142, 0x0142)");
+    }
+}
+
+#[test]
+fn icmp_i16_high_byte_uses_the_predicates_own_signedness() {
+    // a=0xFF00, b=0x0100 — the high bytes differ (0xFF vs 0x01) so the
+    // high byte alone decides the whole comparison, but the SIGNED and
+    // UNSIGNED answers genuinely disagree on this bit pattern: as signed
+    // 16-bit values, a = -256 < b = 256, so the signed predicates read
+    // a<b; as unsigned 16-bit values, a = 0xFF00 = 65280 > b = 0x0100 =
+    // 256, so the unsigned predicates read a>b. If `emit_icmp_i16`'s
+    // high-byte compare accidentally used the unsigned tie-break
+    // predicate (e.g. `ult` instead of `slt`) instead of `pred` itself,
+    // every signed-predicate case below would silently flip. `ult` is
+    // included as the control case showing the unsigned reading really
+    // is the opposite.
+    for (pred, expect) in [("slt", 1u8), ("sle", 1), ("sgt", 0), ("sge", 0), ("ult", 0)] {
+        let m = parse(&format!("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = icmp {pred} i16 %1, %2\n    ret void\n"));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("main::1", 0x14), ("main::2", 0x16), ("main::3", 0x18)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = 0x00; // a lo
+        p.ram_mut()[0x11] = 0xFF; // a hi
+        p.ram_mut()[0x12] = 0x00; // b lo
+        p.ram_mut()[0x13] = 0x01; // b hi
+        p.run(300);
+        assert_eq!(p.ram()[0x18], expect, "{pred}(0xFF00, 0x0100)");
     }
 }
 
