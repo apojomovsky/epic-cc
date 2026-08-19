@@ -298,6 +298,7 @@ impl<'m> Gen<'m> {
                 self.emit_move_val_to_slot(&s.a, s.ty, dst);
                 self.emit(format!("    BRA {l_end}"));
                 self.emit(format!("{l_else}:"));
+                self.bsr = None; // branch target reached via BZ: BSR is unknown here, same as any block label
                 self.emit_move_val_to_slot(&s.b, s.ty, dst);
                 self.emit(format!("{l_end}:"));
             }
@@ -822,6 +823,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                             emit_phi_copies(&mut g, &ct, doms[&b.label].contains(&bc.t));
                             g.emit(format!("    BRA {lt}"));
                             g.emit(format!("{l_fcopies}:"));
+                            g.bsr = None; // branch target reached via BZ: BSR is unknown here, same as any block label
                             emit_phi_copies(&mut g, &cf, doms[&b.label].contains(&bc.f));
                             g.emit(format!("    BRA {lf}"));
                         }

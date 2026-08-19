@@ -640,6 +640,58 @@ fn rotated_loop_exit_phi_reads_the_pre_increment_value_not_the_clobbered_one() {
 }
 
 #[test]
+fn brcond_both_edges_phi_copies_get_correct_bsr_after_the_synthesized_fcopies_label() {
+    // Regression for a bug this fix round's own `(Some(ct), Some(cf))`
+    // BrCond phi-copy handling introduced: the synthesized `l_fcopies`
+    // label (reached via `BZ`, not a real block label) didn't reset
+    // `Gen::bsr`, so if the t-edge's copy left the TRACKED `bsr` pointing
+    // at bank 2, the f-edge's copy — which never actually runs the
+    // t-edge's `MOVLB` at runtime when `BZ` is taken — would wrongly
+    // believe BSR was already 2 and skip emitting its own `MOVLB`,
+    // writing to the wrong physical bank.
+    //
+    // `main::1` (the cond, read from `%1`'s slot) sits in bank 1; both
+    // phi destinations (`main::2` for the t edge, `main::3` for the f
+    // edge) sit in bank 2 — the shape needed to trigger the hazard: the
+    // cond load leaves REAL BSR=1, the t-edge's copy sets REAL BSR=2 only
+    // when the t-edge actually executes, and the f-edge's copy must
+    // independently re-establish BSR=2 rather than trusting a stale
+    // tracked value left over from code-generation order.
+    let m = parse(
+        "global cond i8\nglobal outT i8\nglobal outF i8\nfn main(void) ()\n\
+         block entry:\n\
+           %1 = load i8 @cond\n\
+           br i1 %1 t f\n\
+         block t:\n\
+           %2 = phi i8 7 entry\n\
+           store i8 %2 @outT\n\
+           ret void\n\
+         block f:\n\
+           %3 = phi i8 9 entry\n\
+           store i8 %3 @outF\n\
+           ret void\n",
+    );
+    let addrs = addrs(&[
+        ("cond", 0x10),
+        ("outT", 0x11),
+        ("outF", 0x12),
+        ("main::1", 0x101),
+        ("main::2", 0x210),
+        ("main::3", 0x211),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect_t, expect_f) in [(1u8, 7u8, 0u8), (0, 0, 9)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = c;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x11], expect_t, "outT (bank-2 phi dest) after cond={c}");
+        assert_eq!(p.ram()[0x12], expect_f, "outF (bank-2 phi dest) after cond={c} — without the BSR reset at l_fcopies, this lands in the wrong bank on the cond=0 path");
+    }
+}
+
+#[test]
 #[should_panic(expected = "const cond BrCond")]
 fn brcond_const_cond_is_rejected_not_silently_miscompiled() {
     // Same hazard as `select_const_cond_is_rejected_not_silently_miscompiled`:
