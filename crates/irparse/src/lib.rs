@@ -685,16 +685,40 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
     let mut k: i64 = 0;
     let mut terms: Vec<(u8, String)> = Vec::new();
     let mut cur = source_ty.trim().to_string();
+    // True when the previous GEP level was an array — a struct cur is then
+    // the array's ELEMENT type, so this index is an element selector
+    // (stride = struct size). Without it, a struct index would be a FIELD
+    // selector (struct descent, out of scope — panic).
+    let mut from_array = false;
     for ip in index_parts {
         let ip = ip.trim();
         let idx = parse_val(ip.split_whitespace().last().unwrap());
-        if cur.starts_with('%') {
-            // A %struct.X source's first index is an array-of-struct element
-            // index, not a field selector; real struct descent isn't
-            // supported, so panic loudly instead of mis-folding.
+        if cur.starts_with('%') || cur.starts_with('{') {
+            if from_array {
+                // `[N x %struct.S], i16 0, i16 %i` — the index after an
+                // array-of-struct descent strides by sizeof(%struct.S)
+                // (LLVM: the second index indexes the array's element
+                // type). clang -O1 emits this for `&CARR[i]`; field
+                // selection rides as a separate i8-offset GEP.
+                let (sz, _) = ty_size_align(&cur, types);
+                match &idx {
+                    Val::Const(c) => k += c * i64::from(sz),
+                    Val::Reg(r) => terms.push((sz as u8, r.clone())),
+                    Val::Global(_) => panic!("irparse: gep index cannot be a global"),
+                }
+                // The element's type is the struct itself: a further index
+                // would be a field selector — reject it.
+                from_array = false;
+                continue;
+            }
+            // A struct source's first index IS its element selector; the
+            // next would be a field selector. Neither is supported (field
+            // descent is out of scope) — panic loudly instead of
+            // mis-folding.
             panic!("irparse: gep on struct-typed source {cur} unsupported (struct descent not implemented)");
         }
         let (stride, next) = stride_and_next(&cur, types);
+        from_array = cur.starts_with('[');
         match &idx {
             Val::Const(c) => k += c * stride,
             Val::Reg(r) => terms.push((stride as u8, r.clone())),

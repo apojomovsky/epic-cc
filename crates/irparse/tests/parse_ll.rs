@@ -614,6 +614,54 @@ fn decodes_literal_struct_initializers_to_flat_bytes() {
     assert_eq!(gr.bytes, vec![0x47, 0x00, 0x02, 0x01]);
 }
 
+// Issue #5: clang -O1 lowers `&CARR[i]` on a const struct array to
+// `getelementptr [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i` — the index
+// after an array-of-struct descent is the ELEMENT selector, striding by
+// sizeof(%struct.Pair). Field offsets ride as separate i8-offset GEPs, so
+// no further struct descent is needed.
+const STRUCT_ARRAY_GEP: &str = r#"
+%struct.Pair = type { i8, i16 }
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+define dso_local void @main(i16 %i) {
+  %p = getelementptr inbounds nuw [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i
+  ret void
+}
+"#;
+
+#[test]
+fn folds_struct_array_element_gep_to_struct_stride() {
+    let m = parse_ll(STRUCT_ARRAY_GEP);
+    let body = &m.funcs[0].blocks[0].insts;
+    match &body[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Global("CARR".to_string()));
+            assert_eq!(g.k, 0);
+            assert_eq!(g.terms, vec![(4, "i".to_string())], "element stride = sizeof(%struct.Pair) = 4");
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
+#[test]
+fn folds_struct_array_constant_element_gep_to_byte_offset() {
+    let ll = r#"
+%struct.Pair = type { i8, i16 }
+@CARR = dso_local constant [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 68, i8 0, i16 4369 }, { i8, i8, i16 } { i8 69, i8 0, i16 8738 }], align 2
+define dso_local void @main() {
+  %p = getelementptr inbounds nuw [2 x %struct.Pair], ptr @CARR, i16 0, i16 1
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    match &m.funcs[0].blocks[0].insts[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.k, 4, "constant element 1 -> byte offset 4");
+            assert!(g.terms.is_empty());
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
 // s8: chained multi-index GEP with an inlined base GEP (dynamic struct-array).
 const CHAINED: &str = r#"
 %struct.A = type { i8, [4 x i8] }
