@@ -13,6 +13,11 @@ isel = { path = "../isel" }
 [dev-dependencies]
 pic14-sim = { path = "../sim" }
 asm = { path = "../asm" }
+irparse = { path = "../irparse" }
+wholeprog = { path = "../wholeprog" }
+legalize = { path = "../legalize" }
+callgraph = { path = "../callgraph" }
+alloc = { path = "../alloc" }
 
 [[bin]]
 name = "isel-pic18"

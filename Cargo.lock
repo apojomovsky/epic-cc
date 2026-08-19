@@ -101,12 +101,17 @@ dependencies = [
 name = "isel-pic18"
 version = "0.1.0"
 dependencies = [
+ "alloc",
  "asm",
+ "callgraph",
  "device",
  "ir",
+ "irparse",
  "isel",
  "iselcore",
+ "legalize",
  "pic14-sim",
+ "wholeprog",
 ]
 
 [[package]]
