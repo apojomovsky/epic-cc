@@ -323,6 +323,67 @@ impl<'m> Gen<'m> {
                 self.emit_move_val_to_slot(&s.b, s.ty, dst);
                 self.emit_label(&l_end);
             }
+            Inst::Call(c) => {
+                let callee = self
+                    .m
+                    .funcs
+                    .iter()
+                    .find(|f| f.name == c.func)
+                    .unwrap_or_else(|| panic!("isel-pic18: call to unknown function @{}", c.func));
+                for (i, arg) in c.args.iter().enumerate() {
+                    let pname = &callee.params[i].name;
+                    let pa = self.slot_addr(&c.func, pname).direct();
+                    if let Some(size) = arg.byval {
+                        // `byval` means "copy `size` bytes from the address
+                        // `arg.val` points to" — `val_addr` is the right
+                        // resolver for an address-valued `Val`, but its
+                        // `Val::Const` arm treats the constant itself as a
+                        // RAM address (`k & 0xFF`), same hazard class as
+                        // `Bin`'s LHS/the cast ops' sources above. A byval
+                        // arg is always meant to be a pointer (an alloca's
+                        // address, or another byval slot's), so a bare
+                        // integer literal here has no sensible meaning —
+                        // fail loudly rather than silently copy from
+                        // whatever byte happens to live at `k & 0xFF`.
+                        assert!(
+                            !matches!(arg.val, Val::Const(_)),
+                            "isel-pic18: const byval call arg not yet supported"
+                        );
+                        let src = self.val_addr(&arg.val).direct();
+                        for b in 0..size {
+                            self.emit_copy_byte(src + u16::from(b), pa + u16::from(b));
+                        }
+                    } else if arg.sret {
+                        // `sret` means "store the 2-byte ADDRESS `arg.val`
+                        // points to into the callee's sret slot" — same
+                        // const hazard as `byval` above: an sret arg is
+                        // always meant to be a pointer, so a literal here
+                        // has no sensible meaning.
+                        assert!(
+                            !matches!(arg.val, Val::Const(_)),
+                            "isel-pic18: const sret call arg not yet supported"
+                        );
+                        let addr = self.val_addr(&arg.val).direct();
+                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                        let (a0, f0) = self.operand(pa);
+                        self.emit(format!("    MOVWF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
+                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                        let (a1, f1) = self.operand(pa + 1);
+                        self.emit(format!("    MOVWF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
+                    } else {
+                        let ty = arg.ty.expect("isel-pic18: scalar call arg must carry a type");
+                        self.emit_move_val_to_slot(&arg.val, ty, pa);
+                    }
+                }
+                self.emit(format!("    CALL {}", c.func));
+                if let Some(d) = &c.dst {
+                    let ty = c.ty.expect("isel-pic18: valued call must carry a type");
+                    let dst = self.slot_addr(self.cur_func, d).direct();
+                    for i in 0..ty.bytes() {
+                        self.emit_copy_byte(self.retval_lo + u16::from(i), dst + u16::from(i));
+                    }
+                }
+            }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }

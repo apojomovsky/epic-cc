@@ -758,3 +758,57 @@ fn brcond_const_cond_is_rejected_not_silently_miscompiled() {
     let addrs = addrs(&[]);
     let _ = select(&PIC18F4550, &m, &addrs);
 }
+
+#[test]
+fn call_copies_scalar_args_and_reads_the_retval_back() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             %1 = call i8 @add1(i8 5)\n\
+             ret void\n\
+         fn add1(i8) (x=i8)\n\
+           block entry:\n\
+             %2 = add i8 %x, 1\n\
+             ret i8 %2\n",
+    );
+    let addrs = addrs(&[("main::1", 0x10), ("add1::x", 0x11), ("add1::2", 0x12)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.run(300);
+    assert_eq!(p.ram()[0x10], 6, "main::1 gets add1(5)'s retval");
+}
+
+#[test]
+#[should_panic(expected = "const byval call arg")]
+fn call_const_byval_arg_is_rejected_not_silently_miscompiled() {
+    // A `byval` arg means "copy N bytes from the address `arg.val` points
+    // to" — the IR's text parser has no type-level restriction preventing
+    // a bare literal there (`parse_call_arg` accepts any `parse_val`
+    // result after the `byvalN` keyword), and `val_addr`'s `Val::Const`
+    // arm would silently reinterpret the literal as a RAM address
+    // (`k & 0xFF`) rather than reject it. Same hazard class as `Bin`'s
+    // const-LHS guard; must fail loudly instead.
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    call void @f(byval2 5)\n    ret void\n\
+         fn f(void) (p=byval2)\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[("f::p", 0x10)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "const sret call arg")]
+fn call_const_sret_arg_is_rejected_not_silently_miscompiled() {
+    // Same hazard as the byval case above: an `sret` arg is always meant
+    // to be a 2-byte pointer, but the IR's text parser doesn't prevent a
+    // bare literal after the `sret` keyword, and `val_addr`'s
+    // `Val::Const` arm would silently treat the literal as an address
+    // instead of rejecting it.
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    call void @f(sret 5)\n    ret void\n\
+         fn f(void) (p=sret)\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[("f::p", 0x10)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
