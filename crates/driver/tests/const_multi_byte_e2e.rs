@@ -88,7 +88,7 @@ fn multi_byte_const_tables_run_correctly() {
     let outf = a("outf");
     let outf2 = a("outf2");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/const_multi_byte.c",
             "tests/fixtures/const_multi_byte.hex",

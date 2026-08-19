@@ -224,7 +224,7 @@ fn each_isr_routine_copy_matches_its_original_body() {
 fn the_program_still_computes_mains_results() {
     // A no-interrupt sanity run: the duplication must not disturb the
     // ordinary path. in_a = 47, in_b = 5 -> out = 235, out_q = 9.
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/interrupt_mul.c", "tests/fixtures/interrupt_mul.hex"])
         .output()
         .expect("run driver");

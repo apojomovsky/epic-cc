@@ -55,7 +55,7 @@ fn structs_runs_correctly() {
     let layout = structs_layout();
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/structs.c", "tests/fixtures/structs.hex"])
         .output()
         .expect("run driver");

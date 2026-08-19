@@ -49,7 +49,7 @@ fn a_masked_request_is_deferred_until_main_sets_gie() {
     let addr = |g: &str| *layout.globals.get(g).unwrap_or_else(|| panic!("no global {g}")) as usize;
     let (stage, isr_ran) = (addr("stage"), addr("isr_ran"));
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/interrupt_gate.c", "tests/fixtures/interrupt_gate.hex"])
         .output()
         .expect("run driver");

@@ -76,7 +76,7 @@ fn banked_runs_correctly() {
     // driver used so the bank the simulator must resolve to is unambiguous.
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/banked.c", "tests/fixtures/banked.hex"])
         .output()
         .expect("run driver");

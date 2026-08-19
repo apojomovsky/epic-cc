@@ -95,7 +95,7 @@ fn float_runs_correctly() {
     let out2_addr = *layout.globals.get("out2").expect("out2 global") as usize;
     let out3_addr = *layout.globals.get("out3").expect("out3 global") as usize;
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/float.c", "tests/fixtures/float.hex"])
         .output()
         .expect("run driver");

@@ -66,7 +66,7 @@ fn const_table_reads_past_256_bytes_run_correctly() {
     let layout = const_table_layout();
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/const_table.c", "tests/fixtures/const_table.hex"])
         .output()
         .expect("run driver");

@@ -80,7 +80,7 @@ fn three_chunk_const_tables_run_correctly() {
     let o16_1 = a("o16_1");
     let o16_2 = a("o16_2");
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/const_3chunk.c", "tests/fixtures/const_3chunk.hex"])
         .output()
         .expect("run driver");
