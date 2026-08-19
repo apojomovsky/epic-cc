@@ -13,6 +13,9 @@
 # direnv
 /.direnv/
 
+# Agent worktree dirs
+/.claude/worktrees/
+
 # Build / test artifacts
 *.hex
 *.lst
