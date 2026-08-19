@@ -200,6 +200,73 @@ impl<'m> Gen<'m> {
                     self.emit_icmp_i16(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
                 }
             }
+            Inst::Zext(z) => {
+                // `val_addr` maps `Val::Const(k)` to a RAM ADDRESS
+                // (`k & 0xFF`), not a literal — same hazard already guarded
+                // for `Bin`/`Icmp` above. Not known to be reachable from
+                // clang-generated IR or the differential fuzzer (both only
+                // ever cast a loaded/computed register, never a bare
+                // literal — a literal cast is constant-foldable by the
+                // frontend before it ever reaches this backend), but the
+                // cheap guard costs nothing and keeps a future const-source
+                // producer from silently miscompiling instead of panicking.
+                assert!(
+                    !matches!(z.val, Val::Const(_)),
+                    "isel-pic18: const source Zext not yet supported"
+                );
+                let src = self.val_addr(&z.val).direct();
+                let dst = self.slot_addr(self.cur_func, &z.dst).direct();
+                for i in 0..z.from.bytes() {
+                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+                for i in z.from.bytes()..z.to.bytes() {
+                    self.emit("    MOVLW 0x00".to_string());
+                    let (a, f) = self.operand(dst + u16::from(i));
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                }
+            }
+            Inst::Sext(s) => {
+                // Same const-source hazard as `Inst::Zext`, see its comment.
+                assert!(
+                    !matches!(s.val, Val::Const(_)),
+                    "isel-pic18: const source Sext not yet supported"
+                );
+                let src = self.val_addr(&s.val).direct();
+                let dst = self.slot_addr(self.cur_func, &s.dst).direct();
+                for i in 0..s.from.bytes() {
+                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+                // The sign-fill byte(s) must reflect the SOURCE's actual
+                // sign bit (bit 7 of its highest byte) at the time this
+                // cast runs — not an assumption. `MOVLW 0x00` first, then
+                // `BTFSC sign_byte,7` conditionally overwrites `W` with
+                // `MOVLW 0xFF` only when that bit is set, so every high
+                // byte gets the same, correctly-derived fill value.
+                let sign_byte = src + u16::from(s.from.bytes()) - 1;
+                for i in s.from.bytes()..s.to.bytes() {
+                    self.emit("    MOVLW 0x00".to_string());
+                    let (a, f) = self.operand(sign_byte);
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    BTFSC 0x{f:03X},7,{bank}"));
+                    self.emit("    MOVLW 0xFF".to_string());
+                    let (da, df) = self.operand(dst + u16::from(i));
+                    let dbank = if da == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                }
+            }
+            Inst::Trunc(t) => {
+                // Same const-source hazard as `Inst::Zext`, see its comment.
+                assert!(
+                    !matches!(t.val, Val::Const(_)),
+                    "isel-pic18: const source Trunc not yet supported"
+                );
+                let src = self.val_addr(&t.val).direct();
+                let dst = self.slot_addr(self.cur_func, &t.dst).direct();
+                for i in 0..t.to.bytes() {
+                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+            }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }

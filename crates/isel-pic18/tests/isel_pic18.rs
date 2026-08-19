@@ -364,3 +364,42 @@ fn icmp_i16_const_lhs_is_rejected_not_silently_miscompiled() {
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x14)]);
     let _ = select(&PIC18F4550, &m, &addrs);
 }
+
+#[test]
+fn zext_i8_to_i16_zero_fills_the_high_byte() {
+    let m = parse("global a i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = zext i8 %1 to i16\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x10] = 0xFF;
+    p.run(50);
+    assert_eq!(p.ram()[0x12], 0xFF);
+    assert_eq!(p.ram()[0x13], 0x00);
+}
+
+#[test]
+fn sext_i8_to_i16_sign_fills_the_high_byte() {
+    let m = parse("global a i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = sext i8 %1 to i16\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x10] = 0xFF; // -1
+    p.run(50);
+    assert_eq!(p.ram()[0x12], 0xFF);
+    assert_eq!(p.ram()[0x13], 0xFF, "sign-filled");
+}
+
+#[test]
+fn trunc_i16_to_i8_keeps_the_low_byte() {
+    let m = parse("global a i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = trunc i16 %1 to i8\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("main::1", 0x12), ("main::2", 0x14)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x10] = 0x34;
+    p.ram_mut()[0x11] = 0x12;
+    p.run(50);
+    assert_eq!(p.ram()[0x14], 0x34);
+}
