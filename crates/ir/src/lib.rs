@@ -56,8 +56,16 @@ pub struct Gep { pub dst: String, pub base: GepBase, pub k: u8, pub terms: Vec<(
 #[derive(Clone, Debug, PartialEq)]
 pub struct Alloca { pub dst: String, pub size: u8 }
 /// `memcpy`: byte-copy `len` bytes from `src` to `dst` (defines nothing).
+/// `len` is either a compile-time constant (unrolled per byte) or a 16-bit
+/// register value (issue #4: runtime length — a counted loop; the value is
+/// SSA-dead after the copy, so isel may decrement the length slot in place).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Memcpy { pub dst: Val, pub src: Val, pub len: u8 }
+pub enum MemLen {
+    Const(u8),
+    Reg(Val),
+}
+#[derive(Clone, Debug, PartialEq)]
+pub struct Memcpy { pub dst: Val, pub src: Val, pub len: MemLen }
 /// `freeze`: LLVM freeze (`%d = freeze <ty> <val>`). A no-op in the backend —
 /// it exists so the IR round-trips the source; isel lowers it as a plain byte
 /// copy of `val` into the `dst` slot.
@@ -203,7 +211,15 @@ fn inst_str(i: &Inst) -> String {
             s
         }
         Inst::Alloca(a) => format!("%{} = alloca {}", a.dst, a.size),
-        Inst::Memcpy(m) => format!("memcpy {} {} {}", val_str(&m.dst), val_str(&m.src), m.len),
+        Inst::Memcpy(m) => format!(
+            "memcpy {} {} {}",
+            val_str(&m.dst),
+            val_str(&m.src),
+            match &m.len {
+                MemLen::Const(n) => n.to_string(),
+                MemLen::Reg(v) => val_str(v),
+            }
+        ),
         Inst::Freeze(f) => format!("%{} = freeze {} {}", f.dst, ty_str(f.ty), val_str(&f.val)),
         Inst::FloatBin(b) => format!("%{} = {} float {} {}", b.dst, fbinop_str(b.op), val_str(&b.a), val_str(&b.b)),
         Inst::Fcmp(c) => format!("%{} = fcmp {} float {} {}", c.dst, c.pred, val_str(&c.a), val_str(&c.b)),
@@ -420,7 +436,12 @@ fn parse_inst(line: &str) -> Inst {
         let mut it = rest.split_whitespace();
         let dst = parse_val(it.next().unwrap());
         let src = parse_val(it.next().unwrap());
-        let len = it.next().unwrap().parse().unwrap();
+        let len_tok = it.next().unwrap();
+        let len = if let Some(r) = len_tok.strip_prefix('%') {
+            MemLen::Reg(Val::Reg(r.to_string()))
+        } else {
+            MemLen::Const(len_tok.parse().unwrap())
+        };
         return Inst::Memcpy(Memcpy { dst, src, len });
     }
     if let Some(rest) = line.strip_prefix("store ") {

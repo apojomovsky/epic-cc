@@ -1,5 +1,5 @@
 use irparse::parse_ll;
-use ir::{CallArg, GepBase, Global, Inst, Val};
+use ir::{CallArg, GepBase, Global, Inst, MemLen, Val};
 
 // Array/`constant` globals + getelementptr (phase-3 pointers/const).
 const GEP_ARRAY: &str = r#"
@@ -430,7 +430,7 @@ fn parses_structs_type_table_globals_alloca_memcpy_gep_and_params() {
     // @g1 = memcpy @g2, 4 bytes (i16 4), non-volatile
     assert!(
         body.iter().any(|i| matches!(i, Inst::Memcpy(m) if m.dst == Val::Global("g1".to_string())
-            && m.src == Val::Global("g2".to_string()) && m.len == 4)),
+            && m.src == Val::Global("g2".to_string()) && m.len == MemLen::Const(4))),
         "memcpy must appear: {body:?}"
     );
     // lifetime.start/end produce no instructions
@@ -695,9 +695,32 @@ fn parses_volatile_memcpy() {
     let body = &m.funcs[0].blocks[0].insts;
     assert!(
         body.iter().any(|i| matches!(i, Inst::Memcpy(mm)
-            if mm.len == 4 && mm.dst == Val::Global("g1".to_string())
+            if mm.len == MemLen::Const(4) && mm.dst == Val::Global("g1".to_string())
                 && mm.src == Val::Global("g2".to_string()))),
-        "volatile memcpy must parse to Memcpy{{len:4}}: {body:?}"
+        "volatile memcpy must parse to Memcpy{{len:Const(4)}}: {body:?}"
+    );
+}
+
+// Issue #4: a runtime-length memcpy (`i16 %n`) parses to `MemLen::Reg` — the
+// counted-loop form — instead of panicking on the non-const length.
+#[test]
+fn parses_runtime_length_memcpy() {
+    let src = r#"
+@b1 = dso_local global [16 x i8] zeroinitializer, align 1
+@b2 = dso_local global [16 x i8] zeroinitializer, align 1
+define dso_local void @main(i16 %n) {
+  tail call void @llvm.memcpy.p0.p0.i16(ptr align 1 @b1, ptr align 1 @b2, i16 %n, i1 false)
+  ret void
+}
+"#;
+    let m = parse_ll(src);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert!(
+        body.iter().any(|i| matches!(i, Inst::Memcpy(mm)
+            if mm.len == MemLen::Reg(Val::Reg("n".to_string()))
+                && mm.dst == Val::Global("b1".to_string())
+                && mm.src == Val::Global("b2".to_string()))),
+        "runtime-len memcpy must parse to MemLen::Reg(%n): {body:?}"
     );
 }
 

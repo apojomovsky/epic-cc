@@ -40,7 +40,7 @@
 //! layout) and panics loudly if a value is missing from it.
 
 use device::Device;
-use ir::{BinOp, Gep, GepBase, Inst, Module, Ty, Val};
+use ir::{BinOp, Gep, GepBase, Inst, MemLen, Module, Ty, Val};
 use iselcore::{ssa_key, Slot};
 use std::collections::{HashMap, HashSet};
 
@@ -508,6 +508,118 @@ impl<'m> Gen<'m> {
                 self.emit("    MOVWF INDF".to_string());
             }
         }
+    }
+
+    /// Runtime-length memcpy (issue #4): `len` is a 16-bit SSA register,
+    /// SSA-dead after this copy, so the copy may consume it. The loop
+    /// copies one byte per iteration; EVERY byte of the loop state lives
+    /// in fixed common RAM — countdown 0x71/0x72 (the retval bytes, dead
+    /// at a memcpy), byte index 0x7E (the documented free byte), held byte
+    /// 0x7F — so the banking pass can never insert a BANKSEL inside the
+    /// loop and the skip-sensitive test/branch pairs keep their targets:
+    ///
+    ///   count = len                          ; 0x71 = lo, 0x72 = hi
+    ///   idx = 0                              ; 0x7E
+    ///   l_loop:  if (0x71 | 0x72) == 0 -> l_done
+    ///            FSR = src_base + k + terms + idx; W = INDF; 0x7F = W
+    ///            FSR = dst_base + k + terms + idx; W = 0x7F; INDF = W
+    ///            idx++                       ; INCF 0x7E
+    ///            countdown-- (16-bit)        ; MOVLW 1 / SUBWF 0x71,F /
+    ///                                         ; BTFSS STATUS,0 / SUBWF 0x72,F
+    ///            GOTO l_loop
+    ///   l_done:
+    ///
+    /// The 16-bit countdown decrements the lo byte with `MOVLW 1; SUBWF
+    /// 0x71,F` — C = 0 exactly when lo wrapped (was 0), and the `BTFSS
+    /// STATUS,0` skips the hi byte's decrement on no-borrow, so hi
+    /// decrements once per lo wrap: exact for any length. The zero test at
+    /// the top (`MOVF 0x71,W; IORWF 0x72,W; BTFSC STATUS,2`) skips an
+    /// empty copy.
+    /// The FSR setups read the pointer's term registers (any bank — those
+    /// reads are not inside a skip pair), and the source/dest bases are
+    /// window-checked per byte by `emit_fsr_to` (span <= 0x60), so a valid
+    /// program's `idx` never leaves the window. Copying a const (flash)
+    /// source at a runtime length panics loudly (the byte-at-a-time flash
+    /// reader needs the index in W, which the loop's FSR discipline does
+    /// not provide — the constant-length path covers flash sources).
+    fn emit_memcpy_dynamic(&mut self, dst: &Val, src: &Val, len: &Val) {
+        let l_loop = self.fresh_label();
+        let l_done = self.fresh_label();
+        let cnt_lo: u16 = self.retval_lo; // 0x71 — dead at a memcpy
+        let cnt_hi: u16 = self.retval_lo + 1; // 0x72
+        let idx: u16 = 0x7E; // documented free common byte
+        let hold: u16 = 0x7F; // documented free common byte
+        // FSR = base + k + terms + idx for one byte of a pointer; the FSR
+        // must be re-set per byte (one FSR on classic mid-range).
+        let emit_byte_fsr = |g: &mut Self, ptr: &Val| {
+            let (base, k, terms) = match ptr {
+                Val::Reg(r) => g.resolved_for(r),
+                Val::Global(gname) => {
+                    assert!(
+                        !g.global_is_const(gname),
+                        "isel: memcpy into const (flash) global @{gname}"
+                    );
+                    (Base::Global(gname.clone()), 0u8, Vec::new())
+                }
+                _ => panic!("isel: dynamic memcpy ptr must be a reg or global"),
+            };
+            match &base {
+                Base::Global(name) => {
+                    assert!(
+                        !g.global_is_const(name),
+                        "isel: dynamic memcpy of a const (flash) source @{name} is not supported (runtime length; use a constant length for flash sources)"
+                    );
+                    let span = g.object_span(&base);
+                    g.emit_fsr_to(g.global_addr(name), k, &terms, 0, span);
+                }
+                Base::Slot(sname, indirect) => {
+                    assert!(!indirect, "isel: dynamic memcpy through an indirect slot");
+                    let sa = g.slot_addr(g.cur_func, sname).direct();
+                    let span = g.object_span(&base);
+                    g.emit_fsr_to(sa, k, &terms, 0, span);
+                }
+            }
+            g.emit(format!("    MOVF 0x{idx:02X}, W"));
+            g.emit("    ADDWF FSR, F".to_string());
+        };
+        // Length source slot (the SSA reg's own bytes — read once).
+        let la = self.val_addr(len).direct();
+        // countdown = len.
+        self.emit(format!("    MOVF 0x{la:02X}, W"));
+        self.emit(format!("    MOVWF 0x{cnt_lo:02X}"));
+        self.emit(format!("    MOVF 0x{:02X}, W", la + 1));
+        self.emit(format!("    MOVWF 0x{cnt_hi:02X}"));
+        // idx = 0.
+        self.emit(format!("    CLRF 0x{idx:02X}"));
+        self.emit(format!("{l_loop}:"));
+        // Zero test: (cnt_lo | cnt_hi) == 0 -> done. All common RAM, so
+        // no BANKSEL can appear between the BTFSC and its GOTO.
+        self.emit(format!("    MOVF 0x{cnt_lo:02X}, W"));
+        self.emit(format!("    IORWF 0x{cnt_hi:02X}, W"));
+        self.emit("    BTFSC STATUS, 2".to_string());
+        self.emit(format!("    GOTO {l_done}"));
+        // src[i] -> hold.
+        emit_byte_fsr(self, src);
+        self.emit("    MOVF INDF, W".to_string());
+        self.emit(format!("    MOVWF 0x{hold:02X}"));
+        // dst[i] = hold.
+        emit_byte_fsr(self, dst);
+        self.emit(format!("    MOVF 0x{hold:02X}, W"));
+        self.emit("    MOVWF INDF".to_string());
+        // idx++.
+        self.emit(format!("    INCF 0x{idx:02X}, F"));
+        // countdown-- (16-bit): `MOVLW 1; SUBWF lo,F` sets C = 1 when lo
+        // was >= 1 (no borrow) and 0 when lo was 0 (borrow — lo wrapped to
+        // 0xFF). BTFSS skips the hi-byte decrement exactly when there is
+        // no borrow, so the hi byte decrements once per wrap. (The encoder
+        // has no plain DECF — only DECFSZ.) Both SUBWF targets are common
+        // RAM, so no BANKSEL can land inside this skip pair.
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    SUBWF 0x{cnt_lo:02X}, F"));
+        self.emit("    BTFSS STATUS, 0".to_string());
+        self.emit(format!("    SUBWF 0x{cnt_hi:02X}, F"));
+        self.emit(format!("    GOTO {l_loop}"));
+        self.emit(format!("{l_done}:"));
     }
 
     /// `FSR = base_addr + k + byte_off + Σ scale×%reg`, for an object of
@@ -1664,15 +1776,19 @@ impl<'m> Gen<'m> {
             }
             Inst::Gep(_) => {} // virtual: lowered at each load/store use
             Inst::Alloca(_) => {} // virtual: the slot is sized by alloc; lowered at each use
-            Inst::Memcpy(m) => {
-                // Byte loop over the same pointer machinery: src[i] -> dst[i].
-                // Each byte re-resolves both pointers (dst itself may be a
-                // base+k+i expression), exactly like a per-byte load/store.
-                for i in 0..m.len {
-                    self.emit_ptr_load_byte(&m.src, i);
-                    self.emit_ptr_store_w(&m.dst, i);
+            Inst::Memcpy(m) => match &m.len {
+                MemLen::Const(n) => {
+                    // Byte loop over the same pointer machinery: src[i] ->
+                    // dst[i]. Each byte re-resolves both pointers (dst
+                    // itself may be a base+k+i expression), exactly like a
+                    // per-byte load/store.
+                    for i in 0..*n {
+                        self.emit_ptr_load_byte(&m.src, i);
+                        self.emit_ptr_store_w(&m.dst, i);
+                    }
                 }
-            }
+                MemLen::Reg(v) => self.emit_memcpy_dynamic(&m.dst, &m.src, v),
+            },
             Inst::Bin(b) => {
                 assert!(b.ty != Ty::I1, "isel: only i8/i16/i32 binops supported");
                 let da = self.slot_addr(self.cur_func, &b.dst).direct();
