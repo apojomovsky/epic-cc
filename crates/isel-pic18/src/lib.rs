@@ -55,6 +55,13 @@ impl<'m> Gen<'m> {
     /// label call site has to individually remember: every
     /// `self.emit(format!("{{...}}:"))`/`g.emit(format!("{{...}}:"))` in
     /// this file routes through this instead.
+    ///
+    /// Labels are not the ONLY BSR-clobbering join point, though: a
+    /// `CALL` return is another one (the callee runs its own arbitrary
+    /// `MOVLB`s and never restores the caller's bank on `RETURN`), but it
+    /// is not itself a label, so it structurally cannot go through this
+    /// helper — `Inst::Call`'s arm in `emit_inst` resets `self.bsr`
+    /// directly right after emitting `CALL`.
     fn emit_label(&mut self, label: &str) {
         self.emit(format!("{label}:"));
         self.bsr = None;
@@ -235,6 +242,19 @@ impl<'m> Gen<'m> {
                     !matches!(z.val, Val::Const(_)),
                     "isel-pic18: const source Zext not yet supported"
                 );
+                // Mirrors `isel`'s own width guard (`crates/isel/src/lib.rs`,
+                // "isel: zext must not narrow") — without it, a malformed
+                // `Zext` with `to.bytes() <= from.bytes()` would copy
+                // `from.bytes()` bytes into a narrower-or-equal `to.bytes()`
+                // slot below, writing past the destination into whatever
+                // local sits next to it. Not reachable from today's
+                // clang-generated IR, but a real asymmetry with `isel`
+                // otherwise (silent corruption here vs. a clean panic
+                // there).
+                assert!(
+                    z.to.bytes() > z.from.bytes(),
+                    "isel-pic18: zext must widen (to must be strictly wider than from)"
+                );
                 let src = self.val_addr(&z.val).direct();
                 let dst = self.slot_addr(self.cur_func, &z.dst).direct();
                 for i in 0..z.from.bytes() {
@@ -252,6 +272,18 @@ impl<'m> Gen<'m> {
                 assert!(
                     !matches!(s.val, Val::Const(_)),
                     "isel-pic18: const source Sext not yet supported"
+                );
+                // Same width-relationship hazard as `Inst::Zext` above,
+                // mirroring `isel`'s own sext bounds guard
+                // (`crates/isel/src/lib.rs`, "isel: sext only supports
+                // i8/i16 -> i16/i32"): without it, `to.bytes() <=
+                // from.bytes()` would sign-fill zero or a negative number
+                // of high bytes and still have copied `from.bytes()` bytes
+                // into a same-or-narrower `to.bytes()` slot, writing past
+                // the destination.
+                assert!(
+                    s.to.bytes() > s.from.bytes(),
+                    "isel-pic18: sext must widen (to must be strictly wider than from)"
                 );
                 let src = self.val_addr(&s.val).direct();
                 let dst = self.slot_addr(self.cur_func, &s.dst).direct();
@@ -281,6 +313,16 @@ impl<'m> Gen<'m> {
                 assert!(
                     !matches!(t.val, Val::Const(_)),
                     "isel-pic18: const source Trunc not yet supported"
+                );
+                // Mirrors `isel`'s own width guard (`crates/isel/src/lib.rs`,
+                // "isel: trunc must narrow") — without it, a malformed
+                // `Trunc` with `to.bytes() >= from.bytes()` would read
+                // `to.bytes()` bytes starting at `src` below, past the end
+                // of the (narrower) source slot, and copy that overrun into
+                // the destination.
+                assert!(
+                    t.to.bytes() < t.from.bytes(),
+                    "isel-pic18: trunc must narrow (to must be strictly smaller than from)"
                 );
                 let src = self.val_addr(&t.val).direct();
                 let dst = self.slot_addr(self.cur_func, &t.dst).direct();
@@ -376,6 +418,17 @@ impl<'m> Gen<'m> {
                     }
                 }
                 self.emit(format!("    CALL {}", c.func));
+                // A `CALL` return is a BSR-clobbering join point, same
+                // reasoning as `emit_label` (see its doc comment), but it
+                // is NOT itself a label, so `emit_label`'s reset doesn't
+                // cover it: the callee runs its own arbitrary sequence of
+                // `MOVLB`s and never restores the caller's bank on
+                // `RETURN`, so `self.bsr` (which tracks the bank the MOST
+                // RECENT `MOVLB` set) is stale the instant control returns
+                // here. Trusting it would make `operand()` wrongly elide a
+                // needed `MOVLB` on the next banked access after the call,
+                // silently reading/writing the wrong physical address.
+                self.bsr = None;
                 if let Some(d) = &c.dst {
                     let ty = c.ty.expect("isel-pic18: valued call must carry a type");
                     let dst = self.slot_addr(self.cur_func, d).direct();

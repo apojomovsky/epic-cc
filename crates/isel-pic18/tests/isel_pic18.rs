@@ -780,6 +780,91 @@ fn call_copies_scalar_args_and_reads_the_retval_back() {
 }
 
 #[test]
+fn call_return_invalidates_tracked_bsr_so_a_later_banked_access_is_not_misbanked() {
+    // Regression for the final-review finding: `Gen.bsr` tracks the bank
+    // the MOST RECENT *emitted* `MOVLB` set, but a `CALL` transfers control
+    // to a callee that runs its own arbitrary `MOVLB`s and never restores
+    // the caller's bank on `RETURN` — so the tracked value is stale the
+    // instant control returns to the caller, and (unless invalidated)
+    // `operand()` can wrongly elide a `MOVLB` the next banked access
+    // actually needs.
+    //
+    // Shape, closely modeled on the reviewer's repro:
+    //   main: MOVLB 0x1 (tracked bsr = Some(1)), ADDWF/MOVWF against bank-1
+    //         locals (`main::1`/`main::2`/`main::3`, all >= 0x100) ->
+    //         CALL f
+    //   f:    its own ADDWF/MOVWF against BANK-2 locals (`f::1`/`f::2`/
+    //         `f::3`, all >= 0x200) -> emits its own MOVLB 0x2, and never
+    //         restores bank 1 before RETURN, so the REAL hardware BSR is 2
+    //         when control returns to main.
+    //   main: a second `add` reusing %1/%2 (bank-1 addresses again),
+    //         storing into `main::4` (also bank 1).
+    //
+    // Without the fix, main's tracked `bsr` is still `Some(1)` after the
+    // `CALL` (never invalidated) — and the post-call add's operands are
+    // ALSO bank 1, so `operand()` sees tracked==target and wrongly skips
+    // the `MOVLB`. But the REAL BSR at that point is 2 (left over from
+    // `f`), so every banked access in the post-call add actually lands in
+    // bank 2 (`f`'s slots) instead of bank 1 (main's own `%1`/`%2`/
+    // `main::4`) — silently reading `f`'s operands and writing `main::4`'s
+    // result into `f::3`'s address (0x213) instead of `main::4`'s real
+    // address (0x113), leaving `main::4` untouched (0x00).
+    //
+    // With the fix, `self.bsr = None` after `CALL` forces a fresh `MOVLB
+    // 0x1` before the post-call add touches anything, so it correctly
+    // reads main's own bank-1 `%1`/`%2` and writes bank-1 `main::4`.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal c i8\nglobal d i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %1, %2\n\
+             call void @f()\n\
+             %4 = add i8 %1, %2\n\
+             ret void\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @c\n\
+             %2 = load i8 @d\n\
+             %3 = add i8 %1, %2\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("c", 0x22),
+        ("d", 0x23),
+        ("main::1", 0x110), // bank 1
+        ("main::2", 0x111), // bank 1
+        ("main::3", 0x112), // bank 1: pre-call add's dst, forces MOVLB 0x1
+        ("main::4", 0x113), // bank 1: post-call add's dst — the one under test
+        ("f::1", 0x210),    // bank 2
+        ("f::2", 0x211),    // bank 2
+        ("f::3", 0x212),    // bank 2: f's own add dst, forces MOVLB 0x2 for real
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x20] = 3; // a
+    p.ram_mut()[0x21] = 4; // b
+    p.ram_mut()[0x22] = 0x11; // c (f's own operands; must not leak into main::4)
+    p.ram_mut()[0x23] = 0x22; // d
+    p.run(500);
+    assert!(p.halted(), "asm:\n{asm}");
+    assert_eq!(
+        p.ram()[0x112], 7,
+        "sanity: the pre-call add (main::3 = a+b) must still be correct:\nasm:\n{asm}"
+    );
+    assert_eq!(
+        p.ram()[0x113], 7,
+        "post-call add (main::4 = a+b, bank 1) must land at its real bank-1 \
+         address using main's OWN operands, not get silently misbanked into \
+         bank 2 (f's slots) by a stale tracked BSR left over from the CALL:\nasm:\n{asm}"
+    );
+}
+
+#[test]
 #[should_panic(expected = "const byval call arg")]
 fn call_const_byval_arg_is_rejected_not_silently_miscompiled() {
     // A `byval` arg means "copy N bytes from the address `arg.val` points
