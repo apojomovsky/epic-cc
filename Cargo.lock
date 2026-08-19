@@ -48,6 +48,7 @@ dependencies = [
  "ir",
  "irparse",
  "isel",
+ "isel-pic18",
  "legalize",
  "peephole",
  "pic14-sim",
