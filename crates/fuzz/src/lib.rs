@@ -3046,7 +3046,7 @@ fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), Failure> {
 
 /// Locate the driver binary, mirroring the driver crate's e2e pattern.
 ///
-/// The e2e tests (inside `crates/driver`) use `env!("CARGO_BIN_EXE_driver")`,
+/// The e2e tests (inside `crates/driver`) use `env!("CARGO_BIN_EXE_epic-cc")`,
 /// which Cargo sets only for the package that owns the binary; this crate
 /// instead finds the driver next to the running test executable in
 /// `target/<profile>/` (the driver is a workspace member), honoring a
@@ -3067,7 +3067,7 @@ fn driver_binary() -> Result<PathBuf, String> {
             if let Some(p) = std::env::var_os("PIC8_DRIVER") {
                 return Ok(PathBuf::from(p));
             }
-            if let Some(p) = option_env!("CARGO_BIN_EXE_driver") {
+            if let Some(p) = option_env!("CARGO_BIN_EXE_epic-cc") {
                 return Ok(PathBuf::from(p));
             }
             let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -3076,7 +3076,7 @@ fn driver_binary() -> Result<PathBuf, String> {
             if dir.file_name().and_then(|n| n.to_str()) == Some("deps") {
                 dir.pop(); // integration-test binaries live in target/<profile>/deps
             }
-            let candidate = dir.join("driver");
+            let candidate = dir.join("epic-cc");
             let mut cmd = Command::new("cargo");
             cmd.args(["build", "-p", "driver", "--quiet"]);
             if let Ok(profile) = std::env::var("PROFILE") {
