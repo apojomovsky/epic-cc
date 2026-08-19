@@ -67,10 +67,23 @@ fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
 /// alignment; larger arrays advance sequentially), and panic past the
 /// device's last bank.
 fn place_at(device: &Device, addr: u16, width: u8) -> u16 {
-    try_place_at(device, addr, width).unwrap_or_else(|| {
-        let last_end = device.ram_banks.last().expect("a device has at least one GPR bank").1;
-        panic!("alloc: GPR demand exceeds 0x{last_end:X} ({addr:#06x})")
-    })
+    // Only i16/2-byte globals need even alignment; larger arrays advance
+    // sequentially (min(size, 2) keeps a multi-byte value from being padded
+    // out to a multiple of its own width, which would waste RAM).
+    let align = width.min(2);
+    let mut a = addr;
+    loop {
+        let (start, end) = region_for(device, a);
+        let mut base = a.max(start);
+        if base % u16::from(align) != 0 {
+            base += u16::from(align) - (base % u16::from(align));
+        }
+        if base + u16::from(width) - 1 <= end {
+            return base;
+        }
+        // The value doesn't fit in this region; continue just past its end.
+        a = end + 1;
+    }
 }
 
 /// `globals` placed in order with ONE monotonically-advancing cursor —
@@ -541,5 +554,17 @@ mod tests {
         let g4 = global("g4", 4);
         let refs: Vec<&ir::Global> = vec![&g0, &g1, &g2, &g3, &g4];
         assert_eq!(try_place_globals_sequential(&PIC16F877A, &refs), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "0x01f0")]
+    fn place_at_panic_message_shows_stepped_cursor_not_original_arg() {
+        // PIC16F877A's last bank ends at 0x1EF. Trying to place a 2-byte
+        // value at 0x1EF requires even alignment, so it steps to 0x1F0, which
+        // is past the last bank. The panic message must show the stepped
+        // cursor (0x1f0), not the original argument (0x1ef). This regression
+        // test verifies the fix for the bug where delegating to try_place_at
+        // would incorrectly show the original argument.
+        let _ = place_at(&PIC16F877A, 0x1EF, 2);
     }
 }
