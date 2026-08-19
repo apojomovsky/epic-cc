@@ -192,8 +192,13 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Icmp(c) => {
-                assert_eq!(c.ty.bytes(), 1, "isel-pic18: only i8 Icmp implemented so far (Task 9 adds i16)");
-                self.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+                let n = c.ty.bytes();
+                assert!(n == 1 || n == 2, "isel-pic18: only i8/i16 Icmp implemented so far (n={n})");
+                if n == 1 {
+                    self.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+                } else {
+                    self.emit_icmp_i16(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+                }
             }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
@@ -204,6 +209,15 @@ impl<'m> Gen<'m> {
     /// branch. C/Z/N/OV follow PIC18's standard (ARM-style) condition-code
     /// semantics — C=1 means "no borrow" (a>=b unsigned) — already relied
     /// on by P1's `Pic18::sub_flags`.
+    ///
+    /// Delegates the actual flag test to `emit_cmp_branch` (shared with
+    /// the i16 path, Task 9). A single byte has no "next byte" to defer
+    /// to, so the "equal" outcome must resolve directly to this
+    /// predicate's real answer at equality: true for the non-strict/eq
+    /// predicates (`eq`, `uge`, `ule`, `sge`, `sle`), false for the
+    /// strict ones (`ne`, `ult`, `ugt`, `slt`, `sgt`) — NOT uniformly
+    /// `l_false`, which would silently invert `uge`/`ule`/`sge`/`sle` at
+    /// equality (e.g. `ule(5, 5)` must stay `1`).
     fn emit_icmp_byte(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
         // `val_addr` maps `Val::Const(k)` to a RAM ADDRESS (`k & 0xFF`),
         // not a literal — a constant on the LHS (e.g. `icmp ult i8 5, %x`)
@@ -215,72 +229,211 @@ impl<'m> Gen<'m> {
             !matches!(a, Val::Const(_)),
             "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
         );
-        self.emit_load_w(&b, 0);
-        let av = self.val_addr(&a).direct();
+        let l_true = self.fresh_label();
+        let l_false = self.fresh_label();
+        let l_done = self.fresh_label();
+        let l_equal = if matches!(pred, "eq" | "uge" | "ule" | "sge" | "sle") {
+            l_true.clone()
+        } else {
+            l_false.clone()
+        };
+        self.emit_cmp_branch(&a, &b, 0, pred, &l_true, &l_false, &l_equal);
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+    }
+
+    /// `dst = (a <pred> b) ? 1 : 0` for two bytes: compare the high byte
+    /// (offset 1) first, with `pred`'s own signedness — if it differs,
+    /// that alone decides the whole 16-bit result, since the sign only
+    /// ever lives in the most-significant byte. Only when the high bytes
+    /// are equal does the low byte (offset 0) get compared, always
+    /// **unsigned** (`slt`->`ult`, `sle`->`ule`, `sgt`->`ugt`, `sge`->`uge`;
+    /// `ult`/`ule`/`ugt`/`uge` already are their own tie-break).
+    ///
+    /// `eq`/`ne` don't fit this "high byte decides" shape at all — they
+    /// need BOTH bytes equal (`eq`) or EITHER byte different (`ne`), so
+    /// they're dispatched to their own short-circuit, `emit_icmp_i16_eq_ne`,
+    /// instead of the tie-break machinery built for the eight ordering
+    /// predicates.
+    fn emit_icmp_i16(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
+        // Same const-LHS hazard as `emit_icmp_byte` — this is a separate
+        // entry point (not routed through `emit_icmp_byte`), so it needs
+        // its own guard rather than inheriting one transitively.
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        if pred == "eq" || pred == "ne" {
+            self.emit_icmp_i16_eq_ne(a, b, pred, dst);
+            return;
+        }
+        let unsigned_tiebreak = match pred {
+            "slt" => "ult",
+            "sle" => "ule",
+            "sgt" => "ugt",
+            "sge" => "uge",
+            other => other, // ult/ule/ugt/uge tie-break against themselves
+        };
+        let l_true = self.fresh_label();
+        let l_false = self.fresh_label();
+        let l_done = self.fresh_label();
+        let l_check_low = self.fresh_label();
+
+        // High byte, `pred`'s own signedness. Equal high bytes never
+        // decide the outcome by themselves (a lower byte could still flip
+        // the overall order either way) so "equal" always defers to the
+        // low-byte tie-break, regardless of predicate.
+        self.emit_cmp_branch(&a, &b, 1, pred, &l_true, &l_false, &l_check_low);
+        self.emit(format!("{l_check_low}:"));
+        // Low byte, unsigned tie-break. Here "equal" means the two
+        // 16-bit values are fully identical, so — unlike the high byte —
+        // it DOES have a final answer: true for the non-strict tie-break
+        // predicates (`ule`/`uge`), false for the strict ones
+        // (`ult`/`ugt`).
+        let l_low_equal = if matches!(unsigned_tiebreak, "ule" | "uge") {
+            l_true.clone()
+        } else {
+            l_false.clone()
+        };
+        self.emit_cmp_branch(&a, &b, 0, unsigned_tiebreak, &l_true, &l_false, &l_low_equal);
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+    }
+
+    /// `eq`/`ne` for i16: true (for `eq`) only when both bytes match;
+    /// `ne` is the mirror. Two direct byte-equality checks (`SUBWF` +
+    /// `BNZ`), independent of the signed/unsigned tie-break machinery
+    /// `emit_icmp_i16` uses for the eight ordering predicates — a partial
+    /// match (high byte equal, low byte different) is decisive here in a
+    /// way it never is for `slt`/`ult`/etc.
+    fn emit_icmp_i16_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
+        let l_true = self.fresh_label();
+        let l_false = self.fresh_label();
+        let l_done = self.fresh_label();
+        let l_mismatch = if pred == "eq" { &l_false } else { &l_true };
+        for offset in 0..2u8 {
+            self.emit_load_w(&b, offset);
+            let av = self.val_addr(&a).direct() + u16::from(offset);
+            let (acc, af) = self.operand(av);
+            let bank = if acc == 0 { "A" } else { "B" };
+            self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
+            self.emit(format!("    BNZ {l_mismatch}"));
+        }
+        // Every byte matched: `eq` is true, `ne` is false.
+        let l_all_matched = if pred == "eq" { &l_true } else { &l_false };
+        self.emit(format!("    BRA {l_all_matched}"));
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+    }
+
+    /// The shared flag-test core behind `emit_icmp_byte`/`emit_icmp_i16`:
+    /// computes `a - b` (SUBWF, `W = a - b`) for the byte at `byte_offset`
+    /// and branches on `pred`'s C/Z/N/OV condition — three ways, not two:
+    /// `l_true` if `pred` holds for this byte pair, `l_false` if it
+    /// definitely does not (the bytes differ in the "wrong" direction),
+    /// or `l_equal` if the two bytes are equal. Equality is inherently
+    /// ambiguous from a single byte's flags alone — the caller decides
+    /// what it means: "go check the next byte" (i16's high-byte compare),
+    /// or "that IS the final answer" (i8, and i16's low-byte tie-break),
+    /// by choosing what `l_equal` points at.
+    ///
+    /// `eq`/`ne` are exempt from the three-way split — a byte's equality
+    /// already IS their complete per-byte answer, so their arms use only
+    /// `l_true`/`l_false`. i16's `Icmp` lowering never calls this for
+    /// `eq`/`ne` (see `emit_icmp_i16_eq_ne`); i8's `emit_icmp_byte` does,
+    /// with `l_equal` bound to whichever of `l_true`/`l_false` matches.
+    fn emit_cmp_branch(&mut self, a: &Val, b: &Val, byte_offset: u8, pred: &str, l_true: &str, l_false: &str, l_equal: &str) {
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        self.emit_load_w(b, byte_offset);
+        let av = self.val_addr(a).direct() + u16::from(byte_offset);
         let (acc, af) = self.operand(av);
         let bank = if acc == 0 { "A" } else { "B" };
         self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
 
-        let l_true = self.fresh_label();
-        let l_false = self.fresh_label();
-        let l_done = self.fresh_label();
         match pred {
-            "eq" => self.emit(format!("    BZ {l_true}")),
-            "ne" => self.emit(format!("    BNZ {l_true}")),
-            "ult" => self.emit(format!("    BNC {l_true}")),
-            "uge" => self.emit(format!("    BC {l_true}")),
-            "ugt" => {
-                // C=1 AND Z=0
-                self.emit(format!("    BNC {l_false}"));
+            "eq" => {
+                self.emit(format!("    BZ {l_true}"));
+                self.emit(format!("    BRA {l_false}"));
+            }
+            "ne" => {
                 self.emit(format!("    BNZ {l_true}"));
+                self.emit(format!("    BRA {l_false}"));
+            }
+            "ult" => {
+                self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
+                self.emit(format!("    BZ {l_equal}"));
+                self.emit(format!("    BRA {l_false}"));
+            }
+            "uge" => {
+                self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
+                self.emit(format!("    BZ {l_equal}"));
+                self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
+            }
+            "ugt" => {
+                self.emit(format!("    BNC {l_false}")); // C=0: a<b, definite
+                self.emit(format!("    BZ {l_equal}"));
+                self.emit(format!("    BRA {l_true}")); // C=1,Z=0: a>b, definite
             }
             "ule" => {
-                // C=0 OR Z=1
-                self.emit(format!("    BNC {l_true}"));
-                self.emit(format!("    BZ {l_true}"));
+                self.emit(format!("    BNC {l_true}")); // C=0: a<b, definite
+                self.emit(format!("    BZ {l_equal}"));
+                self.emit(format!("    BRA {l_false}")); // C=1,Z=0: a>b, definite
             }
             "slt" => {
-                // N != OV: true if (N set and OV clear) or (N clear and OV set)
+                // N != OV: true if (N set and OV clear) or (N clear and OV set).
+                self.emit(format!("    BZ {l_equal}"));
                 let l_check_ov = self.fresh_label();
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BOV {l_true}")); // N=0: true only if OV=1
                 self.emit(format!("    BRA {l_false}"));
                 self.emit(format!("{l_check_ov}:"));
                 self.emit(format!("    BNOV {l_true}")); // N=1: true only if OV=0
+                self.emit(format!("    BRA {l_false}"));
             }
             "sge" => {
-                // N == OV: true if (N set and OV set) or (N clear and OV clear)
+                // N == OV: true if (N set and OV set) or (N clear and OV clear).
+                self.emit(format!("    BZ {l_equal}"));
                 let l_check_ov = self.fresh_label();
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BNOV {l_true}")); // N=0: true only if OV=0
                 self.emit(format!("    BRA {l_false}"));
                 self.emit(format!("{l_check_ov}:"));
                 self.emit(format!("    BOV {l_true}")); // N=1: true only if OV=1
+                self.emit(format!("    BRA {l_false}"));
             }
             "sgt" => {
-                // Z=0 AND N==OV
-                self.emit(format!("    BZ {l_false}"));
+                // Z=0 AND N==OV.
+                self.emit(format!("    BZ {l_equal}"));
                 let l_check_ov = self.fresh_label();
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BNOV {l_true}"));
                 self.emit(format!("    BRA {l_false}"));
                 self.emit(format!("{l_check_ov}:"));
                 self.emit(format!("    BOV {l_true}"));
+                self.emit(format!("    BRA {l_false}"));
             }
             "sle" => {
-                // Z=1 OR N!=OV
-                self.emit(format!("    BZ {l_true}"));
+                // Z=1 OR N!=OV.
+                self.emit(format!("    BZ {l_equal}"));
                 let l_check_ov = self.fresh_label();
                 self.emit(format!("    BN {l_check_ov}"));
                 self.emit(format!("    BOV {l_true}"));
                 self.emit(format!("    BRA {l_false}"));
                 self.emit(format!("{l_check_ov}:"));
                 self.emit(format!("    BNOV {l_true}"));
+                self.emit(format!("    BRA {l_false}"));
             }
             other => panic!(
                 "isel-pic18: icmp predicate {other} unreachable (ir::parse validates the 10-entry set)"
             ),
         }
+    }
+
+    /// Common `l_false: MOVLW 0x00 / l_true: MOVLW 0x01` materialization
+    /// shared by `emit_icmp_byte`, `emit_icmp_i16`, and
+    /// `emit_icmp_i16_eq_ne` — the only difference between the three is
+    /// how they arrive at `l_true`/`l_false`.
+    fn emit_materialize_bool(&mut self, l_true: &str, l_false: &str, l_done: &str, dst: &str) {
         self.emit(format!("{l_false}:"));
         self.emit("    MOVLW 0x00".to_string());
         self.emit(format!("    BRA {l_done}"));

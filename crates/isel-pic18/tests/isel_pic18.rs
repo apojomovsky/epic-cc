@@ -229,6 +229,67 @@ fn icmp_sgt_and_sle_combine_z_and_n_xor_ov() {
 }
 
 #[test]
+fn icmp_i16_ties_break_on_the_low_byte() {
+    // High bytes equal (0x01), low bytes differ: 0x0105 vs 0x0103.
+    for (pred, expect) in [("ult", 0u8), ("ugt", 1), ("eq", 0), ("slt", 0), ("sgt", 1)] {
+        let m = parse(&format!("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = icmp {pred} i16 %1, %2\n    ret void\n"));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("main::1", 0x14), ("main::2", 0x16), ("main::3", 0x18)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = 0x05; // a lo
+        p.ram_mut()[0x11] = 0x01; // a hi
+        p.ram_mut()[0x12] = 0x03; // b lo
+        p.ram_mut()[0x13] = 0x01; // b hi
+        p.run(300);
+        assert_eq!(p.ram()[0x18], expect, "{pred}(0x0105, 0x0103)");
+    }
+}
+
+#[test]
+fn icmp_i16_high_byte_alone_decides_when_it_differs() {
+    // a=0x00FF, b=0x0100: a < b even though a's low byte is larger.
+    let m = parse("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = icmp ult i16 %1, %2\n    ret void\n");
+    let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("main::1", 0x14), ("main::2", 0x16), ("main::3", 0x18)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x10] = 0xFF;
+    p.ram_mut()[0x11] = 0x00;
+    p.ram_mut()[0x12] = 0x00;
+    p.ram_mut()[0x13] = 0x01;
+    p.run(300);
+    assert_eq!(p.ram()[0x18], 1);
+}
+
+#[test]
+fn icmp_i16_full_equality_resolves_correctly_for_every_predicate() {
+    // a == b == 0x0142 for all ten predicates: this exercises the "equal
+    // at every byte" edge case for both the high-byte compare (where
+    // `emit_cmp_branch`'s `l_equal` always defers to the low-byte check)
+    // and the low-byte tie-break (where `l_equal` must resolve to this
+    // predicate's real answer at full equality — true for the
+    // non-strict/eq predicates, false for the strict ones).
+    for (pred, expect) in [
+        ("eq", 1u8), ("ne", 0),
+        ("ult", 0), ("ule", 1), ("ugt", 0), ("uge", 1),
+        ("slt", 0), ("sle", 1), ("sgt", 0), ("sge", 1),
+    ] {
+        let m = parse(&format!("global a i16\nglobal b i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    %3 = icmp {pred} i16 %1, %2\n    ret void\n"));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x12), ("main::1", 0x14), ("main::2", 0x16), ("main::3", 0x18)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = 0x42; // a lo
+        p.ram_mut()[0x11] = 0x01; // a hi
+        p.ram_mut()[0x12] = 0x42; // b lo
+        p.ram_mut()[0x13] = 0x01; // b hi
+        p.run(300);
+        assert_eq!(p.ram()[0x18], expect, "{pred}(0x0142, 0x0142)");
+    }
+}
+
+#[test]
 #[should_panic(expected = "const-LHS")]
 fn icmp_const_lhs_is_rejected_not_silently_miscompiled() {
     // `val_addr` maps `Val::Const(k)` to `Slot::Direct(k & 0xFF)` — treating
@@ -240,5 +301,18 @@ fn icmp_const_lhs_is_rejected_not_silently_miscompiled() {
         "global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = icmp ult i8 5, %1\n    ret void\n",
     );
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
+
+#[test]
+#[should_panic(expected = "const-LHS")]
+fn icmp_i16_const_lhs_is_rejected_not_silently_miscompiled() {
+    // Same hazard as `icmp_const_lhs_is_rejected_not_silently_miscompiled`,
+    // but for the new i16 path (`emit_icmp_i16`) — the guard must not be
+    // bypassed just because the width changed.
+    let m = parse(
+        "global x i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @x\n    %2 = icmp ult i16 5, %1\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x14)]);
     let _ = select(&PIC18F4550, &m, &addrs);
 }
