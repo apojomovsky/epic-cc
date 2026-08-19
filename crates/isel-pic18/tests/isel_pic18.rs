@@ -483,22 +483,22 @@ fn br_unconditionally_jumps_to_the_target_block() {
 
 #[test]
 fn brcond_branches_on_the_condition_byte() {
-    let m = parse("global c i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    br i1 %1 t f\n  block t:\n    ret void\n  block f:\n    ret void\n");
-    let addrs = addrs(&[("c", 0x10), ("main::1", 0x11)]);
+    // Each target block stores a DISTINGUISHABLE value to @out (matching
+    // the pattern `select_picks_a_when_cond_is_true_and_b_otherwise` uses
+    // for `Select`) so this test actually proves which way `BZ`/`BRA`
+    // branch, not just that some path halts without panicking — a
+    // polarity inversion (`BZ` going to the wrong target) would still
+    // pass a "both paths halt" check but fails this one.
+    let m = parse("global c i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    br i1 %1 t f\n  block t:\n    store i8 1 @out\n    ret void\n  block f:\n    store i8 2 @out\n    ret void\n");
+    let addrs = addrs(&[("c", 0x10), ("out", 0x11), ("main::1", 0x12)]);
     let asm = select(&PIC18F4550, &m, &addrs);
     let words = asm::assemble_pic18(&asm);
-    for (c, taken_first) in [(1u8, true), (0, false)] {
+    for (c, expect) in [(1u8, 1u8), (0, 2)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
         p.ram_mut()[0x10] = c;
-        // Both target blocks are just `RETURN` after `CALL main`'s frame,
-        // so the only observable difference is which path halts sooner;
-        // assert it runs to completion without panicking on either path
-        // (the exact instruction-count assertion is brittle — prefer
-        // proving both paths are reachable and correct via a later e2e
-        // fixture instead, per Task 15).
         p.run(200);
-        let _ = taken_first;
         assert!(p.halted());
+        assert_eq!(p.ram()[0x11], expect, "brcond(cond={c}) took the wrong target");
     }
 }
 
@@ -535,6 +535,108 @@ fn phi_copies_the_incoming_value_before_the_predecessor_blocks_terminator() {
     assert!(asm.contains("main_Lj:"), "asm:\n{asm}");
     assert!(asm.contains("MOVLW 0x05"), "asm:\n{asm}");
     assert!(asm.contains("MOVLW 0x07"), "asm:\n{asm}");
+    // Bare `asm.contains(...)` above doesn't confirm WHICH block each copy
+    // landed in — split the asm on block labels and check per-section, so
+    // a copy landing in the wrong predecessor's section (or in neither)
+    // would fail this test even though the whole-file `contains` checks
+    // above would still pass.
+    let a_section = block_section(&asm, "main_La");
+    let b_section = block_section(&asm, "main_Lb");
+    assert!(a_section.contains("MOVLW 0x05"), "block a's section:\n{a_section}");
+    assert!(!a_section.contains("MOVLW 0x07"), "block a's section must not contain b's phi copy:\n{a_section}");
+    assert!(b_section.contains("MOVLW 0x07"), "block b's section:\n{b_section}");
+    assert!(!b_section.contains("MOVLW 0x05"), "block b's section must not contain a's phi copy:\n{b_section}");
+}
+
+/// The lines belonging to one block's label, up to (but excluding) the
+/// next line that looks like a label (ends with `:`). Used to check that
+/// per-predecessor phi copies land in the RIGHT block's section, not just
+/// somewhere in the whole function's asm.
+fn block_section(asm: &str, label: &str) -> String {
+    let marker = format!("{label}:");
+    let lines: Vec<&str> = asm.lines().collect();
+    let start = lines
+        .iter()
+        .position(|l| l.trim() == marker)
+        .unwrap_or_else(|| panic!("label {label} not found in:\n{asm}"));
+    lines[start + 1..]
+        .iter()
+        .take_while(|l| !l.trim_end().ends_with(':'))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn ret_with_a_value_writes_it_into_the_fixed_retval_region() {
+    // `Ret(Some((ty, v)))` is new in this task — before this task, only
+    // `Ret(None)` was handled at all (inside `emit_inst`, since it hadn't
+    // moved into the terminator pass yet). It writes each byte of the
+    // returned value into the fixed retval region (`device.common_ram`,
+    // which is 0x0000 for `PIC18F4550`) before `RETURN`. Check both an i8
+    // and an i16 return so both the single-byte and multi-byte loop paths
+    // are exercised.
+    let m = parse("fn main(void) ()\n  block entry:\n    ret i8 42\n");
+    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.run(200);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x00], 42, "i8 retval should land at the fixed retval region (0x0000)");
+
+    let m16 = parse("fn main(void) ()\n  block entry:\n    ret i16 4660\n"); // 4660 == 0x1234
+    let asm16 = select(&PIC18F4550, &m16, &addrs(&[]));
+    let words16 = asm::assemble_pic18(&asm16);
+    let mut p16 = pic14_sim::Pic18::new(words16);
+    p16.run(200);
+    assert!(p16.halted());
+    assert_eq!(p16.ram()[0x00], 0x34, "i16 retval low byte");
+    assert_eq!(p16.ram()[0x01], 0x12, "i16 retval high byte");
+}
+
+#[test]
+fn rotated_loop_exit_phi_reads_the_pre_increment_value_not_the_clobbered_one() {
+    // Regression for the Critical bug found in task review of the first
+    // Task 12 implementation: phi copies were keyed by PREDECESSOR alone,
+    // so a `BrCond` whose two successors both consume phis ran BOTH
+    // successors' copies unconditionally before the branch. On this
+    // rotated-loop shape (the standard clang -O1 loop shape, and the one
+    // `scalar.c` — a Task 15 e2e fixture — actually produces), that
+    // clobbers the loop header's phi slot (`%2`) with the next-iteration
+    // value BEFORE the exit block's phi (`%5`) gets a chance to read the
+    // CURRENT one, so the exit block would read a wrong, clobbered value.
+    //
+    // Loop shape: `%2` (the header phi) starts at 0 (from `entry`), and
+    // each iteration through `body` computes `%3 = %2 + 1`, loops back
+    // while `%3 < 3` (feeding `%2 <- %3` on that back edge), and exits
+    // once `%3 == 3` (feeding `%5 <- %2`, the CURRENT value BEFORE this
+    // iteration's increment, into the exit block).
+    //
+    // Trace: iter1 %2=0,%3=1,cont(1<3); iter2 %2=1,%3=2,cont(2<3);
+    // iter3 %2=2,%3=3,exit(3<3 false) -> %5 must be 2 (the value %2 held
+    // going into the FINAL iteration), not 3 (the clobbered post-increment
+    // value the original bug would have produced).
+    let m = parse(
+        "global out i8\nfn main(void) ()\n\
+         block entry:\n\
+           br body\n\
+         block body:\n\
+           %2 = phi i8 0 entry %3 body\n\
+           %3 = add i8 %2, 1\n\
+           %4 = icmp ult i8 %3, 3\n\
+           br i1 %4 body exit\n\
+         block exit:\n\
+           %5 = phi i8 %2 body\n\
+           store i8 %5 @out\n\
+           ret void\n",
+    );
+    let addrs = addrs(&[("out", 0x10), ("main::2", 0x11), ("main::3", 0x12), ("main::4", 0x13), ("main::5", 0x14)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x10], 2, "exit's phi must read %2's pre-increment value (2), not the clobbered next-iteration value (3)");
 }
 
 #[test]

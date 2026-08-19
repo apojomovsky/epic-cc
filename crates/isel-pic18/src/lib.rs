@@ -7,10 +7,10 @@
 //! abstraction, and PIC14's working code must never be at risk from a
 //! PIC18 edit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use device::Device;
-use ir::{Inst, Module, Ty, Val};
+use ir::{Func, Inst, Module, Ty, Val};
 use iselcore::{ssa_key, Slot};
 
 struct Gen<'m> {
@@ -568,6 +568,122 @@ impl<'m> Gen<'m> {
     }
 }
 
+/// The classic iterative dominator sets for a function's CFG: `doms[b]` is
+/// the set of blocks that dominate block `b`. Used to classify phi-copy
+/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred` — the
+/// pred is inside the merge's loop, so on that edge the merge's phi slots
+/// hold the CURRENT iteration's values. Ported from `isel`'s own
+/// `block_dominators` (`crates/isel/src/lib.rs:3977-4022`) — that function
+/// is private to the `isel` crate (not `pub`), and this task's scope is
+/// limited to `isel-pic18`'s own files, so the algorithm is duplicated
+/// here rather than shared. Covers self-loops (pred == merge) AND
+/// separate-latch back edges (pred is a latch block).
+fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
+    let entry = &f.blocks[0].label;
+    let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
+    // Predecessor lists from the terminators' targets (the terminator is
+    // the last inst of every block).
+    let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+    for b in &f.blocks {
+        let targets: Vec<&str> = match b.insts.last() {
+            Some(Inst::Br(br)) => vec![br.target.as_str()],
+            Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+            _ => vec![],
+        };
+        for t in targets {
+            preds.entry(t).or_default().push(b.label.as_str());
+        }
+    }
+    let mut dom: HashMap<String, HashSet<String>> = HashMap::new();
+    dom.insert(entry.clone(), HashSet::from([entry.clone()]));
+    for b in &f.blocks {
+        if b.label != *entry {
+            dom.insert(b.label.clone(), all.clone());
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for b in &f.blocks {
+            if b.label == *entry {
+                continue;
+            }
+            let mut new: HashSet<String> = match preds.get(b.label.as_str()) {
+                Some(ps) => ps
+                    .iter()
+                    .map(|p| dom[*p].clone())
+                    .reduce(|a, c| a.intersection(&c).cloned().collect())
+                    .unwrap_or_else(|| all.clone()),
+                None => all.clone(),
+            };
+            new.insert(b.label.clone());
+            if new != dom[&b.label] {
+                dom.insert(b.label.clone(), new);
+                changed = true;
+            }
+        }
+    }
+    dom
+}
+
+/// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
+/// copy never overwrites a slot a later copy still needs to read. Ported
+/// from `isel`'s own `emit_phi_copies` (`crates/isel/src/lib.rs:4296-4345`,
+/// private to that crate — same reason as `block_dominators` above).
+///
+/// The ordering depends on whether the edge is a BACK edge into the merge
+/// (`back_edge`, from `block_dominators` — the merge dominates the pred):
+/// - Back edge: the merge's phi slots hold the CURRENT iteration's values,
+///   so a copy reading a slot another copy writes must run BEFORE the
+///   overwrite (reader first).
+/// - Forward edge: a phi slot is only defined by THIS edge's copies, so a
+///   copy reading a slot another copy writes must run AFTER its definer
+///   (writer first).
+/// A true cycle (%a <- %b, %b <- %a) needs a temp register, so it panics
+/// loudly rather than silently miscompile.
+fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
+    let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
+        .iter()
+        .map(|(dst, ty, val)| {
+            let da = g.slot_addr(g.cur_func, dst).direct();
+            let src = match val {
+                Val::Reg(r) => Some(g.slot_addr(g.cur_func, r).direct()),
+                _ => None,
+            };
+            (da, src, *ty, val.clone())
+        })
+        .collect();
+    let n = pending.len();
+    let mut emitted = vec![false; n];
+    let mut emitted_count = 0usize;
+    while emitted_count < n {
+        let mut progress = false;
+        for i in 0..n {
+            if emitted[i] {
+                continue;
+            }
+            let (da, src, ty, val) = &pending[i];
+            let blocked = if back_edge {
+                (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
+            } else {
+                match src {
+                    Some(s) => (0..n).any(|j| !emitted[j] && j != i && pending[j].0 == *s),
+                    None => false,
+                }
+            };
+            if !blocked {
+                g.emit_move_val_to_slot(val, *ty, *da);
+                emitted[i] = true;
+                emitted_count += 1;
+                progress = true;
+            }
+        }
+        if !progress {
+            panic!("isel-pic18: cyclic phi copies not supported");
+        }
+    }
+}
+
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
     let (common_lo, _) = device
         .common_ram
@@ -607,38 +723,48 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             let lbl = if i == 0 { f.name.clone() } else { format!("{}_L{}", f.name, b.label) };
             labels.insert(b.label.clone(), lbl);
         }
+        // Phi elimination: for each (predecessor, merge) EDGE — not just
+        // the predecessor — the copies that must run when that edge is
+        // taken. Keying by predecessor alone (Task 12's original version)
+        // is a real miscompile on a `BrCond` whose two successors both
+        // consume phis: running both successors' copies unconditionally
+        // before the branch clobbers a loop header's phi slot with the
+        // next-iteration value before the exit edge's phi gets a chance to
+        // read the CURRENT one. Ported from `isel`'s own scheme
+        // (`crates/isel/src/lib.rs:4067-4086`).
+        let mut phi_copies: HashMap<(String, String), Vec<(String, Ty, Val)>> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Phi(p) = inst {
+                    for (val, pred) in &p.incoming {
+                        phi_copies
+                            .entry((pred.clone(), b.label.clone()))
+                            .or_default()
+                            .push((p.dst.clone(), p.ty, val.clone()));
+                    }
+                }
+            }
+        }
+        let doms = block_dominators(f);
         for b in &f.blocks {
             g.emit(format!("{}:", labels[&b.label]));
             g.bsr = None; // conservative: BSR is unknown at any branch target
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
                 match inst {
-                    Inst::Phi(_) => {} // handled per-predecessor below, not here
+                    Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                     Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(inst),
                     other => g.emit_inst(other),
                 }
             }
-            // Emit copies for every successor block's Phi entries whose
-            // incoming block is this one, THEN the terminator itself.
-            let successors: Vec<&str> = match terminator {
-                Some(Inst::Br(br)) => vec![br.target.as_str()],
-                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
-                _ => vec![],
-            };
-            for succ in &successors {
-                if let Some(sb) = f.blocks.iter().find(|sb| &sb.label == succ) {
-                    for inst in &sb.insts {
-                        if let Inst::Phi(p) = inst {
-                            if let Some((val, _)) = p.incoming.iter().find(|(_, from)| from == &b.label) {
-                                let dst = g.slot_addr(f.name.as_str(), &p.dst).direct();
-                                g.emit_move_val_to_slot(val, p.ty, dst);
-                            }
-                        }
-                    }
-                }
-            }
             match terminator {
-                Some(Inst::Br(br)) => g.emit(format!("    BRA {}", labels[&br.target])),
+                Some(Inst::Br(br)) => {
+                    let merge = br.target.clone();
+                    if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
+                        emit_phi_copies(&mut g, c, doms[&b.label].contains(&merge));
+                    }
+                    g.emit(format!("    BRA {}", labels[&merge]));
+                }
                 Some(Inst::BrCond(bc)) => {
                     // Same hazard class as `Select`'s cond (Task 11, see
                     // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
@@ -651,9 +777,55 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                         !matches!(bc.cond, Val::Const(_)),
                         "isel-pic18: const cond BrCond not yet supported"
                     );
+                    let lt = labels[&bc.t].clone();
+                    let lf = labels[&bc.f].clone();
+                    let t_copies = phi_copies.get(&(b.label.clone(), bc.t.clone())).cloned();
+                    let f_copies = phi_copies.get(&(b.label.clone(), bc.f.clone())).cloned();
                     g.emit_load_w(&bc.cond, 0);
-                    g.emit(format!("    BZ {}", labels[&bc.f]));
-                    g.emit(format!("    BRA {}", labels[&bc.t]));
+                    // Unlike PIC14's BTFSC/BTFSS (a 1-instruction SKIP, so a
+                    // copy sequence longer than one instruction needs an
+                    // extra `lcop` block to route through), PIC18's BZ/BNZ
+                    // are real branches to a label — so each edge's copies
+                    // can be inlined directly along that edge's own path,
+                    // with no intermediate copy-block indirection needed.
+                    match (t_copies, f_copies) {
+                        // Plain branch, no phi consumers on either edge —
+                        // exactly Task 12's original (correct) shape.
+                        (None, None) => {
+                            g.emit(format!("    BZ {lf}"));
+                            g.emit(format!("    BRA {lt}"));
+                        }
+                        // Only the f (cond==0) edge feeds a phi: BZ can't
+                        // jump straight to `lf` anymore (the copies must
+                        // run first), so it falls through into the copies
+                        // instead; the t edge, needing none, still gets a
+                        // direct branch.
+                        (None, Some(cf)) => {
+                            g.emit(format!("    BNZ {lt}"));
+                            emit_phi_copies(&mut g, &cf, doms[&b.label].contains(&bc.f));
+                            g.emit(format!("    BRA {lf}"));
+                        }
+                        // Only the t (cond!=0) edge feeds a phi: BZ still
+                        // jumps straight to `lf` (no copies needed there);
+                        // falling through (cond!=0) runs t's copies first.
+                        (Some(ct), None) => {
+                            g.emit(format!("    BZ {lf}"));
+                            emit_phi_copies(&mut g, &ct, doms[&b.label].contains(&bc.t));
+                            g.emit(format!("    BRA {lt}"));
+                        }
+                        // Both edges feed a phi: BZ routes to a fresh local
+                        // label that runs the f-edge's copies, so neither
+                        // edge's copies ever run on the other edge's path.
+                        (Some(ct), Some(cf)) => {
+                            let l_fcopies = g.fresh_label();
+                            g.emit(format!("    BZ {l_fcopies}"));
+                            emit_phi_copies(&mut g, &ct, doms[&b.label].contains(&bc.t));
+                            g.emit(format!("    BRA {lt}"));
+                            g.emit(format!("{l_fcopies}:"));
+                            emit_phi_copies(&mut g, &cf, doms[&b.label].contains(&bc.f));
+                            g.emit(format!("    BRA {lf}"));
+                        }
+                    }
                 }
                 Some(Inst::Ret(None)) => g.emit("    RETURN".to_string()),
                 Some(Inst::Ret(Some((ty, v)))) => {
