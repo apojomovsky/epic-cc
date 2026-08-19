@@ -138,6 +138,30 @@ fn roundtrips_control_flow_call_and_cast() {
 }
 
 #[test]
+fn roundtrips_runtime_length_memcpy() {
+    // Issue #4: the register-length form (`memcpy dst src %n`) round-trips
+    // as MemLen::Reg — the counted-loop form — not as a const parse error.
+    let text = "global a i8\nfn f(i16) (n=i16)\n  block entry:\n    memcpy @a %1 %n\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    assert!(out.contains("memcpy @a %1 %n"), "runtime-len memcpy\n---\n{out}");
+    // stable fixed point: parse -> serialize -> parse -> serialize
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    // the parsed len is the register form
+    match &m2.funcs[0].blocks[0].insts[0] {
+        ir::Inst::Memcpy(mm) => {
+            assert_eq!(
+                mm.len,
+                ir::MemLen::Reg(ir::Val::Reg("n".to_string())),
+                "len must round-trip as the register form"
+            );
+        }
+        other => panic!("expected Memcpy, got {other:?}"),
+    }
+}
+
+#[test]
 fn roundtrips_reworked_gep_alloca_memcpy_and_params() {
     let text = "global a i8\nfn f(i16) (x=i8, s=sret)\n  block entry:\n    %p = gep %s +2 +2*%x\n    %1 = alloca 4\n    memcpy @a %1 4\n    ret void\n";
     let m = parse(text);

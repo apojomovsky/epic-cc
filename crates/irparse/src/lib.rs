@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ir::{Alloca, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin, FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, Memcpy, Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
+use ir::{Alloca, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin, FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, Memcpy, MemLen, Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
 
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
@@ -913,8 +913,17 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 let a = split_top_level(args_str, ',');
                 let dst = parse_call_ptr_val(a[0], types, fresh, &mut out);
                 let src = parse_call_ptr_val(a[1], types, fresh, &mut out);
-                // const-len <= 255 assert + non-const-len panic: len is u8
-                let len: u8 = a[2].split_whitespace().last().unwrap().parse().expect("irparse: memcpy len must be a const u8 <= 255");
+                // Len: `i16 N` (const, unrolled — the M7 form, bounded to
+                // 255 bytes) or `i16 %r` (runtime length, issue #4 — the
+                // counted loop; the value is SSA-dead after the copy, so
+                // isel may decrement the length slot in place).
+                let len_tok = a[2].split_whitespace().last().unwrap();
+                let len = if let Some(r) = len_tok.strip_prefix('%') {
+                    MemLen::Reg(Val::Reg(r.to_string()))
+                } else {
+                    let n: u8 = len_tok.parse().expect("irparse: memcpy const len must be a u8 <= 255");
+                    MemLen::Const(n)
+                };
                 // isvolatile (a[3] = `i1 true`/`i1 false`) is an LLVM
                 // optimization hint; our byte copy is identical either way.
                 out.push(Inst::Memcpy(Memcpy { dst, src, len }));
