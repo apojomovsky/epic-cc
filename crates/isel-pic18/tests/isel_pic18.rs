@@ -186,6 +186,49 @@ fn icmp_ugt_and_ule_combine_c_and_z() {
 }
 
 #[test]
+fn icmp_slt_and_sge_use_n_xor_ov() {
+    // -1 (0xFF) < 1 is true; 1 < -1 is false. Also cross the signed-
+    // overflow boundary: 127 < -128 is false (no overflow in this
+    // direction) but tests N!=OV correctly only if the case is chosen so
+    // OV actually gets set — include one such case explicitly.
+    for (pred, a, b, expect) in [
+        ("slt", 0xFFu8, 1u8, 1u8),      // -1 < 1
+        ("slt", 1, 0xFF, 0),             // 1 < -1 is false
+        ("sge", 1, 0xFF, 1),
+        ("sge", 0xFF, 1, 0),
+        ("slt", 0x7F, 0x80, 0),          // 127 < -128: false, but a-b overflows (OV=1), N must still resolve correctly
+    ] {
+        let m = parse(&format!("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, %2\n    ret void\n"));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = a;
+        p.ram_mut()[0x11] = b;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "{pred}({a:#04x},{b:#04x})");
+    }
+}
+
+#[test]
+fn icmp_sgt_and_sle_combine_z_and_n_xor_ov() {
+    for (pred, a, b, expect) in [
+        ("sgt", 5u8, 3u8, 1u8), ("sgt", 3, 5, 0), ("sgt", 5, 5, 0),
+        ("sle", 3, 5, 1), ("sle", 5, 5, 1), ("sle", 5, 3, 0),
+    ] {
+        let m = parse(&format!("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp {pred} i8 %1, %2\n    ret void\n"));
+        let addrs = addrs(&[("a", 0x10), ("b", 0x11), ("main::1", 0x12), ("main::2", 0x13), ("main::3", 0x14)]);
+        let asm = select(&PIC18F4550, &m, &addrs);
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = a;
+        p.ram_mut()[0x11] = b;
+        p.run(200);
+        assert_eq!(p.ram()[0x14], expect, "{pred}({a},{b})");
+    }
+}
+
+#[test]
 #[should_panic(expected = "const-LHS")]
 fn icmp_const_lhs_is_rejected_not_silently_miscompiled() {
     // `val_addr` maps `Val::Const(k)` to `Slot::Direct(k & 0xFF)` — treating

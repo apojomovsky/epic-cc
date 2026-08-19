@@ -222,6 +222,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
 
         let l_true = self.fresh_label();
+        let l_false = self.fresh_label();
         let l_done = self.fresh_label();
         match pred {
             "eq" => self.emit(format!("    BZ {l_true}")),
@@ -230,18 +231,57 @@ impl<'m> Gen<'m> {
             "uge" => self.emit(format!("    BC {l_true}")),
             "ugt" => {
                 // C=1 AND Z=0
-                let l_false = self.fresh_label();
                 self.emit(format!("    BNC {l_false}"));
                 self.emit(format!("    BNZ {l_true}"));
-                self.emit(format!("{l_false}:"));
             }
             "ule" => {
                 // C=0 OR Z=1
                 self.emit(format!("    BNC {l_true}"));
                 self.emit(format!("    BZ {l_true}"));
             }
-            other => panic!("isel-pic18: icmp predicate {other} not yet implemented (Task 8)"),
+            "slt" => {
+                // N != OV: true if (N set and OV clear) or (N clear and OV set)
+                let l_check_ov = self.fresh_label();
+                self.emit(format!("    BN {l_check_ov}"));
+                self.emit(format!("    BOV {l_true}")); // N=0: true only if OV=1
+                self.emit(format!("    BRA {l_false}"));
+                self.emit(format!("{l_check_ov}:"));
+                self.emit(format!("    BNOV {l_true}")); // N=1: true only if OV=0
+            }
+            "sge" => {
+                // N == OV: true if (N set and OV set) or (N clear and OV clear)
+                let l_check_ov = self.fresh_label();
+                self.emit(format!("    BN {l_check_ov}"));
+                self.emit(format!("    BNOV {l_true}")); // N=0: true only if OV=0
+                self.emit(format!("    BRA {l_false}"));
+                self.emit(format!("{l_check_ov}:"));
+                self.emit(format!("    BOV {l_true}")); // N=1: true only if OV=1
+            }
+            "sgt" => {
+                // Z=0 AND N==OV
+                self.emit(format!("    BZ {l_false}"));
+                let l_check_ov = self.fresh_label();
+                self.emit(format!("    BN {l_check_ov}"));
+                self.emit(format!("    BNOV {l_true}"));
+                self.emit(format!("    BRA {l_false}"));
+                self.emit(format!("{l_check_ov}:"));
+                self.emit(format!("    BOV {l_true}"));
+            }
+            "sle" => {
+                // Z=1 OR N!=OV
+                self.emit(format!("    BZ {l_true}"));
+                let l_check_ov = self.fresh_label();
+                self.emit(format!("    BN {l_check_ov}"));
+                self.emit(format!("    BOV {l_true}"));
+                self.emit(format!("    BRA {l_false}"));
+                self.emit(format!("{l_check_ov}:"));
+                self.emit(format!("    BNOV {l_true}"));
+            }
+            other => panic!(
+                "isel-pic18: icmp predicate {other} unreachable (ir::parse validates the 10-entry set)"
+            ),
         }
+        self.emit(format!("{l_false}:"));
         self.emit("    MOVLW 0x00".to_string());
         self.emit(format!("    BRA {l_done}"));
         self.emit(format!("{l_true}:"));
