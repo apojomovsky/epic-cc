@@ -107,7 +107,6 @@ dependencies = [
  "device",
  "ir",
  "irparse",
- "isel",
  "iselcore",
  "legalize",
  "pic14-sim",

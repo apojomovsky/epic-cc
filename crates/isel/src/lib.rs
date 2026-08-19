@@ -5176,52 +5176,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     out.join("\n")
 }
 
-/// Parse an alloc-produced address-map text into `HashMap<String, u16>`:
-/// `global <name> 0xNN` and `local <func> <name> 0xNN` lines become map
-/// entries (locals keyed `{func}::{name}`); `const <name>` lines list flash
-/// globals, which have no RAM address, so they are accepted and skipped —
-/// isel reads their bytes from the `Module`, never from a RAM slot.
-pub fn parse_map(text: &str) -> HashMap<String, u16> {
-    let mut addrs = HashMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with(';') {
-            continue;
-        }
-        let mut it = line.split_whitespace();
-        let kw = it.next().expect("map entry");
-        match kw {
-            "const" => {
-                // Flash global: no RAM address; nothing to record.
-            }
-            "global" => {
-                let name = it
-                    .next()
-                    .unwrap_or_else(|| panic!("isel: malformed map line: {line}"))
-                    .to_string();
-                let addr = it
-                    .next()
-                    .and_then(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-                    .unwrap_or_else(|| panic!("isel: bad address in map line: {line}"));
-                addrs.insert(name, addr);
-            }
-            "local" => {
-                let func = it
-                    .next()
-                    .unwrap_or_else(|| panic!("isel: malformed map line: {line}"))
-                    .to_string();
-                let name = it
-                    .next()
-                    .unwrap_or_else(|| panic!("isel: malformed map line: {line}"))
-                    .to_string();
-                let addr = it
-                    .next()
-                    .and_then(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-                    .unwrap_or_else(|| panic!("isel: bad address in map line: {line}"));
-                addrs.insert(format!("{func}::{name}"), addr);
-            }
-            _ => panic!("isel: unexpected map line: {line}"),
-        }
-    }
-    addrs
-}
+/// `parse_map` lives in `iselcore` now (moved there per the P2 plan's
+/// final-review fix notes: it is a plain text-format parser over `alloc`'s
+/// output with nothing PIC14-specific about it, so `isel-pic18` should not
+/// need a hard dependency on `isel` just to reach it). Re-exported here so
+/// `isel`'s own binary (`src/bin/isel.rs`) keeps working unchanged.
+pub use iselcore::parse_map;
