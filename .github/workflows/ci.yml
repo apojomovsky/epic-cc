@@ -1,11 +1,12 @@
 name: ci
 
 # The repo's one CI workflow: run the full Rust workspace test suite inside
-# the Nix dev shell. The flake (flake.nix + rust-toolchain.toml + flake.lock)
-# is the single source of truth for the toolchain — pinned clang 20.1.8 (the
-# IR producer, deliberately pinned, see docs/09-build-environment.md), rustc
-# 1.97.1, gpasm 1.5.2 — so CI never installs a toolchain of its own and
-# cannot drift from what `nix develop` gives locally.
+# the docker `ci` image (Dockerfile). The Dockerfile is the single source of
+# truth for the toolchain — clang 20.1.8 built from the digest-pinned source
+# tarball (the IR producer, deliberately pinned, see
+# docs/09-build-environment.md), rustc 1.97.1 (rust-toolchain.toml), gpasm
+# 1.5.2 (built from source) — so CI never installs a toolchain of its own
+# and cannot drift from what the dev container gives locally.
 #
 # Single job, deliberate: the suite is one `cargo test` invocation's worth
 # of work (~30s on a runner), there is nothing to split, and a one-job
@@ -14,18 +15,16 @@ name: ci
 # attributable. When real split points exist (XC8 oracles, release bundles,
 # a simulator gate), split here the way epic-hal's family-check.yml does.
 #
-# Toolchain install: Determinate Nix (determinate-nix-action, version-pinned
-# to the installer's own major tag) + the Magic Nix Cache (a shared build
-# cache so the pinned flake's toolchain derivation is not rebuilt from
-# source on every run). actions/cache as a fallback for the cargo target dir
-# (see the cache step's comment). checkout needs the default fetch-depth
-# only: `nix develop` requires git-tracked files, not history.
+# Image caching: the clang-builder stage is the expensive layer (~1h first
+# build). It is cached in GHCR (ghcr.io/<repo>-toolchain) via the buildx
+# registry cache, keyed on the Dockerfile content — rebuilt only when the
+# Dockerfile or a pinned tarball changes. actions/cache warms the cargo
+# target dir and the cargo home across runs.
 
 on:
   push:
     branches: [master]
   pull_request:
-  # Manual re-run (e.g. after a cache hit investigation), no code change needed.
   workflow_dispatch:
 
 permissions:
@@ -37,23 +36,25 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # Pinned to the installer's own version tag (v3 is determinate-nix
-      # 3.x); upgrades are Dependabot-tracked. nix-installer-action's
-      # floating "latest" is the alternative but tilts the toolchain across
-      # runs for no benefit.
-      - uses: DeterminateSystems/determinate-nix-action@v3
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      # Shared build cache for the flake evaluation/build (the toolchain
-      # derivation is ~2 GB of store paths). use-flakehub=false: the repo
-      # has no FlakeHub account, so the opportunistic auth attempt is pure
-      # noise; the GitHub Actions cache is the cache.
-      - uses: DeterminateSystems/magic-nix-cache-action@v14
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          use-flakehub: "false"
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Warm the per-commit cargo build cache across runs. The cache key is
-      # per-branch HEAD, so the first commit after a merge misses and every
-      # push of the same branch (CI reruns) hits.
+      - name: Build ci image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          target: ci
+          load: true
+          tags: epic-cc-ci:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max
+
       - name: Cache cargo target dir
         uses: actions/cache@v5
         with:
@@ -62,5 +63,11 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-${{ github.workflow }}-
 
+      - name: Cache cargo home
+        uses: actions/cache@v5
+        with:
+          path: /tmp/cargo-home
+          key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
       - name: Test every workspace crate
-        run: nix develop --command bash scripts/ci-test.sh
+        run: docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/usr/local/cargo epic-cc-ci:latest bash scripts/ci-test.sh

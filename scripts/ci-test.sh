@@ -19,7 +19,7 @@
 set -uo pipefail
 
 if ! command -v cargo >/dev/null 2>&1; then
-  echo "::error::cargo not on PATH; run inside \`nix develop\` (see docs/09-build-environment.md)" >&2
+  echo "::error::cargo not on PATH; run inside the dev container (see docs/09-build-environment.md)" >&2
   exit 2
 fi
 

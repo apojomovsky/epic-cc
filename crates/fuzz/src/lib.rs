@@ -2956,9 +2956,9 @@ pub fn write_fixture(program: &Program) -> Result<PathBuf, String> {
 /// which the driver and the in-process layout pipeline both require.
 fn pic_clang() -> Result<(String, String), String> {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED")
-        .map_err(|_| "PIC8_CLANG_UNWRAPPED is not set (run inside `nix develop`)".to_string())?;
+        .map_err(|_| "PIC8_CLANG_UNWRAPPED is not set (run inside the dev container)".to_string())?;
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").map_err(|_| {
-        "PIC8_CLANG_RESOURCE_DIR is not set (run inside `nix develop`)".to_string()
+        "PIC8_CLANG_RESOURCE_DIR is not set (run inside the dev container)".to_string()
     })?;
     Ok((clang, resdir))
 }
