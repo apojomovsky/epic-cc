@@ -76,3 +76,26 @@ RUN --mount=type=cache,target=/ccache \
         -DLLVM_CCACHE_DIR=/ccache \
     && cmake --build /build/llvm --target install -j"$(nproc)" \
     && rm -rf /build/llvm /src/llvm
+
+FROM clang-builder AS dev
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+
+# rustc 1.97.1, pinned in rust-toolchain.toml (kept in sync deliberately).
+RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
+    && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97.1 \
+    && rustup component add rustfmt clippy rust-src \
+    && rm /tmp/rustup.sh
+
+ENV PIC8_CLANG_UNWRAPPED=/opt/clang/bin/clang \
+    PIC8_CLANG_RESOURCE_DIR=/opt/clang/lib/clang/20 \
+    PIC8_GPASM=/usr/local/bin/gpasm \
+    PIC8_VENDOR_DIR=/workspace/vendor \
+    PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00
+
+WORKDIR /workspace
+
+FROM dev AS ci
+# ci-test.sh runs from the mounted workspace; nothing extra to install.
