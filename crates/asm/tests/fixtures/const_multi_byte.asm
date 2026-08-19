@@ -1,0 +1,2236 @@
+; pic8 -- integer spine milestone 2 (isel)
+    list p=p16f877a
+    radix hex
+STATUS equ 0x03
+FSR    equ 0x04
+INDF   equ 0x00
+PCL    equ 0x02
+PCLATH equ 0x0A
+
+    org 0x0000
+    goto __start
+
+__start:
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    CALL main
+    SLEEP
+
+main:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVF 0x20, W
+    MOVWF 0x3C
+    MOVF 0x21, W
+    MOVWF 0x3D
+    MOVF 0x3C, W
+    ANDLW 0x03
+    MOVWF 0x3E
+    MOVF 0x3D, W
+    ANDLW 0x00
+    MOVWF 0x3F
+    MOVLW PAGE(__read_t16s)
+    MOVWF PCLATH
+    MOVLW 0x00
+    MOVWF 0x70
+    MOVF 0x3E, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x3E, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x70, W
+    ADDLW 0x00
+    CALL __read_t16s
+    MOVWF 0x70
+    MOVF 0x70, W
+    MOVWF 0x40
+    MOVLW 0x00
+    MOVWF 0x70
+    MOVF 0x3E, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x3E, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x70, W
+    ADDLW 0x01
+    CALL __read_t16s
+    MOVWF 0x70
+    MOVF 0x70, W
+    MOVWF 0x41
+    MOVF 0x40, W
+    MOVWF 0x22
+    MOVF 0x41, W
+    MOVWF 0x23
+    MOVF 0x20, W
+    MOVWF 0x42
+    MOVF 0x21, W
+    MOVWF 0x43
+    MOVF 0x42, W
+    ANDLW 0x03
+    MOVWF 0x44
+    MOVF 0x43, W
+    ANDLW 0x00
+    MOVWF 0x45
+    MOVLW PAGE(__read_t32s)
+    MOVWF PCLATH
+    MOVLW 0x00
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x70, W
+    ADDLW 0x00
+    CALL __read_t32s
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    MOVWF 0x46
+    MOVLW PAGE(__read_t32s)
+    MOVWF PCLATH
+    MOVLW 0x00
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x70, W
+    ADDLW 0x01
+    CALL __read_t32s
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    MOVWF 0x47
+    MOVLW PAGE(__read_t32s)
+    MOVWF PCLATH
+    MOVLW 0x00
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x70, W
+    ADDLW 0x02
+    CALL __read_t32s
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    MOVWF 0x48
+    MOVLW PAGE(__read_t32s)
+    MOVWF PCLATH
+    MOVLW 0x00
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x44, W
+    ADDWF 0x70, W
+    MOVWF 0x70
+    MOVF 0x70, W
+    ADDLW 0x03
+    CALL __read_t32s
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    MOVWF 0x49
+    MOVF 0x46, W
+    MOVWF 0x24
+    MOVF 0x47, W
+    MOVWF 0x25
+    MOVF 0x48, W
+    MOVWF 0x26
+    MOVF 0x49, W
+    MOVWF 0x27
+    MOVF 0x20, W
+    MOVWF 0x4A
+    MOVF 0x21, W
+    MOVWF 0x4B
+    MOVF 0x4A, W
+    ANDLW 0x7F
+    MOVWF 0x4C
+    MOVF 0x4B, W
+    ANDLW 0x00
+    MOVWF 0x4D
+    MOVF 0x4C, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x00
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp0
+    MOVLW PAGE(__read_t16)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp1
+tmp0:
+    MOVLW PAGE(__read_t16_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16_hi
+    MOVWF 0x70
+    MOVF 0x70, W
+tmp1:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x4E
+    MOVF 0x4C, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x01
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp2
+    MOVLW PAGE(__read_t16)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp3
+tmp2:
+    MOVLW PAGE(__read_t16_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16_hi
+    MOVWF 0x70
+    MOVF 0x70, W
+tmp3:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x4F
+    MOVF 0x4E, W
+    MOVWF 0x28
+    MOVF 0x4F, W
+    MOVWF 0x29
+    MOVF 0x20, W
+    MOVWF 0x50
+    MOVF 0x21, W
+    MOVWF 0x51
+    MOVF 0x50, W
+    ANDLW 0x01
+    MOVWF 0x52
+    MOVF 0x51, W
+    ANDLW 0x00
+    MOVWF 0x53
+    MOVF 0x52, W
+    IORLW 0x80
+    MOVWF 0x54
+    MOVF 0x53, W
+    IORLW 0x00
+    MOVWF 0x55
+    MOVF 0x54, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x00
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp4
+    MOVLW PAGE(__read_t16)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp5
+tmp4:
+    MOVLW PAGE(__read_t16_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16_hi
+    MOVWF 0x70
+    MOVF 0x70, W
+tmp5:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x56
+    MOVF 0x54, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x01
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp6
+    MOVLW PAGE(__read_t16)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp7
+tmp6:
+    MOVLW PAGE(__read_t16_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t16_hi
+    MOVWF 0x70
+    MOVF 0x70, W
+tmp7:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x57
+    MOVF 0x56, W
+    MOVWF 0x2A
+    MOVF 0x57, W
+    MOVWF 0x2B
+    MOVF 0x20, W
+    MOVWF 0x58
+    MOVF 0x21, W
+    MOVWF 0x59
+    MOVF 0x58, W
+    ANDLW 0x3F
+    MOVWF 0x5A
+    MOVF 0x59, W
+    ANDLW 0x00
+    MOVWF 0x5B
+    MOVF 0x5A, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x00
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp8
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp9
+tmp8:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp9:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x5C
+    MOVF 0x5A, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x01
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp10
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp11
+tmp10:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp11:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x5D
+    MOVF 0x5A, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x02
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp12
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp13
+tmp12:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp13:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x5E
+    MOVF 0x5A, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x03
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp14
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp15
+tmp14:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp15:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x5F
+    MOVF 0x5C, W
+    MOVWF 0x2C
+    MOVF 0x5D, W
+    MOVWF 0x2D
+    MOVF 0x5E, W
+    MOVWF 0x2E
+    MOVF 0x5F, W
+    MOVWF 0x2F
+    MOVF 0x20, W
+    MOVWF 0x60
+    MOVF 0x21, W
+    MOVWF 0x61
+    MOVF 0x60, W
+    ANDLW 0x01
+    MOVWF 0x62
+    MOVF 0x61, W
+    ANDLW 0x00
+    MOVWF 0x63
+    MOVF 0x62, W
+    IORLW 0x40
+    MOVWF 0x64
+    MOVF 0x63, W
+    IORLW 0x00
+    MOVWF 0x65
+    MOVF 0x64, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x00
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp16
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp17
+tmp16:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp17:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x66
+    MOVF 0x64, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x01
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp18
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp19
+tmp18:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp19:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x67
+    MOVF 0x64, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x02
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp20
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp21
+tmp20:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp21:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x68
+    MOVF 0x64, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x03
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp22
+    MOVLW PAGE(__read_t32)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32
+    MOVWF 0x70
+    MOVF 0x70, W
+    GOTO tmp23
+tmp22:
+    MOVLW PAGE(__read_t32_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_t32_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp23:
+    BCF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x69
+    MOVF 0x66, W
+    MOVWF 0x30
+    MOVF 0x67, W
+    MOVWF 0x31
+    MOVF 0x68, W
+    MOVWF 0x32
+    MOVF 0x69, W
+    MOVWF 0x33
+    MOVF 0x20, W
+    MOVWF 0x6A
+    MOVF 0x21, W
+    MOVWF 0x6B
+    MOVF 0x6A, W
+    ANDLW 0x3F
+    MOVWF 0x6C
+    MOVF 0x6B, W
+    ANDLW 0x00
+    MOVWF 0x6D
+    MOVF 0x6C, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x00
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp24
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp25
+tmp24:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp25:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x20
+    BCF STATUS, 5
+    MOVF 0x6C, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x01
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp26
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp27
+tmp26:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp27:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x21
+    BCF STATUS, 5
+    MOVF 0x6C, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x02
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp28
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp29
+tmp28:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp29:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x22
+    BCF STATUS, 5
+    MOVF 0x6C, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x03
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp30
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp31
+tmp30:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp31:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x23
+    MOVF 0x20, W
+    BCF STATUS, 5
+    MOVWF 0x34
+    BSF STATUS, 5
+    MOVF 0x21, W
+    BCF STATUS, 5
+    MOVWF 0x35
+    BSF STATUS, 5
+    MOVF 0x22, W
+    BCF STATUS, 5
+    MOVWF 0x36
+    BSF STATUS, 5
+    MOVF 0x23, W
+    BCF STATUS, 5
+    MOVWF 0x37
+    MOVF 0x20, W
+    BSF STATUS, 5
+    MOVWF 0x24
+    BCF STATUS, 5
+    MOVF 0x21, W
+    BSF STATUS, 5
+    MOVWF 0x25
+    MOVF 0x24, W
+    ANDLW 0x01
+    MOVWF 0x26
+    MOVF 0x25, W
+    ANDLW 0x00
+    MOVWF 0x27
+    MOVF 0x26, W
+    IORLW 0x40
+    MOVWF 0x28
+    MOVF 0x27, W
+    IORLW 0x00
+    MOVWF 0x29
+    MOVF 0x28, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x00
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp32
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp33
+tmp32:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp33:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x2A
+    MOVF 0x28, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x01
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp34
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp35
+tmp34:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp35:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x2B
+    MOVF 0x28, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x02
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp36
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp37
+tmp36:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp37:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x2C
+    MOVF 0x28, W
+    MOVWF 0x71
+    CLRF 0x70
+    BCF STATUS, 0
+    RLF 0x71, F
+    RLF 0x70, F
+    RLF 0x71, F
+    RLF 0x70, F
+    MOVF 0x71, W
+    ADDLW 0x03
+    MOVWF 0x71
+    MOVF 0x70, W
+    BTFSC STATUS, 0
+    ADDLW 0x01
+    MOVWF 0x70
+    MOVF 0x71, W
+    BTFSC 0x70, 0
+    GOTO tmp38
+    MOVLW PAGE(__read_tf)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    GOTO tmp39
+tmp38:
+    MOVLW PAGE(__read_tf_hi)
+    MOVWF PCLATH
+    MOVF 0x71, W
+    CALL __read_tf_hi
+    MOVWF 0x70
+    MOVLW PAGE(main)
+    MOVWF PCLATH
+    MOVF 0x70, W
+tmp39:
+    BSF STATUS, 5
+    BCF STATUS, 6
+    MOVWF 0x2D
+    MOVF 0x2A, W
+    BCF STATUS, 5
+    MOVWF 0x38
+    BSF STATUS, 5
+    MOVF 0x2B, W
+    BCF STATUS, 5
+    MOVWF 0x39
+    BSF STATUS, 5
+    MOVF 0x2C, W
+    BCF STATUS, 5
+    MOVWF 0x3A
+    BSF STATUS, 5
+    MOVF 0x2D, W
+    BCF STATUS, 5
+    MOVWF 0x3B
+    RETURN
+
+    org 0x0432
+__read_t16:
+    MOVWF 0x70
+    MOVLW HIGH(t16)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(t16)
+    MOVWF PCL
+    .align 256
+    .table t16 260
+t16:
+    RETLW 0x00
+    RETLW 0x10
+    RETLW 0x01
+    RETLW 0x10
+    RETLW 0x02
+    RETLW 0x10
+    RETLW 0x03
+    RETLW 0x10
+    RETLW 0x04
+    RETLW 0x10
+    RETLW 0x05
+    RETLW 0x10
+    RETLW 0x06
+    RETLW 0x10
+    RETLW 0x07
+    RETLW 0x10
+    RETLW 0x08
+    RETLW 0x10
+    RETLW 0x09
+    RETLW 0x10
+    RETLW 0x0A
+    RETLW 0x10
+    RETLW 0x0B
+    RETLW 0x10
+    RETLW 0x0C
+    RETLW 0x10
+    RETLW 0x0D
+    RETLW 0x10
+    RETLW 0x0E
+    RETLW 0x10
+    RETLW 0x0F
+    RETLW 0x10
+    RETLW 0x10
+    RETLW 0x10
+    RETLW 0x11
+    RETLW 0x10
+    RETLW 0x12
+    RETLW 0x10
+    RETLW 0x13
+    RETLW 0x10
+    RETLW 0x14
+    RETLW 0x10
+    RETLW 0x15
+    RETLW 0x10
+    RETLW 0x16
+    RETLW 0x10
+    RETLW 0x17
+    RETLW 0x10
+    RETLW 0x18
+    RETLW 0x10
+    RETLW 0x19
+    RETLW 0x10
+    RETLW 0x1A
+    RETLW 0x10
+    RETLW 0x1B
+    RETLW 0x10
+    RETLW 0x1C
+    RETLW 0x10
+    RETLW 0x1D
+    RETLW 0x10
+    RETLW 0x1E
+    RETLW 0x10
+    RETLW 0x1F
+    RETLW 0x10
+    RETLW 0x20
+    RETLW 0x10
+    RETLW 0x21
+    RETLW 0x10
+    RETLW 0x22
+    RETLW 0x10
+    RETLW 0x23
+    RETLW 0x10
+    RETLW 0x24
+    RETLW 0x10
+    RETLW 0x25
+    RETLW 0x10
+    RETLW 0x26
+    RETLW 0x10
+    RETLW 0x27
+    RETLW 0x10
+    RETLW 0x28
+    RETLW 0x10
+    RETLW 0x29
+    RETLW 0x10
+    RETLW 0x2A
+    RETLW 0x10
+    RETLW 0x2B
+    RETLW 0x10
+    RETLW 0x2C
+    RETLW 0x10
+    RETLW 0x2D
+    RETLW 0x10
+    RETLW 0x2E
+    RETLW 0x10
+    RETLW 0x2F
+    RETLW 0x10
+    RETLW 0x30
+    RETLW 0x10
+    RETLW 0x31
+    RETLW 0x10
+    RETLW 0x32
+    RETLW 0x10
+    RETLW 0x33
+    RETLW 0x10
+    RETLW 0x34
+    RETLW 0x10
+    RETLW 0x35
+    RETLW 0x10
+    RETLW 0x36
+    RETLW 0x10
+    RETLW 0x37
+    RETLW 0x10
+    RETLW 0x38
+    RETLW 0x10
+    RETLW 0x39
+    RETLW 0x10
+    RETLW 0x3A
+    RETLW 0x10
+    RETLW 0x3B
+    RETLW 0x10
+    RETLW 0x3C
+    RETLW 0x10
+    RETLW 0x3D
+    RETLW 0x10
+    RETLW 0x3E
+    RETLW 0x10
+    RETLW 0x3F
+    RETLW 0x10
+    RETLW 0x40
+    RETLW 0x10
+    RETLW 0x41
+    RETLW 0x10
+    RETLW 0x42
+    RETLW 0x10
+    RETLW 0x43
+    RETLW 0x10
+    RETLW 0x44
+    RETLW 0x10
+    RETLW 0x45
+    RETLW 0x10
+    RETLW 0x46
+    RETLW 0x10
+    RETLW 0x47
+    RETLW 0x10
+    RETLW 0x48
+    RETLW 0x10
+    RETLW 0x49
+    RETLW 0x10
+    RETLW 0x4A
+    RETLW 0x10
+    RETLW 0x4B
+    RETLW 0x10
+    RETLW 0x4C
+    RETLW 0x10
+    RETLW 0x4D
+    RETLW 0x10
+    RETLW 0x4E
+    RETLW 0x10
+    RETLW 0x4F
+    RETLW 0x10
+    RETLW 0x50
+    RETLW 0x10
+    RETLW 0x51
+    RETLW 0x10
+    RETLW 0x52
+    RETLW 0x10
+    RETLW 0x53
+    RETLW 0x10
+    RETLW 0x54
+    RETLW 0x10
+    RETLW 0x55
+    RETLW 0x10
+    RETLW 0x56
+    RETLW 0x10
+    RETLW 0x57
+    RETLW 0x10
+    RETLW 0x58
+    RETLW 0x10
+    RETLW 0x59
+    RETLW 0x10
+    RETLW 0x5A
+    RETLW 0x10
+    RETLW 0x5B
+    RETLW 0x10
+    RETLW 0x5C
+    RETLW 0x10
+    RETLW 0x5D
+    RETLW 0x10
+    RETLW 0x5E
+    RETLW 0x10
+    RETLW 0x5F
+    RETLW 0x10
+    RETLW 0x60
+    RETLW 0x10
+    RETLW 0x61
+    RETLW 0x10
+    RETLW 0x62
+    RETLW 0x10
+    RETLW 0x63
+    RETLW 0x10
+    RETLW 0x64
+    RETLW 0x10
+    RETLW 0x65
+    RETLW 0x10
+    RETLW 0x66
+    RETLW 0x10
+    RETLW 0x67
+    RETLW 0x10
+    RETLW 0x68
+    RETLW 0x10
+    RETLW 0x69
+    RETLW 0x10
+    RETLW 0x6A
+    RETLW 0x10
+    RETLW 0x6B
+    RETLW 0x10
+    RETLW 0x6C
+    RETLW 0x10
+    RETLW 0x6D
+    RETLW 0x10
+    RETLW 0x6E
+    RETLW 0x10
+    RETLW 0x6F
+    RETLW 0x10
+    RETLW 0x70
+    RETLW 0x10
+    RETLW 0x71
+    RETLW 0x10
+    RETLW 0x72
+    RETLW 0x10
+    RETLW 0x73
+    RETLW 0x10
+    RETLW 0x74
+    RETLW 0x10
+    RETLW 0x75
+    RETLW 0x10
+    RETLW 0x76
+    RETLW 0x10
+    RETLW 0x77
+    RETLW 0x10
+    RETLW 0x78
+    RETLW 0x10
+    RETLW 0x79
+    RETLW 0x10
+    RETLW 0x7A
+    RETLW 0x10
+    RETLW 0x7B
+    RETLW 0x10
+    RETLW 0x7C
+    RETLW 0x10
+    RETLW 0x7D
+    RETLW 0x10
+    RETLW 0x7E
+    RETLW 0x10
+    RETLW 0x7F
+    RETLW 0x10
+t16_1:
+    RETLW 0x80
+    RETLW 0x10
+    RETLW 0x81
+    RETLW 0x10
+__read_t16_hi:
+    MOVWF 0x70
+    MOVLW HIGH(t16_1)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(t16_1)
+    MOVWF PCL
+
+__read_t16s:
+    MOVWF 0x70
+    MOVLW HIGH(t16s)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(t16s)
+    MOVWF PCL
+    .table t16s 6
+t16s:
+    RETLW 0x34
+    RETLW 0x12
+    RETLW 0x78
+    RETLW 0x56
+    RETLW 0xBC
+    RETLW 0x9A
+
+__read_t32:
+    MOVWF 0x70
+    MOVLW HIGH(t32)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(t32)
+    MOVWF PCL
+    .align 256
+    .table t32 400
+t32:
+    RETLW 0x04
+    RETLW 0x03
+    RETLW 0x02
+    RETLW 0x01
+    RETLW 0x05
+    RETLW 0x04
+    RETLW 0x03
+    RETLW 0x02
+    RETLW 0x06
+    RETLW 0x05
+    RETLW 0x04
+    RETLW 0x03
+    RETLW 0x07
+    RETLW 0x06
+    RETLW 0x05
+    RETLW 0x04
+    RETLW 0x08
+    RETLW 0x07
+    RETLW 0x06
+    RETLW 0x05
+    RETLW 0x09
+    RETLW 0x08
+    RETLW 0x07
+    RETLW 0x06
+    RETLW 0x0A
+    RETLW 0x09
+    RETLW 0x08
+    RETLW 0x07
+    RETLW 0x0B
+    RETLW 0x0A
+    RETLW 0x09
+    RETLW 0x08
+    RETLW 0x0C
+    RETLW 0x0B
+    RETLW 0x0A
+    RETLW 0x09
+    RETLW 0x0D
+    RETLW 0x0C
+    RETLW 0x0B
+    RETLW 0x0A
+    RETLW 0x0E
+    RETLW 0x0D
+    RETLW 0x0C
+    RETLW 0x0B
+    RETLW 0x0F
+    RETLW 0x0E
+    RETLW 0x0D
+    RETLW 0x0C
+    RETLW 0x10
+    RETLW 0x0F
+    RETLW 0x0E
+    RETLW 0x0D
+    RETLW 0x11
+    RETLW 0x10
+    RETLW 0x0F
+    RETLW 0x0E
+    RETLW 0x12
+    RETLW 0x11
+    RETLW 0x10
+    RETLW 0x0F
+    RETLW 0x13
+    RETLW 0x12
+    RETLW 0x11
+    RETLW 0x10
+    RETLW 0x14
+    RETLW 0x13
+    RETLW 0x12
+    RETLW 0x11
+    RETLW 0x15
+    RETLW 0x14
+    RETLW 0x13
+    RETLW 0x12
+    RETLW 0x16
+    RETLW 0x15
+    RETLW 0x14
+    RETLW 0x13
+    RETLW 0x17
+    RETLW 0x16
+    RETLW 0x15
+    RETLW 0x14
+    RETLW 0x18
+    RETLW 0x17
+    RETLW 0x16
+    RETLW 0x15
+    RETLW 0x19
+    RETLW 0x18
+    RETLW 0x17
+    RETLW 0x16
+    RETLW 0x1A
+    RETLW 0x19
+    RETLW 0x18
+    RETLW 0x17
+    RETLW 0x1B
+    RETLW 0x1A
+    RETLW 0x19
+    RETLW 0x18
+    RETLW 0x1C
+    RETLW 0x1B
+    RETLW 0x1A
+    RETLW 0x19
+    RETLW 0x1D
+    RETLW 0x1C
+    RETLW 0x1B
+    RETLW 0x1A
+    RETLW 0x1E
+    RETLW 0x1D
+    RETLW 0x1C
+    RETLW 0x1B
+    RETLW 0x1F
+    RETLW 0x1E
+    RETLW 0x1D
+    RETLW 0x1C
+    RETLW 0x20
+    RETLW 0x1F
+    RETLW 0x1E
+    RETLW 0x1D
+    RETLW 0x21
+    RETLW 0x20
+    RETLW 0x1F
+    RETLW 0x1E
+    RETLW 0x22
+    RETLW 0x21
+    RETLW 0x20
+    RETLW 0x1F
+    RETLW 0x23
+    RETLW 0x22
+    RETLW 0x21
+    RETLW 0x20
+    RETLW 0x24
+    RETLW 0x23
+    RETLW 0x22
+    RETLW 0x21
+    RETLW 0x25
+    RETLW 0x24
+    RETLW 0x23
+    RETLW 0x22
+    RETLW 0x26
+    RETLW 0x25
+    RETLW 0x24
+    RETLW 0x23
+    RETLW 0x27
+    RETLW 0x26
+    RETLW 0x25
+    RETLW 0x24
+    RETLW 0x28
+    RETLW 0x27
+    RETLW 0x26
+    RETLW 0x25
+    RETLW 0x29
+    RETLW 0x28
+    RETLW 0x27
+    RETLW 0x26
+    RETLW 0x2A
+    RETLW 0x29
+    RETLW 0x28
+    RETLW 0x27
+    RETLW 0x2B
+    RETLW 0x2A
+    RETLW 0x29
+    RETLW 0x28
+    RETLW 0x2C
+    RETLW 0x2B
+    RETLW 0x2A
+    RETLW 0x29
+    RETLW 0x2D
+    RETLW 0x2C
+    RETLW 0x2B
+    RETLW 0x2A
+    RETLW 0x2E
+    RETLW 0x2D
+    RETLW 0x2C
+    RETLW 0x2B
+    RETLW 0x2F
+    RETLW 0x2E
+    RETLW 0x2D
+    RETLW 0x2C
+    RETLW 0x30
+    RETLW 0x2F
+    RETLW 0x2E
+    RETLW 0x2D
+    RETLW 0x31
+    RETLW 0x30
+    RETLW 0x2F
+    RETLW 0x2E
+    RETLW 0x32
+    RETLW 0x31
+    RETLW 0x30
+    RETLW 0x2F
+    RETLW 0x33
+    RETLW 0x32
+    RETLW 0x31
+    RETLW 0x30
+    RETLW 0x34
+    RETLW 0x33
+    RETLW 0x32
+    RETLW 0x31
+    RETLW 0x35
+    RETLW 0x34
+    RETLW 0x33
+    RETLW 0x32
+    RETLW 0x36
+    RETLW 0x35
+    RETLW 0x34
+    RETLW 0x33
+    RETLW 0x37
+    RETLW 0x36
+    RETLW 0x35
+    RETLW 0x34
+    RETLW 0x38
+    RETLW 0x37
+    RETLW 0x36
+    RETLW 0x35
+    RETLW 0x39
+    RETLW 0x38
+    RETLW 0x37
+    RETLW 0x36
+    RETLW 0x3A
+    RETLW 0x39
+    RETLW 0x38
+    RETLW 0x37
+    RETLW 0x3B
+    RETLW 0x3A
+    RETLW 0x39
+    RETLW 0x38
+    RETLW 0x3C
+    RETLW 0x3B
+    RETLW 0x3A
+    RETLW 0x39
+    RETLW 0x3D
+    RETLW 0x3C
+    RETLW 0x3B
+    RETLW 0x3A
+    RETLW 0x3E
+    RETLW 0x3D
+    RETLW 0x3C
+    RETLW 0x3B
+    RETLW 0x3F
+    RETLW 0x3E
+    RETLW 0x3D
+    RETLW 0x3C
+    RETLW 0x40
+    RETLW 0x3F
+    RETLW 0x3E
+    RETLW 0x3D
+    RETLW 0x41
+    RETLW 0x40
+    RETLW 0x3F
+    RETLW 0x3E
+    RETLW 0x42
+    RETLW 0x41
+    RETLW 0x40
+    RETLW 0x3F
+    RETLW 0x43
+    RETLW 0x42
+    RETLW 0x41
+    RETLW 0x40
+t32_1:
+    RETLW 0x44
+    RETLW 0x43
+    RETLW 0x42
+    RETLW 0x41
+    RETLW 0x45
+    RETLW 0x44
+    RETLW 0x43
+    RETLW 0x42
+    RETLW 0x46
+    RETLW 0x45
+    RETLW 0x44
+    RETLW 0x43
+    RETLW 0x47
+    RETLW 0x46
+    RETLW 0x45
+    RETLW 0x44
+    RETLW 0x48
+    RETLW 0x47
+    RETLW 0x46
+    RETLW 0x45
+    RETLW 0x49
+    RETLW 0x48
+    RETLW 0x47
+    RETLW 0x46
+    RETLW 0x4A
+    RETLW 0x49
+    RETLW 0x48
+    RETLW 0x47
+    RETLW 0x4B
+    RETLW 0x4A
+    RETLW 0x49
+    RETLW 0x48
+    RETLW 0x4C
+    RETLW 0x4B
+    RETLW 0x4A
+    RETLW 0x49
+    RETLW 0x4D
+    RETLW 0x4C
+    RETLW 0x4B
+    RETLW 0x4A
+    RETLW 0x4E
+    RETLW 0x4D
+    RETLW 0x4C
+    RETLW 0x4B
+    RETLW 0x4F
+    RETLW 0x4E
+    RETLW 0x4D
+    RETLW 0x4C
+    RETLW 0x50
+    RETLW 0x4F
+    RETLW 0x4E
+    RETLW 0x4D
+    RETLW 0x51
+    RETLW 0x50
+    RETLW 0x4F
+    RETLW 0x4E
+    RETLW 0x52
+    RETLW 0x51
+    RETLW 0x50
+    RETLW 0x4F
+    RETLW 0x53
+    RETLW 0x52
+    RETLW 0x51
+    RETLW 0x50
+    RETLW 0x54
+    RETLW 0x53
+    RETLW 0x52
+    RETLW 0x51
+    RETLW 0x55
+    RETLW 0x54
+    RETLW 0x53
+    RETLW 0x52
+    RETLW 0x56
+    RETLW 0x55
+    RETLW 0x54
+    RETLW 0x53
+    RETLW 0x57
+    RETLW 0x56
+    RETLW 0x55
+    RETLW 0x54
+    RETLW 0x58
+    RETLW 0x57
+    RETLW 0x56
+    RETLW 0x55
+    RETLW 0x59
+    RETLW 0x58
+    RETLW 0x57
+    RETLW 0x56
+    RETLW 0x5A
+    RETLW 0x59
+    RETLW 0x58
+    RETLW 0x57
+    RETLW 0x5B
+    RETLW 0x5A
+    RETLW 0x59
+    RETLW 0x58
+    RETLW 0x5C
+    RETLW 0x5B
+    RETLW 0x5A
+    RETLW 0x59
+    RETLW 0x5D
+    RETLW 0x5C
+    RETLW 0x5B
+    RETLW 0x5A
+    RETLW 0x5E
+    RETLW 0x5D
+    RETLW 0x5C
+    RETLW 0x5B
+    RETLW 0x5F
+    RETLW 0x5E
+    RETLW 0x5D
+    RETLW 0x5C
+    RETLW 0x60
+    RETLW 0x5F
+    RETLW 0x5E
+    RETLW 0x5D
+    RETLW 0x61
+    RETLW 0x60
+    RETLW 0x5F
+    RETLW 0x5E
+    RETLW 0x62
+    RETLW 0x61
+    RETLW 0x60
+    RETLW 0x5F
+    RETLW 0x63
+    RETLW 0x62
+    RETLW 0x61
+    RETLW 0x60
+    RETLW 0x64
+    RETLW 0x63
+    RETLW 0x62
+    RETLW 0x61
+    RETLW 0x65
+    RETLW 0x64
+    RETLW 0x63
+    RETLW 0x62
+    RETLW 0x66
+    RETLW 0x65
+    RETLW 0x64
+    RETLW 0x63
+    RETLW 0x67
+    RETLW 0x66
+    RETLW 0x65
+    RETLW 0x64
+__read_t32_hi:
+    MOVWF 0x70
+    MOVLW HIGH(t32_1)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(t32_1)
+    MOVWF PCL
+
+__read_t32s:
+    MOVWF 0x70
+    MOVLW HIGH(t32s)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(t32s)
+    MOVWF PCL
+    .table t32s 12
+t32s:
+    RETLW 0x04
+    RETLW 0x03
+    RETLW 0x02
+    RETLW 0x01
+    RETLW 0x08
+    RETLW 0x07
+    RETLW 0x06
+    RETLW 0x05
+    RETLW 0x0C
+    RETLW 0x0B
+    RETLW 0x0A
+    RETLW 0x09
+
+__read_tf:
+    MOVWF 0x70
+    MOVLW HIGH(tf)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(tf)
+    MOVWF PCL
+    .align 256
+    .table tf 400
+tf:
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xCC
+    RETLW 0x3D
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x4C
+    RETLW 0x3E
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x99
+    RETLW 0x3E
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xCC
+    RETLW 0x3E
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x3F
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x19
+    RETLW 0x3F
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x3F
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x4C
+    RETLW 0x3F
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x3F
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x80
+    RETLW 0x3F
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x8C
+    RETLW 0x3F
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x99
+    RETLW 0x3F
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xA6
+    RETLW 0x3F
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xB3
+    RETLW 0x3F
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xC0
+    RETLW 0x3F
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xCC
+    RETLW 0x3F
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0xD9
+    RETLW 0x3F
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xE6
+    RETLW 0x3F
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xF3
+    RETLW 0x3F
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x06
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x0C
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x13
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x19
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x20
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x26
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x2C
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x39
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x40
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x46
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x4C
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x53
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x59
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x60
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x6C
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x73
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x79
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x80
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x83
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x86
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x89
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x8C
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x90
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x93
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x96
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x99
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x9C
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xA0
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xA3
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xA6
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0xA9
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xAC
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xB0
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xB3
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xB6
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0xB9
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xBC
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xC0
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xC3
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xC6
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0xC9
+    RETLW 0x40
+tf_1:
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xCC
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xD0
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xD3
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xD6
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0xD9
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xDC
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xE0
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xE3
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xE6
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0xE9
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xEC
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0xF0
+    RETLW 0x40
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0xF3
+    RETLW 0x40
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0xF6
+    RETLW 0x40
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0xF9
+    RETLW 0x40
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0xFC
+    RETLW 0x40
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x41
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x01
+    RETLW 0x41
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x03
+    RETLW 0x41
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x04
+    RETLW 0x41
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x06
+    RETLW 0x41
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x08
+    RETLW 0x41
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x09
+    RETLW 0x41
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x0B
+    RETLW 0x41
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x0C
+    RETLW 0x41
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x0E
+    RETLW 0x41
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x10
+    RETLW 0x41
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x11
+    RETLW 0x41
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x13
+    RETLW 0x41
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x14
+    RETLW 0x41
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x16
+    RETLW 0x41
+    RETLW 0x00
+    RETLW 0x00
+    RETLW 0x18
+    RETLW 0x41
+    RETLW 0x9A
+    RETLW 0x99
+    RETLW 0x19
+    RETLW 0x41
+    RETLW 0x33
+    RETLW 0x33
+    RETLW 0x1B
+    RETLW 0x41
+    RETLW 0xCD
+    RETLW 0xCC
+    RETLW 0x1C
+    RETLW 0x41
+    RETLW 0x66
+    RETLW 0x66
+    RETLW 0x1E
+    RETLW 0x41
+__read_tf_hi:
+    MOVWF 0x70
+    MOVLW HIGH(tf_1)
+    MOVWF PCLATH
+    MOVF 0x70, W
+    ADDLW LOW(tf_1)
+    MOVWF PCL
+
+    end

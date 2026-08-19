@@ -880,6 +880,70 @@ fn const_array_300_bytes_parses() {
     assert_eq!(m.globals[0].bytes[299], 66); // (299*37 + 11) & 0xFF
 }
 
+// Issue #3: const tables of multi-byte elements. clang prints an
+// `[N x i32]`/`[N x float]` constant as a typed element list
+// (`[i32 286331153, i32 572662306, ...]` / `[float 0x3FB99999A0000000, ...]`)
+// — never a `c"..."` string — so the const-in-flash path must decode the
+// elements into the table's little-endian byte blob (byte i of element e is
+// table byte e*elem_size + i). A float constant clang cannot print in 8 hex
+// digits (e.g. 0.1f) appears as its f64-promoted bit pattern, which must be
+// narrowed back to the f32 bits exactly like the operand parser does.
+#[test]
+fn const_array_i32_elements_parse_to_le_bytes() {
+    let src = r#"
+@itable = dso_local constant [3 x i32] [i32 0x11111111, i32 0x22222222, i32 -2], align 2
+"#;
+    let m = parse_ll(src);
+    assert_eq!(m.globals.len(), 1);
+    match &m.globals[0] {
+        Global { name, ty, is_const, size, bytes, addr } => {
+            assert_eq!(name, "itable");
+            assert_eq!(*ty, ir::Ty::I32);
+            assert!(*is_const);
+            assert_eq!(*size, 12, "3 x i32 = 12 bytes");
+            assert_eq!(
+                bytes,
+                &vec![
+                    0x11, 0x11, 0x11, 0x11, // 0x11111111 LE
+                    0x22, 0x22, 0x22, 0x22, // 0x22222222 LE
+                    0xFE, 0xFF, 0xFF, 0xFF, // -2 LE
+                ]
+            );
+            assert_eq!(*addr, None);
+        }
+    }
+}
+
+#[test]
+fn const_array_float_elements_parse_to_le_bytes() {
+    // 0x3F800000 = 1.0f; 0x3FB99999A0000000 is the f64 promotion of 0.1f
+    // (clang prints it for float constants not representable in 8 hex
+    // digits) and must narrow to 0x3DCCCCCD; 5.000000e-01 is the decimal
+    // form of 0.5f -> 0x3F000000.
+    let src = r#"
+@ftable = dso_local constant [3 x float] [float 1.000000e+00, float 0x3FB99999A0000000, float 5.000000e-01], align 2
+"#;
+    let m = parse_ll(src);
+    assert_eq!(m.globals.len(), 1);
+    match &m.globals[0] {
+        Global { name, ty, is_const, size, bytes, addr } => {
+            assert_eq!(name, "ftable");
+            assert_eq!(*ty, ir::Ty::F32);
+            assert!(*is_const);
+            assert_eq!(*size, 12, "3 x float = 12 bytes");
+            assert_eq!(
+                bytes,
+                &vec![
+                    0x00, 0x00, 0x80, 0x3F, // 1.0f
+                    0xCD, 0xCC, 0xCC, 0x3D, // 0.1f
+                    0x00, 0x00, 0x00, 0x3F, // 0.5f
+                ]
+            );
+            assert_eq!(*addr, None);
+        }
+    }
+}
+
 #[test]
 #[should_panic(expected = "const array @big too large")]
 fn const_array_512_bytes_panics() {
