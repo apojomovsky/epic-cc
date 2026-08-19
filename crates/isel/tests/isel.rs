@@ -6006,6 +6006,134 @@ fn float_conversion_routines_simulate_against_rust_reference() {
     }
 }
 
+/// The IEEE754 edge-case suite (issue #11): NaN, infinities, and denormals
+/// as OPERANDS of the arithmetic routines, compared bit-for-bit against
+/// Rust's f32 (the IEEE default). The existing cases cover the normal range
+/// and the deterministic div-by-zero; these cover the operand classes the
+/// routines handle "minimally" — the probe found the exact gaps:
+///   - add/sub: inf + -inf must be NaN (not 0); denormal + denormal must
+///     be the denormal sum (not 0)
+///   - mul: inf * 2 must be inf (not 0); inf * 0 must be NaN (not 0);
+///     denormal * 2 must be the denormal product (not 0)
+///   - div: 1.0 / NaN must be NaN (not garbage); inf / 2 must be inf (not
+///     1.7e38); 1.0 / inf must be 0 (not inf); 0.0 / 0.0 must be NaN (not
+///     0); denormal / 2 must be the denormal quotient (not 0)
+#[test]
+fn float_arith_routines_handle_ieee_edge_operands() {
+    // (routine, a, b, label) — the reference is Rust's f32 op.
+    let cases: &[(&str, f32, f32, &str)] = &[
+        // ---- add/sub: inf + -inf = NaN; inf + finite = inf ----
+        ("__add_f32", f32::INFINITY, f32::NEG_INFINITY, "inf + -inf = NaN"),
+        ("__sub_f32", f32::INFINITY, f32::INFINITY, "inf - inf = NaN"),
+        ("__add_f32", f32::INFINITY, 1.0, "inf + 1.0 = inf"),
+        ("__add_f32", 1.0, f32::INFINITY, "1.0 + inf = inf"),
+        ("__add_f32", f32::NEG_INFINITY, 1.0, "-inf + 1.0 = -inf"),
+        // ---- add: denormal operands (exp 0, nonzero mantissa) ----
+        // The max denormal 0x007FFFFF + 1.0 = 1.0 (the denormal is
+        // swallowed by the alignment — the result is exact).
+        ("__add_f32", f32::from_bits(0x007F_FFFF), 1.0, "max denormal + 1.0 = 1.0"),
+        // The min denormal + itself = 2^-149 (0x00000002) — the sum of two
+        // denormals is a denormal, NOT 0.
+        ("__add_f32", f32::from_bits(0x0000_0001), f32::from_bits(0x0000_0001), "min denormal + min denormal"),
+        // A denormal + a normal that swallows it exactly: 2^-149 + 2^-126
+        // = 2^-126 (the denormal is below the normal's ulp).
+        ("__add_f32", f32::from_bits(0x0000_0001), f32::from_bits(0x0080_0000), "min denormal + min normal"),
+        // ---- mul: inf * finite = inf; inf * 0 = NaN; denormal * 2 ----
+        ("__mul_f32", f32::INFINITY, 2.0, "inf * 2.0 = inf"),
+        ("__mul_f32", f32::INFINITY, 0.0, "inf * 0.0 = NaN"),
+        ("__mul_f32", f32::NEG_INFINITY, 0.0, "-inf * 0.0 = NaN"),
+        // The max denormal * 2 = 0x00FFFFFE (a denormal — the product of
+        // two denormals/normals that underflow stays denormal, not 0).
+        ("__mul_f32", f32::from_bits(0x007F_FFFF), 2.0, "max denormal * 2.0"),
+        // ---- div: NaN propagates; inf / finite = inf; finite / inf = 0;
+        //      0/0 = NaN; denormal / 2 ----
+        ("__div_f32", 1.0, f32::NAN, "1.0 / NaN = NaN"),
+        ("__div_f32", f32::NAN, 1.0, "NaN / 1.0 = NaN"),
+        ("__div_f32", f32::INFINITY, 2.0, "inf / 2.0 = inf"),
+        ("__div_f32", 1.0, f32::INFINITY, "1.0 / inf = 0"),
+        ("__div_f32", 0.0, 0.0, "0.0 / 0.0 = NaN"),
+        ("__div_f32", f32::INFINITY, 0.0, "inf / 0.0 = inf"),
+        ("__div_f32", 0.0, f32::INFINITY, "0.0 / inf = 0"),
+        ("__div_f32", f32::from_bits(0x007F_FFFF), 2.0, "max denormal / 2.0"),
+    ];
+    for &(name, a, b, label) in cases {
+        let (ir, map) = float_routine_module(name);
+        let mut seed = Vec::new();
+        for (i, by) in f32_le(a).iter().enumerate() {
+            seed.push((0x20 + i as u16, *by));
+        }
+        for (i, by) in f32_le(b).iter().enumerate() {
+            seed.push((0x24 + i as u16, *by));
+        }
+        let want = match name {
+            "__add_f32" => f32_le(a + b),
+            "__sub_f32" => f32_le(a - b),
+            "__mul_f32" => f32_le(a * b),
+            "__div_f32" => f32_le(a / b),
+            _ => unreachable!(),
+        };
+        let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+        // NaN results: any NaN bit pattern is acceptable (Rust's f32
+        // produces a canonical quiet NaN; the routine may produce a
+        // different quiet NaN — the CLASS must match).
+        let got_f = f32::from_bits(u32::from_le_bytes(got.clone().try_into().unwrap()));
+        let want_f = f32::from_bits(u32::from_le_bytes(want.clone().try_into().unwrap()));
+        let ok = got == want || (got_f.is_nan() && want_f.is_nan());
+        assert!(
+            ok,
+            "{label} ({name}): {got:02X?} ({got_f:?}) must be {want:02X?} ({want_f:?})"
+        );
+    }
+}
+
+/// The conversion routines' IEEE edge operands (issue #11): NaN/inf/denormal
+/// inputs to fptoui/fptosi must saturate deterministically (the C/LLVM
+/// contract: out-of-range conversions are poison, but the routine's clamp
+/// is the deterministic behavior the PIC side must keep), and uitofp/sitofp
+/// of the full u32/i32 range must round correctly at the top end.
+#[test]
+fn float_conversion_routines_handle_ieee_edge_operands() {
+    // (routine, input bytes, expected result bytes, label) — the expected
+    // values are the routine's documented deterministic clamps (LLVM's
+    // fptoui/fptosi of NaN/inf are poison, so the host cannot be the
+    // oracle here; the clamp contract is asserted directly).
+    let cases: &[(&str, [u8; 4], [u8; 4], &str)] = &[
+        // fptoui of NaN -> 0xFFFFFFFF (the e >= 159 clamp).
+        ("__fptoui_f32", f32_le(f32::NAN), 0xFFFF_FFFFu32.to_le_bytes(), "fptoui NaN clamps"),
+        // fptoui of +inf -> 0xFFFFFFFF.
+        ("__fptoui_f32", f32_le(f32::INFINITY), 0xFFFF_FFFFu32.to_le_bytes(), "fptoui +inf clamps"),
+        // fptoui of -inf -> 0xFFFFFFFF (the sign is ignored for fptoui).
+        ("__fptoui_f32", f32_le(f32::NEG_INFINITY), 0xFFFF_FFFFu32.to_le_bytes(), "fptoui -inf clamps"),
+        // fptosi of +inf -> 0x7FFFFFFF (the positive clamp).
+        ("__fptosi_f32", f32_le(f32::INFINITY), 0x7FFF_FFFFu32.to_le_bytes(), "fptosi +inf clamps"),
+        // fptosi of -inf -> 0x80000000 (the negative clamp).
+        ("__fptosi_f32", f32_le(f32::NEG_INFINITY), 0x8000_0000u32.to_le_bytes(), "fptosi -inf clamps"),
+        // fptosi of NaN -> 0x80000000 (the negative clamp — the sign bit
+        // of the NaN is 0, so the positive clamp 0x7FFFFFFF would be the
+        // deterministic choice; the routine's e >= 158 path with sign 0
+        // gives 0x7FFFFFFF).
+        ("__fptosi_f32", f32_le(f32::NAN), 0x7FFF_FFFFu32.to_le_bytes(), "fptosi NaN clamps"),
+        // fptoui of a denormal -> 0 (e == 0).
+        ("__fptoui_f32", f32_le(f32::from_bits(0x0000_0001)), 0u32.to_le_bytes(), "fptoui denormal -> 0"),
+        // fptosi of a denormal -> 0.
+        ("__fptosi_f32", f32_le(f32::from_bits(0x8000_0001)), 0u32.to_le_bytes(), "fptosi -denormal -> 0"),
+        // uitofp of u32::MAX = 4294967295 -> 0x4F7FFFFF (the nearest float
+        // — RNE: 2^32 - 2^23 is representable, the next float up is 2^32).
+        ("__uitofp_f32", 0xFFFF_FFFFu32.to_le_bytes(), f32_le(4294967295.0), "uitofp u32::MAX"),
+        // sitofp of i32::MIN = -2147483648 -> -2^31 = 0xCF000000.
+        ("__sitofp_f32", 0x8000_0000u32.to_le_bytes(), f32_le(-2147483648.0), "sitofp i32::MIN"),
+    ];
+    for &(name, inv, want, label) in cases {
+        let (ir, map) = float_routine_unary_module(name);
+        let mut seed = Vec::new();
+        for (i, by) in inv.iter().enumerate() {
+            seed.push((0x20 + i as u16, *by));
+        }
+        let got = sim_run_bytes(&ir, &map, &seed, 0x24, 4);
+        assert_eq!(got, want, "{label} ({name}): {got:02X?} must be {want:02X?}");
+    }
+}
+
 /// The narrow-source conversion CALL ABI: `sitofp`/`uitofp` of i8/i16
 /// sources go through `call @__sitofp_f32`/`@__uitofp_f32`, whose `val`
 /// param is a fixed 4-byte slot — but the caller copies only the source's
