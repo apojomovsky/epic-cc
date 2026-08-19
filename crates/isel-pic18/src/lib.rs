@@ -244,16 +244,23 @@ impl<'m> Gen<'m> {
                 );
                 // Mirrors `isel`'s own width guard (`crates/isel/src/lib.rs`,
                 // "isel: zext must not narrow") — without it, a malformed
-                // `Zext` with `to.bytes() <= from.bytes()` would copy
-                // `from.bytes()` bytes into a narrower-or-equal `to.bytes()`
-                // slot below, writing past the destination into whatever
-                // local sits next to it. Not reachable from today's
-                // clang-generated IR, but a real asymmetry with `isel`
+                // `Zext` with `to.bytes() < from.bytes()` would copy
+                // `from.bytes()` bytes into a narrower `to.bytes()` slot
+                // below, writing past the destination into whatever local
+                // sits next to it. Equal widths (e.g. `zext i1 to i8`,
+                // where both types report `.bytes() == 1` in the byte
+                // model — an icmp result is materialized as a byte holding
+                // exactly 0/1, so a 1-byte copy IS the zext) are legal and
+                // common (`u8 b = (a < b);`) and must be accepted: the
+                // "extra high bytes" loop from `from.bytes()..to.bytes()`
+                // below simply does not execute when the widths are equal.
+                // Not reachable from today's clang-generated IR for the
+                // narrowing case, but a real asymmetry with `isel`
                 // otherwise (silent corruption here vs. a clean panic
                 // there).
                 assert!(
-                    z.to.bytes() > z.from.bytes(),
-                    "isel-pic18: zext must widen (to must be strictly wider than from)"
+                    z.to.bytes() >= z.from.bytes(),
+                    "isel-pic18: zext must not narrow"
                 );
                 let src = self.val_addr(&z.val).direct();
                 let dst = self.slot_addr(self.cur_func, &z.dst).direct();

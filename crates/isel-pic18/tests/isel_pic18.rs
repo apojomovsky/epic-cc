@@ -379,6 +379,32 @@ fn zext_i8_to_i16_zero_fills_the_high_byte() {
 }
 
 #[test]
+fn zext_i1_to_i8_same_width_widen_compiles_and_runs() {
+    // Regression test: `zext i1 to i8` (e.g. `u8 b = (a < b);`) is legal
+    // and common — i1 and i8 both report `.bytes() == 1` in the byte
+    // model, so this is a same-width "widen" that's really a 1-byte copy.
+    // A prior version of this guard required `to.bytes() > from.bytes()`
+    // (strictly wider), which panicked on this case even though it's not
+    // a narrowing bug. The guard must accept `to.bytes() >= from.bytes()`.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp eq i8 %1, %2\n    %4 = zext i1 %3 to i8\n    store i8 %4 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x10), ("b", 0x11), ("out", 0x12),
+        ("main::1", 0x13), ("main::2", 0x14), ("main::3", 0x15), ("main::4", 0x16),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = av;
+        p.ram_mut()[0x11] = bv;
+        p.run(200);
+        assert_eq!(p.ram()[0x12], expect, "zext(icmp eq({av},{bv}))");
+    }
+}
+
+#[test]
 fn sext_i8_to_i16_sign_fills_the_high_byte() {
     let m = parse("global a i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = sext i8 %1 to i16\n    ret void\n");
     let addrs = addrs(&[("a", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
