@@ -267,6 +267,25 @@ impl<'m> Gen<'m> {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
                 }
             }
+            Inst::Select(s) => {
+                // `cond`/`a`/`b` all route through `emit_load_w`/
+                // `emit_move_val_to_slot`, both of which already handle
+                // `Val::Const` correctly (via `MOVLW`, not as a RAM
+                // address through `val_addr`) — unlike `Bin`'s `a` operand
+                // or `Icmp`'s `a` operand, which go through `val_addr()`
+                // directly and so needed an explicit const-LHS guard, no
+                // guard is needed here.
+                let dst = self.slot_addr(self.cur_func, &s.dst).direct();
+                let l_else = self.fresh_label();
+                let l_end = self.fresh_label();
+                self.emit_load_w(&s.cond, 0);
+                self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
+                self.emit_move_val_to_slot(&s.a, s.ty, dst);
+                self.emit(format!("    BRA {l_end}"));
+                self.emit(format!("{l_else}:"));
+                self.emit_move_val_to_slot(&s.b, s.ty, dst);
+                self.emit(format!("{l_end}:"));
+            }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }

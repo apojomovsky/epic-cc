@@ -434,3 +434,20 @@ fn trunc_const_source_is_rejected_not_silently_miscompiled() {
     let addrs = addrs(&[("main::1", 0x11)]);
     let _ = select(&PIC18F4550, &m, &addrs);
 }
+
+#[test]
+fn select_picks_a_when_cond_is_true_and_b_otherwise() {
+    let m = parse("global c i8\nglobal a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    %2 = load i8 @a\n    %3 = load i8 @b\n    %4 = icmp ne i8 %1, 0\n    %5 = select i1 %4 i8 %2 i8 %3\n    ret void\n");
+    let addrs = addrs(&[("c", 0x10), ("a", 0x11), ("b", 0x12), ("main::1", 0x13), ("main::2", 0x14), ("main::3", 0x15), ("main::4", 0x16), ("main::5", 0x17)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect) in [(1u8, 0x11u8), (0, 0x22)] {
+        // reuse fresh ram each run
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = c;
+        p.ram_mut()[0x11] = 0x11;
+        p.ram_mut()[0x12] = 0x22;
+        p.run(200);
+        assert_eq!(p.ram()[0x17], expect, "select(cond={c})");
+    }
+}
