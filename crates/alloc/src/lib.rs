@@ -41,29 +41,52 @@ fn region_for(device: &Device, addr: u16) -> (u16, u16) {
     })
 }
 
+/// The start address for a `width`-byte value placed at the next free
+/// address `addr`, or `None` if no region past `addr` has room (the device's
+/// last bank has been exhausted). Same placement rule as `place_at` — step
+/// through regions, `align = width.min(2)` — without the panic.
+fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
+    let align = width.min(2);
+    let mut a = addr;
+    loop {
+        let (start, end) = device.region_for(a)?;
+        let mut base = a.max(start);
+        if base % u16::from(align) != 0 {
+            base += u16::from(align) - (base % u16::from(align));
+        }
+        if base + u16::from(width) - 1 <= end {
+            return Some(base);
+        }
+        a = end + 1;
+    }
+}
+
 /// The start address for a `width`-byte value placed at the next free address
 /// `addr`: step across banks when `addr` has passed a region's end, keep the
 /// value even-aligned within its bank region (only 2-byte values need even
 /// alignment; larger arrays advance sequentially), and panic past the
 /// device's last bank.
 fn place_at(device: &Device, addr: u16, width: u8) -> u16 {
-    // Only i16/2-byte globals need even alignment; larger arrays advance
-    // sequentially (min(size, 2) keeps a multi-byte value from being padded
-    // out to a multiple of its own width, which would waste RAM).
-    let align = width.min(2);
-    let mut a = addr;
-    loop {
-        let (start, end) = region_for(device, a);
-        let mut base = a.max(start);
-        if base % u16::from(align) != 0 {
-            base += u16::from(align) - (base % u16::from(align));
-        }
-        if base + u16::from(width) - 1 <= end {
-            return base;
-        }
-        // The value doesn't fit in this region; continue just past its end.
-        a = end + 1;
+    try_place_at(device, addr, width).unwrap_or_else(|| {
+        let last_end = device.ram_banks.last().expect("a device has at least one GPR bank").1;
+        panic!("alloc: GPR demand exceeds 0x{last_end:X} ({addr:#06x})")
+    })
+}
+
+/// `globals` placed in order with ONE monotonically-advancing cursor —
+/// exactly `allocate()`'s original globals loop, extracted so it can be
+/// tried before falling back to bin-packing. Returns `None` the first time
+/// any global doesn't fit, rather than panicking.
+fn try_place_globals_sequential(device: &Device, globals: &[&ir::Global]) -> Option<HashMap<String, u16>> {
+    let mut out = HashMap::new();
+    let mut addr: u16 = device.gpr_start();
+    for g in globals {
+        let width = g.size as u8;
+        let start = try_place_at(device, addr, width)?;
+        out.insert(g.name.clone(), start);
+        addr = start + u16::from(width);
     }
+    Some(out)
 }
 
 /// The start address for a `width`-byte local placed contiguously at the next
@@ -143,25 +166,21 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // sized array advances the free pointer by its byte count. Const globals
     // get no RAM address (their bytes live in flash) but are still recorded
     // so the map text can list them.
-    let mut globals: HashMap<String, u16> = HashMap::new();
     let mut const_globals: HashSet<String> = HashSet::new();
-    let mut addr: u16 = device.gpr_start();
+    let mut non_const: Vec<&ir::Global> = Vec::new();
     for g in &m.globals {
         if g.is_const {
             const_globals.insert(g.name.clone());
-            continue;
+        } else {
+            assert!(g.size <= 255, "alloc: RAM global @{} too large ({} bytes; RAM is byte-addressed, max 255)", g.name, g.size);
+            non_const.push(g);
         }
-        // RAM globals are byte-addressed: `place_at` takes a u8 width. Const
-        // globals are skipped above, so only RAM sizes reach here — a RAM
-        // array past 255 bytes is a parse-time error, but assert loudly
-        // anyway (defense in depth against a hand-built Module).
-        let width = g.size;
-        assert!(width <= 255, "alloc: RAM global @{} too large ({width} bytes; RAM is byte-addressed, max 255)", g.name);
-        let width = width as u8;
-        let start = place_at(device, addr, width);
-        globals.insert(g.name.clone(), start);
-        addr = start + u16::from(width);
     }
+    let globals: HashMap<String, u16> = try_place_globals_sequential(device, &non_const)
+        .unwrap_or_else(|| {
+            let last_end = device.ram_banks.last().expect("a device has at least one GPR bank").1;
+            panic!("alloc: GPR demand exceeds 0x{last_end:X}")
+        });
 
     // end_of_globals = max over the address map of (addr + width), floored at
     // the device's GPR start (mirrors isel's layout computation). The
@@ -488,4 +507,39 @@ pub fn map_text(l: &AllocLayout) -> String {
         out.push_str(&format!("local {func} {name} 0x{:02X}\n", l.locals[key]));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use device::PIC16F877A;
+
+    fn global(name: &str, size: u16) -> ir::Global {
+        ir::Global { name: name.to_string(), ty: ir::Ty::I8, is_const: false, size, bytes: Vec::new(), addr: None }
+    }
+
+    #[test]
+    fn try_place_at_returns_none_instead_of_panicking_past_the_last_bank() {
+        // PIC16F877A's last bank ends at 0x1EF; nothing at or past 0x1F0 has
+        // a region, so placing even a 1-byte value there must fail cleanly.
+        assert_eq!(try_place_at(&PIC16F877A, 0x1F0, 1), None);
+    }
+
+    #[test]
+    fn try_place_globals_sequential_returns_none_when_a_later_global_cannot_fit_anywhere() {
+        // Three 76-byte globals, one 78-byte global, then one 4-byte global
+        // (310 bytes total, well under the device's 320-byte capacity) — the
+        // single advancing cursor abandons a 4-byte leftover in each of the
+        // first three banks it uses, then the 78-byte global leaves only 2
+        // bytes in the fourth (last) bank, too little for the trailing
+        // 4-byte global with nowhere left to go. See Task 3's integration
+        // test for the full derivation of these exact sizes.
+        let g0 = global("g0", 76);
+        let g1 = global("g1", 76);
+        let g2 = global("g2", 76);
+        let g3 = global("g3", 78);
+        let g4 = global("g4", 4);
+        let refs: Vec<&ir::Global> = vec![&g0, &g1, &g2, &g3, &g4];
+        assert_eq!(try_place_globals_sequential(&PIC16F877A, &refs), None);
+    }
 }
