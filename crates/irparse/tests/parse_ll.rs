@@ -614,6 +614,42 @@ fn decodes_literal_struct_initializers_to_flat_bytes() {
     assert_eq!(gr.bytes, vec![0x47, 0x00, 0x02, 0x01]);
 }
 
+// Issue #5 regressions (code review): clang 20.1.8 prints a zero-initialized
+// nested struct field as `{ T } zeroinitializer` inside the parent's brace
+// list, and array-of-literal-struct element types may themselves contain
+// array fields (`[2 x { [2 x { i8, i8, i16 }], i8, i8 }]`). Both shapes must
+// decode, not panic.
+const CONST_STRUCT_REGRESSIONS: &str = r#"
+@W = dso_local constant { { i8, i8, i16 }, i8, i8 } { { i8, i8, i16 } zeroinitializer, i8 120, i8 0 }, align 2
+@O2 = dso_local constant [2 x { [2 x { i8, i8, i16 }], i8, i8 }] [{ [2 x { i8, i8, i16 }], i8, i8 } { [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 1, i8 0, i16 2 }, { i8, i8, i16 } { i8 3, i8 0, i16 4 }], i8 97, i8 0 }, { [2 x { i8, i8, i16 }], i8, i8 } { [2 x { i8, i8, i16 }] [{ i8, i8, i16 } { i8 5, i8 0, i16 6 }, { i8, i8, i16 } { i8 7, i8 0, i16 8 }], i8 98, i8 0 }], align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_nested_zeroinit_and_array_field_structs() {
+    let m = parse_ll(CONST_STRUCT_REGRESSIONS);
+    let g = |n: &str| m.globals.iter().find(|g| g.name == n).unwrap();
+
+    // W = { { 0, 0 }, 'x', pad } — nested Pair zeroinitializer, size 6
+    let w = g("W");
+    assert_eq!(w.size, 6);
+    assert_eq!(w.bytes, vec![0x00, 0x00, 0x00, 0x00, 0x78, 0x00]);
+
+    // O2 = two elements; each { Pair[2], 'a'/'b', pad } — size 10 each.
+    // Element 0: Pairs (1,2),(3,4) then 'a'; element 1: (5,6),(7,8) then 'b'.
+    let o2 = g("O2");
+    assert_eq!(o2.size, 20);
+    let mut expect = Vec::new();
+    for e in [&[1u8, 0, 2, 0, 3, 0, 4, 0][..], &[5, 0, 6, 0, 7, 0, 8, 0]] {
+        expect.extend_from_slice(e);
+        expect.push(if e[0] == 1 { b'a' } else { b'b' });
+        expect.push(0);
+    }
+    assert_eq!(o2.bytes, expect);
+}
+
 // Issue #5: clang -O1 lowers `&CARR[i]` on a const struct array to
 // `getelementptr [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i` — the index
 // after an array-of-struct descent is the ELEMENT selector, striding by

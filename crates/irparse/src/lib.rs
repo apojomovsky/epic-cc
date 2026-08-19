@@ -174,18 +174,24 @@ fn literal_ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
 
 /// Strip a clang self-type prefix from a nested value. clang prints every
 /// non-scalar initializer with its own type: `{ T } { v }` for struct
-/// values, `[N x T] c"..."` / `[N x T] [...]` for array values. The value's
-/// first brace/bracket group is that self-type — strip it when present so
-/// the remainder is the bare value the decoder expects.
+/// values, `{ T } zeroinitializer` for zero-initialized nested structs,
+/// `[N x T] c"..."` / `[N x T] [...]` for array values. The value's first
+/// brace/bracket group is that self-type — strip it when present so the
+/// remainder is the bare value the decoder expects.
 fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
     let value = value.trim();
     if value.starts_with('{') {
-        // `{ i8, i8, i16 } { i8 66, ... }` — the first brace group is the
-        // self-type; `brace_inner` stops at its closing brace, and the
-        // remainder starts with the value's own `{`.
+        // `{ i8, i8, i16 } { i8 66, ... }` / `{ i8, i8, i16 } zeroinitializer`
+        // — the first brace group is the self-type; `brace_inner` stops at
+        // its closing brace, and the remainder is the value's own `{` list
+        // or `zeroinitializer`.
         let inner = brace_inner(value).unwrap_or("");
         let rest = value[inner.len() + 2..].trim();
-        return if rest.starts_with('{') { rest } else { value };
+        return if rest.starts_with('{') || rest.starts_with("zeroinitializer") {
+            rest
+        } else {
+            value
+        };
     }
     if ty.trim().starts_with('[') && value.starts_with('[') {
         // `[3 x i8] c"abc"` / `[2 x T] [ ... ]` — the first bracket group
@@ -212,10 +218,13 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
         let (size, _) = ty_size_align(ty, types);
         return vec![0u8; size as usize];
     }
-    if let Some(inner) = ty.strip_prefix('[') {
+    if let Some(_) = ty.strip_prefix('[') {
         // Array value: `c"..."` (i8), a `[...]` element list, or (struct
-        // elements) a brace list.
-        let close = ty.find(']').unwrap();
+        // elements) a brace list. matching_bracket (depth-aware), NOT
+        // find(']'): a literal-struct element may contain array fields
+        // (`[2 x { [2 x T], i8, i8 }]`), whose `]` would truncate the
+        // outer array type.
+        let close = matching_bracket(ty).expect("array type must have balanced brackets");
         let inner = &ty[1..close];
         let mut pit = inner.splitn(2, "x").map(|s| s.trim());
         let n: usize = pit.next().unwrap().parse().unwrap();
@@ -698,8 +707,12 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
                 // `[N x %struct.S], i16 0, i16 %i` — the index after an
                 // array-of-struct descent strides by sizeof(%struct.S)
                 // (LLVM: the second index indexes the array's element
-                // type). clang -O1 emits this for `&CARR[i]`; field
-                // selection rides as a separate i8-offset GEP.
+                // type). clang -O1 emits this for `&CARR[i]`. Field
+                // selection on an array element arrives as a THIRD index
+                // (`[2 x %struct.Pair], ptr @CARR, i16 0, i16 %i, i32 1`
+                // for `CARR[i].b`) — the loop's next iteration hits the
+                // `!from_array` panic below, which is exactly the loud
+                // struct-descent rejection this branch feeds.
                 let (sz, _) = ty_size_align(&cur, types);
                 match &idx {
                     Val::Const(c) => k += c * i64::from(sz),
@@ -945,9 +958,17 @@ pub fn parse_ll(src: &str) -> Module {
                 // array global: "[N x i8] zeroinitializer" / "[N x i8] c\"...\""
                 // / "[N x { ... }] { {...}, {...} }" (array of literal
                 // structs — clang's expanded form for struct arrays)
-                let close = rest.find(']').unwrap();
+                // matching_bracket (depth-aware), NOT find(']'): a
+                // literal-struct element may contain array fields
+                // (`[2 x { [2 x T], i8, i8 }]`), whose `]` would truncate
+                // the outer array type at the first nested bracket.
+                let close = matching_bracket(rest)
+                    .expect("array global type must have balanced brackets");
                 let inner = &rest[1..close]; // e.g. "8 x i8"
-                let mut pit = inner.split('x').map(|s| s.trim());
+                // splitn(2, "x"), NOT split('x'): a literal-struct element
+                // type may itself contain array fields (`{ [2 x T], i8 }`),
+                // whose `x` would truncate the element string.
+                let mut pit = inner.splitn(2, 'x').map(|s| s.trim());
                 let n: usize = pit.next().unwrap().parse().unwrap();
                 let elem_str = pit.next().unwrap();
                 if elem_str.starts_with('{') {
