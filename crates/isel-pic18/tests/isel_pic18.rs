@@ -436,6 +436,24 @@ fn trunc_const_source_is_rejected_not_silently_miscompiled() {
 }
 
 #[test]
+#[should_panic(expected = "const cond Select")]
+fn select_const_cond_is_rejected_not_silently_miscompiled() {
+    // `emit_load_w`'s `Val::Const` arm emits only `MOVLW`, which (per this
+    // project's simulator, `crates/sim/src/lib.rs:903`) never touches the
+    // Z flag — unlike `MOVF` (the `Val::Reg`/`Val::Global` arm), which
+    // does via `set_zn` (`crates/sim/src/lib.rs:779-783`). Without the
+    // guard, `select i1 1 ...`'s `BZ` right after the `MOVLW` would test
+    // whatever Z flag the PREVIOUS instruction happened to leave, silently
+    // picking the wrong side of the `Select` instead of using the literal
+    // cond. This must fail loudly instead, matching the `Inst::Bin`/
+    // `Inst::Icmp` const-LHS guards and `Zext`/`Sext`/`Trunc`'s
+    // const-source guards.
+    let m = parse("fn main(void) ()\n  block entry:\n    %1 = select i1 1 i8 5 i8 6\n    ret void\n");
+    let addrs = addrs(&[("main::1", 0x12)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
+
+#[test]
 fn select_picks_a_when_cond_is_true_and_b_otherwise() {
     let m = parse("global c i8\nglobal a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    %2 = load i8 @a\n    %3 = load i8 @b\n    %4 = icmp ne i8 %1, 0\n    %5 = select i1 %4 i8 %2 i8 %3\n    ret void\n");
     let addrs = addrs(&[("c", 0x10), ("a", 0x11), ("b", 0x12), ("main::1", 0x13), ("main::2", 0x14), ("main::3", 0x15), ("main::4", 0x16), ("main::5", 0x17)]);

@@ -268,13 +268,29 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Select(s) => {
-                // `cond`/`a`/`b` all route through `emit_load_w`/
-                // `emit_move_val_to_slot`, both of which already handle
-                // `Val::Const` correctly (via `MOVLW`, not as a RAM
-                // address through `val_addr`) — unlike `Bin`'s `a` operand
-                // or `Icmp`'s `a` operand, which go through `val_addr()`
-                // directly and so needed an explicit const-LHS guard, no
-                // guard is needed here.
+                // `a`/`b` route through `emit_move_val_to_slot`, which
+                // handles `Val::Const` correctly (via `MOVLW`+`MOVWF`, not
+                // as a RAM address through `val_addr`) and never branches
+                // on a flag — no guard needed for either.
+                //
+                // `cond` is different: it's loaded via `emit_load_w`, then
+                // immediately tested with `BZ`, which relies on the LOAD
+                // having set the Z flag from `cond`'s value. That's true
+                // when `cond` is `Val::Reg`/`Val::Global` (`emit_load_w`
+                // emits `MOVF ...,W`, and this project's simulator's MOVF
+                // calls `set_zn` — `crates/sim/src/lib.rs:779-783`). It is
+                // NOT true for `Val::Const`: `emit_load_w`'s const arm
+                // emits only `MOVLW`, and the simulator's MOVLW (PIC18
+                // opcode 0xE, `crates/sim/src/lib.rs:903`) does `self.w = k`
+                // with no `set_zn` call at all — so `BZ` would test
+                // whatever Z flag the PREVIOUS instruction happened to
+                // leave, silently picking the wrong side of the `Select`.
+                // Same hazard class as the const-LHS/const-source guards
+                // elsewhere in this file; guard it the same way.
+                assert!(
+                    !matches!(s.cond, Val::Const(_)),
+                    "isel-pic18: const cond Select not yet supported"
+                );
                 let dst = self.slot_addr(self.cur_func, &s.dst).direct();
                 let l_else = self.fresh_label();
                 let l_end = self.fresh_label();
