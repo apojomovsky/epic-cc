@@ -1107,36 +1107,59 @@ impl Pic18 {
     }
 
     /// Resolve a byte/bit-oriented `(a, f)` pair to its physical 12-bit
-    /// address. Indirect addressing registers (`INDFn`/`POSTINCn`/
-    /// `POSTDECn`/`PREINCn`/`PLUSWn`) are checked first — each reads/writes
-    /// through the matching `FSRn`, with the side effect (advance/retreat
-    /// FSRn) happening here so every caller (`read_f`, `write_f`) gets it
-    /// for free. Otherwise: `a=0` (access bank): `f<=0x5F` -> `f` (low
-    /// access, `0x000-0x05F`); `f>0x5F` -> `0xF00+f` (high access/SFR,
+    /// address. `a=0` (access bank): `f<=0x5F` -> `f` (low access,
+    /// `0x000-0x05F`); `f>0x5F` -> `0xF00+f` (high access/SFR,
     /// `0xF60-0xFFF`). `a=1` (banked): `(BSR<<8)|f`. This split is a core
     /// PIC18 architecture invariant (see the plan's reference section),
     /// hard-coded here exactly as `Pic14::bank_base` hard-codes RP1:RP0.
+    ///
+    /// Indirect addressing registers (`INDFn`/`POSTINCn`/`POSTDECn`/
+    /// `PREINCn`/`PLUSWn`) are checked AFTER the physical address above is
+    /// resolved, by matching the RESULT against the SFR addresses those
+    /// registers actually live at (`0xFD9-0xFEF`) — never against the raw
+    /// `f` byte in isolation. `f`'s low byte alone is ambiguous: a
+    /// `BSR`-banked (`a=1`) ordinary GPR access can have a low byte that
+    /// coincidentally equals e.g. `0xE7` (INDF1) while its real physical
+    /// address (`BSR<<8 | f`) lands nowhere near the SFR page — matching on
+    /// raw `f` treated every such GPR write as an indirect-register access
+    /// instead, corrupting unrelated FSRs and, once `cur`/`W` combined into
+    /// a negative `PLUSWn` offset, produced an `i32`-to-`usize` cast so
+    /// large it panicked `read_f`/`write_f`'s array index outright. Found
+    /// via the PIC18 P2 `banked.c` acceptance fixture (Task 15): 90+
+    /// `BSR`-banked globals meant some landed at a physical address whose
+    /// low byte fell in this range purely by chance.
     fn resolve_f(&mut self, a: u16, f: u16) -> usize {
-        let (fsrn_lo, fsrn_hi, indf, postinc, postdec, preinc) = match f {
+        let phys = if a == 0 {
+            if f <= 0x5F {
+                f as usize
+            } else {
+                0xF00 + f as usize
+            }
+        } else {
+            ((self.ram[0xFE0] as usize) << 8) | f as usize
+        };
+        if phys < 0xF00 {
+            return phys;
+        }
+        let (fsrn_lo, fsrn_hi, indf, postinc, postdec, preinc) = match (phys & 0xFF) as u16 {
             0xEF | 0xEE | 0xED | 0xEC | 0xEB => (0xE9, 0xEA, 0xEF, 0xEE, 0xED, 0xEC), // FSR0
             0xE7 | 0xE6 | 0xE5 | 0xE4 | 0xE3 => (0xE1, 0xE2, 0xE7, 0xE6, 0xE5, 0xE4), // FSR1
             0xDF | 0xDE | 0xDD | 0xDC | 0xDB => (0xD9, 0xDA, 0xDF, 0xDE, 0xDD, 0xDC), // FSR2
-            _ => {
-                return if a == 0 {
-                    if f <= 0x5F {
-                        f as usize
-                    } else {
-                        0xF00 + f as usize
-                    }
-                } else {
-                    ((self.ram[0xFE0] as usize) << 8) | f as usize
-                };
-            }
+            _ => return phys,
         };
         let lo_addr = 0xF00 + fsrn_lo;
         let hi_addr = 0xF00 + fsrn_hi;
         let cur = ((self.ram[hi_addr] as u16) << 8) | self.ram[lo_addr] as u16;
-        match f {
+        // Dispatch on `(phys & 0xFF) as u16`, not the raw `f` byte, for
+        // consistency with the arm-selection `match` just above — the two
+        // are provably equal on every path that reaches here today (the
+        // `phys < 0xF00` return above already filters out any case where
+        // they'd diverge), but matching the same derived value the arm
+        // selection uses keeps that invariant local and structural instead
+        // of a fact this function has to independently stay true to, and
+        // avoids a latent trap if the `phys < 0xF00` gate above is ever
+        // loosened.
+        match (phys & 0xFF) as u16 {
             _ if f == indf => cur as usize,
             _ if f == postinc => {
                 let next = cur.wrapping_add(1);

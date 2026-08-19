@@ -8,6 +8,7 @@ publish = false
 ir = { path = "../ir" }
 device = { path = "../device" }
 banking = { path = "../banking" }
+iselcore = { path = "../iselcore" }
 
 [dev-dependencies]
 pic14-sim = { path = "../sim" }

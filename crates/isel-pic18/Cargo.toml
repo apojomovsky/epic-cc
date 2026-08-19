@@ -1,22 +1,23 @@
 [package]
-name = "driver"
+name = "isel-pic18"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [dependencies]
-device = { path = "../device" }
 ir = { path = "../ir" }
+device = { path = "../device" }
+iselcore = { path = "../iselcore" }
+
+[dev-dependencies]
+pic14-sim = { path = "../sim" }
+asm = { path = "../asm" }
 irparse = { path = "../irparse" }
 wholeprog = { path = "../wholeprog" }
 legalize = { path = "../legalize" }
 callgraph = { path = "../callgraph" }
 alloc = { path = "../alloc" }
-isel = { path = "../isel" }
-isel-pic18 = { path = "../isel-pic18" }
-banking = { path = "../banking" }
-peephole = { path = "../peephole" }
-asm = { path = "../asm" }
 
-[dev-dependencies]
-pic14-sim = { path = "../sim" }
+[[bin]]
+name = "isel-pic18"
+path = "src/bin/isel-pic18.rs"

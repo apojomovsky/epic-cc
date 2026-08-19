@@ -48,6 +48,7 @@ dependencies = [
  "ir",
  "irparse",
  "isel",
+ "isel-pic18",
  "legalize",
  "peephole",
  "pic14-sim",
@@ -91,9 +92,30 @@ dependencies = [
  "banking",
  "device",
  "ir",
+ "iselcore",
  "legalize",
  "pic14-sim",
 ]
+
+[[package]]
+name = "isel-pic18"
+version = "0.1.0"
+dependencies = [
+ "alloc",
+ "asm",
+ "callgraph",
+ "device",
+ "ir",
+ "irparse",
+ "iselcore",
+ "legalize",
+ "pic14-sim",
+ "wholeprog",
+]
+
+[[package]]
+name = "iselcore"
+version = "0.1.0"
 
 [[package]]
 name = "legalize"
