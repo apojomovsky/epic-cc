@@ -123,7 +123,6 @@ impl<'m> Gen<'m> {
 
     fn emit_inst(&mut self, i: &Inst) {
         match i {
-            Inst::Ret(None) => self.emit("    RETURN".to_string()),
             Inst::Load(l) => {
                 assert!(l.ty != Ty::I1, "isel-pic18: only i8/i16 loads supported");
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
@@ -595,22 +594,78 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             tmp: &mut tmp,
             out: Vec::new(),
         };
-        // Full multi-block label emission (every non-entry block getting
-        // `{func}_L{label}`) arrives in Task 12. But `__start` already
-        // unconditionally emits `call main` above, and Task 6 is the first
-        // task whose tests actually assemble+simulate the generated code
-        // (rather than just checking the asm text), which exposed that gap:
-        // without a `main:` label, `call main` is an unresolved symbol and
-        // assembly fails outright. So the entry (first) block gets its
-        // label — the bare function name — here now, matching the target
-        // scheme's rule for the first block; the "every other block" half
-        // of the scheme is still deferred to Task 12.
-        for (bi, b) in f.blocks.iter().enumerate() {
-            if bi == 0 {
-                g.emit(format!("{}:", f.name));
-            }
+        // Index-based label scheme, matching `isel::select` exactly
+        // (`crates/isel/src/lib.rs:4085-4094`): the first block in
+        // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
+        // resolve to it, and it's defined exactly once); every other block
+        // gets `{func}_L{label}`. Built once per function, keyed by the
+        // IR block's own `label` field so every `Br`/`BrCond` target and
+        // Phi-copy successor lookup resolves through this map rather than
+        // re-deriving a name inline.
+        let mut labels: HashMap<String, String> = HashMap::new();
+        for (i, b) in f.blocks.iter().enumerate() {
+            let lbl = if i == 0 { f.name.clone() } else { format!("{}_L{}", f.name, b.label) };
+            labels.insert(b.label.clone(), lbl);
+        }
+        for b in &f.blocks {
+            g.emit(format!("{}:", labels[&b.label]));
+            g.bsr = None; // conservative: BSR is unknown at any branch target
+            let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
-                g.emit_inst(inst);
+                match inst {
+                    Inst::Phi(_) => {} // handled per-predecessor below, not here
+                    Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(inst),
+                    other => g.emit_inst(other),
+                }
+            }
+            // Emit copies for every successor block's Phi entries whose
+            // incoming block is this one, THEN the terminator itself.
+            let successors: Vec<&str> = match terminator {
+                Some(Inst::Br(br)) => vec![br.target.as_str()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+                _ => vec![],
+            };
+            for succ in &successors {
+                if let Some(sb) = f.blocks.iter().find(|sb| &sb.label == succ) {
+                    for inst in &sb.insts {
+                        if let Inst::Phi(p) = inst {
+                            if let Some((val, _)) = p.incoming.iter().find(|(_, from)| from == &b.label) {
+                                let dst = g.slot_addr(f.name.as_str(), &p.dst).direct();
+                                g.emit_move_val_to_slot(val, p.ty, dst);
+                            }
+                        }
+                    }
+                }
+            }
+            match terminator {
+                Some(Inst::Br(br)) => g.emit(format!("    BRA {}", labels[&br.target])),
+                Some(Inst::BrCond(bc)) => {
+                    // Same hazard class as `Select`'s cond (Task 11, see
+                    // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
+                    // `Val::Const` arm emits only `MOVLW`, which does not
+                    // set the Z flag (`crates/sim/src/lib.rs`), so a
+                    // literal cond here would make `BZ` test a stale flag
+                    // from whatever came before instead of `cond`'s real
+                    // value. Fail loudly instead of silently miscompiling.
+                    assert!(
+                        !matches!(bc.cond, Val::Const(_)),
+                        "isel-pic18: const cond BrCond not yet supported"
+                    );
+                    g.emit_load_w(&bc.cond, 0);
+                    g.emit(format!("    BZ {}", labels[&bc.f]));
+                    g.emit(format!("    BRA {}", labels[&bc.t]));
+                }
+                Some(Inst::Ret(None)) => g.emit("    RETURN".to_string()),
+                Some(Inst::Ret(Some((ty, v)))) => {
+                    for i in 0..ty.bytes() {
+                        g.emit_load_w(v, i);
+                        let (a, f2) = g.operand(g.retval_lo + u16::from(i));
+                        let bank = if a == 0 { "A" } else { "B" };
+                        g.emit(format!("    MOVWF 0x{f2:03X},{bank}"));
+                    }
+                    g.emit("    RETURN".to_string());
+                }
+                _ => panic!("isel-pic18: block has no terminator"),
             }
         }
         out.extend(g.out);
