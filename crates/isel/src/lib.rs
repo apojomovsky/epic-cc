@@ -715,6 +715,81 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
                 self.emit(format!("{l_done}:"));
             }
+            [(scale, r)] => {
+                // Multi-byte elements (i16/f32 scale 2, i32/f32 scale 4 —
+                // classic mid-range has no MULLW): byte index = s×idx + k +
+                // off, computed 16-bit style like the scale-1 arm: the lo
+                // byte is left-shifted log2(s) times (one RLF pair doubles
+                // the index, two quadruple it) with each shift's carry
+                // rotated into the hi byte, so after the pairs the hi byte
+                // is `s·idx_lo >> 8` exactly; then `ADDLW kk` folds the
+                // bit-8 carry of the + kk add into it — the chunk bit is hi
+                // bit 0, W the in-chunk index, matching the scale-1 flow
+                // (which, for a 2-chunk table, has idx_hi == 0 in bounds).
+                assert_eq!(
+                    self.reg_bytes(r),
+                    2,
+                    "isel: large-table index %{r} must be a 16-bit reg"
+                );
+                assert!(
+                    *scale == 2 || *scale == 4,
+                    "isel: large-table element scale {scale} not supported (i16/i32/float only)"
+                );
+                let a_lo = self.val_addr(&Val::Reg(r.clone())).direct();
+                let l_hi = self.fresh_label();
+                let l_done = self.fresh_label();
+                // Pairs = log2(scale): one shift pair doubles the byte
+                // index (scale 2), two quadruple it (scale 4).
+                let pairs = match *scale {
+                    2 => 1,
+                    4 => 2,
+                    _ => unreachable!(),
+                };
+                // lo = idx_lo; hi = 0; shift pair `pairs` times: lo <<= 1,
+                // hi gets the carry, so after all pairs lo = (s·idx_lo) &
+                // 0xFF and hi = (s·idx_lo) >> 8. C is cleared first — RLF
+                // shifts the incoming carry into bit 0, so a stale C would
+                // corrupt the scaled index's low bits.
+                self.emit(format!("    MOVF 0x{a_lo:02X}, W"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo)); // lo temp
+                self.emit(format!("    CLRF 0x{:02X}", self.scratch)); // hi temp
+                self.emit("    BCF STATUS, 0".to_string());
+                for _ in 0..pairs {
+                    self.emit(format!("    RLF 0x{:02X}, F", self.retval_lo));
+                    self.emit(format!("    RLF 0x{:02X}, F", self.scratch));
+                }
+                // W = lo + kk; C = carry into bit 8.
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    ADDLW 0x{kk:02X}"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
+                // hi += carry; chunk bit = hi bit 0.
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit("    BTFSC STATUS, 0".to_string());
+                self.emit("    ADDLW 0x01".to_string());
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                // W = in-chunk index; bit 0 of the hi temp selects the entry
+                // (identical tail to the scale-1 arm).
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    BTFSC 0x{:02X}, 0", self.scratch));
+                self.emit(format!("    GOTO {l_hi}"));
+                self.emit(format!("    MOVLW PAGE(__read_{name})"));
+                self.emit("    MOVWF PCLATH".to_string());
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    CALL __read_{name}"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                self.emit_pclath_restore(&format!("__read_{name}"));
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    GOTO {l_done}"));
+                self.emit(format!("{l_hi}:"));
+                self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
+                self.emit("    MOVWF PCLATH".to_string());
+                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    CALL __read_{name}_hi"));
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                self.emit_pclath_restore(&format!("__read_{name}_hi"));
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit(format!("{l_done}:"));
+            }
             [] => panic!(
                 "isel: constant index into large const table @{name} not supported (size > 255); only a single 16-bit reg index is supported"
             ),
@@ -1517,19 +1592,14 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
                     }
                 } else {
-                    // A GEP-created pointer: const (flash) bases keep the
-                    // RETLW path (i8 only); RAM bases go through the shared
+                    // A GEP-created pointer: const (flash) bases take the
+                    // RETLW path (each byte a table read — multi-byte loads
+                    // loop over the bytes); RAM bases go through the shared
                     // byte machinery (direct or FSR/INDF).
                     let r = l.ptr.strip_prefix('%').unwrap_or_else(|| {
                         panic!("isel: pointer {:?} is not @global, %reg or a literal", l.ptr)
                     });
                     let ptr = Val::Reg(r.to_string());
-                    if let (Base::Global(name), _, _) = self.resolved_for(r) {
-                        assert!(
-                            !self.global_is_const(&name) || l.ty.bytes() == 1,
-                            "isel: multi-byte const load not supported"
-                        );
-                    }
                     for k in 0..l.ty.bytes() {
                         self.emit_ptr_load_byte(&ptr, k);
                         self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));

@@ -108,6 +108,48 @@ fn parse_val_typed(s: &str, ty: Option<Ty>) -> Val {
     }
 }
 
+/// Decode a typed element-list initializer (`[i16 4660, i16 -25924]`,
+/// `[float 0x3FB99999A0000000, float 5.000000e-01]`) into the table's
+/// little-endian byte blob. clang -O1 prints const arrays of multi-byte
+/// elements this way — never as `c"..."` — so each element is decoded with
+/// the same value grammar as operands (`parse_val_typed` handles the f64
+/// promotion clang prints for float constants that do not fit 8 hex
+/// digits) and appended little-endian. The element type's byte width is
+/// the stride.
+fn parse_array_elements(init: &str, elem: Ty) -> Vec<u8> {
+    let inner = init
+        .strip_prefix('[')
+        .and_then(|s| matching_bracket(&init).map(|i| &s[..i.saturating_sub(1)]))
+        .unwrap_or_else(|| panic!("SPIKE LIMIT: array global initializer {init:?}"));
+    let width = elem.bytes() as usize;
+    let mut out = Vec::new();
+    for elt in split_top_level(inner, ',') {
+        let elt = elt.trim();
+        if elt.is_empty() {
+            continue;
+        }
+        // Element tokens are type-prefixed (`i16 4660`, `float 0x...`);
+        // the type must match the array's element type.
+        let (val_tok, elt_ty) = match elt.split_once(' ') {
+            Some((t, v)) => (v.trim(), ty_of(t)),
+            None => (elt, elem),
+        };
+        assert_eq!(
+            elt_ty, elem,
+            "SPIKE LIMIT: array element type mismatch: {elt:?} (array element is {elem:?})"
+        );
+        let v = match parse_val_typed(val_tok, Some(elem)) {
+            Val::Const(k) => k,
+            _ => panic!("SPIKE LIMIT: array global initializer element {elt:?}"),
+        };
+        let uv = v as u64;
+        for i in 0..width {
+            out.push(((uv >> (8 * i)) & 0xFF) as u8);
+        }
+    }
+    out
+}
+
 /// Decode an LLVM string literal `c"..."` into bytes. LLVM prints every
 /// byte outside the printable range (plus `"` and `\`) as a `\XX` hex
 /// escape, and a literal backslash byte 0x5C as the `\\` escape — so a
@@ -187,6 +229,24 @@ fn brace_inner(s: &str) -> Option<&str> {
                     return Some(&s[1..i]);
                 }
                 depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Given `s` starting with `[`, return the index of the matching `]`.
+fn matching_bracket(s: &str) -> Option<usize> {
+    let mut depth = 0i32;
+    for (i, c) in s.char_indices() {
+        match c {
+            '[' => depth += 1,
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
             }
             _ => {}
         }
@@ -697,6 +757,10 @@ pub fn parse_ll(src: &str) -> Module {
                     vec![0u8; size as usize]
                 } else if init.starts_with("c\"") {
                     parse_string_literal(init)
+                } else if init.starts_with('[') {
+                    // Multi-byte element list — decode elements (LE) into
+                    // the table's byte blob. See parse_array_elements.
+                    parse_array_elements(init, elem)
                 } else {
                     panic!("SPIKE LIMIT: array global initializer {init:?}");
                 };
