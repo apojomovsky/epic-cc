@@ -46,8 +46,9 @@ fn region_for(device: &Device, addr: u16) -> (u16, u16) {
 
 /// The start address for a `width`-byte value placed at the next free
 /// address `addr`, or `None` if no region past `addr` has room (the device's
-/// last bank has been exhausted). Same placement rule as `place_at` — step
-/// through regions, `align = width.min(2)` — without the panic.
+/// last bank has been exhausted). Steps through regions via
+/// `device.region_for`, keeping the value even-aligned within its bank
+/// region (`align = width.min(2)` — only 2-byte values need even alignment).
 fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
     let align = width.min(2);
     let mut a = addr;
@@ -60,31 +61,6 @@ fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
         if base + u16::from(width) - 1 <= end {
             return Some(base);
         }
-        a = end + 1;
-    }
-}
-
-/// The start address for a `width`-byte value placed at the next free address
-/// `addr`: step across banks when `addr` has passed a region's end, keep the
-/// value even-aligned within its bank region (only 2-byte values need even
-/// alignment; larger arrays advance sequentially), and panic past the
-/// device's last bank.
-fn place_at(device: &Device, addr: u16, width: u8) -> u16 {
-    // Only i16/2-byte globals need even alignment; larger arrays advance
-    // sequentially (min(size, 2) keeps a multi-byte value from being padded
-    // out to a multiple of its own width, which would waste RAM).
-    let align = width.min(2);
-    let mut a = addr;
-    loop {
-        let (start, end) = region_for(device, a);
-        let mut base = a.max(start);
-        if base % u16::from(align) != 0 {
-            base += u16::from(align) - (base % u16::from(align));
-        }
-        if base + u16::from(width) - 1 <= end {
-            return base;
-        }
-        // The value doesn't fit in this region; continue just past its end.
         a = end + 1;
     }
 }
@@ -221,7 +197,11 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
     // sized array advances the free pointer by its byte count. Const globals
     // get no RAM address (their bytes live in flash) but are still recorded
-    // so the map text can list them.
+    // so the map text can list them. If sequential placement fails (a small
+    // global stranded behind a monotonically-advancing cursor that already
+    // moved past a bank with room for it), a largest-first bin-packing
+    // fallback with independent per-bank cursors runs below (`.or_else(...)`)
+    // before giving up.
     let mut const_globals: HashSet<String> = HashSet::new();
     let mut non_const: Vec<&ir::Global> = Vec::new();
     for g in &m.globals {
@@ -241,9 +221,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             let bank_count = device.ram_banks.len();
             panic!(
                 "alloc: no arrangement of {} global(s) fits {}'s {bank_count} GPR bank window(s) \
-                 (total demand {demand} bytes, total capacity {capacity} bytes — every arrangement, \
-                 including largest-first bin-packing, leaves at least one global with no single bank \
-                 window big enough for it)",
+                 (total demand {demand} bytes, total capacity {capacity} bytes — no arrangement this \
+                 allocator tries, sequential then largest-first bin-packing, fits)",
                 non_const.len(),
                 device.name,
             );
@@ -470,7 +449,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
 
     // 7. Local addresses: each local at the next free frame byte, in IR
     // order (params first, then defined values in instruction order), stepping
-    // through the banks. `place_at` panics if a frame exceeds 0x1EF.
+    // through the banks via `place_contiguous`/`region_for`, which panics if
+    // a frame exceeds the device's last GPR bank (0x1EF on PIC16F877A).
     let mut locals: HashMap<String, u16> = HashMap::new();
     for f in &m.funcs {
         let b = base[&f.name];
@@ -608,18 +588,6 @@ mod tests {
         let g4 = global("g4", 4);
         let refs: Vec<&ir::Global> = vec![&g0, &g1, &g2, &g3, &g4];
         assert_eq!(try_place_globals_sequential(&PIC16F877A, &refs), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "0x01f0")]
-    fn place_at_panic_message_shows_stepped_cursor_not_original_arg() {
-        // PIC16F877A's last bank ends at 0x1EF. Trying to place a 2-byte
-        // value at 0x1EF requires even alignment, so it steps to 0x1F0, which
-        // is past the last bank. The panic message must show the stepped
-        // cursor (0x1f0), not the original argument (0x1ef). This regression
-        // test verifies the fix for the bug where delegating to try_place_at
-        // would incorrectly show the original argument.
-        let _ = place_at(&PIC16F877A, 0x1EF, 2);
     }
 
     #[test]

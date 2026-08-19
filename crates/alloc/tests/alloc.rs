@@ -618,3 +618,21 @@ fn globals_truly_exceeding_total_capacity_still_panic_with_a_clear_message() {
     }
     let _ = allocate(&PIC16F877A, &m, "depth 1\n");
 }
+
+#[test]
+#[should_panic(expected = "no arrangement")]
+fn a_single_global_larger_than_any_bank_panics_even_under_total_capacity() {
+    // One 200-byte global on PIC16F877A (4 banks x 80 bytes = 320 bytes total
+    // capacity). Total demand (200 bytes) is well under total capacity (320
+    // bytes), so this is not a total-capacity failure — it is issue #7's
+    // literal case: no single bank window (80 bytes) is big enough to hold
+    // this one global by itself, so neither sequential placement nor
+    // largest-first bin-packing can ever place it, no matter what else is
+    // (or isn't) declared alongside it.
+    let mut src = String::new();
+    src.push_str("global g0 i8\n");
+    src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
+    let mut m = parse(&src);
+    m.globals[0].size = 200;
+    let _ = allocate(&PIC16F877A, &m, "depth 1\n");
+}
