@@ -153,6 +153,11 @@ ritual.
    messages: use a comma, a colon, or a period and a new sentence.
    The exception is ascii-art diagrams, where alignment may force
    them. The pre-pr-check and commit-msg hook enforce this.
+   Replacing an em-dash is a judgment call, not a swap: pick the
+   replacement (and split or reorder the sentence when needed) so
+   the result reads as prose. A mechanical ` — ` -> ` , ` sweep
+   produces comma splices; the pre-pr-check flags the ` ,` residue
+   as a warning. Prefer a human or a language model for sweeps.
 
 ### Rust doc comments (the Doxygen equivalent)
 

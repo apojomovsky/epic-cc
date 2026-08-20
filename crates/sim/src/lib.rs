@@ -474,8 +474,8 @@ pub fn parse_hex_pic18(data: &str) -> Vec<u16> {
 
 /// PIC18F4550 (16-bit-word core) instruction-set simulator. `pc` is a
 /// **byte** address (PIC18's PC natively counts bytes, incrementing by 2
-/// per one-word instruction), unlike `Pic14::pc` which is a word address ,
-/// this matches the real hardware and lets the interrupt vectors
+/// per one-word instruction), unlike `Pic14::pc`, which is a word
+/// address. This matches the real hardware and lets the interrupt vectors
 /// (0x000008/0x000018) and `GOTO`/`CALL`'s encoded targets be used
 /// directly without a unit conversion at every call site.
 pub struct Pic18 {
@@ -526,7 +526,7 @@ impl Pic18 {
             0x0000 => pc + 2,
             0x0003 => {
                 // SLEEP: matches Pic14's convention (see `Pic14::exec_byte`)
-                // of `halted = true` as the simulator's stop condition ,
+                // of `halted = true` as the simulator's stop condition:
                 // real programs end on this, since `parse_hex_pic18`
                 // returns the full flash-sized buffer (zero-padded NOPs
                 // all the way out), so "ran off the end of `prog`" never
