@@ -111,13 +111,18 @@ else
 fi
 
 # ── 6. Em-dashes in the PR's prose diff (not ascii art) ────────────
-# AGENTS.md and this script are the rule's own documentation: they
-# necessarily contain the character (and the script's grep patterns),
-# so they are excluded from the scan.
+# Only ADDED lines are scanned: context lines may carry pre-existing
+# em-dashes from lines the PR merely touches. AGENTS.md, this script,
+# and docs/03 are excluded by design: AGENTS.md documents the rule
+# (and needs the character), the script's grep patterns carry it, and
+# docs/03's ADR titles use the em-dash as a structural separator
+# (ADR-001..008 convention).
 emdashes=$(git diff "$BASE_REF"...HEAD -- . \
   ':(exclude)docs/superpowers/plans/' \
   ':(exclude)AGENTS.md' ':(exclude)CLAUDE.md' \
-  ':(exclude)scripts/pre-pr-check.sh' 2>/dev/null | grep -n '—' | head -10)
+  ':(exclude)scripts/pre-pr-check.sh' \
+  ':(exclude)docs/03-decisions.md' 2>/dev/null \
+  | grep -nE '^\+[^+].*—' | head -10)
 if [ -n "$emdashes" ]; then
   printf '    %s\n' "$emdashes"
   fail "em-dashes (—) in the PR's diff (forbidden in prose; use a comma,"

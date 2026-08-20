@@ -14,7 +14,7 @@ if grep -qiE '^(co-authored-by|coauthored-by|authored-by):' "$1"; then
 fi
 
 if grep -q '—' "$1"; then
-  echo "commit-msg: em-dash (—) in the commit message; use a comma, colon, or period (see AGENTS.md)" >&2
+  echo "commit-msg: em-dash (U+2014) in the commit message; use a comma, colon, or period (see AGENTS.md)" >&2
   exit 1
 fi
 
