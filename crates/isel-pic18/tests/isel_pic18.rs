@@ -909,6 +909,29 @@ fn call_const_byval_arg_is_rejected_not_silently_miscompiled() {
 }
 
 #[test]
+fn a_byval_arg_through_a_geped_pointer_copies_from_the_right_offset() {
+    // Passing &g.field (a struct-field GEP) as a byval arg must copy from
+    // g's base + the field's offset, not from g's base.
+    let m = parse(
+        "global g i8\n\
+         fn f(void) (p=byval2)\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %fp = gep @g +2\n\
+             call void @f(byval2 %fp)\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("g", 0x100), ("f::p", 0x120)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(
+        asm.contains("MOVFF 0x102, 0x120") || asm.contains("MOVFF 0x102,0x120"),
+        "the byval copy must start at g+2 (0x102), not g's base (0x100):\n{asm}"
+    );
+}
+
+#[test]
 #[should_panic(expected = "const sret call arg")]
 fn call_const_sret_arg_is_rejected_not_silently_miscompiled() {
     // Same hazard as the byval case above: an `sret` arg is always meant

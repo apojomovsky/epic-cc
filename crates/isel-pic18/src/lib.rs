@@ -622,24 +622,17 @@ impl<'m> Gen<'m> {
                     let pname = &callee.params[i].name;
                     let pa = self.slot_addr(&c.func, pname).direct();
                     if let Some(size) = arg.byval {
-                        // `byval` means "copy `size` bytes from the address
-                        // `arg.val` points to" — `val_addr` is the right
-                        // resolver for an address-valued `Val`, but its
-                        // `Val::Const` arm treats the constant itself as a
-                        // RAM address (`k & 0xFF`), same hazard class as
-                        // `Bin`'s LHS/the cast ops' sources above. A byval
-                        // arg is always meant to be a pointer (an alloca's
-                        // address, or another byval slot's), so a bare
-                        // integer literal here has no sensible meaning —
-                        // fail loudly rather than silently copy from
-                        // whatever byte happens to live at `k & 0xFF`.
-                        assert!(
-                            !matches!(arg.val, Val::Const(_)),
-                            "isel-pic18: const byval call arg not yet supported"
-                        );
-                        let src = self.val_addr(&arg.val).direct();
+                        let src_ptr = match &arg.val {
+                            Val::Const(_) => panic!("isel-pic18: const byval call arg not yet supported"),
+                            other => other.clone(),
+                        };
                         for b in 0..size {
-                            self.emit_copy_byte(src + u16::from(b), pa + u16::from(b));
+                            match self.emit_ptr_setup(&src_ptr, b) {
+                                Addr::Direct(src) => self.emit_copy_byte(src, pa + u16::from(b)),
+                                Addr::Indirect => {
+                                    self.emit(format!("    MOVFF 0xFEF, 0x{:03X}", pa + u16::from(b)));
+                                }
+                            }
                         }
                     } else if arg.sret {
                         // `sret` means "store the 2-byte ADDRESS `arg.val`
