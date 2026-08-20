@@ -1,4 +1,4 @@
-# ADR-009 — PIC18 pointer model: shared GEP fold, single FSR0, no PLUSWn
+# ADR-009 , PIC18 pointer model: shared GEP fold, single FSR0, no PLUSWn
 
 **Status:** Accepted 2026-08-20 (implemented in feat/pic18-p3-pointers)
 
@@ -15,8 +15,8 @@ PIC18 pointer/array/struct support (port P3) uses:
 2. **A two-case pointer model.** A resolved pointer is either `Direct`
    (statically known address: plain `MOVFF`/`MOVF`/`MOVWF`) or
    `Indirect` (FSR0 set up, access through `INDF0`). An sret param's
-   slot holds a 2-byte target ADDRESS, not the object — `Base::Slot(name,
-   true)` — and always goes indirect.
+   slot holds a 2-byte target ADDRESS, not the object , `Base::Slot(name,
+   true)` , and always goes indirect.
 3. **Exactly one indirection register, FSR0, with per-byte re-setup.**
    Every dynamic access recomputes `FSR0 = base + k + Σ scale×%reg +
    byte_off` from scratch per byte (`LFSR` for the static part, unrolled
@@ -45,7 +45,7 @@ PIC18 pointer/array/struct support (port P3) uses:
   The extraction is behavior-preserving (PIC14 test parity confirmed).
 - **Single FSR0 keeps setup a pure function.** Per-byte re-setup costs a
   few extra instructions per multi-byte access but eliminates hidden
-  state-ordering dependencies between calls — the same class of implicit
+  state-ordering dependencies between calls , the same class of implicit
   sequencing assumption the backend already documents against for `BSR`
   tracking. A second FSR would be needed only for two simultaneously
   indirect pointers, which P3's fixtures never require (verified against
@@ -60,13 +60,13 @@ PIC18 pointer/array/struct support (port P3) uses:
 
 ## Rejected alternatives
 
-- **Two FSRs (FSR0 + FSR1) for simultaneous indirect pointers** — more
+- **Two FSRs (FSR0 + FSR1) for simultaneous indirect pointers** , more
   registers to track, no P3 fixture needs it; revisit if a P4+ program
   does.
-- **FSR auto-increment (`POSTINC0`) for multi-byte accesses** — implicit
+- **FSR auto-increment (`POSTINC0`) for multi-byte accesses** , implicit
   ordering between setup calls; rejected for the same reason as the
   `BSR`-tracking hazards.
-- **Porting PIC14's `fsr_window`/window half of `object_span`** — dead
+- **Porting PIC14's `fsr_window`/window half of `object_span`** , dead
   machinery on PIC18's flat address space.
 
 ## Revisit if
