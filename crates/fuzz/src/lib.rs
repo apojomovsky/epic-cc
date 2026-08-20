@@ -21,7 +21,7 @@
 //!   driver binary (a workspace member) produces the hex, `pic14-sim` runs
 //!   it, and the machine must halt;
 //! - the host side compiles `prog.c` (+ a generated `host_main.c` that seeds
-//!   the inputs by name) with the nix shell's `clang` (the pinned clang
+//!   the inputs by name) with the dev container's `clang` (the pinned clang
 //!   WITHOUT `-target`; the unwrapped `$PIC8_CLANG_UNWRAPPED` cannot find the
 //!   host's stdio.h) and reads the printed checksum.
 
@@ -2956,14 +2956,14 @@ pub fn write_fixture(program: &Program) -> Result<PathBuf, String> {
 /// which the driver and the in-process layout pipeline both require.
 fn pic_clang() -> Result<(String, String), String> {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED")
-        .map_err(|_| "PIC8_CLANG_UNWRAPPED is not set (run inside `nix develop`)".to_string())?;
+        .map_err(|_| "PIC8_CLANG_UNWRAPPED is not set (run inside the dev container)".to_string())?;
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").map_err(|_| {
-        "PIC8_CLANG_RESOURCE_DIR is not set (run inside `nix develop`)".to_string()
+        "PIC8_CLANG_RESOURCE_DIR is not set (run inside the dev container)".to_string()
     })?;
     Ok((clang, resdir))
 }
 
-/// The host clang: the nix shell's plain `clang` (the pinned clang WITHOUT
+/// The host clang: the dev container's plain `clang` (the pinned clang WITHOUT
 /// `-target`, whose wrapper knows the host toolchain — the unwrapped
 /// `$PIC8_CLANG_UNWRAPPED` cannot find the host's stdio.h, verified during
 /// development). `PIC8_HOST_CLANG` overrides it.
@@ -3046,7 +3046,7 @@ fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), Failure> {
 
 /// Locate the driver binary, mirroring the driver crate's e2e pattern.
 ///
-/// The e2e tests (inside `crates/driver`) use `env!("CARGO_BIN_EXE_driver")`,
+/// The e2e tests (inside `crates/driver`) use `env!("CARGO_BIN_EXE_epic-cc")`,
 /// which Cargo sets only for the package that owns the binary; this crate
 /// instead finds the driver next to the running test executable in
 /// `target/<profile>/` (the driver is a workspace member), honoring a
@@ -3067,7 +3067,7 @@ fn driver_binary() -> Result<PathBuf, String> {
             if let Some(p) = std::env::var_os("PIC8_DRIVER") {
                 return Ok(PathBuf::from(p));
             }
-            if let Some(p) = option_env!("CARGO_BIN_EXE_driver") {
+            if let Some(p) = option_env!("CARGO_BIN_EXE_epic-cc") {
                 return Ok(PathBuf::from(p));
             }
             let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
@@ -3076,7 +3076,7 @@ fn driver_binary() -> Result<PathBuf, String> {
             if dir.file_name().and_then(|n| n.to_str()) == Some("deps") {
                 dir.pop(); // integration-test binaries live in target/<profile>/deps
             }
-            let candidate = dir.join("driver");
+            let candidate = dir.join("epic-cc");
             let mut cmd = Command::new("cargo");
             cmd.args(["build", "-p", "driver", "--quiet"]);
             if let Ok(profile) = std::env::var("PROFILE") {

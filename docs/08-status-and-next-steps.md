@@ -11,9 +11,9 @@ Last updated: 2026-08-14
 **No compiler code is implemented.** The repository contains documentation plus a working
 build environment. There is no `Cargo.toml` and no crates yet.
 
-The Nix dev shell **is** built and verified — see
-[`09-build-environment.md`](09-build-environment.md). `direnv allow`, then you have pinned
-clang 20.1.8, rustc 1.97.1, gpasm 1.5.2, cvise, creduce, and csmith.
+The docker dev image **is** built and verified — see
+[`09-build-environment.md`](09-build-environment.md). `docker build --target dev`, then you
+have pinned clang 20.1.8, rustc 1.97.1, gpasm 1.5.2, cvise, creduce, and csmith.
 
 We are at the end of a design conversation, following a brainstorm → design → approve →
 implement flow. The state of that flow:
@@ -26,7 +26,7 @@ implement flow. The state of that flow:
 | Online prior-art survey | ✅ done — [`02-prior-art.md`](02-prior-art.md) |
 | Reference books obtained | ✅ done — Muchnick + lcc |
 | Documentation phase | ✅ done — this `docs/` tree |
-| Build environment (Nix flake) | ✅ done and verified — [ADR-007](03-decisions.md), [`09`](09-build-environment.md) |
+| Build environment (docker) | ✅ done and verified — [ADR-008](03-decisions.md), [`09`](09-build-environment.md) |
 | Present design in sections, approve each | ⚠️ **Ten-stage pipeline + repository shape approved; Rust approved (ADR-005). Design sections 2–4 (allocator/banking core, verification harness, phasing) still not presented.** |
 | Write design doc / spec | ⏸ superseded in part by this `docs/` tree |
 | Implementation plan | ❌ not started |
@@ -46,8 +46,8 @@ These are settled. Do not re-litigate them without new evidence.
 5. **De-risking:** spike the backend spine **before** writing the full plan.
 6. **Commits:** conventional commits, single line, at most 3 lines.
 7. **Implementation language:** Rust ([ADR-005](03-decisions.md)).
-8. **Build isolation:** Nix flake + direnv, nothing installed system-wide; clang pinned to
-   20.1.8 ([ADR-007](03-decisions.md)).
+8. **Build isolation:** docker multi-stage toolchain, nothing installed system-wide; clang
+   pinned to 20.1.8 ([ADR-008](03-decisions.md)).
 9. **Vendored material:** user supplies Microchip installers, datasheets, and the reference
    books under `vendor/`, gitignored ([`../vendor/README.md`](../vendor/README.md)).
 

@@ -71,7 +71,7 @@ fn ptr_probe_runs_correctly() {
     // driver used so the simulator resolves the right bank.
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/ptr_probe.c", "tests/fixtures/ptr_probe.hex"])
         .output()
         .expect("run driver");

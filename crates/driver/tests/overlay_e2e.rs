@@ -103,7 +103,7 @@ fn overlay_layout() -> (Module, alloc::AllocLayout) {
 
 #[test]
 fn overlay_runs_correctly() {
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/overlay.c", "tests/fixtures/overlay.hex"])
         .output()
         .expect("run driver");

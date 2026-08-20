@@ -1,7 +1,7 @@
 [toolchain]
-# "stable" is resolved and pinned by the rust-overlay entry in flake.lock, so this
-# is reproducible without hard-coding a version we then have to chase. To move the
-# toolchain deliberately, run `nix flake update rust-overlay`.
-channel = "stable"
+# Pinned explicitly: the docker dev image installs exactly this version, and
+# rustup honors this file on first `cargo` use. Bumping is a deliberate
+# migration (see docs/09-build-environment.md).
+channel = "1.97.1"
 components = ["rustfmt", "clippy", "rust-src"]
 profile = "default"

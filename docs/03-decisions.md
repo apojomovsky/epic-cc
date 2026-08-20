@@ -272,3 +272,52 @@ All were already installed on the host, so availability was not the differentiat
 
 Nix evaluation becomes a recurring obstacle for unsupervised agent work, or a dependency
 we need proves genuinely impractical to package.
+
+---
+
+## ADR-008 — Docker multi-stage toolchain replaces the Nix flake
+
+**Status:** Accepted 2026-08-19 (user-approved); supersedes ADR-007
+
+### Decision
+
+Replace the Nix flake dev shell with a single docker multi-stage build:
+`base` → `clang-builder` → `dev` / `ci` / `release`, all from a digest-pinned
+`ubuntu:22.04` base. The Linux release clang is built from the digest-pinned
+LLVM 20.1.8 source tarball with static LLVM libraries. Full detail in
+[`09-build-environment.md`](09-build-environment.md) and
+[`30-distribution-design.md`](30-distribution-design.md).
+
+### Rationale
+
+- **One tech stack** for local dev, CI, and release builds; the flake's
+  rust-overlay indirection is replaced by an explicit `1.97.1` pin in
+  `rust-toolchain.toml`.
+- **The rpath problem was a Nix artifact.** nixpkgs builds LLVM with shared
+  libraries for store-path dedup, baking `/nix/store/...` into every `.so`.
+  A from-source cmake build defaults to static LLVM libraries, so the bundled
+  clang links only platform runtimes and needs no `patchelf` surgery.
+- **Official LLVM stopped shipping Linux x86_64 binaries after 18.1.8**, so
+  source is the only pin-faithful option for the release clang.
+- **Caching makes the cost one-time:** digest-pinned base + tarball, layer
+  ordering (apt in `base`, clang in its own stage), buildx registry cache in
+  CI, ccache cache mount locally. The clang layer is rebuilt only when a pin
+  changes.
+- **Minimum supported Linux is Ubuntu 22.04 (glibc ≥ 2.35)**, set by the
+  base image — a version floor, not an installable dependency.
+
+### Rejected alternatives
+
+- **Nix-built clang + patchelf into the bundle** — two toolchains, store
+  paths, relocation surgery.
+- **Distro clang (apt)** — drifts from the pin; clang's version is part of
+  our input format.
+- **Fully static clang** — glibc is hostile to static linking (dlopen-based
+  NSS/iconv), LLVM does not support it out of the box, and it buys nothing:
+  glibc is the OS, not an install.
+
+### Revisit if
+
+The clang build cost becomes a bottleneck (mitigated by the cache), or a
+second platform (macOS/ARM64) needs the same toolchain — the stage layout
+generalizes.

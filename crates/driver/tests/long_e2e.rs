@@ -109,7 +109,7 @@ fn long_runs_correctly() {
     let sin_addr = *layout.globals.get("sin").expect("sin global") as usize;
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/long.c", "tests/fixtures/long.hex"])
         .output()
         .expect("run driver");

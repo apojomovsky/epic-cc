@@ -59,7 +59,7 @@ fn dynamic_length_memcpy_runs_correctly() {
     let buf1 = *layout.globals.get("buf1").expect("buf1 global") as usize;
     let buf3 = *layout.globals.get("buf3").expect("buf3 global") as usize;
 
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/dynamic_memcpy.c",
             "tests/fixtures/dynamic_memcpy.hex",

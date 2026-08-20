@@ -20,3 +20,7 @@ asm = { path = "../asm" }
 
 [dev-dependencies]
 pic14-sim = { path = "../sim" }
+
+[[bin]]
+name = "epic-cc"
+path = "src/main.rs"

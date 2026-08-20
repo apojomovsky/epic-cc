@@ -201,7 +201,7 @@ fn multi_page_program_compiles_and_runs_correctly() {
     assert!(total < 0x2000, "program fits the 8K-word device flash (0x{total:04X})");
 
     // ---- run the driver and simulate ----
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/multi_page.c", "tests/fixtures/multi_page.hex"])
         .output()
         .expect("run driver");

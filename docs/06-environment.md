@@ -4,22 +4,23 @@ Machine: **Ubuntu 26.04**, x86-64. Repo: `/home/alexis/projects/pic8_compiler`.
 
 ## Tooling — do not install anything system-wide
 
-**All build and test dependencies come from the Nix flake dev shell.** See
+**All build and test dependencies come from the docker dev image.** See
 [`09-build-environment.md`](09-build-environment.md) for the full picture; the short
 version:
 
 ```bash
-direnv allow                     # one time, then the shell activates on `cd`
-nix develop --command cargo test # or one-shot for automation
+docker build --target dev -t epic-cc-dev .   # first build is slow (clang)
+docker run --rm -it -v "$PWD:/workspace" -w /workspace epic-cc-dev bash
 ```
 
-This provides pinned `clang` 20.1.8, `rustc`/`cargo`, `gpasm`, `cvise`, `creduce`,
-`csmith`, and `pdftotext`. Do **not** `apt install` these — a host-installed version
-shadowing the pinned one is exactly the drift the flake exists to prevent.
+This provides pinned `clang` 20.1.8, `rustc`/`cargo` 1.97.1, `gpasm` 1.5.2, `cvise`,
+`creduce`, `csmith`, and `pdftotext`. Do **not** `apt install` these on the host — a
+host-installed version shadowing the pinned one is exactly the drift the image exists to
+prevent.
 
-Host-provided and used as-is: `git`, `gh`, `curl`, `nix`, `direnv`.
+Host-provided and used as-is: `git`, `gh`, `curl`, `docker`.
 
-Two things are **not** yet packaged and need their own derivations later: `gpsim` and
+Two things are **not** yet packaged and need their own packages later: `gpsim` and
 `yarpgen`. Both are deferred; see [`09-build-environment.md`](09-build-environment.md).
 
 ## The XC8 install
@@ -70,7 +71,7 @@ vendor/books/fraser-hanson-retargetable-c-compiler-lcc-1995.pdf  578 pp
 > **These are gitignored deliberately.** They are copyrighted; never commit them, and never
 > move them somewhere tracked.
 
-`pdftotext` and `pdfinfo` come from the Nix shell, so run these inside `nix develop`.
+`pdftotext` and `pdfinfo` come from the dev image, so run these inside the container.
 
 ### Method 1 — the `Read` tool (best for figures, tables, diagrams)
 

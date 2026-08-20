@@ -2,7 +2,7 @@ use std::process::Command;
 
 #[test]
 fn compiles_straight_line_program_end_to_end() {
-    let out = Command::new(env!("CARGO_BIN_EXE_driver"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/add.c", "tests/fixtures/add.hex"])
         .output()
         .expect("run driver");

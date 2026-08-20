@@ -7,7 +7,11 @@
 //! `isel` -> `banking` -> `peephole` -> page-fit verification -> `asm`;
 //! PIC18 runs `isel-pic18` -> `asm` directly (no banking/peephole/paging).
 
+mod clang_discovery;
+
+use clang_discovery::resolve_clang;
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Command;
 
 fn main() {
@@ -16,9 +20,20 @@ fn main() {
     let hex_out = args.get(2).map(String::as_str).unwrap_or("out.hex");
     let device = &device::PIC16F877A;
 
-    // 1. clang: .c -> .ll (text on stdout)
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    // 1. clang: .c -> .ll (text on stdout). Resolved from the env vars, or
+    // from the bundled clang/ directory next to the executable, or a clean
+    // error (see clang_discovery).
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let (clang, resdir) = match resolve_clang(&std::env::vars().collect(), &exe_dir) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("epic-cc: {msg}");
+            std::process::exit(1);
+        }
+    };
     let ll = Command::new(clang)
         .args([
             "-target",
@@ -29,7 +44,7 @@ fn main() {
             "-ffreestanding",
             "-nostdinc",
             "-resource-dir",
-            &resdir,
+            resdir.to_str().unwrap(),
             "-o",
             "-",
             c_file,
