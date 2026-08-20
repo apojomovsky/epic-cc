@@ -3,6 +3,12 @@
 Each ADR records what was decided, why, what was rejected, and what would make us revisit.
 Evidence for these lives in [`02-prior-art.md`](02-prior-art.md).
 
+ADR-001 through ADR-008 live in this file. **Newer ADRs live one-per-file in
+[`docs/adr/`](adr/)** (`ADR-00N-<topic>.md`, N continuing from 008). Each new ADR adds a
+one-line index entry here, e.g.:
+
+- ADR-009 — <decision title>, <date>
+
 ---
 
 ## ADR-001 — clang as an out-of-process front end; custom PIC14 backend

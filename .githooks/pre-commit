@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pre-commit: workspace hygiene before every commit.
 #   - rustfmt --check on the staged Rust files, via the dev container
-#     (the only rustfmt that exists — nothing rust-related is installed
+#     (the only rustfmt that exists; nothing rust-related is installed
 #     on the host)
 #   - trailing whitespace on staged files
 #
@@ -22,7 +22,7 @@ if [ -n "$staged_rs" ]; then
       -v "$PWD":/workspace -w /workspace epic-cc-dev:local \
       bash -c 'xargs rustfmt --check --edition 2021' >/dev/null 2>&1; then
       echo "pre-commit: staged Rust files are not rustfmt-clean; run: make fmt"
-      echo "pre-commit: (advisory for now — the workspace-wide fmt sweep is a"
+      echo "pre-commit: (advisory for now; the workspace-wide fmt sweep is a"
       echo "pre-commit:  separate task; this check becomes a hard gate after it)"
     fi
   else

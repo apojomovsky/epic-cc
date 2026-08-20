@@ -26,7 +26,7 @@ DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
 	-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
 	-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE)
 
-.PHONY: help image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint
+.PHONY: help image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint pre-pr-check
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -79,3 +79,6 @@ setup-hooks: ## Install git hooks (.githooks/ -> the repo's hooks dir)
 		&& cp .githooks/pre-commit .githooks/commit-msg $$(git rev-parse --git-path hooks)/ \
 		&& chmod +x $$(git rev-parse --git-path hooks)/pre-commit $$(git rev-parse --git-path hooks)/commit-msg
 	@echo "git hooks installed (pre-commit, commit-msg)"
+
+pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 also runs the suite
+	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,)

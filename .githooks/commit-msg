@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# commit-msg: reject auto-attribution trailers. Agent-generated commits
-# must be authored by the human; git history is the record.
+# commit-msg: reject auto-attribution trailers and em-dashes. Agent-generated
+# commits must be authored by the human; git history is the record. Prose
+# never uses em-dashes (comma, colon, or period instead); ascii-art
+# diagrams may.
 #
 # Install with: make setup-hooks
 
@@ -8,6 +10,11 @@ set -uo pipefail
 
 if grep -qiE '^(co-authored-by|coauthored-by|authored-by):' "$1"; then
   echo "commit-msg: 'Co-Authored-By' and similar trailers are not allowed (see AGENTS.md)" >&2
+  exit 1
+fi
+
+if grep -q '—' "$1"; then
+  echo "commit-msg: em-dash (—) in the commit message; use a comma, colon, or period (see AGENTS.md)" >&2
   exit 1
 fi
 

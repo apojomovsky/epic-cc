@@ -286,6 +286,7 @@ Compile a C file to Intel HEX (from the host):
 ```bash
 make compile                      # prints the HEX of the add.c example
 make compile FILE=my/example.c
+make pre-pr-check                 # takeoff ritual before opening a PR
 ```
 
 Run the slow fuzz corpora:
