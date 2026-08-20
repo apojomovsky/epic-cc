@@ -53,7 +53,7 @@ jobs:
           target: ci
           load: true
           tags: epic-cc-ci:latest
-          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
       - name: Cache cargo target dir

@@ -36,7 +36,7 @@ jobs:
           ver="${GITHUB_REF_NAME#v}"
           docker buildx build --target release --load \
             --build-arg EPIC_CC_VERSION="$ver" \
-            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}-toolchain \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true \
             --cache-to type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true \
             -t "epic-cc-release:$ver" .
 
