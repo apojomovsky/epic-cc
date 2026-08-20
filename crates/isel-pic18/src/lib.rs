@@ -696,6 +696,25 @@ impl<'m> Gen<'m> {
                 // nothing of its own. (Alloca gets the same treatment in
                 // Task 10.)
             }
+            Inst::Memcpy(mc) => match &mc.len {
+                ir::MemLen::Const(n) => {
+                    for i in 0..*n {
+                        let src_addr = match self.emit_ptr_setup(&mc.src, i) {
+                            Addr::Direct(a) => a,
+                            Addr::Indirect => {
+                                panic!("isel-pic18: memcpy with an indirect SOURCE not yet supported (P3 scope; see Task 9's Step 3 fixture check)")
+                            }
+                        };
+                        match self.emit_ptr_setup(&mc.dst, i) {
+                            Addr::Direct(dst) => self.emit_copy_byte(src_addr, dst),
+                            Addr::Indirect => self.emit(format!("    MOVFF 0x{src_addr:03X}, 0xFEF")),
+                        }
+                    }
+                }
+                ir::MemLen::Reg(_) => {
+                    panic!("isel-pic18: dynamic-length memcpy not yet supported (P3 scope)")
+                }
+            },
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }

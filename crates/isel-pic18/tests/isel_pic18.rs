@@ -1028,3 +1028,46 @@ fn an_sret_return_writes_through_the_callers_address() {
     );
     assert!(asm.contains("0xFEF") || asm.contains("INDF0"), "an sret store must go through INDF0:\n{asm}");
 }
+
+#[test]
+fn a_const_length_memcpy_copies_byte_by_byte() {
+    // Whole-struct assignment (`g = mk(...)` in structs.c) lowers to a
+    // constant-length memcpy: three MOVFF src+i -> dst+i byte copies, no
+    // loop and no FSR for direct global addresses (mirrors PIC14's
+    // `memcpy_emits_byte_pairs`, crates/isel/tests/isel.rs).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 3\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    for i in 0..3u16 {
+        let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
+        let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
+        assert!(asm.contains(&expect) || asm.contains(&expect_nospace), "byte {i} missing:\n{asm}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "not yet supported")]
+fn a_dynamic_length_memcpy_panics_loudly() {
+    // A runtime length would need a loop; P3's scope is constant-length
+    // memcpy only, so a `MemLen::Reg` must panic loudly rather than
+    // silently copy a wrong number of bytes.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global n i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %len = load i8 @n\n\
+             memcpy @dst @src %len\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110), ("n", 0x120), ("main::len", 0x121)]);
+    select(&PIC18F4550, &m, &addrs);
+}
