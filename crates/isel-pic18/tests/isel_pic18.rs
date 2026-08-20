@@ -942,15 +942,45 @@ fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
 }
 
 #[test]
-#[should_panic(expected = "Task 6")]
-fn a_gep_with_a_dynamic_term_load_panics_until_task_6() {
-    // arr[i] with a REGISTER index has a dynamic term, so the load needs
-    // FSR0 setup — which lands in Task 6. Until then, the Task 4 stub
-    // must panic loudly rather than emit a bogus direct access.
+fn a_dynamic_index_sets_fsr0_and_reads_through_indf0() {
+    // ram[i]: base = @ram (0x120), k = 0, terms = [(1, "i")] (scale 1,
+    // a byte array). Must LFSR the base then read through INDF0, no
+    // constant-offset direct MOVFF this time.
     let m = parse(
-        "global arr i8\nglobal idx i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
-           %i = load i8 @idx\n    %p = gep @arr +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+        "global ram i8\n\
+         global out i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +1*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @out\n\
+             ret void\n",
     );
-    let addrs = addrs(&[("arr", 0x100), ("idx", 0x110), ("out", 0x111), ("main::i", 0x112), ("main::v", 0x113)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let addrs = addrs(&[("ram", 0x120), ("out", 0x130), ("idx", 0x131), ("main::i", 0x132), ("main::v", 0x133)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("LFSR 0, 0x120") || asm.contains("LFSR 0,0x120"), "must seed FSR0 with the array base:\n{asm}");
+    assert!(asm.contains("0xFEF") || asm.contains("INDF0"), "must read through INDF0:\n{asm}");
+}
+
+#[test]
+fn a_scale_2_dynamic_index_unrolls_two_adds() {
+    // A u16 array element: ram16[i] with element width 2: the offset
+    // into the array is 2*i, unrolled as two ADDWFs onto FSR0L (with
+    // carry into FSR0H), mirroring PIC14's emit_accum_terms.
+    let m = parse(
+        "global ram16 i16\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram16 +0 +2*%i\n\
+             %v = load i16 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("ram16", 0x140), ("idx", 0x150), ("main::i", 0x151), ("main::v", 0x152)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let addwf_to_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
+    assert!(addwf_to_fsr0l >= 2, "a scale-2 term must unroll two adds onto FSR0L:\n{asm}");
 }

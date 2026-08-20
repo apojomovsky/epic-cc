@@ -266,8 +266,38 @@ impl<'m> Gen<'m> {
         }
     }
 
-    fn emit_fsr0_dynamic(&mut self, _base_addr: u16, _k: u8, _terms: &[(u8, String)], _byte_off: u8) {
-        panic!("isel-pic18: dynamic pointer offsets arrive in Task 6");
+    /// Set `FSR0 = base_addr + k + Σ scale×%reg + byte_off` and leave the
+    /// access to go through `INDF0` (0xFEF). `LFSR` seeds the STATIC part
+    /// (`base_addr + k + byte_off`, all known at codegen time: one
+    /// two-word instruction, no addressing-mode complexity at all); the
+    /// dynamic term, if any, is then added onto `FSR0L`/`FSR0H` with
+    /// carry via `ADDWF`/`ADDWFC` (both routed through `operand()`, which
+    /// Task 2 taught to recognize FSR0L/FSR0H as the always-access-bank
+    /// SFR segment, so no `MOVLB` is ever emitted for these two writes).
+    ///
+    /// `terms.len() > 1` is out of scope for P3 (see this plan's Scope
+    /// boundary) and panics loudly rather than silently dropping a term.
+    fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        assert!(
+            terms.len() <= 1,
+            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
+            terms.len()
+        );
+        let static_part = u16::from(k) + u16::from(byte_off);
+        let lit = (base_addr + static_part) & 0xFFF;
+        self.emit(format!("    LFSR 0, 0x{lit:03X}"));
+        if let Some((scale, reg)) = terms.first() {
+            let a = self.slot_addr(self.cur_func, reg).direct();
+            for _ in 0..*scale {
+                let (ra, rf) = self.operand(a);
+                self.emit(format!("    MOVF 0x{rf:03X},W,{}", if ra == 0 { "A" } else { "B" }));
+                let (fa, ff) = self.operand(0xFE9); // FSR0L
+                self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
+                self.emit("    MOVLW 0x00".to_string());
+                let (ha, hf) = self.operand(0xFEA); // FSR0H
+                self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
+            }
+        }
     }
     fn emit_fsr0_indirect_slot(&mut self, _slot_addr: u16, _k: u8, _terms: &[(u8, String)], _byte_off: u8) {
         panic!("isel-pic18: sret-indirect pointer offsets arrive in Task 7");
