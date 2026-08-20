@@ -948,6 +948,35 @@ fn call_const_sret_arg_is_rejected_not_silently_miscompiled() {
 }
 
 #[test]
+fn an_sret_arg_through_a_geped_pointer_writes_the_target_address_into_the_callees_slot() {
+    // `call void @f(sret %p)` with `%p = gep @g +0`: the caller-side sret
+    // arm must write the 2-byte ADDRESS of g (not g's contents) into the
+    // callee's sret slot, low byte first, via MOVLW/MOVWF. g at 0x100 ->
+    // MOVLW 0x00 / MOVWF slot, then MOVLW 0x01 / MOVWF slot+1.
+    let m = parse(
+        "global g i8\n\
+         fn f(void) (r=sret)\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = gep @g +0\n\
+             call void @f(sret %p)\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("g", 0x100), ("f::r", 0x120)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(
+        asm.contains("MOVLW 0x00") && asm.contains("MOVWF 0x020,B"),
+        "the sret slot's low byte must receive g's low address byte (0x00):\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x01") && asm.contains("MOVWF 0x021,B"),
+        "the sret slot's high byte must receive g's high address byte (0x01):\n{asm}"
+    );
+}
+
+#[test]
 fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
     // arr[2] with a CONST index folds to a plain direct address, no FSR,
     // no LFSR, just a MOVFF at the folded address (base + 2).
@@ -1009,6 +1038,29 @@ fn a_scale_2_dynamic_index_unrolls_two_adds() {
 }
 
 #[test]
+#[should_panic(expected = "multi-term")]
+fn a_two_term_dynamic_gep_panics_loudly() {
+    // P3's scope boundary is ONE dynamic term per pointer (see the
+    // `emit_fsr0_dynamic` assert): a GEP with two register-indexed terms
+    // must panic loudly rather than silently drop a term and read the
+    // wrong address.
+    let m = parse(
+        "global arr i8\n\
+         global idx1 i8\n\
+         global idx2 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx1\n\
+             %j = load i8 @idx2\n\
+             %p = gep @arr +0 +1*%i +1*%j\n\
+             %v = load i8 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("arr", 0x120), ("idx1", 0x130), ("idx2", 0x131), ("main::i", 0x132), ("main::j", 0x133), ("main::v", 0x134)]);
+    select(&PIC18F4550, &m, &addrs);
+}
+
+#[test]
 fn an_sret_return_writes_through_the_callers_address() {
     // struct Pair mk(...) { r.a = a; return r; }: inside mk, `r` is an
     // sret param: its SLOT holds the caller's target address, and every
@@ -1053,6 +1105,31 @@ fn a_const_length_memcpy_copies_byte_by_byte() {
 }
 
 #[test]
+fn a_memcpy_to_a_dynamic_indexed_destination_writes_through_indf0() {
+    // dst behind a dynamic index (`%dp = gep @dst +0 +1*%i`): the
+    // destination resolves to FSR0/INDF0, so each copied byte must be
+    // MOVFF'd from the direct source address into 0xFEF (INDF0), not
+    // into a statically folded address.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %dp = gep @dst +0 +1*%i\n\
+             memcpy %dp @src 1\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110), ("idx", 0x120), ("main::i", 0x121)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(
+        asm.contains("MOVFF 0x100, 0xFEF") || asm.contains("MOVFF 0x100,0xFEF"),
+        "the copied byte must go from the direct source (0x100) through INDF0 (0xFEF):\n{asm}"
+    );
+}
+
+#[test]
 #[should_panic(expected = "not yet supported")]
 fn a_dynamic_length_memcpy_panics_loudly() {
     // A runtime length would need a loop; P3's scope is constant-length
@@ -1075,15 +1152,14 @@ fn a_dynamic_length_memcpy_panics_loudly() {
 #[test]
 fn alloca_and_gep_emit_nothing_of_their_own() {
     let m = parse(
-        "global out i8\n\
-         fn main(void) ()\n\
+        "fn main(void) ()\n\
            block entry:\n\
              %buf = alloca 4\n\
              %p = gep %buf +1\n\
              store i8 9 %p\n\
              ret void\n",
     );
-    let addrs = addrs(&[("out", 0x100), ("main::buf", 0x110)]);
+    let addrs = addrs(&[("main::buf", 0x110)]);
     let asm = select(&PIC18F4550, &m, &addrs);
     // The store must land at buf+1 (0x111): proof both Alloca and Gep
     // were handled (the seed + the fold), not merely "didn't crash."

@@ -126,51 +126,12 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel-pic18: no gep for pointer %{r} ({key})"))
     }
 
-    /// The byte size of the object a resolved pointer's base ultimately
-    /// refers to: a global's declared size, or a slot's (an alloca's
-    /// buffer size, or a byval/sret param's declared width). Used to size
-    /// a struct-copy loop (byval call args, sret returns; Tasks 7-8).
-    ///
-    /// Unlike PIC14's `object_span`, this has NO window-fit check baked
-    /// in: PIC18's flat FSR addressing has no window an object could
-    /// straddle (see this plan's Global Constraints). This function only
-    /// ever answers "how many bytes," never "does it fit."
-    fn object_span(&self, base: &Base) -> u16 {
-        match base {
-            Base::Global(name) => self
-                .m
-                .globals
-                .iter()
-                .find(|g| g.name == *name)
-                .unwrap_or_else(|| panic!("isel-pic18: unknown global @{name}"))
-                .size as u16,
-            Base::Slot(sname, _) => {
-                let f = self
-                    .m
-                    .funcs
-                    .iter()
-                    .find(|f| f.name == self.cur_func)
-                    .unwrap_or_else(|| panic!("isel-pic18: no span for slot {sname}: unknown function {}", self.cur_func));
-                if let Some(p) = f.params.iter().find(|p| p.name == *sname) {
-                    p.width as u16
-                } else if let Some(a) = f.blocks.iter().flat_map(|b| &b.insts).find_map(|i| match i {
-                    Inst::Alloca(a) if a.dst == *sname => Some(a.size),
-                    _ => None,
-                }) {
-                    a as u16
-                } else {
-                    panic!("isel-pic18: no span for slot {sname} in {}", self.cur_func)
-                }
-            }
-        }
-    }
-
     /// The `,A`/`,B` operand components `(a, f)` for a physical address
     /// used by a `W`-routing instruction (`ADDWF`/`SUBWF`/.../`CPFSxx`/
     /// `MOVWF`), emitting `MOVLB` first if the tracked `BSR` doesn't
     /// already match. PIC18's Access Bank is TWO disjoint ranges: the low
     /// general-purpose segment (`0x000-0x05F`) and the high SFR segment
-    /// (`0xF60-0xFFF` [VERIFY against DS39632], every SFR, including
+    /// (`0xF60-0xFFF`, every SFR, including
     /// FSR0L/FSR0H/FSR1L/FSR1H/FSR2L/FSR2H, lives here), BOTH always
     /// reachable via `a=0` with no `MOVLB`, regardless of `BSR`. Only the
     /// MIDDLE range (`0x060-0xF5F`, ordinary banked GPR) needs a bank
@@ -1324,7 +1285,6 @@ mod tests {
 #[cfg(test)]
 mod p3_gen_tests {
     use super::*;
-    use ir::parse;
 
     fn gen<'a>(
         m: &'a Module,
@@ -1376,25 +1336,5 @@ mod p3_gen_tests {
         // FSR0L, the address this task exists to fix.
         assert_eq!(g.operand(0xFE9), (0, 0xE9), "the SFR segment is access-bank, a=0");
         assert!(g.out.is_empty(), "no MOVLB for an SFR address, regardless of the tracked BSR");
-    }
-
-    #[test]
-    fn object_span_reports_a_global_arrays_byte_size() {
-        let m = parse("global g i32\nfn main(void) ()\n  block entry:\n    ret void\n");
-        let addrs = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
-        let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
-        assert_eq!(g.object_span(&Base::Global("g".to_string())), 4);
-    }
-
-    #[test]
-    fn object_span_reports_an_allocas_declared_size() {
-        let m = parse("fn main(void) ()\n  block entry:\n    %buf = alloca 6\n    ret void\n");
-        let addrs = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
-        let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
-        assert_eq!(g.object_span(&Base::Slot("buf".to_string(), false)), 6);
     }
 }
