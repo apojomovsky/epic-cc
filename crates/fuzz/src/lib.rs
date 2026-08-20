@@ -21,7 +21,7 @@
 //!   driver binary (a workspace member) produces the hex, `pic14-sim` runs
 //!   it, and the machine must halt;
 //! - the host side compiles `prog.c` (+ a generated `host_main.c` that seeds
-//!   the inputs by name) with the nix shell's `clang` (the pinned clang
+//!   the inputs by name) with the dev container's `clang` (the pinned clang
 //!   WITHOUT `-target`; the unwrapped `$PIC8_CLANG_UNWRAPPED` cannot find the
 //!   host's stdio.h) and reads the printed checksum.
 
@@ -2963,7 +2963,7 @@ fn pic_clang() -> Result<(String, String), String> {
     Ok((clang, resdir))
 }
 
-/// The host clang: the nix shell's plain `clang` (the pinned clang WITHOUT
+/// The host clang: the dev container's plain `clang` (the pinned clang WITHOUT
 /// `-target`, whose wrapper knows the host toolchain — the unwrapped
 /// `$PIC8_CLANG_UNWRAPPED` cannot find the host's stdio.h, verified during
 /// development). `PIC8_HOST_CLANG` overrides it.

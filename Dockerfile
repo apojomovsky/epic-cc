@@ -31,6 +31,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         file \
         csmith \
         creduce \
+        cvise \
         poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 

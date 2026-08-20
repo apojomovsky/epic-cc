@@ -274,7 +274,7 @@ docker run --rm -it -v "$PWD:/workspace" -w /workspace epic-cc-dev bash
 Inside the container:
 
 ```bash
-cargo test --workspace            # 354 tests
+cargo test --workspace            # 557 tests
 bash scripts/ci-test.sh           # per-crate PASS/FAIL table (what CI runs)
 ```
 
@@ -339,7 +339,7 @@ consolidated backend spec).
 | [`05-verification.md`](docs/05-verification.md) | Oracles, simulator, differential testing, fuzzing, reduction |
 | [`06-environment.md`](docs/06-environment.md) | Toolchain setup and reference material |
 | [`07-references.md`](docs/07-references.md) | Books, papers, datasheets |
-| [`09-build-environment.md`](docs/09-build-environment.md) | Nix dev shell, pinned versions, gotchas |
+| [`09-build-environment.md`](docs/09-build-environment.md) | docker dev container, pinned versions, gotchas |
 | [`10-spike-findings.md`](docs/10-spike-findings.md) | Feasibility spike: is `.ll` text a workable substrate? |
 | [`11-pointer-const-findings.md`](docs/11-pointer-const-findings.md) | Feasibility spike: pointers via `FSR`/`INDF`, Harvard `const` |
 | [`12-backend-design.md`](docs/12-backend-design.md) | **The approved backend spec** |

@@ -92,17 +92,15 @@ jobs:
         run: |
           $ver = $env:GITHUB_REF_NAME -replace '^v',''
           $bundle = "epic-cc-$ver-x86_64-windows"
-          Push-Location $bundle
-          $env:PIC8_CLANG_UNWRAPPED = "$PWD\clang\bin\clang.exe"
-          $env:PIC8_CLANG_RESOURCE_DIR = "$PWD\clang\lib\clang\20"
-          .\epic-cc.exe ..\crates\driver\tests\fixtures\add.c env.hex
+          $env:PIC8_CLANG_UNWRAPPED = "$PWD\$bundle\clang\bin\clang.exe"
+          $env:PIC8_CLANG_RESOURCE_DIR = "$PWD\$bundle\clang\lib\clang\20"
+          & ".\$bundle\epic-cc.exe" ..\crates\driver\tests\fixtures\add.c env.hex
           Remove-Item Env:PIC8_CLANG_UNWRAPPED
           Remove-Item Env:PIC8_CLANG_RESOURCE_DIR
-          .\epic-cc.exe ..\crates\driver\tests\fixtures\add.c bundled.hex
+          & ".\$bundle\epic-cc.exe" ..\crates\driver\tests\fixtures\add.c bundled.hex
           if ((Get-FileHash env.hex).Hash -ne (Get-FileHash bundled.hex).Hash) {
             throw "smoke mismatch: env-path and bundled-discovery HEX differ"
           }
-          Pop-Location
 
       - name: Zip
         shell: pwsh

@@ -20,7 +20,7 @@ prevent.
 
 Host-provided and used as-is: `git`, `gh`, `curl`, `docker`.
 
-Two things are **not** yet packaged and need their own derivations later: `gpsim` and
+Two things are **not** yet packaged and need their own packages later: `gpsim` and
 `yarpgen`. Both are deferred; see [`09-build-environment.md`](09-build-environment.md).
 
 ## The XC8 install
