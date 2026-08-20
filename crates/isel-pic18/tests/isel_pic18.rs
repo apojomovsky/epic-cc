@@ -984,3 +984,24 @@ fn a_scale_2_dynamic_index_unrolls_two_adds() {
     let addwf_to_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
     assert!(addwf_to_fsr0l >= 2, "a scale-2 term must unroll two adds onto FSR0L:\n{asm}");
 }
+
+#[test]
+fn an_sret_return_writes_through_the_callers_address() {
+    // struct Pair mk(...) { r.a = a; return r; }: inside mk, `r` is an
+    // sret param: its SLOT holds the caller's target address, and every
+    // field store through it must go via FSR0/INDF0, never a direct
+    // write to the slot's own address (that would corrupt the pointer).
+    let m = parse(
+        "fn mk(void) (r=sret)\n\
+           block entry:\n\
+             store i8 5 %r\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("mk::r", 0x160)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(
+        !asm.contains("LFSR 0, 0x160") && !asm.contains("LFSR 0,0x160"),
+        "the store target is INSIDE the pointer at 0x160, not the literal address 0x160:\n{asm}"
+    );
+    assert!(asm.contains("0xFEF") || asm.contains("INDF0"), "an sret store must go through INDF0:\n{asm}");
+}

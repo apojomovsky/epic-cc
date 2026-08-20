@@ -299,8 +299,41 @@ impl<'m> Gen<'m> {
             }
         }
     }
-    fn emit_fsr0_indirect_slot(&mut self, _slot_addr: u16, _k: u8, _terms: &[(u8, String)], _byte_off: u8) {
-        panic!("isel-pic18: sret-indirect pointer offsets arrive in Task 7");
+    /// `slot_addr` holds a 2-byte ADDRESS (an sret param's contents), not
+    /// the object itself: load THAT address into FSR0 (`MOVFF slot,
+    /// FSR0L` / `MOVFF slot+1, FSR0H`, both plain memory-to-memory, no
+    /// access bit needed since MOVFF never uses one), then add the static
+    /// offset (`k + byte_off`) and any dynamic term the same way
+    /// `emit_fsr0_dynamic` does, and access through `INDF0`.
+    fn emit_fsr0_indirect_slot(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        assert!(
+            terms.len() <= 1,
+            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
+            terms.len()
+        );
+        self.emit_copy_byte(slot_addr, 0xFE9); // FSR0L = low byte of the stored address
+        self.emit_copy_byte(slot_addr + 1, 0xFEA); // FSR0H = high byte
+        let static_part = u16::from(k) + u16::from(byte_off);
+        if static_part != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
+            let (fa, ff) = self.operand(0xFE9);
+            self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
+            self.emit("    MOVLW 0x00".to_string());
+            let (ha, hf) = self.operand(0xFEA);
+            self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
+        }
+        if let Some((scale, reg)) = terms.first() {
+            let a = self.slot_addr(self.cur_func, reg).direct();
+            for _ in 0..*scale {
+                let (ra, rf) = self.operand(a);
+                self.emit(format!("    MOVF 0x{rf:03X},W,{}", if ra == 0 { "A" } else { "B" }));
+                let (fa, ff) = self.operand(0xFE9);
+                self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
+                self.emit("    MOVLW 0x00".to_string());
+                let (ha, hf) = self.operand(0xFEA);
+                self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
+            }
+        }
     }
 
     /// Materialize byte `k` of `val` into `W`: a constant via `MOVLW`, a
@@ -618,7 +651,19 @@ impl<'m> Gen<'m> {
                             !matches!(arg.val, Val::Const(_)),
                             "isel-pic18: const sret call arg not yet supported"
                         );
-                        let addr = self.val_addr(&arg.val).direct();
+                        let addr = match &arg.val {
+                            Val::Const(_) => panic!("isel-pic18: const sret call arg not yet supported"),
+                            Val::Global(g) => self.global_addr(g),
+                            Val::Reg(r) => {
+                                let (base, k, terms) = self.resolved_for(r);
+                                assert!(terms.is_empty(), "isel-pic18: dynamic sret target address not yet supported");
+                                match base {
+                                    Base::Global(name) => self.global_addr(&name) + u16::from(k),
+                                    Base::Slot(sname, false) => self.slot_addr(self.cur_func, &sname).direct() + u16::from(k),
+                                    Base::Slot(_, true) => panic!("isel-pic18: sret-of-sret not yet supported"),
+                                }
+                            }
+                        };
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         let (a0, f0) = self.operand(pa);
                         self.emit(format!("    MOVWF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
