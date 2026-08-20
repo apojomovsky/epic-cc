@@ -48,10 +48,13 @@ fn pic18f4550_profile_has_the_right_core_and_flash_size() {
 }
 
 #[test]
-fn pic18f4550_reserves_a_retval_region_and_a_contiguous_gpr_range() {
-    assert_eq!(PIC18F4550.common_ram, Some((0x0000, 0x0003)));
-    assert_eq!(PIC18F4550.gpr_start(), 0x0004);
-    assert_eq!(PIC18F4550.region_for(0x0004), Some((0x0004, 0x07FF)));
-    assert_eq!(PIC18F4550.region_for(0x07FF), Some((0x0004, 0x07FF)));
+fn pic18f4550_reserves_retval_and_isr_save_regions() {
+    // 0x0000-0x0003 = the fixed retval region (P2); 0x0004-0x000F = the
+    // fixed ISR save area (P5, see the P5 plan Task 3); GPR starts at
+    // 0x0010 so nothing overlaps the reservations.
+    assert_eq!(PIC18F4550.common_ram, Some((0x0000, 0x000F)));
+    assert_eq!(PIC18F4550.gpr_start(), 0x0010);
+    assert_eq!(PIC18F4550.region_for(0x0010), Some((0x0010, 0x07FF)));
+    assert_eq!(PIC18F4550.region_for(0x07FF), Some((0x0010, 0x07FF)));
     assert_eq!(PIC18F4550.region_for(0x0800), None, "past the implemented GPR range");
 }
