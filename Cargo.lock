@@ -116,6 +116,9 @@ dependencies = [
 [[package]]
 name = "iselcore"
 version = "0.1.0"
+dependencies = [
+ "ir",
+]
 
 [[package]]
 name = "legalize"

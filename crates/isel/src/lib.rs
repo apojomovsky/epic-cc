@@ -40,8 +40,8 @@
 //! layout) and panics loudly if a value is missing from it.
 
 use device::Device;
-use ir::{BinOp, Gep, GepBase, Inst, MemLen, Module, Ty, Val};
-use iselcore::{ssa_key, Slot};
+use ir::{BinOp, Inst, MemLen, Module, Ty, Val};
+use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 use std::collections::{HashMap, HashSet};
 
 /// The runtime routine names legalize injects for mul/div/rem/shift and the
@@ -115,15 +115,6 @@ fn literal_ptr_addr(ptr: &str) -> u16 {
         .unwrap_or_else(|| panic!("isel: malformed literal pointer {ptr:?}"));
     u16::from_str_radix(lit, 16)
         .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
-}
-
-/// A resolved GEP base: a named global (`@g`) or a local slot. A slot may
-/// be *indirect* (an sret param): it holds the target address, so FSR is
-/// taken from its contents rather than the slot itself being the base.
-#[derive(Clone, Debug)]
-enum Base {
-    Global(String),
-    Slot(String, bool),
 }
 
 /// The four GPR windows reachable through FSR+IRP: bank 0 `[0x20,0x80)`,
@@ -324,13 +315,14 @@ impl<'m> Gen<'m> {
     /// missing object panics loudly.
     fn object_span(&self, base: &Base) -> u16 {
         match base {
-            Base::Global(name) => self
-                .m
-                .globals
-                .iter()
-                .find(|g| g.name == *name)
-                .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
-                .size as u16,
+            Base::Global(name) => {
+                self.m
+                    .globals
+                    .iter()
+                    .find(|g| g.name == *name)
+                    .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
+                    .size as u16
+            }
             Base::Slot(sname, _) => {
                 let f = self
                     .m
@@ -338,7 +330,10 @@ impl<'m> Gen<'m> {
                     .iter()
                     .find(|f| f.name == self.cur_func)
                     .unwrap_or_else(|| {
-                        panic!("isel: no span for slot {sname}: unknown function {}", self.cur_func)
+                        panic!(
+                            "isel: no span for slot {sname}: unknown function {}",
+                            self.cur_func
+                        )
                     });
                 if let Some(p) = f.params.iter().find(|p| p.name == *sname) {
                     p.width as u16
@@ -551,8 +546,8 @@ impl<'m> Gen<'m> {
         let cnt_hi: u16 = self.retval_lo + 1; // 0x72
         let idx: u16 = 0x7E; // documented free common byte
         let hold: u16 = 0x7F; // documented free common byte
-        // FSR = base + k + terms + idx for one byte of a pointer; the FSR
-        // must be re-set per byte (one FSR on classic mid-range).
+                              // FSR = base + k + terms + idx for one byte of a pointer; the FSR
+                              // must be re-set per byte (one FSR on classic mid-range).
         let emit_byte_fsr = |g: &mut Self, ptr: &Val| {
             let (base, k, terms) = match ptr {
                 Val::Reg(r) => g.resolved_for(r),
@@ -635,7 +630,14 @@ impl<'m> Gen<'m> {
     /// general sums accumulate in the fixed scratch byte first. The ADDLW
     /// literal is `(base_addr + k + byte_off) & 0xFF` — FSR holds the low
     /// byte; IRP carries bit 8.
-    fn emit_fsr_to(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8, span: u16) {
+    fn emit_fsr_to(
+        &mut self,
+        base_addr: u16,
+        k: u8,
+        terms: &[(u8, String)],
+        byte_off: u8,
+        span: u16,
+    ) {
         let (irp, base_lo) = fsr_window(base_addr, span);
         let lit = (u16::from(base_lo) + u16::from(k) + u16::from(byte_off)) & 0xFF;
         self.emit(if irp {
@@ -717,7 +719,10 @@ impl<'m> Gen<'m> {
     /// general sums accumulate in scratch.
     fn emit_ptr_index_w(&mut self, k: u8, terms: &[(u8, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
-        assert!(kk <= 0xFF, "isel: const index k {k} + off {byte_off} out of byte range");
+        assert!(
+            kk <= 0xFF,
+            "isel: const index k {k} + off {byte_off} out of byte range"
+        );
         match terms {
             [] => self.emit(format!("    MOVLW 0x{kk:02X}")),
             [(1, r)] => {
@@ -760,8 +765,8 @@ impl<'m> Gen<'m> {
         let size = self.global_size(name) as usize;
         let chunks = (size + 255) / 256; // 256-byte tables: 1 (empty chunk 1)
         let disp = chunks.max(2); // dispatch shape: bit-0 test or >= c chain
-        // The reader entry for chunk c: `__read_<name>`, `__read_<name>_hi`,
-        // `__read_<name>_hi{c}` — matching the table emitter.
+                                  // The reader entry for chunk c: `__read_<name>`, `__read_<name>_hi`,
+                                  // `__read_<name>_hi{c}` — matching the table emitter.
         let entry = |c: usize| {
             if c == 0 {
                 format!("__read_{name}")
@@ -1007,7 +1012,11 @@ impl<'m> Gen<'m> {
         match v {
             Val::Const(k) => {
                 let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-                let b = if signed && i == high { byte ^ 0x80 } else { byte };
+                let b = if signed && i == high {
+                    byte ^ 0x80
+                } else {
+                    byte
+                };
                 self.emit(format!("    MOVLW 0x{b:02X}"));
             }
             _ => {
@@ -1080,7 +1089,11 @@ impl<'m> Gen<'m> {
                 self.emit_load_cmp_byte(b, 0, signed, high);
                 self.emit(format!(
                     "    SUBWF 0x{:02X}, W",
-                    if use_scratch && n == 1 { self.scratch } else { aa }
+                    if use_scratch && n == 1 {
+                        self.scratch
+                    } else {
+                        aa
+                    }
                 ));
                 for i in 1..n {
                     self.emit_load_cmp_byte(b, i, signed, high);
@@ -1569,7 +1582,13 @@ impl<'m> Gen<'m> {
     /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
     /// (`retval_lo` .. `retval_lo + bytes - 1` — 0x71-0x74 for i32) into
     /// `dst`. Void calls skip the retval copy. Mirrors spike emit_call.
-    fn emit_call(&mut self, dst: &Option<String>, ty: Option<Ty>, func: &str, args: &[ir::CallArg]) {
+    fn emit_call(
+        &mut self,
+        dst: &Option<String>,
+        ty: Option<Ty>,
+        func: &str,
+        args: &[ir::CallArg],
+    ) {
         let callee = self
             .m
             .funcs
@@ -1586,7 +1605,9 @@ impl<'m> Gen<'m> {
                 // byte by byte through the shared pointer machinery.
                 assert_eq!(
                     size,
-                    callee.params[i].byval.expect("isel: byval arg for a non-byval param"),
+                    callee.params[i]
+                        .byval
+                        .expect("isel: byval arg for a non-byval param"),
                     "isel: byval size mismatch for arg {i} of @{func}"
                 );
                 for b in 0..size {
@@ -1601,10 +1622,7 @@ impl<'m> Gen<'m> {
                 // crossing an SFR hole would silently mis-address (the same
                 // loud rule as static FSR bases). The MOVLW LOW/HIGH store
                 // emits both address bytes unchanged.
-                assert!(
-                    callee.params[i].sret,
-                    "isel: sret arg for a non-sret param"
-                );
+                assert!(callee.params[i].sret, "isel: sret arg for a non-sret param");
                 let (addr, span) = match &arg.val {
                     Val::Global(g) => (
                         self.global_addr(g),
@@ -1618,7 +1636,9 @@ impl<'m> Gen<'m> {
                         );
                         let addr = match &base {
                             Base::Global(name) => self.global_addr(name),
-                            Base::Slot(sname, false) => self.slot_addr(self.cur_func, sname).direct(),
+                            Base::Slot(sname, false) => {
+                                self.slot_addr(self.cur_func, sname).direct()
+                            }
                             Base::Slot(_, true) => {
                                 panic!("isel: sret target cannot be an indirect (sret) slot")
                             }
@@ -1649,8 +1669,7 @@ impl<'m> Gen<'m> {
                 // __uitofp_f32 zero-extends.
                 if aty.bytes() < callee.params[i].width {
                     assert_eq!(
-                        callee.params[i].width,
-                        4,
+                        callee.params[i].width, 4,
                         "isel: narrow scalar arg {i} of @{func} into a non-4-byte param"
                     );
                     let aw = aty.bytes() as u16;
@@ -1668,8 +1687,7 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVWF 0x{:02X}", pa + 3));
                             } else {
                                 assert_eq!(
-                                    aw,
-                                    1,
+                                    aw, 1,
                                     "isel: unexpected narrow source width for @{func}"
                                 );
                                 self.emit("    MOVLW 0x00".to_string());
@@ -1702,7 +1720,10 @@ impl<'m> Gen<'m> {
             // i32) into dst.
             let da = self.slot_addr(self.cur_func, d).direct();
             for i in 0..t.bytes() {
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + u16::from(i)));
+                self.emit(format!(
+                    "    MOVF 0x{:02X}, W",
+                    self.retval_lo + u16::from(i)
+                ));
                 self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
             }
         }
@@ -2276,9 +2297,8 @@ impl<'m> Gen<'m> {
         match recipe {
             // Variable-count shifts: mask the count to width-1, bounded
             // loop over the val param slot (see emit_shift_body).
-            "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
-            | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32"
-            | "__ashr_i32" => {
+            "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
+            | "__shl_u32" | "__lshr_u32" | "__ashr_i32" => {
                 let (bytes, op) = match recipe {
                     "__shl_u8" => (1, BinOp::Shl),
                     "__shl_u16" => (2, BinOp::Shl),
@@ -2655,7 +2675,8 @@ impl<'m> Gen<'m> {
                 }
                 for i in 0..4u16 {
                     self.emit(format!("    MOVF 0x{:02X}, W", a + i));
-                    self.emit(format!("    MOVWF 0x{:02X}", t[usize::from(i)])); // t = a (32-bit)
+                    self.emit(format!("    MOVWF 0x{:02X}", t[usize::from(i)]));
+                    // t = a (32-bit)
                 }
                 self.emit(format!("    MOVF 0x{:02X}, W", b));
                 self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
@@ -2831,10 +2852,7 @@ impl<'m> Gen<'m> {
         let val = self.slot_addr(name, "val").direct();
         let cnt = self.slot_addr(name, "cnt").direct();
         let hi = val + bytes - 1;
-        self.assert_bank0(
-            &[val, hi, cnt, cnt + bytes - 1, scr, scr + 1],
-            name,
-        );
+        self.assert_bank0(&[val, hi, cnt, cnt + bytes - 1, scr, scr + 1], name);
         let mask: u8 = match bytes {
             1 => 0x07,
             2 => 0x0F,
@@ -3573,7 +3591,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLF 0x{low1:02X}, F"));
         self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
         self.emit(format!("    BSF 0x{low1:02X}, 0")); // eb8
-        // A nonzero exp-zero operand aligns at exp 1 with its raw fraction.
+                                                       // A nonzero exp-zero operand aligns at exp 1 with its raw fraction.
         self.emit(format!("    MOVF 0x{low0:02X}, W"));
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_a_exp_done}"));
@@ -4459,7 +4477,7 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSC STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_round}"));
         self.emit(format!("    BSF 0x{spare:02X}, 1")); // sticky |= rem
-        // RNE: guard (spare bit 0) && (sticky (spare bit 1) || mantissa LSB)
+                                                        // RNE: guard (spare bit 0) && (sticky (spare bit 1) || mantissa LSB)
         self.emit(format!("{l_round}:"));
         // Shift a subnormal result right while e < 1, preserving guard and
         // sticky for the final round-to-nearest-even decision.
@@ -4931,14 +4949,12 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // fall through into the next function.
     if let Some(recipe) = routine_recipe(&f.name) {
         match recipe {
-            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8"
-            | "__udiv_u16" | "__urem_u16" | "__udiv_u32" | "__urem_u32"
-            | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
-            | "__sdiv_i32" | "__srem_i32" | "__shl_u8" | "__lshr_u8"
-            | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
-            | "__shl_u32" | "__lshr_u32" | "__ashr_i32"
-            | "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32"
-            | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32"
+            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8" | "__udiv_u16"
+            | "__urem_u16" | "__udiv_u32" | "__urem_u32" | "__sdiv_i8" | "__srem_i8"
+            | "__sdiv_i16" | "__srem_i16" | "__sdiv_i32" | "__srem_i32" | "__shl_u8"
+            | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
+            | "__shl_u32" | "__lshr_u32" | "__ashr_i32" | "__add_f32" | "__sub_f32"
+            | "__mul_f32" | "__div_f32" | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32"
             | "__fptoui_f32" | "__fptosi_f32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
@@ -5070,7 +5086,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                     let lcop = g.fresh_label();
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lcop}"));
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, cf, doms[&b.label].contains(&bc.f));
                                     g.emit(format!("    GOTO {lf}"));
                                     g.emit(format!("{lcop}:"));
@@ -5082,7 +5101,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 (_, Some(c)) => {
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lt}"));
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.f));
                                     g.emit(format!("    GOTO {lf}"));
                                 }
@@ -5091,7 +5113,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 (Some(c), None) => {
                                     g.emit("    BTFSC STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lf}"));
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.t));
                                     g.emit(format!("    GOTO {lt}"));
                                 }
@@ -5100,13 +5125,19 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                         Val::Const(k) => {
                             if *k != 0 {
                                 if let Some(c) = t_copies {
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.t));
                                 }
                                 g.emit(format!("    GOTO {lt}"));
                             } else {
                                 if let Some(c) = f_copies {
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.f));
                                 }
                                 g.emit(format!("    GOTO {lf}"));
@@ -5244,35 +5275,37 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
 /// are 0), mirroring the asm crate's pass-1 counting so the page-fit
 /// decisions match the addresses the assembler will assign.
 fn word_size(lines: &[String]) -> usize {
-    lines.iter().filter(|raw| {
-        let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() {
-            return false;
-        }
-        if line.starts_with("list") || line.starts_with("radix") {
-            return false;
-        }
-        if line.starts_with("org ") {
-            return false;
-        }
-        if line.starts_with("end") {
-            return false;
-        }
-        if line.ends_with(':') {
-            return false;
-        }
-        if line.contains(" equ ") {
-            return false;
-        }
-        if line.starts_with(".align ") {
-            return false;
-        }
-        if line.starts_with(".table ") {
-            return false;
-        }
-        true
-    })
-    .count()
+    lines
+        .iter()
+        .filter(|raw| {
+            let line = raw.split(';').next().unwrap_or("").trim();
+            if line.is_empty() {
+                return false;
+            }
+            if line.starts_with("list") || line.starts_with("radix") {
+                return false;
+            }
+            if line.starts_with("org ") {
+                return false;
+            }
+            if line.starts_with("end") {
+                return false;
+            }
+            if line.ends_with(':') {
+                return false;
+            }
+            if line.contains(" equ ") {
+                return false;
+            }
+            if line.starts_with(".align ") {
+                return false;
+            }
+            if line.starts_with(".table ") {
+                return false;
+            }
+            true
+        })
+        .count()
 }
 
 /// Greedy page assignment (M11), one function: pad with `.org <next base>`
@@ -5364,9 +5397,8 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
         }
         if let Some(l) = line.strip_suffix(':') {
             let name = l.trim().to_string();
-            let is_target = funcs.contains(&name.as_str())
-                || name == "__start"
-                || readers.contains(&name);
+            let is_target =
+                funcs.contains(&name.as_str()) || name == "__start" || readers.contains(&name);
             if is_target {
                 if let Some((prev, s)) = &cur {
                     check(prev, *s, org);
@@ -5551,103 +5583,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             "".to_string(),
         ]);
     }
-    // Phase-3 pointers: collect every GEP and resolve its chain eagerly to a
-    // folded `(base, k, terms)`, keyed `{func}::{reg}` like every other
-    // local. Seeds first: a byval param slot IS the struct copy
-    // (Slot(name, false)); an sret param slot holds the target address
-    // (Slot(name, true)); an alloca defines its own buffer slot
-    // (Slot(name, false)). Gep itself is virtual — it emits nothing.
-    let mut geps: HashMap<String, Gep> = HashMap::new();
-    let mut resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
-    for f in &m.funcs {
-        for p in &f.params {
-            if p.byval.is_some() {
-                resolved.insert(
-                    ssa_key(&f.name, &p.name),
-                    (Base::Slot(p.name.clone(), false), 0, Vec::new()),
-                );
-            } else if p.sret {
-                resolved.insert(
-                    ssa_key(&f.name, &p.name),
-                    (Base::Slot(p.name.clone(), true), 0, Vec::new()),
-                );
-            }
-        }
-        for b in &f.blocks {
-            for i in &b.insts {
-                match i {
-                    Inst::Gep(g) => {
-                        geps.insert(ssa_key(&f.name, &g.dst), g.clone());
-                    }
-                    Inst::Alloca(a) => {
-                        resolved.insert(
-                            ssa_key(&f.name, &a.dst),
-                            (Base::Slot(a.dst.clone(), false), 0, Vec::new()),
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    // Chain folding (fixpoint scan): a GEP whose base is a `Reg` folds in
-    // that reg's own resolved entry — `k` adds, terms concatenate
-    // (inner-first: terms_inner + terms_outer) — until the base is a Global
-    // or a seeded Slot. A base that is neither a gep nor a seed panics; a
-    // pass that makes no progress with unresolved geeps left is a cycle and
-    // panics loudly.
-    for f in &m.funcs {
-        let fname = f.name.clone();
-        let mut pending: Vec<(String, Gep)> = geps
-            .iter()
-            .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
-            .map(|(k, g)| (k.clone(), g.clone()))
-            .collect();
-        let mut progressed = true;
-        while progressed {
-            progressed = false;
-            let mut rest = Vec::new();
-            for (key, g) in pending {
-                match &g.base {
-                    GepBase::Global(name) => {
-                        assert!(
-                            !resolved.contains_key(&key),
-                            "isel: duplicate definition of pointer reg {key}"
-                        );
-                        resolved.insert(key, (Base::Global(name.clone()), g.k, g.terms.clone()));
-                        progressed = true;
-                    }
-                    GepBase::Reg(r) => {
-                        let rkey = ssa_key(&fname, r);
-                        if let Some((b, kk, tt)) = resolved.get(&rkey).cloned() {
-                            assert!(
-                                !resolved.contains_key(&key),
-                                "isel: duplicate definition of pointer reg {key}"
-                            );
-                            let mut terms = tt.clone();
-                            terms.extend(g.terms.clone());
-                            let k = g.k.checked_add(kk).unwrap_or_else(|| {
-                                panic!("isel: gep offset overflow in {key}")
-                            });
-                            resolved.insert(key, (b, k, terms));
-                            progressed = true;
-                        } else if geps.contains_key(&rkey) {
-                            rest.push((key, g)); // may resolve on a later pass
-                        } else {
-                            panic!(
-                                "isel: no gep for pointer %{r} (chain base missing, key {rkey})"
-                            );
-                        }
-                    }
-                }
-            }
-            pending = rest;
-            if !progressed && !pending.is_empty() {
-                let names: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
-                panic!("isel: cyclic gep chain involving {names:?}");
-            }
-        }
-    }
+    // Phase-3 pointers: resolve every GEP's chain eagerly to a folded
+    // `(base, k, terms)`, keyed `{func}::{reg}` like every other local.
+    // Seeds first: a byval param slot IS the struct copy (Slot(name,
+    // false)); an sret param slot holds the target address (Slot(name,
+    // true)); an alloca defines its own buffer slot (Slot(name, false)).
+    // Gep itself is virtual — it emits nothing. The fold (shared with
+    // isel-pic18) lives in `iselcore::resolve_pointers`.
+    let resolved = resolve_pointers(m);
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
     // ---- PASS A: emit every function body with every PCLATH restore
@@ -5860,7 +5803,10 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // pass B pins it to this same start, so the pages hold in the final text.
     let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
     consts.sort_by_key(|g| g.name.clone());
-    let table_start = page_next.last().copied().unwrap_or(if has_isr { 4 } else { 5 });
+    let table_start = page_next
+        .last()
+        .copied()
+        .unwrap_or(if has_isr { 4 } else { 5 });
     for (entry, page) in reader_pages(&consts, table_start) {
         pages.insert(entry, page);
     }
@@ -5908,19 +5854,19 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 addr_b += word_size(&g.out);
                 out.extend(g.out);
                 if f.isr {
-                // `__start` moves after the ISR (the vector owns word 4):
-                // the reset GOTO at word 0 still reaches it — page 0, by
-                // the ISR fit check above.
-                out.extend([
-                    "__start:".to_string(),
-                    "    MOVLW PAGE(main)".to_string(),
-                    "    MOVWF PCLATH".to_string(),
-                    "    CALL main".to_string(),
-                    "    SLEEP".to_string(),
-                    "".to_string(),
-                ]);
-                addr_b += 4;
-            }
+                    // `__start` moves after the ISR (the vector owns word 4):
+                    // the reset GOTO at word 0 still reaches it — page 0, by
+                    // the ISR fit check above.
+                    out.extend([
+                        "__start:".to_string(),
+                        "    MOVLW PAGE(main)".to_string(),
+                        "    MOVWF PCLATH".to_string(),
+                        "    CALL main".to_string(),
+                        "    SLEEP".to_string(),
+                        "".to_string(),
+                    ]);
+                    addr_b += 4;
+                }
             }
         }
         // Pin the const-table section to its pass-A `table_start` whenever
@@ -6033,7 +5979,11 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // `_hi` reader (the dispatch's bit-0 test references them, and the
         // old layout is documented); larger tables get ceil(size/256)
         // chunks.
-        let n_chunks = if size >= 256 { ((size + 255) / 256).max(2) } else { 1 };
+        let n_chunks = if size >= 256 {
+            ((size + 255) / 256).max(2)
+        } else {
+            1
+        };
         assert!(
             size <= 65535,
             "isel: const @{} table of {size} bytes exceeds the 65535-byte 16-bit index bound",
