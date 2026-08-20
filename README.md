@@ -171,15 +171,17 @@ GPL process boundary out of the inner test loop.
 
 ### 2. `gpasm` byte-for-byte cross-check
 
-14 tests assemble our emitted `.asm` with real `gpasm` and require the resulting Intel HEX
-to match our assembler's output **exactly**. This isolates *"our assembler is wrong"* from
-*"our codegen is wrong"*, two failure modes that otherwise look identical.
+Our emitted `.asm` is assembled with real `gpasm` and the resulting Intel HEX must match
+our assembler's output **exactly** (a cross-check in `crates/asm/tests`). This isolates
+*"our assembler is wrong"* from *"our codegen is wrong"*, two failure modes that otherwise
+look identical.
 
 ### 3. End-to-end acceptance programs
 
-15 e2e tests in [`crates/driver/tests`](crates/driver/tests) push real C through the entire
-pipeline and run the resulting HEX in the simulator, asserting hand-computed results. Each
-fixture documents its expected values and *why* the program is shaped the way it is:
+End-to-end acceptance programs in [`crates/driver/tests`](crates/driver/tests) push real C
+through the entire pipeline and run the resulting HEX in the simulator, asserting
+hand-computed results. Each fixture documents its expected values and *why* the program is
+shaped the way it is:
 
 | Fixture | Exercises |
 |---|---|
@@ -224,8 +226,8 @@ and call depth is checked against the 8-level hardware stack.
 ## Status
 
 **Alpha.** The full integer, pointer, interrupt, `long` and soft-float spine is implemented
-and passing end-to-end. As of this commit: **354 tests passing**, 6 slow corpus tests behind
-`--ignored`.
+and passing end-to-end. A fast subset of the suite gates every commit; the slow fuzz corpus
+runs behind `--ignored`.
 
 ### Supported C surface
 
@@ -264,24 +266,26 @@ These are deliberate and tracked, not surprises:
 
 ## Getting started
 
-Everything comes from a docker multi-stage build, so **install nothing system-wide.**
+Everything runs inside a docker multi-stage build, so **install nothing system-wide.** The
+root `Makefile` is the entry point:
 
 ```bash
-docker build --target dev -t epic-cc-dev .    # first build is slow (compiles clang)
-docker run --rm -it -v "$PWD:/workspace" -w /workspace epic-cc-dev bash
+make image                        # build the dev image (first build is slow: compiles clang)
+make shell                        # interactive dev shell with the whole toolchain
 ```
 
-Inside the container:
+Inside the shell:
 
 ```bash
-cargo test --workspace            # 557 tests
+cargo test --workspace
 bash scripts/ci-test.sh           # per-crate PASS/FAIL table (what CI runs)
 ```
 
-Compile a C file to Intel HEX:
+Compile a C file to Intel HEX (from the host):
 
 ```bash
-cargo run -p driver -- crates/driver/tests/fixtures/add.c out.hex
+make compile                      # prints the HEX of the add.c example
+make compile FILE=my/example.c
 ```
 
 Run the slow fuzz corpora:

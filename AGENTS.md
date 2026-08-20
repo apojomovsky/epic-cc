@@ -1,0 +1,195 @@
+# AGENTS.md
+
+`epic-cc` is a whole-program C compiler for 8-bit Microchip PIC
+microcontrollers (PIC14/PIC18), written in Rust. It uses clang 20.1.8
+as an out-of-process front end (`-S -emit-llvm`, text in) and owns every
+stage from LLVM IR text down to Intel HEX: no external assembler or
+linker in the product. Targets the PIC16F877A today; PIC18 support is
+landing incrementally.
+
+## The one idea that matters most
+
+**The allocator is the compiler.** PIC14 has no stack: locals are
+statically allocated and overlaid across the whole-program call graph,
+which forces whole-program compilation by construction. Every stage is
+a separate crate with a **diffable text boundary** (`.ll` in, `.asm`/HEX
+out), so a miscompile bisects to a stage before anyone reads code.
+Read `docs/30-distribution-design.md` (the docker toolchain) and
+`docs/01-target-pic14.md` (why the target is hard) before touching
+code.
+
+The front end is a **pinned clang 20.1.8** — its version is part of our
+input format, so the pin is a migration, never housekeeping. The
+release bundles ship it; the dev container builds it from the
+digest-pinned source tarball.
+
+## Build & toolchain
+
+Everything runs inside the docker dev image. **No rustup, clang, or
+gpasm on the host; never install them.** The `ci` Dockerfile stage is an
+empty alias of `dev` (identical filesystem), so running locally in the
+dev image IS running in the ci image — there is no separate local ci
+image and no reason to build one.
+
+```bash
+make image          # build the dev image (slow first time: compiles clang)
+make shell          # interactive dev shell (cargo/clang/gpasm inside)
+make test           # full suite, the exact script CI runs (ci-test.sh)
+make test CRATE=asm # scope to one crate
+make compile        # compile add.c to HEX and print it
+make exec CMD='cargo test -p fuzz -- --ignored'   # one-off command
+make info           # toolchain versions + PIC8_* env vars
+make fmt            # cargo fmt in the container
+make lint           # clippy, advisory only (never fails)
+make release-bundle VERSION=0.1.0   # Linux release zip into dist/
+make setup-hooks    # install git hooks from .githooks/
+make help           # all targets
+```
+
+The container runs as your uid (files you write stay host-owned), and
+cargo caches live under `~/.cache/epic-cc/` (persisted across runs, the
+host `target/` is never touched). `make exec` hands its `CMD` to
+`bash -c` — avoid double quotes inside it.
+
+## Worktrees
+
+**All feature work happens in a worktree under `.worktrees/`**, never on
+`master`:
+
+```bash
+git fetch origin master
+git worktree add .worktrees/<name> -b <branch> origin/master
+```
+
+Branch names are conventional: `feat/<description>`, `fix/<description>`,
+`chore/<description>`, `docs/<description>`. The worktree keeps your
+master checkout clean and lets several tasks run in parallel without
+touching each other's trees.
+
+## Development cycle
+
+Fast inner loop, in the container: `make shell`, edit in the mounted
+workspace, `make test CRATE=<crate>` / `make compile`. A build or test
+failing with too little output: `make shell` for the full picture.
+
+Every stage boundary is a text artifact — when debugging a miscompile,
+bisect stage by stage (`.ll` text → our IR → alloc map → `.asm`) before
+reading code. The verification stack is layered and all local:
+our own PIC14 simulator (`crates/sim`), a gpasm byte-for-byte
+cross-check (oracle only, GPL, never shipped), e2e acceptance programs
+through the whole pipeline, and differential fuzzing (`crates/fuzz`).
+
+## Commit hygiene
+
+- **Conventional Commits, single line, <= 3 lines.**
+  `feat(scope): summary`, `fix(...)`, `chore(...)`, `docs(...)`,
+  `build(...)`, `ci(...)`, `test(...)`. Scope is usually the crate
+  (`isel`, `banking`, `driver`) or `docker`.
+- **Never `Co-Authored-By:` or any other trailer.** The commit-msg hook
+  rejects them. The commit message is yours; git history is the record.
+- Commit whenever a piece of work is finished; don't batch unrelated
+  changes.
+- Update the docs a change touches before calling it done.
+
+## Ground rules
+
+- **Approval gates are real.** Brainstorm → design → approve →
+  implement. Present a design and stop until you get a yes, even for
+  work that looks small.
+- **Never reverse-engineer or disassemble XC8 binaries.** XC8 is a
+  black-box differential oracle only: compile the same source with
+  `xc8-cc` and diff observable behaviour. Its licence forbids more.
+- **GPL boundary.** `gputils`/`gpasm` and `gpsim` are GPL: invoking
+  them as external processes in tests is fine; linking them into the
+  compiler is not.
+- **Never commit the reference PDFs.** They are copyrighted and live
+  outside the repo (`docs/06-environment.md`).
+- **Don't copy the Microchip datasheets into docs either** — link them.
+- **Panics are the error surface today.** Unsupported input aborts with
+  a precise message; that is deliberate (correct over silent
+  miscompile). Don't "fix" panics by emitting wrong code.
+
+## Expression conventions (comments and docs)
+
+### Comments
+
+1. **Why, not what.** Code says what it does; comments carry the
+   non-obvious reason, the datasheet fact, the invariant. A comment
+   that restates the line below it is deleted.
+2. **A comment must earn its lines.** More comment lines than code is a
+   smell. Hand-traces survive only where behavior cannot be read from
+   the code, compressed to the essential steps.
+3. **No decoration.** No `/* --- name --- */` separators, no
+   `@file`/`@brief` boilerplate repeating the filename. A 1-3 line
+   file header is fine when it adds context (which stage, what it
+   rides on).
+4. **No narrative.** No "fixed X by doing Y", no iteration or session
+   prose. Verification claims about a change belong in the PR and
+   commit, not in the tree, where they go stale. Durable toolchain or
+   hardware facts (with a date) are a different class and stay.
+5. `TODO`/`FIXME` carry a concrete reason or do not exist.
+
+### Rust doc comments (the Doxygen equivalent)
+
+Rust's documentation comments are `///` (item docs, rendered by
+`cargo doc`) and `//!` (crate/module docs). The repo convention:
+
+- `//!` at the top of every crate root: what the crate does, its place
+  in the pipeline, its text boundary (the stage contract).
+- `///` on public items whose behavior isn't obvious from the
+  signature. Document the contract: what it does, what it returns,
+  what it panics on. No `@param`/`@return` boilerplate — Rust has real
+  types; prose contracts beat re-stated signatures.
+- Panic and invariant notes belong in the doc comment (e.g. "panics
+  if the page assignment straddles a boundary").
+- Tests and internal helpers: `///` only when non-obvious.
+
+### Docs lifecycle
+
+1. `docs/NN-*.md` = the numbered design/decision series; `docs/03` is
+   the ADR log. These are living documents.
+2. Design docs are ephemeral: written during the work, deleted on
+   completion. Git history is the archive.
+3. No bitacores: findings narratives and session logs describing
+   completed work are deleted. Live gotchas live in
+   `docs/09-build-environment.md` (toolchain) or the ADRs (decisions).
+4. **No test counts in the README or live docs.** They go stale on
+   every feature merge; describe mechanisms, never numbers.
+5. Third-party code keeps its own style; these rules are first-party
+   only.
+
+## Non-obvious things that will bite you
+
+- **The `.ll` surface is the input format.** clang's version is pinned
+  because we parse its text output. Never "just bump" it, and never
+  assume a newer clang emits the same IR shapes.
+- **`-target msp430` is a datalayout proxy, not a target.** We are not
+  generating MSP430 code; it gives us the ABI-independent type
+  decisions (8-bit char, 16-bit int/pointers). `-Oz` emits arbitrary
+  widths (`i17`) — we run `-O1` deliberately.
+- **Recursion is a compile error**, and call depth is checked against
+  the 8-level hardware stack. Don't add stack frames; that's not a
+  limitation to "fix", it's the architecture.
+- **Locals are keyed `{func}::{name}`** in the address map — the
+  driver's `HashMap` contract both backends look up. Renaming breaks
+  the map, not just one backend.
+- **BANKSEL between a skip-sensitive test and its branch changes the
+  skip target.** Issue #6 territory; the banking pass and the runtime
+  routines both know this. Don't "helpfully" reorder.
+- **The driver binary is `epic-cc`, not `driver`.** `cargo run -p
+  driver` works (the package is still named driver), but anything that
+  spawns the binary by name must use `epic-cc` (or
+  `CARGO_BIN_EXE_epic-cc` in tests). The fuzz harness's `driver_binary()`
+  learned this the hard way.
+- **Docker builds only see git-tracked files** when COPYing the
+  workspace: stage new files before building a release bundle.
+
+## CI
+
+`.github/workflows/ci.yml` runs the full workspace suite inside the
+`ci` image (an alias of `dev`) on every push/PR. The clang layer is
+cached in GHCR via the buildx registry cache; the first run on a fresh
+cache is ~1h, everything after is minutes. `.github/workflows/
+release.yml` builds the release bundles on tags. Both workflows use
+`packages: write` + `ignore-error=true` on the registry cache — the
+cache is an optimization, never a gate.
