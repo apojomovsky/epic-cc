@@ -141,7 +141,7 @@ pleasantly.
 | **clang** (pinned 20.1.8) | The C front end. Runs out-of-process, emits `.ll` text. The *only* build-time external dependency. | [ADR-001](docs/03-decisions.md), [ADR-007](docs/03-decisions.md) |
 | **gputils / `gpasm`** (1.5.2) | Test-time oracle. Our HEX must match `gpasm`'s **byte for byte**. Never a build dependency. | [`crates/asm/tests`](crates/asm/tests) |
 | **llvm-mos** | Prior art, techniques only: static stack allocation and imaginary registers, reimplemented rather than ported. | [ADR-003](docs/03-decisions.md) |
-| **Nix + direnv** | The whole toolchain, pinned in `flake.lock`. clang's version is part of our *input format*, so a silent bump could change what the parser sees. | [`docs/09-build-environment.md`](docs/09-build-environment.md) |
+| **Docker (multi-stage)** | The whole toolchain, built from a digest-pinned `ubuntu:22.04` base + the LLVM 20.1.8 source tarball + `rust-toolchain.toml`. clang's version is part of our *input format*, so a silent bump could change what the parser sees. | [`docs/09-build-environment.md`](docs/09-build-environment.md) |
 | **cvise / creduce / csmith** | Available in the dev shell for test-case reduction work. | [`docs/05-verification.md`](docs/05-verification.md) |
 
 **On XC8:** Microchip's XC8 is treated as a **black-box differential oracle only**. Compile
@@ -264,36 +264,35 @@ These are deliberate and tracked, not surprises:
 
 ## Getting started
 
-Everything comes from a Nix flake, so **install nothing system-wide.**
+Everything comes from a docker multi-stage build, so **install nothing system-wide.**
 
 ```bash
-direnv allow                      # one time; the shell then activates on `cd`
-cargo test --workspace            # 354 tests
+docker build --target dev -t epic-cc-dev .    # first build is slow (compiles clang)
+docker run --rm -it -v "$PWD:/workspace" -w /workspace epic-cc-dev bash
 ```
 
-Or, one-shot for automation:
+Inside the container:
 
 ```bash
-nix develop --command cargo test --workspace
-nix develop --command bash scripts/ci-test.sh   # per-crate PASS/FAIL table (what CI runs)
+cargo test --workspace            # 354 tests
+bash scripts/ci-test.sh           # per-crate PASS/FAIL table (what CI runs)
 ```
 
 Compile a C file to Intel HEX:
 
 ```bash
-nix develop --command cargo run -p driver -- crates/driver/tests/fixtures/add.c out.hex
+cargo run -p driver -- crates/driver/tests/fixtures/add.c out.hex
 ```
 
 Run the slow fuzz corpora:
 
 ```bash
-nix develop --command cargo test -p fuzz -- --ignored
+cargo test -p fuzz -- --ignored
 ```
 
-Pinned by `flake.lock`: **rustc 1.97.1**, **clang 20.1.8**, **gpasm 1.5.2**, plus cvise,
-creduce and csmith. Gotchas, including why new files must be `git add`ed before
-`nix develop` can see them, are in
-[`docs/09-build-environment.md`](docs/09-build-environment.md).
+Pinned by the Dockerfile: **rustc 1.97.1**, **clang 20.1.8** (source tarball),
+**gpasm 1.5.2** (source), plus csmith, creduce and cvise. Gotchas and the
+caching story are in [`docs/09-build-environment.md`](docs/09-build-environment.md).
 
 ---
 
@@ -316,7 +315,7 @@ crates/
   fuzz/        #           differential generator, runner and reducer
 docs/          # design conversation, ADRs, milestone plans
 scripts/       # ci-test.sh, the workspace test gate (CI and local)
-flake.nix      # the pinned toolchain
+Dockerfile     # the pinned toolchain (multi-stage)
 ```
 
 ---

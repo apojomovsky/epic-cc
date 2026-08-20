@@ -10,9 +10,6 @@
 # Reference PDFs must never be committed — copyrighted, see docs/06-environment.md
 *.pdf
 
-# direnv
-/.direnv/
-
 # Agent worktree dirs
 /.claude/worktrees/
 
