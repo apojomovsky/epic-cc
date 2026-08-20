@@ -12,7 +12,7 @@
 # master plan-free automatically.
 #
 # Usage: bash scripts/pre-pr-check.sh [--test]
-#   --test   also run the full suite (make test) ; slow, opt-in
+#   --test   also run the full suite (make test); slow, opt-in
 #   BASE_REF overrides the base branch (forks: BASE_REF=<fork>/master)
 
 set -uo pipefail
@@ -44,12 +44,12 @@ fi
 if git rev-parse --verify -q "$BASE_REF" >/dev/null 2>&1; then
   behind=$(git rev-list --count "HEAD..$BASE_REF")
   if [ "$behind" -gt 0 ]; then
-    warn "branch is $behind commit(s) behind $BASE_REF ; rebase before merging"
+    warn "branch is $behind commit(s) behind $BASE_REF; rebase before merging"
   else
     ok "up to date with $BASE_REF"
   fi
 else
-  warn "$BASE_REF not found ; fetch first: git fetch origin master"
+  warn "$BASE_REF not found; fetch first: git fetch origin master"
 fi
 
 # ── 3. Implementation plans must not reach master ──────────────────
@@ -74,7 +74,7 @@ fi
 # ── 4. Commit hygiene: conventional, single-subject, no trailers ───
 n=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null || echo 0)
 if [ "$n" -eq 0 ]; then
-  fail "no commits ahead of $BASE_REF ; nothing to PR"
+  fail "no commits ahead of $BASE_REF; nothing to PR"
 else
   say "checking $n commit(s):"
   while IFS= read -r -d '' hash; do
@@ -135,7 +135,7 @@ fi
 # ── 7. Hooks installed (make setup-hooks) ──────────────────────────
 hooks=$(git rev-parse --git-path hooks)
 if [ ! -x "$hooks/pre-commit" ]; then
-  warn "git hooks not installed ; run: make setup-hooks"
+  warn "git hooks not installed; run: make setup-hooks"
 else
   ok "git hooks installed"
 fi
@@ -150,13 +150,13 @@ if [ "$RUN_TESTS" -eq 1 ]; then
     fail "full suite failed"
   fi
 else
-  warn "suite not run ; re-run with --test (make pre-pr-check TEST=1) before merging"
+  warn "suite not run; re-run with --test (make pre-pr-check TEST=1) before merging"
 fi
 
 say ""
 if [ "$FAILS" -gt 0 ]; then
-  say "== $FAILS blocking item(s), $WARNS advisory ; fix and re-run =="
+  say "== $FAILS blocking item(s), $WARNS advisory; fix and re-run =="
   exit 1
 fi
-say "== ritual clean ($WARNS advisory) ; ready to open the PR =="
+say "== ritual clean ($WARNS advisory); ready to open the PR =="
 exit 0
