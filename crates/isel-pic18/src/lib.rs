@@ -688,13 +688,13 @@ impl<'m> Gen<'m> {
                     }
                 }
             }
-            Inst::Gep(_) => {
-                // Virtual: Gep's result is folded away by `resolve_pointers`
-                // (Task 1) before codegen ever runs; the folded `(base, k,
-                // terms)` is consumed at the point of use (`Load`/`Store`/
-                // `Memcpy`/byval-sret) via `Gen::resolved_for`. It emits
-                // nothing of its own. (Alloca gets the same treatment in
-                // Task 10.)
+            Inst::Alloca(_) | Inst::Gep(_) => {
+                // Virtual: Alloca's slot comes from `alloc`'s layout and
+                // Gep's result is folded away by `resolve_pointers`
+                // (Task 1) before codegen ever runs; see this file's
+                // module doc and docs/superpowers/plans/
+                // 2026-08-20-pic18-port-p3.md Task 10. Neither emits
+                // anything of its own.
             }
             Inst::Memcpy(mc) => match &mc.len {
                 ir::MemLen::Const(n) => {

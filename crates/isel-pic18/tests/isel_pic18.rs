@@ -1071,3 +1071,26 @@ fn a_dynamic_length_memcpy_panics_loudly() {
     let addrs = addrs(&[("src", 0x100), ("dst", 0x110), ("n", 0x120), ("main::len", 0x121)]);
     select(&PIC18F4550, &m, &addrs);
 }
+
+#[test]
+fn alloca_and_gep_emit_nothing_of_their_own() {
+    let m = parse(
+        "global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %buf = alloca 4\n\
+             %p = gep %buf +1\n\
+             store i8 9 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("out", 0x100), ("main::buf", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    // The store must land at buf+1 (0x111): proof both Alloca and Gep
+    // were handled (the seed + the fold), not merely "didn't crash."
+    // 0x111 is bank 1, f=0x11, so the banked emission is MOVLB 0x1 +
+    // MOVWF 0x011,B (the literal "0x111" never appears in the asm).
+    assert!(
+        asm.contains("MOVLB 0x1") && asm.contains("MOVWF 0x011,B"),
+        "store must target buf+1 (0x111):\n{asm}"
+    );
+}
