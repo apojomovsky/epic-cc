@@ -187,24 +187,124 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// How a byte access at `ptr + byte_off` completes. `Val::Global`
+    /// resolves directly (globals are never behind another indirection
+    /// layer). `Val::Reg` looks up the pointer's fold via `resolved_for`:
+    /// a `Base::Global`/`Base::Slot(_, false)` (byval/alloca, the slot
+    /// itself IS the object) with no dynamic terms is a plain direct
+    /// address; with dynamic terms it needs FSR0 (Task 6). A
+    /// `Base::Slot(_, true)` (sret, the slot holds a target ADDRESS, not
+    /// the object) always needs FSR0, regardless of terms (Task 7).
+    fn emit_ptr_setup(&mut self, ptr: &Val, byte_off: u8) -> Addr {
+        match ptr {
+            Val::Global(g) => Addr::Direct(self.global_addr(g) + u16::from(byte_off)),
+            Val::Reg(r) => {
+                let (base, k, terms) = self.resolved_for(r);
+                match &base {
+                    Base::Global(name) => {
+                        if terms.is_empty() {
+                            Addr::Direct(self.global_addr(name) + u16::from(k) + u16::from(byte_off))
+                        } else {
+                            self.emit_fsr0_dynamic(self.global_addr(name), k, &terms, byte_off);
+                            Addr::Indirect
+                        }
+                    }
+                    Base::Slot(sname, indirect) => {
+                        let sa = self.slot_addr(self.cur_func, sname).direct();
+                        if !indirect && terms.is_empty() {
+                            Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
+                        } else if !indirect {
+                            self.emit_fsr0_dynamic(sa, k, &terms, byte_off);
+                            Addr::Indirect
+                        } else {
+                            self.emit_fsr0_indirect_slot(sa, k, &terms, byte_off);
+                            Addr::Indirect
+                        }
+                    }
+                }
+            }
+            Val::Const(_) => panic!("isel-pic18: pointer operand must be a register or global"),
+        }
+    }
+
+    fn emit_fsr0_dynamic(&mut self, _base_addr: u16, _k: u8, _terms: &[(u8, String)], _byte_off: u8) {
+        panic!("isel-pic18: dynamic pointer offsets arrive in Task 6");
+    }
+    fn emit_fsr0_indirect_slot(&mut self, _slot_addr: u16, _k: u8, _terms: &[(u8, String)], _byte_off: u8) {
+        panic!("isel-pic18: sret-indirect pointer offsets arrive in Task 7");
+    }
+
+    /// Materialize byte `k` of `val` into `W`: a constant via `MOVLW`, a
+    /// register/global source via `MOVF`. Used only by the
+    /// `Addr::Indirect` store path (the direct path uses
+    /// `emit_move_val_to_slot`/`MOVFF`, which never touches `W`).
+    fn emit_byte_to_w(&mut self, val: &Val, k: u8) {
+        match val {
+            Val::Const(c) => {
+                let byte = ((c >> (i64::from(k) * 8)) & 0xFF) as u8;
+                self.emit(format!("    MOVLW 0x{byte:02X}"));
+            }
+            Val::Reg(r) => {
+                let a = self.slot_addr(self.cur_func, r).direct() + u16::from(k);
+                let (ab, f) = self.operand(a);
+                self.emit(format!("    MOVF 0x{f:03X},W,{}", if ab == 0 { "A" } else { "B" }));
+            }
+            Val::Global(g) => {
+                let a = self.global_addr(g) + u16::from(k);
+                let (ab, f) = self.operand(a);
+                self.emit(format!("    MOVF 0x{f:03X},W,{}", if ab == 0 { "A" } else { "B" }));
+            }
+        }
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         match i {
             Inst::Load(l) => {
                 assert!(l.ty != Ty::I1, "isel-pic18: only i8/i16 loads supported");
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
-                let src = self.global_addr(l.ptr.strip_prefix('@').unwrap_or_else(|| {
-                    panic!("isel-pic18: P2 only supports loads from @global (no pointers yet)")
-                }));
+                let ptr_val = if let Some(g) = l.ptr.strip_prefix('@') {
+                    Val::Global(g.to_string())
+                } else if let Some(r) = l.ptr.strip_prefix('%') {
+                    Val::Reg(r.to_string())
+                } else {
+                    panic!("isel-pic18: malformed load pointer operand {:?}", l.ptr);
+                };
                 for k in 0..l.ty.bytes() {
-                    self.emit_copy_byte(src + u16::from(k), dst + u16::from(k));
+                    match self.emit_ptr_setup(&ptr_val, k) {
+                        Addr::Direct(src) => self.emit_copy_byte(src, dst + u16::from(k)),
+                        Addr::Indirect => self.emit(format!("    MOVFF 0xFEF, 0x{:03X}", dst + u16::from(k))),
+                    }
                 }
             }
             Inst::Store(s) => {
                 assert!(s.ty != Ty::I1, "isel-pic18: only i8/i16 stores supported");
-                let dst = self.global_addr(s.ptr.strip_prefix('@').unwrap_or_else(|| {
-                    panic!("isel-pic18: P2 only supports stores to @global (no pointers yet)")
-                }));
-                self.emit_move_val_to_slot(&s.val, s.ty, dst);
+                let ptr_val = if let Some(g) = s.ptr.strip_prefix('@') {
+                    Val::Global(g.to_string())
+                } else if let Some(r) = s.ptr.strip_prefix('%') {
+                    Val::Reg(r.to_string())
+                } else {
+                    panic!("isel-pic18: malformed store pointer operand {:?}", s.ptr);
+                };
+                // Direct case: a single emit_ptr_setup(_, 0) covers the
+                // whole value via emit_move_val_to_slot (unchanged from
+                // P2 for the common @global case). Indirect case:
+                // re-resolve per byte (each byte's FSR setup is
+                // independent; see Task 6's design note on why no
+                // auto-increment is used), materializing the source byte
+                // into W (a constant literally, a register via MOVF) and
+                // writing it through INDF0.
+                match self.emit_ptr_setup(&ptr_val, 0) {
+                    Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
+                    Addr::Indirect => {
+                        for k in 0..s.ty.bytes() {
+                            if k > 0 {
+                                self.emit_ptr_setup(&ptr_val, k);
+                            }
+                            self.emit_byte_to_w(&s.val, k);
+                            self.emit("    MOVWF 0xFEF,A".to_string()); // INDF0
+                        }
+                    }
+                }
             }
             Inst::Bin(b) => {
                 let n = b.ty.bytes();
@@ -480,6 +580,14 @@ impl<'m> Gen<'m> {
                         self.emit_copy_byte(self.retval_lo + u16::from(i), dst + u16::from(i));
                     }
                 }
+            }
+            Inst::Gep(_) => {
+                // Virtual: Gep's result is folded away by `resolve_pointers`
+                // (Task 1) before codegen ever runs; the folded `(base, k,
+                // terms)` is consumed at the point of use (`Load`/`Store`/
+                // `Memcpy`/byval-sret) via `Gen::resolved_for`. It emits
+                // nothing of its own. (Alloca gets the same treatment in
+                // Task 10.)
             }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }

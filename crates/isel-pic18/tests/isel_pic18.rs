@@ -940,3 +940,17 @@ fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
     );
     assert!(!asm.contains("LFSR"), "a fully-constant GEP needs no FSR setup:\n{asm}");
 }
+
+#[test]
+#[should_panic(expected = "Task 6")]
+fn a_gep_with_a_dynamic_term_load_panics_until_task_6() {
+    // arr[i] with a REGISTER index has a dynamic term, so the load needs
+    // FSR0 setup — which lands in Task 6. Until then, the Task 4 stub
+    // must panic loudly rather than emit a bogus direct access.
+    let m = parse(
+        "global arr i8\nglobal idx i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @idx\n    %p = gep @arr +0 +1*%i\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("arr", 0x100), ("idx", 0x110), ("out", 0x111), ("main::i", 0x112), ("main::v", 0x113)]);
+    let _ = select(&PIC18F4550, &m, &addrs);
+}
