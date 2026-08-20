@@ -110,7 +110,7 @@ else
   fail "whitespace errors in the diff (above); fix and re-stage"
 fi
 
-# ── 6. Em-dashes in the PR's prose diff (not ascii art) ────────────
+# ── 6. Prose hygiene in the PR's diff (not ascii art) ─────────────
 # Only ADDED lines are scanned: context lines may carry pre-existing
 # em-dashes from lines the PR merely touches. AGENTS.md, the hooks,
 # this script, and docs/03 are excluded by design: AGENTS.md documents
@@ -130,6 +130,28 @@ if [ -n "$emdashes" ]; then
   fail "      colon, or period. Exception: ascii-art/diagrams)."
 else
   ok "no em-dashes in the diff"
+fi
+
+# Space-before-comma: the residue a mechanical em-dash sweep leaves
+# behind (` — ` replaced by ` , `, a comma splice). The em-dash scan
+# above cannot catch it, because the sweep deleted every — it swept.
+# Advisory, not blocking: prose-only sweeps need a human or a language
+# model to pick a comma, a colon, or a period with logic; a script
+# cannot. Also catches stray whitespace before commas in code.
+commas=$(git diff "$BASE_REF"...HEAD -- . \
+  ':(exclude)docs/superpowers/plans/' \
+  ':(exclude)AGENTS.md' ':(exclude)CLAUDE.md' \
+  ':(exclude).githooks/' \
+  ':(exclude)scripts/pre-pr-check.sh' \
+  ':(exclude)docs/03-decisions.md' 2>/dev/null \
+  | grep -nE '^\+[^+].* ,' | head -10)
+if [ -n "$commas" ]; then
+  printf '    %s\n' "$commas"
+  warn "space-before-comma (',') in the PR's diff: mechanical em-dash"
+  warn "      sweeps leave this (a comma splice, not prose). Replace"
+  warn "      with a comma, a colon, or a period, chosen with logic."
+else
+  ok "no space-before-comma residue"
 fi
 
 # ── 7. Hooks installed (make setup-hooks) ──────────────────────────
