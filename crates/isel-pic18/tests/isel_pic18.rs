@@ -7,6 +7,20 @@ fn addrs(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
     pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
 }
 
+/// Set the initializer bytes of a const global. The canonical IR text
+/// (`ir::parse`) carries no bytes — those arrive from irparse's `.ll`
+/// decode — so tests that exercise the emitted `db` table / `TBLRD` path
+/// must supply them the way irparse would.
+fn with_bytes(mut m: ir::Module, name: &str, bytes: &[u8]) -> ir::Module {
+    for g in &mut m.globals {
+        if g.name == name {
+            g.bytes = bytes.to_vec();
+            g.size = bytes.len() as u16;
+        }
+    }
+    m
+}
+
 #[test]
 fn empty_function_emits_a_bare_return() {
     let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
@@ -1173,7 +1187,11 @@ fn alloca_and_gep_emit_nothing_of_their_own() {
 
 #[test]
 fn const_byte_load_emits_tblrd() {
-    let m = parse("const t i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @t\n    ret void\n");
+    let m = with_bytes(
+        parse("const t i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @t\n    ret void\n"),
+        "t",
+        &[0x2A],
+    );
     let addrs = addrs(&[("main::1", 0x10)]);
     let asm = select(&PIC18F4550, &m, &addrs);
     assert!(asm.contains("TBLRD*"), "a const read must use TBLRD:\n{asm}");
@@ -1195,15 +1213,19 @@ fn const_dynamic_index_load_uses_tblptr_add() {
     // carry, not silently dropped. (The canonical IR text carries no
     // initializer bytes — those arrive from irparse's .ll decode — so the
     // GEP/base shape is what this test pins.)
-    let m = parse(
-        "const t i8\n\
-         global in i8\n\
-         fn main(void) ()\n\
-           block entry:\n\
-             %1 = load i8 @in\n\
-             %p = gep @t +0 +1*%1\n\
-             %2 = load i8 %p\n\
-             ret void\n",
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global in i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @in\n\
+                 %p = gep @t +0 +1*%1\n\
+                 %2 = load i8 %p\n\
+                 ret void\n",
+        ),
+        "t",
+        &[10, 20, 30, 40],
     );
     let addrs = addrs(&[("in", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
     let asm = select(&PIC18F4550, &m, &addrs);
@@ -1215,7 +1237,11 @@ fn const_dynamic_index_load_uses_tblptr_add() {
 
 #[test]
 fn const_i16_load_reads_two_bytes() {
-    let m = parse("const t i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @t\n    ret void\n");
+    let m = with_bytes(
+        parse("const t i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @t\n    ret void\n"),
+        "t",
+        &[0x34, 0x12],
+    );
     let addrs = addrs(&[("main::1", 0x10)]);
     let asm = select(&PIC18F4550, &m, &addrs);
     // Two independent TBLRD* reads, into dst byte 0 and byte 1.
@@ -1244,4 +1270,25 @@ fn store_through_const_gep_reg_panics() {
     );
     let addrs = addrs(&[("in", 0x10), ("main::1", 0x11)]);
     let _ = select(&PIC18F4550, &m, &addrs);
+}
+
+#[test]
+fn emits_const_tables_as_db_after_start() {
+    // The const table's bytes are emitted as `db` lines between __start
+    // and `end`, so the TBLRD reads resolve through the label.
+    let m = with_bytes(
+        ir::parse("const t i8\nfn main(void) ()\n  block entry:\n    ret void\n"),
+        "t",
+        &[0x0A, 0x14, 0x1E, 0x28],
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    assert!(asm.contains("t:"), "table label must be emitted:\n{asm}");
+    assert!(
+        asm.contains("db 0x0A, 0x14, 0x1E, 0x28"),
+        "the four bytes must be on one db line:\n{asm}"
+    );
+    assert!(
+        asm.rfind("t:").map(|i| asm[i..].contains("db")).unwrap_or(false),
+        "the db bytes must come after the label:\n{asm}"
+    );
 }

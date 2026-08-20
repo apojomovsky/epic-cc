@@ -1396,6 +1396,28 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     out.push("__start:".to_string());
     out.push("    call main".to_string());
     out.push("    sleep".to_string());
+    // P4: every `const` (flash) global becomes a `DB` table after the code,
+    // before `end`. The bytes are the flat LE blob `irparse` decoded; the
+    // table label is the TBLPTR base `LOW`/`HIGH`/`UPPER` resolve. No
+    // chunking and no `.align`: PIC18's `TBLRD` addresses program memory
+    // linearly (byte addresses, two bytes per word), so the 511-byte
+    // `RETLW` ceiling of PIC14 stops existing here.
+    for g in &m.globals {
+        if !g.is_const {
+            continue;
+        }
+        assert!(
+            !g.bytes.is_empty(),
+            "isel-pic18: const @{} has no table bytes",
+            g.name
+        );
+        out.push(format!("{}:", g.name));
+        for chunk in g.bytes.chunks(8) {
+            let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
+            out.push(format!("    db {}", bytes.join(", ")));
+        }
+        out.push("".to_string());
+    }
     // gpasm requires the `end` directive (our own assembler tolerates its
     // absence); PIC14's `isel::select` emits it the same way.
     out.push("    end".to_string());
