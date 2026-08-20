@@ -1,6 +1,7 @@
 //! `iselcore` — shared instruction-selection primitives used by both the
 //! PIC14 (`isel`) and PIC18 (`isel-pic18`) backends.
 
+use ir::{GepBase, Inst, Module};
 use std::collections::HashMap;
 
 /// Map key for a local value: `{func}::{name}` (IR value names without `%`).
@@ -29,7 +30,9 @@ impl Slot {
     pub fn direct(&self) -> u16 {
         match self {
             Slot::Direct(a) => *a,
-            Slot::Frame(_) => unimplemented!("frame-relative slots arrive with the reentrancy phase"),
+            Slot::Frame(_) => {
+                unimplemented!("frame-relative slots arrive with the reentrancy phase")
+            }
         }
     }
 }
@@ -88,4 +91,114 @@ pub fn parse_map(text: &str) -> HashMap<String, u16> {
         }
     }
     addrs
+}
+
+/// Where a pointer's bytes ultimately live, once every `gep` in its chain
+/// has been folded away: a named global, or a local slot (an alloca's own
+/// buffer, or a byval/sret param, where the `bool` is `true` for sret, meaning
+/// the slot holds a target ADDRESS rather than being the object itself).
+#[derive(Clone, Debug)]
+pub enum Base {
+    Global(String),
+    Slot(String, bool),
+}
+
+/// Fold every `Inst::Gep` in `m` to `(base, k, terms)`: `base` is where the
+/// chain ultimately starts, `k` is the constant byte offset, `terms` is
+/// `Vec<(scale, reg)>` for every dynamic (register-indexed) offset in the
+/// chain, inner-to-outer. Keyed `{func}::{reg}` via `ssa_key`, matching
+/// every other per-function map in this pipeline.
+///
+/// Seeds first (byval/sret params, allocas, each its own `Base::Slot`
+/// with no offset), then a fixpoint scan over every `Gep`: a `GepBase::Reg`
+/// folds in its own already-resolved entry (`k` adds, `terms` concatenate
+/// inner-first) until the chain bottoms out at a `Global` or a seed. A
+/// `Gep` whose base is neither a seed nor another (eventually resolvable)
+/// `Gep` is a bug in an earlier stage and panics loudly; a scan that makes
+/// no progress with unresolved geps left is a cycle and panics loudly.
+pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, String)>)> {
+    let mut geps: HashMap<String, ir::Gep> = HashMap::new();
+    let mut resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+    for f in &m.funcs {
+        for p in &f.params {
+            if p.byval.is_some() {
+                resolved.insert(
+                    ssa_key(&f.name, &p.name),
+                    (Base::Slot(p.name.clone(), false), 0, Vec::new()),
+                );
+            } else if p.sret {
+                resolved.insert(
+                    ssa_key(&f.name, &p.name),
+                    (Base::Slot(p.name.clone(), true), 0, Vec::new()),
+                );
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Gep(g) => {
+                        geps.insert(ssa_key(&f.name, &g.dst), g.clone());
+                    }
+                    Inst::Alloca(a) => {
+                        resolved.insert(
+                            ssa_key(&f.name, &a.dst),
+                            (Base::Slot(a.dst.clone(), false), 0, Vec::new()),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    for f in &m.funcs {
+        let fname = f.name.clone();
+        let mut pending: Vec<(String, ir::Gep)> = geps
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
+            .map(|(k, g)| (k.clone(), g.clone()))
+            .collect();
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            let mut rest = Vec::new();
+            for (key, g) in pending {
+                match &g.base {
+                    GepBase::Global(name) => {
+                        assert!(
+                            !resolved.contains_key(&key),
+                            "iselcore: duplicate definition of pointer reg {key}"
+                        );
+                        resolved.insert(key, (Base::Global(name.clone()), g.k, g.terms.clone()));
+                        progressed = true;
+                    }
+                    GepBase::Reg(r) => {
+                        let rkey = ssa_key(&fname, r);
+                        if let Some((b, kk, tt)) = resolved.get(&rkey).cloned() {
+                            assert!(
+                                !resolved.contains_key(&key),
+                                "iselcore: duplicate definition of pointer reg {key}"
+                            );
+                            let mut terms = tt.clone();
+                            terms.extend(g.terms.clone());
+                            let k = g.k.checked_add(kk).unwrap_or_else(|| {
+                                panic!("iselcore: gep offset overflow in {key}")
+                            });
+                            resolved.insert(key, (b, k, terms));
+                            progressed = true;
+                        } else if geps.contains_key(&rkey) {
+                            rest.push((key, g));
+                        } else {
+                            panic!("iselcore: no gep for pointer %{r} (chain base missing, key {rkey})");
+                        }
+                    }
+                }
+            }
+            pending = rest;
+            if !progressed && !pending.is_empty() {
+                let names: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
+                panic!("iselcore: cyclic gep chain involving {names:?}");
+            }
+        }
+    }
+    resolved
 }

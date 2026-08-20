@@ -245,12 +245,19 @@ not a judgement.
 | **P0** | `device` crate; de-hard-code the 877A from `alloc`, `isel`, `banking`, `asm`; introduce `Slot`. No PIC18 code. | The existing test suite still passes, unchanged. Pure refactor. |
 | **P1** | PIC18 `asm` encoder and `sim` core. Hand-written `.asm` inputs only, no codegen. | `gpasm -p p18f4550` byte-for-byte HEX match, plus simulator tests per instruction group. |
 | **P2** | Integer spine: `isel-pic18`, Access Bank + BSR banking, `Slot::Direct`. | `add.c`, `scalar.c`, `overlay.c`, `banked.c` |
-| **P3** | Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
+| **P3** | **DONE** Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
 | **P4** | `const` in flash via `TBLRD`. | `const_table.c`, and the 511-byte ceiling stops existing |
 | **P5** | Interrupts: two vectors, high and low priority. | `interrupt.c`, `interrupt_gate.c`, `interrupt_mul.c` |
 | **P6** | 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c` |
 | **P7** | Soft-float. | `float.c` |
 | **P8** | Point the differential fuzzer at PIC18. | the seed corpora run clean |
+
+**P3 note (2026-08-20):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p3.md`](superpowers/plans/2026-08-20-pic18-port-p3.md).
+`ptr_probe.c` as originally listed bundles a RAM pointer with a `const`-flash
+table read; since `TBLRD` is P4's job, P3 used a substitute
+`ptr_probe_pic18.c` (RAM pointer only) and the original file's full parity
+becomes a P4 acceptance addition once `TBLRD` lands.
 
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely

@@ -7,7 +7,7 @@ ADR-001 through ADR-008 live in this file. **Newer ADRs live one-per-file in
 [`docs/adr/`](adr/)** (`ADR-00N-<topic>.md`, N continuing from 008). Each new ADR adds a
 one-line index entry here, e.g.:
 
-- ADR-009 — <decision title>, <date>
+- ADR-009 — PIC18 pointer model: shared GEP fold, single FSR0, no PLUSWn, 2026-08-20
 
 ---
 

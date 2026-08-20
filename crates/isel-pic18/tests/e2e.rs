@@ -99,7 +99,7 @@ fn banked_c_runs_correctly() {
 /// `out`) fit entirely inside the Access Bank (max global address 0x5E),
 /// but `main`'s own locals (the loop-free but still substantial spill from
 /// summing 90 volatile loads into a 16-bit accumulator) push well past
-/// 0x5F, landing as high as 0x111 — so the emitted assembly DOES contain
+/// 0x5F, landing as high as 0x111, so the emitted assembly DOES contain
 /// `MOVLB`s, just for locals rather than globals. The fixture's name stays
 /// accurate; no global-count bump needed.
 #[test]
@@ -129,4 +129,55 @@ fn banked_c_asm_contains_movlb() {
         asm.lines().any(|l| l.trim().starts_with("MOVLB")),
         "banked.c must exercise BSR-banked addressing on PIC18 (found no MOVLB):\n{asm}"
     );
+}
+
+// P3 end-to-end acceptance: the pointer/array/struct fixtures from Tasks
+// 3-11, compiled through the real PIC18 pipeline and run in the `Pic18`
+// simulator. Seeding and expected values are transcribed verbatim from the
+// working PIC14 tests of the same byte-identical C source
+// (crates/driver/tests/{array,banked_ptr,structs,ptr_probe}_e2e.rs).
+
+#[test]
+fn ptr_probe_pic18_c_runs_correctly() {
+    // in = 0x0035; i = 0x35 & 7 = 5; ram[5] = 0x35; out = ram[5] = 0x35.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ptr_probe_pic18.c"));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 0x35; // in low byte
+    p.ram_mut()[in_addr + 1] = 0x00; // in high byte
+    p.run(200_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0x35, "out == in's low byte read back through the pointer");
+    assert!(p.halted());
+}
+
+#[test]
+fn array_c_runs_correctly() {
+    // Mirrors crates/driver/tests/array_e2e.rs: in low byte = 3 (high byte
+    // stays 0) -> buf[3] = 4 -> out = buf[3] = 4.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/array.c"));
+    p.ram_mut()[globals["in"] as usize] = 3; // in low byte = 3 (high byte stays 0)
+    p.run(200_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 4, "out == buf[3] == 3+1");
+    assert!(p.halted());
+}
+
+#[test]
+fn banked_ptr_c_runs_correctly() {
+    // Mirrors crates/driver/tests/banked_ptr_e2e.rs: in low byte = 3 (high
+    // byte stays 0) -> out == 0xB8 (hand trace in the fixture's comment).
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/banked_ptr.c"));
+    p.ram_mut()[globals["in"] as usize] = 3; // in low byte = 3 (high byte stays 0)
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0xB8, "out == hand-computed 0xB8 for in == 3");
+    assert!(p.halted());
+}
+
+#[test]
+fn structs_c_runs_correctly() {
+    // Mirrors crates/driver/tests/structs_e2e.rs: no input seeding, every
+    // value is a fixed constant, so out == 0x4E (hand trace in the
+    // fixture's comment).
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/structs.c"));
+    p.run(200_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0x4E, "out == hand-computed 0x4E");
+    assert!(p.halted());
 }

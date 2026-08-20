@@ -190,6 +190,17 @@ fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
         .unwrap_or_else(|| panic!("alloc: routine frame needs a bank past 0x{region_end:X}"))
 }
 
+/// `base` unchanged for an ordinary function; `routine_base`-rounded for a
+/// runtime routine (issue #6). Shared by the main-context and ISR-context
+/// base-assignment loops, which both need this same rounding.
+fn round_if_routine(device: &Device, f: &str, base: u16, locals_widths: &HashMap<String, Vec<u8>>) -> u16 {
+    if ir::is_runtime_routine(f) {
+        routine_base(device, base, &locals_widths[f])
+    } else {
+        base
+    }
+}
+
 /// Every function transitively reachable from `roots` over the caller ->
 /// callee map `edges` (the roots included). A visited set keeps a call cycle
 /// (rejected loudly earlier by the topological sort) from looping forever.
@@ -418,11 +429,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         // (its skip-sensitive recipe loops cannot tolerate a BANKSEL between
         // a test and its target, or inside a carry idiom). The base is
         // rounded when the derived frame would straddle a bank boundary.
-        let b = if ir::is_runtime_routine(f) {
-            routine_base(device, b, &locals_widths[f])
-        } else {
-            b
-        };
+        let b = round_if_routine(device, f, b, &locals_widths);
         base.insert(f.clone(), b);
     }
 
@@ -479,11 +486,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             };
             // Issue #6: the ISR context's routine copies get the same
             // single-bank frame rounding as the main context's.
-            let b = if ir::is_runtime_routine(f) {
-                routine_base(device, b, &locals_widths[f])
-            } else {
-                b
-            };
+            let b = round_if_routine(device, f, b, &locals_widths);
             base.insert(f.clone(), b);
         }
     }

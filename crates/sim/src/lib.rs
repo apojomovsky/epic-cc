@@ -102,7 +102,7 @@ impl Pic14 {
     }
     /// Fire the F877A's single interrupt immediately, bypassing GIE and the
     /// enable bits: push the return address and jump to the vector. The
-    /// unconditional test hook — use it to place an interrupt at an exact
+    /// unconditional test hook: use it to place an interrupt at an exact
     /// program counter without modelling INTCON.
     ///
     /// `fire_interrupt` is called BETWEEN steps, so `pc` addresses an
@@ -474,7 +474,7 @@ pub fn parse_hex_pic18(data: &str) -> Vec<u16> {
 
 /// PIC18F4550 (16-bit-word core) instruction-set simulator. `pc` is a
 /// **byte** address (PIC18's PC natively counts bytes, incrementing by 2
-/// per one-word instruction), unlike `Pic14::pc` which is a word address —
+/// per one-word instruction), unlike `Pic14::pc` which is a word address ,
 /// this matches the real hardware and lets the interrupt vectors
 /// (0x000008/0x000018) and `GOTO`/`CALL`'s encoded targets be used
 /// directly without a unit conversion at every call site.
@@ -485,7 +485,7 @@ pub struct Pic18 {
     pc: u32,
     /// Hardware call stack: up to 31 return byte-addresses. `TOSU`/`TOSH`/
     /// `TOSL`/`STKPTR` (SFRs 0xFFF/0xFFE/0xFFD/0xFFC) are computed views
-    /// over this, not separate storage — mirrors how `Pic14::read_f`
+    /// over this, not separate storage: mirrors how `Pic14::read_f`
     /// special-cases the `PCL` SFR address over the `pc` field instead of
     /// storing it twice.
     stack: Vec<u32>,
@@ -526,7 +526,7 @@ impl Pic18 {
             0x0000 => pc + 2,
             0x0003 => {
                 // SLEEP: matches Pic14's convention (see `Pic14::exec_byte`)
-                // of `halted = true` as the simulator's stop condition —
+                // of `halted = true` as the simulator's stop condition ,
                 // real programs end on this, since `parse_hex_pic18`
                 // returns the full flash-sized buffer (zero-padded NOPs
                 // all the way out), so "ran off the end of `prog`" never
@@ -538,7 +538,7 @@ impl Pic18 {
             0x0004 => pc + 2, // CLRWDT: no observable effect in this simulator
             0x0005 => {
                 // PUSH: pushes PC+2 (the address of the next instruction)
-                // without jumping — same stack effect as CALL, minus the
+                // without jumping: the same stack effect as CALL, minus the
                 // jump.
                 self.push_return(pc + 2);
                 pc + 2
@@ -594,7 +594,7 @@ impl Pic18 {
     /// The byte address just after a skip instruction's own effect where
     /// execution resumes on a SKIP. Real PIC18 hardware skips an extra word
     /// when the instruction being skipped is a two-word form
-    /// (`GOTO`/`CALL`/`LFSR`/`MOVFF`) — `after_pc` is the address right
+    /// (`GOTO`/`CALL`/`LFSR`/`MOVFF`). `after_pc` is the address right
     /// after the skip instruction itself (where the skipped instruction
     /// starts); peek its opcode to decide.
     fn skip_pc(&self, after_pc: u32) -> u32 {
@@ -607,12 +607,12 @@ impl Pic18 {
 
     /// Byte-oriented dispatch: mask off the variable fields and match the
     /// fixed "base" bits directly against the encoding table's hex
-    /// constants — do not recover an opcode via shift-then-narrow-mask
+    /// constants. Do not recover an opcode via shift-then-narrow-mask
     /// arithmetic; the two groups have different-width fixed fields (the
     /// d+a+f group's fixed bits are `word & 0xFC00`, clearing d=bit9/
     /// a=bit8/f=bits7-0; the a+f-only group's fixed bits are
     /// `word & 0xFE00`, clearing only a=bit8/f, because bit9 is part of
-    /// ITS fixed identifier, not a variable field) — a narrower mask
+    /// ITS fixed identifier, not a variable field). A narrower mask
     /// silently collides unrelated opcodes.
     fn exec_byte(&mut self, pc: u32, word: u16) -> u32 {
         let a = (word >> 8) & 1;
@@ -814,7 +814,7 @@ impl Pic18 {
             }
             0x5400 | 0x5800 => {
                 // SUBFWB / SUBWFB: f - W - !C, computed as f + !W + C (the
-                // ALU adder with W inverted — see the plan's note that
+                // ALU adder with W inverted. See the plan's note that
                 // these two mnemonics share this exact computation; no
                 // empirical evidence distinguishes them, so both use it).
                 let fv = self.read_f(a, f);
@@ -914,7 +914,7 @@ impl Pic18 {
     /// `TOSU`/`TOSH`/`TOSL`/`STKPTR` (`0xFFF`/`0xFFE`/`0xFFD`/`0xFFC`) are
     /// real physical SFRs on hardware (not just a simulator convenience),
     /// so `push_return`/`pop_return` keep them in sync in `self.ram` on
-    /// every call — `self.stack` is only the internal push/pop mechanism.
+    /// every call: `self.stack` is only the internal push/pop mechanism.
     fn sync_stack_sfrs(&mut self) {
         self.ram[0xFFC] = self.stack.len() as u8;
         let top = self.stack.last().copied().unwrap_or(0);
@@ -1015,14 +1015,28 @@ impl Pic18 {
     }
 
     fn exec_movff(&mut self, pc: u32, word: u16, word2: u16) -> u32 {
-        let src = (word & 0xFFF) as usize;
-        let dst = (word2 & 0xFFF) as usize;
-        self.ram[dst] = self.ram[src];
+        // MOVFF's two 12-bit operands are already full physical addresses
+        // (see isel-pic18's `operand` doc comment: MOVFF bypasses the `a`
+        // bit and `BSR` entirely and addresses the whole linear data
+        // space directly) -- so they go through `resolve_phys`, not
+        // `resolve_f`. `resolve_f` would re-derive a physical address
+        // from what it assumes is an 8-bit register-file field, which
+        // double-adds `0xF00` for anything already in the SFR page and
+        // is out of range entirely for a banked GPR address above 0x5F.
+        //
+        // Resolve `src` and read its value BEFORE resolving `dst`: a
+        // `POSTINCn`-to-`POSTINCm` copy needs both FSRs to advance exactly
+        // once each, and `resolve_phys` performs the post-increment as a
+        // side effect of resolving the address, not as a separate step.
+        let src = self.resolve_phys((word & 0xFFF) as usize);
+        let val = self.ram[src];
+        let dst = self.resolve_phys((word2 & 0xFFF) as usize);
+        self.ram[dst] = val;
         pc + 4
     }
 
     /// RETFIE also restores GIE/GIEH from the shadow saved on interrupt
-    /// entry — no interrupt-entry modelling exists yet in this plan (P1
+    /// entry. No interrupt-entry modelling exists yet in this plan (P1
     /// has no ISR support requirement), so for now RETFIE behaves like
     /// RETURN. Revisit when interrupt modelling is added for PIC18.
     fn exec_retfie(&mut self) -> u32 {
@@ -1116,11 +1130,11 @@ impl Pic18 {
     /// Indirect addressing registers (`INDFn`/`POSTINCn`/`POSTDECn`/
     /// `PREINCn`/`PLUSWn`) are checked AFTER the physical address above is
     /// resolved, by matching the RESULT against the SFR addresses those
-    /// registers actually live at (`0xFD9-0xFEF`) — never against the raw
+    /// registers actually live at (`0xFD9-0xFEF`), never against the raw
     /// `f` byte in isolation. `f`'s low byte alone is ambiguous: a
     /// `BSR`-banked (`a=1`) ordinary GPR access can have a low byte that
     /// coincidentally equals e.g. `0xE7` (INDF1) while its real physical
-    /// address (`BSR<<8 | f`) lands nowhere near the SFR page — matching on
+    /// address (`BSR<<8 | f`) lands nowhere near the SFR page. Matching on
     /// raw `f` treated every such GPR write as an indirect-register access
     /// instead, corrupting unrelated FSRs and, once `cur`/`W` combined into
     /// a negative `PLUSWn` offset, produced an `i32`-to-`usize` cast so
@@ -1138,6 +1152,27 @@ impl Pic18 {
         } else {
             ((self.ram[0xFE0] as usize) << 8) | f as usize
         };
+        self.resolve_phys(phys)
+    }
+
+    /// Shared back half of indirect-address resolution: given an
+    /// ALREADY-FULLY-FORMED physical address (`resolve_f`'s `phys`, or an
+    /// `exec_movff` operand: MOVFF's 12-bit operands are full physical
+    /// addresses in their own right, with no `a`/`BSR` reconstruction step
+    /// of their own), detect whether it lands on one of the
+    /// `INDFn`/`POSTINCn`/`POSTDECn`/`PREINCn`/`PLUSWn` pseudo-registers
+    /// and, if so, dereference through the `FSRn` it names (applying the
+    /// post-increment/-decrement/pre-increment side effect where
+    /// applicable). Otherwise `phys` is already the answer.
+    ///
+    /// Matching is keyed on `phys & 0xFF` alone, exactly as `resolve_f`
+    /// does, never on a separately-threaded raw register-file byte. For
+    /// the same reason documented above `resolve_f`: a `BSR`-banked GPR
+    /// access can have a low byte that coincidentally equals e.g. `0xE7`
+    /// (INDF1) while its real physical address lands nowhere near the SFR
+    /// page, so only the resolved, guaranteed-in-page `phys` value may be
+    /// used to decide "is this actually an indirect register".
+    fn resolve_phys(&mut self, phys: usize) -> usize {
         if phys < 0xF00 {
             return phys;
         }
@@ -1150,16 +1185,8 @@ impl Pic18 {
         let lo_addr = 0xF00 + fsrn_lo;
         let hi_addr = 0xF00 + fsrn_hi;
         let cur = ((self.ram[hi_addr] as u16) << 8) | self.ram[lo_addr] as u16;
-        // Dispatch on `(phys & 0xFF) as u16`, not the raw `f` byte, for
-        // consistency with the arm-selection `match` just above — the two
-        // are provably equal on every path that reaches here today (the
-        // `phys < 0xF00` return above already filters out any case where
-        // they'd diverge), but matching the same derived value the arm
-        // selection uses keeps that invariant local and structural instead
-        // of a fact this function has to independently stay true to, and
-        // avoids a latent trap if the `phys < 0xF00` gate above is ever
-        // loosened.
-        match (phys & 0xFF) as u16 {
+        let f = (phys & 0xFF) as u16;
+        match f {
             _ if f == indf => cur as usize,
             _ if f == postinc => {
                 let next = cur.wrapping_add(1);

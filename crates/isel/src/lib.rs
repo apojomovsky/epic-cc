@@ -1,4 +1,4 @@
-//! `isel` — instruction selection for the integer spine.
+//! `isel`: instruction selection for the integer spine.
 //!
 //! Scalar surface (milestones 2-6): lowers `load`/`store`, the full binop
 //! set `add`/`sub`/`and`/`or`/`xor` (i8 and i16), `zext`/`sext`/`trunc`,
@@ -12,21 +12,21 @@
 //! Phase-3 pointers/const (M5-M7): `gep` defines a *virtual* pointer
 //! (emits nothing), lowered at each `load`/`store`/`memcpy` use. Every GEP
 //! chain is resolved eagerly to a `(Base, k, terms)` triple: `Base::Global`
-//! (RAM or const-flash), `Base::Slot(name, indirect)` — a byval param copy,
+//! (RAM or const-flash), `Base::Slot(name, indirect)`: a byval param copy,
 //! an alloca, or an sret slot holding a target address (indirect). A
 //! constant offset (no terms) reads/writes the plain file register; dynamic
 //! terms set `FSR` to `base + k + Σ s×%r` (single scale-1 term keeps the M5
 //! `MOVF %r,W; ADDLW base+k; MOVWF FSR` fast path; general sums accumulate
 //! in the fixed scratch byte); an indirect base takes the target address
 //! from the slot's contents. Pointers into const (flash) globals load via
-//! `CALL __read_<name>` — a RETLW table emitted after the functions — and a
+//! `CALL __read_<name>`: a RETLW table emitted after the functions, and a
 //! store through a const base panics (ROM is not writable). `memcpy`
 //! lowers to a byte loop of the same pointer machinery; `alloca` is virtual
 //! like `gep` (the slot is sized by alloc). Static FSR bases reach all four
 //! GPR banks via the IRP bit (M9): every FSR setup emits `BCF/BSF STATUS, 7`
 //! (IRP = base bit 8) first, then loads FSR with `(base + k + off) & 0xFF`.
 //! The FSR-accessed object must fit entirely inside one of the four GPR
-//! windows `[0x20,0x80)` `[0xA0,0xF0)` `[0x120,0x170)` `[0x1A0,0x1F0)` —
+//! windows `[0x20,0x80)` `[0xA0,0xF0)` `[0x120,0x170)` `[0x1A0,0x1F0)`:
 //! crossing an SFR hole would silently mis-address, so it panics loudly at
 //! emission (the object span comes from the global size / param width /
 //! alloca size). An *indirect* (sret) base sets IRP from the stored
@@ -40,72 +40,30 @@
 //! layout) and panics loudly if a value is missing from it.
 
 use device::Device;
-use ir::{BinOp, Gep, GepBase, Inst, MemLen, Module, Ty, Val};
-use iselcore::{ssa_key, Slot};
+use ir::{BinOp, Inst, MemLen, Module, Ty, Val};
+use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 use std::collections::{HashMap, HashSet};
 
-/// The runtime routine names legalize injects for mul/div/rem/shift and the
-/// soft-float set. All thirty-three have recipe bodies (Task 3: the i32
-/// mul/div/rem + shifts; M8: the i8/i16 set; M15: the nine float
-/// routines). An injected routine's entry block holds only a
-/// scratch alloca, so emitting it as-is would produce an empty label that
-/// silently falls through into the next function — a routine name with no
-/// recipe yet must panic loudly instead.
-const ROUTINE_NAMES: [&str; 33] = [
-    "__mul_u8",
-    "__mul_u16",
-    "__mul_u32",
-    "__udiv_u8",
-    "__urem_u8",
-    "__udiv_u16",
-    "__urem_u16",
-    "__udiv_u32",
-    "__urem_u32",
-    "__sdiv_i8",
-    "__srem_i8",
-    "__sdiv_i16",
-    "__srem_i16",
-    "__sdiv_i32",
-    "__srem_i32",
-    "__shl_u8",
-    "__lshr_u8",
-    "__ashr_i8",
-    "__shl_u16",
-    "__lshr_u16",
-    "__ashr_i16",
-    "__shl_u32",
-    "__lshr_u32",
-    "__ashr_i32",
-    // The nine soft-float routines (Milestone 15). The gate is what makes
-    // the M14 fuzz reduce test's loud-panic contract hold: a float program
-    // whose injected routine has no recipe yet must panic loudly, never
-    // emit an empty label that silently falls through.
-    "__add_f32",
-    "__sub_f32",
-    "__mul_f32",
-    "__div_f32",
-    "__cmp_f32",
-    "__uitofp_f32",
-    "__sitofp_f32",
-    "__fptoui_f32",
-    "__fptosi_f32",
-];
-
 /// The recipe a routine function emits, or `None` if the name is not a
-/// runtime routine at all.
+/// runtime routine at all. The name set itself is `ir::is_runtime_routine`,
+/// shared with `alloc` (bank-straddle rounding needs the same list): an
+/// injected routine's entry block holds only a scratch alloca, so emitting
+/// it as-is would produce an empty label that silently falls through into
+/// the next function. A routine name with no recipe yet must panic loudly
+/// instead.
 ///
 /// An interrupt-context copy (`__mul_u8_isr`, legalize's routine
 /// duplication) shares the base routine's recipe but keeps its own name for
-/// its label and — the load-bearing part — its own slots, so the ISR's frame
+/// its label and, the load-bearing part, its own slots, so the ISR's frame
 /// never overlaps the copy main is executing in. A duplicated USER function
 /// (`helper_isr`) strips to `helper`, which is not a routine, so it takes
 /// the ordinary block-emission path.
 fn routine_recipe(name: &str) -> Option<&str> {
     let base = name.strip_suffix("_isr").unwrap_or(name);
-    ROUTINE_NAMES.contains(&base).then_some(base)
+    ir::is_runtime_routine(name).then_some(base)
 }
 
-/// The byte address of a literal-pointer operand (`"0x<K>"` — the
+/// The byte address of a literal-pointer operand (`"0x<K>"`, the
 /// `inttoptr (<ty> <k> to ptr)` constant-pointer form parsed by irparse).
 /// Used for direct (SFR) load/store: the register is bank-mirrored
 /// (0x00-0x1F) or common RAM (0x70-0x7F), so no FSR setup and no BANKSEL.
@@ -117,21 +75,12 @@ fn literal_ptr_addr(ptr: &str) -> u16 {
         .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
 }
 
-/// A resolved GEP base: a named global (`@g`) or a local slot. A slot may
-/// be *indirect* (an sret param): it holds the target address, so FSR is
-/// taken from its contents rather than the slot itself being the base.
-#[derive(Clone, Debug)]
-enum Base {
-    Global(String),
-    Slot(String, bool),
-}
-
 /// The four GPR windows reachable through FSR+IRP: bank 0 `[0x20,0x80)`,
 /// bank 1 `[0xA0,0xF0)`, bank 2 `[0x120,0x170)`, bank 3 `[0x1A0,0x1F0)`
 /// (the common region 0x70-0x7F sits inside the first window). The SFR
 /// holes 0x80-0x9F and 0x170-0x19F are not addressable GPR, so an object
 /// that does not fit entirely inside its base's window would silently
-/// mis-address through INDF — it panics loudly instead.
+/// mis-address through INDF: it panics loudly instead.
 ///
 /// Returns `(irp, base_lo)`: `IRP = bit 8 of the base` (STATUS bit 7) and
 /// `FSR = base & 0xFF` (0x120 -> 0x20, 0x1A0 -> 0xA0).
@@ -167,7 +116,7 @@ struct Gen<'m> {
     addrs: &'m HashMap<String, u16>,
     device: &'m Device,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
-    /// its folded `(base, k, terms)` — GEP chains fully collapsed (base
+    /// its folded `(base, k, terms)`: GEP chains fully collapsed (base
     /// `Reg` replaced by the base's own entry), plus the seeded pointer
     /// bases (byval/sret params and allocas). `gep`/`alloca` themselves
     /// emit nothing; each `load`/`store`/`memcpy` through a pointer reg
@@ -195,13 +144,13 @@ impl<'m> Gen<'m> {
         self.out.push(s.into());
     }
 
-    /// The M11 restore pair — `MOVLW PAGE(<cur_func>); MOVWF PCLATH` — right
+    /// The M11 restore pair: `MOVLW PAGE(<cur_func>); MOVWF PCLATH`, right
     /// after a CALL. Skipped when the called target runs in the current
     /// function's own page: the set already wrote that page and nothing since
     /// changed PCLATH<4:3> (a function callee restores itself; a const
     /// reader leaves `HIGH(<base>)` whose bits 4:3 are the table base's page,
     /// equal to the target's page). In pass A (`page_of` is `None`) the
-    /// pages are not known yet, so the restore is always emitted — pass A's
+    /// pages are not known yet, so the restore is always emitted: pass A's
     /// sizes (with every restore) drive the page assignment, and the
     /// pass-B skip only shrinks functions, which never moves a function off
     /// its assigned page (the `.org` pads pin the page bases).
@@ -255,7 +204,7 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel: no address for @{name}"))
     }
 
-    /// Whether `name` is a const (flash) global — read via RETLW tables.
+    /// Whether `name` is a const (flash) global: read via RETLW tables.
     fn global_is_const(&self, name: &str) -> bool {
         self.m
             .globals
@@ -265,7 +214,7 @@ impl<'m> Gen<'m> {
             .is_const
     }
 
-    /// The byte size of a global — a const table's size selects the reader
+    /// The byte size of a global: a const table's size selects the reader
     /// shape (≤ 255 single entry; ≥ 256 two chunked entries, chunk 1 empty
     /// for exactly 256 bytes).
     fn global_size(&self, name: &str) -> u16 {
@@ -279,7 +228,7 @@ impl<'m> Gen<'m> {
 
     /// The byte width of an SSA value reg in the current function, from its
     /// defining param or instruction. Used to verify the large-table GEP
-    /// index is the 16-bit reg clang zexts — reading the hi slot of a
+    /// index is the 16-bit reg clang zexts: reading the hi slot of a
     /// 1-byte index would silently touch a neighbour's slot.
     fn reg_bytes(&self, name: &str) -> u8 {
         let f = self
@@ -317,20 +266,21 @@ impl<'m> Gen<'m> {
         panic!("isel: no definition of %{name} in {}", self.cur_func);
     }
 
-    /// The byte span of a resolved FSR base — the whole object a pointer
+    /// The byte span of a resolved FSR base: the whole object a pointer
     /// into it can legally touch (the runtime terms are bounded by span−1).
     /// `Base::Global` spans its `Global.size`; `Base::Slot` spans the byval
     /// param's `width` or the alloca's `size` in the current function. A
     /// missing object panics loudly.
     fn object_span(&self, base: &Base) -> u16 {
         match base {
-            Base::Global(name) => self
-                .m
-                .globals
-                .iter()
-                .find(|g| g.name == *name)
-                .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
-                .size as u16,
+            Base::Global(name) => {
+                self.m
+                    .globals
+                    .iter()
+                    .find(|g| g.name == *name)
+                    .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
+                    .size as u16
+            }
             Base::Slot(sname, _) => {
                 let f = self
                     .m
@@ -338,7 +288,10 @@ impl<'m> Gen<'m> {
                     .iter()
                     .find(|f| f.name == self.cur_func)
                     .unwrap_or_else(|| {
-                        panic!("isel: no span for slot {sname}: unknown function {}", self.cur_func)
+                        panic!(
+                            "isel: no span for slot {sname}: unknown function {}",
+                            self.cur_func
+                        )
                     });
                 if let Some(p) = f.params.iter().find(|p| p.name == *sname) {
                     p.width as u16
@@ -357,7 +310,7 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// The resolved `(base, k, terms)` for a pointer reg `%r` — a GEP dst,
+    /// The resolved `(base, k, terms)` for a pointer reg `%r`: a GEP dst,
     /// or a seeded byval/sret param / alloca. Anything else is a missing
     /// pointer and panics loudly.
     fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
@@ -392,7 +345,7 @@ impl<'m> Gen<'m> {
                         );
                         if terms.is_empty() {
                             // Constant offset only: the address is statically
-                            // known — a plain file-register access, no FSR.
+                            // known, a plain file-register access, no FSR.
                             Addr::Direct(
                                 self.global_addr(name) + u16::from(k) + u16::from(byte_off),
                             )
@@ -421,11 +374,11 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `W = RAM[ptr + byte_off]` — one byte of a pointer load or a memcpy
+    /// `W = RAM[ptr + byte_off]`: one byte of a pointer load or a memcpy
     /// source. Direct bases read the plain file register; dynamic bases set
     /// FSR first and read INDF; a const (flash) base reads via
     /// `CALL __read_<name>` (the RETLW table leaves the byte in W). A table
-    /// larger than 255 bytes takes the 16-bit index path — the caller
+    /// larger than 255 bytes takes the 16-bit index path: the caller
     /// splits the index into an in-chunk byte (W) and the chunk bit, then
     /// CALLs `__read_<name>` (chunk 0) or `__read_<name>_hi` (chunk 1).
     fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
@@ -487,7 +440,7 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `RAM[ptr + byte_off] = W` — the store side of a byte access (memcpy
+    /// `RAM[ptr + byte_off] = W`: the store side of a byte access (memcpy
     /// destinations; `emit_ptr_store_byte` composes a val load before it).
     fn emit_ptr_store_w(&mut self, ptr: &Val, byte_off: u8) {
         match self.emit_ptr_setup(ptr, byte_off) {
@@ -498,7 +451,7 @@ impl<'m> Gen<'m> {
 
     /// `RAM[ptr + byte_off] = byte byte_off of val`.
     fn emit_ptr_store_byte(&mut self, ptr: &Val, byte_off: u8, val: &Val) {
-        // The address setup comes first — its FSR/scratch computation
+        // The address setup comes first: its FSR/scratch computation
         // clobbers W, so the value is loaded only after FSR is final.
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => {
@@ -515,9 +468,9 @@ impl<'m> Gen<'m> {
     /// Runtime-length memcpy (issue #4): `len` is a 16-bit SSA register,
     /// SSA-dead after this copy, so the copy may consume it. The loop
     /// copies one byte per iteration; EVERY byte of the loop state lives
-    /// in fixed common RAM — countdown 0x71/0x72 (the retval bytes, dead
+    /// in fixed common RAM: countdown 0x71/0x72 (the retval bytes, dead
     /// at a memcpy), byte index 0x7E (the documented free byte), held byte
-    /// 0x7F — so the banking pass can never insert a BANKSEL inside the
+    /// 0x7F, so the banking pass can never insert a BANKSEL inside the
     /// loop and the skip-sensitive test/branch pairs keep their targets:
     ///
     ///   count = len                          ; 0x71 = lo, 0x72 = hi
@@ -532,27 +485,27 @@ impl<'m> Gen<'m> {
     ///   l_done:
     ///
     /// The 16-bit countdown decrements the lo byte with `MOVLW 1; SUBWF
-    /// 0x71,F` — C = 0 exactly when lo wrapped (was 0), and the `BTFSS
+    /// 0x71,F`: C = 0 exactly when lo wrapped (was 0), and the `BTFSS
     /// STATUS,0` skips the hi byte's decrement on no-borrow, so hi
     /// decrements once per lo wrap: exact for any length. The zero test at
     /// the top (`MOVF 0x71,W; IORWF 0x72,W; BTFSC STATUS,2`) skips an
     /// empty copy.
-    /// The FSR setups read the pointer's term registers (any bank — those
+    /// The FSR setups read the pointer's term registers (any bank, those
     /// reads are not inside a skip pair), and the source/dest bases are
     /// window-checked per byte by `emit_fsr_to` (span <= 0x60), so a valid
     /// program's `idx` never leaves the window. Copying a const (flash)
     /// source at a runtime length panics loudly (the byte-at-a-time flash
     /// reader needs the index in W, which the loop's FSR discipline does
-    /// not provide — the constant-length path covers flash sources).
+    /// not provide: the constant-length path covers flash sources).
     fn emit_memcpy_dynamic(&mut self, dst: &Val, src: &Val, len: &Val) {
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
-        let cnt_lo: u16 = self.retval_lo; // 0x71 — dead at a memcpy
+        let cnt_lo: u16 = self.retval_lo; // 0x71, dead at a memcpy
         let cnt_hi: u16 = self.retval_lo + 1; // 0x72
         let idx: u16 = 0x7E; // documented free common byte
         let hold: u16 = 0x7F; // documented free common byte
-        // FSR = base + k + terms + idx for one byte of a pointer; the FSR
-        // must be re-set per byte (one FSR on classic mid-range).
+                              // FSR = base + k + terms + idx for one byte of a pointer; the FSR
+                              // must be re-set per byte (one FSR on classic mid-range).
         let emit_byte_fsr = |g: &mut Self, ptr: &Val| {
             let (base, k, terms) = match ptr {
                 Val::Reg(r) => g.resolved_for(r),
@@ -584,7 +537,7 @@ impl<'m> Gen<'m> {
             g.emit(format!("    MOVF 0x{idx:02X}, W"));
             g.emit("    ADDWF FSR, F".to_string());
         };
-        // Length source slot (the SSA reg's own bytes — read once).
+        // Length source slot (the SSA reg's own bytes, read once).
         let la = self.val_addr(len).direct();
         // countdown = len.
         self.emit(format!("    MOVF 0x{la:02X}, W"));
@@ -611,10 +564,10 @@ impl<'m> Gen<'m> {
         // idx++.
         self.emit(format!("    INCF 0x{idx:02X}, F"));
         // countdown-- (16-bit): `MOVLW 1; SUBWF lo,F` sets C = 1 when lo
-        // was >= 1 (no borrow) and 0 when lo was 0 (borrow — lo wrapped to
+        // was >= 1 (no borrow) and 0 when lo was 0 (borrow, lo wrapped to
         // 0xFF). BTFSS skips the hi-byte decrement exactly when there is
         // no borrow, so the hi byte decrements once per wrap. (The encoder
-        // has no plain DECF — only DECFSZ.) Both SUBWF targets are common
+        // has no plain DECF, only DECFSZ.) Both SUBWF targets are common
         // RAM, so no BANKSEL can land inside this skip pair.
         self.emit("    MOVLW 0x01".to_string());
         self.emit(format!("    SUBWF 0x{cnt_lo:02X}, F"));
@@ -628,14 +581,21 @@ impl<'m> Gen<'m> {
     /// `span` bytes at `base_addr`. The window check runs first: the whole
     /// object must fit inside its base's GPR window (an unrepresentable
     /// cross-hole address would silently mis-address through INDF, so it
-    /// panics loudly). IRP is then set on EVERY FSR setup — a prior
+    /// panics loudly). IRP is then set on EVERY FSR setup: a prior
     /// bank-2/3 access leaves STATUS bit 7 = 1, so skipping the set on a
     /// bank-0/1 base would mis-address into bank 2/3. A single scale-1
     /// term keeps the M5 fast shape (`MOVF %r,W; ADDLW lit; MOVWF FSR`);
     /// general sums accumulate in the fixed scratch byte first. The ADDLW
-    /// literal is `(base_addr + k + byte_off) & 0xFF` — FSR holds the low
+    /// literal is `(base_addr + k + byte_off) & 0xFF`: FSR holds the low
     /// byte; IRP carries bit 8.
-    fn emit_fsr_to(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8, span: u16) {
+    fn emit_fsr_to(
+        &mut self,
+        base_addr: u16,
+        k: u8,
+        terms: &[(u8, String)],
+        byte_off: u8,
+        span: u16,
+    ) {
         let (irp, base_lo) = fsr_window(base_addr, span);
         let lit = (u16::from(base_lo) + u16::from(k) + u16::from(byte_off)) & 0xFF;
         self.emit(if irp {
@@ -663,7 +623,7 @@ impl<'m> Gen<'m> {
     /// The slot holds the target address (the caller stores LOW then HIGH
     /// of it into the two slot bytes), so IRP is set from the stored HIGH
     /// byte BEFORE the FSR computation: bit 0 of `<slot+1>` is the
-    /// address's bit 8 — 1 -> IRP=1 (banks 2/3), 0 -> IRP=0 (banks 0/1).
+    /// address's bit 8; 1 -> IRP=1 (banks 2/3), 0 -> IRP=0 (banks 0/1).
     /// Exactly one of the pair fires: BTFSC skips the BSF when the bit is
     /// 0, BTFSS skips the BCF when it is 1, so IRP always matches the
     /// stored address. IRP is set on EVERY indirect FSR setup (a prior
@@ -696,7 +656,7 @@ impl<'m> Gen<'m> {
     /// `scratch = Σ scale×%reg`: W = 0, then per term
     /// `MOVF %r,W; ADDWF scratch,W; MOVWF scratch` repeated `scale` times.
     /// ADDWF f,W computes W = f + W, so W holds %r only until the first
-    /// ADDWF — it MUST be reloaded before each repetition or a scaled term
+    /// ADDWF: it MUST be reloaded before each repetition or a scaled term
     /// accumulates 2×scratch + %r (silent wrong-address miscompile).
     fn emit_accum_terms(&mut self, terms: &[(u8, String)]) {
         self.emit("    MOVLW 0x00".to_string());
@@ -711,13 +671,16 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `W = k + byte_off + Σ scale×%reg` — the byte index into a const
+    /// `W = k + byte_off + Σ scale×%reg`: the byte index into a const
     /// (flash) table before `CALL __read_<name>`. A single scale-1 term
     /// keeps the M5 `MOVF %r,W` shape (ADDLW only when k + off is nonzero);
     /// general sums accumulate in scratch.
     fn emit_ptr_index_w(&mut self, k: u8, terms: &[(u8, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
-        assert!(kk <= 0xFF, "isel: const index k {k} + off {byte_off} out of byte range");
+        assert!(
+            kk <= 0xFF,
+            "isel: const index k {k} + off {byte_off} out of byte range"
+        );
         match terms {
             [] => self.emit(format!("    MOVLW 0x{kk:02X}")),
             [(1, r)] => {
@@ -738,7 +701,7 @@ impl<'m> Gen<'m> {
     /// Large const table (> 255 bytes) read. The 16-bit GEP index splits
     /// into the in-chunk index (W) and the chunk number (hi temp, fixed
     /// scratch 0x70). For up to two chunks the chunk number is a single bit
-    /// tested with `BTFSC 0x70,0` — the exact M10/M13 sequences, kept
+    /// tested with `BTFSC 0x70,0`, the exact M10/M13 sequences, kept
     /// byte-identical so the committed fixtures hold (a 256-byte table
     /// emits an empty, unreachable chunk 1 the same way). For 3+ chunks
     /// (issue #8) the hi temp is the full chunk number and a descending
@@ -746,7 +709,7 @@ impl<'m> Gen<'m> {
     /// scratch,W` sets C iff scratch >= c, so testing c = n-1 down to 1 in
     /// that order branches to the matching entry and falls through to
     /// chunk 0. W is the in-chunk index; the reader CALL's PCLATH set
-    /// clobbers W, reloaded from the lo temp (0x71, retval_lo — no live
+    /// clobbers W, reloaded from the lo temp (0x71, retval_lo, no live
     /// retval at a const read); the returned byte is parked in the hi temp
     /// (0x70, dead after the chunk tests) across the restore. The reads
     /// leave the byte in W, exactly like the small-table path. Const-only
@@ -760,8 +723,8 @@ impl<'m> Gen<'m> {
         let size = self.global_size(name) as usize;
         let chunks = (size + 255) / 256; // 256-byte tables: 1 (empty chunk 1)
         let disp = chunks.max(2); // dispatch shape: bit-0 test or >= c chain
-        // The reader entry for chunk c: `__read_<name>`, `__read_<name>_hi`,
-        // `__read_<name>_hi{c}` — matching the table emitter.
+                                  // The reader entry for chunk c: `__read_<name>`, `__read_<name>_hi`,
+                                  // `__read_<name>_hi{c}`, matching the table emitter.
         let entry = |c: usize| {
             if c == 0 {
                 format!("__read_{name}")
@@ -772,7 +735,7 @@ impl<'m> Gen<'m> {
             }
         };
         // `CALL __read_...; MOVWF <hi temp>; restore; MOVF <hi temp>,W;
-        // GOTO l_done` — W holds the in-chunk index (the PCLATH set's
+        // GOTO l_done`: W holds the in-chunk index (the PCLATH set's
         // MOVLW clobbers it, reloaded from the lo temp); the returned byte
         // survives the restore via the hi temp.
         let mut chunk_call = |g: &mut Self, c: usize, l_done: &str| {
@@ -852,10 +815,10 @@ impl<'m> Gen<'m> {
                 self.emit(format!("{l_done}:"));
             }
             [(scale, r)] => {
-                // Multi-byte elements (i16/f32 scale 2, i32/f32 scale 4 —
+                // Multi-byte elements (i16/f32 scale 2, i32/f32 scale 4,
                 // classic mid-range has no MULLW): byte index = s×idx + k +
                 // off. For a 2-chunk table (idx_hi == 0 in bounds) the lo
-                // byte is shifted and the carry folded — the exact M13
+                // byte is shifted and the carry folded, the exact M13
                 // sequence. For 3+ chunks the hi byte participates: the
                 // shift pair accumulated `s*idx_lo >> 8` into the hi temp,
                 // then `s*idx_hi` is added (in bounds
@@ -886,7 +849,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    RLF 0x{:02X}, F", self.scratch));
                 }
                 if chunks >= 3 {
-                    // scratch += s*idx_hi (scale ADDWF of idx_hi — one per
+                    // scratch += s*idx_hi (scale ADDWF of idx_hi, one per
                     // element byte of the scale, e.g. 2 adds for i16).
                     self.emit(format!("    MOVF 0x{:02X}, W", a_lo + 1));
                     for _ in 0..*scale {
@@ -1001,13 +964,17 @@ impl<'m> Gen<'m> {
 
     /// W = byte `i` of `v`, with the sign bit complemented (XOR 0x80) when
     /// `signed` and `i` is the high (sign) byte. Complementing the sign bit
-    /// maps signed order onto unsigned order — signed(a >= b) ==
-    /// unsigned((a ^ 0x80) >= (b ^ 0x80)) — so one flag recipe serves both.
+    /// maps signed order onto unsigned order: signed(a >= b) ==
+    /// unsigned((a ^ 0x80) >= (b ^ 0x80)), so one flag recipe serves both.
     fn emit_load_cmp_byte(&mut self, v: &Val, i: u8, signed: bool, high: u8) {
         match v {
             Val::Const(k) => {
                 let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-                let b = if signed && i == high { byte ^ 0x80 } else { byte };
+                let b = if signed && i == high {
+                    byte ^ 0x80
+                } else {
+                    byte
+                };
                 self.emit(format!("    MOVLW 0x{b:02X}"));
             }
             _ => {
@@ -1022,7 +989,7 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Set C = (a >= b) — unsigned or signed (sign-bit complement). For i8
+    /// Set C = (a >= b), unsigned or signed (sign-bit complement). For i8
     /// the SUBWF/SUBLW also leaves Z = (a == b); for i16/i32 the borrow
     /// chain's final Z is only a byte-level flag, so predicates needing
     /// equality append `emit_cmp_eq` (which preserves C). Every multi-byte
@@ -1080,7 +1047,11 @@ impl<'m> Gen<'m> {
                 self.emit_load_cmp_byte(b, 0, signed, high);
                 self.emit(format!(
                     "    SUBWF 0x{:02X}, W",
-                    if use_scratch && n == 1 { self.scratch } else { aa }
+                    if use_scratch && n == 1 {
+                        self.scratch
+                    } else {
+                        aa
+                    }
                 ));
                 for i in 1..n {
                     self.emit_load_cmp_byte(b, i, signed, high);
@@ -1102,14 +1073,14 @@ impl<'m> Gen<'m> {
     /// load-bearing, and the naive `ADDLW 1` fold corrupts the
     /// borrow-out exactly when the folded subtrahend wraps (b_i = 0xFF +
     /// borrow-in = 0x100): the SUBWF then sees W = 0 and leaves
-    /// C = (a_i >= 0) = 1 — a false "no borrow" that mis-compares every
+    /// C = (a_i >= 0) = 1: a false "no borrow" that mis-compares every
     /// higher byte. Folding via INCFSZ's skip keeps C = borrow-in, the true
     /// borrow-out, and the skipped SUBWF's garbage W result is discarded
     /// (a cmp leaves only flags; a and b are never written, so INCFSZ can
     /// fold directly on the operand byte). The signed sign-complement
     /// applies to the HIGH byte only: the a-side is XORed 0x80 into the
     /// scratch (the SUBWF file operand), and the b-side is complemented
-    /// into the 0x71 temp and folded *complemented* via INCFSZ's skip —
+    /// into the 0x71 temp and folded *complemented* via INCFSZ's skip:
     /// the complemented fold wraps at b_hi ^ 0x80 = 0xFF (b_hi = 0x7F +
     /// borrow), where the skip keeps C = borrow-in = 0, the true
     /// borrow-out. A fold on the uncomplemented byte would repair only the
@@ -1124,7 +1095,7 @@ impl<'m> Gen<'m> {
             if signed && i == high {
                 // Both sides are complemented at the high byte. The b-side
                 // is folded COMPLEMENTED via INCFSZ's skip (0x71 as a
-                // second temp — no live retval during a compare), because
+                // second temp, no live retval during a compare), because
                 // the complemented fold wraps at b_hi ^ 0x80 = 0xFF
                 // (b_hi = 0x7F + borrow): the skip keeps C = borrow-in = 0,
                 // the true borrow-out. A fold on the *uncomplemented* byte
@@ -1177,7 +1148,7 @@ impl<'m> Gen<'m> {
     /// byte. Same wrap-correct folds as `emit_cmp_c_file_lhs_wide`; the
     /// signed high byte's literal is pre-complemented (folded into the
     /// SUBLW operand) and the b-side is complemented into the 0x71 temp and
-    /// folded COMPLEMENTED via INCFSZ's skip — the complemented fold
+    /// folded COMPLEMENTED via INCFSZ's skip: the complemented fold
     /// wraps at b_hi ^ 0x80 = 0xFF (b_hi = 0x7F + borrow), where the
     /// skip keeps C = borrow-in, the true borrow-out.
     fn emit_cmp_c_const_lhs_wide(&mut self, k: &i64, b: &Val, n: u8, high: u8, signed: bool) {
@@ -1190,7 +1161,7 @@ impl<'m> Gen<'m> {
             if signed && i == high {
                 // b is a reg/global here: complement it, stash in the 0x71
                 // temp, and fold COMPLEMENTED via INCFSZ's skip (see
-                // emit_cmp_c_file_lhs_wide — the complemented fold wraps at
+                // emit_cmp_c_file_lhs_wide: the complemented fold wraps at
                 // b_hi = 0x7F + borrow, where the skip keeps the true
                 // borrow-out).
                 let addr = self.val_addr(b).direct() + u16::from(high);
@@ -1371,7 +1342,7 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = a - b` for i8: the subtrahend (reg or const) goes in W and SUBWF
-    /// subtracts it from the minuend — SUBWF f,W always computes f - W, so
+    /// subtracts it from the minuend: SUBWF f,W always computes f - W, so
     /// `a` is the file operand. A const LHS is rejected by the caller (sub
     /// is not commutative).
     fn emit_sub8(&mut self, a: &Val, b: &Val, dst: u16) {
@@ -1396,13 +1367,13 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = k - a` (const LHS) for `bytes`-wide values. Byte 0 uses SUBLW
-    /// (W = k - W, C exact — no borrow-in). Each higher byte folds the
+    /// (W = k - W, C exact, no borrow-in). Each higher byte folds the
     /// borrow with the wrap-correct INCFSZ idiom (ported from the i32
     /// chains, issue #1): the minuend byte `k_i` is preloaded into the
     /// destination, the subtrahend byte `a_i` is copied to the scratch, and
     /// `SUBWF dst_i, F` computes `k_i - (a_i + borrow)` in place. When the
     /// fold wraps (a_i = 0xFF + borrow-in = 0x100) the INCFSZ skip leaves
-    /// the destination at `k_i` — the correct mod-256 result — with C =
+    /// the destination at `k_i`, the correct mod-256 result, with C =
     /// borrow-in, the true borrow-out. The naive `ADDLW 1` fold this
     /// replaces corrupted the borrow-out at the wrap (W = 0x00, C = 1), so
     /// every higher byte mis-subtracted.
@@ -1427,7 +1398,7 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = a - b` for i16: low byte SUBWF, then the high byte with the
-    /// borrow from the low byte folded in — if C is clear (borrow), ADDLW 1
+    /// borrow from the low byte folded in: if C is clear (borrow), ADDLW 1
     /// bumps the subtrahend byte before the high SUBWF.
     fn emit_sub16(&mut self, a: &Val, b: &Val, dst: u16) {
         let aa = self.val_addr(a).direct();
@@ -1464,7 +1435,7 @@ impl<'m> Gen<'m> {
     /// addend and accumulates into the destination in place. The fold uses
     /// INCFSZ's skip rather than the i16 chain's `ADDLW 1`: when the fold
     /// wraps (b_i = 0xFF + carry-in = 0x100) the skip leaves the
-    /// destination at `a_i` — the correct mod-256 result — with C =
+    /// destination at `a_i`, the correct mod-256 result, with C =
     /// carry-in, the true carry-out. The i16 fold's C would be corrupted at
     /// an intermediate byte (`SUBWF`-style re-derivation gives
     /// C = (a_i >= 0) = 1 there), silently mis-adding every higher byte.
@@ -1520,7 +1491,7 @@ impl<'m> Gen<'m> {
     /// of the subtrahend and subtracts from the destination in place. The
     /// fold uses INCFSZ's skip rather than the i16 chain's `ADDLW 1`: when
     /// the fold wraps (b_i = 0xFF + borrow-in = 0x100) the skip leaves the
-    /// destination at `a_i` — the correct mod-256 result — with C =
+    /// destination at `a_i`, the correct mod-256 result, with C =
     /// borrow-in = 0, the true borrow-out. The i16 fold's C would be
     /// corrupted at an intermediate byte (C = (a_i >= 0) = 1), silently
     /// mis-subtracting every higher byte.
@@ -1567,9 +1538,15 @@ impl<'m> Gen<'m> {
 
     /// `dst = call func(args)`: copy each arg into the callee's
     /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
-    /// (`retval_lo` .. `retval_lo + bytes - 1` — 0x71-0x74 for i32) into
+    /// (`retval_lo` .. `retval_lo + bytes - 1`, 0x71-0x74 for i32) into
     /// `dst`. Void calls skip the retval copy. Mirrors spike emit_call.
-    fn emit_call(&mut self, dst: &Option<String>, ty: Option<Ty>, func: &str, args: &[ir::CallArg]) {
+    fn emit_call(
+        &mut self,
+        dst: &Option<String>,
+        ty: Option<Ty>,
+        func: &str,
+        args: &[ir::CallArg],
+    ) {
         let callee = self
             .m
             .funcs
@@ -1581,12 +1558,14 @@ impl<'m> Gen<'m> {
             let pa = self.slot_addr(func, pname).direct();
             if let Some(size) = arg.byval {
                 // byval: copy `size` bytes from the arg's pointer (global /
-                // alloca slot / GEP reg) into the callee's param slot — the
+                // alloca slot / GEP reg) into the callee's param slot: the
                 // param slot IS the callee's struct copy (Slot(name, false)),
                 // byte by byte through the shared pointer machinery.
                 assert_eq!(
                     size,
-                    callee.params[i].byval.expect("isel: byval arg for a non-byval param"),
+                    callee.params[i]
+                        .byval
+                        .expect("isel: byval arg for a non-byval param"),
                     "isel: byval size mismatch for arg {i} of @{func}"
                 );
                 for b in 0..size {
@@ -1597,14 +1576,11 @@ impl<'m> Gen<'m> {
                 // sret: store the target address into the callee's sret param
                 // slot (2 bytes). The target is a global or a plain alloca
                 // slot; the callee reaches it through FSR+IRP, so the target
-                // object must fit entirely inside one GPR window — a span
+                // object must fit entirely inside one GPR window: a span
                 // crossing an SFR hole would silently mis-address (the same
                 // loud rule as static FSR bases). The MOVLW LOW/HIGH store
                 // emits both address bytes unchanged.
-                assert!(
-                    callee.params[i].sret,
-                    "isel: sret arg for a non-sret param"
-                );
+                assert!(callee.params[i].sret, "isel: sret arg for a non-sret param");
                 let (addr, span) = match &arg.val {
                     Val::Global(g) => (
                         self.global_addr(g),
@@ -1618,7 +1594,9 @@ impl<'m> Gen<'m> {
                         );
                         let addr = match &base {
                             Base::Global(name) => self.global_addr(name),
-                            Base::Slot(sname, false) => self.slot_addr(self.cur_func, sname).direct(),
+                            Base::Slot(sname, false) => {
+                                self.slot_addr(self.cur_func, sname).direct()
+                            }
                             Base::Slot(_, true) => {
                                 panic!("isel: sret target cannot be an indirect (sret) slot")
                             }
@@ -1639,7 +1617,7 @@ impl<'m> Gen<'m> {
                 self.emit_move_val_to_slot(&arg.val, aty, pa);
                 // M15 conversion ABI: the four conversion routines take
                 // their value in a fixed 4-byte `val` slot, but i8/i16
-                // sources are copied by their own width — the leftover
+                // sources are copied by their own width: the leftover
                 // high bytes are STALE and corrupt the recipe's leading-1
                 // search / sign logic (an i16 `sitofp` reading leftover
                 // high bytes produced exp 157 instead of 130 in the M15
@@ -1649,8 +1627,7 @@ impl<'m> Gen<'m> {
                 // __uitofp_f32 zero-extends.
                 if aty.bytes() < callee.params[i].width {
                     assert_eq!(
-                        callee.params[i].width,
-                        4,
+                        callee.params[i].width, 4,
                         "isel: narrow scalar arg {i} of @{func} into a non-4-byte param"
                     );
                     let aw = aty.bytes() as u16;
@@ -1668,8 +1645,7 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVWF 0x{:02X}", pa + 3));
                             } else {
                                 assert_eq!(
-                                    aw,
-                                    1,
+                                    aw, 1,
                                     "isel: unexpected narrow source width for @{func}"
                                 );
                                 self.emit("    MOVLW 0x00".to_string());
@@ -1688,7 +1664,7 @@ impl<'m> Gen<'m> {
         // M11 PCLATH discipline: every CALL runs with PCLATH<4:3> = the
         // target's page. The set's MOVLW clobbers W, so it must come AFTER
         // the last arg copy (which uses W) and immediately before the CALL;
-        // the caller's own page is restored right after — unless the target
+        // the caller's own page is restored right after, unless the target
         // is in the caller's own page, where the restore is skipped (PCLATH
         // still holds the caller's page after the call, so its
         // intra-function GOTOs keep branching in its page).
@@ -1702,7 +1678,10 @@ impl<'m> Gen<'m> {
             // i32) into dst.
             let da = self.slot_addr(self.cur_func, d).direct();
             for i in 0..t.bytes() {
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo + u16::from(i)));
+                self.emit(format!(
+                    "    MOVF 0x{:02X}, W",
+                    self.retval_lo + u16::from(i)
+                ));
                 self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
             }
         }
@@ -1722,7 +1701,7 @@ impl<'m> Gen<'m> {
                 } else if l.ptr.starts_with("0x") {
                     // A literal (SFR) pointer from `inttoptr`: the register
                     // is bank-mirrored (SFR 0x00-0x1F) or common RAM
-                    // (0x70-0x7F) — a direct MOVF with no FSR setup and no
+                    // (0x70-0x7F): a direct MOVF with no FSR setup and no
                     // BANKSEL. (A literal into a GPR window keeps the plain
                     // direct access too; the banking pass handles it.)
                     let base = literal_ptr_addr(&l.ptr);
@@ -1732,7 +1711,7 @@ impl<'m> Gen<'m> {
                     }
                 } else {
                     // A GEP-created pointer: const (flash) bases take the
-                    // RETLW path (each byte a table read — multi-byte loads
+                    // RETLW path (each byte a table read, multi-byte loads
                     // loop over the bytes); RAM bases go through the shared
                     // byte machinery (direct or FSR/INDF).
                     let r = l.ptr.strip_prefix('%').unwrap_or_else(|| {
@@ -1751,7 +1730,7 @@ impl<'m> Gen<'m> {
                     let dst = self.global_addr(g);
                     self.emit_move_val_to_slot(&s.val, s.ty, dst);
                 } else if s.ptr.starts_with("0x") {
-                    // A literal (SFR) pointer from `inttoptr` — a direct
+                    // A literal (SFR) pointer from `inttoptr`: a direct
                     // MOVWF, no FSR setup, no BANKSEL (bank-mirrored SFR or
                     // common RAM).
                     let base = literal_ptr_addr(&s.ptr);
@@ -1839,7 +1818,7 @@ impl<'m> Gen<'m> {
                     (BinOp::Xor, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
                     (BinOp::Xor, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
                     // sub is NOT commutative: a const LHS (d = k - a) cannot
-                    // reuse the reg-const lowering (which computes a - k) —
+                    // reuse the reg-const lowering (which computes a - k):
                     // SUBLW k computes k - W, so the const-LHS path mirrors
                     // the reg-const borrow chain with the roles swapped
                     // (found by the fuzz corpus; a generated `k - a` shape).
@@ -1866,7 +1845,7 @@ impl<'m> Gen<'m> {
                     }
                     // Milestone-8 binops: legalize rewrites every mul/div/rem
                     // into a runtime routine call, so these ops reach isel only
-                    // via hand-written IR. Panic loudly — the invariant that a
+                    // via hand-written IR. Panic loudly: the invariant that a
                     // legalize miss never silently miscompiles.
                     (BinOp::Mul, _) => panic!("isel: mul reached isel; legalize must rewrite it to a routine call"),
                     (BinOp::UDiv, _) => panic!("isel: udiv reached isel; legalize must rewrite it to a routine call"),
@@ -1876,8 +1855,8 @@ impl<'m> Gen<'m> {
                     // Milestone-8 shifts: a const count inlines as a fixed
                     // RLF/RRF sequence; k == 0 is a plain copy; k >= width
                     // is LLVM poison and panics loudly. A variable (reg)
-                    // count must never reach isel — legalize rewrites it to
-                    // the routine call — so one arriving here is a legalize
+                    // count must never reach isel: legalize rewrites it to
+                    // the routine call, so one arriving here is a legalize
                     // regression and panics loudly too.
                     (BinOp::Shl, _) | (BinOp::LShr, _) | (BinOp::AShr, _) => {
                         let width = b.ty.bytes() as i64 * 8;
@@ -2128,7 +2107,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Copy `bytes` bytes from a routine slot into the fixed retval slots
-    /// (0x71-0x74) — `emit_call` on the caller side reads them after CALL.
+    /// (0x71-0x74): `emit_call` on the caller side reads them after CALL.
     fn store_retval(&mut self, src: u16, bytes: u8) {
         for i in 0..bytes {
             self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(i)));
@@ -2161,7 +2140,7 @@ impl<'m> Gen<'m> {
     /// One 16-iteration chunk of the 32-iteration `__mul_u32` AN526 loop:
     /// test `bk`'s LSB, add `t` to `r` across all 4 bytes (the incfsz
     /// carry idiom), shift `t` left with wraparound (the shifted-out high
-    /// bits are discarded — i32 `mul` wraps), shift `bk` right, count 16.
+    /// bits are discarded, i32 `mul` wraps), shift `bk` right, count 16.
     fn emit_mul32_loop(
         &mut self,
         l_loop: String,
@@ -2202,7 +2181,7 @@ impl<'m> Gen<'m> {
     /// subtract/restore chains read, `cnt`@8 counts 32 iterations. The
     /// full-width remainder never carries out of its 4 bytes for a 32/32
     /// divide (rem <= 2^k - 1 before the k-th shift), so the plain 4-byte
-    /// borrow chain is exact — no extended-bit special case. C after the
+    /// borrow chain is exact: no extended-bit special case. C after the
     /// last SUBWF is 1 iff rem >= den (the quotient-bit discriminator).
     fn emit_divmod32(&mut self, num: u16, scr: u16) {
         let (rem0, den0, cnt) = (scr, scr + 4, scr + 8);
@@ -2261,9 +2240,9 @@ impl<'m> Gen<'m> {
     /// shift-subtract). Args arrive in the routine's `{func}::{param}` slots
     /// (copied by `emit_call`), the result goes to the fixed retval slots,
     /// and working state lives in `{func}::__scr` at the layout-contract
-    /// offsets. Plain addresses only — the banking pass inserts BANKSELs.
+    /// offsets. Plain addresses only: the banking pass inserts BANKSELs.
     /// Div-by-zero is LLVM poison: the loop runs (den = 0 ⇒ deterministic
-    /// but arbitrary (poison)), any value is legal — no guard, documented. The nine
+    /// but arbitrary (poison)), any value is legal: no guard, documented. The nine
     /// shift routines (variable count) share `emit_shift_body`.
     fn emit_routine(&mut self) {
         // `name` addresses this function's OWN slots and label (an `_isr`
@@ -2276,9 +2255,8 @@ impl<'m> Gen<'m> {
         match recipe {
             // Variable-count shifts: mask the count to width-1, bounded
             // loop over the val param slot (see emit_shift_body).
-            "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16"
-            | "__lshr_u16" | "__ashr_i16" | "__shl_u32" | "__lshr_u32"
-            | "__ashr_i32" => {
+            "__shl_u8" | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
+            | "__shl_u32" | "__lshr_u32" | "__ashr_i32" => {
                 let (bytes, op) = match recipe {
                     "__shl_u8" => (1, BinOp::Shl),
                     "__shl_u16" => (2, BinOp::Shl),
@@ -2488,7 +2466,7 @@ impl<'m> Gen<'m> {
                 self.emit("    RETURN".to_string());
             }
             // Signed 8-bit wrappers: abs both operands in place in the param
-            // slots (unsigned abs — INT_MIN safe), run the unsigned divmod,
+            // slots (unsigned abs, INT_MIN safe), run the unsigned divmod,
             // negate the quotient if the signs differed (bit0) / the
             // remainder if the dividend was negative (bit1).
             "__sdiv_i8" | "__srem_i8" => {
@@ -2635,7 +2613,7 @@ impl<'m> Gen<'m> {
                 self.emit("    RETURN".to_string());
             }
             // 32x32 -> 32 shift-add (AN526), 32 iterations: t = a (4 bytes,
-            // shifted left one bit per iteration — the shifted-out high
+            // shifted left one bit per iteration: the shifted-out high
             // bits are DISCARDED, so i32 mul wraps mod 2^32); for each set
             // bit of the multiplier, r += t across all 4 bytes with the
             // incfsz carry idiom. bk is 2 bytes: the low 16 multiplier bits
@@ -2655,7 +2633,8 @@ impl<'m> Gen<'m> {
                 }
                 for i in 0..4u16 {
                     self.emit(format!("    MOVF 0x{:02X}, W", a + i));
-                    self.emit(format!("    MOVWF 0x{:02X}", t[usize::from(i)])); // t = a (32-bit)
+                    self.emit(format!("    MOVWF 0x{:02X}", t[usize::from(i)]));
+                    // t = a (32-bit)
                 }
                 self.emit(format!("    MOVF 0x{:02X}, W", b));
                 self.emit(format!("    MOVWF 0x{bk_lo:02X}"));
@@ -2703,7 +2682,7 @@ impl<'m> Gen<'m> {
                 self.emit("    RETURN".to_string());
             }
             // Signed 32-bit wrappers: abs both operands in place in the
-            // param slots (unsigned abs — INT_MIN safe: |INT_MIN| wraps to
+            // param slots (unsigned abs, INT_MIN safe: |INT_MIN| wraps to
             // itself, deterministic), run the unsigned divmod, negate the
             // quotient if the signs differed (bit0 = num<0 XOR den<0) / the
             // remainder if the dividend was negative (bit1).
@@ -2788,7 +2767,7 @@ impl<'m> Gen<'m> {
             "__sitofp_f32" => {
                 let val = self.slot_addr(name, "val").direct();
                 self.assert_bank0(&[val, val + 3, scr, scr + 7], name);
-                // Save the sign, abs in place (unsigned abs — INT_MIN wraps
+                // Save the sign, abs in place (unsigned abs, INT_MIN wraps
                 // to itself, deterministic), then the uitofp path.
                 let sign = scr + 5;
                 let l_pos = self.fresh_label();
@@ -2817,7 +2796,7 @@ impl<'m> Gen<'m> {
     }
 
     /// The recipe body for the nine variable-count shift routines (i8/i16/
-    /// i32). The count arrives UNMASKED (a full i8/i16/i32 — clang emits
+    /// i32). The count arrives UNMASKED (a full i8/i16/i32, clang emits
     /// it raw); LLVM says counts >= width are poison, so masking to
     /// width-1 keeps the loop bounded (<= 7/15/31 iterations) and yields
     /// the defined-range result: deterministic, documented, never a hang.
@@ -2831,10 +2810,7 @@ impl<'m> Gen<'m> {
         let val = self.slot_addr(name, "val").direct();
         let cnt = self.slot_addr(name, "cnt").direct();
         let hi = val + bytes - 1;
-        self.assert_bank0(
-            &[val, hi, cnt, cnt + bytes - 1, scr, scr + 1],
-            name,
-        );
+        self.assert_bank0(&[val, hi, cnt, cnt + bytes - 1, scr, scr + 1], name);
         let mask: u8 = match bytes {
             1 => 0x07,
             2 => 0x0F,
@@ -2918,9 +2894,9 @@ impl<'m> Gen<'m> {
     /// Extract an f32 param slot into `sign` (bit 7), the full 8-bit biased
     /// exponent into `exp`, and the 24-bit mantissa with the implicit bit
     /// into `mant`..`mant+2`. A zero exponent means the value is +/-0 (or a
-    /// denormal — treated as 0): the mantissa clears. `flip` XORs the sign
+    /// denormal, treated as 0): the mantissa clears. `flip` XORs the sign
     /// (__sub_f32). A DENORMAL (exp 0, nonzero fraction) keeps its fraction
-    /// WITHOUT the implicit bit (issue #11) — the old code cleared the
+    /// WITHOUT the implicit bit (issue #11): the old code cleared the
     /// whole mantissa, so denormal + denormal summed to 0 instead of the
     /// denormal sum.
     fn emit_f32_extract(&mut self, slot: u16, sign: u16, exp: u16, mant: u16, flip: bool) {
@@ -2938,7 +2914,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLF 0x{exp:02X}, F"));
         self.emit(format!("    BTFSC 0x{:02X}, 7", slot + 2));
         self.emit(format!("    BSF 0x{exp:02X}, 0"));
-        // mant = b0, b1, (b2 & 0x7F) | 0x80 (the implicit bit — except for
+        // mant = b0, b1, (b2 & 0x7F) | 0x80 (the implicit bit, except for
         // a denormal, exp 0, which has no implicit bit).
         self.emit(format!("    MOVF 0x{:02X}, W", slot));
         self.emit(format!("    MOVWF 0x{:02X}", mant));
@@ -2967,7 +2943,7 @@ impl<'m> Gen<'m> {
 
     /// RNE round-up: mantissa += 1 across the 3 bytes; on a 24-bit carry the
     /// mantissa renormalizes to 0x800000 with `e += 1`. The carry can only
-    /// fire on a full mantissa (m2 == 0xFF, top bit set — a normal), so at
+    /// fire on a full mantissa (m2 == 0xFF, top bit set, a normal), so at
     /// e == 1 it renormalizes into e == 2 (the smallest-normal binade),
     /// which is correct: 0xFFFFFF x 2^-149 + half-ulp rounds to 2^-125.
     fn emit_f32_round_up(&mut self, m0: u16, m1: u16, m2: u16, e: u16) {
@@ -3014,7 +2990,7 @@ impl<'m> Gen<'m> {
     }
 
     /// Load `slot+2`'s fraction into W and OR the implicit bit unless the
-    /// operand is a denormal (full 8-bit exponent 0 — no implicit bit,
+    /// operand is a denormal (full 8-bit exponent 0, no implicit bit,
     /// issue #11). The caller stores W into the mantissa's high byte.
     fn emit_f32_mant_hi(&mut self, slot: u16) {
         let l_imp = self.fresh_label();
@@ -3076,7 +3052,7 @@ impl<'m> Gen<'m> {
     /// exponent's scale (the result exponent register becomes eb).
     ///
     /// The alignment builds the lost fraction EXACTLY: each shifted-out bit
-    /// is inserted at the top of a 24-bit window `ta` (an RRF chain — the
+    /// is inserted at the top of a 24-bit window `ta` (an RRF chain, the
     /// last bit out, the round bit, lands at ta2 bit 7), and the bits that
     /// overflow the window's bottom are OR'd into `stick` bit 1. The value
     /// is the 6-byte integer `ma:ta` at the result scale.
@@ -3090,8 +3066,8 @@ impl<'m> Gen<'m> {
     /// |a| - |b| = (ma - mb) - frac, computed as a fractional borrow
     /// (ma -= 1 and ta = 2^24 - ta, the deep OR folded into ta's LSB)
     /// followed by the plain 3-byte subtract. The 6-byte value then
-    /// normalizes with a 6-byte left shift — the fraction's bits move into
-    /// the mantissa one at a time — and RNE reads the guard from ta2 bit 7,
+    /// normalizes with a 6-byte left shift: the fraction's bits move into
+    /// the mantissa one at a time, and RNE reads the guard from ta2 bit 7,
     /// the sticky from ta's low bits | stick bit 1. A single wrong RNE bit
     /// is impossible. (The earlier two-bit round/sticky model was inexact
     /// once the fraction's tail drained to a power of two: the M15 float
@@ -3139,7 +3115,7 @@ impl<'m> Gen<'m> {
         // ---- IEEE specials (issue #11): NaN and infinity operands ----
         // NaN a: exp 0xFF (ea == 0xFF) && FRACTION nonzero (the extracted
         // mantissa carries the implicit bit, so inf's 0x800000 must not
-        // read as a NaN — test ma2 & 0x7F | ma1 | ma0). `cnt` is dead at
+        // read as a NaN, test ma2 & 0x7F | ma1 | ma0). `cnt` is dead at
         // this point (the alignment sets it later).
         self.emit(format!("    MOVF 0x{ea:02X}, W"));
         self.emit("    SUBLW 0xFF".to_string());
@@ -3168,7 +3144,7 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_nan}"));
         self.emit(format!("{l_b_nan_done}:"));
-        // inf a? (exp 0xFF, mantissa 0 — the NaN checks above already
+        // inf a? (exp 0xFF, mantissa 0, the NaN checks above already
         // routed mantissa-nonzero exp-0xFF operands to l_nan).
         self.emit(format!("    MOVF 0x{ea:02X}, W"));
         self.emit("    SUBLW 0xFF".to_string());
@@ -3245,7 +3221,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_no_swap}:"));
         // ---- alignment: diff = eb - ea (a is the smaller exponent),
         //      clamped to 31, shift ma right. The result exponent is the
-        //      LARGER one (eb) — the sum/difference is at its scale, so the
+        //      LARGER one (eb): the sum/difference is at its scale, so the
         //      result-exp register becomes eb. ----
         self.emit(format!("    MOVF 0x{ea:02X}, W"));
         self.emit(format!("    SUBWF 0x{eb:02X}, W"));
@@ -3369,7 +3345,7 @@ impl<'m> Gen<'m> {
         // ---- fractional borrow: the exact result is (ma - mb) - frac, so
         //      for frac != 0 the integer part borrows (ma -= 1) and the
         //      fraction becomes 2^24 - ta (the deep OR folded into ta's
-        //      LSB first — it is below the 24-bit window, sticky-typed).
+        //      LSB first, it is below the 24-bit window, sticky-typed).
         //      frac == 0 skips straight to the plain 3-byte subtract. ----
         self.emit(format!("    BTFSC 0x{stick:02X}, 1"));
         self.emit(format!("    BSF 0x{ta0:02X}, 0"));
@@ -3445,12 +3421,12 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BCF 0x{stick:02X}, 0"));
         // ---- RNE: round up iff round && (sticky || mantissa LSB), with
         //      sticky = OR(ta below the top bit) | stick bit 1 (the deep
-        //      OR) — the add path's round/sticky are equivalent (round =
+        //      OR): the add path's round/sticky are equivalent (round =
         //      ta2 bit 7 = the last shifted-out bit; a sum carry promotes
         //      the old round into stick bit 1). ----
         // ---- denormal result: exp 1 with the top mantissa bit clear (the
         //      sum/difference of denormals, or a normal that underflowed)
-        //      converts to exp 0 — the mantissa is already the raw
+        //      converts to exp 0: the mantissa is already the raw
         //      fraction (no implicit bit), and the assemble emits it as-is
         //      for e == 0. A rounded-up 0x800000 (the smallest normal)
         //      keeps exp 1. Both paths reach here: the add path directly
@@ -3510,7 +3486,7 @@ impl<'m> Gen<'m> {
     /// bits; the a/b param slots hold the shifted multiplicand addend and
     /// the low-part register). The 24x24 shift-add runs 24 iterations (the
     /// AN526 pattern): per set multiplier bit, low += (ma << i) mod 2^23
-    /// (exact — its carry feeds m) and m += (ma >> (23-i)); then normalize
+    /// (exact, its carry feeds m) and m += (ma >> (23-i)); then normalize
     /// (bit 47 of the product -> exp+1), round RNE (guard = P bit 22 /
     /// shifted-out bit, sticky = the low bits), assemble.
     fn emit_f32_mul_body(&mut self, pa: u16, pb: u16, scr: u16) {
@@ -3573,7 +3549,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLF 0x{low1:02X}, F"));
         self.emit(format!("    BTFSC 0x{:02X}, 7", pb + 2));
         self.emit(format!("    BSF 0x{low1:02X}, 0")); // eb8
-        // A nonzero exp-zero operand aligns at exp 1 with its raw fraction.
+                                                       // A nonzero exp-zero operand aligns at exp 1 with its raw fraction.
         self.emit(format!("    MOVF 0x{low0:02X}, W"));
         self.emit("    BTFSS STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_a_exp_done}"));
@@ -3802,10 +3778,10 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{bk2:02X}"));
         self.emit(format!("{l_b_mant_done}:"));
         // la = the low-part addend, maintained as la_{i+1} = (la_i >> 1) |
-        // (ma bit i << 22) — the correct low contribution (ma mod 2^i) <<
+        // (ma bit i << 22): the correct low contribution (ma mod 2^i) <<
         // (23-i) at iteration i (testing mb bit 23-i). Starts at 0 (i=0:
         // (ma mod 1) << 23 = 0). (The M15 float probe: an earlier attempt
-        // copied ma into the slot — (ma mod 2^23) << i — which is a
+        // copied ma into the slot: (ma mod 2^23) << i, which is a
         // different, wrong addend that broke every inexact product.)
         self.emit(format!("    CLRF 0x{:02X}", pb));
         self.emit(format!("    CLRF 0x{:02X}", pb + 1));
@@ -3823,7 +3799,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLF 0x{bk2:02X}, F"));
         self.emit("    BTFSS STATUS, 0".to_string());
         self.emit(format!("    GOTO {l_skip}"));
-        // low += la (3-byte): the FIRST byte adds WITHOUT a carry-in — the
+        // low += la (3-byte): the FIRST byte adds WITHOUT a carry-in: the
         // C at this point is the tested multiplier bit (set by the RLF bk
         // chain), not a carry, so the BTFSC/INCFSZ carry-in would add a
         // spurious +1 per set-bit iteration (the M15 float probe found the
@@ -3841,7 +3817,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    ADDWF 0x{low2:02X}, F"));
         // m += addend (4-byte) + the low's carry-out: the carry into m is
         // BIT 23 of the 24-bit low sum (the top byte's bit 7), NOT the
-        // byte carry-out (bit 24) — the M15 float probe found the original
+        // byte carry-out (bit 24): the M15 float probe found the original
         // tested STATUS C, so a sum with bit 23 set but no byte overflow
         // (e.g. 0x700003 + 0x160000 = 0x860003) lost its carry into m and
         // every inexact product came out one 2^23 short. The carry path
@@ -4009,7 +3985,7 @@ impl<'m> Gen<'m> {
     }
 
     /// One restoring-division compare/subtract/restore step: rem (4 bytes)
-    /// -= den (3 bytes — the top byte is implicitly 0) with the borrow
+    /// -= den (3 bytes, the top byte is implicitly 0) with the borrow
     /// folds; on underflow (rem < den) add den back. The final C is the
     /// quotient bit: the caller's branch lands at `l_restore` when clear and
     /// sets the bit at `qbit` bit 0 otherwise; `l_next` resumes after.
@@ -4053,10 +4029,10 @@ impl<'m> Gen<'m> {
     /// The __div_f32 body (scratch: sign@0, e@1-2 = the 16-bit result exp,
     /// rem@3-6 = the partial remainder, den@7-9 = the denominator copy, cnt@10,
     /// spare@11). The numerator lives in the a param slot. 24 restoring
-    /// iterations give floor(ma/mb) (0/1 — ma >= mb bumps e) with rem = ma
+    /// iterations give floor(ma/mb) (0/1, ma >= mb bumps e) with rem = ma
     /// mod mb; 25 more iterations extend the quotient to the mantissa +
     /// guard (the remainder at the end is the sticky). Div-by-zero (mb == 0)
-    /// -> +/-infinity (0x7F800000, deterministic — documented); ma == 0 ->
+    /// -> +/-infinity (0x7F800000, deterministic, documented); ma == 0 ->
     /// +/-0. The e is clamped by the byte arithmetic for the out-of-range
     /// cases (deterministic; the acceptance stays in the normal range).
     fn emit_f32_div_body(&mut self, pa: u16, pb: u16, scr: u16) {
@@ -4374,7 +4350,7 @@ impl<'m> Gen<'m> {
         self.emit_f32_div_step(scr + 3, scr + 7, pa, &l_restore, &l_next);
         self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
         self.emit(format!("    GOTO {l_loop}"));
-        // Save floor(ma/mb) (0/1 — ma >= mb) before the mantissa
+        // Save floor(ma/mb) (0/1, ma >= mb) before the mantissa
         // accumulator clears pa.
         self.emit(format!("    CLRF 0x{spare:02X}"));
         self.emit(format!("    MOVF 0x{:02X}, W", pa));
@@ -4459,7 +4435,7 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSC STATUS, 2".to_string());
         self.emit(format!("    GOTO {l_round}"));
         self.emit(format!("    BSF 0x{spare:02X}, 1")); // sticky |= rem
-        // RNE: guard (spare bit 0) && (sticky (spare bit 1) || mantissa LSB)
+                                                        // RNE: guard (spare bit 0) && (sticky (spare bit 1) || mantissa LSB)
         self.emit(format!("{l_round}:"));
         // Shift a subnormal result right while e < 1, preserving guard and
         // sticky for the final round-to-nearest-even decision.
@@ -4709,7 +4685,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_store2}:"));
         if signed {
             // negate the 4-byte result for a negative input (truncation is
-            // toward zero — the negate of 0 is 0)
+            // toward zero, the negate of 0 is 0)
             self.emit(format!("    BTFSS 0x{sign:02X}, 7"));
             self.emit(format!("    GOTO {l_store}"));
             for addr in [m0, m1, m2, m3] {
@@ -4780,7 +4756,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_nan_b_done}:"));
         // both zero (full 8-bit exp == 0, any signs) -> equal. The exponent's
         // LSB lives in b2 bit 7, so the (b3 & 0x7F) test alone swallows the
-        // smallest NORMALs (8-bit exp 1: 0x00800000..0x00FFFFFF) — skip the
+        // smallest NORMALs (8-bit exp 1: 0x00800000..0x00FFFFFF): skip the
         // zero path when b2 bit 7 is set, mirroring the mul/div zero checks.
         self.emit(format!("    MOVF 0x{:02X}, W", pa + 3));
         self.emit("    ANDLW 0x7F".to_string());
@@ -4865,7 +4841,7 @@ impl<'m> Gen<'m> {
 
 /// The classic iterative dominator sets for a function's CFG: `doms[b]` is
 /// the set of blocks that dominate block `b`. Used to classify the phi-copy
-/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred` — the
+/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred`: the
 /// pred is inside the merge's loop, so on that edge the merge's phi slots
 /// hold the CURRENT iteration's values. This covers self-loops
 /// (pred == merge) AND separate-latch back edges (pred is a latch block).
@@ -4919,26 +4895,24 @@ fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
 
 /// Emit one function's body into `g.out`: runtime routines get their recipe
 /// body; ordinary functions get the block labels, phi copies, and
-/// terminators. Shared by both emission passes — pass A measures the body
+/// terminators. Shared by both emission passes: pass A measures the body
 /// (every PCLATH restore present) to drive the page assignment, pass
 /// B re-emits it with same-page restores skipped.
 fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // Runtime routines (legalize-injected): the entry block holds only the
     // scratch alloca, so instead of the (empty) block emission the recipe
-    // body goes here — the label, the adapted epicurus asm, and the RETURN
+    // body goes here: the label, the adapted epicurus asm, and the RETURN
     // the injected Func has no `ret` for. A routine with no recipe yet
     // panics loudly rather than emitting an empty label that would silently
     // fall through into the next function.
     if let Some(recipe) = routine_recipe(&f.name) {
         match recipe {
-            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8"
-            | "__udiv_u16" | "__urem_u16" | "__udiv_u32" | "__urem_u32"
-            | "__sdiv_i8" | "__srem_i8" | "__sdiv_i16" | "__srem_i16"
-            | "__sdiv_i32" | "__srem_i32" | "__shl_u8" | "__lshr_u8"
-            | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
-            | "__shl_u32" | "__lshr_u32" | "__ashr_i32"
-            | "__add_f32" | "__sub_f32" | "__mul_f32" | "__div_f32"
-            | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32"
+            "__mul_u8" | "__mul_u16" | "__mul_u32" | "__udiv_u8" | "__urem_u8" | "__udiv_u16"
+            | "__urem_u16" | "__udiv_u32" | "__urem_u32" | "__sdiv_i8" | "__srem_i8"
+            | "__sdiv_i16" | "__srem_i16" | "__sdiv_i32" | "__srem_i32" | "__shl_u8"
+            | "__lshr_u8" | "__ashr_i8" | "__shl_u16" | "__lshr_u16" | "__ashr_i16"
+            | "__shl_u32" | "__lshr_u32" | "__ashr_i32" | "__add_f32" | "__sub_f32"
+            | "__mul_f32" | "__div_f32" | "__cmp_f32" | "__uitofp_f32" | "__sitofp_f32"
             | "__fptoui_f32" | "__fptosi_f32" => {}
             other => panic!("isel: unknown runtime routine @{other}"),
         }
@@ -4948,7 +4922,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // Block label scheme: the entry block uses the bare function name
     // (so CALLs and GOTOs resolve to it); every other block is
     // `{func}_L{label}`. The entry block's label is emitted by the block
-    // loop below — no standalone function label here, or `main:` /
+    // loop below: no standalone function label here, or `main:` /
     // `add:` would be defined twice and gpasm would reject the file.
     let mut labels: HashMap<String, String> = HashMap::new();
     for (i, b) in f.blocks.iter().enumerate() {
@@ -4962,7 +4936,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // phi elimination: for each (predecessor, merge) edge, the copies that
     // must run when that edge is taken. Keyed by the edge, NOT just the
     // predecessor: the copies must run ONLY on the edge to their merge
-    // block — running them unconditionally clobbers the phi slots with
+    // block: running them unconditionally clobbers the phi slots with
     // next-iteration values that the other branch's target reads (found by
     // the fuzz corpus: clang folds `acc = i` loops into cross-referencing
     // phis, and the exit block read the clobbered accumulator).
@@ -4988,18 +4962,18 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         if i == 0 && f.isr {
             // The ISR save prologue, right after the vector entry (word 4):
             // W into 0x75, nibble-swapped IN PLACE (SWAPF 0x75, F has no
-            // STATUS side effects and no W dependency — the epilogue's
+            // STATUS side effects and no W dependency, the epilogue's
             // swap-back is the flag-safe W restore), STATUS into 0x76
             // nibble-swapped (SWAPF reads STATUS without touching it),
             // PCLATH and FSR into 0x77/0x78, then the preempted main's
-            // in-flight return value (0x71-0x74) into 0x79-0x7C — the ISR
+            // in-flight return value (0x71-0x74) into 0x79-0x7C: the ISR
             // body's value-returning calls write the retval region, so
-            // without this save they would clobber it — and finally the
+            // without this save they would clobber it, and finally the
             // fixed scratch byte 0x70 into 0x7D. The scratch is LIVE across
             // interrupt windows in the preempted main: const reads stash
             // their byte/index in 0x70 across the PCLATH restore, GEP
             // offsets accumulate there, and the icmp/add/sub chains fold
-            // through it — an ISR that itself uses the scratch (a const
+            // through it: an ISR that itself uses the scratch (a const
             // read, a compare, an i16/i32 op) would silently corrupt that
             // in-flight value without this save. Then PCLATH = 0 so the
             // ISR body's GOTOs stay in page 0 (the M11 restore literal is
@@ -5007,7 +4981,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             // (0x75-0x7D: W/STATUS/PCLATH/FSR/retval x4/scratch = 9 bytes),
             // disjoint from the scratch byte (0x70) and the retval region
             // (0x71-0x74); 0x7E-0x7F stays free. The retval/scratch MOVFs
-            // clobber the CURRENT Z, which is harmless — the interrupted
+            // clobber the CURRENT Z, which is harmless: the interrupted
             // STATUS is already safe in 0x76.
             g.emit("    MOVWF 0x75");
             g.emit("    SWAPF 0x75, F");
@@ -5070,7 +5044,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                     let lcop = g.fresh_label();
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lcop}"));
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, cf, doms[&b.label].contains(&bc.f));
                                     g.emit(format!("    GOTO {lf}"));
                                     g.emit(format!("{lcop}:"));
@@ -5082,7 +5059,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 (_, Some(c)) => {
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lt}"));
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.f));
                                     g.emit(format!("    GOTO {lf}"));
                                 }
@@ -5091,7 +5071,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 (Some(c), None) => {
                                     g.emit("    BTFSC STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lf}"));
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.t));
                                     g.emit(format!("    GOTO {lt}"));
                                 }
@@ -5100,13 +5083,19 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                         Val::Const(k) => {
                             if *k != 0 {
                                 if let Some(c) = t_copies {
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.t));
                                 }
                                 g.emit(format!("    GOTO {lt}"));
                             } else {
                                 if let Some(c) = f_copies {
-                                    g.emit(format!("    ; phi copies for pred {0}", labels[&b.label]));
+                                    g.emit(format!(
+                                        "    ; phi copies for pred {0}",
+                                        labels[&b.label]
+                                    ));
                                     emit_phi_copies(g, c, doms[&b.label].contains(&bc.f));
                                 }
                                 g.emit(format!("    GOTO {lf}"));
@@ -5120,10 +5109,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                         // The restore epilogue replaces the ISR's `ret`. Order
                         // is load-bearing: the retval region (0x79-0x7C ->
                         // 0x71-0x74), then the scratch byte (0x7D -> 0x70), then
-                        // PCLATH/FSR (MOVF — their Z clobbers are fine, STATUS
+                        // PCLATH/FSR (MOVF, their Z clobbers are fine, STATUS
                         // is not yet restored), then STATUS via the nibble
                         // swap-back (SWAPF is flag-safe), and W LAST via its
-                        // swap-back (also flag-safe — MOVF would set Z from the
+                        // swap-back (also flag-safe, MOVF would set Z from the
                         // moved value after STATUS was already restored,
                         // corrupting the interrupted main's Z). RETFIE pops the
                         // hardware-pushed return.
@@ -5165,7 +5154,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
 /// copy never overwrites a slot a later copy still needs to read.
 ///
 /// The ordering depends on whether the edge is a BACK edge into the merge
-/// (`back_edge`, computed by `block_dominators` — the merge block dominates
+/// (`back_edge`, computed by `block_dominators`, the merge block dominates
 /// the pred, so the pred is inside the merge's loop):
 /// - Back edge (a self-loop OR a separate-latch back edge): the merge's phi
 ///   slots hold the CURRENT iteration's values, so a copy reading a slot
@@ -5174,7 +5163,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
 ///   a two-block loop's cross-referencing phis (`%i <- %i.next,
 ///   %acc <- %i` on the latch edge) need the OLD i: writer-first emits
 ///   `%i <- %i.next` then `%acc <- %i`, so the accumulator reads the NEW
-///   induction value — acc = n instead of n-1 (the same seed-75 off-by-one
+///   induction value: acc = n instead of n-1 (the same seed-75 off-by-one
 ///   class the fuzz corpus found on the self-loop form; the generated
 ///   for-loops are single-block, so the separate-latch edge went wrong
 ///   silently).
@@ -5186,7 +5175,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
 ///   same slot-aliasing shape needs writer-first on a forward edge (the
 ///   source slot is not live yet) and reader-first on a back edge (it
 ///   holds the current iteration's value).
-/// A true cycle (%a <- %b, %b <- %a — a loop-carried swap) needs a temp
+/// A true cycle (%a <- %b, %b <- %a, a loop-carried swap) needs a temp
 /// register, so it panics loudly rather than silently miscompile.
 fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
     let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
@@ -5212,13 +5201,13 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
             let (da, src, ty, val) = &pending[i];
             let blocked = if back_edge {
                 // Reader first: blocked while an un-emitted sibling READS
-                // this copy's destination (sibling source == my dst) — that
+                // this copy's destination (sibling source == my dst): that
                 // sibling reads a merge phi slot holding the current
                 // iteration's live value and must run before the overwrite.
                 (0..n).any(|j| !emitted[j] && j != i && pending[j].1 == Some(*da))
             } else {
                 // Writer first: blocked while an un-emitted sibling WRITES
-                // this copy's source (sibling dst == my src) — on a forward
+                // this copy's source (sibling dst == my src): on a forward
                 // edge the source slot is only defined by this edge's
                 // copies, so a reader runs after its definer.
                 match src {
@@ -5244,44 +5233,46 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
 /// are 0), mirroring the asm crate's pass-1 counting so the page-fit
 /// decisions match the addresses the assembler will assign.
 fn word_size(lines: &[String]) -> usize {
-    lines.iter().filter(|raw| {
-        let line = raw.split(';').next().unwrap_or("").trim();
-        if line.is_empty() {
-            return false;
-        }
-        if line.starts_with("list") || line.starts_with("radix") {
-            return false;
-        }
-        if line.starts_with("org ") {
-            return false;
-        }
-        if line.starts_with("end") {
-            return false;
-        }
-        if line.ends_with(':') {
-            return false;
-        }
-        if line.contains(" equ ") {
-            return false;
-        }
-        if line.starts_with(".align ") {
-            return false;
-        }
-        if line.starts_with(".table ") {
-            return false;
-        }
-        true
-    })
-    .count()
+    lines
+        .iter()
+        .filter(|raw| {
+            let line = raw.split(';').next().unwrap_or("").trim();
+            if line.is_empty() {
+                return false;
+            }
+            if line.starts_with("list") || line.starts_with("radix") {
+                return false;
+            }
+            if line.starts_with("org ") {
+                return false;
+            }
+            if line.starts_with("end") {
+                return false;
+            }
+            if line.ends_with(':') {
+                return false;
+            }
+            if line.contains(" equ ") {
+                return false;
+            }
+            if line.starts_with(".align ") {
+                return false;
+            }
+            if line.starts_with(".table ") {
+                return false;
+            }
+            true
+        })
+        .count()
 }
 
 /// Greedy page assignment (M11), one function: pad with `.org <next base>`
-/// before a function that would cross the current 2048-word page's end — and
+/// before a function that would cross the current 2048-word page's end, and
 /// before ANY function whose start is page-aligned (an overflow continuation
-/// or an exact-boundary one) — and return the `(pad, page, next_addr)`. A
+/// or an exact-boundary one), and return the `(pad, page, next_addr)`. A
 /// function larger than one page can never fit (its intra-function GOTOs
 /// need a single stable page) and panics loudly; a program past page 3
-/// (0x2000 — the device flash) panics loudly too. The `.org` pads with
+/// (0x2000, the device flash) panics loudly too. The `.org` pads with
 /// 0x0000 words (the assembler supports it), so the final layout's addresses
 /// are exactly what the tracker predicts.
 /// Verify the FINAL post-banking layout's page fit (issue #17): every
@@ -5289,15 +5280,15 @@ fn word_size(lines: &[String]) -> usize {
 /// resolves to the lower page while its later words sit in the upper one
 /// and its intra-function GOTOs (`PAGE(<func>)` from the label) misbranch.
 ///
-/// The bin-packing assignment (issue #12) runs on POST-banking sizes — the
+/// The bin-packing assignment (issue #12) runs on POST-banking sizes: the
 /// banking pass's BANKSEL growth is measured before packing, so a function
 /// that would straddle a boundary is packed into the next page with an
 /// anchor instead. The `.org` pads pin page bases, so the elision cannot
 /// move a function off its assigned page. This
 /// check walks the final text (the exact layout the assembler will place)
-/// with the same pass-1 semantics `asm::assemble` uses — `.org` jumps,
+/// with the same pass-1 semantics `asm::assemble` uses: `.org` jumps,
 /// `.align N` pads to N-word boundaries, labels take no words, `equ`/
-/// `.table`/`list`/`radix`/`end` emit none — tracks each function's actual
+/// `.table`/`list`/`radix`/`end` emit none, tracks each function's actual
 /// extent from its label to the next function's label (or the program end),
 /// and panics loudly on any straddle or page overflow. `__start` and the
 /// const-table reader entries are checked the same way (a reader is the
@@ -5306,7 +5297,7 @@ fn word_size(lines: &[String]) -> usize {
 /// The extent measure is conservative in the safe direction: the next
 /// function's label is the FIRST word the current function cannot own, and
 /// nothing in between (an `.org` pad, a `.align`) belongs to the function
-/// whose label precedes it — so a function that ends exactly at a page
+/// whose label precedes it, so a function that ends exactly at a page
 /// boundary (its last word is the boundary page's last word) passes, and
 /// only a true straddle panics. The check runs on the post-peephole text
 /// in the driver pipeline, so every pass that can move words is covered.
@@ -5339,7 +5330,7 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
         let last = e - 1;
         if last / 0x800 != s / 0x800 {
             panic!(
-                "isel: post-banking page-fit failure: {name} spans pages (0x{s:04X}-0x{last:04X}) — the banking pass grew it across a page boundary; its label resolves to page {} while its tail sits in page {}",
+                "isel: post-banking page-fit failure: {name} spans pages (0x{s:04X}-0x{last:04X}): the banking pass grew it across a page boundary; its label resolves to page {} while its tail sits in page {}",
                 s / 0x800,
                 last / 0x800
             );
@@ -5364,9 +5355,8 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
         }
         if let Some(l) = line.strip_suffix(':') {
             let name = l.trim().to_string();
-            let is_target = funcs.contains(&name.as_str())
-                || name == "__start"
-                || readers.contains(&name);
+            let is_target =
+                funcs.contains(&name.as_str()) || name == "__start" || readers.contains(&name);
             if is_target {
                 if let Some((prev, s)) = &cur {
                     check(prev, *s, org);
@@ -5389,7 +5379,7 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
         if line.starts_with(".table ") {
             // The const-table DATA begins here. Table bytes may legitimately
             // straddle a page boundary (reads are 256-byte-window based, not
-            // page based — the reader's computed jump reaches across), so the
+            // page based, the reader's computed jump reaches across), so the
             // reader entry's extent must END here, not include the table.
             if let Some((name, s)) = &cur {
                 check(name, *s, org);
@@ -5408,7 +5398,7 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
 /// after each CALL returns: a reader writes `MOVLW HIGH(<base>); MOVWF
 /// PCLATH` before its computed jump, so PCLATH's page bits are the TABLE
 /// BASE's page (`<name>` for single/chunk-0 reads, `<name>_1` for chunk-1
-/// reads) — not `PAGE(__read_<name>)`, the page the caller set (the entry
+/// reads): not `PAGE(__read_<name>)`, the page the caller set (the entry
 /// itself can sit in a different page than its base, e.g. a reader at
 /// 0x7FA with a 256-aligned base at 0x800). The caller's restore after the
 /// call is needed iff that page differs from its own, so this is the map
@@ -5416,8 +5406,8 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
 /// it sits right after the last function, and pass B re-pins the section to
 /// this exact start with a leading `.org` whenever the pass-B elision would
 /// move a reader base across a page boundary (see the pass-B note in
-/// `select`) — so no reader base can drift across a page boundary between
-/// the passes — the pages hold in the final text.
+/// `select`), so no reader base can drift across a page boundary between
+/// the passes: the pages hold in the final text.
 fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usize)> {
     let mut pages = Vec::new();
     let mut addr = table_start;
@@ -5454,13 +5444,13 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 ///
 /// `addrs` is the complete address map from `alloc`: globals by name, locals
 /// by `{func}::{name}` (IR value names without `%`). isel does no slot
-/// allocation — every value's address is read from the map. The icmp scratch
+/// allocation: every value's address is read from the map. The icmp scratch
 /// byte and the four retval bytes live in fixed common RAM (scratch `0x70`,
 /// retval `0x71`-`0x74`): bank-independent, never used by locals (M3), so no
 /// BANKSEL is ever needed for them.
 ///
 /// M11: every CALL runs with PCLATH<4:3> = the target's page (set
-/// immediately before, restored immediately after — the restore is skipped
+/// immediately before, restored immediately after, the restore is skipped
 /// when the target is in the caller's own page), functions are assigned to
 /// 2048-word pages by first-fit bin packing over their post-banking sizes
 /// (a function that would cross a page's end gets a
@@ -5473,9 +5463,9 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
 /// never moves a function off its assigned page).
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
     // The device's interrupt vector(s) (the hardware pushes the return PC
-    // and clears GIE; PCLATH is untouched). The vector IS the ISR entry —
+    // and clears GIE; PCLATH is untouched). The vector IS the ISR entry:
     // no GOTO, since a GOTO's target page would depend on the interrupted
-    // PCLATH (unknowable) — so the ISR is emitted FIRST with a `.org 4` pad
+    // PCLATH (unknowable), so the ISR is emitted FIRST with a `.org 4` pad
     // (words 2-3 after the reset entry), and `__start` moves after it. More
     // interrupt handlers than the device has vectors would fight over one
     // vector: panic loudly.
@@ -5487,7 +5477,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         .collect();
     assert!(
         isr_names.len() <= device.interrupt_vectors.len(),
-        "isel: {} interrupt handlers ({}) — {} has {} interrupt vector(s)",
+        "isel: {} interrupt handlers ({}): {} has {} interrupt vector(s)",
         isr_names.len(),
         isr_names.join(", "),
         device.name,
@@ -5497,8 +5487,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // The icmp scratch byte and the four retval bytes are fixed common-RAM
     // constants (bank-independent, the device's common RAM is never used by
     // locals, so no collision). The widened i32 region must not overrun
-    // common RAM nor overlap the scratch byte — and the ISR save area (W,
-    // STATUS, PCLATH, FSR, retval x4, scratch — 9 bytes) must sit right
+    // common RAM nor overlap the scratch byte, and the ISR save area (W,
+    // STATUS, PCLATH, FSR, retval x4, scratch, 9 bytes) must sit right
     // after the retval region, disjoint from it and from scratch, leaving
     // the last 2 bytes of common RAM free.
     let (common_lo, common_hi) = device
@@ -5539,7 +5529,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     ];
     if !has_isr {
         // No ISR: `__start` sits at the top (word 2) so the reset vector's
-        // GOTO (PCLATH = 0 at reset) always reaches it — byte-identical to
+        // GOTO (PCLATH = 0 at reset) always reaches it, byte-identical to
         // the pre-interrupt layout. With an ISR the vector owns word 4, so
         // `__start` is emitted after the ISR body instead (see pass B).
         out.extend([
@@ -5551,103 +5541,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             "".to_string(),
         ]);
     }
-    // Phase-3 pointers: collect every GEP and resolve its chain eagerly to a
-    // folded `(base, k, terms)`, keyed `{func}::{reg}` like every other
-    // local. Seeds first: a byval param slot IS the struct copy
-    // (Slot(name, false)); an sret param slot holds the target address
-    // (Slot(name, true)); an alloca defines its own buffer slot
-    // (Slot(name, false)). Gep itself is virtual — it emits nothing.
-    let mut geps: HashMap<String, Gep> = HashMap::new();
-    let mut resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
-    for f in &m.funcs {
-        for p in &f.params {
-            if p.byval.is_some() {
-                resolved.insert(
-                    ssa_key(&f.name, &p.name),
-                    (Base::Slot(p.name.clone(), false), 0, Vec::new()),
-                );
-            } else if p.sret {
-                resolved.insert(
-                    ssa_key(&f.name, &p.name),
-                    (Base::Slot(p.name.clone(), true), 0, Vec::new()),
-                );
-            }
-        }
-        for b in &f.blocks {
-            for i in &b.insts {
-                match i {
-                    Inst::Gep(g) => {
-                        geps.insert(ssa_key(&f.name, &g.dst), g.clone());
-                    }
-                    Inst::Alloca(a) => {
-                        resolved.insert(
-                            ssa_key(&f.name, &a.dst),
-                            (Base::Slot(a.dst.clone(), false), 0, Vec::new()),
-                        );
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-    // Chain folding (fixpoint scan): a GEP whose base is a `Reg` folds in
-    // that reg's own resolved entry — `k` adds, terms concatenate
-    // (inner-first: terms_inner + terms_outer) — until the base is a Global
-    // or a seeded Slot. A base that is neither a gep nor a seed panics; a
-    // pass that makes no progress with unresolved geeps left is a cycle and
-    // panics loudly.
-    for f in &m.funcs {
-        let fname = f.name.clone();
-        let mut pending: Vec<(String, Gep)> = geps
-            .iter()
-            .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
-            .map(|(k, g)| (k.clone(), g.clone()))
-            .collect();
-        let mut progressed = true;
-        while progressed {
-            progressed = false;
-            let mut rest = Vec::new();
-            for (key, g) in pending {
-                match &g.base {
-                    GepBase::Global(name) => {
-                        assert!(
-                            !resolved.contains_key(&key),
-                            "isel: duplicate definition of pointer reg {key}"
-                        );
-                        resolved.insert(key, (Base::Global(name.clone()), g.k, g.terms.clone()));
-                        progressed = true;
-                    }
-                    GepBase::Reg(r) => {
-                        let rkey = ssa_key(&fname, r);
-                        if let Some((b, kk, tt)) = resolved.get(&rkey).cloned() {
-                            assert!(
-                                !resolved.contains_key(&key),
-                                "isel: duplicate definition of pointer reg {key}"
-                            );
-                            let mut terms = tt.clone();
-                            terms.extend(g.terms.clone());
-                            let k = g.k.checked_add(kk).unwrap_or_else(|| {
-                                panic!("isel: gep offset overflow in {key}")
-                            });
-                            resolved.insert(key, (b, k, terms));
-                            progressed = true;
-                        } else if geps.contains_key(&rkey) {
-                            rest.push((key, g)); // may resolve on a later pass
-                        } else {
-                            panic!(
-                                "isel: no gep for pointer %{r} (chain base missing, key {rkey})"
-                            );
-                        }
-                    }
-                }
-            }
-            pending = rest;
-            if !progressed && !pending.is_empty() {
-                let names: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
-                panic!("isel: cyclic gep chain involving {names:?}");
-            }
-        }
-    }
+    // Phase-3 pointers: resolve every GEP's chain eagerly to a folded
+    // `(base, k, terms)`, keyed `{func}::{reg}` like every other local.
+    // Seeds first: a byval param slot IS the struct copy (Slot(name,
+    // false)); an sret param slot holds the target address (Slot(name,
+    // true)); an alloca defines its own buffer slot (Slot(name, false)).
+    // Gep itself is virtual: it emits nothing. The fold (shared with
+    // isel-pic18) lives in `iselcore::resolve_pointers`.
+    let resolved = resolve_pointers(m);
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
     // ---- PASS A: emit every function body with every PCLATH restore
@@ -5688,8 +5589,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // The bin packing must fit the FINAL post-banking sizes, or a function
     // packed into a tight page tail can straddle the boundary after banking
     // (the greedy layout had slack; first-fit's tighter packing does not).
-    // Per-function BANKSEL counts are placement-independent — every label
-    // resets the tracked bank, and callee exit banks are callee-local — so
+    // Per-function BANKSEL counts are placement-independent: every label
+    // resets the tracked bank, and callee exit banks are callee-local, so
     // measuring once on the pass-A text (all PCLATH restores present) is
     // exact, and pass B's same-page restore elision only shrinks bodies, so
     // the packed layout is elision-stable.
@@ -5725,7 +5626,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // Measure each function's post-banking extent (function label to the
     // NEXT function label, or the end) with the same pass-1 semantics
     // `asm::assemble` uses. Internal block labels keep the current
-    // function's extent open — only function labels (and `__start`) close
+    // function's extent open: only function labels (and `__start`) close
     // it, exactly like `verify_page_fit`.
     let func_names: HashSet<&str> = order.iter().map(|f| f.name.as_str()).collect();
     let mut post: HashMap<String, usize> = HashMap::new();
@@ -5772,26 +5673,26 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         }
     }
     // Bin-packing page assignment over every function's post-banking size,
-    // in emission order: first-fit — each function goes to the LOWEST-numbered
+    // in emission order, first-fit: each function goes to the LOWEST-numbered
     // page with room for it. The greedy next-fit only considered the current
     // page, so a page tail was wasted whenever the next function was even
     // slightly too large, even when a later small function could fill it;
     // first-fit reuses those tails (a small function later in the module
     // lands in an earlier page's tail, and the program uses fewer pages).
-    // The running word address starts at 5 without an ISR — the reset vector
+    // The running word address starts at 5 without an ISR: the reset vector
     // (1 word: `goto __start`) plus the `__start` body (4 words), with
     // `__start` at the top so the reset vector's GOTO (PCLATH = 0 at reset)
     // always reaches it. With an ISR the vector owns word 4: the ISR is
-    // pinned there (no page pad — the vector IS the entry), `__start` moves
+    // pinned there (no page pad, the vector IS the entry), `__start` moves
     // right after it, and the rest of the program follows. The ISR must fit
-    // page 0 (0x004-0x7FF) AND leave `__start` inside page 0 — the reset
+    // page 0 (0x004-0x7FF) AND leave `__start` inside page 0: the reset
     // GOTO runs with PCLATH = 0, so a `__start` at 0x800+ would be
     // unreachable; it panics loudly (ISRs are usually small).
     let mut pages: HashMap<String, usize> = HashMap::new();
     let mut pads: HashMap<String, usize> = HashMap::new();
     // `page_next[i]` = the next free word in page i (the running address of
     // the page's last placed function). Pages are opened in order, so the
-    // last entry is the program's end — the const-table section's start.
+    // last entry is the program's end: the const-table section's start.
     // Page 0 starts after the 5-word header (reset `goto __start` + the
     // 4-word `__start` body); with an ISR the vector owns word 4 and the
     // ISR branch below sets page 0's next free word after the ISR + `__start`.
@@ -5842,7 +5743,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             };
             pages.insert(name.clone(), page);
             // The anchor: a function whose start is page-aligned gets an
-            // explicit `.org` pad — both the new-page case and the
+            // explicit `.org` pad: both the new-page case and the
             // exact-boundary continuation (the previous function's size
             // hit the boundary precisely, so the strict fit check alone
             // would emit no pad). Without it, pass B's same-page restore
@@ -5856,11 +5757,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         }
     }
     // Const-table readers: the page PCLATH holds after each `__read_*` CALL
-    // (see `reader_pages`). The section sits right after the last function —
+    // (see `reader_pages`). The section sits right after the last function:
     // pass B pins it to this same start, so the pages hold in the final text.
     let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
     consts.sort_by_key(|g| g.name.clone());
-    let table_start = page_next.last().copied().unwrap_or(if has_isr { 4 } else { 5 });
+    let table_start = page_next
+        .last()
+        .copied()
+        .unwrap_or(if has_isr { 4 } else { 5 });
     for (entry, page) in reader_pages(&consts, table_start) {
         pages.insert(entry, page);
     }
@@ -5868,11 +5772,11 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // Same-page calls (and same-page const reads) skip the restore pair; the
     // pages are the assignment's, and the `.org` pads pin the page bases, so
     // the elision cannot move a function off its assigned page (it only
-    // shrinks bodies — page-membership-stable).
+    // shrinks bodies, page-membership-stable).
     //
     // Emission is in PAGE order, not module order: bin packing can place a
     // later function in an earlier page's tail, so module-order emission
-    // would emit a backward `.org` (a page-0 function after a page-1 one) —
+    // would emit a backward `.org` (a page-0 function after a page-1 one):
     // the assembler panics on backward `.org`. Within a page, functions keep
     // their emission order (the page's running address is monotonic).
     let mut page_order: Vec<Vec<(&ir::Func, &str)>> = Vec::new();
@@ -5908,34 +5812,34 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 addr_b += word_size(&g.out);
                 out.extend(g.out);
                 if f.isr {
-                // `__start` moves after the ISR (the vector owns word 4):
-                // the reset GOTO at word 0 still reaches it — page 0, by
-                // the ISR fit check above.
-                out.extend([
-                    "__start:".to_string(),
-                    "    MOVLW PAGE(main)".to_string(),
-                    "    MOVWF PCLATH".to_string(),
-                    "    CALL main".to_string(),
-                    "    SLEEP".to_string(),
-                    "".to_string(),
-                ]);
-                addr_b += 4;
-            }
+                    // `__start` moves after the ISR (the vector owns word 4):
+                    // the reset GOTO at word 0 still reaches it, since it stays in
+                    // page 0 per the ISR fit check above.
+                    out.extend([
+                        "__start:".to_string(),
+                        "    MOVLW PAGE(main)".to_string(),
+                        "    MOVWF PCLATH".to_string(),
+                        "    CALL main".to_string(),
+                        "    SLEEP".to_string(),
+                        "".to_string(),
+                    ]);
+                    addr_b += 4;
+                }
             }
         }
         // Pin the const-table section to its pass-A `table_start` whenever
         // the pass-B elision would move a reader base across a page
         // boundary. `reader_pages` maps every reader entry's page from the
         // pass-A position, but pass B emits the tables at the post-elision
-        // position (bodies only shrink, so the section shifts earlier) — a
+        // position (bodies only shrink, so the section shifts earlier): a
         // chunked table's `.align 256` can then round a base across a page
         // boundary (a base pass A aligned to exactly k*0x800 re-aligns into
         // page k-1 after a 2-word elision), silently invalidating the
         // restore-skip map: a caller that skipped its restore on the mapped
-        // page is left with the reader's HIGH(<base>) page — the drifted one
-        // — and its next GOTO misbranches. The `.org` re-pins the section so
+        // page is left with the reader's HIGH(<base>) page, the drifted one,
+        // and its next GOTO misbranches. The `.org` re-pins the section so
         // the final addresses are exactly the pass-A ones and the map stays
-        // exact — but only when a base's page actually changes (the common
+        // exact, but only when a base's page actually changes (the common
         // case, a small drift that stays within the mapped page, needs no
         // pin). It is always forward (or equal): pass-B bodies are no
         // larger, so `addr_b <= table_start`. A module without consts has no
@@ -5954,31 +5858,31 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     }
     // Const (flash) globals become RETLW tables, emitted after the
     // functions so the CALLs above resolve. Every `__read_<name>` reader
-    // sets PCLATH = HIGH(<name>) first — the computed `ADDLW LOW(<name>);
+    // sets PCLATH = HIGH(<name>) first: the computed `ADDLW LOW(<name>);
     // MOVWF PCL` jump lands at PCLATH:PCL, so a table in a nonzero 256-byte
-    // window needs the window set (the M5 reader left PCLATH stale — the
+    // window needs the window set (the M5 reader left PCLATH stale, the
     // latent window bug). A table of 256+ bytes is emitted as two 256-byte
     // chunks: chunk 0's 256 RETLWs at the base label `<name>` (`.align 256`
     // pads it to a 256-word boundary so LOW(<name>) == 0), then chunk 1's
-    // RETLWs at the fresh label `<name>_1` IMMEDIATELY after — `<name>` +
+    // RETLWs at the fresh label `<name>_1` IMMEDIATELY after: `<name>` +
     // 256 in the address space, so LOW(<name>_1) == 0 too and the true
     // bound is 511 bytes (a table of exactly 256 bytes has an empty chunk
-    // 1, unreachable since its valid indices are 0..255) — then the
+    // 1, unreachable since its valid indices are 0..255), then the
     // `__read_<name>_hi` entry AFTER the
     // table (its computed-goto jumps into the table; the entry instructions
     // are dead after MOVWF PCL). A `.table <name> <size>` directive is
     // emitted immediately before every table's base label; the assembler
     // enforces the window fit loudly (LOW + size <= 0x100 for single-entry
-    // tables, LOW == 0 for chunked bases) — a table that crosses its window
+    // tables, LOW == 0 for chunked bases): a table that crosses its window
     // or a misaligned chunk base would silently misread, so it must fail
     // assembly, not miscompile. Tables beyond 511 bytes (three chunks)
-    // panic loudly — out of scope.
-    // Label-collision guard: every label a table emits — its base label, its
+    // panic loudly: out of scope.
+    // Label-collision guard: every label a table emits, its base label, its
     // reader entry, and for chunked tables the fresh `{name}_1` chunk label
-    // and `__read_{name}_hi` entry — must be unique across all consts. A
+    // and `__read_{name}_hi` entry, must be unique across all consts. A
     // user `const t_1` (or `const __read_t_hi`) next to a chunked `const t`
     // would emit a duplicate label the assembler's symbol insert silently
-    // overwrites (wrong reads, no error) — panic loudly instead.
+    // overwrites (wrong reads, no error): panic loudly instead.
     {
         let mut labels: HashMap<String, String> = HashMap::new();
         for g in &consts {
@@ -6033,14 +5937,18 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // `_hi` reader (the dispatch's bit-0 test references them, and the
         // old layout is documented); larger tables get ceil(size/256)
         // chunks.
-        let n_chunks = if size >= 256 { ((size + 255) / 256).max(2) } else { 1 };
+        let n_chunks = if size >= 256 {
+            ((size + 255) / 256).max(2)
+        } else {
+            1
+        };
         assert!(
             size <= 65535,
             "isel: const @{} table of {size} bytes exceeds the 65535-byte 16-bit index bound",
             g.name
         );
         // `MOVLW HIGH` clobbers W, so the incoming index (W = byte index)
-        // is stashed in the fixed scratch byte (0x70 — free at a const
+        // is stashed in the fixed scratch byte (0x70, free at a const
         // read) across the PCLATH set, then reloaded for the computed jump.
         let reader = |out: &mut Vec<String>, base: &str| {
             out.push(format!("    MOVWF 0x{:02X}", scratch));
@@ -6054,16 +5962,16 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             // Chunked table: chunk 0's reader, then `.align 256` (the
             // assembler pads to the next 256-word boundary, so LOW(name) ==
             // 0), then the `.table` directive, then each chunk's RETLWs at
-            // `name` (chunk 0), `name_1` (chunk 1), `name_2`, ... — every
+            // `name` (chunk 0), `name_1` (chunk 1), `name_2`, ...: every
             // chunk base is exactly 256 words after the previous, so every
-            // LOW() == 0. The reader entries come AFTER the table — chunk
+            // LOW() == 0. The reader entries come AFTER the table: chunk
             // c's reader at `__read_<name>_hi[c]` (chunk 1 keeps the M10
             // `_hi` name for fixture stability). (The entries' computed
             // gotos jump into the table; the entry instructions are dead
             // after MOVWF PCL, so their placement cannot shift the chunks.)
             // A table of exactly 256 bytes gets this branch too (size >=
             // 256): chunk 1 is empty (`name_1:` with no RETLWs, its reader
-            // immediately after) and unreachable — every valid index
+            // immediately after) and unreachable: every valid index
             // 0..255 selects chunk 0.
             out.push(format!("__read_{}:", g.name));
             reader(&mut out, &g.name);
@@ -6113,7 +6021,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
         }
         // Track the tables' `.align`/RETLW words so the running address
-        // stays consistent (tables are unconstrained — their addresses
+        // stays consistent (tables are unconstrained, their addresses
         // don't affect function placement, which is already decided).
         addr += 6; // reader entry (MOVWF/MOVLW/MOVWF/MOVF/ADDLW/MOVWF PCL)
         if size >= 256 {
