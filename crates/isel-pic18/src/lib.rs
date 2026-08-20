@@ -318,7 +318,7 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
             let (fa, ff) = self.operand(0xFE9);
             self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
-            self.emit("    MOVLW 0x00".to_string());
+            self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
             let (ha, hf) = self.operand(0xFEA);
             self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
         }
