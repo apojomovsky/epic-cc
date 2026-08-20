@@ -517,19 +517,20 @@ impl Pic18 {
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         while !self.halted && steps < max_steps {
-            // A latched request whose GIE and INT0IE are both set vectors
-            // at the next step boundary (mirrors `Pic14::run`).
-            if self.interrupt_ready() {
-                self.pending = false;
-                self.enter_isr();
-                return steps; // vectoring costs its own cycle; the handler runs next
-            }
             self.step();
             steps += 1;
         }
         steps
     }
     pub fn step(&mut self) {
+        // Interrupts are recognised at an instruction boundary: a latched,
+        // enabled request vectors instead of executing this instruction,
+        // which then runs on return (mirrors `Pic14::step`).
+        if self.interrupt_ready() {
+            self.pending = false;
+            self.enter_isr();
+            return; // vectoring costs its own cycle; the handler runs next
+        }
         let word = self.prog[(self.pc / 2) as usize];
         let pc = self.pc;
         let next = match word {
