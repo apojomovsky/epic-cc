@@ -1,7 +1,10 @@
-//! `isel-pic18` — instruction selection for the PIC18 integer spine (P2).
-//! Same scope as `isel`'s milestones 2-6 (`Load`/`Store`/`Bin`(add/sub/
-//! and/or/xor)/`Icmp`/`Zext`/`Sext`/`Trunc`/`Select`/`Call`/`Br`/`BrCond`/
-//! `Phi`/`Ret`) — see docs/superpowers/plans/2026-08-18-pic18-port-p2.md.
+//! `isel-pic18`: instruction selection for the PIC18 integer spine (P2),
+//! extended by P3 (pointers, arrays, structs) and P4 (`const` in flash via
+//! `TBLRD`). See docs/superpowers/plans/2026-08-18-pic18-port-p2.md (P2
+//! scope), 2026-08-20-pic18-port-p3.md (P3 scope), and
+//! 2026-08-20-pic18-port-p4.md (P4 scope: `const` globals read via
+//! `TBLRD`, the 511-byte `RETLW` ceiling of PIC14 is gone, stores through
+//! a `const` base panic loudly).
 //! A separate crate from `isel` per docs/29-pic18-port-design.md §2 D-1:
 //! the instruction sets differ enough that sharing would leak an
 //! abstraction, and PIC14's working code must never be at risk from a
@@ -111,6 +114,65 @@ impl<'m> Gen<'m> {
             .addrs
             .get(name)
             .unwrap_or_else(|| panic!("isel-pic18: no address for @{name}"))
+    }
+
+    /// Whether `name` is a `const` (flash) global: read via `TBLRD`, never
+    /// via a RAM address. `alloc` already excludes const globals from the
+    /// address map (`const <name>` lines, no address), so this is the only
+    /// signal `isel-pic18` needs to route a load to the flash path.
+    fn global_is_const(&self, name: &str) -> bool {
+        self.m
+            .globals
+            .iter()
+            .find(|g| g.name == name)
+            .map(|g| g.is_const)
+            .unwrap_or(false)
+    }
+
+    /// The byte width of a value-defining register in the current function
+    /// (its slot is `bytes` wide), for scaling a dynamic const-table index
+    /// when the index register is 16-bit. Mirrors `alloc::def_width`'s
+    /// width rules (an `icmp` result is i1 -> 1 byte) so the addition code
+    /// knows whether to propagate into a high byte.
+    fn reg_width(&self, reg: &str) -> u8 {
+        let f = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .unwrap_or_else(|| panic!("isel-pic18: no function {}", self.cur_func));
+        for p in &f.params {
+            if p.name == reg {
+                // sret params are 2-byte address slots; scalar params use
+                // their width.
+                return if p.sret { 2 } else { p.width };
+            }
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let d = match inst {
+                    Inst::Load(l) if l.dst == reg => Some(l.ty.bytes()),
+                    Inst::Bin(b) if b.dst == reg => Some(b.ty.bytes()),
+                    Inst::Zext(z) if z.dst == reg => Some(z.to.bytes()),
+                    Inst::Sext(s) if s.dst == reg => Some(s.to.bytes()),
+                    Inst::Trunc(t) if t.dst == reg => Some(t.to.bytes()),
+                    Inst::Icmp(c) if c.dst == reg => Some(1),
+                    Inst::Select(s) if s.dst == reg => Some(s.ty.bytes()),
+                    Inst::Call(c) => match (&c.dst, &c.ty) {
+                        (Some(d), Some(t)) if d == reg => Some(t.bytes()),
+                        _ => None,
+                    },
+                    Inst::Phi(p) if p.dst == reg => Some(p.ty.bytes()),
+                    Inst::Alloca(a) if a.dst == reg => Some(a.size),
+                    Inst::Freeze(f) if f.dst == reg => Some(f.ty.bytes()),
+                    _ => None,
+                };
+                if let Some(w) = d {
+                    return w;
+                }
+            }
+        }
+        panic!("isel-pic18: no def width for %{reg} in {}", self.cur_func)
     }
 
     /// The folded `(base, k, terms)` for pointer reg `r` in the current
@@ -301,6 +363,102 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// If `ptr` resolves to a `const` (flash) global, return
+    /// `(table_name, k, terms)` describing where into the table it points;
+    /// `None` for a RAM global or slot. A `Val::Global` const is `(name, 0,
+    /// [])`; a `Val::Reg` const uses its folded `(Base::Global, k, terms)`
+    /// from `resolve_pointers`. This is the flash-side counterpart of
+    /// `emit_ptr_setup`: every const read/store routes through it, and a
+    /// const `store` panics (ROM is not writable).
+    fn const_base_of(&self, ptr: &Val) -> Option<(String, u8, Vec<(u8, String)>)> {
+        match ptr {
+            Val::Global(g) if self.global_is_const(g) => Some((g.clone(), 0, Vec::new())),
+            Val::Reg(r) => match self.resolved_for(r) {
+                (Base::Global(name), k, terms) if self.global_is_const(&name) => {
+                    Some((name, k, terms))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Seed `TBLPTR = table_base + k + byte_off`: the STATIC part of a
+    /// const read. `MOVLW LOW/HIGH/UPPER(table)` load the byte-address
+    /// symbol (the table label's low/mid/upper byte, `TBLPTRL/U = 0xF6/F7/
+    /// F8`, all SFR segment so `a=0` and no `MOVLB`), then the constant
+    /// offset is folded in with carry chains. `TBLPTR` is a BYTE address:
+    /// PIC18 program memory is byte-packed (two bytes per 16-bit word),
+    /// which is exactly the address `LOW`/`HIGH`/`UPPER` resolve from the
+    /// table label's byte address.
+    fn emit_tblptr_static(&mut self, table: &str, k: u8, byte_off: u8) {
+        for (lit, reg) in [
+            (format!("LOW({table})"), 0xF6),
+            (format!("HIGH({table})"), 0xF7),
+            (format!("UPPER({table})"), 0xF8),
+        ] {
+            self.emit(format!("    MOVLW {lit}"));
+            self.emit(format!("    MOVWF 0x{reg:02X},A"));
+        }
+        let static_part = u16::from(k) + u16::from(byte_off);
+        if static_part != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
+            self.emit("    ADDWF 0xF6,F,A".to_string()); // TBLPTRL
+            self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
+            self.emit("    ADDWFC 0xF7,F,A".to_string()); // TBLPTRH
+            self.emit("    MOVLW 0x00".to_string());
+            self.emit("    ADDWFC 0xF8,F,A".to_string()); // TBLPTRU
+        }
+    }
+
+    /// Add the single dynamic term (if any) onto `TBLPTR` with carry,
+    /// `scale` times: `MOVF %reg_lo,W; ADDWF TBLPTRL,F; MOVLW 0;
+    /// ADDWFC TBLPTRH,F; ADDWFC TBLPTRU,F`, plus (for a 16-bit index
+    /// register) the high byte added onto `TBLPTRH` with its own carry.
+    /// `MOVLW` never touches C, so the ADDWF-set carry survives into the
+    /// `ADDWFC`s, the same discipline P3's `add_term_to_fsr0` relies on.
+    /// A 16-bit index needs its high byte folded in or `table[0x1XX]`
+    /// reads the wrong byte, which is why `reg_width` is consulted.
+    fn add_dynamic_to_tblptr(&mut self, terms: &[(u8, String)]) {
+        if let Some((scale, reg)) = terms.first() {
+            let lo = self.slot_addr(self.cur_func, reg).direct();
+            let width = self.reg_width(reg);
+            for _ in 0..*scale {
+                let (ra, rf) = self.operand(lo);
+                self.emit(format!("    MOVF 0x{rf:03X},W,{}", if ra == 0 { "A" } else { "B" }));
+                self.emit("    ADDWF 0xF6,F,A".to_string()); // TBLPTRL += idx_lo
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit("    ADDWFC 0xF7,F,A".to_string());
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit("    ADDWFC 0xF8,F,A".to_string());
+                if width == 2 {
+                    let (ha, hf) = self.operand(lo + 1);
+                    self.emit(format!("    MOVF 0x{hf:03X},W,{}", if ha == 0 { "A" } else { "B" }));
+                    self.emit("    ADDWF 0xF7,F,A".to_string());
+                    self.emit("    MOVLW 0x00".to_string());
+                    self.emit("    ADDWFC 0xF8,F,A".to_string());
+                }
+            }
+        }
+    }
+
+    /// One `const` (flash) byte read: `TBLPTR = table_base + k + Σ terms +
+    /// byte_off`, `TBLRD*` (no auto-increment: per-byte re-setup keeps
+    /// every read independent, mirroring P3's per-byte FSR0 re-setup), then
+    /// `MOVFF TABLAT, dst`. Multi-byte loads call this once per byte with
+    /// an increasing `byte_off`.
+    fn emit_const_load_byte(&mut self, table: &str, k: u8, terms: &[(u8, String)], byte_off: u8, dst: u16) {
+        assert!(
+            terms.len() <= 1,
+            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P4 scope; {} terms)",
+            terms.len()
+        );
+        self.emit_tblptr_static(table, k, byte_off);
+        self.add_dynamic_to_tblptr(terms);
+        self.emit("    TBLRD*".to_string());
+        self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
+    }
+
     fn emit_inst(&mut self, i: &Inst) {
         match i {
             Inst::Load(l) => {
@@ -313,6 +471,16 @@ impl<'m> Gen<'m> {
                 } else {
                     panic!("isel-pic18: malformed load pointer operand {:?}", l.ptr);
                 };
+                // P4: a load through a `const` (flash) base reads via
+                // TBLRD, one independent read per byte. Everything else
+                // (RAM globals, allocas, sret slots, dynamic pointers)
+                // keeps the P2/P3 FSR/INDF path.
+                if let Some((table, k, terms)) = self.const_base_of(&ptr_val) {
+                    for kk in 0..l.ty.bytes() {
+                        self.emit_const_load_byte(&table, k, &terms, kk, dst + u16::from(kk));
+                    }
+                    return;
+                }
                 for k in 0..l.ty.bytes() {
                     match self.emit_ptr_setup(&ptr_val, k) {
                         Addr::Direct(src) => self.emit_copy_byte(src, dst + u16::from(k)),
@@ -329,6 +497,14 @@ impl<'m> Gen<'m> {
                 } else {
                     panic!("isel-pic18: malformed store pointer operand {:?}", s.ptr);
                 };
+                // P4: a store through a `const` (flash) base is a write to
+                // ROM. It must panic loudly (matching PIC14's
+                // store-through-const panic), never silently emit a
+                // MOVFF/MOVWF that the simulator would apply to a RAM
+                // alias of the same low address.
+                if self.const_base_of(&ptr_val).is_some() {
+                    panic!("isel-pic18: ROM is not writable: store through const global {ptr_val:?}");
+                }
                 // Direct case: a single emit_ptr_setup(_, 0) covers the
                 // whole value via emit_move_val_to_slot (unchanged from
                 // P2 for the common @global case). Indirect case:
@@ -1208,6 +1384,28 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     out.push("__start:".to_string());
     out.push("    call main".to_string());
     out.push("    sleep".to_string());
+    // P4: every `const` (flash) global becomes a `DB` table after the code,
+    // before `end`. The bytes are the flat LE blob `irparse` decoded; the
+    // table label is the TBLPTR base `LOW`/`HIGH`/`UPPER` resolve. No
+    // chunking and no `.align`: PIC18's `TBLRD` addresses program memory
+    // linearly (byte addresses, two bytes per word), so the 511-byte
+    // `RETLW` ceiling of PIC14 stops existing here.
+    for g in &m.globals {
+        if !g.is_const {
+            continue;
+        }
+        assert!(
+            !g.bytes.is_empty(),
+            "isel-pic18: const @{} has no table bytes",
+            g.name
+        );
+        out.push(format!("{}:", g.name));
+        for chunk in g.bytes.chunks(8) {
+            let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
+            out.push(format!("    db {}", bytes.join(", ")));
+        }
+        out.push("".to_string());
+    }
     // gpasm requires the `end` directive (our own assembler tolerates its
     // absence); PIC14's `isel::select` emits it the same way.
     out.push("    end".to_string());

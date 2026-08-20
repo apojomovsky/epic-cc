@@ -97,10 +97,10 @@ pub fn assemble(src: &str) -> Vec<u16> {
     out
 }
 
-/// Word count of one PIC18 instruction line's mnemonic — 2 for the
+/// Word count of one PIC18 instruction line's mnemonic: 2 for the
 /// two-word forms (`GOTO`/`CALL`/`LFSR`/`MOVFF`), 1 for everything else.
-/// Directives never reach this (handled in `assemble_pic18`'s pass 1
-/// before this is called).
+/// `DB` never reaches this: `assemble_pic18` handles it in pass 1 (one
+/// byte per `db` value, packed two per word, see the `DB` doc there).
 fn instruction_words_pic18(line: &str) -> usize {
     let mne = line.split_whitespace().next().unwrap_or("");
     match mne.to_ascii_uppercase().as_str() {
@@ -111,9 +111,13 @@ fn instruction_words_pic18(line: &str) -> usize {
 
 /// Assemble PIC18 assembly source into 16-bit words indexed by word
 /// address. Two-pass like `assemble`: pass 1 resolves labels/`org`/`equ`
-/// and measures each line's size; pass 2 encodes. No `.align`/`.table` —
-/// P1 has no const-table codegen to emit them (that machinery arrives with
-/// `TBLRD` support in a later phase).
+/// and measures each line's size; pass 2 encodes. `DB <hex> [, <hex>]*`
+/// (case-insensitive) is a byte-data directive packing bytes into words
+/// little-endian, two per word (even byte = low, odd byte = high, the
+/// byte-packed flash model `TBLRD` reads, matching `gpasm -p p18f4550`'s
+/// own `DB` packing): each `db` value advances `org` by ONE byte, and pass
+/// 2 ORs each byte into `out[addr/2]` at shift `(addr % 2) * 8`. `DB` is
+/// not an instruction, so it never reaches `encode_pic18`.
 ///
 /// **`org` and labels are BYTE addresses here, unlike PIC14's `assemble`**
 /// (confirmed against `gpasm -p p18f4550`: `org 0x0020` places the next
@@ -127,6 +131,7 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
     let mut symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut org = 0usize; // byte address
     let mut lines: Vec<(usize, String)> = Vec::new(); // (byte address, line)
+    let mut db_bytes: Vec<(usize, u8)> = Vec::new(); // (byte address, value)
     for raw in src.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -156,11 +161,22 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
             symbols.insert(name.trim().to_string(), parse_num(val[" equ ".len()..].trim()));
             continue;
         }
+        if line.to_ascii_lowercase().starts_with("db ") {
+            for tok in line[3..].split(',') {
+                let s = tok.trim();
+                if s.is_empty() {
+                    continue;
+                }
+                db_bytes.push((org, (parse_num(s) & 0xFF) as u8));
+                org += 1; // one byte per db value
+            }
+            continue;
+        }
         let words = instruction_words_pic18(line);
         lines.push((org, line.to_string()));
         org += words * 2; // advance by BYTES
     }
-    let mut out = vec![0u16; org / 2];
+    let mut out = vec![0u16; (org + 1) / 2];
     for (addr, line) in &lines {
         let word_addr = addr / 2;
         let encoded = encode_pic18(*addr, line, &symbols);
@@ -168,6 +184,9 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         if encoded.len() == 2 {
             out[word_addr + 1] = encoded[1];
         }
+    }
+    for (addr, b) in db_bytes {
+        out[addr / 2] |= (u16::from(b)) << ((addr % 2) * 8);
     }
     out
 }
@@ -289,6 +308,10 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
             vec![base | k]
         }
         "CLRWDT" => vec![0x0004],
+        "TBLRD*" => vec![0x0008],
+        "TBLRD*+" => vec![0x0009],
+        "TBLRD*-" => vec![0x000A],
+        "TBLRD+*" => vec![0x000B],
         "PUSH" => vec![0x0005],
         "POP" => vec![0x0006],
         "DAW" => vec![0x0007],
@@ -424,18 +447,22 @@ fn strip_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 /// byte of the label's word address (a RETLW table's base, e.g. the
 /// `ADDLW LOW(table); MOVWF PCL` computed jump). `PAGE(<label>)` resolves to
 /// `(addr >> 11) << 3` — the PCLATH<4:3> page bits (bits 2:0 clear), the
-/// literal loaded into PCLATH before a cross-page CALL. A numeric operand
-/// inside the parens — `LOW(0x2A)`, `HIGH(0x123)`, `LOW(35)`, padded or
+/// literal loaded into PCLATH before a cross-page CALL. `UPPER(<label>)`
+/// resolves to byte 2 of the address (`(addr >> 16) & 0xFF`), the `TBLPTRU`
+/// byte of a const table's base (zero for flash below 64 KiB, but the
+/// encoding must still be emitted). A numeric operand inside the parens:
+/// `LOW(0x2A)`, `HIGH(0x123)`, `LOW(35)`, `UPPER(0x12345)`, padded or
 /// unpadded hex — resolves as the plain literal itself (LOW = n & 0xFF,
-/// HIGH = (n >> 8) & 0xFF, PAGE = (n >> 11) << 3), the same semantics as
-/// the label form; gpasm accepts `LOW(<n>)`/`HIGH(<n>)`, so a numeric
-/// operand is valid assembler input and must not be treated as a missing
-/// label.
+/// HIGH = (n >> 8) & 0xFF, PAGE = (n >> 11) << 3, UPPER = (n >> 16) & 0xFF),
+/// the same semantics as the label form; gpasm accepts `LOW(<n>)`/
+/// `HIGH(<n>)`, so a numeric operand is valid assembler input and must not
+/// be treated as a missing label.
 fn parse_lit(s: &str, sym: &std::collections::HashMap<String, usize>) -> usize {
     for (name, mask, shift) in [
         ("LOW(", 0xFFusize, 0usize),
         ("HIGH(", 0xFF, 8),
         ("PAGE(", 0x38, 8),
+        ("UPPER(", 0xFF, 16),
     ] {
         if let Some(inner) = strip_fn(s, name) {
             // A label operand resolves through the symbol table; a number

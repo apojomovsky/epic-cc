@@ -8,6 +8,7 @@ ADR-001 through ADR-008 live in this file. **Newer ADRs live one-per-file in
 one-line index entry here, e.g.:
 
 - ADR-009 — PIC18 pointer model: shared GEP fold, single FSR0, no PLUSWn, 2026-08-20
+- ADR-010 — PIC18 const via TBLRD (DB-packed flash, per-byte TBLPTR re-setup), 2026-08-20
 
 ---
 

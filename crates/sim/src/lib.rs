@@ -579,6 +579,14 @@ impl Pic18 {
             }
             0x0010 | 0x0011 => self.exec_retfie(),
             0x0012 | 0x0013 => self.pop_return(),
+            // TBLRD* / TBLRD*+ / TBLRD*- / TBLRD+*: single-word opcodes
+            // that read one byte of program memory into TABLAT. Must
+            // precede the literal arm below (0x0008..0x000B are numerically
+            // inside 0x0200..=0x6FFF).
+            0x0008 | 0x0009 | 0x000A | 0x000B => {
+                self.exec_tblrd(word);
+                pc + 2
+            }
             0x0100..=0x010F => {
                 self.ram[0xFE0] = (word & 0xF) as u8; // MOVLB: loads BSR
                 pc + 2
@@ -941,6 +949,49 @@ impl Pic18 {
         self.w = w;
         self.set_c(carry);
     }
+
+    /// The 21-bit byte address `TBLPTRU:TBLPTRH:TBLPTRL` points at
+    /// (`TBLPTRL` = `0xFF6`, `TBLPTRH` = `0xFF7`, `TBLPTRU` = `0xFF8`).
+    fn tblptr(&self) -> u32 {
+        ((self.ram[0xFF8] as u32) << 16) | ((self.ram[0xFF7] as u32) << 8) | self.ram[0xFF6] as u32
+    }
+    fn set_tblptr(&mut self, v: u32) {
+        self.ram[0xFF6] = (v & 0xFF) as u8;
+        self.ram[0xFF7] = ((v >> 8) & 0xFF) as u8;
+        self.ram[0xFF8] = ((v >> 16) & 0xFF) as u8;
+    }
+    /// The program-memory byte at byte address `addr` in the byte-packed
+    /// flash model (`asm`'s `DB` packing): even address = word low byte,
+    /// odd address = word high byte. Reads past the end of `prog` as 0x00.
+    fn read_flash_byte(&self, addr: u32) -> u8 {
+        let w = self.prog.get((addr / 2) as usize).copied().unwrap_or(0);
+        if addr % 2 == 0 {
+            (w & 0xFF) as u8
+        } else {
+            (w >> 8) as u8
+        }
+    }
+    /// Execute one of the four `TBLRD*` forms: read the byte at `TBLPTR`
+    /// into `TABLAT` (SFR `0xFF5`), then apply the pointer's side effect
+    /// (`*`: none; `*+`: post-increment; `*-`: post-decrement; `+*`:
+    /// pre-increment). TBLPTR is a BYTE address, so the step is 1, not 2;
+    /// the 21-bit register wraps mod `0x200000` exactly like the hardware.
+    fn exec_tblrd(&mut self, opcode: u16) {
+        match opcode {
+            0x000B => {
+                // TBLRD+*: increment BEFORE the read.
+                self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF);
+            }
+            _ => {}
+        }
+        self.ram[0xFF5] = self.read_flash_byte(self.tblptr());
+        match opcode {
+            0x0009 => self.set_tblptr(self.tblptr().wrapping_add(1) & 0x1F_FFFF), // TBLRD*+
+            0x000A => self.set_tblptr(self.tblptr().wrapping_sub(1) & 0x1F_FFFF), // TBLRD*-
+            _ => {}
+        }
+    }
+
     fn push_return(&mut self, addr: u32) {
         assert!(self.stack.len() < 31, "sim(pic18): call stack overflow (depth 31)");
         self.stack.push(addr);
@@ -1226,5 +1277,70 @@ impl Pic18 {
         } else {
             self.w = r;
         }
+    }
+}
+
+#[cfg(test)]
+mod pic18_tblrd {
+    use super::Pic18;
+
+    /// Build a `Pic18` whose flash word at byte 4 is `0x552A` (low byte
+    /// 0x2A, high byte 0x55) and whose program starts with `TBLRD*` then
+    /// `SLEEP`, with `TBLPTR` preset to byte address 4.
+    fn pic_with_table_at_byte4() -> Pic18 {
+        let mut prog = vec![0u16; 4];
+        prog[0] = 0x0008; // TBLRD*
+        prog[1] = 0x0003; // SLEEP
+        prog[2] = 0x552A; // table word at byte address 4
+        let mut pic = Pic18::new(prog);
+        pic.ram_mut()[0xFF6] = 0x04; // TBLPTRL
+        pic.ram_mut()[0xFF7] = 0x00; // TBLPTRH
+        pic.ram_mut()[0xFF8] = 0x00; // TBLPTRU
+        pic
+    }
+
+    #[test]
+    fn tblrd_star_reads_flash_byte_into_tablat() {
+        let mut pic = pic_with_table_at_byte4();
+        pic.run(10);
+        assert_eq!(pic.ram()[0xFF5], 0x2A, "TABLAT gets the even (low) byte");
+        assert_eq!(pic.ram()[0xFF6], 0x04, "TBLRD* leaves TBLPTR unchanged");
+    }
+
+    #[test]
+    fn tblrd_star_plus_increments_tblptr() {
+        let mut pic = pic_with_table_at_byte4();
+        pic.prog[0] = 0x0009; // TBLRD*+
+        pic.run(10);
+        assert_eq!(pic.ram()[0xFF5], 0x2A, "TABLAT = the even byte at 4");
+        assert_eq!(pic.ram()[0xFF6], 0x05, "TBLRD*+ advances TBLPTR to 5");
+    }
+
+    #[test]
+    fn tblrd_star_plus_at_odd_byte_reads_the_high_byte() {
+        let mut pic = pic_with_table_at_byte4();
+        pic.ram_mut()[0xFF6] = 0x05; // odd byte: high half of word 2
+        pic.prog[0] = 0x0009; // TBLRD*+
+        pic.run(10);
+        assert_eq!(pic.ram()[0xFF5], 0x55, "odd TBLPTR reads the word's high byte");
+    }
+
+    #[test]
+    fn tblrd_star_minus_decrements_tblptr() {
+        let mut pic = pic_with_table_at_byte4();
+        pic.ram_mut()[0xFF6] = 0x05;
+        pic.prog[0] = 0x000A; // TBLRD*-
+        pic.run(10);
+        assert_eq!(pic.ram()[0xFF5], 0x55, "TABLAT = the byte at 5");
+        assert_eq!(pic.ram()[0xFF6], 0x04, "TBLRD*- backs TBLPTR to 4");
+    }
+
+    #[test]
+    fn tblrd_plus_star_preincrements_tblptr() {
+        let mut pic = pic_with_table_at_byte4();
+        pic.prog[0] = 0x000B; // TBLRD+*
+        pic.run(10);
+        assert_eq!(pic.ram()[0xFF5], 0x55, "TBLRD+* reads the byte at 5 (pre-incremented)");
+        assert_eq!(pic.ram()[0xFF6], 0x05, "TBLRD+* leaves TBLPTR at 5");
     }
 }

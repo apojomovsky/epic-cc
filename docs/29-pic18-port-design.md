@@ -246,7 +246,7 @@ not a judgement.
 | **P1** | PIC18 `asm` encoder and `sim` core. Hand-written `.asm` inputs only, no codegen. | `gpasm -p p18f4550` byte-for-byte HEX match, plus simulator tests per instruction group. |
 | **P2** | Integer spine: `isel-pic18`, Access Bank + BSR banking, `Slot::Direct`. | `add.c`, `scalar.c`, `overlay.c`, `banked.c` |
 | **P3** | **DONE** Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
-| **P4** | `const` in flash via `TBLRD`. | `const_table.c`, and the 511-byte ceiling stops existing |
+| **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
 | **P5** | Interrupts: two vectors, high and low priority. | `interrupt.c`, `interrupt_gate.c`, `interrupt_mul.c` |
 | **P6** | 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c` |
 | **P7** | Soft-float. | `float.c` |
@@ -258,6 +258,15 @@ not a judgement.
 table read; since `TBLRD` is P4's job, P3 used a substitute
 `ptr_probe_pic18.c` (RAM pointer only) and the original file's full parity
 becomes a P4 acceptance addition once `TBLRD` lands.
+
+**P4 note (2026-08-20):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p4.md`](superpowers/plans/2026-08-20-pic18-port-p4.md),
+closing the P3 note: the ORIGINAL `ptr_probe.c` (RAM pointer + `const` read)
+now runs on PIC18 via `TBLRD` (ADR-010). `const` reads are linear
+byte-packed flash reads through `TBLPTR`/`TABLAT`; the PIC14 `RETLW`
+chunk machinery (256-byte windows, 511-byte ceiling) is not ported, so the
+ceiling stops existing. `const_table.c` (300 bytes) passes with its PIC14
+expected value.
 
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely

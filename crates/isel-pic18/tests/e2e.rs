@@ -181,3 +181,37 @@ fn structs_c_runs_correctly() {
     assert_eq!(p.ram()[globals["out"] as usize], 0x4E, "out == hand-computed 0x4E");
     assert!(p.halted());
 }
+
+// P4 end-to-end acceptance: const (flash) globals read via TBLRD. The two
+// fixtures are byte-identical to PIC14's (crates/driver/tests/fixtures/),
+// so the expected values come from the PIC14 e2e tests of the same C
+// source; on PIC18 the const reads go through TBLRD instead of the RETLW
+// tables, and there is no 511-byte chunking.
+
+#[test]
+fn const_table_c_runs_correctly() {
+    // Mirrors crates/driver/tests/const_table_e2e.rs: in == 290 (0x0122)
+    // -> out = (0x33 + 0x02 + 0x3C + 0x11) & 0xFF = 0x82, the four reads
+    // exercising chunk-1, chunk-0, chunk-1-last, and chunk-boundary
+    // byte offsets of the 300-byte table (PIC18 reads them all linearly
+    // via TBLRD; no chunks exist anymore).
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/const_table.c"));
+    p.ram_mut()[globals["in"] as usize] = 0x22; // 290 = 0x0122, lo byte
+    p.ram_mut()[globals["in"] as usize + 1] = 0x01; // hi byte
+    p.run(500_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0x82, "out == 0x82 for in == 290 (four boundary reads)");
+    assert!(p.halted());
+}
+
+#[test]
+fn ptr_probe_c_runs_correctly() {
+    // The ORIGINAL ptr_probe.c (full parity with PIC14, per docs/29's P3
+    // note): a runtime RAM pointer AND a const-table read in one program.
+    // Mirrors crates/driver/tests/ptr_probe_e2e.rs: in = 1 -> i = 1 ->
+    // ram[1] = table[1] = 20 (via TBLRD) -> out = 20.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/ptr_probe.c"));
+    p.ram_mut()[globals["in"] as usize] = 1; // in = 1 (16-bit; hi byte zero by default)
+    p.run(200_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 20, "out == table[1] == 20 for in == 1");
+    assert!(p.halted());
+}

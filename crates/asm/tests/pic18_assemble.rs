@@ -211,3 +211,50 @@ fn movff_moves_between_two_full_12_bit_addresses() {
     let words = assemble_pic18("    MOVFF 0x55, 0xF80\n");
     assert_eq!(words, vec![0xC055, 0xFF80]);
 }
+
+#[test]
+fn db_packs_two_bytes_little_endian() {
+    let words = assemble_pic18("    org 0x0000\n    db 0x12\n    db 0x34\n    end\n");
+    assert_eq!(words, vec![0x3412]);
+}
+
+#[test]
+fn db_at_odd_byte_ors_into_the_word_s_high_byte() {
+    // A NOP occupies bytes 0-1, so `db 0xAA` lands at byte 2 (even): word 1's
+    // low byte. A second `db 0xBB` at byte 3 ORs into the same word's high
+    // byte. Odd/even selection must be per-byte, not per-word.
+    let words = assemble_pic18("    org 0x0000\n    nop\n    db 0xAA\n    db 0xBB\n    end\n");
+    assert_eq!(words[0], 0x0000);
+    assert_eq!(words[1], 0xBBAA);
+}
+
+#[test]
+fn db_bytes_advance_the_address_by_one_each() {
+    // 5 db bytes = 2.5 words: the odd trailing byte must not be dropped or
+    // mis-packed into word 1's low byte.
+    let words = assemble_pic18("    org 0x0000\n    db 0x01\n    db 0x02\n    db 0x03\n    db 0x04\n    db 0x05\n    end\n");
+    assert_eq!(words.len(), 3, "5 bytes pack into 3 words");
+    assert_eq!(words[0], 0x0201);
+    assert_eq!(words[1], 0x0403);
+    assert_eq!(words[2], 0x0005);
+}
+
+#[test]
+fn tblrd_all_four_forms_encode() {
+    let cases: &[(&str, u16)] = &[
+        ("TBLRD*", 0x0008),
+        ("TBLRD*+", 0x0009),
+        ("TBLRD*-", 0x000A),
+        ("TBLRD+*", 0x000B),
+    ];
+    for (src, expected) in cases {
+        let words = assemble_pic18(&format!("    {src}\n"));
+        assert_eq!(words, vec![*expected], "encoding {src}");
+    }
+}
+
+#[test]
+fn parse_lit_upper_resolves_the_third_byte() {
+    let words = assemble_pic18("foo equ 0x12345\n    org 0x0000\n    movlw UPPER(foo)\n    end\n");
+    assert_eq!(words[0], 0x0E01, "UPPER(0x12345) == 0x01");
+}
