@@ -42,6 +42,10 @@ struct Gen<'m> {
     /// on the next banked access rather than assumed).
     bsr: Option<u8>,
     cur_func: &'m str,
+    /// True when this function is an interrupt handler: the function body
+    /// runs with a save prologue / restore epilogue and `RETFIE` instead of
+    /// a plain `RETURN` (P5, single-vector compatibility mode).
+    isr: bool,
     /// Module-scoped fresh-label counter, shared across every function so
     /// the emitted `tmp{n}:` labels stay unique in the single `.asm`
     /// output (mirrors `isel`'s `tmp` field, `crates/isel/src/lib.rs:177`).
@@ -1282,7 +1286,26 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // Every pointer reg in the module, folded once up front; later tasks'
     // pointer emitters consume it via `Gen::resolved_for`.
     let resolved = resolve_pointers(m);
-    for f in &m.funcs {
+    // P5: at most one ISR (single-vector compatibility mode, the docs/29
+    // ruling this plan settles). The vector entry is the ISR body itself:
+    // the hardware jumps to 0x0008 (GIE-gated), so the ISR must be emitted
+    // FIRST at that address, before any ordinary function.
+    let isr_count = m.funcs.iter().filter(|f| f.isr).count();
+    assert!(
+        isr_count <= 1,
+        "isel-pic18: {isr_count} interrupt handlers, single-vector compatibility mode supports at most 1 (multiple ISRs not yet supported; see the P5 plan ruling)"
+    );
+    let mut funcs: Vec<&Func> = m.funcs.iter().collect();
+    funcs.sort_by_key(|f| !f.isr); // ISR first, then ordinary functions
+    for f in funcs {
+        if f.isr {
+            // The vector entry at 0x0008 IS the ISR body (the hardware
+            // jumps there with GIE cleared; no GOTO indirection, matching
+            // PIC14's vector-as-entry convention). `__start`'s reset GOTO
+            // at 0x0000 reaches it regardless: PIC18 GOTO/CALL are absolute
+            // 20-bit.
+            out.push("    org 0x0008".to_string());
+        }
         let mut g = Gen {
             m,
             addrs,
@@ -1290,6 +1313,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             retval_lo: common_lo,
             bsr: None,
             cur_func: &f.name,
+            isr: f.isr,
             tmp: &mut tmp,
             out: Vec::new(),
         };
@@ -1329,8 +1353,39 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
         }
         let doms = block_dominators(f);
-        for b in &f.blocks {
+        for (bi, b) in f.blocks.iter().enumerate() {
             g.emit_label(&labels[&b.label]);
+            if bi == 0 && f.isr {
+                // The ISR save prologue, right after the vector entry at
+                // 0x0008. The preempted main's live state this saves:
+                //   - the in-flight return value (0x0000-0x0003): an ISR
+                //     that itself calls a value-returning function would
+                //     clobber it (PIC14 M13's identical hazard)
+                //   - STATUS/BSR/FSR0L/FSR0H: the ISR body's own banked
+                //     access and FSR0 pointer work would clobber them
+                //   - TBLPTRU/H/L: a const read is a multi-instruction
+                //     setup, so an interrupt taken mid-setup leaves a torn
+                //     pointer the ISR body's own const reads would misread
+                // W is saved LAST via MOVWF (which clobbers nothing), so
+                // the preempted main's W is intact until the very last
+                // save instruction.
+                for (src, dst) in [
+                    (common_lo, common_lo + 12),
+                    (common_lo + 1, common_lo + 13),
+                    (common_lo + 2, common_lo + 14),
+                    (common_lo + 3, common_lo + 15),
+                    (0xFD8, common_lo + 1), // STATUS
+                    (0xFE0, common_lo + 2), // BSR
+                    (0xFE9, common_lo + 3), // FSR0L
+                    (0xFEA, common_lo + 4), // FSR0H
+                    (0xFF6, common_lo + 5), // TBLPTRL
+                    (0xFF7, common_lo + 6), // TBLPTRH
+                    (0xFF8, common_lo + 7), // TBLPTRU
+                ] {
+                    g.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+                }
+                g.emit("    MOVWF 0x0004,A".to_string()); // W, last
+            }
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
                 match inst {
@@ -1409,6 +1464,38 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                         }
                     }
                 }
+                Some(Inst::Ret(None)) if g.isr => {
+                    // The ISR restore epilogue replaces `ret`. MOVFF-based
+                    // (never touches STATUS), so the interrupted main's
+                    // Z/N come back intact; only the final W restore via
+                    // MOVF sets Z/N from the moved value (the one accepted
+                    // flag loss, same as PIC14's W-last convention). The
+                    // retval snapshot is restored first, then the SFRs
+                    // (reverse of the prologue), STATUS, and W last.
+                    for (src, dst) in [
+                        (common_lo + 15, common_lo + 3),
+                        (common_lo + 14, common_lo + 2),
+                        (common_lo + 13, common_lo + 1),
+                        (common_lo + 12, common_lo),
+                        (common_lo + 7, 0xFF8), // TBLPTRU
+                        (common_lo + 6, 0xFF7), // TBLPTRH
+                        (common_lo + 5, 0xFF6), // TBLPTRL
+                        (common_lo + 4, 0xFEA), // FSR0H
+                        (common_lo + 3, 0xFE9), // FSR0L
+                        (common_lo + 2, 0xFE0), // BSR
+                        (common_lo + 1, 0xFD8), // STATUS
+                    ] {
+                        g.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+                    }
+                    g.emit("    MOVF 0x0004, W, A".to_string()); // W last
+                    g.emit("    RETFIE".to_string());
+                }
+                Some(Inst::Ret(Some(_))) if g.isr => {
+                    panic!(
+                        "isel-pic18: interrupt handler @{} must be void (cannot return a value)",
+                        f.name
+                    )
+                }
                 Some(Inst::Ret(None)) => g.emit("    RETURN".to_string()),
                 Some(Inst::Ret(Some((ty, v)))) => {
                     for i in 0..ty.bytes() {
@@ -1485,6 +1572,7 @@ mod tests {
                 retval_lo: 0,
                 bsr: None,
                 cur_func: "f",
+                isr: false,
                 tmp: &mut tmp,
                 out: Vec::new(),
             };
@@ -1498,6 +1586,7 @@ mod tests {
                 retval_lo: 0,
                 bsr: None,
                 cur_func: "f",
+                isr: false,
                 tmp: &mut tmp,
                 out: Vec::new(),
             };
@@ -1525,6 +1614,7 @@ mod p3_gen_tests {
             retval_lo: 0,
             bsr: None,
             cur_func: "main",
+            isr: false,
             tmp,
             out: Vec::new(),
         }

@@ -84,6 +84,62 @@ fn literal_ptr_reg_store_copies_via_movff() {
 }
 
 #[test]
+fn isr_emits_vector_prologue_and_retfie() {
+    let m = parse(
+        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    assert!(asm.contains("org 0x0008"), "ISR must be placed at the high vector:\n{asm}");
+    assert!(asm.contains("MOVFF 0x000, 0x00C"), "retval snapshot lo:\n{asm}");
+    assert!(asm.contains("MOVFF 0x003, 0x00F"), "retval snapshot hi:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFD8, 0x001"), "STATUS save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFE0, 0x002"), "BSR save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFE9, 0x003"), "FSR0L save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFEA, 0x004"), "FSR0H save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFF6, 0x005"), "TBLPTRL save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFF7, 0x006"), "TBLPTRH save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFF8, 0x007"), "TBLPTRU save:\n{asm}");
+    assert!(asm.contains("MOVWF 0x0004,A"), "W save last:\n{asm}");
+    // The epilogue: reverse order, MOVFF-based (flags survive), W last via
+    // MOVF (the one accepted flag clobber), then RETFIE.
+    assert!(asm.contains("MOVFF 0x00F, 0x003"), "retval restore hi:\n{asm}");
+    assert!(asm.contains("MOVFF 0x001, 0xFD8"), "STATUS restore:\n{asm}");
+    assert!(asm.contains("MOVF 0x0004, W, A"), "W restore:\n{asm}");
+    assert!(asm.contains("RETFIE"), "ISR must end with RETFIE:\n{asm}");
+}
+
+#[test]
+fn non_isr_functions_still_emit_plain_return() {
+    let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
+    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    assert!(asm.contains("RETURN"));
+    assert!(!asm.contains("RETFIE"));
+    assert!(!asm.contains("org 0x0008"));
+}
+
+#[test]
+#[should_panic(expected = "multiple ISRs")]
+fn two_isrs_panic_loudly() {
+    let m = parse(
+        "fn isr1(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn isr2(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let _ = select(&PIC18F4550, &m, &addrs(&[]));
+}
+
+#[test]
+#[should_panic(expected = "must be void")]
+fn isr_returning_a_value_panics() {
+    let m = parse(
+        "fn isr(i8) [isr] ()\n  block entry:\n    ret i8 5\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let _ = select(&PIC18F4550, &m, &addrs(&[]));
+}
+
+#[test]
 fn i8_binops_load_b_into_w_then_operate_against_a() {
     let cases: &[(&str, &str)] = &[
         ("add", "ADDWF"), ("sub", "SUBWF"), ("and", "ANDWF"), ("or", "IORWF"), ("xor", "XORWF"),
