@@ -23,8 +23,9 @@
 //     whose bit 15 is set — the m12 sign-fill path).
 //   - main's live locals are exactly 9 x i32 (36 bytes): the runtime
 //     routines' frames (base = frame_end(main), biggest __sdiv_i32 at 20
-//     bytes) must stay inside bank 0 (end <= 0x6F) — the loud isel bank-0
-//     assert fires otherwise. Every non-routine op (the adds/shifts, the
+//     bytes) fit inside bank 0 (end <= 0x6F); a straddling routine frame
+//     rounds into bank 1 wholesale (issue #6), so this layout needs no
+//     rounding. Every non-routine op (the adds/shifts, the
 //     icmps, the casts, the struct byval/sret) lives in the noinline helper
 //     `misc`, whose frame has no bank constraint (it calls no runtime
 //     routine). The udiv/mul chain and the urem are split into two locals

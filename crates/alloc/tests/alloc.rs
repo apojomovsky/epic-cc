@@ -636,3 +636,82 @@ fn a_single_global_larger_than_any_bank_panics_even_under_total_capacity() {
     m.globals[0].size = 200;
     let _ = allocate(&PIC16F877A, &m, "depth 1\n");
 }
+
+/// The `__mul_u16` routine module used by the issue-#6 rounding tests: two
+/// i16 params (a, b) plus a 14-byte scratch alloca (the legalize-injected
+/// shape). The frame is 18 bytes; `main` carries `n` i8 locals (no globals,
+/// so the root frame starts at 0x20).
+fn routine_module(main_locals: u32) -> ir::Module {
+    let mut src = String::from(
+        "fn __mul_u16(i16) (a=i16, b=i16)\n\
+           block entry:\n\
+             %__scr = alloca 14\n\
+         fn main(void) ()\n\
+           block entry:\n",
+    );
+    for i in 0..main_locals {
+        src.push_str(&format!("    %m{i} = add i8 1, 2\n"));
+    }
+    src.push_str("    ret void\n");
+    parse(&src)
+}
+
+#[test]
+fn routine_frame_fitting_bank0_stays_put() {
+    // main's frame ends at 0x20 + 62 = 0x5E; __mul_u16's 18-byte frame at
+    // 0x5E..0x70 fits entirely inside bank 0 (last byte 0x6F), so the
+    // derived base is kept (sibling packing is unaffected).
+    let m = routine_module(62);
+    let out = allocate(&PIC16F877A, &m, "edge main __mul_u16\n");
+    assert_eq!(out.locals["__mul_u16::a"], 0x5E);
+    assert_eq!(out.locals["__mul_u16::__scr"], 0x62);
+    assert_eq!(out.locals["__mul_u16::__scr"] + 14, 0x70, "frame ends exactly at the bank-0 boundary");
+}
+
+#[test]
+fn routine_frame_straddling_rounds_into_the_next_bank() {
+    // main's frame ends at 0x20 + 0x40 = 0x60: __mul_u16's 18-byte frame
+    // derived at 0x60 would straddle the bank-0/1 boundary, with params at
+    // 0x60/0x62 but the 14-byte scratch hopping to 0xA0 (place_contiguous
+    // moves the whole local), leaving the frame split across banks, which is
+    // forbidden (skip-sensitive recipe loops, issue #6). The base rounds
+    // wholesale to bank 1 (0xA0), so the whole frame sits inside it.
+    let m = routine_module(0x40);
+    let out = allocate(&PIC16F877A, &m, "edge main __mul_u16\n");
+    assert_eq!(out.locals["__mul_u16::a"], 0xA0, "rounded to bank 1's start");
+    assert_eq!(out.locals["__mul_u16::b"], 0xA2);
+    assert_eq!(out.locals["__mul_u16::__scr"], 0xA4);
+    assert_eq!(out.locals["__mul_u16::__scr"] + 13, 0xB1, "whole frame inside bank 1");
+}
+
+#[test]
+fn routine_rounding_wastes_only_the_partial_bank() {
+    // main -> f (74 i8 locals: frame 0x20..0x6A, physical end 0x6A); f calls
+    // __udiv_u8 (3 bytes: fits bank 0 at 0x6A, no rounding) and __mul_u16
+    // (18 bytes: derived at 0x6A, the 14-byte scratch would hop past the
+    // common region into bank 1, so the frame rounds wholesale to 0xA0;
+    // only the partial bank-0 tail is wasted).
+    let mut src = String::from(
+        "fn __udiv_u8(i8) (num=i8, den=i8)\n\
+           block entry:\n\
+             %__scr = alloca 4\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n\
+           block entry:\n\
+             %__scr = alloca 14\n\
+         fn f(void) ()\n\
+           block entry:\n",
+    );
+    for i in 0..74u32 {
+        src.push_str(&format!("    %f{i} = add i8 1, 2\n"));
+    }
+    src.push_str("    call void @__udiv_u8()\n    call void @__mul_u16()\n    ret void\n");
+    src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
+    let m = parse(&src);
+    let out = allocate(&PIC16F877A, &m, "edge main f\nedge f __udiv_u8\nedge f __mul_u16\n");
+    // The 3-byte routine packs in the bank-0 tail at f's frame end.
+    assert_eq!(out.locals["__udiv_u8::num"], 0x6A);
+    // The 18-byte routine would straddle -> rounds to bank 1.
+    assert_eq!(out.locals["__mul_u16::a"], 0xA0);
+    assert_eq!(out.locals["__mul_u16::__scr"], 0xA4);
+    assert_eq!(out.locals["__mul_u16::__scr"] + 14, 0xB2, "whole frame inside bank 1");
+}

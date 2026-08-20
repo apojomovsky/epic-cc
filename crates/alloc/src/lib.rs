@@ -165,6 +165,31 @@ fn frame_end(device: &Device, base: u16, widths: &[u8]) -> u16 {
     addr
 }
 
+/// The frame base for a runtime routine: a frame that stays inside the bank
+/// its derived base lands in keeps that base (sibling routines pack
+/// contiguously, wasting nothing); a frame that would straddle a bank
+/// boundary moves wholesale to the next bank's start. The routine recipe
+/// loops are skip-sensitive (issue #6): a BANKSEL the banking pass would
+/// insert between a test and its target, or between the two operands of a
+/// same-skip carry idiom (`INCFSZ f,W` targeting `ADDWF g,F`), would
+/// change the skip targets, so the whole frame must live in ONE GPR bank.
+fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
+    let end = frame_end(device, base, widths);
+    let (_, region_end) = device
+        .region_for(base)
+        .expect("alloc: routine frame base in a device GPR bank");
+    if end - 1 <= region_end {
+        return base; // the whole frame fits in the base's bank
+    }
+    // The frame would straddle: snap to the next bank's start (it always
+    // fits there, a routine frame is at most 22 bytes, far under a bank).
+    let next = region_end + 1;
+    device
+        .region_for(next)
+        .map(|(s, _)| s)
+        .unwrap_or_else(|| panic!("alloc: routine frame needs a bank past 0x{region_end:X}"))
+}
+
 /// Every function transitively reachable from `roots` over the caller ->
 /// callee map `edges` (the roots included). A visited set keeps a call cycle
 /// (rejected loudly earlier by the topological sort) from looping forever.
@@ -389,6 +414,15 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 .expect("alloc: empty caller list"),
             None => bank0_start,
         };
+        // Issue #6: a runtime routine's frame must stay inside ONE GPR bank
+        // (its skip-sensitive recipe loops cannot tolerate a BANKSEL between
+        // a test and its target, or inside a carry idiom). The base is
+        // rounded when the derived frame would straddle a bank boundary.
+        let b = if ir::is_runtime_routine(f) {
+            routine_base(device, b, &locals_widths[f])
+        } else {
+            b
+        };
         base.insert(f.clone(), b);
     }
 
@@ -442,6 +476,13 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                     .map(|p| frame_end(device, base[p], &locals_widths[p]))
                     .max()
                     .expect("alloc: empty caller list")
+            };
+            // Issue #6: the ISR context's routine copies get the same
+            // single-bank frame rounding as the main context's.
+            let b = if ir::is_runtime_routine(f) {
+                routine_base(device, b, &locals_widths[f])
+            } else {
+                b
             };
             base.insert(f.clone(), b);
         }

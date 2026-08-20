@@ -732,9 +732,11 @@ fn param(name: &str, width: u8) -> Param {
 /// buffers, Task 3 emits the mul/div/rem recipe bodies against them, Task 4
 /// the shift recipe bodies. The recipes read their inputs from the param
 /// slots (`a`/`b`, `num`/`den`, `val`/`cnt`), write the result to the retval
-/// slots, and use `__scr` strictly by offset. All addresses must stay in
-/// bank 0 (≤ 0xFF) — the recipes' loops are skip-sensitive, so no BANKSEL
-/// may be inserted between a test and its target.
+/// slots, and use `__scr` strictly by offset. Every routine's frame must
+/// stay inside ONE GPR bank (any bank, issue #6), because the recipes'
+/// loops are skip-sensitive: no BANKSEL may be inserted between a test and
+/// its target or inside a carry idiom. `alloc` rounds a routine's base into
+/// a single bank; `isel` verifies the placement.
 ///
 /// | routine | `__scr` size | offsets |
 /// |---|---|---|

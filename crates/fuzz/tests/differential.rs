@@ -343,8 +343,10 @@ __attribute__((noinline)) u8 fold32(u32 v) {\n\
 /// A fixed float test program: the float-fold globals + `body` in main.
 /// The fixed programs are kept to ~2 statements: main's frame holds every
 /// SSA def, and it must leave bank-0 room for the soft-float routine slots
-/// (the isel's loud assert — main_end + 14 <= 0x70), exactly the budget the
-/// generator models. `in3` is parameterized for the 1-ulp sensitivity pin.
+/// (a straddling routine frame rounds into bank 1 wholesale, so keeping
+/// main_end + routine <= 0x70 keeps the frame in bank 0), exactly the
+/// budget the generator models. `in3` is parameterized for the 1-ulp
+/// sensitivity pin.
 fn float_prog(body: &str, in3: u32) -> Program {
     let c_source = format!("{TYPEDEF_PROLOGUE}{FLOAT_GLOBALS}void main(void) {{\n{body}}}\n");
     Program {
@@ -634,7 +636,8 @@ const SIGNED_BODY: &str = "\
 /// exercises ashr sign-fill, and the negative comparisons (slt/sge) run
 /// against the sign-bit set. The body is kept lean (const divisors, no
 /// runtime-divisor guards) so main's frame leaves bank-0 room for the
-/// sdiv/srem i16 routine slots (the isel's loud assert).
+/// sdiv/srem i16 routine slots (a straddling routine frame rounds into
+/// bank 1 wholesale).
 fn signed_prog() -> Program {
     let prologue = format!(
         "{TYPEDEF_PROLOGUE}\

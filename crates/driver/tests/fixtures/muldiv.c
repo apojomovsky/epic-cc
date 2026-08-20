@@ -17,9 +17,10 @@
 //     with a volatile `gate` round-trip so clang keeps genuine i8 SSA
 //     values instead of widening the whole chain to i16.
 //   - the steps are merged just enough (`(out + v) * 5`) to keep main's
-//     frame end <= 0x5E: the runtime recipes' slots must be <= 0x7F (the
-//     loud isel assert fires otherwise — the plan's unmerged shape spills
-//     __mul_u16's 14-byte scratch into bank 1).
+//     frame end <= 0x5E: the runtime recipes' slots must fit one GPR bank
+//     (issue #6; a straddling routine frame rounds into bank 1 wholesale,
+//     and the plan's unmerged shape spills __mul_u16's 14-byte scratch
+//     across the bank-0/1 boundary).
 //
 // Expected: in = 301 -> out = 210 (traced in muldiv_e2e.rs against the
 // exact emitted IR; the plan's shape recomputed — clang strength-reduced

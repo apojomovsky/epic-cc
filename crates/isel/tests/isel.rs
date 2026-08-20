@@ -3053,26 +3053,27 @@ fn mul_div_rem_routines_simulate_correctly() {
     }
 }
 
-/// A routine slot that the banking pass would relocate (0xA0-0xEF is bank
-/// 1) would need BANKSELs inserted inside the skip-sensitive recipe loops —
-/// loud assert, never a silent miscompile. 0xA0 slid under the old ≤0xFF
-/// bound even though the asm encoder rejects file registers past 0x7F.
+/// A routine frame straddling banks (params in bank 0, `__scr` moved to
+/// bank 1) must fail loudly: a BANKSEL the banking pass would insert
+/// between a test and its target, or between the two operands of a carry
+/// idiom, would change the skip targets. Loud assert, never a silent
+/// miscompile.
 #[test]
-#[should_panic(expected = "bank-0")]
+#[should_panic(expected = "straddle banks")]
 fn panics_on_banked_routine_slot() {
     let (ir, mut map) = routine_module("__mul_u8");
     for (k, v) in map.iter_mut() {
         if k == "__mul_u8::__scr" {
-            *v = 0xA0; // bank 1 (0x80-0xEF): pre-fix this passed silently
+            *v = 0xA0; // bank 1 (0x80-0xEF): straddles the bank-0 params
         }
     }
     let _ = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
 }
 
-/// A routine slot past the 0x7F bound entirely (beyond RAM) must also fail
-/// loudly.
+/// A routine slot in a different bank entirely (0x120 is bank 2) must also
+/// fail loudly.
 #[test]
-#[should_panic(expected = "bank-0")]
+#[should_panic(expected = "straddle banks")]
 fn panics_on_routine_slot_past_ram() {
     let (ir, mut map) = routine_module("__mul_u8");
     for (k, v) in map.iter_mut() {
@@ -3081,6 +3082,54 @@ fn panics_on_routine_slot_past_ram() {
         }
     }
     let _ = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
+}
+
+/// Issue #6: a routine whose WHOLE frame sits in a non-zero bank is legal;
+/// the banking pass selects that bank once at the routine entry and never
+/// inserts a BANKSEL between a skip test and its target inside the recipe.
+/// The banked asm must assemble and simulate to the same result as the
+/// bank-0 layout.
+#[test]
+fn multi_bank_routine_frame_computes_correctly() {
+    // Move the whole __mul_u8 frame (params + scratch) into bank 1; main's
+    // locals stay in bank 0. The recipe operands are rewritten to their
+    // 7-bit bank-relative forms by the banking pass.
+    let (ir, mut map) = routine_module("__mul_u8");
+    for (k, v) in map.iter_mut() {
+        match k.as_str() {
+            "__mul_u8::a" => *v = 0xA0,
+            "__mul_u8::b" => *v = 0xA1,
+            "__mul_u8::__scr" => *v = 0xA2,
+            _ => {}
+        }
+    }
+    let m = parse(&ir);
+    let asm = select(&PIC16F877A, &m, &addrs(&map_refs(&map)));
+    let banked = banking::assign_banks(&PIC16F877A, &asm);
+
+    // The load-bearing invariant: no BANKSEL may sit between a skip test
+    // (BTFSS/BTFSC/INCFSZ/DECFSZ) and the instruction it skips over; that
+    // would change the skip target.
+    let lines: Vec<&str> = banked.lines().collect();
+    for w in lines.windows(2) {
+        let t0 = w[0].trim();
+        let t1 = w[1].trim();
+        let is_skip = t0.starts_with("BTFSS") || t0.starts_with("BTFSC")
+            || t0.starts_with("INCFSZ") || t0.starts_with("DECFSZ");
+        let is_banksel = t1.starts_with("BSF STATUS") || t1.starts_with("BCF STATUS");
+        assert!(
+            !(is_skip && is_banksel),
+            "a BANKSEL must never sit between a skip test and its target:\n{banked}"
+        );
+    }
+
+    let words = asm::assemble(&banked);
+    let mut p = pic14_sim::Pic14::new(words);
+    p.ram_mut()[0x20] = 35; // global ina (copied into the routine's a slot)
+    p.ram_mut()[0x21] = 7; // global inb (copied into the routine's b slot)
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{banked}");
+    assert_eq!(p.ram()[0x22], 245, "35 * 7 = 245 through the bank-1 routine frame");
 }
 
 // ---------------------------------------------------------------------------
@@ -3422,11 +3471,11 @@ fn variable_count_shifts_mask_wide_counts() {
     }
 }
 
-/// A shift-routine slot that the banking pass would relocate (bank 1) would
-/// need BANKSELs inside the skip-sensitive loop — loud assert, same as the
-/// mul/div/rem recipes.
+/// A shift-routine frame straddling banks (val in bank 0, `__scr` moved to
+/// bank 1) would need BANKSELs inside the skip-sensitive loop; loud
+/// assert, same as the mul/div/rem recipes.
 #[test]
-#[should_panic(expected = "bank-0")]
+#[should_panic(expected = "straddle banks")]
 fn panics_on_banked_shift_routine_slot() {
     let (ir, mut map) = routine_module("__shl_u16");
     for (k, v) in map.iter_mut() {
@@ -5263,15 +5312,15 @@ fn i32_routines_simulate_correctly() {
     }
 }
 
-/// A bank-1 i32 routine slot must fail loudly (same skip-sensitivity rule
-/// as the i8/i16 recipes).
+/// An i32 routine frame straddling banks must fail loudly (same
+/// skip-sensitivity rule as the i8/i16 recipes).
 #[test]
-#[should_panic(expected = "bank-0")]
+#[should_panic(expected = "straddle banks")]
 fn panics_on_banked_i32_routine_slot() {
     let (ir, mut map) = routine_module32("__mul_u32");
     for (k, v) in map.iter_mut() {
         if k == "__mul_u32::__scr" {
-            *v = 0xA0; // bank 1
+            *v = 0xA0; // bank 1, straddling the bank-0 params
         }
     }
     let _ = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));

@@ -375,9 +375,9 @@ struct Gen {
     rng: SplitMix64,
     /// `(name, width)` of every scalar local emitted so far (t0, t1, …).
     /// Statements reference only the most recent live ones, keeping main's
-    /// live set — and therefore its frame, which the runtime routines'
-    /// bank-0 slots must fit under — small (the long_e2e budget: ≤ 9 i32
-    /// locals).
+    /// live set (and therefore its frame, which the runtime routines'
+    /// frames stack under; a straddling routine frame rounds into the next
+    /// bank) small, the long_e2e budget is ≤ 9 i32 locals.
     locals: Vec<(String, u8)>,
     /// `(start, end)` index ranges of locals that died with their C block
     /// (if/else arms, loop bodies) — out of scope for later statements.
@@ -564,10 +564,14 @@ impl Gen {
     /// The backend gives every SSA def (volatile loads included) its own
     /// RAM slot, so main's frame size = the sum of its defs' widths. The
     /// runtime routines are main's callees: their frames start at main's
-    /// frame end and their LAST slot must stay before the common-RAM jump
-    /// at 0x70 (the loud isel bank-0 assert; 0x70-0x7F is never used by
-    /// locals), so main's frame is capped by the biggest routine the
-    /// program uses. Measured routine frames (params + scratch):
+    /// frame end, and each must stay inside ONE GPR bank (issue #6, the
+    /// recipe loops are skip-sensitive; alloc rounds a straddling routine
+    /// frame into the next bank). Bank 0 holds 0x20..0x6F and the first
+    /// routine frame ends no later than 0x6F (0x70-0x7F is common RAM,
+    /// never used by locals); a larger routine frame simply spills into
+    /// bank 1 wholesale instead of fitting bank 0, so the budget is the
+    /// same 0x70 bound with the same measured routine frames (params +
+    /// scratch):
     ///   u8 mul/div/rem/shift: 3, u16 shift: 6, u16 div/rem: 8,
     ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 18 (14-byte scratch),
     ///   u32 mul: 22.
@@ -1309,8 +1313,9 @@ impl Gen {
         // The routine's FULL frame (params + scratch) measured from the
         // alloc layout: __add_f32/__sub_f32/__mul_f32 = 4+4+14 = 22 bytes,
         // __div_f32 = 4+4+12 = 20. main_end + this must stay <= 0x70 (the
-        // recipe slots are skip-sensitive and must not cross the bank-0
-        // locals region end) — the M14 budget model's `worst_routine`.
+        // recipe slots are skip-sensitive; a straddling routine frame
+        // rounds into bank 1 wholesale, so the budget keeps the frame in
+        // bank 0), the M14 budget model's `worst_routine`.
         let routine = if matches!(op, FBin::Div) { 20 } else { 22 };
         if !self.fit(cost, routine, false, false) {
             return false;
@@ -1565,8 +1570,8 @@ pub fn generate(seed: u64) -> Program {
     // starve them.
     //
     // The flags are a BOUNDED random subset — exactly 2 of the 8, not
-    // independent bits: main's frame (and the runtime routines' bank-0
-    // slots derived from it) is a hard hardware limit, so one program can
+    // independent bits: main's frame (and the runtime routines' frames
+    // stacked under it) is a hard hardware limit, so one program can
     // only hold a couple of heavy constructs. An unbounded bit-draw let a
     // seed's forced tail exceed the budget and was SILENTLY DROPPED
     // (review finding — 'guaranteed when flagged' was false); force() now
@@ -1617,8 +1622,8 @@ pub fn generate(seed: u64) -> Program {
     // mul/div/rem and the structured constructs all fit), then a weighted
     // random fill bounded by the frame budget — the backend gives every
     // SSA def, volatile loads included, its own RAM slot, so main's frame,
-    // and the runtime routines' bank-0 slots derived from it, cap the
-    // program's size. While `forced` is set, the structured statements
+    // and the runtime routines' frames stacked under it, cap the program's
+    // size. While `forced` is set, the structured statements
     // pick their cheapest width so every flagged construct fits.
     let force = |g: &mut Gen, k: usize| -> bool {
         match k {
@@ -2118,10 +2123,10 @@ pub fn generate_ir(seed: u64) -> IrProgram {
     let in2_reg = "%2".to_string();
 
     // 2..=4 statements (the frame budget: every SSA def gets its own RAM
-    // slot, and the signed routines' frames must stay before the bank-0
-    // jump at 0x70 — the fixed shapes are small enough that 4 statements
-    // fit comfortably; the i32 sdiv (the biggest routine, 20 bytes) is
-    // drawn at most once).
+    // slot, and the signed routines' frames must stay before the common-RAM
+    // jump at 0x70 to fit bank 0; the fixed shapes are small enough that 4
+    // statements fit comfortably; the i32 sdiv (the biggest routine, 20
+    // bytes) is drawn at most once).
     let n = 2 + (rng2.next_u64() % 3) as usize;
     let mut last16: Option<String> = None; // IR reg of the last i16 result
     let mut last16_c: Option<String> = None; // its C local
