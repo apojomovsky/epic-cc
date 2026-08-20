@@ -579,7 +579,7 @@ impl Pic18 {
             }
             0x0010 | 0x0011 => self.exec_retfie(),
             0x0012 | 0x0013 => self.pop_return(),
-            // TBLRD* / TBLRD*+ / TBLRD*- / TBLRD+* — single-word opcodes
+            // TBLRD* / TBLRD*+ / TBLRD*- / TBLRD+*: single-word opcodes
             // that read one byte of program memory into TABLAT. Must
             // precede the literal arm below (0x0008..0x000B are numerically
             // inside 0x0200..=0x6FFF).

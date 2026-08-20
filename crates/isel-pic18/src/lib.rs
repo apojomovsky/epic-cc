@@ -1,4 +1,4 @@
-//! `isel-pic18` — instruction selection for the PIC18 integer spine (P2),
+//! `isel-pic18`: instruction selection for the PIC18 integer spine (P2),
 //! extended by P3 (pointers, arrays, structs) and P4 (`const` in flash via
 //! `TBLRD`). See docs/superpowers/plans/2026-08-18-pic18-port-p2.md (P2
 //! scope), 2026-08-20-pic18-port-p3.md (P3 scope), and
@@ -395,7 +395,7 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Seed `TBLPTR = table_base + k + byte_off` — the STATIC part of a
+    /// Seed `TBLPTR = table_base + k + byte_off`: the STATIC part of a
     /// const read. `MOVLW LOW/HIGH/UPPER(table)` load the byte-address
     /// symbol (the table label's low/mid/upper byte, `TBLPTRL/U = 0xF6/F7/
     /// F8`, all SFR segment so `a=0` and no `MOVLB`), then the constant
@@ -428,7 +428,7 @@ impl<'m> Gen<'m> {
     /// ADDWFC TBLPTRH,F; ADDWFC TBLPTRU,F`, plus (for a 16-bit index
     /// register) the high byte added onto `TBLPTRH` with its own carry.
     /// `MOVLW` never touches C, so the ADDWF-set carry survives into the
-    /// `ADDWFC`s — the same discipline P3's `add_term_to_fsr0` relies on.
+    /// `ADDWFC`s, the same discipline P3's `add_term_to_fsr0` relies on.
     /// A 16-bit index needs its high byte folded in or `table[0x1XX]`
     /// reads the wrong byte, which is why `reg_width` is consulted.
     fn add_dynamic_to_tblptr(&mut self, terms: &[(u8, String)]) {

@@ -97,7 +97,7 @@ pub fn assemble(src: &str) -> Vec<u16> {
     out
 }
 
-/// Word count of one PIC18 instruction line's mnemonic — 2 for the
+/// Word count of one PIC18 instruction line's mnemonic: 2 for the
 /// two-word forms (`GOTO`/`CALL`/`LFSR`/`MOVFF`), 1 for everything else.
 /// `DB` never reaches this: `assemble_pic18` handles it in pass 1 (one
 /// byte per `db` value, packed two per word, see the `DB` doc there).
@@ -113,7 +113,7 @@ fn instruction_words_pic18(line: &str) -> usize {
 /// address. Two-pass like `assemble`: pass 1 resolves labels/`org`/`equ`
 /// and measures each line's size; pass 2 encodes. `DB <hex> [, <hex>]*`
 /// (case-insensitive) is a byte-data directive packing bytes into words
-/// little-endian, two per word (even byte = low, odd byte = high — the
+/// little-endian, two per word (even byte = low, odd byte = high, the
 /// byte-packed flash model `TBLRD` reads, matching `gpasm -p p18f4550`'s
 /// own `DB` packing): each `db` value advances `org` by ONE byte, and pass
 /// 2 ORs each byte into `out[addr/2]` at shift `(addr % 2) * 8`. `DB` is
@@ -450,7 +450,7 @@ fn strip_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 /// literal loaded into PCLATH before a cross-page CALL. `UPPER(<label>)`
 /// resolves to byte 2 of the address (`(addr >> 16) & 0xFF`), the `TBLPTRU`
 /// byte of a const table's base (zero for flash below 64 KiB, but the
-/// encoding must still be emitted). A numeric operand inside the parens —
+/// encoding must still be emitted). A numeric operand inside the parens:
 /// `LOW(0x2A)`, `HIGH(0x123)`, `LOW(35)`, `UPPER(0x12345)`, padded or
 /// unpadded hex — resolves as the plain literal itself (LOW = n & 0xFF,
 /// HIGH = (n >> 8) & 0xFF, PAGE = (n >> 11) << 3, UPPER = (n >> 16) & 0xFF),

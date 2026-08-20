@@ -8,8 +8,8 @@ fn addrs(pairs: &[(&str, u16)]) -> HashMap<String, u16> {
 }
 
 /// Set the initializer bytes of a const global. The canonical IR text
-/// (`ir::parse`) carries no bytes — those arrive from irparse's `.ll`
-/// decode — so tests that exercise the emitted `db` table / `TBLRD` path
+/// (`ir::parse`) carries no bytes: those arrive from irparse's `.ll`
+/// decode, so tests that exercise the emitted `db` table / `TBLRD` path
 /// must supply them the way irparse would.
 fn with_bytes(mut m: ir::Module, name: &str, bytes: &[u8]) -> ir::Module {
     for g in &mut m.globals {
@@ -1211,7 +1211,7 @@ fn const_dynamic_index_load_uses_tblptr_add() {
     // A register-indexed const read: TBLPTR = base + k + scale*%reg, then
     // TBLRD*. The dynamic term must be ADDed onto the seeded TBLPTR with
     // carry, not silently dropped. (The canonical IR text carries no
-    // initializer bytes — those arrive from irparse's .ll decode — so the
+    // initializer bytes: those arrive from irparse's .ll decode, so the
     // GEP/base shape is what this test pins.)
     let m = with_bytes(
         parse(

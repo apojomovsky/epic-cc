@@ -1,10 +1,10 @@
 // Milestone-10 const-table acceptance: a 300-byte const (flash) table read
 // through the two-entry chunked readers. Bytes 0..255 = 0x00..0xFF; bytes
-// 256..299 = 0x11,0x12,...,0x3C (0x11 + (i-256)) — distinctive per-byte
+// 256..299 = 0x11,0x12,...,0x3C (0x11 + (i-256))  -  distinctive per-byte
 // values, so a wrong chunk/window lands on the wrong RETLW (a readable
 // wrong-answer, not a crash).
 //
-// Coverage (all runtime reads — see below):
+// Coverage (all runtime reads  -  see below):
 //   - `table[in]`      in = 290 -> chunk 1 (0x33)      runtime chunk-1 read
 //   - `table[in & 3]`  in = 290 -> table[2] = 0x02     runtime chunk-0 read
 //   - `table[in + 9]`  in = 290 -> table[299] = 0x3C   chunk-1 LAST byte (const-299-equivalent)
@@ -12,7 +12,7 @@
 //
 // Why no literal `table[299]` / `table[256]`: clang -O1 constant-folds a
 // load from a const-initialized array at a constant index into a literal
-// (`table[299]` -> `add i8 %v, 60`), so the read never reaches the IR —
+// (`table[299]` -> `add i8 %v, 60`), so the read never reaches the IR,
 // and if it did (gep with no terms), isel's large-table path panics
 // ("constant index into large const table"), since only a single 16-bit
 // reg index can select the chunk. The runtime-index forms above keep all
@@ -21,8 +21,8 @@
 // boundary read on byte 256).
 //
 // The `pad` filler (40 bytes) keeps the table section far enough past
-// main that the chunked table's `.align 256` lands on 0x100 — a nonzero
-// 256-byte window — so the reader's `MOVLW HIGH(table); MOVWF PCLATH` is
+// main that the chunked table's `.align 256` lands on 0x100  -  a nonzero
+// 256-byte window  -  so the reader's `MOVLW HIGH(table); MOVWF PCLATH` is
 // load-bearing (without it the computed PCL jump lands in window 0 and
 // every read returns a wrong byte). pad sorts before table (name order)
 // so its table is emitted first. It is "used once" (`out = pad[in & 15]`)
@@ -31,10 +31,10 @@
 // the final `out`.
 //
 // Layout: main is 187 words (M11 skips the PCLATH restore after a
-// same-page CALL — all of main's reader calls are same-page, so only the
+// same-page CALL  -  all of main's reader calls are same-page, so only the
 // sets remain), so goto (1) + __start (4) + main + __read_pad (6) puts pad
-// at base 0xC6 — pad fits its own window (0xC6 + 40 = 0xEE <= 0x100); the
-// chunked table's `.align 256` lifts the table to 0x100 (window 1 — the
+// at base 0xC6  -  pad fits its own window (0xC6 + 40 = 0xEE <= 0x100); the
+// chunked table's `.align 256` lifts the table to 0x100 (window 1  -  the
 // reader's `MOVLW HIGH(table)` is load-bearing): chunks at table/table_1
 // (LOW == 0 both), total 562 words < 0x800.
 //
