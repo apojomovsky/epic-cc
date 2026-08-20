@@ -129,18 +129,6 @@ impl<'m> Gen<'m> {
             .unwrap_or(false)
     }
 
-    /// The byte size of a global. For a const table this is the flat LE
-    /// byte blob `irparse` decoded (the P4 model has no chunking, so size
-    /// is used only for bounds sanity, never for dispatch).
-    fn global_size(&self, name: &str) -> u16 {
-        self.m
-            .globals
-            .iter()
-            .find(|g| g.name == name)
-            .map(|g| g.size)
-            .unwrap_or_else(|| panic!("isel-pic18: no global @{name}"))
-    }
-
     /// The byte width of a value-defining register in the current function
     /// (its slot is `bytes` wide), for scaling a dynamic const-table index
     /// when the index register is 16-bit. Mirrors `alloc::def_width`'s
