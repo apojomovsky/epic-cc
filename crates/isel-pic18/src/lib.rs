@@ -173,6 +173,23 @@ impl<'m> Gen<'m> {
             }
         }
         panic!("isel-pic18: no def width for %{reg} in {}", self.cur_func)
+    /// Parse a literal-pointer operand (`"0x<K>"`, the `inttoptr` form
+    /// irparse produces) into a full 12-bit physical data-space address.
+    /// A literal pointer is either an access-bank GPR address (`0x000-
+    /// 0x05F`, `a=0`) or an SFR address (`0xF60-0xFFF`, `a=0`): both need
+    /// no `BSR` select, which is what makes direct SFR access one
+    /// instruction. An address past the 12-bit data space panics loudly.
+    fn literal_ptr_addr(&self, ptr: &str) -> u16 {
+        let h = ptr
+            .strip_prefix("0x")
+            .unwrap_or_else(|| panic!("isel-pic18: malformed literal pointer {ptr:?}"));
+        let a = u16::from_str_radix(h, 16)
+            .unwrap_or_else(|_| panic!("isel-pic18: malformed literal pointer {ptr:?}"));
+        assert!(
+            a <= 0xFFF,
+            "isel-pic18: literal pointer 0x{a:03X} outside the 12-bit data space"
+        );
+        a
     }
 
     /// The folded `(base, k, terms)` for pointer reg `r` in the current
@@ -464,6 +481,16 @@ impl<'m> Gen<'m> {
             Inst::Load(l) => {
                 assert!(l.ty != Ty::I1, "isel-pic18: only i8/i16 loads supported");
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
+                // Literal-pointer (SFR) load: `inttoptr` form, a direct
+                // physical address — MOVFF copies byte-wise with no access
+                // bit and no BSR involvement.
+                if l.ptr.starts_with("0x") {
+                    let base = self.literal_ptr_addr(&l.ptr);
+                    for k in 0..l.ty.bytes() {
+                        self.emit_copy_byte(base + u16::from(k), dst + u16::from(k));
+                    }
+                    return;
+                }
                 let ptr_val = if let Some(g) = l.ptr.strip_prefix('@') {
                     Val::Global(g.to_string())
                 } else if let Some(r) = l.ptr.strip_prefix('%') {
@@ -490,6 +517,24 @@ impl<'m> Gen<'m> {
             }
             Inst::Store(s) => {
                 assert!(s.ty != Ty::I1, "isel-pic18: only i8/i16 stores supported");
+                // Literal-pointer (SFR) store: `inttoptr` form, a direct
+                // physical address. A register/global source copies via
+                // MOVFF (no access bit); a constant goes through W with
+                // `operand()`'s access-bit (a=0 for the SFR segment, no
+                // MOVLB).
+                if s.ptr.starts_with("0x") {
+                    let base = self.literal_ptr_addr(&s.ptr);
+                    match &s.val {
+                        Val::Const(_) => self.emit_move_val_to_slot(&s.val, s.ty, base),
+                        _ => {
+                            let src = self.val_addr(&s.val).direct();
+                            for i in 0..s.ty.bytes() {
+                                self.emit_copy_byte(src + u16::from(i), base + u16::from(i));
+                            }
+                        }
+                    }
+                    return;
+                }
                 let ptr_val = if let Some(g) = s.ptr.strip_prefix('@') {
                     Val::Global(g.to_string())
                 } else if let Some(r) = s.ptr.strip_prefix('%') {

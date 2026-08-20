@@ -59,6 +59,31 @@ fn store_a_constant_uses_movlw_then_movwf() {
 }
 
 #[test]
+fn literal_ptr_store_writes_the_sfr_with_no_bank() {
+    // PORTB = 0xF81 on the PIC18F4550 (SFR segment, a=0, no MOVLB).
+    let m = parse("fn main(void) ()\n  block entry:\n    store i8 85 0xF81\n    ret void\n");
+    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    assert!(asm.contains("MOVWF 0x081,A"), "SFR store must be a=0, no MOVLB:\n{asm}");
+    assert!(!asm.contains("MOVLB"), "SFR access must not touch BSR:\n{asm}");
+}
+
+#[test]
+fn literal_ptr_load_copies_from_the_sfr() {
+    let m = parse("global out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 0xF81\n    store i8 %1 @out\n    ret void\n");
+    let addrs = addrs(&[("out", 0x10), ("main::1", 0x11)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("MOVFF 0xF81, 0x011"), "SFR load must copy from 0xF81:\n{asm}");
+}
+
+#[test]
+fn literal_ptr_reg_store_copies_via_movff() {
+    let m = parse("global in i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 0xF81\n    ret void\n");
+    let addrs = addrs(&[("in", 0x10), ("main::1", 0x11)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("MOVFF 0x011, 0xF81"), "SFR reg store must copy via MOVFF:\n{asm}");
+}
+
+#[test]
 fn i8_binops_load_b_into_w_then_operate_against_a() {
     let cases: &[(&str, &str)] = &[
         ("add", "ADDWF"), ("sub", "SUBWF"), ("and", "ANDWF"), ("or", "IORWF"), ("xor", "XORWF"),
