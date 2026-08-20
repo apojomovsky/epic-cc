@@ -15,14 +15,14 @@
 // which would leave the arrays in bank 0).
 //
 // `in` is a 16-bit volatile so clang keeps the index mask `& 3` as an i16
-// `and` (isel lowers i16 and; it has no i8 and) , same discipline as
+// `and` (isel lowers i16 and; it has no i8 and), the same discipline as
 // array.c/ptr_probe.c. The brief's draft used a constant `i = 3`, which
 // clang -O1 folds into constant GEPs (killing the FSR coverage); the
 // runtime index `i = in & 3` keeps all three arrB[i] accesses dynamic.
 //
 // The brief's draft also copied arrB2[5] = arrB1[1] *before* writing
 // arrB1[1] = 0x07, which makes the direct copy copy a stale 0 (out would
-// end 0xB1, not 0xB8 , the plan's own comment claims 0x66 + 0x07 = 0x6D).
+// end 0xB1, not 0xB8: the plan's own comment claims 0x66 + 0x07 = 0x6D).
 // Reordered so the banked direct copy carries the live 0x07, preserving the
 // plan's coverage (banked direct copy BANKSEL read bank1 -> write bank2)
 // and the intended final value.
@@ -54,7 +54,7 @@ void main(void) {
     arrB2[i] = 0x22;                             // FSR+IRP write (bank 2)
     fill2[0] = 0x04;                             // touch fill2 (bank 2)
     arrB3[i] = 0x33;                             // FSR+IRP write (bank 3)
-    out = arrB1[i] + arrB2[i] + arrB3[i];                // 0x66 , FSR+IRP reads
+    out = arrB1[i] + arrB2[i] + arrB3[i];                // 0x66: FSR+IRP reads
     arrB1[1] = 0x07;
     arrB2[5] = arrB1[1];                                 // banked direct copy (BANKSEL)
     out = (unsigned char)(out + arrB2[5]);               // 0x66 + 0x07 = 0x6D

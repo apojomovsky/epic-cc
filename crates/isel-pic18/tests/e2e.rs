@@ -99,7 +99,7 @@ fn banked_c_runs_correctly() {
 /// `out`) fit entirely inside the Access Bank (max global address 0x5E),
 /// but `main`'s own locals (the loop-free but still substantial spill from
 /// summing 90 volatile loads into a 16-bit accumulator) push well past
-/// 0x5F, landing as high as 0x111 , so the emitted assembly DOES contain
+/// 0x5F, landing as high as 0x111, so the emitted assembly DOES contain
 /// `MOVLB`s, just for locals rather than globals. The fixture's name stays
 /// accurate; no global-count bump needed.
 #[test]
@@ -173,7 +173,7 @@ fn banked_ptr_c_runs_correctly() {
 
 #[test]
 fn structs_c_runs_correctly() {
-    // Mirrors crates/driver/tests/structs_e2e.rs: no input seeding , every
+    // Mirrors crates/driver/tests/structs_e2e.rs: no input seeding, every
     // value is a fixed constant, so out == 0x4E (hand trace in the
     // fixture's comment).
     let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/structs.c"));

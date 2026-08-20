@@ -8,7 +8,7 @@
 //! sret call + caller memcpy (`g = mk(3, 0x1234)`, mk writes its sret
 //! target through FSR0), byval calls (`sum(g)`, `pick(arr)`, caller copies
 //! into the byval slots), the dynamic array-in-struct read/store
-//! (`arr.v[arr.n]`, `x.v[x.n]` , FSR0 = base + runtime index), and the
+//! (`arr.v[arr.n]`, `x.v[x.n]`: FSR0 = base + runtime index), and the
 //! nested struct field math (`go.in.a/b/z` at offsets 0/2/4, i16 adds).
 use asm::assemble_file_to_hex;
 use std::process::Command;

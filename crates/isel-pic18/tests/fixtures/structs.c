@@ -1,13 +1,13 @@
 // Milestone-7 structs acceptance: the full M7 surface in one program.
-//   - sret call + struct copy: `g = mk(3, 0x1234)` , mk returns `struct Pair`
+//   - sret call + struct copy: `g = mk(3, 0x1234)`. mk returns `struct Pair`
 //     through a hidden sret pointer; the caller memcpy's the result into the
 //     volatile global `g`.
 //   - byval call from a global: `sum(g)` passes `g` as a byval `struct Pair`
 //     (callee reads p.a at offset 0, p.b at offset 2).
-//   - dynamic array-in-struct: `pick(arr)` reads `x.v[x.n]` , an FSR/INDF
+//   - dynamic array-in-struct: `pick(arr)` reads `x.v[x.n]`: an FSR/INDF
 //     load with a runtime index inside a byval struct; `arr.v[arr.n] = 0x11`
 //     is the matching dynamic store into the global array field.
-//   - nested-struct field math: `go.in.a / go.in.b / go.z` , folded byte
+//   - nested-struct field math: `go.in.a / go.in.b / go.z`: folded byte
 //     GEPs off one volatile global (offsets 0, 2, 4).
 //
 // NOTE: the brief's draft used a *local* `struct Outer o; o.in.a = 1; ...`
