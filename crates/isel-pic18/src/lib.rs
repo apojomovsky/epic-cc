@@ -11,11 +11,24 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 use ir::{Func, Inst, Module, Ty, Val};
-use iselcore::{ssa_key, Slot};
+use iselcore::{resolve_pointers, ssa_key, Base, Slot};
+
+/// The result of resolving a pointer to a concrete access. `Direct`: the
+/// address is statically known, so a plain `MOVFF`/`MOVF`/`MOVWF` reaches
+/// it. `Indirect`: `FSR0` has been set up and the access goes through
+/// `INDF0`.
+enum Addr {
+    Direct(u16),
+    Indirect,
+}
 
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
+    /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
+    /// its folded `(base, k, terms)` by `iselcore::resolve_pointers`; see
+    /// docs/superpowers/plans/2026-08-20-pic18-port-p3.md Task 1/3.
+    resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from
     /// `device.common_ram`) — see the plan's "Where the retval/scratch
     /// design comes from" section.
@@ -98,6 +111,19 @@ impl<'m> Gen<'m> {
             .addrs
             .get(name)
             .unwrap_or_else(|| panic!("isel-pic18: no address for @{name}"))
+    }
+
+    /// The folded `(base, k, terms)` for pointer reg `r` in the current
+    /// function, from the module-wide `resolve_pointers` map. A pointer
+    /// with no entry is a bug in an earlier stage (every `gep` result and
+    /// every byval/sret/alloca seed must have been resolved), so it
+    /// panics loudly rather than silently emitting a bogus access.
+    fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
+        let key = ssa_key(self.cur_func, r);
+        self.resolved
+            .get(&key)
+            .cloned()
+            .unwrap_or_else(|| panic!("isel-pic18: no gep for pointer %{r} ({key})"))
     }
 
     /// The `,A`/`,B` operand components `(a, f)` for a physical address
@@ -854,10 +880,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // Shared across every `Gen` below so `fresh_label()` never repeats a
     // `tmp{n}:` label across two different functions in the same output.
     let mut tmp = 0u32;
+    // Every pointer reg in the module, folded once up front; later tasks'
+    // pointer emitters consume it via `Gen::resolved_for`.
+    let resolved = resolve_pointers(m);
     for f in &m.funcs {
         let mut g = Gen {
             m,
             addrs,
+            resolved: &resolved,
             retval_lo: common_lo,
             bsr: None,
             cur_func: &f.name,
@@ -1021,11 +1051,13 @@ mod tests {
     fn fresh_label_counter_is_shared_across_gens() {
         let m = ir::parse("fn f(void) ()\n  block entry:\n    ret void\n");
         let addrs: HashMap<String, u16> = HashMap::new();
+        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
         let l1 = {
             let mut g = Gen {
                 m: &m,
                 addrs: &addrs,
+                resolved: &resolved,
                 retval_lo: 0,
                 bsr: None,
                 cur_func: "f",
@@ -1038,6 +1070,7 @@ mod tests {
             let mut g = Gen {
                 m: &m,
                 addrs: &addrs,
+                resolved: &resolved,
                 retval_lo: 0,
                 bsr: None,
                 cur_func: "f",
@@ -1055,10 +1088,16 @@ mod tests {
 mod p3_gen_tests {
     use super::*;
 
-    fn gen<'a>(m: &'a Module, addrs: &'a HashMap<String, u16>, tmp: &'a mut u32) -> Gen<'a> {
+    fn gen<'a>(
+        m: &'a Module,
+        addrs: &'a HashMap<String, u16>,
+        resolved: &'a HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+        tmp: &'a mut u32,
+    ) -> Gen<'a> {
         Gen {
             m,
             addrs,
+            resolved,
             retval_lo: 0,
             bsr: None,
             cur_func: "main",
@@ -1071,8 +1110,9 @@ mod p3_gen_tests {
     fn low_access_bank_needs_no_movlb() {
         let m = Module { globals: Vec::new(), funcs: Vec::new() };
         let addrs = HashMap::new();
+        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &mut tmp);
+        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         assert_eq!(g.operand(0x05F), (0, 0x5F));
         assert!(g.out.is_empty(), "no MOVLB for the low access-bank range");
     }
@@ -1081,8 +1121,9 @@ mod p3_gen_tests {
     fn banked_gpr_range_needs_movlb() {
         let m = Module { globals: Vec::new(), funcs: Vec::new() };
         let addrs = HashMap::new();
+        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &mut tmp);
+        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         assert_eq!(g.operand(0x0090), (1, 0x90));
         assert!(g.out.iter().any(|l| l.contains("MOVLB")), "the banked range needs a MOVLB");
     }
@@ -1091,8 +1132,9 @@ mod p3_gen_tests {
     fn sfr_high_segment_needs_no_movlb() {
         let m = Module { globals: Vec::new(), funcs: Vec::new() };
         let addrs = HashMap::new();
+        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &mut tmp);
+        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         // FSR0L, the address this task exists to fix.
         assert_eq!(g.operand(0xFE9), (0, 0xE9), "the SFR segment is access-bank, a=0");
         assert!(g.out.is_empty(), "no MOVLB for an SFR address, regardless of the tracked BSR");

@@ -923,3 +923,20 @@ fn call_const_sret_arg_is_rejected_not_silently_miscompiled() {
     let addrs = addrs(&[("f::p", 0x10)]);
     let _ = select(&PIC18F4550, &m, &addrs);
 }
+
+#[test]
+fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
+    // arr[2] with a CONST index folds to a plain direct address, no FSR,
+    // no LFSR, just a MOVFF at the folded address (base + 2).
+    let m = parse(
+        "global arr i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+           %p = gep @arr +2\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("arr", 0x100), ("out", 0x110), ("main::v", 0x111)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(
+        asm.contains("MOVFF 0x102, 0x111") || asm.contains("MOVFF 0x102,0x111"),
+        "arr[2] must read directly from base+2 (0x102), no FSR machinery:\n{asm}"
+    );
+    assert!(!asm.contains("LFSR"), "a fully-constant GEP needs no FSR setup:\n{asm}");
+}
