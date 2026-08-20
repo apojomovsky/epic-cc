@@ -34,10 +34,11 @@
 //     the fcmp result (via c), the fdiv RNE result (via f) and the
 //     sret/byval byte copies all flow into out3 — any one broken changes
 //     out3 from 0x3EAAAAAB.
-//   - Frame budget (bank 0 GPR 0x20-0x6F; the loud isel bank-0 assert
-//     fires otherwise): globals end at 0x30; main's 11 defs (33 bytes)
-//     end at 0x51; half's frame (8) ends at 0x59, and __div_f32's 20-byte
-//     slots (base = frame_end(half)) end at 0x6C. Everything fits.
+//   - Frame budget (bank 0 GPR 0x20-0x6F): globals end at 0x30; main's 11
+//     defs (33 bytes) end at 0x51; half's frame (8) ends at 0x59, and
+//     __div_f32's 20-byte slots (base = frame_end(half)) end at 0x6C. The
+//     whole routine frame sits in one bank, so no rounding is needed.
+//     Everything fits.
 //
 // Expected (in = 3.0f; the exact emitted IR and the hand computation are
 // traced in crates/driver/tests/float_e2e.rs):

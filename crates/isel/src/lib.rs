@@ -44,9 +44,10 @@ use ir::{BinOp, Gep, GepBase, Inst, MemLen, Module, Ty, Val};
 use iselcore::{ssa_key, Slot};
 use std::collections::{HashMap, HashSet};
 
-/// The runtime routine names legalize injects for mul/div/rem/shift. All
-/// twenty-four have recipe bodies (Task 3: the i32 mul/div/rem + shifts;
-/// M8: the i8/i16 set). An injected routine's entry block holds only a
+/// The runtime routine names legalize injects for mul/div/rem/shift and the
+/// soft-float set. All thirty-three have recipe bodies (Task 3: the i32
+/// mul/div/rem + shifts; M8: the i8/i16 set; M15: the nine float
+/// routines). An injected routine's entry block holds only a
 /// scratch alloca, so emitting it as-is would produce an empty label that
 /// silently falls through into the next function — a routine name with no
 /// recipe yet must panic loudly instead.
@@ -164,6 +165,7 @@ enum Addr {
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
+    device: &'m Device,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)` — GEP chains fully collapsed (base
     /// `Reg` replaced by the base's own entry), plus the seeded pointer
@@ -2091,17 +2093,36 @@ impl<'m> Gen<'m> {
 
     // ---- M8 Task 3: mul/div/rem runtime routine recipes ----
 
-    /// Every recipe slot must sit in bank 0 (≤ 0x7F): 0x80-0xEF maps to
-    /// bank 1, and the loops are skip-sensitive (BTFSS + GOTO, DECFSZ +
-    /// GOTO) — a BANKSEL the banking pass would insert for a banked slot
-    /// would change the skip targets. Loud, documented limitation
-    /// (multi-bank runtime routines are a follow-up); the bound matches the
-    /// asm encoder's own ≤ 0x7F file-register range.
+    /// Every recipe slot must sit inside ONE GPR bank (issue #6): the loops
+    /// are skip-sensitive (BTFSS + GOTO, DECFSZ + GOTO, INCFSZ + ADDWF), so
+    /// a BANKSEL the banking pass would insert between a test and its
+    /// target, or between the two operands of a carry idiom, would change
+    /// the skip targets. `alloc` rounds a routine's frame wholesale into a
+    /// single bank; this verifies the placement (a silent straddle would
+    /// miscompile, so it panics loudly instead).
     fn assert_bank0(&self, addrs: &[u16], routine: &str) {
-        for &a in addrs {
+        if addrs.is_empty() {
+            return;
+        }
+        let first = addrs[0];
+        let target = self.device.bank_of(first).unwrap_or_else(|| {
+            panic!(
+                "isel: {routine} slot 0x{first:02X} is not a banked GPR \
+                 (recipe loops are skip-sensitive; a BANKSEL would change skip targets)"
+            )
+        });
+        for &a in &addrs[1..] {
+            let b = self.device.bank_of(a).unwrap_or_else(|| {
+                panic!(
+                    "isel: {routine} slot 0x{a:02X} is not a banked GPR \
+                     (recipe loops are skip-sensitive; a BANKSEL would change skip targets)"
+                )
+            });
             assert!(
-                a <= 0x7F,
-                "isel: {routine} slot 0x{a:02X} out of bank-0 range (recipe loops are skip-sensitive; a BANKSEL would change skip targets)"
+                b == target,
+                "isel: {routine} slots straddle banks (0x{first:02X} bank {target}, \
+                 0x{a:02X} bank {b}); recipe loops are skip-sensitive, a BANKSEL \
+                 would change skip targets"
             );
         }
     }
@@ -2736,8 +2757,8 @@ impl<'m> Gen<'m> {
             // << 1 | (b2 >> 7)) is nonzero. Args arrive in the routine's
             // param slots; the result goes to the fixed retval region
             // (0x71-0x74); working state lives in `__scr` at the Task-2
-            // contract offsets. All slots stay <= 0x7F (bank 0, loud) — the
-            // loops are skip-sensitive.
+            // contract offsets. All slots stay inside one GPR bank (any
+            // bank, issue #6), the loops are skip-sensitive.
             "__add_f32" | "__sub_f32" => {
                 let pa = self.slot_addr(name, "a").direct();
                 let pb = self.slot_addr(name, "b").direct();
@@ -2803,7 +2824,8 @@ impl<'m> Gen<'m> {
     /// The value shifts **in place in the `val` param slot** (the caller's
     /// copy); the masked count runs the loop from `__scr::cnt@0` (the
     /// layout-contract offset). ashr sets C from the sign bit before each
-    /// rrf so the sign fills every vacated bit.
+    /// rrf so the sign fills every vacated bit. All slots stay inside one
+    /// GPR bank (any bank, issue #6), the loops are skip-sensitive.
     fn emit_shift_body(&mut self, bytes: u16, op: BinOp, scr: u16) {
         let name = self.cur_func;
         let val = self.slot_addr(name, "val").direct();
@@ -5648,6 +5670,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             let mut g = Gen {
                 m,
                 addrs,
+                device,
                 resolved: &resolved,
                 scratch,
                 retval_lo,
@@ -5868,6 +5891,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 let mut g = Gen {
                     m,
                     addrs,
+                    device,
                     resolved: &resolved,
                     scratch,
                     retval_lo,

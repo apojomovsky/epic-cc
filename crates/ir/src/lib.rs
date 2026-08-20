@@ -139,6 +139,52 @@ pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: 
 #[derive(Clone, Debug)]
 pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func> }
 
+/// True for the legalize-injected runtime routines (the mul/div/rem/shift
+/// and soft-float recipe bodies), including the interrupt-context `_isr`
+/// copies. The recipe bodies are skip-sensitive (BTFSS/DECFSZ + GOTO,
+/// INCFSZ + ADDWF), so a routine's frame must sit inside a single GPR bank:
+/// `alloc` rounds routine bases and `isel` verifies the placement. Shared
+/// by both stages; `legalize` injects exactly these names.
+pub fn is_runtime_routine(name: &str) -> bool {
+    let base = name.strip_suffix("_isr").unwrap_or(name);
+    matches!(
+        base,
+        "__mul_u8"
+            | "__mul_u16"
+            | "__mul_u32"
+            | "__udiv_u8"
+            | "__urem_u8"
+            | "__udiv_u16"
+            | "__urem_u16"
+            | "__udiv_u32"
+            | "__urem_u32"
+            | "__sdiv_i8"
+            | "__srem_i8"
+            | "__sdiv_i16"
+            | "__srem_i16"
+            | "__sdiv_i32"
+            | "__srem_i32"
+            | "__shl_u8"
+            | "__lshr_u8"
+            | "__ashr_i8"
+            | "__shl_u16"
+            | "__lshr_u16"
+            | "__ashr_i16"
+            | "__shl_u32"
+            | "__lshr_u32"
+            | "__ashr_i32"
+            | "__add_f32"
+            | "__sub_f32"
+            | "__mul_f32"
+            | "__div_f32"
+            | "__cmp_f32"
+            | "__uitofp_f32"
+            | "__sitofp_f32"
+            | "__fptoui_f32"
+            | "__fptosi_f32"
+    )
+}
+
 fn val_str(v: &Val) -> String {
     match v { Val::Reg(r) => format!("%{r}"), Val::Const(k) => k.to_string(), Val::Global(g) => format!("@{g}") }
 }
