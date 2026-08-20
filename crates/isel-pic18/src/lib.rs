@@ -101,14 +101,25 @@ impl<'m> Gen<'m> {
     }
 
     /// The `,A`/`,B` operand components `(a, f)` for a physical address
-    /// used by a `W`-routing instruction (`ADDWF`/`SUBWF`/.../`CPFSxx`),
-    /// emitting `MOVLB` first if the tracked `BSR` doesn't already match.
-    /// `MOVFF`-based plain copies (`emit_copy_byte`, below) never call
-    /// this — they take full 12-bit addresses directly and need no bank
+    /// used by a `W`-routing instruction (`ADDWF`/`SUBWF`/.../`CPFSxx`/
+    /// `MOVWF`), emitting `MOVLB` first if the tracked `BSR` doesn't
+    /// already match. PIC18's Access Bank is TWO disjoint ranges: the low
+    /// general-purpose segment (`0x000-0x05F`) and the high SFR segment
+    /// (`0xF60-0xFFF` [VERIFY against DS39632], every SFR, including
+    /// FSR0L/FSR0H/FSR1L/FSR1H/FSR2L/FSR2H, lives here), BOTH always
+    /// reachable via `a=0` with no `MOVLB`, regardless of `BSR`. Only the
+    /// MIDDLE range (`0x060-0xF5F`, ordinary banked GPR) needs a bank
+    /// select. Getting this wrong for the SFR segment would emit a
+    /// `MOVLB` before every FSR-setup write and address FSRnL/FSRnH as
+    /// `,B`, architecturally wrong; hardware requires `,A` for the SFR
+    /// segment unconditionally.
+    ///
+    /// `MOVFF`-based plain copies (`emit_copy_byte`, above) never call
+    /// this: they take full 12-bit addresses directly and need no bank
     /// bit at all, which is why `Load`/`Store`/`Phi`-copies/`Call`-arg-
-    /// copies (Tasks 4, 11, 12, 13) never touch `BSR`.
+    /// copies never touch `BSR`.
     fn operand(&mut self, addr: u16) -> (u16, u16) {
-        if addr < 0x60 {
+        if addr < 0x60 || addr >= 0xF60 {
             (0, addr & 0xFF)
         } else {
             let bank = (addr >> 8) as u8;
@@ -1037,5 +1048,53 @@ mod tests {
         };
         assert_eq!(l1, "tmp0");
         assert_eq!(l2, "tmp1", "a second Gen sharing the same backing counter must continue, not restart, the sequence");
+    }
+}
+
+#[cfg(test)]
+mod p3_gen_tests {
+    use super::*;
+
+    fn gen<'a>(m: &'a Module, addrs: &'a HashMap<String, u16>, tmp: &'a mut u32) -> Gen<'a> {
+        Gen {
+            m,
+            addrs,
+            retval_lo: 0,
+            bsr: None,
+            cur_func: "main",
+            tmp,
+            out: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn low_access_bank_needs_no_movlb() {
+        let m = Module { globals: Vec::new(), funcs: Vec::new() };
+        let addrs = HashMap::new();
+        let mut tmp = 0u32;
+        let mut g = gen(&m, &addrs, &mut tmp);
+        assert_eq!(g.operand(0x05F), (0, 0x5F));
+        assert!(g.out.is_empty(), "no MOVLB for the low access-bank range");
+    }
+
+    #[test]
+    fn banked_gpr_range_needs_movlb() {
+        let m = Module { globals: Vec::new(), funcs: Vec::new() };
+        let addrs = HashMap::new();
+        let mut tmp = 0u32;
+        let mut g = gen(&m, &addrs, &mut tmp);
+        assert_eq!(g.operand(0x0090), (1, 0x90));
+        assert!(g.out.iter().any(|l| l.contains("MOVLB")), "the banked range needs a MOVLB");
+    }
+
+    #[test]
+    fn sfr_high_segment_needs_no_movlb() {
+        let m = Module { globals: Vec::new(), funcs: Vec::new() };
+        let addrs = HashMap::new();
+        let mut tmp = 0u32;
+        let mut g = gen(&m, &addrs, &mut tmp);
+        // FSR0L, the address this task exists to fix.
+        assert_eq!(g.operand(0xFE9), (0, 0xE9), "the SFR segment is access-bank, a=0");
+        assert!(g.out.is_empty(), "no MOVLB for an SFR address, regardless of the tracked BSR");
     }
 }
