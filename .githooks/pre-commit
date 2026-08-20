@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# pre-commit: workspace hygiene before every commit.
+#   - rustfmt --check on the staged Rust files, via the dev container
+#     (the only rustfmt that exists — nothing rust-related is installed
+#     on the host)
+#   - trailing whitespace on staged files
+#
+# Install with: make setup-hooks
+
+set -uo pipefail
+
+# Only check files that are actually staged; respect the dev container's
+# existence (skip format checks if the image isn't built yet, e.g. first
+# commit in a fresh clone).
+staged_rs=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
+
+if [ -n "$staged_rs" ]; then
+  if docker image inspect epic-cc-dev:local >/dev/null 2>&1; then
+    if ! echo "$staged_rs" | docker run --rm -i \
+      --user "$(id -u):$(id -g)" \
+      -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+      -v "$PWD":/workspace -w /workspace epic-cc-dev:local \
+      bash -c 'xargs rustfmt --check --edition 2021' >/dev/null 2>&1; then
+      echo "pre-commit: staged Rust files are not rustfmt-clean; run: make fmt"
+      echo "pre-commit: (advisory for now — the workspace-wide fmt sweep is a"
+      echo "pre-commit:  separate task; this check becomes a hard gate after it)"
+    fi
+  else
+    echo "pre-commit: epic-cc-dev:local not built, skipping rustfmt check (make image)"
+  fi
+fi
+
+# Trailing whitespace on staged files (any kind). `git diff --check` exits
+# nonzero on violations; keep its exit status (a pipe would mask it).
+if ! git diff --cached --check; then
+  echo "pre-commit: trailing whitespace or conflict markers; fix and re-stage"
+  exit 1
+fi
+
+exit 0

@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# commit-msg: reject auto-attribution trailers. Agent-generated commits
+# must be authored by the human; git history is the record.
+#
+# Install with: make setup-hooks
+
+set -uo pipefail
+
+if grep -qiE '^(co-authored-by|coauthored-by|authored-by):' "$1"; then
+  echo "commit-msg: 'Co-Authored-By' and similar trailers are not allowed (see AGENTS.md)" >&2
+  exit 1
+fi
+
+exit 0
