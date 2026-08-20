@@ -18,7 +18,7 @@ Read `docs/30-distribution-design.md` (the docker toolchain) and
 `docs/01-target-pic14.md` (why the target is hard) before touching
 code.
 
-The front end is a **pinned clang 20.1.8** — its version is part of our
+The front end is a **pinned clang 20.1.8**: its version is part of our
 input format, so the pin is a migration, never housekeeping. The
 release bundles ship it; the dev container builds it from the
 digest-pinned source tarball.
@@ -28,7 +28,7 @@ digest-pinned source tarball.
 Everything runs inside the docker dev image. **No rustup, clang, or
 gpasm on the host; never install them.** The `ci` Dockerfile stage is an
 empty alias of `dev` (identical filesystem), so running locally in the
-dev image IS running in the ci image — there is no separate local ci
+dev image IS running in the ci image. There is no separate local ci
 image and no reason to build one.
 
 ```bash
@@ -49,7 +49,7 @@ make help           # all targets
 The container runs as your uid (files you write stay host-owned), and
 cargo caches live under `~/.cache/epic-cc/` (persisted across runs, the
 host `target/` is never touched). `make exec` hands its `CMD` to
-`bash -c` — avoid double quotes inside it.
+`bash -c`; avoid double quotes inside it.
 
 ## Worktrees
 
@@ -72,12 +72,31 @@ Fast inner loop, in the container: `make shell`, edit in the mounted
 workspace, `make test CRATE=<crate>` / `make compile`. A build or test
 failing with too little output: `make shell` for the full picture.
 
-Every stage boundary is a text artifact — when debugging a miscompile,
+Every stage boundary is a text artifact. When debugging a miscompile,
 bisect stage by stage (`.ll` text → our IR → alloc map → `.asm`) before
 reading code. The verification stack is layered and all local:
 our own PIC14 simulator (`crates/sim`), a gpasm byte-for-byte
 cross-check (oracle only, GPL, never shipped), e2e acceptance programs
 through the whole pipeline, and differential fuzzing (`crates/fuzz`).
+
+## Takeoff ritual (before every PR)
+
+Run `make pre-pr-check` before opening a PR. It is the gate; it checks:
+
+1. Working tree clean, branch not behind `origin/master`.
+2. **No plan files in the PR's final diff.** Plans live through
+   development; the final commit distills load-bearing decisions into
+   an ADR (`docs/adr/ADR-00N-<topic>.md` + an index line in
+   `docs/03`) and `git rm`s the plan. Squash merging then keeps master
+   plan-free. The plan stays visible in the PR's commit history.
+3. Commit hygiene: conventional single-line subjects, no trailers,
+   no em-dashes, no whitespace errors.
+4. Hooks installed (`make setup-hooks`).
+5. `make pre-pr-check TEST=1` also runs the full suite.
+
+The script exits 1 with the exact fix list while blocking items are
+outstanding. Don't skip it; the CI gate only covers the suite, not the
+ritual.
 
 ## Commit hygiene
 
@@ -85,8 +104,10 @@ through the whole pipeline, and differential fuzzing (`crates/fuzz`).
   `feat(scope): summary`, `fix(...)`, `chore(...)`, `docs(...)`,
   `build(...)`, `ci(...)`, `test(...)`. Scope is usually the crate
   (`isel`, `banking`, `driver`) or `docker`.
-- **Never `Co-Authored-By:` or any other trailer.** The commit-msg hook
-  rejects them. The commit message is yours; git history is the record.
+- **Never `Co-Authored-By:` or any other trailer, and no em-dashes
+  (—).** The commit-msg hook rejects both. Use a comma, a colon, or a
+  period instead. Git history is the record; the commit message is
+  yours.
 - Commit whenever a piece of work is finished; don't batch unrelated
   changes.
 - Update the docs a change touches before calling it done.
@@ -104,7 +125,7 @@ through the whole pipeline, and differential fuzzing (`crates/fuzz`).
   compiler is not.
 - **Never commit the reference PDFs.** They are copyrighted and live
   outside the repo (`docs/06-environment.md`).
-- **Don't copy the Microchip datasheets into docs either** — link them.
+- **Don't copy the Microchip datasheets into docs either**: link them.
 - **Panics are the error surface today.** Unsupported input aborts with
   a precise message; that is deliberate (correct over silent
   miscompile). Don't "fix" panics by emitting wrong code.
@@ -128,6 +149,10 @@ through the whole pipeline, and differential fuzzing (`crates/fuzz`).
    commit, not in the tree, where they go stale. Durable toolchain or
    hardware facts (with a date) are a different class and stay.
 5. `TODO`/`FIXME` carry a concrete reason or do not exist.
+6. **No em-dashes (—) in prose.** Not in comments, docs, or commit
+   messages: use a comma, a colon, or a period and a new sentence.
+   The exception is ascii-art diagrams, where alignment may force
+   them. The pre-pr-check and commit-msg hook enforce this.
 
 ### Rust doc comments (the Doxygen equivalent)
 
@@ -138,7 +163,7 @@ Rust's documentation comments are `///` (item docs, rendered by
   in the pipeline, its text boundary (the stage contract).
 - `///` on public items whose behavior isn't obvious from the
   signature. Document the contract: what it does, what it returns,
-  what it panics on. No `@param`/`@return` boilerplate — Rust has real
+  what it panics on. No `@param`/`@return` boilerplate: Rust has real
   types; prose contracts beat re-stated signatures.
 - Panic and invariant notes belong in the doc comment (e.g. "panics
   if the page assignment straddles a boundary").
@@ -147,15 +172,25 @@ Rust's documentation comments are `///` (item docs, rendered by
 ### Docs lifecycle
 
 1. `docs/NN-*.md` = the numbered design/decision series; `docs/03` is
-   the ADR log. These are living documents.
-2. Design docs are ephemeral: written during the work, deleted on
-   completion. Git history is the archive.
-3. No bitacores: findings narratives and session logs describing
+   the ADR log (ADR-001..008) and the index for newer ADRs. Living
+   documents.
+2. **Implementation plans** (`docs/superpowers/plans/`) are ephemeral:
+   they live through development and are deleted in the final commit
+   before merging (the takeoff ritual enforces this). The PR's commit
+   history keeps them for archaeology; master never carries them.
+   Design docs are not plans: they stay.
+3. **Decisions distill into ADRs when worth it** (pragmatism): a bug
+   fix usually does not earn an ADR, a feature or an architectural
+   change does. Distillation happens in the same final commit that
+   deletes the plan. New ADRs go to `docs/adr/ADR-00N-<topic>.md`
+   (Status line, decision, rationale, rejected alternatives) with a
+   one-line index entry added to `docs/03-decisions.md`.
+4. No bitacores: findings narratives and session logs describing
    completed work are deleted. Live gotchas live in
    `docs/09-build-environment.md` (toolchain) or the ADRs (decisions).
-4. **No test counts in the README or live docs.** They go stale on
+5. **No test counts in the README or live docs.** They go stale on
    every feature merge; describe mechanisms, never numbers.
-5. Third-party code keeps its own style; these rules are first-party
+6. Third-party code keeps its own style; these rules are first-party
    only.
 
 ## Non-obvious things that will bite you
@@ -166,11 +201,11 @@ Rust's documentation comments are `///` (item docs, rendered by
 - **`-target msp430` is a datalayout proxy, not a target.** We are not
   generating MSP430 code; it gives us the ABI-independent type
   decisions (8-bit char, 16-bit int/pointers). `-Oz` emits arbitrary
-  widths (`i17`) — we run `-O1` deliberately.
+  widths (`i17`): we run `-O1` deliberately.
 - **Recursion is a compile error**, and call depth is checked against
   the 8-level hardware stack. Don't add stack frames; that's not a
   limitation to "fix", it's the architecture.
-- **Locals are keyed `{func}::{name}`** in the address map — the
+- **Locals are keyed `{func}::{name}`** in the address map. The
   driver's `HashMap` contract both backends look up. Renaming breaks
   the map, not just one backend.
 - **BANKSEL between a skip-sensitive test and its branch changes the
@@ -191,5 +226,5 @@ Rust's documentation comments are `///` (item docs, rendered by
 cached in GHCR via the buildx registry cache; the first run on a fresh
 cache is ~1h, everything after is minutes. `.github/workflows/
 release.yml` builds the release bundles on tags. Both workflows use
-`packages: write` + `ignore-error=true` on the registry cache — the
+`packages: write` + `ignore-error=true` on the registry cache. The
 cache is an optimization, never a gate.
