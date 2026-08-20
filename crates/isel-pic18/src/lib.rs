@@ -1264,6 +1264,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     out.push("__start:".to_string());
     out.push("    call main".to_string());
     out.push("    sleep".to_string());
+    // gpasm requires the `end` directive (our own assembler tolerates its
+    // absence); PIC14's `isel::select` emits it the same way.
+    out.push("    end".to_string());
     out.join("\n") + "\n"
 }
 
