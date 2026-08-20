@@ -114,16 +114,23 @@ impl<'m> Gen<'m> {
     }
 
     /// The folded `(base, k, terms)` for pointer reg `r` in the current
-    /// function, from the module-wide `resolve_pointers` map. A pointer
-    /// with no entry is a bug in an earlier stage (every `gep` result and
-    /// every byval/sret/alloca seed must have been resolved), so it
-    /// panics loudly rather than silently emitting a bogus access.
+    /// function, from the module-wide `resolve_pointers` map. Every `gep`
+    /// result and every byval/sret/alloca seed resolves; a plain (not
+    /// byval, not sret) pointer PARAMETER never does, since its value is a
+    /// runtime address handed in by the caller with no compile-time base
+    /// to fold, which `resolve_pointers` has no case for yet (P3 scope: see
+    /// ADR-009). Panics loudly rather than silently emitting a bogus
+    /// access.
     fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
         let key = ssa_key(self.cur_func, r);
-        self.resolved
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| panic!("isel-pic18: no gep for pointer %{r} ({key})"))
+        self.resolved.get(&key).cloned().unwrap_or_else(|| {
+            panic!(
+                "isel-pic18: pointer %{r} ({key}) has no resolved base; a plain \
+                 (non-byval, non-sret) pointer parameter dereferenced directly is not \
+                 yet supported (P3 scope: only globals, allocas, and byval/sret params \
+                 resolve, see ADR-009)"
+            )
+        })
     }
 
     /// The `,A`/`,B` operand components `(a, f)` for a physical address
@@ -247,18 +254,7 @@ impl<'m> Gen<'m> {
         let static_part = u16::from(k) + u16::from(byte_off);
         let lit = (base_addr + static_part) & 0xFFF;
         self.emit(format!("    LFSR 0, 0x{lit:03X}"));
-        if let Some((scale, reg)) = terms.first() {
-            let a = self.slot_addr(self.cur_func, reg).direct();
-            for _ in 0..*scale {
-                let (ra, rf) = self.operand(a);
-                self.emit(format!("    MOVF 0x{rf:03X},W,{}", if ra == 0 { "A" } else { "B" }));
-                let (fa, ff) = self.operand(0xFE9); // FSR0L
-                self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
-                self.emit("    MOVLW 0x00".to_string());
-                let (ha, hf) = self.operand(0xFEA); // FSR0H
-                self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
-            }
-        }
+        self.add_term_to_fsr0(terms);
     }
     /// `slot_addr` holds a 2-byte ADDRESS (an sret param's contents), not
     /// the object itself: load THAT address into FSR0 (`MOVFF slot,
@@ -283,39 +279,24 @@ impl<'m> Gen<'m> {
             let (ha, hf) = self.operand(0xFEA);
             self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
         }
+        self.add_term_to_fsr0(terms);
+    }
+    /// Add the single dynamic term (if any) onto `FSR0L`/`FSR0H` with
+    /// carry, `scale` times: `MOVF %reg,W; ADDWF FSR0L,F; MOVLW 0;
+    /// ADDWFC FSR0H,F`. Shared by `emit_fsr0_dynamic` and
+    /// `emit_fsr0_indirect_slot`, the only two FSR0 setups that carry a
+    /// runtime term.
+    fn add_term_to_fsr0(&mut self, terms: &[(u8, String)]) {
         if let Some((scale, reg)) = terms.first() {
             let a = self.slot_addr(self.cur_func, reg).direct();
             for _ in 0..*scale {
                 let (ra, rf) = self.operand(a);
                 self.emit(format!("    MOVF 0x{rf:03X},W,{}", if ra == 0 { "A" } else { "B" }));
-                let (fa, ff) = self.operand(0xFE9);
+                let (fa, ff) = self.operand(0xFE9); // FSR0L
                 self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
                 self.emit("    MOVLW 0x00".to_string());
-                let (ha, hf) = self.operand(0xFEA);
+                let (ha, hf) = self.operand(0xFEA); // FSR0H
                 self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
-            }
-        }
-    }
-
-    /// Materialize byte `k` of `val` into `W`: a constant via `MOVLW`, a
-    /// register/global source via `MOVF`. Used only by the
-    /// `Addr::Indirect` store path (the direct path uses
-    /// `emit_move_val_to_slot`/`MOVFF`, which never touches `W`).
-    fn emit_byte_to_w(&mut self, val: &Val, k: u8) {
-        match val {
-            Val::Const(c) => {
-                let byte = ((c >> (i64::from(k) * 8)) & 0xFF) as u8;
-                self.emit(format!("    MOVLW 0x{byte:02X}"));
-            }
-            Val::Reg(r) => {
-                let a = self.slot_addr(self.cur_func, r).direct() + u16::from(k);
-                let (ab, f) = self.operand(a);
-                self.emit(format!("    MOVF 0x{f:03X},W,{}", if ab == 0 { "A" } else { "B" }));
-            }
-            Val::Global(g) => {
-                let a = self.global_addr(g) + u16::from(k);
-                let (ab, f) = self.operand(a);
-                self.emit(format!("    MOVF 0x{f:03X},W,{}", if ab == 0 { "A" } else { "B" }));
             }
         }
     }
@@ -363,7 +344,7 @@ impl<'m> Gen<'m> {
                             if k > 0 {
                                 self.emit_ptr_setup(&ptr_val, k);
                             }
-                            self.emit_byte_to_w(&s.val, k);
+                            self.emit_load_w(&s.val, k);
                             self.emit("    MOVWF 0xFEF,A".to_string()); // INDF0
                         }
                     }
@@ -600,30 +581,32 @@ impl<'m> Gen<'m> {
                         // points to into the callee's sret slot" — same
                         // const hazard as `byval` above: an sret arg is
                         // always meant to be a pointer, so a literal here
-                        // has no sensible meaning.
+                        // has no sensible meaning. `emit_ptr_setup` resolves
+                        // `arg.val` the same way every other pointer
+                        // consumer does: `Addr::Direct` is a compile-time
+                        // address (write its two bytes as literals);
+                        // `Addr::Indirect` means FSR0 now HOLDS the
+                        // resolved runtime address (a dynamic target, or a
+                        // sret-of-sret target), so the slot gets FSR0's two
+                        // bytes via MOVFF instead of a literal.
                         assert!(
                             !matches!(arg.val, Val::Const(_)),
                             "isel-pic18: const sret call arg not yet supported"
                         );
-                        let addr = match &arg.val {
-                            Val::Const(_) => panic!("isel-pic18: const sret call arg not yet supported"),
-                            Val::Global(g) => self.global_addr(g),
-                            Val::Reg(r) => {
-                                let (base, k, terms) = self.resolved_for(r);
-                                assert!(terms.is_empty(), "isel-pic18: dynamic sret target address not yet supported");
-                                match base {
-                                    Base::Global(name) => self.global_addr(&name) + u16::from(k),
-                                    Base::Slot(sname, false) => self.slot_addr(self.cur_func, &sname).direct() + u16::from(k),
-                                    Base::Slot(_, true) => panic!("isel-pic18: sret-of-sret not yet supported"),
-                                }
+                        match self.emit_ptr_setup(&arg.val, 0) {
+                            Addr::Direct(addr) => {
+                                self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                let (a0, f0) = self.operand(pa);
+                                self.emit(format!("    MOVWF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
+                                self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                                let (a1, f1) = self.operand(pa + 1);
+                                self.emit(format!("    MOVWF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
                             }
-                        };
-                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                        let (a0, f0) = self.operand(pa);
-                        self.emit(format!("    MOVWF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
-                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
-                        let (a1, f1) = self.operand(pa + 1);
-                        self.emit(format!("    MOVWF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
+                            Addr::Indirect => {
+                                self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
+                                self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
+                            }
+                        }
                     } else {
                         let ty = arg.ty.expect("isel-pic18: scalar call arg must carry a type");
                         self.emit_move_val_to_slot(&arg.val, ty, pa);

@@ -34,8 +34,13 @@ PIC18 pointer/array/struct support (port P3) uses:
    ported.
 6. **Loud scope boundaries.** One dynamic term per pointer
    (`terms.len() > 1` panics), constant-length `memcpy` only
-   (`MemLen::Reg` panics), indirect memcpy source panics. Unsupported
-   input aborts with a precise message rather than silently miscompiling.
+   (`MemLen::Reg` panics), indirect memcpy source panics, and a plain
+   (non-byval, non-sret) pointer parameter dereferenced directly panics
+   (`resolve_pointers` only seeds byval/sret params, allocas, and gep
+   chains off them; an opaque runtime pointer value handed in by the
+   caller has no compile-time base to fold and is not modeled yet).
+   Unsupported input aborts with a precise message rather than silently
+   miscompiling.
 
 ## Rationale
 
