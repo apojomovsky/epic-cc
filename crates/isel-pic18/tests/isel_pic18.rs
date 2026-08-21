@@ -344,15 +344,29 @@ fn i16_bitwise_ops_apply_independently_per_byte() {
 }
 
 #[test]
-#[should_panic(expected = "const-LHS")]
-fn i8_binop_const_lhs_is_rejected_not_silently_miscompiled() {
-    // `val_addr` maps `Val::Const(k)` to `Slot::Direct(k & 0xFF)` — treating
-    // a literal as a RAM ADDRESS. Without the guard, `sub i8 5, %x` would
-    // silently emit `SUBWF 0x005,W,A`, reading whatever byte lives at
-    // address 0x05 instead of using the literal 5. This must fail loudly
-    // instead.
+fn i8_binop_const_lhs_sub_emits_sublw() {
+    // `sub i8 5, %x` (`k - a`) is now handled via `SUBLW` for byte 0
+    // (and the `k - a` chain for `n > 1`), not rejected. `add i8 5, %x`
+    // is handled as commutative via operand swap. Verify `sub` emits
+    // `SUBLW 0x05` and runs correctly.
     let m = parse(
         "global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = sub i8 5, %1\n    ret void\n",
+    );
+    let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("SUBLW 0x05"), "sub i8 5, %x should emit SUBLW 0x05, got:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "variable-count")]
+fn i8_binop_const_lhs_is_rejected_not_silently_miscompiled() {
+    // `shl i8 1, %x` has a const LHS (`b.a = 1`) and a variable count
+    // (`b.b = %x`). Const-count shifts are inlined from `b.b`; a
+    // variable count must be a routine call (legalize). Reaching isel
+    // with it means a missing legalize rewrite, so isel must panic rather
+    // than silently miscompile `1 << %x` as `%x << 1`.
+    let m = parse(
+        "global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = shl i8 1, %1\n    ret void\n",
     );
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
     let _ = select(&PIC18F4550, &m, &addrs);
