@@ -80,5 +80,5 @@ setup-hooks: ## Install git hooks (.githooks/ -> the repo's hooks dir)
 		&& chmod +x $$(git rev-parse --git-path hooks)/pre-commit $$(git rev-parse --git-path hooks)/commit-msg
 	@echo "git hooks installed (pre-commit, commit-msg)"
 
-pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 also runs the suite
-	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,)
+pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 runs the suite, PROSE=1 attests comment/doc review
+	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,) $(if $(PROSE),--prose,)

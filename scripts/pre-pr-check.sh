@@ -11,15 +11,23 @@
 # then `git rm` the plan in a final commit. Squash merging then keeps
 # master plan-free automatically.
 #
-# Usage: bash scripts/pre-pr-check.sh [--test]
-#   --test   also run the full suite (make test); slow, opt-in
+# Usage: bash scripts/pre-pr-check.sh [--test] [--prose]
+#   --test    also run the full suite (make test); slow, opt-in
+#   --prose   attest that scripts/prose-diff.sh's output has been read and
+#             judged against AGENTS.md's Expression Conventions
 #   BASE_REF overrides the base branch (forks: BASE_REF=<fork>/master)
 
 set -uo pipefail
 
 BASE_REF="${BASE_REF:-origin/master}"
 RUN_TESTS=0
-[ "${1:-}" = "--test" ] && RUN_TESTS=1
+RUN_PROSE=0
+for arg in "$@"; do
+  case "$arg" in
+    --test) RUN_TESTS=1 ;;
+    --prose) RUN_PROSE=1 ;;
+  esac
+done
 
 FAILS=0
 WARNS=0
@@ -154,7 +162,29 @@ else
   ok "no space-before-comma residue"
 fi
 
-# ── 7. Hooks installed (make setup-hooks) ──────────────────────────
+# ── 7. Comment & doc prose review (added/changed comments, *.md) ──
+# scripts/prose-diff.sh only flags objective signals (block length,
+# hardcoded counts); it cannot judge content, so it never fails on its
+# own. --prose attests the agent read everything printed and fixed it,
+# same trust model as --test below.
+prose_out=$(bash "$(dirname "$0")/prose-diff.sh" 2>/dev/null)
+prose_summary=$(printf '%s\n' "$prose_out" | grep '^SUMMARY:' || true)
+prose_blocks=$(printf '%s' "$prose_summary" | sed -nE 's/.*comment_blocks=([0-9]+).*/\1/p')
+prose_docs=$(printf '%s' "$prose_summary" | sed -nE 's/.*doc_files=([0-9]+).*/\1/p')
+prose_blocks=${prose_blocks:-0}
+prose_docs=${prose_docs:-0}
+if [ "$prose_blocks" -eq 0 ] && [ "$prose_docs" -eq 0 ]; then
+  ok "no added comments or markdown changes to review"
+elif [ "$RUN_PROSE" -eq 1 ]; then
+  ok "prose reviewed and attested ($prose_blocks comment block(s), $prose_docs doc file(s))"
+else
+  warn "$prose_blocks comment block(s), $prose_docs doc file(s) changed; read"
+  warn "      scripts/prose-diff.sh output, judge each against AGENTS.md's"
+  warn "      Expression Conventions, then re-run with --prose (make"
+  warn "      pre-pr-check PROSE=1)"
+fi
+
+# ── 8. Hooks installed (make setup-hooks) ──────────────────────────
 hooks=$(git rev-parse --git-path hooks)
 if [ ! -x "$hooks/pre-commit" ]; then
   warn "git hooks not installed; run: make setup-hooks"
@@ -162,7 +192,7 @@ else
   ok "git hooks installed"
 fi
 
-# ── 8. Suite (opt-in via --test) ───────────────────────────────────
+# ── 9. Suite (opt-in via --test) ───────────────────────────────────
 if [ "$RUN_TESTS" -eq 1 ]; then
   say ""
   say "== running the full suite (make test) =="
