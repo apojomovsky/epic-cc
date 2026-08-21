@@ -33,11 +33,11 @@ struct Gen<'m> {
     /// docs/superpowers/plans/2026-08-20-pic18-port-p3.md Task 1/3.
     resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from
-    /// `device.common_ram`) — see the plan's "Where the retval/scratch
+    /// `device.common_ram`)  -  see the plan's "Where the retval/scratch
     /// design comes from" section.
     retval_lo: u16,
     /// The `BSR` value the last-emitted `MOVLB` set, or `None` when it's
-    /// unknown (module start, or just after a label — branch targets can
+    /// unknown (module start, or just after a label  -  branch targets can
     /// be reached with any prior `BSR` state, so it must be re-established
     /// on the next banked access rather than assumed).
     bsr: Option<u8>,
@@ -59,18 +59,18 @@ impl<'m> Gen<'m> {
     }
 
     /// Emit a label line AND reset the tracked `BSR` (`self.bsr = None`).
-    /// Every label in this file — a real block label, a fresh
-    /// `Select`/`Icmp` branch target, or a synthesized phi-copy label —
+    /// Every label in this file  -  a real block label, a fresh
+    /// `Select`/`Icmp` branch target, or a synthesized phi-copy label
     /// is a place code from more than one preceding path can land, and
     /// each of those paths may have executed a different subset of the
     /// `MOVLB`s that led here (or none at all). `operand()`'s `MOVLB`
     /// elision is only sound when `self.bsr` reflects what's ACTUALLY
     /// true on every path reaching the current point, so any label must
-    /// reset it — trusting a stale tracked value across a branch target
+    /// reset it  -  trusting a stale tracked value across a branch target
     /// has been the exact root cause of three separate miscompile bugs
     /// found across this task's review rounds (`Select`'s `l_else` and
-    /// `l_end`, `BrCond`'s synthesized `l_fcopies`, and — narrower, but
-    /// the same class — `emit_icmp_i16`'s shared `l_true`/`l_false`).
+    /// `l_end`, `BrCond`'s synthesized `l_fcopies`, and  -  narrower, but
+    /// the same class  -  `emit_icmp_i16`'s shared `l_true`/`l_false`).
     /// This helper makes the reset structural instead of a fact every
     /// label call site has to individually remember: every
     /// `self.emit(format!("{{...}}:"))`/`g.emit(format!("{{...}}:"))` in
@@ -80,7 +80,7 @@ impl<'m> Gen<'m> {
     /// `CALL` return is another one (the callee runs its own arbitrary
     /// `MOVLB`s and never restores the caller's bank on `RETURN`), but it
     /// is not itself a label, so it structurally cannot go through this
-    /// helper — `Inst::Call`'s arm in `emit_inst` resets `self.bsr`
+    /// helper  -  `Inst::Call`'s arm in `emit_inst` resets `self.bsr`
     /// directly right after emitting `CALL`.
     fn emit_label(&mut self, label: &str) {
         self.emit(format!("{label}:"));
@@ -197,6 +197,7 @@ impl<'m> Gen<'m> {
         a
     }
 
+
     /// The folded `(base, k, terms)` for pointer reg `r` in the current
     /// function, from the module-wide `resolve_pointers` map. Every `gep`
     /// result and every byval/sret/alloca seed resolves; a plain (not
@@ -248,7 +249,7 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// One byte, memory-to-memory, via `MOVFF` — no access bit, no `BSR`.
+    /// One byte, memory-to-memory, via `MOVFF`  -  no access bit, no `BSR`.
     fn emit_copy_byte(&mut self, src: u16, dst: u16) {
         self.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
     }
@@ -256,7 +257,7 @@ impl<'m> Gen<'m> {
     /// Copy `val` (width `ty.bytes()`) into the slot starting at `dst`. A
     /// register/global source uses `MOVFF` (no access bit needed); a
     /// constant has no `MOVFF` literal form, so it goes through `W` via
-    /// `MOVLW`/`MOVWF` (which DOES need the access bit — this is the one
+    /// `MOVLW`/`MOVWF` (which DOES need the access bit  -  this is the one
     /// place a plain copy still touches `operand`/`BSR`).
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
         match val {
@@ -578,6 +579,7 @@ impl<'m> Gen<'m> {
             }
             Inst::Bin(b) => {
                 let n = b.ty.bytes();
+
                 assert!(
                     n == 1 || n == 2 || n == 4,
                     "isel-pic18: only i8/i16/i32 Bin ops implemented (n={n})"
@@ -652,23 +654,94 @@ impl<'m> Gen<'m> {
                     }
                     return;
                 }
-                // `b.a` is resolved via `val_addr`, which treats a
-                // `Val::Const` as a RAM ADDRESS (`Slot::Direct(k & 0xFF)`)
-                // rather than a literal to load — a constant on the LHS
-                // (e.g. `sub i8 5, %x`, which clang can emit directly from
-                // `5 - x`, and which the differential fuzzer generates) would
-                // silently read whatever byte lives at that address instead
-                // of using the literal. `b.b`'s RHS is fine: it always goes
-                // through `emit_load_w`, which loads a `Val::Const` via
-                // `MOVLW`. This mirrors the const-LHS hazard PIC14's `isel`
-                // already had to guard against (see `emit_sub_const_lhs`,
-                // `crates/isel/src/lib.rs:1598-1609`, and `emit_commutative`,
-                // `crates/isel/src/lib.rs:1100-1106`) — full canonicalization
-                // isn't this task's job, so fail loudly instead of
-                // miscompiling silently, until a later task adds it.
+                // PIC18 port of PIC14's `emit_sub_const_lhs` / `emit_commutative`:
+                // a const LHS would be misread as a RAM address via
+                // `val_addr` (`k & 0xFF` truncates), so handle it here.
+                // Commutative ops swap; `k - a` uses `SUBLW` for byte 0 and
+                // the INCFSZ/BTFSS carry fold for bytes 1..n.
+                if let Val::Const(k) = b.a {
+                    let n = b.ty.bytes();
+                    let dst = self.slot_addr(self.cur_func, &b.dst).direct();
+                    match b.op {
+                        ir::BinOp::Add | ir::BinOp::And | ir::BinOp::Or | ir::BinOp::Xor => {
+                            // Commutative: `k op x` == `x op k`, reuse the
+                            // normal path with swapped operands.
+                            let swapped = ir::Bin {
+                                op: b.op,
+                                ty: b.ty,
+                                dst: b.dst.clone(),
+                                a: b.b.clone(),
+                                b: Val::Const(k),
+                            };
+                            // Re-enter the Bin arm with swapped operands via
+                            // the normal per-byte loop: emit the swapped bin
+                            // directly here to avoid recursion.
+                            let av = self.val_addr(&swapped.a).direct();
+                            for i in 0..n {
+                                self.emit_load_w(&swapped.b, i);
+                                let carry = i > 0 && matches!(swapped.op, ir::BinOp::Add | ir::BinOp::Sub);
+                                let mne = match (swapped.op, carry) {
+                                    (ir::BinOp::Add, false) => "ADDWF",
+                                    (ir::BinOp::Add, true) => "ADDWFC",
+                                    (ir::BinOp::Sub, false) => "SUBWF",
+                                    (ir::BinOp::Sub, true) => "SUBFWB",
+                                    (ir::BinOp::And, _) => "ANDWF",
+                                    (ir::BinOp::Or, _) => "IORWF",
+                                    (ir::BinOp::Xor, _) => "XORWF",
+                                    _ => unreachable!(),
+                                };
+                                let (aacc, af) = self.operand(av + u16::from(i));
+                                let abank = if aacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    {mne} 0x{af:03X},W,{abank}"));
+                                let (dacc, df) = self.operand(dst + u16::from(i));
+                                let dbank = if dacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                            }
+                            return;
+                        }
+                        ir::BinOp::Sub => {
+                            // `k - a` for `n > 1`: byte 0 via `SUBLW`
+                            // (k - W), bytes 1..n via `k_i + ~a_i + C0`
+                            // (the borrow-aware `k - a - !C0` chain). `C0`
+                            // is saved in a flag bit (0x0000,0 in the
+                            // reserved `common_ram`/`retval_lo` region, so
+                            // it is live-free across a `Bin` and an
+                            // interrupt mid-sequence cannot clobber a live
+                            // local) before the `COMF`/`ADDLW` overwrites
+                            // STATUS.
+                            let aa = self.val_addr(&b.b).direct();
+                            let dst = self.slot_addr(self.cur_func, &b.dst).direct();
+                            let (aacc0, af0) = self.operand(aa);
+                            let abank0 = if aacc0 == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVF 0x{af0:03X},W,{abank0}"));
+                            self.emit(format!("    SUBLW 0x{:02X}", (k & 0xFF) as u8));
+                            let (dacc0, df0) = self.operand(dst);
+                            let dbank0 = if dacc0 == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVWF 0x{df0:03X},{dbank0}"));
+                            for i in 1..n {
+                                let kb = ((k >> (u32::from(i) * 8)) & 0xFF) as u8;
+                                self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                self.emit("    BSF 0x0000,0,A".to_string());
+                                self.emit("    BTFSS 0xFD8,0,A".to_string());
+                                self.emit("    BCF 0x0000,0,A".to_string());
+                                let (aacc, af) = self.operand(aa + u16::from(i));
+                                let abank = if aacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    COMF 0x{af:03X},W,{abank}"));
+                                self.emit(format!("    ADDLW 0x{kb:02X}"));
+                                self.emit("    BTFSC 0x0000,0,A".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                                let (dacc, df) = self.operand(dst + u16::from(i));
+                                let dbank = if dacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 assert!(
                     !matches!(b.a, Val::Const(_)),
-                    "isel-pic18: const-LHS Bin (constant as the first operand) not yet supported — needs the isel::emit_sub_const_lhs-equivalent handling"
+                    "isel-pic18: const-LHS Bin (constant as the first operand) not yet supported  -  needs the isel::emit_sub_const_lhs-equivalent handling"
                 );
                 for i in 0..n {
                     // SUBWF computes f - W; the IR's `sub a, b` is `a - b`,
@@ -713,11 +786,11 @@ impl<'m> Gen<'m> {
             }
             Inst::Zext(z) => {
                 // `val_addr` maps `Val::Const(k)` to a RAM ADDRESS
-                // (`k & 0xFF`), not a literal — same hazard already guarded
+                // (`k & 0xFF`), not a literal  -  same hazard already guarded
                 // for `Bin`/`Icmp` above. Not known to be reachable from
                 // clang-generated IR or the differential fuzzer (both only
                 // ever cast a loaded/computed register, never a bare
-                // literal — a literal cast is constant-foldable by the
+                // literal  -  a literal cast is constant-foldable by the
                 // frontend before it ever reaches this backend), but the
                 // cheap guard costs nothing and keeps a future const-source
                 // producer from silently miscompiling instead of panicking.
@@ -726,13 +799,13 @@ impl<'m> Gen<'m> {
                     "isel-pic18: const source Zext not yet supported"
                 );
                 // Mirrors `isel`'s own width guard (`crates/isel/src/lib.rs`,
-                // "isel: zext must not narrow") — without it, a malformed
+                // "isel: zext must not narrow")  -  without it, a malformed
                 // `Zext` with `to.bytes() < from.bytes()` would copy
                 // `from.bytes()` bytes into a narrower `to.bytes()` slot
                 // below, writing past the destination into whatever local
                 // sits next to it. Equal widths (e.g. `zext i1 to i8`,
                 // where both types report `.bytes() == 1` in the byte
-                // model — an icmp result is materialized as a byte holding
+                // model  -  an icmp result is materialized as a byte holding
                 // exactly 0/1, so a 1-byte copy IS the zext) are legal and
                 // common (`u8 b = (a < b);`) and must be accepted: the
                 // "extra high bytes" loop from `from.bytes()..to.bytes()`
@@ -782,7 +855,7 @@ impl<'m> Gen<'m> {
                 }
                 // The sign-fill byte(s) must reflect the SOURCE's actual
                 // sign bit (bit 7 of its highest byte) at the time this
-                // cast runs — not an assumption. `MOVLW 0x00` first, then
+                // cast runs  -  not an assumption. `MOVLW 0x00` first, then
                 // `BTFSC sign_byte,7` conditionally overwrites `W` with
                 // `MOVLW 0xFF` only when that bit is set, so every high
                 // byte gets the same, correctly-derived fill value.
@@ -805,7 +878,7 @@ impl<'m> Gen<'m> {
                     "isel-pic18: const source Trunc not yet supported"
                 );
                 // Mirrors `isel`'s own width guard (`crates/isel/src/lib.rs`,
-                // "isel: trunc must narrow") — without it, a malformed
+                // "isel: trunc must narrow")  -  without it, a malformed
                 // `Trunc` with `to.bytes() >= from.bytes()` would read
                 // `to.bytes()` bytes starting at `src` below, past the end
                 // of the (narrower) source slot, and copy that overrun into
@@ -824,18 +897,18 @@ impl<'m> Gen<'m> {
                 // `a`/`b` route through `emit_move_val_to_slot`, which
                 // handles `Val::Const` correctly (via `MOVLW`+`MOVWF`, not
                 // as a RAM address through `val_addr`) and never branches
-                // on a flag — no guard needed for either.
+                // on a flag  -  no guard needed for either.
                 //
                 // `cond` is different: it's loaded via `emit_load_w`, then
                 // immediately tested with `BZ`, which relies on the LOAD
                 // having set the Z flag from `cond`'s value. That's true
                 // when `cond` is `Val::Reg`/`Val::Global` (`emit_load_w`
                 // emits `MOVF ...,W`, and this project's simulator's MOVF
-                // calls `set_zn` — `crates/sim/src/lib.rs:779-783`). It is
+                // calls `set_zn`  -  `crates/sim/src/lib.rs:779-783`). It is
                 // NOT true for `Val::Const`: `emit_load_w`'s const arm
                 // emits only `MOVLW`, and the simulator's MOVLW (PIC18
                 // opcode 0xE, `crates/sim/src/lib.rs:903`) does `self.w = k`
-                // with no `set_zn` call at all — so `BZ` would test
+                // with no `set_zn` call at all  -  so `BZ` would test
                 // whatever Z flag the PREVIOUS instruction happened to
                 // leave, silently picking the wrong side of the `Select`.
                 // Same hazard class as the const-LHS/const-source guards
@@ -880,7 +953,7 @@ impl<'m> Gen<'m> {
                         }
                     } else if arg.sret {
                         // `sret` means "store the 2-byte ADDRESS `arg.val`
-                        // points to into the callee's sret slot" — same
+                        // points to into the callee's sret slot"  -  same
                         // const hazard as `byval` above: an sret arg is
                         // always meant to be a pointer, so a literal here
                         // has no sensible meaning. `emit_ptr_setup` resolves
@@ -1003,7 +1076,7 @@ impl<'m> Gen<'m> {
     /// `dst = (a <pred> b) ? 1 : 0` for one byte, via `a - b` (SUBWF: f=a,
     /// W=b beforehand, d=W so `a`'s slot is untouched) and a flag-based
     /// branch. C/Z/N/OV follow PIC18's standard (ARM-style) condition-code
-    /// semantics — C=1 means "no borrow" (a>=b unsigned) — already relied
+    /// semantics  -  C=1 means "no borrow" (a>=b unsigned)  -  already relied
     /// on by P1's `Pic18::sub_flags`.
     ///
     /// Delegates the actual flag test to `emit_cmp_branch` (shared with
@@ -1011,12 +1084,12 @@ impl<'m> Gen<'m> {
     /// to, so the "equal" outcome must resolve directly to this
     /// predicate's real answer at equality: true for the non-strict/eq
     /// predicates (`eq`, `uge`, `ule`, `sge`, `sle`), false for the
-    /// strict ones (`ne`, `ult`, `ugt`, `slt`, `sgt`) — NOT uniformly
+    /// strict ones (`ne`, `ult`, `ugt`, `slt`, `sgt`)  -  NOT uniformly
     /// `l_false`, which would silently invert `uge`/`ule`/`sge`/`sle` at
     /// equality (e.g. `ule(5, 5)` must stay `1`).
     fn emit_icmp_byte(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
         // `val_addr` maps `Val::Const(k)` to a RAM ADDRESS (`k & 0xFF`),
-        // not a literal — a constant on the LHS (e.g. `icmp ult i8 5, %x`)
+        // not a literal  -  a constant on the LHS (e.g. `icmp ult i8 5, %x`)
         // would silently compare against whatever byte lives at address
         // 0x05 instead of the literal 5. Same hazard as `Inst::Bin`'s LHS
         // (see the `assert!` there); fail loudly until a later task adds
@@ -1045,13 +1118,13 @@ impl<'m> Gen<'m> {
     /// **unsigned** (`slt`->`ult`, `sle`->`ule`, `sgt`->`ugt`, `sge`->`uge`;
     /// `ult`/`ule`/`ugt`/`uge` already are their own tie-break).
     ///
-    /// `eq`/`ne` don't fit this "high byte decides" shape at all — they
+    /// `eq`/`ne` don't fit this "high byte decides" shape at all  -  they
     /// need BOTH bytes equal (`eq`) or EITHER byte different (`ne`), so
     /// they're dispatched to their own short-circuit, `emit_icmp_i16_eq_ne`,
     /// instead of the tie-break machinery built for the eight ordering
     /// predicates.
     fn emit_icmp_i16(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
-        // Same const-LHS hazard as `emit_icmp_byte` — this is a separate
+        // Same const-LHS hazard as `emit_icmp_byte`  -  this is a separate
         // entry point (not routed through `emit_icmp_byte`), so it needs
         // its own guard rather than inheriting one transitively.
         assert!(
@@ -1081,7 +1154,7 @@ impl<'m> Gen<'m> {
         self.emit_cmp_branch(&a, &b, 1, pred, &l_true, &l_false, &l_check_low);
         self.emit_label(&l_check_low);
         // Low byte, unsigned tie-break. Here "equal" means the two
-        // 16-bit values are fully identical, so — unlike the high byte —
+        // 16-bit values are fully identical, so  -  unlike the high byte
         // it DOES have a final answer: true for the non-strict tie-break
         // predicates (`ule`/`uge`), false for the strict ones
         // (`ult`/`ugt`).
@@ -1178,16 +1251,16 @@ impl<'m> Gen<'m> {
 
     /// The shared flag-test core behind `emit_icmp_byte`/`emit_icmp_i16`:
     /// computes `a - b` (SUBWF, `W = a - b`) for the byte at `byte_offset`
-    /// and branches on `pred`'s C/Z/N/OV condition — three ways, not two:
+    /// and branches on `pred`'s C/Z/N/OV condition  -  three ways, not two:
     /// `l_true` if `pred` holds for this byte pair, `l_false` if it
     /// definitely does not (the bytes differ in the "wrong" direction),
     /// or `l_equal` if the two bytes are equal. Equality is inherently
-    /// ambiguous from a single byte's flags alone — the caller decides
+    /// ambiguous from a single byte's flags alone  -  the caller decides
     /// what it means: "go check the next byte" (i16's high-byte compare),
     /// or "that IS the final answer" (i8, and i16's low-byte tie-break),
     /// by choosing what `l_equal` points at.
     ///
-    /// `eq`/`ne` are exempt from the three-way split — a byte's equality
+    /// `eq`/`ne` are exempt from the three-way split  -  a byte's equality
     /// already IS their complete per-byte answer, so their arms use only
     /// `l_true`/`l_false`. i16's `Icmp` lowering never calls this for
     /// `eq`/`ne` (see `emit_icmp_i16_eq_ne`); i8's `emit_icmp_byte` does,
@@ -1284,7 +1357,7 @@ impl<'m> Gen<'m> {
 
     /// Common `l_false: MOVLW 0x00 / l_true: MOVLW 0x01` materialization
     /// shared by `emit_icmp_byte`, `emit_icmp_i16`, and
-    /// `emit_icmp_i16_eq_ne` — the only difference between the three is
+    /// `emit_icmp_i16_eq_ne`  -  the only difference between the three is
     /// how they arrive at `l_true`/`l_false`.
     fn emit_materialize_bool(&mut self, l_true: &str, l_false: &str, l_done: &str, dst: &str) {
         self.emit_label(l_false);
@@ -1299,7 +1372,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
     }
 
-    /// Load byte `offset` of any `Val` into `W` — a constant via `MOVLW`
+    /// Load byte `offset` of any `Val` into `W`  -  a constant via `MOVLW`
     /// (shifting the literal right by `offset*8` bytes first), a
     /// register/global via `MOVF ...,W` at the resolved address plus
     /// `offset` (which needs the access bit, same as any other
@@ -3719,10 +3792,10 @@ impl<'m> Gen<'m> {
 
 /// The classic iterative dominator sets for a function's CFG: `doms[b]` is
 /// the set of blocks that dominate block `b`. Used to classify phi-copy
-/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred` — the
+/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred`  -  the
 /// pred is inside the merge's loop, so on that edge the merge's phi slots
 /// hold the CURRENT iteration's values. Ported from `isel`'s own
-/// `block_dominators` (`crates/isel/src/lib.rs:3977-4022`) — that function
+/// `block_dominators` (`crates/isel/src/lib.rs:3977-4022`)  -  that function
 /// is private to the `isel` crate (not `pub`), and this task's scope is
 /// limited to `isel-pic18`'s own files, so the algorithm is duplicated
 /// here rather than shared. Covers self-loops (pred == merge) AND
@@ -3778,10 +3851,10 @@ fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
 /// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
 /// copy never overwrites a slot a later copy still needs to read. Ported
 /// from `isel`'s own `emit_phi_copies` (`crates/isel/src/lib.rs:4296-4345`,
-/// private to that crate — same reason as `block_dominators` above).
+/// private to that crate  -  same reason as `block_dominators` above).
 ///
 /// The ordering depends on whether the edge is a BACK edge into the merge
-/// (`back_edge`, from `block_dominators` — the merge dominates the pred):
+/// (`back_edge`, from `block_dominators`  -  the merge dominates the pred):
 /// - Back edge: the merge's phi slots hold the CURRENT iteration's values,
 ///   so a copy reading a slot another copy writes must run BEFORE the
 ///   overwrite (reader first).
@@ -3917,8 +3990,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             let lbl = if i == 0 { f.name.clone() } else { format!("{}_L{}", f.name, b.label) };
             labels.insert(b.label.clone(), lbl);
         }
-        // Phi elimination: for each (predecessor, merge) EDGE — not just
-        // the predecessor — the copies that must run when that edge is
+        // Phi elimination: for each (predecessor, merge) EDGE  -  not just
+        // the predecessor  -  the copies that must run when that edge is
         // taken. Keying by predecessor alone (Task 12's original version)
         // is a real miscompile on a `BrCond` whose two successors both
         // consume phis: running both successors' copies unconditionally
@@ -4009,11 +4082,11 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     // Unlike PIC14's BTFSC/BTFSS (a 1-instruction SKIP, so a
                     // copy sequence longer than one instruction needs an
                     // extra `lcop` block to route through), PIC18's BZ/BNZ
-                    // are real branches to a label — so each edge's copies
+                    // are real branches to a label  -  so each edge's copies
                     // can be inlined directly along that edge's own path,
                     // with no intermediate copy-block indirection needed.
                     match (t_copies, f_copies) {
-                        // Plain branch, no phi consumers on either edge —
+                        // Plain branch, no phi consumers on either edge
                         // exactly Task 12's original (correct) shape.
                         (None, None) => {
                             g.emit(format!("    BZ {lf}"));
@@ -4137,13 +4210,13 @@ mod tests {
 
     /// Regression test for the `tmp` field's shared-borrow requirement:
     /// `Gen::tmp` must be `&'m mut u32` backed by one counter that outlives
-    /// every function's `Gen`, not an owned `u32` reset per function — an
+    /// every function's `Gen`, not an owned `u32` reset per function  -  an
     /// owned counter would let two functions' `fresh_label()` calls both
     /// emit `tmp0`, a duplicate label that fails to assemble once Task 12
     /// starts calling `fresh_label()` for real. `fresh_label()` itself has
     /// no caller yet in Task 3's scope (Select/Icmp/Br land later), so this
-    /// constructs two `Gen`s directly — the way `select()` constructs one
-    /// per function — sharing one backing `tmp: &mut u32`, exactly as
+    /// constructs two `Gen`s directly  -  the way `select()` constructs one
+    /// per function  -  sharing one backing `tmp: &mut u32`, exactly as
     /// `select()` does across its `for f in &m.funcs` loop.
     #[test]
     fn fresh_label_counter_is_shared_across_gens() {

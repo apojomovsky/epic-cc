@@ -13,6 +13,7 @@ one-line index entry here, e.g.:
 - ADR-012: CC-3 silicon-real codegen: EPIC_FOSC_HZ arithmetic, HEX regions, alloc placement, and simulator sizing, 2026-08-21
 - ADR-013 — PIC18 interrupts: single-vector compat mode, MOVFF save area, 2026-08-20
 - ADR-014 — PIC18 arithmetic routines: hardware MULWF schoolbook, branch-based divmod, 2026-08-20
+- ADR-015 — PIC18 soft-float: port of PIC14 recipes, 2026-08-20
 ---
 
 ## ADR-001 — clang as an out-of-process front end; custom PIC14 backend

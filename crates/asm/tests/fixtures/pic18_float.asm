@@ -1,0 +1,2029 @@
+; pic8 -- P2 integer spine (isel-pic18)
+    list p=p18f4550
+    radix hex
+
+    org 0x0000
+    goto __start
+
+half:
+    MOVFF 0x041, 0x049
+    MOVFF 0x042, 0x04A
+    MOVFF 0x043, 0x04B
+    MOVFF 0x044, 0x04C
+    MOVLW 0x00
+    MOVWF 0x04D,A
+    MOVLW 0x00
+    MOVWF 0x04E,A
+    MOVLW 0x20
+    MOVWF 0x04F,A
+    MOVLW 0x40
+    MOVWF 0x050,A
+    CALL __div_f32
+    MOVFF 0x000, 0x045
+    MOVFF 0x001, 0x046
+    MOVFF 0x002, 0x047
+    MOVFF 0x003, 0x048
+    MOVF 0x045,W,A
+    MOVWF 0x000,A
+    MOVF 0x046,W,A
+    MOVWF 0x001,A
+    MOVF 0x047,W,A
+    MOVWF 0x002,A
+    MOVF 0x048,W,A
+    MOVWF 0x003,A
+    RETURN
+pick:
+    MOVFF 0x050, 0x056
+    MOVLW 0x00
+    SUBWF 0x056,W,A
+    BZ tmp0
+    BRA tmp1
+tmp1:
+    MOVLW 0x00
+    BRA tmp2
+tmp0:
+    MOVLW 0x01
+tmp2:
+    MOVWF 0x057,A
+    MOVFF 0x052, 0x058
+    MOVFF 0x053, 0x059
+    MOVFF 0x054, 0x05A
+    MOVFF 0x055, 0x05B
+    MOVF 0x057,W,A
+    BZ tmp3
+    MOVFF 0x058, 0x05C
+    MOVFF 0x059, 0x05D
+    MOVFF 0x05A, 0x05E
+    MOVFF 0x05B, 0x05F
+    BRA tmp4
+tmp3:
+    MOVLW 0x00
+    MOVWF 0x05C,A
+    MOVLW 0x00
+    MOVWF 0x05D,A
+    MOVLW 0x00
+    MOVWF 0x05E,A
+    MOVLW 0x00
+    MOVWF 0x05F,A
+tmp4:
+    MOVF 0x05C,W,A
+    MOVWF 0x000,A
+    MOVF 0x05D,W,A
+    MOVWF 0x001,A
+    MOVF 0x05E,W,A
+    MOVWF 0x002,A
+    MOVF 0x05F,W,A
+    MOVWF 0x003,A
+    RETURN
+mk:
+    MOVFF 0x050, 0xFE9
+    MOVFF 0x051, 0xFEA
+    MOVF 0x052,W,A
+    MOVWF 0xFEF,A
+    MOVFF 0x050, 0xFE9
+    MOVFF 0x051, 0xFEA
+    MOVLW 0x02
+    ADDWF 0x0E9,F,A
+    MOVLW 0x00
+    ADDWFC 0x0EA,F,A
+    MOVF 0x053,W,A
+    MOVWF 0xFEF,A
+    MOVFF 0x050, 0xFE9
+    MOVFF 0x051, 0xFEA
+    MOVLW 0x03
+    ADDWF 0x0E9,F,A
+    MOVLW 0x00
+    ADDWFC 0x0EA,F,A
+    MOVF 0x054,W,A
+    MOVWF 0xFEF,A
+    MOVFF 0x050, 0xFE9
+    MOVFF 0x051, 0xFEA
+    MOVLW 0x04
+    ADDWF 0x0E9,F,A
+    MOVLW 0x00
+    ADDWFC 0x0EA,F,A
+    MOVF 0x055,W,A
+    MOVWF 0xFEF,A
+    MOVFF 0x050, 0xFE9
+    MOVFF 0x051, 0xFEA
+    MOVLW 0x05
+    ADDWF 0x0E9,F,A
+    MOVLW 0x00
+    ADDWFC 0x0EA,F,A
+    MOVF 0x056,W,A
+    MOVWF 0xFEF,A
+    RETURN
+struct_step:
+    MOVLW 0x46
+    MOVWF 0x050,A
+    MOVLW 0x00
+    MOVWF 0x051,A
+    MOVFF 0x041, 0x052
+    MOVFF 0x042, 0x053
+    MOVFF 0x043, 0x054
+    MOVFF 0x044, 0x055
+    MOVFF 0x045, 0x056
+    CALL mk
+    MOVFF 0x046, 0x050
+    MOVFF 0x047, 0x051
+    MOVFF 0x048, 0x052
+    MOVFF 0x049, 0x053
+    MOVFF 0x04A, 0x054
+    MOVFF 0x04B, 0x055
+    CALL pick
+    MOVFF 0x000, 0x04C
+    MOVFF 0x001, 0x04D
+    MOVFF 0x002, 0x04E
+    MOVFF 0x003, 0x04F
+    MOVF 0x04C,W,A
+    MOVWF 0x000,A
+    MOVF 0x04D,W,A
+    MOVWF 0x001,A
+    MOVF 0x04E,W,A
+    MOVWF 0x002,A
+    MOVF 0x04F,W,A
+    MOVWF 0x003,A
+    RETURN
+main:
+    MOVFF 0x010, 0x020
+    MOVFF 0x011, 0x021
+    MOVFF 0x012, 0x022
+    MOVFF 0x013, 0x023
+    MOVFF 0x020, 0x041
+    MOVFF 0x021, 0x042
+    MOVFF 0x022, 0x043
+    MOVFF 0x023, 0x044
+    CALL half
+    MOVFF 0x000, 0x024
+    MOVFF 0x001, 0x025
+    MOVFF 0x002, 0x026
+    MOVFF 0x003, 0x027
+    MOVFF 0x024, 0x014
+    MOVFF 0x025, 0x015
+    MOVFF 0x026, 0x016
+    MOVFF 0x027, 0x017
+    MOVFF 0x020, 0x041
+    MOVFF 0x021, 0x042
+    MOVFF 0x022, 0x043
+    MOVFF 0x023, 0x044
+    MOVLW 0x00
+    MOVWF 0x045,A
+    MOVLW 0x00
+    MOVWF 0x046,A
+    MOVLW 0x80
+    MOVWF 0x047,A
+    MOVLW 0x3E
+    MOVWF 0x048,A
+    CALL __add_f32
+    MOVFF 0x000, 0x028
+    MOVFF 0x001, 0x029
+    MOVFF 0x002, 0x02A
+    MOVFF 0x003, 0x02B
+    MOVFF 0x028, 0x041
+    MOVFF 0x029, 0x042
+    MOVFF 0x02A, 0x043
+    MOVFF 0x02B, 0x044
+    MOVLW 0x00
+    MOVWF 0x045,A
+    MOVLW 0x00
+    MOVWF 0x046,A
+    MOVLW 0x40
+    MOVWF 0x047,A
+    MOVLW 0x40
+    MOVWF 0x048,A
+    CALL __mul_f32
+    MOVFF 0x000, 0x02C
+    MOVFF 0x001, 0x02D
+    MOVFF 0x002, 0x02E
+    MOVFF 0x003, 0x02F
+    MOVFF 0x02C, 0x041
+    MOVFF 0x02D, 0x042
+    MOVFF 0x02E, 0x043
+    MOVFF 0x02F, 0x044
+    CALL __fptosi_f32
+    MOVFF 0x000, 0x030
+    MOVFF 0x001, 0x031
+    MOVFF 0x030, 0x041
+    MOVFF 0x031, 0x042
+    MOVF 0x042,W,A
+    MOVWF 0x043,A
+    MOVWF 0x044,A
+    CALL __sitofp_f32
+    MOVFF 0x000, 0x032
+    MOVFF 0x001, 0x033
+    MOVFF 0x002, 0x034
+    MOVFF 0x003, 0x035
+    MOVFF 0x032, 0x018
+    MOVFF 0x033, 0x019
+    MOVFF 0x034, 0x01A
+    MOVFF 0x035, 0x01B
+    MOVFF 0x020, 0x041
+    MOVFF 0x021, 0x042
+    MOVFF 0x022, 0x043
+    MOVFF 0x023, 0x044
+    MOVLW 0x00
+    MOVWF 0x045,A
+    MOVLW 0x00
+    MOVWF 0x046,A
+    MOVLW 0x40
+    MOVWF 0x047,A
+    MOVLW 0x3F
+    MOVWF 0x048,A
+    CALL __cmp_f32
+    MOVFF 0x000, 0x036
+    MOVLW 0x01
+    SUBWF 0x036,W,A
+    BZ tmp5
+    BRA tmp6
+tmp6:
+    MOVLW 0x00
+    BRA tmp7
+tmp5:
+    MOVLW 0x01
+tmp7:
+    MOVWF 0x037,A
+    MOVFF 0x037, 0x038
+    MOVLW 0x00
+    MOVWF 0x049,A
+    MOVLW 0x00
+    MOVWF 0x04A,A
+    MOVLW 0x80
+    MOVWF 0x04B,A
+    MOVLW 0x3F
+    MOVWF 0x04C,A
+    MOVFF 0x020, 0x04D
+    MOVFF 0x021, 0x04E
+    MOVFF 0x022, 0x04F
+    MOVFF 0x023, 0x050
+    CALL __div_f32
+    MOVFF 0x000, 0x039
+    MOVFF 0x001, 0x03A
+    MOVFF 0x002, 0x03B
+    MOVFF 0x003, 0x03C
+    MOVFF 0x038, 0x041
+    MOVFF 0x039, 0x042
+    MOVFF 0x03A, 0x043
+    MOVFF 0x03B, 0x044
+    MOVFF 0x03C, 0x045
+    CALL struct_step
+    MOVFF 0x000, 0x03D
+    MOVFF 0x001, 0x03E
+    MOVFF 0x002, 0x03F
+    MOVFF 0x003, 0x040
+    MOVFF 0x03D, 0x01C
+    MOVFF 0x03E, 0x01D
+    MOVFF 0x03F, 0x01E
+    MOVFF 0x040, 0x01F
+    RETURN
+__div_f32:
+    MOVF 0x04C,W,A
+    XORWF 0x050,W,A
+    ANDLW 0x80
+    MOVWF 0x051,A
+    MOVF 0x04C,W,A
+    ANDLW 0x7F
+    MOVWF 0x05C,A
+    BCF 0xFD8,0,A
+    RLCF 0x05C,F,A
+    BTFSC 0x04B, 7,A
+    BSF 0x05C, 0,A
+    MOVF 0x050,W,A
+    ANDLW 0x7F
+    MOVWF 0x052,A
+    BCF 0xFD8,0,A
+    RLCF 0x052,F,A
+    BTFSC 0x04F, 7,A
+    BSF 0x052, 0,A
+    MOVF 0x052,W,A
+    SUBWF 0x05C,W,A
+    MOVWF 0x05C,A
+    CLRF 0x057,A
+    BTFSS 0xFD8,0,A
+    BSF 0x057, 0,A
+    ADDLW 0x7F
+    MOVWF 0x052,A
+    MOVLW 0x00
+    BTFSS 0xFD8,0,A
+    GOTO tmp29
+    BTFSC 0x057, 0,A
+    GOTO tmp30
+    MOVLW 0x01
+    GOTO tmp30
+tmp29:
+    BTFSS 0x057, 0,A
+    GOTO tmp30
+    MOVLW 0xFF
+tmp30:
+    MOVWF 0x053,A
+    MOVF 0x04C,W,A
+    ANDLW 0x7F
+    XORLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp31
+    BTFSS 0x04B, 7,A
+    GOTO tmp31
+    MOVF 0x049,W,A
+    IORWF 0x04A,W,A
+    MOVWF 0x05C,A
+    MOVF 0x04B,W,A
+    ANDLW 0x7F
+    IORWF 0x05C,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp32
+    GOTO tmp10
+tmp31:
+    MOVF 0x050,W,A
+    ANDLW 0x7F
+    XORLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp33
+    BTFSS 0x04F, 7,A
+    GOTO tmp33
+    MOVF 0x04D,W,A
+    IORWF 0x04E,W,A
+    MOVWF 0x05C,A
+    MOVF 0x04F,W,A
+    ANDLW 0x7F
+    IORWF 0x05C,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp34
+    GOTO tmp10
+tmp32:
+    MOVF 0x050,W,A
+    ANDLW 0x7F
+    XORLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp35
+    BTFSS 0x04F, 7,A
+    GOTO tmp35
+    MOVF 0x04D,W,A
+    IORWF 0x04E,W,A
+    MOVWF 0x05C,A
+    MOVF 0x04F,W,A
+    ANDLW 0x7F
+    IORWF 0x05C,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp10
+    GOTO tmp9
+tmp35:
+    GOTO tmp9
+tmp34:
+    MOVF 0x04C,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp36
+    BTFSC 0x04B, 7,A
+    GOTO tmp36
+    GOTO tmp8
+tmp36:
+    GOTO tmp8
+tmp33:
+    MOVF 0x04C,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp37
+    MOVF 0x049,W,A
+    IORWF 0x04A,W,A
+    MOVWF 0x05C,A
+    MOVF 0x04B,W,A
+    ANDLW 0x7F
+    IORWF 0x05C,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp37
+    MOVF 0x050,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp8
+    MOVF 0x04D,W,A
+    IORWF 0x04E,W,A
+    MOVWF 0x05C,A
+    MOVF 0x04F,W,A
+    ANDLW 0x7F
+    IORWF 0x05C,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp8
+    GOTO tmp10
+tmp37:
+    MOVF 0x050,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp42
+    MOVF 0x04D,W,A
+    IORWF 0x04E,W,A
+    MOVWF 0x05C,A
+    MOVF 0x04F,W,A
+    ANDLW 0x7F
+    IORWF 0x05C,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp42
+    GOTO tmp9
+tmp10:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    MOVLW 0xC0
+    MOVWF 0x002,A
+    MOVLW 0x7F
+    MOVWF 0x003,A
+    BTFSC 0x051, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp9:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    MOVLW 0x80
+    MOVWF 0x002,A
+    MOVLW 0x7F
+    MOVWF 0x003,A
+    BTFSC 0x051, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp8:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    CLRF 0x002,A
+    CLRF 0x003,A
+    BTFSC 0x051, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp42:
+    MOVF 0x04C,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp43
+    BTFSC 0x04B, 7,A
+    GOTO tmp43
+    INCF 0x052,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x053,F,A
+tmp43:
+    MOVF 0x050,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp44
+    BTFSC 0x04F, 7,A
+    GOTO tmp44
+    MOVLW 0x01
+    SUBWF 0x052,F,A
+    BTFSC 0xFD8,0,A
+    GOTO tmp44
+    MOVLW 0x01
+    SUBWF 0x053,F,A
+tmp44:
+    MOVF 0x04B,W,A
+    ANDLW 0x7F
+    MOVWF 0x04B,A
+    MOVF 0x04C,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp38
+    BTFSC 0x04B, 7,A
+    GOTO tmp38
+    GOTO tmp39
+tmp38:
+    BSF 0x04B, 7,A
+tmp39:
+    CLRF 0x057,A
+tmp25:
+    BTFSC 0x04B, 7,A
+    GOTO tmp26
+    BCF 0xFD8,0,A
+    RLCF 0x049,F,A
+    RLCF 0x04A,F,A
+    RLCF 0x04B,F,A
+    INCF 0x057,F,A
+    GOTO tmp25
+tmp26:
+    MOVF 0x04F,W,A
+    ANDLW 0x7F
+    MOVWF 0x04F,A
+    MOVF 0x050,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp40
+    BTFSC 0x04F, 7,A
+    GOTO tmp40
+    GOTO tmp41
+tmp40:
+    BSF 0x04F, 7,A
+tmp41:
+    CLRF 0x05B,A
+tmp27:
+    BTFSC 0x04F, 7,A
+    GOTO tmp28
+    BCF 0xFD8,0,A
+    RLCF 0x04D,F,A
+    RLCF 0x04E,F,A
+    RLCF 0x04F,F,A
+    INCF 0x05B,F,A
+    GOTO tmp27
+tmp28:
+    MOVF 0x057,W,A
+    SUBWF 0x052,F,A
+    BTFSC 0xFD8,0,A
+    GOTO tmp45
+    MOVLW 0x01
+    SUBWF 0x053,F,A
+tmp45:
+    MOVF 0x05B,W,A
+    ADDWF 0x052,F,A
+    BTFSC 0xFD8,0,A
+    INCF 0x053,F,A
+    MOVF 0x04D,W,A
+    MOVWF 0x058,A
+    MOVF 0x04E,W,A
+    MOVWF 0x059,A
+    MOVF 0x04F,W,A
+    MOVWF 0x05A,A
+    CLRF 0x054,A
+    CLRF 0x055,A
+    CLRF 0x056,A
+    CLRF 0x057,A
+    MOVLW 0x18
+    MOVWF 0x05B,A
+tmp11:
+    BCF 0xFD8,0,A
+    RLCF 0x049,F,A
+    RLCF 0x04A,F,A
+    RLCF 0x04B,F,A
+    RLCF 0x054,F,A
+    RLCF 0x055,F,A
+    RLCF 0x056,F,A
+    RLCF 0x057,F,A
+    MOVF 0x058,W,A
+    SUBWF 0x054,F,A
+    MOVF 0x059,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x059,W,A
+    SUBWF 0x055,F,A
+    MOVF 0x05A,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x05A,W,A
+    SUBWF 0x056,F,A
+    MOVLW 0x00
+    BTFSS 0xFD8,0,A
+    ADDLW 0x01
+    SUBWF 0x057,F,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp12
+    BSF 0x049, 0,A
+    GOTO tmp13
+tmp12:
+    MOVF 0x058,W,A
+    ADDWF 0x054,F,A
+    MOVF 0x059,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x059,W,A
+    ADDWF 0x055,F,A
+    MOVF 0x05A,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x05A,W,A
+    ADDWF 0x056,F,A
+    MOVLW 0x00
+    BTFSC 0xFD8,0,A
+    ADDLW 0x01
+    ADDWF 0x057,F,A
+tmp13:
+    DECFSZ 0x05B,F,A
+    GOTO tmp11
+    CLRF 0x05C,A
+    MOVF 0x049,W,A
+    ANDLW 0x01
+    BTFSC 0xFD8,2,A
+    GOTO tmp15
+    BSF 0x05C, 0,A
+tmp15:
+    CLRF 0x049,A
+    CLRF 0x04A,A
+    CLRF 0x04B,A
+    CLRF 0x04C,A
+    MOVLW 0x19
+    MOVWF 0x05B,A
+tmp16:
+    BCF 0xFD8,0,A
+    RLCF 0x049,F,A
+    RLCF 0x04A,F,A
+    RLCF 0x04B,F,A
+    RLCF 0x04C,F,A
+    BCF 0xFD8,0,A
+    RLCF 0x054,F,A
+    RLCF 0x055,F,A
+    RLCF 0x056,F,A
+    RLCF 0x057,F,A
+    MOVF 0x058,W,A
+    SUBWF 0x054,F,A
+    MOVF 0x059,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x059,W,A
+    SUBWF 0x055,F,A
+    MOVF 0x05A,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x05A,W,A
+    SUBWF 0x056,F,A
+    MOVLW 0x00
+    BTFSS 0xFD8,0,A
+    ADDLW 0x01
+    SUBWF 0x057,F,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp17
+    BSF 0x049, 0,A
+    GOTO tmp18
+tmp17:
+    MOVF 0x058,W,A
+    ADDWF 0x054,F,A
+    MOVF 0x059,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x059,W,A
+    ADDWF 0x055,F,A
+    MOVF 0x05A,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x05A,W,A
+    ADDWF 0x056,F,A
+    MOVLW 0x00
+    BTFSC 0xFD8,0,A
+    ADDLW 0x01
+    ADDWF 0x057,F,A
+tmp18:
+    DECFSZ 0x05B,F,A
+    GOTO tmp16
+    BTFSC 0x05C, 0,A
+    GOTO tmp14
+    MOVLW 0x01
+    SUBWF 0x052,F,A
+    BCF 0xFD8,0,A
+    BTFSC 0x04C, 0,A
+    BSF 0xFD8,0,A
+    RRCF 0x04B,F,A
+    RRCF 0x04A,F,A
+    RRCF 0x049,F,A
+    CLRF 0x05C,A
+    BTFSC 0xFD8,0,A
+    BSF 0x05C, 0,A
+    MOVF 0x054,W,A
+    IORWF 0x055,W,A
+    IORWF 0x056,W,A
+    IORWF 0x057,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp19
+    BSF 0x05C, 1,A
+    GOTO tmp19
+tmp14:
+    BCF 0xFD8,0,A
+    BTFSC 0x04C, 0,A
+    BSF 0xFD8,0,A
+    RRCF 0x04B,F,A
+    RRCF 0x04A,F,A
+    RRCF 0x049,F,A
+    CLRF 0x05C,A
+    BTFSC 0xFD8,0,A
+    BSF 0x05C, 1,A
+    BCF 0xFD8,0,A
+    RRCF 0x04B,F,A
+    RRCF 0x04A,F,A
+    RRCF 0x049,F,A
+    BTFSC 0xFD8,0,A
+    BSF 0x05C, 0,A
+    BSF 0x04B, 7,A
+    MOVF 0x054,W,A
+    IORWF 0x055,W,A
+    IORWF 0x056,W,A
+    IORWF 0x057,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp19
+    BSF 0x05C, 1,A
+tmp19:
+    BTFSC 0x053, 7,A
+    GOTO tmp24
+    MOVF 0x052,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp20
+    GOTO tmp24
+tmp24:
+    BTFSC 0x05C, 0,A
+    BSF 0x05C, 1,A
+    BCF 0xFD8,0,A
+    RRCF 0x04B,F,A
+    RRCF 0x04A,F,A
+    RRCF 0x049,F,A
+    BCF 0x05C, 0,A
+    BTFSC 0xFD8,0,A
+    BSF 0x05C, 0,A
+    INCF 0x052,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x053,F,A
+    GOTO tmp19
+tmp20:
+    BTFSS 0x05C, 0,A
+    GOTO tmp23
+    BTFSC 0x05C, 1,A
+    GOTO tmp21
+    BTFSC 0x049, 0,A
+    GOTO tmp21
+    GOTO tmp22
+tmp21:
+    INCF 0x049,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x04A,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x04B,F,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp46
+    GOTO tmp47
+tmp46:
+    MOVLW 0x80
+    MOVWF 0x04B,A
+    CLRF 0x04A,A
+    CLRF 0x049,A
+    MOVLW 0x01
+    ADDWF 0x052,F,A
+tmp47:
+tmp23:
+    BTFSC 0x04B, 7,A
+    GOTO tmp22
+    MOVF 0x053,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp22
+    MOVF 0x052,W,A
+    SUBLW 0x01
+    BTFSS 0xFD8,2,A
+    GOTO tmp22
+    CLRF 0x052,A
+tmp22:
+    MOVF 0x049,W,A
+    MOVWF 0x000,A
+    MOVF 0x04A,W,A
+    MOVWF 0x001,A
+    MOVLW 0x7F
+    ANDWF 0x04B,W,A
+    MOVWF 0x002,A
+    BTFSC 0x052, 0,A
+    BSF 0x002, 7,A
+    MOVF 0x052,W,A
+    MOVWF 0x003,A
+    BCF 0xFD8,0,A
+    RRCF 0x003,F,A
+    BTFSC 0x051, 7,A
+    BSF 0x003, 7,A
+    RETURN
+__add_f32:
+    MOVF 0x044,W,A
+    ANDLW 0x80
+    MOVWF 0x049,A
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    MOVWF 0x04A,A
+    BCF 0xFD8,0,A
+    RLCF 0x04A,F,A
+    BTFSC 0x043, 7,A
+    BSF 0x04A, 0,A
+    MOVF 0x041,W,A
+    MOVWF 0x04B,A
+    MOVF 0x042,W,A
+    MOVWF 0x04C,A
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp48
+    BTFSC 0x043, 7,A
+    GOTO tmp48
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    GOTO tmp49
+tmp48:
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORLW 0x80
+tmp49:
+    MOVWF 0x04D,A
+    MOVF 0x04A,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp51
+    MOVF 0x04B,W,A
+    IORWF 0x04C,W,A
+    IORWF 0x04D,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp51
+    MOVLW 0x01
+    MOVWF 0x04A,A
+tmp51:
+    MOVF 0x048,W,A
+    ANDLW 0x80
+    MOVWF 0x04E,A
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    MOVWF 0x04F,A
+    BCF 0xFD8,0,A
+    RLCF 0x04F,F,A
+    BTFSC 0x047, 7,A
+    BSF 0x04F, 0,A
+    MOVF 0x045,W,A
+    MOVWF 0x050,A
+    MOVF 0x046,W,A
+    MOVWF 0x051,A
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp52
+    BTFSC 0x047, 7,A
+    GOTO tmp52
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    GOTO tmp53
+tmp52:
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORLW 0x80
+tmp53:
+    MOVWF 0x052,A
+    MOVF 0x04F,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp55
+    MOVF 0x050,W,A
+    IORWF 0x051,W,A
+    IORWF 0x052,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp55
+    MOVLW 0x01
+    MOVWF 0x04F,A
+tmp55:
+    MOVF 0x04A,W,A
+    SUBLW 0xFF
+    BTFSS 0xFD8,2,A
+    GOTO tmp85
+    MOVF 0x04B,W,A
+    IORWF 0x04C,W,A
+    MOVWF 0x054,A
+    MOVF 0x04D,W,A
+    ANDLW 0x7F
+    IORWF 0x054,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp81
+tmp85:
+    MOVF 0x04F,W,A
+    SUBLW 0xFF
+    BTFSS 0xFD8,2,A
+    GOTO tmp86
+    MOVF 0x050,W,A
+    IORWF 0x051,W,A
+    MOVWF 0x054,A
+    MOVF 0x052,W,A
+    ANDLW 0x7F
+    IORWF 0x054,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp81
+tmp86:
+    MOVF 0x04A,W,A
+    SUBLW 0xFF
+    BTFSS 0xFD8,2,A
+    GOTO tmp83
+    MOVF 0x04F,W,A
+    SUBLW 0xFF
+    BTFSS 0xFD8,2,A
+    GOTO tmp84
+    MOVF 0x049,W,A
+    XORWF 0x04E,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp81
+    GOTO tmp82
+tmp84:
+    GOTO tmp82
+tmp83:
+    MOVF 0x04F,W,A
+    SUBLW 0xFF
+    BTFSS 0xFD8,2,A
+    GOTO tmp87
+    MOVF 0x04E,W,A
+    MOVWF 0x049,A
+    GOTO tmp82
+tmp82:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    MOVLW 0x80
+    MOVWF 0x002,A
+    MOVLW 0x7F
+    MOVWF 0x003,A
+    BTFSC 0x049, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp81:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    MOVLW 0xC0
+    MOVWF 0x002,A
+    MOVLW 0x7F
+    MOVWF 0x003,A
+    BTFSC 0x049, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp87:
+    MOVF 0x04B,W,A
+    IORWF 0x04C,W,A
+    IORWF 0x04D,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp56
+    MOVF 0x050,W,A
+    IORWF 0x051,W,A
+    IORWF 0x052,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp57
+    GOTO tmp58
+tmp57:
+    MOVF 0x04E,W,A
+    MOVWF 0x049,A
+    MOVF 0x04F,W,A
+    MOVWF 0x04A,A
+    MOVF 0x050,W,A
+    MOVWF 0x04B,A
+    MOVF 0x051,W,A
+    MOVWF 0x04C,A
+    MOVF 0x052,W,A
+    MOVWF 0x04D,A
+    CLRF 0x053,A
+    GOTO tmp78
+tmp56:
+    MOVF 0x050,W,A
+    IORWF 0x051,W,A
+    IORWF 0x052,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp59
+    CLRF 0x053,A
+    GOTO tmp78
+tmp59:
+    CLRF 0x053,A
+    CLRF 0x055,A
+    CLRF 0x056,A
+    MOVF 0x04F,W,A
+    SUBWF 0x04A,W,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp60
+    MOVF 0x04E,W,A
+    XORWF 0x049,F,A
+    MOVF 0x049,W,A
+    XORWF 0x04E,F,A
+    MOVF 0x04E,W,A
+    XORWF 0x049,F,A
+    MOVF 0x04F,W,A
+    XORWF 0x04A,F,A
+    MOVF 0x04A,W,A
+    XORWF 0x04F,F,A
+    MOVF 0x04F,W,A
+    XORWF 0x04A,F,A
+    MOVF 0x050,W,A
+    XORWF 0x04B,F,A
+    MOVF 0x04B,W,A
+    XORWF 0x050,F,A
+    MOVF 0x050,W,A
+    XORWF 0x04B,F,A
+    MOVF 0x051,W,A
+    XORWF 0x04C,F,A
+    MOVF 0x04C,W,A
+    XORWF 0x051,F,A
+    MOVF 0x051,W,A
+    XORWF 0x04C,F,A
+    MOVF 0x052,W,A
+    XORWF 0x04D,F,A
+    MOVF 0x04D,W,A
+    XORWF 0x052,F,A
+    MOVF 0x052,W,A
+    XORWF 0x04D,F,A
+tmp60:
+    MOVF 0x04A,W,A
+    SUBWF 0x04F,W,A
+    MOVWF 0x054,A
+    MOVF 0x04F,W,A
+    MOVWF 0x04A,A
+    CLRF 0x04F,A
+    MOVLW 0x1F
+    SUBWF 0x054,W,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp61
+    MOVLW 0x1F
+    MOVWF 0x054,A
+tmp61:
+    MOVF 0x054,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp62
+    GOTO tmp63
+tmp62:
+    BCF 0xFD8,0,A
+    RRCF 0x04D,F,A
+    RRCF 0x04C,F,A
+    RRCF 0x04B,F,A
+    RRCF 0x056,F,A
+    RRCF 0x055,F,A
+    RRCF 0x04F,F,A
+    BTFSC 0xFD8,0,A
+    BSF 0x053, 1,A
+    BTFSC 0x056, 7,A
+    BSF 0x053, 0,A
+    BTFSS 0x056, 7,A
+    BCF 0x053, 0,A
+    DECFSZ 0x054,F,A
+    GOTO tmp62
+tmp63:
+    MOVF 0x049,W,A
+    XORWF 0x04E,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp64
+    MOVF 0x050,W,A
+    ADDWF 0x04B,F,A
+    MOVF 0x051,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x051,W,A
+    ADDWF 0x04C,F,A
+    MOVF 0x052,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x052,W,A
+    ADDWF 0x04D,F,A
+    BTFSC 0xFD8,0,A
+    GOTO tmp65
+    GOTO tmp76
+tmp65:
+    BTFSC 0x053, 0,A
+    BSF 0x053, 1,A
+    BCF 0xFD8,0,A
+    RRCF 0x04D,F,A
+    RRCF 0x04C,F,A
+    RRCF 0x04B,F,A
+    BCF 0x053, 0,A
+    BTFSC 0xFD8,0,A
+    BSF 0x053, 0,A
+    BSF 0x04D, 7,A
+    MOVLW 0x01
+    ADDWF 0x04A,F,A
+    GOTO tmp76
+tmp64:
+    MOVF 0x052,W,A
+    SUBWF 0x04D,W,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp70
+    BTFSC 0xFD8,2,A
+    GOTO tmp66
+    GOTO tmp71
+tmp66:
+    MOVF 0x051,W,A
+    SUBWF 0x04C,W,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp70
+    BTFSC 0xFD8,2,A
+    GOTO tmp67
+    GOTO tmp71
+tmp67:
+    MOVF 0x050,W,A
+    SUBWF 0x04B,W,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp70
+    BTFSC 0xFD8,2,A
+    GOTO tmp68
+    GOTO tmp71
+tmp68:
+    MOVF 0x04F,W,A
+    IORWF 0x055,W,A
+    IORWF 0x056,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp69
+    BTFSS 0x053, 1,A
+    GOTO tmp58
+tmp69:
+    BTFSC 0x053, 1,A
+    BSF 0x04F, 0,A
+    CLRF 0x04B,A
+    CLRF 0x04C,A
+    CLRF 0x04D,A
+    GOTO tmp74
+tmp70:
+    MOVF 0x050,W,A
+    XORWF 0x04B,F,A
+    MOVF 0x04B,W,A
+    XORWF 0x050,F,A
+    MOVF 0x050,W,A
+    XORWF 0x04B,F,A
+    MOVF 0x051,W,A
+    XORWF 0x04C,F,A
+    MOVF 0x04C,W,A
+    XORWF 0x051,F,A
+    MOVF 0x051,W,A
+    XORWF 0x04C,F,A
+    MOVF 0x052,W,A
+    XORWF 0x04D,F,A
+    MOVF 0x04D,W,A
+    XORWF 0x052,F,A
+    MOVF 0x052,W,A
+    XORWF 0x04D,F,A
+    MOVF 0x04E,W,A
+    MOVWF 0x049,A
+tmp71:
+    BTFSC 0x053, 1,A
+    BSF 0x04F, 0,A
+    MOVF 0x04F,W,A
+    IORWF 0x055,W,A
+    IORWF 0x056,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp72
+    COMF 0x04F,F,A
+    COMF 0x055,F,A
+    COMF 0x056,F,A
+    INCF 0x04F,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x055,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x056,F,A
+    MOVLW 0x01
+    SUBWF 0x04B,F,A
+    BTFSC 0xFD8,0,A
+    GOTO tmp73
+    MOVLW 0x01
+    SUBWF 0x04C,F,A
+    BTFSC 0xFD8,0,A
+    GOTO tmp73
+    MOVLW 0x01
+    SUBWF 0x04D,F,A
+tmp73:
+tmp72:
+    MOVF 0x050,W,A
+    SUBWF 0x04B,F,A
+    MOVF 0x051,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x051,W,A
+    SUBWF 0x04C,F,A
+    MOVF 0x052,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x052,W,A
+    SUBWF 0x04D,F,A
+    GOTO tmp74
+tmp74:
+    MOVF 0x04D,W,A
+    ANDLW 0x80
+    BTFSS 0xFD8,2,A
+    GOTO tmp75
+    MOVF 0x04A,W,A
+    SUBLW 0x01
+    BTFSC 0xFD8,2,A
+    GOTO tmp75
+    BCF 0xFD8,0,A
+    RLCF 0x04F,F,A
+    RLCF 0x055,F,A
+    RLCF 0x056,F,A
+    RLCF 0x04B,F,A
+    RLCF 0x04C,F,A
+    RLCF 0x04D,F,A
+    MOVLW 0x01
+    SUBWF 0x04A,F,A
+    GOTO tmp74
+tmp75:
+    BTFSC 0x056, 7,A
+    BSF 0x053, 0,A
+    BTFSS 0x056, 7,A
+    BCF 0x053, 0,A
+tmp76:
+    BTFSS 0x053, 0,A
+    GOTO tmp88
+    MOVF 0x04F,W,A
+    IORWF 0x055,W,A
+    IORWF 0x056,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp77
+    BTFSC 0x053, 1,A
+    GOTO tmp77
+    BTFSC 0x04B, 0,A
+    GOTO tmp77
+    GOTO tmp88
+tmp77:
+    INCF 0x04B,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x04C,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x04D,F,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp90
+    GOTO tmp91
+tmp90:
+    MOVLW 0x80
+    MOVWF 0x04D,A
+    CLRF 0x04C,A
+    CLRF 0x04B,A
+    MOVLW 0x01
+    ADDWF 0x04A,F,A
+tmp91:
+tmp88:
+    MOVF 0x04D,W,A
+    ANDLW 0x80
+    BTFSS 0xFD8,2,A
+    GOTO tmp89
+    MOVF 0x04A,W,A
+    SUBLW 0x01
+    BTFSS 0xFD8,2,A
+    GOTO tmp89
+    CLRF 0x04A,A
+tmp89:
+tmp78:
+    MOVF 0x04B,W,A
+    MOVWF 0x000,A
+    MOVF 0x04C,W,A
+    MOVWF 0x001,A
+    MOVLW 0x7F
+    ANDWF 0x04D,W,A
+    MOVWF 0x002,A
+    BTFSC 0x04A, 0,A
+    BSF 0x002, 7,A
+    MOVF 0x04A,W,A
+    MOVWF 0x003,A
+    BCF 0xFD8,0,A
+    RRCF 0x003,F,A
+    BTFSC 0x049, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp58:
+    BTFSS 0x049, 7,A
+    GOTO tmp80
+    BTFSS 0x04E, 7,A
+    GOTO tmp79
+    GOTO tmp80
+tmp79:
+    BCF 0x049, 7,A
+tmp80:
+    CLRF 0x04A,A
+    CLRF 0x04B,A
+    CLRF 0x04C,A
+    CLRF 0x04D,A
+    GOTO tmp78
+__mul_f32:
+    MOVF 0x044,W,A
+    XORWF 0x048,W,A
+    ANDLW 0x80
+    MOVWF 0x049,A
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    MOVWF 0x054,A
+    BCF 0xFD8,0,A
+    RLCF 0x054,F,A
+    BTFSC 0x043, 7,A
+    BSF 0x054, 0,A
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    MOVWF 0x055,A
+    BCF 0xFD8,0,A
+    RLCF 0x055,F,A
+    BTFSC 0x047, 7,A
+    BSF 0x055, 0,A
+    MOVF 0x054,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp107
+    MOVF 0x041,W,A
+    MOVWF 0x056,A
+    MOVF 0x042,W,A
+    IORWF 0x056,W,A
+    MOVWF 0x056,A
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp107
+    MOVLW 0x01
+    MOVWF 0x054,A
+tmp107:
+    MOVF 0x055,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp108
+    MOVF 0x045,W,A
+    MOVWF 0x056,A
+    MOVF 0x046,W,A
+    IORWF 0x056,W,A
+    MOVWF 0x056,A
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp108
+    MOVLW 0x01
+    MOVWF 0x055,A
+tmp108:
+    MOVF 0x055,W,A
+    ADDWF 0x054,W,A
+    MOVWF 0x054,A
+    CLRF 0x053,A
+    BTFSC 0xFD8,0,A
+    BSF 0x053, 0,A
+    MOVLW 0x81
+    ADDWF 0x054,W,A
+    MOVWF 0x04A,A
+    MOVLW 0x00
+    BTFSS 0xFD8,0,A
+    GOTO tmp105
+    BTFSC 0x053, 0,A
+    MOVLW 0x01
+    GOTO tmp106
+tmp105:
+    BTFSC 0x053, 0,A
+    GOTO tmp106
+    MOVLW 0xFF
+tmp106:
+    MOVWF 0x04B,A
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    XORLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp111
+    BTFSS 0x043, 7,A
+    GOTO tmp111
+    MOVF 0x041,W,A
+    IORWF 0x042,W,A
+    MOVWF 0x056,A
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp112
+    GOTO tmp122
+tmp111:
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    XORLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp113
+    BTFSS 0x047, 7,A
+    GOTO tmp113
+    MOVF 0x045,W,A
+    IORWF 0x046,W,A
+    MOVWF 0x056,A
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp114
+    GOTO tmp122
+tmp112:
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    XORLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp115
+    BTFSS 0x047, 7,A
+    GOTO tmp115
+    MOVF 0x045,W,A
+    IORWF 0x046,W,A
+    MOVWF 0x056,A
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp122
+    GOTO tmp123
+tmp115:
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp123
+    BTFSC 0x047, 7,A
+    GOTO tmp123
+    MOVF 0x045,W,A
+    IORWF 0x046,W,A
+    MOVWF 0x056,A
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp123
+    GOTO tmp122
+tmp114:
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp116
+    BTFSC 0x043, 7,A
+    GOTO tmp116
+    MOVF 0x041,W,A
+    IORWF 0x042,W,A
+    MOVWF 0x056,A
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp123
+    GOTO tmp122
+tmp116:
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp123
+    BTFSC 0x043, 7,A
+    GOTO tmp123
+    MOVF 0x041,W,A
+    IORWF 0x042,W,A
+    MOVWF 0x056,A
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp123
+    GOTO tmp122
+tmp113:
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp109
+    MOVF 0x041,W,A
+    IORWF 0x042,W,A
+    MOVWF 0x056,A
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp109
+    GOTO tmp121
+tmp109:
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp110
+    MOVF 0x045,W,A
+    IORWF 0x046,W,A
+    MOVWF 0x056,A
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORWF 0x056,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp110
+    GOTO tmp121
+tmp122:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    MOVLW 0xC0
+    MOVWF 0x002,A
+    MOVLW 0x7F
+    MOVWF 0x003,A
+    BTFSC 0x049, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp123:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    MOVLW 0x80
+    MOVWF 0x002,A
+    MOVLW 0x7F
+    MOVWF 0x003,A
+    BTFSC 0x049, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp110:
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp117
+    BTFSC 0x043, 7,A
+    GOTO tmp117
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    MOVWF 0x043,A
+    GOTO tmp118
+tmp117:
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORLW 0x80
+    MOVWF 0x043,A
+tmp118:
+    MOVF 0x045,W,A
+    MOVWF 0x04C,A
+    MOVF 0x046,W,A
+    MOVWF 0x04D,A
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    MOVWF 0x04E,A
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp119
+    BTFSC 0x047, 7,A
+    GOTO tmp119
+    GOTO tmp120
+tmp119:
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORLW 0x80
+    MOVWF 0x04E,A
+tmp120:
+    CLRF 0x045,A
+    CLRF 0x046,A
+    CLRF 0x047,A
+    CLRF 0x050,A
+    CLRF 0x051,A
+    CLRF 0x052,A
+    CLRF 0x053,A
+    CLRF 0x054,A
+    CLRF 0x055,A
+    CLRF 0x056,A
+    MOVLW 0x18
+    MOVWF 0x04F,A
+tmp92:
+    BCF 0xFD8,0,A
+    RLCF 0x04C,F,A
+    RLCF 0x04D,F,A
+    RLCF 0x04E,F,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp93
+    MOVF 0x045,W,A
+    ADDWF 0x054,F,A
+    MOVF 0x046,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x046,W,A
+    ADDWF 0x055,F,A
+    MOVF 0x047,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x047,W,A
+    ADDWF 0x056,F,A
+    BTFSC 0x056, 7,A
+    GOTO tmp103
+    GOTO tmp104
+tmp103:
+    BCF 0x056, 7,A
+    INCF 0x050,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x051,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x052,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x053,F,A
+tmp104:
+    MOVF 0x041,W,A
+    ADDWF 0x050,F,A
+    MOVF 0x042,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x042,W,A
+    ADDWF 0x051,F,A
+    MOVF 0x043,W,A
+    BTFSC 0xFD8,0,A
+    INCFSZ 0x043,W,A
+    ADDWF 0x052,F,A
+    MOVLW 0x00
+    BTFSC 0xFD8,0,A
+    ADDLW 0x01
+    ADDWF 0x053,F,A
+tmp93:
+    BCF 0xFD8,0,A
+    RRCF 0x047,F,A
+    RRCF 0x046,F,A
+    RRCF 0x045,F,A
+    BTFSC 0x041, 0,A
+    BSF 0x047, 6,A
+    BCF 0xFD8,0,A
+    RRCF 0x043,F,A
+    RRCF 0x042,F,A
+    RRCF 0x041,F,A
+    DECFSZ 0x04F,F,A
+    GOTO tmp92
+    BTFSC 0x053, 0,A
+    GOTO tmp94
+    BCF 0xFD8,0,A
+    RLCF 0x054,F,A
+    RLCF 0x055,F,A
+    RLCF 0x056,F,A
+    GOTO tmp95
+tmp94:
+    BCF 0xFD8,0,A
+    BTFSC 0x053, 0,A
+    BSF 0xFD8,0,A
+    RRCF 0x052,F,A
+    RRCF 0x051,F,A
+    RRCF 0x050,F,A
+    BCF 0x056, 7,A
+    BTFSC 0xFD8,0,A
+    BSF 0x056, 7,A
+    MOVLW 0x01
+    ADDWF 0x04A,F,A
+tmp95:
+    BTFSC 0x04B, 7,A
+    GOTO tmp98
+    MOVF 0x04B,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp96
+    MOVF 0x04A,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp98
+    GOTO tmp96
+tmp96:
+    BTFSC 0x052, 7,A
+    GOTO tmp99
+    MOVF 0x04B,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp97
+    MOVF 0x04A,W,A
+    SUBLW 0x01
+    BTFSC 0xFD8,2,A
+    GOTO tmp99
+tmp97:
+    BCF 0xFD8,0,A
+    RLCF 0x054,F,A
+    RLCF 0x055,F,A
+    RLCF 0x056,F,A
+    RLCF 0x050,F,A
+    RLCF 0x051,F,A
+    RLCF 0x052,F,A
+    MOVLW 0x01
+    SUBWF 0x04A,F,A
+    BTFSC 0xFD8,0,A
+    GOTO tmp95
+    MOVLW 0x01
+    SUBWF 0x04B,F,A
+    GOTO tmp95
+tmp98:
+    BTFSC 0x054, 0,A
+    BSF 0x053, 1,A
+    BCF 0xFD8,0,A
+    RRCF 0x052,F,A
+    RRCF 0x051,F,A
+    RRCF 0x050,F,A
+    RRCF 0x056,F,A
+    RRCF 0x055,F,A
+    RRCF 0x054,F,A
+    INCF 0x04A,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x04B,F,A
+    GOTO tmp95
+tmp99:
+    BTFSS 0x056, 7,A
+    GOTO tmp100
+    MOVLW 0x7F
+    ANDWF 0x056,W,A
+    IORWF 0x055,W,A
+    IORWF 0x054,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp101
+    BTFSC 0x053, 1,A
+    GOTO tmp101
+    BTFSC 0x050, 0,A
+    GOTO tmp101
+    GOTO tmp102
+tmp101:
+    INCF 0x050,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x051,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x052,F,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp124
+    GOTO tmp125
+tmp124:
+    MOVLW 0x80
+    MOVWF 0x052,A
+    CLRF 0x051,A
+    CLRF 0x050,A
+    MOVLW 0x01
+    ADDWF 0x04A,F,A
+tmp125:
+tmp100:
+    BTFSC 0x052, 7,A
+    GOTO tmp102
+    MOVF 0x04B,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp102
+    MOVF 0x04A,W,A
+    SUBLW 0x01
+    BTFSS 0xFD8,2,A
+    GOTO tmp102
+    CLRF 0x04A,A
+tmp102:
+    MOVF 0x050,W,A
+    MOVWF 0x000,A
+    MOVF 0x051,W,A
+    MOVWF 0x001,A
+    MOVLW 0x7F
+    ANDWF 0x052,W,A
+    MOVWF 0x002,A
+    BTFSC 0x04A, 0,A
+    BSF 0x002, 7,A
+    MOVF 0x04A,W,A
+    MOVWF 0x003,A
+    BCF 0xFD8,0,A
+    RRCF 0x003,F,A
+    BTFSC 0x049, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp121:
+    CLRF 0x000,A
+    CLRF 0x001,A
+    CLRF 0x002,A
+    CLRF 0x003,A
+    BTFSC 0x049, 7,A
+    BSF 0x003, 7,A
+    RETURN
+__fptosi_f32:
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    MOVWF 0x045,A
+    BCF 0xFD8,0,A
+    RLCF 0x045,F,A
+    BTFSC 0x043, 7,A
+    BSF 0x045, 0,A
+    MOVF 0x044,W,A
+    ANDLW 0x80
+    MOVWF 0x04A,A
+    MOVF 0x045,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp126
+    CLRF 0x047,A
+    CLRF 0x048,A
+    CLRF 0x049,A
+    CLRF 0x04B,A
+    GOTO tmp132
+tmp126:
+    MOVF 0x041,W,A
+    MOVWF 0x047,A
+    MOVF 0x042,W,A
+    MOVWF 0x048,A
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORLW 0x80
+    MOVWF 0x049,A
+    CLRF 0x04B,A
+    MOVF 0x045,W,A
+    SUBLW 0x96
+    BTFSS 0xFD8,0,A
+    GOTO tmp127
+    MOVWF 0x046,A
+    MOVLW 0x1F
+    SUBWF 0x046,W,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp128
+    MOVLW 0x1F
+    MOVWF 0x046,A
+tmp128:
+    MOVF 0x046,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp129
+    GOTO tmp132
+tmp129:
+    BCF 0xFD8,0,A
+    RRCF 0x049,F,A
+    RRCF 0x048,F,A
+    RRCF 0x047,F,A
+    DECFSZ 0x046,F,A
+    GOTO tmp129
+    GOTO tmp132
+tmp127:
+    SUBLW 0x00
+    MOVWF 0x046,A
+    MOVLW 0x08
+    SUBWF 0x046,W,A
+    BTFSS 0xFD8,0,A
+    GOTO tmp130
+    BTFSS 0x04A, 7,A
+    GOTO tmp131
+    CLRF 0x047,A
+    CLRF 0x048,A
+    CLRF 0x049,A
+    MOVLW 0x80
+    MOVWF 0x04B,A
+    GOTO tmp132
+tmp131:
+    MOVLW 0xFF
+    MOVWF 0x047,A
+    MOVWF 0x048,A
+    MOVWF 0x049,A
+    MOVLW 0x7F
+    MOVWF 0x04B,A
+    GOTO tmp132
+tmp130:
+    BCF 0xFD8,0,A
+    RLCF 0x047,F,A
+    RLCF 0x048,F,A
+    RLCF 0x049,F,A
+    RLCF 0x04B,F,A
+    DECFSZ 0x046,F,A
+    GOTO tmp130
+tmp132:
+    BTFSS 0x04A, 7,A
+    GOTO tmp133
+    COMF 0x047,F,A
+    COMF 0x048,F,A
+    COMF 0x049,F,A
+    COMF 0x04B,F,A
+    INCF 0x047,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x048,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x049,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x04B,F,A
+tmp133:
+    MOVF 0x047,W,A
+    MOVWF 0x000,A
+    MOVF 0x048,W,A
+    MOVWF 0x001,A
+    MOVF 0x049,W,A
+    MOVWF 0x002,A
+    MOVF 0x04B,W,A
+    MOVWF 0x003,A
+    RETURN
+__sitofp_f32:
+    MOVF 0x044,W,A
+    ANDLW 0x80
+    MOVWF 0x04A,A
+    BTFSS 0x044,7,A
+    GOTO tmp134
+    COMF 0x041,F,A
+    COMF 0x042,F,A
+    COMF 0x043,F,A
+    COMF 0x044,F,A
+    INCF 0x041,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x042,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x043,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x044,F,A
+tmp134:
+    MOVF 0x041,W,A
+    IORWF 0x042,W,A
+    IORWF 0x043,W,A
+    IORWF 0x044,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp136
+    CLRF 0x000,A
+    CLRF 0x001,A
+    CLRF 0x002,A
+    CLRF 0x003,A
+    BTFSC 0x04A, 7,A
+    BSF 0x003, 7,A
+    RETURN
+tmp136:
+    CLRF 0x045,A
+tmp137:
+    BTFSC 0x044, 7,A
+    GOTO tmp135
+    BCF 0xFD8,0,A
+    RLCF 0x041,F,A
+    RLCF 0x042,F,A
+    RLCF 0x043,F,A
+    RLCF 0x044,F,A
+    INCF 0x045,F,A
+    GOTO tmp137
+tmp135:
+    MOVF 0x045,W,A
+    SUBLW 0x9E
+    MOVWF 0x046,A
+    CLRF 0x047,A
+    MOVF 0x041,W,A
+    ANDLW 0x80
+    MOVWF 0x048,A
+    MOVF 0x041,W,A
+    ANDLW 0x7F
+    MOVWF 0x049,A
+    BTFSS 0x048, 7,A
+    GOTO tmp139
+    MOVF 0x049,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp138
+    BTFSC 0x042, 0,A
+    GOTO tmp138
+    GOTO tmp139
+tmp138:
+    INCF 0x042,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x043,F,A
+    BTFSC 0xFD8,2,A
+    INCF 0x044,F,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp140
+    GOTO tmp141
+tmp140:
+    MOVLW 0x80
+    MOVWF 0x044,A
+    CLRF 0x043,A
+    CLRF 0x042,A
+    MOVLW 0x01
+    ADDWF 0x046,F,A
+tmp141:
+tmp139:
+    MOVF 0x042,W,A
+    MOVWF 0x000,A
+    MOVF 0x043,W,A
+    MOVWF 0x001,A
+    MOVLW 0x7F
+    ANDWF 0x044,W,A
+    MOVWF 0x002,A
+    BTFSC 0x046, 0,A
+    BSF 0x002, 7,A
+    MOVF 0x046,W,A
+    MOVWF 0x003,A
+    BCF 0xFD8,0,A
+    RRCF 0x003,F,A
+    BTFSC 0x04A, 7,A
+    BSF 0x003, 7,A
+    RETURN
+__cmp_f32:
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    SUBLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp142
+    BTFSS 0x043, 7,A
+    GOTO tmp142
+    MOVF 0x043,W,A
+    ANDLW 0x7F
+    IORWF 0x042,W,A
+    IORWF 0x041,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp144
+tmp142:
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    SUBLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp143
+    BTFSS 0x047, 7,A
+    GOTO tmp143
+    MOVF 0x047,W,A
+    ANDLW 0x7F
+    IORWF 0x046,W,A
+    IORWF 0x045,W,A
+    BTFSS 0xFD8,2,A
+    GOTO tmp144
+tmp143:
+    MOVF 0x044,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp145
+    BTFSC 0x043, 7,A
+    GOTO tmp145
+    MOVF 0x048,W,A
+    ANDLW 0x7F
+    BTFSS 0xFD8,2,A
+    GOTO tmp145
+    BTFSC 0x047, 7,A
+    GOTO tmp145
+    GOTO tmp146
+tmp145:
+    MOVF 0x044,W,A
+    XORWF 0x048,W,A
+    ANDLW 0x80
+    BTFSS 0xFD8,2,A
+    GOTO tmp147
+    MOVF 0x044,W,A
+    ANDLW 0x80
+    MOVWF 0x04A,A
+    BCF 0x044, 7,A
+    BCF 0x048, 7,A
+    MOVF 0x041,W,A
+    XORWF 0x045,W,A
+    MOVWF 0x049,A
+    MOVF 0x042,W,A
+    XORWF 0x046,W,A
+    IORWF 0x049,W,A
+    MOVWF 0x049,A
+    MOVF 0x043,W,A
+    XORWF 0x047,W,A
+    IORWF 0x049,W,A
+    MOVWF 0x049,A
+    MOVF 0x044,W,A
+    XORWF 0x048,W,A
+    IORWF 0x049,W,A
+    MOVWF 0x049,A
+    MOVF 0x045,W,A
+    SUBWF 0x041,W,A
+    MOVF 0x046,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x046,W,A
+    SUBWF 0x042,W,A
+    MOVF 0x047,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x047,W,A
+    SUBWF 0x043,W,A
+    MOVF 0x048,W,A
+    BTFSS 0xFD8,0,A
+    INCFSZ 0x048,W,A
+    SUBWF 0x044,W,A
+    MOVF 0x049,W,A
+    BTFSC 0xFD8,2,A
+    GOTO tmp146
+    BTFSS 0xFD8,0,A
+    GOTO tmp150
+    BTFSS 0x04A, 7,A
+    GOTO tmp149
+    GOTO tmp148
+tmp150:
+    BTFSS 0x04A, 7,A
+    GOTO tmp148
+    GOTO tmp149
+tmp147:
+    BTFSS 0x044, 7,A
+    GOTO tmp149
+    GOTO tmp148
+tmp146:
+    CLRF 0x000,A
+    RETURN
+tmp148:
+    MOVLW 0x01
+    MOVWF 0x000,A
+    RETURN
+tmp149:
+    MOVLW 0x02
+    MOVWF 0x000,A
+    RETURN
+tmp144:
+    MOVLW 0x03
+    MOVWF 0x000,A
+    RETURN
+__start:
+    call main
+    sleep
+    end

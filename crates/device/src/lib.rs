@@ -3,7 +3,7 @@
 //! literals in each of them. See docs/29-pic18-port-design.md (§2 D-3) for
 //! the design this implements. P1 adds the PIC18F4550 profile;
 //! `has_hardware_multiply`/`has_tblrd`/`sfrs` still aren't added (unused so
-//! far) and `access_bank` never will be — it's a core PIC18 invariant, not
+//! far) and `access_bank` never will be  -  it's a core PIC18 invariant, not
 //! a per-device fact (see docs/superpowers/plans/2026-08-18-pic18-port-p1.md). P2 populates `PIC18F4550`'s `ram_banks`/`common_ram` for real (P0/P1 left them as placeholders since nothing consumed them yet).
 
 mod config;
@@ -134,7 +134,7 @@ pub const PIC16F877A: Device = Device {
     },
 };
 
-/// The PIC18F2455/2550/4455/4550 family (the 4550 profile specifically —
+/// The PIC18F2455/2550/4455/4550 family (the 4550 profile specifically
 /// the others share the core with less flash/RAM).
 pub const PIC18F4550: Device = Device {
     name: "p18f4550",
@@ -144,7 +144,7 @@ pub const PIC18F4550: Device = Device {
     // (0x000-0x05F) plus BSR-selected banks 0-7 (0x060-0x7FF) form
     // unbroken GPR, unlike PIC14's four banks separated by SFR holes, so a
     // single-entry table is correct here (see `Device::region_for`, which
-    // already handles an arbitrary bank list generically — no PIC18-
+    // already handles an arbitrary bank list generically  -  no PIC18-
     // specific allocator code is needed anywhere, only this data).
     // 0x0000-0x000F is reserved (see `common_ram` below), so GPR starts at
     // 0x0010.
@@ -450,13 +450,13 @@ pub const PIC18F4550: Device = Device {
 };
 
 impl Device {
-    /// The first GPR bank's start address — where global allocation begins.
+    /// The first GPR bank's start address  -  where global allocation begins.
     pub fn gpr_start(&self) -> u16 {
         self.ram_banks[0].0
     }
 
     /// The inclusive `(start, end)` of the banked GPR region containing
-    /// `addr` — the first bank (in address order) whose end is `>= addr`,
+    /// `addr`  -  the first bank (in address order) whose end is `>= addr`,
     /// so an `addr` before the first bank's start still resolves to that
     /// bank (matching every caller, which only ever asks with `addr` at or
     /// above `gpr_start()`). `None` once `addr` is past the last bank.
@@ -467,7 +467,7 @@ impl Device {
     /// The bank index of a physical GPR address: `Some(n)` for a banked GPR
     /// address, `None` for an SFR or common-RAM address (neither needs a
     /// `BANKSEL`). Panics for an address in neither category (an
-    /// unimplemented/reserved gap) — such an address must never reach the
+    /// unimplemented/reserved gap)  -  such an address must never reach the
     /// banking pass.
     pub fn bank_of(&self, addr: u16) -> Option<u8> {
         if let Some((lo, hi)) = self.common_ram {

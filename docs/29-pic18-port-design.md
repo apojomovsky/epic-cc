@@ -249,7 +249,7 @@ not a judgement.
 | **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
 | **P5** | **DONE** Interrupts: single-vector compatibility mode (IPEN=0), one handler at `0x0008` (see the P5 note and ADR-013). | `interrupt_pic18.c`, `interrupt_gate_pic18.c`; `interrupt_mul.c` joins P6 (it needs `*`/`/`) |
 | **P6** | **DONE** 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c`, `interrupt_mul_pic18.c` |
-| **P7** | Soft-float. | `float.c` |
+| **P7** | **DONE** Soft-float: nine f32 routines via `MULWF`/`TBLRD`/`isr` save area. | `float.c` (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) |
 | **P8** | Point the differential fuzzer at PIC18. | the seed corpora run clean |
 
 **P3 note (2026-08-20):** landed per
@@ -290,6 +290,14 @@ a `gpasm -p p18f4550` byte-for-byte cross-check on the `long.c` asm. The
 muls use hardware `MULWF` schoolbook partials (no shift-add loop); the
 divmod/shift loops are branch-based with no single-GPR-bank constraint.
 
+**P7 note (2026-08-20):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p7.md`](superpowers/plans/2026-08-20-pic18-port-p7.md).
+The nine f32 soft-float routines land together (ADR-015): `float.c`
+(out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) passes on the `Pic18`
+simulator with a `gpasm -p p18f4550` byte-for-byte cross-check. The
+recipes are a 1:1 port of PIC14's verified ieee754 bodies with the
+substitution table (RLF to RLCF, STATUS to 0xFD8, etc.); the frame rule is
+every routine slot at `<=0x5F` (access-bank GPR, no MOVLB in skip windows).
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely
 additive and the PIC14 backend can never regress silently.

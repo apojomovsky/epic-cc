@@ -8,6 +8,7 @@
 use device::PIC18F4550;
 use pic14_sim::{parse_hex_pic18, Pic18};
 use std::collections::HashMap;
+static E2E_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::process::Command;
 
 /// Run clang + the full IR pipeline (through `asm::assemble_file_to_hex`) on
@@ -210,6 +211,7 @@ fn const_table_c_runs_correctly() {
 
 #[test]
 fn interrupt_pic18_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock().unwrap();
     // Mirrors crates/driver/tests/interrupt_e2e.rs: in == 0x10, the ISR
     // fired mid-run after main's PORTB = 0x11 store -> the ISR's
     // bump_isr(out) lands before main's bump reads it:
@@ -326,6 +328,7 @@ fn interrupt_mul_pic18_c_runs_correctly() {
 
 #[test]
 fn interrupt_gate_pic18_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock().unwrap();
     // Mirrors crates/driver/tests/interrupt_gate_e2e.rs: the request is
     // latched while INTCON = 0x10 (INT0IE, GIE clear), taken only after
     // main writes INTCON = 0x90. isr_ran == 1, stage == 3, halted.
@@ -344,5 +347,36 @@ fn interrupt_gate_pic18_c_runs_correctly() {
     p.run(20_000); // through stage 2 (still masked), stage 3's unmask
     assert_eq!(p.ram()[globals["isr_ran"] as usize], 1, "the handler ran exactly once");
     assert_eq!(p.ram()[globals["stage"] as usize], 3, "main completed after the handler returned");
+    assert!(p.halted());
+}
+
+#[test]
+fn float_c_runs_correctly() {
+    // Mirrors crates/driver/tests/float_e2e.rs: in = 3.0f (0x40400000) ->
+    // out1 = 3.0/2.5 = 1.2 = 0x3F99999A (RNE), out2 = 9.0 = 0x41100000
+    // (via fadd/fmul exact + fptosi/sitofp), out3 = 1.0/3.0 = 0x3EAAAAAB
+    // (RNE) via the struct sret/byval path.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/float.c"));
+    // 3.0f = 0x40400000 LE bytes 00 00 40 40
+    p.ram_mut()[globals["in"] as usize] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 1] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 2] = 0x40;
+    p.ram_mut()[globals["in"] as usize + 3] = 0x40;
+    p.run(2_000_000);
+    // out1 = 0x3F99999A LE 9A 99 99 3F
+    assert_eq!(p.ram()[globals["out1"] as usize], 0x9A);
+    assert_eq!(p.ram()[globals["out1"] as usize + 1], 0x99);
+    assert_eq!(p.ram()[globals["out1"] as usize + 2], 0x99);
+    assert_eq!(p.ram()[globals["out1"] as usize + 3], 0x3F);
+    // out2 = 0x41100000 LE 00 00 10 41
+    assert_eq!(p.ram()[globals["out2"] as usize], 0x00);
+    assert_eq!(p.ram()[globals["out2"] as usize + 1], 0x00);
+    assert_eq!(p.ram()[globals["out2"] as usize + 2], 0x10);
+    assert_eq!(p.ram()[globals["out2"] as usize + 3], 0x41);
+    // out3 = 0x3EAAAAAB LE AB AA AA 3E
+    assert_eq!(p.ram()[globals["out3"] as usize], 0xAB);
+    assert_eq!(p.ram()[globals["out3"] as usize + 1], 0xAA);
+    assert_eq!(p.ram()[globals["out3"] as usize + 2], 0xAA);
+    assert_eq!(p.ram()[globals["out3"] as usize + 3], 0x3E);
     assert!(p.halted());
 }
