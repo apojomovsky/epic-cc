@@ -75,8 +75,9 @@ here so it is not relitigated later as a regression.
 ### D-2: Split the XC8 compatibility surface by category
 
 **Decision.** epic-cc natively owns the things every PIC compiler must have, with epic-cc's
-own spelling: absolute placement, interrupt-vector attributes, and configuration words.
-epic-hal owns what is genuinely dialect-specific, which is `epic-math`'s assembly.
+own spelling: absolute placement and configuration words (interrupt-vector marking turned
+out to need no epic-cc-specific spelling at all; see D-8). epic-hal owns what is genuinely
+dialect-specific, which is `epic-math`'s assembly.
 
 epic-cc ships a header, `epic-cc.h`, defining its spellings. epic-hal's platform-header
 seam maps its `EPIC_*` macros onto them, one line per item:
@@ -84,14 +85,15 @@ seam maps its `EPIC_*` macros onto them, one line per item:
 ```c
 /* pic18fxx5x-hal/include/epiccc/pic18_platform.h  (new, alongside target/ and host/) */
 #define EPIC_PLACE(a)   EPIC_AT(a)
-#define EPIC_ISR_HIGH   EPIC_ISR(high)
-#define EPIC_ISR_LOW    EPIC_ISR(low)
 ```
 
-**Rationale.** Placement, ISR attributes and config words are not concessions to XC8. Without
-them epic-cc can only compile test fixtures that fake SFRs with integer-to-pointer casts and
-never boot a physical part. epic-cc owes all three regardless of epic-hal, so they are epic-cc
-API, documented as such.
+**Superseded by D-8:** the `EPIC_ISR_HIGH`/`EPIC_ISR_LOW` mapping shown above at the time of
+this decision turned out to be unnecessary. See D-8.
+
+**Rationale.** Placement and config words are not concessions to XC8. Without them epic-cc can
+only compile test fixtures that fake SFRs with integer-to-pointer casts and never boot a
+physical part. epic-cc owes both regardless of epic-hal, so they are epic-cc API, documented
+as such.
 
 The header must exist in some repo because clang is the front end and rejects unknown
 attributes; the one thing it forwards verbatim is `__attribute__((section("...")))`, on globals
@@ -393,6 +395,155 @@ epic-cc [options] <input.c>...
 across `crates/driver/tests/`, the fuzz harness's `driver_binary()`, the Makefile's `compile`
 target and the README example: mechanical, and the bulk of CC-1's diff.
 
+### D-8: interrupt-vector marking needs no epic-cc spelling; drop it from CC-3
+
+**Decision.** epic-cc does not define an `EPIC_ISR` macro. Interrupt handlers are marked with
+`__attribute__((interrupt(N)))`, msp430's own native syntax (the argument `N` is syntactic
+noise clang requires but nothing downstream reads), which clang already lowers to the
+`msp430_intrcc` calling convention. `irparse` already turns that into `Func.isr`
+(`crates/irparse/src/lib.rs:1070`), and both PIC14 (shipped) and PIC18-in-compatibility-mode
+(`feat/pic18-p5-interrupts`, in flight as of 2026-08-21) use it identically. There is nothing
+for CC-3 to build here.
+
+**Rationale.** D-2, written before this was checked, assumed interrupt-vector marking needed
+the same section-attribute treatment as placement and config words. It does not: clang's
+msp430 target already provides a portable attribute for exactly this purpose, and the
+compiler already consumes it with zero epic-cc-specific code on either core.
+
+**PIC18 high/low priority stays unbuilt, on purpose.** `docs/29-pic18-port-design.md`'s P5 row
+promised two vectors with priority; the PR actually landing it is titled "single-vector
+compatibility mode" deliberately deferring priority. Since the backend does not yet support two
+distinct vector destinations, `EPIC_ISR_HIGH`/`EPIC_ISR_LOW` (D-2's original example) would
+either have no consumer or would silently promise a capability that is not there, which is
+exactly the kind of surface this project's panics-over-silent-miscompile rule exists to
+prevent. When PIC18 priority interrupts land, if the plain `interrupt(N)` attribute cannot
+express which vector a handler belongs to, that decision belongs to that work, not to CC-3.
+
+**Rejected, build `EPIC_ISR_HIGH`/`EPIC_ISR_LOW` now, matching D-2's original example.** Ships
+a macro with no consumer, or an API surface that lies about hardware support until a later PR
+happens to catch up. Deferred, not closed.
+
+### D-9: config words are per-device field tables, verified against `gpasm`, HEX emission gains multi-region support
+
+**Decision.** Both device config regions are modeled as data, following ADR-004's
+device-as-data convention:
+
+```rust
+pub struct FuseValue { pub name: &'static str, pub bits: u8 }
+pub struct FuseField {
+    pub name: &'static str,            // "osc", "wdt", "lvp": datasheet names, per D-4
+    pub byte_offset: u16,               // offset within the config region
+    pub mask: u8,
+    pub shift: u8,
+    pub values: &'static [FuseValue],
+    pub default: &'static str,
+    pub locked: Option<&'static str>,   // Some(only-legal-value) if epic-cc cannot honor an override
+}
+pub struct ConfigRegion {
+    pub base_byte_addr: u32,            // 0x400E (PIC16F877A), 0x300000 (PIC18F4550) [VERIFY]
+    pub reserved_ones: &'static [u8],   // unimplemented bits that must read 1, per datasheet
+    pub fields: &'static [FuseField],
+}
+```
+
+`EPIC_CONFIG("...")`'s string is comma-separated `key=value`, matched case-insensitively
+against the device's field table. An unrecognized field or value panics naming the offending
+token and the valid options. A field not mentioned takes its `default`. The resolved bytes are
+folded with `reserved_ones` OR'd in. epic-cc prints the resolved config bytes and the named
+setting behind each one unconditionally on success (D-4's promise; not gated behind `-v`).
+
+**`locked` is a correctness rule, not an ergonomics nicety.** `isel-pic18` only ever emits
+classic-mode PIC18 encoding. `XINST` (PIC18's extended-instruction-set config bit) must be
+modeled, since v1's fuse coverage is the full bit set per device, but `locked = Some("off")`:
+an override attempting `xinst=on` panics with the field and value, because the alternative is
+silently shipping code whose addressing-mode semantics do not match what the silicon is
+configured to execute, a miscompile, not a build error. `[VERIFY]` whether any other PIC18 or
+PIC16F877A config bit shares this hazard before assuming `XINST` is the only one.
+
+**Full-bit-set transcription is verified against `gpasm`, not trusted by hand alone.** Both
+config regions (roughly one word for the PIC16F877A, roughly thirteen bytes for the
+PIC18F4550, DS39632 §25.1) are transcribed from the datasheets by hand, real transcription-risk
+work. `gpasm` is already this project's byte-for-byte oracle elsewhere; the same pattern
+applies: assemble an equivalent `CONFIG`/`__CONFIG` pragma through `gpasm` and diff the
+resulting bytes against epic-cc's, per fuse combination exercised by the test matrix, rather
+than trusting hand transcription alone. Stays inside the GPL boundary: invoking `gpasm` as a
+process in tests, never linking it.
+
+**HEX emission gains a multi-region entry point; the single-region path is untouched.**
+`to_hex` (`crates/asm/src/lib.rs:561`) already writes byte addresses as `word_index * 2` inside
+one `0x04` extended-linear-address record fixed at `upper=0`. The PIC16F877A's config word sits
+at word address `0x2007`, byte address `0x400E` `[VERIFY]`, still under `0x10000`, so it needs
+no new address window, only widening the `words.len() <= device.flash_words` assert
+(`:417`), which today conflates "program flash size" with "total addressable word space";
+those are different concepts once a config word lives past the program's own ceiling. The
+PIC18F4550's config bytes at byte address `0x300000+` `[VERIFY]` are outside any 16-bit window
+and need a second `0x04` record with `upper=0x0030`. Rather than special-case PIC18, a new
+`to_hex_regions(&[(base_byte_addr, &[u16])]) -> String` accepts a list of chunks and emits a new
+`0x04` record only when a chunk's upper 16 bits differ from the previous one; PIC14 becomes the
+single-chunk case, byte-identical to today's `to_hex` output, and PIC18 becomes two chunks.
+`to_hex` itself is not modified, so every existing PIC14 fixture's golden output is unaffected
+by construction.
+
+**Rejected, size the PIC18 `words` array out to the config region directly (~1.5M entries) and
+let the existing `to_hex` walk it.** Mechanically simpler, but pads roughly 1.5 million mostly-
+zero words into memory and into the walk just to reach one 13-byte region, and produces
+enormous zero-filled HEX output the existing chunking loop was never designed to skip.
+
+### D-10: `EPIC_FOSC_HZ` is a preprocessor macro, resolved by a driver-side pre-scan, not a two-pass compile
+
+**Decision.** `EPIC_FOSC_HZ` is a `#define`, forwarded to every clang invocation via `-D`
+(the mechanism CC-1 already built), not a compiler-synthesized global constant. Resolving its
+value happens before any clang invocation:
+
+1. If no `EPIC_CONFIG(...)` override is found, `EPIC_FOSC_HZ` resolves entirely from the
+   `--device`'s default fuse profile, known before any input file is read. This is the common
+   case and costs nothing extra.
+2. If an override might be present, the driver runs a small, string-literal-aware text scanner
+   (not clang, not a preprocess-only `-E` pass) over the raw `.c` inputs, looking for exactly
+   one top-level `EPIC_CONFIG(` invocation followed by a quoted string. Zero or more than one
+   match across the whole program panics.
+3. The extracted string resolves through the same field table and `locked` rule D-9 defines for
+   the real config-word emission, so there is one resolution path, not two.
+4. `-D EPIC_FOSC_HZ=<value>` is added to every clang invocation before compilation proceeds; the
+   clang-per-file loop's shape is otherwise unchanged from CC-1.
+
+**Rationale.** The embedded-toolchain precedent for a clock-frequency constant splits in two,
+and the split matters here. AVR-GCC's `F_CPU` and XC8's `_XTAL_FREQ` are user-supplied
+preprocessor constants, used almost entirely so a delay macro (`_delay_loop_2(F_CPU/4000*ms)`)
+can unroll into a cycle-counted loop at compile time; a linker symbol cannot fill that role,
+because C requires a constant *expression* there, not a value resolved at link time. The same
+constraint applies to any compile-time-sized baud-divisor table. STM32's CMSIS splits the same
+way for a different reason: `HSE_VALUE` (the raw crystal input) is a `#define`; `SystemCoreClock`
+(the PLL-derived result, computed once at runtime) is a global. epic-hal's plausible uses of
+`EPIC_FOSC_HZ`, a delay primitive or a baud-rate divisor, are the `F_CPU`/`_XTAL_FREQ` shape, not
+the `SystemCoreClock` shape.
+
+**The pre-scan is cheap because `EPIC_CONFIG`'s argument is a string literal we define, not
+arbitrary C.** Finding it needs no semantic analysis and no clang invocation: a small hand-
+written scanner that skips comments and string/char literals correctly (a naive `grep` would
+misfire on a fuse string that happens to contain `/*`-looking text) is sufficient. This is not
+the two-pass full clang compile the option looked like before checking: only the override case
+touches the scanner at all, and even then it never invokes clang.
+
+**Scope restriction for v1, stated plainly.** Exactly one unconditional, top-level
+`EPIC_CONFIG(...)` invocation across the whole program is supported; one wrapped in the user's
+own `#ifdef` is not scanned for and produces the "zero matches, using defaults" path silently
+rather than an error, which is a real sharp edge worth flagging rather than discovering later.
+`[VERIFY]` whether this silent-default behavior should instead be a diagnostic (e.g. "found
+`EPIC_CONFIG` textually but could not confirm it is unconditional") once the scanner exists to
+test it against.
+
+**Rejected, compiler-synthesized global constant.** Simple to build (inject a new `Global` into
+the merged IR after resolution, no driver-loop changes at all) and functionally insufficient:
+not usable in `#if`, and not usable to size a compile-time array, which is the load-bearing use
+case in the ecosystems this convention is borrowed from.
+
+**Rejected, two-pass full clang compile** (preprocess or compile every unit once to discover
+the override, then again with `-D` added). Would have worked, but is strictly more expensive
+than the scanner for no additional correctness, since `EPIC_CONFIG`'s argument never needs
+semantic analysis to extract.
+
+
 
 ---
 
@@ -406,7 +557,7 @@ Fourteen, across three repositories. Each earns its own design and plan.
 |---|---|---|
 | **CC-1** | **Multi-TU front end** | Per D-7: conventional CLI, clang per file, `llvm-link` merge, `wholeprog` becomes a validator (unresolved externals, one `main`) and the symbol sanitizer. Replaces `crates/wholeprog/src/lib.rs:5`. |
 | **CC-2** | **Freestanding libc subset** | Headers and implementations for `stdint.h` (94 uses in epic-hal), `string.h` (43), `stdbool.h` (31), `stddef.h` (17). `string.h` needs real code, not just declarations. |
-| **CC-3** | **Silicon-real codegen** | Config-word tables per device, `EPIC_AT`, `EPIC_ISR`, `EPIC_FOSC_HZ`, the resolved-config report, and the `epic-cc.h` header itself. |
+| **CC-3** | **Silicon-real codegen** | Per D-8/D-9/D-10: config-word field tables (full bit set, both devices), `EPIC_AT`, multi-region HEX emission, `EPIC_FOSC_HZ` via a driver-side pre-scan, the resolved-config report, and the `epic-cc.h` header itself. No `EPIC_ISR`, superseded by D-8. |
 | **CC-4** | **Inline assembly** | The D-3 ladder: naked functions and `.asm` inputs, then intrinsics, then opaque statement-level assembly, then memory operands if warranted. Conservative clobbering throughout, since clang cannot express PIC register clobbers. |
 | **CC-5** | **PIC18 P4-P8** | `const` via `TBLRD`, two-vector interrupts, 32-bit `long` and hardware `MUL`, soft-float, differential fuzzing. Per `docs/29-pic18-port-design.md` §4. |
 | **CC-6** | **Toolchain distribution** | Release bundles for Linux, macOS and Windows with clang 20.1.8 inside; today Linux only (`docs/30-distribution-design.md`). Plus size and map reporting, which PlatformIO expects. |
