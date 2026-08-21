@@ -442,6 +442,7 @@ pub struct FuseField {
 pub struct ConfigRegion {
     pub base_byte_addr: u32,             // 0x400E (PIC16F877A), 0x300000 (PIC18F4550): confirmed
     pub num_bytes: u16,                  // total addressable span, including any gap addresses
+    pub erased_baseline: &'static [u8],  // raw flash content before any FuseField is applied
     pub fields: &'static [FuseField],
 }
 ```
@@ -473,9 +474,16 @@ field (`WDT`, `LVP`, `BOR`, `PWRTEN`, protection, `DEBUG`, pin-mux fields) keeps
 safe default per D-4's original intent (watchdog off, low-voltage programming off, brownout
 on, no code protection, debug off).
 
-The resolved bytes start from an all-`0xFF` region of `num_bytes` length, with each
-`FuseField`'s bits ANDed and ORed in at its `byte_offset`; anything never touched by a field
-stays `0xFF`. epic-cc prints the resolved config bytes and the named setting behind each one
+The resolved bytes start from `erased_baseline`, with each `FuseField`'s bits cleared and set
+at its `byte_offset`; anything never touched by a field keeps its baseline value.
+`erased_baseline` is `0xFF` for every PIC18F4550 byte, confirmed empirically against `gpasm`
+(the same `CONFIG4L` cross-check above), including gap addresses that are not a real register
+at all (`0x300007` read back `0xFF` in the `gpasm` output with no directive touching it). It is
+NOT uniformly `0xFF` for the PIC16F877A: the config word is 14 bits, not 16, so its high byte's
+top two bits are packing padding beyond the real word width, not unimplemented-but-real bits,
+and DS39582C states the word's own erased value directly ("the erased (unprogrammed) value of
+the Configuration Word is 3FFFh"), giving `erased_baseline: &[0xFF, 0x3F]` with no computation
+needed. epic-cc prints the resolved config bytes and the named setting behind each one
 unconditionally on success (D-4's promise;
 not gated behind `-v`).
 
