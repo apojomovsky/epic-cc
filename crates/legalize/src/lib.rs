@@ -79,7 +79,7 @@ pub fn legalize(m: Module) -> Module {
             }
             blocks.push(Block { label: b.label, insts });
         }
-        funcs.push(Func { name: f.name, ret: f.ret, params: f.params, blocks, isr: f.isr });
+        funcs.push(Func { name: f.name, ret: f.ret, params: f.params, blocks, isr: f.isr, naked: f.naked });
     }
     // Runtime-routine duplication for the interrupt context. The user-level
     // duplication ran before the loop above, but the routine CALLs are
@@ -99,7 +99,7 @@ pub fn legalize(m: Module) -> Module {
         f.name = name.clone();
         funcs.push(f);
     }
-    Module { globals: m.globals, funcs }
+    Module { globals: m.globals, funcs, module_asm: m.module_asm }
 }
 
 /// Split the runtime routines that BOTH the main and interrupt contexts
@@ -220,6 +220,7 @@ fn inst_dst(inst: &Inst) -> Option<&str> {
         Inst::FloatBin(b) => Some(&b.dst),
         Inst::Fcmp(c) => Some(&c.dst),
         Inst::FloatConv(c) => Some(&c.dst),
+        Inst::Asm(_) => None,
         Inst::Ret(_) | Inst::Store(_) | Inst::Br(_) | Inst::BrCond(_) | Inst::Memcpy(_) => None,
     }
 }
@@ -532,7 +533,7 @@ fn duplicate_isr_shared(m: Module) -> Module {
             }
         }
     }
-    Module { globals: m.globals, funcs }
+    Module { globals: m.globals, funcs, module_asm: m.module_asm }
 }
 
 /// The runtime routine for a scalar binop, or `None` if legalize leaves the
@@ -801,5 +802,6 @@ fn routine_func(name: &str) -> Func {
             insts: vec![Inst::Alloca(Alloca { dst: "__scr".into(), size: scr })],
         }],
         isr: false, // runtime routines are never interrupt handlers
+        naked: false,
     }
 }

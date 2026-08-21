@@ -39,6 +39,20 @@ pub fn assemble(src: &str) -> Vec<u16> {
         if let Some(_rest) = line.strip_prefix("end") {
             break;
         }
+        // Handle `label: instruction` on one line (e.g. `my_label: nop` from module asm).
+        if let Some(colon) = line.find(':') {
+            let label = line[..colon].trim();
+            let rest = line[colon + 1..].trim();
+            if !label.is_empty() && !label.contains(' ') && !label.contains('\t') {
+                symbols.insert(label.to_string(), org);
+                if rest.is_empty() {
+                    continue;
+                }
+                lines.push((org, rest.to_string()));
+                org += 1;
+                continue;
+            }
+        }
         if let Some(label) = line.strip_suffix(':') {
             symbols.insert(label.trim().to_string(), org);
             continue;
@@ -151,6 +165,21 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         }
         if line.strip_prefix("end").is_some() {
             break;
+        }
+        // Handle `label: instruction` on one line (e.g. `my_label: nop` from module asm).
+        if let Some(colon) = line.find(':') {
+            let label = line[..colon].trim();
+            let rest = line[colon + 1..].trim();
+            if !label.is_empty() && !label.contains(' ') && !label.contains('\t') {
+                symbols.insert(label.to_string(), org);
+                if rest.is_empty() {
+                    continue;
+                }
+                let words = instruction_words_pic18(rest);
+                lines.push((org, rest.to_string()));
+                org += words * 2;
+                continue;
+            }
         }
         if let Some(label) = line.strip_suffix(':') {
             symbols.insert(label.trim().to_string(), org);

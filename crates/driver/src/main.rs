@@ -37,6 +37,14 @@ fn main() {
         }
     };
 
+    for input in &cli.inputs {
+        let lower = input.to_ascii_lowercase();
+        if lower.ends_with(".asm") || lower.ends_with(".s") {
+            eprintln!("epic-cc: .asm inputs are not supported in this build; use EPIC_NAKED functions");
+            std::process::exit(2);
+        }
+    }
+
     let lower = cli.device.to_ascii_lowercase();
     let device = match lower.as_str() {
         "p16f877a" => &device::PIC16F877A,

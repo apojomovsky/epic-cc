@@ -210,6 +210,26 @@ fn walk_region(
             label_idx.insert(name.to_string(), i);
         }
     }
+    // Precompute asm-block membership: verbatim lines between markers are
+    // opaque and clobber the bank to UNKNOWN. The markers themselves also
+    // reset to UNKNOWN.
+    let mut asm_inside = vec![false; region.len()];
+    {
+        let mut in_asm = false;
+        for (i, line) in region.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("; --- asm start ---") {
+                in_asm = true;
+                // marker itself not considered inside, but handled as barrier
+                continue;
+            }
+            if t.starts_with("; --- asm end ---") {
+                in_asm = false;
+                continue;
+            }
+            asm_inside[i] = in_asm;
+        }
+    }
     let mut exits = BankSet(0);
     let mut work: Vec<(usize, BankSet)> = vec![(0, entry)];
     let mut visited: HashSet<(usize, BankSet)> = HashSet::new();
@@ -222,6 +242,16 @@ fn walk_region(
             exits = exits.join(BankSet::UNKNOWN);
             continue;
         };
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("; --- asm start ---") || trimmed.starts_with("; --- asm end ---") {
+            work.push((i + 1, BankSet::UNKNOWN));
+            continue;
+        }
+        if asm_inside[i] {
+            // Inside verbatim Asm: opaque, bank clobbered.
+            work.push((i + 1, BankSet::UNKNOWN));
+            continue;
+        }
         let toks: Vec<&str> = line.trim_start().split_whitespace().collect();
         let Some(mne) = toks.first().copied() else {
             work.push((i + 1, banks));
@@ -298,6 +328,12 @@ fn walk_region(
 /// STATUS` programs therefore keep the resets and their layouts are
 /// unchanged.
 fn is_bank0_only(device: &Device, asm: &str) -> bool {
+    // Any Asm block clobbers the bank: the isel bracket `; --- asm start ---`
+    // marks opaque verbatim that may touch STATUS/RP bits arbitrarily, so the
+    // program cannot be proved to stay in bank 0.
+    if asm.contains("; --- asm start ---") || asm.contains("; --- asm end ---") {
+        return false;
+    }
     for line in asm.lines() {
         let toks: Vec<&str> = line.trim_start().split_whitespace().collect();
         let Some(mne) = toks.first().copied() else {
@@ -348,7 +384,28 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
     let mut known = true; // false = the tracked bank is unknown (entered at a branch target)
     let mut rp0 = false; // STATUS, bit 5
     let mut rp1 = false; // STATUS, bit 6
+    let mut in_asm = false;
     for line in asm.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("; --- asm start ---") {
+            in_asm = true;
+            known = false;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if trimmed.starts_with("; --- asm end ---") {
+            in_asm = false;
+            known = false;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if in_asm {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
         // Collect into a Vec so the BANKSEL-recognition branch below can look
         // ahead without consuming tokens: a BCF/BSF on a banked GPR (not
         // STATUS) must still reach the generic operand-processing path with
