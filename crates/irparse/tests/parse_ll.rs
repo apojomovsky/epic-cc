@@ -1543,3 +1543,49 @@ define float @fadd(float %0) {
         other => panic!("expected Call, got {other:?}"),
     }
 }
+
+#[test]
+fn implicit_entry_block_is_numbered_after_the_unnamed_params() {
+    // LLVM numbers unnamed values in one sequence: the parameters take %0..%N-1,
+    // so the unlabelled entry block of an N-parameter function is %N, not %0.
+    // A phi reaching the loop header from the entry names that block, and the
+    // backends key phi copies on the edge, so mislabelling the entry drops the
+    // loop counter's initialisation and the loop starts from whatever the
+    // overlaid slot held.
+    const S: &str = r#"
+define dso_local noundef ptr @memcpy(ptr noundef returned writeonly %0, ptr nocapture noundef readonly %1, i16 noundef %2) local_unnamed_addr #1 {
+  %4 = icmp eq i16 %2, 0
+  br i1 %4, label %5, label %6
+
+5:                                                ; preds = %6, %3
+  ret ptr %0
+
+6:                                                ; preds = %6, %3
+  %7 = phi i16 [ %11, %6 ], [ 0, %3 ]
+  %11 = add nuw i16 %7, 1
+  %12 = icmp eq i16 %11, %2
+  br i1 %12, label %5, label %6
+}
+"#;
+    let m = parse_ll(S);
+    let f = &m.funcs[0];
+    assert_eq!(f.params.len(), 3);
+    let labels: Vec<&str> = f.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["3", "5", "6"]);
+
+    // Every phi predecessor must name a real block, otherwise the edge-keyed
+    // phi-copy lookup silently finds nothing.
+    let block_labels: Vec<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
+    for b in &f.blocks {
+        for i in &b.insts {
+            if let Inst::Phi(p) = i {
+                for (_, pred) in &p.incoming {
+                    assert!(
+                        block_labels.contains(pred),
+                        "phi pred {pred} is not a block"
+                    );
+                }
+            }
+        }
+    }
+}

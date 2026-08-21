@@ -1221,7 +1221,12 @@ pub fn parse_ll(src: &str) -> Module {
                 params.push(parse_param(p, &types));
             }
 
-            let mut blocks: Vec<Block> = vec![Block { label: "0".into(), insts: Vec::new() }];
+            // The unlabelled entry block shares LLVM's unnamed-value counter with
+            // the parameters, so it is %N for N unnamed params, not always %0.
+            // Phi incomings name it, and the backends key phi copies on the edge.
+            let entry_label = params.iter().filter(|p| p.name.parse::<u32>().is_ok()).count();
+            let mut blocks: Vec<Block> =
+                vec![Block { label: entry_label.to_string(), insts: Vec::new() }];
             // Handle single-line function definitions where the body is on the
             // same line as `define`, e.g. `define void @foo() { tail call ... ret void }`.
             // These appear in the Task 2 acceptance tests.
