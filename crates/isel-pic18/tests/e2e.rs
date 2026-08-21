@@ -218,7 +218,7 @@ fn interrupt_pic18_c_runs_correctly() {
     p.ram_mut()[in_addr] = 0x10;
 
     // Run main to the injection point: right after the `PORTB = 0x11`
-    // store (the PIC14 test's word 77 equivalent — detected by PORTB's
+    // store (the PIC14 test.s word 77 equivalent, detected by PORTB's
     // value rather than a fixed word count, since the PIC18 layout is
     // instruction-denser).
     let mut steps = 0usize;

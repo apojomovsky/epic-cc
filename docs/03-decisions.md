@@ -10,7 +10,7 @@ one-line index entry here, e.g.:
 - ADR-009 — PIC18 pointer model: shared GEP fold, single FSR0, no PLUSWn, 2026-08-20
 - ADR-010 — PIC18 const via TBLRD (DB-packed flash, per-byte TBLPTR re-setup), 2026-08-20
 - ADR-011 — Multi-TU front end: llvm-link merge, sanitize in irparse, 2026-08-20
-- ADR-011 — PIC18 interrupts: single-vector compat mode, MOVFF save area, 2026-08-20
+- ADR-012 — PIC18 interrupts: single-vector compat mode, MOVFF save area, 2026-08-20
 
 ---
 

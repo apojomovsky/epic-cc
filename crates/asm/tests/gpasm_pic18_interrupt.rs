@@ -5,7 +5,7 @@
 //! irparse -> wholeprog -> legalize -> callgraph -> alloc -> isel-pic18 ->
 //! asm) on `crates/isel-pic18/tests/fixtures/interrupt_pic18.c`. It
 //! exercises the whole P5 surface end to end: the `.org 0x0008` high-vector
-//! entry (the ISR's code starts AT the vector — no GOTO indirection), the
+//! entry (the ISR's code starts AT the vector, no GOTO indirection), the
 //! save prologue (retval snapshot, STATUS/BSR/FSR0L/H/TBLPTRL/H/U via
 //! MOVFF, W last), the ISR body (a direct SFR store `MOVWF 0x081,A` from
 //! the `inttoptr` literal pointer, a call to the duplicated shared helper

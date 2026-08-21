@@ -46,7 +46,7 @@ pub const PIC18F4550: Device = Device {
     name: "p18f4550",
     core: Core::Pic18,
     flash_words: 0x4000,
-    // One contiguous GPR range (0x0010-0x07FF) — PIC18's Access Bank
+    // One contiguous GPR range (0x0010-0x07FF): PIC18 Access Bank
     // (0x000-0x05F) plus BSR-selected banks 0-7 (0x060-0x7FF) form
     // unbroken GPR, unlike PIC14's four banks separated by SFR holes, so a
     // single-entry table is correct here (see `Device::region_for`, which
@@ -63,7 +63,7 @@ pub const PIC18F4550: Device = Device {
     //                  needs i8/i16)
     //   0x0004-0x000F  the fixed ISR save area (W, STATUS, BSR, FSR0L/H,
     //                  TBLPTRL/H/U, and the retval snapshot: the preempted
-    //                  main's in-flight return value — P5's prologue/
+    //                  main's in-flight return value, P5. prologue/
     //                  epilogue; see
     //                  docs/superpowers/plans/2026-08-20-pic18-port-p5.md)
     common_ram: Some((0x0000, 0x000F)),

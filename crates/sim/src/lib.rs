@@ -1316,7 +1316,7 @@ impl Pic18 {
     pub fn interrupt_pending(&self) -> bool {
         self.pending
     }
-    /// Push the return address, clear GIE (INTCON bit 7 — hardware does
+    /// Push the return address, clear GIE (INTCON bit 7: hardware does
     /// this on entry so the handler is not immediately re-entered) and
     /// vector to 0x0008.
     fn enter_isr(&mut self) {

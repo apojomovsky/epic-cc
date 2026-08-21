@@ -1,4 +1,4 @@
-# ADR-011: PIC18 interrupts (single-vector compatibility mode, MOVFF save area)
+# ADR-012: PIC18 interrupts (single-vector compatibility mode, MOVFF save area)
 
 **Status:** Accepted 2026-08-20 (implemented in feat/pic18-p5-interrupts)
 

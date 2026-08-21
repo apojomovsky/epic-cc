@@ -27,7 +27,7 @@
 // stays clear of the runtime routines' scratch.
 //
 // The e2e fires the interrupt at a traced pc (the injection point is
-// hand-computed from the exact emitted IR, as the PIC14 test does) — the
+// hand-computed from the exact emitted IR, as the PIC14 test does), the
 // ISR preempts main before the shared helper's argument is read. Hand
 // computation (in = 0x10):
 //   main: out = in                        -> 0x10
@@ -38,7 +38,7 @@
 //   main: out = out + 1                   -> 0x13
 //   main: out = out + bump(2)             -> 0x13 + 3 = 0x16
 //   main: PORTB = 0x22
-//   out == 0x16, PORTB == 0x22, halted (the no-interrupt run gives 0x15 —
+//   out == 0x16, PORTB == 0x22, halted (the no-interrupt run gives 0x15,
 //   the ISR's bump is observable in the final out).
 // The test recomputes this from the exact emitted IR + the injection point.
 

@@ -486,7 +486,7 @@ impl<'m> Gen<'m> {
                 assert!(l.ty != Ty::I1, "isel-pic18: only i8/i16 loads supported");
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 // Literal-pointer (SFR) load: `inttoptr` form, a direct
-                // physical address — MOVFF copies byte-wise with no access
+                // physical address: MOVFF copies byte-wise with no access
                 // bit and no BSR involvement.
                 if l.ptr.starts_with("0x") {
                     let base = self.literal_ptr_addr(&l.ptr);
