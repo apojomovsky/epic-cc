@@ -6,23 +6,40 @@
 //! onward, the pipeline branches on `device.core`: PIC14 runs
 //! `isel` -> `banking` -> `peephole` -> page-fit verification -> `asm`;
 //! PIC18 runs `isel-pic18` -> `asm` directly (no banking/peephole/paging).
+//!
+//! Multiple `.c` inputs are each run through clang separately, then merged
+//! with `llvm-link` before `irparse` ever sees them (docs/31 D-7): the
+//! merge, not this driver, resolves cross-unit symbols and renames
+//! collisions, so `wholeprog` onward sees exactly the single-module shape it
+//! always has.
 
-mod clang_discovery;
+use driver::clang_discovery;
+use driver::cli;
 
-use clang_discovery::resolve_clang;
+use clang_discovery::{resolve_clang, resolve_llvm_link};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    let c_file = &args[1];
-    let hex_out = args.get(2).map(String::as_str).unwrap_or("out.hex");
-    let device = &device::PIC16F877A;
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match cli::parse_args(&argv) {
+        Ok(c) => c,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
 
-    // 1. clang: .c -> .ll (text on stdout). Resolved from the env vars, or
-    // from the bundled clang/ directory next to the executable, or a clean
-    // error (see clang_discovery).
+    let device = match cli.device.as_str() {
+        "p16f877a" => &device::PIC16F877A,
+        "p18f4550" => &device::PIC18F4550,
+        other => {
+            eprintln!("epic-cc: unknown device {other} (expected p16f877a or p18f4550)");
+            std::process::exit(2);
+        }
+    };
+
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
@@ -34,8 +51,46 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let ll = Command::new(clang)
-        .args([
+    let llvm_link = match resolve_llvm_link(&clang) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("epic-cc: {msg}");
+            std::process::exit(1);
+        }
+    };
+
+    // Temp directory for the per-unit .ll files and the merged one. With
+    // --save-temps these become durable artifacts the user can diff.
+    let tmp = match &cli.save_temps {
+        Some(d) => std::path::PathBuf::from(d),
+        None => std::env::temp_dir().join(format!("epic-cc-{}", std::process::id())),
+    };
+    std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let header_dir = tmp.join("include");
+    std::fs::create_dir_all(&header_dir).expect("create header dir");
+    std::fs::write(header_dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).expect("write epic-cc.h");
+
+    let sources: Vec<(String, String)> = cli
+        .inputs
+        .iter()
+        .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap_or_else(|e| {
+            eprintln!("epic-cc: read {p}: {e}");
+            std::process::exit(1);
+        })))
+        .collect();
+    let prescan_spec = driver::prescan::find_epic_config(&sources);
+    let fosc_hz: u64 = match &prescan_spec {
+        Some(spec) => driver::fosc::resolve_fosc_hz(device, spec),
+        None => driver::fosc::resolve_fosc_hz_from_defaults(device),
+    };
+
+
+    // 1. clang: one invocation per translation unit.
+    let mut units = Vec::new();
+    for (n, input) in cli.inputs.iter().enumerate() {
+        let ll_path = tmp.join(format!("{n:03}.ll"));
+        let mut cmd = Command::new(&clang);
+        cmd.args([
             "-target",
             "msp430",
             "-O1",
@@ -45,19 +100,81 @@ fn main() {
             "-nostdinc",
             "-resource-dir",
             resdir.to_str().unwrap(),
-            "-o",
-            "-",
-            c_file,
-        ])
-        .output()
-        .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
-    let ll_text = String::from_utf8(ll.stdout).unwrap();
+        ]);
+        for inc in &cli.includes {
+            cmd.args(["-I", inc]);
+        }
+        for def in &cli.defines {
+            cmd.args(["-D", def]);
+        }
+        cmd.args(["-I", header_dir.to_str().unwrap()]);
+        cmd.args(["-D", &format!("EPIC_FOSC_HZ={fosc_hz}")]);
+        cmd.args(["-o", ll_path.to_str().unwrap(), input]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
 
-    // 2-5. irparse -> wholeprog -> legalize -> callgraph (depth check vs the
+    // 2. llvm-link: N .ll -> one .ll. Merge order is command-line order, so
+    // the renaming of colliding internal symbols is deterministic. Running it
+    // for a single unit too keeps one code path; it only rewrites the module
+    // header and metadata ordering, which irparse already ignores.
+    let merged_path = tmp.join("merged.ll");
+    let mut cmd = Command::new(&llvm_link);
+    cmd.arg("-S");
+    for u in &units {
+        cmd.arg(u);
+    }
+    cmd.args(["-o", merged_path.to_str().unwrap()]);
+    if cli.verbose {
+        eprintln!("epic-cc: {cmd:?}");
+    }
+    let out = cmd.output().expect("run llvm-link");
+    if !out.status.success() {
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        std::process::exit(1);
+    }
+
+    let ll_text =
+        irparse::sanitize_symbols(&std::fs::read_to_string(&merged_path).expect("read merged .ll"));
+    let canonical_spec = ll_text
+        .find("section \".epiccfg.")
+        .map(|i| &ll_text[i + "section \".epiccfg.".len()..])
+        .and_then(|rest| rest.split('"').next())
+        .map(str::to_string);
+
+    match (&prescan_spec, &canonical_spec) {
+        (Some(p), Some(c)) if p != c => panic!(
+            "epic-cc: internal inconsistency, the pre-scan found EPIC_CONFIG({p:?}) but the \
+             compiled program's actual config is {c:?}; this is a pre-scanner bug, please report it"
+        ),
+        (Some(_), None) => panic!(
+            "epic-cc: the pre-scan found an EPIC_CONFIG(...) invocation that did not survive \
+             into the compiled program (likely behind an #ifdef the pre-scan cannot see); v1 \
+             requires an unconditional top-level invocation"
+        ),
+        _ => {}
+    }
+
+    if cli.emit == cli::Emit::Ll {
+        std::fs::write(&cli.output, &ll_text).expect("write .ll");
+        return;
+    }
+
+    // 3-5. irparse -> wholeprog -> legalize -> callgraph (depth check vs the
     // device's hardware stack)
     let mut m = irparse::parse_ll(&ll_text);
     m = wholeprog::merge(m);
+    if cli.emit == cli::Emit::Ir {
+        std::fs::write(&cli.output, ir::serialize(&m)).expect("write ir");
+        return;
+    }
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
     callgraph::check_depth(&cg, device.stack_depth as usize);
@@ -75,7 +192,7 @@ fn main() {
         device::Core::Pic18 => isel_pic18::select(device, &m, &addrs),
     };
 
-    let hex = match device.core {
+    let asm = match device.core {
         device::Core::Pic14 => {
             // 8-9. banking -> peephole (PIC14 only — PIC18's encoder
             // already emits its own access/BSR bits and needs no
@@ -94,11 +211,54 @@ fn main() {
             // before assembling. PIC14-specific — no paging on PIC18: a
             // 20-bit GOTO/CALL reaches the whole 32KB flash.
             isel::verify_page_fit(&m, &asm);
-
-            // 10. asm: PIC14 assembly -> Intel HEX
-            asm::assemble_file_to_hex(device, &asm)
+            asm
         }
-        device::Core::Pic18 => asm::assemble_file_to_hex(device, &asm),
+        device::Core::Pic18 => asm,
     };
-    std::fs::write(hex_out, hex).expect("write hex");
+
+    if cli.emit == cli::Emit::Asm {
+        std::fs::write(&cli.output, &asm).expect("write asm");
+        return;
+    }
+
+    // 10. asm: assembly -> Intel HEX (with config words when present)
+    let fuse_spec = canonical_spec
+        .as_deref()
+        .map(|s| driver::fosc::fuse_spec(s))
+        .unwrap_or_default();
+    let config_bytes: Option<Vec<u8>> = if canonical_spec.is_some() {
+        Some(device::resolve_config(&device.config, &fuse_spec))
+    } else {
+        None
+    };
+    let hex = match (device.core, &config_bytes) {
+        (device::Core::Pic14, Some(cb)) => {
+            let mut words = asm::assemble(&asm);
+            let idx = (device.config.base_byte_addr / 2) as usize;
+            if words.len() <= idx {
+                words.resize(idx + 1, 0);
+            }
+            let w = u16::from(cb[0]) | (u16::from(cb[1]) << 8);
+            words[idx] = w;
+            asm::to_hex(&words)
+        }
+        (device::Core::Pic18, Some(cb)) => {
+            let program_words = asm::assemble_pic18(&asm);
+            let mut config_words = Vec::new();
+            for chunk in cb.chunks(2) {
+                let lo = chunk[0] as u16;
+                let hi = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
+                config_words.push(lo | (hi << 8));
+            }
+            asm::to_hex_regions(&[(0, &program_words), (device.config.base_byte_addr, &config_words)])
+        }
+        _ => asm::assemble_file_to_hex(device, &asm),
+    };
+    if let Some(cb) = &config_bytes {
+        eprintln!("epic-cc: resolved configuration for {}:", device.name);
+        for (i, b) in cb.iter().enumerate() {
+            eprintln!("  byte 0x{:06X} = 0x{b:02X}", device.config.base_byte_addr as usize + i);
+        }
+    }
+    std::fs::write(&cli.output, hex).expect("write hex");
 }

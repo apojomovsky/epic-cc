@@ -3,7 +3,20 @@
 
 /// Decode Intel HEX (gpasm output) into 14-bit words, indexed by word address.
 pub fn parse_hex(data: &str) -> Vec<u16> {
-    let mut words = vec![0u16; 8192];
+    let mut max_word = 8191usize; // never shrink below the historical minimum
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bytes = hex_decode(&line[1..]);
+        let len = bytes[0] as usize;
+        let addr = ((bytes[1] as usize) << 8) | (bytes[2] as usize);
+        if bytes[3] == 0x00 {
+            max_word = max_word.max(addr / 2 + len / 2);
+        }
+    }
+    let mut words = vec![0u16; max_word + 1];
     for line in data.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -490,11 +503,14 @@ pub struct Pic18 {
     /// storing it twice.
     stack: Vec<u32>,
     halted: bool,
+    /// A latched interrupt request awaiting INTCON GIE + INT0IE. Set by
+    /// `request_interrupt`, consumed when the interrupt is taken.
+    pending: bool,
 }
 
 impl Pic18 {
     pub fn new(prog: Vec<u16>) -> Self {
-        Pic18 { prog, ram: [0; 4096], w: 0, pc: 0, stack: Vec::new(), halted: false }
+        Pic18 { prog, ram: [0; 4096], w: 0, pc: 0, stack: Vec::new(), halted: false, pending: false }
     }
     pub fn ram(&self) -> &[u8; 4096] {
         &self.ram
@@ -520,6 +536,14 @@ impl Pic18 {
         steps
     }
     pub fn step(&mut self) {
+        // Interrupts are recognised at an instruction boundary: a latched,
+        // enabled request vectors instead of executing this instruction,
+        // which then runs on return (mirrors `Pic14::step`).
+        if self.interrupt_ready() {
+            self.pending = false;
+            self.enter_isr();
+            return; // vectoring costs its own cycle; the handler runs next
+        }
         let word = self.prog[(self.pc / 2) as usize];
         let pc = self.pc;
         let next = match word {
@@ -1086,11 +1110,12 @@ impl Pic18 {
         pc + 4
     }
 
-    /// RETFIE also restores GIE/GIEH from the shadow saved on interrupt
-    /// entry. No interrupt-entry modelling exists yet in this plan (P1
-    /// has no ISR support requirement), so for now RETFIE behaves like
-    /// RETURN. Revisit when interrupt modelling is added for PIC18.
+    /// RETFIE restores GIE (INTCON bit 7, the hardware's shadow restore)
+    /// and pops the return address, resuming the interrupted code. (The
+    /// interrupt-entry modelling that clears GIE landed with P5's interrupt
+    /// model; before that RETFIE behaved like RETURN.)
     fn exec_retfie(&mut self) -> u32 {
+        self.ram[0xFF2] |= 0x80; // GIE back on
         self.pop_return()
     }
 
@@ -1277,6 +1302,93 @@ impl Pic18 {
         } else {
             self.w = r;
         }
+    }
+
+    /// Fire the high-priority interrupt immediately, bypassing INTCON
+    /// gating: push the return address and jump to vector 0x0008. The
+    /// unconditional test hook, mirroring `Pic14::fire_interrupt`: use it
+    /// to place an interrupt at an exact program counter without modelling
+    /// INTCON. Called BETWEEN steps, so `pc` addresses an instruction that
+    /// has not executed yet; the return address is `pc` itself and RETFIE
+    /// resumes by running it.
+    pub fn fire_interrupt(&mut self) {
+        self.enter_isr();
+    }
+    /// Request the interrupt through the modelled path: latch it and set
+    /// INT0IF (INTCON bit 1). It is taken at the next step boundary at
+    /// which INTCON bits 7 (GIE) and 4 (INT0IE) are both set, so a program
+    /// that masks interrupts keeps it pending until it unmasks. The latch
+    /// is consumed on entry, so a handler that never clears INT0IF still
+    /// runs once rather than looping. (PIC18 INTCON = 0xFF2, same bit
+    /// layout as PIC14's.)
+    pub fn request_interrupt(&mut self) {
+        self.ram[0xFF2] |= 0x02; // INT0IF
+        self.pending = true;
+    }
+    /// Whether a requested interrupt is still latched and not yet taken.
+    pub fn interrupt_pending(&self) -> bool {
+        self.pending
+    }
+    /// Push the return address, clear GIE (INTCON bit 7: hardware does
+    /// this on entry so the handler is not immediately re-entered) and
+    /// vector to 0x0008.
+    fn enter_isr(&mut self) {
+        self.stack.push(self.pc);
+        self.ram[0xFF2] &= !0x80; // clear GIE
+        self.pc = 0x0008;
+    }
+    /// A latched request whose global and source enables are both set.
+    fn interrupt_ready(&self) -> bool {
+        self.pending && self.ram[0xFF2] & 0x80 != 0 && self.ram[0xFF2] & 0x10 != 0
+    }
+}
+
+#[cfg(test)]
+mod pic18_interrupt {
+    use super::Pic18;
+
+    /// A program with NOPs at bytes 0/2/4 (words 0-2) and an ISR at the
+    /// high vector: word 4 (byte 8) = `MOVWF 0x20,A`, word 5 (byte 10) =
+    /// `RETFIE`.
+    fn pic_with_isr() -> Pic18 {
+        let mut prog = vec![0u16; 16];
+        prog[0] = 0x0000; // NOP at byte 0
+        prog[1] = 0x0000; // NOP at byte 2
+        prog[2] = 0x0000; // NOP at byte 4
+        // ISR at byte 8 (word 4): MOVWF 0x020,A then RETFIE
+        prog[4] = 0x6E20; // MOVWF 0x20,A
+        prog[5] = 0x0010; // RETFIE
+        Pic18::new(prog)
+    }
+
+    #[test]
+    fn fire_interrupt_vectors_to_0x0008_and_retfie_resumes() {
+        let mut pic = pic_with_isr();
+        pic.run(2); // two NOPs, pc == 4
+        assert_eq!(pic.pc(), 4);
+        pic.w = 0x2A; // the preempted main's W
+        pic.fire_interrupt();
+        assert_eq!(pic.pc(), 0x0008, "fire must vector to 0x0008");
+        assert_eq!(pic.ram()[0xFF2] & 0x80, 0, "GIE cleared on entry");
+        pic.step(); // the ISR's MOVWF 0x20,A (byte 8 -> pc 10)
+        pic.step(); // RETFIE (byte 10 -> pops byte 4)
+        assert_eq!(pic.ram[0x20], 0x2A, "ISR stored W to 0x20");
+        assert_eq!(pic.pc(), 4, "RETFIE resumes the interrupted instruction");
+        assert_eq!(pic.ram[0xFF2] & 0x80, 0x80, "GIE re-enabled on RETFIE");
+    }
+
+    #[test]
+    fn request_interrupt_is_gated_by_gie_and_int0ie() {
+        let mut pic = pic_with_isr();
+        pic.ram[0xFF2] = 0x10; // INT0IE only, GIE clear
+        pic.request_interrupt();
+        assert!(pic.interrupt_pending(), "requested interrupt must latch");
+        pic.run(3); // three NOPs (bytes 0,2,4), pc == 6
+        assert_eq!(pic.pc(), 6, "must stay masked while GIE is clear");
+        pic.ram[0xFF2] = 0x90; // GIE | INT0IE
+        pic.run(1); // the boundary check vectors on the next step
+        assert_eq!(pic.pc(), 0x0008, "must vector once GIE goes up");
+        assert!(!pic.interrupt_pending(), "the latch is consumed on entry");
     }
 }
 

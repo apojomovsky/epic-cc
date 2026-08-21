@@ -56,7 +56,7 @@ fn const_struct_reads_run_correctly() {
     let addr = |n: &str| *layout.globals.get(n).expect(n) as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/const_struct.c", "tests/fixtures/const_struct.hex"])
+        .args(["tests/fixtures/const_struct.c", "-o", "tests/fixtures/const_struct.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

@@ -247,7 +247,7 @@ not a judgement.
 | **P2** | Integer spine: `isel-pic18`, Access Bank + BSR banking, `Slot::Direct`. | `add.c`, `scalar.c`, `overlay.c`, `banked.c` |
 | **P3** | **DONE** Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
 | **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
-| **P5** | Interrupts: two vectors, high and low priority. | `interrupt.c`, `interrupt_gate.c`, `interrupt_mul.c` |
+| **P5** | **DONE** Interrupts: single-vector compatibility mode (IPEN=0), one handler at `0x0008` (see the P5 note and ADR-013). | `interrupt_pic18.c`, `interrupt_gate_pic18.c`; `interrupt_mul.c` joins P6 (it needs `*`/`/`) |
 | **P6** | **DONE** 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c`, `interrupt_mul_pic18.c` |
 | **P7** | Soft-float. | `float.c` |
 | **P8** | Point the differential fuzzer at PIC18. | the seed corpora run clean |
@@ -268,9 +268,21 @@ chunk machinery (256-byte windows, 511-byte ceiling) is not ported, so the
 ceiling stops existing. `const_table.c` (300 bytes) passes with its PIC14
 expected value.
 
+**P5 note (2026-08-20):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p5.md`](superpowers/plans/2026-08-20-pic18-port-p5.md).
+The "interrupt priority" open question from §7 is settled by
+[ADR-013](adr/ADR-013-pic18-interrupts.md): v1 targets the single-vector
+compatibility mode (IPEN=0, one handler at `0x0008`, GIE-gated), the same
+model PIC14's fixtures exercise; two-vector priority mode stays a
+documented follow-up. The fixtures are PIC14's `interrupt.c`/`interrupt_gate.c`
+with the SFR addresses changed (PORTB 0x06→0xF81, INTCON 0x0B→0xFF2);
+`interrupt_mul.c` needs `*`/`/` and moves to P6. The shared ISR plumbing
+(`Func.isr`, legalize duplication, alloc's disjoint ISR region) is reused
+from PIC14 M13 unchanged.
+
 **P6 note (2026-08-20):** landed per
 [`docs/superpowers/plans/2026-08-20-pic18-port-p6.md`](superpowers/plans/2026-08-20-pic18-port-p6.md).
-The i32 surface and the runtime routine recipes land together (ADR-012):
+The i32 surface and the runtime routine recipes land together (ADR-014):
 `long.c` (0x1634943A), `muldiv.c` (210), and P5's deferred
 `interrupt_mul_pic18.c` (main + ISR both reach `__mul_u8`/`__udiv_u8`, the
 `_isr` copies get disjoint frames) all pass on the `Pic18` simulator, with

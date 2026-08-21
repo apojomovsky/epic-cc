@@ -110,7 +110,7 @@ fn long_runs_correctly() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/long.c", "tests/fixtures/long.hex"])
+        .args(["tests/fixtures/long.c", "-o", "tests/fixtures/long.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

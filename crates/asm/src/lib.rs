@@ -588,3 +588,53 @@ pub fn to_hex(words: &[u16]) -> String {
     hex.push_str(":00000001FF\n");
     hex
 }
+
+/// Multi-region Intel HEX: each `(base_byte_addr, words)` chunk is written
+/// in order, with a new `:04` extended-linear-address record emitted only
+/// when a chunk's upper 16 address bits differ from the previous one. A
+/// single chunk at base 0 produces output byte-identical to `to_hex`.
+pub fn to_hex_regions(chunks: &[(u32, &[u16])]) -> String {
+    let mut hex = String::new();
+    let mut current_upper: Option<u32> = None;
+    for &(base_byte_addr, words) in chunks {
+        let upper = base_byte_addr >> 16;
+        if current_upper != Some(upper) {
+            let rec = [0x02, 0x00, 0x00, 0x04, (upper >> 8) as u8, (upper & 0xFF) as u8];
+            hex.push_str(&hex_record(&rec));
+            current_upper = Some(upper);
+        }
+        // Trim trailing zero words per chunk, matching `to_hex`'s own tail
+        // trim. Config chunks are all 0xFF-erased (word 0xFFFF), so they are
+        // never trimmed; only a program image's zero tail is.
+        let hi = words.iter().rposition(|&w| w != 0).map(|i| i + 1).unwrap_or(0);
+        let mut addr = 0usize;
+        while addr < hi {
+            let n = (hi - addr).min(8);
+            let mut body = vec![0u8; 2 * n];
+            for (i, w) in words[addr..addr + n].iter().enumerate() {
+                body[2 * i] = (w & 0xFF) as u8;
+                body[2 * i + 1] = ((w >> 8) & 0xFF) as u8;
+            }
+            let byte_addr = (base_byte_addr as usize & 0xFFFF) + addr * 2;
+            let mut rec = vec![(2 * n) as u8, (byte_addr >> 8) as u8, (byte_addr & 0xFF) as u8, 0x00];
+            rec.extend_from_slice(&body);
+            hex.push_str(&hex_record(&rec));
+            addr += n;
+        }
+    }
+    hex.push_str(":00000001FF\n");
+    hex
+}
+
+/// Render one Intel HEX record (byte count/address/type already in `rec`,
+/// data appended) with its checksum, `:`-prefixed, newline-terminated.
+fn hex_record(rec: &[u8]) -> String {
+    let sum: u16 = rec.iter().map(|&b| b as u16).sum();
+    let checksum = (0x100 - (sum & 0xFF)) as u8;
+    let mut s = String::from(":");
+    for b in rec {
+        s.push_str(&format!("{b:02X}"));
+    }
+    s.push_str(&format!("{checksum:02X}\n"));
+    s
+}

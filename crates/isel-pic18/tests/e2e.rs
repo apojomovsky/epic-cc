@@ -203,6 +203,55 @@ fn const_table_c_runs_correctly() {
     assert!(p.halted());
 }
 
+// P5 end-to-end acceptance: interrupts. The fixtures are byte-identical to
+// PIC14's except for the SFR addresses (PORTB 0x06 -> 0xF81, INTCON 0x0B
+// -> 0xFF2), so the expected values come from the PIC14 e2e tests of the
+// same C source (crates/driver/tests/{interrupt,interrupt_gate}_e2e.rs).
+
+#[test]
+fn interrupt_pic18_c_runs_correctly() {
+    // Mirrors crates/driver/tests/interrupt_e2e.rs: in == 0x10, the ISR
+    // fired mid-run after main's PORTB = 0x11 store -> the ISR's
+    // bump_isr(out) lands before main's bump reads it:
+    //   out = 0x10 -> ISR bumps to 0x11 -> main: bump(0x11)=0x12 -> +1
+    //   = 0x13 -> +bump(2)=3 -> 0x16; PORTB ends 0x22.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/interrupt_pic18.c"));
+    let in_addr = globals["in"] as usize;
+    let out_addr = globals["out"] as usize;
+    p.ram_mut()[in_addr] = 0x10;
+
+    // Run main to the injection point: right after the `PORTB = 0x11`
+    // store (the PIC14 test.s word 77 equivalent, detected by PORTB's
+    // value rather than a fixed word count, since the PIC18 layout is
+    // instruction-denser).
+    let mut steps = 0usize;
+    while p.ram()[0xF81] != 0x11 {
+        p.step();
+        steps += 1;
+        assert!(steps < 1000, "never reached the PORTB = 0x11 store (pc = {})", p.pc());
+    }
+    // The pre-ISR state the hand computation starts from. `out == in`
+    // (0x10) is guaranteed: PORTB's store comes after out's store.
+    assert_eq!(p.ram()[out_addr], 0x10, "out == in before the ISR");
+
+    // Fire the interrupt: push pc (the next-unexecuted instruction), jump
+    // to the high vector 0x0008.
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 0x0008, "the ISR starts at the high vector");
+
+    // The ISR runs (PORTB = 0x55, out = bump_isr(out)), RETFIE returns to
+    // the interrupted instruction, and main completes: out == 0x16, PORTB
+    // == 0x22, then the __start SLEEP halts the machine.
+    p.run(500_000);
+    assert_eq!(
+        p.ram()[out_addr],
+        0x16,
+        "out == hand-computed 0x16 (ISR bump 0x10 -> 0x11, then 0x11 -> 0x12 -> 0x13 -> 0x16)"
+    );
+    assert_eq!(p.ram()[0xF81], 0x22, "PORTB == 0x22 (main's final SFR write)");
+    assert!(p.halted());
+}
+
 #[test]
 fn ptr_probe_c_runs_correctly() {
     // The ORIGINAL ptr_probe.c (full parity with PIC14, per docs/29's P3
@@ -272,5 +321,28 @@ fn interrupt_mul_pic18_c_runs_correctly() {
     // it asserts the two routine frames are disjoint, which is what makes
     // a mid-routine clobber impossible), so the ISR globals stay untouched.
     assert_eq!(p.ram()[globals["isr_out"] as usize], 0, "ISR frame disjoint from main's");
+    assert!(p.halted());
+}
+
+#[test]
+fn interrupt_gate_pic18_c_runs_correctly() {
+    // Mirrors crates/driver/tests/interrupt_gate_e2e.rs: the request is
+    // latched while INTCON = 0x10 (INT0IE, GIE clear), taken only after
+    // main writes INTCON = 0x90. isr_ran == 1, stage == 3, halted.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/interrupt_gate_pic18.c"));
+    // The request is issued in the stage == 1 window (INTCON not yet
+    // written by main). Step until stage == 1 and INTCON == 0x10, then
+    // request while masked.
+    let mut steps = 0usize;
+    while p.ram()[globals["stage"] as usize] != 1 {
+        p.step();
+        steps += 1;
+        assert!(steps < 1000, "never reached stage 1 (pc = {})", p.pc());
+    }
+    p.request_interrupt();
+    assert!(p.interrupt_pending(), "the request must latch while masked");
+    p.run(20_000); // through stage 2 (still masked), stage 3's unmask
+    assert_eq!(p.ram()[globals["isr_ran"] as usize], 1, "the handler ran exactly once");
+    assert_eq!(p.ram()[globals["stage"] as usize], 3, "main completed after the handler returned");
     assert!(p.halted());
 }

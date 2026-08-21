@@ -2,7 +2,7 @@ use std::process::Command;
 #[test]
 fn probe_runs_correctly() {
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/probe.c", "tests/fixtures/probe.hex"])
+        .args(["tests/fixtures/probe.c", "-o", "tests/fixtures/probe.hex", "--device", "p16f877a"])
         .output().expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
     let hex = std::fs::read_to_string("tests/fixtures/probe.hex").unwrap();

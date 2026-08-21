@@ -646,11 +646,20 @@ fn parse_ptr_operand(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &mu
             }
             prev = t;
         }
-        let k: u8 = k
+        // PIC18 SFRs sit at 12-bit addresses (PORTB = 0xF81), so the
+        // literal form must carry a full `u16`, not the 8-bit byte PIC14's
+        // bank-mirrored SFRs fit in. Keep the historical 2-digit form for
+        // addresses < 0x100 (PIC14's tests pin `0x06`) and widen only when
+        // the address needs the third hex digit.
+        let k: u16 = k
             .unwrap_or_else(|| panic!("irparse: malformed inttoptr {b:?}"))
             .parse()
             .unwrap_or_else(|_| panic!("irparse: inttoptr address not a byte constant: {b:?}"));
-        format!("0x{k:02x}")
+        if k < 0x100 {
+            format!("0x{k:02x}")
+        } else {
+            format!("0x{k:03x}")
+        }
     } else if b.starts_with("getelementptr") {
         let gsrc = &b["getelementptr".len()..];
         let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
@@ -1051,7 +1060,19 @@ pub fn parse_ll(src: &str) -> Module {
                 let ty = ty_of(rest.split_whitespace().next().unwrap());
                 (ty, u16::from(ty.bytes()), Vec::new())
             };
-            globals.push(Global { name, ty, is_const, size, bytes, addr: None });
+            // EPIC_AT(addr) expands to __attribute__((section(".epicat." #addr))); clang
+            // forwards section attributes on globals verbatim (probed against the pinned
+            // clang 20.1.8, docs/31 D-2/§5), so a placed global's raw .ll line contains
+            // `section ".epicat.0x0F81"`. Everything else keeps addr: None.
+            let addr = line
+                .find("section \".epicat.")
+                .map(|i| &line[i + "section \".epicat.".len()..])
+                .and_then(|rest| rest.split('"').next())
+                .map(|hex| {
+                    u16::from_str_radix(hex.trim_start_matches("0x"), 16)
+                        .unwrap_or_else(|_| panic!("irparse: bad EPIC_AT address {hex:?} on @{name}"))
+                });
+            globals.push(Global { name, ty, is_const, size, bytes, addr });
             continue;
         }
 
@@ -1367,4 +1388,66 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         other => panic!("SPIKE LIMIT: unsupported opcode {other:?} in line: {line}"),
     }
     out
+}
+
+/// Rewrite `.` to `_` inside LLVM symbol names (`@name`) so downstream labels
+/// are portable to `gpasm`, which rejects dots in identifiers. `llvm-link`
+/// produces such names when it renames colliding internal symbols.
+///
+/// Intrinsics (`@llvm.memcpy.p0.p0`) keep their dots: `parse_ll` matches them
+/// by prefix and they never become labels. `%` registers are function-local
+/// and cannot collide, so they are left alone. Text inside `"` quotes is
+/// copied through untouched, because a C string constant reaches the `.ll` as
+/// `c"..."` and may contain an `@`.
+///
+/// Panics if two distinct symbols sanitize to the same name.
+pub fn sanitize_symbols(ll: &str) -> String {
+    let b = ll.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    // sanitized name -> the original it came from, for collision detection.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < b.len() {
+        // LLVM escapes a quote inside a string as `\22`, never `\"`, so the
+        // next `"` is always the closing one.
+        if b[i] == b'"' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                out.push(b[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] != b'@' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'.' | b'$')) {
+            j += 1;
+        }
+        let name = &ll[start..j];
+        out.push(b'@');
+        // Every non-intrinsic name goes through the map, dotted or not, so a
+        // pre-existing `helper_3` is seen before `helper.3` sanitizes onto it.
+        if name.is_empty() || name.starts_with("llvm.") {
+            out.extend_from_slice(name.as_bytes());
+        } else {
+            let clean = name.replace('.', "_");
+            match seen.get(&clean) {
+                Some(prev) if prev != name => panic!(
+                    "irparse: symbols @{prev} and @{name} both sanitize to @{clean}"
+                ),
+                _ => {
+                    seen.insert(clean.clone(), name.to_string());
+                }
+            }
+            out.extend_from_slice(clean.as_bytes());
+        }
+        i = j;
+    }
+    String::from_utf8(out).expect("sanitize_symbols: input was valid UTF-8")
 }

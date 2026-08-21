@@ -49,7 +49,7 @@ test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	@$(DOCKER_RUN) bash -c '$(if $(CRATE),cargo test -p $(CRATE) --no-fail-fast,bash scripts/ci-test.sh)'
 
 compile: image ## Compile C to HEX and print it: FILE=crates/driver/tests/fixtures/add.c
-	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- $(FILE) /tmp/out.hex && cat /tmp/out.hex'
+	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- $(FILE) -o /tmp/out.hex --device p16f877a && cat /tmp/out.hex'
 info: image ## Toolchain versions + env vars from the image
 	@$(DOCKER_RUN) bash -c 'rustc --version && $$PIC8_CLANG_UNWRAPPED --version | head -1 && gpasm --version | head -1 && echo && env | grep ^PIC8_ | sort'
 
@@ -80,5 +80,5 @@ setup-hooks: ## Install git hooks (.githooks/ -> the repo's hooks dir)
 		&& chmod +x $$(git rev-parse --git-path hooks)/pre-commit $$(git rev-parse --git-path hooks)/commit-msg
 	@echo "git hooks installed (pre-commit, commit-msg)"
 
-pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 also runs the suite
-	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,)
+pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 runs the suite, PROSE=1 attests comment/doc review
+	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,) $(if $(PROSE),--prose,)

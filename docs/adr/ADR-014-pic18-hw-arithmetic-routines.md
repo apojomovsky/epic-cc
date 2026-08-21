@@ -1,4 +1,4 @@
-# ADR-012: PIC18 arithmetic routines (hardware MULWF, branch-based divmod)
+# ADR-014: PIC18 arithmetic routines (hardware MULWF, branch-based divmod)
 
 **Status:** Accepted 2026-08-20 (implemented in feat/pic18-p6-long-mul)
 

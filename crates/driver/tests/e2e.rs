@@ -3,7 +3,7 @@ use std::process::Command;
 #[test]
 fn compiles_straight_line_program_end_to_end() {
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/add.c", "tests/fixtures/add.hex"])
+        .args(["tests/fixtures/add.c", "-o", "tests/fixtures/add.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
