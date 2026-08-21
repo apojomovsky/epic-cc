@@ -5544,14 +5544,6 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         isr_save_hi + 1,
     );
     let mut out: Vec<String> = Vec::new();
-    if !m.module_asm.is_empty() {
-        out.push("; module asm".to_string());
-        for entry in &m.module_asm {
-            for line in entry.split('\n') {
-                out.push(line.to_string());
-            }
-        }
-    }
     out.extend(vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
         format!("    list p={}", device.name),
@@ -5561,11 +5553,20 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "INDF   equ 0x00".to_string(),
         "PCL    equ 0x02".to_string(),
         "PCLATH equ 0x0A".to_string(),
+        "INTCON equ 0x0B".to_string(),
         "".to_string(),
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
         "".to_string(),
     ]);
+    if !m.module_asm.is_empty() {
+        out.push("; module asm".to_string());
+        for entry in &m.module_asm {
+            for line in entry.split('\n') {
+                out.push(line.to_string());
+            }
+        }
+    }
     if !has_isr {
         // No ISR: `__start` sits at the top (word 2) so the reset vector's
         // GOTO (PCLATH = 0 at reset) always reaches it, byte-identical to

@@ -3919,6 +3919,16 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         .common_ram
         .expect("isel-pic18's fixed retval region needs a common-RAM reservation");
     let mut out: Vec<String> = Vec::new();
+    out.extend(vec![
+        "; pic8 -- P2 integer spine (isel-pic18)".to_string(),
+        format!("    list p={}", device.name),
+        "    radix hex".to_string(),
+        "INTCON equ 0xFF2".to_string(),
+        "".to_string(),
+        "    org 0x0000".to_string(),
+        "    goto __start".to_string(),
+        "".to_string(),
+    ]);
     if !m.module_asm.is_empty() {
         out.push("; module asm".to_string());
         for entry in &m.module_asm {
@@ -3927,15 +3937,6 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
         }
     }
-    out.extend(vec![
-        "; pic8 -- P2 integer spine (isel-pic18)".to_string(),
-        format!("    list p={}", device.name),
-        "    radix hex".to_string(),
-        "".to_string(),
-        "    org 0x0000".to_string(),
-        "    goto __start".to_string(),
-        "".to_string(),
-    ]);
     // Shared across every `Gen` below so `fresh_label()` never repeats a
     // `tmp{n}:` label across two different functions in the same output.
     let mut tmp = 0u32;
