@@ -724,7 +724,11 @@ fn signed_corpus_differential_clean() {
                     FailureKind::Compile => compile += 1,
                     FailureKind::Harness => harness += 1,
                 }
-                println!("signed corpus failure at seed {seed}: {f}");
+                println!(
+                    "signed corpus failure at seed {seed}: {f} (running: clean {clean}, \
+                     mismatch {mismatch}, panic {panic_kind}, nohalt {nohalt}, compile \
+                     {compile}, harness {harness})"
+                );
                 panic!("generated signed seed {seed} not differential-clean: {f}");
             }
         }

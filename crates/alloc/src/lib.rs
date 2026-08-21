@@ -65,22 +65,6 @@ fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
     }
 }
 
-/// `globals` placed in order with ONE monotonically-advancing cursor —
-/// exactly `allocate()`'s original globals loop, extracted so it can be
-/// tried before falling back to bin-packing. Returns `None` the first time
-/// any global doesn't fit, rather than panicking.
-fn try_place_globals_sequential(device: &Device, globals: &[&ir::Global]) -> Option<HashMap<String, u16>> {
-    let mut out = HashMap::new();
-    let mut addr: u16 = device.gpr_start();
-    for g in globals {
-        let width = g.size as u8;
-        let start = try_place_at(device, addr, width)?;
-        out.insert(g.name.clone(), start);
-        addr = start + u16::from(width);
-    }
-    Some(out)
-}
-
 /// The start address for a `width`-byte local placed contiguously at the next
 /// free frame byte `addr`: step across banks when `addr` has passed a
 /// region's end, and panic past the device's last bank. Locals are NOT
@@ -107,40 +91,6 @@ fn place_contiguous(device: &Device, addr: u16, width: u8) -> u16 {
 struct BankCursor {
     end: u16,
     next_free: u16,
-}
-
-/// Places `globals` largest-first into whichever bank's free-space cursor
-/// has room first (First-Fit-Decreasing), so a small global declared after
-/// several large ones can still land in an earlier bank's leftover space —
-/// unlike `try_place_globals_sequential`'s single monotonically-advancing
-/// cursor, which abandons every bank's leftover the moment it moves on.
-/// Returns `None` only if some global has no room in any bank once every
-/// earlier (larger-or-equal) global has been placed.
-fn place_globals_bin_packed(device: &Device, globals: &[&ir::Global]) -> Option<HashMap<String, u16>> {
-    let mut cursors: Vec<BankCursor> =
-        device.ram_banks.iter().map(|&(start, end)| BankCursor { end, next_free: start }).collect();
-    let mut order: Vec<&ir::Global> = globals.to_vec();
-    order.sort_by(|a, b| b.size.cmp(&a.size));
-
-    let mut out = HashMap::new();
-    for g in order {
-        let width = g.size as u8;
-        let align = width.min(2);
-        let mut placed = None;
-        for cursor in cursors.iter_mut() {
-            let mut base = cursor.next_free;
-            if base % u16::from(align) != 0 {
-                base += u16::from(align) - (base % u16::from(align));
-            }
-            if base + u16::from(width) - 1 <= cursor.end {
-                cursor.next_free = base + u16::from(width);
-                placed = Some(base);
-                break;
-            }
-        }
-        out.insert(g.name.clone(), placed?);
-    }
-    Some(out)
 }
 
 /// The physical address just past a frame whose locals, in placement order
@@ -752,10 +702,6 @@ mod tests {
     use super::*;
     use device::PIC16F877A;
 
-    fn global(name: &str, size: u16) -> ir::Global {
-        ir::Global { name: name.to_string(), ty: ir::Ty::I8, is_const: false, size, bytes: Vec::new(), addr: None }
-    }
-
     #[test]
     fn try_place_at_returns_none_instead_of_panicking_past_the_last_bank() {
         // PIC16F877A's last bank ends at 0x1EF; nothing at or past 0x1F0 has
@@ -763,68 +709,4 @@ mod tests {
         assert_eq!(try_place_at(&PIC16F877A, 0x1F0, 1), None);
     }
 
-    #[test]
-    fn try_place_globals_sequential_returns_none_when_a_later_global_cannot_fit_anywhere() {
-        // Three 76-byte globals, one 78-byte global, then one 4-byte global
-        // (310 bytes total, well under the device's 320-byte capacity) — the
-        // single advancing cursor abandons a 4-byte leftover in each of the
-        // first three banks it uses, then the 78-byte global leaves only 2
-        // bytes in the fourth (last) bank, too little for the trailing
-        // 4-byte global with nowhere left to go. See Task 3's integration
-        // test for the full derivation of these exact sizes.
-        let g0 = global("g0", 76);
-        let g1 = global("g1", 76);
-        let g2 = global("g2", 76);
-        let g3 = global("g3", 78);
-        let g4 = global("g4", 4);
-        let refs: Vec<&ir::Global> = vec![&g0, &g1, &g2, &g3, &g4];
-        assert_eq!(try_place_globals_sequential(&PIC16F877A, &refs), None);
-    }
-
-    #[test]
-    fn bin_packed_places_all_globals_with_no_overlaps_and_within_one_bank_each() {
-        // Same reproduction input as Task 1's sequential-failure test: three
-        // 76-byte globals, one 78-byte global, one 4-byte global (310 bytes
-        // total). Bin-packing succeeds where the single advancing cursor
-        // does not (see Task 3's integration test, which proves the
-        // sequential-fails / bin-packed-succeeds contrast through the full
-        // `allocate()` entry point).
-        let g0 = global("g0", 76);
-        let g1 = global("g1", 76);
-        let g2 = global("g2", 76);
-        let g3 = global("g3", 78);
-        let g4 = global("g4", 4);
-        let refs: Vec<&ir::Global> = vec![&g0, &g1, &g2, &g3, &g4];
-        let placed = place_globals_bin_packed(&PIC16F877A, &refs).expect("bin-packing must succeed");
-        assert_eq!(placed.len(), 5);
-
-        // No two globals may overlap, and every placement must lie fully
-        // within a single bank's inclusive range (never straddling one).
-        let mut spans: Vec<(u16, u16)> = refs
-            .iter()
-            .map(|g| {
-                let start = placed[&g.name];
-                (start, start + g.size - 1)
-            })
-            .collect();
-        for &(start, end) in &spans {
-            assert!(
-                PIC16F877A.ram_banks.iter().any(|&(bs, be)| start >= bs && end <= be),
-                "global at 0x{start:03X}..=0x{end:03X} does not fit inside a single bank"
-            );
-        }
-        spans.sort();
-        for w in spans.windows(2) {
-            assert!(w[0].1 < w[1].0, "overlapping placements: {:?} and {:?}", w[0], w[1]);
-        }
-    }
-
-    #[test]
-    fn bin_packed_returns_none_when_total_demand_truly_exceeds_capacity() {
-        // 5 objects of 70 bytes each = 350 bytes > the device's 320-byte
-        // total GPR capacity (4 banks x 80 bytes) — no arrangement fits.
-        let gs: Vec<ir::Global> = (0..5).map(|i| global(&format!("g{i}"), 70)).collect();
-        let refs: Vec<&ir::Global> = gs.iter().collect();
-        assert_eq!(place_globals_bin_packed(&PIC16F877A, &refs), None);
-    }
 }
