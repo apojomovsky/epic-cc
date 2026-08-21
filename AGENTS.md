@@ -41,6 +41,7 @@ make exec CMD='cargo test -p fuzz -- --ignored'   # one-off command
 make info           # toolchain versions + PIC8_* env vars
 make fmt            # cargo fmt in the container
 make lint           # clippy, advisory only (never fails)
+make check-warnings # cargo build --workspace --all-targets, fails on any warning
 make release-bundle VERSION=0.1.0   # Linux release zip into dist/
 make setup-hooks    # install git hooks from .githooks/
 make help           # all targets
@@ -91,7 +92,16 @@ Run `make pre-pr-check` before opening a PR. It is the gate; it checks:
    plan-free. The plan stays visible in the PR's commit history.
 3. Commit hygiene: conventional single-line subjects, no trailers,
    no em-dashes, no whitespace errors.
-4. **Comment and doc prose review.** `scripts/prose-diff.sh` extracts
+4. **Compiler warnings.** `cargo build --workspace --all-targets` must
+   be clean (`make check-warnings`). Hard gate, unlike `make lint`
+   (clippy): rustc's own lints (`unused_mut`, `dead_code`,
+   `unused_variables`, `non_snake_case`, `unused_assignments`, ...) are
+   high-signal and rarely worth silencing, and a `dead_code` warning is
+   what surfaces a function a refactor orphaned but never deleted (see
+   `crates/alloc`'s history). `.githooks/pre-commit` runs the same
+   check on every commit that touches `*.rs`, so this should already
+   be clean by the time the ritual runs.
+5. **Comment and doc prose review.** `scripts/prose-diff.sh` extracts
    every added comment block and markdown diff hunk in the PR; it
    flags a couple of objective signals (block over 3 lines, a
    hardcoded count or tree dump) but cannot judge content, so it never
@@ -101,8 +111,8 @@ Run `make pre-pr-check` before opening a PR. It is the gate; it checks:
    narrative; docs stay clear and skip volatile facts) and fixes
    what doesn't hold up. `make pre-pr-check PROSE=1` records that the
    review happened.
-5. Hooks installed (`make setup-hooks`).
-6. `make pre-pr-check TEST=1` also runs the full suite.
+6. Hooks installed (`make setup-hooks`).
+7. `make pre-pr-check TEST=1` also runs the full suite.
 
 The script exits 1 with the exact fix list while blocking items are
 outstanding. Don't skip it; the CI gate only covers the suite, not the

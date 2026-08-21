@@ -3,11 +3,24 @@
 #   - rustfmt --check on the staged Rust files, via the dev container
 #     (the only rustfmt that exists; nothing rust-related is installed
 #     on the host)
+#   - cargo build --workspace --all-targets must be warning-free (hard
+#     gate: rustc's own lints, unlike clippy's, are high-signal and
+#     rarely worth silencing; a dead_code warning caught a real orphaned
+#     function during the sweep that first cleared this backlog, see
+#     PR #57)
 #   - trailing whitespace on staged files
 #
 # Install with: make setup-hooks
 
 set -uo pipefail
+
+CACHE_DIR="${HOME}/.cache/epic-cc"
+CARGO_HOME_CACHE="$CACHE_DIR/cargo-home"
+# Keyed by worktree path, not shared: every invocation mounts its
+# worktree at the identical in-container /workspace, so a shared target
+# dir lets cargo silently replay a DIFFERENT worktree's cached warnings
+# here. A hard gate on stale output is worse than a slow one.
+WARNCHECK_TARGET_CACHE="$CACHE_DIR/target-warncheck$(printf '%s' "$PWD" | tr '/' '-')"
 
 # Only check files that are actually staged; respect the dev container's
 # existence (skip format checks if the image isn't built yet, e.g. first
@@ -25,8 +38,24 @@ if [ -n "$staged_rs" ]; then
       echo "pre-commit: (advisory for now; the workspace-wide fmt sweep is a"
       echo "pre-commit:  separate task; this check becomes a hard gate after it)"
     fi
+
+    mkdir -p "$CARGO_HOME_CACHE" "$WARNCHECK_TARGET_CACHE"
+    build_out=$(docker run --rm \
+      --user "$(id -u):$(id -g)" \
+      -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+      -v "$CARGO_HOME_CACHE":/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
+      -v "$WARNCHECK_TARGET_CACHE":/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
+      -v "$PWD":/workspace -w /workspace epic-cc-dev:local \
+      bash -c 'cargo build --workspace --all-targets 2>&1')
+    warnings=$(printf '%s\n' "$build_out" | grep '^warning:' || true)
+    if [ -n "$warnings" ]; then
+      echo "pre-commit: compiler warnings present (cargo build --workspace --all-targets):"
+      printf '%s\n' "$build_out" | sed 's/^/pre-commit:   /'
+      echo "pre-commit: fix them before committing (see AGENTS.md)"
+      exit 1
+    fi
   else
-    echo "pre-commit: epic-cc-dev:local not built, skipping rustfmt check (make image)"
+    echo "pre-commit: epic-cc-dev:local not built, skipping rustfmt/warnings checks (make image)"
   fi
 fi
 

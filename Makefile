@@ -19,6 +19,14 @@ CARGO_HOME_CACHE := $(CACHE_DIR)/cargo-home
 TARGET_CACHE := $(CACHE_DIR)/target
 FILE        ?= crates/driver/tests/fixtures/add.c
 
+# check-warnings uses its own target dir, not the shared TARGET_CACHE:
+# every docker invocation mounts its worktree at the identical
+# in-container path (/workspace), so a shared target dir lets cargo
+# silently replay a DIFFERENT worktree's cached warnings here. A hard
+# gate on stale output is worse than a slow one.
+WT_KEY := $(subst /,-,$(CURDIR))
+WARNCHECK_TARGET_CACHE := $(CACHE_DIR)/target-warncheck$(WT_KEY)
+
 DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
 	--user $$(id -u):$$(id -g) \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
@@ -26,7 +34,7 @@ DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
 	-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
 	-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE)
 
-.PHONY: help image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint pre-pr-check
+.PHONY: help image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
@@ -73,6 +81,22 @@ fmt: image ## Format the workspace (cargo fmt)
 
 lint: image ## Clippy, advisory (never fails the build)
 	@$(DOCKER_RUN) bash -c 'cargo clippy --workspace 2>&1 | tail -20'
+
+check-warnings: image ## Fail if cargo build --workspace --all-targets emits any warnings
+	@mkdir -p $(CARGO_HOME_CACHE) $(WARNCHECK_TARGET_CACHE)
+	@docker run --rm --user $$(id -u):$$(id -g) \
+		-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+		-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
+		-v $(WARNCHECK_TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
+		-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE) bash -c '\
+		out=$$(cargo build --workspace --all-targets 2>&1); \
+		warnings=$$(printf "%s\n" "$$out" | grep "^warning:" || true); \
+		if [ -n "$$warnings" ]; then \
+			printf "%s\n" "$$out"; \
+			echo; \
+			echo "check-warnings: compiler warnings present (above); fix before merging"; \
+			exit 1; \
+		fi'
 
 setup-hooks: ## Install git hooks (.githooks/ -> the repo's hooks dir)
 	@mkdir -p $$(git rev-parse --git-path hooks) \

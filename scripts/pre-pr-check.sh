@@ -118,7 +118,17 @@ else
   fail "whitespace errors in the diff (above); fix and re-stage"
 fi
 
-# ── 6. Prose hygiene in the PR's diff (not ascii art) ─────────────
+# ── 6. Compiler warnings: cargo build --workspace --all-targets ────
+# Not opt-in like --test below: an incremental build is fast enough to
+# run on every check, and a clean build is the point of this gate.
+if warn_out=$(make check-warnings 2>&1); then
+  ok "no compiler warnings (cargo build --workspace --all-targets)"
+else
+  printf '%s\n' "$warn_out" | tail -40
+  fail "compiler warnings present (above); fix and re-run (make check-warnings)"
+fi
+
+# ── 7. Prose hygiene in the PR's diff (not ascii art) ─────────────
 # Only ADDED lines are scanned: context lines may carry pre-existing
 # em-dashes from lines the PR merely touches. AGENTS.md, the hooks,
 # this script, and docs/03 are excluded by design: AGENTS.md documents
@@ -162,7 +172,7 @@ else
   ok "no space-before-comma residue"
 fi
 
-# ── 7. Comment & doc prose review (added/changed comments, *.md) ──
+# ── 8. Comment & doc prose review (added/changed comments, *.md) ──
 # scripts/prose-diff.sh only flags objective signals (block length,
 # hardcoded counts); it cannot judge content, so it never fails on its
 # own. --prose attests the agent read everything printed and fixed it,
@@ -184,7 +194,7 @@ else
   warn "      pre-pr-check PROSE=1)"
 fi
 
-# ── 8. Hooks installed (make setup-hooks) ──────────────────────────
+# ── 9. Hooks installed (make setup-hooks) ──────────────────────────
 hooks=$(git rev-parse --git-path hooks)
 if [ ! -x "$hooks/pre-commit" ]; then
   warn "git hooks not installed; run: make setup-hooks"
@@ -192,7 +202,7 @@ else
   ok "git hooks installed"
 fi
 
-# ── 9. Suite (opt-in via --test) ───────────────────────────────────
+# ── 10. Suite (opt-in via --test) ──────────────────────────────────
 if [ "$RUN_TESTS" -eq 1 ]; then
   say ""
   say "== running the full suite (make test) =="
