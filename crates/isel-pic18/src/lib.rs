@@ -1069,6 +1069,14 @@ impl<'m> Gen<'m> {
                     panic!("isel-pic18: dynamic-length memcpy not yet supported (P3 scope)")
                 }
             },
+            Inst::Asm(a) => {
+                // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking Task5.
+                self.emit("; --- asm start ---".to_string());
+                for line in a.template.split('\n') {
+                    self.emit(line.to_string());
+                }
+                self.emit("; --- asm end ---".to_string());
+            },
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }
@@ -3910,7 +3918,16 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     let (common_lo, _) = device
         .common_ram
         .expect("isel-pic18's fixed retval region needs a common-RAM reservation");
-    let mut out = vec![
+    let mut out: Vec<String> = Vec::new();
+    if !m.module_asm.is_empty() {
+        out.push("; module asm".to_string());
+        for entry in &m.module_asm {
+            for line in entry.split('\n') {
+                out.push(line.to_string());
+            }
+        }
+    }
+    out.extend(vec![
         "; pic8 -- P2 integer spine (isel-pic18)".to_string(),
         format!("    list p={}", device.name),
         "    radix hex".to_string(),
@@ -3918,7 +3935,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
         "".to_string(),
-    ];
+    ]);
     // Shared across every `Gen` below so `fresh_label()` never repeats a
     // `tmp{n}:` label across two different functions in the same output.
     let mut tmp = 0u32;
@@ -3956,6 +3973,29 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             };
             g.emit_routine();
             out.extend(g.out);
+            continue;
+        }
+        // CC-4 naked: verbatim, no prologue, panic on non-Asm, barrier markers.
+        if f.naked {
+            out.push(format!("{}:", f.name));
+            out.push("; --- asm start ---".to_string());
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    match inst {
+                        Inst::Asm(a) => {
+                            for line in a.template.split('\n') {
+                                out.push(line.to_string());
+                            }
+                        }
+                        _ => panic!(
+                            "isel-pic18: naked function '{}' contains non-asm instruction; naked bodies must be pure assembly",
+                            f.name
+                        ),
+                    }
+                }
+            }
+            out.push("; --- asm end ---".to_string());
+            out.push("".to_string());
             continue;
         }
         if f.isr {
@@ -4282,7 +4322,7 @@ mod p3_gen_tests {
 
     #[test]
     fn low_access_bank_needs_no_movlb() {
-        let m = Module { globals: Vec::new(), funcs: Vec::new() };
+        let m = Module { globals: Vec::new(), funcs: Vec::new(), module_asm: Vec::new() };
         let addrs = HashMap::new();
         let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
@@ -4293,7 +4333,7 @@ mod p3_gen_tests {
 
     #[test]
     fn banked_gpr_range_needs_movlb() {
-        let m = Module { globals: Vec::new(), funcs: Vec::new() };
+        let m = Module { globals: Vec::new(), funcs: Vec::new(), module_asm: Vec::new() };
         let addrs = HashMap::new();
         let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
@@ -4304,7 +4344,7 @@ mod p3_gen_tests {
 
     #[test]
     fn sfr_high_segment_needs_no_movlb() {
-        let m = Module { globals: Vec::new(), funcs: Vec::new() };
+        let m = Module { globals: Vec::new(), funcs: Vec::new(), module_asm: Vec::new() };
         let addrs = HashMap::new();
         let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;

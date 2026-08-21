@@ -2038,6 +2038,14 @@ impl<'m> Gen<'m> {
                 self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
             }
             Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args),
+            Inst::Asm(a) => {
+                // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking Task5.
+                self.emit("; --- asm start ---".to_string());
+                for line in a.template.split('\n') {
+                    self.emit(line.to_string());
+                }
+                self.emit("; --- asm end ---".to_string());
+            }
             Inst::FloatBin(_) | Inst::Fcmp(_) | Inst::FloatConv(_) => panic!(
                 "isel: float instructions are not code-generated yet (Task 3 soft-float runtime routines)"
             ),
@@ -4918,6 +4926,29 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         g.emit_routine();
         return;
     }
+    // CC-4 naked: verbatim, no prologue, panic on non-Asm, barrier markers.
+    if f.naked {
+        g.emit(format!("{}:", f.name));
+        g.emit("; --- asm start ---".to_string());
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Asm(a) => {
+                        for line in a.template.split('\n') {
+                            g.emit(line.to_string());
+                        }
+                    }
+                    _ => panic!(
+                        "isel: naked function '{}' contains non-asm instruction; naked bodies must be pure assembly",
+                        f.name
+                    ),
+                }
+            }
+        }
+        g.emit("; --- asm end ---".to_string());
+        g.emit("".to_string());
+        return;
+    }
     // Block label scheme: the entry block uses the bare function name
     // (so CALLs and GOTOs resolve to it); every other block is
     // `{func}_L{label}`. The entry block's label is emitted by the block
@@ -5512,7 +5543,16 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "isel: ISR save area 0x{isr_save_lo:02X}-0x{isr_save_hi:02X} must leave 0x{:02X}-0x{common_hi:02X} free",
         isr_save_hi + 1,
     );
-    let mut out = vec![
+    let mut out: Vec<String> = Vec::new();
+    if !m.module_asm.is_empty() {
+        out.push("; module asm".to_string());
+        for entry in &m.module_asm {
+            for line in entry.split('\n') {
+                out.push(line.to_string());
+            }
+        }
+    }
+    out.extend(vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
         format!("    list p={}", device.name),
         "    radix hex".to_string(),
@@ -5525,7 +5565,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
         "".to_string(),
-    ];
+    ]);
     if !has_isr {
         // No ISR: `__start` sits at the top (word 2) so the reset vector's
         // GOTO (PCLATH = 0 at reset) always reaches it, byte-identical to
