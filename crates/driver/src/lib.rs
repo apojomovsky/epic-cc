@@ -6,3 +6,8 @@ pub mod cli;
 pub mod epic_cc_h;
 pub mod fosc;
 pub mod prescan;
+pub mod stdbool_h;
+pub mod stddef_h;
+pub mod stdint_h;
+pub mod string_c;
+pub mod string_h;

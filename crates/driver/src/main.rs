@@ -87,6 +87,10 @@ fn main() {
     let header_dir = tmp.join("include");
     std::fs::create_dir_all(&header_dir).expect("create header dir");
     std::fs::write(header_dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).expect("write epic-cc.h");
+    std::fs::write(header_dir.join("stdint.h"), driver::stdint_h::STDINT_H).expect("write stdint.h");
+    std::fs::write(header_dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H).expect("write stdbool.h");
+    std::fs::write(header_dir.join("stddef.h"), driver::stddef_h::STDDEF_H).expect("write stddef.h");
+    std::fs::write(header_dir.join("string.h"), driver::string_h::STRING_H).expect("write string.h");
 
     let sources: Vec<(String, String)> = cli
         .inputs
@@ -132,6 +136,50 @@ fn main() {
             eprintln!("epic-cc: {cmd:?}");
         }
         let out = cmd.output().expect("run clang");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
+
+    let need_string = sources.iter().any(|(_, src)| {
+        src.lines()
+            .any(|l| l.contains("#include") && l.contains("string.h"))
+    });
+    if need_string {
+        let string_c_path = tmp.join("__epic_string.c");
+        std::fs::write(&string_c_path, driver::string_c::STRING_C).expect("write string.c");
+        let ll_path = tmp.join("__epic_string.ll");
+        let mut cmd = Command::new(&clang);
+        cmd.args([
+            "-target",
+            "msp430",
+            "-O1",
+            "-S",
+            "-emit-llvm",
+            "-ffreestanding",
+            "-nostdinc",
+            "-resource-dir",
+            resdir.to_str().unwrap(),
+        ]);
+        for inc in &cli.includes {
+            cmd.args(["-I", inc]);
+        }
+        for def in &cli.defines {
+            cmd.args(["-D", def]);
+        }
+        cmd.args(["-I", header_dir.to_str().unwrap()]);
+        cmd.args(["-D", &format!("EPIC_FOSC_HZ={fosc_hz}")]);
+        cmd.args([
+            "-o",
+            ll_path.to_str().unwrap(),
+            string_c_path.to_str().unwrap(),
+        ]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang for string.c");
         if !out.status.success() {
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(1);
