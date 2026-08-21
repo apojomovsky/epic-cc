@@ -1051,7 +1051,19 @@ pub fn parse_ll(src: &str) -> Module {
                 let ty = ty_of(rest.split_whitespace().next().unwrap());
                 (ty, u16::from(ty.bytes()), Vec::new())
             };
-            globals.push(Global { name, ty, is_const, size, bytes, addr: None });
+            // EPIC_AT(addr) expands to __attribute__((section(".epicat." #addr))); clang
+            // forwards section attributes on globals verbatim (probed against the pinned
+            // clang 20.1.8, docs/31 D-2/§5), so a placed global's raw .ll line contains
+            // `section ".epicat.0x0F81"`. Everything else keeps addr: None.
+            let addr = line
+                .find("section \".epicat.")
+                .map(|i| &line[i + "section \".epicat.".len()..])
+                .and_then(|rest| rest.split('"').next())
+                .map(|hex| {
+                    u16::from_str_radix(hex.trim_start_matches("0x"), 16)
+                        .unwrap_or_else(|_| panic!("irparse: bad EPIC_AT address {hex:?} on @{name}"))
+                });
+            globals.push(Global { name, ty, is_const, size, bytes, addr });
             continue;
         }
 

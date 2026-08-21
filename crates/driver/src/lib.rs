@@ -3,3 +3,4 @@
 
 pub mod clang_discovery;
 pub mod cli;
+pub mod epic_cc_h;
