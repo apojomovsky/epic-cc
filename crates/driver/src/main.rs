@@ -66,6 +66,24 @@ fn main() {
         None => std::env::temp_dir().join(format!("epic-cc-{}", std::process::id())),
     };
     std::fs::create_dir_all(&tmp).expect("create temp dir");
+    let header_dir = tmp.join("include");
+    std::fs::create_dir_all(&header_dir).expect("create header dir");
+    std::fs::write(header_dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).expect("write epic-cc.h");
+
+    let sources: Vec<(String, String)> = cli
+        .inputs
+        .iter()
+        .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap_or_else(|e| {
+            eprintln!("epic-cc: read {p}: {e}");
+            std::process::exit(1);
+        })))
+        .collect();
+    let prescan_spec = driver::prescan::find_epic_config(&sources);
+    let fosc_hz: u64 = match &prescan_spec {
+        Some(spec) => driver::fosc::resolve_fosc_hz(device, spec),
+        None => driver::fosc::resolve_fosc_hz_from_defaults(device),
+    };
+
 
     // 1. clang: one invocation per translation unit.
     let mut units = Vec::new();
@@ -89,6 +107,8 @@ fn main() {
         for def in &cli.defines {
             cmd.args(["-D", def]);
         }
+        cmd.args(["-I", header_dir.to_str().unwrap()]);
+        cmd.args(["-D", &format!("EPIC_FOSC_HZ={fosc_hz}")]);
         cmd.args(["-o", ll_path.to_str().unwrap(), input]);
         if cli.verbose {
             eprintln!("epic-cc: {cmd:?}");
@@ -123,6 +143,25 @@ fn main() {
 
     let ll_text =
         irparse::sanitize_symbols(&std::fs::read_to_string(&merged_path).expect("read merged .ll"));
+    let canonical_spec = ll_text
+        .find("section \".epiccfg.")
+        .map(|i| &ll_text[i + "section \".epiccfg.".len()..])
+        .and_then(|rest| rest.split('"').next())
+        .map(str::to_string);
+
+    match (&prescan_spec, &canonical_spec) {
+        (Some(p), Some(c)) if p != c => panic!(
+            "epic-cc: internal inconsistency, the pre-scan found EPIC_CONFIG({p:?}) but the \
+             compiled program's actual config is {c:?}; this is a pre-scanner bug, please report it"
+        ),
+        (Some(_), None) => panic!(
+            "epic-cc: the pre-scan found an EPIC_CONFIG(...) invocation that did not survive \
+             into the compiled program (likely behind an #ifdef the pre-scan cannot see); v1 \
+             requires an unconditional top-level invocation"
+        ),
+        _ => {}
+    }
+
     if cli.emit == cli::Emit::Ll {
         std::fs::write(&cli.output, &ll_text).expect("write .ll");
         return;
@@ -182,7 +221,44 @@ fn main() {
         return;
     }
 
-    // 10. asm: assembly -> Intel HEX
-    let hex = asm::assemble_file_to_hex(device, &asm);
+    // 10. asm: assembly -> Intel HEX (with config words when present)
+    let fuse_spec = canonical_spec
+        .as_deref()
+        .map(|s| driver::fosc::fuse_spec(s))
+        .unwrap_or_default();
+    let config_bytes: Option<Vec<u8>> = if canonical_spec.is_some() {
+        Some(device::resolve_config(&device.config, &fuse_spec))
+    } else {
+        None
+    };
+    let hex = match (device.core, &config_bytes) {
+        (device::Core::Pic14, Some(cb)) => {
+            let mut words = asm::assemble(&asm);
+            let idx = (device.config.base_byte_addr / 2) as usize;
+            if words.len() <= idx {
+                words.resize(idx + 1, 0);
+            }
+            let w = u16::from(cb[0]) | (u16::from(cb[1]) << 8);
+            words[idx] = w;
+            asm::to_hex(&words)
+        }
+        (device::Core::Pic18, Some(cb)) => {
+            let program_words = asm::assemble_pic18(&asm);
+            let mut config_words = Vec::new();
+            for chunk in cb.chunks(2) {
+                let lo = chunk[0] as u16;
+                let hi = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
+                config_words.push(lo | (hi << 8));
+            }
+            asm::to_hex_regions(&[(0, &program_words), (device.config.base_byte_addr, &config_words)])
+        }
+        _ => asm::assemble_file_to_hex(device, &asm),
+    };
+    if let Some(cb) = &config_bytes {
+        eprintln!("epic-cc: resolved configuration for {}:", device.name);
+        for (i, b) in cb.iter().enumerate() {
+            eprintln!("  byte 0x{:06X} = 0x{b:02X}", device.config.base_byte_addr as usize + i);
+        }
+    }
     std::fs::write(&cli.output, hex).expect("write hex");
 }

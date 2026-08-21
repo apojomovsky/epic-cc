@@ -1,4 +1,4 @@
-# ADR-014: PIC18 soft-float (port of PIC14 recipes, skip-sensitive frame rule)
+# ADR-015: PIC18 soft-float (port of PIC14 recipes, skip-sensitive frame rule)
 
 **Status:** Accepted 2026-08-20 (implemented in feat/pic18-p7-softfloat)
 
@@ -18,7 +18,7 @@ The float algorithms (decode/encode, implicit bit, RNE guard/sticky/LSB, denorma
 
 ## Rejected alternatives
 
-* Share the recipes via a trait between `isel` and `isel-pic18` (P6 ADR-012 same reasoning: the instruction sets differ enough that sharing leaks an abstraction; PIC14's `PCLATH`/`BANKSEL` vs PIC18's `TBLRD`/`MOVLB` already forced separate crates).
+* Share the recipes via a trait between `isel` and `isel-pic18` (P6 ADR-014 same reasoning: the instruction sets differ enough that sharing leaks an abstraction; PIC14's `PCLATH`/`BANKSEL` vs PIC18's `TBLRD`/`MOVLB` already forced separate crates).
 * Re-derive the algorithms (unnecessary risk; the port is mechanical).
 
 ## Revisit if

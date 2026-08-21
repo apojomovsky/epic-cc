@@ -652,20 +652,91 @@ impl<'m> Gen<'m> {
                     }
                     return;
                 }
-                // `b.a` is resolved via `val_addr`, which treats a
-                // `Val::Const` as a RAM ADDRESS (`Slot::Direct(k & 0xFF)`)
-                // rather than a literal to load  -  a constant on the LHS
-                // (e.g. `sub i8 5, %x`, which clang can emit directly from
-                // `5 - x`, and which the differential fuzzer generates) would
-                // silently read whatever byte lives at that address instead
-                // of using the literal. `b.b`'s RHS is fine: it always goes
-                // through `emit_load_w`, which loads a `Val::Const` via
-                // `MOVLW`. This mirrors the const-LHS hazard PIC14's `isel`
-                // already had to guard against (see `emit_sub_const_lhs`,
-                // `crates/isel/src/lib.rs:1598-1609`, and `emit_commutative`,
-                // `crates/isel/src/lib.rs:1100-1106`)  -  full canonicalization
-                // isn't this task's job, so fail loudly instead of
-                // miscompiling silently, until a later task adds it.
+                // PIC18 port of PIC14's `emit_sub_const_lhs` / `emit_commutative`:
+                // a const LHS would be misread as a RAM address via
+                // `val_addr` (`k & 0xFF` truncates), so handle it here.
+                // Commutative ops swap; `k - a` uses `SUBLW` for byte 0 and
+                // the INCFSZ/BTFSS carry fold for bytes 1..n.
+                if let Val::Const(k) = b.a {
+                    let n = b.ty.bytes();
+                    let dst = self.slot_addr(self.cur_func, &b.dst).direct();
+                    match b.op {
+                        ir::BinOp::Add | ir::BinOp::And | ir::BinOp::Or | ir::BinOp::Xor => {
+                            // Commutative: `k op x` == `x op k`, reuse the
+                            // normal path with swapped operands.
+                            let swapped = ir::Bin {
+                                op: b.op,
+                                ty: b.ty,
+                                dst: b.dst.clone(),
+                                a: b.b.clone(),
+                                b: Val::Const(k),
+                            };
+                            // Re-enter the Bin arm with swapped operands via
+                            // the normal per-byte loop: emit the swapped bin
+                            // directly here to avoid recursion.
+                            let av = self.val_addr(&swapped.a).direct();
+                            for i in 0..n {
+                                self.emit_load_w(&swapped.b, i);
+                                let carry = i > 0 && matches!(swapped.op, ir::BinOp::Add | ir::BinOp::Sub);
+                                let mne = match (swapped.op, carry) {
+                                    (ir::BinOp::Add, false) => "ADDWF",
+                                    (ir::BinOp::Add, true) => "ADDWFC",
+                                    (ir::BinOp::Sub, false) => "SUBWF",
+                                    (ir::BinOp::Sub, true) => "SUBFWB",
+                                    (ir::BinOp::And, _) => "ANDWF",
+                                    (ir::BinOp::Or, _) => "IORWF",
+                                    (ir::BinOp::Xor, _) => "XORWF",
+                                    _ => unreachable!(),
+                                };
+                                let (aacc, af) = self.operand(av + u16::from(i));
+                                let abank = if aacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    {mne} 0x{af:03X},W,{abank}"));
+                                let (dacc, df) = self.operand(dst + u16::from(i));
+                                let dbank = if dacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                            }
+                            return;
+                        }
+                        ir::BinOp::Sub => {
+                            // `k - a` for `n > 1`: byte 0 via `SUBLW`
+                            // (k - W), bytes 1..n via `k_i + ~a_i + C0`
+                            // (the borrow-aware `k - a - !C0` chain). `C0`
+                            // is saved in a flag bit (0x0000,0 in the
+                            // reserved `common_ram`/`retval_lo` region, so
+                            // it is live-free across a `Bin` and an
+                            // interrupt mid-sequence cannot clobber a live
+                            // local) before the `COMF`/`ADDLW` overwrites
+                            // STATUS.
+                            let aa = self.val_addr(&b.b).direct();
+                            let dst = self.slot_addr(self.cur_func, &b.dst).direct();
+                            let (aacc0, af0) = self.operand(aa);
+                            let abank0 = if aacc0 == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVF 0x{af0:03X},W,{abank0}"));
+                            self.emit(format!("    SUBLW 0x{:02X}", (k & 0xFF) as u8));
+                            let (dacc0, df0) = self.operand(dst);
+                            let dbank0 = if dacc0 == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVWF 0x{df0:03X},{dbank0}"));
+                            for i in 1..n {
+                                let kb = ((k >> (u32::from(i) * 8)) & 0xFF) as u8;
+                                self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                self.emit("    BSF 0x0000,0,A".to_string());
+                                self.emit("    BTFSS 0xFD8,0,A".to_string());
+                                self.emit("    BCF 0x0000,0,A".to_string());
+                                let (aacc, af) = self.operand(aa + u16::from(i));
+                                let abank = if aacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    COMF 0x{af:03X},W,{abank}"));
+                                self.emit(format!("    ADDLW 0x{kb:02X}"));
+                                self.emit("    BTFSC 0x0000,0,A".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                                let (dacc, df) = self.operand(dst + u16::from(i));
+                                let dbank = if dacc == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 assert!(
                     !matches!(b.a, Val::Const(_)),
                     "isel-pic18: const-LHS Bin (constant as the first operand) not yet supported  -  needs the isel::emit_sub_const_lhs-equivalent handling"

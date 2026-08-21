@@ -247,7 +247,7 @@ not a judgement.
 | **P2** | Integer spine: `isel-pic18`, Access Bank + BSR banking, `Slot::Direct`. | `add.c`, `scalar.c`, `overlay.c`, `banked.c` |
 | **P3** | **DONE** Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
 | **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
-| **P5** | **DONE** Interrupts: single-vector compatibility mode (IPEN=0), one handler at `0x0008` (see the P5 note and ADR-012). | `interrupt_pic18.c`, `interrupt_gate_pic18.c`; `interrupt_mul.c` joins P6 (it needs `*`/`/`) |
+| **P5** | **DONE** Interrupts: single-vector compatibility mode (IPEN=0), one handler at `0x0008` (see the P5 note and ADR-013). | `interrupt_pic18.c`, `interrupt_gate_pic18.c`; `interrupt_mul.c` joins P6 (it needs `*`/`/`) |
 | **P6** | **DONE** 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c`, `interrupt_mul_pic18.c` |
 | **P7** | **DONE** Soft-float: nine f32 routines via `MULWF`/`TBLRD`/`isr` save area. | `float.c` (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) |
 
@@ -270,8 +270,7 @@ expected value.
 **P5 note (2026-08-20):** landed per
 [`docs/superpowers/plans/2026-08-20-pic18-port-p5.md`](superpowers/plans/2026-08-20-pic18-port-p5.md).
 The "interrupt priority" open question from §7 is settled by
-[ADR-012](adr/ADR-012-pic18-interrupts.md): v1 targets the single-vector
-compatibility mode (IPEN=0, one handler at `0x0008`, GIE-gated), the same
+[ADR-013](adr/ADR-013-pic18-interrupts.md): v1 targets the single-vector
 model PIC14's fixtures exercise; two-vector priority mode stays a
 documented follow-up. The fixtures are PIC14's `interrupt.c`/`interrupt_gate.c`
 with the SFR addresses changed (PORTB 0x06→0xF81, INTCON 0x0B→0xFF2);
@@ -281,7 +280,7 @@ from PIC14 M13 unchanged.
 
 **P6 note (2026-08-20):** landed per
 [`docs/superpowers/plans/2026-08-20-pic18-port-p6.md`](superpowers/plans/2026-08-20-pic18-port-p6.md).
-The i32 surface and the runtime routine recipes land together (ADR-013):
+The i32 surface and the runtime routine recipes land together (ADR-014):
 `long.c` (0x1634943A), `muldiv.c` (210), and P5's deferred
 `interrupt_mul_pic18.c` (main + ISR both reach `__mul_u8`/`__udiv_u8`, the
 `_isr` copies get disjoint frames) all pass on the `Pic18` simulator, with
@@ -291,7 +290,7 @@ divmod/shift loops are branch-based with no single-GPR-bank constraint.
 
 **P7 note (2026-08-20):** landed per
 [`docs/superpowers/plans/2026-08-20-pic18-port-p7.md`](superpowers/plans/2026-08-20-pic18-port-p7.md).
-The nine f32 soft-float routines land together (ADR-014): `float.c`
+The nine f32 soft-float routines land together (ADR-015): `float.c`
 (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) passes on the `Pic18`
 simulator with a `gpasm -p p18f4550` byte-for-byte cross-check. The
 recipes are a 1:1 port of PIC14's verified ieee754 bodies with the
