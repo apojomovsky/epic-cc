@@ -158,9 +158,287 @@ pub const PIC18F4550: Device = Device {
     interrupt_vectors: &[0x0008, 0x0018],
     config: ConfigRegion {
         base_byte_addr: 0x300000,
-        num_bytes: 0,
-        erased_baseline: &[],
-        fields: &[],
+        num_bytes: 14,
+        // Confirmed against gpasm 1.5.2, 2026-08-21 (see the crate's config.rs
+        // tests): every byte in this region, including the two gap addresses,
+        // erases to 0xFF. DS39632E's per-register "Default/Unprogrammed Value"
+        // column in Table 25-1 describes the value read back through the SFR
+        // (unimplemented bits forced to 0 by hardware), not the raw flash
+        // content, which is what this array represents.
+        erased_baseline: &[0xFF; 14],
+        fields: &[
+            // ---- offset 0: CONFIG1L (0x300000), DS39632E Register 25-1 ----
+            FuseField {
+                name: "usbdiv", byte_offset: 0, mask: 0x20, shift: 5,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: None, locked: None, // part of the clock tree
+            },
+            FuseField {
+                name: "cpudiv", byte_offset: 0, mask: 0x18, shift: 3,
+                values: &[
+                    FuseValue { name: "div1", bits: 0b00 },
+                    FuseValue { name: "div2", bits: 0b01 },
+                    FuseValue { name: "div3", bits: 0b10 },
+                    FuseValue { name: "div4", bits: 0b11 },
+                ],
+                default: None, locked: None,
+            },
+            FuseField {
+                name: "plldiv", byte_offset: 0, mask: 0x07, shift: 0,
+                values: &[
+                    FuseValue { name: "noprescale", bits: 0b000 }, // 4 MHz direct
+                    FuseValue { name: "div2", bits: 0b001 },       // 8 MHz input
+                    FuseValue { name: "div3", bits: 0b010 },       // 12 MHz input
+                    FuseValue { name: "div4", bits: 0b011 },       // 16 MHz input
+                    FuseValue { name: "div5", bits: 0b100 },       // 20 MHz input
+                    FuseValue { name: "div6", bits: 0b101 },       // 24 MHz input
+                    FuseValue { name: "div10", bits: 0b110 },      // 40 MHz input
+                    FuseValue { name: "div12", bits: 0b111 },      // 48 MHz input
+                ],
+                default: None, locked: None,
+            },
+            // ---- offset 1: CONFIG1H (0x300001), Register 25-2 ----
+            FuseField {
+                name: "ieso", byte_offset: 1, mask: 0x80, shift: 7,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "fcmen", byte_offset: 1, mask: 0x40, shift: 6,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                // Canonical (x=0) encoding for each named mode; DS39632E lists
+                // some patterns as "111x"/"110x"/etc. where the low bit is a
+                // don't-care. FOSC3:0.
+                name: "osc", byte_offset: 1, mask: 0x0F, shift: 0,
+                values: &[
+                    FuseValue { name: "hspll", bits: 0b1110 },
+                    FuseValue { name: "hs", bits: 0b1100 },
+                    FuseValue { name: "inths", bits: 0b1011 },
+                    FuseValue { name: "intxt", bits: 0b1010 },
+                    FuseValue { name: "intcko", bits: 0b1001 },
+                    FuseValue { name: "intio", bits: 0b1000 },
+                    FuseValue { name: "ecpll", bits: 0b0111 },
+                    FuseValue { name: "ecpio", bits: 0b0110 },
+                    FuseValue { name: "ec", bits: 0b0101 },
+                    FuseValue { name: "ecio", bits: 0b0100 },
+                    FuseValue { name: "xtpll", bits: 0b0010 },
+                    FuseValue { name: "xt", bits: 0b0000 },
+                ],
+                default: None, locked: None, // the oscillator field
+            },
+            // ---- offset 2: CONFIG2L (0x300002), Register 25-3 ----
+            FuseField {
+                name: "vregen", byte_offset: 2, mask: 0x20, shift: 5,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("off"), locked: None, // matches erased default
+            },
+            FuseField {
+                name: "borv", byte_offset: 2, mask: 0x18, shift: 3,
+                values: &[
+                    FuseValue { name: "minimum", bits: 0b11 },
+                    FuseValue { name: "low", bits: 0b10 },
+                    FuseValue { name: "mid", bits: 0b01 },
+                    FuseValue { name: "maximum", bits: 0b00 },
+                ],
+                default: Some("minimum"), locked: None, // matches erased default
+            },
+            FuseField {
+                name: "boren", byte_offset: 2, mask: 0x06, shift: 1,
+                values: &[
+                    FuseValue { name: "hw_always", bits: 0b11 },
+                    FuseValue { name: "hw_off_in_sleep", bits: 0b10 },
+                    FuseValue { name: "sw", bits: 0b01 },
+                    FuseValue { name: "off", bits: 0b00 },
+                ],
+                default: Some("hw_always"), locked: None, // D-4 policy: BOR on
+            },
+            FuseField {
+                // 1 = PWRT disabled, 0 = PWRT enabled (inverted, matches the
+                // PIC16F877A's PWRTEN convention).
+                name: "pwrt", byte_offset: 2, mask: 0x01, shift: 0,
+                values: &[FuseValue { name: "on", bits: 0 }, FuseValue { name: "off", bits: 1 }],
+                default: Some("on"), locked: None, // D-4 policy
+            },
+            // ---- offset 3: CONFIG2H (0x300003), Register 25-4 ----
+            FuseField {
+                name: "wdtps", byte_offset: 3, mask: 0x1E, shift: 1,
+                values: &[
+                    FuseValue { name: "div1", bits: 0b0000 },
+                    FuseValue { name: "div2", bits: 0b0001 },
+                    FuseValue { name: "div4", bits: 0b0010 },
+                    FuseValue { name: "div8", bits: 0b0011 },
+                    FuseValue { name: "div16", bits: 0b0100 },
+                    FuseValue { name: "div32", bits: 0b0101 },
+                    FuseValue { name: "div64", bits: 0b0110 },
+                    FuseValue { name: "div128", bits: 0b0111 },
+                    FuseValue { name: "div256", bits: 0b1000 },
+                    FuseValue { name: "div512", bits: 0b1001 },
+                    FuseValue { name: "div1024", bits: 0b1010 },
+                    FuseValue { name: "div2048", bits: 0b1011 },
+                    FuseValue { name: "div4096", bits: 0b1100 },
+                    FuseValue { name: "div8192", bits: 0b1101 },
+                    FuseValue { name: "div16384", bits: 0b1110 },
+                    FuseValue { name: "div32768", bits: 0b1111 },
+                ],
+                default: Some("div32768"), locked: None, // matches erased default
+            },
+            FuseField {
+                name: "wdt", byte_offset: 3, mask: 0x01, shift: 0,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("off"), locked: None, // D-4 policy
+            },
+            // offset 4: gap (0x300004), no register, no fields
+            // ---- offset 5: CONFIG3H (0x300005), Register 25-5 ----
+            FuseField {
+                name: "mclre", byte_offset: 5, mask: 0x80, shift: 7,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("on"), locked: None, // matches erased default
+            },
+            FuseField {
+                name: "lpt1osc", byte_offset: 5, mask: 0x04, shift: 2,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "pbaden", byte_offset: 5, mask: 0x02, shift: 1,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("on"), locked: None, // matches erased default
+            },
+            FuseField {
+                name: "ccp2mx", byte_offset: 5, mask: 0x01, shift: 0,
+                values: &[FuseValue { name: "rc1", bits: 1 }, FuseValue { name: "rb3", bits: 0 }],
+                default: Some("rc1"), locked: None, // matches erased default
+            },
+            // ---- offset 6: CONFIG4L (0x300006), Register 25-6 ----
+            FuseField {
+                name: "debug", byte_offset: 6, mask: 0x80, shift: 7,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None, // D-4 policy
+            },
+            FuseField {
+                name: "xinst", byte_offset: 6, mask: 0x40, shift: 6,
+                values: &[FuseValue { name: "off", bits: 0 }, FuseValue { name: "on", bits: 1 }],
+                default: Some("off"), locked: Some("off"), // codegen hazard, docs/31 D-9
+            },
+            FuseField {
+                // DS39632E note: "Always leave this bit clear in all other
+                // devices" (44-pin TQFP only). epic-cc does not model package
+                // variants, so this is off unconditionally.
+                name: "icprt", byte_offset: 6, mask: 0x20, shift: 5,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "lvp", byte_offset: 6, mask: 0x04, shift: 2,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("off"), locked: None, // D-4 policy
+            },
+            FuseField {
+                name: "stvren", byte_offset: 6, mask: 0x01, shift: 0,
+                values: &[FuseValue { name: "on", bits: 1 }, FuseValue { name: "off", bits: 0 }],
+                default: Some("on"), locked: None, // matches erased default
+            },
+            // offset 7: gap (0x300007), no register, no fields
+            // ---- offset 8: CONFIG5L (0x300008), Register 25-7 ----
+            FuseField {
+                name: "cp0", byte_offset: 8, mask: 0x01, shift: 0,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None, // D-4 policy
+            },
+            FuseField {
+                name: "cp1", byte_offset: 8, mask: 0x02, shift: 1,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "cp2", byte_offset: 8, mask: 0x04, shift: 2,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "cp3", byte_offset: 8, mask: 0x08, shift: 3,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            // ---- offset 9: CONFIG5H (0x300009), Register 25-8 ----
+            FuseField {
+                name: "cpd", byte_offset: 9, mask: 0x80, shift: 7,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "cpb", byte_offset: 9, mask: 0x40, shift: 6,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            // ---- offset 10: CONFIG6L (0x30000A), Register 25-9 ----
+            FuseField {
+                name: "wrt0", byte_offset: 10, mask: 0x01, shift: 0,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "wrt1", byte_offset: 10, mask: 0x02, shift: 1,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "wrt2", byte_offset: 10, mask: 0x04, shift: 2,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "wrt3", byte_offset: 10, mask: 0x08, shift: 3,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            // ---- offset 11: CONFIG6H (0x30000B), Register 25-10 ----
+            FuseField {
+                name: "wrtc", byte_offset: 11, mask: 0x20, shift: 5,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "wrtb", byte_offset: 11, mask: 0x40, shift: 6,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "wrtd", byte_offset: 11, mask: 0x80, shift: 7,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            // ---- offset 12: CONFIG7L (0x30000C), Register 25-11 ----
+            FuseField {
+                name: "ebtr0", byte_offset: 12, mask: 0x01, shift: 0,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "ebtr1", byte_offset: 12, mask: 0x02, shift: 1,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "ebtr2", byte_offset: 12, mask: 0x04, shift: 2,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            FuseField {
+                name: "ebtr3", byte_offset: 12, mask: 0x08, shift: 3,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+            // ---- offset 13: CONFIG7H (0x30000D), Register 25-12 ----
+            FuseField {
+                name: "ebtrb", byte_offset: 13, mask: 0x40, shift: 6,
+                values: &[FuseValue { name: "off", bits: 1 }, FuseValue { name: "on", bits: 0 }],
+                default: Some("off"), locked: None,
+            },
+        ],
     },
 };
 
