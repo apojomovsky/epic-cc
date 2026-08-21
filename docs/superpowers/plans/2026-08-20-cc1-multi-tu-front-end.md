@@ -910,7 +910,7 @@ Actual: `make test` PASS, all 16 crates, exit 0. `git diff --stat crates/driver/
 
 ---
 
-### Task 6: multi-TU acceptance test
+### Task 6: multi-TU acceptance test — DONE (5ee9b2b)
 
 The end-to-end proof: three translation units with colliding statics, a global defined in one and used in another, and a cross-unit call, compiled by the real binary and run in the simulator.
 
@@ -924,7 +924,7 @@ The end-to-end proof: three translation units with colliding statics, a global d
 - Consumes: the `epic-cc` binary's new CLI from Task 5.
 - Produces: nothing other tasks depend on.
 
-- [ ] **Step 1: Write the fixtures**
+- [x] **Step 1: Write the fixtures**
 
 `multi_tu_main.c`:
 
@@ -959,7 +959,7 @@ unsigned char from_b(unsigned char v) { return bump(v); }   // 4 -> 6
 
 The `noinline` and `volatile` are load-bearing: without them clang `-O1` inlines both helpers away and the collision this test exists to exercise never reaches `llvm-link`. Verified 2026-08-20.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `crates/driver/tests/multi_tu_e2e.rs`:
 
@@ -996,17 +996,21 @@ fn compiles_three_translation_units_end_to_end() {
 
 **Before finishing this test, read `crates/driver/tests/e2e.rs` and `crates/driver/tests/banked_e2e.rs`** to see how they locate a global's RAM address (`e2e.rs` hard-codes `0x20`/`0x21` from the layout). Follow whichever convention they use, and assert `total == 0x0A`.
 
-- [ ] **Step 3: Run to verify it fails**
+- [x] **Step 3: Run to verify it fails**
 
 Run: `make test CRATE=driver`
 Expected: FAIL, because the fixtures and the assertion are not complete until Step 2's note is resolved.
 
-- [ ] **Step 4: Complete the assertion and run**
+Actual: the address-lookup note was resolved during writing rather than left as a TODO to hit at test time, by adding a `multi_tu_layout()` helper (mirrors `array_e2e.rs`'s `array_layout()`, extended to run clang per unit, `llvm-link` the merge, and `sanitize_symbols` before `alloc::allocate`) that returns `total`'s real RAM address. The test therefore compiled and passed on the first run rather than failing first; the fail/pass split from Steps 3-4 collapsed into Step 4's run.
+
+- [x] **Step 4: Complete the assertion and run**
 
 Run: `make test CRATE=driver`
 Expected: PASS, `total == 0x0A`.
 
-- [ ] **Step 5: Verify the collision actually happened**
+Actual: PASS. Also added `the_merge_actually_renamed_colliding_symbols`, a second test asserting the merged `.ll` still contains two `@bump`/`@scratch` lines and at least one dotted rename, so a future clang that starts inlining these helpers away fails loudly here instead of the acceptance test quietly stopping being a collision test.
+
+- [x] **Step 5: Verify the collision actually happened**
 
 This test is worthless if `llvm-link` never had to rename anything. Prove it:
 
@@ -1016,12 +1020,18 @@ make exec CMD='cargo run -q -p driver -- crates/driver/tests/fixtures/multi_tu_m
 
 Expected: two `bump` symbols and two `scratch` symbols, one of each pair carrying a sanitized suffix (`bump_3`, `scratch_4` or similar). If you see only one of each, the fixtures were inlined away and the test is not testing what it claims.
 
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/driver/tests/multi_tu_e2e.rs crates/driver/tests/fixtures/multi_tu_*.c crates/driver/tests/fixtures/multi_tu.hex
-git commit -m "test(driver): multi translation unit end to end acceptance"
+Actual: reproduced by hand. `--emit ll` output (pre-sanitize) showed:
 ```
+@scratch = internal global i8 0, align 1
+@scratch.6 = internal global i8 0, align 1
+define internal fastcc zeroext i8 @bump(i8 noundef zeroext %0) unnamed_addr #2 {
+define internal fastcc zeroext i8 @bump.5(i8 noundef zeroext %0) unnamed_addr #2 {
+```
+Confirms the merge, not the fixtures, produced the collision this task exists to test.
+
+- [x] **Step 6: Commit** — `5ee9b2b`
+
+Deviation: `crates/driver/tests/fixtures/multi_tu.hex` was NOT added. `*.hex` is gitignored project-wide, and on inspection none of the other 23 pre-existing `.hex` fixtures are tracked either (`git ls-files ... | grep .hex` returns nothing): they are generated at test time and the real assertion is the simulator's register/RAM check, not a byte-committed file. The plan's Step 6 command listed the `.hex` by the same convention as the `.c` fixtures without checking this; it does not apply. `git diff --stat crates/driver/tests/fixtures/` in Task 5 Step 4 was still a valid check, since it covers the tracked `.c` files, just not for the reason implied (there is no committed `.hex` to diff against).
 
 ---
 
