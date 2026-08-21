@@ -200,6 +200,9 @@ fn const_table_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize + 1] = 0x01; // hi byte
     p.run(500_000);
     assert_eq!(p.ram()[globals["out"] as usize], 0x82, "out == 0x82 for in == 290 (four boundary reads)");
+    assert!(p.halted());
+}
+
 // P5 end-to-end acceptance: interrupts. The fixtures are byte-identical to
 // PIC14's except for the SFR addresses (PORTB 0x06 -> 0xF81, INTCON 0x0B
 // -> 0xFF2), so the expected values come from the PIC14 e2e tests of the
@@ -259,6 +262,10 @@ fn ptr_probe_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize] = 1; // in = 1 (16-bit; hi byte zero by default)
     p.run(200_000);
     assert_eq!(p.ram()[globals["out"] as usize], 20, "out == table[1] == 20 for in == 1");
+    assert!(p.halted());
+}
+
+#[test]
 fn interrupt_gate_pic18_c_runs_correctly() {
     // Mirrors crates/driver/tests/interrupt_gate_e2e.rs: the request is
     // latched while INTCON = 0x10 (INT0IE, GIE clear), taken only after
@@ -280,12 +287,6 @@ fn interrupt_gate_pic18_c_runs_correctly() {
     assert_eq!(p.ram()[globals["stage"] as usize], 3, "main completed after the handler returned");
     assert!(p.halted());
 }
-
-// P6 end-to-end acceptance: i32 (`long`) arithmetic, hardware-multiply
-// routine recipes, and the ISR-context routine duplication. Fixtures are
-// byte-identical to PIC14's; expected values come from the PIC14 e2e tests
-// of the same C source (crates/driver/tests/{long,muldiv,interrupt_mul}_e2e.rs).
-
 #[test]
 fn long_c_runs_correctly() {
     // Mirrors crates/driver/tests/long_e2e.rs: in = 0x12345678, sin = -19
@@ -337,5 +338,36 @@ fn interrupt_mul_pic18_c_runs_correctly() {
     // it asserts the two routine frames are disjoint, which is what makes
     // a mid-routine clobber impossible), so the ISR globals stay untouched.
     assert_eq!(p.ram()[globals["isr_out"] as usize], 0, "ISR frame disjoint from main's");
+    assert!(p.halted());
+}
+
+#[test]
+fn float_c_runs_correctly() {
+    // Mirrors crates/driver/tests/float_e2e.rs: in = 3.0f (0x40400000) ->
+    // out1 = 3.0/2.5 = 1.2 = 0x3F99999A (RNE), out2 = 9.0 = 0x41100000
+    // (via fadd/fmul exact + fptosi/sitofp), out3 = 1.0/3.0 = 0x3EAAAAAB
+    // (RNE) via the struct sret/byval path.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/float.c"));
+    // 3.0f = 0x40400000 LE bytes 00 00 40 40
+    p.ram_mut()[globals["in"] as usize] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 1] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 2] = 0x40;
+    p.ram_mut()[globals["in"] as usize + 3] = 0x40;
+    p.run(2_000_000);
+    // out1 = 0x3F99999A LE 9A 99 99 3F
+    assert_eq!(p.ram()[globals["out1"] as usize], 0x9A);
+    assert_eq!(p.ram()[globals["out1"] as usize + 1], 0x99);
+    assert_eq!(p.ram()[globals["out1"] as usize + 2], 0x99);
+    assert_eq!(p.ram()[globals["out1"] as usize + 3], 0x3F);
+    // out2 = 0x41100000 LE 00 00 10 41
+    assert_eq!(p.ram()[globals["out2"] as usize], 0x00);
+    assert_eq!(p.ram()[globals["out2"] as usize + 1], 0x00);
+    assert_eq!(p.ram()[globals["out2"] as usize + 2], 0x10);
+    assert_eq!(p.ram()[globals["out2"] as usize + 3], 0x41);
+    // out3 = 0x3EAAAAAB LE AB AA AA 3E
+    assert_eq!(p.ram()[globals["out3"] as usize], 0xAB);
+    assert_eq!(p.ram()[globals["out3"] as usize + 1], 0xAA);
+    assert_eq!(p.ram()[globals["out3"] as usize + 2], 0xAA);
+    assert_eq!(p.ram()[globals["out3"] as usize + 3], 0x3E);
     assert!(p.halted());
 }
