@@ -1233,6 +1233,306 @@ impl<'m> Gen<'m> {
             }
         }
     }
+
+    /// Copy `bytes` bytes from `src` (a slot address) into the fixed
+    /// retval region (`retval_lo`). MOVFF-based; no access bit, no BSR.
+    fn store_retval(&mut self, src: u16, bytes: u8) {
+        for i in 0..bytes {
+            self.emit_copy_byte(src + u16::from(i), self.retval_lo + u16::from(i));
+        }
+    }
+
+    /// Two's-complement negate of a `bytes`-byte value in place: `COMF`
+    /// every byte, then `INCF` the low byte (carry propagates through the
+    /// `INCF` chain exactly like PIC14's `neg16_in_place`/`neg32_in_place`).
+    fn neg_in_place(&mut self, addr: u16, bytes: u8) {
+        for i in 0..bytes {
+            self.emit(format!("    COMF 0x{:03X},F,A", addr + u16::from(i)));
+        }
+        for i in 0..bytes {
+            self.emit(format!("    INCF 0x{:03X},F,A", addr + u16::from(i)));
+        }
+    }
+
+    /// The hardware-multiply recipe for `bytes` = 1, 2, or 4: schoolbook
+    /// partial products via `MULWF` (8x8 -> PRODH:PRODL, SFRs 0xFF4/0xFF3),
+    /// the P6 headline. The result is the low `bytes` bytes of the product,
+    /// written to the retval region:
+    /// - 1 byte: one MULWF, result = PRODL.
+    /// - 2 bytes: P00 (shift 0) and P01 + P10 (shift 8) contribute to the
+    ///   low 16 bits; P11 (shift 16) is dropped.
+    /// - 4 bytes: every Pij with i+j < 4 contributes: PRODL lands at byte
+    ///   i+j, PRODH at byte i+j+1, each with its own carry fold.
+    fn emit_hw_mul(&mut self, name: &str, bytes: u8, scr: u16) {
+        let a = self.slot_addr(name, "a").direct();
+        let b = self.slot_addr(name, "b").direct();
+        match bytes {
+            1 => {
+                self.emit(format!("    MOVF 0x{a:03X},W,A"));
+                self.emit(format!("    MULWF 0x{b:03X},A"));
+                self.store_retval(0xFF3, 1); // PRODL
+                self.emit("    RETURN".to_string());
+            }
+            2 => {
+                let (r0, r1) = (scr, scr + 1);
+                self.emit(format!("    MOVF 0x{a:03X},W,A"));
+                self.emit(format!("    MULWF 0x{b:03X},A")); // P00
+                self.emit(format!("    MOVFF 0xFF3, 0x{r0:03X}"));
+                self.emit(format!("    MOVFF 0xFF4, 0x{r1:03X}"));
+                self.emit(format!("    MOVF 0x{a:03X},W,A"));
+                self.emit(format!("    MULWF 0x{:03X},A", b + 1)); // P01
+                self.emit(format!("    MOVF 0xFF3,W,A"));
+                self.emit(format!("    ADDWF 0x{r1:03X},F,A"));
+                self.emit(format!("    MOVF 0x{:03X},W,A", a + 1));
+                self.emit(format!("    MULWF 0x{b:03X},A")); // P10
+                self.emit(format!("    MOVF 0xFF3,W,A"));
+                self.emit(format!("    ADDWF 0x{r1:03X},F,A"));
+                self.store_retval(r0, 2);
+                self.emit("    RETURN".to_string());
+            }
+            4 => {
+                for i in 0..4u16 {
+                    self.emit(format!("    CLRF 0x{:03X},A", scr + i));
+                }
+                for j in 0..4u16 {
+                    for i in 0..4u16 {
+                        let off = i + j;
+                        if off >= 4 {
+                            continue; // lands at shift >= 32, dropped
+                        }
+                        self.emit(format!("    MOVF 0x{:03X},W,A", a + i));
+                        self.emit(format!("    MULWF 0x{:03X},A", b + j));
+                        self.emit(format!("    MOVF 0xFF3,W,A")); // PRODL
+                        self.emit(format!("    ADDWF 0x{:03X},F,A", scr + off));
+                        self.emit(format!("    MOVF 0xFF4,W,A")); // PRODH
+                        self.emit(format!("    ADDWFC 0x{:03X},F,A", scr + off + 1));
+                    }
+                }
+                self.store_retval(scr, 4);
+                self.emit("    RETURN".to_string());
+            }
+            _ => unreachable!("isel-pic18: hw mul width"),
+        }
+    }
+
+    /// The restoring-division loop body: shifts `num` left one bit per
+    /// iteration (the quotient builds in its vacated bits), accumulates the
+    /// partial remainder in `rem_base..rem_base+bytes`, subtracts `den`
+    /// (`SUBFWB` for the borrow chain — the exact semantics PIC14
+    /// synthesized with its BTFSS/INCFSZ dance), and restores by adding
+    /// back when the subtraction borrowed. `cnt` counts `8*bytes`
+    /// iterations. `BNC`/`BRA` real branches mean the frame needs no
+    /// single-GPR-bank constraint (P6 ruling). Shared by the unsigned
+    /// (`emit_divmod`) and signed (`emit_sdivmod`) wrappers.
+    fn emit_divmod_loop(&mut self, num: u16, den: u16, rem_base: u16, cnt: u16, bytes: u8) {
+        let l_loop = self.fresh_label();
+        let l_restore = self.fresh_label();
+        let l_next = self.fresh_label();
+        for i in 0..u16::from(bytes) {
+            self.emit(format!("    CLRF 0x{:03X},A", rem_base + i));
+        }
+        self.emit(format!("    MOVLW 0x{:02X}", 8 * bytes));
+        self.emit(format!("    MOVWF 0x{cnt:03X},A"));
+        self.emit(format!("{l_loop}:"));
+        self.emit("    BCF STATUS,0".to_string());
+        for i in 0..u16::from(bytes) {
+            self.emit(format!("    RLCF 0x{:03X},F,A", num + i));
+        }
+        for i in 0..u16::from(bytes) {
+            self.emit(format!("    RLCF 0x{:03X},F,A", rem_base + i));
+        }
+        // rem -= den across `bytes` bytes: SUBWF then SUBFWB (borrow-in).
+        for i in 0..u16::from(bytes) {
+            self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+            if i == 0 {
+                self.emit(format!("    SUBWF 0x{:03X},F,A", rem_base));
+            } else {
+                self.emit(format!("    SUBFWB 0x{:03X},F,A", rem_base + i));
+            }
+        }
+        // C after the last byte = (rem >= den): set the quotient bit or restore.
+        self.emit(format!("    BNC {l_restore}"));
+        self.emit(format!("    BSF 0x{num:03X},0,A"));
+        self.emit(format!("    BRA {l_next}"));
+        self.emit(format!("{l_restore}:"));
+        // rem += den back (ADDWF, then ADDWFC for the carries).
+        for i in 0..u16::from(bytes) {
+            self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+            if i == 0 {
+                self.emit(format!("    ADDWF 0x{:03X},F,A", rem_base));
+            } else {
+                self.emit(format!("    ADDWFC 0x{:03X},F,A", rem_base + i));
+            }
+        }
+        self.emit(format!("{l_next}:"));
+        self.emit(format!("    DECFSZ 0x{cnt:03X},F,A"));
+        self.emit(format!("    BRA {l_loop}"));
+    }
+
+    /// The restoring-division recipe for `bytes` = 1, 2, or 4, quotient or
+    /// remainder selected by `quotient`. `rem` occupies the low `bytes`
+    /// bytes of `__scr`; the loop counter sits at `__scr[bytes]`.
+    fn emit_divmod(&mut self, name: &str, bytes: u8, scr: u16, quotient: bool) {
+        let num = self.slot_addr(name, "num").direct();
+        let den = self.slot_addr(name, "den").direct();
+        self.emit_divmod_loop(num, den, scr, scr + u16::from(bytes), bytes);
+        if quotient {
+            self.store_retval(num, bytes);
+        } else {
+            self.store_retval(scr, bytes);
+        }
+        self.emit("    RETURN".to_string());
+    }
+
+    /// The signed div/mod wrapper: abs both operands in place in the param
+    /// slots (unsigned abs, INT_MIN safe), run the unsigned divmod with
+    /// `rem` at `__scr[1..]` and the counter at `__scr[1+bytes]` (byte 0
+    /// holds the flags: bit0 = negate quotient = num<0 XOR den<0, bit1 =
+    /// negate remainder = num<0), then negate per the flags.
+    fn emit_sdivmod(&mut self, name: &str, bytes: u8, scr: u16, quotient: bool) {
+        let num = self.slot_addr(name, "num").direct();
+        let den = self.slot_addr(name, "den").direct();
+        let num_hi = num + u16::from(bytes) - 1;
+        let den_hi = den + u16::from(bytes) - 1;
+        let l_den = self.fresh_label();
+        let l_go = self.fresh_label();
+        let l_store = self.fresh_label();
+        self.emit(format!("    CLRF 0x{scr:03X},A")); // flags = 0
+        self.emit(format!("    BTFSS 0x{num_hi:03X},7,A")); // num < 0?
+        self.emit(format!("    BRA {l_den}"));
+        self.emit(format!("    BSF 0x{scr:03X},1,A")); // bit1: remainder sign follows dividend
+        self.emit(format!("    BSF 0x{scr:03X},0,A")); // bit0: quotient negate: num<0
+        self.neg_in_place(num, bytes); // num = |num|
+        self.emit(format!("{l_den}:"));
+        self.emit(format!("    BTFSS 0x{den_hi:03X},7,A")); // den < 0?
+        self.emit(format!("    BRA {l_go}"));
+        self.neg_in_place(den, bytes); // den = |den|
+        self.emit("    MOVLW 0x01".to_string());
+        self.emit(format!("    XORWF 0x{scr:03X},F,A")); // bit0 ^= den<0
+        self.emit(format!("{l_go}:"));
+        self.emit_divmod_loop(num, den, scr + 1, scr + 1 + u16::from(bytes), bytes);
+        if quotient {
+            self.emit(format!("    BTFSS 0x{scr:03X},0,A"));
+            self.emit(format!("    BRA {l_store}"));
+            self.neg_in_place(num, bytes); // -quotient
+        } else {
+            self.emit(format!("    BTFSS 0x{scr:03X},1,A"));
+            self.emit(format!("    BRA {l_store}"));
+            self.neg_in_place(scr + 1, bytes); // -remainder
+        }
+        self.emit(format!("{l_store}:"));
+        if quotient {
+            self.store_retval(num, bytes);
+        } else {
+            self.store_retval(scr + 1, bytes);
+        }
+        self.emit("    RETURN".to_string());
+    }
+
+    /// The variable-count shift recipe (all nine `__shl_*`/`__lshr_*`/
+    /// `__ashr_*`): mask the count to `width-1` (`__scr[0]` = masked
+    /// count), then a bounded loop over the `val` param slot with
+    /// `RLCF`/`RRCF`, `DECFSZ` on the masked count. `asl` sets C from the
+    /// sign bit before each shift so the sign fills every vacated bit.
+    fn emit_shift_body(&mut self, name: &str, bytes: u8, scr: u16, op: ir::BinOp) {
+        let val = self.slot_addr(name, "val").direct();
+        let hi = val + u16::from(bytes) - 1;
+        let mask: u8 = match bytes {
+            1 => 0x07,
+            2 => 0x0F,
+            4 => 0x1F,
+            _ => unreachable!(),
+        };
+        self.emit(format!("    MOVF 0x{:03X},W,A", self.slot_addr(name, "cnt").direct()));
+        self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
+        self.emit(format!("    MOVWF 0x{scr:03X},A"));
+        let l_loop = self.fresh_label();
+        let l_done = self.fresh_label();
+        self.emit(format!("    MOVF 0x{scr:03X},F,A")); // Z = (cnt == 0)
+        self.emit("    BTFSC STATUS,2".to_string()); // skip the GOTO when cnt != 0
+        self.emit(format!("    BRA {l_done}"));
+        self.emit(format!("{l_loop}:"));
+        match op {
+            ir::BinOp::Shl => {
+                self.emit("    BCF STATUS,0".to_string());
+                for i in 0..u16::from(bytes) {
+                    self.emit(format!("    RLCF 0x{:03X},F,A", val + i));
+                }
+            }
+            ir::BinOp::LShr => {
+                self.emit("    BCF STATUS,0".to_string());
+                for i in (0..u16::from(bytes)).rev() {
+                    self.emit(format!("    RRCF 0x{:03X},F,A", val + i));
+                }
+            }
+            ir::BinOp::AShr => {
+                self.emit(format!("    BTFSC 0x{hi:03X},7,A"));
+                self.emit("    BSF STATUS,0".to_string());
+                self.emit(format!("    BTFSS 0x{hi:03X},7,A"));
+                self.emit("    BCF STATUS,0".to_string());
+                for i in (0..u16::from(bytes)).rev() {
+                    self.emit(format!("    RRCF 0x{:03X},F,A", val + i));
+                }
+            }
+            _ => unreachable!(),
+        }
+        self.emit(format!("    DECFSZ 0x{scr:03X},F,A"));
+        self.emit(format!("    BRA {l_loop}"));
+        self.emit(format!("{l_done}:"));
+        self.store_retval(val, bytes);
+        self.emit("    RETURN".to_string());
+    }
+
+    /// The recipe body for one of the mul/div/rem/shift runtime routines,
+    /// adapted from PIC14's machine-verified epicurus asm but rewritten for
+    /// PIC18: the muls use hardware `MULWF` (8x8 -> PRODH:PRODL, schoolbook
+    /// partials, no shift-add loop), the divmod/shift loops use real branch
+    /// instructions instead of skip-sensitive idioms (PIC18 branches are
+    /// absolute, so a MOVLB between a test and its target is harmless, and
+    /// the whole routine frame has NO single-GPR-bank constraint), and
+    /// `RLCF`/`RRCF` replace `RLF`/`RRF`.
+    ///
+    /// Args arrive in the routine's `{func}::{param}` slots; the result
+    /// goes to the fixed retval slots; working state lives in
+    /// `{func}::__scr`. An `_isr` copy of a routine reads ITS OWN slots
+    /// (the `cur_func` map) so the ISR frame never overlaps the main
+    /// frame.
+    fn emit_routine(&mut self) {
+        let name = self.cur_func;
+        let scr = self.slot_addr(name, "__scr").direct();
+        let recipe = name.strip_suffix("_isr").unwrap_or(name);
+        if !ir::is_runtime_routine(name) {
+            panic!("isel-pic18: @{name} is not a runtime routine");
+        }
+        self.emit(format!("{name}:"));
+        match recipe {
+            "__mul_u8" => self.emit_hw_mul(name, 1, scr),
+            "__mul_u16" => self.emit_hw_mul(name, 2, scr),
+            "__mul_u32" => self.emit_hw_mul(name, 4, scr),
+            "__udiv_u8" => self.emit_divmod(name, 1, scr, true),
+            "__urem_u8" => self.emit_divmod(name, 1, scr, false),
+            "__udiv_u16" => self.emit_divmod(name, 2, scr, true),
+            "__urem_u16" => self.emit_divmod(name, 2, scr, false),
+            "__udiv_u32" => self.emit_divmod(name, 4, scr, true),
+            "__urem_u32" => self.emit_divmod(name, 4, scr, false),
+            "__sdiv_i8" => self.emit_sdivmod(name, 1, scr, true),
+            "__srem_i8" => self.emit_sdivmod(name, 1, scr, false),
+            "__sdiv_i16" => self.emit_sdivmod(name, 2, scr, true),
+            "__srem_i16" => self.emit_sdivmod(name, 2, scr, false),
+            "__sdiv_i32" => self.emit_sdivmod(name, 4, scr, true),
+            "__srem_i32" => self.emit_sdivmod(name, 4, scr, false),
+            "__shl_u8" => self.emit_shift_body(name, 1, scr, ir::BinOp::Shl),
+            "__shl_u16" => self.emit_shift_body(name, 2, scr, ir::BinOp::Shl),
+            "__shl_u32" => self.emit_shift_body(name, 4, scr, ir::BinOp::Shl),
+            "__lshr_u8" => self.emit_shift_body(name, 1, scr, ir::BinOp::LShr),
+            "__lshr_u16" => self.emit_shift_body(name, 2, scr, ir::BinOp::LShr),
+            "__lshr_u32" => self.emit_shift_body(name, 4, scr, ir::BinOp::LShr),
+            "__ashr_i8" => self.emit_shift_body(name, 1, scr, ir::BinOp::AShr),
+            "__ashr_i16" => self.emit_shift_body(name, 2, scr, ir::BinOp::AShr),
+            "__ashr_i32" => self.emit_shift_body(name, 4, scr, ir::BinOp::AShr),
+            other => panic!("isel-pic18: no recipe for runtime routine {other}"),
+        }
+    }
 }
 
 /// The classic iterative dominator sets for a function's CFG: `doms[b]` is
@@ -1371,6 +1671,26 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // pointer emitters consume it via `Gen::resolved_for`.
     let resolved = resolve_pointers(m);
     for f in &m.funcs {
+        // P6: a runtime routine (or its `_isr` copy) emits its recipe body
+        // directly — its entry block holds only the `__scr` alloca, which
+        // the generic block emitter would render as an empty label
+        // (silently falling through into the next function). Every other
+        // function takes the ordinary path.
+        if ir::is_runtime_routine(&f.name) {
+            let mut g = Gen {
+                m,
+                addrs,
+                resolved: &resolved,
+                retval_lo: common_lo,
+                bsr: None,
+                cur_func: &f.name,
+                tmp: &mut tmp,
+                out: Vec::new(),
+            };
+            g.emit_routine();
+            out.extend(g.out);
+            continue;
+        }
         let mut g = Gen {
             m,
             addrs,

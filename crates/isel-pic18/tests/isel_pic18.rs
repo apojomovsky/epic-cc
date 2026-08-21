@@ -112,6 +112,54 @@ fn load_and_store_i8_use_movff() {
     assert!(asm.contains("MOVFF 0x012, 0x011"), "store %1 to out:\n{asm}");
 }
 
+/// Build a module with a runtime routine (name, param widths, __scr size)
+/// plus a main that calls it, so the recipe-emission path is exercised
+/// through `select` exactly as legalize's injected modules reach it.
+#[test]
+fn mul_u8_recipe_uses_hardware_mulwf() {
+    // The P6 headline: the u8 mul is ONE MULWF (W x f -> PRODH:PRODL), no
+    // shift-add loop.
+    let m = parse(
+        "fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__mul_u8::a", 0x20), ("__mul_u8::b", 0x21), ("__mul_u8::__scr", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("MULWF"), "the u8 mul must use hardware MULWF:\n{asm}");
+    assert!(!asm.contains("RLF"), "no shift-add loop on PIC18:\n{asm}");
+}
+
+#[test]
+fn runtime_u16_mul_uses_schoolbook_partials() {
+    let m = parse(
+        "fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__mul_u16::a", 0x20), ("__mul_u16::b", 0x22), ("__mul_u16::__scr", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    // P00 (shift 0), P01 + P10 (shift 8) contribute to the low 16 bits;
+    // P11 (shift 16) is dropped. So exactly 3 hardware MULWF partials.
+    assert_eq!(asm.matches("MULWF").count(), 3, "schoolbook partials, P11 dropped:\n{asm}");
+}
+
+#[test]
+fn udiv_u16_recipe_emits_restoring_loop() {
+    let m = parse(
+        "fn __udiv_u16(i16) (num=i16, den=i16)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__udiv_u16::num", 0x20), ("__udiv_u16::den", 0x22), ("__udiv_u16::__scr", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("RLCF").count(), 4, "16 iterations, num+rem shift:\n{asm}");
+    assert_eq!(asm.matches("DECFSZ").count(), 1, "loop counter:\n{asm}");
+}
+
 #[test]
 fn load_and_store_i16_copy_both_bytes_low_then_high() {
     let m = parse("global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @in\n    store i16 %1 @out\n    ret void\n");
