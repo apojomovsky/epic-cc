@@ -12,8 +12,8 @@ pub struct CallGraph {
 pub fn build(m: &Module) -> CallGraph {
     // Adjacency: caller -> callees, seeded with every function name so that
     // naked functions (which may contain only `asm` and no calls) remain
-    // nodes for the depth check. `Inst::Asm` is intentionally ignored here —
-    // it carries no call edge — and falls through the `if let Call` below
+    // nodes for the depth check. `Inst::Asm` is intentionally ignored here,
+    // it carries no call edge, and falls through the `if let Call` below
     // (equivalent to `_ => continue`). No overlay layout change.
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     let mut edges: Vec<(String, String)> = Vec::new();

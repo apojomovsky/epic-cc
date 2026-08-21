@@ -666,7 +666,7 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         Inst::FloatBin(b) => Some((b.dst.clone(), 4)),
         Inst::Fcmp(c) => Some((c.dst.clone(), 1)),
         Inst::FloatConv(c) => Some((c.dst.clone(), c.to.bytes())),
-        // Asm is opaque verbatim — defines no SSA value needing a RAM slot.
+        // Asm is opaque verbatim, defines no SSA value needing a RAM slot.
         Inst::Asm(_) => None,
     }
 }
