@@ -215,3 +215,62 @@ fn ptr_probe_c_runs_correctly() {
     assert_eq!(p.ram()[globals["out"] as usize], 20, "out == table[1] == 20 for in == 1");
     assert!(p.halted());
 }
+
+// P6 end-to-end acceptance: i32 (`long`) arithmetic, hardware-multiply
+// routine recipes, and the ISR-context routine duplication. Fixtures are
+// byte-identical to PIC14's; expected values come from the PIC14 e2e tests
+// of the same C source (crates/driver/tests/{long,muldiv,interrupt_mul}_e2e.rs).
+
+#[test]
+fn long_c_runs_correctly() {
+    // Mirrors crates/driver/tests/long_e2e.rs: in = 0x12345678, sin = -19
+    // -> out = 0x1634943A (the whole i32 surface: add/mul/udiv/urem/sdiv/
+    // srem/shifts/icmps/casts/struct-byval-sret).
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/long.c"));
+    p.ram_mut()[globals["in"] as usize] = 0x78; // 0x12345678
+    p.ram_mut()[globals["in"] as usize + 1] = 0x56;
+    p.ram_mut()[globals["in"] as usize + 2] = 0x34;
+    p.ram_mut()[globals["in"] as usize + 3] = 0x12;
+    p.ram_mut()[globals["sin"] as usize] = 0xED; // -19 = 0xFFFFFFED
+    p.ram_mut()[globals["sin"] as usize + 1] = 0xFF;
+    p.ram_mut()[globals["sin"] as usize + 2] = 0xFF;
+    p.ram_mut()[globals["sin"] as usize + 3] = 0xFF;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0x3A, "out == 0x1634943A, byte 0:\n{}", p.ram()[globals["out"] as usize]);
+    assert_eq!(p.ram()[globals["out"] as usize + 1], 0x94);
+    assert_eq!(p.ram()[globals["out"] as usize + 2], 0x34);
+    assert_eq!(p.ram()[globals["out"] as usize + 3], 0x16);
+    assert!(p.halted());
+}
+
+#[test]
+fn muldiv_c_runs_correctly() {
+    // Mirrors crates/driver/tests/muldiv_e2e.rs: in = 301 -> out = 210.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/muldiv.c"));
+    p.ram_mut()[globals["in"] as usize] = 0x2D; // 301 = 0x012D, lo byte
+    p.ram_mut()[globals["in"] as usize + 1] = 0x01; // hi byte
+    p.run(500_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 210, "out == hand-computed 210");
+    assert!(p.halted());
+}
+
+#[test]
+fn interrupt_mul_pic18_c_runs_correctly() {
+    // Mirrors crates/driver/tests/interrupt_mul_e2e.rs: main and the ISR
+    // both multiply/divide, so both contexts reach the injected __mul_u8
+    // and __udiv_u8 routines; the _isr copies must have disjoint frames.
+    let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/interrupt_mul_pic18.c"));
+    p.ram_mut()[globals["in_a"] as usize] = 47;
+    p.ram_mut()[globals["in_b"] as usize] = 5;
+    p.ram_mut()[globals["isr_a"] as usize] = 0xAB;
+    p.ram_mut()[globals["isr_b"] as usize] = 3;
+    p.run(1_000_000);
+    // main's context: 47 * 5 = 235 (0xEB), 47 / (5|1) = 47/5 = 9.
+    assert_eq!(p.ram()[globals["out"] as usize], 235, "main mul");
+    assert_eq!(p.ram()[globals["out_q"] as usize], 9, "main div");
+    // The ISR is never fired here (the PIC14 e2e does not fire it either:
+    // it asserts the two routine frames are disjoint, which is what makes
+    // a mid-routine clobber impossible), so the ISR globals stay untouched.
+    assert_eq!(p.ram()[globals["isr_out"] as usize], 0, "ISR frame disjoint from main's");
+    assert!(p.halted());
+}

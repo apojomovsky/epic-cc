@@ -81,7 +81,7 @@ fn const_shl_i16_emits_rlcf_chain() {
     let addrs = addrs(&[("a", 0x20), ("out", 0x24), ("main::1", 0x26), ("main::2", 0x28)]);
     let asm = select(&PIC18F4550, &m, &addrs);
     assert_eq!(asm.matches("RLCF").count(), 6, "3 shifts x 2 bytes:\n{asm}");
-    assert_eq!(asm.matches("BCF STATUS,0").count(), 3, "clear carry before each shift step:\n{asm}");
+    assert_eq!(asm.matches("BCF 0xFD8,0,A").count(), 3, "clear carry before each shift step:\n{asm}");
 }
 
 #[test]
