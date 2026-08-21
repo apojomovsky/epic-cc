@@ -22,7 +22,13 @@ use std::path::Path;
 use std::process::Command;
 
 fn main() {
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    let has_device_flag = argv.iter().any(|a| a == "--device");
+    if !has_device_flag {
+        let env_device = std::env::var("PIC8_DEVICE").unwrap_or_else(|_| "p16f877a".to_string());
+        argv.push("--device".to_string());
+        argv.push(env_device);
+    }
     let cli = match cli::parse_args(&argv) {
         Ok(c) => c,
         Err(msg) => {
@@ -31,12 +37,16 @@ fn main() {
         }
     };
 
-    let device = match cli.device.as_str() {
+    let lower = cli.device.to_ascii_lowercase();
+    let device = match lower.as_str() {
         "p16f877a" => &device::PIC16F877A,
         "p18f4550" => &device::PIC18F4550,
-        other => {
-            eprintln!("epic-cc: unknown device {other} (expected p16f877a or p18f4550)");
-            std::process::exit(2);
+        _ => {
+            eprintln!(
+                "epic-cc: unknown device {} (expected p16f877a or p18f4550)",
+                cli.device
+            );
+            std::process::exit(1);
         }
     };
 
