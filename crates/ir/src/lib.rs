@@ -89,6 +89,9 @@ pub enum FloatConvOp { FpToSi, FpToUi, SiToFp, UiToFp, Fpext, Fptrunc }
 #[derive(Clone, Debug, PartialEq)]
 pub struct FloatConv { pub dst: String, pub op: FloatConvOp, pub from: Ty, pub val: Val, pub to: Ty }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asm { pub template: String, pub clobbers_memory: bool }
+
 #[derive(Clone, Debug)]
 pub enum Inst {
     Load(Load),
@@ -111,6 +114,7 @@ pub enum Inst {
     FloatBin(FloatBin),
     Fcmp(Fcmp),
     FloatConv(FloatConv),
+    Asm(Asm),
 }
 
 #[derive(Clone, Debug)]
@@ -131,13 +135,14 @@ pub struct Func {
     /// position). Serialized as a `[isr]` marker between the ret group and
     /// the params group: `fn isr(void) [isr] ()`.
     pub isr: bool,
+    pub naked: bool,
 }
 
 #[derive(Clone, Debug)]
 pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u16, pub bytes: Vec<u8>, pub addr: Option<u16> }
 
 #[derive(Clone, Debug)]
-pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func> }
+pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func>, pub module_asm: Vec<String> }
 
 /// True for the legalize-injected runtime routines (the mul/div/rem/shift
 /// and soft-float recipe bodies), including the interrupt-context `_isr`
@@ -208,6 +213,9 @@ fn param_str(p: &Param) -> String {
 
 pub fn serialize(m: &Module) -> String {
     let mut out = String::new();
+    for entry in &m.module_asm {
+        out.push_str(&format!("module_asm \"{}\"\n", escape_asm(entry)));
+    }
     for g in &m.globals {
         let kind = if g.is_const { "const" } else { "global" };
         match g.addr { Some(a) => out.push_str(&format!("{kind} {} {} @0x{a:02X}\n", g.name, ty_str(g.ty))), None => out.push_str(&format!("{kind} {} {}\n", g.name, ty_str(g.ty))) }
@@ -215,8 +223,10 @@ pub fn serialize(m: &Module) -> String {
     for f in &m.funcs {
         let ret = match f.ret { Some(t) => ty_str(t), None => "void".to_string() };
         let params: Vec<String> = f.params.iter().map(param_str).collect();
-        let marker = if f.isr { " [isr]" } else { "" };
-        out.push_str(&format!("fn {}({ret}){marker} ({})\n", f.name, params.join(", ")));
+        let mut markers = String::new();
+        if f.isr { markers.push_str(" [isr]"); }
+        if f.naked { markers.push_str(" [naked]"); }
+        out.push_str(&format!("fn {}({ret}){} ({})\n", f.name, markers, params.join(", ")));
         for b in &f.blocks {
             out.push_str(&format!("  block {}:\n", b.label));
             for i in &b.insts {
@@ -225,6 +235,64 @@ pub fn serialize(m: &Module) -> String {
         }
     }
     out
+}
+
+fn escape_asm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_asm(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some('n') => out.push('\n'),
+                Some(other) => { out.push('\\'); out.push(other); }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Extract the inner content of the first quoted string in `s` (starting at
+/// the first `"`), handling `\"` and `\\` escapes, and return (unescaped
+/// content, byte index after the closing `"`).
+fn parse_quoted_unescaped(s: &str) -> (String, usize) {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'"').expect("missing opening quote");
+    let mut i = start + 1;
+    let mut escaped = false;
+    let mut end = None;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            end = Some(i);
+            break;
+        }
+        i += 1;
+    }
+    let closing = end.expect("unterminated quoted string");
+    let raw_inner = &s[start + 1..closing];
+    (unescape_asm(raw_inner), closing + 1)
 }
 
 fn ty_str(t: Ty) -> String { match t { Ty::I1 => "i1".into(), Ty::I8 => "i8".into(), Ty::I16 => "i16".into(), Ty::I32 => "i32".into(), Ty::F32 => "float".into() } }
@@ -270,9 +338,15 @@ fn inst_str(i: &Inst) -> String {
         Inst::FloatBin(b) => format!("%{} = {} float {} {}", b.dst, fbinop_str(b.op), val_str(&b.a), val_str(&b.b)),
         Inst::Fcmp(c) => format!("%{} = fcmp {} float {} {}", c.dst, c.pred, val_str(&c.a), val_str(&c.b)),
         Inst::FloatConv(c) => format!("%{} = {} {} {} to {}", c.dst, fconvop_str(c.op), ty_str(c.from), val_str(&c.val), ty_str(c.to)),
+        Inst::Asm(a) => {
+            if a.clobbers_memory {
+                format!("asm \"{}\" memory", escape_asm(&a.template))
+            } else {
+                format!("asm \"{}\"", escape_asm(&a.template))
+            }
+        }
     }
 }
-
 fn fbinop_str(o: FBinOp) -> &'static str {
     match o {
         FBinOp::FAdd => "fadd",
@@ -337,11 +411,17 @@ fn matching_paren(s: &str, open: usize) -> usize {
 pub fn parse(text: &str) -> Module {
     let mut globals = Vec::new();
     let mut funcs = Vec::new();
+    let mut module_asm = Vec::new();
     let mut cur_func: Option<Func> = None;
     let mut cur_block: Option<Block> = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() { continue; }
+        if line.starts_with("module_asm ") {
+            let (decoded, _) = parse_quoted_unescaped(line);
+            module_asm.push(decoded);
+            continue;
+        }
         if let Some(rest) = line.strip_prefix("global ").or_else(|| line.strip_prefix("const ")) {
             let is_const = line.starts_with("const ");
             let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -358,21 +438,34 @@ pub fn parse(text: &str) -> Module {
             let ret_str = rest[open + 1..ret_close].trim();
             let after = &rest[ret_close + 1..];
             let p_open = after.find('(').expect("fn header must have a params group: fn <name>(<ret>) (<params>)");
-            // the optional `[isr]` marker lives between the ret group and
-            // the params group
-            let isr = after[..p_open].contains("[isr]");
+            // the optional `[isr]` and `[naked]` markers live between the ret group and
+            // the params group, in any order
+            let before_params = &after[..p_open];
+            let isr = before_params.contains("[isr]");
+            let naked = before_params.contains("[naked]");
             let p_close = matching_paren(after, p_open);
             let p_str = &after[p_open + 1..p_close];
-            let ret = if ret_str == "void" { None } else { Some(parse_ty(ret_str)) };
+            let ret = if ret_str == "void" || ret_str.is_empty() { None } else { Some(parse_ty(ret_str)) };
             let params = if p_str.trim().is_empty() { vec![] } else {
                 p_str.split(',').map(parse_param).collect()
             };
             if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
             if let Some(f) = cur_func.take() { funcs.push(f); }
-            cur_func = Some(Func { name, ret, params, blocks: Vec::new(), isr });
-        } else if line.starts_with("block ") {
+            cur_func = Some(Func { name, ret, params, blocks: Vec::new(), isr, naked });
+        } else if line == "}" || line == "{" {
+            continue;
+        } else if line.ends_with(':') {
+            // Support both `block foo:` (canonical) and `foo:` (brace-style test
+            // input from CC-4 Task 1). The brace style is e.g. `entry:` inside
+            // `fn foo() [naked] () { entry: asm ... }`.
             if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
-            let label = line["block ".len()..].trim_end_matches(':').to_string();
+            let raw = line.trim_end_matches(':').trim();
+            let label = if let Some(rest) = raw.strip_prefix("block ") {
+                rest.trim().to_string()
+            } else {
+                raw.to_string()
+            };
+            if label.is_empty() { continue; }
             cur_block = Some(Block { label, insts: Vec::new() });
         } else {
             let inst = parse_inst(line);
@@ -385,7 +478,7 @@ pub fn parse(text: &str) -> Module {
     }
     if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
     if let Some(f) = cur_func.take() { funcs.push(f); }
-    Module { globals, funcs }
+    Module { globals, funcs, module_asm }
 }
 
 fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "float" | "f32" => Ty::F32, other => panic!("unsupported type {other}") } }
@@ -478,6 +571,17 @@ fn parse_gep_expr(rest: &str) -> (GepBase, u8, Vec<(u8, String)>) {
 }
 
 fn parse_inst(line: &str) -> Inst {
+    // CC-4 opaque asm: `asm "template"` or `asm "template" memory` (with
+    // escaping \" \\ \n handled via parse_quoted_unescaped).
+    if line.starts_with("asm ") {
+        let (template, after_idx) = parse_quoted_unescaped(line);
+        let after = line[after_idx..].trim();
+        let clobbers_memory = after.split_whitespace().any(|t| t == "memory");
+        return Inst::Asm(Asm { template, clobbers_memory });
+    }
+    if line == "ret" {
+        return Inst::Ret(None);
+    }
     if let Some(rest) = line.strip_prefix("memcpy ") {
         let mut it = rest.split_whitespace();
         let dst = parse_val(it.next().unwrap());
