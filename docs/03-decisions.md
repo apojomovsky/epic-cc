@@ -16,6 +16,7 @@ one-line index entry here, e.g.:
 - ADR-015 — PIC18 soft-float: port of PIC14 recipes, 2026-08-20
 - ADR-016 — PIC18 fuzz gate: device-threaded differential runner, 2026-08-21
 - ADR-017: CC-4 inline assembly: naked, module asm, opaque blocks, header intrinsics, 2026-08-21
+- ADR-018: CC-2 freestanding libc: stdint/stdbool/stddef headers + a linked-on-demand string.h, 2026-08-21
 ---
 
 ## ADR-001 — clang as an out-of-process front end; custom PIC14 backend

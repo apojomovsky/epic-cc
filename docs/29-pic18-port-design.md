@@ -311,6 +311,12 @@ closed in `isel-pic18` (P6/P7's routines already covered the float/signed
 surface; the `0x0000` Bin `k - a` borrow flag fix is the only new isel
 change in this phase).
 
+**CC-2 note (2026-08-21, ADR-018).** The freestanding `string.h` is the
+first consumer to hand a callee an opaque runtime pointer, which lifts
+the plain-pointer-param boundary ADR-009 item 6 recorded: such a slot
+now resolves and is read through the existing indirect FSR0 helpers,
+the same way an `sret` slot always was.
+
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely
 additive and the PIC14 backend can never regress silently.

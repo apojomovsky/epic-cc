@@ -210,10 +210,9 @@ impl<'m> Gen<'m> {
         let key = ssa_key(self.cur_func, r);
         self.resolved.get(&key).cloned().unwrap_or_else(|| {
             panic!(
-                "isel-pic18: pointer %{r} ({key}) has no resolved base; a plain \
-                 (non-byval, non-sret) pointer parameter dereferenced directly is not \
-                 yet supported (P3 scope: only globals, allocas, and byval/sret params \
-                 resolve, see ADR-009)"
+                "isel-pic18: pointer %{r} ({key}) has no resolved base; only globals, \
+                 allocas, byval/sret params, plain pointer params and gep chains off \
+                 them resolve (see ADR-009, extended by ADR-018)"
             )
         })
     }
