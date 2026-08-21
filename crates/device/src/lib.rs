@@ -40,7 +40,7 @@ pub const PIC16F877A: Device = Device {
     interrupt_vectors: &[0x0004],
 };
 
-/// The PIC18F2455/2550/4455/4550 family (the 4550 profile specifically  - 
+/// The PIC18F2455/2550/4455/4550 family (the 4550 profile specifically
 /// the others share the core with less flash/RAM).
 pub const PIC18F4550: Device = Device {
     name: "p18f4550",

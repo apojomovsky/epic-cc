@@ -60,7 +60,7 @@ impl<'m> Gen<'m> {
 
     /// Emit a label line AND reset the tracked `BSR` (`self.bsr = None`).
     /// Every label in this file  -  a real block label, a fresh
-    /// `Select`/`Icmp` branch target, or a synthesized phi-copy label  - 
+    /// `Select`/`Icmp` branch target, or a synthesized phi-copy label
     /// is a place code from more than one preceding path can land, and
     /// each of those paths may have executed a different subset of the
     /// `MOVLB`s that led here (or none at all). `operand()`'s `MOVLB`
@@ -1081,7 +1081,7 @@ impl<'m> Gen<'m> {
         self.emit_cmp_branch(&a, &b, 1, pred, &l_true, &l_false, &l_check_low);
         self.emit_label(&l_check_low);
         // Low byte, unsigned tie-break. Here "equal" means the two
-        // 16-bit values are fully identical, so  -  unlike the high byte  - 
+        // 16-bit values are fully identical, so  -  unlike the high byte
         // it DOES have a final answer: true for the non-strict tie-break
         // predicates (`ule`/`uge`), false for the strict ones
         // (`ult`/`ugt`).
@@ -4013,7 +4013,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     // can be inlined directly along that edge's own path,
                     // with no intermediate copy-block indirection needed.
                     match (t_copies, f_copies) {
-                        // Plain branch, no phi consumers on either edge  - 
+                        // Plain branch, no phi consumers on either edge
                         // exactly Task 12's original (correct) shape.
                         (None, None) => {
                             g.emit(format!("    BZ {lf}"));
