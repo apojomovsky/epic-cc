@@ -1,9 +1,9 @@
 // Milestone-15 soft-float acceptance: a straight-line program exercising
-// the whole float surface — an fdiv call through a noinline helper (half),
+// the whole float surface  -  an fdiv call through a noinline helper (half),
 // fadd, fmul, the fptosi + sitofp int round trip, the fcmp `olt`
-// predicate, the RNE case 1.0f/3.0f (0x3EAAAAAB — the load-bearing
+// predicate, the RNE case 1.0f/3.0f (0x3EAAAAAB  -  the load-bearing
 // rounding check), and a struct with a float member via sret (mk) and
-// byval (pick) — compiles through the whole driver pipeline and runs
+// byval (pick)  -  compiles through the whole driver pipeline and runs
 // correctly in the simulator.
 //
 // Shape notes (clang -O1 folds aggressively):
@@ -21,18 +21,18 @@
 //     0x3EAAAAAB, stored into the struct.
 //   - The round trip `(float)(int)((a + 0.25f) * 3.0f)` merges the fadd,
 //     the fmul and both conversions into one observed value (out2): the
-//     add and mul are exact (3.25, 9.75 — any >= 1 ulp error changes the
+//     add and mul are exact (3.25, 9.75  -  any >= 1 ulp error changes the
 //     truncation to a different integer), and the fptosi sees a genuinely
 //     fractional value. The exact add/mul VALUES are pinned bit-for-bit by
 //     the Task-3 SIM tests; this step pins the end-to-end chain.
 //   - `struct_step` is the struct surface: `mk` (sret) builds
 //     `{c, f} = {(unsigned char)(a < 0.75f), 1.0f / a}` into a local
-//     struct; `pick` (byval) returns `s.c ? 0.0f : s.f` — an i8 icmp +
+//     struct; `pick` (byval) returns `s.c ? 0.0f : s.f`  -  an i8 icmp +
 //     float select with NO float arithmetic, so struct_step's frame sits
 //     outside the routine-slot chain. The flag is FALSE for a = 3.0
 //     (`fcmp olt` with the brief's operand order), so pick selects s.f:
 //     the fcmp result (via c), the fdiv RNE result (via f) and the
-//     sret/byval byte copies all flow into out3 — any one broken changes
+//     sret/byval byte copies all flow into out3  -  any one broken changes
 //     out3 from 0x3EAAAAAB.
 //   - Frame budget (bank 0 GPR 0x20-0x6F): globals end at 0x30; main's 11
 //     defs (33 bytes) end at 0x51; half's frame (8) ends at 0x59, and
