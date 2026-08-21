@@ -32,6 +32,12 @@ crates="$(cargo metadata --no-deps --format-version 1 2>/dev/null \
   exit 2
 }
 
+# The workspace must stay rustfmt-clean; the baseline was swept in #63.
+if ! cargo fmt --check >/dev/null 2>&1; then
+  echo "::error::workspace is not rustfmt-clean; run 'make fmt' inside the dev container" >&2
+  exit 1
+fi
+
 if [ -z "$crates" ]; then
   echo "::error::no workspace crates found" >&2
   exit 2
