@@ -239,19 +239,164 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // fallback with independent per-bank cursors runs below (`.or_else(...)`)
     // before giving up.
     let mut const_globals: HashSet<String> = HashSet::new();
-    let mut non_const: Vec<&ir::Global> = Vec::new();
+    let mut fixed: Vec<(String, u16, u16)> = Vec::new(); // (name, addr, size)
+    let mut floating: Vec<&ir::Global> = Vec::new();
     for g in &m.globals {
         if g.is_const {
             const_globals.insert(g.name.clone());
         } else {
             assert!(g.size <= 255, "alloc: RAM global @{} too large ({} bytes; RAM is byte-addressed, max 255)", g.name, g.size);
-            non_const.push(g);
+            if let Some(a) = g.addr {
+                fixed.push((g.name.clone(), a, g.size));
+            } else {
+                floating.push(g);
+            }
         }
     }
-    let globals: HashMap<String, u16> = try_place_globals_sequential(device, &non_const)
-        .or_else(|| place_globals_bin_packed(device, &non_const))
+    // Floating globals are placed with the same sequential -> bin-pack
+    // strategy as before, but pinned addresses are respected and the
+    // sequential cursor is bumped past any overlap.
+    let mut globals: HashMap<String, u16> = HashMap::new();
+    for (name, addr, _) in &fixed {
+        globals.insert(name.clone(), *addr);
+    }
+    let floating_map: HashMap<String, u16> = if floating.is_empty() {
+        HashMap::new()
+    } else {
+        // Sort fixed by address for overlap checks.
+        fixed.sort_by_key(|(_, a, _)| *a);
+        let try_float = |addr_start: u16| -> Option<HashMap<String, u16>> {
+            let mut out = HashMap::new();
+            let mut addr = addr_start;
+            // Bump past any fixed that covers the start.
+            for (_, fa, fs) in &fixed {
+                if addr >= *fa && addr < *fa + *fs {
+                    addr = *fa + *fs;
+                }
+            }
+            for g in &floating {
+                let width = g.size as u8;
+                // If the next placement would overlap a fixed region, bump
+                // past it before asking try_place_at.
+                let mut candidate = addr;
+                loop {
+                    let mut bumped = false;
+                    for (_, fa, fs) in &fixed {
+                        if candidate < *fa + *fs && candidate + u16::from(width) > *fa && candidate >= *fa && candidate < *fa + *fs {
+                            candidate = *fa + *fs;
+                            bumped = true;
+                            break;
+                        }
+                        // Also catch the case where the placed range would
+                        // straddle into a fixed region that starts inside it.
+                        if candidate < *fa && candidate + u16::from(width) > *fa {
+                            // Overlaps the start of a fixed region; bump if
+                            // there is overlap, but respect alignment: just
+                            // move candidate past the fixed region and retry.
+                            candidate = *fa + *fs;
+                            bumped = true;
+                            break;
+                        }
+                    }
+                    if !bumped {
+                        break;
+                    }
+                }
+                let start = try_place_at(device, candidate, width)?;
+                // Final overlap check: the aligned placement from
+                // try_place_at may have landed inside a fixed region.
+                let mut start = start;
+                loop {
+                    let mut overlap = None;
+                    for (_, fa, fs) in &fixed {
+                        if start < *fa + *fs && start + u16::from(width) > *fa {
+                            overlap = Some(*fa + *fs);
+                            break;
+                        }
+                    }
+                    if let Some(next) = overlap {
+                        start = try_place_at(device, next, width)?;
+                    } else {
+                        break;
+                    }
+                }
+                out.insert(g.name.clone(), start);
+                addr = start + u16::from(width);
+                // Bump addr past any fixed that it now sits inside.
+                for (_, fa, fs) in &fixed {
+                    if addr > *fa && addr <= *fa + *fs {
+                        addr = *fa + *fs;
+                    }
+                }
+            }
+            Some(out)
+        };
+        let seq = {
+            let mut start = device.gpr_start();
+            for (_, fa, fs) in &fixed {
+                if start >= *fa && start < *fa + *fs {
+                    start = *fa + *fs;
+                }
+            }
+            try_float(start)
+        };
+        seq.or_else(|| {
+            // Bin-pack fallback: build cursors that skip fixed-occupied
+            // bytes. For the small fixtures in this repo the sequential
+            // path suffices; this path is kept correct for completeness.
+            let mut cursors: Vec<BankCursor> = device
+                .ram_banks
+                .iter()
+                .map(|&(s, e)| BankCursor { end: e, next_free: s })
+                .collect();
+            // Advance each cursor past any fixed that lies at its start.
+            for c in &mut cursors {
+                for (_, fa, fs) in &fixed {
+                    if c.next_free >= *fa && c.next_free < *fa + *fs {
+                        c.next_free = *fa + *fs;
+                    }
+                }
+            }
+            let mut order: Vec<&ir::Global> = floating.clone();
+            order.sort_by(|a, b| b.size.cmp(&a.size));
+            let mut out = HashMap::new();
+            for g in order {
+                let width = g.size as u8;
+                let align = width.min(2);
+                let mut placed = None;
+                for cursor in cursors.iter_mut() {
+                    let mut base = cursor.next_free;
+                    if base % u16::from(align) != 0 {
+                        base += u16::from(align) - (base % u16::from(align));
+                    }
+                    // Skip fixed overlap inside this bank.
+                    let mut bumped = true;
+                    while bumped {
+                        bumped = false;
+                        for (_, fa, fs) in &fixed {
+                            if base < *fa + *fs && base + u16::from(width) > *fa {
+                                base = *fa + *fs;
+                                if base % u16::from(align) != 0 {
+                                    base += u16::from(align) - (base % u16::from(align));
+                                }
+                                bumped = true;
+                                break;
+                            }
+                        }
+                    }
+                    if base + u16::from(width) - 1 <= cursor.end {
+                        cursor.next_free = base + u16::from(width);
+                        placed = Some(base);
+                        break;
+                    }
+                }
+                out.insert(g.name.clone(), placed?);
+            }
+            Some(out)
+        })
         .unwrap_or_else(|| {
-            let demand: u32 = non_const.iter().map(|g| u32::from(g.size)).sum();
+            let demand: u32 = floating.iter().map(|g| u32::from(g.size)).sum::<u32>()
+                + fixed.iter().map(|(_, _, s)| u32::from(*s)).sum::<u32>();
             let capacity: u32 =
                 device.ram_banks.iter().map(|&(s, e)| u32::from(e) - u32::from(s) + 1).sum();
             let bank_count = device.ram_banks.len();
@@ -259,10 +404,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 "alloc: no arrangement of {} global(s) fits {}'s {bank_count} GPR bank window(s) \
                  (total demand {demand} bytes, total capacity {capacity} bytes — no arrangement this \
                  allocator tries, sequential then largest-first bin-packing, fits)",
-                non_const.len(),
+                floating.len() + fixed.len(),
                 device.name,
             );
-        });
+        })
+    };
+    globals.extend(floating_map);
 
     // end_of_globals = max over the address map of (addr + width), floored at
     // the device's GPR start (mirrors isel's layout computation). The
