@@ -250,7 +250,7 @@ not a judgement.
 | **P5** | **DONE** Interrupts: single-vector compatibility mode (IPEN=0), one handler at `0x0008` (see the P5 note and ADR-013). | `interrupt_pic18.c`, `interrupt_gate_pic18.c`; `interrupt_mul.c` joins P6 (it needs `*`/`/`) |
 | **P6** | **DONE** 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c`, `interrupt_mul_pic18.c` |
 | **P7** | **DONE** Soft-float: nine f32 routines via `MULWF`/`TBLRD`/`isr` save area. | `float.c` (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) |
-| **P8** | Point the differential fuzzer at PIC18. | the seed corpora run clean |
+| **P8** | **DONE** Fuzz gate: device-threaded differential runner on PIC18. | `pic18.rs` fast (8) and full corpora (200, 50, 50) clean on `Pic18` via `--device` |
 
 **P3 note (2026-08-20):** landed per
 [`docs/superpowers/plans/2026-08-20-pic18-port-p3.md`](superpowers/plans/2026-08-20-pic18-port-p3.md).
@@ -298,6 +298,19 @@ simulator with a `gpasm -p p18f4550` byte-for-byte cross-check. The
 recipes are a 1:1 port of PIC14's verified ieee754 bodies with the
 substitution table (RLF to RLCF, STATUS to 0xFD8, etc.); the frame rule is
 every routine slot at `<=0x5F` (access-bank GPR, no MOVLB in skip windows).
+
+**P8 note (2026-08-21):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p8.md`](superpowers/plans/2026-08-20-pic18-port-p8.md)
+(ADR-016). The differential fuzzer is threaded for PIC18: `run_differential`
+and `run_ir_differential` take a `&Device`, `run_pic`/`pic_layout`/`run_ir_pic`
+dispatch `Pic18` + `parse_hex_pic18` + 4096-byte RAM vs `Pic14`, driver
+gains `--device`/`PIC8_DEVICE`, and `crates/fuzz/tests/pic18.rs` gates the
+same seeded corpora (integer 0..200, float 0..50, signed 0..50) on PIC18
+with the same clean guarantee as PIC14. Gaps surfaced by the corpus are
+closed in `isel-pic18` (P6/P7's routines already covered the float/signed
+surface; the `0x0000` Bin `k - a` borrow flag fix is the only new isel
+change in this phase).
+
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely
 additive and the PIC14 backend can never regress silently.
