@@ -176,7 +176,8 @@ impl<'m> Gen<'m> {
                 }
             }
         }
-        panic!("isel-pic18: no def width for %{reg} in {}", self.cur_func)
+        panic!("isel-pic18: no def width for %{reg} in {}", self.cur_func);
+    }
     /// Parse a literal-pointer operand (`"0x<K>"`, the `inttoptr` form
     /// irparse produces) into a full 12-bit physical data-space address.
     /// A literal pointer is either an access-bank GPR address (`0x000-

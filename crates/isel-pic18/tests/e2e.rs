@@ -200,6 +200,9 @@ fn const_table_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize + 1] = 0x01; // hi byte
     p.run(500_000);
     assert_eq!(p.ram()[globals["out"] as usize], 0x82, "out == 0x82 for in == 290 (four boundary reads)");
+    assert!(p.halted());
+}
+
 // P5 end-to-end acceptance: interrupts. The fixtures are byte-identical to
 // PIC14's except for the SFR addresses (PORTB 0x06 -> 0xF81, INTCON 0x0B
 // -> 0xFF2), so the expected values come from the PIC14 e2e tests of the
@@ -259,6 +262,10 @@ fn ptr_probe_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize] = 1; // in = 1 (16-bit; hi byte zero by default)
     p.run(200_000);
     assert_eq!(p.ram()[globals["out"] as usize], 20, "out == table[1] == 20 for in == 1");
+    assert!(p.halted());
+}
+
+#[test]
 fn interrupt_gate_pic18_c_runs_correctly() {
     // Mirrors crates/driver/tests/interrupt_gate_e2e.rs: the request is
     // latched while INTCON = 0x10 (INT0IE, GIE clear), taken only after
