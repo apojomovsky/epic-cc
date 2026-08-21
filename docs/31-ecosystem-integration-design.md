@@ -440,25 +440,41 @@ pub struct FuseField {
     pub locked: Option<&'static str>,   // Some(only-legal-value) if epic-cc cannot honor an override
 }
 pub struct ConfigRegion {
-    pub base_byte_addr: u32,            // 0x400E (PIC16F877A), 0x300000 (PIC18F4550) [VERIFY]
-    pub reserved_ones: &'static [u8],   // unimplemented bits that must read 1, per datasheet
+    pub base_byte_addr: u32,             // 0x400E (PIC16F877A), 0x300000 (PIC18F4550): confirmed
+    pub reserved_mask: &'static [u8],    // bits NOT in any FuseField, per byte
+    pub reserved_value: &'static [u8],   // what those bits must read as, per byte
     pub fields: &'static [FuseField],
 }
 ```
 
+**The two devices disagree on unimplemented-bit polarity, confirmed against both datasheets.**
+PIC16F877A's unimplemented config bits read `1` (DS39582C Register 14-1: "U-0 Unimplemented
+bit, read as '1'"; erased value `3FFFh`). PIC18F4550's read `0` (DS39632E, every CONFIG
+register's legend: "U = Unimplemented bit, read as '0'"). `reserved_value` carries this
+per-device, per-byte, rather than assuming one polarity; `reserved_mask` marks which bits in
+each byte are reserved at all, since not every byte in the PIC18 config region uses all 8 bits.
+
 `EPIC_CONFIG("...")`'s string is comma-separated `key=value`, matched case-insensitively
 against the device's field table. An unrecognized field or value panics naming the offending
 token and the valid options. A field not mentioned takes its `default`. The resolved bytes are
-folded with `reserved_ones` OR'd in. epic-cc prints the resolved config bytes and the named
-setting behind each one unconditionally on success (D-4's promise; not gated behind `-v`).
+folded with `reserved_value` (masked by `reserved_mask`) OR'd in. epic-cc prints the resolved
+config bytes and the named setting behind each one unconditionally on success (D-4's promise;
+not gated behind `-v`).
 
 **`locked` is a correctness rule, not an ergonomics nicety.** `isel-pic18` only ever emits
 classic-mode PIC18 encoding. `XINST` (PIC18's extended-instruction-set config bit) must be
 modeled, since v1's fuse coverage is the full bit set per device, but `locked = Some("off")`:
 an override attempting `xinst=on` panics with the field and value, because the alternative is
 silently shipping code whose addressing-mode semantics do not match what the silicon is
-configured to execute, a miscompile, not a build error. `[VERIFY]` whether any other PIC18 or
-PIC16F877A config bit shares this hazard before assuming `XINST` is the only one.
+configured to execute, a miscompile, not a build error. **Confirmed by sweeping every field in
+both devices' bit sets against what the backend actually emits (2026-08-21, against DS39582C
+and DS39632E): `XINST` is the only one.** Everything else, pin muxing (`MCLRE`, `LVP`,
+`PBADEN`, `CCP2MX`, `DEBUG`, `ICPRT`), protection (`CP*`/`WRT*`/`EBTR*`/`CPD`/`CPB`, moot since
+epic-cc never emits `TBLWT` self-programming), reset/power timing (`WDT*`, `BOR*`, `PWRTEN`,
+`STVREN`, moot since call depth is a static compile-time check, not a hardware-stack-overflow
+dependency), and clock configuration (`FOSC*`/`PLLDIV`/`CPUDIV`/`USBDIV`/`IESO`/`FCMEN`/
+`VREGEN`, exactly what `EPIC_FOSC_HZ` exists to expose, not hide) are legitimate deployment
+choices that never interact with generated code.
 
 **Full-bit-set transcription is verified against `gpasm`, not trusted by hand alone.** Both
 config regions (roughly one word for the PIC16F877A, roughly thirteen bytes for the
@@ -472,11 +488,13 @@ process in tests, never linking it.
 **HEX emission gains a multi-region entry point; the single-region path is untouched.**
 `to_hex` (`crates/asm/src/lib.rs:561`) already writes byte addresses as `word_index * 2` inside
 one `0x04` extended-linear-address record fixed at `upper=0`. The PIC16F877A's config word sits
-at word address `0x2007`, byte address `0x400E` `[VERIFY]`, still under `0x10000`, so it needs
+at word address `0x2007`, byte address `0x400E`, confirmed against DS39582C Register 14-1
+("CONFIGURATION WORD (ADDRESS 2007h)"), still under `0x10000`, so it needs
 no new address window, only widening the `words.len() <= device.flash_words` assert
 (`:417`), which today conflates "program flash size" with "total addressable word space";
 those are different concepts once a config word lives past the program's own ceiling. The
-PIC18F4550's config bytes at byte address `0x300000+` `[VERIFY]` are outside any 16-bit window
+PIC18F4550's config bytes at byte address `0x300000` through `0x30000D`, confirmed against
+DS39632E Table 25-1, are outside any 16-bit window
 and need a second `0x04` record with `upper=0x0030`. Rather than special-case PIC18, a new
 `to_hex_regions(&[(base_byte_addr, &[u16])]) -> String` accepts a list of chunks and emits a new
 `0x04` record only when a chunk's upper 16 bits differ from the previous one; PIC14 becomes the
