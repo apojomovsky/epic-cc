@@ -579,6 +579,7 @@ impl<'m> Gen<'m> {
             }
             Inst::Bin(b) => {
                 let n = b.ty.bytes();
+
                 assert!(
                     n == 1 || n == 2 || n == 4,
                     "isel-pic18: only i8/i16/i32 Bin ops implemented (n={n})"
