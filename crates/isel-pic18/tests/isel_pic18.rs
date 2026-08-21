@@ -1496,3 +1496,233 @@ fn emits_const_tables_as_db_after_start() {
         "the db bytes must come after the label:\n{asm}"
     );
 }
+// P7 float tests: bit-exact sim per recipe (add, mul, div, cmp, conversions, RNE)
+fn f32_le(x: f32) -> [u8; 4] {
+    x.to_bits().to_le_bytes()
+}
+fn float_routine_sig(name: &str) -> (&'static str, &'static [(&'static str, &'static str)], u16) {
+    match name {
+        "__add_f32" | "__sub_f32" | "__mul_f32" => ("float", &[("a", "i32"), ("b", "i32")], 14),
+        "__div_f32" => ("float", &[("a", "i32"), ("b", "i32")], 12),
+        "__cmp_f32" => ("i8", &[("a", "i32"), ("b", "i32")], 6),
+        "__uitofp_f32" | "__sitofp_f32" => ("float", &[("val", "i32")], 8),
+        "__fptoui_f32" | "__fptosi_f32" => ("i32", &[("val", "i32")], 8),
+        other => panic!("unknown float routine {other}"),
+    }
+}
+fn float_routine_module(name: &str) -> (String, Vec<(String, u16)>) {
+    let (ret, params, scr) = float_routine_sig(name);
+    let pstr = params.iter().map(|(n, t)| format!("{n}={t}")).collect::<Vec<_>>().join(", ");
+    let ir = format!(
+        "global ina float\n\
+         global inb float\n\
+         global out {ret}\n\
+         fn {name}({ret}) ({pstr})\n\
+           block entry:\n\
+             %__scr = alloca {scr}\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load float @ina\n\
+             %y = load float @inb\n\
+             %r = call {ret} @{name}(float %x, float %y)\n\
+             store {ret} %r @out\n\
+             ret void\n"
+    );
+    let mut map = vec![
+        ("ina".to_string(), 0x20u16),
+        ("inb".to_string(), 0x24),
+        ("out".to_string(), 0x28),
+        ("main::x".to_string(), 0x2C),
+        ("main::y".to_string(), 0x30),
+        ("main::r".to_string(), 0x34),
+    ];
+    let mut base = 0x40u16;
+    for (pn, _) in params {
+        map.push((format!("{name}::{pn}"), base));
+        base += 4;
+    }
+    map.push((format!("{name}::__scr"), base));
+    (ir, map)
+}
+fn float_routine_unary_module(name: &str) -> (String, Vec<(String, u16)>) {
+    let (ret, params, scr) = float_routine_sig(name);
+    let pstr = params.iter().map(|(n, t)| format!("{n}={t}")).collect::<Vec<_>>().join(", ");
+    let ir = format!(
+        "global inv i32\n\
+         global out {ret}\n\
+         fn {name}({ret}) ({pstr})\n\
+           block entry:\n\
+             %__scr = alloca {scr}\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = load i32 @inv\n\
+             %r = call {ret} @{name}(i32 %v)\n\
+             store {ret} %r @out\n\
+             ret void\n"
+    );
+    let map = vec![
+        ("inv".to_string(), 0x20u16),
+        ("out".to_string(), 0x24),
+        ("main::v".to_string(), 0x2C),
+        ("main::r".to_string(), 0x30),
+        (format!("{name}::val"), 0x40),
+        (format!("{name}::__scr"), 0x44),
+    ];
+    (ir, map)
+}
+fn sim_run_bytes(ir_text: &str, map: &[(String, u16)], seed: &[(u16, u8)], out: u16, n: usize) -> Vec<u8> {
+    let m = ir::parse(ir_text);
+    let addrs: HashMap<String, u16> = map.iter().cloned().collect();
+    let asm = select(&PIC18F4550, &m, &addrs);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    for &(addr, val) in seed {
+        p.ram_mut()[addr as usize] = val;
+    }
+    p.run(500000);
+    (0..n).map(|i| p.ram()[(out + i as u16) as usize]).collect()
+}
+#[test]
+fn float_add_1_plus_1_is_2() {
+    let (ir, map) = float_routine_module("__add_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(1.0).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    for (i, b) in f32_le(1.0).iter().enumerate() {
+        seed.push((0x24 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+    assert_eq!(got, f32_le(2.0), "1.0+1.0=2.0");
+}
+#[test]
+fn float_sub_1_minus_0_5_is_0_5() {
+    let (ir, map) = float_routine_module("__sub_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(1.0).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    for (i, b) in f32_le(0.5).iter().enumerate() {
+        seed.push((0x24 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+    assert_eq!(got, f32_le(0.5), "1.0-0.5=0.5");
+}
+#[test]
+fn float_mul_2_times_3_is_6() {
+    let (ir, map) = float_routine_module("__mul_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(2.0).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    for (i, b) in f32_le(3.0).iter().enumerate() {
+        seed.push((0x24 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+    assert_eq!(got, f32_le(6.0), "2.0*3.0=6.0");
+}
+#[test]
+fn float_div_3_div_2_5_is_1_2() {
+    let (ir, map) = float_routine_module("__div_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(3.0).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    for (i, b) in f32_le(2.5).iter().enumerate() {
+        seed.push((0x24 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+    assert_eq!(got, f32_le(1.2), "3.0/2.5=1.2 0x3F99999A");
+}
+#[test]
+fn float_div_1_div_3_is_rne() {
+    let (ir, map) = float_routine_module("__div_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(1.0).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    for (i, b) in f32_le(3.0).iter().enumerate() {
+        seed.push((0x24 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+    assert_eq!(got, f32_le(1.0 / 3.0), "1.0/3.0=0x3EAAAAAB RNE");
+}
+#[test]
+fn float_cmp_tri_state() {
+    let cases: &[(&str, f32, f32, u8)] = &[
+        ("eq", 1.0, 1.0, 0),
+        ("lt", 1.0, 2.0, 1),
+        ("gt", 2.0, 1.0, 2),
+        ("nan", f32::NAN, 1.0, 3),
+    ];
+    for &(_, a, b, expect) in cases {
+        let (ir, map) = float_routine_module("__cmp_f32");
+        let mut seed = Vec::new();
+        for (i, by) in f32_le(a).iter().enumerate() {
+            seed.push((0x20 + i as u16, *by));
+        }
+        for (i, by) in f32_le(b).iter().enumerate() {
+            seed.push((0x24 + i as u16, *by));
+        }
+        let got = sim_run_bytes(&ir, &map, &seed, 0x28, 1);
+        let val = got[0];
+        if a.is_nan() || b.is_nan() {
+            assert_eq!(val, 3, "nan cmp should be 3, got {val}");
+        } else {
+            assert_eq!(val, expect, "cmp {a} vs {b} expected {expect} got {val}");
+        }
+    }
+}
+#[test]
+fn float_uitofp_9_is_9() {
+    let (ir, map) = float_routine_unary_module("__uitofp_f32");
+    let mut seed = Vec::new();
+    for (i, b) in 9u32.to_le_bytes().iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x24, 4);
+    assert_eq!(got, f32_le(9.0), "uitofp 9 -> 9.0");
+}
+#[test]
+fn float_sitofp_minus9_is_minus9() {
+    let (ir, map) = float_routine_unary_module("__sitofp_f32");
+    let mut seed = Vec::new();
+    for (i, b) in (-9i32).to_le_bytes().iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x24, 4);
+    assert_eq!(got, f32_le(-9.0), "sitofp -9 -> -9.0");
+}
+#[test]
+fn float_fptosi_truncates() {
+    let (ir, map) = float_routine_unary_module("__fptosi_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(9.75).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x24, 4);
+    assert_eq!(got, 9i32.to_le_bytes(), "fptosi 9.75 -> 9");
+}
+#[test]
+fn float_fptoui_truncates() {
+    let (ir, map) = float_routine_unary_module("__fptoui_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(9.75).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x24, 4);
+    assert_eq!(got, 9u32.to_le_bytes(), "fptoui 9.75 -> 9");
+}
+#[test]
+fn float_rne_0_1_plus_0_2() {
+    let (ir, map) = float_routine_module("__add_f32");
+    let mut seed = Vec::new();
+    for (i, b) in f32_le(0.1).iter().enumerate() {
+        seed.push((0x20 + i as u16, *b));
+    }
+    for (i, b) in f32_le(0.2).iter().enumerate() {
+        seed.push((0x24 + i as u16, *b));
+    }
+    let got = sim_run_bytes(&ir, &map, &seed, 0x28, 4);
+    assert_eq!(got, f32_le(0.1f32 + 0.2f32), "0.1+0.2 RNE");
+}
