@@ -91,8 +91,18 @@ Run `make pre-pr-check` before opening a PR. It is the gate; it checks:
    plan-free. The plan stays visible in the PR's commit history.
 3. Commit hygiene: conventional single-line subjects, no trailers,
    no em-dashes, no whitespace errors.
-4. Hooks installed (`make setup-hooks`).
-5. `make pre-pr-check TEST=1` also runs the full suite.
+4. **Comment and doc prose review.** `scripts/prose-diff.sh` extracts
+   every added comment block and markdown diff hunk in the PR; it
+   flags a couple of objective signals (block over 3 lines, a
+   hardcoded count or tree dump) but cannot judge content, so it never
+   fails the ritual on its own. The agent reads everything the script
+   printed against the Expression Conventions below (why not what,
+   <= 3 lines unless truly justified, no decoration or iteration
+   narrative; docs stay clear and skip volatile facts) and fixes
+   what doesn't hold up. `make pre-pr-check PROSE=1` records that the
+   review happened.
+5. Hooks installed (`make setup-hooks`).
+6. `make pre-pr-check TEST=1` also runs the full suite.
 
 The script exits 1 with the exact fix list while blocking items are
 outstanding. Don't skip it; the CI gate only covers the suite, not the
@@ -193,9 +203,16 @@ Rust's documentation comments are `///` (item docs, rendered by
 4. No bitacores: findings narratives and session logs describing
    completed work are deleted. Live gotchas live in
    `docs/09-build-environment.md` (toolchain) or the ADRs (decisions).
-5. **No test counts in the README or live docs.** They go stale on
-   every feature merge; describe mechanisms, never numbers.
-6. Third-party code keeps its own style; these rules are first-party
+5. **Write for a reader who wasn't there.** Clear, easy to follow,
+   sized to the point being made: a doc that overwhelms with detail is
+   as broken as one that omits the load-bearing fact.
+6. **No coupling to volatile facts.** Test counts, file/dir layout, a
+   pasted tree, line counts: describe mechanisms, never numbers or a
+   snapshot that goes stale on the next merge.
+7. **Diagrams earn their place.** A mermaid diagram is welcome where
+   it clarifies structure or flow that prose would belabor; skip it
+   for anything a sentence already says clearly.
+8. Third-party code keeps its own style; these rules are first-party
    only.
 
 ## Non-obvious things that will bite you
