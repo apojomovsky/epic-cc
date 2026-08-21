@@ -7,7 +7,8 @@
 //! `isel` -> `banking` -> `peephole` -> page-fit verification -> `asm`;
 //! PIC18 runs `isel-pic18` -> `asm` directly (no banking/peephole/paging).
 
-mod clang_discovery;
+use driver::clang_discovery;
+use driver::cli;
 
 use clang_discovery::resolve_clang;
 use std::collections::HashMap;
