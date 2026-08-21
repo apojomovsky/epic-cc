@@ -73,6 +73,37 @@ fn i32_icmp_ugt_compares_high_byte_first() {
 }
 
 #[test]
+fn const_shl_i16_emits_rlcf_chain() {
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = shl i16 %1, 3\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("out", 0x24), ("main::1", 0x26), ("main::2", 0x28)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("RLCF").count(), 6, "3 shifts x 2 bytes:\n{asm}");
+    assert_eq!(asm.matches("BCF STATUS,0").count(), 3, "clear carry before each shift step:\n{asm}");
+}
+
+#[test]
+fn const_ashr_i32_sign_fills() {
+    let m = parse(
+        "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = ashr i32 %1, 4\n    store i32 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("out", 0x24), ("main::1", 0x28), ("main::2", 0x2C)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("RRCF").count(), 16, "4 shifts x 4 bytes:\n{asm}");
+    assert!(asm.contains("BTFSC"), "sign-bit test before each asr step:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "poison")]
+fn const_shift_count_out_of_range_panics() {
+    let m = parse("global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = shl i8 %1, 8\n    ret void\n");
+    let _ = select(&PIC18F4550, &m, &addrs(&[("x", 0x20), ("main::1", 0x21), ("main::2", 0x22)]));
+}
+
+#[test]
 fn load_and_store_i8_use_movff() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x12)]);

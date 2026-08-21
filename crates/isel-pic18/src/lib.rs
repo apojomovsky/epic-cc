@@ -532,6 +532,76 @@ impl<'m> Gen<'m> {
                     n == 1 || n == 2 || n == 4,
                     "isel-pic18: only i8/i16/i32 Bin ops implemented (n={n})"
                 );
+                // Milestone-8 shifts (P6): a const count inlines as a fixed
+                // RLCF/RRCF sequence; k == 0 is a plain copy; k >= width is
+                // LLVM poison and panics loudly. A variable (reg) count must
+                // never reach isel: legalize rewrites it to a routine call.
+                // Without this arm a shift would hit the `(other, _)`
+                // panic below.
+                let av = self.val_addr(&b.a).direct();
+                let dst = self.slot_addr(self.cur_func, &b.dst).direct();
+                // Milestone-8 shifts (P6): a const count inlines as a fixed
+                // RLCF/RRCF sequence; k == 0 is a plain copy; k >= width is
+                // LLVM poison and panics loudly. A variable (reg) count must
+                // never reach isel: legalize rewrites it to a routine call.
+                // Without this arm a shift would hit the `(other, _)`
+                // panic below.
+                if matches!(b.op, ir::BinOp::Shl | ir::BinOp::LShr | ir::BinOp::AShr) {
+                    let width = i64::from(n) * 8;
+                    let k = match &b.b {
+                        Val::Const(k) => *k,
+                        other => panic!(
+                            "isel-pic18: variable-count {:?} shift reached isel (count {other:?}); legalize must rewrite it to a routine call",
+                            b.op
+                        ),
+                    };
+                    assert!(
+                        (0..width).contains(&k),
+                        "isel-pic18: const shift count {k} out of range [0, {width}) (LLVM poison)"
+                    );
+                    // Copy the value into the dst slot, then rotate the dst
+                    // in place k times. shl: lo then hi (carry goes up);
+                    // lshr: hi then lo (bits come down); ashr: set C from
+                    // the sign bit before each rrcf so the sign fills every
+                    // vacated bit.
+                    self.emit_move_val_to_slot(&b.a, b.ty, dst);
+                    for _ in 0..k {
+                        match b.op {
+                            ir::BinOp::Shl => {
+                                self.emit("    BCF STATUS,0".to_string());
+                                for i in 0..n {
+                                    let (da, df) = self.operand(dst + u16::from(i));
+                                    let dbank = if da == 0 { "A" } else { "B" };
+                                    self.emit(format!("    RLCF 0x{df:03X},F,{dbank}"));
+                                }
+                            }
+                            ir::BinOp::LShr => {
+                                self.emit("    BCF STATUS,0".to_string());
+                                for i in (0..n).rev() {
+                                    let (da, df) = self.operand(dst + u16::from(i));
+                                    let dbank = if da == 0 { "A" } else { "B" };
+                                    self.emit(format!("    RRCF 0x{df:03X},F,{dbank}"));
+                                }
+                            }
+                            ir::BinOp::AShr => {
+                                let hi = dst + u16::from(n - 1);
+                                let (ha, hf) = self.operand(hi);
+                                let hbank = if ha == 0 { "A" } else { "B" };
+                                self.emit(format!("    BTFSC 0x{hf:03X},7,{hbank}"));
+                                self.emit("    BSF STATUS,0".to_string());
+                                self.emit(format!("    BTFSS 0x{hf:03X},7,{hbank}"));
+                                self.emit("    BCF STATUS,0".to_string());
+                                for i in (0..n).rev() {
+                                    let (da, df) = self.operand(dst + u16::from(i));
+                                    let dbank = if da == 0 { "A" } else { "B" };
+                                    self.emit(format!("    RRCF 0x{df:03X},F,{dbank}"));
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    return;
+                }
                 // `b.a` is resolved via `val_addr`, which treats a
                 // `Val::Const` as a RAM ADDRESS (`Slot::Direct(k & 0xFF)`)
                 // rather than a literal to load — a constant on the LHS
@@ -550,8 +620,6 @@ impl<'m> Gen<'m> {
                     !matches!(b.a, Val::Const(_)),
                     "isel-pic18: const-LHS Bin (constant as the first operand) not yet supported — needs the isel::emit_sub_const_lhs-equivalent handling"
                 );
-                let av = self.val_addr(&b.a).direct();
-                let dst = self.slot_addr(self.cur_func, &b.dst).direct();
                 for i in 0..n {
                     // SUBWF computes f - W; the IR's `sub a, b` is `a - b`,
                     // so `a` must be `f` and `b` must go into `W` first.
