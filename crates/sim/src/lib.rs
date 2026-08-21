@@ -3,7 +3,20 @@
 
 /// Decode Intel HEX (gpasm output) into 14-bit words, indexed by word address.
 pub fn parse_hex(data: &str) -> Vec<u16> {
-    let mut words = vec![0u16; 8192];
+    let mut max_word = 8191usize; // never shrink below the historical minimum
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bytes = hex_decode(&line[1..]);
+        let len = bytes[0] as usize;
+        let addr = ((bytes[1] as usize) << 8) | (bytes[2] as usize);
+        if bytes[3] == 0x00 {
+            max_word = max_word.max(addr / 2 + len / 2);
+        }
+    }
+    let mut words = vec![0u16; max_word + 1];
     for line in data.lines() {
         let line = line.trim();
         if line.is_empty() {
