@@ -271,6 +271,7 @@ expected value.
 [`docs/superpowers/plans/2026-08-20-pic18-port-p5.md`](superpowers/plans/2026-08-20-pic18-port-p5.md).
 The "interrupt priority" open question from §7 is settled by
 [ADR-013](adr/ADR-013-pic18-interrupts.md): v1 targets the single-vector
+compatibility mode (IPEN=0, one handler at `0x0008`, GIE-gated), the same
 model PIC14's fixtures exercise; two-vector priority mode stays a
 documented follow-up. The fixtures are PIC14's `interrupt.c`/`interrupt_gate.c`
 with the SFR addresses changed (PORTB 0x06→0xF81, INTCON 0x0B→0xFF2);

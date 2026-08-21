@@ -176,7 +176,25 @@ impl<'m> Gen<'m> {
                 }
             }
         }
-        panic!("isel-pic18: no def width for %{reg} in {}", self.cur_func)
+        panic!("isel-pic18: no def width for %{reg} in {}", self.cur_func);
+    }
+    /// Parse a literal-pointer operand (`"0x<K>"`, the `inttoptr` form
+    /// irparse produces) into a full 12-bit physical data-space address.
+    /// A literal pointer is either an access-bank GPR address (`0x000-
+    /// 0x05F`, `a=0`) or an SFR address (`0xF60-0xFFF`, `a=0`): both need
+    /// no `BSR` select, which is what makes direct SFR access one
+    /// instruction. An address past the 12-bit data space panics loudly.
+    fn literal_ptr_addr(&self, ptr: &str) -> u16 {
+        let h = ptr
+            .strip_prefix("0x")
+            .unwrap_or_else(|| panic!("isel-pic18: malformed literal pointer {ptr:?}"));
+        let a = u16::from_str_radix(h, 16)
+            .unwrap_or_else(|_| panic!("isel-pic18: malformed literal pointer {ptr:?}"));
+        assert!(
+            a <= 0xFFF,
+            "isel-pic18: literal pointer 0x{a:03X} outside the 12-bit data space"
+        );
+        a
     }
 
     /// Parse a literal-pointer operand (`"0x<K>"`, the `inttoptr` form
