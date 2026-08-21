@@ -13,6 +13,7 @@ legalize = { path = "../legalize" }
 callgraph = { path = "../callgraph" }
 alloc = { path = "../alloc" }
 isel = { path = "../isel" }
+isel-pic18 = { path = "../isel-pic18" }
 banking = { path = "../banking" }
 peephole = { path = "../peephole" }
 asm = { path = "../asm" }

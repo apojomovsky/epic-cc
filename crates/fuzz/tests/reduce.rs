@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 
+use device;
 use fuzz::{
     generate, reduce, run_differential, write_fixture, FailureKind, Input, Program,
     REDUCTION_CAP, TYPEDEF_PROLOGUE,
@@ -79,7 +80,7 @@ fn synthetic_mismatch_program() -> Program {
 #[test]
 fn reducer_removes_benign_statements_and_keeps_the_culprit() {
     let prog = synthetic_mismatch_program();
-    let failure = match run_differential(&prog) {
+    let failure = match run_differential(&prog, &device::PIC16F877A) {
         Err(f) => f,
         Ok(v) => panic!("the synthetic program must fail the differential, got Ok({v})"),
     };
@@ -89,7 +90,7 @@ fn reducer_removes_benign_statements_and_keeps_the_culprit() {
     assert!(reduced.re_runs <= REDUCTION_CAP, "the reduction must respect the cap");
 
     // The reduced program still fails the differential, with the SAME kind.
-    match run_differential(&reduced.program) {
+    match run_differential(&reduced.program, &device::PIC16F877A) {
         Err(f) => assert_eq!(
             f.kind,
             FailureKind::Mismatch,
@@ -188,11 +189,11 @@ fn reduce_captures_the_fresh_failure_message() {
     // caller failure (same kind, a different program's message) must not
     // leak its message into the reduced failure.
     let prog = synthetic_mismatch_program();
-    let fresh = match run_differential(&prog) {
+    let fresh = match run_differential(&prog, &device::PIC16F877A) {
         Err(f) => f,
         Ok(v) => panic!("the synthetic program must fail the differential, got Ok({v})"),
     };
-    let stale = match run_differential(&other_mismatch_program()) {
+    let stale = match run_differential(&other_mismatch_program(), &device::PIC16F877A) {
         Err(f) => f,
         Ok(v) => panic!("the other program must fail the differential, got Ok({v})"),
     };
@@ -225,7 +226,7 @@ fn reducer_minimizes_a_generated_program_with_a_planted_bug() {
     prog.inputs[0].value = 200; // in0 = 200 (the value that flips the comparison)
     prog.seed = 9998;
 
-    let failure = match run_differential(&prog) {
+    let failure = match run_differential(&prog, &device::PIC16F877A) {
         Err(f) => f,
         Ok(v) => panic!("the planted program must fail the differential, got Ok({v})"),
     };
@@ -233,7 +234,7 @@ fn reducer_minimizes_a_generated_program_with_a_planted_bug() {
 
     let reduced = reduce(&prog, &failure).expect("reduce the planted generated program");
     assert!(reduced.re_runs <= REDUCTION_CAP, "the reduction must respect the cap");
-    match run_differential(&reduced.program) {
+    match run_differential(&reduced.program, &device::PIC16F877A) {
         Err(f) => assert_eq!(f.kind, FailureKind::Mismatch, "failure preserved: {f}"),
         Ok(v) => panic!("the reduced program must still fail, got Ok({v})"),
     }
@@ -310,7 +311,7 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
     // panic is caught, not propagated), and the reducer must minimize it
     // while preserving the panic.
     let prog = synthetic_panic_program();
-    let failure = match run_differential(&prog) {
+    let failure = match run_differential(&prog, &device::PIC16F877A) {
         Err(f) => f,
         Ok(v) => panic!("the i64 program must panic the PIC pipeline, got Ok({v})"),
     };
@@ -326,7 +327,7 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
 
     let reduced = reduce(&prog, &failure).expect("reduce the panic");
     assert!(reduced.re_runs <= REDUCTION_CAP, "the reduction must respect the cap");
-    match run_differential(&reduced.program) {
+    match run_differential(&reduced.program, &device::PIC16F877A) {
         Err(f) => assert_eq!(
             f.kind,
             FailureKind::Panic,
