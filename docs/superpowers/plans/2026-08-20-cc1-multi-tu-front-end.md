@@ -41,7 +41,7 @@ Task order is dependency order. Tasks 1 through 4 are independent of each other 
 
 ---
 
-### Task 1: `irparse::sanitize_symbols`
+### Task 1: `irparse::sanitize_symbols` — DONE (e0ed377)
 
 `llvm-link` renames colliding internal symbols by appending a dot and a number (`@helper` plus `@helper` becomes `@helper` and `@helper.3`). Our own assembler keys labels as plain strings and does not care, but the `gpasm` byte-for-byte cross-check oracle has identifier rules, and `--emit asm` output is user-facing. Rewrite the dots before parsing.
 
@@ -55,7 +55,7 @@ Doing it as a text transform on the merged `.ll`, rather than as a walk over the
 - Consumes: nothing from earlier tasks.
 - Produces: `pub fn sanitize_symbols(ll: &str) -> String`. Task 5 calls it between `llvm-link` and `irparse::parse_ll`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/irparse/tests/sanitize.rs`:
 
@@ -110,12 +110,12 @@ fn panics_when_two_symbols_collide_after_sanitizing() {
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `make test CRATE=irparse`
 Expected: FAIL, `cannot find function 'sanitize_symbols' in crate 'irparse'`.
 
-- [ ] **Step 3: Implement the transform**
+- [x] **Step 3: Implement the transform**
 
 Append to `crates/irparse/src/lib.rs`:
 
@@ -183,17 +183,14 @@ pub fn sanitize_symbols(ll: &str) -> String {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `make test CRATE=irparse`
 Expected: PASS, all six tests, and every pre-existing `irparse` test still green.
 
-- [ ] **Step 5: Commit**
+Actual: PASS, 6/6 new, 39/39 pre-existing.
 
-```bash
-git add crates/irparse/src/lib.rs crates/irparse/tests/sanitize.rs
-git commit -m "feat(irparse): sanitize dotted symbol names from llvm-link"
-```
+- [x] **Step 5: Commit** — `e0ed377`
 
 ---
 
