@@ -112,3 +112,23 @@ mod tests {
         assert!(err.contains("PIC8_CLANG_UNWRAPPED"), "err: {err}");
     }
 }
+
+/// Find `llvm-link` beside the clang that `resolve_clang` returned. Both the
+/// dev image and the release bundle ship them in the same directory, so the
+/// clang path is the only input needed.
+pub fn resolve_llvm_link(clang: &Path) -> Result<PathBuf, String> {
+    let dir = clang
+        .parent()
+        .ok_or_else(|| format!("clang path has no parent directory: {}", clang.display()))?;
+    for name in ["llvm-link", "llvm-link.exe"] {
+        let p = dir.join(name);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Err(format!(
+        "llvm-link not found next to clang in {}. It ships with the toolchain bundle; \
+         set PIC8_CLANG_UNWRAPPED to a clang whose directory also contains llvm-link.",
+        dir.display()
+    ))
+}

@@ -96,7 +96,7 @@ fn float_runs_correctly() {
     let out3_addr = *layout.globals.get("out3").expect("out3 global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/float.c", "tests/fixtures/float.hex"])
+        .args(["tests/fixtures/float.c", "-o", "tests/fixtures/float.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

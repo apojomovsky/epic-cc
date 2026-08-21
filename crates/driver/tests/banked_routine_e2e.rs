@@ -101,10 +101,7 @@ fn banked_routine_runs_correctly() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            "tests/fixtures/banked_routine.c",
-            "tests/fixtures/banked_routine.hex",
-        ])
+        .args(["tests/fixtures/banked_routine.c", "-o", "tests/fixtures/banked_routine.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(

@@ -3032,7 +3032,9 @@ fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), Failure> {
     let driver = driver_binary().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let out = Command::new(&driver)
         .arg(c_path)
+        .arg("-o")
         .arg(hex_path)
+        .args(["--device", "p16f877a"])
         .env("PIC8_CLANG_UNWRAPPED", &clang)
         .env("PIC8_CLANG_RESOURCE_DIR", &resdir)
         .output()

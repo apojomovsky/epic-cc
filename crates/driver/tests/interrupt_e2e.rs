@@ -84,7 +84,7 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/interrupt.c", "tests/fixtures/interrupt.hex"])
+        .args(["tests/fixtures/interrupt.c", "-o", "tests/fixtures/interrupt.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

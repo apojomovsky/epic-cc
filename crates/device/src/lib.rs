@@ -46,20 +46,27 @@ pub const PIC18F4550: Device = Device {
     name: "p18f4550",
     core: Core::Pic18,
     flash_words: 0x4000,
-    // One contiguous GPR range (0x0004-0x07FF) — PIC18's Access Bank
+    // One contiguous GPR range (0x0010-0x07FF): PIC18 Access Bank
     // (0x000-0x05F) plus BSR-selected banks 0-7 (0x060-0x7FF) form
     // unbroken GPR, unlike PIC14's four banks separated by SFR holes, so a
     // single-entry table is correct here (see `Device::region_for`, which
     // already handles an arbitrary bank list generically — no PIC18-
     // specific allocator code is needed anywhere, only this data).
-    // 0x0000-0x0003 is reserved (see `common_ram` below), so GPR starts at
-    // 0x0004.
-    ram_banks: &[(0x0004, 0x07FF)],
-    // Reserved for isel-pic18's fixed `retval` region (up to 4 bytes, for
-    // an i32 return value even though P2's own scope only needs i8/i16) —
-    // bank-independent (always reachable via the Access Bank's `a=0`, no
-    // `BSR` dependency), mirroring PIC14's `common_ram` rationale exactly.
-    common_ram: Some((0x0000, 0x0003)),
+    // 0x0000-0x000F is reserved (see `common_ram` below), so GPR starts at
+    // 0x0010.
+    ram_banks: &[(0x0010, 0x07FF)],
+    // Reserved for isel-pic18's fixed regions, bank-independent (always
+    // reachable via the Access Bank's `a=0`, no `BSR` dependency),
+    // mirroring PIC14's `common_ram` rationale exactly:
+    //   0x0000-0x0003  the fixed `retval` region (up to 4 bytes, for an
+    //                  i32 return value even though P2's own scope only
+    //                  needs i8/i16)
+    //   0x0004-0x000F  the fixed ISR save area (W, STATUS, BSR, FSR0L/H,
+    //                  TBLPTRL/H/U, and the retval snapshot: the preempted
+    //                  main's in-flight return value, P5. prologue/
+    //                  epilogue; see
+    //                  docs/superpowers/plans/2026-08-20-pic18-port-p5.md)
+    common_ram: Some((0x0000, 0x000F)),
     stack_depth: 31,
     interrupt_vectors: &[0x0008, 0x0018],
 };

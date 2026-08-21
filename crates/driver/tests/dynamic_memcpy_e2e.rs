@@ -60,10 +60,7 @@ fn dynamic_length_memcpy_runs_correctly() {
     let buf3 = *layout.globals.get("buf3").expect("buf3 global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            "tests/fixtures/dynamic_memcpy.c",
-            "tests/fixtures/dynamic_memcpy.hex",
-        ])
+        .args(["tests/fixtures/dynamic_memcpy.c", "-o", "tests/fixtures/dynamic_memcpy.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
