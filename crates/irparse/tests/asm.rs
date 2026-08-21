@@ -56,10 +56,17 @@ fn rejects_register_constraint() {
 }
 
 #[test]
-#[should_panic(expected="asm with operands is not supported")]
-fn rejects_operand_form() {
+fn accepts_memory_operands() {
     let ll = r#"define void @foo() { tail call void asm sideeffect "movf $1, w", "=*m,*m,*m"(ptr @t, ptr @y, ptr @t) ret void }"#;
-    parse_ll(ll);
+    let m = parse_ll(ll);
+    let foo = &m.funcs[0].blocks[0].insts[0];
+    if let ir::Inst::Asm(a) = foo {
+        assert_eq!(a.template, "movf $1, w");
+        assert_eq!(a.operands.len(), 3);
+        assert_eq!(a.operands[0].constraint, "=*m");
+        assert_eq!(a.operands[0].ptr, "@t");
+        assert_eq!(a.operands[1].ptr, "@y");
+    } else { panic!("expected Asm"); }
 }
 
 #[test]

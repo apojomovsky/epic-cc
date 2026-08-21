@@ -101,6 +101,59 @@ impl<'m> Gen<'m> {
                 .unwrap_or_else(|| panic!("isel-pic18: no slot for {func}::{name}")),
         )
     }
+    fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
+        for op in operands {
+            if let Some(reg) = op.ptr.strip_prefix('%') {
+                if let Some((_, k, terms)) = self.resolved.get(&ssa_key(self.cur_func, reg)) {
+                    if *k != 0 || !terms.is_empty() {
+                        panic!("asm: GEP-derived pointers are not supported; operand {} is derived via getelementptr (only direct locals and globals are allowed)", op.ptr);
+                    }
+                }
+            }
+        }
+        let mut out = String::with_capacity(template.len() + operands.len() * 6);
+        let mut chars = template.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '$' || c == '%' {
+                if let Some(&next) = chars.peek() {
+                    if next == '%' || next == '$' {
+                        chars.next();
+                        out.push(next);
+                        continue;
+                    }
+                    if next.is_ascii_digit() {
+                        let mut idx_str = String::new();
+                        while let Some(&d) = chars.peek() {
+                            if d.is_ascii_digit() {
+                                idx_str.push(d);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        let idx: usize = idx_str.parse().unwrap();
+                        if idx >= operands.len() {
+                            panic!("asm: placeholder ${idx} out of range for {} operands in template {template:?}", operands.len());
+                        }
+                        let ptr = &operands[idx].ptr;
+                        let addr = if let Some(g) = ptr.strip_prefix('@') {
+                            *self.addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}"))
+                        } else if let Some(r) = ptr.strip_prefix('%') {
+                            self.slot_addr(self.cur_func, r).direct()
+                        } else {
+                            panic!("asm: malformed operand ptr {ptr:?}");
+                        };
+                        out.push_str(&format!("0x{addr:02X}"));
+                        continue;
+                    }
+                }
+                out.push(c);
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
             Val::Reg(r) => self.slot_addr(self.cur_func, r),
@@ -1106,9 +1159,9 @@ impl<'m> Gen<'m> {
                 }
             },
             Inst::Asm(a) => {
-                // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking Task5.
                 self.emit("; --- asm start ---".to_string());
-                for line in a.template.split('\n') {
+                let substituted = self.substitute_asm(&a.template, &a.operands);
+                for line in substituted.split('\n') {
                     self.emit(line.to_string());
                 }
                 self.emit("; --- asm end ---".to_string());
@@ -4020,7 +4073,41 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 for inst in &b.insts {
                     match inst {
                         Inst::Asm(a) => {
-                            for line in a.template.split('\n') {
+                            // Substitute $0/%0 for rung 4 memory operands
+                            let mut substituted = a.template.clone();
+                            if !a.operands.is_empty() {
+                                for op in &a.operands {
+                                    if let Some(reg) = op.ptr.strip_prefix('%') {
+                                        if let Some((_, k, terms)) = resolved.get(&ssa_key(&f.name, reg)) {
+                                            if *k != 0 || !terms.is_empty() {
+                                                panic!("asm: GEP-derived pointers are not supported; operand {} is derived via getelementptr (only direct locals and globals are allowed)", op.ptr);
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut res = String::with_capacity(substituted.len() + a.operands.len() * 6);
+                                let mut chars = substituted.chars().peekable();
+                                while let Some(c) = chars.next() {
+                                    if c == '$' || c == '%' {
+                                        if let Some(&n) = chars.peek() {
+                                            if n == '%' || n == '$' { chars.next(); res.push(n); continue; }
+                                            if n.is_ascii_digit() {
+                                                let mut idx_str = String::new();
+                                                while let Some(&d) = chars.peek() { if d.is_ascii_digit() { idx_str.push(d); chars.next(); } else { break; } }
+                                                let idx: usize = idx_str.parse().unwrap();
+                                                if idx >= a.operands.len() { panic!("asm: placeholder ${idx} out of range for {} operands in template {:?}", a.operands.len(), a.template); }
+                                                let ptr = &a.operands[idx].ptr;
+                                                let addr = if let Some(g) = ptr.strip_prefix('@') { *addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}")) } else if let Some(r) = ptr.strip_prefix('%') { *addrs.get(&ssa_key(&f.name, r)).unwrap_or_else(|| panic!("isel-pic18: no slot for {}::{}", f.name, r)) } else { panic!("asm: malformed operand ptr {ptr:?}") };
+                                                res.push_str(&format!("0x{addr:02X}"));
+                                                continue;
+                                            }
+                                        }
+                                        res.push(c);
+                                    } else { res.push(c); }
+                                }
+                                substituted = res;
+                            }
+                            for line in substituted.split('\n') {
                                 out.push(line.to_string());
                             }
                         }

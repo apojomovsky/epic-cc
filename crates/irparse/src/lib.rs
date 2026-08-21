@@ -11,8 +11,7 @@
 //! misparsing.
 
 use std::collections::{HashMap, HashSet};
-
-use ir::{Alloca, Asm, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin, FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, Memcpy, MemLen, Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
+use ir::{Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin, FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, Memcpy, MemLen, Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
 
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
@@ -425,6 +424,7 @@ fn extract_first_quoted(s: &str) -> Option<(String, String)> {
     None
 }
 
+#[allow(dead_code)]
 /// Extract two consecutive quoted strings after `asm sideeffect`.
 /// Returns (template_raw, constraints_raw).
 fn extract_asm_strings(after_sideeffect: &str) -> Option<(String, String)> {
@@ -1392,52 +1392,93 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
     // `Inst::Asm`. This must run before the generic `call` handling, since
     // the `asm` form is a `call` with an `asm` callee.
     if line.contains("asm sideeffect") {
-        // Extract the two quoted strings: template and constraints.
-        // The line looks like:
-        //   `call void asm sideeffect "bcf INTCON, 7", ""()`
-        //   `%1 = tail call i8 asm sideeffect "movwf $0", "=r,0"(i8 1)`
-        // We find `asm sideeffect` then pull two consecutive quoted strings.
         if let Some(pos) = line.find("asm sideeffect") {
             let after = &line[pos + "asm sideeffect".len()..];
-            if let Some((t_raw, c_raw)) = extract_asm_strings(after) {
-                // Decode template escapes via the same LLVM unescaper used for
-                // `module asm`.
-                let template = unescape_llvm_asm(&t_raw);
-                let constraints_raw = c_raw;
-                let clobbers_memory = constraints_raw.contains("~{memory}");
-                // Constraint checks (order matters: register before generic operand).
-                // Tokenize constraints on ',' and strip clobbers (`~{...}`).
-                let raw_tokens: Vec<String> = constraints_raw
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                // Filter to operand tokens (non-clobbers).
-                let operand_tokens: Vec<String> = raw_tokens
-                    .iter()
-                    .filter(|t| !t.starts_with("~{"))
-                    .cloned()
-                    .collect();
-                if !operand_tokens.is_empty() {
-                    // Register constraint detection: any operand token containing
-                    // 'r' (bare register) is a register constraint. This covers
-                    // `=r`, `r`, `=r,0` ties, etc. `*m` does not contain `r`.
-                    let has_reg = operand_tokens.iter().any(|t| t.contains('r'));
-                    if has_reg {
-                        panic!("register constraints are not supported");
+            // Extract the two quoted strings and the trailing args via
+            // quote-boundary detection (handles escapes). This mirrors the
+            // earlier `extract_asm_strings` but also captures the tail.
+            if let Some((t_raw, after_t)) = extract_first_quoted(after) {
+                if let Some((c_raw, after_c)) = extract_first_quoted(&after_t) {
+                    let template = unescape_llvm_asm(&t_raw);
+                    let constraints_raw = c_raw;
+                    let clobbers_memory = constraints_raw.contains("~{memory}");
+                    let raw_tokens: Vec<String> = constraints_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    let operand_tokens: Vec<String> = raw_tokens
+                        .iter()
+                        .filter(|t| !t.starts_with("~{"))
+                        .cloned()
+                        .collect();
+                    if operand_tokens.is_empty() {
+                        return vec![Inst::Asm(Asm { template, clobbers_memory, operands: Vec::new() })];
                     }
-                    // Any remaining operand token (e.g. `*m`, `=*m`, `0`, `m`) means
-                    // the asm uses operands — rung 4 deferred.
-                    panic!("asm with operands is not supported");
+                    // Validate each operand constraint is a `*m` memory form
+                    for tok in &operand_tokens {
+                        if !tok.contains("*m") {
+                            // Register or other constraint, not memory
+                            panic!("asm: register constraints are not supported on PIC (found \"{tok}\"); use \"*m\" memory operands or no operands");
+                        }
+                    }
+                    // Extract argument list after constraints: `(ptr @x, ptr %y, ...)`
+                    // `after_c` holds the tail after the constraints closing quote
+                    let mut operands = Vec::new();
+                    if let Some(open) = after_c.find('(') {
+                        // find matching ')' for args list
+                        let mut depth = 0usize;
+                        let mut close = None;
+                        for (i, c) in after_c[open..].char_indices() {
+                            if c == '(' { depth += 1; } else if c == ')' { depth -= 1; if depth == 0 { close = Some(open + i); break; } }
+                        }
+                        let close = close.expect("unbalanced parens in asm args");
+                        let args_inner = &after_c[open + 1..close];
+                        let arg_strs = split_top_level(args_inner, ',');
+                        let mut vals: Vec<String> = Vec::new();
+                        for a in arg_strs {
+                            if a.is_empty() {
+                                continue;
+                            }
+                            if a.contains("getelementptr") {
+                                panic!("asm: GEP-derived pointers are not supported; operand derived via getelementptr (only direct globals and locals are allowed)");
+                            }
+                            // The pointer value is the last `@name` or `%name` token
+                            // Args look like `ptr @t`, `ptr %3`, `ptr noundef @g`
+                            let ptr = if let Some(at) = a.rfind('@') {
+                                let end = a[at..].find(|c: char| c.is_whitespace() || c == ',' || c == ')').map(|i| at + i).unwrap_or(a.len());
+                                let name = a[at..end].trim().trim_end_matches(|c| c == ',' || c == ')').to_string();
+                                // include @ prefix
+                                name
+                            } else if let Some(pc) = a.rfind('%') {
+                                let end = a[pc..].find(|c: char| c.is_whitespace() || c == ',' || c == ')').map(|i| pc + i).unwrap_or(a.len());
+                                let name = a[pc..end].trim().trim_end_matches(|c| c == ',' || c == ')').to_string();
+                                name
+                            } else if a.contains("null") || a.contains("zeroinitializer") {
+                                panic!("asm: GEP-derived pointers are not supported; operand derived via getelementptr (only direct globals and locals are allowed)");
+                            } else {
+                                // Fallback: try to parse as typed val via parse_val
+                                // For `i16 0` etc, treat as not a memory pointer
+                                panic!("asm: expected pointer operand for \"*m\" constraint, got {a:?}");
+                            };
+                            // Preserve the prefix form for IR (`@t` / `%reg`)
+                            vals.push(ptr);
+                        }
+                        if vals.len() != operand_tokens.len() {
+                            panic!("asm: operand count mismatch: {} constraints but {} pointer args in {line:?}", operand_tokens.len(), vals.len());
+                        }
+                        for (constraint, ptr) in operand_tokens.into_iter().zip(vals.into_iter()) {
+                            operands.push(AsmOperand { constraint, ptr });
+                        }
+                    } else {
+                        panic!("asm: missing argument list for operands in {line:?}");
+                    }
+                    return vec![Inst::Asm(Asm { template, clobbers_memory, operands })];
                 }
-                return vec![Inst::Asm(Asm { template, clobbers_memory })];
             }
         }
-        // If we reach here, the line contained `asm sideeffect` but we failed
-        // to extract the two strings — treat as malformed.
         panic!("irparse: malformed asm sideeffect in line: {line}");
     }
-
     // Non-asm unreachable: LLVM terminator that carries no IR value. For
     // naked functions this is the trailing `unreachable` after the last asm
     // call (also filtered in parse_ll), for normal functions we just drop it.

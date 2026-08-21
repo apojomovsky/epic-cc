@@ -250,20 +250,31 @@ fn asm_reg_constraint_rejected() {
 }
 
 #[test]
-fn asm_operands_rejected() {
-    // Contains `asm volatile("movf %1, w" : "+m"(t) : "m"(y))` -> operands not supported
+fn asm_memory_operands_p14() {
+    // `asm("movf %1, w" : "+m"(t) : "m"(y))` -> *m operands, should compile
+    let out_hex = "/tmp/asm_operands.hex";
+    let out_asm = "/tmp/asm_operands.asm";
     let res = run_driver(&[
         "tests/fixtures/asm_operands.c",
         "-o",
-        "/tmp/asm_operands.hex",
+        out_hex,
         "--device",
         "p16f877a",
     ]);
-    assert!(!res.status.success(), "expected failure for operands");
-    let stderr = String::from_utf8_lossy(&res.stderr).to_string()
-        + &String::from_utf8_lossy(&res.stdout).to_string();
-    assert!(
-        stderr.contains("asm with operands is not supported"),
-        "expected operands panic, got: {stderr}"
-    );
+    assert!(res.status.success(), "expected success for memory operands, stderr: {}", String::from_utf8_lossy(&res.stderr));
+    assert_hex_non_empty(out_hex);
+    let res = run_driver(&[
+        "tests/fixtures/asm_operands.c",
+        "-o",
+        out_asm,
+        "--device",
+        "p16f877a",
+        "--emit",
+        "asm",
+    ]);
+    assert!(res.status.success(), "emit asm failed: {}", String::from_utf8_lossy(&res.stderr));
+    let asm = std::fs::read_to_string(out_asm).unwrap_or_default();
+    // substituted addresses via slot_addr: should contain MOVF with 0x
+    assert!(asm.contains("MOVF") || asm.contains("movf"), "asm missing MOVF, got:\n{asm}");
+    assert!(asm.contains("0x"), "asm missing substituted address 0x, got:\n{asm}");
 }
