@@ -32,9 +32,30 @@ pub fn optimize(asm: &str) -> String {
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
     // Canonical literal of the last `MOVLW k; MOVWF PCLATH` pair.
     let mut tracked: Option<String> = None;
+    let mut in_asm = false;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("; --- asm start ---") {
+            in_asm = true;
+            out.push(line);
+            tracked = None;
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("; --- asm end ---") {
+            in_asm = false;
+            out.push(line);
+            tracked = None;
+            i += 1;
+            continue;
+        }
+        if in_asm {
+            out.push(line);
+            i += 1;
+            continue;
+        }
         // A label is a branch target: the runtime PCLATH there depends on
         // the path taken, not the linear text order. The tracked literal is
         // only a sound predictor of PCLATH on straight-line code, so it is
@@ -48,6 +69,16 @@ pub fn optimize(asm: &str) -> String {
             continue;
         }
         if is_movlw(line) && i + 1 < lines.len() && is_movwf_pclath(lines[i + 1]) {
+            // Inside Asm guard above already prevents this pair from being
+            // considered across a barrier; still need to ensure the pair
+            // itself is not inside asm (handled) and not crossing into asm.
+            // If the next line is an asm marker, don't elide.
+            let next_trimmed = lines[i + 1].trim_start();
+            if next_trimmed.starts_with("; --- asm") {
+                out.push(line);
+                i += 1;
+                continue;
+            }
             let literal = canonical_literal(movlw_operand(line));
             if tracked.as_deref() == Some(literal.as_str()) {
                 // Same literal already in PCLATH: the new pair is redundant.
