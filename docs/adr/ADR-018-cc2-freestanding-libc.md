@@ -28,7 +28,7 @@ flags and hands it to `llvm-link` as one more unit. Gating on the include
 keeps the code out of programs that never use it and leaves the symbols
 free for a user's own implementation, so no `weak` linkage is needed.
 
-**Twelve entry points ship:** `memcpy`, `memmove`, `memset`, `memcmp`,
+**These entry points ship:** `memcpy`, `memmove`, `memset`, `memcmp`,
 `strlen`, `strnlen`, `strcpy`, `strncpy`, `strcat`, `strncat`, `strcmp`,
 `strncmp`. The header declares exactly what exists, so a missing function
 is a clang error at the call site rather than a link-time surprise.

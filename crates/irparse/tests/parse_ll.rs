@@ -1546,12 +1546,10 @@ define float @fadd(float %0) {
 
 #[test]
 fn implicit_entry_block_is_numbered_after_the_unnamed_params() {
-    // LLVM numbers unnamed values in one sequence: the parameters take %0..%N-1,
-    // so the unlabelled entry block of an N-parameter function is %N, not %0.
-    // A phi reaching the loop header from the entry names that block, and the
+    // A phi reaching a loop header from the entry names that block, and the
     // backends key phi copies on the edge, so mislabelling the entry drops the
-    // loop counter's initialisation and the loop starts from whatever the
-    // overlaid slot held.
+    // loop counter's initialisation: the loop then starts from whatever the
+    // overlaid slot happened to hold.
     const S: &str = r#"
 define dso_local noundef ptr @memcpy(ptr noundef returned writeonly %0, ptr nocapture noundef readonly %1, i16 noundef %2) local_unnamed_addr #1 {
   %4 = icmp eq i16 %2, 0
