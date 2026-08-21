@@ -8,6 +8,7 @@
 use device::PIC18F4550;
 use pic14_sim::{parse_hex_pic18, Pic18};
 use std::collections::HashMap;
+static E2E_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use std::process::Command;
 
 /// Run clang + the full IR pipeline (through `asm::assemble_file_to_hex`) on
@@ -210,6 +211,7 @@ fn const_table_c_runs_correctly() {
 
 #[test]
 fn interrupt_pic18_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock().unwrap();
     // Mirrors crates/driver/tests/interrupt_e2e.rs: in == 0x10, the ISR
     // fired mid-run after main's PORTB = 0x11 store -> the ISR's
     // bump_isr(out) lands before main's bump reads it:
@@ -267,6 +269,7 @@ fn ptr_probe_c_runs_correctly() {
 
 #[test]
 fn interrupt_gate_pic18_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock().unwrap();
     // Mirrors crates/driver/tests/interrupt_gate_e2e.rs: the request is
     // latched while INTCON = 0x10 (INT0IE, GIE clear), taken only after
     // main writes INTCON = 0x90. isr_ran == 1, stage == 3, halted.
