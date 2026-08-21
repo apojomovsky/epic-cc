@@ -29,12 +29,135 @@ fn empty_function_emits_a_bare_return() {
 }
 
 #[test]
+fn i32_add_emits_a_four_byte_carry_chain() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i32\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = add i32 %1, %2\n    store i32 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x24), ("out", 0x28),
+        ("main::1", 0x30), ("main::2", 0x34), ("main::3", 0x38)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("ADDWF 0x030,W,A"), "byte 0 add:\n{asm}");
+    assert_eq!(asm.matches("ADDWFC").count(), 3, "bytes 1-3 carry adds:\n{asm}");
+    assert_eq!(asm.matches("MOVWF").count(), 4, "four result bytes:\n{asm}");
+}
+
+#[test]
+fn i32_icmp_eq_ne_compare_all_four_bytes() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal o1 i8\nglobal o2 i8\n\
+         fn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = icmp eq i32 %1, %2\n    store i8 %3 @o1\n\
+         %4 = icmp ne i32 %1, %2\n    store i8 %4 @o2\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x24), ("o1", 0x28), ("o2", 0x29),
+        ("main::1", 0x30), ("main::2", 0x34), ("main::3", 0x38), ("main::4", 0x39)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("SUBWF").count(), 8, "four bytes x two predicates:\n{asm}");
+    assert_eq!(asm.matches("BNZ").count(), 8, "mismatch branches:\n{asm}");
+}
+
+#[test]
+fn i32_icmp_ugt_compares_high_byte_first() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal o1 i8\nfn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = icmp ugt i32 %1, %2\n    store i8 %3 @o1\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x24), ("o1", 0x28),
+        ("main::1", 0x30), ("main::2", 0x34), ("main::3", 0x38)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("SUBWF 0x033,W,A"), "high byte (offset 3) compared first:\n{asm}");
+}
+
+#[test]
+fn const_shl_i16_emits_rlcf_chain() {
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = shl i16 %1, 3\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("out", 0x24), ("main::1", 0x26), ("main::2", 0x28)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("RLCF").count(), 6, "3 shifts x 2 bytes:\n{asm}");
+    assert_eq!(asm.matches("BCF 0xFD8,0,A").count(), 3, "clear carry before each shift step:\n{asm}");
+}
+
+#[test]
+fn const_ashr_i32_sign_fills() {
+    let m = parse(
+        "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = ashr i32 %1, 4\n    store i32 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("out", 0x24), ("main::1", 0x28), ("main::2", 0x2C)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("RRCF").count(), 16, "4 shifts x 4 bytes:\n{asm}");
+    assert!(asm.contains("BTFSC"), "sign-bit test before each asr step:\n{asm}");
+}
+
+#[test]
+#[should_panic(expected = "poison")]
+fn const_shift_count_out_of_range_panics() {
+    let m = parse("global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = shl i8 %1, 8\n    ret void\n");
+    let _ = select(&PIC18F4550, &m, &addrs(&[("x", 0x20), ("main::1", 0x21), ("main::2", 0x22)]));
+}
+
+#[test]
 fn load_and_store_i8_use_movff() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x12)]);
     let asm = select(&PIC18F4550, &m, &addrs);
     assert!(asm.contains("MOVFF 0x010, 0x012"), "load into %1's slot:\n{asm}");
     assert!(asm.contains("MOVFF 0x012, 0x011"), "store %1 to out:\n{asm}");
+}
+
+/// Build a module with a runtime routine (name, param widths, __scr size)
+/// plus a main that calls it, so the recipe-emission path is exercised
+/// through `select` exactly as legalize's injected modules reach it.
+#[test]
+fn mul_u8_recipe_uses_hardware_mulwf() {
+    // The P6 headline: the u8 mul is ONE MULWF (W x f -> PRODH:PRODL), no
+    // shift-add loop.
+    let m = parse(
+        "fn __mul_u8(i8) (a=i8, b=i8)\n  block entry:\n    %__scr = alloca 6\n    ret i8 0\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__mul_u8::a", 0x20), ("__mul_u8::b", 0x21), ("__mul_u8::__scr", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("MULWF"), "the u8 mul must use hardware MULWF:\n{asm}");
+    assert!(!asm.contains("RLF"), "no shift-add loop on PIC18:\n{asm}");
+}
+
+#[test]
+fn runtime_u16_mul_uses_schoolbook_partials() {
+    let m = parse(
+        "fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__mul_u16::a", 0x20), ("__mul_u16::b", 0x22), ("__mul_u16::__scr", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    // P00 (shift 0), P01 + P10 (shift 8) contribute to the low 16 bits;
+    // P11 (shift 16) is dropped. So exactly 3 hardware MULWF partials.
+    assert_eq!(asm.matches("MULWF").count(), 3, "schoolbook partials, P11 dropped:\n{asm}");
+}
+
+#[test]
+fn udiv_u16_recipe_emits_restoring_loop() {
+    let m = parse(
+        "fn __udiv_u16(i16) (num=i16, den=i16)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__udiv_u16::num", 0x20), ("__udiv_u16::den", 0x22), ("__udiv_u16::__scr", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("RLCF").count(), 4, "16 iterations, num+rem shift:\n{asm}");
+    assert_eq!(asm.matches("DECFSZ").count(), 1, "loop counter:\n{asm}");
 }
 
 #[test]

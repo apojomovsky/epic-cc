@@ -248,7 +248,7 @@ not a judgement.
 | **P3** | **DONE** Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
 | **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
 | **P5** | **DONE** Interrupts: single-vector compatibility mode (IPEN=0), one handler at `0x0008` (see the P5 note and ADR-013). | `interrupt_pic18.c`, `interrupt_gate_pic18.c`; `interrupt_mul.c` joins P6 (it needs `*`/`/`) |
-| **P6** | 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c` |
+| **P6** | **DONE** 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c`, `interrupt_mul_pic18.c` |
 | **P7** | Soft-float. | `float.c` |
 | **P8** | Point the differential fuzzer at PIC18. | the seed corpora run clean |
 
@@ -279,6 +279,16 @@ with the SFR addresses changed (PORTB 0x06→0xF81, INTCON 0x0B→0xFF2);
 `interrupt_mul.c` needs `*`/`/` and moves to P6. The shared ISR plumbing
 (`Func.isr`, legalize duplication, alloc's disjoint ISR region) is reused
 from PIC14 M13 unchanged.
+
+**P6 note (2026-08-20):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p6.md`](superpowers/plans/2026-08-20-pic18-port-p6.md).
+The i32 surface and the runtime routine recipes land together (ADR-014):
+`long.c` (0x1634943A), `muldiv.c` (210), and P5's deferred
+`interrupt_mul_pic18.c` (main + ISR both reach `__mul_u8`/`__udiv_u8`, the
+`_isr` copies get disjoint frames) all pass on the `Pic18` simulator, with
+a `gpasm -p p18f4550` byte-for-byte cross-check on the `long.c` asm. The
+muls use hardware `MULWF` schoolbook partials (no shift-add loop); the
+divmod/shift loops are branch-based with no single-GPR-bank constraint.
 
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely
