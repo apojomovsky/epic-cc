@@ -81,7 +81,7 @@ fn three_chunk_const_tables_run_correctly() {
     let o16_2 = a("o16_2");
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/const_3chunk.c", "tests/fixtures/const_3chunk.hex"])
+        .args(["tests/fixtures/const_3chunk.c", "-o", "tests/fixtures/const_3chunk.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

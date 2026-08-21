@@ -1368,3 +1368,65 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
     }
     out
 }
+
+/// Rewrite `.` to `_` inside LLVM symbol names (`@name`) so downstream labels
+/// are portable to `gpasm`, which rejects dots in identifiers. `llvm-link`
+/// produces such names when it renames colliding internal symbols.
+///
+/// Intrinsics (`@llvm.memcpy.p0.p0`) keep their dots: `parse_ll` matches them
+/// by prefix and they never become labels. `%` registers are function-local
+/// and cannot collide, so they are left alone. Text inside `"` quotes is
+/// copied through untouched, because a C string constant reaches the `.ll` as
+/// `c"..."` and may contain an `@`.
+///
+/// Panics if two distinct symbols sanitize to the same name.
+pub fn sanitize_symbols(ll: &str) -> String {
+    let b = ll.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len());
+    // sanitized name -> the original it came from, for collision detection.
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut i = 0;
+    while i < b.len() {
+        // LLVM escapes a quote inside a string as `\22`, never `\"`, so the
+        // next `"` is always the closing one.
+        if b[i] == b'"' {
+            out.push(b[i]);
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                out.push(b[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] != b'@' {
+            out.push(b[i]);
+            i += 1;
+            continue;
+        }
+        let start = i + 1;
+        let mut j = start;
+        while j < b.len() && (b[j].is_ascii_alphanumeric() || matches!(b[j], b'_' | b'.' | b'$')) {
+            j += 1;
+        }
+        let name = &ll[start..j];
+        out.push(b'@');
+        // Every non-intrinsic name goes through the map, dotted or not, so a
+        // pre-existing `helper_3` is seen before `helper.3` sanitizes onto it.
+        if name.is_empty() || name.starts_with("llvm.") {
+            out.extend_from_slice(name.as_bytes());
+        } else {
+            let clean = name.replace('.', "_");
+            match seen.get(&clean) {
+                Some(prev) if prev != name => panic!(
+                    "irparse: symbols @{prev} and @{name} both sanitize to @{clean}"
+                ),
+                _ => {
+                    seen.insert(clean.clone(), name.to_string());
+                }
+            }
+            out.extend_from_slice(clean.as_bytes());
+        }
+        i = j;
+    }
+    String::from_utf8(out).expect("sanitize_symbols: input was valid UTF-8")
+}

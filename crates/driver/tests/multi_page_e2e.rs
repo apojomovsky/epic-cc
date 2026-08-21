@@ -202,7 +202,7 @@ fn multi_page_program_compiles_and_runs_correctly() {
 
     // ---- run the driver and simulate ----
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/multi_page.c", "tests/fixtures/multi_page.hex"])
+        .args(["tests/fixtures/multi_page.c", "-o", "tests/fixtures/multi_page.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

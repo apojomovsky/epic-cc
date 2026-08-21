@@ -225,7 +225,7 @@ fn the_program_still_computes_mains_results() {
     // A no-interrupt sanity run: the duplication must not disturb the
     // ordinary path. in_a = 47, in_b = 5 -> out = 235, out_q = 9.
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/interrupt_mul.c", "tests/fixtures/interrupt_mul.hex"])
+        .args(["tests/fixtures/interrupt_mul.c", "-o", "tests/fixtures/interrupt_mul.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

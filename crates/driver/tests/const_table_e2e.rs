@@ -67,7 +67,7 @@ fn const_table_reads_past_256_bytes_run_correctly() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/const_table.c", "tests/fixtures/const_table.hex"])
+        .args(["tests/fixtures/const_table.c", "-o", "tests/fixtures/const_table.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

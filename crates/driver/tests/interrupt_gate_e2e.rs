@@ -50,7 +50,7 @@ fn a_masked_request_is_deferred_until_main_sets_gie() {
     let (stage, isr_ran) = (addr("stage"), addr("isr_ran"));
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/interrupt_gate.c", "tests/fixtures/interrupt_gate.hex"])
+        .args(["tests/fixtures/interrupt_gate.c", "-o", "tests/fixtures/interrupt_gate.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

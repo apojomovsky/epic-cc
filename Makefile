@@ -49,7 +49,7 @@ test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	@$(DOCKER_RUN) bash -c '$(if $(CRATE),cargo test -p $(CRATE) --no-fail-fast,bash scripts/ci-test.sh)'
 
 compile: image ## Compile C to HEX and print it: FILE=crates/driver/tests/fixtures/add.c
-	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- $(FILE) /tmp/out.hex && cat /tmp/out.hex'
+	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- $(FILE) -o /tmp/out.hex --device p16f877a && cat /tmp/out.hex'
 info: image ## Toolchain versions + env vars from the image
 	@$(DOCKER_RUN) bash -c 'rustc --version && $$PIC8_CLANG_UNWRAPPED --version | head -1 && gpasm --version | head -1 && echo && env | grep ^PIC8_ | sort'
 

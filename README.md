@@ -20,7 +20,7 @@ volatile unsigned char in;
 volatile unsigned char out;
 void main(void) { out = in + 1; }
 
-$ cargo run -p driver -- add.c add.hex && cat add.hex
+$ cargo run -p driver -- add.c -o add.hex --device p16f877a && cat add.hex
 :020000040000FA
 :10000000012800308A0005206300831203132008B2
 :0E001000A2002208013EA3002308A100080060
@@ -349,6 +349,9 @@ consolidated backend spec).
 | [`11-pointer-const-findings.md`](docs/11-pointer-const-findings.md) | Feasibility spike: pointers via `FSR`/`INDF`, Harvard `const` |
 | [`12-backend-design.md`](docs/12-backend-design.md) | **The approved backend spec** |
 | [`13-`…`28-`](docs/) | Per-milestone implementation plans (harness → integer spine → pointers → interrupts → `long` → fuzzing → soft-float) |
+| [`29-pic18-port-design.md`](docs/29-pic18-port-design.md) | The PIC18 port: why it is smaller than a second compiler, and its phases |
+| [`30-distribution-design.md`](docs/30-distribution-design.md) | The docker toolchain and the release bundles |
+| [`31-ecosystem-integration-design.md`](docs/31-ecosystem-integration-design.md) | Making epic-cc epic-hal's default toolchain, and reaching PlatformIO |
 
 Working notes for contributors and agents are in [`CLAUDE.md`](CLAUDE.md).
 

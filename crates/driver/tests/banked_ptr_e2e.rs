@@ -102,7 +102,7 @@ fn banked_ptr_runs_correctly() {
     let in_addr = *layout.globals.get("in").expect("in global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/banked_ptr.c", "tests/fixtures/banked_ptr.hex"])
+        .args(["tests/fixtures/banked_ptr.c", "-o", "tests/fixtures/banked_ptr.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

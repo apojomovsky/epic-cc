@@ -24,3 +24,7 @@ pic14-sim = { path = "../sim" }
 [[bin]]
 name = "epic-cc"
 path = "src/main.rs"
+
+[lib]
+name = "driver"
+path = "src/lib.rs"
