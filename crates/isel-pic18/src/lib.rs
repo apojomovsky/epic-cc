@@ -568,7 +568,7 @@ impl<'m> Gen<'m> {
                     for _ in 0..k {
                         match b.op {
                             ir::BinOp::Shl => {
-                                self.emit("    BCF STATUS,0".to_string());
+                                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                                 for i in 0..n {
                                     let (da, df) = self.operand(dst + u16::from(i));
                                     let dbank = if da == 0 { "A" } else { "B" };
@@ -576,7 +576,7 @@ impl<'m> Gen<'m> {
                                 }
                             }
                             ir::BinOp::LShr => {
-                                self.emit("    BCF STATUS,0".to_string());
+                                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                                 for i in (0..n).rev() {
                                     let (da, df) = self.operand(dst + u16::from(i));
                                     let dbank = if da == 0 { "A" } else { "B" };
@@ -588,9 +588,9 @@ impl<'m> Gen<'m> {
                                 let (ha, hf) = self.operand(hi);
                                 let hbank = if ha == 0 { "A" } else { "B" };
                                 self.emit(format!("    BTFSC 0x{hf:03X},7,{hbank}"));
-                                self.emit("    BSF STATUS,0".to_string());
+                                self.emit("    BSF 0xFD8,0,A".to_string()); // STATUS C
                                 self.emit(format!("    BTFSS 0x{hf:03X},7,{hbank}"));
-                                self.emit("    BCF STATUS,0".to_string());
+                                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                                 for i in (0..n).rev() {
                                     let (da, df) = self.operand(dst + u16::from(i));
                                     let dbank = if da == 0 { "A" } else { "B" };
@@ -1243,13 +1243,20 @@ impl<'m> Gen<'m> {
     }
 
     /// Two's-complement negate of a `bytes`-byte value in place: `COMF`
-    /// every byte, then `INCF` the low byte (carry propagates through the
-    /// `INCF` chain exactly like PIC14's `neg16_in_place`/`neg32_in_place`).
+    /// every byte, then `INCF` the low byte, and each higher byte
+    /// increments ONLY if the previous byte's `INCF` wrapped to zero (the
+    /// carry propagates through the Z chain — `BTFSC STATUS,2` before each
+    /// higher `INCF`, exactly PIC14's `neg16_in_place`/`neg32_in_place`).
+    /// An unconditional `INCF` on every byte would turn `0xFFED` (-19) into
+    /// `0x0113` instead of `0x0013` (19): the high byte must not advance
+    /// when the low INCF did not wrap.
     fn neg_in_place(&mut self, addr: u16, bytes: u8) {
         for i in 0..bytes {
             self.emit(format!("    COMF 0x{:03X},F,A", addr + u16::from(i)));
         }
-        for i in 0..bytes {
+        self.emit(format!("    INCF 0x{:03X},F,A", addr));
+        for i in 1..bytes {
+            self.emit("    BTFSC 0xFD8,2,A".to_string()); // STATUS Z
             self.emit(format!("    INCF 0x{:03X},F,A", addr + u16::from(i)));
         }
     }
@@ -1317,33 +1324,44 @@ impl<'m> Gen<'m> {
 
     /// The restoring-division loop body: shifts `num` left one bit per
     /// iteration (the quotient builds in its vacated bits), accumulates the
-    /// partial remainder in `rem_base..rem_base+bytes`, subtracts `den`
+    /// partial remainder in `rem_base..rem_base+rem_bytes`, subtracts `den`
     /// (`SUBFWB` for the borrow chain — the exact semantics PIC14
     /// synthesized with its BTFSS/INCFSZ dance), and restores by adding
-    /// back when the subtraction borrowed. `cnt` counts `8*bytes`
+    /// back when the subtraction borrowed. `cnt` counts `8*den_bytes`
     /// iterations. `BNC`/`BRA` real branches mean the frame needs no
     /// single-GPR-bank constraint (P6 ruling). Shared by the unsigned
     /// (`emit_divmod`) and signed (`emit_sdivmod`) wrappers.
-    fn emit_divmod_loop(&mut self, num: u16, den: u16, rem_base: u16, cnt: u16, bytes: u8) {
+    ///
+    /// `rem_bytes` is the remainder width, `den_bytes` the divisor width:
+    /// the u8 case uses a 2-byte remainder ("the 8-bit rem shift can
+    /// carry", the PIC14 layout contract) with a 1-byte divisor — the
+    /// divisor's implicit high byte is 0, folded with `MOVLW 0` +
+    /// `SUBFWB`/`ADDWFC`. u16 and u32 use equal widths.
+    fn emit_divmod_loop(&mut self, num: u16, den: u16, rem_base: u16, cnt: u16, den_bytes: u8, rem_bytes: u8) {
         let l_loop = self.fresh_label();
         let l_restore = self.fresh_label();
         let l_next = self.fresh_label();
-        for i in 0..u16::from(bytes) {
+        for i in 0..u16::from(rem_bytes) {
             self.emit(format!("    CLRF 0x{:03X},A", rem_base + i));
         }
-        self.emit(format!("    MOVLW 0x{:02X}", 8 * bytes));
+        self.emit(format!("    MOVLW 0x{:02X}", 8 * den_bytes));
         self.emit(format!("    MOVWF 0x{cnt:03X},A"));
         self.emit(format!("{l_loop}:"));
-        self.emit("    BCF STATUS,0".to_string());
-        for i in 0..u16::from(bytes) {
+        self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+        for i in 0..u16::from(den_bytes) {
             self.emit(format!("    RLCF 0x{:03X},F,A", num + i));
         }
-        for i in 0..u16::from(bytes) {
+        for i in 0..u16::from(rem_bytes) {
             self.emit(format!("    RLCF 0x{:03X},F,A", rem_base + i));
         }
-        // rem -= den across `bytes` bytes: SUBWF then SUBFWB (borrow-in).
-        for i in 0..u16::from(bytes) {
-            self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+        // rem -= den: SUBWF then SUBFWB (borrow-in); beyond den_bytes the
+        // divisor byte is implicitly 0, folded with MOVLW 0 + SUBFWB.
+        for i in 0..u16::from(rem_bytes) {
+            if i < u16::from(den_bytes) {
+                self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+            } else {
+                self.emit("    MOVLW 0x00".to_string());
+            }
             if i == 0 {
                 self.emit(format!("    SUBWF 0x{:03X},F,A", rem_base));
             } else {
@@ -1356,8 +1374,12 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BRA {l_next}"));
         self.emit(format!("{l_restore}:"));
         // rem += den back (ADDWF, then ADDWFC for the carries).
-        for i in 0..u16::from(bytes) {
-            self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+        for i in 0..u16::from(rem_bytes) {
+            if i < u16::from(den_bytes) {
+                self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+            } else {
+                self.emit("    MOVLW 0x00".to_string());
+            }
             if i == 0 {
                 self.emit(format!("    ADDWF 0x{:03X},F,A", rem_base));
             } else {
@@ -1369,31 +1391,34 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BRA {l_loop}"));
     }
 
-    /// The restoring-division recipe for `bytes` = 1, 2, or 4, quotient or
-    /// remainder selected by `quotient`. `rem` occupies the low `bytes`
-    /// bytes of `__scr`; the loop counter sits at `__scr[bytes]`.
-    fn emit_divmod(&mut self, name: &str, bytes: u8, scr: u16, quotient: bool) {
+    /// The restoring-division recipe for `den_bytes` = 1, 2, or 4, quotient
+    /// or remainder selected by `quotient`. The remainder is 2 bytes for a
+    /// u8 divide (the u8 rem shift can carry — PIC14 layout contract), and
+    /// `den_bytes` bytes otherwise; the loop counter sits after the rem.
+    fn emit_divmod(&mut self, name: &str, den_bytes: u8, scr: u16, quotient: bool) {
         let num = self.slot_addr(name, "num").direct();
         let den = self.slot_addr(name, "den").direct();
-        self.emit_divmod_loop(num, den, scr, scr + u16::from(bytes), bytes);
+        let rem_bytes = den_bytes.max(2);
+        self.emit_divmod_loop(num, den, scr, scr + u16::from(rem_bytes), den_bytes, rem_bytes);
         if quotient {
-            self.store_retval(num, bytes);
+            self.store_retval(num, den_bytes);
         } else {
-            self.store_retval(scr, bytes);
+            self.store_retval(scr, den_bytes);
         }
         self.emit("    RETURN".to_string());
     }
 
     /// The signed div/mod wrapper: abs both operands in place in the param
     /// slots (unsigned abs, INT_MIN safe), run the unsigned divmod with
-    /// `rem` at `__scr[1..]` and the counter at `__scr[1+bytes]` (byte 0
-    /// holds the flags: bit0 = negate quotient = num<0 XOR den<0, bit1 =
-    /// negate remainder = num<0), then negate per the flags.
-    fn emit_sdivmod(&mut self, name: &str, bytes: u8, scr: u16, quotient: bool) {
+    /// `rem` at `__scr[1..]` and the counter after it (byte 0 holds the
+    /// flags: bit0 = negate quotient = num<0 XOR den<0, bit1 = negate
+    /// remainder = num<0), then negate per the flags.
+    fn emit_sdivmod(&mut self, name: &str, den_bytes: u8, scr: u16, quotient: bool) {
         let num = self.slot_addr(name, "num").direct();
         let den = self.slot_addr(name, "den").direct();
-        let num_hi = num + u16::from(bytes) - 1;
-        let den_hi = den + u16::from(bytes) - 1;
+        let num_hi = num + u16::from(den_bytes) - 1;
+        let den_hi = den + u16::from(den_bytes) - 1;
+        let rem_bytes = den_bytes.max(2);
         let l_den = self.fresh_label();
         let l_go = self.fresh_label();
         let l_store = self.fresh_label();
@@ -1402,29 +1427,29 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BRA {l_den}"));
         self.emit(format!("    BSF 0x{scr:03X},1,A")); // bit1: remainder sign follows dividend
         self.emit(format!("    BSF 0x{scr:03X},0,A")); // bit0: quotient negate: num<0
-        self.neg_in_place(num, bytes); // num = |num|
+        self.neg_in_place(num, den_bytes); // num = |num|
         self.emit(format!("{l_den}:"));
         self.emit(format!("    BTFSS 0x{den_hi:03X},7,A")); // den < 0?
         self.emit(format!("    BRA {l_go}"));
-        self.neg_in_place(den, bytes); // den = |den|
+        self.neg_in_place(den, den_bytes); // den = |den|
         self.emit("    MOVLW 0x01".to_string());
         self.emit(format!("    XORWF 0x{scr:03X},F,A")); // bit0 ^= den<0
         self.emit(format!("{l_go}:"));
-        self.emit_divmod_loop(num, den, scr + 1, scr + 1 + u16::from(bytes), bytes);
+        self.emit_divmod_loop(num, den, scr + 1, scr + 1 + u16::from(rem_bytes), den_bytes, rem_bytes);
         if quotient {
             self.emit(format!("    BTFSS 0x{scr:03X},0,A"));
             self.emit(format!("    BRA {l_store}"));
-            self.neg_in_place(num, bytes); // -quotient
+            self.neg_in_place(num, den_bytes); // -quotient
         } else {
             self.emit(format!("    BTFSS 0x{scr:03X},1,A"));
             self.emit(format!("    BRA {l_store}"));
-            self.neg_in_place(scr + 1, bytes); // -remainder
+            self.neg_in_place(scr + 1, den_bytes); // -remainder
         }
         self.emit(format!("{l_store}:"));
         if quotient {
-            self.store_retval(num, bytes);
+            self.store_retval(num, den_bytes);
         } else {
-            self.store_retval(scr + 1, bytes);
+            self.store_retval(scr + 1, den_bytes);
         }
         self.emit("    RETURN".to_string());
     }
@@ -1449,27 +1474,27 @@ impl<'m> Gen<'m> {
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
         self.emit(format!("    MOVF 0x{scr:03X},F,A")); // Z = (cnt == 0)
-        self.emit("    BTFSC STATUS,2".to_string()); // skip the GOTO when cnt != 0
+        self.emit("    BTFSC 0xFD8,2,A".to_string()); // STATUS Z // skip the GOTO when cnt != 0
         self.emit(format!("    BRA {l_done}"));
         self.emit(format!("{l_loop}:"));
         match op {
             ir::BinOp::Shl => {
-                self.emit("    BCF STATUS,0".to_string());
+                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                 for i in 0..u16::from(bytes) {
                     self.emit(format!("    RLCF 0x{:03X},F,A", val + i));
                 }
             }
             ir::BinOp::LShr => {
-                self.emit("    BCF STATUS,0".to_string());
+                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                 for i in (0..u16::from(bytes)).rev() {
                     self.emit(format!("    RRCF 0x{:03X},F,A", val + i));
                 }
             }
             ir::BinOp::AShr => {
                 self.emit(format!("    BTFSC 0x{hi:03X},7,A"));
-                self.emit("    BSF STATUS,0".to_string());
+                self.emit("    BSF 0xFD8,0,A".to_string()); // STATUS C
                 self.emit(format!("    BTFSS 0x{hi:03X},7,A"));
-                self.emit("    BCF STATUS,0".to_string());
+                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                 for i in (0..u16::from(bytes)).rev() {
                     self.emit(format!("    RRCF 0x{:03X},F,A", val + i));
                 }
