@@ -1,8 +1,8 @@
 // Milestone-12 "long" acceptance: a straight-line program exercising the
-// whole i32 surface — add via a noinline call, mul, udiv, urem, sdiv, srem,
+// whole i32 surface  -  add via a noinline call, mul, udiv, urem, sdiv, srem,
 // const-count shl/lshr/ashr (inline), icmp ult/ugt/ule, trunc/zext/sext
 // (i32->i8/i16 and i8/i16->i32), and a struct with a long member via
-// byval/sret ({i8,i32}, 6-byte layout) — compiles through the whole driver
+// byval/sret ({i8,i32}, 6-byte layout)  -  compiles through the whole driver
 // pipeline and runs correctly in the simulator.
 //
 // Shape notes (clang -O1 folds aggressively):
@@ -20,7 +20,7 @@
 //     volatile g8/g16 round-trips force i8/i16 SSA values, so `(unsigned
 //     long)g8` / `(long)(signed char)g8` emit real `zext`/`sext` ops (the
 //     i16 zext/sext come from the g16 round-trip of `sin`'s low half,
-//     whose bit 15 is set — the m12 sign-fill path).
+//     whose bit 15 is set  -  the m12 sign-fill path).
 //   - main's live locals are exactly 9 x i32 (36 bytes): the runtime
 //     routines' frames (base = frame_end(main), biggest __sdiv_i32 at 20
 //     bytes) fit inside bank 0 (end <= 0x6F); a straddling routine frame
@@ -30,7 +30,7 @@
 //     `misc`, whose frame has no bank constraint (it calls no runtime
 //     routine). The udiv/mul chain and the urem are split into two locals
 //     (`m`, `u`) so the merge-add happens in misc, keeping main at 9 defs.
-//   - No i32 const tables and no const-const i32 ops (deferred — both still
+//   - No i32 const tables and no const-const i32 ops (deferred  -  both still
 //     panic loudly).
 //
 // Expected: in = 0x12345678, sin = -19 -> out = 0x1634943A (traced in

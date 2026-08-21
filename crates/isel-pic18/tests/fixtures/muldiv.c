@@ -1,6 +1,6 @@
 // Milestone-8 mul/div/mod/shift acceptance: a straight-line program that
-// exercises the whole new scalar surface — mul, udiv, urem, sdiv, srem,
-// shl (const), lshr (const), and a variable-count shl — on both i16 and
+// exercises the whole new scalar surface  -  mul, udiv, urem, sdiv, srem,
+// shl (const), lshr (const), and a variable-count shl  -  on both i16 and
 // i8, with a hand-computable `out`.
 //
 // Notes on why the C is shaped the way it is (clang -O1 folds aggressively):
@@ -23,7 +23,7 @@
 //     across the bank-0/1 boundary).
 //
 // Expected: in = 301 -> out = 210 (traced in muldiv_e2e.rs against the
-// exact emitted IR; the plan's shape recomputed — clang strength-reduced
+// exact emitted IR; the plan's shape recomputed  -  clang strength-reduced
 // `a % 7`, folded the constant `b`, and widened the i8 chain).
 volatile unsigned int out;
 volatile unsigned int in;

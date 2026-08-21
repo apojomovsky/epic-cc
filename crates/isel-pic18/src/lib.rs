@@ -953,7 +953,7 @@ impl<'m> Gen<'m> {
     }
 
     /// `dst = (a <pred> b) ? 1 : 0` for two bytes: compare the high byte
-    /// (offset 1) first, with `pred`'s own signedness — if it differs,
+    /// (offset 1) first, with `pred`'s own signedness: if it differs,
     /// that alone decides the whole 16-bit result, since the sign only
     /// ever lives in the most-significant byte. Only when the high bytes
     /// are equal does the low byte (offset 0) get compared, always
@@ -1012,7 +1012,7 @@ impl<'m> Gen<'m> {
     /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
     /// byte matches; `ne` is the mirror. Direct per-byte equality checks
     /// (`SUBWF` + `BNZ`), independent of the signed/unsigned tie-break
-    /// machinery used for the eight ordering predicates — a partial match
+    /// machinery used for the eight ordering predicates: a partial match
     /// (some byte equal, another different) is decisive here in a way it
     /// never is for `slt`/`ult`/etc.
     fn emit_icmp_i16_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
@@ -1039,7 +1039,7 @@ impl<'m> Gen<'m> {
     }
 
     /// `dst = (a <pred> b) ? 1 : 0` for four bytes: compare the high byte
-    /// (offset 3) first with `pred`'s own signedness — if it differs,
+    /// (offset 3) first with `pred`'s own signedness: if it differs,
     /// that alone decides the whole 32-bit result. Only when the high
     /// bytes are equal does the next byte get compared, and so on down to
     /// byte 0, always **unsigned** for the tie-breaks (same rule as
@@ -1245,7 +1245,7 @@ impl<'m> Gen<'m> {
     /// Two's-complement negate of a `bytes`-byte value in place: `COMF`
     /// every byte, then `INCF` the low byte, and each higher byte
     /// increments ONLY if the previous byte's `INCF` wrapped to zero (the
-    /// carry propagates through the Z chain — `BTFSC STATUS,2` before each
+    /// carry propagates through the Z chain, `BTFSC STATUS,2` before each
     /// higher `INCF`, exactly PIC14's `neg16_in_place`/`neg32_in_place`).
     /// An unconditional `INCF` on every byte would turn `0xFFED` (-19) into
     /// `0x0113` instead of `0x0013` (19): the high byte must not advance
@@ -1325,7 +1325,7 @@ impl<'m> Gen<'m> {
     /// The restoring-division loop body: shifts `num` left one bit per
     /// iteration (the quotient builds in its vacated bits), accumulates the
     /// partial remainder in `rem_base..rem_base+rem_bytes`, subtracts `den`
-    /// (`SUBFWB` for the borrow chain — the exact semantics PIC14
+    /// (`SUBFWB` for the borrow chain, the exact semantics PIC14
     /// synthesized with its BTFSS/INCFSZ dance), and restores by adding
     /// back when the subtraction borrowed. `cnt` counts `8*den_bytes`
     /// iterations. `BNC`/`BRA` real branches mean the frame needs no
@@ -1334,7 +1334,7 @@ impl<'m> Gen<'m> {
     ///
     /// `rem_bytes` is the remainder width, `den_bytes` the divisor width:
     /// the u8 case uses a 2-byte remainder ("the 8-bit rem shift can
-    /// carry", the PIC14 layout contract) with a 1-byte divisor — the
+    /// carry", the PIC14 layout contract) with a 1-byte divisor: the
     /// divisor's implicit high byte is 0, folded with `MOVLW 0` +
     /// `SUBFWB`/`ADDWFC`. u16 and u32 use equal widths.
     fn emit_divmod_loop(&mut self, num: u16, den: u16, rem_base: u16, cnt: u16, den_bytes: u8, rem_bytes: u8) {
@@ -1393,7 +1393,7 @@ impl<'m> Gen<'m> {
 
     /// The restoring-division recipe for `den_bytes` = 1, 2, or 4, quotient
     /// or remainder selected by `quotient`. The remainder is 2 bytes for a
-    /// u8 divide (the u8 rem shift can carry — PIC14 layout contract), and
+    /// u8 divide (the u8 rem shift can carry, PIC14 layout contract), and
     /// `den_bytes` bytes otherwise; the loop counter sits after the rem.
     fn emit_divmod(&mut self, name: &str, den_bytes: u8, scr: u16, quotient: bool) {
         let num = self.slot_addr(name, "num").direct();
@@ -1697,7 +1697,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     let resolved = resolve_pointers(m);
     for f in &m.funcs {
         // P6: a runtime routine (or its `_isr` copy) emits its recipe body
-        // directly — its entry block holds only the `__scr` alloca, which
+        // directly: its entry block holds only the `__scr` alloca, which
         // the generic block emitter would render as an empty label
         // (silently falling through into the next function). Every other
         // function takes the ordinary path.
