@@ -194,7 +194,7 @@ Actual: PASS, 6/6 new, 39/39 pre-existing.
 
 ---
 
-### Task 2: `wholeprog` validates the merged module
+### Task 2: `wholeprog` validates the merged module — DONE (ff235a6)
 
 `llvm-link` does not fail on a `declare` it could not satisfy, it leaves it in place. Left alone that becomes a `CALL` to a label the assembler has never heard of, and the user gets a panic from `crates/asm` naming a symbol they never wrote. Catch it here, while the names are still theirs.
 
@@ -208,7 +208,7 @@ This needs **no IR format change**: every call target is already in the IR as `I
 - Consumes: `ir::{Module, Inst}`.
 - Produces: `pub fn merge(m: Module) -> Module`, same signature as today. Behaviour changes from pass-through to validating.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/wholeprog/tests/validate.rs`. The IR text syntax below was taken from
 `ir::serialize` output on 2026-08-20, not invented: a call is `%1 = call i8 @helper(i8 3)`,
@@ -270,12 +270,14 @@ fn helper(i8) (0=i8)
 }
 ```
 
-- [ ] **Step 2: Run the tests to verify they fail**
+- [x] **Step 2: Run the tests to verify they fail**
 
 Run: `make test CRATE=wholeprog`
 Expected: FAIL. `accepts_a_resolved_module` passes trivially (today's `merge` is a pass-through), the three `should_panic` tests fail with "did not panic".
 
-- [ ] **Step 3: Implement the checks**
+Actual: matched exactly.
+
+- [x] **Step 3: Implement the checks**
 
 Replace `crates/wholeprog/src/lib.rs` entirely:
 
@@ -328,22 +330,21 @@ fn check_calls_resolved(m: &Module) {
 }
 ```
 
-- [ ] **Step 4: Run the crate tests**
+- [x] **Step 4: Run the crate tests**
 
 Run: `make test CRATE=wholeprog`
 Expected: PASS, all four.
 
-- [ ] **Step 5: Run the FULL suite, because this changes a shared stage**
+Actual: PASS, 4/4 new, plus the pre-existing `tests/merge.rs` (2 tests) unaffected.
+
+- [x] **Step 5: Run the FULL suite, because this changes a shared stage**
 
 Run: `make test`
 Expected: PASS. Every existing fixture defines `main` (verified 2026-08-20), and `crates/driver/tests/*_e2e.rs` plus `crates/isel-pic18/tests/e2e.rs` call `wholeprog::merge` directly on parsed fixtures. If any of them now panics on `main`, that fixture is the bug report: read it before weakening the check.
 
-- [ ] **Step 6: Commit**
+Actual: PASS, all 16 crates, exit 0, no failures.
 
-```bash
-git add crates/wholeprog/src/lib.rs crates/wholeprog/tests/validate.rs
-git commit -m "feat(wholeprog): reject undefined symbols and a missing entry point"
-```
+- [x] **Step 6: Commit** — `ff235a6`
 
 ---
 
