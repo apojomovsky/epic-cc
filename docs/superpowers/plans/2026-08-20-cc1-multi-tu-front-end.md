@@ -715,7 +715,7 @@ Actual: PASS, 2/2 new, full driver crate suite unaffected.
 
 ---
 
-### Task 5: wire the driver and migrate every call site
+### Task 5: wire the driver and migrate every call site — DONE (3dff778)
 
 This is the task that flips the CLI. It must land as one commit, because the moment `main.rs` stops accepting a positional output path, roughly 25 call sites break.
 
@@ -727,11 +727,13 @@ This is the task that flips the CLI. It must land as one commit, because the mom
 - Modify: `README.md:23` (the worked example)
 - Modify: `AGENTS.md` if it shows the old invocation
 
+Actual: `crates/driver/tests/e2e.rs` (bare filename, does not match the `*_e2e.rs` glob used to find and batch-migrate the other 21) was missed by the batch pass and fixed as its own edit. `AGENTS.md` had no invocation to migrate, only prose describing the mechanism (`:222`), left untouched.
+
 **Interfaces:**
 - Consumes: `cli::parse_args`, `clang_discovery::{resolve_clang, resolve_llvm_link}`, `irparse::sanitize_symbols`, `wholeprog::merge`.
 - Produces: the `epic-cc` binary's new command line.
 
-- [ ] **Step 1: Find every call site**
+- [x] **Step 1: Find every call site**
 
 ```bash
 grep -rn "CARGO_BIN_EXE_epic-cc" --include=*.rs crates/ | wc -l
@@ -740,7 +742,7 @@ grep -rn "run -q -p driver\|run -p driver" Makefile README.md AGENTS.md
 
 Write the list down. Every one of them is migrated in this task.
 
-- [ ] **Step 2: Rewrite `main.rs`**
+- [x] **Step 2: Rewrite `main.rs`**
 
 Replace the body of `fn main` in `crates/driver/src/main.rs`. The stages from `irparse::parse_ll` onward (today's lines 59 to 103) are copied across **unchanged**; only the front half changes.
 
@@ -864,7 +866,9 @@ fn main() {
 
 **Do not paraphrase the pipeline half.** Open the file, keep lines 61 to 102 as they are, and change only `hex_out` to `&cli.output`.
 
-- [ ] **Step 3: Migrate the call sites**
+Actual: the pipeline body was kept verbatim, but `--emit asm` (a real requirement, not a nicety, per the Interfaces block above) needs an interception point between "final asm text" and "assemble to hex" that the original single `match device.core { ... asm::assemble_file_to_hex(...) }` did not have. Split into two matches: the first produces the final `asm: String` (banking + peephole + page-fit for PIC14, passthrough for PIC18), the second calls `asm::assemble_file_to_hex`. The `Emit::Asm` early return sits between them. No stage crate's behavior changed, only where the driver reads the intermediate value.
+
+- [x] **Step 3: Migrate the call sites**
 
 For each `crates/driver/tests/*_e2e.rs`, the change is mechanical:
 
@@ -889,7 +893,7 @@ For each `crates/driver/tests/*_e2e.rs`, the change is mechanical:
 $ cargo run -p driver -- add.c -o add.hex --device p16f877a && cat add.hex
 ```
 
-- [ ] **Step 4: Run the full suite**
+- [x] **Step 4: Run the full suite**
 
 Run: `make test`
 Expected: PASS, with every committed `.hex` fixture byte-identical to what is in git. Confirm that explicitly:
@@ -900,12 +904,9 @@ git diff --stat crates/driver/tests/fixtures/
 
 Expected: empty. A changed `.hex` here means `llvm-link` or the sanitizer perturbed codegen, and that is a stop-and-investigate, not a "regenerate the golden file".
 
-- [ ] **Step 5: Commit**
+Actual: `make test` PASS, all 16 crates, exit 0. `git diff --stat crates/driver/tests/fixtures/` returned empty: every golden HEX byte-identical.
 
-```bash
-git add -A
-git commit -m "feat(driver): multi-file compilation via llvm-link"
-```
+- [x] **Step 5: Commit** — `3dff778`
 
 ---
 
