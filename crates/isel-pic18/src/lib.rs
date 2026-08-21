@@ -528,7 +528,10 @@ impl<'m> Gen<'m> {
             }
             Inst::Bin(b) => {
                 let n = b.ty.bytes();
-                assert!(n == 1 || n == 2, "isel-pic18: only i8/i16 Bin ops implemented (n={n})");
+                assert!(
+                    n == 1 || n == 2 || n == 4,
+                    "isel-pic18: only i8/i16/i32 Bin ops implemented (n={n})"
+                );
                 // `b.a` is resolved via `val_addr`, which treats a
                 // `Val::Const` as a RAM ADDRESS (`Slot::Direct(k & 0xFF)`)
                 // rather than a literal to load — a constant on the LHS
@@ -578,11 +581,16 @@ impl<'m> Gen<'m> {
             }
             Inst::Icmp(c) => {
                 let n = c.ty.bytes();
-                assert!(n == 1 || n == 2, "isel-pic18: only i8/i16 Icmp implemented so far (n={n})");
+                assert!(
+                    n == 1 || n == 2 || n == 4,
+                    "isel-pic18: only i8/i16/i32 Icmp implemented so far (n={n})"
+                );
                 if n == 1 {
                     self.emit_icmp_byte(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
-                } else {
+                } else if n == 2 {
                     self.emit_icmp_i16(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
+                } else {
+                    self.emit_icmp_i32(c.a.clone(), c.b.clone(), &c.pred, &c.dst);
                 }
             }
             Inst::Zext(z) => {
@@ -933,18 +941,22 @@ impl<'m> Gen<'m> {
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 
-    /// `eq`/`ne` for i16: true (for `eq`) only when both bytes match;
-    /// `ne` is the mirror. Two direct byte-equality checks (`SUBWF` +
-    /// `BNZ`), independent of the signed/unsigned tie-break machinery
-    /// `emit_icmp_i16` uses for the eight ordering predicates — a partial
-    /// match (high byte equal, low byte different) is decisive here in a
-    /// way it never is for `slt`/`ult`/etc.
+    /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
+    /// byte matches; `ne` is the mirror. Direct per-byte equality checks
+    /// (`SUBWF` + `BNZ`), independent of the signed/unsigned tie-break
+    /// machinery used for the eight ordering predicates — a partial match
+    /// (some byte equal, another different) is decisive here in a way it
+    /// never is for `slt`/`ult`/etc.
     fn emit_icmp_i16_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
+        self.emit_icmp_eq_ne(a, b, pred, dst, 2);
+    }
+
+    fn emit_icmp_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str, bytes: u8) {
         let l_true = self.fresh_label();
         let l_false = self.fresh_label();
         let l_done = self.fresh_label();
         let l_mismatch = if pred == "eq" { &l_false } else { &l_true };
-        for offset in 0..2u8 {
+        for offset in 0..bytes {
             self.emit_load_w(&b, offset);
             let av = self.val_addr(&a).direct() + u16::from(offset);
             let (acc, af) = self.operand(av);
@@ -955,6 +967,59 @@ impl<'m> Gen<'m> {
         // Every byte matched: `eq` is true, `ne` is false.
         let l_all_matched = if pred == "eq" { &l_true } else { &l_false };
         self.emit(format!("    BRA {l_all_matched}"));
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+    }
+
+    /// `dst = (a <pred> b) ? 1 : 0` for four bytes: compare the high byte
+    /// (offset 3) first with `pred`'s own signedness — if it differs,
+    /// that alone decides the whole 32-bit result. Only when the high
+    /// bytes are equal does the next byte get compared, and so on down to
+    /// byte 0, always **unsigned** for the tie-breaks (same rule as
+    /// `emit_icmp_i16`).
+    ///
+    /// `eq`/`ne` dispatch to `emit_icmp_eq_ne` with `bytes = 4`.
+    fn emit_icmp_i32(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        if pred == "eq" || pred == "ne" {
+            self.emit_icmp_eq_ne(a, b, pred, dst, 4);
+            return;
+        }
+        let unsigned_tiebreak = match pred {
+            "slt" => "ult",
+            "sle" => "ule",
+            "sgt" => "ugt",
+            "sge" => "uge",
+            other => other, // ult/ule/ugt/uge tie-break against themselves
+        };
+        let l_true = self.fresh_label();
+        let l_false = self.fresh_label();
+        let l_done = self.fresh_label();
+
+        // Compare bytes 3 (the sign byte, `pred`'s own signedness), then
+        // 2 and 1 as unsigned tie-breaks that defer to the next lower
+        // byte on equality, then byte 0 with the final answer.
+        let l_check_b2 = self.fresh_label();
+        let l_check_b1 = self.fresh_label();
+        let l_check_b0 = self.fresh_label();
+
+        self.emit_cmp_branch(&a, &b, 3, pred, &l_true, &l_false, &l_check_b2);
+        self.emit_label(&l_check_b2);
+        self.emit_cmp_branch(&a, &b, 2, unsigned_tiebreak, &l_true, &l_false, &l_check_b1);
+        self.emit_label(&l_check_b1);
+        self.emit_cmp_branch(&a, &b, 1, unsigned_tiebreak, &l_true, &l_false, &l_check_b0);
+        self.emit_label(&l_check_b0);
+        // Byte 0 equality is the full-value equality: final answer for the
+        // non-strict tie-break predicates (`ule`/`uge`), false for the
+        // strict ones (`ult`/`ugt`).
+        let l_low_equal = if matches!(unsigned_tiebreak, "ule" | "uge") {
+            l_true.clone()
+        } else {
+            l_false.clone()
+        };
+        self.emit_cmp_branch(&a, &b, 0, unsigned_tiebreak, &l_true, &l_false, &l_low_equal);
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 

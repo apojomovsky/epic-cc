@@ -29,6 +29,50 @@ fn empty_function_emits_a_bare_return() {
 }
 
 #[test]
+fn i32_add_emits_a_four_byte_carry_chain() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i32\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = add i32 %1, %2\n    store i32 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x24), ("out", 0x28),
+        ("main::1", 0x30), ("main::2", 0x34), ("main::3", 0x38)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("ADDWF 0x030,W,A"), "byte 0 add:\n{asm}");
+    assert_eq!(asm.matches("ADDWFC").count(), 3, "bytes 1-3 carry adds:\n{asm}");
+    assert_eq!(asm.matches("MOVWF").count(), 4, "four result bytes:\n{asm}");
+}
+
+#[test]
+fn i32_icmp_eq_ne_compare_all_four_bytes() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal o1 i8\nglobal o2 i8\n\
+         fn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = icmp eq i32 %1, %2\n    store i8 %3 @o1\n\
+         %4 = icmp ne i32 %1, %2\n    store i8 %4 @o2\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x24), ("o1", 0x28), ("o2", 0x29),
+        ("main::1", 0x30), ("main::2", 0x34), ("main::3", 0x38), ("main::4", 0x39)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert_eq!(asm.matches("SUBWF").count(), 8, "four bytes x two predicates:\n{asm}");
+    assert_eq!(asm.matches("BNZ").count(), 8, "mismatch branches:\n{asm}");
+}
+
+#[test]
+fn i32_icmp_ugt_compares_high_byte_first() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal o1 i8\nfn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = icmp ugt i32 %1, %2\n    store i8 %3 @o1\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("b", 0x24), ("o1", 0x28),
+        ("main::1", 0x30), ("main::2", 0x34), ("main::3", 0x38)]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(asm.contains("SUBWF 0x033,W,A"), "high byte (offset 3) compared first:\n{asm}");
+}
+
+#[test]
 fn load_and_store_i8_use_movff() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x12)]);
