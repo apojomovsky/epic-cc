@@ -1,15 +1,15 @@
 //! Seeded C generator + differential runner (PIC driver+sim vs host clang)
 //! + greedy cvise-style reducer.
 //!
-//! Milestone 14's random-testing crate: the whole pipeline — a seeded
+//! Milestone 14's random-testing crate: the whole pipeline - a seeded
 //! generator, a differential runner, a greedy reducer, and a corpus gate.
 //! The generator emits a tiny, deterministic C program in the milestone's
 //! "discipline" (unsigned-only arithmetic in genuinely explicit-width types
-//! — `u8`/`u16`/`u32` from `TYPEDEF_PROLOGUE`, never bare `unsigned long`,
-//! which is 64-bit on LP64 hosts — guarded shifts, a volatile `u8`
-//! checksum); the differential runner compiles it twice —
+//! - `u8`/`u16`/`u32` from `TYPEDEF_PROLOGUE`, never bare `unsigned long`,
+//! which is 64-bit on LP64 hosts - guarded shifts, a volatile `u8`
+//! checksum); the differential runner compiles it twice  -
 //! through the PIC8 driver into `pic14-sim`, and through host clang into a
-//! native binary — seeds the volatile inputs identically on both sides, and
+//! native binary - seeds the volatile inputs identically on both sides, and
 //! compares the resulting checksums.
 //!
 //! The harness contracts (see docs/27-phase6-random-testing-plan.md):
@@ -39,12 +39,12 @@ pub const CHECKSUM_NAME: &str = "checksum";
 /// program.
 ///
 /// WHY (the milestone's "Important" fix): Task 1 documented `unsigned long`
-/// as "32-bit on both msp430 and the host" — that equivalence is FALSE. On
+/// as "32-bit on both msp430 and the host" - that equivalence is FALSE. On
 /// LP64 hosts `unsigned long` is 64-bit, so a u32 computation whose result
 /// exceeds 2^32 (e.g. `x * x` for x = 0xFFFFFFFF, or a 64-bit quotient)
 /// diverges: msp430 wraps at 2^32, the host does not. `stdint.h` was the
 /// first choice (`uint8_t`/`uint16_t`/`uint32_t` are exactly this), but it
-/// does NOT resolve under the driver's fixed flags — `-nostdinc` drops the
+/// does NOT resolve under the driver's fixed flags - `-nostdinc` drops the
 /// builtin resource-dir include path (verified empirically; adding an
 /// explicit `-isystem` fixes it, but the driver's flags are not ours to
 /// change). So the robust option is self-contained typedefs guarded on the
@@ -54,16 +54,16 @@ pub const CHECKSUM_NAME: &str = "checksum";
 /// - u16 = unsigned short (16 bits on both targets)
 /// - u32 = msp430: `unsigned long` (msp430 int is 16-bit, so its 32-bit
 ///        type is long) / host: `unsigned int` (32-bit on the pinned
-///        x86-64-linux host) — genuinely 32-bit on BOTH sides.
+///        x86-64-linux host) - genuinely 32-bit on BOTH sides.
 ///
 /// Milestone 15 added the signed widths `s16`/`s32` for the float
 /// conversions (`sitofp` needs a signed source, `fptosi` a signed target;
 /// bare `int` is 16-bit on msp430 but 32-bit on the host): s16 = msp430
-/// `int` / host `short`, s32 = msp430 `long` / host `int` — genuinely
+/// `int` / host `short`, s32 = msp430 `long` / host `int` - genuinely
 /// 16/32-bit on both sides, same guard pattern.
 ///
 /// Issue #14 added `s8` for the signed differential generator (signed
-/// arithmetic/comparisons at 8 bits need an explicit s8 — `signed char` is
+/// arithmetic/comparisons at 8 bits need an explicit s8 - `signed char` is
 /// 8-bit on both targets).
 ///
 /// With these, u8/u16/u32/s8/s16/s32 arithmetic wraps identically on both
@@ -102,11 +102,11 @@ const MAX_SIM_STEPS: usize = 5_000_000;
 // Seeded RNG
 // ---------------------------------------------------------------------------
 
-/// SplitMix64 — a small, self-contained, deterministic 64-bit PRNG.
+/// SplitMix64 - a small, self-contained, deterministic 64-bit PRNG.
 ///
 /// Chosen over a bare LCG at the same zero-dependency cost: SplitMix64 is a
-/// few lines, keeps only a 64-bit word of state, and — unlike an LCG, whose
-/// low bits cycle visibly — mixes every output bit, so adjacent seeds produce
+/// few lines, keeps only a 64-bit word of state, and - unlike an LCG, whose
+/// low bits cycle visibly - mixes every output bit, so adjacent seeds produce
 /// meaningfully different programs while the output stays perfectly
 /// reproducible (the corpus contract; no entropy is ever consulted).
 struct SplitMix64 {
@@ -135,8 +135,8 @@ impl SplitMix64 {
 // ---------------------------------------------------------------------------
 
 /// One volatile input global: `volatile unsigned <width> <name>;` (or
-/// `volatile float <name>;` when `is_float`), seeded with `value` — for a
-/// float input, the 4-byte IEEE-754 bit pattern — on both sides of the
+/// `volatile float <name>;` when `is_float`), seeded with `value` - for a
+/// float input, the 4-byte IEEE-754 bit pattern - on both sides of the
 /// differential (the sim seeds the RAM bytes; the host writes the bits
 /// through a union, see `host_main_source`).
 #[derive(Debug, Clone)]
@@ -173,10 +173,10 @@ pub struct Program {
 
 /// An IR-level differential program (issue #14): canonical IR text in the
 /// `ir::parse` dialect (`global <name> <ty>` / `fn <name>(<ret>) (<params>)`
-/// / `block <label>:` / `%d = <op> <ty> <a> <b>` — no LLVM `@`-global
-/// definitions, no commas) fed DIRECTLY to the in-process pipeline —
+/// / `block <label>:` / `%d = <op> <ty> <a> <b>` - no LLVM `@`-global
+/// definitions, no commas) fed DIRECTLY to the in-process pipeline  -
 /// `ir::parse` -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
-/// banking -> peephole -> asm — bypassing clang. The PIC side runs the
+/// banking -> peephole -> asm - bypassing clang. The PIC side runs the
 /// canonical IR; the host side runs the `c_twin` C source (the same
 /// computation in the C discipline) so the differential still compares
 /// checksums.
@@ -200,16 +200,16 @@ pub struct IrProgram {
 // ---------------------------------------------------------------------------
 
 /// The kind of a differential failure. The reducer accepts a candidate
-/// deletion only when the failure it observed PERSISTS — the same kind — so
+/// deletion only when the failure it observed PERSISTS - the same kind - so
 /// a candidate that merely breaks the build (e.g. a deletion that orphaned
 /// a local) is rejected as a NEW failure, not the original one surviving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
-    /// The PIC and host checksums disagree (a miscompile — the
+    /// The PIC and host checksums disagree (a miscompile - the
     /// differential's core detection).
     Mismatch,
     /// The PIC compiler pipeline panicked or the driver failed (the
-    /// loud-panic contract — a compiler bug).
+    /// loud-panic contract - a compiler bug).
     Panic,
     /// The simulator did not halt within the step budget.
     NoHalt,
@@ -332,7 +332,7 @@ const FLOAT_MIX2: u64 = 0xA5A5_1234_5678_9ABC;
 
 /// A random NORMAL f32 bit pattern with the biased exponent in `lo..=hi`.
 /// The band [100, 150] (values ~2^-27..2^23) is the safe arithmetic range
-/// — the corpus's documented filter: NaN/inf/denormals are excluded, and
+/// - the corpus's documented filter: NaN/inf/denormals are excluded, and
 /// the operand pools keep every statement RESULT in the normal range too,
 /// so the differential verifies RNE rounding without IEEE edge-case noise.
 fn normal_bits(rng: &mut SplitMix64, lo: u32, hi: u32) -> u32 {
@@ -342,7 +342,7 @@ fn normal_bits(rng: &mut SplitMix64, lo: u32, hi: u32) -> u32 {
     sign | (exp << 23) | mant
 }
 
-/// The edge input in6: ±0, the smallest normals (0x00800000-ish — the
+/// The edge input in6: ±0, the smallest normals (0x00800000-ish - the
 /// Task-3 cmp fix's boundary values), the RNE classics 1/3 and 0.1, or a
 /// random normal with exponent 80..140 (still safe as an fadd/fsub
 /// B-operand and as a cmp comparand).
@@ -380,7 +380,7 @@ struct Gen {
     /// bank) small, the long_e2e budget is ≤ 9 i32 locals.
     locals: Vec<(String, u8)>,
     /// `(start, end)` index ranges of locals that died with their C block
-    /// (if/else arms, loop bodies) — out of scope for later statements.
+    /// (if/else arms, loop bodies) - out of scope for later statements.
     dead: Vec<(usize, usize)>,
     /// The generated `main` body statements, one per line where possible
     /// (a flat, structurally-known shape for the Task-3 reducer).
@@ -388,7 +388,7 @@ struct Gen {
     used_fold16: bool,
     used_fold32: bool,
     /// Whether the array/struct globals are actually used (declared only
-    /// then — every unused global byte costs main's frame budget).
+    /// then - every unused global byte costs main's frame budget).
     used_array: bool,
     used_struct: bool,
     /// Estimated main-frame bytes emitted so far (see `frame_budget`).
@@ -406,7 +406,7 @@ struct Gen {
     /// locals). Frame-budget estimates in this mode are exact def counts
     /// (measured from clang IR), so the fill margin is 0.
     float_mode: bool,
-    /// Float locals (`float tN`) emitted so far — the float operand pool
+    /// Float locals (`float tN`) emitted so far - the float operand pool
     /// (a local's value is a normal-range float by construction, see
     /// `emit_fbin`; int locals never exist in float mode).
     flocals: Vec<String>,
@@ -446,11 +446,11 @@ impl Gen {
     }
 
     /// A `(width)`-cast operand: an input, a recent local, or a constant
-    /// (always inside `width`'s range — constants never truncate).
+    /// (always inside `width`'s range - constants never truncate).
     ///
     /// Only SAME-WIDTH inputs/locals are drawn: a cross-width cast would
     /// make clang materialize a zext/trunc def in main's frame, and the
-    /// frame-budget model counts the statement's own defs, not the casts —
+    /// frame-budget model counts the statement's own defs, not the casts  -
     /// the corpus found the resulting bank-0 overflow (seeds 34/169/176).
     fn operand(&mut self, w: u8) -> String {
         let ct = ctype(w);
@@ -484,7 +484,7 @@ impl Gen {
         let ct = ctype(w);
         // The input of the same width (each width has exactly one input:
         // in0 u8, in1 u16, in2 u32), found by position in INPUT_WIDTHS like
-        // `operand` does — a w / 8 - 1 formula would yield the undeclared
+        // `operand` does - a w / 8 - 1 formula would yield the undeclared
         // in3 for w = 32.
         let i = INPUT_WIDTHS
             .iter()
@@ -586,7 +586,7 @@ impl Gen {
         if self.float_mode {
             // Float-mode globals end (measured from the allocator, which
             // places even-aligned): in0 u8 @0x20, in3 float @0x22, in6 float
-            // @0x26, checksum u8 @0x2A, fout float @0x2C — end 0x30. (No
+            // @0x26, checksum u8 @0x2A, fout float @0x2C - end 0x30. (No
             // array/struct in float mode.)
             return 0x70 - self.worst_routine - 0x30;
         }
@@ -610,7 +610,7 @@ impl Gen {
         let routine = self.worst_routine.max(routine);
         // The 8-byte safety margin applies to the FILL phase only: the
         // per-statement estimates are measured upper bounds (>= real), so
-        // forced statements must fit by estimate alone — the margin would
+        // forced statements must fit by estimate alone - the margin would
         // reject real-fit flagged combos (e.g. array+struct: 35 est of a
         // 41 budget). The fill statements' cumulative real cost is still
         // bounded by est + 8 <= the hard bank-0 limit. Float mode's
@@ -626,7 +626,7 @@ impl Gen {
         // The trailing `+ (u8)in0` is a volatile read: without it the body
         // is pure arithmetic on the arg, so a constant-foldable arg makes
         // clang specialize the helper and dead-arg the original call into
-        // `poison` (seed 2 — the IR pipeline cannot parse poison). in0 is
+        // `poison` (seed 2 - the IR pipeline cannot parse poison). in0 is
         // seeded identically on both sides, so the fold stays deterministic.
         if used16 {
             s.push_str(
@@ -641,7 +641,7 @@ impl Gen {
         s
     }
 
-    /// Emit `{ct} tK = expr;` (declare-and-initialize — every generated
+    /// Emit `{ct} tK = expr;` (declare-and-initialize - every generated
     /// local is single-assignment) + the fold, and return the local name.
     fn push_compute(&mut self, w: u8, expr: String) -> String {
         let t = self.new_local(w);
@@ -705,7 +705,7 @@ impl Gen {
         };
         // A FORCED (flag-guaranteed) op must fit, and the later forced
         // statements' globals (array/struct) shrink the budget, so a heavy
-        // forced op always runs at u8 — the cheapest width. The guarantee
+        // forced op always runs at u8 - the cheapest width. The guarantee
         // is on the OP, not the width: a u8 mul still pulls in the mul
         // runtime routine (mul i16), and u16/u32 arith stays covered by
         // the fill statements. Fill statements keep the random width and
@@ -726,7 +726,7 @@ impl Gen {
         let a = self.operand(w);
         // i8/i16 div/rem need a RUNTIME divisor (a constant divisor makes
         // clang strength-reduce into magic-number i9/i17 multiplies the IR
-        // pipeline cannot parse; u32 keeps `udiv i32` — see `operand_reg`).
+        // pipeline cannot parse; u32 keeps `udiv i32` - see `operand_reg`).
         let b = if w < 32 && matches!(op, BinOp::Div | BinOp::Rem) {
             self.operand_reg(w)
         } else {
@@ -812,7 +812,7 @@ impl Gen {
     /// the checksum (branch-conditional folding; the same seeded inputs run
     /// the same branch on both sides, and both arms' code survives).
     fn emit_ifelse(&mut self) -> bool {
-        // A forced (flag-guaranteed) if always runs at u8 — the cheapest —
+        // A forced (flag-guaranteed) if always runs at u8 - the cheapest  -
         // so it fits alongside the other forced statements; the fill phase
         // keeps the random width (u32 ifs are expensive, ~30 main bytes).
         let w = if self.forced { 8 } else { self.pick_width() };
@@ -843,7 +843,7 @@ impl Gen {
             let fold = g.fold_line(w, &t).replace("  ", "    ");
             format!("{line}\n{fold}")
         };
-        // The then-arm's locals die at the end of their block — mark them
+        // The then-arm's locals die at the end of their block - mark them
         // dead BEFORE generating the else arm, so the else arm (and later
         // statements) can never reference them.
         let then = arm(self);
@@ -860,7 +860,7 @@ impl Gen {
     fn emit_loop(&mut self) -> bool {
         // Bias the accumulator to u8 (a u32 loop's phi web costs ~4x a u8
         // one in main's frame and starves the mul/div statements of budget
-        // — u32 math is covered by arith/struct/cmp instead). A forced
+        // - u32 math is covered by arith/struct/cmp instead). A forced
         // (flag-guaranteed) loop always runs at u8.
         let w = if self.forced {
             8
@@ -894,7 +894,7 @@ impl Gen {
             _ => format!("{}u", 2 + self.below(4)),
         };
         let mut body = String::new();
-        // 1-2 body ops (each is a def in the phi web — keep the loop cheap).
+        // 1-2 body ops (each is a def in the phi web - keep the loop cheap).
         // NO `+`/`-` on the induction var: clang -O1 strength-reduces
         // `acc += i` over the masked bound into a closed-form sum in i9
         // magic arithmetic, which the IR pipeline cannot parse (found by
@@ -978,7 +978,7 @@ impl Gen {
         // magic multiply (see `operand_reg`). The real urem surface is
         // covered by the runtime-divisor arith statements.
         let n = [8u32, 4, 8, 4][self.below(4) as usize];
-        // Operands FIRST — a local created before them would self-reference.
+        // Operands FIRST - a local created before them would self-reference.
         let x = self.operand(16);
         let y = self.operand(8);
         let ix = self.new_local(8);
@@ -990,11 +990,11 @@ impl Gen {
 
     /// A struct statement: field-wise stores into the volatile global
     /// struct `s` (u8/u16/u32 fields), then a width-mixing fold over the
-    /// fields (explicit casts; no layout dependence — names only).
+    /// fields (explicit casts; no layout dependence - names only).
     fn emit_struct(&mut self) -> bool {
         // Main-frame cost = the three operand locals + the field loads +
         // the s.c u32 shift/xor chain, MEASURED at 21-23 defs from clang
-        // -O1 IR (the u32 fold is expensive in main's frame — the old
+        // -O1 IR (the u32 fold is expensive in main's frame - the old
         // 13-byte estimate under-ran by ~10 and overflowed bank 0 once
         // the routine frames were stacked on main's end).
         if !self.fit(24, 0, false, true) {
@@ -1026,13 +1026,13 @@ impl Gen {
 
     // ---- Issue #14: the signed surface (signed mode only) ----
 
-    /// A signed width (s8/s16/s32 — the same byte widths as u8/u16/u32, so
+    /// A signed width (s8/s16/s32 - the same byte widths as u8/u16/u32, so
     /// the frame-budget model and the local slots are shared).
     fn spick_width(&mut self) -> u8 {
         [8u8, 16, 32][self.below(3) as usize]
     }
 
-    /// A signed arithmetic statement: `(sW)((uW)a op (uW)b)` — computed in
+    /// A signed arithmetic statement: `(sW)((uW)a op (uW)b)` - computed in
     /// the unsigned domain so wrapping is defined on BOTH sides (C's usual
     /// arithmetic conversions: on msp430 u16/u32 promote to the unsigned
     /// int/long of the same width and wrap mod 2^W; on the host the wider
@@ -1080,7 +1080,7 @@ impl Gen {
             _ => "^",
         };
         // Forced statements draw volatile/local operands only (a const
-        // operand would let clang fold the op away — no coverage).
+        // operand would let clang fold the op away - no coverage).
         let pick = |g: &mut Self, w: u8| -> String {
             if g.forced {
                 g.operand_reg(w)
@@ -1107,17 +1107,17 @@ impl Gen {
     /// A signed div/rem statement with a CONSTANT divisor in 2..=9: the
     /// only signed-division UB pair is INT_MIN / -1, and the divisor is
     /// neither 0 nor -1, so no dividend guard is needed (signed const
-    /// divisors stay plain `sdiv`/`srem` — clang does NOT magic-number
+    /// divisors stay plain `sdiv`/`srem` - clang does NOT magic-number
     /// strength-reduce signed division, verified; the unsigned generator's
     /// runtime-divisor rule is a udiv-only quirk). The dividend is a
-    /// volatile input / local (never a constant — a const would fold).
+    /// volatile input / local (never a constant - a const would fold).
     fn emit_sdivrem(&mut self, rem: bool) -> bool {
         let mut w = self.spick_width();
         if self.forced {
             w = 8; // a flag-guaranteed statement runs at the cheapest width
         }
         // Frames: __sdiv/__srem_i8 = 5, i16 = 7, i32 = 12 (the unsigned
-        // table's 14/14/12 over-estimates — conservative, so reuse it).
+        // table's 14/14/12 over-estimates - conservative, so reuse it).
         let (cost, routine) = match w {
             8 => (10, 14),
             16 => (12, 14),
@@ -1138,8 +1138,8 @@ impl Gen {
         true
     }
 
-    /// A signed arithmetic-shift statement: `(sW)((sW)v >> c)` — a const
-    /// count in 1..=W-1, or a masked runtime count (volatile/local — a
+    /// A signed arithmetic-shift statement: `(sW)((sW)v >> c)` - a const
+    /// count in 1..=W-1, or a masked runtime count (volatile/local - a
     /// const count would fold the shift). ashr sign-fills, exercising the
     /// __ashr routines' sign extension.
     fn emit_sshift(&mut self) -> bool {
@@ -1173,7 +1173,7 @@ impl Gen {
     }
 
     /// A signed comparison folded straight into the checksum:
-    /// `checksum ^= (u8)((sW)a rel (sW)b)` — icmp slt/sle/sgt/sge/eq/ne.
+    /// `checksum ^= (u8)((sW)a rel (sW)b)` - icmp slt/sle/sgt/sge/eq/ne.
     /// Volatile/local operands only (a const pair would fold the icmp).
     fn emit_scmp(&mut self) -> bool {
         let mut w = self.spick_width();
@@ -1204,7 +1204,7 @@ impl Gen {
     /// generated normal with the exponent in 100..150, value ~2^-27..2^23),
     /// a normal-range constant, or a recent float local. The band pool is
     /// the safe source for every arithmetic slot: values are normal and
-    /// their arithmetic stays normal (the corpus's documented filter — no
+    /// their arithmetic stays normal (the corpus's documented filter - no
     /// NaN/denormal/inf INPUTS, and the operand pools keep the RESULTS
     /// normal too, so the differential verifies RNE rounding without IEEE
     /// edge-case noise). Returns `(text, main-frame bytes the load costs)`.
@@ -1223,11 +1223,11 @@ impl Gen {
     }
 
     /// A float operand from the ANY pool: the band pool plus the edge input
-    /// in6 (±0, the smallest normals, and normals with exponents 80..140 —
+    /// in6 (±0, the smallest normals, and normals with exponents 80..140  -
     /// the Task-3 cmp fix's boundary values). The edge input is safe as a
     /// fcmp operand (comparisons are exact) and as an fadd/fsub B-operand
     /// (the band A-operand dominates, so A ± B stays in the normal range),
-    /// but NOT for fmul/fdiv — the smallest normals would underflow to a
+    /// but NOT for fmul/fdiv - the smallest normals would underflow to a
     /// denormal and zero would divide by zero.
     fn foperand_any(&mut self) -> (String, u32) {
         match self.below(5) {
@@ -1245,9 +1245,9 @@ impl Gen {
     }
 
     /// A KNOWN-NONZERO divisor for fdiv: the band input in3 (exponent
-    /// 100..150 — never zero) or a nonzero constant. Locals are excluded:
+    /// 100..150 - never zero) or a nonzero constant. Locals are excluded:
     /// their value is unknown to the generator, and a runtime zero divisor
-    /// would diverge — the host computes IEEE ±inf (sign of the dividend)
+    /// would diverge - the host computes IEEE ±inf (sign of the dividend)
     /// while the routine returns the deterministic +0x7F800000.
     fn fdivisor(&mut self) -> (String, u32) {
         match self.below(3) {
@@ -1278,10 +1278,10 @@ impl Gen {
 
     /// The bits fold for a float RESULT: store it to the volatile `fout`
     /// global, re-read the four bytes as a u32 (the type-punned
-    /// `*(volatile u32*)&fout` — LLVM opaque pointers make this a plain
+    /// `*(volatile u32*)&fout` - LLVM opaque pointers make this a plain
     /// `load i32` of the float global's bytes, no bitcast inst), and fold
     /// through the shared fold32 helper. The fold is over the float's EXACT
-    /// bits — a single wrong RNE bit changes the checksum.
+    /// bits - a single wrong RNE bit changes the checksum.
     fn fpush_fold(&mut self, t: &str) {
         self.used_fold32 = true;
         self.body.push(format!("  fout = {t};"));
@@ -1335,7 +1335,7 @@ impl Gen {
     }
 
     /// A float comparison statement: `checksum = (u8)(checksum ^ (u8)(a rel
-    /// b));` — the fcmp predicate materialized by legalize's __cmp_f32
+    /// b));` - the fcmp predicate materialized by legalize's __cmp_f32
     /// tri-state tree (the C ordered operators cover olt/ole/ogt/oge/oeq/
     /// one). Main-frame cost = the operand loads + the tree's worst shape
     /// (call 1 + 2 icmps 2 + select 1 + the zext 1 + the checksum load 1 +
@@ -1362,10 +1362,10 @@ impl Gen {
     }
 
     /// A float conversion statement. The sources are the bits of the band
-    /// input in3 read through the type-punned load (any u32 — always
+    /// input in3 read through the type-punned load (any u32 - always
     /// defined), and the fptoui/fptosi targets are masked to ≤ 32767.5 so
     /// the conversion is ALWAYS in range (an out-of-range fptoui/fptosi is
-    /// LLVM poison — the host could materialize anything, diverging from
+    /// LLVM poison - the host could materialize anything, diverging from
     /// the routine's clamp). The `* 0.5f` makes odd masks fractional,
     /// exercising the truncation. Costs measured from clang IR.
     fn emit_fconv(&mut self, kind: FConvKind) -> bool {
@@ -1395,7 +1395,7 @@ impl Gen {
                 let cost = 23;
                 // The shape contains an fmul (`* 0.5f`): __mul_f32's FULL
                 // frame (params 8 + scratch 14 = 22) dominates the
-                // conversion routines' 12-byte frames — counting 12 let
+                // conversion routines' 12-byte frames - counting 12 let
                 // seed 4's conv overflow bank 0 (the __mul_f32 slots at
                 // 0xA0, found by the M15 float corpus).
                 if !self.fit(cost, 22, false, false) {
@@ -1403,7 +1403,7 @@ impl Gen {
                 }
                 self.frame_est += cost;
                 self.worst_routine = self.worst_routine.max(22);
-                // (float)(bits & 0xFFFF) * 0.5f <= 32767.5 — in range for
+                // (float)(bits & 0xFFFF) * 0.5f <= 32767.5 - in range for
                 // both the u32 and the s32 target (defined conversions).
                 let line = match kind {
                     FConvKind::FpToUi => {
@@ -1423,7 +1423,7 @@ impl Gen {
 
     /// Emit the helper functions (1–3): noinline, 0–3 unsigned params,
     /// u8 return. Bodies use only INLINE ops (add/sub/and/or/xor/const
-    /// shifts/icmps — no mul/div/rem, whose runtime-routine frames would
+    /// shifts/icmps - no mul/div/rem, whose runtime-routine frames would
     /// stack on main's frame) so helper frames never hit the bank-0 limit.
     fn emit_helpers(&mut self) -> (Vec<Helper>, String) {
         let n = 1 + self.below(3) as usize; // 1..=3
@@ -1446,7 +1446,7 @@ impl Gen {
             let mut prev: Vec<(String, u8)> = Vec::new();
             // One op PER PARAM first: every param must be referenced in the
             // body, or clang replaces the unused call arg with `poison`
-            // (found by the corpus at seed 19 — the IR pipeline cannot
+            // (found by the corpus at seed 19 - the IR pipeline cannot
             // parse poison, so it panics loudly). The op's second operand is
             // a VOLATILE INPUT read: that makes the body impossible to
             // constant-fold/specialize, so clang cannot dead-arg the call
@@ -1464,7 +1464,7 @@ impl Gen {
                 prev.push((v, pw));
             }
             // Then 1-2 extra ops over params/prev locals/constants (inline
-            // ops only — no mul/div/rem, whose runtime-routine frames
+            // ops only - no mul/div/rem, whose runtime-routine frames
             // would stack on main's frame; helpers stay self-contained).
             let nops = 1 + self.below(2) as usize;
             for _ in 0..nops {
@@ -1564,17 +1564,17 @@ pub fn generate(seed: u64) -> Program {
     // Per-seed feature flags: each construct/op is guaranteed to appear in
     // a program when its flag is set (the RNG mix varies which programs are
     // rich; the fixed 8-seed fast corpus and the 200-seed corpus span the
-    // surface — pinned by the tests' coverage sanity checks). The heavy ops
+    // surface - pinned by the tests' coverage sanity checks). The heavy ops
     // (mul/div/rem pull in the big runtime routines) are flags too: forced
     // FIRST, while the frame budget is empty, so the random fill cannot
     // starve them.
     //
-    // The flags are a BOUNDED random subset — exactly 2 of the 8, not
+    // The flags are a BOUNDED random subset - exactly 2 of the 8, not
     // independent bits: main's frame (and the runtime routines' frames
     // stacked under it) is a hard hardware limit, so one program can
     // only hold a couple of heavy constructs. An unbounded bit-draw let a
     // seed's forced tail exceed the budget and was SILENTLY DROPPED
-    // (review finding — 'guaranteed when flagged' was false); force() now
+    // (review finding - 'guaranteed when flagged' was false); force() now
     // panics if a flagged construct cannot fit, so the draw must stay
     // inside the budget by construction. The RNG mix still varies which
     // programs are rich (which 2 of the 8), and the fill statements cover
@@ -1620,7 +1620,7 @@ pub fn generate(seed: u64) -> Program {
 
     // Feature-flagged statements FIRST (frame budget empty, so the heavy
     // mul/div/rem and the structured constructs all fit), then a weighted
-    // random fill bounded by the frame budget — the backend gives every
+    // random fill bounded by the frame budget - the backend gives every
     // SSA def, volatile loads included, its own RAM slot, so main's frame,
     // and the runtime routines' frames stacked under it, cap the program's
     // size. While `forced` is set, the structured statements
@@ -1655,12 +1655,12 @@ pub fn generate(seed: u64) -> Program {
             // A flagged construct is GUARANTEED to appear (the tests pin
             // the corpus's per-seed feature coverage). Silently dropping it
             // on a budget rejection would lose that coverage without a
-            // trace, so fail loudly instead — the frame-budget model must
+            // trace, so fail loudly instead - the frame-budget model must
             // be recalibrated (cheaper forced variants, fewer simultaneous
             // flags) until every flagged construct fits.
             panic!(
                 "fuzz: seed {seed}: flagged construct #{k} rejected by the frame budget \
-                 (frame_est {}, worst_routine {}, budget {}) — the 'guaranteed when \
+                 (frame_est {}, worst_routine {}, budget {}) - the 'guaranteed when \
                  flagged' contract is broken; recalibrate the budget model",
                 g.frame_est,
                 g.worst_routine,
@@ -1727,26 +1727,26 @@ pub fn generate(seed: u64) -> Program {
 // Milestone 15: the float differential (Task 5)
 // ---------------------------------------------------------------------------
 
-/// Generate a deterministic FLOAT differential program from `seed` — the
+/// Generate a deterministic FLOAT differential program from `seed` - the
 /// milestone's RNE verification at scale. The float inputs are random
 /// IEEE-754 BIT PATTERNS under the documented corpus filter: NaN,
 /// infinities, and denormals are EXCLUDED (the routines' IEEE edge-case
-/// handling is deterministic-but-minimal and deferred — see the plan's
+/// handling is deterministic-but-minimal and deferred - see the plan's
 /// self-review notes); in3 is a normal with the exponent in the safe band
 /// 100..150 (value ~2^-27..2^23, whose arithmetic stays in the normal
 /// range), and in6 is the edge value (±0, the smallest normals
-/// 0x00800000-ish, and normals with exponents 80..140 — covering the
+/// 0x00800000-ish, and normals with exponents 80..140 - covering the
 /// Task-3 cmp fix: the sign-magnitude ordering, the zero equality, and the
 /// smallest-normals boundary).
 ///
-/// The statements cover the whole float surface — fadd/fsub/fmul/fdiv
+/// The statements cover the whole float surface - fadd/fsub/fmul/fdiv
 /// (the four soft-float arithmetic routines), fcmp (the ordered C
 /// predicates through legalize's __cmp_f32 tri-state tree), and the four
-/// int↔float conversions (uitofp/sitofp/fptoui/fptosi) — with the operand
+/// int↔float conversions (uitofp/sitofp/fptoui/fptosi) - with the operand
 /// pools chosen so every RESULT also stays in the normal range (no
 /// overflow/underflow/denormal noise; the differential then purely verifies
 /// RNE rounding at scale). Every float result is folded over its BITS: the
-/// volatile `fout` global is re-read as u32 (the type-punned load — a
+/// volatile `fout` global is re-read as u32 (the type-punned load - a
 /// single wrong RNE bit changes the fold), and the fold32 byte-mix feeds
 /// the volatile u8 checksum. `in0` (u8) stays as the fold helper's
 /// determinism anchor (same role as in the integer generator).
@@ -1764,8 +1764,8 @@ pub fn generate_float(seed: u64) -> Program {
     let mut rng = SplitMix64::new(seed ^ FLOAT_MIX2);
 
     // Inputs: in0 u8 (the fold anchor), in3 the band normal (exponent
-    // 100..150 — the safe arithmetic source), in6 the edge value (±0, the
-    // smallest normals, normals with exponents 80..140 — the cmp coverage).
+    // 100..150 - the safe arithmetic source), in6 the edge value (±0, the
+    // smallest normals, normals with exponents 80..140 - the cmp coverage).
     let mut inputs = Vec::new();
     inputs.push(Input {
         name: "in0".into(),
@@ -1801,7 +1801,7 @@ pub fn generate_float(seed: u64) -> Program {
     // rotates ((seed / 6) % 4), so uitofp/sitofp/fptoui/fptosi each get
     // forced seeds in the corpus. Its operands come from the
     // inputs/constants (no locals yet) and its cost (<= 23) fits the empty
-    // frame — a rejection means the budget model is broken.
+    // frame - a rejection means the budget model is broken.
     let forced: FloatKind = match seed % 6 {
         0 => FloatKind::Add,
         1 => FloatKind::Sub,
@@ -1824,7 +1824,7 @@ pub fn generate_float(seed: u64) -> Program {
     if !forced_ok {
         panic!(
             "fuzz: float seed {seed}: the forced statement was rejected by the frame budget \
-             (frame_est {}, worst_routine {}, budget {}) — recalibrate the float budget model",
+             (frame_est {}, worst_routine {}, budget {}) - recalibrate the float budget model",
             g.frame_est,
             g.worst_routine,
             g.frame_budget()
@@ -1875,7 +1875,7 @@ enum FloatKind {
 }
 
 /// Emit one float statement of `k`; false = the frame budget rejected it
-/// (the fill loop stops; the forced statement panics instead — see
+/// (the fill loop stops; the forced statement panics instead - see
 /// `generate_float`).
 fn emit_float_kind(g: &mut Gen, k: FloatKind, force_input: bool) -> bool {
     match k {
@@ -1906,14 +1906,14 @@ fn emit_float_kind(g: &mut Gen, k: FloatKind, force_input: bool) -> bool {
 const SIGNED_MIX: u64 = 0x51ED_0000_0000_0001;
 const SIGNED_MIX2: u64 = 0x51ED_0000_0000_0002;
 
-/// Generate a deterministic SIGNED differential program from `seed` — issue
+/// Generate a deterministic SIGNED differential program from `seed` - issue
 /// #14's signed surface. The inputs are the same fixed u8/u16/u32 volatile
 /// globals as the integer generator (in0/in1/in2), read through `(sW)`
-/// casts; the statements are the signed ops — sdiv/srem (const divisors
+/// casts; the statements are the signed ops - sdiv/srem (const divisors
 /// 2..=9, so the only signed-division UB pair INT_MIN / -1 is excluded by
 /// construction), ashr (const or masked counts), the signed comparisons
 /// (icmp slt/sle/sgt/sge/eq/ne folded straight into the checksum), and the
-/// signed binops — all computed in the wrap-safe discipline:
+/// signed binops - all computed in the wrap-safe discipline:
 ///
 /// - arithmetic computes in the UNSIGNED domain and re-casts
 ///   (`(sW)((uW)a op (uW)b)`), so wrapping is defined on BOTH sides (C's
@@ -1922,20 +1922,20 @@ const SIGNED_MIX2: u64 = 0x51ED_0000_0000_0002;
 ///   wider int holds the exact result and the cast truncates identically);
 /// - mul widens to the next unsigned width (u8 -> u16, u16 -> u32) so the
 ///   host's int promotion cannot overflow;
-/// - div/rem use const divisors 2..=9 (never 0, never -1 — the only
+/// - div/rem use const divisors 2..=9 (never 0, never -1 - the only
 ///   host-UB pair is INT_MIN / -1, excluded by construction; signed const
-///   divisors stay plain `sdiv`/`srem` — clang does NOT magic-number
+///   divisors stay plain `sdiv`/`srem` - clang does NOT magic-number
 ///   strength-reduce signed division, verified);
 /// - ashr results are folded width-preservingly (a signed shift truncated
 ///   to u8 would let clang prove the sign-fill irrelevant and lower it as
-///   `lshr` — the fold reads the full width, so the ashr stays).
+///   `lshr` - the fold reads the full width, so the ashr stays).
 ///
 /// Every random choice comes from the seeded RNG in a fixed order, so
 /// `seed` fully determines the program. The first (forced) statement's
 /// kind rotates over the 8 signed families (seed % 8), so across the
 /// corpus every signed kind is guaranteed to appear; the fill statements
 /// are best-effort against the frame budget (the same bank-0 model as the
-/// integer generator — the signed routines' frames are smaller than the
+/// integer generator - the signed routines' frames are smaller than the
 /// unsigned ones, so the budget is conservative).
 pub fn generate_signed(seed: u64) -> Program {
     let mut g = Gen::new(seed ^ SIGNED_MIX);
@@ -1965,7 +1965,7 @@ pub fn generate_signed(seed: u64) -> Program {
 
     // The forced first statement rotates over the 8 signed families
     // (seed % 8), so the corpus spans the signed surface by construction.
-    // Each forced statement runs at s8 (the cheapest width — the guarantee
+    // Each forced statement runs at s8 (the cheapest width - the guarantee
     // is on the KIND, not the width) and fits the empty frame; a rejection
     // means the budget model is broken.
     let forced: SignedKind = match seed % 8 {
@@ -1992,7 +1992,7 @@ pub fn generate_signed(seed: u64) -> Program {
     if !forced_ok {
         panic!(
             "fuzz: signed seed {seed}: the forced statement was rejected by the frame budget \
-             (frame_est {}, worst_routine {}, budget {}) — recalibrate the signed budget model",
+             (frame_est {}, worst_routine {}, budget {}) - recalibrate the signed budget model",
             g.frame_est,
             g.worst_routine,
             g.frame_budget()
@@ -2052,7 +2052,7 @@ pub fn generate_signed(seed: u64) -> Program {
 
 // ---------------------------------------------------------------------------
 // Issue #14: the IR-level differential (canonical IR straight to the
-// in-process pipeline — no clang, no driver binary)
+// in-process pipeline - no clang, no driver binary)
 // ---------------------------------------------------------------------------
 
 /// The RNG-mix constants separating the IR generator's streams from the
@@ -2061,19 +2061,19 @@ pub fn generate_signed(seed: u64) -> Program {
 const IR_MIX: u64 = 0x1A5E_0000_0000_0001;
 const IR_MIX2: u64 = 0x1A5E_0000_0000_0002;
 
-/// Generate a deterministic IR-level differential program from `seed` —
+/// Generate a deterministic IR-level differential program from `seed`  -
 /// issue #14's IR mode. The PIC side runs the canonical IR text (the
 /// `ir::parse` dialect: `global <name> <ty>` / `fn <name>(<ret>) (<params>)`
-/// / `block <label>:` / `%d = <op> <ty> <a> <b>` — no LLVM `@`-global
-/// definitions, no commas) DIRECTLY through the in-process pipeline —
+/// / `block <label>:` / `%d = <op> <ty> <a> <b>` - no LLVM `@`-global
+/// definitions, no commas) DIRECTLY through the in-process pipeline  -
 /// `ir::parse` -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
-/// banking -> peephole -> asm — bypassing clang and the driver binary. The
+/// banking -> peephole -> asm - bypassing clang and the driver binary. The
 /// host side runs the `c_twin` C source (the same computation in the C
 /// discipline) through host clang, so the differential still compares
 /// checksums.
 ///
 /// The statement pool covers the signed IR surface: `sdiv`/`srem` (const
-/// divisors 2..=9 — the only signed-division UB pair INT_MIN / -1 is
+/// divisors 2..=9 - the only signed-division UB pair INT_MIN / -1 is
 /// excluded by construction), `ashr` (const counts), `icmp slt` (zext to
 /// i8), plus `add`/`trunc` as the supporting surface and a rare i32 `sdiv`.
 /// Every statement's result is folded into the volatile i8 `checksum`
@@ -2176,7 +2176,7 @@ pub fn generate_ir(seed: u64) -> IrProgram {
                     )
                 }
                 3 => {
-                    // add i16 (unsigned wrap — matches the C unsigned-domain
+                    // add i16 (unsigned wrap - matches the C unsigned-domain
                     // discipline).
                     let a = last16.clone().unwrap_or_else(|| in_reg.clone());
                     let a_c = last16_c.clone().unwrap_or_else(|| "in".to_string());
@@ -2238,7 +2238,7 @@ pub fn generate_ir(seed: u64) -> IrProgram {
                     )
                 }
                 _ => {
-                    // i32 sdiv by a const 2..=9 (at most once — the biggest
+                    // i32 sdiv by a const 2..=9 (at most once - the biggest
                     // routine frame).
                     if used_i32 {
                         // Fall back to an i16 sdiv (the i32 slot is spent).
@@ -2400,13 +2400,13 @@ fn ir_fold_lines(ir_reg: &str, c_local: &str, width: u8, reg: &mut u32) -> (Vec<
 /// which surfaces as a failed process or a caught pipeline panic), a
 /// non-halting sim run, or a host/PIC checksum mismatch. The classification
 /// (`FailureKind`) is what the Task-3 reducer preserves.
-pub fn run_differential(program: &Program) -> Result<u32, Failure> {
+pub fn run_differential(program: &Program, device: &device::Device) -> Result<u32, Failure> {
     let dir = WorkDir::new();
     let c_path = dir.path.join("prog.c");
     std::fs::write(&c_path, &program.c_source)
         .map_err(|e| Failure::new(FailureKind::Harness, format!("write prog.c: {e}")))?;
 
-    let pic = run_pic(program, &c_path, &dir)?;
+    let pic = run_pic(program, &c_path, &dir, device)?;
     let host = run_host(program, &c_path, &dir)?;
 
     if pic == host {
@@ -2421,15 +2421,15 @@ pub fn run_differential(program: &Program) -> Result<u32, Failure> {
 
 /// Run an IR-level program on both sides and return the agreed checksum
 /// (issue #14's IR mode): the PIC side runs the canonical IR through the
-/// in-process pipeline — `ir::parse` -> wholeprog -> legalize -> callgraph
-/// -> alloc -> isel -> banking -> peephole -> asm — bypassing clang and
+/// in-process pipeline - `ir::parse` -> wholeprog -> legalize -> callgraph
+/// -> alloc -> isel -> banking -> peephole -> asm - bypassing clang and
 /// the driver binary; the host side compiles the C twin with host clang
 /// (the same computation in the C discipline). A pipeline panic is a
 /// `Panic` failure (the loud-panic contract); a checksum disagreement a
 /// `Mismatch`.
-pub fn run_ir_differential(prog: &IrProgram) -> Result<u32, Failure> {
+pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure> {
     let dir = WorkDir::new();
-    let pic = run_ir_pic(prog)?;
+    let pic = run_ir_pic(prog, device)?;
 
     let twin_path = dir.path.join("twin.c");
     std::fs::write(&twin_path, &prog.c_twin)
@@ -2460,20 +2460,28 @@ pub fn run_ir_differential(prog: &IrProgram) -> Result<u32, Failure> {
 /// checksum read, `halted()` required. A pipeline panic (a compiler bug)
 /// is caught and reported as a `Panic` failure, so the fuzz loop survives
 /// them.
-fn run_ir_pic(prog: &IrProgram) -> Result<u32, Failure> {
+fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure> {
     let (hex, layout) = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut m = ir::parse(&prog.ir_text);
         m = wholeprog::merge(m);
         m = legalize::legalize(m);
         let cg = callgraph::build(&m);
-        let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
+        let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
         let mut addrs: HashMap<String, u16> = HashMap::new();
         addrs.extend(layout.globals.clone());
         addrs.extend(layout.locals.clone());
-        let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-        let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-        let asm = peephole::optimize(&asm);
-        let hex = asm::assemble_file_to_hex(&device::PIC16F877A, &asm);
+        let hex = match device.core {
+            device::Core::Pic18 => {
+                let asm = isel_pic18::select(device, &m, &addrs);
+                asm::assemble_file_to_hex(device, &asm)
+            }
+            device::Core::Pic14 => {
+                let asm = isel::select(device, &m, &addrs);
+                let asm = banking::assign_banks(device, &asm);
+                let asm = peephole::optimize(&asm);
+                asm::assemble_file_to_hex(device, &asm)
+            }
+        };
         (hex, layout)
     }))
     .map_err(|p| {
@@ -2495,34 +2503,62 @@ fn run_ir_pic(prog: &IrProgram) -> Result<u32, Failure> {
             )
         })?;
 
-    let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-    for input in &prog.inputs {
-        let addr = *layout
-            .globals
-            .get(&input.name)
-            .ok_or_else(|| {
-                Failure::new(
-                    FailureKind::Compile,
-                    format!("no global '{}' in the alloc map", input.name),
-                )
-            })?;
-        seed_le(&mut p, addr, input.width, input.value);
-    }
-    p.run(MAX_SIM_STEPS);
-    if !p.halted() {
-        return Err(Failure::new(
-            FailureKind::NoHalt,
-            format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
-        ));
-    }
-    Ok(read_le(p.ram(), checksum_addr, 1) as u32)
+    let checksum = match device.core {
+        device::Core::Pic18 => {
+            let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+            for input in &prog.inputs {
+                let addr = *layout
+                    .globals
+                    .get(&input.name)
+                    .ok_or_else(|| {
+                        Failure::new(
+                            FailureKind::Compile,
+                            format!("no global '{}' in the alloc map", input.name),
+                        )
+                    })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
+        device::Core::Pic14 => {
+            let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
+            for input in &prog.inputs {
+                let addr = *layout
+                    .globals
+                    .get(&input.name)
+                    .ok_or_else(|| {
+                        Failure::new(
+                            FailureKind::Compile,
+                            format!("no global '{}' in the alloc map", input.name),
+                        )
+                    })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
+    };
+    Ok(checksum)
 }
 
 /// PIC side: alloc layout (in-process, mirroring the driver's e2e) for the
 /// input/checksum addresses, the driver binary for the hex, `pic14-sim`
 /// seeded at those addresses, run, checksum read, `halted()` required.
-fn run_pic(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Failure> {
-    let layout = pic_layout(c_path)?;
+fn run_pic(program: &Program, c_path: &Path, dir: &WorkDir, device: &device::Device) -> Result<u32, Failure> {
+    let layout = pic_layout(c_path, device)?;
     let checksum_addr = *layout
         .globals
         .get(&program.checksum_name)
@@ -2534,31 +2570,59 @@ fn run_pic(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Failu
         })?;
 
     let hex_path = dir.path.join("prog.hex");
-    run_driver(c_path, &hex_path)?;
+    run_driver(c_path, &hex_path, device)?;
 
     let hex = std::fs::read_to_string(&hex_path)
         .map_err(|e| Failure::new(FailureKind::Harness, format!("read {}: {e}", hex_path.display())))?;
-    let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-    for input in &program.inputs {
-        let addr = *layout
-            .globals
-            .get(&input.name)
-            .ok_or_else(|| {
-                Failure::new(
-                    FailureKind::Compile,
-                    format!("no global '{}' in the alloc map", input.name),
-                )
-            })?;
-        seed_le(&mut p, addr, input.width, input.value);
-    }
-    p.run(MAX_SIM_STEPS);
-    if !p.halted() {
-        return Err(Failure::new(
-            FailureKind::NoHalt,
-            format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
-        ));
-    }
-    Ok(read_le(p.ram(), checksum_addr, 1) as u32)
+    let checksum = match device.core {
+        device::Core::Pic18 => {
+            let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+            for input in &program.inputs {
+                let addr = *layout
+                    .globals
+                    .get(&input.name)
+                    .ok_or_else(|| {
+                        Failure::new(
+                            FailureKind::Compile,
+                            format!("no global '{}' in the alloc map", input.name),
+                        )
+                    })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
+        device::Core::Pic14 => {
+            let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
+            for input in &program.inputs {
+                let addr = *layout
+                    .globals
+                    .get(&input.name)
+                    .ok_or_else(|| {
+                        Failure::new(
+                            FailureKind::Compile,
+                            format!("no global '{}' in the alloc map", input.name),
+                        )
+                    })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
+    };
+    Ok(checksum)
 }
 
 /// Host side: compile `prog.c` + a generated `host_main.c` with host clang
@@ -2577,7 +2641,7 @@ fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Fail
     let exe = dir.path.join("prog");
 
     // `-Dmain=pic_main` renames the generated `main`, so it must apply to
-    // prog.c only — host_main.c provides the real `main` and is compiled
+    // prog.c only - host_main.c provides the real `main` and is compiled
     // without the rename, then the two objects are linked.
     run_ok(
         Command::new(&clang)
@@ -2659,7 +2723,7 @@ fn host_main_source(program: &Program) -> Result<String, String> {
     s.push_str("void pic_main(void);\nint main(void) {\n");
     for input in &program.inputs {
         if input.is_float {
-            // Seed the float's BITS through a union — an assignment would
+            // Seed the float's BITS through a union - an assignment would
             // ROUND the bit pattern to the nearest float (0x3F800000 as an
             // unsigned int is not 1.0f). The union is host-side only.
             s.push_str(&format!(
@@ -2708,20 +2772,20 @@ pub struct ReducedProgram {
 
 /// Greedily reduce `program` while `failure` persists: iterate over the
 /// main-body statements (the generator's structural knowledge), try
-/// deleting each statement — or replacing its expression with a constant /
-/// one of its operands — re-run the differential, and keep the deletion
+/// deleting each statement - or replacing its expression with a constant /
+/// one of its operands - re-run the differential, and keep the deletion
 /// only when the SAME failure kind survives. Stop at a fixed point (a full
 /// pass with no accepted change) or when `REDUCTION_CAP` re-runs are
 /// exhausted.
 ///
 /// `program` is verified to still exhibit `failure` first; its ACTUAL kind
 /// AND message are taken from that verification run (robust against a stale
-/// caller argument — the caller's message must not leak into the reduced
+/// caller argument - the caller's message must not leak into the reduced
 /// failure) and a differential-clean program is an error (nothing to
-/// reduce). The reduced program is NOT written here — `write_fixture`
+/// reduce). The reduced program is NOT written here - `write_fixture`
 /// persists it as the `reduced_<seed>.c` artifact.
 pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, String> {
-    let fresh = match run_differential(program) {
+    let fresh = match run_differential(program, &device::PIC16F877A) {
         Err(f) => f,
         Ok(_) => {
             return Err(format!(
@@ -2762,7 +2826,7 @@ pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, St
                     statements: candidate,
                     prologue: program.prologue.clone(),
                 };
-                match run_differential(&probe) {
+                match run_differential(&probe, &device::PIC16F877A) {
                     Err(f) if f.kind == target => {
                         statements = probe.statements;
                         continue 'reduce; // restart the pass from the top
@@ -2798,7 +2862,7 @@ pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, St
 /// = delete it; `Some(text)` = replace it with `text`. Deletion is always
 /// tried first; expression replacement (with the constant `0u` or one of
 /// the expression's top-level operands) applies to single-line assignments,
-/// and ONLY when the replacement is strictly shorter — the well-founded
+/// and ONLY when the replacement is strictly shorter - the well-founded
 /// measure that makes the greedy terminate (without it, two equally-valid
 /// short forms keep replacing each other and the pass never reaches the
 /// fixed point).
@@ -2841,7 +2905,7 @@ fn split_assignment(stmt: &str) -> Option<(String, String)> {
             b'=' if depth == 0 => {
                 // The relational forms (`==`, `!=`, `<=`, `>=`) contain
                 // `=` too, but in these statements they live inside
-                // parenthesized operands — a depth-0 `=` is the assignment.
+                // parenthesized operands - a depth-0 `=` is the assignment.
                 // Guard the two-char forms anyway.
                 let prev = if i > 0 { bytes[i - 1] } else { 0 };
                 if matches!(prev, b'=' | b'!' | b'<' | b'>') {
@@ -2865,7 +2929,7 @@ fn split_assignment(stmt: &str) -> Option<(String, String)> {
 /// The top-level operands of an expression: strip a leading result-cast
 /// `(uN)( … )` (the generator's `({ct})(…)` shape), then split at the FIRST
 /// binary operator at paren depth 0. Returns [] when there is no such
-/// operator (a bare operand/constant — only constant replacement applies).
+/// operator (a bare operand/constant - only constant replacement applies).
 fn top_level_operands(expr: &str) -> Vec<String> {
     let mut inner = expr.trim();
     let b = inner.as_bytes();
@@ -2969,7 +3033,7 @@ fn pic_clang() -> Result<(String, String), String> {
 }
 
 /// The host clang: the dev container's plain `clang` (the pinned clang WITHOUT
-/// `-target`, whose wrapper knows the host toolchain — the unwrapped
+/// `-target`, whose wrapper knows the host toolchain - the unwrapped
 /// `$PIC8_CLANG_UNWRAPPED` cannot find the host's stdio.h, verified during
 /// development). `PIC8_HOST_CLANG` overrides it.
 fn host_clang() -> String {
@@ -2980,7 +3044,7 @@ fn host_clang() -> String {
 /// (mirroring `crates/driver/tests/long_e2e.rs`). Panics in the pipeline
 /// (a compiler bug) are caught and reported as a `Panic` failure, so the
 /// fuzz loop survives them.
-fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, Failure> {
+fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayout, Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let ll = Command::new(&clang)
         .args([
@@ -3012,7 +3076,7 @@ fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, Failure> {
         m = wholeprog::merge(m);
         m = legalize::legalize(m);
         let cg = callgraph::build(&m);
-        alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg))
+        alloc::allocate(device, &m, &callgraph::edges_text(&cg))
     }))
     .map_err(|p| {
         let msg = p
@@ -3027,14 +3091,14 @@ fn pic_layout(c_path: &Path) -> Result<alloc::AllocLayout, Failure> {
 /// Run the driver binary (a workspace member) over the C file to produce the
 /// hex, passing the PIC clang env vars it expects. A failed driver is the
 /// loud-panic contract: a compiler panic or an unsupported construct.
-fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), Failure> {
+fn run_driver(c_path: &Path, hex_path: &Path, device: &device::Device) -> Result<(), Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
-    let driver = driver_binary().map_err(|e| Failure::new(FailureKind::Harness, e))?;
+    let driver = driver_binary(device).map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let out = Command::new(&driver)
         .arg(c_path)
         .arg("-o")
         .arg(hex_path)
-        .args(["--device", "p16f877a"])
+        .args(["--device", device.name])
         .env("PIC8_CLANG_UNWRAPPED", &clang)
         .env("PIC8_CLANG_RESOURCE_DIR", &resdir)
         .output()
@@ -3060,50 +3124,52 @@ fn run_driver(c_path: &Path, hex_path: &Path) -> Result<(), Failure> {
 /// `PIC8_DRIVER` env override first.
 ///
 /// The nested `cargo build -p driver` runs on EVERY first use (cheap when
-/// up to date) — NOT only when the binary is missing: `cargo test -p fuzz`
+/// up to date) - NOT only when the binary is missing: `cargo test -p fuzz`
 /// does not rebuild the driver (fuzz does not depend on it), so a stale
 /// binary from an earlier compiler build would otherwise silently run the
 /// differential against outdated code (found when the corpus kept failing
 /// with an already-fixed isel panic). The nested cargo cannot deadlock on
 /// the build lock because tests run only after the outer build has finished
 /// (verified empirically).
-fn driver_binary() -> Result<PathBuf, String> {
-    static CACHE: OnceLock<Result<PathBuf, String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            if let Some(p) = std::env::var_os("PIC8_DRIVER") {
-                return Ok(PathBuf::from(p));
+fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
+    fn locate() -> Result<PathBuf, String> {
+        if let Some(p) = std::env::var_os("PIC8_DRIVER") {
+            return Ok(PathBuf::from(p));
+        }
+        if let Some(p) = option_env!("CARGO_BIN_EXE_epic-cc") {
+            return Ok(PathBuf::from(p));
+        }
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+        let mut dir = exe.clone();
+        dir.pop();
+        if dir.file_name().and_then(|n| n.to_str()) == Some("deps") {
+            dir.pop();
+        }
+        let candidate = dir.join("epic-cc");
+        let mut cmd = Command::new("cargo");
+        cmd.args(["build", "-p", "driver", "--quiet"]);
+        if let Ok(profile) = std::env::var("PROFILE") {
+            if profile != "debug" {
+                cmd.args(["--profile", &profile]);
             }
-            if let Some(p) = option_env!("CARGO_BIN_EXE_epic-cc") {
-                return Ok(PathBuf::from(p));
-            }
-            let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
-            let mut dir = exe.clone();
-            dir.pop(); // the exe name
-            if dir.file_name().and_then(|n| n.to_str()) == Some("deps") {
-                dir.pop(); // integration-test binaries live in target/<profile>/deps
-            }
-            let candidate = dir.join("epic-cc");
-            let mut cmd = Command::new("cargo");
-            cmd.args(["build", "-p", "driver", "--quiet"]);
-            if let Ok(profile) = std::env::var("PROFILE") {
-                if profile != "debug" {
-                    cmd.args(["--profile", &profile]);
-                }
-            }
-            let status = cmd
-                .status()
-                .map_err(|e| format!("cargo build -p driver: {e}"))?;
-            if !status.success() {
-                return Err("cargo build -p driver failed".into());
-            }
-            if candidate.exists() {
-                Ok(candidate)
-            } else {
-                Err(format!("driver binary not found at {}", candidate.display()))
-            }
-        })
-        .clone()
+        }
+        let status = cmd.status().map_err(|e| format!("cargo build -p driver: {e}"))?;
+        if !status.success() {
+            return Err("cargo build -p driver failed".into());
+        }
+        if candidate.exists() {
+            Ok(candidate)
+        } else {
+            Err(format!("driver binary not found at {}", candidate.display()))
+        }
+    }
+    static CACHE_P14: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    static CACHE_P18: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    let cache = match device.core {
+        device::Core::Pic18 => &CACHE_P18,
+        device::Core::Pic14 => &CACHE_P14,
+    };
+    cache.get_or_init(locate).clone()
 }
 
 fn run_ok(cmd: &mut Command, what: &str) -> Result<(), String> {
@@ -3137,7 +3203,7 @@ fn width_mask(width: u8) -> u32 {
 
 /// Seed `width` little-endian bytes of `value` at `addr` (the sim side of
 /// the harness's identical seeding; the host side uses `host_main_source`).
-fn seed_le(p: &mut pic14_sim::Pic14, addr: u16, width: u8, value: u32) {
+fn seed_le(ram: &mut [u8], addr: u16, width: u8, value: u32) {
     let bytes = match width {
         8 => 1,
         16 => 2,
@@ -3145,11 +3211,11 @@ fn seed_le(p: &mut pic14_sim::Pic14, addr: u16, width: u8, value: u32) {
         w => panic!("bad input width {w}"),
     };
     for i in 0..bytes {
-        p.ram_mut()[addr as usize + i] = ((value >> (8 * i)) & 0xFF) as u8;
+        ram[addr as usize + i] = ((value >> (8 * i)) & 0xFF) as u8;
     }
 }
 
-fn read_le(ram: &[u8; 512], addr: u16, bytes: u8) -> u32 {
+fn read_le(ram: &[u8], addr: u16, bytes: u8) -> u32 {
     let mut v = 0u32;
     for i in 0..bytes as usize {
         v |= (ram[addr as usize + i] as u32) << (8 * i);

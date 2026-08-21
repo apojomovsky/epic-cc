@@ -4,12 +4,13 @@
 //! seeded generator must produce deterministic, differential-clean programs.
 //!
 //! Task 2: the explicit-width typedef discipline (a u32 value > 2^16 wraps
-//! identically on both sides — Task 1's `unsigned long` equivalence is
+//! identically on both sides  -  Task 1's `unsigned long` equivalence is
 //! false on LP64 hosts), the full generation surface, and the fixed seed
 //! corpus (8 fast seeds; the full 200-seed corpus runs under `--ignored`).
 
 use std::collections::HashMap;
 
+use device;
 use fuzz::{
     generate, generate_float, generate_ir, generate_signed, run_differential,
     run_ir_differential, FailureKind, Input, IrProgram, Program, TYPEDEF_PROLOGUE,
@@ -40,7 +41,7 @@ fn tiny_program(in0: u32) -> Program {
 fn tiny_program_differential_clean() {
     // (unsigned char)(in0 * 7 + 3) for in0 = 0, 1, 200.
     for (in0, expect) in [(0u32, 3u32), (1, 10), (200, 123)] {
-        let got = run_differential(&tiny_program(in0)).unwrap_or_else(|e| {
+        let got = run_differential(&tiny_program(in0), &device::PIC16F877A).unwrap_or_else(|e| {
             panic!("seed in0={in0} not differential-clean: {e}")
         });
         assert_eq!(got, expect, "checksum for in0={in0}");
@@ -70,7 +71,7 @@ fn mismatching_variant_fails() {
         statements: Vec::new(),
         prologue: c_source,
     };
-    match run_differential(&prog) {
+    match run_differential(&prog, &device::PIC16F877A) {
         Err(e) => assert!(e.to_string().contains("mismatch"), "expected a mismatch, got: {e}"),
         Ok(v) => panic!("expected a mismatch, got Ok({v})"),
     }
@@ -135,7 +136,7 @@ fn u32_arithmetic_wraps_identically_on_both_sides() {
         statements: Vec::new(),
         prologue: c_source,
     };
-    let got = run_differential(&prog)
+    let got = run_differential(&prog, &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("u32 program not differential-clean: {e}"));
     assert_eq!(got, 0, "u32 wraps at 2^32 identically on both sides");
 }
@@ -144,7 +145,7 @@ fn u32_arithmetic_wraps_identically_on_both_sides() {
 fn unsigned_long_u32_arithmetic_mismatches() {
     // Documents WHY the typedef discipline exists: the same program written
     // with `unsigned long` (Task 1's documented width) is NOT
-    // differential-clean once u32 values exceed 2^16 — the host computes
+    // differential-clean once u32 values exceed 2^16  -  the host computes
     // `x * x` in 64 bits (0xFFFFFFFE00000001 > 0xFFFFFFFFu -> 1), msp430 in
     // 32 (wraps to 1, 1 > 0xFFFFFFFFu -> 0). The harness MUST report it.
     let c_source = "volatile unsigned long in0;\n\
@@ -167,7 +168,7 @@ fn unsigned_long_u32_arithmetic_mismatches() {
         statements: Vec::new(),
         prologue: c_source,
     };
-    match run_differential(&prog) {
+    match run_differential(&prog, &device::PIC16F877A) {
         Err(e) => assert!(
             e.to_string().contains("mismatch"),
             "expected a mismatch (host unsigned long is 64-bit), got: {e}"
@@ -203,7 +204,7 @@ const SURFACE: &[(&str, &str)] = &[
 #[test]
 fn fast_corpus_spans_the_generation_surface() {
     // The 8 fixed fast seeds must jointly exercise every construct
-    // (deterministic — the RNG stream is fixed, so this never flaps).
+    // (deterministic  -  the RNG stream is fixed, so this never flaps).
     let srcs: Vec<String> = (0..8u64).map(|s| generate(s).c_source).collect();
     for (what, marker) in SURFACE {
         assert!(
@@ -228,7 +229,7 @@ fn full_corpus_differential_clean() {
     let mut harness = 0usize;
     for seed in 0..200u64 {
         let prog = generate(seed);
-        match run_differential(&prog) {
+        match run_differential(&prog, &device::PIC16F877A) {
             Ok(_) => clean += 1,
             Err(f) => {
                 match f.kind {
@@ -301,7 +302,7 @@ fn generator_corpus_differential_clean() {
     // A fixed small seed set, differential-clean (the plan's fast subset).
     for seed in 0..8 {
         let prog = generate(seed);
-        run_differential(&prog)
+        run_differential(&prog, &device::PIC16F877A)
             .unwrap_or_else(|e| panic!("generated seed {seed} not differential-clean: {e}"));
     }
 }
@@ -311,7 +312,7 @@ fn generator_corpus_differential_clean() {
 fn generator_20_seed_smoke() {
     for seed in 0..20 {
         let prog = generate(seed);
-        run_differential(&prog)
+        run_differential(&prog, &device::PIC16F877A)
             .unwrap_or_else(|e| panic!("generated seed {seed} not differential-clean: {e}"));
     }
 }
@@ -323,10 +324,10 @@ fn generator_20_seed_smoke() {
 /// The float-fold program pieces shared by the fixed float tests: the
 /// globals (in0 u8, the float inputs in3..in6, the checksum, the bits-fold
 /// global `fout`), the fold32 helper, and the fold's shape. Every float
-/// result is stored to the volatile `fout` global and re-read as a u32 —
+/// result is stored to the volatile `fout` global and re-read as a u32  -
 /// `*(volatile u32*)&fout` is a plain `load i32` of the float global's
 /// bytes under LLVM's opaque pointers (no bitcast inst, so the PIC
-/// pipeline parses it) — and the fold32 byte-mix feeds the checksum. A
+/// pipeline parses it)  -  and the fold32 byte-mix feeds the checksum. A
 /// single wrong RNE bit in any float result changes the fold.
 const FLOAT_GLOBALS: &str = "\
 volatile u8 in0;\n\
@@ -383,7 +384,7 @@ fn float_fixed_arith_clean() {
         fold0 = ffold("t0"),
         fold1 = ffold("t1"),
     );
-    let got = run_differential(&float_prog(&body, 0x3F80_0000))
+    let got = run_differential(&float_prog(&body, 0x3F80_0000), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float fixed arith not differential-clean: {e}"));
     assert_eq!(got, 0x51, "hand-computed float add+mul checksum");
 }
@@ -398,7 +399,7 @@ fn float_fixed_divsub_clean() {
         fold0 = ffold("t0"),
         fold1 = ffold("t1"),
     );
-    let got = run_differential(&float_prog(&body, 0x3F80_0000))
+    let got = run_differential(&float_prog(&body, 0x3F80_0000), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float fixed div/sub not differential-clean: {e}"));
     assert_eq!(got, 0xBF, "hand-computed float div+sub checksum");
 }
@@ -414,14 +415,14 @@ fn float_fixed_rne_clean() {
         fold0 = ffold("t0"),
         fold1 = ffold("t1"),
     );
-    let got = run_differential(&float_prog(&body, 0x3F80_0000))
+    let got = run_differential(&float_prog(&body, 0x3F80_0000), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float fixed RNE not differential-clean: {e}"));
     assert_eq!(got, 0x30, "hand-computed RNE checksum (1.0+0.1 and 1.1/3)");
 }
 
 #[test]
 fn float_fixed_cmp_clean() {
-    // fcmp: c0 = (1.0f < 2.0f) = 1; c1 = (-0.0f == 0.0f) = 1 — the Task-3
+    // fcmp: c0 = (1.0f < 2.0f) = 1; c1 = (-0.0f == 0.0f) = 1  -  the Task-3
     // cmp fix's zero-equality (in6 = 0x80000000 = -0.0). checksum = 1 ^ 1 =
     // 0; a sign-magnitude bug (e.g. -0 < +0) flips c1 and mismatches.
     let body = "\
@@ -429,7 +430,7 @@ fn float_fixed_cmp_clean() {
   checksum = (u8)(checksum ^ (u8)(in6 == 0.0f));\n";
     let mut prog = float_prog(body, 0x3F80_0000);
     prog.inputs[4].value = 0x8000_0000; // in6 = -0.0
-    let got = run_differential(&prog)
+    let got = run_differential(&prog, &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float fixed fcmp not differential-clean: {e}"));
     assert_eq!(got, 0x00, "-0.0 == +0.0 (and 1.0 < 2.0)");
 }
@@ -437,14 +438,14 @@ fn float_fixed_cmp_clean() {
 #[test]
 fn float_fixed_convs_clean() {
     // uitofp + fptoui: t0 = (float)0x3F800003 = 1065353216.0f (the nearest
-    // float — 0x4E7E0000, fold 00^00^7E^4E = 30); fptoui of
+    // float  -  0x4E7E0000, fold 00^00^7E^4E = 30); fptoui of
     // (float)(3 & 0xFFFF) = 3 (fold 03). checksum = 30 ^ 03 = 33.
     let body = format!(
         "  float t0 = (float)(*(volatile u32*)&in3);\n{fold0}\
          \x20 checksum = (u8)(checksum ^ fold32((u32)((float)((*(volatile u32*)&in3) & 0xFFFFu))));\n",
         fold0 = ffold("t0"),
     );
-    let got = run_differential(&float_prog(&body, 0x3F80_0003))
+    let got = run_differential(&float_prog(&body, 0x3F80_0003), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float fixed uitofp/fptoui not differential-clean: {e}"));
     assert_eq!(got, 0x33, "hand-computed uitofp/fptoui checksum");
 }
@@ -458,7 +459,7 @@ fn float_fixed_signed_convs_clean() {
          \x20 checksum = (u8)(checksum ^ fold32((u32)((s32)((float)(s32)((*(volatile u32*)&in3) & 0xFFFFu)))));\n",
         fold0 = ffold("t0"),
     );
-    let got = run_differential(&float_prog(&body, 0x3F80_0003))
+    let got = run_differential(&float_prog(&body, 0x3F80_0003), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float fixed sitofp/fptosi not differential-clean: {e}"));
     assert_eq!(got, 0x33, "hand-computed sitofp/fptosi checksum");
 }
@@ -468,16 +469,16 @@ fn float_fold_is_ulp_sensitive() {
     // A single wrong RNE bit must change the checksum: with in3 flipped by
     // 1 ulp (0x3F800001 = 1.0f + 2^-23), t0 = in3 + 0.1f rounds to
     // 0x3F8CCCCE (not 0x3F8CCCCD) and t1 = t0 / 3.0f rounds to 0x3EBBBBBD
-    // — the fold changes, so the differential would catch a rounding error
+    //  -  the fold changes, so the differential would catch a rounding error
     // in ANY statement. 0x32 verified against Rust f32 semantics.
     let body = format!(
         "  float t0 = in3 + in6;\n{fold0}  float t1 = t0 / 3.0f;\n{fold1}",
         fold0 = ffold("t0"),
         fold1 = ffold("t1"),
     );
-    let a = run_differential(&float_prog(&body, 0x3F80_0000))
+    let a = run_differential(&float_prog(&body, 0x3F80_0000), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float RNE program (1.0f) not clean: {e}"));
-    let b = run_differential(&float_prog(&body, 0x3F80_0001))
+    let b = run_differential(&float_prog(&body, 0x3F80_0001), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float RNE program (1.0f + 1ulp) not clean: {e}"));
     assert_eq!(a, 0x30, "the 1.0f run's hand-computed checksum");
     assert_eq!(b, 0x32, "the 1.0f + 1ulp run's checksum (Rust f32 reference)");
@@ -510,7 +511,7 @@ fn generate_float_is_deterministic_and_spanning() {
     );
     // The float inputs are volatile float globals (the bit-pattern filter is
     // documented on generate_float: no NaN/inf/denormal inputs). Float
-    // RESULTS fold over their BITS through the fout global — every seed
+    // RESULTS fold over their BITS through the fout global  -  every seed
     // with a float-result statement (fbin/uitofp/sitofp) uses it, and the
     // union of the fast seeds covers it (cmp/fptoui-only seeds fold
     // directly).
@@ -526,7 +527,7 @@ fn generate_float_is_deterministic_and_spanning() {
     // The fast span window covers the 6 families by construction (the
     // forced first statement rotates seed % 6 over add/sub/mul/div/cmp/conv)
     // and the conversion SUB-kinds (fptoui/fptosi) via the forced Conv
-    // rotation ((seed / 6) % 4 — seeds 5/11/17/23). Source generation only.
+    // rotation ((seed / 6) % 4  -  seeds 5/11/17/23). Source generation only.
     let srcs: Vec<String> = (0..24u64).map(|s| generate_float(s).c_source).collect();
     for &(what, marker) in FLOAT_SURFACE {
         assert!(
@@ -553,7 +554,7 @@ fn float_corpus_differential_clean() {
     let mut harness = 0usize;
     for seed in 0..50u64 {
         let prog = generate_float(seed);
-        match run_differential(&prog) {
+        match run_differential(&prog, &device::PIC16F877A) {
             Ok(_) => clean += 1,
             Err(f) => {
                 match f.kind {
@@ -616,8 +617,8 @@ fn float_corpus_spans_the_float_surface() {
 
 /// A fixed signed statement body over the unsigned inputs in0/in1/in2.
 /// The wrap-safe discipline: arithmetic computes in the unsigned domain
-/// (`(sW)((uW)a op (uW)b)` — wrapping is defined on both sides), div/rem
-/// use CONST divisors 2..=9 (never 0, never -1 — the only signed-division
+/// (`(sW)((uW)a op (uW)b)`  -  wrapping is defined on both sides), div/rem
+/// use CONST divisors 2..=9 (never 0, never -1  -  the only signed-division
 /// UB pair INT_MIN / -1 is excluded by construction; signed const divisors
 /// stay plain `sdiv`/`srem`, clang does NOT magic-number strength-reduce
 /// signed division), shifts are const-count (ashr sign-fills), and the
@@ -665,11 +666,11 @@ fn signed_prog() -> Program {
 #[test]
 fn signed_fixed_program_differential_clean() {
     // The wrap-safe signed surface (sdiv/srem/ashr/slt/sge across
-    // s8/s16/s32) must be differential-clean — the compiler's signed
+    // s8/s16/s32) must be differential-clean  -  the compiler's signed
     // routines agree with the host's for the edge-seeded inputs. in1 =
     // 0x8000 exercises the INT_MIN guard and ashr sign-fill; in2 =
     // 0x80000000 the i32 wrap.
-    let got = run_differential(&signed_prog())
+    let got = run_differential(&signed_prog(), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("signed fixed program not differential-clean: {e}"));
     assert!(got < 256, "checksum is a u8");
 }
@@ -697,7 +698,7 @@ fn generate_signed_fast_corpus_differential_clean() {
     // The signed generator's fast seeds must all be differential-clean.
     for seed in 0..8u64 {
         let prog = generate_signed(seed);
-        run_differential(&prog)
+        run_differential(&prog, &device::PIC16F877A)
             .unwrap_or_else(|e| panic!("signed seed {seed} not differential-clean: {e}"));
     }
 }
@@ -714,7 +715,7 @@ fn signed_corpus_differential_clean() {
     let mut harness = 0usize;
     for seed in 0..50u64 {
         let prog = generate_signed(seed);
-        match run_differential(&prog) {
+        match run_differential(&prog, &device::PIC16F877A) {
             Ok(_) => clean += 1,
             Err(f) => {
                 match f.kind {
@@ -790,7 +791,7 @@ fn ir_mode_fixed_program_differential_clean() {
     // The canonical-IR path (sdiv/srem/ashr/icmp slt/zext/select) must be
     // differential-clean against the C twin for the edge input in = 0x8000
     // (-32768: sdiv by 3, srem 5, ashr sign-fill, slt true).
-    let got = run_ir_differential(&ir_prog())
+    let got = run_ir_differential(&ir_prog(), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("IR-mode fixed program not differential-clean: {e}"));
     assert!(got < 256, "checksum is a u8");
 }
@@ -813,7 +814,7 @@ fn generate_ir_fast_corpus_differential_clean() {
     // PIC side runs canonical IR, the host side the C twin).
     for seed in 0..8u64 {
         let prog = generate_ir(seed);
-        run_ir_differential(&prog)
+        run_ir_differential(&prog, &device::PIC16F877A)
             .unwrap_or_else(|e| panic!("IR seed {seed} not differential-clean: {e}"));
     }
 }
