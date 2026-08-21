@@ -90,7 +90,17 @@ pub enum FloatConvOp { FpToSi, FpToUi, SiToFp, UiToFp, Fpext, Fptrunc }
 pub struct FloatConv { pub dst: String, pub op: FloatConvOp, pub from: Ty, pub val: Val, pub to: Ty }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Asm { pub template: String, pub clobbers_memory: bool }
+pub struct AsmOperand {
+    /// The LLVM constraint for this operand, e.g. `"*m"` or `"=*m"`.
+    /// Only `*m` memory forms are valid on PIC; `r` is rejected earlier.
+    pub constraint: String,
+    /// The pointer value this operand names, canonical `ptr` form like
+    /// `"@g"` or `"%x"` (the `%`/`@` prefix is included).
+    pub ptr: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Asm { pub template: String, pub clobbers_memory: bool, pub operands: Vec<AsmOperand> }
 
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -342,11 +352,21 @@ fn inst_str(i: &Inst) -> String {
         Inst::Fcmp(c) => format!("%{} = fcmp {} float {} {}", c.dst, c.pred, val_str(&c.a), val_str(&c.b)),
         Inst::FloatConv(c) => format!("%{} = {} {} {} to {}", c.dst, fconvop_str(c.op), ty_str(c.from), val_str(&c.val), ty_str(c.to)),
         Inst::Asm(a) => {
+            let mut s = format!("asm \"{}\"", escape_asm(&a.template));
             if a.clobbers_memory {
-                format!("asm \"{}\" memory", escape_asm(&a.template))
-            } else {
-                format!("asm \"{}\"", escape_asm(&a.template))
+                s.push_str(" memory");
             }
+            if !a.operands.is_empty() {
+                s.push(' ');
+                s.push_str(
+                    &a.operands
+                        .iter()
+                        .map(|o| format!("{} {}", o.constraint, o.ptr))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            s
         }
     }
 }
@@ -576,13 +596,75 @@ fn parse_gep_expr(rest: &str) -> (GepBase, u8, Vec<(u8, String)>) {
 }
 
 fn parse_inst(line: &str) -> Inst {
-    // CC-4 opaque asm: `asm "template"` or `asm "template" memory` (with
-    // escaping \" \\ \n handled via parse_quoted_unescaped).
+    // CC-4 asm: `asm "template" [memory] [[constraint ptr], ...]`
+    // `memory` is the clobber marker; operands are `constraint ptr` pairs
+    // like `*m @x` or `=*m %y` (only `*m` forms are valid, enforced in
+    // irparse). This parser is lenient and round-trips whatever it sees.
     if line.starts_with("asm ") {
         let (template, after_idx) = parse_quoted_unescaped(line);
         let after = line[after_idx..].trim();
-        let clobbers_memory = after.split_whitespace().any(|t| t == "memory");
-        return Inst::Asm(Asm { template, clobbers_memory });
+        let mut clobbers_memory = false;
+        let rest: &str;
+        // fast path: `memory` as first token after template
+        if after.starts_with("memory") {
+            let tail = &after["memory".len()..];
+            if tail.is_empty() || tail.starts_with(|c: char| c.is_whitespace() || c == ',') {
+                clobbers_memory = true;
+                rest = tail.trim_start_matches(|c: char| c.is_whitespace() || c == ',').trim();
+                let mut operands = Vec::new();
+                if !rest.is_empty() {
+                    for tok in rest.split(',') {
+                        let tok = tok.trim();
+                        if tok.is_empty() { continue; }
+                        let mut it = tok.split_whitespace();
+                        let constraint = it.next().unwrap_or("").to_string();
+                        let ptr = it.next().unwrap_or("").to_string();
+                        if constraint.is_empty() || ptr.is_empty() { panic!("malformed asm operand {tok:?} in {line:?}"); }
+                        operands.push(AsmOperand { constraint, ptr });
+                    }
+                }
+                return Inst::Asm(Asm { template, clobbers_memory, operands });
+            } else {
+                rest = after;
+            }
+        } else if after.split_whitespace().any(|t| t.trim_matches(',') == "memory") {
+            // `memory` appears later (e.g. `*m @x, memory`); remove it
+            clobbers_memory = true;
+            let parts: Vec<String> = after
+                .split(',')
+                .map(|s| s.split_whitespace().filter(|t| *t != "memory").collect::<Vec<_>>().join(" "))
+                .filter(|s| !s.trim().is_empty())
+                .collect();
+            let owned = parts.join(", ");
+            let mut operands = Vec::new();
+            if !owned.is_empty() {
+                for tok in owned.split(',') {
+                    let tok = tok.trim();
+                    if tok.is_empty() { continue; }
+                    let mut it = tok.split_whitespace();
+                    let constraint = it.next().unwrap_or("").to_string();
+                    let ptr = it.next().unwrap_or("").to_string();
+                    if constraint.is_empty() || ptr.is_empty() { panic!("malformed asm operand {tok:?} in {line:?}"); }
+                    operands.push(AsmOperand { constraint, ptr });
+                }
+            }
+            return Inst::Asm(Asm { template, clobbers_memory, operands });
+        } else {
+            rest = after;
+        }
+        let mut operands = Vec::new();
+        if !rest.is_empty() {
+            for tok in rest.split(',') {
+                let tok = tok.trim();
+                if tok.is_empty() { continue; }
+                let mut it = tok.split_whitespace();
+                let constraint = it.next().unwrap_or("").to_string();
+                let ptr = it.next().unwrap_or("").to_string();
+                if constraint.is_empty() || ptr.is_empty() { panic!("malformed asm operand {tok:?} in {line:?}"); }
+                operands.push(AsmOperand { constraint, ptr });
+            }
+        }
+        return Inst::Asm(Asm { template, clobbers_memory, operands });
     }
     if line == "ret" {
         return Inst::Ret(None);
