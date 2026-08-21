@@ -646,11 +646,20 @@ fn parse_ptr_operand(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &mu
             }
             prev = t;
         }
-        let k: u8 = k
+        // PIC18 SFRs sit at 12-bit addresses (PORTB = 0xF81), so the
+        // literal form must carry a full `u16`, not the 8-bit byte PIC14's
+        // bank-mirrored SFRs fit in. Keep the historical 2-digit form for
+        // addresses < 0x100 (PIC14's tests pin `0x06`) and widen only when
+        // the address needs the third hex digit.
+        let k: u16 = k
             .unwrap_or_else(|| panic!("irparse: malformed inttoptr {b:?}"))
             .parse()
             .unwrap_or_else(|_| panic!("irparse: inttoptr address not a byte constant: {b:?}"));
-        format!("0x{k:02x}")
+        if k < 0x100 {
+            format!("0x{k:02x}")
+        } else {
+            format!("0x{k:03x}")
+        }
     } else if b.starts_with("getelementptr") {
         let gsrc = &b["getelementptr".len()..];
         let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);

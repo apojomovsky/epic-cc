@@ -11,6 +11,7 @@ one-line index entry here, e.g.:
 - ADR-010 — PIC18 const via TBLRD (DB-packed flash, per-byte TBLPTR re-setup), 2026-08-20
 - ADR-011 — Multi-TU front end: llvm-link merge, sanitize in irparse, 2026-08-20
 - ADR-012: CC-3 silicon-real codegen: EPIC_FOSC_HZ arithmetic, HEX regions, alloc placement, and simulator sizing, 2026-08-21
+- ADR-013 — PIC18 interrupts: single-vector compat mode, MOVFF save area, 2026-08-20
 ---
 
 ## ADR-001 — clang as an out-of-process front end; custom PIC14 backend
