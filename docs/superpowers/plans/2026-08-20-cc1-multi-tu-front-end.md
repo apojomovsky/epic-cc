@@ -348,7 +348,7 @@ Actual: PASS, all 16 crates, exit 0, no failures.
 
 ---
 
-### Task 3: driver argument parsing
+### Task 3: driver argument parsing — DONE (cf6be7c)
 
 Hand-rolled, because the workspace has zero external dependencies and keeps them that way.
 
@@ -377,7 +377,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String>;
 
 `parse_args` takes the argument list **without** `argv[0]`. Task 5 calls it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/driver/tests/cli.rs`:
 
@@ -460,7 +460,7 @@ fn rejects_a_flag_missing_its_value() {
 
 Note this test file uses `driver::cli`, so the crate needs a library target alongside its binary.
 
-- [ ] **Step 2: Give the driver crate a library target**
+- [x] **Step 2: Give the driver crate a library target**
 
 Add to `crates/driver/Cargo.toml`, after the `[[bin]]` block:
 
@@ -482,12 +482,14 @@ pub mod cli;
 
 In `crates/driver/src/main.rs`, replace `mod clang_discovery;` with `use driver::clang_discovery;` and add `use driver::cli;`.
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 Run: `make test CRATE=driver`
 Expected: FAIL, `unresolved import driver::cli`.
 
-- [ ] **Step 4: Implement the parser**
+Actual: FAIL with `E0583: file not found for module 'cli'`, same root cause, module did not exist yet.
+
+- [x] **Step 4: Implement the parser**
 
 Create `crates/driver/src/cli.rs`:
 
@@ -615,17 +617,16 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
 
 The closure borrows `argv` and mutates `i`, which the borrow checker will reject as written. If it does, inline the three `short(...)` calls as explicit `if`/`else if` blocks with the same body rather than fighting it; correctness first, brevity second.
 
-- [ ] **Step 5: Run the tests to verify they pass**
+Actual: implemented directly with the inlined `if`/`else if` form, skipping the closure attempt.
+
+- [x] **Step 5: Run the tests to verify they pass**
 
 Run: `make test CRATE=driver`
 Expected: PASS for the nine `cli.rs` tests. The existing e2e tests still pass, because `main.rs` is not wired to `cli` yet.
 
-- [ ] **Step 6: Commit**
+Actual: PASS, 9/9 cli.rs, all pre-existing driver e2e tests unaffected.
 
-```bash
-git add crates/driver/Cargo.toml crates/driver/src/lib.rs crates/driver/src/cli.rs crates/driver/src/main.rs crates/driver/tests/cli.rs
-git commit -m "feat(driver): hand-rolled CLI parsing for multi-file input"
-```
+- [x] **Step 6: Commit** — `cf6be7c`
 
 ---
 
