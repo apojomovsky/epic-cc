@@ -20,7 +20,7 @@ volatile unsigned char in;
 volatile unsigned char out;
 void main(void) { out = in + 1; }
 
-$ cargo run -p driver -- add.c add.hex && cat add.hex
+$ cargo run -p driver -- add.c -o add.hex --device p16f877a && cat add.hex
 :020000040000FA
 :10000000012800308A0005206300831203132008B2
 :0E001000A2002208013EA3002308A100080060

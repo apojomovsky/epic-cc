@@ -54,7 +54,7 @@ fn scalar_runs_correctly() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/scalar.c", "tests/fixtures/scalar.hex"])
+        .args(["tests/fixtures/scalar.c", "-o", "tests/fixtures/scalar.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));

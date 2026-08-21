@@ -89,10 +89,7 @@ fn multi_byte_const_tables_run_correctly() {
     let outf2 = a("outf2");
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            "tests/fixtures/const_multi_byte.c",
-            "tests/fixtures/const_multi_byte.hex",
-        ])
+        .args(["tests/fixtures/const_multi_byte.c", "-o", "tests/fixtures/const_multi_byte.hex", "--device", "p16f877a"])
         .output()
         .expect("run driver");
     assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
