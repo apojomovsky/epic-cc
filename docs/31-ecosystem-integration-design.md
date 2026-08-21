@@ -441,18 +441,24 @@ pub struct FuseField {
 }
 pub struct ConfigRegion {
     pub base_byte_addr: u32,             // 0x400E (PIC16F877A), 0x300000 (PIC18F4550): confirmed
-    pub reserved_mask: &'static [u8],    // bits NOT in any FuseField, per byte
-    pub reserved_value: &'static [u8],   // what those bits must read as, per byte
+    pub num_bytes: u16,                  // total addressable span, including any gap addresses
     pub fields: &'static [FuseField],
 }
 ```
 
-**The two devices disagree on unimplemented-bit polarity, confirmed against both datasheets.**
-PIC16F877A's unimplemented config bits read `1` (DS39582C Register 14-1: "U-0 Unimplemented
-bit, read as '1'"; erased value `3FFFh`). PIC18F4550's read `0` (DS39632E, every CONFIG
-register's legend: "U = Unimplemented bit, read as '0'"). `reserved_value` carries this
-per-device, per-byte, rather than assuming one polarity; `reserved_mask` marks which bits in
-each byte are reserved at all, since not every byte in the PIC18 config region uses all 8 bits.
+**Every bit not covered by a `FuseField`, and every byte address in the region's span that is
+not a real config register at all, resolves to `1` (erased), uniformly on both devices.**
+Cross-checked empirically against `gpasm` 2026-08-21: assembling `CONFIG4L` on the PIC18F4550
+with every named field set left both genuinely-unimplemented bit positions within that byte
+(bits 4-3) and the following gap address (`0x300007`, not a config register at all per
+DS39632E Table 25-1) at `0xFF`, not the "reads as 0" value DS39632E's register legend states.
+That distinction is the fix: "unimplemented, reads as 0" describes hardware **read-time**
+masking of the SFR (the silicon forces those bits to 0 on read regardless of the flash
+content), not a **flash-write** requirement, and `gpasm` writes the erased state and only
+clears what an explicit directive asks it to. PIC16F877A's datasheet-documented "unimplemented,
+read as 1" is the same rule stated from the other polarity: leave it erased. There was never
+a real per-device split at the byte-content level, only in how each device's read logic
+presents an unimplemented bit, which is irrelevant to what epic-cc writes.
 
 `EPIC_CONFIG("...")`'s string is comma-separated `key=value`, matched case-insensitively
 against the device's field table. An unrecognized field or value panics naming the offending
@@ -467,9 +473,10 @@ field (`WDT`, `LVP`, `BOR`, `PWRTEN`, protection, `DEBUG`, pin-mux fields) keeps
 safe default per D-4's original intent (watchdog off, low-voltage programming off, brownout
 on, no code protection, debug off).
 
-The resolved bytes are
-folded with `reserved_value` (masked by `reserved_mask`) OR'd in. epic-cc prints the resolved
-config bytes and the named setting behind each one unconditionally on success (D-4's promise;
+The resolved bytes start from an all-`0xFF` region of `num_bytes` length, with each
+`FuseField`'s bits ANDed and ORed in at its `byte_offset`; anything never touched by a field
+stays `0xFF`. epic-cc prints the resolved config bytes and the named setting behind each one
+unconditionally on success (D-4's promise;
 not gated behind `-v`).
 
 **`locked` is a correctness rule, not an ergonomics nicety.** `isel-pic18` only ever emits
