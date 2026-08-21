@@ -122,9 +122,10 @@ pub struct Block { pub label: String, pub insts: Vec<Inst> }
 
 /// A function parameter. `width` is the slot size in bytes: the scalar byte
 /// width, the byval struct size (`byval`), or 2 for an sret pointer slot
-/// (holds the target address).
+/// (holds the target address). `ptr` marks a plain pointer param, whose slot
+/// holds an address: width alone cannot say so, an `i16` is also 2 bytes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Param { pub name: String, pub width: u8, pub byval: Option<u8>, pub sret: bool }
+pub struct Param { pub name: String, pub width: u8, pub byval: Option<u8>, pub sret: bool, pub ptr: bool }
 #[derive(Clone, Debug)]
 pub struct Func {
     pub name: String,
@@ -199,6 +200,8 @@ fn param_str(p: &Param) -> String {
         format!("{}=byval{n}", p.name)
     } else if p.sret {
         format!("{}=sret", p.name)
+    } else if p.ptr {
+        format!("{}=ptr", p.name)
     } else {
         // scalar: encode the width so the text round-trips it (bare names
         // re-parse as width 1, silently undersizing i16 slots)
@@ -491,8 +494,8 @@ fn parse_val(s: &str) -> Val {
 }
 
 /// Parse one canonical param token: `<name>=i8` | `<name>=i16` |
-/// `<name>=byval<N>` | `<name>=sret`. Bare `<name>` (width-1 shorthand,
-/// retained for backward compatibility) also parses.
+/// `<name>=ptr` | `<name>=byval<N>` | `<name>=sret`. Bare `<name>` (width-1
+/// shorthand, retained for backward compatibility) also parses.
 fn parse_param(s: &str) -> Param {
     let s = s.trim();
     let (name, rest) = match s.find('=') {
@@ -502,13 +505,15 @@ fn parse_param(s: &str) -> Param {
     let name = name.trim_start_matches('%').to_string();
     if let Some(n) = rest.strip_prefix("byval") {
         let n = n.parse::<u8>().unwrap();
-        Param { name, width: n, byval: Some(n), sret: false }
+        Param { name, width: n, byval: Some(n), sret: false, ptr: false }
     } else if rest == "sret" {
-        Param { name, width: 2, byval: None, sret: true }
+        Param { name, width: 2, byval: None, sret: true, ptr: false }
+    } else if rest == "ptr" {
+        Param { name, width: 2, byval: None, sret: false, ptr: true }
     } else if matches!(rest, "i1" | "i8" | "i16" | "i32" | "float" | "f32") {
-        Param { name, width: parse_ty(rest).bytes(), byval: None, sret: false }
+        Param { name, width: parse_ty(rest).bytes(), byval: None, sret: false, ptr: false }
     } else if rest.is_empty() {
-        Param { name, width: 1, byval: None, sret: false }
+        Param { name, width: 1, byval: None, sret: false, ptr: false }
     } else {
         panic!("malformed param {s:?}")
     }

@@ -168,6 +168,17 @@ impl<'m> Gen<'m> {
     /// Resolve `{func}::{name}` to its base byte address (lo for multi-byte).
     /// Every address comes from the caller-supplied map; a missing value
     /// panics loudly rather than being allocated internally.
+    /// True when `name` is a plain pointer param of the current function, whose
+    /// slot holds a runtime address rather than being the object itself.
+    fn param_holds_addr(&self, name: &str) -> bool {
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| f.params.iter().any(|p| p.name == name && p.ptr))
+            .unwrap_or(false)
+    }
+
     fn slot_addr(&self, func: &str, name: &str) -> Slot {
         Slot::Direct(
             *self
@@ -357,14 +368,17 @@ impl<'m> Gen<'m> {
                     }
                     Base::Slot(sname, indirect) => {
                         let sa = self.slot_addr(self.cur_func, sname).direct();
-                        if !indirect && terms.is_empty() {
+                        // A plain pointer param's slot holds the address rather
+                        // than being the object, so it is read like an `sret`
+                        // slot (a `byval` param's slot IS the object).
+                        if *indirect || self.param_holds_addr(sname) {
+                            self.emit_fsr_indirect(sa, k, &terms, byte_off);
+                            Addr::Indirect
+                        } else if terms.is_empty() {
                             Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
-                        } else if !indirect {
+                        } else {
                             let span = self.object_span(&base);
                             self.emit_fsr_to(sa, k, &terms, byte_off, span);
-                            Addr::Indirect
-                        } else {
-                            self.emit_fsr_indirect(sa, k, &terms, byte_off);
                             Addr::Indirect
                         }
                     }
@@ -909,6 +923,78 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVLW 0x{b:02X}"));
             }
             Val::Reg(r) => {
+                if let Some((base, k, terms)) =
+                    self.resolved.get(&ssa_key(self.cur_func, r)).cloned()
+                {
+                    // The shapes below read the base's two bytes as a runtime
+                    // address. Only a pointer param's slot holds one: a global's
+                    // or an alloca's address is a link-time constant that would
+                    // need a literal materialization instead.
+                    let sa = match &base {
+                        Base::Slot(sname, false) if self.param_holds_addr(sname) => {
+                            self.slot_addr(self.cur_func, sname).direct()
+                        }
+                        other => panic!("isel: cannot take the value of a GEP over {other:?}"),
+                    };
+                    // The pointer value is `base + k + Σterms`, so byte 1 needs
+                    // the carry OUT of byte 0. Byte 0 only produces one when it
+                    // actually adds something: a bare `MOVF` leaves the caller's
+                    // carry standing, and propagating that adds a phantom 1.
+                    let adds_in_byte0 = k != 0 || !terms.is_empty();
+                    assert!(
+                        k == 0 || terms.is_empty(),
+                        "isel: GEP with both a constant offset and dynamic terms \
+                         loses the term's carry; not supported"
+                    );
+                    match terms.as_slice() {
+                        [] => {
+                            if idx == 0 {
+                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                if k != 0 {
+                                    self.emit(format!("    ADDLW 0x{k:02X}"));
+                                }
+                            } else {
+                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                if adds_in_byte0 {
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                }
+                            }
+                        }
+                        [(1, reg)] => {
+                            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                            if idx == 0 {
+                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                            } else {
+                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                self.emit("    BTFSC STATUS, 0".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                                self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                            }
+                        }
+                        _ => {
+                            assert!(
+                                terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
+                                "isel: multi-term GEP load with {terms:?} not supported"
+                            );
+                            let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
+                            let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
+                            if idx == 0 {
+                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
+                                self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
+                            } else {
+                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                self.emit("    BTFSC STATUS, 0".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                                self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
+                                self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
+                            }
+                        }
+                    }
+                    return;
+                }
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
@@ -1611,8 +1697,100 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF 0x{:02X}", pa));
                 self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
                 self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+            } else if arg.ty.is_none() {
+                assert!(
+                    !arg.sret && arg.byval.is_none(),
+                    "isel: plain ptr arg must be non-sret/non-byval"
+                );
+                assert_eq!(
+                    callee.params[i].width, 2,
+                    "isel: callee ptr param must be 2 bytes"
+                );
+                match &arg.val {
+                    Val::Global(g) => {
+                        let addr = self.global_addr(g);
+                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                    }
+                    Val::Const(c) => {
+                        assert_eq!(*c, 0, "isel: non-zero const ptr not supported");
+                        self.emit(format!("    CLRF 0x{:02X}", pa));
+                        self.emit(format!("    CLRF 0x{:02X}", pa + 1));
+                    }
+                    // A global at a constant offset (`&g[2]`) has a link-time
+                    // address: materialize it as two literals.
+                    Val::Reg(r) if matches!(self.resolved_for(r), (Base::Global(_), _, ref t) if t.is_empty()) =>
+                    {
+                        let (base, k, _) = self.resolved_for(r);
+                        let Base::Global(name) = &base else {
+                            unreachable!()
+                        };
+                        let addr = self.global_addr(name) + u16::from(k);
+                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                    }
+                    Val::Reg(r) => {
+                        let (base, k, terms) = self.resolved_for(r);
+                        // As in `emit_load_byte`: the shapes below read the base
+                        // slot's two bytes as a runtime address.
+                        let sa = match &base {
+                            Base::Slot(sname, false) if self.param_holds_addr(sname) => {
+                                self.slot_addr(self.cur_func, sname).direct()
+                            }
+                            other => panic!("isel: cannot pass a GEP over {other:?} as a ptr arg"),
+                        };
+                        let k_lo = (u16::from(k) & 0xFF) as u8;
+                        let k_hi = (u16::from(k) >> 8) as u8;
+                        match terms.as_slice() {
+                            [] => {
+                                if k_lo == 0 && k_hi == 0 {
+                                    self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                    self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                    self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                    self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                } else {
+                                    self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                    if k_lo != 0 {
+                                        self.emit(format!("    ADDLW 0x{k_lo:02X}"));
+                                    }
+                                    self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                    self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                    if k_lo != 0 {
+                                        self.emit(format!("    BTFSC STATUS, 0"));
+                                        self.emit(format!("    ADDLW 0x01"));
+                                    }
+                                    if k_hi != 0 {
+                                        self.emit(format!("    ADDLW 0x{k_hi:02X}"));
+                                    }
+                                    self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                }
+                            }
+                            [(1, reg)] => {
+                                let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                                if k_lo != 0 {
+                                    self.emit(format!("    ADDLW 0x{k_lo:02X}"));
+                                }
+                                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                self.emit(format!("    BTFSC STATUS, 0"));
+                                self.emit(format!("    ADDLW 0x01"));
+                                self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                if k_hi != 0 {
+                                    self.emit(format!("    ADDLW 0x{k_hi:02X}"));
+                                }
+                                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                            }
+                            _ => panic!("isel: plain ptr arg with multiple terms not yet supported: {terms:?}"),
+                        }
+                    }
+                }
             } else {
-                // Scalar args: unchanged.
                 let aty = arg.ty.expect("isel: scalar call arg must carry a type");
                 self.emit_move_val_to_slot(&arg.val, aty, pa);
                 // M15 conversion ABI: the four conversion routines take
@@ -5213,7 +5391,13 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
             let src = match val {
-                Val::Reg(r) => Some(g.slot_addr(g.cur_func, r).direct()),
+                Val::Reg(r) => {
+                    if g.resolved.contains_key(&ssa_key(g.cur_func, r)) {
+                        None
+                    } else {
+                        Some(g.slot_addr(g.cur_func, r).direct())
+                    }
+                }
                 _ => None,
             };
             (da, src, *ty, val.clone())

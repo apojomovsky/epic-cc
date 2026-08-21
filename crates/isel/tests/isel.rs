@@ -6567,3 +6567,26 @@ fn fcmp_predicates_materialize_end_to_end() {
         assert_eq!(p.ram()[0x28], want, "fcmp {pred}({a}, {b}) must be {want}:\n{asm}");
     }
 }
+
+#[test]
+fn pointer_param_high_byte_reads_without_a_phantom_carry() {
+    // Byte 1 of a pointer param's value is a plain read: byte 0 was a bare
+    // MOVF and produced no carry, so propagating one both adds a phantom 1
+    // and clobbers the carry the surrounding 16-bit compare is about to test
+    // (memmove's `d > s` always answered false).
+    let m = parse(
+        "global out i8\nfn f(void) (0=ptr, 1=ptr)\n  block entry:\n\
+           %c = icmp ugt i16 %0 %1\n    store i8 %c @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("out", 0x21),
+        ("f::0", 0x25),
+        ("f::1", 0x27),
+        ("f::c", 0x29),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        !asm.contains("ADDLW 0x01"),
+        "a k=0 pointer param read must not propagate a carry:\n{asm}"
+    );
+}
