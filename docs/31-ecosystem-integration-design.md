@@ -436,7 +436,7 @@ pub struct FuseField {
     pub mask: u8,
     pub shift: u8,
     pub values: &'static [FuseValue],
-    pub default: &'static str,
+    pub default: Option<&'static str>,  // None: no safe default exists, override is required
     pub locked: Option<&'static str>,   // Some(only-legal-value) if epic-cc cannot honor an override
 }
 pub struct ConfigRegion {
@@ -456,7 +456,18 @@ each byte are reserved at all, since not every byte in the PIC18 config region u
 
 `EPIC_CONFIG("...")`'s string is comma-separated `key=value`, matched case-insensitively
 against the device's field table. An unrecognized field or value panics naming the offending
-token and the valid options. A field not mentioned takes its `default`. The resolved bytes are
+token and the valid options. A field not mentioned takes its `default`, if it has one.
+
+**Oscillator-related fields have no default.** `FOSC` (both devices) and, on the PIC18F4550,
+`PLLDIV`/`CPUDIV`/`USBDIV`, get `default: None`. A wrong guess here does not produce a
+suboptimal chip, it produces one that does not run at all, since the right value depends
+entirely on the board's crystal. `default: None` and unset panics with a clear message
+naming the field and its valid values, rather than silently picking something. Every other
+field (`WDT`, `LVP`, `BOR`, `PWRTEN`, protection, `DEBUG`, pin-mux fields) keeps a concrete
+safe default per D-4's original intent (watchdog off, low-voltage programming off, brownout
+on, no code protection, debug off).
+
+The resolved bytes are
 folded with `reserved_value` (masked by `reserved_mask`) OR'd in. epic-cc prints the resolved
 config bytes and the named setting behind each one unconditionally on success (D-4's promise;
 not gated behind `-v`).
