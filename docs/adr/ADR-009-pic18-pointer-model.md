@@ -41,6 +41,9 @@ PIC18 pointer/array/struct support (port P3) uses:
    caller has no compile-time base to fold and is not modeled yet).
    Unsupported input aborts with a precise message rather than silently
    miscompiling.
+   **Superseded in part by ADR-018:** plain pointer params now resolve,
+   so a callee that indexes a caller-supplied pointer compiles on both
+   backends. The other boundaries in this item still hold.
 
 ## Rationale
 

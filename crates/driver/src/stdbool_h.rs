@@ -1,0 +1,13 @@
+pub const STDBOOL_H: &str = r#"#ifndef _STDBOOL_H
+#define _STDBOOL_H
+
+#define __bool_true_false_are_defined 1
+
+#ifndef __cplusplus
+#define bool _Bool
+#define true 1
+#define false 0
+#endif
+
+#endif /* _STDBOOL_H */
+"#;

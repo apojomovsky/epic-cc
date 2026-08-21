@@ -49,13 +49,19 @@ fn strip_attrs(s: &str) -> String {
 }
 
 fn ty_of(s: &str) -> Ty {
-    match s {
+    // Attribute-decorated operand types arrive whole (`ptr noundef`,
+    // `range(i16 -255, 256)`): key off the leading type token.
+    let base = s.split_whitespace().next().unwrap_or(s);
+    let base = base.split('(').next().unwrap_or(base);
+    match base {
         "i1" => Ty::I1,
         "i8" => Ty::I8,
         "i16" => Ty::I16,
         "i32" => Ty::I32,
         "float" | "f32" => Ty::F32,
-        other => panic!("SPIKE: unsupported type {other:?}"),
+        // An opaque `ptr` is a 16-bit address on this datalayout.
+        "ptr" => Ty::I16,
+        other => panic!("SPIKE: unsupported type {other:?} (full {s:?})"),
     }
 }
 
@@ -88,6 +94,8 @@ fn parse_val_typed(s: &str, ty: Option<Ty>) -> Val {
         // programs (e.g. a dead call arg the optimizer replaced after
         // specializing a noinline helper). Any materialization is therefore
         // correct; 0 keeps the IR pipeline simple.
+        Val::Const(0)
+    } else if s == "null" || s == "zeroinitializer" || s == "undef" {
         Val::Const(0)
     } else if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         let v = u64::from_str_radix(hex, 16)
@@ -1024,7 +1032,8 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
         }
         match t.as_str() {
             "ptr" | "dead_on_unwind" | "noalias" | "nocapture" | "writable" | "writeonly"
-            | "readonly" | "nonnull" | "noundef" | "zeroext" | "signext" | "immarg" | "sret" | "byval" => {}
+            | "readonly" | "nonnull" | "noundef" | "zeroext" | "signext" | "immarg" | "sret"
+            | "byval" | "returned" => {}
             "align" => skip_next = true,
             "i1" | "i8" | "i16" | "i32" | "float" | "f32" => scalar = Some(ty_of(t)),
             _ => {
@@ -1039,6 +1048,7 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
                 } else if t.starts_with("initializes")
                     || t.starts_with("range(")
                     || t.starts_with("align(")
+                    || t.starts_with("captures(")
                     || t.starts_with('#')
                 {
                     // paren group / attr-group ref
@@ -1057,7 +1067,10 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
     } else {
         2 // plain ptr param: a 2-byte address slot
     };
-    Param { name, width, byval, sret }
+    // No scalar type token and no byval/sret attribute means a plain `ptr`:
+    // its slot holds an address, which `width` alone cannot distinguish.
+    let ptr = scalar.is_none() && byval.is_none() && !sret;
+    Param { name, width, byval, sret, ptr }
 }
 
 /// Parse `.ll` text into canonical IR.
@@ -1221,7 +1234,12 @@ pub fn parse_ll(src: &str) -> Module {
                 params.push(parse_param(p, &types));
             }
 
-            let mut blocks: Vec<Block> = vec![Block { label: "0".into(), insts: Vec::new() }];
+            // The unlabelled entry block shares LLVM's unnamed-value counter with
+            // the parameters, so it is %N for N unnamed params, not always %0.
+            // Phi incomings name it, and the backends key phi copies on the edge.
+            let entry_label = params.iter().filter(|p| p.name.parse::<u32>().is_ok()).count();
+            let mut blocks: Vec<Block> =
+                vec![Block { label: entry_label.to_string(), insts: Vec::new() }];
             // Handle single-line function definitions where the body is on the
             // same line as `define`, e.g. `define void @foo() { tail call ... ret void }`.
             // These appear in the Task 2 acceptance tests.

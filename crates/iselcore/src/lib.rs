@@ -131,6 +131,11 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                     ssa_key(&f.name, &p.name),
                     (Base::Slot(p.name.clone(), true), 0, Vec::new()),
                 );
+            } else if p.ptr {
+                resolved.insert(
+                    ssa_key(&f.name, &p.name),
+                    (Base::Slot(p.name.clone(), false), 0, Vec::new()),
+                );
             }
         }
         for b in &f.blocks {

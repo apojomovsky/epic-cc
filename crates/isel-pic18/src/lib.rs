@@ -210,10 +210,9 @@ impl<'m> Gen<'m> {
         let key = ssa_key(self.cur_func, r);
         self.resolved.get(&key).cloned().unwrap_or_else(|| {
             panic!(
-                "isel-pic18: pointer %{r} ({key}) has no resolved base; a plain \
-                 (non-byval, non-sret) pointer parameter dereferenced directly is not \
-                 yet supported (P3 scope: only globals, allocas, and byval/sret params \
-                 resolve, see ADR-009)"
+                "isel-pic18: pointer %{r} ({key}) has no resolved base; only globals, \
+                 allocas, byval/sret params, plain pointer params and gep chains off \
+                 them resolve (see ADR-009, extended by ADR-018)"
             )
         })
     }
@@ -303,13 +302,23 @@ impl<'m> Gen<'m> {
                     }
                     Base::Slot(sname, indirect) => {
                         let sa = self.slot_addr(self.cur_func, sname).direct();
-                        if !indirect && terms.is_empty() {
-                            Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
-                        } else if !indirect {
-                            self.emit_fsr0_dynamic(sa, k, &terms, byte_off);
-                            Addr::Indirect
-                        } else {
+                        // A plain pointer param's slot holds the address rather
+                        // than being the object, so it is read like an `sret`
+                        // slot (a `byval` param's slot IS the object).
+                        let holds_addr = self
+                            .m
+                            .funcs
+                            .iter()
+                            .find(|f| f.name == self.cur_func)
+                            .map(|f| f.params.iter().any(|p| p.name == *sname && p.ptr))
+                            .unwrap_or(false);
+                        if *indirect || holds_addr {
                             self.emit_fsr0_indirect_slot(sa, k, &terms, byte_off);
+                            Addr::Indirect
+                        } else if terms.is_empty() {
+                            Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
+                        } else {
+                            self.emit_fsr0_dynamic(sa, k, &terms, byte_off);
                             Addr::Indirect
                         }
                     }
@@ -980,6 +989,33 @@ impl<'m> Gen<'m> {
                             Addr::Indirect => {
                                 self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
                                 self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
+                            }
+                        }
+                    } else if arg.ty.is_none() {
+                        // A plain `ptr` arg carries no scalar type: pass the
+                        // resolved 2-byte address, the same shape `sret` uses.
+                        assert!(!arg.sret && arg.byval.is_none(), "isel-pic18: plain ptr arg must be non-sret/non-byval");
+                        assert_eq!(callee.params[i].width, 2, "isel-pic18: callee ptr param must be 2 bytes");
+                        if let Val::Const(k) = arg.val {
+                            assert_eq!(k, 0, "isel-pic18: non-zero const ptr not supported");
+                            let (a0, f0) = self.operand(pa);
+                            self.emit(format!("    CLRF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
+                            let (a1, f1) = self.operand(pa + 1);
+                            self.emit(format!("    CLRF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
+                        } else {
+                            match self.emit_ptr_setup(&arg.val, 0) {
+                                Addr::Direct(addr) => {
+                                    self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                    let (a0, f0) = self.operand(pa);
+                                    self.emit(format!("    MOVWF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
+                                    self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                                    let (a1, f1) = self.operand(pa + 1);
+                                    self.emit(format!("    MOVWF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
+                                }
+                                Addr::Indirect => {
+                                    self.emit_copy_byte(0xFE9, pa); // FSR0L -> param slot lo
+                                    self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> param slot hi
+                                }
                             }
                         }
                     } else {

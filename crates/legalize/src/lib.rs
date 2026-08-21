@@ -719,7 +719,7 @@ fn lower_bin(b: &ir::Bin, used: &mut Vec<String>) -> Option<Inst> {
 }
 
 fn param(name: &str, width: u8) -> Param {
-    Param { name: name.into(), width, byval: None, sret: false }
+    Param { name: name.into(), width, byval: None, sret: false, ptr: false }
 }
 
 /// The injected runtime routine definitions. Each is an ordinary function
