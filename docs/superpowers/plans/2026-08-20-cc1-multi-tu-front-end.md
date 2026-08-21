@@ -630,7 +630,7 @@ Actual: PASS, 9/9 cli.rs, all pre-existing driver e2e tests unaffected.
 
 ---
 
-### Task 4: locate `llvm-link`
+### Task 4: locate `llvm-link` — DONE (acb42c9)
 
 `resolve_clang` at `crates/driver/src/clang_discovery.rs:16` returns `(clang_path, resource_dir)` from `PIC8_CLANG_UNWRAPPED`/`PIC8_CLANG_RESOURCE_DIR`, then from a bundled `clang` beside the executable. `llvm-link` ships in the same directory in both cases (confirmed 2026-08-20: `/opt/clang/bin/llvm-link`, 6 MB).
 
@@ -642,7 +642,7 @@ Actual: PASS, 9/9 cli.rs, all pre-existing driver e2e tests unaffected.
 - Consumes: `resolve_clang`'s returned clang path.
 - Produces: `pub fn resolve_llvm_link(clang: &Path) -> Result<PathBuf, String>`. Task 5 calls it with the path `resolve_clang` returned.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/driver/tests/llvm_link_discovery.rs`:
 
@@ -671,12 +671,14 @@ fn reports_a_clean_error_when_missing() {
 }
 ```
 
-- [ ] **Step 2: Run to verify failure**
+- [x] **Step 2: Run to verify failure**
 
 Run: `make test CRATE=driver`
 Expected: FAIL, `cannot find function 'resolve_llvm_link'`.
 
-- [ ] **Step 3: Implement**
+Actual: FAIL with `E0432: no 'resolve_llvm_link' in 'clang_discovery'`, same root cause.
+
+- [x] **Step 3: Implement**
 
 Append to `crates/driver/src/clang_discovery.rs`:
 
@@ -702,17 +704,14 @@ pub fn resolve_llvm_link(clang: &Path) -> Result<PathBuf, String> {
 }
 ```
 
-- [ ] **Step 4: Run to verify passing**
+- [x] **Step 4: Run to verify passing**
 
 Run: `make test CRATE=driver`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+Actual: PASS, 2/2 new, full driver crate suite unaffected.
 
-```bash
-git add crates/driver/src/clang_discovery.rs crates/driver/tests/llvm_link_discovery.rs
-git commit -m "feat(driver): locate llvm-link beside the resolved clang"
-```
+- [x] **Step 5: Commit** — `acb42c9`
 
 ---
 
