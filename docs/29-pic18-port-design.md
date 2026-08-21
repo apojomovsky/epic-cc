@@ -248,7 +248,7 @@ not a judgement.
 | **P3** | **DONE** Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
 | **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
 | **P5** | Interrupts: two vectors, high and low priority. | `interrupt.c`, `interrupt_gate.c`, `interrupt_mul.c` |
-| **P6** | 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c` |
+| **P6** | **DONE** 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c`, `interrupt_mul_pic18.c` |
 | **P7** | Soft-float. | `float.c` |
 | **P8** | Point the differential fuzzer at PIC18. | the seed corpora run clean |
 
@@ -267,6 +267,16 @@ byte-packed flash reads through `TBLPTR`/`TABLAT`; the PIC14 `RETLW`
 chunk machinery (256-byte windows, 511-byte ceiling) is not ported, so the
 ceiling stops existing. `const_table.c` (300 bytes) passes with its PIC14
 expected value.
+
+**P6 note (2026-08-20):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p6.md`](superpowers/plans/2026-08-20-pic18-port-p6.md).
+The i32 surface and the runtime routine recipes land together (ADR-012):
+`long.c` (0x1634943A), `muldiv.c` (210), and P5's deferred
+`interrupt_mul_pic18.c` (main + ISR both reach `__mul_u8`/`__udiv_u8`, the
+`_isr` copies get disjoint frames) all pass on the `Pic18` simulator, with
+a `gpasm -p p18f4550` byte-for-byte cross-check on the `long.c` asm. The
+muls use hardware `MULWF` schoolbook partials (no shift-add loop); the
+divmod/shift loops are branch-based with no single-GPR-bank constraint.
 
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely
