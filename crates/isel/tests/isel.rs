@@ -7065,7 +7065,7 @@ fn isr_epilogue_preserves_preempted_z_for_main_branch() {
     let mut p = Pic14::new(words);
     p.ram_mut()[0x50] = 0x5A; // the ISR body's MOVF source: W = 0x5A, Z = 0
                               // Run main up to the Z test: the ADDWF at word 54 just set Z = 1 with
-                              // W = 0xFF (non-zero — pre-fix the epilogue's MOVF 0x75, W clears Z
+                              // W = 0xFF (non-zero, pre-fix the epilogue's MOVF 0x75, W clears Z
                               // from exactly this saved W).
     let mut steps = 0usize;
     while p.pc() != 55 {

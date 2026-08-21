@@ -195,7 +195,7 @@ fn multi_page_program_compiles_and_runs_correctly() {
     assert_eq!(
         page("main"),
         Some(1),
-        "main in page 1 (nonzero — PAGE(main) != 0)"
+        "main in page 1 (nonzero, PAGE(main) != 0)"
     );
     assert_eq!(page("F3"), Some(2), "F3 in page 2");
     assert_eq!(page("F4"), Some(3), "F4 in page 3");
