@@ -287,6 +287,103 @@ versions, which goes wrong the first time a board JSON needs a fix that no compi
 justifies. `[VERIFY]` the current PlatformIO platform and package manifest schema before
 building against this shape.
 
+### D-7: Translation units merge through `llvm-link`, out of process
+
+**Decision.** The driver runs clang once per `.c` file, merges the resulting `.ll` files with
+`llvm-link -S`, and hands the single merged `.ll` to `irparse` unchanged. `wholeprog` stays a
+validator and never becomes a linker.
+
+**Rationale.** Merging translation units is not concatenation. Four things have to happen, and
+`llvm-link` does all four correctly. Probed on 2026-08-20 with two units carrying same-named
+statics and a cross-unit global:
+
+```
+a.ll:  @shared  = dso_local global i8 0            <- definition
+       @scratch = internal global i8 0
+       define internal fastcc i8 @helper()
+       declare i8 @from_b(i8)                      <- unresolved
+
+b.ll:  @shared  = external dso_local global i8     <- declaration
+       @scratch = internal global i8 0             <- collides
+       define internal fastcc i8 @helper(i8)       <- collides
+       define i8 @from_b(i8)
+
+merged.ll:
+       @shared    = dso_local global i8 0          <- one definition kept
+       @scratch   = internal global i8 0
+       @scratch.4 = internal global i8 0           <- renamed
+       define internal fastcc i8 @helper()
+       define internal fastcc i8 @helper.3(i8)     <- renamed
+       define i8 @from_b(i8)
+                                                   <- the declare is gone
+```
+
+None of it is expressible today. `irparse` strips `internal` as a noise attribute
+(`crates/irparse/src/lib.rs:39`), so linkage is discarded before anything could use it; `declare`
+lines are ignored entirely; and `@shared = external dso_local global i8` parses as a *definition*,
+because the matcher looks for the substring `global ` (`:947`), so one extern referenced from
+three units becomes three conflicting definitions of one byte. `ir::Module` has nowhere to record
+any of it.
+
+**The posture is identical to clang's.** Out of process, text in, text out, no libLLVM linked, so
+[ADR-001](03-decisions.md) holds unchanged. The merged `.ll` is still a diffable text artifact, so
+the stage boundary the pipeline rests on is preserved and in fact gains a bisect point.
+`llvm-link` is already in the dev image at 6 MB against clang's 218 MB, so the bundle cost is
+noise.
+
+**The decisive argument is not cost.** Getting one-definition selection or internal-linkage
+renaming subtly wrong produces a miscompile, which is the single failure class this project's
+architecture exists to prevent.
+
+**Rejected, implement the merge in `wholeprog`.** Requires teaching `irparse` to preserve linkage,
+adding declaration state to `ir::Func` and `ir::Global`, and writing renaming and one-definition
+resolution by hand. Full ownership of subtle semantics that ship in the box, bought with the
+miscompile risk above.
+
+**Rejected, textual concatenation of the `.ll` files with our own mangling.** Cheap, and wrong for
+any program with two same-named statics.
+
+#### Consequences
+
+**`llvm-link` runs even for one input, and that is safe.** Probed against
+`crates/driver/tests/fixtures/add.c`: the only differences are the module-ID comment,
+`source_filename`, and metadata ordering. `irparse` already skips `;` and `!` lines
+(`crates/irparse/src/lib.rs:933`) and already ignores `source_filename`. The committed golden HEX
+fixtures are unaffected. Running it unconditionally keeps one code path instead of two.
+
+**`wholeprog` gains real validation, with no IR format change.** `llvm-link` does not error on a
+`declare` it could not satisfy, it just leaves it, which downstream becomes a `CALL` to a label the
+assembler never heard of. `wholeprog` collects called-but-not-defined names and fails with the
+list. Every call target is already in the IR, so this needs no new field and no change to the
+`serialize`/`parse` round trip. It also checks there is exactly one `main`.
+
+**Symbols are sanitized once, in `wholeprog`.** `llvm-link` emits `@helper.3`. Our assembler does
+not care, since labels are plain string keys (`crates/asm/src/lib.rs:43`), but the `gpasm`
+byte-for-byte oracle has identifier rules and that oracle is load-bearing. Rewriting `.` to `_`
+immediately after the merge, before anything downstream sees a name, is what keeps `alloc`'s
+address map and `isel`'s labels consistent, since both key off `{func}::{name}`. A sanitized name
+colliding with a real user symbol panics with both names rather than silently overwriting.
+
+**The CLI becomes conventional and the positional output goes away.**
+
+```
+epic-cc [options] <input.c>...
+  -o <file>            output HEX (default: a.hex)
+  -I <dir>             include path, repeatable, forwarded to clang
+  -D <name[=value]>    define, repeatable, forwarded to clang
+  --device <name>      p16f877a | p18f4550, required
+  --emit <stage>       ll | ir | asm | hex (default hex)
+  --save-temps <dir>   write every stage artifact
+  -v                   echo the clang and llvm-link commands
+```
+
+`--emit` makes the pipeline's text boundaries a user-facing feature rather than a test-only one.
+`--device` is required, matching `avr-gcc -mmcu`, and is what retires the hard-coded device at
+`crates/driver/src/main.rs:21`. Dropping the positional output form touches roughly 25 call sites
+across `crates/driver/tests/`, the fuzz harness's `driver_binary()`, the Makefile's `compile`
+target and the README example: mechanical, and the bulk of CC-1's diff.
+
+
 ---
 
 ## 3. Sub-projects
@@ -297,7 +394,7 @@ Fourteen, across three repositories. Each earns its own design and plan.
 
 | ID | Sub-project | Contents |
 |---|---|---|
-| **CC-1** | **Multi-TU front end** | Driver takes a file list, `-I`, `-D`, `-o`, `--device`. `wholeprog` becomes a real merge: cross-TU symbol resolution, extern reconciliation, duplicate detection. Replaces `crates/wholeprog/src/lib.rs:5`. |
+| **CC-1** | **Multi-TU front end** | Per D-7: conventional CLI, clang per file, `llvm-link` merge, `wholeprog` becomes a validator (unresolved externals, one `main`) and the symbol sanitizer. Replaces `crates/wholeprog/src/lib.rs:5`. |
 | **CC-2** | **Freestanding libc subset** | Headers and implementations for `stdint.h` (94 uses in epic-hal), `string.h` (43), `stdbool.h` (31), `stddef.h` (17). `string.h` needs real code, not just declarations. |
 | **CC-3** | **Silicon-real codegen** | Config-word tables per device, `EPIC_AT`, `EPIC_ISR`, `EPIC_FOSC_HZ`, the resolved-config report, and the `epic-cc.h` header itself. |
 | **CC-4** | **Inline assembly** | The D-3 ladder: naked functions and `.asm` inputs, then intrinsics, then opaque statement-level assembly, then memory operands if warranted. Conservative clobbering throughout, since clang cannot express PIC register clobbers. |
