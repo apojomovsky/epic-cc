@@ -247,11 +247,9 @@ not a judgement.
 | **P2** | Integer spine: `isel-pic18`, Access Bank + BSR banking, `Slot::Direct`. | `add.c`, `scalar.c`, `overlay.c`, `banked.c` |
 | **P3** | **DONE** Pointers, arrays, structs via FSR0/1. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` |
 | **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
-| **P4** | **DONE** `const` in flash via `TBLRD`. | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stops existing |
 | **P5** | **DONE** Interrupts: single-vector compatibility mode (IPEN=0), one handler at `0x0008` (see the P5 note and ADR-012). | `interrupt_pic18.c`, `interrupt_gate_pic18.c`; `interrupt_mul.c` joins P6 (it needs `*`/`/`) |
 | **P6** | **DONE** 32-bit `long`, and hardware `MUL` throughout. | `long.c`, `muldiv.c`, `interrupt_mul_pic18.c` |
-| **P7** | Soft-float. | `float.c` |
-| **P8** | Point the differential fuzzer at PIC18. | the seed corpora run clean |
+| **P7** | **DONE** Soft-float: nine f32 routines via `MULWF`/`TBLRD`/`isr` save area. | `float.c` (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) |
 
 **P3 note (2026-08-20):** landed per
 [`docs/superpowers/plans/2026-08-20-pic18-port-p3.md`](superpowers/plans/2026-08-20-pic18-port-p3.md).
@@ -283,7 +281,7 @@ from PIC14 M13 unchanged.
 
 **P6 note (2026-08-20):** landed per
 [`docs/superpowers/plans/2026-08-20-pic18-port-p6.md`](superpowers/plans/2026-08-20-pic18-port-p6.md).
-The i32 surface and the runtime routine recipes land together (ADR-012):
+The i32 surface and the runtime routine recipes land together (ADR-013):
 `long.c` (0x1634943A), `muldiv.c` (210), and P5's deferred
 `interrupt_mul_pic18.c` (main + ISR both reach `__mul_u8`/`__udiv_u8`, the
 `_isr` copies get disjoint frames) all pass on the `Pic18` simulator, with
@@ -291,6 +289,14 @@ a `gpasm -p p18f4550` byte-for-byte cross-check on the `long.c` asm. The
 muls use hardware `MULWF` schoolbook partials (no shift-add loop); the
 divmod/shift loops are branch-based with no single-GPR-bank constraint.
 
+**P7 note (2026-08-20):** landed per
+[`docs/superpowers/plans/2026-08-20-pic18-port-p7.md`](superpowers/plans/2026-08-20-pic18-port-p7.md).
+The nine f32 soft-float routines land together (ADR-014): `float.c`
+(out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) passes on the `Pic18`
+simulator with a `gpasm -p p18f4550` byte-for-byte cross-check. The
+recipes are a 1:1 port of PIC14's verified ieee754 bodies with the
+substitution table (RLF to RLCF, STATUS to 0xFD8, etc.); the frame rule is
+every routine slot at `<=0x5F` (access-bank GPR, no MOVLB in skip windows).
 **P0 deserves emphasis.** It is a pure refactor with the entire existing suite as its
 oracle, and it is where `Slot` lands. If P0 is done well, every later phase is purely
 additive and the PIC14 backend can never regress silently.
