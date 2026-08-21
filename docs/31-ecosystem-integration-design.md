@@ -357,12 +357,22 @@ assembler never heard of. `wholeprog` collects called-but-not-defined names and 
 list. Every call target is already in the IR, so this needs no new field and no change to the
 `serialize`/`parse` round trip. It also checks there is exactly one `main`.
 
-**Symbols are sanitized once, in `wholeprog`.** `llvm-link` emits `@helper.3`. Our assembler does
-not care, since labels are plain string keys (`crates/asm/src/lib.rs:43`), but the `gpasm`
-byte-for-byte oracle has identifier rules and that oracle is load-bearing. Rewriting `.` to `_`
-immediately after the merge, before anything downstream sees a name, is what keeps `alloc`'s
-address map and `isel`'s labels consistent, since both key off `{func}::{name}`. A sanitized name
-colliding with a real user symbol panics with both names rather than silently overwriting.
+**Symbols are sanitized once, as a text transform on the merged `.ll`, before `irparse::parse_ll`
+ever runs.** `llvm-link` emits `@helper.3`. Our assembler does not care, since labels are plain
+string keys (`crates/asm/src/lib.rs:43`), but the `gpasm` byte-for-byte oracle has identifier
+rules and that oracle is load-bearing. Rewriting `.` to `_` immediately after the merge is what
+keeps `alloc`'s address map and `isel`'s labels consistent, since both key off `{func}::{name}`.
+A sanitized name colliding with a real user symbol panics with both names rather than silently
+overwriting.
+
+**Implemented as `irparse::sanitize_symbols`, a text transform, not a walk over the parsed
+`ir::Module` in `wholeprog`.** A name reaches the IR through seven different fields
+(`Func.name`, `Global.name`, `Call.func`, `Val::Global`, `GepBase::Global`, `Load.ptr`,
+`Store.ptr`) across `Inst`'s twenty variants; an IR-level walk in `wholeprog` would have to stay
+exhaustive across all of them, silently, forever. One text pass over `@`-prefixed identifiers in
+the merged `.ll` covers every one of those sites in a single pass and cannot miss a future `Inst`
+variant. See [ADR-011](adr/ADR-011-multi-tu-front-end.md) for the full decision and the
+`llvm-link` probe evidence this rests on.
 
 **The CLI becomes conventional and the positional output goes away.**
 
