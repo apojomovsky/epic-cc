@@ -188,6 +188,67 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Substitute `$0`/`%0` placeholders in an inline asm template with the
+    /// allocated address of each `*m` operand. Each operand's `ptr` is either
+    /// `@global` or `%local`; globals are looked up directly, locals via
+    /// `ssa_key(func, name)`. GEP-derived pointers panic per D-3.
+    fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
+        // Detect GEP-derived operand pointers: any `%reg` that resolves to a
+        // GEP with non-zero offset or dynamic terms is not a direct local.
+        for op in operands {
+            if let Some(reg) = op.ptr.strip_prefix('%') {
+                if let Some((_, k, terms)) = self.resolved.get(&ssa_key(self.cur_func, reg)) {
+                    if *k != 0 || !terms.is_empty() {
+                        panic!("asm: GEP-derived pointers are not supported; operand {} is derived via getelementptr (only direct locals and globals are allowed)", op.ptr);
+                    }
+                }
+            }
+        }
+        let mut out = String::with_capacity(template.len() + operands.len() * 6);
+        let mut chars = template.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '$' || c == '%' {
+                if let Some(&next) = chars.peek() {
+                    if next == '%' || next == '$' {
+                        // escaped `%%` or `$$` -> literal second char
+                        chars.next();
+                        out.push(next);
+                        continue;
+                    }
+                    if next.is_ascii_digit() {
+                        let mut idx_str = String::new();
+                        while let Some(&d) = chars.peek() {
+                            if d.is_ascii_digit() {
+                                idx_str.push(d);
+                                chars.next();
+                            } else {
+                                break;
+                            }
+                        }
+                        let idx: usize = idx_str.parse().unwrap();
+                        if idx >= operands.len() {
+                            panic!("asm: placeholder ${idx} out of range for {} operands in template {template:?}", operands.len());
+                        }
+                        let ptr = &operands[idx].ptr;
+                        let addr = if let Some(g) = ptr.strip_prefix('@') {
+                            *self.addrs.get(g).unwrap_or_else(|| panic!("isel: no address for @{g}"))
+                        } else if let Some(r) = ptr.strip_prefix('%') {
+                            self.slot_addr(self.cur_func, r).direct()
+                        } else {
+                            panic!("asm: malformed operand ptr {ptr:?}");
+                        };
+                        out.push_str(&format!("0x{addr:02X}"));
+                        continue;
+                    }
+                }
+                out.push(c);
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
     /// Resolve an operand value to its base byte address (lo for multi-byte).
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
@@ -2217,9 +2278,11 @@ impl<'m> Gen<'m> {
             }
             Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args),
             Inst::Asm(a) => {
-                // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking Task5.
+                // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking.
+                // Rung 4: substitute `$0`/`%0` memory operands via slot_addr.
                 self.emit("; --- asm start ---".to_string());
-                for line in a.template.split('\n') {
+                let substituted = self.substitute_asm(&a.template, &a.operands);
+                for line in substituted.split('\n') {
                     self.emit(line.to_string());
                 }
                 self.emit("; --- asm end ---".to_string());
@@ -5112,7 +5175,8 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             for inst in &b.insts {
                 match inst {
                     Inst::Asm(a) => {
-                        for line in a.template.split('\n') {
+                        let substituted = g.substitute_asm(&a.template, &a.operands);
+                        for line in substituted.split('\n') {
                             g.emit(line.to_string());
                         }
                     }
