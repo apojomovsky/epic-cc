@@ -25,5 +25,34 @@ pub const EPIC_CC_H: &str = r#"#ifndef EPIC_CC_H
 #define EPIC_FOSC_HZ 0
 #endif
 
+#define EPIC_NAKED __attribute__((naked))
+#define __epic_nop()    asm volatile("nop")
+#define __epic_clrwdt() asm volatile("clrwdt")
+#define __epic_sleep()  asm volatile("sleep")
+#define __epic_di()     asm volatile("bcf INTCON, 7")
+#define __epic_ei()     asm volatile("bsf INTCON, 7")
+
 #endif /* EPIC_CC_H */
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::EPIC_CC_H;
+
+    #[test]
+    fn header_has_epic_naked() {
+        assert!(EPIC_CC_H.contains("EPIC_NAKED"), "EPIC_CC_H missing EPIC_NAKED");
+        assert!(EPIC_CC_H.contains("__epic_nop"), "EPIC_CC_H missing __epic_nop");
+        assert!(EPIC_CC_H.contains("__epic_clrwdt"), "EPIC_CC_H missing __epic_clrwdt");
+        assert!(EPIC_CC_H.contains("__epic_sleep"), "EPIC_CC_H missing __epic_sleep");
+        assert!(EPIC_CC_H.contains("__epic_di"), "EPIC_CC_H missing __epic_di");
+        assert!(EPIC_CC_H.contains("__epic_ei"), "EPIC_CC_H missing __epic_ei");
+        // All intrinsics must be single opaque asm blocks.
+        assert!(EPIC_CC_H.contains("asm volatile(\"nop\")"));
+        assert!(EPIC_CC_H.contains("asm volatile(\"clrwdt\")"));
+        assert!(EPIC_CC_H.contains("asm volatile(\"sleep\")"));
+        assert!(EPIC_CC_H.contains("asm volatile(\"bcf INTCON, 7\")"));
+        assert!(EPIC_CC_H.contains("asm volatile(\"bsf INTCON, 7\")"));
+        assert!(EPIC_CC_H.contains("__attribute__((naked))"));
+    }
+}
