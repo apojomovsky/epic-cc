@@ -36,7 +36,10 @@ fn does_not_rewrite_inside_string_constants() {
     // dot; rewriting inside it would corrupt program data.
     let ll = "@s = private constant [14 x i8] c\"user@host.com\\00\"\n";
     let out = sanitize_symbols(ll);
-    assert!(out.contains("c\"user@host.com\\00\""), "string constant was rewritten: {out}");
+    assert!(
+        out.contains("c\"user@host.com\\00\""),
+        "string constant was rewritten: {out}"
+    );
     assert!(out.starts_with("@s = "));
 }
 

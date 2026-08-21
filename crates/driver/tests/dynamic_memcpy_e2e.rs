@@ -34,7 +34,11 @@ fn dyn_memcpy_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -60,10 +64,20 @@ fn dynamic_length_memcpy_runs_correctly() {
     let buf3 = *layout.globals.get("buf3").expect("buf3 global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/dynamic_memcpy.c", "-o", "tests/fixtures/dynamic_memcpy.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/dynamic_memcpy.c",
+            "-o",
+            "tests/fixtures/dynamic_memcpy.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/dynamic_memcpy.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -78,12 +92,20 @@ fn dynamic_length_memcpy_runs_correctly() {
     p.ram_mut()[in_addr + 1] = 0x00;
     p.run(2_000_000);
 
-    assert_eq!(p.ram()[out_addr], 0xEF, "out == 0xEF for in == 10 (10-byte runtime copy + zero-length guard)");
+    assert_eq!(
+        p.ram()[out_addr],
+        0xEF,
+        "out == 0xEF for in == 10 (10-byte runtime copy + zero-length guard)"
+    );
     // buf1[0..9] = the pattern (10 bytes copied)
     for i in 0..10 {
         assert_eq!(p.ram()[buf1 + i], (i as u8).wrapping_mul(0x37), "buf1[{i}]");
     }
-    assert_eq!(p.ram()[buf1 + 10], 0, "buf1[10] untouched (only 10 bytes copied)");
+    assert_eq!(
+        p.ram()[buf1 + 10],
+        0,
+        "buf1[10] untouched (only 10 bytes copied)"
+    );
     // buf3 untouched by the zero-length copy
     for i in 0..8 {
         assert_eq!(p.ram()[buf3 + i], 0, "buf3[{i}] stays zero (len-0 guard)");

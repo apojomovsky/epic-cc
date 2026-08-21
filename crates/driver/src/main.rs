@@ -40,7 +40,9 @@ fn main() {
     for input in &cli.inputs {
         let lower = input.to_ascii_lowercase();
         if lower.ends_with(".asm") || lower.ends_with(".s") {
-            eprintln!("epic-cc: .asm inputs are not supported in this build; use EPIC_NAKED functions");
+            eprintln!(
+                "epic-cc: .asm inputs are not supported in this build; use EPIC_NAKED functions"
+            );
             std::process::exit(2);
         }
     }
@@ -86,26 +88,35 @@ fn main() {
     std::fs::create_dir_all(&tmp).expect("create temp dir");
     let header_dir = tmp.join("include");
     std::fs::create_dir_all(&header_dir).expect("create header dir");
-    std::fs::write(header_dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).expect("write epic-cc.h");
-    std::fs::write(header_dir.join("stdint.h"), driver::stdint_h::STDINT_H).expect("write stdint.h");
-    std::fs::write(header_dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H).expect("write stdbool.h");
-    std::fs::write(header_dir.join("stddef.h"), driver::stddef_h::STDDEF_H).expect("write stddef.h");
-    std::fs::write(header_dir.join("string.h"), driver::string_h::STRING_H).expect("write string.h");
+    std::fs::write(header_dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H)
+        .expect("write epic-cc.h");
+    std::fs::write(header_dir.join("stdint.h"), driver::stdint_h::STDINT_H)
+        .expect("write stdint.h");
+    std::fs::write(header_dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H)
+        .expect("write stdbool.h");
+    std::fs::write(header_dir.join("stddef.h"), driver::stddef_h::STDDEF_H)
+        .expect("write stddef.h");
+    std::fs::write(header_dir.join("string.h"), driver::string_h::STRING_H)
+        .expect("write string.h");
 
     let sources: Vec<(String, String)> = cli
         .inputs
         .iter()
-        .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap_or_else(|e| {
-            eprintln!("epic-cc: read {p}: {e}");
-            std::process::exit(1);
-        })))
+        .map(|p| {
+            (
+                p.clone(),
+                std::fs::read_to_string(p).unwrap_or_else(|e| {
+                    eprintln!("epic-cc: read {p}: {e}");
+                    std::process::exit(1);
+                }),
+            )
+        })
         .collect();
     let prescan_spec = driver::prescan::find_epic_config(&sources);
     let fosc_hz: u64 = match &prescan_spec {
         Some(spec) => driver::fosc::resolve_fosc_hz(device, spec),
         None => driver::fosc::resolve_fosc_hz_from_defaults(device),
     };
-
 
     // 1. clang: one invocation per translation unit.
     let mut units = Vec::new();
@@ -316,14 +327,20 @@ fn main() {
                 let hi = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
                 config_words.push(lo | (hi << 8));
             }
-            asm::to_hex_regions(&[(0, &program_words), (device.config.base_byte_addr, &config_words)])
+            asm::to_hex_regions(&[
+                (0, &program_words),
+                (device.config.base_byte_addr, &config_words),
+            ])
         }
         _ => asm::assemble_file_to_hex(device, &asm),
     };
     if let Some(cb) = &config_bytes {
         eprintln!("epic-cc: resolved configuration for {}:", device.name);
         for (i, b) in cb.iter().enumerate() {
-            eprintln!("  byte 0x{:06X} = 0x{b:02X}", device.config.base_byte_addr as usize + i);
+            eprintln!(
+                "  byte 0x{:06X} = 0x{b:02X}",
+                device.config.base_byte_addr as usize + i
+            );
         }
     }
     std::fs::write(&cli.output, hex).expect("write hex");

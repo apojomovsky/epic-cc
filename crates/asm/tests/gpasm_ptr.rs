@@ -46,11 +46,21 @@ fn ptr_probe_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("ptr_probe_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "ptr_probe_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "ptr_probe_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/ptr_probe_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator: in = 1 -> ram[1] = table[1] = 20 -> out

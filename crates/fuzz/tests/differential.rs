@@ -12,8 +12,8 @@ use std::collections::HashMap;
 
 use device;
 use fuzz::{
-    generate, generate_float, generate_ir, generate_signed, run_differential,
-    run_ir_differential, FailureKind, Input, IrProgram, Program, TYPEDEF_PROLOGUE,
+    generate, generate_float, generate_ir, generate_signed, run_differential, run_ir_differential,
+    FailureKind, Input, IrProgram, Program, TYPEDEF_PROLOGUE,
 };
 
 /// The brief's tiny program: one u8 volatile input, one scalar expression.
@@ -41,9 +41,8 @@ fn tiny_program(in0: u32) -> Program {
 fn tiny_program_differential_clean() {
     // (unsigned char)(in0 * 7 + 3) for in0 = 0, 1, 200.
     for (in0, expect) in [(0u32, 3u32), (1, 10), (200, 123)] {
-        let got = run_differential(&tiny_program(in0), &device::PIC16F877A).unwrap_or_else(|e| {
-            panic!("seed in0={in0} not differential-clean: {e}")
-        });
+        let got = run_differential(&tiny_program(in0), &device::PIC16F877A)
+            .unwrap_or_else(|e| panic!("seed in0={in0} not differential-clean: {e}"));
         assert_eq!(got, expect, "checksum for in0={in0}");
     }
 }
@@ -72,7 +71,10 @@ fn mismatching_variant_fails() {
         prologue: c_source,
     };
     match run_differential(&prog, &device::PIC16F877A) {
-        Err(e) => assert!(e.to_string().contains("mismatch"), "expected a mismatch, got: {e}"),
+        Err(e) => assert!(
+            e.to_string().contains("mismatch"),
+            "expected a mismatch, got: {e}"
+        ),
         Ok(v) => panic!("expected a mismatch, got Ok({v})"),
     }
 }
@@ -87,9 +89,18 @@ fn generator_emits_explicit_width_types() {
     // guarded typedefs (u32 = unsigned long on msp430, unsigned int on the
     // host), never bare `unsigned long` globals (64-bit on LP64 hosts).
     let a = generate(0);
-    assert!(a.c_source.contains("#ifdef __MSP430__"), "msp430-guarded typedefs");
-    assert!(a.c_source.contains("typedef unsigned char u8;"), "u8 typedef");
-    assert!(a.c_source.contains("typedef unsigned short u16;"), "u16 typedef");
+    assert!(
+        a.c_source.contains("#ifdef __MSP430__"),
+        "msp430-guarded typedefs"
+    );
+    assert!(
+        a.c_source.contains("typedef unsigned char u8;"),
+        "u8 typedef"
+    );
+    assert!(
+        a.c_source.contains("typedef unsigned short u16;"),
+        "u16 typedef"
+    );
     assert!(
         a.c_source.contains("typedef unsigned long u32;")
             && a.c_source.contains("typedef unsigned int u32;"),
@@ -154,7 +165,7 @@ fn unsigned_long_u32_arithmetic_mismatches() {
                      unsigned long x = in0;\n\
                      checksum = (unsigned char)(x * x > 0xFFFFFFFFu);\n\
                    }\n"
-        .to_string();
+    .to_string();
     let prog = Program {
         c_source: c_source.clone(),
         inputs: vec![Input {
@@ -285,10 +296,22 @@ fn full_corpus_spans_the_generation_surface() {
 fn generate_is_deterministic_and_disciplined() {
     let a = generate(42);
     let b = generate(42);
-    assert_eq!(a.c_source, b.c_source, "same seed must give the same source");
-    assert!(a.c_source.contains("volatile u8 in0;"), "volatile u8 input decl");
-    assert!(a.c_source.contains("checksum = (u8)(checksum ^ "), "the checksum fold");
-    assert!(a.c_source.ends_with("}\n"), "the generated main ends the file");
+    assert_eq!(
+        a.c_source, b.c_source,
+        "same seed must give the same source"
+    );
+    assert!(
+        a.c_source.contains("volatile u8 in0;"),
+        "volatile u8 input decl"
+    );
+    assert!(
+        a.c_source.contains("checksum = (u8)(checksum ^ "),
+        "the checksum fold"
+    );
+    assert!(
+        a.c_source.ends_with("}\n"),
+        "the generated main ends the file"
+    );
     assert_eq!(a.checksum_name, "checksum");
     assert!(!a.inputs.is_empty());
     assert!(
@@ -353,11 +376,36 @@ fn float_prog(body: &str, in3: u32) -> Program {
     Program {
         c_source: c_source.clone(),
         inputs: vec![
-            Input { name: "in0".into(), value: 0, width: 8, is_float: false },
-            Input { name: "in3".into(), value: in3, width: 32, is_float: true },
-            Input { name: "in4".into(), value: 0x4000_0000, width: 32, is_float: true }, // 2.0f
-            Input { name: "in5".into(), value: 0x4040_0000, width: 32, is_float: true }, // 3.0f
-            Input { name: "in6".into(), value: 0x3DCC_CCCD, width: 32, is_float: true }, // 0.1f
+            Input {
+                name: "in0".into(),
+                value: 0,
+                width: 8,
+                is_float: false,
+            },
+            Input {
+                name: "in3".into(),
+                value: in3,
+                width: 32,
+                is_float: true,
+            },
+            Input {
+                name: "in4".into(),
+                value: 0x4000_0000,
+                width: 32,
+                is_float: true,
+            }, // 2.0f
+            Input {
+                name: "in5".into(),
+                value: 0x4040_0000,
+                width: 32,
+                is_float: true,
+            }, // 3.0f
+            Input {
+                name: "in6".into(),
+                value: 0x3DCC_CCCD,
+                width: 32,
+                is_float: true,
+            }, // 0.1f
         ],
         checksum_name: "checksum".into(),
         seed: 0,
@@ -481,7 +529,10 @@ fn float_fold_is_ulp_sensitive() {
     let b = run_differential(&float_prog(&body, 0x3F80_0001), &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float RNE program (1.0f + 1ulp) not clean: {e}"));
     assert_eq!(a, 0x30, "the 1.0f run's hand-computed checksum");
-    assert_eq!(b, 0x32, "the 1.0f + 1ulp run's checksum (Rust f32 reference)");
+    assert_eq!(
+        b, 0x32,
+        "the 1.0f + 1ulp run's checksum (Rust f32 reference)"
+    );
     assert_ne!(a, b, "a 1-ulp input change must change the checksum");
 }
 
@@ -652,9 +703,24 @@ fn signed_prog() -> Program {
     Program {
         c_source: c_source.clone(),
         inputs: vec![
-            Input { name: "in0".into(), value: 200, width: 8, is_float: false },
-            Input { name: "in1".into(), value: 0x8000, width: 16, is_float: false },
-            Input { name: "in2".into(), value: 0x8000_0000, width: 32, is_float: false },
+            Input {
+                name: "in0".into(),
+                value: 200,
+                width: 8,
+                is_float: false,
+            },
+            Input {
+                name: "in1".into(),
+                value: 0x8000,
+                width: 16,
+                is_float: false,
+            },
+            Input {
+                name: "in2".into(),
+                value: 0x8000_0000,
+                width: 32,
+                is_float: false,
+            },
         ],
         checksum_name: "checksum".into(),
         seed: 0,
@@ -682,14 +748,23 @@ fn generate_signed_is_deterministic_and_disciplined() {
     // 32-bit on the host), every signed expression an explicit-width cast.
     let a = generate_signed(42);
     let b = generate_signed(42);
-    assert_eq!(a.c_source, b.c_source, "same seed must give the same source");
+    assert_eq!(
+        a.c_source, b.c_source,
+        "same seed must give the same source"
+    );
     assert!(
         a.c_source.contains("(s16)") || a.c_source.contains("(s32)") || a.c_source.contains("(s8)"),
         "signed casts present"
     );
     // The s8 typedef exists on both sides.
-    assert!(a.c_source.contains("typedef signed char s8;"), "s8 typedef (msp430 arm)");
-    assert!(a.c_source.contains("typedef signed char s8;"), "s8 typedef (host arm)");
+    assert!(
+        a.c_source.contains("typedef signed char s8;"),
+        "s8 typedef (msp430 arm)"
+    );
+    assert!(
+        a.c_source.contains("typedef signed char s8;"),
+        "s8 typedef (host arm)"
+    );
     assert_eq!(a.checksum_name, "checksum");
 }
 
@@ -783,7 +858,12 @@ volatile u16 in;\nvolatile u16 out;\nvolatile u8 out2;\nvolatile u8 checksum;\nv
 fn ir_prog() -> IrProgram {
     IrProgram {
         ir_text: IR_TEXT.to_string(),
-        inputs: vec![Input { name: "in".into(), value: 0x8000, width: 16, is_float: false }],
+        inputs: vec![Input {
+            name: "in".into(),
+            value: 0x8000,
+            width: 16,
+            is_float: false,
+        }],
         checksum_name: "checksum".into(),
         seed: 0,
         c_twin: IR_TWIN_C.to_string(),

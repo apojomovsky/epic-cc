@@ -32,7 +32,10 @@ fn explicit_global_addr_past_0xff_roundtrips() {
     let m = parse("global g i16 @0x150\n");
     assert_eq!(m.globals[0].addr, Some(0x150));
     let out = serialize(&m);
-    assert!(out.contains("global g i16 @0x150"), "missing wide addr\n---\n{out}");
+    assert!(
+        out.contains("global g i16 @0x150"),
+        "missing wide addr\n---\n{out}"
+    );
     assert_eq!(serialize(&parse(&out)), out, "stable fixed point");
 }
 
@@ -45,12 +48,24 @@ fn gep_and_sized_globals_roundtrip() {
     let m2 = parse(&out);
     assert_eq!(serialize(&m2), out);
     // gep line round-trips verbatim
-    assert!(out.contains("%p = gep @ram +0 +1*%3"), "missing gep line\n---\n{out}");
+    assert!(
+        out.contains("%p = gep @ram +0 +1*%3"),
+        "missing gep line\n---\n{out}"
+    );
     // sized global keeps its address
-    assert!(out.contains("global ram i8 @0x25"), "missing global addr\n---\n{out}");
+    assert!(
+        out.contains("global ram i8 @0x25"),
+        "missing global addr\n---\n{out}"
+    );
     // const global carries no @addr in the canonical text
-    assert!(out.contains("const table i8\n"), "missing const line\n---\n{out}");
-    assert!(!out.contains("const table i8 @"), "const must serialize without an address\n---\n{out}");
+    assert!(
+        out.contains("const table i8\n"),
+        "missing const line\n---\n{out}"
+    );
+    assert!(
+        !out.contains("const table i8 @"),
+        "const must serialize without an address\n---\n{out}"
+    );
     // parsed scalar global sizes default from the type (widened to u16)
     assert_eq!(m.globals[0].size, u16::from(ir::Ty::I8.bytes()));
     assert_eq!(m.globals[1].size, u16::from(ir::Ty::I8.bytes()));
@@ -70,7 +85,9 @@ fn gep_and_sized_globals_roundtrip() {
 
 #[test]
 fn roundtrips_all_icmp_predicates_and_sext() {
-    let preds = ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"];
+    let preds = [
+        "eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge",
+    ];
     let mut insts = String::new();
     for (i, p) in preds.iter().enumerate() {
         insts.push_str(&format!("    %c{i} = icmp {p} i8 %a %b\n"));
@@ -84,10 +101,16 @@ fn roundtrips_all_icmp_predicates_and_sext() {
     assert_eq!(serialize(&m2), out);
     // every predicate serializes verbatim
     for (i, p) in preds.iter().enumerate() {
-        assert!(out.contains(&format!("%c{i} = icmp {p} i8 %a %b")), "missing {p}\n---\n{out}");
+        assert!(
+            out.contains(&format!("%c{i} = icmp {p} i8 %a %b")),
+            "missing {p}\n---\n{out}"
+        );
     }
     // sext serializes canonically
-    assert!(out.contains("%s = sext i8 %v to i16"), "missing sext\n---\n{out}");
+    assert!(
+        out.contains("%s = sext i8 %v to i16"),
+        "missing sext\n---\n{out}"
+    );
 }
 
 #[test]
@@ -133,7 +156,10 @@ fn roundtrips_control_flow_call_and_cast() {
         "%12 = icmp eq i16 %11 0",
         "%13 = select i1 %12 i16 100 i16 %9",
     ] {
-        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+        assert!(
+            out.contains(line),
+            "missing canonical line: {line}\n---\n{out}"
+        );
     }
 }
 
@@ -141,10 +167,14 @@ fn roundtrips_control_flow_call_and_cast() {
 fn roundtrips_runtime_length_memcpy() {
     // Issue #4: the register-length form (`memcpy dst src %n`) round-trips
     // as MemLen::Reg — the counted-loop form — not as a const parse error.
-    let text = "global a i8\nfn f(i16) (n=i16)\n  block entry:\n    memcpy @a %1 %n\n    ret void\n";
+    let text =
+        "global a i8\nfn f(i16) (n=i16)\n  block entry:\n    memcpy @a %1 %n\n    ret void\n";
     let m = parse(text);
     let out = serialize(&m);
-    assert!(out.contains("memcpy @a %1 %n"), "runtime-len memcpy\n---\n{out}");
+    assert!(
+        out.contains("memcpy @a %1 %n"),
+        "runtime-len memcpy\n---\n{out}"
+    );
     // stable fixed point: parse -> serialize -> parse -> serialize
     let m2 = parse(&out);
     assert_eq!(serialize(&m2), out);
@@ -172,7 +202,10 @@ fn roundtrips_reworked_gep_alloca_memcpy_and_params() {
     assert!(m.funcs[0].params[1].sret);
 
     let out = serialize(&m);
-    assert!(out.contains("fn f(i16) (x=i8, s=sret)"), "params header\n---\n{out}");
+    assert!(
+        out.contains("fn f(i16) (x=i8, s=sret)"),
+        "params header\n---\n{out}"
+    );
     assert!(out.contains("%p = gep %s +2 +2*%x"), "gep\n---\n{out}");
     assert!(out.contains("%1 = alloca 4"), "alloca\n---\n{out}");
     assert!(out.contains("memcpy @a %1 4"), "memcpy\n---\n{out}");
@@ -201,8 +234,14 @@ fn roundtrips_byval_param_and_call_arg() {
     assert_eq!(m.funcs[0].params[0].byval, Some(4));
     assert_eq!(m.funcs[0].params[0].width, 4);
     let out = serialize(&m);
-    assert!(out.contains("fn f(i8) (p=byval4)"), "byval param header\n---\n{out}");
-    assert!(out.contains("%r = call i8 @g(i8 %1, byval4 %p)"), "call args\n---\n{out}");
+    assert!(
+        out.contains("fn f(i8) (p=byval4)"),
+        "byval param header\n---\n{out}"
+    );
+    assert!(
+        out.contains("%r = call i8 @g(i8 %1, byval4 %p)"),
+        "call args\n---\n{out}"
+    );
     let m2 = parse(&out);
     assert_eq!(serialize(&m2), out);
     match &m2.funcs[0].blocks[0].insts[0] {
@@ -227,10 +266,16 @@ fn scalar_param_widths_roundtrip() {
     assert_eq!(m.funcs[0].params[0].width, 2); // i16 -> width 2
     assert_eq!(m.funcs[0].params[1].width, 1); // i8 -> width 1
     let out = serialize(&m);
-    assert_eq!(out, text, "scalar widths must serialize back to typed params\n---\n{out}");
+    assert_eq!(
+        out, text,
+        "scalar widths must serialize back to typed params\n---\n{out}"
+    );
     // re-parse: the i16 scalar keeps width 2 (re-parsed as 1 before the fix)
     let m2 = parse(&out);
-    assert_eq!(m2.funcs[0].params[0].width, 2, "i16 scalar param must re-parse with width 2");
+    assert_eq!(
+        m2.funcs[0].params[0].width, 2,
+        "i16 scalar param must re-parse with width 2"
+    );
     assert_eq!(serialize(&m2), out);
 }
 
@@ -267,7 +312,10 @@ fn roundtrips_new_binops_and_freeze() {
         "%8 = ashr i16 %7 2",
         "%9 = freeze i16 %8",
     ] {
-        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+        assert!(
+            out.contains(line),
+            "missing canonical line: {line}\n---\n{out}"
+        );
     }
 }
 
@@ -276,7 +324,10 @@ fn gep_base_global_roundtrips() {
     let text = "global a i8\nfn main(void) ()\n  block entry:\n    %p = gep @a +3\n    ret void\n";
     let m = parse(text);
     let out = serialize(&m);
-    assert!(out.contains("%p = gep @a +3"), "const-offset gep\n---\n{out}");
+    assert!(
+        out.contains("%p = gep @a +3"),
+        "const-offset gep\n---\n{out}"
+    );
     let m2 = parse(&out);
     assert_eq!(serialize(&m2), out);
     match &m2.funcs[0].blocks[0].insts[0] {
@@ -298,14 +349,20 @@ fn roundtrips_isr_marker() {
     let m = parse(text);
     assert!(m.funcs[0].isr, "isr marker must parse to Func.isr == true");
     let out = serialize(&m);
-    assert!(out.contains("fn isr(void) [isr] ()"), "isr marker header\n---\n{out}");
+    assert!(
+        out.contains("fn isr(void) [isr] ()"),
+        "isr marker header\n---\n{out}"
+    );
     let m2 = parse(&out);
     assert!(m2.funcs[0].isr, "isr marker must round-trip");
     assert_eq!(serialize(&m2), out, "stable fixed point");
     // a plain function carries no marker
     let m3 = parse("fn main(void) ()\n  block entry:\n    ret void\n");
     assert!(!m3.funcs[0].isr);
-    assert!(!serialize(&m3).contains("[isr]"), "no marker on a non-isr fn");
+    assert!(
+        !serialize(&m3).contains("[isr]"),
+        "no marker on a non-isr fn"
+    );
 }
 
 #[test]
@@ -315,8 +372,14 @@ fn roundtrips_literal_ptr_load_store() {
     let text = "fn main(void) ()\n  block entry:\n    %1 = load i8 0x06\n    store i8 85 0x06\n    ret void\n";
     let m = parse(text);
     let out = serialize(&m);
-    assert!(out.contains("%1 = load i8 0x06"), "literal ptr load\n---\n{out}");
-    assert!(out.contains("store i8 85 0x06"), "literal ptr store\n---\n{out}");
+    assert!(
+        out.contains("%1 = load i8 0x06"),
+        "literal ptr load\n---\n{out}"
+    );
+    assert!(
+        out.contains("store i8 85 0x06"),
+        "literal ptr store\n---\n{out}"
+    );
     let m2 = parse(&out);
     assert_eq!(serialize(&m2), out, "stable fixed point");
     match &m2.funcs[0].blocks[0].insts[0] {
@@ -331,7 +394,10 @@ fn roundtrips_i32_ops() {
     // and parser touch — binop, icmp, casts, and a sized scalar param.
     let text = "global in i32\nfn f(i32) (x=i32)\n  block entry:\n    %1 = add i32 %x, 2\n    %2 = icmp ult i32 %1, 10\n    %3 = zext i8 %1 to i32\n    %4 = trunc i32 %1 to i8\n    %5 = sext i16 %1 to i32\n    store i32 %5 @in\n    ret void\n";
     let m = parse(text);
-    assert_eq!(m.funcs[0].params[0].width, 4, "i32 scalar param must carry width 4");
+    assert_eq!(
+        m.funcs[0].params[0].width, 4,
+        "i32 scalar param must carry width 4"
+    );
     let out = serialize(&m);
     // stable fixed point
     let m2 = parse(&out);
@@ -346,7 +412,10 @@ fn roundtrips_i32_ops() {
         "store i32 %5 @in",
         "global in i32",
     ] {
-        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+        assert!(
+            out.contains(line),
+            "missing canonical line: {line}\n---\n{out}"
+        );
     }
 }
 
@@ -372,7 +441,10 @@ fn roundtrips_float_insts_and_constants() {
     let m = parse(text);
     assert_eq!(m.globals[0].ty, ir::Ty::F32, "float global type");
     assert_eq!(m.globals[0].size, 4, "float global is 4 bytes");
-    assert_eq!(m.funcs[0].params[0].width, 4, "float scalar param is width 4");
+    assert_eq!(
+        m.funcs[0].params[0].width, 4,
+        "float scalar param is width 4"
+    );
     let out = serialize(&m);
     // stable fixed point: parse -> serialize -> parse -> serialize
     let m2 = parse(&out);
@@ -397,6 +469,9 @@ fn roundtrips_float_insts_and_constants() {
         "%11 = fptrunc float %9 to float",
         "ret float %11",
     ] {
-        assert!(out.contains(line), "missing canonical line: {line}\n---\n{out}");
+        assert!(
+            out.contains(line),
+            "missing canonical line: {line}\n---\n{out}"
+        );
     }
 }

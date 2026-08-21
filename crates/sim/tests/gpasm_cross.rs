@@ -13,7 +13,11 @@ fn agrees_with_gpasm_assembled_program() {
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string(format!("{dir}/fib.hex")).expect("read hex");
     let mut p = Pic14::new(parse_hex(&hex));

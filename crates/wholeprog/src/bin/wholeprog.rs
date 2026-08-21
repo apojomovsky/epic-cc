@@ -1,6 +1,6 @@
+use ir::{parse, serialize};
 use std::fs;
 use wholeprog::merge;
-use ir::{parse, serialize};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

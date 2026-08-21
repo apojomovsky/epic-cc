@@ -6,8 +6,7 @@
 
 use device::PIC18F4550;
 use fuzz::{
-    generate, generate_float, generate_ir, generate_signed, run_differential,
-    run_ir_differential,
+    generate, generate_float, generate_ir, generate_signed, run_differential, run_ir_differential,
 };
 
 #[test]

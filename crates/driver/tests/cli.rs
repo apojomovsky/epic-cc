@@ -16,8 +16,8 @@ fn parses_a_minimal_invocation() {
 #[test]
 fn collects_multiple_inputs_includes_and_defines() {
     let c = parse_args(&args(&[
-        "a.c", "b.c", "-I", "inc", "-I", "inc2", "-D", "F=1", "-D", "G",
-        "-o", "out.hex", "--device", "p18f4550",
+        "a.c", "b.c", "-I", "inc", "-I", "inc2", "-D", "F=1", "-D", "G", "-o", "out.hex",
+        "--device", "p18f4550",
     ]))
     .unwrap();
     assert_eq!(c.inputs, vec!["a.c", "b.c"]);
@@ -29,7 +29,15 @@ fn collects_multiple_inputs_includes_and_defines() {
 
 #[test]
 fn accepts_attached_short_flag_forms() {
-    let c = parse_args(&args(&["a.c", "-Iinc", "-DF=1", "-oout.hex", "--device", "p16f877a"])).unwrap();
+    let c = parse_args(&args(&[
+        "a.c",
+        "-Iinc",
+        "-DF=1",
+        "-oout.hex",
+        "--device",
+        "p16f877a",
+    ]))
+    .unwrap();
     assert_eq!(c.includes, vec!["inc"]);
     assert_eq!(c.defines, vec!["F=1"]);
     assert_eq!(c.output, "out.hex");
@@ -37,7 +45,12 @@ fn accepts_attached_short_flag_forms() {
 
 #[test]
 fn parses_emit_stages() {
-    for (s, want) in [("ll", Emit::Ll), ("ir", Emit::Ir), ("asm", Emit::Asm), ("hex", Emit::Hex)] {
+    for (s, want) in [
+        ("ll", Emit::Ll),
+        ("ir", Emit::Ir),
+        ("asm", Emit::Asm),
+        ("hex", Emit::Hex),
+    ] {
         let c = parse_args(&args(&["a.c", "--device", "p16f877a", "--emit", s])).unwrap();
         assert_eq!(c.emit, want);
     }
@@ -63,7 +76,10 @@ fn rejects_an_unknown_flag() {
 
 #[test]
 fn rejects_an_unknown_emit_stage() {
-    let e = parse_args(&args(&["a.c", "--device", "p16f877a", "--emit", "bytecode"])).unwrap_err();
+    let e = parse_args(&args(&[
+        "a.c", "--device", "p16f877a", "--emit", "bytecode",
+    ]))
+    .unwrap_err();
     assert!(e.contains("bytecode"), "{e}");
 }
 

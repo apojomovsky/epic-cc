@@ -84,11 +84,21 @@ fn const_table_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("const_table_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "const_table_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "const_table_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/const_table_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator: in = 290 -> out = 0x82 (hand-computed,
@@ -97,6 +107,10 @@ fn const_table_hex_matches_gpasm_and_runs() {
     p.ram_mut()[0x20] = 0x22; // in low byte = 290 & 0xFF
     p.ram_mut()[0x21] = 0x01; // in high byte = 290 >> 8
     p.run(2_000_000);
-    assert_eq!(p.ram()[0x22], 0x82, "out == hand-computed 0x82 for in == 290");
+    assert_eq!(
+        p.ram()[0x22],
+        0x82,
+        "out == hand-computed 0x82 for in == 290"
+    );
     assert!(p.halted());
 }

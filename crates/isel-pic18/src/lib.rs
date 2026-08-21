@@ -137,7 +137,10 @@ impl<'m> Gen<'m> {
                         }
                         let ptr = &operands[idx].ptr;
                         let addr = if let Some(g) = ptr.strip_prefix('@') {
-                            *self.addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}"))
+                            *self
+                                .addrs
+                                .get(g)
+                                .unwrap_or_else(|| panic!("isel-pic18: no address for @{g}"))
                         } else if let Some(r) = ptr.strip_prefix('%') {
                             self.slot_addr(self.cur_func, r).direct()
                         } else {
@@ -250,7 +253,6 @@ impl<'m> Gen<'m> {
         a
     }
 
-
     /// The folded `(base, k, terms)` for pointer reg `r` in the current
     /// function, from the module-wide `resolve_pointers` map. Every `gep`
     /// result and every byval/sret/alloca seed resolves; a plain (not
@@ -347,7 +349,9 @@ impl<'m> Gen<'m> {
                 match &base {
                     Base::Global(name) => {
                         if terms.is_empty() {
-                            Addr::Direct(self.global_addr(name) + u16::from(k) + u16::from(byte_off))
+                            Addr::Direct(
+                                self.global_addr(name) + u16::from(k) + u16::from(byte_off),
+                            )
                         } else {
                             self.emit_fsr0_dynamic(self.global_addr(name), k, &terms, byte_off);
                             Addr::Indirect
@@ -409,7 +413,13 @@ impl<'m> Gen<'m> {
     /// access bit needed since MOVFF never uses one), then add the static
     /// offset (`k + byte_off`) and any dynamic term the same way
     /// `emit_fsr0_dynamic` does, and access through `INDF0`.
-    fn emit_fsr0_indirect_slot(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_fsr0_indirect_slot(
+        &mut self,
+        slot_addr: u16,
+        k: u8,
+        terms: &[(u8, String)],
+        byte_off: u8,
+    ) {
         assert!(
             terms.len() <= 1,
             "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
@@ -421,10 +431,16 @@ impl<'m> Gen<'m> {
         if static_part != 0 {
             self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
             let (fa, ff) = self.operand(0xFE9);
-            self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
+            self.emit(format!(
+                "    ADDWF 0x{ff:03X},F,{}",
+                if fa == 0 { "A" } else { "B" }
+            ));
             self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
             let (ha, hf) = self.operand(0xFEA);
-            self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
+            self.emit(format!(
+                "    ADDWFC 0x{hf:03X},F,{}",
+                if ha == 0 { "A" } else { "B" }
+            ));
         }
         self.add_term_to_fsr0(terms);
     }
@@ -438,12 +454,21 @@ impl<'m> Gen<'m> {
             let a = self.slot_addr(self.cur_func, reg).direct();
             for _ in 0..*scale {
                 let (ra, rf) = self.operand(a);
-                self.emit(format!("    MOVF 0x{rf:03X},W,{}", if ra == 0 { "A" } else { "B" }));
+                self.emit(format!(
+                    "    MOVF 0x{rf:03X},W,{}",
+                    if ra == 0 { "A" } else { "B" }
+                ));
                 let (fa, ff) = self.operand(0xFE9); // FSR0L
-                self.emit(format!("    ADDWF 0x{ff:03X},F,{}", if fa == 0 { "A" } else { "B" }));
+                self.emit(format!(
+                    "    ADDWF 0x{ff:03X},F,{}",
+                    if fa == 0 { "A" } else { "B" }
+                ));
                 self.emit("    MOVLW 0x00".to_string());
                 let (ha, hf) = self.operand(0xFEA); // FSR0H
-                self.emit(format!("    ADDWFC 0x{hf:03X},F,{}", if ha == 0 { "A" } else { "B" }));
+                self.emit(format!(
+                    "    ADDWFC 0x{hf:03X},F,{}",
+                    if ha == 0 { "A" } else { "B" }
+                ));
             }
         }
     }
@@ -510,7 +535,10 @@ impl<'m> Gen<'m> {
             let width = self.reg_width(reg);
             for _ in 0..*scale {
                 let (ra, rf) = self.operand(lo);
-                self.emit(format!("    MOVF 0x{rf:03X},W,{}", if ra == 0 { "A" } else { "B" }));
+                self.emit(format!(
+                    "    MOVF 0x{rf:03X},W,{}",
+                    if ra == 0 { "A" } else { "B" }
+                ));
                 self.emit("    ADDWF 0xF6,F,A".to_string()); // TBLPTRL += idx_lo
                 self.emit("    MOVLW 0x00".to_string());
                 self.emit("    ADDWFC 0xF7,F,A".to_string());
@@ -518,7 +546,10 @@ impl<'m> Gen<'m> {
                 self.emit("    ADDWFC 0xF8,F,A".to_string());
                 if width == 2 {
                     let (ha, hf) = self.operand(lo + 1);
-                    self.emit(format!("    MOVF 0x{hf:03X},W,{}", if ha == 0 { "A" } else { "B" }));
+                    self.emit(format!(
+                        "    MOVF 0x{hf:03X},W,{}",
+                        if ha == 0 { "A" } else { "B" }
+                    ));
                     self.emit("    ADDWF 0xF7,F,A".to_string());
                     self.emit("    MOVLW 0x00".to_string());
                     self.emit("    ADDWFC 0xF8,F,A".to_string());
@@ -532,7 +563,14 @@ impl<'m> Gen<'m> {
     /// every read independent, mirroring P3's per-byte FSR0 re-setup), then
     /// `MOVFF TABLAT, dst`. Multi-byte loads call this once per byte with
     /// an increasing `byte_off`.
-    fn emit_const_load_byte(&mut self, table: &str, k: u8, terms: &[(u8, String)], byte_off: u8, dst: u16) {
+    fn emit_const_load_byte(
+        &mut self,
+        table: &str,
+        k: u8,
+        terms: &[(u8, String)],
+        byte_off: u8,
+        dst: u16,
+    ) {
         assert!(
             terms.len() <= 1,
             "isel-pic18: multi-term dynamic pointer offsets not yet supported (P4 scope; {} terms)",
@@ -579,7 +617,9 @@ impl<'m> Gen<'m> {
                 for k in 0..l.ty.bytes() {
                     match self.emit_ptr_setup(&ptr_val, k) {
                         Addr::Direct(src) => self.emit_copy_byte(src, dst + u16::from(k)),
-                        Addr::Indirect => self.emit(format!("    MOVFF 0xFEF, 0x{:03X}", dst + u16::from(k))),
+                        Addr::Indirect => {
+                            self.emit(format!("    MOVFF 0xFEF, 0x{:03X}", dst + u16::from(k)))
+                        }
                     }
                 }
             }
@@ -616,7 +656,9 @@ impl<'m> Gen<'m> {
                 // MOVFF/MOVWF that the simulator would apply to a RAM
                 // alias of the same low address.
                 if self.const_base_of(&ptr_val).is_some() {
-                    panic!("isel-pic18: ROM is not writable: store through const global {ptr_val:?}");
+                    panic!(
+                        "isel-pic18: ROM is not writable: store through const global {ptr_val:?}"
+                    );
                 }
                 // Direct case: a single emit_ptr_setup(_, 0) covers the
                 // whole value via emit_move_val_to_slot (unchanged from
@@ -741,7 +783,8 @@ impl<'m> Gen<'m> {
                             let av = self.val_addr(&swapped.a).direct();
                             for i in 0..n {
                                 self.emit_load_w(&swapped.b, i);
-                                let carry = i > 0 && matches!(swapped.op, ir::BinOp::Add | ir::BinOp::Sub);
+                                let carry =
+                                    i > 0 && matches!(swapped.op, ir::BinOp::Add | ir::BinOp::Sub);
                                 let mne = match (swapped.op, carry) {
                                     (ir::BinOp::Add, false) => "ADDWF",
                                     (ir::BinOp::Add, true) => "ADDWFC",
@@ -822,7 +865,9 @@ impl<'m> Gen<'m> {
                         (ir::BinOp::And, _) => "ANDWF",
                         (ir::BinOp::Or, _) => "IORWF",
                         (ir::BinOp::Xor, _) => "XORWF",
-                        (other, _) => panic!("isel-pic18: Bin op {other:?} not yet implemented (Task 6+)"),
+                        (other, _) => {
+                            panic!("isel-pic18: Bin op {other:?} not yet implemented (Task 6+)")
+                        }
                     };
                     let (aacc, af) = self.operand(av + u16::from(i));
                     let abank = if aacc == 0 { "A" } else { "B" };
@@ -1002,14 +1047,19 @@ impl<'m> Gen<'m> {
                     let pa = self.slot_addr(&c.func, pname).direct();
                     if let Some(size) = arg.byval {
                         let src_ptr = match &arg.val {
-                            Val::Const(_) => panic!("isel-pic18: const byval call arg not yet supported"),
+                            Val::Const(_) => {
+                                panic!("isel-pic18: const byval call arg not yet supported")
+                            }
                             other => other.clone(),
                         };
                         for b in 0..size {
                             match self.emit_ptr_setup(&src_ptr, b) {
                                 Addr::Direct(src) => self.emit_copy_byte(src, pa + u16::from(b)),
                                 Addr::Indirect => {
-                                    self.emit(format!("    MOVFF 0xFEF, 0x{:03X}", pa + u16::from(b)));
+                                    self.emit(format!(
+                                        "    MOVFF 0xFEF, 0x{:03X}",
+                                        pa + u16::from(b)
+                                    ));
                                 }
                             }
                         }
@@ -1034,10 +1084,19 @@ impl<'m> Gen<'m> {
                             Addr::Direct(addr) => {
                                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                                 let (a0, f0) = self.operand(pa);
-                                self.emit(format!("    MOVWF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
-                                self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                                self.emit(format!(
+                                    "    MOVWF 0x{f0:03X},{}",
+                                    if a0 == 0 { "A" } else { "B" }
+                                ));
+                                self.emit(format!(
+                                    "    MOVLW 0x{:02X}",
+                                    ((addr >> 8) & 0xFF) as u8
+                                ));
                                 let (a1, f1) = self.operand(pa + 1);
-                                self.emit(format!("    MOVWF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
+                                self.emit(format!(
+                                    "    MOVWF 0x{f1:03X},{}",
+                                    if a1 == 0 { "A" } else { "B" }
+                                ));
                             }
                             Addr::Indirect => {
                                 self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
@@ -1047,23 +1106,44 @@ impl<'m> Gen<'m> {
                     } else if arg.ty.is_none() {
                         // A plain `ptr` arg carries no scalar type: pass the
                         // resolved 2-byte address, the same shape `sret` uses.
-                        assert!(!arg.sret && arg.byval.is_none(), "isel-pic18: plain ptr arg must be non-sret/non-byval");
-                        assert_eq!(callee.params[i].width, 2, "isel-pic18: callee ptr param must be 2 bytes");
+                        assert!(
+                            !arg.sret && arg.byval.is_none(),
+                            "isel-pic18: plain ptr arg must be non-sret/non-byval"
+                        );
+                        assert_eq!(
+                            callee.params[i].width, 2,
+                            "isel-pic18: callee ptr param must be 2 bytes"
+                        );
                         if let Val::Const(k) = arg.val {
                             assert_eq!(k, 0, "isel-pic18: non-zero const ptr not supported");
                             let (a0, f0) = self.operand(pa);
-                            self.emit(format!("    CLRF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
+                            self.emit(format!(
+                                "    CLRF 0x{f0:03X},{}",
+                                if a0 == 0 { "A" } else { "B" }
+                            ));
                             let (a1, f1) = self.operand(pa + 1);
-                            self.emit(format!("    CLRF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
+                            self.emit(format!(
+                                "    CLRF 0x{f1:03X},{}",
+                                if a1 == 0 { "A" } else { "B" }
+                            ));
                         } else {
                             match self.emit_ptr_setup(&arg.val, 0) {
                                 Addr::Direct(addr) => {
                                     self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                                     let (a0, f0) = self.operand(pa);
-                                    self.emit(format!("    MOVWF 0x{f0:03X},{}", if a0 == 0 { "A" } else { "B" }));
-                                    self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                                    self.emit(format!(
+                                        "    MOVWF 0x{f0:03X},{}",
+                                        if a0 == 0 { "A" } else { "B" }
+                                    ));
+                                    self.emit(format!(
+                                        "    MOVLW 0x{:02X}",
+                                        ((addr >> 8) & 0xFF) as u8
+                                    ));
                                     let (a1, f1) = self.operand(pa + 1);
-                                    self.emit(format!("    MOVWF 0x{f1:03X},{}", if a1 == 0 { "A" } else { "B" }));
+                                    self.emit(format!(
+                                        "    MOVWF 0x{f1:03X},{}",
+                                        if a1 == 0 { "A" } else { "B" }
+                                    ));
                                 }
                                 Addr::Indirect => {
                                     self.emit_copy_byte(0xFE9, pa); // FSR0L -> param slot lo
@@ -1072,7 +1152,9 @@ impl<'m> Gen<'m> {
                             }
                         }
                     } else {
-                        let ty = arg.ty.expect("isel-pic18: scalar call arg must carry a type");
+                        let ty = arg
+                            .ty
+                            .expect("isel-pic18: scalar call arg must carry a type");
                         self.emit_move_val_to_slot(&arg.val, ty, pa);
                         // M15 conversion ABI: __uitofp_f32/__sitofp_f32 take a 4-byte val slot
                         // but i8/i16 sources copy only their width; stale high bytes corrupt
@@ -1097,7 +1179,10 @@ impl<'m> Gen<'m> {
                                         self.emit(format!("    MOVWF 0x{:03X},A", pa + 2));
                                         self.emit(format!("    MOVWF 0x{:03X},A", pa + 3));
                                     } else {
-                                        assert_eq!(aw, 1, "isel-pic18: unexpected narrow width for @__sitofp_f32");
+                                        assert_eq!(
+                                            aw, 1,
+                                            "isel-pic18: unexpected narrow width for @__sitofp_f32"
+                                        );
                                         self.emit("    MOVLW 0x00".to_string());
                                         self.emit(format!("    BTFSC 0x{sign:03X},7,A"));
                                         self.emit("    MOVLW 0xFF".to_string());
@@ -1106,7 +1191,9 @@ impl<'m> Gen<'m> {
                                         }
                                     }
                                 }
-                                other => panic!("isel-pic18: narrow scalar arg into wide param of @{other}"),
+                                other => panic!(
+                                    "isel-pic18: narrow scalar arg into wide param of @{other}"
+                                ),
                             }
                         }
                     }
@@ -1150,7 +1237,9 @@ impl<'m> Gen<'m> {
                         };
                         match self.emit_ptr_setup(&mc.dst, i) {
                             Addr::Direct(dst) => self.emit_copy_byte(src_addr, dst),
-                            Addr::Indirect => self.emit(format!("    MOVFF 0x{src_addr:03X}, 0xFEF")),
+                            Addr::Indirect => {
+                                self.emit(format!("    MOVFF 0x{src_addr:03X}, 0xFEF"))
+                            }
                         }
                     }
                 }
@@ -1165,7 +1254,7 @@ impl<'m> Gen<'m> {
                     self.emit(line.to_string());
                 }
                 self.emit("; --- asm end ---".to_string());
-            },
+            }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
         }
     }
@@ -1260,7 +1349,15 @@ impl<'m> Gen<'m> {
         } else {
             l_false.clone()
         };
-        self.emit_cmp_branch(&a, &b, 0, unsigned_tiebreak, &l_true, &l_false, &l_low_equal);
+        self.emit_cmp_branch(
+            &a,
+            &b,
+            0,
+            unsigned_tiebreak,
+            &l_true,
+            &l_false,
+            &l_low_equal,
+        );
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 
@@ -1342,7 +1439,15 @@ impl<'m> Gen<'m> {
         } else {
             l_false.clone()
         };
-        self.emit_cmp_branch(&a, &b, 0, unsigned_tiebreak, &l_true, &l_false, &l_low_equal);
+        self.emit_cmp_branch(
+            &a,
+            &b,
+            0,
+            unsigned_tiebreak,
+            &l_true,
+            &l_false,
+            &l_low_equal,
+        );
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 
@@ -1362,7 +1467,16 @@ impl<'m> Gen<'m> {
     /// `l_true`/`l_false`. i16's `Icmp` lowering never calls this for
     /// `eq`/`ne` (see `emit_icmp_i16_eq_ne`); i8's `emit_icmp_byte` does,
     /// with `l_equal` bound to whichever of `l_true`/`l_false` matches.
-    fn emit_cmp_branch(&mut self, a: &Val, b: &Val, byte_offset: u8, pred: &str, l_true: &str, l_false: &str, l_equal: &str) {
+    fn emit_cmp_branch(
+        &mut self,
+        a: &Val,
+        b: &Val,
+        byte_offset: u8,
+        pred: &str,
+        l_true: &str,
+        l_false: &str,
+        l_equal: &str,
+    ) {
         assert!(
             !matches!(a, Val::Const(_)),
             "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
@@ -1592,7 +1706,15 @@ impl<'m> Gen<'m> {
     /// carry", the PIC14 layout contract) with a 1-byte divisor: the
     /// divisor's implicit high byte is 0, folded with `MOVLW 0` +
     /// `SUBFWB`/`ADDWFC`. u16 and u32 use equal widths.
-    fn emit_divmod_loop(&mut self, num: u16, den: u16, rem_base: u16, cnt: u16, den_bytes: u8, rem_bytes: u8) {
+    fn emit_divmod_loop(
+        &mut self,
+        num: u16,
+        den: u16,
+        rem_base: u16,
+        cnt: u16,
+        den_bytes: u8,
+        rem_bytes: u8,
+    ) {
         let l_loop = self.fresh_label();
         let l_restore = self.fresh_label();
         let l_next = self.fresh_label();
@@ -1654,7 +1776,14 @@ impl<'m> Gen<'m> {
         let num = self.slot_addr(name, "num").direct();
         let den = self.slot_addr(name, "den").direct();
         let rem_bytes = den_bytes.max(2);
-        self.emit_divmod_loop(num, den, scr, scr + u16::from(rem_bytes), den_bytes, rem_bytes);
+        self.emit_divmod_loop(
+            num,
+            den,
+            scr,
+            scr + u16::from(rem_bytes),
+            den_bytes,
+            rem_bytes,
+        );
         if quotient {
             self.store_retval(num, den_bytes);
         } else {
@@ -1690,7 +1819,14 @@ impl<'m> Gen<'m> {
         self.emit("    MOVLW 0x01".to_string());
         self.emit(format!("    XORWF 0x{scr:03X},F,A")); // bit0 ^= den<0
         self.emit(format!("{l_go}:"));
-        self.emit_divmod_loop(num, den, scr + 1, scr + 1 + u16::from(rem_bytes), den_bytes, rem_bytes);
+        self.emit_divmod_loop(
+            num,
+            den,
+            scr + 1,
+            scr + 1 + u16::from(rem_bytes),
+            den_bytes,
+            rem_bytes,
+        );
         if quotient {
             self.emit(format!("    BTFSS 0x{scr:03X},0,A"));
             self.emit(format!("    BRA {l_store}"));
@@ -1723,7 +1859,10 @@ impl<'m> Gen<'m> {
             4 => 0x1F,
             _ => unreachable!(),
         };
-        self.emit(format!("    MOVF 0x{:03X},W,A", self.slot_addr(name, "cnt").direct()));
+        self.emit(format!(
+            "    MOVF 0x{:03X},W,A",
+            self.slot_addr(name, "cnt").direct()
+        ));
         self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
         self.emit(format!("    MOVWF 0x{scr:03X},A"));
         let l_loop = self.fresh_label();
@@ -2426,7 +2565,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLCF 0x{low1:03X},F,A"));
         self.emit(format!("    BTFSC 0x{:03X}, 7,A", pb + 2));
         self.emit(format!("    BSF 0x{low1:03X}, 0,A")); // eb8
-                                                       // A nonzero exp-zero operand aligns at exp 1 with its raw fraction.
+                                                         // A nonzero exp-zero operand aligns at exp 1 with its raw fraction.
         self.emit(format!("    MOVF 0x{low0:03X},W,A"));
         self.emit("    BTFSS 0xFD8,2,A".to_string());
         self.emit(format!("    GOTO {l_a_exp_done}"));
@@ -3312,7 +3451,7 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSC 0xFD8,2,A".to_string());
         self.emit(format!("    GOTO {l_round}"));
         self.emit(format!("    BSF 0x{spare:03X}, 1,A")); // sticky |= rem
-                                                        // RNE: guard (spare bit 0) && (sticky (spare bit 1) || mantissa LSB)
+                                                          // RNE: guard (spare bit 0) && (sticky (spare bit 1) || mantissa LSB)
         self.emit(format!("{l_round}:"));
         // Shift a subnormal result right while e < 1, preserving guard and
         // sticky for the final round-to-nearest-even decision.
@@ -4151,7 +4290,11 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // re-deriving a name inline.
         let mut labels: HashMap<String, String> = HashMap::new();
         for (i, b) in f.blocks.iter().enumerate() {
-            let lbl = if i == 0 { f.name.clone() } else { format!("{}_L{}", f.name, b.label) };
+            let lbl = if i == 0 {
+                f.name.clone()
+            } else {
+                format!("{}_L{}", f.name, b.label)
+            };
             labels.insert(b.label.clone(), lbl);
         }
         // Phi elimination: for each (predecessor, merge) EDGE  -  not just
@@ -4446,7 +4589,11 @@ mod p3_gen_tests {
 
     #[test]
     fn low_access_bank_needs_no_movlb() {
-        let m = Module { globals: Vec::new(), funcs: Vec::new(), module_asm: Vec::new() };
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
         let addrs = HashMap::new();
         let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
@@ -4457,24 +4604,42 @@ mod p3_gen_tests {
 
     #[test]
     fn banked_gpr_range_needs_movlb() {
-        let m = Module { globals: Vec::new(), funcs: Vec::new(), module_asm: Vec::new() };
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
         let addrs = HashMap::new();
         let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         assert_eq!(g.operand(0x0090), (1, 0x90));
-        assert!(g.out.iter().any(|l| l.contains("MOVLB")), "the banked range needs a MOVLB");
+        assert!(
+            g.out.iter().any(|l| l.contains("MOVLB")),
+            "the banked range needs a MOVLB"
+        );
     }
 
     #[test]
     fn sfr_high_segment_needs_no_movlb() {
-        let m = Module { globals: Vec::new(), funcs: Vec::new(), module_asm: Vec::new() };
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
         let addrs = HashMap::new();
         let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         // FSR0L, the address this task exists to fix.
-        assert_eq!(g.operand(0xFE9), (0, 0xE9), "the SFR segment is access-bank, a=0");
-        assert!(g.out.is_empty(), "no MOVLB for an SFR address, regardless of the tracked BSR");
+        assert_eq!(
+            g.operand(0xFE9),
+            (0, 0xE9),
+            "the SFR segment is access-bank, a=0"
+        );
+        assert!(
+            g.out.is_empty(),
+            "no MOVLB for an SFR address, regardless of the tracked BSR"
+        );
     }
 }

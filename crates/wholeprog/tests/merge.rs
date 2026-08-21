@@ -1,5 +1,5 @@
-use wholeprog::merge;
 use ir::parse;
+use wholeprog::merge;
 
 #[test]
 fn passes_single_module_through() {

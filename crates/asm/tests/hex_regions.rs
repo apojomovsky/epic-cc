@@ -18,8 +18,8 @@ fn two_chunks_crossing_a_64k_boundary_emit_a_second_extended_address_record() {
     let lines: Vec<&str> = hex.lines().collect();
     assert_eq!(lines[0], ":020000040000FA"); // upper=0x0000
     assert!(lines.iter().any(|l| *l == ":020000040030CA")); // upper=0x0030
-    // The config word's own data record: 2 bytes, address 0x0000 within
-    // the 0x0030 window, low byte 0xFF, high byte 0x9B.
+                                                            // The config word's own data record: 2 bytes, address 0x0000 within
+                                                            // the 0x0030 window, low byte 0xFF, high byte 0x9B.
     assert!(hex.contains(":02000000FF9B"));
     assert_eq!(lines.last().unwrap(), &":00000001FF");
 }

@@ -1,6 +1,6 @@
-use std::fs;
-use legalize::legalize;
 use ir::{parse, serialize};
+use legalize::legalize;
+use std::fs;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

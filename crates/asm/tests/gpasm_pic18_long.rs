@@ -52,7 +52,10 @@ fn to_gpasm_src(src: &str) -> String {
         }
         out.push(raw.to_string());
         let mne = line.split_whitespace().next().unwrap_or("");
-        let words = if matches!(mne.to_ascii_uppercase().as_str(), "GOTO" | "CALL" | "LFSR" | "MOVFF") {
+        let words = if matches!(
+            mne.to_ascii_uppercase().as_str(),
+            "GOTO" | "CALL" | "LFSR" | "MOVFF"
+        ) {
             2
         } else {
             1
@@ -72,10 +75,20 @@ fn pic18_long_hex_matches_gpasm() {
     let gpasm_asm = std::env::temp_dir().join("pic18_long_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p18f4550", gpasm_asm.to_str().unwrap(), "-o", "/tmp/pic18_long_gpasm.hex"])
+        .args([
+            "-p",
+            "p18f4550",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "/tmp/pic18_long_gpasm.hex",
+        ])
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string("/tmp/pic18_long_gpasm.hex").unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
 }

@@ -12,11 +12,18 @@ fn places_a_global_and_resolves_config_end_to_end() {
         ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     // The resolved-config report is on stderr, unconditional per D-4.
     let report = String::from_utf8_lossy(&out.stderr);
-    assert!(report.contains("resolved configuration for p16f877a"), "{report}");
+    assert!(
+        report.contains("resolved configuration for p16f877a"),
+        "{report}"
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/config_probe.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);

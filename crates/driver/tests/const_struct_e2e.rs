@@ -33,7 +33,11 @@ fn const_struct_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -56,10 +60,20 @@ fn const_struct_reads_run_correctly() {
     let addr = |n: &str| *layout.globals.get(n).expect(n) as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/const_struct.c", "-o", "tests/fixtures/const_struct.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/const_struct.c",
+            "-o",
+            "tests/fixtures/const_struct.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/const_struct.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -70,7 +84,11 @@ fn const_struct_reads_run_correctly() {
 
     assert_eq!(p.ram()[addr("out_a")], 0x41, "out_a = C1.a");
     assert_eq!(p.ram()[addr("out_a2")], 0x45, "out_a2 = CARR[1].a");
-    assert_eq!(p.ram()[addr("out_a3")], 0x44, "out_a3 = CARR[idx].a (idx=0)");
+    assert_eq!(
+        p.ram()[addr("out_a3")],
+        0x44,
+        "out_a3 = CARR[idx].a (idx=0)"
+    );
     let b = |p: &pic14_sim::Pic14, n: &str| {
         let a = addr(n);
         u16::from(p.ram()[a]) | (u16::from(p.ram()[a + 1]) << 8)
@@ -88,8 +106,20 @@ fn const_struct_reads_run_correctly() {
     p.ram_mut()[addr("idx")] = 1;
     p.run(200_000);
     assert!(p.halted());
-    assert_eq!(p.ram()[addr("out_a3")], 0x45, "out_a3 = CARR[idx].a (idx=1)");
+    assert_eq!(
+        p.ram()[addr("out_a3")],
+        0x45,
+        "out_a3 = CARR[idx].a (idx=1)"
+    );
     assert_eq!(b(&p, "out_b3"), 0x2222, "out_b3 = CARR[idx].b (idx=1)");
-    assert_eq!(p.ram()[addr("out_m0")], 0x00, "out_m0 = ((u8*)&C1)[1] (padding byte)");
-    assert_eq!(p.ram()[addr("out_m1")], 0x12, "out_m1 = ((u8*)&C1)[3] (C1.b high byte)");
+    assert_eq!(
+        p.ram()[addr("out_m0")],
+        0x00,
+        "out_m0 = ((u8*)&C1)[1] (padding byte)"
+    );
+    assert_eq!(
+        p.ram()[addr("out_m1")],
+        0x12,
+        "out_m1 = ((u8*)&C1)[3] (C1.b high byte)"
+    );
 }

@@ -108,7 +108,12 @@ fn to_gpasm_src(src: &str) -> String {
                     .get(label)
                     .unwrap_or_else(|| panic!("PAGE({label}) label not found"));
                 let lit = (addr >> 11) << 3;
-                rendered = format!("{}{}0x{lit:02X}{}", &rendered[..start], " ", &rendered[start + 5 + end + 1..]);
+                rendered = format!(
+                    "{}{}0x{lit:02X}{}",
+                    &rendered[..start],
+                    " ",
+                    &rendered[start + 5 + end + 1..]
+                );
             }
             out.push(rendered);
             org += 1;
@@ -130,11 +135,21 @@ fn float_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("float_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "float_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "float_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/float_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator: in = 3.0f -> out1 = 0x3F99999A (fdiv
@@ -152,18 +167,28 @@ fn float_hex_matches_gpasm_and_runs() {
     for i in 0..4 {
         got[i] = p.ram()[0x24 + i];
     }
-    assert_eq!(got, (3.0f32 / 2.5f32).to_bits().to_le_bytes(), "out1 == 1.2 = 0x3F99999A");
+    assert_eq!(
+        got,
+        (3.0f32 / 2.5f32).to_bits().to_le_bytes(),
+        "out1 == 1.2 = 0x3F99999A"
+    );
     for i in 0..4 {
         got[i] = p.ram()[0x28 + i];
     }
     assert_eq!(
         got,
-        (((3.0f32 + 0.25f32) * 3.0f32) as i16 as f32).to_bits().to_le_bytes(),
+        (((3.0f32 + 0.25f32) * 3.0f32) as i16 as f32)
+            .to_bits()
+            .to_le_bytes(),
         "out2 == 9.0 = 0x41100000"
     );
     for i in 0..4 {
         got[i] = p.ram()[0x2C + i];
     }
-    assert_eq!(got, (1.0f32 / 3.0f32).to_bits().to_le_bytes(), "out3 == 1.0/3.0 = 0x3EAAAAAB (RNE)");
+    assert_eq!(
+        got,
+        (1.0f32 / 3.0f32).to_bits().to_le_bytes(),
+        "out3 == 1.0/3.0 = 0x3EAAAAAB (RNE)"
+    );
     assert!(p.halted());
 }

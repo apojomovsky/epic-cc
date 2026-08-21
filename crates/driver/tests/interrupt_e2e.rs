@@ -59,7 +59,11 @@ fn interrupt_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -84,10 +88,20 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/interrupt.c", "-o", "tests/fixtures/interrupt.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/interrupt.c",
+            "-o",
+            "tests/fixtures/interrupt.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/interrupt.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -100,11 +114,19 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
     while p.pc() != INJECT_PC {
         p.step();
         steps += 1;
-        assert!(steps < 200, "never reached the injection point (pc = {})", p.pc());
+        assert!(
+            steps < 200,
+            "never reached the injection point (pc = {})",
+            p.pc()
+        );
     }
     // The pre-ISR state the hand computation starts from.
     assert_eq!(p.ram()[out_addr], 0x10, "out == in before the ISR");
-    assert_eq!(p.ram()[0x06], 0x11, "PORTB == 0x11 (main's SFR write) before the ISR");
+    assert_eq!(
+        p.ram()[0x06],
+        0x11,
+        "PORTB == 0x11 (main's SFR write) before the ISR"
+    );
 
     // Fire the interrupt: push pc+1 (76), jump to the vector at word 4.
     p.fire_interrupt();
@@ -114,7 +136,15 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
     // word 76, and main completes: out == 0x16, PORTB == 0x22, then the
     // __start SLEEP halts the machine.
     p.run(500_000);
-    assert_eq!(p.ram()[out_addr], 0x16, "out == hand-computed 0x16 (ISR bump 0x10 -> 0x11, then 0x11 -> 0x12 -> 0x13 -> 0x16)");
-    assert_eq!(p.ram()[0x06], 0x22, "PORTB == 0x22 (main's final SFR write)");
+    assert_eq!(
+        p.ram()[out_addr],
+        0x16,
+        "out == hand-computed 0x16 (ISR bump 0x10 -> 0x11, then 0x11 -> 0x12 -> 0x13 -> 0x16)"
+    );
+    assert_eq!(
+        p.ram()[0x06],
+        0x22,
+        "PORTB == 0x22 (main's final SFR write)"
+    );
     assert!(p.halted());
 }

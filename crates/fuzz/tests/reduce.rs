@@ -16,8 +16,8 @@ use std::path::PathBuf;
 
 use device;
 use fuzz::{
-    generate, reduce, run_differential, write_fixture, FailureKind, Input, Program,
-    REDUCTION_CAP, TYPEDEF_PROLOGUE,
+    generate, reduce, run_differential, write_fixture, FailureKind, Input, Program, REDUCTION_CAP,
+    TYPEDEF_PROLOGUE,
 };
 
 /// Removes a fixture file on drop. Synthetic fixtures must not survive the
@@ -84,10 +84,17 @@ fn reducer_removes_benign_statements_and_keeps_the_culprit() {
         Err(f) => f,
         Ok(v) => panic!("the synthetic program must fail the differential, got Ok({v})"),
     };
-    assert_eq!(failure.kind, FailureKind::Mismatch, "the synthetic failure must be a mismatch");
+    assert_eq!(
+        failure.kind,
+        FailureKind::Mismatch,
+        "the synthetic failure must be a mismatch"
+    );
 
     let reduced = reduce(&prog, &failure).expect("reduce the synthetic mismatch");
-    assert!(reduced.re_runs <= REDUCTION_CAP, "the reduction must respect the cap");
+    assert!(
+        reduced.re_runs <= REDUCTION_CAP,
+        "the reduction must respect the cap"
+    );
 
     // The reduced program still fails the differential, with the SAME kind.
     match run_differential(&reduced.program, &device::PIC16F877A) {
@@ -147,7 +154,10 @@ fn reducer_removes_benign_statements_and_keeps_the_culprit() {
         path.display()
     );
     let saved = std::fs::read_to_string(&path).expect("read the saved fixture back");
-    assert_eq!(saved, reduced.program.c_source, "the fixture is the reduced program");
+    assert_eq!(
+        saved, reduced.program.c_source,
+        "the fixture is the reduced program"
+    );
     drop(_guard);
     assert!(
         !path.exists(),
@@ -206,8 +216,7 @@ fn reduce_captures_the_fresh_failure_message() {
 
     let reduced = reduce(&prog, &stale).expect("reduce the synthetic mismatch");
     assert_eq!(
-        reduced.failure,
-        fresh,
+        reduced.failure, fresh,
         "the reduced failure must be the FRESH verification failure, not the caller's stale one"
     );
 }
@@ -233,7 +242,10 @@ fn reducer_minimizes_a_generated_program_with_a_planted_bug() {
     assert_eq!(failure.kind, FailureKind::Mismatch);
 
     let reduced = reduce(&prog, &failure).expect("reduce the planted generated program");
-    assert!(reduced.re_runs <= REDUCTION_CAP, "the reduction must respect the cap");
+    assert!(
+        reduced.re_runs <= REDUCTION_CAP,
+        "the reduction must respect the cap"
+    );
     match run_differential(&reduced.program, &device::PIC16F877A) {
         Err(f) => assert_eq!(f.kind, FailureKind::Mismatch, "failure preserved: {f}"),
         Ok(v) => panic!("the reduced program must still fail, got Ok({v})"),
@@ -326,7 +338,10 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
     );
 
     let reduced = reduce(&prog, &failure).expect("reduce the panic");
-    assert!(reduced.re_runs <= REDUCTION_CAP, "the reduction must respect the cap");
+    assert!(
+        reduced.re_runs <= REDUCTION_CAP,
+        "the reduction must respect the cap"
+    );
     match run_differential(&reduced.program, &device::PIC16F877A) {
         Err(f) => assert_eq!(
             f.kind,
@@ -353,7 +368,10 @@ fn differential_reports_unsupported_construct_panic_and_reducer_minimizes() {
     let path = write_fixture(&reduced.program).expect("save the reduced fixture");
     let _guard = FixtureGuard(path.clone());
     let saved = std::fs::read_to_string(&path).expect("read the saved fixture back");
-    assert_eq!(saved, reduced.program.c_source, "the fixture is the reduced program");
+    assert_eq!(
+        saved, reduced.program.c_source,
+        "the fixture is the reduced program"
+    );
     drop(_guard);
     assert!(
         !path.exists(),

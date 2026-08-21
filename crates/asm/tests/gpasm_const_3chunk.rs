@@ -106,7 +106,12 @@ fn to_gpasm_src(src: &str) -> String {
                     .get(label)
                     .unwrap_or_else(|| panic!("PAGE({label}) label not found"));
                 let lit = (addr >> 11) << 3;
-                rendered = format!("{}{}0x{lit:02X}{}", &rendered[..start], " ", &rendered[start + 5 + end + 1..]);
+                rendered = format!(
+                    "{}{}0x{lit:02X}{}",
+                    &rendered[..start],
+                    " ",
+                    &rendered[start + 5 + end + 1..]
+                );
             }
             out.push(rendered);
             org += 1;
@@ -128,11 +133,21 @@ fn const_3chunk_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("const_3chunk_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "const_3chunk_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "const_3chunk_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/const_3chunk_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
 
@@ -145,8 +160,20 @@ fn const_3chunk_hex_matches_gpasm_and_runs() {
     p.ram_mut()[0x21] = 0x01; // in high byte = 290 >> 8
     p.run(5_000_000);
     assert_eq!(p.ram()[0x22], 0x34, "out8 == 0x34");
-    assert_eq!(u16::from_le_bytes([p.ram()[0x24], p.ram()[0x25]]), 0x1022, "o16_0");
-    assert_eq!(u16::from_le_bytes([p.ram()[0x26], p.ram()[0x27]]), 0x1080, "o16_1");
-    assert_eq!(u16::from_le_bytes([p.ram()[0x28], p.ram()[0x29]]), 0x1100, "o16_2");
+    assert_eq!(
+        u16::from_le_bytes([p.ram()[0x24], p.ram()[0x25]]),
+        0x1022,
+        "o16_0"
+    );
+    assert_eq!(
+        u16::from_le_bytes([p.ram()[0x26], p.ram()[0x27]]),
+        0x1080,
+        "o16_1"
+    );
+    assert_eq!(
+        u16::from_le_bytes([p.ram()[0x28], p.ram()[0x29]]),
+        0x1100,
+        "o16_2"
+    );
     assert!(p.halted());
 }

@@ -44,7 +44,11 @@ fn multi_tu_layout() -> alloc::AllocLayout {
             ])
             .output()
             .expect("run clang");
-        assert!(out.status.success(), "clang: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "clang: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         units.push(ll_path);
     }
 
@@ -56,7 +60,11 @@ fn multi_tu_layout() -> alloc::AllocLayout {
     }
     cmd.args(["-o", merged_path.to_str().unwrap()]);
     let out = cmd.output().expect("run llvm-link");
-    assert!(out.status.success(), "llvm-link: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "llvm-link: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let ll_text =
         irparse::sanitize_symbols(&std::fs::read_to_string(&merged_path).expect("read merged .ll"));
@@ -84,7 +92,11 @@ fn compiles_three_translation_units_end_to_end() {
         ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/multi_tu.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -108,7 +120,8 @@ fn the_merge_actually_renamed_colliding_symbols() {
     let llvm_link = driver::clang_discovery::resolve_llvm_link(std::path::Path::new(&clang))
         .expect("resolve_llvm_link");
 
-    let tmp = std::env::temp_dir().join(format!("epiccc-multi-tu-collision-{}", std::process::id()));
+    let tmp =
+        std::env::temp_dir().join(format!("epiccc-multi-tu-collision-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
 
     let mut units = Vec::new();
@@ -116,9 +129,18 @@ fn the_merge_actually_renamed_colliding_symbols() {
         let ll_path = tmp.join(format!("{n:03}.ll"));
         let out = Command::new(&clang)
             .args([
-                "-target", "msp430", "-O1", "-S", "-emit-llvm",
-                "-ffreestanding", "-nostdinc", "-resource-dir", &resdir,
-                "-o", ll_path.to_str().unwrap(), input,
+                "-target",
+                "msp430",
+                "-O1",
+                "-S",
+                "-emit-llvm",
+                "-ffreestanding",
+                "-nostdinc",
+                "-resource-dir",
+                &resdir,
+                "-o",
+                ll_path.to_str().unwrap(),
+                input,
             ])
             .output()
             .expect("run clang");
@@ -144,7 +166,10 @@ fn the_merge_actually_renamed_colliding_symbols() {
         "expected llvm-link to keep two distinct @bump/@scratch symbols (one renamed), \
          found {bump_count} bump line(s) and {scratch_count} scratch line(s) in:\n{merged}"
     );
-    let dotted_renames = merged.lines().filter(|l| l.contains('@') && l.contains('.')).count();
+    let dotted_renames = merged
+        .lines()
+        .filter(|l| l.contains('@') && l.contains('.'))
+        .count();
     assert!(
         dotted_renames > 0,
         "expected at least one dotted llvm-link rename (e.g. @bump.3) before sanitizing"

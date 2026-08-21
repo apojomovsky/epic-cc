@@ -267,7 +267,7 @@ impl Pic14 {
 
     fn exec_byte(&mut self, pc: u16, word: u16) -> u16 {
         match word {
-            0x0000 => return pc + 1, // NOP
+            0x0000 => return pc + 1,            // NOP
             0x0008 => return self.pop_return(), // RETURN
             0x0009 => {
                 self.ram[INTCON] |= GIE; // RETFIE re-enables interrupts
@@ -510,7 +510,15 @@ pub struct Pic18 {
 
 impl Pic18 {
     pub fn new(prog: Vec<u16>) -> Self {
-        Pic18 { prog, ram: [0; 4096], w: 0, pc: 0, stack: Vec::new(), halted: false, pending: false }
+        Pic18 {
+            prog,
+            ram: [0; 4096],
+            w: 0,
+            pc: 0,
+            stack: Vec::new(),
+            halted: false,
+            pending: false,
+        }
     }
     pub fn ram(&self) -> &[u8; 4096] {
         &self.ram
@@ -1017,7 +1025,10 @@ impl Pic18 {
     }
 
     fn push_return(&mut self, addr: u32) {
-        assert!(self.stack.len() < 31, "sim(pic18): call stack overflow (depth 31)");
+        assert!(
+            self.stack.len() < 31,
+            "sim(pic18): call stack overflow (depth 31)"
+        );
         self.stack.push(addr);
         self.sync_stack_sfrs();
     }
@@ -1051,7 +1062,11 @@ impl Pic18 {
 
     fn exec_bra_rcall(&mut self, pc: u32, word: u16) -> u32 {
         let raw = word & 0x7FF;
-        let n = if raw & 0x400 != 0 { (raw as i32) - 0x800 } else { raw as i32 }; // sign-extend 11 bits
+        let n = if raw & 0x400 != 0 {
+            (raw as i32) - 0x800
+        } else {
+            raw as i32
+        }; // sign-extend 11 bits
         let is_call = word & 0x0800 != 0;
         let next_word = (pc / 2) as i32 + 1 + n;
         if is_call {
@@ -1355,7 +1370,7 @@ mod pic18_interrupt {
         prog[0] = 0x0000; // NOP at byte 0
         prog[1] = 0x0000; // NOP at byte 2
         prog[2] = 0x0000; // NOP at byte 4
-        // ISR at byte 8 (word 4): MOVWF 0x020,A then RETFIE
+                          // ISR at byte 8 (word 4): MOVWF 0x020,A then RETFIE
         prog[4] = 0x6E20; // MOVWF 0x20,A
         prog[5] = 0x0010; // RETFIE
         Pic18::new(prog)
@@ -1434,7 +1449,11 @@ mod pic18_tblrd {
         pic.ram_mut()[0xFF6] = 0x05; // odd byte: high half of word 2
         pic.prog[0] = 0x0009; // TBLRD*+
         pic.run(10);
-        assert_eq!(pic.ram()[0xFF5], 0x55, "odd TBLPTR reads the word's high byte");
+        assert_eq!(
+            pic.ram()[0xFF5],
+            0x55,
+            "odd TBLPTR reads the word's high byte"
+        );
     }
 
     #[test]
@@ -1452,7 +1471,11 @@ mod pic18_tblrd {
         let mut pic = pic_with_table_at_byte4();
         pic.prog[0] = 0x000B; // TBLRD+*
         pic.run(10);
-        assert_eq!(pic.ram()[0xFF5], 0x55, "TBLRD+* reads the byte at 5 (pre-incremented)");
+        assert_eq!(
+            pic.ram()[0xFF5],
+            0x55,
+            "TBLRD+* reads the byte at 5 (pre-incremented)"
+        );
         assert_eq!(pic.ram()[0xFF6], 0x05, "TBLRD+* leaves TBLPTR at 5");
     }
 }

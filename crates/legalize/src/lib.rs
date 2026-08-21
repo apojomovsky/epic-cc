@@ -43,7 +43,10 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ir::{Alloca, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Icmp, Inst, Module, Param, Ty, Val};
+use ir::{
+    Alloca, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Icmp, Inst, Module, Param, Ty,
+    Val,
+};
 
 pub fn legalize(m: Module) -> Module {
     // Interrupt duplication happens in two layers. User functions split
@@ -63,10 +66,12 @@ pub fn legalize(m: Module) -> Module {
             let mut insts = Vec::with_capacity(b.insts.len());
             for inst in b.insts {
                 match inst {
-                    Inst::Bin(bin) => match fold_const_bin(&bin).or_else(|| lower_bin(&bin, &mut used)) {
-                        Some(folded_or_call) => insts.push(folded_or_call),
-                        None => insts.push(Inst::Bin(bin)),
-                    },
+                    Inst::Bin(bin) => {
+                        match fold_const_bin(&bin).or_else(|| lower_bin(&bin, &mut used)) {
+                            Some(folded_or_call) => insts.push(folded_or_call),
+                            None => insts.push(Inst::Bin(bin)),
+                        }
+                    }
                     Inst::Icmp(icmp) => match fold_const_icmp(&icmp) {
                         Some(frozen) => insts.push(frozen),
                         None => insts.push(Inst::Icmp(icmp)),
@@ -77,9 +82,19 @@ pub fn legalize(m: Module) -> Module {
                     other => insts.push(other),
                 }
             }
-            blocks.push(Block { label: b.label, insts });
+            blocks.push(Block {
+                label: b.label,
+                insts,
+            });
         }
-        funcs.push(Func { name: f.name, ret: f.ret, params: f.params, blocks, isr: f.isr, naked: f.naked });
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks,
+            isr: f.isr,
+            naked: f.naked,
+        });
     }
     // Runtime-routine duplication for the interrupt context. The user-level
     // duplication ran before the loop above, but the routine CALLs are
@@ -99,7 +114,11 @@ pub fn legalize(m: Module) -> Module {
         f.name = name.clone();
         funcs.push(f);
     }
-    Module { globals: m.globals, funcs, module_asm: m.module_asm }
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
 }
 
 /// Split the runtime routines that BOTH the main and interrupt contexts
@@ -128,8 +147,11 @@ fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
             }
         }
     }
-    let isr_roots: Vec<&str> =
-        funcs.iter().filter(|f| f.isr).map(|f| f.name.as_str()).collect();
+    let isr_roots: Vec<&str> = funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
     let isr_ctx = reachable(&isr_roots, &adj);
     let main_ctx = reachable(&["main"], &adj);
     let shared: HashSet<&str> = used
@@ -247,8 +269,18 @@ fn lower_fbin(b: &ir::FloatBin, used: &mut Vec<String>) -> Inst {
         ty: Some(Ty::F32),
         func: func.to_string(),
         args: vec![
-            CallArg { ty: Some(Ty::F32), val: b.a.clone(), byval: None, sret: false },
-            CallArg { ty: Some(Ty::F32), val: b.b.clone(), byval: None, sret: false },
+            CallArg {
+                ty: Some(Ty::F32),
+                val: b.a.clone(),
+                byval: None,
+                sret: false,
+            },
+            CallArg {
+                ty: Some(Ty::F32),
+                val: b.b.clone(),
+                byval: None,
+                sret: false,
+            },
         ],
     })
 }
@@ -268,8 +300,18 @@ fn lower_fcmp(c: &ir::Fcmp, used: &mut Vec<String>, names: &mut FreshNames) -> V
         func: func.to_string(),
 
         args: vec![
-            CallArg { ty: Some(Ty::F32), val: c.a.clone(), byval: None, sret: false },
-            CallArg { ty: Some(Ty::F32), val: c.b.clone(), byval: None, sret: false },
+            CallArg {
+                ty: Some(Ty::F32),
+                val: c.a.clone(),
+                byval: None,
+                sret: false,
+            },
+            CallArg {
+                ty: Some(Ty::F32),
+                val: c.b.clone(),
+                byval: None,
+                sret: false,
+            },
         ],
     })];
     insts.extend(fcmp_tree(&c.pred, &call_dst, &c.dst, names));
@@ -343,7 +385,9 @@ fn fcmp_tree(pred: &str, c: &str, dst: &str, names: &mut FreshNames) -> Vec<Inst
         "ule" => out.push(fcmp_icmp("ne", c, 2, dst)),
         "une" => out.push(fcmp_icmp("ne", c, 0, dst)),
         "uno" => out.push(fcmp_icmp("eq", c, 3, dst)),
-        "true" | "false" => panic!("legalize: fcmp {pred} is a compile-time constant (clang never emits it)"),
+        "true" | "false" => {
+            panic!("legalize: fcmp {pred} is a compile-time constant (clang never emits it)")
+        }
         other => panic!("legalize: unknown fcmp predicate {other:?}"),
     }
     out
@@ -437,7 +481,12 @@ fn reachable(roots: &[&str], adj: &HashMap<String, Vec<String>>) -> HashSet<Stri
 /// than depending on the callgraph crate — it is a tiny, stable scan and
 /// legalize already owns the module (no new dependency).
 fn duplicate_isr_shared(m: Module) -> Module {
-    let isr_names: HashSet<&str> = m.funcs.iter().filter(|f| f.isr).map(|f| f.name.as_str()).collect();
+    let isr_names: HashSet<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
     if isr_names.is_empty() {
         return m;
     }
@@ -458,7 +507,10 @@ fn duplicate_isr_shared(m: Module) -> Module {
     // The ISR context = the ISR + its transitive callees; the main context =
     // main + its transitive callees. Every function in BOTH (never the ISR
     // itself, never main) is duplicated.
-    let isr_ctx = isr_names.iter().flat_map(|r| reachable(&[r], &adj)).collect::<HashSet<String>>();
+    let isr_ctx = isr_names
+        .iter()
+        .flat_map(|r| reachable(&[r], &adj))
+        .collect::<HashSet<String>>();
     let main_ctx = reachable(&["main"], &adj);
     // main is excluded from the duplication above, so an ISR that
     // (transitively) calls main would leave the ISR's call on the original
@@ -533,7 +585,11 @@ fn duplicate_isr_shared(m: Module) -> Module {
             }
         }
     }
-    Module { globals: m.globals, funcs, module_asm: m.module_asm }
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
 }
 
 /// The runtime routine for a scalar binop, or `None` if legalize leaves the
@@ -591,23 +647,41 @@ fn fold_const_bin(b: &ir::Bin) -> Option<Inst> {
     // value). Ty::bytes() maps I1 to 1 byte like I8, so folding it here
     // would manufacture an out-of-range "i1" constant instead of hitting
     // that guard — leave it unfolded so isel's existing check still fires.
-    if b.ty == Ty::I1 { return None }
-    let (Val::Const(a), Val::Const(k)) = (&b.a, &b.b) else { return None };
+    if b.ty == Ty::I1 {
+        return None;
+    }
+    let (Val::Const(a), Val::Const(k)) = (&b.a, &b.b) else {
+        return None;
+    };
     let width = u32::from(b.ty.bytes()) * 8;
     let result = eval_binop(b.op, width, *a, *k)?;
-    Some(Inst::Freeze(ir::Freeze { dst: b.dst.clone(), ty: b.ty, val: Val::Const(result) }))
+    Some(Inst::Freeze(ir::Freeze {
+        dst: b.dst.clone(),
+        ty: b.ty,
+        val: Val::Const(result),
+    }))
 }
 
 /// Same fold for `Icmp`; the result is always `i1`.
 fn fold_const_icmp(c: &Icmp) -> Option<Inst> {
-    let (Val::Const(a), Val::Const(k)) = (&c.a, &c.b) else { return None };
+    let (Val::Const(a), Val::Const(k)) = (&c.a, &c.b) else {
+        return None;
+    };
     let width = u32::from(c.ty.bytes()) * 8;
     let result = eval_icmp(&c.pred, width, *a, *k);
-    Some(Inst::Freeze(ir::Freeze { dst: c.dst.clone(), ty: Ty::I1, val: Val::Const(i64::from(result)) }))
+    Some(Inst::Freeze(ir::Freeze {
+        dst: c.dst.clone(),
+        ty: Ty::I1,
+        val: Val::Const(i64::from(result)),
+    }))
 }
 
 fn const_mask(width: u32) -> u64 {
-    if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }
+    if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    }
 }
 
 /// Interpret the low `width` bits of `v` as a two's-complement signed value.
@@ -646,25 +720,35 @@ fn eval_binop(op: BinOp, width: u32, a: i64, b: i64) -> Option<i64> {
         BinOp::Xor => canon_unsigned(au ^ bu, width),
         BinOp::Mul => canon_unsigned(au.wrapping_mul(bu), width),
         BinOp::UDiv => {
-            if bu == 0 { return None };
+            if bu == 0 {
+                return None;
+            };
             canon_unsigned(au / bu, width)
         }
         BinOp::URem => {
-            if bu == 0 { return None };
+            if bu == 0 {
+                return None;
+            };
             canon_unsigned(au % bu, width)
         }
         BinOp::SDiv => {
-            if bu == 0 { return None };
+            if bu == 0 {
+                return None;
+            };
             let q = sign_extend(au, width).wrapping_div(sign_extend(bu, width));
             canon_signed(q as u64, width)
         }
         BinOp::SRem => {
-            if bu == 0 { return None };
+            if bu == 0 {
+                return None;
+            };
             let r = sign_extend(au, width).wrapping_rem(sign_extend(bu, width));
             canon_signed(r as u64, width)
         }
         BinOp::Shl | BinOp::LShr | BinOp::AShr => {
-            if !(0..i64::from(width)).contains(&b) { return None };
+            if !(0..i64::from(width)).contains(&b) {
+                return None;
+            };
             let shift = b as u32;
             match op {
                 BinOp::Shl => canon_unsigned(au.wrapping_shl(shift), width),
@@ -712,14 +796,30 @@ fn lower_bin(b: &ir::Bin, used: &mut Vec<String>) -> Option<Inst> {
         ty: Some(b.ty),
         func: func.to_string(),
         args: vec![
-            CallArg { ty: Some(b.ty), val: b.a.clone(), byval: None, sret: false },
-            CallArg { ty: Some(b.ty), val: b.b.clone(), byval: None, sret: false },
+            CallArg {
+                ty: Some(b.ty),
+                val: b.a.clone(),
+                byval: None,
+                sret: false,
+            },
+            CallArg {
+                ty: Some(b.ty),
+                val: b.b.clone(),
+                byval: None,
+                sret: false,
+            },
         ],
     }))
 }
 
 fn param(name: &str, width: u8) -> Param {
-    Param { name: name.into(), width, byval: None, sret: false, ptr: false }
+    Param {
+        name: name.into(),
+        width,
+        byval: None,
+        sret: false,
+        ptr: false,
+    }
 }
 
 /// The injected runtime routine definitions. Each is an ordinary function
@@ -780,9 +880,15 @@ fn routine_func(name: &str) -> Func {
         "__sdiv_i8" | "__srem_i8" => (Ty::I8, vec![param("num", 1), param("den", 1)], 5),
         "__sdiv_i16" | "__srem_i16" => (Ty::I16, vec![param("num", 2), param("den", 2)], 7),
         "__sdiv_i32" | "__srem_i32" => (Ty::I32, vec![param("num", 4), param("den", 4)], 12),
-        "__shl_u8" | "__lshr_u8" | "__ashr_i8" => (Ty::I8, vec![param("val", 1), param("cnt", 1)], 3),
-        "__shl_u16" | "__lshr_u16" | "__ashr_i16" => (Ty::I16, vec![param("val", 2), param("cnt", 2)], 4),
-        "__shl_u32" | "__lshr_u32" | "__ashr_i32" => (Ty::I32, vec![param("val", 4), param("cnt", 4)], 2),
+        "__shl_u8" | "__lshr_u8" | "__ashr_i8" => {
+            (Ty::I8, vec![param("val", 1), param("cnt", 1)], 3)
+        }
+        "__shl_u16" | "__lshr_u16" | "__ashr_i16" => {
+            (Ty::I16, vec![param("val", 2), param("cnt", 2)], 4)
+        }
+        "__shl_u32" | "__lshr_u32" | "__ashr_i32" => {
+            (Ty::I32, vec![param("val", 4), param("cnt", 4)], 2)
+        }
         // Milestone 15: the soft-float routines (f32 slots are 4 bytes).
         "__add_f32" | "__sub_f32" | "__mul_f32" => {
             (Ty::F32, vec![param("a", 4), param("b", 4)], 14)
@@ -799,7 +905,10 @@ fn routine_func(name: &str) -> Func {
         params,
         blocks: vec![Block {
             label: "entry".into(),
-            insts: vec![Inst::Alloca(Alloca { dst: "__scr".into(), size: scr })],
+            insts: vec![Inst::Alloca(Alloca {
+                dst: "__scr".into(),
+                size: scr,
+            })],
         }],
         isr: false, // runtime routines are never interrupt handlers
         naked: false,

@@ -1,6 +1,6 @@
-use std::fs;
 use callgraph::{build, check_depth, edges_text};
 use ir::parse;
+use std::fs;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

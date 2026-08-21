@@ -45,7 +45,11 @@ fn three_chunk_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -81,10 +85,20 @@ fn three_chunk_const_tables_run_correctly() {
     let o16_2 = a("o16_2");
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/const_3chunk.c", "-o", "tests/fixtures/const_3chunk.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/const_3chunk.c",
+            "-o",
+            "tests/fixtures/const_3chunk.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/const_3chunk.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -93,9 +107,25 @@ fn three_chunk_const_tables_run_correctly() {
     p.ram_mut()[in_addr + 1] = 0x01;
     p.run(5_000_000);
 
-    assert_eq!(p.ram()[out8], 0x34, "out8 == 0x34 for in == 290 (chunk-0, chunk-1-first, chunk-2 reads)");
-    assert_eq!(read_le4(p.ram(), o16_0) & 0xFFFF, 0x1022, "o16_0 == 0x1022 (i16 chunk 0)");
-    assert_eq!(read_le4(p.ram(), o16_1) & 0xFFFF, 0x1080, "o16_1 == 0x1080 (i16 chunk 1, scale-2 carry)");
-    assert_eq!(read_le4(p.ram(), o16_2) & 0xFFFF, 0x1100, "o16_2 == 0x1100 (i16 chunk 2, scale-2 hi-byte carry)");
+    assert_eq!(
+        p.ram()[out8],
+        0x34,
+        "out8 == 0x34 for in == 290 (chunk-0, chunk-1-first, chunk-2 reads)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), o16_0) & 0xFFFF,
+        0x1022,
+        "o16_0 == 0x1022 (i16 chunk 0)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), o16_1) & 0xFFFF,
+        0x1080,
+        "o16_1 == 0x1080 (i16 chunk 1, scale-2 carry)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), o16_2) & 0xFFFF,
+        0x1100,
+        "o16_2 == 0x1100 (i16 chunk 2, scale-2 hi-byte carry)"
+    );
     assert!(p.halted());
 }

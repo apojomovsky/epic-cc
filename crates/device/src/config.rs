@@ -16,9 +16,9 @@ pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for pair in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (key, val) = pair
-            .split_once('=')
-            .unwrap_or_else(|| panic!("device: malformed EPIC_CONFIG entry {pair:?} (expected key=value)"));
+        let (key, val) = pair.split_once('=').unwrap_or_else(|| {
+            panic!("device: malformed EPIC_CONFIG entry {pair:?} (expected key=value)")
+        });
         let (key, val) = (key.trim(), val.trim());
 
         let field = region

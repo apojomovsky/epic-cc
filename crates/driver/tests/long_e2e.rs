@@ -85,7 +85,11 @@ fn long_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -110,10 +114,20 @@ fn long_runs_correctly() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/long.c", "-o", "tests/fixtures/long.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/long.c",
+            "-o",
+            "tests/fixtures/long.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/long.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -133,6 +147,9 @@ fn long_runs_correctly() {
         | ((p.ram()[out_addr + 1] as u32) << 8)
         | ((p.ram()[out_addr + 2] as u32) << 16)
         | ((p.ram()[out_addr + 3] as u32) << 24);
-    assert_eq!(got, 0x1634943A, "out == hand-computed 0x1634943A for in == 0x12345678, sin == -19");
+    assert_eq!(
+        got, 0x1634943A,
+        "out == hand-computed 0x1634943A for in == 0x12345678, sin == -19"
+    );
     assert!(p.halted());
 }

@@ -57,11 +57,11 @@ fn decfsz_skips_the_next_instruction_when_it_reaches_zero() {
     let mut p = Pic18::new(words);
     p.run(10);
     assert_eq!(p.ram()[0x20], 0); // decremented to 0
-    // The skip lands on the trailing NOP at word 5 = byte 10 (correctly
-    // skipping the whole 2-word GOTO, not landing mid-GOTO on its second
-    // word); `run` then executes that NOP too, ending at byte 12. Reaching
-    // 12 cleanly (no decode panic on a stray 0xF000 continuation word, no
-    // jump to `fail`'s bogus target) is the proof the skip worked.
+                                  // The skip lands on the trailing NOP at word 5 = byte 10 (correctly
+                                  // skipping the whole 2-word GOTO, not landing mid-GOTO on its second
+                                  // word); `run` then executes that NOP too, ending at byte 12. Reaching
+                                  // 12 cleanly (no decode panic on a stray 0xF000 continuation word, no
+                                  // jump to `fail`'s bogus target) is the proof the skip worked.
     assert_eq!(p.pc(), 12);
 }
 
@@ -184,7 +184,11 @@ fn rlcf_rotates_left_through_carry() {
     let mut p = Pic18::new(words);
     p.run(10);
     assert_eq!(p.ram()[0x20], 0);
-    assert_eq!(p.ram()[0xFD8] & 0x01, 0x01, "C set from the rotated-out bit7");
+    assert_eq!(
+        p.ram()[0xFD8] & 0x01,
+        0x01,
+        "C set from the rotated-out bit7"
+    );
 }
 
 #[test]
@@ -201,7 +205,11 @@ fn rrcf_rotates_right_through_carry() {
     let mut p = Pic18::new(words);
     p.run(10);
     assert_eq!(p.ram()[0x20], 0);
-    assert_eq!(p.ram()[0xFD8] & 0x01, 0x01, "C set from the rotated-out bit0");
+    assert_eq!(
+        p.ram()[0xFD8] & 0x01,
+        0x01,
+        "C set from the rotated-out bit0"
+    );
 }
 
 #[test]
@@ -328,7 +336,11 @@ fn addlw_adds_to_w_with_flags() {
     let mut p = Pic18::new(words);
     p.run(2);
     assert_eq!(p.w(), 0x80);
-    assert_eq!(p.ram()[0xFD8] & 0x08, 0x08, "OV set: 127+1 signed-overflows");
+    assert_eq!(
+        p.ram()[0xFD8] & 0x08,
+        0x08,
+        "OV set: 127+1 signed-overflows"
+    );
 }
 
 #[test]
@@ -452,7 +464,8 @@ fn postdec0_writes_then_decrements() {
 
 #[test]
 fn plusw0_reads_fsr0_plus_signed_w_without_side_effect() {
-    let src = "    LFSR 0, 0x55\n    MOVLW 0x42\n    MOVWF 0x56,A\n    MOVLW 1\n    MOVF 0xFEB,W,A\n"; // MOVF PLUSW0,W
+    let src =
+        "    LFSR 0, 0x55\n    MOVLW 0x42\n    MOVWF 0x56,A\n    MOVLW 1\n    MOVF 0xFEB,W,A\n"; // MOVF PLUSW0,W
     let words = asm::assemble_pic18(src);
     let mut p = Pic18::new(words);
     p.run(10);
@@ -554,5 +567,9 @@ fn movff_dereferences_indf_and_postinc_operands() {
     // FSR1L lives at 0xF00 + 0xE1 = 0xFE1 (resolve_f's FSR1 match arm:
     // fsrn_lo = 0xE1). FSR1 must have advanced past 0x021 after the
     // post-increment.
-    assert_eq!(p.ram()[0xFE1], 0x22, "FSR1L must read 0x22 after POSTINC1's increment");
+    assert_eq!(
+        p.ram()[0xFE1],
+        0x22,
+        "FSR1L must read 0x22 after POSTINC1's increment"
+    );
 }

@@ -74,11 +74,16 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         } else if a == "--device" {
             i += 1;
             device = Some(
-                argv.get(i).cloned().ok_or("epic-cc: --device needs a value")?,
+                argv.get(i)
+                    .cloned()
+                    .ok_or("epic-cc: --device needs a value")?,
             );
         } else if a == "--emit" {
             i += 1;
-            let v = argv.get(i).cloned().ok_or("epic-cc: --emit needs a value")?;
+            let v = argv
+                .get(i)
+                .cloned()
+                .ok_or("epic-cc: --emit needs a value")?;
             emit = match v.as_str() {
                 "ll" => Emit::Ll,
                 "ir" => Emit::Ir,
@@ -89,7 +94,9 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         } else if a == "--save-temps" {
             i += 1;
             save_temps = Some(
-                argv.get(i).cloned().ok_or("epic-cc: --save-temps needs a value")?,
+                argv.get(i)
+                    .cloned()
+                    .ok_or("epic-cc: --save-temps needs a value")?,
             );
         } else if a == "-v" {
             verbose = true;

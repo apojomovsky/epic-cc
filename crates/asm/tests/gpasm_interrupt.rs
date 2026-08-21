@@ -121,7 +121,12 @@ fn to_gpasm_src(src: &str) -> String {
                     .get(label)
                     .unwrap_or_else(|| panic!("PAGE({label}) label not found"));
                 let lit = (addr >> 11) << 3;
-                rendered = format!("{}{}0x{lit:02X}{}", &rendered[..start], " ", &rendered[start + 5 + end + 1..]);
+                rendered = format!(
+                    "{}{}0x{lit:02X}{}",
+                    &rendered[..start],
+                    " ",
+                    &rendered[start + 5 + end + 1..]
+                );
             }
             out.push(rendered);
             org += 1;
@@ -143,11 +148,21 @@ fn interrupt_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("interrupt_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "interrupt_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "interrupt_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/interrupt_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator exactly like the e2e: in = 0x10, fire at
@@ -158,14 +173,30 @@ fn interrupt_hex_matches_gpasm_and_runs() {
     while p.pc() != INJECT_PC {
         p.step();
         steps += 1;
-        assert!(steps < 200, "never reached the injection point (pc = {})", p.pc());
+        assert!(
+            steps < 200,
+            "never reached the injection point (pc = {})",
+            p.pc()
+        );
     }
     assert_eq!(p.ram()[0x20], 0x10, "out == in before the ISR");
-    assert_eq!(p.ram()[0x06], 0x11, "PORTB == 0x11 (main's SFR write) before the ISR");
+    assert_eq!(
+        p.ram()[0x06],
+        0x11,
+        "PORTB == 0x11 (main's SFR write) before the ISR"
+    );
     p.fire_interrupt();
     assert_eq!(p.pc(), VECTOR, "the ISR starts at the vector (word 4)");
     p.run(500_000);
-    assert_eq!(p.ram()[0x20], 0x16, "out == hand-computed 0x16 (ISR bump 0x10 -> 0x11, then 0x11 -> 0x12 -> 0x13 -> 0x16)");
-    assert_eq!(p.ram()[0x06], 0x22, "PORTB == 0x22 (main's final SFR write)");
+    assert_eq!(
+        p.ram()[0x20],
+        0x16,
+        "out == hand-computed 0x16 (ISR bump 0x10 -> 0x11, then 0x11 -> 0x12 -> 0x13 -> 0x16)"
+    );
+    assert_eq!(
+        p.ram()[0x06],
+        0x22,
+        "PORTB == 0x22 (main's final SFR write)"
+    );
     assert!(p.halted());
 }

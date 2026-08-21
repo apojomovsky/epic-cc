@@ -1,9 +1,11 @@
-use legalize::legalize;
 use ir::{parse, Inst};
+use legalize::legalize;
 
 #[test]
 fn passes_8_bit_through() {
-    let m = parse("global in i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    ret void\n");
+    let m = parse(
+        "global in i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    ret void\n",
+    );
     assert_eq!(legalize(m).funcs.len(), 1);
 }
 
@@ -33,8 +35,11 @@ fn lowers_mul_and_variable_shifts_to_runtime_calls() {
     // The const-count shift stayed a Bin (isel inlines it).
     assert!(text.contains("%k = shl i16 %a 3"));
     // The used routine defs are injected with their scratch allocas.
-    assert!(text.contains("fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14"));
-    assert!(text.contains("fn __shl_u16(i16) (val=i16, cnt=i16)\n  block entry:\n    %__scr = alloca 4"));
+    assert!(
+        text.contains("fn __mul_u16(i16) (a=i16, b=i16)\n  block entry:\n    %__scr = alloca 14")
+    );
+    assert!(text
+        .contains("fn __shl_u16(i16) (val=i16, cnt=i16)\n  block entry:\n    %__scr = alloca 4"));
     // Unused routines are NOT injected.
     assert!(!text.contains("__udiv_u8"));
 }
@@ -79,11 +84,24 @@ fn injected_routines_get_param_and_scratch_slots_allocated() {
         other => panic!("__shl_u16 must inject the scratch alloca, got {other:?}"),
     }
     // Overlay placement: params first (2+2 bytes), then the __scr buffer.
-    let out = alloc::allocate(&device::PIC16F877A, &m2, "edge main __mul_u16\nedge main __shl_u16\n");
+    let out = alloc::allocate(
+        &device::PIC16F877A,
+        &m2,
+        "edge main __mul_u16\nedge main __shl_u16\n",
+    );
     assert_eq!(out.locals["__mul_u16::b"], out.locals["__mul_u16::a"] + 2);
-    assert_eq!(out.locals["__mul_u16::__scr"], out.locals["__mul_u16::b"] + 2);
-    assert_eq!(out.locals["__shl_u16::cnt"], out.locals["__shl_u16::val"] + 2);
-    assert_eq!(out.locals["__shl_u16::__scr"], out.locals["__shl_u16::cnt"] + 2);
+    assert_eq!(
+        out.locals["__mul_u16::__scr"],
+        out.locals["__mul_u16::b"] + 2
+    );
+    assert_eq!(
+        out.locals["__shl_u16::cnt"],
+        out.locals["__shl_u16::val"] + 2
+    );
+    assert_eq!(
+        out.locals["__shl_u16::__scr"],
+        out.locals["__shl_u16::cnt"] + 2
+    );
 }
 
 /// Table-driven: every mul/div/rem binop and every reg-count shift on i8/i16
@@ -96,28 +114,28 @@ fn pins_all_runtime_routine_mappings() {
     use ir::Ty;
     // (op, ty text, ty, routine, param names, __scr size)
     let cases: &[(&str, &str, Ty, &str, &[&str], u8)] = &[
-        ("mul",  "i8",  Ty::I8,  "__mul_u8",  &["a", "b"], 6),
-        ("mul",  "i16", Ty::I16, "__mul_u16", &["a", "b"], 14),
-        ("udiv", "i8",  Ty::I8,  "__udiv_u8",  &["num", "den"], 4),
+        ("mul", "i8", Ty::I8, "__mul_u8", &["a", "b"], 6),
+        ("mul", "i16", Ty::I16, "__mul_u16", &["a", "b"], 14),
+        ("udiv", "i8", Ty::I8, "__udiv_u8", &["num", "den"], 4),
         ("udiv", "i16", Ty::I16, "__udiv_u16", &["num", "den"], 7),
-        ("urem", "i8",  Ty::I8,  "__urem_u8",  &["num", "den"], 4),
+        ("urem", "i8", Ty::I8, "__urem_u8", &["num", "den"], 4),
         ("urem", "i16", Ty::I16, "__urem_u16", &["num", "den"], 7),
-        ("sdiv", "i8",  Ty::I8,  "__sdiv_i8",  &["num", "den"], 5),
+        ("sdiv", "i8", Ty::I8, "__sdiv_i8", &["num", "den"], 5),
         ("sdiv", "i16", Ty::I16, "__sdiv_i16", &["num", "den"], 7),
-        ("srem", "i8",  Ty::I8,  "__srem_i8",  &["num", "den"], 5),
+        ("srem", "i8", Ty::I8, "__srem_i8", &["num", "den"], 5),
         ("srem", "i16", Ty::I16, "__srem_i16", &["num", "den"], 7),
-        ("shl",  "i8",  Ty::I8,  "__shl_u8",   &["val", "cnt"], 3),
-        ("shl",  "i16", Ty::I16, "__shl_u16",  &["val", "cnt"], 4),
-        ("lshr", "i8",  Ty::I8,  "__lshr_u8",  &["val", "cnt"], 3),
+        ("shl", "i8", Ty::I8, "__shl_u8", &["val", "cnt"], 3),
+        ("shl", "i16", Ty::I16, "__shl_u16", &["val", "cnt"], 4),
+        ("lshr", "i8", Ty::I8, "__lshr_u8", &["val", "cnt"], 3),
         ("lshr", "i16", Ty::I16, "__lshr_u16", &["val", "cnt"], 4),
-        ("ashr", "i8",  Ty::I8,  "__ashr_i8",  &["val", "cnt"], 3),
+        ("ashr", "i8", Ty::I8, "__ashr_i8", &["val", "cnt"], 3),
         ("ashr", "i16", Ty::I16, "__ashr_i16", &["val", "cnt"], 4),
-        ("mul",  "i32", Ty::I32, "__mul_u32",  &["a", "b"], 11),
+        ("mul", "i32", Ty::I32, "__mul_u32", &["a", "b"], 11),
         ("udiv", "i32", Ty::I32, "__udiv_u32", &["num", "den"], 10),
         ("urem", "i32", Ty::I32, "__urem_u32", &["num", "den"], 10),
         ("sdiv", "i32", Ty::I32, "__sdiv_i32", &["num", "den"], 12),
         ("srem", "i32", Ty::I32, "__srem_i32", &["num", "den"], 12),
-        ("shl",  "i32", Ty::I32, "__shl_u32",  &["val", "cnt"], 2),
+        ("shl", "i32", Ty::I32, "__shl_u32", &["val", "cnt"], 2),
         ("lshr", "i32", Ty::I32, "__lshr_u32", &["val", "cnt"], 2),
         ("ashr", "i32", Ty::I32, "__ashr_i32", &["val", "cnt"], 2),
     ];
@@ -144,7 +162,11 @@ fn pins_all_runtime_routine_mappings() {
         assert_eq!(f.params.len(), 2, "{routine} param count");
         for (i, pname) in params.iter().enumerate() {
             assert_eq!(f.params[i].name, *pname, "{routine} param {i} name");
-            assert_eq!(f.params[i].width, ty_enum.bytes(), "{routine} param {i} width");
+            assert_eq!(
+                f.params[i].width,
+                ty_enum.bytes(),
+                "{routine} param {i} width"
+            );
         }
         // (c) The injected scratch alloca matches the Task-2 layout contract.
         assert_eq!(f.blocks.len(), 1, "{routine} block count");
@@ -212,7 +234,10 @@ fn duplicates_shared_functions_for_the_isr() {
     let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
     // Both the original and the _isr copy exist.
     assert!(names.contains(&"helper"), "helper must remain: {names:?}");
-    assert!(names.contains(&"helper_isr"), "helper_isr must be added: {names:?}");
+    assert!(
+        names.contains(&"helper_isr"),
+        "helper_isr must be added: {names:?}"
+    );
     // The copy is a deep clone: same body, `isr` flag cleared.
     let helper_isr = func("helper_isr", &m2);
     assert!(!helper_isr.isr, "the _isr copy must not be marked isr");
@@ -259,9 +284,18 @@ fn rewrites_transitive_calls_and_skips_non_shared_callees() {
     let m2 = legalize(m);
     let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
     // Both shared functions got copies; the non-shared callee did not.
-    assert!(names.contains(&"helper_isr"), "helper_isr missing: {names:?}");
-    assert!(names.contains(&"helper2_isr"), "helper2_isr missing: {names:?}");
-    assert!(names.contains(&"isr_only"), "isr_only must remain: {names:?}");
+    assert!(
+        names.contains(&"helper_isr"),
+        "helper_isr missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"helper2_isr"),
+        "helper2_isr missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"isr_only"),
+        "isr_only must remain: {names:?}"
+    );
     assert!(
         !names.contains(&"isr_only_isr"),
         "non-shared callee must NOT be duplicated: {names:?}"
@@ -296,8 +330,14 @@ fn duplicated_module_roundtrips_canonical_text() {
              ret void\n",
     );
     let text = ir::serialize(&legalize(m));
-    assert!(text.contains("fn helper_isr(void) ()"), "missing copy:\n{text}");
-    assert!(text.contains("fn isr(void) [isr] ()"), "isr marker lost:\n{text}");
+    assert!(
+        text.contains("fn helper_isr(void) ()"),
+        "missing copy:\n{text}"
+    );
+    assert!(
+        text.contains("fn isr(void) [isr] ()"),
+        "isr marker lost:\n{text}"
+    );
     let m2 = parse(&text);
     assert_eq!(ir::serialize(&m2), text); // stable fixed point
 }
@@ -311,8 +351,15 @@ fn no_shared_function_means_no_duplication() {
     let src = "fn main(void) ()\n  block entry:\n    call void @helper()\n    ret void\nfn helper(void) ()\n  block entry:\n    ret void\n";
     let m = parse(src);
     let text = ir::serialize(&legalize(m));
-    assert!(!text.contains("_isr"), "no ISR: must not duplicate:\n{text}");
-    assert_eq!(text, ir::serialize(&parse(src)), "no ISR: must be byte-identical");
+    assert!(
+        !text.contains("_isr"),
+        "no ISR: must not duplicate:\n{text}"
+    );
+    assert_eq!(
+        text,
+        ir::serialize(&parse(src)),
+        "no ISR: must be byte-identical"
+    );
     // An ISR with only private callees: nothing is shared, so nothing is
     // duplicated and the ISR's calls stay untouched.
     let m = parse(
@@ -333,8 +380,14 @@ fn no_shared_function_means_no_duplication() {
     );
     let m2 = legalize(m);
     let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
-    assert!(!names.contains(&"helper_isr"), "helper is not shared: {names:?}");
-    assert!(!names.contains(&"isr_private_isr"), "isr_private is not shared: {names:?}");
+    assert!(
+        !names.contains(&"helper_isr"),
+        "helper is not shared: {names:?}"
+    );
+    assert!(
+        !names.contains(&"isr_private_isr"),
+        "isr_private is not shared: {names:?}"
+    );
     assert_eq!(call_targets(func("isr", &m2)), ["isr_private"]);
     assert_eq!(call_targets(func("main", &m2)), ["helper"]);
 }
@@ -418,9 +471,13 @@ fn lowers_fcmp_to_cmp_call_and_materialization_tree() {
     );
     let text = ir::serialize(&legalize(m));
     // olt = (c==1): a single icmp on the call result.
-    assert!(text.contains("%c0 = call i8 @__cmp_f32(float %a, float %b)\n    %x1 = icmp eq i8 %c0 1"));
+    assert!(
+        text.contains("%c0 = call i8 @__cmp_f32(float %a, float %b)\n    %x1 = icmp eq i8 %c0 1")
+    );
     // oeq = (c==0).
-    assert!(text.contains("%c1 = call i8 @__cmp_f32(float %a, float %b)\n    %x2 = icmp eq i8 %c1 0"));
+    assert!(
+        text.contains("%c1 = call i8 @__cmp_f32(float %a, float %b)\n    %x2 = icmp eq i8 %c1 0")
+    );
     // one = (c==1) || (c==2): two icmps + a select (the OR materialization).
     assert!(text.contains("%c2 = call i8 @__cmp_f32(float %a, float %b)"));
     assert!(text.contains("%c3 = icmp eq i8 %c2 1"));
@@ -432,9 +489,13 @@ fn lowers_fcmp_to_cmp_call_and_materialization_tree() {
     assert!(text.contains("%c7 = icmp eq i8 %c5 3"));
     assert!(text.contains("%x4 = select i1 %c6 i1 1 i1 %c7"));
     // ord = (c!=3): a single icmp.
-    assert!(text.contains("%c8 = call i8 @__cmp_f32(float %a, float %b)\n    %x5 = icmp ne i8 %c8 3"));
+    assert!(
+        text.contains("%c8 = call i8 @__cmp_f32(float %a, float %b)\n    %x5 = icmp ne i8 %c8 3")
+    );
     // uno = (c==3).
-    assert!(text.contains("%c9 = call i8 @__cmp_f32(float %a, float %b)\n    %x6 = icmp eq i8 %c9 3"));
+    assert!(
+        text.contains("%c9 = call i8 @__cmp_f32(float %a, float %b)\n    %x6 = icmp eq i8 %c9 3")
+    );
     // No i1 binops anywhere — the ORs are selects, never `or i1`.
     assert!(!text.contains("or i1"), "i1 binops are forbidden:\n{text}");
     assert!(!text.contains("and i1"), "i1 binops are forbidden:\n{text}");
@@ -447,7 +508,10 @@ fn lowers_fcmp_to_cmp_call_and_materialization_tree() {
 #[test]
 fn pins_all_fcmp_predicate_trees() {
     // (pred, single icmp (op, k) | OR of two eqs (k1, k2))
-    enum Tree { Icmp(&'static str, i64), Or(i64, i64) }
+    enum Tree {
+        Icmp(&'static str, i64),
+        Or(i64, i64),
+    }
     use Tree::*;
     let cases: &[(&str, Tree)] = &[
         ("oeq", Icmp("eq", 0)),
@@ -489,7 +553,10 @@ fn pins_all_fcmp_predicate_trees() {
                 );
             }
         }
-        assert!(!text.contains("or i1"), "{pred}: i1 binop forbidden:\n{text}");
+        assert!(
+            !text.contains("or i1"),
+            "{pred}: i1 binop forbidden:\n{text}"
+        );
     }
 }
 
@@ -552,10 +619,14 @@ fn injects_float_routines_with_exact_scratch_sizes() {
     }
     // The injected defs carry the canonical text form too.
     let text = ir::serialize(&m2);
-    assert!(text.contains("fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14"));
+    assert!(
+        text.contains("fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14")
+    );
     assert!(text.contains("fn __cmp_f32(i8) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 6"));
     assert!(text.contains("fn __fptosi_f32(i32) (val=i32)\n  block entry:\n    %__scr = alloca 8"));
-    assert!(text.contains("fn __uitofp_f32(float) (val=i32)\n  block entry:\n    %__scr = alloca 8"));
+    assert!(
+        text.contains("fn __uitofp_f32(float) (val=i32)\n  block entry:\n    %__scr = alloca 8")
+    );
     // Only the used routines are injected (no integer routines here).
     assert!(!text.contains("__mul_u8"));
     assert!(!text.contains("__udiv_u16"));
@@ -645,7 +716,10 @@ fn float_lowering_roundtrips_canonical_text() {
         "fn __cmp_f32(i8) (a=i32, b=i32)",
         "fn __fptosi_f32(i32) (val=i32)",
     ] {
-        assert!(text.contains(line), "missing canonical line: {line}\n---\n{text}");
+        assert!(
+            text.contains(line),
+            "missing canonical line: {line}\n---\n{text}"
+        );
     }
 }
 
@@ -676,7 +750,10 @@ fn duplicates_shared_runtime_routines_for_the_isr() {
     );
     let m2 = legalize(m);
     let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
-    assert!(names.contains(&"__mul_u8"), "main's routine must remain: {names:?}");
+    assert!(
+        names.contains(&"__mul_u8"),
+        "main's routine must remain: {names:?}"
+    );
     assert!(
         names.contains(&"__mul_u8_isr"),
         "the ISR needs its own routine copy: {names:?}"
@@ -689,7 +766,10 @@ fn duplicates_shared_runtime_routines_for_the_isr() {
     let orig = func("__mul_u8", &m2);
     let copy = func("__mul_u8_isr", &m2);
     assert!(!copy.isr, "the routine copy must not be marked isr");
-    assert_eq!(copy.ret, orig.ret, "the copy keeps the routine's return type");
+    assert_eq!(
+        copy.ret, orig.ret,
+        "the copy keeps the routine's return type"
+    );
     assert_eq!(
         copy.params.len(),
         orig.params.len(),
@@ -727,7 +807,10 @@ fn does_not_duplicate_isr_only_runtime_routines() {
     );
     let m2 = legalize(m);
     let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
-    assert!(names.contains(&"__mul_u8"), "the routine must be injected: {names:?}");
+    assert!(
+        names.contains(&"__mul_u8"),
+        "the routine must be injected: {names:?}"
+    );
     assert!(
         !names.contains(&"__mul_u8_isr"),
         "an ISR-only routine must NOT be duplicated: {names:?}"
@@ -761,7 +844,10 @@ fn adds_two_constants_without_reaching_isel() {
     let m = parse("fn main(void) ()\n  block entry:\n    %a = add i8 200, 100\n    ret void\n");
     let text = ir::serialize(&legalize(m));
     // 200 + 100 = 300, wraps to 44 in 8 bits.
-    assert!(text.contains("%a = freeze i8 44"), "expected folded add\n---\n{text}");
+    assert!(
+        text.contains("%a = freeze i8 44"),
+        "expected folded add\n---\n{text}"
+    );
 }
 
 #[test]
@@ -770,22 +856,34 @@ fn subtracts_two_constants_without_reaching_isel() {
     // constant as a file-register address instead of computing k1 - k2.
     let m = parse("fn main(void) ()\n  block entry:\n    %a = sub i8 5, 3\n    ret void\n");
     let text = ir::serialize(&legalize(m));
-    assert!(text.contains("%a = freeze i8 2"), "expected folded sub\n---\n{text}");
+    assert!(
+        text.contains("%a = freeze i8 2"),
+        "expected folded sub\n---\n{text}"
+    );
 }
 
 #[test]
 fn folds_signed_division_with_truncation_toward_zero() {
     let m = parse("fn main(void) ()\n  block entry:\n    %a = sdiv i8 -7, 2\n    ret void\n");
     let text = ir::serialize(&legalize(m));
-    assert!(text.contains("%a = freeze i8 -3"), "expected -7/2 truncated to -3\n---\n{text}");
+    assert!(
+        text.contains("%a = freeze i8 -3"),
+        "expected -7/2 truncated to -3\n---\n{text}"
+    );
 }
 
 #[test]
 fn folds_mul_directly_instead_of_calling_the_runtime_routine() {
     let m = parse("fn main(void) ()\n  block entry:\n    %a = mul i8 6, 7\n    ret void\n");
     let text = ir::serialize(&legalize(m));
-    assert!(text.contains("%a = freeze i8 42"), "expected folded mul\n---\n{text}");
-    assert!(!text.contains("__mul_u8"), "must not call the runtime routine for a constant fold\n---\n{text}");
+    assert!(
+        text.contains("%a = freeze i8 42"),
+        "expected folded mul\n---\n{text}"
+    );
+    assert!(
+        !text.contains("__mul_u8"),
+        "must not call the runtime routine for a constant fold\n---\n{text}"
+    );
 }
 
 #[test]
@@ -797,8 +895,14 @@ fn folds_icmp_predicates_on_two_constants() {
          ret void\n",
     );
     let text = ir::serialize(&legalize(m));
-    assert!(text.contains("%a = freeze i1 1"), "3 ult 5 is true\n---\n{text}");
-    assert!(text.contains("%b = freeze i1 0"), "-1 sgt 0 (signed) is false\n---\n{text}");
+    assert!(
+        text.contains("%a = freeze i1 1"),
+        "3 ult 5 is true\n---\n{text}"
+    );
+    assert!(
+        text.contains("%b = freeze i1 0"),
+        "-1 sgt 0 (signed) is false\n---\n{text}"
+    );
 }
 
 #[test]

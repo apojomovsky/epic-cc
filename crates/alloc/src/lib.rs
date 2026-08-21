@@ -39,7 +39,11 @@ pub struct AllocLayout {
 /// range, so locals never land there. Panics past the device's last bank.
 fn region_for(device: &Device, addr: u16) -> (u16, u16) {
     device.region_for(addr).unwrap_or_else(|| {
-        let last_end = device.ram_banks.last().expect("a device has at least one GPR bank").1;
+        let last_end = device
+            .ram_banks
+            .last()
+            .expect("a device has at least one GPR bank")
+            .1;
         panic!("alloc: GPR demand exceeds 0x{last_end:X} ({addr:#06x})")
     })
 }
@@ -143,7 +147,12 @@ fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
 /// `base` unchanged for an ordinary function; `routine_base`-rounded for a
 /// runtime routine (issue #6). Shared by the main-context and ISR-context
 /// base-assignment loops, which both need this same rounding.
-fn round_if_routine(device: &Device, f: &str, base: u16, locals_widths: &HashMap<String, Vec<u8>>) -> u16 {
+fn round_if_routine(
+    device: &Device,
+    f: &str,
+    base: u16,
+    locals_widths: &HashMap<String, Vec<u8>>,
+) -> u16 {
     if ir::is_runtime_routine(f) {
         routine_base(device, base, &locals_widths[f])
     } else {
@@ -195,7 +204,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         if g.is_const {
             const_globals.insert(g.name.clone());
         } else {
-            assert!(g.size <= 255, "alloc: RAM global @{} too large ({} bytes; RAM is byte-addressed, max 255)", g.name, g.size);
+            assert!(
+                g.size <= 255,
+                "alloc: RAM global @{} too large ({} bytes; RAM is byte-addressed, max 255)",
+                g.name,
+                g.size
+            );
             if let Some(a) = g.addr {
                 fixed.push((g.name.clone(), a, g.size));
             } else {
@@ -232,7 +246,11 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 loop {
                     let mut bumped = false;
                     for (_, fa, fs) in &fixed {
-                        if candidate < *fa + *fs && candidate + u16::from(width) > *fa && candidate >= *fa && candidate < *fa + *fs {
+                        if candidate < *fa + *fs
+                            && candidate + u16::from(width) > *fa
+                            && candidate >= *fa
+                            && candidate < *fa + *fs
+                        {
                             candidate = *fa + *fs;
                             bumped = true;
                             break;
@@ -365,12 +383,13 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // the device's GPR start (mirrors isel's layout computation). The
     // scratch/retval bytes live in the device's fixed common RAM, so the
     // first frame base follows the globals directly.
-    let end_of_globals = m.globals.iter().fold(device.gpr_start(), |end, g| {
-        match globals.get(&g.name) {
-            Some(&a) => end.max(a + u16::from(g.size)),
-            None => end,
-        }
-    });
+    let end_of_globals =
+        m.globals
+            .iter()
+            .fold(device.gpr_start(), |end, g| match globals.get(&g.name) {
+                Some(&a) => end.max(a + u16::from(g.size)),
+                None => end,
+            });
     let bank0_start = end_of_globals;
 
     // 2. locals_widths(f) = the byte widths of f's params and defined values
@@ -544,7 +563,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // results; the ISR contexts are then re-derived from that base in topo
     // order (callers precede callees, and every caller of an ISR-context
     // function is itself in the ISR context after the legalize duplication).
-    let isr_names: HashSet<&str> = m.funcs.iter().filter(|f| f.isr).map(|f| f.name.as_str()).collect();
+    let isr_names: HashSet<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
     if !isr_names.is_empty() {
         let isr_roots: Vec<&String> = topo
             .iter()
@@ -566,8 +590,10 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         // Re-derive the ISR contexts from the disjoint base (topo order: an
         // ISR root's base is fixed first, then each callee's base derives
         // from its already-fixed callers).
-        let isr_ctx: HashSet<String> =
-            isr_roots.iter().flat_map(|r| reachable(&[r.as_str()], &edges)).collect();
+        let isr_ctx: HashSet<String> = isr_roots
+            .iter()
+            .flat_map(|r| reachable(&[r.as_str()], &edges))
+            .collect();
         for f in &topo {
             if !isr_ctx.contains(f) {
                 continue;
@@ -710,5 +736,4 @@ mod tests {
         // a region, so placing even a 1-byte value there must fail cleanly.
         assert_eq!(try_place_at(&PIC16F877A, 0x1F0, 1), None);
     }
-
 }

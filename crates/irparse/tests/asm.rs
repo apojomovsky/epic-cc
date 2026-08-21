@@ -1,5 +1,5 @@
+use ir::Inst;
 use irparse::parse_ll;
-use ir::{Inst};
 
 #[test]
 fn module_asm() {
@@ -16,11 +16,17 @@ fn naked() {
 }
 attributes #0 = { naked noinline nounwind }"#;
     let m = parse_ll(ll);
-    let bar = m.funcs.iter().find(|f| f.name=="bar").unwrap();
+    let bar = m.funcs.iter().find(|f| f.name == "bar").unwrap();
     assert!(bar.naked);
     // naked body should contain one Asm, no Ret
-    assert!(bar.blocks[0].insts.iter().any(|i| matches!(i, Inst::Asm(_))));
-    assert!(!bar.blocks[0].insts.iter().any(|i| matches!(i, Inst::Ret(_))));
+    assert!(bar.blocks[0]
+        .insts
+        .iter()
+        .any(|i| matches!(i, Inst::Asm(_))));
+    assert!(!bar.blocks[0]
+        .insts
+        .iter()
+        .any(|i| matches!(i, Inst::Ret(_))));
 }
 
 #[test]
@@ -29,27 +35,33 @@ fn opaque_asm_no_operands() {
  ret void }"#;
     // use multiline to avoid single-line parsing edge; but also test single-line
     let m = parse_ll(ll);
-    let foo = m.funcs.iter().find(|f| f.name=="foo").unwrap();
-    assert!(matches!(&foo.blocks[0].insts[0], ir::Inst::Asm(a) if a.template=="bcf INTCON, 7" && !a.clobbers_memory));
+    let foo = m.funcs.iter().find(|f| f.name == "foo").unwrap();
+    assert!(
+        matches!(&foo.blocks[0].insts[0], ir::Inst::Asm(a) if a.template=="bcf INTCON, 7" && !a.clobbers_memory)
+    );
 }
 
 #[test]
 fn opaque_asm_single_line() {
-    let ll = r#"define void @foo() { tail call void asm sideeffect "bcf INTCON, 7", ""() #0 ret void }"#;
+    let ll =
+        r#"define void @foo() { tail call void asm sideeffect "bcf INTCON, 7", ""() #0 ret void }"#;
     let m = parse_ll(ll);
-    let foo = m.funcs.iter().find(|f| f.name=="foo").unwrap();
-    assert!(matches!(&foo.blocks[0].insts[0], ir::Inst::Asm(a) if a.template=="bcf INTCON, 7" && !a.clobbers_memory));
+    let foo = m.funcs.iter().find(|f| f.name == "foo").unwrap();
+    assert!(
+        matches!(&foo.blocks[0].insts[0], ir::Inst::Asm(a) if a.template=="bcf INTCON, 7" && !a.clobbers_memory)
+    );
 }
 
 #[test]
 fn clobbers_memory_flag() {
-    let ll = r#"define void @foo() { tail call void asm sideeffect "nop", "~{memory}"() ret void }"#;
+    let ll =
+        r#"define void @foo() { tail call void asm sideeffect "nop", "~{memory}"() ret void }"#;
     let m = parse_ll(ll);
     assert!(matches!(&m.funcs[0].blocks[0].insts[0], ir::Inst::Asm(a) if a.clobbers_memory));
 }
 
 #[test]
-#[should_panic(expected="register constraints are not supported")]
+#[should_panic(expected = "register constraints are not supported")]
 fn rejects_register_constraint() {
     let ll = r#"define void @foo() { %1 = tail call i8 asm sideeffect "movwf $0", "=r,0"(i8 1) ret void }"#;
     parse_ll(ll);
@@ -66,7 +78,9 @@ fn accepts_memory_operands() {
         assert_eq!(a.operands[0].constraint, "=*m");
         assert_eq!(a.operands[0].ptr, "@t");
         assert_eq!(a.operands[1].ptr, "@y");
-    } else { panic!("expected Asm"); }
+    } else {
+        panic!("expected Asm");
+    }
 }
 
 #[test]

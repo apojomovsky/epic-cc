@@ -147,7 +147,10 @@ fn globals_span_across_banks() {
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_eq!(out.globals["g0"], 0x20);
     assert_eq!(out.globals["g79"], 0x6F); // last bank-0 GPR byte
-    assert!(out.globals["g80"] >= 0xA0, "81st global crosses into bank 1");
+    assert!(
+        out.globals["g80"] >= 0xA0,
+        "81st global crosses into bank 1"
+    );
     assert_eq!(out.globals["g80"], 0xA0);
     assert!(out.globals["g89"] >= 0xA0);
 }
@@ -165,7 +168,10 @@ fn frame_spans_across_banks() {
     // No globals: the root frame starts at 0x20; v79 at 0x6F, v80 at 0xA0.
     assert_eq!(out.locals["f::v0"], 0x20);
     assert_eq!(out.locals["f::v79"], 0x6F);
-    assert!(out.locals["f::v80"] >= 0xA0, "80th local crosses into bank 1");
+    assert!(
+        out.locals["f::v80"] >= 0xA0,
+        "80th local crosses into bank 1"
+    );
     assert_eq!(out.locals["f::v80"], 0xA0);
 }
 
@@ -273,7 +279,11 @@ fn i16_globals_stay_even_aligned_across_banks() {
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
     assert_eq!(out.globals["g79"], 0x6F);
     assert!(out.globals["w"] >= 0xA0, "i16 spills into bank 1");
-    assert_eq!(out.globals["w"] % 2, 0, "i16 stays even-aligned within the bank");
+    assert_eq!(
+        out.globals["w"] % 2,
+        0,
+        "i16 stays even-aligned within the bank"
+    );
 }
 
 #[test]
@@ -382,8 +392,14 @@ fn const_300_byte_table_gets_no_ram_address_and_layout_unchanged() {
     );
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // const table: no RAM address, but listed in const_globals.
-    assert!(!out.globals.contains_key("table"), "const table must not get a RAM address");
-    assert!(out.const_globals.contains("table"), "const table must be in const_globals");
+    assert!(
+        !out.globals.contains_key("table"),
+        "const table must not get a RAM address"
+    );
+    assert!(
+        out.const_globals.contains("table"),
+        "const table must be in const_globals"
+    );
     // RAM layout unchanged: a at 0x20, after at 0x21 (const skipped).
     assert_eq!(out.globals["a"], 0x20);
     assert_eq!(out.globals["after"], 0x21);
@@ -409,8 +425,14 @@ fn alloca_byval_and_sret_params_get_full_widths_params_first() {
     // The alloca lands after the params, at its full 4-byte size.
     assert_eq!(out.locals["f::buf"], 0x26);
     // No overlap: each slot strictly follows the previous slot's end.
-    assert!(out.locals["f::r"] >= out.locals["f::p"] + 4, "sret overlaps byval param");
-    assert!(out.locals["f::buf"] >= out.locals["f::r"] + 2, "alloca overlaps sret param");
+    assert!(
+        out.locals["f::r"] >= out.locals["f::p"] + 4,
+        "sret overlaps byval param"
+    );
+    assert!(
+        out.locals["f::buf"] >= out.locals["f::r"] + 2,
+        "alloca overlaps sret param"
+    );
     assert_eq!(out.total_bank0, 4 + 2 + 4);
 }
 
@@ -509,8 +531,14 @@ fn isr_root_region_is_disjoint_from_the_main_context() {
     assert_eq!(out.locals["m2_isr::i2"], 0x25);
     // Disjointness: no _isr frame overlaps a main-context frame (which
     // occupy 0x20..0x23).
-    assert!(out.locals["isr::i0"] >= 0x23, "isr frame overlaps the main context");
-    assert!(out.locals["m2_isr::i2"] >= 0x23, "m2_isr frame overlaps the main context");
+    assert!(
+        out.locals["isr::i0"] >= 0x23,
+        "isr frame overlaps the main context"
+    );
+    assert!(
+        out.locals["m2_isr::i2"] >= 0x23,
+        "m2_isr frame overlaps the main context"
+    );
 }
 
 /// The ISR root's disjoint base clears the main context's PHYSICAL frame end
@@ -591,13 +619,21 @@ fn a_global_layout_sequential_placement_cannot_fit_succeeds_via_bin_packing() {
         .collect();
     for &(start, end) in &spans {
         assert!(
-            PIC16F877A.ram_banks.iter().any(|&(bs, be)| start >= bs && end <= be),
+            PIC16F877A
+                .ram_banks
+                .iter()
+                .any(|&(bs, be)| start >= bs && end <= be),
             "global at 0x{start:03X}..=0x{end:03X} does not fit inside a single bank"
         );
     }
     spans.sort();
     for w in spans.windows(2) {
-        assert!(w[0].1 < w[1].0, "overlapping placements: {:?} and {:?}", w[0], w[1]);
+        assert!(
+            w[0].1 < w[1].0,
+            "overlapping placements: {:?} and {:?}",
+            w[0],
+            w[1]
+        );
     }
 }
 
@@ -665,7 +701,11 @@ fn routine_frame_fitting_bank0_stays_put() {
     let out = allocate(&PIC16F877A, &m, "edge main __mul_u16\n");
     assert_eq!(out.locals["__mul_u16::a"], 0x5E);
     assert_eq!(out.locals["__mul_u16::__scr"], 0x62);
-    assert_eq!(out.locals["__mul_u16::__scr"] + 14, 0x70, "frame ends exactly at the bank-0 boundary");
+    assert_eq!(
+        out.locals["__mul_u16::__scr"] + 14,
+        0x70,
+        "frame ends exactly at the bank-0 boundary"
+    );
 }
 
 #[test]
@@ -678,10 +718,17 @@ fn routine_frame_straddling_rounds_into_the_next_bank() {
     // wholesale to bank 1 (0xA0), so the whole frame sits inside it.
     let m = routine_module(0x40);
     let out = allocate(&PIC16F877A, &m, "edge main __mul_u16\n");
-    assert_eq!(out.locals["__mul_u16::a"], 0xA0, "rounded to bank 1's start");
+    assert_eq!(
+        out.locals["__mul_u16::a"], 0xA0,
+        "rounded to bank 1's start"
+    );
     assert_eq!(out.locals["__mul_u16::b"], 0xA2);
     assert_eq!(out.locals["__mul_u16::__scr"], 0xA4);
-    assert_eq!(out.locals["__mul_u16::__scr"] + 13, 0xB1, "whole frame inside bank 1");
+    assert_eq!(
+        out.locals["__mul_u16::__scr"] + 13,
+        0xB1,
+        "whole frame inside bank 1"
+    );
 }
 
 #[test]
@@ -707,11 +754,19 @@ fn routine_rounding_wastes_only_the_partial_bank() {
     src.push_str("    call void @__udiv_u8()\n    call void @__mul_u16()\n    ret void\n");
     src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
     let m = parse(&src);
-    let out = allocate(&PIC16F877A, &m, "edge main f\nedge f __udiv_u8\nedge f __mul_u16\n");
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge main f\nedge f __udiv_u8\nedge f __mul_u16\n",
+    );
     // The 3-byte routine packs in the bank-0 tail at f's frame end.
     assert_eq!(out.locals["__udiv_u8::num"], 0x6A);
     // The 18-byte routine would straddle -> rounds to bank 1.
     assert_eq!(out.locals["__mul_u16::a"], 0xA0);
     assert_eq!(out.locals["__mul_u16::__scr"], 0xA4);
-    assert_eq!(out.locals["__mul_u16::__scr"] + 14, 0xB2, "whole frame inside bank 1");
+    assert_eq!(
+        out.locals["__mul_u16::__scr"] + 14,
+        0xB2,
+        "whole frame inside bank 1"
+    );
 }

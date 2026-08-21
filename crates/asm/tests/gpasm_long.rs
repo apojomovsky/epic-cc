@@ -109,7 +109,12 @@ fn to_gpasm_src(src: &str) -> String {
                     .get(label)
                     .unwrap_or_else(|| panic!("PAGE({label}) label not found"));
                 let lit = (addr >> 11) << 3;
-                rendered = format!("{}{}0x{lit:02X}{}", &rendered[..start], " ", &rendered[start + 5 + end + 1..]);
+                rendered = format!(
+                    "{}{}0x{lit:02X}{}",
+                    &rendered[..start],
+                    " ",
+                    &rendered[start + 5 + end + 1..]
+                );
             }
             out.push(rendered);
             org += 1;
@@ -131,11 +136,21 @@ fn long_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("long_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "long_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "long_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/long_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator: in = 0x12345678, sin = -19 ->
@@ -157,6 +172,9 @@ fn long_hex_matches_gpasm_and_runs() {
         | ((p.ram()[0x2F] as u32) << 8)
         | ((p.ram()[0x30] as u32) << 16)
         | ((p.ram()[0x31] as u32) << 24);
-    assert_eq!(got, 0x1634943A, "out == hand-computed 0x1634943A for in == 0x12345678, sin == -19");
+    assert_eq!(
+        got, 0x1634943A,
+        "out == hand-computed 0x1634943A for in == 0x12345678, sin == -19"
+    );
     assert!(p.halted());
 }

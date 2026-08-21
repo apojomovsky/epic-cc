@@ -1,6 +1,6 @@
 use device::PIC16F877A;
-use isel::select;
 use ir::parse;
+use isel::select;
 
 fn run_mul(a: u32, b: u32) -> u32 {
     let ir = "global ina float\n\

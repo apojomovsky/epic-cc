@@ -1,5 +1,5 @@
-use irparse::parse_ll;
 use ir::{CallArg, GepBase, Global, Inst, MemLen, Val};
+use irparse::parse_ll;
 
 // Array/`constant` globals + getelementptr (phase-3 pointers/const).
 const GEP_ARRAY: &str = r#"
@@ -20,7 +20,14 @@ fn parses_array_and_const_globals_and_gep() {
 
     // @ram = global [8 x i8] zeroinitializer
     match &m.globals[0] {
-        Global { name, ty, is_const, size, bytes, addr } => {
+        Global {
+            name,
+            ty,
+            is_const,
+            size,
+            bytes,
+            addr,
+        } => {
             assert_eq!(name, "ram");
             assert_eq!(*ty, ir::Ty::I8);
             assert!(!is_const);
@@ -32,7 +39,14 @@ fn parses_array_and_const_globals_and_gep() {
 
     // @table = constant [4 x i8] c"\0A\14\1E("
     match &m.globals[1] {
-        Global { name, ty, is_const, size, bytes, addr } => {
+        Global {
+            name,
+            ty,
+            is_const,
+            size,
+            bytes,
+            addr,
+        } => {
             assert_eq!(name, "table");
             assert_eq!(*ty, ir::Ty::I8);
             assert!(is_const);
@@ -86,7 +100,11 @@ fn parses_backslash_escapes_in_const_literals() {
     let m = parse_ll(BACKSLASH_LITERAL);
     let g = m.globals.iter().find(|g| g.name == "t").expect("const @t");
     assert!(g.is_const);
-    assert_eq!(g.bytes, vec![0x00, 0x5C, 0x5C, 0xFF], "`\\\\` must decode to one 0x5C byte each");
+    assert_eq!(
+        g.bytes,
+        vec![0x00, 0x5C, 0x5C, 0xFF],
+        "`\\\\` must decode to one 0x5C byte each"
+    );
 }
 
 const LL: &str = r#"
@@ -177,8 +195,24 @@ fn parses_probe_control_flow_calls_and_casts() {
             assert_eq!(c.func, "add");
             assert_eq!(c.ty, Some(ir::Ty::I16));
             assert_eq!(c.args.len(), 2);
-            assert_eq!(c.args[0], CallArg { ty: Some(ir::Ty::I16), val: Val::Reg("10".to_string()), byval: None, sret: false });
-            assert_eq!(c.args[1], CallArg { ty: Some(ir::Ty::I16), val: Val::Reg("13".to_string()), byval: None, sret: false });
+            assert_eq!(
+                c.args[0],
+                CallArg {
+                    ty: Some(ir::Ty::I16),
+                    val: Val::Reg("10".to_string()),
+                    byval: None,
+                    sret: false
+                }
+            );
+            assert_eq!(
+                c.args[1],
+                CallArg {
+                    ty: Some(ir::Ty::I16),
+                    val: Val::Reg("13".to_string()),
+                    byval: None,
+                    sret: false
+                }
+            );
         }
         other => panic!("expected Call, got {other:?}"),
     }
@@ -268,9 +302,11 @@ define i16 @main() {
         other => panic!("expected Sext, got {other:?}"),
     }
 
-    for (idx, p) in ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"]
-        .iter()
-        .enumerate()
+    for (idx, p) in [
+        "eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge",
+    ]
+    .iter()
+    .enumerate()
     {
         match &body[idx + 1] {
             Inst::Icmp(i) => {
@@ -404,7 +440,11 @@ fn parses_structs_type_table_globals_alloca_memcpy_gep_and_params() {
     match &body[2] {
         Inst::Store(s) => {
             assert_eq!(s.ty, ir::Ty::I8);
-            assert!(s.ptr.starts_with("%__gep"), "store ptr must reference the synthesized gep reg: {}", s.ptr);
+            assert!(
+                s.ptr.starts_with("%__gep"),
+                "store ptr must reference the synthesized gep reg: {}",
+                s.ptr
+            );
         }
         other => panic!("expected Store, got {other:?}"),
     }
@@ -429,13 +469,17 @@ fn parses_structs_type_table_globals_alloca_memcpy_gep_and_params() {
 
     // @g1 = memcpy @g2, 4 bytes (i16 4), non-volatile
     assert!(
-        body.iter().any(|i| matches!(i, Inst::Memcpy(m) if m.dst == Val::Global("g1".to_string())
-            && m.src == Val::Global("g2".to_string()) && m.len == MemLen::Const(4))),
+        body.iter().any(
+            |i| matches!(i, Inst::Memcpy(m) if m.dst == Val::Global("g1".to_string())
+            && m.src == Val::Global("g2".to_string()) && m.len == MemLen::Const(4))
+        ),
         "memcpy must appear: {body:?}"
     );
     // lifetime.start/end produce no instructions
     assert!(
-        !body.iter().any(|i| matches!(i, Inst::Call(c) if c.func.starts_with("llvm.lifetime"))),
+        !body
+            .iter()
+            .any(|i| matches!(i, Inst::Call(c) if c.func.starts_with("llvm.lifetime"))),
         "lifetime calls must be skipped"
     );
 }
@@ -600,7 +644,10 @@ fn decodes_literal_struct_initializers_to_flat_bytes() {
     // CARR = two { i8, i8, i16 } elements -> size 8, concatenated
     let carr = g("CARR");
     assert_eq!(carr.size, 8);
-    assert_eq!(carr.bytes, vec![0x44, 0x00, 0x11, 0x11, 0x45, 0x00, 0x22, 0x22]);
+    assert_eq!(
+        carr.bytes,
+        vec![0x44, 0x00, 0x11, 0x11, 0x45, 0x00, 0x22, 0x22]
+    );
 
     // zeroinitializer literal struct -> zeros of the layout size
     let cz = g("CZ");
@@ -672,7 +719,11 @@ fn folds_struct_array_element_gep_to_struct_stride() {
         Inst::Gep(g) => {
             assert_eq!(g.base, GepBase::Global("CARR".to_string()));
             assert_eq!(g.k, 0);
-            assert_eq!(g.terms, vec![(4, "i".to_string())], "element stride = sizeof(%struct.Pair) = 4");
+            assert_eq!(
+                g.terms,
+                vec![(4, "i".to_string())],
+                "element stride = sizeof(%struct.Pair) = 4"
+            );
         }
         other => panic!("expected Gep, got {other:?}"),
     }
@@ -820,7 +871,10 @@ fn preserves_byval_on_inlined_gep_call_arg() {
     let m = parse_ll(BYVAL_GEP_ARG);
     let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
     // The inlined GEP is synthesized BEFORE the Call (insts[0] = gep).
-    assert!(matches!(main.blocks[0].insts[0], Inst::Gep(_)), "synth GEP first");
+    assert!(
+        matches!(main.blocks[0].insts[0], Inst::Gep(_)),
+        "synth GEP first"
+    );
     match &main.blocks[0].insts[1] {
         Inst::Call(c) => {
             assert_eq!(c.func, "take_byval");
@@ -828,7 +882,11 @@ fn preserves_byval_on_inlined_gep_call_arg() {
             let arg = &c.args[0];
             assert_eq!(arg.byval, Some(4), "byval(%struct.Pair) -> size 4");
             assert!(!arg.sret);
-            assert!(matches!(arg.val, Val::Reg(_)), "inlined GEP is synthesized into a reg: {:?}", arg.val);
+            assert!(
+                matches!(arg.val, Val::Reg(_)),
+                "inlined GEP is synthesized into a reg: {:?}",
+                arg.val
+            );
         }
         other => panic!("expected Call, got {other:?}"),
     }
@@ -1022,7 +1080,10 @@ fn parses_isr_marker_and_inttoptr() {
     assert_eq!(main.ret, None);
     // the store's ptr is the literal inttoptr form
     match &main.blocks[0].insts[0] {
-        Inst::Store(s) => assert_eq!(s.ptr, "0x06", "inttoptr (i16 6 to ptr) -> literal ptr '0x06'"),
+        Inst::Store(s) => assert_eq!(
+            s.ptr, "0x06",
+            "inttoptr (i16 6 to ptr) -> literal ptr '0x06'"
+        ),
         other => panic!("expected Store, got {other:?}"),
     }
     match &isr.blocks[0].insts[0] {
@@ -1031,8 +1092,14 @@ fn parses_isr_marker_and_inttoptr() {
     }
     // the canonical text round-trips: serialize -> parse -> serialize stable
     let out = ir::serialize(&m);
-    assert!(out.contains("fn isr(void) [isr] ()"), "isr marker header\n---\n{out}");
-    assert!(out.contains("store i8 85 0x06"), "literal ptr store\n---\n{out}");
+    assert!(
+        out.contains("fn isr(void) [isr] ()"),
+        "isr marker header\n---\n{out}"
+    );
+    assert!(
+        out.contains("store i8 85 0x06"),
+        "literal ptr store\n---\n{out}"
+    );
     let m2 = ir::parse(&out);
     assert_eq!(ir::serialize(&m2), out, "stable fixed point");
     let m2isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
@@ -1072,7 +1139,14 @@ fn const_array_300_bytes_parses() {
     let m = parse_ll(&src);
     assert_eq!(m.globals.len(), 1);
     match &m.globals[0] {
-        Global { name, ty, is_const, size, bytes, addr } => {
+        Global {
+            name,
+            ty,
+            is_const,
+            size,
+            bytes,
+            addr,
+        } => {
             assert_eq!(name, "table");
             assert_eq!(*ty, ir::Ty::I8);
             assert!(*is_const, "const table must be flagged const");
@@ -1102,7 +1176,14 @@ fn const_array_i32_elements_parse_to_le_bytes() {
     let m = parse_ll(src);
     assert_eq!(m.globals.len(), 1);
     match &m.globals[0] {
-        Global { name, ty, is_const, size, bytes, addr } => {
+        Global {
+            name,
+            ty,
+            is_const,
+            size,
+            bytes,
+            addr,
+        } => {
             assert_eq!(name, "itable");
             assert_eq!(*ty, ir::Ty::I32);
             assert!(*is_const);
@@ -1132,7 +1213,14 @@ fn const_array_float_elements_parse_to_le_bytes() {
     let m = parse_ll(src);
     assert_eq!(m.globals.len(), 1);
     match &m.globals[0] {
-        Global { name, ty, is_const, size, bytes, addr } => {
+        Global {
+            name,
+            ty,
+            is_const,
+            size,
+            bytes,
+            addr,
+        } => {
             assert_eq!(name, "ftable");
             assert_eq!(*ty, ir::Ty::F32);
             assert!(*is_const);
@@ -1160,7 +1248,14 @@ fn const_array_600_bytes_parses() {
     let m = parse_ll(&src);
     assert_eq!(m.globals.len(), 1);
     match &m.globals[0] {
-        Global { name, ty, is_const, size, bytes, addr } => {
+        Global {
+            name,
+            ty,
+            is_const,
+            size,
+            bytes,
+            addr,
+        } => {
             assert_eq!(name, "big");
             assert_eq!(*ty, ir::Ty::I8);
             assert!(*is_const);
@@ -1169,9 +1264,21 @@ fn const_array_600_bytes_parses() {
             assert_eq!(*addr, None);
         }
     }
-    assert_eq!(m.globals[0].bytes[511], (511u32.wrapping_mul(37).wrapping_add(11)) as u8, "chunk-boundary byte");
-    assert_eq!(m.globals[0].bytes[512], (512u32.wrapping_mul(37).wrapping_add(11)) as u8, "first byte past the old bound");
-    assert_eq!(m.globals[0].bytes[599], (599u32.wrapping_mul(37).wrapping_add(11)) as u8, "last byte");
+    assert_eq!(
+        m.globals[0].bytes[511],
+        (511u32.wrapping_mul(37).wrapping_add(11)) as u8,
+        "chunk-boundary byte"
+    );
+    assert_eq!(
+        m.globals[0].bytes[512],
+        (512u32.wrapping_mul(37).wrapping_add(11)) as u8,
+        "first byte past the old bound"
+    );
+    assert_eq!(
+        m.globals[0].bytes[599],
+        (599u32.wrapping_mul(37).wrapping_add(11)) as u8,
+        "last byte"
+    );
 }
 
 #[test]
@@ -1249,7 +1356,12 @@ define dso_local i8 @f(i8 %x) {
             assert_eq!(c.args.len(), 1);
             assert_eq!(
                 c.args[0],
-                CallArg { ty: Some(ir::Ty::I8), val: Val::Const(0), byval: None, sret: false },
+                CallArg {
+                    ty: Some(ir::Ty::I8),
+                    val: Val::Const(0),
+                    byval: None,
+                    sret: false
+                },
                 "a poison arg is never observed, so Const(0) is the correct materialization"
             );
         }
@@ -1396,13 +1508,25 @@ define float @g() {
     // promoted, 0x3FF0000000000000 = 1.0f (its promotion is exact).
     match &g.blocks[0].insts[2] {
         Inst::FloatBin(b) => {
-            assert_eq!(b.a, Val::Const(0.1f32.to_bits() as i64), "0.1f promoted hex");
-            assert_eq!(b.b, Val::Const(1.5f32.to_bits() as i64), "1.5f promoted hex");
+            assert_eq!(
+                b.a,
+                Val::Const(0.1f32.to_bits() as i64),
+                "0.1f promoted hex"
+            );
+            assert_eq!(
+                b.b,
+                Val::Const(1.5f32.to_bits() as i64),
+                "1.5f promoted hex"
+            );
         }
         other => panic!("expected FloatBin, got {other:?}"),
     }
     match &g.blocks[0].insts[3] {
-        Inst::FloatBin(b) => assert_eq!(b.b, Val::Const(1.0f32.to_bits() as i64), "1.0f promoted hex"),
+        Inst::FloatBin(b) => assert_eq!(
+            b.b,
+            Val::Const(1.0f32.to_bits() as i64),
+            "1.0f promoted hex"
+        ),
         other => panic!("expected FloatBin, got {other:?}"),
     }
 }
@@ -1455,7 +1579,11 @@ define void @call_promoted() {
     match &f("ret_promoted").blocks[0].insts[0] {
         Inst::Ret(Some((ty, val))) => {
             assert_eq!(*ty, ir::Ty::F32);
-            assert_eq!(*val, Val::Const(0.1f32.to_bits() as i64), "ret promoted hex");
+            assert_eq!(
+                *val,
+                Val::Const(0.1f32.to_bits() as i64),
+                "ret promoted hex"
+            );
         }
         other => panic!("expected Ret, got {other:?}"),
     }
@@ -1463,18 +1591,38 @@ define void @call_promoted() {
     match &f("select_promoted").blocks[0].insts[0] {
         Inst::Select(s) => {
             assert_eq!(s.ty, ir::Ty::F32);
-            assert_eq!(s.a, Val::Const(0.1f32.to_bits() as i64), "select a promoted hex");
-            assert_eq!(s.b, Val::Const(1.5f32.to_bits() as i64), "select b promoted hex");
+            assert_eq!(
+                s.a,
+                Val::Const(0.1f32.to_bits() as i64),
+                "select a promoted hex"
+            );
+            assert_eq!(
+                s.b,
+                Val::Const(1.5f32.to_bits() as i64),
+                "select b promoted hex"
+            );
         }
         other => panic!("expected Select, got {other:?}"),
     }
     // phi incoming values decode the f64 promotion.
-    let phi_blk = f("phi_promoted").blocks.iter().find(|b| b.label == "m").unwrap();
+    let phi_blk = f("phi_promoted")
+        .blocks
+        .iter()
+        .find(|b| b.label == "m")
+        .unwrap();
     match &phi_blk.insts[0] {
         Inst::Phi(p) => {
             assert_eq!(p.ty, ir::Ty::F32);
-            assert_eq!(p.incoming[0].0, Val::Const(0.1f32.to_bits() as i64), "phi promoted hex");
-            assert_eq!(p.incoming[1].0, Val::Const(1.5f32.to_bits() as i64), "phi promoted hex");
+            assert_eq!(
+                p.incoming[0].0,
+                Val::Const(0.1f32.to_bits() as i64),
+                "phi promoted hex"
+            );
+            assert_eq!(
+                p.incoming[1].0,
+                Val::Const(1.5f32.to_bits() as i64),
+                "phi promoted hex"
+            );
         }
         other => panic!("expected Phi, got {other:?}"),
     }
@@ -1482,8 +1630,16 @@ define void @call_promoted() {
     match &f("icmp_promoted").blocks[0].insts[0] {
         Inst::Icmp(c) => {
             assert_eq!(c.ty, ir::Ty::F32);
-            assert_eq!(c.a, Val::Const(0.1f32.to_bits() as i64), "icmp a promoted hex");
-            assert_eq!(c.b, Val::Const(1.5f32.to_bits() as i64), "icmp b promoted hex");
+            assert_eq!(
+                c.a,
+                Val::Const(0.1f32.to_bits() as i64),
+                "icmp a promoted hex"
+            );
+            assert_eq!(
+                c.b,
+                Val::Const(1.5f32.to_bits() as i64),
+                "icmp b promoted hex"
+            );
         }
         other => panic!("expected Icmp, got {other:?}"),
     }
@@ -1491,7 +1647,11 @@ define void @call_promoted() {
     match &f("zext_promoted").blocks[0].insts[0] {
         Inst::Zext(z) => {
             assert_eq!(z.from, ir::Ty::F32);
-            assert_eq!(z.val, Val::Const(0.1f32.to_bits() as i64), "zext promoted hex");
+            assert_eq!(
+                z.val,
+                Val::Const(0.1f32.to_bits() as i64),
+                "zext promoted hex"
+            );
         }
         other => panic!("expected Zext, got {other:?}"),
     }
@@ -1499,7 +1659,11 @@ define void @call_promoted() {
     match &f("call_promoted").blocks[0].insts[0] {
         Inst::Call(c) => {
             assert_eq!(c.args[0].ty, Some(ir::Ty::F32));
-            assert_eq!(c.args[0].val, Val::Const(0.1f32.to_bits() as i64), "call arg promoted hex");
+            assert_eq!(
+                c.args[0].val,
+                Val::Const(0.1f32.to_bits() as i64),
+                "call arg promoted hex"
+            );
         }
         other => panic!("expected Call, got {other:?}"),
     }

@@ -1,18 +1,26 @@
 use driver::prescan::find_epic_config;
 
 fn src(s: &[(&str, &str)]) -> Vec<(String, String)> {
-    s.iter().map(|(n, c)| (n.to_string(), c.to_string())).collect()
+    s.iter()
+        .map(|(n, c)| (n.to_string(), c.to_string()))
+        .collect()
 }
 
 #[test]
 fn finds_a_simple_invocation() {
-    let found = find_epic_config(&src(&[("main.c", "EPIC_CONFIG(\"osc=hspll, wdt=off\");\n")]));
+    let found = find_epic_config(&src(&[(
+        "main.c",
+        "EPIC_CONFIG(\"osc=hspll, wdt=off\");\n",
+    )]));
     assert_eq!(found.as_deref(), Some("osc=hspll, wdt=off"));
 }
 
 #[test]
 fn returns_none_when_absent() {
-    assert_eq!(find_epic_config(&src(&[("main.c", "void main(void) {}\n")])), None);
+    assert_eq!(
+        find_epic_config(&src(&[("main.c", "void main(void) {}\n")])),
+        None
+    );
 }
 
 #[test]

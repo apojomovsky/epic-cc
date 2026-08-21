@@ -102,12 +102,26 @@ fn multi_page_pipeline() -> (String, alloc::AllocLayout) {
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
     let ll = Command::new(clang)
         .args([
-            "-target", "msp430", "-O1", "-S", "-emit-llvm", "-ffreestanding", "-nostdinc",
-            "-resource-dir", &resdir, "-o", "-", "tests/fixtures/multi_page.c",
+            "-target",
+            "msp430",
+            "-O1",
+            "-S",
+            "-emit-llvm",
+            "-ffreestanding",
+            "-nostdinc",
+            "-resource-dir",
+            &resdir,
+            "-o",
+            "-",
+            "tests/fixtures/multi_page.c",
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -171,14 +185,26 @@ fn multi_page_program_compiles_and_runs_correctly() {
     // page 1, and the table section sits in page 3.
     assert_eq!(page("f1"), Some(0), "f1 in page 0");
     assert_eq!(page("F1"), Some(0), "F1 in page 0");
-    assert_eq!(page("f3"), Some(0), "f3 in page 0 (bin-packed into the tail)");
+    assert_eq!(
+        page("f3"),
+        Some(0),
+        "f3 in page 0 (bin-packed into the tail)"
+    );
     assert_eq!(page("F2"), Some(1), "F2 in page 1");
     assert_eq!(page("f2"), Some(1), "f2 in page 1");
-    assert_eq!(page("main"), Some(1), "main in page 1 (nonzero — PAGE(main) != 0)");
+    assert_eq!(
+        page("main"),
+        Some(1),
+        "main in page 1 (nonzero — PAGE(main) != 0)"
+    );
     assert_eq!(page("F3"), Some(2), "F3 in page 2");
     assert_eq!(page("F4"), Some(3), "F4 in page 3");
     assert_eq!(page("__read_table"), Some(3), "reader in page 3");
-    assert_eq!(page("table"), Some(3), "table in page 3 (later than every function)");
+    assert_eq!(
+        page("table"),
+        Some(3),
+        "table in page 3 (later than every function)"
+    );
     assert_eq!(page("table_1"), Some(3), "table chunk 1 in page 3");
     assert_eq!(page("__read_table_hi"), Some(3), "chunk-1 reader in page 3");
 
@@ -192,20 +218,44 @@ fn multi_page_program_compiles_and_runs_correctly() {
     assert_ne!(page("f3"), page("f2"), "f3 -> f2 is cross-page");
     assert_ne!(page("main"), page("f3"), "main -> f3 is cross-page");
     assert_ne!(page("main"), page("f1"), "main -> f1 is cross-page");
-    assert_ne!(page("main"), page("__read_table"), "main -> reader is cross-page");
-    assert_ne!(page("main"), page("__read_table_hi"), "main -> hi reader is cross-page");
+    assert_ne!(
+        page("main"),
+        page("__read_table"),
+        "main -> reader is cross-page"
+    );
+    assert_ne!(
+        page("main"),
+        page("__read_table_hi"),
+        "main -> hi reader is cross-page"
+    );
 
     // The program must exceed 0x800 words (the whole point of multi-page).
     let total = *addrs.get("__read_table_hi").unwrap() + 6;
-    assert!(total > 0x800, "program is {total} words (must exceed 0x800)");
-    assert!(total < 0x2000, "program fits the 8K-word device flash (0x{total:04X})");
+    assert!(
+        total > 0x800,
+        "program is {total} words (must exceed 0x800)"
+    );
+    assert!(
+        total < 0x2000,
+        "program fits the 8K-word device flash (0x{total:04X})"
+    );
 
     // ---- run the driver and simulate ----
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/multi_page.c", "-o", "tests/fixtures/multi_page.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/multi_page.c",
+            "-o",
+            "tests/fixtures/multi_page.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/multi_page.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);

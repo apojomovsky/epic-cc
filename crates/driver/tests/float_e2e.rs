@@ -66,7 +66,11 @@ fn float_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -96,10 +100,20 @@ fn float_runs_correctly() {
     let out3_addr = *layout.globals.get("out3").expect("out3 global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/float.c", "-o", "tests/fixtures/float.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/float.c",
+            "-o",
+            "tests/fixtures/float.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/float.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -114,7 +128,11 @@ fn float_runs_correctly() {
     for i in 0..4 {
         got1[i] = p.ram()[out1_addr + i];
     }
-    assert_eq!(got1, f32_bytes(3.0 / 2.5), "out1 == 3.0/2.5 = 1.2 = 0x3F99999A");
+    assert_eq!(
+        got1,
+        f32_bytes(3.0 / 2.5),
+        "out1 == 3.0/2.5 = 1.2 = 0x3F99999A"
+    );
     let mut got2 = [0u8; 4];
     for i in 0..4 {
         got2[i] = p.ram()[out2_addr + i];
@@ -128,6 +146,10 @@ fn float_runs_correctly() {
     for i in 0..4 {
         got3[i] = p.ram()[out3_addr + i];
     }
-    assert_eq!(got3, f32_bytes(1.0 / 3.0), "out3 == 1.0/3.0 = 0x3EAAAAAB (RNE)");
+    assert_eq!(
+        got3,
+        f32_bytes(1.0 / 3.0),
+        "out3 == 1.0/3.0 = 0x3EAAAAAB (RNE)"
+    );
     assert!(p.halted());
 }
