@@ -99,7 +99,3 @@ fn three_chunk_const_tables_run_correctly() {
     assert_eq!(read_le4(p.ram(), o16_2) & 0xFFFF, 0x1100, "o16_2 == 0x1100 (i16 chunk 2, scale-2 hi-byte carry)");
     assert!(p.halted());
 }
-
-fn read_le16(ram: &[u8], addr: usize) -> u16 {
-    u16::from_le_bytes([ram[addr], ram[addr + 1]])
-}

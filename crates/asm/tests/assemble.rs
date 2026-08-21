@@ -126,7 +126,7 @@ fn panics_when_program_exceeds_device_flash() {
     // 0x000-0x1FFF); a program whose highest word address is ≥ 0x2000 (8K
     // words) cannot be stored and must panic loudly. `nop` is 0x0000 (to_hex
     // would trim it) but the bound assert fires before rendering.
-    let mut src = String::from("    org 0x2000\n    nop\n    end\n");
+    let src = String::from("    org 0x2000\n    nop\n    end\n");
     let _ = assemble_file_to_hex(&device::PIC16F877A, &src);
 }
 

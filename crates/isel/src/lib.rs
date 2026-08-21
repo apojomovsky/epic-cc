@@ -738,7 +738,7 @@ impl<'m> Gen<'m> {
         // GOTO l_done`: W holds the in-chunk index (the PCLATH set's
         // MOVLW clobbers it, reloaded from the lo temp); the returned byte
         // survives the restore via the hi temp.
-        let mut chunk_call = |g: &mut Self, c: usize, l_done: &str| {
+        let chunk_call = |g: &mut Self, c: usize, l_done: &str| {
             let e = entry(c);
             g.emit(format!("    MOVLW PAGE({e})"));
             g.emit("    MOVWF PCLATH".to_string());
@@ -753,7 +753,7 @@ impl<'m> Gen<'m> {
         // (`MOVLW 0x100-c; ADDWF scratch,W` sets C iff scratch >= c). Each
         // test branches to the c-th chunk's call; the fall-through after the
         // lowest test is chunk 0's call, and every call lands on `l_done`.
-        let mut emit_chain = |g: &mut Self, l_done: &str| {
+        let emit_chain = |g: &mut Self, l_done: &str| {
             let mut l_calls: Vec<(String, usize)> = Vec::new();
             for c in (1..disp).rev() {
                 let l = g.fresh_label();
@@ -2926,7 +2926,6 @@ impl<'m> Gen<'m> {
         // its value is frac x 2^-149 = frac x 2^(1-127-23), so the
         // alignment treats it as exp 1 with the raw fraction (no implicit
         // bit). ±0 (exp 0, fraction 0) stays exp 0.
-        let l_den = self.fresh_label();
         let l_den_done = self.fresh_label();
         self.emit(format!("    MOVF 0x{exp:02X}, W"));
         self.emit("    BTFSS STATUS, 2".to_string());
@@ -4063,7 +4062,7 @@ impl<'m> Gen<'m> {
         let l_norm_a_done = self.fresh_label();
         let l_norm_b = self.fresh_label();
         let l_norm_b_done = self.fresh_label();
-        let l_ehi_B = self.fresh_label();
+        let l_ehi_b = self.fresh_label();
         let l_ehi_done = self.fresh_label();
         let l_a_not_ff = self.fresh_label();
         let l_a_inf = self.fresh_label();
@@ -4112,12 +4111,12 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{e:02X}"));
         self.emit("    MOVLW 0x00".to_string());
         self.emit("    BTFSS STATUS, 0".to_string());
-        self.emit(format!("    GOTO {l_ehi_B}"));
+        self.emit(format!("    GOTO {l_ehi_b}"));
         self.emit(format!("    BTFSC 0x{rem3:02X}, 0"));
         self.emit(format!("    GOTO {l_ehi_done}"));
         self.emit("    MOVLW 0x01".to_string());
         self.emit(format!("    GOTO {l_ehi_done}"));
-        self.emit(format!("{l_ehi_B}:"));
+        self.emit(format!("{l_ehi_b}:"));
         self.emit(format!("    BTFSS 0x{rem3:02X}, 0"));
         self.emit(format!("    GOTO {l_ehi_done}"));
         self.emit("    MOVLW 0xFF".to_string());
@@ -5323,7 +5322,7 @@ pub fn verify_page_fit(m: &Module, asm: &str) {
     }
     let mut org = 0usize;
     let mut cur: Option<(String, usize)> = None;
-    let mut check = |name: &str, s: usize, e: usize| {
+    let check = |name: &str, s: usize, e: usize| {
         if e <= s {
             return; // empty extent (a label with no words before the next target)
         }
