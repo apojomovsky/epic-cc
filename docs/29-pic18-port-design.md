@@ -252,37 +252,31 @@ not a judgement.
 | **P7** | **DONE** Soft-float: nine f32 routines via `MULWF`/`TBLRD`/`isr` save area. | `float.c` (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) |
 | **P8** | **DONE** Fuzz gate: device-threaded differential runner on PIC18. | `pic18.rs` fast (8) and full corpora (200, 50, 50) clean on `Pic18` via `--device` |
 
-**P3 note (2026-08-20):** landed per
-[`docs/superpowers/plans/2026-08-20-pic18-port-p3.md`](superpowers/plans/2026-08-20-pic18-port-p3.md).
+**P3 note (2026-08-20):** landed 2026-08-20 (see [ADR-009](adr/ADR-009-pic18-pointer-model.md)).
 `ptr_probe.c` as originally listed bundles a RAM pointer with a `const`-flash
 table read; since `TBLRD` is P4's job, P3 used a substitute
 `ptr_probe_pic18.c` (RAM pointer only) and the original file's full parity
 becomes a P4 acceptance addition once `TBLRD` lands.
 
-**P4 note (2026-08-20):** landed per
-[`docs/superpowers/plans/2026-08-20-pic18-port-p4.md`](superpowers/plans/2026-08-20-pic18-port-p4.md),
-closing the P3 note: the ORIGINAL `ptr_probe.c` (RAM pointer + `const` read)
-now runs on PIC18 via `TBLRD` (ADR-010). `const` reads are linear
+**P4 note (2026-08-20):** landed 2026-08-20, closing the P3 note: the ORIGINAL
+`ptr_probe.c` (RAM pointer + `const` read) now runs on PIC18 via `TBLRD`
+([ADR-010](adr/ADR-010-pic18-const-tblrd.md)). `const` reads are linear
 byte-packed flash reads through `TBLPTR`/`TABLAT`; the PIC14 `RETLW`
 chunk machinery (256-byte windows, 511-byte ceiling) is not ported, so the
 ceiling stops existing. `const_table.c` (300 bytes) passes with its PIC14
 expected value.
-
-**P5 note (2026-08-20):** landed per
-[`docs/superpowers/plans/2026-08-20-pic18-port-p5.md`](superpowers/plans/2026-08-20-pic18-port-p5.md).
-The "interrupt priority" open question from §7 is settled by
-[ADR-013](adr/ADR-013-pic18-interrupts.md): v1 targets the single-vector
-compatibility mode (IPEN=0, one handler at `0x0008`, GIE-gated), the same
-model PIC14's fixtures exercise; two-vector priority mode stays a
-documented follow-up. The fixtures are PIC14's `interrupt.c`/`interrupt_gate.c`
+**P5 note (2026-08-20):** landed 2026-08-20. The "interrupt priority" open
+question from §7 is settled by [ADR-013](adr/ADR-013-pic18-interrupts.md): v1
+targets the single-vector compatibility mode (IPEN=0, one handler at `0x0008`,
+GIE-gated), the same model PIC14's fixtures exercise; two-vector priority mode
+stays a documented follow-up. The fixtures are PIC14's `interrupt.c`/`interrupt_gate.c`
 with the SFR addresses changed (PORTB 0x06→0xF81, INTCON 0x0B→0xFF2);
 `interrupt_mul.c` needs `*`/`/` and moves to P6. The shared ISR plumbing
 (`Func.isr`, legalize duplication, alloc's disjoint ISR region) is reused
 from PIC14 M13 unchanged.
 
-**P6 note (2026-08-20):** landed per
-[`docs/superpowers/plans/2026-08-20-pic18-port-p6.md`](superpowers/plans/2026-08-20-pic18-port-p6.md).
-The i32 surface and the runtime routine recipes land together (ADR-014):
+**P6 note (2026-08-20):** landed 2026-08-20. The i32 surface and the runtime
+routine recipes land together ([ADR-014](adr/ADR-014-pic18-hw-arithmetic-routines.md)):
 `long.c` (0x1634943A), `muldiv.c` (210), and P5's deferred
 `interrupt_mul_pic18.c` (main + ISR both reach `__mul_u8`/`__udiv_u8`, the
 `_isr` copies get disjoint frames) all pass on the `Pic18` simulator, with
@@ -290,18 +284,16 @@ a `gpasm -p p18f4550` byte-for-byte cross-check on the `long.c` asm. The
 muls use hardware `MULWF` schoolbook partials (no shift-add loop); the
 divmod/shift loops are branch-based with no single-GPR-bank constraint.
 
-**P7 note (2026-08-20):** landed per
-[`docs/superpowers/plans/2026-08-20-pic18-port-p7.md`](superpowers/plans/2026-08-20-pic18-port-p7.md).
-The nine f32 soft-float routines land together (ADR-015): `float.c`
+**P7 note (2026-08-20):** landed 2026-08-20. The nine f32 soft-float routines
+land together ([ADR-015](adr/ADR-015-pic18-softfloat.md)): `float.c`
 (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) passes on the `Pic18`
 simulator with a `gpasm -p p18f4550` byte-for-byte cross-check. The
 recipes are a 1:1 port of PIC14's verified ieee754 bodies with the
 substitution table (RLF to RLCF, STATUS to 0xFD8, etc.); the frame rule is
 every routine slot at `<=0x5F` (access-bank GPR, no MOVLB in skip windows).
 
-**P8 note (2026-08-21):** landed per
-[`docs/superpowers/plans/2026-08-20-pic18-port-p8.md`](superpowers/plans/2026-08-20-pic18-port-p8.md)
-(ADR-016). The differential fuzzer is threaded for PIC18: `run_differential`
+**P8 note (2026-08-21):** landed 2026-08-21 ([ADR-016](adr/ADR-016-pic18-fuzz-gate.md)).
+The differential fuzzer is threaded for PIC18: `run_differential`
 and `run_ir_differential` take a `&Device`, `run_pic`/`pic_layout`/`run_ir_pic`
 dispatch `Pic18` + `parse_hex_pic18` + 4096-byte RAM vs `Pic14`, driver
 gains `--device`/`PIC8_DEVICE`, and `crates/fuzz/tests/pic18.rs` gates the
