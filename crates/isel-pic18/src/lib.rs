@@ -324,6 +324,88 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
                 }
             }
+            Val::Reg(r)
+                if self
+                    .resolved
+                    .contains_key(&iselcore::ssa_key(self.cur_func, r)) =>
+            {
+                let (base, k, terms) = self
+                    .resolved
+                    .get(&iselcore::ssa_key(self.cur_func, r))
+                    .cloned()
+                    .unwrap();
+                let sa = match &base {
+                    iselcore::Base::Slot(sname, false)
+                        if self
+                            .m
+                            .funcs
+                            .iter()
+                            .find(|f| f.name == self.cur_func)
+                            .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
+                            .unwrap_or(false) =>
+                    {
+                        self.slot_addr(self.cur_func, sname).direct()
+                    }
+                    other => {
+                        panic!("isel-pic18: cannot materialize GEP over {other:?} in move to slot")
+                    }
+                };
+                let adds_in_byte0 = k != 0 || !terms.is_empty();
+                assert!(
+                    k == 0 || terms.is_empty(),
+                    "isel-pic18: GEP with both k and terms not supported in move"
+                );
+                for i in 0..ty.bytes() {
+                    match terms.as_slice() {
+                        [] => {
+                            if i == 0 {
+                                let (a, f) = self.operand(sa);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                if k != 0 {
+                                    self.emit(format!("    ADDLW 0x{k:02X}"));
+                                }
+                            } else {
+                                let (a, f) = self.operand(sa + 1);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                if adds_in_byte0 {
+                                    self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                }
+                            }
+                            let (a, f) = self.operand(dst + u16::from(i));
+                            let bank = if a == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                        }
+                        [(1, reg)] => {
+                            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                            let (ra_a, ra_f) = self.operand(ra);
+                            let ra_bank = if ra_a == 0 { "A" } else { "B" };
+                            let ra1 = ra + 1;
+                            let (ra1_a, ra1_f) = self.operand(ra1);
+                            let ra1_bank = if ra1_a == 0 { "A" } else { "B" };
+                            if i == 0 {
+                                let (a, f) = self.operand(sa);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                            } else {
+                                let (a, f) = self.operand(sa + 1);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                                self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                            }
+                            let (a, f) = self.operand(dst + u16::from(i));
+                            let bank = if a == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                        }
+                        _ => panic!("isel-pic18: multi-term GEP move with {terms:?} not supported"),
+                    }
+                }
+            }
             _ => {
                 let src = self.val_addr(val).direct();
                 for i in 0..ty.bytes() {
@@ -1594,7 +1676,97 @@ impl<'m> Gen<'m> {
                 let byte = ((*k >> (u32::from(offset) * 8)) & 0xFF) as u8;
                 self.emit(format!("    MOVLW 0x{byte:02X}"));
             }
-            _ => {
+            Val::Reg(r) => {
+                if false {
+                    let keys: Vec<_> = self
+                        .resolved
+                        .keys()
+                        .filter(|k| k.starts_with(self.cur_func))
+                        .collect();
+                    panic!("debug keys for {}: {:?}", self.cur_func, keys);
+                }
+                if let Some((base, k, terms)) = self
+                    .resolved
+                    .get(&iselcore::ssa_key(self.cur_func, r))
+                    .cloned()
+                {
+                    // GEP pointer value materialization for returns and scalar
+                    // pointer copies. Mirrors PIC14's emit_load_byte GEP arm
+                    // but using PIC18 status at 0xFD8. Only pointer-param bases
+                    // are needed for the string.h pointer-returning helpers;
+                    // literal bases are left as loud panics for now.
+                    let sa = match &base {
+                        iselcore::Base::Slot(sname, false)
+                            if self
+                                .m
+                                .funcs
+                                .iter()
+                                .find(|f| f.name == self.cur_func)
+                                .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
+                                .unwrap_or(false) =>
+                        {
+                            self.slot_addr(self.cur_func, sname).direct()
+                        }
+                        other => {
+                            panic!("isel-pic18: cannot take the value of a GEP over {other:?}")
+                        }
+                    };
+                    let adds_in_byte0 = k != 0 || !terms.is_empty();
+                    assert!(
+                        k == 0 || terms.is_empty(),
+                        "isel-pic18: GEP with both a constant offset and dynamic terms loses the term's carry; not supported"
+                    );
+                    match terms.as_slice() {
+                        [] => {
+                            if offset == 0 {
+                                let (a, f) = self.operand(sa);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                if k != 0 {
+                                    self.emit(format!("    ADDLW 0x{k:02X}"));
+                                }
+                            } else {
+                                let (a, f) = self.operand(sa + 1);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                if adds_in_byte0 {
+                                    self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                }
+                            }
+                            return;
+                        }
+                        [(1, reg)] => {
+                            let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                            let (ra_a, ra_f) = self.operand(ra);
+                            let ra_bank = if ra_a == 0 { "A" } else { "B" };
+                            let ra1 = ra + 1;
+                            let (ra1_a, ra1_f) = self.operand(ra1);
+                            let ra1_bank = if ra1_a == 0 { "A" } else { "B" };
+                            if offset == 0 {
+                                let (a, f) = self.operand(sa);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                            } else {
+                                let (a, f) = self.operand(sa + 1);
+                                let bank = if a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                                self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                                self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                            }
+                            return;
+                        }
+                        _ => panic!("isel-pic18: multi-term GEP load with {terms:?} not supported"),
+                    }
+                }
+                let addr = self.val_addr(v).direct() + u16::from(offset);
+                let (a, f) = self.operand(addr);
+                let bank = if a == 0 { "A" } else { "B" };
+                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+            }
+            Val::Global(_g) => {
                 let addr = self.val_addr(v).direct() + u16::from(offset);
                 let (a, f) = self.operand(addr);
                 let bank = if a == 0 { "A" } else { "B" };
@@ -4105,6 +4277,7 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
         .map(|(dst, ty, val)| {
             let da = g.slot_addr(g.cur_func, dst).direct();
             let src = match val {
+                Val::Reg(r) if g.resolved.contains_key(&iselcore::ssa_key(g.cur_func, r)) => None,
                 Val::Reg(r) => Some(g.slot_addr(g.cur_func, r).direct()),
                 _ => None,
             };

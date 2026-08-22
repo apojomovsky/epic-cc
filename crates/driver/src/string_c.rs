@@ -8,14 +8,14 @@
 pub const STRING_C: &str = r#"#include <stddef.h>
 #include <string.h>
 
-void *memcpy(void *dest, const void *src, size_t n) {
+__attribute__((noinline)) void *memcpy(void *dest, const void *src, size_t n) {
     unsigned char *d = (unsigned char*)dest;
     const unsigned char *s = (const unsigned char*)src;
     for (size_t i = 0; i < n; i++) d[i] = s[i];
     return dest;
 }
 
-void *memmove(void *dest, const void *src, size_t n) {
+__attribute__((noinline)) void *memmove(void *dest, const void *src, size_t n) {
     unsigned char *d = (unsigned char*)dest;
     const unsigned char *s = (const unsigned char*)src;
     if (n == 0) return dest;
@@ -28,13 +28,13 @@ void *memmove(void *dest, const void *src, size_t n) {
     return dest;
 }
 
-void *memset(void *s, int c, size_t n) {
+__attribute__((noinline)) void *memset(void *s, int c, size_t n) {
     unsigned char *p = (unsigned char*)s;
     for (size_t i = 0; i < n; i++) p[i] = (unsigned char)c;
     return s;
 }
 
-int memcmp(const void *s1, const void *s2, size_t n) {
+__attribute__((noinline)) int memcmp(const void *s1, const void *s2, size_t n) {
     const unsigned char *p1 = (const unsigned char*)s1;
     const unsigned char *p2 = (const unsigned char*)s2;
     for (size_t i = 0; i < n; i++) {
@@ -43,33 +43,33 @@ int memcmp(const void *s1, const void *s2, size_t n) {
     return 0;
 }
 
-size_t strlen(const char *s) {
+__attribute__((noinline)) size_t strlen(const char *s) {
     size_t i = 0;
     while (s[i]) i++;
     return i;
 }
 
-size_t strnlen(const char *s, size_t maxlen) {
+__attribute__((noinline)) size_t strnlen(const char *s, size_t maxlen) {
     size_t i = 0;
     while (i < maxlen && s[i]) i++;
     return i;
 }
 
-char *strcpy(char *dest, const char *src) {
+__attribute__((noinline)) char *strcpy(char *dest, const char *src) {
     size_t i = 0;
     while (src[i]) { dest[i] = src[i]; i++; }
     dest[i] = 0;
     return dest;
 }
 
-char *strncpy(char *dest, const char *src, size_t n) {
+__attribute__((noinline)) char *strncpy(char *dest, const char *src, size_t n) {
     size_t i = 0;
     while (i < n && src[i]) { dest[i] = src[i]; i++; }
     while (i < n) { dest[i] = 0; i++; }
     return dest;
 }
 
-char *strcat(char *dest, const char *src) {
+__attribute__((noinline)) char *strcat(char *dest, const char *src) {
     size_t d = 0;
     while (dest[d]) d++;
     size_t i = 0;
@@ -78,7 +78,7 @@ char *strcat(char *dest, const char *src) {
     return dest;
 }
 
-char *strncat(char *dest, const char *src, size_t n) {
+__attribute__((noinline)) char *strncat(char *dest, const char *src, size_t n) {
     size_t d = 0;
     while (dest[d]) d++;
     size_t i = 0;
@@ -87,13 +87,13 @@ char *strncat(char *dest, const char *src, size_t n) {
     return dest;
 }
 
-int strcmp(const char *s1, const char *s2) {
+__attribute__((noinline)) int strcmp(const char *s1, const char *s2) {
     size_t i = 0;
     while (s1[i] && s1[i] == s2[i]) i++;
     return (int)(unsigned char)s1[i] - (int)(unsigned char)s2[i];
 }
 
-int strncmp(const char *s1, const char *s2, size_t n) {
+__attribute__((noinline)) int strncmp(const char *s1, const char *s2, size_t n) {
     size_t i = 0;
     while (i < n) {
         unsigned char a = (unsigned char)s1[i];
@@ -105,5 +105,45 @@ int strncmp(const char *s1, const char *s2, size_t n) {
     return 0;
 }
 
+__attribute__((noinline)) void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char*)s;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == (unsigned char)c) return (void*)(p + i);
+    }
+    return 0;
+}
+
+__attribute__((noinline)) char *strchr(const char *s, int c) {
+    size_t i = 0;
+    while (1) {
+        unsigned char ch = s[i];
+        if (ch == (unsigned char)c) return (char*)(s + i);
+        if (ch == 0) return 0;
+        i++;
+    }
+}
+
+__attribute__((noinline)) char *strrchr(const char *s, int c) {
+    char *last = 0;
+    size_t i = 0;
+    while (1) {
+        unsigned char ch = s[i];
+        if (ch == 0) break;
+        if (ch == (unsigned char)c) last = (char*)(s + i);
+        i++;
+    }
+    if ((unsigned char)c == 0) return (char*)(s + i);
+    return last;
+}
+
+__attribute__((noinline)) char *strstr(const char *haystack, const char *needle) {
+    size_t nlen = strlen(needle);
+    if (nlen == 0) return (char*)haystack;
+    for (size_t i = 0; haystack[i]; i++) {
+        if (haystack[i] == needle[0] && memcmp(haystack + i, needle, nlen) == 0)
+            return (char*)(haystack + i);
+    }
+    return 0;
+}
 
 "#;

@@ -2013,9 +2013,10 @@ impl<'m> Gen<'m> {
                 MemLen::Reg(v) => self.emit_memcpy_dynamic(&m.dst, &m.src, v),
             },
             Inst::Bin(b) => {
-                assert!(b.ty != Ty::I1, "isel: only i8/i16/i32 binops supported");
+                assert!(b.ty != Ty::I1 || matches!(b.op, BinOp::And | BinOp::Or | BinOp::Xor), "isel: only i8/i16/i32 binops supported (and i1 And/Or/Xor)");
+                let b_ty = if b.ty == Ty::I1 { Ty::I8 } else { b.ty };
                 let da = self.slot_addr(self.cur_func, &b.dst).direct();
-                match (b.op, b.ty) {
+                match (b.op, b_ty) {
                     (BinOp::Add, Ty::I16) => self.emit_add16(&b.a, &b.b, da),
                     (BinOp::Add, Ty::I32) => self.emit_add32(&b.a, &b.b, da),
                     (BinOp::Add, Ty::I8) => {
