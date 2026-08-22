@@ -56,5 +56,9 @@ fn pic18f4550_reserves_retval_and_isr_save_regions() {
     assert_eq!(PIC18F4550.gpr_start(), 0x0010);
     assert_eq!(PIC18F4550.region_for(0x0010), Some((0x0010, 0x07FF)));
     assert_eq!(PIC18F4550.region_for(0x07FF), Some((0x0010, 0x07FF)));
-    assert_eq!(PIC18F4550.region_for(0x0800), None, "past the implemented GPR range");
+    assert_eq!(
+        PIC18F4550.region_for(0x0800),
+        None,
+        "past the implemented GPR range"
+    );
 }

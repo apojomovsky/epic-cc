@@ -231,7 +231,10 @@ impl<'m> Gen<'m> {
                         }
                         let ptr = &operands[idx].ptr;
                         let addr = if let Some(g) = ptr.strip_prefix('@') {
-                            *self.addrs.get(g).unwrap_or_else(|| panic!("isel: no address for @{g}"))
+                            *self
+                                .addrs
+                                .get(g)
+                                .unwrap_or_else(|| panic!("isel: no address for @{g}"))
                         } else if let Some(r) = ptr.strip_prefix('%') {
                             self.slot_addr(self.cur_func, r).direct()
                         } else {

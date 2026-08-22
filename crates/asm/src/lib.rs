@@ -59,7 +59,10 @@ pub fn assemble(src: &str) -> Vec<u16> {
         }
         if let Some(eq) = line.find(" equ ") {
             let (name, val) = line.split_at(eq);
-            symbols.insert(name.trim().to_string(), parse_num(val[" equ ".len()..].trim()));
+            symbols.insert(
+                name.trim().to_string(),
+                parse_num(val[" equ ".len()..].trim()),
+            );
             continue;
         }
         // `.align N`: pad with NOP words (zeros) to the next N-word
@@ -187,7 +190,10 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         }
         if let Some(eq) = line.find(" equ ") {
             let (name, val) = line.split_at(eq);
-            symbols.insert(name.trim().to_string(), parse_num(val[" equ ".len()..].trim()));
+            symbols.insert(
+                name.trim().to_string(),
+                parse_num(val[" equ ".len()..].trim()),
+            );
             continue;
         }
         if line.to_ascii_lowercase().starts_with("db ") {
@@ -247,9 +253,16 @@ fn parse_d_bit(rest: &str) -> u16 {
 /// instruction's own BYTE address (matching `symbols`, which `assemble_pic18`
 /// also stores as byte addresses); the relative-branch/`GOTO`/`CALL` arms
 /// divide by 2 to get the *word* address/offset the ISA's `k`/`n` fields need.
-fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<String, usize>) -> Vec<u16> {
+fn encode_pic18(
+    addr: usize,
+    line: &str,
+    symbols: &std::collections::HashMap<String, usize>,
+) -> Vec<u16> {
     let mut it = line.splitn(2, char::is_whitespace);
-    let mne = it.next().expect("asm: empty instruction line").to_ascii_uppercase();
+    let mne = it
+        .next()
+        .expect("asm: empty instruction line")
+        .to_ascii_uppercase();
     let rest = it.next().unwrap_or("").trim();
     let ops: Vec<&str> = rest.split(',').map(str::trim).collect();
     match mne.as_str() {
@@ -347,7 +360,11 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
         "SLEEP" => vec![0x0003],
         "RESET" => vec![0x00FF],
         "RETFIE" | "RETURN" => {
-            let s: u16 = if rest.eq_ignore_ascii_case("FAST") { 1 } else { 0 };
+            let s: u16 = if rest.eq_ignore_ascii_case("FAST") {
+                1
+            } else {
+                0
+            };
             let base: u16 = if mne == "RETFIE" { 0x0010 } else { 0x0012 };
             vec![base | s]
         }
@@ -398,7 +415,10 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
                 .get(rest)
                 .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
             let k = (target >> 1) as u32; // byte address -> word address
-            vec![0xEF00 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
+            vec![
+                0xEF00 | (k & 0xFF) as u16,
+                0xF000 | ((k >> 8) & 0xFFF) as u16,
+            ]
         }
         "CALL" => {
             let (label, fast) = match ops.as_slice() {
@@ -411,7 +431,10 @@ fn encode_pic18(addr: usize, line: &str, symbols: &std::collections::HashMap<Str
                 .unwrap_or_else(|| panic!("asm(pic18): undefined label {label}"));
             let k = (target >> 1) as u32; // byte address -> word address
             let s: u16 = if fast { 1 } else { 0 };
-            vec![0xEC00 | s << 8 | (k & 0xFF) as u16, 0xF000 | ((k >> 8) & 0xFFF) as u16]
+            vec![
+                0xEC00 | s << 8 | (k & 0xFF) as u16,
+                0xF000 | ((k >> 8) & 0xFFF) as u16,
+            ]
         }
         "LFSR" => {
             let fsr: u16 = ops[0]
@@ -535,7 +558,11 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
     // Destination bit for the two-operand file ops (`f, W` / `f, F`): W = 0,
     // F = 1. An absent destination defaults to W, matching the encoding this
     // assembler always produced before destinations were parsed.
-    let d = match parts.get(2).map(|s| s.trim().to_ascii_uppercase()).as_deref() {
+    let d = match parts
+        .get(2)
+        .map(|s| s.trim().to_ascii_uppercase())
+        .as_deref()
+    {
         Some("F") => 1,
         _ => 0,
     };
@@ -592,7 +619,11 @@ pub fn to_hex(words: &[u16]) -> String {
     // gpasm emits a leading 04 extended-linear-address record (upper 16 bits = 0).
     hex.push_str(":020000040000FA\n");
     // trim trailing zeros to the highest set word
-    let hi = words.iter().rposition(|&w| w != 0).map(|i| i + 1).unwrap_or(0);
+    let hi = words
+        .iter()
+        .rposition(|&w| w != 0)
+        .map(|i| i + 1)
+        .unwrap_or(0);
     let mut addr = 0usize;
     while addr < hi {
         // gpasm chunks at 16 data bytes (8 words) per record.
@@ -603,7 +634,12 @@ pub fn to_hex(words: &[u16]) -> String {
             body[2 * i + 1] = ((w >> 8) & 0xFF) as u8;
         }
         let byte_addr = addr * 2;
-        let mut rec = vec![(2 * n) as u8, (byte_addr >> 8) as u8, (byte_addr & 0xFF) as u8, 0x00];
+        let mut rec = vec![
+            (2 * n) as u8,
+            (byte_addr >> 8) as u8,
+            (byte_addr & 0xFF) as u8,
+            0x00,
+        ];
         rec.extend_from_slice(&body);
         let sum: u16 = rec.iter().map(|&b| b as u16).sum();
         rec.push((0x100 - (sum & 0xFF)) as u8);
@@ -628,14 +664,25 @@ pub fn to_hex_regions(chunks: &[(u32, &[u16])]) -> String {
     for &(base_byte_addr, words) in chunks {
         let upper = base_byte_addr >> 16;
         if current_upper != Some(upper) {
-            let rec = [0x02, 0x00, 0x00, 0x04, (upper >> 8) as u8, (upper & 0xFF) as u8];
+            let rec = [
+                0x02,
+                0x00,
+                0x00,
+                0x04,
+                (upper >> 8) as u8,
+                (upper & 0xFF) as u8,
+            ];
             hex.push_str(&hex_record(&rec));
             current_upper = Some(upper);
         }
         // Trim trailing zero words per chunk, matching `to_hex`'s own tail
         // trim. Config chunks are all 0xFF-erased (word 0xFFFF), so they are
         // never trimmed; only a program image's zero tail is.
-        let hi = words.iter().rposition(|&w| w != 0).map(|i| i + 1).unwrap_or(0);
+        let hi = words
+            .iter()
+            .rposition(|&w| w != 0)
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let mut addr = 0usize;
         while addr < hi {
             let n = (hi - addr).min(8);
@@ -645,7 +692,12 @@ pub fn to_hex_regions(chunks: &[(u32, &[u16])]) -> String {
                 body[2 * i + 1] = ((w >> 8) & 0xFF) as u8;
             }
             let byte_addr = (base_byte_addr as usize & 0xFFFF) + addr * 2;
-            let mut rec = vec![(2 * n) as u8, (byte_addr >> 8) as u8, (byte_addr & 0xFF) as u8, 0x00];
+            let mut rec = vec![
+                (2 * n) as u8,
+                (byte_addr >> 8) as u8,
+                (byte_addr & 0xFF) as u8,
+                0x00,
+            ];
             rec.extend_from_slice(&body);
             hex.push_str(&hex_record(&rec));
             addr += n;

@@ -38,7 +38,11 @@ fn compile_fixture() -> (alloc::AllocLayout, String) {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -98,7 +102,10 @@ fn isr_gets_its_own_multiply_routine_with_a_disjoint_frame() {
 #[test]
 fn both_routine_copies_emit_their_own_body() {
     let (_layout, asm) = compile_fixture();
-    assert!(asm.contains("__mul_u8:"), "main's routine body is missing:\n{asm}");
+    assert!(
+        asm.contains("__mul_u8:"),
+        "main's routine body is missing:\n{asm}"
+    );
     assert!(
         asm.contains("__mul_u8_isr:"),
         "the ISR routine copy must emit its own body:\n{asm}"
@@ -115,7 +122,9 @@ fn both_routine_copies_emit_their_own_body() {
 /// and a truncated comparison would miss the retval store at the end.
 fn body_of(asm: &str, label: &str) -> Vec<String> {
     let mut lines = asm.lines().skip_while(|l| l.trim() != format!("{label}:"));
-    lines.next().unwrap_or_else(|| panic!("no @{label} in the emitted asm"));
+    lines
+        .next()
+        .unwrap_or_else(|| panic!("no @{label} in the emitted asm"));
     let mut body = Vec::new();
     for l in lines {
         let t = l.trim();
@@ -199,7 +208,10 @@ fn each_isr_routine_copy_matches_its_original_body() {
         .filter_map(|l| l.trim().strip_suffix(':').map(str::to_string))
         .filter(|l| l.starts_with("__") && l.ends_with("_isr"))
         .collect();
-    assert!(!copies.is_empty(), "the fixture must produce at least one _isr routine copy");
+    assert!(
+        !copies.is_empty(),
+        "the fixture must produce at least one _isr routine copy"
+    );
     // The fixture is written to exercise the name-discriminating recipes,
     // so the divide copy must actually be among them.
     assert!(
@@ -225,13 +237,28 @@ fn the_program_still_computes_mains_results() {
     // A no-interrupt sanity run: the duplication must not disturb the
     // ordinary path. in_a = 47, in_b = 5 -> out = 235, out_q = 9.
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/interrupt_mul.c", "-o", "tests/fixtures/interrupt_mul.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/interrupt_mul.c",
+            "-o",
+            "tests/fixtures/interrupt_mul.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let (layout, _asm) = compile_fixture();
-    let addr = |g: &str| *layout.globals.get(g).unwrap_or_else(|| panic!("no global {g}")) as usize;
+    let addr = |g: &str| {
+        *layout
+            .globals
+            .get(g)
+            .unwrap_or_else(|| panic!("no global {g}")) as usize
+    };
 
     let hex = std::fs::read_to_string("tests/fixtures/interrupt_mul.hex").unwrap();
     let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
@@ -240,6 +267,14 @@ fn the_program_still_computes_mains_results() {
     p.run(500_000);
     assert!(p.halted(), "program must SLEEP-halt");
     assert_eq!(p.ram()[addr("out")], 235, "out == 47 * 5");
-    assert_eq!(p.ram()[addr("out_q")], 9, "out_q == 47 / 5 (the remainder would be 2)");
-    assert_eq!(p.ram()[addr("isr_out")], 0, "the ISR never ran, so isr_out stays 0");
+    assert_eq!(
+        p.ram()[addr("out_q")],
+        9,
+        "out_q == 47 / 5 (the remainder would be 2)"
+    );
+    assert_eq!(
+        p.ram()[addr("isr_out")],
+        0,
+        "the ISR never ran, so isr_out stays 0"
+    );
 }

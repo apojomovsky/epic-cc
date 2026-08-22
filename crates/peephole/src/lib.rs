@@ -123,7 +123,10 @@ fn is_label(line: &str) -> bool {
 }
 
 fn movlw_operand(line: &str) -> &str {
-    line.trim_start().strip_prefix("MOVLW").unwrap_or(line).trim()
+    line.trim_start()
+        .strip_prefix("MOVLW")
+        .unwrap_or(line)
+        .trim()
 }
 
 /// Normalize an operand for equality: numeric literals to `0xXX` hex, so
@@ -139,10 +142,7 @@ fn canonical_literal(operand: &str) -> String {
 }
 
 fn parse_literal(s: &str) -> Option<u16> {
-    if let Some(hex) = s
-        .strip_prefix("0x")
-        .or_else(|| s.strip_prefix("0X"))
-    {
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         u16::from_str_radix(hex, 16).ok()
     } else {
         s.parse::<u16>().ok()

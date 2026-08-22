@@ -30,7 +30,11 @@ fn the_instruction_at_the_injection_point_is_not_skipped() {
     assert_eq!(p.pc(), 4, "the vector is word 4");
     p.run(100);
     assert!(p.halted());
-    assert_eq!(p.ram()[0x20], 0x01, "the MOVWF at the injection pc must still run");
+    assert_eq!(
+        p.ram()[0x20],
+        0x01,
+        "the MOVWF at the injection pc must still run"
+    );
 }
 
 #[test]
@@ -42,8 +46,15 @@ fn a_masked_request_stays_pending_until_gie_is_set() {
     let pc_before = p.pc();
     p.request_interrupt();
     assert_eq!(p.pc(), pc_before, "a masked request must not vector");
-    assert_ne!(p.ram()[INTCON] & INTF, 0, "the request sets the source flag");
-    assert!(p.interrupt_pending(), "the request stays pending while masked");
+    assert_ne!(
+        p.ram()[INTCON] & INTF,
+        0,
+        "the request sets the source flag"
+    );
+    assert!(
+        p.interrupt_pending(),
+        "the request stays pending while masked"
+    );
 
     // Unmasking takes it at the next step boundary.
     p.ram_mut()[INTCON] |= GIE;
@@ -61,7 +72,11 @@ fn a_request_with_the_source_disabled_stays_pending() {
     let pc_before = p.pc();
     p.request_interrupt();
     p.step();
-    assert_ne!(p.pc(), 4, "the source is disabled, so the interrupt is not taken");
+    assert_ne!(
+        p.pc(),
+        4,
+        "the source is disabled, so the interrupt is not taken"
+    );
     assert!(p.interrupt_pending(), "it stays pending");
     assert!(p.pc() > pc_before, "and the program keeps running");
 }
@@ -101,6 +116,9 @@ fn a_pending_request_does_not_re_enter_the_handler() {
     p.ram_mut()[INTCON] = GIE | INTE;
     p.request_interrupt();
     p.run(200);
-    assert!(p.halted(), "the program must reach SLEEP, not loop in the handler");
+    assert!(
+        p.halted(),
+        "the program must reach SLEEP, not loop in the handler"
+    );
     assert_eq!(p.ram()[0x20], 0x01, "and it still does its work");
 }

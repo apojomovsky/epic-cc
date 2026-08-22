@@ -29,7 +29,11 @@ fn scalar_hex_matches_gpasm_and_runs() {
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/scalar_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator: in = 7 -> out = 174 (hand-computed,

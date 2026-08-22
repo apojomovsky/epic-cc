@@ -89,7 +89,10 @@ mod tests {
         let dir = fake_bundle("bundled");
         let (clang, resdir) = resolve_clang(&HashMap::new(), &dir).unwrap();
         assert_eq!(clang, dir.join("clang").join("bin").join("clang"));
-        assert_eq!(resdir, dir.join("clang").join("lib").join("clang").join("20"));
+        assert_eq!(
+            resdir,
+            dir.join("clang").join("lib").join("clang").join("20")
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

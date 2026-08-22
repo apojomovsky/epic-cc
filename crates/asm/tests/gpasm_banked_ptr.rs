@@ -28,11 +28,21 @@ fn banked_ptr_hex_matches_gpasm_and_runs() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::write(format!("{dir}/banked_ptr_ours.hex"), &ours).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", "banked_ptr.asm", "-o", "banked_ptr_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            "banked_ptr.asm",
+            "-o",
+            "banked_ptr_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/banked_ptr_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator: in = 3 -> out = 0xB8 (hand-computed,
@@ -40,6 +50,10 @@ fn banked_ptr_hex_matches_gpasm_and_runs() {
     let mut p = Pic14::new(parse_hex(&ours));
     p.ram_mut()[0x20] = 3; // in low byte = 3 (high byte stays 0)
     p.run(2_000_000);
-    assert_eq!(p.ram()[0x1B0], 0xB8, "out == hand-computed 0xB8 for in == 3");
+    assert_eq!(
+        p.ram()[0x1B0],
+        0xB8,
+        "out == hand-computed 0xB8 for in == 3"
+    );
     assert!(p.halted());
 }

@@ -56,7 +56,11 @@ fn banked_ptr_pipeline() -> (alloc::AllocLayout, String) {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -102,16 +106,30 @@ fn banked_ptr_runs_correctly() {
     let in_addr = *layout.globals.get("in").expect("in global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/banked_ptr.c", "-o", "tests/fixtures/banked_ptr.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/banked_ptr.c",
+            "-o",
+            "tests/fixtures/banked_ptr.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/banked_ptr.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
     let mut p = pic14_sim::Pic14::new(prog);
     p.ram_mut()[in_addr] = 3; // in low byte = 3 (high byte stays 0)
     p.run(2_000_000);
-    assert_eq!(p.ram()[out_addr], 0xB8, "out == hand-computed 0xB8 for in == 3");
+    assert_eq!(
+        p.ram()[out_addr],
+        0xB8,
+        "out == hand-computed 0xB8 for in == 3"
+    );
     assert!(p.halted());
 }

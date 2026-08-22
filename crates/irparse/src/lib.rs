@@ -10,8 +10,12 @@
 //! structurally malformed input, panics loudly rather than silently
 //! misparsing.
 
+use ir::{
+    Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin,
+    FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, MemLen, Memcpy, Module,
+    Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext,
+};
 use std::collections::{HashMap, HashSet};
-use ir::{Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin, FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, Memcpy, MemLen, Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext};
 
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
@@ -34,9 +38,9 @@ fn strip_attrs(s: &str) -> String {
             continue;
         }
         match tok {
-            "noundef" | "nsw" | "nuw" | "nneg" | "samesign" | "volatile" | "tail" | "fastcc" | "inbounds"
-            | "dso_local" | "local_unnamed_addr" | "internal" | "unnamed_addr" | "zeroext"
-            | "signext" | "disjoint" | "nusw" | "inrange" => continue,
+            "noundef" | "nsw" | "nuw" | "nneg" | "samesign" | "volatile" | "tail" | "fastcc"
+            | "inbounds" | "dso_local" | "local_unnamed_addr" | "internal" | "unnamed_addr"
+            | "zeroext" | "signext" | "disjoint" | "nusw" | "inrange" => continue,
             _ => {}
         }
         if !out.is_empty() {
@@ -289,7 +293,10 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
 /// padding, but missing trailing fields decode as zeros for robustness.
 fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
     let inner = brace_inner(ty).expect("literal struct type must be `{ ... }`");
-    let ty_fields: Vec<&str> = split_top_level(inner, ',').into_iter().map(|s| s.trim()).collect();
+    let ty_fields: Vec<&str> = split_top_level(inner, ',')
+        .into_iter()
+        .map(|s| s.trim())
+        .collect();
     let (size, _) = literal_ty_size_align(ty, types);
     let mut blob = vec![0u8; size as usize];
     if init.starts_with("zeroinitializer") {
@@ -297,7 +304,10 @@ fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
     }
     let v_inner = brace_inner(init)
         .unwrap_or_else(|| panic!("SPIKE LIMIT: struct initializer {init:?} for type {ty:?}"));
-    let values: Vec<&str> = split_top_level(v_inner, ',').into_iter().map(|s| s.trim()).collect();
+    let values: Vec<&str> = split_top_level(v_inner, ',')
+        .into_iter()
+        .map(|s| s.trim())
+        .collect();
     assert!(
         values.len() <= ty_fields.len(),
         "SPIKE LIMIT: struct initializer {init:?} has more values than type {ty:?} has fields"
@@ -368,7 +378,10 @@ fn unescape_llvm_asm(s: &str) -> String {
             } else if i + 1 < b.len() && b[i + 1] == b'"' {
                 out.push('"');
                 i += 2;
-            } else if i + 2 < b.len() && (b[i + 1] as char).is_ascii_hexdigit() && (b[i + 2] as char).is_ascii_hexdigit() {
+            } else if i + 2 < b.len()
+                && (b[i + 1] as char).is_ascii_hexdigit()
+                && (b[i + 2] as char).is_ascii_hexdigit()
+            {
                 let hi = (b[i + 1] as char).to_digit(16).unwrap();
                 let lo = (b[i + 2] as char).to_digit(16).unwrap();
                 let byte = ((hi << 4) | lo) as u8;
@@ -467,13 +480,19 @@ fn func_is_naked(header_suffix: &str, attr_map: &HashMap<String, String>) -> boo
     let tokens: Vec<&str> = header_suffix.split_whitespace().collect();
     for tok in tokens {
         if tok.starts_with('#') {
-            let key = tok.trim_end_matches(|c| c == ',' || c == '{' || c == '}').to_string();
+            let key = tok
+                .trim_end_matches(|c| c == ',' || c == '{' || c == '}')
+                .to_string();
             for k in key.split(',') {
                 let k = k.trim();
                 if k.is_empty() {
                     continue;
                 }
-                let k = if k.starts_with('#') { k.to_string() } else { format!("#{k}") };
+                let k = if k.starts_with('#') {
+                    k.to_string()
+                } else {
+                    format!("#{k}")
+                };
                 if let Some(inner) = attr_map.get(&k) {
                     for w in inner.split(|c: char| !c.is_alphanumeric() && c != '_') {
                         if w == "naked" {
@@ -598,7 +617,11 @@ type StructTypes = HashMap<String, StructInfo>;
 
 fn round_up(x: u16, align: u8) -> u16 {
     let a = u16::from(align);
-    if a == 0 { x } else { ((x + a - 1) / a) * a }
+    if a == 0 {
+        x
+    } else {
+        ((x + a - 1) / a) * a
+    }
 }
 
 /// Size and alignment of an LLVM type string, for structs already resolved.
@@ -613,7 +636,9 @@ fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
         let (es, ea) = ty_size_align(elem, types);
         (n * es, ea)
     } else if let Some(n) = t.strip_prefix('%') {
-        let info = types.get(n).unwrap_or_else(|| panic!("irparse: unknown struct type {t}"));
+        let info = types
+            .get(n)
+            .unwrap_or_else(|| panic!("irparse: unknown struct type {t}"));
         (u16::from(info.size), info.align)
     } else if t.starts_with('{') {
         // Literal struct type (`{ i8, i8, i16 }`): layout by the same
@@ -662,13 +687,22 @@ fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> 
     for f in fields {
         let (fsize, falign) = ty_size_align_opt(f, types)?;
         off = round_up(off, falign);
-        assert!(off <= 255, "irparse: struct field offset {off} exceeds 255 (byte-addressed)");
+        assert!(
+            off <= 255,
+            "irparse: struct field offset {off} exceeds 255 (byte-addressed)"
+        );
         off += fsize;
         max_align = max_align.max(falign);
     }
     let size = round_up(off, max_align);
-    assert!(size <= 255, "irparse: struct size {size} exceeds 255 (byte-addressed)");
-    Some(StructInfo { size: size as u8, align: max_align })
+    assert!(
+        size <= 255,
+        "irparse: struct size {size} exceeds 255 (byte-addressed)"
+    );
+    Some(StructInfo {
+        size: size as u8,
+        align: max_align,
+    })
 }
 
 /// Collect `%struct.X = type { ... }` declarations into a resolved size/
@@ -680,10 +714,19 @@ fn build_struct_table(src: &str) -> StructTypes {
         if let Some(rest) = l.strip_prefix("%struct.") {
             let eq = rest.find('=').unwrap();
             let name = format!("struct.{}", rest[..eq].trim());
-            let ty_str = rest[eq + 1..].trim().strip_prefix("type ").expect("struct decl must be 'type {...}'");
-            assert!(ty_str.starts_with('{'), "irparse: expected struct type, got {ty_str:?}");
+            let ty_str = rest[eq + 1..]
+                .trim()
+                .strip_prefix("type ")
+                .expect("struct decl must be 'type {...}'");
+            assert!(
+                ty_str.starts_with('{'),
+                "irparse: expected struct type, got {ty_str:?}"
+            );
             let inner = brace_inner(ty_str).expect("struct type must have balanced braces");
-            let fields: Vec<String> = split_top_level(inner, ',').iter().map(|s| s.trim().to_string()).collect();
+            let fields: Vec<String> = split_top_level(inner, ',')
+                .iter()
+                .map(|s| s.trim().to_string())
+                .collect();
             decls.push((name, fields));
         }
     }
@@ -704,7 +747,10 @@ fn build_struct_table(src: &str) -> StructTypes {
         }
     }
     for (name, _) in &decls {
-        assert!(types.contains_key(name), "irparse: struct {name} unresolved (cycle?)");
+        assert!(
+            types.contains_key(name),
+            "irparse: struct {name} unresolved (cycle?)"
+        );
     }
     types
 }
@@ -725,7 +771,11 @@ impl Fresh {
             while i < bytes.len() {
                 if bytes[i] == b'%' {
                     let mut j = i + 1;
-                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'.') {
+                    while j < bytes.len()
+                        && (bytes[j].is_ascii_alphanumeric()
+                            || bytes[j] == b'_'
+                            || bytes[j] == b'.')
+                    {
                         j += 1;
                     }
                     if j > i + 1 {
@@ -754,14 +804,28 @@ impl Fresh {
 /// Parse one call/function pointer operand that may be an inlined GEP:
 /// `ptr @g` / `ptr %r` -> a plain `Val`; `ptr getelementptr ...` ->
 /// materialize a Gep inst and return its fresh reg.
-fn parse_call_ptr_val(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec<Inst>) -> Val {
-    let b = arg.trim().strip_prefix("ptr").map(|x| x.trim()).unwrap_or(arg.trim());
+fn parse_call_ptr_val(
+    arg: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+) -> Val {
+    let b = arg
+        .trim()
+        .strip_prefix("ptr")
+        .map(|x| x.trim())
+        .unwrap_or(arg.trim());
     if b.contains("getelementptr") {
         let gpos = b.find("getelementptr").unwrap();
         let gsrc = &b[gpos + "getelementptr".len()..];
         let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
         let n = fresh.reg();
-        out.push(Inst::Gep(Gep { dst: n.clone(), base, k, terms }));
+        out.push(Inst::Gep(Gep {
+            dst: n.clone(),
+            base,
+            k,
+            terms,
+        }));
         Val::Reg(n)
     } else {
         parse_val(b.split_whitespace().last().unwrap())
@@ -772,12 +836,24 @@ fn parse_call_ptr_val(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &m
 /// that gets materialized as a fresh Gep inst, or an `inttoptr (<ty> <k> to
 /// ptr)` constant pointer). Returns `"@name"`, `"%name"`, or the literal ptr
 /// form `"0x<K>"` (SFR access — distinct from `@global`/`%reg`).
-fn parse_ptr_operand(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec<Inst>) -> String {
-    let b = arg.trim().strip_prefix("ptr").map(|x| x.trim()).unwrap_or(arg.trim());
+fn parse_ptr_operand(
+    arg: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+) -> String {
+    let b = arg
+        .trim()
+        .strip_prefix("ptr")
+        .map(|x| x.trim())
+        .unwrap_or(arg.trim());
     if b.starts_with("inttoptr") {
         // inttoptr (<ty> <k> to ptr) -> literal ptr form "0x<K>"
-        let open = b.find('(').unwrap_or_else(|| panic!("irparse: malformed inttoptr {b:?}"));
-        let inner = balanced_inner(&b[open + 1..]).unwrap_or_else(|| panic!("irparse: unbalanced inttoptr parens in {b:?}"));
+        let open = b
+            .find('(')
+            .unwrap_or_else(|| panic!("irparse: malformed inttoptr {b:?}"));
+        let inner = balanced_inner(&b[open + 1..])
+            .unwrap_or_else(|| panic!("irparse: unbalanced inttoptr parens in {b:?}"));
         let mut prev = "";
         let mut k = None;
         for t in inner.split_whitespace() {
@@ -805,7 +881,12 @@ fn parse_ptr_operand(arg: &str, types: &StructTypes, fresh: &mut Fresh, out: &mu
         let gsrc = &b["getelementptr".len()..];
         let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
         let n = fresh.reg();
-        out.push(Inst::Gep(Gep { dst: n.clone(), base, k, terms }));
+        out.push(Inst::Gep(Gep {
+            dst: n.clone(),
+            base,
+            k,
+            terms,
+        }));
         format!("%{n}")
     } else {
         let tok = b.split_whitespace().next().unwrap();
@@ -889,7 +970,10 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
         }
         cur = next;
     }
-    assert!(k >= 0 && k <= 255, "irparse: gep byte offset {k} out of range");
+    assert!(
+        k >= 0 && k <= 255,
+        "irparse: gep byte offset {k} out of range"
+    );
     (k as u8, terms)
 }
 
@@ -898,7 +982,12 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
 /// `[4 x i8], ptr %1, i16 0, i16 %2`, scalar sources, reg/global bases, and
 /// chained (inlined) bases. Strips its own `inbounds`/`nuw`/`nusw`/`inrange`
 /// attrs. Runs on the RAW source (never `strip_attrs`).
-fn parse_gep_expr(src: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec<Inst>) -> (GepBase, u8, Vec<(u8, String)>) {
+fn parse_gep_expr(
+    src: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+) -> (GepBase, u8, Vec<(u8, String)>) {
     let mut s = src.trim();
     loop {
         let t = s.split_whitespace().next().unwrap_or("");
@@ -909,12 +998,21 @@ fn parse_gep_expr(src: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut V
         }
     }
     let (source_ty, base_part, index_parts) = if let Some(rest) = s.strip_prefix('(') {
-        let inner = balanced_inner(rest).unwrap_or_else(|| panic!("irparse: unbalanced gep parens in {src:?}"));
+        let inner = balanced_inner(rest)
+            .unwrap_or_else(|| panic!("irparse: unbalanced gep parens in {src:?}"));
         let parts = split_top_level(inner, ',');
-        (parts[0].trim().to_string(), parts[1].trim().to_string(), parts[2..].to_vec())
+        (
+            parts[0].trim().to_string(),
+            parts[1].trim().to_string(),
+            parts[2..].to_vec(),
+        )
     } else {
         let parts = split_top_level(s, ',');
-        (parts[0].trim().to_string(), parts[1].trim().to_string(), parts[2..].to_vec())
+        (
+            parts[0].trim().to_string(),
+            parts[1].trim().to_string(),
+            parts[2..].to_vec(),
+        )
     };
     let base = parse_base(&base_part, types, fresh, out);
     let (k, terms) = fold_gep(&source_ty, &index_parts, types);
@@ -923,8 +1021,17 @@ fn parse_gep_expr(src: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut V
 
 /// Parse a GEP base operand: `ptr @g`, `ptr %r`, or a chained inlined GEP
 /// (materialized as a fresh Gep inst, base = its reg).
-fn parse_base(base_part: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec<Inst>) -> GepBase {
-    let b = base_part.trim().strip_prefix("ptr").map(|x| x.trim()).unwrap_or(base_part.trim());
+fn parse_base(
+    base_part: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+) -> GepBase {
+    let b = base_part
+        .trim()
+        .strip_prefix("ptr")
+        .map(|x| x.trim())
+        .unwrap_or(base_part.trim());
     if let Some(g) = b.strip_prefix('@') {
         GepBase::Global(g.to_string())
     } else if let Some(r) = b.strip_prefix('%') {
@@ -933,7 +1040,12 @@ fn parse_base(base_part: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut
         let inner_src = &b["getelementptr".len()..];
         let (ibase, ik, iterms) = parse_gep_expr(inner_src, types, fresh, out);
         let n = fresh.reg();
-        out.push(Inst::Gep(Gep { dst: n.clone(), base: ibase, k: ik, terms: iterms }));
+        out.push(Inst::Gep(Gep {
+            dst: n.clone(),
+            base: ibase,
+            k: ik,
+            terms: iterms,
+        }));
         GepBase::Reg(n)
     } else {
         panic!("irparse: bad gep base {base_part:?}");
@@ -945,12 +1057,21 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
     let a = a.trim();
     if a.contains("getelementptr") {
         let ty_tok = a.split_whitespace().next().unwrap();
-        let ty = if ty_tok == "ptr" { None } else { Some(ty_of(ty_tok)) };
+        let ty = if ty_tok == "ptr" {
+            None
+        } else {
+            Some(ty_of(ty_tok))
+        };
         let gpos = a.find("getelementptr").unwrap();
         let gsrc = &a[gpos + "getelementptr".len()..];
         let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
         let n = fresh.reg();
-        out.push(Inst::Gep(Gep { dst: n.clone(), base, k, terms }));
+        out.push(Inst::Gep(Gep {
+            dst: n.clone(),
+            base,
+            k,
+            terms,
+        }));
         // The attr prefix before the inlined GEP can carry byval/sret
         // (`ptr ... byval(%struct.S) align 2 getelementptr ...` — clang's
         // shape for passing a struct element by value). Preserve them or
@@ -960,15 +1081,20 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
         for t in tokenize_parens(&a[..gpos]) {
             if let Some(rest) = t.strip_prefix("byval(") {
                 let inner = rest.trim_end_matches(')');
-                let info = types.get(inner.trim_start_matches('%')).unwrap_or_else(|| {
-                    panic!("irparse: unknown byval type {inner}")
-                });
+                let info = types
+                    .get(inner.trim_start_matches('%'))
+                    .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
                 byval = Some(info.size);
             } else if t.starts_with("sret(") {
                 sret = true;
             }
         }
-        CallArg { ty, val: Val::Reg(n), byval, sret }
+        CallArg {
+            ty,
+            val: Val::Reg(n),
+            byval,
+            sret,
+        }
     } else {
         let toks = tokenize_parens(a);
         let mut ty = None;
@@ -990,7 +1116,9 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                 _ => {
                     if let Some(rest) = t.strip_prefix("byval(") {
                         let inner = rest.trim_end_matches(')');
-                        let info = types.get(inner.trim_start_matches('%')).unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
+                        let info = types
+                            .get(inner.trim_start_matches('%'))
+                            .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
                         byval = Some(info.size);
                     } else if t.starts_with("sret(") {
                         sret = true;
@@ -1002,7 +1130,8 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                         val_tok = Some(t.clone());
                     } else if t.parse::<i64>().is_ok() {
                         val_tok = Some(t.clone());
-                    } else if t.parse::<f32>().is_ok() || t.starts_with("0x") || t.starts_with("0X") {
+                    } else if t.parse::<f32>().is_ok() || t.starts_with("0x") || t.starts_with("0X")
+                    {
                         // an f32 constant (decimal `5.000000e-01` or hex bit
                         // pattern `0x3F800000`) — parse_val materializes the bits.
                         val_tok = Some(t.clone());
@@ -1010,7 +1139,12 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                 }
             }
         }
-        CallArg { ty: ty.clone(), val: parse_val_typed(&val_tok.expect("call arg must carry a value"), ty), byval, sret }
+        CallArg {
+            ty: ty.clone(),
+            val: parse_val_typed(&val_tok.expect("call arg must carry a value"), ty),
+            byval,
+            sret,
+        }
     }
 }
 
@@ -1039,7 +1173,9 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
             _ => {
                 if let Some(rest) = t.strip_prefix("byval(") {
                     let inner = rest.trim_end_matches(')');
-                    let info = types.get(inner.trim_start_matches('%')).unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
+                    let info = types
+                        .get(inner.trim_start_matches('%'))
+                        .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
                     byval = Some(info.size);
                 } else if t.starts_with("sret(") {
                     sret = true;
@@ -1070,7 +1206,13 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
     // No scalar type token and no byval/sret attribute means a plain `ptr`:
     // its slot holds an address, which `width` alone cannot distinguish.
     let ptr = scalar.is_none() && byval.is_none() && !sret;
-    Param { name, width, byval, sret, ptr }
+    Param {
+        name,
+        width,
+        byval,
+        sret,
+        ptr,
+    }
 }
 
 /// Parse `.ll` text into canonical IR.
@@ -1129,8 +1271,8 @@ pub fn parse_ll(src: &str) -> Module {
             };
             let rest = rest.trim();
             let (ty, size, bytes) = if rest.starts_with('[') {
-                let close = matching_bracket(rest)
-                    .expect("array global type must have balanced brackets");
+                let close =
+                    matching_bracket(rest).expect("array global type must have balanced brackets");
                 let inner = &rest[1..close];
                 let mut pit = inner.splitn(2, 'x').map(|s| s.trim());
                 let n: usize = pit.next().unwrap().parse().unwrap();
@@ -1139,9 +1281,15 @@ pub fn parse_ll(src: &str) -> Module {
                     let (es, _) = literal_ty_size_align(elem_str, &types);
                     let size = n * es as usize;
                     if is_const {
-                        assert!(size <= 65535, "irparse: const array @{name} too large ({size} bytes; max 65535)");
+                        assert!(
+                            size <= 65535,
+                            "irparse: const array @{name} too large ({size} bytes; max 65535)"
+                        );
                     } else {
-                        assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
+                        assert!(
+                            size <= 255,
+                            "irparse: array @{name} too large ({size} bytes)"
+                        );
                     }
                     let size = size as u16;
                     let init = rest[close + 1..].trim();
@@ -1155,9 +1303,15 @@ pub fn parse_ll(src: &str) -> Module {
                     let elem = ty_of(elem_str);
                     let size = n * elem.bytes() as usize;
                     if is_const {
-                        assert!(size <= 65535, "irparse: const array @{name} too large ({size} bytes; max 65535)");
+                        assert!(
+                            size <= 65535,
+                            "irparse: const array @{name} too large ({size} bytes; max 65535)"
+                        );
                     } else {
-                        assert!(size <= 255, "irparse: array @{name} too large ({size} bytes)");
+                        assert!(
+                            size <= 255,
+                            "irparse: array @{name} too large ({size} bytes)"
+                        );
                     }
                     let size = size as u16;
                     let init = rest[close + 1..].trim();
@@ -1173,7 +1327,10 @@ pub fn parse_ll(src: &str) -> Module {
                     (elem, size, bytes)
                 }
             } else if rest.starts_with('{') {
-                let close = brace_inner(rest).expect("literal struct type must be `{ ... }`").len() + 1;
+                let close = brace_inner(rest)
+                    .expect("literal struct type must be `{ ... }`")
+                    .len()
+                    + 1;
                 let ty_str = &rest[..close + 1];
                 let (size, _) = literal_ty_size_align(ty_str, &types);
                 let init = rest[close + 1..].trim();
@@ -1183,10 +1340,23 @@ pub fn parse_ll(src: &str) -> Module {
                     decode_typed_value(ty_str, init, &types)
                 };
                 (Ty::I8, size, bytes)
-            } else if let Some(struct_tok) = rest.split_whitespace().next().filter(|t| t.starts_with('%')) {
-                let info = types.get(struct_tok.trim_start_matches('%')).unwrap_or_else(|| panic!("irparse: unknown struct type {struct_tok} for @{name}"));
+            } else if let Some(struct_tok) = rest
+                .split_whitespace()
+                .next()
+                .filter(|t| t.starts_with('%'))
+            {
+                let info = types
+                    .get(struct_tok.trim_start_matches('%'))
+                    .unwrap_or_else(|| {
+                        panic!("irparse: unknown struct type {struct_tok} for @{name}")
+                    });
                 let size = u16::from(info.size);
-                let init = rest[struct_tok.len()..].trim().split(',').next().unwrap().trim();
+                let init = rest[struct_tok.len()..]
+                    .trim()
+                    .split(',')
+                    .next()
+                    .unwrap()
+                    .trim();
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
                 } else {
@@ -1202,10 +1372,18 @@ pub fn parse_ll(src: &str) -> Module {
                 .map(|i| &line[i + "section \".epicat.".len()..])
                 .and_then(|rest| rest.split('"').next())
                 .map(|hex| {
-                    u16::from_str_radix(hex.trim_start_matches("0x"), 16)
-                        .unwrap_or_else(|_| panic!("irparse: bad EPIC_AT address {hex:?} on @{name}"))
+                    u16::from_str_radix(hex.trim_start_matches("0x"), 16).unwrap_or_else(|_| {
+                        panic!("irparse: bad EPIC_AT address {hex:?} on @{name}")
+                    })
                 });
-            globals.push(Global { name, ty, is_const, size, bytes, addr });
+            globals.push(Global {
+                name,
+                ty,
+                is_const,
+                size,
+                bytes,
+                addr,
+            });
             continue;
         }
 
@@ -1217,11 +1395,19 @@ pub fn parse_ll(src: &str) -> Module {
             let head = strip_attrs(&line[..at]);
             let isr = head.split_whitespace().any(|t| t == "msp430_intrcc");
             let ret_tok = head.split_whitespace().last().unwrap().to_string();
-            let ret = if ret_tok == "void" { None } else { Some(ty_of(&ret_tok)) };
+            let ret = if ret_tok == "void" {
+                None
+            } else {
+                Some(ty_of(&ret_tok))
+            };
 
             // naked detection: suffix after `)` up to `{`, plus attribute map
             let close_pos = open + 1 + params_str.len();
-            let suffix_raw = if close_pos + 1 < line.len() { &line[close_pos + 1..] } else { "" };
+            let suffix_raw = if close_pos + 1 < line.len() {
+                &line[close_pos + 1..]
+            } else {
+                ""
+            };
             let suffix = suffix_raw.split('{').next().unwrap_or("").trim();
             let naked = func_is_naked(suffix, &attr_map);
 
@@ -1237,9 +1423,14 @@ pub fn parse_ll(src: &str) -> Module {
             // The unlabelled entry block shares LLVM's unnamed-value counter with
             // the parameters, so it is %N for N unnamed params, not always %0.
             // Phi incomings name it, and the backends key phi copies on the edge.
-            let entry_label = params.iter().filter(|p| p.name.parse::<u32>().is_ok()).count();
-            let mut blocks: Vec<Block> =
-                vec![Block { label: entry_label.to_string(), insts: Vec::new() }];
+            let entry_label = params
+                .iter()
+                .filter(|p| p.name.parse::<u32>().is_ok())
+                .count();
+            let mut blocks: Vec<Block> = vec![Block {
+                label: entry_label.to_string(),
+                insts: Vec::new(),
+            }];
             // Handle single-line function definitions where the body is on the
             // same line as `define`, e.g. `define void @foo() { tail call ... ret void }`.
             // These appear in the Task 2 acceptance tests.
@@ -1300,7 +1491,14 @@ pub fn parse_ll(src: &str) -> Module {
                         handled_inline = true;
                     }
                     if handled_inline {
-                        funcs.push(Func { name, ret, params, blocks, isr, naked });
+                        funcs.push(Func {
+                            name,
+                            ret,
+                            params,
+                            blocks,
+                            isr,
+                            naked,
+                        });
                         continue;
                     }
                 } else {
@@ -1320,8 +1518,16 @@ pub fn parse_ll(src: &str) -> Module {
                     if l != "unreachable" && !l.is_empty() {
                         if let Some(colon) = l.find(':') {
                             let head = &l[..colon];
-                            if !head.is_empty() && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_') && !l.starts_with('%') {
-                                blocks.push(Block { label: head.to_string(), insts: Vec::new() });
+                            if !head.is_empty()
+                                && head
+                                    .chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                                && !l.starts_with('%')
+                            {
+                                blocks.push(Block {
+                                    label: head.to_string(),
+                                    insts: Vec::new(),
+                                });
                             } else {
                                 let insts = parse_inst(l, &types, &mut fresh);
                                 blocks.last_mut().unwrap().insts.extend(insts);
@@ -1362,10 +1568,15 @@ pub fn parse_ll(src: &str) -> Module {
                     if let Some(colon) = l.find(':') {
                         let head = &l[..colon];
                         if !head.is_empty()
-                            && head.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
+                            && head
+                                .chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
                             && !l.starts_with('%')
                         {
-                            blocks.push(Block { label: head.to_string(), insts: Vec::new() });
+                            blocks.push(Block {
+                                label: head.to_string(),
+                                insts: Vec::new(),
+                            });
                             continue;
                         }
                     }
@@ -1375,13 +1586,23 @@ pub fn parse_ll(src: &str) -> Module {
                         break;
                     }
                 }
-                funcs.push(Func { name, ret, params, blocks, isr, naked });
+                funcs.push(Func {
+                    name,
+                    ret,
+                    params,
+                    blocks,
+                    isr,
+                    naked,
+                });
             }
         }
     }
-    Module { globals, funcs, module_asm }
+    Module {
+        globals,
+        funcs,
+        module_asm,
+    }
 }
-
 
 /// Parse a single `.ll` instruction (RAW line; GEPs are never attr-stripped).
 /// Returns a `Vec` because inlined GEP operands materialize a synthetic Gep
@@ -1413,7 +1634,11 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                         .cloned()
                         .collect();
                     if operand_tokens.is_empty() {
-                        return vec![Inst::Asm(Asm { template, clobbers_memory, operands: Vec::new() })];
+                        return vec![Inst::Asm(Asm {
+                            template,
+                            clobbers_memory,
+                            operands: Vec::new(),
+                        })];
                     }
                     // Validate each operand constraint is a `*m` memory form
                     for tok in &operand_tokens {
@@ -1430,7 +1655,15 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                         let mut depth = 0usize;
                         let mut close = None;
                         for (i, c) in after_c[open..].char_indices() {
-                            if c == '(' { depth += 1; } else if c == ')' { depth -= 1; if depth == 0 { close = Some(open + i); break; } }
+                            if c == '(' {
+                                depth += 1;
+                            } else if c == ')' {
+                                depth -= 1;
+                                if depth == 0 {
+                                    close = Some(open + i);
+                                    break;
+                                }
+                            }
                         }
                         let close = close.expect("unbalanced parens in asm args");
                         let args_inner = &after_c[open + 1..close];
@@ -1446,13 +1679,25 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                             // The pointer value is the last `@name` or `%name` token
                             // Args look like `ptr @t`, `ptr %3`, `ptr noundef @g`
                             let ptr = if let Some(at) = a.rfind('@') {
-                                let end = a[at..].find(|c: char| c.is_whitespace() || c == ',' || c == ')').map(|i| at + i).unwrap_or(a.len());
-                                let name = a[at..end].trim().trim_end_matches(|c| c == ',' || c == ')').to_string();
+                                let end = a[at..]
+                                    .find(|c: char| c.is_whitespace() || c == ',' || c == ')')
+                                    .map(|i| at + i)
+                                    .unwrap_or(a.len());
+                                let name = a[at..end]
+                                    .trim()
+                                    .trim_end_matches(|c| c == ',' || c == ')')
+                                    .to_string();
                                 // include @ prefix
                                 name
                             } else if let Some(pc) = a.rfind('%') {
-                                let end = a[pc..].find(|c: char| c.is_whitespace() || c == ',' || c == ')').map(|i| pc + i).unwrap_or(a.len());
-                                let name = a[pc..end].trim().trim_end_matches(|c| c == ',' || c == ')').to_string();
+                                let end = a[pc..]
+                                    .find(|c: char| c.is_whitespace() || c == ',' || c == ')')
+                                    .map(|i| pc + i)
+                                    .unwrap_or(a.len());
+                                let name = a[pc..end]
+                                    .trim()
+                                    .trim_end_matches(|c| c == ',' || c == ')')
+                                    .to_string();
                                 name
                             } else if a.contains("null") || a.contains("zeroinitializer") {
                                 panic!("asm: GEP-derived pointers are not supported; operand derived via getelementptr (only direct globals and locals are allowed)");
@@ -1473,7 +1718,11 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     } else {
                         panic!("asm: missing argument list for operands in {line:?}");
                     }
-                    return vec![Inst::Asm(Asm { template, clobbers_memory, operands })];
+                    return vec![Inst::Asm(Asm {
+                        template,
+                        clobbers_memory,
+                        operands,
+                    })];
                 }
             }
         }
@@ -1494,7 +1743,10 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
     };
     let trimmed = line.trim();
     let (dst, rest) = match trimmed.find(" = ") {
-        Some(i) => (Some(trimmed[..i].trim_start_matches('%').to_string()), trimmed[i + 3..].trim()),
+        Some(i) => (
+            Some(trimmed[..i].trim_start_matches('%').to_string()),
+            trimmed[i + 3..].trim(),
+        ),
         None => (None, trimmed),
     };
 
@@ -1517,23 +1769,38 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         "getelementptr" => {
             let src = rest["getelementptr".len()..].trim();
             let (base, k, terms) = parse_gep_expr(src, types, fresh, &mut out);
-            out.push(Inst::Gep(Gep { dst: dst.unwrap(), base, k, terms }));
+            out.push(Inst::Gep(Gep {
+                dst: dst.unwrap(),
+                base,
+                k,
+                terms,
+            }));
         }
         "alloca" => {
             let after = rest["alloca".len()..].trim();
             let ty_tok = after.split(',').next().unwrap().trim();
             let size = if let Some(n) = ty_tok.strip_prefix('%') {
-                types.get(n).unwrap_or_else(|| panic!("irparse: unknown alloca type {ty_tok}")).size
+                types
+                    .get(n)
+                    .unwrap_or_else(|| panic!("irparse: unknown alloca type {ty_tok}"))
+                    .size
             } else {
                 ty_of(ty_tok).bytes()
             };
-            out.push(Inst::Alloca(Alloca { dst: dst.unwrap(), size }));
+            out.push(Inst::Alloca(Alloca {
+                dst: dst.unwrap(),
+                size,
+            }));
         }
         "load" => {
             let args = split_top_level(&rest["load".len()..], ',');
             let ty = ty_of(strip_attrs(args[0]).trim());
             let ptr = parse_ptr_operand(args[1], types, fresh, &mut out);
-            out.push(Inst::Load(Load { dst: dst.unwrap(), ty, ptr }));
+            out.push(Inst::Load(Load {
+                dst: dst.unwrap(),
+                ty,
+                ptr,
+            }));
         }
         "store" => {
             let args = split_top_level(&rest["store".len()..], ',');
@@ -1548,7 +1815,12 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let body = rest["call".len()..].trim();
             let open = body.find('(').unwrap();
             let head = &body[..open];
-            let func = head.split_whitespace().last().unwrap().trim_start_matches('@').to_string();
+            let func = head
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .trim_start_matches('@')
+                .to_string();
             let args_str = balanced_inner(&body[open + 1..]).unwrap();
             if func.starts_with("llvm.memcpy.p0.p0") {
                 let a = split_top_level(args_str, ',');
@@ -1562,13 +1834,17 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 let len = if let Some(r) = len_tok.strip_prefix('%') {
                     MemLen::Reg(Val::Reg(r.to_string()))
                 } else {
-                    let n: u8 = len_tok.parse().expect("irparse: memcpy const len must be a u8 <= 255");
+                    let n: u8 = len_tok
+                        .parse()
+                        .expect("irparse: memcpy const len must be a u8 <= 255");
                     MemLen::Const(n)
                 };
                 // isvolatile (a[3] = `i1 true`/`i1 false`) is an LLVM
                 // optimization hint; our byte copy is identical either way.
                 out.push(Inst::Memcpy(Memcpy { dst, src, len }));
-            } else if func.starts_with("llvm.lifetime.start") || func.starts_with("llvm.lifetime.end") {
+            } else if func.starts_with("llvm.lifetime.start")
+                || func.starts_with("llvm.lifetime.end")
+            {
                 // lifetime markers produce no IR
             } else {
                 let arg_parts = split_top_level(args_str, ',');
@@ -1582,20 +1858,51 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 }
                 let first = head.trim();
                 let at = first.rfind('@').unwrap();
-                let ret_tok = first[..at].trim().split_whitespace().last().unwrap().to_string();
-                let ty = if ret_tok == "void" { None } else { Some(ty_of(&ret_tok)) };
-                out.push(Inst::Call(Call { dst, ty, func, args }));
+                let ret_tok = first[..at]
+                    .trim()
+                    .split_whitespace()
+                    .last()
+                    .unwrap()
+                    .to_string();
+                let ty = if ret_tok == "void" {
+                    None
+                } else {
+                    Some(ty_of(&ret_tok))
+                };
+                out.push(Inst::Call(Call {
+                    dst,
+                    ty,
+                    func,
+                    args,
+                }));
             }
         }
         "br" => {
             let body = rest["br".len()..].trim();
             if body.starts_with("label") {
-                out.push(Inst::Br(Br { target: body.split_whitespace().nth(1).unwrap().trim_start_matches('%').to_string() }));
+                out.push(Inst::Br(Br {
+                    target: body
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap()
+                        .trim_start_matches('%')
+                        .to_string(),
+                }));
             } else {
                 let parts = split_top_level(body, ',');
                 let cond = parse_val(parts[0].split_whitespace().nth(1).unwrap());
-                let t = parts[1].split_whitespace().nth(1).unwrap().trim_start_matches('%').to_string();
-                let f = parts[2].split_whitespace().nth(1).unwrap().trim_start_matches('%').to_string();
+                let t = parts[1]
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .trim_start_matches('%')
+                    .to_string();
+                let f = parts[2]
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap()
+                    .trim_start_matches('%')
+                    .to_string();
                 out.push(Inst::BrCond(BrCond { cond, t, f }));
             }
         }
@@ -1606,7 +1913,10 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             } else {
                 let mut it = body.split_whitespace();
                 let ty = ty_of(it.next().unwrap());
-                out.push(Inst::Ret(Some((ty, parse_val_typed(it.next().unwrap(), Some(ty))))));
+                out.push(Inst::Ret(Some((
+                    ty,
+                    parse_val_typed(it.next().unwrap(), Some(ty)),
+                ))));
             }
         }
         "phi" => {
@@ -1617,10 +1927,19 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 let inner = part.split(']').next().unwrap();
                 let mut it = inner.split(',');
                 let v = parse_val_typed(it.next().unwrap(), Some(ty));
-                let lbl = it.next().unwrap().trim().trim_start_matches('%').to_string();
+                let lbl = it
+                    .next()
+                    .unwrap()
+                    .trim()
+                    .trim_start_matches('%')
+                    .to_string();
                 incoming.push((v, lbl));
             }
-            out.push(Inst::Phi(Phi { dst: dst.unwrap(), ty, incoming }));
+            out.push(Inst::Phi(Phi {
+                dst: dst.unwrap(),
+                ty,
+                incoming,
+            }));
         }
         "zext" | "sext" | "trunc" => {
             let body = strip_attrs(&rest[op.len()..]);
@@ -1631,21 +1950,46 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let val = parse_val_typed(it.next().unwrap(), Some(from));
             let to = ty_of(rhs);
             match op.as_str() {
-                "zext" => out.push(Inst::Zext(Zext { dst: dst.unwrap(), from, val, to })),
-                "sext" => out.push(Inst::Sext(Sext { dst: dst.unwrap(), from, val, to })),
-                _ => out.push(Inst::Trunc(Trunc { dst: dst.unwrap(), from, val, to })),
+                "zext" => out.push(Inst::Zext(Zext {
+                    dst: dst.unwrap(),
+                    from,
+                    val,
+                    to,
+                })),
+                "sext" => out.push(Inst::Sext(Sext {
+                    dst: dst.unwrap(),
+                    from,
+                    val,
+                    to,
+                })),
+                _ => out.push(Inst::Trunc(Trunc {
+                    dst: dst.unwrap(),
+                    from,
+                    val,
+                    to,
+                })),
             }
         }
         "icmp" => {
             let body = strip_attrs(&rest["icmp".len()..]);
             let mut it = body.split_whitespace();
             let pred = it.next().unwrap().to_string();
-            const PREDS: [&str; 10] = ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"];
-            if !PREDS.contains(&pred.as_str()) { panic!("SPIKE: unsupported icmp predicate {pred:?} in line: {line}"); }
+            const PREDS: [&str; 10] = [
+                "eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge",
+            ];
+            if !PREDS.contains(&pred.as_str()) {
+                panic!("SPIKE: unsupported icmp predicate {pred:?} in line: {line}");
+            }
             let ty = ty_of(it.next().unwrap());
             let a = parse_val_typed(it.next().unwrap(), Some(ty));
             let b = parse_val_typed(it.next().unwrap(), Some(ty));
-            out.push(Inst::Icmp(Icmp { dst: dst.unwrap(), pred, ty, a, b }));
+            out.push(Inst::Icmp(Icmp {
+                dst: dst.unwrap(),
+                pred,
+                ty,
+                a,
+                b,
+            }));
         }
         "select" => {
             let body = rest["select".len()..].trim();
@@ -1655,7 +1999,13 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let ty = ty_of(it1.next().unwrap());
             let a = parse_val_typed(it1.next().unwrap(), Some(ty));
             let b = parse_val_typed(parts[2].split_whitespace().nth(1).unwrap(), Some(ty));
-            out.push(Inst::Select(Select { dst: dst.unwrap(), cond, ty, a, b }));
+            out.push(Inst::Select(Select {
+                dst: dst.unwrap(),
+                cond,
+                ty,
+                a,
+                b,
+            }));
         }
         "add" | "and" | "or" | "xor" | "sub" | "mul" | "udiv" | "urem" | "sdiv" | "srem"
         | "shl" | "lshr" | "ashr" => {
@@ -1679,20 +2029,33 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 "ashr" => BinOp::AShr,
                 _ => BinOp::Sub,
             };
-            out.push(Inst::Bin(Bin { dst: dst.unwrap(), op: o, ty, a, b }));
+            out.push(Inst::Bin(Bin {
+                dst: dst.unwrap(),
+                op: o,
+                ty,
+                a,
+                b,
+            }));
         }
         "freeze" => {
             let body = strip_attrs(&rest[op.len()..]);
             let mut it = body.split_whitespace();
             let ty = ty_of(it.next().unwrap());
             let val = parse_val_typed(it.next().unwrap(), Some(ty));
-            out.push(Inst::Freeze(ir::Freeze { dst: dst.unwrap(), ty, val }));
+            out.push(Inst::Freeze(ir::Freeze {
+                dst: dst.unwrap(),
+                ty,
+                val,
+            }));
         }
         "fadd" | "fsub" | "fmul" | "fdiv" => {
             let body = strip_attrs(&rest[op.len()..]);
             let mut it = body.split_whitespace();
             let ty = ty_of(it.next().unwrap());
-            assert!(ty == Ty::F32, "irparse: float binop {op} must be f32, got {ty:?}");
+            assert!(
+                ty == Ty::F32,
+                "irparse: float binop {op} must be f32, got {ty:?}"
+            );
             let a = parse_val_typed(it.next().unwrap(), Some(ty));
             let b = parse_val_typed(it.next().unwrap(), Some(ty));
             let o = match op.as_str() {
@@ -1701,15 +2064,20 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 "fmul" => FBinOp::FMul,
                 _ => FBinOp::FDiv,
             };
-            out.push(Inst::FloatBin(FloatBin { dst: dst.unwrap(), op: o, a, b }));
+            out.push(Inst::FloatBin(FloatBin {
+                dst: dst.unwrap(),
+                op: o,
+                a,
+                b,
+            }));
         }
         "fcmp" => {
             let body = strip_attrs(&rest["fcmp".len()..]);
             let mut it = body.split_whitespace();
             let pred = it.next().unwrap().to_string();
             const FPREDS: [&str; 16] = [
-                "false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord",
-                "ueq", "ugt", "uge", "ult", "ule", "une", "uno", "true",
+                "false", "oeq", "ogt", "oge", "olt", "ole", "one", "ord", "ueq", "ugt", "uge",
+                "ult", "ule", "une", "uno", "true",
             ];
             if !FPREDS.contains(&pred.as_str()) {
                 panic!("SPIKE: unsupported fcmp predicate {pred:?} in line: {line}");
@@ -1718,11 +2086,18 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             assert!(ty == Ty::F32, "irparse: fcmp must be f32, got {ty:?}");
             let a = parse_val_typed(it.next().unwrap(), Some(ty));
             let b = parse_val_typed(it.next().unwrap(), Some(ty));
-            out.push(Inst::Fcmp(Fcmp { dst: dst.unwrap(), pred, a, b }));
+            out.push(Inst::Fcmp(Fcmp {
+                dst: dst.unwrap(),
+                pred,
+                a,
+                b,
+            }));
         }
         "fptosi" | "fptoui" | "sitofp" | "uitofp" | "fpext" | "fptrunc" => {
             let body = strip_attrs(&rest[op.len()..]);
-            let to_i = body.rfind(" to ").unwrap_or_else(|| panic!("irparse: malformed {op} (missing 'to') in line: {line}"));
+            let to_i = body.rfind(" to ").unwrap_or_else(|| {
+                panic!("irparse: malformed {op} (missing 'to') in line: {line}")
+            });
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
             let mut it = lhs.split_whitespace();
             let from = ty_of(it.next().unwrap());
@@ -1736,7 +2111,13 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 "fpext" => FloatConvOp::Fpext,
                 _ => FloatConvOp::Fptrunc,
             };
-            out.push(Inst::FloatConv(FloatConv { dst: dst.unwrap(), op: o, from, val, to }));
+            out.push(Inst::FloatConv(FloatConv {
+                dst: dst.unwrap(),
+                op: o,
+                from,
+                val,
+                to,
+            }));
         }
         other => panic!("SPIKE LIMIT: unsupported opcode {other:?} in line: {line}"),
     }
@@ -1791,9 +2172,9 @@ pub fn sanitize_symbols(ll: &str) -> String {
         } else {
             let clean = name.replace('.', "_");
             match seen.get(&clean) {
-                Some(prev) if prev != name => panic!(
-                    "irparse: symbols @{prev} and @{name} both sanitize to @{clean}"
-                ),
+                Some(prev) if prev != name => {
+                    panic!("irparse: symbols @{prev} and @{name} both sanitize to @{clean}")
+                }
                 _ => {
                     seen.insert(clean.clone(), name.to_string());
                 }

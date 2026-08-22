@@ -33,7 +33,11 @@ fn structs_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -56,10 +60,20 @@ fn structs_runs_correctly() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/structs.c", "-o", "tests/fixtures/structs.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/structs.c",
+            "-o",
+            "tests/fixtures/structs.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/structs.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);

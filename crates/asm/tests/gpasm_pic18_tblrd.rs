@@ -21,11 +21,21 @@ fn gpasm_cross_check(fixture: &str, src: &str) {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::write(format!("{dir}/{fixture}_ours.hex"), &ours).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p18f4550", &format!("{fixture}.asm"), "-o", &format!("{fixture}_gpasm.hex")])
+        .args([
+            "-p",
+            "p18f4550",
+            &format!("{fixture}.asm"),
+            "-o",
+            &format!("{fixture}_gpasm.hex"),
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/{fixture}_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
 }

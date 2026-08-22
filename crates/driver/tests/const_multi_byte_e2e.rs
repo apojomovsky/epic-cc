@@ -49,7 +49,11 @@ fn multi_byte_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -89,10 +93,20 @@ fn multi_byte_const_tables_run_correctly() {
     let outf2 = a("outf2");
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/const_multi_byte.c", "-o", "tests/fixtures/const_multi_byte.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/const_multi_byte.c",
+            "-o",
+            "tests/fixtures/const_multi_byte.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/const_multi_byte.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -101,13 +115,45 @@ fn multi_byte_const_tables_run_correctly() {
     p.ram_mut()[in_addr + 1] = 0x01;
     p.run(5_000_000);
 
-    assert_eq!(read_le4(p.ram(), out_s16) & 0xFFFF, 0x9ABC, "out_s16 == 0x9ABC (small i16 table)");
-    assert_eq!(read_le4(p.ram(), out_s32), 0x090A0B0C, "out_s32 == 0x090A0B0C (small i32 table)");
-    assert_eq!(read_le4(p.ram(), out_l16) & 0xFFFF, 0x1022, "out_l16 == 0x1022 (i16 chunk 0)");
-    assert_eq!(read_le4(p.ram(), out_l16b) & 0xFFFF, 0x1080, "out_l16b == 0x1080 (i16 chunk 1, scale-2 carry)");
-    assert_eq!(read_le4(p.ram(), out_l32), 0x23242526, "out_l32 == 0x23242526 (i32 chunk 0)");
-    assert_eq!(read_le4(p.ram(), out_l32b), 0x41424344, "out_l32b == 0x41424344 (i32 chunk 1, scale-4 carry)");
-    assert_eq!(read_le4(p.ram(), outf), 0x4059999A, "outf == 3.4f (float chunk 0, f64-narrowed init)");
-    assert_eq!(read_le4(p.ram(), outf2), 0x40CCCCCD, "outf2 == 6.4f (float chunk 1)");
+    assert_eq!(
+        read_le4(p.ram(), out_s16) & 0xFFFF,
+        0x9ABC,
+        "out_s16 == 0x9ABC (small i16 table)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), out_s32),
+        0x090A0B0C,
+        "out_s32 == 0x090A0B0C (small i32 table)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), out_l16) & 0xFFFF,
+        0x1022,
+        "out_l16 == 0x1022 (i16 chunk 0)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), out_l16b) & 0xFFFF,
+        0x1080,
+        "out_l16b == 0x1080 (i16 chunk 1, scale-2 carry)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), out_l32),
+        0x23242526,
+        "out_l32 == 0x23242526 (i32 chunk 0)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), out_l32b),
+        0x41424344,
+        "out_l32b == 0x41424344 (i32 chunk 1, scale-4 carry)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), outf),
+        0x4059999A,
+        "outf == 3.4f (float chunk 0, f64-narrowed init)"
+    );
+    assert_eq!(
+        read_le4(p.ram(), outf2),
+        0x40CCCCCD,
+        "outf2 == 6.4f (float chunk 1)"
+    );
     assert!(p.halted());
 }

@@ -32,7 +32,9 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 
-const LITERAL_OPS: [&str; 7] = ["MOVLW", "ADDLW", "ANDLW", "IORLW", "XORLW", "SUBLW", "RETLW"];
+const LITERAL_OPS: [&str; 7] = [
+    "MOVLW", "ADDLW", "ANDLW", "IORLW", "XORLW", "SUBLW", "RETLW",
+];
 
 /// The skip-conditional ops: the next instruction runs only when the tested
 /// bit/byte is clear/set/zero/nonzero. A banked operand under one of these
@@ -58,7 +60,10 @@ fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
     // separate (`STATUS, 5`); both are the same instruction.
     let (reg, bit) = match toks.get(2) {
         Some(b) => (
-            toks.get(1).copied().unwrap_or("").trim_end_matches([',', ';', ')']),
+            toks.get(1)
+                .copied()
+                .unwrap_or("")
+                .trim_end_matches([',', ';', ')']),
             b.trim_end_matches([',', ';', ')']),
         ),
         None => {
@@ -448,7 +453,8 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
             } else if let Some(target) = toks.get(1) {
                 let callee = target.trim_end_matches([',', ';', ')']);
                 let cur = BankSet::single(u8::from(rp0) | (u8::from(rp1) << 1));
-                let eb = func_exit_bank(device, callee, cur, &call_targets, &regions, &mut exit_memo);
+                let eb =
+                    func_exit_bank(device, callee, cur, &call_targets, &regions, &mut exit_memo);
                 if eb.is_single() {
                     known = true;
                     rp0 = eb.single_bank() & 1 == 1;

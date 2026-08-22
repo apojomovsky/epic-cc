@@ -314,13 +314,33 @@ enum FConvKind {
 /// makes the -0.0 == +0.0 cmp case reachable (in6's single value cannot
 /// be both signs).
 const FCONSTS: &[&str] = &[
-    "0.0f", "-0.0f", "1.0f", "-1.0f", "0.5f", "2.0f", "3.0f", "0.25f", "100.0f", "0.1f",
-    "0.33333334f", "10.0f", "0.75f",
+    "0.0f",
+    "-0.0f",
+    "1.0f",
+    "-1.0f",
+    "0.5f",
+    "2.0f",
+    "3.0f",
+    "0.25f",
+    "100.0f",
+    "0.1f",
+    "0.33333334f",
+    "10.0f",
+    "0.75f",
 ];
 
 /// The divisor pool: FCONSTS minus the zeros.
 const FCONSTS_NONZERO: &[&str] = &[
-    "1.0f", "-1.0f", "0.5f", "2.0f", "3.0f", "0.25f", "100.0f", "0.1f", "0.33333334f", "10.0f",
+    "1.0f",
+    "-1.0f",
+    "0.5f",
+    "2.0f",
+    "3.0f",
+    "0.25f",
+    "100.0f",
+    "0.1f",
+    "0.33333334f",
+    "10.0f",
     "0.75f",
 ];
 
@@ -590,9 +610,8 @@ impl Gen {
             // array/struct in float mode.)
             return 0x70 - self.worst_routine - 0x30;
         }
-        let globals = 0x29
-            + if self.used_array { 8 } else { 0 }
-            + if self.used_struct { 8 } else { 0 };
+        let globals =
+            0x29 + if self.used_array { 8 } else { 0 } + if self.used_struct { 8 } else { 0 };
         0x70 - self.worst_routine - globals
     }
 
@@ -603,9 +622,12 @@ impl Gen {
         let globals = if self.float_mode {
             0x30 // the float-mode globals end (see `frame_budget`)
         } else {
-            0x29
-                + if self.used_array || uses_array { 8 } else { 0 }
-                + if self.used_struct || uses_struct { 8 } else { 0 }
+            0x29 + if self.used_array || uses_array { 8 } else { 0 }
+                + if self.used_struct || uses_struct {
+                    8
+                } else {
+                    0
+                }
         };
         let routine = self.worst_routine.max(routine);
         // The 8-byte safety margin applies to the FILL phase only: the
@@ -645,7 +667,8 @@ impl Gen {
     /// local is single-assignment) + the fold, and return the local name.
     fn push_compute(&mut self, w: u8, expr: String) -> String {
         let t = self.new_local(w);
-        self.body.push(format!("  {ct} {t} = {expr};", ct = ctype(w)));
+        self.body
+            .push(format!("  {ct} {t} = {expr};", ct = ctype(w)));
         self.push_fold(w, &t);
         t
     }
@@ -674,7 +697,13 @@ impl Gen {
 
     fn emit_arith_inner(&mut self, forced: Option<BinOp>) -> bool {
         let r = self.below(100);
-        let mut w = if r < 50 { 8 } else if r < 80 { 16 } else { 32 };
+        let mut w = if r < 50 {
+            8
+        } else if r < 80 {
+            16
+        } else {
+            32
+        };
         let op = match forced {
             Some(op) => op,
             None if w == 32 => match self.below(10) {
@@ -739,7 +768,11 @@ impl Gen {
                 let (l, r_op) = (format!("({}){a}", ctype(w)), format!("({}){b}", ctype(w)));
                 if r < 2 {
                     let c = self.below(u32::from(w));
-                    format!("({ct})({l} {s} {c}u)", ct = ctype(w), s = if matches!(op, BinOp::Shl) { "<<" } else { ">>" })
+                    format!(
+                        "({ct})({l} {s} {c}u)",
+                        ct = ctype(w),
+                        s = if matches!(op, BinOp::Shl) { "<<" } else { ">>" }
+                    )
                 } else {
                     let m = w - 1;
                     format!(
@@ -849,7 +882,9 @@ impl Gen {
         let then = arm(self);
         self.dead.push((self.locals.len() - 1, self.locals.len()));
         let els = arm(self);
-        self.body.push(format!("  if ({cond}) {{\n{then}\n  }} else {{\n{els}\n  }}"));
+        self.body.push(format!(
+            "  if ({cond}) {{\n{then}\n  }} else {{\n{els}\n  }}"
+        ));
         self.dead.push((self.locals.len() - 1, self.locals.len()));
         true
     }
@@ -903,9 +938,7 @@ impl Gen {
         let nops = 1 + self.below(2);
         for _ in 0..nops {
             let op = ["^", "&", "|"][self.below(3) as usize];
-            body.push_str(&format!(
-                "    acc = ({ct})(({ct})acc {op} ({ct})i);\n"
-            ));
+            body.push_str(&format!("    acc = ({ct})(({ct})acc {op} ({ct})i);\n"));
         }
         if self.below(2) == 0 {
             // A masked variable shift (count < width) inside the loop.
@@ -982,9 +1015,11 @@ impl Gen {
         let x = self.operand(16);
         let y = self.operand(8);
         let ix = self.new_local(8);
-        self.body.push(format!("  u8 {ix} = (u8)((u16){x} % {n}u);"));
+        self.body
+            .push(format!("  u8 {ix} = (u8)((u16){x} % {n}u);"));
         self.body.push(format!("  arr[{ix}] = (u8){y};"));
-        self.body.push(format!("  checksum = (u8)(checksum ^ (u8)arr[{ix}]);"));
+        self.body
+            .push(format!("  checksum = (u8)(checksum ^ (u8)arr[{ix}]);"));
         true
     }
 
@@ -1014,7 +1049,8 @@ impl Gen {
         let line = if mode == 0 {
             self.used_fold16 = true;
             self.used_fold32 = true;
-            "  checksum = (u8)(checksum ^ (u8)s.a ^ fold16((u16)s.b) ^ fold32((u32)s.c));".to_string()
+            "  checksum = (u8)(checksum ^ (u8)s.a ^ fold16((u16)s.b) ^ fold32((u32)s.c));"
+                .to_string()
         } else {
             self.used_fold16 = true;
             "  checksum = (u8)(checksum ^ (u8)s.a ^ fold16((u16)s.b) ^ (u8)((u32)s.c >> 24u));"
@@ -1285,7 +1321,8 @@ impl Gen {
     fn fpush_fold(&mut self, t: &str) {
         self.used_fold32 = true;
         self.body.push(format!("  fout = {t};"));
-        self.body.push("  checksum = (u8)(checksum ^ fold32(*(volatile u32*)&fout));".to_string());
+        self.body
+            .push("  checksum = (u8)(checksum ^ fold32(*(volatile u32*)&fout));".to_string());
     }
 
     /// A float arithmetic statement: `float tN = a op b;` folded through the
@@ -1357,7 +1394,9 @@ impl Gen {
         self.frame_est += cost;
         self.worst_routine = self.worst_routine.max(14);
         let rel = ["<", "<=", ">", ">=", "==", "!="][self.below(6) as usize];
-        self.body.push(format!("  checksum = (u8)(checksum ^ (u8)({a} {rel} {b}));"));
+        self.body.push(format!(
+            "  checksum = (u8)(checksum ^ (u8)({a} {rel} {b}));"
+        ));
         true
     }
 
@@ -1440,9 +1479,7 @@ impl Gen {
                 sig.push_str(&format!("{} p{}", ctype(pw), i));
             }
             let name = format!("helper{k}");
-            src.push_str(&format!(
-                "__attribute__((noinline)) u8 {name}({sig}) {{\n"
-            ));
+            src.push_str(&format!("__attribute__((noinline)) u8 {name}({sig}) {{\n"));
             let mut prev: Vec<(String, u8)> = Vec::new();
             // One op PER PARAM first: every param must be referenced in the
             // body, or clang replaces the unused call arg with `poison`
@@ -1614,7 +1651,10 @@ pub fn generate(seed: u64) -> Program {
             is_float: false,
         });
     }
-    decls.push_str(&format!("volatile u8 {checksum};\n", checksum = CHECKSUM_NAME));
+    decls.push_str(&format!(
+        "volatile u8 {checksum};\n",
+        checksum = CHECKSUM_NAME
+    ));
 
     let (helpers, helper_src) = g.emit_helpers();
 
@@ -1791,7 +1831,10 @@ pub fn generate_float(seed: u64) -> Program {
     for n in ["in3", "in6"] {
         decls.push_str(&format!("volatile float {n};\n"));
     }
-    decls.push_str(&format!("volatile u8 {checksum};\n", checksum = CHECKSUM_NAME));
+    decls.push_str(&format!(
+        "volatile u8 {checksum};\n",
+        checksum = CHECKSUM_NAME
+    ));
     decls.push_str("volatile float fout;\n");
 
     // The float statement families: 6 kinds (the fptoui/fptosi conversions
@@ -1961,7 +2004,10 @@ pub fn generate_signed(seed: u64) -> Program {
             is_float: false,
         });
     }
-    decls.push_str(&format!("volatile u8 {checksum};\n", checksum = CHECKSUM_NAME));
+    decls.push_str(&format!(
+        "volatile u8 {checksum};\n",
+        checksum = CHECKSUM_NAME
+    ));
 
     // The forced first statement rotates over the 8 signed families
     // (seed % 8), so the corpus spans the signed surface by construction.
@@ -2490,32 +2536,29 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
             .copied()
             .or_else(|| p.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("unknown panic");
-        Failure::new(FailureKind::Panic, format!("compiler pipeline panic: {msg}"))
+        Failure::new(
+            FailureKind::Panic,
+            format!("compiler pipeline panic: {msg}"),
+        )
     })?;
 
-    let checksum_addr = *layout
-        .globals
-        .get(&prog.checksum_name)
-        .ok_or_else(|| {
-            Failure::new(
-                FailureKind::Compile,
-                format!("no global '{}' in the alloc map", prog.checksum_name),
-            )
-        })?;
+    let checksum_addr = *layout.globals.get(&prog.checksum_name).ok_or_else(|| {
+        Failure::new(
+            FailureKind::Compile,
+            format!("no global '{}' in the alloc map", prog.checksum_name),
+        )
+    })?;
 
     let checksum = match device.core {
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
             for input in &prog.inputs {
-                let addr = *layout
-                    .globals
-                    .get(&input.name)
-                    .ok_or_else(|| {
-                        Failure::new(
-                            FailureKind::Compile,
-                            format!("no global '{}' in the alloc map", input.name),
-                        )
-                    })?;
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
                 seed_le(p.ram_mut(), addr, input.width, input.value);
             }
             p.run(MAX_SIM_STEPS);
@@ -2530,15 +2573,12 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
         device::Core::Pic14 => {
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
             for input in &prog.inputs {
-                let addr = *layout
-                    .globals
-                    .get(&input.name)
-                    .ok_or_else(|| {
-                        Failure::new(
-                            FailureKind::Compile,
-                            format!("no global '{}' in the alloc map", input.name),
-                        )
-                    })?;
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
                 seed_le(p.ram_mut(), addr, input.width, input.value);
             }
             p.run(MAX_SIM_STEPS);
@@ -2557,36 +2597,39 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
 /// PIC side: alloc layout (in-process, mirroring the driver's e2e) for the
 /// input/checksum addresses, the driver binary for the hex, `pic14-sim`
 /// seeded at those addresses, run, checksum read, `halted()` required.
-fn run_pic(program: &Program, c_path: &Path, dir: &WorkDir, device: &device::Device) -> Result<u32, Failure> {
+fn run_pic(
+    program: &Program,
+    c_path: &Path,
+    dir: &WorkDir,
+    device: &device::Device,
+) -> Result<u32, Failure> {
     let layout = pic_layout(c_path, device)?;
-    let checksum_addr = *layout
-        .globals
-        .get(&program.checksum_name)
-        .ok_or_else(|| {
-            Failure::new(
-                FailureKind::Compile,
-                format!("no global '{}' in the alloc map", program.checksum_name),
-            )
-        })?;
+    let checksum_addr = *layout.globals.get(&program.checksum_name).ok_or_else(|| {
+        Failure::new(
+            FailureKind::Compile,
+            format!("no global '{}' in the alloc map", program.checksum_name),
+        )
+    })?;
 
     let hex_path = dir.path.join("prog.hex");
     run_driver(c_path, &hex_path, device)?;
 
-    let hex = std::fs::read_to_string(&hex_path)
-        .map_err(|e| Failure::new(FailureKind::Harness, format!("read {}: {e}", hex_path.display())))?;
+    let hex = std::fs::read_to_string(&hex_path).map_err(|e| {
+        Failure::new(
+            FailureKind::Harness,
+            format!("read {}: {e}", hex_path.display()),
+        )
+    })?;
     let checksum = match device.core {
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
             for input in &program.inputs {
-                let addr = *layout
-                    .globals
-                    .get(&input.name)
-                    .ok_or_else(|| {
-                        Failure::new(
-                            FailureKind::Compile,
-                            format!("no global '{}' in the alloc map", input.name),
-                        )
-                    })?;
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
                 seed_le(p.ram_mut(), addr, input.width, input.value);
             }
             p.run(MAX_SIM_STEPS);
@@ -2601,15 +2644,12 @@ fn run_pic(program: &Program, c_path: &Path, dir: &WorkDir, device: &device::Dev
         device::Core::Pic14 => {
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
             for input in &program.inputs {
-                let addr = *layout
-                    .globals
-                    .get(&input.name)
-                    .ok_or_else(|| {
-                        Failure::new(
-                            FailureKind::Compile,
-                            format!("no global '{}' in the alloc map", input.name),
-                        )
-                    })?;
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
                 seed_le(p.ram_mut(), addr, input.width, input.value);
             }
             p.run(MAX_SIM_STEPS);
@@ -2678,22 +2718,25 @@ fn run_host(program: &Program, c_path: &Path, dir: &WorkDir) -> Result<u32, Fail
     if !out.status.success() {
         return Err(Failure::new(
             FailureKind::Compile,
-            format!("host binary failed: {}", String::from_utf8_lossy(&out.stderr)),
+            format!(
+                "host binary failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ),
         ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let line = stdout
-        .lines()
-        .next()
-        .ok_or_else(|| Failure::new(FailureKind::Compile, "host binary printed nothing".to_string()))?;
-    line.trim()
-        .parse::<u32>()
-        .map_err(|_| {
-            Failure::new(
-                FailureKind::Compile,
-                format!("host binary printed a non-checksum line: {stdout:?}"),
-            )
-        })
+    let line = stdout.lines().next().ok_or_else(|| {
+        Failure::new(
+            FailureKind::Compile,
+            "host binary printed nothing".to_string(),
+        )
+    })?;
+    line.trim().parse::<u32>().map_err(|_| {
+        Failure::new(
+            FailureKind::Compile,
+            format!("host binary printed a non-checksum line: {stdout:?}"),
+        )
+    })
 }
 
 /// The generated `host_main.c`: seeds each input global by name (matching the
@@ -2971,8 +3014,17 @@ fn top_level_operands(expr: &str) -> Vec<String> {
             _ if depth == 0
                 && matches!(
                     bytes[i],
-                    b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^' | b'<' | b'>'
-                        | b'=' | b'!'
+                    b'+' | b'-'
+                        | b'*'
+                        | b'/'
+                        | b'%'
+                        | b'&'
+                        | b'|'
+                        | b'^'
+                        | b'<'
+                        | b'>'
+                        | b'='
+                        | b'!'
                 ) =>
             {
                 let two = bytes.get(i + 1).copied();
@@ -3024,8 +3076,9 @@ pub fn write_fixture(program: &Program) -> Result<PathBuf, String> {
 /// The PIC clang pair (`$PIC8_CLANG_UNWRAPPED` + `$PIC8_CLANG_RESOURCE_DIR`),
 /// which the driver and the in-process layout pipeline both require.
 fn pic_clang() -> Result<(String, String), String> {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED")
-        .map_err(|_| "PIC8_CLANG_UNWRAPPED is not set (run inside the dev container)".to_string())?;
+    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").map_err(|_| {
+        "PIC8_CLANG_UNWRAPPED is not set (run inside the dev container)".to_string()
+    })?;
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").map_err(|_| {
         "PIC8_CLANG_RESOURCE_DIR is not set (run inside the dev container)".to_string()
     })?;
@@ -3062,15 +3115,23 @@ fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayo
         ])
         .arg(c_path)
         .output()
-        .map_err(|e| Failure::new(FailureKind::Harness, format!("run clang for the layout: {e}")))?;
+        .map_err(|e| {
+            Failure::new(
+                FailureKind::Harness,
+                format!("run clang for the layout: {e}"),
+            )
+        })?;
     if !ll.status.success() {
         return Err(Failure::new(
             FailureKind::Compile,
-            format!("clang (layout) failed: {}", String::from_utf8_lossy(&ll.stderr)),
+            format!(
+                "clang (layout) failed: {}",
+                String::from_utf8_lossy(&ll.stderr)
+            ),
         ));
     }
-    let ll_text =
-        String::from_utf8(ll.stdout).map_err(|e| Failure::new(FailureKind::Harness, format!("clang stdout: {e}")))?;
+    let ll_text = String::from_utf8(ll.stdout)
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("clang stdout: {e}")))?;
     std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut m = irparse::parse_ll(&ll_text);
         m = wholeprog::merge(m);
@@ -3084,7 +3145,10 @@ fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayo
             .copied()
             .or_else(|| p.downcast_ref::<String>().map(String::as_str))
             .unwrap_or("unknown panic");
-        Failure::new(FailureKind::Panic, format!("compiler pipeline panic: {msg}"))
+        Failure::new(
+            FailureKind::Panic,
+            format!("compiler pipeline panic: {msg}"),
+        )
     })
 }
 
@@ -3153,14 +3217,19 @@ fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
                 cmd.args(["--profile", &profile]);
             }
         }
-        let status = cmd.status().map_err(|e| format!("cargo build -p driver: {e}"))?;
+        let status = cmd
+            .status()
+            .map_err(|e| format!("cargo build -p driver: {e}"))?;
         if !status.success() {
             return Err("cargo build -p driver failed".into());
         }
         if candidate.exists() {
             Ok(candidate)
         } else {
-            Err(format!("driver binary not found at {}", candidate.display()))
+            Err(format!(
+                "driver binary not found at {}",
+                candidate.display()
+            ))
         }
     }
     static CACHE_P14: OnceLock<Result<PathBuf, String>> = OnceLock::new();
@@ -3177,7 +3246,10 @@ fn run_ok(cmd: &mut Command, what: &str) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!("{what} failed: {}", String::from_utf8_lossy(&out.stderr)))
+        Err(format!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ))
     }
 }
 

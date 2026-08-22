@@ -13,11 +13,21 @@ fn hand_written_pic18_program_matches_gpasm_and_runs_correctly() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::write(format!("{dir}/pic18_acceptance_ours.hex"), &ours).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p18f4550", "pic18_acceptance.asm", "-o", "pic18_acceptance_gpasm.hex"])
+        .args([
+            "-p",
+            "p18f4550",
+            "pic18_acceptance.asm",
+            "-o",
+            "pic18_acceptance_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/pic18_acceptance_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
 
@@ -33,6 +43,14 @@ fn hand_written_pic18_program_matches_gpasm_and_runs_correctly() {
     // 0x24 before SLEEP halts the simulator.
     assert_eq!(p.ram()[0x21], 0, "the loop counter reaches zero");
     assert_eq!(p.ram()[0x23], 10, "double(5) = 10");
-    assert_eq!(p.ram()[0x120], 10, "banked write via MOVLB 1 / MOVWF 0x20,B");
-    assert_eq!(p.ram()[0x24], 10, "W (10) stored to 0x24 right before SLEEP");
+    assert_eq!(
+        p.ram()[0x120],
+        10,
+        "banked write via MOVLB 1 / MOVWF 0x20,B"
+    );
+    assert_eq!(
+        p.ram()[0x24],
+        10,
+        "W (10) stored to 0x24 right before SLEEP"
+    );
 }

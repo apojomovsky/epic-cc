@@ -108,7 +108,12 @@ fn to_gpasm_src(src: &str) -> String {
                     .get(label)
                     .unwrap_or_else(|| panic!("PAGE({label}) label not found"));
                 let lit = (addr >> 11) << 3;
-                rendered = format!("{}{}0x{lit:02X}{}", &rendered[..start], " ", &rendered[start + 5 + end + 1..]);
+                rendered = format!(
+                    "{}{}0x{lit:02X}{}",
+                    &rendered[..start],
+                    " ",
+                    &rendered[start + 5 + end + 1..]
+                );
             }
             out.push(rendered);
             org += 1;
@@ -130,11 +135,21 @@ fn const_multi_byte_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("const_multi_byte_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "const_multi_byte_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "const_multi_byte_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/const_multi_byte_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
 

@@ -44,7 +44,11 @@ fn const_table_layout() -> alloc::AllocLayout {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -67,10 +71,20 @@ fn const_table_reads_past_256_bytes_run_correctly() {
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/const_table.c", "-o", "tests/fixtures/const_table.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/const_table.c",
+            "-o",
+            "tests/fixtures/const_table.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/const_table.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -78,6 +92,10 @@ fn const_table_reads_past_256_bytes_run_correctly() {
     p.ram_mut()[0x20] = 0x22; // in low byte = 290 & 0xFF
     p.ram_mut()[0x21] = 0x01; // in high byte = 290 >> 8
     p.run(200_000);
-    assert_eq!(p.ram()[out_addr], 0x82, "out == 0x82 for in == 290 (chunk-1, chunk-0, chunk-1-last, boundary reads)");
+    assert_eq!(
+        p.ram()[out_addr],
+        0x82,
+        "out == 0x82 for in == 290 (chunk-1, chunk-0, chunk-1-last, boundary reads)"
+    );
     assert!(p.halted());
 }

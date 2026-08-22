@@ -1,5 +1,5 @@
-use driver::fosc::resolve_fosc_hz;
 use device::{PIC16F877A, PIC18F4550};
+use driver::fosc::resolve_fosc_hz;
 
 #[test]
 fn pic14_xt_is_the_crystal_frequency() {

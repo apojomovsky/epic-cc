@@ -18,7 +18,10 @@ pub fn merge(m: Module) -> Module {
 
 fn check_entry(m: &Module) {
     let mains = m.funcs.iter().filter(|f| f.name == "main").count();
-    assert_eq!(mains, 1, "wholeprog: expected exactly one `main`, found {mains}");
+    assert_eq!(
+        mains, 1,
+        "wholeprog: expected exactly one `main`, found {mains}"
+    );
 }
 
 /// `llvm-link` leaves an unsatisfied `declare` in place rather than failing.

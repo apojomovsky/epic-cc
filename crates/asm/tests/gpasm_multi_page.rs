@@ -120,7 +120,12 @@ fn to_gpasm_src(src: &str) -> String {
                     .get(label)
                     .unwrap_or_else(|| panic!("PAGE({label}) label not found"));
                 let lit = (addr >> 11) << 3;
-                rendered = format!("{}{}0x{lit:02X}{}", &rendered[..start], " ", &rendered[start + 5 + end + 1..]);
+                rendered = format!(
+                    "{}{}0x{lit:02X}{}",
+                    &rendered[..start],
+                    " ",
+                    &rendered[start + 5 + end + 1..]
+                );
             }
             out.push(rendered);
             org += 1;
@@ -142,11 +147,21 @@ fn multi_page_hex_matches_gpasm_and_runs() {
     let gpasm_asm = std::env::temp_dir().join("multi_page_gpasm.asm");
     std::fs::write(&gpasm_asm, &gpasm_src).unwrap();
     let out = Command::new(gpasm())
-        .args(["-p", "p16f877a", gpasm_asm.to_str().unwrap(), "-o", "multi_page_gpasm.hex"])
+        .args([
+            "-p",
+            "p16f877a",
+            gpasm_asm.to_str().unwrap(),
+            "-o",
+            "multi_page_gpasm.hex",
+        ])
         .current_dir(dir)
         .output()
         .expect("run gpasm");
-    assert!(out.status.success(), "gpasm: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let theirs = std::fs::read_to_string(format!("{dir}/multi_page_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
     // and it runs in the simulator: in = 290 -> out = 0xD8 (hand-computed
@@ -155,6 +170,10 @@ fn multi_page_hex_matches_gpasm_and_runs() {
     p.ram_mut()[0x20] = 0x22; // in low byte = 290 & 0xFF
     p.ram_mut()[0x21] = 0x01; // in high byte = 290 >> 8
     p.run(2_000_000);
-    assert_eq!(p.ram()[0x22], 0xD8, "out == hand-computed 0xD8 for in == 290");
+    assert_eq!(
+        p.ram()[0x22],
+        0xD8,
+        "out == hand-computed 0xD8 for in == 290"
+    );
     assert!(p.halted());
 }

@@ -20,7 +20,9 @@ use pic14_sim::Pic14;
 //   6: MOVWF 0x76     0x00F6   ; ISR side-effect -> RAM[0x76] = 0xAA
 //   7: RETFIE         0x0009   ; pop return -> pc = 2
 fn interrupt_program() -> Vec<u16> {
-    vec![0x3005, 0x00A0, 0x2802, 0x0000, 0x00F5, 0x30AA, 0x00F6, 0x0009]
+    vec![
+        0x3005, 0x00A0, 0x2802, 0x0000, 0x00F5, 0x30AA, 0x00F6, 0x0009,
+    ]
 }
 
 #[test]
@@ -50,7 +52,11 @@ fn fire_interrupt_jumps_to_vector_and_retfie_resumes() {
     // the interrupt preempted, so main resumes its loop instead of falling
     // out of it.
     p.step(); // RETFIE
-    assert_eq!(p.pc(), 2, "main resumes at the preempted instruction, not past it");
+    assert_eq!(
+        p.pc(),
+        2,
+        "main resumes at the preempted instruction, not past it"
+    );
     p.run(5);
     assert_eq!(p.pc(), 2, "and it is still spinning in its loop");
 }

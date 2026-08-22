@@ -41,12 +41,30 @@ mod tests {
 
     #[test]
     fn header_has_epic_naked() {
-        assert!(EPIC_CC_H.contains("EPIC_NAKED"), "EPIC_CC_H missing EPIC_NAKED");
-        assert!(EPIC_CC_H.contains("__epic_nop"), "EPIC_CC_H missing __epic_nop");
-        assert!(EPIC_CC_H.contains("__epic_clrwdt"), "EPIC_CC_H missing __epic_clrwdt");
-        assert!(EPIC_CC_H.contains("__epic_sleep"), "EPIC_CC_H missing __epic_sleep");
-        assert!(EPIC_CC_H.contains("__epic_di"), "EPIC_CC_H missing __epic_di");
-        assert!(EPIC_CC_H.contains("__epic_ei"), "EPIC_CC_H missing __epic_ei");
+        assert!(
+            EPIC_CC_H.contains("EPIC_NAKED"),
+            "EPIC_CC_H missing EPIC_NAKED"
+        );
+        assert!(
+            EPIC_CC_H.contains("__epic_nop"),
+            "EPIC_CC_H missing __epic_nop"
+        );
+        assert!(
+            EPIC_CC_H.contains("__epic_clrwdt"),
+            "EPIC_CC_H missing __epic_clrwdt"
+        );
+        assert!(
+            EPIC_CC_H.contains("__epic_sleep"),
+            "EPIC_CC_H missing __epic_sleep"
+        );
+        assert!(
+            EPIC_CC_H.contains("__epic_di"),
+            "EPIC_CC_H missing __epic_di"
+        );
+        assert!(
+            EPIC_CC_H.contains("__epic_ei"),
+            "EPIC_CC_H missing __epic_ei"
+        );
         // All intrinsics must be single opaque asm blocks.
         assert!(EPIC_CC_H.contains("asm volatile(\"nop\")"));
         assert!(EPIC_CC_H.contains("asm volatile(\"clrwdt\")"));

@@ -75,5 +75,9 @@ pub fn edges_text(g: &CallGraph) -> String {
 }
 
 pub fn check_depth(g: &CallGraph, limit: usize) {
-    assert!(g.max_depth <= limit, "callgraph: depth {} exceeds hardware stack {limit}", g.max_depth);
+    assert!(
+        g.max_depth <= limit,
+        "callgraph: depth {} exceeds hardware stack {limit}",
+        g.max_depth
+    );
 }

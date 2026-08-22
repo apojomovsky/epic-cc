@@ -90,7 +90,11 @@ fn overlay_layout() -> (Module, alloc::AllocLayout) {
         ])
         .output()
         .expect("run clang");
-    assert!(ll.status.success(), "clang: {}", String::from_utf8_lossy(&ll.stderr));
+    assert!(
+        ll.status.success(),
+        "clang: {}",
+        String::from_utf8_lossy(&ll.stderr)
+    );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
@@ -104,10 +108,20 @@ fn overlay_layout() -> (Module, alloc::AllocLayout) {
 #[test]
 fn overlay_runs_correctly() {
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args(["tests/fixtures/overlay.c", "-o", "tests/fixtures/overlay.hex", "--device", "p16f877a"])
+        .args([
+            "tests/fixtures/overlay.c",
+            "-o",
+            "tests/fixtures/overlay.hex",
+            "--device",
+            "p16f877a",
+        ])
         .output()
         .expect("run driver");
-    assert!(out.status.success(), "driver: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
     let hex = std::fs::read_to_string("tests/fixtures/overlay.hex").unwrap();
     let prog = pic14_sim::parse_hex(&hex);
@@ -133,14 +147,21 @@ fn overlay_frames_share_ram() {
         "each sibling must carry >= 16 bytes of simultaneous locals (got big_a={span_a}, big_b={span_b})");
 
     // (b) sibling frames overlay: identical base region (never co-live).
-    assert_eq!(base_of(&layout, "big_a"), base_of(&layout, "big_b"),
-        "big_a and big_b must share a base address");
+    assert_eq!(
+        base_of(&layout, "big_a"),
+        base_of(&layout, "big_b"),
+        "big_a and big_b must share a base address"
+    );
 
     // main's frame is disjoint and sits before the shared sibling region.
     assert!(base_of(&layout, "main") + span_main <= base_of(&layout, "big_a"));
 
     // Overlay wins: total bank-0 demand < sum of the three demands.
     let sum_demands = span_a + span_b + span_main;
-    assert!(layout.total_bank0 < sum_demands,
-        "total_bank0 {} must be < sum of individual demands {}", layout.total_bank0, sum_demands);
+    assert!(
+        layout.total_bank0 < sum_demands,
+        "total_bank0 {} must be < sum of individual demands {}",
+        layout.total_bank0,
+        sum_demands
+    );
 }

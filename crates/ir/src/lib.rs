@@ -2,59 +2,161 @@
 //! every stage reads IR text in and writes IR text out.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Ty { I1, I8, I16, I32, F32 }
+pub enum Ty {
+    I1,
+    I8,
+    I16,
+    I32,
+    F32,
+}
 impl Ty {
-    pub fn bytes(self) -> u8 { match self { Ty::I1 | Ty::I8 => 1, Ty::I16 => 2, Ty::I32 | Ty::F32 => 4 } }
+    pub fn bytes(self) -> u8 {
+        match self {
+            Ty::I1 | Ty::I8 => 1,
+            Ty::I16 => 2,
+            Ty::I32 | Ty::F32 => 4,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum Val { Reg(String), Const(i64), Global(String) }
+pub enum Val {
+    Reg(String),
+    Const(i64),
+    Global(String),
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum BinOp { Add, Sub, And, Or, Xor, Mul, UDiv, URem, SDiv, SRem, Shl, LShr, AShr }
+pub enum BinOp {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Mul,
+    UDiv,
+    URem,
+    SDiv,
+    SRem,
+    Shl,
+    LShr,
+    AShr,
+}
 
 /// A GEP base: a named global (`@g`) or a pointer SSA register (`%r` — the
 /// result of an alloca, a byval/sret param, or another GEP).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum GepBase { Global(String), Reg(String) }
+pub enum GepBase {
+    Global(String),
+    Reg(String),
+}
 
 #[derive(Clone, Debug)]
-pub struct Load { pub dst: String, pub ty: Ty, pub ptr: String } // ptr = "@name" or "%name"
+pub struct Load {
+    pub dst: String,
+    pub ty: Ty,
+    pub ptr: String,
+} // ptr = "@name" or "%name"
 #[derive(Clone, Debug)]
-pub struct Store { pub ty: Ty, pub val: Val, pub ptr: String }
+pub struct Store {
+    pub ty: Ty,
+    pub val: Val,
+    pub ptr: String,
+}
 #[derive(Clone, Debug)]
-pub struct Bin { pub dst: String, pub op: BinOp, pub ty: Ty, pub a: Val, pub b: Val }
+pub struct Bin {
+    pub dst: String,
+    pub op: BinOp,
+    pub ty: Ty,
+    pub a: Val,
+    pub b: Val,
+}
 #[derive(Clone, Debug)]
-pub struct Zext { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
+pub struct Zext {
+    pub dst: String,
+    pub from: Ty,
+    pub val: Val,
+    pub to: Ty,
+}
 #[derive(Clone, Debug)]
-pub struct Sext { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
+pub struct Sext {
+    pub dst: String,
+    pub from: Ty,
+    pub val: Val,
+    pub to: Ty,
+}
 #[derive(Clone, Debug)]
-pub struct Trunc { pub dst: String, pub from: Ty, pub val: Val, pub to: Ty }
+pub struct Trunc {
+    pub dst: String,
+    pub from: Ty,
+    pub val: Val,
+    pub to: Ty,
+}
 #[derive(Clone, Debug)]
-pub struct Icmp { pub dst: String, pub pred: String, pub ty: Ty, pub a: Val, pub b: Val }
+pub struct Icmp {
+    pub dst: String,
+    pub pred: String,
+    pub ty: Ty,
+    pub a: Val,
+    pub b: Val,
+}
 #[derive(Clone, Debug)]
-pub struct Select { pub dst: String, pub cond: Val, pub ty: Ty, pub a: Val, pub b: Val }
+pub struct Select {
+    pub dst: String,
+    pub cond: Val,
+    pub ty: Ty,
+    pub a: Val,
+    pub b: Val,
+}
 /// A call argument. `ty` is `None` for pointer (`ptr`) args (byval/sret),
 /// `Some` for scalar args. `byval`/`sret` are the phase-3 call ABI flags.
 #[derive(Clone, Debug, PartialEq)]
-pub struct CallArg { pub ty: Option<Ty>, pub val: Val, pub byval: Option<u8>, pub sret: bool }
+pub struct CallArg {
+    pub ty: Option<Ty>,
+    pub val: Val,
+    pub byval: Option<u8>,
+    pub sret: bool,
+}
 #[derive(Clone, Debug)]
-pub struct Call { pub dst: Option<String>, pub ty: Option<Ty>, pub func: String, pub args: Vec<CallArg> }
+pub struct Call {
+    pub dst: Option<String>,
+    pub ty: Option<Ty>,
+    pub func: String,
+    pub args: Vec<CallArg>,
+}
 #[derive(Clone, Debug)]
-pub struct Br { pub target: String }
+pub struct Br {
+    pub target: String,
+}
 #[derive(Clone, Debug)]
-pub struct BrCond { pub cond: Val, pub t: String, pub f: String }
+pub struct BrCond {
+    pub cond: Val,
+    pub t: String,
+    pub f: String,
+}
 #[derive(Clone, Debug)]
-pub struct Phi { pub dst: String, pub ty: Ty, pub incoming: Vec<(Val, String)> }
+pub struct Phi {
+    pub dst: String,
+    pub ty: Ty,
+    pub incoming: Vec<(Val, String)>,
+}
 /// A getelementptr, reworked for structs/arrays: `base` is a global or a
 /// pointer reg, `k` a constant byte offset, and `terms` scaled dynamic
 /// offsets (`Σ scale×%reg`).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Gep { pub dst: String, pub base: GepBase, pub k: u8, pub terms: Vec<(u8, String)> }
+pub struct Gep {
+    pub dst: String,
+    pub base: GepBase,
+    pub k: u8,
+    pub terms: Vec<(u8, String)>,
+}
 /// `alloca`: a local buffer of `size` bytes (virtual — isel allocates no
 /// registers; alloc sizes the slot).
 #[derive(Clone, Debug, PartialEq)]
-pub struct Alloca { pub dst: String, pub size: u8 }
+pub struct Alloca {
+    pub dst: String,
+    pub size: u8,
+}
 /// `memcpy`: byte-copy `len` bytes from `src` to `dst` (defines nothing).
 /// `len` is either a compile-time constant (unrolled per byte) or a 16-bit
 /// register value (issue #4: runtime length — a counted loop; the value is
@@ -65,29 +167,65 @@ pub enum MemLen {
     Reg(Val),
 }
 #[derive(Clone, Debug, PartialEq)]
-pub struct Memcpy { pub dst: Val, pub src: Val, pub len: MemLen }
+pub struct Memcpy {
+    pub dst: Val,
+    pub src: Val,
+    pub len: MemLen,
+}
 /// `freeze`: LLVM freeze (`%d = freeze <ty> <val>`). A no-op in the backend —
 /// it exists so the IR round-trips the source; isel lowers it as a plain byte
 /// copy of `val` into the `dst` slot.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Freeze { pub dst: String, pub ty: Ty, pub val: Val }
+pub struct Freeze {
+    pub dst: String,
+    pub ty: Ty,
+    pub val: Val,
+}
 
 /// The four float arithmetic ops (always f32 — msp430's float == f32).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FBinOp { FAdd, FSub, FMul, FDiv }
+pub enum FBinOp {
+    FAdd,
+    FSub,
+    FMul,
+    FDiv,
+}
 /// `%d = fadd float %a %b` — both operands and the dst are f32 (implicit).
 #[derive(Clone, Debug, PartialEq)]
-pub struct FloatBin { pub dst: String, pub op: FBinOp, pub a: Val, pub b: Val }
+pub struct FloatBin {
+    pub dst: String,
+    pub op: FBinOp,
+    pub a: Val,
+    pub b: Val,
+}
 /// `%d = fcmp <pred> float %a %b` — the 16 LLVM float predicates; dst is i1.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Fcmp { pub dst: String, pub pred: String, pub a: Val, pub b: Val }
+pub struct Fcmp {
+    pub dst: String,
+    pub pred: String,
+    pub a: Val,
+    pub b: Val,
+}
 /// The int<->float conversions and the f32->f32 casts (fpext/fptrunc are
 /// no-ops on msp430 — double == float — but round-trip for the text).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FloatConvOp { FpToSi, FpToUi, SiToFp, UiToFp, Fpext, Fptrunc }
+pub enum FloatConvOp {
+    FpToSi,
+    FpToUi,
+    SiToFp,
+    UiToFp,
+    Fpext,
+    Fptrunc,
+}
 /// `%d = fptosi <from> <val> to <to>` (and the other five ops).
 #[derive(Clone, Debug, PartialEq)]
-pub struct FloatConv { pub dst: String, pub op: FloatConvOp, pub from: Ty, pub val: Val, pub to: Ty }
+pub struct FloatConv {
+    pub dst: String,
+    pub op: FloatConvOp,
+    pub from: Ty,
+    pub val: Val,
+    pub to: Ty,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AsmOperand {
@@ -100,7 +238,11 @@ pub struct AsmOperand {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Asm { pub template: String, pub clobbers_memory: bool, pub operands: Vec<AsmOperand> }
+pub struct Asm {
+    pub template: String,
+    pub clobbers_memory: bool,
+    pub operands: Vec<AsmOperand>,
+}
 
 #[derive(Clone, Debug)]
 pub enum Inst {
@@ -128,14 +270,23 @@ pub enum Inst {
 }
 
 #[derive(Clone, Debug)]
-pub struct Block { pub label: String, pub insts: Vec<Inst> }
+pub struct Block {
+    pub label: String,
+    pub insts: Vec<Inst>,
+}
 
 /// A function parameter. `width` is the slot size in bytes: the scalar byte
 /// width, the byval struct size (`byval`), or 2 for an sret pointer slot
 /// (holds the target address). `ptr` marks a plain pointer param, whose slot
 /// holds an address: width alone cannot say so, an `i16` is also 2 bytes.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Param { pub name: String, pub width: u8, pub byval: Option<u8>, pub sret: bool, pub ptr: bool }
+pub struct Param {
+    pub name: String,
+    pub width: u8,
+    pub byval: Option<u8>,
+    pub sret: bool,
+    pub ptr: bool,
+}
 #[derive(Clone, Debug)]
 pub struct Func {
     pub name: String,
@@ -150,10 +301,21 @@ pub struct Func {
 }
 
 #[derive(Clone, Debug)]
-pub struct Global { pub name: String, pub ty: Ty, pub is_const: bool, pub size: u16, pub bytes: Vec<u8>, pub addr: Option<u16> }
+pub struct Global {
+    pub name: String,
+    pub ty: Ty,
+    pub is_const: bool,
+    pub size: u16,
+    pub bytes: Vec<u8>,
+    pub addr: Option<u16>,
+}
 
 #[derive(Clone, Debug)]
-pub struct Module { pub globals: Vec<Global>, pub funcs: Vec<Func>, pub module_asm: Vec<String> }
+pub struct Module {
+    pub globals: Vec<Global>,
+    pub funcs: Vec<Func>,
+    pub module_asm: Vec<String>,
+}
 
 /// True for the legalize-injected runtime routines (the mul/div/rem/shift
 /// and soft-float recipe bodies), including the interrupt-context `_isr`
@@ -202,7 +364,11 @@ pub fn is_runtime_routine(name: &str) -> bool {
 }
 
 fn val_str(v: &Val) -> String {
-    match v { Val::Reg(r) => format!("%{r}"), Val::Const(k) => k.to_string(), Val::Global(g) => format!("@{g}") }
+    match v {
+        Val::Reg(r) => format!("%{r}"),
+        Val::Const(k) => k.to_string(),
+        Val::Global(g) => format!("@{g}"),
+    }
 }
 
 fn param_str(p: &Param) -> String {
@@ -219,7 +385,10 @@ fn param_str(p: &Param) -> String {
             1 => format!("{}=i8", p.name),
             2 => format!("{}=i16", p.name),
             4 => format!("{}=i32", p.name),
-            w => panic!("ir: cannot serialize scalar param {} with width {w}", p.name),
+            w => panic!(
+                "ir: cannot serialize scalar param {} with width {w}",
+                p.name
+            ),
         }
     }
 }
@@ -231,15 +400,30 @@ pub fn serialize(m: &Module) -> String {
     }
     for g in &m.globals {
         let kind = if g.is_const { "const" } else { "global" };
-        match g.addr { Some(a) => out.push_str(&format!("{kind} {} {} @0x{a:02X}\n", g.name, ty_str(g.ty))), None => out.push_str(&format!("{kind} {} {}\n", g.name, ty_str(g.ty))) }
+        match g.addr {
+            Some(a) => out.push_str(&format!("{kind} {} {} @0x{a:02X}\n", g.name, ty_str(g.ty))),
+            None => out.push_str(&format!("{kind} {} {}\n", g.name, ty_str(g.ty))),
+        }
     }
     for f in &m.funcs {
-        let ret = match f.ret { Some(t) => ty_str(t), None => "void".to_string() };
+        let ret = match f.ret {
+            Some(t) => ty_str(t),
+            None => "void".to_string(),
+        };
         let params: Vec<String> = f.params.iter().map(param_str).collect();
         let mut markers = String::new();
-        if f.isr { markers.push_str(" [isr]"); }
-        if f.naked { markers.push_str(" [naked]"); }
-        out.push_str(&format!("fn {}({ret}){} ({})\n", f.name, markers, params.join(", ")));
+        if f.isr {
+            markers.push_str(" [isr]");
+        }
+        if f.naked {
+            markers.push_str(" [naked]");
+        }
+        out.push_str(&format!(
+            "fn {}({ret}){} ({})\n",
+            f.name,
+            markers,
+            params.join(", ")
+        ));
         for b in &f.blocks {
             out.push_str(&format!("  block {}:\n", b.label));
             for i in &b.insts {
@@ -272,7 +456,10 @@ fn unescape_asm(s: &str) -> String {
                 Some('\\') => out.push('\\'),
                 Some('"') => out.push('"'),
                 Some('n') => out.push('\n'),
-                Some(other) => { out.push('\\'); out.push(other); }
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
                 None => out.push('\\'),
             }
         } else {
@@ -287,7 +474,10 @@ fn unescape_asm(s: &str) -> String {
 /// content, byte index after the closing `"`).
 fn parse_quoted_unescaped(s: &str) -> (String, usize) {
     let bytes = s.as_bytes();
-    let start = bytes.iter().position(|&b| b == b'"').expect("missing opening quote");
+    let start = bytes
+        .iter()
+        .position(|&b| b == b'"')
+        .expect("missing opening quote");
     let mut i = start + 1;
     let mut escaped = false;
     let mut end = None;
@@ -308,29 +498,94 @@ fn parse_quoted_unescaped(s: &str) -> (String, usize) {
     (unescape_asm(raw_inner), closing + 1)
 }
 
-fn ty_str(t: Ty) -> String { match t { Ty::I1 => "i1".into(), Ty::I8 => "i8".into(), Ty::I16 => "i16".into(), Ty::I32 => "i32".into(), Ty::F32 => "float".into() } }
+fn ty_str(t: Ty) -> String {
+    match t {
+        Ty::I1 => "i1".into(),
+        Ty::I8 => "i8".into(),
+        Ty::I16 => "i16".into(),
+        Ty::I32 => "i32".into(),
+        Ty::F32 => "float".into(),
+    }
+}
 
 fn inst_str(i: &Inst) -> String {
     match i {
         Inst::Load(l) => format!("%{} = load {} {}", l.dst, ty_str(l.ty), l.ptr),
         Inst::Store(s) => format!("store {} {} {}", ty_str(s.ty), val_str(&s.val), s.ptr),
-        Inst::Bin(b) => format!("%{} = {} {} {} {}", b.dst, op_str(b.op), ty_str(b.ty), val_str(&b.a), val_str(&b.b)),
+        Inst::Bin(b) => format!(
+            "%{} = {} {} {} {}",
+            b.dst,
+            op_str(b.op),
+            ty_str(b.ty),
+            val_str(&b.a),
+            val_str(&b.b)
+        ),
         Inst::Ret(None) => "ret void".into(),
         Inst::Ret(Some((t, v))) => format!("ret {} {}", ty_str(*t), val_str(v)),
-        Inst::Zext(z) => format!("%{} = zext {} {} to {}", z.dst, ty_str(z.from), val_str(&z.val), ty_str(z.to)),
-        Inst::Sext(s) => format!("%{} = sext {} {} to {}", s.dst, ty_str(s.from), val_str(&s.val), ty_str(s.to)),
-        Inst::Trunc(t) => format!("%{} = trunc {} {} to {}", t.dst, ty_str(t.from), val_str(&t.val), ty_str(t.to)),
-        Inst::Icmp(i) => format!("%{} = icmp {} {} {} {}", i.dst, i.pred, ty_str(i.ty), val_str(&i.a), val_str(&i.b)),
-        Inst::Select(s) => format!("%{} = select i1 {} {} {} {} {}", s.dst, val_str(&s.cond), ty_str(s.ty), val_str(&s.a), ty_str(s.ty), val_str(&s.b)),
+        Inst::Zext(z) => format!(
+            "%{} = zext {} {} to {}",
+            z.dst,
+            ty_str(z.from),
+            val_str(&z.val),
+            ty_str(z.to)
+        ),
+        Inst::Sext(s) => format!(
+            "%{} = sext {} {} to {}",
+            s.dst,
+            ty_str(s.from),
+            val_str(&s.val),
+            ty_str(s.to)
+        ),
+        Inst::Trunc(t) => format!(
+            "%{} = trunc {} {} to {}",
+            t.dst,
+            ty_str(t.from),
+            val_str(&t.val),
+            ty_str(t.to)
+        ),
+        Inst::Icmp(i) => format!(
+            "%{} = icmp {} {} {} {}",
+            i.dst,
+            i.pred,
+            ty_str(i.ty),
+            val_str(&i.a),
+            val_str(&i.b)
+        ),
+        Inst::Select(s) => format!(
+            "%{} = select i1 {} {} {} {} {}",
+            s.dst,
+            val_str(&s.cond),
+            ty_str(s.ty),
+            val_str(&s.a),
+            ty_str(s.ty),
+            val_str(&s.b)
+        ),
         Inst::Call(c) => match (&c.ty, &c.dst) {
-            (Some(t), Some(d)) => format!("%{d} = call {} @{}({})", ty_str(*t), c.func, call_args_str(&c.args)),
+            (Some(t), Some(d)) => format!(
+                "%{d} = call {} @{}({})",
+                ty_str(*t),
+                c.func,
+                call_args_str(&c.args)
+            ),
             _ => format!("call void @{}({})", c.func, call_args_str(&c.args)),
         },
         Inst::Br(b) => format!("br {}", b.target),
         Inst::BrCond(b) => format!("br i1 {} {} {}", val_str(&b.cond), b.t, b.f),
-        Inst::Phi(p) => format!("%{} = phi {} {}", p.dst, ty_str(p.ty), p.incoming.iter().map(|(v, l)| format!("{} {}", val_str(v), l)).collect::<Vec<_>>().join(" ")),
+        Inst::Phi(p) => format!(
+            "%{} = phi {} {}",
+            p.dst,
+            ty_str(p.ty),
+            p.incoming
+                .iter()
+                .map(|(v, l)| format!("{} {}", val_str(v), l))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         Inst::Gep(g) => {
-            let base = match &g.base { GepBase::Global(n) => format!("@{n}"), GepBase::Reg(r) => format!("%{r}") };
+            let base = match &g.base {
+                GepBase::Global(n) => format!("@{n}"),
+                GepBase::Reg(r) => format!("%{r}"),
+            };
             let mut s = format!("%{} = gep {} +{}", g.dst, base, g.k);
             for (scale, reg) in &g.terms {
                 s.push_str(&format!(" +{scale}*%{reg}"));
@@ -348,9 +603,28 @@ fn inst_str(i: &Inst) -> String {
             }
         ),
         Inst::Freeze(f) => format!("%{} = freeze {} {}", f.dst, ty_str(f.ty), val_str(&f.val)),
-        Inst::FloatBin(b) => format!("%{} = {} float {} {}", b.dst, fbinop_str(b.op), val_str(&b.a), val_str(&b.b)),
-        Inst::Fcmp(c) => format!("%{} = fcmp {} float {} {}", c.dst, c.pred, val_str(&c.a), val_str(&c.b)),
-        Inst::FloatConv(c) => format!("%{} = {} {} {} to {}", c.dst, fconvop_str(c.op), ty_str(c.from), val_str(&c.val), ty_str(c.to)),
+        Inst::FloatBin(b) => format!(
+            "%{} = {} float {} {}",
+            b.dst,
+            fbinop_str(b.op),
+            val_str(&b.a),
+            val_str(&b.b)
+        ),
+        Inst::Fcmp(c) => format!(
+            "%{} = fcmp {} float {} {}",
+            c.dst,
+            c.pred,
+            val_str(&c.a),
+            val_str(&c.b)
+        ),
+        Inst::FloatConv(c) => format!(
+            "%{} = {} {} {} to {}",
+            c.dst,
+            fconvop_str(c.op),
+            ty_str(c.from),
+            val_str(&c.val),
+            ty_str(c.to)
+        ),
         Inst::Asm(a) => {
             let mut s = format!("asm \"{}\"", escape_asm(&a.template));
             if a.clobbers_memory {
@@ -392,9 +666,16 @@ fn fconvop_str(o: FloatConvOp) -> &'static str {
 
 fn call_arg_str(a: &CallArg) -> String {
     let mut s = String::new();
-    if let Some(t) = a.ty { s.push_str(&ty_str(t)); s.push(' '); }
-    if let Some(n) = a.byval { s.push_str(&format!("byval{n} ")); }
-    if a.sret { s.push_str("sret "); }
+    if let Some(t) = a.ty {
+        s.push_str(&ty_str(t));
+        s.push(' ');
+    }
+    if let Some(n) = a.byval {
+        s.push_str(&format!("byval{n} "));
+    }
+    if a.sret {
+        s.push_str("sret ");
+    }
     s.push_str(&val_str(&a.val));
     s
 }
@@ -425,8 +706,14 @@ fn op_str(o: BinOp) -> &'static str {
 fn matching_paren(s: &str, open: usize) -> usize {
     let mut depth = 0usize;
     for (i, c) in s[open..].char_indices() {
-        match c { '(' => depth += 1, ')' => depth -= 1, _ => {} }
-        if depth == 0 { return open + i; }
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            return open + i;
+        }
     }
     panic!("unbalanced parens in {s:?}");
 }
@@ -439,20 +726,36 @@ pub fn parse(text: &str) -> Module {
     let mut cur_block: Option<Block> = None;
     for line in text.lines() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
         if line.starts_with("module_asm ") {
             let (decoded, _) = parse_quoted_unescaped(line);
             module_asm.push(decoded);
             continue;
         }
-        if let Some(rest) = line.strip_prefix("global ").or_else(|| line.strip_prefix("const ")) {
+        if let Some(rest) = line
+            .strip_prefix("global ")
+            .or_else(|| line.strip_prefix("const "))
+        {
             let is_const = line.starts_with("const ");
             let parts: Vec<&str> = rest.split_whitespace().collect();
             // format: <name> <ty> [@addr]
             let name = parts[0].to_string();
             let ty = parse_ty(parts[1]);
-            let addr = if parts.len() >= 3 { parse_addr(parts[2]) } else { None };
-            globals.push(Global { name, ty, is_const, size: u16::from(ty.bytes()), bytes: Vec::new(), addr });
+            let addr = if parts.len() >= 3 {
+                parse_addr(parts[2])
+            } else {
+                None
+            };
+            globals.push(Global {
+                name,
+                ty,
+                is_const,
+                size: u16::from(ty.bytes()),
+                bytes: Vec::new(),
+                addr,
+            });
         } else if line.starts_with("fn ") {
             let rest = &line[3..];
             let open = rest.find('(').unwrap();
@@ -460,7 +763,9 @@ pub fn parse(text: &str) -> Module {
             let ret_close = matching_paren(rest, open);
             let ret_str = rest[open + 1..ret_close].trim();
             let after = &rest[ret_close + 1..];
-            let p_open = after.find('(').expect("fn header must have a params group: fn <name>(<ret>) (<params>)");
+            let p_open = after
+                .find('(')
+                .expect("fn header must have a params group: fn <name>(<ret>) (<params>)");
             // the optional `[isr]` and `[naked]` markers live between the ret group and
             // the params group, in any order
             let before_params = &after[..p_open];
@@ -468,28 +773,56 @@ pub fn parse(text: &str) -> Module {
             let naked = before_params.contains("[naked]");
             let p_close = matching_paren(after, p_open);
             let p_str = &after[p_open + 1..p_close];
-            let ret = if ret_str == "void" || ret_str.is_empty() { None } else { Some(parse_ty(ret_str)) };
-            let params = if p_str.trim().is_empty() { vec![] } else {
+            let ret = if ret_str == "void" || ret_str.is_empty() {
+                None
+            } else {
+                Some(parse_ty(ret_str))
+            };
+            let params = if p_str.trim().is_empty() {
+                vec![]
+            } else {
                 p_str.split(',').map(parse_param).collect()
             };
-            if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
-            if let Some(f) = cur_func.take() { funcs.push(f); }
-            cur_func = Some(Func { name, ret, params, blocks: Vec::new(), isr, naked });
+            if let Some(f) = cur_func.as_mut() {
+                if let Some(b) = cur_block.take() {
+                    f.blocks.push(b);
+                }
+            }
+            if let Some(f) = cur_func.take() {
+                funcs.push(f);
+            }
+            cur_func = Some(Func {
+                name,
+                ret,
+                params,
+                blocks: Vec::new(),
+                isr,
+                naked,
+            });
         } else if line == "}" || line == "{" {
             continue;
         } else if line.ends_with(':') {
             // Support both `block foo:` (canonical) and `foo:` (brace-style test
             // input from CC-4 Task 1). The brace style is e.g. `entry:` inside
             // `fn foo() [naked] () { entry: asm ... }`.
-            if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
+            if let Some(f) = cur_func.as_mut() {
+                if let Some(b) = cur_block.take() {
+                    f.blocks.push(b);
+                }
+            }
             let raw = line.trim_end_matches(':').trim();
             let label = if let Some(rest) = raw.strip_prefix("block ") {
                 rest.trim().to_string()
             } else {
                 raw.to_string()
             };
-            if label.is_empty() { continue; }
-            cur_block = Some(Block { label, insts: Vec::new() });
+            if label.is_empty() {
+                continue;
+            }
+            cur_block = Some(Block {
+                label,
+                insts: Vec::new(),
+            });
         } else {
             let inst = parse_inst(line);
             match (&mut cur_func, &mut cur_block) {
@@ -499,18 +832,44 @@ pub fn parse(text: &str) -> Module {
             }
         }
     }
-    if let Some(f) = cur_func.as_mut() { if let Some(b) = cur_block.take() { f.blocks.push(b); } }
-    if let Some(f) = cur_func.take() { funcs.push(f); }
-    Module { globals, funcs, module_asm }
+    if let Some(f) = cur_func.as_mut() {
+        if let Some(b) = cur_block.take() {
+            f.blocks.push(b);
+        }
+    }
+    if let Some(f) = cur_func.take() {
+        funcs.push(f);
+    }
+    Module {
+        globals,
+        funcs,
+        module_asm,
+    }
 }
 
-fn parse_ty(s: &str) -> Ty { match s { "i1" => Ty::I1, "i8" => Ty::I8, "i16" => Ty::I16, "i32" => Ty::I32, "float" | "f32" => Ty::F32, other => panic!("unsupported type {other}") } }
-fn parse_addr(s: &str) -> Option<u16> { s.strip_prefix('@').map(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).unwrap()) }
+fn parse_ty(s: &str) -> Ty {
+    match s {
+        "i1" => Ty::I1,
+        "i8" => Ty::I8,
+        "i16" => Ty::I16,
+        "i32" => Ty::I32,
+        "float" | "f32" => Ty::F32,
+        other => panic!("unsupported type {other}"),
+    }
+}
+fn parse_addr(s: &str) -> Option<u16> {
+    s.strip_prefix('@')
+        .map(|h| u16::from_str_radix(h.trim_start_matches("0x"), 16).unwrap())
+}
 fn parse_val(s: &str) -> Val {
     let s = s.trim_end_matches(',');
-    if let Some(r) = s.strip_prefix('%') { Val::Reg(r.to_string()) }
-    else if let Some(g) = s.strip_prefix('@') { Val::Global(g.to_string()) }
-    else { Val::Const(s.parse().unwrap_or_else(|_| panic!("bad value {s}"))) }
+    if let Some(r) = s.strip_prefix('%') {
+        Val::Reg(r.to_string())
+    } else if let Some(g) = s.strip_prefix('@') {
+        Val::Global(g.to_string())
+    } else {
+        Val::Const(s.parse().unwrap_or_else(|_| panic!("bad value {s}")))
+    }
 }
 
 /// Parse one canonical param token: `<name>=i8` | `<name>=i16` |
@@ -525,15 +884,45 @@ fn parse_param(s: &str) -> Param {
     let name = name.trim_start_matches('%').to_string();
     if let Some(n) = rest.strip_prefix("byval") {
         let n = n.parse::<u8>().unwrap();
-        Param { name, width: n, byval: Some(n), sret: false, ptr: false }
+        Param {
+            name,
+            width: n,
+            byval: Some(n),
+            sret: false,
+            ptr: false,
+        }
     } else if rest == "sret" {
-        Param { name, width: 2, byval: None, sret: true, ptr: false }
+        Param {
+            name,
+            width: 2,
+            byval: None,
+            sret: true,
+            ptr: false,
+        }
     } else if rest == "ptr" {
-        Param { name, width: 2, byval: None, sret: false, ptr: true }
+        Param {
+            name,
+            width: 2,
+            byval: None,
+            sret: false,
+            ptr: true,
+        }
     } else if matches!(rest, "i1" | "i8" | "i16" | "i32" | "float" | "f32") {
-        Param { name, width: parse_ty(rest).bytes(), byval: None, sret: false, ptr: false }
+        Param {
+            name,
+            width: parse_ty(rest).bytes(),
+            byval: None,
+            sret: false,
+            ptr: false,
+        }
     } else if rest.is_empty() {
-        Param { name, width: 1, byval: None, sret: false, ptr: false }
+        Param {
+            name,
+            width: 1,
+            byval: None,
+            sret: false,
+            ptr: false,
+        }
     } else {
         panic!("malformed param {s:?}")
     }
@@ -559,18 +948,32 @@ fn parse_call_arg(s: &str) -> CallArg {
             }
         }
     }
-    CallArg { ty, val: parse_val(val_tok.expect("call arg must carry a value")), byval, sret }
+    CallArg {
+        ty,
+        val: parse_val(val_tok.expect("call arg must carry a value")),
+        byval,
+        sret,
+    }
 }
 
 fn parse_call(rest: &str) -> (Option<Ty>, String, Vec<CallArg>) {
     let at = rest.find('@').unwrap();
     let ty_part = rest[..at].trim();
-    let ty = if ty_part == "void" { None } else { Some(parse_ty(ty_part)) };
+    let ty = if ty_part == "void" {
+        None
+    } else {
+        Some(parse_ty(ty_part))
+    };
     let open = rest.find('(').unwrap();
     let func = rest[at + 1..open].trim().to_string();
     let close = matching_paren(rest, open);
-    let args = if open + 1 == close { vec![] } else {
-        rest[open + 1..close].split(',').map(parse_call_arg).collect()
+    let args = if open + 1 == close {
+        vec![]
+    } else {
+        rest[open + 1..close]
+            .split(',')
+            .map(parse_call_arg)
+            .collect()
     };
     (ty, func, args)
 }
@@ -583,7 +986,12 @@ fn parse_gep_expr(rest: &str) -> (GepBase, u8, Vec<(u8, String)>) {
     } else {
         GepBase::Reg(base_tok.trim_start_matches('%').to_string())
     };
-    let k = it.next().unwrap().trim_start_matches('+').parse::<u8>().unwrap();
+    let k = it
+        .next()
+        .unwrap()
+        .trim_start_matches('+')
+        .parse::<u8>()
+        .unwrap();
     let mut terms = Vec::new();
     for t in it {
         let t = t.trim_start_matches('+');
@@ -610,29 +1018,47 @@ fn parse_inst(line: &str) -> Inst {
             let tail = &after["memory".len()..];
             if tail.is_empty() || tail.starts_with(|c: char| c.is_whitespace() || c == ',') {
                 clobbers_memory = true;
-                rest = tail.trim_start_matches(|c: char| c.is_whitespace() || c == ',').trim();
+                rest = tail
+                    .trim_start_matches(|c: char| c.is_whitespace() || c == ',')
+                    .trim();
                 let mut operands = Vec::new();
                 if !rest.is_empty() {
                     for tok in rest.split(',') {
                         let tok = tok.trim();
-                        if tok.is_empty() { continue; }
+                        if tok.is_empty() {
+                            continue;
+                        }
                         let mut it = tok.split_whitespace();
                         let constraint = it.next().unwrap_or("").to_string();
                         let ptr = it.next().unwrap_or("").to_string();
-                        if constraint.is_empty() || ptr.is_empty() { panic!("malformed asm operand {tok:?} in {line:?}"); }
+                        if constraint.is_empty() || ptr.is_empty() {
+                            panic!("malformed asm operand {tok:?} in {line:?}");
+                        }
                         operands.push(AsmOperand { constraint, ptr });
                     }
                 }
-                return Inst::Asm(Asm { template, clobbers_memory, operands });
+                return Inst::Asm(Asm {
+                    template,
+                    clobbers_memory,
+                    operands,
+                });
             } else {
                 rest = after;
             }
-        } else if after.split_whitespace().any(|t| t.trim_matches(',') == "memory") {
+        } else if after
+            .split_whitespace()
+            .any(|t| t.trim_matches(',') == "memory")
+        {
             // `memory` appears later (e.g. `*m @x, memory`); remove it
             clobbers_memory = true;
             let parts: Vec<String> = after
                 .split(',')
-                .map(|s| s.split_whitespace().filter(|t| *t != "memory").collect::<Vec<_>>().join(" "))
+                .map(|s| {
+                    s.split_whitespace()
+                        .filter(|t| *t != "memory")
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
                 .filter(|s| !s.trim().is_empty())
                 .collect();
             let owned = parts.join(", ");
@@ -640,15 +1066,23 @@ fn parse_inst(line: &str) -> Inst {
             if !owned.is_empty() {
                 for tok in owned.split(',') {
                     let tok = tok.trim();
-                    if tok.is_empty() { continue; }
+                    if tok.is_empty() {
+                        continue;
+                    }
                     let mut it = tok.split_whitespace();
                     let constraint = it.next().unwrap_or("").to_string();
                     let ptr = it.next().unwrap_or("").to_string();
-                    if constraint.is_empty() || ptr.is_empty() { panic!("malformed asm operand {tok:?} in {line:?}"); }
+                    if constraint.is_empty() || ptr.is_empty() {
+                        panic!("malformed asm operand {tok:?} in {line:?}");
+                    }
                     operands.push(AsmOperand { constraint, ptr });
                 }
             }
-            return Inst::Asm(Asm { template, clobbers_memory, operands });
+            return Inst::Asm(Asm {
+                template,
+                clobbers_memory,
+                operands,
+            });
         } else {
             rest = after;
         }
@@ -656,15 +1090,23 @@ fn parse_inst(line: &str) -> Inst {
         if !rest.is_empty() {
             for tok in rest.split(',') {
                 let tok = tok.trim();
-                if tok.is_empty() { continue; }
+                if tok.is_empty() {
+                    continue;
+                }
                 let mut it = tok.split_whitespace();
                 let constraint = it.next().unwrap_or("").to_string();
                 let ptr = it.next().unwrap_or("").to_string();
-                if constraint.is_empty() || ptr.is_empty() { panic!("malformed asm operand {tok:?} in {line:?}"); }
+                if constraint.is_empty() || ptr.is_empty() {
+                    panic!("malformed asm operand {tok:?} in {line:?}");
+                }
                 operands.push(AsmOperand { constraint, ptr });
             }
         }
-        return Inst::Asm(Asm { template, clobbers_memory, operands });
+        return Inst::Asm(Asm {
+            template,
+            clobbers_memory,
+            operands,
+        });
     }
     if line == "ret" {
         return Inst::Ret(None);
@@ -683,10 +1125,16 @@ fn parse_inst(line: &str) -> Inst {
     }
     if let Some(rest) = line.strip_prefix("store ") {
         let parts: Vec<&str> = rest.split_whitespace().collect();
-        return Inst::Store(Store { ty: parse_ty(parts[0]), val: parse_val(parts[1]), ptr: parts[2].to_string() });
+        return Inst::Store(Store {
+            ty: parse_ty(parts[0]),
+            val: parse_val(parts[1]),
+            ptr: parts[2].to_string(),
+        });
     }
     if let Some(rest) = line.strip_prefix("ret ") {
-        if rest == "void" { return Inst::Ret(None); }
+        if rest == "void" {
+            return Inst::Ret(None);
+        }
         let mut it = rest.split_whitespace();
         let t = parse_ty(it.next().unwrap());
         return Inst::Ret(Some((t, parse_val(it.next().unwrap()))));
@@ -699,11 +1147,18 @@ fn parse_inst(line: &str) -> Inst {
             let f = it.next().unwrap().to_string();
             return Inst::BrCond(BrCond { cond, t, f });
         }
-        return Inst::Br(Br { target: rest.to_string() });
+        return Inst::Br(Br {
+            target: rest.to_string(),
+        });
     }
     if let Some(rest) = line.strip_prefix("call ") {
         let (ty, func, args) = parse_call(rest);
-        return Inst::Call(Call { dst: None, ty, func, args });
+        return Inst::Call(Call {
+            dst: None,
+            ty,
+            func,
+            args,
+        });
     }
     // defining instruction: %d = op ...
     let eq = line.find(" = ").unwrap();
@@ -717,7 +1172,12 @@ fn parse_inst(line: &str) -> Inst {
     }
     if let Some(rest) = body.strip_prefix("call ") {
         let (ty, func, args) = parse_call(rest);
-        return Inst::Call(Call { dst: Some(dst), ty, func, args });
+        return Inst::Call(Call {
+            dst: Some(dst),
+            ty,
+            func,
+            args,
+        });
     }
     if let Some(rest) = body.strip_prefix("alloca ") {
         let size = rest.trim().parse().unwrap();
@@ -727,7 +1187,11 @@ fn parse_inst(line: &str) -> Inst {
         let mut it = rest.split_whitespace();
         let from = parse_ty(it.next().unwrap());
         let val = parse_val(it.next().unwrap());
-        assert_eq!(it.next().unwrap(), "to", "zext must be '%d = zext <t> <v> to <t2>'");
+        assert_eq!(
+            it.next().unwrap(),
+            "to",
+            "zext must be '%d = zext <t> <v> to <t2>'"
+        );
         let to = parse_ty(it.next().unwrap());
         return Inst::Zext(Zext { dst, from, val, to });
     }
@@ -735,25 +1199,43 @@ fn parse_inst(line: &str) -> Inst {
         let mut it = rest.split_whitespace();
         let from = parse_ty(it.next().unwrap());
         let val = parse_val(it.next().unwrap());
-        assert_eq!(it.next().unwrap(), "to", "trunc must be '%d = trunc <t> <v> to <t2>'");
+        assert_eq!(
+            it.next().unwrap(),
+            "to",
+            "trunc must be '%d = trunc <t> <v> to <t2>'"
+        );
         let to = parse_ty(it.next().unwrap());
         return Inst::Trunc(Trunc { dst, from, val, to });
     }
     if let Some(rest) = body.strip_prefix("icmp ") {
         let mut it = rest.split_whitespace();
         let pred = it.next().unwrap().to_string();
-        const PREDS: [&str; 10] = ["eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge"];
-        if !PREDS.contains(&pred.as_str()) { panic!("unsupported icmp predicate {pred}"); }
+        const PREDS: [&str; 10] = [
+            "eq", "ne", "ult", "ule", "ugt", "uge", "slt", "sle", "sgt", "sge",
+        ];
+        if !PREDS.contains(&pred.as_str()) {
+            panic!("unsupported icmp predicate {pred}");
+        }
         let t = parse_ty(it.next().unwrap());
         let a = parse_val(it.next().unwrap());
         let b = parse_val(it.next().unwrap());
-        return Inst::Icmp(Icmp { dst, pred, ty: t, a, b });
+        return Inst::Icmp(Icmp {
+            dst,
+            pred,
+            ty: t,
+            a,
+            b,
+        });
     }
     if let Some(rest) = body.strip_prefix("sext ") {
         let mut it = rest.split_whitespace();
         let from = parse_ty(it.next().unwrap());
         let val = parse_val(it.next().unwrap());
-        assert_eq!(it.next().unwrap(), "to", "sext must be '%d = sext <t> <v> to <t2>'");
+        assert_eq!(
+            it.next().unwrap(),
+            "to",
+            "sext must be '%d = sext <t> <v> to <t2>'"
+        );
         let to = parse_ty(it.next().unwrap());
         return Inst::Sext(Sext { dst, from, val, to });
     }
@@ -768,9 +1250,17 @@ fn parse_inst(line: &str) -> Inst {
         let t = parse_ty(it.next().unwrap());
         let a = parse_val(it.next().unwrap());
         let t2 = parse_ty(it.next().unwrap());
-        if t != t2 { panic!("select operand type mismatch {:?} vs {:?}", t, t2); }
+        if t != t2 {
+            panic!("select operand type mismatch {:?} vs {:?}", t, t2);
+        }
         let b = parse_val(it.next().unwrap());
-        return Inst::Select(Select { dst, cond, ty: t, a, b });
+        return Inst::Select(Select {
+            dst,
+            cond,
+            ty: t,
+            a,
+            b,
+        });
     }
     if let Some(rest) = body.strip_prefix("phi ") {
         let mut it = rest.split_whitespace();
@@ -781,11 +1271,20 @@ fn parse_inst(line: &str) -> Inst {
             let pred = it.next().unwrap().to_string();
             incoming.push((val, pred));
         }
-        return Inst::Phi(Phi { dst, ty: t, incoming });
+        return Inst::Phi(Phi {
+            dst,
+            ty: t,
+            incoming,
+        });
     }
     if let Some(rest) = body.strip_prefix("gep ") {
         let (base, k, terms) = parse_gep_expr(rest);
-        return Inst::Gep(Gep { dst, base, k, terms });
+        return Inst::Gep(Gep {
+            dst,
+            base,
+            k,
+            terms,
+        });
     }
     if let Some(rest) = body.strip_prefix("freeze ") {
         let mut it = rest.split_whitespace();
@@ -820,10 +1319,17 @@ fn parse_inst(line: &str) -> Inst {
         return Inst::Fcmp(Fcmp { dst, pred, a, b });
     }
     // conversions/casts: `%d = fptosi <from> <val> to <to>` etc.
-    if matches!(op, "fptosi" | "fptoui" | "sitofp" | "uitofp" | "fpext" | "fptrunc") {
+    if matches!(
+        op,
+        "fptosi" | "fptoui" | "sitofp" | "uitofp" | "fpext" | "fptrunc"
+    ) {
         let from = parse_ty(it.next().unwrap());
         let val = parse_val(it.next().unwrap());
-        assert_eq!(it.next().unwrap(), "to", "{op} must be '%d = {op} <t> <v> to <t2>'");
+        assert_eq!(
+            it.next().unwrap(),
+            "to",
+            "{op} must be '%d = {op} <t> <v> to <t2>'"
+        );
         let to = parse_ty(it.next().unwrap());
         let o = match op {
             "fptosi" => FloatConvOp::FpToSi,
@@ -833,7 +1339,13 @@ fn parse_inst(line: &str) -> Inst {
             "fpext" => FloatConvOp::Fpext,
             _ => FloatConvOp::Fptrunc,
         };
-        return Inst::FloatConv(FloatConv { dst, op: o, from, val, to });
+        return Inst::FloatConv(FloatConv {
+            dst,
+            op: o,
+            from,
+            val,
+            to,
+        });
     }
     let t = parse_ty(it.next().unwrap());
     let a = parse_val(it.next().unwrap());
@@ -854,5 +1366,11 @@ fn parse_inst(line: &str) -> Inst {
         "ashr" => BinOp::AShr,
         other => panic!("unsupported op {other}"),
     };
-    Inst::Bin(Bin { dst, op, ty: t, a, b })
+    Inst::Bin(Bin {
+        dst,
+        op,
+        ty: t,
+        a,
+        b,
+    })
 }

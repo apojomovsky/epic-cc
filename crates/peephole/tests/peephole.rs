@@ -63,7 +63,8 @@ fn tracked_value_resets_at_labels() {
     // function's CALL set (a real multi-page miscompile this rule fixes), so
     // the tracked literal is forgotten at every label and the second pair is
     // kept.
-    let asm = "    MOVLW 0x08\n    MOVWF PCLATH\n    GOTO lbl\nlbl:\n    MOVLW 0x08\n    MOVWF PCLATH\n";
+    let asm =
+        "    MOVLW 0x08\n    MOVWF PCLATH\n    GOTO lbl\nlbl:\n    MOVLW 0x08\n    MOVWF PCLATH\n";
     assert_eq!(optimize(asm), asm);
 }
 

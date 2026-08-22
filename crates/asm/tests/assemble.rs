@@ -142,7 +142,10 @@ fn device_flash_exact_fill_does_not_panic() {
     src.push_str("    end\n");
     let hex = assemble_file_to_hex(&device::PIC16F877A, &src);
     assert!(hex.contains(":00000001FF\n"), "missing EOF record: {hex:?}");
-    assert!(hex.lines().count() > 2, "full-flash image must span records");
+    assert!(
+        hex.lines().count() > 2,
+        "full-flash image must span records"
+    );
 }
 
 #[test]
@@ -152,7 +155,10 @@ fn program_at_word_0x1000_assembles() {
     // bound (< 0x2000). A single instruction placed at 0x1000 is legal now.
     let src = "    org 0x1000\n    movlw 0x2A\n    end\n";
     let words = assemble_file_to_hex(&device::PIC16F877A, &src);
-    assert!(words.contains(":00000001FF\n"), "missing EOF record: {words:?}");
+    assert!(
+        words.contains(":00000001FF\n"),
+        "missing EOF record: {words:?}"
+    );
 }
 
 // ---- Milestone 11: PAGE(label) resolution ----
@@ -200,7 +206,11 @@ fn low_high_page_accept_numeric_operands() {
     let words = assemble(src);
     assert_eq!(words[0], 0x3000 | 0x2A, "LOW(0x2A)");
     assert_eq!(words[1], 0x3000 | 0x01, "HIGH(0x123)");
-    assert_eq!(words[2], 0x3000 | 0x10, "PAGE(0x1234) = (0x1234 >> 11) << 3");
+    assert_eq!(
+        words[2],
+        0x3000 | 0x10,
+        "PAGE(0x1234) = (0x1234 >> 11) << 3"
+    );
     assert_eq!(words[3], 0x3000 | 0x04, "LOW(0x4) — unpadded hex operand");
     assert_eq!(words[4], 0x3000 | 0x23, "LOW(35) — decimal operand");
     assert_eq!(words[5], 0x3000 | 0x2A, "LOW(0x2a) — lowercase hex operand");
@@ -218,7 +228,8 @@ fn panics_on_backward_org() {
     // later pass (banking) inserting words could push a page base
     // backwards, and the silent overwrite would misbranch. It must panic
     // loudly instead.
-    let src = "    org 0x0000\n    movlw 0x01\n    movlw 0x02\n    movlw 0x03\n    org 0x0000\n    end\n";
+    let src =
+        "    org 0x0000\n    movlw 0x01\n    movlw 0x02\n    movlw 0x03\n    org 0x0000\n    end\n";
     let _ = assemble(src);
 }
 
@@ -232,7 +243,10 @@ fn forward_org_and_same_address_org_assemble() {
     let words = assemble(src);
     assert_eq!(words[0x000], 0x3001);
     assert_eq!(words[0x800], 0x3002);
-    assert_eq!(words[0x801], 0x3003, "same-address .org emits the next word in place");
+    assert_eq!(
+        words[0x801], 0x3003,
+        "same-address .org emits the next word in place"
+    );
 }
 
 // ---- Milestone 10: const-table window-fit directives ----

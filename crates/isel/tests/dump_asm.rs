@@ -1,6 +1,6 @@
 use device::PIC16F877A;
-use isel::select;
 use ir::parse;
+use isel::select;
 
 #[test]
 fn dump_mul_asm() {
