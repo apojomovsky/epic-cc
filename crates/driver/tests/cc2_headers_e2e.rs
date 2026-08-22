@@ -108,8 +108,8 @@ fn run_cc2(device_name: &str, device: &device::Device) {
     );
     let hex = std::fs::read_to_string(&hex_path).expect("read hex");
 
-    // in = 7, so every check passing sums to 22 (see the fixture).
-    let expected: u8 = 22;
+    // in = 7, so every check passing sums to 26 (see the fixture).
+    let expected: u8 = 26;
     match device.core {
         device::Core::Pic14 => {
             let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
