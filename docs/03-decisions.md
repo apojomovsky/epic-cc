@@ -1,4 +1,4 @@
-# 03 — Architecture decision records
+# 03 -- Architecture decision records
 
 Each ADR records what was decided, why, what was rejected, and what would make us revisit.
 Evidence for these lives in [`02-prior-art.md`](02-prior-art.md).
@@ -7,19 +7,20 @@ ADR-001 through ADR-008 live in this file. **Newer ADRs live one-per-file in
 [`docs/adr/`](adr/)** (`ADR-00N-<topic>.md`, N continuing from 008). Each new ADR adds a
 one-line index entry here, e.g.:
 
-- ADR-009 — PIC18 pointer model: shared GEP fold, single FSR0, no PLUSWn, 2026-08-20
-- ADR-010 — PIC18 const via TBLRD (DB-packed flash, per-byte TBLPTR re-setup), 2026-08-20
-- ADR-011 — Multi-TU front end: llvm-link merge, sanitize in irparse, 2026-08-20
+- ADR-009 -- PIC18 pointer model: shared GEP fold, single FSR0, no PLUSWn, 2026-08-20
+- ADR-010 -- PIC18 const via TBLRD (DB-packed flash, per-byte TBLPTR re-setup), 2026-08-20
+- ADR-011 -- Multi-TU front end: llvm-link merge, sanitize in irparse, 2026-08-20
 - ADR-012: CC-3 silicon-real codegen: EPIC_FOSC_HZ arithmetic, HEX regions, alloc placement, and simulator sizing, 2026-08-21
-- ADR-013 — PIC18 interrupts: single-vector compat mode, MOVFF save area, 2026-08-20
-- ADR-014 — PIC18 arithmetic routines: hardware MULWF schoolbook, branch-based divmod, 2026-08-20
-- ADR-015 — PIC18 soft-float: port of PIC14 recipes, 2026-08-20
-- ADR-016 — PIC18 fuzz gate: device-threaded differential runner, 2026-08-21
+- ADR-013 -- PIC18 interrupts: single-vector compat mode, MOVFF save area, 2026-08-20
+- ADR-014 -- PIC18 arithmetic routines: hardware MULWF schoolbook, branch-based divmod, 2026-08-20
+- ADR-015 -- PIC18 soft-float: port of PIC14 recipes, 2026-08-20
+- ADR-016 -- PIC18 fuzz gate: device-threaded differential runner, 2026-08-21
 - ADR-017: CC-4 inline assembly: naked, module asm, opaque blocks, header intrinsics, 2026-08-21
 - ADR-018: CC-2 freestanding libc: stdint/stdbool/stddef headers + a linked-on-demand string.h, 2026-08-21
+- ADR-019: PIC variants -- file-per-device TOML + build.rs codegen + --target + canonical-per-core CI, 2026-08-22
 ---
 
-## ADR-001 — clang as an out-of-process front end; custom PIC14 backend
+## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 
 **Status:** Accepted 2026-08-14 (user-approved)
 
@@ -48,7 +49,7 @@ your .c files ──► clang -S -emit-llvm ──► .ll text ──► [our co
 passes.
 
 **Avoided:** LLVM API churn (no rebuilding against LLVM 19→20→21), a multi-gigabyte build
-dependency, a C++ plugin architecture, and — decisively — a permanent fork of LLVM's
+dependency, a C++ plugin architecture, and -- decisively -- a permanent fork of LLVM's
 target-independent core.
 
 ### Rationale
@@ -59,7 +60,7 @@ be repeated: llvm-mos disproves it. The correct argument is about cost:
 - llvm-mos succeeded, at the price of a **22,421-line diff from upstream outside their own
   target directory**, including major surgery on Loop Strength Reduction.
 - llvm-pic attempted **our exact target** (`PICMid`) with 3 people over ~18 months, with
-  direct mentorship from the llvm-mos team, aiming at a language subset far below ours —
+  direct mentorship from the llvm-mos team, aiming at a language subset far below ours --
   and was archived in November 2025 without working `CALL`/`GOTO` and without having
   started on banking at all.
 
@@ -72,13 +73,13 @@ diffable, snapshottable artifact.
 
 ### Rejected alternatives
 
-**B — Fork SDCC's pic14 port.** Would inherit device headers, a library, a regression
+**B -- Fork SDCC's pic14 port.** Would inherit device headers, a library, a regression
 suite, and users. Rejected: the port is unmaintained and fails its own regression tests;
 it is architected around per-file compilation, which fights whole-program overlay
 allocation; and understanding a large old C codebase costs roughly what writing fresh
 costs.
 
-**C — Write our own C front end (chibicc/lcc style), no LLVM at all.** Zero external
+**C -- Write our own C front end (chibicc/lcc style), no LLVM at all.** Zero external
 dependencies, total control, small enough to hold in context. Rejected *as a starting
 point*: we would re-litigate integer promotions, bitfields, designated initializers,
 constant expressions, and varargs indefinitely, and with no optimizer, code density would
@@ -97,12 +98,12 @@ backend is proven.
 
 ### Revisit if
 
-The spike shows `.ll` text is an unworkable interface — in which case Approach C (own front
+The spike shows `.ll` text is an unworkable interface -- in which case Approach C (own front
 end) becomes the fallback, not the LLVM backend route.
 
 ---
 
-## ADR-002 — Whole-program compilation; we own the toolchain down to HEX
+## ADR-002 -- Whole-program compilation; we own the toolchain down to HEX
 
 **Status:** Accepted 2026-08-14 (user-approved)
 
@@ -117,7 +118,7 @@ ourselves. No external assembler or linker in the shipping product.
 On PIC14 the **allocator is the compiler**. Since locals cannot live on a stack, every
 local must be statically allocated and non-interfering frames overlaid using the whole call
 graph. This requires whole-program visibility by construction. A traditional separate
-compilation + relocatable linking model fights this hard — which is precisely the
+compilation + relocatable linking model fights this hard -- which is precisely the
 architectural trap SDCC's pic14 port is in.
 
 Owning the assembler is cheap: 35 instructions, fixed 14-bit encoding. Owning it removes an
@@ -127,9 +128,9 @@ encoding live in one place.
 ### Rejected alternatives
 
 - **Emit `.asm`, hand off to gputils (gpasm/gplink).** gputils is actively maintained
-  (v1.5.2, 2025-10-23 — an earlier assumption that it was abandoned was wrong). But
+  (v1.5.2, 2025-10-23 -- an earlier assumption that it was abandoned was wrong). But
   relocatable linking makes whole-program overlay allocation awkward; we would end up
-  bypassing `gplink` anyway. **We still use `gpasm` as a test-time cross-check oracle** —
+  bypassing `gplink` anyway. **We still use `gpasm` as a test-time cross-check oracle** --
   that is different from depending on it.
 - **Emit `.asm`, hand off to Microchip `pic-as`.** Modern, correct, knows every device.
   Rejected: proprietary, non-redistributable, and it makes the project unusable for anyone
@@ -137,7 +138,7 @@ encoding live in one place.
 
 ---
 
-## ADR-003 — Steal llvm-mos's two techniques, not its implementation
+## ADR-003 -- Steal llvm-mos's two techniques, not its implementation
 
 **Status:** Accepted 2026-08-14
 
@@ -167,7 +168,7 @@ ceiling. Validating it is spike question 3.
 
 ---
 
-## ADR-004 — Device support is data, not code
+## ADR-004 -- Device support is data, not code
 
 **Status:** Accepted 2026-08-14 (presented, pending final design approval)
 
@@ -184,7 +185,7 @@ being actively maintained makes its `.inc` files a durable upstream source.
 
 ---
 
-## ADR-005 — Implement in Rust
+## ADR-005 -- Implement in Rust
 
 **Status:** Accepted 2026-08-14 (user-approved)
 
@@ -201,16 +202,16 @@ preference:
   at build time.
 - `cargo test` needs no build-system babysitting.
 - Exhaustive `match` over instruction and IR enums turns every unhandled case into a
-  compile error rather than a silent miscompile — which matters enormously in a project
+  compile error rather than a silent miscompile -- which matters enormously in a project
   whose failure mode *is* silent miscompilation.
 - Snapshot testing (`insta`) fits a text-in/text-out pipeline exactly.
 
-C++ would be the alternative if we ever wanted to link libLLVM — but ADR-001 says we never
+C++ would be the alternative if we ever wanted to link libLLVM -- but ADR-001 says we never
 do, which removes the main reason to choose it.
 
 ---
 
-## ADR-006 — XC8 is a black-box oracle, never a reverse-engineering target
+## ADR-006 -- XC8 is a black-box oracle, never a reverse-engineering target
 
 **Status:** Accepted 2026-08-14 (user-accepted after being raised as a concern)
 
@@ -223,8 +224,8 @@ and observing its output and behaviour.
 
 The original project idea included disassembling XC8 binaries to reproduce their behaviour.
 Two problems: the XC8 licence forbids reverse engineering, and it is the *slow* path
-regardless. Black-box differential testing — compile the same C with both compilers, run
-both on our simulator, compare observable state — is legally clean, faster, and yields a
+regardless. Black-box differential testing -- compile the same C with both compilers, run
+both on our simulator, compare observable state -- is legally clean, faster, and yields a
 permanent regression oracle, which is exactly what unsupervised agent work needs.
 
 Everything genuinely load-bearing is public: datasheets, the ISA, the XC8 user guide's ABI
@@ -232,7 +233,7 @@ chapter, and SDCC/gputils source.
 
 ---
 
-## ADR-007 — Nix flake + direnv for isolated, reproducible builds
+## ADR-007 -- Nix flake + direnv for isolated, reproducible builds
 
 **Status:** Accepted 2026-08-14 (user-approved)
 
@@ -257,18 +258,18 @@ Secondary: `nix develop --command <cmd>` is a one-line, daemon-free, scriptable 
 point, which serves the autonomy requirement in [`00-charter.md`](00-charter.md).
 
 The host already had `nix` (2.34.8, flakes enabled) and `direnv` (2.37.1) installed, and
-nixpkgs carries `gputils` at exactly 1.5.2 — the current upstream release — plus `cvise`,
+nixpkgs carries `gputils` at exactly 1.5.2 -- the current upstream release -- plus `cvise`,
 `creduce`, and `csmith`.
 
 ### Rejected alternatives
 
 All were already installed on the host, so availability was not the differentiator:
 
-- **Docker / podman** — familiar, and trivially handles proprietary vendor blobs. Rejected
+- **Docker / podman** -- familiar, and trivially handles proprietary vendor blobs. Rejected
   as primary: reproducibility is only as good as base-image and `apt` pinning, which drift.
   The flake can still emit an OCI image via `dockerTools` if CI portability is ever needed,
   keeping one source of truth.
-- **Pixi / conda-forge** — good lockfile story and much gentler than Nix. Rejected:
+- **Pixi / conda-forge** -- good lockfile story and much gentler than Nix. Rejected:
   `gputils` and `gpsim` are not on conda-forge, and conda is a poor fit for GTK-linked
   system tooling like gpsim.
 
@@ -289,7 +290,7 @@ we need proves genuinely impractical to package.
 
 ---
 
-## ADR-008 — Docker multi-stage toolchain replaces the Nix flake
+## ADR-008 -- Docker multi-stage toolchain replaces the Nix flake
 
 **Status:** Accepted 2026-08-19 (user-approved); supersedes ADR-007
 
@@ -318,20 +319,20 @@ LLVM 20.1.8 source tarball with static LLVM libraries. Full detail in
   CI, ccache cache mount locally. The clang layer is rebuilt only when a pin
   changes.
 - **Minimum supported Linux is Ubuntu 22.04 (glibc ≥ 2.35)**, set by the
-  base image — a version floor, not an installable dependency.
+  base image -- a version floor, not an installable dependency.
 
 ### Rejected alternatives
 
-- **Nix-built clang + patchelf into the bundle** — two toolchains, store
+- **Nix-built clang + patchelf into the bundle** -- two toolchains, store
   paths, relocation surgery.
-- **Distro clang (apt)** — drifts from the pin; clang's version is part of
+- **Distro clang (apt)** -- drifts from the pin; clang's version is part of
   our input format.
-- **Fully static clang** — glibc is hostile to static linking (dlopen-based
+- **Fully static clang** -- glibc is hostile to static linking (dlopen-based
   NSS/iconv), LLVM does not support it out of the box, and it buys nothing:
   glibc is the OS, not an install.
 
 ### Revisit if
 
 The clang build cost becomes a bottleneck (mitigated by the cache), or a
-second platform (macOS/ARM64) needs the same toolchain — the stage layout
+second platform (macOS/ARM64) needs the same toolchain -- the stage layout
 generalizes.
