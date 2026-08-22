@@ -60,13 +60,27 @@ different providers and on different machines, share one GitHub account, so the
 board is the only place that knows what is already taken. **Do not choose a
 ticket by reading the issue list.**
 
+Run once per machine (and after any env change):
+
+0. `epic-tasks doctor` — checks `EPIC_AGENT_ID`, `EPIC_TASKS_PROJECT`,
+   `gh` auth with `project` scope, and board reachability. Fix what it
+   reports before claiming.
+
+For every ticket:
+
 1. `epic-tasks next` to see what you may take, `epic-tasks claim <repo>#<n>` to
    take it. Exit 2 means another agent won the race, so go back to `next`.
    Exit 3 means the board is unreachable: do the work and say so in the pull
    request. Exit 4 means stop and ask.
-2. Branch as `<type>/<issue>-<slug>`, for example `fix/71-switch-default-branch`.
-3. Open the pull request with `Closes #N`, then
+2. Create a worktree under `.worktrees/` and branch as
+   `<type>/<issue>-<slug>`, for example `fix/71-switch-default-branch`
+   (see Worktrees below — never work on `master`).
+3. Work, then run the takeoff ritual (`make pre-pr-check` → `epic-tasks takeoff`).
+4. Open the pull request with `Closes #N`, then
    `epic-tasks review <repo>#<n> --pr <url>`.
+5. After the PR merges, remove the worktree:
+   `git worktree remove .worktrees/<name>`. Never remove a worktree before
+   merge — the branch must stay reachable for review.
 
 Set `EPIC_AGENT_ID` (`<runtime>@<host>`) and `EPIC_TASKS_PROJECT` once per
 runtime and machine. `claim` refuses to act without an identity, because an
@@ -80,17 +94,23 @@ blocked, taken, or conflicting is decided there, not in this file.
 ## Worktrees
 
 **All feature work happens in a worktree under `.worktrees/`**, never on
-`master`:
+`master`, and worktrees are removed only after the PR merges:
 
 ```bash
 git fetch origin master
 git worktree add .worktrees/<name> -b <branch> origin/master
+# ... work, PR, merge ...
+git worktree remove .worktrees/<name>
 ```
 
 Branch names are conventional: `feat/<description>`, `fix/<description>`,
 `chore/<description>`, `docs/<description>`. The worktree keeps your
 master checkout clean and lets several tasks run in parallel without
-touching each other's trees.
+touching each other's trees. Squash merging keeps master plan-free.
+
+Worktree discipline is enforced by the takeoff ritual (`epic-tasks takeoff`
+checks you are in a `.worktrees/` worktree and not on `master`).
+
 
 ## Development cycle
 
@@ -107,17 +127,20 @@ through the whole pipeline, and differential fuzzing (`crates/fuzz`).
 
 ## Takeoff ritual (before every PR)
 
-Run `make pre-pr-check` before opening a PR. It is the gate; it checks:
+Run `make pre-pr-check` before opening a PR. It is a thin wrapper around
+`epic-tasks takeoff`, the shared skeleton used by every epic repository
+(canonical checks live in `epic-tasks/epic_tasks/takeoff.py`). It checks:
 
-1. Working tree clean, branch not behind `origin/master`.
-2. **No plan files in the PR's final diff.** Plans live through
+1. Working tree clean, branch not behind `origin/master` (or `$BASE_REF`).
+2. **You are in a `.worktrees/` worktree**, not on `master`.
+3. **No plan files in the PR's final diff.** Plans live through
    development; the final commit distills load-bearing decisions into
    an ADR (`docs/adr/ADR-00N-<topic>.md` + an index line in
    `docs/03`) and `git rm`s the plan. Squash merging then keeps master
    plan-free. The plan stays visible in the PR's commit history.
-3. Commit hygiene: conventional single-line subjects, no trailers,
+4. Commit hygiene: conventional single-line subjects, no trailers,
    no em-dashes, no whitespace errors.
-4. **Compiler warnings.** `cargo build --workspace --all-targets` must
+5. **Compiler warnings.** `cargo build --workspace --all-targets` must
    be clean (`make check-warnings`). Hard gate, unlike `make lint`
    (clippy): rustc's own lints (`unused_mut`, `dead_code`,
    `unused_variables`, `non_snake_case`, `unused_assignments`, ...) are
@@ -126,7 +149,7 @@ Run `make pre-pr-check` before opening a PR. It is the gate; it checks:
    `crates/alloc`'s history). `.githooks/pre-commit` runs the same
    check on every commit that touches `*.rs`, so this should already
    be clean by the time the ritual runs.
-5. **Comment and doc prose review.** `scripts/prose-diff.sh` extracts
+6. **Comment and doc prose review.** `scripts/prose-diff.sh` extracts
    every added comment block and markdown diff hunk in the PR; it
    flags a couple of objective signals (block over 3 lines, a
    hardcoded count or tree dump) but cannot judge content, so it never
@@ -136,12 +159,12 @@ Run `make pre-pr-check` before opening a PR. It is the gate; it checks:
    narrative; docs stay clear and skip volatile facts) and fixes
    what doesn't hold up. `make pre-pr-check PROSE=1` records that the
    review happened.
-6. Hooks installed (`make setup-hooks`).
-7. `make pre-pr-check TEST=1` also runs the full suite.
+7. Hooks installed (`make setup-hooks`).
+8. `make pre-pr-check TEST=1` also runs the full suite (or `epic-tasks takeoff --test`).
 
-The script exits 1 with the exact fix list while blocking items are
+The ritual exits 1 with the exact fix list while blocking items are
 outstanding. Don't skip it; the CI gate only covers the suite, not the
-ritual.
+ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
 
 ## Commit hygiene
 
