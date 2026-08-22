@@ -1478,7 +1478,7 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
         match t.as_str() {
             "ptr" | "dead_on_unwind" | "noalias" | "nocapture" | "writable" | "writeonly"
             | "readonly" | "readnone" | "nonnull" | "noundef" | "zeroext" | "signext"
-            | "immarg" | "sret" | "byval" | "returned" => {}
+            | "immarg" | "sret" | "byval" | "returned" | "..." => {}
             "align" => skip_next = true,
             "i1" | "i8" | "i16" | "i32" | "float" | "f32" => scalar = Some(ty_of(t)),
             _ => {
@@ -1760,7 +1760,7 @@ pub fn parse_ll(src: &str) -> Module {
             let mut params = Vec::new();
             for p in split_top_level(params_str, ',') {
                 let p = p.trim();
-                if p.is_empty() {
+                if p.is_empty() || p == "..." {
                     continue;
                 }
                 params.push(parse_param(p, &types));
@@ -2198,7 +2198,25 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         }
         "call" => {
             let body = rest["call".len()..].trim();
-            let open = body.find('(').unwrap();
+            // Find the callee's '(' — the one after `@func` or `%reg`,
+            // not a '(' inside a preceding prototype `(ptr, ...)` or inside
+            // an arg attribute like `dereferenceable(10)`.  The callee is
+            // the first `@` or `%` in the body (the `call` already stripped
+            // its `tail`/`fastcc` markers), and its args '(' follows it.
+            let at = body.find('@');
+            let pct = body.find('%');
+            let callee_pos = match (at, pct) {
+                (Some(a), Some(p)) => Some(a.min(p)),
+                (Some(a), None) => Some(a),
+                (None, Some(p)) => Some(p),
+                (None, None) => None,
+            };
+            let open = if let Some(pos) = callee_pos {
+                let after = &body[pos..];
+                after.find('(').map(|i| pos + i).unwrap_or_else(|| body.find('(').unwrap())
+            } else {
+                body.find('(').unwrap()
+            };
             let head = &body[..open];
             let func = head
                 .split_whitespace()
@@ -2242,12 +2260,24 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     args.push(parse_call_arg(ap, types, fresh, &mut out));
                 }
                 let first = head.trim();
+                // Return type is the first type token in the head, skipping
+                // leading attributes like `zeroext`/`signext` and the varargs
+                // prototype `(ptr, ...)` that appears for `call void (ptr, ...)
+                // @varargs` callees. The head for `call void (ptr, ...)
+                // @epic_harness_log(...)` is `void (ptr, ...) @epic_harness_log`,
+                // whose first type token is still `void`.
                 let head_parts: Vec<&str> = first.split_whitespace().collect();
-                let ret_tok = if head_parts.len() >= 2 {
-                    head_parts[head_parts.len() - 2].to_string()
-                } else {
-                    "void".to_string()
-                };
+                let mut ret_tok = "void".to_string();
+                for tok in head_parts {
+                    let clean = tok.split('(').next().unwrap().trim_end_matches(',');
+                    match clean {
+                        "void" | "i1" | "i8" | "i16" | "i32" | "ptr" | "float" | "f32" => {
+                            ret_tok = clean.to_string();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
                 let ty = if ret_tok == "void" {
                     None
                 } else {

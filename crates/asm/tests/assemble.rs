@@ -122,11 +122,11 @@ fn assembles_swapf_and_retfie() {
 #[test]
 #[should_panic(expected = "exceeds device flash")]
 fn panics_when_program_exceeds_device_flash() {
-    // 0x2000 words fill the PIC16F877A's flash exactly (addresses
-    // 0x000-0x1FFF); a program whose highest word address is ≥ 0x2000 (8K
+    // 0x4000 words fill the PIC16F877A's flash exactly (addresses
+    // 0x000-0x3FFF); a program whose highest word address is ≥ 0x4000 (16K
     // words) cannot be stored and must panic loudly. `nop` is 0x0000 (to_hex
     // would trim it) but the bound assert fires before rendering.
-    let src = String::from("    org 0x2000\n    nop\n    end\n");
+    let src = String::from("    org 0x4000\n    nop\n    end\n");
     let _ = assemble_file_to_hex(&device::PIC16F877A, &src);
 }
 

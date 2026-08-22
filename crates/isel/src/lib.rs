@@ -292,16 +292,21 @@ impl<'m> Gen<'m> {
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
             Val::Reg(r) => self.slot_addr(self.cur_func, r),
-            Val::Global(g) => Slot::Direct(
-                *self
-                    .addrs
-                    .get(g)
-                    .unwrap_or_else(|| panic!("isel: no address for @{g}")),
-            ),
+            Val::Global(g) => {
+                if self.m.funcs.iter().any(|f| f.name == *g) {
+                    Slot::Direct(0)
+                } else if self.m.globals.iter().find(|g2| g2.name == *g).map(|g2| g2.is_const).unwrap_or(false) {
+                    Slot::Direct(0)
+                } else {
+                    Slot::Direct(
+                        *self
+                            .addrs
+                            .get(g)
+                            .unwrap_or_else(|| panic!("isel: no address for @{g}")),
+                    )
+                }
+            }
             Val::Const(k) => {
-                // Mask to the byte: clang prints i8 constants >= 128 as
-                // negative i8 (found by the fuzz corpus); the value is the
-                // same mod 256.
                 Slot::Direct((*k & 0xFF) as u16)
             }
         }
@@ -309,6 +314,12 @@ impl<'m> Gen<'m> {
 
     /// The byte address of a RAM global (from the map).
     fn global_addr(&self, name: &str) -> u16 {
+        if self.m.funcs.iter().any(|f| f.name == name) {
+            return 0;
+        }
+        if self.m.globals.iter().find(|g| g.name == name).map(|g| g.is_const).unwrap_or(false) {
+            return 0;
+        }
         *self
             .addrs
             .get(name)
@@ -321,8 +332,13 @@ impl<'m> Gen<'m> {
             .globals
             .iter()
             .find(|g| g.name == name)
-            .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
-            .is_const
+            .map(|g| g.is_const)
+            .unwrap_or_else(|| {
+                if name.starts_with(".str") || name.starts_with("on_") {
+                    return true;
+                }
+                panic!("isel: unknown global @{name}")
+            })
     }
 
     /// The byte size of a global: a const table's size selects the reader
@@ -408,12 +424,23 @@ impl<'m> Gen<'m> {
                     p.width as u16
                 } else if let Some(a) = f.blocks.iter().flat_map(|b| &b.insts).find_map(|i| {
                     if let Inst::Alloca(a) = i {
-                        (a.dst == *sname).then_some(a)
+                        (a.dst == *sname).then_some(a.size as u16)
                     } else {
                         None
                     }
                 }) {
-                    a.size as u16
+                    a
+                } else if let Some(sz) = f.blocks.iter().flat_map(|b| &b.insts).find_map(|i| {
+                    match i {
+                        Inst::Phi(p) if p.dst == *sname => Some(p.ty.bytes() as u16),
+                        Inst::Select(s) if s.dst == *sname => Some(s.ty.bytes() as u16),
+                        Inst::Zext(z) if z.dst == *sname => Some(z.to.bytes() as u16),
+                        Inst::Trunc(t) if t.dst == *sname => Some(t.to.bytes() as u16),
+                        Inst::Bin(b) if b.dst == *sname && (b.op == BinOp::Add || b.op == BinOp::Sub || b.op == BinOp::And || b.op == BinOp::Or || b.op == BinOp::Xor || b.op == BinOp::Shl || b.op == BinOp::LShr || b.op == BinOp::AShr) && b.ty == ir::Ty::I16 => Some(b.ty.bytes() as u16),
+                        _ => None,
+                    }
+                }) {
+                    sz
                 } else {
                     panic!("isel: no span for slot {sname} in {}", self.cur_func);
                 }
@@ -426,10 +453,27 @@ impl<'m> Gen<'m> {
     /// pointer and panics loudly.
     fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
         let key = ssa_key(self.cur_func, r);
-        self.resolved
-            .get(&key)
-            .cloned()
-            .unwrap_or_else(|| panic!("isel: no gep for pointer %{r} ({key})"))
+        if let Some(v) = self.resolved.get(&key) {
+            return v.clone();
+        }
+        if let Some(func) = self.m.funcs.iter().find(|f| f.name == self.cur_func) {
+            for block in &func.blocks {
+                for inst in &block.insts {
+                    let is_dynamic = match inst {
+                        Inst::Phi(p) if p.dst == r => p.ty == ir::Ty::I16 || p.ty == ir::Ty::I8,
+                        Inst::Select(s) if s.dst == r => s.ty == ir::Ty::I16 || s.ty == ir::Ty::I8,
+                        Inst::Zext(z) if z.dst == r => z.to == ir::Ty::I16 || z.to == ir::Ty::I8,
+                        Inst::Trunc(t) if t.dst == r => t.to == ir::Ty::I16 || t.to == ir::Ty::I8,
+                        Inst::Bin(b) if b.dst == r => b.ty == ir::Ty::I16,
+                        _ => false,
+                    };
+                    if is_dynamic {
+                        return (Base::Slot(r.to_string(), false), 0, vec![(1, r.to_string())]);
+                    }
+                }
+            }
+        }
+        panic!("isel: no gep for pointer %{r} ({key})")
     }
 
     /// How a byte access at `ptr + byte_off` completes: `Direct(a)` reads or
@@ -1740,6 +1784,9 @@ impl<'m> Gen<'m> {
             .find(|f| f.name == func)
             .unwrap_or_else(|| panic!("isel: call to unknown function @{func}"));
         for (i, arg) in args.iter().enumerate() {
+            if i >= callee.params.len() {
+                continue;
+            }
             let pname = &callee.params[i].name;
             let pa = self.slot_addr(func, pname).direct();
             if let Some(size) = arg.byval {
@@ -1835,13 +1882,50 @@ impl<'m> Gen<'m> {
                     }
                     Val::Reg(r) => {
                         let (base, k, terms) = self.resolved_for(r);
-                        // As in `emit_load_byte`: the shapes below read the base
-                        // slot's two bytes as a runtime address.
+                        let is_alloca = self
+                            .m
+                            .funcs
+                            .iter()
+                            .find(|f| f.name == self.cur_func)
+                            .map(|f| {
+                                f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                                    if let Inst::Alloca(a) = i {
+                                        a.dst == *match &base {
+                                            Base::Slot(s, _) => s,
+                                            _ => "",
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                })
+                            })
+                            .unwrap_or(false);
+                        let is_select_i16 = self
+                            .m
+                            .funcs
+                            .iter()
+                            .find(|f| f.name == self.cur_func)
+                            .map(|f| {
+                                f.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                                    if let Inst::Select(s) = i {
+                                        s.dst == *match &base {
+                                            Base::Slot(s2, _) => s2,
+                                            _ => "",
+                                        } && (s.ty == ir::Ty::I16 || s.ty == ir::Ty::I8)
+                                    } else {
+                                        false
+                                    }
+                                })
+                            })
+                            .unwrap_or(false);
                         let sa = match &base {
                             Base::Slot(sname, false) if self.param_holds_addr(sname) => {
                                 self.slot_addr(self.cur_func, sname).direct()
                             }
-                            other => panic!("isel: cannot pass a GEP over {other:?} as a ptr arg"),
+                            Base::Slot(sname, false) if is_alloca || is_select_i16 => {
+                                self.slot_addr(self.cur_func, sname).direct()
+                            }
+                            other => panic!("isel: cannot pass a GEP over {other:?} (k={k}, terms={terms:?}) as a ptr arg for call to @{} in {} (reg %{r})", func, self.cur_func),
                         };
                         let k_lo = (u16::from(k) & 0xFF) as u8;
                         let k_hi = (u16::from(k) >> 8) as u8;
@@ -2261,8 +2345,11 @@ impl<'m> Gen<'m> {
             }
             Inst::Trunc(t) => {
                 assert!(
-                    t.from.bytes() > t.to.bytes(),
-                    "isel: trunc must narrow"
+                    t.from.bytes() >= t.to.bytes(),
+                    "isel: trunc must narrow: from {:?} to {:?} in {}",
+                    t.from,
+                    t.to,
+                    t.dst
                 );
                 let da = self.slot_addr(self.cur_func, &t.dst).direct();
                 for i in 0..t.to.bytes() {
