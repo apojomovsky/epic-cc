@@ -62,7 +62,7 @@ ticket by reading the issue list.**
 
 Run once per machine (and after any env change):
 
-0. `epic-tasks doctor` — checks `EPIC_AGENT_ID`, `EPIC_TASKS_PROJECT`,
+0. `epic-tasks doctor`: checks `EPIC_AGENT_ID`, `EPIC_TASKS_PROJECT`,
    `gh` auth with `project` scope, and board reachability. Fix what it
    reports before claiming.
 
@@ -74,13 +74,14 @@ For every ticket:
    request. Exit 4 means stop and ask.
 2. Create a worktree under `.worktrees/` and branch as
    `<type>/<issue>-<slug>`, for example `fix/71-switch-default-branch`
-   (see Worktrees below — never work on `master`).
+   (see Worktrees below, never work on `master`).
 3. Work, then run the takeoff ritual (`make pre-pr-check` → `epic-tasks takeoff`).
 4. Open the pull request with `Closes #N`, then
    `epic-tasks review <repo>#<n> --pr <url>`.
 5. After the PR merges, remove the worktree:
    `git worktree remove .worktrees/<name>`. Never remove a worktree before
-   merge — the branch must stay reachable for review.
+   merge, the branch must stay reachable for review.
+
 
 Set `EPIC_AGENT_ID` (`<runtime>@<host>`) and `EPIC_TASKS_PROJECT` once per
 runtime and machine. `claim` refuses to act without an identity, because an
