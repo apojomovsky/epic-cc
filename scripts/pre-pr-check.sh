@@ -61,7 +61,7 @@ else
 fi
 
 # ── 3. Implementation plans must not reach master ──────────────────
-plans=$(git diff --name-only "$BASE_REF"...HEAD -- docs/superpowers/plans/ 2>/dev/null)
+plans=$(git diff --name-only --diff-filter=AM "$BASE_REF"...HEAD -- docs/superpowers/plans/ 2>/dev/null)
 if [ -n "$plans" ]; then
   fail "plan file(s) in the PR's final diff (must not reach master):"
   for p in $plans; do
