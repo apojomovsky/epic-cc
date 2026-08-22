@@ -5,33 +5,16 @@
 use std::process::Command;
 
 fn layout_for(device: &device::Device, fixture: &str) -> alloc::AllocLayout {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-    let ll = Command::new(clang)
-        .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-resource-dir",
-            resdir.as_str(),
-            "-I",
-            "tests/fixtures",
-            fixture,
-            "-o",
-            "-",
-        ])
-        .output()
-        .expect("run clang");
-    assert!(
-        ll.status.success(),
-        "clang failed: {}",
-        String::from_utf8_lossy(&ll.stderr)
+    let (clang, resdir) = driver::clang::pic_clang_from_env();
+    let ll_text = driver::clang::compile_to_stdout(
+        &clang,
+        &resdir,
+        std::path::Path::new(fixture),
+        &driver::clang::Options {
+            includes: vec!["tests/fixtures".to_string()],
+            ..Default::default()
+        },
     );
-    let ll_text = String::from_utf8(ll.stdout).unwrap();
     {
         let m0 = irparse::parse_ll(&ll_text);
         let gtbl = m0

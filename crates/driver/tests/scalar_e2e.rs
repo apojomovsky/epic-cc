@@ -11,31 +11,13 @@ use std::collections::HashMap;
 use std::process::Command;
 
 fn scalar_layout() -> alloc::AllocLayout {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-    let ll = Command::new(clang)
-        .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-resource-dir",
-            &resdir,
-            "-o",
-            "-",
-            "tests/fixtures/scalar.c",
-        ])
-        .output()
-        .expect("run clang");
-    assert!(
-        ll.status.success(),
-        "clang: {}",
-        String::from_utf8_lossy(&ll.stderr)
+    let (clang, resdir) = driver::clang::pic_clang_from_env();
+    let ll_text = driver::clang::compile_to_stdout(
+        &clang,
+        &resdir,
+        std::path::Path::new("tests/fixtures/scalar.c"),
+        &driver::clang::Options::default(),
     );
-    let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
     m = wholeprog::merge(m);

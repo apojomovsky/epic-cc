@@ -45,27 +45,13 @@ fn run_one(device: &str, v: u8) {
     );
     let hex = std::fs::read_to_string(&hex_path).unwrap();
     if device == "p16f877a" {
-        let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-        let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-        let ll = Command::new(clang)
-            .args([
-                "-target",
-                "msp430",
-                "-O1",
-                "-S",
-                "-emit-llvm",
-                "-ffreestanding",
-                "-nostdinc",
-                "-resource-dir",
-                &resdir,
-                "-o",
-                "-",
-                "tests/fixtures/switch.c",
-            ])
-            .output()
-            .expect("clang");
-        assert!(ll.status.success());
-        let ll_text = String::from_utf8(ll.stdout).unwrap();
+        let (clang, resdir) = driver::clang::pic_clang_from_env();
+        let ll_text = driver::clang::compile_to_stdout(
+            &clang,
+            &resdir,
+            std::path::Path::new("tests/fixtures/switch.c"),
+            &driver::clang::Options::default(),
+        );
         let mut m = irparse::parse_ll(&ll_text);
         m = wholeprog::merge(m);
         m = legalize::legalize(m);
@@ -92,27 +78,13 @@ fn run_one(device: &str, v: u8) {
         assert!(p.halted());
     } else {
         // p18: ensure alloc+isel succeeds (sim gate lives in PIC14)
-        let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-        let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-        let ll = Command::new(clang)
-            .args([
-                "-target",
-                "msp430",
-                "-O1",
-                "-S",
-                "-emit-llvm",
-                "-ffreestanding",
-                "-nostdinc",
-                "-resource-dir",
-                &resdir,
-                "-o",
-                "-",
-                "tests/fixtures/switch.c",
-            ])
-            .output()
-            .expect("clang");
-        assert!(ll.status.success());
-        let ll_text = String::from_utf8(ll.stdout).unwrap();
+        let (clang, resdir) = driver::clang::pic_clang_from_env();
+        let ll_text = driver::clang::compile_to_stdout(
+            &clang,
+            &resdir,
+            std::path::Path::new("tests/fixtures/switch.c"),
+            &driver::clang::Options::default(),
+        );
         let mut m = irparse::parse_ll(&ll_text);
         m = wholeprog::merge(m);
         m = legalize::legalize(m);

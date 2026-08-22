@@ -13,6 +13,7 @@
 //! collisions, so `wholeprog` onward sees exactly the single-module shape it
 //! always has.
 
+use driver::clang;
 use driver::clang_discovery;
 use driver::cli;
 
@@ -119,29 +120,17 @@ fn main() {
     };
 
     // 1. clang: one invocation per translation unit.
+    let clang_opts = clang::Options {
+        includes: cli.includes.clone(),
+        defines: cli.defines.clone(),
+        header_dir: Some(header_dir.clone()),
+        fosc_hz: Some(fosc_hz),
+    };
     let mut units = Vec::new();
     for (n, input) in cli.inputs.iter().enumerate() {
         let ll_path = tmp.join(format!("{n:03}.ll"));
-        let mut cmd = Command::new(&clang);
-        cmd.args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-resource-dir",
-            resdir.to_str().unwrap(),
-        ]);
-        for inc in &cli.includes {
-            cmd.args(["-I", inc]);
-        }
-        for def in &cli.defines {
-            cmd.args(["-D", def]);
-        }
-        cmd.args(["-I", header_dir.to_str().unwrap()]);
-        cmd.args(["-D", &format!("EPIC_FOSC_HZ={fosc_hz}")]);
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
         cmd.args(["-o", ll_path.to_str().unwrap(), input]);
         if cli.verbose {
             eprintln!("epic-cc: {cmd:?}");
@@ -162,26 +151,8 @@ fn main() {
         let string_c_path = tmp.join("__epic_string.c");
         std::fs::write(&string_c_path, driver::string_c::STRING_C).expect("write string.c");
         let ll_path = tmp.join("__epic_string.ll");
-        let mut cmd = Command::new(&clang);
-        cmd.args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-resource-dir",
-            resdir.to_str().unwrap(),
-        ]);
-        for inc in &cli.includes {
-            cmd.args(["-I", inc]);
-        }
-        for def in &cli.defines {
-            cmd.args(["-D", def]);
-        }
-        cmd.args(["-I", header_dir.to_str().unwrap()]);
-        cmd.args(["-D", &format!("EPIC_FOSC_HZ={fosc_hz}")]);
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
         cmd.args([
             "-o",
             ll_path.to_str().unwrap(),

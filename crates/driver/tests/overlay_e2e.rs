@@ -71,31 +71,13 @@ fn base_of(layout: &alloc::AllocLayout, fname: &str) -> u16 {
 /// Run clang + the full IR pipeline on the overlay fixture, exactly as the
 /// driver does, and return the alloc layout.
 fn overlay_layout() -> (Module, alloc::AllocLayout) {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-    let ll = Command::new(clang)
-        .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-resource-dir",
-            &resdir,
-            "-o",
-            "-",
-            "tests/fixtures/overlay.c",
-        ])
-        .output()
-        .expect("run clang");
-    assert!(
-        ll.status.success(),
-        "clang: {}",
-        String::from_utf8_lossy(&ll.stderr)
+    let (clang, resdir) = driver::clang::pic_clang_from_env();
+    let ll_text = driver::clang::compile_to_stdout(
+        &clang,
+        &resdir,
+        std::path::Path::new("tests/fixtures/overlay.c"),
+        &driver::clang::Options::default(),
     );
-    let ll_text = String::from_utf8(ll.stdout).unwrap();
 
     let mut m = irparse::parse_ll(&ll_text);
     m = wholeprog::merge(m);

@@ -30,41 +30,29 @@ fn header_dir() -> std::path::PathBuf {
 }
 
 fn compile_ll(clang: &str, resdir: &str, hdir: &std::path::Path, src: &str) -> String {
-    let out = Command::new(clang)
-        .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-resource-dir",
-            resdir,
-            "-I",
-            hdir.to_str().unwrap(),
-            "-o",
-            "-",
-            src,
-        ])
-        .output()
-        .expect("run clang");
-    assert!(
-        out.status.success(),
-        "clang {src}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap()
+    driver::clang::compile_to_stdout(
+        std::path::Path::new(clang),
+        std::path::Path::new(resdir),
+        std::path::Path::new(src),
+        &driver::clang::Options {
+            header_dir: Some(hdir.to_path_buf()),
+            ..Default::default()
+        },
+    )
 }
 
 /// Rebuild the address map the driver computes for `fixture`, mirroring
 /// `main.rs`: the extra `string.h` translation unit is appended to the user's
 /// module before the whole-program stages run.
 fn layout_for(device: &device::Device, fixture: &str) -> alloc::AllocLayout {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    let (clang, resdir) = driver::clang::pic_clang_from_env();
     let hdir = header_dir();
-    let mut m = irparse::parse_ll(&compile_ll(&clang, &resdir, &hdir, fixture));
+    let mut m = irparse::parse_ll(&compile_ll(
+        clang.to_str().unwrap(),
+        resdir.to_str().unwrap(),
+        &hdir,
+        fixture,
+    ));
 
     let src_text = std::fs::read_to_string(fixture).unwrap_or_default();
     if src_text
@@ -74,8 +62,8 @@ fn layout_for(device: &device::Device, fixture: &str) -> alloc::AllocLayout {
         let c_path = hdir.parent().unwrap().join("__epic_string.c");
         std::fs::write(&c_path, driver::string_c::STRING_C).unwrap();
         let mut sm = irparse::parse_ll(&compile_ll(
-            &clang,
-            &resdir,
+            clang.to_str().unwrap(),
+            resdir.to_str().unwrap(),
             &hdir,
             c_path.to_str().unwrap(),
         ));
