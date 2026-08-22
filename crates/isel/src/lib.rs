@@ -75,24 +75,60 @@ fn literal_ptr_addr(ptr: &str) -> u16 {
         .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
 }
 
-/// The four GPR windows reachable through FSR+IRP: bank 0 `[0x20,0x80)`,
-/// bank 1 `[0xA0,0xF0)`, bank 2 `[0x120,0x170)`, bank 3 `[0x1A0,0x1F0)`
-/// (the common region 0x70-0x7F sits inside the first window). The SFR
-/// holes 0x80-0x9F and 0x170-0x19F are not addressable GPR, so an object
-/// that does not fit entirely inside its base's window would silently
-/// mis-address through INDF: it panics loudly instead.
-///
-/// Returns `(irp, base_lo)`: `IRP = bit 8 of the base` (STATUS bit 7) and
-/// `FSR = base & 0xFF` (0x120 -> 0x20, 0x1A0 -> 0xA0).
-fn fsr_window(base_addr: u16, span: u16) -> (bool, u8) {
-    let win_end = match base_addr {
-        0x20..=0x7F => 0x80,
-        0xA0..=0xEF => 0xF0,
-        0x120..=0x16F => 0x170,
-        0x1A0..=0x1EF => 0x1F0,
-        _ => panic!(
-            "isel: FSR base 0x{base_addr:03X} outside GPR space (windows [0x20,0x80) [0xA0,0xF0) [0x120,0x170) [0x1A0,0x1F0))"
-        ),
+/// The GPR windows reachable through FSR+IRP, derived from the device's
+/// `ram_banks` and `common_ram`. Each bank's window is the GPR bank itself
+/// plus, for the first bank, the common RAM that is bank-mirrored. The
+/// concrete windows for the 877A are `[0x20,0x80) [0xA0,0xF0) [0x120,0x170)
+/// [0x1A0,0x1F0)`; other PIC14 parts derive analogously from their
+/// `ram_banks`/`common_ram`.
+fn fsr_window(device: &Device, base_addr: u16, span: u16) -> (bool, u8) {
+    // Derive windows from the device. First bank's window extends through
+    // common RAM when common directly follows its GPR (0x6F -> 0x70-0x7F -> 0x80).
+    let mut windows: Vec<(u16, u16)> = Vec::new();
+    for (i, (lo, hi)) in device.ram_banks.iter().enumerate() {
+        let mut end = hi + 1;
+        if i == 0 {
+            if let Some((clo, chi)) = device.common_ram {
+                if clo == hi + 1 {
+                    end = chi + 1;
+                }
+            }
+        }
+        windows.push((*lo, end));
+    }
+    // Common RAM addresses are inside the first window; treat them as bank 0.
+    let win_end = if let Some((clo, chi)) = device.common_ram {
+        if base_addr >= clo && base_addr <= chi {
+            windows[0].1
+        } else {
+            let mut found = None;
+            for ((lo, hi), (_, we)) in device.ram_banks.iter().zip(&windows) {
+                if base_addr >= *lo && base_addr <= *hi {
+                    found = Some(*we);
+                    break;
+                }
+            }
+            found.unwrap_or_else(|| {
+                panic!(
+                    "isel: FSR base 0x{base_addr:03X} outside GPR space (device {})",
+                    device.name
+                )
+            })
+        }
+    } else {
+        let mut found = None;
+        for ((lo, hi), (_, we)) in device.ram_banks.iter().zip(&windows) {
+            if base_addr >= *lo && base_addr <= *hi {
+                found = Some(*we);
+                break;
+            }
+        }
+        found.unwrap_or_else(|| {
+            panic!(
+                "isel: FSR base 0x{base_addr:03X} outside GPR space (device {})",
+                device.name
+            )
+        })
     };
     assert!(
         base_addr + span <= win_end,
@@ -674,7 +710,7 @@ impl<'m> Gen<'m> {
         byte_off: u8,
         span: u16,
     ) {
-        let (irp, base_lo) = fsr_window(base_addr, span);
+        let (irp, base_lo) = fsr_window(self.device, base_addr, span);
         let lit = (u16::from(base_lo) + u16::from(k) + u16::from(byte_off)) & 0xFF;
         self.emit(if irp {
             "    BSF STATUS, 7".to_string()
@@ -1756,7 +1792,7 @@ impl<'m> Gen<'m> {
                     }
                     Val::Const(_) => panic!("isel: sret target must be a global or an alloca slot"),
                 };
-                fsr_window(addr, span);
+                fsr_window(self.device, addr, span);
                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                 self.emit(format!("    MOVWF 0x{:02X}", pa));
                 self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));

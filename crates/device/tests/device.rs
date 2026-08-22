@@ -62,3 +62,33 @@ fn pic18f4550_reserves_retval_and_isr_save_regions() {
         "past the implemented GPR range"
     );
 }
+
+#[test]
+fn by_name_resolves_both_devices() {
+    assert_eq!(device::by_name("p16f877a").unwrap().name, "p16f877a");
+    assert_eq!(device::by_name("p18f4550").unwrap().name, "p18f4550");
+    assert!(device::by_name("p16f887").is_none());
+    assert!(
+        device::by_name("P16F877A").is_none(),
+        "by_name is case-sensitive; driver lowercases"
+    );
+}
+
+#[test]
+fn all_contains_both_seed_devices() {
+    assert_eq!(device::ALL.len(), 2);
+    assert!(device::ALL.iter().any(|d| d.name == "p16f877a"));
+    assert!(device::ALL.iter().any(|d| d.name == "p18f4550"));
+}
+
+#[test]
+fn by_name_case_insensitive_helper() {
+    assert_eq!(
+        device::by_name_case_insensitive("P16F877A").unwrap().name,
+        "p16f877a"
+    );
+    assert_eq!(
+        device::by_name_case_insensitive("p18F4550").unwrap().name,
+        "p18f4550"
+    );
+}

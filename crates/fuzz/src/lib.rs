@@ -2527,6 +2527,9 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 let asm = peephole::optimize(&asm);
                 asm::assemble_file_to_hex(device, &asm)
             }
+            device::Core::Pic14e => {
+                panic!("fuzz: pic14e core not yet implemented for {}", device.name)
+            }
         };
         (hex, layout)
     }))
@@ -2590,6 +2593,7 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
+        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
     };
     Ok(checksum)
 }
@@ -2661,6 +2665,7 @@ fn run_pic(
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
+        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
     };
     Ok(checksum)
 }
@@ -3237,6 +3242,7 @@ fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
     let cache = match device.core {
         device::Core::Pic18 => &CACHE_P18,
         device::Core::Pic14 => &CACHE_P14,
+        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
     };
     cache.get_or_init(locate).clone()
 }

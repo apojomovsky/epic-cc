@@ -113,6 +113,10 @@ fn run_cc2(device_name: &str, device: &device::Device) {
             assert_eq!(sim.ram()[out_addr], expected, "out for {device_name} in=7");
             assert!(sim.halted(), "halted {device_name}");
         }
+        device::Core::Pic14e => panic!(
+            "cc2 test: pic14e core not yet implemented for {}",
+            device.name
+        ),
     }
     let _ = std::fs::remove_file(&hex_path);
 }
