@@ -892,6 +892,154 @@ impl Fresh {
             }
         }
     }
+    fn switch_label(&mut self) -> String {
+        loop {
+            self.counter += 1;
+            let n = format!("__switch{}", self.counter);
+            if !self.used.contains(&n) {
+                self.used.insert(n.clone());
+                return n;
+            }
+        }
+    }
+    fn switch_cmp(&mut self) -> String {
+        loop {
+            self.counter += 1;
+            let n = format!("__scmp{}", self.counter);
+            if !self.used.contains(&n) {
+                self.used.insert(n.clone());
+                return n;
+            }
+        }
+    }
+}
+
+/// Lower an LLVM `switch` terminator text into a chain of `icmp eq` +
+/// `brcond` blocks. `switch_text` is the full `switch ... [ ... ]` line(s)
+/// flattened into one string (the aggregator ensures the closing `]` is
+/// present). The current function's `blocks` already contains the entry that
+/// holds the switch; this splices in fresh fallthrough blocks.
+fn lower_switch(blocks: &mut Vec<Block>, switch_text: &str, fresh: &mut Fresh) {
+    let body = switch_text
+        .trim_start()
+        .strip_prefix("switch")
+        .unwrap_or_else(|| panic!("irparse: malformed switch {switch_text:?}"))
+        .trim();
+    let label_pos = body
+        .find("label")
+        .unwrap_or_else(|| panic!("irparse: malformed switch {switch_text:?}"));
+    let cond_raw = body[..label_pos].trim().trim_end_matches(',').trim();
+    let cond_clean = strip_attrs(cond_raw);
+    let mut cond_it = cond_clean.split_whitespace();
+    let cond_ty_tok = cond_it
+        .next()
+        .unwrap_or_else(|| panic!("irparse: malformed switch cond {switch_text:?}"));
+    let cond_ty = ty_of(cond_ty_tok);
+    let cond_val_tok = cond_it
+        .next()
+        .unwrap_or_else(|| panic!("irparse: malformed switch cond value {switch_text:?}"));
+    let cond_val = parse_val_typed(cond_val_tok, Some(cond_ty));
+    let after_label = body[label_pos + "label".len()..].trim();
+    let default_label = after_label
+        .split(|c| c == ' ' || c == ',' || c == '[')
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches('%')
+        .to_string();
+    let lbracket = switch_text
+        .find('[')
+        .unwrap_or_else(|| panic!("irparse: malformed switch missing '[' {switch_text:?}"));
+    let rbracket = switch_text
+        .rfind(']')
+        .unwrap_or_else(|| panic!("irparse: malformed switch missing ']' {switch_text:?}"));
+    let inner = if rbracket > lbracket + 1 {
+        &switch_text[lbracket + 1..rbracket]
+    } else {
+        ""
+    };
+    let mut cases: Vec<(Ty, Val, String)> = Vec::new();
+    let s = inner.trim();
+    if !s.is_empty() {
+        let mut rest = s;
+        while !rest.trim().is_empty() {
+            rest = rest.trim_start();
+            if rest.starts_with(',') {
+                rest = rest[1..].trim_start();
+                continue;
+            }
+            if rest.is_empty() {
+                break;
+            }
+            let ty_end = rest.find(|c: char| c.is_whitespace()).unwrap_or_else(|| {
+                panic!("irparse: malformed switch case ty {rest:?} in {switch_text:?}")
+            });
+            let ty_tok = rest[..ty_end].trim();
+            let ty = ty_of(ty_tok);
+            rest = rest[ty_end..].trim_start();
+            let comma = rest.find(',').unwrap_or_else(|| {
+                panic!("irparse: malformed switch case missing ',' {rest:?} in {switch_text:?}")
+            });
+            let val_tok = rest[..comma].trim();
+            let val = parse_val_typed(val_tok, Some(ty));
+            rest = rest[comma + 1..].trim_start();
+            if !rest.starts_with("label") {
+                panic!("irparse: malformed switch case missing label {rest:?} in {switch_text:?}");
+            }
+            rest = rest["label".len()..].trim_start();
+            if !rest.starts_with('%') {
+                panic!("irparse: malformed switch case label {rest:?} in {switch_text:?}");
+            }
+            let end = rest
+                .find(|c: char| c == ',' || c == ' ' || c == '\t' || c == '\n' || c == '\r')
+                .unwrap_or(rest.len());
+            let label = rest[1..end].trim().to_string();
+            cases.push((ty, val, label));
+            rest = rest[end..].trim_start();
+        }
+    }
+    if cases.is_empty() {
+        blocks.last_mut().unwrap().insts.push(Inst::Br(Br {
+            target: default_label,
+        }));
+        return;
+    }
+    let n = cases.len();
+    let mut cur_idx = blocks.len() - 1;
+    for (i, (case_ty, case_val, case_label)) in cases.into_iter().enumerate() {
+        if case_ty != cond_ty {
+            panic!(
+                "irparse: switch case type {case_ty:?} mismatches cond type {cond_ty:?} in {switch_text:?}"
+            );
+        }
+        let is_last = i + 1 == n;
+        let false_label = if is_last {
+            default_label.clone()
+        } else {
+            fresh.switch_label()
+        };
+        let cmp_dst = fresh.switch_cmp();
+        let icmp = Icmp {
+            dst: cmp_dst.clone(),
+            pred: "eq".to_string(),
+            ty: cond_ty,
+            a: cond_val.clone(),
+            b: case_val,
+        };
+        blocks[cur_idx].insts.push(Inst::Icmp(icmp));
+        blocks[cur_idx].insts.push(Inst::BrCond(BrCond {
+            cond: Val::Reg(cmp_dst),
+            t: case_label,
+            f: false_label.clone(),
+        }));
+        if !is_last {
+            blocks.push(Block {
+                label: false_label,
+                insts: Vec::new(),
+            });
+            cur_idx = blocks.len() - 1;
+        }
+    }
 }
 
 /// Parse one call/function pointer operand that may be an inlined GEP:
@@ -1682,6 +1830,10 @@ pub fn parse_ll(src: &str) -> Module {
                             if pl.is_empty() {
                                 continue;
                             }
+                            if pl.trim_start().starts_with("switch") {
+                                lower_switch(&mut blocks, pl, &mut fresh);
+                                continue;
+                            }
                             // Labels inside single-line bodies are not expected
                             let insts = parse_inst(pl, &types, &mut fresh);
                             blocks.last_mut().unwrap().insts.extend(insts);
@@ -1714,7 +1866,22 @@ pub fn parse_ll(src: &str) -> Module {
                     let _ = &first;
                     let l = first.trim();
                     if l != "unreachable" && !l.is_empty() {
-                        if let Some(colon) = l.find(':') {
+                        if l.trim_start().starts_with("switch") {
+                            let mut switch_text = l.to_string();
+                            while !switch_text.contains(']') {
+                                if let Some(next_raw) = lines.next() {
+                                    let next_l = next_raw.trim();
+                                    switch_text.push(' ');
+                                    switch_text.push_str(next_l);
+                                    if next_l.contains(']') {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            lower_switch(&mut blocks, &switch_text, &mut fresh);
+                        } else if let Some(colon) = l.find(':') {
                             let head = &l[..colon];
                             if !head.is_empty()
                                 && head
@@ -1792,21 +1959,7 @@ pub fn parse_ll(src: &str) -> Module {
                                 break;
                             }
                         }
-                        let label_pos = switch_text
-                            .find("label")
-                            .unwrap_or_else(|| panic!("irparse: malformed switch {switch_text:?}"));
-                        let after = switch_text[label_pos + "label".len()..].trim();
-                        let default_label = after
-                            .split_whitespace()
-                            .next()
-                            .unwrap()
-                            .trim_start_matches('%')
-                            .trim_end_matches(',')
-                            .trim_end_matches('[')
-                            .to_string();
-                        blocks.last_mut().unwrap().insts.push(Inst::Br(Br {
-                            target: default_label,
-                        }));
+                        lower_switch(&mut blocks, &switch_text, &mut fresh);
                         if has_trailing_brace {
                             break;
                         }
@@ -2419,21 +2572,9 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             }));
         }
         "switch" => {
-            let body = rest["switch".len()..].trim();
-            let label_pos = body
-                .find("label")
-                .unwrap_or_else(|| panic!("irparse: malformed switch {line:?}"));
-            let after = body[label_pos + "label".len()..].trim();
-            let default_label = after
-                .split(|c| c == ' ' || c == ',' || c == '[')
-                .next()
-                .unwrap()
-                .trim()
-                .trim_start_matches('%')
-                .to_string();
-            out.push(Inst::Br(Br {
-                target: default_label,
-            }));
+            panic!(
+                "irparse: switch via parse_inst is unsupported (IR must be lowered in parse_ll block terminator path): {line:?}"
+            );
         }
         other => panic!("SPIKE LIMIT: unsupported opcode {other:?} in line: {line}"),
     }
