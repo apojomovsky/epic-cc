@@ -24,10 +24,12 @@ use std::process::Command;
 
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
-    let has_device_flag = argv.iter().any(|a| a == "--device");
+    let has_device_flag = argv
+        .iter()
+        .any(|a| matches!(a.as_str(), "--device" | "--target" | "--mcu" | "-mcu"));
     if !has_device_flag {
         let env_device = std::env::var("PIC8_DEVICE").unwrap_or_else(|_| "p16f877a".to_string());
-        argv.push("--device".to_string());
+        argv.push("--target".to_string());
         argv.push(env_device);
     }
     let cli = match cli::parse_args(&argv) {
@@ -49,17 +51,25 @@ fn main() {
     }
 
     let lower = cli.device.to_ascii_lowercase();
-    let device = match lower.as_str() {
-        "p16f877a" => &device::PIC16F877A,
-        "p18f4550" => &device::PIC18F4550,
-        _ => {
-            eprintln!(
-                "epic-cc: unknown device {} (expected p16f877a or p18f4550)",
-                cli.device
-            );
-            std::process::exit(1);
-        }
-    };
+    let device = device::by_name(&lower).unwrap_or_else(|| {
+        let available = device::ALL
+            .iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "epic-cc: unknown device {} (available: {})",
+            cli.device, available
+        );
+        std::process::exit(1);
+    });
+    if device.core == device::Core::Pic14e {
+        eprintln!(
+            "epic-cc: device {} has core pic14e which has no backend yet (need isel-pic14e)",
+            device.name
+        );
+        std::process::exit(1);
+    }
 
     let exe_dir = std::env::current_exe()
         .ok()
@@ -238,6 +248,13 @@ fn main() {
     let asm = match device.core {
         device::Core::Pic14 => isel::select(device, &m, &addrs),
         device::Core::Pic18 => isel_pic18::select(device, &m, &addrs),
+        device::Core::Pic14e => {
+            eprintln!(
+                "epic-cc: pic14e core not yet implemented for {}",
+                device.name
+            );
+            std::process::exit(1);
+        }
     };
 
     let asm = match device.core {
@@ -262,6 +279,13 @@ fn main() {
             asm
         }
         device::Core::Pic18 => asm,
+        device::Core::Pic14e => {
+            eprintln!(
+                "epic-cc: pic14e core not yet implemented for {}",
+                device.name
+            );
+            std::process::exit(1);
+        }
     };
 
     if cli.emit == cli::Emit::Asm {

@@ -29,7 +29,7 @@ usage: epic-cc [options] <input.c>...
   -o <file>            output file (default: a.hex)
   -I <dir>             include path, repeatable, forwarded to clang
   -D <name[=value]>    define, repeatable, forwarded to clang
-  --device <name>      p16f877a | p18f4550 (required)
+  --target <name>      device name (e.g. p16f877a, p18f4550); aliases: --device, --mcu, -mcu
   --emit <stage>       ll | ir | asm | hex (default: hex)
   --save-temps <dir>   write every stage artifact into <dir>
   -v                   echo the clang and llvm-link commands
@@ -71,12 +71,12 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                 i += 1;
                 output = Some(argv.get(i).cloned().ok_or("epic-cc: -o needs a value")?);
             }
-        } else if a == "--device" {
+        } else if a == "--device" || a == "--target" || a == "--mcu" || a == "-mcu" {
             i += 1;
             device = Some(
                 argv.get(i)
                     .cloned()
-                    .ok_or("epic-cc: --device needs a value")?,
+                    .ok_or(format!("epic-cc: {a} needs a value"))?,
             );
         } else if a == "--emit" {
             i += 1;
@@ -107,11 +107,10 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         }
         i += 1;
     }
-
     if inputs.is_empty() {
         return Err(format!("epic-cc: no input files\n\n{USAGE}"));
     }
-    let device = device.ok_or_else(|| format!("epic-cc: --device is required\n\n{USAGE}"))?;
+    let device = device.ok_or_else(|| format!("epic-cc: --target is required\n\n{USAGE}"))?;
 
     Ok(Cli {
         inputs,

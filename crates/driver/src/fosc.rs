@@ -37,6 +37,7 @@ pub fn resolve_fosc_hz(device: &Device, spec: &str) -> u64 {
     match device.core {
         Core::Pic14 => pic14_hz(&device.config, &fuse, xtal),
         Core::Pic18 => pic18_hz(&device.config, &fuse, xtal),
+        Core::Pic14e => panic!("fosc: pic14e core not yet implemented for {}", device.name),
     }
 }
 

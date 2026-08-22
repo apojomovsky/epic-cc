@@ -463,6 +463,7 @@ pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
     let words = match device.core {
         device::Core::Pic14 => assemble(src),
         device::Core::Pic18 => assemble_pic18(src),
+        device::Core::Pic14e => panic!("asm: pic14e core not yet implemented for {}", device.name),
     };
     assert!(
         words.len() as u32 <= device.flash_words,

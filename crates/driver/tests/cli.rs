@@ -59,7 +59,7 @@ fn parses_emit_stages() {
 #[test]
 fn rejects_a_missing_device() {
     let e = parse_args(&args(&["a.c"])).unwrap_err();
-    assert!(e.contains("--device"), "{e}");
+    assert!(e.contains("--target"), "{e}");
 }
 
 #[test]
