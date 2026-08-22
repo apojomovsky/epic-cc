@@ -273,6 +273,20 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
                     out.extend(decode_typed_value(elem, elt, types));
                 }
                 out
+            } else if elem.starts_with('%') {
+                let inner_list = value
+                    .strip_prefix('[')
+                    .and_then(|s| matching_bracket(value).map(|i| &s[..i.saturating_sub(1)]))
+                    .unwrap_or_else(|| panic!("SPIKE LIMIT: struct array value {value:?}"));
+                let mut out = Vec::new();
+                for elt in split_top_level(inner_list, ',') {
+                    let elt = elt.trim();
+                    if elt.is_empty() {
+                        continue;
+                    }
+                    out.extend(decode_typed_value(elem, elt, types));
+                }
+                out
             } else {
                 parse_array_elements(value, ty_of(elem))
             }
@@ -290,6 +304,9 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
     }
     if ty.starts_with('{') {
         return decode_literal_struct(ty, value, types);
+    }
+    if ty.starts_with('%') {
+        return decode_named_struct(ty, value, types);
     }
     // Scalar value: `i8 65`, `i16 -5`, `float 1.500000e+00`.
     let (_, v) = value.split_once(' ').unwrap_or(("", value));
@@ -342,6 +359,65 @@ fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
                     fbytes.len(),
                     fsize as usize,
                     "SPIKE LIMIT: field value {v:?} of {f:?} decodes to the wrong width"
+                );
+                blob[off as usize..(off + fsize) as usize].copy_from_slice(&fbytes);
+            }
+        }
+        off += fsize;
+    }
+    blob
+}
+/// Decode a named struct initializer (e.g. `%struct.pair = type { i8, i16 }`
+/// with value `{ i8 65, i16 4660 }` or `%struct.pair { i8 65, i16 4660 }`)
+/// into its flat little-endian blob using the same field layout as the
+/// type table (padding bytes stay zero).
+fn decode_named_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
+    let name = ty.trim().trim_start_matches('%');
+    let info = types
+        .get(name)
+        .unwrap_or_else(|| panic!("irparse: unknown struct type {ty:?}"));
+    let size = usize::from(info.size);
+    let mut blob = vec![0u8; size];
+    let init = init.trim();
+    if init.starts_with("zeroinitializer") {
+        return blob;
+    }
+    // Value may be prefixed with its own type: `%struct.X { ... }` or
+    // `%struct.X zeroinitializer`. Strip the leading named type when present.
+    let mut v = init;
+    if v.starts_with('%') {
+        if let Some(b) = v.find('{') {
+            v = v[b..].trim();
+        } else if v.contains("zeroinitializer") {
+            return blob;
+        } else {
+            panic!("SPIKE LIMIT: named struct value {init:?} for type {ty:?}");
+        }
+    }
+    let v_inner = brace_inner(v)
+        .unwrap_or_else(|| panic!("SPIKE LIMIT: struct initializer {init:?} for type {ty:?}"));
+    let values: Vec<&str> = split_top_level(v_inner, ',')
+        .into_iter()
+        .map(|s| s.trim())
+        .collect();
+    assert!(
+        values.len() <= info.fields.len(),
+        "SPIKE LIMIT: struct initializer {init:?} has more values than type {ty:?} has fields"
+    );
+    let mut off: u16 = 0;
+    for (i, f) in info.fields.iter().enumerate() {
+        if f.is_empty() {
+            continue;
+        }
+        let (fsize, falign) = ty_size_align(f, types);
+        off = round_up(off, falign);
+        if let Some(val) = values.get(i) {
+            if !val.is_empty() {
+                let fbytes = decode_typed_value(f, val, types);
+                assert_eq!(
+                    fbytes.len(),
+                    fsize as usize,
+                    "SPIKE LIMIT: field value {val:?} of {f:?} decodes to the wrong width"
                 );
                 blob[off as usize..(off + fsize) as usize].copy_from_slice(&fbytes);
             }
@@ -628,6 +704,7 @@ fn tokenize_parens(s: &str) -> Vec<String> {
 struct StructInfo {
     size: u8,
     align: u8,
+    fields: Vec<String>,
 }
 type StructTypes = HashMap<String, StructInfo>;
 
@@ -694,7 +771,6 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
         }
     }
 }
-
 /// Layout a struct from its field type strings. `None` while an unresolved
 /// (mutually/forward-referenced) struct is referenced.
 fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> {
@@ -718,6 +794,7 @@ fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> 
     Some(StructInfo {
         size: size as u8,
         align: max_align,
+        fields: fields.to_vec(),
     })
 }
 
@@ -917,8 +994,7 @@ fn parse_ptr_operand(
 /// Compute the byte stride contributed by one GEP index and the type to
 /// descend into. Level 0 treats the source type as an array-of-itself
 /// (stride = its size); a scalar (i1/i8/i16) strides by its size with no
-/// further descent. Struct-typed sources never reach here: `fold_gep`
-/// rejects them up front.
+/// further descent. Struct-typed sources are handled in `fold_gep` directly.
 fn stride_and_next(cur: &str, types: &StructTypes) -> (i64, String) {
     let cur = cur.trim();
     if cur.starts_with('[') {
@@ -934,6 +1010,53 @@ fn stride_and_next(cur: &str, types: &StructTypes) -> (i64, String) {
     }
 }
 
+/// Offset and type of field `idx` within struct `cur`.
+fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
+    let cur = cur.trim();
+    if let Some(name) = cur.strip_prefix('%') {
+        let info = types
+            .get(name)
+            .unwrap_or_else(|| panic!("irparse: unknown struct type {cur}"));
+        assert!(
+            idx < info.fields.len(),
+            "irparse: struct {cur} field index {idx} out of range ({} fields)",
+            info.fields.len()
+        );
+        let mut off: u16 = 0;
+        for (i, f) in info.fields.iter().enumerate() {
+            let (fsize, falign) = ty_size_align(f, types);
+            off = round_up(off, falign);
+            if i == idx {
+                return (off, f.clone());
+            }
+            off += fsize;
+        }
+        unreachable!();
+    } else {
+        // Literal `{ ... }`
+        let inner = brace_inner(cur).expect("literal struct type must be `{ ... }`");
+        let fields: Vec<&str> = split_top_level(inner, ',')
+            .into_iter()
+            .map(|s| s.trim())
+            .collect();
+        assert!(
+            idx < fields.len(),
+            "irparse: struct {cur} field index {idx} out of range ({} fields)",
+            fields.len()
+        );
+        let mut off: u16 = 0;
+        for (i, f) in fields.iter().enumerate() {
+            let (fsize, falign) = ty_size_align(f, types);
+            off = round_up(off, falign);
+            if i == idx {
+                return (off, f.to_string());
+            }
+            off += fsize;
+        }
+        unreachable!();
+    }
+}
+
 /// Fold GEP indices into `(k, terms)`: constant indices × their stride fold
 /// into the byte offset `k`; register indices become scaled `(scale, reg)`
 /// terms.
@@ -943,9 +1066,14 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
     let mut cur = source_ty.trim().to_string();
     // True when the previous GEP level was an array — a struct cur is then
     // the array's ELEMENT type, so this index is an element selector
-    // (stride = struct size). Without it, a struct index would be a FIELD
-    // selector (struct descent, out of scope — panic).
+    // (stride = struct size). Without it, a struct index is a FIELD selector.
     let mut from_array = false;
+    // For direct struct sources (`%struct.X` or `{...}`) the first index is
+    // the pointer/array offset into the struct array (like `i32 0` in
+    // `getelementptr %struct.Desc, ptr @s, i32 0, i32 1`). Track whether that
+    // first array-like index has been consumed so the next struct index is
+    // treated as a field selector.
+    let mut struct_array_done = false;
     for ip in index_parts {
         let ip = ip.trim();
         let idx = parse_val(ip.split_whitespace().last().unwrap());
@@ -953,29 +1081,47 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
             if from_array {
                 // `[N x %struct.S], i16 0, i16 %i` — the index after an
                 // array-of-struct descent strides by sizeof(%struct.S)
-                // (LLVM: the second index indexes the array's element
-                // type). clang -O1 emits this for `&CARR[i]`. Field
-                // selection on an array element arrives as a THIRD index
-                // (`[2 x %struct.Pair], ptr @CARR, i16 0, i16 %i, i32 1`
-                // for `CARR[i].b`) — the loop's next iteration hits the
-                // `!from_array` panic below, which is exactly the loud
-                // struct-descent rejection this branch feeds.
                 let (sz, _) = ty_size_align(&cur, types);
                 match &idx {
                     Val::Const(c) => k += c * i64::from(sz),
                     Val::Reg(r) => terms.push((sz as u8, r.clone())),
                     Val::Global(_) => panic!("irparse: gep index cannot be a global"),
                 }
-                // The element's type is the struct itself: a further index
-                // would be a field selector — reject it.
                 from_array = false;
+                // Element selector consumed; next struct index is a field
+                // selector (offset within the element).
+                struct_array_done = true;
                 continue;
             }
-            // A struct source's first index IS its element selector; the
-            // next would be a field selector. Neither is supported (field
-            // descent is out of scope) — panic loudly instead of
-            // mis-folding.
-            panic!("irparse: gep on struct-typed source {cur} unsupported (struct descent not implemented)");
+            if !struct_array_done {
+                // First index into a struct-typed pointer is the array offset
+                // (`0` in `getelementptr %struct.Desc, ptr @s, i32 0, i32 1`).
+                let (sz, _) = ty_size_align(&cur, types);
+                match &idx {
+                    Val::Const(c) => k += c * i64::from(sz),
+                    Val::Reg(r) => terms.push((sz as u8, r.clone())),
+                    Val::Global(_) => panic!("irparse: gep index cannot be a global"),
+                }
+                struct_array_done = true;
+                continue;
+            }
+            // Field selector: `i32 2` selects field 2 of the struct.
+            let field_idx = match &idx {
+                Val::Const(c) => {
+                    assert!(*c >= 0, "irparse: negative struct field index {c}");
+                    *c as usize
+                }
+                Val::Reg(r) => panic!("irparse: gep struct field index cannot be a register {r:?}"),
+                Val::Global(_) => panic!("irparse: gep index cannot be a global"),
+            };
+            let (off, field_ty) = struct_field(&cur, field_idx, types);
+            k += i64::from(off);
+            cur = field_ty;
+            // After descending into a field, the next index is not a struct
+            // field selector unless the field itself is a struct/array.
+            struct_array_done = false;
+            from_array = false;
+            continue;
         }
         let (stride, next) = stride_and_next(&cur, types);
         from_array = cur.starts_with('[');
@@ -985,6 +1131,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
             Val::Global(_) => panic!("irparse: gep index cannot be a global"),
         }
         cur = next;
+        struct_array_done = false;
     }
     assert!(
         k >= 0 && k <= 255,
@@ -1337,12 +1484,15 @@ pub fn parse_ll(src: &str) -> Module {
                     let bytes = if init.starts_with("zeroinitializer") {
                         vec![0u8; size as usize]
                     } else {
-                        // Named struct array initializer like [%struct.irq_desc_t { i8 1, ... }, ...].
-                        // Decoding the literal bytes precisely needs the struct's field layout;
-                        // for the HAL's ROM tables a zero blob is sufficient to let the program
-                        // build through the pipeline. A correct byte-accurate decode can replace
-                        // this once the field-level decoder for named structs is added.
-                        vec![0u8; size as usize]
+                        let ty_str = &rest[..close + 1];
+                        let decoded = decode_typed_value(ty_str, init, &types);
+                        assert_eq!(
+                            decoded.len(),
+                            size,
+                            "SPIKE LIMIT: array global @{name} initializer decoded to {} bytes, expected {size} for {ty_str:?}",
+                            decoded.len()
+                        );
+                        decoded
                     };
                     (Ty::I8, size as u16, bytes)
                 } else {
@@ -1397,11 +1547,19 @@ pub fn parse_ll(src: &str) -> Module {
                         panic!("irparse: unknown struct type {struct_tok} for @{name}")
                     });
                 let size = u16::from(info.size);
-                // Named struct globals may be zeroinitializer or a literal
-                // `{ ... }` initializer. The literal's field bytes are not needed
-                // for the HAL's ROM tables to build; a zero blob of the right size
-                // is sufficient to satisfy the pipeline.
-                let bytes = vec![0u8; size as usize];
+                let init = rest[struct_tok.len()..].trim();
+                let bytes = if init.starts_with("zeroinitializer") {
+                    vec![0u8; size as usize]
+                } else {
+                    let decoded = decode_typed_value(struct_tok, init, &types);
+                    assert_eq!(
+                        decoded.len(),
+                        size as usize,
+                        "SPIKE LIMIT: global @{name} initializer decoded to {} bytes, expected {size} for {struct_tok:?}",
+                        decoded.len()
+                    );
+                    decoded
+                };
                 (Ty::I8, size, bytes)
             } else {
                 let ty = ty_of(rest.split_whitespace().next().unwrap());

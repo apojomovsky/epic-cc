@@ -962,16 +962,42 @@ define dso_local void @main(i16 %n) {
     );
 }
 
-// Fix (2): struct-typed GEP sources must panic loudly (not mis-fold the first
-// index as a field selector) until real struct descent is implemented.
+// Fix (2): struct-typed GEP sources now decode field selectors to byte
+// offsets (field 1 of `{i8,i16}` is at offset 2). The previous panic for
+// any struct GEP is now only for register field indices.
 #[test]
-#[should_panic(expected = "struct-typed source")]
-fn struct_gep_source_panics() {
+fn struct_gep_source_with_field_selector_decodes() {
     let ll = r#"
 %struct.S = type { i8, i16 }
 @s = dso_local global %struct.S zeroinitializer, align 2
 define dso_local void @main() {
   %p = getelementptr %struct.S, ptr @s, i16 0, i16 1
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    let gep = m.funcs[0].blocks[0]
+        .insts
+        .iter()
+        .find_map(|i| match i {
+            Inst::Gep(g) => Some(g),
+            _ => None,
+        })
+        .expect("gep must exist");
+    assert_eq!(gep.base, GepBase::Global("s".to_string()));
+    assert_eq!(gep.k, 2, "field 1 of {{i8,i16}} at offset 2");
+    assert!(gep.terms.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "field index cannot be a register")]
+fn struct_gep_register_field_index_panics() {
+    let ll = r#"
+%struct.S = type { i8, i16 }
+@s = dso_local global %struct.S zeroinitializer, align 2
+define dso_local void @main() {
+  %r = load i16, ptr @s, align 2
+  %p = getelementptr %struct.S, ptr @s, i16 0, i16 %r
   ret void
 }
 "#;
