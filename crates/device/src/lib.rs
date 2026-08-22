@@ -4,7 +4,7 @@
 //! the design this implements. P1 adds the PIC18F4550 profile;
 //! `has_hardware_multiply`/`has_tblrd`/`sfrs` still aren't added (unused so
 //! far) and `access_bank` never will be  -  it's a core PIC18 invariant, not
-//! a per-device fact (see docs/superpowers/plans/2026-08-18-pic18-port-p1.md). P2 populates `PIC18F4550`'s `ram_banks`/`common_ram` for real (P0/P1 left them as placeholders since nothing consumed them yet).
+//! a per-device fact. P2 populates `PIC18F4550`'s `ram_banks`/`common_ram` for real (P0/P1 left them as placeholders since nothing consumed them yet).
 
 mod config;
 pub use config::resolve_config;
@@ -259,9 +259,8 @@ pub const PIC18F4550: Device = Device {
     //                  needs i8/i16)
     //   0x0004-0x000F  the fixed ISR save area (W, STATUS, BSR, FSR0L/H,
     //                  TBLPTRL/H/U, and the retval snapshot: the preempted
-    //                  main's in-flight return value, P5. prologue/
-    //                  epilogue; see
-    //                  docs/superpowers/plans/2026-08-20-pic18-port-p5.md)
+    //                  main's in-flight return value, P5 prologue/
+    //                  epilogue; see docs/adr/ADR-013-pic18-interrupts.md)
     common_ram: Some((0x0000, 0x000F)),
     stack_depth: 31,
     interrupt_vectors: &[0x0008, 0x0018],

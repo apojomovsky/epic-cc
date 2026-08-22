@@ -1,136 +1,89 @@
-# 08 — Status and next steps
+# 08 - Status and next steps
 
-**Start here if you are resuming cold.**
+**Start here if you are resuming cold.** This is the current-state map; the detailed
+designs and their ADRs are the source of truth.
 
-Last updated: 2026-08-14
+Last updated: 2026-08-22
 
 ---
 
 ## Where we are
 
-**No compiler code is implemented.** The repository contains documentation plus a working
-build environment. There is no `Cargo.toml` and no crates yet.
+The design conversation from 2026-08-14 is closed and implemented. The repository
+now contains a complete compiler, not just documentation:
 
-The docker dev image **is** built and verified — see
-[`09-build-environment.md`](09-build-environment.md). `docker build --target dev`, then you
-have pinned clang 20.1.8, rustc 1.97.1, gpasm 1.5.2, cvise, creduce, and csmith.
+- **Build environment:** docker multi-stage toolchain, verified. `make image` builds the
+  `dev` image with pinned clang 20.1.8, rustc 1.97.1, gpasm 1.5.2, csmith, creduce and
+  cvise. See [`09-build-environment.md`](09-build-environment.md) and
+  [ADR-008](03-decisions.md).
+- **PIC14 backend:** feature-complete for the v1 C surface. Core C89, 8/16/32-bit ints,
+  pointers, arrays, structs, `const` in flash via `RETLW` tables, frame overlay across
+  the whole-program call graph, multi-bank RAM and multi-page flash, interrupts with
+  SFR headers, and IEEE-754 single soft-float. Every feature has an e2e fixture under
+  `crates/driver/tests/fixtures` and a gpasm byte-for-byte cross-check.
+- **PIC18 backend:** P0 through P8 landed per [`29-pic18-port-design.md`](29-pic18-port-design.md).
+  `device` abstraction, PIC18 `asm` encoder and `sim` core, integer spine with Access
+  Bank and `BSR` banking, pointers via `FSR0`/`INDF0` ([ADR-009](adr/ADR-009-pic18-pointer-model.md)),
+  `const` via `TBLRD` ([ADR-010](adr/ADR-010-pic18-const-tblrd.md)),
+  interrupts in single-vector compat mode ([ADR-013](adr/ADR-013-pic18-interrupts.md)),
+  32-bit `long` with hardware `MULWF` ([ADR-014](adr/ADR-014-pic18-hw-arithmetic-routines.md)),
+  soft-float ([ADR-015](adr/ADR-015-pic18-softfloat.md)),
+  and a device-threaded differential fuzz gate ([ADR-016](adr/ADR-016-pic18-fuzz-gate.md)).
+- **Multi-TU and distribution:** `llvm-link` merge and `epic-cc` binary naming per
+  [ADR-011](adr/ADR-011-multi-tu-front-end.md); silicon-real codegen (`EPIC_AT`,
+  `EPIC_CONFIG`, `EPIC_FOSC_HZ`) per [ADR-012](adr/ADR-012-cc3-silicon-real-codegen.md);
+  freestanding libc headers per [ADR-018](adr/ADR-018-cc2-freestanding-libc.md);
+  inline assembly (rungs 1-4) per [ADR-017](adr/ADR-017-cc4-inline-assembly.md).
+  Public binary distribution is designed in [`30-distribution-design.md`](30-distribution-design.md);
+  ecosystem integration (epic-cc as the default toolchain for epic-hal, PlatformIO)
+  is designed in [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md).
 
-We are at the end of a design conversation, following a brainstorm → design → approve →
-implement flow. The state of that flow:
+What used to live in this document, the phasing table, the "never presented" sections,
+and the open-questions list, is superseded by [`12-backend-design.md`](12-backend-design.md)
+(the approved PIC14 spec), [`29-pic18-port-design.md`](29-pic18-port-design.md),
+[`30-distribution-design.md`](30-distribution-design.md),
+[`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md) and the
+ADRs in [`03-decisions.md`](03-decisions.md) plus `docs/adr/`.
 
-| Step | Status |
-|---|---|
-| Explore project context | ✅ done |
-| Clarifying questions (4 asked, 4 answered) | ✅ done |
-| Propose 2–3 approaches with trade-offs | ✅ done — Approach A chosen |
-| Online prior-art survey | ✅ done — [`02-prior-art.md`](02-prior-art.md) |
-| Reference books obtained | ✅ done — Muchnick + lcc |
-| Documentation phase | ✅ done — this `docs/` tree |
-| Build environment (docker) | ✅ done and verified — [ADR-008](03-decisions.md), [`09`](09-build-environment.md) |
-| Present design in sections, approve each | ⚠️ **Ten-stage pipeline + repository shape approved; Rust approved (ADR-005). Design sections 2–4 (allocator/banking core, verification harness, phasing) still not presented.** |
-| Write design doc / spec | ⏸ superseded in part by this `docs/` tree |
-| Implementation plan | ❌ not started |
-| **Feasibility spike** | ✅ **done — all four questions answered, success criterion met. See [`10-spike-findings.md`](10-spike-findings.md)** |
+## What the user has decided (still settled)
 
-## What the user has explicitly decided
-
-These are settled. Do not re-litigate them without new evidence.
-
-1. **Goal:** a usable compiler for real PIC16F877A projects — write C, flash it, hardware
-   works. Not a research artifact, not an XC8 clone.
+1. **Goal:** a usable compiler for real PIC16F877A projects, write C, flash it,
+   hardware works. Not a research artifact, not an XC8 clone.
 2. **Toolchain:** whole-program compilation, we own everything down to Intel HEX.
-3. **C surface:** all of it — core C89 + 8/16-bit ints, 32-bit `long` with soft arithmetic,
-   soft-float, and interrupts with SFR headers.
-4. **Architecture:** Approach A — clang as an out-of-process front end emitting `.ll` text;
+3. **C surface:** all of it, core C89 + 8/16-bit ints, 32-bit `long` with soft
+   arithmetic, soft-float, and interrupts with SFR headers.
+4. **Architecture:** Approach A, clang as an out-of-process front end emitting `.ll` text;
    custom whole-program PIC14 backend. Not an LLVM backend.
-5. **De-risking:** spike the backend spine **before** writing the full plan.
-6. **Commits:** conventional commits, single line, at most 3 lines.
-7. **Implementation language:** Rust ([ADR-005](03-decisions.md)).
-8. **Build isolation:** docker multi-stage toolchain, nothing installed system-wide; clang
-   pinned to 20.1.8 ([ADR-008](03-decisions.md)).
-9. **Vendored material:** user supplies Microchip installers, datasheets, and the reference
+5. **Commits:** conventional commits, single line, at most 3 lines.
+6. **Implementation language:** Rust ([ADR-005](03-decisions.md)).
+7. **Build isolation:** docker multi-stage toolchain, nothing installed system-wide;
+   clang pinned to 20.1.8 ([ADR-008](03-decisions.md)).
+8. **Vendored material:** user supplies Microchip installers, datasheets, and the reference
    books under `vendor/`, gitignored ([`../vendor/README.md`](../vendor/README.md)).
 
-## What is presented but NOT yet approved
+## Where to go next
 
-- The **device-description-as-data** approach ([ADR-004](03-decisions.md)) — presented,
-  pending final design approval.
+| If you want | Read |
+|---|---|
+| The PIC14 architecture and why it is hard | [`01-target-pic14.md`](01-target-pic14.md) |
+| The consolidated backend spec | [`12-backend-design.md`](12-backend-design.md) |
+| The ten-stage pipeline and stage contracts | [`04-pipeline-design.md`](04-pipeline-design.md) |
+| Verification: simulator, gpasm oracle, fuzzing | [`05-verification.md`](05-verification.md) |
+| Build environment and pinned versions | [`09-build-environment.md`](09-build-environment.md) |
+| PIC18 port: why it is smaller than a second compiler, and its phases | [`29-pic18-port-design.md`](29-pic18-port-design.md) |
+| Public binary distribution | [`30-distribution-design.md`](30-distribution-design.md) |
+| Ecosystem integration: epic-cc + epic-hal + PlatformIO | [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md) |
+| Architecture decisions and rejected alternatives | [`03-decisions.md`](03-decisions.md) and `docs/adr/` |
 
-## What was never presented at all
+Implementation plans (`docs/superpowers/plans/`) are ephemeral and never tracked on
+`master` (see `AGENTS.md`); load-bearing decisions are distilled into ADRs. The
+numbered milestone plans `docs/13-` through `docs/28-` are the historical record of
+the PIC14 spine and remain as reference.
 
-Design sections 2–4 were outlined internally but never shown to the user:
+## Corrections that still apply
 
-- **Section 2** — the allocator / banking core in detail
-- **Section 3** — the verification harness (partially captured in [`05-verification.md`](05-verification.md))
-- **Section 4** — phasing and milestones
-
----
-
-## ✅ Both de-risking spikes are complete
-
-The backend-spine spike ([`10-spike-findings.md`](10-spike-findings.md)) and the
-pointer/`const`-in-flash spike ([`11-pointer-const-findings.md`](11-pointer-const-findings.md))
-both finished on 2026-08-14. Their probes compile and run correctly in the throwaway PIC14
-simulator, cross-checked against `gpasm`. The two hardest unknowns are now answered:
-
-- `.ll` is a good substrate; the IR surface (scalars, control flow, pointers, structs,
-  `const`) is tractable.
-- The pointer layer lowers cleanly via `FSR`/`INDF`; Harvard `const` lowers via `RETLW`
-  tables (with a known PCLATH/page-crossing caveat to design around).
-- Common RAM is tight: colouring + bank-0 spill are first-version allocator work.
-
-**Next up (needs user decision, not yet approved):** present the allocator/banking core and
-the remaining design sections (2–4) for approval, then write the implementation plan. The
-pointer/`const` risk is now de-risked rather than open.
-
----
-
-## Proposed phasing after the spike (never presented — needs user approval)
-
-Sequenced so the hard, high-risk parts come early and the large-but-decoupled parts come
-last.
-
-1. **Verification harness first** — our PIC14 simulator, the `xc8-cc` differential runner,
-   `gpasm` cross-check, snapshot infrastructure. Build the oracle before the thing it
-   judges.
-2. **Integer spine** — core C89, 8/16-bit ints, control flow, non-recursive calls. Overlay
-   allocation and BANKSEL/PAGESEL minimisation land here. This is the bulk of the
-   difficulty.
-3. **Pointers, arrays, structs** — the `FSR`/`INDF` codegen problem.
-4. **Interrupts + SFR headers + device description** — makes it actually usable on hardware.
-5. **32-bit `long`** + soft mul/div/mod runtime.
-6. **Random testing at scale** — YARPGen + cvise loop running unsupervised.
-7. **Soft-float** — largest library chunk, least coupled to the hard backend problems.
-
-## Open questions
-
-- **Datalayout:** the spike used MSP430's wholesale (`-target msp430` —
-  `p:16:16`, byte alignment, native 8/16-bit) and it worked end-to-end. Treat MSP430's as
-  the working default; a custom datalayout remains an option but is no longer required.
-- **Which clang optimization passes to enable.** `-O2`/`-Oz` wholesale is wrong. Three
-  known costs: SROA increases RAM pressure on a 368-byte machine; the optimizer normalises
-  shifts-and-adds into multiplies we must re-expand; and — measured during environment
-  setup, see [`09`](09-build-environment.md) — `-Oz` emits **arbitrary-precision integer
-  therefore cannot assume 8/16/32-bit widths. Needs a curated pass list. The spike ran
-  successfully at `-O1` (allocas vanish, no arbitrary-width ints or intrinsics); `-Oz`
-  remains confirmed-problematic, so the curated list should sit at `-O1`/`-O2`, not `-Oz`.
-- **Legalizer generality.** Directly following from the above: how general does the
-  widening/narrowing story need to be? A `mul i17` on a core with no hardware multiply is
-  an unpleasant lowering, and it appeared in a two-function test program.
-- **Every `[VERIFY]` item in [`01-target-pic14.md`](01-target-pic14.md)** — memory map, bank
-  ranges, common RAM extent, flash size, `const`-in-flash access mechanism. Confirm against
-  DS39582 and DS33023 before hard-coding into the device file.
-- **Interrupt/main shared-function policy:** duplicate such functions, or give them
-  non-overlapping frames? Affects both RAM pressure and code size.
-- **Recursion:** confirmed a compile error. Should there be an escape hatch
-  (e.g. an explicit software-stack attribute) for the rare case? Probably not for v1.
-
-## Corrections made during the design conversation
-
-Recorded so they are not silently re-introduced:
-
-- **"LLVM cannot target accumulator machines" is false.** llvm-mos disproves it. The real
-  argument against the LLVM route is *cost*, not *possibility*. See [ADR-001](03-decisions.md).
+- **"LLVM cannot target accumulator machines" is false.** llvm-mos disproves it. The
+  argument against the LLVM route is cost, not possibility. See [ADR-001](03-decisions.md).
 - **"gputils is largely unmaintained" is false.** v1.5.2 shipped 2025-10-23 and it is
   actively maintained. It is a useful oracle and device-data source.
 - **"XC8 is clang-based, so its PIC16 codegen is LLVM" is false.** clang is the front end;

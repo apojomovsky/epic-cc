@@ -1,8 +1,8 @@
 //! `isel-pic18`: instruction selection for the PIC18 integer spine (P2),
 //! extended by P3 (pointers, arrays, structs) and P4 (`const` in flash via
-//! `TBLRD`). See docs/superpowers/plans/2026-08-18-pic18-port-p2.md (P2
-//! scope), 2026-08-20-pic18-port-p3.md (P3 scope), and
-//! 2026-08-20-pic18-port-p4.md (P4 scope: `const` globals read via
+//! `TBLRD`). See docs/29-pic18-port-design.md §4 for phasing, and
+//! docs/adr/ADR-009-pic18-pointer-model.md (P3) and
+//! docs/adr/ADR-010-pic18-const-tblrd.md (P4: `const` globals read via
 //! `TBLRD`, the 511-byte `RETLW` ceiling of PIC14 is gone, stores through
 //! a `const` base panic loudly).
 //! A separate crate from `isel` per docs/29-pic18-port-design.md §2 D-1:
@@ -30,7 +30,7 @@ struct Gen<'m> {
     addrs: &'m HashMap<String, u16>,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)` by `iselcore::resolve_pointers`; see
-    /// docs/superpowers/plans/2026-08-20-pic18-port-p3.md Task 1/3.
+    /// docs/adr/ADR-009-pic18-pointer-model.md.
     resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from
     /// `device.common_ram`)  -  see the plan's "Where the retval/scratch
@@ -1303,9 +1303,8 @@ impl<'m> Gen<'m> {
             Inst::Alloca(_) | Inst::Gep(_) => {
                 // Virtual: Alloca's slot comes from `alloc`'s layout and
                 // Gep's result is folded away by `resolve_pointers`
-                // (Task 1) before codegen ever runs; see this file's
-                // module doc and docs/superpowers/plans/
-                // 2026-08-20-pic18-port-p3.md Task 10. Neither emits
+                // before codegen ever runs; see this file's module doc and
+                // docs/adr/ADR-009-pic18-pointer-model.md. Neither emits
                 // anything of its own.
             }
             Inst::Memcpy(mc) => match &mc.len {
