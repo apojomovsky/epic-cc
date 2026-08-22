@@ -16,10 +16,8 @@ const INPUTS: [&str; 3] = [
 /// sanitize) plus `alloc`, so the test can find `total`'s RAM address the
 /// same way `array_e2e.rs` and `banked_e2e.rs` do for a single unit.
 fn multi_tu_layout() -> alloc::AllocLayout {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-    let llvm_link = driver::clang_discovery::resolve_llvm_link(std::path::Path::new(&clang))
-        .expect("resolve_llvm_link");
+    let (clang, resdir) = driver::clang::pic_clang_from_env();
+    let llvm_link = driver::clang_discovery::resolve_llvm_link(&clang).expect("resolve_llvm_link");
 
     let tmp = std::env::temp_dir().join(format!("epiccc-multi-tu-test-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).unwrap();
@@ -27,27 +25,12 @@ fn multi_tu_layout() -> alloc::AllocLayout {
     let mut units = Vec::new();
     for (n, input) in INPUTS.iter().enumerate() {
         let ll_path = tmp.join(format!("{n:03}.ll"));
-        let out = Command::new(&clang)
-            .args([
-                "-target",
-                "msp430",
-                "-O1",
-                "-S",
-                "-emit-llvm",
-                "-ffreestanding",
-                "-nostdinc",
-                "-resource-dir",
-                &resdir,
-                "-o",
-                ll_path.to_str().unwrap(),
-                input,
-            ])
-            .output()
-            .expect("run clang");
-        assert!(
-            out.status.success(),
-            "clang: {}",
-            String::from_utf8_lossy(&out.stderr)
+        driver::clang::compile_to_file(
+            &clang,
+            &resdir,
+            std::path::Path::new(input),
+            &ll_path,
+            &driver::clang::Options::default(),
         );
         units.push(ll_path);
     }
@@ -115,10 +98,8 @@ fn compiles_three_translation_units_end_to_end() {
 /// and the merge path this whole task exists for goes untested.
 #[test]
 fn the_merge_actually_renamed_colliding_symbols() {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-    let llvm_link = driver::clang_discovery::resolve_llvm_link(std::path::Path::new(&clang))
-        .expect("resolve_llvm_link");
+    let (clang, resdir) = driver::clang::pic_clang_from_env();
+    let llvm_link = driver::clang_discovery::resolve_llvm_link(&clang).expect("resolve_llvm_link");
 
     let tmp =
         std::env::temp_dir().join(format!("epiccc-multi-tu-collision-{}", std::process::id()));
@@ -127,24 +108,13 @@ fn the_merge_actually_renamed_colliding_symbols() {
     let mut units = Vec::new();
     for (n, input) in INPUTS.iter().enumerate() {
         let ll_path = tmp.join(format!("{n:03}.ll"));
-        let out = Command::new(&clang)
-            .args([
-                "-target",
-                "msp430",
-                "-O1",
-                "-S",
-                "-emit-llvm",
-                "-ffreestanding",
-                "-nostdinc",
-                "-resource-dir",
-                &resdir,
-                "-o",
-                ll_path.to_str().unwrap(),
-                input,
-            ])
-            .output()
-            .expect("run clang");
-        assert!(out.status.success());
+        driver::clang::compile_to_file(
+            &clang,
+            &resdir,
+            std::path::Path::new(input),
+            &ll_path,
+            &driver::clang::Options::default(),
+        );
         units.push(ll_path);
     }
 
