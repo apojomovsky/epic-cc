@@ -1,224 +1,33 @@
 #!/usr/bin/env bash
-# Takeoff ritual: run before opening a PR. Verifies the branch meets the
-# repo's merge conventions and prints exactly what still has to be done.
-# Exits 1 while blocking items are outstanding; advisory items warn only.
+# Unified takeoff — thin wrapper around `epic-tasks takeoff`.
+# Canonical checks live in epic-tasks/epic_tasks/takeoff.py so every epic
+# repository runs the same ritual (worktree discipline, hygiene, prose,
+# repo-specific hard gates). This file only preserves `make pre-pr-check`
+# as the entry point and forwards flags.
 #
-# The load-bearing rule: implementation plans (docs/superpowers/plans/)
-# live in the PR's commit history for archaeology but must not reach
-# master's tree. Distill load-bearing decisions into
-# docs/adr/ADR-00N-<topic>.md (Status line, rationale, rejected
-# alternatives; add a one-line index entry to docs/03-decisions.md),
-# then `git rm` the plan in a final commit. Squash merging then keeps
-# master plan-free automatically.
-#
-# Usage: bash scripts/pre-pr-check.sh [--test] [--prose]
-#   --test    also run the full suite (make test); slow, opt-in
-#   --prose   attest that scripts/prose-diff.sh's output has been read and
-#             judged against AGENTS.md's Expression Conventions
-#   BASE_REF overrides the base branch (forks: BASE_REF=<fork>/master)
+# Usage: bash scripts/pre-pr-check.sh [--test] [--prose] [--base <ref>]
+#   --test   also run the full suite
+#   --prose  attest that scripts/prose-diff.sh output was reviewed
+#   --base   base ref to diff against (default origin/master or $BASE_REF)
+#   BASE_REF env var overrides the base (for forks)
 
 set -uo pipefail
 
-BASE_REF="${BASE_REF:-origin/master}"
-RUN_TESTS=0
-RUN_PROSE=0
-for arg in "$@"; do
-  case "$arg" in
-    --test) RUN_TESTS=1 ;;
-    --prose) RUN_PROSE=1 ;;
-  esac
+# Prefer a PATH install, fall back to sibling checkout layout.
+if command -v epic-tasks >/dev/null 2>&1; then
+  exec epic-tasks takeoff "$@"
+fi
+
+# Try sibling layout: EPIC_TASKS_ROOT or parent of this repo's parent
+for cand in "${EPIC_TASKS_ROOT:-}" "$(git rev-parse --show-toplevel 2>/dev/null)/../epic-tasks" "$HOME/projects/epic-tasks"; do
+  [ -z "$cand" ] && continue
+  cand=$(realpath -m "$cand" 2>/dev/null || echo "$cand")
+  if [ -x "$cand/epic-tasks" ]; then
+    exec "$cand/epic-tasks" takeoff "$@"
+  fi
 done
 
-FAILS=0
-WARNS=0
-
-say()  { printf '%s\n' "$*"; }
-ok()   { say "  [ok] $*"; }
-warn() { say "  [warn] $*"; WARNS=$((WARNS + 1)); }
-fail() { say "  [FAIL] $*"; FAILS=$((FAILS + 1)); }
-
-branch=$(git branch --show-current)
-say "== Takeoff ritual: ${branch:-detached HEAD} =="
-say ""
-
-# ── 1. Working tree must be clean ──────────────────────────────────
-if [ -n "$(git status --porcelain)" ]; then
-  fail "working tree has uncommitted changes (commit or stash first)"
-else
-  ok "working tree clean"
-fi
-
-# ── 2. Branch must not be behind the base ──────────────────────────
-if git rev-parse --verify -q "$BASE_REF" >/dev/null 2>&1; then
-  behind=$(git rev-list --count "HEAD..$BASE_REF")
-  if [ "$behind" -gt 0 ]; then
-    warn "branch is $behind commit(s) behind $BASE_REF; rebase before merging"
-  else
-    ok "up to date with $BASE_REF"
-  fi
-else
-  warn "$BASE_REF not found; fetch first: git fetch origin master"
-fi
-
-# ── 3. Implementation plans must not reach master ──────────────────
-plans=$(git diff --name-only --diff-filter=AM "$BASE_REF"...HEAD -- docs/superpowers/plans/ 2>/dev/null)
-if [ -n "$plans" ]; then
-  fail "plan file(s) in the PR's final diff (must not reach master):"
-  for p in $plans; do
-    say "    - $p"
-  done
-  say "    Fix:"
-  say "      1. Distill load-bearing decisions/rulings into"
-  say "         docs/adr/ADR-00N-<topic>.md (Status line, rationale,"
-  say "         rejected alternatives) and add a one-line index entry"
-  say "         to docs/03-decisions.md."
-  say "      2. git rm the plan in a final commit."
-  say "    The plan stays in the PR's commit history (archaeology);"
-  say "    master must not carry it."
-else
-  ok "no plan files in the PR diff"
-fi
-
-# ── 4. Commit hygiene: conventional, single-subject, no trailers ───
-n=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null || echo 0)
-if [ "$n" -eq 0 ]; then
-  fail "no commits ahead of $BASE_REF; nothing to PR"
-else
-  say "checking $n commit(s):"
-  while IFS= read -r -d '' hash; do
-    IFS= read -r -d '' subject || break
-    IFS= read -r -d '' body || break
-    short=${hash:0:7}
-    if [[ "$subject" == Merge\ * ]]; then
-      ok "$short merge commit (git-generated, skipped)"
-      continue
-    fi
-    if [[ "$subject" =~ ^(feat|fix|chore|docs|build|ci|test|refactor|style|perf|revert|plan)(\([a-z0-9-]+\))?!?: ]]; then
-      ok "$short conventional"
-    else
-      fail "$short not conventional: $subject"
-    fi
-    [ ${#subject} -gt 72 ] && warn "$short subject ${#subject} chars (keep <= 72)"
-    nl=$(printf '%s' "$body" | grep -c . || true)
-    [ "$nl" -gt 3 ] && warn "$short body $nl lines (keep <= 3)"
-    if printf '%s\n%s' "$subject" "$body" | grep -qiE '^(co-authored-by|coauthored-by|authored-by):'; then
-      fail "$short carries a Co-Authored-By/trailer (forbidden, AGENTS.md)"
-    fi
-    if printf '%s\n%s' "$subject" "$body" | grep -q '—'; then
-      fail "$short contains an em-dash in the commit message (forbidden; use a comma, colon, or period)"
-    fi
-  done < <(git log "$BASE_REF..HEAD" --format='%H%x00%s%x00%b%x00')
-fi
-
-# ── 5. Whitespace errors in the PR diff ────────────────────────────
-if out=$(git diff "$BASE_REF"...HEAD --check 2>&1); then
-  ok "no whitespace errors"
-else
-  printf '%s\n' "$out" | head -10
-  fail "whitespace errors in the diff (above); fix and re-stage"
-fi
-
-# ── 6. Compiler warnings: cargo build --workspace --all-targets ────
-# Not opt-in like --test below: an incremental build is fast enough to
-# run on every check, and a clean build is the point of this gate.
-if warn_out=$(make check-warnings 2>&1); then
-  ok "no compiler warnings (cargo build --workspace --all-targets)"
-else
-  printf '%s\n' "$warn_out" | tail -40
-  fail "compiler warnings present (above); fix and re-run (make check-warnings)"
-fi
-
-# ── 7. Prose hygiene in the PR's diff (not ascii art) ─────────────
-# Only ADDED lines are scanned: context lines may carry pre-existing
-# em-dashes from lines the PR merely touches. AGENTS.md, the hooks,
-# this script, and docs/03 are excluded by design: AGENTS.md documents
-# the rule (and needs the character), the hook and script carry it in
-# their enforcement patterns, and docs/03's ADR titles use the em-dash
-# as a structural separator (ADR-001..008 convention).
-emdashes=$(git diff "$BASE_REF"...HEAD -- . \
-  ':(exclude)docs/superpowers/plans/' \
-  ':(exclude)AGENTS.md' ':(exclude)CLAUDE.md' \
-  ':(exclude).githooks/' \
-  ':(exclude)scripts/pre-pr-check.sh' \
-  ':(exclude)docs/03-decisions.md' 2>/dev/null \
-  | grep -nE '^\+[^+].*—' | head -10)
-if [ -n "$emdashes" ]; then
-  printf '    %s\n' "$emdashes"
-  fail "em-dashes (—) in the PR's diff (forbidden in prose; use a comma,"
-  fail "      colon, or period. Exception: ascii-art/diagrams)."
-else
-  ok "no em-dashes in the diff"
-fi
-
-# Space-before-comma: the residue a mechanical em-dash sweep leaves
-# behind (` — ` replaced by ` , `, a comma splice). The em-dash scan
-# above cannot catch it, because the sweep deleted every — it swept.
-# Advisory, not blocking: prose-only sweeps need a human or a language
-# model to pick a comma, a colon, or a period with logic; a script
-# cannot. Also catches stray whitespace before commas in code.
-commas=$(git diff "$BASE_REF"...HEAD -- . \
-  ':(exclude)docs/superpowers/plans/' \
-  ':(exclude)AGENTS.md' ':(exclude)CLAUDE.md' \
-  ':(exclude).githooks/' \
-  ':(exclude)scripts/pre-pr-check.sh' \
-  ':(exclude)docs/03-decisions.md' 2>/dev/null \
-  | grep -nE '^\+[^+].* ,' | head -10)
-if [ -n "$commas" ]; then
-  printf '    %s\n' "$commas"
-  warn "space-before-comma (',') in the PR's diff: mechanical em-dash"
-  warn "      sweeps leave this (a comma splice, not prose). Replace"
-  warn "      with a comma, a colon, or a period, chosen with logic."
-else
-  ok "no space-before-comma residue"
-fi
-
-# ── 8. Comment & doc prose review (added/changed comments, *.md) ──
-# scripts/prose-diff.sh only flags objective signals (block length,
-# hardcoded counts); it cannot judge content, so it never fails on its
-# own. --prose attests the agent read everything printed and fixed it,
-# same trust model as --test below.
-prose_out=$(bash "$(dirname "$0")/prose-diff.sh" 2>/dev/null)
-prose_summary=$(printf '%s\n' "$prose_out" | grep '^SUMMARY:' || true)
-prose_blocks=$(printf '%s' "$prose_summary" | sed -nE 's/.*comment_blocks=([0-9]+).*/\1/p')
-prose_docs=$(printf '%s' "$prose_summary" | sed -nE 's/.*doc_files=([0-9]+).*/\1/p')
-prose_blocks=${prose_blocks:-0}
-prose_docs=${prose_docs:-0}
-if [ "$prose_blocks" -eq 0 ] && [ "$prose_docs" -eq 0 ]; then
-  ok "no added comments or markdown changes to review"
-elif [ "$RUN_PROSE" -eq 1 ]; then
-  ok "prose reviewed and attested ($prose_blocks comment block(s), $prose_docs doc file(s))"
-else
-  warn "$prose_blocks comment block(s), $prose_docs doc file(s) changed; read"
-  warn "      scripts/prose-diff.sh output, judge each against AGENTS.md's"
-  warn "      Expression Conventions, then re-run with --prose (make"
-  warn "      pre-pr-check PROSE=1)"
-fi
-
-# ── 9. Hooks installed (make setup-hooks) ──────────────────────────
-hooks=$(git rev-parse --git-path hooks)
-if [ ! -x "$hooks/pre-commit" ]; then
-  warn "git hooks not installed; run: make setup-hooks"
-else
-  ok "git hooks installed"
-fi
-
-# ── 10. Suite (opt-in via --test) ──────────────────────────────────
-if [ "$RUN_TESTS" -eq 1 ]; then
-  say ""
-  say "== running the full suite (make test) =="
-  if make test; then
-    ok "full suite passed"
-  else
-    fail "full suite failed"
-  fi
-else
-  warn "suite not run; re-run with --test (make pre-pr-check TEST=1) before merging"
-fi
-
-say ""
-if [ "$FAILS" -gt 0 ]; then
-  say "== $FAILS blocking item(s), $WARNS advisory; fix and re-run =="
-  exit 1
-fi
-say "== ritual clean ($WARNS advisory); ready to open the PR =="
-exit 0
+echo "epic-tasks not found — install it:" >&2
+echo "  ln -s \"\$PWD/epic-tasks/epic-tasks\" ~/.local/bin/epic-tasks" >&2
+echo "  gh auth refresh -s project" >&2
+exit 4
