@@ -99,6 +99,13 @@ names via a small alias table (`FOSC` -> `osc`, `WDTE` -> `wdt`, `INTRC` ->
 `intosc`, etc.) documented in its header, and emits deterministically
 formatted TOML (fields sorted by `byte_offset`/`shift`, values by `bits`).
 See `docs/adr/ADR-020-dfp-toml-generator.md` and `scripts/gen-device.py --help`.
+
+`crates/device/provenance.rs` reaches the crate only via `include!`, never a
+`mod` declaration, so `cargo fmt` (and `make fmt`) never visits it. The
+pre-commit hook still catches drift, since it runs `rustfmt --check` on staged
+files directly rather than through `cargo fmt`. Run `rustfmt` on that file by
+hand after editing it.
+
 ## Release bundles
 
 Tag-triggered [`release.yml`](../.github/workflows/release.yml) builds the
