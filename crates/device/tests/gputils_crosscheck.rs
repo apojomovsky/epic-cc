@@ -63,3 +63,67 @@ fn ram_map_matches_gputils_for_every_device() {
     }
     assert!(checked > 0, "no device was cross-checked");
 }
+
+use device::Core;
+use std::process::Command;
+
+fn gpasm() -> String {
+    std::env::var("PIC8_GPASM").unwrap_or_else(|_| "gpasm".into())
+}
+
+/// Assembles `org <addr>` for `dev` and returns gpasm's combined output.
+/// gpasm exits 0 on a range warning, so the caller matches on the text.
+fn probe_org(dev_name: &str, addr: u32, tag: &str) -> String {
+    let dir = std::env::temp_dir();
+    let asm = dir.join(format!("probe_{dev_name}_{tag}.asm"));
+    let hex = dir.join(format!("probe_{dev_name}_{tag}.hex"));
+    std::fs::write(&asm, format!("    org 0x{addr:X}\n    nop\n    end\n")).unwrap();
+    let out = Command::new(gpasm())
+        .args([
+            "-p",
+            dev_name,
+            asm.to_str().unwrap(),
+            "-o",
+            hex.to_str().unwrap(),
+        ])
+        .output()
+        .expect("gpasm must be runnable; set PIC8_GPASM");
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+const OVERFLOW: &str = "Address exceeds maximum range";
+
+#[test]
+fn flash_words_matches_gputils_for_every_device() {
+    let Some(_share) = gputils_share() else {
+        return;
+    };
+    for dev in device::ALL {
+        // org counts words on PIC14 and bytes on PIC18, so the last valid
+        // address and the first bad one differ per core.
+        let (last, past) = match dev.core {
+            Core::Pic14 | Core::Pic14e => (dev.flash_words - 1, dev.flash_words),
+            Core::Pic18 => (dev.flash_words * 2 - 2, dev.flash_words * 2),
+        };
+
+        let inside = probe_org(dev.name, last, "last");
+        assert!(
+            !inside.contains(OVERFLOW),
+            "{}: gpasm rejects 0x{last:X}, which flash_words = {} claims exists:\n{inside}",
+            dev.name,
+            dev.flash_words
+        );
+
+        let outside = probe_org(dev.name, past, "past");
+        assert!(
+            outside.contains(OVERFLOW),
+            "{}: gpasm accepts 0x{past:X}, past the {} words flash_words claims:\n{outside}",
+            dev.name,
+            dev.flash_words
+        );
+    }
+}
