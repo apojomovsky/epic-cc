@@ -50,8 +50,7 @@ fn main() {
         }
     }
 
-    let lower = cli.device.to_ascii_lowercase();
-    let device = device::by_name(&lower).unwrap_or_else(|| {
+    let device = device::resolve(&cli.device).unwrap_or_else(|| {
         let available = device::ALL
             .iter()
             .map(|d| d.name)

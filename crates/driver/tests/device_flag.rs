@@ -190,3 +190,31 @@ fn device_flag_overrides_env() {
     );
     let _ = std::fs::remove_file(&out);
 }
+
+#[test]
+fn device_flag_accepts_the_hal_manifest_spelling() {
+    // epic-hal's manifest names variants `16F877A`, and XC8 takes `16f877a`.
+    // Both must reach the compiler without a caller-side mapping table.
+    for spelling in ["16F877A", "16f877a", "PIC16F877A"] {
+        let out = tmp_hex(&format!("hal-spelling-{spelling}"));
+        let fixture = fixture_add();
+        let res = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+            .args([
+                fixture.as_str(),
+                "-o",
+                out.to_str().unwrap(),
+                "--target",
+                spelling,
+            ])
+            .output()
+            .expect("run driver");
+        assert!(
+            res.status.success(),
+            "--target {spelling} failed: {}",
+            String::from_utf8_lossy(&res.stderr)
+        );
+        let hex = std::fs::read_to_string(&out).expect("read hex");
+        assert_eq!(pic14_sim::parse_hex(&hex).len(), 8192);
+        let _ = std::fs::remove_file(&out);
+    }
+}
