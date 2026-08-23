@@ -18,7 +18,7 @@ one-line index entry here, e.g.:
 - ADR-017: CC-4 inline assembly: naked, module asm, opaque blocks, header intrinsics, 2026-08-21
 - ADR-018: CC-2 freestanding libc: stdint/stdbool/stddef headers + a linked-on-demand string.h, 2026-08-21
 - ADR-019: PIC variants -- file-per-device TOML + build.rs codegen + --target + canonical-per-core CI, 2026-08-22
----
+- ADR-020: DFP -> TOML generator (ATDF/EDC ingestion, deterministic output, --check gate), 2026-08-23
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

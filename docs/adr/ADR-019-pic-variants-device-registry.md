@@ -27,8 +27,31 @@
 ## Consequences
 
 * `p16f887.toml` is the first exemplar; `pic14e` (`p16f1937` etc.) is a firewall error until `isel-pic14e` exists. The firewall is at the driver, not at codegen: `build.rs` validates a `pic14e` TOML like any other (same single `0x0004` vector as `pic14`) and the driver refuses the target with `core pic14e which has no backend yet`. Refusing at codegen would make a `pic14e` TOML impossible to keep in tree at all, which is the wrong trade: the data should be reviewable before the backend exists. Each backend stage (`asm`, `fosc`, `fuzz`) panics on the core as a backstop, covered by `crates/asm/tests/pic14e_firewall.rs`.
-* DFP/ATDF → TOML generator is a follow-up (#86); `.atdf` itself is never committed, only the TOML it generates (licence-clean, same posture as config transcription today).
+* DFP/ATDF -> TOML generator is a follow-up (#86); `.atdf` itself is never committed, only the TOML it generates (licence-clean, same posture as config transcription today).
 
 ## Revisit if
 
 * `hal` needs SFR names that cannot be expressed in the optional `sfrs` table, or a new core requires fields not in the schema -- extend the schema, don't revert to Rust consts.
+
+## Addendum 2026-08-23 -- DFP as the TOML source (epic-cc#86)
+
+`scripts/gen-device.py` is the one-shot generator that removes the
+hand-transcription tax at device #3+. It reads a Microchip DFP
+(`*.atdf` / `*.PIC` / `xc8/pic/dat/{ini,cfgdata}`) and emits the
+deterministic `crates/device/devices/<stem>.toml`.
+
+* **Primary source:** the ATDF/EDC PIC file from the DFP
+  (`PIC16Fxxx_DFP` on https://packs.download.microchip.com/), free
+  download, gitignored; `gputils` `.inc` is the byte-for-byte oracle.
+* **Fallback:** `xc8/pic/dat/ini/*.ini` + `cfgdata/*.cfgdata` under
+  `$PIC8_XC8_ROOT` (the same DFP repacked by XC8), which is what
+  `gen-device` uses when `--atdf` is not given and a local XC8
+  install is present.
+* **Posture:** XC8 headers are black-box oracle only, per `AGENTS.md`
+  GPL boundary. The `.atdf`/`.PIC` itself is **never committed**,
+  only the TOML it generates, same licence posture as the original
+  hand transcription.
+* **Alias table:** DFP field/value names are normalised to our
+  `EPIC_CONFIG` names (`WDTE` -> `wdt`, `FOSC` -> `osc`, `INTRC` ->
+  `intosc`, etc.) documented in the script header; `gen-device
+  --check` + `git diff --exit-code` in CI/nightly gates drift.

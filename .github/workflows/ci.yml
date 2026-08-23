@@ -1,25 +1,27 @@
 name: ci
 
-# The repo's one CI workflow: run the full Rust workspace test suite inside
-# the docker `ci` image (Dockerfile). The Dockerfile is the single source of
-# truth for the toolchain — clang 20.1.8 built from the digest-pinned source
-# tarball (the IR producer, deliberately pinned, see
-# docs/09-build-environment.md), rustc 1.97.1 (rust-toolchain.toml), gpasm
-# 1.5.2 (built from source) — so CI never installs a toolchain of its own
-# and cannot drift from what the dev container gives locally.
+# Stratified CI per the PIC variants design (2026-08-22 §8, ADR-019).
 #
-# Single job, deliberate: the suite is one `cargo test` invocation's worth
-# of work (~30s on a runner), there is nothing to split, and a one-job
-# workflow keeps the PR check list to a single entry. The per-crate PASS/FAIL
-# table inside the job (scripts/ci-test.sh) is what makes failures
-# attributable. When real split points exist (XC8 oracles, release bundles,
-# a simulator gate), split here the way epic-hal's family-check.yml does.
+# A compiler bug is core-wide (wrong isel for a C construct, fails on one
+# pic14 iff it fails on every pic14) or data-wide (wrong TOML value -
+# caught by schema + one sanity compile for that device). Running
+# devices × fixtures × fuzz on every PR is the HAL trap.
 #
-# Image caching: the clang-builder stage is the expensive layer (~1h first
-# build). It is cached in GHCR (ghcr.io/<repo>-toolchain) via the buildx
-# registry cache, keyed on the Dockerfile content — rebuilt only when the
-# Dockerfile or a pinned tarball changes. actions/cache warms the cargo
-# target dir and the cargo home across runs.
+# Split:
+# - canonical per core (always, full): p16f877a (pic14) + p18f4550 (pic18).
+#   Fixed 2-job matrix. Runs the full gate that ran as the single job
+#   before: cargo test for every crate (15 e2e fixtures → HEX → gpasm
+#   byte-match + sim + fuzz seeded). Cost O(cores)=2, not O(devices).
+# - per-device lightweight (on change, cheap, ~0.5 s/device): for each
+#   devices/*.toml touched in the PR diff, schema/invariants + alloc
+#   empty-prog + 80-byte global placement + asm flash-bound + single
+#   add.c → HEX + gpasm -p <device> round-trip. No fuzz, no float tortures.
+#
+# PR CI = canonical full + lightweight only for TOMLs touched in the diff
+# (git diff --name-only origin/master -- crates/device/devices/*.toml).
+# Nightly cron = lightweight for all devices (see nightly.yml).
+# Full per-device fuzz never, a fuzz bug is core-wide and the canonical
+# already found it.
 
 on:
   push:
@@ -32,8 +34,17 @@ permissions:
   packages: write
 
 jobs:
-  test:
+  canonical:
+    name: canonical ${{ matrix.device }} (${{ matrix.core }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - device: p16f877a
+            core: pic14
+          - device: p18f4550
+            core: pic18
     steps:
       - uses: actions/checkout@v5
 
@@ -60,7 +71,7 @@ jobs:
         uses: actions/cache@v5
         with:
           path: target
-          key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ github.sha }}
+          key: cargo-${{ runner.os }}-${{ github.workflow }}-${{ github.sha }}-${{ matrix.device }}
           restore-keys: |
             cargo-${{ runner.os }}-${{ github.workflow }}-
 
@@ -70,5 +81,107 @@ jobs:
           path: /tmp/cargo-home
           key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
+      - name: Check device TOMLs match DFP (gen-device --check)
+        run: |
+          echo "Checking device TOMLs against DFP source (skips if DFP not present)..."
+          for f in crates/device/devices/*.toml; do
+            stem=$(basename "$f" .toml)
+            echo "  --check $stem"
+            python3 scripts/gen-device.py "$stem" --check || {
+              ec=$?
+              if [ -d "/opt/microchip/xc8/v4.00/pic/packs" ]; then
+                echo "DFP check failed for $stem with DFP present: failing"
+                exit $ec
+              else
+                echo "DFP not installed on this runner, skipping strict check for $stem"
+              fi
+            }
+          done
+
       - name: Test every workspace crate
         run: docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/ci-test.sh
+
+  devices-changed:
+    name: devices-changed (lightweight)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ci image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          target: ci
+          load: true
+          tags: epic-cc-ci:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+
+      - name: Cache cargo target dir
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: cargo-${{ runner.os }}-devices-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-devices-
+            cargo-${{ runner.os }}-${{ github.workflow }}-
+
+      - name: Cache cargo home
+        uses: actions/cache@v5
+        with:
+          path: /tmp/cargo-home
+          key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Detect changed device TOMLs vs origin/master
+        id: changed
+        run: |
+          set -euo pipefail
+          git fetch origin master --quiet || true
+          # PR: diff vs merge-base with origin/master. Push to master: diff is empty (no extra per-device work).
+          # workflow_dispatch on a branch: same as PR detection; the nightly workflow covers "all devices".
+          base="origin/master"
+          if git rev-parse --verify "$base" >/dev/null 2>&1; then
+            changed=$(git diff --name-only "$base"...HEAD -- crates/device/devices/*.toml 2>/dev/null || true)
+          else
+            changed=""
+          fi
+          if [ -z "$changed" ]; then
+            echo "changed=" >> "$GITHUB_OUTPUT"
+            echo "devices-changed: no device TOML touched vs $base"
+          else
+            # Persist list for the next step; also expose via output for debugging.
+            printf "%s\n" "$changed" > /tmp/changed_devices.txt
+            cat /tmp/changed_devices.txt
+            # Escape newlines for GITHUB_OUTPUT multiline value
+            {
+              echo "changed<<EOF"
+              cat /tmp/changed_devices.txt
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Per-device lightweight (only for touched TOMLs)
+        run: |
+          set -euo pipefail
+          if [ ! -f /tmp/changed_devices.txt ]; then
+            echo "devices-changed: no device TOML touched, nothing to do"
+            exit 0
+          fi
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            stem=$(basename "$f" .toml)
+            echo "::group::sanity $stem ($f)"
+            docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/sanity.sh "$stem"
+            echo "::endgroup::"
+          done < /tmp/changed_devices.txt

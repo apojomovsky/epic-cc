@@ -251,9 +251,13 @@ These are deliberate and tracked, not surprises:
 
 - **Diagnostics are panics.** Unsupported input aborts with a precise message instead of a
   user-facing error. Correct, but not yet friendly.
-- **Device support is hard-coded to the PIC16F877A.** The
-  [device-description-as-data](docs/03-decisions.md) design (ADR-004) is not implemented;
-  there is no `devices/*.toml` yet.
+- **Device support is file-per-device TOML** (`crates/device/devices/*.toml`,
+  see [ADR-019](docs/adr/ADR-019-pic-variants-device-registry.md)); adding
+  a same-core part is a file add via `scripts/gen-device.py` from the
+  Microchip DFP (https://packs.download.microchip.com/, `PIC16Fxxx_DFP`;
+  the `.atdf`/`.PIC` itself is never committed, only the TOML it
+  generates). `p16f887` is the first exemplar alongside `p16f877a` and
+  `p18f4550`.
 - **`BANKSEL` minimisation is linear tracking**, reset at every label, not the published
   CASES'06 2-approximation the design calls for.
 - **Overlay allocation is call-graph-based**, not interference-graph colouring. Common RAM
@@ -319,9 +323,8 @@ crates/
   sim/         #           PIC14 instruction-set simulator
   fuzz/        #           differential generator, runner and reducer
 docs/          # design conversation, ADRs, milestone plans
-scripts/       # ci-test.sh, the workspace test gate (CI and local)
+scripts/       # ci-test.sh, gen-device.py (DFP -> TOML), pre-pr-check, prose-diff
 Dockerfile     # the pinned toolchain (multi-stage)
-```
 
 ---
 

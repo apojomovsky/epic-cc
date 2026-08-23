@@ -91,6 +91,58 @@ The final oracle is real silicon. HEX files can be flashed via MPLAB IPE. This i
 scope for automated loops but is the ultimate acceptance test for
 [`00-charter.md`](00-charter.md)'s goal ("write C, flash it, have my hardware work").
 
+
+## CI stratification - canonical per core + per-device lightweight
+
+CI does not grow as `devices x fixtures`. A bug is core-wide (wrong
+`isel` for a C construct, fails on one `pic14` iff it fails on every
+`pic14`) or data-wide (wrong TOML value, caught by schema plus one
+sanity compile for that device). The gate is split per
+`docs/superpowers/specs/2026-08-22-pic-variants-design.md` §8 and
+ADR-019.
+
+| Gate | When | What |
+|------|------|------|
+| **Canonical per core** | Every PR, always | `p16f877a` (`pic14`) + `p18f4550` (`pic18`): fixed 2-job matrix in `ci.yml`. Runs the full gate that ran before one job: `bash scripts/ci-test.sh` (every crate's `cargo test`, 15 e2e fixtures to HEX to `gpasm -p <canonical>` byte-match + `sim` + `fuzz` seeded 200). Cost `O(cores)=2`, not `O(devices)`. |
+| **Per-device lightweight** | PR iff `devices/*.toml` touched; nightly always | For each touched device: schema/invariants (`build.rs` validation), `alloc` empty-prog does not panic, one 80-byte global lands inside `ram_banks`, `asm` flash-bound tiny program, single `add.c` to HEX for that `--target` + `gpasm -p <device>` assemble of that asm. `~0.5 s/device`. No fuzz, no float/const tortures. |
+| **Nightly** | `schedule: 02:00 UTC` + `workflow_dispatch` (`nightly.yml`) | Lightweight for every `devices/*.toml`. Proves no TOML drifted. |
+| **Never** | - | Full per-device `devices x 15` e2e, full per-device fuzz. A fuzz bug is core-wide by construction and the canonical already found it. |
+
+Implementation:
+
+* `ci.yml` has a `canonical` job with a `matrix.include` of the two
+  canonical stems and a `devices-changed` job that does
+  `git diff --name-only origin/master...HEAD -- crates/device/devices/*.toml`
+  and loops `bash scripts/sanity.sh <stem>` for each stem touched. PRs
+  that touch only `p16f887.toml` do not re-run 15 fixtures for `p16f877a`.
+* `nightly.yml` loops the same helper over every TOML.
+
+### Local helpers
+
+```bash
+# One device (the cheap drill, ~0.5 s):
+make sanity DEVICE=p16f887
+bash scripts/sanity.sh p16f887
+
+# Every device (what nightly runs):
+make sanity-all
+for f in crates/device/devices/*.toml; do bash scripts/sanity.sh $(basename $f .toml); done
+
+# Only TOMLs touched vs origin/master (what PR CI does):
+make sanity-changed
+git diff --name-only origin/master -- crates/device/devices/*.toml | while read f; do bash scripts/sanity.sh $(basename $f .toml); done
+
+# Direct cargo test for the alloc/asm slice (the --changed-only equivalent):
+#   SANITY_DEVICE filters the per-device test to one stem:
+SANITY_DEVICE=p16f887 cargo test -p device --test sanity -- --nocapture
+cargo test -p device --test sanity -- --nocapture   # all devices
+```
+
+The `SANITY_DEVICE` filter is the `cargo test -p device --test sanity -- --changed-only`
+equivalent referenced in the issue: pair it with the `git diff` list to
+run only the touched stems, or use `make sanity-changed` which does the
+diff and the loop for you.
+
 ## Licensing boundary — important
 
 `gputils` and `gpsim` are **GPL**. Invoking them as external processes from a test harness
