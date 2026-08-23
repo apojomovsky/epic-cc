@@ -15,7 +15,7 @@
 **Non-goals (v1):**
 
 * `pic14e` -- `p16f1937` and the enhanced mid-range core (49 extra insns, linear GPR, `MOVLP`/`ADDFSR`) need a new backend `isel-pic14e`, not a TOML. `core = "pic14e"` is a loud firewall.
-* Per-device SFR header emission in `cc` beyond an empty `sfrs` table -- that is HAL's job (#70).
+* Per-device SFR header emission in `cc`. `Device.sfrs` exists and is emitted, empty for every part `cc` ships; populating it and generating headers is HAL's job (#70).
 * Goal-directed clock solver sugar over `EPIC_CONFIG` (doc 31 D-4 deferred). Names stay datasheet-names.
 * Full `devices × fixtures` fuzz/matrix. By construction a bug is core-wide or data-wide (see §7).
 
@@ -24,7 +24,8 @@
 ## 2. Empirical ground truth
 
 * `crates/device` already has two profiles `PIC16F877A: Pic14` and `PIC18F4550: Pic18` with `ram_banks`, `common_ram`, `flash_words`, `stack_depth`, `interrupt_vectors`, `ConfigRegion`. `alloc`, `banking`, `sim`, `asm`, `driver`, `fuzz` thread `&Device`.
-* Remaining hardcoding: `isel::fsr_window` enumerates 4 PIC14 windows `[0x20,0x80) [0xA0,0xF0) [0x120,0x170) [0x1A0,0x1F0)` literally; `STATUS,7` IRP bit, `0x70-0x7F` common RAM literals appear in comments/tests.
+* Remaining hardcoding: `isel::fsr_window` enumerates the 4 PIC14 windows literally, as the inclusive ranges the device table uses (`[0x20,0x6F] [0xA0,0xEF] [0x120,0x16F] [0x1A0,0x1EF]`); `STATUS,7` IRP bit, `0x70-0x7F` common RAM literals appear in comments/tests.
+* Those bank starts are themselves conservative. gputils puts the last bank 2 SFR at `0x010F` and the last bank 3 SFR at `0x018D`, so GPR really starts at `0x110` and `0x190` and the table drops 32 bytes of the part's 368. Correcting it is `#92`, which is blocked on `#95`: the simulator decides banked GPR by a fixed `0x20-0x6F` operand window and cannot address the recovered bytes.
 * `16F887` is same ISA as `16F877A`: 35 insns, same `STATUS.RP1:RP0` banking, same 4×2K paging, single `FSR+IRP`, 8-deep stack, 368 B GPR in same banks, `0x70-0x7F` common, `8K×14` flash, single vector `0x0004`. Only config changes (877A: 1 word at `0x2007`; 887: 2 words `0x2007/0x2008` with ~18 fields) plus SFR additions (`ANSEL/ANSELH/OSCCON`). Verified against DS39582C vs DS41291D.
 * Source posture per `AGENTS.md`: GPL tools as process invocation are fine, transcribing tables into source is a different act; XC8 is black-box oracle only.
 
@@ -92,11 +93,11 @@ fields = [{name="ANS0", mask=0x01, shift=0}, {name="ANS1", mask=0x02, shift=1}]
 
 * `ram_banks` sorted by `lo`, non-overlapping, `lo <= hi`, all `hi <= 0x7FF`.
 * `common_ram` disjoint from every bank (and from SFR holes -- banks already encode the holes by being separate ranges).
-* `flash_words` > 0, power-of-two-ish (warn if not 0x1000/0x2000/0x4000 etc.).
+* `flash_words` > 0 and a power of two (a non power of two is a transcription error until a part proves otherwise).
 * `erased_baseline.len() == num_bytes`.
-* Every `field.mask` has contiguous bits aligned to `shift`; `values[*].bits` fits within mask width.
+* Every `field.mask` is exactly `mask.count_ones()` contiguous bits at `shift`, so width and shift determine the mask; `values[*].bits` fits within mask width.
 * `interrupt_vectors` length matches `core` (1 for pic14, 2 for pic18 with IPEN, etc.).
-* `core == "pic14e"` panics at codegen with `"no backend for core pic14e (need isel-pic14e)"` -- firewall.
+* `core == "pic14e"` validates like `pic14` (one `0x0004` vector). The firewall is the driver refusing the target, not a codegen panic, so a `pic14e` TOML can be reviewed before the backend exists. See ADR-019.
 
 File naming: `<name>.toml` where `<name>` is the canonical `Device.name` (`p16f877a`, `p16f887`, `p18f4550`). Driver's `--target` resolves via `by_name` on that stem.
 
@@ -151,7 +152,8 @@ crates/device/
 ## 7. Driver
 
 * New flag: `--target <name>` (alias `-mcu <name>`) -- string, not `Target` enum, resolves via `device::by_name`. `PIC8_DEVICE` env remains for `fuzz` harness.
-* Unknown name: `panic!("unknown target '{name}', available: {}", ALL.iter().map(|d| d.name).join(", "))`.
+* Unknown name: the driver exits 1 listing every stem in `ALL`.
+* Resolution is tolerant so the claim below holds in practice: `device::resolve` lowercases and accepts the stem with or without a leading `p`, and strips a `pic` prefix, so `p16f887`, `16F887`, `16f887` and `PIC16F887` all reach the same device. `by_name` stays exact. Without this the promise of no board table was not kept: HAL-2 shipped a per family mapping table in `epic_build.py` because `16F877A` would not resolve.
 * PlatformIO contract: `epic-platformio/boards/<stem>.json` will carry `"mcu": "<name>"`, builder does `epic-cc --target ${BOARD_MCU} sources...`. No driver-side board table needed.
 * Config reporting stays: resolved config words printed (bytes) as today, now for whichever `Device.config` was selected.
 
@@ -184,7 +186,7 @@ Implementation: `ci.yml` splits into `canonical` (fixed matrix) and `devices-cha
 
 ## 10. HAL contract
 
-`cc` owns memory map + config (the compiler needs them); `hal` owns SFR headers + peripheral bodies. The only shared artifact is the TOML `sfrs` table (initially empty, populated when `hal#70` starts). `hal`'s generator may read the same ATDF or the same TOML `sfrs` table to emit `pic16f87xa-hal/include/generated/<stem>.h`; `cc` consumes no SFR names at codegen. This split is why two ADRs are needed (cc ADR here, hal ADR in `epic-hal`).
+`cc` owns memory map + config (the compiler needs them); `hal` owns SFR headers + peripheral bodies. The only shared artifact is the TOML `sfrs` table (initially empty, populated when `hal#70` starts). `hal`'s generator may read the same ATDF or the same TOML `sfrs` table; `cc` consumes no SFR names at codegen. The HAL emits one header per family rather than per part, because its SFR headers already cover a family with build time device selection (`pic16f88x_sfr.h` serves 882/883/884/886/887), and its device registry is already `epic-common/manifest/modules.toml`. See `epic-hal#70`. This split is why two ADRs are needed (cc ADR here, hal ADR in `epic-hal`).
 
 ---
 
