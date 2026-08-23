@@ -27,6 +27,7 @@ The generator is stdlib only (python 3.11+, no deps) per epic-tasks rule.
 """
 
 import argparse
+import hashlib
 import pathlib
 import re
 import sys
@@ -408,6 +409,17 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     out_lines.append(f'stack_depth = {stack_depth}')
     vectors_str = ", ".join(f"0x{v:04X}" for v in interrupt_vectors)
     out_lines.append(f'interrupt_vectors = [{vectors_str}]')
+    if edc_path is not None:
+        # edc_path is the ATDF/EDC PIC XML actually parsed; hash it so the
+        # TOML is traceable to the exact pack that produced it.
+        pack_name = edc_path.parent.name
+        digest = hashlib.sha256(edc_path.read_bytes()).hexdigest()
+        out_lines.append("")
+        out_lines.append("[provenance]")
+        out_lines.append('tier = "atdf"')
+        out_lines.append(f'source = "{edc_path.name}"')
+        out_lines.append(f'pack = "{pack_name}"')
+        out_lines.append(f'sha256 = "{digest}"')
     out_lines.append("")
     out_lines.append("[config]")
     out_lines.append(f'base_byte_addr = 0x{base_byte_addr:04X}')
