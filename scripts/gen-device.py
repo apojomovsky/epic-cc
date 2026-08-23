@@ -129,6 +129,14 @@ PART_DEFAULTS = {
     },
 }
 
+def find_pack_name(atdf_path: pathlib.Path) -> str:
+    # DFP directories are named *_DFP (optionally version-suffixed); the
+    # immediate parent is just "edc", which would misrepresent the source.
+    for parent in atdf_path.resolve().parents:
+        if "_DFP" in parent.name.upper():
+            return parent.name
+    return "unknown"
+
 def find_edc_pic(stem: str):
     name = stem_to_edc_name(stem) + ".PIC"
     base = pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs")
@@ -412,7 +420,7 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     if edc_path is not None:
         # edc_path is the ATDF/EDC PIC XML actually parsed; hash it so the
         # TOML is traceable to the exact pack that produced it.
-        pack_name = edc_path.parent.name
+        pack_name = find_pack_name(edc_path)
         digest = hashlib.sha256(edc_path.read_bytes()).hexdigest()
         out_lines.append("")
         out_lines.append("[provenance]")
@@ -440,6 +448,14 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         out_lines.append("")
     content = "\n".join(out_lines).rstrip() + "\n"
     return content
+
+def strip_provenance_block(text: str) -> str:
+    # --check compares device numbers, not origin metadata: the stanza's
+    # shape is validated separately by crates/device/provenance.rs, and its
+    # tier legitimately differs between hand-written and generated TOMLs.
+    blocks = text.rstrip("\n").split("\n\n")
+    blocks = [b for b in blocks if not b.startswith("[provenance]")]
+    return "\n\n".join(blocks) + "\n"
 
 def main():
     ap = argparse.ArgumentParser(description="DFP/ATDF -> TOML generator for epic-cc device registry")
@@ -493,10 +509,12 @@ def main():
             print(toml_content)
             sys.exit(1)
         existing = out_path.read_text()
-        if existing != toml_content:
+        existing_cmp = strip_provenance_block(existing)
+        generated_cmp = strip_provenance_block(toml_content)
+        if existing_cmp != generated_cmp:
             print(f"gen-device --check: {out_path} drifts from DFP source", file=sys.stderr)
             import difflib
-            diff = difflib.unified_diff(existing.splitlines(keepends=True), toml_content.splitlines(keepends=True), fromfile=str(out_path), tofile="generated")
+            diff = difflib.unified_diff(existing_cmp.splitlines(keepends=True), generated_cmp.splitlines(keepends=True), fromfile=str(out_path), tofile="generated")
             sys.stdout.writelines(diff)
             sys.exit(1)
         print(f"gen-device --check: {out_path} ok")
