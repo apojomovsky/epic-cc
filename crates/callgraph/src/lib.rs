@@ -22,6 +22,13 @@ pub fn build(m: &Module) -> CallGraph {
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::Call(c) = inst {
+                    // Indirect calls lower to a numeric register (e.g. "8");
+                    // they have no static callee and must not enter the
+                    // call graph, otherwise alloc sees an edge to an
+                    // undefined function (epic-cc#73).
+                    if c.func.chars().all(|ch| ch.is_ascii_digit()) {
+                        continue;
+                    }
                     edges.push((f.name.clone(), c.func.clone()));
                     adj.entry(f.name.clone()).or_default().push(c.func.clone());
                 }

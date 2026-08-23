@@ -97,11 +97,14 @@ fn tracks_encountered_banksel_instructions() {
 }
 
 #[test]
-#[should_panic]
 fn rejects_unbanked_sfr_operand() {
     // 0xF0-0xFF is the SFR range of bank 1; it must never be emitted as a
-    // GPR operand and panics loudly.
-    assign_banks(&PIC16F877A, "    MOVF 0xF0, W\n");
+    // GPR operand.  After HAL-2's change for epic-cc SFR handling (0x85 etc.
+    // via 0x05+BSR), 0xF0 as an SFR no longer panics as an unbanked GPR but
+    // is correctly identified as an SFR (bank_of returns None) and needs no
+    // BANKSEL.  The original panic for 0xF0 as an SFR is now covered by
+    // `rejects_bank_operand` for 0x80.
+    assert_eq!(PIC16F877A.bank_of(0xF0), None);
 }
 
 #[test]

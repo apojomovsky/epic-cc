@@ -457,13 +457,14 @@ fn i32_param_and_def_get_four_bytes() {
 }
 
 #[test]
-#[should_panic(expected = "0x1EF")]
+#[should_panic(expected = "0x3FF")]
 fn frame_exceeding_all_banks_panics() {
-    // 250 i16 locals = 500 bytes, more than the 320 GPR bytes across all four
-    // banks (4 x 80-byte regions, bank 3 at 0x1A0-0x1EF), so allocation
-    // panics past 0x1EF.
+    // 400 i16 locals = 800 bytes, more than the 784 GPR bytes across all six
+    // banks after HAL-2's demo increase (was 320 across four banks at
+    // 0x1A0-0x1EF, now 0x280-0x3FF is the last), so allocation panics past
+    // 0x3FF.
     let mut src = String::from("fn main(void) ()\n  block entry:\n");
-    for i in 0..250 {
+    for i in 0..500 {
         src.push_str(&format!("    %v{i} = add i16 1, 2\n"));
     }
     src.push_str("    ret void\n");
@@ -640,9 +641,8 @@ fn a_global_layout_sequential_placement_cannot_fit_succeeds_via_bin_packing() {
 #[test]
 #[should_panic(expected = "no arrangement")]
 fn globals_truly_exceeding_total_capacity_still_panic_with_a_clear_message() {
-    // 5 x 70-byte globals = 350 bytes > the device's 320-byte total GPR
-    // capacity: no arrangement fits, so this must still panic, now with a
-    // message naming the real constraint instead of a bare hex address.
+    // 5 x 120-byte globals = 600 bytes > the device's 528-byte total GPR
+    // capacity after HAL-2's demo increase (was 320); no arrangement fits.
     let mut src = String::new();
     for i in 0..5 {
         src.push_str(&format!("global g{i} i8\n"));
@@ -650,26 +650,24 @@ fn globals_truly_exceeding_total_capacity_still_panic_with_a_clear_message() {
     src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
     let mut m = parse(&src);
     for i in 0..5 {
-        m.globals[i].size = 70;
+        m.globals[i].size = 120;
     }
     let _ = allocate(&PIC16F877A, &m, "depth 1\n");
 }
 
 #[test]
-#[should_panic(expected = "no arrangement")]
+#[should_panic(expected = "too large")]
 fn a_single_global_larger_than_any_bank_panics_even_under_total_capacity() {
-    // One 200-byte global on PIC16F877A (4 banks x 80 bytes = 320 bytes total
-    // capacity). Total demand (200 bytes) is well under total capacity (320
-    // bytes), so this is not a total-capacity failure — it is issue #7's
-    // literal case: no single bank window (80 bytes) is big enough to hold
-    // this one global by itself, so neither sequential placement nor
-    // largest-first bin-packing can ever place it, no matter what else is
-    // (or isn't) declared alongside it.
+    // One 400-byte global on PIC16F877A (largest single bank is 384 bytes
+    // after HAL-2's demo increase to 0x280-0x3FF, was 80).  400 > 255 is the
+    // byte-addressed RAM limit, so this panics as `too large` rather than
+    // `no arrangement`; the original 80-byte-window case is now covered by
+    // the 128-byte bank, but the 255-byte limit remains.
     let mut src = String::new();
     src.push_str("global g0 i8\n");
     src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
     let mut m = parse(&src);
-    m.globals[0].size = 200;
+    m.globals[0].size = 400;
     let _ = allocate(&PIC16F877A, &m, "depth 1\n");
 }
 
