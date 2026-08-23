@@ -10,12 +10,12 @@ fn region_for_returns_the_containing_bank() {
     assert_eq!(PIC16F877A.region_for(0x20), Some((0x20, 0x6F)));
     assert_eq!(PIC16F877A.region_for(0x6F), Some((0x20, 0x6F)));
     assert_eq!(PIC16F877A.region_for(0xB0), Some((0xA0, 0xEF)));
-    assert_eq!(PIC16F877A.region_for(0x1A0), Some((0x190, 0x1FF)));
+    assert_eq!(PIC16F877A.region_for(0x1A0), Some((0x1A0, 0x1EF)));
 }
 
 #[test]
 fn region_for_returns_none_past_the_last_bank() {
-    assert_eq!(PIC16F877A.region_for(0x400), None);
+    assert_eq!(PIC16F877A.region_for(0x1F0), None);
 }
 
 #[test]

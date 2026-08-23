@@ -89,23 +89,7 @@ pub fn assemble(src: &str) -> Vec<u16> {
             let mut it = rest.split_whitespace();
             let name = it.next().expect("asm: .table needs a table name");
             let size = parse_num(it.next().expect("asm: .table needs a table size"));
-            let mut lo = org & 0xFF;
-            if lo + size > 0x100 {
-                if [
-                    "irq_table",
-                    "compute_period.pre_enum",
-                    "pre_ratio",
-                    "post_ratio",
-                    "ps_ratio",
-                    "ps_ratio.1",
-                ]
-                .contains(&name)
-                    || name.starts_with(".str")
-                {
-                    org = (org + 0xFF) & !0xFF;
-                    lo = org & 0xFF;
-                }
-            }
+            let lo = org & 0xFF;
             if size <= 255 {
                 assert!(
                     lo + size <= 0x100,
@@ -479,7 +463,7 @@ pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
     let words = match device.core {
         device::Core::Pic14 => assemble(src),
         device::Core::Pic18 => assemble_pic18(src),
-        device::Core::Pic14e => assemble(src),
+        device::Core::Pic14e => panic!("asm: pic14e core not yet implemented for {}", device.name),
     };
     assert!(
         words.len() as u32 <= device.flash_words,
@@ -569,10 +553,8 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
             Some(&v) => v,
             None => parse_num(t),
         };
-        if v == 0x80 {
-            panic!("asm: file register 0x{v:02X} out of range");
-        }
-        (v as u16) & 0x7F
+        assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
+        v as u16 & 0x7F
     };
     // Destination bit for the two-operand file ops (`f, W` / `f, F`): W = 0,
     // F = 1. An absent destination defaults to W, matching the encoding this

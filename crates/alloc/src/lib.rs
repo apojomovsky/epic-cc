@@ -732,9 +732,8 @@ mod tests {
 
     #[test]
     fn try_place_at_returns_none_instead_of_panicking_past_the_last_bank() {
-        // PIC16F877A's last bank ends at 0x3FF after HAL-2's demo increase
-        // (was 0x1EF); nothing at or past 0x400 has a region, so placing even
-        // a 1-byte value there must fail cleanly.
-        assert_eq!(try_place_at(&PIC16F877A, 0x400, 1), None);
+        // PIC16F877A's last bank ends at 0x1EF; nothing at or past 0x1F0 has
+        // a region, so placing even a 1-byte value there must fail cleanly.
+        assert_eq!(try_place_at(&PIC16F877A, 0x1F0, 1), None);
     }
 }
