@@ -1,0 +1,10 @@
+<!--
+  Hand-authored fixture, not a Microchip file. Describes an imaginary
+  tiny PIC14 part invented only to exercise gen-device.py; no real
+  silicon has these numbers. Microchip's ATDF/EDC files are licensed
+  and are never committed to this repo.
+-->
+<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN01">
+  <edc:MemTraits edc:hwstackdepth="0x8"/>
+  <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2007"/>
+</edc:PIC>
