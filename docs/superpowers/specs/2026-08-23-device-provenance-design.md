@@ -173,8 +173,11 @@ be skipped for lack of a download.
 emit the §5 stanza. That is a small addition to an existing script rather than
 new work, but it has to happen for `build.rs` to be able to require the stanza.
 
-The `--check` invocation should also move inside the dev image for consistency
-with "everything runs in docker"; it currently runs `python3` on the host runner.
+The `--check` invocation runs `python3` on the host runner rather than in the dev
+image, which reads as inconsistent with "everything runs in docker". It stays on
+the host: the DFP, when present, is installed on the runner and not in the image,
+so moving the check inside would break the only case where it does any work. The
+inconsistency is deliberate and worth a comment in `ci.yml` rather than a fix.
 
 ## 8. The datasheet fallback
 
