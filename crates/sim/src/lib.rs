@@ -1,6 +1,8 @@
 //! PIC16F877A (14-bit core) instruction-set simulator.
 //! Owned, deterministic, cycle-counting, embeddable in `cargo test`.
 
+use device::Device;
+
 /// Decode Intel HEX (gpasm output) into 14-bit words, indexed by word address.
 pub fn parse_hex(data: &str) -> Vec<u16> {
     let mut max_word = 8191usize; // never shrink below the historical minimum
@@ -75,6 +77,11 @@ pub const INTF: u8 = 1 << 1;
 pub const VECTOR: u16 = 4;
 
 pub struct Pic14 {
+    /// Supplies the GPR map. A direct operand is banked GPR when its physical
+    /// address falls inside one of this device's `ram_banks`, which is not the
+    /// same as a fixed operand window: bank 2 and 3 SFRs are shorter than bank
+    /// 0's, so their GPR starts below 0x20.
+    device: &'static Device,
     prog: Vec<u16>,
     ram: [u8; 512],
     w: u8,
@@ -87,8 +94,18 @@ pub struct Pic14 {
 }
 
 impl Pic14 {
+    /// A simulator on the canonical PIC14 geometry (`PIC16F877A`), for callers
+    /// that only execute instructions and never depend on where GPR begins in
+    /// a bank. Use [`Pic14::with_device`] for anything that does: a part whose
+    /// banks differ is modelled wrongly here, silently.
     pub fn new(prog: Vec<u16>) -> Self {
+        Self::with_device(&device::PIC16F877A, prog)
+    }
+
+    /// A simulator on `device`'s real memory map.
+    pub fn with_device(device: &'static Device, prog: Vec<u16>) -> Self {
         Pic14 {
+            device,
             prog,
             ram: [0; 512],
             w: 0,
@@ -213,16 +230,36 @@ impl Pic14 {
             base + fsr
         }
     }
-    // Bank base for direct operands in 0x20-0x6F: bank = STATUS<7:5> (RP1:RP0).
+    // Bank base for direct operands: bank = STATUS<6:5> (RP1:RP0).
     fn bank_base(&self) -> usize {
         ((self.ram[3] >> 5) & 0x3) as usize * 0x80
+    }
+
+    /// The physical address of a direct operand when it names banked GPR, or
+    /// `None` when it names common RAM or a bank-independent SFR (both of
+    /// which the compiler addresses by their bank-0 offset).
+    fn banked_addr(&self, f: usize) -> Option<usize> {
+        if let Some((lo, hi)) = self.device.common_ram {
+            if f >= lo as usize && f <= hi as usize {
+                return None;
+            }
+        }
+        let phys = f + self.bank_base();
+        self.device
+            .ram_banks
+            .iter()
+            .any(|&(lo, hi)| phys >= lo as usize && phys <= hi as usize)
+            .then_some(phys)
     }
     fn read_f(&self, f: usize) -> u8 {
         match f {
             0x00 => self.ram[self.indirect_addr()], // INDF -> RAM[FSR] via IRP
             0x02 => (self.pc & 0xFF) as u8,         // PCL
-            0x20..=0x6F => self.ram[f + self.bank_base()],
-            _ => self.ram[f], // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
+            _ => match self.banked_addr(f) {
+                Some(phys) => self.ram[phys],
+                // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
+                None => self.ram[f],
+            },
         }
     }
     fn write_f(&mut self, f: usize, v: u8) {
@@ -231,8 +268,11 @@ impl Pic14 {
                 let addr = self.indirect_addr();
                 self.ram[addr] = v; // INDF -> RAM[FSR] via IRP
             }
-            0x20..=0x6F => self.ram[f + self.bank_base()] = v,
-            _ => self.ram[f] = v, // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
+            _ => match self.banked_addr(f) {
+                Some(phys) => self.ram[phys] = v,
+                // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
+                None => self.ram[f] = v,
+            },
         }
     }
     fn write_d(&mut self, d: u16, f: usize, r: u8) {

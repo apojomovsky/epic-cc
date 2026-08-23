@@ -10,7 +10,7 @@ fn region_for_returns_the_containing_bank() {
     assert_eq!(PIC16F877A.region_for(0x20), Some((0x20, 0x6F)));
     assert_eq!(PIC16F877A.region_for(0x6F), Some((0x20, 0x6F)));
     assert_eq!(PIC16F877A.region_for(0xB0), Some((0xA0, 0xEF)));
-    assert_eq!(PIC16F877A.region_for(0x1A0), Some((0x1A0, 0x1EF)));
+    assert_eq!(PIC16F877A.region_for(0x1A0), Some((0x190, 0x1EF)));
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn bank_of_is_none_for_sfr_and_common_ram() {
 #[test]
 #[should_panic(expected = "0x180")]
 fn bank_of_panics_on_an_unimplemented_gap() {
-    PIC16F877A.bank_of(0x180); // the 0x170-0x19F unimplemented gap
+    PIC16F877A.bank_of(0x180); // bank 3 SFRs, below the 0x190 GPR start
 }
 
 #[test]
@@ -166,4 +166,32 @@ fn by_name_stays_exact() {
     assert!(device::by_name("P16F877A").is_none());
     assert!(device::by_name("16f877a").is_none());
     assert!(device::by_name("p16f877a").is_some());
+}
+
+#[test]
+fn pic14_banks_cover_the_full_368_bytes_of_gpr() {
+    // gputils p16f877a.inc: bank 2's last SFR is EEADRH at 0x10F and bank 3's
+    // is EECON2 at 0x18D (0x18E-0x18F are __BADRAM), so GPR starts at 0x110
+    // and 0x190. The 16 bytes above each bank mirror common RAM. DS39582C
+    // section 2.2 quotes 368 bytes; the 887 (DS41291D) is identical.
+    let banked: u32 = PIC16F877A
+        .ram_banks
+        .iter()
+        .map(|&(lo, hi)| (hi - lo + 1) as u32)
+        .sum();
+    let (clo, chi) = PIC16F877A.common_ram.unwrap();
+    assert_eq!(banked + (chi - clo + 1) as u32, 368);
+
+    // the bytes the old tables dropped
+    assert_eq!(PIC16F877A.bank_of(0x110), Some(2));
+    assert_eq!(PIC16F877A.bank_of(0x11F), Some(2));
+    assert_eq!(PIC16F877A.bank_of(0x190), Some(3));
+    assert_eq!(PIC16F877A.bank_of(0x19F), Some(3));
+}
+
+#[test]
+fn p16f887_has_the_same_gpr_geometry_as_the_877a() {
+    let d = device::by_name("p16f887").unwrap();
+    assert_eq!(d.ram_banks, PIC16F877A.ram_banks);
+    assert_eq!(d.common_ram, PIC16F877A.common_ram);
 }
