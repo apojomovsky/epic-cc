@@ -27,3 +27,12 @@
 
 # Agent worktrees
 /.worktrees/
+# DFP / ATDF packs: authoritative device data, free download, never committed.
+# Only the derived TOML in crates/device/devices/*.toml is tracked.
+*.atdf
+*.ATDF
+*.atpack
+*.PIC
+*.pic
+dfp/
+atdf/
