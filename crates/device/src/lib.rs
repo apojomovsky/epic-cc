@@ -1,10 +1,9 @@
 //! Per-part memory-map and capability facts, threaded through `alloc`,
 //! `isel`, `banking`, and `driver` instead of being hard-coded PIC16F877A
 //! literals in each of them. See docs/29-pic18-port-design.md (§2 D-3) for
-//! the design this implements. P1 adds the PIC18F4550 profile;
-//! `has_hardware_multiply`/`has_tblrd`/`sfrs` still aren't added (unused so
-//! far) and `access_bank` never will be  -  it's a core PIC18 invariant, not
-//! a per-device fact. P2 populates `PIC18F4550`'s `ram_banks`/`common_ram` for real (P0/P1 left them as placeholders since nothing consumed them yet).
+//! the design this implements. `has_hardware_multiply`/`has_tblrd` aren't
+//! added (nothing consumes them yet) and `access_bank` never will be  -  it's
+//! a core PIC18 invariant, not a per-device fact.
 
 mod config;
 pub use config::resolve_config;
@@ -33,6 +32,26 @@ pub struct Device {
     /// priority) for a PIC18 device with IPEN set.
     pub interrupt_vectors: &'static [u16],
     pub config: ConfigRegion,
+    /// The one artifact this registry shares with `epic-hal`, which generates
+    /// its per family SFR headers from it. Empty for every device `cc` ships:
+    /// the compiler needs the memory map and the config words, never a name.
+    pub sfrs: &'static [Sfr],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Sfr {
+    pub name: &'static str,
+    pub addr: u16,
+    /// Width in bytes; 1 for every PIC14 and PIC18 SFR today.
+    pub width: u8,
+    pub fields: &'static [SfrField],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SfrField {
+    pub name: &'static str,
+    pub mask: u8,
+    pub shift: u8,
 }
 include!(concat!(env!("OUT_DIR"), "/devices.rs"));
 

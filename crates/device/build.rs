@@ -44,7 +44,6 @@ struct ValueToml {
     bits: u8,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct SfrToml {
     name: String,
@@ -54,7 +53,6 @@ struct SfrToml {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct SfrFieldToml {
     name: String,
     mask: u8,
@@ -171,16 +169,30 @@ fn main() {
                 dev.config.num_bytes
             );
         }
+        if dev.flash_words == 0 {
+            panic!("device: {}: flash_words must be greater than 0", path);
+        }
+        if !dev.flash_words.is_power_of_two() {
+            panic!(
+                "device: {}: flash_words {} is not a power of two; every supported \
+                 part sizes program memory in powers of two, so this is a \
+                 transcription error until a part proves otherwise",
+                path, dev.flash_words
+            );
+        }
         if dev.interrupt_vectors.is_empty() {
             panic!("device: {}: interrupt_vectors must not be empty", path);
         }
-        // core-specific vector count check (soft)
+        // `pic14e` keeps the single 0x0004 vector of `pic14`, so it takes the
+        // same check. Having no backend is a driver-level refusal, not a
+        // reason to leave its data unvalidated.
         match dev.core.as_str() {
-            "pic14" => {
+            "pic14" | "pic14e" => {
                 if dev.interrupt_vectors.len() != 1 {
                     panic!(
-                        "device: {}: pic14 must have exactly 1 interrupt vector, got {}",
+                        "device: {}: {} must have exactly 1 interrupt vector, got {}",
                         path,
+                        dev.core,
                         dev.interrupt_vectors.len()
                     );
                 }
@@ -194,7 +206,6 @@ fn main() {
                     );
                 }
             }
-            "pic14e" => {}
             _ => panic!("device: {}: unknown core {:?}", path, dev.core),
         }
         // field validation
@@ -205,8 +216,18 @@ fn main() {
             if f.shift >= 8 {
                 panic!("device: {}: field {:?} shift must be < 8", path, f.name);
             }
-            // mask must be contiguous? we just check bits fit
+            // A fuse field is a contiguous run of bits at `shift`, so width and
+            // shift determine the mask. Anything else means the two disagree and
+            // the resolver would place the value wrong.
             let width = f.mask.count_ones();
+            let expected = (((1u16 << width) - 1) << f.shift) as u16;
+            if expected > 0xFF || f.mask as u16 != expected {
+                panic!(
+                    "device: {}: field {:?} mask {:#04X} is not {} contiguous bit(s) \
+                     at shift {} (expected {:#04X})",
+                    path, f.name, f.mask, width, f.shift, expected
+                );
+            }
             let max_bits = if width >= 8 { 255 } else { (1u16 << width) - 1 };
             for v in &f.values {
                 if (v.bits as u16) > max_bits {
@@ -324,7 +345,25 @@ fn main() {
                 locked = locked_str
             ));
         }
-        out.push_str("        ],\n    },\n};\n\n");
+        out.push_str("        ],\n    },\n    sfrs: &[\n");
+        for s in &dev.sfrs {
+            out.push_str(&format!(
+                "        Sfr {{ name: \"{name}\", addr: 0x{addr:04X}, width: {width}, fields: &[\n",
+                name = s.name,
+                addr = s.addr,
+                width = s.width
+            ));
+            for f in &s.fields {
+                out.push_str(&format!(
+                    "            SfrField {{ name: \"{name}\", mask: 0x{mask:02X}, shift: {shift} }},\n",
+                    name = f.name,
+                    mask = f.mask,
+                    shift = f.shift
+                ));
+            }
+            out.push_str("        ] },\n");
+        }
+        out.push_str("    ],\n};\n\n");
     }
     // ALL and by_name
     let idents: Vec<String> = entries
