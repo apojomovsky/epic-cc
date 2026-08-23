@@ -70,7 +70,7 @@ impl Device {
                 return Some(i as u8);
             }
         }
-        if addr == 0x80 || addr == 0xF0 || addr == 0x180 {
+        if addr == 0x80 || addr == 0x180 {
             panic!(
                 "device: 0x{addr:03X} is not a banked GPR address on {}",
                 self.name
