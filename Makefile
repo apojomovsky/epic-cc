@@ -106,5 +106,19 @@ setup-hooks: ## Install git hooks (.githooks/ -> the repo's hooks dir)
 		&& chmod +x $$(git rev-parse --git-path hooks)/pre-commit $$(git rev-parse --git-path hooks)/commit-msg
 	@echo "git hooks installed (pre-commit, commit-msg)"
 
+sanity: image ## Per-device lightweight: DEVICE=p16f877a (spec 2026-08-22 section 8)
+	@test -n "$(DEVICE)" || (echo "usage: make sanity DEVICE=<stem>  e.g. make sanity DEVICE=p16f887" >&2; exit 2)
+	@$(DOCKER_RUN) bash scripts/sanity.sh $(DEVICE)
+
+sanity-all: image ## Nightly lightweight for every device in crates/device/devices/*.toml
+	@$(DOCKER_RUN) bash -c 'for f in crates/device/devices/*.toml; do s=$$(basename $$f .toml); echo "=== sanity $$s ==="; bash scripts/sanity.sh $$s || exit 1; done'
+
+sanity-changed: image ## PR lightweight for TOMLs touched vs origin/master
+	@$(DOCKER_RUN) bash -c '\
+		git fetch origin master --quiet || true; \
+		changed=$$(git diff --name-only origin/master...HEAD -- crates/device/devices/*.toml 2>/dev/null || true); \
+		if [ -z "$$changed" ]; then echo "sanity-changed: no device TOML touched vs origin/master"; exit 0; fi; \
+		for f in $$changed; do s=$$(basename $$f .toml); echo "=== sanity-changed $$s ==="; bash scripts/sanity.sh $$s || exit 1; done'
+
 pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 runs the suite, PROSE=1 attests comment/doc review
 	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,) $(if $(PROSE),--prose,)
