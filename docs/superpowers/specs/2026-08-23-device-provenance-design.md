@@ -4,7 +4,7 @@
 **Date:** 2026-08-23<br>
 **Parent:** `docs/superpowers/specs/2026-08-22-pic-variants-design.md`, `docs/adr/ADR-019-pic-variants-device-registry.md`<br>
 **Scope:** `epic-cc` device registry only. No codegen, `alloc` or `isel` change.<br>
-**Tickets:** `epic-cc#104` (this: schema + gate), `#86` (ATDF generator, rescoped). Prior data bugs: `#88`, `#92`, `#101`.
+**Tickets:** `epic-cc#104` (this: schema + gate). Generator landed as `#103` (ADR-020), closing `#86`. Prior data bugs: `#88`, `#92`, `#101`.
 
 ---
 
@@ -145,16 +145,36 @@ reported as uncovered and must be `tier = "datasheet"`.
 set; the same two comparisons apply, so no per-core branch is expected beyond
 the `gpr*` naming.
 
-## 7. The generator (`#86`, rescoped)
+## 7. The generator, which has already landed
 
-`scripts/gen-device.py <PART> --out <toml>` reads a Microchip ATDF and emits
-deterministic TOML including the provenance stanza. `--check` regenerates in
-memory and diffs against the committed file.
+`#86` closed while this design was being written: `#103` merged
+`scripts/gen-device.py` (ATDF ingestion, `--check`) plus `ADR-020`. The generator
+half of the plan therefore exists, and §6 stands on top of it rather than beside
+it.
 
-Rescoped in one respect: `#86` framed this as removing the hand transcription tax
-at device three and beyond, a convenience. After `#88` the `--check` half is the
-mechanical defence against invented hardware, and it is what justifies the work.
-The generator remains a follow-up because the gate in §6 does not depend on it.
+Two gaps remain, and they are why `#104` is still the load-bearing ticket.
+
+**The `--check` gate is a no-op on every runner today.** `ci.yml` wraps it in a
+fallback that skips when `/opt/microchip/xc8/v4.00/pic/packs` is absent, which is
+the case on the GitHub runners. Measured on master run `32656428057`:
+
+```
+DFP not installed on this runner, skipping strict check for p16f877a
+DFP not installed on this runner, skipping strict check for p16f887
+DFP not installed on this runner, skipping strict check for p18f4550
+```
+
+So the ATDF tier currently contributes zero PR coverage. That is exactly the
+"gate evaporates where it matters" failure D-5 rejects, and it is what the
+gputils cross-check in §6 fixes: gputils *is* in the image, so its check cannot
+be skipped for lack of a download.
+
+**The generated TOMLs carry no provenance.** `gen-device.py` must be taught to
+emit the §5 stanza. That is a small addition to an existing script rather than
+new work, but it has to happen for `build.rs` to be able to require the stanza.
+
+The `--check` invocation should also move inside the dev image for consistency
+with "everything runs in docker"; it currently runs `python3` on the host runner.
 
 ## 8. The datasheet fallback
 
