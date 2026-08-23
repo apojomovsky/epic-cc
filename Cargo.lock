@@ -36,6 +36,9 @@ dependencies = [
 name = "device"
 version = "0.1.0"
 dependencies = [
+ "alloc",
+ "asm",
+ "ir",
  "serde",
  "toml",
 ]
