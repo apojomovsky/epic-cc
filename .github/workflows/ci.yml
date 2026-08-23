@@ -70,5 +70,22 @@ jobs:
           path: /tmp/cargo-home
           key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
+      - name: Check device TOMLs match DFP (gen-device --check)
+        run: |
+          echo "Checking device TOMLs against DFP source (skips if DFP not present)..."
+          for f in crates/device/devices/*.toml; do
+            stem=$(basename "$f" .toml)
+            echo "  --check $stem"
+            python3 scripts/gen-device.py "$stem" --check || {
+              ec=$?
+              if [ -d "/opt/microchip/xc8/v4.00/pic/packs" ]; then
+                echo "DFP check failed for $stem with DFP present: failing"
+                exit $ec
+              else
+                echo "DFP not installed on this runner, skipping strict check for $stem"
+              fi
+            }
+          done
+
       - name: Test every workspace crate
         run: docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/ci-test.sh

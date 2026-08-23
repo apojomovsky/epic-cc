@@ -73,17 +73,32 @@ XC8 is a **test oracle only** ([`05-verification.md`](05-verification.md)). It
 is proprietary and cannot be part of the image. It is detected at runtime via
 `$PIC8_XC8_ROOT`; differential tests skip with a clear message when absent.
 
-## CI
+## Device TOML authoring (DFP -> TOML)
 
-GitHub Actions runs the full workspace test suite on every push/PR
-([`.github/workflows/ci.yml`](../.github/workflows/ci.yml)): one job, `docker
-run … epic-cc-ci:latest bash scripts/ci-test.sh`, so CI uses exactly the
-Dockerfile's toolchain — the Dockerfile is the single source of truth,
-nothing is installed on the runner. The loop itself lives in
-[`scripts/ci-test.sh`](../scripts/ci-test.sh) (per-crate `cargo test` with a
-PASS/FAIL summary table), the same script you can run locally to reproduce a
-CI result exactly.
+Per-device memory maps and config words live in `crates/device/devices/*.toml`
+and are generated from Microchip DFPs, not hand-transcribed at device #3+:
 
+```bash
+python3 scripts/gen-device.py p16f887 --out crates/device/devices/p16f887.toml
+python3 scripts/gen-device.py p16f887 --check   # CI gate: fails if TOML drifts
+```
+
+Source posture per `AGENTS.md` GPL boundary:
+
+* **Primary:** the DFP's `xc8/pic/dat/{ini,cfgdata}` and `edc/*.PIC` XML
+  (inside the `.atpack` zip). The pack itself is downloaded from
+  `https://packs.download.microchip.com/` (`Microchip.PIC16Fxxx_DFP` for
+  mid-range) and is never committed. The `.atpack`/`.atdf`/`.PIC` stays in
+  `vendor/microchip/device-data/` (gitignored) or under `$PIC8_XC8_ROOT`; only
+  the generated TOML is committed.
+* **Oracle:** `gputils` headers (`share/gputils/header/p16f887.inc`) are the
+  byte-for-byte oracle; XC8 headers are black-box oracle only.
+
+The generator (`scripts/gen-device.py`, stdlib only) normalises field/value
+names via a small alias table (`FOSC` -> `osc`, `WDTE` -> `wdt`, `INTRC` ->
+`intosc`, etc.) documented in its header, and emits deterministically
+formatted TOML (fields sorted by `byte_offset`/`shift`, values by `bits`).
+See `docs/adr/ADR-020-dfp-toml-generator.md` and `scripts/gen-device.py --help`.
 ## Release bundles
 
 Tag-triggered [`release.yml`](../.github/workflows/release.yml) builds the
