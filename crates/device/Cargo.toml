@@ -9,3 +9,4 @@ toml = "0.8"
 alloc = { path = "../alloc" }
 asm = { path = "../asm" }
 ir = { path = "../ir" }
+toml = "0.8"
