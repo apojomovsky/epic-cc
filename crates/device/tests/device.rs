@@ -93,3 +93,43 @@ fn by_name_case_insensitive_helper() {
         "p18f4550"
     );
 }
+
+#[test]
+fn every_device_exposes_an_sfr_table() {
+    // The table is the contract epic-hal generates its per family SFR headers
+    // from. The compiler never reads an SFR name, so it stays empty here; what
+    // matters is that the field exists and survives codegen.
+    for d in device::ALL {
+        assert!(d.sfrs.is_empty(), "{} ships a non-empty sfrs table", d.name);
+    }
+}
+
+#[test]
+fn fuse_masks_are_contiguous_at_their_shift() {
+    // build.rs rejects a mask that is not `width` contiguous bits at `shift`.
+    // Assert the shipped data satisfies the invariant the generator enforces,
+    // so a regression in either surfaces here rather than at resolve time.
+    for d in device::ALL {
+        for f in d.config.fields {
+            let width = f.mask.count_ones();
+            let expected = (((1u16 << width) - 1) << f.shift) as u16;
+            assert_eq!(
+                f.mask as u16, expected,
+                "{}: field {} mask {:#04X} is not {} bit(s) at shift {}",
+                d.name, f.name, f.mask, width, f.shift
+            );
+        }
+    }
+}
+
+#[test]
+fn flash_words_is_a_power_of_two() {
+    for d in device::ALL {
+        assert!(
+            d.flash_words.is_power_of_two(),
+            "{}: flash_words {} is not a power of two",
+            d.name,
+            d.flash_words
+        );
+    }
+}
