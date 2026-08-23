@@ -90,6 +90,9 @@ fn main() {
         if path.extension().and_then(|s| s.to_str()) != Some("toml") {
             continue;
         }
+        // The directory line above only fires when a file is added or removed:
+        // a directory's mtime does not change when a file's contents do.
+        println!("cargo:rerun-if-changed={}", path.display());
         let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
         let content = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("device: cannot read {}: {e}", path.display()));
