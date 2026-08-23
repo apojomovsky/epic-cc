@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- Build with `nix develop --command cargo …`; never `apt install` toolchain deps (flake pins rustc 1.97.1, gpasm 1.5.2).
+- Build with `make exec CMD="cargo ..." …`; never `apt install` toolchain deps (flake pins rustc 1.97.1, gpasm 1.5.2).
 - Conventional commits, single line, ≤ 3 lines.
 - `gpasm`/`gpsim` are GPL: invoke only as external processes, never link.
 - No external assembler/linker in the product; the simulator is our own.
 - Each pipeline stage is a crate with a text boundary; the simulator is infrastructure (`crates/sim`), not a stage.
-- New files must be `git add`ed before `nix develop` sees them.
+- New files must be `git add`ed before `make shell  # docker` sees them.
 
 ---
 
@@ -66,7 +66,7 @@ publish = false
 
 - [ ] **Step 4: Verify it builds**
 
-Run: `nix develop --command cargo build`
+Run: `make exec CMD="cargo build"  # docker`
 Expected: exit 0, compiles the empty crate.
 
 - [ ] **Step 5: Commit**
@@ -108,7 +108,7 @@ fn decodes_little_endian_words() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `nix develop --command cargo test --test hex`
+Run: `make test  # docker: cargo test --test hex`
 Expected: FAIL, `parse_hex` not found.
 
 - [ ] **Step 3: Implement the decoder**
@@ -168,7 +168,7 @@ fn hex_nibble(c: u8) -> u8 {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `nix develop --command cargo test --test hex`
+Run: `make test  # docker: cargo test --test hex`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -224,7 +224,7 @@ fn addwf_carries_and_zero() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `nix develop --command cargo test --test byte_ops`
+Run: `make test  # docker: cargo test --test byte_ops`
 Expected: FAIL, `Pic14` not found.
 
 - [ ] **Step 3: Implement state and the byte-op subset**
@@ -398,7 +398,7 @@ impl Pic14 {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `nix develop --command cargo test --test byte_ops`
+Run: `make test  # docker: cargo test --test byte_ops`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -460,7 +460,7 @@ fn call_and_retlw_roundtrip() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `nix develop --command cargo test --test bit_lit`
+Run: `make test  # docker: cargo test --test bit_lit`
 Expected: FAIL (stubs return `pc+1`).
 
 - [ ] **Step 3: Implement bit, call/goto, and literal**
@@ -619,7 +619,7 @@ Add these two helpers next to `add_flags`:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `nix develop --command cargo test --test bit_lit`
+Run: `make test  # docker: cargo test --test bit_lit`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -669,7 +669,7 @@ fn movwf_pcl_computed_jump() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `nix develop --command cargo test --test indirect`
+Run: `make test  # docker: cargo test --test indirect`
 Expected: FAIL (INDF/PCL not aliased).
 
 - [ ] **Step 3: Implement the aliasing**
@@ -711,7 +711,7 @@ And in `exec_byte`'s `0x00` arm (MOVWF), add the PCL special case before `write_
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `nix develop --command cargo test --test indirect`
+Run: `make test  # docker: cargo test --test indirect`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -784,12 +784,12 @@ fn agrees_with_gpasm_assembled_program() {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `nix develop --command cargo test --test gpasm_cross`
+Run: `make test  # docker: cargo test --test gpasm_cross`
 Expected: FAIL if the fixture/flow is broken (e.g. missing fixture) — this is the first end-to-end check.
 
 - [ ] **Step 4: Verify it passes**
 
-Run: `nix develop --command cargo test --test gpasm_cross`
+Run: `make test  # docker: cargo test --test gpasm_cross`
 Expected: PASS — `0x12 + 0x34 = 0x46`, halted at `SLEEP`.
 
 - [ ] **Step 5: Commit**

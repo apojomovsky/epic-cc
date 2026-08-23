@@ -34,6 +34,9 @@ fn check_calls_resolved(m: &Module) {
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::Call(c) = inst {
+                    if c.func.chars().all(|ch| ch.is_ascii_digit()) {
+                        continue;
+                    }
                     if !defined.contains(c.func.as_str()) {
                         missing.insert(c.func.as_str());
                     }

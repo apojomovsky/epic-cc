@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- Build/test with `nix develop --command cargo …`; never `apt install` toolchain deps.
+- Build/test with `make exec CMD="cargo ..." …`; never `apt install` toolchain deps.
 - clang driven via `$PIC8_CLANG_UNWRAPPED` with `-resource-dir "$PIC8_CLANG_RESOURCE_DIR"` (`-target msp430 -O1 -S -emit-llvm -ffreestanding -nostdinc`).
 - Conventional commits, single line, ≤ 3 lines.
 - No external assembler in the product; `gpasm` external-process test-only; GPL never linked.
 - Text boundaries: stages communicate via text; the `ir` crate defines the IR text format. The driver may import stage libraries; stages do not import each other.
-- New files must be `git add`ed before `nix develop` sees them.
+- New files must be `git add`ed before `make shell  # docker` sees them.
 - Unsupported constructs panic loudly, never silently miscompile.
 
 ## The verified reference
@@ -59,9 +59,9 @@ Block labels are the `.ll` labels as-is (`0`, `4`, `6`, `8`; first block label i
 - Produces: new `Inst` variants `Zext{dst,from,val,to}`, `Trunc{dst,from,val,to}`, `Icmp{dst,pred,ty,a,b}`, `Select{dst,cond,ty,a,b}`, `Call{dst:Option<String>, ty:Option<Ty>, func, args:Vec<(Ty,Val)>}`, `Br{target}`, `BrCond{cond,t,f}`, `Phi{dst,ty,incoming:Vec<(Val,String)>}` — with `serialize`/`parse` for each, in the canonical line forms above.
 
 - [ ] **Step 1: Extend the failing test** — append to `crates/ir/tests/roundtrip.rs` a module exercising every new variant and assert the round-trip fixed point (parse → serialize → parse → serialize is stable) and that key canonical lines appear (e.g. `%9 = phi i16 0 main %15 main_L8`, `br i1 %3 6 8`, `%14 = call i16 @add(i16 %10, i16 %13)`, `call void @f()`, `%2 = zext i8 %1 to i16`, `%5 = trunc i16 %14 to i8`, `%12 = icmp eq i16 %11 0`, `%13 = select i1 %12 i16 100 i16 %9`). Use exactly the canonical syntax above (space-separated, no commas in the serialized form).
-- [ ] **Step 2: Run to verify it fails** — `nix develop --command cargo test -p ir`.
+- [ ] **Step 2: Run to verify it fails** — `make test CRATE=ir  # docker: cargo test -p ir`.
 - [ ] **Step 3: Implement** — add the variants to `Inst`, the `inst_str`/`parse_inst` arms, and a `Call` arg list serializer/parser. `phi` serializes as `%d = phi <ty> <v1> <p1> <v2> <p2> …`; parse splits into `(val, pred)` pairs. `icmp` pred is a bare word (`eq`/`ne`); parse rejects others loudly. `Call` serializes args as `(<ty> <val>, …)` with no spaces inside parens; `call void @f()` has no dst.
-- [ ] **Step 4: Run to verify it passes** — `nix develop --command cargo test -p ir`.
+- [ ] **Step 4: Run to verify it passes** — `make test CRATE=ir  # docker: cargo test -p ir`.
 - [ ] **Step 5: Commit** — `git add crates/ir && git commit -m "feat(ir): control-flow, call, and cast instruction variants"`.
 
 ---
@@ -77,9 +77,9 @@ Block labels are the `.ll` labels as-is (`0`, `4`, `6`, `8`; first block label i
 - Produces: `parse_ll` handles `zext`/`trunc`/`icmp`/`select`/`br`/`call`/`phi` from `.ll` text, stripping attributes (`nsw`, `nuw`, `nneg`, `tail`, `fastcc`, `noundef`, `align`, metadata) — port the corresponding `parse_inst` arms from `spike/src/ir.rs` (on disk), adapting to the `ir` struct-form variants and the canonical text syntax. `call` args keep their order; `phi` incoming pairs map `(val, pred-label)`.
 
 - [ ] **Step 1: Extend the failing test** — append a test that parses the full probe `.ll` (`spike/probe.ll`, read via `include_str!` is not possible cross-crate — copy the IR text into the test, or read the file at runtime with `std::fs` and a relative path; prefer embedding a trimmed copy) and asserts: 2 functions, block labels `0/4/6/8` in main, a `Phi` with the correct incoming pairs, a `Call` to `@add` with 2 args, and a `BrCond`.
-- [ ] **Step 2: Run to verify it fails** — `nix develop --command cargo test -p irparse`.
+- [ ] **Step 2: Run to verify it fails** — `make test CRATE=irparse  # docker: cargo test -p irparse`.
 - [ ] **Step 3: Implement** — port the arms. `br label %6` → `Br{6}`; `br i1 %3, label %6, label %8` → `BrCond{%3, 6, 8}`; `call i16 @add(i16 %10, i16 %13)` → `Call{Some(14), I16, "add", [(I16, Reg 10), (I16, Reg 13)]}`; `%7 = phi i8 [ 0, %0 ], [ %5, %4 ]` → `Phi{7, I8, [(Const 0, "0"), (Reg 5, "4")]}`.
-- [ ] **Step 4: Run to verify it passes** — `nix develop --command cargo test -p irparse`.
+- [ ] **Step 4: Run to verify it passes** — `make test CRATE=irparse  # docker: cargo test -p irparse`.
 - [ ] **Step 5: Commit** — `git commit -m "feat(irparse): parse control flow, calls, and casts"`.
 
 ---
@@ -95,9 +95,9 @@ Block labels are the `.ll` labels as-is (`0`, `4`, `6`, `8`; first block label i
 - Produces: `build(&Module)` walks every block, adds `(caller, callee)` for each `Call`; `max_depth` = longest call-chain path (1 for no calls); `check_depth(g, limit)` panics if `max_depth > limit`; **recursion detection**: panic with a clear message if the call graph has a cycle (DFS-based).
 
 - [ ] **Step 1: Extend the failing test** — (a) `main → add` yields edge `("main","add")` and depth 2; (b) `f → g → f` panics with a recursion message; (c) `f → g → h` depth 3 passes `check_depth(8)` and panics on `check_depth(2)`.
-- [ ] **Step 2: Run to verify it fails** — `nix develop --command cargo test -p callgraph`.
+- [ ] **Step 2: Run to verify it fails** — `make test CRATE=callgraph  # docker: cargo test -p callgraph`.
 - [ ] **Step 3: Implement** — DFS over the call graph: detect back edges (cycle → panic "recursion"), compute longest path depth. The IR text parse must support the `call` line for the test inputs (use `ir::parse` with the canonical form from Task 1).
-- [ ] **Step 4: Run to verify it passes** — `nix develop --command cargo test -p callgraph`.
+- [ ] **Step 4: Run to verify it passes** — `make test CRATE=callgraph  # docker: cargo test -p callgraph`.
 - [ ] **Step 5: Commit** — `git commit -m "feat(callgraph): real edges, recursion detection, depth check"`.
 
 ---
@@ -243,11 +243,11 @@ fn probe_runs_correctly() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails** — `nix develop --command cargo test -p driver --test probe_e2e`. (Debug any stage gaps — likely isel panic messages; fix in the isel tasks' files, not the test.)
+- [ ] **Step 2: Run to verify it fails** — `make test CRATE=driver  # docker: cargo test -p driver --test probe_e2e`. (Debug any stage gaps — likely isel panic messages; fix in the isel tasks' files, not the test.)
 - [ ] **Step 3: Write the gpasm cross-check for the probe's asm**
 
 `crates/asm/tests/fixtures/probe.asm` — take the `.asm` the driver produced for `probe.c` (run the driver manually once it passes, copy `probe.asm` output into the fixture; regenerate it with `cargo run -p driver -- crates/driver/tests/fixtures/probe.c /tmp/probe.hex` and extract the asm — the driver currently writes only hex, so run the stage binaries manually: `irparse`→`wholeprog`→`legalize`→`callgraph`→`alloc`→`isel`→`banking`→`peephole`→ capture the final `.asm`). Then `crates/asm/tests/gpasm_probe.rs` asserts our `assemble_file_to_hex` output equals gpasm's HEX byte-for-byte (mirror `crates/asm/tests/gpasm_cross.rs` from milestone 1) and runs it in `pic14_sim` asserting `out == 48`.
-- [ ] **Step 4: Verify the full suite** — `nix develop --command cargo test` (all crates green).
+- [ ] **Step 4: Verify the full suite** — `make test  # docker: cargo test` (all crates green).
 - [ ] **Step 5: Commit** — `git add crates/driver/tests crates/asm/tests && git commit -m "test(e2e): probe compiles, assembles, and runs correctly"`.
 
 ---

@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- Build/test with `nix develop --command cargo …`; never `apt install` toolchain deps.
+- Build/test with `make exec CMD="cargo ..." …`; never `apt install` toolchain deps.
 - clang driven via `$PIC8_CLANG_UNWRAPPED` with `-resource-dir "$PIC8_CLANG_RESOURCE_DIR"` (`-target msp430 -O1 -S -emit-llvm -ffreestanding -nostdinc`).
 - Conventional commits, single line, ≤ 3 lines.
 - No external assembler in the product; `gpasm` external-process test-only; GPL never linked.
 - Text boundaries: stages communicate via text; the `ir` crate defines the IR text format; the `alloc` map and `.asm` are text artifacts.
-- New files must be `git add`ed before `nix develop` sees them.
+- New files must be `git add`ed before `make shell  # docker` sees them.
 - Unsupported constructs panic loudly, never silently miscompile.
 
 ## The pointer/const lowering (the load-bearing design — from the spike, docs/11)
@@ -50,7 +50,7 @@ const <name> <ty> @0xNN             ; const globals: NO addr (flash); <ty> may b
 - Produces: `Inst::Gep { dst, base: String, offset: Val }` with canonical `%d = gep @<base> <val>`; `Global { name, is_const, ty, size: u8, bytes: Vec<u8>, addr: Option<u16> }` with canonical `global <name> <ty> [@0xNN]` / `const <name> <ty>` lines (const globals serialize without an address); parse accepts the size/bytes fields. `size` defaults from `ty.bytes()` when parsing a scalar global line.
 
 - [ ] **Step 1: Extend the failing test** — round-trip a module with `%p = gep @ram %3`, a `const table i8` global (no addr), and `global ram i8 @0x25` (size 8): assert the round-trip fixed point and that the const line has no `@addr` and the gep line round-trips.
-- [ ] **Step 2: Run to verify it fails** — `nix develop --command cargo test -p ir`.
+- [ ] **Step 2: Run to verify it fails** — `make test CRATE=ir  # docker: cargo test -p ir`.
 - [ ] **Step 3: Implement** — the Gep variant + serialize/parse; Global.size/bytes + serialize/parse (the canonical `const <name> <ty>` line carries no addr; `global <name> <ty> [@0xNN]`; `size`/`bytes` are metadata — decide how to carry them in the canonical text: simplest is to extend the lines to `global <name> <ty> <size> @0xNN` — but that breaks the existing driver map parser; **alternative: keep the map text unchanged (`global <name> 0xNN`) and let the driver get `size`/`bytes` from the `ir` Module directly** (the driver has the Module). Ruling: `size` and `bytes` are carried in the `ir::Global` struct only (not the alloc map text); the alloc map text stays `global <name> 0xNN` / `const <name>` (const listed without addr, for isel to see it exists).
 - [ ] **Step 4: Run to verify it passes**.
 - [ ] **Step 5: Commit** — `git commit -m "feat(ir): gep instruction and sized globals"`.

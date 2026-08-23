@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- Build/test with `nix develop --command cargo …`; never `apt install` toolchain deps.
+- Build/test with `make exec CMD="cargo ..." …`; never `apt install` toolchain deps.
 - clang driven via `$PIC8_CLANG_UNWRAPPED` with `-resource-dir "$PIC8_CLANG_RESOURCE_DIR"` (`-target msp430 -O1 -S -emit-llvm -ffreestanding -nostdinc`).
 - Conventional commits, single line, ≤ 3 lines.
 - No external assembler in the product; `gpasm` external-process test-only; GPL never linked.
 - Text boundaries: stages communicate via text; the `ir` crate defines the IR text format.
-- New files must be `git add`ed before `nix develop` sees them.
+- New files must be `git add`ed before `make shell  # docker` sees them.
 - Unsupported constructs panic loudly, never silently miscompile.
 
 ## The lowering recipes (the load-bearing design)
