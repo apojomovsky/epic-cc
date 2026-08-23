@@ -29,7 +29,8 @@ usage: epic-cc [options] <input.c>...
   -o <file>            output file (default: a.hex)
   -I <dir>             include path, repeatable, forwarded to clang
   -D <name[=value]>    define, repeatable, forwarded to clang
-  --target <name>      device name (e.g. p16f877a, p18f4550); aliases: --device, --mcu, -mcu
+  --target <name>      device name (p16f877a, 16F877A and PIC16F877A all resolve);
+                       aliases: --device, --mcu, -mcu
   --emit <stage>       ll | ir | asm | hex (default: hex)
   --save-temps <dir>   write every stage artifact into <dir>
   -v                   echo the clang and llvm-link commands

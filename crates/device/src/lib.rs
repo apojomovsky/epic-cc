@@ -55,6 +55,27 @@ pub struct SfrField {
 }
 include!(concat!(env!("OUT_DIR"), "/devices.rs"));
 
+/// Resolve a device by any spelling the toolchain ecosystem uses.
+///
+/// The same part is written four ways: `p16f887` here, `16F887` in epic-hal's
+/// manifest, `16f887` by XC8's `-mcpu`, and `PIC16F887` by MPLAB's part
+/// defines. Accepting all of them is what lets the variants design keep its
+/// promise that `--target` is the interface and no caller needs a board table.
+///
+/// `by_name` stays exact; this is the forgiving front door.
+pub fn resolve(name: &str) -> Option<&'static Device> {
+    let s = name.trim().to_ascii_lowercase();
+    if let Some(d) = by_name(&s) {
+        return Some(d);
+    }
+    let stem = match s.strip_prefix("pic") {
+        Some(rest) => format!("p{rest}"),
+        None if !s.starts_with('p') => format!("p{s}"),
+        None => return None,
+    };
+    by_name(&stem)
+}
+
 impl Device {
     /// The first GPR bank's start address  -  where global allocation begins.
     pub fn gpr_start(&self) -> u16 {
