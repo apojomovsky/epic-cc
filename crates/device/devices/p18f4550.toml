@@ -319,3 +319,9 @@ mask = 0x40
 shift = 6
 default = "off"
 values = [{ name = "off", bits = 1 }, { name = "on", bits = 0 }]
+
+[provenance]
+tier = "datasheet"
+document = "DS39632E"
+tables = ["Memory Organization"]
+ticket = "epic-cc#104"

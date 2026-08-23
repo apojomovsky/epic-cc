@@ -81,3 +81,9 @@ mask = 0x20
 shift = 5
 default = "off"
 values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[provenance]
+tier = "datasheet"
+document = "DS39582C"
+tables = ["TABLE 2-1: Register File Map"]
+ticket = "epic-cc#92"
