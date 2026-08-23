@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- Build/test with `nix develop --command cargo …`; never `apt install` toolchain deps.
+- Build/test with `make exec CMD="cargo ..." …`; never `apt install` toolchain deps.
 - clang driven via `$PIC8_CLANG_UNWRAPPED` with `-resource-dir "$PIC8_CLANG_RESOURCE_DIR"` (`-target msp430 -O1 -S -emit-llvm -ffreestanding -nostdinc`).
 - Conventional commits, single line, ≤ 3 lines.
 - No external assembler in the product; `gpasm` external-process test-only; GPL never linked.
 - Text boundaries: stages communicate via text. The `alloc` map and the `isel`→`banking` `.asm` (with physical operands) are text artifacts.
-- New files must be `git add`ed before `nix develop` sees them.
+- New files must be `git add`ed before `make shell  # docker` sees them.
 - Unsupported constructs panic loudly, never silently miscompile.
 
 ## The bank model (the load-bearing design)
@@ -44,7 +44,7 @@
   - common mirror: write via `MOVWF 0x70` in bank 0, read `MOVF 0x70, W` in bank 1 (RP=01) — same value.
   - BANKSEL end-to-end: a program that `BSF STATUS, RP0`, writes a bank-1 cell, `BCF STATUS, RP0`, reads a bank-0 cell — assert both.
   - IRP indirect: FSR=0x20, IRP=1 (BSF STATUS, 7), `MOVWF INDF` writes physical 0x120; IRP=0 writes physical 0x20.
-- [ ] **Step 2: Run to verify it fails** — `nix develop --command cargo test -p pic14-sim --test banking`.
+- [ ] **Step 2: Run to verify it fails** — `make test CRATE=pic14  # docker: cargo test -p pic14-sim --test banking`.
 - [ ] **Step 3: Implement** — the resolve model in `read_f`/`write_f`; grow `ram` to 512; keep INDF/PCL special handling. STATUS/FSR/PCL/PCLATH reads/writes resolve to physical `f` (bank-independent, `f < 0x20`).
 - [ ] **Step 4: Run to verify it passes** — banking tests + the full sim suite (existing tests must still pass: reset = bank 0).
 - [ ] **Step 5: Commit** — `git commit -m "feat(sim): bank-aware memory model"`.
@@ -81,7 +81,7 @@
 - [ ] **Step 1: Extend the failing test** — hand-written `.asm` with `MOVF 0xA0, W` and `MOVF 0x20, W` (bank 1 then bank 0): assert the output contains `BSF STATUS, RP0` (or equivalent) before the 0xA0 instruction, the operand rewritten to `0x20`, and a `BCF STATUS, RP0` before returning to bank 0; `MOVF 0x70, W` (common) and `BTFSC STATUS, 2` (SFR) get no BANKSEL; consecutive same-bank operands get no redundant BANKSEL.
 - [ ] **Step 2: Run to verify it fails**.
 - [ ] **Step 3: Implement** — the scan; keep the literal-op skip (M3) and the ≥0x80 rejection for *in-bank* operands that were never rewritten (defensive: a physical operand `0x20–0x6F` in bank 0 needs no rewrite; `0x80–0x9F` SFR-range operands are out of scope for our emissions and still rejected).
-- [ ] **Step 4: Run to verify it passes** — banking tests + `nix develop --command cargo test --workspace` (the existing overlay/probe e2e use only bank 0, so no BANKSEL is inserted and their `.asm` is unchanged).
+- [ ] **Step 4: Run to verify it passes** — banking tests + `make test  # docker: cargo test --workspace` (the existing overlay/probe e2e use only bank 0, so no BANKSEL is inserted and their `.asm` is unchanged).
 - [ ] **Step 5: Commit** — `git commit -m "feat(banking): insert BANKSEL across banks"`.
 
 ---
@@ -113,7 +113,7 @@ void main(void) {
 
 - [ ] **Step 2: Write the acceptance test** — `banked_e2e.rs` runs the driver, simulates (no presets needed beyond the program's own writes), asserts `out` equals the hand-computed value and `halted()`. Also assert (inspect the `.asm` via the driver pipeline or by running the stage binaries) that the emitted `.asm` contains at least one `BSF STATUS, RP0`-style BANKSEL (i.e., banking actually engaged — not a bank-0-only program). 
 - [ ] **Step 3: Run to verify it fails, then make it pass** — debug in the responsible stage (likely banking operand handling or the sim resolve); keep stage tests green. The `gpasm_banked.rs` cross-check mirrors the M3 pattern: fixture the driver's `.asm` for `banked.c`, assert our HEX equals gpasm byte-for-byte and the sim run gives the same `out`.
-- [ ] **Step 4: Run the full suite** — `nix develop --command cargo test` all green (probe, add.c, overlay, banked e2e).
+- [ ] **Step 4: Run the full suite** — `make test  # docker: cargo test` all green (probe, add.c, overlay, banked e2e).
 - [ ] **Step 5: Commit** — `git commit -m "test(e2e): multi-bank program compiles and runs with BANKSEL"`.
 
 ---

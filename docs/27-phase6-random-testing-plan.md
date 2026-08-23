@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Build/test with `nix develop --command cargo …`; never bare `cargo`.
+- Build/test with `make exec CMD="cargo ..." …`; never bare `cargo`.
 - clang driven via `$PIC8_CLANG_UNWRAPPED` with `-resource-dir "$PIC8_CLANG_RESOURCE_DIR"` (`-target msp430 -O1 -S -emit-llvm -ffreestanding -nostdinc`) for the PIC side; **host clang** (no `-target`) for the reference.
 - Conventional commits, single line, ≤ 3 lines.
 - No external assembler in the product; gpasm external-process test-only.

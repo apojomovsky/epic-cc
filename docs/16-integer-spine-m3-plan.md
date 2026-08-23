@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- Build/test with `nix develop --command cargo …`; never `apt install` toolchain deps.
+- Build/test with `make exec CMD="cargo ..." …`; never `apt install` toolchain deps.
 - clang driven via `$PIC8_CLANG_UNWRAPPED` with `-resource-dir "$PIC8_CLANG_RESOURCE_DIR"` (`-target msp430 -O1 -S -emit-llvm -ffreestanding -nostdinc`).
 - Conventional commits, single line, ≤ 3 lines.
 - No external assembler in the product; `gpasm` external-process test-only; GPL never linked.
 - Text boundaries: stages communicate via text; the driver may import stage libraries; stages do not import each other. The `alloc` output map is a text artifact consumed by the driver and `isel`.
-- New files must be `git add`ed before `nix develop` sees them.
+- New files must be `git add`ed before `make shell  # docker` sees them.
 - Unsupported constructs panic loudly, never silently miscompile.
 
 ## The overlay algorithm (the load-bearing design)
@@ -57,7 +57,7 @@ local big_a::%5 0x30
 - Produces: `pub fn edges_text(g: &CallGraph) -> String` — one `edge <caller> <callee>` line per edge, then `depth <max_depth>`; the binary writes it. `alloc` (Task 2) parses this text.
 
 - [ ] **Step 1: Extend the failing test** — assert `edges_text` for a main→a, main→b graph contains `edge main a`, `edge main b`, `depth 2`.
-- [ ] **Step 2: Run to verify it fails** — `nix develop --command cargo test -p callgraph`.
+- [ ] **Step 2: Run to verify it fails** — `make test CRATE=callgraph  # docker: cargo test -p callgraph`.
 - [ ] **Step 3: Implement** — add `edges_text`; the binary writes it (replacing/extending the current output; keep `depth`).
 - [ ] **Step 4: Run to verify it passes**.
 - [ ] **Step 5: Commit** — `git commit -m "feat(callgraph): emit parseable edge list"`.
@@ -100,7 +100,7 @@ local big_a::%5 0x30
 - [ ] **Step 2: Run to verify it fails** (isel still allocates internally / ignores the local map entries).
 - [ ] **Step 3: Implement the isel refactor** — delete the slot allocator; every value lookup goes through the map. Keep the i8/i16 width asserts, the icmp-scratch usage (now from the map-provided layout), call/ret retval handling. Update every isel test that asserted allocator-chosen addresses to use map-provided addresses (addresses become explicit test inputs).
 - [ ] **Step 4: Update the driver** — parse both `global` and `local` lines into one map (local key `{func}::{name}`), pass it to `isel::select`. The `add.c` e2e must still pass (`out == 8` for `in == 7`).
-- [ ] **Step 5: Run to verify it passes** — `nix develop --command cargo test --workspace`.
+- [ ] **Step 5: Run to verify it passes** — `make test  # docker: cargo test --workspace`.
 - [ ] **Step 6: Commit** — `git commit -m "feat(isel,driver): consume the complete overlay address map"`.
 
 ---
@@ -146,7 +146,7 @@ void main(void) {
 
 - [ ] **Step 2: Write the acceptance test** — `overlay_e2e.rs` runs the driver on `overlay.c`, simulates the HEX with `in = 3`, asserts `out` equals the hand-computed expected value and `halted()`. Separately, a test that runs `alloc` on the overlay program's IR (via the stage binaries or the `alloc` lib) and asserts the local map shows big_a's and big_b's locals **overlapping** (same base region), and `total_bank0` < `locals_size(big_a) + locals_size(big_b) + locals_size(main)`.
 - [ ] **Step 3: Run to verify it fails** (before Task 2/3 land, or if the program's frames don't actually overlay), then make it pass. Debug in the responsible stage; keep stage tests green.
-- [ ] **Step 4: Run the full suite** — `nix develop --command cargo test` all green (probe e2e, add.c e2e, overlay e2e).
+- [ ] **Step 4: Run the full suite** — `make test  # docker: cargo test` all green (probe e2e, add.c e2e, overlay e2e).
 - [ ] **Step 5: Commit** — `git commit -m "test(e2e): overlay sibling frames share RAM and run correctly"`.
 
 ---

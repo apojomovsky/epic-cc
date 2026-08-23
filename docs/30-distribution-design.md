@@ -57,7 +57,7 @@ Dockerfile (multi-stage, buildx, digest-pinned ubuntu:22.04)
 │                    → cmake -DCMAKE_BUILD_TYPE=Release -DLLVM_ENABLE_PROJECTS=clang
 │                    → static-lib clang + lib/clang/20 builtin headers
 ├── dev           → clang-builder + rustup (honors rust-toolchain.toml → 1.97.1)
-│                    → interactive shell, replaces `nix develop`
+│                    → interactive shell, replaces `make shell  # docker`
 ├── ci            → dev + scripts/ci-test.sh (what CI runs; script unchanged)
 └── release       → clang-builder + cargo → assembles the distribution bundle
 ```

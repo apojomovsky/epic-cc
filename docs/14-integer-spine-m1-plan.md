@@ -12,12 +12,12 @@
 
 ## Global Constraints
 
-- Build/test with `nix develop --command cargo …`; never `apt install` toolchain deps.
+- Build/test with `make exec CMD="cargo ..." …`; never `apt install` toolchain deps.
 - clang is driven via `$PIC8_CLANG_UNWRAPPED` with `-resource-dir "$PIC8_CLANG_RESOURCE_DIR"` (flake env vars; see docs/09).
 - Conventional commits, single line, ≤ 3 lines.
 - No external assembler/linker in the product; `gpasm` is external-process test-only. GPL tools never linked.
 - Every stage boundary is a text artifact: each stage binary reads a file path (or stdin) and writes text to a file path (or stdout). No stage imports another stage's code — they communicate only via the text formats (the shared `crates/ir` crate defines the IR text format; everything else is plain text).
-- New files must be `git add`ed before `nix develop` sees them.
+- New files must be `git add`ed before `make shell  # docker` sees them.
 - Unsupported constructs fail loudly with a clear `panic!` message, never silently miscompile.
 
 ## The IR text format (defined by `crates/ir`, used by every stage)
@@ -83,7 +83,7 @@ fn roundtrips_a_straight_line_program() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `nix develop --command cargo test -p ir`
+Run: `make test CRATE=ir  # docker: cargo test -p ir`
 Expected: FAIL, `ir` crate not found.
 
 - [ ] **Step 3: Add the crate and implement**
@@ -265,7 +265,7 @@ Also update root `Cargo.toml` workspace members to include `"crates/ir"`.
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `nix develop --command cargo test -p ir`
+Run: `make test CRATE=ir  # docker: cargo test -p ir`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -318,7 +318,7 @@ fn parses_straight_line_ll() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `nix develop --command cargo test -p irparse`
+Run: `make test CRATE=irparse  # docker: cargo test -p irparse`
 Expected: FAIL, crate not found.
 
 - [ ] **Step 3: Implement (port the spike parser, attribute stripping required)**
@@ -341,7 +341,7 @@ fn main() {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `nix develop --command cargo test -p irparse`
+Run: `make test CRATE=irparse  # docker: cargo test -p irparse`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -388,7 +388,7 @@ fn rejects_empty_module() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p wholeprog`
+Run: `make test CRATE=wholeprog  # docker: cargo test -p wholeprog`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
@@ -404,7 +404,7 @@ Binary `wholeprog <in.ir> <out.ir>` reads text, calls `merge(parse(...))`, write
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p wholeprog`
+Run: `make test CRATE=wholeprog  # docker: cargo test -p wholeprog`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -444,7 +444,7 @@ fn passes_8_bit_through() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p legalize`
+Run: `make test CRATE=legalize  # docker: cargo test -p legalize`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
@@ -468,7 +468,7 @@ Binary `legalize <in.ir> <out.ir>`.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p legalize`
+Run: `make test CRATE=legalize  # docker: cargo test -p legalize`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -512,7 +512,7 @@ fn single_function_has_no_edges() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p callgraph`
+Run: `make test CRATE=callgraph  # docker: cargo test -p callgraph`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement (no calls in milestone 1)**
@@ -533,7 +533,7 @@ Binary `callgraph <in.ir> <out.cg>` writes `depth 1` (and `fn main` if present).
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p callgraph`
+Run: `make test CRATE=callgraph  # docker: cargo test -p callgraph`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -577,7 +577,7 @@ fn globals_get_bank0_addresses() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p alloc`
+Run: `make test CRATE=alloc  # docker: cargo test -p alloc`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
@@ -611,7 +611,7 @@ Binary `alloc <in.ir> <out.ir> <out.map>`: writes `serialize(&allocate(parse(...
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p alloc`
+Run: `make test CRATE=alloc  # docker: cargo test -p alloc`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -665,7 +665,7 @@ fn emits_add_for_in_plus_one() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p isel`
+Run: `make test CRATE=isel  # docker: cargo test -p isel`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement** (port the verified straight-line codegen from `spike/src/codegen.rs` — the `emit_load_byte`/`MOVF`/`MOVWF`/`ADDLW` patterns; keep only 8-bit load/store/add/sub/and/or/xor + ret for milestone 1; panic loudly on anything else)
@@ -760,7 +760,7 @@ Binary `isel <in.ir> <in.map> <out.asm>` reads IR text + address map, writes `.a
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p isel`
+Run: `make test CRATE=isel  # docker: cargo test -p isel`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -805,7 +805,7 @@ fn rejects_bank_operand() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p banking`
+Run: `make test CRATE=banking  # docker: cargo test -p banking`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
@@ -827,7 +827,7 @@ Binary `banking <in.asm> <out.asm>`.
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p banking`
+Run: `make test CRATE=banking  # docker: cargo test -p banking`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -908,7 +908,7 @@ fn assembles_movf_add_movwf() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p asm`
+Run: `make test CRATE=asm  # docker: cargo test -p asm`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
@@ -1026,7 +1026,7 @@ Also provide `pub fn assemble_file_to_hex(src: &str) -> String { to_hex(&assembl
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p asm`
+Run: `make test CRATE=asm  # docker: cargo test -p asm`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -1083,7 +1083,7 @@ void main(void) { out = in + 1; }
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p driver`
+Run: `make test CRATE=driver  # docker: cargo test -p driver`
 Expected: FAIL.
 
 - [ ] **Step 3: Implement**
@@ -1133,7 +1133,7 @@ fn main() {
 
 - [ ] **Step 4: Run to verify it passes**
 
-Run: `nix develop --command cargo test -p driver`
+Run: `make test CRATE=driver  # docker: cargo test -p driver`
 Expected: PASS (end-to-end: `out == 8` for `in == 7`, halted).
 
 - [ ] **Step 5: Commit**
@@ -1207,14 +1207,14 @@ fn our_hex_matches_gpasm_and_runs() {
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `nix develop --command cargo test -p asm --test gpasm_cross`
+Run: `make test CRATE=asm  # docker: cargo test -p asm --test gpasm_cross`
 Expected: FAIL if our HEX differs from gpasm's (debug the byte order / encodings until it matches).
 
 - [ ] **Step 3: Fix until it passes** — if our encoding disagrees with gpasm, correct `crates/asm/src/lib.rs` encodings (the simulator's `pic14_sim::parse_hex` is the ground truth for byte order; the datasheet table in Task 10 for encodings).
 
 - [ ] **Step 4: Verify full suite**
 
-Run: `nix develop --command cargo test`
+Run: `make test  # docker: cargo test`
 Expected: all crates' tests pass, including the driver e2e and this cross-check.
 
 - [ ] **Step 5: Commit**

@@ -1,0 +1,8 @@
+#!/bin/sh
+# pre-push: run the exact CI locally before pushing.
+# This is the 1-to-1 reproduction for `epic-cc-ci:latest bash scripts/ci-test.sh`
+# that CI runs (see #99).  `cargo test -- --skip gpasm` is NOT the same — it
+# skips `pic14e_firewall` and other Docker-only checks.
+set -e
+echo "pre-push: make ci-local (docker epic-cc-ci bash scripts/ci-test.sh) — see #99"
+make ci-local

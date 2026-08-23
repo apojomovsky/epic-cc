@@ -254,7 +254,7 @@ Nix pins it exactly in `flake.lock`. `apt` and conda-forge both drift; a Docker 
 unless pinned by digest with rebuild discipline. Of the options considered, only Nix closes
 this properly.
 
-Secondary: `nix develop --command <cmd>` is a one-line, daemon-free, scriptable entry
+Secondary: `make shell  # docker --command <cmd>` is a one-line, daemon-free, scriptable entry
 point, which serves the autonomy requirement in [`00-charter.md`](00-charter.md).
 
 The host already had `nix` (2.34.8, flakes enabled) and `direnv` (2.37.1) installed, and
@@ -276,12 +276,12 @@ All were already installed on the host, so availability was not the differentiat
 ### Consequences
 
 - **XC8 must not become a flake input.** It is proprietary; making it a build dependency
-  would break `nix develop` for anyone without a licensed install, including CI. It is
+  would break `make shell  # docker` for anyone without a licensed install, including CI. It is
   detected at runtime via `$PIC8_XC8_ROOT` and its tests skip when absent.
 - Two packages are missing from nixpkgs and need their own derivations eventually:
   **gpsim** and **YARPGen**. Both are deferred to the fuzzing phase; neither blocks the
   spike.
-- New files must be `git add`ed before `nix develop` can see them.
+- New files must be `git add`ed before `make shell  # docker` can see them.
 
 ### Revisit if
 
