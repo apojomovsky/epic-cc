@@ -133,3 +133,37 @@ fn flash_words_is_a_power_of_two() {
         );
     }
 }
+
+#[test]
+fn resolve_accepts_every_spelling_the_ecosystem_uses() {
+    // epic-cc's own stem, epic-hal's manifest variant, XC8's -mcpu, and MPLAB's
+    // part define, all naming one part.
+    for spelling in ["p16f877a", "P16F877A", "16F877A", "16f877a", "PIC16F877A"] {
+        assert_eq!(
+            device::resolve(spelling).map(|d| d.name),
+            Some("p16f877a"),
+            "{spelling} should resolve"
+        );
+    }
+    assert_eq!(
+        device::resolve("  16F887  ").map(|d| d.name),
+        Some("p16f887")
+    );
+    assert_eq!(device::resolve("18f4550").map(|d| d.name), Some("p18f4550"));
+}
+
+#[test]
+fn resolve_rejects_a_part_we_do_not_ship() {
+    assert!(device::resolve("p99f9999").is_none());
+    assert!(device::resolve("16F1937").is_none());
+    assert!(device::resolve("").is_none());
+}
+
+#[test]
+fn by_name_stays_exact() {
+    // resolve() is the forgiving front door; by_name is the exact lookup the
+    // generated table provides, and callers depend on that distinction.
+    assert!(device::by_name("P16F877A").is_none());
+    assert!(device::by_name("16f877a").is_none());
+    assert!(device::by_name("p16f877a").is_some());
+}
