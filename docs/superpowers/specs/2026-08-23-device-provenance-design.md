@@ -208,9 +208,11 @@ value, and this path is not in the steady state loop.
 
 Backfill provenance for the three existing TOMLs. `#92` already cites DS39582C
 (877A) and DS41291D (887), so those start at `tier = "datasheet"` until
-regenerated from ATDF. `p18f4550` has no document recorded anywhere in the repo
-yet, so the migration step must look up and cite its datasheet number rather than
-inherit one; that lookup is part of the work, not an assumption baked in here.
+regenerated from ATDF. `p18f4550` has no such citation from `#92`, since that
+ticket never touched it, but its datasheet is already recorded elsewhere in the
+repo: DS39632E is cited throughout `crates/driver/src/fosc.rs` and named in
+`docs/29-pic18-port-design.md`. The migration step is to reuse that number, not
+to discover a new one.
 
 **Risk:** the cross-check may fail immediately on `p16f887` or `p18f4550` if their
 hand written values disagree with gputils. That is the gate working, but it means
