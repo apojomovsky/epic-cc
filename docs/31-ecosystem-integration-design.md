@@ -2,6 +2,9 @@
 
 > **Approval status:** parity scope, compatibility split, fuse surface, toolchain role
 > and sequencing **approved by the user on 2026-08-20**.
+> **Amended 2026-08-24**, approved by the user: parity covers three families, not two;
+> `pic16f193x-hal` is deferred rather than rejected; `HAL-3` is decomposed into clusters.
+> Section 6 records what has landed.
 > This document is the **decomposition of record**. It holds the map and the decisions
 > that constrain every piece; it is not an implementation plan. Each sub-project below
 > earns its own design and plan cycle.
@@ -10,10 +13,10 @@
 and the two ship together as a fully open-source 8-bit PIC ecosystem, reachable from
 PlatformIO and from a one-line installer that touches nothing on Microchip's servers.
 
-**Definition of done:** every `epic-*` module and both `pic16f87xa-hal` and
-`pic18fxx5x-hal` build and pass their gates under epic-cc, per module, on both families.
-`pic16f193x-hal` (enhanced mid-range) is explicitly out of scope: epic-cc has no backend
-for that core.
+**Definition of done:** every `epic-*` module and `pic16f87xa-hal`, `pic16f88x-hal` and
+`pic18fxx5x-hal` build and pass their gates under epic-cc, per module, on all three families.
+`pic16f193x-hal` (enhanced mid-range) is **deferred**: epic-cc has no backend for that core,
+and adding one is a separate decision the user intends to revisit.
 
 ---
 
@@ -57,15 +60,24 @@ silicon," and that is where the work is.
 
 ## 2. Decisions
 
-### D-1: Parity means two families, per module
+### D-1: Parity means three families, per module
 
-**Decision.** Every `epic-*` module, on `pic16f87xa-hal` and `pic18fxx5x-hal`.
-`pic16f193x-hal` is out of scope.
+**Decision, amended 2026-08-24.** Every `epic-*` module, on `pic16f87xa-hal`,
+`pic16f88x-hal` and `pic18fxx5x-hal`. `pic16f193x-hal` is deferred.
 
-**Rationale.** epic-cc's two device profiles, `PIC16F877A` and `PIC18F4550`
-(`crates/device/src/lib.rs:33,45`), line up exactly with those two HAL families.
-Covering the third would mean a third instruction-selection backend for the enhanced
+**Rationale.** epic-cc's device registry holds `p16f877a`, `p16f887` and `p18f4550`
+(`crates/device/devices/`), which line up exactly with those three HAL families.
+Covering the 193x would mean a third instruction-selection backend for the enhanced
 mid-range core, which is a port on the scale of the PIC18 one and is a separate decision.
+It is deferred rather than rejected: the user intends to revisit it.
+
+**Why the 887 is in scope rather than incidental.** It shares the PIC14 ISA with the
+877A and differs only in device data. It is therefore the standing proof of a property
+this project wants to hold: adding epic-cc support for a device on an already supported
+ISA should be close to free, a TOML file rather than a backend change. If the 887 ever
+costs real engineering in a HAL module, that is the finding, and the fix belongs in the
+device registry rather than in the module. The file-per-device registry (section 6) exists
+to make that true.
 
 **"Per module" is load-bearing.** The 877A has 368 bytes of RAM and 8K words of flash.
 Parity means each module builds and passes its gate, never that the whole shelf links into
@@ -660,6 +672,13 @@ the pipeline's diffable text boundaries exist to serve. The genuinely unknown wo
 `epic-tick` on the 4550) so the PIC18 path cannot drift silently while PIC14 integration
 proceeds.
 
+**Amendment status, 2026-08-24.** `CC-1` and `CC-3` landed on 2026-08-22. The PIC18 smoke
+slice did not follow, and PIC14 has moved a long way since: the device registry, the 887
+device, the `hal-887` CI job and the first real HAL firmware are all PIC14. Every epic-hal
+conformance cluster therefore defers its `18F4550` acceptance box until #75 lands, which
+makes #75 the gate on the PIC18 half of the epic rather than a nice to have. It is tracked
+as #75 and has been promoted to the `P2 gate` phase on the board.
+
 **Rejected, PIC18 first.** Matches current momentum and targets the roomier part, but puts a
 new backend and a new integration layer under test simultaneously, so a miscompile is ambiguous
 between them.
@@ -680,15 +699,20 @@ That assembly exists to beat XC8's licence-gated optimizer, and epic-cc has no l
 building that C path under epic-cc and measuring, not by porting 400 assembly statements.
 **Before believing this**, check whether anything depends on the *fixed-cycle* property the
 assembly advertises, as opposed to only its speed: a C path is not cycle-deterministic.
+**Owner as of 2026-08-24:** `apojomovsky/epic-hal#90`, split out of HAL-3 so it can run first.
+Its result decides whether `CC-4` is a dependency of this epic at all.
 
 **`epic-serial`'s `printf` retarget (HAL-3).** Depends on how much of `stdio` `CC-2` provides.
 Variadic functions on a machine with no stack are their own design problem. Likely resolved by
 a non-variadic formatting API on the epic-cc path rather than by implementing `printf`.
+**Owner as of 2026-08-24:** `apojomovsky/epic-hal#91`, split out of HAL-3 so the API is settled
+before the serial cluster starts rather than during it.
 
 **RAM headroom on the 877A `[VERIFY]`.** epic-hal's modules fit under XC8 today. epic-cc's
 overlay allocator is a different allocator, and 368 bytes leaves little room to be wrong. This
 is a real risk of the chosen sequencing and is best discovered early, which is also an argument
-for that sequencing.
+for that sequencing. **Owner as of 2026-08-24:** `apojomovsky/epic-hal#84`, the first cluster,
+which records the baseline figures every later cluster compares against.
 
 **Section-attribute passthrough: confirmed 2026-08-20.** D-2 and D-4 rest on clang forwarding
 `__attribute__((section("...")))` verbatim into the `.ll`. Probed against the pinned clang 20.1.8
@@ -704,3 +728,72 @@ working knowledge. Confirm against current PlatformIO documentation before `PIO-
 **Host simulation's future.** epic-hal's fast inner loop is a host build under gcc. epic-cc's
 `crates/sim` runs actual target code, which is a stronger gate but a slower loop. `HAL-4`
 decides whether the host build remains the inner loop or is replaced.
+
+---
+
+## 6. Where this stands, 2026-08-24
+
+Recorded so a cold reader is not misled by section 3's future tense. Section 3 is the
+decomposition; this is its state.
+
+### Landed
+
+| ID | State | Evidence |
+|---|---|---|
+| **CC-1** multi-TU front end | Done | #66, ADR-011 |
+| **CC-2** freestanding libc | Done | ADR-018, and #62 shipped the `strchr` family on 2026-08-22 |
+| **CC-3** silicon-real codegen | Done | #67, ADR-012 |
+| **CC-4** inline assembly ladder | Done, rungs 1 to 4 | ADR-017 |
+| **CC-5** PIC18 P4 to P8 | Done | `docs/29-pic18-port-design.md` |
+| **CC-6** distribution, size and map | Open | #74, plus #118 for the CI consumable artifact |
+| **HAL-1** epic-cc build variant | Done | `epic-hal#57` |
+| **HAL-2** build-system backend | Done | `epic-hal#58` |
+| **HAL-3** module conformance | Decomposed, see below | `epic-hal#59` |
+| **HAL-4** verification via `crates/sim` | Open | `epic-hal#60` |
+| **HAL-5** distribution flip | Open | `epic-hal#61` |
+| **PIO-0 to PIO-3** | Open | `epic-platformio#1` to `#4` |
+
+### The device registry, which this document never decomposed
+
+Between 2026-08-22 and 2026-08-24 a slab of work landed that section 3 does not mention
+and that D-1's three-family target now rests on:
+
+- **File-per-device TOML registry** with `build.rs` codegen and `--target` (#83), its
+  first exemplar `p16f887` (#85), a DFP to TOML generator ingesting ATDF (#86), schema
+  hardening and the pic14e firewall (#91), and a provenance stanza with an always-on
+  gputils cross-check (#104).
+- **Tolerant device-name resolution** (#93), which let `epic-hal` delete its MCU mapping
+  table entirely (`epic-hal#74`).
+- **CI stratification** into a canonical job per core plus a lightweight per-device job
+  (#84), and a `hal-887` job that builds `epic-hal`'s 887 firmware inside an epic-cc job
+  (#113).
+- **PIC14 device-data corrections** found by pointing the registry at real silicon: banks
+  2 and 3 starting at the real GPR boundary (#92, #101) and the simulator resolving banked
+  GPR from the device map rather than a fixed window (#95, #100).
+
+This is what makes "a new device on a supported ISA should be nearly free" a design
+property rather than a hope, which is the argument D-1 now leans on.
+
+### HAL-3 is decomposed into clusters
+
+`epic-hal#59` is a tracking issue. The work is in `epic-hal#84` through `#92`.
+
+**The distinction the decomposition rests on.** A module that registers a HAL callback
+still **builds** under epic-cc, because the dispatch is compiled out under `#ifndef EPIC_AT`
+(`epic-hal#67`). What it cannot do is **pass a gate that needs the callback to fire**. The
+clusters split on that line, so most of the shelf proceeds in parallel with the compiler
+work instead of queueing behind it.
+
+**The finding that was not obvious.** `epic-tick` and `epic-taskmgr` both register
+`OverflowCallback`. Function pointers (#73) therefore sit underneath the scheduling core
+that most of the module shelf depends on, not off to the side among leaf modules. #73 is
+promoted to the `P2 gate` phase for that reason, and #117 covers the sibling gap, lowering
+`inttoptr` on a runtime address, which is the other half of `epic-hal#67`.
+
+### Open scope question
+
+`epic-hal` also holds eleven `epic-combo-*` integration firmwares, which link several
+modules into one image and are the strongest gates in that repository. They are named
+`epic-*`, so the definition of done arguably covers them, and they are where the 877A's
+368 bytes are most likely to run out. D-1's "per module is load-bearing" argues the other
+way. Tracked as `epic-hal#92`, held at `dispatch-only` pending the user's decision.
