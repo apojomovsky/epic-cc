@@ -36,7 +36,13 @@ DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
 	-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
 	-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE)
 
-.PHONY: help image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check
+.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check
+
+bootstrap: ## First-time setup: host deps, git hooks, dev image
+	@bash scripts/bootstrap.sh
+
+doctor: ## Report what first-time setup is missing, change nothing
+	@bash scripts/bootstrap.sh --check-only
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
