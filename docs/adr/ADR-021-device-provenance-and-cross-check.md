@@ -10,13 +10,24 @@
   to build without it. `tier = "atdf"` needs `source`, `pack` and `sha256`;
   `tier = "datasheet"` needs `document` and `ticket`.
 * `crates/device/tests/gputils_crosscheck.rs` gates every device on every PR:
-  `flash_words` via two `gpasm` `org` probes, and the RAM map by comparing
-  coalesced ranges against the generic `.lkr`.
-* Comparison is union-and-coalesce, never element-wise, because gputils splits
-  a flat PIC18 window into nine banks describing the same memory as one TOML
-  entry.
-* Missing gputils fails rather than skips, with `PIC8_ALLOW_NO_GPUTILS=1` as
-  the explicit escape.
+  `flash_words` via two `gpasm` `org` probes, and the RAM map against the
+  generic `.lkr`.
+* On PIC14 the comparison is per bank and ordered, plus a separate check of
+  `common_ram` against the first unprotected `SHAREBANK`. A merged total would
+  accept a moved banked/common boundary, which `isel` reads as `fsr_window`.
+  Union-and-coalesce survives only on PIC18, where gputils splits a flat window
+  into nine `DATABANK`s that one TOML entry describes.
+* Coverage is correlated with provenance: a device with no `.lkr` is named in
+  the test output and must be `tier = "datasheet"`. Nothing may be both
+  unverified and silent.
+* Missing gputils fails rather than skips. The escape is two variables,
+  `PIC8_ALLOW_NO_GPUTILS` plus `PIC8_UNVERIFIED_DEVICE_DATA`, and prints a
+  banner; one variable alone still fails. Both are read only when the data root
+  is absent, so they cannot silence a gate that could have run.
+* `scripts/gen-device.py` refuses to emit a TOML for a field its source does
+  not state, naming the field and exiting non-zero. It has no per-device
+  fallback constants: a generated map that carries a real `sha256` reads as
+  attested, so a guess there is worse than no generator.
 
 ## Rationale
 
@@ -38,16 +49,26 @@ cannot be skipped for want of a download.
   never validated, and relocatable placement reveals no bank geometry. Supplying
   a linker script with the ranges would assert what we are verifying.
 
+## Known exception
+
+`p18f4550` ships `common_ram = [0x0,0xF]` while its `.lkr` access RAM is
+`0x0-0x5F`, so the two cannot be compared. On PIC18 `common_ram` is not the
+hardware access window: it is `isel-pic18`'s fixed, `BSR`-independent retval
+and scratch reservation carved out of the bottom of access RAM, a compiler
+choice no linker script can attest. PIC18 therefore compares only the total
+allocatable span, and the banked/common boundary stays unverified there. A
+per-device `access_bank` field, which `docs/29` originally sketched and the
+registry collapsed into `common_ram`, would make it checkable.
+
 ## Revisit if
 
-* A supported part has no `.lkr`, making the cross-check silently vacuous for
-  it. The datasheet provenance tier is the current answer, but a second oracle
-  would be better.
-* `gpr_ranges_from_lkr` starts missing real geometry. It reads `DATABANK` and
-  `SHAREBANK` lines textually and does not evaluate `#IFDEF`/`#ELSE` guards or
-  match `ACCESSBANK` lines at all. `p18f4550`'s correct `0x0-0x5F` range comes
-  from a `DATABANK` inside a never-taken `_EXTENDEDMODE` branch, while the
-  active `ACCESSBANK` line is ignored outright; today's result is right only
-  because both branches describe the same physical access RAM. A future device
-  whose access RAM is declared solely via `ACCESSBANK` would produce a false
-  mismatch, and the parser would need to evaluate the guard or read that line.
+* A supported part has no `.lkr` **and** gpasm does not know its `-p` name.
+  The RAM half then reports it uncovered and demands the datasheet tier, but
+  the flash half fails outright because the probe cannot run. That is the
+  right failure and not a silent pass, though it means such a part cannot be
+  added without a second oracle.
+* The `.lkr` guard evaluation stops matching how we assemble. `ram_from_lkr`
+  evaluates `#IFDEF`/`#ELSE`/`#FI` with no symbol defined, which is true of
+  epic-cc (no gputils C runtime, no extended instruction mode) and selects the
+  `ACCESSBANK accessram` arm on the 4550. A part built only with
+  `_EXTENDEDMODE` on would need the guards driven by a symbol set.
