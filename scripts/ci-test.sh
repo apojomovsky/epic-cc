@@ -52,6 +52,31 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
+# The device generator is python, so no cargo invocation covers it. It gates
+# the same data the gputils cross-check does, and an unrun test is not a gate.
+echo "::group::gen-device"
+if python3 scripts/test_gen_device.py; then
+  echo "PASS: gen-device"
+  row="| gen-device | PASS |"
+else
+  echo "FAIL: gen-device"
+  row="| gen-device | FAIL |"
+  fail=1
+fi
+echo "::endgroup::"
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+  echo "$row" >> "$GITHUB_STEP_SUMMARY"
+fi
+
+# A run with no oracle is reported, not silently green: the cross-check itself
+# refuses to pass on one opt-in, and this makes the second one visible.
+if [ -n "${PIC8_ALLOW_NO_GPUTILS:-}" ]; then
+  echo "::warning::PIC8_ALLOW_NO_GPUTILS is set; device data is NOT cross-checked in this run"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    echo "| device cross-check | DISABLED (PIC8_ALLOW_NO_GPUTILS) |" >> "$GITHUB_STEP_SUMMARY"
+  fi
+fi
+
 for crate in $crates; do
   echo "::group::${crate}"
   if cargo test -p "$crate" --no-fail-fast; then
