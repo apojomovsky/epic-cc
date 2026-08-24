@@ -33,6 +33,21 @@ fn bank_of_is_none_for_sfr_and_common_ram() {
 }
 
 #[test]
+fn bank_of_banks_a_non_mirrored_bank0_sfr() {
+    // Only the six core registers (INDF/PCL/STATUS/FSR/PCLATH/INTCON) are
+    // mirrored into every bank. A non-mirrored bank-0 SFR (PORTA 0x05,
+    // TMR0 0x01, ...) exists solely in bank 0, so it needs RP1:RP0 = 0.
+    assert_eq!(PIC16F877A.bank_of(0x00), None); // INDF, mirrored
+    assert_eq!(PIC16F877A.bank_of(0x02), None); // PCL, mirrored
+    assert_eq!(PIC16F877A.bank_of(0x04), None); // FSR, mirrored
+    assert_eq!(PIC16F877A.bank_of(0x0A), None); // PCLATH, mirrored
+    assert_eq!(PIC16F877A.bank_of(0x0B), None); // INTCON, mirrored
+    assert_eq!(PIC16F877A.bank_of(0x01), Some(0)); // TMR0, not mirrored
+    assert_eq!(PIC16F877A.bank_of(0x05), Some(0)); // PORTA, not mirrored
+    assert_eq!(PIC16F877A.bank_of(0x06), Some(0)); // PORTB, not mirrored
+    assert_eq!(PIC16F877A.bank_of(0x10), Some(0)); // T1CON, not mirrored
+}
+#[test]
 fn bank_of_banks_a_high_bank_sfr() {
     // An SFR above the first GPR bank is paged by RP1:RP0 like a GPR is, so
     // it needs a BANKSEL: the 887's ANSEL/ANSELH are the motivating case.

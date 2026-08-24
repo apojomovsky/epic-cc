@@ -33,9 +33,9 @@ isr:
     MOVLW 0x00
     MOVWF PCLATH
     MOVLW 0x55
-    MOVWF 0x06
     BCF STATUS, 5
     BCF STATUS, 6
+    MOVWF 0x06
     MOVF 0x20, W
     MOVWF 0x2C
     MOVF 0x2C, W

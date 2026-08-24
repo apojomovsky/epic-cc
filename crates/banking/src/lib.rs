@@ -4,9 +4,11 @@
 /// pass scans the assembly, infers each file-register operand's memory bank
 /// from its address, inserts a `BANKSEL` when the tracked current bank
 /// differs, and rewrites the operand to the 7-bit bank-relative address
-/// (`physical & 0x7F`). Bank-0 SFRs (`0x00..=0x1F`) and the common GPR
-/// block (`0x70..=0x7F`) need no banking; a high-bank SFR (the 887's
-/// `0x188` ANSEL) is banked like a GPR. Literal-immediate ops are skipped.
+/// (`physical & 0x7F`). The core registers mirrored into every bank and the
+/// common GPR block (`0x70..=0x7F`) need no banking; a non-mirrored bank-0
+/// SFR (PORTA 0x05) is banked like bank-0 GPR and a high-bank SFR (the
+/// 887's `0x188` ANSEL) is banked like a GPR. Literal-immediate ops are
+/// skipped.
 ///
 /// The tracked bank is reset to UNKNOWN at every label (a branch target — the
 /// runtime bank can arrive there from any arm, so the linear predecessor's
@@ -97,8 +99,9 @@ fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
 }
 
 /// The bank a file-register operand selects, or `None` when the operand is
-/// not a banked GPR (SFR/common/literal). The operand token is the first
-/// after the mnemonic, with any trailing comma/semicolon stripped.
+/// bank-independent (a mirrored SFR, common RAM, or a literal). The operand
+/// token is the first after the mnemonic, with any trailing
+/// comma/semicolon stripped.
 fn operand_bank(device: &Device, mne: &str, toks: &[&str]) -> Option<u8> {
     if LITERAL_OPS.contains(&mne) {
         return None;

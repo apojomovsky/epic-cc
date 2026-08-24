@@ -55,6 +55,13 @@ pub struct SfrField {
     pub mask: u8,
     pub shift: u8,
 }
+/// The PIC14 core registers mirrored into every bank (issue #112): only
+/// these may be accessed with any RP1:RP0 value. Every other bank-0 SFR
+/// (PORTA 0x05, TMR0 0x01, ...) exists solely in bank 0, so `bank_of`
+/// returns `Some(0)` for it and the banking pass emits a BANKSEL. Mid-range
+/// parts (877A, 887) share this map; TMR0 0x01 is deliberately absent
+/// (OPTION_REG occupies its slot in banks 1/3).
+const MIRRORED_SFRS: &[u16] = &[0x00, 0x02, 0x03, 0x04, 0x0A, 0x0B];
 include!(concat!(env!("OUT_DIR"), "/devices.rs"));
 
 /// Resolve a device by any spelling the toolchain ecosystem uses.
@@ -98,7 +105,7 @@ impl Device {
 
     /// The bank a physical file-register address selects: `Some(n)` when the
     /// address needs a `BANKSEL`, `None` when it does not (common RAM, and the
-    /// bank-0 SFRs below `gpr_start`).
+    /// PIC14 core registers mirrored into every bank).
     ///
     /// Panics on an address the allocator must never emit: a non-canonical
     /// alias of common RAM (`0xF0` is `0x70` seen from bank 1), or a gap on a
@@ -115,7 +122,15 @@ impl Device {
             }
         }
         if addr < self.gpr_start() {
-            return None; // SFR range, below the first GPR bank
+            // SFR range, below the first GPR bank. Only the six core
+            // registers are mirrored into every bank; any other bank-0 SFR
+            // (PORTA 0x05, TMR0 0x01, ...) exists solely in bank 0, so it
+            // needs RP1:RP0 = 0.
+            return if MIRRORED_SFRS.contains(&addr) {
+                None
+            } else {
+                Some(0)
+            };
         }
         match self.core {
             // PIC14 pages the 9-bit file-register address by its top two bits
