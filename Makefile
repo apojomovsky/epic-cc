@@ -106,9 +106,9 @@ check-warnings: image ## Fail if cargo build --workspace --all-targets emits any
 
 setup-hooks: ## Install git hooks (.githooks/ -> the repo's hooks dir)
 	@mkdir -p $$(git rev-parse --git-path hooks) \
-		&& cp .githooks/pre-commit .githooks/commit-msg $$(git rev-parse --git-path hooks)/ \
-		&& chmod +x $$(git rev-parse --git-path hooks)/pre-commit $$(git rev-parse --git-path hooks)/commit-msg
-	@echo "git hooks installed (pre-commit, commit-msg)"
+		&& cp .githooks/pre-commit .githooks/commit-msg .githooks/pre-push $$(git rev-parse --git-path hooks)/ \
+		&& chmod +x $$(git rev-parse --git-path hooks)/pre-commit $$(git rev-parse --git-path hooks)/commit-msg $$(git rev-parse --git-path hooks)/pre-push
+	@echo "git hooks installed (pre-commit, commit-msg, pre-push)"
 
 sanity: image ## Per-device lightweight: DEVICE=p16f877a (spec 2026-08-22 section 8)
 	@test -n "$(DEVICE)" || (echo "usage: make sanity DEVICE=<stem>  e.g. make sanity DEVICE=p16f887" >&2; exit 2)

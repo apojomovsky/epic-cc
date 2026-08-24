@@ -198,6 +198,11 @@ ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
 - **Panics are the error surface today.** Unsupported input aborts with
   a precise message; that is deliberate (correct over silent
   miscompile). Don't "fix" panics by emitting wrong code.
+- **No force pushes.** Rewriting a branch that already exists on the
+  remote drops it for every other agent and clone; the pre-push hook
+  refuses it. If the guard is triggered, rebase onto master and get
+  the human's explicit go-ahead before re-running with
+  `EPIC_FORCE_PUSH_APPROVED=1 git push --force-with-lease`.
 
 ## Expression conventions (comments and docs)
 

@@ -1,8 +1,53 @@
-#!/bin/sh
-# pre-push: run the exact CI locally before pushing.
-# This is the 1-to-1 reproduction for `epic-cc-ci:latest bash scripts/ci-test.sh`
-# that CI runs (see #99).  `cargo test -- --skip gpasm` is NOT the same — it
-# skips `pic14e_firewall` and other Docker-only checks.
-set -e
+#!/usr/bin/env bash
+# pre-push: reject force pushes, then run the exact CI locally.
+#
+# Force guard first (cheap, rejects before a long CI run). A push is a
+# force when the remote ref is not an ancestor of the local oid (a
+# non-fast-forward rewrite): it drops the current branch tip for every
+# other agent pulling that branch, and the old commits are only
+# recoverable from a reflog nobody is guaranteed to have. That must be
+# an explicit human decision, not a default: when a rewrite is genuinely
+# needed (messy history), get the human's go-ahead, then re-run with
+#   EPIC_FORCE_PUSH_APPROVED=1 git push --force-with-lease
+# New branches and branch deletions are not rewrites and always pass.
+#
+# Then the CI reproduction: `make ci-local` is the 1-to-1 reproduction
+# for `epic-cc-ci:latest bash scripts/ci-test.sh` that CI runs (see
+# #99). `cargo test -- --skip gpasm` is NOT the same, it skips
+# `pic14e_firewall` and other Docker-only checks.
+
+set -u
+
+# ---- force-push guard ----
+
+approved="${EPIC_FORCE_PUSH_APPROVED:-0}"
+force_refs=""
+
+while read -r local_ref local_oid remote_ref remote_oid; do
+    [ -z "$local_ref" ] && continue
+    # New branch (no remote counterpart) or a delete: not a rewrite.
+    [ "$remote_oid" = "0000000000000000000000000000000000000000" ] && continue
+    [ "$local_oid" = "0000000000000000000000000000000000000000" ] && continue
+    if ! git merge-base --is-ancestor "$remote_oid" "$local_oid" 2>/dev/null; then
+        force_refs="$force_refs $local_ref"
+    fi
+done
+
+if [ -n "$force_refs" ]; then
+    if [ "$approved" = "1" ]; then
+        echo "pre-push: force push approved for:$force_refs (EPIC_FORCE_PUSH_APPROVED=1)"
+    else
+        echo "pre-push: refusing force push of:$force_refs" >&2
+        echo "  A force push rewrites shared branch history and drops the current" >&2
+        echo "  branch commits for every other agent working this repo." >&2
+        echo "  If the rewrite is genuinely needed, get the human's explicit" >&2
+        echo "  go-ahead, then re-run with:" >&2
+        echo "    EPIC_FORCE_PUSH_APPROVED=1 git push --force-with-lease" >&2
+        exit 1
+    fi
+fi
+
+# --- local CI (only reached when the push is not refused) ------------
+
 echo "pre-push: make ci-local (docker epic-cc-ci bash scripts/ci-test.sh) — see #99"
 make ci-local
