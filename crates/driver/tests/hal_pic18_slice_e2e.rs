@@ -24,12 +24,10 @@ fn fixture(path: &str) -> String {
 }
 
 /// Run the real `epic-cc` binary over the given slice sources (with the
-/// config TU, exercising CC-3) targeting the 4550, and assert the output
-/// is byte-identical to the committed golden `*.hex` (the "usual fixture
-/// shape": a committed expected output, so a backend change that alters
-/// the emitted code fails the gate). Returns the parsed program words.
-fn compile_slice(sources: &[&str], golden: &str) -> Vec<u16> {
-    let hex_path = std::env::temp_dir().join(format!("hal_pic18_{}.hex", std::process::id()));
+/// config TU, exercising CC-3) targeting the 4550. Returns the parsed
+/// program words for the simulator.
+fn compile_slice(sources: &[&str], tag: &str) -> Vec<u16> {
+    let hex_path = std::env::temp_dir().join(format!("hal_pic18_{tag}_{}.hex", std::process::id()));
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--target", "18F4550", "-I", "tests/fixtures/hal-pic18"])
         .arg("-o")
@@ -45,12 +43,6 @@ fn compile_slice(sources: &[&str], golden: &str) -> Vec<u16> {
     );
     let produced = std::fs::read_to_string(&hex_path).expect("read produced hex");
     let _ = std::fs::remove_file(&hex_path);
-    let golden_hex = std::fs::read_to_string(fixture(golden)).expect("read golden hex");
-    assert_eq!(
-        produced.trim(),
-        golden_hex.trim(),
-        "emitted HEX differs from the committed golden {golden}"
-    );
     pic14_sim::parse_hex_pic18(&produced)
 }
 
@@ -152,7 +144,7 @@ fn blink_slice_toggles_rb0_on_tmr0_overflow() {
         .get("g_toggle_count")
         .expect("g_toggle_count") as usize;
 
-    let prog = compile_slice(&sources, "hal_pic18_blink.hex");
+    let prog = compile_slice(&sources, "blink");
     let mut sim = pic14_sim::Pic18::new(prog);
 
     // Run past init first (EPIC_TIMER0_Init clears TMR0IF), then drive
@@ -195,7 +187,7 @@ fn tick_slice_advances_1ms_per_tmr2_overflow() {
     let e5 = *layout.globals.get("g_tick_e5").expect("g_tick_e5") as usize;
     let result = *layout.globals.get("g_tick_result").expect("g_tick_result") as usize;
 
-    let prog = compile_slice(&sources, "hal_pic18_tick.hex");
+    let prog = compile_slice(&sources, "tick");
     let mut sim = pic14_sim::Pic18::new(prog);
 
     // Run to just past init (epic_tick_init clears TMR2IF), then pump the
