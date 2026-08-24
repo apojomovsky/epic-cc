@@ -84,6 +84,23 @@ local layer cache + a ccache cache mount locally. Because the base image and
 the LLVM tarball are digest-pinned, the clang layer is rebuilt only when the
 Dockerfile or a pin changes.
 
+## Cargo target cache is per worktree
+
+`CARGO_TARGET_DIR` points at `~/.cache/epic-cc/target-<worktree path with /
+replaced by ->`, so each worktree builds into its own cache. This is
+load-bearing: every docker invocation mounts its worktree at the identical
+in-container path (`/workspace`), and cargo fingerprints compilation units
+partly by absolute path, so a shared target dir lets cargo silently replay a
+different worktree's artifacts. `check-warnings` uses its own
+`target-warncheck-<same key>` dir for the same reason.
+
+Caches are never pruned automatically, and removing a worktree does not
+remove its cache (the caches live outside the repo). To reclaim the space of
+a removed worktree, delete the matching dirs under `~/.cache/epic-cc/`, whose
+names carry the worktree path with slashes replaced by dashes. Correctness
+first, disk second: a cold per-worktree build is the price of never replaying
+a sibling branch's bytes.
+
 ## XC8 is not a build dependency
 
 XC8 is a **test oracle only** ([`05-verification.md`](05-verification.md)). It
