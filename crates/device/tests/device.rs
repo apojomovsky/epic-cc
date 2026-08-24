@@ -33,8 +33,21 @@ fn bank_of_is_none_for_sfr_and_common_ram() {
 }
 
 #[test]
-fn bank_of_is_none_for_sfr_gap() {
-    assert_eq!(PIC16F877A.bank_of(0x180), None); // 0x180 is INDF in bank 3, an SFR below the 0x190 GPR start
+fn bank_of_banks_a_high_bank_sfr() {
+    // An SFR above the first GPR bank is paged by RP1:RP0 like a GPR is, so
+    // it needs a BANKSEL: the 887's ANSEL/ANSELH are the motivating case.
+    assert_eq!(PIC16F877A.bank_of(0x180), Some(3)); // INDF, bank 3
+    assert_eq!(PIC16F877A.bank_of(0x188), Some(3)); // ANSEL on the 887
+    assert_eq!(PIC16F877A.bank_of(0x85), Some(1)); // TRISA
+    assert_eq!(PIC16F877A.bank_of(0x10F), Some(2));
+}
+
+#[test]
+#[should_panic(expected = "0x0F0 aliases common RAM 0x70")]
+fn bank_of_panics_on_a_common_ram_alias() {
+    // 0xF0 is 0x70 seen from bank 1: common RAM has one canonical spelling
+    // and no stage may emit an alias of it.
+    PIC16F877A.bank_of(0xF0);
 }
 
 #[test]

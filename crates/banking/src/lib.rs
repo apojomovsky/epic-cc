@@ -4,8 +4,9 @@
 /// pass scans the assembly, infers each file-register operand's memory bank
 /// from its address, inserts a `BANKSEL` when the tracked current bank
 /// differs, and rewrites the operand to the 7-bit bank-relative address
-/// (`physical & 0x7F`). SFRs (`0x00..=0x1F`) and the common GPR block
-/// (`0x70..=0x7F`) need no banking. Literal-immediate ops are skipped.
+/// (`physical & 0x7F`). Bank-0 SFRs (`0x00..=0x1F`) and the common GPR
+/// block (`0x70..=0x7F`) need no banking; a high-bank SFR (the 887's
+/// `0x188` ANSEL) is banked like a GPR. Literal-immediate ops are skipped.
 ///
 /// The tracked bank is reset to UNKNOWN at every label (a branch target — the
 /// runtime bank can arrive there from any arm, so the linear predecessor's
@@ -26,8 +27,9 @@
 ///
 /// # Panics
 ///
-/// `Device::bank_of` panics if any file-register operand lies in an
-/// SFR/unused range that must never be emitted as a GPR address.
+/// `Device::bank_of` panics if any file-register operand is a
+/// non-canonical alias of common RAM (`0xF0` is `0x70` seen from bank 1),
+/// which no stage may emit.
 use std::collections::{HashMap, HashSet};
 
 use device::Device;

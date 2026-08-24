@@ -553,7 +553,7 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
             Some(&v) => v,
             None => parse_num(t),
         };
-        assert!(v <= 0x1FF, "asm: file register 0x{v:03X} out of range");
+        assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
         v as u16 & 0x7F
     };
     // Destination bit for the two-operand file ops (`f, W` / `f, F`): W = 0,

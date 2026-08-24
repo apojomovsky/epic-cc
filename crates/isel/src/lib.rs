@@ -1733,15 +1733,12 @@ impl<'m> Gen<'m> {
         func: &str,
         args: &[ir::CallArg],
     ) {
-        let Some(callee) = self.m.funcs.iter().find(|f| f.name == func) else {
-            // Indirect call via function pointer (e.g. overflow callback).
-            // PIC14 has no indirect CALL, and the HAL's weak ISRs use a
-            // global function pointer that isel does not yet lower. For the
-            // 887 smoke the callback is not needed in the ISR (blinky polls
-            // or the dispatch is a no-op), so treat the indirect call as a
-            // NOP and keep the build green. Filed as a gap.
-            return;
-        };
+        let callee = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == func)
+            .unwrap_or_else(|| panic!("isel: call to unknown function @{func}"));
         for (i, arg) in args.iter().enumerate() {
             let pname = &callee.params[i].name;
             let pa = self.slot_addr(func, pname).direct();
@@ -1980,11 +1977,9 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
                     }
                 } else if l.ptr.starts_with("0x") {
-                    // A literal (SFR) pointer from `inttoptr`: the register
-                    // is bank-mirrored (SFR 0x00-0x1F) or common RAM
-                    // (0x70-0x7F): a direct MOVF with no FSR setup and no
-                    // BANKSEL. (A literal into a GPR window keeps the plain
-                    // direct access too; the banking pass handles it.)
+                    // A literal (SFR) pointer from `inttoptr`: a direct MOVF
+                    // with no FSR setup. The banking pass supplies whatever
+                    // BANKSEL the address turns out to need.
                     let base = literal_ptr_addr(&l.ptr);
                     for k in 0..l.ty.bytes() {
                         self.emit(format!("    MOVF 0x{:02X}, W", base + u16::from(k)));
@@ -2011,9 +2006,8 @@ impl<'m> Gen<'m> {
                     let dst = self.global_addr(g);
                     self.emit_move_val_to_slot(&s.val, s.ty, dst);
                 } else if s.ptr.starts_with("0x") {
-                    // A literal (SFR) pointer from `inttoptr`: a direct
-                    // MOVWF, no FSR setup, no BANKSEL (bank-mirrored SFR or
-                    // common RAM).
+                    // A literal (SFR) pointer from `inttoptr`: a direct MOVWF
+                    // with no FSR setup, banked by the banking pass.
                     let base = literal_ptr_addr(&s.ptr);
                     for k in 0..s.ty.bytes() {
                         self.emit_load_byte(&s.val, k);
@@ -2263,14 +2257,22 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Trunc(t) => {
+                // i1 and i8 are both one byte, so the byte widths alone do not
+                // separate `trunc i8 -> i1` (narrowing) from a widening trunc.
+                assert!(
+                    t.from.bytes() > t.to.bytes() || (t.to == Ty::I1 && t.from != Ty::I1),
+                    "isel: trunc must narrow"
+                );
                 let da = self.slot_addr(self.cur_func, &t.dst).direct();
                 for i in 0..t.to.bytes() {
-                    if i < t.from.bytes() {
-                        self.emit_load_byte(&t.val, i);
-                    } else {
-                        self.emit("    MOVLW 0x00".to_string());
-                    }
+                    self.emit_load_byte(&t.val, i);
                     self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                }
+                if t.to == Ty::I1 {
+                    // Every i1 consumer tests the whole byte for nonzero, so
+                    // the truncated-away bits have to go: 0x02 is false.
+                    self.emit("    MOVLW 0x01".to_string());
+                    self.emit(format!("    ANDWF 0x{da:02X}, F"));
                 }
             }
             Inst::Icmp(ic) => {
