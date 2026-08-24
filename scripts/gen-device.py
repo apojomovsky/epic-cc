@@ -85,6 +85,9 @@ def alias_value(field: str, value: str, stem: str) -> str:
             return "rc"
     return v
 
+# Which enum value a fuse defaults to when the user names none. This is
+# compiler policy, not device geometry: geometry has no defaults at all,
+# a source that does not state it makes the generator fail.
 SAFE_DEFAULTS = {
     "wdt": "off",
     "bor": "on",
@@ -246,22 +249,64 @@ def parse_cfgdata(cfg_path: pathlib.Path):
             continue
     return cwords
 
+EDC_ARCH_TO_CORE = {"16xxxx": "pic14", "16exxx": "pic14e", "18xxxx": "pic18"}
+INI_ARCH_TO_CORE = {"PIC14": "pic14", "PIC14E": "pic14e", "PIC16": "pic18"}
+
+
+class MissingFacts(Exception):
+    """Fields the source file does not state. Never defaulted: a fabricated
+    memory map carrying a real sha256 is worse than no generator at all."""
+
+
 def parse_edc(edc_path: pathlib.Path):
-    ns = {"edc": "http://crownking/edc"}
-    tree = ET.parse(edc_path)
-    root = tree.getroot()
-    hwstack = None
-    for mt in root.findall(".//edc:MemTraits", ns):
-        hwstack = mt.get(f"{{{ns['edc']}}}hwstackdepth")
-        if hwstack:
+    # Only what the XML actually states. An absent key stays absent so the
+    # caller can name it in the failure instead of substituting a number.
+    ns = "{http://crownking/edc}"
+    root = ET.parse(edc_path).getroot()
+    out = {}
+    arch = root.get(ns + "arch")
+    if arch and arch.lower() in EDC_ARCH_TO_CORE:
+        out["core"] = EDC_ARCH_TO_CORE[arch.lower()]
+    for mt in root.iter(ns + "MemTraits"):
+        hw = mt.get(ns + "hwstackdepth")
+        if hw:
+            out["hwstack"] = int(hw, 0)
             break
-    config_sectors = []
-    for sec in root.findall(".//edc:ConfigFuseSector", ns):
-        b = sec.get(f"{{{ns['edc']}}}beginaddr")
-        e = sec.get(f"{{{ns['edc']}}}endaddr")
+    code_end = 0
+    for cs in root.iter(ns + "CodeSector"):
+        end = cs.get(ns + "endaddr")
+        if end:
+            code_end = max(code_end, int(end, 0))
+    if code_end:
+        out["code_end"] = code_end
+    cfg = []
+    for sec in root.iter(ns + "ConfigFuseSector"):
+        b = sec.get(ns + "beginaddr")
+        e = sec.get(ns + "endaddr")
         if b and e:
-            config_sectors.append((int(b, 0), int(e, 0)))
-    return {"hwstack": hwstack, "config_sectors": config_sectors}
+            cfg.append((int(b, 0), int(e, 0)))
+    if cfg:
+        out["config_sectors"] = cfg
+    # EDC endaddr is exclusive. A GPR sector that another sector shadows is
+    # the bank-independent window; the shadows are mirrors, not extra storage.
+    sectors = []
+    shadowed = set()
+    for gs in root.iter(ns + "GPRDataSector"):
+        b = gs.get(ns + "beginaddr")
+        e = gs.get(ns + "endaddr")
+        if not (b and e):
+            continue
+        ref = gs.get(ns + "shadowidref")
+        if ref:
+            shadowed.add(ref)
+            continue
+        sectors.append((int(b, 0), int(e, 0) - 1, gs.get(ns + "regionid")))
+    if sectors:
+        out["ram_banks"] = sorted((lo, hi) for lo, hi, rid in sectors if rid not in shadowed)
+        common = sorted((lo, hi) for lo, hi, rid in sectors if rid in shadowed)
+        if common:
+            out["common_ram"] = common[0]
+    return out
 
 def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     ini_sections = parse_ini(ini_path) if ini_path and ini_path.exists() else {}
@@ -272,27 +317,87 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
             if k.upper() == suffix.upper():
                 sec = v
                 break
-    arch = sec.get("ARCH", "PIC14")
-    core = "pic14"
-    if arch.upper() == "PIC14":
-        core = "pic14"
-    elif arch.upper() == "PIC16":
-        core = "pic18"
-    elif arch.upper() in ("PIC14E", "PIC14E_ENHANCED"):
-        core = "pic14e"
-    else:
-        if stem.startswith("p18"):
-            core = "pic18"
-    romsize_s = sec.get("ROMSIZE", "2000")
-    flash_words = int(romsize_s, 16) if isinstance(romsize_s, str) else 8192
+    edc = parse_edc(edc_path) if edc_path and edc_path.exists() else {}
+    missing = []
+
+    def scalar(key):
+        v = sec.get(key)
+        if isinstance(v, list):
+            v = v[0]
+        return v.strip() if isinstance(v, str) and v.strip() else None
+
+    def pick(field, *candidates):
+        for c in candidates:
+            if c is not None:
+                return c
+        missing.append(field)
+        return None
+
+    # ini/cfgdata first, EDC second: the committed TOMLs were generated from
+    # the ini path, so it stays the primary and EDC fills what it omits.
+    arch = scalar("ARCH")
+    core = pick(
+        "core (ini ARCH or EDC edc:arch)",
+        INI_ARCH_TO_CORE.get(arch.upper()) if arch else None,
+        edc.get("core"),
+    )
+    romsize = scalar("ROMSIZE")
+    edc_words = None
+    if "code_end" in edc and core is not None:
+        # EDC states PIC18 program memory in bytes; flash_words counts words.
+        edc_words = edc["code_end"] // 2 if core == "pic18" else edc["code_end"]
+    flash_words = pick(
+        "flash_words (ini ROMSIZE or EDC CodeSector)",
+        int(romsize, 16) if romsize else None,
+        edc_words,
+    )
     if flash_words == 0:
-        flash_words = 8192
-    rambank_s = sec.get("RAMBANK", "20-7F,A0-EF,110-16F,190-1EF")
-    if isinstance(rambank_s, list):
-        rambank_s = rambank_s[0]
-    ram_banks = parse_rambank(rambank_s)
-    common_s = sec.get("COMMON", "70-7F")
-    common_ram = parse_common(common_s) if common_s else None
+        missing.append("flash_words (source states 0)")
+    # common_ram is read from whichever source supplied ram_banks, so a part
+    # with no shared window yields none instead of borrowing another part's.
+    rambank = scalar("RAMBANK")
+    common_ram = None
+    if rambank:
+        ram_banks = parse_rambank(rambank)
+        common = scalar("COMMON")
+        common_ram = parse_common(common) if common else None
+    elif "ram_banks" in edc:
+        ram_banks = edc["ram_banks"]
+        common_ram = edc.get("common_ram")
+    else:
+        missing.append("ram_banks (ini RAMBANK or EDC GPRDataSector)")
+        ram_banks = []
+    stack_s = scalar("STACKDEPTH")
+    stack_depth = pick(
+        "stack_depth (EDC MemTraits hwstackdepth or ini STACKDEPTH)",
+        edc.get("hwstack"),
+        int(stack_s, 0) if stack_s and re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", stack_s) else None,
+    )
+    cfg_cwords = []
+    if cfg_path and cfg_path.exists():
+        cwords_all = parse_cfgdata(cfg_path)
+        cfg_cwords = [c for c in cwords_all if c["name"].upper().startswith("CONFIG")]
+    cfg_span = None
+    if not cfg_cwords:
+        cfg_range = scalar("CONFIG")
+        if cfg_range:
+            lo_s, _, hi_s = cfg_range.partition("-")
+            cfg_span = (int(lo_s, 16), int(hi_s, 16) if hi_s else int(lo_s, 16))
+        elif edc.get("config_sectors"):
+            lo = min(b for b, _ in edc["config_sectors"])
+            cfg_span = (lo, max(e for _, e in edc["config_sectors"]) - 1)
+        else:
+            missing.append("config words (cfgdata, ini CONFIG or EDC ConfigFuseSector)")
+    if missing:
+        raise MissingFacts(missing)
+    if cfg_span is not None:
+        # No per-fuse table, so only the word range is known. The erased value
+        # is a core fact (PIC14 words read all ones in 14 bits), not per-part.
+        erased_word = 0xFF if core == "pic18" else 0x3FFF
+        cfg_cwords = [
+            {"addr": a, "mask": erased_word, "default": erased_word, "name": "CONFIG", "settings": []}
+            for a in range(cfg_span[0], cfg_span[1] + 1)
+        ]
     if common_ram:
         canonical_lo, canonical_hi = common_ram
         adjusted = []
@@ -309,43 +414,13 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
             else:
                 adjusted.append((lo, hi))
         ram_banks = adjusted
-    stack_s = sec.get("STACKDEPTH", "8")
-    if isinstance(stack_s, list):
-        stack_s = stack_s[0]
-    try:
-        stack_depth = int(stack_s, 0)
-    except:
-        stack_depth = 8
-    if edc_path and edc_path.exists():
-        edc = parse_edc(edc_path)
-        if edc.get("hwstack"):
-            stack_depth = int(edc["hwstack"], 0)
     if core == "pic18":
         interrupt_vectors = [0x0008, 0x0018]
     else:
         interrupt_vectors = [0x0004]
-    cfg_cwords = []
-    if cfg_path and cfg_path.exists():
-        cwords_all = parse_cfgdata(cfg_path)
-        cfg_cwords = [c for c in cwords_all if c["name"].upper().startswith("CONFIG")]
-    else:
-        cfg_range_s = sec.get("CONFIG", "2007-2007")
-        if isinstance(cfg_range_s, list):
-            cfg_range_s = cfg_range_s[0]
-        if "-" in cfg_range_s:
-            lo_s, hi_s = cfg_range_s.split("-", 1)
-            lo = int(lo_s, 16)
-            hi = int(hi_s, 16)
-        else:
-            lo = hi = int(cfg_range_s, 16)
-        cfg_cwords = [{"addr": lo, "mask": 0x3FFF, "default": 0x3FFF, "name": "CONFIG", "settings": []}]
-    if not cfg_cwords:
-        base_word = 0x2007
-        num_words = 1
-    else:
-        cfg_cwords.sort(key=lambda c: c["addr"])
-        base_word = cfg_cwords[0]["addr"]
-        num_words = cfg_cwords[-1]["addr"] - base_word + 1
+    cfg_cwords.sort(key=lambda c: c["addr"])
+    base_word = cfg_cwords[0]["addr"]
+    num_words = cfg_cwords[-1]["addr"] - base_word + 1
     base_byte_addr = base_word * 2
     num_bytes = num_words * 2
     erased = []
@@ -412,8 +487,6 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     out_lines.append(f'ram_banks = [{banks_str}]')
     if common_ram:
         out_lines.append(f'common_ram = [0x{common_ram[0]:04X}, 0x{common_ram[1]:04X}]')
-    else:
-        out_lines.append(f'common_ram = null')
     out_lines.append(f'stack_depth = {stack_depth}')
     vectors_str = ", ".join(f"0x{v:04X}" for v in interrupt_vectors)
     out_lines.append(f'interrupt_vectors = [{vectors_str}]')
@@ -487,10 +560,6 @@ def main():
     else:
         edc = find_edc_pic(stem)
         ini, cfg = find_ini_and_cfgdata(stem)
-    if not ini or not ini.exists():
-        print(f"gen-device: warning: ini not found for {stem}, using defaults", file=sys.stderr)
-    if not cfg or not cfg.exists():
-        print(f"gen-device: warning: cfgdata not found for {stem}, config will be minimal", file=sys.stderr)
     if (not edc or not edc.exists()) and (not ini or not ini.exists()) and (not cfg or not cfg.exists()):
         print(f"gen-device: no DFP source found for {stem}", file=sys.stderr)
         print("  Fetch the Microchip DFP pack:", file=sys.stderr)
@@ -499,7 +568,16 @@ def main():
         print("  The .atdf/.PIC itself is not committed; only the generated TOML is.", file=sys.stderr)
         print("  Alternatively pass --atdf /path/to/PIC16F887.PIC", file=sys.stderr)
         sys.exit(2)
-    toml_content = generate_toml(stem, ini, cfg, edc)
+    try:
+        toml_content = generate_toml(stem, ini, cfg, edc)
+    except MissingFacts as e:
+        # Refusing beats guessing: a TOML the generator invented would still
+        # carry a real sha256 and read as attested. See ADR-021.
+        print(f"gen-device: {stem}: source does not supply:", file=sys.stderr)
+        for field in e.args[0]:
+            print(f"  - {field}", file=sys.stderr)
+        print(f"  sources read: edc={edc} ini={ini} cfgdata={cfg}", file=sys.stderr)
+        sys.exit(3)
     out_path = args.out
     if not out_path:
         out_path = pathlib.Path(f"crates/device/devices/{stem}.toml")

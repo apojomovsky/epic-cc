@@ -2,9 +2,25 @@
   Hand-authored fixture, not a Microchip file. Describes an imaginary
   tiny PIC14 part invented only to exercise gen-device.py; no real
   silicon has these numbers. Microchip's ATDF/EDC files are licensed
-  and are never committed to this repo.
+  and are never committed to this repo. Every field the generator
+  needs is stated here, because a field it cannot read is a hard error.
 -->
-<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN01">
-  <edc:MemTraits edc:hwstackdepth="0x8"/>
-  <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2007"/>
+<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN01" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x100">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x20" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x20" edc:endaddr="0x70" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="common" edc:beginaddr="0x70" edc:endaddr="0x80" edc:bank="0"/>
+      <edc:SFRDataSector edc:beginaddr="0x80" edc:endaddr="0xA0" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:beginaddr="0xA0" edc:endaddr="0xF0" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="commonmirror" edc:shadowidref="common" edc:beginaddr="0xF0" edc:endaddr="0x100" edc:bank="1"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
 </edc:PIC>
