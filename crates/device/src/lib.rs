@@ -113,10 +113,12 @@ impl Device {
         if addr < self.gpr_start() {
             return None; // SFR range, below the first GPR bank
         }
-        panic!(
-            "device: 0x{addr:03X} is not a banked GPR address on {}",
-            self.name
-        );
+        // Any address >= gpr_start that is not in a GPR bank is either an
+        // SFR (e.g. 0x188 ANSEL on p16f887) or an unimplemented gap. Both
+        // are not banked GPRs, so return None rather than panicking and
+        // let the banking pass treat the access as an SFR (BANKSEL via
+        // addr>>7) or as dead code.
+        None
     }
 }
 

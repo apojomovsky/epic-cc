@@ -33,9 +33,8 @@ fn bank_of_is_none_for_sfr_and_common_ram() {
 }
 
 #[test]
-#[should_panic(expected = "0x180")]
-fn bank_of_panics_on_an_unimplemented_gap() {
-    PIC16F877A.bank_of(0x180); // bank 3 SFRs, below the 0x190 GPR start
+fn bank_of_is_none_for_sfr_gap() {
+    assert_eq!(PIC16F877A.bank_of(0x180), None); // 0x180 is INDF in bank 3, an SFR below the 0x190 GPR start
 }
 
 #[test]

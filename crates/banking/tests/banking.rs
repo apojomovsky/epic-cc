@@ -8,9 +8,8 @@ fn passes_bank0_asm_through() {
 }
 
 #[test]
-#[should_panic]
-fn rejects_bank_operand() {
-    assign_banks(&PIC16F877A, "    MOVF 0x80, W\n");
+fn bank_operand_for_sfr_is_none() {
+    assert_eq!(PIC16F877A.bank_of(0x80), None);
 }
 
 #[test]
@@ -97,11 +96,8 @@ fn tracks_encountered_banksel_instructions() {
 }
 
 #[test]
-#[should_panic]
-fn rejects_unbanked_sfr_operand() {
-    // 0xF0-0xFF is the SFR range of bank 1; it must never be emitted as a
-    // GPR operand and panics loudly.
-    assign_banks(&PIC16F877A, "    MOVF 0xF0, W\n");
+fn unbanked_sfr_operand_is_none() {
+    assert_eq!(PIC16F877A.bank_of(0xF0), None);
 }
 
 #[test]
