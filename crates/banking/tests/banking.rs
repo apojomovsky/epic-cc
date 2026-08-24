@@ -59,6 +59,38 @@ fn common_and_sfr_operands_need_no_banksel() {
 }
 
 #[test]
+fn banks_a_non_mirrored_bank0_sfr_after_a_banked_operand() {
+    // Issue #112: a bank-0 SFR (PORTA 0x05) is not mirrored into the other
+    // banks, so after a bank-1 operand the pass must select bank 0 before
+    // the store, or the write lands on the bank-1 SFR at the same offset
+    // (TRISA 0x85) instead of PORTA.
+    let asm = "    MOVWF 0x85\n    MOVWF 0x05\n";
+    let expected = "    BSF STATUS, 5\n    MOVWF 0x05\n    BCF STATUS, 5\n    MOVWF 0x05\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn mirrored_sfr_operands_need_no_banksel() {
+    // STATUS (0x03) is one of the six core registers mirrored into every
+    // bank: it never needs a BANKSEL even after a banked operand.
+    let asm = "    MOVWF 0x85\n    MOVWF 0x03\n";
+    let expected = "    BSF STATUS, 5\n    MOVWF 0x05\n    MOVWF 0x03\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn bank0_sfr_under_a_skip_forks_like_a_banked_operand() {
+    // A bank-0 SFR operand under a skip-sensitive test is conditional: the
+    // skip-taken path keeps the caller's bank (1), the not-taken path pins
+    // bank 0, so the callee's exit bank is not provable and the caller gets
+    // a full reset. The bank-0 SFR (0x05) behaves exactly like a banked GPR
+    // in the fork analysis (issue #6 shape).
+    let asm = "    MOVF 0xA5, W\n    CALL helper\n    MOVF 0x85, W\nhelper:\n    BTFSC STATUS, 2\n    MOVF 0x05, W\n    RETURN\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x25, W\n    CALL helper\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x05, W\nhelper:\n    BTFSC STATUS, 2\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x05, W\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
 fn no_redundant_banksel_within_same_bank() {
     // Two bank-1 operands in a row share one BANKSEL.
     let asm = "    MOVF 0xA0, W\n    MOVWF 0xE5\n";

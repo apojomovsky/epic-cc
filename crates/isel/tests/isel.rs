@@ -6756,13 +6756,15 @@ fn literal_ptr_load_emits_direct_movf() {
 }
 
 #[test]
-fn banking_leaves_sfr_and_isr_save_area_untouched() {
-    // SFRs (0x00-0x1F) and the common GPR block (0x70-0x7F) need no
-    // banking: the literal-pointer accesses and the ISR save area must pass
-    // through `assign_banks` unchanged — no BANKSEL inserted for them, no
-    // operand rewritten. (Bank-0 body operands DO get a full BANKSEL after
-    // each label — that is correct: the interrupted program's bank is
-    // unknown at an ISR entry.)
+fn banking_selects_bank0_for_sfr_and_leaves_save_area_untouched() {
+    // The common GPR block (0x70-0x7F) and the mirrored core registers need
+    // no banking; a non-mirrored bank-0 SFR (PORTB 0x06) is reachable only
+    // with RP1:RP0 = 0, so the pass selects bank 0 before it when the bank
+    // is unknown or differs. The ISR save area must pass through
+    // `assign_banks` unchanged — no BANKSEL inserted for it, no operand
+    // rewritten. (Bank-0 body operands get a full BANKSEL after each label
+    // too — the interrupted program's bank is unknown at an ISR entry, and
+    // the SFR store rides on the body's select.)
     let m = parse(
         "global in i8\nglobal out i8\n\
          fn isr(void) [isr] ()\n  block entry:\n    %v = load i8 @in\n    store i8 %v 0x06\n    ret void\n\
@@ -6776,17 +6778,19 @@ fn banking_leaves_sfr_and_isr_save_area_untouched() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     let banked = banking::assign_banks(&device::PIC16F877A, &asm);
-    // The SFR store follows the value load directly — no BANKSEL can be
-    // inserted between them (0x06 is an SFR, never banked).
+    // The SFR store follows the value load directly: the body's banked
+    // operand already selected bank 0, so no BANKSEL is inserted between
+    // the load and the store.
     assert!(
         banked.contains("    MOVF 0x25, W\n    MOVWF 0x06"),
         "SFR store is direct with no BANKSEL:\n{banked}"
     );
-    // The SFR load is the first instruction after main's label — a banked
-    // operand would get a full BANKSEL there; an SFR gets none.
+    // The SFR load is the first instruction after main's label — the bank
+    // is unknown there, so the bank-0 SFR gets a full bank-0 select (issue
+    // #112: without it the load would read the bank-1 SFR at 0x86).
     assert!(
-        banked.contains("main:\n    MOVF 0x06, W"),
-        "SFR load is direct with no BANKSEL:\n{banked}"
+        banked.contains("main:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x06, W"),
+        "SFR load gets a bank-0 select at the label:\n{banked}"
     );
     // The save area (common RAM 0x75-0x7D, scratch included) passes
     // through untouched.
