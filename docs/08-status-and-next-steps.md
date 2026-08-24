@@ -3,7 +3,7 @@
 **Start here if you are resuming cold.** This is the current-state map; the detailed
 designs and their ADRs are the source of truth.
 
-Last updated: 2026-08-22
+Last updated: 2026-08-24
 
 ---
 
@@ -29,6 +29,16 @@ now contains a complete compiler, not just documentation:
   32-bit `long` with hardware `MULWF` ([ADR-014](adr/ADR-014-pic18-hw-arithmetic-routines.md)),
   soft-float ([ADR-015](adr/ADR-015-pic18-softfloat.md)),
   and a device-threaded differential fuzz gate ([ADR-016](adr/ADR-016-pic18-fuzz-gate.md)).
+- **Device registry:** file-per-device TOML under `crates/device/devices/` with
+  `build.rs` codegen and a `--target` flag ([ADR-019](adr/ADR-019-pic-variants-device-registry.md)),
+  holding `p16f877a`, `p16f887` and `p18f4550`. A DFP to TOML generator ingests Microchip
+  ATDF ([ADR-020](adr/ADR-020-dfp-toml-generator.md)), a provenance stanza records where
+  each field came from, and an always-on gputils cross-check catches drift against the
+  oracle ([ADR-021](adr/ADR-021-device-provenance-and-cross-check.md)). Device names
+  resolve in every spelling the toolchain uses, so no caller keeps a mapping table. CI is
+  stratified into a canonical job per core plus a lightweight per-device job, and a
+  `hal-887` job builds epic-hal's 887 firmware inside an epic-cc job so a compiler change
+  cannot silently break the HAL.
 - **Multi-TU and distribution:** `llvm-link` merge and `epic-cc` binary naming per
   [ADR-011](adr/ADR-011-multi-tu-front-end.md); silicon-real codegen (`EPIC_AT`,
   `EPIC_CONFIG`, `EPIC_FOSC_HZ`) per [ADR-012](adr/ADR-012-cc3-silicon-real-codegen.md);
@@ -36,7 +46,9 @@ now contains a complete compiler, not just documentation:
   inline assembly (rungs 1-4) per [ADR-017](adr/ADR-017-cc4-inline-assembly.md).
   Public binary distribution is designed in [`30-distribution-design.md`](30-distribution-design.md);
   ecosystem integration (epic-cc as the default toolchain for epic-hal, PlatformIO)
-  is designed in [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md).
+  is designed in [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md),
+  whose section 6 is the current state of that effort: CC-1 through CC-5 landed, HAL-1 and
+  HAL-2 landed, HAL-3 decomposed into clusters, and parity amended to three families.
 
 What used to live in this document, the phasing table, the "never presented" sections,
 and the open-questions list, is superseded by [`12-backend-design.md`](12-backend-design.md)
