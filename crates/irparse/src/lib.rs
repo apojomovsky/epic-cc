@@ -1542,9 +1542,9 @@ pub fn parse_ll(src: &str) -> Module {
         if line.is_empty() || line.starts_with(';') || line.starts_with('!') {
             continue;
         }
-        // Module-level inline assembly: `module asm "..."` — decode LLVM
-        // escapes and split on embedded ` A` (newline) so a single
-        // concatenated `module asm "a Ab"` becomes two entries. Multiple
+        // Module-level inline assembly (`module asm "..."`): decode LLVM
+        // escapes and split on embedded `\0A` (newline) so a single
+        // concatenated `module asm "a\0Ab"` becomes two entries. Multiple
         // `module asm` lines are kept order-preserving.
         if line.starts_with("module asm") {
             if let Some((inner_raw, _)) = extract_first_quoted(line) {
