@@ -107,6 +107,11 @@ pub struct Select {
     pub ty: Ty,
     pub a: Val,
     pub b: Val,
+    /// True for a pointer-typed select (`select i1 c, ptr a, ptr b`): the
+    /// result is a pointer VALUE, folded by iselcore like a GEP and emitted
+    /// by neither backend (lowered at each load/store use). False for value
+    /// selects (i1/i8/i16/f32), which both backends lower as a copy.
+    pub ptr: bool,
 }
 /// A call argument. `ty` is `None` for pointer (`ptr`) args (byval/sret),
 /// `Some` for scalar args. `byval`/`sret` are the phase-3 call ABI flags.
@@ -551,15 +556,27 @@ fn inst_str(i: &Inst) -> String {
             val_str(&i.a),
             val_str(&i.b)
         ),
-        Inst::Select(s) => format!(
-            "%{} = select i1 {} {} {} {} {}",
-            s.dst,
-            val_str(&s.cond),
-            ty_str(s.ty),
-            val_str(&s.a),
-            ty_str(s.ty),
-            val_str(&s.b)
-        ),
+        Inst::Select(s) => {
+            if s.ptr {
+                format!(
+                    "%{} = select i1 {} ptr {} ptr {}",
+                    s.dst,
+                    val_str(&s.cond),
+                    val_str(&s.a),
+                    val_str(&s.b)
+                )
+            } else {
+                format!(
+                    "%{} = select i1 {} {} {} {} {}",
+                    s.dst,
+                    val_str(&s.cond),
+                    ty_str(s.ty),
+                    val_str(&s.a),
+                    ty_str(s.ty),
+                    val_str(&s.b)
+                )
+            }
+        }
         Inst::Call(c) => match (&c.ty, &c.dst) {
             (Some(t), Some(d)) => format!(
                 "%{d} = call {} @{}({})",
@@ -1247,19 +1264,34 @@ fn parse_inst(line: &str) -> Inst {
             "select must be '%d = select i1 <cond> <t> <a> <t> <b>'"
         );
         let cond = parse_val(it.next().unwrap());
-        let t = parse_ty(it.next().unwrap());
+        let t = it.next().unwrap();
+        if t == "ptr" {
+            let a = parse_val(it.next().unwrap());
+            assert_eq!(it.next().unwrap(), "ptr", "select ptr arm type");
+            let b = parse_val(it.next().unwrap());
+            return Inst::Select(Select {
+                dst,
+                cond,
+                ty: Ty::I16,
+                a,
+                b,
+                ptr: true,
+            });
+        }
+        let ty = parse_ty(t);
         let a = parse_val(it.next().unwrap());
         let t2 = parse_ty(it.next().unwrap());
-        if t != t2 {
-            panic!("select operand type mismatch {:?} vs {:?}", t, t2);
+        if ty != t2 {
+            panic!("select operand type mismatch {ty:?} vs {t2:?}");
         }
         let b = parse_val(it.next().unwrap());
         return Inst::Select(Select {
             dst,
             cond,
-            ty: t,
+            ty,
             a,
             b,
+            ptr: false,
         });
     }
     if let Some(rest) = body.strip_prefix("phi ") {

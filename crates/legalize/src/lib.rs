@@ -44,8 +44,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ir::{
-    Alloca, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Icmp, Inst, Module, Param, Ty,
-    Val,
+    Alloca, Bin, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Icmp, Inst,
+    Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
 };
 
 pub fn legalize(m: Module) -> Module {
@@ -54,6 +54,7 @@ pub fn legalize(m: Module) -> Module {
     // The runtime routines split after it (`split_isr_routines`), because
     // the loop is what creates their calls.
     let m = duplicate_isr_shared(m);
+    let m = sink_ptr_select_funcs(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
     // Fresh SSA names for the fcmp materialization intermediates (the call
@@ -118,6 +119,278 @@ pub fn legalize(m: Module) -> Module {
         globals: m.globals,
         funcs,
         module_asm: m.module_asm,
+    }
+}
+
+/// A pointer-returning function whose body is a pure chain of cond/gep
+/// defs ending in a pointer select cannot lower through a CALL boundary:
+/// iselcore folds pointer SELECTs and GEPs inside the caller, but a pointer
+/// VALUE returned from a call has no foldable base in the caller (the
+/// callee's registers are private). Sink such a function into its call
+/// sites: each `%r = call @f(args)` is replaced by a cloned copy of the
+/// body's value-producing instructions (cond defs and the select), with
+/// the callee's params substituted by the caller's args and the select's
+/// dst renamed to the call's dst. The function is then removed when no
+/// callers remain. A non-sinkable body keeps the loud iselcore panic.
+fn sink_ptr_select_funcs(m: Module) -> Module {
+    let mut sinkable: HashMap<String, Vec<Inst>> = HashMap::new();
+    for f in &m.funcs {
+        if f.ret != Some(Ty::I16) || f.isr || f.naked || f.blocks.len() != 1 {
+            continue;
+        }
+        let insts = &f.blocks[0].insts;
+        let (Some(Inst::Ret(Some((Ty::I16, Val::Reg(ret_reg))))), rest) =
+            (insts.last(), &insts[..insts.len().saturating_sub(1)])
+        else {
+            continue;
+        };
+        // The final def is either a pointer select over constant arms or a
+        // plain GEP (the `return &addrs[inst]` shape, whose runtime term the
+        // caller must carry). Both are pointer VALUES the caller can fold.
+        let final_dst = match rest.last() {
+            Some(Inst::Select(s)) if s.ptr && s.dst == *ret_reg => Some(s.dst.clone()),
+            Some(Inst::Gep(g)) if g.dst == *ret_reg => Some(g.dst.clone()),
+            _ => None,
+        };
+        let Some(_) = final_dst else {
+            continue;
+        };
+        let body = &rest[..rest.len()];
+        let defined: HashSet<&str> = body.iter().filter_map(inst_dst).collect();
+        let mut ok = true;
+        for inst in body {
+            for reg in inst_regs(inst) {
+                if !f.params.iter().any(|p| p.name == reg) && !defined.contains(reg.as_str()) {
+                    ok = false;
+                }
+            }
+        }
+        if ok {
+            sinkable.insert(f.name.clone(), body.to_vec());
+        }
+    }
+    if sinkable.is_empty() {
+        return m;
+    }
+    // Param-name lists of the sinkable funcs, captured before `m.funcs` is
+    // consumed by the caller rewrite loop below.
+    let sink_params: HashMap<String, Vec<String>> = m
+        .funcs
+        .iter()
+        .filter(|f| sinkable.contains_key(&f.name))
+        .map(|f| {
+            (
+                f.name.clone(),
+                f.params.iter().map(|p| p.name.clone()).collect(),
+            )
+        })
+        .collect();
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for mut f in m.funcs {
+        let mut used_names: HashSet<String> = HashSet::new();
+        for p in &f.params {
+            used_names.insert(p.name.clone());
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Some(d) = inst_dst(inst) {
+                    used_names.insert(d.to_string());
+                }
+            }
+        }
+        let mut fresh = FreshNames {
+            used: used_names,
+            next: 0,
+        };
+        let mut blocks = Vec::with_capacity(f.blocks.len());
+        for b in f.blocks {
+            let mut insts = Vec::with_capacity(b.insts.len());
+            for inst in b.insts {
+                if let Inst::Call(c) = &inst {
+                    if let Some(body) = sinkable.get(&c.func) {
+                        if c.dst.is_some() && c.ty == Some(Ty::I16) {
+                            let mut subst: HashMap<String, Val> = HashMap::new();
+                            if let Some(pnames) = sink_params.get(&c.func) {
+                                for (i, p) in pnames.iter().enumerate() {
+                                    if let Some(a) = c.args.get(i) {
+                                        subst.insert(p.clone(), a.val.clone());
+                                    }
+                                }
+                            }
+                            let call_dst = c.dst.clone().unwrap();
+                            // Every body dst gets a fresh name (params were
+                            // substituted above), so clones at different call
+                            // sites never collide; the final select's dst
+                            // becomes the call's dst.
+                            let mut rename_map: HashMap<String, String> = HashMap::new();
+                            for binst in body {
+                                if let Some(d) = inst_dst(binst) {
+                                    rename_map.insert(d.to_string(), fresh.fresh());
+                                }
+                            }
+                            let mut cloned = Vec::with_capacity(body.len());
+                            for binst in body {
+                                cloned.push(substitute_regs(binst, &subst, &rename_map));
+                            }
+                            // The final def (select or gep) becomes the call's
+                            // dst.
+                            match cloned.last_mut() {
+                                Some(Inst::Select(s)) => s.dst = call_dst,
+                                Some(Inst::Gep(g)) => g.dst = call_dst,
+                                _ => {}
+                            }
+                            insts.extend(cloned);
+                            continue;
+                        }
+                    }
+                }
+                insts.push(inst);
+            }
+            blocks.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        f.blocks = blocks;
+        funcs.push(f);
+    }
+    let calls: HashSet<String> = funcs
+        .iter()
+        .flat_map(|f| f.blocks.iter())
+        .flat_map(|b| b.insts.iter())
+        .filter_map(|i| match i {
+            Inst::Call(c) => Some(c.func.clone()),
+            _ => None,
+        })
+        .collect();
+    funcs.retain(|f| !sinkable.contains_key(&f.name) || calls.contains(&f.name));
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
+}
+
+fn inst_regs(inst: &Inst) -> Vec<String> {
+    let mut regs = Vec::new();
+    let mut push = |v: &Val| {
+        if let Val::Reg(r) = v {
+            regs.push(r.clone());
+        }
+    };
+    match inst {
+        Inst::Bin(b) => {
+            push(&b.a);
+            push(&b.b);
+        }
+        Inst::Icmp(c) => {
+            push(&c.a);
+            push(&c.b);
+        }
+        Inst::Select(s) => {
+            push(&s.a);
+            push(&s.b);
+        }
+        Inst::Zext(z) => push(&z.val),
+        Inst::Sext(x) => push(&x.val),
+        Inst::Trunc(t) => push(&t.val),
+        Inst::Gep(g) => {
+            if let GepBase::Reg(r) = &g.base {
+                regs.push(r.clone());
+            }
+            for (_, t) in &g.terms {
+                regs.push(t.clone());
+            }
+        }
+        _ => {}
+    }
+    regs
+}
+
+fn substitute_regs(
+    inst: &Inst,
+    subst: &HashMap<String, Val>,
+    rename: &HashMap<String, String>,
+) -> Inst {
+    let sub = |v: &Val| -> Val {
+        match v {
+            Val::Reg(r) => {
+                if let Some(n) = rename.get(r) {
+                    Val::Reg(n.clone())
+                } else {
+                    subst.get(r).cloned().unwrap_or_else(|| Val::Reg(r.clone()))
+                }
+            }
+            _ => v.clone(),
+        }
+    };
+    match inst {
+        Inst::Bin(b) => Inst::Bin(Bin {
+            dst: rename.get(&b.dst).cloned().unwrap_or_else(|| b.dst.clone()),
+            op: b.op,
+            ty: b.ty,
+            a: sub(&b.a),
+            b: sub(&b.b),
+        }),
+        Inst::Icmp(c) => Inst::Icmp(Icmp {
+            dst: rename.get(&c.dst).cloned().unwrap_or_else(|| c.dst.clone()),
+            pred: c.pred.clone(),
+            ty: c.ty,
+            a: sub(&c.a),
+            b: sub(&c.b),
+        }),
+        Inst::Select(s) => Inst::Select(Select {
+            dst: rename.get(&s.dst).cloned().unwrap_or_else(|| s.dst.clone()),
+            cond: sub(&s.cond),
+            ty: s.ty,
+            a: sub(&s.a),
+            b: sub(&s.b),
+            ptr: s.ptr,
+        }),
+        Inst::Zext(z) => Inst::Zext(Zext {
+            dst: rename.get(&z.dst).cloned().unwrap_or_else(|| z.dst.clone()),
+            from: z.from,
+            val: sub(&z.val),
+            to: z.to,
+        }),
+        Inst::Sext(x) => Inst::Sext(Sext {
+            dst: rename.get(&x.dst).cloned().unwrap_or_else(|| x.dst.clone()),
+            from: x.from,
+            val: sub(&x.val),
+            to: x.to,
+        }),
+        Inst::Trunc(t) => Inst::Trunc(Trunc {
+            dst: rename.get(&t.dst).cloned().unwrap_or_else(|| t.dst.clone()),
+            from: t.from,
+            val: sub(&t.val),
+            to: t.to,
+        }),
+        Inst::Gep(g) => {
+            let base = match &g.base {
+                GepBase::Global(n) => GepBase::Global(n.clone()),
+                GepBase::Reg(r) => match subst.get(r) {
+                    Some(Val::Reg(nr)) => GepBase::Reg(nr.clone()),
+                    Some(Val::Global(ng)) => GepBase::Global(ng.clone()),
+                    _ => GepBase::Reg(rename.get(r).cloned().unwrap_or_else(|| r.clone())),
+                },
+            };
+            let terms = g
+                .terms
+                .iter()
+                .map(|(sc, r)| match subst.get(r) {
+                    Some(Val::Reg(nr)) => (*sc, nr.clone()),
+                    Some(Val::Global(ng)) => (*sc, ng.clone()),
+                    _ => (*sc, rename.get(r).cloned().unwrap_or_else(|| r.clone())),
+                })
+                .collect();
+            Inst::Gep(Gep {
+                dst: rename.get(&g.dst).cloned().unwrap_or_else(|| g.dst.clone()),
+                base,
+                k: g.k,
+                terms,
+            })
+        }
+        other => other.clone(),
     }
 }
 
@@ -367,6 +640,7 @@ fn fcmp_tree(pred: &str, c: &str, dst: &str, names: &mut FreshNames) -> Vec<Inst
             ty: Ty::I1,
             a: Val::Const(1), // i1 true
             b: Val::Reg(t2),
+            ptr: false,
         }));
     }
     let mut out = Vec::new();
