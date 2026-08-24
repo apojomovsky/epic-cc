@@ -116,7 +116,7 @@ pub enum Base {
 /// adds, `terms` concatenate inner-first) until the chain bottoms out at a
 /// `Global` or a seed. A pointer select folds when both arms resolve to the
 /// same base with matching term sets: `select i1 c, base+kA, base+kB`
-/// (kA < kB) is `base + kA + (kB-kA)×c` — the cond reg becomes a scale-1
+/// (kA < kB) is `base + kA + (kB-kA)×c`: the cond reg becomes a scale-1
 /// term, its 0/1 polarity picking the low arm. A `Gep` whose base is
 /// neither a seed nor another (eventually resolvable) `Gep`/select is a bug
 /// in an earlier stage and panics loudly, as does a select whose arms do
