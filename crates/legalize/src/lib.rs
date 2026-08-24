@@ -55,6 +55,7 @@ pub fn legalize(m: Module) -> Module {
     // the loop is what creates their calls.
     let m = duplicate_isr_shared(m);
     let m = sink_ptr_select_funcs(m);
+    let m = normalize_ptr_selects(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
     // Fresh SSA names for the fcmp materialization intermediates (the call
@@ -121,6 +122,95 @@ pub fn legalize(m: Module) -> Module {
         module_asm: m.module_asm,
     }
 }
+/// Normalize pointer selects to the canonical `true->hi` order so
+/// `iselcore::fold_select` always sees a small positive scale. A select
+/// `c ? lo : hi` (true->low) is rewritten as `c_inv = xor c,1; select
+/// c_inv, hi, lo` which is `c_inv ? hi : lo` and folds to `lo + (hi-lo)*c_inv`
+/// with the same small scale. `inttoptr` arms are not pointer selects
+/// (they stay value selects) and are left alone; only `ptr` selects are
+/// normalized. This keeps the `256-d` wrapped encoding out of the common
+/// path and preserves the small `d` isel fast path.
+fn normalize_ptr_selects(m: Module) -> Module {
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for mut f in m.funcs {
+        // Map of Gep dst -> k for this function, to decide arm order without
+        // needing iselcore's resolved map.
+        let mut gep_k: HashMap<String, u8> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Gep(g) = inst {
+                    gep_k.insert(g.dst.clone(), g.k);
+                }
+            }
+        }
+        let mut used: HashSet<String> = HashSet::new();
+        for p in &f.params {
+            used.insert(p.name.clone());
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Some(d) = inst_dst(inst) {
+                    used.insert(d.to_string());
+                }
+            }
+        }
+        let mut fresh = FreshNames { used, next: 0 };
+        let mut blocks = Vec::with_capacity(f.blocks.len());
+        for b in f.blocks {
+            let mut insts: Vec<Inst> = Vec::with_capacity(b.insts.len() + 2);
+            for inst in b.insts {
+                if let Inst::Select(s) = &inst {
+                    if s.ptr {
+                        let ka = match &s.a {
+                            Val::Global(_) => Some(0u8),
+                            Val::Reg(r) => gep_k.get(r).copied(),
+                            _ => None,
+                        };
+                        let kb = match &s.b {
+                            Val::Global(_) => Some(0u8),
+                            Val::Reg(r) => gep_k.get(r).copied(),
+                            _ => None,
+                        };
+                        if let (Some(ka), Some(kb)) = (ka, kb) {
+                            if ka < kb {
+                                // true->low: need to complement cond and swap arms.
+                                let inv = fresh.fresh();
+                                insts.push(Inst::Bin(Bin {
+                                    dst: inv.clone(),
+                                    op: BinOp::Xor,
+                                    ty: Ty::I1,
+                                    a: s.cond.clone(),
+                                    b: Val::Const(1),
+                                }));
+                                insts.push(Inst::Select(Select {
+                                    dst: s.dst.clone(),
+                                    cond: Val::Reg(inv),
+                                    ty: s.ty,
+                                    a: s.b.clone(),
+                                    b: s.a.clone(),
+                                    ptr: true,
+                                }));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                insts.push(inst);
+            }
+            blocks.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        f.blocks = blocks;
+        funcs.push(f);
+    }
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
+}
 
 /// A pointer-returning function whose body is a pure chain of cond/gep
 /// defs ending in a pointer select cannot lower through a CALL boundary:
@@ -159,6 +249,22 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
         let defined: HashSet<&str> = body.iter().filter_map(inst_dst).collect();
         let mut ok = true;
         for inst in body {
+            // Only a pure chain of cond/gep defs ending in a pointer select
+            // is sinkable. Any call, load, store, or other side effect would
+            // be duplicated at each call site and must keep the loud panic.
+            match inst {
+                Inst::Icmp(_)
+                | Inst::Gep(_)
+                | Inst::Select(_)
+                | Inst::Zext(_)
+                | Inst::Sext(_)
+                | Inst::Trunc(_)
+                | Inst::Bin(_) => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
+            }
             for reg in inst_regs(inst) {
                 if !f.params.iter().any(|p| p.name == reg) && !defined.contains(reg.as_str()) {
                     ok = false;
@@ -288,6 +394,7 @@ fn inst_regs(inst: &Inst) -> Vec<String> {
             push(&c.b);
         }
         Inst::Select(s) => {
+            push(&s.cond);
             push(&s.a);
             push(&s.b);
         }

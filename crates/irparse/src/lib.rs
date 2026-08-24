@@ -2470,8 +2470,12 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             // A pointer-typed select is a pointer VALUE only when BOTH arms
             // are compile-time pointer constants (an inlined `getelementptr`
             // or a bare `@global`): iselcore folds those into the resolved
-            // map. A select with a runtime reg arm (`%p`) is a plain 2-byte
-            // value select, copied like any i16.
+            // map. `inttoptr` arms (SFR constants like `inttoptr i16 11 to
+            // ptr`) are intentionally left as value selects; they are 2-byte
+            // address copies, not folds into a const table base, and the
+            // `EPIC_IRQ_ClearFlag` select of two `inttoptr` SFRs is tracked
+            // as a later wall. A select with a runtime reg arm (`%p`) is a
+            // plain 2-byte value select, copied like any i16.
             let arm_is_const_ptr = |p: &str| -> bool {
                 let toks: Vec<&str> = p.trim().split_whitespace().collect();
                 let mut i = 0;

@@ -114,14 +114,18 @@ pub enum Base {
 /// with no offset), then a fixpoint scan over every `Gep` and pointer
 /// select: a `GepBase::Reg` folds in its own already-resolved entry (`k`
 /// adds, `terms` concatenate inner-first) until the chain bottoms out at a
-/// `Global` or a seed. A pointer select folds when both arms resolve to the
-/// same base with matching term sets: `select i1 c, base+kA, base+kB`
-/// (kA < kB) is `base + kA + (kB-kA)×c`: the cond reg becomes a scale-1
-/// term, its 0/1 polarity picking the low arm. A `Gep` whose base is
-/// neither a seed nor another (eventually resolvable) `Gep`/select is a bug
-/// in an earlier stage and panics loudly, as does a select whose arms do
-/// not fold to a common base; a scan that makes no progress with unresolved
-/// entries left is a cycle and panics loudly.
+/// `Global` or a seed. A pointer select folds as `select c, a, b` where
+/// `c ? a : b` with `a = base+ka` and `b = base+kb` becomes
+/// `base + kb + (ka - kb)*c` (wrapping `u8` difference, so `c=0` picks `b`
+/// and `c=1` picks `a`). When `ka > kb` the scale is small (`ka-kb`); when
+/// `ka < kb` it wraps to `256-(kb-ka)` and the backend emits the complement
+/// efficiently. `legalize` normalizes the common `true->hi` shape to the
+/// small scale, but `iselcore` is correct for either order without
+/// normalization. A `Gep` whose base is neither a seed nor another
+/// (eventually resolvable) `Gep`/select is a bug in an earlier stage and
+/// panics loudly, as does a select whose arms do not fold to a common base;
+/// a scan that makes no progress with unresolved entries left is a cycle and
+/// panics loudly.
 pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, String)>)> {
     let mut geps: HashMap<String, ir::Gep> = HashMap::new();
     let mut selects: HashMap<String, ir::Select> = HashMap::new();
@@ -247,11 +251,14 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
     resolved
 }
 
-/// Fold a pointer-typed select whose two arms resolve to the same base with
-/// identical term sets: `select i1 c, base+kA, base+kB` becomes
-/// `(base, min(kA,kB), terms + (|kA-kB|, c))`. The cond's 0/1 polarity picks
-/// the arm, so no inversion is needed. Returns `None` when the arms do not
-/// fold to a common base, the term sets differ, or the cond is not a reg.
+/// Fold a pointer-typed select `select i1 c, ptr a, ptr b` (`c ? a : b`)
+/// where `a = base+ka` and `b = base+kb` with identical term sets. The
+/// result is `base + kb + (ka - kb)*c` (wrapping `u8`), so `c=0` yields `b`
+/// and `c=1` yields `a`. When `ka > kb` the scale is `ka-kb` (small,
+/// canonical `true->hi` shape); when `ka < kb` it wraps to `256-(kb-ka)` and
+/// isel emits the complement as `lo + (kb-ka)*(1-c)` to keep code size
+/// small. Returns `None` when the arms do not fold to a common base, the
+/// term sets differ, or the cond is not a reg.
 fn fold_select(
     s: &ir::Select,
     resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
@@ -269,17 +276,18 @@ fn fold_select(
     if va.0 != vb.0 || va.2 != vb.2 {
         return None;
     }
-    let (lo, hi) = (va.1.min(vb.1), va.1.max(vb.1));
-    let d = hi - lo;
     let c = match &s.cond {
         ir::Val::Reg(c) => c.clone(),
         _ => return None,
     };
-    if d == 0 {
+    let ka = va.1;
+    let kb = vb.1;
+    if ka == kb {
         // Both arms are the same pointer: the select is a no-op.
-        return Some((va.0.clone(), lo, va.2.clone()));
+        return Some((va.0.clone(), ka, va.2.clone()));
     }
-    let mut terms = va.2.clone();
+    let d = ka.wrapping_sub(kb);
+    let mut terms = vb.2.clone();
     terms.push((d, c));
-    Some((va.0.clone(), lo, terms))
+    Some((vb.0.clone(), kb, terms))
 }

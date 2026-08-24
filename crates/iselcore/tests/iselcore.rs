@@ -87,8 +87,12 @@ fn folds_a_pointer_select_over_a_const_base() {
 
 #[test]
 fn folds_a_pointer_select_with_arm_order_swapped() {
-    // `select i1 %c, ptr @addrs, ptr @addrs+4` (the real HAL emits the
-    // offset on the TRUE arm): folds to the same (base, 0, [(4, c)]).
+    // `select i1 %c, ptr @addrs, ptr @addrs+4` is `c ? 0 : 4` (true->low):
+    // iselcore encodes as `base+kb + (ka-kb)*c` with wrapping `u8`, so
+    // `kb=4` and `d = 0-4 = 252` (i.e. `4 + 252*c` wraps to `0` when `c=1`).
+    // The common `true->hi` shape (`select c, +4, 0`) stays `0 + 4*c`; the
+    // swapped shape is correct but large-scale, and `legalize` normalizes it
+    // to the small scale in the pipeline.
     let m = parse(
         "global addrs i8\n\
          fn main() ()\n\
@@ -100,8 +104,8 @@ fn folds_a_pointer_select_with_arm_order_swapped() {
     let r = resolve_pointers(&m);
     let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
     assert!(matches!(base, Base::Global(n) if n == "addrs"));
-    assert_eq!(*k, 0);
-    assert_eq!(terms, &[(4u8, "c".to_string())]);
+    assert_eq!(*k, 4);
+    assert_eq!(terms, &[(252u8, "c".to_string())]);
 }
 
 #[test]
