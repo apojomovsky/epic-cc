@@ -1777,3 +1777,64 @@ define dso_local noundef ptr @memcpy(ptr noundef returned writeonly %0, ptr noca
         }
     }
 }
+
+#[test]
+fn pointer_select_preserves_inlined_gep_offsets() {
+    // The ccp_sel shape: a ptr select over an inlined GEP (offset 4) and a
+    // bare global. The offset must survive as a materialized Gep inst, and
+    // the select must be flagged pointer-typed.
+    let text = r#"
+@addrs = dso_local constant [8 x i8] zeroinitializer, align 1
+define dso_local ptr @ccp_sel(i8 %0) {
+  %2 = icmp eq i8 %0, 1
+  %3 = select i1 %2, ptr getelementptr inbounds nuw (i8, ptr @addrs, i16 4), ptr @addrs
+  ret ptr %3
+}
+"#;
+    let m = parse_ll(text);
+    let f = m
+        .funcs
+        .iter()
+        .find(|f| f.name == "ccp_sel")
+        .expect("ccp_sel parsed");
+    let mut saw_gep = false;
+    let mut saw_select = false;
+    for i in &f.blocks[0].insts {
+        match i {
+            Inst::Gep(g) => {
+                assert_eq!(g.k, 4, "inlined select-arm GEP must keep its offset");
+                assert!(matches!(&g.base, GepBase::Global(n) if n == "addrs"));
+                saw_gep = true;
+            }
+            Inst::Select(s) => {
+                assert!(s.ptr, "ptr select must be flagged");
+                assert_eq!(s.ty, ir::Ty::I16);
+                saw_select = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_gep, "the inlined GEP arm must be materialized");
+    assert!(saw_select, "the select must parse");
+}
+
+#[test]
+fn reg_arm_pointer_select_stays_a_value_select() {
+    // A ptr select over runtime regs (e.g. strrchr's loop select) is a
+    // 2-byte value select, not a pointer fold: no synthesized gep, ptr=false.
+    let text = r#"
+define dso_local ptr @f(ptr %0, ptr %1, i1 %c) {
+  %3 = select i1 %c, ptr %0, ptr %1
+  ret ptr %3
+}
+"#;
+    let m = parse_ll(text);
+    let f = m.funcs.iter().find(|f| f.name == "f").expect("f found");
+    match &f.blocks[0].insts[0] {
+        Inst::Select(s) => {
+            assert!(!s.ptr, "reg-arm ptr select stays a value select");
+            assert_eq!(s.ty, ir::Ty::I16);
+        }
+        other => panic!("expected Select, got {other:?}"),
+    }
+}
