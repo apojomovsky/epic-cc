@@ -25,7 +25,6 @@ force_refs=""
 
 while read -r local_ref local_oid remote_ref remote_oid; do
     [ -z "$local_ref" ] && continue
-    # New branch (no remote counterpart) or a delete: not a rewrite.
     [ "$remote_oid" = "0000000000000000000000000000000000000000" ] && continue
     [ "$local_oid" = "0000000000000000000000000000000000000000" ] && continue
     if ! git merge-base --is-ancestor "$remote_oid" "$local_oid" 2>/dev/null; then
