@@ -110,6 +110,9 @@ Branch names are conventional: `feat/<description>`, `fix/<description>`,
 `chore/<description>`, `docs/<description>`. The worktree keeps your
 master checkout clean and lets several tasks run in parallel without
 touching each other's trees. Squash merging keeps master plan-free.
+The default base is the latest `origin/master`; branching off a different
+branch is the exception, reserved for multi-step work other tasks build on
+in parallel.
 
 Worktree discipline is enforced by the takeoff ritual (`epic-tasks takeoff`
 checks you are in a `.worktrees/` worktree and not on `master`).
