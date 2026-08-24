@@ -25,11 +25,13 @@ digest-pinned source tarball.
 
 ## Build & toolchain
 
-Everything runs inside the docker dev image. **No rustup, clang, or
-gpasm on the host; never install them.** The `ci` Dockerfile stage is an
-empty alias of `dev` (identical filesystem), so running locally in the
-dev image IS running in the ci image. There is no separate local ci
-image and no reason to build one.
+First-time setup: `make bootstrap` (checks host deps, installs git
+hooks, builds the dev image; `make doctor` reports what is missing
+without changing anything). Everything runs inside the docker dev
+image. **No rustup, clang, or gpasm on the host; never install them.**
+The `ci` Dockerfile stage is an empty alias of `dev` (identical
+filesystem), so running locally in the dev image IS running in the ci
+image. There is no separate local ci image and no reason to build one.
 
 ```bash
 make image          # build the dev image (slow first time: compiles clang)
