@@ -16,17 +16,18 @@
 LOCAL_IMAGE := epic-cc-dev:local
 CACHE_DIR   := $(HOME)/.cache/epic-cc
 CARGO_HOME_CACHE := $(CACHE_DIR)/cargo-home
-TARGET_CACHE := $(CACHE_DIR)/target
+
+# Every docker invocation mounts its worktree at the identical in-container
+# path (/workspace), so a shared target dir lets cargo silently replay a
+# DIFFERENT worktree's cached artifacts here: fingerprints key on the
+# absolute path, which is constant across worktrees. One target dir per
+# worktree (WT_KEY) restores the distinction. check-warnings used to be the
+# only target isolated this way; now every target is.
+WT_KEY := $(subst /,-,$(CURDIR))
+TARGET_CACHE := $(CACHE_DIR)/target$(WT_KEY)
+WARNCHECK_TARGET_CACHE := $(CACHE_DIR)/target-warncheck$(WT_KEY)
 FILE        ?= crates/driver/tests/fixtures/add.c
 TARGET      ?= p16f877a
-
-# check-warnings uses its own target dir, not the shared TARGET_CACHE:
-# every docker invocation mounts its worktree at the identical
-# in-container path (/workspace), so a shared target dir lets cargo
-# silently replay a DIFFERENT worktree's cached warnings here. A hard
-# gate on stale output is worse than a slow one.
-WT_KEY := $(subst /,-,$(CURDIR))
-WARNCHECK_TARGET_CACHE := $(CACHE_DIR)/target-warncheck$(WT_KEY)
 
 DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
 	--user $$(id -u):$$(id -g) \
