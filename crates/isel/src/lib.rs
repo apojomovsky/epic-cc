@@ -2319,7 +2319,14 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Select(s) => {
-                self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
+                if s.ptr {
+                    // A pointer-typed select is a pointer VALUE, folded by
+                    // iselcore into the resolved map like a GEP: it emits
+                    // nothing and every load/store/memcpy through it lowers
+                    // via the fold (mirror of Inst::Gep below).
+                } else {
+                    self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
+                }
             }
             Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args),
             Inst::Asm(a) => {

@@ -97,27 +97,34 @@ pub fn parse_map(text: &str) -> HashMap<String, u16> {
 /// has been folded away: a named global, or a local slot (an alloca's own
 /// buffer, or a byval/sret param, where the `bool` is `true` for sret, meaning
 /// the slot holds a target ADDRESS rather than being the object itself).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Base {
     Global(String),
     Slot(String, bool),
 }
 
-/// Fold every `Inst::Gep` in `m` to `(base, k, terms)`: `base` is where the
-/// chain ultimately starts, `k` is the constant byte offset, `terms` is
-/// `Vec<(scale, reg)>` for every dynamic (register-indexed) offset in the
-/// chain, inner-to-outer. Keyed `{func}::{reg}` via `ssa_key`, matching
-/// every other per-function map in this pipeline.
+/// Fold every `Inst::Gep` and pointer-typed `Inst::Select` in `m` to
+/// `(base, k, terms)`: `base` is where the chain ultimately starts, `k` is
+/// the constant byte offset, `terms` is `Vec<(scale, reg)>` for every
+/// dynamic (register-indexed) offset in the chain, inner-to-outer. Keyed
+/// `{func}::{reg}` via `ssa_key`, matching every other per-function map in
+/// this pipeline.
 ///
 /// Seeds first (byval/sret params, allocas, each its own `Base::Slot`
-/// with no offset), then a fixpoint scan over every `Gep`: a `GepBase::Reg`
-/// folds in its own already-resolved entry (`k` adds, `terms` concatenate
-/// inner-first) until the chain bottoms out at a `Global` or a seed. A
-/// `Gep` whose base is neither a seed nor another (eventually resolvable)
-/// `Gep` is a bug in an earlier stage and panics loudly; a scan that makes
-/// no progress with unresolved geps left is a cycle and panics loudly.
+/// with no offset), then a fixpoint scan over every `Gep` and pointer
+/// select: a `GepBase::Reg` folds in its own already-resolved entry (`k`
+/// adds, `terms` concatenate inner-first) until the chain bottoms out at a
+/// `Global` or a seed. A pointer select folds when both arms resolve to the
+/// same base with matching term sets: `select i1 c, base+kA, base+kB`
+/// (kA < kB) is `base + kA + (kB-kA)×c`: the cond reg becomes a scale-1
+/// term, its 0/1 polarity picking the low arm. A `Gep` whose base is
+/// neither a seed nor another (eventually resolvable) `Gep`/select is a bug
+/// in an earlier stage and panics loudly, as does a select whose arms do
+/// not fold to a common base; a scan that makes no progress with unresolved
+/// entries left is a cycle and panics loudly.
 pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, String)>)> {
     let mut geps: HashMap<String, ir::Gep> = HashMap::new();
+    let mut selects: HashMap<String, ir::Select> = HashMap::new();
     let mut resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
     for f in &m.funcs {
         for p in &f.params {
@@ -150,6 +157,9 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                             (Base::Slot(a.dst.clone(), false), 0, Vec::new()),
                         );
                     }
+                    Inst::Select(s) if s.ptr => {
+                        selects.insert(ssa_key(&f.name, &s.dst), s.clone());
+                    }
                     _ => {}
                 }
             }
@@ -161,6 +171,11 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
             .iter()
             .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
             .map(|(k, g)| (k.clone(), g.clone()))
+            .collect();
+        let mut pending_selects: Vec<(String, ir::Select)> = selects
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
+            .map(|(k, s)| (k.clone(), s.clone()))
             .collect();
         let mut progressed = true;
         while progressed {
@@ -190,7 +205,7 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                             });
                             resolved.insert(key, (b, k, terms));
                             progressed = true;
-                        } else if geps.contains_key(&rkey) {
+                        } else if geps.contains_key(&rkey) || selects.contains_key(&rkey) {
                             rest.push((key, g));
                         } else {
                             panic!("iselcore: no gep for pointer %{r} (chain base missing, key {rkey})");
@@ -199,11 +214,72 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                 }
             }
             pending = rest;
-            if !progressed && !pending.is_empty() {
-                let names: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
-                panic!("iselcore: cyclic gep chain involving {names:?}");
+            // Pointer-select pass: fold a select whose arms resolve to the
+            // same base with matching term sets. The cond reg becomes a
+            // scale-1 term, so `select c, base+kA, base+kB` (kA < kB) is
+            // `base + kA + (kB-kA)×c`: c = 0 picks kA, c = 1 adds the
+            // difference. The scale is the difference of two u8 offsets, so
+            // it always fits. Arms that do not fold (different bases, term
+            // mismatches, non-reg cond) stay pending and panic below.
+            let mut rest_selects = Vec::new();
+            for (key, s) in pending_selects {
+                if let Some(folded) = fold_select(&s, &resolved, &fname) {
+                    assert!(
+                        !resolved.contains_key(&key),
+                        "iselcore: duplicate definition of pointer reg {key}"
+                    );
+                    resolved.insert(key, folded);
+                    progressed = true;
+                } else {
+                    rest_selects.push((key, s));
+                }
+            }
+            pending_selects = rest_selects;
+            if !progressed && (!pending.is_empty() || !pending_selects.is_empty()) {
+                let gnames: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
+                let snames: Vec<&str> = pending_selects.iter().map(|(k, _)| k.as_str()).collect();
+                panic!(
+                    "iselcore: cyclic or unresolvable pointer chain (geps {gnames:?}, selects {snames:?})"
+                );
             }
         }
     }
     resolved
+}
+
+/// Fold a pointer-typed select whose two arms resolve to the same base with
+/// identical term sets: `select i1 c, base+kA, base+kB` becomes
+/// `(base, min(kA,kB), terms + (|kA-kB|, c))`. The cond's 0/1 polarity picks
+/// the arm, so no inversion is needed. Returns `None` when the arms do not
+/// fold to a common base, the term sets differ, or the cond is not a reg.
+fn fold_select(
+    s: &ir::Select,
+    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    fname: &str,
+) -> Option<(Base, u8, Vec<(u8, String)>)> {
+    let arm = |v: &ir::Val| -> Option<(Base, u8, Vec<(u8, String)>)> {
+        match v {
+            ir::Val::Reg(r) => resolved.get(&ssa_key(fname, r)).cloned(),
+            ir::Val::Global(g) => Some((Base::Global(g.clone()), 0, Vec::new())),
+            _ => None,
+        }
+    };
+    let va = arm(&s.a)?;
+    let vb = arm(&s.b)?;
+    if va.0 != vb.0 || va.2 != vb.2 {
+        return None;
+    }
+    let (lo, hi) = (va.1.min(vb.1), va.1.max(vb.1));
+    let d = hi - lo;
+    let c = match &s.cond {
+        ir::Val::Reg(c) => c.clone(),
+        _ => return None,
+    };
+    if d == 0 {
+        // Both arms are the same pointer: the select is a no-op.
+        return Some((va.0.clone(), lo, va.2.clone()));
+    }
+    let mut terms = va.2.clone();
+    terms.push((d, c));
+    Some((va.0.clone(), lo, terms))
 }

@@ -1073,6 +1073,61 @@ fn parse_call_ptr_val(
     }
 }
 
+/// Parse one select arm: a plain typed value (`i16 6`, `i8 %r`), an
+/// `inttoptr` constant pointer, or an inlined `getelementptr` (materialized
+/// as a fresh Gep inst so its byte offset survives; the old parse extracted
+/// only the base global and silently read the wrong element). Returns the
+/// arm's `Val`.
+fn parse_select_arm(
+    part: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+) -> Val {
+    let part = part.trim();
+    if part.contains("inttoptr") {
+        let start = part.find("inttoptr").unwrap();
+        let inttoptr_part = &part[start + "inttoptr".len()..];
+        let after = inttoptr_part
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let mut it = after.split_whitespace();
+        let _ty = it.next();
+        let val_str = it
+            .next()
+            .unwrap_or_else(|| panic!("irparse: malformed inttoptr in select {part:?}"));
+        if val_str.starts_with('%') {
+            Val::Reg(val_str[1..].to_string())
+        } else if val_str.starts_with('@') {
+            Val::Global(val_str[1..].to_string())
+        } else {
+            Val::Const(
+                val_str
+                    .parse::<i64>()
+                    .unwrap_or_else(|_| panic!("irparse: inttoptr address not constant {part:?}")),
+            )
+        }
+    } else if part.contains("getelementptr") {
+        let gpos = part.find("getelementptr").unwrap();
+        let gsrc = &part[gpos + "getelementptr".len()..];
+        let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
+        let n = fresh.reg();
+        out.push(Inst::Gep(Gep {
+            dst: n.clone(),
+            base,
+            k,
+            terms,
+        }));
+        Val::Reg(n)
+    } else {
+        let mut it = part.split_whitespace();
+        let ty = ty_of(it.next().unwrap());
+        parse_val_typed(it.next().unwrap(), Some(ty))
+    }
+}
+
 /// Parse a load/store pointer operand (`ptr @g`, `ptr %r`, an inlined GEP
 /// that gets materialized as a fresh Gep inst, or an `inttoptr (<ty> <k> to
 /// ptr)` constant pointer). Returns `"@name"`, `"%name"`, or the literal ptr
@@ -2412,77 +2467,29 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let body = rest["select".len()..].trim();
             let parts = split_top_level(body, ',');
             let cond = parse_val(parts[0].split_whitespace().nth(1).unwrap());
-            let mut it1 = parts[1].split_whitespace();
-            let ty = ty_of(it1.next().unwrap());
-            let a = if parts[1].contains("inttoptr") {
-                let start = parts[1].find("inttoptr").unwrap();
-                let inttoptr_part = &parts[1][start + "inttoptr".len()..];
-                let after = inttoptr_part
-                    .trim()
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .trim();
-                let mut it = after.split_whitespace();
-                let _ty = it.next();
-                let val_str = it.next().unwrap_or_else(|| {
-                    panic!(
-                        "irparse: malformed inttoptr in select {parts_1:?}",
-                        parts_1 = parts[1]
-                    )
-                });
-                if val_str.starts_with('%') {
-                    Val::Reg(val_str[1..].to_string())
-                } else if val_str.starts_with('@') {
-                    Val::Global(val_str[1..].to_string())
-                } else {
-                    Val::Const(val_str.parse::<i64>().unwrap_or_else(|_| {
-                        panic!("irparse: inttoptr address not constant {val_str:?}")
-                    }))
+            // A pointer-typed select is a pointer VALUE only when BOTH arms
+            // are compile-time pointer constants (an inlined `getelementptr`
+            // or a bare `@global`): iselcore folds those into the resolved
+            // map. A select with a runtime reg arm (`%p`) is a plain 2-byte
+            // value select, copied like any i16.
+            let arm_is_const_ptr = |p: &str| -> bool {
+                let toks: Vec<&str> = p.trim().split_whitespace().collect();
+                let mut i = 0;
+                while i < toks.len() && toks[i] != "ptr" {
+                    i += 1;
                 }
-            } else if parts[1].contains("getelementptr") {
-                let at = parts[1].find('@').unwrap();
-                let after = &parts[1][at + 1..];
-                let end = after
-                    .find(|c| c == ',' || c == ')' || c == ' ' || c == ']')
-                    .unwrap_or(after.len());
-                Val::Global(after[..end].trim().to_string())
-            } else {
-                parse_val_typed(it1.next().unwrap(), Some(ty))
+                let Some(t) = toks.get(i + 1) else {
+                    return false;
+                };
+                t.starts_with('@') || t.starts_with("getelementptr")
             };
-            let b = if parts[2].contains("inttoptr") {
-                let start = parts[2].find("inttoptr").unwrap();
-                let inttoptr_part = &parts[2][start + "inttoptr".len()..];
-                let after = inttoptr_part
-                    .trim()
-                    .trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .trim();
-                let mut it = after.split_whitespace();
-                let _ty = it.next();
-                let val_str = it.next().unwrap_or_else(|| {
-                    panic!(
-                        "irparse: malformed inttoptr in select {parts_2:?}",
-                        parts_2 = parts[2]
-                    )
-                });
-                if val_str.starts_with('%') {
-                    Val::Reg(val_str[1..].to_string())
-                } else if val_str.starts_with('@') {
-                    Val::Global(val_str[1..].to_string())
-                } else {
-                    Val::Const(val_str.parse::<i64>().unwrap_or_else(|_| {
-                        panic!("irparse: inttoptr address not constant {val_str:?}")
-                    }))
-                }
-            } else if parts[2].contains("getelementptr") {
-                let at = parts[2].find('@').unwrap();
-                let after = &parts[2][at + 1..];
-                let end = after
-                    .find(|c| c == ',' || c == ')' || c == ' ' || c == ']')
-                    .unwrap_or(after.len());
-                Val::Global(after[..end].trim().to_string())
+            let ptr = arm_is_const_ptr(&parts[1]) && arm_is_const_ptr(&parts[2]);
+            let a = parse_select_arm(&parts[1], types, fresh, &mut out);
+            let b = parse_select_arm(&parts[2], types, fresh, &mut out);
+            let ty = if ptr {
+                Ty::I16
             } else {
-                parse_val_typed(parts[2].split_whitespace().nth(1).unwrap(), Some(ty))
+                ty_of(parts[1].split_whitespace().next().unwrap())
             };
             out.push(Inst::Select(Select {
                 dst: dst.unwrap(),
@@ -2490,6 +2497,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 ty,
                 a,
                 b,
+                ptr,
             }));
         }
         "add" | "and" | "or" | "xor" | "sub" | "mul" | "udiv" | "urem" | "sdiv" | "srem"

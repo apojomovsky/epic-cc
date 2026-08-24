@@ -926,3 +926,61 @@ fn leaves_an_out_of_range_shift_count_unfolded_for_isels_existing_poison_check()
         "must stay a Bin so isel's poison assert still fires\n---\n{text}"
     );
 }
+
+#[test]
+fn sinks_ptr_select_into_caller_and_drops_func() {
+    // ccp_sel's noinline shape: a pointer-returning function whose body is
+    // `icmp` + pointer select + ret. Legalize sinks it into the caller: the
+    // call disappears, the caller carries the select chain, and the callee
+    // is dropped (no callers remain).
+    let m = parse(
+        "global addrs i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @addrs\n\
+             %r = call i16 @ccp_sel(i8 %i)\n\
+             store i8 0, %r\n\
+             ret void\n\
+         fn ccp_sel(i16) (0=i8)\n\
+           block entry:\n\
+             %2 = icmp eq i8 %0, 1\n\
+             %g = gep @addrs +4\n\
+             %3 = select i1 %2, ptr %g, ptr @addrs\n\
+             ret i16 %3\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        !text.contains("@ccp_sel("),
+        "the sunk function must be dropped:\n{text}"
+    );
+    assert!(
+        !text.contains("call"),
+        "the caller's call must be replaced:\n{text}"
+    );
+    assert!(
+        text.contains("%r = select i1 %c0 ptr %c1 ptr @addrs"),
+        "the select chain must be in the caller:\n{text}"
+    );
+}
+
+#[test]
+fn keeps_a_non_sinkable_ptr_func() {
+    // A pointer-returning function with a body that is not a select of
+    // constant arms (here a ret of a plain param) is not sinkable; it stays
+    // in the module.
+    let m = parse(
+        "global addrs i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %r = call i16 @identity(@addrs)\n\
+             ret void\n\
+         fn identity(i16) (0=ptr)\n\
+           block entry:\n\
+             ret i16 %0\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@identity"),
+        "a non-sinkable pointer func must stay:\n{text}"
+    );
+}

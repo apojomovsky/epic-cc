@@ -672,6 +672,7 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         Inst::Sext(s) => Some((s.dst.clone(), s.to.bytes())),
         Inst::Trunc(t) => Some((t.dst.clone(), t.to.bytes())),
         Inst::Icmp(i) => Some((i.dst.clone(), 1)),
+        Inst::Select(s) if s.ptr => None,
         Inst::Select(s) => Some((s.dst.clone(), s.ty.bytes())),
         Inst::Call(c) => match (&c.dst, &c.ty) {
             (Some(d), Some(t)) => Some((d.clone(), t.bytes())),

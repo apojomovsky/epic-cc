@@ -66,3 +66,90 @@ fn seeds_alloca_and_byval_sret_params_as_slots() {
     );
     assert!(matches!(r.get("f::r"), Some((Base::Slot(n, true), 0, t)) if n == "r" && t.is_empty()));
 }
+#[test]
+fn folds_a_pointer_select_over_a_const_base() {
+    // `%s = select i1 %c, ptr @addrs+4, ptr @addrs` (the ccp_sel shape):
+    // the cond becomes a scale-4 term, the low offset 0 is the base k.
+    let m = parse(
+        "const addrs i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %g = gep @addrs +4\n\
+             %s = select i1 %c, ptr %g, ptr @addrs\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
+    assert!(matches!(base, Base::Global(n) if n == "addrs"));
+    assert_eq!(*k, 0);
+    assert_eq!(terms, &[(4u8, "c".to_string())]);
+}
+
+#[test]
+fn folds_a_pointer_select_with_arm_order_swapped() {
+    // `select i1 %c, ptr @addrs, ptr @addrs+4` (the real HAL emits the
+    // offset on the TRUE arm): folds to the same (base, 0, [(4, c)]).
+    let m = parse(
+        "global addrs i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %g = gep @addrs +4\n\
+             %s = select i1 %c, ptr @addrs, ptr %g\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
+    assert!(matches!(base, Base::Global(n) if n == "addrs"));
+    assert_eq!(*k, 0);
+    assert_eq!(terms, &[(4u8, "c".to_string())]);
+}
+
+#[test]
+fn folds_a_noop_pointer_select() {
+    // Both arms are the same pointer: the select is a no-op, no term.
+    let m = parse(
+        "global addrs i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %s = select i1 %c, ptr @addrs, ptr @addrs\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
+    assert!(matches!(base, Base::Global(n) if n == "addrs"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+}
+
+#[test]
+fn leaves_a_value_select_unresolved() {
+    // A select over runtime regs is a value select (2-byte pointer copy),
+    // never a pointer fold: it must not appear in the resolved map.
+    let m = parse(
+        "fn main() ()\n\
+           block entry:\n\
+             %s = select i1 %c, i16 %x, i16 %y\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    assert!(
+        !r.contains_key("main::s"),
+        "a value select must not be resolved as a pointer"
+    );
+}
+
+#[test]
+#[should_panic(expected = "cyclic or unresolvable pointer chain")]
+fn panics_on_a_pointer_select_with_distinct_bases() {
+    // Arms over different globals cannot fold to one base: loud panic,
+    // never a silent read from the wrong table.
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %s = select i1 %c, ptr @a, ptr @b\n\
+             ret void\n",
+    );
+    let _ = resolve_pointers(&m);
+}
