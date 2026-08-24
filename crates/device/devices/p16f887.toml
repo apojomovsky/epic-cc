@@ -113,3 +113,9 @@ mask = 0x06
 shift = 1
 default = "off"
 values = [{ name = "half", bits = 0 }, { name = "1fourth", bits = 1 }, { name = "256", bits = 2 }, { name = "off", bits = 3 }]
+
+[provenance]
+tier = "datasheet"
+document = "DS41291D"
+tables = ["TABLE 2-1: Register File Map"]
+ticket = "epic-cc#92"

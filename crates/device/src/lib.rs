@@ -8,6 +8,8 @@
 mod config;
 pub use config::resolve_config;
 
+pub mod gputils;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Core {
     Pic14,

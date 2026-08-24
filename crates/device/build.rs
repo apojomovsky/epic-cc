@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::{env, fs, path::Path};
 
+include!("provenance.rs");
+
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 struct DeviceToml {
@@ -96,6 +98,12 @@ fn main() {
         let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
         let content = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("device: cannot read {}: {e}", path.display()));
+        let raw: toml::Value = content
+            .parse()
+            .unwrap_or_else(|e| panic!("device: parse {}: {e}", path.display()));
+        if let Err(msg) = validate_provenance(path.file_name().unwrap().to_str().unwrap(), &raw) {
+            panic!("{msg}");
+        }
         let dev: DeviceToml = toml::from_str(&content)
             .unwrap_or_else(|e| panic!("device: parse {}: {e}", path.display()));
         // validation: file stem must match name

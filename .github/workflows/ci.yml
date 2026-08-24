@@ -93,7 +93,7 @@ jobs:
                 echo "DFP check failed for $stem with DFP present: failing"
                 exit $ec
               else
-                echo "DFP not installed on this runner, skipping strict check for $stem"
+                echo "::warning::DFP absent, ATDF check SKIPPED for $stem. The always-on gate is crates/device/tests/gputils_crosscheck.rs"
               fi
             }
           done

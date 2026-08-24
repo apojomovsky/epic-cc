@@ -36,3 +36,5 @@
 *.pic
 dfp/
 atdf/
+# Exception: hand-authored fixture describing no real silicon, not a vendor file.
+!scripts/fixtures/synthetic.atdf

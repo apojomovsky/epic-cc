@@ -59,6 +59,23 @@ The driver resolves clang from these env vars, or from the bundled `clang/`
 directory next to the executable in release bundles, or fails with a clean
 diagnostic (see `crates/driver/src/clang_discovery.rs`).
 
+## Environment variables the device data gate reads
+
+`crates/device/tests/gputils_crosscheck.rs` verifies every device TOML against
+gputils (ADR-021). It is the only oracle the device registry has, so running
+without it takes two variables, not one.
+
+| Variable | Meaning |
+|---|---|
+| `PIC8_GPUTILS_SHARE` | gputils data root, default `/usr/local/share/gputils` |
+| `PIC8_ALLOW_NO_GPUTILS` | acknowledges the data root is absent. On its own the gate still **fails** |
+| `PIC8_UNVERIFIED_DEVICE_DATA` | set to `i-accept-unverified-device-data`, and only with the variable above, to run with no device verification at all |
+
+Both are read only when the data root is genuinely missing, so setting them
+cannot switch off a gate that could have run. With both set the tests print a
+`DEVICE DATA UNVERIFIED` banner and verify nothing; `scripts/ci-test.sh` also
+records the disabled gate in the CI step summary.
+
 ## Caching
 
 The clang build is the only expensive layer (~1 h first build). It is cached
@@ -99,6 +116,13 @@ names via a small alias table (`FOSC` -> `osc`, `WDTE` -> `wdt`, `INTRC` ->
 `intosc`, etc.) documented in its header, and emits deterministically
 formatted TOML (fields sorted by `byte_offset`/`shift`, values by `bits`).
 See `docs/adr/ADR-020-dfp-toml-generator.md` and `scripts/gen-device.py --help`.
+
+`crates/device/provenance.rs` reaches the crate only via `include!`, never a
+`mod` declaration, so `cargo fmt` (and `make fmt`) never visits it. The
+pre-commit hook still catches drift, since it runs `rustfmt --check` on staged
+files directly rather than through `cargo fmt`. Run `rustfmt` on that file by
+hand after editing it.
+
 ## Release bundles
 
 Tag-triggered [`release.yml`](../.github/workflows/release.yml) builds the
