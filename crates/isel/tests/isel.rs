@@ -6761,9 +6761,9 @@ fn banking_selects_bank0_for_sfr_and_leaves_save_area_untouched() {
     // no banking; a non-mirrored bank-0 SFR (PORTB 0x06) is reachable only
     // with RP1:RP0 = 0, so the pass selects bank 0 before it when the bank
     // is unknown or differs. The ISR save area must pass through
-    // `assign_banks` unchanged — no BANKSEL inserted for it, no operand
+    // `assign_banks` unchanged: no BANKSEL inserted for it, no operand
     // rewritten. (Bank-0 body operands get a full BANKSEL after each label
-    // too — the interrupted program's bank is unknown at an ISR entry, and
+    // too: the interrupted program's bank is unknown at an ISR entry, and
     // the SFR store rides on the body's select.)
     let m = parse(
         "global in i8\nglobal out i8\n\
@@ -6785,7 +6785,7 @@ fn banking_selects_bank0_for_sfr_and_leaves_save_area_untouched() {
         banked.contains("    MOVF 0x25, W\n    MOVWF 0x06"),
         "SFR store is direct with no BANKSEL:\n{banked}"
     );
-    // The SFR load is the first instruction after main's label — the bank
+    // The SFR load is the first instruction after main's label: the bank
     // is unknown there, so the bank-0 SFR gets a full bank-0 select (issue
     // #112: without it the load would read the bank-1 SFR at 0x86).
     assert!(
