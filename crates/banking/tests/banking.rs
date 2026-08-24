@@ -8,9 +8,19 @@ fn passes_bank0_asm_through() {
 }
 
 #[test]
-#[should_panic]
-fn rejects_bank_operand() {
-    assign_banks(&PIC16F877A, "    MOVF 0x80, W\n");
+fn banks_a_high_bank_sfr_operand() {
+    let asm = "    MOVF 0x80, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x00, W\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn banks_the_887_ansel_operand() {
+    // 0x188 (ANSEL on the p16f887) is what made this pass necessary: without
+    // the BANKSEL the assembler's 7-bit mask lands the write on 0x08.
+    let asm = "    MOVWF 0x188\n";
+    let expected = "    BSF STATUS, 5\n    BSF STATUS, 6\n    MOVWF 0x08\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
 #[test]
@@ -98,9 +108,10 @@ fn tracks_encountered_banksel_instructions() {
 
 #[test]
 #[should_panic]
-fn rejects_unbanked_sfr_operand() {
-    // 0xF0-0xFF is the SFR range of bank 1; it must never be emitted as a
-    // GPR operand and panics loudly.
+fn rejects_common_ram_alias_operand() {
+    // 0xF0 is common RAM (0x70) seen from bank 1. The canonical spelling is
+    // the bank-0 one, so an alias means an upstream stage emitted a bad
+    // address and must abort, not silently hit the right register.
     assign_banks(&PIC16F877A, "    MOVF 0xF0, W\n");
 }
 

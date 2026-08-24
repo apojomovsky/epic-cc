@@ -6171,6 +6171,23 @@ fn zext_and_trunc_i32_simulate() {
 }
 
 #[test]
+fn trunc_to_i1_keeps_only_bit_0() {
+    // i1 is consumed as "the whole byte is nonzero", so a trunc to i1 has to
+    // drop the truncated-away bits: bit 0 of 0x02 is clear, so it is false.
+    let ir = "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %v = load i8 @in\n    %b = trunc i8 %v to i1\n    br i1 %b then else\n  block then:\n    store i8 1 @out\n    ret void\n  block else:\n    store i8 0 @out\n    ret void\n";
+    let map = vec![
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::v", 0x30),
+        ("main::b", 0x31),
+    ];
+    for (input, want) in [(0x02u8, 0x00u8), (0x03, 0x01), (0x01, 0x01), (0x00, 0x00)] {
+        let got = sim_run_bytes(ir, &str_map(&map), &[(0x20, input)], 0x21, 1);
+        assert_eq!(got[0], want, "trunc i8 0x{input:02X} to i1");
+    }
+}
+
+#[test]
 fn inline_i32_shifts_simulate() {
     // shl: 0x12345678 << 3 = 0x91A2B3C0.
     let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %s = shl i32 %a, 3\n    store i32 %s @out\n    ret void\n";

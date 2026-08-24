@@ -94,11 +94,13 @@ impl Device {
             .copied()
     }
 
-    /// The bank index of a physical GPR address: `Some(n)` for a banked GPR
-    /// address, `None` for an SFR or common-RAM address (neither needs a
-    /// `BANKSEL`). Panics for an address in neither category (an
-    /// unimplemented/reserved gap)  -  such an address must never reach the
-    /// banking pass.
+    /// The bank a physical file-register address selects: `Some(n)` when the
+    /// address needs a `BANKSEL`, `None` when it does not (common RAM, and the
+    /// bank-0 SFRs below `gpr_start`).
+    ///
+    /// Panics on an address the allocator must never emit: a non-canonical
+    /// alias of common RAM (`0xF0` is `0x70` seen from bank 1), or a gap on a
+    /// core whose banking this cannot express.
     pub fn bank_of(&self, addr: u16) -> Option<u8> {
         if let Some((lo, hi)) = self.common_ram {
             if addr >= lo && addr <= hi {
@@ -113,10 +115,26 @@ impl Device {
         if addr < self.gpr_start() {
             return None; // SFR range, below the first GPR bank
         }
-        panic!(
-            "device: 0x{addr:03X} is not a banked GPR address on {}",
-            self.name
-        );
+        match self.core {
+            // PIC14 pages the 9-bit file-register address by its top two bits
+            // (RP1:RP0), so a high-bank SFR such as the 887's 0x188 ANSEL is
+            // banked exactly like a GPR is.
+            Core::Pic14 | Core::Pic14e => {
+                if let Some((lo, hi)) = self.common_ram {
+                    let alias = addr & 0x7F;
+                    assert!(
+                        alias < lo || alias > hi,
+                        "device: 0x{addr:03X} aliases common RAM 0x{alias:02X} on {}",
+                        self.name
+                    );
+                }
+                Some((addr >> 7) as u8)
+            }
+            Core::Pic18 => panic!(
+                "device: 0x{addr:03X} is not a banked GPR address on {}",
+                self.name
+            ),
+        }
     }
 }
 
