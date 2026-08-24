@@ -18,6 +18,7 @@ CACHE_DIR   := $(HOME)/.cache/epic-cc
 CARGO_HOME_CACHE := $(CACHE_DIR)/cargo-home
 TARGET_CACHE := $(CACHE_DIR)/target
 FILE        ?= crates/driver/tests/fixtures/add.c
+TARGET      ?= p16f877a
 
 # check-warnings uses its own target dir, not the shared TARGET_CACHE:
 # every docker invocation mounts its worktree at the identical
@@ -56,10 +57,12 @@ exec: image ## One-off command: make exec CMD='cargo test -p asm'
 test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	@$(DOCKER_RUN) bash -c '$(if $(CRATE),cargo test -p $(CRATE) --no-fail-fast,bash scripts/ci-test.sh)'
 
-ci-local: image ## EXACT CI, locally: docker epic-cc-ci bash scripts/ci-test.sh — run before git push (see #99)
+ci-local: image ## EXACT CI, locally: docker epic-cc-ci bash scripts/ci-test.sh, run before git push (see #99)
 	@$(DOCKER_RUN) bash scripts/ci-test.sh
 
-compile: image ## Compile C to HEX and print it: FILE=crates/driver/tests/fixtures/add.c
+compile: image ## Compile C to HEX and print it: FILE=x.c TARGET=p16f887
+	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- $(FILE) -o /tmp/out.hex --target $(TARGET) && cat /tmp/out.hex'
+
 info: image ## Toolchain versions + env vars from the image
 	@$(DOCKER_RUN) bash -c 'rustc --version && $$PIC8_CLANG_UNWRAPPED --version | head -1 && gpasm --version | head -1 && echo && env | grep ^PIC8_ | sort'
 
