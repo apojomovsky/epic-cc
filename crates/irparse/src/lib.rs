@@ -2276,11 +2276,15 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 body.find('(').unwrap()
             };
             let head = &body[..open];
-            let func = head
-                .split_whitespace()
-                .last()
-                .unwrap()
-                .trim_start_matches(|c| c == '@' || c == '%')
+            let callee_tok = head.split_whitespace().last().unwrap();
+            // A `@name` callee is a direct call (strip the sigil); a `%reg`
+            // callee is an indirect call through a function pointer, whose
+            // target is the SSA register name (numeric). Keeping the sigil
+            // distinction is what lets the backend lower the two differently
+            // (epic-cc#73).
+            let func = callee_tok
+                .trim_start_matches('@')
+                .trim_start_matches('%')
                 .to_string();
             let args_str = balanced_inner(&body[open + 1..]).unwrap();
             if func.starts_with("llvm.memcpy.p0.p0") {
@@ -2346,6 +2350,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     ty,
                     func,
                     args,
+                    callees: Vec::new(),
                 }));
             }
         }

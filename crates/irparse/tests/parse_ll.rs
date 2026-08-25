@@ -1837,4 +1837,37 @@ define dso_local ptr @f(ptr %0, ptr %1, i1 %c) {
         }
         other => panic!("expected Select, got {other:?}"),
     }
+#[test]
+fn parses_indirect_call_through_function_pointer() {
+    // `call void %3(...)` is an indirect call: the callee is an SSA register,
+    // not a function name. irparse must keep the numeric register name in
+    // `func` (the sigil distinction is what lets the backend lower the two
+    // differently, epic-cc#73) and leave `callees` empty for legalize to fill.
+    let src = r#"
+define dso_local void @main() {
+  %1 = load i8, ptr @sel, align 1
+  %2 = icmp eq i8 %1, 0
+  %3 = select i1 %2, ptr @f0, ptr @f1
+  call void %3()
+  ret void
+}
+"#;
+    let m = parse_ll(src);
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    let call = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("expected a call");
+    assert_eq!(
+        call.func, "3",
+        "indirect callee keeps the SSA register name"
+    );
+    assert!(call.callees.is_empty(), "callees filled later by legalize");
+    assert_eq!(call.ty, None, "void call");
+    assert!(call.args.is_empty());
 }
