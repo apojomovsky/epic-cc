@@ -1799,20 +1799,32 @@ impl<'m> Gen<'m> {
                     .cloned()
                 {
                     // GEP pointer value materialization for returns and scalar
-                    // pointer copies. Mirrors PIC14's emit_load_byte GEP arm
-                    // but using PIC18 status at 0xFD8. Only pointer-param bases
-                    // are needed for the string.h pointer-returning helpers;
-                    // literal bases are left as loud panics for now.
+                    // pointer copies. Mirrors isel's emit_load_byte GEP arm
+                    // but using PIC18 status at 0xFD8. Two base kinds hold
+                    // runtime address bytes: a plain pointer param's slot
+                    // (Slot(name, false), the string.h helper params) and a
+                    // runtime-address slot (Slot(name, true): an IntToPtr or
+                    // const-arm pointer select dst). A runtime slot's bytes
+                    // ARE the address, so reading them and adding k/terms is
+                    // exactly the pointer value. Literal (global) bases stay
+                    // loud panics: their address is a link-time constant
+                    // needing literal materialization.
                     let sa = match &base {
-                        iselcore::Base::Slot(sname, false)
-                            if self
-                                .m
-                                .funcs
-                                .iter()
-                                .find(|f| f.name == self.cur_func)
-                                .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
-                                .unwrap_or(false) =>
-                        {
+                        iselcore::Base::Slot(sname, indirect) => {
+                            let holds_addr = if *indirect {
+                                true
+                            } else {
+                                self.m
+                                    .funcs
+                                    .iter()
+                                    .find(|f| f.name == self.cur_func)
+                                    .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
+                                    .unwrap_or(false)
+                            };
+                            assert!(
+                                holds_addr,
+                                "isel-pic18: cannot take the value of a GEP over {base:?}"
+                            );
                             self.slot_addr(self.cur_func, sname).direct()
                         }
                         other => {

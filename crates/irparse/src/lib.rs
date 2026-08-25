@@ -2398,7 +2398,11 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         }
         "phi" => {
             let body = rest["phi".len()..].trim();
-            let ty = ty_of(body.split_whitespace().next().unwrap());
+            let ty_tok = body.split_whitespace().next().unwrap().to_string();
+            // A pointer-typed phi prints with a `ptr` type token; ty_of maps
+            // that to Ty::I16, so the token is captured before the erasure.
+            let ptr = ty_tok == "ptr";
+            let ty = ty_of(&ty_tok);
             let mut incoming = Vec::new();
             for part in body.split('[').skip(1) {
                 let inner = part.split(']').next().unwrap();
@@ -2415,6 +2419,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             out.push(Inst::Phi(Phi {
                 dst: dst.unwrap(),
                 ty,
+                ptr,
                 incoming,
             }));
         }

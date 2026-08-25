@@ -218,6 +218,13 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
             for b in &f.blocks {
                 for i in &b.insts {
                     if let Inst::Phi(p) = i {
+                        // Only a pointer-typed phi (`phi ptr [...]`) is a
+                        // pointer VALUE; a plain i16 value phi (clang emits
+                        // `phi i8`/`phi i16` for value merges everywhere)
+                        // must never be seeded as an indirect slot.
+                        if !p.ptr {
+                            continue;
+                        }
                         let key = ssa_key(&fname, &p.dst);
                         if resolved.contains_key(&key) {
                             continue;

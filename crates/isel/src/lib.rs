@@ -1035,11 +1035,19 @@ impl<'m> Gen<'m> {
                     self.resolved.get(&ssa_key(self.cur_func, r)).cloned()
                 {
                     // The shapes below read the base's two bytes as a runtime
-                    // address. Only a pointer param's slot holds one: a global's
-                    // or an alloca's address is a link-time constant that would
-                    // need a literal materialization instead.
+                    // address. A pointer param's slot holds one, and so does a
+                    // runtime-address slot (`Base::Slot(_, true)`, an IntToPtr
+                    // or const-arm pointer select dst): its bytes ARE the
+                    // address, so reading them plus k/terms is the pointer
+                    // value. A global's or an alloca's address is a link-time
+                    // constant that would need a literal materialization, so
+                    // those stay loud panics.
                     let sa = match &base {
-                        Base::Slot(sname, false) if self.param_holds_addr(sname) => {
+                        Base::Slot(sname, indirect) => {
+                            assert!(
+                                *indirect || self.param_holds_addr(sname),
+                                "isel: cannot take the value of a GEP over {base:?}"
+                            );
                             self.slot_addr(self.cur_func, sname).direct()
                         }
                         other => panic!("isel: cannot take the value of a GEP over {other:?}"),
