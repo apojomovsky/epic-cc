@@ -324,6 +324,13 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel: unknown global @{name}"))
             .is_const
     }
+    /// Whether `name` is a function (a valid indirect-call target) rather
+    /// than a RAM/const global. A function's address is a link-time label
+    /// literal, materialized as LOW/HIGH bytes, never looked up in the
+    /// address map (epic-cc#73).
+    fn is_function(&self, name: &str) -> bool {
+        self.m.funcs.iter().any(|f| f.name == name)
+    }
 
     /// The byte size of a global: a const table's size selects the reader
     /// shape (≤ 255 single entry; ≥ 256 two chunked entries, chunk 1 empty
@@ -1099,8 +1106,15 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
             Val::Global(g) => {
-                let a = self.val_addr(&Val::Global(g.clone())).direct();
-                self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
+                if self.is_function(g) {
+                    // A function's address is a link-time label literal:
+                    // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73).
+                    let lit = if idx == 0 { "LOW" } else { "HIGH" };
+                    self.emit(format!("    MOVLW {lit}({g})"));
+                } else {
+                    let a = self.val_addr(&Val::Global(g.clone())).direct();
+                    self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
+                }
             }
         }
     }
@@ -1722,17 +1736,10 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `dst = call func(args)`: copy each arg into the callee's
-    /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
-    /// (`retval_lo` .. `retval_lo + bytes - 1`, 0x71-0x74 for i32) into
-    /// `dst`. Void calls skip the retval copy. Mirrors spike emit_call.
-    fn emit_call(
-        &mut self,
-        dst: &Option<String>,
-        ty: Option<Ty>,
-        func: &str,
-        args: &[ir::CallArg],
-    ) {
+    /// Copy each call arg into the callee's `{func}::{param}` slots. Shared
+    /// by the direct call path and the per-candidate arms of an indirect
+    /// call chain (epic-cc#73).
+    fn emit_call_args(&mut self, func: &str, args: &[ir::CallArg]) {
         let callee = self
             .m
             .funcs
@@ -1939,6 +1946,25 @@ impl<'m> Gen<'m> {
                 }
             }
         }
+    }
+
+    /// `dst = call func(args)`: copy each arg into the callee's
+    /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
+    /// (`retval_lo` .. `retval_lo + bytes - 1`, 0x71-0x74 for i32) into
+    /// `dst`. Void calls skip the retval copy. Mirrors spike emit_call.
+    fn emit_call(
+        &mut self,
+        dst: &Option<String>,
+        ty: Option<Ty>,
+        func: &str,
+        args: &[ir::CallArg],
+        callees: &[String],
+    ) {
+        if !callees.is_empty() {
+            self.emit_indirect_call(dst, ty, func, args, callees);
+            return;
+        }
+        self.emit_call_args(func, args);
         // M11 PCLATH discipline: every CALL runs with PCLATH<4:3> = the
         // target's page. The set's MOVLW clobbers W, so it must come AFTER
         // the last arg copy (which uses W) and immediately before the CALL;
@@ -1954,6 +1980,65 @@ impl<'m> Gen<'m> {
             let t = ty.expect("isel: valued call must carry a type");
             // Copy the retval region (0x71..0x71+bytes-1, up to 0x74 for
             // i32) into dst.
+            let da = self.slot_addr(self.cur_func, d).direct();
+            for i in 0..t.bytes() {
+                self.emit(format!(
+                    "    MOVF 0x{:02X}, W",
+                    self.retval_lo + u16::from(i)
+                ));
+                self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+            }
+        }
+    }
+
+    /// `dst = call %fp(args)` through a function pointer: an inline
+    /// compare-and-call chain over the candidate set. Each candidate's two
+    /// address bytes are compared against the fp value; on a match the args
+    /// are copied into that candidate's param slots and the direct-call
+    /// PCLATH/CALL/restore sequence runs, then control jumps to the shared
+    /// retval copy. No candidate matches (a bogus or null fp, which a valid
+    /// C program never reaches) falls into a deterministic trap loop rather
+    /// than a silent wrong call (epic-cc#73).
+    fn emit_indirect_call(
+        &mut self,
+        dst: &Option<String>,
+        ty: Option<Ty>,
+        func: &str,
+        args: &[ir::CallArg],
+        callees: &[String],
+    ) {
+        let fp = self.slot_addr(self.cur_func, func).direct();
+        let l_done = self.fresh_label();
+        for cand in callees.iter() {
+            let l_next = self.fresh_label();
+            // Compare the fp value's two bytes against the candidate's
+            // address. The compare pairs (XORLW then BTFSS) never have a
+            // memory operand between the flag-set and the skip target, so
+            // the banking pass has nothing to insert between them (issue #6).
+            self.emit(format!("    MOVF 0x{fp:02X}, W"));
+            self.emit(format!("    XORLW LOW({cand})"));
+            self.emit("    BTFSS STATUS, 2 ; Z".to_string());
+            self.emit(format!("    GOTO {l_next}"));
+            self.emit(format!("    MOVF 0x{:02X}, W", fp + 1));
+            self.emit(format!("    XORLW HIGH({cand})"));
+            self.emit("    BTFSS STATUS, 2 ; Z".to_string());
+            self.emit(format!("    GOTO {l_next}"));
+            // Matched: copy args into this candidate's slots and call it.
+            self.emit_call_args(cand, args);
+            self.emit(format!("    MOVLW PAGE({cand})"));
+            self.emit("    MOVWF PCLATH".to_string());
+            self.emit(format!("    CALL {cand}"));
+            self.emit_pclath_restore(cand);
+            self.emit(format!("    GOTO {l_done}"));
+            self.emit(format!("{l_next}:"));
+        }
+        // No candidate matched: deterministic trap.
+        let l_trap = self.fresh_label();
+        self.emit(format!("{l_trap}:"));
+        self.emit(format!("    GOTO {l_trap}"));
+        self.emit(format!("{l_done}:"));
+        if let Some(d) = dst {
+            let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
             for i in 0..t.bytes() {
                 self.emit(format!(
@@ -2328,7 +2413,7 @@ impl<'m> Gen<'m> {
                     self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
                 }
             }
-            Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args),
+            Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args, &c.callees),
             Inst::Asm(a) => {
                 // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking.
                 // Rung 4: substitute `$0`/`%0` memory operands via slot_addr.

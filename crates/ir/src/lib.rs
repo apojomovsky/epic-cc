@@ -128,6 +128,11 @@ pub struct Call {
     pub ty: Option<Ty>,
     pub func: String,
     pub args: Vec<CallArg>,
+    /// Candidate targets of an indirect call (`func` is then the SSA
+    /// register name, numeric). Empty for a direct call, whose target is
+    /// `func`. Filled by `legalize` from the whole-program address-taken
+    /// set; the canonical text round-trips it.
+    pub callees: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub struct Br {
@@ -579,12 +584,18 @@ fn inst_str(i: &Inst) -> String {
         }
         Inst::Call(c) => match (&c.ty, &c.dst) {
             (Some(t), Some(d)) => format!(
-                "%{d} = call {} @{}({})",
+                "%{d} = call {} {}({}){}",
                 ty_str(*t),
-                c.func,
-                call_args_str(&c.args)
+                callee_str(&c.func, &c.callees),
+                call_args_str(&c.args),
+                callees_str(&c.callees)
             ),
-            _ => format!("call void @{}({})", c.func, call_args_str(&c.args)),
+            _ => format!(
+                "call void {}({}){}",
+                callee_str(&c.func, &c.callees),
+                call_args_str(&c.args),
+                callees_str(&c.callees)
+            ),
         },
         Inst::Br(b) => format!("br {}", b.target),
         Inst::BrCond(b) => format!("br i1 {} {} {}", val_str(&b.cond), b.t, b.f),
@@ -699,6 +710,26 @@ fn call_arg_str(a: &CallArg) -> String {
 
 fn call_args_str(args: &[CallArg]) -> String {
     args.iter().map(call_arg_str).collect::<Vec<_>>().join(", ")
+}
+
+/// The callee token: `@name` for a direct call, `%reg` for an indirect one
+/// (whose `func` is the SSA register name and `callees` is non-empty).
+fn callee_str(func: &str, callees: &[String]) -> String {
+    if callees.is_empty() {
+        format!("@{func}")
+    } else {
+        format!("%{func}")
+    }
+}
+
+/// The `callees <f0> <f1> ...` suffix for an indirect call's canonical text.
+/// Empty for a direct call (no suffix).
+fn callees_str(callees: &[String]) -> String {
+    if callees.is_empty() {
+        String::new()
+    } else {
+        format!(" callees {}", callees.join(" "))
+    }
 }
 
 fn op_str(o: BinOp) -> &'static str {
@@ -973,16 +1004,26 @@ fn parse_call_arg(s: &str) -> CallArg {
     }
 }
 
-fn parse_call(rest: &str) -> (Option<Ty>, String, Vec<CallArg>) {
-    let at = rest.find('@').unwrap();
-    let ty_part = rest[..at].trim();
+fn parse_call(rest: &str) -> (Option<Ty>, String, Vec<CallArg>, Vec<String>) {
+    // The callee is the first `@name` (direct) or `%reg` (indirect) token
+    // after the return type. `find('@')` alone would miss an indirect call.
+    let at = rest.find('@');
+    let pct = rest.find('%');
+    let callee_pos = match (at, pct) {
+        (Some(a), Some(p)) => Some(a.min(p)),
+        (Some(a), None) => Some(a),
+        (None, Some(p)) => Some(p),
+        (None, None) => None,
+    };
+    let callee_pos = callee_pos.expect("call must have a callee");
+    let ty_part = rest[..callee_pos].trim();
     let ty = if ty_part == "void" {
         None
     } else {
         Some(parse_ty(ty_part))
     };
     let open = rest.find('(').unwrap();
-    let func = rest[at + 1..open].trim().to_string();
+    let func = rest[callee_pos + 1..open].trim().to_string();
     let close = matching_paren(rest, open);
     let args = if open + 1 == close {
         vec![]
@@ -992,7 +1033,14 @@ fn parse_call(rest: &str) -> (Option<Ty>, String, Vec<CallArg>) {
             .map(parse_call_arg)
             .collect()
     };
-    (ty, func, args)
+    // Optional `callees <f0> <f1> ...` suffix after the closing paren.
+    let tail = rest[close + 1..].trim();
+    let callees = if let Some(list) = tail.strip_prefix("callees") {
+        list.split_whitespace().map(str::to_string).collect()
+    } else {
+        vec![]
+    };
+    (ty, func, args, callees)
 }
 
 fn parse_gep_expr(rest: &str) -> (GepBase, u8, Vec<(u8, String)>) {
@@ -1169,12 +1217,13 @@ fn parse_inst(line: &str) -> Inst {
         });
     }
     if let Some(rest) = line.strip_prefix("call ") {
-        let (ty, func, args) = parse_call(rest);
+        let (ty, func, args, callees) = parse_call(rest);
         return Inst::Call(Call {
             dst: None,
             ty,
             func,
             args,
+            callees,
         });
     }
     // defining instruction: %d = op ...
@@ -1188,12 +1237,13 @@ fn parse_inst(line: &str) -> Inst {
         return Inst::Load(Load { dst, ty: t, ptr });
     }
     if let Some(rest) = body.strip_prefix("call ") {
-        let (ty, func, args) = parse_call(rest);
+        let (ty, func, args, callees) = parse_call(rest);
         return Inst::Call(Call {
             dst: Some(dst),
             ty,
             func,
             args,
+            callees,
         });
     }
     if let Some(rest) = body.strip_prefix("alloca ") {

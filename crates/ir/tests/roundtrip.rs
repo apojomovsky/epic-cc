@@ -164,6 +164,43 @@ fn roundtrips_control_flow_call_and_cast() {
 }
 
 #[test]
+fn roundtrips_indirect_call_callees() {
+    // An indirect call's candidate list round-trips through the canonical
+    // text (`callees <f0> <f1> ...`), and a direct call carries no suffix.
+    let text = "fn main(void) ()\n  block entry:\n    %1 = call i16 %3(i16 3, i16 4) callees add mul\n    call void %5() callees f0 f1\n    call void @f()\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    // stable fixed point: parse -> serialize -> parse -> serialize
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out);
+    assert!(
+        out.contains("%1 = call i16 %3(i16 3, i16 4) callees add mul"),
+        "missing indirect call callees\n---\n{out}"
+    );
+    assert!(
+        out.contains("call void %5() callees f0 f1"),
+        "missing void indirect call callees\n---\n{out}"
+    );
+    assert!(
+        out.contains("call void @f()"),
+        "direct call must keep no callees suffix\n---\n{out}"
+    );
+    // The parsed callees lists are populated.
+    let calls: Vec<&ir::Call> = m.funcs[0]
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| match i {
+            ir::Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls[0].callees, vec!["add".to_string(), "mul".to_string()]);
+    assert_eq!(calls[1].callees, vec!["f0".to_string(), "f1".to_string()]);
+    assert!(calls[2].callees.is_empty(), "direct call has no callees");
+}
+
+#[test]
 fn roundtrips_runtime_length_memcpy() {
     // Issue #4: the register-length form (`memcpy dst src %n`) round-trips
     // as MemLen::Reg — the counted-loop form — not as a const parse error.

@@ -984,3 +984,94 @@ fn keeps_a_non_sinkable_ptr_func() {
         "a non-sinkable pointer func must stay:\n{text}"
     );
 }
+
+/// An indirect call site's `callees` is filled from the whole-program
+/// address-taken set (every function whose address appears as a value),
+/// sorted deterministically. A direct call keeps an empty list.
+#[test]
+fn fills_indirect_callees_from_address_taken_set() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @sel\n\
+             %2 = icmp eq i8 %1 0\n\
+             %3 = select i1 %2 ptr @f0 ptr @f1\n\
+             %4 = call i8 %3()\n\
+             call void @f2()\n\
+             ret void\n\
+         fn f0(void) ()\n  block entry:\n    ret void\n\
+         fn f1(void) ()\n  block entry:\n    ret void\n\
+         fn f2(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let calls: Vec<&ir::Call> = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| match i {
+            ir::Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .collect();
+    // The indirect call's candidates are the address-taken functions, sorted.
+    assert_eq!(calls[0].callees, vec!["f0".to_string(), "f1".to_string()]);
+    // The direct call keeps an empty candidate list.
+    assert!(calls[1].callees.is_empty(), "direct call has no callees");
+}
+
+/// A function-pointer VALUE referencing a shared function inside the ISR
+/// context is rewritten to the `_isr` copy, so the ISR's stored callback
+/// points at the copy (which runs in the disjoint ISR region), not the
+/// main-context original.
+#[test]
+fn rewrites_shared_function_pointer_values_in_isr_context() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             store i16 @cb @g_cb\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             store i16 @cb @g_cb\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    // The shared function got an `_isr` copy.
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing"
+    );
+    // The ISR's store now references the copy; main's stays on the original.
+    let isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    let isr_store = isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            ir::Inst::Store(s) => Some(s),
+            _ => None,
+        })
+        .expect("isr store");
+    assert_eq!(
+        isr_store.val,
+        ir::Val::Global("cb_isr".to_string()),
+        "ISR store must point at the _isr copy"
+    );
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let main_store = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            ir::Inst::Store(s) => Some(s),
+            _ => None,
+        })
+        .expect("main store");
+    assert_eq!(
+        main_store.val,
+        ir::Val::Global("cb".to_string()),
+        "main store stays on the original"
+    );
+}

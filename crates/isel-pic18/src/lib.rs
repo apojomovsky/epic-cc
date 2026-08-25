@@ -188,6 +188,13 @@ impl<'m> Gen<'m> {
             .map(|g| g.is_const)
             .unwrap_or(false)
     }
+    /// Whether `name` is a function (a valid indirect-call target) rather
+    /// than a RAM/const global. A function's address is a link-time label
+    /// literal, materialized as LOW/HIGH bytes, never looked up in the
+    /// address map (epic-cc#73).
+    fn is_function(&self, name: &str) -> bool {
+        self.m.funcs.iter().any(|f| f.name == name)
+    }
 
     /// The byte width of a value-defining register in the current function
     /// (its slot is `bytes` wide), for scaling a dynamic const-table index
@@ -404,6 +411,17 @@ impl<'m> Gen<'m> {
                         }
                         _ => panic!("isel-pic18: multi-term GEP move with {terms:?} not supported"),
                     }
+                }
+            }
+            Val::Global(g) if self.is_function(g) => {
+                // A function's address is a link-time label literal: byte 0
+                // = LOW(g), byte 1 = HIGH(g) (epic-cc#73).
+                for i in 0..ty.bytes() {
+                    let lit = if i == 0 { "LOW" } else { "HIGH" };
+                    self.emit(format!("    MOVLW {lit}({g})"));
+                    let (a, f) = self.operand(dst + u16::from(i));
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
                 }
             }
             _ => {
@@ -662,6 +680,165 @@ impl<'m> Gen<'m> {
         self.add_dynamic_to_tblptr(terms);
         self.emit("    TBLRD*".to_string());
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
+    }
+
+    /// Copy each call arg into the callee's `{func}::{param}` slots. Shared
+    /// by the direct call path and the per-candidate arms of an indirect
+    /// call chain (epic-cc#73).
+    fn emit_call_args(&mut self, func: &str, args: &[ir::CallArg]) {
+        let callee = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == func)
+            .unwrap_or_else(|| panic!("isel-pic18: call to unknown function @{func}"));
+        for (i, arg) in args.iter().enumerate() {
+            let pname = &callee.params[i].name;
+            let pa = self.slot_addr(&func, pname).direct();
+            if let Some(size) = arg.byval {
+                let src_ptr = match &arg.val {
+                    Val::Const(_) => {
+                        panic!("isel-pic18: const byval call arg not yet supported")
+                    }
+                    other => other.clone(),
+                };
+                for b in 0..size {
+                    match self.emit_ptr_setup(&src_ptr, b) {
+                        Addr::Direct(src) => self.emit_copy_byte(src, pa + u16::from(b)),
+                        Addr::Indirect => {
+                            self.emit(format!("    MOVFF 0xFEF, 0x{:03X}", pa + u16::from(b)));
+                        }
+                    }
+                }
+            } else if arg.sret {
+                // `sret` means "store the 2-byte ADDRESS `arg.val`
+                // points to into the callee's sret slot"  -  same
+                // const hazard as `byval` above: an sret arg is
+                // always meant to be a pointer, so a literal here
+                // has no sensible meaning. `emit_ptr_setup` resolves
+                // `arg.val` the same way every other pointer
+                // consumer does: `Addr::Direct` is a compile-time
+                // address (write its two bytes as literals);
+                // `Addr::Indirect` means FSR0 now HOLDS the
+                // resolved runtime address (a dynamic target, or a
+                // sret-of-sret target), so the slot gets FSR0's two
+                // bytes via MOVFF instead of a literal.
+                assert!(
+                    !matches!(arg.val, Val::Const(_)),
+                    "isel-pic18: const sret call arg not yet supported"
+                );
+                match self.emit_ptr_setup(&arg.val, 0) {
+                    Addr::Direct(addr) => {
+                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                        let (a0, f0) = self.operand(pa);
+                        self.emit(format!(
+                            "    MOVWF 0x{f0:03X},{}",
+                            if a0 == 0 { "A" } else { "B" }
+                        ));
+                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                        let (a1, f1) = self.operand(pa + 1);
+                        self.emit(format!(
+                            "    MOVWF 0x{f1:03X},{}",
+                            if a1 == 0 { "A" } else { "B" }
+                        ));
+                    }
+                    Addr::Indirect => {
+                        self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
+                        self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
+                    }
+                }
+            } else if arg.ty.is_none() {
+                // A plain `ptr` arg carries no scalar type: pass the
+                // resolved 2-byte address, the same shape `sret` uses.
+                assert!(
+                    !arg.sret && arg.byval.is_none(),
+                    "isel-pic18: plain ptr arg must be non-sret/non-byval"
+                );
+                assert_eq!(
+                    callee.params[i].width, 2,
+                    "isel-pic18: callee ptr param must be 2 bytes"
+                );
+                if let Val::Const(k) = arg.val {
+                    assert_eq!(k, 0, "isel-pic18: non-zero const ptr not supported");
+                    let (a0, f0) = self.operand(pa);
+                    self.emit(format!(
+                        "    CLRF 0x{f0:03X},{}",
+                        if a0 == 0 { "A" } else { "B" }
+                    ));
+                    let (a1, f1) = self.operand(pa + 1);
+                    self.emit(format!(
+                        "    CLRF 0x{f1:03X},{}",
+                        if a1 == 0 { "A" } else { "B" }
+                    ));
+                } else {
+                    match self.emit_ptr_setup(&arg.val, 0) {
+                        Addr::Direct(addr) => {
+                            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                            let (a0, f0) = self.operand(pa);
+                            self.emit(format!(
+                                "    MOVWF 0x{f0:03X},{}",
+                                if a0 == 0 { "A" } else { "B" }
+                            ));
+                            self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                            let (a1, f1) = self.operand(pa + 1);
+                            self.emit(format!(
+                                "    MOVWF 0x{f1:03X},{}",
+                                if a1 == 0 { "A" } else { "B" }
+                            ));
+                        }
+                        Addr::Indirect => {
+                            self.emit_copy_byte(0xFE9, pa); // FSR0L -> param slot lo
+                            self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> param slot hi
+                        }
+                    }
+                }
+            } else {
+                let ty = arg
+                    .ty
+                    .expect("isel-pic18: scalar call arg must carry a type");
+                self.emit_move_val_to_slot(&arg.val, ty, pa);
+                // M15 conversion ABI: __uitofp_f32/__sitofp_f32 take a 4-byte val slot
+                // but i8/i16 sources copy only their width; stale high bytes corrupt
+                // the leading-1 search (P14 fix: isel/src/lib.rs:1618-1661). Fill them.
+                if (ty.bytes() as u16) < u16::from(callee.params[i].width) {
+                    assert_eq!(
+                        callee.params[i].width, 4,
+                        "isel-pic18: narrow scalar arg {} of @{} into non-4-byte param",
+                        i, func
+                    );
+                    let aw = ty.bytes() as u16;
+                    match func {
+                        "__uitofp_f32" => {
+                            for j in aw..4 {
+                                self.emit(format!("    CLRF 0x{:03X},A", pa + j));
+                            }
+                        }
+                        "__sitofp_f32" => {
+                            let sign = pa + aw - 1;
+                            if aw == 2 {
+                                self.emit(format!("    MOVF 0x{sign:03X},W,A"));
+                                self.emit(format!("    MOVWF 0x{:03X},A", pa + 2));
+                                self.emit(format!("    MOVWF 0x{:03X},A", pa + 3));
+                            } else {
+                                assert_eq!(
+                                    aw, 1,
+                                    "isel-pic18: unexpected narrow width for @__sitofp_f32"
+                                );
+                                self.emit("    MOVLW 0x00".to_string());
+                                self.emit(format!("    BTFSC 0x{sign:03X},7,A"));
+                                self.emit("    MOVLW 0xFF".to_string());
+                                for j in 1..4 {
+                                    self.emit(format!("    MOVWF 0x{:03X},A", pa + j));
+                                }
+                            }
+                        }
+                        other => {
+                            panic!("isel-pic18: narrow scalar arg into wide param of @{other}")
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn emit_inst(&mut self, i: &Inst) {
@@ -1118,188 +1295,32 @@ impl<'m> Gen<'m> {
                 self.emit_label(&l_end);
             }
             Inst::Call(c) => {
-                let callee = self
-                    .m
-                    .funcs
-                    .iter()
-                    .find(|f| f.name == c.func)
-                    .unwrap_or_else(|| panic!("isel-pic18: call to unknown function @{}", c.func));
-                for (i, arg) in c.args.iter().enumerate() {
-                    let pname = &callee.params[i].name;
-                    let pa = self.slot_addr(&c.func, pname).direct();
-                    if let Some(size) = arg.byval {
-                        let src_ptr = match &arg.val {
-                            Val::Const(_) => {
-                                panic!("isel-pic18: const byval call arg not yet supported")
-                            }
-                            other => other.clone(),
-                        };
-                        for b in 0..size {
-                            match self.emit_ptr_setup(&src_ptr, b) {
-                                Addr::Direct(src) => self.emit_copy_byte(src, pa + u16::from(b)),
-                                Addr::Indirect => {
-                                    self.emit(format!(
-                                        "    MOVFF 0xFEF, 0x{:03X}",
-                                        pa + u16::from(b)
-                                    ));
-                                }
-                            }
+                if !c.callees.is_empty() {
+                    self.emit_indirect_call(&c.dst, c.ty, &c.func, &c.args, &c.callees);
+                } else {
+                    self.emit_call_args(&c.func, &c.args);
+                    self.emit(format!("    CALL {}", c.func));
+                    // A `CALL` return is a BSR-clobbering join point, same
+                    // reasoning as `emit_label` (see its doc comment), but it
+                    // is NOT itself a label, so `emit_label`'s reset doesn't
+                    // cover it: the callee runs its own arbitrary sequence of
+                    // `MOVLB`s and never restores the caller's bank on
+                    // `RETURN`, so `self.bsr` (which tracks the bank the MOST
+                    // RECENT `MOVLB` set) is stale the instant control returns
+                    // here. Trusting it would make `operand()` wrongly elide a
+                    // needed `MOVLB` on the next banked access after the call,
+                    // silently reading/writing the wrong physical address.
+                    self.bsr = None;
+                    if let Some(d) = &c.dst {
+                        let ty = c.ty.expect("isel-pic18: valued call must carry a type");
+                        let dst = self.slot_addr(self.cur_func, d).direct();
+                        for i in 0..ty.bytes() {
+                            self.emit_copy_byte(self.retval_lo + u16::from(i), dst + u16::from(i));
                         }
-                    } else if arg.sret {
-                        // `sret` means "store the 2-byte ADDRESS `arg.val`
-                        // points to into the callee's sret slot"  -  same
-                        // const hazard as `byval` above: an sret arg is
-                        // always meant to be a pointer, so a literal here
-                        // has no sensible meaning. `emit_ptr_setup` resolves
-                        // `arg.val` the same way every other pointer
-                        // consumer does: `Addr::Direct` is a compile-time
-                        // address (write its two bytes as literals);
-                        // `Addr::Indirect` means FSR0 now HOLDS the
-                        // resolved runtime address (a dynamic target, or a
-                        // sret-of-sret target), so the slot gets FSR0's two
-                        // bytes via MOVFF instead of a literal.
-                        assert!(
-                            !matches!(arg.val, Val::Const(_)),
-                            "isel-pic18: const sret call arg not yet supported"
-                        );
-                        match self.emit_ptr_setup(&arg.val, 0) {
-                            Addr::Direct(addr) => {
-                                self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                                let (a0, f0) = self.operand(pa);
-                                self.emit(format!(
-                                    "    MOVWF 0x{f0:03X},{}",
-                                    if a0 == 0 { "A" } else { "B" }
-                                ));
-                                self.emit(format!(
-                                    "    MOVLW 0x{:02X}",
-                                    ((addr >> 8) & 0xFF) as u8
-                                ));
-                                let (a1, f1) = self.operand(pa + 1);
-                                self.emit(format!(
-                                    "    MOVWF 0x{f1:03X},{}",
-                                    if a1 == 0 { "A" } else { "B" }
-                                ));
-                            }
-                            Addr::Indirect => {
-                                self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
-                                self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
-                            }
-                        }
-                    } else if arg.ty.is_none() {
-                        // A plain `ptr` arg carries no scalar type: pass the
-                        // resolved 2-byte address, the same shape `sret` uses.
-                        assert!(
-                            !arg.sret && arg.byval.is_none(),
-                            "isel-pic18: plain ptr arg must be non-sret/non-byval"
-                        );
-                        assert_eq!(
-                            callee.params[i].width, 2,
-                            "isel-pic18: callee ptr param must be 2 bytes"
-                        );
-                        if let Val::Const(k) = arg.val {
-                            assert_eq!(k, 0, "isel-pic18: non-zero const ptr not supported");
-                            let (a0, f0) = self.operand(pa);
-                            self.emit(format!(
-                                "    CLRF 0x{f0:03X},{}",
-                                if a0 == 0 { "A" } else { "B" }
-                            ));
-                            let (a1, f1) = self.operand(pa + 1);
-                            self.emit(format!(
-                                "    CLRF 0x{f1:03X},{}",
-                                if a1 == 0 { "A" } else { "B" }
-                            ));
-                        } else {
-                            match self.emit_ptr_setup(&arg.val, 0) {
-                                Addr::Direct(addr) => {
-                                    self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                                    let (a0, f0) = self.operand(pa);
-                                    self.emit(format!(
-                                        "    MOVWF 0x{f0:03X},{}",
-                                        if a0 == 0 { "A" } else { "B" }
-                                    ));
-                                    self.emit(format!(
-                                        "    MOVLW 0x{:02X}",
-                                        ((addr >> 8) & 0xFF) as u8
-                                    ));
-                                    let (a1, f1) = self.operand(pa + 1);
-                                    self.emit(format!(
-                                        "    MOVWF 0x{f1:03X},{}",
-                                        if a1 == 0 { "A" } else { "B" }
-                                    ));
-                                }
-                                Addr::Indirect => {
-                                    self.emit_copy_byte(0xFE9, pa); // FSR0L -> param slot lo
-                                    self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> param slot hi
-                                }
-                            }
-                        }
-                    } else {
-                        let ty = arg
-                            .ty
-                            .expect("isel-pic18: scalar call arg must carry a type");
-                        self.emit_move_val_to_slot(&arg.val, ty, pa);
-                        // M15 conversion ABI: __uitofp_f32/__sitofp_f32 take a 4-byte val slot
-                        // but i8/i16 sources copy only their width; stale high bytes corrupt
-                        // the leading-1 search (P14 fix: isel/src/lib.rs:1618-1661). Fill them.
-                        if (ty.bytes() as u16) < u16::from(callee.params[i].width) {
-                            assert_eq!(
-                                callee.params[i].width, 4,
-                                "isel-pic18: narrow scalar arg {} of @{} into non-4-byte param",
-                                i, c.func
-                            );
-                            let aw = ty.bytes() as u16;
-                            match c.func.as_str() {
-                                "__uitofp_f32" => {
-                                    for j in aw..4 {
-                                        self.emit(format!("    CLRF 0x{:03X},A", pa + j));
-                                    }
-                                }
-                                "__sitofp_f32" => {
-                                    let sign = pa + aw - 1;
-                                    if aw == 2 {
-                                        self.emit(format!("    MOVF 0x{sign:03X},W,A"));
-                                        self.emit(format!("    MOVWF 0x{:03X},A", pa + 2));
-                                        self.emit(format!("    MOVWF 0x{:03X},A", pa + 3));
-                                    } else {
-                                        assert_eq!(
-                                            aw, 1,
-                                            "isel-pic18: unexpected narrow width for @__sitofp_f32"
-                                        );
-                                        self.emit("    MOVLW 0x00".to_string());
-                                        self.emit(format!("    BTFSC 0x{sign:03X},7,A"));
-                                        self.emit("    MOVLW 0xFF".to_string());
-                                        for j in 1..4 {
-                                            self.emit(format!("    MOVWF 0x{:03X},A", pa + j));
-                                        }
-                                    }
-                                }
-                                other => panic!(
-                                    "isel-pic18: narrow scalar arg into wide param of @{other}"
-                                ),
-                            }
-                        }
-                    }
-                }
-                self.emit(format!("    CALL {}", c.func));
-                // A `CALL` return is a BSR-clobbering join point, same
-                // reasoning as `emit_label` (see its doc comment), but it
-                // is NOT itself a label, so `emit_label`'s reset doesn't
-                // cover it: the callee runs its own arbitrary sequence of
-                // `MOVLB`s and never restores the caller's bank on
-                // `RETURN`, so `self.bsr` (which tracks the bank the MOST
-                // RECENT `MOVLB` set) is stale the instant control returns
-                // here. Trusting it would make `operand()` wrongly elide a
-                // needed `MOVLB` on the next banked access after the call,
-                // silently reading/writing the wrong physical address.
-                self.bsr = None;
-                if let Some(d) = &c.dst {
-                    let ty = c.ty.expect("isel-pic18: valued call must carry a type");
-                    let dst = self.slot_addr(self.cur_func, d).direct();
-                    for i in 0..ty.bytes() {
-                        self.emit_copy_byte(self.retval_lo + u16::from(i), dst + u16::from(i));
                     }
                 }
             }
+
             Inst::Alloca(_) | Inst::Gep(_) => {
                 // Virtual: Alloca's slot comes from `alloc`'s layout and
                 // Gep's result is folded away by `resolve_pointers`
@@ -1337,6 +1358,53 @@ impl<'m> Gen<'m> {
                 self.emit("; --- asm end ---".to_string());
             }
             other => panic!("isel-pic18: unsupported instruction for P2 (so far): {other:?}"),
+        }
+    }
+
+    /// `dst = call %fp(args)` through a function pointer: an inline
+    /// compare-and-call chain over the candidate set. Each candidate's two
+    /// address bytes are compared against the fp value; on a match the args
+    /// are copied into that candidate's param slots and the CALL runs, then
+    /// control jumps to the shared retval copy. No candidate matches (a bogus
+    /// or null fp, which a valid C program never reaches) falls into a
+    /// deterministic trap loop rather than a silent wrong call (epic-cc#73).
+    fn emit_indirect_call(
+        &mut self,
+        dst: &Option<String>,
+        ty: Option<Ty>,
+        func: &str,
+        args: &[ir::CallArg],
+        callees: &[String],
+    ) {
+        let l_done = self.fresh_label();
+        for cand in callees.iter() {
+            let l_next = self.fresh_label();
+            // Compare the fp value's two bytes against the candidate's
+            // address. MOVF sets Z; XORLW leaves it; BNZ skips on mismatch.
+            self.emit_load_w(&Val::Reg(func.to_string()), 0);
+            self.emit(format!("    XORLW LOW({cand})"));
+            self.emit(format!("    BNZ {l_next}"));
+            self.emit_load_w(&Val::Reg(func.to_string()), 1);
+            self.emit(format!("    XORLW HIGH({cand})"));
+            self.emit(format!("    BNZ {l_next}"));
+            // Matched: copy args into this candidate's slots and call it.
+            self.emit_call_args(cand, args);
+            self.emit(format!("    CALL {cand}"));
+            self.bsr = None;
+            self.emit(format!("    BRA {l_done}"));
+            self.emit_label(&l_next);
+        }
+        // No candidate matched: deterministic trap.
+        let l_trap = self.fresh_label();
+        self.emit_label(&l_trap);
+        self.emit(format!("    BRA {l_trap}"));
+        self.emit_label(&l_done);
+        if let Some(d) = dst {
+            let t = ty.expect("isel-pic18: valued call must carry a type");
+            let da = self.slot_addr(self.cur_func, d).direct();
+            for i in 0..t.bytes() {
+                self.emit_copy_byte(self.retval_lo + u16::from(i), da + u16::from(i));
+            }
         }
     }
 
@@ -1765,11 +1833,18 @@ impl<'m> Gen<'m> {
                 let bank = if a == 0 { "A" } else { "B" };
                 self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
             }
-            Val::Global(_g) => {
-                let addr = self.val_addr(v).direct() + u16::from(offset);
-                let (a, f) = self.operand(addr);
-                let bank = if a == 0 { "A" } else { "B" };
-                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+            Val::Global(g) => {
+                if self.is_function(g) {
+                    // A function's address is a link-time label literal:
+                    // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73).
+                    let lit = if offset == 0 { "LOW" } else { "HIGH" };
+                    self.emit(format!("    MOVLW {lit}({g})"));
+                } else {
+                    let addr = self.val_addr(v).direct() + u16::from(offset);
+                    let (a, f) = self.operand(addr);
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                }
             }
         }
     }
