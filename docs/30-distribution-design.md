@@ -147,7 +147,7 @@ suite, now running inside the `ci` image.
 can pin a compiler by tag and run it without building clang. The binary
 identifies itself: the driver's `build.rs` stamps `EPIC_CC_VERSION` (the
 release stage's build ARG) into the build, and `epic-cc --version` prints
-`epic-cc master-<sha>` (crate version when the ARG is unset). The gate runs
+`epic-cc 0.0.0-master-<sha>` (crate version when the ARG is unset). The gate runs
 the downloaded zip on a bare runner with no clang environment, which is
 exactly the consumer's shape. Windows stays tag-only until a consumer exists.
 

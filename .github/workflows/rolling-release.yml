@@ -33,7 +33,7 @@ jobs:
 
       - name: Build release bundle (cached clang layer)
         run: |
-          ver="master-${{ github.sha }}"
+          ver="0.0.0-master-${{ github.sha }}"
           docker buildx build --target release --load \
             --build-arg EPIC_CC_VERSION="$ver" \
             --cache-from type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true \
@@ -42,14 +42,14 @@ jobs:
 
       - name: Extract bundle from image
         run: |
-          ver="master-${{ github.sha }}"
+          ver="0.0.0-master-${{ github.sha }}"
           docker create --name epic-cc-bundle "epic-cc-release:$ver"
           docker cp "epic-cc-bundle:/out" dist
           docker rm epic-cc-bundle
 
       - name: Zip
         run: |
-          ver="master-${{ github.sha }}"
+          ver="0.0.0-master-${{ github.sha }}"
           (cd dist && zip -qr "../epic-cc-${ver}-x86_64-linux.zip" "epic-cc-${ver}-x86_64-linux")
 
       - uses: actions/upload-artifact@v4
@@ -85,8 +85,8 @@ jobs:
           stamp="$($exe --version)"
           echo "stamp: $stamp"
           case "$stamp" in
-            "epic-cc master-${{ github.sha }}") ;;
-            *) echo "::error::expected 'epic-cc master-${{ github.sha }}', got '$stamp'"; exit 1 ;;
+            "epic-cc 0.0.0-master-${{ github.sha }}") ;;
+            *) echo "::error::expected 'epic-cc 0.0.0-master-${{ github.sha }}', got '$stamp'"; exit 1 ;;
           esac
 
       - name: Smoke compile with no clang environment
@@ -127,7 +127,7 @@ jobs:
       - name: Write release notes
         run: |
           cat <<'EOF' > notes.md
-          Rolling build of the epic-cc Linux bundle at master-@SHA@.
+          Rolling build of the epic-cc Linux bundle at 0.0.0-master-@SHA@.
 
           This is a prerelease published on every push to master so downstream
           CI can pin a compiler and run it without building clang. Pin this
@@ -136,11 +136,11 @@ jobs:
           Run it as-is (the bundle ships its own clang):
 
           ```bash
-          unzip epic-cc-master-@SHA@-x86_64-linux.zip
-          ./epic-cc-master-@SHA@-x86_64-linux/epic-cc --target p16f887 app.c -o app.hex
+          unzip epic-cc-0.0.0-master-@SHA@-x86_64-linux.zip
+          ./epic-cc-0.0.0-master-@SHA@-x86_64-linux/epic-cc --target p16f887 app.c -o app.hex
           ```
 
-          The binary identifies itself with `--version` (`epic-cc master-@SHA@`).
+          The binary identifies itself with `--version` (`epic-cc 0.0.0-master-@SHA@`).
           Requires Ubuntu 22.04 / Debian 12 or newer on x86_64.
 
           <details><summary>Checksums</summary>
@@ -163,6 +163,6 @@ jobs:
           gh release create "ci-$sha" \
             --target "$sha" \
             --prerelease \
-            --title "epic-cc rolling master-$sha" \
+            --title "epic-cc rolling 0.0.0-master-\$sha" \
             --notes-file notes.md \
             bundle/epic-cc-*.zip bundle/SHA256SUMS

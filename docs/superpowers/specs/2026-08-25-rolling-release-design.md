@@ -56,7 +56,7 @@ report which compiler it used.
 ### A -- Per-commit rolling release, one Linux zip (chosen)
 
 A new `rolling-release.yml`: on every `push` to `master`, build the existing
-Linux bundle with `EPIC_CC_VERSION=master-<sha>`, then:
+Linux bundle with `EPIC_CC_VERSION=0.0.0-master-<sha>`, then:
 
 1. **build** -- docker buildx `--target release` (clang layer from the existing
    GHCR cache), extract, zip.
@@ -106,14 +106,14 @@ on: push: branches: [master]; workflow_dispatch
 permissions: contents: write, packages: write
 
 build (ubuntu-latest)
-  - buildx --target release --build-arg EPIC_CC_VERSION=master-<sha>
+  - buildx --target release --build-arg EPIC_CC_VERSION=0.0.0-master-<sha>
       --cache-from/to ghcr.io/...-toolchain (the existing cache ref)
-  - extract bundle from the image, zip as epic-cc-master-<sha>-x86_64-linux.zip
+  - extract bundle from the image, zip as epic-cc-0.0.0-master-<sha>-x86_64-linux.zip
   - upload artifact
 
 gate (ubuntu-latest, needs build)
   - download the zip, unzip
-  - ./epic-cc --version          assert it equals `epic-cc master-<sha>`
+  - ./epic-cc --version          assert it equals `epic-cc 0.0.0-master-<sha>`
   - cat add.c | ./epic-cc --target p16f887 -o out.hex (no PIC8_* env)
     assert out.hex non-empty
   - sha256sum the zip, emit SHA256SUMS
@@ -143,7 +143,7 @@ fn main() {
 ```
 
 and `epic-cc --version` prints `epic-cc <stamp>`:
-`epic-cc master-<sha>` in a rolling bundle, `epic-cc 0.1.0` in dev and tag
+`epic-cc 0.0.0-master-<sha>` in a rolling bundle, `epic-cc 0.1.0` in dev and tag
 releases (where `EPIC_CC_VERSION` is unset, `CARGO_PKG_VERSION` is the
 fallback). The stamp is also what `release.yml` passes today (the plain
 version), so tag releases and rolling releases share one code path.
@@ -156,7 +156,7 @@ and prints only the one line.
 The zip keeps the layout `docs/30` defines, plus the llvm-link this PR ships
 next to clang: `epic-cc-<ver>-x86_64-linux/` containing `epic-cc`,
 `clang/bin/clang`, `clang/bin/llvm-link`, `clang/lib/clang/20/`,
-`LICENSE.clang.txt`. The rolling ver is `master-<sha>`.
+`LICENSE.clang.txt`. The rolling ver is `0.0.0-master-<sha>`.
 
 ### 4.4 Cache reuse
 
@@ -171,7 +171,7 @@ cargo target cache is mounted. Cost is minutes per push, not hours.
 | Acceptance | Where |
 |---|---|
 | push to master publishes an artifact another job can fetch and run as `epic-cc --target p16f887 ...` with no clang build | `rolling-yml` build + gate (gate IS the consumer shape) |
-| artifact prints an identifying version or commit | `--version` = `master-<sha>`, asserted by the gate |
+| artifact prints an identifying version or commit | `--version` = `0.0.0-master-<sha>`, asserted by the gate |
 | `apojomovsky/epic-hal#80` can consume it | consume the `ci-<sha>` prerelease, assert `--version` in the job log, run `make epiccc-build`; pin = the tag |
 
 ## 6. Testing

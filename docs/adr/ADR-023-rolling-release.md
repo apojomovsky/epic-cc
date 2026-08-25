@@ -7,7 +7,7 @@
 ## Decision
 
 * Every push to master runs `.github/workflows/rolling-release.yml`: it builds
-  the existing Linux bundle with `EPIC_CC_VERSION=master-<sha>`, proves the zip
+  the existing Linux bundle with `EPIC_CC_VERSION=0.0.0-master-<sha>`, proves the zip
   on a bare runner (the binary reports the commit, and it compiles a fresh C
   file for `p16f887` using only its bundled clang and llvm-link), then creates
   a prerelease tagged `ci-<sha>` carrying the zip, its sha256 sums, and
