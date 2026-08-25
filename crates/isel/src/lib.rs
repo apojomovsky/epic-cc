@@ -30,8 +30,12 @@
 //! crossing an SFR hole would silently mis-address, so it panics loudly at
 //! emission (the object span comes from the global size / param width /
 //! alloca size). An *indirect* (sret) base sets IRP from the stored
-//! address's high byte (`BTFSC/BTFSS <slot+1>,0; BSF/BCF STATUS,7`) before
-//! computing `FSR = [slot] + k + off`, so sret targets may sit in any bank
+//! (the caller's sret store checks the target's window the same way). A
+//! runtime SFR address (a runtime `inttoptr`, issue #117) is reached the
+//! same way and needs no static BANKSEL: `INDF` addresses the whole linear
+//! file space through FSR+IRP, so an indirect access never consults a bank
+//! register.
+//!
 //! (the caller's sret store checks the target's window the same way).
 //!
 //! Every value's address comes from the caller-supplied address map: globals

@@ -87,8 +87,9 @@ Val`, `to: Ty` (I16)):
   unchanged.
 - **ir**: serialize/deserialize the new inst (`%d = inttoptr <from> <val> to
   ptr`), and size it in the allocator's value sizing (`to.bytes()` = 2).
-- **isel (PIC14)** and **isel-pic18**: lower as a 2-byte value copy from the
-  source's slot (or MOVLW for a `Const`), exactly like the existing `Zext`
+  i16->i16 shape. The address bytes land in the dst slot. (PIC18 asserts on a
+  `Const` source for now; clang -O1 folds a literal inttoptr into the
+  load/store pointer operand, so the guard never fires on the HAL's shapes.)
   i16->i16 shape. The address bytes land in the dst slot.
 - `ptrtoint` stays out of scope (today: `Inst::Trunc`, loud panic on the
   HAL's shapes; clang does not emit it at -O1 for these functions).
