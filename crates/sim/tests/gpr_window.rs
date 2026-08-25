@@ -19,6 +19,8 @@ const WIDE_BANKS: Device = Device {
     flash_words: 0x2000,
     ram_banks: &[(0x20, 0x6F), (0xA0, 0xEF), (0x110, 0x16F), (0x190, 0x1EF)],
     common_ram: Some((0x70, 0x7F)),
+    access_bank: None,
+    fixed_retval: None,
     stack_depth: 8,
     interrupt_vectors: &[0x0004],
     config: ConfigRegion {

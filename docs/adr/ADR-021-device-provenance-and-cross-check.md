@@ -12,11 +12,13 @@
 * `crates/device/tests/gputils_crosscheck.rs` gates every device on every PR:
   `flash_words` via two `gpasm` `org` probes, and the RAM map against the
   generic `.lkr`.
-* On PIC14 the comparison is per bank and ordered, plus a separate check of
-  `common_ram` against the first unprotected `SHAREBANK`. A merged total would
-  accept a moved banked/common boundary, which `isel` reads as `fsr_window`.
-  Union-and-coalesce survives only on PIC18, where gputils splits a flat window
-  into nine `DATABANK`s that one TOML entry describes.
+* On both cores the comparison is per-bank and ordered, plus a separate
+  check of the BSR-free window: PIC14 `common_ram` against the first
+  unprotected `SHAREBANK`, PIC18 `access_bank` against the first
+  unprotected `ACCESSBANK`. A merged total would accept a moved boundary,
+  which `isel` reads as `fsr_window` (PIC14) and which would hide a
+  mis-modelled access-bank split (PIC18). Union-and-coalesce survives only
+  for coalescing adjacent gputils banks that one TOML entry describes.
 * Coverage is correlated with provenance: a device with no `.lkr` is named in
   the test output and must be `tier = "datasheet"`. Nothing may be both
   unverified and silent.
@@ -48,17 +50,6 @@ cannot be skipped for want of a download.
 * **Probe gplink for RAM geometry.** Measured and rejected: absolute `udata` is
   never validated, and relocatable placement reveals no bank geometry. Supplying
   a linker script with the ranges would assert what we are verifying.
-
-## Known exception
-
-`p18f4550` ships `common_ram = [0x0,0xF]` while its `.lkr` access RAM is
-`0x0-0x5F`, so the two cannot be compared. On PIC18 `common_ram` is not the
-hardware access window: it is `isel-pic18`'s fixed, `BSR`-independent retval
-and scratch reservation carved out of the bottom of access RAM, a compiler
-choice no linker script can attest. PIC18 therefore compares only the total
-allocatable span, and the banked/common boundary stays unverified there. A
-per-device `access_bank` field, which `docs/29` originally sketched and the
-registry collapsed into `common_ram`, would make it checkable.
 
 ## Revisit if
 

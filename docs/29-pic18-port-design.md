@@ -206,8 +206,9 @@ pub struct Device {
     pub core: Core,                  // Pic14 | Pic18
     pub flash_words: u32,            // 16,384 for the 4550  [VERIFY]
     pub ram_banks: &'static [Bank],
-    pub access_bank: Option<Range<u16>>,   // PIC18 only
-    pub common_ram: Option<Range<u16>>,    // PIC14 only
+    pub common_ram: Option<Range<u16>>,    // PIC14 only: mirrored window
+    pub access_bank: Option<Range<u16>>,   // PIC18 only: hardware access RAM
+    pub fixed_retval: Option<Range<u16>>,  // PIC18 only: compiler policy reservation inside access_bank
     pub stack_depth: u8,             // 8 (PIC14) / 31 (PIC18)  [VERIFY]
     pub interrupt_vectors: &'static [u16], // [0x0004] / [0x0008, 0x0018]  [VERIFY]
     pub has_hardware_multiply: bool,

@@ -244,6 +244,11 @@ impl Pic14 {
                 return None;
             }
         }
+        if let Some((lo, hi)) = self.device.fixed_retval {
+            if f >= lo as usize && f <= hi as usize {
+                return None;
+            }
+        }
         let phys = f + self.bank_base();
         self.device
             .ram_banks

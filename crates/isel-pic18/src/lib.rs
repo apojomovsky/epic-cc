@@ -33,7 +33,7 @@ struct Gen<'m> {
     /// docs/adr/ADR-009-pic18-pointer-model.md.
     resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from
-    /// `device.common_ram`)  -  see the plan's "Where the retval/scratch
+    /// `device.fixed_retval`)  -  see the plan's "Where the retval/scratch
     /// design comes from" section.
     retval_lo: u16,
     /// The `BSR` value the last-emitted `MOVLB` set, or `None` when it's
@@ -1068,7 +1068,7 @@ impl<'m> Gen<'m> {
                             // (k - W), bytes 1..n via `k_i + ~a_i + C0`
                             // (the borrow-aware `k - a - !C0` chain). `C0`
                             // is saved in a flag bit (0x0000,0 in the
-                            // reserved `common_ram`/`retval_lo` region, so
+                            // reserved `fixed_retval`/`retval_lo` region, so
                             // it is live-free across a `Bin` and an
                             // interrupt mid-sequence cannot clobber a live
                             // local) before the `COMF`/`ADDLW` overwrites
@@ -4391,8 +4391,8 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
 
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
     let (common_lo, _) = device
-        .common_ram
-        .expect("isel-pic18's fixed retval region needs a common-RAM reservation");
+        .fixed_retval
+        .expect("isel-pic18's fixed retval region needs a fixed_retval reservation");
     let mut out: Vec<String> = Vec::new();
     out.extend(vec![
         "; pic8 -- P2 integer spine (isel-pic18)".to_string(),
