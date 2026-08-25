@@ -1837,6 +1837,8 @@ define dso_local ptr @f(ptr %0, ptr %1, i1 %c) {
         }
         other => panic!("expected Select, got {other:?}"),
     }
+}
+
 #[test]
 fn parses_indirect_call_through_function_pointer() {
     // `call void %3(...)` is an indirect call: the callee is an SSA register,

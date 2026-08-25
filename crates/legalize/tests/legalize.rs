@@ -982,6 +982,9 @@ fn keeps_a_non_sinkable_ptr_func() {
     assert!(
         text.contains("@identity"),
         "a non-sinkable pointer func must stay:\n{text}"
+    );
+}
+
 /// An indirect call site's `callees` is filled from the whole-program
 /// address-taken set (every function whose address appears as a value),
 /// sorted deterministically. A direct call keeps an empty list.
