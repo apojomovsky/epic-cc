@@ -1799,16 +1799,12 @@ impl<'m> Gen<'m> {
                     .cloned()
                 {
                     // GEP pointer value materialization for returns and scalar
-                    // pointer copies. Mirrors isel's emit_load_byte GEP arm
-                    // but using PIC18 status at 0xFD8. Two base kinds hold
-                    // runtime address bytes: a plain pointer param's slot
-                    // (Slot(name, false), the string.h helper params) and a
-                    // runtime-address slot (Slot(name, true): an IntToPtr or
-                    // const-arm pointer select dst). A runtime slot's bytes
-                    // ARE the address, so reading them and adding k/terms is
-                    // exactly the pointer value. Literal (global) bases stay
-                    // loud panics: their address is a link-time constant
-                    // needing literal materialization.
+                    // pointer copies. Two base kinds hold runtime address
+                    // bytes: a plain pointer param's slot and a
+                    // runtime-address slot (an IntToPtr or const-arm select
+                    // dst); both read as `base + k + terms`. Literal bases
+                    // stay loud panics (their address is a link-time
+                    // constant).
                     let sa = match &base {
                         iselcore::Base::Slot(sname, indirect) => {
                             let holds_addr = if *indirect {
