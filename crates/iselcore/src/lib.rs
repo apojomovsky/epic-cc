@@ -188,14 +188,17 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
         let mut progressed = true;
         while progressed {
             progressed = false;
-            for s in selects.values().filter(|s| s.dst.starts_with(&fname)) {
-                if resolved.contains_key(&ssa_key(&fname, &s.dst)) {
+            for (key, s) in selects
+                .iter()
+                .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
+            {
+                if resolved.contains_key(key) {
                     continue;
                 }
                 let const_arm = |v: &ir::Val| matches!(v, ir::Val::Const(_));
                 if const_arm(&s.a) && const_arm(&s.b) {
                     resolved.insert(
-                        ssa_key(&fname, &s.dst),
+                        key.clone(),
                         (Base::Slot(s.dst.clone(), true), 0, Vec::new()),
                     );
                     progressed = true;
