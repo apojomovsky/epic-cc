@@ -1,6 +1,6 @@
 # Rolling master release bundles for downstream CI -- Design
 
-**Status:** draft (pending approval)
+**Status:** Accepted 2026-08-25 (approved, see ADR-023)
 **Date:** 2026-08-25
 **Parent:** `docs/30-distribution-design.md` (D1-D6), ADR-008 (docker toolchain)
 **Ticket:** `epic-cc#118`
