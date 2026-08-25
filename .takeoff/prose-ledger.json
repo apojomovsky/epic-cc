@@ -186,5 +186,15 @@
     "tier": "4-8",
     "justification": "Two base kinds hold runtime address bytes for pointer-value materialization; both read as base+k+terms. Literal bases stay loud panics.",
     "exception": "hand-trace"
+  },
+  "efd5889d3665": {
+    "tier": "4-8",
+    "justification": "PIC18 shape-3 unit test comment: the pointer phi joining a select result and a literal needs phi copies per edge into the dst slot before the FSR0/INDF0 deref; the assert pins that the phi dst slot (0x28) is what FSR0 loads.",
+    "exception": "hand-trace"
+  },
+  "213afcd2b905": {
+    "tier": "4-8",
+    "justification": "gpasm cross-check sim comment: runtime write_offset(irq&1=0) writes PIR1 through a runtime inttoptr, so the hand-derived sums change (both read_offset calls hit PIR1, not PIR1 and PIR2); the comment records the non-obvious expected values.",
+    "exception": "hand-trace"
   }
 }
