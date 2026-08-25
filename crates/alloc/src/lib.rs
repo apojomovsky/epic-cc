@@ -671,7 +671,19 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         Inst::Zext(z) => Some((z.dst.clone(), z.to.bytes())),
         Inst::Sext(s) => Some((s.dst.clone(), s.to.bytes())),
         Inst::Trunc(t) => Some((t.dst.clone(), t.to.bytes())),
+        Inst::IntToPtr(p) => Some((p.dst.clone(), p.to.bytes())),
         Inst::Icmp(i) => Some((i.dst.clone(), 1)),
+        // A pointer-typed select whose arms are both runtime address
+        // literals materializes its two address bytes into the dst slot
+        // (isel's value-select path, epic-cc#117), so the dst needs a slot
+        // like any 2-byte value. A pointer select over folded (compile-time)
+        // arms is virtual (iselcore folds it like a GEP) and defines no
+        // slot.
+        Inst::Select(s)
+            if s.ptr && matches!((&s.a, &s.b), (ir::Val::Const(_), ir::Val::Const(_))) =>
+        {
+            Some((s.dst.clone(), s.ty.bytes()))
+        }
         Inst::Select(s) if s.ptr => None,
         Inst::Select(s) => Some((s.dst.clone(), s.ty.bytes())),
         Inst::Call(c) => match (&c.dst, &c.ty) {

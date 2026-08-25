@@ -25,6 +25,7 @@ fn local_widths(m: &Module, fname: &str) -> HashMap<String, u8> {
                 Inst::Bin(b) => (b.dst.clone(), b.ty.bytes()),
                 Inst::Zext(z) => (z.dst.clone(), z.to.bytes()),
                 Inst::Trunc(t) => (t.dst.clone(), t.to.bytes()),
+                Inst::IntToPtr(p) => (p.dst.clone(), p.to.bytes()),
                 Inst::Icmp(i) => (i.dst.clone(), 1),
                 Inst::Select(s) => (s.dst.clone(), s.ty.bytes()),
                 Inst::Call(c) => match (&c.dst, &c.ty) {

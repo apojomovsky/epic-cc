@@ -12,8 +12,8 @@
 
 use ir::{
     Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin,
-    FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, MemLen, Memcpy, Module,
-    Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext,
+    FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, IntToPtr, Load, MemLen, Memcpy,
+    Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -2398,7 +2398,11 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         }
         "phi" => {
             let body = rest["phi".len()..].trim();
-            let ty = ty_of(body.split_whitespace().next().unwrap());
+            let ty_tok = body.split_whitespace().next().unwrap().to_string();
+            // A pointer-typed phi prints with a `ptr` type token; ty_of maps
+            // that to Ty::I16, so the token is captured before the erasure.
+            let ptr = ty_tok == "ptr";
+            let ty = ty_of(&ty_tok);
             let mut incoming = Vec::new();
             for part in body.split('[').skip(1) {
                 let inner = part.split(']').next().unwrap();
@@ -2415,10 +2419,11 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             out.push(Inst::Phi(Phi {
                 dst: dst.unwrap(),
                 ty,
+                ptr,
                 incoming,
             }));
         }
-        "zext" | "sext" | "trunc" | "inttoptr" | "ptrtoint" => {
+        "zext" | "sext" | "trunc" | "ptrtoint" => {
             let body = strip_attrs(&rest[op.len()..]);
             let to_i = body.rfind(" to ").unwrap();
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
@@ -2427,7 +2432,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let val = parse_val_typed(it.next().unwrap(), Some(from));
             let to = ty_of(rhs);
             match op.as_str() {
-                "zext" | "inttoptr" => out.push(Inst::Zext(Zext {
+                "zext" => out.push(Inst::Zext(Zext {
                     dst: dst.unwrap(),
                     from,
                     val,
@@ -2446,6 +2451,25 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     to,
                 })),
             }
+        }
+        "inttoptr" => {
+            // A runtime integer address becoming a pointer VALUE: the dst
+            // slot holds the two address bytes, seeded as an indirect
+            // (sret-style) pointer by iselcore. Kept distinct from `zext`,
+            // whose i16->i16 shape is a plain value copy.
+            let body = strip_attrs(&rest[op.len()..]);
+            let to_i = body.rfind(" to ").unwrap();
+            let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
+            let mut it = lhs.split_whitespace();
+            let from = ty_of(it.next().unwrap());
+            let val = parse_val_typed(it.next().unwrap(), Some(from));
+            let to = ty_of(rhs);
+            out.push(Inst::IntToPtr(IntToPtr {
+                dst: dst.unwrap(),
+                from,
+                val,
+                to,
+            }));
         }
         "icmp" => {
             let body = strip_attrs(&rest["icmp".len()..]);
@@ -2486,7 +2510,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 let Some(t) = toks.get(i + 1) else {
                     return false;
                 };
-                t.starts_with('@') || t.starts_with("getelementptr")
+                t.starts_with('@') || t.starts_with("getelementptr") || t.starts_with("inttoptr")
             };
             let ptr = arm_is_const_ptr(&parts[1]) && arm_is_const_ptr(&parts[2]);
             let a = parse_select_arm(&parts[1], types, fresh, &mut out);

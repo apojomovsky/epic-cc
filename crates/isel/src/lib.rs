@@ -30,8 +30,12 @@
 //! crossing an SFR hole would silently mis-address, so it panics loudly at
 //! emission (the object span comes from the global size / param width /
 //! alloca size). An *indirect* (sret) base sets IRP from the stored
-//! address's high byte (`BTFSC/BTFSS <slot+1>,0; BSF/BCF STATUS,7`) before
-//! computing `FSR = [slot] + k + off`, so sret targets may sit in any bank
+//! (the caller's sret store checks the target's window the same way). A
+//! runtime SFR address (a runtime `inttoptr`, issue #117) is reached the
+//! same way and needs no static BANKSEL: `INDF` addresses the whole linear
+//! file space through FSR+IRP, so an indirect access never consults a bank
+//! register.
+//!
 //! (the caller's sret store checks the target's window the same way).
 //!
 //! Every value's address comes from the caller-supplied address map: globals
@@ -366,6 +370,7 @@ impl<'m> Gen<'m> {
                     Inst::Zext(z) if z.dst == name => z.to.bytes(),
                     Inst::Sext(x) if x.dst == name => x.to.bytes(),
                     Inst::Trunc(t) if t.dst == name => t.to.bytes(),
+                    Inst::IntToPtr(p) if p.dst == name => p.to.bytes(),
                     Inst::Icmp(c) if c.dst == name => 1,
                     Inst::Select(s) if s.dst == name => s.ty.bytes(),
                     Inst::Phi(p) if p.dst == name => p.ty.bytes(),
@@ -1034,11 +1039,19 @@ impl<'m> Gen<'m> {
                     self.resolved.get(&ssa_key(self.cur_func, r)).cloned()
                 {
                     // The shapes below read the base's two bytes as a runtime
-                    // address. Only a pointer param's slot holds one: a global's
-                    // or an alloca's address is a link-time constant that would
-                    // need a literal materialization instead.
+                    // address. A pointer param's slot holds one, and so does a
+                    // runtime-address slot (`Base::Slot(_, true)`, an IntToPtr
+                    // or const-arm pointer select dst): its bytes ARE the
+                    // address, so reading them plus k/terms is the pointer
+                    // value. A global's or an alloca's address is a link-time
+                    // constant that would need a literal materialization, so
+                    // those stay loud panics.
                     let sa = match &base {
-                        Base::Slot(sname, false) if self.param_holds_addr(sname) => {
+                        Base::Slot(sname, indirect) => {
+                            assert!(
+                                *indirect || self.param_holds_addr(sname),
+                                "isel: cannot take the value of a GEP over {base:?}"
+                            );
                             self.slot_addr(self.cur_func, sname).direct()
                         }
                         other => panic!("isel: cannot take the value of a GEP over {other:?}"),
@@ -2304,6 +2317,22 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    CLRF 0x{:02X}", da + u16::from(i)));
                 }
             }
+            Inst::IntToPtr(p) => {
+                // A runtime integer address becoming a pointer VALUE: copy
+                // the two address bytes into the dst slot, which iselcore
+                // seeded as an indirect pointer (`Base::Slot(dst, true)`).
+                // Equal-width i16 -> i16, exactly like a zext, but the dst
+                // is an ADDRESS, not an ordinary value.
+                assert_eq!(
+                    p.from, p.to,
+                    "isel: inttoptr must keep the byte width (i16 -> ptr)"
+                );
+                let da = self.slot_addr(self.cur_func, &p.dst).direct();
+                for i in 0..p.from.bytes() {
+                    self.emit_load_byte(&p.val, i);
+                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                }
+            }
             Inst::Sext(x) => {
                 // i8/i16 -> i16/i32, sign-filling from the SOURCE's high
                 // byte (the loop below reads `x.from.bytes() - 1`). i1 has
@@ -2405,10 +2434,19 @@ impl<'m> Gen<'m> {
             }
             Inst::Select(s) => {
                 if s.ptr {
-                    // A pointer-typed select is a pointer VALUE, folded by
-                    // iselcore into the resolved map like a GEP: it emits
-                    // nothing and every load/store/memcpy through it lowers
-                    // via the fold (mirror of Inst::Gep below).
+                    if matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
+                        // A pointer select over two runtime address LITERALS
+                        // (the HAL's `pir_reg_addr(d)` arms): the selected
+                        // arm's address bytes must land in the dst slot,
+                        // which iselcore seeded as an indirect pointer. The
+                        // two-byte value select is exactly the materialization.
+                        self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
+                    } else {
+                        // A pointer-typed select is a pointer VALUE, folded by
+                        // iselcore into the resolved map like a GEP: it emits
+                        // nothing and every load/store/memcpy through it lowers
+                        // via the fold (mirror of Inst::Gep below).
+                    }
                 } else {
                     self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
                 }

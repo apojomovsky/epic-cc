@@ -378,6 +378,31 @@ fn gep_base_global_roundtrips() {
 }
 
 #[test]
+fn roundtrips_runtime_inttoptr() {
+    // epic-cc#117: a runtime integer address becoming a pointer VALUE keeps
+    // its own instruction (distinct from `zext`, whose i16->i16 shape is a
+    // plain value copy) so iselcore can seed the dst as an indirect pointer.
+    let text = "fn main(void) ()\n  block entry:\n    %p = inttoptr i16 %a to i16\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    assert!(
+        out.contains("%p = inttoptr i16 %a to i16"),
+        "inttoptr inst\n---\n{out}"
+    );
+    let m2 = parse(&out);
+    assert_eq!(serialize(&m2), out, "stable fixed point");
+    match &m2.funcs[0].blocks[0].insts[0] {
+        ir::Inst::IntToPtr(p) => {
+            assert_eq!(p.dst, "p");
+            assert_eq!(p.from, ir::Ty::I16);
+            assert_eq!(p.val, ir::Val::Reg("a".to_string()));
+            assert_eq!(p.to, ir::Ty::I16);
+        }
+        other => panic!("expected IntToPtr, got {other:?}"),
+    }
+}
+
+#[test]
 fn roundtrips_isr_marker() {
     // Milestone 13: the interrupt marker `[isr]` sits between the ret group
     // and the params group: `fn isr(void) [isr] ()`. It must round-trip and

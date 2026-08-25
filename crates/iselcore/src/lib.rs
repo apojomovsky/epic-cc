@@ -160,7 +160,96 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                     Inst::Select(s) if s.ptr => {
                         selects.insert(ssa_key(&f.name, &s.dst), s.clone());
                     }
+                    Inst::IntToPtr(p) => {
+                        // A runtime integer address becoming a pointer VALUE:
+                        // the dst slot holds the two address bytes, so every
+                        // load/store through it lowers as an indirect
+                        // (sret-style) FSR/INDF access. The address bytes are
+                        // materialized by isel's `Inst::IntToPtr` lowering.
+                        resolved.insert(
+                            ssa_key(&f.name, &p.dst),
+                            (Base::Slot(p.dst.clone(), true), 0, Vec::new()),
+                        );
+                    }
                     _ => {}
+                }
+            }
+        }
+    }
+
+    // Pointer-typed selects whose two arms are compile-time pointer
+    // constants (the literal `inttoptr (<ty> <k> to ptr)` arms clang emits
+    // for the HAL's `pir_reg_addr(d)`) are runtime address VALUES: the
+    // selected arm's address bytes land in the dst slot (isel materializes
+    // the select as a 2-byte value select), so the dst dereferences as an
+    // indirect slot like an IntToPtr result.
+    for f in &m.funcs {
+        let fname = f.name.clone();
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            for (key, s) in selects
+                .iter()
+                .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
+            {
+                if resolved.contains_key(key) {
+                    continue;
+                }
+                let const_arm = |v: &ir::Val| matches!(v, ir::Val::Const(_));
+                if const_arm(&s.a) && const_arm(&s.b) {
+                    resolved.insert(
+                        key.clone(),
+                        (Base::Slot(s.dst.clone(), true), 0, Vec::new()),
+                    );
+                    progressed = true;
+                }
+            }
+        }
+    }
+    // Pointer-typed phis whose every incoming is a runtime-address value
+    // (a `Const` literal address or a register already seeded as a runtime
+    // slot) are runtime addresses themselves: phi elimination copies the
+    // incoming's two bytes into the dst slot per edge, so the dst can
+    // dereference indirectly. A phi with any compile-time (folded) arm
+    // keeps the loud unresolvable-chain panic below: its bytes do not live
+    // in a slot.
+    for f in &m.funcs {
+        let fname = f.name.clone();
+        let mut progressed = true;
+        while progressed {
+            progressed = false;
+            for b in &f.blocks {
+                for i in &b.insts {
+                    if let Inst::Phi(p) = i {
+                        // Only a pointer-typed phi (`phi ptr [...]`) is a
+                        // pointer VALUE; a plain i16 value phi (clang emits
+                        // `phi i8`/`phi i16` for value merges everywhere)
+                        // must never be seeded as an indirect slot.
+                        if !p.ptr {
+                            continue;
+                        }
+                        let key = ssa_key(&fname, &p.dst);
+                        if resolved.contains_key(&key) {
+                            continue;
+                        }
+                        // A qualifying reg is one already seeded as a
+                        // runtime-address slot (`Base::Slot(_, true)` with
+                        // no offset): its bytes live in a slot the phi copy
+                        // can move. A folded (compile-time) pointer reg has
+                        // no slot and cannot be an incoming here.
+                        let runtime = p.incoming.iter().all(|(v, _)| match v {
+                            ir::Val::Const(_) => true,
+                            ir::Val::Reg(r) => matches!(
+                                resolved.get(&ssa_key(&fname, r)),
+                                Some((Base::Slot(_, true), 0, t)) if t.is_empty()
+                            ),
+                            ir::Val::Global(_) => false,
+                        });
+                        if runtime && !p.incoming.is_empty() {
+                            resolved.insert(key, (Base::Slot(p.dst.clone(), true), 0, Vec::new()));
+                            progressed = true;
+                        }
+                    }
                 }
             }
         }
@@ -223,6 +312,13 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
             // mismatches, non-reg cond) stay pending and panic below.
             let mut rest_selects = Vec::new();
             for (key, s) in pending_selects {
+                // A select whose arms are both runtime address CONSTANTS was
+                // already seeded above as an indirect slot: the bytes the
+                // select writes into the dst come from isel's value-select
+                // materialization, not from a fold. Skip it here.
+                if matches!((&s.a, &s.b), (ir::Val::Const(_), ir::Val::Const(_))) {
+                    continue;
+                }
                 if let Some(folded) = fold_select(&s, &resolved, &fname) {
                     assert!(
                         !resolved.contains_key(&key),
