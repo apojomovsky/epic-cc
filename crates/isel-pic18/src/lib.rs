@@ -343,15 +343,21 @@ impl<'m> Gen<'m> {
                     .cloned()
                     .unwrap();
                 let sa = match &base {
-                    iselcore::Base::Slot(sname, false)
-                        if self
-                            .m
-                            .funcs
-                            .iter()
-                            .find(|f| f.name == self.cur_func)
-                            .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
-                            .unwrap_or(false) =>
-                    {
+                    iselcore::Base::Slot(sname, indirect) => {
+                        let holds_addr = if *indirect {
+                            true
+                        } else {
+                            self.m
+                                .funcs
+                                .iter()
+                                .find(|f| f.name == self.cur_func)
+                                .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
+                                .unwrap_or(false)
+                        };
+                        assert!(
+                            holds_addr,
+                            "isel-pic18: cannot materialize GEP over {base:?} in move to slot"
+                        );
                         self.slot_addr(self.cur_func, sname).direct()
                     }
                     other => {

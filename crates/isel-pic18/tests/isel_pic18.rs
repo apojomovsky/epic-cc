@@ -1283,6 +1283,34 @@ fn runtime_ptr_select_derefs_through_fsr0() {
 }
 
 #[test]
+fn runtime_ptr_phi_derefs_through_slot_after_phi_copies() {
+    // The GetFlag -O1 shape on PIC18: a pointer phi joining a literal-arm
+    // select result and a literal. Phi copies move the incoming's address
+    // bytes into the dst slot per edge, then the deref goes indirect
+    // through FSR0/INDF0 from the slot.
+    let m = parse(
+        "global c i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %c = load i8 @c\n    br i1 %c t f\n  block t:\n    %pt = select i1 %c ptr 12 ptr 13\n    br merge\n  block f:\n    br merge\n  block merge:\n    %p = phi ptr %pt t 11 f\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("c", 0x20),
+        ("out", 0x21),
+        ("main::c", 0x25),
+        ("main::pt", 0x26),
+        ("main::p", 0x28),
+        ("main::v", 0x29),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs);
+    assert!(
+        asm.contains("MOVFF 0x028, 0xFE9"),
+        "FSR0 loaded from the phi dst slot:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFEF, 0x029"),
+        "access through INDF0 (0xFEF):\n{asm}"
+    );
+}
+
+#[test]
 fn select_l_end_resets_bsr_so_a_later_same_block_instruction_is_not_misbanked() {
     // Regression for a third instance of the same BSR-tracking hazard,
     // this time at `Select`'s MERGE label (`l_end`), found during the
