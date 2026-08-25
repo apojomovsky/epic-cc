@@ -24,6 +24,10 @@ use std::process::Command;
 
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
+    if argv.iter().any(|a| a == "--version" || a == "-V") {
+        println!("epic-cc {}", env!("EPIC_CC_STAMP"));
+        return;
+    }
     let has_device_flag = argv
         .iter()
         .any(|a| matches!(a.as_str(), "--device" | "--target" | "--mcu" | "-mcu"));
