@@ -79,7 +79,27 @@ For every ticket:
    (see Worktrees below, never work on `master`).
 3. Work, then run the takeoff ritual (`make pre-pr-check` → `epic-tasks takeoff`).
 4. Open the pull request with `Closes #N`, then
-   `epic-tasks review <repo>#<n> --pr <url>`.
+   `epic-tasks review <repo>#<n> --pr <url>`. The body must use real newlines:
+   copy-paste-safe ``gh pr create --body-file - <<'EOF'`` (or
+   ``cat <<'EOF' > /tmp/pr_body.md`` + ``gh pr create --body-file /tmp/pr_body.md``),
+   NEVER ``gh pr create --body "a\nb"``, the shell never expands ``\n`` so GitHub
+   renders literal ``\n`` as text and the bullets collapse to one line (epic-cc#129):
+   ```bash
+   cat <<'EOF' > /tmp/pr_body.md
+   Closes #N
+
+   Summary of the change.
+
+   - bullet one
+   - bullet two
+   EOF
+   gh pr create --title "fix(scope): summary" --body-file /tmp/pr_body.md
+   # - or inline: gh pr create --title "..." --body-file - <<'EOF'
+   ```
+   Heal an existing PR with ``gh pr edit --body-file - <<'EOF'`` or
+   ``python3 -c 'from epic_tasks.gh import normalize_pr_body; print(normalize_pr_body(open("body.txt").read()))'``.
+   The local ``check_pr_body`` gate (``epic_tasks/takeoff.py``) warns (advisory) and
+   ``.github/workflows/pr-body.yml`` fails in CI when the body contains literal ``\n``/``\r``.
 5. After the PR merges, remove the worktree:
    `git worktree remove .worktrees/<name>`. Never remove a worktree before
    merge, the branch must stay reachable for review.
@@ -165,8 +185,15 @@ Run `make pre-pr-check` before opening a PR. It is a thin wrapper around
    narrative; docs stay clear and skip volatile facts) and fixes
    what doesn't hold up. `make pre-pr-check PROSE=1` records that the
    review happened.
-7. Hooks installed (`make setup-hooks`).
-8. `make pre-pr-check TEST=1` also runs the full suite (or `epic-tasks takeoff --test`).
+7. **PR body hygiene: real newlines only.** PR descriptions must use
+   actual newlines (``gh pr create --body-file <file>`` or a heredoc),
+   never an inline ``"a\n\n- b"`` that renders literally as ``\n`` on
+   GitHub (epic-cc#129). The takeoff ritual (``check_pr_body`` in
+   ``epic_tasks/takeoff.py`` + ``epic_tasks.gh:normalize_pr_body``) warns (advisory) and
+   the ``.github/workflows/pr-body.yml`` CI workflow fails in CI when a body
+   contains literal ``\n``/``\r``; heal with ``gh pr edit --body-file``.
+8. Hooks installed (`make setup-hooks`).
+9. `make pre-pr-check TEST=1` also runs the full suite (or `epic-tasks takeoff --test`).
 
 The ritual exits 1 with the exact fix list while blocking items are
 outstanding. Don't skip it; the CI gate only covers the suite, not the
@@ -179,9 +206,12 @@ ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
   `build(...)`, `ci(...)`, `test(...)`. Scope is usually the crate
   (`isel`, `banking`, `driver`) or `docker`.
 - **Never `Co-Authored-By:` or any other trailer, and no em-dashes
-  (—).** The commit-msg hook rejects both. Use a comma, a colon, or a
+  (,).** The commit-msg hook rejects both. Use a comma, a colon, or a
   period instead. Git history is the record; the commit message is
   yours.
+- **PR bodies use real newlines.** ``gh pr create --body-file`` or a
+  heredoc, never ``--body "line\nnext"``. Literal ``\n`` is rejected by
+  takeoff and by ``.github/workflows/pr-body.yml`` (epic-cc#129).
 - Commit whenever a piece of work is finished; don't batch unrelated
   changes.
 - Update the docs a change touches before calling it done.
@@ -228,13 +258,13 @@ ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
    commit, not in the tree, where they go stale. Durable toolchain or
    hardware facts (with a date) are a different class and stay.
 5. `TODO`/`FIXME` carry a concrete reason or do not exist.
-6. **No em-dashes (—) in prose.** Not in comments, docs, or commit
+6. **No em-dashes (,) in prose.** Not in comments, docs, or commit
    messages: use a comma, a colon, or a period and a new sentence.
    The exception is ascii-art diagrams, where alignment may force
    them. The pre-pr-check and commit-msg hook enforce this.
    Replacing an em-dash is a judgment call, not a swap: pick the
    replacement (and split or reorder the sentence when needed) so
-   the result reads as prose. A mechanical ` — ` -> ` , ` sweep
+   the result reads as prose. A mechanical ` , ` -> ` , ` sweep
    produces comma splices; the pre-pr-check flags the ` ,` residue
    as a warning. Prefer a human or a language model for sweeps.
 

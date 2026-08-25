@@ -1,0 +1,37 @@
+name: pr-body
+
+# Resilience for oh-my-pi escaped-newline bug (epic-cc#129): bodies that
+# contain literal \n instead of real newlines render as one line on GitHub.
+# Both the local takeoff gate (epic_tasks/takeoff.py:check_pr_body) and this
+# CI workflow enforce the same invariant so the bug is caught no matter which
+# client opened the PR.
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+jobs:
+  pr-body:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR body for literal \n escapes
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.pull_request?.body || "";
+            // Strip fenced and inline code so documenting the bug (e.g. `--body "a\nb"`) does not trip the gate
+            const stripped = body.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '');
+            if (stripped.includes("\\n") || stripped.includes("\\r")) {
+              const preview = body.slice(0, 300).replaceAll("\n", "↵");
+              core.setFailed(
+                `PR body contains literal \\n (backslash + n) rendered as text, not a newline ` +
+                `(epic-cc#129). Use real newlines: gh pr create --body-file <file> or a heredoc, ` +
+                `never an inline "\\n" string. Fix: gh pr edit ${context.payload.pull_request.number} --body-file <fixed>. ` +
+                `Preview: ${preview}`
+              );
+            } else {
+              core.info("PR body newlines ok");
+            }
