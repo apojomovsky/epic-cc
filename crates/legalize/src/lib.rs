@@ -971,7 +971,10 @@ fn fill_indirect_callees(m: &mut Module) {
     }
     addr_taken.retain(|g| defined.contains(g.as_str()));
 
-    // Direct call edges (indirect sites have no static target yet).
+    // Direct call edges plus address-taken edges (a stored callback, a
+    // select arm): a function whose address appears as a value in `f`'s body
+    // is a potential indirect-call target of `f`, so it must be in `f`'s
+    // context for the candidate split (epic-cc#73).
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for f in &m.funcs {
         adj.entry(f.name.clone()).or_default();
@@ -981,6 +984,11 @@ fn fill_indirect_callees(m: &mut Module) {
                     if c.callees.is_empty() {
                         adj.entry(f.name.clone()).or_default().push(c.func.clone());
                     }
+                }
+                let mut taken = HashSet::new();
+                collect_global_vals(inst, &mut taken);
+                for g in taken {
+                    adj.entry(f.name.clone()).or_default().push(g);
                 }
             }
         }
