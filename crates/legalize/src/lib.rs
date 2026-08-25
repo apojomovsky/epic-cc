@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 
 use ir::{
     Alloca, Bin, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Icmp, Inst,
-    MemLen, Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
+    IntToPtr, MemLen, Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
 };
 
 pub fn legalize(m: Module) -> Module {
@@ -296,6 +296,7 @@ fn inst_regs(inst: &Inst) -> Vec<String> {
         Inst::Zext(z) => push(&z.val),
         Inst::Sext(x) => push(&x.val),
         Inst::Trunc(t) => push(&t.val),
+        Inst::IntToPtr(p) => push(&p.val),
         Inst::Gep(g) => {
             if let GepBase::Reg(r) = &g.base {
                 regs.push(r.clone());
@@ -366,6 +367,12 @@ fn substitute_regs(
             from: t.from,
             val: sub(&t.val),
             to: t.to,
+        }),
+        Inst::IntToPtr(p) => Inst::IntToPtr(IntToPtr {
+            dst: rename.get(&p.dst).cloned().unwrap_or_else(|| p.dst.clone()),
+            from: p.from,
+            val: sub(&p.val),
+            to: p.to,
         }),
         Inst::Gep(g) => {
             let base = match &g.base {
@@ -507,6 +514,7 @@ fn inst_dst(inst: &Inst) -> Option<&str> {
         Inst::Zext(z) => Some(&z.dst),
         Inst::Sext(s) => Some(&s.dst),
         Inst::Trunc(t) => Some(&t.dst),
+        Inst::IntToPtr(p) => Some(&p.dst),
         Inst::Icmp(i) => Some(&i.dst),
         Inst::Select(s) => Some(&s.dst),
         Inst::Call(c) => c.dst.as_deref(),
@@ -910,6 +918,7 @@ fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>) {
         Inst::Zext(z) => rv(&mut z.val, shared),
         Inst::Sext(x) => rv(&mut x.val, shared),
         Inst::Trunc(t) => rv(&mut t.val, shared),
+        Inst::IntToPtr(p) => rv(&mut p.val, shared),
         Inst::Icmp(i) => {
             rv(&mut i.a, shared);
             rv(&mut i.b, shared);
@@ -1054,6 +1063,7 @@ fn collect_global_vals(inst: &Inst, out: &mut HashSet<String>) {
         Inst::Zext(z) => push(&z.val, out),
         Inst::Sext(x) => push(&x.val, out),
         Inst::Trunc(t) => push(&t.val, out),
+        Inst::IntToPtr(p) => push(&p.val, out),
         Inst::Icmp(i) => {
             push(&i.a, out);
             push(&i.b, out);

@@ -7770,6 +7770,7 @@ fn narrow_conversion_sources_sign_and_zero_extend_through_the_call_abi() {
             Inst::Zext(z) => Some((z.dst.clone(), z.to)),
             Inst::Sext(s) => Some((s.dst.clone(), s.to)),
             Inst::Trunc(t) => Some((t.dst.clone(), t.to)),
+            Inst::IntToPtr(p) => Some((p.dst.clone(), p.to)),
             Inst::Icmp(c) => Some((c.dst.clone(), ir::Ty::I1)),
             Inst::Select(s) => Some((s.dst.clone(), s.ty)),
             Inst::Call(c) => c
@@ -8102,6 +8103,7 @@ fn fcmp_predicates_materialize_end_to_end() {
             Inst::Zext(z) => Some((z.dst.clone(), z.to)),
             Inst::Sext(s) => Some((s.dst.clone(), s.to)),
             Inst::Trunc(t) => Some((t.dst.clone(), t.to)),
+            Inst::IntToPtr(p) => Some((p.dst.clone(), p.to)),
             Inst::Icmp(c) => Some((c.dst.clone(), ir::Ty::I1)),
             Inst::Select(s) => Some((s.dst.clone(), s.ty)),
             Inst::Call(c) => c

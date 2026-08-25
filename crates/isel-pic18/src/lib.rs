@@ -223,6 +223,7 @@ impl<'m> Gen<'m> {
                     Inst::Zext(z) if z.dst == reg => Some(z.to.bytes()),
                     Inst::Sext(s) if s.dst == reg => Some(s.to.bytes()),
                     Inst::Trunc(t) if t.dst == reg => Some(t.to.bytes()),
+                    Inst::IntToPtr(p) if p.dst == reg => Some(p.to.bytes()),
                     Inst::Icmp(c) if c.dst == reg => Some(1),
                     Inst::Select(s) if s.dst == reg => Some(s.ty.bytes()),
                     Inst::Call(c) => match (&c.dst, &c.ty) {

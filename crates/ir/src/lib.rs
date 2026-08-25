@@ -79,6 +79,18 @@ pub struct Zext {
     pub to: Ty,
 }
 #[derive(Clone, Debug)]
+/// `%d = inttoptr <from> <val> to ptr`: a runtime integer address becoming a
+/// pointer VALUE. Kept distinct from `Zext` (which also parses to i16/i16)
+/// because the dst slot of an `IntToPtr` holds a target ADDRESS, not an
+/// ordinary value: `iselcore` seeds it as `Base::Slot(dst, true)` so every
+/// load/store through it lowers as an indirect (FSR/INDF) access.
+pub struct IntToPtr {
+    pub dst: String,
+    pub from: Ty,
+    pub val: Val,
+    pub to: Ty,
+}
+#[derive(Clone, Debug)]
 pub struct Sext {
     pub dst: String,
     pub from: Ty,
@@ -263,6 +275,7 @@ pub enum Inst {
     Zext(Zext),
     Sext(Sext),
     Trunc(Trunc),
+    IntToPtr(IntToPtr),
     Icmp(Icmp),
     Select(Select),
     Call(Call),
@@ -552,6 +565,13 @@ fn inst_str(i: &Inst) -> String {
             ty_str(t.from),
             val_str(&t.val),
             ty_str(t.to)
+        ),
+        Inst::IntToPtr(p) => format!(
+            "%{} = inttoptr {} {} to {}",
+            p.dst,
+            ty_str(p.from),
+            val_str(&p.val),
+            ty_str(p.to)
         ),
         Inst::Icmp(i) => format!(
             "%{} = icmp {} {} {} {}",
@@ -1249,6 +1269,18 @@ fn parse_inst(line: &str) -> Inst {
     if let Some(rest) = body.strip_prefix("alloca ") {
         let size = rest.trim().parse().unwrap();
         return Inst::Alloca(Alloca { dst, size });
+    }
+    if let Some(rest) = body.strip_prefix("inttoptr ") {
+        let mut it = rest.split_whitespace();
+        let from = parse_ty(it.next().unwrap());
+        let val = parse_val(it.next().unwrap());
+        assert_eq!(
+            it.next().unwrap(),
+            "to",
+            "inttoptr must be '%d = inttoptr <t> <v> to <t2>'"
+        );
+        let to = parse_ty(it.next().unwrap());
+        return Inst::IntToPtr(IntToPtr { dst, from, val, to });
     }
     if let Some(rest) = body.strip_prefix("zext ") {
         let mut it = rest.split_whitespace();

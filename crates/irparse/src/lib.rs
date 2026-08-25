@@ -12,8 +12,8 @@
 
 use ir::{
     Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin,
-    FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, Load, MemLen, Memcpy, Module,
-    Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext,
+    FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, IntToPtr, Load, MemLen, Memcpy,
+    Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -2418,7 +2418,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 incoming,
             }));
         }
-        "zext" | "sext" | "trunc" | "inttoptr" | "ptrtoint" => {
+        "zext" | "sext" | "trunc" | "ptrtoint" => {
             let body = strip_attrs(&rest[op.len()..]);
             let to_i = body.rfind(" to ").unwrap();
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
@@ -2427,7 +2427,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let val = parse_val_typed(it.next().unwrap(), Some(from));
             let to = ty_of(rhs);
             match op.as_str() {
-                "zext" | "inttoptr" => out.push(Inst::Zext(Zext {
+                "zext" => out.push(Inst::Zext(Zext {
                     dst: dst.unwrap(),
                     from,
                     val,
@@ -2446,6 +2446,25 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     to,
                 })),
             }
+        }
+        "inttoptr" => {
+            // A runtime integer address becoming a pointer VALUE: the dst
+            // slot holds the two address bytes, seeded as an indirect
+            // (sret-style) pointer by iselcore. Kept distinct from `zext`,
+            // whose i16->i16 shape is a plain value copy.
+            let body = strip_attrs(&rest[op.len()..]);
+            let to_i = body.rfind(" to ").unwrap();
+            let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
+            let mut it = lhs.split_whitespace();
+            let from = ty_of(it.next().unwrap());
+            let val = parse_val_typed(it.next().unwrap(), Some(from));
+            let to = ty_of(rhs);
+            out.push(Inst::IntToPtr(IntToPtr {
+                dst: dst.unwrap(),
+                from,
+                val,
+                to,
+            }));
         }
         "icmp" => {
             let body = strip_attrs(&rest["icmp".len()..]);

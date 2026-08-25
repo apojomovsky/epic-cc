@@ -366,6 +366,7 @@ impl<'m> Gen<'m> {
                     Inst::Zext(z) if z.dst == name => z.to.bytes(),
                     Inst::Sext(x) if x.dst == name => x.to.bytes(),
                     Inst::Trunc(t) if t.dst == name => t.to.bytes(),
+                    Inst::IntToPtr(p) if p.dst == name => p.to.bytes(),
                     Inst::Icmp(c) if c.dst == name => 1,
                     Inst::Select(s) if s.dst == name => s.ty.bytes(),
                     Inst::Phi(p) if p.dst == name => p.ty.bytes(),
