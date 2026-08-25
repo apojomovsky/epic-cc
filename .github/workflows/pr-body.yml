@@ -22,7 +22,9 @@ jobs:
         with:
           script: |
             const body = context.payload.pull_request?.body || "";
-            if (body.includes("\\n") || body.includes("\\r")) {
+            // Strip fenced and inline code so documenting the bug (e.g. `--body "a\nb"`) does not trip the gate
+            const stripped = body.replace(/```[\s\S]*?```/g, '').replace(/`[^`]*`/g, '');
+            if (stripped.includes("\\n") || stripped.includes("\\r")) {
               const preview = body.slice(0, 300).replaceAll("\n", "↵");
               core.setFailed(
                 `PR body contains literal \\n (backslash + n) rendered as text, not a newline ` +
