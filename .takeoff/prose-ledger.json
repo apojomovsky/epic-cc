@@ -181,5 +181,10 @@
     "tier": "4-8",
     "justification": "const-arm selects were seeded as slots; the fold pass skips them since their bytes come from the select materialization.",
     "exception": "hand-trace"
+  },
+  "2b9384fc61b7": {
+    "tier": "4-8",
+    "justification": "Two base kinds hold runtime address bytes for pointer-value materialization; both read as base+k+terms. Literal bases stay loud panics.",
+    "exception": "hand-trace"
   }
 }
