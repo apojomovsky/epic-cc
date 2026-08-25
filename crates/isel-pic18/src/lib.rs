@@ -413,6 +413,17 @@ impl<'m> Gen<'m> {
                     }
                 }
             }
+            Val::Global(g) if self.is_function(g) => {
+                // A function's address is a link-time label literal: byte 0
+                // = LOW(g), byte 1 = HIGH(g) (epic-cc#73).
+                for i in 0..ty.bytes() {
+                    let lit = if i == 0 { "LOW" } else { "HIGH" };
+                    self.emit(format!("    MOVLW {lit}({g})"));
+                    let (a, f) = self.operand(dst + u16::from(i));
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                }
+            }
             _ => {
                 let src = self.val_addr(val).direct();
                 for i in 0..ty.bytes() {
