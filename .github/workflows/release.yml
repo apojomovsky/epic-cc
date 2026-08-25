@@ -86,7 +86,12 @@ jobs:
           Copy-Item "$src\bin\llvm-link.exe" "$bundle\clang\bin\"
           Copy-Item -Recurse "$src\lib\clang" "$bundle\clang\lib\clang"
           Copy-Item "target\release\epic-cc.exe" "$bundle\"
-          Copy-Item "$src\LICENSE.TXT" "$bundle\LICENSE.clang.txt"
+          # The MSVC archive does not ship LICENSE.TXT; fetch the pinned
+          # source license, same file and checksum the Linux bundle uses.
+          curl.exe -fsSL -o "$bundle\LICENSE.clang.txt" "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-20.1.8/llvm/LICENSE.TXT"
+          if ((Get-FileHash "$bundle\LICENSE.clang.txt" -Algorithm SHA256).Hash.ToLowerInvariant() -ne "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee") {
+            throw "clang license checksum mismatch"
+          }
 
       - name: Smoke test (env path vs bundled discovery)
         shell: pwsh
