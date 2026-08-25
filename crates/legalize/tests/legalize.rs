@@ -1075,3 +1075,52 @@ fn rewrites_shared_function_pointer_values_in_isr_context() {
         "main store stays on the original"
     );
 }
+
+/// The pid clamp intrinsics (`llvm.smax`/`llvm.smin`) lower to an
+/// icmp/select tree, and `llvm.abs` to icmp + sub + select. The canonical
+/// text round-trips the lowered shape, so the assertions are text-level
+/// (matching the repo's other legalize tests).
+#[test]
+fn lowers_smax_smin_abs_to_icmp_select() {
+    let m = parse(
+        "global a i16\n\
+         global b i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @a\n\
+             %b = load i16 @b\n\
+             %x = call i16 @llvm.smax.i16(i16 %a, i16 %b)\n\
+             %y = call i16 @llvm.smin.i16(i16 %x, i16 %b)\n\
+             %z = call i16 @llvm.abs.i16(i16 %y, i1 0)\n\
+             store i16 %z, @a\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    // smax: icmp sgt + select of the two operands (canonical text has
+    // no commas between operands).
+    assert!(text.contains("%c0 = icmp sgt i16 %a %b"), "{text}");
+    assert!(text.contains("%x = select i1 %c0 i16 %a i16 %b"), "{text}");
+    // smin: icmp slt + select.
+    assert!(text.contains("%c1 = icmp slt i16 %x %b"), "{text}");
+    assert!(text.contains("%y = select i1 %c1 i16 %x i16 %b"), "{text}");
+    // abs: icmp slt 0, sub 0-a, select neg when negative.
+    assert!(text.contains("%c2 = icmp slt i16 %y 0"), "{text}");
+    assert!(text.contains("%c3 = sub i16 0 %y"), "{text}");
+    assert!(text.contains("%z = select i1 %c2 i16 %c3 i16 %y"), "{text}");
+}
+
+/// An unknown `llvm.*` intrinsic panics loudly so a new clang-emitted
+/// intrinsic surfaces as a clear error instead of a silent hole.
+#[test]
+#[should_panic(expected = "legalize: unknown intrinsic")]
+fn unknown_intrinsic_panics() {
+    let m = parse(
+        "global a i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @a\n\
+             %x = call i16 @llvm.sadd.sat.i16(i16 %a, i16 %a)\n\
+             ret void\n",
+    );
+    let _ = legalize(m);
+}

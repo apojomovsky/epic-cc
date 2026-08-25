@@ -1,4 +1,4 @@
-use ir::{CallArg, GepBase, Global, Inst, MemLen, Val};
+use ir::{CallArg, GepBase, Global, Inst, MemLen, Ty, Val};
 use irparse::parse_ll;
 
 // Array/`constant` globals + getelementptr (phase-3 pointers/const).
@@ -1872,4 +1872,32 @@ define dso_local void @main() {
     assert!(call.callees.is_empty(), "callees filled later by legalize");
     assert_eq!(call.ty, None, "void call");
     assert!(call.args.is_empty());
+}
+
+// epic-cc#133: clang folds the HAL's abs idiom to
+// `tail call i16 @llvm.abs.i16(i16 %x, i1 false)`. The `i1 false` immarg
+// is not an integer token, so parse_call_arg must accept `true`/`false`
+// (as Const(1)/Const(0), the same mapping parse_val uses).
+const ABS_INTRINSIC: &str = r#"
+define i16 @f(i16 %x) {
+  %a = tail call i16 @llvm.abs.i16(i16 %x, i1 false)
+  ret i16 %a
+}
+declare i16 @llvm.abs.i16(i16, i1 immarg)
+"#;
+
+#[test]
+fn parses_abs_intrinsic_i1_false_immarg() {
+    let m = parse_ll(ABS_INTRINSIC);
+    let f = m.funcs.iter().find(|f| f.name == "f").unwrap();
+    match &f.blocks[0].insts[0] {
+        Inst::Call(c) => {
+            assert_eq!(c.func, "llvm.abs.i16");
+            assert_eq!(c.args.len(), 2);
+            assert_eq!(c.args[0].val, Val::Reg("x".to_string()));
+            assert_eq!(c.args[1].val, Val::Const(0), "i1 false -> Const(0)");
+            assert_eq!(c.args[1].ty, Some(Ty::I1));
+        }
+        other => panic!("expected Call, got {other:?}"),
+    }
 }
