@@ -151,9 +151,6 @@ fn runtime_sfr_hex_matches_gpasm_and_runs() {
     // inttoptr. Hand-derived from the driver e2e: out_flag = 1 + 0 +
     // read_offset(0)=0x00 + read_offset(0)=0x00 = 1; out_clear = PIR1|PIR2
     // = 0x00; out_write = 0xAA.
-    // standalone write_offset(0, 0xAA) writes PIR1. Hand-derived from the
-    // driver e2e: out_flag = 1 + 0 + read_offset(0)=0x00 + read_offset(1)=
-    // 0x00 = 1; out_clear = PIR1|PIR2 = 0x00; out_write = 0xAA.
     let mut p = Pic14::new(parse_hex(&ours));
     p.ram_mut()[0x20] = 4; // irq (layout from the driver run)
     p.ram_mut()[0x0B] = 0x00; // INTCON
