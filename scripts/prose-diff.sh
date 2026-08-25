@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
-# Diff-scoped prose surface for the takeoff ritual's comment/doc review
-# step (AGENTS.md): a thin wrapper over `epic-tasks prose`, so the lint
-# rules live in exactly one place and every epic repository runs the
-# same check. Prints every added comment block in BASE_REF...HEAD with
-# its location, class and id; `--verify` exits 1 with the fix list when
-# a block violates the mechanical prose rules (line caps, decoration,
-# narrative, em-dash). The judgment rules (why not what, earns its
-# lines) are the agent's, applied while reading the listing.
+# Diff-scoped prose for the takeoff ritual's comment review: a thin
+# wrapper over `epic-tasks prose`, so the lint rules live in one
+# place and every epic repo runs the same lint. Prints every added
+# comment block in BASE_REF..HEAD; `--verify` exits 1 with the fix
+# list when a block violates the mechanical rules.
 #
 # Usage: bash scripts/prose-diff.sh [--verify]
-#   --verify exit 1 with the fix list when blocks violate the rules
 #   BASE_REF overrides the base branch (forks: BASE_REF=<fork>/master)
 
 set -uo pipefail

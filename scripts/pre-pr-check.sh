@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Unified takeoff — thin wrapper around `epic-tasks takeoff`.
-# Canonical checks live in epic-tasks/epic_tasks/takeoff.py so every epic
-# repository runs the same ritual (worktree discipline, hygiene, prose,
-# repo-specific hard gates). This file only preserves `make pre-pr-check`
-# as the entry point and forwards flags.
+# Unified takeoff, a thin wrapper around `epic-tasks takeoff`, so every
+# epic repo runs the same canonical checks (worktree discipline, prose
+# lint, hygiene). This file only preserves `make pre-pr-check` as the
+# entry point and forwards flags.
 #
 # Usage: bash scripts/pre-pr-check.sh [--test] [--base <ref>]
 #   --test   also run the full suite
 #   --base   base ref to diff against (default origin/master or $BASE_REF)
-#   BASE_REF env var overrides the base (for forks)
 set -uo pipefail
 
 # Prefer a PATH install, fall back to sibling checkout layout.
