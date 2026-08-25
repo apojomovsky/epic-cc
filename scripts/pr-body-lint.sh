@@ -13,7 +13,6 @@ set -euo pipefail
 
 lint_file() {
   local file="$1"
-  # Prefer single-source python helper; fallback to fixed-string grep.
   if python3 -c "from epic_tasks.gh import contains_literal_escapes" 2>/dev/null; then
     if python3 -c "import sys; from epic_tasks.gh import contains_literal_escapes; sys.exit(0 if contains_literal_escapes(open(sys.argv[1], encoding='utf-8', errors='ignore').read()) else 1)" "$file"; then
       echo "pr-body-lint: literal \\n/\\r in $file — use real newlines (gh pr create --body-file - <<'EOF')" >&2
@@ -22,7 +21,14 @@ lint_file() {
       exit 1
     fi
   else
-    if grep -qF '\n' "$file" || grep -qF '\r' "$file"; then
+    if python3 - "$file" <<'PY'
+import re, sys
+data=open(sys.argv[1], encoding="utf-8", errors="ignore").read()
+stripped=re.sub(r"```[\s\S]*?```","",data)
+stripped=re.sub(r"`[^`]*`","",stripped)
+sys.exit(0 if "\\n" in stripped or "\\r" in stripped else 1)
+PY
+    then
       echo "pr-body-lint: literal \\n/\\r in $file — use real newlines (gh pr create --body-file - <<'EOF')" >&2
       echo "hint: cat <<'EOF' > /tmp/pr_body.md; gh pr create --body-file /tmp/pr_body.md" >&2
       grep -nF '\n' "$file" | head -n 20 >&2 || true
