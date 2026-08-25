@@ -53,7 +53,7 @@ make ci-local
 
 # ---- prose lint gate (fires even when the ritual was never run) ----
 
-if ! python3 -m epic_tasks prose --verify; then
+if ! bash scripts/prose-diff.sh --verify; then
     echo "pre-push: comment blocks violating the prose rules (see above)" >&2
     echo "  Fix the flagged blocks, or reword them so they hold up." >&2
     exit 1
