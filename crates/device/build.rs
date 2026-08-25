@@ -12,6 +12,10 @@ struct DeviceToml {
     ram_banks: Vec<(u16, u16)>,
     #[serde(default)]
     common_ram: Option<(u16, u16)>,
+    #[serde(default)]
+    access_bank: Option<(u16, u16)>,
+    #[serde(default)]
+    fixed_retval: Option<(u16, u16)>,
     stack_depth: u8,
     interrupt_vectors: Vec<u16>,
     config: ConfigToml,
@@ -159,18 +163,72 @@ fn main() {
                 );
             }
         }
-        if let Some((clo, chi)) = dev.common_ram {
-            if clo > chi {
-                panic!(
-                    "device: {}: common_ram [{:#06X},{:#06X}] lo > hi",
-                    path, clo, chi
-                );
-            }
-            for (lo, hi) in &dev.ram_banks {
-                if clo <= *hi && chi >= *lo {
-                    panic!("device: {}: common_ram [{:#06X},{:#06X}] overlaps ram_banks [{:#06X},{:#06X}]", path, clo, chi, lo, hi);
+        // per-core memory map checks: common_ram is PIC14 only, access_bank +
+        // fixed_retval are PIC18 only. Ensures the field never carries two
+        // meanings at once (issue #109).
+        match dev.core.as_str() {
+            "pic14" | "pic14e" => {
+                if dev.common_ram.is_none() {
+                    panic!("device: {}: {} requires common_ram", path, dev.core);
+                }
+                if dev.access_bank.is_some() {
+                    panic!(
+                        "device: {}: {} must not have access_bank (PIC18 only)",
+                        path, dev.core
+                    );
+                }
+                if dev.fixed_retval.is_some() {
+                    panic!(
+                        "device: {}: {} must not have fixed_retval (PIC18 only)",
+                        path, dev.core
+                    );
+                }
+                if let Some((clo, chi)) = dev.common_ram {
+                    if clo > chi {
+                        panic!(
+                            "device: {}: common_ram [{:#06X},{:#06X}] lo > hi",
+                            path, clo, chi
+                        );
+                    }
+                    for (lo, hi) in &dev.ram_banks {
+                        if clo <= *hi && chi >= *lo {
+                            panic!("device: {}: common_ram [{:#06X},{:#06X}] overlaps ram_banks [{:#06X},{:#06X}]", path, clo, chi, lo, hi);
+                        }
+                    }
                 }
             }
+            "pic18" => {
+                if dev.common_ram.is_some() {
+                    panic!("device: {}: pic18 must not have common_ram (use access_bank + fixed_retval)", path);
+                }
+                let (alo, ahi) = dev
+                    .access_bank
+                    .unwrap_or_else(|| panic!("device: {}: pic18 requires access_bank", path));
+                let (flo, fhi) = dev
+                    .fixed_retval
+                    .unwrap_or_else(|| panic!("device: {}: pic18 requires fixed_retval", path));
+                if alo > ahi {
+                    panic!(
+                        "device: {}: access_bank [{:#06X},{:#06X}] lo > hi",
+                        path, alo, ahi
+                    );
+                }
+                if flo > fhi {
+                    panic!(
+                        "device: {}: fixed_retval [{:#06X},{:#06X}] lo > hi",
+                        path, flo, fhi
+                    );
+                }
+                if flo < alo || fhi > ahi {
+                    panic!("device: {}: fixed_retval [{:#06X},{:#06X}] must lie inside access_bank [{:#06X},{:#06X}]", path, flo, fhi, alo, ahi);
+                }
+                for (lo, hi) in &dev.ram_banks {
+                    if flo <= *hi && fhi >= *lo {
+                        panic!("device: {}: fixed_retval [{:#06X},{:#06X}] overlaps ram_banks [{:#06X},{:#06X}]", path, flo, fhi, lo, hi);
+                    }
+                }
+            }
+            _ => {}
         }
         if dev.config.erased_baseline.len() != dev.config.num_bytes as usize {
             panic!(
@@ -300,6 +358,14 @@ fn main() {
             Some((lo, hi)) => format!("Some((0x{lo:04X}, 0x{hi:04X}))"),
             None => "None".to_string(),
         };
+        let access_str = match dev.access_bank {
+            Some((lo, hi)) => format!("Some((0x{lo:04X}, 0x{hi:04X}))"),
+            None => "None".to_string(),
+        };
+        let retval_str = match dev.fixed_retval {
+            Some((lo, hi)) => format!("Some((0x{lo:04X}, 0x{hi:04X}))"),
+            None => "None".to_string(),
+        };
         let vectors_str = dev
             .interrupt_vectors
             .iter()
@@ -314,13 +380,15 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
-            "pub const {ident}: Device = Device {{\n    name: \"{name}\",\n    core: {core},\n    flash_words: 0x{flash:X},\n    ram_banks: &[{ram_banks}],\n    common_ram: {common},\n    stack_depth: {stack},\n    interrupt_vectors: &[{vectors}],\n    config: ConfigRegion {{\n        base_byte_addr: 0x{base:X},\n        num_bytes: {num_bytes},\n        erased_baseline: &[{erased}],\n        fields: &[\n",
+            "pub const {ident}: Device = Device {{\n    name: \"{name}\",\n    core: {core},\n    flash_words: 0x{flash:X},\n    ram_banks: &[{ram_banks}],\n    common_ram: {common},\n    access_bank: {access},\n    fixed_retval: {retval},\n    stack_depth: {stack},\n    interrupt_vectors: &[{vectors}],\n    config: ConfigRegion {{\n        base_byte_addr: 0x{base:X},\n        num_bytes: {num_bytes},\n        erased_baseline: &[{erased}],\n        fields: &[\n",
             ident = ident,
             name = dev.name,
             core = core_variant,
             flash = dev.flash_words,
             ram_banks = ram_banks_str,
             common = common_str,
+            access = access_str,
+            retval = retval_str,
             stack = dev.stack_depth,
             vectors = vectors_str,
             base = dev.config.base_byte_addr,

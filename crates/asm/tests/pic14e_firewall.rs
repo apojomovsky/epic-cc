@@ -11,6 +11,8 @@ const PIC14E_STUB: Device = Device {
     flash_words: 0x4000,
     ram_banks: &[(0x20, 0x6F)],
     common_ram: Some((0x70, 0x7F)),
+    access_bank: None,
+    fixed_retval: None,
     stack_depth: 16,
     interrupt_vectors: &[0x0004],
     config: ConfigRegion {

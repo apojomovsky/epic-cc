@@ -2,10 +2,10 @@ name = "p18f4550"
 core = "pic18"
 flash_words = 16384
 ram_banks = [[0x0010, 0x07FF]]
-common_ram = [0x0000, 0x000F]
+access_bank = [0x0000, 0x005F]
+fixed_retval = [0x0000, 0x000F]
 stack_depth = 31
 interrupt_vectors = [0x0008, 0x0018]
-
 [config]
 base_byte_addr = 0x300000
 num_bytes = 14

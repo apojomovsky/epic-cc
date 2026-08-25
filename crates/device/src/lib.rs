@@ -2,8 +2,7 @@
 //! `isel`, `banking`, and `driver` instead of being hard-coded PIC16F877A
 //! literals in each of them. See docs/29-pic18-port-design.md (§2 D-3) for
 //! the design this implements. `has_hardware_multiply`/`has_tblrd` aren't
-//! added (nothing consumes them yet) and `access_bank` never will be  -  it's
-//! a core PIC18 invariant, not a per-device fact.
+//! added (nothing consumes them yet).
 
 mod config;
 pub use config::resolve_config;
@@ -25,9 +24,20 @@ pub struct Device {
     pub flash_words: u32,
     /// Every banked GPR region, in address order: inclusive `(start, end)`.
     pub ram_banks: &'static [(u16, u16)],
-    /// The bank-independent common-RAM range, inclusive, if the core has one
-    /// (`None` for a PIC18 Access-Bank device).
+    /// PIC14 only: the physically mirrored common-RAM window reachable from
+    /// any bank with no `BANKSEL` (`None` on PIC18; the access bank is
+    /// modelled by `access_bank` there).
     pub common_ram: Option<(u16, u16)>,
+    /// PIC18 only: the hardware access bank, BSR-independent, as declared
+    /// by gputils `ACCESSBANK` (`None` on PIC14, whose analogue is
+    /// `common_ram`).
+    pub access_bank: Option<(u16, u16)>,
+    /// PIC18 only: compiler policy reservation inside the access bank for
+    /// the fixed BSR-independent return-value region plus the ISR save
+    /// spill area (`None` on PIC14). Not a hardware fact, so it is not
+    /// cross-checked against the `.lkr`; it is where `isel-pic18` puts
+    /// `retval_lo`.
+    pub fixed_retval: Option<(u16, u16)>,
     /// Hardware call-stack depth; recursion beyond it is rejected at legalize.
     pub stack_depth: u8,
     /// Interrupt vector word address(es): one for PIC14; two (high/low
@@ -112,6 +122,11 @@ impl Device {
     /// core whose banking this cannot express.
     pub fn bank_of(&self, addr: u16) -> Option<u8> {
         if let Some((lo, hi)) = self.common_ram {
+            if addr >= lo && addr <= hi {
+                return None;
+            }
+        }
+        if let Some((lo, hi)) = self.fixed_retval {
             if addr >= lo && addr <= hi {
                 return None;
             }

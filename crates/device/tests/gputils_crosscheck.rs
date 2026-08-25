@@ -121,13 +121,27 @@ fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
             }
         }
         Core::Pic18 => {
-            // Named exception, unresolved: `p18f4550` ships common_ram
-            // [0x0,0xF] while the .lkr access RAM is [0x0,0x5F]. On PIC18 our
-            // common_ram is isel-pic18's fixed retval reservation carved out
-            // of access RAM (see isel-pic18::select), a compiler choice the
-            // .lkr cannot attest, so only the total span is comparable.
+            // PIC18 has two hardware regions: ACCESSBANK (0x0-0x5F) and the
+            // banked GPR banks (0x60-0x7FF). Our `ram_banks` lumps the GPR
+            // part of the access window (0x10-0x5F) with the banked banks,
+            // so a direct per-bank compare would mismatch. Verify the
+            // hardware access window separately and the total allocatable
+            // span (GPR plus the fixed retval reservation) against the
+            // coalesced hardware total. `fixed_retval` is policy, not
+            // hardware, so it is not compared here beyond being part of
+            // the total.
+            let theirs_access = lkr.access.first().copied();
+            if dev.access_bank != theirs_access {
+                let show = |r: Option<(u16, u16)>| r.map_or("none".into(), |x| fmt(&[x]));
+                problems.push(format!(
+                    "{}: access_bank is {} but the first unprotected ACCESSBANK is {}",
+                    dev.name,
+                    show(dev.access_bank),
+                    show(theirs_access)
+                ));
+            }
             let mut ours = dev.ram_banks.to_vec();
-            ours.extend(dev.common_ram);
+            ours.extend(dev.fixed_retval);
             let mut theirs = lkr.banks.clone();
             theirs.extend(&lkr.access);
             let (ours, theirs) = (coalesce(&ours), coalesce(&theirs));
@@ -173,6 +187,29 @@ fn ram_map_matches_gputils_for_every_device() {
     );
     assert!(!checked.is_empty(), "no device was cross-checked");
     assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+#[test]
+fn widening_access_bank_past_0x5f_fails_the_gate() {
+    let lkr = LkrRam {
+        banks: vec![(0x60, 0x7FF)],
+        shared: Vec::new(),
+        access: vec![(0x0, 0x5F)],
+    };
+    let base = device::PIC18F4550;
+    let widened = device::Device {
+        access_bank: Some((0x0000, 0x0060)),
+        ..base
+    };
+    let problems = compare(&widened, &lkr);
+    assert!(
+        !problems.is_empty(),
+        "widened access_bank 0x0-0x60 should disagree with gputils 0x0-0x5F"
+    );
+    assert!(
+        problems.iter().any(|p| p.contains("access_bank")),
+        "problems should name access_bank: {problems:?}"
+    );
 }
 
 fn gpasm() -> String {

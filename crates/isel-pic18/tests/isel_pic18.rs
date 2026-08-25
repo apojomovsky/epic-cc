@@ -1100,7 +1100,7 @@ fn ret_with_a_value_writes_it_into_the_fixed_retval_region() {
     // `Ret(Some((ty, v)))` is new in this task — before this task, only
     // `Ret(None)` was handled at all (inside `emit_inst`, since it hadn't
     // moved into the terminator pass yet). It writes each byte of the
-    // returned value into the fixed retval region (`device.common_ram`,
+    // returned value into the fixed retval region (`device.fixed_retval`,
     // which is 0x0000 for `PIC18F4550`) before `RETURN`. Check both an i8
     // and an i16 return so both the single-byte and multi-byte loop paths
     // are exercised.
