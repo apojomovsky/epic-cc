@@ -929,6 +929,10 @@ fn parse_ty(s: &str) -> Ty {
     match s {
         "i1" => Ty::I1,
         "i8" => Ty::I8,
+        // An opaque `ptr` is a 16-bit address on this datalayout (mirror of
+        // irparse's ty_of); canonical text prints pointer-typed phis and
+        // selects with the `ptr` token.
+        "ptr" => Ty::I16,
         "i16" => Ty::I16,
         "i32" => Ty::I32,
         "float" | "f32" => Ty::F32,
