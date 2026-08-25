@@ -56,3 +56,29 @@ fn edges_text_parseable_format() {
     assert!(text.contains("edge main b\n"));
     assert!(text.contains("depth 2\n"));
 }
+/// An indirect call's `callees` list contributes one edge per candidate, so
+/// the depth check and the overlay allocator see the conservative graph.
+#[test]
+fn indirect_call_emits_one_edge_per_candidate() {
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    %1 = call i8 %3() callees f0 f1\n    ret void\n\
+         fn f0(void) ()\n  block entry:\n    ret void\n\
+         fn f1(void) ()\n  block entry:\n    ret void\n",
+    );
+    let g = build(&m);
+    assert!(g.edges.contains(&("main".into(), "f0".into())));
+    assert!(g.edges.contains(&("main".into(), "f1".into())));
+    assert_eq!(g.max_depth, 2);
+}
+
+/// A cycle through a function pointer (an indirect call whose candidate set
+/// includes a function that reaches the caller) is rejected by the DFS.
+#[test]
+#[should_panic(expected = "recursion")]
+fn recursion_through_function_pointer_detected() {
+    let m = parse(
+        "fn f(void) ()\n  block entry:\n    %1 = call void %3() callees g\n    ret void\n\
+         fn g(void) ()\n  block entry:\n    call void @f()\n    ret void\n",
+    );
+    let _ = build(&m);
+}

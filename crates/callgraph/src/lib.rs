@@ -22,15 +22,25 @@ pub fn build(m: &Module) -> CallGraph {
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::Call(c) = inst {
-                    // Indirect calls lower to a numeric register (e.g. "8");
-                    // they have no static callee and must not enter the
-                    // call graph, otherwise alloc sees an edge to an
-                    // undefined function (epic-cc#73).
-                    if c.func.chars().all(|ch| ch.is_ascii_digit()) {
-                        continue;
+                    // A direct call has a static target. An indirect call
+                    // (numeric `func`, the SSA register) has a `callees`
+                    // candidate list filled by legalize: emit one edge per
+                    // candidate so the depth/recursion checks and the overlay
+                    // allocator see the conservative whole-program graph
+                    // (epic-cc#73). A numeric `func` with no candidates is a
+                    // malformed module and must not enter the graph silently.
+                    if c.callees.is_empty() {
+                        if c.func.chars().all(|ch| ch.is_ascii_digit()) {
+                            continue;
+                        }
+                        edges.push((f.name.clone(), c.func.clone()));
+                        adj.entry(f.name.clone()).or_default().push(c.func.clone());
+                    } else {
+                        for callee in &c.callees {
+                            edges.push((f.name.clone(), callee.clone()));
+                            adj.entry(f.name.clone()).or_default().push(callee.clone());
+                        }
                     }
-                    edges.push((f.name.clone(), c.func.clone()));
-                    adj.entry(f.name.clone()).or_default().push(c.func.clone());
                 }
                 // Inst::Asm and all other non-call instructions: no edge.
             }
