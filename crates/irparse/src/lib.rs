@@ -1494,6 +1494,11 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                         // see parse_val: a poison arg is never observed, so
                         // materializing it as Const(0) is sound.
                         val_tok = Some(t.clone());
+                    } else if t == "true" || t == "false" {
+                        // An `i1 true`/`i1 false` immarg (e.g. llvm.abs's
+                        // `is_int_min_poison`). parse_val maps them to
+                        // Const(1)/Const(0), the same as the bare form.
+                        val_tok = Some(t.clone());
                     } else if t.parse::<i64>().is_ok() {
                         val_tok = Some(t.clone());
                     } else if t.parse::<f32>().is_ok() || t.starts_with("0x") || t.starts_with("0X")

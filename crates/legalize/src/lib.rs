@@ -80,6 +80,18 @@ pub fn legalize(m: Module) -> Module {
                     Inst::FloatBin(fb) => insts.push(lower_fbin(&fb, &mut used)),
                     Inst::Fcmp(fc) => insts.extend(lower_fcmp(&fc, &mut used, &mut names)),
                     Inst::FloatConv(fc) => insts.push(lower_fconv(&fc, &mut used)),
+                    Inst::Call(c) => {
+                        if c.func.starts_with("llvm.") {
+                            // A clang-emitted intrinsic (`llvm.smax.*`,
+                            // `llvm.smin.*`, `llvm.abs.*`) becomes the
+                            // icmp/select tree; an unknown intrinsic panics
+                            // loudly so a new one surfaces as a clear error
+                            // instead of a hole the assembler never sees.
+                            insts.extend(lower_intrinsic(&c, &mut names));
+                        } else {
+                            insts.push(Inst::Call(c));
+                        }
+                    }
                     other => insts.push(other),
                 }
             }
@@ -729,6 +741,106 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
         other => panic!(
             "legalize: unsupported float conversion {other:?} (msp430 has no f64; fpext/fptrunc are f32->f32 only)"
         ),
+    }
+}
+
+/// Rewrite a clang-emitted integer intrinsic call into the icmp/select tree:
+///
+/// | intrinsic | tree |
+/// |---|---|
+/// | `llvm.smax.W(a, b)` | `%c = icmp sgt W %a, %b; select %c, %a, %b` |
+/// | `llvm.smin.W(a, b)` | `%c = icmp slt W %a, %b; select %c, %a, %b` |
+/// | `llvm.abs.W(a, flag)` | `%c = icmp slt W %a, 0; %n = sub W 0, %a; select %c, %n, %a` |
+///
+/// The tree is width-parametric (i8/i16/i32): the isel icmp/select/sub
+/// emitters are byte-generic, so the same shape serves every width. For
+/// `abs`, the `flag` (`is_int_min_poison`) is read but ignored: with
+/// `false` the `sub` maps `INT_MIN -> -INT_MIN = INT_MIN` (the conforming
+/// value), and with `true` any value is conforming for the poison input.
+/// The dst/ty ride on the call's own fields. An unknown `llvm.*` intrinsic
+/// panics loudly so a new one surfaces as a clear error instead of a hole.
+fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
+    let dst = c
+        .dst
+        .clone()
+        .unwrap_or_else(|| panic!("legalize: intrinsic {} must carry a dst", c.func));
+    let ty =
+        c.ty.unwrap_or_else(|| panic!("legalize: intrinsic {} must carry a result type", c.func));
+    let cond = names.fresh();
+    match c.func.as_str() {
+        "llvm.smax.i8" | "llvm.smax.i16" | "llvm.smax.i32" => {
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "sgt".into(),
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a,
+                    b,
+                    ptr: false,
+                }),
+            ]
+        }
+        "llvm.smin.i8" | "llvm.smin.i16" | "llvm.smin.i32" => {
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "slt".into(),
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a,
+                    b,
+                    ptr: false,
+                }),
+            ]
+        }
+        "llvm.abs.i8" | "llvm.abs.i16" | "llvm.abs.i32" => {
+            let a = c.args[0].val.clone();
+            // The second arg (is_int_min_poison) is read but ignored; see
+            // the fn doc for why one lowering serves both flag values.
+            let neg = names.fresh();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "slt".into(),
+                    ty,
+                    a: a.clone(),
+                    b: Val::Const(0),
+                }),
+                Inst::Bin(ir::Bin {
+                    dst: neg.clone(),
+                    op: ir::BinOp::Sub,
+                    ty,
+                    a: Val::Const(0),
+                    b: a.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a: Val::Reg(neg),
+                    b: a,
+                    ptr: false,
+                }),
+            ]
+        }
+        other => panic!("legalize: unknown intrinsic {other:?}"),
     }
 }
 

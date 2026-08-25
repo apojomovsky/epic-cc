@@ -37,6 +37,13 @@ fn check_calls_resolved(m: &Module) {
                     if c.func.chars().all(|ch| ch.is_ascii_digit()) {
                         continue;
                     }
+                    // An `llvm.*` intrinsic is `declare`d by clang, never
+                    // defined here; legalize lowers every supported one and
+                    // panics loudly on an unknown, so skipping keeps this a
+                    // user-symbol check.
+                    if c.func.starts_with("llvm.") {
+                        continue;
+                    }
                     if !defined.contains(c.func.as_str()) {
                         missing.insert(c.func.as_str());
                     }
