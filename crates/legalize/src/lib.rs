@@ -45,7 +45,7 @@ use std::collections::{HashMap, HashSet};
 
 use ir::{
     Alloca, Bin, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Icmp, Inst,
-    Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
+    MemLen, Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
 };
 
 pub fn legalize(m: Module) -> Module {
@@ -115,11 +115,13 @@ pub fn legalize(m: Module) -> Module {
         f.name = name.clone();
         funcs.push(f);
     }
-    Module {
+    let mut m = Module {
         globals: m.globals,
         funcs,
         module_asm: m.module_asm,
-    }
+    };
+    fill_indirect_callees(&mut m);
+    m
 }
 
 /// A pointer-returning function whose body is a pure chain of cond/gep
@@ -771,7 +773,10 @@ fn duplicate_isr_shared(m: Module) -> Module {
         return m;
     }
 
-    // Caller -> callee edges from the CALL insts.
+    // Caller -> callee edges from the CALL insts, plus address-taken edges:
+    // a function whose address appears as a value in `f`'s body (a stored
+    // callback, a select arm) is a potential indirect-call target of `f`,
+    // so it must be in `f`'s context for the duplication (epic-cc#73).
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for f in &m.funcs {
         adj.entry(f.name.clone()).or_default();
@@ -779,6 +784,11 @@ fn duplicate_isr_shared(m: Module) -> Module {
             for inst in &b.insts {
                 if let Inst::Call(c) = inst {
                     adj.entry(f.name.clone()).or_default().push(c.func.clone());
+                }
+                let mut taken = HashSet::new();
+                collect_global_vals(inst, &mut taken);
+                for g in taken {
+                    adj.entry(f.name.clone()).or_default().push(g);
                 }
             }
         }
@@ -862,6 +872,12 @@ fn duplicate_isr_shared(m: Module) -> Module {
                         c.func = format!("{target}_isr");
                     }
                 }
+                // A function-pointer VALUE referencing a shared function
+                // (a `store ptr @f`, a `select ptr @f, ptr @g`, a call arg)
+                // must also point at the `_isr` copy inside the ISR context,
+                // or the ISR would call the main-context original and run in
+                // the main region's frames (epic-cc#73).
+                rewrite_inst_vals(inst, &shared_set);
             }
         }
     }
@@ -869,6 +885,204 @@ fn duplicate_isr_shared(m: Module) -> Module {
         globals: m.globals,
         funcs,
         module_asm: m.module_asm,
+    }
+}
+
+/// Rewrite every `Val::Global(f)` in `inst` to `Val::Global(f_isr)` when `f`
+/// is in `shared` (a function duplicated for the ISR context). Covers every
+/// inst variant that carries a `Val`; the pointer-returning `sink_ptr_select`
+/// bodies and the `Call.func` target are handled separately.
+fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>) {
+    fn rv(v: &mut Val, shared: &HashSet<&str>) {
+        if let Val::Global(g) = v {
+            if shared.contains(g.as_str()) {
+                *v = Val::Global(format!("{g}_isr"));
+            }
+        }
+    }
+    match inst {
+        Inst::Store(s) => rv(&mut s.val, shared),
+        Inst::Bin(b) => {
+            rv(&mut b.a, shared);
+            rv(&mut b.b, shared);
+        }
+        Inst::Ret(Some((_, v))) => rv(v, shared),
+        Inst::Zext(z) => rv(&mut z.val, shared),
+        Inst::Sext(x) => rv(&mut x.val, shared),
+        Inst::Trunc(t) => rv(&mut t.val, shared),
+        Inst::Icmp(i) => {
+            rv(&mut i.a, shared);
+            rv(&mut i.b, shared);
+        }
+        Inst::Select(s) => {
+            rv(&mut s.cond, shared);
+            rv(&mut s.a, shared);
+            rv(&mut s.b, shared);
+        }
+        Inst::Call(c) => {
+            for arg in &mut c.args {
+                rv(&mut arg.val, shared);
+            }
+        }
+        Inst::Phi(p) => {
+            for (v, _) in &mut p.incoming {
+                rv(v, shared);
+            }
+        }
+        Inst::Memcpy(mc) => {
+            rv(&mut mc.dst, shared);
+            rv(&mut mc.src, shared);
+            if let MemLen::Reg(v) = &mut mc.len {
+                rv(v, shared);
+            }
+        }
+        Inst::Freeze(fr) => rv(&mut fr.val, shared),
+        Inst::FloatBin(fb) => {
+            rv(&mut fb.a, shared);
+            rv(&mut fb.b, shared);
+        }
+        Inst::Fcmp(fc) => {
+            rv(&mut fc.a, shared);
+            rv(&mut fc.b, shared);
+        }
+        Inst::FloatConv(fc) => rv(&mut fc.val, shared),
+        _ => {}
+    }
+}
+
+/// Fill the `callees` candidate list of every indirect call site. The
+/// candidate set is the whole-program address-taken set (every function whose
+/// address appears as a value), split by call-graph context so an ISR-context
+/// site only ever references `_isr` copies and a main-context site only the
+/// originals: the overlay allocator's disjoint-region analysis depends on it.
+/// `!callees` metadata is never consumed (clang omits it for table loads).
+fn fill_indirect_callees(m: &mut Module) {
+    // Address-taken set: every `Val::Global(f)` where `f` is a defined
+    // function. Non-const globals with `ptr` initializers are zeroinit and
+    // contribute nothing; const fp tables panic at parse (out of scope).
+    let defined: HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
+    let mut addr_taken: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                collect_global_vals(inst, &mut addr_taken);
+            }
+        }
+    }
+    addr_taken.retain(|g| defined.contains(g.as_str()));
+
+    // Direct call edges (indirect sites have no static target yet).
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &m.funcs {
+        adj.entry(f.name.clone()).or_default();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Call(c) = inst {
+                    if c.callees.is_empty() {
+                        adj.entry(f.name.clone()).or_default().push(c.func.clone());
+                    }
+                }
+            }
+        }
+    }
+    let isr_ctx: HashSet<String> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .flat_map(|f| reachable(&[&f.name], &adj))
+        .collect();
+
+    for f in &mut m.funcs {
+        let in_isr = isr_ctx.contains(&f.name);
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::Call(c) = inst {
+                    // A direct call's `func` is a defined function name; an
+                    // indirect call's `func` is the SSA register (numeric),
+                    // not a defined function. Only the latter gets candidates.
+                    if defined.contains(c.func.as_str()) {
+                        continue;
+                    }
+                    let mut cands: Vec<String> = addr_taken
+                        .iter()
+                        .filter(|g| {
+                            if in_isr {
+                                isr_ctx.contains(*g)
+                            } else {
+                                !isr_ctx.contains(*g)
+                            }
+                        })
+                        .cloned()
+                        .collect();
+                    cands.sort();
+                    // Self-check: every candidate must be a defined function.
+                    for g in &cands {
+                        assert!(
+                            defined.contains(g.as_str()),
+                            "legalize: indirect call candidate @{g} is not a defined function"
+                        );
+                    }
+                    c.callees = cands;
+                }
+            }
+        }
+    }
+}
+
+/// Collect every `Val::Global` in `inst` into `out` (the address-taken set).
+fn collect_global_vals(inst: &Inst, out: &mut HashSet<String>) {
+    fn push(v: &Val, out: &mut HashSet<String>) {
+        if let Val::Global(g) = v {
+            out.insert(g.clone());
+        }
+    }
+    match inst {
+        Inst::Store(s) => push(&s.val, out),
+        Inst::Bin(b) => {
+            push(&b.a, out);
+            push(&b.b, out);
+        }
+        Inst::Ret(Some((_, v))) => push(v, out),
+        Inst::Zext(z) => push(&z.val, out),
+        Inst::Sext(x) => push(&x.val, out),
+        Inst::Trunc(t) => push(&t.val, out),
+        Inst::Icmp(i) => {
+            push(&i.a, out);
+            push(&i.b, out);
+        }
+        Inst::Select(s) => {
+            push(&s.cond, out);
+            push(&s.a, out);
+            push(&s.b, out);
+        }
+        Inst::Call(c) => {
+            for arg in &c.args {
+                push(&arg.val, out);
+            }
+        }
+        Inst::Phi(p) => {
+            for (v, _) in &p.incoming {
+                push(v, out);
+            }
+        }
+        Inst::Memcpy(mc) => {
+            push(&mc.dst, out);
+            push(&mc.src, out);
+            if let MemLen::Reg(v) = &mc.len {
+                push(v, out);
+            }
+        }
+        Inst::Freeze(fr) => push(&fr.val, out),
+        Inst::FloatBin(fb) => {
+            push(&fb.a, out);
+            push(&fb.b, out);
+        }
+        Inst::Fcmp(fc) => {
+            push(&fc.a, out);
+            push(&fc.b, out);
+        }
+        Inst::FloatConv(fc) => push(&fc.val, out),
+        _ => {}
     }
 }
 
