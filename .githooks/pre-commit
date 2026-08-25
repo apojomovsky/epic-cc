@@ -65,4 +65,25 @@ if ! git diff --cached --check; then
   exit 1
 fi
 
+# Missing final newline on staged text files. `git diff --check` does not
+# flag a file whose last byte is not a newline, but a missing EOF newline is
+# a real hygiene defect (POSIX text files end in a newline; a diff hunk that
+# appends to such a file shows a spurious `\ No newline at end of file`).
+# Skip binary files (a NUL byte in the first 8 KiB marks them as such).
+staged_all=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -n "$staged_all" ]; then
+  while IFS= read -r f; do
+    [ -f "$f" ] || continue
+    before=$(head -c 8192 "$f" 2>/dev/null | wc -c)
+    after=$(head -c 8192 "$f" 2>/dev/null | tr -d '\000' | wc -c)
+    if [ "$after" -lt "$before" ]; then
+      continue # binary (a NUL byte was stripped)
+    fi
+    if [ -s "$f" ] && [ "$(tail -c 1 "$f" | od -An -c | tr -d ' ')" != "\\n" ]; then
+      echo "pre-commit: $f is missing a final newline; add one and re-stage"
+      exit 1
+    fi
+  done <<< "$staged_all"
+fi
+
 exit 0
