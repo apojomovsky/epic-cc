@@ -96,6 +96,7 @@ epic-cc-<ver>-x86_64-linux/          epic-cc-<ver>-x86_64-windows/
 ├── epic-cc                        ├── epic-cc.exe
 ├── clang/                         ├── clang/
 │   ├── bin/clang                  │   ├── bin/clang.exe
+│   ├── bin/llvm-link              │   └── bin/llvm-link.exe
 │   └── lib/clang/20/              │   └── lib/clang/20/   ← builtin headers
 └── LICENSE (LLVM Apache-2.0)      └── LICENSE (LLVM Apache-2.0)
 ```
@@ -114,6 +115,10 @@ Replace the `expect()`s on `PIC8_CLANG_UNWRAPPED` / `PIC8_CLANG_RESOURCE_DIR`
    (same `-resource-dir` semantics);
 3. neither → clean diagnostic: "no clang front end found; set PIC8_CLANG_UNWRAPPED or ship
    the `clang/` directory next to the executable" — never a panic.
+
+`llvm-link` is resolved from the same directory as the resolved clang and is
+always run (multi-unit merge, single-unit no-op), so the bundle ships it
+next to `clang` in `clang/bin/`.
 
 Rename the shipped binary from `driver` to `epic-cc` via a `[[bin]]` entry in the driver
 crate's `Cargo.toml` (`cargo run -p driver` keeps working). No pipeline-stage changes.
@@ -134,6 +139,17 @@ New `release.yml`, tag-triggered:
 
 Existing CI (`.github/workflows/ci.yml`) continues to gate every commit with the full test
 suite, now running inside the `ci` image.
+
+### Rolling master bundles (ADR-023)
+
+`.github/workflows/rolling-release.yml` publishes the Linux bundle as a
+`ci-<sha>` prerelease on every push to master, so downstream CI (epic-hal#80)
+can pin a compiler by tag and run it without building clang. The binary
+identifies itself: the driver's `build.rs` stamps `EPIC_CC_VERSION` (the
+release stage's build ARG) into the build, and `epic-cc --version` prints
+`epic-cc 0.0.0-master-<sha>` (crate version when the ARG is unset). The gate runs
+the downloaded zip on a bare runner with no clang environment, which is
+exactly the consumer's shape. Windows stays tag-only until a consumer exists.
 
 ## Testing
 

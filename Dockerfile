@@ -119,13 +119,14 @@ RUN cargo build --release -p driver \
     && mkdir -p "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin" \
     && cp target/release/epic-cc "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && cp /opt/clang/bin/clang "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
+    && cp /opt/clang/bin/llvm-link "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && mkdir -p "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/lib" \
     && cp -r /opt/clang/lib/clang "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/lib/" \
     && curl -fsSL -o "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/LICENSE.clang.txt" \
         https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-20.1.8/llvm/LICENSE.TXT \
     && echo "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee  /out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/LICENSE.clang.txt" | sha256sum -c - \
     && cd "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux" \
-    && ./epic-cc /workspace/crates/driver/tests/fixtures/add.c /tmp/env.hex \
+    && ./epic-cc /workspace/crates/driver/tests/fixtures/add.c -o /tmp/env.hex \
     && env -u PIC8_CLANG_UNWRAPPED -u PIC8_CLANG_RESOURCE_DIR \
-       ./epic-cc /workspace/crates/driver/tests/fixtures/add.c /tmp/bundled.hex \
+       ./epic-cc /workspace/crates/driver/tests/fixtures/add.c -o /tmp/bundled.hex \
     && cmp /tmp/env.hex /tmp/bundled.hex

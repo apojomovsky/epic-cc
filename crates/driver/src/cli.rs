@@ -34,6 +34,7 @@ usage: epic-cc [options] <input.c>...
   --emit <stage>       ll | ir | asm | hex (default: hex)
   --save-temps <dir>   write every stage artifact into <dir>
   -v                   echo the clang and llvm-link commands
+  --version, -V        print the compiler identity (e.g. epic-cc 0.0.0-master-<sha>)
 ";
 
 /// Parse an argument list that does NOT include `argv[0]`.

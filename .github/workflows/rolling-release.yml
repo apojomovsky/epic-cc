@@ -1,0 +1,168 @@
+name: rolling-release
+
+# Per-commit prerelease of the Linux bundle on every push to master, so a
+# downstream job (epic-hal#80) can pin a compiler by tag and run it with no
+# clang build. Pattern: build -> gate -> publish, from epic-hal's
+# release-bundles.yml; workflow_dispatch runs build+gate as a dry run.
+# Windows stays tag-only (release.yml) until a consumer exists.
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build release bundle (cached clang layer)
+        run: |
+          ver="0.0.0-master-${{ github.sha }}"
+          docker buildx build --target release --load \
+            --build-arg EPIC_CC_VERSION="$ver" \
+            --cache-from type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true \
+            --cache-to type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true \
+            -t "epic-cc-release:$ver" .
+
+      - name: Extract bundle from image
+        run: |
+          ver="0.0.0-master-${{ github.sha }}"
+          docker create --name epic-cc-bundle "epic-cc-release:$ver"
+          docker cp "epic-cc-bundle:/out" dist
+          docker rm epic-cc-bundle
+
+      - name: Zip
+        run: |
+          ver="0.0.0-master-${{ github.sha }}"
+          (cd dist && zip -qr "../epic-cc-${ver}-x86_64-linux.zip" "epic-cc-${ver}-x86_64-linux")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle
+          path: epic-cc-*.zip
+
+  gate:
+    # Prove the artifact a consumer will download, the way the consumer will
+    # use it: bare runner, no clang env, no source tree. The zip's own bundled
+    # clang must compile on its own, and the binary must identify itself as
+    # this commit.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-bundle
+          path: bundle
+
+      - name: Unzip and locate the binary
+        run: |
+          cd bundle
+          unzip -q epic-cc-*.zip
+          find . -maxdepth 2 -type f -name epic-cc -exec chmod +x {} \;
+          ls -la
+
+      - name: Assert version stamp matches the commit
+        run: |
+          cd bundle
+          exe=$(find . -name epic-cc -type f | head -1)
+          [ -n "$exe" ] || { echo "::error::no epic-cc binary in bundle"; exit 1; }
+          stamp="$($exe --version)"
+          echo "stamp: $stamp"
+          case "$stamp" in
+            "epic-cc 0.0.0-master-${{ github.sha }}") ;;
+            *) echo "::error::expected 'epic-cc 0.0.0-master-${{ github.sha }}', got '$stamp'"; exit 1 ;;
+          esac
+
+      - name: Smoke compile with no clang environment
+        run: |
+          exe=$(find bundle -name epic-cc -type f | head -1)
+          printf 'volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) { out = in + 1; }\n' > add.c
+          env -u PIC8_CLANG_UNWRAPPED -u PIC8_CLANG_RESOURCE_DIR "$exe" --target p16f887 add.c -o out.hex
+          test -s out.hex
+          echo "smoke: $(wc -c < out.hex) bytes of HEX from the bundled clang alone"
+
+      - name: Checksum the artifact
+        run: |
+          cd bundle
+          sha256sum epic-cc-*.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundle-checksum
+          path: bundle/SHA256SUMS
+
+  publish:
+    if: github.event_name == 'push'
+    needs: [build, gate]
+    runs-on: ubuntu-latest
+    steps:
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-bundle
+          path: bundle
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-bundle-checksum
+          path: bundle
+
+      - name: Write release notes
+        run: |
+          cat <<'EOF' > notes.md
+          Rolling build of the epic-cc Linux bundle at 0.0.0-master-@SHA@.
+
+          This is a prerelease published on every push to master so downstream
+          CI can pin a compiler and run it without building clang. Pin this
+          tag (`ci-@SHA@`) to get a reproducible compiler.
+
+          Run it as-is (the bundle ships its own clang):
+
+          ```bash
+          unzip epic-cc-0.0.0-master-@SHA@-x86_64-linux.zip
+          ./epic-cc-0.0.0-master-@SHA@-x86_64-linux/epic-cc --target p16f887 app.c -o app.hex
+          ```
+
+          The binary identifies itself with `--version` (`epic-cc 0.0.0-master-@SHA@`).
+          Requires Ubuntu 22.04 / Debian 12 or newer on x86_64.
+
+          <details><summary>Checksums</summary>
+
+          ```
+          EOF
+          sed -i "s/@SHA@/${{ github.sha }}/g" notes.md
+          cat bundle/SHA256SUMS >> notes.md
+          cat <<'EOF' >> notes.md
+          ```
+
+          </details>
+          EOF
+
+      - name: Create the prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sha="${{ github.sha }}"
+          gh release create "ci-$sha" \
+            --target "$sha" \
+            --prerelease \
+            --title "epic-cc rolling 0.0.0-master-\$sha" \
+            --notes-file notes.md \
+            bundle/epic-cc-*.zip bundle/SHA256SUMS
