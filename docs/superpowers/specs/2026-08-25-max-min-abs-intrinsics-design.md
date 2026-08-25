@@ -1,6 +1,6 @@
 # PIC14 signed min/max/abs intrinsics and s16 mul -- Design
 
-**Status:** draft (pending approval)
+**Status:** approved (2026-08-25) / implemented in PR #136
 **Date:** 2026-08-25
 **Parent:** `docs/03-decisions.md` ADR-002 (whole-program compilation), ADR-003 (static allocation)
 **Ticket:** `epic-cc#133`
