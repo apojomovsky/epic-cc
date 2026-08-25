@@ -150,9 +150,10 @@ answer is: closed by reference, no reproducer exists on current master.
 
 ## 5. Acceptance (from #133)
 
-- [ ] A fixture with the pid clamp pattern (signed min/max on i16, then a
+- [x] A fixture with the pid clamp pattern (signed min/max on i16, then a
       16x16 -> 32 signed multiply feeding an i16 trunc) compiles and runs on
-      the `p16f877a` simulator, committed HEX in the usual shape.
+      the `p16f877a` simulator, generated HEX in the usual shape (driver
+      fixtures generate HEX in-test; asm fixtures commit HEX).
 - [ ] `epic-cc` builds the un-stubbed `epic_pid.c` + C-path math sources
       (no `__EPIC_CC__` body) into a runnable program.
 - [ ] The sret/spike question answered: closed by reference (pre-#73

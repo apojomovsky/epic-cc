@@ -1107,6 +1107,29 @@ fn lowers_smax_smin_abs_to_icmp_select() {
     assert!(text.contains("%c2 = icmp slt i16 %y 0"), "{text}");
     assert!(text.contains("%c3 = sub i16 0 %y"), "{text}");
     assert!(text.contains("%z = select i1 %c2 i16 %c3 i16 %y"), "{text}");
+
+    // Width-parametric: same lowering works for i8 and i32.
+    let m2 = parse(
+        "global a i8
+         global b i8
+         global c i32
+         global d i32
+         fn main(void) ()
+           block entry:
+             %a = load i8 @a
+             %b = load i8 @b
+             %c = load i32 @c
+             %d = load i32 @d
+             %x = call i8 @llvm.smax.i8(i8 %a, i8 %b)
+             %y = call i32 @llvm.smin.i32(i32 %c, i32 %d)
+             store i8 %x, @a
+             store i32 %y, @c
+             ret void
+",
+    );
+    let text2 = ir::serialize(&legalize(m2));
+    assert!(text2.contains("icmp sgt i8"), "{text2}");
+    assert!(text2.contains("icmp slt i32"), "{text2}");
 }
 
 /// An unknown `llvm.*` intrinsic panics loudly so a new clang-emitted

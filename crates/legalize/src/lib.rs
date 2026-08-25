@@ -744,21 +744,11 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
     }
 }
 
-/// Rewrite a clang-emitted integer intrinsic call into the icmp/select tree:
-///
-/// | intrinsic | tree |
-/// |---|---|
-/// | `llvm.smax.W(a, b)` | `%c = icmp sgt W %a, %b; select %c, %a, %b` |
-/// | `llvm.smin.W(a, b)` | `%c = icmp slt W %a, %b; select %c, %a, %b` |
-/// | `llvm.abs.W(a, flag)` | `%c = icmp slt W %a, 0; %n = sub W 0, %a; select %c, %n, %a` |
-///
-/// The tree is width-parametric (i8/i16/i32): the isel icmp/select/sub
-/// emitters are byte-generic, so the same shape serves every width. For
-/// `abs`, the `flag` (`is_int_min_poison`) is read but ignored: with
-/// `false` the `sub` maps `INT_MIN -> -INT_MIN = INT_MIN` (the conforming
-/// value), and with `true` any value is conforming for the poison input.
-/// The dst/ty ride on the call's own fields. An unknown `llvm.*` intrinsic
-/// panics loudly so a new one surfaces as a clear error instead of a hole.
+/// Lower `llvm.smax/smin/abs.W` to icmp/select trees (see design spec).
+/// smax: sgt+select, smin: slt+select, abs: slt0+sub+select.
+/// Width-parametric (i8/i16/i32) via byte-generic isel. Abs flag
+/// ignored (wraps INT_MIN for false, poison allows any value for true).
+/// Unknown `llvm.*` panics loudly.
 fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
     let dst = c
         .dst
