@@ -172,12 +172,12 @@ computation happens later (see 4.4), so the `.ll` boundary stays a pure parse.
 ### 4.2 `irparse`
 
 - `call %3(...)`: keep the current numeric `func`, no longer strip the `%`
-  distinction — the callee token's sigil decides direct vs indirect:
+  distinction: the callee token's sigil decides direct vs indirect.
   `@name` → direct (current behavior); `%reg` → indirect (marker, empty
   `callees`). The `!callees` metadata is dropped with the trailing `, !...`
-  cut (already true at `lib.rs:2180`) — never consumed.
+  cut (already true at `lib.rs:2180`), never consumed.
 - Global values stay as `Val::Global(f)` wherever they appear (select,
-  store val, call arg, phi, icmp) — no change; they are the raw material for
+  store val, call arg, phi, icmp), no change; they are the raw material for
   the address-taken set.
 - Unchanged: `store ptr @f` into a RAM global parses fine today (it is a
   `Val::Global`); only the *codegen* of such a value needs the new literal
@@ -202,7 +202,7 @@ After all existing lowering and the interrupt duplication:
 2. **Compute the address-taken set** A = { g : `Value::Global(g)` appears in
    any instruction of the post-legalize module }. (Non-const globals with
    `ptr` initializers are zeroinit and contribute nothing; const tables panic
-   at parse — out of scope.)
+   at parse, out of scope.)
 3. **Compute the two contexts** once: ISR-ctx = transitive closure of the ISR
    roots over the *direct* call edges; main-ctx = everything else.
 4. **Fill `callees` for every indirect call site**: a site inside an
@@ -242,7 +242,7 @@ value that will later match the chain's compare. Needed in: `emit_load_byte`
 instead of the direct `CALL func`:
 - args are copied inside each matched arm into that candidate's `{f}::{param}`
   slots (identical copy code to today's direct call, parameterized per
-  candidate) — the copy only runs for the candidate that matched;
+  candidate), the copy only runs for the candidate that matched;
 - the PCLATH discipline (PIC14) is the direct-call one, per arm
   (`MOVLW PAGE(f); MOVWF PCLATH; CALL f; emit_pclath_restore(f)`);
   `emit_pclath_restore` already consults the pass-B page map, which has every
@@ -328,7 +328,7 @@ the machine halts); the same source compiles for `p16f877a` and `p18f4550`.
 - **Conservative depth.** Programs whose indirect calls create long
   conservative chains now fail the 8-level depth check even if the runtime
   path is shallow. Accepted (issue text); recorded in the ADR.
-- **Const fp tables** (`tbl[idx]()`) still panic — a hard limitation boundary
+- **Const fp tables** (`tbl[idx]()`) still panic, a hard limitation boundary
   documented in the ADR's "revisit if".
 - **Bogus fp at runtime** traps deterministically (GOTO loop) instead of a
   silent wrong call. A valid C program never produces one (UB otherwise).
