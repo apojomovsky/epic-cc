@@ -175,16 +175,16 @@ Run `make pre-pr-check` before opening a PR. It is a thin wrapper around
    `crates/alloc`'s history). `.githooks/pre-commit` runs the same
    check on every commit that touches `*.rs`, so this should already
    be clean by the time the ritual runs.
-6. **Comment and doc prose review.** `scripts/prose-diff.sh` extracts
-   every added comment block and markdown diff hunk in the PR; it
-   flags a couple of objective signals (block over 3 lines, a
-   hardcoded count or tree dump) but cannot judge content, so it never
-   fails the ritual on its own. The agent reads everything the script
-   printed against the Expression Conventions below (why not what,
-   <= 3 lines unless truly justified, no decoration or iteration
-   narrative; docs stay clear and skip volatile facts) and fixes
-   what doesn't hold up. `make pre-pr-check PROSE=1` records that the
-   review happened.
+6. **Comment and doc prose review.** `scripts/prose-diff.sh` prints
+   every added comment block in the PR, and `epic-tasks prose --verify`
+   (part of this ritual) fails it on the mechanical rules: the 8-line
+   block cap, no `@file`/`@brief` decoration, no iteration or
+   verification narrative, no em-dashes (the Expression Conventions
+   below). Content judgment stays the agent's: read the listing the
+   script prints and fix what doesn't hold up against the conventions
+   (why, not what; a comment must earn its lines). The pre-push hook
+   runs the same verify, so a block that slips past the ritual still
+   blocks the push.
 7. **PR body hygiene: real newlines only.** PR descriptions must use
    actual newlines (``gh pr create --body-file <file>`` or a heredoc),
    never an inline ``"a\n\n- b"`` that renders literally as ``\n`` on
@@ -197,7 +197,8 @@ Run `make pre-pr-check` before opening a PR. It is a thin wrapper around
 
 The ritual exits 1 with the exact fix list while blocking items are
 outstanding. Don't skip it; the CI gate only covers the suite, not the
-ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
+ritual. The prose step is a hard gate: a block that violates the
+mechanical rules fails the ritual and blocks the push.
 
 ## Commit hygiene
 
@@ -247,8 +248,11 @@ ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
    non-obvious reason, the datasheet fact, the invariant. A comment
    that restates the line below it is deleted.
 2. **A comment must earn its lines.** More comment lines than code is a
-   smell. Hand-traces survive only where behavior cannot be read from
-   the code, compressed to the essential steps.
+   smell. The block ladder is 1 to 8 lines: 2 to 3 lines for a compact
+   reason, 4 to 8 only when the reason genuinely needs the room (a
+   hand-trace of non-obvious behavior), over 8 is a hard failure of
+   the prose gate. Hand-traces survive only where behavior cannot be
+   read from the code, compressed to the essential steps.
 3. **No decoration.** No `/* --- name --- */` separators, no
    `@file`/`@brief` boilerplate repeating the filename. A 1-3 line
    file header is fine when it adds context (which stage, what it

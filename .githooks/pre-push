@@ -50,3 +50,11 @@ fi
 
 echo "pre-push: make ci-local (docker epic-cc-ci bash scripts/ci-test.sh) — see #99"
 make ci-local
+
+# ---- prose lint gate (fires even when the ritual was never run) ----
+
+if ! bash scripts/prose-diff.sh --verify; then
+    echo "pre-push: comment blocks violating the prose rules (see above)" >&2
+    echo "  Fix the flagged blocks, or reword them so they hold up." >&2
+    exit 1
+fi

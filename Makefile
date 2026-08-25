@@ -130,5 +130,5 @@ sanity-changed: image ## PR lightweight for TOMLs touched vs origin/master
 		if [ -z "$$changed" ]; then echo "sanity-changed: no device TOML touched vs origin/master"; exit 0; fi; \
 		for f in $$changed; do s=$$(basename $$f .toml); echo "=== sanity-changed $$s ==="; bash scripts/sanity.sh $$s || exit 1; done'
 
-pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 runs the suite, PROSE=1 attests comment/doc review
-	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,) $(if $(PROSE),--prose,)
+pre-pr-check: ## Takeoff ritual before opening a PR; TEST=1 runs the suite
+	@bash scripts/pre-pr-check.sh $(if $(TEST),--test,)
