@@ -57,3 +57,19 @@ fn helper(i8) (0=i8)
 ",
     ));
 }
+
+/// An `llvm.*` intrinsic call is `declare`d by clang, never defined here;
+/// wholeprog must not treat it as an undefined user symbol. legalize lowers
+/// every supported one and panics loudly on an unknown.
+#[test]
+fn accepts_an_intrinsic_call() {
+    let out = merge(parse(
+        "\
+fn main(void) ()
+  block 0:
+    %1 = call i16 @llvm.smax.i16(i16 %2, i16 %3)
+    ret void
+",
+    ));
+    assert_eq!(out.funcs.len(), 1);
+}
