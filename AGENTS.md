@@ -82,7 +82,7 @@ For every ticket:
    `epic-tasks review <repo>#<n> --pr <url>`. The body must use real newlines:
    copy-paste-safe ``gh pr create --body-file - <<'EOF'`` (or
    ``cat <<'EOF' > /tmp/pr_body.md`` + ``gh pr create --body-file /tmp/pr_body.md``),
-   NEVER ``gh pr create --body "a\nb"`` — the shell never expands ``\n`` so GitHub
+   NEVER ``gh pr create --body "a\nb"``, the shell never expands ``\n`` so GitHub
    renders literal ``\n`` as text and the bullets collapse to one line (epic-cc#129):
    ```bash
    cat <<'EOF' > /tmp/pr_body.md
@@ -94,7 +94,7 @@ For every ticket:
    - bullet two
    EOF
    gh pr create --title "fix(scope): summary" --body-file /tmp/pr_body.md
-   # — or inline: gh pr create --title "..." --body-file - <<'EOF'
+   # - or inline: gh pr create --title "..." --body-file - <<'EOF'
    ```
    Heal an existing PR with ``gh pr edit --body-file - <<'EOF'`` or
    ``python3 -c 'from epic_tasks.gh import normalize_pr_body; print(normalize_pr_body(open("body.txt").read()))'``.
@@ -206,7 +206,7 @@ ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
   `build(...)`, `ci(...)`, `test(...)`. Scope is usually the crate
   (`isel`, `banking`, `driver`) or `docker`.
 - **Never `Co-Authored-By:` or any other trailer, and no em-dashes
-  (—).** The commit-msg hook rejects both. Use a comma, a colon, or a
+  (,).** The commit-msg hook rejects both. Use a comma, a colon, or a
   period instead. Git history is the record; the commit message is
   yours.
 - **PR bodies use real newlines.** ``gh pr create --body-file`` or a
@@ -258,13 +258,13 @@ ritual. `epic-tasks takeoff --prose` is the same as `PROSE=1`.
    commit, not in the tree, where they go stale. Durable toolchain or
    hardware facts (with a date) are a different class and stay.
 5. `TODO`/`FIXME` carry a concrete reason or do not exist.
-6. **No em-dashes (—) in prose.** Not in comments, docs, or commit
+6. **No em-dashes (,) in prose.** Not in comments, docs, or commit
    messages: use a comma, a colon, or a period and a new sentence.
    The exception is ascii-art diagrams, where alignment may force
    them. The pre-pr-check and commit-msg hook enforce this.
    Replacing an em-dash is a judgment call, not a swap: pick the
    replacement (and split or reorder the sentence when needed) so
-   the result reads as prose. A mechanical ` — ` -> ` , ` sweep
+   the result reads as prose. A mechanical ` , ` -> ` , ` sweep
    produces comma splices; the pre-pr-check flags the ` ,` residue
    as a warning. Prefer a human or a language model for sweeps.
 
