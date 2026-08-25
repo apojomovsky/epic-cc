@@ -147,8 +147,10 @@ fn runtime_sfr_hex_matches_gpasm_and_runs() {
     let theirs = std::fs::read_to_string(format!("{dir}/runtime_sfr_gpasm.hex")).unwrap();
     assert_eq!(ours.trim(), theirs.trim(), "our HEX differs from gpasm");
 
-    // And it runs: preload PIR2 (0x0D) with BCLIF (0x01), irq = 4 selects
-    // the PIR2 arm, GetFlag returns 1, ClearFlag clears the bit, and the
+    // runtime write_offset(irq & 1 = 0, 0xAA) writes PIR1 through a runtime
+    // inttoptr. Hand-derived from the driver e2e: out_flag = 1 + 0 +
+    // read_offset(0)=0x00 + read_offset(0)=0x00 = 1; out_clear = PIR1|PIR2
+    // = 0x00; out_write = 0xAA.
     // standalone write_offset(0, 0xAA) writes PIR1. Hand-derived from the
     // driver e2e: out_flag = 1 + 0 + read_offset(0)=0x00 + read_offset(1)=
     // 0x00 = 1; out_clear = PIR1|PIR2 = 0x00; out_write = 0xAA.

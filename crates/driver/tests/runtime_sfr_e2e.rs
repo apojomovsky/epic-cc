@@ -9,9 +9,14 @@
 //!   3. pointer phi joining the select result and the INTCON literal
 //!      (GetFlag's `in_intcon ? INTCON : addr` join).
 //!
-//! Hand-computed expectations (sim preloads `irq` and the SFR bytes):
-//!   PIR1 = 0x0C, PIR2 = 0x0D, INTCON = 0x0B (the F877A SFRs).
-//!   irq = 0 (RB, in_intcon):     GetFlag=1, Clear clears INTCON, out_flag=3
+//!                                (1 + 0 + PIR1 + PIR1), out_clear=1
+//!   irq = 2 (TMR1, PIR1):        GetFlag=1, Clear clears PIR1, out_flag=1
+//!     (1 + 0 + PIR1(0) + PIR1(0)), out_clear=2
+//!   irq = 4 (BCL, PIR2):         GetFlag=1, Clear clears PIR2, out_flag=1
+//!     (1 + 0 + PIR1(0) + PIR1(0)), out_clear=0
+//!   write_offset(0, 0xAA) writes PIR1 directly: out_write = 0xAA every run.
+//! The map classifies the runtime address slots as ordinary RAM locals; the
+//! table stays const (flash): `irq_table` has no RAM address.
 //!                                (1 + 0 + PIR1 + PIR2), out_clear=1
 //!   irq = 2 (TMR1, PIR1):        GetFlag=1, Clear clears PIR1, out_flag=3
 //!     (1 + 0 + 0 + PIR2), out_clear=2
@@ -99,7 +104,7 @@ fn runtime_sfr_shapes_read_and_write_the_right_address() {
     p.ram_mut()[0x0D] = 0x02; // PIR2 idle (CCP2IF)
     p.run(200_000);
     assert!(p.halted());
-    assert_eq!(p.ram()[addr("out_flag")], 3, "flag sum irq=2");
+    assert_eq!(p.ram()[addr("out_flag")], 1, "flag sum irq=2");
     assert_eq!(p.ram()[addr("out_clear")], 0x02, "PIR1|PIR2 irq=2");
     assert_eq!(p.ram()[addr("out_write")], 0xAA, "direct PIR1 write irq=2");
     assert_eq!(

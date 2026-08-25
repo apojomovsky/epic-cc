@@ -57,7 +57,6 @@ static const irq_desc_t irq_table[6] = {
 volatile uint8_t irq;
 volatile uint8_t out_flag;
 volatile uint8_t out_clear;
-volatile uint8_t out_offset;
 volatile uint8_t out_write;
 
 /* Shape 2 + 3: the real HAL function shapes, shared implementation. */
@@ -107,8 +106,8 @@ void main(void)
     EPIC_IRQ_ClearFlag();
     out_clear = EPIC_REG8(PIC_REG_PIR1) | EPIC_REG8(PIC_REG_PIR2);
     out_flag = (uint8_t)(out_flag + EPIC_IRQ_GetFlag());
-    out_flag = (uint8_t)(out_flag + read_offset(0));
-    out_flag = (uint8_t)(out_flag + read_offset(1));
-    write_offset(0, 0xAA);
+    out_flag = (uint8_t)(out_flag + read_offset(irq & 1));
+    out_flag = (uint8_t)(out_flag + read_offset(irq & 1));
+    write_offset(irq & 1, 0xAA);
     out_write = EPIC_REG8(PIC_REG_PIR1);
 }
