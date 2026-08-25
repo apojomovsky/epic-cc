@@ -56,9 +56,11 @@
 ## Known trade-offs
 
 * **One docker + cargo release build per push.** The clang layer comes from the
-  existing GHCR registry cache and the cargo target dir is cached, so the cost
-  is minutes per push, not hours. Every rolling release is also a release
-  asset: acceptable, prereleases stay out of `releases/latest`.
+  existing GHCR registry cache, but the release stage runs the driver
+  `cargo build --release` from scratch: the `EPIC_CC_VERSION` ARG changes
+  every push and busts that RUN layer, and no cargo target cache is mounted.
+  Cost is minutes per push, not hours. Every rolling release is also a
+  release asset: acceptable, prereleases stay out of `releases/latest`.
 * **Prereleases do not resolve through `releases/latest`.** A consumer must
   read the tag (`ci-<sha>`); a "latest" resolution endpoint is a follow-up if a
   consumer needs it.

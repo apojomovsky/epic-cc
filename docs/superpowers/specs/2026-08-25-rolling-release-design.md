@@ -74,9 +74,9 @@ deterministic (a HAL job pinned to `ci-<sha>` always runs the same compiler,
 and history stays reproducible); the gate on the bare runner is literally the
 downstream job's shape, so `epic-hal#80` is a thin add; no new infrastructure.
 
-*Cons:* one docker build + cargo release build per push (cached; minutes not
-hours); release count grows with commits (GitHub handles it; prereleases stay
-out of `latest`).
+*Cons:* one docker build + cargo release build per push (clang layer cached,
+minutes not hours); release count grows with commits (GitHub handles it;
+prereleases stay out of `latest`).
 
 ### B -- Single moving `master` prerelease (issue wording, option 1a)
 
@@ -151,18 +151,20 @@ version), so tag releases and rolling releases share one code path.
 `--version` is handled before argument parsing (like any compiler's), exits 0,
 and prints only the one line.
 
-### 4.3 Bundle layout, unchanged
+### 4.3 Bundle layout
 
-The zip keeps the exact layout `docs/30` defines: `epic-cc-<ver>-x86_64-linux/`
-containing `epic-cc`, `clang/bin/clang`, `clang/lib/clang/20/`,
+The zip keeps the layout `docs/30` defines, plus the llvm-link this PR ships
+next to clang: `epic-cc-<ver>-x86_64-linux/` containing `epic-cc`,
+`clang/bin/clang`, `clang/bin/llvm-link`, `clang/lib/clang/20/`,
 `LICENSE.clang.txt`. The rolling ver is `master-<sha>`.
 
 ### 4.4 Cache reuse
 
 The workflow uses the same `ghcr.io/${{ github.repository }}-toolchain` cache
-ref as `ci.yml`, so the clang layer and the cargo target dir are shared across
-both workflows; the rolling build costs only the final `cargo build --release`
-delta per push (minutes, not hours).
+ref as `ci.yml`, so the clang layer is shared across both workflows. The
+release stage's `cargo build --release` runs per push: the
+`EPIC_CC_VERSION` ARG changes every push and busts that RUN layer, and no
+cargo target cache is mounted. Cost is minutes per push, not hours.
 
 ## 5. Acceptance mapping
 

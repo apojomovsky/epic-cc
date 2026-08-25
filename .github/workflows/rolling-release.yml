@@ -161,6 +161,7 @@ jobs:
         run: |
           sha="${{ github.sha }}"
           gh release create "ci-$sha" \
+            --target "$sha" \
             --prerelease \
             --title "epic-cc rolling master-$sha" \
             --notes-file notes.md \
