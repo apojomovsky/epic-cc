@@ -2505,7 +2505,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 let Some(t) = toks.get(i + 1) else {
                     return false;
                 };
-                t.starts_with('@') || t.starts_with("getelementptr")
+                t.starts_with('@') || t.starts_with("getelementptr") || t.starts_with("inttoptr")
             };
             let ptr = arm_is_const_ptr(&parts[1]) && arm_is_const_ptr(&parts[2]);
             let a = parse_select_arm(&parts[1], types, fresh, &mut out);

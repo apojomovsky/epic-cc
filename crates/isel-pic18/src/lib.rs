@@ -1197,6 +1197,26 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
                 }
             }
+            Inst::IntToPtr(p) => {
+                // A runtime integer address becoming a pointer VALUE: copy
+                // the two address bytes into the dst slot, which iselcore
+                // seeded as an indirect pointer (`Base::Slot(dst, true)`).
+                // Equal-width i16 -> i16, like a zext, but the dst is an
+                // ADDRESS (derefs through FSR0/INDF0 per ADR-009).
+                assert_eq!(
+                    p.from, p.to,
+                    "isel-pic18: inttoptr must keep the byte width (i16 -> ptr)"
+                );
+                assert!(
+                    !matches!(p.val, Val::Const(_)),
+                    "isel-pic18: const source IntToPtr not yet supported"
+                );
+                let src = self.val_addr(&p.val).direct();
+                let dst = self.slot_addr(self.cur_func, &p.dst).direct();
+                for i in 0..p.from.bytes() {
+                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+            }
             Inst::Sext(s) => {
                 // Same const-source hazard as `Inst::Zext`, see its comment.
                 assert!(
@@ -1261,6 +1281,24 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Select(s) => {
+                if s.ptr && matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
+                    // A pointer select over two runtime address LITERALS
+                    // (the HAL's `pir_reg_addr(d)` arms): the selected arm's
+                    // address bytes must land in the dst slot, which iselcore
+                    // seeded as an indirect pointer (`Base::Slot(dst, true)`).
+                    // The two-byte value select below is exactly the
+                    // materialization; the existing arms handle `Const` arms
+                    // via `emit_move_val_to_slot`'s MOVLW path.
+                } else if s.ptr {
+                    // A pointer-typed select folded by iselcore into the
+                    // resolved map (a GEP-chain select): emits nothing, every
+                    // load/store through it lowers via the fold. PIC18 has
+                    // no const-arm fold today, so this is the GEP-arm shape.
+                    assert!(
+                        !matches!(s.cond, Val::Const(_)),
+                        "isel-pic18: const cond pointer Select not yet supported"
+                    );
+                }
                 // `a`/`b` route through `emit_move_val_to_slot`, which
                 // handles `Val::Const` correctly (via `MOVLW`+`MOVWF`, not
                 // as a RAM address through `val_addr`) and never branches
@@ -1280,20 +1318,22 @@ impl<'m> Gen<'m> {
                 // leave, silently picking the wrong side of the `Select`.
                 // Same hazard class as the const-LHS/const-source guards
                 // elsewhere in this file; guard it the same way.
-                assert!(
-                    !matches!(s.cond, Val::Const(_)),
-                    "isel-pic18: const cond Select not yet supported"
-                );
-                let dst = self.slot_addr(self.cur_func, &s.dst).direct();
-                let l_else = self.fresh_label();
-                let l_end = self.fresh_label();
-                self.emit_load_w(&s.cond, 0);
-                self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
-                self.emit_move_val_to_slot(&s.a, s.ty, dst);
-                self.emit(format!("    BRA {l_end}"));
-                self.emit_label(&l_else);
-                self.emit_move_val_to_slot(&s.b, s.ty, dst);
-                self.emit_label(&l_end);
+                if !s.ptr || matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
+                    assert!(
+                        !matches!(s.cond, Val::Const(_)),
+                        "isel-pic18: const cond Select not yet supported"
+                    );
+                    let dst = self.slot_addr(self.cur_func, &s.dst).direct();
+                    let l_else = self.fresh_label();
+                    let l_end = self.fresh_label();
+                    self.emit_load_w(&s.cond, 0);
+                    self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
+                    self.emit_move_val_to_slot(&s.a, s.ty, dst);
+                    self.emit(format!("    BRA {l_end}"));
+                    self.emit_label(&l_else);
+                    self.emit_move_val_to_slot(&s.b, s.ty, dst);
+                    self.emit_label(&l_end);
+                }
             }
             Inst::Call(c) => {
                 if !c.callees.is_empty() {

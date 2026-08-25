@@ -2305,6 +2305,22 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    CLRF 0x{:02X}", da + u16::from(i)));
                 }
             }
+            Inst::IntToPtr(p) => {
+                // A runtime integer address becoming a pointer VALUE: copy
+                // the two address bytes into the dst slot, which iselcore
+                // seeded as an indirect pointer (`Base::Slot(dst, true)`).
+                // Equal-width i16 -> i16, exactly like a zext, but the dst
+                // is an ADDRESS, not an ordinary value.
+                assert_eq!(
+                    p.from, p.to,
+                    "isel: inttoptr must keep the byte width (i16 -> ptr)"
+                );
+                let da = self.slot_addr(self.cur_func, &p.dst).direct();
+                for i in 0..p.from.bytes() {
+                    self.emit_load_byte(&p.val, i);
+                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                }
+            }
             Inst::Sext(x) => {
                 // i8/i16 -> i16/i32, sign-filling from the SOURCE's high
                 // byte (the loop below reads `x.from.bytes() - 1`). i1 has
@@ -2406,10 +2422,19 @@ impl<'m> Gen<'m> {
             }
             Inst::Select(s) => {
                 if s.ptr {
-                    // A pointer-typed select is a pointer VALUE, folded by
-                    // iselcore into the resolved map like a GEP: it emits
-                    // nothing and every load/store/memcpy through it lowers
-                    // via the fold (mirror of Inst::Gep below).
+                    if matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
+                        // A pointer select over two runtime address LITERALS
+                        // (the HAL's `pir_reg_addr(d)` arms): the selected
+                        // arm's address bytes must land in the dst slot,
+                        // which iselcore seeded as an indirect pointer. The
+                        // two-byte value select is exactly the materialization.
+                        self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
+                    } else {
+                        // A pointer-typed select is a pointer VALUE, folded by
+                        // iselcore into the resolved map like a GEP: it emits
+                        // nothing and every load/store/memcpy through it lowers
+                        // via the fold (mirror of Inst::Gep below).
+                    }
                 } else {
                     self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
                 }
