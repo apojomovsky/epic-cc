@@ -499,6 +499,12 @@ impl Pic14 {
 /// sized for PIC18's larger flash.
 pub fn parse_hex_pic18(data: &str) -> Vec<u16> {
     let mut words = vec![0u16; 0x4000];
+    // Config words live far above flash (PIC18F4550 config base 0x300000,
+    // DS39632E §25.1); their `:04` extended-linear-address records must be
+    // tracked so each data record's 16-bit address resolves against the
+    // real base, and the config data dropped (it is not flash). Without
+    // the tracking, a config record's low-16 address aliases flash word 0.
+    let mut extended_upper: usize = 0;
     for line in data.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -512,13 +518,22 @@ pub fn parse_hex_pic18(data: &str) -> Vec<u16> {
         let data = &bytes[4..4 + len];
         match rectype {
             0x00 => {
+                let base = extended_upper + addr;
+                // Config-region records (0x300000, beyond the 0x4000-word
+                // flash window) carry no program data; skip them rather
+                // than writing into the flash array.
+                if base >= 0x8000 {
+                    continue;
+                }
                 for (i, chunk) in data.chunks(2).enumerate() {
                     let w = (chunk[0] as u16) | ((chunk[1] as u16) << 8);
-                    words[addr / 2 + i] = w;
+                    words[base / 2 + i] = w;
                 }
             }
             0x01 => break,
-            0x04 => {}
+            0x04 => {
+                extended_upper = ((data[0] as usize) << 8 | data[1] as usize) << 16;
+            }
             other => panic!("unsupported HEX record type {other:#x}"),
         }
     }
@@ -1517,5 +1532,40 @@ mod pic18_tblrd {
             "TBLRD+* reads the byte at 5 (pre-incremented)"
         );
         assert_eq!(pic.ram()[0xFF6], 0x05, "TBLRD+* leaves TBLPTR at 5");
+    }
+}
+
+#[cfg(test)]
+mod parse_hex_pic18_extended {
+    use super::parse_hex_pic18;
+
+    #[test]
+    fn config_region_records_do_not_aliases_flash_word_zero() {
+        // An EPIC_CONFIG build emits a `:04` extended-linear-address
+        // record for the config region (PIC18F4550 config base 0x300000)
+        // followed by config data records at low-16 address 0x0000.
+        // Without tracking the extended upper, those data records alias
+        // flash word 0 and clobber the reset vector. Checksums are the
+        // Intel HEX 2's-complement byte sum.
+        let hex = "\
+:020000040030CA\n\
+:04000000FFFFFFFF\n\
+:00000001FF\n";
+        let words = parse_hex_pic18(hex);
+        assert_eq!(words[0], 0x0000, "flash word 0 must stay untouched");
+        assert_eq!(words.len(), 0x4000);
+    }
+
+    #[test]
+    fn program_region_records_still_land() {
+        // Program records at linear address 0 (the common case) are
+        // unaffected by the extended-address tracking.
+        let hex = "\
+:020000040000FA\n\
+:040000001122334452\n\
+:00000001FF\n";
+        let words = parse_hex_pic18(hex);
+        assert_eq!(words[0], 0x2211, "little-endian pair at word 0");
+        assert_eq!(words[1], 0x4433, "little-endian pair at word 1");
     }
 }
