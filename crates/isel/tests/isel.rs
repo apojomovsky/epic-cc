@@ -8211,3 +8211,34 @@ fn pointer_param_high_byte_reads_without_a_phantom_carry() {
         "a k=0 pointer param read must not propagate a carry:\n{asm}"
     );
 }
+
+/// An indirect call through a function pointer lowers to a compare-and-call
+/// chain over the candidate set: each candidate's two address bytes are
+/// compared against the fp value, the matched arm CALLs, and an unmatched fp
+/// falls into a deterministic trap (epic-cc#73).
+#[test]
+fn indirect_call_emits_compare_and_call_chain() {
+    let m = parse(
+        "fn f0(void) ()\n  block entry:\n    ret void\n\
+         fn f1(void) ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n\
+           call void %3() callees f0 f1\n    ret void\n",
+    );
+    let addrs = addrs(&[("main::3", 0x2B)]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("XORLW LOW(f0)"),
+        "compare fp lo against f0:\n{asm}"
+    );
+    assert!(
+        asm.contains("XORLW HIGH(f0)"),
+        "compare fp hi against f0:\n{asm}"
+    );
+    assert!(
+        asm.contains("XORLW LOW(f1)"),
+        "compare fp against f1:\n{asm}"
+    );
+    assert!(asm.contains("    CALL f0"), "CALL f0:\n{asm}");
+    assert!(asm.contains("    CALL f1"), "CALL f1:\n{asm}");
+    assert!(asm.contains("GOTO tmp"), "trap loop:\n{asm}");
+}
