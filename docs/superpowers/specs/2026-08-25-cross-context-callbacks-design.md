@@ -116,7 +116,7 @@ The candidate split then uses the extended context only on the ISR side: an
 ISR-context indirect call site gets `callees = A ∩ isr_ctx` (the stored callback is
 a candidate and its copy runs in the disjoint ISR region); a main-context site keeps
 today's `A - isr_ctx` (its candidates never lose anything, and a main-side call
-through the same global matches the `_isr` copy the rewrite stored).
+through the same global gets empty callees and lowers to the trap loop (no main-side `_isr` dispatch).
 
 *Why the named-store edge is sound.* The ISR can only reach a callback through a
 global it actually reads (step 2) that some store writes (step 3). Adding those

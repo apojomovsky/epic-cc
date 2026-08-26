@@ -1297,3 +1297,99 @@ fn unknown_intrinsic_panics() {
     );
     let _ = legalize(m);
 }
+/// A cross-context callback that calls a shared helper: the store-edge
+/// extension must close over callees, so the helper is `_isr`-duplicated
+/// and the callback's copy calls the helper's copy (ADR-013: the ISR must
+/// never run a main-context frame).
+#[test]
+fn closes_cross_context_extension_over_callees() {
+    let m = parse(
+        "global g_cb i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i16 @cb @g_cb\n\
+             call void @helper()\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %1 = load i16 @g_cb\n\
+             call void @1()\n\
+             ret void\n\
+         fn cb(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn helper(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    // Both the callback and its callee are duplicated.
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing"
+    );
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "helper_isr"),
+        "helper_isr missing"
+    );
+    // The callback's copy calls the helper's copy.
+    let cb_isr = m2.funcs.iter().find(|f| f.name == "cb_isr").unwrap();
+    let call = cb_isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("cb_isr call");
+    assert_eq!(call.func, "helper_isr");
+}
+
+/// A callee storing two params into two ISR-read globals: every call-site
+/// argument is rewritten to the `_isr` copy, not just the first match.
+#[test]
+fn rewrites_every_param_forwarded_argument() {
+    let m = parse(
+        "global s_cb0 i16\n\
+         global s_cb1 i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @register(i16 @cb0, i16 @cb1)\n\
+             ret void\n\
+         fn register(void) (0=i16, 1=i16)\n\
+           block entry:\n\
+             store i16 %0 @s_cb0\n\
+             store i16 %1 @s_cb1\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %1 = load i16 @s_cb0\n\
+             call void @1()\n\
+             %2 = load i16 @s_cb1\n\
+             call void @2()\n\
+             ret void\n\
+         fn cb0(void) ()\n  block entry:\n    ret void\n\
+         fn cb1(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb0_isr"),
+        "cb0_isr missing"
+    );
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb1_isr"),
+        "cb1_isr missing"
+    );
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let call = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("main call");
+    assert_eq!(call.args[0].val, ir::Val::Global("cb0_isr".to_string()));
+    assert_eq!(call.args[1].val, ir::Val::Global("cb1_isr".to_string()));
+}
