@@ -8441,7 +8441,7 @@ fn single_entry_table_within_window_emits_no_align() {
     let asm = select(&PIC16F877A, &m, &addrs);
     let base = label_addr(&asm, "t");
     assert!(
-        base & 0xFF + 60 <= 0x100,
+        (base & 0xFF) + 60 <= 0x100,
         "table must sit in window 0 (base 0x{base:03X}):\n{asm}"
     );
     assert!(
