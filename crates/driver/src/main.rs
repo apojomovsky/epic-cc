@@ -242,12 +242,16 @@ fn main() {
 
     // 6. alloc: complete overlay address map (globals + locals per function)
     let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
+    if let Some(map_path) = &cli.map {
+        std::fs::write(map_path, driver::report::map_text(&device, &layout)).expect("write map");
+    }
 
     // 7. isel: IR -> assembly. Locals are keyed `{func}::{name}` in the
-    // map, matching what both backends look up.
+    // map, matching what both backends look up. The keys are cloned: the
+    // layout is still needed for the size report after isel runs.
     let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals);
-    addrs.extend(layout.locals);
+    addrs.extend(layout.globals.iter().map(|(k, &v)| (k.clone(), v)));
+    addrs.extend(layout.locals.iter().map(|(k, &v)| (k.clone(), v)));
     let asm = match device.core {
         device::Core::Pic14 => isel::select(device, &m, &addrs),
         device::Core::Pic18 => isel_pic18::select(device, &m, &addrs),
@@ -296,7 +300,10 @@ fn main() {
         return;
     }
 
-    // 10. asm: assembly -> Intel HEX (with config words when present)
+    // 10. asm: assembly -> Intel HEX (with config words when present). The
+    // program words are captured before config insertion: the PIC14 config
+    // word lives past the flash ceiling (0x2007 on the 877A), so the hex
+    // vec is resized to include it and its length would overcount flash.
     let fuse_spec = canonical_spec
         .as_deref()
         .map(|s| driver::fosc::fuse_spec(s))
@@ -306,9 +313,10 @@ fn main() {
     } else {
         None
     };
+    let program_words = asm::assemble_words(device, &asm);
     let hex = match (device.core, &config_bytes) {
         (device::Core::Pic14, Some(cb)) => {
-            let mut words = asm::assemble(&asm);
+            let mut words = program_words.clone();
             let idx = (device.config.base_byte_addr / 2) as usize;
             if words.len() <= idx {
                 words.resize(idx + 1, 0);
@@ -318,7 +326,6 @@ fn main() {
             asm::to_hex(&words)
         }
         (device::Core::Pic18, Some(cb)) => {
-            let program_words = asm::assemble_pic18(&asm);
             let mut config_words = Vec::new();
             for chunk in cb.chunks(2) {
                 let lo = chunk[0] as u16;
@@ -330,7 +337,7 @@ fn main() {
                 (device.config.base_byte_addr, &config_words),
             ])
         }
-        _ => asm::assemble_file_to_hex(device, &asm),
+        _ => asm::to_hex(&program_words),
     };
     if let Some(cb) = &config_bytes {
         eprintln!("epic-cc: resolved configuration for {}:", device.name);
@@ -341,5 +348,9 @@ fn main() {
             );
         }
     }
+    eprint!(
+        "{}",
+        driver::report::render_size(&device, &layout, program_words.len())
+    );
     std::fs::write(&cli.output, hex).expect("write hex");
 }

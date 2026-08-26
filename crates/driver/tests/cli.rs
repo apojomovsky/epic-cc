@@ -88,3 +88,14 @@ fn rejects_a_flag_missing_its_value() {
     let e = parse_args(&args(&["a.c", "--device"])).unwrap_err();
     assert!(e.contains("--device"), "{e}");
 }
+#[test]
+fn parses_a_map_file() {
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a", "--map", "out.map"])).unwrap();
+    assert_eq!(c.map.as_deref(), Some("out.map"));
+}
+
+#[test]
+fn map_defaults_to_none() {
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
+    assert_eq!(c.map, None);
+}

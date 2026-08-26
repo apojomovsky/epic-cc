@@ -453,13 +453,10 @@ fn encode_pic18(
     }
 }
 
-/// Assemble source and render the result as Intel HEX.
-///
-/// The whole program (code + tables) must fit the device's flash: a program
-/// whose highest word address is beyond `device.flash_words` panics loudly.
-/// `assemble`/`assemble_pic18` are layout-only and stay unasserted so
-/// isel's unit tests can inspect words of any size.
-pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
+/// Assemble source into program words, asserting the program fits the
+/// device's flash. The driver uses this for both the size report and the
+/// hex emission, so the reported flash count is exactly the program's.
+pub fn assemble_words(device: &Device, src: &str) -> Vec<u16> {
     let words = match device.core {
         device::Core::Pic14 => assemble(src),
         device::Core::Pic18 => assemble_pic18(src),
@@ -473,7 +470,17 @@ pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
         device.flash_words,
         device.flash_words,
     );
-    to_hex(&words)
+    words
+}
+
+/// Assemble source and render the result as Intel HEX.
+///
+/// The whole program (code + tables) must fit the device's flash: a program
+/// whose highest word address is beyond `device.flash_words` panics loudly.
+/// `assemble`/`assemble_pic18` are layout-only and stay unasserted so
+/// isel's unit tests can inspect words of any size.
+pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
+    to_hex(&assemble_words(device, src))
 }
 
 fn parse_num(s: &str) -> usize {

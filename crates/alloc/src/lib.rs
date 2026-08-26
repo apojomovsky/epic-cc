@@ -31,6 +31,17 @@ pub struct AllocLayout {
     pub locals: HashMap<String, u16>,
     pub total_bank0: u16,
     pub const_globals: HashSet<String>,
+    /// Per-bank high-water bytes (both main and ISR contexts): the highest
+    /// allocated address in each GPR bank minus the bank start, floored at
+    /// 0. The allocator places sequentially from each bank start, so this
+    /// is the occupied bytes; the only holes are the 1-byte region-tail
+    /// gaps an i16 leaves when it moves wholesale to the next bank, which
+    /// the high-water mark conservatively includes.
+    pub bank_used: Vec<u16>,
+    /// The disjoint ISR region's span in bytes (0 without an ISR): the
+    /// distance from the ISR root's base to the highest ISR-context frame
+    /// end. Reported separately and included in `bank_used`.
+    pub isr_bytes: u16,
 }
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
@@ -642,6 +653,43 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         }
     }
 
+    // 7b. Per-bank high-water marks and the ISR region span. Every placed
+    // address (globals + locals, both contexts) contributes its end; the
+    // ISR region is the distance from the ISR root's base to the highest
+    // ISR-context frame end, 0 without an ISR.
+    let mut bank_used: Vec<u16> = device.ram_banks.iter().map(|_| 0u16).collect();
+    let mut isr_bytes: u16 = 0;
+    if !isr_names.is_empty() {
+        let isr_roots: Vec<&String> = topo
+            .iter()
+            .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
+            .collect();
+        let isr_ctx: HashSet<String> = isr_roots
+            .iter()
+            .flat_map(|r| reachable(&[r.as_str()], &edges))
+            .collect();
+        let isr_lo = isr_roots
+            .iter()
+            .map(|r| base[r.as_str()])
+            .min()
+            .unwrap_or(bank0_start);
+        let isr_hi = isr_ctx
+            .iter()
+            .map(|f| frame_end(device, base[f], &locals_widths[f]))
+            .max()
+            .unwrap_or(isr_lo);
+        isr_bytes = isr_hi - isr_lo;
+    }
+    for (i, &(start, end)) in device.ram_banks.iter().enumerate() {
+        let mut hi: Option<u16> = None;
+        for (_, &a) in globals.iter().chain(locals.iter()) {
+            if a >= start && a <= end {
+                hi = Some(hi.map_or(a, |h| h.max(a)));
+            }
+        }
+        bank_used[i] = hi.map_or(0, |h| h - start + 1);
+    }
+
     // 8. Total bank-0 demand = max over roots of depth_end(root), with an
     // ISR root's disjoint base offset included (its region starts after the
     // main context's total, not at bank0_start).
@@ -658,6 +706,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         locals,
         total_bank0,
         const_globals,
+        bank_used,
+        isr_bytes,
     }
 }
 

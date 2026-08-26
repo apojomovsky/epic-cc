@@ -7,6 +7,7 @@ pub mod cli;
 pub mod epic_cc_h;
 pub mod fosc;
 pub mod prescan;
+pub mod report;
 pub mod stdbool_h;
 pub mod stddef_h;
 pub mod stdint_h;
