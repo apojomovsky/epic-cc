@@ -10,9 +10,6 @@
 # Reference PDFs must never be committed — copyrighted, see docs/06-environment.md
 *.pdf
 
-# Agent worktree dirs
-/.claude/worktrees/
-
 # Build / test artifacts
 *.hex
 *.lst
@@ -21,6 +18,11 @@
 *.o
 *.ll
 /scratch/
+
+# Root scratch asm dumps (crates/asm/tests/fixtures/*.asm are tracked fixtures)
+/_*.asm
+# Claude Code placeholder, conventions live in AGENTS.md
+/CLAUDE.md
 
 # Throwaway feasibility spike (docs/10-spike-findings.md). Not part of the product.
 /spike/
