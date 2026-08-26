@@ -42,6 +42,11 @@ pub struct AllocLayout {
     /// distance from the ISR root's base to the highest ISR-context frame
     /// end. Reported separately and included in `bank_used`.
     pub isr_bytes: u16,
+    /// Whether the module has an ISR. Distinct from `isr_bytes > 0`: a
+    /// store-only ISR (e.g. a flag-clear handler) has no local frames, so
+    /// its overlay region span is 0, but the backend still emits the
+    /// ISR-save prologue, which the size report must count.
+    pub has_isr: bool,
 }
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
@@ -630,6 +635,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // through the banks via `place_contiguous`/`region_for`, which panics if
     // a frame exceeds the device's last GPR bank (0x1EF on PIC16F877A).
     let mut locals: HashMap<String, u16> = HashMap::new();
+    let mut local_width: HashMap<String, u8> = HashMap::new();
     for f in &m.funcs {
         let b = base[&f.name];
         let mut addr = b;
@@ -637,7 +643,9 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         let mut place = |name: &str, width: u8| {
             if seen.insert(name.to_string()) {
                 let start = place_contiguous(device, addr, width);
-                locals.insert(format!("{}::{name}", f.name), start);
+                let key = format!("{}::{name}", f.name);
+                locals.insert(key.clone(), start);
+                local_width.insert(key, width);
                 addr = start + u16::from(width);
             }
         };
@@ -682,12 +690,21 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     }
     for (i, &(start, end)) in device.ram_banks.iter().enumerate() {
         let mut hi: Option<u16> = None;
-        for (_, &a) in globals.iter().chain(locals.iter()) {
-            if a >= start && a <= end {
-                hi = Some(hi.map_or(a, |h| h.max(a)));
+        for g in &m.globals {
+            if let Some(&a) = globals.get(&g.name) {
+                let e = a + u16::from(g.size);
+                if a >= start && a <= end {
+                    hi = Some(hi.map_or(e, |h| h.max(e)));
+                }
             }
         }
-        bank_used[i] = hi.map_or(0, |h| h - start + 1);
+        for (key, &a) in &locals {
+            let e = a + u16::from(local_width[key]);
+            if a >= start && a <= end {
+                hi = Some(hi.map_or(e, |h| h.max(e)));
+            }
+        }
+        bank_used[i] = hi.map_or(0, |h| h - start);
     }
 
     // 8. Total bank-0 demand = max over roots of depth_end(root), with an
@@ -708,6 +725,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         const_globals,
         bank_used,
         isr_bytes,
+        has_isr: !isr_names.is_empty(),
     }
 }
 
@@ -762,9 +780,10 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
 
 /// Render the layout as `global <name> 0xNN`, `const <name>` (no address —
 /// the global lives in flash), and `local <func> <name> 0xNN` lines,
-/// deterministically sorted by key. Consumed by the driver, which keys
-/// locals `{func}::{name}` and distinguishes const globals via the `const`
-/// prefix (isel reads their bytes from flash, never from a RAM slot).
+/// deterministically sorted by key. The internal alloc<->isel contract
+/// (the alloc bin and alloc tests consume it); the driver's user-facing
+/// map file renders the same facts with the unsplit `{func}::{name}` key
+/// (driver::report::map_text).
 pub fn map_text(l: &AllocLayout) -> String {
     let mut out = String::new();
     let mut globals: Vec<&String> = l.globals.keys().collect();

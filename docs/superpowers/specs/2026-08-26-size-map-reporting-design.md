@@ -19,12 +19,12 @@ matches the D-4 config-words report precedent (`epic-cc: resolved configuration 
 ...` on stderr, `config_e2e.rs` asserts it) and PlatformIO parses build output. No
 suppress flag in v1; the config report has none either.
 
-`--map <file>` writes the allocator's address map. The file format is `alloc::map_text`'s
-existing text contract, already tested and documented: `global <name> 0xNN`,
-`local <func> <name> 0xNN` (the driver's `{func}::{name}` HashMap keys, split for
-readability), and `const <name>` for flash-resident globals. Reusing it avoids a second
-format to maintain. The map is written right after allocation, so it is available for
-`--emit asm` and `--emit hex` alike.
+`--map <file>` writes the allocator's address map: `global <name> 0xNN`, `const <name>`
+(flash-resident, no RAM address), and `local <key> 0xNN` where `<key>` is the driver's
+`{func}::{name}` HashMap key, all sorted deterministically. Using the HashMap key keeps
+one symbol spelling across the compiler and its artifacts (AGENTS.md names it as the
+contract). The map is written right after allocation, so it is available for `--emit asm`
+and `--emit hex` alike.
 
 ### D-2: "RAM used" means the bytes of RAM the program's allocation occupies
 
@@ -32,7 +32,7 @@ Overlay allocation makes "used" non-obvious: a byte can be live in several frame
 the physical span from GPR start to the highest frame end overcounts (it includes the
 inter-bank SFR/gap regions). The report therefore defines used as the sum of:
 
-- **per-bank high-water marks**: for each GPR bank, the highest allocated address
+- **per-bank high-water marks**: for each GPR bank, the highest allocated byte
   (globals + locals, main and ISR contexts) minus the bank start, floored at 0. The
   allocator places sequentially from each bank start, so the high-water mark is the
   occupied bytes; the only holes are the 1-byte region-tail gaps an i16 leaves when it
@@ -40,10 +40,10 @@ inter-bank SFR/gap regions). The report therefore defines used as the sum of:
 - **the fixed common/access-bank region**: isel's scratch/retval/ISR-save layout.
   PIC14: scratch (1) + retval (4) = 5 bytes, + ISR save (9) = 14 with an ISR. PIC18:
   retval + flag (4) = 4 bytes, + ISR save (12) = 16 with an ISR. These are isel's
-  layout constants, asserted in isel; the report documents them in one place.
-
-The report states this definition on the RAM line, per the issue's requirement that the
-report say what it means by used.
+  layout constants, asserted in isel; the report documents them in one place. The
+  fixed count follows the module's `has_isr` flag, not the ISR region span: a
+  store-only ISR (a flag-clear handler) has no local frames, so its span is 0, but the
+  save prologue is still emitted and counted.
 
 ### D-3: Flash used = the program's assembled words, before config insertion
 
@@ -66,7 +66,7 @@ and is included in the bank totals, so the report says so rather than double-cou
 ```
 epic-cc: program size for p16f877a:
   flash: 123/8192 words (1.5%)
-  RAM: 123/368 bytes (33.4%) (overlay: a byte can be live in several frames; used = the bytes of RAM the program's allocation occupies)
+  RAM: 121/336 bytes (36.0%) (overlay: a byte can be live in several frames; used = the bytes of RAM the program's allocation occupies)
     bank 0: 80/80 bytes
     bank 1: 27/80 bytes
     bank 2: 0/80 bytes
@@ -75,8 +75,14 @@ epic-cc: program size for p16f877a:
     ISR region: 12 bytes (disjoint, after the main context, included in the bank totals)
 ```
 
-PIC18 renders the same shape: one GPR bank line, and `fixed: N/16 bytes` for the
-`fixed_retval` region instead of `common`.
+The RAM total is the GPR banks plus the fixed region (4 x 80 + 16 = 336 on the 877A);
+the bank lines and the common line sum to the used total (80 + 27 + 14 = 121). The ISR
+region is a sub-total inside the bank numbers, not an addition.
+
+PIC18 renders the same shape: one GPR bank line (0x0010..0x07FF = 2032 bytes), and
+`fixed: N/16 bytes` for the `fixed_retval` region instead of `common`. The RAM total is
+2032 + 16 = 2048; the access bank is not added separately because it overlaps the GPR
+bank (BSR-independent window over the same registers).
 
 ## Files
 

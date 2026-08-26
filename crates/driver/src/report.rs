@@ -58,12 +58,14 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
                 base
             }
         }
-        device::Core::Pic14e => 0,
+        // The driver exits on pic14e before the report runs.
+        device::Core::Pic14e => unreachable!("pic14e has no backend"),
     }
 }
 
-/// The fixed region's total capacity: PIC14 common RAM, PIC18's access
-/// bank (the fixed_retval reservation is a policy slice of it).
+/// The fixed region's total capacity: PIC14 common RAM, PIC18's
+/// fixed_retval reservation (the access bank overlaps the GPR banks, so
+/// summing it would double-count the shared window).
 pub fn fixed_total(device: &Device) -> u16 {
     match device.core {
         device::Core::Pic14 => {
@@ -74,11 +76,12 @@ pub fn fixed_total(device: &Device) -> u16 {
         }
         device::Core::Pic18 => {
             let (lo, hi) = device
-                .access_bank
-                .expect("PIC18 devices have an access bank");
+                .fixed_retval
+                .expect("PIC18 devices have a fixed_retval reservation");
             hi - lo + 1
         }
-        device::Core::Pic14e => 0,
+        // The driver exits on pic14e before the report runs.
+        device::Core::Pic14e => unreachable!("pic14e has no backend"),
     }
 }
 
@@ -98,8 +101,7 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         .map(|&(s, e)| e - s + 1)
         .sum::<u16>()
         + fixed_total(device);
-    let ram_used: u16 =
-        layout.bank_used.iter().sum::<u16>() + fixed_bytes(device, layout.isr_bytes > 0);
+    let ram_used: u16 = layout.bank_used.iter().sum::<u16>() + fixed_bytes(device, layout.has_isr);
     out.push_str(&format!(
         "  RAM: {ram_used}/{ram_total} bytes ({:.1}%) (overlay: a byte can be live in several frames; used = the bytes of RAM the program's allocation occupies)\n",
         ram_used as f64 * 100.0 / ram_total as f64
@@ -109,7 +111,7 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         let total = end - start + 1;
         out.push_str(&format!("    bank {i}: {used}/{total} bytes\n"));
     }
-    let fixed = fixed_bytes(device, layout.isr_bytes > 0);
+    let fixed = fixed_bytes(device, layout.has_isr);
     let fixed_total = fixed_total(device);
     let fixed_name = match device.core {
         device::Core::Pic14 => "common",
