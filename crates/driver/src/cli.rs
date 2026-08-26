@@ -21,6 +21,7 @@ pub struct Cli {
     pub emit: Emit,
     pub save_temps: Option<String>,
     pub verbose: bool,
+    pub map: Option<String>,
 }
 
 pub const USAGE: &str = "\
@@ -33,6 +34,8 @@ usage: epic-cc [options] <input.c>...
                        aliases: --device, --mcu, -mcu
   --emit <stage>       ll | ir | asm | hex (default: hex)
   --save-temps <dir>   write every stage artifact into <dir>
+  --map <file>         write the symbol-to-address map (globals and
+                       {func}::{name} locals) into <file>
   -v                   echo the clang and llvm-link commands
   --version, -V        print the compiler identity (e.g. epic-cc 0.0.0-master-<sha>)
 ";
@@ -47,6 +50,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut emit = Emit::Hex;
     let mut save_temps = None;
     let mut verbose = false;
+    let mut map = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -100,6 +104,9 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     .cloned()
                     .ok_or("epic-cc: --save-temps needs a value")?,
             );
+        } else if a == "--map" {
+            i += 1;
+            map = Some(argv.get(i).cloned().ok_or("epic-cc: --map needs a value")?);
         } else if a == "-v" {
             verbose = true;
         } else if a.starts_with('-') {
@@ -123,5 +130,6 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         emit,
         save_temps,
         verbose,
+        map,
     })
 }
