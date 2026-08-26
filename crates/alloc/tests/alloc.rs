@@ -584,6 +584,75 @@ fn isr_region_clears_the_main_context_physical_frame_end() {
 }
 
 #[test]
+fn bank_used_tracks_high_water_per_bank() {
+    // 79 i8 globals fill bank 0 GPR (0x20..0x6E); main's i16 local moves
+    // wholesale to 0xA0 (bank 1) leaving a 1-byte hole at 0x6F, and its
+    // i8 local lands at 0xA2. bank_used[0] = 0x6E - 0x20 + 1 = 79 (the
+    // hole at 0x6F is not allocated), bank_used[1] = 0xA3 - 0xA0 = 3,
+    // banks 2-3 = 0.
+    let mut gsrc = String::new();
+    for i in 0..79 {
+        gsrc.push_str(&format!("global g{i} i8\n"));
+    }
+    let m = parse(&format!(
+        "{gsrc}fn main(void) ()\n\
+               block entry:\n\
+                 %v0 = add i16 1, 2\n\
+                 %v1 = add i8 3, 4\n\
+                 ret void\n"
+    ));
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.bank_used, vec![79, 3, 0, 0]);
+    assert_eq!(out.isr_bytes, 0);
+}
+
+#[test]
+fn isr_bytes_reports_the_disjoint_region_span() {
+    // main's context occupies 0x20..0x23 (depth_end 3); the ISR root's
+    // base is 0x23 and its chain (isr -> m1_isr -> m2_isr, one i8 local
+    // each) ends at 0x26. isr_bytes = 0x26 - 0x23 = 3.
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             %v0 = add i8 1, 2\n\
+             call void @m1()\n\
+             ret void\n\
+         fn m1(void) ()\n\
+           block entry:\n\
+             %v1 = add i8 1, 2\n\
+             call void @m2()\n\
+             ret void\n\
+         fn m2(void) ()\n\
+           block entry:\n\
+             %v2 = add i8 1, 2\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %i0 = add i8 1, 2\n\
+             call void @m1_isr()\n\
+             ret void\n\
+         fn m1_isr(void) ()\n\
+           block entry:\n\
+             %i1 = add i8 1, 2\n\
+             call void @m2_isr()\n\
+             ret void\n\
+         fn m2_isr(void) ()\n\
+           block entry:\n\
+             %i2 = add i8 1, 2\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge main m1\nedge m1 m2\nedge isr m1_isr\nedge m1_isr m2_isr\n",
+    );
+    assert_eq!(out.isr_bytes, 3);
+    // The ISR region is included in the bank totals: the highest ISR
+    // address 0x25 is in bank 0, so bank_used[0] = 0x26 - 0x20 = 6.
+    assert_eq!(out.bank_used[0], 6);
+}
+
+#[test]
 fn a_global_layout_sequential_placement_cannot_fit_succeeds_via_bin_packing() {
     // Three 76-byte globals, one 78-byte global, then one 4-byte global (310
     // bytes total, under the device's 320-byte capacity) — declared in an
