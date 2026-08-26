@@ -1,5 +1,13 @@
 use asm::{assemble, assemble_file_to_hex, to_hex};
 use pic14_sim::parse_hex;
+#[test]
+fn assemble_words_returns_program_words_without_hex() {
+    let src = "    org 0x0000\n    movlw 0x2A\n    nop\n    end\n";
+    let words = asm::assemble_words(&device::PIC16F877A, src);
+    assert_eq!(words.len(), 2);
+    assert_eq!(words[0], 0x302A); // movlw 0x2A
+    assert_eq!(words[1], 0x0000); // nop
+}
 
 #[test]
 fn assembles_movf_add_movwf() {
