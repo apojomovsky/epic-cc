@@ -227,8 +227,8 @@ skip-sensitive `BANKSEL` hazard recorded in `AGENTS.md` is exactly the failure m
 never inserts inside a block.
 
 **This is separate from whether `epic-math` uses any of it.** epic-cc supports assembly because
-a standalone compiler must. Whether the HAL's math routines go through it under epic-cc is
-HAL-3's call, and the benchmark argues they should not (see §5).
+a standalone compiler must. Whether the HAL's math routines go through it under epic-cc was
+HAL-3's call, and the measurement settled it: they do (see §5, decided 2026-08-26).
 
 ### D-4: Fuses are sparse overrides over safe defaults, using datasheet names
 
@@ -653,8 +653,8 @@ Fourteen, across three repositories. Each earns its own design and plan.
 ```
 
 `CC-1` blocks every HAL sub-project. `CC-2` and `CC-3` block `HAL-3`. `CC-4` blocks `HAL-3`
-only if `epic-math` keeps its assembly under epic-cc. `CC-5` blocks PIC18 family parity but
-nothing on the PIC14 path.
+because `epic-math` keeps its assembly under epic-cc (measured, §5, 2026-08-26). `CC-5` blocks
+PIC18 family parity but nothing on the PIC14 path.
 
 ### Chosen order: PIC14 first as the pathfinder
 
@@ -699,8 +699,17 @@ That assembly exists to beat XC8's licence-gated optimizer, and epic-cc has no l
 building that C path under epic-cc and measuring, not by porting 400 assembly statements.
 **Before believing this**, check whether anything depends on the *fixed-cycle* property the
 assembly advertises, as opposed to only its speed: a C path is not cycle-deterministic.
-**Owner as of 2026-08-24:** `apojomovsky/epic-hal#90`, split out of HAL-3 so it can run first.
-Its result decides whether `CC-4` is a dependency of this epic at all.
+**Decided 2026-08-26 by `apojomovsky/epic-hal#90`: the C path loses, so `CC-4` stays a
+dependency.** Measured on both PIC14 devices (877A and 887, identical codegen): the C path
+under epic-cc is correct but slower than the hand asm on every op (add 153 vs 80, sub 90 vs
+75, mul8 423 vs 145, mul16 797 vs 302, div 1000 vs 441 cycles; full table in
+epic-hal's `docs/experiments/math-cycle-benchmark-epiccc/README.md`). The gap is the call
+plus the richer contract, not codegen quality, and the C path also loses to epic-cc's own
+inlined arithmetic. The fixed-cycle question is answered with evidence: no consumer in the
+shelf, combos, or demos times a math call, so the property is not load-bearing. Two small
+epic-cc gaps block the full C path from building (`ptr null` call arg: #144, `llvm.fshl`:
+#145); they do not change the decision. `epic-math` keeps its assembly under epic-cc via the
+CC-4 rung.
 
 **`epic-serial`'s `printf` retarget (HAL-3).** Depends on how much of `stdio` `CC-2` provides.
 Variadic functions on a machine with no stack are their own design problem. Likely resolved by
