@@ -5885,12 +5885,30 @@ fn reader_pages(consts: &[&ir::Global], table_start: usize) -> Vec<(String, usiz
             addr = aligned + 256 * (n_chunks - 1) + (size - 256) + 6 * (n_chunks - 1);
         } else {
             // Single table: base sits 6 words (the reader entry) after the
-            // section's running address.
-            pages.push((format!("__read_{}", g.name), (addr + 6) / 0x800));
-            addr += 6 + size;
+            // section's running address. A base that would cross its window
+            // is 256-aligned by the emitter (the same fold), so the page
+            // PCLATH holds after the call is the ALIGNED base's page.
+            let aligned = window_align(addr + 6, size);
+            pages.push((format!("__read_{}", g.name), aligned / 0x800));
+            addr = aligned + size;
         }
     }
     pages
+}
+
+/// The word address a single-entry (<= 255 byte) const table's base must
+/// occupy so its RETLWs fit one 256-byte window: `base` unchanged when
+/// LOW(base) + size <= 0x100, else the next 256-word boundary (LOW 0).
+/// Issue #138: a 60-byte table at base 0xCEA wraps (0xEA + 60 > 0x100) and
+/// the assembler's `.table` window assert panics; the caller emits
+/// `.align 256` to this base so placement never decides a <= 255-byte
+/// table's fit, mirroring the chunked branch's alignment.
+fn window_align(base: usize, size: usize) -> usize {
+    if (base & 0xFF) + size <= 0x100 {
+        base
+    } else {
+        (base + 255) & !255
+    }
 }
 
 /// Select instructions for the whole module, producing PIC14 assembly text.
@@ -6250,7 +6268,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         }
         page_order[page].push((*f, name.as_str()));
     }
-    {
+    let section_start = {
         let mut tmp = 0u32;
         let mut addr_b: usize = if has_isr { 4 } else { 5 };
         for funcs_on_page in &page_order {
@@ -6307,6 +6325,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // pin). It is always forward (or equal): pass-B bodies are no
         // larger, so `addr_b <= table_start`. A module without consts has no
         // section to pin.
+        let mut start = addr_b;
         if !consts.is_empty() {
             let pages_a = reader_pages(&consts, table_start);
             let pages_b = reader_pages(&consts, addr_b);
@@ -6316,9 +6335,11 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 .any(|((_, pa), (_, pb))| pa != pb);
             if drift {
                 out.push(format!("    org 0x{table_start:04X}"));
+                start = table_start;
             }
         }
-    }
+        start
+    };
     // Const (flash) globals become RETLW tables, emitted after the
     // functions so the CALLs above resolve. Every `__read_<name>` reader
     // sets PCLATH = HIGH(<name>) first: the computed `ADDLW LOW(<name>);
@@ -6388,7 +6409,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
         }
     }
-    let mut addr = table_start;
+    let mut addr = section_start;
     for g in consts {
         assert!(
             !g.bytes.is_empty(),
@@ -6473,10 +6494,18 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 reader(&mut out, &chunk_label);
             }
         } else {
-            // Single-entry table (<= 255 bytes): `.table` immediately before
-            // the base label; the assembler asserts LOW(name) + size <= 0x100.
+            // Single-entry table (<= 255 bytes): a base that would cross
+            // its window gets `.align 256` before the `.table` directive
+            // (issue #138), so the assembler's LOW + size <= 0x100 assert
+            // never fires on a <= 255-byte table: placement never decides
+            // its fit, mirroring the chunked branch's alignment. A base
+            // that already fits emits no `.align` (no flash waste).
             out.push(format!("__read_{}:", g.name));
             reader(&mut out, &g.name);
+            let base = window_align(addr + 6, size);
+            if base != addr + 6 {
+                out.push("    .align 256".to_string());
+            }
             out.push(format!("    .table {} {size}", g.name));
             out.push(format!("{}:", g.name));
             for b in &g.bytes[..size] {
@@ -6493,7 +6522,10 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             addr += size - 256; // chunks 1.. RETLWs
             addr += 6 * (n_chunks - 1); // chunk reader entries
         } else {
-            addr += size; // single-entry RETLWs
+            // The `.align 256` the emitter folds in when the natural base
+            // (the running address after the reader entry) would cross its
+            // window, then the RETLWs.
+            addr = window_align(addr, size) + size;
         }
         out.push("".to_string());
     }

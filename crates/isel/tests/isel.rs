@@ -4853,18 +4853,15 @@ fn exact_boundary_function_stays_anchored_after_elision() {
 }
 
 #[test]
-fn table_section_pinned_to_pass_a_start_after_elision() {
-    // F2 regression: `reader_pages` maps every reader entry's page from the
-    // pass-A `table_start`, but pass B emits the tables at the post-elision
-    // position. Here the pass-A section starts at 0x7FA — a few words short
-    // of the 0x800 boundary — so the small table's base (reader entry + 6
-    // words, no align) sits EXACTLY at 0x800 (page 1): the mapped page.
-    // main and last both elide their same-page h0 restores (4 words), which
-    // pulls the base back to 0x7FC (page 0) without the pin — the final
-    // layout no longer matches the map (a caller that trusted it would skip
-    // a needed restore). The `.org 0x7FA` pin must hold the section at the
-    // pass-A start so the assembled reader base's page matches
-    // `reader_pages`.
+fn single_table_elision_drift_folded_by_window_align() {
+    // F2 regression, adapted for the window-align fix (issue #138): the
+    // reader page map uses the pass-A `table_start`, but pass B emits the
+    // tables at the post-elision position. Here the section starts at
+    // 0x7FA, so the base (reader + 6 words) sits exactly at 0x800 (page 1);
+    // the elided restores pull the natural base back to 0x7FC, where a
+    // 200-byte table crosses its window. The align folds it to 0x800 again,
+    // matching the map with no `.org` pin, so the caller's restore decision
+    // stays exact.
     let m = module_with_globals(
         &format!(
             "global in i8\nglobal out i8\nconst t i8\n\
@@ -4890,26 +4887,27 @@ fn table_section_pinned_to_pass_a_start_after_elision() {
         ("last::a", 0x31),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // The pin: `.org 0x7FA` immediately before the reader entry — the
-    // pass-A table start, not the drifted post-elision position.
-    assert!(
-        asm.contains("    org 0x07FA"),
-        "table-section pin missing:\n{asm}"
-    );
+    // The elision drift is real: the reader sits at the post-elision
+    // position (0x7F6), not the pass-A 0x7FA.
     assert_eq!(
         label_addr(&asm, "__read_t"),
-        0x7FA,
-        "reader pinned to the pass-A start:\n{asm}"
+        0x7F6,
+        "reader at the post-elision start:\n{asm}"
     );
-    // The table base stays exactly at the page boundary, so its page
-    // matches the reader_pages map (page 1).
-    assert_eq!(
-        label_addr(&asm, "t"),
-        0x800,
-        "table base pinned to 0x800:\n{asm}"
+    assert!(
+        !asm.contains("    org 0x07FA"),
+        "no pin needed when the window align absorbs the drift:\n{asm}"
     );
+    // The window align folds the crossing base back onto the page
+    // boundary, so its page matches the reader_pages map (page 1).
+    assert!(
+        asm.contains("    .align 256\n    .table t 200"),
+        "window align must precede the table:\n{asm}"
+    );
+    let base = label_addr(&asm, "t");
+    assert_eq!(base, 0x800, "table base held at the page boundary:\n{asm}");
     assert_eq!(
-        label_addr(&asm, "t") >> 11,
+        base >> 11,
         1,
         "base page matches the reader_pages map:\n{asm}"
     );
@@ -4923,7 +4921,7 @@ fn table_section_pinned_to_pass_a_start_after_elision() {
         asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
         "cross-page table read keeps the restore:\n{asm}"
     );
-    // Load-bearing sim: the pinned table reads correctly (h0(x) = 0, so
+    // Load-bearing sim: the aligned table reads correctly (h0(x) = 0, so
     // out == t[in]).
     assert_eq!(
         sim_run_asm(&asm, &[(0x20, 0)], 0x21),
@@ -8330,4 +8328,129 @@ fn indirect_call_emits_compare_and_call_chain() {
     assert!(asm.contains("    CALL f0"), "CALL f0:\n{asm}");
     assert!(asm.contains("    CALL f1"), "CALL f1:\n{asm}");
     assert!(asm.contains("GOTO tmp"), "trap loop:\n{asm}");
+}
+
+#[test]
+fn single_entry_table_crossing_window_is_256_aligned() {
+    // Issue #138: a <= 255-byte table whose natural base would cross its
+    // 256-byte window used to panic in the assembler's `.table` assert (a
+    // 60-byte table at base 0x1EA: LOW 0xEA + 60 = 0x126 > 0x100). The
+    // emitter now folds `.align 256` before the `.table` directive, the
+    // exact chunked-branch alignment, so placement never decides the fit.
+    // main is padded so the table's natural base lands at 0x1EA: layout =
+    // goto (1) + __start (4) + main (479) + t reader (6) -> base 0x1EA,
+    // aligned to 0x200.
+    let ir_text = format!(
+        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n{}    ret void\n",
+        pad_body(156)
+    );
+    let m = module_with_globals(
+        &ir_text,
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("t", 60),
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::v", 0x26),
+        ("main::a", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    // The crossing is real: without the align the base would sit at LOW
+    // 0xEA and the assembler's `.table` assert would fire (the regression
+    // this test pins).
+    let base = label_addr(&asm, "t");
+    assert!(
+        base & 0xFF == 0,
+        "crossing base must be 256-aligned (base 0x{base:03X}):\n{asm}"
+    );
+    assert!(
+        asm.contains("    .align 256\n    .table t 60"),
+        "the .align 256 must precede the .table directive:\n{asm}"
+    );
+    // And the program really builds and runs: in = 3 -> table[3] = 3.
+    verify_page_fit(&m, &asm);
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 3)], 0x21),
+        3,
+        "table[3] = 3 through the aligned window-2 reader:\n{asm}"
+    );
+}
+
+#[test]
+fn single_entry_table_within_window_emits_no_align() {
+    // A <= 255-byte table whose natural base already fits its window must
+    // not gain a pad: `.align 256` would waste up to 255 words of flash for
+    // nothing. main is padded so the table's natural base lands in window
+    // 0 (LOW + 60 <= 0x100), far from any crossing.
+    let ir_text = format!(
+        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n{}    ret void\n",
+        pad_body(10)
+    );
+    let m = module_with_globals(
+        &ir_text,
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+            },
+            const_table_global("t", 60),
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::v", 0x26),
+        ("main::a", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    let base = label_addr(&asm, "t");
+    assert!(
+        (base & 0xFF) + 60 <= 0x100,
+        "table must sit in window 0 (base 0x{base:03X}):\n{asm}"
+    );
+    assert!(
+        !asm.contains("    .align 256"),
+        "no pad for a table that fits its window:\n{asm}"
+    );
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 5)], 0x21),
+        5,
+        "table[5] = 5:\n{asm}"
+    );
 }
