@@ -106,11 +106,21 @@ fn map_file_matches_the_allocator_map() {
         "driver: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let layout = add_layout();
     let written = std::fs::read_to_string(&map_path).unwrap();
     assert_eq!(
         written,
-        driver::report::map_text(&device::PIC16F877A, &layout)
+        driver::report::map_text(&device::PIC16F877A, &add_layout())
+    );
+    // The map is the allocator's own addresses, in the driver's HashMap
+    // key form ({func}::{name} locals), sorted deterministically. add.c
+    // has two globals and two i8 locals, so the exact lines are pinned.
+    assert_eq!(
+        written,
+        "; epic-cc map for p16f877a\n\
+         global in 0x20\n\
+         global out 0x21\n\
+         local main::1 0x22\n\
+         local main::2 0x23\n"
     );
     let _ = std::fs::remove_file(&hex_path);
     let _ = std::fs::remove_file(&map_path);
