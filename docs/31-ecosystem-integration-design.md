@@ -4,6 +4,9 @@
 > and sequencing **approved by the user on 2026-08-20**.
 > **Amended 2026-08-24**, approved by the user: parity covers three families, not two;
 > `pic16f193x-hal` is deferred rather than rejected; `HAL-3` is decomposed into clusters.
+> **Amended 2026-08-26**, decided by the user: the PlatformIO platform is named
+> `platform-epic8`, registry id `epic8` (was the `platform-pic8`/`pic8` working name
+> when this document was written). D-6 and section 3 carry the new name.
 > Section 6 records what has landed.
 > This document is the **decomposition of record**. It holds the map and the decisions
 > that constrain every piece; it is not an implementation plan. Each sub-project below
@@ -291,7 +294,8 @@ existing users.
 
 ### D-6: PlatformIO gets its own repository
 
-**Decision.** A new `platform-pic8` repository, plus two packages cut from the existing repos'
+**Decision.** A new `platform-epic8` repository (registry id `epic8`; on GitHub it is
+`epic-platformio`), plus two packages cut from the existing repos'
 releases: `toolchain-epiccc` from epic-cc, `framework-epichal` from epic-hal.
 
 **Rationale.** PlatformIO's registry model is one repository per platform (`platform.json`,
@@ -628,7 +632,7 @@ Fourteen, across three repositories. Each earns its own design and plan.
 | **HAL-4** | **Verification** | epic-cc's `crates/sim` replaces the `mdb` / MPLAB SIM gate on the epic-cc path. This is what makes a public CI job possible. |
 | **HAL-5** | **Distribution flip** | `install.sh` and the bundles default to epic-cc: zero Microchip downloads, a scaffolded Makefile, no `.X` project. |
 
-### platform-pic8 (new)
+### platform-epic8 (new)
 
 | ID | Sub-project | Contents |
 |---|---|---|
