@@ -607,6 +607,21 @@ fn bank_used_tracks_high_water_per_bank() {
 }
 
 #[test]
+fn bank_used_counts_a_multi_byte_value_in_full() {
+    // A single i16 local at 0x20 occupies 0x20..0x22: the high-water END is
+    // 0x22, so bank_used[0] = 2, not 1 (tracking the start would undercount
+    // by width - 1).
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             %v0 = add i16 1, 2\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.bank_used, vec![2, 0, 0, 0]);
+}
+
+#[test]
 fn isr_bytes_reports_the_disjoint_region_span() {
     // main's context occupies 0x20..0x23 (depth_end 3); the ISR root's
     // base is 0x23 and its chain (isr -> m1_isr -> m2_isr, one i8 local

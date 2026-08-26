@@ -762,7 +762,7 @@ decomposition; this is its state.
 | **CC-3** silicon-real codegen | Done | #67, ADR-012 |
 | **CC-4** inline assembly ladder | Done, rungs 1 to 4 | ADR-017 |
 | **CC-5** PIC18 P4 to P8 | Done | `docs/29-pic18-port-design.md` |
-| **CC-6** distribution, size and map | Done | #74, ADR-025; #118 for the CI consumable artifact |
+| **CC-6** distribution, size and map | Done (reporting half) | #74, ADR-025; #118 for the CI consumable artifact |
 | **HAL-1** epic-cc build variant | Done | `epic-hal#57` |
 | **HAL-2** build-system backend | Done | `epic-hal#58` |
 | **HAL-3** module conformance | Decomposed, see below | `epic-hal#59` |

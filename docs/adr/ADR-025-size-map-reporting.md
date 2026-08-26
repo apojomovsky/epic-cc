@@ -21,14 +21,20 @@
   <key> 0xNN` where `<key>` is the driver's `{func}::{name}` HashMap key
   (the AGENTS.md contract), sorted deterministically.
 * `alloc::AllocLayout` gains `bank_used: Vec<u16>` (per-bank high-water
-  bytes, main and ISR contexts) and `isr_bytes: u16` (the disjoint ISR
-  region's span). `asm` gains `assemble_words(device, src) -> Vec<u16>`
-  (program words with the flash-fit assert); `assemble_file_to_hex`
-  delegates to it.
+  bytes, main and ISR contexts), `isr_bytes: u16` (the disjoint ISR
+  region's span), and `has_isr: bool`. `asm` gains
+  `assemble_words(device, src) -> Vec<u16>` (program words with the
+  flash-fit assert); `assemble_file_to_hex` delegates to it.
 * **Flash used is the program's assembled words before config insertion**:
   the PIC14 config word lives past the flash ceiling (0x2007 on the
   877A), so the hex vec is resized to include it and its length would
   overcount.
+* **Per-bank usage is the high-water END** (addr + width), not the start:
+  a bank whose highest value is multi-byte (i16/i32) would otherwise
+  undercount by width - 1. The fixed count follows `has_isr`, not
+  `isr_bytes > 0`: a store-only ISR (a flag-clear handler) has no local
+  frames, so its span is 0, but the backend still emits the ISR-save
+  prologue.
 
 ## Rationale
 
@@ -43,7 +49,7 @@
   spelling across the compiler and its artifacts.
 * The overlay allocator already holds every RAM fact (the issue's own
   framing: "this is a reporting surface over facts it holds"), so the
-  reporting adds no new analysis, only the two fields that make the facts
+  reporting adds no new analysis, only the fields that make the facts
   public.
 * The high-water-mark definition is honest for sequential allocation:
   values are placed from each bank start, so the highest allocated
@@ -70,9 +76,11 @@
   i16 local crosses a bank boundary reports that bank as full (the hole
   byte counts). This is the conservative fit signal a user cutting RAM
   needs, not a reallocation promise.
-* **PIC18 fixed-region reporting uses the access bank** (the
-  `fixed_retval` reservation is a policy slice of it), so the fixed line
-  shows a 16-byte used slice of the 96-byte access bank.
+* **PIC18 fixed-region reporting uses the `fixed_retval` reservation** (16
+  bytes) as the fixed total, not the access bank: the access bank overlaps
+  the GPR banks (a BSR-independent window over the same registers), so
+  summing it would double-count the shared window. The fixed line shows
+  the 16-byte reservation, 4 of which are used without an ISR.
 
 ## Revisit if
 

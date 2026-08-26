@@ -262,8 +262,10 @@ These are deliberate and tracked, not surprises:
   CASES'06 2-approximation the design calls for.
 - **Overlay allocation is call-graph-based**, not interference-graph colouring. Common RAM
   currently holds fixed scratch/retval bytes rather than serving as a general imaginary
-*- **`.asm` / `.lst` / `.map` output** is not yet exposed by the driver, which emits HEX only.
-- **`.asm` / `.lst` output** is not yet exposed by the driver, which emits HEX only (the map is: `--map <file>`).
+  register file.
+- **`.asm` / `.lst` output** is not yet exposed by the driver, which emits HEX only (the
+  map is: `--map <file>`).
+- **XC8 and gpsim oracles** are designed but not wired into the suite.
 
 ---
 
