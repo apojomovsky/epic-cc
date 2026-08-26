@@ -6067,6 +6067,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     let mut order: Vec<&ir::Func> = Vec::with_capacity(m.funcs.len());
     order.extend(m.funcs.iter().filter(|f| f.isr));
     order.extend(m.funcs.iter().filter(|f| !f.isr));
+    let mut bodies_by_name: HashMap<String, usize> = HashMap::new();
     let mut bodies: Vec<(String, usize)> = Vec::new();
     let mut body_texts: Vec<String> = Vec::new();
     {
@@ -6086,6 +6087,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             };
             emit_func_body(&mut g, f);
             bodies.push((f.name.clone(), word_size(&g.out)));
+            bodies_by_name.insert(f.name.clone(), word_size(&g.out));
             body_texts.push(g.out.join("\n"));
         }
     }
@@ -6348,10 +6350,38 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // pin). It is always forward (or equal): pass-B bodies are no
         // larger, so `addr_b <= table_start`. A module without consts has no
         // section to pin.
+        //
+        // The window-fit accounting runs at the FINAL post-banking
+        // position, not the pre-banking `addr_b`: the banking pass inserts
+        // BANKSEL words into the function bodies, pushing the assembler's
+        // org at the first table forward (epic-cc#151). Only the LAST
+        // page's growth moves the section (earlier pages' growth is
+        // absorbed by the next page's `.org` pad), so the final position
+        // is `addr_b + last_page_growth`.
         let mut start = addr_b;
         if !consts.is_empty() {
+            // `pages` also holds const-reader entries (their page can
+            // exceed every function's page); the section sits after the
+            // LAST function, so only that page's banking growth moves it.
+            let last_page = bodies
+                .iter()
+                .map(|(name, _)| pages[name])
+                .max()
+                .unwrap_or(0);
+            let growth: usize = order
+                .iter()
+                .filter(|f| pages[&f.name] == last_page)
+                .map(|f| post[&f.name] - bodies_by_name[&f.name])
+                .sum();
+            start = addr_b + growth;
+            // The pin decision must compare the map against the ACTUAL
+            // emission position `start` (post-banking), not the
+            // pre-banking `addr_b`: growth can push a base across a page
+            // boundary that neither pass-A nor `addr_b` cross. Checking
+            // at `start` is conservative (start >= addr_b, and a pin
+            // re-anchors to the map-consistent `table_start`).
             let pages_a = reader_pages(&consts, table_start);
-            let pages_b = reader_pages(&consts, addr_b);
+            let pages_b = reader_pages(&consts, start);
             let drift = pages_a
                 .iter()
                 .zip(&pages_b)
