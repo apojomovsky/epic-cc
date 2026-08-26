@@ -1354,7 +1354,17 @@ fn fill_indirect_callees(m: &mut Module) {
             }
         }
     }
-    addr_taken.retain(|g| defined.contains(g.as_str()));
+    // Arity map for the candidate filter: an indirect call site only ever
+    // invokes a candidate with the matching number of arguments. Without
+    // this, a 1-arg ISR callback site (RB change) collects 0-arg callbacks
+    // (Timer0 overflow) into its candidate set and isel panics copying
+    // args into a param-less slot. An `_isr` copy shares its original's
+    // params, so the arity check on the original carries over.
+    let arity: HashMap<String, usize> = m
+        .funcs
+        .iter()
+        .map(|f| (f.name.clone(), f.params.len()))
+        .collect();
 
     // The extended ISR context (epic-cc#137): the ISR roots' reachability
     // over direct calls and address-value edges, plus every defined function
@@ -1382,6 +1392,7 @@ fn fill_indirect_callees(m: &mut Module) {
                                 !isr_ctx.contains(*g)
                             }
                         })
+                        .filter(|g| arity.get(*g).copied() == Some(c.args.len()))
                         .cloned()
                         .collect();
                     // An ISR-site candidate that is a duplicated ORIGINAL
