@@ -6374,8 +6374,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 .map(|f| post[&f.name] - bodies_by_name[&f.name])
                 .sum();
             start = addr_b + growth;
+            // The pin decision must compare the map against the ACTUAL
+            // emission position `start` (post-banking), not the
+            // pre-banking `addr_b`: growth can push a base across a page
+            // boundary that neither pass-A nor `addr_b` cross. Checking
+            // at `start` is conservative (start >= addr_b, and a pin
+            // re-anchors to the map-consistent `table_start`).
             let pages_a = reader_pages(&consts, table_start);
-            let pages_b = reader_pages(&consts, addr_b);
+            let pages_b = reader_pages(&consts, start);
             let drift = pages_a
                 .iter()
                 .zip(&pages_b)

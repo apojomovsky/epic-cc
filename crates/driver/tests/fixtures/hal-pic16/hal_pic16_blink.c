@@ -2,7 +2,7 @@
  * HAL API under epic-cc. main registers a Timer0 overflow callback
  * through the inlined Init (the store folds to a named literal,
  * ADR-024), registers an RB change callback through the param-forwarded
- * shape, reads the const `irq_table` through EPIC_IRQ_GetFlag (the
+ * shape, reads the const `irq_table` through EPIC_IRQ_GetFlagMask (the
  * non-zero regression guard, epic-cc#114), then idles. The e2e fires
  * the Timer0 interrupt and asserts the callback ran end to end.
  */
@@ -15,7 +15,6 @@
 void TIMER0_IRQHandler(void);
 void RB_IRQHandler(void);
 void EPIC_IRQ_Restore(uint8_t prev_state);
-uint8_t EPIC_IRQ_GetFlag(uint8_t irq);
 uint8_t EPIC_IRQ_GetFlagMask(uint8_t irq);
 
 /* Toggle count, the ISR callback is the only writer. */

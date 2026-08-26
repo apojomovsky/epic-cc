@@ -3,7 +3,7 @@
  * `irq_table` is the regression shape of epic-cc#114: a static const
  * array of a named struct, read by field, must emit its real
  * initializer bytes (never a zero blob). The e2e reads a field through
- * EPIC_IRQ_GetFlag's runtime-SFR path and asserts non-zero.
+ * EPIC_IRQ_GetFlagMask's runtime-indexed path and asserts non-zero.
  */
 
 #include "hal_pic16.h"
