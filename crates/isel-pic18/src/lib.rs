@@ -777,6 +777,39 @@ impl<'m> Gen<'m> {
                         "    CLRF 0x{f1:03X},{}",
                         if a1 == 0 { "A" } else { "B" }
                     ));
+                } else if let Val::Global(g) = &arg.val {
+                    if self.is_function(g) {
+                        // A function's address is a link-time label literal:
+                        // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73). A
+                        // param-forwarded callback (epic-cc#137) arrives as
+                        // such an arg.
+                        let (a0, f0) = self.operand(pa);
+                        self.emit(format!("    MOVLW LOW({g})"));
+                        self.emit(format!(
+                            "    MOVWF 0x{f0:03X},{}",
+                            if a0 == 0 { "A" } else { "B" }
+                        ));
+                        let (a1, f1) = self.operand(pa + 1);
+                        self.emit(format!("    MOVLW HIGH({g})"));
+                        self.emit(format!(
+                            "    MOVWF 0x{f1:03X},{}",
+                            if a1 == 0 { "A" } else { "B" }
+                        ));
+                    } else {
+                        let addr = self.global_addr(g);
+                        let (a0, f0) = self.operand(pa);
+                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                        self.emit(format!(
+                            "    MOVWF 0x{f0:03X},{}",
+                            if a0 == 0 { "A" } else { "B" }
+                        ));
+                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                        let (a1, f1) = self.operand(pa + 1);
+                        self.emit(format!(
+                            "    MOVWF 0x{f1:03X},{}",
+                            if a1 == 0 { "A" } else { "B" }
+                        ));
+                    }
                 } else {
                     match self.emit_ptr_setup(&arg.val, 0) {
                         Addr::Direct(addr) => {
@@ -1344,6 +1377,17 @@ impl<'m> Gen<'m> {
             Inst::Call(c) => {
                 if !c.callees.is_empty() {
                     self.emit_indirect_call(&c.dst, c.ty, &c.func, &c.args, &c.callees);
+                } else if !self.is_function(&c.func) {
+                    // An indirect call site (numeric `func`, the SSA
+                    // register) whose candidate list is empty cannot be a
+                    // direct call: the target is a runtime value the
+                    // compiler could not resolve (an opaque store into an
+                    // ISR-visible global, epic-cc#137). Emit the
+                    // deterministic trap loop rather than panic on the
+                    // register name or silently call nothing.
+                    let l_trap = self.fresh_label();
+                    self.emit_label(&l_trap);
+                    self.emit(format!("    BRA {l_trap}"));
                 } else {
                     self.emit_call_args(&c.func, &c.args);
                     self.emit(format!("    CALL {}", c.func));

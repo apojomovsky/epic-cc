@@ -22,6 +22,7 @@ one-line index entry here, e.g.:
 - ADR-021: Device provenance and the gputils cross-check (required stanza, always-on RAM/flash gate), 2026-08-23
 - ADR-022: Indirect calls through function pointers (compare-and-call chain, whole-program address-taken set, ISR value rewrite), 2026-08-24
 - ADR-023: Rolling master release bundles (per-commit ci-<sha> prereleases, version stamp, bundled llvm-link), 2026-08-25
+- ADR-024: Cross-context stored callbacks (store in main, invoke in the ISR: global store/load visibility edges, `_isr` store rewrite, opaque-store trap), 2026-08-25
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 
