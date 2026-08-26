@@ -1828,11 +1828,22 @@ impl<'m> Gen<'m> {
                 );
                 match &arg.val {
                     Val::Global(g) => {
-                        let addr = self.global_addr(g);
-                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                        self.emit(format!("    MOVWF 0x{:02X}", pa));
-                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
-                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                        if self.is_function(g) {
+                            // A function's address is a link-time label
+                            // literal: byte 0 = LOW(g), byte 1 = HIGH(g)
+                            // (epic-cc#73). A param-forwarded callback
+                            // (epic-cc#137) arrives as such an arg.
+                            self.emit(format!("    MOVLW LOW({g})"));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa));
+                            self.emit(format!("    MOVLW HIGH({g})"));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                        } else {
+                            let addr = self.global_addr(g);
+                            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa));
+                            self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                            self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                        }
                     }
                     Val::Const(c) => {
                         assert_eq!(*c, 0, "isel: non-zero const ptr not supported");
@@ -1975,6 +1986,18 @@ impl<'m> Gen<'m> {
     ) {
         if !callees.is_empty() {
             self.emit_indirect_call(dst, ty, func, args, callees);
+            return;
+        }
+        // An indirect call site (numeric `func`, the SSA register) whose
+        // candidate list is empty cannot be a direct call: the target is a
+        // runtime value the compiler could not resolve (an opaque store into
+        // an ISR-visible global, epic-cc#137). Emit the deterministic trap
+        // loop rather than panic on the register name or silently call
+        // nothing.
+        if !self.is_function(func) {
+            let l_trap = self.fresh_label();
+            self.emit(format!("{l_trap}:"));
+            self.emit(format!("    GOTO {l_trap}"));
             return;
         }
         self.emit_call_args(func, args);

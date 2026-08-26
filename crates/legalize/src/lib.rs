@@ -844,15 +844,243 @@ fn reachable(roots: &[&str], adj: &HashMap<String, Vec<String>>) -> HashSet<Stri
         if !seen.insert(f.to_string()) {
             continue;
         }
-        if let Some(cs) = adj.get(f) {
-            for c in cs {
-                if !seen.contains(c) {
-                    stack.push(c);
+        if let Some(next) = adj.get(f) {
+            stack.extend(next.iter().map(String::as_str));
+        }
+    }
+    seen
+}
+/// Resolve a pointer operand to the global it addresses, one hop through
+/// GEPs: `@g` -> `g`, `gep @g +k` -> `g`, and a `gep %r +k` whose `%r` is
+/// itself a `gep @g` chain -> `g`. Resolution is scoped to the containing
+/// function (SSA names are per-function). A runtime register base (a param,
+/// an alloca, a load) resolves to nothing: the target is not statically
+/// nameable, which the store-edge scan treats as opaque.
+fn ptr_global(ptr: &str, f: &Func) -> Option<String> {
+    if let Some(g) = ptr.strip_prefix('@') {
+        return Some(g.to_string());
+    }
+    let mut cur = ptr.strip_prefix('%')?.to_string();
+    for _ in 0..8 {
+        let mut found = None;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Gep(g) = inst {
+                    if g.dst == cur {
+                        match &g.base {
+                            GepBase::Global(n) => return Some(n.clone()),
+                            GepBase::Reg(r) => {
+                                found = Some(r.clone());
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        match found {
+            Some(r) => cur = r,
+            None => return None,
+        }
+    }
+    None
+}
+/// The `@g`/`%r` pointer text of a `Val` (memcpy operands are pointer
+/// values). A non-pointer val has no pointer text.
+fn ptr_of_val(v: &Val) -> String {
+    match v {
+        Val::Global(g) => format!("@{g}"),
+        Val::Reg(r) => format!("%{r}"),
+        _ => String::new(),
+    }
+}
+/// Resolve a pointer operand to the global it addresses using a precomputed
+/// per-function GEP base map (dst reg -> base). The store-rewrite loop
+/// mutates the function, so resolution must not borrow it; the map is built
+/// once per function before the mutation.
+fn ptr_global_map(ptr: &str, bases: &HashMap<String, GepBase>) -> Option<String> {
+    if let Some(g) = ptr.strip_prefix('@') {
+        return Some(g.to_string());
+    }
+    let mut cur = ptr.strip_prefix('%')?.to_string();
+    for _ in 0..8 {
+        match bases.get(&cur) {
+            Some(GepBase::Global(n)) => return Some(n.clone()),
+            Some(GepBase::Reg(r)) => cur = r.clone(),
+            None => return None,
+        }
+    }
+    None
+}
+
+/// The globals the ISR context READS (loads, memcpy sources): a store into
+/// one of these from anywhere in the module feeds an ISR indirect call, so
+/// the stored value must be rewritten to the `_isr` copy when duplicated.
+/// A global the ISR only writes never feeds an ISR call, and rewriting a
+/// store into it would break the epic-cc#73 fixture (main's store must stay
+/// on the original).
+fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<String> {
+    let mut out: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        if !isr_ctx.contains(&f.name) {
+            continue;
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Load(l) => {
+                        if let Some(g) = ptr_global(&l.ptr, f) {
+                            out.insert(g);
+                        }
+                    }
+                    Inst::Memcpy(mc) => {
+                        if let Some(g) = ptr_global(&ptr_of_val(&mc.src), f) {
+                            out.insert(g);
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
     }
-    seen
+    out
+}
+
+/// Returns `(isr_ctx, isr_read_globals, adj, param_stores)`: the extended
+/// context, the globals the context READS (the cross-context store-rewrite
+/// predicate), the caller -> callee adjacency (the main context derives from
+/// it), and the `(func, param_index)` positions whose stored value feeds an
+/// ISR-read global (the call-site argument rewrite targets).
+fn isr_context(
+    m: &Module,
+) -> (
+    HashSet<String>,
+    HashSet<String>,
+    HashMap<String, Vec<String>>,
+    HashSet<(String, usize)>,
+) {
+    let isr_names: HashSet<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
+    if isr_names.is_empty() {
+        return (
+            HashSet::new(),
+            HashSet::new(),
+            HashMap::new(),
+            HashSet::new(),
+        );
+    }
+    let defined: HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for f in &m.funcs {
+        adj.entry(f.name.clone()).or_default();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Call(c) = inst {
+                    if c.callees.is_empty() {
+                        adj.entry(f.name.clone()).or_default().push(c.func.clone());
+                    }
+                }
+                let mut taken = HashSet::new();
+                collect_global_vals(inst, &mut taken);
+                for g in taken {
+                    adj.entry(f.name.clone()).or_default().push(g);
+                }
+            }
+        }
+    }
+    let mut isr_ctx: HashSet<String> = isr_names
+        .iter()
+        .flat_map(|r| reachable(&[r], &adj))
+        .collect();
+    let mut param_stores: HashSet<(String, usize)> = HashSet::new();
+    // Store edges, iterated to a fixpoint: a defined function (or a param
+    // resolved through call sites) stored into a global the ISR context
+    // READS joins the ISR context, and its own callees join transitively
+    // (a cross-context callback that calls a shared helper must have the
+    // helper duplicated too, or `cb_isr` would call the main-context
+    // original and clobber a live main frame, ADR-013). The read set is
+    // recomputed over the grown context each round, so a global read only
+    // by a store-edge-added function is still seen.
+    loop {
+        let read = isr_read_globals(m, &isr_ctx);
+        let mut grew = false;
+        for f in &m.funcs {
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let Inst::Store(s) = inst {
+                        let Some(g) = ptr_global(&s.ptr, f) else {
+                            continue;
+                        };
+                        if !read.contains(&g) {
+                            continue;
+                        }
+                        match &s.val {
+                            Val::Global(fn_name) if defined.contains(fn_name.as_str()) => {
+                                if isr_ctx.insert(fn_name.clone()) {
+                                    grew = true;
+                                }
+                            }
+                            Val::Reg(reg_name) => {
+                                // Param hop: any call of this function
+                                // passing a named function as this param
+                                // feeds the global.
+                                let param_idx =
+                                    f.params.iter().position(|param| param.name == *reg_name);
+                                if let Some(pi) = param_idx {
+                                    param_stores.insert((f.name.clone(), pi));
+                                    for cf in &m.funcs {
+                                        for cb in &cf.blocks {
+                                            for ci in &cb.insts {
+                                                if let Inst::Call(c) = ci {
+                                                    if c.func == f.name {
+                                                        if let Some(a) = c.args.get(pi) {
+                                                            if let Val::Global(fn_name) = &a.val {
+                                                                if defined
+                                                                    .contains(fn_name.as_str())
+                                                                    && isr_ctx
+                                                                        .insert(fn_name.clone())
+                                                                {
+                                                                    grew = true;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+        // The context grew: close it over callees so a store-edge-added
+        // function's own callees join too. The closure runs from every
+        // current member (not just the ISR roots), so the store-edge
+        // additions are preserved and their callees join.
+        let members: Vec<&str> = isr_ctx.iter().map(String::as_str).collect();
+        let grown = reachable(&members, &adj);
+        if grown.len() == isr_ctx.len() && grown.is_subset(&isr_ctx) {
+            break;
+        }
+        isr_ctx = grown;
+    }
+    let read = isr_read_globals(m, &isr_ctx);
+
+    (isr_ctx, read, adj, param_stores)
 }
 
 /// The interrupt shared-function duplication (the M13 ruling): every function
@@ -883,34 +1111,12 @@ fn duplicate_isr_shared(m: Module) -> Module {
         return m;
     }
 
-    // Caller -> callee edges from the CALL insts, plus address-taken edges:
-    // a function whose address appears as a value in `f`'s body (a stored
-    // callback, a select arm) is a potential indirect-call target of `f`,
-    // so it must be in `f`'s context for the duplication (epic-cc#73).
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    for f in &m.funcs {
-        adj.entry(f.name.clone()).or_default();
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Inst::Call(c) = inst {
-                    adj.entry(f.name.clone()).or_default().push(c.func.clone());
-                }
-                let mut taken = HashSet::new();
-                collect_global_vals(inst, &mut taken);
-                for g in taken {
-                    adj.entry(f.name.clone()).or_default().push(g);
-                }
-            }
-        }
-    }
-
-    // The ISR context = the ISR + its transitive callees; the main context =
-    // main + its transitive callees. Every function in BOTH (never the ISR
-    // itself, never main) is duplicated.
-    let isr_ctx = isr_names
-        .iter()
-        .flat_map(|r| reachable(&[r], &adj))
-        .collect::<HashSet<String>>();
+    // The extended ISR context (epic-cc#137): the ISR roots' reachability
+    // over direct calls and address-value edges, plus every defined function
+    // whose address is stored into an ISR-visible global (a cross-context
+    // callback: stored by main-side code, invoked by the ISR). The main
+    // context derives from the same adjacency.
+    let (isr_ctx, isr_read, adj, param_stores) = isr_context(&m);
     let main_ctx = reachable(&["main"], &adj);
     // main is excluded from the duplication above, so an ISR that
     // (transitively) calls main would leave the ISR's call on the original
@@ -988,6 +1194,74 @@ fn duplicate_isr_shared(m: Module) -> Module {
                 // or the ISR would call the main-context original and run in
                 // the main region's frames (epic-cc#73).
                 rewrite_inst_vals(inst, &shared_set);
+            }
+        }
+    }
+    // Cross-context store rewrite (epic-cc#137): a store OUTSIDE the ISR
+    // context whose value is a duplicated function and whose target is a
+    // global the ISR READS must point at the `_isr` copy, or the ISR would
+    // load the main-context original's address and dispatch it into the
+    // main region's frames. Predicated on the target being ISR-read (not
+    // merely ISR-visible): a global the ISR only writes never feeds an ISR
+    // call, and rewriting a store into it would break the epic-cc#73
+    // fixture (main's store must stay on the original).
+    for f in &mut funcs {
+        if rewrite_set.contains(&f.name) {
+            continue;
+        }
+        // GEP bases are resolved before the mutation loop (the function is
+        // borrowed mutably below).
+        let mut bases: HashMap<String, GepBase> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Gep(g) = inst {
+                    bases.insert(g.dst.clone(), g.base.clone());
+                }
+            }
+        }
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::Store(s) = inst {
+                    let Some(g) = ptr_global_map(&s.ptr, &bases) else {
+                        continue;
+                    };
+                    if !isr_read.contains(&g) {
+                        continue;
+                    }
+                    if let Val::Global(fn_name) = &s.val {
+                        if shared_set.contains(fn_name.as_str()) {
+                            s.val = Val::Global(format!("{fn_name}_isr"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Param-forwarded call arguments (epic-cc#137): a call passing a named
+    // function into a param that a callee stores into an ISR-read global
+    // (the `EPIC_GPIO_RegisterChangeCallback(on_rb_change)` shape) must pass
+    // the `_isr` copy, or the ISR loads the original's address. The rewrite
+    // lands at the call site, outside the ISR context.
+    for f in &mut funcs {
+        if rewrite_set.contains(&f.name) {
+            continue;
+        }
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                if let Inst::Call(c) = inst {
+                    // Every param of the callee that feeds an ISR-read
+                    // global must be rewritten, not just the first match
+                    // (a callee may store two params into two globals).
+                    for (_, pi) in param_stores.iter().filter(|(callee, _)| callee == &c.func) {
+                        if let Some(a) = c.args.get_mut(*pi) {
+                            if let Val::Global(fn_name) = &a.val {
+                                if shared_set.contains(fn_name.as_str()) {
+                                    a.val = Val::Global(format!("{fn_name}_isr"));
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1082,34 +1356,11 @@ fn fill_indirect_callees(m: &mut Module) {
     }
     addr_taken.retain(|g| defined.contains(g.as_str()));
 
-    // Direct call edges plus address-taken edges (a stored callback, a
-    // select arm): a function whose address appears as a value in `f`'s body
-    // is a potential indirect-call target of `f`, so it must be in `f`'s
-    // context for the candidate split (epic-cc#73).
-    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
-    for f in &m.funcs {
-        adj.entry(f.name.clone()).or_default();
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Inst::Call(c) = inst {
-                    if c.callees.is_empty() {
-                        adj.entry(f.name.clone()).or_default().push(c.func.clone());
-                    }
-                }
-                let mut taken = HashSet::new();
-                collect_global_vals(inst, &mut taken);
-                for g in taken {
-                    adj.entry(f.name.clone()).or_default().push(g);
-                }
-            }
-        }
-    }
-    let isr_ctx: HashSet<String> = m
-        .funcs
-        .iter()
-        .filter(|f| f.isr)
-        .flat_map(|f| reachable(&[&f.name], &adj))
-        .collect();
+    // The extended ISR context (epic-cc#137): the ISR roots' reachability
+    // over direct calls and address-value edges, plus every defined function
+    // whose address is stored into an ISR-visible global (a cross-context
+    // callback: stored by main-side code, invoked by the ISR).
+    let (isr_ctx, _, _, _) = isr_context(m);
 
     for f in &mut m.funcs {
         let in_isr = isr_ctx.contains(&f.name);
@@ -1133,7 +1384,24 @@ fn fill_indirect_callees(m: &mut Module) {
                         })
                         .cloned()
                         .collect();
+                    // An ISR-site candidate that is a duplicated ORIGINAL
+                    // (address-taken elsewhere, e.g. a select arm) must
+                    // dispatch the `_isr` copy: the ISR can never run a
+                    // main-context frame (ADR-013). The copy exists because
+                    // the original is in the ISR context and main also
+                    // reaches it.
+                    if in_isr {
+                        for g in &mut cands {
+                            if isr_ctx.contains(g.as_str()) && defined.contains(g.as_str()) {
+                                let copy = format!("{g}_isr");
+                                if defined.contains(&copy) {
+                                    *g = copy;
+                                }
+                            }
+                        }
+                    }
                     cands.sort();
+                    cands.dedup();
                     // Self-check: every candidate must be a defined function.
                     for g in &cands {
                         assert!(
