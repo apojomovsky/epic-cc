@@ -49,7 +49,7 @@ Established by inspection on 2026-08-20, with the locations that prove each clai
 | **`epic-math` already has a portable C path.** `src/host/` implements the same four modules in C for the host-simulation build. | `epic-math/src/host/` |
 | **The hand asm loses to an optimizing compiler.** On the 4550 it is beaten on every operation at `-O2`/`-O3`; on the 877A it is beaten on mul and div at `-O3`. It exists to beat XC8's licence-gated optimizer. | `docs/experiments/math-cycle-benchmark/README.md` |
 | **Getting started is gated on two Microchip downloads**, and CI pulls a private image because the EULA forbids redistributing XC8. | `README.md` getting-started, `AGENTS.md` CI section |
-| **`epic-serial` retargets XC8's `printf`.** | `epic-serial/src/epic_serial.c:207` |
+| **`epic-serial` retargets XC8's `printf`.** Decided: a shared non-variadic put API replaces it as the documented surface (§5, epic-hal#91). | `epic-serial/src/epic_serial.c:207` |
 
 The load-bearing conclusion: **the HAL is far better positioned for this than the compiler
 is.** epic-hal needs macro mappings and a build backend. epic-cc needs to grow from
@@ -624,7 +624,7 @@ Fourteen, across three repositories. Each earns its own design and plan.
 |---|---|---|
 | **HAL-1** | **epic-cc build environment** | A fourth `include/` and `src/` variant beside `target/`, `host/` and `mdb/`. Add `EPIC_ISR_HIGH`/`EPIC_ISR_LOW` and `EPIC_CONFIG` macros, map all four onto epic-cc spellings. |
 | **HAL-2** | **Build-system backend** | `epic_build.py` and `epic-hal.mk` learn epic-cc: no XC8, no device pack, no MPLAB X project. The python-outside-the-container workaround becomes unnecessary on this path, since epic-cc has no manifest resolution problem. |
-| **HAL-3** | **Module conformance** | Every `epic-*` module and both HALs building and passing. Contains the two real decisions: `epic-math`'s assembly (see §5) and `epic-serial`'s `printf` retarget. Largest HAL item. |
+| **HAL-3** | **Module conformance** | Every `epic-*` module and both HALs building and passing. Contains the two real decisions: `epic-math`'s assembly (see §5) and `epic-serial`'s formatting surface (see §5, decided 2026-08-26). Largest HAL item. |
 | **HAL-4** | **Verification** | epic-cc's `crates/sim` replaces the `mdb` / MPLAB SIM gate on the epic-cc path. This is what makes a public CI job possible. |
 | **HAL-5** | **Distribution flip** | `install.sh` and the bundles default to epic-cc: zero Microchip downloads, a scaffolded Makefile, no `.X` project. |
 
@@ -714,8 +714,16 @@ CC-4 rung.
 **`epic-serial`'s `printf` retarget (HAL-3).** Depends on how much of `stdio` `CC-2` provides.
 Variadic functions on a machine with no stack are their own design problem. Likely resolved by
 a non-variadic formatting API on the epic-cc path rather than by implementing `printf`.
-**Owner as of 2026-08-24:** `apojomovsky/epic-hal#91`, split out of HAL-3 so the API is settled
-before the serial cluster starts rather than during it.
+**Decided 2026-08-26 by `apojomovsky/epic-hal#91`: a shared non-variadic put API.** CC-2 ships
+`stdint`/`stdbool`/`stddef`/`string` only, and `stdio` was never in scope: a real `printf`
+needs `va_start`/`va_arg` (a hidden frame-region pointer), which is an isel/alloc ABI project
+(#131), not a libc one. The full target-firmware census is constant strings, fixed-width
+integers and hex bytes, so the format string interpreter was never earning its keep. epic-serial
+adopts eight `epic_serial_put_*` functions, and both toolchains share them; applications never
+`#ifdef` between environments. `putch` remains on XC8 as the `printf` retarget for legacy
+firmware only. Two epic-cc gaps were found by probing the put shape and filed: string literal
+pointer args (#148) and local array allocas (#149), both panic loudly today, and neither
+changes the decision.
 
 **RAM headroom on the 877A `[VERIFY]`.** epic-hal's modules fit under XC8 today. epic-cc's
 overlay allocator is a different allocator, and 368 bytes leaves little room to be wrong. This
