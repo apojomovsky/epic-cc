@@ -5934,6 +5934,43 @@ fn window_align(base: usize, size: usize) -> usize {
     }
 }
 
+/// The final word address after `text`: the org the assembler reaches
+/// walking `text` with the same pass-1 semantics `asm::assemble` uses
+/// (org / labels / equ / .align / .table). Stops at `end` or at a
+/// `__read_` reader label (the const section's start).
+fn measure_end_org(text: &str) -> usize {
+    let mut org = 0usize;
+    for raw in text.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("org ") {
+            org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
+            continue;
+        }
+        if line.starts_with("end") || line.starts_with("__read_") {
+            break;
+        }
+        if line.strip_suffix(':').is_some() {
+            continue;
+        }
+        if line.contains(" equ ") {
+            continue;
+        }
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n: usize = n.trim().parse().unwrap();
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        if line.starts_with(".table ") {
+            continue;
+        }
+        org += 1;
+    }
+    org
+}
+
 /// Select instructions for the whole module, producing PIC14 assembly text.
 ///
 /// `addrs` is the complete address map from `alloc`: globals by name, locals
@@ -6067,7 +6104,6 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     let mut order: Vec<&ir::Func> = Vec::with_capacity(m.funcs.len());
     order.extend(m.funcs.iter().filter(|f| f.isr));
     order.extend(m.funcs.iter().filter(|f| !f.isr));
-    let mut bodies_by_name: HashMap<String, usize> = HashMap::new();
     let mut bodies: Vec<(String, usize)> = Vec::new();
     let mut body_texts: Vec<String> = Vec::new();
     {
@@ -6087,7 +6123,6 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             };
             emit_func_body(&mut g, f);
             bodies.push((f.name.clone(), word_size(&g.out)));
-            bodies_by_name.insert(f.name.clone(), word_size(&g.out));
             body_texts.push(g.out.join("\n"));
         }
     }
@@ -6352,28 +6387,30 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // section to pin.
         //
         // The window-fit accounting runs at the FINAL post-banking
-        // position, not the pre-banking `addr_b`: the banking pass inserts
-        // BANKSEL words into the function bodies, pushing the assembler's
-        // org at the first table forward (epic-cc#151). Only the LAST
-        // page's growth moves the section (earlier pages' growth is
-        // absorbed by the next page's `.org` pad), so the final position
-        // is `addr_b + last_page_growth`.
+        // position: bank + peephole the emitted text exactly as the
+        // driver will and measure its end, so the fold sees the
+        // assembler's org, not an estimate. The old `addr_b + growth`
+        // estimate missed the const-reader regions (their bodies + RETLW
+        // data follow the code): without them every reader CALL left the
+        // bank UNKNOWN and banking over-inserted BANKSELs, over-estimating
+        // the end (epic-cc#151).
         let mut start = addr_b;
         if !consts.is_empty() {
-            // `pages` also holds const-reader entries (their page can
-            // exceed every function's page); the section sits after the
-            // LAST function, so only that page's banking growth moves it.
-            let last_page = bodies
-                .iter()
-                .map(|(name, _)| pages[name])
-                .max()
-                .unwrap_or(0);
-            let growth: usize = order
-                .iter()
-                .filter(|f| pages[&f.name] == last_page)
-                .map(|f| post[&f.name] - bodies_by_name[&f.name])
-                .sum();
-            start = addr_b + growth;
+            // Append placeholder reader bodies (a `RETLW` exit) so the
+            // regions resolve like the real text's; the analysis keys on
+            // operand banks, never the literal addresses. The measurement
+            // stops at the first reader.
+            let mut code_text = out.join("\n");
+            for g in &consts {
+                code_text.push_str("\n__read_");
+                code_text.push_str(&g.name);
+                code_text.push_str(
+                    ":\n    MOVWF 0x70\n    MOVLW 0x00\n    MOVWF PCLATH\n    MOVF 0x70, W\n    ADDLW 0x00\n    MOVWF PCL\n    RETLW 0x00",
+                );
+            }
+            let banked = banking::assign_banks(device, &code_text);
+            let peeped = peephole::optimize(&banked);
+            start = measure_end_org(&peeped);
             // The pin decision must compare the map against the ACTUAL
             // emission position `start` (post-banking), not the
             // pre-banking `addr_b`: growth can push a base across a page
