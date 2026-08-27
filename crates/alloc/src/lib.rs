@@ -418,7 +418,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 let bank_count = device.ram_banks.len();
                 panic!(
                     "alloc: no arrangement of {} global(s) fits {}'s {bank_count} GPR bank window(s) \
-                     (total demand {demand} bytes, total capacity {capacity} bytes — no arrangement this \
+                     (total demand {demand} bytes, total capacity {capacity} bytes, no arrangement this \
                      allocator tries, sequential then largest-first bin-packing, fits)",
                     floating.len() + fixed.len(),
                     device.name,

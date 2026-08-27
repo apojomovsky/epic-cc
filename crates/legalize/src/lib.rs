@@ -1468,14 +1468,11 @@ fn fill_indirect_callees(m: &mut Module) {
     }
     // Arity and width maps for the candidate filter: an indirect call
     // site only ever invokes a candidate with the matching number of
-    // arguments and matching argument widths. Without the arity check, a
-    // 1-arg ISR callback site (RB change) collects 0-arg callbacks (Timer0
-    // overflow) and isel panics copying args into a param-less slot
-    // (epic-cc#152). Without the width check, a site passing an i8 (the RB
-    // change callback's PORTB byte) collects 1-arg `ptr`-param tasks (the
-    // taskmgr scheduler) and isel panics copying a narrow arg into a
-    // 2-byte slot. An `_isr` copy shares its original's params, so both
-    // checks on the original carry over.
+    // arguments and matching widths. Without the arity check, a 1-arg ISR
+    // callback site collects 0-arg callbacks and isel panics (epic-cc#152);
+    // without the width check, an i8 arg site collects ptr-param tasks and
+    // isel panics copying a narrow arg into a 2-byte slot. An `_isr` copy
+    // shares its original's params, so both checks carry over.
     let arity: HashMap<String, usize> = m
         .funcs
         .iter()
