@@ -1127,6 +1127,84 @@ fn parse_select_arm(
         parse_val_typed(it.next().unwrap(), Some(ty))
     }
 }
+/// Materialize a `getelementptr` constant expression that appears as a value
+/// (`phi`, `binop`, or `ptrtoint` operand). The caller has already detected
+/// `getelementptr` in the operand string.
+fn materialize_gep_val(
+    s: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+) -> Val {
+    let gpos = s.find("getelementptr").unwrap();
+    let gsrc = &s[gpos + "getelementptr".len()..];
+    let (base, k, terms) = parse_gep_expr(gsrc, types, fresh, out);
+    let n = fresh.reg();
+    out.push(Inst::Gep(Gep {
+        dst: n.clone(),
+        base,
+        k,
+        terms,
+    }));
+    Val::Reg(n)
+}
+
+/// Parse a value that may be a plain `Val`, a folded `getelementptr`, or a
+/// `ptrtoint` wrapping a folded `getelementptr`. Used by the `phi` and
+/// `binop` dispatchers.
+///
+/// `ptrtoint (ptr getelementptr ... to i16)` is clang's constant-address form
+/// for `&buf[N]` as an integer. It is lowered as a materialized Gep plus a
+/// `Trunc` that reinterprets the 16-bit address as an integer value.
+fn parse_value_with_gep(
+    raw: &str,
+    ty: Ty,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+) -> Val {
+    let s = raw.trim();
+    if s.contains("getelementptr") && s.contains("ptrtoint") {
+        let after = &s[s.find("ptrtoint").unwrap() + "ptrtoint".len()..];
+        let to_pos = after
+            .rfind(" to ")
+            .unwrap_or_else(|| panic!("irparse: malformed ptrtoint {s:?}"));
+        let inner = after[..to_pos].trim().trim_start_matches('(').trim();
+        let gep_reg = if inner.contains("getelementptr") {
+            materialize_gep_val(inner, types, fresh, out)
+        } else {
+            let tok = inner.split_whitespace().last().unwrap();
+            parse_val_typed(tok, Some(Ty::I16))
+        };
+        let to_tok = after[to_pos + 4..]
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let to = ty_of(to_tok);
+        match gep_reg {
+            Val::Reg(r) => {
+                let n = fresh.reg();
+                out.push(Inst::Trunc(Trunc {
+                    dst: n.clone(),
+                    from: Ty::I16,
+                    val: Val::Reg(r),
+                    to,
+                }));
+                Val::Reg(n)
+            }
+            other => other,
+        }
+    } else if s.contains("getelementptr") {
+        materialize_gep_val(s, types, fresh, out)
+    } else {
+        let tok = s.split_whitespace().last().unwrap_or(s);
+        parse_val_typed(tok, Some(ty))
+    }
+}
 
 /// Parse a load/store pointer operand (`ptr @g`, `ptr %r`, an inlined GEP
 /// that gets materialized as a fresh Gep inst, or an `inttoptr (<ty> <k> to
@@ -1337,10 +1415,11 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
         struct_array_done = false;
     }
     assert!(
-        k >= 0 && k <= 255,
+        k >= -128 && k <= 255,
         "irparse: gep byte offset {k} out of range"
     );
-    (k as u8, terms)
+    let k_wrapped = ((k % 256 + 256) % 256) as u8;
+    (k_wrapped, terms)
 }
 
 /// Parse a getelementptr into `(base, k, terms)`. Handles the paren
@@ -2414,11 +2493,13 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let mut incoming = Vec::new();
             for part in body.split('[').skip(1) {
                 let inner = part.split(']').next().unwrap();
-                let mut it = inner.split(',');
-                let v = parse_val_typed(it.next().unwrap(), Some(ty));
-                let lbl = it
-                    .next()
-                    .unwrap()
+                let pair = split_top_level(inner, ',');
+                let val_str = pair[0].trim();
+                let lbl_str = pair[1].trim();
+                let v = parse_value_with_gep(val_str, ty, types, fresh, &mut out);
+                let lbl = lbl_str
+                    .trim()
+                    .trim_start_matches("label")
                     .trim()
                     .trim_start_matches('%')
                     .to_string();
@@ -2432,13 +2513,50 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             }));
         }
         "zext" | "sext" | "trunc" | "ptrtoint" => {
-            let body = strip_attrs(&rest[op.len()..]);
+            let body_raw = &rest[op.len()..];
+            let body_stripped = strip_attrs(body_raw);
+            let body = if body_stripped.contains("getelementptr") {
+                body_raw
+            } else {
+                &body_stripped
+            };
+            let body = body.trim();
             let to_i = body.rfind(" to ").unwrap();
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
-            let mut it = lhs.split_whitespace();
-            let from = ty_of(it.next().unwrap());
-            let val = parse_val_typed(it.next().unwrap(), Some(from));
-            let to = ty_of(rhs);
+            let to = ty_of(
+                rhs.trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap(),
+            );
+            let (from, val) = if lhs.contains("getelementptr") {
+                let first = lhs
+                    .split_whitespace()
+                    .next()
+                    .unwrap()
+                    .trim_start_matches('(');
+                let from = ty_of(first);
+                let v = materialize_gep_val(lhs, types, fresh, &mut out);
+                (from, v)
+            } else {
+                let mut it = lhs.split_whitespace();
+                let first = it
+                    .next()
+                    .unwrap()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')');
+                let from = ty_of(first);
+                let tok = it
+                    .next()
+                    .unwrap_or(first)
+                    .trim_start_matches('(')
+                    .trim_end_matches(')')
+                    .trim_end_matches(',');
+                let v = parse_val_typed(tok, Some(from));
+                (from, v)
+            };
             match op.as_str() {
                 "zext" => out.push(Inst::Zext(Zext {
                     dst: dst.unwrap(),
@@ -2539,11 +2657,45 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         }
         "add" | "and" | "or" | "xor" | "sub" | "mul" | "udiv" | "urem" | "sdiv" | "srem"
         | "shl" | "lshr" | "ashr" => {
-            let body = strip_attrs(&rest[op.len()..]);
-            let mut it = body.split_whitespace();
-            let ty = ty_of(it.next().unwrap());
-            let a = parse_val(it.next().unwrap());
-            let b = parse_val(it.next().unwrap());
+            let raw = rest[op.len()..].trim();
+            let body_for_split = if raw.contains("getelementptr") || raw.contains("ptrtoint") {
+                raw.to_string()
+            } else {
+                strip_attrs(raw)
+            };
+            let parts = split_top_level(&body_for_split, ',');
+            assert!(
+                parts.len() == 2,
+                "irparse: binop {op} must have 2 operands, got {parts:?} in {line:?}"
+            );
+            let first = parts[0].trim();
+            let sp = first
+                .find(|c: char| c.is_whitespace())
+                .unwrap_or_else(|| panic!("irparse: malformed binop operand {first:?}"));
+            let ty_tok = first[..sp].trim();
+            let ty = ty_of(ty_tok);
+            let val_str_a = first[sp..].trim();
+            let a = parse_value_with_gep(val_str_a, ty, types, fresh, &mut out);
+            let second_raw = parts[1].trim();
+            let b = if second_raw
+                .split_whitespace()
+                .next()
+                .map(|t| matches!(t, "i1" | "i8" | "i16" | "i32" | "ptr" | "float" | "f32"))
+                .unwrap_or(false)
+                && second_raw.contains(' ')
+            {
+                let sp2 = second_raw.find(|c: char| c.is_whitespace()).unwrap();
+                let ty2_tok = second_raw[..sp2].trim();
+                let ty2 = ty_of(ty2_tok);
+                assert_eq!(
+                    ty, ty2,
+                    "irparse: binop {op} operand types mismatch {ty:?} vs {ty2:?} in {line:?}"
+                );
+                let val_str_b = second_raw[sp2..].trim();
+                parse_value_with_gep(val_str_b, ty, types, fresh, &mut out)
+            } else {
+                parse_value_with_gep(second_raw, ty, types, fresh, &mut out)
+            };
             let o = match op.as_str() {
                 "add" => BinOp::Add,
                 "and" => BinOp::And,
