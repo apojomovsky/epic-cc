@@ -1,5 +1,5 @@
 //! CC-2 acceptance: the freestanding headers (`stdint.h`, `stdbool.h`,
-//! `stddef.h`, `string.h`) and the `string.h` implementation the driver links
+//! `stddef.h`, `stdlib.h`, `string.h`) and the `string.h` implementation the driver links
 //! in when a source includes it, compiled through the whole pipeline and run
 //! on both cores' simulators.
 //!
@@ -139,6 +139,7 @@ fn cc2_headers_compile_without_string() {
         #include <stdint.h>
         #include <stdbool.h>
         #include <stddef.h>
+        #include <stdlib.h>
         volatile uint8_t in;
         volatile uint8_t out;
         void main(void) { bool b = true; size_t n = 1; uint16_t x = in; out = b ? (uint8_t)(x + n) : 0; }

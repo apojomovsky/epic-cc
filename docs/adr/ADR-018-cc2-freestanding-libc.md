@@ -1,4 +1,4 @@
-# ADR-018: CC-2 freestanding libc subset (stdint, stdbool, stddef, string)
+# ADR-018: CC-2 freestanding libc subset (stdint, stdbool, stddef, string; stdlib joined 2026-08)
 
 **Status:** Accepted 2026-08-21 (implemented in `feat/cc2-libc`)
 
@@ -19,6 +19,11 @@ Ship the four headers as `pub const` strings in `crates/driver/src/`
 (`stdint_h.rs`, `stdbool_h.rs`, `stddef_h.rs`, `string_h.rs`), the shape
 `epic_cc_h.rs` already uses. Content is minimal C99 freestanding, with
 `size_t` and `ptrdiff_t` matching the msp430 datalayout proxy (16-bit).
+
+2026-08: `stdlib.h` joins the set as a header-only addition (`stdlib_h.rs`,
+`size_t` only), because vendored third-party sources such as m-stack include
+it for `size_t` alone (epic-cc#163). It stays header-only until a consumer
+needs code.
 
 Ship the `string.h` implementation as a freestanding C translation unit
 (`string_c.rs`). The driver writes the headers into the temp include

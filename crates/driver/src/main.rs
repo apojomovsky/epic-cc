@@ -112,6 +112,8 @@ fn main() {
         .expect("write stddef.h");
     std::fs::write(header_dir.join("string.h"), driver::string_h::STRING_H)
         .expect("write string.h");
+    std::fs::write(header_dir.join("stdlib.h"), driver::stdlib_h::STDLIB_H)
+        .expect("write stdlib.h");
 
     let sources: Vec<(String, String)> = cli
         .inputs
