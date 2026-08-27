@@ -1354,16 +1354,30 @@ fn fill_indirect_callees(m: &mut Module) {
             }
         }
     }
-    // Arity map for the candidate filter: an indirect call site only ever
-    // invokes a candidate with the matching number of arguments. Without
-    // this, a 1-arg ISR callback site (RB change) collects 0-arg callbacks
-    // (Timer0 overflow) into its candidate set and isel panics copying
-    // args into a param-less slot. An `_isr` copy shares its original's
-    // params, so the arity check on the original carries over.
+    // Arity and width maps for the candidate filter: an indirect call
+    // site only ever invokes a candidate with the matching number of
+    // arguments and matching argument widths. Without the arity check, a
+    // 1-arg ISR callback site (RB change) collects 0-arg callbacks (Timer0
+    // overflow) and isel panics copying args into a param-less slot
+    // (epic-cc#152). Without the width check, a site passing an i8 (the RB
+    // change callback's PORTB byte) collects 1-arg `ptr`-param tasks (the
+    // taskmgr scheduler) and isel panics copying a narrow arg into a
+    // 2-byte slot. An `_isr` copy shares its original's params, so both
+    // checks on the original carry over.
     let arity: HashMap<String, usize> = m
         .funcs
         .iter()
         .map(|f| (f.name.clone(), f.params.len()))
+        .collect();
+    let param_widths: HashMap<String, Vec<u16>> = m
+        .funcs
+        .iter()
+        .map(|f| {
+            (
+                f.name.clone(),
+                f.params.iter().map(|p| u16::from(p.width)).collect(),
+            )
+        })
         .collect();
 
     // The extended ISR context (epic-cc#137): the ISR roots' reachability
@@ -1393,6 +1407,13 @@ fn fill_indirect_callees(m: &mut Module) {
                             }
                         })
                         .filter(|g| arity.get(*g).copied() == Some(c.args.len()))
+                        .filter(|g| {
+                            let widths = param_widths.get(*g).map(Vec::as_slice).unwrap_or(&[]);
+                            c.args
+                                .iter()
+                                .zip(widths.iter())
+                                .all(|(a, &w)| u16::from(a.ty.map(|t| t.bytes()).unwrap_or(2)) == w)
+                        })
                         .cloned()
                         .collect();
                     // An ISR-site candidate that is a duplicated ORIGINAL
