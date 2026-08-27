@@ -197,6 +197,77 @@ fn reachable<'a>(roots: &[&'a str], edges: &'a HashMap<String, Vec<String>>) -> 
     seen
 }
 
+/// Largest-first bin-pack of the floating globals into per-bank cursors
+/// (the fallback the sequential path used when it could not fit them all).
+/// Independent per-bank cursors let a later small global use a bank the
+/// sequential cursor already passed. Returns `None` when no arrangement
+/// fits.
+fn bin_pack(
+    device: &Device,
+    fixed: &[(String, u16, u16)],
+    floating: &[&ir::Global],
+) -> Option<HashMap<String, u16>> {
+    let mut cursors: Vec<BankCursor> = device
+        .ram_banks
+        .iter()
+        .map(|&(s, e)| BankCursor {
+            end: e,
+            next_free: s,
+        })
+        .collect();
+    for c in &mut cursors {
+        for (_, fa, fs) in fixed {
+            if c.next_free >= *fa && c.next_free < *fa + *fs {
+                c.next_free = *fa + *fs;
+            }
+        }
+    }
+    let mut order: Vec<&ir::Global> = floating.to_vec();
+    order.sort_by(|a, b| b.size.cmp(&a.size));
+    let mut out = HashMap::new();
+    for g in order {
+        let width = g.size as u8;
+        let align = width.min(2);
+        let mut placed = None;
+        for cursor in cursors.iter_mut() {
+            let mut base = cursor.next_free;
+            if base % u16::from(align) != 0 {
+                base += u16::from(align) - (base % u16::from(align));
+            }
+            let mut bumped = true;
+            while bumped {
+                bumped = false;
+                for (_, fa, fs) in fixed {
+                    if base < *fa + *fs && base + u16::from(width) > *fa {
+                        base = *fa + *fs;
+                        if base % u16::from(align) != 0 {
+                            base += u16::from(align) - (base % u16::from(align));
+                        }
+                        bumped = true;
+                        break;
+                    }
+                }
+            }
+            if base + u16::from(width) - 1 <= cursor.end {
+                cursor.next_free = base + u16::from(width);
+                placed = Some(base);
+                break;
+            }
+        }
+        out.insert(g.name.clone(), placed?);
+    }
+    Some(out)
+}
+
+/// The end address of a global arrangement: the highest `addr + size`.
+fn global_end(map: &HashMap<String, u16>, floating: &[&ir::Global]) -> u16 {
+    floating
+        .iter()
+        .filter_map(|g| map.get(&g.name).map(|a| a + u16::from(g.size)))
+        .max()
+        .unwrap_or(0)
+}
+
 /// Assign every address: globals sequential (even-aligned i16, stepping
 /// through banks), locals per the overlay algorithm over the call graph parsed
 /// from `edges_text` (`edge <caller> <callee>` lines, order-agnostic; `depth`
@@ -324,74 +395,37 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             }
             try_float(start)
         };
-        seq.or_else(|| {
-            // Bin-pack fallback: build cursors that skip fixed-occupied
-            // bytes. For the small fixtures in this repo the sequential
-            // path suffices; this path is kept correct for completeness.
-            let mut cursors: Vec<BankCursor> = device
-                .ram_banks
-                .iter()
-                .map(|&(s, e)| BankCursor { end: e, next_free: s })
-                .collect();
-            // Advance each cursor past any fixed that lies at its start.
-            for c in &mut cursors {
-                for (_, fa, fs) in &fixed {
-                    if c.next_free >= *fa && c.next_free < *fa + *fs {
-                        c.next_free = *fa + *fs;
-                    }
-                }
+        // Prefer the arrangement with the lower footprint. The sequential
+        // order preserves the .ll order, but a large global after small
+        // ones wastes the tail of the first bank (epic-taskmgr's 80-byte
+        // task table lands in bank 1 on the 877A, pushing the frames past
+        // the last bank, epic-hal#86). The largest-first bin-pack closes
+        // that gap; when both fit, the tighter end wins and the layout
+        // stays otherwise unchanged (small fixtures place identically).
+        let bin = bin_pack(device, &fixed, &floating);
+        let floating_map: HashMap<String, u16> = match (&seq, &bin) {
+            (Some(s), Some(b)) if global_end(b, &floating) < global_end(s, &floating) => b.clone(),
+            (Some(s), _) => s.clone(),
+            (None, Some(b)) => b.clone(),
+            (None, None) => {
+                let demand: u32 = floating.iter().map(|g| u32::from(g.size)).sum::<u32>()
+                    + fixed.iter().map(|(_, _, s)| u32::from(*s)).sum::<u32>();
+                let capacity: u32 = device
+                    .ram_banks
+                    .iter()
+                    .map(|&(s, e)| u32::from(e) - u32::from(s) + 1)
+                    .sum();
+                let bank_count = device.ram_banks.len();
+                panic!(
+                    "alloc: no arrangement of {} global(s) fits {}'s {bank_count} GPR bank window(s) \
+                     (total demand {demand} bytes, total capacity {capacity} bytes — no arrangement this \
+                     allocator tries, sequential then largest-first bin-packing, fits)",
+                    floating.len() + fixed.len(),
+                    device.name,
+                );
             }
-            let mut order: Vec<&ir::Global> = floating.clone();
-            order.sort_by(|a, b| b.size.cmp(&a.size));
-            let mut out = HashMap::new();
-            for g in order {
-                let width = g.size as u8;
-                let align = width.min(2);
-                let mut placed = None;
-                for cursor in cursors.iter_mut() {
-                    let mut base = cursor.next_free;
-                    if base % u16::from(align) != 0 {
-                        base += u16::from(align) - (base % u16::from(align));
-                    }
-                    // Skip fixed overlap inside this bank.
-                    let mut bumped = true;
-                    while bumped {
-                        bumped = false;
-                        for (_, fa, fs) in &fixed {
-                            if base < *fa + *fs && base + u16::from(width) > *fa {
-                                base = *fa + *fs;
-                                if base % u16::from(align) != 0 {
-                                    base += u16::from(align) - (base % u16::from(align));
-                                }
-                                bumped = true;
-                                break;
-                            }
-                        }
-                    }
-                    if base + u16::from(width) - 1 <= cursor.end {
-                        cursor.next_free = base + u16::from(width);
-                        placed = Some(base);
-                        break;
-                    }
-                }
-                out.insert(g.name.clone(), placed?);
-            }
-            Some(out)
-        })
-        .unwrap_or_else(|| {
-            let demand: u32 = floating.iter().map(|g| u32::from(g.size)).sum::<u32>()
-                + fixed.iter().map(|(_, _, s)| u32::from(*s)).sum::<u32>();
-            let capacity: u32 =
-                device.ram_banks.iter().map(|&(s, e)| u32::from(e) - u32::from(s) + 1).sum();
-            let bank_count = device.ram_banks.len();
-            panic!(
-                "alloc: no arrangement of {} global(s) fits {}'s {bank_count} GPR bank window(s) \
-                 (total demand {demand} bytes, total capacity {capacity} bytes — no arrangement this \
-                 allocator tries, sequential then largest-first bin-packing, fits)",
-                floating.len() + fixed.len(),
-                device.name,
-            );
-        })
+        };
+        floating_map
     };
     globals.extend(floating_map);
 
