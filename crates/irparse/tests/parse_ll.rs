@@ -1901,3 +1901,24 @@ fn parses_abs_intrinsic_i1_false_immarg() {
         other => panic!("expected Call, got {other:?}"),
     }
 }
+
+// Globals whose types contain unions resolve (epic-cc#165): clang emits
+// named `%union.` declarations, normalized to largest member plus padding,
+// so they layout with the same struct rules.
+const UNION_GLOBAL: &str = r#"
+%union.u = type { i16 }
+%struct.bd = type { %union.u, i8 }
+@g = dso_local global %struct.bd zeroinitializer, align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn parses_global_of_union_containing_struct() {
+    let m = parse_ll(UNION_GLOBAL);
+    assert_eq!(m.globals.len(), 1);
+    // union { i16 } is 2 bytes, the trailing i8 pads the struct to 4.
+    assert_eq!(m.globals[0].size, 4);
+    assert_eq!(m.globals[0].addr, None);
+}
