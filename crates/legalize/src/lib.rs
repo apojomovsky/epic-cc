@@ -800,6 +800,56 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
                 }),
             ]
         }
+        "llvm.umin.i8" | "llvm.umin.i16" | "llvm.umin.i32" => {
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "ult".into(),
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a,
+                    b,
+                    ptr: false,
+                }),
+            ]
+        }
+        "llvm.usub.sat.i8" | "llvm.usub.sat.i16" | "llvm.usub.sat.i32" => {
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            let sub = names.fresh();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "uge".into(),
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Bin(ir::Bin {
+                    dst: sub.clone(),
+                    op: ir::BinOp::Sub,
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a: Val::Reg(sub),
+                    b: Val::Const(0),
+                    ptr: false,
+                }),
+            ]
+        }
         "llvm.abs.i8" | "llvm.abs.i16" | "llvm.abs.i32" => {
             let a = c.args[0].val.clone();
             // The second arg (is_int_min_poison) is read but ignored; see
