@@ -800,6 +800,56 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
                 }),
             ]
         }
+        "llvm.umin.i8" | "llvm.umin.i16" | "llvm.umin.i32" => {
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "ult".into(),
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a,
+                    b,
+                    ptr: false,
+                }),
+            ]
+        }
+        "llvm.usub.sat.i8" | "llvm.usub.sat.i16" | "llvm.usub.sat.i32" => {
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            let sub = names.fresh();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "uge".into(),
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Bin(ir::Bin {
+                    dst: sub.clone(),
+                    op: ir::BinOp::Sub,
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a: Val::Reg(sub),
+                    b: Val::Const(0),
+                    ptr: false,
+                }),
+            ]
+        }
         "llvm.abs.i8" | "llvm.abs.i16" | "llvm.abs.i32" => {
             let a = c.args[0].val.clone();
             // The second arg (is_int_min_poison) is read but ignored; see
@@ -850,44 +900,112 @@ fn reachable(roots: &[&str], adj: &HashMap<String, Vec<String>>) -> HashSet<Stri
     }
     seen
 }
-/// Resolve a pointer operand to the global it addresses, one hop through
-/// GEPs: `@g` -> `g`, `gep @g +k` -> `g`, and a `gep %r +k` whose `%r` is
-/// itself a `gep @g` chain -> `g`. Resolution is scoped to the containing
-/// function (SSA names are per-function). A runtime register base (a param,
-/// an alloca, a load) resolves to nothing: the target is not statically
-/// nameable, which the store-edge scan treats as opaque.
-fn ptr_global(ptr: &str, f: &Func) -> Option<String> {
+/// The field offset sentinel for a read that touches every field of a
+/// global (a whole-object access: memcpy source, or a base-pointer read the
+/// GEP walk cannot narrow). A store edge only feeds an ISR read when the
+/// stored field overlaps the read field; the sentinel overlaps every field.
+const ALL_FIELDS: u16 = 0xFFFF;
+
+/// Resolve a pointer operand to `(global, field_byte_offset)`, one hop
+/// through GEPs. The field is the accumulated constant byte offset modulo
+/// the innermost runtime scale: `gep @g +0 +10*%i +9` (element %i, field 9
+/// of a 10-byte TCB) resolves to field 9, `gep @g +0 +10*%i +0` (the fn
+/// field) to field 0, and a bare `@g`/`gep @g +0` to field 0. A whole-object
+/// read at an unresolvable offset degrades to `ALL_FIELDS` (a store into
+/// any field then feeds it), the conservative direction; a runtime register
+/// base (a param, an alloca, a load) resolves to nothing and the store-edge
+/// scan treats it as opaque.
+fn global_field(ptr: &str, f: &Func) -> Option<(String, u16)> {
     if let Some(g) = ptr.strip_prefix('@') {
-        return Some(g.to_string());
+        return Some((g.to_string(), 0));
     }
     let mut cur = ptr.strip_prefix('%')?.to_string();
+    let mut k: u16 = 0;
+    let mut min_scale: Option<u8> = None;
     for _ in 0..8 {
-        let mut found = None;
+        let mut found = false;
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::Gep(g) = inst {
                     if g.dst == cur {
                         match &g.base {
-                            GepBase::Global(n) => return Some(n.clone()),
+                            GepBase::Global(n) => {
+                                k = k.wrapping_add(u16::from(g.k));
+                                if min_scale.is_none() {
+                                    min_scale = g.terms.iter().map(|(s, _)| *s).min();
+                                }
+                                return Some((n.clone(), field_of(k, min_scale)));
+                            }
                             GepBase::Reg(r) => {
-                                found = Some(r.clone());
+                                k = k.wrapping_add(u16::from(g.k));
+                                if min_scale.is_none() {
+                                    min_scale = g.terms.iter().map(|(s, _)| *s).min();
+                                }
+                                cur = r.clone();
+                                found = true;
                                 break;
                             }
                         }
                     }
                 }
             }
-            if found.is_some() {
+            if found {
                 break;
             }
         }
-        match found {
-            Some(r) => cur = r,
+        if !found {
+            return None;
+        }
+    }
+    None
+}
+
+/// The field a constant byte offset selects, given the innermost runtime
+/// scale: `offset % scale` when a scale is known (an array-of-struct
+/// element stride), the bare offset otherwise (a direct struct or global).
+fn field_of(offset: u16, min_scale: Option<u8>) -> u16 {
+    match min_scale {
+        Some(s) if s > 0 => offset % u16::from(s),
+        _ => offset,
+    }
+}
+
+/// `global_field` over a precomputed per-function GEP base map (the
+/// store-rewrite loop mutates the function, so resolution must not borrow
+/// it). The GEP's constant offset `k` and term scales ride in the map
+/// entries.
+fn global_field_map(
+    ptr: &str,
+    bases: &HashMap<String, (GepBase, u8, Vec<(u8, String)>)>,
+) -> Option<(String, u16)> {
+    if let Some(g) = ptr.strip_prefix('@') {
+        return Some((g.to_string(), 0));
+    }
+    let mut cur = ptr.strip_prefix('%')?.to_string();
+    let mut k: u16 = 0;
+    let mut min_scale: Option<u8> = None;
+    for _ in 0..8 {
+        match bases.get(&cur) {
+            Some((GepBase::Global(n), gk, terms)) => {
+                k = k.wrapping_add(u16::from(*gk));
+                if min_scale.is_none() {
+                    min_scale = terms.iter().map(|(s, _)| *s).min();
+                }
+                return Some((n.clone(), field_of(k, min_scale)));
+            }
+            Some((GepBase::Reg(r), gk, terms)) => {
+                k = k.wrapping_add(u16::from(*gk));
+                if min_scale.is_none() {
+                    min_scale = terms.iter().map(|(s, _)| *s).min();
+                }
+                cur = r.clone();
+            }
             None => return None,
         }
     }
     None
 }
+
 /// The `@g`/`%r` pointer text of a `Val` (memcpy operands are pointer
 /// values). A non-pointer val has no pointer text.
 fn ptr_of_val(v: &Val) -> String {
@@ -897,33 +1015,20 @@ fn ptr_of_val(v: &Val) -> String {
         _ => String::new(),
     }
 }
-/// Resolve a pointer operand to the global it addresses using a precomputed
-/// per-function GEP base map (dst reg -> base). The store-rewrite loop
-/// mutates the function, so resolution must not borrow it; the map is built
-/// once per function before the mutation.
-fn ptr_global_map(ptr: &str, bases: &HashMap<String, GepBase>) -> Option<String> {
-    if let Some(g) = ptr.strip_prefix('@') {
-        return Some(g.to_string());
-    }
-    let mut cur = ptr.strip_prefix('%')?.to_string();
-    for _ in 0..8 {
-        match bases.get(&cur) {
-            Some(GepBase::Global(n)) => return Some(n.clone()),
-            Some(GepBase::Reg(r)) => cur = r.clone(),
-            None => return None,
-        }
-    }
-    None
-}
 
-/// The globals the ISR context READS (loads, memcpy sources): a store into
-/// one of these from anywhere in the module feeds an ISR indirect call, so
-/// the stored value must be rewritten to the `_isr` copy when duplicated.
-/// A global the ISR only writes never feeds an ISR call, and rewriting a
-/// store into it would break the epic-cc#73 fixture (main's store must stay
-/// on the original).
-fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<String> {
-    let mut out: HashSet<String> = HashSet::new();
+/// The `(global, field)` pairs the ISR context READS (loads, memcpy
+/// sources): a store into one of these from anywhere in the module feeds
+/// an ISR indirect call, so the stored value must be rewritten to the
+/// `_isr` copy when duplicated. A global the ISR only writes never feeds
+/// an ISR call, and rewriting a store into it would break the epic-cc#73
+/// fixture (main's store must stay on the original). Field-sensitive: the
+/// scheduler's task table (`g_tasks`, fn/arg fields stored by main,
+/// flags/countdown/period fields read by the ISR tick) must not pull the
+/// stored task functions into the ISR context, or the main-context
+/// dispatch loses its candidates and the ISR duplication doubles flash
+/// (epic-hal#86). A memcpy source (whole object) reads `ALL_FIELDS`.
+fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<(String, u16)> {
+    let mut out: HashSet<(String, u16)> = HashSet::new();
     for f in &m.funcs {
         if !isr_ctx.contains(&f.name) {
             continue;
@@ -932,13 +1037,13 @@ fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<String> {
             for inst in &b.insts {
                 match inst {
                     Inst::Load(l) => {
-                        if let Some(g) = ptr_global(&l.ptr, f) {
-                            out.insert(g);
+                        if let Some((g, k)) = global_field(&l.ptr, f) {
+                            out.insert((g, k));
                         }
                     }
                     Inst::Memcpy(mc) => {
-                        if let Some(g) = ptr_global(&ptr_of_val(&mc.src), f) {
-                            out.insert(g);
+                        if let Some((g, _)) = global_field(&ptr_of_val(&mc.src), f) {
+                            out.insert((g, ALL_FIELDS));
                         }
                     }
                     _ => {}
@@ -950,15 +1055,16 @@ fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<String> {
 }
 
 /// Returns `(isr_ctx, isr_read_globals, adj, param_stores)`: the extended
-/// context, the globals the context READS (the cross-context store-rewrite
-/// predicate), the caller -> callee adjacency (the main context derives from
-/// it), and the `(func, param_index)` positions whose stored value feeds an
-/// ISR-read global (the call-site argument rewrite targets).
+/// context, the `(global, field)` pairs the context READS (the
+/// cross-context store-rewrite predicate), the caller -> callee adjacency
+/// (the main context derives from it), and the `(func, param_index)`
+/// positions whose stored value feeds an ISR-read global (the call-site
+/// argument rewrite targets).
 fn isr_context(
     m: &Module,
 ) -> (
     HashSet<String>,
-    HashSet<String>,
+    HashSet<(String, u16)>,
     HashMap<String, Vec<String>>,
     HashSet<(String, usize)>,
 ) {
@@ -1015,10 +1121,13 @@ fn isr_context(
             for b in &f.blocks {
                 for inst in &b.insts {
                     if let Inst::Store(s) = inst {
-                        let Some(g) = ptr_global(&s.ptr, f) else {
+                        let Some((g, sk)) = global_field(&s.ptr, f) else {
                             continue;
                         };
-                        if !read.contains(&g) {
+                        let feeds = read
+                            .iter()
+                            .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
+                        if !feeds {
                             continue;
                         }
                         match &s.val {
@@ -1211,21 +1320,24 @@ fn duplicate_isr_shared(m: Module) -> Module {
         }
         // GEP bases are resolved before the mutation loop (the function is
         // borrowed mutably below).
-        let mut bases: HashMap<String, GepBase> = HashMap::new();
+        let mut bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = HashMap::new();
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::Gep(g) = inst {
-                    bases.insert(g.dst.clone(), g.base.clone());
+                    bases.insert(g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()));
                 }
             }
         }
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 if let Inst::Store(s) = inst {
-                    let Some(g) = ptr_global_map(&s.ptr, &bases) else {
+                    let Some((g, sk)) = global_field_map(&s.ptr, &bases) else {
                         continue;
                     };
-                    if !isr_read.contains(&g) {
+                    let feeds = isr_read
+                        .iter()
+                        .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
+                    if !feeds {
                         continue;
                     }
                     if let Val::Global(fn_name) = &s.val {
@@ -1354,16 +1466,27 @@ fn fill_indirect_callees(m: &mut Module) {
             }
         }
     }
-    // Arity map for the candidate filter: an indirect call site only ever
-    // invokes a candidate with the matching number of arguments. Without
-    // this, a 1-arg ISR callback site (RB change) collects 0-arg callbacks
-    // (Timer0 overflow) into its candidate set and isel panics copying
-    // args into a param-less slot. An `_isr` copy shares its original's
-    // params, so the arity check on the original carries over.
+    // Arity and width maps for the candidate filter: an indirect call
+    // site only ever invokes a candidate with the matching number of
+    // arguments and matching widths. Without the arity check, a 1-arg ISR
+    // callback site collects 0-arg callbacks and isel panics (epic-cc#152);
+    // without the width check, an i8 arg site collects ptr-param tasks and
+    // isel panics copying a narrow arg into a 2-byte slot. An `_isr` copy
+    // shares its original's params, so both checks carry over.
     let arity: HashMap<String, usize> = m
         .funcs
         .iter()
         .map(|f| (f.name.clone(), f.params.len()))
+        .collect();
+    let param_widths: HashMap<String, Vec<u16>> = m
+        .funcs
+        .iter()
+        .map(|f| {
+            (
+                f.name.clone(),
+                f.params.iter().map(|p| u16::from(p.width)).collect(),
+            )
+        })
         .collect();
 
     // The extended ISR context (epic-cc#137): the ISR roots' reachability
@@ -1393,6 +1516,13 @@ fn fill_indirect_callees(m: &mut Module) {
                             }
                         })
                         .filter(|g| arity.get(*g).copied() == Some(c.args.len()))
+                        .filter(|g| {
+                            let widths = param_widths.get(*g).map(Vec::as_slice).unwrap_or(&[]);
+                            c.args
+                                .iter()
+                                .zip(widths.iter())
+                                .all(|(a, &w)| u16::from(a.ty.map(|t| t.bytes()).unwrap_or(2)) == w)
+                        })
                         .cloned()
                         .collect();
                     // An ISR-site candidate that is a duplicated ORIGINAL

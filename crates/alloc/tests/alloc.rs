@@ -38,10 +38,14 @@ fn globals_get_bank0_addresses() {
 
 #[test]
 fn i16_global_advances_two_bytes() {
+    // The prefer-lower-footprint tie-break (epic-hal#86): the largest-first
+    // bin-pack places the 2-byte i16 first at 0x20 and the 1-byte i8 at
+    // 0x22, one byte tighter than the .ll-order sequential (i8 at 0x20,
+    // i16 at 0x22-0x23). The i16 still advances by two bytes.
     let m = parse("global a i8\nglobal b i16\nfn main(void) ()\n  block entry:\n    ret void\n");
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
-    assert_eq!(out.globals["a"], 0x20);
-    assert_eq!(out.globals["b"], 0x22);
+    assert_eq!(out.globals["b"], 0x20);
+    assert_eq!(out.globals["a"], 0x22);
 }
 
 #[test]

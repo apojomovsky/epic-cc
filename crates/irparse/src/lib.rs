@@ -1490,9 +1490,12 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
                         sret = true;
                     } else if t.starts_with('%') || t.starts_with('@') {
                         val_tok = Some(t.clone());
-                    } else if t == "poison" {
-                        // see parse_val: a poison arg is never observed, so
-                        // materializing it as Const(0) is sound.
+                    } else if t == "poison" || t == "null" || t == "undef" || t == "zeroinitializer"
+                    {
+                        // see parse_val: poison/undef/zeroinitializer are
+                        // never observed, and null is the zero pointer, so
+                        // materializing each as Const(0) is sound. clang
+                        // prints a NULL function arg as `ptr noundef null`.
                         val_tok = Some(t.clone());
                     } else if t == "true" || t == "false" {
                         // An `i1 true`/`i1 false` immarg (e.g. llvm.abs's

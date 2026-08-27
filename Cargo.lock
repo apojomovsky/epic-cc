@@ -124,6 +124,7 @@ dependencies = [
  "ir",
  "iselcore",
  "legalize",
+ "peephole",
  "pic14-sim",
 ]
 

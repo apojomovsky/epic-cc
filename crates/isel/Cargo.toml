@@ -9,6 +9,7 @@ ir = { path = "../ir" }
 device = { path = "../device" }
 banking = { path = "../banking" }
 iselcore = { path = "../iselcore" }
+peephole = { path = "../peephole" }
 
 [dev-dependencies]
 pic14-sim = { path = "../sim" }
