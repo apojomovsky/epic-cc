@@ -1164,6 +1164,28 @@ fn parse_value_with_gep(
     out: &mut Vec<Inst>,
 ) -> Val {
     let s = raw.trim();
+    if s.contains("inttoptr") {
+        let start = s.find("inttoptr").unwrap();
+        let part = &s[start + "inttoptr".len()..];
+        let inner = part
+            .trim()
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let mut it = inner.split_whitespace();
+        let _ty = it.next();
+        let val_str = it
+            .next()
+            .unwrap_or_else(|| panic!("irparse: malformed inttoptr {s:?}"));
+        if val_str.starts_with('%') {
+            return Val::Reg(val_str[1..].to_string());
+        } else if val_str.starts_with('@') {
+            return Val::Global(val_str[1..].to_string());
+        } else if let Ok(k) = val_str.parse::<i64>() {
+            return Val::Const(k);
+        }
+        return parse_val_typed(val_str, Some(ty));
+    }
     if s.contains("getelementptr") && s.contains("ptrtoint") {
         let after = &s[s.find("ptrtoint").unwrap() + "ptrtoint".len()..];
         let to_pos = after
@@ -1418,8 +1440,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
         k >= -128 && k <= 255,
         "irparse: gep byte offset {k} out of range"
     );
-    let k_wrapped = ((k % 256 + 256) % 256) as u8;
-    (k_wrapped, terms)
+    (k as u8, terms)
 }
 
 /// Parse a getelementptr into `(base, k, terms)`. Handles the paren
@@ -2514,13 +2535,12 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         }
         "zext" | "sext" | "trunc" | "ptrtoint" => {
             let body_raw = &rest[op.len()..];
-            let body_stripped = strip_attrs(body_raw);
-            let body = if body_stripped.contains("getelementptr") {
-                body_raw
+            let body_str = if body_raw.contains("getelementptr") {
+                body_raw.trim().to_string()
             } else {
-                &body_stripped
+                strip_attrs(body_raw).trim().to_string()
             };
-            let body = body.trim();
+            let body = body_str.as_str().trim();
             let to_i = body.rfind(" to ").unwrap();
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
             let to = ty_of(
