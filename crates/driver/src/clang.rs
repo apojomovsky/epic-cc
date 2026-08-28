@@ -38,12 +38,16 @@ pub struct Options {
     /// `-D` defines (`cli.defines`).
     pub defines: Vec<String>,
     /// The `tmp/include` dir the driver materialises (`epic-cc.h`, `stdint.h`,
-    /// …). Added as `-I <header_dir>` when `Some`.
+    /// ...). Added as `-I <header_dir>` when `Some`.
     pub header_dir: Option<PathBuf>,
     /// `EPIC_FOSC_HZ` value. Added as `-D EPIC_FOSC_HZ=<hz>` when `Some`.
     pub fosc_hz: Option<u64>,
+    /// `-fpack-struct`: the XC8 PIC18 record layout gives every struct
+    /// member byte alignment (epic-cc#166). irparse reads the packedness
+    /// back from the `<{ ... }>` types clang prints, so nothing past the
+    /// front end needs the flag.
+    pub packed_structs: bool,
 }
-
 impl Options {
     pub fn new() -> Self {
         Self::default()
@@ -75,6 +79,9 @@ pub fn apply_options(cmd: &mut Command, opts: &Options) {
     }
     if let Some(hz) = opts.fosc_hz {
         cmd.args(["-D", &format!("EPIC_FOSC_HZ={hz}")]);
+    }
+    if opts.packed_structs {
+        cmd.arg("-fpack-struct");
     }
 }
 
@@ -191,6 +198,7 @@ mod tests {
             defines: vec!["FOO=1".to_string()],
             header_dir: Some(PathBuf::from("/tmp/hdr")),
             fosc_hz: Some(20_000_000),
+            packed_structs: false,
         };
         apply_options(&mut cmd, &opts);
         let dbg = format!("{cmd:?}");
@@ -198,5 +206,24 @@ mod tests {
         assert!(dbg.contains("FOO=1"));
         assert!(dbg.contains("/tmp/hdr"));
         assert!(dbg.contains("EPIC_FOSC_HZ=20000000"));
+        assert!(!dbg.contains("-fpack-struct"), "off by default");
+    }
+
+    #[test]
+    fn options_add_fpack_struct_only_when_packed() {
+        // PIC18 rides the XC8 record layout (every member byte-aligned,
+        // epic-cc#166); the flag must appear only when the caller opts in.
+        let mut cmd = base_cmd(Path::new("clang"), Path::new("/res"));
+        apply_options(
+            &mut cmd,
+            &Options {
+                packed_structs: true,
+                ..Default::default()
+            },
+        );
+        assert!(format!("{cmd:?}").contains("-fpack-struct"));
+        let mut cmd = base_cmd(Path::new("clang"), Path::new("/res"));
+        apply_options(&mut cmd, &Options::default());
+        assert!(!format!("{cmd:?}").contains("-fpack-struct"));
     }
 }

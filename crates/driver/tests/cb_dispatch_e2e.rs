@@ -39,6 +39,7 @@ fn cross_context_dispatch_runs_the_task() {
         defines: Vec::new(),
         header_dir: Some(header_dir),
         fosc_hz: None,
+        packed_structs: false,
     };
     let ll_text = driver::clang::compile_to_stdout(
         &clang,
