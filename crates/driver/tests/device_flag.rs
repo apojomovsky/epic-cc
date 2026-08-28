@@ -218,3 +218,35 @@ fn device_flag_accepts_the_hal_manifest_spelling() {
         let _ = std::fs::remove_file(&out);
     }
 }
+
+#[test]
+fn xc8_predefines_reach_the_frontend() {
+    // The driver derives the XC8 toolchain and part macros from the
+    // resolved device; third-party sources switch on them (epic-cc#164).
+    let src = r#"
+#if !defined(__XC) || !defined(__XC8) || !defined(_PIC18) || !defined(_18F4550)
+#error "XC8 predefines missing"
+#endif
+void main(void) { }
+"#;
+    let tmp = std::env::temp_dir().join("epic-cc-xc8-predefines.c");
+    std::fs::write(&tmp, src).unwrap();
+    let out = tmp_hex("predefines");
+    let res = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            tmp.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--device",
+            "p18f4550",
+        ])
+        .output()
+        .expect("run driver");
+    assert!(
+        res.status.success(),
+        "predefines missing: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&out);
+}

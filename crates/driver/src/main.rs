@@ -137,7 +137,10 @@ fn main() {
     // 1. clang: one invocation per translation unit.
     let clang_opts = clang::Options {
         includes: cli.includes.clone(),
-        defines: cli.defines.clone(),
+        defines: driver::predef::xc8_predefines(device.core, device.name)
+            .into_iter()
+            .chain(cli.defines.clone())
+            .collect(),
         header_dir: Some(header_dir.clone()),
         fosc_hz: Some(fosc_hz),
     };
