@@ -798,30 +798,37 @@ fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> 
     })
 }
 
-/// Collect `%struct.X = type { ... }` declarations into a resolved size/
-/// layout table (fixpoint over forward/recursive struct references).
+/// Collect `%struct.X = type { ... }` and `%union.X = type { ... }`
+/// declarations into a resolved size/layout table (fixpoint over
+/// forward/recursive struct references). clang normalizes a union to its
+/// largest member plus trailing padding, so the same layout rules apply.
 fn build_struct_table(src: &str) -> StructTypes {
     let mut decls: Vec<(String, Vec<String>)> = Vec::new();
     for line in src.lines() {
         let l = line.trim();
-        if let Some(rest) = l.strip_prefix("%struct.") {
-            let eq = rest.find('=').unwrap();
-            let name = format!("struct.{}", rest[..eq].trim());
-            let ty_str = rest[eq + 1..]
-                .trim()
-                .strip_prefix("type ")
-                .expect("struct decl must be 'type {...}'");
-            assert!(
-                ty_str.starts_with('{'),
-                "irparse: expected struct type, got {ty_str:?}"
-            );
-            let inner = brace_inner(ty_str).expect("struct type must have balanced braces");
-            let fields: Vec<String> = split_top_level(inner, ',')
-                .iter()
-                .map(|s| s.trim().to_string())
-                .collect();
-            decls.push((name, fields));
-        }
+        let (kind, rest) = if let Some(rest) = l.strip_prefix("%struct.") {
+            ("struct.", rest)
+        } else if let Some(rest) = l.strip_prefix("%union.") {
+            ("union.", rest)
+        } else {
+            continue;
+        };
+        let eq = rest.find('=').unwrap();
+        let name = format!("{}{}", kind, rest[..eq].trim());
+        let ty_str = rest[eq + 1..]
+            .trim()
+            .strip_prefix("type ")
+            .expect("struct decl must be 'type {...}'");
+        assert!(
+            ty_str.starts_with('{'),
+            "irparse: expected struct type, got {ty_str:?}"
+        );
+        let inner = brace_inner(ty_str).expect("struct type must have balanced braces");
+        let fields: Vec<String> = split_top_level(inner, ',')
+            .iter()
+            .map(|s| s.trim().to_string())
+            .collect();
+        decls.push((name, fields));
     }
     let mut types: StructTypes = HashMap::new();
     loop {
