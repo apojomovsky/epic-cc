@@ -7,6 +7,9 @@
 > **Amended 2026-08-26**, decided by the user: the PlatformIO platform is named
 > `platform-epic8`, registry id `epic8` (was the `platform-pic8`/`pic8` working name
 > when this document was written). D-6 and section 3 carry the new name.
+> **Amended 2026-08-28**: HAL-3 closed with all nine clusters landed (#84 through #92); the
+> 877A RAM headroom question is answered with measurements (section 5), and the consolidated
+> per-module and per-combo figures are recorded in `epic-hal#59`.
 > Section 6 records what has landed.
 > This document is the **decomposition of record**. It holds the map and the decisions
 > that constrain every piece; it is not an implementation plan. Each sub-project below
@@ -729,11 +732,13 @@ firmware only. Two epic-cc gaps were found by probing the put shape and filed: s
 pointer args (#148) and local array allocas (#149), both panic loudly today, and neither
 changes the decision.
 
-**RAM headroom on the 877A `[VERIFY]`.** epic-hal's modules fit under XC8 today. epic-cc's
-overlay allocator is a different allocator, and 368 bytes leaves little room to be wrong. This
-is a real risk of the chosen sequencing and is best discovered early, which is also an argument
-for that sequencing. **Owner as of 2026-08-24:** `apojomovsky/epic-hal#84`, the first cluster,
-which records the baseline figures every later cluster compares against.
+**RAM headroom on the 877A: answered 2026-08-28 by the HAL-3 clusters.** `epic-hal#59`
+records the shelf-wide figures. Per module the overlay fits with room to the wall: the
+harness slice high-waters at 83 B, `epic-tick` runs its target gate at 288/368 bytes,
+`epic-serial` builds at 297/368. At whole-program scale the wall is real and arrives loudly,
+not silently: four of the eight PIC16 combos exceed the 352-byte GPR capacity, three of them
+by a single byte, each with a precise `alloc: GPR demand exceeds 0x1EF` panic. Per-combo XC8
+baselines and the exact epic-cc panics live in epic-hal's `docs/combo-epiccc-conformance.md`.
 
 **Section-attribute passthrough: confirmed 2026-08-20.** D-2 and D-4 rest on clang forwarding
 `__attribute__((section("...")))` verbatim into the `.ll`. Probed against the pinned clang 20.1.8
@@ -752,7 +757,7 @@ decides whether the host build remains the inner loop or is replaced.
 
 ---
 
-## 6. Where this stands, 2026-08-24
+## 6. Where this stands, 2026-08-28
 
 Recorded so a cold reader is not misled by section 3's future tense. Section 3 is the
 decomposition; this is its state.
@@ -769,7 +774,7 @@ decomposition; this is its state.
 | **CC-6** distribution, size and map | Done (reporting half) | #74, ADR-025; #118 for the CI consumable artifact |
 | **HAL-1** epic-cc build variant | Done | `epic-hal#57` |
 | **HAL-2** build-system backend | Done | `epic-hal#58` |
-| **HAL-3** module conformance | Decomposed, see below | `epic-hal#59` |
+| **HAL-3** module conformance | Done: clusters #84 to #92 closed 2026-08-24 to 2026-08-28, residuals filed | `epic-hal#59` |
 | **HAL-4** verification via `crates/sim` | Open | `epic-hal#60` |
 | **HAL-5** distribution flip | Open | `epic-hal#61` |
 | **PIO-0 to PIO-3** | Open | `epic-platformio#1` to `#4` |
@@ -811,10 +816,20 @@ that most of the module shelf depends on, not off to the side among leaf modules
 promoted to the `P2 gate` phase for that reason, and #117 covers the sibling gap, lowering
 `inttoptr` on a runtime address, which is the other half of `epic-hal#67`.
 
-### Open scope question
+**Closed 2026-08-28.** All nine clusters landed. On the 877A the pure logic and peripheral
+modules build as `__EPIC_CC__`-guarded slices, `epic-tick` passes its PORTB toggle gate on
+both devices in CI, and `epic-serial` ships the shared `put_*` surface. What remains is a
+list of filed compiler gaps with repros, not open questions: runtime pointer call args
+(#155, epic-taskmgr's dispatch), array allocas (#149), string literal pointer arguments
+(#148), `llvm.fshl` (#145), the const-table window (#121), and the PIC18 sdcard and
+settings slice (#143). Several gaps filed during the clusters closed on master since:
+#137, #138, #144, #159, and the m-stack set #163 to #166.
 
-`epic-hal` also holds eleven `epic-combo-*` integration firmwares, which link several
-modules into one image and are the strongest gates in that repository. They are named
-`epic-*`, so the definition of done arguably covers them, and they are where the 877A's
-368 bytes are most likely to run out. D-1's "per module is load-bearing" argues the other
-way. Tracked as `epic-hal#92`, held at `dispatch-only` pending the user's decision.
+### Combo firmwares: scope confirmed, landed 2026-08-28
+
+The `epic-combo-*` integration firmwares were confirmed into HAL-3 as `epic-hal#92` and
+closed with it on 2026-08-28. All thirteen build and gate green under XC8, the differential
+oracle, each with its RAM and flash baseline recorded. Under epic-cc each currently stops on
+a filed compiler gap: the 877A ones on the GPR window or lowering panics, the PIC18 ones on
+`i64`. The headroom matrix with per-combo numbers is epic-hal's
+`docs/combo-epiccc-conformance.md`.
