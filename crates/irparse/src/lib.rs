@@ -1827,7 +1827,15 @@ pub fn parse_ll(src: &str) -> Module {
                     let bytes = if init.starts_with("zeroinitializer") {
                         vec![0u8; size as usize]
                     } else {
-                        decode_typed_value(&rest[..close + 1], init, &types)
+                        let decoded = decode_typed_value(&rest[..close + 1], init, &types);
+                        assert_eq!(
+                            decoded.len(),
+                            size as usize,
+                            "SPIKE LIMIT: literal array global @{name} initializer decoded to {} bytes, expected {size} for {:?}",
+                            decoded.len(),
+                            &rest[..close + 1]
+                        );
+                        decoded
                     };
                     (Ty::I8, size, bytes)
                 } else if elem_str.starts_with('%') {

@@ -38,7 +38,7 @@ pub struct Options {
     /// `-D` defines (`cli.defines`).
     pub defines: Vec<String>,
     /// The `tmp/include` dir the driver materialises (`epic-cc.h`, `stdint.h`,
-    /// ...). Added as `-I <header_dir>` when `Some`.
+    /// …). Added as `-I <header_dir>` when `Some`.
     pub header_dir: Option<PathBuf>,
     /// `EPIC_FOSC_HZ` value. Added as `-D EPIC_FOSC_HZ=<hz>` when `Some`.
     pub fosc_hz: Option<u64>,
@@ -48,6 +48,7 @@ pub struct Options {
     /// front end needs the flag.
     pub packed_structs: bool,
 }
+
 impl Options {
     pub fn new() -> Self {
         Self::default()
