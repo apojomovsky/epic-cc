@@ -35,6 +35,7 @@ fn umin_and_usub_sat_run_correctly() {
         defines: Vec::new(),
         header_dir: Some(header_dir),
         fosc_hz: None,
+        packed_structs: false,
     };
     let ll_text = driver::clang::compile_to_stdout(
         &clang,

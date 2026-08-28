@@ -38,6 +38,7 @@ fn null_function_arg_compiles_and_runs() {
         defines: Vec::new(),
         header_dir: Some(header_dir),
         fosc_hz: None,
+        packed_structs: false,
     };
     let ll_text = driver::clang::compile_to_stdout(
         &clang,

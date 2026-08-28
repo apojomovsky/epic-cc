@@ -186,17 +186,21 @@ fn literal_ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
     let inner = brace_inner(t).expect("literal struct type must be `{ ... }`");
     let mut off: u16 = 0;
     let mut max_align: u8 = 0;
+    let packed = packed_braces(t);
     for f in split_top_level(inner, ',') {
         let f = f.trim();
         if f.is_empty() {
             continue;
         }
         let (fsize, falign) = ty_size_align(f, types);
-        off = round_up(off, falign);
+        if !packed {
+            off = round_up(off, falign);
+        }
         off += fsize;
         max_align = max_align.max(falign);
     }
-    (round_up(off, max_align), max_align)
+    let align = if packed { 1 } else { max_align };
+    (round_up(off, align), align)
 }
 
 /// Strip a clang self-type prefix from a nested value. clang prints every
@@ -207,14 +211,24 @@ fn literal_ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
 /// remainder is the bare value the decoder expects.
 fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
     let value = value.trim();
-    if value.starts_with('{') {
-        // `{ i8, i8, i16 } { i8 66, ... }` / `{ i8, i8, i16 } zeroinitializer`
-        // — the first brace group is the self-type; `brace_inner` stops at
-        // its closing brace, and the remainder is the value's own `{` list
-        // or `zeroinitializer`.
-        let inner = brace_inner(value).unwrap_or("");
-        let rest = value[inner.len() + 2..].trim();
-        return if rest.starts_with('{') || rest.starts_with("zeroinitializer") {
+    if value.starts_with('{') || value.starts_with("<{") {
+        // `{ T } { v }` / `{ T } zeroinitializer`, packed `<{ T } <{ v }>>`:
+        // the first brace group is the self-type; `brace_inner` stops at its
+        // closing brace, and the remainder is the value's own `{` list or
+        // `zeroinitializer`.
+        let (v, packed) = match value.strip_prefix('<') {
+            Some(r) if r.trim_start().starts_with('{') => (r.trim_start(), true),
+            _ => (value, false),
+        };
+        let inner = brace_inner(v).unwrap_or("");
+        let mut rest = v[inner.len() + 2..].trim();
+        if packed && rest.starts_with('>') {
+            rest = rest[1..].trim_start();
+        }
+        return if rest.starts_with('{')
+            || rest.starts_with("<{")
+            || rest.starts_with("zeroinitializer")
+        {
             rest
         } else {
             value
@@ -259,7 +273,7 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
         let bytes = if elem == "i8" && value.starts_with('c') && value.contains('"') {
             parse_string_literal(value)
         } else if value.starts_with('[') {
-            if elem.starts_with('{') {
+            if elem.starts_with('{') || elem.starts_with("<{") {
                 let inner_list = value
                     .strip_prefix('[')
                     .and_then(|s| matching_bracket(value).map(|i| &s[..i.saturating_sub(1)]))
@@ -302,7 +316,7 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
         );
         return bytes;
     }
-    if ty.starts_with('{') {
+    if ty.starts_with('{') || ty.starts_with("<{") {
         return decode_literal_struct(ty, value, types);
     }
     if ty.starts_with('%') {
@@ -320,10 +334,11 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
     }
 }
 
-/// Decode a literal struct initializer (`{ i8 65, i8 0, i16 4660 }`) into
-/// the flat little-endian blob, placing each field at its aligned offset
-/// (the same rules as the type table). clang prints every field including
-/// padding, but missing trailing fields decode as zeros for robustness.
+/// Decode a literal struct initializer (`{ i8 65, i8 0, i16 4660 }`, packed
+/// `<{ ... }>`) into the flat little-endian blob, placing each field at its
+/// layout offset (the same rules as the type table). clang prints every
+/// field including padding, but missing trailing fields decode as zeros for
+/// robustness.
 fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
     let inner = brace_inner(ty).expect("literal struct type must be `{ ... }`");
     let ty_fields: Vec<&str> = split_top_level(inner, ',')
@@ -346,12 +361,15 @@ fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
         "SPIKE LIMIT: struct initializer {init:?} has more values than type {ty:?} has fields"
     );
     let mut off: u16 = 0;
+    let packed = packed_braces(ty);
     for (i, f) in ty_fields.iter().enumerate() {
         if f.is_empty() {
             continue;
         }
         let (fsize, falign) = ty_size_align(f, types);
-        off = round_up(off, falign);
+        if !packed {
+            off = round_up(off, falign);
+        }
         if let Some(v) = values.get(i) {
             if !v.is_empty() {
                 let fbytes = decode_typed_value(f, v, types);
@@ -410,7 +428,9 @@ fn decode_named_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
             continue;
         }
         let (fsize, falign) = ty_size_align(f, types);
-        off = round_up(off, falign);
+        if !info.packed {
+            off = round_up(off, falign);
+        }
         if let Some(val) = values.get(i) {
             if !val.is_empty() {
                 let fbytes = decode_typed_value(f, val, types);
@@ -638,8 +658,22 @@ fn balanced_inner(s: &str) -> Option<&str> {
     None
 }
 
-/// Given `s` starting with `{`, return the content between the outer braces.
+/// True when the type or value string carries LLVM packed braces: clang
+/// prints a record whose layout packs as `<{ ... }>`.
+fn packed_braces(s: &str) -> bool {
+    s.trim_start().starts_with("<{")
+}
+
+/// Given `s` starting with `{` (or the packed `<{`), return the content
+/// between the outer braces.
 fn brace_inner(s: &str) -> Option<&str> {
+    let s = s.trim_start();
+    // Skip the packed `<` wrapper so the scan sees `{ ... }`; the trailing
+    // `>` never enters the returned slice.
+    let s = match s.strip_prefix('<') {
+        Some(r) if r.trim_start().starts_with('{') => r.trim_start(),
+        _ => s,
+    };
     let mut depth = 0i32;
     for (i, c) in s.char_indices() {
         match c {
@@ -705,6 +739,9 @@ struct StructInfo {
     size: u8,
     align: u8,
     fields: Vec<String>,
+    /// clang packed the record (printed `<{ ... }>`): fields sit at running
+    /// offsets with no padding, struct alignment 1.
+    packed: bool,
 }
 type StructTypes = HashMap<String, StructInfo>;
 
@@ -733,10 +770,10 @@ fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
             .get(n)
             .unwrap_or_else(|| panic!("irparse: unknown struct type {t}"));
         (u16::from(info.size), info.align)
-    } else if t.starts_with('{') {
-        // Literal struct type (`{ i8, i8, i16 }`): layout by the same
-        // rules as `compute_struct`. Literal structs are value types
-        // (no cycles), so plain recursion terminates.
+    } else if t.starts_with('{') || t.starts_with("<{") {
+        // Literal struct type (`{ i8, i8, i16 }`, packed `<{ ... }>`):
+        // layout by the same rules as `compute_struct`. Literal structs are
+        // value types (no cycles), so plain recursion terminates.
         literal_ty_size_align(t, types)
     } else {
         match t {
@@ -772,13 +809,18 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
     }
 }
 /// Layout a struct from its field type strings. `None` while an unresolved
-/// (mutually/forward-referenced) struct is referenced.
-fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> {
+/// (mutually/forward-referenced) struct is referenced. A packed record
+/// (clang's `-fpack-struct` layout, printed `<{ ... }>`) places every field
+/// at the running offset with alignment 1; unpacked records round each
+/// field up to its natural alignment.
+fn compute_struct(fields: &[String], types: &StructTypes, packed: bool) -> Option<StructInfo> {
     let mut off: u16 = 0;
     let mut max_align: u8 = 0;
     for f in fields {
         let (fsize, falign) = ty_size_align_opt(f, types)?;
-        off = round_up(off, falign);
+        if !packed {
+            off = round_up(off, falign);
+        }
         assert!(
             off <= 255,
             "irparse: struct field offset {off} exceeds 255 (byte-addressed)"
@@ -786,15 +828,17 @@ fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> 
         off += fsize;
         max_align = max_align.max(falign);
     }
-    let size = round_up(off, max_align);
+    let align = if packed { 1 } else { max_align };
+    let size = round_up(off, align);
     assert!(
         size <= 255,
         "irparse: struct size {size} exceeds 255 (byte-addressed)"
     );
     Some(StructInfo {
         size: size as u8,
-        align: max_align,
+        align,
         fields: fields.to_vec(),
+        packed,
     })
 }
 
@@ -803,7 +847,7 @@ fn compute_struct(fields: &[String], types: &StructTypes) -> Option<StructInfo> 
 /// forward/recursive struct references). clang normalizes a union to its
 /// largest member plus trailing padding, so the same layout rules apply.
 fn build_struct_table(src: &str) -> StructTypes {
-    let mut decls: Vec<(String, Vec<String>)> = Vec::new();
+    let mut decls: Vec<(String, Vec<String>, bool)> = Vec::new();
     for line in src.lines() {
         let l = line.trim();
         let (kind, rest) = if let Some(rest) = l.strip_prefix("%struct.") {
@@ -819,8 +863,9 @@ fn build_struct_table(src: &str) -> StructTypes {
             .trim()
             .strip_prefix("type ")
             .expect("struct decl must be 'type {...}'");
+        let packed = packed_braces(ty_str);
         assert!(
-            ty_str.starts_with('{'),
+            ty_str.starts_with('{') || ty_str.starts_with("<{"),
             "irparse: expected struct type, got {ty_str:?}"
         );
         let inner = brace_inner(ty_str).expect("struct type must have balanced braces");
@@ -828,16 +873,16 @@ fn build_struct_table(src: &str) -> StructTypes {
             .iter()
             .map(|s| s.trim().to_string())
             .collect();
-        decls.push((name, fields));
+        decls.push((name, fields, packed));
     }
     let mut types: StructTypes = HashMap::new();
     loop {
         let mut changed = false;
-        for (name, fields) in &decls {
+        for (name, fields, packed) in &decls {
             if types.contains_key(name) {
                 continue;
             }
-            if let Some(info) = compute_struct(fields, &types) {
+            if let Some(info) = compute_struct(fields, &types, *packed) {
                 types.insert(name.clone(), info);
                 changed = true;
             }
@@ -846,7 +891,7 @@ fn build_struct_table(src: &str) -> StructTypes {
             break;
         }
     }
-    for (name, _) in &decls {
+    for (name, _, _) in &decls {
         assert!(
             types.contains_key(name),
             "irparse: struct {name} unresolved (cycle?)"
@@ -1335,7 +1380,9 @@ fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
         let mut off: u16 = 0;
         for (i, f) in info.fields.iter().enumerate() {
             let (fsize, falign) = ty_size_align(f, types);
-            off = round_up(off, falign);
+            if !info.packed {
+                off = round_up(off, falign);
+            }
             if i == idx {
                 return (off, f.clone());
             }
@@ -1355,9 +1402,12 @@ fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
             fields.len()
         );
         let mut off: u16 = 0;
+        let packed = packed_braces(cur);
         for (i, f) in fields.iter().enumerate() {
             let (fsize, falign) = ty_size_align(f, types);
-            off = round_up(off, falign);
+            if !packed {
+                off = round_up(off, falign);
+            }
             if i == idx {
                 return (off, f.to_string());
             }
@@ -1387,7 +1437,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
     for ip in index_parts {
         let ip = ip.trim();
         let idx = parse_val(ip.split_whitespace().last().unwrap());
-        if cur.starts_with('%') || cur.starts_with('{') {
+        if cur.starts_with('%') || cur.starts_with('{') || cur.starts_with("<{") {
             if from_array {
                 // `[N x %struct.S], i16 0, i16 %i` — the index after an
                 // array-of-struct descent strides by sizeof(%struct.S)
@@ -1758,7 +1808,7 @@ pub fn parse_ll(src: &str) -> Module {
                 let mut pit = inner.splitn(2, 'x').map(|s| s.trim());
                 let n: usize = pit.next().unwrap().parse().unwrap();
                 let elem_str = pit.next().unwrap();
-                if elem_str.starts_with('{') {
+                if elem_str.starts_with('{') || elem_str.starts_with("<{") {
                     let (es, _) = literal_ty_size_align(elem_str, &types);
                     let size = n * es as usize;
                     if is_const {
@@ -1777,7 +1827,15 @@ pub fn parse_ll(src: &str) -> Module {
                     let bytes = if init.starts_with("zeroinitializer") {
                         vec![0u8; size as usize]
                     } else {
-                        decode_typed_value(&rest[..close + 1], init, &types)
+                        let decoded = decode_typed_value(&rest[..close + 1], init, &types);
+                        assert_eq!(
+                            decoded.len(),
+                            size as usize,
+                            "SPIKE LIMIT: literal array global @{name} initializer decoded to {} bytes, expected {size} for {:?}",
+                            decoded.len(),
+                            &rest[..close + 1]
+                        );
+                        decoded
                     };
                     (Ty::I8, size, bytes)
                 } else if elem_str.starts_with('%') {
@@ -1840,14 +1898,17 @@ pub fn parse_ll(src: &str) -> Module {
                     };
                     (elem, size, bytes)
                 }
-            } else if rest.starts_with('{') {
-                let close = brace_inner(rest)
-                    .expect("literal struct type must be `{ ... }`")
-                    .len()
-                    + 1;
-                let ty_str = &rest[..close + 1];
+            } else if rest.starts_with('{') || rest.starts_with("<{") {
+                let packed = rest.starts_with("<{");
+                let inner = brace_inner(rest).expect("literal struct type must be `{ ... }`");
+                let open = rest.find('{').unwrap();
+                let mut ty_end = open + 1 + inner.len() + 1;
+                if packed {
+                    ty_end += 1; // the packed wrapper's closing `>`
+                }
+                let ty_str = &rest[..ty_end];
                 let (size, _) = literal_ty_size_align(ty_str, &types);
-                let init = rest[close + 1..].trim();
+                let init = rest[ty_end..].trim();
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
                 } else {

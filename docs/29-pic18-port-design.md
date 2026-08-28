@@ -420,6 +420,9 @@ proves worse than expected in practice, the fallback is to extract the algorithm
 narrow emitter interface at P7, informed by two working implementations rather than by
 speculation.
 
-**The clang side is assumed unchanged.** `-target msp430` should remain the right datalayout
-proxy for PIC18 (8-bit `char`, 16-bit `int`, byte alignment). `[VERIFY]` that PIC18 pointer
-width does not argue for a different proxy, particularly for pointers into program memory.
+**The clang side is assumed unchanged, with one exception.** `-target msp430` remains the
+datalayout proxy for PIC18 (8-bit `char`, 16-bit `int`), but its member alignment is not
+XC8's: mixed 8/16-bit structs padded to align 2 until the driver added `-fpack-struct` for
+PIC18, making record layout byte-aligned like XC8 ([ADR-026](adr/ADR-026-pic18-struct-byte-alignment.md),
+from `epic-cc#166`). `[VERIFY]` that PIC18 pointer width does not argue for a different
+proxy, particularly for pointers into program memory.

@@ -250,3 +250,61 @@ void main(void) { }
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&out);
 }
+#[test]
+fn pic18_packs_structs_to_the_xc8_sizes() {
+    // The XC8 PIC18 record layout gives every member byte alignment, so a
+    // mixed 8/16-bit struct keeps its natural wire size (epic-cc#166). The
+    // negative-array check refuses to compile when the layout still pads;
+    // PIC14 deliberately keeps the msp430 natural alignment (ADR-019).
+    let src = r#"
+struct config_desc {
+  unsigned char a, b;
+  unsigned short w;
+  unsigned char c, d, e, f, g;
+};
+typedef char packed_ok[(sizeof(struct config_desc) == 9) ? 1 : -1];
+void main(void) { }
+"#;
+    let tmp = std::env::temp_dir().join("epic-cc-packed-structs.c");
+    std::fs::write(&tmp, src).unwrap();
+    let out = tmp_hex("packed");
+    let res = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            tmp.to_str().unwrap(),
+            "-o",
+            out.to_str().unwrap(),
+            "--device",
+            "p18f4550",
+        ])
+        .output()
+        .expect("run driver");
+    assert!(
+        res.status.success(),
+        "PIC18 must compile with the XC8 packed size: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+
+    let out14 = tmp_hex("packed14");
+    let res = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            tmp.to_str().unwrap(),
+            "-o",
+            out14.to_str().unwrap(),
+            "--device",
+            "p16f877a",
+        ])
+        .output()
+        .expect("run driver");
+    assert!(
+        !res.status.success(),
+        "PIC14 keeps the msp430 natural alignment; sizeof must stay 10"
+    );
+    assert!(
+        String::from_utf8_lossy(&res.stderr).contains("negative size"),
+        "expected the negative-array size check to fail: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_file(&out14);
+}

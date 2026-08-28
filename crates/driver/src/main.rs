@@ -143,6 +143,7 @@ fn main() {
             .collect(),
         header_dir: Some(header_dir.clone()),
         fosc_hz: Some(fosc_hz),
+        packed_structs: device.core == device::Core::Pic18,
     };
     let mut units = Vec::new();
     for (n, input) in cli.inputs.iter().enumerate() {

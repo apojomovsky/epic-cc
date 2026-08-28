@@ -46,6 +46,7 @@ fn fixture_layout() -> HashMap<String, u16> {
         defines: Vec::new(),
         header_dir: Some(header_dir),
         fosc_hz: None,
+        packed_structs: false,
     };
     let ll_text =
         driver::clang::compile_to_stdout(&clang, &resdir, std::path::Path::new(fixture()), &opts);
