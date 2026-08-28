@@ -1922,3 +1922,116 @@ fn parses_global_of_union_containing_struct() {
     assert_eq!(m.globals[0].size, 4);
     assert_eq!(m.globals[0].addr, None);
 }
+// Issue #166: PIC18 byte-aligned struct ABI. With `-fpack-struct` (the
+// XC8-compatible record layout for PIC18) clang prints packed LLVM struct
+// types as `<{ ... }>`: fields at running offsets, no padding, alignment 1.
+// The type table must reconstruct those offsets or every folded gep, global
+// decode, and alloca lands on the wrong byte (m-stack's wire-size checks).
+const PACKED_WIRE: &str = r#"
+%struct.CD = type <{ i8, i8, i16, i8, i8, i8, i8, i8 }>
+
+@cz = dso_local local_unnamed_addr global %struct.CD zeroinitializer, align 1
+@ci = dso_local local_unnamed_addr global %struct.CD <{ i8 1, i8 2, i16 4660, i8 3, i8 4, i8 5, i8 6, i8 7 }>, align 1
+
+define dso_local zeroext i16 @read_w(ptr noundef %0) local_unnamed_addr #0 {
+  %2 = getelementptr inbounds nuw %struct.CD, ptr %0, i32 0, i32 2
+  %3 = load i16, ptr %2, align 1
+  ret i16 %3
+}
+
+define dso_local zeroext i8 @take(ptr noundef byval(%struct.CD) align 1 %0) local_unnamed_addr #0 {
+  %2 = load i8, ptr %0, align 1
+  ret i8 %2
+}
+
+define dso_local void @main() local_unnamed_addr #1 {
+  %1 = alloca %struct.CD, align 1
+  ret void
+}
+"#;
+
+#[test]
+fn lays_out_packed_named_structs_with_running_offsets() {
+    let m = parse_ll(PACKED_WIRE);
+    let cz = m.globals.iter().find(|g| g.name == "cz").unwrap();
+    // XC8 wire size 9, not the align-2 10.
+    assert_eq!(cz.size, 9, "packed {{i8,i8,i16,i8x5}} is 9 bytes");
+    assert_eq!(cz.bytes, vec![0u8; 9]);
+
+    // The initializer decodes with no padding bytes: w = 0x1234 lands at
+    // offset 2 little-endian.
+    let ci = m.globals.iter().find(|g| g.name == "ci").unwrap();
+    assert_eq!(ci.size, 9);
+    assert_eq!(ci.bytes, vec![1, 2, 0x34, 0x12, 3, 4, 5, 6, 7]);
+
+    // A gep field selector folds to the running offset (field 2 at 2, not
+    // the align-2 offset 4).
+    let body = &m.funcs[0].blocks[0].insts;
+    match &body[0] {
+        Inst::Gep(g) => {
+            assert_eq!(g.base, GepBase::Reg("0".to_string()));
+            assert_eq!(g.k, 2, "packed field 2 offset");
+            assert!(g.terms.is_empty());
+        }
+        other => panic!("expected Gep, got {other:?}"),
+    }
+
+    // byval width and alloca size follow the packed size.
+    let take = m.funcs.iter().find(|f| f.name == "take").unwrap();
+    assert_eq!(take.params[0].byval, Some(9));
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    match &main.blocks[0].insts[0] {
+        Inst::Alloca(a) => assert_eq!(a.size, 9, "packed alloca size"),
+        other => panic!("expected Alloca, got {other:?}"),
+    }
+}
+
+// A packed outer can hold an UNPACKED inner: clang keeps `{ ... }` for an
+// inner struct whose own layout packing did not cap. The outer's fields
+// still run at offsets with no padding, and the inner keeps its own
+// (align-2) layout inside its 4 bytes.
+const PACKED_NESTED: &str = r#"
+%struct.inner = type { i16, i16 }
+%struct.outer_p = type <{ %struct.inner, i8 }>
+
+@go = dso_local local_unnamed_addr global %struct.outer_p zeroinitializer, align 1
+@gl = dso_local local_unnamed_addr global <{ %struct.inner, i8 }> zeroinitializer, align 1
+
+define dso_local zeroext i8 @read_c(ptr noundef %0) local_unnamed_addr #0 {
+  %2 = getelementptr inbounds nuw %struct.outer_p, ptr %0, i32 0, i32 1
+  %3 = load i8, ptr %2, align 1
+  ret i8 %3
+}
+"#;
+
+#[test]
+fn lays_out_a_packed_outer_around_an_unpacked_inner() {
+    let m = parse_ll(PACKED_NESTED);
+    // The named packed outer: inner contributes 4 bytes at offset 0, c at 4.
+    let go = m.globals.iter().find(|g| g.name == "go").unwrap();
+    assert_eq!(go.size, 5, "outer_p = inner(4) + i8");
+    // The literal packed type decodes with the same running-offset rule.
+    let gl = m.globals.iter().find(|g| g.name == "gl").unwrap();
+    assert_eq!(gl.size, 5);
+    let body = &m.funcs[0].blocks[0].insts;
+    match &body[0] {
+        Inst::Gep(g) => assert_eq!(g.k, 4, "field 1 starts right after the inner"),
+        other => panic!("expected Gep, got {other:?}"),
+    }
+}
+
+// Packed array elements stride by the packed size: an array of the 9-byte
+// config descriptor is 18 bytes, not 20.
+const PACKED_ARRAY: &str = r#"
+%struct.CD = type <{ i8, i8, i16, i8, i8, i8, i8, i8 }>
+@arr = dso_local global [2 x %struct.CD] zeroinitializer, align 1
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn strides_packed_struct_arrays_by_the_packed_size() {
+    let m = parse_ll(PACKED_ARRAY);
+    assert_eq!(m.globals[0].size, 18);
+}
