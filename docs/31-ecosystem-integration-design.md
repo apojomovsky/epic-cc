@@ -730,7 +730,11 @@ adopts eight `epic_serial_put_*` functions, and both toolchains share them; appl
 `#ifdef` between environments. `putch` remains on XC8 as the `printf` retarget for legacy
 firmware only. Two epic-cc gaps were found by probing the put shape and filed: string literal
 pointer args (#148) and local array allocas (#149), both panic loudly today, and neither
-changes the decision.
+changes the decision. **Extended 2026-08-28 by `apojomovsky/epic-hal#97`:** with #148 still
+open, `epic_serial_put_str` expands per call site on the epic-cc path (the literal is staged
+through an exact-size RAM copy, the `EPIC_HARNESS_LOG_STATIC` pattern), and a literal-only
+`printf(str)` shim maps onto it for XC8-era banner call sites; a `printf` with arguments is
+a compile error there, which keeps the variadic side at #131.
 
 **RAM headroom on the 877A: answered 2026-08-28 by the HAL-3 clusters.** `epic-hal#59`
 records the shelf-wide figures. Per module the overlay fits with room to the wall: the
