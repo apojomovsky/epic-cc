@@ -734,11 +734,13 @@ changes the decision.
 
 **RAM headroom on the 877A: answered 2026-08-28 by the HAL-3 clusters.** `epic-hal#59`
 records the shelf-wide figures. Per module the overlay fits with room to the wall: the
-harness slice high-waters at 83 B, `epic-tick` runs its target gate at 288/368 bytes,
+harness slice high-waters at 82 B (0x72), `epic-tick` runs its target gate at 288/368 bytes,
 `epic-serial` builds at 297/368. At whole-program scale the wall is real and arrives loudly,
-not silently: four of the eight PIC16 combos exceed the 352-byte GPR capacity, three of them
-by a single byte, each with a precise `alloc: GPR demand exceeds 0x1EF` panic. Per-combo XC8
-baselines and the exact epic-cc panics live in epic-hal's `docs/combo-epiccc-conformance.md`.
+not silently: four of the eight PIC16 combos exceed the GPR capacity, three of them by a
+single byte with a precise `alloc: GPR demand exceeds 0x1EF` panic, and encoder-tick by 25
+bin-packed bytes (`no arrangement of 16 globals fits p16f877a's 4 GPR bank window(s)`).
+Per-combo XC8 baselines and the exact epic-cc panics live in epic-hal's
+`docs/combo-epiccc-conformance.md`.
 
 **Section-attribute passthrough: confirmed 2026-08-20.** D-2 and D-4 rest on clang forwarding
 `__attribute__((section("...")))` verbatim into the `.ll`. Probed against the pinned clang 20.1.8
@@ -818,7 +820,8 @@ promoted to the `P2 gate` phase for that reason, and #117 covers the sibling gap
 
 **Closed 2026-08-28.** All nine clusters landed. On the 877A the pure logic and peripheral
 modules build as `__EPIC_CC__`-guarded slices, `epic-tick` passes its PORTB toggle gate on
-both devices in CI, and `epic-serial` ships the shared `put_*` surface. What remains is a
+both devices (the 16F887 gate runs in CI; both devices verified locally), and `epic-serial`
+ships the shared `put_*` surface. What remains is a
 list of filed compiler gaps with repros, not open questions: runtime pointer call args
 (#155, epic-taskmgr's dispatch), array allocas (#149), string literal pointer arguments
 (#148), `llvm.fshl` (#145), the const-table window (#121), and the PIC18 sdcard and
