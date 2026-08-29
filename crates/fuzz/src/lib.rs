@@ -3113,6 +3113,7 @@ fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayo
             "-emit-llvm",
             "-ffreestanding",
             "-nostdinc",
+            "-gline-tables-only",
             "-resource-dir",
             &resdir,
             "-o",

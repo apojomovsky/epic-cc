@@ -82,3 +82,25 @@ fn recursion_through_function_pointer_detected() {
     );
     let _ = build(&m);
 }
+
+/// A back edge reports the source location of the call that closes the
+/// cycle, resolved from the module's debug info (epic-cc#175).
+#[test]
+#[should_panic(expected = "f.c:3:7: callgraph: recursion detected (call cycle involving f)")]
+fn recursion_names_the_call_site() {
+    let mut m = parse("fn f(void) ()\n  block entry:\n    call void @f()\n    ret void\n");
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for i in &mut b.insts {
+                if let ir::Inst::Call(c) = i {
+                    c.loc = Some(ir::SrcLoc {
+                        file: "f.c".to_string(),
+                        line: 3,
+                        col: 7,
+                    });
+                }
+            }
+        }
+    }
+    let _ = build(&m);
+}

@@ -1,10 +1,14 @@
 //! Thin wrapper around the pinned clang invocation.
 //!
 //! The PIC front end is always `clang -target msp430 -O1 -S -emit-llvm
-//! -ffreestanding -nostdinc -resource-dir <resdir>`, that list is the
-//! input-format contract (docs/01 §-target, AGENTS.md). Duplicating it
-//! across `main.rs` and two dozen e2e tests is how a flag drift goes
-//! unnoticed. This module is the single source for those flags.
+//! -ffreestanding -nostdinc -gline-tables-only -resource-dir <resdir>`,
+//! that list is the input-format contract (docs/01 §-target, AGENTS.md).
+//! Duplicating it across `main.rs` and two dozen e2e tests is how a flag
+//! drift goes unnoticed. This module is the single source for those flags.
+//!
+//! `-gline-tables-only` rides in the contract: it adds line-table debug
+//! metadata that `irparse` resolves into the `file.c:line:col` of
+//! backend-stage panic messages, and nothing else the pipeline reads.
 //!
 //! Two layers:
 //! - `base_cmd` returns a `Command` pre-loaded with the fixed flags,
@@ -26,6 +30,7 @@ const BASE_ARGS: &[&str] = &[
     "-emit-llvm",
     "-ffreestanding",
     "-nostdinc",
+    "-gline-tables-only",
     "-resource-dir",
 ];
 
@@ -184,6 +189,7 @@ mod tests {
             "-emit-llvm",
             "-ffreestanding",
             "-nostdinc",
+            "-gline-tables-only",
             "-resource-dir",
         ] {
             assert!(dbg.contains(flag), "missing {flag} in {dbg}");

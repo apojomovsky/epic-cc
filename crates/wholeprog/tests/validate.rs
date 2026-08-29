@@ -33,7 +33,7 @@ fn main(void) ()
 #[test]
 #[should_panic(expected = "undefined symbols: alpha, beta")]
 fn lists_every_undefined_symbol_sorted() {
-    // Called in the order beta, alpha; reported sorted, because a BTreeSet
+    // Called in the order beta, alpha; reported sorted, because a BTreeMap
     // makes the diagnostic stable across runs.
     merge(parse(
         "\
@@ -72,4 +72,33 @@ fn main(void) ()
 ",
     ));
     assert_eq!(out.funcs.len(), 1);
+}
+
+/// With debug locations on the calls, each undefined symbol also names the
+/// call sites that reference it (epic-cc#175).
+#[test]
+#[should_panic(expected = "undefined symbols: from_b (called at main.c:3:3)")]
+fn undefined_symbol_names_its_call_site() {
+    let mut m = parse(
+        "\
+fn main(void) ()
+  block 0:
+    %1 = call i8 @from_b(i8 3)
+    ret void
+",
+    );
+    for f in &mut m.funcs {
+        for b in &mut f.blocks {
+            for i in &mut b.insts {
+                if let ir::Inst::Call(c) = i {
+                    c.loc = Some(ir::SrcLoc {
+                        file: "main.c".to_string(),
+                        line: 3,
+                        col: 3,
+                    });
+                }
+            }
+        }
+    }
+    merge(m);
 }
