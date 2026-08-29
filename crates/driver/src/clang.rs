@@ -189,6 +189,7 @@ mod tests {
             "-emit-llvm",
             "-ffreestanding",
             "-nostdinc",
+            "-gline-tables-only",
             "-resource-dir",
         ] {
             assert!(dbg.contains(flag), "missing {flag} in {dbg}");

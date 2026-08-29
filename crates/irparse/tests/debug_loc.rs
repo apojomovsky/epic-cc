@@ -92,3 +92,22 @@ define dso_local double @get() local_unnamed_addr #0 !dbg !6 {
 "#;
     let _ = parse_ll(src);
 }
+
+#[test]
+#[should_panic(expected = "t.c:2:1: irparse: unsupported param type token \"double\"")]
+fn param_type_panic_names_the_function_site() {
+    // A `double` param panics in parse_param, which sees the define's
+    // subprogram location, like the return-type path.
+    let src = r#"
+define dso_local void @f(double noundef %0) local_unnamed_addr #0 !dbg !6 {
+  ret void, !dbg !9
+}
+
+!0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !7, producer: "clang version 20.1.8", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly, unit: !0)
+!6 = distinct !DISubprogram(name: "f", scope: !7, file: !7, line: 2, type: !8, scopeLine: 2, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
+!7 = !DIFile(filename: "t.c", directory: "/x")
+!8 = !DISubroutineType(types: !{})
+!9 = !DILocation(line: 2, column: 25, scope: !6)
+"#;
+    let _ = parse_ll(src);
+}

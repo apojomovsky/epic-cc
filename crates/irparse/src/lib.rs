@@ -620,9 +620,10 @@ fn build_debug_info(src: &str) -> DebugInfoTable {
             scopes.insert(id, (f, l));
             continue;
         }
-        if let (Some(l), Some(c), Some(s)) =
-            (lineno, num_field(body, "column"), node_field(body, "scope"))
-        {
+        if let (Some(l), Some(s)) = (lineno, node_field(body, "scope")) {
+            // A column-less DILocation exists (a naked function's single
+            // location has no column); col 1 stands for the line start.
+            let c = num_field(body, "column").unwrap_or(1);
             locs.push((id, l, c, s));
         }
     }
@@ -679,26 +680,14 @@ fn node_field(body: &str, name: &str) -> Option<u32> {
 }
 
 /// The unescaped string value of `name: "..."` in a metadata node body.
+/// Escapes follow LLVM's printer (`\\`, `\"`, hex `\XX`), the same
+/// convention `unescape_llvm_asm` implements for asm strings.
 fn string_field(body: &str, name: &str) -> Option<String> {
     let key = format!("{name}: \"");
-    let mut rest = &body[body.find(&key)? + key.len()..];
-    let mut out = String::new();
-    while let Some(c) = rest.chars().next() {
-        match c {
-            '"' => return Some(out),
-            '\\' => {
-                let mut chars = rest.chars();
-                chars.next();
-                out.push(chars.next()?);
-                rest = &rest[2..];
-            }
-            c => {
-                out.push(c);
-                rest = &rest[c.len_utf8()..];
-            }
-        }
-    }
-    None
+    // Re-include the opening quote so the extractor sees a quoted span.
+    let rest = &body[body.find(&key)? + key.len() - 1..];
+    let (inner_raw, _) = extract_first_quoted(rest)?;
+    Some(unescape_llvm_asm(&inner_raw))
 }
 
 /// Build map `attributes #N -> inner content of { ... }` from `src`.
@@ -1877,7 +1866,10 @@ fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
                 {
                     // paren group / attr-group ref
                 } else {
-                    panic!("irparse: unsupported param type token {t:?} in {p:?}");
+                    panic!(
+                        "{}irparse: unsupported param type token {t:?} in {p:?}",
+                        loc_prefix(loc)
+                    );
                 }
             }
         }
