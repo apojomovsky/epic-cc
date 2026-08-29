@@ -111,3 +111,40 @@ define dso_local void @f(double noundef %0) local_unnamed_addr #0 !dbg !6 {
 "#;
     let _ = parse_ll(src);
 }
+
+#[test]
+fn location_through_lexical_block_resolves_its_file() {
+    // A DILocation may scope through a DILexicalBlock rather than
+    // straight to the subprogram; the file comes from the scope chain,
+    // which only type-keyed node classification can follow.
+    let src = r#"
+define dso_local i16 @main() local_unnamed_addr #0 !dbg !6 {
+  %1 = call i16 @helper(), !dbg !9
+  ret i16 %1, !dbg !10
+}
+
+!6 = distinct !DISubprogram(name: "main", scope: !7, file: !7, line: 1, type: !8, scopeLine: 1, spFlags: DISPFlagDefinition, unit: !0)
+!7 = !DIFile(filename: "t.c", directory: "/x")
+!8 = !DISubroutineType(types: !{})
+!9 = !DILocation(line: 2, column: 3, scope: !20)
+!20 = !DILexicalBlock(scope: !6, file: !7, line: 1, column: 1)
+"#;
+    let m = parse_ll(src);
+    let main = m.funcs.iter().find(|f| f.name == "main").unwrap();
+    let call = main.blocks[0]
+        .insts
+        .iter()
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c.loc.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        call,
+        Some(SrcLoc {
+            file: "t.c".to_string(),
+            line: 2,
+            col: 3
+        })
+    );
+}

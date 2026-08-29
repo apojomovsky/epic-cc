@@ -592,8 +592,14 @@ fn loc_prefix(loc: Option<&SrcLoc>) -> String {
 /// separate passes.
 fn build_debug_info(src: &str) -> DebugInfoTable {
     let mut files: HashMap<u32, String> = HashMap::new();
-    // Scope-like nodes (DISubprogram, DILexicalBlock, ...): id -> (file id, line).
-    let mut scopes: HashMap<u32, (u32, u32)> = HashMap::new();
+    // Any scope-like node: id -> its file's id. A DILocation resolves its
+    // file through its scope, which may be a DISubprogram or a nested
+    // DILexicalBlock/DILexicalBlockFile.
+    let mut scope_files: HashMap<u32, u32> = HashMap::new();
+    // DISubprograms: id -> (file id, line). These serve the define line's
+    // `!dbg`, which has no DILocation to point at.
+    let mut subs: HashMap<u32, (u32, u32)> = HashMap::new();
+    // DILocations: (id, line, column, scope).
     let mut locs: Vec<(u32, u32, u32, u32)> = Vec::new();
     for raw in src.lines() {
         let line = raw.trim();
@@ -608,28 +614,35 @@ fn build_debug_info(src: &str) -> DebugInfoTable {
         if let Some(r) = body.strip_prefix("distinct ") {
             body = r.trim();
         }
+        // Classify on the node type, not field presence: DISubprogram and
+        // the lexical blocks also carry `scope:`/`line:`, which would
+        // otherwise blur into the location shape.
         if body.starts_with("!DIFile(") {
             if let Some(f) = string_field(body, "filename") {
                 files.insert(id, f);
             }
-            continue;
-        }
-        let file = node_field(body, "file");
-        let lineno = num_field(body, "line");
-        if let (Some(f), Some(l)) = (file, lineno) {
-            scopes.insert(id, (f, l));
-            continue;
-        }
-        if let (Some(l), Some(s)) = (lineno, node_field(body, "scope")) {
-            // A column-less DILocation exists (a naked function's single
-            // location has no column); col 1 stands for the line start.
-            let c = num_field(body, "column").unwrap_or(1);
-            locs.push((id, l, c, s));
+        } else if body.starts_with("!DILocation(") {
+            if let (Some(l), Some(s)) = (num_field(body, "line"), node_field(body, "scope")) {
+                // A column-less DILocation exists (a naked function's
+                // single location has no column); col 1 stands for the
+                // line start.
+                let c = num_field(body, "column").unwrap_or(1);
+                locs.push((id, l, c, s));
+            }
+        } else if body.starts_with("!DISubprogram(") {
+            if let (Some(f), Some(l)) = (node_field(body, "file"), num_field(body, "line")) {
+                subs.insert(id, (f, l));
+                scope_files.insert(id, f);
+            }
+        } else if body.starts_with("!DILexicalBlock(") || body.starts_with("!DILexicalBlockFile(") {
+            if let Some(f) = node_field(body, "file") {
+                scope_files.insert(id, f);
+            }
         }
     }
     let mut table: DebugInfoTable = HashMap::new();
     for (id, l, c, s) in locs {
-        if let Some((f, _)) = scopes.get(&s) {
+        if let Some(f) = scope_files.get(&s) {
             if let Some(name) = files.get(f) {
                 table.insert(
                     id,
@@ -642,7 +655,7 @@ fn build_debug_info(src: &str) -> DebugInfoTable {
             }
         }
     }
-    for (id, (f, l)) in scopes {
+    for (id, (f, l)) in subs {
         if let Some(name) = files.get(&f) {
             // A define's `!dbg` names its subprogram, which has no
             // column; col 1 names the function's opening line.
