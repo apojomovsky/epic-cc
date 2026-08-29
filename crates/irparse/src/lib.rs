@@ -13,7 +13,7 @@
 use ir::{
     Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin,
     FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, IntToPtr, Load, MemLen, Memcpy,
-    Module, Param, Phi, Select, Sext, Store, Trunc, Ty, Val, Zext,
+    Module, Param, Phi, Select, Sext, SrcLoc, Store, Trunc, Ty, Val, Zext,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -51,7 +51,7 @@ fn strip_attrs(s: &str) -> String {
     out
 }
 
-fn ty_of(s: &str) -> Ty {
+fn ty_of(s: &str, loc: Option<&SrcLoc>) -> Ty {
     // Attribute-decorated operand types arrive whole (`ptr noundef`,
     // `range(i16 -255, 256)`): key off the leading type token.
     let base = s.split_whitespace().next().unwrap_or(s);
@@ -64,7 +64,10 @@ fn ty_of(s: &str) -> Ty {
         "float" | "f32" => Ty::F32,
         // An opaque `ptr` is a 16-bit address on this datalayout.
         "ptr" => Ty::I16,
-        other => panic!("SPIKE: unsupported type {other:?} (full {s:?})"),
+        other => panic!(
+            "{}SPIKE: unsupported type {other:?} (full {s:?})",
+            loc_prefix(loc)
+        ),
     }
 }
 
@@ -158,7 +161,7 @@ fn parse_array_elements(init: &str, elem: Ty) -> Vec<u8> {
         // Element tokens are type-prefixed (`i16 4660`, `float 0x...`);
         // the type must match the array's element type.
         let (val_tok, elt_ty) = match elt.split_once(' ') {
-            Some((t, v)) => (v.trim(), ty_of(t)),
+            Some((t, v)) => (v.trim(), ty_of(t, None)),
             None => (elt, elem),
         };
         assert_eq!(
@@ -302,7 +305,7 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
                 }
                 out
             } else {
-                parse_array_elements(value, ty_of(elem))
+                parse_array_elements(value, ty_of(elem, None))
             }
         } else {
             panic!("SPIKE LIMIT: array value {value:?} for type {ty:?}");
@@ -324,8 +327,8 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
     }
     // Scalar value: `i8 65`, `i16 -5`, `float 1.500000e+00`.
     let (_, v) = value.split_once(' ').unwrap_or(("", value));
-    let w = ty_of(ty).bytes() as usize;
-    match parse_val_typed(v.trim(), Some(ty_of(ty))) {
+    let w = ty_of(ty, None).bytes() as usize;
+    match parse_val_typed(v.trim(), Some(ty_of(ty, None))) {
         Val::Const(k) => {
             let uv = k as u64;
             (0..w).map(|i| ((uv >> (8 * i)) & 0xFF) as u8).collect()
@@ -556,6 +559,146 @@ fn extract_asm_strings(after_sideeffect: &str) -> Option<(String, String)> {
     let (t_raw, after_t) = extract_first_quoted(after_sideeffect)?;
     let (c_raw, _) = extract_first_quoted(&after_t)?;
     Some((t_raw, c_raw))
+}
+
+/// Resolved C source locations keyed by LLVM metadata node id, built from
+/// the `-gline-tables-only` nodes clang adds (`!DIFile`, `!DISubprogram`,
+/// `!DILocation`). Parse-time panics and `Call.loc` resolve their
+/// `file.c:line:col` through it.
+type DebugInfoTable = HashMap<u32, SrcLoc>;
+
+/// The `!dbg !N` id a define or instruction line carries, if any.
+fn dbg_id(s: &str) -> Option<u32> {
+    let pos = s.find("!dbg !")? + "!dbg !".len();
+    let tail = &s[pos..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    tail[..end].parse().ok()
+}
+
+/// Resolve a line's `!dbg !N` through the table.
+fn dbg_loc(s: &str, dbg: &DebugInfoTable) -> Option<SrcLoc> {
+    dbg_id(s).and_then(|id| dbg.get(&id).cloned())
+}
+
+/// `{file}:{line}:{col}: ` prefix for panics that carry a source location.
+fn loc_prefix(loc: Option<&SrcLoc>) -> String {
+    loc.map(|l| format!("{l}: ")).unwrap_or_default()
+}
+
+/// Build the table in one scan. Nodes reference files and scopes that may
+/// be defined later in the text, so collection and resolution are
+/// separate passes.
+fn build_debug_info(src: &str) -> DebugInfoTable {
+    let mut files: HashMap<u32, String> = HashMap::new();
+    // Scope-like nodes (DISubprogram, DILexicalBlock, ...): id -> (file id, line).
+    let mut scopes: HashMap<u32, (u32, u32)> = HashMap::new();
+    let mut locs: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for raw in src.lines() {
+        let line = raw.trim();
+        if !line.starts_with('!') {
+            continue;
+        }
+        let Some(eq) = line.find(" = ") else { continue };
+        let Ok(id) = line[1..eq].parse::<u32>() else {
+            continue;
+        };
+        let mut body = line[eq + 3..].trim();
+        if let Some(r) = body.strip_prefix("distinct ") {
+            body = r.trim();
+        }
+        if body.starts_with("!DIFile(") {
+            if let Some(f) = string_field(body, "filename") {
+                files.insert(id, f);
+            }
+            continue;
+        }
+        let file = node_field(body, "file");
+        let lineno = num_field(body, "line");
+        if let (Some(f), Some(l)) = (file, lineno) {
+            scopes.insert(id, (f, l));
+            continue;
+        }
+        if let (Some(l), Some(c), Some(s)) =
+            (lineno, num_field(body, "column"), node_field(body, "scope"))
+        {
+            locs.push((id, l, c, s));
+        }
+    }
+    let mut table: DebugInfoTable = HashMap::new();
+    for (id, l, c, s) in locs {
+        if let Some((f, _)) = scopes.get(&s) {
+            if let Some(name) = files.get(f) {
+                table.insert(
+                    id,
+                    SrcLoc {
+                        file: name.clone(),
+                        line: l,
+                        col: c,
+                    },
+                );
+            }
+        }
+    }
+    for (id, (f, l)) in scopes {
+        if let Some(name) = files.get(&f) {
+            // A define's `!dbg` names its subprogram, which has no
+            // column; col 1 names the function's opening line.
+            table.insert(
+                id,
+                SrcLoc {
+                    file: name.clone(),
+                    line: l,
+                    col: 1,
+                },
+            );
+        }
+    }
+    table
+}
+
+/// The integer value of `name: N` in a metadata node body.
+fn num_field(body: &str, name: &str) -> Option<u32> {
+    let key = format!("{name}: ");
+    let tail = &body[body.find(&key)? + key.len()..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    tail[..end].parse().ok()
+}
+
+/// The `!N` node id referenced by `name: !N` in a metadata node body.
+fn node_field(body: &str, name: &str) -> Option<u32> {
+    let key = format!("{name}: !");
+    let tail = &body[body.find(&key)? + key.len()..];
+    let end = tail
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(tail.len());
+    tail[..end].parse().ok()
+}
+
+/// The unescaped string value of `name: "..."` in a metadata node body.
+fn string_field(body: &str, name: &str) -> Option<String> {
+    let key = format!("{name}: \"");
+    let mut rest = &body[body.find(&key)? + key.len()..];
+    let mut out = String::new();
+    while let Some(c) = rest.chars().next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => {
+                let mut chars = rest.chars();
+                chars.next();
+                out.push(chars.next()?);
+                rest = &rest[2..];
+            }
+            c => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    None
 }
 
 /// Build map `attributes #N -> inner content of { ... }` from `src`.
@@ -971,7 +1114,13 @@ impl Fresh {
 /// flattened into one string (the aggregator ensures the closing `]` is
 /// present). The current function's `blocks` already contains the entry that
 /// holds the switch; this splices in fresh fallthrough blocks.
-fn lower_switch(blocks: &mut Vec<Block>, switch_text: &str, fresh: &mut Fresh) {
+fn lower_switch(
+    blocks: &mut Vec<Block>,
+    switch_text: &str,
+    fresh: &mut Fresh,
+    dbg: &DebugInfoTable,
+) {
+    let loc = dbg_loc(switch_text, dbg);
     let body = switch_text
         .trim_start()
         .strip_prefix("switch")
@@ -986,7 +1135,7 @@ fn lower_switch(blocks: &mut Vec<Block>, switch_text: &str, fresh: &mut Fresh) {
     let cond_ty_tok = cond_it
         .next()
         .unwrap_or_else(|| panic!("irparse: malformed switch cond {switch_text:?}"));
-    let cond_ty = ty_of(cond_ty_tok);
+    let cond_ty = ty_of(cond_ty_tok, loc.as_ref());
     let cond_val_tok = cond_it
         .next()
         .unwrap_or_else(|| panic!("irparse: malformed switch cond value {switch_text:?}"));
@@ -1027,7 +1176,7 @@ fn lower_switch(blocks: &mut Vec<Block>, switch_text: &str, fresh: &mut Fresh) {
                 panic!("irparse: malformed switch case ty {rest:?} in {switch_text:?}")
             });
             let ty_tok = rest[..ty_end].trim();
-            let ty = ty_of(ty_tok);
+            let ty = ty_of(ty_tok, loc.as_ref());
             rest = rest[ty_end..].trim_start();
             let comma = rest.find(',').unwrap_or_else(|| {
                 panic!("irparse: malformed switch case missing ',' {rest:?} in {switch_text:?}")
@@ -1135,6 +1284,7 @@ fn parse_select_arm(
     types: &StructTypes,
     fresh: &mut Fresh,
     out: &mut Vec<Inst>,
+    loc: Option<&SrcLoc>,
 ) -> Val {
     let part = part.trim();
     if part.contains("inttoptr") {
@@ -1175,7 +1325,7 @@ fn parse_select_arm(
         Val::Reg(n)
     } else {
         let mut it = part.split_whitespace();
-        let ty = ty_of(it.next().unwrap());
+        let ty = ty_of(it.next().unwrap(), loc);
         parse_val_typed(it.next().unwrap(), Some(ty))
     }
 }
@@ -1214,6 +1364,7 @@ fn parse_value_with_gep(
     types: &StructTypes,
     fresh: &mut Fresh,
     out: &mut Vec<Inst>,
+    loc: Option<&SrcLoc>,
 ) -> Val {
     let s = raw.trim();
     if s.contains("inttoptr") {
@@ -1258,7 +1409,7 @@ fn parse_value_with_gep(
             .split_whitespace()
             .next()
             .unwrap();
-        let to = ty_of(to_tok);
+        let to = ty_of(to_tok, loc);
         match gep_reg {
             Val::Reg(r) => {
                 let n = fresh.reg();
@@ -1576,14 +1727,20 @@ fn parse_base(
 }
 
 /// Parse one call argument (may carry an inlined GEP, byval, or sret).
-fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec<Inst>) -> CallArg {
+fn parse_call_arg(
+    a: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    out: &mut Vec<Inst>,
+    loc: Option<&SrcLoc>,
+) -> CallArg {
     let a = a.trim();
     if a.contains("getelementptr") {
         let ty_tok = a.split_whitespace().next().unwrap();
         let ty = if ty_tok == "ptr" {
             None
         } else {
-            Some(ty_of(ty_tok))
+            Some(ty_of(ty_tok, loc))
         };
         let gpos = a.find("getelementptr").unwrap();
         let gsrc = &a[gpos + "getelementptr".len()..];
@@ -1632,7 +1789,7 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
             }
             match t.as_str() {
                 "ptr" => {}
-                "i1" | "i8" | "i16" | "i32" | "float" | "f32" => ty = Some(ty_of(t)),
+                "i1" | "i8" | "i16" | "i32" | "float" | "f32" => ty = Some(ty_of(t, loc)),
                 "align" => skip_next = true,
                 "noundef" | "nonnull" | "noalias" | "nocapture" | "readonly" | "writeonly"
                 | "writable" | "dead_on_unwind" | "immarg" | "zeroext" | "signext" => {}
@@ -1683,7 +1840,7 @@ fn parse_call_arg(a: &str, types: &StructTypes, fresh: &mut Fresh, out: &mut Vec
 /// all LLVM attrs (`dead_on_unwind`, `noalias`, `nocapture`, `writable`,
 /// `writeonly`, `readonly`, `nonnull`, `align`, `initializes(...)`, ...)
 /// stripped. `byval(%X)`/`sret(%X)` sizes come from the struct table.
-fn parse_param(p: &str, types: &StructTypes) -> Param {
+fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
     let toks = tokenize_parens(p);
     let mut scalar = None;
     let mut byval = None;
@@ -1700,7 +1857,7 @@ fn parse_param(p: &str, types: &StructTypes) -> Param {
             | "readonly" | "readnone" | "nonnull" | "noundef" | "zeroext" | "signext"
             | "immarg" | "sret" | "byval" | "returned" | "..." => {}
             "align" => skip_next = true,
-            "i1" | "i8" | "i16" | "i32" | "float" | "f32" => scalar = Some(ty_of(t)),
+            "i1" | "i8" | "i16" | "i32" | "float" | "f32" => scalar = Some(ty_of(t, loc)),
             _ => {
                 if let Some(rest) = t.strip_prefix("byval(") {
                     let inner = rest.trim_end_matches(')');
@@ -1751,6 +1908,7 @@ pub fn parse_ll(src: &str) -> Module {
     let types = build_struct_table(src);
     let mut fresh = Fresh::new(src);
     let attr_map = build_attr_map(src);
+    let dbg = build_debug_info(src);
 
     let mut globals = Vec::new();
     let mut funcs = Vec::new();
@@ -1872,7 +2030,7 @@ pub fn parse_ll(src: &str) -> Module {
                     };
                     (Ty::I8, size as u16, bytes)
                 } else {
-                    let elem = ty_of(elem_str);
+                    let elem = ty_of(elem_str, None);
                     let size = n * elem.bytes() as usize;
                     if is_const {
                         assert!(
@@ -1941,7 +2099,7 @@ pub fn parse_ll(src: &str) -> Module {
                 };
                 (Ty::I8, size, bytes)
             } else {
-                let ty = ty_of(rest.split_whitespace().next().unwrap());
+                let ty = ty_of(rest.split_whitespace().next().unwrap(), None);
                 (ty, u16::from(ty.bytes()), Vec::new())
             };
             let addr = line
@@ -1972,10 +2130,11 @@ pub fn parse_ll(src: &str) -> Module {
             let head = strip_attrs(&line[..at]);
             let isr = head.split_whitespace().any(|t| t == "msp430_intrcc");
             let ret_tok = head.split_whitespace().last().unwrap().to_string();
+            let fn_loc = dbg_loc(line, &dbg);
             let ret = if ret_tok == "void" {
                 None
             } else {
-                Some(ty_of(&ret_tok))
+                Some(ty_of(&ret_tok, fn_loc.as_ref()))
             };
 
             // naked detection: suffix after `)` up to `{`, plus attribute map
@@ -1994,7 +2153,7 @@ pub fn parse_ll(src: &str) -> Module {
                 if p.is_empty() || p == "..." {
                     continue;
                 }
-                params.push(parse_param(p, &types));
+                params.push(parse_param(p, &types, fn_loc.as_ref()));
             }
 
             // The unlabelled entry block shares LLVM's unnamed-value counter with
@@ -2062,11 +2221,11 @@ pub fn parse_ll(src: &str) -> Module {
                                 continue;
                             }
                             if pl.trim_start().starts_with("switch") {
-                                lower_switch(&mut blocks, pl, &mut fresh);
+                                lower_switch(&mut blocks, pl, &mut fresh, &dbg);
                                 continue;
                             }
                             // Labels inside single-line bodies are not expected
-                            let insts = parse_inst(pl, &types, &mut fresh);
+                            let insts = parse_inst(pl, &types, &mut fresh, &dbg);
                             blocks.last_mut().unwrap().insts.extend(insts);
                         }
                         handled_inline = true;
@@ -2111,7 +2270,7 @@ pub fn parse_ll(src: &str) -> Module {
                                     break;
                                 }
                             }
-                            lower_switch(&mut blocks, &switch_text, &mut fresh);
+                            lower_switch(&mut blocks, &switch_text, &mut fresh, &dbg);
                         } else if let Some(colon) = l.find(':') {
                             let head = &l[..colon];
                             if !head.is_empty()
@@ -2125,11 +2284,11 @@ pub fn parse_ll(src: &str) -> Module {
                                     insts: Vec::new(),
                                 });
                             } else {
-                                let insts = parse_inst(l, &types, &mut fresh);
+                                let insts = parse_inst(l, &types, &mut fresh, &dbg);
                                 blocks.last_mut().unwrap().insts.extend(insts);
                             }
                         } else {
-                            let insts = parse_inst(l, &types, &mut fresh);
+                            let insts = parse_inst(l, &types, &mut fresh, &dbg);
                             blocks.last_mut().unwrap().insts.extend(insts);
                         }
                     }
@@ -2155,7 +2314,11 @@ pub fn parse_ll(src: &str) -> Module {
                         }
                         continue;
                     }
-                    if l == "unreachable" {
+                    // clang attaches a `, !dbg !N` location to the naked
+                    // function's trailing `unreachable` under
+                    // `-gline-tables-only`; it stays a terminator, not an
+                    // opcode.
+                    if l == "unreachable" || l.starts_with("unreachable, !") {
                         if has_trailing_brace {
                             break;
                         }
@@ -2190,13 +2353,13 @@ pub fn parse_ll(src: &str) -> Module {
                                 break;
                             }
                         }
-                        lower_switch(&mut blocks, &switch_text, &mut fresh);
+                        lower_switch(&mut blocks, &switch_text, &mut fresh, &dbg);
                         if has_trailing_brace {
                             break;
                         }
                         continue;
                     }
-                    let insts = parse_inst(l, &types, &mut fresh);
+                    let insts = parse_inst(l, &types, &mut fresh, &dbg);
                     blocks.last_mut().unwrap().insts.extend(insts);
                     if has_trailing_brace {
                         break;
@@ -2224,7 +2387,12 @@ pub fn parse_ll(src: &str) -> Module {
 /// Returns a `Vec` because inlined GEP operands materialize a synthetic Gep
 /// inst before the consuming instruction, and `llvm.lifetime.*` calls
 /// produce nothing.
-fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
+fn parse_inst(
+    line: &str,
+    types: &StructTypes,
+    fresh: &mut Fresh,
+    dbg: &DebugInfoTable,
+) -> Vec<Inst> {
     // Lift `call ... asm sideeffect "template", "constraints"(...)` into
     // `Inst::Asm`. This must run before the generic `call` handling, since
     // the `asm` form is a `call` with an `asm` callee.
@@ -2352,6 +2520,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         return Vec::new();
     }
 
+    let cur = dbg_loc(line, dbg);
     // Drop trailing metadata: ", !tbaa !2" / ", !llvm.loop !5"
     let line = match line.find(", !") {
         Some(i) => &line[..i],
@@ -2401,7 +2570,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     .unwrap_or_else(|| panic!("irparse: unknown alloca type {ty_tok}"))
                     .size
             } else {
-                ty_of(ty_tok).bytes()
+                ty_of(ty_tok, cur.as_ref()).bytes()
             };
             out.push(Inst::Alloca(Alloca {
                 dst: dst.unwrap(),
@@ -2410,7 +2579,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         }
         "load" => {
             let args = split_top_level(&rest["load".len()..], ',');
-            let ty = ty_of(strip_attrs(args[0]).trim());
+            let ty = ty_of(strip_attrs(args[0]).trim(), cur.as_ref());
             let ptr = parse_ptr_operand(args[1], types, fresh, &mut out);
             out.push(Inst::Load(Load {
                 dst: dst.unwrap(),
@@ -2422,7 +2591,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let args = split_top_level(&rest["store".len()..], ',');
             let a0 = strip_attrs(args[0]);
             let mut it = a0.trim().split_whitespace();
-            let ty = ty_of(it.next().unwrap());
+            let ty = ty_of(it.next().unwrap(), cur.as_ref());
             let val = parse_val_typed(it.next().unwrap(), Some(ty));
             let ptr = parse_ptr_operand(args[1], types, fresh, &mut out);
             out.push(Inst::Store(Store { ty, val, ptr }));
@@ -2495,7 +2664,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     if ap.is_empty() {
                         continue;
                     }
-                    args.push(parse_call_arg(ap, types, fresh, &mut out));
+                    args.push(parse_call_arg(ap, types, fresh, &mut out, cur.as_ref()));
                 }
                 let first = head.trim();
                 // Return type is the first type token in the head, skipping
@@ -2519,7 +2688,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 let ty = if ret_tok == "void" {
                     None
                 } else {
-                    Some(ty_of(&ret_tok))
+                    Some(ty_of(&ret_tok, cur.as_ref()))
                 };
                 out.push(Inst::Call(Call {
                     dst,
@@ -2527,6 +2696,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     func,
                     args,
                     callees: Vec::new(),
+                    loc: cur.clone(),
                 }));
             }
         }
@@ -2565,7 +2735,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 out.push(Inst::Ret(None));
             } else {
                 let mut it = body.split_whitespace();
-                let ty = ty_of(it.next().unwrap());
+                let ty = ty_of(it.next().unwrap(), cur.as_ref());
                 out.push(Inst::Ret(Some((
                     ty,
                     parse_val_typed(it.next().unwrap(), Some(ty)),
@@ -2578,14 +2748,14 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             // A pointer-typed phi prints with a `ptr` type token; ty_of maps
             // that to Ty::I16, so the token is captured before the erasure.
             let ptr = ty_tok == "ptr";
-            let ty = ty_of(&ty_tok);
+            let ty = ty_of(&ty_tok, cur.as_ref());
             let mut incoming = Vec::new();
             for part in body.split('[').skip(1) {
                 let inner = part.split(']').next().unwrap();
                 let pair = split_top_level(inner, ',');
                 let val_str = pair[0].trim();
                 let lbl_str = pair[1].trim();
-                let v = parse_value_with_gep(val_str, ty, types, fresh, &mut out);
+                let v = parse_value_with_gep(val_str, ty, types, fresh, &mut out, cur.as_ref());
                 let lbl = lbl_str
                     .trim()
                     .trim_start_matches("label")
@@ -2618,6 +2788,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     .split_whitespace()
                     .next()
                     .unwrap(),
+                cur.as_ref(),
             );
             let (from, val) = if lhs.contains("getelementptr") {
                 let first = lhs
@@ -2625,7 +2796,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     .next()
                     .unwrap()
                     .trim_start_matches('(');
-                let from = ty_of(first);
+                let from = ty_of(first, cur.as_ref());
                 let v = materialize_gep_val(lhs, types, fresh, &mut out);
                 (from, v)
             } else {
@@ -2635,7 +2806,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                     .unwrap()
                     .trim_start_matches('(')
                     .trim_end_matches(')');
-                let from = ty_of(first);
+                let from = ty_of(first, cur.as_ref());
                 let tok = it
                     .next()
                     .unwrap_or(first)
@@ -2675,9 +2846,9 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             let to_i = body.rfind(" to ").unwrap();
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
             let mut it = lhs.split_whitespace();
-            let from = ty_of(it.next().unwrap());
+            let from = ty_of(it.next().unwrap(), cur.as_ref());
             let val = parse_val_typed(it.next().unwrap(), Some(from));
-            let to = ty_of(rhs);
+            let to = ty_of(rhs, cur.as_ref());
             out.push(Inst::IntToPtr(IntToPtr {
                 dst: dst.unwrap(),
                 from,
@@ -2695,7 +2866,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             if !PREDS.contains(&pred.as_str()) {
                 panic!("SPIKE: unsupported icmp predicate {pred:?} in line: {line}");
             }
-            let ty = ty_of(it.next().unwrap());
+            let ty = ty_of(it.next().unwrap(), cur.as_ref());
             let a = parse_val_typed(it.next().unwrap(), Some(ty));
             let b = parse_val_typed(it.next().unwrap(), Some(ty));
             out.push(Inst::Icmp(Icmp {
@@ -2727,12 +2898,12 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 t.starts_with('@') || t.starts_with("getelementptr") || t.starts_with("inttoptr")
             };
             let ptr = arm_is_const_ptr(&parts[1]) && arm_is_const_ptr(&parts[2]);
-            let a = parse_select_arm(&parts[1], types, fresh, &mut out);
-            let b = parse_select_arm(&parts[2], types, fresh, &mut out);
+            let a = parse_select_arm(&parts[1], types, fresh, &mut out, cur.as_ref());
+            let b = parse_select_arm(&parts[2], types, fresh, &mut out, cur.as_ref());
             let ty = if ptr {
                 Ty::I16
             } else {
-                ty_of(parts[1].split_whitespace().next().unwrap())
+                ty_of(parts[1].split_whitespace().next().unwrap(), cur.as_ref())
             };
             out.push(Inst::Select(Select {
                 dst: dst.unwrap(),
@@ -2761,9 +2932,9 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or_else(|| panic!("irparse: malformed binop operand {first:?}"));
             let ty_tok = first[..sp].trim();
-            let ty = ty_of(ty_tok);
+            let ty = ty_of(ty_tok, cur.as_ref());
             let val_str_a = first[sp..].trim();
-            let a = parse_value_with_gep(val_str_a, ty, types, fresh, &mut out);
+            let a = parse_value_with_gep(val_str_a, ty, types, fresh, &mut out, cur.as_ref());
             let second_raw = parts[1].trim();
             let b = if second_raw
                 .split_whitespace()
@@ -2774,15 +2945,15 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             {
                 let sp2 = second_raw.find(|c: char| c.is_whitespace()).unwrap();
                 let ty2_tok = second_raw[..sp2].trim();
-                let ty2 = ty_of(ty2_tok);
+                let ty2 = ty_of(ty2_tok, cur.as_ref());
                 assert_eq!(
                     ty, ty2,
                     "irparse: binop {op} operand types mismatch {ty:?} vs {ty2:?} in {line:?}"
                 );
                 let val_str_b = second_raw[sp2..].trim();
-                parse_value_with_gep(val_str_b, ty, types, fresh, &mut out)
+                parse_value_with_gep(val_str_b, ty, types, fresh, &mut out, cur.as_ref())
             } else {
-                parse_value_with_gep(second_raw, ty, types, fresh, &mut out)
+                parse_value_with_gep(second_raw, ty, types, fresh, &mut out, cur.as_ref())
             };
             let o = match op.as_str() {
                 "add" => BinOp::Add,
@@ -2810,7 +2981,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         "freeze" => {
             let body = strip_attrs(&rest[op.len()..]);
             let mut it = body.split_whitespace();
-            let ty = ty_of(it.next().unwrap());
+            let ty = ty_of(it.next().unwrap(), cur.as_ref());
             let val = parse_val_typed(it.next().unwrap(), Some(ty));
             out.push(Inst::Freeze(ir::Freeze {
                 dst: dst.unwrap(),
@@ -2821,7 +2992,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
         "fadd" | "fsub" | "fmul" | "fdiv" => {
             let body = strip_attrs(&rest[op.len()..]);
             let mut it = body.split_whitespace();
-            let ty = ty_of(it.next().unwrap());
+            let ty = ty_of(it.next().unwrap(), cur.as_ref());
             assert!(
                 ty == Ty::F32,
                 "irparse: float binop {op} must be f32, got {ty:?}"
@@ -2852,7 +3023,7 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             if !FPREDS.contains(&pred.as_str()) {
                 panic!("SPIKE: unsupported fcmp predicate {pred:?} in line: {line}");
             }
-            let ty = ty_of(it.next().unwrap());
+            let ty = ty_of(it.next().unwrap(), cur.as_ref());
             assert!(ty == Ty::F32, "irparse: fcmp must be f32, got {ty:?}");
             let a = parse_val_typed(it.next().unwrap(), Some(ty));
             let b = parse_val_typed(it.next().unwrap(), Some(ty));
@@ -2870,9 +3041,9 @@ fn parse_inst(line: &str, types: &StructTypes, fresh: &mut Fresh) -> Vec<Inst> {
             });
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
             let mut it = lhs.split_whitespace();
-            let from = ty_of(it.next().unwrap());
+            let from = ty_of(it.next().unwrap(), cur.as_ref());
             let val = parse_val_typed(it.next().unwrap(), Some(from));
-            let to = ty_of(rhs);
+            let to = ty_of(rhs, cur.as_ref());
             let o = match op.as_str() {
                 "fptosi" => FloatConvOp::FpToSi,
                 "fptoui" => FloatConvOp::FpToUi,

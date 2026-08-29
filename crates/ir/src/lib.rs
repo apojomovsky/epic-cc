@@ -125,6 +125,22 @@ pub struct Select {
     /// selects (i1/i8/i16/f32), which both backends lower as a copy.
     pub ptr: bool,
 }
+/// A C source location for diagnostics: the `file.c:line:col` of the user
+/// construct a panic refers to. Resolved in `irparse` from clang's
+/// `-gline-tables-only` metadata; `col` is 1 for line-level scopes that
+/// carry no column (a define's `!dbg` subprogram).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SrcLoc {
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+impl std::fmt::Display for SrcLoc {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.file, self.line, self.col)
+    }
+}
+
 /// A call argument. `ty` is `None` for pointer (`ptr`) args (byval/sret),
 /// `Some` for scalar args. `byval`/`sret` are the phase-3 call ABI flags.
 #[derive(Clone, Debug, PartialEq)]
@@ -145,6 +161,12 @@ pub struct Call {
     /// `func`. Filled by `legalize` from the whole-program address-taken
     /// set; the canonical text round-trips it.
     pub callees: Vec<String>,
+    /// Source location of the call in the user's C, when the module was
+    /// parsed from debug-info-carrying LLVM IR. `None` means compiler
+    /// generated: legalize's runtime routines, or a canonical-text
+    /// reparse. Diagnostics read it; the backend ignores it and the
+    /// canonical text does not carry it.
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Br {
@@ -1258,6 +1280,7 @@ fn parse_inst(line: &str) -> Inst {
             func,
             args,
             callees,
+            loc: None,
         });
     }
     // defining instruction: %d = op ...
@@ -1278,6 +1301,7 @@ fn parse_inst(line: &str) -> Inst {
             func,
             args,
             callees,
+            loc: None,
         });
     }
     if let Some(rest) = body.strip_prefix("alloca ") {

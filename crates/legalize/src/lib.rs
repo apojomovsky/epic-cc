@@ -578,6 +578,7 @@ fn lower_fbin(b: &ir::FloatBin, used: &mut Vec<String>) -> Inst {
             },
         ],
         callees: Vec::new(),
+        loc: None,
     })
 }
 
@@ -610,6 +611,7 @@ fn lower_fcmp(c: &ir::Fcmp, used: &mut Vec<String>, names: &mut FreshNames) -> V
             },
         ],
         callees: Vec::new(),
+        loc: None,
     })];
     insts.extend(fcmp_tree(&c.pred, &call_dst, &c.dst, names));
     insts
@@ -713,6 +715,7 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
             func: mark("__fptosi_f32", used),
             args: vec![CallArg { ty: Some(Ty::F32), val: c.val.clone(), byval: None, sret: false }],
             callees: Vec::new(),
+            loc: None,
         }),
         (FloatConvOp::FpToUi, Ty::F32, to @ (Ty::I8 | Ty::I16 | Ty::I32)) => Inst::Call(Call {
             dst,
@@ -720,6 +723,7 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
             func: mark("__fptoui_f32", used),
             args: vec![CallArg { ty: Some(Ty::F32), val: c.val.clone(), byval: None, sret: false }],
             callees: Vec::new(),
+            loc: None,
         }),
         (FloatConvOp::SiToFp, from @ (Ty::I8 | Ty::I16 | Ty::I32), Ty::F32) => Inst::Call(Call {
             dst,
@@ -727,6 +731,7 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
             func: mark("__sitofp_f32", used),
             args: vec![CallArg { ty: Some(from), val: c.val.clone(), byval: None, sret: false }],
             callees: Vec::new(),
+            loc: None,
         }),
         (FloatConvOp::UiToFp, from @ (Ty::I8 | Ty::I16 | Ty::I32), Ty::F32) => Inst::Call(Call {
             dst,
@@ -734,6 +739,7 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
             func: mark("__uitofp_f32", used),
             args: vec![CallArg { ty: Some(from), val: c.val.clone(), byval: None, sret: false }],
             callees: Vec::new(),
+            loc: None,
         }),
         (FloatConvOp::Fpext | FloatConvOp::Fptrunc, Ty::F32, Ty::F32) => {
             Inst::Freeze(ir::Freeze { dst: c.dst.clone(), ty: Ty::F32, val: c.val.clone() })
@@ -1833,6 +1839,7 @@ fn lower_bin(b: &ir::Bin, used: &mut Vec<String>) -> Option<Inst> {
             },
         ],
         callees: Vec::new(),
+        loc: None,
     }))
 }
 
