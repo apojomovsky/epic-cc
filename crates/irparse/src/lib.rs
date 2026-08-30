@@ -918,7 +918,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
         let mut pit = inner.splitn(2, "x").map(|x| x.trim());
         let n_str = pit.next().unwrap_or_else(|| {
             panic!(
-                "{}irparse: malformed array type {t:?} (expected "[N x T]")",
+                "{}irparse: malformed array type {t:?} (expected \"[N x T]\")",
                 loc_prefix(loc)
             )
         });
@@ -930,7 +930,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
         });
         let elem = pit.next().unwrap_or_else(|| {
             panic!(
-                "{}irparse: malformed array type {t:?} (expected "[N x T]")",
+                "{}irparse: malformed array type {t:?} (expected \"[N x T]\")",
                 loc_prefix(loc)
             )
         });
@@ -976,7 +976,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
             "i1" | "i8" => (1, 1),
             "i16" | "ptr" => (2, 2),
             "i32" | "float" | "f32" => (4, 2),
-            other => panic!("{}irparse: unsupported type {other:?}", loc_prefix(loc)),
+            other => panic!("{}SPIKE: unsupported type {other:?}", loc_prefix(loc)),
         }
     }
 }
