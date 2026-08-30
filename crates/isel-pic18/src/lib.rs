@@ -1308,20 +1308,26 @@ impl<'m> Gen<'m> {
                     !matches!(t.val, Val::Const(_)),
                     "isel-pic18: const source Trunc not yet supported"
                 );
-                // Mirrors `isel`'s own width guard (`crates/isel/src/lib.rs`,
-                // "isel: trunc must narrow")  -  without it, a malformed
-                // `Trunc` with `to.bytes() >= from.bytes()` would read
-                // `to.bytes()` bytes starting at `src` below, past the end
-                // of the (narrower) source slot, and copy that overrun into
-                // the destination.
+                // `Ty::I1` and `Ty::I8` are both 1 byte, so byte widths alone
+                // do not separate `trunc i8 -> i1` (narrowing) from a
+                // non-narrowing trunc. Mirrors `isel` ("isel: trunc must
+                // narrow").
                 assert!(
-                    t.to.bytes() < t.from.bytes(),
+                    t.from.bytes() > t.to.bytes() || (t.to == Ty::I1 && t.from != Ty::I1),
                     "isel-pic18: trunc must narrow (to must be strictly smaller than from)"
                 );
                 let src = self.val_addr(&t.val).direct();
                 let dst = self.slot_addr(self.cur_func, &t.dst).direct();
                 for i in 0..t.to.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+                if t.to == Ty::I1 {
+                    // Every `i1` consumer tests the whole byte for nonzero,
+                    // so high bits must be cleared: `0x02` is false.
+                    self.emit("    MOVLW 0x01".to_string());
+                    let (a, f) = self.operand(dst);
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    ANDWF 0x{f:03X},F,{bank}"));
                 }
             }
             Inst::Select(s) => {
