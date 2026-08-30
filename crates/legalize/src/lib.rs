@@ -87,7 +87,7 @@ pub fn legalize(m: Module) -> Module {
                             // icmp/select tree; an unknown intrinsic panics
                             // loudly so a new one surfaces as a clear error
                             // instead of a hole the assembler never sees.
-                            insts.extend(lower_intrinsic(&c, &mut names));
+                            insts.extend(lower_intrinsic(&c, &mut names, &mut used));
                         } else {
                             insts.push(Inst::Call(c));
                         }
@@ -755,7 +755,7 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
 /// Width-parametric (i8/i16/i32) via byte-generic isel. Abs flag
 /// ignored (wraps INT_MIN for false, poison allows any value for true).
 /// Unknown `llvm.*` panics loudly.
-fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
+fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<String>) -> Vec<Inst> {
     let dst = c
         .dst
         .clone()
@@ -886,14 +886,15 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
                 }),
             ]
         }
-        "llvm.fshl.i8" | "llvm.fshl.i16" | "llvm.fshl.i32"
-        | "llvm.fshr.i8" | "llvm.fshr.i16" | "llvm.fshr.i32" => {
+        "llvm.fshl.i8" | "llvm.fshl.i16" | "llvm.fshl.i32" | "llvm.fshr.i8" | "llvm.fshr.i16"
+        | "llvm.fshr.i32" => {
             // Funnel-shift: fshl(a,b,c) = (a << (c mod N)) | (b >> ((N - (c mod N)) mod N))
             // with the 0-shift guard so the complementary shift is 0 not N.
-            // Lower to: shift = c & (N-1), shl/lshr, sub, lshr/shl, select, or.
-            // The Bin shl/lshr will later be inlined (const count) or become
-            // __shl/__lshr calls (reg count) in the same legalize pass; the
-            // extra ops (and/sub/select/or) stay as Bin/Icmp/Select.
+            // For a const shift the masked count is const-folded so the two
+            // funnel shifts stay as Bin with Const (isel inlines them). For a
+            // variable shift the counts are Reg and must be Calls
+            // (__shl/__lshr), as the main legalize loop does not re-run on the
+            // Bins we create here, so we emit Calls directly.
             let a = c.args[0].val.clone();
             let b = c.args[1].val.clone();
             let sh = c.args[2].val.clone();
@@ -904,67 +905,215 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
                 Ty::I32 => 32,
                 _ => panic!("legalize: {} unsupported type {ty:?}", c.func),
             };
-            let mask = Val::Const(i64::from(width - 1));
-            let width_val = Val::Const(i64::from(width));
+            let width_i64 = i64::from(width);
+            let mask_i64 = i64::from(width - 1);
+            let mut insts: Vec<Inst> = Vec::new();
+            if let Val::Const(c) = sh.clone() {
+                let sh_masked_c = c & mask_i64;
+                let sub_c = (width_i64 - sh_masked_c) & mask_i64;
+                let sh_val = Val::Const(sh_masked_c);
+                let sub_val = Val::Const(sub_c);
+                let shl_dst = names.fresh();
+                let shr_dst = names.fresh();
+                if is_fshl {
+                    insts.push(Inst::Bin(ir::Bin {
+                        dst: shl_dst.clone(),
+                        op: BinOp::Shl,
+                        ty,
+                        a: a.clone(),
+                        b: sh_val,
+                    }));
+                    if sh_masked_c == 0 {
+                        insts.push(Inst::Freeze(ir::Freeze {
+                            dst: shr_dst.clone(),
+                            ty,
+                            val: Val::Const(0),
+                        }));
+                    } else {
+                        insts.push(Inst::Bin(ir::Bin {
+                            dst: shr_dst.clone(),
+                            op: BinOp::LShr,
+                            ty,
+                            a: b.clone(),
+                            b: sub_val,
+                        }));
+                    }
+                } else {
+                    insts.push(Inst::Bin(ir::Bin {
+                        dst: shr_dst.clone(),
+                        op: BinOp::LShr,
+                        ty,
+                        a: a.clone(),
+                        b: sh_val,
+                    }));
+                    if sh_masked_c == 0 {
+                        insts.push(Inst::Freeze(ir::Freeze {
+                            dst: shl_dst.clone(),
+                            ty,
+                            val: Val::Const(0),
+                        }));
+                    } else {
+                        insts.push(Inst::Bin(ir::Bin {
+                            dst: shl_dst.clone(),
+                            op: BinOp::Shl,
+                            ty,
+                            a: b.clone(),
+                            b: sub_val,
+                        }));
+                    }
+                }
+                insts.push(Inst::Bin(ir::Bin {
+                    dst,
+                    op: BinOp::Or,
+                    ty,
+                    a: Val::Reg(shl_dst),
+                    b: Val::Reg(shr_dst),
+                }));
+                return insts;
+            }
             let sh_masked = names.fresh();
-            let shl_dst = names.fresh();
             let sub_dst = names.fresh();
+            let shl_dst = names.fresh();
             let shr_dst = names.fresh();
             let shr_sel = names.fresh();
             let is_zero = names.fresh();
-            // sh_masked = sh & (width-1)  (modulo width)
-            // sub = width - sh_masked
-            // shl/lshr pair swapped for fshl vs fshr
-            let mut insts = Vec::new();
             insts.push(Inst::Bin(ir::Bin {
                 dst: sh_masked.clone(),
-                op: ir::BinOp::And,
+                op: BinOp::And,
                 ty,
                 a: sh.clone(),
-                b: mask,
+                b: Val::Const(mask_i64),
             }));
             insts.push(Inst::Bin(ir::Bin {
                 dst: sub_dst.clone(),
-                op: ir::BinOp::Sub,
+                op: BinOp::Sub,
                 ty,
-                a: width_val,
+                a: Val::Const(width_i64),
                 b: Val::Reg(sh_masked.clone()),
             }));
             if is_fshl {
-                // fshl: (a << sh) | (b >> (width - sh))
-                insts.push(Inst::Bin(ir::Bin {
-                    dst: shl_dst.clone(),
-                    op: ir::BinOp::Shl,
-                    ty,
-                    a: a.clone(),
-                    b: Val::Reg(sh_masked.clone()),
+                let func = match ty {
+                    Ty::I8 => "__shl_u8",
+                    Ty::I16 => "__shl_u16",
+                    Ty::I32 => "__shl_u32",
+                    _ => unreachable!(),
+                };
+                if !used_routines.iter().any(|u| u == func) {
+                    used_routines.push(func.to_string());
+                }
+                insts.push(Inst::Call(Call {
+                    dst: Some(shl_dst.clone()),
+                    ty: Some(ty),
+                    func: func.to_string(),
+                    args: vec![
+                        CallArg {
+                            ty: Some(ty),
+                            val: a.clone(),
+                            byval: None,
+                            sret: false,
+                        },
+                        CallArg {
+                            ty: Some(ty),
+                            val: Val::Reg(sh_masked.clone()),
+                            byval: None,
+                            sret: false,
+                        },
+                    ],
+                    callees: Vec::new(),
+                    loc: None,
                 }));
-                insts.push(Inst::Bin(ir::Bin {
-                    dst: shr_dst.clone(),
-                    op: ir::BinOp::LShr,
-                    ty,
-                    a: b.clone(),
-                    b: Val::Reg(sub_dst.clone()),
+                let func = match ty {
+                    Ty::I8 => "__lshr_u8",
+                    Ty::I16 => "__lshr_u16",
+                    Ty::I32 => "__lshr_u32",
+                    _ => unreachable!(),
+                };
+                if !used_routines.iter().any(|u| u == func) {
+                    used_routines.push(func.to_string());
+                }
+                insts.push(Inst::Call(Call {
+                    dst: Some(shr_dst.clone()),
+                    ty: Some(ty),
+                    func: func.to_string(),
+                    args: vec![
+                        CallArg {
+                            ty: Some(ty),
+                            val: b.clone(),
+                            byval: None,
+                            sret: false,
+                        },
+                        CallArg {
+                            ty: Some(ty),
+                            val: Val::Reg(sub_dst.clone()),
+                            byval: None,
+                            sret: false,
+                        },
+                    ],
+                    callees: Vec::new(),
+                    loc: None,
                 }));
             } else {
-                // fshr: (a >> sh) | (b << (width - sh))
-                insts.push(Inst::Bin(ir::Bin {
-                    dst: shr_dst.clone(),
-                    op: ir::BinOp::LShr,
-                    ty,
-                    a: a.clone(),
-                    b: Val::Reg(sh_masked.clone()),
+                let func = match ty {
+                    Ty::I8 => "__lshr_u8",
+                    Ty::I16 => "__lshr_u16",
+                    Ty::I32 => "__lshr_u32",
+                    _ => unreachable!(),
+                };
+                if !used_routines.iter().any(|u| u == func) {
+                    used_routines.push(func.to_string());
+                }
+                insts.push(Inst::Call(Call {
+                    dst: Some(shr_dst.clone()),
+                    ty: Some(ty),
+                    func: func.to_string(),
+                    args: vec![
+                        CallArg {
+                            ty: Some(ty),
+                            val: a.clone(),
+                            byval: None,
+                            sret: false,
+                        },
+                        CallArg {
+                            ty: Some(ty),
+                            val: Val::Reg(sh_masked.clone()),
+                            byval: None,
+                            sret: false,
+                        },
+                    ],
+                    callees: Vec::new(),
+                    loc: None,
                 }));
-                insts.push(Inst::Bin(ir::Bin {
-                    dst: shl_dst.clone(),
-                    op: ir::BinOp::Shl,
-                    ty,
-                    a: b.clone(),
-                    b: Val::Reg(sub_dst.clone()),
+                let func = match ty {
+                    Ty::I8 => "__shl_u8",
+                    Ty::I16 => "__shl_u16",
+                    Ty::I32 => "__shl_u32",
+                    _ => unreachable!(),
+                };
+                if !used_routines.iter().any(|u| u == func) {
+                    used_routines.push(func.to_string());
+                }
+                insts.push(Inst::Call(Call {
+                    dst: Some(shl_dst.clone()),
+                    ty: Some(ty),
+                    func: func.to_string(),
+                    args: vec![
+                        CallArg {
+                            ty: Some(ty),
+                            val: b.clone(),
+                            byval: None,
+                            sret: false,
+                        },
+                        CallArg {
+                            ty: Some(ty),
+                            val: Val::Reg(sub_dst.clone()),
+                            byval: None,
+                            sret: false,
+                        },
+                    ],
+                    callees: Vec::new(),
+                    loc: None,
                 }));
             }
-            // Guard the complementary shift: when sh_masked==0, the
-            // (width - sh) shift is width, which must produce 0 not b.
             insts.push(Inst::Icmp(ir::Icmp {
                 dst: is_zero.clone(),
                 pred: "eq".into(),
@@ -974,15 +1123,15 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
             }));
             insts.push(Inst::Select(ir::Select {
                 dst: shr_sel.clone(),
-                cond: Val::Reg(is_zero.clone()),
+                cond: Val::Reg(is_zero),
                 ty,
                 a: Val::Const(0),
-                b: Val::Reg(shr_dst.clone()),
+                b: Val::Reg(shr_dst),
                 ptr: false,
             }));
             insts.push(Inst::Bin(ir::Bin {
                 dst,
-                op: ir::BinOp::Or,
+                op: BinOp::Or,
                 ty,
                 a: Val::Reg(shl_dst),
                 b: Val::Reg(shr_sel),
@@ -992,7 +1141,6 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
         other => panic!("legalize: unknown intrinsic {other:?}"),
     }
 }
-
 
 /// Every function transitively reachable from `roots` over the caller ->
 /// callee map `adj` (the roots included). A visited set keeps a call cycle
