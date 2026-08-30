@@ -184,9 +184,18 @@ fn parse_array_elements(init: &str, elem: Ty) -> Vec<u8> {
 /// nested `{ ... }` fields, `[N x T]` fields) — same layout rules as
 /// `compute_struct`: fields at aligned offsets, size rounded up to the max
 /// field alignment. `types` resolves any named `%struct.X` field.
-fn literal_ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
+fn literal_ty_size_align(
+    t: &str,
+    types: &StructTypes,
+    loc: Option<&SrcLoc>,
+) -> (u16, u8) {
     let t = t.trim();
-    let inner = brace_inner(t).expect("literal struct type must be `{ ... }`");
+    let inner = brace_inner(t).unwrap_or_else(|| {
+        panic!(
+            "{}irparse: literal struct type must be `{{ ... }}` (got {t:?})",
+            loc_prefix(loc)
+        )
+    });
     let mut off: u16 = 0;
     let mut max_align: u8 = 0;
     let packed = packed_braces(t);
@@ -195,7 +204,7 @@ fn literal_ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
         if f.is_empty() {
             continue;
         }
-        let (fsize, falign) = ty_size_align(f, types);
+        let (fsize, falign) = ty_size_align(f, types, loc);
         if !packed {
             off = round_up(off, falign);
         }
@@ -259,7 +268,7 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
     let ty = ty.trim();
     let value = strip_self_type(ty, value).trim();
     if value.starts_with("zeroinitializer") {
-        let (size, _) = ty_size_align(ty, types);
+        let (size, _) = ty_size_align(ty, types, None);
         return vec![0u8; size as usize];
     }
     if let Some(_) = ty.strip_prefix('[') {
@@ -310,7 +319,7 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
         } else {
             panic!("SPIKE LIMIT: array value {value:?} for type {ty:?}");
         };
-        let expect = n * usize::from(ty_size_align(elem, types).0);
+        let expect = n * usize::from(ty_size_align(elem, types, None).0);
         assert_eq!(
             bytes.len(),
             expect,
@@ -348,7 +357,7 @@ fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
         .into_iter()
         .map(|s| s.trim())
         .collect();
-    let (size, _) = literal_ty_size_align(ty, types);
+    let (size, _) = literal_ty_size_align(ty, types, None);
     let mut blob = vec![0u8; size as usize];
     if init.starts_with("zeroinitializer") {
         return blob;
@@ -369,7 +378,7 @@ fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
         if f.is_empty() {
             continue;
         }
-        let (fsize, falign) = ty_size_align(f, types);
+        let (fsize, falign) = ty_size_align(f, types, None);
         if !packed {
             off = round_up(off, falign);
         }
@@ -430,7 +439,7 @@ fn decode_named_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
         if f.is_empty() {
             continue;
         }
-        let (fsize, falign) = ty_size_align(f, types);
+        let (fsize, falign) = ty_size_align(f, types, None);
         if !info.packed {
             off = round_up(off, falign);
         }
@@ -900,39 +909,81 @@ fn round_up(x: u16, align: u8) -> u16 {
 }
 
 /// Size and alignment of an LLVM type string, for structs already resolved.
-fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
+fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8) {
     let t = t.trim();
     if t.starts_with('[') {
-        let close = matching_bracket(t).expect("array type must have balanced brackets");
+        let close = matching_bracket(t).unwrap_or_else(|| {
+            panic!(
+                "{}irparse: array type {t:?} missing closing `]`",
+                loc_prefix(loc)
+            )
+        });
         let inner = &t[1..close]; // "N x T"
         let mut pit = inner.splitn(2, "x").map(|x| x.trim());
-        let n: u32 = pit.next().unwrap().parse().unwrap();
-        let elem = pit.next().unwrap();
-        let (es, ea) = ty_size_align(elem, types);
-        let size = n.checked_mul(u32::from(es)).unwrap_or_else(|| {
-            panic!("irparse: array type {t:?} too large ({} * {es} overflows u16)", n)
+        let n_str = pit.next().unwrap_or_else(|| {
+            panic!(
+                "{}irparse: malformed array type {t:?} (expected "[N x T]")",
+                loc_prefix(loc)
+            )
         });
-        assert!(
-            size <= u32::from(u16::MAX),
-            "irparse: array type {t:?} too large ({size} bytes; max 65535)"
-        );
+        let n: u32 = n_str.parse().unwrap_or_else(|_| {
+            panic!(
+                "{}irparse: malformed array length {n_str:?} in type {t:?}",
+                loc_prefix(loc)
+            )
+        });
+        let elem = pit.next().unwrap_or_else(|| {
+            panic!(
+                "{}irparse: malformed array type {t:?} (expected "[N x T]")",
+                loc_prefix(loc)
+            )
+        });
+        if elem.is_empty() {
+            panic!(
+                "{}irparse: malformed array type {t:?} (missing element type)",
+                loc_prefix(loc)
+            );
+        }
+        if n == 0 {
+            panic!(
+                "{}irparse: zero-length array type {t:?} is not supported",
+                loc_prefix(loc)
+            );
+        }
+        let (es, ea) = ty_size_align(elem, types, loc);
+        let size = n.checked_mul(u32::from(es)).unwrap_or_else(|| {
+            panic!(
+                "{}irparse: array type {t:?} too large ({} * {es} overflows u16)",
+                loc_prefix(loc),
+                n
+            )
+        });
+        if size > u32::from(u16::MAX) {
+            panic!(
+                "{}irparse: array type {t:?} too large ({size} bytes; max 65535)",
+                loc_prefix(loc)
+            );
+        }
         (size as u16, ea)
     } else if let Some(n) = t.strip_prefix('%') {
         let info = types
             .get(n)
-            .unwrap_or_else(|| panic!("irparse: unknown struct type {t}"));
+            .unwrap_or_else(|| panic!("{}irparse: unknown struct type {t}", loc_prefix(loc)));
         (u16::from(info.size), info.align)
     } else if t.starts_with('{') || t.starts_with("<{") {
         // Literal struct type (`{ i8, i8, i16 }`, packed `<{ ... }>`):
         // layout by the same rules as `compute_struct`. Literal structs are
         // value types (no cycles), so plain recursion terminates.
-        literal_ty_size_align(t, types)
+        literal_ty_size_align(t, types, loc)
     } else {
         match t {
             "i1" | "i8" => (1, 1),
             "i16" | "ptr" => (2, 2),
             "i32" | "float" | "f32" => (4, 2),
-            other => panic!("irparse: unsupported type {other:?}"),
+            other => panic!(
+                "{}irparse: unsupported type {other:?}",
+                loc_prefix(loc)
+            ),
         }
     }
 }
@@ -1519,12 +1570,12 @@ fn stride_and_next(cur: &str, types: &StructTypes) -> (i64, String) {
     if cur.starts_with('[') {
         let close = cur.find(']').unwrap();
         let inner = &cur[1..close];
-        let (sz, _) = ty_size_align(cur, types);
+        let (sz, _) = ty_size_align(cur, types, None);
         let elem = inner.splitn(2, "x").nth(1).unwrap().trim().to_string();
         (i64::from(sz), elem)
     } else {
         // scalar (i1/i8/i16): stride = its size, no further descent
-        let (sz, _) = ty_size_align(cur, types);
+        let (sz, _) = ty_size_align(cur, types, None);
         (i64::from(sz), cur.to_string())
     }
 }
@@ -1543,7 +1594,7 @@ fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
         );
         let mut off: u16 = 0;
         for (i, f) in info.fields.iter().enumerate() {
-            let (fsize, falign) = ty_size_align(f, types);
+            let (fsize, falign) = ty_size_align(f, types, None);
             if !info.packed {
                 off = round_up(off, falign);
             }
@@ -1568,7 +1619,7 @@ fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
         let mut off: u16 = 0;
         let packed = packed_braces(cur);
         for (i, f) in fields.iter().enumerate() {
-            let (fsize, falign) = ty_size_align(f, types);
+            let (fsize, falign) = ty_size_align(f, types, None);
             if !packed {
                 off = round_up(off, falign);
             }
@@ -1605,7 +1656,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
             if from_array {
                 // `[N x %struct.S], i16 0, i16 %i` — the index after an
                 // array-of-struct descent strides by sizeof(%struct.S)
-                let (sz, _) = ty_size_align(&cur, types);
+                let (sz, _) = ty_size_align(&cur, types, None);
                 match &idx {
                     Val::Const(c) => k += c * i64::from(sz),
                     Val::Reg(r) => terms.push((sz as u8, r.clone())),
@@ -1620,7 +1671,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
             if !struct_array_done {
                 // First index into a struct-typed pointer is the array offset
                 // (`0` in `getelementptr %struct.Desc, ptr @s, i32 0, i32 1`).
-                let (sz, _) = ty_size_align(&cur, types);
+                let (sz, _) = ty_size_align(&cur, types, None);
                 match &idx {
                     Val::Const(c) => k += c * i64::from(sz),
                     Val::Reg(r) => terms.push((sz as u8, r.clone())),
@@ -1983,7 +2034,7 @@ pub fn parse_ll(src: &str) -> Module {
                 let n: usize = pit.next().unwrap().parse().unwrap();
                 let elem_str = pit.next().unwrap();
                 if elem_str.starts_with('{') || elem_str.starts_with("<{") {
-                    let (es, _) = literal_ty_size_align(elem_str, &types);
+                    let (es, _) = literal_ty_size_align(elem_str, &types, None);
                     let size = n * es as usize;
                     if is_const {
                         assert!(
@@ -2081,7 +2132,7 @@ pub fn parse_ll(src: &str) -> Module {
                     ty_end += 1; // the packed wrapper's closing `>`
                 }
                 let ty_str = &rest[..ty_end];
-                let (size, _) = literal_ty_size_align(ty_str, &types);
+                let (size, _) = literal_ty_size_align(ty_str, &types, None);
                 let init = rest[ty_end..].trim();
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
@@ -2580,12 +2631,17 @@ fn parse_inst(
         "alloca" => {
             let after = rest["alloca".len()..].trim();
             let ty_tok = split_top_level(after, ',').first().unwrap().trim();
-            let (size16, _) = ty_size_align(ty_tok, types);
-            assert!(
-                size16 <= 255,
-                "irparse: alloca %{dst} too large ({size16} bytes)",
-                dst = dst.as_ref().unwrap()
-            );
+            // Alloca carries only size (ir::Alloca.size is u8, max 255); the
+            // natural alignment from ty_size_align is discarded — the frame is
+            // laid out by alloc without per-slot alignment, matching %struct.S.
+            let (size16, _) = ty_size_align(ty_tok, types, cur.as_ref());
+            if size16 > 255 {
+                panic!(
+                    "{}irparse: alloca %{dst} too large ({size16} bytes; max 255)",
+                    loc_prefix(cur.as_ref()),
+                    dst = dst.as_ref().unwrap()
+                );
+            }
             let size = size16 as u8;
             out.push(Inst::Alloca(Alloca {
                 dst: dst.unwrap(),
