@@ -184,11 +184,7 @@ fn parse_array_elements(init: &str, elem: Ty) -> Vec<u8> {
 /// nested `{ ... }` fields, `[N x T]` fields) — same layout rules as
 /// `compute_struct`: fields at aligned offsets, size rounded up to the max
 /// field alignment. `types` resolves any named `%struct.X` field.
-fn literal_ty_size_align(
-    t: &str,
-    types: &StructTypes,
-    loc: Option<&SrcLoc>,
-) -> (u16, u8) {
+fn literal_ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8) {
     let t = t.trim();
     let inner = brace_inner(t).unwrap_or_else(|| {
         panic!(
@@ -980,10 +976,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
             "i1" | "i8" => (1, 1),
             "i16" | "ptr" => (2, 2),
             "i32" | "float" | "f32" => (4, 2),
-            other => panic!(
-                "{}irparse: unsupported type {other:?}",
-                loc_prefix(loc)
-            ),
+            other => panic!("{}irparse: unsupported type {other:?}", loc_prefix(loc)),
         }
     }
 }
