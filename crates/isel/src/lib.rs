@@ -320,7 +320,12 @@ impl<'m> Gen<'m> {
     }
 
     /// Whether `name` is a const (flash) global: read via RETLW tables.
+    /// A const that was copied to RAM (alloc placed it in `addrs` because it
+    /// is used as a pointer call argument) is treated as RAM.
     fn global_is_const(&self, name: &str) -> bool {
+        if self.addrs.contains_key(name) {
+            return false;
+        }
         self.m
             .globals
             .iter()
@@ -1851,7 +1856,10 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    CLRF 0x{:02X}", pa + 1));
                     }
                     // A global at a constant offset (`&g[2]`) has a link-time
-                    // address: materialize it as two literals.
+                    // address: materialize it as two literals. This now also
+                    // covers a GEP over a const global that was copied to RAM
+                    // (the `is_const` copy is in `addrs`, so `global_is_const`
+                    // is false and the bytes live in RAM).
                     Val::Reg(r) if matches!(self.resolved_for(r), (Base::Global(_), _, ref t) if t.is_empty()) =>
                     {
                         let (base, k, _) = self.resolved_for(r);
@@ -1867,8 +1875,47 @@ impl<'m> Gen<'m> {
                     Val::Reg(r) => {
                         let (base, k, terms) = self.resolved_for(r);
                         // As in `emit_load_byte`: the shapes below read the base
-                        // slot's two bytes as a runtime address.
+                        // slot's two bytes as a runtime address. A GEP over a
+                        // RAM-copied const global (Base::Global) is also a
+                        // plain RAM address: base_addr + k + terms.
                         let sa = match &base {
+                            Base::Global(name) => {
+                                // RAM-copied const: treat like a slot base.
+                                // Only constant offset or single dynamic term
+                                // is needed for the literal shapes.
+                                let base_addr = self.global_addr(name);
+                                let k_lo = (u16::from(k) & 0xFF) as u8;
+                                let k_hi = (u16::from(k) >> 8) as u8;
+                                match terms.as_slice() {
+                                    [] => {
+                                        let addr = base_addr + u16::from(k);
+                                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                        continue;
+                                    }
+                                    [(1, reg)] => {
+                                        let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                                        self.emit(format!("    MOVLW 0x{:02X}", (base_addr & 0xFF) as u8));
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra));
+                                        if k_lo != 0 {
+                                            self.emit(format!("    ADDLW 0x{k_lo:02X}"));
+                                        }
+                                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                        self.emit(format!("    MOVLW 0x{:02X}", ((base_addr >> 8) & 0xFF) as u8));
+                                        self.emit("    BTFSC STATUS, 0".to_string());
+                                        self.emit("    ADDLW 0x01".to_string());
+                                        self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                        if k_hi != 0 {
+                                            self.emit(format!("    ADDLW 0x{k_hi:02X}"));
+                                        }
+                                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                        continue;
+                                    }
+                                    _ => panic!("isel: plain ptr arg with multiple terms not yet supported: {terms:?}"),
+                                }
+                            }
                             Base::Slot(sname, false) if self.param_holds_addr(sname) => {
                                 self.slot_addr(self.cur_func, sname).direct()
                             }
@@ -6073,14 +6120,30 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // GOTO (PCLATH = 0 at reset) always reaches it, byte-identical to
         // the pre-interrupt layout. With an ISR the vector owns word 4, so
         // `__start` is emitted after the ISR body instead (see pass B).
-        out.extend([
+        // Const string literals copied to RAM (alloc moved @.str to `addrs`)
+        // need their bytes initialized before main runs.
+        let mut init: Vec<String> = Vec::new();
+        for g in &m.globals {
+            if g.is_const && addrs.contains_key(&g.name) {
+                let base = addrs[&g.name];
+                for (i, b) in g.bytes.iter().enumerate() {
+                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                }
+            }
+        }
+        let mut start_block: Vec<String> = vec![
             "__start:".to_string(),
             "    MOVLW PAGE(main)".to_string(),
             "    MOVWF PCLATH".to_string(),
+        ];
+        start_block.extend(init);
+        start_block.extend([
             "    CALL main".to_string(),
             "    SLEEP".to_string(),
             "".to_string(),
         ]);
+        out.extend(start_block);
     }
     // Phase-3 pointers: resolve every GEP's chain eagerly to a folded
     // `(base, k, terms)`, keyed `{func}::{reg}` like every other local.
@@ -6141,14 +6204,28 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "".to_string(),
     ];
     if !has_isr {
-        measure.extend([
+        let mut init: Vec<String> = Vec::new();
+        for g in &m.globals {
+            if g.is_const && addrs.contains_key(&g.name) {
+                let base = addrs[&g.name];
+                for (i, b) in g.bytes.iter().enumerate() {
+                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                }
+            }
+        }
+        let mut blk: Vec<String> = vec![
             "__start:".to_string(),
             "    MOVLW PAGE(main)".to_string(),
             "    MOVWF PCLATH".to_string(),
+        ];
+        blk.extend(init);
+        blk.extend([
             "    CALL main".to_string(),
             "    SLEEP".to_string(),
             "".to_string(),
         ]);
+        measure.extend(blk);
     }
     for (i, (name, _)) in bodies.iter().enumerate() {
         measure.push(body_texts[i].clone());
@@ -6356,15 +6433,30 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     // `__start` moves after the ISR (the vector owns word 4):
                     // the reset GOTO at word 0 still reaches it, since it stays in
                     // page 0 per the ISR fit check above.
-                    out.extend([
+                    let mut init: Vec<String> = Vec::new();
+                    for g in &m.globals {
+                        if g.is_const && addrs.contains_key(&g.name) {
+                            let base = addrs[&g.name];
+                            for (i, b) in g.bytes.iter().enumerate() {
+                                init.push(format!("    MOVLW 0x{b:02X}"));
+                                init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                            }
+                        }
+                    }
+                    let mut blk: Vec<String> = vec![
                         "__start:".to_string(),
                         "    MOVLW PAGE(main)".to_string(),
                         "    MOVWF PCLATH".to_string(),
+                    ];
+                    let init_len = init.len();
+                    blk.extend(init);
+                    blk.extend([
                         "    CALL main".to_string(),
                         "    SLEEP".to_string(),
                         "".to_string(),
                     ]);
-                    addr_b += 4;
+                    out.extend(blk);
+                    addr_b += 4 + init_len;
                 }
             }
         }
