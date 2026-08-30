@@ -902,14 +902,21 @@ fn round_up(x: u16, align: u8) -> u16 {
 /// Size and alignment of an LLVM type string, for structs already resolved.
 fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
     let t = t.trim();
-    if let Some(r) = t.strip_prefix('[') {
-        let close = r.find(']').unwrap();
-        let inner = &r[..close]; // "N x T"
+    if t.starts_with('[') {
+        let close = matching_bracket(t).expect("array type must have balanced brackets");
+        let inner = &t[1..close]; // "N x T"
         let mut pit = inner.splitn(2, "x").map(|x| x.trim());
-        let n: u16 = pit.next().unwrap().parse().unwrap();
+        let n: u32 = pit.next().unwrap().parse().unwrap();
         let elem = pit.next().unwrap();
         let (es, ea) = ty_size_align(elem, types);
-        (n * es, ea)
+        let size = n.checked_mul(u32::from(es)).unwrap_or_else(|| {
+            panic!("irparse: array type {t:?} too large ({} * {es} overflows u16)", n)
+        });
+        assert!(
+            size <= u32::from(u16::MAX),
+            "irparse: array type {t:?} too large ({size} bytes; max 65535)"
+        );
+        (size as u16, ea)
     } else if let Some(n) = t.strip_prefix('%') {
         let info = types
             .get(n)
@@ -934,14 +941,18 @@ fn ty_size_align(t: &str, types: &StructTypes) -> (u16, u8) {
 /// (used for the fixpoint struct-table build).
 fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
     let t = t.trim();
-    if let Some(r) = t.strip_prefix('[') {
-        let close = r.find(']').unwrap();
-        let inner = &r[..close];
+    if t.starts_with('[') {
+        let close = matching_bracket(t)?;
+        let inner = &t[1..close];
         let mut pit = inner.splitn(2, "x").map(|x| x.trim());
-        let n: u16 = pit.next()?.parse().ok()?;
+        let n: u32 = pit.next()?.parse().ok()?;
         let elem = pit.next()?;
         let (es, ea) = ty_size_align_opt(elem, types)?;
-        Some((n * es, ea))
+        let size = n.checked_mul(u32::from(es))?;
+        if size > u32::from(u16::MAX) {
+            return None;
+        }
+        Some((size as u16, ea))
     } else if let Some(n) = t.strip_prefix('%') {
         types.get(n).map(|s| (u16::from(s.size), s.align))
     } else {
@@ -2568,7 +2579,7 @@ fn parse_inst(
         }
         "alloca" => {
             let after = rest["alloca".len()..].trim();
-            let ty_tok = after.split(',').next().unwrap().trim();
+            let ty_tok = split_top_level(after, ',').first().unwrap().trim();
             let (size16, _) = ty_size_align(ty_tok, types);
             assert!(
                 size16 <= 255,
