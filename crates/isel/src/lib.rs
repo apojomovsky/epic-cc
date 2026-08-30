@@ -1843,8 +1843,11 @@ impl<'m> Gen<'m> {
                             self.emit(format!("    MOVLW HIGH({g})"));
                             self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                         } else {
+                            if self.global_is_const(g) {
+                                let size = self.global_size(g);
+                                panic!("isel: const global @{g} too large for RAM copy ({size} bytes, max 255)");
+                            }
                             let addr = self.global_addr(g);
-                            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                             self.emit(format!("    MOVWF 0x{:02X}", pa));
                             self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
                             self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
@@ -6230,14 +6233,28 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     for (i, (name, _)) in bodies.iter().enumerate() {
         measure.push(body_texts[i].clone());
         if has_isr && name == isr_names[0] {
-            measure.extend([
+            let mut init: Vec<String> = Vec::new();
+            for g in &m.globals {
+                if g.is_const && addrs.contains_key(&g.name) {
+                    let base = addrs[&g.name];
+                    for (idx, b) in g.bytes.iter().enumerate() {
+                        init.push(format!("    MOVLW 0x{b:02X}"));
+                        init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
+                    }
+                }
+            }
+            let mut blk: Vec<String> = vec![
                 "__start:".to_string(),
                 "    MOVLW PAGE(main)".to_string(),
                 "    MOVWF PCLATH".to_string(),
+            ];
+            blk.extend(init);
+            blk.extend([
                 "    CALL main".to_string(),
                 "    SLEEP".to_string(),
                 "".to_string(),
             ]);
+            measure.extend(blk);
         }
     }
     let banked = banking::assign_banks(device, &measure.join("\n"));
@@ -6377,7 +6394,11 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     // Const-table readers: the page PCLATH holds after each `__read_*` CALL
     // (see `reader_pages`). The section sits right after the last function:
     // pass B pins it to this same start, so the pages hold in the final text.
-    let mut consts: Vec<&ir::Global> = m.globals.iter().filter(|g| g.is_const).collect();
+    let mut consts: Vec<&ir::Global> = m
+        .globals
+        .iter()
+        .filter(|g| g.is_const && !addrs.contains_key(&g.name))
+        .collect();
     consts.sort_by_key(|g| g.name.clone());
     let table_start = page_next
         .last()
