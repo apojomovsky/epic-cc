@@ -180,7 +180,12 @@ impl<'m> Gen<'m> {
     /// via a RAM address. `alloc` already excludes const globals from the
     /// address map (`const <name>` lines, no address), so this is the only
     /// signal `isel-pic18` needs to route a load to the flash path.
+    /// A const that was copied to RAM (alloc placed it in `addrs`) is treated
+    /// as RAM.
     fn global_is_const(&self, name: &str) -> bool {
+        if self.addrs.contains_key(name) {
+            return false;
+        }
         self.m
             .globals
             .iter()
@@ -4826,9 +4831,31 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     }
     // `__start` calls `main` and halts; matches the shape `isel::select`
     // uses for its own program entry, minus the ISR machinery (P5).
-    out.push("__start:".to_string());
-    out.push("    call main".to_string());
-    out.push("    sleep".to_string());
+    // Const string literals copied to RAM need init before main.
+    {
+        let mut init: Vec<String> = Vec::new();
+        for g in &m.globals {
+            if g.is_const && addrs.contains_key(&g.name) {
+                let base = addrs[&g.name];
+                for (i, b) in g.bytes.iter().enumerate() {
+                    let addr = base + i as u16;
+                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    // Access-bank check mirrors Gen::operand: <0x60 or >=0xF60 is A.
+                    if addr < 0x60 || addr >= 0xF60 {
+                        init.push(format!("    MOVWF 0x{addr:03X},A"));
+                    } else {
+                        let bsr = (addr >> 8) as u8;
+                        init.push(format!("    MOVLB 0x{bsr:02X}"));
+                        init.push(format!("    MOVWF 0x{addr:03X},B"));
+                    }
+                }
+            }
+        }
+        out.push("__start:".to_string());
+        out.extend(init);
+        out.push("    call main".to_string());
+        out.push("    sleep".to_string());
+    }
     // P4: every `const` (flash) global becomes a `DB` table after the code,
     // before `end`. The bytes are the flat LE blob `irparse` decoded; the
     // table label is the TBLPTR base `LOW`/`HIGH`/`UPPER` resolve. No

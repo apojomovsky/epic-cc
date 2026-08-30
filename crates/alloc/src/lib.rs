@@ -279,16 +279,92 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
     // sized array advances the free pointer by its byte count. Const globals
     // get no RAM address (their bytes live in flash) but are still recorded
-    // so the map text can list them. If sequential placement fails (a small
-    // global stranded behind a monotonically-advancing cursor that already
-    // moved past a bank with room for it), a largest-first bin-packing
-    // fallback with independent per-bank cursors runs below (`.or_else(...)`)
-    // before giving up.
+    // so the map text can list them. A const that is used as a plain pointer
+    // call argument (direct `@.str`/`@k` or a `getelementptr` over it) is
+    // instead placed in RAM as a static initialized copy so the callee's
+    // generic pointer load (FSR/INDF through the param slot) reads the
+    // literal correctly. Only small consts (<=255 bytes) are copied; larger
+    // tables stay in flash.
     let mut const_globals: HashSet<String> = HashSet::new();
     let mut fixed: Vec<(String, u16, u16)> = Vec::new(); // (name, addr, size)
     let mut floating: Vec<&ir::Global> = Vec::new();
+    let mut const_to_ram: HashSet<String> = HashSet::new();
+    {
+        use ir::GepBase;
+        let mut func_gep: HashMap<String, HashMap<String, GepBase>> = HashMap::new();
+        for f in &m.funcs {
+            let mut m2: HashMap<String, GepBase> = HashMap::new();
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let ir::Inst::Gep(g) = inst {
+                        m2.insert(g.dst.clone(), g.base.clone());
+                    }
+                }
+            }
+            func_gep.insert(f.name.clone(), m2);
+        }
+        for f in &m.funcs {
+            let gep_map = func_gep.get(&f.name).unwrap();
+            let find_const_base = |reg: &str| -> Option<String> {
+                let mut cur = reg.to_string();
+                let mut seen: HashSet<String> = HashSet::new();
+                loop {
+                    if !seen.insert(cur.clone()) {
+                        break;
+                    }
+                    match gep_map.get(&cur) {
+                        Some(GepBase::Global(name)) => {
+                            if m.globals.iter().any(|gl| gl.name == *name && gl.is_const) {
+                                return Some(name.clone());
+                            } else {
+                                return None;
+                            }
+                        }
+                        Some(GepBase::Reg(r)) => cur = r.clone(),
+                        None => return None,
+                    }
+                }
+                None
+            };
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    if let ir::Inst::Call(c) = inst {
+                        for arg in &c.args {
+                            if arg.ty.is_none() {
+                                match &arg.val {
+                                    ir::Val::Global(g) => {
+                                        if m.globals.iter().any(|gl| &gl.name == g && gl.is_const) {
+                                            if let Some(gl) =
+                                                m.globals.iter().find(|gl| &gl.name == g)
+                                            {
+                                                if gl.size <= 255 {
+                                                    const_to_ram.insert(g.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ir::Val::Reg(r) => {
+                                        if let Some(base) = find_const_base(r) {
+                                            if let Some(gl) =
+                                                m.globals.iter().find(|gl| gl.name == base)
+                                            {
+                                                if gl.size <= 255 {
+                                                    const_to_ram.insert(base);
+                                                }
+                                            }
+                                        }
+                                    }
+                                    ir::Val::Const(_) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     for g in &m.globals {
-        if g.is_const {
+        if g.is_const && !const_to_ram.contains(&g.name) {
             const_globals.insert(g.name.clone());
         } else {
             assert!(
