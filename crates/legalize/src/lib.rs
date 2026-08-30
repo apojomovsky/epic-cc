@@ -886,9 +886,113 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames) -> Vec<Inst> {
                 }),
             ]
         }
+        "llvm.fshl.i8" | "llvm.fshl.i16" | "llvm.fshl.i32"
+        | "llvm.fshr.i8" | "llvm.fshr.i16" | "llvm.fshr.i32" => {
+            // Funnel-shift: fshl(a,b,c) = (a << (c mod N)) | (b >> ((N - (c mod N)) mod N))
+            // with the 0-shift guard so the complementary shift is 0 not N.
+            // Lower to: shift = c & (N-1), shl/lshr, sub, lshr/shl, select, or.
+            // The Bin shl/lshr will later be inlined (const count) or become
+            // __shl/__lshr calls (reg count) in the same legalize pass; the
+            // extra ops (and/sub/select/or) stay as Bin/Icmp/Select.
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            let sh = c.args[2].val.clone();
+            let is_fshl = c.func.starts_with("llvm.fshl");
+            let width: u8 = match ty {
+                Ty::I8 => 8,
+                Ty::I16 => 16,
+                Ty::I32 => 32,
+                _ => panic!("legalize: {} unsupported type {ty:?}", c.func),
+            };
+            let mask = Val::Const(i64::from(width - 1));
+            let width_val = Val::Const(i64::from(width));
+            let sh_masked = names.fresh();
+            let shl_dst = names.fresh();
+            let sub_dst = names.fresh();
+            let shr_dst = names.fresh();
+            let shr_sel = names.fresh();
+            let is_zero = names.fresh();
+            // sh_masked = sh & (width-1)  (modulo width)
+            // sub = width - sh_masked
+            // shl/lshr pair swapped for fshl vs fshr
+            let mut insts = Vec::new();
+            insts.push(Inst::Bin(ir::Bin {
+                dst: sh_masked.clone(),
+                op: ir::BinOp::And,
+                ty,
+                a: sh.clone(),
+                b: mask,
+            }));
+            insts.push(Inst::Bin(ir::Bin {
+                dst: sub_dst.clone(),
+                op: ir::BinOp::Sub,
+                ty,
+                a: width_val,
+                b: Val::Reg(sh_masked.clone()),
+            }));
+            if is_fshl {
+                // fshl: (a << sh) | (b >> (width - sh))
+                insts.push(Inst::Bin(ir::Bin {
+                    dst: shl_dst.clone(),
+                    op: ir::BinOp::Shl,
+                    ty,
+                    a: a.clone(),
+                    b: Val::Reg(sh_masked.clone()),
+                }));
+                insts.push(Inst::Bin(ir::Bin {
+                    dst: shr_dst.clone(),
+                    op: ir::BinOp::LShr,
+                    ty,
+                    a: b.clone(),
+                    b: Val::Reg(sub_dst.clone()),
+                }));
+            } else {
+                // fshr: (a >> sh) | (b << (width - sh))
+                insts.push(Inst::Bin(ir::Bin {
+                    dst: shr_dst.clone(),
+                    op: ir::BinOp::LShr,
+                    ty,
+                    a: a.clone(),
+                    b: Val::Reg(sh_masked.clone()),
+                }));
+                insts.push(Inst::Bin(ir::Bin {
+                    dst: shl_dst.clone(),
+                    op: ir::BinOp::Shl,
+                    ty,
+                    a: b.clone(),
+                    b: Val::Reg(sub_dst.clone()),
+                }));
+            }
+            // Guard the complementary shift: when sh_masked==0, the
+            // (width - sh) shift is width, which must produce 0 not b.
+            insts.push(Inst::Icmp(ir::Icmp {
+                dst: is_zero.clone(),
+                pred: "eq".into(),
+                ty,
+                a: Val::Reg(sh_masked.clone()),
+                b: Val::Const(0),
+            }));
+            insts.push(Inst::Select(ir::Select {
+                dst: shr_sel.clone(),
+                cond: Val::Reg(is_zero.clone()),
+                ty,
+                a: Val::Const(0),
+                b: Val::Reg(shr_dst.clone()),
+                ptr: false,
+            }));
+            insts.push(Inst::Bin(ir::Bin {
+                dst,
+                op: ir::BinOp::Or,
+                ty,
+                a: Val::Reg(shl_dst),
+                b: Val::Reg(shr_sel),
+            }));
+            insts
+        }
         other => panic!("legalize: unknown intrinsic {other:?}"),
     }
 }
+
 
 /// Every function transitively reachable from `roots` over the caller ->
 /// callee map `adj` (the roots included). A visited set keeps a call cycle
