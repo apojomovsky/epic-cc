@@ -1,5 +1,5 @@
 //! Local-array alloca acceptance for #149: stack `[N x i8]` written and
-//! read at a runtime index — the local counterpart to `array.c`. The
+//! read at a runtime index, the local counterpart to `array.c`. The
 //! driver HEX must run to halt on the simulator with `out == 4` for
 //! `in == 3` (buf[3] = 4, then out = buf[3]).
 

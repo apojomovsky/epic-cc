@@ -2625,7 +2625,7 @@ fn parse_inst(
             let after = rest["alloca".len()..].trim();
             let ty_tok = split_top_level(after, ',').first().unwrap().trim();
             // Alloca carries only size (ir::Alloca.size is u8, max 255); the
-            // natural alignment from ty_size_align is discarded — the frame is
+            // natural alignment from ty_size_align is discarded, as the frame is
             // laid out by alloc without per-slot alignment, matching %struct.S.
             let (size16, _) = ty_size_align(ty_tok, types, cur.as_ref());
             if size16 > 255 {

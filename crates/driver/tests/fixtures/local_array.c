@@ -1,6 +1,6 @@
 // Local-array alloca probe for #149: a stack [N x i8] buffer written
-// and read at a runtime index — the local counterpart to the global
-// array.c. Acceptance: local buffer survives GEP + load/store lowering
+// and read at a runtime index, the local counterpart to the global
+// array.c. Acceptance: local buffer survives GEP and load/store lowering
 // and runs correctly on the simulator.
 //
 // Uses volatile globals for the index and result so clang cannot fold the
@@ -11,7 +11,7 @@ volatile unsigned short in;
 volatile unsigned char out;
 
 void main(void) {
-    // Local buffer — the shape that previously hit SPIKE: unsupported type "[8"
+    // Local buffer, the shape that previously hit SPIKE: unsupported type "[8"
     char buf[8];
     unsigned char i = (unsigned char)(in & 7);
     buf[i] = (unsigned char)(i + 1);
