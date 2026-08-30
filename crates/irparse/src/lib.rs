@@ -2569,14 +2569,13 @@ fn parse_inst(
         "alloca" => {
             let after = rest["alloca".len()..].trim();
             let ty_tok = after.split(',').next().unwrap().trim();
-            let size = if let Some(n) = ty_tok.strip_prefix('%') {
-                types
-                    .get(n)
-                    .unwrap_or_else(|| panic!("irparse: unknown alloca type {ty_tok}"))
-                    .size
-            } else {
-                ty_of(ty_tok, cur.as_ref()).bytes()
-            };
+            let (size16, _) = ty_size_align(ty_tok, types);
+            assert!(
+                size16 <= 255,
+                "irparse: alloca %{dst} too large ({size16} bytes)",
+                dst = dst.as_ref().unwrap()
+            );
+            let size = size16 as u8;
             out.push(Inst::Alloca(Alloca {
                 dst: dst.unwrap(),
                 size,
