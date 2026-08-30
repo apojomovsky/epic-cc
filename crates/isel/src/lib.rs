@@ -1848,6 +1848,7 @@ impl<'m> Gen<'m> {
                                 panic!("isel: const global @{g} too large for RAM copy ({size} bytes, max 255)");
                             }
                             let addr = self.global_addr(g);
+                            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                             self.emit(format!("    MOVWF 0x{:02X}", pa));
                             self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
                             self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
