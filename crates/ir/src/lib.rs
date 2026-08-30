@@ -200,8 +200,10 @@ pub struct Gep {
     pub k: u8,
     pub terms: Vec<(u8, String)>,
 }
-/// `alloca`: a local buffer of `size` bytes (virtual — isel allocates no
-/// registers; alloc sizes the slot).
+/// `alloca`: a local buffer of `size` bytes (virtual, isel allocates no
+/// registers; alloc sizes the slot). `size` is a `u8` (max 255 bytes);
+/// oversized types such as `[N x T]`, `{ ... }`, `%struct.X` or literal structs
+/// exceeding 255 bytes panic at parse time in `irparse::ty_size_align`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Alloca {
     pub dst: String,
