@@ -4,13 +4,53 @@ use std::process::Command;
 
 fn layout_for_device(dev: &'static device::Device) -> alloc::AllocLayout {
     let (clang, resdir) = driver::clang::pic_clang_from_env();
+    let header_dir = {
+        let ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let tid = format!("{:?}", std::thread::current().id());
+        let dir = std::env::temp_dir()
+            .join(format!("str-literal-{}-{}-{}", std::process::id(), tid, ns))
+            .join("include");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("stdint.h"), driver::stdint_h::STDINT_H).unwrap();
+        std::fs::write(dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H).unwrap();
+        std::fs::write(dir.join("stddef.h"), driver::stddef_h::STDDEF_H).unwrap();
+        std::fs::write(dir.join("string.h"), driver::string_h::STRING_H).unwrap();
+        std::fs::write(dir.join("stdlib.h"), driver::stdlib_h::STDLIB_H).unwrap();
+        std::fs::write(dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).unwrap();
+        dir
+    };
+    let opts = driver::clang::Options {
+        header_dir: Some(header_dir.clone()),
+        ..Default::default()
+    };
     let ll_text = driver::clang::compile_to_stdout(
         &clang,
         &resdir,
         std::path::Path::new("tests/fixtures/str_literal.c"),
-        &driver::clang::Options::default(),
+        &opts,
     );
     let mut m = irparse::parse_ll(&ll_text);
+    // Mirror driver/main.rs: when the source includes string.h, the
+    // string.c translation unit is appended before wholeprog.
+    let src_text = std::fs::read_to_string("tests/fixtures/str_literal.c").unwrap_or_default();
+    if src_text
+        .lines()
+        .any(|l| l.contains("#include") && l.contains("string.h"))
+    {
+        let c_path = header_dir.parent().unwrap().join("__epic_string.c");
+        std::fs::write(&c_path, driver::string_c::STRING_C).unwrap();
+        let mut sm = irparse::parse_ll(&driver::clang::compile_to_stdout(
+            &clang, &resdir, &c_path, &opts,
+        ));
+        m.funcs.extend(sm.funcs.drain(..));
+        m.globals.extend(sm.globals.drain(..));
+        m.module_asm.extend(sm.module_asm.drain(..));
+        let _ = std::fs::remove_file(&c_path);
+    }
+    let _ = std::fs::remove_dir_all(header_dir.parent().unwrap());
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
