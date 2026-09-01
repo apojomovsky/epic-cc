@@ -469,7 +469,7 @@ fn i32_param_and_def_get_four_bytes() {
              ret void\n",
     );
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
-    // p i32 at 0x20, q at 0x24, r at 0x28 — contiguous 4-byte slots; s
+    // p i32 at 0x20, q at 0x24, r at 0x28 (contiguous 4-byte slots); s
     // reuses q's slot (q is dead once r and s are computed).
     assert_eq!(out.locals["f::p"], 0x20);
     assert_eq!(out.locals["f::q"], 0x24);
@@ -938,7 +938,7 @@ fn co_live_values_do_not_share() {
 
 /// A value live across a call (used after it) keeps its slot; a value dead
 /// before the call shares with the callee's frame base region only if the
-/// liveness says so — here the live value pins the frame at 2 bytes.
+/// liveness says so; here the live value pins the frame at 2 bytes.
 #[test]
 fn value_live_across_call_pins_the_frame() {
     let m = parse(
