@@ -316,12 +316,9 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
     // start even when its last linear use is earlier. A backward fixpoint
     // computes live-in/live-out per block; the interval loop then extends
     // each value's range to the start of every block it is live-in to and
-    // the end of every block it is live-out of. Phi incoming values are
-    // excluded from the use sets (they are used precisely at the pred end)
-    // and phi dsts from the def sets (they are written by the pred-end
-    // copies), so the fixpoint does not distort their intervals. The
-    // test-side `ir::parse` keeps a `label ` prefix on Br targets while
-    // `irparse` strips it; normalize both forms here.
+    // the end of every block it is live-out of. Phi incomings are excluded
+    // from the use sets (they are used precisely at the pred end) and phi
+    // dsts from the def sets (they are written by the pred-end copies).
     let norm = |t: &str| {
         t.strip_prefix("label ")
             .unwrap_or(t)
