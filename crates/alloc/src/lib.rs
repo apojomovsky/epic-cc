@@ -770,6 +770,46 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                             }
                         }
                     }
+                    // A pointer select whose arms are const globals (or GEPs
+                    // over them) is a runtime address VALUE when the arms do
+                    // not fold to a common base (iselcore seeds it as an
+                    // indirect slot, epic-cc#147): the selected arm's bytes
+                    // are read through the slot with RAM semantics, so each
+                    // const arm must be copied to RAM. A select that folds
+                    // (same base, e.g. the ccp_sel shape) keeps its const in
+                    // flash: every load through it lowers via the fold's
+                    // RETLW/TBLRD path.
+                    if let ir::Inst::Select(s) = inst {
+                        if !s.ptr {
+                            continue;
+                        }
+                        let const_base = |v: &ir::Val| -> Option<String> {
+                            match v {
+                                ir::Val::Global(g) => {
+                                    if m.globals.iter().any(|gl| &gl.name == g && gl.is_const) {
+                                        Some(g.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                ir::Val::Reg(r) => find_const_base(r),
+                                ir::Val::Const(_) => None,
+                            }
+                        };
+                        let (ba, bb) = (const_base(&s.a), const_base(&s.b));
+                        match (ba, bb) {
+                            (Some(a), Some(b)) if a != b => {
+                                for g in [a, b] {
+                                    if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
+                                        if gl.size <= 255 {
+                                            const_to_ram.insert(g);
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
         }
@@ -1239,18 +1279,13 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         Inst::Trunc(t) => Some((t.dst.clone(), t.to.bytes())),
         Inst::IntToPtr(p) => Some((p.dst.clone(), p.to.bytes())),
         Inst::Icmp(i) => Some((i.dst.clone(), 1)),
-        // A pointer-typed select whose arms are both runtime address
-        // literals materializes its two address bytes into the dst slot
-        // (isel's value-select path, epic-cc#117), so the dst needs a slot
-        // like any 2-byte value. A pointer select over folded (compile-time)
-        // arms is virtual (iselcore folds it like a GEP) and defines no
-        // slot.
-        Inst::Select(s)
-            if s.ptr && matches!((&s.a, &s.b), (ir::Val::Const(_), ir::Val::Const(_))) =>
-        {
-            Some((s.dst.clone(), s.ty.bytes()))
-        }
-        Inst::Select(s) if s.ptr => None,
+        // A pointer-typed select materializes its two address bytes into
+        // the dst slot (isel's value-select path, epic-cc#117 and
+        // epic-cc#147), so the dst needs a slot like any 2-byte value.
+        // A pointer select over folded (compile-time) arms is virtual
+        // (iselcore folds it like a GEP) and never writes the slot, so the
+        // allocation is harmless dead space; distinguishing the two shapes
+        // here would duplicate iselcore's fold.
         Inst::Select(s) => Some((s.dst.clone(), s.ty.bytes())),
         Inst::Call(c) => match (&c.dst, &c.ty) {
             (Some(d), Some(t)) => Some((d.clone(), t.bytes())),

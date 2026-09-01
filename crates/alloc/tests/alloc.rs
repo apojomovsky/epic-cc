@@ -387,6 +387,33 @@ fn sized_array_global_does_not_break_frame_overlay() {
 }
 
 #[test]
+fn const_select_arms_are_copied_to_ram_when_the_select_does_not_fold() {
+    // A pointer select over two distinct const globals is a runtime
+    // address VALUE (iselcore seeds it as an indirect slot, epic-cc#147):
+    // the selected arm's bytes are read through the slot with RAM
+    // semantics, so both const arms must be copied to RAM.
+    let mut m = parse(
+        "const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %s = select i1 %c, ptr @a, ptr @b\n\
+             ret void\n",
+    );
+    m.globals[0].size = 4; // a: [4 x i8]
+    m.globals[1].size = 4; // b: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert!(
+        out.globals.contains_key("a"),
+        "const select arm @a must be copied to RAM"
+    );
+    assert!(
+        out.globals.contains_key("b"),
+        "const select arm @b must be copied to RAM"
+    );
+}
+
+#[test]
 fn const_300_byte_table_gets_no_ram_address_and_layout_unchanged() {
     // A 300-byte const table (u16 size) gets NO RAM address (its bytes live
     // in flash) but is recorded in const_globals; the surrounding RAM globals

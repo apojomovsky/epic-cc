@@ -139,10 +139,10 @@ fn leaves_a_value_select_unresolved() {
 }
 
 #[test]
-#[should_panic(expected = "cyclic or unresolvable pointer chain")]
-fn panics_on_a_pointer_select_with_distinct_bases() {
-    // Arms over different globals cannot fold to one base: loud panic,
-    // never a silent read from the wrong table.
+fn seeds_a_pointer_select_with_distinct_global_bases() {
+    // Arms over different globals cannot fold to one base, but both are
+    // runtime address VALUES: the dst is seeded as an indirect slot whose
+    // bytes isel materializes as a 2-byte value select (epic-cc#147).
     let m = parse(
         "global a i8\n\
          global b i8\n\
@@ -151,5 +151,29 @@ fn panics_on_a_pointer_select_with_distinct_bases() {
              %s = select i1 %c, ptr @a, ptr @b\n\
              ret void\n",
     );
-    let _ = resolve_pointers(&m);
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
+    assert!(matches!(base, Base::Slot(n, true) if n == "s"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+}
+
+#[test]
+fn seeds_a_pointer_select_with_a_global_and_a_runtime_slot() {
+    // A global arm and a runtime-address reg arm (an IntToPtr dst) do not
+    // fold; both are materializable address values, so the dst is seeded
+    // as an indirect slot.
+    let m = parse(
+        "global a i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %p = inttoptr i16 12 to ptr\n\
+             %s = select i1 %c, ptr @a, ptr %p\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
+    assert!(matches!(base, Base::Slot(n, true) if n == "s"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
 }
