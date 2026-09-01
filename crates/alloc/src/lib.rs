@@ -176,6 +176,224 @@ fn round_if_routine(
     }
 }
 
+/// The liveness-colored frame of one function: the distinct slot widths in
+/// allocation order (the order `frame_end` walks) and the frame's byte size
+/// (the colored peak, not the width sum). Values whose live ranges never
+/// overlap share a slot, so a frame shrinks from the width sum to the peak
+/// simultaneous demand (M3 deferred this; epic-cc#172 is the deferral's
+/// bill). The coloring is deterministic: values are processed in (range
+/// start, placement order) and each reuses the lowest slot whose interval
+/// is disjoint.
+struct FrameLayout {
+    widths: Vec<u8>,
+    size: u16,
+    /// value name -> slot index into `widths`. Every def and param gets a
+    /// slot; the locals placement reads this to put each value at its
+    /// slot's address.
+    slot_of: HashMap<String, usize>,
+}
+
+/// Compute a function's liveness-colored frame from its IR. Each value's
+/// live interval is `[min(def, uses, phi pred ends), max(...)]` in linear
+/// block order (entry first, then label order). Phi incoming values are
+/// used at the END of their predecessor (isel emits the incoming copies
+/// there), and a phi destination is live from the earliest predecessor end
+/// (its first copy) through its last use. A loop-carried value (use before
+/// def in linear order) gets an interval spanning the loop, so it can never
+/// alias a value it is co-live with; a dead def is a point interval,
+/// immediately reusable. Greedy first-fit coloring reuses the lowest slot
+/// whose interval is disjoint; the slot's width grows to the widest
+/// occupant.
+fn frame_layout(f: &ir::Func) -> FrameLayout {
+    // Block order: the entry block (unlabeled) first, then label order.
+    let mut order: Vec<&ir::Block> = f.blocks.iter().collect();
+    // The entry block (label `entry` in hand-written IR, a numeric label in
+    // irparse output) is always first; the rest follow in label order.
+    order.sort_by_key(|b| match b.label.parse::<u64>() {
+        Ok(v) => (1u8, v),
+        Err(_) => (0u8, 0),
+    });
+    let idx: HashMap<&str, usize> = order
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.label.as_str(), i))
+        .collect();
+    let block_len: Vec<u16> = order.iter().map(|b| b.insts.len() as u16).collect();
+
+    // defs: value name -> (block index, def position, width, placement
+    // order). Params are defined at entry and come first; defined values
+    // follow in instruction order. The placement order breaks ties in the
+    // coloring, so same-start values keep the documented params-first,
+    // instruction-order layout.
+    let mut defs: HashMap<String, (usize, u16, u8, usize)> = HashMap::new();
+    let mut order_idx = 0usize;
+    for p in &f.params {
+        defs.insert(p.name.clone(), (0, 0, p.width, order_idx));
+        order_idx += 1;
+    }
+    for (i, b) in order.iter().enumerate() {
+        for (pos, inst) in b.insts.iter().enumerate() {
+            if let Some((name, width)) = def_width(inst) {
+                defs.insert(name, (i, pos as u16, width, order_idx));
+                order_idx += 1;
+            }
+        }
+    }
+
+    // uses: value name -> set of (block, position). A phi's incoming values
+    // are used at the END of their predecessor (isel emits the incoming
+    // copies there), not in the merge block.
+    let mut uses: HashMap<String, HashSet<(usize, u16)>> = HashMap::new();
+    for (i, b) in order.iter().enumerate() {
+        for (pos, inst) in b.insts.iter().enumerate() {
+            if let ir::Inst::Phi(p) = inst {
+                for (v, pred) in &p.incoming {
+                    let vn = val_name(v);
+                    if defs.contains_key(&vn) {
+                        let pi = idx[pred.as_str()];
+                        uses.entry(vn).or_default().insert((pi, block_len[pi]));
+                    }
+                }
+                continue;
+            }
+            for v in inst_vals(inst) {
+                if defs.contains_key(&v) {
+                    uses.entry(v).or_default().insert((i, pos as u16));
+                }
+            }
+        }
+    }
+
+    // phi destinations: the ends of their merge block's predecessors (the
+    // copy points where isel writes the slot).
+    let mut phi_pred_ends: HashMap<String, HashSet<(usize, u16)>> = HashMap::new();
+    for b in &order {
+        for inst in &b.insts {
+            if let ir::Inst::Phi(p) = inst {
+                for (_, pred) in &p.incoming {
+                    let pi = idx[pred.as_str()];
+                    phi_pred_ends
+                        .entry(p.dst.clone())
+                        .or_default()
+                        .insert((pi, block_len[pi]));
+                }
+            }
+        }
+    }
+
+    // Live interval per value: [min(def, uses, pred ends), max(...)] in
+    // linear order. A loop-carried value (use before def in linear order)
+    // spans the loop, so it cannot alias a co-live value; a dead def is a
+    // point interval, immediately reusable.
+    let mut vals: Vec<(&String, (usize, u16), (usize, u16), u8, usize)> = Vec::new();
+    for (v, &(d, p_d, w, o)) in &defs {
+        let mut lo = (d, p_d);
+        let mut hi = (d, p_d);
+        if let Some(us) = uses.get(v) {
+            for &(b, p) in us {
+                lo = lo.min((b, p));
+                hi = hi.max((b, p));
+            }
+        }
+        if let Some(ps) = phi_pred_ends.get(v) {
+            for &(b, p) in ps {
+                lo = lo.min((b, p));
+                hi = hi.max((b, p));
+            }
+        }
+        vals.push((v, lo, hi, w, o));
+    }
+    vals.sort_by(|a, b| a.1.cmp(&b.1).then(a.4.cmp(&b.4)));
+
+    // Greedy first-fit coloring: reuse the lowest slot whose interval is
+    // disjoint from the new value's; the slot's width grows to the widest
+    // occupant.
+    let mut slots: Vec<((usize, u16), (usize, u16), u8)> = Vec::new();
+    let mut slot_of: HashMap<String, usize> = HashMap::new();
+    for (v, lo, hi, w, _) in &vals {
+        let mut placed = None;
+        for (i, (slo, shi, _)) in slots.iter().enumerate() {
+            if hi < slo || shi < lo {
+                placed = Some(i);
+                break;
+            }
+        }
+        match placed {
+            Some(i) => {
+                slots[i].0 = slots[i].0.min(*lo);
+                slots[i].1 = slots[i].1.max(*hi);
+                slots[i].2 = slots[i].2.max(*w);
+                slot_of.insert((*v).clone(), i);
+            }
+            None => {
+                slots.push((*lo, *hi, *w));
+                slot_of.insert((*v).clone(), slots.len() - 1);
+            }
+        }
+    }
+    let widths: Vec<u8> = slots.iter().map(|&(_, _, w)| w).collect();
+    let size: u16 = widths.iter().map(|&w| u16::from(w)).sum();
+    FrameLayout {
+        widths,
+        size,
+        slot_of,
+    }
+}
+
+/// The SSA values an instruction reads, for liveness. Mirrors the operand
+/// shapes of every `Inst` variant; a value that is only defined (never read)
+/// contributes no use.
+fn inst_vals(inst: &ir::Inst) -> Vec<String> {
+    use ir::Inst;
+    match inst {
+        Inst::Load(l) => vec![l.ptr.clone()],
+        Inst::Store(s) => vec![s.ptr.clone(), val_name(&s.val)],
+        Inst::Bin(b) => vec![val_name(&b.a), val_name(&b.b)],
+        Inst::Ret(Some((_, v))) => vec![val_name(v)],
+        Inst::Ret(None) => Vec::new(),
+        Inst::Zext(z) => vec![val_name(&z.val)],
+        Inst::Sext(s) => vec![val_name(&s.val)],
+        Inst::Trunc(t) => vec![val_name(&t.val)],
+        Inst::IntToPtr(p) => vec![val_name(&p.val)],
+        Inst::Icmp(i) => vec![val_name(&i.a), val_name(&i.b)],
+        Inst::Select(s) => vec![val_name(&s.cond), val_name(&s.a), val_name(&s.b)],
+        Inst::Call(c) => c.args.iter().map(|a| val_name(&a.val)).collect(),
+        Inst::Br(_) => Vec::new(),
+        Inst::BrCond(b) => vec![val_name(&b.cond)],
+        Inst::Phi(p) => p.incoming.iter().map(|(v, _)| val_name(v)).collect(),
+        Inst::Gep(g) => {
+            let mut vs = Vec::new();
+            if let ir::GepBase::Reg(r) = &g.base {
+                vs.push(r.clone());
+            }
+            vs.extend(g.terms.iter().map(|(_, r)| r.clone()));
+            vs
+        }
+        Inst::Alloca(_) => Vec::new(),
+        Inst::Memcpy(m) => vec![val_name(&m.dst), val_name(&m.src)]
+            .into_iter()
+            .chain(match &m.len {
+                ir::MemLen::Const(_) => None,
+                ir::MemLen::Reg(v) => Some(val_name(v)),
+            })
+            .collect(),
+        Inst::Freeze(f) => vec![val_name(&f.val)],
+        Inst::FloatBin(b) => vec![val_name(&b.a), val_name(&b.b)],
+        Inst::Fcmp(c) => vec![val_name(&c.a), val_name(&c.b)],
+        Inst::FloatConv(c) => vec![val_name(&c.val)],
+        Inst::Asm(a) => a.operands.iter().map(|o| o.ptr.clone()).collect(),
+    }
+}
+
+/// The SSA value name of a `Val` operand, or empty for a constant/global
+/// (constants and globals are not frame locals).
+fn val_name(v: &ir::Val) -> String {
+    match v {
+        ir::Val::Reg(r) => r.clone(),
+        ir::Val::Const(_) | ir::Val::Global(_) => String::new(),
+    }
+}
+
 /// Every function transitively reachable from `roots` over the caller ->
 /// callee map `edges` (the roots included). A visited set keeps a call cycle
 /// (rejected loudly earlier by the topological sort) from looping forever.
@@ -518,36 +736,19 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             });
     let bank0_start = end_of_globals;
 
-    // 2. locals_widths(f) = the byte widths of f's params and defined values
-    // in placement order (params first, then defined values in instruction
-    // order), each name counted once (phi destinations are defined values;
-    // icmp destinations are i1). The physical frame end (step 6) is derived
-    // by walking these widths through `place_contiguous`, and locals_size(f)
-    // (the virtual footprint, used for depth_end) is their sum.
+    // 2. locals_widths(f) = the liveness-colored slot widths of f's params
+    // and defined values, in allocation order (the order `frame_end` walks
+    // and the locals placement reproduces). Values whose live ranges never
+    // overlap share a slot, so a frame shrinks from the width sum to the
+    // peak simultaneous demand (M3 deferred this; epic-cc#172 is the
+    // deferral's bill). locals_size(f) is the colored frame's byte size.
     let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut locals_size: HashMap<String, u16> = HashMap::new();
     for f in &m.funcs {
-        let mut widths: Vec<u8> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for p in &f.params {
-            if seen.insert(p.name.clone()) {
-                widths.push(p.width);
-            }
-        }
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Some((name, width)) = def_width(inst) {
-                    if seen.insert(name) {
-                        widths.push(width);
-                    }
-                }
-            }
-        }
-        locals_widths.insert(f.name.clone(), widths);
+        let fl = frame_layout(f);
+        locals_widths.insert(f.name.clone(), fl.widths);
+        locals_size.insert(f.name.clone(), fl.size);
     }
-    let locals_size: HashMap<String, u16> = locals_widths
-        .iter()
-        .map(|(f, ws)| (f.clone(), ws.iter().map(|&w| u16::from(w)).sum()))
-        .collect();
 
     // 3. Call graph from the edge text.
     let mut edges: HashMap<String, Vec<String>> = HashMap::new(); // caller -> callees
@@ -740,34 +941,28 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         }
     }
 
-    // 7. Local addresses: each local at the next free frame byte, in IR
-    // order (params first, then defined values in instruction order), stepping
-    // through the banks via `place_contiguous`/`region_for`, which panics if
-    // a frame exceeds the device's last GPR bank (0x1EF on PIC16F877A).
+    // 7. Local addresses: each slot of the liveness-colored frame at the
+    // next free frame byte, stepping through the banks via
+    // `place_contiguous`/`region_for` (which panics if a frame exceeds the
+    // device's last GPR bank, 0x1EF on PIC16F877A), then every value at its
+    // slot's address. The slot walk is exactly `frame_end`'s, so the placed
+    // end equals the physical end the callee bases were derived from.
     let mut locals: HashMap<String, u16> = HashMap::new();
     let mut local_width: HashMap<String, u8> = HashMap::new();
     for f in &m.funcs {
         let b = base[&f.name];
+        let fl = frame_layout(f);
+        let mut slot_addr: Vec<u16> = Vec::with_capacity(fl.widths.len());
         let mut addr = b;
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut place = |name: &str, width: u8| {
-            if seen.insert(name.to_string()) {
-                let start = place_contiguous(device, addr, width);
-                let key = format!("{}::{name}", f.name);
-                locals.insert(key.clone(), start);
-                local_width.insert(key, width);
-                addr = start + u16::from(width);
-            }
-        };
-        for p in &f.params {
-            place(&p.name, p.width);
+        for &w in &fl.widths {
+            let start = place_contiguous(device, addr, w);
+            slot_addr.push(start);
+            addr = start + u16::from(w);
         }
-        for blk in &f.blocks {
-            for inst in &blk.insts {
-                if let Some((name, width)) = def_width(inst) {
-                    place(&name, width);
-                }
-            }
+        for (name, &slot) in &fl.slot_of {
+            let key = format!("{}::{name}", f.name);
+            locals.insert(key.clone(), slot_addr[slot]);
+            local_width.insert(key, fl.widths[slot]);
         }
     }
 
