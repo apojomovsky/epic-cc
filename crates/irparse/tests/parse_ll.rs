@@ -26,6 +26,7 @@ fn parses_array_and_const_globals_and_gep() {
             is_const,
             size,
             bytes,
+            refs: _,
             addr,
         } => {
             assert_eq!(name, "ram");
@@ -45,6 +46,7 @@ fn parses_array_and_const_globals_and_gep() {
             is_const,
             size,
             bytes,
+            refs: _,
             addr,
         } => {
             assert_eq!(name, "table");
@@ -1171,6 +1173,7 @@ fn const_array_300_bytes_parses() {
             is_const,
             size,
             bytes,
+            refs: _,
             addr,
         } => {
             assert_eq!(name, "table");
@@ -1208,6 +1211,7 @@ fn const_array_i32_elements_parse_to_le_bytes() {
             is_const,
             size,
             bytes,
+            refs: _,
             addr,
         } => {
             assert_eq!(name, "itable");
@@ -1245,6 +1249,7 @@ fn const_array_float_elements_parse_to_le_bytes() {
             is_const,
             size,
             bytes,
+            refs: _,
             addr,
         } => {
             assert_eq!(name, "ftable");
@@ -1280,6 +1285,7 @@ fn const_array_600_bytes_parses() {
             is_const,
             size,
             bytes,
+            refs: _,
             addr,
         } => {
             assert_eq!(name, "big");

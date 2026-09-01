@@ -360,6 +360,11 @@ pub struct Global {
     pub is_const: bool,
     pub size: u16,
     pub bytes: Vec<u8>,
+    /// Byte offsets into `bytes` that hold a function's link-time address
+    /// (a `ptr @fn` const struct field, epic-cc#154): the table emitters
+    /// and the const-to-RAM init materialize `LOW(fn)`/`HIGH(fn)` label
+    /// literals at these offsets instead of the placeholder zero bytes.
+    pub refs: Vec<(usize, String)>,
     pub addr: Option<u16>,
 }
 
@@ -857,6 +862,7 @@ pub fn parse(text: &str) -> Module {
                 size: u16::from(ty.bytes()),
                 bytes: Vec::new(),
                 addr,
+                refs: Vec::new(),
             });
         } else if line.starts_with("fn ") {
             let rest = &line[3..];
