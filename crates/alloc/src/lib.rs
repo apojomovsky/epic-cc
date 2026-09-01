@@ -770,15 +770,14 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                             }
                         }
                     }
-                    // A pointer select whose arms are const globals (or GEPs
-                    // over them) is a runtime address VALUE when the arms do
-                    // not fold to a common base (iselcore seeds it as an
+                    // A pointer select whose arms are const globals is a runtime
+                    // address VALUE when the arms do not fold to a common base
+                    // (iselcore seeds it as an
                     // indirect slot, epic-cc#147): the selected arm's bytes
                     // are read through the slot with RAM semantics, so each
                     // const arm must be copied to RAM. A select that folds
                     // (same base, e.g. the ccp_sel shape) keeps its const in
-                    // flash: every load through it lowers via the fold's
-                    // RETLW/TBLRD path.
+                    // flash: loads lower via the fold's RETLW/TBLRD path.
                     if let ir::Inst::Select(s) = inst {
                         if !s.ptr {
                             continue;
@@ -796,18 +795,19 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                                 ir::Val::Const(_) => None,
                             }
                         };
+                        // `ba != bb` is the fold test: equal const bases fold
+                        // (ccp_sel shape, const stays in flash); different
+                        // bases, or a const arm against a RAM/runtime arm,
+                        // seed the select and need each const arm in RAM.
                         let (ba, bb) = (const_base(&s.a), const_base(&s.b));
-                        match (ba, bb) {
-                            (Some(a), Some(b)) if a != b => {
-                                for g in [a, b] {
-                                    if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
-                                        if gl.size <= 255 {
-                                            const_to_ram.insert(g);
-                                        }
+                        if ba != bb {
+                            for g in [ba, bb].into_iter().flatten() {
+                                if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
+                                    if gl.size <= 255 {
+                                        const_to_ram.insert(g);
                                     }
                                 }
                             }
-                            _ => {}
                         }
                     }
                 }

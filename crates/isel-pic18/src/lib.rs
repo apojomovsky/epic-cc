@@ -336,8 +336,8 @@ impl<'m> Gen<'m> {
     /// link-time address as two literals, a `Reg` copies the two bytes of
     /// its runtime-address slot (a seeded select dst, an IntToPtr dst, or
     /// a pointer param). Used by the pointer-select materialization
-    /// (epic-cc#147); a reg with a constant offset or dynamic terms is a
-    /// computed address with no single materializable value and panics.
+    /// (epic-cc#147); a reg with dynamic terms is a computed address with
+    /// no single materializable value and panics.
     fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
         match val {
             Val::Const(k) => {

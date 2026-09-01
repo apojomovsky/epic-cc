@@ -5,54 +5,39 @@
 //! Hand-computed expectations (sim sets `ok_flag` before run):
 //!   - ok_flag = 1: out = 'P' (0x50)
 //!   - ok_flag = 0: out = 'F' (0x46)
-use std::collections::HashMap;
 use std::process::Command;
 
-fn layout_for_device(dev: &'static device::Device) -> alloc::AllocLayout {
+/// Compile `fixture` for `device` and run it in the sim with `ok_flag` set
+/// to each `(flag, expected_out)` pair, asserting `out` and `halted`.
+fn run_fixture(
+    device_name: &str,
+    device: &'static device::Device,
+    fixture: &str,
+    cases: &[(u8, u8)],
+) {
     let (clang, resdir) = driver::clang::pic_clang_from_env();
     let ll_text = driver::clang::compile_to_stdout(
         &clang,
         &resdir,
-        std::path::Path::new("tests/fixtures/select_globals.c"),
+        std::path::Path::new(fixture),
         &driver::clang::Options::default(),
     );
     let mut m = irparse::parse_ll(&ll_text);
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
-    let layout = alloc::allocate(dev, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = match dev.core {
-        device::Core::Pic14 => isel::select(dev, &m, &addrs),
-        device::Core::Pic18 => isel_pic18::select(dev, &m, &addrs),
-        _ => panic!("unsupported core"),
-    };
-    let _ = match dev.core {
-        device::Core::Pic14 => {
-            let a = banking::assign_banks(dev, &asm);
-            peephole::optimize(&a)
-        }
-        _ => asm,
-    };
-    layout
-}
-
-fn run_select_globals(device_name: &str, device: &'static device::Device) {
-    let layout = layout_for_device(device);
+    let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
     let ok_addr = *layout.globals.get("ok_flag").expect("ok_flag") as usize;
     let out_addr = *layout.globals.get("out").expect("out") as usize;
 
-    let hex_path = format!("tests/fixtures/select_globals_{device_name}.hex");
+    let stem = std::path::Path::new(fixture)
+        .file_stem()
+        .expect("fixture file name")
+        .to_str()
+        .expect("fixture name utf8");
+    let hex_path = format!("tests/fixtures/{stem}_{device_name}.hex");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([
-            "tests/fixtures/select_globals.c",
-            "-o",
-            &hex_path,
-            "--device",
-            device_name,
-        ])
+        .args([fixture, "-o", &hex_path, "--device", device_name])
         .output()
         .expect("run driver");
     assert!(
@@ -62,34 +47,52 @@ fn run_select_globals(device_name: &str, device: &'static device::Device) {
     );
     let hex = std::fs::read_to_string(&hex_path).expect("read hex");
 
-    let check = |flag: u8, expected: u8| match device.core {
-        device::Core::Pic14 => {
-            let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-            sim.ram_mut()[ok_addr] = flag;
-            sim.run(200_000);
-            assert_eq!(
-                sim.ram()[out_addr],
-                expected,
-                "out {device_name} flag={flag}"
-            );
-            assert!(sim.halted(), "halted {device_name} flag={flag}");
+    for &(flag, expected) in cases {
+        match device.core {
+            device::Core::Pic14 => {
+                let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
+                sim.ram_mut()[ok_addr] = flag;
+                sim.run(200_000);
+                assert_eq!(
+                    sim.ram()[out_addr],
+                    expected,
+                    "out {device_name} flag={flag}"
+                );
+                assert!(sim.halted(), "halted {device_name} flag={flag}");
+            }
+            device::Core::Pic18 => {
+                let mut sim = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+                sim.ram_mut()[ok_addr] = flag;
+                sim.run(200_000);
+                assert_eq!(
+                    sim.ram()[out_addr],
+                    expected,
+                    "out {device_name} flag={flag}"
+                );
+                assert!(sim.halted(), "halted {device_name} flag={flag}");
+            }
+            device::Core::Pic14e => panic!("pic14e core not implemented"),
         }
-        device::Core::Pic18 => {
-            let mut sim = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-            sim.ram_mut()[ok_addr] = flag;
-            sim.run(200_000);
-            assert_eq!(
-                sim.ram()[out_addr],
-                expected,
-                "out {device_name} flag={flag}"
-            );
-            assert!(sim.halted(), "halted {device_name} flag={flag}");
-        }
-        device::Core::Pic14e => panic!("pic14e core not implemented"),
-    };
-    check(1, b'P');
-    check(0, b'F');
+    }
     let _ = std::fs::remove_file(&hex_path);
+}
+
+fn run_select_globals(device_name: &str, device: &'static device::Device) {
+    run_fixture(
+        device_name,
+        device,
+        "tests/fixtures/select_globals.c",
+        &[(1, b'P'), (0, b'F')],
+    );
+}
+
+fn run_select_globals_one_const(device_name: &str, device: &'static device::Device) {
+    run_fixture(
+        device_name,
+        device,
+        "tests/fixtures/select_globals_one_const.c",
+        &[(1, b'P'), (0, b'R')],
+    );
 }
 
 #[test]
@@ -100,4 +103,14 @@ fn select_globals_runs_on_p16() {
 #[test]
 fn select_globals_runs_on_p18() {
     run_select_globals("p18f4550", &device::PIC18F4550);
+}
+
+#[test]
+fn select_globals_one_const_arm_runs_on_p16() {
+    run_select_globals_one_const("p16f877a", &device::PIC16F877A);
+}
+
+#[test]
+fn select_globals_one_const_arm_runs_on_p18() {
+    run_select_globals_one_const("p18f4550", &device::PIC18F4550);
 }
