@@ -346,8 +346,14 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
 fn inst_vals(inst: &ir::Inst) -> Vec<String> {
     use ir::Inst;
     match inst {
-        Inst::Load(l) => vec![l.ptr.clone()],
-        Inst::Store(s) => vec![s.ptr.clone(), val_name(&s.val)],
+        // Load/Store pointers are canonical prefixed forms (`%x`/`@g`);
+        // strip the prefix so a local pointer matches the defs keys (a
+        // global pointer is never a def and is filtered by the caller).
+        Inst::Load(l) => vec![l.ptr.strip_prefix('%').unwrap_or(&l.ptr).to_string()],
+        Inst::Store(s) => vec![
+            s.ptr.strip_prefix('%').unwrap_or(&s.ptr).to_string(),
+            val_name(&s.val),
+        ],
         Inst::Bin(b) => vec![val_name(&b.a), val_name(&b.b)],
         Inst::Ret(Some((_, v))) => vec![val_name(v)],
         Inst::Ret(None) => Vec::new(),
@@ -381,7 +387,14 @@ fn inst_vals(inst: &ir::Inst) -> Vec<String> {
         Inst::FloatBin(b) => vec![val_name(&b.a), val_name(&b.b)],
         Inst::Fcmp(c) => vec![val_name(&c.a), val_name(&c.b)],
         Inst::FloatConv(c) => vec![val_name(&c.val)],
-        Inst::Asm(a) => a.operands.iter().map(|o| o.ptr.clone()).collect(),
+        // Asm operand pointers are canonical prefixed forms (`%x`/`@g`);
+        // strip the prefix so a local operand matches the defs keys (a
+        // global operand is never a def and is filtered by the caller).
+        Inst::Asm(a) => a
+            .operands
+            .iter()
+            .map(|o| o.ptr.strip_prefix('%').unwrap_or(&o.ptr).to_string())
+            .collect(),
     }
 }
 

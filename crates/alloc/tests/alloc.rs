@@ -1038,3 +1038,52 @@ fn liveness_layout_is_deterministic() {
     assert_eq!(o1.locals, o2.locals);
     assert_eq!(o1.bank_used, o2.bank_used);
 }
+
+/// A store through a local pointer reads the pointed-to value: the alloca
+/// stays live across the store, so a value live at the same point cannot
+/// share its slot (the store would clobber it). The prefixed pointer form
+/// (`%__scr`) must be stripped to match the defs keys.
+#[test]
+fn store_through_local_pointer_keeps_it_live() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %__scr = alloca 2\n\
+             %c = add i8 1, 2\n\
+             %d = add i8 3, 4\n\
+             store i8 %d %__scr\n\
+             %e = add i8 %c, 1\n\
+             store i8 %e @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::__scr"], out.locals["f::c"],
+        "store through __scr clobbers live c"
+    );
+    // e is dead after its store, so it reuses __scr's slot.
+    assert_eq!(out.locals["f::e"], out.locals["f::__scr"]);
+}
+
+/// An asm operand reading a local keeps it live: the prefixed operand form
+/// (`%x`) must be stripped to match the defs keys, or the value's slot is
+/// reused while the asm reads it.
+#[test]
+fn asm_operand_keeps_the_value_live() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %x = add i8 1, 2\n\
+             %y = add i8 3, 4\n\
+             asm \"movf $0, W\" *m %x\n\
+             store i8 %y, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::x"], out.locals["f::y"],
+        "asm reads x while y is live"
+    );
+}
