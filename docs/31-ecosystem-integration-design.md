@@ -736,13 +736,26 @@ through an exact-size RAM copy, the `EPIC_HARNESS_LOG_STATIC` pattern), and a li
 `printf(str)` shim maps onto it for XC8-era banner call sites; a `printf` with arguments is
 a compile error there, which keeps the variadic side at #131.
 
-**RAM headroom on the 877A: answered 2026-08-28 by the HAL-3 clusters.** `epic-hal#59`
-records the shelf-wide figures. Per module the overlay fits with room to the wall: the
-harness slice high-waters at 82 B (0x72), `epic-tick` runs its target gate at 288/368 bytes,
-`epic-serial` builds at 297/368. At whole-program scale the wall is real and arrives loudly,
-not silently: four of the eight PIC16 combos exceed the GPR capacity, three of them by a
-single byte with a precise `alloc: GPR demand exceeds 0x1EF` panic, and encoder-tick by 25
-bin-packed bytes (`no arrangement of 16 globals fits p16f877a's 4 GPR bank window(s)`).
+**RAM headroom on the 877A: answered 2026-08-28 by the HAL-3 clusters, and the
+locals wall closed 2026-09-01 by epic-cc#172.** `epic-hal#59` records the shelf-wide
+figures. Per module the overlay fits with room to the wall: the harness slice high-waters
+at 82 B (0x72), `epic-tick` runs its target gate at 288/368 bytes, `epic-serial` builds at
+297/368. At whole-program scale the wall was real and arrived loudly, not silently: four
+of the eight PIC16 combos exceeded the GPR capacity, three of them by a single byte with
+a precise `alloc: GPR demand exceeds 0x1EF` panic, and encoder-tick by 25 bin-packed
+bytes (`no arrangement of 16 globals fits p16f877a's 4 GPR bank window(s)`).
+
+The locals wall is closed by liveness-based intra-frame slot reuse in `alloc`
+(epic-cc#172): each function's frame shrinks from the sum of its locals' byte widths to
+the peak simultaneous demand, computed as linear-scan live intervals over the IR (phi
+destinations live at predecessor ends, loop-carried values spanning their loop). The
+epic-encoder sizecheck target now links on 16F877A and 16F887 at RAM 67/368 (was
+150/368) and flash 1649/8192 (was 1785/8192). The full epic-encoder / epic-serial
+examples and the combos with the target harness now pass the allocator but hit a
+pre-existing flash-density wall (10.7K words vs the 877A's 8K flash), a codegen issue
+separate from this ticket. The encoder-tick combo's global bin-pack failure (377 B of
+globals, five `EPIC_HARNESS_LOG_STATIC` staging buffers owning 291 B) is a globals
+problem, not a locals problem, and stays open as an epic-hal staging-buffer reduction.
 Per-combo XC8 baselines and the exact epic-cc panics live in epic-hal's
 `docs/combo-epiccc-conformance.md`.
 

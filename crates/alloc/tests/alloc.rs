@@ -83,8 +83,10 @@ fn sibling_frames_share_a_base() {
     assert_eq!(out.locals["main::m0"], 0x21);
     assert_eq!(out.locals["a::a0"], 0x22);
     assert!(out.locals["main::m0"] < out.locals["a::a0"]);
-    // (c) overlay wins: total bank-0 demand < sum of the three demands.
-    assert_eq!(out.total_bank0, 5);
+    // The dead defs (a0/a1/b0/b1 never read) share one slot each, so the
+    // total is 3 (main's m0 + the shared 2-byte slot), not the 5 the
+    // pre-liveness allocator needed.
+    assert_eq!(out.total_bank0, 3);
     assert!(out.total_bank0 < 1 + 4 + 4);
 }
 
@@ -112,9 +114,9 @@ fn map_text_emits_global_and_local_lines() {
         map_text(&out),
         "global in 0x20\n\
          local a a0 0x22\n\
-         local a a1 0x24\n\
+         local a a1 0x22\n\
          local b b0 0x22\n\
-         local b b1 0x24\n\
+         local b b1 0x22\n\
          local main m0 0x21\n",
     );
 }
@@ -161,10 +163,14 @@ fn globals_span_across_banks() {
 
 #[test]
 fn frame_spans_across_banks() {
-    // One function with 90 i8 locals: its frame crosses bank 0 into 0xA0+.
-    let mut src = String::from("fn f(void) ()\n  block entry:\n");
+    // One function with 90 i8 locals, all live (stored to a const sink so
+    // liveness keeps them co-resident): its frame crosses bank 0 into 0xA0+.
+    let mut src = String::from("const sink i8\nfn f(void) ()\n  block entry:\n");
     for i in 0..90 {
         src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
+    }
+    for i in 0..90 {
+        src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
     }
     src.push_str("    ret void\n");
     let m = parse(&src);
@@ -188,7 +194,7 @@ fn callee_base_follows_callers_physical_frame_end() {
     // common-RAM gap and would place b at 0xA0, exactly where a's spill
     // locals live while both frames are live during the call.
     let mut src = String::from(
-        "fn main(void) ()\n\
+        "const sink i8\nfn main(void) ()\n\
            block entry:\n\
              %m0 = add i8 1, 2\n\
              call void @a()\n\
@@ -198,6 +204,9 @@ fn callee_base_follows_callers_physical_frame_end() {
     );
     for i in 0..90 {
         src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
+    }
+    for i in 0..90 {
+        src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
     }
     src.push_str(
         "    call void @b()\n\
@@ -242,10 +251,12 @@ fn callee_base_clears_region_tail_hole_left_by_i16_local() {
         gsrc.push_str(&format!("global g{i} i8\n"));
     }
     let src = format!(
-        "{gsrc}fn main(void) ()\n\
+        "{gsrc}const sink i8\nfn main(void) ()\n\
            block entry:\n\
              %v0 = add i16 1, 2\n\
              %v1 = add i8 3, 4\n\
+             store i16 %v0, ptr @sink\n\
+             store i8 %v1, ptr @sink\n\
              call void @b()\n\
              ret void\n\
          fn b(void) ()\n\
@@ -295,9 +306,12 @@ fn i16_frame_stays_even_aligned_across_banks() {
     // A frame of 50 i16 locals (100 bytes) crosses bank 0 into bank 1. From
     // the even root base 0x20 the i16s land on even addresses, and the bank
     // progression (0x6F -> 0xA0) keeps them even-aligned within each bank.
-    let mut src = String::from("fn f(void) ()\n  block entry:\n");
+    let mut src = String::from("const sink i16\nfn f(void) ()\n  block entry:\n");
     for i in 0..50 {
         src.push_str(&format!("    %v{i} = add i16 1, 2\n"));
+    }
+    for i in 0..50 {
+        src.push_str(&format!("    store i16 %v{i}, ptr @sink\n"));
     }
     src.push_str("    ret void\n");
     let m = parse(&src);
@@ -446,17 +460,21 @@ fn i32_param_and_def_get_four_bytes() {
     // i32 def must each consume a full 4-byte slot (no intra-frame alignment,
     // exactly like the i16 slots in params_are_frame_locals_too).
     let m = parse(
-        "fn f(i32) (p=i32)\n\
+        "const sink i32\nfn f(i32) (p=i32)\n\
            block entry:\n\
              %q = add i32 %p, 1\n\
              %r = add i32 %q, 2\n\
+             %s = add i32 %p, %r\n\
+             store i32 %s, ptr @sink\n\
              ret void\n",
     );
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
-    // p i32 at 0x20, q at 0x24, r at 0x28 — contiguous 4-byte slots.
+    // p i32 at 0x20, q at 0x24, r at 0x28 (contiguous 4-byte slots); s
+    // reuses q's slot (q is dead once r and s are computed).
     assert_eq!(out.locals["f::p"], 0x20);
     assert_eq!(out.locals["f::q"], 0x24);
     assert_eq!(out.locals["f::r"], 0x28);
+    assert_eq!(out.locals["f::s"], 0x24);
     assert_eq!(out.total_bank0, 4 + 4 + 4);
 }
 
@@ -466,9 +484,12 @@ fn frame_exceeding_all_banks_panics() {
     // 250 i16 locals = 500 bytes, more than the 320 GPR bytes across all four
     // banks (4 x 80-byte regions, bank 3 at 0x1A0-0x1EF), so allocation
     // panics past 0x1EF.
-    let mut src = String::from("fn main(void) ()\n  block entry:\n");
+    let mut src = String::from("const sink i16\nfn main(void) ()\n  block entry:\n");
     for i in 0..250 {
         src.push_str(&format!("    %v{i} = add i16 1, 2\n"));
+    }
+    for i in 0..250 {
+        src.push_str(&format!("    store i16 %v{i}, ptr @sink\n"));
     }
     src.push_str("    ret void\n");
     let m = parse(&src);
@@ -560,10 +581,12 @@ fn isr_region_clears_the_main_context_physical_frame_end() {
         gsrc.push_str(&format!("global g{i} i8\n"));
     }
     let src = format!(
-        "{gsrc}fn main(void) ()\n\
+        "{gsrc}const sink i8\nfn main(void) ()\n\
            block entry:\n\
              %v0 = add i16 1, 2\n\
              %v1 = add i8 3, 4\n\
+             store i16 %v0, ptr @sink\n\
+             store i8 %v1, ptr @sink\n\
              ret void\n\
          fn isr(void) [isr] ()\n\
            block entry:\n\
@@ -599,10 +622,12 @@ fn bank_used_tracks_high_water_per_bank() {
         gsrc.push_str(&format!("global g{i} i8\n"));
     }
     let m = parse(&format!(
-        "{gsrc}fn main(void) ()\n\
+        "{gsrc}const sink i8\nfn main(void) ()\n\
                block entry:\n\
                  %v0 = add i16 1, 2\n\
                  %v1 = add i8 3, 4\n\
+                 store i16 %v0, ptr @sink\n\
+                 store i8 %v1, ptr @sink\n\
                  ret void\n"
     ));
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
@@ -767,14 +792,19 @@ fn a_single_global_larger_than_any_bank_panics_even_under_total_capacity() {
 /// so the root frame starts at 0x20).
 fn routine_module(main_locals: u32) -> ir::Module {
     let mut src = String::from(
-        "fn __mul_u16(i16) (a=i16, b=i16)\n\
+        "const sink i8\nfn __mul_u16(i16) (a=i16, b=i16)\n\
            block entry:\n\
              %__scr = alloca 14\n\
+             store i16 %a, ptr %__scr\n\
+             store i16 %b, ptr %__scr\n\
          fn main(void) ()\n\
            block entry:\n",
     );
     for i in 0..main_locals {
         src.push_str(&format!("    %m{i} = add i8 1, 2\n"));
+    }
+    for i in 0..main_locals {
+        src.push_str(&format!("    store i8 %m{i}, ptr @sink\n"));
     }
     src.push_str("    ret void\n");
     parse(&src)
@@ -827,17 +857,24 @@ fn routine_rounding_wastes_only_the_partial_bank() {
     // common region into bank 1, so the frame rounds wholesale to 0xA0;
     // only the partial bank-0 tail is wasted).
     let mut src = String::from(
-        "fn __udiv_u8(i8) (num=i8, den=i8)\n\
+        "const sink i8\nfn __udiv_u8(i8) (num=i8, den=i8)\n\
            block entry:\n\
              %__scr = alloca 4\n\
+             store i8 %num, ptr %__scr\n\
+             store i8 %den, ptr %__scr\n\
          fn __mul_u16(i16) (a=i16, b=i16)\n\
            block entry:\n\
              %__scr = alloca 14\n\
+             store i16 %a, ptr %__scr\n\
+             store i16 %b, ptr %__scr\n\
          fn f(void) ()\n\
            block entry:\n",
     );
     for i in 0..74u32 {
         src.push_str(&format!("    %f{i} = add i8 1, 2\n"));
+    }
+    for i in 0..74u32 {
+        src.push_str(&format!("    store i8 %f{i}, ptr @sink\n"));
     }
     src.push_str("    call void @__udiv_u8()\n    call void @__mul_u16()\n    ret void\n");
     src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
@@ -856,5 +893,231 @@ fn routine_rounding_wastes_only_the_partial_bank() {
         out.locals["__mul_u16::__scr"] + 14,
         0xB2,
         "whole frame inside bank 1"
+    );
+}
+
+// ---- liveness overlay (epic-cc#172) ----
+
+/// Two i8 defs in the same block, the first dead before the second is
+/// defined: they share one slot. The pre-liveness allocator gave each a
+/// byte (frame 2); liveness gives frame 1.
+#[test]
+fn dead_def_reuses_the_slot() {
+    let m = parse(
+        "fn f(void) ()\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             %b = add i8 3, 4\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::a"], 0x20);
+    assert_eq!(out.locals["f::b"], 0x20, "dead a's slot is reused by b");
+    assert_eq!(out.total_bank0, 1);
+}
+
+/// Two i8 defs both live at the same point (each stored to a const sink)
+/// cannot share: the frame is 2 bytes.
+#[test]
+fn co_live_values_do_not_share() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             %b = add i8 3, 4\n\
+             store i8 %a, ptr @sink\n\
+             store i8 %b, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::a"], 0x20);
+    assert_eq!(out.locals["f::b"], 0x21);
+    assert_eq!(out.total_bank0, 2);
+}
+
+/// A value live across a call (used after it) keeps its slot; a value dead
+/// before the call shares with the callee's frame base region only if the
+/// liveness says so; here the live value pins the frame at 2 bytes.
+#[test]
+fn value_live_across_call_pins_the_frame() {
+    let m = parse(
+        "const sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             call void @callee()\n\
+             store i8 %a, ptr @sink\n\
+             ret void\n\
+         fn callee(void) ()\n\
+           block entry:\n\
+             %c = add i8 5, 6\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    // main's frame is 1 byte (a is live across the call); callee's base is
+    // main's physical end 0x21.
+    assert_eq!(out.locals["main::a"], 0x20);
+    assert_eq!(out.locals["callee::c"], 0x21);
+}
+
+/// A phi destination is live from the earliest predecessor end (isel's
+/// copies) through the merge block: two phi destinations of the same merge
+/// never share a slot, and a value dead before the merge's copies can.
+#[test]
+fn phi_destinations_are_live_at_pred_ends() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             br i1 %c, label %t, label %f\n\
+           block t:\n\
+             %x = add i8 1, 2\n\
+             br label %m\n\
+           block f:\n\
+             %y = add i8 3, 4\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i8 %x t %y f\n\
+             store i8 %p, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    // x and y are dead by the merge (only the phi reads them, at the pred
+    // ends), so they share a slot; p is live from the pred ends through the
+    // merge, so it gets its own.
+    assert_eq!(out.locals["f::x"], out.locals["f::y"]);
+    assert_ne!(out.locals["f::p"], out.locals["f::x"]);
+}
+
+/// A loop-carried value (use before def in linear order) spans the loop and
+/// cannot alias a value it is co-live with: the back-edge phi and the
+/// induction value stay in distinct slots.
+#[test]
+fn loop_carried_values_do_not_alias() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             br label %h\n\
+           block h:\n\
+             %i = phi i8 0 entry %next h\n\
+             %acc = phi i8 0 entry %sum h\n\
+             %sum = add i8 %acc, %i\n\
+             %next = add i8 %i, 1\n\
+             store i8 %sum, ptr @sink\n\
+             br i1 1, label %h, label %exit\n\
+           block exit:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    // i, acc, sum, next are all live in the loop header: 4 distinct slots.
+    let mut addrs: Vec<u16> = ["i", "acc", "sum", "next"]
+        .iter()
+        .map(|v| out.locals[&format!("f::{v}")])
+        .collect();
+    addrs.sort();
+    addrs.dedup();
+    assert_eq!(addrs.len(), 4, "loop-carried values must not alias");
+}
+
+/// The frame layout is deterministic: two identical modules allocate
+/// identically.
+#[test]
+fn liveness_layout_is_deterministic() {
+    let src = "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             %b = add i8 3, 4\n\
+             store i8 %a, ptr @sink\n\
+             store i8 %b, ptr @sink\n\
+             ret void\n";
+    let o1 = allocate(&PIC16F877A, &parse(src), "depth 1\n");
+    let o2 = allocate(&PIC16F877A, &parse(src), "depth 1\n");
+    assert_eq!(o1.locals, o2.locals);
+    assert_eq!(o1.bank_used, o2.bank_used);
+}
+
+/// A store through a local pointer reads the pointed-to value: the alloca
+/// stays live across the store, so a value live at the same point cannot
+/// share its slot (the store would clobber it). The prefixed pointer form
+/// (`%__scr`) must be stripped to match the defs keys.
+#[test]
+fn store_through_local_pointer_keeps_it_live() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %__scr = alloca 2\n\
+             %c = add i8 1, 2\n\
+             %d = add i8 3, 4\n\
+             store i8 %d %__scr\n\
+             %e = add i8 %c, 1\n\
+             store i8 %e @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::__scr"], out.locals["f::c"],
+        "store through __scr clobbers live c"
+    );
+    // The alloca is a memory object: its slot is reserved for the whole
+    // function, so e (dead after its store) still cannot reuse it.
+    assert_ne!(out.locals["f::e"], out.locals["f::__scr"]);
+}
+
+/// An asm operand reading a local keeps it live: the prefixed operand form
+/// (`%x`) must be stripped to match the defs keys, or the value's slot is
+/// reused while the asm reads it.
+#[test]
+fn asm_operand_keeps_the_value_live() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %x = add i8 1, 2\n\
+             %y = add i8 3, 4\n\
+             asm \"movf $0, W\" *m %x\n\
+             store i8 %y, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::x"], out.locals["f::y"],
+        "asm reads x while y is live"
+    );
+}
+
+/// A GEP index is re-read by isel at every load/store through the GEP's
+/// result pointer (the FSR setup recomputes the address from the index each
+/// time), so the index stays live until the last use of the GEP dst. Without
+/// the propagation, the index's slot is reused by a later load temp while
+/// the FSR setup still reads it.
+#[test]
+fn gep_index_stays_live_until_last_gep_use() {
+    let m = parse(
+        "global arr i8\n         fn f(void) ()\n           block entry:\n             %i = and i8 7, 3\n             %p = gep @arr +0 +1*%i\n             store i8 1 %p\n             %q = gep @arr +0 +1*%i\n             %v = load i8 %q\n             %w = add i8 %v, 1\n             store i8 %w @arr\n             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::i"], out.locals["f::v"],
+        "the load temp reuses the index slot while the FSR setup reads it"
+    );
+}
+
+/// An indirect call's `func` register is read by isel at dispatch time
+/// (after the args are loaded), so it stays live through the call. Without
+/// the use, a later arg temp reuses its slot and clobbers the function
+/// pointer before the compare-and-call chain reads it.
+#[test]
+fn indirect_call_target_stays_live_through_the_call() {
+    let m = parse(
+        "const sink i8\n         fn f(void) ()\n           block entry:\n             %fp = load i16 @sink\n             %a = add i8 1, 2\n             %b = call i8 %fp(i8 %a) callees g h\n             store i8 %b, ptr @sink\n             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::fp"], out.locals["f::a"],
+        "the arg temp reuses the fp slot while the dispatch reads it"
     );
 }

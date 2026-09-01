@@ -1264,14 +1264,28 @@ fn parse_inst(line: &str) -> Inst {
     }
     if let Some(rest) = line.strip_prefix("br ") {
         if let Some(r) = rest.strip_prefix("i1 ") {
+            // Canonical form: `br i1 %c, label %t, label %f` (the test-side
+            // parser also accepts the bare `br i1 %c, %t, %f` shorthand).
             let mut it = r.split_whitespace();
             let cond = parse_val(it.next().unwrap());
-            let t = it.next().unwrap().to_string();
-            let f = it.next().unwrap().to_string();
+            let mut t = it.next().unwrap().to_string();
+            if t == "label" {
+                t = it.next().unwrap().to_string();
+            }
+            let mut f = it.next().unwrap().to_string();
+            if f == "label" {
+                f = it.next().unwrap().to_string();
+            }
+            let t = t.trim_start_matches('%').trim_end_matches(',').to_string();
+            let f = f.trim_start_matches('%').trim_end_matches(',').to_string();
             return Inst::BrCond(BrCond { cond, t, f });
         }
         return Inst::Br(Br {
-            target: rest.to_string(),
+            target: rest
+                .strip_prefix("label ")
+                .unwrap_or(rest)
+                .trim_start_matches('%')
+                .to_string(),
         });
     }
     if let Some(rest) = line.strip_prefix("call ") {
