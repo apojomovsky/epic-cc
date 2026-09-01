@@ -319,8 +319,8 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
     // the end of every block it is live-out of. Phi incoming values are
     // excluded from the use sets (they are used precisely at the pred end)
     // and phi dsts from the def sets (they are written by the pred-end
-    // copies), so the fixpoint does not distort their intervals.
-    // The test-side `ir::parse` keeps a `label ` prefix on Br targets while
+    // copies), so the fixpoint does not distort their intervals. The
+    // test-side `ir::parse` keeps a `label ` prefix on Br targets while
     // `irparse` strips it; normalize both forms here.
     let norm = |t: &str| {
         t.strip_prefix("label ")

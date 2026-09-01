@@ -749,7 +749,7 @@ The locals wall is closed by liveness-based intra-frame slot reuse in `alloc`
 (epic-cc#172): each function's frame shrinks from the sum of its locals' byte widths to
 the peak simultaneous demand, computed as linear-scan live intervals over the IR (phi
 destinations live at predecessor ends, loop-carried values spanning their loop). The
-epic-encoder sizecheck target now links on 16F877A and 16F887 at RAM 69/368 (was
+epic-encoder sizecheck target now links on 16F877A and 16F887 at RAM 67/368 (was
 150/368) and flash 1649/8192 (was 1785/8192). The full epic-encoder / epic-serial
 examples and the combos with the target harness now pass the allocator but hit a
 pre-existing flash-density wall (10.7K words vs the 877A's 8K flash), a codegen issue

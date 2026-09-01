@@ -21,14 +21,14 @@
 //! steps (before the three real statements) each call the `__mul_u8`/
 //! `__udiv_u8` recipes. The overlay allocator bases every callee at its
 //! caller's physical frame end, so the recipe slots sit right after `main`'s
-//! frame — at 0x2A, exactly where `f3`'s frame also starts (f3 is another
+//! frame, at 0x2A, exactly where `f3`'s frame also starts (f3 is another
 //! main callee). The two regions overlap but are NEVER simultaneously live:
 //! main's padding (and its recipe calls) runs before the `f3` call, so the
 //! recipe slots and f3's frame are used at disjoint times. This is safe by
 //! construction (padding is pure dead code that must run before the real
 //! statements), but it is load-bearing: moving the padding after the f3
 //! call, or letting main call f3 before the padding, would corrupt f3's
-//! frame — documented here per the task-4 review.
+//! frame, documented here per the task-4 review.
 //!
 //!
 //! The layout below is the liveness-overlay one (epic-cc#172): the uncalled
@@ -50,7 +50,7 @@
 //! main           0x1000  page 2   (calls f3/f1 cross-page; reads table)
 //! F4             0x1125  page 2   (filler)
 //! __read_table   0x14DC  page 2   (cross-page from f3; same-page from main)
-//! table          0x1500  page 2   (256-byte window 0x15 — the reader's
+//! table          0x1500  page 2   (256-byte window 0x15, the reader's
 //!                                   `MOVLW HIGH(table); MOVWF PCLATH` is
 //!                                   load-bearing: without it the computed
 //!                                   PCL jump would land in window 0x10)
@@ -71,11 +71,11 @@
 //! (`same_page_call_skips_restore`, `multi_page_module_runs_in_sim`).
 //!
 //! `out` for in == 290 (0x0122), hand-computed against the exact emitted IR
-//! (clang -O1 folds arithmetic, so the trace is the IR, not the C — the
+//! (clang -O1 folds arithmetic, so the trace is the IR, not the C, the
 //! evaluator in the task's generator reproduces it; the fixture's volatile
 //! reads keep every table read runtime):
 //!   - in = 290 -> f3's argument x = (unsigned char)in = 34 (0x22)
-//!   - f1(34) = 0x5C, f2(34) = 0x53, f3(34) = 0x4B — each function is the
+//!   - f1(34) = 0x5C, f2(34) = 0x53, f3(34) = 0x4B, each function is the
 //!     add/xor chain (add an odd constant, xor the input, repeat; constants
 //!     read from the exact emitted IR), with f2 adding f1(x) and f3 adding
 //!     f2(x) plus table[x & 3] = table[2] = 0x02. Evaluated over u8
@@ -197,7 +197,7 @@ fn multi_page_program_compiles_and_runs_correctly() {
     // calls are same-page (f2 -> f1 is 0 -> 0, f3 -> f2 is 0 -> 0), main's
     // calls are cross-page (main -> f3 is 2 -> 0, main -> f1 is 2 -> 0),
     // and the readers are cross-page from f3 (0 -> 2) but same-page from
-    // main (2 -> 2) — the same-page restore-skip discipline is covered by
+    // main (2 -> 2). The same-page restore-skip discipline is covered by
     // the isel unit tests (`same_page_call_skips_restore`,
     // `multi_page_module_runs_in_sim`).
     assert_eq!(page("f2"), page("f1"), "f2 -> f1 is same-page");
