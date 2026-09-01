@@ -1105,3 +1105,19 @@ fn gep_index_stays_live_until_last_gep_use() {
         "the load temp reuses the index slot while the FSR setup reads it"
     );
 }
+
+/// An indirect call's `func` register is read by isel at dispatch time
+/// (after the args are loaded), so it stays live through the call. Without
+/// the use, a later arg temp reuses its slot and clobbers the function
+/// pointer before the compare-and-call chain reads it.
+#[test]
+fn indirect_call_target_stays_live_through_the_call() {
+    let m = parse(
+        "const sink i8\n         fn f(void) ()\n           block entry:\n             %fp = load i16 @sink\n             %a = add i8 1, 2\n             %b = call i8 %fp(i8 %a) callees g h\n             store i8 %b, ptr @sink\n             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::fp"], out.locals["f::a"],
+        "the arg temp reuses the fp slot while the dispatch reads it"
+    );
+}

@@ -311,6 +311,96 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
         }
     }
 
+    // Loop-aware liveness: a value used in a loop body is live across the
+    // back-edge, so its slot is occupied at the body's end and the header's
+    // start even when its last linear use is earlier. A backward fixpoint
+    // computes live-in/live-out per block; the interval loop then extends
+    // each value's range to the start of every block it is live-in to and
+    // the end of every block it is live-out of. Phi incoming values are
+    // excluded from the use sets (they are used precisely at the pred end)
+    // and phi dsts from the def sets (they are written by the pred-end
+    // copies), so the fixpoint does not distort their intervals.
+    // The test-side `ir::parse` keeps a `label ` prefix on Br targets while
+    // `irparse` strips it; normalize both forms here.
+    let norm = |t: &str| {
+        t.strip_prefix("label ")
+            .unwrap_or(t)
+            .trim_start_matches('%')
+            .to_string()
+    };
+    let mut succ: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, b) in order.iter().enumerate() {
+        let mut ss = Vec::new();
+        for inst in &b.insts {
+            match inst {
+                ir::Inst::Br(br) => ss.push(idx[&norm(&br.target)[..]]),
+                ir::Inst::BrCond(bc) => {
+                    ss.push(idx[&norm(&bc.t)[..]]);
+                    ss.push(idx[&norm(&bc.f)[..]]);
+                }
+                _ => {}
+            }
+        }
+        succ.insert(i, ss);
+    }
+    // Use-before-def per block: a value used in a block before (or at) its
+    // own def there is live at the block's start; a value used only after
+    // its def is not. Phi dsts are defined at the block start, so their uses
+    // never count as use-before-def; phi incomings are excluded from `uses`
+    // (they are live precisely at the pred end, via phi_pred_ends).
+    let mut use_before_def: Vec<HashSet<String>> = vec![HashSet::new(); order.len()];
+    for (v, us) in &uses {
+        for &(b, p) in us {
+            let def_pos = defs.get(v).map(|&(d, pd, _, _, _)| (d, pd));
+            let before = match def_pos {
+                Some((d, pd)) => d != b || p <= pd,
+                None => true,
+            };
+            if before {
+                use_before_def[b].insert(v.clone());
+            }
+        }
+    }
+    let mut def_set: Vec<HashSet<String>> = vec![HashSet::new(); order.len()];
+    for (v, &(d, _, _, _, mem)) in &defs {
+        if !mem {
+            def_set[d].insert(v.clone());
+        }
+    }
+    let mut live_in: Vec<HashSet<String>> = vec![HashSet::new(); order.len()];
+    let mut live_out: Vec<HashSet<String>> = vec![HashSet::new(); order.len()];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in (0..order.len()).rev() {
+            let mut lo_new: HashSet<String> = HashSet::new();
+            for s in &succ[&i] {
+                lo_new.extend(live_in[*s].iter().cloned());
+            }
+            if lo_new != live_out[i] {
+                live_out[i] = lo_new;
+                changed = true;
+            }
+            let mut li_new: HashSet<String> = use_before_def[i].clone();
+            for v in live_out[i].iter() {
+                if !def_set[i].contains(v) {
+                    li_new.insert(v.clone());
+                }
+            }
+            if li_new != live_in[i] {
+                live_in[i] = li_new;
+                changed = true;
+            }
+        }
+    }
+    // Predecessor map for the interval extension below.
+    let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, ss) in &succ {
+        for s in ss {
+            preds.entry(*s).or_default().push(*i);
+        }
+    }
+
     // phi destinations: the ends of their merge block's predecessors (the
     // copy points where isel writes the slot).
     let mut phi_pred_ends: HashMap<String, HashSet<(usize, u16)>> = HashMap::new();
@@ -357,6 +447,28 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
                 for &(b, p) in ps {
                     lo = lo.min((b, p));
                     hi = hi.max((b, p));
+                }
+            }
+            // Loop-aware extension: a value live-in to a block (live across
+            // a back-edge into it) occupies its slot from that block's start
+            // through the end of every predecessor (the value is live at the
+            // pred ends too). The entry block's live-ins are params, already
+            // covered by their defs.
+            if let Some(ps) = preds.get(&0) {
+                for &bi in ps {
+                    if live_in[0].contains(v) {
+                        hi = hi.max((bi, block_len[bi]));
+                    }
+                }
+            }
+            for (bi, li) in live_in.iter().enumerate().skip(1) {
+                if li.contains(v) {
+                    lo = lo.min((bi, 0));
+                    if let Some(ps) = preds.get(&bi) {
+                        for &pi in ps {
+                            hi = hi.max((pi, block_len[pi]));
+                        }
+                    }
                 }
             }
             (lo, hi)
@@ -423,7 +535,18 @@ fn inst_vals(inst: &ir::Inst) -> Vec<String> {
         Inst::IntToPtr(p) => vec![val_name(&p.val)],
         Inst::Icmp(i) => vec![val_name(&i.a), val_name(&i.b)],
         Inst::Select(s) => vec![val_name(&s.cond), val_name(&s.a), val_name(&s.b)],
-        Inst::Call(c) => c.args.iter().map(|a| val_name(&a.val)).collect(),
+        Inst::Call(c) => {
+            let mut vs: Vec<String> = c.args.iter().map(|a| val_name(&a.val)).collect();
+            // An indirect call's `func` is the SSA register holding the
+            // function pointer; isel reads it at dispatch time (after the
+            // args are loaded), so it is a use here. A direct call's `func`
+            // is a function name, never a def key, and is filtered by the
+            // caller.
+            if !c.callees.is_empty() {
+                vs.push(c.func.clone());
+            }
+            vs
+        }
         Inst::Br(_) => Vec::new(),
         Inst::BrCond(b) => vec![val_name(&b.cond)],
         Inst::Phi(p) => p.incoming.iter().map(|(v, _)| val_name(v)).collect(),

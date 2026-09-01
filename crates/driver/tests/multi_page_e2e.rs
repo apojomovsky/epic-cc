@@ -1,7 +1,7 @@
 //! Milestone-11 multi-page acceptance: a > 2KB program with functions spread
-//! across pages 0-2, a const table in page 3, cross-page calls (f2 -> f1,
+//! across pages 0-2, a const table in page 2, cross-page calls (f2 -> f1,
 //! f3 -> f2, main -> f1) and cross-page const-reader calls (main/f3 ->
-//! `__read_table`/`__read_table_hi` in page 3), all simulated to a
+//! `__read_table`/`__read_table_hi` in page 2), all simulated to a
 //! hand-computed `out`.
 //!
 //! Fixture: `multi_page.c`. The functions in source order (clang -O1 emits
@@ -21,7 +21,7 @@
 //! steps (before the three real statements) each call the `__mul_u8`/
 //! `__udiv_u8` recipes. The overlay allocator bases every callee at its
 //! caller's physical frame end, so the recipe slots sit right after `main`'s
-//! frame — at 0x52, exactly where `f3`'s frame also starts (f3 is another
+//! frame — at 0x2A, exactly where `f3`'s frame also starts (f3 is another
 //! main callee). The two regions overlap but are NEVER simultaneously live:
 //! main's padding (and its recipe calls) runs before the `f3` call, so the
 //! recipe slots and f3's frame are used at disjoint times. This is safe by
@@ -30,45 +30,43 @@
 //! call, or letting main call f3 before the padding, would corrupt f3's
 //! frame — documented here per the task-4 review.
 //!
-//! Final assembled layout (label address -> page, verified below from the
-//! assembled text exactly as `asm::assemble` walks it; the addresses come
-//! from the `.org` pads + `.align 256` of the final post-banking,
-//! post-peephole text — the peephole only removes words, and every `.org`
-//! base re-pins its page, so label-address page membership is exact). The
-//! layout is the issue-#12 bin-packed one: first-fit over POST-BANKING
-//! sizes fills page tails, so f3 and the mul/div recipes land in page 0's
-//! tail after F1 (the greedy next-fit would have padded them to later
-//! pages) and the table section sits in page 3:
+//!
+//! The layout below is the liveness-overlay one (epic-cc#172): the uncalled
+//! fillers' frames collapse to their live peak (F2: 1261 -> 951 words of
+//! body), so the first-fit bin packing re-packs the pages. The chain and
+//! the readers still sit in the designed pages, main still lands in a
+//! NONZERO page, and the table section still sits in page 2.
 //!
 //! ```text
 //! __start        0x0001  page 0
 //! f1             0x0005  page 0   (chain root)
-//! F1             0x01B9  page 0   (filler)
-//! f3             0x06B6  page 0   (calls f2   -> cross-page; reads table)
-//! __mul_u8       0x0744  page 0
-//! __udiv_u8      0x0768  page 0
+//! F1             0x0170  page 0   (filler)
+//! f2             0x0527  page 0   (calls f1   -> same page)
+//! f3             0x0663  page 0   (calls f2   -> same page; reads table)
+//! __mul_u8       0x06E6  page 0
+//! __udiv_u8      0x0704  page 0
 //! F2             0x0800  page 1   (filler, .org-padded)
-//! f2             0x0CFD  page 1   (calls f1   -> cross-page)
-//! main           0x0E78  page 1   (calls f3/f1 cross-page; reads table)
-//! F3             0x1000  page 2   (filler, .org-padded)
-//! F4             0x1800  page 3   (filler, .org-padded)
-//! __read_table   0x1CFD  page 3   (cross-page from main/f3)
-//! table          0x1E00  page 3   (256-byte window 0x1E — the reader's
+//! F3             0x0BB7  page 1   (filler)
+//! main           0x1000  page 2   (calls f3/f1 cross-page; reads table)
+//! F4             0x1125  page 2   (filler)
+//! __read_table   0x14DC  page 2   (cross-page from f3; same-page from main)
+//! table          0x1500  page 2   (256-byte window 0x15 — the reader's
 //!                                   `MOVLW HIGH(table); MOVWF PCLATH` is
 //!                                   load-bearing: without it the computed
 //!                                   PCL jump would land in window 0x10)
-//! table_1        0x1F00  page 3
-//! __read_table_hi 0x1F2C page 3   (cross-page from main)
+//! table_1        0x1600  page 2
+//! __read_table_hi 0x162C page 2   (same-page from main)
 //! ```
 //!
-//! Total program: 0x1F32 = 7986 words (> 0x800, < 0x2000 device bound).
+//! Total program: 0x1632 = 5682 words (> 0x800, < 0x2000 device bound).
 //!
-//! Cross-page CALL sites in the final asm: f2 -> f1 (page 1 -> 0), f3 -> f2
-//! (0 -> 1), f3 -> __read_table (0 -> 3), main -> f3 (1 -> 0), main -> f1
-//! (1 -> 0), main -> __read_table (1 -> 3), main -> __read_table_hi
-//! (1 -> 3). Every call in this layout is cross-page, so each carries the
-//! `MOVLW PAGE(t); MOVWF PCLATH` set before and the `MOVLW PAGE(cur);
-//! MOVWF PCLATH` restore after — both in the final asm. The same-page
+//! Cross-page CALL sites in the final asm: f2 -> f1 (page 0 -> 0, same
+//! page), f3 -> f2 (0 -> 0, same page), f3 -> __read_table (0 -> 2), main
+//! -> f3 (2 -> 0), main -> f1 (2 -> 0), main -> __read_table (2 -> 2, same
+//! page), main -> __read_table_hi (2 -> 2, same page). The cross-page calls
+//! carry the `MOVLW PAGE(t); MOVWF PCLATH` set before and the `MOVLW
+//! PAGE(cur); MOVWF PCLATH` restore after; the same-page calls skip the
+//! restore (the caller's page is still in PCLATH). The same-page
 //! restore-skip discipline is covered by the isel unit tests
 //! (`same_page_call_skips_restore`, `multi_page_module_runs_in_sim`).
 //!
@@ -162,53 +160,64 @@ fn multi_page_program_compiles_and_runs_correctly() {
     // The chain and the readers must sit in the designed pages (see the
     // layout table above) — in particular main must be in a NONZERO page
     // (so __start's PAGE(main) is a nonzero literal). The bin-packed
-    // layout (issue #12) fills page tails with post-banking sizes: f3 and
-    // the mul/div recipes land in page 0's tail after F1, main lands in
-    // page 1, and the table section sits in page 3.
+    // layout (issue #12) fills page tails with post-banking sizes: f2, f3
+    // and the mul/div recipes land in page 0's tail after F1, main lands
+    // in page 2, and the table section sits in page 2.
     assert_eq!(page("f1"), Some(0), "f1 in page 0");
     assert_eq!(page("F1"), Some(0), "F1 in page 0");
+    assert_eq!(
+        page("f2"),
+        Some(0),
+        "f2 in page 0 (bin-packed into the tail)"
+    );
     assert_eq!(
         page("f3"),
         Some(0),
         "f3 in page 0 (bin-packed into the tail)"
     );
     assert_eq!(page("F2"), Some(1), "F2 in page 1");
-    assert_eq!(page("f2"), Some(1), "f2 in page 1");
+    assert_eq!(page("F3"), Some(1), "F3 in page 1");
     assert_eq!(
         page("main"),
-        Some(1),
-        "main in page 1 (nonzero, PAGE(main) != 0)"
+        Some(2),
+        "main in page 2 (nonzero, PAGE(main) != 0)"
     );
-    assert_eq!(page("F3"), Some(2), "F3 in page 2");
-    assert_eq!(page("F4"), Some(3), "F4 in page 3");
-    assert_eq!(page("__read_table"), Some(3), "reader in page 3");
+    assert_eq!(page("F4"), Some(2), "F4 in page 2");
+    assert_eq!(page("__read_table"), Some(2), "reader in page 2");
     assert_eq!(
         page("table"),
-        Some(3),
-        "table in page 3 (later than every function)"
+        Some(2),
+        "table in page 2 (later than every function)"
     );
-    assert_eq!(page("table_1"), Some(3), "table chunk 1 in page 3");
-    assert_eq!(page("__read_table_hi"), Some(3), "chunk-1 reader in page 3");
+    assert_eq!(page("table_1"), Some(2), "table chunk 1 in page 2");
+    assert_eq!(page("__read_table_hi"), Some(2), "chunk-1 reader in page 2");
 
     // The cross-page CALL sites must really cross (page of caller's label vs
-    // page of the target's label, from the assembled layout). Every call in
-    // this layout is cross-page (f3 -> f2 is 0 -> 1, main -> f3 is 1 -> 0,
-    // main -> f1 is 1 -> 0, the readers are 0/1 -> 3) — the same-page
-    // restore-skip discipline is covered by the isel unit tests
-    // (`same_page_call_skips_restore`, `multi_page_module_runs_in_sim`).
-    assert_ne!(page("f2"), page("f1"), "f2 -> f1 is cross-page");
-    assert_ne!(page("f3"), page("f2"), "f3 -> f2 is cross-page");
+    // page of the target's label, from the assembled layout). The chain
+    // calls are same-page (f2 -> f1 is 0 -> 0, f3 -> f2 is 0 -> 0), main's
+    // calls are cross-page (main -> f3 is 2 -> 0, main -> f1 is 2 -> 0),
+    // and the readers are cross-page from f3 (0 -> 2) but same-page from
+    // main (2 -> 2) — the same-page restore-skip discipline is covered by
+    // the isel unit tests (`same_page_call_skips_restore`,
+    // `multi_page_module_runs_in_sim`).
+    assert_eq!(page("f2"), page("f1"), "f2 -> f1 is same-page");
+    assert_eq!(page("f3"), page("f2"), "f3 -> f2 is same-page");
     assert_ne!(page("main"), page("f3"), "main -> f3 is cross-page");
     assert_ne!(page("main"), page("f1"), "main -> f1 is cross-page");
     assert_ne!(
+        page("f3"),
+        page("__read_table"),
+        "f3 -> reader is cross-page"
+    );
+    assert_eq!(
         page("main"),
         page("__read_table"),
-        "main -> reader is cross-page"
+        "main -> reader is same-page"
     );
-    assert_ne!(
+    assert_eq!(
         page("main"),
         page("__read_table_hi"),
-        "main -> hi reader is cross-page"
+        "main -> hi reader is same-page"
     );
 
     // The program must exceed 0x800 words (the whole point of multi-page).
