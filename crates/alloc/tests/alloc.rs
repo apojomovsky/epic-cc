@@ -1062,8 +1062,9 @@ fn store_through_local_pointer_keeps_it_live() {
         out.locals["f::__scr"], out.locals["f::c"],
         "store through __scr clobbers live c"
     );
-    // e is dead after its store, so it reuses __scr's slot.
-    assert_eq!(out.locals["f::e"], out.locals["f::__scr"]);
+    // The alloca is a memory object: its slot is reserved for the whole
+    // function, so e (dead after its store) still cannot reuse it.
+    assert_ne!(out.locals["f::e"], out.locals["f::__scr"]);
 }
 
 /// An asm operand reading a local keeps it live: the prefixed operand form
@@ -1085,5 +1086,22 @@ fn asm_operand_keeps_the_value_live() {
     assert_ne!(
         out.locals["f::x"], out.locals["f::y"],
         "asm reads x while y is live"
+    );
+}
+
+/// A GEP index is re-read by isel at every load/store through the GEP's
+/// result pointer (the FSR setup recomputes the address from the index each
+/// time), so the index stays live until the last use of the GEP dst. Without
+/// the propagation, the index's slot is reused by a later load temp while
+/// the FSR setup still reads it.
+#[test]
+fn gep_index_stays_live_until_last_gep_use() {
+    let m = parse(
+        "global arr i8\n         fn f(void) ()\n           block entry:\n             %i = and i8 7, 3\n             %p = gep @arr +0 +1*%i\n             store i8 1 %p\n             %q = gep @arr +0 +1*%i\n             %v = load i8 %q\n             %w = add i8 %v, 1\n             store i8 %w @arr\n             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(
+        out.locals["f::i"], out.locals["f::v"],
+        "the load temp reuses the index slot while the FSR setup reads it"
     );
 }

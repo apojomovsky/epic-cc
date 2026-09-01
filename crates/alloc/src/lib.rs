@@ -221,20 +221,27 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
     let block_len: Vec<u16> = order.iter().map(|b| b.insts.len() as u16).collect();
 
     // defs: value name -> (block index, def position, width, placement
-    // order). Params are defined at entry and come first; defined values
-    // follow in instruction order. The placement order breaks ties in the
-    // coloring, so same-start values keep the documented params-first,
-    // instruction-order layout.
-    let mut defs: HashMap<String, (usize, u16, u8, usize)> = HashMap::new();
+    // order, memory object). Params are defined at entry and come first;
+    // defined values follow in instruction order. The placement order
+    // breaks ties in the coloring, so same-start values keep the documented
+    // params-first, instruction-order layout. A memory object (an alloca or
+    // a byval/sret param) is a RAM region the code reads and writes through
+    // derived pointers, not a value with a def-use range: its slot must stay
+    // reserved for the whole function, so it gets a full-function interval.
+    let mut defs: HashMap<String, (usize, u16, u8, usize, bool)> = HashMap::new();
     let mut order_idx = 0usize;
     for p in &f.params {
-        defs.insert(p.name.clone(), (0, 0, p.width, order_idx));
+        defs.insert(
+            p.name.clone(),
+            (0, 0, p.width, order_idx, p.byval.is_some() || p.sret),
+        );
         order_idx += 1;
     }
     for (i, b) in order.iter().enumerate() {
         for (pos, inst) in b.insts.iter().enumerate() {
             if let Some((name, width)) = def_width(inst) {
-                defs.insert(name, (i, pos as u16, width, order_idx));
+                let mem = matches!(inst, ir::Inst::Alloca(_));
+                defs.insert(name, (i, pos as u16, width, order_idx, mem));
                 order_idx += 1;
             }
         }
@@ -242,23 +249,63 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
 
     // uses: value name -> set of (block, position). A phi's incoming values
     // are used at the END of their predecessor (isel emits the incoming
-    // copies there), not in the merge block.
+    // copies there), not in the merge block. Every operand is recorded,
+    // including GEP dsts (which define no slot but whose uses drive the
+    // operand propagation below); the interval loop filters to defs.
     let mut uses: HashMap<String, HashSet<(usize, u16)>> = HashMap::new();
     for (i, b) in order.iter().enumerate() {
         for (pos, inst) in b.insts.iter().enumerate() {
             if let ir::Inst::Phi(p) = inst {
                 for (v, pred) in &p.incoming {
                     let vn = val_name(v);
-                    if defs.contains_key(&vn) {
-                        let pi = idx[pred.as_str()];
-                        uses.entry(vn).or_default().insert((pi, block_len[pi]));
-                    }
+                    let pi = idx[pred.as_str()];
+                    uses.entry(vn).or_default().insert((pi, block_len[pi]));
                 }
                 continue;
             }
             for v in inst_vals(inst) {
-                if defs.contains_key(&v) {
-                    uses.entry(v).or_default().insert((i, pos as u16));
+                uses.entry(v).or_default().insert((i, pos as u16));
+            }
+            if let ir::Inst::Gep(g) = inst {
+                uses.entry(g.dst.clone())
+                    .or_default()
+                    .insert((i, pos as u16));
+            }
+        }
+    }
+
+    // A GEP's base and term regs are re-read by isel at every load/store
+    // through the GEP's result pointer (the FSR setup recomputes the
+    // address from the index each time), so their liveness extends to the
+    // last use of the GEP dst: propagate the dst's uses onto its operands.
+    let mut gep_operands: HashMap<String, Vec<String>> = HashMap::new();
+    for b in &order {
+        for inst in &b.insts {
+            if let ir::Inst::Gep(g) = inst {
+                let mut ops = Vec::new();
+                if let ir::GepBase::Reg(r) = &g.base {
+                    ops.push(r.clone());
+                }
+                ops.extend(g.terms.iter().map(|(_, r)| r.clone()));
+                gep_operands.insert(g.dst.clone(), ops);
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (dst, ops) in &gep_operands {
+            let dst_uses: Vec<(usize, u16)> = uses
+                .get(dst)
+                .map(|u| u.iter().copied().collect())
+                .unwrap_or_default();
+            for op in ops {
+                if let Some(op_uses) = uses.get_mut(op) {
+                    let before = op_uses.len();
+                    op_uses.extend(dst_uses.iter().copied());
+                    if op_uses.len() != before {
+                        changed = true;
+                    }
                 }
             }
         }
@@ -284,23 +331,36 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
     // Live interval per value: [min(def, uses, pred ends), max(...)] in
     // linear order. A loop-carried value (use before def in linear order)
     // spans the loop, so it cannot alias a co-live value; a dead def is a
-    // point interval, immediately reusable.
+    // point interval, immediately reusable. A memory object spans the whole
+    // function (its slot is a RAM region, live from entry to exit), so it
+    // never aliases anything.
     let mut vals: Vec<(&String, (usize, u16), (usize, u16), u8, usize)> = Vec::new();
-    for (v, &(d, p_d, w, o)) in &defs {
-        let mut lo = (d, p_d);
-        let mut hi = (d, p_d);
-        if let Some(us) = uses.get(v) {
-            for &(b, p) in us {
-                lo = lo.min((b, p));
-                hi = hi.max((b, p));
+    for (v, &(d, p_d, w, o, mem)) in &defs {
+        let (lo, hi) = if mem {
+            (
+                (0usize, 0u16),
+                (
+                    order.len().saturating_sub(1),
+                    block_len.last().copied().unwrap_or(0),
+                ),
+            )
+        } else {
+            let mut lo = (d, p_d);
+            let mut hi = (d, p_d);
+            if let Some(us) = uses.get(v) {
+                for &(b, p) in us {
+                    lo = lo.min((b, p));
+                    hi = hi.max((b, p));
+                }
             }
-        }
-        if let Some(ps) = phi_pred_ends.get(v) {
-            for &(b, p) in ps {
-                lo = lo.min((b, p));
-                hi = hi.max((b, p));
+            if let Some(ps) = phi_pred_ends.get(v) {
+                for &(b, p) in ps {
+                    lo = lo.min((b, p));
+                    hi = hi.max((b, p));
+                }
             }
-        }
+            (lo, hi)
+        };
         vals.push((v, lo, hi, w, o));
     }
     vals.sort_by(|a, b| a.1.cmp(&b.1).then(a.4.cmp(&b.4)));
