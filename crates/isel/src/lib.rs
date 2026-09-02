@@ -228,6 +228,44 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// The byte width of function `func`'s va region: the maximum over its
+    /// call sites of the sum of extra-arg widths (the args past the named
+    /// params). Mirrors `alloc::va_sizes` exactly, so the boundary assert
+    /// in `VaArg` sees the same size the allocator reserved.
+    fn func_va_size(&self, func: &str) -> u16 {
+        self.m
+            .funcs
+            .iter()
+            .find_map(|f| {
+                if f.name != func {
+                    return None;
+                }
+                let named = f.params.len();
+                let mut max_w: u16 = 0;
+                for caller in &self.m.funcs {
+                    for b in &caller.blocks {
+                        for inst in &b.insts {
+                            if let ir::Inst::Call(c) = inst {
+                                if !c.callees.is_empty() || c.func != func {
+                                    continue;
+                                }
+                                if c.args.len() <= named {
+                                    continue;
+                                }
+                                let extra: u16 = c.args[named..]
+                                    .iter()
+                                    .map(|a| a.ty.map(|t| u16::from(t.bytes())).unwrap_or(2))
+                                    .sum();
+                                max_w = max_w.max(extra);
+                            }
+                        }
+                    }
+                }
+                Some(max_w)
+            })
+            .unwrap_or(0)
+    }
+
     /// Substitute `$0`/`%0` placeholders in an inline asm template with the
     /// allocated address of each `*m` operand. Each operand's `ptr` is either
     /// `@global` or `%local`; globals are looked up directly, locals via
@@ -1864,7 +1902,33 @@ impl<'m> Gen<'m> {
             .iter()
             .find(|f| f.name == func)
             .unwrap_or_else(|| panic!("isel: call to unknown function @{func}"));
+        let named = callee.params.len();
+        let mut va_off: u16 = 0;
         for (i, arg) in args.iter().enumerate() {
+            if i >= named {
+                // Extra (variadic) arg: lands in the callee's `__va`
+                // region at the running offset (epic-cc#131). The region
+                // is direct in the callee's frame; isel asserts at the
+                // callee's `va_arg` that it never crosses a 256-byte GPR
+                // pair, so the sum of extra widths is bounded by the
+                // region alloc reserved.
+                let va = self
+                    .addrs
+                    .get(&ssa_key(func, "__va"))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!("isel: variadic call to non-variadic @{func} (no __va region)")
+                    });
+                let aty = arg.ty.expect("isel: scalar variadic arg must carry a type");
+                let aw = u16::from(aty.bytes());
+                assert!(
+                    (va & 0xFF) + va_off + aw <= 0x100,
+                    "isel: variadic args of @{func} exceed its va region (off {va_off} + {aw})"
+                );
+                self.emit_move_val_to_slot(&arg.val, aty, va + va_off);
+                va_off += aw;
+                continue;
+            }
             let pname = &callee.params[i].name;
             let pa = self.slot_addr(func, pname).direct();
             if let Some(size) = arg.byval {
@@ -2666,6 +2730,57 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args, &c.callees),
+            Inst::VaStart(v) => {
+                // The va list slot holds the ADDRESS of the current
+                // argument in the `__va` region (clang's `ap` is a running
+                // pointer). va_start stores the region base address; a
+                // forwarded list (vprintf receiving printf's `ap`) arrives
+                // as a plain ptr param and needs no local va_start.
+                let list = self.slot_addr(self.cur_func, &v.list).direct();
+                let va_base = self
+                    .addrs
+                    .get(&ssa_key(self.cur_func, "__va"))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "isel: va_start in non-variadic context {} (no __va region)",
+                            self.cur_func
+                        )
+                    });
+                // The region must fit one 256-byte GPR pair: FSR addresses
+                // it through IRP. alloc places it; isel asserts.
+                let region_w = self.func_va_size(self.cur_func);
+                assert!(
+                    (va_base & 0xFF) + region_w <= 0x100,
+                    "isel: va region @0x{va_base:02X} ({} bytes) crosses a 256-byte GPR pair",
+                    region_w
+                );
+                self.emit(format!("    MOVLW 0x{:02X}", (va_base & 0xFF) as u8));
+                self.emit(format!("    MOVWF 0x{list:02X}"));
+                self.emit(format!("    MOVLW 0x{:02X}", ((va_base >> 8) & 0xFF) as u8));
+                self.emit(format!("    MOVWF 0x{:02X}", list + 1));
+            }
+            Inst::VaArg(v) => {
+                // Read the next variadic argument at the address the list
+                // slot holds (`*(va_list + i)` byte i), then advance the
+                // slot by the argument width. Works identically for a
+                // locally started list and a forwarded one (vprintf's ap).
+                let da = self.slot_addr(self.cur_func, &v.dst).direct();
+                let list = self.slot_addr(self.cur_func, &v.ptr).direct();
+                for i in 0..v.ty.bytes() {
+                    self.emit_fsr_indirect(list, 0, &[], i);
+                    self.emit("    MOVF INDF, W".to_string());
+                    self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+                }
+                // Advance the list address by the argument width: byte 0
+                // wraps to 0 exactly when it carries into byte 1 (Z after
+                // INCF).
+                for _ in 0..v.ty.bytes() {
+                    self.emit(format!("    INCF 0x{list:02X}, F"));
+                    self.emit("    BTFSC STATUS, 2".to_string());
+                    self.emit(format!("    INCF 0x{:02X}, F", list + 1));
+                }
+            }
             Inst::Asm(a) => {
                 // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking.
                 // Rung 4: substitute `$0`/`%0` memory operands via slot_addr.

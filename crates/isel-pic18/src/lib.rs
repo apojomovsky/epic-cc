@@ -926,7 +926,27 @@ impl<'m> Gen<'m> {
             .iter()
             .find(|f| f.name == func)
             .unwrap_or_else(|| panic!("isel-pic18: call to unknown function @{func}"));
+        let named = callee.params.len();
+        let mut va_off: u16 = 0;
         for (i, arg) in args.iter().enumerate() {
+            if i >= named {
+                // Extra (variadic) arg: lands in the callee's `__va`
+                // region at the running offset (epic-cc#131).
+                let va = self
+                    .addrs
+                    .get(&ssa_key(&func, "__va"))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!("isel-pic18: variadic call to non-variadic @{func} (no __va region)")
+                    });
+                let aty = arg
+                    .ty
+                    .expect("isel-pic18: scalar variadic arg must carry a type");
+                let aw = u16::from(aty.bytes());
+                self.emit_move_val_to_slot(&arg.val, aty, va + va_off);
+                va_off += aw;
+                continue;
+            }
             let pname = &callee.params[i].name;
             let pa = self.slot_addr(&func, pname).direct();
             if let Some(size) = arg.byval {
@@ -1526,6 +1546,51 @@ impl<'m> Gen<'m> {
                 let dst = self.slot_addr(self.cur_func, &f.dst).direct();
                 for i in 0..f.ty.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+            }
+            Inst::VaStart(v) => {
+                // The va list slot holds the ADDRESS of the current
+                // argument in the `__va` region. va_start stores the
+                // region base; a forwarded list (vprintf receiving
+                // printf's `ap`) is a plain ptr param and needs none.
+                let list = self.slot_addr(self.cur_func, &v.list).direct();
+                let va_base = self
+                    .addrs
+                    .get(&ssa_key(self.cur_func, "__va"))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "isel-pic18: va_start in non-variadic context {} (no __va region)",
+                            self.cur_func
+                        )
+                    });
+                self.emit(format!("    MOVLW 0x{:02X}", (va_base & 0xFF) as u8));
+                let (la, lf) = self.operand(list);
+                self.emit(format!(
+                    "    MOVWF 0x{lf:03X},{}",
+                    if la == 0 { "A" } else { "B" }
+                ));
+                self.emit(format!("    MOVLW 0x{:02X}", ((va_base >> 8) & 0xFF) as u8));
+            }
+            Inst::VaArg(v) => {
+                let da = self.slot_addr(self.cur_func, &v.dst).direct();
+                let list = self.slot_addr(self.cur_func, &v.ptr).direct();
+                for i in 0..v.ty.bytes() {
+                    self.emit_fsr0_indirect_slot(list, 0, &[], i);
+                    self.emit_copy_byte(0xFEF, da + u16::from(i)); // INDF0
+                }
+                for _ in 0..v.ty.bytes() {
+                    let (la, lf) = self.operand(list);
+                    self.emit(format!(
+                        "    INCF 0x{lf:03X},F,{}",
+                        if la == 0 { "A" } else { "B" }
+                    ));
+                    self.emit("    BTFSC 0xFD8,2,A".to_string()); // STATUS Z
+                    let (ha, hf) = self.operand(list + 1);
+                    self.emit(format!(
+                        "    INCF 0x{hf:03X},F,{}",
+                        if ha == 0 { "A" } else { "B" }
+                    ));
                 }
             }
             Inst::Sext(s) => {
@@ -2313,15 +2378,26 @@ impl<'m> Gen<'m> {
     /// higher `INCF`, exactly PIC14's `neg16_in_place`/`neg32_in_place`).
     /// An unconditional `INCF` on every byte would turn `0xFFED` (-19) into
     /// `0x0113` instead of `0x0013` (19): the high byte must not advance
-    /// when the low INCF did not wrap.
     fn neg_in_place(&mut self, addr: u16, bytes: u8) {
         for i in 0..bytes {
-            self.emit(format!("    COMF 0x{:03X},F,A", addr + u16::from(i)));
+            let (a, f) = self.operand(addr + u16::from(i));
+            self.emit(format!(
+                "    COMF 0x{f:03X},F,{}",
+                if a == 0 { "A" } else { "B" }
+            ));
         }
-        self.emit(format!("    INCF 0x{:03X},F,A", addr));
+        let (a0, f0) = self.operand(addr);
+        self.emit(format!(
+            "    INCF 0x{f0:03X},F,{}",
+            if a0 == 0 { "A" } else { "B" }
+        ));
         for i in 1..bytes {
             self.emit("    BTFSC 0xFD8,2,A".to_string()); // STATUS Z
-            self.emit(format!("    INCF 0x{:03X},F,A", addr + u16::from(i)));
+            let (a, f) = self.operand(addr + u16::from(i));
+            self.emit(format!(
+                "    INCF 0x{f:03X},F,{}",
+                if a == 0 { "A" } else { "B" }
+            ));
         }
     }
 
@@ -2332,38 +2408,80 @@ impl<'m> Gen<'m> {
     /// - 1 byte: one MULWF, result = PRODL.
     /// - 2 bytes: P00 (shift 0) and P01 + P10 (shift 8) contribute to the
     ///   low 16 bits; P11 (shift 16) is dropped.
-    /// - 4 bytes: every Pij with i+j < 4 contributes: PRODL lands at byte
-    ///   i+j, PRODH at byte i+j+1, each with its own carry fold.
     fn emit_hw_mul(&mut self, name: &str, bytes: u8, scr: u16) {
         let a = self.slot_addr(name, "a").direct();
         let b = self.slot_addr(name, "b").direct();
         match bytes {
             1 => {
-                self.emit(format!("    MOVF 0x{a:03X},W,A"));
-                self.emit(format!("    MULWF 0x{b:03X},A"));
+                let (aa, af) = self.operand(a);
+                self.emit(format!(
+                    "    MOVF 0x{af:03X},W,{}",
+                    if aa == 0 { "A" } else { "B" }
+                ));
+                let (ba, bf) = self.operand(b);
+                self.emit(format!(
+                    "    MULWF 0x{bf:03X},{}",
+                    if ba == 0 { "A" } else { "B" }
+                ));
                 self.store_retval(0xFF3, 1); // PRODL
                 self.emit("    RETURN".to_string());
             }
             2 => {
                 let (r0, r1) = (scr, scr + 1);
-                self.emit(format!("    MOVF 0x{a:03X},W,A"));
-                self.emit(format!("    MULWF 0x{b:03X},A")); // P00
+                let (aa, af) = self.operand(a);
+                self.emit(format!(
+                    "    MOVF 0x{af:03X},W,{}",
+                    if aa == 0 { "A" } else { "B" }
+                ));
+                let (ba, bf) = self.operand(b);
+                self.emit(format!(
+                    "    MULWF 0x{bf:03X},{}",
+                    if ba == 0 { "A" } else { "B" }
+                )); // P00
                 self.emit(format!("    MOVFF 0xFF3, 0x{r0:03X}"));
                 self.emit(format!("    MOVFF 0xFF4, 0x{r1:03X}"));
-                self.emit(format!("    MOVF 0x{a:03X},W,A"));
-                self.emit(format!("    MULWF 0x{:03X},A", b + 1)); // P01
-                self.emit(format!("    MOVF 0xFF3,W,A"));
-                self.emit(format!("    ADDWF 0x{r1:03X},F,A"));
-                self.emit(format!("    MOVF 0x{:03X},W,A", a + 1));
-                self.emit(format!("    MULWF 0x{b:03X},A")); // P10
-                self.emit(format!("    MOVF 0xFF3,W,A"));
-                self.emit(format!("    ADDWF 0x{r1:03X},F,A"));
+                let (aa, af) = self.operand(a);
+                self.emit(format!(
+                    "    MOVF 0x{af:03X},W,{}",
+                    if aa == 0 { "A" } else { "B" }
+                ));
+                let (b1a, b1f) = self.operand(b + 1);
+                self.emit(format!(
+                    "    MULWF 0x{b1f:03X},{}",
+                    if b1a == 0 { "A" } else { "B" }
+                )); // P01
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                let (r1a, r1f) = self.operand(r1);
+                self.emit(format!(
+                    "    ADDWF 0x{r1f:03X},F,{}",
+                    if r1a == 0 { "A" } else { "B" }
+                ));
+                let (a1a, a1f) = self.operand(a + 1);
+                self.emit(format!(
+                    "    MOVF 0x{a1f:03X},W,{}",
+                    if a1a == 0 { "A" } else { "B" }
+                ));
+                let (ba, bf) = self.operand(b);
+                self.emit(format!(
+                    "    MULWF 0x{bf:03X},{}",
+                    if ba == 0 { "A" } else { "B" }
+                )); // P10
+                self.emit("    MOVF 0xFF3,W,A".to_string());
+                let (r1a, r1f) = self.operand(r1);
+                self.emit(format!(
+                    "    ADDWF 0x{r1f:03X},F,{}",
+                    if r1a == 0 { "A" } else { "B" }
+                ));
                 self.store_retval(r0, 2);
                 self.emit("    RETURN".to_string());
             }
             4 => {
                 for i in 0..4u16 {
-                    self.emit(format!("    CLRF 0x{:03X},A", scr + i));
+                    let (sa, sf) = self.operand(scr + i);
+                    self.emit(format!(
+                        "    CLRF 0x{sf:03X},{}",
+                        if sa == 0 { "A" } else { "B" }
+                    ));
                 }
                 for j in 0..4u16 {
                     for i in 0..4u16 {
@@ -2371,12 +2489,28 @@ impl<'m> Gen<'m> {
                         if off >= 4 {
                             continue; // lands at shift >= 32, dropped
                         }
-                        self.emit(format!("    MOVF 0x{:03X},W,A", a + i));
-                        self.emit(format!("    MULWF 0x{:03X},A", b + j));
-                        self.emit(format!("    MOVF 0xFF3,W,A")); // PRODL
-                        self.emit(format!("    ADDWF 0x{:03X},F,A", scr + off));
-                        self.emit(format!("    MOVF 0xFF4,W,A")); // PRODH
-                        self.emit(format!("    ADDWFC 0x{:03X},F,A", scr + off + 1));
+                        let (aa, af) = self.operand(a + i);
+                        self.emit(format!(
+                            "    MOVF 0x{af:03X},W,{}",
+                            if aa == 0 { "A" } else { "B" }
+                        ));
+                        let (ba, bf) = self.operand(b + j);
+                        self.emit(format!(
+                            "    MULWF 0x{bf:03X},{}",
+                            if ba == 0 { "A" } else { "B" }
+                        ));
+                        self.emit("    MOVF 0xFF3,W,A".to_string()); // PRODL
+                        let (oa, of) = self.operand(scr + off);
+                        self.emit(format!(
+                            "    ADDWF 0x{of:03X},F,{}",
+                            if oa == 0 { "A" } else { "B" }
+                        ));
+                        self.emit("    MOVF 0xFF4,W,A".to_string()); // PRODH
+                        let (o1a, o1f) = self.operand(scr + off + 1);
+                        self.emit(format!(
+                            "    ADDWFC 0x{o1f:03X},F,{}",
+                            if o1a == 0 { "A" } else { "B" }
+                        ));
                     }
                 }
                 self.store_retval(scr, 4);
@@ -2414,52 +2548,86 @@ impl<'m> Gen<'m> {
         let l_restore = self.fresh_label();
         let l_next = self.fresh_label();
         for i in 0..u16::from(rem_bytes) {
-            self.emit(format!("    CLRF 0x{:03X},A", rem_base + i));
+            let (ra, rf) = self.operand(rem_base + i);
+            self.emit(format!(
+                "    CLRF 0x{rf:03X},{}",
+                if ra == 0 { "A" } else { "B" }
+            ));
         }
         self.emit(format!("    MOVLW 0x{:02X}", 8 * den_bytes));
-        self.emit(format!("    MOVWF 0x{cnt:03X},A"));
-        self.emit(format!("{l_loop}:"));
+        let (ca, cf) = self.operand(cnt);
+        self.emit(format!(
+            "    MOVWF 0x{cf:03X},{}",
+            if ca == 0 { "A" } else { "B" }
+        ));
+        self.emit_label(&l_loop);
         self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
         for i in 0..u16::from(den_bytes) {
-            self.emit(format!("    RLCF 0x{:03X},F,A", num + i));
+            let (na, nf) = self.operand(num + i);
+            self.emit(format!(
+                "    RLCF 0x{nf:03X},F,{}",
+                if na == 0 { "A" } else { "B" }
+            ));
         }
         for i in 0..u16::from(rem_bytes) {
-            self.emit(format!("    RLCF 0x{:03X},F,A", rem_base + i));
+            let (ra, rf) = self.operand(rem_base + i);
+            self.emit(format!(
+                "    RLCF 0x{rf:03X},F,{}",
+                if ra == 0 { "A" } else { "B" }
+            ));
         }
         // rem -= den: SUBWF then SUBFWB (borrow-in); beyond den_bytes the
         // divisor byte is implicitly 0, folded with MOVLW 0 + SUBFWB.
         for i in 0..u16::from(rem_bytes) {
             if i < u16::from(den_bytes) {
-                self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+                let (da, df) = self.operand(den + i);
+                self.emit(format!(
+                    "    MOVF 0x{df:03X},W,{}",
+                    if da == 0 { "A" } else { "B" }
+                ));
             } else {
                 self.emit("    MOVLW 0x00".to_string());
             }
-            if i == 0 {
-                self.emit(format!("    SUBWF 0x{:03X},F,A", rem_base));
-            } else {
-                self.emit(format!("    SUBFWB 0x{:03X},F,A", rem_base + i));
-            }
+            let (ra, rf) = self.operand(rem_base + i);
+            let mne = if i == 0 { "SUBWF" } else { "SUBFWB" };
+            self.emit(format!(
+                "    {mne} 0x{rf:03X},F,{}",
+                if ra == 0 { "A" } else { "B" }
+            ));
         }
         // C after the last byte = (rem >= den): set the quotient bit or restore.
         self.emit(format!("    BNC {l_restore}"));
-        self.emit(format!("    BSF 0x{num:03X},0,A"));
+        let (na, nf) = self.operand(num);
+        self.emit(format!(
+            "    BSF 0x{nf:03X},0,{}",
+            if na == 0 { "A" } else { "B" }
+        ));
         self.emit(format!("    BRA {l_next}"));
-        self.emit(format!("{l_restore}:"));
+        self.emit_label(&l_restore);
         // rem += den back (ADDWF, then ADDWFC for the carries).
         for i in 0..u16::from(rem_bytes) {
             if i < u16::from(den_bytes) {
-                self.emit(format!("    MOVF 0x{:03X},W,A", den + i));
+                let (da, df) = self.operand(den + i);
+                self.emit(format!(
+                    "    MOVF 0x{df:03X},W,{}",
+                    if da == 0 { "A" } else { "B" }
+                ));
             } else {
                 self.emit("    MOVLW 0x00".to_string());
             }
-            if i == 0 {
-                self.emit(format!("    ADDWF 0x{:03X},F,A", rem_base));
-            } else {
-                self.emit(format!("    ADDWFC 0x{:03X},F,A", rem_base + i));
-            }
+            let (ra, rf) = self.operand(rem_base + i);
+            let mne = if i == 0 { "ADDWF" } else { "ADDWFC" };
+            self.emit(format!(
+                "    {mne} 0x{rf:03X},F,{}",
+                if ra == 0 { "A" } else { "B" }
+            ));
         }
-        self.emit(format!("{l_next}:"));
-        self.emit(format!("    DECFSZ 0x{cnt:03X},F,A"));
+        self.emit_label(&l_next);
+        let (ca, cf) = self.operand(cnt);
+        self.emit(format!(
+            "    DECFSZ 0x{cf:03X},F,{}",
+            if ca == 0 { "A" } else { "B" }
+        ));
         self.emit(format!("    BRA {l_loop}"));
     }
 
@@ -2501,19 +2669,42 @@ impl<'m> Gen<'m> {
         let l_den = self.fresh_label();
         let l_go = self.fresh_label();
         let l_store = self.fresh_label();
-        self.emit(format!("    CLRF 0x{scr:03X},A")); // flags = 0
-        self.emit(format!("    BTFSS 0x{num_hi:03X},7,A")); // num < 0?
+        let (sa, sf) = self.operand(scr);
+        self.emit(format!(
+            "    CLRF 0x{sf:03X},{}",
+            if sa == 0 { "A" } else { "B" }
+        )); // flags = 0
+        let (na, nf) = self.operand(num_hi);
+        self.emit(format!(
+            "    BTFSS 0x{nf:03X},7,{}",
+            if na == 0 { "A" } else { "B" }
+        )); // num < 0?
         self.emit(format!("    BRA {l_den}"));
-        self.emit(format!("    BSF 0x{scr:03X},1,A")); // bit1: remainder sign follows dividend
-        self.emit(format!("    BSF 0x{scr:03X},0,A")); // bit0: quotient negate: num<0
+        let (sa, sf) = self.operand(scr);
+        self.emit(format!(
+            "    BSF 0x{sf:03X},1,{}",
+            if sa == 0 { "A" } else { "B" }
+        )); // bit1: remainder sign follows dividend
+        self.emit(format!(
+            "    BSF 0x{sf:03X},0,{}",
+            if sa == 0 { "A" } else { "B" }
+        )); // bit0: quotient negate: num<0
         self.neg_in_place(num, den_bytes); // num = |num|
-        self.emit(format!("{l_den}:"));
-        self.emit(format!("    BTFSS 0x{den_hi:03X},7,A")); // den < 0?
+        self.emit_label(&l_den);
+        let (da, df) = self.operand(den_hi);
+        self.emit(format!(
+            "    BTFSS 0x{df:03X},7,{}",
+            if da == 0 { "A" } else { "B" }
+        )); // den < 0?
         self.emit(format!("    BRA {l_go}"));
         self.neg_in_place(den, den_bytes); // den = |den|
         self.emit("    MOVLW 0x01".to_string());
-        self.emit(format!("    XORWF 0x{scr:03X},F,A")); // bit0 ^= den<0
-        self.emit(format!("{l_go}:"));
+        let (sa, sf) = self.operand(scr);
+        self.emit(format!(
+            "    XORWF 0x{sf:03X},F,{}",
+            if sa == 0 { "A" } else { "B" }
+        )); // bit0 ^= den<0
+        self.emit_label(&l_go);
         self.emit_divmod_loop(
             num,
             den,
@@ -2523,15 +2714,23 @@ impl<'m> Gen<'m> {
             rem_bytes,
         );
         if quotient {
-            self.emit(format!("    BTFSS 0x{scr:03X},0,A"));
+            let (sa, sf) = self.operand(scr);
+            self.emit(format!(
+                "    BTFSS 0x{sf:03X},0,{}",
+                if sa == 0 { "A" } else { "B" }
+            ));
             self.emit(format!("    BRA {l_store}"));
             self.neg_in_place(num, den_bytes); // -quotient
         } else {
-            self.emit(format!("    BTFSS 0x{scr:03X},1,A"));
+            let (sa, sf) = self.operand(scr);
+            self.emit(format!(
+                "    BTFSS 0x{sf:03X},1,{}",
+                if sa == 0 { "A" } else { "B" }
+            ));
             self.emit(format!("    BRA {l_store}"));
             self.neg_in_place(scr + 1, den_bytes); // -remainder
         }
-        self.emit(format!("{l_store}:"));
+        self.emit_label(&l_store);
         if quotient {
             self.store_retval(num, den_bytes);
         } else {
@@ -2554,45 +2753,78 @@ impl<'m> Gen<'m> {
             4 => 0x1F,
             _ => unreachable!(),
         };
+        let (ca, cf) = self.operand(self.slot_addr(name, "cnt").direct());
         self.emit(format!(
-            "    MOVF 0x{:03X},W,A",
-            self.slot_addr(name, "cnt").direct()
+            "    MOVF 0x{cf:03X},W,{}",
+            if ca == 0 { "A" } else { "B" }
         ));
         self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
-        self.emit(format!("    MOVWF 0x{scr:03X},A"));
+        let (sa, sf) = self.operand(scr);
+        self.emit(format!(
+            "    MOVWF 0x{sf:03X},{}",
+            if sa == 0 { "A" } else { "B" }
+        ));
         let l_loop = self.fresh_label();
         let l_done = self.fresh_label();
-        self.emit(format!("    MOVF 0x{scr:03X},F,A")); // Z = (cnt == 0)
+        let (sa, sf) = self.operand(scr);
+        self.emit(format!(
+            "    MOVF 0x{sf:03X},F,{}",
+            if sa == 0 { "A" } else { "B" }
+        )); // Z = (cnt == 0)
         self.emit("    BTFSC 0xFD8,2,A".to_string()); // STATUS Z // skip the GOTO when cnt != 0
         self.emit(format!("    BRA {l_done}"));
-        self.emit(format!("{l_loop}:"));
+        self.emit_label(&l_loop);
         match op {
             ir::BinOp::Shl => {
                 self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                 for i in 0..u16::from(bytes) {
-                    self.emit(format!("    RLCF 0x{:03X},F,A", val + i));
+                    let (va, vf) = self.operand(val + i);
+                    self.emit(format!(
+                        "    RLCF 0x{vf:03X},F,{}",
+                        if va == 0 { "A" } else { "B" }
+                    ));
                 }
             }
             ir::BinOp::LShr => {
                 self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                 for i in (0..u16::from(bytes)).rev() {
-                    self.emit(format!("    RRCF 0x{:03X},F,A", val + i));
+                    let (va, vf) = self.operand(val + i);
+                    self.emit(format!(
+                        "    RRCF 0x{vf:03X},F,{}",
+                        if va == 0 { "A" } else { "B" }
+                    ));
                 }
             }
             ir::BinOp::AShr => {
-                self.emit(format!("    BTFSC 0x{hi:03X},7,A"));
+                let (ha, hf) = self.operand(hi);
+                self.emit(format!(
+                    "    BTFSC 0x{hf:03X},7,{}",
+                    if ha == 0 { "A" } else { "B" }
+                ));
                 self.emit("    BSF 0xFD8,0,A".to_string()); // STATUS C
-                self.emit(format!("    BTFSS 0x{hi:03X},7,A"));
+                let (ha, hf) = self.operand(hi);
+                self.emit(format!(
+                    "    BTFSS 0x{hf:03X},7,{}",
+                    if ha == 0 { "A" } else { "B" }
+                ));
                 self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
                 for i in (0..u16::from(bytes)).rev() {
-                    self.emit(format!("    RRCF 0x{:03X},F,A", val + i));
+                    let (va, vf) = self.operand(val + i);
+                    self.emit(format!(
+                        "    RRCF 0x{vf:03X},F,{}",
+                        if va == 0 { "A" } else { "B" }
+                    ));
                 }
             }
             _ => unreachable!(),
         }
-        self.emit(format!("    DECFSZ 0x{scr:03X},F,A"));
+        let (sa, sf) = self.operand(scr);
+        self.emit(format!(
+            "    DECFSZ 0x{sf:03X},F,{}",
+            if sa == 0 { "A" } else { "B" }
+        ));
         self.emit(format!("    BRA {l_loop}"));
-        self.emit(format!("{l_done}:"));
+        self.emit_label(&l_done);
         self.store_retval(val, bytes);
         self.emit("    RETURN".to_string());
     }
