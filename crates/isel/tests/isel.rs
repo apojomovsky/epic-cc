@@ -8477,3 +8477,70 @@ fn single_entry_table_within_window_emits_no_align() {
         "table[5] = 5:\n{asm}"
     );
 }
+
+#[test]
+fn config_table_crossing_window_top_is_256_aligned() {
+    // epic-cc#121: the 68-byte `__epic_config` table placed at base 0xFED
+    // (LOW 0xED + 68 > 0x100) used to panic the assembler's `.table`
+    // window assert. The emitter's `window_align` folds `.align 256`
+    // before the `.table` directive, so placement never decides the fit.
+    // main (26 words) sits in page 0; helper (2023 words) fills page 1 to
+    // 0xFE7, so the table's natural base lands at 0xFED, aligned to
+    // 0x1000.
+    let ir_text = format!(
+        "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
+           %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
+           store i8 %v @out\n{}    ret void\n\
+         fn helper(void) ()\n  block entry:\n{}    ret void\n",
+        pad_body(5),
+        pad_body(674)
+    );
+    let m = module_with_globals(
+        &ir_text,
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                refs: Vec::new(),
+            },
+            const_table_global("t", 68),
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::i", 0x25),
+        ("main::v", 0x26),
+        ("main::a", 0x27),
+        ("helper::a", 0x28),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    let base = label_addr(&asm, "t");
+    assert!(
+        base & 0xFF == 0,
+        "crossing base must be 256-aligned (base 0x{base:03X}):\n{asm}"
+    );
+    assert!(
+        asm.contains("    .align 256\n    .table t 68"),
+        "the .align 256 must precede the .table directive:\n{asm}"
+    );
+    verify_page_fit(&m, &asm);
+    assert_eq!(
+        sim_run_asm(&asm, &[(0x20, 3)], 0x21),
+        3,
+        "table[3] = 3 through the aligned reader:\n{asm}"
+    );
+}
