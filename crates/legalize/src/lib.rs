@@ -1724,6 +1724,14 @@ fn fill_indirect_callees(m: &mut Module) {
             }
         }
     }
+    // A const struct's function-pointer fields (epic-cc#154) hold function
+    // addresses in flash: the functions are address-taken, so an indirect
+    // call through a loaded field can dispatch them.
+    for g in &m.globals {
+        for (_, f) in &g.refs {
+            addr_taken.insert(f.clone());
+        }
+    }
     // Arity and width maps for the candidate filter: an indirect call
     // site only ever invokes a candidate with the matching number of
     // arguments and matching widths. Without the arity check, a 1-arg ISR

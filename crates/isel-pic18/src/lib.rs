@@ -4954,7 +4954,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     let addr = base + i as u16;
-                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    // A function-address field (epic-cc#154) materializes
+                    // the link-time label literal.
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        init.push(format!("    MOVLW {lit}({f})"));
+                    } else {
+                        init.push(format!("    MOVLW 0x{b:02X}"));
+                    }
                     // Access-bank check mirrors Gen::operand: <0x60 or >=0xF60 is A.
                     if addr < 0x60 || addr >= 0xF60 {
                         init.push(format!("    MOVWF 0x{addr:03X},A"));
@@ -4987,9 +4994,29 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             g.name
         );
         out.push(format!("{}:", g.name));
-        for chunk in g.bytes.chunks(8) {
-            let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
-            out.push(format!("    db {}", bytes.join(", ")));
+        // Chunk the plain bytes 8 per line (the pre-#154 layout); a
+        // function-address field (epic-cc#154) materializes the link-time
+        // label literal, byte 0 = LOW(fn), byte 1 = HIGH(fn), resolved by
+        // the assembler's symbol table, and splits its own line.
+        let mut chunk: Vec<String> = Vec::new();
+        for (i, b) in g.bytes.iter().enumerate() {
+            if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                if !chunk.is_empty() {
+                    out.push(format!("    db {}", chunk.join(", ")));
+                    chunk.clear();
+                }
+                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                out.push(format!("    db {lit}({f})"));
+            } else {
+                chunk.push(format!("0x{b:02X}"));
+                if chunk.len() == 8 {
+                    out.push(format!("    db {}", chunk.join(", ")));
+                    chunk.clear();
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            out.push(format!("    db {}", chunk.join(", ")));
         }
         out.push("".to_string());
     }

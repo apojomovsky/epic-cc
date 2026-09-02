@@ -256,11 +256,17 @@ fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
 }
 
 /// Decode one constant of a literal/named type into its flat little-endian
-/// byte blob. `value` forms: `zeroinitializer`, a scalar (`i8 65`,
-/// `i16 4660`, `float 0x...`), a `c"..."` or `[...]` array value, or a
-/// nested `{ ... }` struct value (possibly self-type-prefixed). Unknown
-/// shapes panic loudly.
-fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
+/// byte blob, appending any function-address references (byte offset into
+/// the blob, function name) to `refs`. `value` forms: `zeroinitializer`, a
+/// scalar (`i8 65`, `i16 4660`, `float 0x...`), a `c"..."` or `[...]`
+/// array value, or a nested `{ ... }` struct value (possibly
+/// self-type-prefixed). Unknown shapes panic loudly.
+fn decode_typed_value(
+    ty: &str,
+    value: &str,
+    types: &StructTypes,
+    refs: &mut Vec<(usize, String)>,
+) -> Vec<u8> {
     let ty = ty.trim();
     let value = strip_self_type(ty, value).trim();
     if value.starts_with("zeroinitializer") {
@@ -292,7 +298,10 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
                     if elt.is_empty() {
                         continue;
                     }
-                    out.extend(decode_typed_value(elem, elt, types));
+                    let base = out.len();
+                    let mut elt_refs = Vec::new();
+                    out.extend(decode_typed_value(elem, elt, types, &mut elt_refs));
+                    refs.extend(elt_refs.into_iter().map(|(o, f)| (base + o, f)));
                 }
                 out
             } else if elem.starts_with('%') {
@@ -306,7 +315,10 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
                     if elt.is_empty() {
                         continue;
                     }
-                    out.extend(decode_typed_value(elem, elt, types));
+                    let base = out.len();
+                    let mut elt_refs = Vec::new();
+                    out.extend(decode_typed_value(elem, elt, types, &mut elt_refs));
+                    refs.extend(elt_refs.into_iter().map(|(o, f)| (base + o, f)));
                 }
                 out
             } else {
@@ -325,10 +337,10 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
         return bytes;
     }
     if ty.starts_with('{') || ty.starts_with("<{") {
-        return decode_literal_struct(ty, value, types);
+        return decode_literal_struct(ty, value, types, refs);
     }
     if ty.starts_with('%') {
-        return decode_named_struct(ty, value, types);
+        return decode_named_struct(ty, value, types, refs);
     }
     // Scalar value: `i8 65`, `i16 -5`, `float 1.500000e+00`.
     let (_, v) = value.split_once(' ').unwrap_or(("", value));
@@ -337,6 +349,15 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
         Val::Const(k) => {
             let uv = k as u64;
             (0..w).map(|i| ((uv >> (8 * i)) & 0xFF) as u8).collect()
+        }
+        // A `ptr @fn` field holds the function's link-time address: the
+        // bytes are a placeholder (the emitters materialize LOW/HIGH
+        // label literals at the recorded offsets, epic-cc#154).
+        Val::Global(g) => {
+            for o in 0..w {
+                refs.push((o, g.clone()));
+            }
+            vec![0u8; w]
         }
         _ => panic!("SPIKE LIMIT: non-constant struct field value {value:?}"),
     }
@@ -347,7 +368,12 @@ fn decode_typed_value(ty: &str, value: &str, types: &StructTypes) -> Vec<u8> {
 /// layout offset (the same rules as the type table). clang prints every
 /// field including padding, but missing trailing fields decode as zeros for
 /// robustness.
-fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
+fn decode_literal_struct(
+    ty: &str,
+    init: &str,
+    types: &StructTypes,
+    refs: &mut Vec<(usize, String)>,
+) -> Vec<u8> {
     let inner = brace_inner(ty).expect("literal struct type must be `{ ... }`");
     let ty_fields: Vec<&str> = split_top_level(inner, ',')
         .into_iter()
@@ -380,7 +406,9 @@ fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
         }
         if let Some(v) = values.get(i) {
             if !v.is_empty() {
-                let fbytes = decode_typed_value(f, v, types);
+                let mut frefs = Vec::new();
+                let fbytes = decode_typed_value(f, v, types, &mut frefs);
+                refs.extend(frefs.into_iter().map(|(o, g)| (usize::from(off) + o, g)));
                 assert_eq!(
                     fbytes.len(),
                     fsize as usize,
@@ -397,7 +425,12 @@ fn decode_literal_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
 /// with value `{ i8 65, i16 4660 }` or `%struct.pair { i8 65, i16 4660 }`)
 /// into its flat little-endian blob using the same field layout as the
 /// type table (padding bytes stay zero).
-fn decode_named_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
+fn decode_named_struct(
+    ty: &str,
+    init: &str,
+    types: &StructTypes,
+    refs: &mut Vec<(usize, String)>,
+) -> Vec<u8> {
     let name = ty.trim().trim_start_matches('%');
     let info = types
         .get(name)
@@ -441,7 +474,9 @@ fn decode_named_struct(ty: &str, init: &str, types: &StructTypes) -> Vec<u8> {
         }
         if let Some(val) = values.get(i) {
             if !val.is_empty() {
-                let fbytes = decode_typed_value(f, val, types);
+                let mut frefs = Vec::new();
+                let fbytes = decode_typed_value(f, val, types, &mut frefs);
+                refs.extend(frefs.into_iter().map(|(o, g)| (usize::from(off) + o, g)));
                 assert_eq!(
                     fbytes.len(),
                     fsize as usize,
@@ -2005,6 +2040,7 @@ pub fn parse_ll(src: &str) -> Module {
 
         // Global definitions: "@name = ... global|constant <ty> ..."
         if line.starts_with('@') {
+            let mut refs: Vec<(usize, String)> = Vec::new();
             let eq = line.find('=').unwrap();
             let name = line[1..eq].trim().to_string();
             if name.starts_with("llvm.") {
@@ -2045,7 +2081,8 @@ pub fn parse_ll(src: &str) -> Module {
                     let bytes = if init.starts_with("zeroinitializer") {
                         vec![0u8; size as usize]
                     } else {
-                        let decoded = decode_typed_value(&rest[..close + 1], init, &types);
+                        let decoded =
+                            decode_typed_value(&rest[..close + 1], init, &types, &mut refs);
                         assert_eq!(
                             decoded.len(),
                             size as usize,
@@ -2079,7 +2116,7 @@ pub fn parse_ll(src: &str) -> Module {
                         vec![0u8; size as usize]
                     } else {
                         let ty_str = &rest[..close + 1];
-                        let decoded = decode_typed_value(ty_str, init, &types);
+                        let decoded = decode_typed_value(ty_str, init, &types, &mut refs);
                         assert_eq!(
                             decoded.len(),
                             size,
@@ -2130,7 +2167,7 @@ pub fn parse_ll(src: &str) -> Module {
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
                 } else {
-                    decode_typed_value(ty_str, init, &types)
+                    decode_typed_value(ty_str, init, &types, &mut refs)
                 };
                 (Ty::I8, size, bytes)
             } else if let Some(struct_tok) = rest
@@ -2148,7 +2185,7 @@ pub fn parse_ll(src: &str) -> Module {
                 let bytes = if init.starts_with("zeroinitializer") {
                     vec![0u8; size as usize]
                 } else {
-                    let decoded = decode_typed_value(struct_tok, init, &types);
+                    let decoded = decode_typed_value(struct_tok, init, &types, &mut refs);
                     assert_eq!(
                         decoded.len(),
                         size as usize,
@@ -2177,6 +2214,7 @@ pub fn parse_ll(src: &str) -> Module {
                 is_const,
                 size,
                 bytes,
+                refs,
                 addr,
             });
             continue;

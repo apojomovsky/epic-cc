@@ -6238,7 +6238,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             if g.is_const && addrs.contains_key(&g.name) {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    // A function-address field (epic-cc#154) materializes
+                    // the link-time label literal.
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        init.push(format!("    MOVLW {lit}({f})"));
+                    } else {
+                        init.push(format!("    MOVLW 0x{b:02X}"));
+                    }
                     init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                 }
             }
@@ -6320,7 +6327,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             if g.is_const && addrs.contains_key(&g.name) {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    // A function-address field (epic-cc#154) materializes
+                    // the link-time label literal.
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        init.push(format!("    MOVLW {lit}({f})"));
+                    } else {
+                        init.push(format!("    MOVLW 0x{b:02X}"));
+                    }
                     init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                 }
             }
@@ -6346,7 +6360,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 if g.is_const && addrs.contains_key(&g.name) {
                     let base = addrs[&g.name];
                     for (idx, b) in g.bytes.iter().enumerate() {
-                        init.push(format!("    MOVLW 0x{b:02X}"));
+                        // A function-address field (epic-cc#154) materializes
+                        // the link-time label literal.
+                        if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == idx) {
+                            let lit = if idx % 2 == 0 { "LOW" } else { "HIGH" };
+                            init.push(format!("    MOVLW {lit}({f})"));
+                        } else {
+                            init.push(format!("    MOVLW 0x{b:02X}"));
+                        }
                         init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
                     }
                 }
@@ -6773,8 +6794,13 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             out.push("    .align 256".to_string());
             out.push(format!("    .table {} {size}", g.name));
             out.push(format!("{}:", g.name));
-            for b in &g.bytes[..256] {
-                out.push(format!("    RETLW 0x{b:02X}"));
+            for (i, b) in g.bytes[..256].iter().enumerate() {
+                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                    let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                    out.push(format!("    RETLW {lit}({f})"));
+                } else {
+                    out.push(format!("    RETLW 0x{b:02X}"));
+                }
             }
             for c in 1..n_chunks {
                 let start = c * 256;
@@ -6785,8 +6811,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     format!("{}_{}", g.name, c)
                 };
                 out.push(format!("{chunk_label}:"));
-                for b in &g.bytes[start..end.min(size)] {
-                    out.push(format!("    RETLW 0x{b:02X}"));
+                for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
+                    let abs = start + i;
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == abs) {
+                        let lit = if abs % 2 == 0 { "LOW" } else { "HIGH" };
+                        out.push(format!("    RETLW {lit}({f})"));
+                    } else {
+                        out.push(format!("    RETLW 0x{b:02X}"));
+                    }
                 }
             }
             // reader entries after the table
@@ -6819,8 +6851,16 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
             out.push(format!("    .table {} {size}", g.name));
             out.push(format!("{}:", g.name));
-            for b in &g.bytes[..size] {
-                out.push(format!("    RETLW 0x{b:02X}"));
+            for (i, b) in g.bytes[..size].iter().enumerate() {
+                // A function-address field (epic-cc#154) materializes the
+                // link-time label literal: byte 0 = LOW(fn), byte 1 =
+                // HIGH(fn), resolved by the assembler's symbol table.
+                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                    let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                    out.push(format!("    RETLW {lit}({f})"));
+                } else {
+                    out.push(format!("    RETLW 0x{b:02X}"));
+                }
             }
         }
         // Track the tables' `.align`/RETLW words so the running address

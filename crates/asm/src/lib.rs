@@ -148,7 +148,7 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
     let mut symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut org = 0usize; // byte address
     let mut lines: Vec<(usize, String)> = Vec::new(); // (byte address, line)
-    let mut db_bytes: Vec<(usize, u8)> = Vec::new(); // (byte address, value)
+    let mut db_bytes: Vec<(usize, String)> = Vec::new(); // (byte address, raw token)
     for raw in src.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -202,7 +202,11 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
                 if s.is_empty() {
                     continue;
                 }
-                db_bytes.push((org, (parse_num(s) & 0xFF) as u8));
+                // A `LOW(fn)`/`HIGH(fn)` label literal (a const struct's
+                // function-pointer field, epic-cc#154) resolves through the
+                // pass-2 symbol table, so the raw token is kept and parsed
+                // after labels are known.
+                db_bytes.push((org, s.to_string()));
                 org += 1; // one byte per db value
             }
             continue;
@@ -220,7 +224,8 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
             out[word_addr + 1] = encoded[1];
         }
     }
-    for (addr, b) in db_bytes {
+    for (addr, tok) in db_bytes {
+        let b = (parse_lit(&tok, &symbols) & 0xFF) as u8;
         out[addr / 2] |= (u16::from(b)) << ((addr % 2) * 8);
     }
     out

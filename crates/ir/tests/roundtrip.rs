@@ -78,6 +78,7 @@ fn gep_and_sized_globals_roundtrip() {
         addr: Some(0x25),
         size: 8,
         bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        refs: Vec::new(),
     };
     assert_eq!(g.size, 8);
     assert_eq!(g.bytes, vec![1, 2, 3, 4, 5, 6, 7, 8]);
