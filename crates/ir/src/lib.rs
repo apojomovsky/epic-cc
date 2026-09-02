@@ -56,6 +56,12 @@ pub struct Load {
     pub dst: String,
     pub ty: Ty,
     pub ptr: String,
+    /// True for a pointer-typed load (`load ptr, ptr @x`): the result is a
+    /// runtime pointer VALUE whose bytes live in the dst slot, so iselcore
+    /// seeds it as an indirect slot (a GEP over it, a deref through it, or
+    /// a ptr arg pass all read those bytes). False for value loads
+    /// (i1/i8/i16/f32), which lower as plain copies.
+    pub ptr_ty: bool,
 } // ptr = "@name" or "%name"
 #[derive(Clone, Debug)]
 pub struct Store {
@@ -568,7 +574,14 @@ fn ty_str(t: Ty) -> String {
 
 fn inst_str(i: &Inst) -> String {
     match i {
-        Inst::Load(l) => format!("%{} = load {} {}", l.dst, ty_str(l.ty), l.ptr),
+        Inst::Load(l) => {
+            let t = if l.ptr_ty {
+                "ptr".to_string()
+            } else {
+                ty_str(l.ty)
+            };
+            format!("%{} = load {} {}", l.dst, t, l.ptr)
+        }
         Inst::Store(s) => format!("store {} {} {}", ty_str(s.ty), val_str(&s.val), s.ptr),
         Inst::Bin(b) => format!(
             "%{} = {} {} {} {}",
@@ -1311,9 +1324,16 @@ fn parse_inst(line: &str) -> Inst {
     let body = line[eq + 3..].trim();
     if let Some(rest) = body.strip_prefix("load ") {
         let mut it = rest.split_whitespace();
-        let t = parse_ty(it.next().unwrap());
+        let ty_tok = it.next().unwrap();
+        let ptr_ty = ty_tok == "ptr";
+        let t = parse_ty(ty_tok);
         let ptr = it.next().unwrap().to_string();
-        return Inst::Load(Load { dst, ty: t, ptr });
+        return Inst::Load(Load {
+            dst,
+            ty: t,
+            ptr,
+            ptr_ty,
+        });
     }
     if let Some(rest) = body.strip_prefix("call ") {
         let (ty, func, args, callees) = parse_call(rest);

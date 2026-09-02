@@ -177,3 +177,45 @@ fn seeds_a_pointer_select_with_a_global_and_a_runtime_slot() {
     assert_eq!(*k, 0);
     assert!(terms.is_empty());
 }
+
+#[test]
+fn seeds_a_load_ptr_result_as_an_indirect_slot() {
+    // `%7 = load ptr, ptr @g_t1_handle` (the HAL's handle field) is a
+    // runtime pointer VALUE: its bytes live in the dst slot, so a GEP over
+    // it must resolve to that slot (epic-cc#183's TIMER1_IRQHandler shape).
+    let m = parse(
+        "global g_t1_handle i8\n\
+         fn main() ()\n\
+           block entry:\n\
+             %7 = load ptr @g_t1_handle\n\
+             %10 = gep %7 +10\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("main::7").expect("load ptr must seed");
+    assert!(matches!(base, Base::Slot(n, true) if n == "7"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+    let (base, k, terms) = r.get("main::10").expect("gep over load ptr must resolve");
+    assert!(matches!(base, Base::Slot(n, true) if n == "7"));
+    assert_eq!(*k, 10);
+    assert!(terms.is_empty());
+}
+
+#[test]
+fn leaves_a_value_load_unresolved() {
+    // A plain `load i16` is a value copy, never a pointer: it must not
+    // appear in the resolved map (epic-cc#183 regression guard).
+    let m = parse(
+        "global in i16\n\
+         fn main() ()\n\
+           block entry:\n\
+             %1 = load i16 @in\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    assert!(
+        !r.contains_key("main::1"),
+        "a value load must not be resolved as a pointer"
+    );
+}
