@@ -526,6 +526,20 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
                 }
             }
+            Val::Global(g) => {
+                // A data global in value position is a pointer ADDRESS (a
+                // `store ptr @g, ...` or a pointer phi incoming; clang
+                // always loads scalar globals first): materialize it as two
+                // literals, never copy the pointee's contents (epic-cc#155).
+                let addr = self.global_addr(g);
+                for i in 0..ty.bytes() {
+                    let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVLW 0x{byte:02X}"));
+                    let (a, f) = self.operand(dst + u16::from(i));
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                }
+            }
             _ => {
                 let src = self.val_addr(val).direct();
                 for i in 0..ty.bytes() {
@@ -904,6 +918,41 @@ impl<'m> Gen<'m> {
                             "    MOVWF 0x{f1:03X},{}",
                             if a1 == 0 { "A" } else { "B" }
                         ));
+                    }
+                } else if let Val::Reg(r) = &arg.val {
+                    // A runtime pointer value (a `load ptr` result, e.g.
+                    // the taskmgr `t->arg` field): the two address bytes
+                    // live in the reg's slot. Copy them into the param
+                    // slot; the callee's FSR-based deref resolves the
+                    // address at runtime (epic-cc#155).
+                    if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) {
+                        let sa = self.slot_addr(self.cur_func, r).direct();
+                        self.emit_copy_byte(sa, pa);
+                        self.emit_copy_byte(sa + 1, pa + 1);
+                    } else {
+                        match self.emit_ptr_setup(&arg.val, 0) {
+                            Addr::Direct(addr) => {
+                                self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                let (a0, f0) = self.operand(pa);
+                                self.emit(format!(
+                                    "    MOVWF 0x{f0:03X},{}",
+                                    if a0 == 0 { "A" } else { "B" }
+                                ));
+                                self.emit(format!(
+                                    "    MOVLW 0x{:02X}",
+                                    ((addr >> 8) & 0xFF) as u8
+                                ));
+                                let (a1, f1) = self.operand(pa + 1);
+                                self.emit(format!(
+                                    "    MOVWF 0x{f1:03X},{}",
+                                    if a1 == 0 { "A" } else { "B" }
+                                ));
+                            }
+                            Addr::Indirect => {
+                                self.emit_copy_byte(0xFE9, pa); // FSR0L -> param slot lo
+                                self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> param slot hi
+                            }
+                        }
                     }
                 } else {
                     match self.emit_ptr_setup(&arg.val, 0) {
