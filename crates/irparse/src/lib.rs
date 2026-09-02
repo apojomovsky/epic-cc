@@ -56,6 +56,9 @@ fn ty_of(s: &str, loc: Option<&SrcLoc>) -> Ty {
     // `range(i16 -255, 256)`): key off the leading type token.
     let base = s.split_whitespace().next().unwrap_or(s);
     let base = base.split('(').next().unwrap_or(base);
+    // An `inttoptr ... to ptr, !dbg !N` rhs carries the trailing comma of
+    // the instruction's operand list.
+    let base = base.trim_end_matches(',');
     match base {
         "i1" => Ty::I1,
         "i8" => Ty::I8,
@@ -2687,6 +2690,7 @@ fn parse_inst(
                 dst: dst.unwrap(),
                 ty,
                 ptr,
+                ptr_ty: strip_attrs(args[0]).trim().starts_with("ptr"),
             }));
         }
         "store" => {
