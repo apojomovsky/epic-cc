@@ -497,6 +497,124 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Set up the memcpy SOURCE pointer on FSR1 (an indirect source would
+    /// otherwise be clobbered by the destination's FSR0 setup) and return
+    /// `Some(direct_addr)` for a direct source, `None` for an indirect one
+    /// (the byte is read via INDF1, 0xFE7). Mirrors `emit_ptr_setup`'s
+    /// resolution, targeting FSR1L/FSR1H (0xFE1/0xFE2).
+    fn emit_memcpy_src_setup(&mut self, ptr: &Val, byte_off: u8) -> Option<u16> {
+        match ptr {
+            Val::Global(g) => Some(self.global_addr(g) + u16::from(byte_off)),
+            Val::Reg(r) => {
+                let (base, k, terms) = self.resolved_for(r);
+                match &base {
+                    Base::Global(name) => {
+                        if terms.is_empty() {
+                            Some(self.global_addr(name) + u16::from(k) + u16::from(byte_off))
+                        } else {
+                            self.emit_fsr1_dynamic(self.global_addr(name), k, &terms, byte_off);
+                            None
+                        }
+                    }
+                    Base::Slot(sname, indirect) => {
+                        let sa = self.slot_addr(self.cur_func, sname).direct();
+                        let holds_addr = self
+                            .m
+                            .funcs
+                            .iter()
+                            .find(|f| f.name == self.cur_func)
+                            .map(|f| f.params.iter().any(|p| p.name == *sname && p.ptr))
+                            .unwrap_or(false);
+                        if *indirect || holds_addr {
+                            self.emit_fsr1_indirect_slot(sa, k, &terms, byte_off);
+                            None
+                        } else if terms.is_empty() {
+                            Some(sa + u16::from(k) + u16::from(byte_off))
+                        } else {
+                            self.emit_fsr1_dynamic(sa, k, &terms, byte_off);
+                            None
+                        }
+                    }
+                }
+            }
+            Val::Const(_) => panic!("isel-pic18: pointer operand must be a register or global"),
+        }
+    }
+
+    /// Set `FSR1 = base_addr + k + Σ scale×%reg + byte_off` and leave the
+    /// access to go through `INDF1` (0xFE7). FSR1 mirror of
+    /// `emit_fsr0_dynamic` (LFSR 1, FSR1L/FSR1H = 0xFE1/0xFE2).
+    fn emit_fsr1_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        assert!(
+            terms.len() <= 1,
+            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
+            terms.len()
+        );
+        let static_part = u16::from(k) + u16::from(byte_off);
+        let lit = (base_addr + static_part) & 0xFFF;
+        self.emit(format!("    LFSR 1, 0x{lit:03X}"));
+        self.add_term_to_fsr1(terms);
+    }
+    /// `slot_addr` holds a 2-byte ADDRESS (an sret param's contents), not
+    /// the object itself: load THAT address into FSR1, then add the static
+    /// offset and any dynamic term. FSR1 mirror of `emit_fsr0_indirect_slot`.
+    fn emit_fsr1_indirect_slot(
+        &mut self,
+        slot_addr: u16,
+        k: u8,
+        terms: &[(u8, String)],
+        byte_off: u8,
+    ) {
+        assert!(
+            terms.len() <= 1,
+            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
+            terms.len()
+        );
+        self.emit_copy_byte(slot_addr, 0xFE1); // FSR1L = low byte of the stored address
+        self.emit_copy_byte(slot_addr + 1, 0xFE2); // FSR1H = high byte
+        let static_part = u16::from(k) + u16::from(byte_off);
+        if static_part != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
+            let (fa, ff) = self.operand(0xFE1);
+            self.emit(format!(
+                "    ADDWF 0x{ff:03X},F,{}",
+                if fa == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
+            let (ha, hf) = self.operand(0xFE2);
+            self.emit(format!(
+                "    ADDWFC 0x{hf:03X},F,{}",
+                if ha == 0 { "A" } else { "B" }
+            ));
+        }
+        self.add_term_to_fsr1(terms);
+    }
+    /// Add the single dynamic term (if any) onto `FSR1L`/`FSR1H` with
+    /// carry, `scale` times. FSR1 mirror of `add_term_to_fsr0`.
+    fn add_term_to_fsr1(&mut self, terms: &[(u8, String)]) {
+        if let Some((scale, reg)) = terms.first() {
+            let a = self.slot_addr(self.cur_func, reg).direct();
+            for _ in 0..*scale {
+                let (ra, rf) = self.operand(a);
+                self.emit(format!(
+                    "    MOVF 0x{rf:03X},W,{}",
+                    if ra == 0 { "A" } else { "B" }
+                ));
+                let (fa, ff) = self.operand(0xFE1); // FSR1L
+                self.emit(format!(
+                    "    ADDWF 0x{ff:03X},F,{}",
+                    if fa == 0 { "A" } else { "B" }
+                ));
+                self.emit("    MOVLW 0x00".to_string());
+                let (ha, hf) = self.operand(0xFE2); // FSR1H
+                self.emit(format!(
+                    "    ADDWFC 0x{hf:03X},F,{}",
+                    if ha == 0 { "A" } else { "B" }
+                ));
+            }
+        }
+    }
+
     /// Set `FSR0 = base_addr + k + Σ scale×%reg + byte_off` and leave the
     /// access to go through `INDF0` (0xFEF). `LFSR` seeds the STATIC part
     /// (`base_addr + k + byte_off`, all known at codegen time: one
@@ -1433,17 +1551,33 @@ impl<'m> Gen<'m> {
             Inst::Memcpy(mc) => match &mc.len {
                 ir::MemLen::Const(n) => {
                     for i in 0..*n {
-                        let src_addr = match self.emit_ptr_setup(&mc.src, i) {
-                            Addr::Direct(a) => a,
-                            Addr::Indirect => {
-                                panic!("isel-pic18: memcpy with an indirect SOURCE not yet supported (P3 scope; see Task 9's Step 3 fixture check)")
-                            }
-                        };
+                        // The source pointer is set up on FSR1 (an indirect
+                        // source would otherwise be clobbered by the
+                        // destination's FSR0 setup), the destination on
+                        // FSR0, and the byte moves through W. W is
+                        // ISR-saved (0x0004), so an interrupt taken
+                        // mid-copy cannot corrupt the held byte.
+                        let src_direct = self.emit_memcpy_src_setup(&mc.src, i);
                         match self.emit_ptr_setup(&mc.dst, i) {
-                            Addr::Direct(dst) => self.emit_copy_byte(src_addr, dst),
-                            Addr::Indirect => {
-                                self.emit(format!("    MOVFF 0x{src_addr:03X}, 0xFEF"))
+                            Addr::Direct(dst) => {
+                                match src_direct {
+                                    Some(a) => {
+                                        self.emit(format!("    MOVFF 0x{a:03X}, 0x{dst:03X}"))
+                                    }
+                                    None => {
+                                        self.emit("    MOVF 0xFE7,W,A".to_string()); // INDF1
+                                        self.emit(format!("    MOVWF 0x{dst:03X},A"));
+                                    }
+                                }
                             }
+                            Addr::Indirect => match src_direct {
+                                Some(a) => {
+                                    self.emit(format!("    MOVFF 0x{a:03X}, 0xFEF"));
+                                }
+                                None => {
+                                    self.emit("    MOVFF 0xFE7, 0xFEF".to_string());
+                                }
+                            },
                         }
                     }
                 }

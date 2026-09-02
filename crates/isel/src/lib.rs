@@ -1923,6 +1923,21 @@ impl<'m> Gen<'m> {
                             Base::Slot(sname, false) if self.param_holds_addr(sname) => {
                                 self.slot_addr(self.cur_func, sname).direct()
                             }
+                            Base::Slot(sname, false) => {
+                                // A plain alloca slot: the slot IS the
+                                // object, so its address is a compile-time
+                                // constant. Materialize it as two literals
+                                // (epic-cc#125: `store_handle(&h)`).
+                                let addr = self.slot_addr(self.cur_func, sname).direct();
+                                self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                                self.emit(format!(
+                                    "    MOVLW 0x{:02X}",
+                                    ((addr >> 8) & 0xFF) as u8
+                                ));
+                                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                                continue;
+                            }
                             other => panic!("isel: cannot pass a GEP over {other:?} as a ptr arg"),
                         };
                         let k_lo = (u16::from(k) & 0xFF) as u8;
