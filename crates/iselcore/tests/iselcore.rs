@@ -228,20 +228,71 @@ fn seeds_a_load_ptr_result_as_an_indirect_slot() {
     assert!(terms.is_empty());
 }
 
+// epic-cc#131: a `va_arg ptr` result is a runtime pointer VALUE (the
+// address bytes live in the dst slot), seeded exactly like an IntToPtr or
+// a load-ptr result. A GEP over it must resolve to that slot.
 #[test]
-fn leaves_a_value_load_unresolved() {
-    // A plain `load i16` is a value copy, never a pointer: it must not
-    // appear in the resolved map (epic-cc#183 regression guard).
+fn seeds_a_va_arg_ptr_result_as_an_indirect_slot() {
     let m = parse(
-        "global in i16\n\
-         fn main() ()\n\
+        "fn vprintf(i16) (fmt, ...)\n\
            block entry:\n\
-             %1 = load i16 @in\n\
-             ret void\n",
+             %s = va_arg ptr ap ptr\n\
+             %10 = gep %s +10\n\
+             ret i16 0\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("vprintf::s").expect("va_arg ptr must seed");
+    assert!(matches!(base, Base::Slot(n, true) if n == "s"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+    let (base, k, terms) = r
+        .get("vprintf::10")
+        .expect("gep over va_arg ptr must resolve");
+    assert!(matches!(base, Base::Slot(n, true) if n == "s"));
+    assert_eq!(*k, 10);
+    assert!(terms.is_empty());
+}
+
+// A value-typed `va_arg` (i16 read) is a plain value, never a pointer: it
+// must not appear in the resolved map.
+#[test]
+fn leaves_a_value_va_arg_unresolved() {
+    let m = parse(
+        "fn vprintf(i16) (fmt, ...)\n\
+           block entry:\n\
+             %9 = va_arg ptr ap i16\n\
+             ret i16 %9\n",
     );
     let r = resolve_pointers(&m);
     assert!(
-        !r.contains_key("main::1"),
-        "a value load must not be resolved as a pointer"
+        !r.contains_key("vprintf::9"),
+        "a value va_arg must not be resolved as a pointer"
     );
+}
+
+// A pointer-typed phi whose incoming values are a pointer PARAM (the
+// vprintf forwarding shape: `ap` is a plain ptr param holding the va
+// list address) and a GEP over the phi's own dst (the loop increment)
+// seeds as an indirect slot: the param's slot holds the address bytes the
+// phi copy can move, and the self-GEP resolves against the seed.
+#[test]
+fn seeds_a_ptr_phi_with_param_and_self_gep_incomings() {
+    let m = parse(
+        "fn vprintf(i16) (fmt, ap=ptr)\n\
+           block entry:\n\
+             %p = phi ptr %ap entry %q loop\n\
+             %q = gep %p +1\n\
+             br loop\n\
+           block loop:\n\
+             br entry\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("vprintf::p").expect("ptr phi must seed");
+    assert!(matches!(base, Base::Slot(n, true) if n == "p"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+    let (base, k, terms) = r.get("vprintf::q").expect("self-gep must resolve");
+    assert!(matches!(base, Base::Slot(n, true) if n == "p"));
+    assert_eq!(*k, 1);
+    assert!(terms.is_empty());
 }

@@ -538,3 +538,35 @@ fn roundtrips_float_insts_and_constants() {
         );
     }
 }
+
+// epic-cc#131: the variadic surface round-trips. The `...` prototype token
+// survives serialize/parse, `va_start <list>` stays a marker, and
+// `%d = va_arg ptr <list> <ty>` keeps its type and pointer-typed flag.
+#[test]
+fn roundtrips_variadic_va_start_and_va_arg() {
+    let text = "fn vprintf(i16) (fmt, ...)\n  block entry:\n    va_start ap\n    %9 = va_arg ptr ap i16\n    %65 = va_arg ptr ap ptr\n    ret i16 %9\n";
+    let m = parse(text);
+    let f = m.funcs.iter().find(|f| f.name == "vprintf").unwrap();
+    assert!(
+        f.variadic,
+        "the `...` prototype token marks the function variadic"
+    );
+    let out = serialize(&m);
+    assert!(
+        out.contains("fn vprintf(i16) (fmt=i8, ...)"),
+        "variadic marker survives serialize\n---\n{out}"
+    );
+    assert!(out.contains("va_start ap"), "va_start survives\n---\n{out}");
+    assert!(
+        out.contains("%9 = va_arg ptr ap i16"),
+        "i16 va_arg survives\n---\n{out}"
+    );
+    assert!(
+        out.contains("%65 = va_arg ptr ap ptr"),
+        "ptr va_arg survives\n---\n{out}"
+    );
+    let m2 = parse(&out);
+    let f2 = m2.funcs.iter().find(|f| f.name == "vprintf").unwrap();
+    assert!(f2.variadic);
+    assert_eq!(serialize(&m2), out, "stable fixed point");
+}
