@@ -145,10 +145,12 @@ fn instruction_words_pic18(line: &str) -> usize {
 /// by 2 wherever the ISA's `k`/`n` fields need a *word* address/offset
 /// (`GOTO`/`CALL`'s absolute target, every relative branch's offset).
 pub fn assemble_pic18(src: &str) -> Vec<u16> {
-    let mut symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    let mut org = 0usize; // byte address
-    let mut lines: Vec<(usize, String)> = Vec::new(); // (byte address, line)
-    let mut db_bytes: Vec<(usize, String)> = Vec::new(); // (byte address, raw token)
+    // Every meaningful source line becomes one entry in the stream, in
+    // order: `org ...`, `label:`, `db ...`, or an instruction. The far-
+    // branch expansion below splices between entries, and every layout
+    // decision (label addresses, instruction addresses, db addresses)
+    // re-walks this stream, so the passes agree by construction.
+    let mut lines: Vec<String> = Vec::new();
     for raw in src.lines() {
         let line = raw.split(';').next().unwrap_or("").trim();
         if line.is_empty() {
@@ -157,75 +159,205 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         if line.starts_with("list") || line.starts_with("radix") {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("org ") {
-            let target = parse_num(rest.trim());
-            assert!(
-                target >= org,
-                "asm: backward .org to 0x{target:04X} from 0x{org:04X} — an .org can only pad forward"
-            );
-            org = target;
-            continue;
-        }
         if line.strip_prefix("end").is_some() {
             break;
         }
-        // Handle `label: instruction` on one line (e.g. `my_label: nop` from module asm).
+        if let Some(eq) = line.find(" equ ") {
+            let (name, val) = line.split_at(eq);
+            let val_txt = val[" equ ".len()..].trim().to_string();
+            lines.push(format!("equ {name} {val_txt}"));
+            continue;
+        }
+        // A `label: instruction` line splits into a label entry and an
+        // instruction entry, so expansion can splice between them.
         if let Some(colon) = line.find(':') {
             let label = line[..colon].trim();
             let rest = line[colon + 1..].trim();
             if !label.is_empty() && !label.contains(' ') && !label.contains('\t') {
-                symbols.insert(label.to_string(), org);
-                if rest.is_empty() {
-                    continue;
+                lines.push(format!("{label}:"));
+                if !rest.is_empty() {
+                    lines.push(rest.to_string());
                 }
-                let words = instruction_words_pic18(rest);
-                lines.push((org, rest.to_string()));
-                org += words * 2;
                 continue;
             }
         }
-        if let Some(label) = line.strip_suffix(':') {
-            symbols.insert(label.trim().to_string(), org);
-            continue;
+        lines.push(line.to_string());
+    }
+
+    /// The inverted form of each conditional branch mnemonic.
+    fn invert_cond(mne: &str) -> &'static str {
+        match mne {
+            "BZ" => "BNZ",
+            "BNZ" => "BZ",
+            "BC" => "BNC",
+            "BNC" => "BC",
+            "BOV" => "BNOV",
+            "BNOV" => "BOV",
+            "BN" => "BNN",
+            "BNN" => "BN",
+            _ => unreachable!("invert_cond: {mne}"),
         }
-        if let Some(eq) = line.find(" equ ") {
-            let (name, val) = line.split_at(eq);
-            symbols.insert(
-                name.trim().to_string(),
-                parse_num(val[" equ ".len()..].trim()),
+    }
+
+    /// Walk the stream and resolve every label to its byte address.
+    /// `base_symbols` carries the pre-stream definitions (the `equ` names
+    /// and the far-branch `__far_skipN` labels), which the walk preserves.
+    fn resolve_labels(
+        lines: &[String],
+        base_symbols: &std::collections::HashMap<String, usize>,
+    ) -> (std::collections::HashMap<String, usize>, usize) {
+        let mut symbols: std::collections::HashMap<String, usize> = base_symbols.clone();
+        let mut org = 0usize; // byte address
+        for line in lines {
+            if line.strip_suffix(':').is_some() {
+                symbols.insert(line.trim_end_matches(':').to_string(), org);
+            } else if let Some(rest) = line.strip_prefix("equ ") {
+                let mut it = rest.splitn(2, char::is_whitespace);
+                let name = it.next().unwrap().to_string();
+                let val = it.next().unwrap_or("");
+                symbols.insert(name, parse_num(val.trim()));
+            } else if let Some(rest) = line.strip_prefix("org ") {
+                org = parse_num(rest.trim());
+            } else if line.to_ascii_lowercase().starts_with("db ") {
+                org += line[3..]
+                    .split(',')
+                    .filter(|t| !t.trim().is_empty())
+                    .count();
+            } else {
+                org += instruction_words_pic18(line) * 2;
+            }
+        }
+        (symbols, org)
+    }
+
+    /// Walk the stream and collect each instruction with its byte address
+    /// plus each db byte with its byte address.
+    fn layout_addrs(lines: &[String]) -> (Vec<(usize, String)>, Vec<(usize, String)>, usize) {
+        let mut instrs = Vec::new();
+        let mut dbs = Vec::new();
+        let mut org = 0usize;
+        for line in lines {
+            if line.strip_suffix(':').is_some() {
+                continue;
+            }
+            if line.starts_with("equ ") {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("org ") {
+                org = parse_num(rest.trim());
+                continue;
+            }
+            if line.to_ascii_lowercase().starts_with("db ") {
+                for tok in line[3..].split(',') {
+                    if tok.trim().is_empty() {
+                        continue;
+                    }
+                    dbs.push((org, tok.trim().to_string()));
+                    org += 1; // one byte per db value
+                }
+                continue;
+            }
+            instrs.push((org, line.clone()));
+            org += instruction_words_pic18(line) * 2;
+        }
+        (instrs, dbs, org)
+    }
+
+    // `equ` and stream labels are resolved by the walks below; this base
+    // map starts empty (equ lines carry their own definitions) and grows
+    // only with nothing the walks do not also produce.
+    let symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    // Far conditional branches: a PIC18 `B<cond>` reaches +/-128 words,
+    // `BRA` +/-1024. A larger body expands the branch in place
+    // (`B<!cond> skip / BRA far / skip:`), and an out-of-range `BRA`
+    // becomes an absolute `GOTO`. The pass iterates to a fixpoint; each
+    // replacement is always in range, so it terminates.
+    let mut serial = 0usize;
+    loop {
+        let (symbols_now, _) = resolve_labels(&lines, &symbols);
+        let (instrs, _, _) = layout_addrs(&lines);
+        let mut expanded = false;
+        for (i, (addr, text)) in instrs.iter().enumerate() {
+            let mut it = text.splitn(2, char::is_whitespace);
+            let mne = it.next().unwrap_or("").to_ascii_uppercase();
+            let is_cond = matches!(
+                mne.as_str(),
+                "BZ" | "BNZ" | "BC" | "BNC" | "BOV" | "BNOV" | "BN" | "BNN"
             );
-            continue;
-        }
-        if line.to_ascii_lowercase().starts_with("db ") {
-            for tok in line[3..].split(',') {
-                let s = tok.trim();
-                if s.is_empty() {
+            let is_bra = mne == "BRA";
+            if !is_cond && !is_bra {
+                continue;
+            }
+            let rest = it.next().unwrap_or("").trim();
+            let target = *symbols_now
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined label {rest}"));
+            let off = (target >> 1) as i32 - ((addr >> 1) as i32 + 1);
+            let in_range = if is_bra {
+                (-1024..=1023).contains(&off)
+            } else {
+                (-128..=127).contains(&off)
+            };
+            if in_range {
+                continue;
+            }
+            // Map the i-th instruction back to its stream index: labels,
+            // org and db entries do not count as instructions.
+            let mut li = 0usize;
+            let mut n_instr = 0usize;
+            for line in &lines {
+                let is_label = line.strip_suffix(':').is_some();
+                let is_db = line.to_ascii_lowercase().starts_with("db ");
+                let is_org = line.starts_with("org ");
+                let is_equ = line.starts_with("equ ");
+                if is_label || is_db || is_org || is_equ {
+                    li += 1;
                     continue;
                 }
-                // A `LOW(fn)`/`HIGH(fn)` label literal (a const struct's
-                // function-pointer field, epic-cc#154) resolves through the
-                // pass-2 symbol table, so the raw token is kept and parsed
-                // after labels are known.
-                db_bytes.push((org, s.to_string()));
-                org += 1; // one byte per db value
+                if n_instr == i {
+                    break;
+                }
+                n_instr += 1;
+                li += 1;
             }
-            continue;
+            let target_label = rest.to_string();
+            if is_bra {
+                // A BRA beyond its +-1024-word range becomes an absolute
+                // GOTO (2 words, the whole flash is reachable); the
+                // replacement is a different mnemonic, so the round's
+                // other branches shift by at most 2 bytes and this BRA is
+                // gone forever.
+                lines[li] = format!("GOTO {target_label}");
+            } else {
+                let inv = invert_cond(&mne).to_string();
+                let skip = format!("__far_skip{serial}");
+                serial += 1;
+                lines[li] = format!("{inv} {skip}");
+                lines.insert(li + 1, format!("BRA {target_label}"));
+                lines.insert(li + 2, format!("{skip}:"));
+            }
+            expanded = true;
+            break;
         }
-        let words = instruction_words_pic18(line);
-        lines.push((org, line.to_string()));
-        org += words * 2; // advance by BYTES
+        if !expanded {
+            break;
+        }
     }
-    let mut out = vec![0u16; (org + 1) / 2];
-    for (addr, line) in &lines {
+
+    let (symbols_final, total_bytes) = resolve_labels(&lines, &symbols);
+    let (instrs, dbs, _) = layout_addrs(&lines);
+    let mut out = vec![0u16; (total_bytes + 1) / 2];
+    for (addr, line) in &instrs {
         let word_addr = addr / 2;
-        let encoded = encode_pic18(*addr, line, &symbols);
+        let encoded = encode_pic18(*addr, line, &symbols_final);
         out[word_addr] = encoded[0];
         if encoded.len() == 2 {
             out[word_addr + 1] = encoded[1];
         }
     }
-    for (addr, tok) in db_bytes {
-        let b = (parse_lit(&tok, &symbols) & 0xFF) as u8;
+    for (addr, tok) in dbs {
+        let b = (parse_lit(&tok, &symbols_final) & 0xFF) as u8;
         out[addr / 2] |= (u16::from(b)) << ((addr % 2) * 8);
     }
     out
