@@ -115,6 +115,7 @@ pub fn legalize(m: Module) -> Module {
             blocks,
             isr: f.isr,
             naked: f.naked,
+            variadic: f.variadic,
         });
     }
     // Runtime-routine duplication for the interrupt context. The user-level
@@ -542,6 +543,8 @@ fn inst_dst(inst: &Inst) -> Option<&str> {
         Inst::Gep(g) => Some(&g.dst),
         Inst::Alloca(a) => Some(&a.dst),
         Inst::Freeze(f) => Some(&f.dst),
+        Inst::VaArg(v) => Some(&v.dst),
+        Inst::VaStart(_) => None,
         Inst::FloatBin(b) => Some(&b.dst),
         Inst::Fcmp(c) => Some(&c.dst),
         Inst::FloatConv(c) => Some(&c.dst),
@@ -2232,5 +2235,6 @@ fn routine_func(name: &str) -> Func {
         }],
         isr: false, // runtime routines are never interrupt handlers
         naked: false,
+        variadic: false,
     }
 }

@@ -13,7 +13,7 @@
 use ir::{
     Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin,
     FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, IntToPtr, Load, MemLen, Memcpy,
-    Module, Param, Phi, Select, Sext, SrcLoc, Store, Trunc, Ty, Val, Zext,
+    Module, Param, Phi, Select, Sext, SrcLoc, Store, Trunc, Ty, VaArg, VaStart, Val, Zext,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -2251,6 +2251,9 @@ pub fn parse_ll(src: &str) -> Module {
             let suffix = suffix_raw.split('{').next().unwrap_or("").trim();
             let naked = func_is_naked(suffix, &attr_map);
 
+            let variadic = split_top_level(params_str, ',')
+                .iter()
+                .any(|p| p.trim() == "...");
             let mut params = Vec::new();
             for p in split_top_level(params_str, ',') {
                 let p = p.trim();
@@ -2342,6 +2345,7 @@ pub fn parse_ll(src: &str) -> Module {
                             blocks,
                             isr,
                             naked,
+                            variadic,
                         });
                         continue;
                     }
@@ -2476,6 +2480,7 @@ pub fn parse_ll(src: &str) -> Module {
                     blocks,
                     isr,
                     naked,
+                    variadic,
                 });
             }
         }
@@ -2765,6 +2770,24 @@ fn parse_inst(
                 || func.starts_with("llvm.lifetime.end")
             {
                 // lifetime markers produce no IR
+            } else if func.starts_with("llvm.va_start") {
+                // `llvm.va_start.p0(ptr %ap)`: the va_list slot is the
+                // alloca %ap. Record a no-op VaStart marker (the slot is
+                // zeroed by entry-frame setup).
+                let a = split_top_level(args_str, ',');
+                // `ptr nonnull %2` or `ptr %2`: the va_list slot is the
+                // last whitespace token (attributes like `nonnull` ride
+                // ahead of it).
+                let list = a[0]
+                    .trim()
+                    .split_whitespace()
+                    .last()
+                    .unwrap_or("")
+                    .trim_start_matches('%')
+                    .to_string();
+                out.push(Inst::VaStart(VaStart { list }));
+            } else if func.starts_with("llvm.va_end") {
+                // va_end is a no-op: the va list is an in-frame offset.
             } else {
                 let arg_parts = split_top_level(args_str, ',');
                 let mut args = Vec::new();
@@ -2963,6 +2986,36 @@ fn parse_inst(
                 from,
                 val,
                 to,
+            }));
+        }
+        "va_arg" => {
+            // `%9 = va_arg ptr %2, i16` / `%65 = va_arg ptr %3, ptr`: the
+            // list operand is the va_list slot (`ptr %2`), the type after
+            // the comma is the argument type. The trailing `!dbg !N`
+            // attribute and its operand comma are stripped.
+            let body = strip_attrs(&rest["va_arg".len()..]);
+            let parts = split_top_level(&body, ',');
+            assert_eq!(
+                parts.len(),
+                2,
+                "irparse: va_arg must have 2 operands in {line:?}"
+            );
+            let list_tok = parts[0].trim();
+            let list = list_tok
+                .split_whitespace()
+                .last()
+                .unwrap_or("")
+                .trim_start_matches('%')
+                .to_string();
+            let ty_tok = parts[1].trim();
+            let ptr_ty = ty_tok == "ptr";
+            let ty = ty_of(ty_tok, cur.as_ref());
+            let dst_name = dst.as_ref().expect("irparse: va_arg must define a value");
+            out.push(Inst::VaArg(VaArg {
+                dst: dst_name.clone(),
+                ty,
+                ptr: list,
+                ptr_ty,
             }));
         }
         "icmp" => {

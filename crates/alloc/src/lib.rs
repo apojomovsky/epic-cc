@@ -208,6 +208,7 @@ struct FrameLayout {
 fn frame_layout(
     f: &ir::Func,
     resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    va_size: u16,
 ) -> FrameLayout {
     // Block order: the entry block (unlabeled) first, then label order.
     let mut order: Vec<&ir::Block> = f.blocks.iter().collect();
@@ -239,6 +240,15 @@ fn frame_layout(
             p.name.clone(),
             (0, 0, p.width, order_idx, p.byval.is_some() || p.sret),
         );
+        order_idx += 1;
+    }
+    // The va region: the contiguous frame bytes a variadic callee's extra
+    // args land in, one region per variadic function, sized to the widest
+    // call site. Full-function interval like any memory object: the
+    // callee's `va_arg` reads are live across the whole body and the
+    // caller's arg copies happen at each call point.
+    if va_size > 0 {
+        defs.insert("__va".to_string(), (0, 0, va_size as u8, order_idx, true));
         order_idx += 1;
     }
     for (i, b) in order.iter().enumerate() {
@@ -560,6 +570,10 @@ fn inst_vals(inst: &ir::Inst) -> Vec<String> {
             vs
         }
         Inst::Alloca(_) => Vec::new(),
+        // va_arg reads the list slot to index the va region; va_start
+        // writes the list slot's offset.
+        Inst::VaArg(v) => vec![v.ptr.clone()],
+        Inst::VaStart(v) => vec![v.list.clone()],
         Inst::Memcpy(m) => vec![val_name(&m.dst), val_name(&m.src)]
             .into_iter()
             .chain(match &m.len {
@@ -688,6 +702,53 @@ fn global_end(map: &HashMap<String, u16>, floating: &[&ir::Global]) -> u16 {
 /// from `edges_text` (`edge <caller> <callee>` lines, order-agnostic; `depth`
 /// lines are informational). Panics loudly on a cyclic or unknown-function
 /// call graph, and if total demand exceeds the device's GPR space.
+
+/// The byte size of each variadic callee's va region: the maximum over its
+/// call sites of the sum of extra-arg widths (the args past the named
+/// params, which land in the callee's `__va` region in order).
+fn va_sizes(m: &Module) -> HashMap<String, u16> {
+    let mut sizes: HashMap<String, u16> = HashMap::new();
+    let mut params_len: HashMap<String, usize> = m
+        .funcs
+        .iter()
+        .map(|f| (f.name.clone(), f.params.len()))
+        .collect();
+    for f in &m.funcs {
+        if !f.variadic {
+            continue;
+        }
+        let named = f.params.len();
+        let max_w: u16 = 0;
+        let _ = max_w;
+        sizes.entry(f.name.clone()).or_insert(0);
+        params_len.insert(f.name.clone(), named);
+    }
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let ir::Inst::Call(c) = inst {
+                    if !c.callees.is_empty() {
+                        continue; // indirect calls never carry extras today
+                    }
+                    let Some(&named) = params_len.get(&c.func) else {
+                        continue;
+                    };
+                    if c.args.len() <= named {
+                        continue;
+                    }
+                    let extra: u16 = c.args[named..]
+                        .iter()
+                        .map(|a| a.ty.map(|t| u16::from(t.bytes())).unwrap_or(2))
+                        .sum();
+                    let e = sizes.entry(c.func.clone()).or_insert(0);
+                    *e = (*e).max(extra);
+                }
+            }
+        }
+    }
+    sizes
+}
+
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // iselcore's pointer resolution: a pointer select seeded as an indirect
     // slot materializes its two address bytes into the dst slot, so the
@@ -985,8 +1046,9 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // deferral's bill). locals_size(f) is the colored frame's byte size.
     let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
     let mut locals_size: HashMap<String, u16> = HashMap::new();
+    let va_sizes = va_sizes(m);
     for f in &m.funcs {
-        let fl = frame_layout(f, &resolved);
+        let fl = frame_layout(f, &resolved, *va_sizes.get(&f.name).unwrap_or(&0));
         locals_widths.insert(f.name.clone(), fl.widths);
         locals_size.insert(f.name.clone(), fl.size);
     }
@@ -1192,7 +1254,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut local_width: HashMap<String, u8> = HashMap::new();
     for f in &m.funcs {
         let b = base[&f.name];
-        let fl = frame_layout(f, &resolved);
+        let fl = frame_layout(f, &resolved, *va_sizes.get(&f.name).unwrap_or(&0));
         let mut slot_addr: Vec<u16> = Vec::with_capacity(fl.widths.len());
         let mut addr = b;
         for &w in &fl.widths {
@@ -1319,7 +1381,7 @@ fn def_width(
             _ => None,
         },
         Inst::Phi(p) => Some((p.dst.clone(), p.ty.bytes())),
-        Inst::Store(_) | Inst::Ret(_) | Inst::Br(_) | Inst::BrCond(_) => None,
+        Inst::Store(_) | Inst::Ret(_) | Inst::Br(_) | Inst::BrCond(_) | Inst::VaStart(_) => None,
         // Gep computes a virtual pointer address (isel turns it into FSR/INDF
         // or a RETLW table read); it defines no value needing a RAM slot.
         Inst::Gep(_) => None,
@@ -1329,6 +1391,8 @@ fn def_width(
         Inst::Memcpy(_) => None,
         // Freeze defines the dst slot, sized by the operand type.
         Inst::Freeze(f) => Some((f.dst.clone(), f.ty.bytes())),
+        // va_arg defines the read argument's dst, sized by its type.
+        Inst::VaArg(v) => Some((v.dst.clone(), v.ty.bytes())),
         // Float: binops/conv casts define an f32 (4-byte) dst; fcmp an i1.
         Inst::FloatBin(b) => Some((b.dst.clone(), 4)),
         Inst::Fcmp(c) => Some((c.dst.clone(), 1)),
