@@ -707,6 +707,7 @@ fn pointer_module(ir_text: &str) -> ir::Module {
             size: 1,
             bytes: vec![0],
             addr: None,
+            refs: Vec::new(),
         },
         ir::Global {
             name: "ram".into(),
@@ -715,6 +716,7 @@ fn pointer_module(ir_text: &str) -> ir::Module {
             size: 8,
             bytes: vec![0; 8],
             addr: None,
+            refs: Vec::new(),
         },
         ir::Global {
             name: "table".into(),
@@ -723,6 +725,7 @@ fn pointer_module(ir_text: &str) -> ir::Module {
             size: 4,
             bytes: vec![10, 20, 30, 40],
             addr: None,
+            refs: Vec::new(),
         },
     ];
     m
@@ -3891,6 +3894,7 @@ fn const_table_global(name: &str, size: usize) -> ir::Global {
         is_const: true,
         size: size as u16,
         bytes,
+        refs: Vec::new(),
         addr: None,
     }
 }
@@ -3978,6 +3982,7 @@ fn large_const_table_emits_two_entry_reader_and_16bit_caller() {
                 size: 2,
                 bytes: vec![0; 2],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -3986,6 +3991,7 @@ fn large_const_table_emits_two_entry_reader_and_16bit_caller() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("t", 300),
         ],
@@ -4092,6 +4098,7 @@ fn multi_term_large_table_index_panics() {
                 size: 2,
                 bytes: vec![0; 2],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "j".into(),
@@ -4100,6 +4107,7 @@ fn multi_term_large_table_index_panics() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("t", 300),
         ],
@@ -4146,6 +4154,7 @@ fn panics_when_user_const_collides_with_generated_chunk_label() {
                 size: 2,
                 bytes: vec![0; 2],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -4154,6 +4163,7 @@ fn panics_when_user_const_collides_with_generated_chunk_label() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("t", 300),
             const_table_global("t_1", 1),
@@ -4185,6 +4195,7 @@ fn panics_when_user_const_collides_with_generated_reader_label() {
                 size: 2,
                 bytes: vec![0; 2],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -4193,6 +4204,7 @@ fn panics_when_user_const_collides_with_generated_reader_label() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("t", 300),
             const_table_global("__read_t_hi", 1),
@@ -4232,6 +4244,7 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -4240,6 +4253,7 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("aaa_fill", 231),
             ir::Global {
@@ -4249,6 +4263,7 @@ fn small_const_table_in_nonzero_window_reads_correctly() {
                 size: 4,
                 bytes: vec![10, 20, 30, 40],
                 addr: None,
+                refs: Vec::new(),
             },
         ],
     );
@@ -4301,6 +4316,7 @@ fn large_const_table_reads_simulate_correctly() {
                 size: 2,
                 bytes: vec![0; 2],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -4309,6 +4325,7 @@ fn large_const_table_reads_simulate_correctly() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("aaa_fill", 206),
             const_table_global("t", 300),
@@ -4385,6 +4402,7 @@ fn exactly_256_byte_table_uses_chunked_shape_and_assembles() {
                 size: 2,
                 bytes: vec![0; 2],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -4393,6 +4411,7 @@ fn exactly_256_byte_table_uses_chunked_shape_and_assembles() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("t", 256),
         ],
@@ -8356,6 +8375,7 @@ fn single_entry_table_crossing_window_is_256_aligned() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -8364,6 +8384,7 @@ fn single_entry_table_crossing_window_is_256_aligned() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("t", 60),
         ],
@@ -8419,6 +8440,7 @@ fn single_entry_table_within_window_emits_no_align() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             ir::Global {
                 name: "out".into(),
@@ -8427,6 +8449,7 @@ fn single_entry_table_within_window_emits_no_align() {
                 size: 1,
                 bytes: vec![0],
                 addr: None,
+                refs: Vec::new(),
             },
             const_table_global("t", 60),
         ],

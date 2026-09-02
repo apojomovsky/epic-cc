@@ -20,6 +20,7 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 use ir::{Inst, Module};
+use iselcore::{resolve_pointers, ssa_key, Base};
 
 /// Complete address map: globals keyed by name, locals keyed `{func}::{name}`,
 /// plus the total overlay span (in bytes) across all banks. `const_globals`
@@ -204,7 +205,10 @@ struct FrameLayout {
 /// immediately reusable. Greedy first-fit coloring reuses the lowest slot
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
-fn frame_layout(f: &ir::Func) -> FrameLayout {
+fn frame_layout(
+    f: &ir::Func,
+    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+) -> FrameLayout {
     // Block order: the entry block (unlabeled) first, then label order.
     let mut order: Vec<&ir::Block> = f.blocks.iter().collect();
     // The entry block (label `entry` in hand-written IR, a numeric label in
@@ -239,7 +243,7 @@ fn frame_layout(f: &ir::Func) -> FrameLayout {
     }
     for (i, b) in order.iter().enumerate() {
         for (pos, inst) in b.insts.iter().enumerate() {
-            if let Some((name, width)) = def_width(inst) {
+            if let Some((name, width)) = def_width(inst, resolved, &f.name) {
                 let mem = matches!(inst, ir::Inst::Alloca(_));
                 defs.insert(name, (i, pos as u16, width, order_idx, mem));
                 order_idx += 1;
@@ -685,6 +689,10 @@ fn global_end(map: &HashMap<String, u16>, floating: &[&ir::Global]) -> u16 {
 /// lines are informational). Panics loudly on a cyclic or unknown-function
 /// call graph, and if total demand exceeds the device's GPR space.
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
+    // iselcore's pointer resolution: a pointer select seeded as an indirect
+    // slot materializes its two address bytes into the dst slot, so the
+    // dst needs a RAM slot; a folded select is virtual and defines none.
+    let resolved = resolve_pointers(m);
     // 1. Globals: sequential, aligned to at most two bytes (i16 -> even
     // address; larger arrays advance sequentially), stepping through the banks as bank 0 GPR fills up. Each global spans
     // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
@@ -766,6 +774,46 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                                         }
                                     }
                                     ir::Val::Const(_) => {}
+                                }
+                            }
+                        }
+                    }
+                    // A pointer select whose arms are const globals is a runtime
+                    // address VALUE when the arms do not fold to a common base
+                    // (iselcore seeds it as an
+                    // indirect slot, epic-cc#147): the selected arm's bytes
+                    // are read through the slot with RAM semantics, so each
+                    // const arm must be copied to RAM. A select that folds
+                    // (same base, e.g. the ccp_sel shape) keeps its const in
+                    // flash: loads lower via the fold's RETLW/TBLRD path.
+                    if let ir::Inst::Select(s) = inst {
+                        if !s.ptr {
+                            continue;
+                        }
+                        let const_base = |v: &ir::Val| -> Option<String> {
+                            match v {
+                                ir::Val::Global(g) => {
+                                    if m.globals.iter().any(|gl| &gl.name == g && gl.is_const) {
+                                        Some(g.clone())
+                                    } else {
+                                        None
+                                    }
+                                }
+                                ir::Val::Reg(r) => find_const_base(r),
+                                ir::Val::Const(_) => None,
+                            }
+                        };
+                        // `ba != bb` is the fold test: equal const bases fold
+                        // (ccp_sel shape, const stays in flash); different
+                        // bases, or a const arm against a RAM/runtime arm,
+                        // seed the select and need each const arm in RAM.
+                        let (ba, bb) = (const_base(&s.a), const_base(&s.b));
+                        if ba != bb {
+                            for g in [ba, bb].into_iter().flatten() {
+                                if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
+                                    if gl.size <= 255 {
+                                        const_to_ram.insert(g);
+                                    }
                                 }
                             }
                         }
@@ -938,7 +986,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
     let mut locals_size: HashMap<String, u16> = HashMap::new();
     for f in &m.funcs {
-        let fl = frame_layout(f);
+        let fl = frame_layout(f, &resolved);
         locals_widths.insert(f.name.clone(), fl.widths);
         locals_size.insert(f.name.clone(), fl.size);
     }
@@ -1144,7 +1192,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut local_width: HashMap<String, u8> = HashMap::new();
     for f in &m.funcs {
         let b = base[&f.name];
-        let fl = frame_layout(f);
+        let fl = frame_layout(f, &resolved);
         let mut slot_addr: Vec<u16> = Vec::with_capacity(fl.widths.len());
         let mut addr = b;
         for &w in &fl.widths {
@@ -1229,8 +1277,18 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
 
 /// The value a defining instruction writes: `(name, byte width)`, or `None`
 /// for non-defining instructions. `icmp` results are i1 (1 byte) regardless
-/// of the operand type.
-fn def_width(inst: &Inst) -> Option<(String, u8)> {
+/// of the operand type. `resolved` is iselcore's pointer resolution for
+/// the module: a pointer select gets a slot only when iselcore seeded it
+/// as an indirect slot (its two address bytes are materialized into the
+/// dst, epic-cc#117 and epic-cc#147). A folded select is virtual (iselcore
+/// folds it like a GEP) and defines no slot; allocating one would be dead
+/// space that perturbs the liveness coloring and can clobber a fold-term
+/// register the fold still reads at every load site.
+fn def_width(
+    inst: &Inst,
+    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    fname: &str,
+) -> Option<(String, u8)> {
     match inst {
         Inst::Load(l) => Some((l.dst.clone(), l.ty.bytes())),
         Inst::Bin(b) => Some((b.dst.clone(), b.ty.bytes())),
@@ -1239,19 +1297,23 @@ fn def_width(inst: &Inst) -> Option<(String, u8)> {
         Inst::Trunc(t) => Some((t.dst.clone(), t.to.bytes())),
         Inst::IntToPtr(p) => Some((p.dst.clone(), p.to.bytes())),
         Inst::Icmp(i) => Some((i.dst.clone(), 1)),
-        // A pointer-typed select whose arms are both runtime address
-        // literals materializes its two address bytes into the dst slot
-        // (isel's value-select path, epic-cc#117), so the dst needs a slot
-        // like any 2-byte value. A pointer select over folded (compile-time)
-        // arms is virtual (iselcore folds it like a GEP) and defines no
-        // slot.
+        // A pointer select iselcore seeded as an indirect slot
+        // (`Base::Slot(dst, true)`) materializes its two address bytes into
+        // the dst slot (epic-cc#117 and epic-cc#147), so the dst needs a
+        // slot like any 2-byte value. A folded select is virtual and
+        // defines no slot.
         Inst::Select(s)
-            if s.ptr && matches!((&s.a, &s.b), (ir::Val::Const(_), ir::Val::Const(_))) =>
+            if matches!(
+                resolved.get(&ssa_key(fname, &s.dst)),
+                Some((Base::Slot(_, true), 0, t)) if t.is_empty()
+            ) =>
         {
             Some((s.dst.clone(), s.ty.bytes()))
         }
-        Inst::Select(s) if s.ptr => None,
-        Inst::Select(s) => Some((s.dst.clone(), s.ty.bytes())),
+        // A value select (i1/i8/i16/f32) copies the selected operand into
+        // the dst slot like any other value.
+        Inst::Select(s) if !s.ptr => Some((s.dst.clone(), s.ty.bytes())),
+        Inst::Select(_) => None,
         Inst::Call(c) => match (&c.dst, &c.ty) {
             (Some(d), Some(t)) => Some((d.clone(), t.bytes())),
             _ => None,

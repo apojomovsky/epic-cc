@@ -117,11 +117,15 @@ pub enum Base {
 /// `Global` or a seed. A pointer select folds when both arms resolve to the
 /// same base with matching term sets: `select i1 c, base+kA, base+kB`
 /// (kA < kB) is `base + kA + (kB-kA)×c`: the cond reg becomes a scale-1
-/// term, its 0/1 polarity picking the low arm. A `Gep` whose base is
-/// neither a seed nor another (eventually resolvable) `Gep`/select is a bug
-/// in an earlier stage and panics loudly, as does a select whose arms do
-/// not fold to a common base; a scan that makes no progress with unresolved
-/// entries left is a cycle and panics loudly.
+/// term, its 0/1 polarity picking the low arm. A select whose arms are
+/// runtime address VALUES that do not fold (distinct globals, a global vs
+/// a runtime slot, two runtime slots) is itself a runtime address VALUE:
+/// its dst is seeded as an indirect slot whose bytes isel materializes as
+/// a 2-byte value select. A `Gep` whose base is neither a seed nor another
+/// (eventually resolvable) `Gep`/select is a bug in an earlier stage and
+/// panics loudly, as does a select with an arm that is neither foldable
+/// nor a materializable runtime value; a scan that makes no progress with
+/// unresolved entries left is a cycle and panics loudly.
 pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, String)>)> {
     let mut geps: HashMap<String, ir::Gep> = HashMap::new();
     let mut selects: HashMap<String, ir::Select> = HashMap::new();
@@ -308,8 +312,14 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
             // scale-1 term, so `select c, base+kA, base+kB` (kA < kB) is
             // `base + kA + (kB-kA)×c`: c = 0 picks kA, c = 1 adds the
             // difference. The scale is the difference of two u8 offsets, so
-            // it always fits. Arms that do not fold (different bases, term
-            // mismatches, non-reg cond) stay pending and panic below.
+            // it always fits. A select whose arms are runtime address
+            // VALUES that do not fold (distinct globals, a global vs a
+            // runtime slot, two runtime slots) is itself a runtime address
+            // VALUE: seed the dst as an indirect slot, whose bytes isel
+            // materializes as a 2-byte value select. Only an arm that is
+            // neither foldable nor a materializable runtime value (a
+            // folded GEP reg, whose address is a link-time constant with no
+            // slot bytes) stays pending and panics below.
             let mut rest_selects = Vec::new();
             for (key, s) in pending_selects {
                 // A select whose arms are both runtime address CONSTANTS was
@@ -325,6 +335,15 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                         "iselcore: duplicate definition of pointer reg {key}"
                     );
                     resolved.insert(key, folded);
+                    progressed = true;
+                } else if select_arm_is_runtime_value(&s.a, &resolved, &fname)
+                    && select_arm_is_runtime_value(&s.b, &resolved, &fname)
+                {
+                    assert!(
+                        !resolved.contains_key(&key),
+                        "iselcore: duplicate definition of pointer reg {key}"
+                    );
+                    resolved.insert(key, (Base::Slot(s.dst.clone(), true), 0, Vec::new()));
                     progressed = true;
                 } else {
                     rest_selects.push((key, s));
@@ -378,4 +397,27 @@ fn fold_select(
     let mut terms = va.2.clone();
     terms.push((d, c));
     Some((va.0.clone(), lo, terms))
+}
+
+/// Whether a pointer-select arm is a runtime address VALUE whose two bytes
+/// isel can materialize into the dst slot: a `Const` literal, a `Global`
+/// (its address is a link-time literal), or a reg resolving to a
+/// runtime-address slot (`Base::Slot(_, true)`, whose bytes ARE the
+/// address) or a plain global base (a link-time literal). A reg with a
+/// constant offset or dynamic terms is a computed address with no single
+/// materializable value and is not a runtime value.
+fn select_arm_is_runtime_value(
+    v: &ir::Val,
+    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    fname: &str,
+) -> bool {
+    match v {
+        ir::Val::Const(_) | ir::Val::Global(_) => true,
+        ir::Val::Reg(r) => match resolved.get(&ssa_key(fname, r)) {
+            Some((Base::Slot(_, true), 0, t)) | Some((Base::Global(_), 0, t)) if t.is_empty() => {
+                true
+            }
+            _ => false,
+        },
+    }
 }

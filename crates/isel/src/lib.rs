@@ -1120,6 +1120,7 @@ impl<'m> Gen<'m> {
                     }
                     return;
                 }
+
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
@@ -1130,8 +1131,14 @@ impl<'m> Gen<'m> {
                     let lit = if idx == 0 { "LOW" } else { "HIGH" };
                     self.emit(format!("    MOVLW {lit}({g})"));
                 } else {
+                    // A data global in value position is a pointer ADDRESS
+                    // (a `store ptr @g, ...` or a pointer phi incoming;
+                    // clang always loads scalar globals first): materialize
+                    // it as two literals, never read the pointee's contents
+                    // (epic-cc#155).
                     let a = self.val_addr(&Val::Global(g.clone())).direct();
-                    self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
+                    let b = ((a >> (idx as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVLW 0x{b:02X}"));
                 }
             }
         }
@@ -1450,13 +1457,98 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = cond ? a : b` via an if/else jump over two copies. Mirrors spike
-    /// emit_select.
+    /// `emit_select` in the spike crate. `cond` is a runtime reg (a const
+    /// cond folds to a plain copy of the selected arm); `a`/`b` route
+    /// through `emit_move_val_to_slot`, which handles `Val::Const` and
+    /// `Val::Reg` correctly and never branches on a flag, so no guard is
+    /// needed for either.
+    ///
+    /// Whether pointer-select dst `name` was seeded by iselcore as an
+    /// indirect slot (`Base::Slot(_, true)`): its bytes are a runtime
+    /// address VALUE the select must materialize, not a folded pointer.
+    fn select_is_seeded(&self, name: &str) -> bool {
+        matches!(
+            self.resolved.get(&ssa_key(self.cur_func, name)),
+            Some((Base::Slot(_, true), 0, t)) if t.is_empty()
+        )
+    }
+
+    /// Copy the two-byte ADDRESS VALUE of `val` into the slot at `dst`:
+    /// a `Const` literal writes the constant bytes, a `Global` writes its
+    /// link-time address as two literals, a `Reg` reads the two bytes of
+    /// its runtime-address slot (a seeded select dst, an IntToPtr dst, or
+    /// a pointer param). Used by the pointer-select materialization
+    /// (epic-cc#147); a reg with dynamic terms is a computed address with
+    /// no single materializable value and panics.
+    fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
+        match val {
+            Val::Const(k) => {
+                self.emit(format!("    MOVLW 0x{:02X}", (k & 0xFF) as u8));
+                self.emit(format!("    MOVWF 0x{:02X}", dst));
+                self.emit(format!("    MOVLW 0x{:02X}", ((k >> 8) & 0xFF) as u8));
+                self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+            }
+            Val::Global(g) => {
+                if self.is_function(g) {
+                    self.emit(format!("    MOVLW LOW({g})"));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst));
+                    self.emit(format!("    MOVLW HIGH({g})"));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+                } else {
+                    let addr = self.global_addr(g);
+                    self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst));
+                    self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                    self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+                }
+            }
+            Val::Reg(r) => {
+                let (base, k, terms) = self.resolved_for(r);
+                assert!(
+                    k == 0 && terms.is_empty(),
+                    "isel: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
+                );
+                let sa = match &base {
+                    Base::Slot(sname, true) => self.slot_addr(self.cur_func, sname).direct(),
+                    Base::Global(name) => {
+                        let addr = self.global_addr(name);
+                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                        self.emit(format!("    MOVWF 0x{:02X}", dst));
+                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                        self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+                        return;
+                    }
+                    other => panic!("isel: cannot materialize {other:?} as a select arm"),
+                };
+                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                self.emit(format!("    MOVWF 0x{:02X}", dst));
+                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+            }
+        }
+    }
+
+    /// `d = cond ? a : b` via an if/else jump over two copies. Mirrors spike
+    /// `emit_select` in the spike crate. `cond` is a runtime reg (a const
+    /// cond folds to a plain copy of the selected arm); `a`/`b` route
+    /// through `emit_move_val_to_slot`, which handles `Val::Const` and
+    /// `Val::Reg` correctly and never branches on a flag, so no guard is
+    /// needed for either.
+    ///
+    /// A pointer select whose dst is a seeded indirect slot holds an
+    /// ADDRESS VALUE: the arms are materialized as their two address
+    /// bytes, not copied as RAM contents (epic-cc#147).
     fn emit_select(&mut self, dst: &str, cond: &Val, ty: Ty, a: &Val, b: &Val) {
         let da = self.slot_addr(self.cur_func, dst).direct();
+        let addr_value = self.select_is_seeded(dst);
         match cond {
             Val::Const(k) => {
                 let v = if *k != 0 { a } else { b };
-                self.emit_move_val_to_slot(v, ty, da);
+                if addr_value {
+                    self.emit_move_addr_to_slot(v, da);
+                } else {
+                    self.emit_move_val_to_slot(v, ty, da);
+                }
                 return;
             }
             Val::Global(_) => panic!("isel: select condition is a global"),
@@ -1471,10 +1563,18 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVF 0x{ca:02X}, W"));
         self.emit("    BTFSC STATUS, 2 ; Z".to_string());
         self.emit(format!("    GOTO {l_else}"));
-        self.emit_move_val_to_slot(a, ty, da);
+        if addr_value {
+            self.emit_move_addr_to_slot(a, da);
+        } else {
+            self.emit_move_val_to_slot(a, ty, da);
+        }
         self.emit(format!("    GOTO {l_end}"));
         self.emit(format!("{l_else}:"));
-        self.emit_move_val_to_slot(b, ty, da);
+        if addr_value {
+            self.emit_move_addr_to_slot(b, da);
+        } else {
+            self.emit_move_val_to_slot(b, ty, da);
+        }
         self.emit(format!("{l_end}:"));
     }
 
@@ -1864,6 +1964,18 @@ impl<'m> Gen<'m> {
                     // covers a GEP over a const global that was copied to RAM
                     // (the `is_const` copy is in `addrs`, so `global_is_const`
                     // is false and the bytes live in RAM).
+                    Val::Reg(r) if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) => {
+                        // A runtime pointer value (a `load ptr` result, e.g.
+                        // the taskmgr `t->arg` field): the two address bytes
+                        // live in the reg's slot. Copy them into the param
+                        // slot; the callee's FSR-based deref resolves the
+                        // address at runtime (epic-cc#155).
+                        let sa = self.slot_addr(self.cur_func, r).direct();
+                        self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                        self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                    }
                     Val::Reg(r) if matches!(self.resolved_for(r), (Base::Global(_), _, ref t) if t.is_empty()) =>
                     {
                         let (base, k, _) = self.resolved_for(r);
@@ -1938,7 +2050,12 @@ impl<'m> Gen<'m> {
                                 self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
                                 continue;
                             }
-                            other => panic!("isel: cannot pass a GEP over {other:?} as a ptr arg"),
+                            // A runtime-address slot (a seeded pointer
+                            // select dst, an IntToPtr dst) holds the address
+                            // bytes: pass them through (epic-cc#147).
+                            Base::Slot(sname, true) => {
+                                self.slot_addr(self.cur_func, sname).direct()
+                            }
                         };
                         let k_lo = (u16::from(k) & 0xFF) as u8;
                         let k_hi = (u16::from(k) >> 8) as u8;
@@ -2529,6 +2646,14 @@ impl<'m> Gen<'m> {
                         // arm's address bytes must land in the dst slot,
                         // which iselcore seeded as an indirect pointer. The
                         // two-byte value select is exactly the materialization.
+                        self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
+                    } else if self.select_is_seeded(&s.dst) {
+                        // A pointer select whose arms are runtime address
+                        // VALUES that do not fold (distinct globals, a global
+                        // vs a runtime slot, two runtime slots, epic-cc#147):
+                        // iselcore seeded the dst as an indirect slot, so the
+                        // selected arm's address bytes must land in it. The
+                        // two-byte value select materializes them.
                         self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
                     } else {
                         // A pointer-typed select is a pointer VALUE, folded by
@@ -6146,7 +6271,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             if g.is_const && addrs.contains_key(&g.name) {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    // A function-address field (epic-cc#154) materializes
+                    // the link-time label literal.
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        init.push(format!("    MOVLW {lit}({f})"));
+                    } else {
+                        init.push(format!("    MOVLW 0x{b:02X}"));
+                    }
                     init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                 }
             }
@@ -6228,7 +6360,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             if g.is_const && addrs.contains_key(&g.name) {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    // A function-address field (epic-cc#154) materializes
+                    // the link-time label literal.
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        init.push(format!("    MOVLW {lit}({f})"));
+                    } else {
+                        init.push(format!("    MOVLW 0x{b:02X}"));
+                    }
                     init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                 }
             }
@@ -6254,7 +6393,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 if g.is_const && addrs.contains_key(&g.name) {
                     let base = addrs[&g.name];
                     for (idx, b) in g.bytes.iter().enumerate() {
-                        init.push(format!("    MOVLW 0x{b:02X}"));
+                        // A function-address field (epic-cc#154) materializes
+                        // the link-time label literal.
+                        if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == idx) {
+                            let lit = if idx % 2 == 0 { "LOW" } else { "HIGH" };
+                            init.push(format!("    MOVLW {lit}({f})"));
+                        } else {
+                            init.push(format!("    MOVLW 0x{b:02X}"));
+                        }
                         init.push(format!("    MOVWF 0x{:02X}", base + idx as u16));
                     }
                 }
@@ -6681,8 +6827,13 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             out.push("    .align 256".to_string());
             out.push(format!("    .table {} {size}", g.name));
             out.push(format!("{}:", g.name));
-            for b in &g.bytes[..256] {
-                out.push(format!("    RETLW 0x{b:02X}"));
+            for (i, b) in g.bytes[..256].iter().enumerate() {
+                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                    let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                    out.push(format!("    RETLW {lit}({f})"));
+                } else {
+                    out.push(format!("    RETLW 0x{b:02X}"));
+                }
             }
             for c in 1..n_chunks {
                 let start = c * 256;
@@ -6693,8 +6844,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     format!("{}_{}", g.name, c)
                 };
                 out.push(format!("{chunk_label}:"));
-                for b in &g.bytes[start..end.min(size)] {
-                    out.push(format!("    RETLW 0x{b:02X}"));
+                for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
+                    let abs = start + i;
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == abs) {
+                        let lit = if abs % 2 == 0 { "LOW" } else { "HIGH" };
+                        out.push(format!("    RETLW {lit}({f})"));
+                    } else {
+                        out.push(format!("    RETLW 0x{b:02X}"));
+                    }
                 }
             }
             // reader entries after the table
@@ -6727,8 +6884,16 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
             out.push(format!("    .table {} {size}", g.name));
             out.push(format!("{}:", g.name));
-            for b in &g.bytes[..size] {
-                out.push(format!("    RETLW 0x{b:02X}"));
+            for (i, b) in g.bytes[..size].iter().enumerate() {
+                // A function-address field (epic-cc#154) materializes the
+                // link-time label literal: byte 0 = LOW(fn), byte 1 =
+                // HIGH(fn), resolved by the assembler's symbol table.
+                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                    let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                    out.push(format!("    RETLW {lit}({f})"));
+                } else {
+                    out.push(format!("    RETLW 0x{b:02X}"));
+                }
             }
         }
         // Track the tables' `.align`/RETLW words so the running address

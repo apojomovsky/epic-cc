@@ -285,6 +285,16 @@ impl<'m> Gen<'m> {
         })
     }
 
+    /// Whether pointer-select dst `name` was seeded by iselcore as an
+    /// indirect slot (`Base::Slot(_, true)`): its bytes are a runtime
+    /// address VALUE the select must materialize, not a folded pointer.
+    fn select_is_seeded(&self, name: &str) -> bool {
+        matches!(
+            self.resolved.get(&ssa_key(self.cur_func, name)),
+            Some((Base::Slot(_, true), 0, t)) if t.is_empty()
+        )
+    }
+
     /// The `,A`/`,B` operand components `(a, f)` for a physical address
     /// used by a `W`-routing instruction (`ADDWF`/`SUBWF`/.../`CPFSxx`/
     /// `MOVWF`), emitting `MOVLB` first if the tracked `BSR` doesn't
@@ -319,6 +329,86 @@ impl<'m> Gen<'m> {
     /// One byte, memory-to-memory, via `MOVFF`  -  no access bit, no `BSR`.
     fn emit_copy_byte(&mut self, src: u16, dst: u16) {
         self.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+    }
+
+    /// Copy the two-byte ADDRESS VALUE of `val` into the slot at `dst`:
+    /// a `Const` literal writes the constant bytes, a `Global` writes its
+    /// link-time address as two literals, a `Reg` copies the two bytes of
+    /// its runtime-address slot (a seeded select dst, an IntToPtr dst, or
+    /// a pointer param). Used by the pointer-select materialization
+    /// (epic-cc#147); a reg with dynamic terms is a computed address with
+    /// no single materializable value and panics.
+    fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
+        match val {
+            Val::Const(k) => {
+                for (i, byte) in [(0u16, (k & 0xFF) as u8), (1u16, ((k >> 8) & 0xFF) as u8)] {
+                    self.emit(format!("    MOVLW 0x{byte:02X}"));
+                    let (a, f) = self.operand(dst + i);
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                }
+            }
+            Val::Global(g) => {
+                if self.is_function(g) {
+                    self.emit(format!("    MOVLW LOW({g})"));
+                    let (a0, f0) = self.operand(dst);
+                    self.emit(format!(
+                        "    MOVWF 0x{f0:03X},{}",
+                        if a0 == 0 { "A" } else { "B" }
+                    ));
+                    self.emit(format!("    MOVLW HIGH({g})"));
+                    let (a1, f1) = self.operand(dst + 1);
+                    self.emit(format!(
+                        "    MOVWF 0x{f1:03X},{}",
+                        if a1 == 0 { "A" } else { "B" }
+                    ));
+                } else {
+                    let addr = self.global_addr(g);
+                    self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                    let (a0, f0) = self.operand(dst);
+                    self.emit(format!(
+                        "    MOVWF 0x{f0:03X},{}",
+                        if a0 == 0 { "A" } else { "B" }
+                    ));
+                    self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                    let (a1, f1) = self.operand(dst + 1);
+                    self.emit(format!(
+                        "    MOVWF 0x{f1:03X},{}",
+                        if a1 == 0 { "A" } else { "B" }
+                    ));
+                }
+            }
+            Val::Reg(r) => {
+                let (base, k, terms) = self.resolved_for(r);
+                assert!(
+                    k == 0 && terms.is_empty(),
+                    "isel-pic18: cannot materialize a computed address ({base:?} k={k} terms={terms:?}) as a select arm"
+                );
+                match &base {
+                    Base::Slot(sname, true) => {
+                        let sa = self.slot_addr(self.cur_func, sname).direct();
+                        self.emit_copy_byte(sa, dst);
+                        self.emit_copy_byte(sa + 1, dst + 1);
+                    }
+                    Base::Global(name) => {
+                        let addr = self.global_addr(name);
+                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                        let (a0, f0) = self.operand(dst);
+                        self.emit(format!(
+                            "    MOVWF 0x{f0:03X},{}",
+                            if a0 == 0 { "A" } else { "B" }
+                        ));
+                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                        let (a1, f1) = self.operand(dst + 1);
+                        self.emit(format!(
+                            "    MOVWF 0x{f1:03X},{}",
+                            if a1 == 0 { "A" } else { "B" }
+                        ));
+                    }
+                    other => panic!("isel-pic18: cannot materialize {other:?} as a select arm"),
+                }
+            }
+        }
     }
 
     /// Copy `val` (width `ty.bytes()`) into the slot starting at `dst`. A
@@ -431,6 +521,20 @@ impl<'m> Gen<'m> {
                 for i in 0..ty.bytes() {
                     let lit = if i == 0 { "LOW" } else { "HIGH" };
                     self.emit(format!("    MOVLW {lit}({g})"));
+                    let (a, f) = self.operand(dst + u16::from(i));
+                    let bank = if a == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                }
+            }
+            Val::Global(g) => {
+                // A data global in value position is a pointer ADDRESS (a
+                // `store ptr @g, ...` or a pointer phi incoming; clang
+                // always loads scalar globals first): materialize it as two
+                // literals, never copy the pointee's contents (epic-cc#155).
+                let addr = self.global_addr(g);
+                for i in 0..ty.bytes() {
+                    let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVLW 0x{byte:02X}"));
                     let (a, f) = self.operand(dst + u16::from(i));
                     let bank = if a == 0 { "A" } else { "B" };
                     self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
@@ -932,6 +1036,41 @@ impl<'m> Gen<'m> {
                             "    MOVWF 0x{f1:03X},{}",
                             if a1 == 0 { "A" } else { "B" }
                         ));
+                    }
+                } else if let Val::Reg(r) = &arg.val {
+                    // A runtime pointer value (a `load ptr` result, e.g.
+                    // the taskmgr `t->arg` field): the two address bytes
+                    // live in the reg's slot. Copy them into the param
+                    // slot; the callee's FSR-based deref resolves the
+                    // address at runtime (epic-cc#155).
+                    if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) {
+                        let sa = self.slot_addr(self.cur_func, r).direct();
+                        self.emit_copy_byte(sa, pa);
+                        self.emit_copy_byte(sa + 1, pa + 1);
+                    } else {
+                        match self.emit_ptr_setup(&arg.val, 0) {
+                            Addr::Direct(addr) => {
+                                self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                                let (a0, f0) = self.operand(pa);
+                                self.emit(format!(
+                                    "    MOVWF 0x{f0:03X},{}",
+                                    if a0 == 0 { "A" } else { "B" }
+                                ));
+                                self.emit(format!(
+                                    "    MOVLW 0x{:02X}",
+                                    ((addr >> 8) & 0xFF) as u8
+                                ));
+                                let (a1, f1) = self.operand(pa + 1);
+                                self.emit(format!(
+                                    "    MOVWF 0x{f1:03X},{}",
+                                    if a1 == 0 { "A" } else { "B" }
+                                ));
+                            }
+                            Addr::Indirect => {
+                                self.emit_copy_byte(0xFE9, pa); // FSR0L -> param slot lo
+                                self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> param slot hi
+                            }
+                        }
                     }
                 } else {
                     match self.emit_ptr_setup(&arg.val, 0) {
@@ -1457,6 +1596,13 @@ impl<'m> Gen<'m> {
                     // The two-byte value select below is exactly the
                     // materialization; the existing arms handle `Const` arms
                     // via `emit_move_val_to_slot`'s MOVLW path.
+                } else if s.ptr && self.select_is_seeded(&s.dst) {
+                    // A pointer select whose arms are runtime address VALUES
+                    // that do not fold (distinct globals, a global vs a
+                    // runtime slot, two runtime slots, epic-cc#147): iselcore
+                    // seeded the dst as an indirect slot, so the selected
+                    // arm's address bytes must land in it. The two-byte
+                    // value select below materializes them.
                 } else if s.ptr {
                     // A pointer-typed select folded by iselcore into the
                     // resolved map (a GEP-chain select): emits nothing, every
@@ -1470,7 +1616,9 @@ impl<'m> Gen<'m> {
                 // `a`/`b` route through `emit_move_val_to_slot`, which
                 // handles `Val::Const` correctly (via `MOVLW`+`MOVWF`, not
                 // as a RAM address through `val_addr`) and never branches
-                // on a flag  -  no guard needed for either.
+                // on a flag  -  no guard needed for either. A seeded
+                // pointer select (epic-cc#147) holds an ADDRESS VALUE, so
+                // its arms go through `emit_move_addr_to_slot` instead.
                 //
                 // `cond` is different: it's loaded via `emit_load_w`, then
                 // immediately tested with `BZ`, which relies on the LOAD
@@ -1486,20 +1634,30 @@ impl<'m> Gen<'m> {
                 // leave, silently picking the wrong side of the `Select`.
                 // Same hazard class as the const-LHS/const-source guards
                 // elsewhere in this file; guard it the same way.
-                if !s.ptr || matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
+                let seeded = s.ptr && self.select_is_seeded(&s.dst);
+                if !s.ptr || matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) || seeded {
                     assert!(
                         !matches!(s.cond, Val::Const(_)),
                         "isel-pic18: const cond Select not yet supported"
                     );
                     let dst = self.slot_addr(self.cur_func, &s.dst).direct();
+                    let addr_value = seeded;
                     let l_else = self.fresh_label();
                     let l_end = self.fresh_label();
                     self.emit_load_w(&s.cond, 0);
                     self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
-                    self.emit_move_val_to_slot(&s.a, s.ty, dst);
+                    if addr_value {
+                        self.emit_move_addr_to_slot(&s.a, dst);
+                    } else {
+                        self.emit_move_val_to_slot(&s.a, s.ty, dst);
+                    }
                     self.emit(format!("    BRA {l_end}"));
                     self.emit_label(&l_else);
-                    self.emit_move_val_to_slot(&s.b, s.ty, dst);
+                    if addr_value {
+                        self.emit_move_addr_to_slot(&s.b, dst);
+                    } else {
+                        self.emit_move_val_to_slot(&s.b, s.ty, dst);
+                    }
                     self.emit_label(&l_end);
                 }
             }
@@ -4979,7 +5137,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     let addr = base + i as u16;
-                    init.push(format!("    MOVLW 0x{b:02X}"));
+                    // A function-address field (epic-cc#154) materializes
+                    // the link-time label literal.
+                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        init.push(format!("    MOVLW {lit}({f})"));
+                    } else {
+                        init.push(format!("    MOVLW 0x{b:02X}"));
+                    }
                     // Access-bank check mirrors Gen::operand: <0x60 or >=0xF60 is A.
                     if addr < 0x60 || addr >= 0xF60 {
                         init.push(format!("    MOVWF 0x{addr:03X},A"));
@@ -5012,9 +5177,29 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             g.name
         );
         out.push(format!("{}:", g.name));
-        for chunk in g.bytes.chunks(8) {
-            let bytes: Vec<String> = chunk.iter().map(|b| format!("0x{b:02X}")).collect();
-            out.push(format!("    db {}", bytes.join(", ")));
+        // Chunk the plain bytes 8 per line (the pre-#154 layout); a
+        // function-address field (epic-cc#154) materializes the link-time
+        // label literal, byte 0 = LOW(fn), byte 1 = HIGH(fn), resolved by
+        // the assembler's symbol table, and splits its own line.
+        let mut chunk: Vec<String> = Vec::new();
+        for (i, b) in g.bytes.iter().enumerate() {
+            if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                if !chunk.is_empty() {
+                    out.push(format!("    db {}", chunk.join(", ")));
+                    chunk.clear();
+                }
+                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                out.push(format!("    db {lit}({f})"));
+            } else {
+                chunk.push(format!("0x{b:02X}"));
+                if chunk.len() == 8 {
+                    out.push(format!("    db {}", chunk.join(", ")));
+                    chunk.clear();
+                }
+            }
+        }
+        if !chunk.is_empty() {
+            out.push(format!("    db {}", chunk.join(", ")));
         }
         out.push("".to_string());
     }
