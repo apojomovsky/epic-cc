@@ -1081,22 +1081,16 @@ impl<'m> Gen<'m> {
                 if let Some((base, k, terms)) =
                     self.resolved.get(&ssa_key(self.cur_func, r)).cloned()
                 {
-                    // The shapes below read the base's two bytes as a runtime
-                    // address. A pointer param's slot holds one, and so does a
-                    // runtime-address slot (`Base::Slot(_, true)`, an IntToPtr
-                    // or const-arm pointer select dst): its bytes ARE the
-                    // address, so reading them plus k/terms is the pointer
-                    // value. An alloca's address (a plain `Base::Slot(_,
-                    // false)` that isn't a pointer param) has no link-time
-                    // literal — the frame slot only exists after allocation —
-                    // so that stays a loud panic. `Base::Global` is a real
-                    // link-time constant instead: since ipsccp#193 started
-                    // propagating a global's address into a pointer PARAMETER
-                    // (a helper called from one site with a global argument),
-                    // a GEP over that parameter resolves here to `Base::Global`
-                    // with the parameter's own offset chain, not a slot —
-                    // materialized as a literal below, same as
-                    // `emit_move_addr_to_slot`'s `Base::Global` arm.
+                    // The shapes below read the base's two bytes as a
+                    // runtime address (a pointer param's slot, or a
+                    // runtime-address slot like an IntToPtr dst). An
+                    // alloca's address has no link-time literal, so that
+                    // stays a loud panic. `Base::Global` is a real
+                    // link-time constant: ipsccp (epic-cc#193) can
+                    // propagate a global argument into a pointer
+                    // parameter, so a GEP over it resolves here to
+                    // `Base::Global`, materialized as a literal below, same
+                    // as `emit_move_addr_to_slot`'s `Base::Global` arm.
                     if let Base::Global(name) = &base {
                         let addr = self.global_addr(name).wrapping_add(k as u16);
                         let lo = (addr & 0xFF) as u8;

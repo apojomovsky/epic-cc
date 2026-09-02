@@ -5,8 +5,8 @@
 //! `epic_tick_init(fosc_hz)`'s only caller always passes the literal
 //! `FOSC_HZ`, so the whole nested-loop period search in the file-local
 //! helper it calls survives untouched into every TU's `.ll`. But by the
-//! time `llvm-link` has merged every TU, the whole call graph — and every
-//! cross-TU constant argument — is visible in one module. Nothing after
+//! time `llvm-link` has merged every TU, the whole call graph, and every
+//! cross-TU constant argument, is visible in one module. Nothing after
 //! `llvm-link` ever re-derives that, so a whole-program compiler that
 //! skips this step is leaving exactly the constant-folding a linking,
 //! whole-program compiler exists to do on the table (epic-cc#193).
@@ -16,7 +16,7 @@
 //! only live between its call and return, so two functions that are never
 //! simultaneously live can share RAM. A generic `-O2` inlines aggressively
 //! enough to merge callee locals permanently into `main`'s frame (`main`
-//! never returns, so nothing it ever contains can be reclaimed) — measured
+//! never returns, so nothing it ever contains can be reclaimed), measured
 //! to blow the 877A's 368-byte budget on this ticket's example. None of
 //! `internalize`/`ipsccp`/`instcombine`/`simplifycfg`/`dce` inline a
 //! multi-call-site function across a call boundary, so call-graph shape
@@ -35,11 +35,11 @@
 //!     `ipsccp` exposes (dead branches, now-constant arithmetic).
 //!
 //! Measured on the epic-encoder full example (epic-cc#193, epic-hal's
-//! `epic-encoder` module on the 16F877A — gpio+timer0+timer2+ssp+usart+
+//! `epic-encoder` module on the 16F877A: gpio+timer0+timer2+ssp+usart+
 //! irq+wdt+dispatch+tick+encoder+serial+the example TU): 13281 -> 7519
 //! words (-43%), RAM 358 -> 350/368 bytes (still fits). That takes the
 //! full example from 62% over the 877A's real 8192-word flash budget to
-//! 7519/8192 (91.8%) — it links. XC8 builds the same source combination
+//! 7519/8192 (91.8%), it links. XC8 builds the same source combination
 //! at 5356/8192 (65.4%), so epic-cc is now within 1.4x of XC8 instead of
 //! 2.5x.
 
@@ -53,37 +53,30 @@ const PASSES: &str = "internalize,ipsccp,instcombine,simplifycfg,dce";
 /// Symbols `internalize` must never touch:
 ///
 /// - `main` (the whole program's one entry point) and every
-///   `msp430_intrcc` interrupt handler (the vector table's entry points —
+///   `msp430_intrcc` interrupt handler (the vector table's entry points,
 ///   `irparse` identifies them the same way, by that calling-convention
 ///   token on the `define` line).
 /// - Every **variadic** function (a `(...)` parameter list). Load-bearing,
 ///   not caution for its own sake: measured on epic-cc#131's `printf`
 ///   acceptance fixture, internalizing a single-call-site variadic
-///   function (`printf`, called once with a literal format string) lets
-///   `ipsccp` replace every use of its named format-string parameter with
-///   that literal — sound as a pure value substitution, but our
-///   `llvm.va_start` lowering locates the first vararg relative to that
-///   parameter's own frame slot, and a parameter with no remaining SSA
-///   uses doesn't reliably get one allocated. The result silently
-///   corrupts the vararg walk (one format byte read as 0) with no panic
-///   to catch it. Named parameters immediately before `...` are exactly
-///   the ones `va_start` depends on this way, so the whole function stays
-///   external — external-linkage arguments are never specialized by
-///   `ipsccp`. The cost is a constant format string one call deep not
-///   getting folded into `printf`'s callee; no measured example needed
-///   that.
+///   function lets `ipsccp` replace every use of its named format-string
+///   parameter with the caller's literal, sound as a pure value
+///   substitution, but our `llvm.va_start` lowering locates the first
+///   vararg relative to that parameter's own frame slot, and a parameter
+///   with no remaining SSA uses doesn't reliably get one allocated. The
+///   vararg walk silently corrupts (one format byte read as 0), no panic.
+///   So the whole function stays external, since external-linkage
+///   arguments are never specialized by `ipsccp`.
 /// - Every **mutable global variable** (LLVM `global`, not `constant`).
 ///   Also load-bearing: measured on epic-cc#133's pid-clamp fixture,
 ///   internalizing a plain (non-`const`, non-`volatile`) global that
 ///   nothing in the compiled program ever stores to lets `ipsccp` read it
-///   as permanently equal to its zero-initializer — correct for a truly
+///   as permanently equal to its zero-initializer. Correct for a truly
 ///   closed program, but epic-cc's own e2e harness (and real embedded
 ///   code with a memory-mapped input) writes such globals from outside
 ///   the compiled image, a channel no IR-level analysis can see. A
-///   `constant` global (string literals, `irq_table`-style const data)
-///   has no such hazard — nothing ever writes it by construction — so
-///   those stay eligible and are exactly what the `Base::Global`-as-value
-///   isel fix (epic-cc#193) exists to let flow through `ipsccp` safely.
+///   `constant` global has no such hazard, nothing ever writes it by
+///   construction, so those stay eligible.
 fn public_api(ll_text: &str) -> Vec<String> {
     let mut api = Vec::new();
     for line in ll_text.lines() {
@@ -103,7 +96,7 @@ fn public_api(ll_text: &str) -> Vec<String> {
         } else if line.starts_with('@') && line.split_whitespace().any(|t| t == "global") {
             // A top-level `@name = ... global ...` declaration: mutable
             // storage, preserved. `constant` declarations (and anything
-            // else — aliases, ifuncs) fall through and stay eligible.
+            // else, aliases, ifuncs) fall through and stay eligible.
             let name_end = line[1..]
                 .find(|c: char| c == '=' || c.is_whitespace())
                 .map(|i| i + 1)
@@ -123,8 +116,8 @@ pub fn run(opt_bin: &Path, merged_path: &Path, out_path: &Path) -> Result<String
     let api = public_api(&ll_text);
     if api.is_empty() {
         // No `main`/ISR found yet (e.g. a library-only compile that never
-        // reaches wholeprog's "exactly one main" check) — internalizing
-        // everything would be unsound, so skip the stage; downstream
+        // reaches wholeprog's "exactly one main" check), so internalizing
+        // everything would be unsound; skip the stage instead, downstream
         // still gets the plain merged IR.
         return Ok(ll_text);
     }

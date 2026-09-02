@@ -245,14 +245,12 @@ fn main() {
     }
 
     // 2.5. Whole-program cleanup: each TU's clang invocation cannot see the
-    // rest of the call graph, so a call site's constant argument or a
-    // config-driven dead branch survives raw into every TU's own .ll. Now
-    // that llvm-link has merged the whole program into one module, run the
-    // curated, RAM-safe pass list over it (driver::wholeprog_opt) before
-    // anything else reads the IR — irparse/wholeprog/legalize/isel see the
-    // cleaned-up module, exactly as if the constant folding had always been
-    // there. See crates/driver/src/wholeprog_opt.rs for the pass list and
-    // why each pass preserves the overlay allocator's frame boundaries.
+    // rest of the call graph, so a call site's constant argument survives
+    // raw into every TU's own .ll. Now that llvm-link has merged the
+    // program into one module, run the curated pass list over it
+    // (driver::wholeprog_opt) before anything else reads the IR. See
+    // crates/driver/src/wholeprog_opt.rs for the pass list and why it
+    // preserves the overlay allocator's frame boundaries.
     let opt_path = tmp.join("merged_opt.ll");
     let merged_ll_text = match driver::wholeprog_opt::run(&opt_bin, &merged_path, &opt_path) {
         Ok(text) => text,

@@ -2422,25 +2422,14 @@ pub fn parse_ll(src: &str) -> Module {
                         }
                         continue;
                     }
-                    // clang attaches a `, !dbg !N` location to the naked
-                    // function's trailing `unreachable` under
-                    // `-gline-tables-only`; it stays a terminator, not an
-                    // opcode. Historically this was always the naked-asm
-                    // trailing case (nothing real follows), so dropping it
-                    // left the block with no `Inst` terminator and no
-                    // downstream stage cared. Since the whole-program `opt`
-                    // pass (epic-cc#193) started synthesizing bare
-                    // `unreachable` blocks too (simplifycfg/instcombine
-                    // proving a branch target dead), a block with no
-                    // terminator now also happens for ordinary functions,
-                    // and isel panics ("block has no terminator"). LLVM
-                    // guarantees a block ending in `unreachable` is never
-                    // entered at runtime, so closing it with a self-branch
-                    // is always safe dead code — except for `naked`, whose
-                    // isel separately requires the body to be pure asm and
-                    // rejects any synthesized instruction; a naked
-                    // function's trailing `unreachable` is always the
-                    // historical nothing-follows case, so it stays dropped.
+                    // clang attaches `, !dbg !N` to a naked function's
+                    // trailing `unreachable`; it stays a terminator, not an
+                    // opcode. `wholeprog_opt` (epic-cc#193) can now also
+                    // synthesize a bare `unreachable` block for an ordinary
+                    // function, and isel needs a real terminator there. LLVM
+                    // guarantees such a block is never entered at runtime,
+                    // so a self-branch closes it safely, except `naked`,
+                    // whose isel requires a pure-asm body and stays dropped.
                     if l == "unreachable" || l.starts_with("unreachable, !") {
                         if !naked {
                             let here = blocks.last().unwrap().label.clone();

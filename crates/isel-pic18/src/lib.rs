@@ -437,14 +437,13 @@ impl<'m> Gen<'m> {
                     .get(&iselcore::ssa_key(self.cur_func, r))
                     .cloned()
                     .unwrap();
-                // A global's address is a link-time constant: a GEP over it
-                // (via ipsccp propagating a global argument into a helper's
-                // pointer parameter, epic-cc#193) resolves here to
-                // `Base::Global` with the parameter's own offset chain, not
-                // a slot. Handled separately from the slot case below since
-                // its "base bytes" are literals (`MOVLW`), not a `MOVF` read
-                // — mirrors `emit_move_addr_to_slot`'s `Base::Global` arm
-                // above, plus the k/terms folding the slot case already does.
+                // A global's address is a link-time constant. ipsccp
+                // (epic-cc#193) can propagate a global argument into a
+                // helper's pointer parameter, so a GEP over it resolves
+                // here to `Base::Global`, not a slot. Its base bytes are
+                // literals (`MOVLW`), not a `MOVF` read, so it needs its
+                // own arm, mirroring `emit_move_addr_to_slot`'s above plus
+                // the slot case's k/terms folding.
                 if let iselcore::Base::Global(name) = &base {
                     assert!(
                         k == 0 || terms.is_empty(),
