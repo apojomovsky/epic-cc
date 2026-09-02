@@ -115,6 +115,8 @@ fn main() {
     std::fs::write(header_dir.join("stdlib.h"), driver::stdlib_h::STDLIB_H)
         .expect("write stdlib.h");
     std::fs::write(header_dir.join("xc.h"), driver::xc_h::XC_H).expect("write xc.h");
+    std::fs::write(header_dir.join("stdarg.h"), driver::stdarg_h::STDARG_H)
+        .expect("write stdarg.h");
     std::fs::write(header_dir.join("stdio.h"), driver::stdio_h::STDIO_H).expect("write stdio.h");
 
     let sources: Vec<(String, String)> = cli
@@ -168,6 +170,10 @@ fn main() {
         src.lines()
             .any(|l| l.contains("#include") && l.contains("string.h"))
     });
+    let need_stdio = sources.iter().any(|(_, src)| {
+        src.lines()
+            .any(|l| l.contains("#include") && l.contains("stdio.h"))
+    });
     if need_string {
         let string_c_path = tmp.join("__epic_string.c");
         std::fs::write(&string_c_path, driver::string_c::STRING_C).expect("write string.c");
@@ -183,6 +189,27 @@ fn main() {
             eprintln!("epic-cc: {cmd:?}");
         }
         let out = cmd.output().expect("run clang for string.c");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
+    if need_stdio {
+        let stdio_c_path = tmp.join("__epic_stdio.c");
+        std::fs::write(&stdio_c_path, driver::stdio_c::STDIO_C).expect("write stdio.c");
+        let ll_path = tmp.join("__epic_stdio.ll");
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
+        cmd.args([
+            "-o",
+            ll_path.to_str().unwrap(),
+            stdio_c_path.to_str().unwrap(),
+        ]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang for stdio.c");
         if !out.status.success() {
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(1);

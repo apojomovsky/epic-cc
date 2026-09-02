@@ -1,14 +1,22 @@
-//! The `stdio.h` stub epic-cc ships to user code. Vendored third-party
-//! sources (m-stack's crc.c) include it unconditionally but use nothing
-//! from it: the only stdio calls sit under `#if PC_CODE_TO_GENERATE_THE_TABLES`,
-//! a PC-only table generator that is never defined on target. The real
-//! stdio surface (printf and friends) is epic-cc#131's scope; this stub
-//! only makes the include resolve.
+//! The `stdio.h` header epic-cc ships to user code: exactly the entry
+//! points the bundled formatter implements (epic-cc#131, ADR-018
+//! discipline: a missing entry point is a clang error at the call site,
+//! never a link-time surprise). No FILE stream surface: the target has no
+//! OS and the retargetable sink is a user-provided `putchar`.
 
 pub const STDIO_H: &str = r#"#ifndef _STDIO_H
 #define _STDIO_H
 
-/* epic-cc stub: no stdio surface yet (epic-cc#131). */
+#include <stdarg.h>
+#include <stddef.h>
+
+int printf(const char *fmt, ...);
+int puts(const char *s);
+int putchar(int c);
+int snprintf(char *s, size_t n, const char *fmt, ...);
+int vsnprintf(char *s, size_t n, const char *fmt, va_list ap);
+int sprintf(char *s, const char *fmt, ...);
+int vprintf(const char *fmt, va_list ap);
 
 #endif /* _STDIO_H */
 "#;
