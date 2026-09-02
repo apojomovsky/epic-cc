@@ -12,6 +12,8 @@ pub mod report;
 pub mod stdbool_h;
 pub mod stddef_h;
 pub mod stdint_h;
+pub mod stdio_h;
 pub mod stdlib_h;
 pub mod string_c;
 pub mod string_h;
+pub mod xc_h;
