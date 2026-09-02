@@ -245,6 +245,31 @@ pub struct Freeze {
     pub val: Val,
 }
 
+/// `va_arg`: read the next variadic argument of type `ty` from the
+/// `__va` region of the current variadic function. The list slot (`ptr`)
+/// holds the current byte offset into the region; the read advances it by
+/// the argument width, exactly as the msp430-proxy `va_arg` IR
+/// instruction semantics (epic-cc#131).
+#[derive(Clone, Debug)]
+pub struct VaArg {
+    pub dst: String,
+    pub ty: Ty,
+    /// The va_list slot (`%ap` below `va_start`), holding the offset.
+    pub ptr: String,
+    /// True when the read argument is pointer-typed (`va_arg ptr %ap, ptr`):
+    /// the value is a runtime pointer (an address), seeded by iselcore as
+    /// an indirect slot like an IntToPtr result.
+    pub ptr_ty: bool,
+}
+/// `va_start`: reset the function's va_list slot to offset 0 of the
+/// `__va` region. The backends zero the slot at entry; the node exists so
+/// a variadic function's marker is never silently dropped.
+#[derive(Clone, Debug)]
+pub struct VaStart {
+    /// The va_list slot name.
+    pub list: String,
+}
+
 /// The four float arithmetic ops (always f32 — msp430's float == f32).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FBinOp {
@@ -327,6 +352,8 @@ pub enum Inst {
     Alloca(Alloca),
     Memcpy(Memcpy),
     Freeze(Freeze),
+    VaArg(VaArg),
+    VaStart(VaStart),
     FloatBin(FloatBin),
     Fcmp(Fcmp),
     FloatConv(FloatConv),
@@ -362,6 +389,11 @@ pub struct Func {
     /// the params group: `fn isr(void) [isr] ()`.
     pub isr: bool,
     pub naked: bool,
+    /// True for a variadic function (`fn f(...)` in the .ll prototype): a
+    /// callee that reads extra args through `va_arg`. Its calls may pass
+    /// more args than the named params; those land in the callee's `__va`
+    /// region (epic-cc#131).
+    pub variadic: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -487,12 +519,14 @@ pub fn serialize(m: &Module) -> String {
         if f.naked {
             markers.push_str(" [naked]");
         }
-        out.push_str(&format!(
-            "fn {}({ret}){} ({})\n",
-            f.name,
-            markers,
-            params.join(", ")
-        ));
+        let mut proto = params.join(", ");
+        if f.variadic {
+            if !proto.is_empty() {
+                proto.push_str(", ");
+            }
+            proto.push_str("...");
+        }
+        out.push_str(&format!("fn {}({ret}){} ({})\n", f.name, markers, proto));
         for b in &f.blocks {
             out.push_str(&format!("  block {}:\n", b.label));
             for i in &b.insts {
@@ -709,6 +743,15 @@ fn inst_str(i: &Inst) -> String {
             }
         ),
         Inst::Freeze(f) => format!("%{} = freeze {} {}", f.dst, ty_str(f.ty), val_str(&f.val)),
+        Inst::VaArg(v) => {
+            let t = if v.ptr_ty {
+                "ptr".to_string()
+            } else {
+                ty_str(v.ty)
+            };
+            format!("%{} = va_arg ptr {} {}", v.dst, v.ptr, t)
+        }
+        Inst::VaStart(v) => format!("va_start {}", v.list),
         Inst::FloatBin(b) => format!(
             "%{} = {} float {} {}",
             b.dst,
@@ -905,10 +948,16 @@ pub fn parse(text: &str) -> Module {
             } else {
                 Some(parse_ty(ret_str))
             };
+            let variadic = p_str.split(',').any(|s| s.trim() == "...");
             let params = if p_str.trim().is_empty() {
                 vec![]
             } else {
-                p_str.split(',').map(parse_param).collect()
+                p_str
+                    .split(',')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty() && *s != "...")
+                    .map(parse_param)
+                    .collect()
             };
             if let Some(f) = cur_func.as_mut() {
                 if let Some(b) = cur_block.take() {
@@ -925,6 +974,7 @@ pub fn parse(text: &str) -> Module {
                 blocks: Vec::new(),
                 isr,
                 naked,
+                variadic,
             });
         } else if line == "}" || line == "{" {
             continue;
@@ -1325,10 +1375,29 @@ fn parse_inst(line: &str) -> Inst {
             loc: None,
         });
     }
+    if let Some(rest) = line.strip_prefix("va_start ") {
+        return Inst::VaStart(VaStart {
+            list: rest.trim().to_string(),
+        });
+    }
     // defining instruction: %d = op ...
     let eq = line.find(" = ").unwrap();
     let dst = line[..eq].trim_start_matches('%').to_string();
     let body = line[eq + 3..].trim();
+    if let Some(rest) = body.strip_prefix("va_arg ") {
+        // Canonical: `va_arg <ptr> <list> <ty>`: the list is the va_list
+        // slot name, the last token is the argument type.
+        let toks: Vec<&str> = rest.split_whitespace().collect();
+        let ptr_ty = toks.last().map(|t| *t == "ptr").unwrap_or(false);
+        let t = parse_ty(toks.last().unwrap());
+        let ptr = toks[toks.len() - 2].trim_start_matches('%').to_string();
+        return Inst::VaArg(VaArg {
+            dst,
+            ty: t,
+            ptr,
+            ptr_ty,
+        });
+    }
     if let Some(rest) = body.strip_prefix("load ") {
         let mut it = rest.split_whitespace();
         let ty_tok = it.next().unwrap();

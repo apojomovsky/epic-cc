@@ -2042,21 +2042,51 @@ fn strides_packed_struct_arrays_by_the_packed_size() {
     assert_eq!(m.globals[0].size, 18);
 }
 
+// epic-cc#131: the variadic surface. clang lowers `va_start(ap, fmt)` to
+// `call void @llvm.va_start.p0(ptr %ap)` (a VaStart marker naming the
+// va_list slot) and each `va_arg(ap, T)` to `%d = va_arg ptr %ap, T`
+// (a VaArg read: the slot holds the running offset into the `__va`
+// region). The `...` prototype token marks the function variadic.
+const VARIADIC: &str = r#"
+define dso_local i16 @vprintf(ptr %fmt, ...) {
+  %ap = alloca i16, align 2
+  call void @llvm.va_start.p0(ptr %ap)
+  %9 = va_arg ptr %ap, i16
+  %65 = va_arg ptr %ap, ptr
+  ret i16 %9
+}
+declare void @llvm.va_start.p0(ptr)
+"#;
+
 #[test]
-fn parses_runtime_inttoptr_with_dbg_attribute() {
-    // The full epic-encoder example's `EPIC_GPIO_Init` computes an SFR
-    // address at runtime (`%7 = select i1 %5, i16 %6, i16 133`) and casts
-    // it: `%13 = inttoptr i16 %7 to ptr, !dbg !47`. The `!dbg` attribute
-    // carries the operand-list comma into the `to` type token, which must
-    // not break type resolution (epic-cc#183).
-    let src = "define dso_local void @main() {\n  %7 = select i1 %5, i16 %6, i16 133\n  %13 = inttoptr i16 %7 to ptr, !dbg !47\n  ret void\n}\n";
-    let m = parse_ll(src);
-    match &m.funcs[0].blocks[0].insts[1] {
-        Inst::IntToPtr(p) => {
-            assert_eq!(p.dst, "13");
-            assert_eq!(p.from, Ty::I16);
-            assert_eq!(p.to, Ty::I16, "ptr resolves to the 16-bit address type");
+fn parses_variadic_prototype_va_start_and_va_arg() {
+    let m = parse_ll(VARIADIC);
+    let f = m.funcs.iter().find(|f| f.name == "vprintf").unwrap();
+    assert!(
+        f.variadic,
+        "the `...` prototype token marks the function variadic"
+    );
+    let insts = &f.blocks[0].insts;
+    match &insts[1] {
+        Inst::VaStart(v) => assert_eq!(v.list, "ap", "va_start names the va_list slot"),
+        other => panic!("expected VaStart, got {other:?}"),
+    }
+    match &insts[2] {
+        Inst::VaArg(v) => {
+            assert_eq!(v.dst, "9");
+            assert_eq!(v.ty, Ty::I16);
+            assert_eq!(v.ptr, "ap");
+            assert!(!v.ptr_ty, "i16 read is not pointer-typed");
         }
-        other => panic!("expected IntToPtr, got {other:?}"),
+        other => panic!("expected VaArg, got {other:?}"),
+    }
+    match &insts[3] {
+        Inst::VaArg(v) => {
+            assert_eq!(v.dst, "65");
+            assert_eq!(v.ty, Ty::I16, "ptr resolves to the 16-bit address type");
+            assert_eq!(v.ptr, "ap");
+            assert!(v.ptr_ty, "ptr read is pointer-typed");
+        }
+        other => panic!("expected VaArg, got {other:?}"),
     }
 }

@@ -164,6 +164,17 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                     Inst::Select(s) if s.ptr => {
                         selects.insert(ssa_key(&f.name, &s.dst), s.clone());
                     }
+                    Inst::VaArg(v) if v.ptr_ty => {
+                        // A `va_arg ptr` result is a runtime pointer VALUE:
+                        // its two bytes live in the dst slot (a GEP over it
+                        // or a deref through it reads those bytes), the same
+                        // model as IntToPtr and the load-ptr seed
+                        // (epic-cc#131).
+                        resolved.insert(
+                            ssa_key(&f.name, &v.dst),
+                            (Base::Slot(v.dst.clone(), true), 0, Vec::new()),
+                        );
+                    }
                     Inst::IntToPtr(p) => {
                         // A runtime integer address becoming a pointer VALUE:
                         // the dst slot holds the two address bytes, so every
