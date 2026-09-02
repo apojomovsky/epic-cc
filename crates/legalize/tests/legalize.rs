@@ -1393,3 +1393,27 @@ fn rewrites_every_param_forwarded_argument() {
     assert_eq!(call.args[0].val, ir::Val::Global("cb0_isr".to_string()));
     assert_eq!(call.args[1].val, ir::Val::Global("cb1_isr".to_string()));
 }
+
+/// `llvm.umin`/`llvm.umax` (unsized clamps, e.g. the sd-card byte-shift
+/// masks) lower to the same icmp/select tree as their signed cousins,
+/// with unsigned predicates (epic-cc#143).
+#[test]
+fn lowers_umin_umax_to_icmp_select() {
+    let m = parse(
+        "global a i16\n\
+         global b i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @a\n\
+             %b = load i16 @b\n\
+             %x = call i16 @llvm.umin.i16(i16 %a, i16 %b)\n\
+             %y = call i16 @llvm.umax.i16(i16 %x, i16 %b)\n\
+             store i16 %y, @a\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(text.contains("%c0 = icmp ult i16 %a %b"), "{text}");
+    assert!(text.contains("%x = select i1 %c0 i16 %a i16 %b"), "{text}");
+    assert!(text.contains("%c1 = icmp ugt i16 %x %b"), "{text}");
+    assert!(text.contains("%y = select i1 %c1 i16 %x i16 %b"), "{text}");
+}
