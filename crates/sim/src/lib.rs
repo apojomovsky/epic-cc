@@ -249,12 +249,16 @@ impl Pic14 {
                 return None;
             }
         }
-        let phys = f + self.bank_base();
-        self.device
-            .ram_banks
-            .iter()
-            .any(|&(lo, hi)| phys >= lo as usize && phys <= hi as usize)
-            .then_some(phys)
+        // The six core registers (INDF, PCL, STATUS, FSR, PCLATH, INTCON)
+        // are mirrored into every bank and addressed by their bank-0
+        // offset; every other direct operand is paged by RP1:RP0, so its
+        // physical address is `f + bank_base` even when that lands in a
+        // banked SFR window (PIE1 at 0x8C, PIR1 at 0x0C, ...) rather than
+        // a GPR bank (epic-cc#173).
+        if matches!(f, 0x00 | 0x02 | 0x03 | 0x04 | 0x0A | 0x0B) {
+            return None;
+        }
+        Some(f + self.bank_base())
     }
     fn read_f(&self, f: usize) -> u8 {
         match f {

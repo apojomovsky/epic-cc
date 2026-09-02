@@ -10,7 +10,6 @@ use pic14_sim::Pic14;
 // interrupt must do. Pushing pc + 1 would resume at word 3 and walk the
 // program out of its own loop.
 //
-// Program (hand-encoded 14-bit words):
 //   0: MOVLW 0x05     0x3005   ; W = 5
 //   1: MOVWF 0x20     0x00A0   ; RAM[0x20] = 5
 //   2: GOTO 0x02      0x2802   ; main busy-loop (fires here: pc=2)
@@ -59,4 +58,23 @@ fn fire_interrupt_jumps_to_vector_and_retfie_resumes() {
     );
     p.run(5);
     assert_eq!(p.pc(), 2, "and it is still spinning in its loop");
+}
+
+// epic-cc#173: a direct write to a banked SFR window (PIE1 at 0x8C, bank 1)
+// must land at the physical address, not the bank-0 alias. The compiler
+// emits `BSF STATUS,5; BCF STATUS,6; MOVWF 0x0C` (RP0 set, operand 0x0C);
+// the simulator pages the operand by RP1:RP0 to 0x8C.
+//
+//   2: BCF STATUS,6   0x1303   ; RP1 = 0
+//   3: MOVWF 0x0C     0x008C   ; PIE1 (bank 1) = 2
+fn banked_sfr_program() -> Vec<u16> {
+    vec![0x3002, 0x1683, 0x1303, 0x008C, 0x2804]
+}
+
+#[test]
+fn banked_sfr_write_lands_at_the_physical_address() {
+    let mut p = Pic14::new(banked_sfr_program());
+    p.run(10);
+    assert_eq!(p.ram()[0x8C], 0x02, "PIE1 (bank 1) must receive the write");
+    assert_eq!(p.ram()[0x0C], 0x00, "the bank-0 alias must stay untouched");
 }
