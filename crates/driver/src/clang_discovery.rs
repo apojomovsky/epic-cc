@@ -135,3 +135,22 @@ pub fn resolve_llvm_link(clang: &Path) -> Result<PathBuf, String> {
         dir.display()
     ))
 }
+
+/// Find `opt` beside the clang that `resolve_clang` returned, the same way
+/// `resolve_llvm_link` finds `llvm-link`.
+pub fn resolve_opt(clang: &Path) -> Result<PathBuf, String> {
+    let dir = clang
+        .parent()
+        .ok_or_else(|| format!("clang path has no parent directory: {}", clang.display()))?;
+    for name in ["opt", "opt.exe"] {
+        let p = dir.join(name);
+        if p.exists() {
+            return Ok(p);
+        }
+    }
+    Err(format!(
+        "opt not found next to clang in {}. It ships with the toolchain bundle; \
+         set PIC8_CLANG_UNWRAPPED to a clang whose directory also contains opt.",
+        dir.display()
+    ))
+}

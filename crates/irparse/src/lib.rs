@@ -2425,8 +2425,31 @@ pub fn parse_ll(src: &str) -> Module {
                     // clang attaches a `, !dbg !N` location to the naked
                     // function's trailing `unreachable` under
                     // `-gline-tables-only`; it stays a terminator, not an
-                    // opcode.
+                    // opcode. Historically this was always the naked-asm
+                    // trailing case (nothing real follows), so dropping it
+                    // left the block with no `Inst` terminator and no
+                    // downstream stage cared. Since the whole-program `opt`
+                    // pass (epic-cc#193) started synthesizing bare
+                    // `unreachable` blocks too (simplifycfg/instcombine
+                    // proving a branch target dead), a block with no
+                    // terminator now also happens for ordinary functions,
+                    // and isel panics ("block has no terminator"). LLVM
+                    // guarantees a block ending in `unreachable` is never
+                    // entered at runtime, so closing it with a self-branch
+                    // is always safe dead code — except for `naked`, whose
+                    // isel separately requires the body to be pure asm and
+                    // rejects any synthesized instruction; a naked
+                    // function's trailing `unreachable` is always the
+                    // historical nothing-follows case, so it stays dropped.
                     if l == "unreachable" || l.starts_with("unreachable, !") {
+                        if !naked {
+                            let here = blocks.last().unwrap().label.clone();
+                            blocks
+                                .last_mut()
+                                .unwrap()
+                                .insts
+                                .push(Inst::Br(Br { target: here }));
+                        }
                         if has_trailing_brace {
                             break;
                         }
