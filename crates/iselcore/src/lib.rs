@@ -238,15 +238,37 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                         }
                         // A qualifying reg is one already seeded as a
                         // runtime-address slot (`Base::Slot(_, true)` with
-                        // no offset): its bytes live in a slot the phi copy
-                        // can move. A folded (compile-time) pointer reg has
-                        // no slot and cannot be an incoming here.
+                        // no offset) or a plain pointer PARAM (whose slot
+                        // holds the address, `Base::Slot(_, false)` per the
+                        // ADR-009 ptr-param seeding): its bytes live in a
+                        // slot the phi copy can move. A folded
+                        // (compile-time) pointer reg has no slot and cannot
+                        // be an incoming here.
+                        let param_holds_addr =
+                            |n: &str| f.params.iter().any(|p| p.name == *n && p.ptr);
+                        let self_gep = |r: &str| {
+                            // A GEP over the phi's own dst is the
+                            // loop-carried pointer increment (`%18 = gep
+                            // %7 +1` feeding `%7 = phi ptr [%18, %5]`):
+                            // its address bytes are the phi slot's bytes
+                            // plus k/terms, so it is a runtime address
+                            // value once the phi seeds as an indirect slot
+                            // (the GEP fixpoint then resolves it against
+                            // that seed).
+                            matches!(
+                                geps.get(&ssa_key(&fname, r)),
+                                Some(g) if g.base == ir::GepBase::Reg(p.dst.clone())
+                            )
+                        };
                         let runtime = p.incoming.iter().all(|(v, _)| match v {
                             ir::Val::Const(_) => true,
-                            ir::Val::Reg(r) => matches!(
-                                resolved.get(&ssa_key(&fname, r)),
-                                Some((Base::Slot(_, true), 0, t)) if t.is_empty()
-                            ),
+                            ir::Val::Reg(r) => match resolved.get(&ssa_key(&fname, r)) {
+                                Some((Base::Slot(_, true), 0, t)) if t.is_empty() => true,
+                                Some((Base::Slot(n, false), 0, t)) if t.is_empty() => {
+                                    param_holds_addr(n)
+                                }
+                                _ => self_gep(r),
+                            },
                             ir::Val::Global(_) => false,
                         });
                         if runtime && !p.incoming.is_empty() {

@@ -177,3 +177,30 @@ fn seeds_a_pointer_select_with_a_global_and_a_runtime_slot() {
     assert_eq!(*k, 0);
     assert!(terms.is_empty());
 }
+
+#[test]
+fn seeds_a_ptr_phi_over_a_ptr_param_and_self_gep() {
+    // The sd-card crc walk: `%7 = phi ptr [...]` whose incomings are a
+    // ptr param and a GEP over the phi's own dst (the loop increment).
+    // Both are runtime address values once the phi seeds as an indirect
+    // slot, and the self-GEP then resolves against that seed
+    // (epic-cc#143).
+    let m = parse(
+        "fn add(void) (p=ptr)\n\
+           block entry:\n\
+             br block5\n\
+         block block5:\n\
+             %7 = phi ptr %18 block5 %p entry\n\
+             %18 = gep %7 +1\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("add::7").expect("ptr phi seeds");
+    assert!(matches!(base, Base::Slot(n, true) if n == "7"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+    let (base, k, terms) = r.get("add::18").expect("self-gep resolves");
+    assert!(matches!(base, Base::Slot(n, true) if n == "7"));
+    assert_eq!(*k, 1);
+    assert!(terms.is_empty());
+}
