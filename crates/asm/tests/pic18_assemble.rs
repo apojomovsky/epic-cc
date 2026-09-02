@@ -258,3 +258,66 @@ fn parse_lit_upper_resolves_the_third_byte() {
     let words = assemble_pic18("foo equ 0x12345\n    org 0x0000\n    movlw UPPER(foo)\n    end\n");
     assert_eq!(words[0], 0x0E01, "UPPER(0x12345) == 0x01");
 }
+
+#[test]
+fn far_conditional_branch_expands_to_inverted_hop_plus_bra() {
+    // A `B<cond>` reaches only +/-128 words. The classic PIC18 idiom
+    // expands `BZ far` into `BNZ skip / BRA far / skip:`; the expansion
+    // keeps every label reachable and the program one word larger.
+    let mut asm = String::from("    BZ far\n");
+    for _ in 0..140 {
+        asm.push_str("    NOP\n");
+    }
+    asm.push_str("far:\n    end\n");
+    let words = assemble_pic18(&asm);
+    // far at word 141: the bare BZ (offset 140) is out of range. Expanded:
+    // word 0 BNZ +1, word 1 BRA -> far (word 143, offset 141), 140 NOPs
+    // follow. The trailing far label holds no instruction, so the program
+    // is 143 words.
+    assert_eq!(
+        words[0] & 0xFF00,
+        0xE100,
+        "BNZ (inverted) at word 0, got {:#06x}",
+        words[0]
+    );
+    assert_eq!(words[0] & 0xFF, 1, "BNZ hops over the BRA");
+    assert_eq!(words[1] & 0xF000, 0xD000, "BRA at word 1");
+    assert_eq!(
+        words[1] & 0x7FF,
+        140,
+        "BRA reaches far (word 142 from word 2)"
+    );
+    assert_eq!(words.len(), 142, "140 NOPs + 2-word expansion (+ label)");
+}
+
+#[test]
+fn in_range_conditional_branch_stays_single_word() {
+    let mut asm = String::from("    BZ near\n");
+    for _ in 0..10 {
+        asm.push_str("    NOP\n");
+    }
+    asm.push_str("near:\n    end\n");
+    let words = assemble_pic18(&asm);
+    // near at word 11 (offset 10 from word 0): in range, no expansion, and
+    // the trailing label holds no instruction.
+    assert_eq!(words.len(), 11, "no expansion for an in-range branch");
+    assert_eq!(words[0] & 0xFF00, 0xE000, "BZ encodes directly");
+    assert_eq!(words[0] & 0xFF, 10, "offset to the target");
+}
+
+#[test]
+fn far_unconditional_bra_becomes_goto() {
+    // A `BRA` reaches +/-1024 words; beyond that it becomes an absolute
+    // 2-word `GOTO`.
+    let mut asm = String::from("    BRA far\n");
+    for _ in 0..1100 {
+        asm.push_str("    NOP\n");
+    }
+    asm.push_str("far:\n    end\n");
+    let words = assemble_pic18(&asm);
+    // far at word 1101: the bare BRA (offset 1100) is out of range, so it
+    // becomes `GOTO far` (2 words) with target word 1102.
+    assert_eq!(words[0], 0xEF00 | 0x4E, "GOTO word 0 (low byte 0x4E)");
+    assert_eq!(words[1], 0xF000 | 0x04, "GOTO word 1 (high byte 0x04)");
+    assert_eq!(words.len(), 1102, "1100 NOPs + 2-word GOTO (+ label)");
+}

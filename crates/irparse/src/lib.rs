@@ -3025,11 +3025,22 @@ fn parse_inst(
         }
         "add" | "and" | "or" | "xor" | "sub" | "mul" | "udiv" | "urem" | "sdiv" | "srem"
         | "shl" | "lshr" | "ashr" => {
-            let raw = rest[op.len()..].trim();
+            let mut raw = rest[op.len()..].trim().to_string();
+            // LLVM shift/div flags (`exact`) and add/mul overflow flags
+            // (`nuw`/`nsw`) ride ahead of the operand list, in any order:
+            // `lshr exact i32 %a, 8`. Strip them so the type token is
+            // first in the left operand.
+            while let Some(tok) = raw.split_whitespace().next() {
+                if matches!(tok, "exact" | "nuw" | "nsw") {
+                    raw = raw[tok.len()..].trim().to_string();
+                } else {
+                    break;
+                }
+            }
             let body_for_split = if raw.contains("getelementptr") || raw.contains("ptrtoint") {
                 raw.to_string()
             } else {
-                strip_attrs(raw)
+                strip_attrs(&raw)
             };
             let parts = split_top_level(&body_for_split, ',');
             assert!(

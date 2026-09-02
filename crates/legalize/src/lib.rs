@@ -835,6 +835,27 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                 }),
             ]
         }
+        "llvm.umax.i8" | "llvm.umax.i16" | "llvm.umax.i32" => {
+            let a = c.args[0].val.clone();
+            let b = c.args[1].val.clone();
+            vec![
+                Inst::Icmp(ir::Icmp {
+                    dst: cond.clone(),
+                    pred: "ugt".into(),
+                    ty,
+                    a: a.clone(),
+                    b: b.clone(),
+                }),
+                Inst::Select(ir::Select {
+                    dst,
+                    cond: Val::Reg(cond),
+                    ty,
+                    a,
+                    b,
+                    ptr: false,
+                }),
+            ]
+        }
         "llvm.usub.sat.i8" | "llvm.usub.sat.i16" | "llvm.usub.sat.i32" => {
             let a = c.args[0].val.clone();
             let b = c.args[1].val.clone();

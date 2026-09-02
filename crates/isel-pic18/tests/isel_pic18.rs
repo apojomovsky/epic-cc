@@ -2218,3 +2218,58 @@ fn indirect_call_emits_compare_and_call_chain() {
     assert!(asm.contains("    CALL f1"), "CALL f1:\n{asm}");
     assert!(asm.contains("BRA tmp"), "trap loop:\n{asm}");
 }
+
+#[test]
+fn freeze_copies_bytes_like_a_noop() {
+    let m = parse("global a i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = freeze i16 %1\n    ret void\n");
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("a", 0x10), ("main::1", 0x20), ("main::2", 0x22)]),
+    );
+    assert!(
+        asm.contains("MOVFF 0x020, 0x022"),
+        "freeze copies the value slot:\n{asm}"
+    );
+}
+
+#[test]
+fn inttoptr_copies_the_two_address_bytes() {
+    let m = parse("global a i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = inttoptr i16 %1 to ptr\n    ret void\n");
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("a", 0x10), ("main::1", 0x20), ("main::2", 0x24)]),
+    );
+    assert!(
+        asm.contains("MOVFF 0x020, 0x024"),
+        "inttoptr copies the runtime address bytes:\n{asm}"
+    );
+}
+
+#[test]
+fn inttoptr_const_source_is_rejected_not_silently_miscompiled() {
+    let m =
+        parse("fn main(void) ()\n  block entry:\n    %1 = inttoptr i16 12 to ptr\n    ret void\n");
+    let result = std::panic::catch_unwind(|| select(&PIC18F4550, &m, &addrs(&[("main::1", 0x20)])));
+    assert!(result.is_err(), "const-source IntToPtr must panic loudly");
+}
+
+#[test]
+fn sext_i1_to_i8_zero_fills_not_sign_fills() {
+    let m = parse("global a i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = trunc i8 %1 to i1\n    %3 = sext i1 %2 to i8\n    ret void\n");
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[
+            ("a", 0x10),
+            ("main::1", 0x20),
+            ("main::2", 0x21),
+            ("main::3", 0x22),
+        ]),
+    );
+    assert!(
+        asm.contains("MOVFF 0x021, 0x022"),
+        "i1 sext of a truncated byte is a same-byte copy:\n{asm}"
+    );
+}

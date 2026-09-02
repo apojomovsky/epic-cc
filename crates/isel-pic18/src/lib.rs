@@ -1518,6 +1518,16 @@ impl<'m> Gen<'m> {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
                 }
             }
+            Inst::Freeze(f) => {
+                // freeze is a no-op in the backend: copy `val` byte-for-byte
+                // into the dst slot (same shape as `Inst::Zext` at equal
+                // width, mirroring `isel`'s own Freeze arm).
+                let src = self.val_addr(&f.val).direct();
+                let dst = self.slot_addr(self.cur_func, &f.dst).direct();
+                for i in 0..f.ty.bytes() {
+                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+            }
             Inst::Sext(s) => {
                 // Same const-source hazard as `Inst::Zext`, see its comment.
                 assert!(
@@ -1532,14 +1542,30 @@ impl<'m> Gen<'m> {
                 // of high bytes and still have copied `from.bytes()` bytes
                 // into a same-or-narrower `to.bytes()` slot, writing past
                 // the destination.
+                // `i1 -> iN` is a 0/1 value: an i1's stored byte is exactly
+                // 0 or 1 (every i1 producer clears the high bits), so the
+                // "sign" fill is zero and a plain copy IS the sext. Panic
+                // only on equal-or-narrowing widths that would write past
+                // the destination.
                 assert!(
-                    s.to.bytes() > s.from.bytes(),
-                    "isel-pic18: sext must widen (to must be strictly wider than from)"
+                    s.to.bytes() >= s.from.bytes(),
+                    "isel-pic18: sext must not narrow"
                 );
                 let src = self.val_addr(&s.val).direct();
                 let dst = self.slot_addr(self.cur_func, &s.dst).direct();
                 for i in 0..s.from.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                }
+                if s.from == Ty::I1 && s.to.bytes() > s.from.bytes() {
+                    for i in s.from.bytes()..s.to.bytes() {
+                        self.emit("    MOVLW 0x00".to_string());
+                        let (a, f) = self.operand(dst + u16::from(i));
+                        let bank = if a == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    }
+                    // the i1 widening already zero-filled: skip the
+                    // sign-fill loop below
+                    return;
                 }
                 // The sign-fill byte(s) must reflect the SOURCE's actual
                 // sign bit (bit 7 of its highest byte) at the time this
@@ -1715,6 +1741,27 @@ impl<'m> Gen<'m> {
                         // FSR0, and the byte moves through W. W is
                         // ISR-saved (0x0004), so an interrupt taken
                         // mid-copy cannot corrupt the held byte.
+                        // A `const` (flash) source has no RAM address: the
+                        // byte is read via TBLRD into TABLAT, then moved
+                        // from there (epic-cc#143: default-struct initializer
+                        // copies from `@__const.*`).
+                        if let Some((table, k, terms)) = self.const_base_of(&mc.src) {
+                            // Seed TBLPTR at the flash source byte, read it
+                            // into TABLAT, then move TABLAT (0xFF5) to the
+                            // destination (direct or FSR0-indirect).
+                            self.emit_tblptr_static(&table, k, i as u8);
+                            self.add_dynamic_to_tblptr(&terms);
+                            self.emit("    TBLRD*".to_string());
+                            match self.emit_ptr_setup(&mc.dst, i) {
+                                Addr::Direct(dst) => {
+                                    self.emit(format!("    MOVFF 0xFF5, 0x{dst:03X}"));
+                                }
+                                Addr::Indirect => {
+                                    self.emit("    MOVFF 0xFF5, 0xFEF".to_string());
+                                }
+                            }
+                            continue;
+                        }
                         let src_direct = self.emit_memcpy_src_setup(&mc.src, i);
                         match self.emit_ptr_setup(&mc.dst, i) {
                             Addr::Direct(dst) => {
