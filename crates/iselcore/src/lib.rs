@@ -175,6 +175,19 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
                             (Base::Slot(p.dst.clone(), true), 0, Vec::new()),
                         );
                     }
+                    Inst::Load(l) if l.ptr_ty => {
+                        // A `load ptr` result is a runtime pointer VALUE:
+                        // the dst slot holds the two loaded address bytes
+                        // (a GEP over it, a deref through it, or a ptr arg
+                        // pass all read those bytes). Seeding it as an
+                        // indirect slot lets a GEP chain over a loaded
+                        // handle field resolve (the HAL's
+                        // `h->OverflowCallback` shape, epic-cc#183).
+                        resolved.insert(
+                            ssa_key(&f.name, &l.dst),
+                            (Base::Slot(l.dst.clone(), true), 0, Vec::new()),
+                        );
+                    }
                     _ => {}
                 }
             }
