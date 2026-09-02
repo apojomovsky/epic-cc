@@ -2041,3 +2041,22 @@ fn strides_packed_struct_arrays_by_the_packed_size() {
     let m = parse_ll(PACKED_ARRAY);
     assert_eq!(m.globals[0].size, 18);
 }
+
+#[test]
+fn parses_runtime_inttoptr_with_dbg_attribute() {
+    // The full epic-encoder example's `EPIC_GPIO_Init` computes an SFR
+    // address at runtime (`%7 = select i1 %5, i16 %6, i16 133`) and casts
+    // it: `%13 = inttoptr i16 %7 to ptr, !dbg !47`. The `!dbg` attribute
+    // carries the operand-list comma into the `to` type token, which must
+    // not break type resolution (epic-cc#183).
+    let src = "define dso_local void @main() {\n  %7 = select i1 %5, i16 %6, i16 133\n  %13 = inttoptr i16 %7 to ptr, !dbg !47\n  ret void\n}\n";
+    let m = parse_ll(src);
+    match &m.funcs[0].blocks[0].insts[1] {
+        Inst::IntToPtr(p) => {
+            assert_eq!(p.dst, "13");
+            assert_eq!(p.from, Ty::I16);
+            assert_eq!(p.to, Ty::I16, "ptr resolves to the 16-bit address type");
+        }
+        other => panic!("expected IntToPtr, got {other:?}"),
+    }
+}
