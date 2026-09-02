@@ -1120,6 +1120,7 @@ impl<'m> Gen<'m> {
                     }
                     return;
                 }
+
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
             }
@@ -1130,8 +1131,14 @@ impl<'m> Gen<'m> {
                     let lit = if idx == 0 { "LOW" } else { "HIGH" };
                     self.emit(format!("    MOVLW {lit}({g})"));
                 } else {
+                    // A data global in value position is a pointer ADDRESS
+                    // (a `store ptr @g, ...` or a pointer phi incoming;
+                    // clang always loads scalar globals first): materialize
+                    // it as two literals, never read the pointee's contents
+                    // (epic-cc#155).
                     let a = self.val_addr(&Val::Global(g.clone())).direct();
-                    self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
+                    let b = ((a >> (idx as u32 * 8)) & 0xFF) as u8;
+                    self.emit(format!("    MOVLW 0x{b:02X}"));
                 }
             }
         }
@@ -1864,6 +1871,18 @@ impl<'m> Gen<'m> {
                     // covers a GEP over a const global that was copied to RAM
                     // (the `is_const` copy is in `addrs`, so `global_is_const`
                     // is false and the bytes live in RAM).
+                    Val::Reg(r) if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) => {
+                        // A runtime pointer value (a `load ptr` result, e.g.
+                        // the taskmgr `t->arg` field): the two address bytes
+                        // live in the reg's slot. Copy them into the param
+                        // slot; the callee's FSR-based deref resolves the
+                        // address at runtime (epic-cc#155).
+                        let sa = self.slot_addr(self.cur_func, r).direct();
+                        self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                        self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                    }
                     Val::Reg(r) if matches!(self.resolved_for(r), (Base::Global(_), _, ref t) if t.is_empty()) =>
                     {
                         let (base, k, _) = self.resolved_for(r);
