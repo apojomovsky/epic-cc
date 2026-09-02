@@ -68,6 +68,14 @@ pub fn legalize(m: Module) -> Module {
             for inst in b.insts {
                 match inst {
                     Inst::Bin(bin) => {
+                        // i64 arithmetic is a documented limitation: only
+                        // the aggregate load/store copy (the HAL handle
+                        // shape, epic-cc#125) is supported. A Bin on i64
+                        // panics loudly rather than silently miscompiling.
+                        assert!(
+                            bin.ty != Ty::I64,
+                            "legalize: i64 arithmetic not supported (only i64 aggregate copies, epic-cc#125)"
+                        );
                         match fold_const_bin(&bin).or_else(|| lower_bin(&bin, &mut used)) {
                             Some(folded_or_call) => insts.push(folded_or_call),
                             None => insts.push(Inst::Bin(bin)),

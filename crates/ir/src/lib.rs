@@ -7,6 +7,7 @@ pub enum Ty {
     I8,
     I16,
     I32,
+    I64,
     F32,
 }
 impl Ty {
@@ -15,6 +16,10 @@ impl Ty {
             Ty::I1 | Ty::I8 => 1,
             Ty::I16 => 2,
             Ty::I32 | Ty::F32 => 4,
+            // i64 appears only as an aggregate load/store copy (the HAL
+            // handle-copy shape, epic-cc#125); arithmetic on it is a
+            // documented limitation and panics in legalize.
+            Ty::I64 => 8,
         }
     }
 }
@@ -562,6 +567,7 @@ fn ty_str(t: Ty) -> String {
         Ty::I8 => "i8".into(),
         Ty::I16 => "i16".into(),
         Ty::I32 => "i32".into(),
+        Ty::I64 => "i64".into(),
         Ty::F32 => "float".into(),
     }
 }
@@ -965,6 +971,7 @@ fn parse_ty(s: &str) -> Ty {
         "ptr" => Ty::I16,
         "i16" => Ty::I16,
         "i32" => Ty::I32,
+        "i64" => Ty::I64,
         "float" | "f32" => Ty::F32,
         other => panic!("unsupported type {other}"),
     }

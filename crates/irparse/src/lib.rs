@@ -61,6 +61,7 @@ fn ty_of(s: &str, loc: Option<&SrcLoc>) -> Ty {
         "i8" => Ty::I8,
         "i16" => Ty::I16,
         "i32" => Ty::I32,
+        "i64" => Ty::I64,
         "float" | "f32" => Ty::F32,
         // An opaque `ptr` is a 16-bit address on this datalayout.
         "ptr" => Ty::I16,
@@ -1011,6 +1012,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
             "i1" | "i8" => (1, 1),
             "i16" | "ptr" => (2, 2),
             "i32" | "float" | "f32" => (4, 2),
+            "i64" => (8, 2),
             other => panic!("{}SPIKE: unsupported type {other:?}", loc_prefix(loc)),
         }
     }
@@ -1039,6 +1041,7 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
             "i1" | "i8" => Some((1, 1)),
             "i16" | "ptr" => Some((2, 2)),
             "i32" | "float" | "f32" => Some((4, 2)),
+            "i64" => Some((8, 2)),
             _ => None,
         }
     }
