@@ -1082,15 +1082,13 @@ impl<'m> Gen<'m> {
                     self.resolved.get(&ssa_key(self.cur_func, r)).cloned()
                 {
                     // The shapes below read the base's two bytes as a
-                    // runtime address (a pointer param's slot, or a
-                    // runtime-address slot like an IntToPtr dst). An
-                    // alloca's address has no link-time literal, so that
-                    // stays a loud panic. `Base::Global` is a real
-                    // link-time constant: ipsccp (epic-cc#193) can
-                    // propagate a global argument into a pointer
-                    // parameter, so a GEP over it resolves here to
-                    // `Base::Global`, materialized as a literal below, same
-                    // as `emit_move_addr_to_slot`'s `Base::Global` arm.
+                    // runtime address (a pointer param's slot, or an
+                    // IntToPtr-dst slot). An alloca's address has no
+                    // link-time literal, so that stays a loud panic.
+                    // `Base::Global` is a real link-time constant: ipsccp
+                    // (epic-cc#193) can propagate a global into a pointer
+                    // param, resolving here to `Base::Global`, materialized
+                    // below like `emit_move_addr_to_slot`'s own arm.
                     if let Base::Global(name) = &base {
                         let addr = self.global_addr(name).wrapping_add(k as u16);
                         let lo = (addr & 0xFF) as u8;
