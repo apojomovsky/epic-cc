@@ -352,3 +352,40 @@ fn bank0_only_with_movwf_status_address_keeps_resets() {
     let expected = "    MOVWF 0x03\nL:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n";
     assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
+
+// ---- Item 4: an internal label's incoming bank is provable when every
+// ---- path that can reach it agrees, regardless of caller.
+
+#[test]
+fn loop_back_label_with_provable_bank_skips_reset() {
+    // `top` is reached both by fall-through (after `MOVF 0xA0, W` pins bank
+    // 1) and by the `GOTO top` loop-back edge, whose own incoming bank (via
+    // the walk) is the same bank 1, so, unlike a label reached by
+    // unrelated arms, the reset at `top` is redundant and gets skipped.
+    let asm = "    MOVF 0x20, W\n    CALL looper\n    MOVF 0x21, W\nlooper:\n    MOVF 0xA0, W\ntop:\n    MOVWF 0xE5\n    BTFSC STATUS, 2\n    GOTO top\n    RETURN\n";
+    let expected = "    MOVF 0x20, W\n    CALL looper\n    BCF STATUS, 5\n    MOVF 0x21, W\nlooper:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\ntop:\n    MOVWF 0x65\n    BTFSC STATUS, 2\n    GOTO top\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn label_with_conflicting_predecessor_banks_keeps_full_reset() {
+    // `join` is reached from two arms that disagree: the `GOTO join` arm
+    // last pinned bank 1 (`MOVF 0xA0, W`), the fall-through arm (from
+    // `alt`) last pinned bank 0 (`MOVF 0x30, W`), the join is not a
+    // single bank, so `join` keeps the full reset, same as before item 4.
+    let asm = "    MOVF 0x20, W\n    CALL brancher\n    MOVF 0x21, W\nbrancher:\n    BTFSC STATUS, 2\n    GOTO alt\n    MOVF 0xA0, W\n    GOTO join\nalt:\n    MOVF 0x30, W\njoin:\n    MOVWF 0xE5\n    RETURN\n";
+    let expected = "    MOVF 0x20, W\n    CALL brancher\n    BCF STATUS, 5\n    MOVF 0x21, W\nbrancher:\n    BTFSC STATUS, 2\n    GOTO alt\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    GOTO join\nalt:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x30, W\njoin:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVWF 0x65\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn region_with_computed_jump_keeps_full_resets() {
+    // A region containing `MOVWF PCL` (isel's table-reader computed jump)
+    // is defensively excluded from the item-4 label analysis entirely, so
+    // `top` here keeps the full reset even though its only visible
+    // predecessor (fall-through) is bank 1, same conservative behavior as
+    // if item 4 did not exist for this region.
+    let asm = "    MOVF 0x20, W\n    CALL looper\n    MOVF 0x21, W\nlooper:\n    MOVF 0xA0, W\n    MOVWF PCL\ntop:\n    MOVWF 0xE5\n    RETURN\n";
+    let expected = "    MOVF 0x20, W\n    CALL looper\n    BCF STATUS, 5\n    MOVF 0x21, W\nlooper:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    MOVWF PCL\ntop:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVWF 0x65\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
