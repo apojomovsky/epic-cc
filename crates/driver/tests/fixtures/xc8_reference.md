@@ -30,20 +30,21 @@ xc8-cc -mdfp=<PIC16Fxxx_DFP> -mcpu=16f877a -O2 -std=c99 -Wall -Wextra \
   -DPIC16F877A -I<includes> -DFOSC_HZ=20000000
 ```
 
-**`-O2` is requested but may not be what actually ran.** No XC8 license
-file was present when this was measured (a fresh, unlicensed
-`epic-hal-toolchain` image), and `xc8-cc --help` documents a
-license-gated fallback to a lesser optimization mode
-(`--nofallback: Prevent falling back to lesser license modes
-(deprecated)`, i.e. the fallback exists and is only opt-out-able via a
-now-deprecated flag). The compiler's own `.s` output names the applied
-level `Og9`, not `O2`:
-`subtitle "Microchip MPLAB XC8 C Compiler v4.00 build ... Og9"`. So this
-row is a real, reproducible number, but **not confirmed to be XC8's best
-achievable output**; treat the epic-cc-vs-XC8 ratio as a floor on the
-gap, not the true gap, until apojomovsky/epic-hal#121 resolves the
-licensing question. If a licensed re-measurement changes this row
-meaningfully, update this table alongside it.
+This row was originally flagged as possibly reflecting a degraded,
+unlicensed-fallback optimization tier rather than the requested `-O2`
+(no license file was present, and `xc8-cc --help` documents a
+`--nofallback` flag whose description implies exactly such a fallback
+exists). That concern is resolved: XC8 v4.00's own release notes state
+license checks were removed entirely (build date matching what's
+measured here), and as of July 2026 all MPLAB XC compiler licenses are
+free and unlimited, so `--nofallback` being `deprecated` is a leftover
+from the pre-v4 licensing model, not evidence of an active one, and no
+license file being present is no longer unusual. The `Og9` label the
+`.s` output carries (`subtitle "Microchip MPLAB XC8 C Compiler v4.00
+build ... Og9"`) is very likely an internal build/pipeline identifier
+unrelated to optimization level. This row is very likely already XC8's
+genuine best output for the requested `-O2`. See apojomovsky/epic-hal#121
+(closed) for the full correction.
 
 ## Regenerating
 
