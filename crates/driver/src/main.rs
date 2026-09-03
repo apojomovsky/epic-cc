@@ -157,10 +157,13 @@ fn main() {
         packed_structs: device.core == device::Core::Pic18,
     };
     let mut units = Vec::new();
+    let mut dep_paths = Vec::new();
     for (n, input) in cli.inputs.iter().enumerate() {
         let ll_path = tmp.join(format!("{n:03}.ll"));
+        let dep_path = tmp.join(format!("{n:03}.d"));
         let mut cmd = clang::base_cmd(&clang, &resdir);
         clang::apply_options(&mut cmd, &clang_opts);
+        cmd.args(["-MD", "-MF", dep_path.to_str().unwrap()]);
         cmd.args(["-o", ll_path.to_str().unwrap(), input]);
         if cli.verbose {
             eprintln!("epic-cc: {cmd:?}");
@@ -171,16 +174,21 @@ fn main() {
             std::process::exit(1);
         }
         units.push(ll_path);
+        dep_paths.push(dep_path);
     }
 
-    let need_string = sources.iter().any(|(_, src)| {
-        src.lines()
-            .any(|l| l.contains("#include") && l.contains("string.h"))
-    });
-    let need_stdio = sources.iter().any(|(_, src)| {
-        src.lines()
-            .any(|l| l.contains("#include") && l.contains("stdio.h"))
-    });
+    // See `driver::header_detect` (epic-cc#196) for why this reads clang's
+    // `-MD` dependency output rather than grepping the raw source text.
+    let dep_texts: Vec<String> = dep_paths
+        .iter()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .collect();
+    let need_string = dep_texts
+        .iter()
+        .any(|t| driver::header_detect::dep_file_includes(t, "string.h"));
+    let need_stdio = dep_texts
+        .iter()
+        .any(|t| driver::header_detect::dep_file_includes(t, "stdio.h"));
     if need_string {
         let string_c_path = tmp.join("__epic_string.c");
         std::fs::write(&string_c_path, driver::string_c::STRING_C).expect("write string.c");
