@@ -220,6 +220,9 @@ void putch(char c)
  * decimal/hex semantics on both. */
 #ifdef __EPIC_CC__
 static char s_fmt_buf[12];               /* sign + 10 digits + NUL fits i32 */
+/* epic_serial_put_str's shared staging buffer (epic-hal#123); external
+ * linkage, every TU that expands the macro needs this symbol. */
+char g_epic_serial_str_scratch[EPIC_SERIAL_STR_SCRATCH_SZ];
 #endif
 /**
  * @brief Emit v in decimal via a local buffer.

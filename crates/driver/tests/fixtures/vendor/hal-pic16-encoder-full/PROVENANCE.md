@@ -13,6 +13,10 @@ below against a current epic-hal checkout) when the drift between this
 snapshot and real epic-hal code becomes a concern, e.g. epic-hal adds a
 new codegen shape this snapshot doesn't exercise.
 
+**Re-vendored 2026-09-03** (`epic-serial/include/epic_serial.h`,
+`epic-serial/src/epic_serial.c` only): apojomovsky/epic-hal#123/#124,
+the `printf`-literal staging buffer consolidation (epic-cc#206).
+
 Source files (paths relative to the epic-hal repo root):
 
 ```
