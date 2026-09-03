@@ -84,6 +84,7 @@ jobs:
           Copy-Item "$src\bin\clang.exe" "$bundle\clang\bin\"
           Copy-Item "$src\bin\*.dll" "$bundle\clang\bin\"
           Copy-Item "$src\bin\llvm-link.exe" "$bundle\clang\bin\"
+          Copy-Item "$src\bin\opt.exe" "$bundle\clang\bin\"
           Copy-Item -Recurse "$src\lib\clang" "$bundle\clang\lib\clang"
           Copy-Item "target\release\epic-cc.exe" "$bundle\"
           # The MSVC archive does not ship LICENSE.TXT; fetch the pinned

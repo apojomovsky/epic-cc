@@ -96,7 +96,8 @@ epic-cc-<ver>-x86_64-linux/          epic-cc-<ver>-x86_64-windows/
 ├── epic-cc                        ├── epic-cc.exe
 ├── clang/                         ├── clang/
 │   ├── bin/clang                  │   ├── bin/clang.exe
-│   ├── bin/llvm-link              │   └── bin/llvm-link.exe
+│   ├── bin/llvm-link              │   ├── bin/llvm-link.exe
+│   ├── bin/opt                    │   └── bin/opt.exe
 │   └── lib/clang/20/              │   └── lib/clang/20/   ← builtin headers
 └── LICENSE (LLVM Apache-2.0)      └── LICENSE (LLVM Apache-2.0)
 ```
@@ -118,7 +119,9 @@ Replace the `expect()`s on `PIC8_CLANG_UNWRAPPED` / `PIC8_CLANG_RESOURCE_DIR`
 
 `llvm-link` is resolved from the same directory as the resolved clang and is
 always run (multi-unit merge, single-unit no-op), so the bundle ships it
-next to `clang` in `clang/bin/`.
+next to `clang` in `clang/bin/`. `opt` runs the whole-program cleanup over
+the merged module (ADR-011's D-7 follow-up, epic-cc#193) and is resolved the
+same way, so it ships in `clang/bin/` too.
 
 Rename the shipped binary from `driver` to `epic-cc` via a `[[bin]]` entry in the driver
 crate's `Cargo.toml` (`cargo run -p driver` keeps working). No pipeline-stage changes.

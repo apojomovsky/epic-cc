@@ -13,9 +13,10 @@
   a prerelease tagged `ci-<sha>` carrying the zip, its sha256 sums, and
   real-newline notes. `workflow_dispatch` runs build+gate as a dry run without
   publishing.
-* The release bundle ships `llvm-link` next to `clang` in `clang/bin/`, because
-  the driver resolves llvm-link from the same directory and always runs it
-  (multi-unit merge, single-unit no-op).
+* The release bundle ships `llvm-link` and `opt` next to `clang` in
+  `clang/bin/`, because the driver resolves both from the same directory and
+  always runs them (llvm-link: multi-unit merge, single-unit no-op; opt: the
+  whole-program cleanup over the merged module).
 * The driver gains a version stamp: a `build.rs` reads the `EPIC_CC_VERSION`
   build ARG (an environment variable of the docker release stage's cargo RUN)
   and exports `EPIC_CC_STAMP`; `epic-cc --version` (and `-V`) prints
