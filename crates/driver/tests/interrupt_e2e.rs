@@ -9,21 +9,21 @@
 //! `in` and `out` are volatile globals at 0x21 / 0x20 (the alloc layout the
 //! driver used); PORTB is the F877A SFR at RAM[0x06].
 //!
-//! The injection point is main's **word 77** (`%2 = load out`, the argument
+//! The injection point is main's **word 75** (`%2 = load out`, the argument
 //! load of `out = bump(out)`, immediately after the `PORTB = 0x11` store at
-//! word 76) — verified against the exact emitted asm (crates/asm/tests/
+//! word 74), verified against the exact emitted asm (crates/asm/tests/
 //! fixtures/interrupt.asm, which was captured from this same driver
 //! pipeline): the ISR preempts main before the shared helper's argument is
 //! read, so the ISR's bump lands in `out` before main's bump reads it.
 //!
 //! Hand computation from the emitted IR + the injection point (in = 0x10):
-//!   main: out = in                          -> 0x10   (word 74 store)
-//!   main: PORTB = 0x11                      (word 76 store)
-//!   <- fire_interrupt at pc == 77: push 78, jump to the vector (word 4)
+//!   main: out = in                          -> 0x10   (word 72 store)
+//!   main: PORTB = 0x11                      (word 74 store)
+//!   <- fire_interrupt at pc == 75: push 76, jump to the vector (word 4)
 //!   isr:  save W/STATUS/PCLATH/FSR/retval/scratch -> 0x75-0x7D
 //!         PORTB = 0x55                      (SFR write from the ISR)
 //!         out = bump_isr(out = 0x10)        -> 0x11   (the _isr duplicate)
-//!         restore; RETFIE -> pc == 78
+//!         restore; RETFIE -> pc == 76
 //!   main: %2 = load out (0x11, the ISR's bump) -> bump(0x11) = 0x12 -> out
 //!   main: %4 = load out (0x12); %5 = %4 + 1 = 0x13 -> out
 //!   main: %6 = load out (0x13); %7 = bump(2) = 3; %8 = %6 + %7 = 0x16 -> out
@@ -34,10 +34,10 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-/// The interrupt vector (word 4) and the injection point (word 77) as
+/// The interrupt vector (word 4) and the injection point (word 75) as
 /// documented above.
 const VECTOR: u16 = 4;
-const INJECT_PC: u16 = 77;
+const INJECT_PC: u16 = 75;
 
 fn interrupt_layout() -> alloc::AllocLayout {
     let (clang, resdir) = driver::clang::pic_clang_from_env();
