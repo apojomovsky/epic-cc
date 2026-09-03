@@ -225,8 +225,9 @@ fn zext_trunc_pair() {
         ("main::t", 0x2A),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %v=0x27, %z lo=0x28 hi=0x29, %t=0x2A.
-    assert!(asm.contains("MOVF 0x27, W"), "zext copies v:\n{asm}");
+    // %v=0x27, %z lo=0x28 hi=0x29, %t=0x2A. epic-cc#214: %v's own reload
+    // for the zext is redundant (still in W right after Inst::Load's own
+    // store to 0x27) and gets elided.
     assert!(asm.contains("MOVWF 0x28"), "zext stores d_lo:\n{asm}");
     assert!(asm.contains("CLRF 0x29"), "zext zeroes d_hi:\n{asm}");
     assert!(asm.contains("MOVF 0x28, W"), "trunc reads z_lo:\n{asm}");
@@ -277,8 +278,9 @@ fn sext_i8_to_i16_copies_low_and_sign_fills_high() {
         ("main::s", 0x28),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %v=0x27, %s lo=0x28 hi=0x29.
-    assert!(asm.contains("MOVF 0x27, W"), "sext copies v:\n{asm}");
+    // %v=0x27, %s lo=0x28 hi=0x29. epic-cc#214: %v's own reload for the
+    // sext is redundant (still in W right after Inst::Load's own store to
+    // 0x27) and gets elided.
     assert!(asm.contains("MOVWF 0x28"), "sext stores d_lo:\n{asm}");
     // Sign-fill: test the source's MSB (byte 0 of the i8 lives at 0x27),
     // then fill the high byte with 0xFF (negative) or 0x00 (positive).
@@ -386,9 +388,12 @@ fn phi_copy_chain_emits_dependent_copies_in_order() {
         ("main::q", 0x28),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %p=0x27, %q=0x28, %a=0x26.
+    // %p=0x27, %q=0x28, %a=0x26. epic-cc#214: %q's own reload of %p's slot
+    // is redundant (still in W right after %p's own copy stores it there)
+    // and gets elided; %p's copy still strictly precedes %q's, the actual
+    // property this test checks.
     assert!(
-        asm.contains("MOVF 0x26, W\n    MOVWF 0x27\n    MOVF 0x27, W\n    MOVWF 0x28"),
+        asm.contains("MOVF 0x26, W\n    MOVWF 0x27\n    MOVWF 0x28"),
         "dependent copies must emit %p before %q:\n{asm}"
     );
 }
@@ -427,8 +432,10 @@ fn icmp_eq_i8_materializes_i1() {
         ("main::c", 0x26),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %1=0x25, %c=0x26, scratch=0x70 (fixed common RAM).
-    assert!(asm.contains("MOVF 0x25, W"), "load a:\n{asm}");
+    // %1=0x25, %c=0x26, scratch=0x70 (fixed common RAM). epic-cc#214:
+    // %1's own reload for the XOR is redundant (still in W right after
+    // Inst::Load's own store to 0x25) and gets elided, so "load a" is no
+    // longer its own instruction; the XOR itself is still the real check.
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
     assert!(asm.contains("MOVWF 0x70"), "store xor to scratch:\n{asm}");
     assert!(asm.contains("MOVLW 0x00"), "materialize 0:\n{asm}");
@@ -2013,8 +2020,9 @@ fn icmp_ne_i8_inverts_eq_materialization() {
         ("main::c", 0x26),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %1=0x25, %c=0x26, scratch=0x70.
-    assert!(asm.contains("MOVF 0x25, W"), "load a:\n{asm}");
+    // %1=0x25, %c=0x26, scratch=0x70. epic-cc#214: %1's own reload for the
+    // XOR is redundant (still in W right after Inst::Load's own store to
+    // 0x25) and gets elided, so "load a" is no longer its own instruction.
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
     assert!(asm.contains("MOVWF 0x70"), "store xor to scratch:\n{asm}");
     assert!(
@@ -4907,10 +4915,13 @@ fn single_table_elision_drift_folded_by_window_align() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // The elision drift is real: the reader sits at the post-elision
-    // position (0x7F6), not the pass-A 0x7FA.
+    // position (0x7F5), not the pass-A 0x7FA. (epic-cc#214 shifted this by
+    // one further word: a redundant store+immediate-reload of an SSA
+    // value already in W, elided in main/h0 ahead of the reader, same
+    // drift mechanism this test exercises, just one word more of it.)
     assert_eq!(
         label_addr(&asm, "__read_t"),
-        0x7F6,
+        0x7F5,
         "reader at the post-elision start:\n{asm}"
     );
     assert!(
@@ -5405,10 +5416,10 @@ fn zext_i8_to_i32_clears_high_bytes() {
         ("main::z", 0x38),
     ];
     let asm = select(&PIC16F877A, &m, &addrs(&map));
+    // epic-cc#214: %v's own reload for the zext is redundant (still in W
+    // right after Inst::Load's own store to 0x30) and gets elided.
     assert!(
-        asm.contains(
-            "    MOVF 0x30, W\n    MOVWF 0x38\n    CLRF 0x39\n    CLRF 0x3A\n    CLRF 0x3B"
-        ),
+        asm.contains("    MOVWF 0x38\n    CLRF 0x39\n    CLRF 0x3A\n    CLRF 0x3B"),
         "zext copies byte 0 and clears bytes 1-3:\n{asm}"
     );
 }
@@ -6884,9 +6895,11 @@ fn banking_selects_bank0_for_sfr_and_leaves_save_area_untouched() {
     let banked = banking::assign_banks(&device::PIC16F877A, &asm);
     // The SFR store follows the value load directly: the body's banked
     // operand already selected bank 0, so no BANKSEL is inserted between
-    // the load and the store.
+    // the load and the store. epic-cc#214: %v's own reload for the store
+    // is also redundant (still in W right after Inst::Load's own store to
+    // 0x25) and gets elided, leaving just the SFR write itself.
     assert!(
-        banked.contains("    MOVF 0x25, W\n    MOVWF 0x06"),
+        banked.contains("    MOVWF 0x25\n    MOVWF 0x06"),
         "SFR store is direct with no BANKSEL:\n{banked}"
     );
     // The SFR load is the first instruction after main's label: the bank

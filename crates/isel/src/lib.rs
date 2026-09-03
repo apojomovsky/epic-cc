@@ -176,12 +176,58 @@ struct Gen<'m> {
     /// sizes drive the page assignment); `Some` in pass B, where a
     /// same-page restore is skipped.
     page_of: Option<&'m HashMap<String, usize>>,
+    /// The slot address whose value `emit_w_store`/`emit_w_load` last
+    /// confirmed is also currently sitting in W, or `None` when unknown
+    /// (epic-cc#214, the redundant-reload pattern #209 measured: isel
+    /// materializes a value to its slot, then whatever consumes it next
+    /// independently reloads the same slot, not knowing it never left W).
+    /// Wired at `Inst::Load`'s own store to its result's slot,
+    /// `emit_load_byte`'s ordinary-register read, and
+    /// `emit_move_val_to_slot`'s store: `dst` there is always this SSA
+    /// value's own private slot, never the address actually read/written
+    /// (a real SFR access, when the source is one, stays a plain,
+    /// untracked `emit`; a global's own value is read fresh every time,
+    /// only the *result*'s slot is ever cached), so this is sound even
+    /// when the source is genuinely volatile or interrupt-shared. Plain
+    /// `emit` unconditionally clears it, so every other call site is safe
+    /// by construction: a stale belief can only survive between two
+    /// consecutive `emit_w_*` calls with nothing else emitted in between,
+    /// and a slot's own function is never reachable from both main and an
+    /// ISR (the existing ISR-duplication policy the overlay allocator
+    /// already relies on), so nothing outside this straight-line sequence
+    /// can touch it either.
+    w_holds: Option<u16>,
     out: Vec<String>,
 }
 
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
+        self.w_holds = None;
         self.out.push(s.into());
+    }
+
+    /// `MOVWF addr`, unless `addr` is already known to hold W's value from
+    /// an immediately preceding `emit_w_store`/`emit_w_load` of the same
+    /// address (a genuine no-op then: the byte there already equals W).
+    /// Marks `addr` as holding W's value either way.
+    fn emit_w_store(&mut self, addr: u16) {
+        if self.w_holds != Some(addr) {
+            self.emit(format!("    MOVWF 0x{addr:02X}"));
+        }
+        self.w_holds = Some(addr);
+    }
+
+    /// `MOVF addr, W`, unless `addr`'s value is already known to be in W
+    /// (epic-cc#214: the redundant-reload pattern #209 measured, W already
+    /// holds exactly what a preceding `emit_w_store`/`emit_w_load` of the
+    /// same address put there, nothing emitted since). Marks `addr` as
+    /// holding W's value either way, so a repeated load of the same
+    /// address collapses too.
+    fn emit_w_load(&mut self, addr: u16) {
+        if self.w_holds != Some(addr) {
+            self.emit(format!("    MOVF 0x{addr:02X}, W"));
+        }
+        self.w_holds = Some(addr);
     }
 
     /// The M11 restore pair: `MOVLW PAGE(<cur_func>); MOVWF PCLATH`, right
@@ -1205,7 +1251,7 @@ impl<'m> Gen<'m> {
                 }
 
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
-                self.emit(format!("    MOVF 0x{:02X}, W", a + u16::from(idx)));
+                self.emit_w_load(a + u16::from(idx));
             }
             Val::Global(g) => {
                 if self.is_function(g) {
@@ -1249,7 +1295,7 @@ impl<'m> Gen<'m> {
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
         for i in 0..ty.bytes() {
             self.emit_load_byte(val, i);
-            self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+            self.emit_w_store(dst + u16::from(i));
         }
     }
 
@@ -2387,16 +2433,19 @@ impl<'m> Gen<'m> {
                     let src = self.global_addr(g);
                     for k in 0..l.ty.bytes() {
                         self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
-                        self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
+                        self.emit_w_store(dst + u16::from(k));
                     }
                 } else if l.ptr.starts_with("0x") {
                     // A literal (SFR) pointer from `inttoptr`: a direct MOVF
                     // with no FSR setup. The banking pass supplies whatever
-                    // BANKSEL the address turns out to need.
+                    // BANKSEL the address turns out to need. `dst` is this
+                    // SSA value's own (never volatile) slot, so the store
+                    // side is trackable even though the read just above it
+                    // (of `base`, which may be a real SFR) is not.
                     let base = literal_ptr_addr(&l.ptr);
                     for k in 0..l.ty.bytes() {
                         self.emit(format!("    MOVF 0x{:02X}, W", base + u16::from(k)));
-                        self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
+                        self.emit_w_store(dst + u16::from(k));
                     }
                 } else {
                     // A GEP-created pointer: const (flash) bases take the
@@ -2409,7 +2458,7 @@ impl<'m> Gen<'m> {
                     let ptr = Val::Reg(r.to_string());
                     for k in 0..l.ty.bytes() {
                         self.emit_ptr_load_byte(&ptr, k);
-                        self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(k)));
+                        self.emit_w_store(dst + u16::from(k));
                     }
                 }
             }
@@ -6493,6 +6542,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 cur_func: &f.name,
                 tmp: &mut tmp,
                 page_of: None,
+                w_holds: None,
                 out: Vec::new(),
             };
             emit_func_body(&mut g, f);
@@ -6763,6 +6813,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     cur_func: &f.name,
                     tmp: &mut tmp,
                     page_of: Some(&pages),
+                    w_holds: None,
                     out: Vec::new(),
                 };
                 emit_func_body(&mut g, f);
