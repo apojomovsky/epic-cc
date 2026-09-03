@@ -149,22 +149,34 @@ void epic_serial_put_hex16(uint16_t v);
  * epic-cc has no stdio and cannot yet pass a const pointer across a
  * call boundary (epic-cc#148), so on that path put_str expands per
  * call site: the literal lands in const data and is copied byte-wise
- * into an exact-size RAM staging buffer, and the RAM copy is written
- * (the EPIC_HARNESS_LOG_STATIC pattern). The argument must be a string
+ * into a RAM staging buffer, and the RAM copy is written (the
+ * EPIC_HARNESS_LOG_STATIC pattern). The argument must be a string
  * literal; XC8 and host keep the out-of-line function.
+ *
+ * One shared file-scope buffer (g_epic_serial_str_scratch), not one
+ * per call site: distinct same-shape statics never merge, so every
+ * literal logged stayed resident (epic-hal#123, epic-cc#206: 83 of
+ * 350 RAM bytes on one example). Safe since each expansion copies in
+ * and writes out before the next runs. Sized by
+ * EPIC_SERIAL_STR_SCRATCH_SZ; epic_str_len_ok_ still asserts a
+ * literal fits at compile time, no silent truncation.
  */
 #ifdef __EPIC_CC__
+#ifndef EPIC_SERIAL_STR_SCRATCH_SZ
+#define EPIC_SERIAL_STR_SCRATCH_SZ 64u
+#endif
+extern char g_epic_serial_str_scratch[EPIC_SERIAL_STR_SCRATCH_SZ];
 #define epic_serial_put_str(s)                                                         \
     do {                                                                               \
         static const char epic_str_src_[] = s;                                         \
-        static char epic_str_buf_[sizeof(epic_str_src_)];                              \
         uint8_t epic_str_i_;                                                           \
-        typedef char epic_str_len_ok_[(sizeof(epic_str_src_) <= 256) ? 1 : -1];       \
+        typedef char epic_str_len_ok_[                                                \
+            (sizeof(epic_str_src_) <= EPIC_SERIAL_STR_SCRATCH_SZ) ? 1 : -1];          \
         for (epic_str_i_ = 0u; epic_str_i_ < (uint8_t)sizeof(epic_str_src_);           \
              epic_str_i_++) {                                                          \
-            epic_str_buf_[epic_str_i_] = epic_str_src_[epic_str_i_];                   \
+            g_epic_serial_str_scratch[epic_str_i_] = epic_str_src_[epic_str_i_];       \
         }                                                                              \
-        epic_serial_write((const uint8_t *)epic_str_buf_,                              \
+        epic_serial_write((const uint8_t *)g_epic_serial_str_scratch,                  \
                           (int)sizeof(epic_str_src_) - 1);                             \
     } while (0)
 
