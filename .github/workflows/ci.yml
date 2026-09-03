@@ -116,7 +116,11 @@ jobs:
           done
 
       - name: Test every workspace crate
-        run: docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/ci-test.sh
+        run: |
+          docker run --rm -v "$PWD:/workspace" -w /workspace \
+            -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
+            -v "$GITHUB_STEP_SUMMARY:$GITHUB_STEP_SUMMARY" -e GITHUB_STEP_SUMMARY \
+            epic-cc-ci:latest bash scripts/ci-test.sh
 
   hal-887:
     # epic-hal's 887 firmware is built by this compiler but nothing in either

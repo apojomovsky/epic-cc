@@ -219,14 +219,16 @@ fn flash_and_ram_do_not_regress() {
     let update = std::env::var("UPDATE_SIZE_BASELINE").is_ok();
     let baseline = load_baseline();
     let mut measured = Vec::new();
+    let mut rows = Vec::new();
     let mut failures = Vec::new();
 
     for c in cases() {
         let report = measure(&c);
         let flash_words = parse_after(&report, "flash: ");
         let ram_bytes = parse_after(&report, "RAM: ");
+        let base = baseline.entry.iter().find(|e| e.name == c.name).cloned();
 
-        if let Some(base) = baseline.entry.iter().find(|e| e.name == c.name) {
+        if let Some(base) = &base {
             if !update {
                 if flash_words > base.flash_words {
                     failures.push(format!(
@@ -254,6 +256,14 @@ fn flash_and_ram_do_not_regress() {
             ));
         }
 
+        rows.push(Row {
+            name: c.name,
+            device: c.device,
+            flash_words,
+            flash_baseline: base.as_ref().map(|b| b.flash_words),
+            ram_bytes,
+            ram_baseline: base.as_ref().map(|b| b.ram_bytes),
+        });
         measured.push(BaselineEntry {
             name: c.name.to_string(),
             device: c.device.to_string(),
@@ -261,6 +271,8 @@ fn flash_and_ram_do_not_regress() {
             ram_bytes,
         });
     }
+
+    write_step_summary(&rows);
 
     if update {
         save_baseline(&Baseline { entry: measured });
@@ -273,4 +285,72 @@ fn flash_and_ram_do_not_regress() {
          UPDATE_SIZE_BASELINE=1 cargo test -p driver --test size_regression_e2e",
         failures.join("\n")
     );
+}
+
+/// One ladder entry's measured-vs-baseline numbers, for the step-summary
+/// table. `*_baseline` is `None` for a case with no recorded baseline yet
+/// (only possible with `UPDATE_SIZE_BASELINE=1`, which is about to add
+/// one).
+struct Row {
+    name: &'static str,
+    device: &'static str,
+    flash_words: u32,
+    flash_baseline: Option<u32>,
+    ram_bytes: u32,
+    ram_baseline: Option<u32>,
+}
+
+fn signed_delta(current: u32, baseline: Option<u32>) -> String {
+    match baseline {
+        None => "(new)".to_string(),
+        Some(b) => {
+            let d = current as i64 - b as i64;
+            if d > 0 {
+                format!("+{d}")
+            } else {
+                d.to_string()
+            }
+        }
+    }
+}
+
+/// Append a markdown table of every case's measured size against its
+/// baseline to `$GITHUB_STEP_SUMMARY`, when set (CI only, a no-op for a
+/// local `cargo test`). Runs unconditionally, on a pass or a failure, so
+/// a PR shows exactly what moved and by how much instead of a bare
+/// crate-level PASS/FAIL (epic-cc#200 follow-up).
+fn write_step_summary(rows: &[Row]) {
+    let Ok(path) = std::env::var("GITHUB_STEP_SUMMARY") else {
+        return;
+    };
+    let mut out = String::from(
+        "\n## Size regression (epic-cc#200)\n\n\
+         | Fixture | Device | Flash words | delta | RAM bytes | delta |\n\
+         |---|---|---|---|---|---|\n",
+    );
+    for r in rows {
+        out.push_str(&format!(
+            "| {} | {} | {}{} | {} | {}{} | {} |\n",
+            r.name,
+            r.device,
+            r.flash_words,
+            r.flash_baseline
+                .map(|b| format!(" / {b}"))
+                .unwrap_or_default(),
+            signed_delta(r.flash_words, r.flash_baseline),
+            r.ram_bytes,
+            r.ram_baseline
+                .map(|b| format!(" / {b}"))
+                .unwrap_or_default(),
+            signed_delta(r.ram_bytes, r.ram_baseline),
+        ));
+    }
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open GITHUB_STEP_SUMMARY");
+    f.write_all(out.as_bytes())
+        .expect("write GITHUB_STEP_SUMMARY");
 }
