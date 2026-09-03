@@ -1081,14 +1081,59 @@ impl<'m> Gen<'m> {
                 if let Some((base, k, terms)) =
                     self.resolved.get(&ssa_key(self.cur_func, r)).cloned()
                 {
-                    // The shapes below read the base's two bytes as a runtime
-                    // address. A pointer param's slot holds one, and so does a
-                    // runtime-address slot (`Base::Slot(_, true)`, an IntToPtr
-                    // or const-arm pointer select dst): its bytes ARE the
-                    // address, so reading them plus k/terms is the pointer
-                    // value. A global's or an alloca's address is a link-time
-                    // constant that would need a literal materialization, so
-                    // those stay loud panics.
+                    // The shapes below read the base's two bytes as a
+                    // runtime address (a pointer param's slot, or an
+                    // IntToPtr-dst slot). An alloca's address has no
+                    // link-time literal, so that stays a loud panic.
+                    // `Base::Global` is a real link-time constant: ipsccp
+                    // (epic-cc#193) can propagate a global into a pointer
+                    // param, resolving here to `Base::Global`, materialized
+                    // below like `emit_move_addr_to_slot`'s own arm.
+                    if let Base::Global(name) = &base {
+                        let addr = self.global_addr(name).wrapping_add(k as u16);
+                        let lo = (addr & 0xFF) as u8;
+                        let hi = ((addr >> 8) & 0xFF) as u8;
+                        match terms.as_slice() {
+                            [] => {
+                                self.emit(format!(
+                                    "    MOVLW 0x{:02X}",
+                                    if idx == 0 { lo } else { hi }
+                                ));
+                            }
+                            [(1, reg)] => {
+                                let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                                if idx == 0 {
+                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
+                                    self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                                } else {
+                                    self.emit(format!("    MOVLW 0x{hi:02X}"));
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                }
+                            }
+                            _ => {
+                                assert!(
+                                    terms.len() == 2 && terms.iter().all(|(sc, _)| *sc == 1),
+                                    "isel: multi-term GEP load with {terms:?} not supported"
+                                );
+                                let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
+                                let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
+                                if idx == 0 {
+                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
+                                    self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
+                                    self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
+                                } else {
+                                    self.emit(format!("    MOVLW 0x{hi:02X}"));
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
+                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
+                                }
+                            }
+                        }
+                        return;
+                    }
                     let sa = match &base {
                         Base::Slot(sname, indirect) => {
                             assert!(

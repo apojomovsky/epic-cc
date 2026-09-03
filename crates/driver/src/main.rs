@@ -17,7 +17,7 @@ use driver::clang;
 use driver::clang_discovery;
 use driver::cli;
 
-use clang_discovery::{resolve_clang, resolve_llvm_link};
+use clang_discovery::{resolve_clang, resolve_llvm_link, resolve_opt};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -86,6 +86,13 @@ fn main() {
         }
     };
     let llvm_link = match resolve_llvm_link(&clang) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("epic-cc: {msg}");
+            std::process::exit(1);
+        }
+    };
+    let opt_bin = match resolve_opt(&clang) {
         Ok(p) => p,
         Err(msg) => {
             eprintln!("epic-cc: {msg}");
@@ -237,8 +244,23 @@ fn main() {
         std::process::exit(1);
     }
 
-    let ll_text =
-        irparse::sanitize_symbols(&std::fs::read_to_string(&merged_path).expect("read merged .ll"));
+    // 2.5. Whole-program cleanup: each TU's clang invocation cannot see the
+    // rest of the call graph, so a call site's constant argument survives
+    // raw into every TU's own .ll. Now that llvm-link has merged the
+    // program into one module, run the curated pass list over it
+    // (driver::wholeprog_opt) before anything else reads the IR. See
+    // crates/driver/src/wholeprog_opt.rs for the pass list and why it
+    // preserves the overlay allocator's frame boundaries.
+    let opt_path = tmp.join("merged_opt.ll");
+    let merged_ll_text = match driver::wholeprog_opt::run(&opt_bin, &merged_path, &opt_path) {
+        Ok(text) => text,
+        Err(msg) => {
+            eprintln!("epic-cc: whole-program opt: {msg}");
+            std::process::exit(1);
+        }
+    };
+
+    let ll_text = irparse::sanitize_symbols(&merged_ll_text);
     let canonical_spec = ll_text
         .find("section \".epiccfg.")
         .map(|i| &ll_text[i + "section \".epiccfg.".len()..])

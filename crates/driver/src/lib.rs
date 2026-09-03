@@ -18,4 +18,5 @@ pub mod stdio_h;
 pub mod stdlib_h;
 pub mod string_c;
 pub mod string_h;
+pub mod wholeprog_opt;
 pub mod xc_h;

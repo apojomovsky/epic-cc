@@ -2422,11 +2422,23 @@ pub fn parse_ll(src: &str) -> Module {
                         }
                         continue;
                     }
-                    // clang attaches a `, !dbg !N` location to the naked
-                    // function's trailing `unreachable` under
-                    // `-gline-tables-only`; it stays a terminator, not an
-                    // opcode.
+                    // clang attaches `, !dbg !N` to a naked function's
+                    // trailing `unreachable`; it stays a terminator, not an
+                    // opcode. `wholeprog_opt` (epic-cc#193) can now also
+                    // synthesize a bare `unreachable` block for an ordinary
+                    // function, and isel needs a real terminator there. LLVM
+                    // guarantees such a block is never entered at runtime,
+                    // so a self-branch closes it safely, except `naked`,
+                    // whose isel requires a pure-asm body and stays dropped.
                     if l == "unreachable" || l.starts_with("unreachable, !") {
+                        if !naked {
+                            let here = blocks.last().unwrap().label.clone();
+                            blocks
+                                .last_mut()
+                                .unwrap()
+                                .insts
+                                .push(Inst::Br(Br { target: here }));
+                        }
                         if has_trailing_brace {
                             break;
                         }

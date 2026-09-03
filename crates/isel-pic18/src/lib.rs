@@ -437,6 +437,49 @@ impl<'m> Gen<'m> {
                     .get(&iselcore::ssa_key(self.cur_func, r))
                     .cloned()
                     .unwrap();
+                // A global's address is a link-time constant. ipsccp
+                // (epic-cc#193) can propagate a global argument into a
+                // helper's pointer parameter, so a GEP over it resolves
+                // here to `Base::Global`, not a slot. Its base bytes are
+                // literals (`MOVLW`), not a `MOVF` read, so it needs its
+                // own arm, mirroring `emit_move_addr_to_slot`'s above plus
+                // the slot case's k/terms folding.
+                if let iselcore::Base::Global(name) = &base {
+                    assert!(
+                        k == 0 || terms.is_empty(),
+                        "isel-pic18: GEP with both k and terms not supported in move"
+                    );
+                    let addr = self.global_addr(name).wrapping_add(k as u16);
+                    for i in 0..ty.bytes() {
+                        let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
+                        match terms.as_slice() {
+                            [] => {
+                                self.emit(format!("    MOVLW 0x{byte:02X}"));
+                            }
+                            [(1, reg)] => {
+                                let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
+                                let ra_i = ra + u16::from(i);
+                                let (ra_a, ra_f) = self.operand(ra_i);
+                                let ra_bank = if ra_a == 0 { "A" } else { "B" };
+                                self.emit(format!("    MOVLW 0x{byte:02X}"));
+                                if i == 0 {
+                                    self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                                } else {
+                                    self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                    self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                                }
+                            }
+                            _ => panic!(
+                                "isel-pic18: multi-term GEP move with {terms:?} not supported"
+                            ),
+                        }
+                        let (a, f) = self.operand(dst + u16::from(i));
+                        let bank = if a == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    }
+                    return;
+                }
                 let sa = match &base {
                     iselcore::Base::Slot(sname, indirect) => {
                         let holds_addr = if *indirect {
