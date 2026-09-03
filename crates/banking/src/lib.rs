@@ -15,8 +15,30 @@
 /// bank is not reliable); the next banked operand after a reset emits a FULL
 /// `BANKSEL` that re-establishes both RP bits. Between labels the tracking
 /// still removes redundant switches on straight-line code. A CALL to a
-/// callee whose exit bank is provable (issue #13) keeps tracking that bank
-/// instead of resetting.
+/// callee whose exit bank is provable (issue #13 item 2) keeps tracking that
+/// bank instead of resetting; a label whose incoming bank is provable across
+/// every path that can reach it (issue #13 item 4, `label_provable_banks`)
+/// does the same, symmetric to item 2 but for branch targets instead of
+/// CALL sites. Sound only because every control transfer in this
+/// compiler's own output is a plain, textually-visible `GOTO`/`CALL <name>`:
+/// an indirect call site lowers to a linear chain of direct `CALL`s
+/// against a finite candidate set (`isel::emit_indirect_call`), never a
+/// computed jump, and the compiler's one computed jump (`MOVWF PCL`, a
+/// `.table` byte-table reader) never targets a named label, so a label's
+/// predecessor set is always fully discoverable by scanning for `GOTO`/
+/// `CALL` references to its name (defensively, a region containing that
+/// computed jump is excluded from item 4 entirely regardless).
+///
+/// Measured on `hal-pic16-encoder-full` (epic-cc#210): item 4 eliminates 18
+/// label resets (36 fewer words of raw `BANKSEL` instructions), but the
+/// fixture's final flash-word count is unchanged:
+/// every one of those savings lands before a later `.table`'s `.align 256`
+/// padding (`crates/asm/src/lib.rs`), which rounds up to the same absolute
+/// address regardless of how much slack precedes it. The savings are real
+/// (verified directly against `asm::assemble_words`, not just instruction
+/// count) and would show up as a smaller program on any layout where they
+/// don't fall inside such a padding gap; they just don't on this specific
+/// fixture's specific table layout.
 ///
 /// `BANKSEL <n>` selects bank `n` by setting/clearing the two RP bits of
 /// `STATUS` (RP0 = bit 5, RP1 = bit 6); only the bits that change are
@@ -179,6 +201,11 @@ fn function_regions(asm: &str) -> (HashSet<String>, HashMap<String, Vec<&str>>) 
 /// not provable. Memoized on `(func, entry)`; the call graph is a DAG
 /// (recursion is rejected by `callgraph::check_depth`), so the recursion
 /// through `walk_region` terminates.
+///
+/// `labels`, when given, also collects the join of every incoming bank
+/// state this walk observes at each of `func`'s own internal labels (see
+/// `walk_region`), used by the issue #13 item 4 label analysis; pass an
+/// empty scratch map when only the exit bank is wanted.
 fn func_exit_bank(
     device: &Device,
     func: &str,
@@ -186,6 +213,7 @@ fn func_exit_bank(
     call_targets: &HashSet<String>,
     regions: &HashMap<String, Vec<&str>>,
     memo: &mut HashMap<(String, BankSet), BankSet>,
+    labels: &mut HashMap<String, BankSet>,
 ) -> BankSet {
     if let Some(&v) = memo.get(&(func.to_string(), entry)) {
         return v;
@@ -194,7 +222,7 @@ fn func_exit_bank(
         // No region (not a CALL target / not in the text): conservative.
         return BankSet::UNKNOWN;
     };
-    let v = walk_region(device, region, entry, call_targets, regions, memo);
+    let v = walk_region(device, region, entry, call_targets, regions, memo, labels);
     memo.insert((func.to_string(), entry), v);
     v
 }
@@ -206,6 +234,12 @@ fn func_exit_bank(
 /// a skip op (BTFSC/BTFSS/INCFSZ/DECFSZ) forks into both paths, a GOTO
 /// jumps, and RETURN/RETLW/RETFIE record an exit. A path that falls off the
 /// region's end without returning is not a provable exit (UNKNOWN).
+///
+/// Every time the walk reaches one of `region`'s own labels, it joins the
+/// arriving `banks` into `labels[name]` (issue #13 item 4). A label's
+/// incoming bank is provable when this join, across every walk that ever
+/// reaches it (including transitively, through a CALL into another
+/// region), stays a single bank.
 fn walk_region(
     device: &Device,
     region: &[&str],
@@ -213,6 +247,7 @@ fn walk_region(
     call_targets: &HashSet<String>,
     regions: &HashMap<String, Vec<&str>>,
     memo: &mut HashMap<(String, BankSet), BankSet>,
+    labels: &mut HashMap<String, BankSet>,
 ) -> BankSet {
     let mut label_idx: HashMap<String, usize> = HashMap::new();
     for (i, line) in region.iter().enumerate() {
@@ -268,6 +303,9 @@ fn walk_region(
             continue;
         };
         if mne.ends_with(':') {
+            let name = mne.trim_end_matches(':');
+            let joined = labels.get(name).copied().unwrap_or(BankSet(0)).join(banks);
+            labels.insert(name.to_string(), joined);
             work.push((i + 1, banks));
             continue;
         }
@@ -293,7 +331,7 @@ fn walk_region(
         if mne == "CALL" {
             if let Some(target) = toks.get(1) {
                 let callee = target.trim_end_matches([',', ';', ')']);
-                let eb = func_exit_bank(device, callee, banks, call_targets, regions, memo);
+                let eb = func_exit_bank(device, callee, banks, call_targets, regions, memo, labels);
                 work.push((i + 1, eb));
             }
             continue;
@@ -371,6 +409,59 @@ fn is_bank0_only(device: &Device, asm: &str) -> bool {
     true
 }
 
+/// True when `region` contains a computed jump (`MOVWF PCL`, isel's
+/// `.table`-directive-demarcated `RETLW` byte-table reader). Such a jump's
+/// target is a runtime-computed offset into the table, never a textual
+/// `GOTO`/`CALL <label>` reference, so it is invisible to the label
+/// analysis below by construction: every predecessor the walk finds for a
+/// label is therefore exhaustive, *unless* the table's landing offsets
+/// could ever coincide with a real branch-target label sharing the same
+/// region. Nothing in this codebase's table layout does that, but the
+/// check costs little and removes the need to prove it never will:
+/// disqualify the whole region defensively rather than reason it through.
+fn region_has_computed_jump(region: &[&str]) -> bool {
+    region.iter().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("MOVWF PCL") || t.starts_with(".table")
+    })
+}
+
+/// Issue #13 item 4: the join of every incoming bank state `walk_region`
+/// observes at each label in `regions`, entered with the fully unknown
+/// symbolic set (safe regardless of which bank any real caller happens to
+/// be in, a caller-independent invariant of the callee's own
+/// control flow, not a fact about any one call site). A CALL made during
+/// one region's walk recurses into the callee's own region and keeps
+/// accumulating into the same map, so a label's entry here already
+/// reflects every reachable path, including cross-function ones.
+///
+/// Skips any region `region_has_computed_jump` flags; such a region's
+/// labels are simply absent from the result and keep today's behavior
+/// (always reset).
+fn label_provable_banks(
+    device: &Device,
+    call_targets: &HashSet<String>,
+    regions: &HashMap<String, Vec<&str>>,
+    memo: &mut HashMap<(String, BankSet), BankSet>,
+) -> HashMap<String, BankSet> {
+    let mut labels: HashMap<String, BankSet> = HashMap::new();
+    for region in regions.values() {
+        if region_has_computed_jump(region) {
+            continue;
+        }
+        walk_region(
+            device,
+            region,
+            BankSet::UNKNOWN,
+            call_targets,
+            regions,
+            memo,
+            &mut labels,
+        );
+    }
+    labels
+}
+
 /// Insert `BANKSEL` before file-register operands whose bank differs from the
 /// tracked current bank — or whenever the tracked bank is unknown (just after
 /// a label) — and rewrite banked operands to `physical & 0x7F`.
@@ -390,6 +481,18 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
     // and joins every path's exit; a single-bank join is provable.
     let (call_targets, regions) = function_regions(asm);
     let mut exit_memo: HashMap<(String, BankSet), BankSet> = HashMap::new();
+    // Issue #13 item 4: a label's incoming bank is provable when every path
+    // that can reach it agrees, regardless of caller, see
+    // `label_provable_banks`. Computed once, up front, over the whole
+    // program: a label's provable predecessors can appear anywhere in the
+    // text (a caller's CALL site may come before or after the callee's own
+    // definition), so this can't be folded into the single linear scan
+    // below the way the CALL-exit-bank check (item 2) is.
+    let label_bank = label_provable_banks(device, &call_targets, &regions, &mut exit_memo);
+    // Scratch sink for `func_exit_bank`'s label-accumulation output below:
+    // this call site only wants the exit bank, `label_bank` above already
+    // has the complete, whole-program label analysis.
+    let mut scratch_labels: HashMap<String, BankSet> = HashMap::new();
     let mut out = String::new();
     let mut known = true; // false = the tracked bank is unknown (entered at a branch target)
     let mut rp0 = false; // STATUS, bit 5
@@ -432,10 +535,25 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
         // it; the next banked operand (when the needed bank is unknown) gets
         // a FULL BANKSEL that re-establishes both RP bits. In a bank-0-only
         // program the bank provably stays 0, so the reset is skipped.
+        // Issue #13 item 4: when every path that can reach this label
+        // agrees on a single bank (`label_bank`, computed up front over the
+        // whole program), the tracked bank becomes that bank instead,
+        // same shape as item 2's CALL-exit-bank carry-through.
         if mne.ends_with(':') {
-            // In a bank-0-only program the bank provably stays 0, so the
-            // reset is skipped (the tracked bank remains known).
-            known = bank0_only;
+            let name = mne.trim_end_matches(':');
+            match label_bank.get(name) {
+                Some(bs) if bs.is_single() => {
+                    known = true;
+                    rp0 = bs.single_bank() & 1 == 1;
+                    rp1 = bs.single_bank() & 2 == 2;
+                }
+                _ => {
+                    // In a bank-0-only program the bank provably stays 0,
+                    // so the reset is skipped (the tracked bank remains
+                    // known).
+                    known = bank0_only;
+                }
+            }
             out.push_str(line);
             out.push('\n');
             continue;
@@ -458,8 +576,15 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
             } else if let Some(target) = toks.get(1) {
                 let callee = target.trim_end_matches([',', ';', ')']);
                 let cur = BankSet::single(u8::from(rp0) | (u8::from(rp1) << 1));
-                let eb =
-                    func_exit_bank(device, callee, cur, &call_targets, &regions, &mut exit_memo);
+                let eb = func_exit_bank(
+                    device,
+                    callee,
+                    cur,
+                    &call_targets,
+                    &regions,
+                    &mut exit_memo,
+                    &mut scratch_labels,
+                );
                 if eb.is_single() {
                     known = true;
                     rp0 = eb.single_bank() & 1 == 1;
