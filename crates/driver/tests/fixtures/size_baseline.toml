@@ -1,0 +1,34 @@
+# epic-cc#200 size-regression baseline. Do not hand-edit the
+# numbers; regenerate with:
+#   UPDATE_SIZE_BASELINE=1 cargo test -p driver --test size_regression_e2e
+# then diff and commit deliberately.
+
+[[entry]]
+name = "add-16f877a"
+device = "16F877A"
+flash_words = 13
+ram_bytes = 9
+
+[[entry]]
+name = "add-18f4550"
+device = "18F4550"
+flash_words = 13
+ram_bytes = 8
+
+[[entry]]
+name = "hal-pic16-blink-16f877a"
+device = "16F877A"
+flash_words = 690
+ram_bytes = 59
+
+[[entry]]
+name = "hal-pic18-blink-18f4550"
+device = "18F4550"
+flash_words = 459
+ram_bytes = 34
+
+[[entry]]
+name = "hal-pic16-encoder-full-16f877a"
+device = "16F877A"
+flash_words = 7519
+ram_bytes = 350
