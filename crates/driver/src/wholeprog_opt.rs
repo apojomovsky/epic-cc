@@ -59,14 +59,17 @@
 //! Two further, independent fixes stack on top of that baseline
 //! (epic-cc#205/#206): consolidating `printf`'s per-call-site literal
 //! staging buffer into one shared buffer (apojomovsky/epic-hal#123/#124)
-//! took the full example to 7327 words / 332 bytes RAM; adding the
-//! always-inline pass above on top of that takes it to 7240 words / 329
-//! bytes RAM. The always-inline pass alone (no buffer fix in play) also
-//! measurably helps the plain `hal-pic16-blink` example: 690 -> 652 words,
-//! 59 -> 47 bytes RAM. Note this does **not** close epic-cc#205's
-//! deepest-call-chain finding by itself: that chain's critical hop folds
-//! into `main`, which `always_inline_candidates` deliberately excludes by
-//! design (see above); closing that hop is the deferred `-O2` tier's job.
+//! took the full example to 7327 words / 332 bytes RAM (call depth still
+//! 8/8, the device's hard limit); adding the always-inline pass above on
+//! top of that takes it to 7240 words / 329 bytes RAM and, measured via
+//! `callgraph::build`'s own `max_depth`, drops call depth to **6/8**, two
+//! levels of margin recovered. This pass never inlines into `main` or an
+//! ISR by design, so that is not one big fold shortening the chain's
+//! `main`-adjacent hop; it is many small ordinary-caller folds each
+//! shortening one link, which compounds along chains that pass through
+//! several of them. The always-inline pass alone (no buffer fix in play)
+//! also measurably helps the plain `hal-pic16-blink` example: 690 -> 652
+//! words, 59 -> 47 bytes RAM.
 
 use std::path::Path;
 use std::process::Command;
