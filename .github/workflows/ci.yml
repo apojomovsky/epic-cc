@@ -47,6 +47,7 @@ jobs:
         with:
           repository: apojomovsky/epic-tasks
           path: epic-tasks
+          token: ${{ secrets.EPIC_TASKS_TOKEN }}
 
       - name: Lint added comment blocks
         run: python3 epic-tasks/epic-tasks prose --verify
