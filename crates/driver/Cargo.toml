@@ -20,6 +20,8 @@ asm = { path = "../asm" }
 
 [dev-dependencies]
 pic14-sim = { path = "../sim" }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
 
 [[bin]]
 name = "epic-cc"
