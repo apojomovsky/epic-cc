@@ -333,18 +333,13 @@ fn mark_always_inline(ll_text: &str, candidates: &[String]) -> String {
                     .map(|o| name_start + o)
                     .unwrap_or(line.len());
                 if set.contains(&line[name_start..name_end]) {
-                    // `local_unnamed_addr`/`unnamed_addr` must immediately
-                    // follow the parameter list (a fixed LLVM IR keyword
-                    // position), so this can't insert right after `)`.
-                    // Metadata attachments (` !dbg !9`, ` !prof !3`, ...)
-                    // must in turn be the last thing before the opening
-                    // `{`, so a bare attribute keyword inserted after one
-                    // breaks parsing (`opt`: "expected '{' in function
-                    // body", verified against a real clang-emitted
-                    // `!dbg`-carrying `define` line). Insert right before
-                    // the first metadata attachment instead, when the line
-                    // has one; otherwise right before the brace, which is
-                    // always a valid function-attribute position.
+                    // `local_unnamed_addr` has a fixed position right after
+                    // the parameter list, and metadata (` !dbg !9`, ...)
+                    // must be the last thing before `{`, so insert right
+                    // before the first metadata attachment (else right
+                    // before the brace): verified against a real
+                    // clang-emitted `!dbg`-carrying line, `opt` otherwise
+                    // errors "expected '{' in function body".
                     if let Some(brace) = line.rfind('{') {
                         let head = &line[..brace];
                         let insert_at = head
