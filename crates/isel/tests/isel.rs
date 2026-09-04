@@ -1709,7 +1709,10 @@ fn separate_latch_back_edge_cross_referencing_phis_simulates() {
 
 #[test]
 fn and_i8_uses_andwf_andlw() {
-    // reg-reg: MOVF b,W; ANDWF a,W; MOVWF d. reg-const: MOVF a,W; ANDLW k.
+    // reg-reg: ANDWF a,W; MOVWF d (b's own reload is elided: epic-cc#217
+    // wires emit_commutative through the W-tracking cache #214 established,
+    // and b's value is still in W from its own immediately preceding
+    // store). reg-const: MOVF a,W; ANDLW k.
     let m = parse(
         "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = and i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = and i8 %a, 5\n    store i8 %r2 @o2\n    ret void\n",
     );
@@ -1726,11 +1729,17 @@ fn and_i8_uses_andwf_andlw() {
         ("main::r2", 0x2A),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // reg-reg: %a=0x27, %b=0x28, %r1=0x29.
-    assert!(asm.contains("MOVF 0x28, W"), "load b:\n{asm}");
+    // reg-reg: %a=0x27, %b=0x28, %r1=0x29. b's reload is elided: its value
+    // is already in W from the immediately preceding `%b = load i8 @y`.
+    assert!(
+        !asm.contains("MOVF 0x28, W"),
+        "b's reload should be elided:\n{asm}"
+    );
     assert!(asm.contains("ANDWF 0x27, W"), "a & b:\n{asm}");
     assert!(asm.contains("MOVWF 0x29"), "store d1:\n{asm}");
-    // reg-const: %a=0x27, %r2=0x2A.
+    // reg-const: %a=0x27, %r2=0x2A. a's reload is not elided here: a
+    // global store to @o1 sits between it and a's own last load.
+    assert!(asm.contains("MOVF 0x27, W"), "reload a:\n{asm}");
     assert!(asm.contains("ANDLW 0x05"), "a & 5:\n{asm}");
     assert!(asm.contains("MOVWF 0x2A"), "store d2:\n{asm}");
 }
@@ -4915,13 +4924,13 @@ fn single_table_elision_drift_folded_by_window_align() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // The elision drift is real: the reader sits at the post-elision
-    // position (0x7F5), not the pass-A 0x7FA. (epic-cc#214 shifted this by
-    // one further word: a redundant store+immediate-reload of an SSA
-    // value already in W, elided in main/h0 ahead of the reader, same
-    // drift mechanism this test exercises, just one word more of it.)
+    // position (0x7F4), not the pass-A 0x7FA. (epic-cc#214 shifted this by
+    // one word, epic-cc#217 by one more: h0's `xor i8 %x, %x` now elides
+    // its own redundant reload too, same drift mechanism this test
+    // exercises, just one word more of it.)
     assert_eq!(
         label_addr(&asm, "__read_t"),
-        0x7F5,
+        0x7F4,
         "reader at the post-elision start:\n{asm}"
     );
     assert!(
