@@ -182,12 +182,13 @@ struct Gen<'m> {
     /// materializes a value to its slot, then whatever consumes it next
     /// independently reloads the same slot, not knowing it never left W).
     /// Wired at `Inst::Load`'s own store to its result's slot,
-    /// `emit_load_byte`'s ordinary-register read, and
-    /// `emit_move_val_to_slot`'s store: `dst` there is always this SSA
-    /// value's own private slot, never the address actually read/written
-    /// (a real SFR access, when the source is one, stays a plain,
-    /// untracked `emit`; a global's own value is read fresh every time,
-    /// only the *result*'s slot is ever cached), so this is sound even
+    /// `emit_load_byte`'s ordinary-register read, `emit_move_val_to_slot`'s
+    /// store, and `emit_commutative`'s (epic-cc#217) register-operand
+    /// reload and result store: `dst`/the reloaded register operand are
+    /// always this SSA value's own private slot, never the address actually
+    /// read/written (a real SFR access, when the source is one, stays a
+    /// plain, untracked `emit`; a global's own value is read fresh every
+    /// time, only the *result*'s slot is ever cached), so this is sound even
     /// when the source is genuinely volatile or interrupt-shared. Plain
     /// `emit` unconditionally clears it, so every other call site is safe
     /// by construction: a stale belief can only survive between two
@@ -1771,17 +1772,17 @@ impl<'m> Gen<'m> {
             Val::Reg(rb) => {
                 let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 for i in 0..n {
-                    self.emit(format!("    MOVF 0x{:02X}, W", bb + u16::from(i)));
+                    self.emit_w_load(bb + u16::from(i));
                     self.emit(format!("    {op} 0x{:02X}, W", ra + u16::from(i)));
-                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                    self.emit_w_store(dst + u16::from(i));
                 }
             }
             Val::Const(k) => {
                 for i in 0..n {
                     let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-                    self.emit(format!("    MOVF 0x{:02X}, W", ra + u16::from(i)));
+                    self.emit_w_load(ra + u16::from(i));
                     self.emit(format!("    {opw} 0x{byte:02X}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+                    self.emit_w_store(dst + u16::from(i));
                 }
             }
             Val::Global(_) => panic!("isel: {op} with a global operand"),
