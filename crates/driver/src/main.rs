@@ -331,10 +331,13 @@ fn main() {
 
     let asm = match device.core {
         device::Core::Pic14 => {
-            // 8-9. banking -> peephole (PIC14 only — PIC18's encoder
-            // already emits its own access/BSR bits and needs no
-            // BANKSEL-equivalent post-pass; no PCLATH exists to elide
-            // either, so peephole has nothing to do for PIC18).
+            // 8-9. schedule -> banking -> peephole, PIC14 only: PIC18's
+            // encoder emits its own access/BSR bits and has no PCLATH, so
+            // neither pass has anything to do for PIC18. schedule
+            // (ADR-027, epic-cc#210) runs before banking so it sees
+            // isel's raw instruction order before banking turns bank
+            // demand into BANKSEL text; phase 1 is an identity transform.
+            let asm = schedule::schedule(device, &asm);
             let asm = banking::assign_banks(device, &asm);
             let asm = peephole::optimize(&asm);
 
