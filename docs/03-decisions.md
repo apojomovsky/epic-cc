@@ -25,6 +25,7 @@ one-line index entry here, e.g.:
 - ADR-024: Cross-context stored callbacks (store in main, invoke in the ISR: global store/load visibility edges, `_isr` store rewrite, opaque-store trap), 2026-08-25
 - ADR-025: Size and map reporting (stderr size report, --map file, overlay RAM definition), 2026-08-26
 - ADR-026: PIC18 struct ABI is XC8 byte alignment (`-fpack-struct` for PIC18, irparse reads packed `<{ ... }>` types; PIC14 unchanged), 2026-08-28
+- ADR-027: Bank-aware instruction scheduler: a new `schedule` pass between isel and banking, phase 1 scoped to a single hand-verified reorder shape, 2026-09-04
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 
