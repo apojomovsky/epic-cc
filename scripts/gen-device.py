@@ -24,6 +24,20 @@ Alias table: normalises DFP names to our EPIC_CONFIG names.
 
 Determinism: fields sorted by byte_offset then shift, values by bits.
 The generator is stdlib only (python 3.11+, no deps) per epic-tasks rule.
+
+PIC18 config fields come from the EDC file's own `DCRDef`/`DCRFieldDef`/
+`DCRFieldSemantic` structure directly (see `parse_edc_dcr_fields`), not
+from `.cfgdata`: each `DCRDef` is already one real config byte, unlike
+PIC14's word-oriented `.cfgdata` shape.
+
+CAUTION, confirmed on `Microchip.PIC18Fxxxx_DFP` 1.8.178: this pack's EDC
+`GPRDataSector` data for at least PIC18F2550 and PIC18F4550 lists only
+`gpr0`-`gpr3` (0x60-0x400, 1024 bytes), while gputils' own linker scripts
+(`/usr/local/share/gputils/lkr/18f{2550,4550}_g.lkr`) and the datasheet
+agree both parts have `gpr0`-`gpr7` (0x60-0x800, 2048 bytes). The DFP pack
+itself can understate RAM; `ram_banks` from an `--atdf` run must be cross-
+checked against gputils (`crates/device/tests/gputils_crosscheck.rs`,
+ADR-021) before being trusted, the same way every device already is.
 """
 
 import argparse
@@ -258,6 +272,96 @@ class MissingFacts(Exception):
     memory map carrying a real sha256 is worse than no generator at all."""
 
 
+def merge_contiguous(ranges):
+    """Collapse adjacent (lo, hi) ranges (hi + 1 == next lo) into one span.
+    A bank-organized GPR map (gpr0, gpr1, ...) is one physical span with no
+    gaps; the schema wants the merged form, matching the hand-transcribed
+    TOMLs (`p18f4550.toml`'s single `ram_banks` entry)."""
+    if not ranges:
+        return []
+    ranges = sorted(ranges)
+    merged = [ranges[0]]
+    for lo, hi in ranges[1:]:
+        mlo, mhi = merged[-1]
+        if lo == mhi + 1:
+            merged[-1] = (mlo, hi)
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def parse_edc_dcr_fields(cfs_el, ns: str):
+    """Extract per-byte PIC18 config fields directly from `DCRDef`/
+    `DCRFieldDef`/`DCRFieldSemantic`, the same EDC elements gputils and XC8
+    themselves read. Each `DCRDef` is one real config byte (`_addr`), not a
+    16-bit word like PIC14's `.cfgdata` shape, so this bypasses the
+    word/`cfgdata` pipeline entirely rather than force-fitting it.
+
+    Bit position within a byte comes from `AdjustPoint`, whose `offset`
+    means "skip this many reserved bits before the next field", not an
+    absolute position: a byte's fields and `AdjustPoint`s are walked in
+    document order with a running cursor. This is verified per byte against
+    the DCRDef's own `impl` bitmask (the union of every field's bit range,
+    including hidden/reserved ones, must equal `impl` exactly); a mismatch
+    means the cursor math is wrong for that byte and is a hard failure, not
+    a best-effort guess.
+
+    Returns `(base_addr, num_bytes, fields)`, `fields` a list of raw dicts
+    (`raw_name`, `byte_offset`, `mask`, `shift`, `values`), unaliased.
+    """
+    dcrs = cfs_el.findall(ns + "DCRDef")
+    if not dcrs:
+        return None
+    addrs = [int(d.get(ns + "_addr"), 0) for d in dcrs]
+    base = min(addrs)
+    fields = []
+    for dcr in dcrs:
+        addr = int(dcr.get(ns + "_addr"), 0)
+        impl = int(dcr.get(ns + "impl"), 0)
+        modelist = dcr.find(ns + "DCRModeList")
+        mode = modelist.find(ns + "DCRMode") if modelist is not None else None
+        if mode is None:
+            continue
+        cursor = 0
+        covered = 0
+        for child in mode:
+            tag = child.tag[len(ns):] if child.tag.startswith(ns) else child.tag
+            if tag == "AdjustPoint":
+                cursor += int(child.get(ns + "offset"), 0)
+            elif tag == "DCRFieldDef":
+                mask = int(child.get(ns + "mask"), 0)
+                width = bin(mask).count("1")
+                covered |= ((1 << width) - 1) << cursor
+                hidden = (
+                    child.get(ns + "ishidden") == "true"
+                    or child.get(ns + "islanghidden") == "true"
+                )
+                if not hidden:
+                    values = []
+                    for sem in child.findall(ns + "DCRFieldSemantic"):
+                        when = sem.get(ns + "when") or ""
+                        m = re.search(r"==\s*(0x[0-9a-fA-F]+|\d+)", when)
+                        if m:
+                            values.append((sem.get(ns + "cname"), int(m.group(1), 0)))
+                    if values:
+                        fields.append({
+                            "raw_name": child.get(ns + "name"),
+                            "byte_offset": addr - base,
+                            "mask": ((1 << width) - 1) << cursor,
+                            "shift": cursor,
+                            "values": values,
+                        })
+                cursor += width
+        if covered != impl:
+            raise MissingFacts([
+                f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): field bit "
+                f"layout 0x{covered:02x} does not match its own impl "
+                f"0x{impl:02x}, the AdjustPoint/DCRFieldDef walk is wrong "
+                f"for this byte"
+            ])
+    return base, max(addrs) - base + 1, fields
+
+
 def parse_edc(edc_path: pathlib.Path):
     # Only what the XML actually states. An absent key stays absent so the
     # caller can name it in the failure instead of substituting a number.
@@ -287,22 +391,53 @@ def parse_edc(edc_path: pathlib.Path):
             cfg.append((int(b, 0), int(e, 0)))
     if cfg:
         out["config_sectors"] = cfg
+        # DCRDef/DCRFieldDef give real per-byte fields; only the first
+        # ConfigFuseSector needs it; a device with more than one would be
+        # a new fact to name, not silently ignore.
+        dcr = parse_edc_dcr_fields(next(root.iter(ns + "ConfigFuseSector")), ns)
+        if dcr is not None:
+            out["config_dcr"] = dcr
     # EDC endaddr is exclusive. A GPR sector that another sector shadows is
     # the bank-independent window; the shadows are mirrors, not extra storage.
+    # PIC18 states the same low window twice more, once per instruction-set
+    # mode (`TraditionalModeOnly` is the access bank we compile for; classic
+    # mode never sets `xinst`, so `ExtendedModeOnly`'s copy is for a mode
+    # this compiler does not target and must not contribute a bank at all).
+    parent_of = {child: parent for parent in root.iter() for child in parent}
+
+    def mode_ancestor(el):
+        cur = el
+        while cur in parent_of:
+            cur = parent_of[cur]
+            tag = cur.tag[len(ns):] if cur.tag.startswith(ns) else cur.tag
+            if tag in ("TraditionalModeOnly", "ExtendedModeOnly", "RegardlessOfMode"):
+                return tag
+        return None
+
     sectors = []
     shadowed = set()
+    access = []
     for gs in root.iter(ns + "GPRDataSector"):
+        if mode_ancestor(gs) == "ExtendedModeOnly":
+            continue
         b = gs.get(ns + "beginaddr")
         e = gs.get(ns + "endaddr")
         if not (b and e):
+            continue
+        if mode_ancestor(gs) == "TraditionalModeOnly":
+            access.append((int(b, 0), int(e, 0) - 1))
             continue
         ref = gs.get(ns + "shadowidref")
         if ref:
             shadowed.add(ref)
             continue
         sectors.append((int(b, 0), int(e, 0) - 1, gs.get(ns + "regionid")))
+    if access:
+        out["access_bank"] = sorted(access)[0]
     if sectors:
-        out["ram_banks"] = sorted((lo, hi) for lo, hi, rid in sectors if rid not in shadowed)
+        out["ram_banks"] = merge_contiguous(
+            [(lo, hi) for lo, hi, rid in sectors if rid not in shadowed]
+        )
         common = sorted((lo, hi) for lo, hi, rid in sectors if rid in shadowed)
         if common:
             out["common_ram"] = common[0]
@@ -374,11 +509,17 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         int(stack_s, 0) if stack_s and re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", stack_s) else None,
     )
     cfg_cwords = []
+    dcr_result = edc.get("config_dcr") if core == "pic18" else None
     if cfg_path and cfg_path.exists():
         cwords_all = parse_cfgdata(cfg_path)
         cfg_cwords = [c for c in cwords_all if c["name"].upper().startswith("CONFIG")]
     cfg_span = None
-    if not cfg_cwords:
+    # PIC18's EDC ConfigFuseSector is already byte-addressed (one DCRDef per
+    # real config byte); PIC14's is word-addressed (one CWORD per flash
+    # word), same as ini/cfgdata. This only matters for the address-range-only
+    # fallback below: the DCR path (the common case) never goes through it.
+    cfg_span_is_bytes = False
+    if not cfg_cwords and dcr_result is None:
         cfg_range = scalar("CONFIG")
         if cfg_range:
             lo_s, _, hi_s = cfg_range.partition("-")
@@ -386,13 +527,21 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         elif edc.get("config_sectors"):
             lo = min(b for b, _ in edc["config_sectors"])
             cfg_span = (lo, max(e for _, e in edc["config_sectors"]) - 1)
+            cfg_span_is_bytes = core == "pic18"
         else:
             missing.append("config words (cfgdata, ini CONFIG or EDC ConfigFuseSector)")
     if missing:
         raise MissingFacts(missing)
+    access_bank = edc.get("access_bank") if core == "pic18" else None
+    # Not a hardware fact (see `Device::fixed_retval`'s doc comment): a
+    # compiler-policy reservation for `retval_lo`/ISR spill inside the access
+    # bank, identical on every classic PIC18 part because the access bank
+    # itself always starts at 0 on this core.
+    fixed_retval = (0x0000, 0x000F) if access_bank is not None else None
     if cfg_span is not None:
-        # No per-fuse table, so only the word range is known. The erased value
-        # is a core fact (PIC14 words read all ones in 14 bits), not per-part.
+        # No per-fuse table, so only the address range is known. The erased
+        # value is a core fact (PIC14 words read all ones in 14 bits, PIC18
+        # bytes read 0xFF), not per-part.
         erased_word = 0xFF if core == "pic18" else 0x3FFF
         cfg_cwords = [
             {"addr": a, "mask": erased_word, "default": erased_word, "name": "CONFIG", "settings": []}
@@ -418,66 +567,85 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         interrupt_vectors = [0x0008, 0x0018]
     else:
         interrupt_vectors = [0x0004]
-    cfg_cwords.sort(key=lambda c: c["addr"])
-    base_word = cfg_cwords[0]["addr"]
-    num_words = cfg_cwords[-1]["addr"] - base_word + 1
-    base_byte_addr = base_word * 2
-    num_bytes = num_words * 2
-    erased = []
-    for cw in cfg_cwords:
-        default = cw["default"]
-        erased.append(default & 0xFF)
-        erased.append((default >> 8) & 0xFF)
-    while len(erased) < num_bytes:
-        erased.append(0xFF)
-    erased = erased[:num_bytes]
+    def finalize_field(raw_field_name, byte_offset, mask_in_byte, shift_in_byte, raw_values):
+        field_name = alias_field(raw_field_name, stem)
+        vals = [(alias_value(field_name, name, stem), bits) for name, bits in raw_values]
+        seen_bits = {}
+        deduped = []
+        for name, bits in vals:
+            if bits not in seen_bits:
+                seen_bits[bits] = name
+                deduped.append((name, bits))
+        deduped.sort(key=lambda x: x[1])
+        if not deduped:
+            return None
+        part_def = PART_DEFAULTS.get(stem, {})
+        default_name = part_def.get(field_name)
+        if default_name is None:
+            default_name = SAFE_DEFAULTS.get(field_name)
+            if default_name and not any(n == default_name for n, _ in deduped):
+                default_name = None
+        return {
+            "name": field_name,
+            "byte_offset": byte_offset,
+            "mask": mask_in_byte,
+            "shift": shift_in_byte,
+            "default": default_name,
+            "values": deduped,
+        }
+
     fields = []
-    for cw in cfg_cwords:
-        cword_byte_base = (cw["addr"] - base_word) * 2
-        for setting in cw["settings"]:
-            mask_word = setting["mask"]
-            if mask_word == 0:
-                continue
-            lowbit = mask_word & -mask_word
-            ctz = (lowbit.bit_length() - 1)
-            word_shift = ctz
-            byte_in_word = word_shift // 8
-            shift_in_byte = word_shift % 8
-            mask_in_byte = (mask_word >> (byte_in_word * 8)) & 0xFF
-            width = bin(mask_in_byte).count("1")
-            byte_offset = cword_byte_base + byte_in_word
-            raw_field_name = setting["name"]
-            field_name = alias_field(raw_field_name, stem)
-            vals = []
-            for v in setting["values"]:
-                raw_val = v["value"]
-                raw_name = v["name"]
-                normalized = (raw_val >> word_shift) & ((1 << width) - 1) if width < 8 else (raw_val >> word_shift)
-                alias = alias_value(field_name, raw_name, stem)
-                vals.append((alias, normalized))
-            seen_bits = {}
-            deduped = []
-            for name, bits in vals:
-                if bits not in seen_bits:
-                    seen_bits[bits] = name
-                    deduped.append((name, bits))
-            deduped.sort(key=lambda x: x[1])
-            if not deduped:
-                continue
-            part_def = PART_DEFAULTS.get(stem, {})
-            default_name = part_def.get(field_name)
-            if default_name is None:
-                default_name = SAFE_DEFAULTS.get(field_name)
-                if default_name and not any(n == default_name for n, _ in deduped):
-                    default_name = None
-            fields.append({
-                "name": field_name,
-                "byte_offset": byte_offset,
-                "mask": mask_in_byte,
-                "shift": shift_in_byte,
-                "default": default_name,
-                "values": deduped,
-            })
+    if dcr_result is not None:
+        # Each `DCRDef` is already one real config byte (see
+        # `parse_edc_dcr_fields`); no word/`* 2` conversion applies here,
+        # unlike the `.cfgdata` word-oriented path below.
+        base_byte_addr, num_bytes, raw_fields = dcr_result
+        erased = [0xFF] * num_bytes
+        for rf in raw_fields:
+            f = finalize_field(rf["raw_name"], rf["byte_offset"], rf["mask"], rf["shift"], rf["values"])
+            if f is not None:
+                fields.append(f)
+    else:
+        cfg_cwords.sort(key=lambda c: c["addr"])
+        base_word = cfg_cwords[0]["addr"]
+        num_words = cfg_cwords[-1]["addr"] - base_word + 1
+        if cfg_span_is_bytes:
+            base_byte_addr = base_word
+            num_bytes = num_words
+            erased = [cw["default"] & 0xFF for cw in cfg_cwords]
+        else:
+            base_byte_addr = base_word * 2
+            num_bytes = num_words * 2
+            erased = []
+            for cw in cfg_cwords:
+                default = cw["default"]
+                erased.append(default & 0xFF)
+                erased.append((default >> 8) & 0xFF)
+            while len(erased) < num_bytes:
+                erased.append(0xFF)
+            erased = erased[:num_bytes]
+        for cw in cfg_cwords:
+            cword_byte_base = (cw["addr"] - base_word) * 2
+            for setting in cw["settings"]:
+                mask_word = setting["mask"]
+                if mask_word == 0:
+                    continue
+                lowbit = mask_word & -mask_word
+                ctz = (lowbit.bit_length() - 1)
+                word_shift = ctz
+                byte_in_word = word_shift // 8
+                shift_in_byte = word_shift % 8
+                mask_in_byte = (mask_word >> (byte_in_word * 8)) & 0xFF
+                width = bin(mask_in_byte).count("1")
+                byte_offset = cword_byte_base + byte_in_word
+                raw_values = []
+                for v in setting["values"]:
+                    raw_val = v["value"]
+                    normalized = (raw_val >> word_shift) & ((1 << width) - 1) if width < 8 else (raw_val >> word_shift)
+                    raw_values.append((v["name"], normalized))
+                f = finalize_field(setting["name"], byte_offset, mask_in_byte, shift_in_byte, raw_values)
+                if f is not None:
+                    fields.append(f)
     fields.sort(key=lambda f: (f["byte_offset"], f["shift"]))
     out_lines = []
     out_lines.append(f'name = "{stem}"')
@@ -487,6 +655,10 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     out_lines.append(f'ram_banks = [{banks_str}]')
     if common_ram:
         out_lines.append(f'common_ram = [0x{common_ram[0]:04X}, 0x{common_ram[1]:04X}]')
+    if access_bank:
+        out_lines.append(f'access_bank = [0x{access_bank[0]:04X}, 0x{access_bank[1]:04X}]')
+    if fixed_retval:
+        out_lines.append(f'fixed_retval = [0x{fixed_retval[0]:04X}, 0x{fixed_retval[1]:04X}]')
     out_lines.append(f'stack_depth = {stack_depth}')
     vectors_str = ", ".join(f"0x{v:04X}" for v in interrupt_vectors)
     out_lines.append(f'interrupt_vectors = [{vectors_str}]')
