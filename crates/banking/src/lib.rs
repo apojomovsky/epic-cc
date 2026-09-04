@@ -58,7 +58,10 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 
-const LITERAL_OPS: [&str; 7] = [
+/// `pub`: `crates/schedule` reuses this to avoid a second, independently
+/// drifting copy of which mnemonics take a literal instead of a file
+/// register (epic-cc#210/ADR-027).
+pub const LITERAL_OPS: [&str; 7] = [
     "MOVLW", "ADDLW", "ANDLW", "IORLW", "XORLW", "SUBLW", "RETLW",
 ];
 
@@ -66,7 +69,10 @@ const LITERAL_OPS: [&str; 7] = [
 /// bit/byte is clear/set/zero/nonzero. A banked operand under one of these
 /// is CONDITIONAL — the exit-bank analysis must join both paths (the
 /// operand may or may not run, so its bank may or may not be selected).
-const SKIP_OPS: [&str; 4] = ["BTFSC", "BTFSS", "INCFSZ", "DECFSZ"];
+/// `pub`: `crates/schedule` (ADR-027) treats a skip op and its immediate
+/// successor as an atomic, unsplittable, unenterable pair, reusing this
+/// same set rather than redefining it.
+pub const SKIP_OPS: [&str; 4] = ["BTFSC", "BTFSS", "INCFSZ", "DECFSZ"];
 
 /// The STATUS register's address (the PIC16F877A's register 3).
 const STATUS_ADDR: u16 = 0x03;
@@ -80,8 +86,9 @@ const STATUS_ADDR: u16 = 0x03;
 /// The bit operand is matched by its numeric value (5 = RP0, 6 = RP1), so
 /// `RP0`/`RP1` symbol forms would need the equ table — the isel output
 /// always uses the numeric forms, and hand-written asm in the fixtures does
-/// too.
-fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
+/// too. `pub`: `crates/schedule` (ADR-027) reuses this exact recognizer so
+/// its own bank-select detection never drifts from banking's.
+pub fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
     // The comma may be attached to the register token (`STATUS,5`) or
     // separate (`STATUS, 5`); both are the same instruction.
     let (reg, bit) = match toks.get(2) {
@@ -123,8 +130,10 @@ fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
 /// The bank a file-register operand selects, or `None` when the operand is
 /// bank-independent (a mirrored SFR, common RAM, or a literal). The operand
 /// token is the first after the mnemonic, with any trailing
-/// comma/semicolon stripped.
-fn operand_bank(device: &Device, mne: &str, toks: &[&str]) -> Option<u8> {
+/// comma/semicolon stripped. `pub`: `crates/schedule` (ADR-027) reuses this
+/// so its own notion of "which bank does this instruction need" is always
+/// identical to the pass that actually inserts the `BANKSEL`s.
+pub fn operand_bank(device: &Device, mne: &str, toks: &[&str]) -> Option<u8> {
     if LITERAL_OPS.contains(&mne) {
         return None;
     }

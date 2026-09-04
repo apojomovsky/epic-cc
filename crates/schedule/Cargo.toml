@@ -1,0 +1,13 @@
+[package]
+name = "schedule"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+device = { path = "../device" }
+banking = { path = "../banking" }
+
+[[bin]]
+name = "schedule"
+path = "src/bin/schedule.rs"
