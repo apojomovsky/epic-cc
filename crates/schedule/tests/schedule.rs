@@ -1,5 +1,5 @@
 use device::PIC16F877A;
-use schedule::{classify, regions, schedule, Line};
+use schedule::{classify, phase1, regions, schedule, Line};
 
 #[test]
 fn identity_transform_is_lossless() {
@@ -162,4 +162,97 @@ fn dest_w_form_writes_w_not_the_file_register() {
         }
         other => panic!("expected an Insn, got {other:?}"),
     }
+}
+
+// -- phase 1: the singleton-excursion swap (ADR-027) --------------------
+
+#[test]
+fn sinks_a_w_and_flag_free_excursion_past_its_successor() {
+    // A, cur(B), A: cur is BSF, which touches neither W nor a flag, so
+    // it is a move candidate; its successor is not a skip op and shares
+    // no file address with it, so sink succeeds.
+    let asm = "    MOVWF 0x20\n    BSF 0x85, 3\n    MOVWF 0x21\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase1(&mut lines);
+    assert_eq!(n, 1);
+    let order: Vec<&str> = lines.iter().map(Line::raw).collect();
+    assert_eq!(
+        order,
+        vec!["    MOVWF 0x20", "    MOVWF 0x21", "    BSF 0x85, 3"],
+        "cur sank past its successor, merging the two bank-0 operands"
+    );
+}
+
+#[test]
+fn falls_back_to_hoisting_when_the_successor_is_a_skip_op() {
+    // Sink is blocked (the successor is a skip op: swapping into that
+    // slot would corrupt what it guards), so phase1 falls back to
+    // hoisting cur past its predecessor instead.
+    let asm = "    MOVWF 0x20\n    BSF 0x85, 3\n    BTFSC 0x21, 2\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase1(&mut lines);
+    assert_eq!(n, 1);
+    let order: Vec<&str> = lines.iter().map(Line::raw).collect();
+    assert_eq!(
+        order,
+        vec!["    BSF 0x85, 3", "    MOVWF 0x20", "    BTFSC 0x21, 2"],
+        "cur hoisted past its predecessor instead"
+    );
+}
+
+#[test]
+fn declines_when_the_excursion_instruction_reads_w() {
+    // The exact ADR-027 EPIC_IRQ_Enable shape: cur is a MOVWF, which
+    // always reads W, so it is never a phase-1 move candidate. The real
+    // fix for this shape moves a different, independent instruction
+    // instead, deferred to a later phase, not silently attempted here.
+    let asm = "    MOVWF 0x190\n    MOVWF 0x8D\n    MOVWF 0x192\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase1(&mut lines);
+    assert_eq!(n, 0, "MOVWF reads W, never a move candidate");
+}
+
+#[test]
+fn declines_when_the_excursion_instruction_sets_flags() {
+    let asm = "    MOVWF 0x20\n    ANDLW 0x0F\n    MOVWF 0x21\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase1(&mut lines);
+    assert_eq!(n, 0, "ANDLW touches both W and flags");
+}
+
+#[test]
+fn declines_a_skip_target_excursion_instruction() {
+    // cur is itself the atomic other half of a skip pair: never a move
+    // candidate regardless of what it otherwise is.
+    let asm = "    BTFSC 0x20, 2\n    BSF 0x85, 3\n    MOVWF 0x21\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase1(&mut lines);
+    assert_eq!(n, 0, "cur is a skip target");
+}
+
+#[test]
+fn declines_a_non_excursion_run_of_one_bank() {
+    // No excursion at all: every operand needs the same bank, so there
+    // is nothing to reduce.
+    let asm = "    MOVWF 0x20\n    MOVWF 0x21\n    MOVWF 0x22\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase1(&mut lines);
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn phase1_never_crosses_a_region_boundary() {
+    // The excursion candidate at index 1 has a label right after it:
+    // there is no `i + 1` inside the same region, so it must never move.
+    let asm = "    MOVWF 0x20\n    BSF 0x85, 3\nl1:\n    MOVWF 0x21\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase1(&mut lines);
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn schedule_applies_phase1_end_to_end() {
+    let asm = "    MOVWF 0x20\n    BSF 0x85, 3\n    MOVWF 0x21\n";
+    let out = schedule(&PIC16F877A, asm);
+    assert_eq!(out, "    MOVWF 0x20\n    MOVWF 0x21\n    BSF 0x85, 3\n");
 }

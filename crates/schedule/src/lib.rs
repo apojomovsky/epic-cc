@@ -312,15 +312,125 @@ pub fn regions(lines: &[Line]) -> Vec<std::ops::Range<usize>> {
     out
 }
 
+/// `cur` is never a move candidate unless every one of these holds: not a
+/// skip op, not a skip target (issue #6: never move the other half of an
+/// atomic pair), and touches neither W nor a flag. The last two together
+/// mean moving `cur` past one neighbor can never disturb a W-chain or a
+/// flag-chain, since `cur` itself is simply not part of either chain; the
+/// only remaining hazard to check per neighbor is a shared file-register
+/// address (see `file_collision`).
+fn is_move_candidate(cur: &Insn) -> bool {
+    cur.bank.is_some()
+        && !cur.is_skip
+        && !cur.is_skip_target
+        && !cur.reads_flags
+        && !cur.writes_flags
+        && !cur.reads_w
+        && !cur.writes_w
+}
+
+/// True when `a` and `b` name the same file-register address: swapping
+/// them would reorder a read/write against itself (RAW/WAR/WAW), unsound
+/// regardless of what `a`/`b` otherwise do. Given `phase1`'s own excursion
+/// precondition (`cur.bank != prev.bank`, and a bank is a pure function
+/// of the address), this can never actually trigger for the exact
+/// neighbor `phase1` calls it with today: same address always means same
+/// bank, so a same-address neighbor could never have satisfied the
+/// excursion check in the first place. Kept anyway as the real invariant
+/// this function is supposed to guarantee, checked directly rather than
+/// assumed, and load-bearing the moment any future phase loosens the
+/// precondition that currently makes it unreachable.
+fn file_collision(a: &Insn, b: &Insn) -> bool {
+    a.file_addr.is_some() && a.file_addr == b.file_addr
+}
+
+/// Try to swap `lines[i]` with the immediately following instruction
+/// (`lines[i + 1]`), reducing an `A, cur(B), A` excursion to `A, A, cur`
+/// -- one fewer bank switch, since the two `A` operands are now adjacent
+/// and `cur` instead directly precedes whatever needed a switch to `B`
+/// anyway. Safe when `next` is not a skip op (swapping into the position
+/// right after a skip op would corrupt what that skip actually guards)
+/// and the two don't share a file-register address. Returns whether the
+/// swap happened.
+fn try_sink(lines: &mut [Line], i: usize) -> bool {
+    let ok = match (&lines[i], &lines[i + 1]) {
+        (Line::Insn(cur), Line::Insn(next)) => !next.is_skip && !file_collision(cur, next),
+        _ => false,
+    };
+    if ok {
+        lines.swap(i, i + 1);
+    }
+    ok
+}
+
+/// The mirror of `try_sink`: swap `lines[i]` with the immediately
+/// preceding instruction (`lines[i - 1]`), reducing an `A, cur(B), A`
+/// excursion to `cur, A, A`. Safe when `prev` is not itself a skip target
+/// (swapping something in front of it would land between its skip op and
+/// it) and the two don't share a file-register address.
+fn try_hoist(lines: &mut [Line], i: usize) -> bool {
+    let ok = match (&lines[i - 1], &lines[i]) {
+        (Line::Insn(prev), Line::Insn(cur)) => !prev.is_skip_target && !file_collision(cur, prev),
+        _ => false,
+    };
+    if ok {
+        lines.swap(i - 1, i);
+    }
+    ok
+}
+
+/// Phase 1 (ADR-027, epic-cc#210): the single hand-verified reorder
+/// shape, deliberately narrower than general list scheduling (no
+/// lookahead past one neighbor on either side, no multi-instruction
+/// bundling, no flag-chain reasoning). For every `Line::Insn` at index
+/// `i` strictly inside a region (so both `i - 1` and `i + 1` exist in the
+/// same straight-line run `regions` already computed), sandwiched between
+/// two neighbors that both need the SAME bank `cur` itself doesn't:
+/// try sinking `cur` past its successor first (matching the shape found
+/// by hand during epic-cc#210's investigation), falling back to hoisting
+/// it past its predecessor when sinking is blocked. Mutates `lines` in
+/// place; returns the number of swaps performed.
+///
+/// Deliberately does NOT capture every hand-traced excursion from the
+/// investigation: an excursion instruction that is itself a `MOVWF` (or
+/// any op reading W) is never a move candidate here by construction
+/// (`is_move_candidate`), even when the actual fix is to move a
+/// DIFFERENT, independent instruction earlier instead (the `EPIC_IRQ_
+/// Enable` example ADR-027 cites is exactly this shape) -- that needs
+/// moving more than one instruction and is explicitly deferred to a
+/// later phase, not silently included here.
+pub fn phase1(lines: &mut [Line]) -> usize {
+    let mut swapped = 0usize;
+    for region in regions(lines) {
+        if region.len() < 3 {
+            continue;
+        }
+        let mut i = region.start + 1;
+        while i + 1 < region.end {
+            let excursion = match (&lines[i - 1], &lines[i], &lines[i + 1]) {
+                (Line::Insn(prev), Line::Insn(cur), Line::Insn(next)) => {
+                    is_move_candidate(cur)
+                        && prev.bank.is_some()
+                        && prev.bank == next.bank
+                        && prev.bank != cur.bank
+                }
+                _ => false,
+            };
+            if excursion && (try_sink(lines, i) || try_hoist(lines, i)) {
+                swapped += 1;
+            }
+            i += 1;
+        }
+    }
+    swapped
+}
+
 /// Reorder small, provably-independent instruction groups to reduce
-/// mid-block bank switches (ADR-027). Phase 1: identity transform. The
-/// classification and region-splitting above are exercised (so a
-/// malformed line panics here, at the pipeline stage that owns this
-/// analysis, rather than downstream in `banking`) but nothing is moved
-/// yet.
+/// mid-block bank switches (ADR-027, epic-cc#210). See `phase1` for
+/// exactly what this does and does not move.
 pub fn schedule(device: &Device, asm: &str) -> String {
-    let lines = classify(device, asm);
-    let _regions = regions(&lines);
+    let mut lines = classify(device, asm);
+    phase1(&mut lines);
     // `str::lines()` never yields a trailing empty entry for a single
     // final `\n` (or no entry at all for input with none), so joining
     // `lines` back with `\n` and only conditionally appending one more
