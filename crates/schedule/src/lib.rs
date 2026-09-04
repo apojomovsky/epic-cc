@@ -425,12 +425,174 @@ pub fn phase1(lines: &mut [Line]) -> usize {
     swapped
 }
 
+/// A pure `k -> W` producer with no other effect: `MOVLW`, the only
+/// mnemonic isel emits with this shape (writes W, reads nothing, touches
+/// no flag, never a skip op or target). The sole candidate "producer"
+/// half of a phase-2 bundle.
+fn is_movlw_producer(insn: &Insn) -> bool {
+    insn.mnemonic == "MOVLW"
+        && insn.writes_w
+        && !insn.reads_w
+        && !insn.reads_flags
+        && !insn.writes_flags
+        && !insn.is_skip
+        && !insn.is_skip_target
+}
+
+/// A pure `W -> f` consumer with no other effect: `MOVWF`, needing a
+/// bank. The sole candidate "consumer" half of a phase-2 bundle.
+fn is_movwf_consumer(insn: &Insn) -> bool {
+    insn.mnemonic == "MOVWF"
+        && insn.reads_w
+        && !insn.writes_w
+        && insn.writes_file
+        && !insn.reads_file
+        && !insn.is_skip
+        && !insn.is_skip_target
+        && insn.bank.is_some()
+}
+
+/// The start of the maximal contiguous run of `Line::Insn` entries ending
+/// at `end - 1` that all need the same bank `bank`, without leaving
+/// `region`. `phase2` calls this on the run immediately preceding an
+/// excursion, always non-empty by construction (the excursion detection
+/// already confirmed `lines[end - 1]` needs `bank`).
+fn run_start(lines: &[Line], region: &std::ops::Range<usize>, end: usize, bank: u8) -> usize {
+    let mut start = end;
+    while start > region.start {
+        match &lines[start - 1] {
+            Line::Insn(p) if p.bank == Some(bank) => start -= 1,
+            _ => break,
+        }
+    }
+    start
+}
+
+/// A position strictly inside `run` (never its very first element: this
+/// module has no way to know what precedes the run itself, so a bundle
+/// is only ever inserted between two of the run's OWN already-known
+/// elements) where `W` is dead right before it -- the element at that
+/// position does not read `W`, so a `MOVLW` (which unconditionally
+/// clobbers `W`) can land immediately before it without disturbing
+/// anything. Returns the index to insert before, or `None` if the run
+/// has no such gap.
+fn find_dead_w_gap(lines: &[Line], run: std::ops::Range<usize>) -> Option<usize> {
+    for k in (run.start + 1)..run.end {
+        if let Line::Insn(y) = &lines[k] {
+            if !y.reads_w {
+                return Some(k);
+            }
+        }
+    }
+    None
+}
+
+/// Phase 2 (ADR-027, epic-cc#210): the corrected fix for the exact shape
+/// phase 1 cannot touch -- an excursion instruction (`cur`) that itself
+/// reads `W` (a `MOVWF`, most commonly), so it can never safely move.
+/// When `cur` is immediately followed by a `MOVLW`/`MOVWF` pair (`P`,
+/// `M`) materializing an unrelated value into `M`'s own bank (the SAME
+/// bank the run before `cur` needs), and nothing right after that pair
+/// depends on `W` still holding what `P` set, hunt the PRECEDING run for
+/// a genuine dead-`W` gap (a point where the next instruction doesn't
+/// read `W` anyway) and splice `(P, M)` in there instead of leaving them
+/// stranded after `cur`.
+///
+/// This is deliberately narrower than it might look: exactly one
+/// producer, exactly one consumer, both immediately adjacent to `cur` and
+/// to each other, never searched for further away. Skipping the dead-`W`
+/// check and simply hoisting `(P, M)` to sit right before `cur` (this
+/// module's own first, hand-traced attempt at fixing this shape) is
+/// unsound: `P` clobbers `W` unconditionally, and `cur` still needs
+/// whatever value was in `W` right before it. The check exists because
+/// that mistake was real, caught only by working through the exact
+/// example by hand, not a hypothetical worth guarding against.
+pub fn phase2(lines: &mut Vec<Line>) -> usize {
+    let mut swapped = 0usize;
+    'restart: loop {
+        for region in regions(lines) {
+            if region.len() < 4 {
+                continue;
+            }
+            for i in (region.start + 1)..(region.end.saturating_sub(2)) {
+                // Unlike phase 1's excursion check, `lines[i + 1]` is not
+                // expected to share `prev`'s bank here: it is `P`, the
+                // literal producer (bank-less by construction), checked
+                // below. The "closing" bank-A neighbor this excursion
+                // needs is `M` (`lines[i + 2]`), not `lines[i + 1]`.
+                let excursion_bank = match (&lines[i - 1], &lines[i]) {
+                    (Line::Insn(prev), Line::Insn(cur))
+                        if prev.bank.is_some()
+                            && prev.bank != cur.bank
+                            && !is_move_candidate(cur)
+                            && !cur.is_skip
+                            && !cur.is_skip_target =>
+                    {
+                        prev.bank
+                    }
+                    _ => None,
+                };
+                let Some(bank) = excursion_bank else {
+                    continue;
+                };
+                let (m_addr, bundle_ok) = match (&lines[i + 1], &lines[i + 2]) {
+                    (Line::Insn(p), Line::Insn(m)) => (
+                        m.file_addr,
+                        is_movlw_producer(p) && is_movwf_consumer(m) && m.bank == Some(bank),
+                    ),
+                    _ => (None, false),
+                };
+                if !bundle_ok {
+                    continue;
+                }
+                // Nothing right after the bundle's old position may still
+                // need `W` holding what `P` set there; if the bundle was
+                // the region's last content, there is nothing to strand.
+                let after_ok = i + 3 >= region.end
+                    || matches!(&lines[i + 3], Line::Insn(after) if !after.reads_w);
+                if !after_ok {
+                    continue;
+                }
+                let cur_addr = match &lines[i] {
+                    Line::Insn(cur) => cur.file_addr,
+                    _ => None,
+                };
+                if m_addr.is_some() && m_addr == cur_addr {
+                    continue;
+                }
+                let start = run_start(lines, &region, i, bank);
+                let Some(gap) = find_dead_w_gap(lines, start..i) else {
+                    continue;
+                };
+                let collides = match (&lines[gap - 1], &lines[gap]) {
+                    (Line::Insn(x), Line::Insn(y)) => {
+                        m_addr.is_some() && (m_addr == x.file_addr || m_addr == y.file_addr)
+                    }
+                    _ => false,
+                };
+                if collides {
+                    continue;
+                }
+                let p = lines.remove(i + 1);
+                let m = lines.remove(i + 1);
+                lines.insert(gap, m);
+                lines.insert(gap, p);
+                swapped += 1;
+                continue 'restart;
+            }
+        }
+        break;
+    }
+    swapped
+}
+
 /// Reorder small, provably-independent instruction groups to reduce
-/// mid-block bank switches (ADR-027, epic-cc#210). See `phase1` for
-/// exactly what this does and does not move.
+/// mid-block bank switches (ADR-027, epic-cc#210). See `phase1`/`phase2`
+/// for exactly what this does and does not move.
 pub fn schedule(device: &Device, asm: &str) -> String {
     let mut lines = classify(device, asm);
     phase1(&mut lines);
+    phase2(&mut lines);
     // `str::lines()` never yields a trailing empty entry for a single
     // final `\n` (or no entry at all for input with none), so joining
     // `lines` back with `\n` and only conditionally appending one more
