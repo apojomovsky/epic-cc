@@ -1,5 +1,5 @@
 use device::PIC16F877A;
-use schedule::{classify, phase1, regions, schedule, Line};
+use schedule::{classify, phase1, phase2, regions, schedule, Line};
 
 #[test]
 fn identity_transform_is_lossless() {
@@ -255,4 +255,116 @@ fn schedule_applies_phase1_end_to_end() {
     let asm = "    MOVWF 0x20\n    BSF 0x85, 3\n    MOVWF 0x21\n";
     let out = schedule(&PIC16F877A, asm);
     assert_eq!(out, "    MOVWF 0x20\n    MOVWF 0x21\n    BSF 0x85, 3\n");
+}
+
+// -- phase 2: the dead-W bundle hoist (ADR-027, the corrected version) --
+
+/// The corrected `EPIC_IRQ_Enable` shape: `cur` (`MOVWF 0x85`) reads W,
+/// so phase 1 declines it. `MOVF 0x21, W` (index 1 of the preceding run)
+/// does not read W, a genuine dead-W gap; `(MOVLW 0x40, MOVWF 0x23)`
+/// splices in right before it.
+fn irq_enable_shaped_asm() -> &'static str {
+    "    MOVWF 0x20\n\
+     \x20   MOVF 0x21, W\n\
+     \x20   IORWF 0x20, W\n\
+     \x20   MOVWF 0x22\n\
+     \x20   MOVWF 0x85\n\
+     \x20   MOVLW 0x40\n\
+     \x20   MOVWF 0x23\n"
+}
+
+#[test]
+fn phase2_splices_a_bundle_into_a_genuine_dead_w_gap() {
+    let mut lines = classify(&PIC16F877A, irq_enable_shaped_asm());
+    let n = phase2(&mut lines);
+    assert_eq!(n, 1);
+    let order: Vec<&str> = lines.iter().map(Line::raw).collect();
+    assert_eq!(
+        order,
+        vec![
+            "    MOVWF 0x20",
+            "    MOVLW 0x40",
+            "    MOVWF 0x23",
+            "    MOVF 0x21, W",
+            "    IORWF 0x20, W",
+            "    MOVWF 0x22",
+            "    MOVWF 0x85",
+        ],
+        "the bundle spliced in before the first line that doesn't read W"
+    );
+}
+
+#[test]
+fn phase1_alone_does_not_touch_the_irq_enable_shape() {
+    // Confirms phase 1's own documented boundary: cur reads W, so phase 1
+    // must decline this shape entirely, leaving it for phase 2.
+    let mut lines = classify(&PIC16F877A, irq_enable_shaped_asm());
+    let n = phase1(&mut lines);
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn phase2_declines_when_the_run_has_no_dead_w_gap() {
+    // Every element of the preceding run reads W (ADDWF/IORWF-style
+    // chains), so there is nowhere safe to splice the bundle in.
+    let asm = "    MOVWF 0x20\n\
+               \x20   IORWF 0x20, W\n\
+               \x20   ADDWF 0x20, W\n\
+               \x20   MOVWF 0x22\n\
+               \x20   MOVWF 0x85\n\
+               \x20   MOVLW 0x40\n\
+               \x20   MOVWF 0x23\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase2(&mut lines);
+    assert_eq!(n, 0);
+}
+
+#[test]
+fn phase2_declines_when_something_after_the_bundle_still_reads_w() {
+    let asm = "    MOVWF 0x20\n\
+               \x20   MOVF 0x21, W\n\
+               \x20   IORWF 0x20, W\n\
+               \x20   MOVWF 0x22\n\
+               \x20   MOVWF 0x85\n\
+               \x20   MOVLW 0x40\n\
+               \x20   MOVWF 0x23\n\
+               \x20   MOVWF 0x24\n"; // reads W: still needs what MOVLW set
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase2(&mut lines);
+    assert_eq!(n, 0, "the trailing MOVWF still needs W == 0x40");
+}
+
+#[test]
+fn phase2_declines_a_skip_target_excursion_instruction() {
+    // cur (MOVWF 0x85) immediately follows a skip op (BTFSC 0x22, 2,
+    // itself bank0 so it still completes the excursion pattern). cur
+    // itself never moves in phase 2 (only P/M do), so this exclusion is
+    // a conservative, uniform "never reason about anything skip-adjacent"
+    // policy matching phase 1, not because this specific splice would
+    // provably break the (BTFSC, cur) pair.
+    let asm = "    MOVWF 0x20\n\
+               \x20   MOVF 0x21, W\n\
+               \x20   IORWF 0x20, W\n\
+               \x20   BTFSC 0x22, 2\n\
+               \x20   MOVWF 0x85\n\
+               \x20   MOVLW 0x40\n\
+               \x20   MOVWF 0x23\n";
+    let mut lines = classify(&PIC16F877A, asm);
+    let n = phase2(&mut lines);
+    assert_eq!(n, 0, "cur is a skip target");
+}
+
+#[test]
+fn schedule_applies_phase2_end_to_end() {
+    let out = schedule(&PIC16F877A, irq_enable_shaped_asm());
+    assert_eq!(
+        out,
+        "    MOVWF 0x20\n\
+         \x20   MOVLW 0x40\n\
+         \x20   MOVWF 0x23\n\
+         \x20   MOVF 0x21, W\n\
+         \x20   IORWF 0x20, W\n\
+         \x20   MOVWF 0x22\n\
+         \x20   MOVWF 0x85\n"
+    );
 }
