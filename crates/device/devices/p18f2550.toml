@@ -42,7 +42,7 @@ name = "usbdiv"
 byte_offset = 0
 mask = 0x20
 shift = 5
-values = [{ name = "1", bits = 0 }, { name = "2", bits = 1 }]
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
 
 [[config.fields]]
 name = "osc"
@@ -75,19 +75,18 @@ shift = 0
 values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
 
 [[config.fields]]
-name = "bor"
+name = "boren"
 byte_offset = 2
 mask = 0x06
 shift = 1
-default = "on"
-values = [{ name = "off", bits = 0 }, { name = "soft", bits = 1 }, { name = "on_active", bits = 2 }, { name = "on", bits = 3 }]
+values = [{ name = "off", bits = 0 }, { name = "sw", bits = 1 }, { name = "hw_off_in_sleep", bits = 2 }, { name = "hw_always", bits = 3 }]
 
 [[config.fields]]
 name = "borv"
 byte_offset = 2
 mask = 0x18
 shift = 3
-values = [{ name = "0", bits = 0 }, { name = "1", bits = 1 }, { name = "2", bits = 2 }, { name = "3", bits = 3 }]
+values = [{ name = "maximum", bits = 0 }, { name = "mid", bits = 1 }, { name = "low", bits = 2 }, { name = "minimum", bits = 3 }]
 
 [[config.fields]]
 name = "vregen"
@@ -109,14 +108,14 @@ name = "wdtps"
 byte_offset = 3
 mask = 0x1E
 shift = 1
-values = [{ name = "1", bits = 0 }, { name = "2", bits = 1 }, { name = "4", bits = 2 }, { name = "8", bits = 3 }, { name = "16", bits = 4 }, { name = "32", bits = 5 }, { name = "64", bits = 6 }, { name = "128", bits = 7 }, { name = "256", bits = 8 }, { name = "512", bits = 9 }, { name = "1024", bits = 10 }, { name = "2048", bits = 11 }, { name = "4096", bits = 12 }, { name = "8192", bits = 13 }, { name = "16384", bits = 14 }, { name = "32768", bits = 15 }]
+values = [{ name = "div1", bits = 0 }, { name = "div2", bits = 1 }, { name = "div4", bits = 2 }, { name = "div8", bits = 3 }, { name = "div16", bits = 4 }, { name = "div32", bits = 5 }, { name = "div64", bits = 6 }, { name = "div128", bits = 7 }, { name = "div256", bits = 8 }, { name = "div512", bits = 9 }, { name = "div1024", bits = 10 }, { name = "div2048", bits = 11 }, { name = "div4096", bits = 12 }, { name = "div8192", bits = 13 }, { name = "div16384", bits = 14 }, { name = "div32768", bits = 15 }]
 
 [[config.fields]]
 name = "ccp2mx"
 byte_offset = 5
 mask = 0x01
 shift = 0
-values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+values = [{ name = "rb3", bits = 0 }, { name = "rc1", bits = 1 }]
 
 [[config.fields]]
 name = "pbaden"
@@ -160,6 +159,8 @@ name = "xinst"
 byte_offset = 6
 mask = 0x40
 shift = 6
+default = "off"
+locked = "off"
 values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
 
 [[config.fields]]
