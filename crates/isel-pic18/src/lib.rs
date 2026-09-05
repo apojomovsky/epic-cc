@@ -16,6 +16,15 @@ use device::Device;
 use ir::{Func, Inst, Module, Ty, Val};
 use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 
+/// The high Access Bank segment's start: every classic-mode PIC18's SFRs
+/// live at `0xF60-0xFFF` (160 bytes) by the core's own linear-addressing
+/// definition (gputils' `.lkr` scripts declare it as a second, fixed
+/// `ACCESSBANK` region, `accesssfr`, on both devices this core ships).
+/// Unlike the low segment's `0x00-0x5F` (`Device::access_bank`, real
+/// per-device data), the schema has no field for this because nothing has
+/// needed one yet: it is architecture, not silicon (epic-cc#226 audit).
+const PIC18_SFR_ACCESS_LO: u16 = 0xF60;
+
 /// The result of resolving a pointer to a concrete access. `Direct`: the
 /// address is statically known, so a plain `MOVFF`/`MOVF`/`MOVWF` reaches
 /// it. `Indirect`: `FSR0` has been set up and the access goes through
@@ -36,6 +45,12 @@ struct Gen<'m> {
     /// `device.fixed_retval`)  -  see the plan's "Where the retval/scratch
     /// design comes from" section.
     retval_lo: u16,
+    /// The access bank's high bound (from `device.access_bank`), soft-float
+    /// runtime routines' frame-fits-in-the-access-bank assertions bound
+    /// against. Every classic PIC18 device has shared this exact value
+    /// (`0x5F`) so far (epic-cc#226 audit), but it is device data, not an
+    /// architectural constant guaranteed for every future PIC18 part.
+    access_bank_hi: u16,
     /// The `BSR` value the last-emitted `MOVLB` set, or `None` when it's
     /// unknown (module start, or just after a label  -  branch targets can
     /// be reached with any prior `BSR` state, so it must be re-established
@@ -314,7 +329,7 @@ impl<'m> Gen<'m> {
     /// bit at all, which is why `Load`/`Store`/`Phi`-copies/`Call`-arg-
     /// copies never touch `BSR`.
     fn operand(&mut self, addr: u16) -> (u16, u16) {
-        if addr < 0x60 || addr >= 0xF60 {
+        if addr <= self.access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
             (0, addr & 0xFF)
         } else {
             let bank = (addr >> 8) as u8;
@@ -4876,14 +4891,16 @@ impl<'m> Gen<'m> {
                 let pb = self.slot_addr(name, "b").direct();
                 for addr in [pa, pa + 3, pb, pb + 3, scr, scr + 13] {
                     assert!(
-                        addr <= 0x5F,
-                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x05F)"
+                        addr <= self.access_bank_hi,
+                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x{:03X})",
+                        self.access_bank_hi
                     );
                 }
                 assert!(
-                    self.retval_lo + 3 <= 0x5F,
-                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x05F)",
-                    self.retval_lo + 3
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
+                    self.retval_lo + 3,
+                    self.access_bank_hi
                 );
                 self.emit_f32_extract(pa, scr, scr + 1, scr + 2, false);
                 self.emit_f32_extract(pb, scr + 5, scr + 6, scr + 7, recipe == "__sub_f32");
@@ -4894,14 +4911,16 @@ impl<'m> Gen<'m> {
                 let b = self.slot_addr(name, "b").direct();
                 for addr in [a, a + 3, b, b + 3, scr, scr + 13] {
                     assert!(
-                        addr <= 0x5F,
-                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x05F)"
+                        addr <= self.access_bank_hi,
+                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x{:03X})",
+                        self.access_bank_hi
                     );
                 }
                 assert!(
-                    self.retval_lo + 3 <= 0x5F,
-                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x05F)",
-                    self.retval_lo + 3
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
+                    self.retval_lo + 3,
+                    self.access_bank_hi
                 );
                 self.emit_f32_mul_body(a, b, scr);
             }
@@ -4910,14 +4929,16 @@ impl<'m> Gen<'m> {
                 let b = self.slot_addr(name, "b").direct();
                 for addr in [a, a + 3, b, b + 3, scr, scr + 11] {
                     assert!(
-                        addr <= 0x5F,
-                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x05F)"
+                        addr <= self.access_bank_hi,
+                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x{:03X})",
+                        self.access_bank_hi
                     );
                 }
                 assert!(
-                    self.retval_lo + 3 <= 0x5F,
-                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x05F)",
-                    self.retval_lo + 3
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
+                    self.retval_lo + 3,
+                    self.access_bank_hi
                 );
                 self.emit_f32_div_body(a, b, scr);
             }
@@ -4925,14 +4946,16 @@ impl<'m> Gen<'m> {
                 let val = self.slot_addr(name, "val").direct();
                 for addr in [val, val + 3, scr, scr + 7] {
                     assert!(
-                        addr <= 0x5F,
-                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x05F)"
+                        addr <= self.access_bank_hi,
+                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x{:03X})",
+                        self.access_bank_hi
                     );
                 }
                 assert!(
-                    self.retval_lo + 3 <= 0x5F,
-                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x05F)",
-                    self.retval_lo + 3
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
+                    self.retval_lo + 3,
+                    self.access_bank_hi
                 );
                 self.emit_f32_uitofp_body(val, scr, None);
             }
@@ -4940,14 +4963,16 @@ impl<'m> Gen<'m> {
                 let val = self.slot_addr(name, "val").direct();
                 for addr in [val, val + 3, scr, scr + 7] {
                     assert!(
-                        addr <= 0x5F,
-                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x05F)"
+                        addr <= self.access_bank_hi,
+                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x{:03X})",
+                        self.access_bank_hi
                     );
                 }
                 assert!(
-                    self.retval_lo + 3 <= 0x5F,
-                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x05F)",
-                    self.retval_lo + 3
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
+                    self.retval_lo + 3,
+                    self.access_bank_hi
                 );
                 let sign = scr + 5;
                 let l_pos = self.fresh_label();
@@ -4964,14 +4989,16 @@ impl<'m> Gen<'m> {
                 let val = self.slot_addr(name, "val").direct();
                 for addr in [val, val + 3, scr, scr + 7] {
                     assert!(
-                        addr <= 0x5F,
-                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x05F)"
+                        addr <= self.access_bank_hi,
+                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x{:03X})",
+                        self.access_bank_hi
                     );
                 }
                 assert!(
-                    self.retval_lo + 3 <= 0x5F,
-                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x05F)",
-                    self.retval_lo + 3
+                    self.retval_lo + 3 <= self.access_bank_hi,
+                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
+                    self.retval_lo + 3,
+                    self.access_bank_hi
                 );
                 self.emit_f32_fptoi_body(val, scr, recipe == "__fptosi_f32");
             }
@@ -4980,14 +5007,16 @@ impl<'m> Gen<'m> {
                 let b = self.slot_addr(name, "b").direct();
                 for addr in [a, a + 3, b, b + 3, scr, scr + 5] {
                     assert!(
-                        addr <= 0x5F,
-                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x05F)"
+                        addr <= self.access_bank_hi,
+                        "float routine {name} frame exceeds the access-bank GPR region (0x{addr:03X} > 0x{:03X})",
+                        self.access_bank_hi
                     );
                 }
                 assert!(
-                    self.retval_lo <= 0x5F,
-                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x05F)",
-                    self.retval_lo
+                    self.retval_lo <= self.access_bank_hi,
+                    "float routine {name} retval exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
+                    self.retval_lo,
+                    self.access_bank_hi
                 );
                 self.emit_f32_cmp_body(a, b, scr);
             }
@@ -5117,6 +5146,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
     let (common_lo, _) = device
         .fixed_retval
         .expect("isel-pic18's fixed retval region needs a fixed_retval reservation");
+    let (_, access_bank_hi) = device
+        .access_bank
+        .expect("isel-pic18's access-bank frame checks need an access_bank reservation");
     let mut out: Vec<String> = Vec::new();
     out.extend(vec![
         "; pic8 -- P2 integer spine (isel-pic18)".to_string(),
@@ -5165,6 +5197,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 addrs,
                 resolved: &resolved,
                 retval_lo: common_lo,
+                access_bank_hi,
                 bsr: None,
                 cur_func: &f.name,
                 isr: f.isr,
@@ -5245,6 +5278,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             addrs,
             resolved: &resolved,
             retval_lo: common_lo,
+            access_bank_hi,
             bsr: None,
             cur_func: &f.name,
             isr: f.isr,
@@ -5467,8 +5501,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
-                    // Access-bank check mirrors Gen::operand: <0x60 or >=0xF60 is A.
-                    if addr < 0x60 || addr >= 0xF60 {
+                    // Access-bank check mirrors Gen::operand.
+                    if addr <= access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
                         init.push(format!("    MOVWF 0x{addr:03X},A"));
                     } else {
                         let bsr = (addr >> 8) as u8;
@@ -5557,6 +5591,7 @@ mod tests {
                 addrs: &addrs,
                 resolved: &resolved,
                 retval_lo: 0,
+                access_bank_hi: 0x5F,
                 bsr: None,
                 cur_func: "f",
                 isr: false,
@@ -5571,6 +5606,7 @@ mod tests {
                 addrs: &addrs,
                 resolved: &resolved,
                 retval_lo: 0,
+                access_bank_hi: 0x5F,
                 bsr: None,
                 cur_func: "f",
                 isr: false,
@@ -5599,6 +5635,7 @@ mod p3_gen_tests {
             addrs,
             resolved,
             retval_lo: 0,
+            access_bank_hi: 0x5F,
             bsr: None,
             cur_func: "main",
             isr: false,
