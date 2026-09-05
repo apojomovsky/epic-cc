@@ -27,19 +27,34 @@
 /// an identical literal, so eliding it is sound; differing tokens are
 /// conservatively kept. A standalone `MOVWF PCLATH` (writing the unknown
 /// value currently in W) forgets the tracked literal.
+use ir::SrcLoc;
+
 pub fn optimize(asm: &str) -> String {
+    optimize_with_locs(asm, &[]).0
+}
+
+/// `optimize` plus a parallel per-line source-location vector, kept
+/// index-aligned with the returned text. An elided `MOVLW k; MOVWF PCLATH`
+/// pair drops its two locs with it; every other line keeps its own loc.
+/// `locs` may be empty (the text-only path); when non-empty it must be the
+/// same length as `asm`'s lines.
+pub fn optimize_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Option<SrcLoc>>) {
     let lines: Vec<&str> = asm.lines().collect();
+    let locs = locs.to_vec();
     let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut out_locs: Vec<Option<SrcLoc>> = Vec::with_capacity(lines.len());
     // Canonical literal of the last `MOVLW k; MOVWF PCLATH` pair.
     let mut tracked: Option<String> = None;
     let mut in_asm = false;
     let mut i = 0;
     while i < lines.len() {
         let line = lines[i];
+        let cur_loc = locs.get(i).cloned().flatten();
         let trimmed = line.trim_start();
         if trimmed.starts_with("; --- asm start ---") {
             in_asm = true;
             out.push(line);
+            out_locs.push(cur_loc);
             tracked = None;
             i += 1;
             continue;
@@ -47,12 +62,14 @@ pub fn optimize(asm: &str) -> String {
         if trimmed.starts_with("; --- asm end ---") {
             in_asm = false;
             out.push(line);
+            out_locs.push(cur_loc);
             tracked = None;
             i += 1;
             continue;
         }
         if in_asm {
             out.push(line);
+            out_locs.push(cur_loc);
             i += 1;
             continue;
         }
@@ -64,6 +81,7 @@ pub fn optimize(asm: &str) -> String {
         // runtime context) must never elide the next function's CALL set.
         if is_label(line) {
             out.push(line);
+            out_locs.push(cur_loc);
             tracked = None;
             i += 1;
             continue;
@@ -76,6 +94,7 @@ pub fn optimize(asm: &str) -> String {
             let next_trimmed = lines[i + 1].trim_start();
             if next_trimmed.starts_with("; --- asm") {
                 out.push(line);
+                out_locs.push(cur_loc);
                 i += 1;
                 continue;
             }
@@ -86,7 +105,9 @@ pub fn optimize(asm: &str) -> String {
                 continue;
             }
             out.push(line);
+            out_locs.push(cur_loc);
             out.push(lines[i + 1]);
+            out_locs.push(locs.get(i + 1).cloned().flatten());
             tracked = Some(literal);
             i += 2;
             continue;
@@ -95,18 +116,20 @@ pub fn optimize(asm: &str) -> String {
             // Standalone write of an unknown value: keep it, forget the
             // tracked literal (it no longer reflects PCLATH).
             out.push(line);
+            out_locs.push(cur_loc);
             tracked = None;
             i += 1;
             continue;
         }
         out.push(line);
+        out_locs.push(cur_loc);
         i += 1;
     }
     let mut result = out.join("\n");
     if asm.ends_with('\n') {
         result.push('\n');
     }
-    result
+    (result, out_locs)
 }
 
 fn is_movlw(line: &str) -> bool {

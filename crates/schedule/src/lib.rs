@@ -22,6 +22,7 @@
 
 use banking::{operand_bank, SKIP_OPS};
 use device::Device;
+use ir::SrcLoc;
 
 /// One classified instruction: everything a reordering decision needs to
 /// know about it. Unrecognized mnemonics never reach this type; `classify`
@@ -400,6 +401,14 @@ fn try_hoist(lines: &mut [Line], i: usize) -> bool {
 /// moving more than one instruction and is explicitly deferred to a
 /// later phase, not silently included here.
 pub fn phase1(lines: &mut [Line]) -> usize {
+    phase1_with_locs(lines, &mut [])
+}
+
+/// `phase1` plus a parallel per-line source-location vector, kept
+/// index-aligned with `lines` through every swap. `locs` may be empty
+/// (the text-only path); when non-empty it must be the same length as
+/// `lines`.
+pub fn phase1_with_locs(lines: &mut [Line], locs: &mut [Option<SrcLoc>]) -> usize {
     let mut swapped = 0usize;
     for region in regions(lines) {
         if region.len() < 3 {
@@ -416,8 +425,18 @@ pub fn phase1(lines: &mut [Line]) -> usize {
                 }
                 _ => false,
             };
-            if excursion && (try_sink(lines, i) || try_hoist(lines, i)) {
-                swapped += 1;
+            if excursion {
+                if try_sink(lines, i) {
+                    if !locs.is_empty() {
+                        locs.swap(i, i + 1);
+                    }
+                    swapped += 1;
+                } else if try_hoist(lines, i) {
+                    if !locs.is_empty() {
+                        locs.swap(i - 1, i);
+                    }
+                    swapped += 1;
+                }
             }
             i += 1;
         }
@@ -508,6 +527,14 @@ fn find_dead_w_gap(lines: &[Line], run: std::ops::Range<usize>) -> Option<usize>
 /// that mistake was real, caught only by working through the exact
 /// example by hand, not a hypothetical worth guarding against.
 pub fn phase2(lines: &mut Vec<Line>) -> usize {
+    phase2_with_locs(lines, &mut Vec::new())
+}
+
+/// `phase2` plus a parallel per-line source-location vector, kept
+/// index-aligned with `lines` through every remove/insert. `locs` may be
+/// empty (the text-only path); when non-empty it must be the same length
+/// as `lines`.
+pub fn phase2_with_locs(lines: &mut Vec<Line>, locs: &mut Vec<Option<SrcLoc>>) -> usize {
     let mut swapped = 0usize;
     'restart: loop {
         for region in regions(lines) {
@@ -577,6 +604,12 @@ pub fn phase2(lines: &mut Vec<Line>) -> usize {
                 let m = lines.remove(i + 1);
                 lines.insert(gap, m);
                 lines.insert(gap, p);
+                if !locs.is_empty() {
+                    let lp = locs.remove(i + 1);
+                    let lm = locs.remove(i + 1);
+                    locs.insert(gap, lm);
+                    locs.insert(gap, lp);
+                }
                 swapped += 1;
                 continue 'restart;
             }
@@ -590,9 +623,22 @@ pub fn phase2(lines: &mut Vec<Line>) -> usize {
 /// mid-block bank switches (ADR-027, epic-cc#210). See `phase1`/`phase2`
 /// for exactly what this does and does not move.
 pub fn schedule(device: &Device, asm: &str) -> String {
+    schedule_with_locs(device, asm, &[]).0
+}
+
+/// `schedule` plus a parallel per-line source-location vector, kept
+/// index-aligned with the returned text through every reorder. `locs` may
+/// be empty (the text-only path); when non-empty it must be the same
+/// length as `asm`'s lines.
+pub fn schedule_with_locs(
+    device: &Device,
+    asm: &str,
+    locs: &[Option<SrcLoc>],
+) -> (String, Vec<Option<SrcLoc>>) {
     let mut lines = classify(device, asm);
-    phase1(&mut lines);
-    phase2(&mut lines);
+    let mut locs = locs.to_vec();
+    phase1_with_locs(&mut lines, &mut locs);
+    phase2_with_locs(&mut lines, &mut locs);
     // `str::lines()` never yields a trailing empty entry for a single
     // final `\n` (or no entry at all for input with none), so joining
     // `lines` back with `\n` and only conditionally appending one more
@@ -605,5 +651,5 @@ pub fn schedule(device: &Device, asm: &str) -> String {
     if asm.ends_with('\n') {
         out.push('\n');
     }
-    out
+    (out, locs)
 }

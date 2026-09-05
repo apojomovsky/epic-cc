@@ -57,6 +57,7 @@
 use std::collections::{HashMap, HashSet};
 
 use device::Device;
+use ir::SrcLoc;
 
 /// `pub`: `crates/schedule` reuses this to avoid a second, independently
 /// drifting copy of which mnemonics take a literal instead of a file
@@ -475,6 +476,20 @@ fn label_provable_banks(
 /// tracked current bank — or whenever the tracked bank is unknown (just after
 /// a label) — and rewrite banked operands to `physical & 0x7F`.
 pub fn assign_banks(device: &Device, asm: &str) -> String {
+    assign_banks_with_locs(device, asm, &[]).0
+}
+
+/// `assign_banks` plus a parallel per-line source-location vector, kept
+/// index-aligned with the returned text. An inserted `BANKSEL` inherits the
+/// source location of the instruction it precedes (the banked operand that
+/// needed the switch); a pass-through line keeps its own loc. `locs` may be
+/// empty (the text-only path); when non-empty it must be the same length as
+/// `asm`'s lines.
+pub fn assign_banks_with_locs(
+    device: &Device,
+    asm: &str,
+    locs: &[Option<SrcLoc>],
+) -> (String, Vec<Option<SrcLoc>>) {
     // Issue #16 (left over from #13): a bank-0-only program provably never
     // leaves bank 0, so the label/CALL resets below can be skipped entirely
     // instead of emitting the dead full BANKSEL preamble after every label
@@ -503,29 +518,37 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
     // has the complete, whole-program label analysis.
     let mut scratch_labels: HashMap<String, BankSet> = HashMap::new();
     let mut out = String::new();
+    let mut out_locs: Vec<Option<SrcLoc>> = Vec::new();
     let mut known = true; // false = the tracked bank is unknown (entered at a branch target)
     let mut rp0 = false; // STATUS, bit 5
     let mut rp1 = false; // STATUS, bit 6
     let mut in_asm = false;
+    let locs = locs.to_vec();
+    let mut li = 0usize;
+    let push =
+        |out: &mut String, out_locs: &mut Vec<Option<SrcLoc>>, line: &str, loc: Option<SrcLoc>| {
+            out.push_str(line);
+            out.push('\n');
+            out_locs.push(loc);
+        };
     for line in asm.lines() {
+        let cur_loc = locs.get(li).cloned().flatten();
+        li += 1;
         let trimmed = line.trim_start();
         if trimmed.starts_with("; --- asm start ---") {
             in_asm = true;
             known = false;
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
         if trimmed.starts_with("; --- asm end ---") {
             in_asm = false;
             known = false;
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
         if in_asm {
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
         // Collect into a Vec so the BANKSEL-recognition branch below can look
@@ -534,8 +557,7 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
         // its operand intact.
         let toks: Vec<&str> = line.trim_start().split_whitespace().collect();
         let Some(mne) = toks.first().copied() else {
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         };
 
@@ -563,8 +585,7 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
                     known = bank0_only;
                 }
             }
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
 
@@ -604,8 +625,7 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
             } else {
                 known = false;
             }
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
 
@@ -616,8 +636,7 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
         // start) must pass through untouched — BANKSEL-rewriting it would
         // relocate the program.
         if mne == "org" || mne == "end" || mne.starts_with('.') {
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
 
@@ -634,22 +653,19 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
                 }
                 None => known = false,
             }
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
 
         // Literal-immediate ops take an 8-bit constant, not a file register.
         if LITERAL_OPS.contains(&mne) {
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         }
 
         // Byte- and bit-oriented ops: the file-register operand is the first.
         let Some(op) = toks.get(1).copied() else {
-            out.push_str(line);
-            out.push('\n');
+            push(&mut out, &mut out_locs, line, cur_loc.clone());
             continue;
         };
         if let Some(hex) = op.trim_end_matches([',', ';', ')']).strip_prefix("0x") {
@@ -657,7 +673,14 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
                 if let Some(bank) = device.bank_of(v) {
                     let cur = u8::from(rp0) | (u8::from(rp1) << 1);
                     if !known || bank != cur {
+                        let before = out.len();
                         emit_banksel(&mut out, &mut rp0, &mut rp1, bank, !known);
+                        // The inserted BANKSEL lines inherit the banked
+                        // operand's source location.
+                        let n = out.len() - before;
+                        for _ in 0..n {
+                            out_locs.push(cur_loc.clone());
+                        }
                         known = true;
                     }
                     let rewritten = v & 0x7F;
@@ -668,15 +691,15 @@ pub fn assign_banks(device: &Device, asm: &str) -> String {
                             1,
                         ));
                         out.push('\n');
+                        out_locs.push(cur_loc.clone());
                         continue;
                     }
                 }
             }
         }
-        out.push_str(line);
-        out.push('\n');
+        push(&mut out, &mut out_locs, line, cur_loc.clone());
     }
-    out
+    (out, out_locs)
 }
 
 fn emit_banksel(out: &mut String, rp0: &mut bool, rp1: &mut bool, bank: u8, full: bool) {

@@ -24,6 +24,7 @@ name = "banking"
 version = "0.1.0"
 dependencies = [
  "device",
+ "ir",
 ]
 
 [[package]]
@@ -173,6 +174,9 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 [[package]]
 name = "peephole"
 version = "0.1.0"
+dependencies = [
+ "ir",
+]
 
 [[package]]
 name = "pic14-sim"
@@ -206,6 +210,7 @@ version = "0.1.0"
 dependencies = [
  "banking",
  "device",
+ "ir",
 ]
 
 [[package]]
