@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use device::Device;
-use ir::{Func, Inst, Module, Ty, Val};
+use ir::{Func, Inst, Module, SrcLoc, Ty, Val};
 use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
@@ -65,12 +65,21 @@ struct Gen<'m> {
     /// the emitted `tmp{n}:` labels stay unique in the single `.asm`
     /// output (mirrors `isel`'s `tmp` field, `crates/isel/src/lib.rs:177`).
     tmp: &'m mut u32,
+    /// The source location of the instruction currently being emitted, or
+    /// `None` for compiler-generated glue (prologue, `__start`, const
+    /// tables, runtime routines). `emit` records it on the line it pushes,
+    /// so the parallel `locs` vector stays index-aligned with `out`.
+    cur_loc: Option<SrcLoc>,
     out: Vec<String>,
+    /// One source location per emitted line, index-aligned with `out`.
+    /// `None` marks a compiler-generated line (no source instruction).
+    locs: Vec<Option<SrcLoc>>,
 }
 
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.out.push(s.into());
+        self.locs.push(self.cur_loc.clone());
     }
 
     /// Emit a label line AND reset the tracked `BSR` (`self.bsr = None`).
@@ -1222,6 +1231,7 @@ impl<'m> Gen<'m> {
     }
 
     fn emit_inst(&mut self, i: &Inst) {
+        self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
                 assert!(l.ty != Ty::I1, "isel-pic18: only i8/i16 loads supported");
@@ -1415,6 +1425,7 @@ impl<'m> Gen<'m> {
                                 dst: b.dst.clone(),
                                 a: b.b.clone(),
                                 b: Val::Const(k),
+                                loc: b.loc.clone(),
                             };
                             // Re-enter the Bin arm with swapped operands via
                             // the normal per-byte loop: emit the swapped bin
@@ -5143,6 +5154,18 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
 }
 
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
+    select_with_locs(device, m, addrs).0
+}
+
+/// `select` plus a parallel per-line source-location vector, index-aligned
+/// with the returned asm text. `None` marks a compiler-generated line (the
+/// header, `__start`, const tables, prologue glue). The driver threads this
+/// through to build the address-to-line table.
+pub fn select_with_locs(
+    device: &Device,
+    m: &Module,
+    addrs: &HashMap<String, u16>,
+) -> (String, Vec<Option<SrcLoc>>) {
     let (common_lo, _) = device
         .fixed_retval
         .expect("isel-pic18's fixed retval region needs a fixed_retval reservation");
@@ -5150,6 +5173,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         .access_bank
         .expect("isel-pic18's access-bank frame checks need an access_bank reservation");
     let mut out: Vec<String> = Vec::new();
+    let mut locs: Vec<Option<SrcLoc>> = Vec::new();
     out.extend(vec![
         "; pic8 -- P2 integer spine (isel-pic18)".to_string(),
         format!("    list p={}", device.name),
@@ -5160,11 +5184,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "    goto __start".to_string(),
         "".to_string(),
     ]);
+    locs.extend(std::iter::repeat(None).take(8));
     if !m.module_asm.is_empty() {
         out.push("; module asm".to_string());
+        locs.push(None);
         for entry in &m.module_asm {
             for line in entry.split('\n') {
                 out.push(line.to_string());
+                locs.push(None);
             }
         }
     }
@@ -5202,16 +5229,21 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 cur_func: &f.name,
                 isr: f.isr,
                 tmp: &mut tmp,
+                cur_loc: None,
                 out: Vec::new(),
+                locs: Vec::new(),
             };
             g.emit_routine();
             out.extend(g.out);
+            locs.extend(g.locs);
             continue;
         }
         // CC-4 naked: verbatim, no prologue, panic on non-Asm, barrier markers.
         if f.naked {
             out.push(format!("{}:", f.name));
+            locs.push(None);
             out.push("; --- asm start ---".to_string());
+            locs.push(None);
             for b in &f.blocks {
                 for inst in &b.insts {
                     match inst {
@@ -5252,6 +5284,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                             }
                             for line in substituted.split('\n') {
                                 out.push(line.to_string());
+                                locs.push(None);
                             }
                         }
                         _ => panic!(
@@ -5262,7 +5295,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 }
             }
             out.push("; --- asm end ---".to_string());
+            locs.push(None);
             out.push("".to_string());
+            locs.push(None);
             continue;
         }
         if f.isr {
@@ -5272,6 +5307,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             // at 0x0000 reaches it regardless: PIC18 GOTO/CALL are absolute
             // 20-bit.
             out.push("    org 0x0008".to_string());
+            locs.push(None);
         }
         let mut g = Gen {
             m,
@@ -5283,7 +5319,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             cur_func: &f.name,
             isr: f.isr,
             tmp: &mut tmp,
+            cur_loc: None,
             out: Vec::new(),
+            locs: Vec::new(),
         };
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
@@ -5362,12 +5400,13 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             for inst in &b.insts {
                 match inst {
                     Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
-                    Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(inst),
+                    Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(inst),
                     other => g.emit_inst(other),
                 }
             }
             match terminator {
                 Some(Inst::Br(br)) => {
+                    g.cur_loc = br.loc.clone();
                     let merge = br.target.clone();
                     if let Some(c) = phi_copies.get(&(b.label.clone(), merge.clone())) {
                         emit_phi_copies(&mut g, c, doms[&b.label].contains(&merge));
@@ -5375,6 +5414,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     g.emit(format!("    BRA {}", labels[&merge]));
                 }
                 Some(Inst::BrCond(bc)) => {
+                    g.cur_loc = bc.loc.clone();
                     // Same hazard class as `Select`'s cond (Task 11, see
                     // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
                     // `Val::Const` arm emits only `MOVLW`, which does not
@@ -5436,7 +5476,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                         }
                     }
                 }
-                Some(Inst::Ret(None)) if g.isr => {
+                Some(Inst::Ret(None, loc)) if g.isr => {
+                    g.cur_loc = loc.clone();
                     // The ISR restore epilogue replaces `ret`. MOVFF-based
                     // (never touches STATUS), so the interrupted main's
                     // Z/N come back intact; only the final W restore via
@@ -5462,14 +5503,18 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     g.emit("    MOVF 0x0004, W, A".to_string()); // W last
                     g.emit("    RETFIE".to_string());
                 }
-                Some(Inst::Ret(Some(_))) if g.isr => {
+                Some(Inst::Ret(Some(_), _)) if g.isr => {
                     panic!(
                         "isel-pic18: interrupt handler @{} must be void (cannot return a value)",
                         f.name
                     )
                 }
-                Some(Inst::Ret(None)) => g.emit("    RETURN".to_string()),
-                Some(Inst::Ret(Some((ty, v)))) => {
+                Some(Inst::Ret(None, loc)) => {
+                    g.cur_loc = loc.clone();
+                    g.emit("    RETURN".to_string())
+                }
+                Some(Inst::Ret(Some((ty, v)), loc)) => {
+                    g.cur_loc = loc.clone();
                     for i in 0..ty.bytes() {
                         g.emit_load_w(v, i);
                         let (a, f2) = g.operand(g.retval_lo + u16::from(i));
@@ -5482,6 +5527,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
         }
         out.extend(g.out);
+        locs.extend(g.locs);
     }
     // `__start` calls `main` and halts; matches the shape `isel::select`
     // uses for its own program entry, minus the ISR machinery (P5).
@@ -5513,9 +5559,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             }
         }
         out.push("__start:".to_string());
+        locs.push(None);
+        let init_len = init.len();
         out.extend(init);
+        locs.extend(std::iter::repeat(None).take(init_len));
         out.push("    call main".to_string());
+        locs.push(None);
         out.push("    sleep".to_string());
+        locs.push(None);
     }
     // P4: every `const` (flash) global becomes a `DB` table after the code,
     // before `end`. The bytes are the flat LE blob `irparse` decoded; the
@@ -5533,6 +5584,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             g.name
         );
         out.push(format!("{}:", g.name));
+        locs.push(None);
         // Chunk the plain bytes 8 per line (the pre-#154 layout); a
         // function-address field (epic-cc#154) materializes the link-time
         // label literal, byte 0 = LOW(fn), byte 1 = HIGH(fn), resolved by
@@ -5542,27 +5594,33 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
                 if !chunk.is_empty() {
                     out.push(format!("    db {}", chunk.join(", ")));
+                    locs.push(None);
                     chunk.clear();
                 }
                 let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
                 out.push(format!("    db {lit}({f})"));
+                locs.push(None);
             } else {
                 chunk.push(format!("0x{b:02X}"));
                 if chunk.len() == 8 {
                     out.push(format!("    db {}", chunk.join(", ")));
+                    locs.push(None);
                     chunk.clear();
                 }
             }
         }
         if !chunk.is_empty() {
             out.push(format!("    db {}", chunk.join(", ")));
+            locs.push(None);
         }
         out.push("".to_string());
+        locs.push(None);
     }
     // gpasm requires the `end` directive (our own assembler tolerates its
     // absence); PIC14's `isel::select` emits it the same way.
     out.push("    end".to_string());
-    out.join("\n") + "\n"
+    locs.push(None);
+    (out.join("\n") + "\n", locs)
 }
 
 #[cfg(test)]
@@ -5596,7 +5654,9 @@ mod tests {
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
+                cur_loc: None,
                 out: Vec::new(),
+                locs: Vec::new(),
             };
             g.fresh_label()
         };
@@ -5611,7 +5671,9 @@ mod tests {
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
+                cur_loc: None,
                 out: Vec::new(),
+                locs: Vec::new(),
             };
             g.fresh_label()
         };
@@ -5640,7 +5702,9 @@ mod p3_gen_tests {
             cur_func: "main",
             isr: false,
             tmp,
+            cur_loc: None,
             out: Vec::new(),
+            locs: Vec::new(),
         }
     }
 

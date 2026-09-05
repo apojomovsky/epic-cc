@@ -67,12 +67,14 @@ pub struct Load {
     /// a ptr arg pass all read those bytes). False for value loads
     /// (i1/i8/i16/f32), which lower as plain copies.
     pub ptr_ty: bool,
+    pub loc: Option<SrcLoc>,
 } // ptr = "@name" or "%name"
 #[derive(Clone, Debug)]
 pub struct Store {
     pub ty: Ty,
     pub val: Val,
     pub ptr: String,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Bin {
@@ -81,6 +83,7 @@ pub struct Bin {
     pub ty: Ty,
     pub a: Val,
     pub b: Val,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Zext {
@@ -88,6 +91,7 @@ pub struct Zext {
     pub from: Ty,
     pub val: Val,
     pub to: Ty,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 /// `%d = inttoptr <from> <val> to ptr`: a runtime integer address becoming a
@@ -100,6 +104,7 @@ pub struct IntToPtr {
     pub from: Ty,
     pub val: Val,
     pub to: Ty,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Sext {
@@ -107,6 +112,7 @@ pub struct Sext {
     pub from: Ty,
     pub val: Val,
     pub to: Ty,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Trunc {
@@ -114,6 +120,7 @@ pub struct Trunc {
     pub from: Ty,
     pub val: Val,
     pub to: Ty,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Icmp {
@@ -122,6 +129,7 @@ pub struct Icmp {
     pub ty: Ty,
     pub a: Val,
     pub b: Val,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Select {
@@ -135,6 +143,7 @@ pub struct Select {
     /// by neither backend (lowered at each load/store use). False for value
     /// selects (i1/i8/i16/f32), which both backends lower as a copy.
     pub ptr: bool,
+    pub loc: Option<SrcLoc>,
 }
 /// A C source location for diagnostics: the `file.c:line:col` of the user
 /// construct a panic refers to. Resolved in `irparse` from clang's
@@ -175,19 +184,22 @@ pub struct Call {
     /// Source location of the call in the user's C, when the module was
     /// parsed from debug-info-carrying LLVM IR. `None` means compiler
     /// generated: legalize's runtime routines, or a canonical-text
-    /// reparse. Diagnostics read it; the backend ignores it and the
-    /// canonical text does not carry it.
+    /// reparse. Diagnostics read it; the backend threads it through to the
+    /// address-to-line table (epic-cc#238) and the canonical text does not
+    /// carry it.
     pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Br {
     pub target: String,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct BrCond {
     pub cond: Val,
     pub t: String,
     pub f: String,
+    pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
 pub struct Phi {
@@ -200,6 +212,7 @@ pub struct Phi {
     /// iselcore as an indirect slot; a phi with a compile-time (folded)
     /// arm keeps the loud unresolvable-chain panic.
     pub ptr: bool,
+    pub loc: Option<SrcLoc>,
 }
 /// A getelementptr, reworked for structs/arrays: `base` is a global or a
 /// pointer reg, `k` a constant byte offset, and `terms` scaled dynamic
@@ -210,6 +223,7 @@ pub struct Gep {
     pub base: GepBase,
     pub k: u8,
     pub terms: Vec<(u8, String)>,
+    pub loc: Option<SrcLoc>,
 }
 /// `alloca`: a local buffer of `size` bytes (virtual, isel allocates no
 /// registers; alloc sizes the slot). `size` is a `u8` (max 255 bytes);
@@ -219,6 +233,7 @@ pub struct Gep {
 pub struct Alloca {
     pub dst: String,
     pub size: u8,
+    pub loc: Option<SrcLoc>,
 }
 /// `memcpy`: byte-copy `len` bytes from `src` to `dst` (defines nothing).
 /// `len` is either a compile-time constant (unrolled per byte) or a 16-bit
@@ -234,6 +249,7 @@ pub struct Memcpy {
     pub dst: Val,
     pub src: Val,
     pub len: MemLen,
+    pub loc: Option<SrcLoc>,
 }
 /// `freeze`: LLVM freeze (`%d = freeze <ty> <val>`). A no-op in the backend —
 /// it exists so the IR round-trips the source; isel lowers it as a plain byte
@@ -243,6 +259,7 @@ pub struct Freeze {
     pub dst: String,
     pub ty: Ty,
     pub val: Val,
+    pub loc: Option<SrcLoc>,
 }
 
 /// `va_arg`: read the next variadic argument of type `ty` from the
@@ -260,6 +277,7 @@ pub struct VaArg {
     /// the value is a runtime pointer (an address), seeded by iselcore as
     /// an indirect slot like an IntToPtr result.
     pub ptr_ty: bool,
+    pub loc: Option<SrcLoc>,
 }
 /// `va_start`: reset the function's va_list slot to offset 0 of the
 /// `__va` region. The backends zero the slot at entry; the node exists so
@@ -268,6 +286,7 @@ pub struct VaArg {
 pub struct VaStart {
     /// The va_list slot name.
     pub list: String,
+    pub loc: Option<SrcLoc>,
 }
 
 /// The four float arithmetic ops (always f32 — msp430's float == f32).
@@ -285,6 +304,7 @@ pub struct FloatBin {
     pub op: FBinOp,
     pub a: Val,
     pub b: Val,
+    pub loc: Option<SrcLoc>,
 }
 /// `%d = fcmp <pred> float %a %b` — the 16 LLVM float predicates; dst is i1.
 #[derive(Clone, Debug, PartialEq)]
@@ -293,6 +313,7 @@ pub struct Fcmp {
     pub pred: String,
     pub a: Val,
     pub b: Val,
+    pub loc: Option<SrcLoc>,
 }
 /// The int<->float conversions and the f32->f32 casts (fpext/fptrunc are
 /// no-ops on msp430 — double == float — but round-trip for the text).
@@ -313,6 +334,7 @@ pub struct FloatConv {
     pub from: Ty,
     pub val: Val,
     pub to: Ty,
+    pub loc: Option<SrcLoc>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -330,6 +352,7 @@ pub struct Asm {
     pub template: String,
     pub clobbers_memory: bool,
     pub operands: Vec<AsmOperand>,
+    pub loc: Option<SrcLoc>,
 }
 
 #[derive(Clone, Debug)]
@@ -337,7 +360,7 @@ pub enum Inst {
     Load(Load),
     Store(Store),
     Bin(Bin),
-    Ret(Option<(Ty, Val)>),
+    Ret(Option<(Ty, Val)>, Option<SrcLoc>),
     Zext(Zext),
     Sext(Sext),
     Trunc(Trunc),
@@ -358,6 +381,40 @@ pub enum Inst {
     Fcmp(Fcmp),
     FloatConv(FloatConv),
     Asm(Asm),
+}
+
+impl Inst {
+    /// The C source location this instruction was parsed from, if any.
+    /// `None` means compiler generated (legalize's runtime routines, a
+    /// canonical-text reparse) or a line with no `!dbg` metadata.
+    pub fn loc(&self) -> Option<&SrcLoc> {
+        match self {
+            Inst::Load(i) => i.loc.as_ref(),
+            Inst::Store(i) => i.loc.as_ref(),
+            Inst::Bin(i) => i.loc.as_ref(),
+            Inst::Ret(_, loc) => loc.as_ref(),
+            Inst::Zext(i) => i.loc.as_ref(),
+            Inst::Sext(i) => i.loc.as_ref(),
+            Inst::Trunc(i) => i.loc.as_ref(),
+            Inst::IntToPtr(i) => i.loc.as_ref(),
+            Inst::Icmp(i) => i.loc.as_ref(),
+            Inst::Select(i) => i.loc.as_ref(),
+            Inst::Call(i) => i.loc.as_ref(),
+            Inst::Br(i) => i.loc.as_ref(),
+            Inst::BrCond(i) => i.loc.as_ref(),
+            Inst::Phi(i) => i.loc.as_ref(),
+            Inst::Gep(i) => i.loc.as_ref(),
+            Inst::Alloca(i) => i.loc.as_ref(),
+            Inst::Memcpy(i) => i.loc.as_ref(),
+            Inst::Freeze(i) => i.loc.as_ref(),
+            Inst::VaArg(i) => i.loc.as_ref(),
+            Inst::VaStart(i) => i.loc.as_ref(),
+            Inst::FloatBin(i) => i.loc.as_ref(),
+            Inst::Fcmp(i) => i.loc.as_ref(),
+            Inst::FloatConv(i) => i.loc.as_ref(),
+            Inst::Asm(i) => i.loc.as_ref(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -631,8 +688,8 @@ fn inst_str(i: &Inst) -> String {
             val_str(&b.a),
             val_str(&b.b)
         ),
-        Inst::Ret(None) => "ret void".into(),
-        Inst::Ret(Some((t, v))) => format!("ret {} {}", ty_str(*t), val_str(v)),
+        Inst::Ret(None, _) => "ret void".into(),
+        Inst::Ret(Some((t, v)), _) => format!("ret {} {}", ty_str(*t), val_str(v)),
         Inst::Zext(z) => format!(
             "%{} = zext {} {} to {}",
             z.dst,
@@ -1240,6 +1297,7 @@ fn parse_inst(line: &str) -> Inst {
                     template,
                     clobbers_memory,
                     operands,
+                    loc: None,
                 });
             } else {
                 rest = after;
@@ -1281,6 +1339,7 @@ fn parse_inst(line: &str) -> Inst {
                 template,
                 clobbers_memory,
                 operands,
+                loc: None,
             });
         } else {
             rest = after;
@@ -1305,10 +1364,11 @@ fn parse_inst(line: &str) -> Inst {
             template,
             clobbers_memory,
             operands,
+            loc: None,
         });
     }
     if line == "ret" {
-        return Inst::Ret(None);
+        return Inst::Ret(None, None);
     }
     if let Some(rest) = line.strip_prefix("memcpy ") {
         let mut it = rest.split_whitespace();
@@ -1320,7 +1380,12 @@ fn parse_inst(line: &str) -> Inst {
         } else {
             MemLen::Const(len_tok.parse().unwrap())
         };
-        return Inst::Memcpy(Memcpy { dst, src, len });
+        return Inst::Memcpy(Memcpy {
+            dst,
+            src,
+            len,
+            loc: None,
+        });
     }
     if let Some(rest) = line.strip_prefix("store ") {
         let parts: Vec<&str> = rest.split_whitespace().collect();
@@ -1328,15 +1393,16 @@ fn parse_inst(line: &str) -> Inst {
             ty: parse_ty(parts[0]),
             val: parse_val(parts[1]),
             ptr: parts[2].to_string(),
+            loc: None,
         });
     }
     if let Some(rest) = line.strip_prefix("ret ") {
         if rest == "void" {
-            return Inst::Ret(None);
+            return Inst::Ret(None, None);
         }
         let mut it = rest.split_whitespace();
         let t = parse_ty(it.next().unwrap());
-        return Inst::Ret(Some((t, parse_val(it.next().unwrap()))));
+        return Inst::Ret(Some((t, parse_val(it.next().unwrap()))), None);
     }
     if let Some(rest) = line.strip_prefix("br ") {
         if let Some(r) = rest.strip_prefix("i1 ") {
@@ -1354,7 +1420,12 @@ fn parse_inst(line: &str) -> Inst {
             }
             let t = t.trim_start_matches('%').trim_end_matches(',').to_string();
             let f = f.trim_start_matches('%').trim_end_matches(',').to_string();
-            return Inst::BrCond(BrCond { cond, t, f });
+            return Inst::BrCond(BrCond {
+                cond,
+                t,
+                f,
+                loc: None,
+            });
         }
         return Inst::Br(Br {
             target: rest
@@ -1362,6 +1433,7 @@ fn parse_inst(line: &str) -> Inst {
                 .unwrap_or(rest)
                 .trim_start_matches('%')
                 .to_string(),
+            loc: None,
         });
     }
     if let Some(rest) = line.strip_prefix("call ") {
@@ -1378,6 +1450,7 @@ fn parse_inst(line: &str) -> Inst {
     if let Some(rest) = line.strip_prefix("va_start ") {
         return Inst::VaStart(VaStart {
             list: rest.trim().to_string(),
+            loc: None,
         });
     }
     // defining instruction: %d = op ...
@@ -1396,6 +1469,7 @@ fn parse_inst(line: &str) -> Inst {
             ty: t,
             ptr,
             ptr_ty,
+            loc: None,
         });
     }
     if let Some(rest) = body.strip_prefix("load ") {
@@ -1409,6 +1483,7 @@ fn parse_inst(line: &str) -> Inst {
             ty: t,
             ptr,
             ptr_ty,
+            loc: None,
         });
     }
     if let Some(rest) = body.strip_prefix("call ") {
@@ -1424,7 +1499,11 @@ fn parse_inst(line: &str) -> Inst {
     }
     if let Some(rest) = body.strip_prefix("alloca ") {
         let size = rest.trim().parse().unwrap();
-        return Inst::Alloca(Alloca { dst, size });
+        return Inst::Alloca(Alloca {
+            dst,
+            size,
+            loc: None,
+        });
     }
     if let Some(rest) = body.strip_prefix("inttoptr ") {
         let mut it = rest.split_whitespace();
@@ -1436,7 +1515,13 @@ fn parse_inst(line: &str) -> Inst {
             "inttoptr must be '%d = inttoptr <t> <v> to <t2>'"
         );
         let to = parse_ty(it.next().unwrap());
-        return Inst::IntToPtr(IntToPtr { dst, from, val, to });
+        return Inst::IntToPtr(IntToPtr {
+            dst,
+            from,
+            val,
+            to,
+            loc: None,
+        });
     }
     if let Some(rest) = body.strip_prefix("zext ") {
         let mut it = rest.split_whitespace();
@@ -1448,7 +1533,13 @@ fn parse_inst(line: &str) -> Inst {
             "zext must be '%d = zext <t> <v> to <t2>'"
         );
         let to = parse_ty(it.next().unwrap());
-        return Inst::Zext(Zext { dst, from, val, to });
+        return Inst::Zext(Zext {
+            dst,
+            from,
+            val,
+            to,
+            loc: None,
+        });
     }
     if let Some(rest) = body.strip_prefix("trunc ") {
         let mut it = rest.split_whitespace();
@@ -1460,7 +1551,13 @@ fn parse_inst(line: &str) -> Inst {
             "trunc must be '%d = trunc <t> <v> to <t2>'"
         );
         let to = parse_ty(it.next().unwrap());
-        return Inst::Trunc(Trunc { dst, from, val, to });
+        return Inst::Trunc(Trunc {
+            dst,
+            from,
+            val,
+            to,
+            loc: None,
+        });
     }
     if let Some(rest) = body.strip_prefix("icmp ") {
         let mut it = rest.split_whitespace();
@@ -1480,6 +1577,7 @@ fn parse_inst(line: &str) -> Inst {
             ty: t,
             a,
             b,
+            loc: None,
         });
     }
     if let Some(rest) = body.strip_prefix("sext ") {
@@ -1492,7 +1590,13 @@ fn parse_inst(line: &str) -> Inst {
             "sext must be '%d = sext <t> <v> to <t2>'"
         );
         let to = parse_ty(it.next().unwrap());
-        return Inst::Sext(Sext { dst, from, val, to });
+        return Inst::Sext(Sext {
+            dst,
+            from,
+            val,
+            to,
+            loc: None,
+        });
     }
     if let Some(rest) = body.strip_prefix("select ") {
         let mut it = rest.split_whitespace();
@@ -1514,6 +1618,7 @@ fn parse_inst(line: &str) -> Inst {
                 a,
                 b,
                 ptr: true,
+                loc: None,
             });
         }
         let ty = parse_ty(t);
@@ -1530,6 +1635,7 @@ fn parse_inst(line: &str) -> Inst {
             a,
             b,
             ptr: false,
+            loc: None,
         });
     }
     if let Some(rest) = body.strip_prefix("phi ") {
@@ -1550,6 +1656,7 @@ fn parse_inst(line: &str) -> Inst {
             ty: t,
             ptr,
             incoming,
+            loc: None,
         });
     }
     if let Some(rest) = body.strip_prefix("gep ") {
@@ -1559,13 +1666,19 @@ fn parse_inst(line: &str) -> Inst {
             base,
             k,
             terms,
+            loc: None,
         });
     }
     if let Some(rest) = body.strip_prefix("freeze ") {
         let mut it = rest.split_whitespace();
         let t = parse_ty(it.next().unwrap());
         let val = parse_val(it.next().unwrap());
-        return Inst::Freeze(Freeze { dst, ty: t, val });
+        return Inst::Freeze(Freeze {
+            dst,
+            ty: t,
+            val,
+            loc: None,
+        });
     }
     let mut it = body.split_whitespace();
     let op = it.next().unwrap();
@@ -1582,7 +1695,13 @@ fn parse_inst(line: &str) -> Inst {
             "fmul" => FBinOp::FMul,
             _ => FBinOp::FDiv,
         };
-        return Inst::FloatBin(FloatBin { dst, op: o, a, b });
+        return Inst::FloatBin(FloatBin {
+            dst,
+            op: o,
+            a,
+            b,
+            loc: None,
+        });
     }
     // fcmp: `%d = fcmp <pred> float %a %b` (dst is i1).
     if op == "fcmp" {
@@ -1591,7 +1710,13 @@ fn parse_inst(line: &str) -> Inst {
         assert!(t == Ty::F32, "fcmp must be f32, got {t:?}");
         let a = parse_val(it.next().unwrap());
         let b = parse_val(it.next().unwrap());
-        return Inst::Fcmp(Fcmp { dst, pred, a, b });
+        return Inst::Fcmp(Fcmp {
+            dst,
+            pred,
+            a,
+            b,
+            loc: None,
+        });
     }
     // conversions/casts: `%d = fptosi <from> <val> to <to>` etc.
     if matches!(
@@ -1620,6 +1745,7 @@ fn parse_inst(line: &str) -> Inst {
             from,
             val,
             to,
+            loc: None,
         });
     }
     let t = parse_ty(it.next().unwrap());
@@ -1647,5 +1773,6 @@ fn parse_inst(line: &str) -> Inst {
         ty: t,
         a,
         b,
+        loc: None,
     })
 }

@@ -532,7 +532,7 @@ define dso_local void @main() local_unnamed_addr #1 {
         other => panic!("expected i32 add, got {other:?}"),
     }
     match &fbody[1] {
-        Inst::Ret(Some((ty, _))) => assert_eq!(*ty, ir::Ty::I32),
+        Inst::Ret(Some((ty, _)), _) => assert_eq!(*ty, ir::Ty::I32),
         other => panic!("expected i32 ret, got {other:?}"),
     }
 
@@ -541,7 +541,7 @@ define dso_local void @main() local_unnamed_addr #1 {
     // load i32, call i32, store i32, icmp ult i32, zext i1->i32, store,
     // trunc i32->i16, sext i16->i32, store, ret = 10
     assert_eq!(body.len(), 10);
-    assert!(matches!(body.last(), Some(Inst::Ret(None))));
+    assert!(matches!(body.last(), Some(Inst::Ret(None, _))));
     assert!(matches!(&body[0], Inst::Load(l) if l.ty == ir::Ty::I32));
     match &body[1] {
         Inst::Call(c) => {
@@ -1609,7 +1609,7 @@ define void @call_promoted() {
     // ret float 0x3FB99999A0000000 -> Const(0.1f bits), not the low-32
     // truncation 0xA0000000.
     match &f("ret_promoted").blocks[0].insts[0] {
-        Inst::Ret(Some((ty, val))) => {
+        Inst::Ret(Some((ty, val)), _) => {
             assert_eq!(*ty, ir::Ty::F32);
             assert_eq!(
                 *val,

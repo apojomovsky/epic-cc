@@ -22,6 +22,7 @@ pub struct Cli {
     pub save_temps: Option<String>,
     pub verbose: bool,
     pub map: Option<String>,
+    pub line_table: Option<String>,
 }
 
 pub const USAGE: &str = "\
@@ -36,6 +37,8 @@ usage: epic-cc [options] <input.c>...
   --save-temps <dir>   write every stage artifact into <dir>
   --map <file>         write the symbol-to-address map (globals and
                        {func}::{name} locals) into <file>
+  --line-table <file>  write the address-to-source-line table into <file>
+                       (one `file:line:col <addr>` record per word)
   -v                   echo the clang and llvm-link commands
   --version, -V        print the compiler identity (e.g. epic-cc 0.0.0-master-<sha>)
 ";
@@ -51,6 +54,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut save_temps = None;
     let mut verbose = false;
     let mut map = None;
+    let mut line_table = None;
 
     let mut i = 0;
     while i < argv.len() {
@@ -107,6 +111,13 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         } else if a == "--map" {
             i += 1;
             map = Some(argv.get(i).cloned().ok_or("epic-cc: --map needs a value")?);
+        } else if a == "--line-table" {
+            i += 1;
+            line_table = Some(
+                argv.get(i)
+                    .cloned()
+                    .ok_or("epic-cc: --line-table needs a value")?,
+            );
         } else if a == "-v" {
             verbose = true;
         } else if a.starts_with('-') {
@@ -131,5 +142,6 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         save_temps,
         verbose,
         map,
+        line_table,
     })
 }

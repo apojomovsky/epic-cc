@@ -44,7 +44,7 @@
 //! layout) and panics loudly if a value is missing from it.
 
 use device::Device;
-use ir::{BinOp, Inst, MemLen, Module, Ty, Val};
+use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
 use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 use std::collections::{HashMap, HashSet};
 
@@ -198,13 +198,22 @@ struct Gen<'m> {
     /// already relies on), so nothing outside this straight-line sequence
     /// can touch it either.
     w_holds: Option<u16>,
+    /// The source location of the instruction currently being emitted, or
+    /// `None` for compiler-generated glue (prologue, `__start`, const init,
+    /// runtime routines). `emit` records it on the line it pushes, so the
+    /// parallel `locs` vector stays index-aligned with `out`.
+    cur_loc: Option<SrcLoc>,
     out: Vec<String>,
+    /// One source location per emitted line, index-aligned with `out`.
+    /// `None` marks a compiler-generated line (no source instruction).
+    locs: Vec<Option<SrcLoc>>,
 }
 
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.w_holds = None;
         self.out.push(s.into());
+        self.locs.push(self.cur_loc.clone());
     }
 
     /// `MOVWF addr`, unless `addr` is already known to hold W's value from
@@ -2426,6 +2435,7 @@ impl<'m> Gen<'m> {
     }
 
     fn emit_inst(&mut self, i: &Inst) {
+        self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
                 assert!(l.ty != Ty::I1, "isel: only i8/i16 loads supported");
@@ -2894,6 +2904,7 @@ impl<'m> Gen<'m> {
     }
 
     fn emit_terminator(&mut self, t: &Inst, labels: &HashMap<String, String>) {
+        self.cur_loc = t.loc().cloned();
         match t {
             Inst::Br(br) => {
                 let l = &labels[&br.target];
@@ -2904,8 +2915,8 @@ impl<'m> Gen<'m> {
                 let lf = &labels[&b.f];
                 self.emit_cond_branch(&b.cond, lt, lf);
             }
-            Inst::Ret(None) => self.emit("    RETURN".to_string()),
-            Inst::Ret(Some((ty, v))) => {
+            Inst::Ret(None, _) => self.emit("    RETURN".to_string()),
+            Inst::Ret(Some((ty, v)), _) => {
                 // Copy the value into the fixed retval slots (0x71..0x74 for
                 // i32), then RETURN.
                 for i in 0..ty.bytes() {
@@ -5746,6 +5757,10 @@ fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
 /// (every PCLATH restore present) to drive the page assignment, pass
 /// B re-emits it with same-page restores skipped.
 fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
+    // Labels, prologue, and phi-copy glue are compiler-generated: no source
+    // instruction owns them, so they must not inherit a stale loc from the
+    // previous function's last instruction.
+    g.cur_loc = None;
     // Runtime routines (legalize-injected): the entry block holds only the
     // scratch alloca, so instead of the (empty) block emission the recipe
     // body goes here: the label, the adapted epicurus asm, and the RETURN
@@ -5879,7 +5894,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         for i in &b.insts {
             match i {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
-                Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(i),
+                Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
                 _ => g.emit_inst(i),
             }
         }
@@ -5987,7 +6002,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                         // moved value after STATUS was already restored,
                         // corrupting the interrupted main's Z). RETFIE pops the
                         // hardware-pushed return.
-                        Inst::Ret(None) => {
+                        Inst::Ret(None, _) => {
                             g.emit("    MOVF 0x79, W");
                             g.emit("    MOVWF 0x71");
                             g.emit("    MOVF 0x7A, W");
@@ -6007,7 +6022,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                             g.emit("    SWAPF 0x75, W");
                             g.emit("    RETFIE");
                         }
-                        Inst::Ret(Some(_)) => panic!(
+                        Inst::Ret(Some(_), _) => panic!(
                             "isel: interrupt handler @{} must be void (cannot return a value)",
                             f.name
                         ),
@@ -6394,6 +6409,20 @@ fn measure_end_org(text: &str) -> usize {
 /// same-page restores skipped (the pads pin the page bases, so the elision
 /// never moves a function off its assigned page).
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
+    select_with_locs(device, m, addrs).0
+}
+
+/// `select` plus a parallel per-line source-location vector, index-aligned
+/// with the returned asm text. `None` marks a compiler-generated line (the
+/// header, `__start`, const tables, prologue glue). The driver threads this
+/// through banking/peephole to build the address-to-line table.
+pub fn select_with_locs(
+    device: &Device,
+    m: &Module,
+    addrs: &HashMap<String, u16>,
+) -> (String, Vec<Option<SrcLoc>>) {
+    let mut out: Vec<String> = Vec::new();
+    let mut locs: Vec<Option<SrcLoc>> = Vec::new();
     // The device's interrupt vector(s) (the hardware pushes the return PC
     // and clears GIE; PCLATH is untouched). The vector IS the ISR entry:
     // no GOTO, since a GOTO's target page would depend on the interrupted
@@ -6445,7 +6474,6 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "isel: ISR save area 0x{isr_save_lo:02X}-0x{isr_save_hi:02X} must leave 0x{:02X}-0x{common_hi:02X} free",
         isr_save_hi + 1,
     );
-    let mut out: Vec<String> = Vec::new();
     out.extend(vec![
         "; pic8 -- integer spine milestone 2 (isel)".to_string(),
         format!("    list p={}", device.name),
@@ -6461,11 +6489,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         "    goto __start".to_string(),
         "".to_string(),
     ]);
+    locs.extend(std::iter::repeat(None).take(13));
     if !m.module_asm.is_empty() {
         out.push("; module asm".to_string());
+        locs.push(None);
         for entry in &m.module_asm {
             for line in entry.split('\n') {
                 out.push(line.to_string());
+                locs.push(None);
             }
         }
     }
@@ -6504,7 +6535,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             "    SLEEP".to_string(),
             "".to_string(),
         ]);
+        let start_len = start_block.len();
         out.extend(start_block);
+        locs.extend(std::iter::repeat(None).take(start_len));
     }
     // Phase-3 pointers: resolve every GEP's chain eagerly to a folded
     // `(base, k, terms)`, keyed `{func}::{reg}` like every other local.
@@ -6544,7 +6577,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 tmp: &mut tmp,
                 page_of: None,
                 w_holds: None,
+                cur_loc: None,
                 out: Vec::new(),
+                locs: Vec::new(),
             };
             emit_func_body(&mut g, f);
             bodies.push((f.name.clone(), word_size(&g.out)));
@@ -6815,15 +6850,19 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     tmp: &mut tmp,
                     page_of: Some(&pages),
                     w_holds: None,
+                    cur_loc: None,
                     out: Vec::new(),
+                    locs: Vec::new(),
                 };
                 emit_func_body(&mut g, f);
                 if let Some(pad) = pads.get(*name) {
                     out.push(format!("    org 0x{pad:04X}"));
+                    locs.push(None);
                     addr_b = *pad;
                 }
                 addr_b += word_size(&g.out);
                 out.extend(g.out);
+                locs.extend(g.locs);
                 if f.isr {
                     // `__start` moves after the ISR (the vector owns word 4):
                     // the reset GOTO at word 0 still reaches it, since it stays in
@@ -6850,7 +6889,9 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                         "    SLEEP".to_string(),
                         "".to_string(),
                     ]);
+                    let blk_len = blk.len();
                     out.extend(blk);
+                    locs.extend(std::iter::repeat(None).take(blk_len));
                     addr_b += 4 + init_len;
                 }
             }
@@ -6912,6 +6953,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 .any(|((_, pa), (_, pb))| pa != pb);
             if drift {
                 out.push(format!("    org 0x{table_start:04X}"));
+                locs.push(None);
                 start = table_start;
             }
         }
@@ -7011,13 +7053,19 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
         // `MOVLW HIGH` clobbers W, so the incoming index (W = byte index)
         // is stashed in the fixed scratch byte (0x70, free at a const
         // read) across the PCLATH set, then reloaded for the computed jump.
-        let reader = |out: &mut Vec<String>, base: &str| {
+        let reader = |out: &mut Vec<String>, locs: &mut Vec<Option<SrcLoc>>, base: &str| {
             out.push(format!("    MOVWF 0x{:02X}", scratch));
+            locs.push(None);
             out.push(format!("    MOVLW HIGH({base})"));
+            locs.push(None);
             out.push("    MOVWF PCLATH".to_string());
+            locs.push(None);
             out.push(format!("    MOVF 0x{:02X}, W", scratch));
+            locs.push(None);
             out.push(format!("    ADDLW LOW({base})"));
+            locs.push(None);
             out.push("    MOVWF PCL".to_string());
+            locs.push(None);
         };
         if size >= 256 {
             // Chunked table: chunk 0's reader, then `.align 256` (the
@@ -7035,10 +7083,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             // immediately after) and unreachable: every valid index
             // 0..255 selects chunk 0.
             out.push(format!("__read_{}:", g.name));
-            reader(&mut out, &g.name);
+            locs.push(None);
+            reader(&mut out, &mut locs, &g.name);
             out.push("    .align 256".to_string());
+            locs.push(None);
             out.push(format!("    .table {} {size}", g.name));
+            locs.push(None);
             out.push(format!("{}:", g.name));
+            locs.push(None);
             for (i, b) in g.bytes[..256].iter().enumerate() {
                 if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
                     let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
@@ -7046,6 +7098,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }
+                locs.push(None);
             }
             for c in 1..n_chunks {
                 let start = c * 256;
@@ -7056,6 +7109,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     format!("{}_{}", g.name, c)
                 };
                 out.push(format!("{chunk_label}:"));
+                locs.push(None);
                 for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
                     let abs = start + i;
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == abs) {
@@ -7064,6 +7118,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     } else {
                         out.push(format!("    RETLW 0x{b:02X}"));
                     }
+                    locs.push(None);
                 }
             }
             // reader entries after the table
@@ -7079,7 +7134,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     format!("__read_{}_hi{c}", g.name)
                 };
                 out.push(format!("{entry}:"));
-                reader(&mut out, &chunk_label);
+                locs.push(None);
+                reader(&mut out, &mut locs, &chunk_label);
             }
         } else {
             // Single-entry table (<= 255 bytes): a base that would cross
@@ -7089,13 +7145,17 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             // its fit, mirroring the chunked branch's alignment. A base
             // that already fits emits no `.align` (no flash waste).
             out.push(format!("__read_{}:", g.name));
-            reader(&mut out, &g.name);
+            locs.push(None);
+            reader(&mut out, &mut locs, &g.name);
             let base = window_align(addr + 6, size);
             if base != addr + 6 {
                 out.push("    .align 256".to_string());
+                locs.push(None);
             }
             out.push(format!("    .table {} {size}", g.name));
+            locs.push(None);
             out.push(format!("{}:", g.name));
+            locs.push(None);
             for (i, b) in g.bytes[..size].iter().enumerate() {
                 // A function-address field (epic-cc#154) materializes the
                 // link-time label literal: byte 0 = LOW(fn), byte 1 =
@@ -7106,6 +7166,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }
+                locs.push(None);
             }
         }
         // Track the tables' `.align`/RETLW words so the running address
@@ -7124,9 +7185,11 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             addr = window_align(addr, size) + size;
         }
         out.push("".to_string());
+        locs.push(None);
     }
     out.push("    end".to_string());
-    out.join("\n")
+    locs.push(None);
+    (out.join("\n"), locs)
 }
 
 /// `parse_map` lives in `iselcore` now (moved there per the P2 plan's
