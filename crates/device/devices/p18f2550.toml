@@ -1,0 +1,298 @@
+name = "p18f2550"
+core = "pic18"
+flash_words = 16384
+# Widened past the DFP's own gpr0-gpr3: it understates this part's RAM by
+# half, confirmed against gputils' 18f2550_g.lkr (gpr0-gpr7), same defect
+# on its p18f4550 entry too. See scripts/gen-device.py's module docstring.
+# `gen-device.py p18f2550 --check` against a local XC8 install will flag
+# this as drift; that is expected until the DFP is fixed upstream.
+ram_banks = [[0x0010, 0x07FF]]
+access_bank = [0x0000, 0x005F]
+fixed_retval = [0x0000, 0x000F]
+stack_depth = 31
+interrupt_vectors = [0x0008, 0x0018]
+
+[provenance]
+tier = "atdf"
+source = "PIC18F2550.PIC"
+pack = "Microchip.PIC18Fxxxx_DFP"
+sha256 = "dbd5e93ee0e8e3f27c5a0e4fc9bbfbc47c497616f29439f26d0199153d6890cf"
+
+[config]
+base_byte_addr = 0x300000
+num_bytes = 14
+erased_baseline = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+
+[[config.fields]]
+name = "plldiv"
+byte_offset = 0
+mask = 0x07
+shift = 0
+values = [{ name = "noprescale", bits = 0 }, { name = "div2", bits = 1 }, { name = "div3", bits = 2 }, { name = "div4", bits = 3 }, { name = "div5", bits = 4 }, { name = "div6", bits = 5 }, { name = "div10", bits = 6 }, { name = "div12", bits = 7 }]
+
+[[config.fields]]
+name = "cpudiv"
+byte_offset = 0
+mask = 0x18
+shift = 3
+values = [{ name = "div1", bits = 0 }, { name = "div2", bits = 1 }, { name = "div3", bits = 2 }, { name = "div4", bits = 3 }]
+
+[[config.fields]]
+name = "usbdiv"
+byte_offset = 0
+mask = 0x20
+shift = 5
+values = [{ name = "1", bits = 0 }, { name = "2", bits = 1 }]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 1
+mask = 0x0F
+shift = 0
+values = [{ name = "xt", bits = 0 }, { name = "xtpll", bits = 2 }, { name = "ecio", bits = 4 }, { name = "ec", bits = 5 }, { name = "ecpio", bits = 6 }, { name = "ecpll", bits = 7 }, { name = "intio", bits = 8 }, { name = "intcko", bits = 9 }, { name = "intxt", bits = 10 }, { name = "inths", bits = 11 }, { name = "hs", bits = 12 }, { name = "hspll", bits = 14 }]
+
+[[config.fields]]
+name = "fcmen"
+byte_offset = 1
+mask = 0x40
+shift = 6
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "ieso"
+byte_offset = 1
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "pwrt"
+byte_offset = 2
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "bor"
+byte_offset = 2
+mask = 0x06
+shift = 1
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "soft", bits = 1 }, { name = "on_active", bits = 2 }, { name = "on", bits = 3 }]
+
+[[config.fields]]
+name = "borv"
+byte_offset = 2
+mask = 0x18
+shift = 3
+values = [{ name = "0", bits = 0 }, { name = "1", bits = 1 }, { name = "2", bits = 2 }, { name = "3", bits = 3 }]
+
+[[config.fields]]
+name = "vregen"
+byte_offset = 2
+mask = 0x20
+shift = 5
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "wdt"
+byte_offset = 3
+mask = 0x01
+shift = 0
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "wdtps"
+byte_offset = 3
+mask = 0x1E
+shift = 1
+values = [{ name = "1", bits = 0 }, { name = "2", bits = 1 }, { name = "4", bits = 2 }, { name = "8", bits = 3 }, { name = "16", bits = 4 }, { name = "32", bits = 5 }, { name = "64", bits = 6 }, { name = "128", bits = 7 }, { name = "256", bits = 8 }, { name = "512", bits = 9 }, { name = "1024", bits = 10 }, { name = "2048", bits = 11 }, { name = "4096", bits = 12 }, { name = "8192", bits = 13 }, { name = "16384", bits = 14 }, { name = "32768", bits = 15 }]
+
+[[config.fields]]
+name = "ccp2mx"
+byte_offset = 5
+mask = 0x01
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "pbaden"
+byte_offset = 5
+mask = 0x02
+shift = 1
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "lpt1osc"
+byte_offset = 5
+mask = 0x04
+shift = 2
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "mclre"
+byte_offset = 5
+mask = 0x80
+shift = 7
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "stvren"
+byte_offset = 6
+mask = 0x01
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "lvp"
+byte_offset = 6
+mask = 0x04
+shift = 2
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "xinst"
+byte_offset = 6
+mask = 0x40
+shift = 6
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "debug"
+byte_offset = 6
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cp0"
+byte_offset = 8
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cp1"
+byte_offset = 8
+mask = 0x02
+shift = 1
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cp2"
+byte_offset = 8
+mask = 0x04
+shift = 2
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cp3"
+byte_offset = 8
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cpb"
+byte_offset = 9
+mask = 0x40
+shift = 6
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cpd"
+byte_offset = 9
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrt0"
+byte_offset = 10
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrt1"
+byte_offset = 10
+mask = 0x02
+shift = 1
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrt2"
+byte_offset = 10
+mask = 0x04
+shift = 2
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrt3"
+byte_offset = 10
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrtc"
+byte_offset = 11
+mask = 0x20
+shift = 5
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrtb"
+byte_offset = 11
+mask = 0x40
+shift = 6
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wrtd"
+byte_offset = 11
+mask = 0x80
+shift = 7
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "ebtr0"
+byte_offset = 12
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "ebtr1"
+byte_offset = 12
+mask = 0x02
+shift = 1
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "ebtr2"
+byte_offset = 12
+mask = 0x04
+shift = 2
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "ebtr3"
+byte_offset = 12
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "ebtrb"
+byte_offset = 13
+mask = 0x40
+shift = 6
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]

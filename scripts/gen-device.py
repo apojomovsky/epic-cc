@@ -88,6 +88,27 @@ def alias_field(name: str, stem: str) -> str:
         return "bor"
     return FIELD_ALIAS.get(name, name.lower())
 
+# PIC18F2550's DFP entry (Microchip.PIC18Fxxxx_DFP 1.8.178) spells the same
+# bit values p18f4550.toml already ships under different cnames (a pack
+# revision difference, confirmed bit-for-bit against the DFP's own `when`
+# values for both parts, not a hardware difference). `fosc.rs::pic18_hz`
+# matches on p18f4550's spelling literally, so an unaliased p18f2550 value
+# fails there with "unknown osc/cpudiv/plldiv", not a wrong Fosc: normalise
+# here, the same job this table already does for p16f877a's EXTRC/INTRC.
+P18F2550_OSC_ALIAS = {
+    "hspll_hs": "hspll", "intosc_hs": "inths", "intosc_xt": "intxt",
+    "intosc_ec": "intcko", "intoscio_ec": "intio", "ecpll_ec": "ecpll",
+    "ecpllio_ec": "ecpio", "ec_ec": "ec", "ecio_ec": "ecio",
+    "xtpll_xt": "xtpll", "xt_xt": "xt",
+}
+P18F2550_CPUDIV_ALIAS = {
+    "osc1_pll2": "div1", "osc2_pll3": "div2", "osc3_pll4": "div3", "osc4_pll6": "div4",
+}
+P18F2550_PLLDIV_ALIAS = {
+    "1": "noprescale", "2": "div2", "3": "div3", "4": "div4",
+    "5": "div5", "6": "div6", "10": "div10", "12": "div12",
+}
+
 def alias_value(field: str, value: str, stem: str) -> str:
     v = value.lower()
     if field in ("osc", "fosc") and v.startswith("intrc"):
@@ -97,6 +118,13 @@ def alias_value(field: str, value: str, stem: str) -> str:
             return "rc"
         if v == "extrc_clkout":
             return "rc"
+    if stem == "p18f2550":
+        if field == "osc" and v in P18F2550_OSC_ALIAS:
+            return P18F2550_OSC_ALIAS[v]
+        if field == "cpudiv" and v in P18F2550_CPUDIV_ALIAS:
+            return P18F2550_CPUDIV_ALIAS[v]
+        if field == "plldiv" and v in P18F2550_PLLDIV_ALIAS:
+            return P18F2550_PLLDIV_ALIAS[v]
     return v
 
 # Which enum value a fuse defaults to when the user names none. This is
@@ -579,6 +607,17 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     # bank, identical on every classic PIC18 part because the access bank
     # itself always starts at 0 on this core.
     fixed_retval = (0x0000, 0x000F) if access_bank is not None else None
+    if access_bank is not None and fixed_retval is not None:
+        # `Device::ram_banks` on PIC18 is not "the physical banked GPR
+        # sectors": the schema folds in whatever part of the access bank
+        # `fixed_retval` does not reserve (see `crates/device/tests/
+        # gputils_crosscheck.rs`'s PIC18 comparison and the already-shipped
+        # `p18f4550.toml`, whose `ram_banks` starts at 0x10, not the banked
+        # region's own 0x60). Synthesize that leftover access-bank span and
+        # merge it with the real banked sectors the same way multiple banked
+        # sectors already merge.
+        leftover_access = (fixed_retval[1] + 1, access_bank[1])
+        ram_banks = merge_contiguous(ram_banks + [leftover_access])
     if cfg_span is not None:
         # No per-fuse table, so only the address range is known. The erased
         # value is a core fact (PIC14 words read all ones in 14 bits, PIC18
