@@ -331,21 +331,50 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
             elif tag == "DCRFieldDef":
                 mask = int(child.get(ns + "mask"), 0)
                 width = bin(mask).count("1")
+                fname = child.get(ns + "name")
+                # The field's own mask must be a contiguous run from bit 0
+                # (its local, unshifted value-mask; AdjustPoint supplies the
+                # real position). A non-contiguous mask means this field's
+                # bits aren't packed the way the cursor walk assumes, and
+                # reconstructing mask/shift from width alone would silently
+                # encode the wrong bits.
+                if mask != (1 << width) - 1:
+                    raise MissingFacts([
+                        f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                        f"field {fname}'s mask 0x{mask:x} is not a "
+                        f"contiguous run from bit 0, cannot place it from "
+                        f"width and cursor alone"
+                    ])
                 covered |= ((1 << width) - 1) << cursor
                 hidden = (
                     child.get(ns + "ishidden") == "true"
                     or child.get(ns + "islanghidden") == "true"
                 )
                 if not hidden:
+                    semantics = child.findall(ns + "DCRFieldSemantic")
                     values = []
-                    for sem in child.findall(ns + "DCRFieldSemantic"):
+                    unmatched = []
+                    for sem in semantics:
                         when = sem.get(ns + "when") or ""
                         m = re.search(r"==\s*(0x[0-9a-fA-F]+|\d+)", when)
                         if m:
                             values.append((sem.get(ns + "cname"), int(m.group(1), 0)))
+                        else:
+                            unmatched.append(when)
+                    if semantics and not values:
+                        # Every semantic used a form this generator does not
+                        # read (a relational `when`, not `==`). Dropping the
+                        # field silently would contradict the one rule this
+                        # module exists to keep: a fact it cannot read is a
+                        # hard error, never an omission.
+                        raise MissingFacts([
+                            f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                            f"field {fname}'s semantics use an unhandled "
+                            f"`when` form: {unmatched}"
+                        ])
                     if values:
                         fields.append({
-                            "raw_name": child.get(ns + "name"),
+                            "raw_name": fname,
                             "byte_offset": addr - base,
                             "mask": ((1 << width) - 1) << cursor,
                             "shift": cursor,
@@ -433,7 +462,17 @@ def parse_edc(edc_path: pathlib.Path):
             continue
         sectors.append((int(b, 0), int(e, 0) - 1, gs.get(ns + "regionid")))
     if access:
-        out["access_bank"] = sorted(access)[0]
+        merged_access = merge_contiguous(access)
+        if len(merged_access) != 1:
+            # The schema's access_bank is a single range (Device::access_bank
+            # is `Option<(u16, u16)>`); more than one surviving span after
+            # merging means the source split it in a way this generator does
+            # not understand, not that picking the first is safe.
+            raise MissingFacts([
+                f"access bank: TraditionalModeOnly GPRDataSector sectors "
+                f"do not merge into one range: {merged_access}"
+            ])
+        out["access_bank"] = merged_access[0]
     if sectors:
         out["ram_banks"] = merge_contiguous(
             [(lo, hi) for lo, hi, rid in sectors if rid not in shadowed]
@@ -514,11 +553,14 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         cwords_all = parse_cfgdata(cfg_path)
         cfg_cwords = [c for c in cwords_all if c["name"].upper().startswith("CONFIG")]
     cfg_span = None
-    # PIC18's EDC ConfigFuseSector is already byte-addressed (one DCRDef per
-    # real config byte); PIC14's is word-addressed (one CWORD per flash
-    # word), same as ini/cfgdata. This only matters for the address-range-only
-    # fallback below: the DCR path (the common case) never goes through it.
-    cfg_span_is_bytes = False
+    # PIC18's config bytes are already byte-addressed everywhere they can
+    # come from here (EDC ConfigFuseSector's DCRDef `_addr`, and `.cfgdata`,
+    # which XC8 repackages from the same DFP source); PIC14's `.cfgdata`/ini
+    # CONFIG are word-addressed (one CWORD per flash word). This applies to
+    # every path that lands in the `cfg_cwords` word-shift pipeline below,
+    # not just the address-range-only fallback: the DCR path (the common
+    # case for PIC18) never goes through that pipeline at all.
+    cwords_are_bytes = core == "pic18"
     if not cfg_cwords and dcr_result is None:
         cfg_range = scalar("CONFIG")
         if cfg_range:
@@ -527,7 +569,6 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         elif edc.get("config_sectors"):
             lo = min(b for b, _ in edc["config_sectors"])
             cfg_span = (lo, max(e for _, e in edc["config_sectors"]) - 1)
-            cfg_span_is_bytes = core == "pic18"
         else:
             missing.append("config words (cfgdata, ini CONFIG or EDC ConfigFuseSector)")
     if missing:
@@ -609,7 +650,7 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         cfg_cwords.sort(key=lambda c: c["addr"])
         base_word = cfg_cwords[0]["addr"]
         num_words = cfg_cwords[-1]["addr"] - base_word + 1
-        if cfg_span_is_bytes:
+        if cwords_are_bytes:
             base_byte_addr = base_word
             num_bytes = num_words
             erased = [cw["default"] & 0xFF for cw in cfg_cwords]
@@ -625,7 +666,7 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
                 erased.append(0xFF)
             erased = erased[:num_bytes]
         for cw in cfg_cwords:
-            cword_byte_base = (cw["addr"] - base_word) * 2
+            cword_byte_base = (cw["addr"] - base_word) if cwords_are_bytes else (cw["addr"] - base_word) * 2
             for setting in cw["settings"]:
                 mask_word = setting["mask"]
                 if mask_word == 0:
