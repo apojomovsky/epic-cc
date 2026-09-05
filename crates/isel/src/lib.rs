@@ -6161,6 +6161,16 @@ fn word_size(lines: &[String]) -> usize {
         })
         .count()
 }
+/// Words the `__start` init copy loop occupies: 2 per byte of every const
+/// global resident in RAM, one `MOVLW`/`MOVWF` pair each. The packer's
+/// page-0 base must count them (issue #207).
+fn start_init_words(m: &Module, addrs: &HashMap<String, u16>) -> usize {
+    m.globals
+        .iter()
+        .filter(|g| g.is_const && addrs.contains_key(&g.name))
+        .map(|g| 2 * g.bytes.len())
+        .sum()
+}
 
 /// Greedy page assignment (M11), one function: pad with `.org <next base>`
 /// before a function that would cross the current 2048-word page's end, and
@@ -6599,11 +6609,21 @@ pub fn select_with_locs(
     // measuring once on the pass-A text (all PCLATH restores present) is
     // exact, and pass B's same-page restore elision only shrinks bodies, so
     // the packed layout is elision-stable.
+    // Hand-written module asm rides before `__start` in the final text, so
+    // the measure carries it too (same words, same banking context), and
+    // the packer's page-0 base counts its words below (issue #207).
+    let modasm_lines: Vec<String> = m
+        .module_asm
+        .iter()
+        .flat_map(|e| e.split('\n'))
+        .map(|l| l.to_string())
+        .collect();
     let mut measure: Vec<String> = vec![
         "    org 0x0000".to_string(),
         "    goto __start".to_string(),
         "".to_string(),
     ];
+    measure.extend(modasm_lines.iter().cloned());
     if !has_isr {
         let mut init: Vec<String> = Vec::new();
         for g in &m.globals {
@@ -6726,36 +6746,33 @@ pub fn select_with_locs(
     // slightly too large, even when a later small function could fill it;
     // first-fit reuses those tails (a small function later in the module
     // lands in an earlier page's tail, and the program uses fewer pages).
-    // The running word address starts at 5 without an ISR: the reset vector
-    // (1 word: `goto __start`) plus the `__start` body (4 words), with
-    // `__start` at the top so the reset vector's GOTO (PCLATH = 0 at reset)
-    // always reaches it. With an ISR the vector owns word 4: the ISR is
-    // pinned there (no page pad, the vector IS the entry), `__start` moves
-    // right after it, and the rest of the program follows. The ISR must fit
-    // page 0 (0x004-0x7FF) AND leave `__start` inside page 0: the reset
-    // GOTO runs with PCLATH = 0, so a `__start` at 0x800+ would be
-    // unreachable; it panics loudly (ISRs are usually small).
+    // The running word address starts after the page-0 prefix: the reset
+    // vector, the module asm, and the `__start` body plus init (counted in
+    // `page_next` below, issue #207), with `__start` at the top so the
+    // reset GOTO (PCLATH = 0) always reaches it. With an ISR the vector
+    // owns word 4: the ISR is pinned there, `__start` follows it, and the
+    // ISR must fit page 0 AND leave `__start` reachable, else panic loudly.
     let mut pages: HashMap<String, usize> = HashMap::new();
     let mut pads: HashMap<String, usize> = HashMap::new();
-    // `page_next[i]` = the next free word in page i (the running address of
-    // the page's last placed function). Pages are opened in order, so the
-    // last entry is the program's end: the const-table section's start.
-    // Page 0 starts after the 5-word header (reset `goto __start` + the
-    // 4-word `__start` body); with an ISR the vector owns word 4 and the
-    // ISR branch below sets page 0's next free word after the ISR + `__start`.
-    let mut page_next: Vec<usize> = vec![if has_isr { 4 } else { 5 }];
+    let init_words = start_init_words(m, addrs);
+    let mut page_next: Vec<usize> = vec![if has_isr {
+        4
+    } else {
+        5 + word_size(&modasm_lines) + init_words
+    }];
     for (name, _) in &bodies {
         let size = post[name];
         if has_isr && name == isr_names[0] {
             assert!(
-                4 + size + 4 <= 0x800,
+                4 + size + 4 + init_words <= 0x800,
                 "isel: isr @{name} of {size} words does not fit page 0 (0x004-0x7FF) with room for the reset __start"
             );
             pages.insert(name.clone(), 0);
             pads.insert(name.clone(), 4);
             // `size` is the ISR's post-banking body extent (label to the
-            // `__start` label); the 4-word `__start` body follows it.
-            page_next[0] = 4 + size + 4;
+            // `__start` label); the 4-word `__start` body and its init copy
+            // loop follow it (issue #207).
+            page_next[0] = 4 + size + 4 + init_words;
         } else {
             if size > 0x800 {
                 panic!("isel: function @{name} of {size} words exceeds a 2048-word page (0x800)");
