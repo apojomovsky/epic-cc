@@ -31,10 +31,12 @@ now contains a complete compiler, not just documentation:
   and a device-threaded differential fuzz gate ([ADR-016](adr/ADR-016-pic18-fuzz-gate.md)).
 - **Device registry:** file-per-device TOML under `crates/device/devices/` with
   `build.rs` codegen and a `--target` flag ([ADR-019](adr/ADR-019-pic-variants-device-registry.md)),
-  holding `p16f877a`, `p16f887` and `p18f4550`. A DFP to TOML generator ingests Microchip
-  ATDF ([ADR-020](adr/ADR-020-dfp-toml-generator.md)), a provenance stanza records where
-  each field came from, and an always-on gputils cross-check catches drift against the
-  oracle ([ADR-021](adr/ADR-021-device-provenance-and-cross-check.md)). Device names
+  holding `p16f877a`, `p16f887`, `p18f4550` and `p18f2550`. A DFP to TOML generator
+  ingests Microchip ATDF ([ADR-020](adr/ADR-020-dfp-toml-generator.md)), a provenance
+  stanza records where each field came from, and an always-on gputils cross-check
+  catches drift against the oracle ([ADR-021](adr/ADR-021-device-provenance-and-cross-check.md)).
+  Adding a device on an already-supported core is now a documented, twice-proven
+  runbook, [`32-adding-a-device.md`](32-adding-a-device.md). Device names
   resolve in every spelling the toolchain uses, so no caller keeps a mapping table. CI is
   stratified into a canonical job per core plus a lightweight per-device job, and a
   `hal-887` job builds epic-hal's 887 firmware inside an epic-cc job so a compiler change
@@ -83,6 +85,7 @@ ADRs in [`03-decisions.md`](03-decisions.md) plus `docs/adr/`.
 | Verification: simulator, gpasm oracle, fuzzing | [`05-verification.md`](05-verification.md) |
 | Build environment and pinned versions | [`09-build-environment.md`](09-build-environment.md) |
 | PIC18 port: why it is smaller than a second compiler, and its phases | [`29-pic18-port-design.md`](29-pic18-port-design.md) |
+| Adding a device on a core this compiler already supports | [`32-adding-a-device.md`](32-adding-a-device.md) |
 | Public binary distribution | [`30-distribution-design.md`](30-distribution-design.md) |
 | Ecosystem integration: epic-cc + epic-hal + PlatformIO | [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md) |
 | Architecture decisions and rejected alternatives | [`03-decisions.md`](03-decisions.md) and `docs/adr/` |
