@@ -25,19 +25,19 @@ gen_device = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(gen_device)
 
 
-def run_generator(source, name="synthetic"):
+def run_generator(source, name="synthetic", pack=None):
     with tempfile.TemporaryDirectory() as d:
         out = pathlib.Path(d) / "synthetic.toml"
-        r = subprocess.run(
-            [sys.executable, str(GEN), name, "--atdf", str(source), "--out", str(out)],
-            capture_output=True, text=True,
-        )
+        cmd = [sys.executable, str(GEN), name, "--atdf", str(source), "--out", str(out)]
+        if pack:
+            cmd += ["--pack", pack]
+        r = subprocess.run(cmd, capture_output=True, text=True)
         return r, out.read_text() if out.exists() else ""
 
 
 class GenDeviceTest(unittest.TestCase):
     def generate(self):
-        r, text = run_generator(FIXTURE)
+        r, text = run_generator(FIXTURE, pack="Microchip.PIC16Fxxx_DFP")
         self.assertEqual(r.returncode, 0, r.stderr)
         return text
 
@@ -45,7 +45,41 @@ class GenDeviceTest(unittest.TestCase):
         text = self.generate()
         self.assertIn("[provenance]", text)
         self.assertIn('tier = "atdf"', text)
+        self.assertIn('pack = "Microchip.PIC16Fxxx_DFP"', text)
         self.assertIn("sha256 = ", text)
+
+    def test_refuses_when_pack_name_cannot_be_resolved(self):
+        # The fixture path has no *_DFP ancestor directory, so without
+        # --pack the pack name is unknowable. Writing pack = "unknown"
+        # would fabricate provenance (ADR-021): refuse instead.
+        r, text = run_generator(FIXTURE)
+        self.assertNotEqual(r.returncode, 0, "an unresolvable pack name must not generate")
+        self.assertIn("pack", r.stderr)
+        self.assertEqual(text, "", "nothing may be written when the pack name is unknown")
+
+    def test_pack_name_derived_from_dfp_ancestor_directory(self):
+        # A file still inside its pack directory needs no --pack: the
+        # *_DFP ancestor names the pack, matching how a .atpack unzips.
+        with tempfile.TemporaryDirectory() as d:
+            pack_dir = pathlib.Path(d) / "Microchip.PIC16Fxxx_DFP.1.7.162" / "edc"
+            pack_dir.mkdir(parents=True)
+            src = pack_dir / "synthetic.atdf"
+            src.write_text(FIXTURE.read_text())
+            r, text = run_generator(src)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('pack = "Microchip.PIC16Fxxx_DFP.1.7.162"', text)
+
+    def test_explicit_pack_wins_over_ancestor_directory(self):
+        # --pack is the caller's deliberate choice; it must not be
+        # overridden by whatever directory the file happens to sit in.
+        with tempfile.TemporaryDirectory() as d:
+            pack_dir = pathlib.Path(d) / "Microchip.PIC16Fxxx_DFP" / "edc"
+            pack_dir.mkdir(parents=True)
+            src = pack_dir / "synthetic.atdf"
+            src.write_text(FIXTURE.read_text())
+            r, text = run_generator(src, pack="Microchip.PIC18Fxxxx_DFP")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('pack = "Microchip.PIC18Fxxxx_DFP"', text)
 
     def test_is_deterministic(self):
         self.assertEqual(self.generate(), self.generate())
@@ -68,7 +102,7 @@ class GenDeviceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "no_ram.atdf"
             src.write_text(stripped)
-            r, text = run_generator(src)
+            r, text = run_generator(src, pack="Microchip.PIC16Fxxx_DFP")
         self.assertNotEqual(r.returncode, 0, "a source with no RAM map must not generate")
         self.assertIn("ram_banks", r.stderr)
         self.assertEqual(text, "", "nothing may be written when a field is missing")
@@ -82,7 +116,7 @@ class GenDevicePic18Test(unittest.TestCase):
     it silently mis-generating both the config region and the RAM map."""
 
     def generate(self):
-        r, text = run_generator(PIC18_FIXTURE, name="p18syn01")
+        r, text = run_generator(PIC18_FIXTURE, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
         self.assertEqual(r.returncode, 0, r.stderr)
         return text
 
@@ -162,7 +196,7 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "bad_impl.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01")
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
         self.assertNotEqual(r.returncode, 0, "an impl mismatch must not generate")
         self.assertIn("does not match", r.stderr)
         self.assertEqual(text, "")
@@ -178,7 +212,7 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "bad_mask.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01")
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
         self.assertNotEqual(r.returncode, 0, "a non-contiguous field mask must not generate")
         self.assertIn("not a contiguous run", r.stderr)
         self.assertEqual(text, "")
@@ -200,7 +234,7 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "relational_when.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01")
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
         self.assertNotEqual(r.returncode, 0, "an unhandled `when` form must not generate")
         self.assertIn("unhandled", r.stderr)
         self.assertEqual(text, "")
@@ -217,7 +251,7 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "split_access.atdf"
             src.write_text(split)
-            r, text = run_generator(src, name="p18syn01")
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("access_bank = [0x0000, 0x005F]", text)
 
