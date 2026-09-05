@@ -1415,6 +1415,7 @@ impl<'m> Gen<'m> {
                                 dst: b.dst.clone(),
                                 a: b.b.clone(),
                                 b: Val::Const(k),
+                                loc: b.loc.clone(),
                             };
                             // Re-enter the Bin arm with swapped operands via
                             // the normal per-byte loop: emit the swapped bin
@@ -5362,7 +5363,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
             for inst in &b.insts {
                 match inst {
                     Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
-                    Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(inst),
+                    Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(inst),
                     other => g.emit_inst(other),
                 }
             }
@@ -5436,7 +5437,7 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                         }
                     }
                 }
-                Some(Inst::Ret(None)) if g.isr => {
+                Some(Inst::Ret(None, _)) if g.isr => {
                     // The ISR restore epilogue replaces `ret`. MOVFF-based
                     // (never touches STATUS), so the interrupted main's
                     // Z/N come back intact; only the final W restore via
@@ -5462,14 +5463,14 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     g.emit("    MOVF 0x0004, W, A".to_string()); // W last
                     g.emit("    RETFIE".to_string());
                 }
-                Some(Inst::Ret(Some(_))) if g.isr => {
+                Some(Inst::Ret(Some(_), _)) if g.isr => {
                     panic!(
                         "isel-pic18: interrupt handler @{} must be void (cannot return a value)",
                         f.name
                     )
                 }
-                Some(Inst::Ret(None)) => g.emit("    RETURN".to_string()),
-                Some(Inst::Ret(Some((ty, v)))) => {
+                Some(Inst::Ret(None, _)) => g.emit("    RETURN".to_string()),
+                Some(Inst::Ret(Some((ty, v)), _)) => {
                     for i in 0..ty.bytes() {
                         g.emit_load_w(v, i);
                         let (a, f2) = g.operand(g.retval_lo + u16::from(i));

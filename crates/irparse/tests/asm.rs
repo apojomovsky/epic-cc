@@ -26,7 +26,7 @@ attributes #0 = { naked noinline nounwind }"#;
     assert!(!bar.blocks[0]
         .insts
         .iter()
-        .any(|i| matches!(i, Inst::Ret(_))));
+        .any(|i| matches!(i, Inst::Ret(_, _))));
 }
 
 #[test]

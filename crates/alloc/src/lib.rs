@@ -538,8 +538,8 @@ fn inst_vals(inst: &ir::Inst) -> Vec<String> {
             val_name(&s.val),
         ],
         Inst::Bin(b) => vec![val_name(&b.a), val_name(&b.b)],
-        Inst::Ret(Some((_, v))) => vec![val_name(v)],
-        Inst::Ret(None) => Vec::new(),
+        Inst::Ret(Some((_, v)), _) => vec![val_name(v)],
+        Inst::Ret(None, _) => Vec::new(),
         Inst::Zext(z) => vec![val_name(&z.val)],
         Inst::Sext(s) => vec![val_name(&s.val)],
         Inst::Trunc(t) => vec![val_name(&t.val)],
@@ -1381,7 +1381,7 @@ fn def_width(
             _ => None,
         },
         Inst::Phi(p) => Some((p.dst.clone(), p.ty.bytes())),
-        Inst::Store(_) | Inst::Ret(_) | Inst::Br(_) | Inst::BrCond(_) | Inst::VaStart(_) => None,
+        Inst::Store(_) | Inst::Ret(..) | Inst::Br(_) | Inst::BrCond(_) | Inst::VaStart(_) => None,
         // Gep computes a virtual pointer address (isel turns it into FSR/INDF
         // or a RETLW table read); it defines no value needing a RAM slot.
         Inst::Gep(_) => None,

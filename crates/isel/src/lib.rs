@@ -2904,8 +2904,8 @@ impl<'m> Gen<'m> {
                 let lf = &labels[&b.f];
                 self.emit_cond_branch(&b.cond, lt, lf);
             }
-            Inst::Ret(None) => self.emit("    RETURN".to_string()),
-            Inst::Ret(Some((ty, v))) => {
+            Inst::Ret(None, _) => self.emit("    RETURN".to_string()),
+            Inst::Ret(Some((ty, v)), _) => {
                 // Copy the value into the fixed retval slots (0x71..0x74 for
                 // i32), then RETURN.
                 for i in 0..ty.bytes() {
@@ -5879,7 +5879,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         for i in &b.insts {
             match i {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
-                Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(_) => terminator = Some(i),
+                Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
                 _ => g.emit_inst(i),
             }
         }
@@ -5987,7 +5987,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                         // moved value after STATUS was already restored,
                         // corrupting the interrupted main's Z). RETFIE pops the
                         // hardware-pushed return.
-                        Inst::Ret(None) => {
+                        Inst::Ret(None, _) => {
                             g.emit("    MOVF 0x79, W");
                             g.emit("    MOVWF 0x71");
                             g.emit("    MOVF 0x7A, W");
@@ -6007,7 +6007,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                             g.emit("    SWAPF 0x75, W");
                             g.emit("    RETFIE");
                         }
-                        Inst::Ret(Some(_)) => panic!(
+                        Inst::Ret(Some(_), _) => panic!(
                             "isel: interrupt handler @{} must be void (cannot return a value)",
                             f.name
                         ),

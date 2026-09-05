@@ -1300,6 +1300,7 @@ fn lower_switch(
     if cases.is_empty() {
         blocks.last_mut().unwrap().insts.push(Inst::Br(Br {
             target: default_label,
+            loc: loc.clone(),
         }));
         return;
     }
@@ -1324,12 +1325,14 @@ fn lower_switch(
             ty: cond_ty,
             a: cond_val.clone(),
             b: case_val,
+            loc: loc.clone(),
         };
         blocks[cur_idx].insts.push(Inst::Icmp(icmp));
         blocks[cur_idx].insts.push(Inst::BrCond(BrCond {
             cond: Val::Reg(cmp_dst),
             t: case_label,
             f: false_label.clone(),
+            loc: loc.clone(),
         }));
         if !is_last {
             blocks.push(Block {
@@ -1349,6 +1352,7 @@ fn parse_call_ptr_val(
     types: &StructTypes,
     fresh: &mut Fresh,
     out: &mut Vec<Inst>,
+    loc: Option<&SrcLoc>,
 ) -> Val {
     let b = arg
         .trim()
@@ -1365,6 +1369,7 @@ fn parse_call_ptr_val(
             base,
             k,
             terms,
+            loc: loc.cloned(),
         }));
         Val::Reg(n)
     } else {
@@ -1419,6 +1424,7 @@ fn parse_select_arm(
             base,
             k,
             terms,
+            loc: loc.cloned(),
         }));
         Val::Reg(n)
     } else {
@@ -1435,6 +1441,7 @@ fn materialize_gep_val(
     types: &StructTypes,
     fresh: &mut Fresh,
     out: &mut Vec<Inst>,
+    loc: Option<&SrcLoc>,
 ) -> Val {
     let gpos = s.find("getelementptr").unwrap();
     let gsrc = &s[gpos + "getelementptr".len()..];
@@ -1445,6 +1452,7 @@ fn materialize_gep_val(
         base,
         k,
         terms,
+        loc: loc.cloned(),
     }));
     Val::Reg(n)
 }
@@ -1494,7 +1502,7 @@ fn parse_value_with_gep(
             .unwrap_or_else(|| panic!("irparse: malformed ptrtoint {s:?}"));
         let inner = after[..to_pos].trim().trim_start_matches('(').trim();
         let gep_reg = if inner.contains("getelementptr") {
-            materialize_gep_val(inner, types, fresh, out)
+            materialize_gep_val(inner, types, fresh, out, loc)
         } else {
             let tok = inner.split_whitespace().last().unwrap();
             parse_val_typed(tok, Some(Ty::I16))
@@ -1516,13 +1524,14 @@ fn parse_value_with_gep(
                     from: Ty::I16,
                     val: Val::Reg(r),
                     to,
+                    loc: loc.cloned(),
                 }));
                 Val::Reg(n)
             }
             other => other,
         }
     } else if s.contains("getelementptr") {
-        materialize_gep_val(s, types, fresh, out)
+        materialize_gep_val(s, types, fresh, out, loc)
     } else {
         let tok = s.split_whitespace().last().unwrap_or(s);
         parse_val_typed(tok, Some(ty))
@@ -1538,6 +1547,7 @@ fn parse_ptr_operand(
     types: &StructTypes,
     fresh: &mut Fresh,
     out: &mut Vec<Inst>,
+    loc: Option<&SrcLoc>,
 ) -> String {
     let b = arg
         .trim()
@@ -1583,6 +1593,7 @@ fn parse_ptr_operand(
             base,
             k,
             terms,
+            loc: loc.cloned(),
         }));
         format!("%{n}")
     } else {
@@ -1817,6 +1828,7 @@ fn parse_base(
             base: ibase,
             k: ik,
             terms: iterms,
+            loc: None,
         }));
         GepBase::Reg(n)
     } else {
@@ -1849,6 +1861,7 @@ fn parse_call_arg(
             base,
             k,
             terms,
+            loc: loc.cloned(),
         }));
         // The attr prefix before the inlined GEP can carry byval/sret
         // (`ptr ... byval(%struct.S) align 2 getelementptr ...` — clang's
@@ -2433,11 +2446,10 @@ pub fn parse_ll(src: &str) -> Module {
                     if l == "unreachable" || l.starts_with("unreachable, !") {
                         if !naked {
                             let here = blocks.last().unwrap().label.clone();
-                            blocks
-                                .last_mut()
-                                .unwrap()
-                                .insts
-                                .push(Inst::Br(Br { target: here }));
+                            blocks.last_mut().unwrap().insts.push(Inst::Br(Br {
+                                target: here,
+                                loc: dbg_loc(l, &dbg),
+                            }));
                         }
                         if has_trailing_brace {
                             break;
@@ -2514,6 +2526,7 @@ fn parse_inst(
     fresh: &mut Fresh,
     dbg: &DebugInfoTable,
 ) -> Vec<Inst> {
+    let cur = dbg_loc(line, dbg);
     // Lift `call ... asm sideeffect "template", "constraints"(...)` into
     // `Inst::Asm`. This must run before the generic `call` handling, since
     // the `asm` form is a `call` with an `asm` callee.
@@ -2543,6 +2556,7 @@ fn parse_inst(
                             template,
                             clobbers_memory,
                             operands: Vec::new(),
+                            loc: cur.clone(),
                         })];
                     }
                     // Validate each operand constraint is a `*m` memory form
@@ -2627,6 +2641,7 @@ fn parse_inst(
                         template,
                         clobbers_memory,
                         operands,
+                        loc: cur.clone(),
                     })];
                 }
             }
@@ -2680,6 +2695,7 @@ fn parse_inst(
                 base,
                 k,
                 terms,
+                loc: cur.clone(),
             }));
         }
         "alloca" => {
@@ -2700,17 +2716,19 @@ fn parse_inst(
             out.push(Inst::Alloca(Alloca {
                 dst: dst.unwrap(),
                 size,
+                loc: cur.clone(),
             }));
         }
         "load" => {
             let args = split_top_level(&rest["load".len()..], ',');
             let ty = ty_of(strip_attrs(args[0]).trim(), cur.as_ref());
-            let ptr = parse_ptr_operand(args[1], types, fresh, &mut out);
+            let ptr = parse_ptr_operand(args[1], types, fresh, &mut out, cur.as_ref());
             out.push(Inst::Load(Load {
                 dst: dst.unwrap(),
                 ty,
                 ptr,
                 ptr_ty: strip_attrs(args[0]).trim().starts_with("ptr"),
+                loc: cur.clone(),
             }));
         }
         "store" => {
@@ -2719,8 +2737,13 @@ fn parse_inst(
             let mut it = a0.trim().split_whitespace();
             let ty = ty_of(it.next().unwrap(), cur.as_ref());
             let val = parse_val_typed(it.next().unwrap(), Some(ty));
-            let ptr = parse_ptr_operand(args[1], types, fresh, &mut out);
-            out.push(Inst::Store(Store { ty, val, ptr }));
+            let ptr = parse_ptr_operand(args[1], types, fresh, &mut out, cur.as_ref());
+            out.push(Inst::Store(Store {
+                ty,
+                val,
+                ptr,
+                loc: cur.clone(),
+            }));
         }
         "call" => {
             let body = rest["call".len()..].trim();
@@ -2760,8 +2783,8 @@ fn parse_inst(
             let args_str = balanced_inner(&body[open + 1..]).unwrap();
             if func.starts_with("llvm.memcpy.p0.p0") {
                 let a = split_top_level(args_str, ',');
-                let dst = parse_call_ptr_val(a[0], types, fresh, &mut out);
-                let src = parse_call_ptr_val(a[1], types, fresh, &mut out);
+                let dst = parse_call_ptr_val(a[0], types, fresh, &mut out, cur.as_ref());
+                let src = parse_call_ptr_val(a[1], types, fresh, &mut out, cur.as_ref());
                 // Len: `i16 N` (const, unrolled — the M7 form, bounded to
                 // 255 bytes) or `i16 %r` (runtime length, issue #4 — the
                 // counted loop; the value is SSA-dead after the copy, so
@@ -2777,7 +2800,12 @@ fn parse_inst(
                 };
                 // isvolatile (a[3] = `i1 true`/`i1 false`) is an LLVM
                 // optimization hint; our byte copy is identical either way.
-                out.push(Inst::Memcpy(Memcpy { dst, src, len }));
+                out.push(Inst::Memcpy(Memcpy {
+                    dst,
+                    src,
+                    len,
+                    loc: cur.clone(),
+                }));
             } else if func.starts_with("llvm.lifetime.start")
                 || func.starts_with("llvm.lifetime.end")
             {
@@ -2797,7 +2825,10 @@ fn parse_inst(
                     .unwrap_or("")
                     .trim_start_matches('%')
                     .to_string();
-                out.push(Inst::VaStart(VaStart { list }));
+                out.push(Inst::VaStart(VaStart {
+                    list,
+                    loc: cur.clone(),
+                }));
             } else if func.starts_with("llvm.va_end") {
                 // va_end is a no-op: the va list is an in-frame offset.
             } else {
@@ -2854,6 +2885,7 @@ fn parse_inst(
                         .unwrap()
                         .trim_start_matches('%')
                         .to_string(),
+                    loc: cur.clone(),
                 }));
             } else {
                 let parts = split_top_level(body, ',');
@@ -2870,20 +2902,25 @@ fn parse_inst(
                     .unwrap()
                     .trim_start_matches('%')
                     .to_string();
-                out.push(Inst::BrCond(BrCond { cond, t, f }));
+                out.push(Inst::BrCond(BrCond {
+                    cond,
+                    t,
+                    f,
+                    loc: cur.clone(),
+                }));
             }
         }
         "ret" => {
             let body = rest["ret".len()..].trim();
             if body == "void" {
-                out.push(Inst::Ret(None));
+                out.push(Inst::Ret(None, cur.clone()));
             } else {
                 let mut it = body.split_whitespace();
                 let ty = ty_of(it.next().unwrap(), cur.as_ref());
-                out.push(Inst::Ret(Some((
-                    ty,
-                    parse_val_typed(it.next().unwrap(), Some(ty)),
-                ))));
+                out.push(Inst::Ret(
+                    Some((ty, parse_val_typed(it.next().unwrap(), Some(ty)))),
+                    cur.clone(),
+                ));
             }
         }
         "phi" => {
@@ -2913,6 +2950,7 @@ fn parse_inst(
                 ty,
                 ptr,
                 incoming,
+                loc: cur.clone(),
             }));
         }
         "zext" | "sext" | "trunc" | "ptrtoint" => {
@@ -2941,7 +2979,7 @@ fn parse_inst(
                     .unwrap()
                     .trim_start_matches('(');
                 let from = ty_of(first, cur.as_ref());
-                let v = materialize_gep_val(lhs, types, fresh, &mut out);
+                let v = materialize_gep_val(lhs, types, fresh, &mut out, cur.as_ref());
                 (from, v)
             } else {
                 let mut it = lhs.split_whitespace();
@@ -2966,18 +3004,21 @@ fn parse_inst(
                     from,
                     val,
                     to,
+                    loc: cur.clone(),
                 })),
                 "sext" => out.push(Inst::Sext(Sext {
                     dst: dst.unwrap(),
                     from,
                     val,
                     to,
+                    loc: cur.clone(),
                 })),
                 _ => out.push(Inst::Trunc(Trunc {
                     dst: dst.unwrap(),
                     from,
                     val,
                     to,
+                    loc: cur.clone(),
                 })),
             }
         }
@@ -2998,6 +3039,7 @@ fn parse_inst(
                 from,
                 val,
                 to,
+                loc: cur.clone(),
             }));
         }
         "va_arg" => {
@@ -3028,6 +3070,7 @@ fn parse_inst(
                 ty,
                 ptr: list,
                 ptr_ty,
+                loc: cur.clone(),
             }));
         }
         "icmp" => {
@@ -3049,6 +3092,7 @@ fn parse_inst(
                 ty,
                 a,
                 b,
+                loc: cur.clone(),
             }));
         }
         "select" => {
@@ -3086,6 +3130,7 @@ fn parse_inst(
                 a,
                 b,
                 ptr,
+                loc: cur.clone(),
             }));
         }
         "add" | "and" | "or" | "xor" | "sub" | "mul" | "udiv" | "urem" | "sdiv" | "srem"
@@ -3161,6 +3206,7 @@ fn parse_inst(
                 ty,
                 a,
                 b,
+                loc: cur.clone(),
             }));
         }
         "freeze" => {
@@ -3172,6 +3218,7 @@ fn parse_inst(
                 dst: dst.unwrap(),
                 ty,
                 val,
+                loc: cur.clone(),
             }));
         }
         "fadd" | "fsub" | "fmul" | "fdiv" => {
@@ -3195,6 +3242,7 @@ fn parse_inst(
                 op: o,
                 a,
                 b,
+                loc: cur.clone(),
             }));
         }
         "fcmp" => {
@@ -3217,6 +3265,7 @@ fn parse_inst(
                 pred,
                 a,
                 b,
+                loc: cur.clone(),
             }));
         }
         "fptosi" | "fptoui" | "sitofp" | "uitofp" | "fpext" | "fptrunc" => {
@@ -3243,6 +3292,7 @@ fn parse_inst(
                 from,
                 val,
                 to,
+                loc: cur.clone(),
             }));
         }
         "switch" => {

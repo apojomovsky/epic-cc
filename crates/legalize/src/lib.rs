@@ -162,7 +162,7 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
             continue;
         }
         let insts = &f.blocks[0].insts;
-        let (Some(Inst::Ret(Some((Ty::I16, Val::Reg(ret_reg))))), rest) =
+        let (Some(Inst::Ret(Some((Ty::I16, Val::Reg(ret_reg))), _)), rest) =
             (insts.last(), &insts[..insts.len().saturating_sub(1)])
         else {
             continue;
@@ -355,6 +355,7 @@ fn substitute_regs(
             ty: b.ty,
             a: sub(&b.a),
             b: sub(&b.b),
+            loc: b.loc.clone(),
         }),
         Inst::Icmp(c) => Inst::Icmp(Icmp {
             dst: rename.get(&c.dst).cloned().unwrap_or_else(|| c.dst.clone()),
@@ -362,6 +363,7 @@ fn substitute_regs(
             ty: c.ty,
             a: sub(&c.a),
             b: sub(&c.b),
+            loc: c.loc.clone(),
         }),
         Inst::Select(s) => Inst::Select(Select {
             dst: rename.get(&s.dst).cloned().unwrap_or_else(|| s.dst.clone()),
@@ -370,30 +372,35 @@ fn substitute_regs(
             a: sub(&s.a),
             b: sub(&s.b),
             ptr: s.ptr,
+            loc: s.loc.clone(),
         }),
         Inst::Zext(z) => Inst::Zext(Zext {
             dst: rename.get(&z.dst).cloned().unwrap_or_else(|| z.dst.clone()),
             from: z.from,
             val: sub(&z.val),
             to: z.to,
+            loc: z.loc.clone(),
         }),
         Inst::Sext(x) => Inst::Sext(Sext {
             dst: rename.get(&x.dst).cloned().unwrap_or_else(|| x.dst.clone()),
             from: x.from,
             val: sub(&x.val),
             to: x.to,
+            loc: x.loc.clone(),
         }),
         Inst::Trunc(t) => Inst::Trunc(Trunc {
             dst: rename.get(&t.dst).cloned().unwrap_or_else(|| t.dst.clone()),
             from: t.from,
             val: sub(&t.val),
             to: t.to,
+            loc: t.loc.clone(),
         }),
         Inst::IntToPtr(p) => Inst::IntToPtr(IntToPtr {
             dst: rename.get(&p.dst).cloned().unwrap_or_else(|| p.dst.clone()),
             from: p.from,
             val: sub(&p.val),
             to: p.to,
+            loc: p.loc.clone(),
         }),
         Inst::Gep(g) => {
             let base = match &g.base {
@@ -418,6 +425,7 @@ fn substitute_regs(
                 base,
                 k: g.k,
                 terms,
+                loc: g.loc.clone(),
             })
         }
         other => other.clone(),
@@ -549,7 +557,7 @@ fn inst_dst(inst: &Inst) -> Option<&str> {
         Inst::Fcmp(c) => Some(&c.dst),
         Inst::FloatConv(c) => Some(&c.dst),
         Inst::Asm(_) => None,
-        Inst::Ret(_) | Inst::Store(_) | Inst::Br(_) | Inst::BrCond(_) | Inst::Memcpy(_) => None,
+        Inst::Ret(_, _) | Inst::Store(_) | Inst::Br(_) | Inst::BrCond(_) | Inst::Memcpy(_) => None,
     }
 }
 
@@ -589,7 +597,7 @@ fn lower_fbin(b: &ir::FloatBin, used: &mut Vec<String>) -> Inst {
             },
         ],
         callees: Vec::new(),
-        loc: None,
+        loc: b.loc.clone(),
     })
 }
 
@@ -622,7 +630,7 @@ fn lower_fcmp(c: &ir::Fcmp, used: &mut Vec<String>, names: &mut FreshNames) -> V
             },
         ],
         callees: Vec::new(),
-        loc: None,
+        loc: c.loc.clone(),
     })];
     insts.extend(fcmp_tree(&c.pred, &call_dst, &c.dst, names));
     insts
@@ -635,6 +643,7 @@ fn fcmp_icmp(pred: &str, c: &str, k: i64, dst: &str) -> Inst {
         ty: Ty::I8,
         a: Val::Reg(c.into()),
         b: Val::Const(k),
+        loc: None,
     })
 }
 
@@ -678,6 +687,7 @@ fn fcmp_tree(pred: &str, c: &str, dst: &str, names: &mut FreshNames) -> Vec<Inst
             a: Val::Const(1), // i1 true
             b: Val::Reg(t2),
             ptr: false,
+            loc: None,
         }));
     }
     let mut out = Vec::new();
@@ -753,7 +763,7 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
             loc: None,
         }),
         (FloatConvOp::Fpext | FloatConvOp::Fptrunc, Ty::F32, Ty::F32) => {
-            Inst::Freeze(ir::Freeze { dst: c.dst.clone(), ty: Ty::F32, val: c.val.clone() })
+            Inst::Freeze(ir::Freeze { dst: c.dst.clone(), ty: Ty::F32, val: c.val.clone(), loc: None })
         }
         other => panic!(
             "legalize: unsupported float conversion {other:?} (msp430 has no f64; fpext/fptrunc are f32->f32 only)"
@@ -785,6 +795,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: a.clone(),
                     b: b.clone(),
+                    loc: None,
                 }),
                 Inst::Select(ir::Select {
                     dst,
@@ -793,6 +804,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     a,
                     b,
                     ptr: false,
+                    loc: None,
                 }),
             ]
         }
@@ -806,6 +818,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: a.clone(),
                     b: b.clone(),
+                    loc: None,
                 }),
                 Inst::Select(ir::Select {
                     dst,
@@ -814,6 +827,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     a,
                     b,
                     ptr: false,
+                    loc: None,
                 }),
             ]
         }
@@ -827,6 +841,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: a.clone(),
                     b: b.clone(),
+                    loc: None,
                 }),
                 Inst::Select(ir::Select {
                     dst,
@@ -835,6 +850,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     a,
                     b,
                     ptr: false,
+                    loc: None,
                 }),
             ]
         }
@@ -848,6 +864,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: a.clone(),
                     b: b.clone(),
+                    loc: None,
                 }),
                 Inst::Select(ir::Select {
                     dst,
@@ -856,6 +873,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     a,
                     b,
                     ptr: false,
+                    loc: None,
                 }),
             ]
         }
@@ -870,6 +888,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: a.clone(),
                     b: b.clone(),
+                    loc: None,
                 }),
                 Inst::Bin(ir::Bin {
                     dst: sub.clone(),
@@ -877,6 +896,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: a.clone(),
                     b: b.clone(),
+                    loc: None,
                 }),
                 Inst::Select(ir::Select {
                     dst,
@@ -885,6 +905,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     a: Val::Reg(sub),
                     b: Val::Const(0),
                     ptr: false,
+                    loc: None,
                 }),
             ]
         }
@@ -900,6 +921,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: a.clone(),
                     b: Val::Const(0),
+                    loc: None,
                 }),
                 Inst::Bin(ir::Bin {
                     dst: neg.clone(),
@@ -907,6 +929,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: Val::Const(0),
                     b: a.clone(),
+                    loc: None,
                 }),
                 Inst::Select(ir::Select {
                     dst,
@@ -915,6 +938,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     a: Val::Reg(neg),
                     b: a,
                     ptr: false,
+                    loc: None,
                 }),
             ]
         }
@@ -954,12 +978,14 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                         ty,
                         a: a.clone(),
                         b: sh_val,
+                        loc: None,
                     }));
                     if sh_masked_c == 0 {
                         insts.push(Inst::Freeze(ir::Freeze {
                             dst: shr_dst.clone(),
                             ty,
                             val: Val::Const(0),
+                            loc: None,
                         }));
                     } else {
                         insts.push(Inst::Bin(ir::Bin {
@@ -968,6 +994,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                             ty,
                             a: b.clone(),
                             b: sub_val,
+                            loc: None,
                         }));
                     }
                 } else {
@@ -977,12 +1004,14 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                         ty,
                         a: a.clone(),
                         b: sh_val,
+                        loc: None,
                     }));
                     if sh_masked_c == 0 {
                         insts.push(Inst::Freeze(ir::Freeze {
                             dst: shl_dst.clone(),
                             ty,
                             val: Val::Const(0),
+                            loc: None,
                         }));
                     } else {
                         insts.push(Inst::Bin(ir::Bin {
@@ -991,6 +1020,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                             ty,
                             a: b.clone(),
                             b: sub_val,
+                            loc: None,
                         }));
                     }
                 }
@@ -1000,6 +1030,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                     ty,
                     a: Val::Reg(shl_dst),
                     b: Val::Reg(shr_dst),
+                    loc: None,
                 }));
                 return insts;
             }
@@ -1015,6 +1046,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                 ty,
                 a: sh.clone(),
                 b: Val::Const(mask_i64),
+                loc: None,
             }));
             insts.push(Inst::Bin(ir::Bin {
                 dst: sub_dst.clone(),
@@ -1022,6 +1054,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                 ty,
                 a: Val::Const(width_i64),
                 b: Val::Reg(sh_masked.clone()),
+                loc: None,
             }));
             if is_fshl {
                 let func = match ty {
@@ -1152,6 +1185,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                 ty,
                 a: Val::Reg(sh_masked.clone()),
                 b: Val::Const(0),
+                loc: None,
             }));
             insts.push(Inst::Select(ir::Select {
                 dst: shr_sel.clone(),
@@ -1160,6 +1194,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                 a: Val::Const(0),
                 b: Val::Reg(shr_dst),
                 ptr: false,
+                loc: None,
             }));
             insts.push(Inst::Bin(ir::Bin {
                 dst,
@@ -1167,6 +1202,7 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                 ty,
                 a: Val::Reg(shl_dst),
                 b: Val::Reg(shr_sel),
+                loc: None,
             }));
             insts
         }
@@ -1692,7 +1728,7 @@ fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>) {
             rv(&mut b.a, shared);
             rv(&mut b.b, shared);
         }
-        Inst::Ret(Some((_, v))) => rv(v, shared),
+        Inst::Ret(Some((_, v)), _) => rv(v, shared),
         Inst::Zext(z) => rv(&mut z.val, shared),
         Inst::Sext(x) => rv(&mut x.val, shared),
         Inst::Trunc(t) => rv(&mut t.val, shared),
@@ -1868,7 +1904,7 @@ fn collect_global_vals(inst: &Inst, out: &mut HashSet<String>) {
             push(&b.a, out);
             push(&b.b, out);
         }
-        Inst::Ret(Some((_, v))) => push(v, out),
+        Inst::Ret(Some((_, v)), _) => push(v, out),
         Inst::Zext(z) => push(&z.val, out),
         Inst::Sext(x) => push(&x.val, out),
         Inst::Trunc(t) => push(&t.val, out),
@@ -1980,6 +2016,7 @@ fn fold_const_bin(b: &ir::Bin) -> Option<Inst> {
         dst: b.dst.clone(),
         ty: b.ty,
         val: Val::Const(result),
+        loc: None,
     }))
 }
 
@@ -1994,6 +2031,7 @@ fn fold_const_icmp(c: &Icmp) -> Option<Inst> {
         dst: c.dst.clone(),
         ty: Ty::I1,
         val: Val::Const(i64::from(result)),
+        loc: None,
     }))
 }
 
@@ -2231,6 +2269,7 @@ fn routine_func(name: &str) -> Func {
             insts: vec![Inst::Alloca(Alloca {
                 dst: "__scr".into(),
                 size: scr,
+                loc: None,
             })],
         }],
         isr: false, // runtime routines are never interrupt handlers
