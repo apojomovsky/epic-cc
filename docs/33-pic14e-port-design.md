@@ -12,7 +12,7 @@ peripheral/register reference is real and in-repo, and because the
 1937/1939 are the popular hobbyist Enhanced Mid-range parts.
 
 **Definition of done:** parity with what the PIC14 backend supports
-today. The fifteen existing e2e fixtures compile, assemble byte-for-byte
+today. The existing e2e fixtures compile, assemble byte-for-byte
 against `gpasm -p p16f1937`, and run correctly in the simulator, for
 PIC14E.
 
@@ -50,7 +50,7 @@ first are flagged `[VERIFY]`, matching the convention in
 verification strategy survives whole: `gpasm`, `gpsim` and XC8 all
 support the 1937, so all three oracles carry over. The PIC14 integer
 spine's ALU/literal/bit emitters, the `PCLATH` paging machinery, the
-`__mul_u8`/`__udiv_u8` shift-add routines, the nine soft-float
+`__mul_u8`/`__udiv_u8` shift-add routines, the soft-float
 routines, and the `RETLW` const-table machinery all carry over with
 mnemonic-for-mnemonic substitution.
 
@@ -103,12 +103,12 @@ clear answer from the ISA survey: **it shares the emitter surface with
 **Rejected, a `Target` trait over one generic `isel`.** Same reasoning
 as the PIC18 port's D-1: the abstraction would degrade into
 `emit_move(dst, src)` wrappers that obscure the point of the port, and
-it would refactor 7,000 lines of working, tested code first.
+it would refactor the working, tested backend first.
 
 **Rejected, one crate parameterised by `Device`, branching
 internally.** Same scatter objection as PIC18's D-1.
 
-**Consequence, stated plainly:** the nine soft-float routines and the
+**Consequence, stated plainly:** the soft-float routines and the
 mul/div routines are written a third time. This is accepted and cheap:
 they are 1:1 ports of the verified PIC14 bodies with a substitution
 table, exactly as the PIC18 port did (ADR-015).
@@ -291,7 +291,7 @@ that is a test, not a judgement.
 | **P4** | `const` in flash via `RETLW` (carried over). | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stays (D-5) |
 | **P5** | Interrupts: single vector, hardware context save, `_isr` frame copies. | `interrupt.c`, `interrupt_gate.c`; the ISR needs no manual save/restore |
 | **P6** | 32-bit `long`, mul/div routines (carried over from PIC14). | `long.c`, `muldiv.c`, `interrupt_mul.c` |
-| **P7** | Soft-float: nine f32 routines (1:1 port of the PIC14 bodies). | `float.c` (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) |
+| **P7** | Soft-float: f32 routines (1:1 port of the PIC14 bodies). | `float.c` (out1=0x3F99999A, out2=0x41100000, out3=0x3EAAAAAB) |
 | **P8** | Fuzz gate: device-threaded differential runner on PIC14E. | `pic14e.rs` fast (8) and full corpora (200, 50, 50) clean on the PIC14E sim via `--device` |
 
 **P0 deserves emphasis.** It is pure data plus one schema field, with
@@ -346,7 +346,7 @@ any.
    embeddable in `cargo test`.
 2. **`gpasm` byte-for-byte cross-check**, against `-p p16f1937`. This
    is P1's entire acceptance criterion and the reason P1 precedes P2.
-3. **The fifteen e2e acceptance programs**, recompiled for PIC14E. They
+3. **The e2e acceptance programs**, recompiled for PIC14E. They
    are the parity definition, phase by phase, in the P2-P7 table above.
 4. **Differential fuzzing** against host clang, with the seed corpora.
 
@@ -393,10 +393,9 @@ this is the PIC14E analog of the PIC18 two-word-instruction risk.
 W/STATUS/BSR/FSR0/FSR1/PCLATH on entry and restores on `RETFIE`
 (DS41364B §4.1). The compiler must not rely on ISR-side register
 values surviving, and the `_isr` frame copies must be disjoint from
-the main frames, same as PIC18's P5. The one thing to verify: whether
-the shadow save happens for the low-priority path only or for all
-interrupts (this core has no priority, so it should be all, but the
-wording in §4.1 is worth a second read).
+the main frames, same as PIC18's P5. The one thing to verify: re-read
+§4.1 to confirm the shadow save covers every interrupt entry on this
+core, which has no priority levels.
 
 **The clang side is assumed unchanged.** `-target msp430` remains the
 datalayout proxy, same as PIC18 (8-bit `char`, 16-bit `int`,

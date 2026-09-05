@@ -83,6 +83,7 @@ ADRs in [`03-decisions.md`](03-decisions.md) plus `docs/adr/`.
 | Verification: simulator, gpasm oracle, fuzzing | [`05-verification.md`](05-verification.md) |
 | Build environment and pinned versions | [`09-build-environment.md`](09-build-environment.md) |
 | PIC18 port: why it is smaller than a second compiler, and its phases | [`29-pic18-port-design.md`](29-pic18-port-design.md) |
+| PIC14E port: Enhanced Mid-range backend plan and its phases | [`33-pic14e-port-design.md`](33-pic14e-port-design.md) |
 | Public binary distribution | [`30-distribution-design.md`](30-distribution-design.md) |
 | Ecosystem integration: epic-cc + epic-hal + PlatformIO | [`31-ecosystem-integration-design.md`](31-ecosystem-integration-design.md) |
 | Architecture decisions and rejected alternatives | [`03-decisions.md`](03-decisions.md) and `docs/adr/` |
