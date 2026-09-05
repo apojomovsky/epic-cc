@@ -81,7 +81,7 @@ fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {
     let _osc = named(region, spec, "osc");
     xtal.unwrap_or_else(|| {
         panic!(
-            "epic-cc: xtal_hz=<Hz> is required in EPIC_CONFIG for PIC16F877A \
+            "epic-cc: xtal_hz=<Hz> is required in EPIC_CONFIG \
              (DS39582C §14.2: Fosc is the crystal or the declared RC frequency)"
         )
     })
