@@ -184,8 +184,9 @@ pub struct Call {
     /// Source location of the call in the user's C, when the module was
     /// parsed from debug-info-carrying LLVM IR. `None` means compiler
     /// generated: legalize's runtime routines, or a canonical-text
-    /// reparse. Diagnostics read it; the backend ignores it and the
-    /// canonical text does not carry it.
+    /// reparse. Diagnostics read it; the backend threads it through to the
+    /// address-to-line table (epic-cc#238) and the canonical text does not
+    /// carry it.
     pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
