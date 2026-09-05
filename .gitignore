@@ -11,6 +11,7 @@
 *.pdf
 
 # Build / test artifacts
+__pycache__/
 *.hex
 *.lst
 *.cod

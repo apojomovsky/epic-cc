@@ -142,11 +142,14 @@ class GenDevicePic18Test(unittest.TestCase):
         self.assertIn("fixed_retval = [0x0000, 0x000F]", text)
 
     def test_contiguous_gpr_banks_merge(self):
-        # gpr0 (0x60-0x7F) and gpr1 (0x80-0x9F) are back-to-back; the
-        # schema wants one merged range, matching the hand-transcribed
-        # p18f4550.toml's single-entry `ram_banks`.
+        # gpr0 (0x60-0x7F) and gpr1 (0x80-0x9F) are back-to-back, and the
+        # schema's `ram_banks` also folds in whatever the access bank
+        # (0x00-0x5F) leaves over after `fixed_retval` (0x00-0x0F) reserves
+        # its slice: matching the hand-transcribed p18f4550.toml, whose
+        # `ram_banks` starts right after `fixed_retval`, not at the banked
+        # region's own start address.
         text = self.generate()
-        self.assertIn("ram_banks = [[0x0060, 0x009F]]", text)
+        self.assertIn("ram_banks = [[0x0010, 0x009F]]", text)
 
     def test_bit_layout_mismatch_against_impl_is_a_hard_failure(self):
         # If CONFIGX's declared `impl` no longer matches the union of its

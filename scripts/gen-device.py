@@ -81,22 +81,61 @@ FIELD_ALIAS = {
     "FCMEN": "fcmen",
 }
 
+# Per-part raw-DFP-name overrides, same shape as PART_DEFAULTS below: a
+# part whose DFP spells a field differently than the name we already ship
+# for a sibling gets an entry here instead of a bespoke if-branch.
+PART_FIELD_ALIASES = {
+    "p16f877a": {"BOREN": "bor", "BODEN": "bor"},
+    "p18f2550": {"BOR": "boren"},
+}
+
 def alias_field(name: str, stem: str) -> str:
-    if name == "BOREN" and stem == "p16f877a":
-        return "bor"
-    if name == "BODEN" and stem == "p16f877a":
-        return "bor"
+    override = PART_FIELD_ALIASES.get(stem, {}).get(name)
+    if override:
+        return override
     return FIELD_ALIAS.get(name, name.lower())
+
+# Per-part cname overrides, keyed by the already-aliased field name then the
+# DFP's lowercased cname. p18f2550's entry: Microchip.PIC18Fxxxx_DFP 1.8.178
+# spells the same bit values p18f4550.toml already ships (same datasheet,
+# same family, confirmed bit-for-bit against both parts' own DFP `when`
+# values) under different cnames, a pack revision difference, not a
+# hardware one. Several call sites match on p18f4550's spelling literally
+# (fosc.rs::pic18_hz's osc/cpudiv/plldiv), so an unaliased value fails
+# there with "unknown osc/cpudiv/plldiv", not a wrong Fosc.
+PART_VALUE_ALIASES = {
+    "p16f877a": {
+        "osc": {"extrc": "rc", "extrc_clkout": "rc"},
+    },
+    "p18f2550": {
+        "osc": {
+            "hspll_hs": "hspll", "intosc_hs": "inths", "intosc_xt": "intxt",
+            "intosc_ec": "intcko", "intoscio_ec": "intio", "ecpll_ec": "ecpll",
+            "ecpllio_ec": "ecpio", "ec_ec": "ec", "ecio_ec": "ecio",
+            "xtpll_xt": "xtpll", "xt_xt": "xt",
+        },
+        "cpudiv": {
+            "osc1_pll2": "div1", "osc2_pll3": "div2", "osc3_pll4": "div3", "osc4_pll6": "div4",
+        },
+        "plldiv": {
+            "1": "noprescale", "2": "div2", "3": "div3", "4": "div4",
+            "5": "div5", "6": "div6", "10": "div10", "12": "div12",
+        },
+        "usbdiv": {"1": "off", "2": "on"},
+        "boren": {"off": "off", "soft": "sw", "on_active": "hw_off_in_sleep", "on": "hw_always"},
+        "borv": {"0": "maximum", "1": "mid", "2": "low", "3": "minimum"},
+        "wdtps": {str(2**i): f"div{2**i}" for i in range(16)},
+        "ccp2mx": {"off": "rb3", "on": "rc1"},
+    },
+}
 
 def alias_value(field: str, value: str, stem: str) -> str:
     v = value.lower()
     if field in ("osc", "fosc") and v.startswith("intrc"):
         v = v.replace("intrc", "intosc")
-    if field in ("osc", "fosc") and stem == "p16f877a":
-        if v == "extrc":
-            return "rc"
-        if v == "extrc_clkout":
-            return "rc"
+    override = PART_VALUE_ALIASES.get(stem, {}).get(field, {}).get(v)
+    if override:
+        return override
     return v
 
 # Which enum value a fuse defaults to when the user names none. This is
@@ -579,6 +618,17 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     # bank, identical on every classic PIC18 part because the access bank
     # itself always starts at 0 on this core.
     fixed_retval = (0x0000, 0x000F) if access_bank is not None else None
+    if access_bank is not None and fixed_retval is not None:
+        # `Device::ram_banks` on PIC18 is not "the physical banked GPR
+        # sectors": the schema folds in whatever part of the access bank
+        # `fixed_retval` does not reserve (see `crates/device/tests/
+        # gputils_crosscheck.rs`'s PIC18 comparison and the already-shipped
+        # `p18f4550.toml`, whose `ram_banks` starts at 0x10, not the banked
+        # region's own 0x60). Synthesize that leftover access-bank span and
+        # merge it with the real banked sectors the same way multiple banked
+        # sectors already merge.
+        leftover_access = (fixed_retval[1] + 1, access_bank[1])
+        ram_banks = merge_contiguous(ram_banks + [leftover_access])
     if cfg_span is not None:
         # No per-fuse table, so only the address range is known. The erased
         # value is a core fact (PIC14 words read all ones in 14 bits, PIC18
@@ -626,12 +676,22 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
             default_name = SAFE_DEFAULTS.get(field_name)
             if default_name and not any(n == default_name for n, _ in deduped):
                 default_name = None
+        locked = None
+        if core == "pic18" and field_name == "xinst":
+            # Backend-wide, not device data: this compiler never emits
+            # Extended Instruction Set / Indexed Addressing code for any
+            # PIC18 part (see the access-bank note in parse_edc's PIC18
+            # handling), so `xinst` must be unconditionally off, the same
+            # way p18f4550.toml already locks it.
+            default_name = "off"
+            locked = "off"
         return {
             "name": field_name,
             "byte_offset": byte_offset,
             "mask": mask_in_byte,
             "shift": shift_in_byte,
             "default": default_name,
+            "locked": locked,
             "values": deduped,
         }
 
@@ -729,6 +789,8 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
         out_lines.append(f'shift = {f["shift"]}')
         if f["default"] is not None:
             out_lines.append(f'default = "{f["default"]}"')
+        if f.get("locked") is not None:
+            out_lines.append(f'locked = "{f["locked"]}"')
         vals_str = ", ".join(f'{{ name = "{n}", bits = {b} }}' for n, b in f["values"])
         out_lines.append(f'values = [{vals_str}]')
         out_lines.append("")
