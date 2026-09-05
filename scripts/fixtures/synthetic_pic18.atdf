@@ -1,0 +1,66 @@
+<!--
+  Hand-authored fixture, not a Microchip file. Describes an imaginary tiny
+  PIC18 part invented only to exercise gen-device.py's PIC18 path; no real
+  silicon has these numbers. Microchip's ATDF/EDC files are licensed and
+  are never committed to this repo.
+
+  Shapes deliberately exercised, each one a real bug found against the
+  actual PIC18F2550 DFP (epic-cc#230):
+  - CONFIGX/CONFIGY are non-adjacent bytes (a gap at 0x300001, mirroring
+    PIC18F2550's real missing CONFIG3L), so base/size must come from the
+    DCRDef addresses actually present, not an assumed contiguous run.
+  - CONFIGX has a reserved bit placed via `AdjustPoint`, plus a second,
+    explicitly hidden field: the bit-position walk must skip past both
+    correctly and the hidden field must not appear in the output.
+  - The access bank (`TraditionalModeOnly`) and the Extended Instruction
+    Set's mirror of it (`ExtendedModeOnly`) are given different, wrong-on-
+    purpose ranges: a correct generator reads only the Traditional one.
+  - gpr0/gpr1 are contiguous and must merge into one `ram_banks` entry.
+-->
+<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC18SYN01" edc:arch="18xxxx">
+  <edc:ArchDef edc:name="18xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x10"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x800"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x300000" edc:endaddr="0x300003">
+      <edc:DCRDef edc:name="CONFIGX" edc:_addr="0x300000" edc:impl="0x05">
+        <edc:DCRModeList>
+          <edc:DCRMode edc:id="DS.0">
+            <edc:DCRFieldDef edc:name="ALPHA" edc:mask="0x1">
+              <edc:DCRFieldSemantic edc:cname="ON" edc:when="(field &amp; 0x1) == 0x1"/>
+              <edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x0"/>
+            </edc:DCRFieldDef>
+            <edc:AdjustPoint edc:offset="1"/>
+            <edc:DCRFieldDef edc:name="RES" edc:mask="0x1" edc:ishidden="true" edc:islanghidden="true">
+              <edc:DCRFieldSemantic edc:cname="" edc:when="(field &amp; 0x1) == 0x0"/>
+            </edc:DCRFieldDef>
+          </edc:DCRMode>
+        </edc:DCRModeList>
+      </edc:DCRDef>
+      <edc:DCRDef edc:name="CONFIGY" edc:_addr="0x300002" edc:impl="0x03">
+        <edc:DCRModeList>
+          <edc:DCRMode edc:id="DS.0">
+            <edc:DCRFieldDef edc:name="GAMMA" edc:mask="0x3">
+              <edc:DCRFieldSemantic edc:cname="THREE" edc:when="(field &amp; 0x3) == 0x3"/>
+              <edc:DCRFieldSemantic edc:cname="ONE" edc:when="(field &amp; 0x3) == 0x1"/>
+              <edc:DCRFieldSemantic edc:cname="ZERO" edc:when="(field &amp; 0x3) == 0x0"/>
+            </edc:DCRFieldDef>
+          </edc:DCRMode>
+        </edc:DCRModeList>
+      </edc:DCRDef>
+    </edc:ConfigFuseSector>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x1000">
+    <edc:RegardlessOfMode>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x60" edc:endaddr="0x80" edc:bank="0x0"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:beginaddr="0x80" edc:endaddr="0xA0" edc:bank="0x1"/>
+    </edc:RegardlessOfMode>
+    <edc:TraditionalModeOnly>
+      <edc:GPRDataSector edc:regionid="accessram" edc:beginaddr="0x0" edc:endaddr="0x60" edc:bank="0"/>
+    </edc:TraditionalModeOnly>
+    <edc:ExtendedModeOnly>
+      <edc:GPRDataSector edc:regionid="gpre" edc:beginaddr="0x0" edc:endaddr="0x90" edc:bank="0"/>
+    </edc:ExtendedModeOnly>
+  </edc:DataSpace>
+</edc:PIC>
