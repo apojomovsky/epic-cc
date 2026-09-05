@@ -16,6 +16,15 @@ use device::Device;
 use ir::{Func, Inst, Module, Ty, Val};
 use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 
+/// The high Access Bank segment's start: every classic-mode PIC18's SFRs
+/// live at `0xF60-0xFFF` (160 bytes) by the core's own linear-addressing
+/// definition (gputils' `.lkr` scripts declare it as a second, fixed
+/// `ACCESSBANK` region, `accesssfr`, on both devices this core ships).
+/// Unlike the low segment's `0x00-0x5F` (`Device::access_bank`, real
+/// per-device data), the schema has no field for this because nothing has
+/// needed one yet: it is architecture, not silicon (epic-cc#226 audit).
+const PIC18_SFR_ACCESS_LO: u16 = 0xF60;
+
 /// The result of resolving a pointer to a concrete access. `Direct`: the
 /// address is statically known, so a plain `MOVFF`/`MOVF`/`MOVWF` reaches
 /// it. `Indirect`: `FSR0` has been set up and the access goes through
@@ -320,7 +329,7 @@ impl<'m> Gen<'m> {
     /// bit at all, which is why `Load`/`Store`/`Phi`-copies/`Call`-arg-
     /// copies never touch `BSR`.
     fn operand(&mut self, addr: u16) -> (u16, u16) {
-        if addr < 0x60 || addr >= 0xF60 {
+        if addr <= self.access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
             (0, addr & 0xFF)
         } else {
             let bank = (addr >> 8) as u8;
@@ -5492,8 +5501,8 @@ pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> Stri
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
-                    // Access-bank check mirrors Gen::operand: <0x60 or >=0xF60 is A.
-                    if addr < 0x60 || addr >= 0xF60 {
+                    // Access-bank check mirrors Gen::operand.
+                    if addr <= access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
                         init.push(format!("    MOVWF 0x{addr:03X},A"));
                     } else {
                         let bsr = (addr >> 8) as u8;
