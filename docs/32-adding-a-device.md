@@ -57,7 +57,7 @@ Everything below assumes Path A.
 
 ```bash
 python3 scripts/gen-device.py <part> --atdf <path/to/PART.PIC> \
-    --out crates/device/devices/<stem>.toml
+    --pack <pack-name> --out crates/device/devices/<stem>.toml
 ```
 
 `<part>` accepts any spelling the generator normalizes (`PIC16F887`,
@@ -69,6 +69,16 @@ directly for PIC18 config fields, and `GPRDataSector` (split by
 the access bank. See the module docstring in `scripts/gen-device.py` for
 what each core's fields mean and how the alias tables normalize DFP
 spelling to this repo's `EPIC_CONFIG` vocabulary.
+
+`--pack <name>` names the DFP for the `[provenance]` stanza (e.g.
+`Microchip.PIC18Fxxxx_DFP`). It is required whenever the `--atdf` file
+has no `*_DFP` ancestor directory, which is exactly the
+`vendor/microchip/device-data/` shape this runbook's sources use: the
+pack name is a directory-level fact of the `.atpack` layout, not
+something the XML states, and the generator refuses to fabricate it
+(ADR-021). A file still inside its pack directory (e.g. under a local
+XC8 install's `pic/packs/*/edc/`) needs no `--pack`; the `*_DFP`
+ancestor names it.
 
 **If the part shares an existing family's datasheet with a sibling
 already in the registry** (e.g. a second PIC18F2455/2550/4455/4550

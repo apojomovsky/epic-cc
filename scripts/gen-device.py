@@ -16,6 +16,11 @@ Output: crates/device/devices/<stem>.toml deterministically formatted.
   python3 scripts/gen-device.py PIC16F887 --out crates/device/devices/p16f887.toml
   python3 scripts/gen-device.py p16f887 --check   # CI: fails if drift
 
+Provenance pack name: derived from the source file's nearest *_DFP ancestor
+directory (how a .atpack unzips). A file extracted elsewhere has no such
+ancestor; pass --pack <name> explicitly, or the generator refuses to write
+the provenance stanza (ADR-021: never fabricate provenance).
+
 Alias table: normalises DFP names to our EPIC_CONFIG names.
   Field aliases: FOSC->osc, WDTE->wdt, PWRTE->pwrt, BOREN/BODEN->bor/boren,
                  etc. (lowercased fallback). Value aliases: INTRC->INTOSC,
@@ -185,13 +190,15 @@ PART_DEFAULTS = {
     },
 }
 
-def find_pack_name(atdf_path: pathlib.Path) -> str:
+def find_pack_name(atdf_path: pathlib.Path) -> str | None:
     # DFP directories are named *_DFP (optionally version-suffixed); the
     # immediate parent is just "edc", which would misrepresent the source.
+    # None means the file was extracted outside its pack directory; the
+    # caller must supply the pack name explicitly (--pack) or refuse.
     for parent in atdf_path.resolve().parents:
         if "_DFP" in parent.name.upper():
             return parent.name
-    return "unknown"
+    return None
 
 def find_edc_pic(stem: str):
     name = stem_to_edc_name(stem) + ".PIC"
@@ -521,7 +528,7 @@ def parse_edc(edc_path: pathlib.Path):
             out["common_ram"] = common[0]
     return out
 
-def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
+def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, require_pack=True):
     ini_sections = parse_ini(ini_path) if ini_path and ini_path.exists() else {}
     suffix = stem_to_suffix(stem).upper()
     sec = ini_sections.get(suffix, {})
@@ -765,14 +772,23 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None):
     out_lines.append(f'interrupt_vectors = [{vectors_str}]')
     if edc_path is not None:
         # edc_path is the ATDF/EDC PIC XML actually parsed; hash it so the
-        # TOML is traceable to the exact pack that produced it.
-        pack_name = find_pack_name(edc_path)
+        # TOML is traceable to the exact pack that produced it. The pack
+        # name is a directory-level fact of the .atpack layout, not
+        # something the XML states, so a file extracted outside its pack
+        # directory needs it passed explicitly; guessing "unknown" would
+        # fabricate provenance (ADR-021).
+        pack_name = pack or find_pack_name(edc_path)
+        if pack_name is None and require_pack:
+            raise MissingFacts(
+                ["pack name: no *_DFP ancestor directory and no --pack given"]
+            )
         digest = hashlib.sha256(edc_path.read_bytes()).hexdigest()
         out_lines.append("")
         out_lines.append("[provenance]")
         out_lines.append('tier = "atdf"')
         out_lines.append(f'source = "{edc_path.name}"')
-        out_lines.append(f'pack = "{pack_name}"')
+        if pack_name is not None:
+            out_lines.append(f'pack = "{pack_name}"')
         out_lines.append(f'sha256 = "{digest}"')
     out_lines.append("")
     out_lines.append("[config]")
@@ -809,6 +825,7 @@ def main():
     ap = argparse.ArgumentParser(description="DFP/ATDF -> TOML generator for epic-cc device registry")
     ap.add_argument("device", help="device name: p16f887, PIC16F887, 16f887, etc.")
     ap.add_argument("--atdf", type=pathlib.Path, help="explicit ATDF/EDC PIC file path")
+    ap.add_argument("--pack", help="DFP pack name for the provenance stanza, e.g. Microchip.PIC16Fxxx_DFP (required when --atdf has no *_DFP ancestor directory)")
     ap.add_argument("--out", type=pathlib.Path, help="output TOML path (default crates/device/devices/<stem>.toml)")
     ap.add_argument("--check", action="store_true", help="verify existing TOML matches generated; exit 1 on drift")
     ap.add_argument("--with-sfrs", action="store_true", help="include SFR table (placeholder)")
@@ -844,7 +861,7 @@ def main():
         print("  Alternatively pass --atdf /path/to/PIC16F887.PIC", file=sys.stderr)
         sys.exit(2)
     try:
-        toml_content = generate_toml(stem, ini, cfg, edc)
+        toml_content = generate_toml(stem, ini, cfg, edc, args.pack, require_pack=not args.check)
     except MissingFacts as e:
         # Refusing beats guessing: a TOML the generator invented would still
         # carry a real sha256 and read as attested. See ADR-021.

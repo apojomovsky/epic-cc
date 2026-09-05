@@ -132,6 +132,10 @@ The generator (`scripts/gen-device.py`, stdlib only) normalises field/value
 names via a small alias table (`FOSC` -> `osc`, `WDTE` -> `wdt`, `INTRC` ->
 `intosc`, etc.) documented in its header, and emits deterministically
 formatted TOML (fields sorted by `byte_offset`/`shift`, values by `bits`).
+The provenance `pack` name is derived from the source file's nearest
+`*_DFP` ancestor directory; a file extracted outside its pack directory
+needs `--pack <name>` passed explicitly, otherwise the generator refuses to
+write the stanza rather than fabricate `pack = "unknown"` (ADR-021).
 See `docs/adr/ADR-020-dfp-toml-generator.md` and `scripts/gen-device.py --help`.
 
 `crates/device/provenance.rs` reaches the crate only via `include!`, never a
