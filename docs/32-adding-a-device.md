@@ -3,8 +3,9 @@
 Status: **living reference**, not a one-off task plan. Re-read this whole
 document before starting a device addition, and update it whenever a real
 addition teaches something this version got wrong or left out. It documents
-a path proven twice: PIC14's `p16f887` (`#85`) and PIC18's `p18f2550`
-(`#224`, `#226`). Mirrors `epic-hal/docs/adding-a-device.md`'s shape and
+a path proven twice: PIC14's `p16f887` (`#85`, landed in `#90`) and
+PIC18's `p18f2550` (`#224`/`#226`, landed in `#232`/`#234`). Mirrors
+`epic-hal/docs/adding-a-device.md`'s shape and
 its "living reference, not a checklist" posture.
 
 This is **Path A only**: a new device on a core this compiler already
@@ -39,8 +40,8 @@ Everything below assumes Path A.
 
 1. Find the part's Device Family Pack. Free download from
    `https://packs.download.microchip.com/`; never install XC8 to get one,
-   though a local pinned XC8 install (`docker/ci-toolchain/Dockerfile`'s
-   tag) also carries the same DFP data under
+   though a local pinned XC8 install (the root `Dockerfile`'s pinned
+   tag, `PIC8_XC8_ROOT`) also carries the same DFP data under
    `/opt/microchip/xc8/v4.00/pic/packs/*/edc/*.PIC` and works as an
    alternate `--atdf` source.
 2. **Never commit the pack.** `*.atdf`, `*.PIC`, `*.atpack` are gitignored
@@ -199,7 +200,7 @@ Two failure shapes to expect and fix, not route around:
 | DFP pack understates RAM banks for a device the generator otherwise handles correctly | `p18f2550`, `p18f4550`, same DFP pack | `#231`, `#232`, `scripts/gen-device.py` module docstring |
 | DFP pack revision spells config enum values (and even a field name) differently than an already-shipped sibling for the identical hardware bit | `p18f2550` vs. `p18f4550` | `#232`, `scripts/gen-device.py`'s `PART_FIELD_ALIASES`/`PART_VALUE_ALIASES` |
 | A field the backend cannot honor for every silicon-legal value needs an explicit `locked` value, not just a `default` | PIC18 `xinst` | `#232`, `crates/device/src/config.rs`'s `locked` handling |
-| Core-dispatched Rust code hardcoding a literal transcribed from the first device on a core instead of deriving it from `Device` fields | PIC18 access-bank boundary in `isel-pic18` | `#226`, `#234` |
+| Core-dispatched Rust code hardcoding a literal transcribed from the first device on a core instead of deriving it from `Device` fields | PIC18 access-bank boundary in `isel-pic18` | `#226` (issue), `#234` (fix) |
 
 This table is deliberately device-specific in its "confirmed on" column
 and generic in its "pattern" column, the same posture
