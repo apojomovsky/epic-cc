@@ -8,12 +8,13 @@
 > question incorrectly deferred to P3 that actually gates P0 (the
 > linear-region design, resolved in D-2 below), and a set of factual
 > errors in the device-data sketch (D-3). All are addressed in this
-> revision. **Still pending user approval**, and two external
-> preconditions block starting P0 regardless of approval: DS41364B is
-> not vendored in this repo (`vendor/` has no PIC16F193X datasheet), and
-> whether `gputils` 1.5.2 knows `-p p16f1937` and ships its `.lkr` has
-> not been checked. Both are named again in D-3 and section 4.
-> This document is the design of record for
+> revision. **Still pending user approval.** One external precondition
+> blocks starting P0 regardless of approval: DS41364B is not vendored
+> in this repo (`vendor/` has no PIC16F193X datasheet), so no
+> `[VERIFY]` item in this document is currently checkable. The other
+> precondition checked during this revision resolved cleanly: `gputils`
+> 1.5.2 knows `p16f1937`/`p16f1939` by name and ships their `.lkr`
+> files (D-3). This document is the design of record for
 > [issue #228](https://github.com/apojomovsky/epic-cc/issues/228). The
 > implementation plan derives from it and does not exist yet.
 
@@ -299,15 +300,18 @@ even open:**
   not among them. Every `[VERIFY]` in this document has no checkable
   target in this repo today. Get it into `vendor/` before P0 starts,
   not during it.
-- **Whether `gputils` 1.5.2 knows `-p p16f1937` and ships a `.lkr` for
-  it has not been checked.** ADR-021's own "Revisit if" clause names
-  this exact failure mode: a supported part with no `.lkr`, where "the
-  flash half fails outright because the probe cannot run." P1's entire
-  acceptance criterion is a `gpasm -p p16f1937` byte-for-byte match; if
-  gputils does not know this part, P1 as scoped cannot run, and P0's
-  cross-check gate (built on the same tool) is uncovered too. This is a
-  five-minute check and should be the first thing whoever picks up P0
-  does, before writing the TOML.
+- **Resolved, checked directly in the dev image.** `gpasm -l14e` lists
+  `p16f1937` and `p16f1939` (and the rest of the family) by name, and
+  `/usr/local/share/gputils/lkr/16f1937_g.lkr` exists, alongside a
+  `p16f1937.inc` header and gputils' own generated SFR/RAM/config/
+  feature HTML reference pages under
+  `/usr/local/share/doc/gputils-1.5.2/html/`. ADR-021's "Revisit if"
+  failure mode (a supported part with no `.lkr`) does not apply here.
+  P1's `gpasm -p p16f1937` acceptance criterion can run. The gputils-
+  generated HTML pages are also worth reading before DS41364B is
+  vendored: they are gputils' own cross-check data, not a datasheet
+  substitute, but they cover the SFR map, RAM map, config words and
+  feature bits and may resolve some `[VERIFY]` items early.
 
 The 1937/1939 TOMLs otherwise need `[VERIFY]` against DS41364B for:
 flash size (8192/16384 words), SRAM (512/1024 bytes), 16-level stack,
@@ -475,9 +479,10 @@ phase list as the effort reference. Each has an acceptance criterion
 that is a test, not a judgement, except where noted below as still
 needing one.
 
-**Before P0 opens:** confirm DS41364B is vendored, and confirm gputils
-1.5.2 recognizes `-p p16f1937` and ships its `.lkr` (D-3). Neither is a
-phase; both are go/no-go gates on the whole plan.
+**Before P0 opens:** confirm DS41364B is vendored (D-3). The gputils
+precondition already resolved cleanly during this revision, checked
+directly in the dev image (D-3): not a phase, but the one remaining
+go/no-go gate on the whole plan.
 
 | Phase | Deliverable | Acceptance |
 |---|---|---|
@@ -548,9 +553,9 @@ any.
 
 1. **Our own simulator**, extended with a PIC14E core. Deterministic,
    embeddable in `cargo test`.
-2. **`gpasm` byte-for-byte cross-check**, against `-p p16f1937`, gated
-   on the precondition in D-3 that gputils actually supports this part.
-   This is P1's entire acceptance criterion and the reason P1 precedes
+2. **`gpasm` byte-for-byte cross-check**, against `-p p16f1937`; gputils
+   support for this part is confirmed (D-3). This is P1's entire
+   acceptance criterion and the reason P1 precedes
    P2.
 3. **The e2e acceptance programs**, recompiled for PIC14E. They are
    the parity definition, phase by phase, in the P2-P7 table above,
