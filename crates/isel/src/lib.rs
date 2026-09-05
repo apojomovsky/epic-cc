@@ -1841,13 +1841,17 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{dst:02X}"));
         for i in 1..bytes {
             let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-            // The subtrahend byte is copied to the scratch first (the dst
-            // preload may overlay a), then the minuend byte is preloaded
-            // into the destination, then the fold runs against the scratch.
+            // Subtrahend to scratch (dst preload may overlay a), k_i into
+            // dst, then W reloaded from the scratch before the fold: on the
+            // no-borrow path BTFSS skips INCFSZ, so without the reload W
+            // would hold k_i and SUBWF would compute k_i - k_i = 0 instead
+            // of k_i - a_i (fuzz corpus seed 128; INCFSZ overwrites W on
+            // the borrow path, so the reload is harmless there).
             self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
             self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
             self.emit(format!("    MOVLW 0x{kb:02X}"));
             self.emit(format!("    MOVWF 0x{:02X}", dst + u16::from(i)));
+            self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
             self.emit("    BTFSS STATUS, 0 ; C".to_string());
             self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
             self.emit(format!("    SUBWF 0x{:02X}, F", dst + u16::from(i)));
