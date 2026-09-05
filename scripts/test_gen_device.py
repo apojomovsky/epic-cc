@@ -81,6 +81,25 @@ class GenDeviceTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('pack = "Microchip.PIC18Fxxxx_DFP"', text)
 
+    def test_check_does_not_require_a_pack_name(self):
+        # --check strips the provenance stanza before comparing, so the
+        # pack name is irrelevant to it. A file outside its pack
+        # directory must still be checkable without --pack.
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d) / "synthetic.toml"
+            r = subprocess.run(
+                [sys.executable, str(GEN), "synthetic", "--atdf", str(FIXTURE),
+                 "--pack", "Microchip.PIC16Fxxx_DFP", "--out", str(out)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            r = subprocess.run(
+                [sys.executable, str(GEN), "synthetic", "--atdf", str(FIXTURE),
+                 "--out", str(out), "--check"],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_is_deterministic(self):
         self.assertEqual(self.generate(), self.generate())
 

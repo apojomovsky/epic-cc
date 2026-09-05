@@ -528,7 +528,7 @@ def parse_edc(edc_path: pathlib.Path):
             out["common_ram"] = common[0]
     return out
 
-def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None):
+def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, require_pack=True):
     ini_sections = parse_ini(ini_path) if ini_path and ini_path.exists() else {}
     suffix = stem_to_suffix(stem).upper()
     sec = ini_sections.get(suffix, {})
@@ -778,7 +778,7 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None):
         # directory needs it passed explicitly; guessing "unknown" would
         # fabricate provenance (ADR-021).
         pack_name = pack or find_pack_name(edc_path)
-        if pack_name is None:
+        if pack_name is None and require_pack:
             raise MissingFacts(
                 ["pack name: no *_DFP ancestor directory and no --pack given"]
             )
@@ -787,7 +787,8 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None):
         out_lines.append("[provenance]")
         out_lines.append('tier = "atdf"')
         out_lines.append(f'source = "{edc_path.name}"')
-        out_lines.append(f'pack = "{pack_name}"')
+        if pack_name is not None:
+            out_lines.append(f'pack = "{pack_name}"')
         out_lines.append(f'sha256 = "{digest}"')
     out_lines.append("")
     out_lines.append("[config]")
@@ -860,7 +861,7 @@ def main():
         print("  Alternatively pass --atdf /path/to/PIC16F887.PIC", file=sys.stderr)
         sys.exit(2)
     try:
-        toml_content = generate_toml(stem, ini, cfg, edc, args.pack)
+        toml_content = generate_toml(stem, ini, cfg, edc, args.pack, require_pack=not args.check)
     except MissingFacts as e:
         # Refusing beats guessing: a TOML the generator invented would still
         # carry a real sha256 and read as attested. See ADR-021.
