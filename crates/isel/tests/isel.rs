@@ -5741,6 +5741,50 @@ fn sub32_simulates_with_borrow_chain() {
 }
 
 #[test]
+fn sub_const_lhs_no_borrow_fold_reloads_the_subtrahend() {
+    // const-LHS `d = k - a`: each higher byte preloads k_i into dst and
+    // folds the borrow with INCFSZ's skip. On the no-borrow path the skip
+    // means SUBWF must find the subtrahend in W, reloaded from scratch
+    // after the MOVLW/MOVWF pair (the pair leaves W holding k_i); without
+    // it SUBWF computes k_i - k_i = 0, zeroing every no-borrow byte (fuzz
+    // corpus seed 128). Bytes 1-3 below all fold no-borrow.
+    let ir = "global x i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %r = sub i32 305419896, %a\n    store i32 %r @out\n    ret void\n";
+    let map = [
+        ("x", 0x20),
+        ("out", 0x24),
+        ("main::a", 0x30),
+        ("main::r", 0x34),
+    ];
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0x01), (0x21, 0x00), (0x22, 0x00), (0x23, 0x00)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0x77, 0x56, 0x34, 0x12],
+        "0x12345678 - 1 must be 0x12345677 (no-borrow bytes 1-3 must not zero)"
+    );
+
+    // Mirror corpus shape: borrow-in at byte 1 only (0x120000FF), so
+    // bytes 2-3 fold on the no-borrow path again.
+    let got = sim_run_bytes(
+        ir,
+        &str_map(&map),
+        &[(0x20, 0xFF), (0x21, 0x00), (0x22, 0x00), (0x23, 0x12)],
+        0x24,
+        4,
+    );
+    assert_eq!(
+        &got[..],
+        &[0x79, 0x55, 0x34, 0x00],
+        "0x12345678 - 0x120000FF must be 0x00345579"
+    );
+}
+
+#[test]
 fn cmp_i32_simulates_correctly() {
     let ir = "global x i32\nglobal y i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i32 @x\n    %b = load i32 @y\n    %c = icmp ult i32 %a, %b\n    store i8 %c @out\n    ret void\n";
     let map = vec![
