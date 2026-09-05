@@ -317,9 +317,9 @@ fn main() {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.iter().map(|(k, &v)| (k.clone(), v)));
     addrs.extend(layout.locals.iter().map(|(k, &v)| (k.clone(), v)));
-    let asm = match device.core {
-        device::Core::Pic14 => isel::select(device, &m, &addrs),
-        device::Core::Pic18 => isel_pic18::select(device, &m, &addrs),
+    let (asm, mut locs) = match device.core {
+        device::Core::Pic14 => isel::select_with_locs(device, &m, &addrs),
+        device::Core::Pic18 => isel_pic18::select_with_locs(device, &m, &addrs),
         device::Core::Pic14e => {
             eprintln!(
                 "epic-cc: pic14e core not yet implemented for {}",
@@ -337,9 +337,12 @@ fn main() {
             // (ADR-027, epic-cc#210) runs before banking so it sees
             // isel's raw instruction order before banking turns bank
             // demand into BANKSEL text; phase 1 is an identity transform.
-            let asm = schedule::schedule(device, &asm);
-            let asm = banking::assign_banks(device, &asm);
-            let asm = peephole::optimize(&asm);
+            let (asm, l) = schedule::schedule_with_locs(device, &asm, &locs);
+            locs = l;
+            let (asm, l) = banking::assign_banks_with_locs(device, &asm, &locs);
+            locs = l;
+            let (asm, l) = peephole::optimize_with_locs(&asm, &locs);
+            locs = l;
 
             // Issue #17: the page assignment ran on pre-banking sizes; the
             // banking pass inserts BANKSEL words that grow the text. Verify
@@ -382,6 +385,13 @@ fn main() {
         None
     };
     let program_words = asm::assemble_words(device, &asm);
+    if let Some(lt_path) = &cli.line_table {
+        std::fs::write(
+            lt_path,
+            driver::report::line_table_text(&device, &asm, &locs),
+        )
+        .expect("write line table");
+    }
     let hex = match (device.core, &config_bytes) {
         (device::Core::Pic14, Some(cb)) => {
             let mut words = program_words.clone();

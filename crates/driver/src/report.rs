@@ -8,6 +8,59 @@
 
 use alloc::AllocLayout;
 use device::Device;
+use ir::SrcLoc;
+
+/// The address-to-source-line table: one `file:line:col <addr>` record per
+/// word of the final program, sorted by address. Compiler-generated words
+/// (no source instruction) are omitted. Built by walking the final asm
+/// text with the same pass-1 semantics `asm::assemble` uses (tracking
+/// `org`, labels, `.align`, `.table`, `end`), pairing each word address
+/// with the parallel per-line `locs` vector the backend threaded through.
+/// The table is the Phase-1 debugger artifact: a breakpoint on a C line
+/// resolves to the word addresses that line produced.
+pub fn line_table_text(device: &Device, asm: &str, locs: &[Option<SrcLoc>]) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("; epic-cc line table for {}\n", device.name));
+    let mut org = 0usize;
+    let mut li = 0usize;
+    for raw in asm.lines() {
+        let line = raw.split(';').next().unwrap_or("").trim();
+        let loc = locs.get(li).cloned().flatten();
+        li += 1;
+        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("org ") {
+            org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
+            continue;
+        }
+        if line.starts_with("end") {
+            break;
+        }
+        if let Some(l) = line.strip_suffix(':') {
+            // A label defines no word; the next instruction's address is
+            // the label's. Skip.
+            let _ = l;
+            continue;
+        }
+        if line.contains(" equ ") {
+            continue;
+        }
+        if let Some(n) = line.strip_prefix(".align ") {
+            let n: usize = n.trim().parse().unwrap();
+            org = (org + n - 1) & !(n - 1);
+            continue;
+        }
+        if line.starts_with(".table ") {
+            continue;
+        }
+        if let Some(loc) = loc {
+            out.push_str(&format!("{} 0x{org:04X}\n", loc));
+        }
+        org += 1;
+    }
+    out
+}
 
 /// The address map file: `global <name> 0xNN`, `const <name>` (flash, no
 /// RAM address), and `local <key> 0xNN` where `<key>` is the driver's
