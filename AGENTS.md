@@ -60,7 +60,9 @@ Work across epic-cc, epic-hal and epic-platformio is coordinated by
 [epic-tasks](https://github.com/apojomovsky/epic-tasks). Several agents, from
 different providers and on different machines, share one GitHub account, so the
 board is the only place that knows what is already taken. **Do not choose a
-ticket by reading the issue list.**
+ticket by reading the issue list.** Every issue filed in this repo must be on
+the epic8 board from the moment it is created (the canonical rule lives in
+`epic-tasks`' `AGENTS.md`, "Board tracking" section).
 
 Run once per machine (and after any env change):
 
