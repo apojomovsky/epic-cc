@@ -1,20 +1,27 @@
 # 33: PIC14E (Enhanced Mid-range) port design
 
-> **Approval status:** revision 2, addressing an independent review
-> (2026-09-05) that held the previous version rather than approving it.
-> The review found a correctness-class error in this document's own
-> reasoning (the skip-window hazard does not disappear on this core, it
-> survives; see D-1 and the table in section 1), an architectural
-> question incorrectly deferred to P3 that actually gates P0 (the
-> linear-region design, resolved in D-2 below), and a set of factual
-> errors in the device-data sketch (D-3). All are addressed in this
-> revision. **Still pending user approval.** One external precondition
-> blocks starting P0 regardless of approval: DS41364B is not vendored
-> in this repo (`vendor/` has no PIC16F193X datasheet), so no
-> `[VERIFY]` item in this document is currently checkable. The other
-> precondition checked during this revision resolved cleanly: `gputils`
-> 1.5.2 knows `p16f1937`/`p16f1939` by name and ships their `.lkr`
-> files (D-3). This document is the design of record for
+> **Approval status:** revision 3. Revision 2 addressed an independent
+> review (2026-09-05) that held revision 1 rather than approving it: a
+> correctness-class error in the document's own reasoning (the
+> skip-window hazard does not disappear on this core, it survives; see
+> D-1 and the table in section 1), an architectural question
+> incorrectly deferred to P3 that actually gates P0 (the linear-region
+> design, resolved in D-2), and a set of factual errors in the
+> device-data sketch (D-3). Revision 3 vendors and reads the actual
+> datasheets, which were not available in this repo when revision 2 was
+> written: **both external preconditions are now resolved.** `vendor/
+> microchip/datasheets/` now holds `DS41364E.pdf` (PIC16F1934/6/7,
+> revision 2 named the wrong document number, `DS41364B`; the correct,
+> current one is `E`), `DS40001574D.pdf` (PIC16F1938/9, a genuinely
+> **separate** document, not the same one as the 1934/6/7 family, a
+> distinction revision 2 also missed), and `DS80000479.pdf` (the family
+> silicon errata). `gputils` support for both target parts was already
+> confirmed in revision 2. Every `[VERIFY]` item this revision could
+> check against those documents is resolved below, one of them
+> correcting a claim revision 2 itself introduced (OPTION/TRIS were not
+> actually removed on this core; see section 1). **Still pending user
+> approval**, on the design decisions, not the facts. This document is
+> the design of record for
 > [issue #228](https://github.com/apojomovsky/epic-cc/issues/228). The
 > implementation plan derives from it and does not exist yet.
 
@@ -57,25 +64,26 @@ The PIC18 port was a new core in almost every dimension: 16-bit words,
 byte-oriented PC, two-word instructions, an access bank, hardware
 multiply, `TBLRD`, two interrupt vectors. PIC14E keeps the PIC14
 foundation and adds a layer on top, on the ISA side. Every figure in
-this table is working knowledge and must be confirmed against the PIC16F193X
-datasheet (DS41364B) before it is hard-coded, which is currently
-impossible in this repo (see the approval-status note above); items
-most worth checking first are flagged `[VERIFY]`, matching the
-convention in [`01-target-pic14.md`](01-target-pic14.md).
+this table is now confirmed against the actual datasheets (DS41364E
+for 1934/6/7, DS40001574D for 1938/9, both in `vendor/microchip/
+datasheets/`, see the approval-status note); citations below name the
+real section and table, not the guessed ones revision 2 carried
+forward from general PIC14E knowledge before the documents were
+vendored.
 
 | PIC14 constraint | PIC14E |
 |---|---|
-| 14-bit instruction words | Same 14-bit words; the byte-oriented, bit-oriented and literal opcode families are claimed to be **bit-identical encodings** to the classic set (DS41364B Table 26-3). `[VERIFY]`, unflagged in revision 1 despite being the load-bearing claim behind D-1. Also confirm that `OPTION`/`TRIS f` are removed and STATUS bits 5-7 (RP0/RP1/IRP) are unimplemented on this core, since the backend would otherwise silently emit dead classic-PIC14 bank-select code that assembles but does nothing; this deserves a P1 negative test, not an assumption. |
-| 8-level hardware stack | 16-level. DS41364B adds `STKPTR`/`TOSL`/`TOSH` (readable/writable) and `STVREN` (stack over/underflow reset); still not addressable for compiler purposes in v1, and none of the new stack facilities are used. |
-| Bank via RP1:RP0 bits in STATUS | Dedicated 5-bit `BSR` register, `MOVLB k` (DS41364B §2.2, Table 26-3) |
-| 16 bytes of `BANKSEL`-free common RAM (0x70-0x7F) | Same 16 common bytes, reachable from any bank (DS41364B §2.2). Today's PIC14 backend already spends 14 of those 16 bytes on fixed scratch/retval/ISR-save (`crates/driver/src/report.rs:98-105`); PIC14E's `MIRRORED_SFRS` list also needs to grow from PIC14's `{0x00, 0x02, 0x03, 0x04, 0x0A, 0x0B}` to the full 0x00-0x0B block (INDF0/1, PCL, STATUS, FSR0L/H, FSR1L/H, BSR, WREG, PCLATH, INTCON all mirror on this core), or `Device::bank_of` will emit spurious `BANKSEL`s around FSR/BSR/WREG access. |
-| 2K-word pages via `PCLATH<4:3>` | Same 2K-word pages, but `PCLATH` is 7 bits and `MOVLP k` loads it in one instruction (DS41364B §2.3) |
-| `PCLATH` paging on every call and goto | Same, plus `BRA` and `BRW` for relocatable branches. **`[VERIFY]`, currently stated two ways and not reconciled:** section 1's own table said "±256 words" in revision 1; D-6 says "PC + 1 + signed 9-bit." A signed 9-bit displacement is a range of ±256 *words* around PC+1, so these may actually agree, but neither was checked against DS41364B and the document should not carry an unreconciled figure into P1. |
-| No multiply instruction | Still none: no `MULWF`/`MULLW` in the instruction set (DS41364B Table 26-3) |
+| 14-bit instruction words | Same 14-bit words. **Confirmed**: the byte-oriented, bit-oriented and literal opcode families are bit-identical encodings to the classic set (DS41364E Table 29-3, page 367; e.g. `ADDWF f,d` = `00 0111 dfff ffff`, `BCF f,b` = `01 00bb bfff ffff`, matching classic PIC14 exactly). **Corrected, this revision got it wrong first:** `OPTION` and `TRIS f` are *not* removed. Both are listed as real instructions in DS41364E Table 29-3 under "Inherent Operations" (`OPTION` = `00 0000 0110 0010`, `TRIS f` = `00 0000 0110 0fff`), and function as documented, alternate ways to write `OPTION_REG`/`TRISx` directly. What *is* confirmed gone: STATUS bits 7-5 (classic PIC14's IRP/RP1/RP0) are "Unimplemented: Read as '0'" on this core (DS41364E Register 3-1), so a classic-PIC14 `BCF/BSF STATUS,5/6/7` the backend might inherit assembles cleanly and does nothing; this is still worth a P1 negative test, just not the OPTION/TRIS one revision 2 proposed. |
+| 8-level hardware stack | 16-level (DS41364E page 3, "16-Level Deep Hardware Stack"). Not addressable for compiler purposes in v1. |
+| Bank via RP1:RP0 bits in STATUS | Dedicated `BSR` register, `MOVLB k` (DS41364E Table 29-3: `MOVLB k` = `00 0000 001k kkkk`, a 5-bit literal, addressing all 32 banks) |
+| 16 bytes of `BANKSEL`-free common RAM (0x70-0x7F) | Same 16 common bytes, reachable from any bank (DS41364E section 3.2.4, "16 bytes of common RAM accessible from all banks"). Today's PIC14 backend already spends 14 of those 16 bytes on fixed scratch/retval/ISR-save (`crates/driver/src/report.rs:98-105`); PIC14E's `MIRRORED_SFRS` list also needs to grow from PIC14's `{0x00, 0x02, 0x03, 0x04, 0x0A, 0x0B}` to the full 0x00-0x0B block. **Confirmed** directly against DS41364E's Table 3-3 memory map (page 30): every bank's first 12 bytes are `INDF0, INDF1, PCL, STATUS, FSR0L, FSR0H, FSR1L, FSR1H, BSR, WREG, PCLATH, INTCON`, exactly the reviewer's proposed set, word for word. Get this wrong and `Device::bank_of` emits spurious `BANKSEL`s around FSR/BSR/WREG access. |
+| 2K-word pages via `PCLATH<4:3>` | Same 2K-word pages, `PCLATH` is 7 bits, `MOVLP k` loads it in one instruction (DS41364E Table 29-3: `MOVLP k` = `11 0001 1kkk kkkk`) |
+| `PCLATH` paging on every call and goto | Same, plus `BRA` and `BRW` for relocatable branches. **Confirmed, and the two figures were never actually in conflict:** DS41364E Table 29-3 gives `BRA k` = `11 001k kkkk kkkk`, a 9-bit signed literal (1 bit in the opcode nibble plus 8 more), which is exactly a ±256-word range around PC+1. "±256 words" and "signed 9-bit" describe the same encoding at two levels of precision; there was nothing to reconcile once the table was actually read. `BRW` = `00 0000 0000 1011`, a fixed encoding with no literal field, since the offset comes from `W`. |
+| No multiply instruction | Still none: no `MULWF`/`MULLW` in DS41364E Table 29-3 |
 | `const` in flash via `RETLW` jump tables | Same `RETLW` mechanism in v1 (D-5); the FSR-to-flash mapping is a named follow-up, not v1 |
-| 8-bit FSR + IRP bit, objects must fit one bank window | 16-bit FSR0/FSR1 with `ADDFSR`, `MOVIW`/`MOVWI` pre/post inc/dec and indexed `[k]INDFn`. **Corrected from revision 1:** the linear data region (0x2000-0x29AF) is not extra storage, it is an alternate, bank-spanning *address* for the same physical GPR bytes `ram_banks` already describes (DS41364B §2.5.2). It lets the compiler choose a linear-addressing encoding instead of a banked encoding when convenient; it does not let the allocator place an object anywhere it couldn't already place one physically. See D-2. |
-| One interrupt vector, manual context save | One vector at 0x0004, **hardware context save** of W/STATUS/BSR/FSR0/FSR1/PCLATH to shadow registers, restored by `RETFIE` (DS41364B §4.1) |
-| 4 banks | Up to 32 banks of 128 bytes (DS41364B §2.2) |
+| 8-bit FSR + IRP bit, objects must fit one bank window | 16-bit FSR0/FSR1 with `ADDFSR`, `MOVIW`/`MOVWI` pre/post inc/dec and indexed `[k]INDFn` (DS41364E Table 29-3, "C-Compiler Optimized" group). The linear data region (0x2000-0x29AF, **confirmed** exact, DS41364E section 3.5.2 and Figure 3-11) is not extra storage, it is an alternate, bank-spanning *address* for the same physical GPR bytes `ram_banks` already describes. It lets the compiler choose a linear-addressing encoding instead of a banked encoding when convenient; it does not let the allocator place an object anywhere it couldn't already place one physically. See D-2 for the confirmed formula. |
+| One interrupt vector, manual context save | One vector at 0x0004, **hardware context save** of W, STATUS (except TO/PD), BSR, FSR0, FSR1, PCLATH to shadow registers, restored by `RETFIE` (DS41364E section 7.5, "Automatic Context Saving", **confirmed** word for word against the D-4 claim). The shadow registers themselves live in Bank 31 and are readable/writable, useful if an ISR ever needs to see or override what will be restored. |
+| 4 banks | 32 banks of 128 bytes (DS41364E section 3.2: "The data memory is partitioned in 32 memory banks with 128 bytes in a bank", confirmed, each bank = 12 core registers + up to 20 SFRs + up to 80 bytes GPR + 16 bytes common RAM) |
 
 ### What carries over unchanged
 
@@ -224,12 +232,18 @@ call-graph overlay allocator unchanged. Recursion remains a compile
 error. **The allocator continues to assign every object a physical
 `(bank, offset)` address exactly as it does today; it never places
 anything "in the linear region" as a distinct pool.** What PIC14E's
-linear data region (DS41364B §2.5.2, FSR addresses 0x2000-0x29AF
-aliasing the concatenated 80-byte GPR blocks of every bank) adds is a
-second way to *address* an already-allocated physical byte range: a
-fixed, architecture-level formula (`linear_addr = 0x2000 + bank * 80 +
-offset`, `[VERIFY]` the exact stride and base against DS41364B) that
-`isel-pic14e` may choose when emitting an access to an object whose
+linear data region (DS41364E section 3.5.2, FSR addresses 0x2000-0x29AF
+aliasing the concatenated 80-byte GPR blocks of banks 0-30, confirmed
+against Figure 3-11) adds is a second way to *address* an already-
+allocated physical byte range: a fixed, architecture-level formula,
+`linear_addr = 0x2000 + bank * 80 + (physical_offset - 0x20)` for
+`physical_offset` in a bank's 80-byte GPR window (0x20-0x6F within the
+bank; the 16 bytes of common RAM are explicitly excluded from the
+linear region per DS41364E section 3.5.2, and bank 31 is not included
+either, the region covers exactly 31 banks x 80 bytes = 2480 bytes,
+0x2000 to 0x29AF), confirmed identical in DS40001574D for the 1938/9,
+so this is a per-core constant, not a per-part one. `isel-pic14e` may
+choose this addressing when emitting an access to an object whose
 physical layout would otherwise need a bank switch mid-access (the
 canonical case: a struct or array that straddles a bank boundary).
 `iselcore::Slot::Direct(u16)` keeps storing the physical address
@@ -245,9 +259,9 @@ fixed architectural formula, not per-device data, it does not need a
 `linear_ram` TOML field, an ADR-021-style oracle, or a `gen-device.py`
 extractor (revision 1 proposed a field with none of those, which was
 itself a defect: see D-3). It needs one constant, hard-coded once in
-`isel-pic14e` for the `pic14e` core (the base address and per-bank
-stride are architectural, not per-part), `[VERIFY]`ed against DS41364B
-and cross-checked that it agrees for both the 1937 and 1939.
+`isel-pic14e` for the `pic14e` core; confirmed above that the base
+address, stride and bank count agree exactly between DS41364E (1937)
+and DS40001574D (1939).
 
 **Why the abstraction already exists.** `Slot` landed with the PIC18
 port (P0, `iselcore`), and D-2's resolution above means PIC14E consumes
@@ -262,7 +276,13 @@ claiming `iselcore` was "unchanged."
 rest of the family), generated by `scripts/gen-device.py`, which
 already maps the EDC/ini architecture `16exxx`/`PIC14E` to `core =
 "pic14e"` (checked directly: `scripts/gen-device.py:312-313`). The
-firewall stays until the backend lands.
+firewall stays until the backend lands. **The family spans two
+datasheets, not one**, a distinction revision 1 and 2 both missed by
+citing a single document number for the whole family: PIC16F1934/6/7
+(including the 1937) is DS41364E; PIC16F1938/9 (including the 1939) is
+the separately-numbered DS40001574D. Both are now in `vendor/
+microchip/datasheets/`, along with the family silicon errata,
+DS80000479.
 
 **Rationale.** ADR-019 already settled device-as-data and the
 file-per-device TOML registry; `gen-device.py` already knows the
@@ -274,14 +294,18 @@ called it that.** Two real code changes gate P0, and belong in P0's
 ticket rather than surfacing later as surprises:
 
 1. **The config-word byte address in the sketch was wrong by a factor
-   that matters.** PIC14 config addresses are word addresses that get
-   doubled into a byte address (`crates/device/devices/p16f877a.toml`
-   uses `base_byte_addr = 0x400E` for word `0x2007`, confirmed against
-   `scripts/gen-device.py:609`). Revision 1's sketch wrote `0x8007  #
-   word address, 14-bit words`, which does not double to itself; the
-   corrected value below is `0x1000E`, still `[VERIFY]` against
-   DS41364B for whether `0x8007` is even the right word address for
-   this core.
+   that matters, though the underlying word address itself was right.**
+   PIC14 config addresses are word addresses that get doubled into a
+   byte address (`crates/device/devices/p16f877a.toml` uses
+   `base_byte_addr = 0x400E` for word `0x2007`, confirmed against
+   `scripts/gen-device.py:609`, whose doubling rule is `cwords_are_bytes
+   = core == "pic18"`, so `pic14e` gets the same doubling as `pic14`
+   automatically, no new code needed there). **Confirmed against
+   DS41364E section 4.1:** Configuration Word 1 is genuinely at word
+   address `0x8007`, Configuration Word 2 at `0x8008`, exactly what
+   revision 1 wrote. The bug was purely the units label: revision 1's
+   sketch wrote `base_byte_addr = 0x8007`, which does not double to
+   itself. The corrected value is `0x1000E`.
 2. **Two config words do not fit the existing PIC14 hex-emission
    path.** `crates/driver/src/main.rs:396-405`'s PIC14 arm writes
    exactly one config word through `asm::to_hex`, whose extended-
@@ -291,15 +315,13 @@ ticket rather than surfacing later as surprises:
    uses (`crates/asm/src/lib.rs:806`). This is driver work that belongs
    in P0, not an implicit assumption.
 
-**Explicit preconditions, not yet checked, both named in the approval-
-status note above and repeated here because they gate whether P0 can
-even open:**
+**Both external preconditions from earlier revisions are now resolved,
+repeated here for the record:**
 
-- **DS41364B is not vendored.** `vendor/README.md`'s datasheet table
-  lists DS39582, DS33023, DS52053, DS33014; PIC16F193X's DS41364B is
-  not among them. Every `[VERIFY]` in this document has no checkable
-  target in this repo today. Get it into `vendor/` before P0 starts,
-  not during it.
+- **Datasheets vendored and read.** `DS41364E.pdf` (1934/6/7) and
+  `DS40001574D.pdf` (1938/9) are in `vendor/microchip/datasheets/`,
+  along with the errata `DS80000479.pdf`. Every fact this document
+  states as confirmed was checked against them directly.
 - **Resolved, checked directly in the dev image.** `gpasm -l14e` lists
   `p16f1937` and `p16f1939` (and the rest of the family) by name, and
   `/usr/local/share/gputils/lkr/16f1937_g.lkr` exists, alongside a
@@ -307,18 +329,22 @@ even open:**
   feature HTML reference pages under
   `/usr/local/share/doc/gputils-1.5.2/html/`. ADR-021's "Revisit if"
   failure mode (a supported part with no `.lkr`) does not apply here.
-  P1's `gpasm -p p16f1937` acceptance criterion can run. The gputils-
-  generated HTML pages are also worth reading before DS41364B is
-  vendored: they are gputils' own cross-check data, not a datasheet
-  substitute, but they cover the SFR map, RAM map, config words and
-  feature bits and may resolve some `[VERIFY]` items early.
+  P1's `gpasm -p p16f1937` acceptance criterion can run. gputils' own
+  generated HTML pages are a second, independent cross-check for the
+  device TOMLs once P0 starts writing them, alongside the datasheets.
 
-The 1937/1939 TOMLs otherwise need `[VERIFY]` against DS41364B for:
-flash size (8192/16384 words), SRAM (512/1024 bytes), 16-level stack,
-single vector at 0x0004, the corrected config word address(es), and the
-bank map (32 banks × 128 bytes, 16 common bytes at 0x70-0x7F, and the
-corrected `MIRRORED_SFRS` set from section 1: the full 0x00-0x0B block,
-not classic PIC14's subset).
+The 1937/1939 TOMLs need, per-part: flash size (8192 words for the
+1937 per DS41364E's family table; 16384 for the 1939, `[VERIFY]`
+against DS40001574D's equivalent table, not yet checked in this
+revision), SRAM (512/1024 bytes per the same tables), and the config
+word values proper (the bit-field *meanings*, Register 4-1 onward in
+DS41364E, are extensive and were not transcribed here; whoever writes
+the actual TOML should read that register description directly rather
+than work from this summary). Confirmed and shared across both parts,
+not needing further per-part checking: 16-level stack, single vector at
+0x0004, the corrected config word address(es) (0x8007/0x8008 words,
+0x1000E/0x10010 bytes), and the bank map (32 banks x 128 bytes, 16
+common bytes at 0x70-0x7F, `MIRRORED_SFRS` the full 0x00-0x0B block).
 
 ### D-4: Interrupts: single vector, hardware context save
 
@@ -327,9 +353,12 @@ shadow-register context save. No priority model exists on this core
 (no `IPEN`), so there is no compatibility-mode question like PIC18's
 P5 had.
 
-**Rationale.** DS41364B §4.1: on interrupt entry the hardware saves
-W/STATUS/BSR/FSR0/FSR1/PCLATH to shadow registers and restores them on
-`RETFIE`. The ISR needs no manual save/restore prologue, which is
+**Rationale.** **Confirmed**, DS41364E section 7.5 ("Automatic Context
+Saving"): on interrupt entry the hardware saves W, STATUS (except TO
+and PD), BSR, FSR0, FSR1 and PCLATH to shadow registers and restores
+them on `RETFIE`; the shadow registers themselves live in Bank 31 and
+are readable/writable. The ISR needs no manual save/restore prologue,
+which is
 simpler than both existing backends (PIC14 saves manually, PIC18 has
 the two-vector priority question). The `epic_dispatch_all_irqs`
 fan-out shape carries over from `pic16f193x-hal`'s implementation if
@@ -355,9 +384,12 @@ and confirm before P2.
 ### D-5: `const` in flash via `RETLW` in v1; the FSR-flash mapping is a follow-up
 
 **Decision:** v1 ports the classic PIC14 `RETLW` const-table machinery
-unchanged. The PIC14E-native FSR-to-flash mapping (DS41364B §2.5.3:
-setting bit 7 of FSRnH maps the FSR to program flash, read through
-`MOVIW`) is a documented follow-up, not v1.
+unchanged. The PIC14E-native FSR-to-flash mapping (**confirmed**,
+DS41364E section 3.5.3, "Program Flash Memory": setting the MSb of
+FSRnH maps the FSR to program flash, the lower 15 bits address it,
+only the low 8 bits of each location are readable through `INDF`, one
+extra instruction cycle per access, and it is read-only, writing flash
+this way is not possible) is a documented follow-up, not v1.
 
 **Rationale.** The `RETLW` machinery is proven, carries over with no
 changes, and de-risks the port. The FSR-flash mapping is the PIC14E
@@ -375,16 +407,16 @@ relative form fits, which reduces the number of pages that need
 management.
 
 **Rationale.** The 1937's 8192 words is four 2K-word pages, the same
-page geometry as the 877A; the 1939's 16384 words is eight. The
-`PCLATH<4:3>` -> `PC<12:11>` mapping for `CALL`/`GOTO` is identical to
-classic PIC14 (DS41364B §2.3.2). `MOVLP` loads all 7 PCLATH bits in
-one instruction, which is strictly simpler than the classic
+page geometry as the 877A; the 1939's 16384 words is eight. `MOVLP`
+loads all 7 PCLATH bits in one instruction (**confirmed**, DS41364E
+Table 29-3), which is strictly simpler than the classic
 `MOVLW`+`MOVWF PCLATH` pair. `BRA` and `BRW` are new and give the
 backend relocatable branches, which the peephole pass can use to elide
-page management on intra-page branches. The exact `BRA` range is the
-`[VERIFY]` item flagged in section 1; whatever it turns out to be, both
-figures currently in this document describe the same instruction, not
-two different ones, so this decision does not change shape either way.
+page management on intra-page branches: `BRA`'s 9-bit signed literal
+(section 1, confirmed) covers a ±256-word jump with no page management
+at all. The `PCLATH<4:3>` behavior on `CALL`/`GOTO` itself was not
+re-derived from the datasheet in this revision; DS41364E's "PCL and
+PCLATH" section (3.3) is the place to check it, `[VERIFY]` still open.
 
 ---
 
@@ -422,24 +454,21 @@ correction: the allocator never learns about the linear region at all.
 
 ### The device profile
 
-The 1937 TOML follows the existing schema (ADR-019). Sketch, every
-constant `[VERIFY]` against DS41364B once it is vendored (see D-3):
+The 1937 TOML follows the existing schema (ADR-019). Sketch, values
+confirmed against DS41364E except where noted:
 
 ```toml
 name = "p16f1937"
 core = "pic14e"
-flash_words = 8192          # DS41364B Table 1-1
+flash_words = 8192          # DS41364E family table, page 4
 ram_banks = [ ... ]         # 32 banks x 128 bytes, GPR blocks per bank
 common_ram = [0x0070, 0x007F]
-stack_depth = 16            # DS41364B section 2.4
+stack_depth = 16            # DS41364E page 3, "16-Level Deep Hardware Stack"
 interrupt_vectors = [0x0004]
 
 [config]
-base_byte_addr = 0x1000E    # corrected from revision 1's 0x8007; word
-                             # address doubled, per the p16f877a.toml
-                             # precedent (0x2007 -> 0x400E). [VERIFY]
-                             # 0x8007 is even the right PIC14E word
-                             # address; this only fixes the units bug.
+base_byte_addr = 0x1000E    # word 0x8007, confirmed DS41364E section 4.1,
+                             # doubled per the existing PIC14 convention
 num_bytes = 4                # CONFIG1 + CONFIG2; needs to_hex_regions
                               # in the driver, D-3 item 2
 
@@ -479,15 +508,15 @@ phase list as the effort reference. Each has an acceptance criterion
 that is a test, not a judgement, except where noted below as still
 needing one.
 
-**Before P0 opens:** confirm DS41364B is vendored (D-3). The gputils
-precondition already resolved cleanly during this revision, checked
-directly in the dev image (D-3): not a phase, but the one remaining
-go/no-go gate on the whole plan.
+**Before P0 opens:** both external preconditions from earlier revisions
+are resolved (D-3): the datasheets are vendored and read, and gputils
+support for both target parts is confirmed. Nothing external blocks
+starting P0 once this document itself is approved.
 
 | Phase | Deliverable | Acceptance |
 |---|---|---|
 | **P0** | 193x device TOMLs via `gen-device.py`; the two driver-side hex-path and config-address fixes (D-3); firewall stays. No backend codegen. | `gen-device --check` clean; the TOMLs validate through `build.rs` including `[provenance]`; the driver still refuses `pic14e` with the existing message; the corrected config hex path is exercised by a unit test independent of the firewall. |
-| **P1** | PIC14E `asm` encoder and `sim` core, including `MIRRORED_SFRS` for the 0x00-0x0B block. Hand-written `.asm` inputs only, no codegen. | `gpasm -p p16f1937` byte-for-byte HEX match, plus simulator tests per instruction group (the new ASRF/LSLF/LSRF, MOVLB/MOVLP, BRA/BRW/CALLW, ADDFSR/MOVIW/MOVWI, and a negative test confirming `OPTION`/`TRIS`/RP0-RP1-IRP are inert or rejected, not silently miscompiled). |
+| **P1** | PIC14E `asm` encoder and `sim` core, including `MIRRORED_SFRS` for the 0x00-0x0B block. Hand-written `.asm` inputs only, no codegen. | `gpasm -p p16f1937` byte-for-byte HEX match, plus simulator tests per instruction group (the new ASRF/LSLF/LSRF, MOVLB/MOVLP, BRA/BRW/CALLW, ADDFSR/MOVIW/MOVWI, `OPTION`/`TRIS` writing `OPTION_REG`/`TRISx` correctly since they are real instructions here, and a negative test confirming STATUS bits 5-7 (RP0/RP1/IRP) read as 0 and a `BCF`/`BSF` against them is inert rather than silently miscompiled). |
 | **P2** | Integer spine: `isel-pic14e`, BSR/MOVLB banking via the adapted `crates/banking` pass (D-1), `Slot::Direct` unchanged (D-2). The single-GPR-bank routine-frame constraint (section 1) is designed for here, not deferred. | `add.c`, `scalar.c`, `overlay.c`, `banked.c`; a routine-recipe-shaped skip-idiom test confirming no `MOVLB` lands inside a skip pair |
 | **P3** | Pointers, arrays, structs via FSR0/1; linear addressing (D-2) used for objects that straddle a bank. | `ptr_probe.c`, `array.c`, `structs.c`, `banked_ptr.c` extended with a struct/array that spans two banks; the emitted `.asm` is inspected to confirm linear addressing was chosen for the spanning case and banked addressing otherwise, not just that the simulator produces the right value |
 | **P4** | `const` in flash via `RETLW` (carried over). | `const_table.c`, `ptr_probe.c`; the 511-byte ceiling stays (D-5) |
@@ -587,33 +616,46 @@ relying on it, and reconcile whichever is true with `docs/31`.
 
 ## 7. Risks and open questions
 
-**Every `[VERIFY]` item above**, now unresolvable in this repo until
-DS41364B is vendored (D-3): memory map, bank layout, the linear-region
-formula's exact base/stride, stack depth, vector address, config word
-address(es), flash size, the bit-identical-encoding claim underpinning
-D-1, and the `BRA` range figure.
+**Most `[VERIFY]` items from earlier revisions are now resolved**, per
+the confirmed citations throughout sections 1-3: the bank map, the
+`MIRRORED_SFRS` set, the linear-region formula, the config word
+addresses, the bit-identical-encoding claim underpinning D-1, and the
+`BRA`/`BRW` encodings are all checked directly against DS41364E and,
+where family-shared, cross-checked against DS40001574D. What remains
+genuinely open: the exact `PCLATH<4:3>`-to-`PC` mapping for `CALL`/
+`GOTO` (D-6), whether the 1939's flash/SRAM figures in DS40001574D
+match what is written here for the 1937 (not yet checked directly), and
+the config word *bit-field meanings* (only the addresses were checked;
+the actual TOML needs the register description, DS41364E Register 4-1
+onward, read in full).
 
-**The FSR address space has three regions.** Traditional data memory
-(0x000-0xFFF), the linear alias (0x2000-0x29AF, D-2), and program flash
-(bit 7 of FSRnH set, 0x8000+), with reserved gaps between (DS41364B
-§2.5). The simulator must model all three and the one-extra-cycle cost
-of flash access. Getting this boundary wrong is a whole class of P1
-bugs, which is precisely why P1 is gated on a byte-for-byte `gpasm`
-match.
+**The FSR address space has three regions, confirmed exactly.**
+Traditional data memory, 0x000-0xFFF (DS41364E section 3.5.1, "a
+region from FSR address 0x000 to FSR address 0xFFF"); the linear
+alias, 0x2000-0x29AF (D-2); and program flash, starting at 0x8000 when
+the MSb of FSRnH is set (DS41364E section 3.5.3), with only the low 8
+bits of each flash word readable through `INDF`, one extra instruction
+cycle per access, and no write path. The simulator must model all
+three and that one-extra-cycle cost. Getting this boundary wrong is a
+whole class of P1 bugs, which is precisely why P1 is gated on a
+byte-for-byte `gpasm` match.
 
 **The `MOVIW`/`MOVWI` pre/post inc/dec forms.** `++INDFn`, `--INDFn`,
 `INDFn++`, `INDFn-`, and the indexed `[k]INDFn` form each have a
-distinct encoding and a distinct FSR side effect (DS41364B Table 26-3).
-The assembler's encoding and the simulator's FSR update must agree;
-this is the PIC14E analog of the PIC18 two-word-instruction risk.
+distinct encoding (DS41364E Table 29-3, "C-Compiler Optimized" group:
+`MOVIW n mm` = `00 0000 0001 0nmm`, `MOVIW k[n]` = `11 1111 0nkk kkkk`,
+`MOVWI` mirrors both with the load/store direction bit flipped) and a
+distinct FSR side effect. The assembler's encoding and the simulator's
+FSR update must agree; this is the PIC14E analog of the PIC18
+two-word-instruction risk.
 
-**The shadow-register interrupt model.** The hardware saves
-W/STATUS/BSR/FSR0/FSR1/PCLATH on entry and restores on `RETFIE`
-(DS41364B §4.1). The compiler must not rely on ISR-side register
-values surviving, and the `_isr` frame copies must be disjoint from
-the main frames, same as PIC18's P5. The one thing to verify: re-read
-§4.1 to confirm the shadow save covers every interrupt entry on this
-core, which has no priority levels.
+**The shadow-register interrupt model, confirmed** (D-4, section 1):
+W, STATUS (except TO/PD), BSR, FSR0, FSR1 and PCLATH save on entry and
+restore on `RETFIE` (DS41364E section 7.5). The compiler must not rely
+on ISR-side register values surviving, and the `_isr` frame copies must
+be disjoint from the main frames, same as PIC18's P5. This core has no
+priority levels at all, so there is no PIC18-style "does the shadow
+save happen for every entry" question to ask.
 
 **The clang side is assumed unchanged, including one question revision
 1 didn't ask.** `-target msp430` remains the datalayout proxy, same as
@@ -622,12 +664,13 @@ width (16-bit FSR-based, like PIC18's) does not argue for a different
 proxy, and answer the `-fpack-struct`/ADR-026 question explicitly
 (D-4) rather than let PIC14E inherit PIC14's `false` by omission.
 
-**`MIRRORED_SFRS` needs a PIC14E-specific set.** Section 1 and D-3 name
-this; repeated here because it is a P1/P2 boundary concern: get it
-wrong and the symptom is a spurious `BANKSEL` around FSR/BSR/WREG
-access, which is the kind of bug that only shows up once P2's codegen
+**`MIRRORED_SFRS`'s PIC14E-specific set is confirmed** (section 1), but
+worth repeating here as a P1/P2 boundary concern regardless: get the
+implementation of it wrong and the symptom is a spurious `BANKSEL`
+around FSR/BSR/WREG access, which only shows up once P2's codegen
 starts exercising those registers, not in P1's hand-written `.asm`
-tests.
+tests. Knowing the right answer does not prevent mistyping it into
+`crates/device/src/lib.rs`.
 
 **Resolved from revision 1, kept here for visibility.** The linear
 region's interaction with the allocator was revision 1's open "P3's
