@@ -480,3 +480,30 @@ fn direct_operands_page_by_bsr() {
     );
     assert_eq!(p.ram()[0x20], 0, "bank-0 0x20 untouched");
 }
+
+#[test]
+fn common_ram_mirrors_across_bsr() {
+    // The 16 bytes 0x70-0x7F are common RAM, reachable from any bank at
+    // their physical address regardless of BSR (DS41364E section 3.2.4).
+    // With BSR = 1 the direct 0x72 must still land on physical 0x72, not
+    // page to 0xF2 (surfaced by the cross-bank __mul_u16 recipe in the P2
+    // e2e: its retval region 0x71-0x74 would be corrupted by a nonzero BSR
+    // if common RAM were paged).
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLB 1\n\
+             MOVLW 0x5A\n\
+             MOVWF 0x72\n\
+             SLEEP\n",
+    );
+    assert_eq!(
+        p.ram()[0x72],
+        0x5A,
+        "direct 0x72 with BSR=1 is the common-RAM physical 0x72"
+    );
+    assert_eq!(
+        p.ram()[0xF2],
+        0,
+        "the paged 0xF2 must not receive the write"
+    );
+}
