@@ -19,34 +19,37 @@ Depends on phase 1 (landed). Blocked by: none. Umbrella: `#203`.
 
 ## Scope
 
-- **Full `-g` in the front end, and consume the dbg intrinsics it
+- **Full `-g` in the front end, and consume the debug records it
   brings.** Switching `-gline-tables-only` to full `-g` is *not* a bare
-  flag flip: full `-g` makes clang emit
-  `call void @llvm.dbg.declare(metadata ptr %buf, metadata !7,
-  metadata !10)` and `call void @llvm.dbg.value(metadata i16 %1,
-  metadata !8, metadata !6)` lines, and those currently break the parse.
-  `parse_call_arg` (`crates/irparse/src/lib.rs:1943`) leaves the value
-  token `None` on a `metadata`-typed arg and panics ("call arg must
-  carry a value"); the call dispatcher (`lib.rs:2783+`) arm-selects on
-  `llvm.memcpy/lifetime/va_start/va_end` only and has no `llvm.dbg.*`
-  arm; and `legalize` (`crates/legalize/src/lib.rs:1209`) panics on any
-  intrinsic the parser lets through ("unknown intrinsic"). So phase 2
-  must teach **irparse to parse and drop `llvm.dbg.declare` and
-  `llvm.dbg.value`** (a `metadata` call arg, emitted as no `Inst`) and
-  **legalize to elide any that survive**, alongside the flag flip.
-  `-g` is the only clang-flag depth change the debugger needs; its cost
-  is this intrinsic handling, not a bigger front-end contract.
+  flag flip. With the pinned clang 20.1.8 at `-O1` (the toolchain's
+  fixed `-O1`; AGENTS.md), full `-g` emits LLVM **debug-record lines**
+  like `#dbg_value(i16 %0, !18, !DIExpression(), !23)`, and at `-O0`
+  `#dbg_declare(ptr %1, !19, ...)`, in the function body (observed
+  2026-09-06 via `/opt/clang/bin/clang -g -S -emit-llvm`). The parser
+  has no filter for `#`-prefixed lines: they route through `parse_ll`'s
+  body loop (not empty/`;`/label/`switch`) into `parse_inst`, whose
+  opcode dispatch (`crates/irparse/src/lib.rs:3303`, `other =>
+  panic!("SPIKE LIMIT: unsupported opcode ...")`) panics on
+  `#dbg_value`. So phase 2 must teach **irparse to parse and drop
+  `#dbg_value`/`#dbg_declare`/`#dbg_assign` record lines** (a `#`-line
+  guard in the `parse_ll` body loop, plus a `#dbg_` drop in `parse_inst`
+  for safety), emitting no `Inst`, alongside the flag flip. Full `-g`
+  also adds `!llvm.dbg.cu` metadata (already skipped as a `!` line) and
+  a `, !dbg !N` tail on global/`define` lines (tolerated today; keep as
+  a known-dropped-token case). `-g` is the only clang-flag depth change
+  the debugger needs; its cost is this debug-record handling, not a
+  larger front-end contract.
 - **The C-name to allocation-key bridge.** `DILocalVariable`'s name is
   the C identifier (`buf`); `AllocLayout.local`s (`crates/alloc`) are
   keyed `{func}::{name}` from the liveness frame's **SSA def names**
   (`format!("{}::{name}", f.name)` at `alloc:1265`), which for promoted
   or unnamed temporaries are numbers, not C names (`local main::1`,
-  `local main::2` in the map e2e). The `llvm.dbg.declare`/`dbg.value`
-  value operand is precisely the C-name to SSA-value link: irparse
-  records each `DILocalVariable`'s SSA value/address operand from the
-  dbg intrinsic, and this phase's join is **C-name -> recorded SSA key
-  -> `AllocLayout` address** (`AllocLayout.globals` for globals, keyed
-  by name, are already address-keyed by C name). A variable
+  `local main::2` in the map e2e). The `#dbg_value`/`#dbg_declare`
+  record's value operand is precisely the C-name to SSA-value link:
+  irparse records each `DILocalVariable`'s SSA value/address operand
+  from the debug record, and this phase's join is **C-name -> recorded
+  SSA key -> `AllocLayout` address** (`AllocLayout.globals` for globals,
+  keyed by name, are already address-keyed by C name). A variable
   optimized away or otherwise unmapped to an allocation has no address
   and is omitted from the table (defined fallback, not an error).
 - **The typed table and its artifact.** The deliverable that phase 4
@@ -79,12 +82,12 @@ constant address (impossible on the no-stack PIC14, see `docs/34` §1).
 ## Acceptance
 
 - Full `-g` is passed and existing fixtures with locals compile and
-  produce HEX without an irparse or legalize panic (the dbg-intrinsic
-  handling works). The unit test pinning `BASE_ARGS`
+  produce HEX without an irparse panic (the `#dbg_value`/`#dbg_declare`
+  record drop works). The unit test pinning `BASE_ARGS`
   (`crates/driver/src/clang.rs:192`) is updated with the `-g` flag.
 - irparse tests: a `!DILocalVariable`/`!DIType`-bearing `.ll` parses
-  into the extended table with correct name/scope/type, and
-  `llvm.dbg.*` intrinsics emit no `Inst`.
+  into the extended table with correct name/scope/type, and `#dbg_*`
+  record lines emit no `Inst`.
 - Join tests: a program with global + local vars of all covered types
   resolves each C name to the address `AllocLayout` assigns, through
   the recorded SSA-key bridge; an optimized-away variable is omitted,
@@ -102,9 +105,10 @@ Non-goal: no ELF/DWARF encoding here. The in-process table is phase
 ## Notes for the reader
 
 This is a **compiler front-end/data phase only**; nothing runs a
-program yet. Phase 2's dbg-intrinsic consumption is the load-bearing
-risk: full `-g` is only valuable if irparse absorbs `llvm.dbg.*` as
-metadata, not as instructions, so the compiler output is unchanged.
-The design doc records the flag depth as "the one clang-flag change
-the whole debugger needs"; this phase is where that change's cost is
-paid, in irparse/legalize, not in a larger front-end contract.
+program yet. Phase 2's `#dbg_*` record consumption is the load-bearing
+risk: full `-g` is only valuable if irparse absorbs the debug-record
+lines clang emits as metadata, not as instructions, so the compiler
+output is unchanged. The design doc records the flag depth as "the one
+clang-flag change the whole debugger needs"; this phase is where that
+change's cost is paid, in the irparse record drop, not in a larger
+front-end contract.

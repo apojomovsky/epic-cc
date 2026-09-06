@@ -163,12 +163,13 @@ text as a trailing comment, which would have changed the diffable
 
 **Phase 2: typed variable table.** Extract `DILocalVariable`/`DIType` from
 the same `-g` metadata (switching the front end from `-gline-tables-only`
-to full `-g`, which also requires irparse to parse and drop clang's
-`llvm.dbg.declare`/`llvm.dbg.value` intrinsics, emitted as no `Inst`, and
-legalize to elide any that survive). Join against
+to full `-g`, which also requires irparse to consume and drop clang's
+`#dbg_value`/`#dbg_declare`/`#dbg_assign` debug-record lines, emitted as
+no `Inst`, plus the `, !dbg !N` tails full `-g` adds to global/`define`
+lines). Join against
 `AllocLayout.globals`/`.locals` (`crates/alloc`), which already has the
-address half of this for free, bridged from C names through the dbg
-intrinsic value operand (phase-2 ticket; the alloc local keys are SSA def
+address half of this for free, bridged from C names through the debug
+record value operand (phase-2 ticket; the alloc local keys are SSA def
 names, not C identifiers). **V1 type depth (settled 2026-09-06): scalars +
 aggregates** (`char`/`int`/`long`/`enum`, pointers, `struct`/`union` with
 member offsets, `T[N]`); bit-fields, `_Bool` and flexible array members

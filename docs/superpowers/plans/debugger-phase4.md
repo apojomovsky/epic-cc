@@ -1,9 +1,9 @@
 # Debugger phase 4: gdbstub adapter + ELF/DWARF sidecar
 
 **Ticket body (to become `epic-cc#NNN`)**. Mirror `#246`'s structure.
-See F9 note: how the two halves (sidecar encoder, RSP adapter) are
-branched and PR'd is a filing-time decision; this draft does not
-prescribe it.
+Whether the two halves (sidecar encoder, RSP adapter) are developed on
+one worktree or two is a filing-time decision per the repo workflow
+(one PR per issue, `Closes #N`); this draft does not prescribe it.
 
 ---
 
