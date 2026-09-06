@@ -1,9 +1,9 @@
 # Debugger phase 4: gdbstub adapter + ELF/DWARF sidecar
 
-**Ticket body (to become `epic-cc#NNN`)** — mirror `#246`'s structure.
-Splits into two issues once the open-risk spike (below) resolves: one
-for the target-description spike + RSP adapter, one for the sidecar
-encoder, on the same `feat/<issue>-gdbstub` worktree branch.
+**Ticket body (to become `epic-cc#NNN`)**. Mirror `#246`'s structure.
+See F9 note: how the two halves (sidecar encoder, RSP adapter) are
+branched and PR'd is a filing-time decision; this draft does not
+prescribe it.
 
 ---
 
@@ -13,7 +13,7 @@ Fourth and final phase of the source-level debugger
 (`docs/34-debugger-design.md` §4; umbrella `#203`). The gdbstub/RSP
 adapter (front-end decided in the 2026-09-05 brainstorm) over phase
 3's sim control surface, emitting the ELF+DWARF sidecar from phases
-1-2's tables, shipped as a **separate `epic-cc-gdbserver` binary**.
+1-2's data, shipped as a **separate `epic-cc-gdbserver` binary**.
 Scope for v1 (settled 2026-09-06): **PIC14 core only**, proving the
 pattern before the PIC18 path (`docs/34` §5 non-goal).
 
@@ -25,31 +25,48 @@ Depends on phase 1 (line table, landed), phase 2 (type table), phase 3
 - **Open-risk spike first.** `docs/34` §3 records as not-yet-spiked:
   "PIC14 is not a gdb-known architecture." The design must confirm a
   custom-architecture target works: gdb's `qXfer:features:read`
-  target-description XML (the established pattern for architectures
-  that predate built-in gdb support) combined with a synthetic
-  `e_machine` in the sidecar ELF. This spike is a precondition for
-  finalizing this phase's design; phase 4 is not implemented until it
-  lands. Follow the §3 spike methodology (a throwaway stub answering
-  raw RSP with fabricated values, on a known gdb arch first, then the
-  custom-arch interaction).
+  target-description XML (the established pattern) combined with a
+  synthetic `e_machine` in the sidecar ELF. Follow the §3 spike
+  methodology (a throwaway stub answering raw RSP with fabricated
+  values, on a known gdb arch first, then the custom-arch
+  interaction). The phase is not implemented until this lands.
 - **`epic-cc-gdbserver` binary.** A new crate/bin, decoupled from the
   one-shot compiler lifecycle (the compiler emits HEX once and exits;
   a debugger is a long-lived network service). Entry:
   `epic-cc-gdbserver <hex> <sidecar.elf> --port <port>`, then
-  `gdb <sidecar.elf> -ex "target remote :<port>"`. Ships alongside
-  `epic-cc` in the release bundles.
+  `gdb <sidecar.elf> -ex "target remote :<port>"`.
 - **gdbstub::Target** over phase 3's control surface. Implement the
   registers (PIC14 `W`/`PC`/`STATUS`/`FSR`/active bank / the six
   bank-independent core registers), memory read/write, and run/step
-  (with the phase-3 `run_until` as breakpoint execution).
-- **Target description + sidecar encoder.** The DWARF/ELF encoder
-  (proposed `gimli::write` for DWARF, `object` crate for the ELF
-  container) consumes the phase-1 line table and the phase-2 typed
-  variable table. Given every location is `DW_OP_addr(constant)`
-  (`docs/34` §1), the emitted DWARF is near-minimal: one compile unit,
-  flat `DW_TAG_subprogram`/`DW_TAG_variable`/`DW_TAG_base_type`,
-  a `.debug_line` program from the line table. The sidecar is never
-  flashed and does not touch the HEX output path.
+  (with the phase-3 `run_until` as breakpoint execution). This phase
+  also implements **line-granular stepping**: the adapter rounds up
+  from the phase-3 surface against the phase-1 `--line-table` artifact,
+  i.e. stop on the first instruction whose address is on a different
+  line, respecting the phase-1 `BANKSEL` inherits-a-line case.
+- **Sidecar encoder with aggregate DWARF.** The encoder (proposed
+  `gimli::write` for DWARF, `object` crate for the ELF container)
+  consumes the phase-2 **in-process type table** (the single source of
+  truth; the phase-2 text artifact is not the input) plus the phase-1
+  line table. Every location is `DW_OP_addr(constant)` (`docs/34` §1),
+  so there is no CFI, frame-base, or register-relative DWARF. The v1
+  types are scalars **plus aggregates**, so the emitted DIE set is not
+  flat base types only: it must include `DW_TAG_structure_type` /
+  `DW_TAG_union_type` with `DW_TAG_member` +
+  `DW_AT_data_member_location`, `DW_TAG_array_type` +
+  `DW_TAG_subrange_type`, and `DW_TAG_enumeration_type`, for
+  `print s.member` / `print arr[i]` to resolve. Minimal in the
+  dimension that matters (one compile unit, constant-address
+  locations), not minimal in DIE-kind coverage.
+- **Add gdb to the dev/ci image.** Phase 4's acceptance runs real gdb
+  sessions, and the dev image (`Dockerfile` `dev` stage) does not
+  install gdb; it is absent from the toolchain contract everywhere in
+  the repo. This phase adds a digest-pinned apt gdb to the image so
+  the acceptance is runnable in CI. gdb is a test/acceptance-time
+  dependency for the build and a user-side dependency for whoever runs
+  the debugger; it is **decided at filing/implementation time** whether
+  gdb ships in the release bundle or stays a build/CI-time host dep
+  (a host that runs `epic-cc-gdbserver` needs a gdb either way to make
+  it useful, but the bundle itself does not have to carry one).
 
 Non-goals (v1): real-hardware debugging (ICSP / Microchip debug
 executive, `docs/34` §5), any architecture beyond PIC14, and any
@@ -60,18 +77,23 @@ location form beyond constant addresses.
 - The spike confirms a custom-arch gdb session against the sim: at
   minimum `gdb <sidecar.elf> -ex "target remote :<port>" -ex "info
   registers"` lists PIC14 registers, and `x/4xb 0x70` reads ram. The
-  spike's findings are recorded before the adapter is built, and the
-  design doc is updated with the result.
+  spike's findings are recorded and the design doc is updated before
+  the adapter is built.
+- gdb is present in the dev/ci image (CI runs the acceptance).
 - `epic-cc-gdbserver <hex> <sidecar.elf> --port <p>` accepts a
   connection and an end-to-end gdb session: set a `break t.c:N`
   (resolved from the sidecar `.debug_line`), `run`, stop at the line,
-  `print <var>` (typed, from the sidecar DWARF), `continue`/`step` to
-  the next line, `quit`. The sidecar's `.debug_line` matches phase 1's
+  `print <var>` (typed, from the sidecar DWARF), `print s.member` /
+  `print arr[i]` for an aggregate fixture, `continue`/`step` to the
+  next line, `quit`. The sidecar's `.debug_line` matches phase 1's
   `--line-table` artifact for the same fixture.
-- The sidecar for a fixture that exercises a global, a local, and a
-  `print`ed array element reads the right memory address over RSP
-  (the phase-1/§3 pattern: a fabricated address + DWARF type must
-  resolve to correct values).
+- Step crosses a source line correctly for the phase-1 `BANKSEL`
+  inherits-a-line case (line-stepping respects the preservation
+  contract).
+- The sidecar for a fixture that exercises a global, a local, and an
+  array/struct element reads the right memory address over RSP (the
+  phase-1/§3 pattern: a fabricated address + DWARF type resolves to
+  correct values).
 - Regression: sim tests and driver tests stay green; `--line-table`
   output unchanged for existing fixtures.
 - Release bundles include the `epic-cc-gdbserver` binary.
@@ -83,6 +105,7 @@ so its ticket deliberately front-loads the spike: the whole point of
 `docs/34` §3's spike methodology is to retire that risk *before* the
 adapter is built, not to discover a custom-arch dead end after phases
 2-3 are invested. If the spike shows the custom-arch path is a dead
-end, the fallback is a PIC-known-arch `e_machine` hack or a gdb
+end, the fallback is a PIC-known-arch `e_machine` hack or a
 target-description-only session with raw address debugging; the spike
-decides which is real.
+decides which is real. The gdb-in-image change and the aggregate-DIE
+encoder are the two under-scoped pieces this ticket now makes explicit.

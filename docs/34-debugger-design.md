@@ -120,10 +120,16 @@ dependency; the tool Cranelift/wasmtime use for exactly this "non-LLVM
 backend, still needs DWARF" situation) encodes the DWARF; the `object`
 crate writes the ELF container generically. Given every location is
 `DW_OP_addr(constant)` (section 1), the DWARF this project emits is close
-to the simplest valid form the format supports: one compile unit, flat
-`DW_TAG_subprogram`/`DW_TAG_variable` entries, `DW_TAG_base_type` for the
-handful of C primitive types epic-cc supports, and a `.debug_line` program
-built directly from the line table Phase 1 (below) produces.
+to the simplest valid form the format supports: one compile unit, constant
+address locations, no CFI or register-relative expressions. The DIE set is
+not flat base types alone, because v1 types (phase 2) are scalars plus
+aggregates: it must cover `DW_TAG_base_type` and `DW_TAG_enumeration_type`
+for scalars, and `DW_TAG_structure_type`/`DW_TAG_union_type` with
+`DW_TAG_member` + `DW_AT_data_member_location` and
+`DW_TAG_array_type` + `DW_TAG_subrange_type` for aggregates, so gdb
+resolves `print s.member` and `print arr[i]`. The `.debug_line` program
+is built directly from the line table Phase 1 (below) produces. What stays
+minimal is the location dimension, not the DIE-kind coverage.
 
 **Open risk, not yet spiked.** PIC14 is not a gdb-known architecture. The
 spike above used x86-64 specifically to control for that variable. gdb does
@@ -157,14 +163,18 @@ text as a trailing comment, which would have changed the diffable
 
 **Phase 2: typed variable table.** Extract `DILocalVariable`/`DIType` from
 the same `-g` metadata (switching the front end from `-gline-tables-only`
-to full `-g`; the one clang-flag change the whole debugger needs). Join
-against `AllocLayout.globals`/`.locals` (`crates/alloc`), which already has
-the address half of this for free. **V1 type depth (settled 2026-09-06):
-scalars + aggregates** (`char`/`int`/`long`/`enum`, pointers, `struct`/
-`union` with member offsets, `T[N]`); bit-fields, `_Bool` and flexible
-array members are deferred. Emit a `--var-table <file>` text artifact
-(`global <name> 0xNN TYPE` / `local {func}::{name} 0xNN TYPE`) mirroring
-`--line-table`, as phase 4's type input and for inspection.
+to full `-g`, which also requires irparse to parse and drop clang's
+`llvm.dbg.declare`/`llvm.dbg.value` intrinsics, emitted as no `Inst`, and
+legalize to elide any that survive). Join against
+`AllocLayout.globals`/`.locals` (`crates/alloc`), which already has the
+address half of this for free, bridged from C names through the dbg
+intrinsic value operand (phase-2 ticket; the alloc local keys are SSA def
+names, not C identifiers). **V1 type depth (settled 2026-09-06): scalars +
+aggregates** (`char`/`int`/`long`/`enum`, pointers, `struct`/`union` with
+member offsets, `T[N]`); bit-fields, `_Bool` and flexible array members
+are deferred. The in-process type table is phase 4's encoder input; a
+`--var-table <file>` text artifact (mirroring `--line-table`, TYPE is a
+flat debug print) is emitted for human inspection only.
 
 **Phase 3: sim control surface.** `crates/sim` runs to completion or a
 cycle count today; it has no halt/resume/breakpoint state machine. Add:
@@ -173,7 +183,8 @@ memory read/write, and a step primitive at instruction granularity (line
 stepping rounds up from this in the adapter, not in `sim` itself). No
 in-sim breakpoint table (the adapter owns it), and **PIC14 core only for
 v1 (settled 2026-09-06)**, PIC18/PIC14E untouched, per the PIC14-first
-non-goal below.
+non-goal below. Note: this phase edits `crates/sim`, the same crate pic14e
+P1 (#246) edits, so the two must not be worked simultaneously.
 
 **Phase 4: gdbstub adapter.** New crate implementing `gdbstub::Target` over
 Phase 3's control surface. Consumes Phases 1/2's data to emit the ELF+DWARF
@@ -184,7 +195,10 @@ service, decoupled from the one-shot compile lifecycle):
 `gdb <sidecar.elf> -ex "target remote :<port>"`. **PIC14 core only for v1.**
 The open risk in section 3 (custom architecture target description) needs
 a dedicated spike before this phase's design is finalized; the phase is
-not implemented until that spike lands.
+not implemented until that spike lands. gdb is absent from the dev/ci
+image today, so this phase adds a digest-pinned apt gdb for its acceptance
+sessions (test/CI-time and user-side host dependency; the bundle need not
+carry one).
 
 ## 5. Non-goals for this document
 
