@@ -64,12 +64,6 @@ fn eighty_byte_global_lands_in_ram_banks() {
 #[test]
 fn asm_flash_bound_accepts_tiny_program() {
     for dev in devices_under_test() {
-        // The pic14e asm encoder does not exist yet (P1); the firewall
-        // panic is the deliberate refusal, so the flash-bound check cannot
-        // run for those devices until the encoder lands.
-        if dev.core == device::Core::Pic14e {
-            continue;
-        }
         // Minimal program: one NOP at org 0. NOP (0x0000) is valid on both
         // PIC14 and PIC18 and avoids label resolution (GOTO with a literal
         // trips the PIC18 label table).
