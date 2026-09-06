@@ -26,8 +26,8 @@ the closest existing sibling:
   Mid-range has its own extra instructions (the shifts, the FSR moves,
   `BRA`/`BRW`/`CALLW`, ...) and its own BSR-based addressing, exactly
   why `Core::Pic14e` exists. Its asm encoder and simulator landed in
-  P1; the codegen (`isel-pic14e`) is what P2 adds, and the driver keeps
-  refusing `pic14e` until then).
+  P1; the integer-spine backend (`isel-pic14e`) landed in P2 and the
+  driver now compiles it; the FSR/pointer divergence is P3 onward).
 
 If any of those don't hold, this is **Path B: a new core**, a design
 effort the size of `docs/29-pic18-port-design.md`, not a device addition.
@@ -36,7 +36,8 @@ verification gate per peripheral-equivalent, ending at a device TOML and
 firewall removal). PIC14E (Enhanced Mid-range) is exactly such a Path B
 port: its design of record is `docs/33-pic14e-port-design.md`, and its
 P0 phase landed the 193x device TOMLs; P1 added the asm encoder and sim
-core; the driver firewall stays until the backend lands (P2 onward).
+core; P2 added the integer-spine backend and BSR banking, ending the
+driver firewall.
 
 Everything below assumes Path A.
 
