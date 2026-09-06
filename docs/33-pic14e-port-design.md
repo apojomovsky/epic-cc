@@ -28,16 +28,19 @@
 **Target:** the PIC16F1937 / PIC16F1939 family (the 1933/1934/1936/1938
 share the core with less flash and RAM; the PIC12F1xxx parts share the
 core once it exists, noted but not scoped here). The 1937/1939 are
-popular hobbyist Enhanced Mid-range parts, and `pic16f193x-hal` is named
-in epic-hal's own ecosystem-integration decisions
-(`epic-cc/docs/31-ecosystem-integration-design.md` D-1) as an enhanced
-mid-range HAL, currently **deferred** there specifically because
-"epic-cc has no backend for that core." **This needs reconciling before
-approval, not after:** confirm in epic-hal what state `pic16f193x-hal`
-is actually in (a real, XC8-verified HAL that would serve as a register
-reference and cross-check per section 6, or a placeholder deferred
-pending exactly this port) before relying on it as this document's
-stated reason for picking this family.
+popular hobbyist Enhanced Mid-range parts, and `pic16f193x-hal` is a
+real, substantial reason to pick this family, confirmed by reading
+epic-hal directly rather than assuming: `pic16f193x-hal/docs/
+ARCHITECTURE.md` records real-target builds passing for all six family
+parts under XC8, disassembly-level codegen probing of the actual
+compiled firmware (the FSR1:INDF1 indirect-addressing pattern this core
+uses for runtime SFR access, and a real RMW trap it found and fixed),
+and `mdb`-confirmed register readback for at least one peripheral.
+epic-cc's own `docs/31-ecosystem-integration-design.md` D-1 calling
+`pic16f193x-hal` "deferred" is not in tension with this: that decision
+is about epic-cc's own *compiler backend* not existing yet for this
+core, not about the HAL itself being unfinished or a placeholder. This
+port is exactly what closes that gap.
 
 **Definition of done, rescoped from revision 1.** Revision 1 defined
 parity against "what the PIC14 backend supports today," written when
@@ -600,17 +603,20 @@ Two additions specific to a port, both inherited from the PIC18 port:
 - **Cross-target differential.** The same C source compiled for both
   targets must produce the same observable results in the simulator.
 
-**`pic16f193x-hal` as a cross-check pillar needs confirming to exist
-before it is counted on.** Revision 1 cited its `docs/ARCHITECTURE.md`
-(BSR auto-banking of literal SFR tokens, the FSR1:INDF1 RMW trap, the
-`movlb 1` + `iorwf PIE1,f` fix shape) as "the reference for the device
-TOML's SFR table." That may be entirely accurate, but this document
-cannot see epic-hal's repository, and epic-cc's own
-`docs/31-ecosystem-integration-design.md` D-1 currently defers
-`pic16f193x-hal` for the stated reason that no backend exists yet.
-Confirm which is true (a real, XC8-verified HAL already exists to
-reference, or it does not and this pillar is aspirational) before
-relying on it, and reconcile whichever is true with `docs/31`.
+**`pic16f193x-hal` as a cross-check pillar, confirmed by reading
+epic-hal directly.** Its `docs/ARCHITECTURE.md` is real, XC8-verified
+material, not aspirational: real-target builds pass for all six family
+parts, and Finding 1 documents (from disassembling the actual linked
+firmware, not from assumption) that runtime SFR access on this core
+compiles to indirect addressing through FSR1/INDF1, with an RMW trap in
+that pattern that a later finding in the same document fixes. This is
+exactly the kind of fact this port's device TOML and `isel-pic14e`'s
+FSR emitters need to get right, and it comes from someone who already
+hit the failure mode on real hardware. The revision-2 concern that this
+might be aspirational, because `docs/31-ecosystem-integration-design.md`
+D-1 "defers" `pic16f193x-hal`, was based on reading only epic-cc's side
+of that decision: D-1 defers epic-cc's own PIC14E *compiler backend*,
+not the HAL, which is exactly the gap this port closes.
 
 ---
 
