@@ -77,7 +77,10 @@ For every ticket:
 2. Create a worktree under `.worktrees/` and branch as
    `<type>/<issue>-<slug>`, for example `fix/71-switch-default-branch`
    (see Worktrees below, never work on `master`).
-3. Work, then run the takeoff ritual (`make pre-pr-check` → `epic-tasks takeoff`).
+3. Develop the fix or feature, then dispatch a separate reviewer for the code
+   and address its findings (the Review gate, canonical in epic-tasks'
+   `AGENTS.md`). Only then run the takeoff ritual
+   (`make pre-pr-check` → `epic-tasks takeoff`).
 4. Open the pull request with `Closes #N`, then
    `epic-tasks review <repo>#<n> --pr <url>`. The body must use real newlines:
    copy-paste-safe ``gh pr create --body-file - <<'EOF'`` (or
