@@ -502,6 +502,608 @@ impl Pic14 {
     }
 }
 
+/// The three FSR address regions of the Enhanced Mid-range core
+/// (DS41364E section 3.5): traditional data memory 0x000-0xFFF, the
+/// linear alias 0x2000-0x29AF (banks 0-30, 80 GPR bytes per bank, the 16
+/// common bytes excluded), and program flash from 0x8000 when FSRnH's MSb
+/// is set (low 8 bits of each word readable through INDF, read-only, one
+/// extra cycle per access).
+pub struct Pic14e {
+    prog: Vec<u16>,
+    /// 4096 bytes of data memory (32 banks x 128 bytes, DS41364E
+    /// section 3.2).
+    ram: [u8; 4096],
+    w: u8,
+    /// Word address; the PC is 15 bits, PCLATH supplies PC<14:8>.
+    pc: u16,
+    stack: Vec<u16>,
+    halted: bool,
+    /// A latched interrupt request awaiting GIE + INTE, mirroring `Pic14`.
+    pending: bool,
+    /// Extra cycle owed by an INDF access to the program-flash region
+    /// (DS41364E section 3.5.3 note 2): the step budget consumes it before
+    /// the next instruction executes.
+    cycle_debt: u8,
+}
+
+impl Pic14e {
+    /// A simulator on `device`'s memory map. The bank map, the linear
+    /// region and the flash window are per-core constants on this core
+    /// (docs/33 D-2), so only the `Core::Pic14e` contract is checked, not
+    /// per-device fields.
+    pub fn with_device(device: &'static Device, prog: Vec<u16>) -> Self {
+        assert_eq!(
+            device.core,
+            device::Core::Pic14e,
+            "sim(pic14e): {} is not a pic14e device",
+            device.name
+        );
+        Pic14e {
+            prog,
+            ram: [0; 4096],
+            w: 0,
+            pc: 0,
+            stack: Vec::new(),
+            halted: false,
+            pending: false,
+            cycle_debt: 0,
+        }
+    }
+    pub fn ram(&self) -> &[u8; 4096] {
+        &self.ram
+    }
+    pub fn ram_mut(&mut self) -> &mut [u8; 4096] {
+        &mut self.ram
+    }
+    pub fn w(&self) -> u8 {
+        self.w
+    }
+    pub fn pc(&self) -> u16 {
+        self.pc
+    }
+    pub fn halted(&self) -> bool {
+        self.halted
+    }
+    pub fn fire_interrupt(&mut self) {
+        self.enter_isr();
+    }
+    pub fn request_interrupt(&mut self) {
+        self.ram[INTCON] |= INTF;
+        self.pending = true;
+    }
+    pub fn interrupt_pending(&self) -> bool {
+        self.pending
+    }
+    fn enter_isr(&mut self) {
+        self.stack.push(self.pc);
+        self.ram[INTCON] &= !GIE;
+        self.pc = VECTOR;
+    }
+    fn interrupt_ready(&self) -> bool {
+        self.pending && self.ram[INTCON] & GIE != 0 && self.ram[INTCON] & INTE != 0
+    }
+    pub fn run(&mut self, max_steps: usize) -> usize {
+        let mut steps = 0;
+        while !self.halted && steps < max_steps {
+            self.step();
+            steps += 1;
+        }
+        steps
+    }
+    pub fn step(&mut self) {
+        // A flash INDF access costs an extra cycle: consume it before the
+        // next instruction (DS41364E section 3.5.3).
+        if self.cycle_debt > 0 {
+            self.cycle_debt -= 1;
+            return;
+        }
+        if self.interrupt_ready() {
+            self.pending = false;
+            self.enter_isr();
+            return;
+        }
+        let word = self.prog[self.pc as usize];
+        let pc = self.pc;
+        let next = match (word >> 12) & 0x3 {
+            0 => self.exec_byte(pc, word),
+            1 => self.exec_bit(pc, word),
+            2 => self.exec_call_goto(pc, word),
+            3 => self.exec_literal(pc, word),
+            _ => unreachable!(),
+        };
+        self.pc = next;
+        if self.pc as usize >= self.prog.len() {
+            self.halted = true;
+        }
+    }
+
+    fn set_z(&mut self, v: u8) {
+        if v == 0 {
+            self.ram[3] |= 0b100;
+        } else {
+            self.ram[3] &= !0b100;
+        }
+    }
+    fn set_c(&mut self, c: bool) {
+        if c {
+            self.ram[3] |= 0b001;
+        } else {
+            self.ram[3] &= !0b001;
+        }
+    }
+
+    /// The physical data-memory address an FSR selects. Program flash is
+    /// read-only, so a write path never resolves here: `write_ram` panics
+    /// on an FSR address in the flash region.
+    fn indirect_addr(&self, fsr: u16) -> usize {
+        if fsr & 0x8000 != 0 {
+            // Program flash: the lower 15 bits are the word address, only
+            // the low 8 bits are readable (DS41364E section 3.5.3).
+            usize::from(fsr & 0x7FFF)
+        } else if (0x2000..=0x29AF).contains(&fsr) {
+            // Linear alias: bank * 80 + (GPR offset - 0x20), banks 0-30
+            // (DS41364E section 3.5.2).
+            let off = usize::from(fsr - 0x2000);
+            let bank = off / 80;
+            (bank * 0x80) + 0x20 + (off % 80)
+        } else {
+            // Traditional data memory, 0x000-0xFFF.
+            usize::from(fsr)
+        }
+    }
+
+    fn read_ram(&mut self, fsr: u16) -> u8 {
+        let a = self.indirect_addr(fsr);
+        if fsr & 0x8000 != 0 {
+            // One extra cycle per flash access; the low 8 bits of the word.
+            self.cycle_debt = 1;
+            return (self.prog[a] & 0xFF) as u8;
+        }
+        self.ram[a]
+    }
+
+    /// The physical address of a direct operand: the mirrored core
+    /// registers (0x00-0x0B, DS41364E Table 3-3) are addressable from any
+    /// bank at their bank-0 offset; everything else is paged by BSR.
+    fn direct_addr(&self, f: usize) -> usize {
+        if f <= 0x0B {
+            f
+        } else {
+            ((self.ram[0x08] as usize & 0x1F) << 7) | f
+        }
+    }
+    fn read_f(&mut self, f: usize) -> u8 {
+        match f {
+            0x00 => self.read_ram(self.fsr(0)), // INDF0
+            0x01 => self.read_ram(self.fsr(1)), // INDF1
+            0x02 => (self.pc & 0xFF) as u8,     // PCL
+            0x09 => self.w,                     // WREG
+            _ => self.ram[self.direct_addr(f)],
+        }
+    }
+    fn write_ram(&mut self, fsr: u16, v: u8) {
+        assert!(
+            fsr & 0x8000 == 0,
+            "sim(pic14e): program flash is read-only (FSR 0x{fsr:04X})"
+        );
+        let a = self.indirect_addr(fsr);
+        self.ram[a] = v;
+    }
+    fn write_f(&mut self, f: usize, v: u8) {
+        match f {
+            0x00 => self.write_ram(self.fsr(0), v), // INDF0
+            0x01 => self.write_ram(self.fsr(1), v), // INDF1
+            0x02 => {
+                // PCL write: the whole PC changes to PCLATH<6:0>:v.
+                self.pc = ((self.ram[0x0A] as u16 & 0x7F) << 8) | v as u16;
+            }
+            0x03 => {
+                // STATUS bits 7-5 are unimplemented (read as 0) and TO/PD
+                // are not writable (DS41364E Register 3-1): a write can
+                // only reach Z/DC/C.
+                self.ram[3] = (self.ram[3] & 0x18) | (v & 0x07);
+            }
+            0x09 => self.w = v, // WREG
+            _ => {
+                let a = self.direct_addr(f);
+                self.ram[a] = v;
+            }
+        }
+    }
+    /// The current FSR0/FSR1 value as a 16-bit address.
+    fn fsr(&self, n: usize) -> u16 {
+        u16::from(self.ram[4 + 2 * n]) | (u16::from(self.ram[5 + 2 * n]) << 8)
+    }
+    fn set_fsr(&mut self, n: usize, v: u16) {
+        self.ram[4 + 2 * n] = (v & 0xFF) as u8;
+        self.ram[5 + 2 * n] = (v >> 8) as u8;
+    }
+    fn write_d(&mut self, d: u16, f: usize, r: u8) {
+        if d == 1 {
+            self.write_f(f, r);
+        } else {
+            self.w = r;
+        }
+    }
+    fn pop_return(&mut self) -> u16 {
+        self.stack.pop().unwrap_or(0)
+    }
+    fn add_flags(&mut self, a: u8, b: u8, r: u8) {
+        self.set_z(r);
+        self.set_c((a as u16 + b as u16) > 0xFF);
+    }
+
+    fn exec_byte(&mut self, pc: u16, word: u16) -> u16 {
+        match word {
+            0x0000 => return pc + 1, // NOP
+            0x0001 => {
+                // RESET: reinitialize the core (PC 0, W 0, stack emptied),
+                // matching `Pic18`'s RESET model.
+                self.w = 0;
+                self.stack.clear();
+                return 0;
+            }
+            0x0008 => return self.pop_return(), // RETURN
+            0x0009 => {
+                self.ram[INTCON] |= GIE; // RETFIE re-enables interrupts
+                return self.pop_return();
+            }
+            0x000A => {
+                // CALLW: PCL = W, PCH = PCLATH (DS41364E section 3.3.3).
+                let target = ((self.ram[0x0A] as u16 & 0x7F) << 8) | self.w as u16;
+                self.stack.push(pc + 1);
+                return target;
+            }
+            0x000B => {
+                // BRW: PC = PC + 1 + W (DS41364E section 3.3.4).
+                return pc + 1 + self.w as u16;
+            }
+            0x0062 => {
+                // OPTION: W -> OPTION_REG (0x095), written by its absolute
+                // address regardless of BSR.
+                self.ram[0x95] = self.w;
+                return pc + 1;
+            }
+            0x0063 => {
+                self.halted = true; // SLEEP
+                return pc;
+            }
+            0x0064 => return pc + 1, // CLRWDT
+            _ if (0x0010..=0x001F).contains(&word) => {
+                // MOVIW/MOVWI with pre/post inc/dec: 00 0000 0001 dnmm.
+                let n = ((word >> 2) & 1) as usize;
+                let mm = (word & 0x3) as u8;
+                let to_w = word & 0x08 == 0;
+                let fsr = self.fsr(n);
+                // ++FSRn = 00, --FSRn = 01, FSRn++ = 10, FSRn-- = 11.
+                let (eff, after) = match mm {
+                    0 => (fsr.wrapping_add(1), fsr.wrapping_add(1)),
+                    1 => (fsr.wrapping_sub(1), fsr.wrapping_sub(1)),
+                    2 => (fsr, fsr.wrapping_add(1)),
+                    _ => (fsr, fsr.wrapping_sub(1)),
+                };
+                let v = self.read_ram(eff);
+                self.set_fsr(n, after);
+                if to_w {
+                    self.set_z(v);
+                    self.w = v;
+                } else {
+                    self.write_ram(eff, self.w);
+                }
+                return pc + 1;
+            }
+            _ if (0x0020..=0x003F).contains(&word) => {
+                self.ram[0x08] = (word & 0x1F) as u8; // MOVLB k
+                return pc + 1;
+            }
+            _ if (0x0060..=0x0067).contains(&word) => {
+                // TRIS f: W -> TRISx (f = 5, 6, 7 at 0x08C-0x08E, DS41364E
+                // Register 12-3); other f values are not a documented TRIS
+                // register, and 0x0062/0x0063/0x0064 (OPTION/SLEEP/CLRWDT)
+                // are pre-empted above.
+                let f = word & 0x7;
+                assert!(
+                    (5..=7).contains(&f),
+                    "sim(pic14e): TRIS {f} has no TRIS register (only TRISA/B/C exist)"
+                );
+                self.ram[0x8C + (f - 5) as usize] = self.w;
+                return pc + 1;
+            }
+            _ => {}
+        }
+        let d = (word >> 7) & 1;
+        let f = (word & 0x7F) as usize;
+        let op6 = (word >> 8) & 0x3F;
+        match op6 {
+            0x07 => {
+                let v = self.read_f(f);
+                let r = self.w.wrapping_add(v);
+                self.add_flags(self.w, v, r);
+                self.write_d(d, f, r);
+            }
+            0x05 => {
+                let r = self.w & self.read_f(f);
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x01 => {
+                if d == 1 {
+                    self.write_f(f, 0);
+                } else {
+                    self.w = 0;
+                }
+                self.set_z(0);
+            }
+            0x08 => {
+                let r = self.read_f(f);
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x00 => {
+                if d == 1 {
+                    if f == 0x02 {
+                        // MOVWF PCL changes the whole PC, handled by the
+                        // PCL write path.
+                        let pclath = (self.ram[0x0A] as u16) & 0x7F;
+                        return (pclath << 8) | (self.w as u16);
+                    }
+                    self.write_f(f, self.w);
+                }
+            }
+            0x02 => {
+                let v = self.read_f(f);
+                let r = v.wrapping_sub(self.w);
+                self.set_z(r);
+                self.set_c(v >= self.w);
+                self.write_d(d, f, r);
+            }
+            0x09 => {
+                let r = !self.read_f(f); // COMF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x03 => {
+                let r = self.read_f(f).wrapping_sub(1); // DECF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0B => {
+                let r = self.read_f(f).wrapping_sub(1); // DECFSZ
+                self.set_z(r);
+                self.write_d(d, f, r);
+                if r == 0 {
+                    return pc + 2;
+                }
+            }
+            0x0A => {
+                let r = self.read_f(f).wrapping_add(1); // INCF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0F => {
+                let r = self.read_f(f).wrapping_add(1); // INCFSZ
+                self.set_z(r);
+                self.write_d(d, f, r);
+                if r == 0 {
+                    return pc + 2;
+                }
+            }
+            0x04 => {
+                let r = self.w | self.read_f(f); // IORWF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0D => {
+                // RLF through carry; the carry bit is bit 0 of the shifted
+                // value and the shifted-out bit becomes C.
+                let cin = if self.ram[3] & 0b001 != 0 { 1 } else { 0 };
+                let v = self.read_f(f);
+                let r = (v << 1) | cin;
+                self.set_c(v & 0x80 != 0);
+                self.write_d(d, f, r);
+            }
+            0x0C => {
+                let cin = if self.ram[3] & 0b001 != 0 { 0x80 } else { 0 };
+                let v = self.read_f(f);
+                let r = (v >> 1) | cin;
+                self.set_c(v & 0x01 != 0);
+                self.write_d(d, f, r);
+            }
+            0x06 => {
+                let r = self.w ^ self.read_f(f); // XORWF
+                self.set_z(r);
+                self.write_d(d, f, r);
+            }
+            0x0E => {
+                let v = self.read_f(f); // SWAPF
+                let r = (v << 4) | (v >> 4);
+                self.write_d(d, f, r);
+            }
+            other => panic!("sim(pic14e): byte opcode {other:#x} not yet implemented"),
+        }
+        pc + 1
+    }
+
+    fn exec_bit(&mut self, pc: u16, word: u16) -> u16 {
+        let b = ((word >> 7) & 0x7) as u8;
+        let f = (word & 0x7F) as usize;
+        match (word >> 10) & 0x3 {
+            0 => {
+                let v = self.read_f(f) & !(1 << b);
+                self.write_f(f, v); // BCF
+            }
+            1 => {
+                let v = self.read_f(f) | (1 << b);
+                self.write_f(f, v); // BSF
+            }
+            2 => {
+                if self.read_f(f) & (1 << b) == 0 {
+                    return pc + 2; // BTFSC skip if clear
+                }
+            }
+            3 => {
+                if self.read_f(f) & (1 << b) != 0 {
+                    return pc + 2; // BTFSS skip if set
+                }
+            }
+            _ => unreachable!(),
+        }
+        pc + 1
+    }
+
+    fn exec_call_goto(&mut self, pc: u16, word: u16) -> u16 {
+        let k = word & 0x7FF;
+        // GOTO/CALL: PC<14:11> from PCLATH<6:3>, the 11-bit literal is
+        // PC<10:0> (DS41364E Figure 3-4); PCLATH is not modified.
+        let target = ((self.ram[0x0A] as u16 & 0x78) << 8) | k;
+        if word & 0x0800 != 0 {
+            target // GOTO
+        } else {
+            self.stack.push(pc + 1); // CALL
+            target
+        }
+    }
+
+    fn exec_literal(&mut self, pc: u16, word: u16) -> u16 {
+        let op6 = (word >> 8) & 0x3F;
+        let k = (word & 0xFF) as u8;
+        match op6 {
+            0x35 | 0x36 | 0x37 | 0x3B | 0x3D => {
+                // The PIC14E shift/add/sub-with-carry byte ops live in the
+                // 11-prefixed family (DS41364E Table 29-3).
+                let d = (word >> 7) & 1;
+                let f = (word & 0x7F) as usize;
+                match op6 {
+                    0x3D => {
+                        // ADDWFC: f + W + C.
+                        let v = self.read_f(f);
+                        let cin = (self.ram[3] & 0b001 != 0) as u8;
+                        let r = self.w.wrapping_add(v).wrapping_add(cin);
+                        self.set_z(r);
+                        self.set_c((self.w as u16 + v as u16 + cin as u16) > 0xFF);
+                        self.write_d(d, f, r);
+                    }
+                    0x3B => {
+                        // SUBWFB: f - W - !C.
+                        let v = self.read_f(f);
+                        let cin = (self.ram[3] & 0b001 != 0) as u8;
+                        let r = v.wrapping_sub(self.w).wrapping_sub(1 - cin);
+                        self.set_z(r);
+                        self.set_c(v >= self.w.wrapping_add(1 - cin));
+                        self.write_d(d, f, r);
+                    }
+                    0x37 => {
+                        // ASRF: arithmetic right shift, MSb held.
+                        let v = self.read_f(f);
+                        self.set_c(v & 0x01 != 0);
+                        let r = (v >> 1) | (v & 0x80);
+                        self.set_z(r);
+                        self.write_d(d, f, r);
+                    }
+                    0x35 => {
+                        // LSLF: left shift through... LSLF shifts left,
+                        // bit 7 into C, bit 0 cleared.
+                        let v = self.read_f(f);
+                        self.set_c(v & 0x80 != 0);
+                        let r = v << 1;
+                        self.set_z(r);
+                        self.write_d(d, f, r);
+                    }
+                    _ => {
+                        // LSRF: logical right shift, bit 0 into C.
+                        let v = self.read_f(f);
+                        self.set_c(v & 0x01 != 0);
+                        let r = v >> 1;
+                        self.set_z(r);
+                        self.write_d(d, f, r);
+                    }
+                }
+                return pc + 1;
+            }
+            0x31 => {
+                // MOVLP sets word bit 7 (`11 0001 1kk kkkk`); ADDFSR's 6-bit
+                // k never reaches it (`11 0001 0nkk kkkk`).
+                if word & 0x80 != 0 {
+                    self.ram[0x0A] = (word & 0x7F) as u8; // MOVLP
+                } else {
+                    // ADDFSR FSRn, k: signed 6-bit k (DS41364E).
+                    let n = ((word >> 6) & 1) as usize;
+                    let k = if word & 0x20 != 0 {
+                        ((word & 0x3F) as i16) - 64
+                    } else {
+                        (word & 0x3F) as i16
+                    };
+                    let cur = self.fsr(n) as i16;
+                    self.set_fsr(n, cur.wrapping_add(k) as u16);
+                }
+                return pc + 1;
+            }
+            0x32 | 0x33 => {
+                // BRA: PC = PC + 1 + signed 9-bit literal.
+                let k = word & 0x1FF;
+                let off = if k & 0x100 != 0 {
+                    (k | 0xFE00) as i16
+                } else {
+                    k as i16
+                };
+                return (pc as i16 + 1 + off) as u16;
+            }
+            0x3F => {
+                // Indexed MOVIW/MOVWI: 11 1111 dnkk kkkk, signed 6-bit k.
+                let n = ((word >> 6) & 1) as usize;
+                let k = if word & 0x20 != 0 {
+                    ((word & 0x3F) as i16) - 64
+                } else {
+                    (word & 0x3F) as i16
+                };
+                let eff = self.fsr(n).wrapping_add(k as u16);
+                if word & 0x80 != 0 {
+                    self.write_ram(eff, self.w); // MOVWI
+                } else {
+                    let v = self.read_ram(eff);
+                    self.set_z(v);
+                    self.w = v; // MOVIW
+                }
+                return pc + 1;
+            }
+            _ => {}
+        }
+        match (word >> 8) & 0xF {
+            0xE | 0xF => {
+                let r = self.w.wrapping_add(k);
+                self.add_flags(self.w, k, r);
+                self.w = r;
+            }
+            0x9 => {
+                self.w &= k;
+                self.set_z(self.w);
+            }
+            0x8 => {
+                self.w |= k;
+                self.set_z(self.w);
+            }
+            0xA => {
+                self.w ^= k;
+                self.set_z(self.w);
+            }
+            0xC | 0xD => {
+                let r = k.wrapping_sub(self.w);
+                self.set_z(r);
+                self.set_c(k >= self.w);
+                self.w = r;
+            }
+            0x0..=0x3 => self.w = k, // MOVLW
+            0x4..=0x7 => {
+                self.w = k; // RETLW
+                let ret = self.pop_return();
+                return ret;
+            }
+            _ => unreachable!(),
+        }
+        pc + 1
+    }
+}
+
 /// Decode Intel HEX into 16-bit words for a PIC18F4550-sized program
 /// (`0x4000` words = 32768 bytes of flash). Same wire format as
 /// `parse_hex` (`asm::to_hex` emits identical HEX regardless of core), just
