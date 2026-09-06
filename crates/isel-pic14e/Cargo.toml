@@ -1,0 +1,26 @@
+[package]
+name = "isel-pic14e"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+device = { path = "../device" }
+banking = { path = "../banking" }
+iselcore = { path = "../iselcore" }
+peephole = { path = "../peephole" }
+
+[dev-dependencies]
+pic14-sim = { path = "../sim" }
+asm = { path = "../asm" }
+irparse = { path = "../irparse" }
+wholeprog = { path = "../wholeprog" }
+legalize = { path = "../legalize" }
+callgraph = { path = "../callgraph" }
+alloc = { path = "../alloc" }
+schedule = { path = "../schedule" }
+
+[[bin]]
+name = "isel-pic14e"
+path = "src/bin/isel-pic14e.rs"
