@@ -1,0 +1,139 @@
+name = "p16f1939"
+core = "pic14e"
+flash_words = 16384
+ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF], [0x0120, 0x016F], [0x01A0, 0x01EF], [0x0220, 0x026F], [0x02A0, 0x02EF], [0x0320, 0x036F], [0x03A0, 0x03EF], [0x0420, 0x046F], [0x04A0, 0x04EF], [0x0520, 0x056F], [0x05A0, 0x05EF], [0x0620, 0x064F]]
+common_ram = [0x0070, 0x007F]
+stack_depth = 16
+interrupt_vectors = [0x0004]
+
+[provenance]
+tier = "atdf"
+source = "PIC16F1939.PIC"
+pack = "Microchip.PIC12-16F1xxx_DFP.1.9.258"
+sha256 = "dbe0b628c953c17df4ef2f4e8386c2d611e3444eb4fbf73e5c89925e5cf88a65"
+
+[config]
+base_byte_addr = 0x1000E
+num_bytes = 4
+erased_baseline = [0xFF, 0x3F, 0xFF, 0x3F]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 0
+mask = 0x07
+shift = 0
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "extrc", bits = 3 }, { name = "intosc", bits = 4 }, { name = "ecl", bits = 5 }, { name = "ecm", bits = 6 }, { name = "ech", bits = 7 }]
+
+[[config.fields]]
+name = "wdt"
+byte_offset = 0
+mask = 0x18
+shift = 3
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "swdten", bits = 1 }, { name = "nsleep", bits = 2 }, { name = "on", bits = 3 }]
+
+[[config.fields]]
+name = "pwrt"
+byte_offset = 0
+mask = 0x20
+shift = 5
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "mclre"
+byte_offset = 0
+mask = 0x40
+shift = 6
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "cp"
+byte_offset = 0
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cpd"
+byte_offset = 1
+mask = 0x01
+shift = 0
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "boren"
+byte_offset = 1
+mask = 0x06
+shift = 1
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "sboden", bits = 1 }, { name = "nsleep", bits = 2 }, { name = "on", bits = 3 }]
+
+[[config.fields]]
+name = "clkouten"
+byte_offset = 1
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "ieso"
+byte_offset = 1
+mask = 0x10
+shift = 4
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "fcmen"
+byte_offset = 1
+mask = 0x20
+shift = 5
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "wrt"
+byte_offset = 2
+mask = 0x03
+shift = 0
+default = "off"
+values = [{ name = "all", bits = 0 }, { name = "half", bits = 1 }, { name = "boot", bits = 2 }, { name = "off", bits = 3 }]
+
+[[config.fields]]
+name = "vcapen"
+byte_offset = 2
+mask = 0x30
+shift = 4
+values = [{ name = "ra0", bits = 0 }, { name = "ra5", bits = 1 }, { name = "ra6", bits = 2 }, { name = "off", bits = 3 }]
+
+[[config.fields]]
+name = "pllen"
+byte_offset = 3
+mask = 0x01
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "stvren"
+byte_offset = 3
+mask = 0x02
+shift = 1
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "borv"
+byte_offset = 3
+mask = 0x04
+shift = 2
+values = [{ name = "hi", bits = 0 }, { name = "lo", bits = 1 }]
+
+[[config.fields]]
+name = "lvp"
+byte_offset = 3
+mask = 0x20
+shift = 5
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]

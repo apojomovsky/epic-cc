@@ -392,31 +392,7 @@ fn main() {
         )
         .expect("write line table");
     }
-    let hex = match (device.core, &config_bytes) {
-        (device::Core::Pic14, Some(cb)) => {
-            let mut words = program_words.clone();
-            let idx = (device.config.base_byte_addr / 2) as usize;
-            if words.len() <= idx {
-                words.resize(idx + 1, 0);
-            }
-            let w = u16::from(cb[0]) | (u16::from(cb[1]) << 8);
-            words[idx] = w;
-            asm::to_hex(&words)
-        }
-        (device::Core::Pic18, Some(cb)) => {
-            let mut config_words = Vec::new();
-            for chunk in cb.chunks(2) {
-                let lo = chunk[0] as u16;
-                let hi = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
-                config_words.push(lo | (hi << 8));
-            }
-            asm::to_hex_regions(&[
-                (0, &program_words),
-                (device.config.base_byte_addr, &config_words),
-            ])
-        }
-        _ => asm::to_hex(&program_words),
-    };
+    let hex = driver::hex::emit(&device, &program_words, config_bytes.as_deref());
     if let Some(cb) = &config_bytes {
         eprintln!("epic-cc: resolved configuration for {}:", device.name);
         for (i, b) in cb.iter().enumerate() {

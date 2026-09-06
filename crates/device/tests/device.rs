@@ -107,11 +107,19 @@ fn by_name_resolves_both_devices() {
 
 #[test]
 fn all_contains_every_seed_device() {
-    assert_eq!(device::ALL.len(), 4);
+    assert_eq!(device::ALL.len(), 10);
     assert!(device::ALL.iter().any(|d| d.name == "p16f877a"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f4550"));
     assert!(device::ALL.iter().any(|d| d.name == "p16f887"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f2550"));
+    for stem in [
+        "p16f1933", "p16f1934", "p16f1936", "p16f1937", "p16f1938", "p16f1939",
+    ] {
+        assert!(
+            device::ALL.iter().any(|d| d.name == stem),
+            "{stem} missing from ALL"
+        );
+    }
 }
 
 #[test]
@@ -187,7 +195,7 @@ fn resolve_accepts_every_spelling_the_ecosystem_uses() {
 #[test]
 fn resolve_rejects_a_part_we_do_not_ship() {
     assert!(device::resolve("p99f9999").is_none());
-    assert!(device::resolve("16F1937").is_none());
+    assert!(device::resolve("16F1935").is_none());
     assert!(device::resolve("").is_none());
 }
 

@@ -1,4 +1,4 @@
-use device::{resolve_config, PIC16F877A, PIC18F4550};
+use device::{resolve_config, PIC16F1937, PIC16F877A, PIC18F4550};
 
 #[test]
 fn erased_baseline_is_the_datasheet_stated_value() {
@@ -56,6 +56,38 @@ fn pic18_erased_baseline_is_all_ff_confirmed_against_gpasm() {
     assert_eq!(PIC18F4550.config.erased_baseline, &[0xFF; 14]);
     assert_eq!(PIC18F4550.config.num_bytes, 14);
     assert_eq!(PIC18F4550.config.base_byte_addr, 0x300000);
+}
+
+#[test]
+fn pic14e_config_words_resolve_against_the_datasheet_layout() {
+    // DS41364E Register 4-1/4-2 (1934/6/7; DS40001574D is identical for
+    // 1938/9): CONFIG1 at word 0x8007 (byte 0x1000E) and CONFIG2 at word
+    // 0x8008 (byte 0x10010), each a 14-bit word erased to 0x3FFF. The
+    // erased baseline is the two words' bytes, low byte first.
+    assert_eq!(PIC16F1937.config.base_byte_addr, 0x1000E);
+    assert_eq!(PIC16F1937.config.num_bytes, 4);
+    assert_eq!(PIC16F1937.config.erased_baseline, &[0xFF, 0x3F, 0xFF, 0x3F]);
+    // Every field the datasheet declares resolves; the required osc field
+    // has no default, so it must be named explicitly.
+    let bytes = resolve_config(
+        &PIC16F1937.config,
+        "osc=xt, wdt=off, pwrt=on, mclre=on, cp=off, cpd=off, boren=on, \
+         clkouten=off, ieso=off, fcmen=off, wrt=off, vcapen=off, pllen=off, \
+         stvren=on, borv=hi, lvp=off",
+    );
+    assert_eq!(bytes.len(), 4);
+    // CONFIG1 low byte: FOSC=XT (0b001) | WDTE=00 | PWRTE=on (0) |
+    // MCLRE=on (1) | CP=off (1).
+    assert_eq!(bytes[0], 0xC1);
+    // CONFIG1 high byte: CPD=off (1) | BOREN=on (11) | CLKOUTEN=off (1) |
+    // IESO=off (0) | FCMEN=off (0).
+    assert_eq!(bytes[1], 0x0F);
+    // CONFIG2 low byte: WRT=off (11) | VCAPEN=off (11).
+    assert_eq!(bytes[2], 0xFF);
+    // CONFIG2 high byte: PLLEN=off (0) | STVREN=on (1) | BORV=hi (0) |
+    // DEBUG and the unimplemented bit 11 stay at their erased 1s |
+    // LVP=off (0).
+    assert_eq!(bytes[3], 0x1A);
 }
 
 #[test]
