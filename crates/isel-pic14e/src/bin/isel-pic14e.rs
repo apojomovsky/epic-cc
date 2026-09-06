@@ -4,7 +4,7 @@ use std::fs;
 /// `isel-pic14e <in.ir> <in.map> <out.asm>`
 ///
 /// The address map is a text file with `global <name> 0xNN`,
-/// `local <func> <name> 0xNN`, and `const <name>` (no address — flash)
+/// `local <func> <name> 0xNN`, and `const <name>` (no address, flash)
 /// lines (produced by the `alloc` stage). Locals are keyed
 /// `{func}::{name}`, matching the keys the backend looks up.
 fn main() {

@@ -1,6 +1,6 @@
 // Milestone-6 scalar acceptance: a loop over a hand-computable computation
-// that exercises the full scalar surface — `sub`, `and i8`, `or`, `xor`,
-// and the `eq`/`ne`/`ugt`/`ult` comparison predicates — with no `mul`/
+// that exercises the full scalar surface, `sub`, `and i8`, `or`, `xor`,
+// and the `eq`/`ne`/`ugt`/`ult` comparison predicates, with no `mul`/
 // `shl`/`div` (clang folds `i + i` into `shl`, so the doubling is written
 // as plain adds of the loop counter). Everything is i8/i16 scalar: no
 // pointers, no structs, no arrays.

@@ -1049,14 +1049,13 @@ impl<'m> Gen<'m> {
             }
             [(scale, r)] => {
                 // Multi-byte elements (i16/f32 scale 2, i32/f32 scale 4,
-                // classic mid-range has no MULLW): byte index = s×idx + k +
-                // off. For a 2-chunk table (idx_hi == 0 in bounds) the lo
-                // byte is shifted and the carry folded, the exact M13
-                // sequence. For 3+ chunks the hi byte participates: the
-                // shift pair accumulated `s*idx_lo >> 8` into the hi temp,
-                // then `s*idx_hi` is added (in bounds
-                // s*idx_hi + (s*idx_lo >> 8) + carry <= 255), so the hi
-                // temp is then the exact chunk number.
+                // no MULLW): byte index = s×idx + k + off. For a 2-chunk
+                // table (idx_hi == 0 in bounds) the lo byte is shifted and
+                // the carry folded, the exact M13 sequence. For 3+ chunks
+                // the hi byte participates: the shift pair accumulated
+                // `s*idx_lo >> 8` into the hi temp, then `s*idx_hi` is
+                // added (in bounds s*idx_hi + (s*idx_lo >> 8) + carry <=
+                // 255), so the hi temp is the exact chunk number.
                 assert_eq!(
                     self.reg_bytes(r),
                     2,
@@ -2286,13 +2285,11 @@ impl<'m> Gen<'m> {
                 self.emit_move_val_to_slot(&arg.val, aty, pa);
                 // M15 conversion ABI: the four conversion routines take
                 // their value in a fixed 4-byte `val` slot, but i8/i16
-                // sources are copied by their own width: the leftover
+                // sources are copied by their own width, so the leftover
                 // high bytes are STALE and corrupt the recipe's leading-1
-                // search / sign logic (an i16 `sitofp` reading leftover
-                // high bytes produced exp 157 instead of 130 in the M15
-                // acceptance). Fill them so the slot holds a proper i32:
-                // __sitofp_f32 sign-extends (i16: the top value byte IS
-                // the sign byte, copied up; i8: 0xFF/0x00 by bit 7),
+                // search / sign logic (an i16 `sitofp` reading stale high
+                // bytes gave exp 157 instead of 130). Fill them so the
+                // slot holds a proper i32: __sitofp_f32 sign-extends,
                 // __uitofp_f32 zero-extends.
                 if aty.bytes() < callee.params[i].width {
                     assert_eq!(
@@ -2899,7 +2896,7 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Asm(a) => {
-                // Asm barrier: W/STATUS/bank clobbered — verbatim, bracketed for banking.
+                // Asm barrier: W/STATUS/bank clobbered; verbatim and bracketed.
                 // Rung 4: substitute `$0`/`%0` memory operands via slot_addr.
                 self.emit("; --- asm start ---".to_string());
                 let substituted = self.substitute_asm(&a.template, &a.operands);
@@ -3599,16 +3596,11 @@ impl<'m> Gen<'m> {
                 self.emit("    RETURN".to_string());
             }
             // The nine soft-float routines (Milestone 15): hand-written
-            // IEEE754 recipes, round-to-nearest-even. The float format: 4
-            // bytes LE: b0 = mantissa LSB, b1, b2 = mantissa MSB + the
-            // exponent's LSB (bit 7 of b2), b3 = sign | exponent[7:1]; the
-            // 24-bit mantissa = (b2 & 0x7F) << 16 | b1 << 8 | b0, plus the
-            // implicit 0x800000 when the 8-bit biased exponent ((b3 & 0x7F)
-            // << 1 | (b2 >> 7)) is nonzero. Args arrive in the routine's
-            // param slots; the result goes to the fixed retval region
-            // (0x71-0x74); working state lives in `__scr` at the Task-2
-            // contract offsets. All slots stay inside one GPR bank (any
-            // bank, issue #6), the loops are skip-sensitive.
+            // IEEE754 recipes, round-to-nearest-even. Float format: 4 bytes
+            // LE, b0 mantissa LSB, b3 sign | exponent, implicit 0x800000 on
+            // nonzero bias. Args in param slots, result in the fixed retval
+            // region, working state in `__scr`. All slots stay inside one
+            // GPR bank (issue #6), the loops are skip-sensitive.
             "__add_f32" | "__sub_f32" => {
                 let pa = self.slot_addr(name, "a").direct();
                 let pb = self.slot_addr(name, "b").direct();
@@ -3737,16 +3729,12 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
-    // -----------------------------------------------------------------------
-    // The soft-float routine recipes (Milestone 15, Task 3).
-    // -----------------------------------------------------------------------
-    //
-    // IEEE754 single (f32) = 4 bytes LE: b0 = mantissa LSB, b1, b2 =
-    // mantissa MSB + the exponent's LSB (bit 7 of b2), b3 = sign |
-    // exponent[7:1]. The 24-bit mantissa = (b2 & 0x7F) << 16 | b1 << 8 | b0,
-    // plus the implicit 0x800000 when the 8-bit biased exponent ((b3 & 0x7F)
-    // << 1 | (b2 >> 7)) is nonzero. Round-to-nearest-even: round up iff
-    // guard && (sticky || mantissa LSB); on a rounding carry the mantissa
+    // Soft-float routine recipes (Milestone 15, Task 3). IEEE754 single
+    // (f32) = 4 bytes LE: b0 mantissa LSB, b2 = mantissa MSB + exponent
+    // LSB (bit 7), b3 = sign | exponent[7:1]; the 24-bit mantissa =
+    // (b2 & 0x7F) << 16 | b1 << 8 | b0, plus implicit 0x800000 when the
+    // biased exponent ((b3 & 0x7F) << 1 | b2 >> 7) is nonzero. RNE: round
+    // up iff guard && (sticky || mantissa LSB); a rounding carry
     // renormalizes (0x800000, exp+1). The retval region is 0x71-0x74.
 
     /// Swap two bytes via the XOR trick (no scratch needed). Each XORWF
@@ -4289,19 +4277,14 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BSF 0x{stick:02X}, 0"));
         self.emit(format!("    BTFSS 0x{ta2:02X}, 7"));
         self.emit(format!("    BCF 0x{stick:02X}, 0"));
-        // ---- RNE: round up iff round && (sticky || mantissa LSB), with
-        //      sticky = OR(ta below the top bit) | stick bit 1 (the deep
-        //      OR): the add path's round/sticky are equivalent (round =
-        //      ta2 bit 7 = the last shifted-out bit; a sum carry promotes
-        //      the old round into stick bit 1). ----
-        // ---- denormal result: exp 1 with the top mantissa bit clear (the
-        //      sum/difference of denormals, or a normal that underflowed)
-        //      converts to exp 0: the mantissa is already the raw
-        //      fraction (no implicit bit), and the assemble emits it as-is
-        //      for e == 0. A rounded-up 0x800000 (the smallest normal)
-        //      keeps exp 1. Both paths reach here: the add path directly
-        //      (a denormal sum never normalizes), the sub path after its
-        //      normalize loop stops at ea == 1. ----
+        // RNE: round up iff round && (sticky || mantissa LSB), where
+        // sticky = OR(ta below the top bit) | stick bit 1 (round = ta2
+        // bit 7, the last shifted-out bit; a sum carry promotes it into
+        // stick bit 1). Denormal: exp 1 with the top mantissa bit clear
+        // (a denormal sum/difference or an underflowed normal) converts
+        // to exp 0, the mantissa being the raw fraction assembled as-is;
+        // a rounded-up 0x800000 keeps exp 1. Both paths reach here: the
+        // add path directly, the sub path after its normalize loop stops at ea == 1.
         let l_den_conv = self.fresh_label();
         let l_den_done = self.fresh_label();
         self.emit(format!("{l_round_step}:"));
@@ -5858,29 +5841,14 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
         if i == 0 && f.isr {
-            // The ISR save prologue, right after the vector entry (word 4):
-            // W into 0x75, nibble-swapped IN PLACE (SWAPF 0x75, F has no
-            // STATUS side effects and no W dependency, the epilogue's
-            // swap-back is the flag-safe W restore), STATUS into 0x76
-            // nibble-swapped (SWAPF reads STATUS without touching it),
-            // PCLATH and FSR into 0x77/0x78, then the preempted main's
-            // in-flight return value (0x71-0x74) into 0x79-0x7C: the ISR
-            // body's value-returning calls write the retval region, so
-            // without this save they would clobber it, and finally the
-            // fixed scratch byte 0x70 into 0x7D. The scratch is LIVE across
-            // interrupt windows in the preempted main: const reads stash
-            // their byte/index in 0x70 across the PCLATH restore, GEP
-            // offsets accumulate there, and the icmp/add/sub chains fold
-            // through it: an ISR that itself uses the scratch (a const
-            // read, a compare, an i16/i32 op) would silently corrupt that
-            // in-flight value without this save. Then PCLATH = 0 so the
-            // ISR body's GOTOs stay in page 0 (the M11 restore literal is
-            // PAGE(isr) = 0). The save area is fixed common RAM
-            // (0x75-0x7D: W/STATUS/PCLATH/FSR/retval x4/scratch = 9 bytes),
-            // disjoint from the scratch byte (0x70) and the retval region
-            // (0x71-0x74); 0x7E-0x7F stays free. The retval/scratch MOVFs
-            // clobber the CURRENT Z, which is harmless: the interrupted
-            // STATUS is already safe in 0x76.
+            // ISR save prologue (vector word 4): W into 0x75 and STATUS
+            // into 0x76, each nibble-swapped in place (flag-safe, no W
+            // dependency; the epilogue swap-backs restore them), then
+            // PCLATH/FSR into 0x77/0x78, the preempted main's in-flight
+            // retval (0x71-0x74) into 0x79-0x7C, and the LIVE scratch byte
+            // 0x70 into 0x7D. Save area = common RAM 0x75-0x7D (9 bytes),
+            // disjoint from scratch and retval. Then PCLATH = 0 so the ISR
+            // body's GOTOs stay in page 0 (the M11 restore literal is PAGE(isr) = 0).
             g.emit("    MOVWF 0x75");
             g.emit("    SWAPF 0x75, F");
             g.emit("    SWAPF STATUS, W");
@@ -6004,16 +5972,14 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                 }
                 _ if f.isr => {
                     match t {
-                        // The restore epilogue replaces the ISR's `ret`. Order
-                        // is load-bearing: the retval region (0x79-0x7C ->
-                        // 0x71-0x74), then the scratch byte (0x7D -> 0x70), then
-                        // PCLATH/FSR (MOVF, their Z clobbers are fine, STATUS
-                        // is not yet restored), then STATUS via the nibble
-                        // swap-back (SWAPF is flag-safe), and W LAST via its
-                        // swap-back (also flag-safe, MOVF would set Z from the
-                        // moved value after STATUS was already restored,
-                        // corrupting the interrupted main's Z). RETFIE pops the
-                        // hardware-pushed return.
+                        // The restore epilogue replaces the ISR's `ret`.
+                        // Order is load-bearing: retval (0x79-0x7C ->
+                        // 0x71-0x74), scratch (0x7D -> 0x70), PCLATH/FSR
+                        // (their Z clobbers are fine, STATUS not yet
+                        // restored), then STATUS via nibble swap-back
+                        // (flag-safe), and W last via its swap-back (MOVF
+                        // would set Z from the moved value after STATUS was
+                        // restored, corrupting the interrupted main's Z).
                         Inst::Ret(None, _) => {
                             g.emit("    MOVF 0x79, W");
                             g.emit("    MOVWF 0x71");
@@ -6572,14 +6538,11 @@ pub fn select_with_locs(
     // Fresh-label counter at module scope: labels are file-scoped in the
     // single `.asm` output, so it must not reset per function.
     // ---- PASS A: emit every function body with every PCLATH restore
-    // present, measure word sizes, and run the page assignment over
-    // ALL functions. A single-pass emission cannot know a forward call
-    // target's page while the caller is being emitted (the target's
-    // placement depends on sizes measured later), so pass A measures and
-    // assigns first; pass B (below) emits the final text with every
-    // function's page known.
-    // Emission order: the ISR first (it owns the vector at word 4), then
-    // every other function in module order.
+    // present, measure word sizes, and run the page assignment over ALL
+    // functions. A single pass cannot know a forward call target's page
+    // while emitting (its placement depends on sizes measured later), so
+    // pass A measures and assigns first; pass B emits with pages known.
+    // Emission order: the ISR first (it owns the vector at word 4), then the rest in module order.
     let mut order: Vec<&ir::Func> = Vec::with_capacity(m.funcs.len());
     order.extend(m.funcs.iter().filter(|f| f.isr));
     order.extend(m.funcs.iter().filter(|f| !f.isr));
@@ -6608,18 +6571,14 @@ pub fn select_with_locs(
             body_texts.push(g.out.join("\n"));
         }
     }
-    // The banking pass inserts BANKSEL words that grow the text (issue #17).
-    // The bin packing must fit the FINAL post-banking sizes, or a function
-    // packed into a tight page tail can straddle the boundary after banking
-    // (the greedy layout had slack; first-fit's tighter packing does not).
-    // Per-function BANKSEL counts are placement-independent: every label
-    // resets the tracked bank, and callee exit banks are callee-local, so
-    // measuring once on the pass-A text (all PCLATH restores present) is
-    // exact, and pass B's same-page restore elision only shrinks bodies, so
-    // the packed layout is elision-stable.
-    // Hand-written module asm rides before `__start` in the final text, so
-    // the measure carries it too (same words, same banking context), and
-    // the packer's page-0 base counts its words below (issue #207).
+    // The banking pass inserts BANKSEL words that grow the text (issue
+    // #17), so the bin packing must fit the FINAL post-banking sizes, or
+    // a function packed into a tight page tail can straddle the boundary
+    // after banking. Per-function BANKSEL counts are placement-independent
+    // (every label resets the tracked bank, callee exit banks are
+    // callee-local), so measuring once on the pass-A text is exact and
+    // pass B's same-page elision only shrinks bodies, being elision-stable.
+    // Module asm rides before `__start`; the page-0 base counts its words below (issue #207).
     let modasm_lines: Vec<String> = m
         .module_asm
         .iter()
@@ -6748,18 +6707,13 @@ pub fn select_with_locs(
         }
     }
     // Bin-packing page assignment over every function's post-banking size,
-    // in emission order, first-fit: each function goes to the LOWEST-numbered
-    // page with room for it. The greedy next-fit only considered the current
-    // page, so a page tail was wasted whenever the next function was even
-    // slightly too large, even when a later small function could fill it;
-    // first-fit reuses those tails (a small function later in the module
-    // lands in an earlier page's tail, and the program uses fewer pages).
-    // The running word address starts after the page-0 prefix: the reset
-    // vector, the module asm, and the `__start` body plus init (counted in
-    // `page_next` below, issue #207), with `__start` at the top so the
-    // reset GOTO (PCLATH = 0) always reaches it. With an ISR the vector
-    // owns word 4: the ISR is pinned there, `__start` follows it, and the
-    // ISR must fit page 0 AND leave `__start` reachable, else panic loudly.
+    // in emission order, first-fit: each goes to the LOWEST-numbered page
+    // with room. The greedy next-fit wasted a page tail whenever the next
+    // function was too large even when a later small one could fill it;
+    // first-fit reuses those tails and uses fewer pages. The running word
+    // address starts after the page-0 prefix (reset vector, module asm,
+    // `__start` body plus init, issue #207), with `__start` at top so the
+    // reset GOTO (PCLATH = 0) reaches it; the ISR pins the vector at word 4.
     let mut pages: HashMap<String, usize> = HashMap::new();
     let mut pads: HashMap<String, usize> = HashMap::new();
     let init_words = start_init_words(m, addrs);
@@ -6815,14 +6769,13 @@ pub fn select_with_locs(
             };
             pages.insert(name.clone(), page);
             // The anchor: a function whose start is page-aligned gets an
-            // explicit `.org` pad: both the new-page case and the
-            // exact-boundary continuation (the previous function's size
-            // hit the boundary precisely, so the strict fit check alone
-            // would emit no pad). Without it, pass B's same-page restore
-            // elision shrinks the previous function and slides this one
-            // below the boundary into a straddle: its label resolves to the
-            // LOWER page while its later words sit in the upper one, so
-            // intra-function GOTOs (PAGE(<func>) from the label) misbranch.
+            // explicit `.org` pad (both the new-page case and the exact-
+            // boundary continuation, where the strict fit check alone
+            // emits no pad). Without it, pass B's same-page elision shrinks
+            // the previous function and slides this one below the boundary
+            // into a straddle: its label resolves to the LOWER page while
+            // its later words sit in the upper one, so intra-function GOTOs
+            // (PAGE(<func>) from the label) misbranch.
             if start & 0x7FF == 0 {
                 pads.insert(name.clone(), start);
             }
@@ -6845,16 +6798,13 @@ pub fn select_with_locs(
         pages.insert(entry, page);
     }
     // ---- PASS B: emit the final text with every function's page known.
-    // Same-page calls (and same-page const reads) skip the restore pair; the
-    // pages are the assignment's, and the `.org` pads pin the page bases, so
-    // the elision cannot move a function off its assigned page (it only
-    // shrinks bodies, page-membership-stable).
-    //
+    // Same-page calls (and const reads) skip the restore pair; the `.org`
+    // pads pin the page bases, so elision cannot move a function off its
+    // assigned page (it only shrinks bodies, page-membership-stable).
     // Emission is in PAGE order, not module order: bin packing can place a
     // later function in an earlier page's tail, so module-order emission
-    // would emit a backward `.org` (a page-0 function after a page-1 one):
-    // the assembler panics on backward `.org`. Within a page, functions keep
-    // their emission order (the page's running address is monotonic).
+    // would emit a backward `.org` (the assembler panics). Within a page,
+    // functions keep their emission order (the address is monotonic).
     let mut page_order: Vec<Vec<(&ir::Func, &str)>> = Vec::new();
     for (f, (name, _)) in order.iter().zip(&bodies) {
         let page = pages[name];
@@ -6925,32 +6875,14 @@ pub fn select_with_locs(
                 }
             }
         }
-        // Pin the const-table section to its pass-A `table_start` whenever
-        // the pass-B elision would move a reader base across a page
-        // boundary. `reader_pages` maps every reader entry's page from the
-        // pass-A position, but pass B emits the tables at the post-elision
-        // position (bodies only shrink, so the section shifts earlier): a
-        // chunked table's `.align 256` can then round a base across a page
-        // boundary (a base pass A aligned to exactly k*0x800 re-aligns into
-        // page k-1 after a 2-word elision), silently invalidating the
-        // restore-skip map: a caller that skipped its restore on the mapped
-        // page is left with the reader's HIGH(<base>) page, the drifted one,
-        // and its next GOTO misbranches. The `.org` re-pins the section so
-        // the final addresses are exactly the pass-A ones and the map stays
-        // exact, but only when a base's page actually changes (the common
-        // case, a small drift that stays within the mapped page, needs no
-        // pin). It is always forward (or equal): pass-B bodies are no
-        // larger, so `addr_b <= table_start`. A module without consts has no
-        // section to pin.
-        //
-        // The window-fit accounting runs at the FINAL post-banking
-        // position: bank + peephole the emitted text exactly as the
-        // driver will and measure its end, so the fold sees the
-        // assembler's org, not an estimate. The old `addr_b + growth`
-        // estimate missed the const-reader regions (their bodies + RETLW
-        // data follow the code): without them every reader CALL left the
-        // bank UNKNOWN and banking over-inserted BANKSELs, over-estimating
-        // the end (epic-cc#151).
+        // Pin the const-table section to its pass-A `table_start` when the
+        // pass-B elision would move a reader base across a page boundary:
+        // `reader_pages` maps pages from pass-A, but pass B emits tables
+        // post-elision (bodies only shrink), so a chunk's `.align 256` can
+        // round a base across a page, invalidating the restore-skip map.
+        // The `.org` re-pins final addresses to pass-A ones only when a
+        // base's page changes (`addr_b <= table_start`). Window-fit runs at
+        // FINAL post-banking; `addr_b + growth` missed const readers and over-inserted BANKSELs.
         let mut start = addr_b;
         if !consts.is_empty() {
             // Append placeholder reader bodies (a `RETLW` exit) so the
@@ -6989,32 +6921,13 @@ pub fn select_with_locs(
         start
     };
     // Const (flash) globals become RETLW tables, emitted after the
-    // functions so the CALLs above resolve. Every `__read_<name>` reader
-    // sets PCLATH = HIGH(<name>) first: the computed `ADDLW LOW(<name>);
-    // MOVWF PCL` jump lands at PCLATH:PCL, so a table in a nonzero 256-byte
-    // window needs the window set (the M5 reader left PCLATH stale, the
-    // latent window bug). A table of 256+ bytes is emitted as two 256-byte
-    // chunks: chunk 0's 256 RETLWs at the base label `<name>` (`.align 256`
-    // pads it to a 256-word boundary so LOW(<name>) == 0), then chunk 1's
-    // RETLWs at the fresh label `<name>_1` IMMEDIATELY after: `<name>` +
-    // 256 in the address space, so LOW(<name>_1) == 0 too and the true
-    // bound is 511 bytes (a table of exactly 256 bytes has an empty chunk
-    // 1, unreachable since its valid indices are 0..255), then the
-    // `__read_<name>_hi` entry AFTER the
-    // table (its computed-goto jumps into the table; the entry instructions
-    // are dead after MOVWF PCL). A `.table <name> <size>` directive is
-    // emitted immediately before every table's base label; the assembler
-    // enforces the window fit loudly (LOW + size <= 0x100 for single-entry
-    // tables, LOW == 0 for chunked bases): a table that crosses its window
-    // or a misaligned chunk base would silently misread, so it must fail
-    // assembly, not miscompile. Tables beyond 511 bytes (three chunks)
-    // panic loudly: out of scope.
-    // Label-collision guard: every label a table emits, its base label, its
-    // reader entry, and for chunked tables the fresh `{name}_1` chunk label
-    // and `__read_{name}_hi` entry, must be unique across all consts. A
-    // user `const t_1` (or `const __read_t_hi`) next to a chunked `const t`
-    // would emit a duplicate label the assembler's symbol insert silently
-    // overwrites (wrong reads, no error): panic loudly instead.
+    // functions so the CALLs resolve. Every `__read_<name>` reader sets
+    // PCLATH = HIGH(<name>) first: the `ADDLW LOW; MOVWF PCL` jump lands at
+    // PCLATH:PCL, so a table in a nonzero 256-byte window needs the window
+    // set. Tables of 256+ bytes emit as `.align 256` chunks (base LOW == 0)
+    // with a `.table <name> <size>` directive the assembler checks loudly;
+    // >511 bytes panics. Label-collision guard: every label a table emits
+    // (base, reader, `{name}_1`, `__read_{name}_hi`) must be unique.
     {
         let mut labels: HashMap<String, String> = HashMap::new();
         for g in &consts {
@@ -7097,20 +7010,14 @@ pub fn select_with_locs(
             locs.push(None);
         };
         if size >= 256 {
-            // Chunked table: chunk 0's reader, then `.align 256` (the
-            // assembler pads to the next 256-word boundary, so LOW(name) ==
-            // 0), then the `.table` directive, then each chunk's RETLWs at
-            // `name` (chunk 0), `name_1` (chunk 1), `name_2`, ...: every
-            // chunk base is exactly 256 words after the previous, so every
-            // LOW() == 0. The reader entries come AFTER the table: chunk
-            // c's reader at `__read_<name>_hi[c]` (chunk 1 keeps the M10
-            // `_hi` name for fixture stability). (The entries' computed
-            // gotos jump into the table; the entry instructions are dead
-            // after MOVWF PCL, so their placement cannot shift the chunks.)
-            // A table of exactly 256 bytes gets this branch too (size >=
-            // 256): chunk 1 is empty (`name_1:` with no RETLWs, its reader
-            // immediately after) and unreachable: every valid index
-            // 0..255 selects chunk 0.
+            // Chunked table: chunk 0's reader, then `.align 256` (pads to
+            // the next 256-word boundary, LOW(name) == 0), the `.table`
+            // directive, then each chunk's RETLWs at `name`, `name_1`,
+            // `name_2`, ...: every base is exactly 256 words after the
+            // previous, so every LOW() == 0. Reader entries come AFTER the
+            // table at `__read_<name>_hi[c]` (chunk 1 keeps the M10 `_hi`
+            // name for fixture stability). A 256-byte table gets this
+            // branch too (chunk 1 empty, unreachable: indices 0..255 = chunk 0).
             out.push(format!("__read_{}:", g.name));
             locs.push(None);
             reader(&mut out, &mut locs, &g.name);

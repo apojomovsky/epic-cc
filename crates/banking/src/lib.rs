@@ -80,22 +80,19 @@ const STATUS_ADDR: u16 = 0x03;
 
 /// A bank-select op's effect on the tracked bank, or `None` when the line
 /// is not a bank-select op. Recognized forms (issue #13 item 3):
-/// - `BCF/BSF STATUS, 5/6` — the comma attached to either token
-///   (classic PIC14: RP0 = bit 5, RP1 = bit 6);
-/// - `BCF/BSF 0x03, 5/6` — STATUS by its register address (classic);
-/// - `MOVWF STATUS` / `MOVWF 0x03` — writes all of STATUS from W: the RP
-///   bits become UNKNOWABLE (the `Some(None)` case, classic only);
-/// - `MOVLB k` — PIC14E loads the whole bank into the dedicated BSR
-///   register in one instruction (DS41364E Table 29-3 = `00 0000 001k
-///   kkkk`, 5-bit literal addressing all 32 banks).
-/// Classic PIC14 and PIC14E diverge in *which* forms are bank select ops:
+/// - `BCF/BSF STATUS, 5/6` (the comma attached to either token) and
+///   `BCF/BSF 0x03, 5/6`, classic PIC14's RP0 = bit 5, RP1 = bit 6;
+/// - `MOVWF STATUS` / `MOVWF 0x03`, classic only: writes STATUS from W, so
+///   the RP bits become UNKNOWABLE (the `Some(None)` case);
+/// - `MOVLB k`, PIC14E: loads the whole bank into the dedicated BSR
+///   register in one instruction (DS41364E Table 29-3, 5-bit literal).
+/// Classic PIC14 and PIC14E diverge in which forms are bank select ops:
 /// PIC14E's STATUS bits 5-7 are unimplemented (read as 0) and the bank
-/// lives in BSR, so `BCF/BSF STATUS, 5/6` are inert on PIC14E (not bank
-/// ops at all) and `MOVWF STATUS` no longer writes the bank a `MOVLB`
-/// does. The bit operand is matched by its numeric value, so `RP0`/`RP1`
-/// symbol forms would need the equ table — the isel output always uses
-/// the numeric forms, and hand-written asm in the fixtures does too.
-/// `pub`: `crates/schedule` (ADR-027) reuses this exact recognizer so its
+/// lives in BSR, so `BCF/BSF STATUS, 5/6` are inert and `MOVWF STATUS` no
+/// longer writes the bank. The bit operand is matched by its numeric value,
+/// so `RP0`/`RP1` symbol forms would need the equ table. The isel output
+/// always uses the numeric forms, and hand-written asm in the fixtures does
+/// too. `pub`: `crates/schedule` (ADR-027) reuses this recognizer so its
 /// own bank-select detection never drifts from banking's.
 pub fn bank_op_effect(device: &Device, mne: &str, toks: &[&str]) -> Option<Option<u8>> {
     // The comma may be attached to the register token (`STATUS,5`) or
