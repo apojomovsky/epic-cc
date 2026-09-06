@@ -66,13 +66,6 @@ fn main() {
         );
         std::process::exit(1);
     });
-    if device.core == device::Core::Pic14e {
-        eprintln!(
-            "epic-cc: device {} has core pic14e which has no backend yet (need isel-pic14e)",
-            device.name
-        );
-        std::process::exit(1);
-    }
 
     let exe_dir = std::env::current_exe()
         .ok()
@@ -320,23 +313,20 @@ fn main() {
     let (asm, mut locs) = match device.core {
         device::Core::Pic14 => isel::select_with_locs(device, &m, &addrs),
         device::Core::Pic18 => isel_pic18::select_with_locs(device, &m, &addrs),
-        device::Core::Pic14e => {
-            eprintln!(
-                "epic-cc: pic14e core not yet implemented for {}",
-                device.name
-            );
-            std::process::exit(1);
-        }
+        device::Core::Pic14e => isel_pic14e::select_with_locs(device, &m, &addrs),
     };
 
     let asm = match device.core {
-        device::Core::Pic14 => {
-            // 8-9. schedule -> banking -> peephole, PIC14 only: PIC18's
-            // encoder emits its own access/BSR bits and has no PCLATH, so
-            // neither pass has anything to do for PIC18. schedule
+        device::Core::Pic14 | device::Core::Pic14e => {
+            // 8-9. schedule -> banking -> peephole, PIC14 and PIC14E only:
+            // PIC18's encoder emits its own access/BSR bits and has no
+            // PCLATH, so neither pass has anything to do for PIC18. schedule
             // (ADR-027, epic-cc#210) runs before banking so it sees
             // isel's raw instruction order before banking turns bank
-            // demand into BANKSEL text; phase 1 is an identity transform.
+            // demand into BANKSEL/MOVLB text; phase 1 is an identity
+            // transform. The banking pass is core-aware (docs/33 D-1): it
+            // emits the classic RP-bit `BCF/BSF STATUS, 5/6` BANKSEL on
+            // PIC14 and the single `MOVLB k` on PIC14E, tracking BSR there.
             let (asm, l) = schedule::schedule_with_locs(device, &asm, &locs);
             locs = l;
             let (asm, l) = banking::assign_banks_with_locs(device, &asm, &locs);
@@ -345,25 +335,22 @@ fn main() {
             locs = l;
 
             // Issue #17: the page assignment ran on pre-banking sizes; the
-            // banking pass inserts BANKSEL words that grow the text. Verify
-            // the FINAL layout's page fit — a function that grew across a
-            // page boundary has no `.org` anchor, so the assembler's
+            // banking pass inserts BANKSEL/MOVLB words that grow the text.
+            // Verify the FINAL layout's page fit: a function that grew
+            // across a page boundary has no `.org` anchor, so the assembler's
             // backward-.org panic would never fire and it would silently
             // straddle (label in the lower page, tail in the upper page,
             // intra-function GOTOs misbranching). Panic loudly instead,
-            // before assembling. PIC14-specific — no paging on PIC18: a
-            // 20-bit GOTO/CALL reaches the whole 32KB flash.
-            isel::verify_page_fit(&m, &asm);
+            // before assembling. PIC14/PIC14E (both page their GOTOs via
+            // PCLATH; PIC18's 20-bit GOTO/CALL reach the whole 32KB flash).
+            if device.core == device::Core::Pic14 {
+                isel::verify_page_fit(&m, &asm);
+            } else {
+                isel_pic14e::verify_page_fit(&m, &asm);
+            }
             asm
         }
         device::Core::Pic18 => asm,
-        device::Core::Pic14e => {
-            eprintln!(
-                "epic-cc: pic14e core not yet implemented for {}",
-                device.name
-            );
-            std::process::exit(1);
-        }
     };
 
     if cli.emit == cli::Emit::Asm {

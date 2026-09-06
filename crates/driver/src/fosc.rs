@@ -35,9 +35,8 @@ pub fn resolve_fosc_hz(device: &Device, spec: &str) -> u64 {
     // Validate the fuse half (required oscillator fields, locked, etc.).
     let _ = device::resolve_config(&device.config, &fuse);
     match device.core {
-        Core::Pic14 => pic14_hz(&device.config, &fuse, xtal),
+        Core::Pic14 | Core::Pic14e => pic14_hz(&device.config, &fuse, xtal),
         Core::Pic18 => pic18_hz(&device.config, &fuse, xtal),
-        Core::Pic14e => panic!("fosc: pic14e core not yet implemented for {}", device.name),
     }
 }
 
