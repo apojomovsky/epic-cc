@@ -22,6 +22,11 @@ name: ci
 # Nightly cron = lightweight for all devices (see nightly.yml).
 # Full per-device fuzz never, a fuzz bug is core-wide and the canonical
 # already found it.
+#
+# Non-code PRs (doc-only, allowlisted by scripts/ci_noncode_check.py, the
+# same classifier epic-hal uses) skip the Docker build and the full
+# build+test loop in every heavy job, but the prose job always runs: a
+# trailing-whitespace or em-dash violation can live in a .md file too.
 
 on:
   push:
@@ -65,11 +70,29 @@ jobs:
             core: pic18
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # Docs/allowlisted PRs skip the Docker build and full cargo test
+      # loop but still run the cheap always-on lint (the prose job above),
+      # mirroring epic-hal's non-code handling. Anything off the allowlist
+      # (scripts/ci-test.sh, workflow files, code) runs the full gate.
+      - name: Determine non-code
+        id: noncode
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            result="$(python3 scripts/ci_noncode_check.py '${{ github.event.pull_request.base.sha }}')"
+          else
+            result="false"
+          fi
+          echo "non_code=$result" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -77,6 +100,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ci image (cached)
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/build-push-action@v6
         with:
           target: ci
@@ -86,6 +110,7 @@ jobs:
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
       - name: Cache cargo target dir
+        if: steps.noncode.outputs.non_code != 'true'
         uses: actions/cache@v5
         with:
           path: target
@@ -94,12 +119,14 @@ jobs:
             cargo-${{ runner.os }}-${{ github.workflow }}-
 
       - name: Cache cargo home
+        if: steps.noncode.outputs.non_code != 'true'
         uses: actions/cache@v5
         with:
           path: /tmp/cargo-home
           key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Check device TOMLs match DFP (gen-device --check)
+        if: steps.noncode.outputs.non_code != 'true'
         run: |
           echo "Checking device TOMLs against DFP source (skips if DFP not present)..."
           for f in crates/device/devices/*.toml; do
@@ -117,6 +144,7 @@ jobs:
           done
 
       - name: Test every workspace crate
+        if: steps.noncode.outputs.non_code != 'true'
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace \
             -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
@@ -140,10 +168,22 @@ jobs:
           repository: apojomovsky/epic-hal
           path: hal
 
+      - name: Determine non-code
+        id: noncode
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            result="$(python3 scripts/ci_noncode_check.py '${{ github.event.pull_request.base.sha }}')"
+          else
+            result="false"
+          fi
+          echo "non_code=$result" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -151,6 +191,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ci image (cached)
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/build-push-action@v6
         with:
           target: ci
@@ -160,22 +201,26 @@ jobs:
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
       - name: Cache cargo home
+        if: steps.noncode.outputs.non_code != 'true'
         uses: actions/cache@v5
         with:
           path: /tmp/cargo-home
           key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
 
       - name: Build the epic-cc binary
+        if: steps.noncode.outputs.non_code != 'true'
         run: docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home -e CARGO_TARGET_DIR=/workspace/target epic-cc-ci:latest bash -c 'cargo build --release -p driver'
 
       # epic_build.py needs tomllib (python 3.11+); the ci image is 22.04 and
       # ships 3.10, so the script is emitted on the runner and only the compile
       # itself runs in the container.
       - name: Emit the HAL build script
+        if: steps.noncode.outputs.non_code != 'true'
         working-directory: hal
         run: python3 scripts/epic_build.py build --module pic16f88x-hal --mcu 16F887 --toolchain epic-cc --epic-cc /cc/release/epic-cc --build-dir build-sim/pic16f88x-hal
 
       - name: Compile the 887 firmware
+        if: steps.noncode.outputs.non_code != 'true'
         run: |
           docker run --rm -v "$PWD/target:/cc:ro" -v "$PWD/hal:/hal" -w /hal \
             -e EPIC_REPO_ROOT=/hal epic-cc-ci:latest \
@@ -192,10 +237,22 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Determine non-code
+        id: noncode
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            result="$(python3 scripts/ci_noncode_check.py '${{ github.event.pull_request.base.sha }}')"
+          else
+            result="false"
+          fi
+          echo "non_code=$result" >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
@@ -203,6 +260,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build ci image (cached)
+        if: steps.noncode.outputs.non_code != 'true'
         uses: docker/build-push-action@v6
         with:
           target: ci
@@ -212,6 +270,7 @@ jobs:
           cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
 
       - name: Cache cargo target dir
+        if: steps.noncode.outputs.non_code != 'true'
         uses: actions/cache@v5
         with:
           path: target
@@ -221,6 +280,7 @@ jobs:
             cargo-${{ runner.os }}-${{ github.workflow }}-
 
       - name: Cache cargo home
+        if: steps.noncode.outputs.non_code != 'true'
         uses: actions/cache@v5
         with:
           path: /tmp/cargo-home
