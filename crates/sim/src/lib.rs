@@ -728,9 +728,17 @@ impl Pic14e {
     fn pop_return(&mut self) -> u16 {
         self.stack.pop().unwrap_or(0)
     }
+    fn set_dc(&mut self, c: bool) {
+        if c {
+            self.ram[3] |= 0b010;
+        } else {
+            self.ram[3] &= !0b010;
+        }
+    }
     fn add_flags(&mut self, a: u8, b: u8, r: u8) {
         self.set_z(r);
         self.set_c((a as u16 + b as u16) > 0xFF);
+        self.set_dc(((a & 0x0F) as u16 + (b & 0x0F) as u16) > 0x0F);
     }
 
     fn exec_byte(&mut self, pc: u16, word: u16) -> u16 {
@@ -855,6 +863,7 @@ impl Pic14e {
                 let r = v.wrapping_sub(self.w);
                 self.set_z(r);
                 self.set_c(v >= self.w);
+                self.set_dc((v & 0x0F) >= (self.w & 0x0F));
                 self.write_d(d, f, r);
             }
             0x09 => {
@@ -981,15 +990,21 @@ impl Pic14e {
                         let r = self.w.wrapping_add(v).wrapping_add(cin);
                         self.set_z(r);
                         self.set_c((self.w as u16 + v as u16 + cin as u16) > 0xFF);
+                        self.set_dc(
+                            ((self.w & 0x0F) as u16 + (v & 0x0F) as u16 + cin as u16) > 0x0F,
+                        );
                         self.write_d(d, f, r);
                     }
                     0x3B => {
-                        // SUBWFB: f - W - !C.
+                        // SUBWFB: f - W - (1 - C); C = 1 when no borrow
+                        // (f >= W + (1-C)), the SUBWF polarity.
                         let v = self.read_f(f);
                         let cin = (self.ram[3] & 0b001 != 0) as u8;
-                        let r = v.wrapping_sub(self.w).wrapping_sub(1 - cin);
+                        let bor = 1 - cin;
+                        let r = v.wrapping_sub(self.w).wrapping_sub(bor);
                         self.set_z(r);
-                        self.set_c(v >= self.w.wrapping_add(1 - cin));
+                        self.set_c(v >= self.w.wrapping_add(bor));
+                        self.set_dc((v & 0x0F) >= (self.w & 0x0F).wrapping_add(bor));
                         self.write_d(d, f, r);
                     }
                     0x37 => {
@@ -1090,6 +1105,7 @@ impl Pic14e {
                 let r = k.wrapping_sub(self.w);
                 self.set_z(r);
                 self.set_c(k >= self.w);
+                self.set_dc((k & 0x0F) >= (self.w & 0x0F));
                 self.w = r;
             }
             0x0..=0x3 => self.w = k, // MOVLW
