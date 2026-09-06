@@ -5066,6 +5066,214 @@ fn banked_growth_within_page_passes() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #207: count `__start`'s RAM-const init words in the page-0 base.
+//
+// The packer modeled page 0 after a 5-word header, but `__start` also
+// carries the init copy loop (2 words per byte). Every function lands
+// `init_words` later than modeled; a tight tail then straddles a page
+// boundary from an unrelated change. Count the words in the base.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn page_packing_counts_start_init_words() {
+    // 10 const bytes in RAM = 20 init words: the true page-0 base is 25,
+    // not 5. main (2006 words) + helper (31) = 2037: modeled helper ends
+    // at 0x7FA (fits page 0), but really spans 0x7EF-0x80D (straddles).
+    // With the init words counted, helper is anchored into page 1 with
+    // `.org 0x800` instead.
+    let m = module_with_globals(
+        &format!(
+            "global in i8\nglobal out i8\nconst c i8\n\
+             fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %b = add i8 %1, 0\n{}    store i8 %b @out\n    ret void\n\
+             fn helper(void) ()\n  block entry:\n{}    ret void\n",
+            pad_body(666),
+            pad_body(10)
+        ),
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "c".into(),
+                ty: ir::Ty::I8,
+                is_const: true,
+                size: 10,
+                bytes: vec![0x41; 10],
+                addr: None,
+                refs: Vec::new(),
+            },
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("c", 0x40),
+        ("main::1", 0x25),
+        ("main::b", 0x26),
+        ("main::a", 0x27),
+        ("helper::a", 0x30),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    // main sits after the 1-word reset goto plus the 24-word `__start`
+    // (4 body words + 20 init words): the packer counted the init.
+    assert_eq!(
+        label_addr(&asm, "main"),
+        25,
+        "main must start after goto + __start + init:\n{asm}"
+    );
+    // helper does not fit page 0's real tail and is anchored to page 1.
+    assert_eq!(
+        label_addr(&asm, "helper"),
+        0x800,
+        "helper must be packed into page 1:\n{asm}"
+    );
+    let banked = banking::assign_banks(&PIC16F877A, &asm);
+    // No panic: the anchored layout is page-fit.
+    verify_page_fit(&m, &banked);
+    // The banked program really runs: out = in + 0 = in.
+    assert_eq!(
+        sim_run_asm(&banked, &[(0x20, 7)], 0x21),
+        7,
+        "banked program must run:\n{banked}"
+    );
+}
+
+// Issue #207, ISR variant: the `page_next[0]` base after the ISR must
+// count the `__start` init loop too, or functions after `__start` are
+// modeled earlier than they land and a tight tail straddles.
+#[test]
+fn page_packing_counts_start_init_words_isr() {
+    // 10 const bytes in RAM = 20 init words. main + helper are sized so
+    // the modeled fit passes but the real layout straddles; with the init
+    // counted, helper is anchored into page 1 with `.org 0x800`.
+    let m = module_with_globals(
+        &format!(
+            "global in i8\nglobal out i8\nconst c i8\n\
+             fn isr(void) [isr] ()\n  block entry:\n    %v = load i8 @in\n    store i8 %v @out\n    ret void\n\
+             fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %b = add i8 %1, 0\n{}    store i8 %b @out\n    ret void\n\
+             fn helper(void) ()\n  block entry:\n{}    ret void\n",
+            pad_body(648),
+            pad_body(10)
+        ),
+        vec![
+            ir::Global {
+                name: "in".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "out".into(),
+                ty: ir::Ty::I8,
+                is_const: false,
+                size: 1,
+                bytes: vec![0],
+                addr: None,
+                refs: Vec::new(),
+            },
+            ir::Global {
+                name: "c".into(),
+                ty: ir::Ty::I8,
+                is_const: true,
+                size: 10,
+                bytes: vec![0x41; 10],
+                addr: None,
+                refs: Vec::new(),
+            },
+        ],
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("c", 0x40),
+        ("isr::v", 0x28),
+        ("main::1", 0x25),
+        ("main::b", 0x26),
+        ("main::a", 0x27),
+        ("helper::a", 0x30),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    // helper does not fit page 0's real tail and is anchored to page 1.
+    assert_eq!(
+        label_addr(&asm, "helper"),
+        0x800,
+        "helper must be packed into page 1:\n{asm}"
+    );
+    let banked = banking::assign_banks(&PIC16F877A, &asm);
+    // No panic: the anchored layout is page-fit.
+    verify_page_fit(&m, &banked);
+}
+
+// Issue #207, module-asm variant: hand-written module asm rides before
+// `__start` in the final text, so the packer's page-0 base must count its
+// words too, or the same modeled-earlier straddle follows.
+#[test]
+fn page_packing_counts_module_asm_words() {
+    // 20 module-asm words: the true page-0 base is 25, not 5. main (2006
+    // words) + helper (31) = 2037: modeled helper ends at 0x7FA (fits),
+    // but really spans 0x7EF-0x80D (straddles). With the words counted,
+    // helper is anchored into page 1 with `.org 0x800`.
+    let m = parse(&format!(
+        "global in i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %b = add i8 %1, 0\n{}    store i8 %b @out\n    ret void\n\
+         fn helper(void) ()\n  block entry:\n{}    ret void\n",
+        pad_body(666),
+        pad_body(10)
+    ));
+    let mut m = m;
+    m.module_asm = vec!["    NOP\n".repeat(20)];
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::b", 0x26),
+        ("main::a", 0x27),
+        ("helper::a", 0x30),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    // main sits after the 1-word reset goto, the 20 module-asm words, and
+    // the 4-word `__start`: the packer counted the module asm.
+    assert_eq!(
+        label_addr(&asm, "main"),
+        25,
+        "main must start after goto + module asm + __start:\n{asm}"
+    );
+    // helper does not fit page 0's real tail and is anchored to page 1.
+    assert_eq!(
+        label_addr(&asm, "helper"),
+        0x800,
+        "helper must be packed into page 1:\n{asm}"
+    );
+    let banked = banking::assign_banks(&PIC16F877A, &asm);
+    // No panic: the anchored layout is page-fit.
+    verify_page_fit(&m, &banked);
+    // The banked program really runs: out = in + 0 = in.
+    assert_eq!(
+        sim_run_asm(&banked, &[(0x20, 7)], 0x21),
+        7,
+        "banked program must run:\n{banked}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Issue #12: bin packing over measured function sizes.
 //
 // The greedy next-fit pads to a new page whenever the next function does
