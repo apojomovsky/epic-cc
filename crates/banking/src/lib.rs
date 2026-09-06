@@ -78,18 +78,26 @@ pub const SKIP_OPS: [&str; 4] = ["BTFSC", "BTFSS", "INCFSZ", "DECFSZ"];
 /// The STATUS register's address (the PIC16F877A's register 3).
 const STATUS_ADDR: u16 = 0x03;
 
-/// A bank-select op's effect on the RP bits, or `None` when the line is not
-/// a bank-select op. Recognized forms (issue #13 item 3):
-/// - `BCF/BSF STATUS, 5/6` — the comma attached to either token;
-/// - `BCF/BSF 0x03, 5/6` — STATUS by its register address;
+/// A bank-select op's effect on the tracked bank, or `None` when the line
+/// is not a bank-select op. Recognized forms (issue #13 item 3):
+/// - `BCF/BSF STATUS, 5/6` — the comma attached to either token
+///   (classic PIC14: RP0 = bit 5, RP1 = bit 6);
+/// - `BCF/BSF 0x03, 5/6` — STATUS by its register address (classic);
 /// - `MOVWF STATUS` / `MOVWF 0x03` — writes all of STATUS from W: the RP
-///   bits become UNKNOWABLE (the `Some(None)` case).
-/// The bit operand is matched by its numeric value (5 = RP0, 6 = RP1), so
-/// `RP0`/`RP1` symbol forms would need the equ table — the isel output
-/// always uses the numeric forms, and hand-written asm in the fixtures does
-/// too. `pub`: `crates/schedule` (ADR-027) reuses this exact recognizer so
-/// its own bank-select detection never drifts from banking's.
-pub fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
+///   bits become UNKNOWABLE (the `Some(None)` case, classic only);
+/// - `MOVLB k` — PIC14E loads the whole bank into the dedicated BSR
+///   register in one instruction (DS41364E Table 29-3 = `00 0000 001k
+///   kkkk`, 5-bit literal addressing all 32 banks).
+/// Classic PIC14 and PIC14E diverge in *which* forms are bank select ops:
+/// PIC14E's STATUS bits 5-7 are unimplemented (read as 0) and the bank
+/// lives in BSR, so `BCF/BSF STATUS, 5/6` are inert on PIC14E (not bank
+/// ops at all) and `MOVWF STATUS` no longer writes the bank a `MOVLB`
+/// does. The bit operand is matched by its numeric value, so `RP0`/`RP1`
+/// symbol forms would need the equ table — the isel output always uses
+/// the numeric forms, and hand-written asm in the fixtures does too.
+/// `pub`: `crates/schedule` (ADR-027) reuses this exact recognizer so its
+/// own bank-select detection never drifts from banking's.
+pub fn bank_op_effect(device: &Device, mne: &str, toks: &[&str]) -> Option<Option<u8>> {
     // The comma may be attached to the register token (`STATUS,5`) or
     // separate (`STATUS, 5`); both are the same instruction.
     let (reg, bit) = match toks.get(2) {
@@ -109,23 +117,40 @@ pub fn bank_op_effect(mne: &str, toks: &[&str]) -> Option<Option<u8>> {
             }
         }
     };
-    let is_status = reg == "STATUS"
-        || reg
-            .strip_prefix("0x")
-            .and_then(|h| u16::from_str_radix(h, 16).ok())
-            == Some(STATUS_ADDR);
-    if mne == "MOVWF" && is_status {
-        return Some(None); // all of STATUS written from W: bank unknowable
-    }
-    if (mne == "BCF" || mne == "BSF") && is_status {
-        let on = mne == "BSF";
-        match bit {
-            "5" => return Some(Some(if on { 1 } else { 0 })),
-            "6" => return Some(Some(if on { 2 } else { 0 })),
-            _ => return None, // a STATUS bit that is not an RP bit
+    if device.core == device::Core::Pic14e {
+        // PIC14E: the bank is the BSR register, loaded by `MOVLB k`. STATUS
+        // bits 5-7 are unimplemented, so the classic RP-bit forms and
+        // `MOVWF STATUS` are not bank ops on this core.
+        if mne == "MOVLB" {
+            let k = toks
+                .get(1)
+                .copied()
+                .unwrap_or("")
+                .trim_end_matches([',', ';', ')']);
+            let v = u32::from_str_radix(k.strip_prefix("0x").unwrap_or(k), 16).unwrap_or(0);
+            Some(Some(v.min(0x1F) as u8))
+        } else {
+            None
         }
+    } else {
+        let is_status = reg == "STATUS"
+            || reg
+                .strip_prefix("0x")
+                .and_then(|h| u16::from_str_radix(h, 16).ok())
+                == Some(STATUS_ADDR);
+        if mne == "MOVWF" && is_status {
+            return Some(None); // all of STATUS written from W: bank unknowable
+        }
+        if (mne == "BCF" || mne == "BSF") && is_status {
+            let on = mne == "BSF";
+            match bit {
+                "5" => return Some(Some(if on { 1 } else { 0 })),
+                "6" => return Some(Some(if on { 2 } else { 0 })),
+                _ => return None, // a STATUS bit that is not an RP bit
+            }
+        }
+        None
     }
-    None
 }
 
 /// The bank a file-register operand selects, or `None` when the operand is
@@ -149,16 +174,19 @@ pub fn operand_bank(device: &Device, mne: &str, toks: &[&str]) -> Option<u8> {
 // ---------------------------------------------------------------------------
 
 /// A set of possible banks (bit `i` set = bank `i` possible). The join of
-/// two sets is the bitwise OR; `0x0F` (all four banks) is the UNKNOWN set.
-/// A function's exit bank is provable iff the joined set of every path's
-/// exit is a single bank.
+/// two sets is the bitwise OR; `0xFFFF_FFFF` (all 32 banks) is the UNKNOWN
+/// set. A function's exit bank is provable iff the joined set of every
+/// path's exit is a single bank. Classic PIC14 has four banks, PIC14E
+/// thirty-two (DS41364E section 3.2); the same `u32` mask covers both on
+/// the device's `ram_banks` enumerate index, and a UNKNOWN superset is
+/// conservatively correct on either core.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct BankSet(u8);
+struct BankSet(u32);
 
 impl BankSet {
-    const UNKNOWN: BankSet = BankSet(0x0F);
+    const UNKNOWN: BankSet = BankSet(0xFFFF_FFFF);
     fn single(b: u8) -> BankSet {
-        BankSet(1 << b)
+        BankSet(1u32 << b)
     }
     fn join(self, o: BankSet) -> BankSet {
         BankSet(self.0 | o.0)
@@ -358,7 +386,7 @@ fn walk_region(
             work.push((j, banks));
             continue;
         }
-        if let Some(effect) = bank_op_effect(mne, &toks) {
+        if let Some(effect) = bank_op_effect(device, mne, &toks) {
             let nb = match effect {
                 Some(b) => BankSet::single(b),
                 None => BankSet::UNKNOWN,
@@ -397,10 +425,10 @@ fn is_bank0_only(device: &Device, asm: &str) -> bool {
         let Some(mne) = toks.first().copied() else {
             continue;
         };
-        // Any bank-select op (BCF/BSF STATUS by name or address, MOVWF
-        // STATUS) touches the bank bits: the pass cannot prove the bank
-        // stays 0 at every label/CALL.
-        if bank_op_effect(mne, &toks).is_some() {
+        // Any bank-select op (BCF/BSF STATUS by name or address on PIC14,
+        // MOVLB k on PIC14E, MOVWF STATUS on PIC14) touches the bank: the
+        // pass cannot prove the bank stays 0 at every label/CALL.
+        if bank_op_effect(device, mne, &toks).is_some() {
             return false;
         }
         // Directives (`org`, `.align`, `.table`, `end`, ...) take
@@ -520,8 +548,7 @@ pub fn assign_banks_with_locs(
     let mut out = String::new();
     let mut out_locs: Vec<Option<SrcLoc>> = Vec::new();
     let mut known = true; // false = the tracked bank is unknown (entered at a branch target)
-    let mut rp0 = false; // STATUS, bit 5
-    let mut rp1 = false; // STATUS, bit 6
+    let mut cur_bank: u8 = 0; // the tracked bank (RP0|(RP1<<1) on classic PIC14, BSR on PIC14E)
     let mut in_asm = false;
     let locs = locs.to_vec();
     let mut li = 0usize;
@@ -575,8 +602,7 @@ pub fn assign_banks_with_locs(
             match label_bank.get(name) {
                 Some(bs) if bs.is_single() => {
                     known = true;
-                    rp0 = bs.single_bank() & 1 == 1;
-                    rp1 = bs.single_bank() & 2 == 2;
+                    cur_bank = bs.single_bank();
                 }
                 _ => {
                     // In a bank-0-only program the bank provably stays 0,
@@ -605,7 +631,7 @@ pub fn assign_banks_with_locs(
                 known = true;
             } else if let Some(target) = toks.get(1) {
                 let callee = target.trim_end_matches([',', ';', ')']);
-                let cur = BankSet::single(u8::from(rp0) | (u8::from(rp1) << 1));
+                let cur = BankSet::single(cur_bank);
                 let eb = func_exit_bank(
                     device,
                     callee,
@@ -617,8 +643,7 @@ pub fn assign_banks_with_locs(
                 );
                 if eb.is_single() {
                     known = true;
-                    rp0 = eb.single_bank() & 1 == 1;
-                    rp1 = eb.single_bank() & 2 == 2;
+                    cur_bank = eb.single_bank();
                 } else {
                     known = false;
                 }
@@ -640,15 +665,14 @@ pub fn assign_banks_with_locs(
             continue;
         }
 
-        // A bank-select op (BCF/BSF STATUS by name or address, MOVWF STATUS)
-        // updates the tracked bank. MOVWF STATUS writes all of STATUS from W:
-        // the RP bits become unknowable, so the next banked operand gets a
-        // FULL BANKSEL.
-        if let Some(effect) = bank_op_effect(mne, &toks) {
+        // A bank-select op (BCF/BSF STATUS by name or address on classic
+        // PIC14, MOVLB k on PIC14E) updates the tracked bank. MOVWF STATUS
+        // writes all of STATUS from W on classic PIC14: the RP bits become
+        // unknowable, so the next banked operand gets a FULL BANKSEL.
+        if let Some(effect) = bank_op_effect(device, mne, &toks) {
             match effect {
                 Some(b) => {
-                    rp0 = b & 1 == 1;
-                    rp1 = b & 2 == 2;
+                    cur_bank = b;
                     known = true;
                 }
                 None => known = false,
@@ -671,17 +695,21 @@ pub fn assign_banks_with_locs(
         if let Some(hex) = op.trim_end_matches([',', ';', ')']).strip_prefix("0x") {
             if let Ok(v) = u16::from_str_radix(hex, 16) {
                 if let Some(bank) = device.bank_of(v) {
-                    let cur = u8::from(rp0) | (u8::from(rp1) << 1);
-                    if !known || bank != cur {
+                    if !known || bank != cur_bank {
                         let before = out.len();
-                        emit_banksel(&mut out, &mut rp0, &mut rp1, bank, !known);
-                        // The inserted BANKSEL lines inherit the banked
+                        if device.core == device::Core::Pic14e {
+                            emit_movlb(&mut out, bank);
+                        } else {
+                            emit_banksel(&mut out, &mut cur_bank, bank, !known);
+                        }
+                        // The inserted BANKSEL/MOVLB lines inherit the banked
                         // operand's source location.
                         let n = out.len() - before;
                         for _ in 0..n {
                             out_locs.push(cur_loc.clone());
                         }
                         known = true;
+                        cur_bank = bank;
                     }
                     let rewritten = v & 0x7F;
                     if rewritten != v {
@@ -702,12 +730,27 @@ pub fn assign_banks_with_locs(
     (out, out_locs)
 }
 
-fn emit_banksel(out: &mut String, rp0: &mut bool, rp1: &mut bool, bank: u8, full: bool) {
-    for (bit, cur, target) in [(5, rp0, bank & 1 == 1), (6, rp1, bank & 2 == 2)] {
-        if full || *cur != target {
+fn emit_banksel(out: &mut String, cur_bank: &mut u8, bank: u8, full: bool) {
+    for (bit, mask) in [(5, 1), (6, 2)] {
+        let cur = *cur_bank & mask != 0;
+        let target = bank & mask != 0;
+        if full || cur != target {
             let op = if target { "BSF" } else { "BCF" };
             out.push_str(&format!("    {op} STATUS, {bit}\n"));
-            *cur = target;
+            *cur_bank = if target {
+                *cur_bank | mask
+            } else {
+                *cur_bank & !mask
+            };
         }
     }
+}
+
+/// PIC14E: `MOVLB k` loads the whole 5-bit bank into the dedicated BSR
+/// register in a single instruction (DS41364E Table 29-3 = `00 0000 001k
+/// kkkk`). Unlike classic PIC14's two-`BCF`/`BSF` RP-bit dance, it always
+/// fully establishes the bank, so `full` is irrelevant and the tracked
+/// bank simply becomes `k`.
+fn emit_movlb(out: &mut String, bank: u8) {
+    out.push_str(&format!("    MOVLB 0x{bank:02X}\n"));
 }
