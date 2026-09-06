@@ -95,9 +95,11 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
 /// constants (crates/isel/src/lib.rs, crates/isel-pic18/src/lib.rs).
 pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
     match device.core {
-        device::Core::Pic14 => {
+        device::Core::Pic14 | device::Core::Pic14e => {
             let base = 1 + 4; // scratch + retval
             if has_isr {
+                // The ISR save area (W/STATUS/PCLATH/FSR/retval x4/scratch
+                // = 9 bytes) sits right after the retval region.
                 base + 9
             } else {
                 base
@@ -111,20 +113,18 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
                 base
             }
         }
-        // The driver exits on pic14e before the report runs.
-        device::Core::Pic14e => unreachable!("pic14e has no backend"),
     }
 }
 
-/// The fixed region's total capacity: PIC14 common RAM, PIC18's
+/// The fixed region's total capacity: PIC14/PIC14E common RAM, PIC18's
 /// fixed_retval reservation (the access bank overlaps the GPR banks, so
 /// summing it would double-count the shared window).
 pub fn fixed_total(device: &Device) -> u16 {
     match device.core {
-        device::Core::Pic14 => {
+        device::Core::Pic14 | device::Core::Pic14e => {
             let (lo, hi) = device
                 .common_ram
-                .expect("PIC14 devices have a common-RAM region");
+                .expect("PIC14/PIC14E devices have a common-RAM region");
             hi - lo + 1
         }
         device::Core::Pic18 => {
@@ -133,8 +133,6 @@ pub fn fixed_total(device: &Device) -> u16 {
                 .expect("PIC18 devices have a fixed_retval reservation");
             hi - lo + 1
         }
-        // The driver exits on pic14e before the report runs.
-        device::Core::Pic14e => unreachable!("pic14e has no backend"),
     }
 }
 

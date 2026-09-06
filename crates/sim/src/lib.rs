@@ -663,10 +663,12 @@ impl Pic14e {
     }
 
     /// The physical address of a direct operand: the mirrored core
-    /// registers (0x00-0x0B, DS41364E Table 3-3) are addressable from any
-    /// bank at their bank-0 offset; everything else is paged by BSR.
+    /// registers (0x00-0x0B, DS41364E Table 3-3) and the common RAM block
+    /// (0x70-0x7F, DS41364E section 3.2.4) are addressable from any bank
+    /// at their physical address regardless of BSR; everything else is
+    /// paged by BSR.
     fn direct_addr(&self, f: usize) -> usize {
-        if f <= 0x0B {
+        if f <= 0x0B || (0x70..=0x7F).contains(&f) {
             f
         } else {
             ((self.ram[0x08] as usize & 0x1F) << 7) | f
