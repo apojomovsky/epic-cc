@@ -23,9 +23,11 @@ the closest existing sibling:
   `0x0004`; PIC18 classic mode: two, `0x0008`/`0x0018`).
 - Same instruction set (`Core::Pic14` and `Core::Pic14e` are *not* the
   same core despite the shared "PIC16" datasheet naming: Enhanced
-  Mid-range has its own 49 extra instructions and its own addressing
-  quirks, exactly why `Core::Pic14e` exists purely as a firewall today,
-  see `crates/asm/tests/pic14e_firewall.rs`).
+  Mid-range has its own extra instructions (the shifts, the FSR moves,
+  `BRA`/`BRW`/`CALLW`, ...) and its own BSR-based addressing, exactly
+  why `Core::Pic14e` exists. Its asm encoder and simulator landed in
+  P1; the codegen (`isel-pic14e`) is what P2 adds, and the driver keeps
+  refusing `pic14e` until then).
 
 If any of those don't hold, this is **Path B: a new core**, a design
 effort the size of `docs/29-pic18-port-design.md`, not a device addition.
@@ -33,8 +35,8 @@ Read that doc as the template (ISA/encoding survey, phased plan, a
 verification gate per peripheral-equivalent, ending at a device TOML and
 firewall removal). PIC14E (Enhanced Mid-range) is exactly such a Path B
 port: its design of record is `docs/33-pic14e-port-design.md`, and its
-P0 phase lands the 193x device TOMLs while the `pic14e` firewall stays
-until the backend lands (P1 onward).
+P0 phase landed the 193x device TOMLs; P1 added the asm encoder and sim
+core; the driver firewall stays until the backend lands (P2 onward).
 
 Everything below assumes Path A.
 

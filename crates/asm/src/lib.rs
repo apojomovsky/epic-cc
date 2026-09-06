@@ -7,8 +7,18 @@
 
 use device::Device;
 
-/// Assemble PIC14 assembly source into 14-bit words indexed by word address.
-pub fn assemble(src: &str) -> Vec<u16> {
+/// Pass 1 shared by the PIC14 and PIC14E assemblers: resolves labels,
+/// `org`, `equ`, `.align` and `.table`, skips `list`/`radix`, and stops
+/// at `end`, returning the instruction lines with their word addresses,
+/// the final address (the program size in words), and the symbol table.
+/// Both cores share the same directives and word-addressed layout.
+fn assemble_first_pass(
+    src: &str,
+) -> (
+    Vec<(usize, String)>,
+    std::collections::HashMap<String, usize>,
+    usize,
+) {
     let mut symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut org = 0usize;
     // Pass 1: labels, org, equ; measure size.
@@ -36,7 +46,7 @@ pub fn assemble(src: &str) -> Vec<u16> {
             org = target;
             continue;
         }
-        if let Some(_rest) = line.strip_prefix("end") {
+        if line.strip_prefix("end").is_some() {
             break;
         }
         // Handle `label: instruction` on one line (e.g. `my_label: nop` from module asm).
@@ -106,6 +116,12 @@ pub fn assemble(src: &str) -> Vec<u16> {
         lines.push((org, line.to_string()));
         org += 1;
     }
+    (lines, symbols, org)
+}
+
+/// Assemble PIC14 assembly source into 14-bit words indexed by word address.
+pub fn assemble(src: &str) -> Vec<u16> {
+    let (lines, symbols, org) = assemble_first_pass(src);
     // Pass 2: encode.
     let mut out = vec![0u16; org];
     for (addr, line) in &lines {
@@ -597,7 +613,7 @@ pub fn assemble_words(device: &Device, src: &str) -> Vec<u16> {
     let words = match device.core {
         device::Core::Pic14 => assemble(src),
         device::Core::Pic18 => assemble_pic18(src),
-        device::Core::Pic14e => panic!("asm: pic14e core not yet implemented for {}", device.name),
+        device::Core::Pic14e => assemble_pic14e(src),
     };
     assert!(
         words.len() as u32 <= device.flash_words,
@@ -755,6 +771,149 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         "GOTO" => 0x2800 | (sym.get(op).copied().unwrap_or_else(|| parse_num(op)) as u16 & 0x7FF),
         "CALL" => 0x2000 | (sym.get(op).copied().unwrap_or_else(|| parse_num(op)) as u16 & 0x7FF),
         other => panic!("asm: unsupported mnemonic {other}"),
+    }
+}
+
+/// Assemble PIC14E (Enhanced Mid-range) assembly source into 14-bit words
+/// indexed by word address. Two-pass like `assemble`: the shared pass 1
+/// resolves labels/`org`/`equ`/directives; pass 2 encodes the extended
+/// instruction set. The classic opcodes are bit-identical on this core
+/// (DS41364E Table 29-3), so `encode_pic14e` encodes only the genuinely new
+/// mnemonics and falls through to `encode` for the rest. Every new
+/// encoding is confirmed byte-for-byte against `gpasm -p 16f1937` 1.5.2
+/// (2026-09-06), including the `BRA` offset math (the operand is the
+/// absolute target; the assembled literal is `target - (pc + 1)`, masked
+/// into the signed 9-bit field, matching the PIC18 relative branches).
+pub fn assemble_pic14e(src: &str) -> Vec<u16> {
+    let (lines, symbols, org) = assemble_first_pass(src);
+    let mut out = vec![0u16; org];
+    for (addr, line) in &lines {
+        out[*addr] = encode_pic14e(*addr, line, &symbols);
+    }
+    out
+}
+
+/// Encode one PIC14E instruction line to one 14-bit word. `addr` is the
+/// instruction's own word address, needed for the `BRA` relative offset.
+/// New mnemonics (DS41364E Table 29-3) encode here; the classic ones fall
+/// through to `encode`.
+fn encode_pic14e(addr: usize, line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let mne = parts[0].to_ascii_uppercase();
+    let op = parts.get(1).copied().unwrap_or("");
+    let f = |s: &str| -> u16 {
+        let t = s.trim_end_matches(',');
+        let v = match sym.get(t) {
+            Some(&v) => v,
+            None => parse_num(t),
+        };
+        assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
+        v as u16 & 0x7F
+    };
+    // Destination bit for the two-operand file ops (`f, W` / `f, F`): W = 0,
+    // F = 1. An absent destination defaults to F (d = 1), matching
+    // gpasm/MPASM's documented default for the byte-oriented ops
+    // ("Default is d = 1", MPASM User's Guide); confirmed against
+    // `gpasm -p 16f1937` 1.5.2 (2026-09-06): `ASRF 0x20` assembles to
+    // 0x37A0. The classic `encode` defaults to W, which P1 does not touch.
+    let d = match parts
+        .get(2)
+        .map(|s| s.trim().to_ascii_uppercase())
+        .as_deref()
+    {
+        Some("F") => 1,
+        Some("W") => 0,
+        _ => 1,
+    };
+    // `FSRn` operand -> n bit. Every FSR instruction names the register as
+    // `FSR0`/`FSR1`, either first (`ADDFSR FSR0, k`) or inside the indexed/
+    // modifier syntax (`MOVIW 3[FSR1]`, `MOVIW FSR0++`).
+    let fsr_n = |s: &str| -> u16 {
+        match s {
+            s if s.contains("FSR0") => 0,
+            s if s.contains("FSR1") => 1,
+            other => panic!("asm: {mne} needs FSR0 or FSR1, got {other}"),
+        }
+    };
+    match mne.as_str() {
+        "MOVLB" => 0x0020 | (parse_num(op) as u16 & 0x1F),
+        "MOVLP" => 0x3180 | (parse_num(op) as u16 & 0x7F),
+        "BRA" => {
+            // The literal is the signed 9-bit offset the hardware adds to
+            // PC+1 (DS41364E section 3.3.4): `target - (pc + 1)`, wrapped
+            // into the field. gpasm's operand is the absolute target
+            // address, same as the label form (confirmed against
+            // `gpasm -p 16f1937` 1.5.2: `BRA here` at word 5 with `here`
+            // at word 7 assembles to 0x3201).
+            let target = match sym.get(op) {
+                Some(&v) => v as i64,
+                None => {
+                    let (neg, rest) = match op.strip_prefix('-') {
+                        Some(r) => (true, r),
+                        None => (false, op),
+                    };
+                    let v = parse_num(rest) as i64;
+                    if neg {
+                        -v
+                    } else {
+                        v
+                    }
+                }
+            };
+            let off = (target - (addr as i64 + 1)) & 0x1FF;
+            0x3200 | off as u16
+        }
+        "BRW" => 0x000B,
+        "CALLW" => 0x000A,
+        "ADDFSR" => {
+            let n = fsr_n(parts.get(1).copied().unwrap_or(""));
+            let ktxt = parts.get(2).copied().unwrap_or("");
+            let k = match ktxt.strip_prefix('-') {
+                Some(r) => -(parse_num(r) as i64),
+                None => parse_num(ktxt) as i64,
+            };
+            0x3100 | (n << 6) | ((k & 0x3F) as u16)
+        }
+        "MOVIW" | "MOVWI" => {
+            let full = parts[1..].join(" ");
+            let n = fsr_n(&full);
+            if full.contains('[') {
+                // Indexed: MOVIW = 11 1111 0nkk kkkk, MOVWI = 11 1111 1nkk,
+                // signed 6-bit k.
+                let ktxt = full.split('[').next().unwrap_or("").trim();
+                let k = match ktxt.strip_prefix('-') {
+                    Some(r) => -(parse_num(r) as i64),
+                    None => parse_num(ktxt) as i64,
+                };
+                let base = if mne == "MOVIW" { 0x3F00 } else { 0x3F80 };
+                base | (n << 6) | ((k & 0x3F) as u16)
+            } else {
+                // Modifier forms: ++FSRn = 00, --FSRn = 01, FSRn++ = 10,
+                // FSRn-- = 11; MOVIW = 00 0000 0001 0nmm, MOVWI = ... 1nmm.
+                let mm = if full.starts_with("++") {
+                    0
+                } else if full.starts_with("--") {
+                    1
+                } else if full.ends_with("++") {
+                    2
+                } else {
+                    3
+                };
+                let base = if mne == "MOVIW" { 0x0010 } else { 0x0018 };
+                base | (n << 2) | mm
+            }
+        }
+        "OPTION" => 0x0062,
+        "TRIS" => 0x0060 | f(op),
+        "CLRW" => 0x0103,
+        "DECF" => 0x0300 | (d << 7) | f(op),
+        "ASRF" => 0x3700 | (d << 7) | f(op),
+        "LSLF" => 0x3500 | (d << 7) | f(op),
+        "LSRF" => 0x3600 | (d << 7) | f(op),
+        "ADDWFC" => 0x3D00 | (d << 7) | f(op),
+        "SUBWFB" => 0x3B00 | (d << 7) | f(op),
+        "RESET" => 0x0001,
+        _ => encode(line, sym),
     }
 }
 

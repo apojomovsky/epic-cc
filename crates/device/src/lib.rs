@@ -72,6 +72,15 @@ pub struct SfrField {
 /// parts (877A, 887) share this map; TMR0 0x01 is deliberately absent
 /// (OPTION_REG occupies its slot in banks 1/3).
 const MIRRORED_SFRS: &[u16] = &[0x00, 0x02, 0x03, 0x04, 0x0A, 0x0B];
+
+/// PIC14E's mirrored block, confirmed byte for byte against DS41364E's
+/// memory map (Table 3-3): every bank's first 12 bytes are `INDF0, INDF1,
+/// PCL, STATUS, FSR0L, FSR0H, FSR1L, FSR1H, BSR, WREG, PCLATH, INTCON`.
+/// The design (docs/33 D-1) names this as the P1 `MIRRORED_SFRS` growth:
+/// classic PIC14's six-register subset is wrong for the Enhanced core.
+const MIRRORED_SFRS_PIC14E: &[u16] = &[
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
+];
 include!(concat!(env!("OUT_DIR"), "/devices.rs"));
 
 /// Resolve a device by any spelling the toolchain ecosystem uses.
@@ -137,11 +146,16 @@ impl Device {
             }
         }
         if addr < self.gpr_start() {
-            // SFR range, below the first GPR bank. Only the six core
-            // registers are mirrored into every bank; any other bank-0 SFR
-            // (PORTA 0x05, TMR0 0x01, ...) exists solely in bank 0, so it
-            // needs RP1:RP0 = 0.
-            return if MIRRORED_SFRS.contains(&addr) {
+            // SFR range, below the first GPR bank. The mirrored core
+            // register block differs per core (classic PIC14's six registers
+            // vs PIC14E's full 0x00-0x0B, confirmed against DS41364E Table
+            // 3-3); any other bank-0 SFR (PORTA 0x05, TMR0 0x01, ...) exists
+            // solely in bank 0, so it needs RP1:RP0 = 0.
+            let mirrored = match self.core {
+                Core::Pic14e => MIRRORED_SFRS_PIC14E,
+                _ => MIRRORED_SFRS,
+            };
+            return if mirrored.contains(&addr) {
                 None
             } else {
                 Some(0)

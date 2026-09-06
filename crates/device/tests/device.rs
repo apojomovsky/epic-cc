@@ -66,6 +66,25 @@ fn bank_of_panics_on_a_common_ram_alias() {
 }
 
 #[test]
+fn pic14e_mirrors_the_full_core_register_block() {
+    // DS41364E Table 3-3 (and the memory maps in Table 3-5/3-8, which the
+    // 1937's 32 banks repeat): every bank's first 12 bytes are INDF0,
+    // INDF1, PCL, STATUS, FSR0L, FSR0H, FSR1L, FSR1H, BSR, WREG, PCLATH,
+    // INTCON, addressable without a bank switch. Every other bank-0 SFR is
+    // not mirrored (PORTA 0x0C exists solely in bank 0).
+    let dev = device::by_name("p16f1937").unwrap();
+    assert_eq!(dev.core, Core::Pic14e);
+    for addr in 0x00..=0x0B {
+        assert_eq!(
+            dev.bank_of(addr),
+            None,
+            "0x{addr:02X} must be bank-independent on pic14e"
+        );
+    }
+    assert_eq!(dev.bank_of(0x0C), Some(0)); // PORTA, not mirrored
+}
+
+#[test]
 fn pic18f4550_profile_has_the_right_core_and_flash_size() {
     assert_eq!(PIC18F4550.core, Core::Pic18);
     assert_eq!(PIC18F4550.name, "p18f4550");

@@ -26,7 +26,7 @@
 
 ## Consequences
 
-* `p16f887.toml` is the first exemplar; `pic14e` (`p16f1937` etc.) is a firewall error until `isel-pic14e` exists. The firewall is at the driver, not at codegen: `build.rs` validates a `pic14e` TOML like any other (same single `0x0004` vector as `pic14`) and the driver refuses the target with `core pic14e which has no backend yet`. Refusing at codegen would make a `pic14e` TOML impossible to keep in tree at all, which is the wrong trade: the data should be reviewable before the backend exists. Each backend stage (`asm`, `fosc`, `fuzz`) panics on the core as a backstop, covered by `crates/asm/tests/pic14e_firewall.rs`.
+* `p16f887.toml` is the first exemplar; `pic14e` (`p16f1937` etc.) stayed a firewall error until `isel-pic14e` exists. The firewall is at the driver, not at codegen: `build.rs` validates a `pic14e` TOML like any other (same single `0x0004` vector as `pic14`) and the driver refuses the target with `core pic14e which has no backend yet`. Refusing at codegen would make a `pic14e` TOML impossible to keep in tree at all, which is the wrong trade: the data should be reviewable before the backend exists. The backend stages carry the same firewall as backstops (`fosc`, `fuzz`; the `asm` one lifted when the P1 encoder landed).
 * DFP/ATDF -> TOML generator is a follow-up (#86); `.atdf` itself is never committed, only the TOML it generates (licence-clean, same posture as config transcription today).
 
 ## Revisit if
