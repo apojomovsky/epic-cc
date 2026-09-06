@@ -89,25 +89,45 @@ fn movlb_and_movlp_load_bsr_and_pclath() {
 
 #[test]
 fn bra_branches_by_its_relative_offset() {
-    // BRA +2 from word 0 skips both NOPs and lands on the MOVLW.
-    let p = run_asm(
-        "    org 0\n\
+    // The 9-bit field is a signed literal the hardware adds to PC+1
+    // (DS41364E section 3.3.4); gpasm's numeric operand is the absolute
+    // target, so the assembler encodes `target - (pc + 1)` into the
+    // field. The pc assertions fail under either a wrong encoder
+    // (field = operand) or a wrong sim reading (offset from pc, not pc+1).
+    // BRA 3 from word 0 (field +2) skips both NOPs and lands on the MOVLW.
+    let p = {
+        let words = assemble_pic14e(
+            "    org 0\n\
              BRA 0x03\n\
              NOP\n\
              NOP\n\
              MOVLW 0x2A\n\
              SLEEP\n",
-    );
+        );
+        let mut p = Pic14e::with_device(&device::PIC16F1937, words);
+        p.run(10_000);
+        p
+    };
+    assert_eq!(p.pc(), 0x04, "BRA 3 must land on the SLEEP's address");
     assert_eq!(p.w(), 0x2A, "BRA must jump over both NOPs");
-    // Negative offset: BRA -2 from word 4 lands on word 3.
+    // Negative target: BRA 0x23 from word 0x24 (field -2) must land on the
+    // SLEEP and halt with the pre-branch W. A wrong sim reading (field
+    // applied from pc, not pc+1) lands back on the GOTO at 0x22 and loops
+    // forever; a wrong encoder (field = operand, not target-(pc+1)) lands
+    // at 0x48. Both fail the pc assertion.
     let p = run_asm(
-        "    org 0x23\n\
+        "    org 0x21\n\
              MOVLW 0x11\n\
-             BRA -2\n\
-             MOVLW 0x22\n\
-             SLEEP\n",
+             GOTO 0x24\n\
+             SLEEP\n\
+             BRA 0x23\n",
     );
-    assert_eq!(p.w(), 0x11, "BRA -2 must land on word 3, not fall through");
+    assert_eq!(
+        p.pc(),
+        0x23,
+        "BRA 0x23 must land on the SLEEP, negative field"
+    );
+    assert_eq!(p.w(), 0x11, "the pre-branch MOVLW's W survives");
 }
 
 #[test]
@@ -321,6 +341,125 @@ fn program_flash_reads_low_byte_and_costs_an_extra_cycle() {
     assert_eq!(p.w(), 0x34, "low 8 bits of flash word 0x0020");
     p.step(); // the flash access's extra cycle
     assert_eq!(p.pc(), 0x05, "extra cycle before SLEEP");
+}
+
+#[test]
+fn addwfc_and_subwfb_set_carry_and_dc() {
+    // ADDWFC with C set: 0xFF + 0x01 + 1 -> 0x01, C = 1, DC = 1 (low
+    // nibble 0xF + 1 + 1).
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0xFF\n\
+             MOVWF 0x20\n\
+             MOVLW 0x01\n\
+             MOVWF 0x03\n\
+             MOVLW 0x01\n\
+             ADDWFC 0x20, F\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.ram()[0x20], 0x01);
+    assert_eq!(p.ram()[0x03] & 0b001, 0b001, "C = carry out of 0xFF+1+1");
+    assert_eq!(
+        p.ram()[0x03] & 0b010,
+        0b010,
+        "DC = carry out of the low nibble"
+    );
+    // SUBWFB with C set (no borrow): 0x2F - 0x11 - 0 -> 0x1E, C = 1 (no
+    // borrow), DC = 1 (no nibble borrow).
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0x2F\n\
+             MOVWF 0x20\n\
+             MOVLW 0x01\n\
+             MOVWF 0x03\n\
+             MOVLW 0x11\n\
+             SUBWFB 0x20, W\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.w(), 0x1E);
+    assert_eq!(p.ram()[0x03] & 0b001, 0b001, "C = 1 when no borrow");
+    assert_eq!(p.ram()[0x03] & 0b010, 0b010, "DC = 1 when no nibble borrow");
+    // SUBWFB with C clear (borrow): 0x05 - 0x07 - 1 -> 0xFD, C = 0, DC = 0.
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0x05\n\
+             MOVWF 0x20\n\
+             MOVLW 0x07\n\
+             SUBWFB 0x20, W\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.w(), 0xFD);
+    assert_eq!(p.ram()[0x03] & 0b001, 0, "C = 0 when a borrow occurs");
+    assert_eq!(
+        p.ram()[0x03] & 0b010,
+        0,
+        "DC = 0 when the low nibble borrows"
+    );
+}
+
+#[test]
+fn classic_opcodes_still_work_on_pic14e() {
+    // The 14-bit PIC14 opcodes must behave identically on the enhanced
+    // core: SUBWF (with DC), ADDLW (with DC), and CALL/RETLW (with the
+    // pre-emption of 0x000A-0x000B by CALLW/BRW verified separately).
+    // SUBWF f, W: f - W; DC = 1 while no nibble borrow (0x2 - 0x2).
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0x12\n\
+             MOVWF 0x20\n\
+             MOVLW 0x02\n\
+             SUBWF 0x20, W\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.w(), 0x10);
+    assert_eq!(p.ram()[0x03] & 0b001, 0b001, "C = 1 while no borrow");
+    assert_eq!(
+        p.ram()[0x03] & 0b010,
+        0b010,
+        "DC = 1 while no nibble borrow"
+    );
+    // 0x12 - 0x03 = 0x0F: the low nibble borrows, DC = 0.
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0x12\n\
+             MOVWF 0x20\n\
+             MOVLW 0x03\n\
+             SUBWF 0x20, W\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.w(), 0x0F);
+    assert_eq!(
+        p.ram()[0x03] & 0b010,
+        0,
+        "DC = 0 when the low nibble borrows"
+    );
+    // ADDLW with DC: 0x0F + 0x01 -> 0x10.
+    let p = run_asm(
+        "    org 0x20\n\
+             MOVLW 0x0F\n\
+             ADDLW 0x01\n\
+             SLEEP\n",
+    );
+    assert_eq!(p.w(), 0x10);
+    assert_eq!(
+        p.ram()[0x03] & 0b010,
+        0b010,
+        "ADDLW sets DC on nibble carry"
+    );
+    // CALL/RETLW round trip through the stack.
+    let p = run_asm(
+        "    org 0x20\n\
+             CALL 0x30\n\
+             SLEEP\n\
+             org 0x30\n\
+             RETLW 0x2A\n",
+    );
+    assert_eq!(p.w(), 0x2A, "RETLW loads W and returns past the CALL");
+    assert_eq!(
+        p.pc(),
+        0x21,
+        "the RETLW returns to the SLEEP after the CALL"
+    );
 }
 
 #[test]
