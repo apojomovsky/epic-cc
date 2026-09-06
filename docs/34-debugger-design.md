@@ -7,11 +7,11 @@
 > (a separate `epic-cc-gdbserver` binary, phase 4) were settled on
 > 2026-09-06. Phase 1 (below) is landed: `epic-cc#238`, merged as `#240`,
 > decided in [`ADR-028`](adr/ADR-028-address-to-line-table.md). Phases 2-4
-> have tickets drafted (scope in `docs/superpowers/plans/` during
-> development, before their PRs) and await review and their own
-> implementation; this document was originally numbered 32 and renumbered
-> to 34 after two unrelated docs claimed that range while it sat as a
-> local draft.
+> are filed as `#257` (typed variable table), `#258` (sim control
+> surface) and `#259` (gdbstub adapter + sidecar), reviewed, and await
+> their own implementation. This document was originally numbered 32 and
+> renumbered to 34 after two unrelated docs claimed that range while it
+> sat as a local draft.
 
 **Goal:** a source-level debugger for programs compiled by epic-cc, comparable
 in spirit to gdb, so a user can set a breakpoint on a C line, step, and print
