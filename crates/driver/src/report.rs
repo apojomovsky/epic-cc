@@ -96,9 +96,11 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
 pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
     match device.core {
         device::Core::Pic14 | device::Core::Pic14e => {
-            let base = 4; // retval + scratch
+            let base = 1 + 4; // scratch + retval
             if has_isr {
-                base + 8
+                // The ISR save area (W/STATUS/PCLATH/FSR/retval x4/scratch
+                // = 9 bytes) sits right after the retval region.
+                base + 9
             } else {
                 base
             }
