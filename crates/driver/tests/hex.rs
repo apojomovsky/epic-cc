@@ -60,7 +60,7 @@ fn pic14e_two_config_words_land_at_0x1000e_and_0x10010() {
 }
 
 #[test]
-fn pic14_single_config_word_keeps_the_historical_splice() {
+fn pic14_config_word_lands_at_0x400e_within_the_program_image() {
     let dev = &PIC16F877A;
     let cb = device::resolve_config(
         &dev.config,

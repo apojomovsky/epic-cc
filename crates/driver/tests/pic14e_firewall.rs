@@ -9,7 +9,7 @@ use std::process::Command;
 fn driver_refuses_pic14e_with_the_firewall_message() {
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
-            "crates/driver/tests/fixtures/add.c",
+            "tests/fixtures/add.c",
             "-o",
             "/tmp/pic14e_firewall.hex",
             "--target",
