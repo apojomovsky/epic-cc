@@ -31,8 +31,10 @@ If any of those don't hold, this is **Path B: a new core**, a design
 effort the size of `docs/29-pic18-port-design.md`, not a device addition.
 Read that doc as the template (ISA/encoding survey, phased plan, a
 verification gate per peripheral-equivalent, ending at a device TOML and
-firewall removal). A PIC14E (Enhanced Mid-range) Path B design doc does
-not exist yet; when it does, it belongs at `docs/33-*`.
+firewall removal). PIC14E (Enhanced Mid-range) is exactly such a Path B
+port: its design of record is `docs/33-pic14e-port-design.md`, and its
+P0 phase lands the 193x device TOMLs while the `pic14e` firewall stays
+until the backend lands (P1 onward).
 
 Everything below assumes Path A.
 

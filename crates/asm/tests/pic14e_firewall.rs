@@ -16,9 +16,9 @@ const PIC14E_STUB: Device = Device {
     stack_depth: 16,
     interrupt_vectors: &[0x0004],
     config: ConfigRegion {
-        base_byte_addr: 0x8007,
-        num_bytes: 2,
-        erased_baseline: &[0xFF, 0xFF],
+        base_byte_addr: 0x1000E,
+        num_bytes: 4,
+        erased_baseline: &[0xFF, 0x3F, 0xFF, 0x3F],
         fields: &[],
     },
     sfrs: &[],
