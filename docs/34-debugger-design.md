@@ -2,12 +2,16 @@
 
 > **Approval status:** front end (gdbstub/RSP) and v1 target scope
 > (simulator only, no hardware) were decided by the user during
-> brainstorming on 2026-09-05. Phase 1 (below) is landed: `epic-cc#238`,
-> merged as `#240`, decided in
-> [`ADR-028`](adr/ADR-028-address-to-line-table.md). Phases 2-4 are still
-> proposal, pending their own tickets and review; this document was
-> originally numbered 32 and renumbered to 34 after two unrelated docs
-> claimed that range while it sat as a local draft.
+> brainstorming on 2026-09-05. V1 type depth (scalars + aggregates,
+> phase 2), core coverage (PIC14 only, phases 3-4) and the shipping form
+> (a separate `epic-cc-gdbserver` binary, phase 4) were settled on
+> 2026-09-06. Phase 1 (below) is landed: `epic-cc#238`, merged as `#240`,
+> decided in [`ADR-028`](adr/ADR-028-address-to-line-table.md). Phases 2-4
+> are filed as `#257` (typed variable table), `#258` (sim control
+> surface) and `#259` (gdbstub adapter + sidecar), reviewed, and await
+> their own implementation. This document was originally numbered 32 and
+> renumbered to 34 after two unrelated docs claimed that range while it
+> sat as a local draft.
 
 **Goal:** a source-level debugger for programs compiled by epic-cc, comparable
 in spirit to gdb, so a user can set a breakpoint on a C line, step, and print
@@ -116,10 +120,16 @@ dependency; the tool Cranelift/wasmtime use for exactly this "non-LLVM
 backend, still needs DWARF" situation) encodes the DWARF; the `object`
 crate writes the ELF container generically. Given every location is
 `DW_OP_addr(constant)` (section 1), the DWARF this project emits is close
-to the simplest valid form the format supports: one compile unit, flat
-`DW_TAG_subprogram`/`DW_TAG_variable` entries, `DW_TAG_base_type` for the
-handful of C primitive types epic-cc supports, and a `.debug_line` program
-built directly from the line table Phase 1 (below) produces.
+to the simplest valid form the format supports: one compile unit, constant
+address locations, no CFI or register-relative expressions. The DIE set is
+not flat base types alone, because v1 types (phase 2) are scalars plus
+aggregates: it must cover `DW_TAG_base_type` and `DW_TAG_enumeration_type`
+for scalars, and `DW_TAG_structure_type`/`DW_TAG_union_type` with
+`DW_TAG_member` + `DW_AT_data_member_location` and
+`DW_TAG_array_type` + `DW_TAG_subrange_type` for aggregates, so gdb
+resolves `print s.member` and `print arr[i]`. The `.debug_line` program
+is built directly from the line table Phase 1 (below) produces. What stays
+minimal is the location dimension, not the DIE-kind coverage.
 
 **Open risk, not yet spiked.** PIC14 is not a gdb-known architecture. The
 spike above used x86-64 specifically to control for that variable. gdb does
@@ -152,22 +162,44 @@ text as a trailing comment, which would have changed the diffable
 `.asm` boundary and broken the gpasm oracle.
 
 **Phase 2: typed variable table.** Extract `DILocalVariable`/`DIType` from
-the same `-g` metadata. Join against `AllocLayout.globals`/`.locals`
-(`crates/alloc`), which already has the address half of this for free.
+the same `-g` metadata (switching the front end from `-gline-tables-only`
+to full `-g`, which also requires irparse to consume and drop clang's
+`#dbg_value`/`#dbg_declare`/`#dbg_assign` debug-record lines, emitted as
+no `Inst`, plus the `, !dbg !N` tails full `-g` adds to global/`define`
+lines). Join against
+`AllocLayout.globals`/`.locals` (`crates/alloc`), which already has the
+address half of this for free, bridged from C names through the debug
+record value operand (phase-2 ticket; the alloc local keys are SSA def
+names, not C identifiers). **V1 type depth (settled 2026-09-06): scalars +
+aggregates** (`char`/`int`/`long`/`enum`, pointers, `struct`/`union` with
+member offsets, `T[N]`); bit-fields, `_Bool` and flexible array members
+are deferred. The in-process type table is phase 4's encoder input; a
+`--var-table <file>` text artifact (mirroring `--line-table`, TYPE is a
+flat debug print) is emitted for human inspection only.
 
 **Phase 3: sim control surface.** `crates/sim` runs to completion or a
 cycle count today; it has no halt/resume/breakpoint state machine. Add:
 run-until-address, register read (`W`, `PC`, `STATUS`, `FSR`, active bank),
 memory read/write, and a step primitive at instruction granularity (line
-stepping rounds up from this in the adapter, not in `sim` itself).
+stepping rounds up from this in the adapter, not in `sim` itself). No
+in-sim breakpoint table (the adapter owns it), and **PIC14 core only for
+v1 (settled 2026-09-06)**, PIC18/PIC14E untouched, per the PIC14-first
+non-goal below. Note: this phase edits `crates/sim`, the same crate pic14e
+P1 (#246) edits, so the two must not be worked simultaneously.
 
 **Phase 4: gdbstub adapter.** New crate implementing `gdbstub::Target` over
 Phase 3's control surface. Consumes Phases 1/2's data to emit the ELF+DWARF
-sidecar (section 3) at build time. Ships as a new binary or driver
-subcommand, e.g. `epic-cc-gdbserver <hex> <sidecar.elf> --port <port>`, used
-as `gdb <sidecar.elf> -ex "target remote :<port>"`. The open risk in
-section 3 (custom architecture target description) needs resolving before
-this phase's design is finalized.
+sidecar (section 3) at build time. Ships as a **separate
+`epic-cc-gdbserver` binary** (settled 2026-09-06; a long-lived network
+service, decoupled from the one-shot compile lifecycle):
+`epic-cc-gdbserver <hex> <sidecar.elf> --port <port>`, used as
+`gdb <sidecar.elf> -ex "target remote :<port>"`. **PIC14 core only for v1.**
+The open risk in section 3 (custom architecture target description) needs
+a dedicated spike before this phase's design is finalized; the phase is
+not implemented until that spike lands. gdb is absent from the dev/ci
+image today, so this phase adds a digest-pinned apt gdb for its acceptance
+sessions (test/CI-time and user-side host dependency; the bundle need not
+carry one).
 
 ## 5. Non-goals for this document
 
