@@ -3,7 +3,7 @@
 **Start here if you are resuming cold.** This is the current-state map; the detailed
 designs and their ADRs are the source of truth.
 
-Last updated: 2026-08-24
+Last updated: 2026-09-06
 
 ---
 
@@ -29,6 +29,16 @@ now contains a complete compiler, not just documentation:
   32-bit `long` with hardware `MULWF` ([ADR-014](adr/ADR-014-pic18-hw-arithmetic-routines.md)),
   soft-float ([ADR-015](adr/ADR-015-pic18-softfloat.md)),
   and a device-threaded differential fuzz gate ([ADR-016](adr/ADR-016-pic18-fuzz-gate.md)).
+- **PIC baseline core (tracking only):** the baseline ISA (PIC10F, PIC12F5xx,
+  PIC16F5x, e.g. PIC10F200, PIC12F508/509, PIC16F54/57/59) is another distinct
+  8-bit core alongside the shipped `pic14` and `pic18` backends: a 12-bit
+  instruction word, a 2-level hardware stack, no interrupts on most parts, and a
+  register-file banking model that differs from both existing cores. Supporting
+  it would need its own `Core::PicBaseline` variant and an `isel-pic-baseline`,
+  the same shape of effort as the PIC14E port (#228). Deliberately not picked up;
+  revisit if a real consumer (a PlatformIO board request, a HAL port) wants one
+  of these parts. Scope is
+  bounded to 8-bit PIC only; dsPIC, PIC24 and PIC32 remain out of scope entirely.
 - **Device registry:** file-per-device TOML under `crates/device/devices/` with
   `build.rs` codegen and a `--target` flag ([ADR-019](adr/ADR-019-pic-variants-device-registry.md)),
   holding `p16f877a`, `p16f887`, `p18f4550` and `p18f2550`. A DFP to TOML generator
