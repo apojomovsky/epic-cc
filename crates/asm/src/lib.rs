@@ -811,14 +811,19 @@ fn encode_pic14e(addr: usize, line: &str, sym: &std::collections::HashMap<String
         v as u16 & 0x7F
     };
     // Destination bit for the two-operand file ops (`f, W` / `f, F`): W = 0,
-    // F = 1. An absent destination defaults to W, matching `encode`.
+    // F = 1. An absent destination defaults to F (d = 1), matching
+    // gpasm/MPASM's documented default for the byte-oriented ops
+    // ("Default is d = 1", MPASM User's Guide); confirmed against
+    // `gpasm -p 16f1937` 1.5.2 (2026-09-06): `ASRF 0x20` assembles to
+    // 0x37A0. The classic `encode` defaults to W, which P1 does not touch.
     let d = match parts
         .get(2)
         .map(|s| s.trim().to_ascii_uppercase())
         .as_deref()
     {
         Some("F") => 1,
-        _ => 0,
+        Some("W") => 0,
+        _ => 1,
     };
     // `FSRn` operand -> n bit. Every FSR instruction names the register as
     // `FSR0`/`FSR1`, either first (`ADDFSR FSR0, k`) or inside the indexed/
