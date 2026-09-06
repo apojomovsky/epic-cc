@@ -131,29 +131,29 @@ fn banked_c_runs_correctly() {
     assert!(p.halted());
 }
 
-/// P2's skip-idiom acceptance (docs/33 section 4): a single `MOVLB` must
-/// not land inside a skip pair. The routine-recipe loops in `banked.c`
-/// (the DECFSZ-driven mul/div recipes) are skip-sensitive: banking must
-/// place the `MOVLB` to switch to an operand's bank *before* the skip
-/// test, never between the skip op and its skipped target. Scan the final
-/// banked text: no `MOVLB` may directly follow a banked operand that the
-/// recursion/loop needs, and no `MOVLB` may sit immediately after a skip
-/// op. Concretely, assert the emitted asm contains `MOVLB` (banking did
-/// run) and that no line between a skip op and its target begins with
-/// `MOVLB`.
+/// P2's skip-idiom acceptance (docs/33 section 4): a routine-recipe-shaped
+/// program whose `__mul_u16` DECFSZ loops are skip-sensitive, compiled for
+/// PIC14E, must neither straddle the routine's bank-switch demand across a
+/// skip pair nor land a `MOVLB` right after a skip op. `banked_routine.c`
+/// (issue #6): its noinline `mul30` pushes `__mul_u16`'s frame into a
+/// non-zero bank, so the banking pass emits `MOVLB`s around the recipe
+/// call; the DECFSZ loops inside the recipe body are the skip-window
+/// hazard docs/33 section 1 names. Assert both (a) the emitted asm DOES
+/// contain `MOVLB` (banking ran for real) and (b) no `MOVLB` is the
+/// immediately-following instruction of any skip op.
 #[test]
-fn skip_idioms_never_land_a_movlb_between_skip_and_target() {
+fn skip_idioms_never_land_a_movlb_inside_a_recipe_skip_pair() {
     let _guard = E2E_LOCK.lock();
-    let ll = {
-        let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-        let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-        let (ll, _) = clang_compile(
-            &clang,
-            &resdir,
-            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/banked.c"),
-        );
-        ll
-    };
+    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
+    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    let (ll, _) = clang_compile(
+        &clang,
+        &resdir,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/banked_routine.c"
+        ),
+    );
     let mut m = irparse::parse_ll(&ll);
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
@@ -168,25 +168,65 @@ fn skip_idioms_never_land_a_movlb_between_skip_and_target() {
     let asm = optimize(&asm);
     assert!(
         asm.lines().any(|l| l.trim().starts_with("MOVLB")),
-        "banked.c must exercise BSR-banked addressing on PIC14E (found no MOVLB)"
+        "banked_routine.c must exercise BSR-banked addressing on PIC14E (found no MOVLB)",
     );
-    // Walk line-by-line; a skip op (BTFSC/BTFSS/INCFSZ/DECFSZ) guards the
-    // next instruction. No MOVLB may be that next instruction (a bank
-    // switch there would be skipped, leaving the following banked operand
-    // in the wrong bank).
+    // The single-GPR-bank routine-frame constraint (issue #6): `__mul_u16`'s
+    // whole frame lives in ONE bank, so no MOVLB belongs inside its
+    // skip-sensitive DECFSZ body. Walk every skip op's immediately-following
+    // instruction: a MOVLB there would be the skip's target and, when the
+    // skip is taken (loop-exit), would be skipped, leaving the subsequent
+    // banked operand in the wrong bank.
     let lines: Vec<&str> = asm.lines().collect();
+    let mut split_pairs = 0;
     for (i, line) in lines.iter().enumerate() {
         let mne = line.trim().split_whitespace().next().unwrap_or("");
         if banking::SKIP_OPS.contains(&mne) {
             if let Some(next) = lines.get(i + 1) {
-                assert!(
-                    !next.trim().starts_with("MOVLB"),
-                    "skip pair must not be broken by a MOVLB:\n  {}:\n    {}\n    {}",
-                    mne,
-                    line.trim(),
-                    next.trim()
-                );
+                if next.trim().starts_with("MOVLB") {
+                    split_pairs += 1;
+                }
             }
         }
     }
+    assert_eq!(
+        split_pairs, 0,
+        "a MOVLB landed inside a skip pair; the recipe frame straddles banks:\n{asm}"
+    );
+    // The single-GPR-bank frame constraint (issue #6, docs/33 section 1):
+    // assert the whole `__mul_u16` frame (params + scratch) lies inside ONE
+    // bank, so no MOVLB was ever needed inside its skip-sensitive body.
+    let scr = *layout
+        .locals
+        .get("__mul_u16::__scr")
+        .expect("__mul_u16::__scr");
+    let a = *layout.locals.get("__mul_u16::a").expect("__mul_u16::a");
+    let b = *layout.locals.get("__mul_u16::b").expect("__mul_u16::b");
+    let all = [a, b, scr];
+    let bank_idx = PIC16F1937
+        .ram_banks
+        .iter()
+        .position(|&(s, e)| a >= s && a <= e)
+        .expect("__mul_u16 params must land in a GPR bank");
+    let (bs, be) = PIC16F1937.ram_banks[bank_idx];
+    for &x in &all {
+        assert!(
+            x >= bs && x <= be,
+            "recipe frame byte 0x{x:03X} is outside bank {bank_idx} (0x{bs:03X}-0x{be:03X}); \
+             the recipe loops are skip-sensitive and a MOVLB would change skip targets"
+        );
+    }
+}
+
+#[test]
+fn banked_routine_c_runs_correctly() {
+    // out = (465 * 7) & 0xFFFF = 3255 = 0x0CB7 (sum 1..30 = 465).
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/banked_routine.c"
+    ));
+    p.run(2_000_000);
+    let out_addr = globals["out"] as usize;
+    assert_eq!(p.ram()[out_addr], 0xB7, "out low byte: 3255 = 0x0CB7");
+    assert_eq!(p.ram()[out_addr + 1], 0x0C, "out high byte: 3255 = 0x0CB7");
+    assert!(p.halted());
 }
