@@ -3,9 +3,11 @@
 //! Chains every milestone-1 stage crate: `irparse` -> `wholeprog` ->
 //! `legalize` -> `callgraph` (depth check vs the device's stack) -> `alloc`
 //! (+ address map) -> `isel` -> `banking` -> `peephole` -> `asm`. From `isel`
-//! onward, the pipeline branches on `device.core`: PIC14 runs
-//! `isel` -> `banking` -> `peephole` -> page-fit verification -> `asm`;
-//! PIC18 runs `isel-pic18` -> `asm` directly (no banking/peephole/paging).
+//! onward, the pipeline branches on `device.core`: PIC14 and PIC14E run
+//! `isel`/`isel-pic14e` -> `schedule` -> `banking` -> `peephole` ->
+//! page-fit verification -> `asm` (banking emits `MOVLB`/`BSR` on PIC14E,
+//! RP-bit `BANKSEL` on classic PIC14); PIC18 runs `isel-pic18` -> `asm`
+//! directly (no banking/peephole/paging).
 //!
 //! Multiple `.c` inputs are each run through clang separately, then merged
 //! with `llvm-link` before `irparse` ever sees them (docs/31 D-7): the
