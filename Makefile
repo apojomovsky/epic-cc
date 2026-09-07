@@ -7,6 +7,12 @@
 #   --user + passwd/group mounts   files written into the workspace stay
 #                                  host-owned (root-owned files break host
 #                                  `rm -rf`)
+#   image UID/GID build args       belt-and-suspenders for the above: the
+#                                  dev image's own default user (used by
+#                                  any docker run that skips --user, e.g.
+#                                  ad hoc debugging) is baked to match the
+#                                  host, so root-owned files can't happen
+#                                  even from a bypass invocation
 #   cargo caches under ~/.cache/   registry + target are persisted across
 #                                  container runs (ephemeral containers
 #                                  would rebuild the whole workspace each
@@ -48,7 +54,7 @@ help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
 
 image: ## Build the dev image (only image you need locally)
-	docker build --target dev -t $(LOCAL_IMAGE) .
+	docker build --target dev --build-arg UID=$$(id -u) --build-arg GID=$$(id -g) -t $(LOCAL_IMAGE) .
 
 shell: image ## Interactive dev shell inside the container
 	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE)
