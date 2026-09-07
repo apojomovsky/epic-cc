@@ -161,37 +161,39 @@ ENV PIC8_CLANG_UNWRAPPED=/opt/clang/bin/clang \
 
 WORKDIR /workspace
 
-# Non-root by default: any invocation that skips the Makefile's --user
-# flag (a hand-typed `docker run`, ad hoc debugging) must not silently
-# write root-owned files into the bind-mounted workspace, since those
-# can't be deleted by the host user without sudo afterward. `make image`
-# passes the host UID/GID as build args so this default matches it
-# transparently; the Makefile's own --user flags remain the primary
-# mechanism on the sanctioned path and make this redundant there.
-# CARGO_TARGET_DIR defaults outside /workspace too, so a bypass
-# invocation that also skips the target-cache mount still can't write
-# build artifacts into the workspace's own target/.
+# Non-root by default: a bypass docker run that skips the Makefile's
+# --user flag must not write root-owned files into the bind-mounted
+# workspace, since those need sudo to delete. make image bakes the
+# host UID/GID as the image's own default user; CARGO_HOME and
+# CARGO_TARGET_DIR default outside /workspace and /usr/local (both
+# root-owned from the build) so a bypass invocation can still run
+# cargo. A host UID/GID of 0 resolves this default to root same as
+# before, hardening only the (overwhelmingly common) non-root case.
 ARG UID=1000
 ARG GID=1000
 RUN (getent group "$GID" >/dev/null || groupadd -g "$GID" epic) \
-    && (getent passwd "$UID" >/dev/null || useradd -m -u "$UID" -g "$GID" -s /bin/bash epic)
-ENV CARGO_TARGET_DIR=/tmp/cargo-target
+    && (getent passwd "$UID" >/dev/null || useradd -m -u "$UID" -g "$GID" -s /bin/bash epic) \
+    && chown "$UID:$GID" /workspace
+ENV CARGO_HOME=/tmp/cargo-home \
+    CARGO_TARGET_DIR=/tmp/cargo-target
 USER $UID:$GID
 
 FROM dev AS ci
 # CI's own docker run calls (.github/workflows/ci.yml) intentionally omit
 # --user and fix ownership afterward with an explicit sudo chown, a
 # pattern that predates and is independent of the dev-stage hardening
-# above, so it stays on root with cargo's normal target-dir default.
+# above, so it stays on root with cargo's normal defaults.
 USER root
-ENV CARGO_TARGET_DIR=target
+ENV CARGO_HOME=/usr/local/cargo \
+    CARGO_TARGET_DIR=target
 # ci-test.sh runs from the mounted workspace; nothing extra to install.
 
 FROM dev AS release
 # COPYs the source into the image instead of bind-mounting it, so it
 # never touches host files regardless of user; stays on root like ci.
 USER root
-ENV CARGO_TARGET_DIR=target
+ENV CARGO_HOME=/usr/local/cargo \
+    CARGO_TARGET_DIR=target
 
 ARG EPIC_CC_VERSION=dev
 COPY . /workspace

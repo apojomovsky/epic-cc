@@ -1,23 +1,11 @@
-# Docker-first dev entry point for epic-cc. The dev image (ci is an empty
-# alias of it, so running in dev IS running in ci) hosts every target:
-# build, test, compile, release bundles, and a dev shell. Nobody needs
-# rustup, clang, or gpasm installed on the host.
+# Docker-first dev entry point for epic-cc. Everything (build, test,
+# compile, release, dev shell) runs inside the dev image; ci is an
+# alias of it. Nobody needs rustup, clang, or gpasm on the host.
 #
-# Container plumbing (why it is the way it is):
-#   --user + passwd/group mounts   files written into the workspace stay
-#                                  host-owned (root-owned files break host
-#                                  `rm -rf`)
-#   image UID/GID build args       belt-and-suspenders for the above: the
-#                                  dev image's own default user (used by
-#                                  any docker run that skips --user, e.g.
-#                                  ad hoc debugging) is baked to match the
-#                                  host, so root-owned files can't happen
-#                                  even from a bypass invocation
-#   cargo caches under ~/.cache/   registry + target are persisted across
-#                                  container runs (ephemeral containers
-#                                  would rebuild the whole workspace each
-#                                  time); CARGO_TARGET_DIR points there so
-#                                  the host's own target/ is never touched
+# --user + passwd/group mounts keep files you write host-owned; the
+# image's own default user (UID/GID build args, set by make image)
+# backs that up for any docker run bypassing --user. Cargo caches
+# live under ~/.cache/, so the host's own target/ is never touched.
 
 LOCAL_IMAGE := epic-cc-dev:local
 CACHE_DIR   := $(HOME)/.cache/epic-cc
