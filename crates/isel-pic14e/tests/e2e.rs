@@ -355,17 +355,34 @@ fn span_ptr_c_runtime_pointer_to_straddling_global_uses_linear_base() {
         (0x2000..=0x29AF).contains(&linear_base),
         "big's linear base 0x{linear_base:04X} must be in the linear region"
     );
-    // The asm must materialize the pointer value as the linear base: a
-    // MOVLW of the base's low byte and a MOVLW of its high byte (0x20).
+    // The asm must materialize the pointer value as the linear base at the
+    // `gp` store site: the low byte stored to gp is the linear base's low
+    // byte (0x00) and the high byte is its high byte (0x20). The physical
+    // base 0x{big:02X} would store low 0x{big:02X} / high 0x00 instead, so
+    // this distinguishes the two. The store uses the banked file-register
+    // form (low 7 bits of the physical address, with a preceding MOVLB).
     let lo = (linear_base & 0xFF) as u8;
     let hi = ((linear_base >> 8) & 0xFF) as u8;
+    let gp = globals["gp"];
+    let gp_lo = format!("MOVWF 0x{:02X}", gp & 0x7F);
+    let gp_hi = format!("MOVWF 0x{:02X}", (gp + 1) & 0x7F);
     let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
-    let has_lo = lines.iter().any(|l| *l == format!("MOVLW 0x{lo:02X}"));
-    let has_hi = lines.iter().any(|l| *l == format!("MOVLW 0x{hi:02X}"));
+    // The MOVLW that feeds a given MOVWF is the nearest preceding MOVLW
+    // (a MOVLB may sit between them).
+    let feeding_movlw = |store: &str| {
+        let idx = lines.iter().position(|l| *l == store)?;
+        lines[..idx]
+            .iter()
+            .rev()
+            .find(|l| l.starts_with("MOVLW "))
+            .map(|l| l.to_string())
+    };
+    let lo_ok = feeding_movlw(&gp_lo) == Some(format!("MOVLW 0x{lo:02X}"));
+    let hi_ok = feeding_movlw(&gp_hi) == Some(format!("MOVLW 0x{hi:02X}"));
     assert!(
-        has_lo && has_hi,
-        "span_ptr.c must materialize the pointer value as the linear base \
-         0x{linear_base:04X} (MOVLW 0x{lo:02X} / MOVLW 0x{hi:02X}):\n{asm}"
+        lo_ok && hi_ok,
+        "span_ptr.c must store the linear base 0x{linear_base:04X} to gp \
+         (low 0x{lo:02X} -> {gp_lo}, high 0x{hi:02X} -> {gp_hi}):\n{asm}"
     );
     // And the simulated result must be right: big[0] + big[89] = 0x11 + 0x22.
     p.run(200_000);
