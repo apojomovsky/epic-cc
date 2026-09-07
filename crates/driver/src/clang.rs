@@ -32,6 +32,7 @@ const BASE_ARGS: &[&str] = &[
     "-ffreestanding",
     "-nostdinc",
     "-g",
+    "-ffp-contract=off",
     "-resource-dir",
 ];
 
