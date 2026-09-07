@@ -178,15 +178,16 @@ are deferred. The in-process type table is phase 4's encoder input; a
 `--var-table <file>` text artifact (mirroring `--line-table`, TYPE is a
 flat debug print) is emitted for human inspection only.
 
-**Phase 3: sim control surface.** `crates/sim` runs to completion or a
-cycle count today; it has no halt/resume/breakpoint state machine. Add:
-run-until-address, register read (`W`, `PC`, `STATUS`, `FSR`, active bank),
-memory read/write, and a step primitive at instruction granularity (line
-stepping rounds up from this in the adapter, not in `sim` itself). No
-in-sim breakpoint table (the adapter owns it), and **PIC14 core only for
-v1 (settled 2026-09-06)**, PIC18/PIC14E untouched, per the PIC14-first
-non-goal below. Note: this phase edits `crates/sim`, the same crate pic14e
-P1 (#246) edits, so the two must not be worked simultaneously.
+**Phase 3: sim control surface. Landed** (`epic-cc#258`): `Pic14` grew
+the control surface the adapter drives: run-until-address (`run_until`,
+reached/halted/capped), register read/write (`W`, `PC`, `STATUS`, `FSR`,
+`PCLATH`, `INTCON`, the active bank), banked-resolved `read_mem`/
+`write_mem`, program-flash reads, and the existing instruction-granular
+`step`. No in-sim breakpoint table (the adapter owns it), and **PIC14
+core only for v1 (settled 2026-09-06)**, PIC18/PIC14E untouched, per the
+PIC14-first non-goal below. Note: this phase edits `crates/sim`, the
+same crate pic14e P1 (#246) edits, so the two must not be worked
+simultaneously.
 
 **Phase 4: gdbstub adapter.** New crate implementing `gdbstub::Target` over
 Phase 3's control surface. Consumes Phases 1/2's data to emit the ELF+DWARF
