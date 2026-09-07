@@ -256,28 +256,53 @@ fn banked_routine_c_runs_correctly() {
     assert!(p.halted());
 }
 
-// P3 end-to-end acceptance (docs/33 section 4): pointers, arrays and
+// P3/P4 end-to-end acceptance (docs/33 section 4): pointers, arrays and
 // structs via FSR0/1, plus linear addressing (D-2) for objects that
 // straddle a bank. The fixtures are byte-identical to the PIC18 ones of
 // the same C source (crates/isel-pic18/tests/fixtures/), so the expected
-// values come from the PIC18 e2e tests; `ptr_probe.c` is the RAM-only
-// variant (const-flash reads are P4).
+// values come from the PIC18 e2e tests. `ptr_probe.c` is the original
+// Milestone-5 probe: a runtime RAM pointer (FSR/INDF) AND a const-table
+// read (RETLW), both in one program (P4 restores the const-flash read).
 
 #[test]
 fn ptr_probe_c_runs_correctly() {
-    // in = 0x0035; i = 0x35 & 7 = 5; ram[5] = 0x35; out = ram[5] = 0x35.
+    // in = 1; i = 1 & 3 = 1; ram[1] = table[1] = 20; out = ram[1] = 20.
     let (mut p, globals) = compile(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/ptr_probe.c"
     ));
     let in_addr = globals["in"] as usize;
-    p.ram_mut()[in_addr] = 0x35; // in low byte
+    p.ram_mut()[in_addr] = 0x01; // in low byte
     p.ram_mut()[in_addr + 1] = 0x00; // in high byte
     p.run(200_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
-        0x35,
-        "out == in's low byte read back through the pointer"
+        20,
+        "out == table[1] == 20 read through the pointer"
+    );
+    assert!(p.halted());
+}
+
+/// P4 acceptance (docs/33 section 4, D-5): a 300-byte const (flash) table
+/// read through the two-entry chunked RETLW readers. Mirrors
+/// crates/driver/tests/const_table_e2e.rs: in == 290 (0x0122) -> out =
+/// (0x33 + 0x02 + 0x3C + 0x11) & 0xFF = 0x82, the four reads exercising
+/// chunk-1, chunk-0, chunk-1-last, and chunk-boundary byte offsets. The
+/// 511-byte ceiling the RETLW mechanism imposes stays (D-5).
+#[test]
+fn const_table_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/const_table.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 0x22; // 290 = 0x0122, lo byte
+    p.ram_mut()[in_addr + 1] = 0x01; // hi byte
+    p.run(500_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x82,
+        "out == 0x82 for in == 290 (four boundary reads)"
     );
     assert!(p.halted());
 }

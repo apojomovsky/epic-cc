@@ -1,24 +1,17 @@
-// P3 (PIC18) acceptance: a runtime RAM pointer, read and written through
-// FSR0/INDF0, the pure pointer path, no const-flash involvement.
-//
-// This is PIC14's ptr_probe.c with the `const` table and its read
-// REMOVED: on PIC18 a const-flash read needs TBLRD, which is P4's job
-// (docs/29-pic18-port-design.md §4). See this plan's fixture-scope note
-// for why the two backends' ptr_probe fixtures differ for now. Once P4
-// lands, the ORIGINAL ptr_probe.c (unmodified) becomes a P4 acceptance
-// addition for PIC18 too, and at that point running the same file through
-// both backends is a clean parity check.
-//
-// `in` selects an index into `ram` (masked to 0-7, matching the array
-// size); the value written is `in`'s low byte itself, then read back
-// through the same pointer, so a wrong FSR/INDF sequence shows up as a
-// wrong `out` rather than merely a crash.
+// Milestone-5 pointer/const probe: a runtime RAM pointer (FSR/INDF path) and
+// a const-table read (RETLW path) in one program (docs/11). `volatile`
+// everywhere keeps -O1 from folding the pointer away: the RAM GEP survives as
+// a separate SSA value because the index comes from volatile input and the
+// memory is volatile. `in` is a 16-bit volatile so clang keeps the index mask
+// `& 3` as an i16 `and` (isel lowers i16 and; it has no i8 and). Expected:
+// in = 1 -> ram[1] = table[1] = 20 -> out = 20.
 volatile unsigned short in;
 volatile unsigned char out;
+static const unsigned char table[4] = {10, 20, 30, 40};
 volatile unsigned char ram[8];
 void main(void) {
-    unsigned char i = (unsigned char)(in & 7);
+    unsigned char i = (unsigned char)(in & 3);
     volatile unsigned char *p = ram + i;
-    *p = (unsigned char)in;
+    *p = table[i];
     out = *p;
 }
