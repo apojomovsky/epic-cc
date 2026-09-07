@@ -35,7 +35,7 @@ program.
 | recursion | p16f877a | - | - | - | - | - | - | SDCC-ERR (pic14: invalid combination of short/long) |
 | recursion | p18f4550 | - | - | - | - | - | - | SDCC-WRONG (epic=0x78 sdcc=0x1; SDCC pic14 static-overlay recursion corrupts n) |
 | printf-f | p16f877a | - | - | - | - | - | - | MISMATCH (epic=0xa sdcc=0xef; probe is a placeholder, %f ships in PR #295) |
-| printf-f | p18f4550 | - | - | - | - | - | - | PANIC (sim: index out of bounds 65535) |
+| printf-f | p18f4550 | - | - | - | - | - | - | MISMATCH (epic=0xa sdcc=0xec; probe is a placeholder, %f ships in PR #295) |
 
 ## Findings
 
@@ -58,8 +58,15 @@ program.
   the sim PANIC below. The recursion probe is a surface probe: epic-cc
   supports recursion (it compiles and runs correctly), so this row is
   informational, not a gap to close.
-- **PANIC on PIC18** (printf-f): SDCC's output accesses address 0xFFFF,
-  which our sim does not model (likely a config/EEPROM access). Real finding.
+- **PANIC on PIC18 (resolved).** The `index out of bounds: len 4096 but
+  index 65535` panic was a harness bug, not a sim gap: the gplink re-run
+  (to produce the symbol map) overwrote SDCC's good hex with a broken link
+  that omitted the crt0 startup, leaving FSR1/FSR2 uninitialized so a
+  `MOVFF ... POSTDEC1` wrapped to 0xFFFF. The harness now writes the map
+  link to a throwaway hex, and the sim gained the missing `DECF` opcode.
+  The remaining p18 mismatches are real differential findings (SDCC's
+  startup/lib code and the sim's opcode coverage are still being
+  reconciled).
 - **`double` is now supported** on epic-cc (mapped to f32, since msp430's
   double == float). The double probe passes on both cores. The `%f` printf
   gap remains (tracked by the PIC18 sub-epic).
