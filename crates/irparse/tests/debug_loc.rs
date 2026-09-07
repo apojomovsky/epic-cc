@@ -75,20 +75,22 @@ fn instruction_panic_names_the_c_line() {
 }
 
 #[test]
-#[should_panic(expected = "t.c:2:1: SPIKE: unsupported type \"double\"")]
+#[should_panic(expected = "t.c:2:1: SPIKE: unsupported type")]
 fn define_panic_names_the_function_site() {
     // The define line's `!dbg` names its subprogram, which has a line but
-    // no column; col 1 stands for the function's opening line.
+    // no column; col 1 stands for the function's opening line. `double`
+    // is now supported (msp430 double == f32); `{ float, float }` (from
+    // `_Complex float`) is still unsupported.
     let src = r#"
-define dso_local double @get() local_unnamed_addr #0 !dbg !6 {
-  ret double 1.500000e+00, !dbg !9
+define dso_local { float, float } @get() local_unnamed_addr #0 !dbg !6 {
+  ret { float, float } { float 1.000000e+00, float 2.000000e+00 }, !dbg !10
 }
 
 !0 = distinct !DICompileUnit(language: DW_LANG_C11, file: !7, producer: "clang version 20.1.8", isOptimized: true, runtimeVersion: 0, emissionKind: LineTablesOnly, unit: !0)
 !6 = distinct !DISubprogram(name: "get", scope: !7, file: !7, line: 2, type: !8, scopeLine: 2, spFlags: DISPFlagDefinition | DISPFlagOptimized, unit: !0)
 !7 = !DIFile(filename: "t.c", directory: "/x")
 !8 = !DISubroutineType(types: !{})
-!9 = !DILocation(line: 2, column: 25, scope: !6)
+!10 = !DILocation(line: 2, column: 25, scope: !6)
 "#;
     let _ = parse_ll(src);
 }
