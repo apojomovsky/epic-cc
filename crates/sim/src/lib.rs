@@ -633,6 +633,12 @@ pub struct Pic14e {
     halted: bool,
     /// A latched interrupt request awaiting GIE + INTE, mirroring `Pic14`.
     pending: bool,
+    /// The hardware shadow-register context save (DS41364E section 7.5,
+    /// D-4): W, STATUS (except TO/PD), BSR, FSR0L/H, FSR1L/H, PCLATH are
+    /// snapshotted on interrupt entry and restored on RETFIE. The compiler
+    /// emits no manual save/restore for them (the P5 static assertion), so
+    /// the sim must model the shadow save for the run to be faithful.
+    shadow: [u8; 8],
     /// Extra cycle owed by an INDF access to the program-flash region
     /// (DS41364E section 3.5.3 note 2): the step budget consumes it before
     /// the next instruction executes.
@@ -659,6 +665,7 @@ impl Pic14e {
             stack: Vec::new(),
             halted: false,
             pending: false,
+            shadow: [0; 8],
             cycle_debt: 0,
         }
     }
@@ -688,6 +695,16 @@ impl Pic14e {
         self.pending
     }
     fn enter_isr(&mut self) {
+        // Hardware shadow context save (DS41364E section 7.5, D-4): W,
+        // STATUS (except TO and PD), BSR, FSR0, FSR1 and PCLATH. The
+        // compiler relies on it (no manual save/restore), so the sim
+        // restores these at RETFIE.
+        self.shadow[0] = self.w;
+        self.shadow[1] = self.ram[3] & !0x18; // STATUS minus TO (bit 4) and PD (bit 3)
+        self.shadow[2] = self.ram[8]; // BSR
+        for (s, r) in self.shadow[3..].iter_mut().zip([4u8, 5, 6, 7, 10]) {
+            *s = self.ram[usize::from(r)];
+        } // FSR0L, FSR0H, FSR1L, FSR1H, PCLATH
         self.stack.push(self.pc);
         self.ram[INTCON] &= !GIE;
         self.pc = VECTOR;
@@ -868,6 +885,14 @@ impl Pic14e {
             }
             0x0008 => return self.pop_return(), // RETURN
             0x0009 => {
+                // RETFIE: restore the hardware shadow context save
+                // (DS41364E section 7.5, D-4) and re-enable interrupts.
+                self.w = self.shadow[0];
+                self.ram[3] = (self.ram[3] & 0x18) | (self.shadow[1] & 0x07); // STATUS minus TO/PD
+                self.ram[8] = self.shadow[2]; // BSR
+                for (s, r) in self.shadow[3..].iter().zip([4u8, 5, 6, 7, 10]) {
+                    self.ram[usize::from(r)] = *s;
+                } // FSR0L, FSR0H, FSR1L, FSR1H, PCLATH
                 self.ram[INTCON] |= GIE; // RETFIE re-enables interrupts
                 return self.pop_return();
             }
