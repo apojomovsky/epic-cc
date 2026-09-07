@@ -16,7 +16,15 @@ permissions:
   packages: write
 
 jobs:
+  # See ci.yml's warm-toolchain-cache job / toolchain-cache.yml: this
+  # workflow runs on every push to master, the same trigger ci.yml uses, so
+  # without this its build job would be a 5th concurrent racer against the
+  # same GHCR cache ref on a cold cache.
+  warm-toolchain-cache:
+    uses: ./.github/workflows/toolchain-cache.yml
+
   build:
+    needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
