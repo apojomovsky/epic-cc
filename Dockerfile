@@ -51,35 +51,6 @@ RUN curl -fsSL -o /tmp/gputils.tar.gz \
     && make install \
     && rm -rf /tmp/gputils-1.5.2 /tmp/gputils.tar.gz
 
-# SDCC 4.6.0: the SDCC parity oracle (docs/35). Built from source,
-# digest-pinned, exactly like gputils. SDCC is GPL: it lives in the image as
-# an external oracle only, never linked or committed into the MIT repo. Its
-# pic14/pic16 ports need gputils (built above) and the boost graph library
-# (apt, above). The regression suite ships in the tarball under
-# support/regression/ and is used by the parity harness (Tier 3), never
-# committed.
-RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
-        https://downloads.sourceforge.net/project/sdcc/sdcc/4.6.0/sdcc-src-4.6.0.tar.bz2 \
-    && echo "5fd6a93e5997ce01756868fe35e441095cfb637894a80c262514a634094973b6  /tmp/sdcc.tar.bz2" | sha256sum -c - \
-    && tar -xjf /tmp/sdcc.tar.bz2 -C /tmp \
-    && cd /tmp/sdcc-4.6.0 \
-    && ./configure --prefix=/usr/local \
-        --disable-mcs51-port --disable-z80-port --disable-z180-port \
-        --disable-r2k-port --disable-r2ka-port --disable-r3ka-port \
-        --disable-r4k-port --disable-r5k-port --disable-r6k-port \
-        --disable-sm83-port --disable-tlcs90-port --disable-ez80-port \
-        --disable-z80n-port --disable-r800-port --disable-ds390-port \
-        --disable-ds400-port --disable-hc08-port --disable-s08-port \
-        --disable-stm8-port --disable-pdk13-port --disable-pdk14-port \
-        --disable-pdk15-port --disable-mos6502-port --disable-mos65c02-port \
-        --disable-f8-port --disable-f8l-port \
-    && make -j"$(nproc)" \
-    && make install \
-    && make -C device/non-free/lib install \
-    && mkdir -p /usr/local/share/sdcc/regression \
-    && cp -r support/regression/* /usr/local/share/sdcc/regression/ \
-    && rm -rf /tmp/sdcc-4.6.0 /tmp/sdcc.tar.bz2
-
 FROM base AS clang-builder
 
 # LLVM 20.1.8 source, digest-pinned. clang's version is part of our input
@@ -121,6 +92,36 @@ RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
     && sh /tmp/rustup.sh -y --profile minimal --default-toolchain 1.97.1 \
     && rustup component add rustfmt clippy rust-src \
     && rm /tmp/rustup.sh
+
+# SDCC 4.6.0: the SDCC parity oracle (docs/35). Built from source,
+# digest-pinned, exactly like gputils. SDCC is GPL: it lives in the image as
+# an external oracle only, never linked or committed into the MIT repo. Its
+# pic14/pic16 ports need gputils (built in base) and the boost graph library
+# (apt, base). The regression suite ships in the tarball under
+# support/regression/ and is used by the parity harness (Tier 3), never
+# committed. Built in dev (not base) so the expensive clang-builder layer
+# stays cached when the SDCC pin changes.
+RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
+        https://downloads.sourceforge.net/project/sdcc/sdcc/4.6.0/sdcc-src-4.6.0.tar.bz2 \
+    && echo "5fd6a93e5997ce01756868fe35e441095cfb637894a80c262514a634094973b6  /tmp/sdcc.tar.bz2" | sha256sum -c - \
+    && tar -xjf /tmp/sdcc.tar.bz2 -C /tmp \
+    && cd /tmp/sdcc-4.6.0 \
+    && ./configure --prefix=/usr/local \
+        --disable-mcs51-port --disable-z80-port --disable-z180-port \
+        --disable-r2k-port --disable-r2ka-port --disable-r3ka-port \
+        --disable-r4k-port --disable-r5k-port --disable-r6k-port \
+        --disable-sm83-port --disable-tlcs90-port --disable-ez80-port \
+        --disable-z80n-port --disable-r800-port --disable-ds390-port \
+        --disable-ds400-port --disable-hc08-port --disable-s08-port \
+        --disable-stm8-port --disable-pdk13-port --disable-pdk14-port \
+        --disable-pdk15-port --disable-mos6502-port --disable-mos65c02-port \
+        --disable-f8-port --disable-f8l-port \
+    && make -j"$(nproc)" \
+    && make install \
+    && make -C device/non-free/lib install \
+    && mkdir -p /usr/local/share/sdcc/regression \
+    && cp -r support/regression/* /usr/local/share/sdcc/regression/ \
+    && rm -rf /tmp/sdcc-4.6.0 /tmp/sdcc.tar.bz2
 
 # PIC8_HOST_CLANG: the fuzz differential harness's host-reference compiler
 # (crates/fuzz/src/lib.rs host_clang()) — this same clang, no -target,
