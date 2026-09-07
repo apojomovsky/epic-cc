@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         xz-utils \
-        file \
+        gdb \
         csmith \
         creduce \
         cvise \
@@ -150,9 +150,10 @@ WORKDIR /workspace
 # shipped binary twice — once via env vars, once via bundled discovery — and
 # requires byte-identical HEX, proving the bundle's clang loads and the
 # driver finds it.
-RUN cargo build --release -p driver \
+RUN cargo build --release -p driver -p epic-cc-gdbserver \
     && mkdir -p "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin" \
     && cp target/release/epic-cc "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
+    && cp target/release/epic-cc-gdbserver "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && cp /opt/clang/bin/clang "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && cp /opt/clang/bin/llvm-link "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && cp /opt/clang/bin/opt "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \

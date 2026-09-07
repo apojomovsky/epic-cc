@@ -1,0 +1,20 @@
+[package]
+name = "epic-cc-gdbserver"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "epic-cc-gdbserver"
+path = "src/main.rs"
+
+[lib]
+name = "epic_cc_gdbserver"
+path = "src/lib.rs"
+
+[dependencies]
+pic14-sim = { path = "../sim" }
+gdbstub = "0.7.10"
+gdbstub_arch = "0.3.0"
+object = { version = "0.36", default-features = false, features = ["read_core", "elf", "std"] }
+gimli = "0.31"

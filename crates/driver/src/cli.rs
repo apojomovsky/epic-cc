@@ -24,6 +24,7 @@ pub struct Cli {
     pub map: Option<String>,
     pub line_table: Option<String>,
     pub var_table: Option<String>,
+    pub sidecar: Option<String>,
 }
 
 pub const USAGE: &str = "\
@@ -41,6 +42,7 @@ usage: epic-cc [options] <input.c>...
   --line-table <file>  write the address-to-source-line table into <file>
                        (one `file:line:col <addr>` record per word)
   -v                   echo the clang and llvm-link commands
+  --sidecar <file>     write the ELF+DWARF sidecar for gdb into <file>
   --var-table <file>   write the typed variable table into <file>
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
@@ -59,6 +61,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut map = None;
     let mut line_table = None;
     let mut var_table = None;
+    let mut sidecar = None;
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -123,6 +126,13 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
             );
         } else if a == "-v" {
             verbose = true;
+        } else if a == "--sidecar" {
+            i += 1;
+            sidecar = Some(
+                argv.get(i)
+                    .cloned()
+                    .ok_or("epic-cc: --sidecar needs a value")?,
+            );
         } else if a == "--var-table" {
             i += 1;
             var_table = Some(
@@ -151,6 +161,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         emit,
         save_temps,
         var_table,
+        sidecar,
         verbose,
         map,
         line_table,

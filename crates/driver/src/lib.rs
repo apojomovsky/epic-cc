@@ -11,6 +11,7 @@ pub mod hex;
 pub mod predef;
 pub mod prescan;
 pub mod report;
+pub mod sidecar;
 pub mod stdarg_h;
 pub mod stdbool_h;
 pub mod stddef_h;
