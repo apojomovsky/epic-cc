@@ -1092,7 +1092,7 @@ fn parse_ty(s: &str) -> Ty {
         "i16" => Ty::I16,
         "i32" => Ty::I32,
         "i64" => Ty::I64,
-        "float" | "f32" => Ty::F32,
+        "float" | "f32" | "double" => Ty::F32,
         other => panic!("unsupported type {other}"),
     }
 }
@@ -1175,7 +1175,7 @@ fn parse_call_arg(s: &str) -> CallArg {
     let mut val_tok = None;
     for tok in s.trim().split_whitespace() {
         match tok {
-            "i1" | "i8" | "i16" | "i32" | "float" | "f32" => ty = Some(parse_ty(tok)),
+            "i1" | "i8" | "i16" | "i32" | "float" | "f32" | "double" => ty = Some(parse_ty(tok)),
             _ => {
                 if let Some(n) = tok.strip_prefix("byval") {
                     byval = Some(n.parse().unwrap());

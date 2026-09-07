@@ -1028,7 +1028,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
         match t {
             "i1" | "i8" => (1, 1),
             "i16" | "ptr" => (2, 2),
-            "i32" | "float" | "f32" => (4, 2),
+            "i32" | "float" | "f32" | "double" => (4, 2),
             "i64" => (8, 2),
             other => panic!("{}SPIKE: unsupported type {other:?}", loc_prefix(loc)),
         }
@@ -1057,7 +1057,7 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
         match t {
             "i1" | "i8" => Some((1, 1)),
             "i16" | "ptr" => Some((2, 2)),
-            "i32" | "float" | "f32" => Some((4, 2)),
+            "i32" | "float" | "f32" | "double" => Some((4, 2)),
             "i64" => Some((8, 2)),
             _ => None,
         }
@@ -1914,7 +1914,9 @@ fn parse_call_arg(
             }
             match t.as_str() {
                 "ptr" => {}
-                "i1" | "i8" | "i16" | "i32" | "float" | "f32" => ty = Some(ty_of(t, loc)),
+                "i1" | "i8" | "i16" | "i32" | "float" | "f32" | "double" => {
+                    ty = Some(ty_of(t, loc))
+                }
                 "align" => skip_next = true,
                 "noundef" | "nonnull" | "noalias" | "nocapture" | "readonly" | "writeonly"
                 | "writable" | "dead_on_unwind" | "immarg" | "zeroext" | "signext" => {}
@@ -1982,7 +1984,9 @@ fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
             | "readonly" | "readnone" | "nonnull" | "noundef" | "zeroext" | "signext"
             | "immarg" | "sret" | "byval" | "returned" | "..." => {}
             "align" => skip_next = true,
-            "i1" | "i8" | "i16" | "i32" | "float" | "f32" => scalar = Some(ty_of(t, loc)),
+            "i1" | "i8" | "i16" | "i32" | "float" | "f32" | "double" => {
+                scalar = Some(ty_of(t, loc))
+            }
             _ => {
                 if let Some(rest) = t.strip_prefix("byval(") {
                     let inner = rest.trim_end_matches(')');
@@ -2877,7 +2881,8 @@ fn parse_inst(
                 for tok in head_parts {
                     let clean = tok.split('(').next().unwrap().trim_end_matches(',');
                     match clean {
-                        "void" | "i1" | "i8" | "i16" | "i32" | "ptr" | "float" | "f32" => {
+                        "void" | "i1" | "i8" | "i16" | "i32" | "ptr" | "float" | "f32"
+                        | "double" => {
                             ret_tok = clean.to_string();
                             break;
                         }
@@ -3193,7 +3198,12 @@ fn parse_inst(
             let b = if second_raw
                 .split_whitespace()
                 .next()
-                .map(|t| matches!(t, "i1" | "i8" | "i16" | "i32" | "ptr" | "float" | "f32"))
+                .map(|t| {
+                    matches!(
+                        t,
+                        "i1" | "i8" | "i16" | "i32" | "ptr" | "float" | "f32" | "double"
+                    )
+                })
                 .unwrap_or(false)
                 && second_raw.contains(' ')
             {
