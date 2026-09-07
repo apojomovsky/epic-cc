@@ -1,15 +1,12 @@
 name: toolchain-cache
 
-# Warms ghcr.io/<repo>-toolchain's registry cache once per workflow run, so
-# concurrent jobs that each build the `ci`/`release` image against the same
-# cache-from/cache-to ref (canonical x2 + hal-887 + devices-changed in
-# ci.yml; devices-all + sdcc-parity in nightly.yml; the single build job in
-# rolling-release.yml/release.yml) don't race to independently rebuild and
-# push it. On a warm cache this is a few-second cache-from hit; on a cold
-# cache (a real clang-builder/base Dockerfile change, or the pinned ubuntu
-# digest bumping) it pays the ~2h LLVM build exactly once instead of once
-# per concurrent consumer. Callers add `needs: <job-name-that-calls-this>`
-# ahead of their own image-building jobs.
+# Warms ghcr.io/<repo>-toolchain's registry cache once per workflow run.
+# Without this, every job that builds the ci/release image against that
+# same cache ref (up to 5 across ci.yml, nightly.yml, rolling-release.yml,
+# release.yml) would race to rebuild and push it independently on a cold
+# cache, paying the ~2h LLVM build several times over instead of once.
+# Callers add `needs: <job-name-that-calls-this>` ahead of their own
+# image-building jobs.
 
 on:
   workflow_call:

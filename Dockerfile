@@ -1,26 +1,12 @@
 # syntax=docker/dockerfile:1
 #
-# epic-cc toolchain images. Single source of truth for the build/test/release
-# environment (docs/30-distribution-design.md, ADR-008).
-#
-# Stages:
-#   base          — ubuntu:22.04 (digest-pinned; glibc 2.35 = the minimum
-#                   supported Linux) + exactly the build tools
-#                   clang-builder's own RUN needs. Nothing else may be
-#                   added here: base sits upstream of clang-builder in the
-#                   cache chain, so any change to it — even an unrelated
-#                   apt package — busts BuildKit's registry-cached LLVM
-#                   build (~2h from scratch) even though clang-builder's
-#                   own instructions never changed. Test oracles, fuzz
-#                   tooling, and anything else non-essential to compiling
-#                   clang belong in dev instead (see dev's own comment).
-#   clang-builder — LLVM 20.1.8 from the digest-pinned source tarball, static
-#                   LLVM libs (no libLLVM.so, no rpath work). The expensive
-#                   layer; cached in GHCR via the buildx registry cache.
-#   dev           — clang-builder + rustup 1.97.1 (rust-toolchain.toml) +
-#                   gputils + test-oracle/fuzz tooling + SDCC + env
-#   ci            — dev; runs scripts/ci-test.sh (what CI executes)
-#   release       — dev; builds epic-cc and assembles the distribution bundle
+# epic-cc toolchain images, the build/test/release environment (docs/30-
+# distribution-design.md, ADR-008). Stages: base, only clang-builder's own
+# build deps, nothing else, since base sits upstream of its ~2h cached LLVM
+# build and any other change here would bust that cache; clang-builder,
+# LLVM 20.1.8, cached in GHCR; dev, clang-builder plus rustup, gputils,
+# test-oracle/fuzz tooling, and SDCC; ci, runs scripts/ci-test.sh; release,
+# builds and bundles epic-cc.
 
 FROM ubuntu:22.04@sha256:79676deb51ebb02885b0b9d33788e78a37cf1045ad79d1bb04c6a222c3556b3d AS base
 
@@ -93,7 +79,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libboost-graph-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# gputils 1.5.2 — test oracle (gpasm byte-for-byte cross-checks). Built from
+# gputils 1.5.2, test oracle (gpasm byte-for-byte cross-checks). Built from
 # source: apt (jammy) has 1.4.0 and the cross-checks are version-sensitive.
 # Note the tarball lives under the 1.5.0 directory on SourceForge. Built
 # here (not base) for the same reason as the apt packages above: gputils'
