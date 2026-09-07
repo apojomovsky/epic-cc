@@ -1,12 +1,11 @@
 # syntax=docker/dockerfile:1
 #
-# epic-cc toolchain images, the build/test/release environment (docs/30-
-# distribution-design.md, ADR-008). Stages: base, only clang-builder's own
-# build deps, nothing else, since base sits upstream of its ~2h cached LLVM
-# build and any other change here would bust that cache; clang-builder,
-# LLVM 20.1.8, cached in GHCR; dev, clang-builder plus rustup, gputils,
-# test-oracle/fuzz tooling, and SDCC; ci, runs scripts/ci-test.sh; release,
-# builds and bundles epic-cc.
+# epic-cc toolchain images (docs/30-distribution-design.md, ADR-008).
+# Stages: base, only clang-builder's own build deps and nothing else, since
+# a change here would bust its ~2h cached LLVM build; clang-builder, LLVM
+# 20.1.8, GHCR-cached; dev, clang-builder plus rustup, gputils, oracle/fuzz
+# tooling, SDCC; ci, runs scripts/ci-test.sh; release, builds and bundles
+# epic-cc.
 
 FROM ubuntu:22.04@sha256:79676deb51ebb02885b0b9d33788e78a37cf1045ad79d1bb04c6a222c3556b3d AS base
 
