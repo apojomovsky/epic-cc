@@ -330,6 +330,92 @@ fn banked_ptr_c_runs_correctly() {
     assert!(p.halted());
 }
 
+/// P3 regression (reviewer finding): a runtime pointer VALUE to a
+/// bank-straddling global must carry the linear alias, so a deref at an
+/// offset past the bank boundary walks the linear region (which compresses
+/// the common-RAM hole), not the hole itself. The pointer is passed through
+/// a function boundary so it is genuinely runtime, not a static GEP.
+#[test]
+fn span_ptr_c_runtime_pointer_to_straddling_global_uses_linear_base() {
+    let (mut p, globals, asm) = compile_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/span_ptr.c"
+    ));
+    let big = globals["big"];
+    assert!(
+        big >= 0x20 && big <= 0x6F && 0x6F - big + 1 < 90,
+        "span_ptr.c layout: big[90] at 0x{big:03X} must straddle bank 0 -> bank 1"
+    );
+    // The pointer value stored to `gp` and passed to `sum` must be the
+    // linear alias (0x2000 + bank*80 + (off-0x20)), not the physical base,
+    // so a deref at offset 89 walks the linear region (which compresses the
+    // common-RAM hole), not the hole itself.
+    let linear_base = 0x2000 + (big & 0x7F) - 0x20;
+    assert!(
+        (0x2000..=0x29AF).contains(&linear_base),
+        "big's linear base 0x{linear_base:04X} must be in the linear region"
+    );
+    // The asm must materialize the pointer value as the linear base: a
+    // MOVLW of the base's low byte and a MOVLW of its high byte (0x20).
+    let lo = (linear_base & 0xFF) as u8;
+    let hi = ((linear_base >> 8) & 0xFF) as u8;
+    let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
+    let has_lo = lines.iter().any(|l| *l == format!("MOVLW 0x{lo:02X}"));
+    let has_hi = lines.iter().any(|l| *l == format!("MOVLW 0x{hi:02X}"));
+    assert!(
+        has_lo && has_hi,
+        "span_ptr.c must materialize the pointer value as the linear base \
+         0x{linear_base:04X} (MOVLW 0x{lo:02X} / MOVLW 0x{hi:02X}):\n{asm}"
+    );
+    // And the simulated result must be right: big[0] + big[89] = 0x11 + 0x22.
+    p.run(200_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x33,
+        "out == big[0] + big[89] == 0x11 + 0x22 through a runtime pointer"
+    );
+    assert!(p.halted());
+}
+
+/// P3 regression (reviewer finding): a constant-length memcpy whose
+/// destination is a bank-straddling global must route through FSR0 with the
+/// linear base, not emit direct file-register stores that walk into the
+/// common-RAM hole and bank-1 SFRs.
+#[test]
+fn span_memcpy_c_into_straddling_destination_uses_linear_base() {
+    let (mut p, globals, asm) = compile_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/span_memcpy.c"
+    ));
+    let big = globals["big"];
+    assert!(
+        big >= 0xA0 && big <= 0xEF && 0xEF - big + 1 < 90,
+        "span_memcpy.c layout: big[90] at 0x{big:03X} must straddle bank 1 -> bank 2"
+    );
+    // The memcpy destination must be addressed through the linear region:
+    // the asm must contain a MOVLW of the linear base's high byte (0x20)
+    // before a MOVWF FSR0H, and the base's low byte before a MOVWF FSR0L.
+    let linear_base = 0x2000 + (big & 0x7F) - 0x20;
+    let lo = (linear_base & 0xFF) as u8;
+    let hi = ((linear_base >> 8) & 0xFF) as u8;
+    let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
+    let has_lo = lines.iter().any(|l| *l == format!("MOVLW 0x{lo:02X}"));
+    let has_hi = lines.iter().any(|l| *l == format!("MOVLW 0x{hi:02X}"));
+    assert!(
+        has_lo && has_hi,
+        "span_memcpy.c must address the straddling destination through the \
+         linear base 0x{linear_base:04X} (MOVLW 0x{lo:02X} / MOVLW 0x{hi:02X}):\n{asm}"
+    );
+    // And the simulated result must be right: big[79] == src[79] == 0x50.
+    p.run(200_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x50,
+        "out == big[79] == src[79] == 0x50 after the 80-byte memcpy"
+    );
+    assert!(p.halted());
+}
+
 /// P3's linear-addressing acceptance (docs/33 section 4): a bank-straddling
 /// array must be addressed through the linear region (FSR base in
 /// 0x2000-0x29AF) so one FSR walks across banks, while a single-bank array

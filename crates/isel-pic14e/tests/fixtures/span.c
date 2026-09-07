@@ -7,7 +7,7 @@
 // Layout (alloc, region_for): `in` (i16) at 0x20-0x21; `big[90]` straddles
 // bank 0 -> bank 1 (0x22-0x6F then 0xA0-0xAF, the common-RAM hole 0x70-0x7F
 // skipped), so its linear base is 0x2002 and one FSR walks all 90 bytes;
-// `small[8]` fits bank 1 (0xB0-0xB7), addressed physically. `out` at 0xB8.
+// `small[8]` fits bank 1 (0xAC-0xB3), addressed physically. `out` at 0xB4.
 //
 // `in` is a 16-bit volatile so clang keeps the index mask `& 7` as an i16
 // `and` (isel lowers i16 and; it has no i8 and), the same discipline as
