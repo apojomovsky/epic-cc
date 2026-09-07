@@ -5947,18 +5947,13 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
         if i == 0 && f.isr {
             // The hardware saves W, STATUS (except TO/PD), BSR, FSR0,
             // FSR1 and PCLATH on entry and restores them on RETFIE
-            // (DS41364E section 7.5, D-4), so the ISR emits no save/
-            // restore prologue for them. The preempted main's in-flight
-            // retval (0x71-0x74) and the LIVE scratch byte (0x70) are
-            // NOT part of that hardware save (they are compiler ABI, not
-            // core registers): an ISR that calls a value-returning
-            // function or does a const read would clobber them, the same
-            // hazard PIC14 M13 and PIC18 P5 save against (docs/33 D-4:
-            // the `_isr` frame copies and the retval/scratch protection
-            // apply unchanged). Backup them into 0x79-0x7D. Then PCLATH =
-            // 0 so the ISR body's own intra-function GOTOs stay in page 0
-            // (the hardware restores main's PCLATH at RETFIE, so the pin
-            // is safe to leave set).
+            // (DS41364E section 7.5, D-4), so the ISR emits no
+            // save/restore prologue for them. The preempted main's
+            // in-flight retval (0x71-0x74) and scratch (0x70) are NOT
+            // part of that hardware save (compiler ABI, the hazard PIC14
+            // M13 / PIC18 P5 protect): backup into 0x79-0x7D. Then
+            // PCLATH = 0 so the ISR body's intra-function GOTOs stay in
+            // page 0 (the hardware restores main's PCLATH at RETFIE).
             g.emit("    MOVF 0x71, W");
             g.emit("    MOVWF 0x79");
             g.emit("    MOVF 0x72, W");

@@ -13,7 +13,7 @@
 // GIE at stage 2. `stage` makes each window observable from the test.
 //
 // Expected: isr_ran == 0 for the whole masked window, then exactly 1 after
-// GIE goes up. Exactly one, not more — the handler never clears INTF, so a
+// GIE goes up. Exactly one, not more: the handler never clears INTF, so a
 // simulator that re-armed on the still-set flag would spin in the handler
 // and never reach the final stage.
 #define INTCON (*(volatile unsigned char *)0x0B)
