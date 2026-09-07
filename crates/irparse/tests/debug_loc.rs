@@ -63,13 +63,14 @@ fn call_without_metadata_has_no_location() {
 }
 
 #[test]
-#[should_panic(expected = "t.c:4:3: SPIKE: unsupported type \"double\"")]
+#[should_panic(expected = "t.c:4:3: SPIKE: unsupported type")]
 fn instruction_panic_names_the_c_line() {
     // The panic fires while the alloca line is parsed; the location is
-    // the line's own DILocation, not a Rust call site.
+    // the line's own DILocation, not a Rust call site. `double` is now
+    // supported (msp430 double == f32); `i24` is still unsupported.
     let src = DBG_MODULE.replace(
         "%1 = tail call i16 @helper() #1, !dbg !9",
-        "%1 = alloca double, align 8, !dbg !9",
+        "%1 = alloca i24, align 8, !dbg !9",
     );
     let _ = parse_ll(&src);
 }
@@ -96,12 +97,13 @@ define dso_local { float, float } @get() local_unnamed_addr #0 !dbg !6 {
 }
 
 #[test]
-#[should_panic(expected = "t.c:2:1: irparse: unsupported param type token \"double\"")]
+#[should_panic(expected = "t.c:2:1: irparse: unsupported param type token")]
 fn param_type_panic_names_the_function_site() {
-    // A `double` param panics in parse_param, which sees the define's
-    // subprogram location, like the return-type path.
+    // A `{ float, float }` param panics in parse_param, which sees the
+    // define's subprogram location, like the return-type path. `double`
+    // is now supported (msp430 double == f32); `_Complex float` is not.
     let src = r#"
-define dso_local void @f(double noundef %0) local_unnamed_addr #0 !dbg !6 {
+define dso_local void @f({ float, float } noundef %0) local_unnamed_addr #0 !dbg !6 {
   ret void, !dbg !9
 }
 
