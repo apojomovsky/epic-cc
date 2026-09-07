@@ -57,8 +57,18 @@ jobs:
       - name: Lint added comment blocks
         run: python3 epic-tasks/epic-tasks prose --verify
 
+  # Warms ghcr.io/<repo>-toolchain's registry cache once before the jobs
+  # below each independently build the image against it. Without this,
+  # canonical (x2) + hal-887 + devices-changed would all race to rebuild
+  # and push the same cache ref on a cold cache (a genuine clang-builder
+  # or base change, or an ubuntu digest bump), paying the ~2h LLVM build
+  # up to 4x in parallel instead of once. See toolchain-cache.yml.
+  warm-toolchain-cache:
+    uses: ./.github/workflows/toolchain-cache.yml
+
   canonical:
     name: canonical ${{ matrix.device }} (${{ matrix.core }})
+    needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -151,6 +161,15 @@ jobs:
             -v "$GITHUB_STEP_SUMMARY:$GITHUB_STEP_SUMMARY" -e GITHUB_STEP_SUMMARY \
             epic-cc-ci:latest bash scripts/ci-test.sh
 
+      # The docker run above executes as root, so target/ ends up
+      # root-owned on this bind-mounted host path. Without this, the
+      # "Cache cargo target dir" step's post-job save fails silently
+      # (tar: Permission denied on target/debug/incremental/**/*.lock),
+      # and the cache above never actually saves.
+      - name: Fix target dir ownership (container runs as root)
+        if: steps.noncode.outputs.non_code != 'true'
+        run: sudo chown -R "$(id -u):$(id -g)" target
+
   hal-887:
     # epic-hal's 887 firmware is built by this compiler but nothing in either
     # repository compiled it: epic-hal#77 merged an hour and three quarters
@@ -158,6 +177,7 @@ jobs:
     # has no epic-cc to run, so the gate lives here, where the compiler and its
     # pinned clang already do.
     name: pic16f88x-hal 887 under epic-cc
+    needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -233,6 +253,7 @@ jobs:
 
   devices-changed:
     name: devices-changed (lightweight)
+    needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -330,3 +351,9 @@ jobs:
             docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/sanity.sh "$stem"
             echo "::endgroup::"
           done < /tmp/changed_devices.txt
+
+      # See the same-named step in the canonical job: docker runs as root,
+      # so without this the target dir cache above never actually saves.
+      - name: Fix target dir ownership (container runs as root)
+        if: steps.noncode.outputs.non_code != 'true'
+        run: sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true

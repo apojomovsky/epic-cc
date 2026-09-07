@@ -507,3 +507,67 @@ fn common_ram_mirrors_across_bsr() {
         "the paged 0xF2 must not receive the write"
     );
 }
+
+#[test]
+fn interrupt_save_restores_shadow_context_on_fire_and_retfie() {
+    // The hardware shadow context save (DS41364E section 7.5, D-4): on
+    // interrupt entry, W, STATUS (except TO/PD), BSR, FSR0, FSR1 and
+    // PCLATH are snapshotted and restored on RETFIE. The compiler emits no
+    // manual save/restore for them, so this is what makes the P5
+    // no-manual-save acceptance meaningful in simulation.
+    let mut p = Pic14e::with_device(
+        &device::PIC16F1937,
+        vec![
+            0x3008, // 0: MOVLW 0x08        -> W = 0x08
+            0x00A0, // 1: MOVWF 0x20        -> RAM[0x20] = 0x08 (a byte the ISR clobbers)
+            0x3005, // 2: MOVLW 0x05        -> W = 0x05 (the pre-ISR W)
+            0x0000, // 3: NOP               (the injection point)
+            0x3077, // 4: MOVLW 0x77        (the ISR body clobbers W)
+            0x0009, // 5: RETFIE            (restores the shadow context)
+            0x0000, // 6: unreachable NOP
+        ],
+    );
+    p.step(); // MOVLW 0x08, pc -> 1
+    p.step(); // MOVWF 0x20, pc -> 2
+    p.step(); // MOVLW 0x05, pc -> 3
+    assert_eq!(p.pc(), 3, "reached the injection point, W = 0x05");
+
+    // Distinct pre-ISR values for every register the shadow save covers.
+    p.ram_mut()[3] = 0b101; // STATUS Z and C
+    p.ram_mut()[8] = 0x03; // BSR
+    p.ram_mut()[4] = 0x11; // FSR0L
+    p.ram_mut()[5] = 0x22; // FSR0H
+    p.ram_mut()[6] = 0x33; // FSR1L
+    p.ram_mut()[7] = 0x44; // FSR1H
+    p.ram_mut()[10] = 0x50; // PCLATH
+
+    // Fire the interrupt: the six are snapshotted to the hardware shadow
+    // registers and the vector runs.
+    p.fire_interrupt(); // shadows the context, vectors to 4
+    assert_eq!(p.pc(), 4, "the ISR starts at the vector");
+    // Clobber everything the shadow save covers from inside the "ISR".
+    p.ram_mut()[3] = 0b111; // STATUS Z/DC/C
+    p.ram_mut()[8] = 0x1F; // BSR
+    p.ram_mut()[4] = 0xFF; // FSR0L
+    p.ram_mut()[5] = 0x20; // FSR0H
+    p.ram_mut()[6] = 0x55; // FSR1L
+    p.ram_mut()[7] = 0x02; // FSR1H
+    p.ram_mut()[10] = 0x40; // PCLATH
+    p.step(); // MOVLW 0x77 (W = 0x77 now)
+    assert_eq!(p.w(), 0x77, "the ISR body clobbered W");
+    p.step(); // RETFIE: restore the shadow context, return to pc 3
+
+    assert_eq!(p.w(), 0x05, "RETFIE restores the pre-ISR W");
+    assert_eq!(
+        p.ram()[3] & 0x07,
+        0b101,
+        "RETFIE restores the pre-ISR STATUS"
+    );
+    assert_eq!(p.ram()[8], 0x03, "RETFIE restores the pre-ISR BSR");
+    assert_eq!(p.ram()[4], 0x11, "RETFIE restores FSR0L");
+    assert_eq!(p.ram()[5], 0x22, "RETFIE restores FSR0H");
+    assert_eq!(p.ram()[6], 0x33, "RETFIE restores FSR1L");
+    assert_eq!(p.ram()[7], 0x44, "RETFIE restores FSR1H");
+    assert_eq!(p.ram()[10], 0x50, "RETFIE restores PCLATH");
+    assert_eq!(p.pc(), 3, "RETFIE returns to the interrupted instruction");
+}

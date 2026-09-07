@@ -1,0 +1,44 @@
+name: toolchain-cache
+
+# Warms ghcr.io/<repo>-toolchain's registry cache once per workflow run.
+# Without this, every job that builds the ci/release image against that
+# same cache ref (up to 5 across ci.yml, nightly.yml, rolling-release.yml,
+# release.yml) would race to rebuild and push it independently on a cold
+# cache, paying the ~2h LLVM build several times over instead of once.
+# Callers add `needs: <job-name-that-calls-this>` ahead of their own
+# image-building jobs.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  warm:
+    name: warm toolchain cache
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # No load/push/tags: this job only needs the registry cache
+      # populated, not a local or published image. Every other job's own
+      # "Build ci image (cached)" (or `docker buildx build --target
+      # release`) step then hits CACHED against what this pushes.
+      - name: Build + push the toolchain cache (ci target)
+        uses: docker/build-push-action@v6
+        with:
+          target: ci
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true

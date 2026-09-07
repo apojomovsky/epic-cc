@@ -16,8 +16,15 @@ permissions:
   packages: write
 
 jobs:
+  # See ci.yml's warm-toolchain-cache job / toolchain-cache.yml: avoids
+  # devices-all and sdcc-parity racing to independently rebuild + push the
+  # same GHCR cache on a cold cache.
+  warm-toolchain-cache:
+    uses: ./.github/workflows/toolchain-cache.yml
+
   devices-all:
     name: devices-all lightweight
+    needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -66,8 +73,15 @@ jobs:
             echo "::endgroup::"
           done
 
+      # The docker run above executes as root, so target/ ends up
+      # root-owned on this bind-mounted host path; without this, the
+      # "Cache cargo target dir" step's post-job save fails silently.
+      - name: Fix target dir ownership (container runs as root)
+        run: sudo chown -R "$(id -u):$(id -g)" target
+
   sdcc-parity:
     name: sdcc-parity differential
+    needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -112,3 +126,7 @@ jobs:
             -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
             -e GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
             epic-cc-ci:latest bash scripts/sdcc-parity.sh
+
+      # See devices-all's same-named step above.
+      - name: Fix target dir ownership (container runs as root)
+        run: sudo chown -R "$(id -u):$(id -g)" target
