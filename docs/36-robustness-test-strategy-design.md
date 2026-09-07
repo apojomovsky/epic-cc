@@ -65,14 +65,20 @@ into that lane's implementation plan:
   `&&label`, nested functions, `__int128`, wide `long double`
   literals) rather than a hand-maintained per-file exclusion list that
   needs upkeep as the corpus or the roadmap changes.
-- **Wire any ICE through the existing reducer.** The ticket's text
-  stops at "assert does not panic." The reducer in `crates/fuzz`
-  already accepts a classified `Failure` and does not require a host
-  side for a `Panic`-kind failure, so any crash the corpus finds should
-  be minimized the same way a differential mismatch is, and the
-  reduced reproducer committed as a permanent regression fixture. A
-  nightly job that finds a crash and only logs it is a fire alarm
-  nobody answers.
+- **Minimize any ICE before filing it.** The ticket's text stops at
+  "assert does not panic." `crates/fuzz::reduce` is not directly
+  reusable here: it takes a `Program` (a checksum, seeded inputs, a
+  host twin) and its greedy loop unconditionally re-runs the full
+  differential (PIC side and host side) on every candidate, which a
+  bare torture-suite source file has neither the shape for nor any use
+  for, since Lane A's oracle is "does not panic," not a checksum match.
+  What is reusable is the *technique*: the same greedy statement/line
+  deletion down to a fixed point, re-checking only "still panics" after
+  each deletion instead of re-running a differential. A lightweight,
+  host-free variant of that loop, purpose-built for Lane A, should
+  minimize any crash the corpus finds, with the reduced reproducer
+  committed as a permanent regression fixture. A nightly job that finds
+  a crash and only logs it is a fire alarm nobody answers.
 
 Oracle: none needed, "does not panic" is a self-contained check.
 CI placement: nightly, non-blocking, exactly as the ticket scopes it.
@@ -95,9 +101,13 @@ the `.ll`-to-IR boundary that the whole backend trusts. A second
 candidate, once the first is running, is any other stage that parses
 untrusted text rather than only IR built in-process.
 
-Corpus seed: harvest the existing `.ll`/IR fixtures already committed
-across the workspace's test directories as the initial fuzz corpus,
-rather than starting from nothing.
+Corpus seed: there are no standalone `.ll`/IR fixture files in the
+tree today; the IR text the workspace already exercises lives as
+inline string constants inside test source files (for example
+`crates/irparse/tests/parse_ll.rs`, `sanitize.rs`). Seeding the fuzz
+corpus needs a small one-time extraction step, pulling those string
+constants out into real corpus files, rather than pointing at
+pre-existing files that do not exist.
 
 Crash triage: `cargo fuzz tmin` (the tool's own minimizer, since the
 input here is IR text, not generated C, so the C-level reducer does
@@ -189,16 +199,23 @@ that "loud panic on unsupported input" already covers for syntax.
 
 ### Lane G: compile-time bound ("does not hang") tests
 
-The bank and interference allocator is, by the project's own framing,
-NP-hard. A pathological interference graph or an adversarially deep
-call graph could regress allocator running time into a combinatorial
-blowup that nothing today would catch until a real build hangs.
+`crates/banking`'s `BANKSEL` minimization (pipeline stage 8) is the
+pass the project's own documents (`docs/01-target-pic14.md`,
+`docs/12-backend-design.md`) cite as NP-hard, even with variables
+already pre-assigned to banks: it is a dataflow problem over the
+control-flow graph's bank state, not a property of the overlay
+allocator in `crates/alloc`. A control-flow shape with enough
+bank-crossing accesses and branching could regress that dataflow pass
+into a combinatorial blowup that nothing today would catch until a
+real build hangs.
 
-Design: a small number of adversarially-shaped fixtures (wide
-interference graphs, deep call graphs, sized to be practical to keep
-in the repository) with a wall-clock timeout assertion in CI. This is
-a performance-regression class distinct from every correctness lane
-above it.
+Design: a small number of adversarially-shaped fixtures (deeply
+branching control flow with many distinct-bank accesses interleaved,
+sized to be practical to keep in the repository) targeting
+`crates/banking` specifically, with a wall-clock timeout assertion in
+CI. This is a performance-regression class distinct from every
+correctness lane above it, and distinct from Lane F's resource-limit
+fixtures, which target size, not running time.
 
 ## 3. Named but out of scope for this document
 
