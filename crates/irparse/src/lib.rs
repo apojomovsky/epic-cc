@@ -67,7 +67,7 @@ fn ty_of(s: &str, loc: Option<&SrcLoc>) -> Ty {
         "i16" => Ty::I16,
         "i32" => Ty::I32,
         "i64" => Ty::I64,
-        "float" | "f32" => Ty::F32,
+        "float" | "f32" | "double" => Ty::F32,
         // An opaque `ptr` is a 16-bit address on this datalayout.
         "ptr" => Ty::I16,
         other => panic!(

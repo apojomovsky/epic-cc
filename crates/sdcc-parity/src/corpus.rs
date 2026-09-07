@@ -71,8 +71,11 @@ pub fn tier2() -> Vec<CorpusProgram> {
             &["out"],
         ),
         // double: 64-bit float arithmetic, read the low byte of the result.
+        // On msp430 double == float (32-bit), so this exercises the double
+        // type mapping; the conversion to unsigned int is the supported
+        // FpToUi path.
         prog(
-            "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    double a = 1.5;\n    double b = (double)in;\n    double c = a * b;\n    out = (unsigned char)((unsigned long long)c & 0xFF);\n}\n",
+            "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    double a = 1.5;\n    double b = (double)in;\n    double c = a * b;\n    out = (unsigned char)((unsigned int)c & 0xFF);\n}\n",
             &[("in", 8, 2)],
             &["out"],
         ),
