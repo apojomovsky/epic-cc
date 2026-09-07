@@ -2,7 +2,7 @@ use ir::{Inst, SrcLoc};
 use irparse::parse_ll;
 
 // A minimal module carrying exactly the line-table metadata clang adds
-// under `-gline-tables-only`: a DIFile per file, a DISubprogram per
+// under `-g`: a DIFile per file, a DISubprogram per
 // definition, a DILocation per instruction.
 const DBG_MODULE: &str = r#"
 define dso_local i16 @main() local_unnamed_addr #0 !dbg !6 {

@@ -305,6 +305,14 @@ fn main() {
     if let Some(map_path) = &cli.map {
         std::fs::write(map_path, driver::report::map_text(&device, &layout)).expect("write map");
     }
+    if let Some(vt_path) = &cli.var_table {
+        let dbg_vars = irparse::parse_debug_vars(&ll_text);
+        std::fs::write(
+            vt_path,
+            driver::report::var_table_text(&device, &layout, &dbg_vars),
+        )
+        .expect("write var table");
+    }
 
     // 7. isel: IR -> assembly. Locals are keyed `{func}::{name}` in the
     // map, matching what both backends look up. The keys are cloned: the

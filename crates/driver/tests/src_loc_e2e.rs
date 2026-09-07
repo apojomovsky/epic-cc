@@ -1,5 +1,5 @@
 // epic-cc#175 acceptance: front-end-stage panics name the C source
-// location that caused them, resolved from clang's `-gline-tables-only`
+// location that caused them, resolved from clang's `-g`
 // metadata. The three diagnostic classes are the ones the issue observed
 // in practice: unsupported type, undefined symbol, recursion.
 

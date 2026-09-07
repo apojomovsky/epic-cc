@@ -147,7 +147,7 @@ pub struct Select {
 }
 /// A C source location for diagnostics: the `file.c:line:col` of the user
 /// construct a panic refers to. Resolved in `irparse` from clang's
-/// `-gline-tables-only` metadata; `col` is 1 for line-level scopes that
+/// `-g` metadata; `col` is 1 for line-level scopes that
 /// carry no column (a define's `!dbg` subprogram).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SrcLoc {

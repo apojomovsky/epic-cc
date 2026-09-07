@@ -9,6 +9,7 @@
 use alloc::AllocLayout;
 use device::Device;
 use ir::SrcLoc;
+use irparse::DebugVars;
 
 /// The address-to-source-line table: one `file:line:col <addr>` record per
 /// word of the final program, sorted by address. Compiler-generated words
@@ -84,6 +85,50 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
     locals.sort();
     for key in locals {
         out.push_str(&format!("local {key} 0x{:02X}\n", layout.locals[key]));
+    }
+    out
+}
+
+/// The typed variable table: `global <name> 0xNN TYPE` and
+/// `local {func}::{name} 0xNN TYPE`, one flattened record per variable
+/// the join mapped to an address. The join is `DebugVars` metadata
+/// against `AllocLayout`: globals by C name, locals through the SSA key
+/// their `#dbg_*` record named. A variable with no allocation (promoted,
+/// constant-folded, or otherwise optimized away) is omitted; the TYPE
+/// field is the flat debug print, the in-process table stays phase 4's
+/// DWARF source.
+pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("; epic-cc var table for {}\n", device.name));
+    for v in &vars.globals {
+        if let Some(func) = &v.func {
+            // Function-local static: clang names the symbol
+            // `{func}.{name}`, which is the map's global key.
+            if let Some(&addr) = layout.globals.get(&format!("{func}.{name}", name = v.name)) {
+                out.push_str(&format!(
+                    "local {func}::{name} 0x{addr:02X} {ty}\n",
+                    name = v.name,
+                    ty = vars.type_string(v.ty)
+                ));
+            }
+        } else if let Some(&addr) = layout.globals.get(&v.name) {
+            out.push_str(&format!(
+                "global {name} 0x{addr:02X} {ty}\n",
+                name = v.name,
+                ty = vars.type_string(v.ty)
+            ));
+        }
+    }
+    for v in &vars.locals {
+        let Some(func) = &v.func else { continue };
+        let Some(ssa) = &v.ssa else { continue };
+        if let Some(&addr) = layout.locals.get(&format!("{func}::{ssa}")) {
+            out.push_str(&format!(
+                "local {func}::{name} 0x{addr:02X} {ty}\n",
+                name = v.name,
+                ty = vars.type_string(v.ty)
+            ));
+        }
     }
     out
 }

@@ -23,6 +23,7 @@ pub struct Cli {
     pub verbose: bool,
     pub map: Option<String>,
     pub line_table: Option<String>,
+    pub var_table: Option<String>,
 }
 
 pub const USAGE: &str = "\
@@ -40,9 +41,11 @@ usage: epic-cc [options] <input.c>...
   --line-table <file>  write the address-to-source-line table into <file>
                        (one `file:line:col <addr>` record per word)
   -v                   echo the clang and llvm-link commands
+  --var-table <file>   write the typed variable table into <file>
+                       (`global <name> 0xNN TYPE` / `local {func}::{name}
+                       0xNN TYPE`, one flattened record per mapped var)
   --version, -V        print the compiler identity (e.g. epic-cc 0.0.0-master-<sha>)
 ";
-
 /// Parse an argument list that does NOT include `argv[0]`.
 pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut inputs = Vec::new();
@@ -55,7 +58,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut verbose = false;
     let mut map = None;
     let mut line_table = None;
-
+    let mut var_table = None;
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -120,6 +123,13 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
             );
         } else if a == "-v" {
             verbose = true;
+        } else if a == "--var-table" {
+            i += 1;
+            var_table = Some(
+                argv.get(i)
+                    .cloned()
+                    .ok_or("epic-cc: --var-table needs a value")?,
+            );
         } else if a.starts_with('-') {
             return Err(format!("epic-cc: unknown option {a}\n\n{USAGE}"));
         } else {
@@ -140,6 +150,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         device,
         emit,
         save_temps,
+        var_table,
         verbose,
         map,
         line_table,
