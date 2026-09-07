@@ -1363,7 +1363,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         let mut hi: Option<u16> = None;
         for g in &m.globals {
             if let Some(&a) = globals.get(&g.name) {
-                let e = a + u16::from(g.size);
+                // A bank-straddling global's physical end skips common RAM
+                // (docs/33 D-2), so the per-bank high-water must use
+                // physical_end, not a + size (which would overcount the
+                // first bank into the common-RAM hole and miss the later
+                // banks entirely).
+                let e = physical_end(device, a, u16::from(g.size));
                 if a >= start && a <= end {
                     hi = Some(hi.map_or(e, |h| h.max(e)));
                 }
