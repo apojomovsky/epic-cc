@@ -396,6 +396,22 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel: no address for @{name}"))
     }
 
+    /// The address materialized as a runtime pointer VALUE for a global at
+    /// a constant offset `k`: the linear alias when the object straddles a
+    /// bank (docs/33 D-2), else the physical address. A pointer value to a
+    /// straddling object must carry the linear base so a later FSR deref at
+    /// an offset past the bank boundary walks the linear region (which
+    /// compresses the common-RAM hole) instead of the hole itself.
+    fn ptr_value_addr(&self, name: &str, k: u8) -> u16 {
+        let addr = self.global_addr(name);
+        let span = self.global_size(name);
+        if object_straddles(self.device, addr, span) {
+            fsr_base(self.device, addr, span) + u16::from(k)
+        } else {
+            addr + u16::from(k)
+        }
+    }
+
     /// Whether `name` is a const (flash) global: read via RETLW tables.
     /// A const that was copied to RAM (alloc placed it in `addrs` because it
     /// is used as a pointer call argument) is treated as RAM.
@@ -1168,7 +1184,7 @@ impl<'m> Gen<'m> {
                     // param, resolving here to `Base::Global`, materialized
                     // below like `emit_move_addr_to_slot`'s own arm.
                     if let Base::Global(name) = &base {
-                        let addr = self.global_addr(name).wrapping_add(k as u16);
+                        let addr = self.ptr_value_addr(name, k);
                         let lo = (addr & 0xFF) as u8;
                         let hi = ((addr >> 8) & 0xFF) as u8;
                         match terms.as_slice() {
@@ -1296,8 +1312,9 @@ impl<'m> Gen<'m> {
                     // (a `store ptr @g, ...` or a pointer phi incoming;
                     // clang always loads scalar globals first): materialize
                     // it as two literals, never read the pointee's contents
-                    // (epic-cc#155).
-                    let a = self.val_addr(&Val::Global(g.clone())).direct();
+                    // (epic-cc#155). A bank-straddling global's address is
+                    // the linear alias (docs/33 D-2).
+                    let a = self.ptr_value_addr(g, 0);
                     let b = ((a >> (idx as u32 * 8)) & 0xFF) as u8;
                     self.emit(format!("    MOVLW 0x{b:02X}"));
                 }
@@ -1656,7 +1673,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVLW HIGH({g})"));
                     self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
                 } else {
-                    let addr = self.global_addr(g);
+                    let addr = self.ptr_value_addr(g, 0);
                     self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                     self.emit(format!("    MOVWF 0x{:02X}", dst));
                     self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -1672,7 +1689,7 @@ impl<'m> Gen<'m> {
                 let sa = match &base {
                     Base::Slot(sname, true) => self.slot_addr(self.cur_func, sname).direct(),
                     Base::Global(name) => {
-                        let addr = self.global_addr(name);
+                        let addr = self.ptr_value_addr(name, k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", dst));
                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2146,7 +2163,7 @@ impl<'m> Gen<'m> {
                                 let size = self.global_size(g);
                                 panic!("isel: const global @{g} too large for RAM copy ({size} bytes, max 255)");
                             }
-                            let addr = self.global_addr(g);
+                            let addr = self.ptr_value_addr(g, 0);
                             self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                             self.emit(format!("    MOVWF 0x{:02X}", pa));
                             self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2181,7 +2198,7 @@ impl<'m> Gen<'m> {
                         let Base::Global(name) = &base else {
                             unreachable!()
                         };
-                        let addr = self.global_addr(name) + u16::from(k);
+                        let addr = self.ptr_value_addr(name, k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", pa));
                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2198,12 +2215,11 @@ impl<'m> Gen<'m> {
                                 // RAM-copied const: treat like a slot base.
                                 // Only constant offset or single dynamic term
                                 // is needed for the literal shapes.
-                                let base_addr = self.global_addr(name);
                                 let k_lo = (u16::from(k) & 0xFF) as u8;
                                 let k_hi = (u16::from(k) >> 8) as u8;
                                 match terms.as_slice() {
                                     [] => {
-                                        let addr = base_addr + u16::from(k);
+                                        let addr = self.ptr_value_addr(name, k);
                                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                                         self.emit(format!("    MOVWF 0x{:02X}", pa));
                                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2211,6 +2227,12 @@ impl<'m> Gen<'m> {
                                         continue;
                                     }
                                     [(1, reg)] => {
+                                        // A dynamic term: the base must be
+                                        // the linear alias when the object
+                                        // straddles (docs/33 D-2), so the
+                                        // runtime offset walks the linear
+                                        // region, not the common-RAM hole.
+                                        let base_addr = self.ptr_value_addr(name, 0);
                                         let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                                         self.emit(format!("    MOVLW 0x{:02X}", (base_addr & 0xFF) as u8));
                                         self.emit(format!("    ADDWF 0x{:02X}, W", ra));
