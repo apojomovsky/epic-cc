@@ -824,8 +824,8 @@ fn interrupt_mul_c_runs_correctly() {
 
 // P7 end-to-end acceptance (docs/33 section 4): soft-float f32 routines,
 // a third copy per D-1 (1:1 port of the verified PIC14 bodies). The
-// fixture is byte-identical to PIC14's; expected values come from the
-// PIC14 e2e test of the same C source (crates/driver/tests/float_e2e.rs).
+// fixture is byte-identical to pic18's float.c; expected values come from
+// the PIC14 e2e test of the same C source (crates/driver/tests/float_e2e.rs).
 
 #[test]
 fn float_c_runs_correctly() {
