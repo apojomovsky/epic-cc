@@ -52,6 +52,15 @@ fn compile(c_path: &str) -> (Pic14e, HashMap<String, u16>) {
 /// Like `compile`, but also returns the emitted `.asm` text so a test can
 /// inspect the addressing mode (linear vs banked) chosen for an object.
 fn compile_asm(c_path: &str) -> (Pic14e, HashMap<String, u16>, String) {
+    let (p, globals, asm, _locals) = compile_with_layout(c_path);
+    (p, globals, asm)
+}
+
+/// Like `compile`, but also returns the emitted `.asm` text and the full
+/// locals slot map so a test can assert the runtime routine frames.
+fn compile_with_layout(
+    c_path: &str,
+) -> (Pic14e, HashMap<String, u16>, String, HashMap<String, u16>) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
@@ -71,7 +80,12 @@ fn compile_asm(c_path: &str) -> (Pic14e, HashMap<String, u16>, String) {
     isel_pic14e::verify_page_fit(&m, &asm);
     let words = assemble_words(&PIC16F1937, &asm);
 
-    (Pic14e::with_device(&PIC16F1937, words), layout.globals, asm)
+    (
+        Pic14e::with_device(&PIC16F1937, words),
+        layout.globals,
+        asm,
+        layout.locals,
+    )
 }
 
 /// Run clang alone on `c_path`, returning the `.ll` text and the
@@ -687,5 +701,123 @@ fn interrupt_gate_c_runs_correctly() {
     p.run(500_000);
     assert_eq!(p.ram()[isr_ran], 1, "the ISR ran exactly once after GIE");
     assert_eq!(p.ram()[stage], 3, "main reaches its final stage");
+    assert!(p.halted());
+}
+
+// P6 end-to-end acceptance (docs/33 section 4): i32 (`long`) arithmetic,
+// hardware-multiply routine recipes, and the ISR-context routine
+// duplication. Fixtures are byte-identical to PIC14's; expected values come
+// from the PIC14 e2e tests of the same C source
+// (crates/driver/tests/{long,muldiv,interrupt_mul}_e2e.rs).
+
+#[test]
+fn long_c_runs_correctly() {
+    // Mirrors crates/driver/tests/long_e2e.rs: in = 0x12345678, sin = -19
+    // -> out = 0x1634943A (the whole i32 surface: add/mul/udiv/urem/sdiv/
+    // srem/shifts/icmps/casts/struct-byval-sret).
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/long.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 0x78; // 0x12345678
+    p.ram_mut()[globals["in"] as usize + 1] = 0x56;
+    p.ram_mut()[globals["in"] as usize + 2] = 0x34;
+    p.ram_mut()[globals["in"] as usize + 3] = 0x12;
+    p.ram_mut()[globals["sin"] as usize] = 0xED; // -19 = 0xFFFFFFED
+    p.ram_mut()[globals["sin"] as usize + 1] = 0xFF;
+    p.ram_mut()[globals["sin"] as usize + 2] = 0xFF;
+    p.ram_mut()[globals["sin"] as usize + 3] = 0xFF;
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x3A,
+        "out == 0x1634943A, byte 0"
+    );
+    assert_eq!(p.ram()[globals["out"] as usize + 1], 0x94);
+    assert_eq!(p.ram()[globals["out"] as usize + 2], 0x34);
+    assert_eq!(p.ram()[globals["out"] as usize + 3], 0x16);
+    assert!(p.halted());
+}
+
+#[test]
+fn muldiv_c_runs_correctly() {
+    // Mirrors crates/driver/tests/muldiv_e2e.rs: in = 301 -> out = 210.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/muldiv.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 0x2D; // 301 = 0x012D, lo byte
+    p.ram_mut()[globals["in"] as usize + 1] = 0x01; // hi byte
+    p.run(500_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        210,
+        "out == hand-computed 210"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn interrupt_mul_c_runs_correctly() {
+    // Mirrors crates/driver/tests/interrupt_mul_e2e.rs: main and the ISR
+    // both multiply/divide, so both contexts reach the injected __mul_u8
+    // and __udiv_u8 routines; the _isr copies must have disjoint frames,
+    // which is what makes a mid-routine clobber impossible.
+    let (mut p, globals, asm, locals) = compile_with_layout(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/interrupt_mul.c"
+    ));
+    p.ram_mut()[globals["in_a"] as usize] = 47;
+    p.ram_mut()[globals["in_b"] as usize] = 5;
+    p.ram_mut()[globals["isr_a"] as usize] = 0xAB;
+    p.ram_mut()[globals["isr_b"] as usize] = 3;
+    p.run(1_000_000);
+    // main's context: 47 * 5 = 235 (0xEB), 47 / (5|1) = 47/5 = 9.
+    assert_eq!(p.ram()[globals["out"] as usize], 235, "main mul");
+    assert_eq!(p.ram()[globals["out_q"] as usize], 9, "main div");
+
+    // The ISR context must get its own routine copies with disjoint frames:
+    // an interrupt taken while main is partway through __mul_u8 must not
+    // re-enter the same frame (the bug issue #2 pinned). Both copies exist
+    // in the alloc layout, and no byte of main's frame overlaps the ISR's.
+    let slot_of = |f: &str, name: &str| {
+        *locals
+            .get(&format!("{f}::{name}"))
+            .unwrap_or_else(|| panic!("no slot {f}::{name} in the layout"))
+    };
+    assert!(
+        locals.contains_key("__mul_u8_isr::__scr"),
+        "the ISR context must get its own __mul_u8_isr copy"
+    );
+    // __mul_u8's frame: params a/b + the 6-byte __scr (legalize's
+    // routine_func sizing); same slot set for the _isr copy.
+    let frame = |f: &str| {
+        let (a, b, scr) = (slot_of(f, "a"), slot_of(f, "b"), slot_of(f, "__scr"));
+        [(a, 1), (b, 1), (scr, 6)]
+    };
+    for (ma, msz) in frame("__mul_u8") {
+        for (ia, isz) in frame("__mul_u8_isr") {
+            let overlap = ma < ia + isz && ia < ma + msz;
+            assert!(
+                !overlap,
+                "__mul_u8 frame [0x{ma:02X},+{msz}) overlaps __mul_u8_isr \
+                 [0x{ia:02X},+{isz}) - an interrupt during main's multiply \
+                 would clobber it"
+            );
+        }
+    }
+    // Both routine bodies emit, and the ISR's call targets its own copy.
+    assert!(
+        asm.lines().any(|l| l.trim() == "__mul_u8:"),
+        "main's mul body:\n{asm}"
+    );
+    assert!(
+        asm.lines().any(|l| l.trim() == "__mul_u8_isr:"),
+        "the ISR mul copy must emit its own body:\n{asm}"
+    );
+    assert!(
+        asm.lines().any(|l| l.trim() == "CALL __mul_u8_isr"),
+        "the ISR must call its own __mul_u8_isr copy:\n{asm}"
+    );
     assert!(p.halted());
 }
