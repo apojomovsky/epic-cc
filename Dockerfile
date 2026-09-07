@@ -51,7 +51,7 @@ RUN curl -fsSL -o /tmp/gputils.tar.gz \
     && make install \
     && rm -rf /tmp/gputils-1.5.2 /tmp/gputils.tar.gz
 
-# SDCC 4.6.0 — the SDCC parity oracle (docs/35). Built from source,
+# SDCC 4.6.0: the SDCC parity oracle (docs/35). Built from source,
 # digest-pinned, exactly like gputils. SDCC is GPL: it lives in the image as
 # an external oracle only, never linked or committed into the MIT repo. Its
 # pic14/pic16 ports need gputils (built above) and the boost graph library
