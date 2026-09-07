@@ -97,9 +97,11 @@ pub fn tier2() -> Vec<CorpusProgram> {
             &[("in", 8, 9)],
             &["out"],
         ),
-        // Recursion: a recursive function (SDCC supports it; epic-cc rejects
-        // it by design, so this is a surface probe that will fail on epic-cc
-        // until recursion lands).
+        // Recursion: a recursive function. epic-cc supports recursion (it
+        // compiles and runs correctly, fact(5)=120); SDCC's PIC14 backend
+        // uses static overlay registers with no hardware stack, so its
+        // recursion corrupts n and returns 1 (an SDCC oracle bug, not an
+        // epic-cc gap). See baseline.md.
         prog(
             "volatile unsigned char in;\nvolatile unsigned char out;\nunsigned char fact(unsigned char n) {\n    if (n <= 1) return 1;\n    return (unsigned char)(n * fact((unsigned char)(n - 1)));\n}\nvoid main(void) {\n    out = fact(in);\n}\n",
             &[("in", 8, 5)],

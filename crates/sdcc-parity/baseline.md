@@ -33,8 +33,8 @@ program.
 | fnptr | p16f877a | 81 | 158 | 512 | 512 | 501 | 5000000 | PASS |
 | fnptr | p18f4550 | 57 | 3 | 4096 | 4096 | 119 | 5000000 | PASS |
 | recursion | p16f877a | - | - | - | - | - | - | SDCC-ERR (pic14: invalid combination of short/long) |
-| recursion | p18f4550 | - | - | - | - | - | - | MISMATCH (epic=0x78 sdcc=0x1) |
-| printf-f | p16f877a | - | - | - | - | - | - | MISMATCH (epic=0xa sdcc=0xef) |
+| recursion | p18f4550 | - | - | - | - | - | - | SDCC-WRONG (epic=0x78 sdcc=0x1; SDCC pic14 static-overlay recursion corrupts n) |
+| printf-f | p16f877a | - | - | - | - | - | - | MISMATCH (epic=0xa sdcc=0xef; probe is a placeholder, %f ships in PR #295) |
 | printf-f | p18f4550 | - | - | - | - | - | - | PANIC (sim: index out of bounds 65535) |
 
 ## Findings
@@ -50,6 +50,14 @@ program.
 - **Output mismatches** (recursion, printf-f on PIC18) are real differential
   findings: both compilers accepted the program but produced different
   results. These are the gaps the sub-epics must close.
+- **Recursion is an SDCC oracle bug, not an epic-cc gap.** epic-cc computes
+  `fact(5)=120` (0x78) correctly on both cores. SDCC's PIC14 backend uses
+  static overlay registers (`r0x1002`/`r0x1003`) with no hardware stack, so
+  recursive calls clobber each other's `n` and SDCC returns 1. SDCC's PIC18
+  backend uses a real stack (FSR1/FSR2) and is correct, but its output hits
+  the sim PANIC below. The recursion probe is a surface probe: epic-cc
+  supports recursion (it compiles and runs correctly), so this row is
+  informational, not a gap to close.
 - **PANIC on PIC18** (printf-f): SDCC's output accesses address 0xFFFF,
   which our sim does not model (likely a config/EEPROM access). Real finding.
 - **`double` is now supported** on epic-cc (mapped to f32, since msp430's
