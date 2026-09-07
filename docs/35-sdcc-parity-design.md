@@ -25,10 +25,12 @@ SDCC's strength is surface breadth, not codegen. Its pic16 (PIC18) port
 is "not yet mature and still lacks many features" (SDCC manual 4.10),
 unmaintained, and has **no regression gate** (manual 4.10: "no
 automatic regression tests are currently performed for the PIC16
-target"). Its pic14 port is the same (manual 4.9). So "at least as good
-as SDCC" is a low bar on code size and cycles and a real bar on
-language surface: C99/C11, 64-bit ints, bit-fields, unions, malloc,
-math.h, recursion, priority interrupts.
+target"). Its pic14 port is the same in effect: the manual (4.9.8.5)
+says the full regression suite "does not pass, indicating that there
+are still major bugs in the port". So "at least as good as SDCC" is a
+low bar on code size and cycles and a real bar on language surface:
+C99/C11, 64-bit ints, bit-fields, unions, malloc, math.h, recursion,
+priority interrupts.
 
 epic-cc is already ahead of SDCC in two places, and the DoD must not
 regress them:
@@ -81,18 +83,19 @@ not accidental.
 
 ## 3. Gap inventory
 
-Verified against the SDCC 4.6.2 manual, `pic14devices.txt`,
+Verified against the SDCC 4.6.0 manual, `pic14devices.txt`,
 `supported-devices.ac`, and epic-cc's tree. Items marked **verify** are
 ones where the corpus (P0) is the arbiter: clang's frontend may already
 close them untested.
 
-### PIC18 (SDCC "pic16" port) — epic-cc gaps
+### PIC18 (SDCC "pic16" port): epic-cc gaps
 
 | Capability | SDCC | epic-cc | Note |
 |---|---|---|---|
-| C89 core, 8/16/32-bit ints, float, pointers, arrays, structs, varargs, switch, function pointers, inline asm, `#pragma config` | ✅ | ✅ | parity already |
+| C89 core, 8/16/32-bit ints, float, pointers, arrays, structs, varargs, switch, function pointers, inline asm | ✅ | ✅ | parity already |
+| Config words | ✅ (`#pragma config`) | ✅ (`EPIC_CONFIG` macro) | different syntax, same capability; epic-cc's is ADR-012 |
 | 64-bit `long long` | ✅ | ❌ | backend work (i64 ops) |
-| `double` (64-bit float) | ✅ | ❌ | f32 only; **verify** SDCC's default width |
+| `double` | ✅ (4-byte default, 8-byte via `--double`) | ❌ | f32 only; **verify** SDCC's default width |
 | Bit-fields | ✅ | untested | clang lowers to shift/mask IR we already handle; **verify** |
 | Unions | ✅ | partial | `%union.` globals parse (#165); locals **verify** |
 | Recursion / reentrancy (LARGE stack model) | ✅ | ❌ by design | `Slot::Frame` hook exists (docs/29 D-2); real gap to close |
@@ -106,7 +109,7 @@ close them untested.
 | EEPROM access | ✅ | ❌ | **verify** |
 | Memory models (small/large) | ✅ | ❌ | static overlay only |
 
-### PIC14 (SDCC "pic14" port) — epic-cc gaps
+### PIC14 (SDCC "pic14" port): epic-cc gaps
 
 | Capability | SDCC | epic-cc | Note |
 |---|---|---|---|
@@ -119,7 +122,7 @@ close them untested.
 | 64-bit | ❌ | ❌ | no gap |
 | Enhanced core (16F193x) | experimental (`libsdcce`) | in progress | the PIC14E sub-epic |
 
-### PIC14E — the whole core
+### PIC14E: the whole core
 
 SDCC: experimental support (16F193x, 12F1822, separate `libsdcce`).
 epic-cc: the port is **in progress** (docs/33, issue #228). P1 (asm
@@ -129,13 +132,13 @@ parity on that core.
 
 ## 4. The oracle infrastructure (P0)
 
-**SDCC from source, digest-pinned, in the image** — exactly the gputils
+**SDCC from source, digest-pinned, in the image**: exactly the gputils
 pattern:
 
 - SDCC **4.6.0** (latest release, June 2026) source tarball, sha256
   pinned, built in the Dockerfile.
 - Build deps to add to `base`: `libboost-dev`, `bison`, `flex` (SDCC's
-  build needs them; gputils 1.5.2 is already built — **verify** its
+  build needs them; gputils 1.5.2 is already built; **verify** its
   version is what SDCC 4.6.0's pic ports expect).
 - SDCC's regression suite vendored into the image (GPL, never
   committed).
@@ -148,8 +151,15 @@ differential):
 
 - For each corpus program: compile with epic-cc to hex; compile with
   `sdcc -mpic16 -p18f4550` (or `-mpic14`) through gplink to hex; load
-  both into our sim; seed identical inputs; compare final RAM, ports,
-  and cycle count; record flash words + RAM bytes from both.
+  both into our sim; seed identical inputs; compare the program's
+  declared output globals and ports, matched by name across the two
+  compilers' symbol/map output, plus the cycle count; record flash
+  words + RAM bytes from both. The comparison is scoped to named
+  outputs, never the whole RAM image: the two compilers allocate
+  globals and locals at different addresses with different overlay
+  strategies, so unrelated bytes would differ. This mirrors the fuzz
+  differential (crates/fuzz), which compares a single named checksum
+  global rather than full RAM.
 - Output: per-program table (flash, RAM, cycles, pass/fail) + aggregate
   ratios, published to the CI step summary like the size-regression
   job.
@@ -157,9 +167,9 @@ differential):
 **The corpus** (committed, MIT-clean, ours):
 
 - Tier 1: the existing e2e fixtures (61 on PIC14, 15+ on PIC18).
-- Tier 2: one program per SDCC capability — bit-fields, unions, 64-bit,
+- Tier 2: one program per SDCC capability: bit-fields, unions, 64-bit,
   double, malloc, math, code/eeprom pointers, priority interrupts,
-  recursion, `%f` — each with a hand-computed expected result.
+  recursion, `%f`, each with a hand-computed expected result.
 - Tier 3 (image-only): SDCC's own regression suite, run against both
   compilers, pass-rate comparison.
 
@@ -170,8 +180,12 @@ All five must hold:
 1. **Conformance.** Every Tier-2 corpus program compiles under epic-cc
    and sim-verifies to its hand-computed result.
 2. **Differential.** For every corpus program SDCC accepts, epic-cc's
-   sim-observed final state (RAM, ports, cycle count) matches SDCC's,
-   given identical seeded inputs.
+   sim-observed final state (the program's named output globals and
+   ports, matched by name) matches SDCC's, given identical seeded
+   inputs. Cycle count is not part of this item: two compilers emit
+   different instruction sequences, so an exact cycle match is
+   unachievable and would contradict item 4. Cycle count belongs solely
+   to the <= comparison in item 4.
 3. **Size.** On every corpus program, epic-cc flash words <= SDCC flash
    words and RAM bytes <= SDCC RAM bytes. (Interim: a documented
    per-program ratio, tracked in CI, tightened to <=.)
@@ -219,10 +233,10 @@ established pattern (docs/31, epic-hal#59) is tracking issues + labels
 
 ## 8. Sequencing
 
-- **P0** — SDCC oracle + harness + baseline (blocks everything).
-- **P1** — PIC18 parity (the stated priority; biggest surface).
-- **P2** — PIC14 parity (small; two axes already won).
-- **P3** — PIC14E port + parity (P1-P2 landed; finish P3-P8, then
+- **P0**: SDCC oracle + harness + baseline (blocks everything).
+- **P1**: PIC18 parity (the stated priority; biggest surface).
+- **P2**: PIC14 parity (small; two axes already won).
+- **P3**: PIC14E port + parity (P1-P2 landed; finish P3-P8, then
   parity).
 
 ## 9. Where SDCC's ideas help most
