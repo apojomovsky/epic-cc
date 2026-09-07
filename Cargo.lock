@@ -234,6 +234,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "sdcc-parity"
+version = "0.1.0"
+dependencies = [
+ "device",
+ "pic14-sim",
+]
+
+[[package]]
 name = "serde"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
