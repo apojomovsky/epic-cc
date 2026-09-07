@@ -2603,13 +2603,11 @@ impl<'m> Gen<'m> {
                     // per-byte load/store.
                     //
                     // A bank-straddling destination routes through FSR0
-                    // (docs/33 D-2), and that FSR setup clobbers W
-                    // (MOVLW/MOVWF FSR0L/H + ADDWF), so the loaded byte is
-                    // parked in the fixed hold byte (0x7F, the documented
-                    // free common byte) before the setup and reloaded
-                    // after, mirroring the dynamic memcpy path. A direct
-                    // destination's setup emits nothing, so W survives and
-                    // no park is needed.
+                    // (docs/33 D-2), whose setup clobbers W, so the loaded
+                    // byte is parked in the fixed hold byte (0x7F) before
+                    // the setup and reloaded after. A direct destination's
+                    // setup emits nothing, so W survives and no park is
+                    // needed.
                     let hold: u16 = 0x7F;
                     for i in 0..*n {
                         self.emit_ptr_load_byte(&m.src, i);
