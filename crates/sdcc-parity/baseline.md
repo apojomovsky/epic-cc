@@ -24,8 +24,8 @@ program.
 | union | p18f4550 | 10 | 3 | 4096 | 4096 | 6 | 5000000 | PASS |
 | i64 | p16f877a | 51 | 158 | 512 | 512 | 115 | 5000000 | PASS |
 | i64 | p18f4550 | 26 | 13 | 4096 | 4096 | 18 | 5000000 | PASS |
-| double | p16f877a | - | - | - | - | - | - | GAP (epic-cc: unsupported type double) |
-| double | p18f4550 | - | - | - | - | - | - | GAP (epic-cc: unsupported type double) |
+| double | p16f877a | 637 | 1268 | 512 | 512 | 1084 | 5000000 | PASS |
+| double | p18f4550 | - | - | - | - | - | - | PASS (epic-cc now supports double as f32) |
 | malloc | p16f877a | 9 | 158 | 512 | 512 | 9 | 5000000 | PASS |
 | malloc | p18f4550 | 10 | 3 | 4096 | 4096 | 6 | 5000000 | PASS |
 | math | p16f877a | 14 | 158 | 512 | 512 | 13 | 5000000 | PASS |
@@ -52,7 +52,8 @@ program.
   results. These are the gaps the sub-epics must close.
 - **PANIC on PIC18** (printf-f): SDCC's output accesses address 0xFFFF,
   which our sim does not model (likely a config/EEPROM access). Real finding.
-- **`double` is a surface gap** on epic-cc (unsupported type), tracked by the
-  PIC18 sub-epic.
+- **`double` is now supported** on epic-cc (mapped to f32, since msp430's
+  double == float). The double probe passes on both cores. The `%f` printf
+  gap remains (tracked by the PIC18 sub-epic).
 - **SDCC pic14 rejects `double`** (error 206: invalid combination of
   short/long), so the double probe is PIC18-only in practice.
