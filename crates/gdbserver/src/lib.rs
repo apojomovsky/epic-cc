@@ -197,9 +197,13 @@ impl SingleThreadBase for Pic14Target {
     }
 
     fn write_registers(&mut self, regs: &X86CoreRegs) -> TargetResult<(), Self> {
+        // Every mapped register reads back what gdb wrote: W, PC, the
+        // full STATUS byte (bank bits included), FSR, and PCLATH.
         self.sim.set_w(regs.eax as u8);
         self.sim.set_pc(regs.eip as u16);
-        self.sim.set_bank(((regs.ecx >> 5) & 0b11) as u8);
+        self.sim.ram_mut()[0x03] = regs.ecx as u8;
+        self.sim.ram_mut()[0x04] = regs.edx as u8;
+        self.sim.ram_mut()[0x0A] = regs.ebx as u8;
         Ok(())
     }
 
@@ -211,13 +215,14 @@ impl SingleThreadBase for Pic14Target {
     }
 
     fn write_addrs(&mut self, start_addr: u32, data: &[u8]) -> TargetResult<(), Self> {
-        if start_addr >= RAM_SIZE {
+        let base = start_addr as usize;
+        let end = base + data.len();
+        // Flash is read-only through this surface; a write crossing
+        // the RAM boundary fails loudly instead of dropping its tail.
+        if start_addr >= RAM_SIZE || end > RAM_SIZE as usize {
             return Err(TargetError::NonFatal);
         }
-        let base = start_addr as usize;
-        let end = (base + data.len()).min(RAM_SIZE as usize);
-        let n = end - base;
-        self.sim.ram_mut()[base..base + n].copy_from_slice(&data[..n]);
+        self.sim.ram_mut()[base..end].copy_from_slice(data);
         Ok(())
     }
 
@@ -304,9 +309,10 @@ impl Pic14Target {
             if self.sim.halted() {
                 return Some(SingleThreadStopReason::Terminated(Signal::SIGKILL));
             }
-            if self.breakpoints.contains(&(self.sim.pc() as u32)) {
-                return Some(SingleThreadStopReason::SwBreak(()));
-            }
+            // No pre-step breakpoint check: resuming on a breakpoint
+            // address must advance (gdb lifts the stop's breakpoint
+            // before continuing), and the post-step check below
+            // catches every arrival including a self-loop.
             self.sim.step();
             if self.sim.halted() {
                 return Some(SingleThreadStopReason::Terminated(Signal::SIGKILL));

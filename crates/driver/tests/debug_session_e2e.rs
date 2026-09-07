@@ -118,6 +118,9 @@ fn typed_session_break_print_step() {
             "next",
             "info line",
             "print g_ch",
+            "print g_p.x",
+            "next",
+            "print g_p.x",
             "continue",
             "quit",
         ]
@@ -143,6 +146,10 @@ fn typed_session_break_print_step() {
     // After `next` past line 20, `g_ch` is 43 and the current
     // line advanced to 21.
     assert!(text.contains("$5 = 43"), "print g_ch after next:\n{text}");
+    // The struct member resolves through the aggregate DIEs: still 0
+    // at line 21, then 42 once line 21's store has executed.
+    assert!(text.contains("$6 = 0"), "print g_p.x at line 21:\n{text}");
+    assert!(text.contains("$7 = 42"), "print g_p.x at line 22:\n{text}");
     assert!(
         text.contains("Line 21 of"),
         "step advanced the line:\n{text}"

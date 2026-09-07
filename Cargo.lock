@@ -104,8 +104,6 @@ version = "0.1.0"
 dependencies = [
  "gdbstub",
  "gdbstub_arch",
- "gimli",
- "object",
  "pic14-sim",
 ]
 

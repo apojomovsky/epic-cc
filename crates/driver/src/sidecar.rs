@@ -3,9 +3,9 @@
 //! line rows and the phase-2 typed variable table into one DWARF
 //! compile unit with aggregate DIEs (struct/union members, array
 //! subranges, enums), every location a `DW_OP_addr(constant)` per
-//! docs/34 section 1, inside an `EM_NONE` ELF container (docs/34
-//! section 3 spike: gdb resolves symbols and line tables from it
-//! unchanged).
+//! docs/34 section 1, inside an `EM_386` ELF container (docs/34
+//! section 3 spike: the session runs as i386, so the sidecar declares
+//! the architecture gdb will use).
 
 use alloc::AllocLayout;
 use ir::SrcLoc;
@@ -67,6 +67,11 @@ pub fn joined_vars(layout: &AllocLayout, vars: &DebugVars) -> Vec<VarRecord> {
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
+    // Same-named variables in different functions share one flat C
+    // namespace in the DWARF: first in sorted order wins, so the
+    // sidecar is deterministic no matter how gdb orders its symtabs.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|v| seen.insert(v.name.clone()));
     out
 }
 
@@ -526,15 +531,14 @@ pub fn encode(rows: &[LineRow], layout: &AllocLayout, vars: &DebugVars) -> Vec<u
     out
 }
 
-/// The source path as an absolute path. gdb concatenates the line
-/// table's directory with the file name when it builds the file's
-/// subfile, but uses the CU's `DW_AT_name` verbatim: a relative name
-/// on one side and a composed one on the other would split the
-/// variables and the line rows across two same-basename symtabs, and
-/// the line rows would never be looked up (`watch_main_source_file_-
-/// lossage` only merges into a symbol-less mainsub). Absolute on both
-/// sides keeps one subfile. The textual artifacts keep the relative
-/// clang path; only the sidecar absolutizes.
+/// Split a source path into an absolute directory plus a bare file
+/// name, mirroring what gcc emits.
+/// The line rows must land in the same symtab as the variables:
+/// gdb concatenates the line directory with the file name for the
+/// former but uses the CU name verbatim for the latter, so a relative
+/// name on either side splits same-basename symtabs and the rows are
+/// never looked up. Absolute on both sides keeps one subfile. Only
+/// the sidecar absolutizes; the textual artifacts keep clang's path.
 /// The (directory, file) pair for a source path, mirroring what gcc
 /// emits: the directory is absolute, the file name is relative to it.
 fn source_dir_file(file: &str) -> (String, String) {
