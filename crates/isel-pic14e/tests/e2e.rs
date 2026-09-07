@@ -540,3 +540,152 @@ fn span_c_uses_linear_for_straddling_and_banked_otherwise() {
     );
     assert!(p.halted());
 }
+
+// P5 end-to-end acceptance (docs/33 section 4, D-4): interrupts. The
+// fixtures are byte-identical to PIC14's except for the SFR addresses
+// (PORTB 0x06 -> 0x0D on the 1937; INTCON stays 0x0B), so the expected
+// values come from the PIC14 e2e tests of the same C source
+// (crates/driver/tests/{interrupt,interrupt_gate}_e2e.rs).
+
+#[test]
+fn interrupt_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    // Mirrors crates/driver/tests/interrupt_e2e.rs: in == 0x10, the ISR
+    // fired mid-run right after main's PORTB = 0x11 store -> the ISR's
+    // bump_isr(out) lands before main's bump reads it:
+    //   out = 0x10 -> ISR bumps to 0x11 -> main: bump(0x11)=0x12 -> +1
+    //   = 0x13 -> +bump(2)=3 -> 0x16; PORTB ends 0x22.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/interrupt.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    let out_addr = globals["out"] as usize;
+    p.ram_mut()[in_addr] = 0x10;
+
+    // Run main to the injection point: right after the `PORTB = 0x11`
+    // store (detected by PORTB's value rather than a fixed word count,
+    // since the PIC14E layout is instruction-denser than classic PIC14's).
+    let mut steps = 0usize;
+    while p.ram()[0x0D] != 0x11 {
+        p.step();
+        steps += 1;
+        assert!(
+            steps < 1000,
+            "never reached the PORTB = 0x11 store (pc = {})",
+            p.pc()
+        );
+    }
+    // The pre-ISR state the hand computation starts from. `out == in`
+    // (0x10) is guaranteed: PORTB's store comes after out's store.
+    assert_eq!(p.ram()[out_addr], 0x10, "out == in before the ISR");
+
+    // Fire the interrupt: the hardware saves W/STATUS/BSR/FSR/PCLATH to
+    // its shadow registers, pushes the return PC and jumps to the vector
+    // 0x0004.
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 0x0004, "the ISR starts at the vector");
+
+    // The ISR runs (PORTB = 0x55, out = bump_isr(out)), RETFIE restores
+    // the shadow context and returns to the interrupted instruction, and
+    // main completes: out == 0x16, PORTB == 0x22, then the __start SLEEP
+    // halts the machine.
+    p.run(500_000);
+    assert_eq!(
+        p.ram()[out_addr],
+        0x16,
+        "out == hand-computed 0x16 (ISR bump 0x10 -> 0x11, then 0x11 -> 0x12 -> 0x13 -> 0x16)"
+    );
+    assert_eq!(
+        p.ram()[0x0D],
+        0x22,
+        "PORTB == 0x22 (main's final SFR write)"
+    );
+    assert!(p.halted());
+}
+
+/// P5 acceptance (docs/33 section 4, D-4): the ISR must be emitted with NO
+/// manual save/restore prologue, because the hardware shadow registers save
+/// W, STATUS, BSR, FSR0, FSR1 and PCLATH on entry and restore them on
+/// RETFIE. A simulation pass alone cannot distinguish "the hardware saved
+/// it" from "we saved it manually and it happened to work", so this static
+/// assertion on the emitted `.asm` is the point of the phase's acceptance.
+/// The old manual prologue used `SWAPF 0x75, F` / `SWAPF STATUS, W` /
+/// `MOVF PCLATH, W` / `MOVF FSR, W`; none of those may appear, and a
+/// `RETFIE` must close the handler.
+#[test]
+fn interrupt_c_emits_no_manual_context_save() {
+    let (_p, _globals, asm) = compile_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/interrupt.c"
+    ));
+    let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
+    let manual_save = [
+        "SWAPF 0x75, F",
+        "SWAPF STATUS, W",
+        "SWAPF 0x76, W",
+        "SWAPF 0x75, W",
+    ];
+    for idiom in manual_save {
+        assert!(
+            !lines.iter().any(|l| *l == idiom),
+            "interrupt.c must not emit the manual context-save idiom `{idiom}` \
+             (the hardware shadow registers save W/STATUS/BSR/FSR/PCLATH, D-4):\n{asm}"
+        );
+    }
+    assert!(
+        !lines
+            .iter()
+            .any(|l| *l == "MOVF PCLATH, W" || *l == "MOVF FSR, W"),
+        "interrupt.c must not read back PCLATH/FSR to save them (the hardware \
+         shadows them, D-4):\n{asm}"
+    );
+    assert!(
+        lines.iter().any(|l| *l == "RETFIE"),
+        "interrupt.c must close the ISR with RETFIE (the hardware restores \
+         the shadow context there):\n{asm}"
+    );
+}
+
+/// P5 acceptance (docs/33 section 4, D-4), the gating path: a request made
+/// while GIE is clear stays pending; it is taken only once main unmasks,
+/// and exactly once. Mirrors crates/driver/tests/interrupt_gate_e2e.rs.
+#[test]
+fn interrupt_gate_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/interrupt_gate.c"
+    ));
+    let stage = globals["stage"] as usize;
+    let isr_ran = globals["isr_ran"] as usize;
+
+    // Run into the masked window (stage == 1) and request the interrupt.
+    let mut steps = 0usize;
+    while p.ram()[stage] != 1 {
+        p.step();
+        steps += 1;
+        assert!(steps < 1000, "never reached stage 1 (pc = {})", p.pc());
+    }
+    p.request_interrupt();
+    assert!(p.interrupt_pending(), "the request latches");
+
+    // Through the whole masked window the handler must not run.
+    steps = 0;
+    while p.ram()[stage] != 2 {
+        p.step();
+        steps += 1;
+        assert!(steps < 1000, "never reached stage 2 (pc = {})", p.pc());
+    }
+    assert_eq!(
+        p.ram()[isr_ran],
+        0,
+        "the masked window must not run the ISR"
+    );
+
+    // Main sets GIE; the pending request is taken, once.
+    p.run(500_000);
+    assert_eq!(p.ram()[isr_ran], 1, "the ISR ran exactly once after GIE");
+    assert_eq!(p.ram()[stage], 3, "main reaches its final stage");
+    assert!(p.halted());
+}
