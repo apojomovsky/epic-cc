@@ -580,19 +580,33 @@ impl Pic14 {
     /// Read `len` bytes of the data image starting at direct-operand
     /// address `addr`, each byte banked-resolved the way `banked_addr`
     /// resolves the machine's own direct operands (so `read_mem(0x20, 4)`
-    /// with bank 1 selected reads 0xA0..0xA3). INDF and PCL keep their
-    /// machine semantics.
+    /// with bank 1 selected reads 0xA0..0xA3). INDF reads and PCL reads
+    /// keep their machine semantics; a PCL byte written here is stored,
+    /// not loaded into the PC: use `set_pc` for that. Panics when `addr`
+    /// leaves the 7-bit direct-operand space: no ISA operand can name
+    /// it, so there is no machine-faithful resolution.
     pub fn read_mem(&self, addr: u8, len: usize) -> Vec<u8> {
+        self.check_operand_range(addr);
         (0..len)
-            .map(|i| self.read_f(addr.wrapping_add(i as u8) as usize))
+            .map(|i| self.read_f((addr.wrapping_add(i as u8) & 0x7F) as usize))
             .collect()
     }
 
     /// Write bytes into the data image, resolved like `read_mem`.
     pub fn write_mem(&mut self, addr: u8, bytes: &[u8]) {
+        self.check_operand_range(addr);
         for (i, &b) in bytes.iter().enumerate() {
-            self.write_f(addr.wrapping_add(i as u8) as usize, b);
+            self.write_f((addr.wrapping_add(i as u8) & 0x7F) as usize, b);
         }
+    }
+
+    /// A span must start in the 7-bit direct-operand space; the span
+    /// itself wraps per byte, like consecutive operands.
+    fn check_operand_range(&self, addr: u8) {
+        assert!(
+            addr <= 0x7F,
+            "read_mem/write_mem: {addr:#04X} is outside the 7-bit direct-operand space"
+        );
     }
 
     /// Read one program-flash word.

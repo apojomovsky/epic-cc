@@ -99,6 +99,15 @@ fn memory_round_trips_across_a_bank_boundary() {
 }
 
 #[test]
+#[should_panic(expected = "outside the 7-bit direct-operand space")]
+fn memory_rejects_addresses_no_operand_can_name() {
+    let mut p = Pic14::new(short_program());
+    // 0x80 is not a direct operand: no ISA operand can name it, so the
+    // surface refuses it instead of silently touching another bank.
+    p.write_mem(0x80, &[0x77]);
+}
+
+#[test]
 fn program_flash_reads_return_the_word() {
     let p = Pic14::new(short_program());
     assert_eq!(p.read_prog_word(0), Some(0x3055));
