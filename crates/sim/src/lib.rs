@@ -502,6 +502,105 @@ impl Pic14 {
     }
 }
 
+/// Why `run_until` stopped: the target address is the next instruction,
+/// the program ran past its last word, or the step cap expired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    Reached,
+    Halted,
+    Capped,
+}
+
+impl Pic14 {
+    /// STATUS, the flag/bank register at 0x03.
+    pub fn status(&self) -> u8 {
+        self.ram[3]
+    }
+
+    /// The active GPR bank (STATUS RP1:RP0), 0-3.
+    pub fn bank(&self) -> u8 {
+        ((self.ram[3] >> 5) & 0b11) as u8
+    }
+
+    /// Select the GPR bank (writes RP1:RP0, the other STATUS bits keep
+    /// their values).
+    pub fn set_bank(&mut self, bank: u8) {
+        self.ram[3] = (self.ram[3] & !(0b11 << 5)) | ((bank & 0b11) << 5);
+    }
+
+    /// FSR, the indirect-address register at 0x04.
+    pub fn fsr(&self) -> u8 {
+        self.ram[0x04]
+    }
+
+    /// PCLATH, the PC latch at 0x0A.
+    pub fn pclath(&self) -> u8 {
+        self.ram[0x0A]
+    }
+
+    /// INTCON, the interrupt control register at 0x0B.
+    pub fn intcon(&self) -> u8 {
+        self.ram[INTCON]
+    }
+
+    /// Set the working register.
+    pub fn set_w(&mut self, v: u8) {
+        self.w = v;
+    }
+
+    /// Set the program counter. Execution resumes from the written
+    /// address; the halted flag tracks it, so writing an in-range
+    /// address resumes a program that ran off its end.
+    pub fn set_pc(&mut self, addr: u16) {
+        self.pc = addr;
+        self.halted = addr as usize >= self.prog.len();
+    }
+
+    /// Run until `pc` reaches `target`, the program halts, or
+    /// `max_steps` instructions have executed. The breakpoint primitive:
+    /// the adapter owns the breakpoint set and calls this per stop, so
+    /// the sim keeps no breakpoint state of its own.
+    pub fn run_until(&mut self, target: u16, max_steps: usize) -> StopReason {
+        let mut steps = 0;
+        loop {
+            if self.pc == target {
+                return StopReason::Reached;
+            }
+            if self.halted {
+                return StopReason::Halted;
+            }
+            if steps >= max_steps {
+                return StopReason::Capped;
+            }
+            self.step();
+            steps += 1;
+        }
+    }
+
+    /// Read `len` bytes of the data image starting at direct-operand
+    /// address `addr`, each byte banked-resolved the way `banked_addr`
+    /// resolves the machine's own direct operands (so `read_mem(0x20, 4)`
+    /// with bank 1 selected reads 0xA0..0xA3). INDF and PCL keep their
+    /// machine semantics.
+    pub fn read_mem(&self, addr: u8, len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| self.read_f(addr.wrapping_add(i as u8) as usize))
+            .collect()
+    }
+
+    /// Write bytes into the data image, resolved like `read_mem`.
+    pub fn write_mem(&mut self, addr: u8, bytes: &[u8]) {
+        for (i, &b) in bytes.iter().enumerate() {
+            self.write_f(addr.wrapping_add(i as u8) as usize, b);
+        }
+    }
+
+    /// Read one program-flash word.
+    pub fn read_prog_word(&self, addr: u16) -> Option<u16> {
+        self.prog.get(addr as usize).copied()
+    }
+}
+
 /// The three FSR address regions of the Enhanced Mid-range core
 /// (DS41364E section 3.5): traditional data memory 0x000-0xFFF, the
 /// linear alias 0x2000-0x29AF (banks 0-30, 80 GPR bytes per bank, the 16
