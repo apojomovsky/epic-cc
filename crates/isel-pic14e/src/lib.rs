@@ -554,7 +554,18 @@ impl<'m> Gen<'m> {
                     !self.global_is_const(g),
                     "isel: store to const (flash) global @{g}"
                 );
-                Addr::Direct(self.global_addr(g) + u16::from(byte_off))
+                let span = self.global_size(g);
+                if object_straddles(self.device, self.global_addr(g), span) {
+                    // A bank-straddling global (docs/33 D-2): route through
+                    // FSR0 with the linear base so one FSR walks the whole
+                    // object across banks (a direct file-register access
+                    // would walk into the common-RAM hole past the bank
+                    // boundary).
+                    self.emit_fsr_to(self.global_addr(g), 0, &[], byte_off, span);
+                    Addr::Indirect
+                } else {
+                    Addr::Direct(self.global_addr(g) + u16::from(byte_off))
+                }
             }
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
@@ -598,6 +609,40 @@ impl<'m> Gen<'m> {
                                 self.emit_fsr_to(sa, k, &terms, byte_off, span);
                                 Addr::Indirect
                             }
+                        }
+                    }
+                }
+            }
+            Val::Const(_) => panic!("isel: pointer operand must be a register or global"),
+        }
+    }
+
+    /// Pure mirror of `emit_ptr_setup`'s addressing-mode decision: whether
+    /// `ptr + byte_off` completes through FSR0 (`Indirect`) rather than a
+    /// plain file register (`Direct`). Emits nothing. Used by the constant
+    /// memcpy path to decide whether the loaded byte must be parked before
+    /// the destination's FSR setup (which clobbers W).
+    fn ptr_setup_is_indirect(&self, ptr: &Val, _byte_off: u8) -> bool {
+        match ptr {
+            Val::Global(g) => {
+                let span = self.global_size(g);
+                object_straddles(self.device, self.global_addr(g), span)
+            }
+            Val::Reg(r) => {
+                let (base, _k, terms) = self.resolved_for(r);
+                match &base {
+                    Base::Global(name) => {
+                        let span = self.object_span(&base);
+                        !(terms.is_empty()
+                            && !object_straddles(self.device, self.global_addr(name), span))
+                    }
+                    Base::Slot(sname, indirect) => {
+                        let sa = self.slot_addr(self.cur_func, sname).direct();
+                        if *indirect || self.param_holds_addr(sname) {
+                            true
+                        } else {
+                            let span = self.object_span(&base);
+                            !(terms.is_empty() && !object_straddles(self.device, sa, span))
                         }
                     }
                 }
@@ -669,15 +714,6 @@ impl<'m> Gen<'m> {
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => self.emit(format!("    MOVF 0x{a:02X}, W")),
             Addr::Indirect => self.emit("    MOVF INDF0, W".to_string()),
-        }
-    }
-
-    /// `RAM[ptr + byte_off] = W`: the store side of a byte access (memcpy
-    /// destinations; `emit_ptr_store_byte` composes a val load before it).
-    fn emit_ptr_store_w(&mut self, ptr: &Val, byte_off: u8) {
-        match self.emit_ptr_setup(ptr, byte_off) {
-            Addr::Direct(a) => self.emit(format!("    MOVWF 0x{a:02X}")),
-            Addr::Indirect => self.emit("    MOVWF INDF0".to_string()),
         }
     }
 
@@ -2565,9 +2601,34 @@ impl<'m> Gen<'m> {
                     // dst[i]. Each byte re-resolves both pointers (dst
                     // itself may be a base+k+i expression), exactly like a
                     // per-byte load/store.
+                    //
+                    // A bank-straddling destination routes through FSR0
+                    // (docs/33 D-2), and that FSR setup clobbers W
+                    // (MOVLW/MOVWF FSR0L/H + ADDWF), so the loaded byte is
+                    // parked in the fixed hold byte (0x7F, the documented
+                    // free common byte) before the setup and reloaded
+                    // after, mirroring the dynamic memcpy path. A direct
+                    // destination's setup emits nothing, so W survives and
+                    // no park is needed.
+                    let hold: u16 = 0x7F;
                     for i in 0..*n {
                         self.emit_ptr_load_byte(&m.src, i);
-                        self.emit_ptr_store_w(&m.dst, i);
+                        if self.ptr_setup_is_indirect(&m.dst, i) {
+                            // The destination's FSR setup clobbers W, so
+                            // park the loaded byte first and reload after.
+                            self.emit(format!("    MOVWF 0x{hold:02X}"));
+                            self.emit_ptr_setup(&m.dst, i);
+                            self.emit(format!("    MOVF 0x{hold:02X}, W"));
+                            self.emit("    MOVWF INDF0".to_string());
+                        } else {
+                            // Direct destination: setup emits nothing, W
+                            // survives.
+                            let a = match self.emit_ptr_setup(&m.dst, i) {
+                                Addr::Direct(a) => a,
+                                Addr::Indirect => unreachable!(),
+                            };
+                            self.emit(format!("    MOVWF 0x{a:02X}"));
+                        }
                     }
                 }
                 MemLen::Reg(v) => self.emit_memcpy_dynamic(&m.dst, &m.src, v),
