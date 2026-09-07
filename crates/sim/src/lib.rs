@@ -1691,6 +1691,14 @@ impl Pic18 {
                 self.set_zn(r);
                 self.write_d(d, a, f, r);
             }
+            0x0400 => {
+                // DECF: f - 1
+                let fv = self.read_f(a, f);
+                let r = fv.wrapping_sub(1);
+                self.sub_flags(fv, 1, r);
+                self.set_zn(r);
+                self.write_d(d, a, f, r);
+            }
             other => panic!(
                 "sim(pic18): byte opcode base {other:#06x} (word {word:#06x}) not yet implemented"
             ),

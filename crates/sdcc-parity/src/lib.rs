@@ -223,8 +223,14 @@ fn compile_sdcc(
 
     // Re-run gplink with -m on the same objects to get the symbol map. The
     // object is prog.o in the work dir; the libs are in the SDCC lib dirs.
+    // The `-o` output goes to a THROWAWAY hex (maponly.hex), NOT prog.hex:
+    // SDCC's own link already produced the correct prog.hex (with the crt0
+    // startup that sets up the stack), and gplink's re-link here omits the
+    // crt0 object, so writing it over prog.hex would clobber the good hex
+    // with a broken one (no reset-vector startup, uninitialized FSRs).
     let obj = dir.path.join("prog.o");
-    let map_path = dir.path.join("prog.map");
+    let map_path = dir.path.join("maponly.map");
+    let map_hex = dir.path.join("maponly.hex");
     let lib_dir = format!("/usr/local/share/sdcc/lib/{port}");
     let nonfree_dir = format!("/usr/local/share/sdcc/non-free/lib/{port}");
     let lib = format!("libsdcc.lib");
@@ -242,7 +248,7 @@ fn compile_sdcc(
         .arg(format!("-I{lib_dir}"))
         .arg(format!("-I{nonfree_dir}"))
         .args(["-w", "-r", "-m", "-o"])
-        .arg(&hex_path)
+        .arg(&map_hex)
         .arg(&obj)
         .arg(&lib)
         .arg(&devlib)
