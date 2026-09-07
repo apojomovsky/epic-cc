@@ -1,0 +1,34 @@
+// Issue #15 acceptance: a program that MASKS interrupts with INTCON, so the
+// simulator's GIE / enable-bit modelling is what decides when the handler
+// runs.
+//
+// INTCON is the F877A interrupt control register, bank-independent at 0x0B:
+//   bit 7 GIE  global interrupt enable
+//   bit 4 INTE RB0/INT external interrupt enable
+//   bit 1 INTF RB0/INT external interrupt flag
+//
+// The e2e requests an interrupt while `stage == 1`, i.e. with INTE set but
+// GIE still clear. A simulator that ignores INTCON would vector immediately;
+// the modelled one latches the request and takes it only after main writes
+// GIE at stage 2. `stage` makes each window observable from the test.
+//
+// Expected: isr_ran == 0 for the whole masked window, then exactly 1 after
+// GIE goes up. Exactly one, not more — the handler never clears INTF, so a
+// simulator that re-armed on the still-set flag would spin in the handler
+// and never reach the final stage.
+#define INTCON (*(volatile unsigned char *)0x0B)
+
+volatile unsigned char isr_ran;
+volatile unsigned char stage;
+
+__attribute__((interrupt(0))) void isr(void) {
+    isr_ran = (unsigned char)(isr_ran + 1);
+}
+
+void main(void) {
+    stage = 1;      // the test requests the interrupt in this window
+    INTCON = 0x10;  // INTE set, GIE clear: enabled source, still masked
+    stage = 2;      // still masked here
+    INTCON = 0x90;  // GIE | INTE: unmasked, the pending request is taken
+    stage = 3;      // reached only if the handler ran once and returned
+}
