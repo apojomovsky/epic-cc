@@ -65,3 +65,50 @@ jobs:
             docker run --rm -v "$PWD:/workspace" -w /workspace -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home epic-cc-ci:latest bash scripts/sanity.sh "$stem"
             echo "::endgroup::"
           done
+
+  sdcc-parity:
+    name: sdcc-parity differential
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ci image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          target: ci
+          load: true
+          tags: epic-cc-ci:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+
+      - name: Cache cargo target dir
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: cargo-${{ runner.os }}-sdcc-parity-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-sdcc-parity-
+            cargo-${{ runner.os }}-
+
+      - name: Cache cargo home
+        uses: actions/cache@v5
+        with:
+          path: /tmp/cargo-home
+          key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Run the SDCC parity differential
+        run: |
+          docker run --rm -v "$PWD:/workspace" -w /workspace \
+            -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
+            -e GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            epic-cc-ci:latest bash scripts/sdcc-parity.sh

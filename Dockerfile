@@ -33,6 +33,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         creduce \
         cvise \
         poppler-utils \
+        flex \
+        bison \
+        libboost-graph-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # gputils 1.5.2 — test oracle (gpasm byte-for-byte cross-checks). Built from
@@ -47,6 +50,35 @@ RUN curl -fsSL -o /tmp/gputils.tar.gz \
     && make -j"$(nproc)" \
     && make install \
     && rm -rf /tmp/gputils-1.5.2 /tmp/gputils.tar.gz
+
+# SDCC 4.6.0 — the SDCC parity oracle (docs/35). Built from source,
+# digest-pinned, exactly like gputils. SDCC is GPL: it lives in the image as
+# an external oracle only, never linked or committed into the MIT repo. Its
+# pic14/pic16 ports need gputils (built above) and the boost graph library
+# (apt, above). The regression suite ships in the tarball under
+# support/regression/ and is used by the parity harness (Tier 3), never
+# committed.
+RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
+        https://downloads.sourceforge.net/project/sdcc/sdcc/4.6.0/sdcc-src-4.6.0.tar.bz2 \
+    && echo "5fd6a93e5997ce01756868fe35e441095cfb637894a80c262514a634094973b6  /tmp/sdcc.tar.bz2" | sha256sum -c - \
+    && tar -xjf /tmp/sdcc.tar.bz2 -C /tmp \
+    && cd /tmp/sdcc-4.6.0 \
+    && ./configure --prefix=/usr/local \
+        --disable-mcs51-port --disable-z80-port --disable-z180-port \
+        --disable-r2k-port --disable-r2ka-port --disable-r3ka-port \
+        --disable-r4k-port --disable-r5k-port --disable-r6k-port \
+        --disable-sm83-port --disable-tlcs90-port --disable-ez80-port \
+        --disable-z80n-port --disable-r800-port --disable-ds390-port \
+        --disable-ds400-port --disable-hc08-port --disable-s08-port \
+        --disable-stm8-port --disable-pdk13-port --disable-pdk14-port \
+        --disable-pdk15-port --disable-mos6502-port --disable-mos65c02-port \
+        --disable-f8-port --disable-f8l-port \
+    && make -j"$(nproc)" \
+    && make install \
+    && make -C device/non-free/lib install \
+    && mkdir -p /usr/local/share/sdcc/regression \
+    && cp -r support/regression/* /usr/local/share/sdcc/regression/ \
+    && rm -rf /tmp/sdcc-4.6.0 /tmp/sdcc.tar.bz2
 
 FROM base AS clang-builder
 
@@ -97,6 +129,8 @@ ENV PIC8_CLANG_UNWRAPPED=/opt/clang/bin/clang \
     PIC8_CLANG_RESOURCE_DIR=/opt/clang/lib/clang/20 \
     PIC8_HOST_CLANG=/opt/clang/bin/clang \
     PIC8_GPASM=/usr/local/bin/gpasm \
+    PIC8_SDCC=/usr/local/bin/sdcc \
+    PIC8_SDCC_REGRESSION=/usr/local/share/sdcc/regression \
     PIC8_VENDOR_DIR=/workspace/vendor \
     PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00
 
