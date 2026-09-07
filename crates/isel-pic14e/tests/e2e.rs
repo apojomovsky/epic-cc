@@ -49,6 +49,31 @@ fn compile(c_path: &str) -> (Pic14e, HashMap<String, u16>) {
     (Pic14e::with_device(&PIC16F1937, words), layout.globals)
 }
 
+/// Like `compile`, but also returns the emitted `.asm` text so a test can
+/// inspect the addressing mode (linear vs banked) chosen for an object.
+fn compile_asm(c_path: &str) -> (Pic14e, HashMap<String, u16>, String) {
+    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
+    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
+    let mut m = irparse::parse_ll(&ll);
+    m = wholeprog::merge(m);
+    m = legalize::legalize(m);
+    let cg = callgraph::build(&m);
+    callgraph::check_depth(&cg, PIC16F1937.stack_depth as usize);
+    let layout = alloc::allocate(&PIC16F1937, &m, &callgraph::edges_text(&cg));
+    let mut addrs: HashMap<String, u16> = HashMap::new();
+    addrs.extend(layout.globals.clone());
+    addrs.extend(layout.locals.clone());
+    let asm = select(&PIC16F1937, &m, &addrs);
+    let asm = schedule(&PIC16F1937, &asm);
+    let asm = assign_banks(&PIC16F1937, &asm);
+    let asm = optimize(&asm);
+    isel_pic14e::verify_page_fit(&m, &asm);
+    let words = assemble_words(&PIC16F1937, &asm);
+
+    (Pic14e::with_device(&PIC16F1937, words), layout.globals, asm)
+}
+
 /// Run clang alone on `c_path`, returning the `.ll` text and the
 /// dependency-file text (the driver's header-detect reads the latter; the
 /// P2 fixtures include no headers, so it is unused here but kept for
@@ -228,5 +253,162 @@ fn banked_routine_c_runs_correctly() {
     let out_addr = globals["out"] as usize;
     assert_eq!(p.ram()[out_addr], 0xB7, "out low byte: 3255 = 0x0CB7");
     assert_eq!(p.ram()[out_addr + 1], 0x0C, "out high byte: 3255 = 0x0CB7");
+    assert!(p.halted());
+}
+
+// P3 end-to-end acceptance (docs/33 section 4): pointers, arrays and
+// structs via FSR0/1, plus linear addressing (D-2) for objects that
+// straddle a bank. The fixtures are byte-identical to the PIC18 ones of
+// the same C source (crates/isel-pic18/tests/fixtures/), so the expected
+// values come from the PIC18 e2e tests; `ptr_probe.c` is the RAM-only
+// variant (const-flash reads are P4).
+
+#[test]
+fn ptr_probe_c_runs_correctly() {
+    // in = 0x0035; i = 0x35 & 7 = 5; ram[5] = 0x35; out = ram[5] = 0x35.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptr_probe.c"
+    ));
+    let in_addr = globals["in"] as usize;
+    p.ram_mut()[in_addr] = 0x35; // in low byte
+    p.ram_mut()[in_addr + 1] = 0x00; // in high byte
+    p.run(200_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x35,
+        "out == in's low byte read back through the pointer"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn array_c_runs_correctly() {
+    // in low byte = 3 (high byte stays 0) -> buf[3] = 4 -> out = buf[3] = 4.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/array.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 3; // in low byte = 3 (high byte stays 0)
+    p.run(200_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 4, "out == buf[3] == 3+1");
+    assert!(p.halted());
+}
+
+#[test]
+fn structs_c_runs_correctly() {
+    // No input seeding, every value is a fixed constant, so out == 0x4E
+    // (hand trace in the fixture's comment).
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/structs.c"
+    ));
+    p.run(200_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x4E,
+        "out == hand-computed 0x4E"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn banked_ptr_c_runs_correctly() {
+    // in low byte = 3 (high byte stays 0) -> out == 0xB8 (hand trace in
+    // the fixture's comment).
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/banked_ptr.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 3; // in low byte = 3 (high byte stays 0)
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0xB8,
+        "out == hand-computed 0xB8 for in == 3"
+    );
+    assert!(p.halted());
+}
+
+/// P3's linear-addressing acceptance (docs/33 section 4): a bank-straddling
+/// array must be addressed through the linear region (FSR base in
+/// 0x2000-0x29AF) so one FSR walks across banks, while a single-bank array
+/// is addressed through the physical (banked) FSR base. The `.asm` is
+/// inspected directly, not just the simulated output, so a coincidentally
+/// correct byte cannot pass.
+#[test]
+fn span_c_uses_linear_for_straddling_and_banked_otherwise() {
+    let (mut p, globals, asm) = compile_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/span.c"
+    ));
+    // The spanning array `big` straddles bank 0 -> bank 1, so its FSR base
+    // must be the linear alias (0x2000 + bank*80 + (off-0x20)); the
+    // single-bank `small` must use its physical base (0xAC, bank 1).
+    let big = globals["big"];
+    let small = globals["small"];
+    // `big` starts in bank 0's GPR and its 90 bytes do not fit the bank-0
+    // GPR window (0x20-0x6F), so it straddles into bank 1 (the common-RAM
+    // hole 0x70-0x7F is skipped).
+    assert!(
+        big >= 0x20 && big <= 0x6F && 0x6F - big + 1 < 90,
+        "span.c layout: big[90] at 0x{big:03X} must straddle bank 0 -> bank 1"
+    );
+    assert!(
+        small >= 0xA0 && small + 8 <= 0xEF,
+        "span.c layout: small[8] at 0x{small:03X} must fit bank 1"
+    );
+    // Linear base for `big`: 0x2000 + bank0*80 + (0x22 - 0x20) = 0x2002.
+    let linear_base = 0x2000 + (big & 0x7F) - 0x20;
+    assert!(
+        (0x2000..=0x29AF).contains(&linear_base),
+        "big's linear base 0x{linear_base:04X} must be in the linear region"
+    );
+    // The asm must load FSR0H with 0x20 (the linear region's high byte) for
+    // the spanning accesses, and with 0x00 for the banked `small` accesses.
+    // Simpler, robust check: the asm must contain a MOVLW 0x20 immediately
+    // before a MOVWF FSR0H (linear high byte) AND a MOVLW 0x00 before a
+    // MOVWF FSR0H (banked high byte), and the linear base 0x2002 must be
+    // loaded (MOVLW 0x02; MOVWF FSR0L) for the spanning accesses.
+    let lines: Vec<&str> = asm.lines().map(|l| l.trim()).collect();
+    let mut linear_hi = false;
+    let mut banked_hi = false;
+    let mut linear_lo = false;
+    for (i, l) in lines.iter().enumerate() {
+        if *l == "MOVWF FSR0H" {
+            if let Some(prev) = lines.get(i.wrapping_sub(1)) {
+                if *prev == "MOVLW 0x20" {
+                    linear_hi = true;
+                } else if *prev == "MOVLW 0x00" {
+                    banked_hi = true;
+                }
+            }
+        }
+        if *l == "MOVWF FSR0L" {
+            if let Some(prev) = lines.get(i.wrapping_sub(1)) {
+                if *prev == "MOVLW 0x02" {
+                    linear_lo = true;
+                }
+            }
+        }
+    }
+    assert!(
+        linear_hi && linear_lo,
+        "span.c must address the straddling array through the linear region \
+         (FSR0 = 0x2002):\n{asm}"
+    );
+    assert!(
+        banked_hi,
+        "span.c must address the single-bank array through the physical \
+         (banked) FSR base:\n{asm}"
+    );
+    // And the simulated result must be right: in = 3 -> 0x11 + 0x22 + 0x33.
+    p.ram_mut()[globals["in"] as usize] = 3;
+    p.run(200_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x66,
+        "out == 0x11 + 0x22 + 0x33 for in == 3"
+    );
     assert!(p.halted());
 }
