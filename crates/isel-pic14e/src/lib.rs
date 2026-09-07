@@ -87,66 +87,41 @@ fn literal_ptr_addr(ptr: &str) -> u16 {
         .unwrap_or_else(|_| panic!("isel: malformed literal pointer {ptr:?}"))
 }
 
-/// The GPR windows reachable through FSR+IRP, derived from the device's
-/// `ram_banks` and `common_ram`. Each bank's window is the GPR bank itself
-/// plus, for the first bank, the common RAM that is bank-mirrored. The
-/// concrete windows for the 877A are `[0x20,0x80) [0xA0,0xF0) [0x120,0x170)
-/// [0x1A0,0x1F0)`; other PIC14 parts derive analogously from their
-/// `ram_banks`/`common_ram`.
-fn fsr_window(device: &Device, base_addr: u16, span: u16) -> (bool, u8) {
-    // Derive windows from the device. First bank's window extends through
-    // common RAM when common directly follows its GPR (0x6F -> 0x70-0x7F -> 0x80).
-    let mut windows: Vec<(u16, u16)> = Vec::new();
-    for (i, (lo, hi)) in device.ram_banks.iter().enumerate() {
-        let mut end = hi + 1;
-        if i == 0 {
-            if let Some((clo, chi)) = device.common_ram {
-                if clo == hi + 1 {
-                    end = chi + 1;
-                }
-            }
-        }
-        windows.push((*lo, end));
+/// Whether an object at `base_addr` spanning `span` bytes straddles a GPR
+/// bank boundary on this device (docs/33 D-2): the object's physical bytes
+/// do not all fit inside one bank's GPR window. On PIC14E such an object is
+/// addressed through the linear region so one FSR walks across banks; on
+/// every other core it is unrepresentable (classic PIC14's FSR+IRP cannot
+/// cross a bank) and the allocator never produces one.
+fn object_straddles(device: &Device, base_addr: u16, span: u16) -> bool {
+    let (_, end) = device
+        .region_for(base_addr)
+        .expect("isel: FSR base 0x{base_addr:03X} outside GPR space (device {device.name})");
+    base_addr + span - 1 > end
+}
+
+/// The FSR base address for an object at `base_addr` spanning `span` bytes:
+/// the physical address when the object fits one GPR bank (banked
+/// addressing), or the linear alias when it straddles a bank boundary
+/// (docs/33 D-2). The linear alias is `0x2000 + bank * 80 +
+/// (physical_offset - 0x20)` for `physical_offset` in a bank's 80-byte GPR
+/// window (0x20-0x6F within the bank; common RAM excluded, bank 31
+/// excluded), a fixed per-core constant confirmed identical for the 1937
+/// and 1939. On PIC14E FSR0/FSR1 are 16-bit, so the base is loaded into
+/// FSR0L/FSR0H directly and one FSR walks the whole object across banks.
+fn fsr_base(device: &Device, base_addr: u16, span: u16) -> u16 {
+    if !object_straddles(device, base_addr, span) {
+        return base_addr;
     }
-    // Common RAM addresses are inside the first window; treat them as bank 0.
-    let win_end = if let Some((clo, chi)) = device.common_ram {
-        if base_addr >= clo && base_addr <= chi {
-            windows[0].1
-        } else {
-            let mut found = None;
-            for ((lo, hi), (_, we)) in device.ram_banks.iter().zip(&windows) {
-                if base_addr >= *lo && base_addr <= *hi {
-                    found = Some(*we);
-                    break;
-                }
-            }
-            found.unwrap_or_else(|| {
-                panic!(
-                    "isel: FSR base 0x{base_addr:03X} outside GPR space (device {})",
-                    device.name
-                )
-            })
-        }
-    } else {
-        let mut found = None;
-        for ((lo, hi), (_, we)) in device.ram_banks.iter().zip(&windows) {
-            if base_addr >= *lo && base_addr <= *hi {
-                found = Some(*we);
-                break;
-            }
-        }
-        found.unwrap_or_else(|| {
-            panic!(
-                "isel: FSR base 0x{base_addr:03X} outside GPR space (device {})",
-                device.name
-            )
-        })
-    };
-    assert!(
-        base_addr + span <= win_end,
-        "isel: FSR object at 0x{base_addr:03X} span {span} crosses window end 0x{win_end:X} (SFR hole)"
-    );
-    (((base_addr >> 8) & 1) == 1, (base_addr & 0xFF) as u8)
+    let bank = device
+        .ram_banks
+        .iter()
+        .position(|&(s, e)| base_addr >= s && base_addr <= e)
+        .expect("isel: FSR base 0x{base_addr:03X} outside GPR space (device {device.name})");
+    // `physical_offset` is the within-bank offset (0x20-0x6F), i.e. the low
+    // 7 bits of the physical address; the linear alias is
+    // `0x2000 + bank*80 + (physical_offset - 0x20)`.
+    0x2000 + (bank as u16) * 80 + ((base_addr & 0x7F) - 0x20)
 }
 
 /// How a single-byte pointer access completes after `emit_ptr_setup`.
@@ -421,6 +396,22 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel: no address for @{name}"))
     }
 
+    /// The address materialized as a runtime pointer VALUE for a global at
+    /// a constant offset `k`: the linear alias when the object straddles a
+    /// bank (docs/33 D-2), else the physical address. A pointer value to a
+    /// straddling object must carry the linear base so a later FSR deref at
+    /// an offset past the bank boundary walks the linear region (which
+    /// compresses the common-RAM hole) instead of the hole itself.
+    fn ptr_value_addr(&self, name: &str, k: u8) -> u16 {
+        let addr = self.global_addr(name);
+        let span = self.global_size(name);
+        if object_straddles(self.device, addr, span) {
+            fsr_base(self.device, addr, span) + u16::from(k)
+        } else {
+            addr + u16::from(k)
+        }
+    }
+
     /// Whether `name` is a const (flash) global: read via RETLW tables.
     /// A const that was copied to RAM (alloc placed it in `addrs` because it
     /// is used as a pointer call argument) is treated as RAM.
@@ -563,7 +554,18 @@ impl<'m> Gen<'m> {
                     !self.global_is_const(g),
                     "isel: store to const (flash) global @{g}"
                 );
-                Addr::Direct(self.global_addr(g) + u16::from(byte_off))
+                let span = self.global_size(g);
+                if object_straddles(self.device, self.global_addr(g), span) {
+                    // A bank-straddling global (docs/33 D-2): route through
+                    // FSR0 with the linear base so one FSR walks the whole
+                    // object across banks (a direct file-register access
+                    // would walk into the common-RAM hole past the bank
+                    // boundary).
+                    self.emit_fsr_to(self.global_addr(g), 0, &[], byte_off, span);
+                    Addr::Indirect
+                } else {
+                    Addr::Direct(self.global_addr(g) + u16::from(byte_off))
+                }
             }
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
@@ -573,14 +575,20 @@ impl<'m> Gen<'m> {
                             !self.global_is_const(name),
                             "isel: store to const (flash) global @{name}"
                         );
-                        if terms.is_empty() {
-                            // Constant offset only: the address is statically
-                            // known, a plain file-register access, no FSR.
+                        let span = self.object_span(&base);
+                        if terms.is_empty()
+                            && !object_straddles(self.device, self.global_addr(name), span)
+                        {
+                            // Constant offset only, object fits one bank: the
+                            // address is statically known, a plain
+                            // file-register access, no FSR.
                             Addr::Direct(
                                 self.global_addr(name) + u16::from(k) + u16::from(byte_off),
                             )
                         } else {
-                            let span = self.object_span(&base);
+                            // Dynamic terms, or a bank-straddling object
+                            // (docs/33 D-2): FSR0 with the linear base so one
+                            // FSR walks the whole object across banks.
                             self.emit_fsr_to(self.global_addr(name), k, &terms, byte_off, span);
                             Addr::Indirect
                         }
@@ -593,12 +601,48 @@ impl<'m> Gen<'m> {
                         if *indirect || self.param_holds_addr(sname) {
                             self.emit_fsr_indirect(sa, k, &terms, byte_off);
                             Addr::Indirect
-                        } else if terms.is_empty() {
-                            Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
                         } else {
                             let span = self.object_span(&base);
-                            self.emit_fsr_to(sa, k, &terms, byte_off, span);
-                            Addr::Indirect
+                            if terms.is_empty() && !object_straddles(self.device, sa, span) {
+                                Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
+                            } else {
+                                self.emit_fsr_to(sa, k, &terms, byte_off, span);
+                                Addr::Indirect
+                            }
+                        }
+                    }
+                }
+            }
+            Val::Const(_) => panic!("isel: pointer operand must be a register or global"),
+        }
+    }
+
+    /// Pure mirror of `emit_ptr_setup`'s addressing-mode decision: whether
+    /// `ptr + byte_off` completes through FSR0 (`Indirect`) rather than a
+    /// plain file register (`Direct`). Emits nothing. Used by the constant
+    /// memcpy path to decide whether the loaded byte must be parked before
+    /// the destination's FSR setup (which clobbers W).
+    fn ptr_setup_is_indirect(&self, ptr: &Val, _byte_off: u8) -> bool {
+        match ptr {
+            Val::Global(g) => {
+                let span = self.global_size(g);
+                object_straddles(self.device, self.global_addr(g), span)
+            }
+            Val::Reg(r) => {
+                let (base, _k, terms) = self.resolved_for(r);
+                match &base {
+                    Base::Global(name) => {
+                        let span = self.object_span(&base);
+                        !(terms.is_empty()
+                            && !object_straddles(self.device, self.global_addr(name), span))
+                    }
+                    Base::Slot(sname, indirect) => {
+                        let sa = self.slot_addr(self.cur_func, sname).direct();
+                        if *indirect || self.param_holds_addr(sname) {
+                            true
+                        } else {
+                            let span = self.object_span(&base);
+                            !(terms.is_empty() && !object_straddles(self.device, sa, span))
                         }
                     }
                 }
@@ -669,16 +713,7 @@ impl<'m> Gen<'m> {
         }
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => self.emit(format!("    MOVF 0x{a:02X}, W")),
-            Addr::Indirect => self.emit("    MOVF INDF, W".to_string()),
-        }
-    }
-
-    /// `RAM[ptr + byte_off] = W`: the store side of a byte access (memcpy
-    /// destinations; `emit_ptr_store_byte` composes a val load before it).
-    fn emit_ptr_store_w(&mut self, ptr: &Val, byte_off: u8) {
-        match self.emit_ptr_setup(ptr, byte_off) {
-            Addr::Direct(a) => self.emit(format!("    MOVWF 0x{a:02X}")),
-            Addr::Indirect => self.emit("    MOVWF INDF".to_string()),
+            Addr::Indirect => self.emit("    MOVF INDF0, W".to_string()),
         }
     }
 
@@ -693,7 +728,7 @@ impl<'m> Gen<'m> {
             }
             Addr::Indirect => {
                 self.emit_load_byte(val, byte_off);
-                self.emit("    MOVWF INDF".to_string());
+                self.emit("    MOVWF INDF0".to_string());
             }
         }
     }
@@ -768,7 +803,9 @@ impl<'m> Gen<'m> {
                 }
             }
             g.emit(format!("    MOVF 0x{idx:02X}, W"));
-            g.emit("    ADDWF FSR, F".to_string());
+            g.emit("    ADDWF FSR0L, F".to_string());
+            g.emit("    BTFSC STATUS, 0".to_string());
+            g.emit("    INCF FSR0H, F".to_string());
         };
         // Length source slot (the SSA reg's own bytes, read once).
         let la = self.val_addr(len).direct();
@@ -788,12 +825,12 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_done}"));
         // src[i] -> hold.
         emit_byte_fsr(self, src);
-        self.emit("    MOVF INDF, W".to_string());
+        self.emit("    MOVF INDF0, W".to_string());
         self.emit(format!("    MOVWF 0x{hold:02X}"));
         // dst[i] = hold.
         emit_byte_fsr(self, dst);
         self.emit(format!("    MOVF 0x{hold:02X}, W"));
-        self.emit("    MOVWF INDF".to_string());
+        self.emit("    MOVWF INDF0".to_string());
         // idx++.
         self.emit(format!("    INCF 0x{idx:02X}, F"));
         // countdown-- (16-bit): `MOVLW 1; SUBWF lo,F` sets C = 1 when lo
@@ -810,17 +847,14 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_done}:"));
     }
 
-    /// `FSR = base_addr + k + byte_off + Σ scale×%reg`, for an object of
-    /// `span` bytes at `base_addr`. The window check runs first: the whole
-    /// object must fit inside its base's GPR window (an unrepresentable
-    /// cross-hole address would silently mis-address through INDF, so it
-    /// panics loudly). IRP is then set on EVERY FSR setup: a prior
-    /// bank-2/3 access leaves STATUS bit 7 = 1, so skipping the set on a
-    /// bank-0/1 base would mis-address into bank 2/3. A single scale-1
-    /// term keeps the M5 fast shape (`MOVF %r,W; ADDLW lit; MOVWF FSR`);
-    /// general sums accumulate in the fixed scratch byte first. The ADDLW
-    /// literal is `(base_addr + k + byte_off) & 0xFF`: FSR holds the low
-    /// byte; IRP carries bit 8.
+    /// `FSR0 = base_addr + k + byte_off + Σ scale×%reg`, for an object of
+    /// `span` bytes at `base_addr`. On PIC14E FSR0 is 16-bit, so the base
+    /// (physical, or the linear alias when the object straddles a bank,
+    /// docs/33 D-2) is loaded into FSR0L/FSR0H and the dynamic offset is
+    /// added with carry into FSR0H. A single scale-1 term keeps the M5 fast
+    /// shape (`MOVF %r,W; ADDLW lit`); general sums accumulate in the fixed
+    /// scratch byte first. The offset (k + byte_off + Σ terms) is bounded
+    /// by the object span (≤ 255), so a single carry covers it.
     fn emit_fsr_to(
         &mut self,
         base_addr: u16,
@@ -829,39 +863,54 @@ impl<'m> Gen<'m> {
         byte_off: u8,
         span: u16,
     ) {
-        let (irp, base_lo) = fsr_window(self.device, base_addr, span);
-        let lit = (u16::from(base_lo) + u16::from(k) + u16::from(byte_off)) & 0xFF;
-        self.emit(if irp {
-            "    BSF STATUS, 7".to_string()
-        } else {
-            "    BCF STATUS, 7".to_string()
-        });
+        let base = fsr_base(self.device, base_addr, span);
+        let kk = u16::from(k) + u16::from(byte_off);
+        assert!(
+            kk <= 0xFF,
+            "isel: FSR offset k {k} + off {byte_off} out of byte range"
+        );
+        // FSR0 = base (16-bit).
+        self.emit(format!("    MOVLW 0x{:02X}", (base & 0xFF) as u8));
+        self.emit("    MOVWF FSR0L".to_string());
+        self.emit(format!("    MOVLW 0x{:02X}", ((base >> 8) & 0xFF) as u8));
+        self.emit("    MOVWF FSR0H".to_string());
+        // W = k + byte_off + Σ terms (the offset, 8-bit).
         match terms {
+            [] => {
+                if kk != 0 {
+                    self.emit(format!("    MOVLW 0x{kk:02X}"));
+                } else {
+                    self.emit("    MOVLW 0x00".to_string());
+                }
+            }
             [(1, r)] => {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
-                self.emit("    MOVWF FSR".to_string());
+                if kk != 0 {
+                    self.emit(format!("    ADDLW 0x{kk:02X}"));
+                }
             }
             _ => {
                 self.emit_accum_terms(terms);
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
-                self.emit("    MOVWF FSR".to_string());
+                if kk != 0 {
+                    self.emit(format!("    ADDLW 0x{kk:02X}"));
+                }
             }
         }
+        // FSR0 += W with carry into FSR0H.
+        self.emit("    ADDWF FSR0L, F".to_string());
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit("    INCF FSR0H, F".to_string());
     }
 
-    /// Indirect (sret) FSR setup: `FSR = [slot] + k + byte_off + Σ terms`.
-    /// The slot holds the target address (the caller stores LOW then HIGH
-    /// of it into the two slot bytes), so IRP is set from the stored HIGH
-    /// byte BEFORE the FSR computation: bit 0 of `<slot+1>` is the
-    /// address's bit 8; 1 -> IRP=1 (banks 2/3), 0 -> IRP=0 (banks 0/1).
-    /// Exactly one of the pair fires: BTFSC skips the BSF when the bit is
-    /// 0, BTFSS skips the BCF when it is 1, so IRP always matches the
-    /// stored address. IRP is set on EVERY indirect FSR setup (a prior
-    /// bank-2/3 target leaves STATUS bit 7 = 1). The static k + off must
-    /// fit the ADDLW literal.
+    /// Indirect (sret/pointer-param) FSR0 setup: `FSR0 = [slot] + k +
+    /// byte_off + Σ terms`. The slot holds the target address (the caller
+    /// stores LOW then HIGH of it into the two slot bytes), so FSR0L/FSR0H
+    /// are loaded directly from the slot's two bytes, then the static k +
+    /// off and the dynamic terms are added with carry into FSR0H. The
+    /// target is a global or alloca slot whose span fits one bank (sret
+    /// targets never straddle), so the physical address is used unchanged.
     fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
@@ -869,21 +918,39 @@ impl<'m> Gen<'m> {
             "isel: indirect offset k {k} + off {byte_off} out of byte range"
         );
         let hi = slot_addr + 1;
-        self.emit(format!("    BTFSC 0x{hi:02X}, 0"));
-        self.emit("    BSF STATUS, 7".to_string());
-        self.emit(format!("    BTFSS 0x{hi:02X}, 0"));
-        self.emit("    BCF STATUS, 7".to_string());
-        if terms.is_empty() {
-            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
-            self.emit("    MOVWF FSR".to_string());
-        } else {
-            self.emit_accum_terms(terms);
-            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
-            self.emit("    MOVWF FSR".to_string());
+        // FSR0 = [slot] (16-bit).
+        self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
+        self.emit("    MOVWF FSR0L".to_string());
+        self.emit(format!("    MOVF 0x{hi:02X}, W"));
+        self.emit("    MOVWF FSR0H".to_string());
+        // W = k + byte_off + Σ terms (the offset, 8-bit).
+        match terms {
+            [] => {
+                if kk != 0 {
+                    self.emit(format!("    MOVLW 0x{kk:02X}"));
+                } else {
+                    self.emit("    MOVLW 0x00".to_string());
+                }
+            }
+            [(1, r)] => {
+                let a = self.val_addr(&Val::Reg(r.clone())).direct();
+                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                if kk != 0 {
+                    self.emit(format!("    ADDLW 0x{kk:02X}"));
+                }
+            }
+            _ => {
+                self.emit_accum_terms(terms);
+                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                if kk != 0 {
+                    self.emit(format!("    ADDLW 0x{kk:02X}"));
+                }
+            }
         }
+        // FSR0 += W with carry into FSR0H.
+        self.emit("    ADDWF FSR0L, F".to_string());
+        self.emit("    BTFSC STATUS, 0".to_string());
+        self.emit("    INCF FSR0H, F".to_string());
     }
 
     /// `scratch = Σ scale×%reg`: W = 0, then per term
@@ -1153,7 +1220,7 @@ impl<'m> Gen<'m> {
                     // param, resolving here to `Base::Global`, materialized
                     // below like `emit_move_addr_to_slot`'s own arm.
                     if let Base::Global(name) = &base {
-                        let addr = self.global_addr(name).wrapping_add(k as u16);
+                        let addr = self.ptr_value_addr(name, k);
                         let lo = (addr & 0xFF) as u8;
                         let hi = ((addr >> 8) & 0xFF) as u8;
                         match terms.as_slice() {
@@ -1281,8 +1348,9 @@ impl<'m> Gen<'m> {
                     // (a `store ptr @g, ...` or a pointer phi incoming;
                     // clang always loads scalar globals first): materialize
                     // it as two literals, never read the pointee's contents
-                    // (epic-cc#155).
-                    let a = self.val_addr(&Val::Global(g.clone())).direct();
+                    // (epic-cc#155). A bank-straddling global's address is
+                    // the linear alias (docs/33 D-2).
+                    let a = self.ptr_value_addr(g, 0);
                     let b = ((a >> (idx as u32 * 8)) & 0xFF) as u8;
                     self.emit(format!("    MOVLW 0x{b:02X}"));
                 }
@@ -1641,7 +1709,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVLW HIGH({g})"));
                     self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
                 } else {
-                    let addr = self.global_addr(g);
+                    let addr = self.ptr_value_addr(g, 0);
                     self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                     self.emit(format!("    MOVWF 0x{:02X}", dst));
                     self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -1657,7 +1725,7 @@ impl<'m> Gen<'m> {
                 let sa = match &base {
                     Base::Slot(sname, true) => self.slot_addr(self.cur_func, sname).direct(),
                     Base::Global(name) => {
-                        let addr = self.global_addr(name);
+                        let addr = self.ptr_value_addr(name, k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", dst));
                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2093,7 +2161,15 @@ impl<'m> Gen<'m> {
                     }
                     Val::Const(_) => panic!("isel: sret target must be a global or an alloca slot"),
                 };
-                fsr_window(self.device, addr, span);
+                // The callee's `emit_fsr_indirect` loads FSR0 from this
+                // stored physical address; a straddling target would walk
+                // across the common-RAM hole and mis-address, so it must fit
+                // one bank (sret targets are small structs, never straddling).
+                assert!(
+                    !object_straddles(self.device, addr, span),
+                    "isel: sret target at 0x{addr:03X} span {span} straddles a bank; \
+                     sret targets must fit one GPR bank"
+                );
                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                 self.emit(format!("    MOVWF 0x{:02X}", pa));
                 self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2123,7 +2199,7 @@ impl<'m> Gen<'m> {
                                 let size = self.global_size(g);
                                 panic!("isel: const global @{g} too large for RAM copy ({size} bytes, max 255)");
                             }
-                            let addr = self.global_addr(g);
+                            let addr = self.ptr_value_addr(g, 0);
                             self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                             self.emit(format!("    MOVWF 0x{:02X}", pa));
                             self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2158,7 +2234,7 @@ impl<'m> Gen<'m> {
                         let Base::Global(name) = &base else {
                             unreachable!()
                         };
-                        let addr = self.global_addr(name) + u16::from(k);
+                        let addr = self.ptr_value_addr(name, k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", pa));
                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2175,12 +2251,11 @@ impl<'m> Gen<'m> {
                                 // RAM-copied const: treat like a slot base.
                                 // Only constant offset or single dynamic term
                                 // is needed for the literal shapes.
-                                let base_addr = self.global_addr(name);
                                 let k_lo = (u16::from(k) & 0xFF) as u8;
                                 let k_hi = (u16::from(k) >> 8) as u8;
                                 match terms.as_slice() {
                                     [] => {
-                                        let addr = base_addr + u16::from(k);
+                                        let addr = self.ptr_value_addr(name, k);
                                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                                         self.emit(format!("    MOVWF 0x{:02X}", pa));
                                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2188,6 +2263,12 @@ impl<'m> Gen<'m> {
                                         continue;
                                     }
                                     [(1, reg)] => {
+                                        // A dynamic term: the base must be
+                                        // the linear alias when the object
+                                        // straddles (docs/33 D-2), so the
+                                        // runtime offset walks the linear
+                                        // region, not the common-RAM hole.
+                                        let base_addr = self.ptr_value_addr(name, 0);
                                         let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                                         self.emit(format!("    MOVLW 0x{:02X}", (base_addr & 0xFF) as u8));
                                         self.emit(format!("    ADDWF 0x{:02X}, W", ra));
@@ -2520,9 +2601,32 @@ impl<'m> Gen<'m> {
                     // dst[i]. Each byte re-resolves both pointers (dst
                     // itself may be a base+k+i expression), exactly like a
                     // per-byte load/store.
+                    //
+                    // A bank-straddling destination routes through FSR0
+                    // (docs/33 D-2), whose setup clobbers W, so the loaded
+                    // byte is parked in the fixed hold byte (0x7F) before
+                    // the setup and reloaded after. A direct destination's
+                    // setup emits nothing, so W survives and no park is
+                    // needed.
+                    let hold: u16 = 0x7F;
                     for i in 0..*n {
                         self.emit_ptr_load_byte(&m.src, i);
-                        self.emit_ptr_store_w(&m.dst, i);
+                        if self.ptr_setup_is_indirect(&m.dst, i) {
+                            // The destination's FSR setup clobbers W, so
+                            // park the loaded byte first and reload after.
+                            self.emit(format!("    MOVWF 0x{hold:02X}"));
+                            self.emit_ptr_setup(&m.dst, i);
+                            self.emit(format!("    MOVF 0x{hold:02X}, W"));
+                            self.emit("    MOVWF INDF0".to_string());
+                        } else {
+                            // Direct destination: setup emits nothing, W
+                            // survives.
+                            let a = match self.emit_ptr_setup(&m.dst, i) {
+                                Addr::Direct(a) => a,
+                                Addr::Indirect => unreachable!(),
+                            };
+                            self.emit(format!("    MOVWF 0x{a:02X}"));
+                        }
                     }
                 }
                 MemLen::Reg(v) => self.emit_memcpy_dynamic(&m.dst, &m.src, v),
@@ -2883,7 +2987,7 @@ impl<'m> Gen<'m> {
                 let list = self.slot_addr(self.cur_func, &v.ptr).direct();
                 for i in 0..v.ty.bytes() {
                     self.emit_fsr_indirect(list, 0, &[], i);
-                    self.emit("    MOVF INDF, W".to_string());
+                    self.emit("    MOVF INDF0, W".to_string());
                     self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
                 }
                 // Advance the list address by the argument width: byte 0
@@ -6467,8 +6571,13 @@ pub fn select_with_locs(
         format!("    list p={}", device.name),
         "    radix hex".to_string(),
         "STATUS equ 0x03".to_string(),
-        "FSR    equ 0x04".to_string(),
-        "INDF   equ 0x00".to_string(),
+        "FSR    equ 0x04".to_string(), // FSR0L; the P5 ISR prologue (deleted there) saves only the low byte
+        "FSR0L  equ 0x04".to_string(),
+        "FSR0H  equ 0x05".to_string(),
+        "FSR1L  equ 0x06".to_string(),
+        "FSR1H  equ 0x07".to_string(),
+        "INDF0  equ 0x00".to_string(),
+        "INDF1  equ 0x01".to_string(),
         "PCL    equ 0x02".to_string(),
         "PCLATH equ 0x0A".to_string(),
         "INTCON equ 0x0B".to_string(),

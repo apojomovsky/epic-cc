@@ -65,11 +65,44 @@ fn region_for(device: &Device, addr: u16) -> (u16, u16) {
     })
 }
 
+/// The physical address just past a `width`-byte global placed at `start`:
+/// the address a following global's cursor must advance to. For a
+/// single-bank object this is `start + width`; for a bank-straddling object
+/// (PIC14E, docs/33 D-2) the bytes skip common RAM, so the physical end is
+/// `start + width` plus the skipped common-RAM bytes. Mirrors the placement
+/// walk in `try_place_straddle`.
+fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
+    let mut cur = start;
+    let mut remaining = width;
+    while remaining > 0 {
+        let (region_start, end) = device
+            .region_for(cur)
+            .expect("alloc: global placement past the last GPR bank");
+        if cur < region_start {
+            cur = region_start; // skip common RAM / unimplemented gap
+        }
+        let avail = end - cur + 1;
+        if remaining <= avail {
+            return cur + remaining;
+        }
+        remaining -= avail;
+        cur = end + 1;
+    }
+    cur
+}
+
 /// The start address for a `width`-byte value placed at the next free
 /// address `addr`, or `None` if no region past `addr` has room (the device's
 /// last bank has been exhausted). Steps through regions via
 /// `device.region_for`, keeping the value even-aligned within its bank
 /// region (`align = width.min(2)` — only 2-byte values need even alignment).
+///
+/// On PIC14E a global too large for any single GPR bank may straddle a bank
+/// boundary (docs/33 D-2): the object's bytes are placed contiguously
+/// through the GPR banks, skipping common RAM, and `isel-pic14e` addresses
+/// it through the linear region so one FSR walks across banks. On every
+/// other core a straddling global is unrepresentable (classic PIC14's
+/// FSR+IRP cannot cross a bank), so it keeps panicking loudly.
 fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
     let align = width.min(2);
     let mut a = addr;
@@ -82,8 +115,37 @@ fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
         if base + u16::from(width) - 1 <= end {
             return Some(base);
         }
+        if device.core == device::Core::Pic14e && u16::from(width) > end - start + 1 {
+            // Too large for one region: straddle across banks (PIC14E only).
+            return try_place_straddle(device, base, width);
+        }
         a = end + 1;
     }
+}
+
+/// Place a `width`-byte global contiguously starting at the aligned `addr`,
+/// stepping across GPR bank boundaries (skipping common RAM) so the object
+/// may straddle two banks. Returns the start address, or `None` past the
+/// device's last bank. The object's bytes all land in GPR banks; the
+/// physical layout is non-contiguous (the common-RAM hole between banks is
+/// skipped), which is exactly the case `isel-pic14e` addresses through the
+/// linear region (docs/33 D-2).
+fn try_place_straddle(device: &Device, addr: u16, width: u8) -> Option<u16> {
+    let mut cur = addr;
+    let mut remaining = u16::from(width);
+    while remaining > 0 {
+        let (start, end) = device.region_for(cur)?;
+        if cur < start {
+            cur = start; // skip common RAM / unimplemented gap
+        }
+        let avail = end - cur + 1;
+        if remaining <= avail {
+            return Some(addr);
+        }
+        remaining -= avail;
+        cur = end + 1;
+    }
+    Some(addr)
 }
 
 /// The start address for a `width`-byte local placed contiguously at the next
@@ -972,7 +1034,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                     }
                 }
                 out.insert(g.name.clone(), start);
-                addr = start + u16::from(width);
+                addr = physical_end(device, start, u16::from(width));
                 // Bump addr past any fixed that it now sits inside.
                 for (_, fa, fs) in &fixed {
                     if addr > *fa && addr <= *fa + *fs {
@@ -1025,15 +1087,16 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     };
     globals.extend(floating_map);
 
-    // end_of_globals = max over the address map of (addr + width), floored at
-    // the device's GPR start (mirrors isel's layout computation). The
+    // end_of_globals = max over the address map of the physical end (addr +
+    // width, or the bank-straddling physical end on PIC14E), floored at the
+    // device's GPR start (mirrors isel's layout computation). The
     // scratch/retval bytes live in the device's fixed common RAM, so the
     // first frame base follows the globals directly.
     let end_of_globals =
         m.globals
             .iter()
             .fold(device.gpr_start(), |end, g| match globals.get(&g.name) {
-                Some(&a) => end.max(a + u16::from(g.size)),
+                Some(&a) => end.max(physical_end(device, a, u16::from(g.size))),
                 None => end,
             });
     let bank0_start = end_of_globals;
@@ -1300,7 +1363,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         let mut hi: Option<u16> = None;
         for g in &m.globals {
             if let Some(&a) = globals.get(&g.name) {
-                let e = a + u16::from(g.size);
+                // A bank-straddling global's physical end skips common RAM
+                // (docs/33 D-2), so the per-bank high-water must use
+                // physical_end, not a + size (which would overcount the
+                // first bank into the common-RAM hole and miss the later
+                // banks entirely).
+                let e = physical_end(device, a, u16::from(g.size));
                 if a >= start && a <= end {
                     hi = Some(hi.map_or(e, |h| h.max(e)));
                 }
