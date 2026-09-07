@@ -1,55 +1,33 @@
 # syntax=docker/dockerfile:1
 #
-# epic-cc toolchain images. Single source of truth for the build/test/release
-# environment (docs/30-distribution-design.md, ADR-008).
-#
-# Stages:
-#   base          — ubuntu:22.04 (digest-pinned; glibc 2.35 = the minimum
-#                   supported Linux) + build tools + test oracles
-#   clang-builder — LLVM 20.1.8 from the digest-pinned source tarball, static
-#                   LLVM libs (no libLLVM.so, no rpath work). The expensive
-#                   layer; cached in GHCR via the buildx registry cache.
-#   dev           — clang-builder + rustup 1.97.1 (rust-toolchain.toml) + env
-#   ci            — dev; runs scripts/ci-test.sh (what CI executes)
-#   release       — dev; builds epic-cc and assembles the distribution bundle
+# epic-cc toolchain images (docs/30-distribution-design.md, ADR-008).
+# Stages: base, only clang-builder's own build deps and nothing else, since
+# a change here would bust its ~2h cached LLVM build; clang-builder, LLVM
+# 20.1.8, GHCR-cached; dev, clang-builder plus rustup, gputils, oracle/fuzz
+# tooling, SDCC; ci, runs scripts/ci-test.sh; release, builds and bundles
+# epic-cc.
 
 FROM ubuntu:22.04@sha256:79676deb51ebb02885b0b9d33788e78a37cf1045ad79d1bb04c6a222c3556b3d AS base
 
 ENV DEBIAN_FRONTEND=noninteractive
 
+# Exactly what clang-builder's RUN below needs: cmake/ninja-build to
+# configure and build LLVM, ccache for LLVM_CCACHE_BUILD, curl/ca-
+# certificates/xz-utils to fetch and extract the source tarball, python3
+# because LLVM's own top-level CMakeLists.txt does an unconditional
+# find_package(Python3) regardless of LLVM_INCLUDE_TESTS. See this file's
+# header comment for why nothing else may be added here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
         ninja-build \
         zlib1g-dev \
         ccache \
-        python3 \
-        git \
         curl \
         ca-certificates \
         xz-utils \
-        file \
-        csmith \
-        creduce \
-        cvise \
-        poppler-utils \
-        flex \
-        bison \
-        libboost-graph-dev \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
-
-# gputils 1.5.2 — test oracle (gpasm byte-for-byte cross-checks). Built from
-# source: apt (jammy) has 1.4.0 and the cross-checks are version-sensitive.
-# Note the tarball lives under the 1.5.0 directory on SourceForge.
-RUN curl -fsSL -o /tmp/gputils.tar.gz \
-        https://downloads.sourceforge.net/project/gputils/gputils/1.5.0/gputils-1.5.2.tar.gz \
-    && echo "62a215e7d5575cd488a5ada66e5708ff402634abe86a9b39e4dbdb19c986ab7e  /tmp/gputils.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/gputils.tar.gz -C /tmp \
-    && cd /tmp/gputils-1.5.2 \
-    && ./configure --prefix=/usr/local \
-    && make -j"$(nproc)" \
-    && make install \
-    && rm -rf /tmp/gputils-1.5.2 /tmp/gputils.tar.gz
 
 FROM base AS clang-builder
 
@@ -83,6 +61,41 @@ RUN --mount=type=cache,target=/ccache \
 
 FROM clang-builder AS dev
 
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Test-oracle, fuzz, and misc tooling: deliberately kept out of base (see
+# this file's header comment) so adding or changing any of these can never
+# bust clang-builder's LLVM cache. python3 is already in base (LLVM's own
+# cmake needs it); git/file are general tooling; csmith/creduce/cvise/
+# poppler-utils are the fuzz-corpus/reduction toolchain; flex/bison/
+# libboost-graph-dev are gputils' and SDCC's own build deps.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        file \
+        csmith \
+        creduce \
+        cvise \
+        poppler-utils \
+        flex \
+        bison \
+        libboost-graph-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# gputils 1.5.2, test oracle (gpasm byte-for-byte cross-checks). Built from
+# source: apt (jammy) has 1.4.0 and the cross-checks are version-sensitive.
+# Note the tarball lives under the 1.5.0 directory on SourceForge. Built
+# here (not base) for the same reason as the apt packages above: gputils'
+# own version bumps must never bust the clang-builder cache.
+RUN curl -fsSL -o /tmp/gputils.tar.gz \
+        https://downloads.sourceforge.net/project/gputils/gputils/1.5.0/gputils-1.5.2.tar.gz \
+    && echo "62a215e7d5575cd488a5ada66e5708ff402634abe86a9b39e4dbdb19c986ab7e  /tmp/gputils.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gputils.tar.gz -C /tmp \
+    && cd /tmp/gputils-1.5.2 \
+    && ./configure --prefix=/usr/local \
+    && make -j"$(nproc)" \
+    && make install \
+    && rm -rf /tmp/gputils-1.5.2 /tmp/gputils.tar.gz
+
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
@@ -96,8 +109,8 @@ RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
 # SDCC 4.6.0: the SDCC parity oracle (docs/35). Built from source,
 # digest-pinned, exactly like gputils. SDCC is GPL: it lives in the image as
 # an external oracle only, never linked or committed into the MIT repo. Its
-# pic14/pic16 ports need gputils (built in base) and the boost graph library
-# (apt, base). The regression suite ships in the tarball under
+# pic14/pic16 ports need gputils (built above) and the boost graph library
+# (apt, above). The regression suite ships in the tarball under
 # support/regression/ and is used by the parity harness (Tier 3), never
 # committed. Built in dev (not base) so the expensive clang-builder layer
 # stays cached when the SDCC pin changes.

@@ -16,7 +16,12 @@ permissions:
   packages: write
 
 jobs:
+  # See ci.yml's warm-toolchain-cache job / toolchain-cache.yml.
+  warm-toolchain-cache:
+    uses: ./.github/workflows/toolchain-cache.yml
+
   linux:
+    needs: warm-toolchain-cache
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
