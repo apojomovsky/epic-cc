@@ -5945,22 +5945,20 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
         if i == 0 && f.isr {
-            // ISR save prologue (vector word 4): W into 0x75 and STATUS
-            // into 0x76, each nibble-swapped in place (flag-safe, no W
-            // dependency; the epilogue swap-backs restore them), then
-            // PCLATH/FSR into 0x77/0x78, the preempted main's in-flight
-            // retval (0x71-0x74) into 0x79-0x7C, and the LIVE scratch byte
-            // 0x70 into 0x7D. Save area = common RAM 0x75-0x7D (9 bytes),
-            // disjoint from scratch and retval. Then PCLATH = 0 so the ISR
-            // body's GOTOs stay in page 0 (the M11 restore literal is PAGE(isr) = 0).
-            g.emit("    MOVWF 0x75");
-            g.emit("    SWAPF 0x75, F");
-            g.emit("    SWAPF STATUS, W");
-            g.emit("    MOVWF 0x76");
-            g.emit("    MOVF PCLATH, W");
-            g.emit("    MOVWF 0x77");
-            g.emit("    MOVF FSR, W");
-            g.emit("    MOVWF 0x78");
+            // The hardware saves W, STATUS (except TO/PD), BSR, FSR0,
+            // FSR1 and PCLATH on entry and restores them on RETFIE
+            // (DS41364E section 7.5, D-4), so the ISR emits no save/
+            // restore prologue for them. The preempted main's in-flight
+            // retval (0x71-0x74) and the LIVE scratch byte (0x70) are
+            // NOT part of that hardware save (they are compiler ABI, not
+            // core registers): an ISR that calls a value-returning
+            // function or does a const read would clobber them, the same
+            // hazard PIC14 M13 and PIC18 P5 save against (docs/33 D-4:
+            // the `_isr` frame copies and the retval/scratch protection
+            // apply unchanged). Backup them into 0x79-0x7D. Then PCLATH =
+            // 0 so the ISR body's own intra-function GOTOs stay in page 0
+            // (the hardware restores main's PCLATH at RETFIE, so the pin
+            // is safe to leave set).
             g.emit("    MOVF 0x71, W");
             g.emit("    MOVWF 0x79");
             g.emit("    MOVF 0x72, W");
@@ -6076,14 +6074,11 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                 }
                 _ if f.isr => {
                     match t {
-                        // The restore epilogue replaces the ISR's `ret`.
-                        // Order is load-bearing: retval (0x79-0x7C ->
-                        // 0x71-0x74), scratch (0x7D -> 0x70), PCLATH/FSR
-                        // (their Z clobbers are fine, STATUS not yet
-                        // restored), then STATUS via nibble swap-back
-                        // (flag-safe), and W last via its swap-back (MOVF
-                        // would set Z from the moved value after STATUS was
-                        // restored, corrupting the interrupted main's Z).
+                        // The retval/scratch restore replaces the ISR's
+                        // `ret`; the hardware restores W, STATUS, BSR,
+                        // FSR0, FSR1 and PCLATH from its shadow registers
+                        // on RETFIE (DS41364E section 7.5, D-4), so the
+                        // ISR emits no manual core-register restore.
                         Inst::Ret(None, _) => {
                             g.emit("    MOVF 0x79, W");
                             g.emit("    MOVWF 0x71");
@@ -6095,13 +6090,6 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                             g.emit("    MOVWF 0x74");
                             g.emit("    MOVF 0x7D, W");
                             g.emit("    MOVWF 0x70");
-                            g.emit("    MOVF 0x77, W");
-                            g.emit("    MOVWF PCLATH");
-                            g.emit("    MOVF 0x78, W");
-                            g.emit("    MOVWF FSR");
-                            g.emit("    SWAPF 0x76, W");
-                            g.emit("    MOVWF STATUS");
-                            g.emit("    SWAPF 0x75, W");
                             g.emit("    RETFIE");
                         }
                         Inst::Ret(Some(_), _) => panic!(
@@ -6540,16 +6528,18 @@ pub fn select_with_locs(
     // The icmp scratch byte and the four retval bytes are fixed common-RAM
     // constants (bank-independent, the device's common RAM is never used by
     // locals, so no collision). The widened i32 region must not overrun
-    // common RAM nor overlap the scratch byte, and the ISR save area (W,
-    // STATUS, PCLATH, FSR, retval x4, scratch, 9 bytes) must sit right
-    // after the retval region, disjoint from it and from scratch, leaving
-    // the last 2 bytes of common RAM free.
+    // common RAM nor overlap the scratch byte, and the ISR retval/scratch
+    // backup area (retval x4, scratch, 5 bytes) must sit right after the
+    // retval region, disjoint from it and from scratch, leaving the last
+    // bytes of common RAM free. The core registers (W, STATUS, BSR, FSR0,
+    // FSR1, PCLATH) are saved by the hardware shadow registers, not here
+    // (D-4).
     let (common_lo, common_hi) = device
         .common_ram
         .expect("isel's fixed scratch/retval/ISR-save layout needs a common-RAM region");
     let scratch: u16 = common_lo;
     let retval_lo: u16 = common_lo + 1;
-    let isr_save_lo: u16 = common_lo + 5;
+    let isr_save_lo: u16 = common_lo + 9;
     let isr_save_hi: u16 = common_lo + 13;
     assert!(
         retval_lo + 4 <= common_hi + 1,
@@ -6571,7 +6561,6 @@ pub fn select_with_locs(
         format!("    list p={}", device.name),
         "    radix hex".to_string(),
         "STATUS equ 0x03".to_string(),
-        "FSR    equ 0x04".to_string(), // FSR0L; the P5 ISR prologue (deleted there) saves only the low byte
         "FSR0L  equ 0x04".to_string(),
         "FSR0H  equ 0x05".to_string(),
         "FSR1L  equ 0x06".to_string(),
@@ -6586,7 +6575,7 @@ pub fn select_with_locs(
         "    goto __start".to_string(),
         "".to_string(),
     ]);
-    locs.extend(std::iter::repeat(None).take(13));
+    locs.extend(std::iter::repeat(None).take(12));
     if !m.module_asm.is_empty() {
         out.push("; module asm".to_string());
         locs.push(None);
