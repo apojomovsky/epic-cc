@@ -59,9 +59,9 @@ reference it for diagnostics) and never reaches `isel`, `banking`,
 So Phase 1 (below) is narrower than a clean-slate read suggests: no new
 clang flag, no new parsing. The work is carrying an attribute that already
 exists on `ir::Inst` the rest of the way to an address, through the four
-stages that currently have no obligation to preserve it. Phase 2's move to
-full `-g` (for `DILocalVariable`/`DIType`) is the only place a clang-flag
-change is still needed, since `-gline-tables-only` deliberately omits
+stages that currently have no obligation to preserve it. Phase 2 moved the
+front end to full `-g` (for `DILocalVariable`/`DIType`), the one clang-flag
+change the debugger needs (`#257`); line-tables-only deliberately omitted
 variable and type metadata.
 
 ## 2. What clang can and cannot give us
@@ -161,9 +161,10 @@ actually rejected along the way, notably attaching the line to the asm
 text as a trailing comment, which would have changed the diffable
 `.asm` boundary and broken the gpasm oracle.
 
-**Phase 2: typed variable table.** Extract `DILocalVariable`/`DIType` from
-the same `-g` metadata (switching the front end from `-gline-tables-only`
-to full `-g`, which also requires irparse to consume and drop clang's
+**Phase 2: typed variable table. Landed** (`epic-cc#257`): irparse's
+`parse_debug_vars` extracts `DILocalVariable`/`DIType` from
+the full `-g` metadata. The front end now passes `-g`, which required
+irparse to consume and drop clang's
 `#dbg_value`/`#dbg_declare`/`#dbg_assign` debug-record lines, emitted as
 no `Inst`, plus the `, !dbg !N` tails full `-g` adds to global/`define`
 lines). Join against

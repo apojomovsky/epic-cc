@@ -63,7 +63,7 @@ fn clang_compile(clang: &str, resdir: &str, c_path: &str) -> (String, String) {
             "-emit-llvm",
             "-ffreestanding",
             "-nostdinc",
-            "-gline-tables-only",
+            "-g",
             "-resource-dir",
             resdir,
             "-o",

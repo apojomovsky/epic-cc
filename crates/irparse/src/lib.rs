@@ -17,6 +17,8 @@ use ir::{
 };
 use std::collections::{HashMap, HashSet};
 
+pub mod debug_vars;
+pub use debug_vars::{parse_debug_vars, DebugVars, DiTypeNode, DiVar};
 /// Strip LLVM parameter/return attributes we do not model, e.g.
 /// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
 ///
@@ -606,7 +608,7 @@ fn extract_asm_strings(after_sideeffect: &str) -> Option<(String, String)> {
 }
 
 /// Resolved C source locations keyed by LLVM metadata node id, built from
-/// the `-gline-tables-only` nodes clang adds (`!DIFile`, `!DISubprogram`,
+/// the `-g` nodes clang adds (`!DIFile`, `!DISubprogram`,
 /// `!DILocation`). Parse-time panics and `Call.loc` resolve their
 /// `file.c:line:col` through it.
 type DebugInfoTable = HashMap<u32, SrcLoc>;
@@ -805,6 +807,18 @@ fn func_is_naked(header_suffix: &str, attr_map: &HashMap<String, String>) -> boo
         }
     }
     false
+}
+
+/// The bare (unquoted) token value of `name: TOKEN` in a metadata node
+/// body, e.g. `tag: DW_TAG_pointer_type`. Reads to the next top-level
+/// `,` or `)`.
+pub fn token_field(body: &str, name: &str) -> Option<String> {
+    let key = format!("{name}: ");
+    let tail = &body[body.find(&key)? + key.len()..];
+    let end = tail
+        .find(|c: char| c == ',' || c == ')')
+        .unwrap_or(tail.len());
+    Some(tail[..end].trim().to_string())
 }
 
 /// Split `s` on `sep` only at paren/bracket/brace depth 0 (so paren GEPs,
@@ -2435,6 +2449,13 @@ pub fn parse_ll(src: &str) -> Module {
                         }
                         continue;
                     }
+                    // Full `-g` debug records: metadata, never IR.
+                    if l.starts_with("#dbg") {
+                        if has_trailing_brace {
+                            break;
+                        }
+                        continue;
+                    }
                     // clang attaches `, !dbg !N` to a naked function's
                     // trailing `unreachable`; it stays a terminator, not an
                     // opcode. `wholeprog_opt` (epic-cc#193) can now also
@@ -2526,6 +2547,9 @@ fn parse_inst(
     fresh: &mut Fresh,
     dbg: &DebugInfoTable,
 ) -> Vec<Inst> {
+    if line.trim_start().starts_with("#dbg") {
+        return Vec::new();
+    }
     let cur = dbg_loc(line, dbg);
     // Lift `call ... asm sideeffect "template", "constraints"(...)` into
     // `Inst::Asm`. This must run before the generic `call` handling, since
