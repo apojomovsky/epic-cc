@@ -131,15 +131,36 @@ resolves `print s.member` and `print arr[i]`. The `.debug_line` program
 is built directly from the line table Phase 1 (below) produces. What stays
 minimal is the location dimension, not the DIE-kind coverage.
 
-**Open risk, not yet spiked.** PIC14 is not a gdb-known architecture. The
-spike above used x86-64 specifically to control for that variable. gdb does
-support fully custom targets via a `qXfer:features:read` target-description
-XML (established pattern: several architectures shipped this way before
-gaining built-in gdb support), and DWARF processing itself is
-architecture-agnostic in gdb, but the exact interaction between a
-synthetic/placeholder `e_machine` in the sidecar ELF and a custom register
-target description needs its own short spike before Phase 4 is designed in
-detail. Flagged here rather than assumed solved.
+**Open risk: spiked 2026-09-07 (phase 4, `epic-cc#259`). Finding: the
+custom-architecture register path is a dead end on unpatched gdb; the
+ticket's documented fallback is the design.** Setup: an `-O0 -g` static
+x86-64 ELF with `e_machine` patched to `EM_NONE` (0), driven by a
+from-scratch Python RSP stub. Findings:
+
+- gdb 15.1 loads an `EM_NONE` ELF without complaint and resolves
+  symbols and `.debug_line` normally: `break t.c:9` lands on the exact
+  address, `print g_in` applies the DWARF type to a fabricated `m`
+  reply. DWARF processing is fully architecture-agnostic, as hoped.
+- A custom target description (`qXfer:features:read:target.xml` with
+  `org.gnu.gdb.pic14.core` registers) is rejected: stock gdb builds are
+  single-target (Ubuntu's amd64 gdb offers only i386/x86-64 variants)
+  and each architecture validates descriptions against its own feature
+  set ("Architecture rejected target-supplied description"). There is
+  no `info registers` path to PIC14 register names without a patched
+  gdb, and none of this phase's scope ships one.
+- The fallback session works end to end: no target description, the
+  arch defaults from the ELF to i386, the `g` packet is returned in
+  i386 core-register order with PIC14 values mapped (PC to `eip`, `W`
+  to `eax`), and breakpoint/step/continue, `x`, and typed `print` all
+  behave. Line-granular stepping needs no adapter support either: gdb
+  itself single-steps against the sidecar's `.debug_line`.
+
+Design consequences for phase 4: the sidecar declares `e_machine = EM_386` (the i386 the session runs as, see the register mapping below); the
+adapter answers `g`/`G`/`p`/`P` in i386 order with the register mapping
+above; `m`/`M` read and write the RAM image physically (DWARF variable
+addresses are physical byte addresses); `Z0`/`c` run via phase 3's
+`run_until` over word addresses; `s` steps one word and lets gdb do
+line granularity against the sidecar line table.
 
 ## 4. Phase plan
 
@@ -189,19 +210,30 @@ PIC14-first non-goal below. Note: this phase edits `crates/sim`, the
 same crate pic14e P1 (#246) edits, so the two must not be worked
 simultaneously.
 
-**Phase 4: gdbstub adapter.** New crate implementing `gdbstub::Target` over
-Phase 3's control surface. Consumes Phases 1/2's data to emit the ELF+DWARF
-sidecar (section 3) at build time. Ships as a **separate
-`epic-cc-gdbserver` binary** (settled 2026-09-06; a long-lived network
-service, decoupled from the one-shot compile lifecycle):
-`epic-cc-gdbserver <hex> <sidecar.elf> --port <port>`, used as
-`gdb <sidecar.elf> -ex "target remote :<port>"`. **PIC14 core only for v1.**
-The open risk in section 3 (custom architecture target description) needs
-a dedicated spike before this phase's design is finalized; the phase is
-not implemented until that spike lands. gdb is absent from the dev/ci
-image today, so this phase adds a digest-pinned apt gdb for its acceptance
-sessions (test/CI-time and user-side host dependency; the bundle need not
-carry one).
+**Phase 4: gdbstub adapter. Landed** (`epic-cc#259`): new
+`crates/gdbserver` crate implementing `gdbstub::Target` over Phase 3's
+control surface, shipped as the separate `epic-cc-gdbserver` binary
+(`epic-cc-gdbserver <hex> <sidecar.elf> --port <port>`, used as
+`gdb <sidecar.elf> -ex "target remote :<port>"`). The driver emits the
+ELF+DWARF sidecar via `--sidecar` (`driver::sidecar`, `gimli` +
+`object`), consuming the phase-1 line rows and the phase-2 in-process
+type table; `--line-table` is built from the same rows, so the two
+artifacts agree by construction. **PIC14 core only for v1.**
+
+Spike-settled deviations from the pre-spike sketch, all in section 3:
+no custom target description (stock gdb rejects it; the session runs
+as i386 with PIC14 state mapped onto the x86 core registers: PC to
+`eip`, `W` to `eax`, `STATUS` to `ecx`, `FSR` to `edx`, `PCLATH` to
+`ebx`); DWARF variable names are flat C identifiers (gdb parses `::`
+as C++ scope); the CU's source paths are absolute (otherwise gdb files
+the line rows under a different symtab than the variables and the
+breakpoint lookup misses); the CU's `low_pc` starts at its first
+mapped word with no `DW_LNE_set_address(0)` (either zero trips gdb's
+linker-GC heuristic and the whole line table is skipped); line
+stepping needs no adapter support (gdb single-steps against the
+sidecar's `.debug_line` itself). gdb joined the dev/ci image as an
+apt package for the acceptance sessions; the release bundle carries
+the `epic-cc-gdbserver` binary but no gdb.
 
 ## 5. Non-goals for this document
 

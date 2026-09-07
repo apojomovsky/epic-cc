@@ -389,6 +389,12 @@ fn main() {
         )
         .expect("write line table");
     }
+    if let Some(sc_path) = &cli.sidecar {
+        let rows = driver::sidecar::line_rows(&asm, &locs);
+        let dbg_vars = irparse::parse_debug_vars(&ll_text);
+        std::fs::write(sc_path, driver::sidecar::encode(&rows, &layout, &dbg_vars))
+            .expect("write sidecar");
+    }
     let hex = driver::hex::emit(&device, &program_words, config_bytes.as_deref());
     if let Some(cb) = &config_bytes {
         eprintln!("epic-cc: resolved configuration for {}:", device.name);

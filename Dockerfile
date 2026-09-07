@@ -133,11 +133,14 @@ RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
 # Test-time tooling only, no from-source build (gputils, SDCC) depends on
 # any of these, so they sit last: adding one here can only bust its own
 # apt layer, never the gputils/SDCC builds above. git/file are general
-# tooling; csmith/creduce/cvise/poppler-utils are the fuzz-corpus/
-# reduction toolchain.
+# tooling; gdb is the debugger acceptance oracle
+# (crates/driver/tests/debug_session_e2e.rs runs it as a subprocess against
+# epic-cc-gdbserver, epic-cc#259); csmith/creduce/cvise/poppler-utils are
+# the fuzz-corpus/reduction toolchain.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         file \
+        gdb \
         csmith \
         creduce \
         cvise \
@@ -171,9 +174,10 @@ WORKDIR /workspace
 # shipped binary twice — once via env vars, once via bundled discovery — and
 # requires byte-identical HEX, proving the bundle's clang loads and the
 # driver finds it.
-RUN cargo build --release -p driver \
+RUN cargo build --release -p driver -p epic-cc-gdbserver \
     && mkdir -p "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin" \
     && cp target/release/epic-cc "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
+    && cp target/release/epic-cc-gdbserver "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && cp /opt/clang/bin/clang "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && cp /opt/clang/bin/llvm-link "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && cp /opt/clang/bin/opt "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \

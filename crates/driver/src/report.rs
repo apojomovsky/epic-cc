@@ -6,6 +6,7 @@
 //! this less obvious than on a stack machine, since a byte can be live in
 //! several frames, so the report states the definition on the line.
 
+use super::sidecar;
 use alloc::AllocLayout;
 use device::Device;
 use ir::SrcLoc;
@@ -22,43 +23,11 @@ use irparse::DebugVars;
 pub fn line_table_text(device: &Device, asm: &str, locs: &[Option<SrcLoc>]) -> String {
     let mut out = String::new();
     out.push_str(&format!("; epic-cc line table for {}\n", device.name));
-    let mut org = 0usize;
-    let mut li = 0usize;
-    for raw in asm.lines() {
-        let line = raw.split(';').next().unwrap_or("").trim();
-        let loc = locs.get(li).cloned().flatten();
-        li += 1;
-        if line.is_empty() || line.starts_with("list") || line.starts_with("radix") {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("org ") {
-            org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16).unwrap();
-            continue;
-        }
-        if line.starts_with("end") {
-            break;
-        }
-        if let Some(l) = line.strip_suffix(':') {
-            // A label defines no word; the next instruction's address is
-            // the label's. Skip.
-            let _ = l;
-            continue;
-        }
-        if line.contains(" equ ") {
-            continue;
-        }
-        if let Some(n) = line.strip_prefix(".align ") {
-            let n: usize = n.trim().parse().unwrap();
-            org = (org + n - 1) & !(n - 1);
-            continue;
-        }
-        if line.starts_with(".table ") {
-            continue;
-        }
-        if let Some(loc) = loc {
-            out.push_str(&format!("{} 0x{org:04X}\n", loc));
-        }
-        org += 1;
+    // The rows are the sidecar's `.debug_line` source by construction:
+    // both artifacts walk out of `sidecar::line_rows`, so they cannot
+    // drift apart.
+    for (loc, addr) in sidecar::line_rows(asm, locs) {
+        out.push_str(&format!("{loc} 0x{addr:04X}\n"));
     }
     out
 }

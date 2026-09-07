@@ -11,6 +11,8 @@ irparse = { path = "../irparse" }
 wholeprog = { path = "../wholeprog" }
 legalize = { path = "../legalize" }
 callgraph = { path = "../callgraph" }
+gimli = { version = "0.31", features = ["read"] }
+object = { version = "0.36", default-features = false, features = ["read_core", "write_core", "elf", "std"] }
 alloc = { path = "../alloc" }
 isel = { path = "../isel" }
 isel-pic14e = { path = "../isel-pic14e" }
@@ -21,6 +23,7 @@ peephole = { path = "../peephole" }
 asm = { path = "../asm" }
 
 [dev-dependencies]
+epic-cc-gdbserver = { path = "../gdbserver" }
 pic14-sim = { path = "../sim" }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
