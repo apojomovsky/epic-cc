@@ -6,7 +6,8 @@
 //! ADR-018's pointer rule: every string walk is an INDEX loop, the only
 //! pointer read is `va_arg` (now modelled directly), and the 32-bit
 //! conversion bodies are `noinline` helpers so every function stays under
-//! the 877A's 2048-word page limit. No floats (`%f` is CC-5).
+//! the 877A's 2048-word page limit. `%f` formats an f32 (== double here)
+//! at 2 fixed decimals using the float runtime.
 
 pub const STDIO_C: &str = r#"#include <stdarg.h>
 #include <stddef.h>
@@ -54,6 +55,29 @@ __attribute__((noinline)) static int out_hex(unsigned long v, int lc) {
     return k;
 }
 
+/* Format one f32 (== double here) to fixed 2 decimals, returning the
+   written count. Pulled out of vprintf into its own noinline frame so the
+   float runtime routines stack after this small frame, keeping vprintf's
+   frame small enough that vprintf + the float routines fit the PIC18
+   access-bank GPR region (the soft-float bodies are access-bank-bound).
+   clang folds `-d` to `fneg` (unsupported), so negation is written as
+   `0.0 - d`, which comes out as fsub. */
+__attribute__((noinline)) static int out_float(double d) {
+    int w = 0;
+    int neg = 0;
+    if (d < 0) { neg = 1; d = 0.0 - d; }
+    unsigned long whole = (unsigned long)d;
+    double frac = d - (double)whole;
+    unsigned long cent = (unsigned long)(frac * 100.0 + 0.5);
+    if (cent >= 100) { cent = 0; whole++; }
+    if (neg) { putchar('-'); w++; }
+    w += out_dec(whole, 0);
+    putchar('.'); w++;
+    putchar((unsigned char)('0' + cent / 10)); w++;
+    putchar((unsigned char)('0' + cent % 10)); w++;
+    return w;
+}
+
 __attribute__((noinline)) int vprintf(const char *fmt, va_list ap) {
     int written = 0;
     size_t i = 0;
@@ -98,6 +122,9 @@ __attribute__((noinline)) int vprintf(const char *fmt, va_list ap) {
                 written += out_hex(v, conv == 'x');
                 break;
             }
+            case 'f': case 'F':
+                written += out_float(va_arg(ap, double));
+                break;
             default:
                 /* Unknown conversion: emit verbatim so a format bug is
                    visible instead of silently dropped. */
