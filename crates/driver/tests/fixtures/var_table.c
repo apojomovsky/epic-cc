@@ -13,7 +13,8 @@ int main(void) {
   int *p = &slot;
   int arr[4];
   arr[0] = g_int;
-  *p = 42;
+  static volatile int st = 5;
+  g_int = st;
   g_char = (char)*p;
   g_long = *p;
   g_p.x = *p;

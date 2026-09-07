@@ -44,8 +44,8 @@ usage: epic-cc [options] <input.c>...
   --var-table <file>   write the typed variable table into <file>
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
+  --version, -V        print the compiler identity (e.g. epic-cc 0.0.0-master-<sha>)
 ";
-
 /// Parse an argument list that does NOT include `argv[0]`.
 pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut inputs = Vec::new();

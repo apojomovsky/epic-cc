@@ -140,8 +140,8 @@ pub fn parse_debug_vars(src: &str) -> DebugVars {
     let mut composites: Vec<RawComposite> = Vec::new();
     // DILocalVariable: id, name, line, type id, arg, scope id.
     let mut local_meta: Vec<(u32, String, u32, u32, Option<u32>, u32)> = Vec::new();
-    // DIGlobalVariable: id, name, line, type id.
-    let mut global_meta: Vec<(u32, String, u32, u32)> = Vec::new();
+    // DIGlobalVariable: id, name, line, type id, isLocal, scope id.
+    let mut global_meta: Vec<(u32, String, u32, u32, bool, u32)> = Vec::new();
     let mut sub_names: HashMap<u32, String> = HashMap::new();
     // Lexical block id -> parent scope id.
     let mut scope_parent: HashMap<u32, u32> = HashMap::new();
@@ -204,7 +204,10 @@ pub fn parse_debug_vars(src: &str) -> DebugVars {
                     name: string_field(body, "name"),
                     base: node_field(body, "baseType"),
                 },
-                "DW_TAG_const_type" | "DW_TAG_volatile_type" => DiTypeNode::Qualifier {
+                "DW_TAG_const_type"
+                | "DW_TAG_volatile_type"
+                | "DW_TAG_restrict_type"
+                | "DW_TAG_atomic_type" => DiTypeNode::Qualifier {
                     base: node_field(body, "baseType"),
                 },
                 _ => DiTypeNode::Other,
@@ -244,11 +247,14 @@ pub fn parse_debug_vars(src: &str) -> DebugVars {
             }
         } else if body.starts_with("!DIGlobalVariable(") {
             if let Some(name) = string_field(body, "name") {
+                let is_local = token_field(body, "isLocal").as_deref() == Some("true");
                 global_meta.push((
                     id,
                     name,
                     num_field(body, "line").unwrap_or(0),
                     node_field(body, "type").unwrap_or(0),
+                    is_local,
+                    node_field(body, "scope").unwrap_or(0),
                 ));
             }
         }
@@ -288,13 +294,18 @@ pub fn parse_debug_vars(src: &str) -> DebugVars {
         types.insert(c.id, node);
     }
 
+    // A function-local static (`isLocal: true`) is a global whose C
+    // symbol clang names `{func}.{name}`; its `func` records that, so
+    // the driver joins the sanitized `{func}_{name}` symbol.
     let mut globals: Vec<DiVar> = global_meta
         .into_iter()
-        .map(|(_id, name, line, ty)| DiVar {
+        .map(|(_id, name, line, ty, is_local, scope)| DiVar {
             name,
             line,
             ty,
-            func: None,
+            func: is_local
+                .then(|| scope_func(Some(scope), &scope_parent, &sub_names))
+                .flatten(),
             arg: None,
             ssa: None,
         })

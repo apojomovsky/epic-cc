@@ -2,8 +2,7 @@
 //! metadata (`DILocalVariable`/`DIType`/`#dbg_*` records) against the
 //! allocation map. Acceptance: every covered global type renders with
 //! its allocated address, an address-taken local resolves through the
-//! SSA-key bridge, and the phase-1 line table is unchanged by the `-g`
-//! switch on this fixture.
+//! SSA-key bridge, and every record's address agrees with `--map`.
 
 use std::process::Command;
 
@@ -104,17 +103,37 @@ fn var_table_addresses_match_the_map() {
     }
     // The map keys locals by SSA def name, the var table prints the C
     // name. The invariant is the address set: each local record's
-    // address must be a local address the map reports.
-    let local_addrs: Vec<u16> = map
+    // address must be a local or (function-local static) global address
+    // the map reports.
+    let map_addrs: Vec<u16> = map
         .lines()
-        .filter(|l| l.starts_with("local main::"))
+        .filter(|l| l.starts_with("local ") || l.starts_with("global "))
         .map(|l| u16::from_str_radix(&l.split_whitespace().nth(2).unwrap()[2..], 16).unwrap())
         .collect();
     for l in t.lines().filter(|l| l.starts_with("local main::")) {
         let addr = u16::from_str_radix(&l.split_whitespace().nth(2).unwrap()[2..], 16).unwrap();
         assert!(
-            local_addrs.contains(&addr),
+            map_addrs.contains(&addr),
             "var table address 0x{addr:02X} not in map:\n{map}"
         );
     }
+}
+
+#[test]
+fn function_local_static_joins_via_symbol_key() {
+    let map = artifact("tests/fixtures/var_table.c", "--map", "/tmp/vt_smap.txt");
+    let t = artifact(
+        "tests/fixtures/var_table.c",
+        "--var-table",
+        "/tmp/vt_static.txt",
+    );
+    let st = record(&t, "main::st");
+    assert_eq!(st.1, "int");
+    let map_line = map
+        .lines()
+        .find(|l| l.starts_with("global main.st "))
+        .expect("dotted static symbol in map");
+    let map_addr: u16 =
+        u16::from_str_radix(&map_line.split_whitespace().nth(2).unwrap()[2..], 16).unwrap();
+    assert_eq!(st.0, map_addr, "static local address mismatch");
 }

@@ -101,7 +101,17 @@ pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -
     let mut out = String::new();
     out.push_str(&format!("; epic-cc var table for {}\n", device.name));
     for v in &vars.globals {
-        if let Some(&addr) = layout.globals.get(&v.name) {
+        if let Some(func) = &v.func {
+            // Function-local static: clang names the symbol
+            // `{func}.{name}`, which is the map's global key.
+            if let Some(&addr) = layout.globals.get(&format!("{func}.{name}", name = v.name)) {
+                out.push_str(&format!(
+                    "local {func}::{name} 0x{addr:02X} {ty}\n",
+                    name = v.name,
+                    ty = vars.type_string(v.ty)
+                ));
+            }
+        } else if let Some(&addr) = layout.globals.get(&v.name) {
             out.push_str(&format!(
                 "global {name} 0x{addr:02X} {ty}\n",
                 name = v.name,
