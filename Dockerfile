@@ -63,19 +63,13 @@ FROM clang-builder AS dev
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Test-oracle, fuzz, and misc tooling: deliberately kept out of base (see
-# this file's header comment) so adding or changing any of these can never
-# bust clang-builder's LLVM cache. python3 is already in base (LLVM's own
-# cmake needs it); git/file are general tooling; csmith/creduce/cvise/
-# poppler-utils are the fuzz-corpus/reduction toolchain; flex/bison/
-# libboost-graph-dev are gputils' and SDCC's own build deps.
+# SDCC's own build deps (its configure queries the installed gpasm/gputils
+# for its device table, and needs flex/bison/boost to build itself), so
+# they must land before the gputils and SDCC RUNs below. Kept to exactly
+# these three so unrelated tooling added later cannot bust the gputils/
+# SDCC layers the same way base is protected from clang-builder churn
+# (this file's header comment).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-        file \
-        csmith \
-        creduce \
-        cvise \
-        poppler-utils \
         flex \
         bison \
         libboost-graph-dev \
@@ -135,6 +129,20 @@ RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
     && mkdir -p /usr/local/share/sdcc/regression \
     && cp -r support/regression/* /usr/local/share/sdcc/regression/ \
     && rm -rf /tmp/sdcc-4.6.0 /tmp/sdcc.tar.bz2
+
+# Test-time tooling only, no from-source build (gputils, SDCC) depends on
+# any of these, so they sit last: adding one here can only bust its own
+# apt layer, never the gputils/SDCC builds above. git/file are general
+# tooling; csmith/creduce/cvise/poppler-utils are the fuzz-corpus/
+# reduction toolchain.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        file \
+        csmith \
+        creduce \
+        cvise \
+        poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
 
 # PIC8_HOST_CLANG: the fuzz differential harness's host-reference compiler
 # (crates/fuzz/src/lib.rs host_clang()) — this same clang, no -target,
