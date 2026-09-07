@@ -13,8 +13,10 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Exactly what clang-builder's RUN below needs: cmake/ninja-build to
 # configure and build LLVM, ccache for LLVM_CCACHE_BUILD, curl/ca-
-# certificates/xz-utils to fetch and extract the source tarball. See this
-# file's header comment for why nothing else may be added here.
+# certificates/xz-utils to fetch and extract the source tarball, python3
+# because LLVM's own top-level CMakeLists.txt does an unconditional
+# find_package(Python3) regardless of LLVM_INCLUDE_TESTS. See this file's
+# header comment for why nothing else may be added here.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         cmake \
@@ -24,6 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         xz-utils \
+        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 FROM base AS clang-builder
@@ -62,11 +65,11 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # Test-oracle, fuzz, and misc tooling: deliberately kept out of base (see
 # this file's header comment) so adding or changing any of these can never
-# bust clang-builder's LLVM cache. python3/git/file are general tooling;
-# csmith/creduce/cvise/poppler-utils are the fuzz-corpus/reduction toolchain;
-# flex/bison/libboost-graph-dev are gputils' and SDCC's own build deps.
+# bust clang-builder's LLVM cache. python3 is already in base (LLVM's own
+# cmake needs it); git/file are general tooling; csmith/creduce/cvise/
+# poppler-utils are the fuzz-corpus/reduction toolchain; flex/bison/
+# libboost-graph-dev are gputils' and SDCC's own build deps.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        python3 \
         git \
         file \
         csmith \
