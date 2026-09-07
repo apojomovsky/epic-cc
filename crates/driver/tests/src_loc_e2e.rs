@@ -28,12 +28,12 @@ fn run_driver(name: &str, src: &str) -> (bool, String) {
 #[test]
 fn unsupported_type_panic_names_the_definition_site() {
     let (ok, stderr) = run_driver(
-        "spike_double",
-        "long double get(void) { return 1.5L; }\nint main(void) { return (int)get(); }\n",
+        "spike_complex",
+        "_Complex float get(void) { return 1.0f + 2.0f*1.0fi; }\nint main(void) { return (int)__real__ get(); }\n",
     );
-    assert!(!ok, "long double must be rejected, not compiled");
+    assert!(!ok, "_Complex float must be rejected, not compiled");
     assert!(
-        stderr.contains("spike_double.c:1:1: SPIKE: unsupported type \"double\""),
+        stderr.contains("spike_complex.c:1:1: SPIKE: unsupported type"),
         "panic must carry the C location:\n{stderr}"
     );
 }
