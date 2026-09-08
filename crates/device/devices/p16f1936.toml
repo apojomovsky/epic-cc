@@ -34,6 +34,7 @@ values = [{ name = "off", bits = 0 }, { name = "swdten", bits = 1 }, { name = "n
 
 [[config.fields]]
 name = "pwrt"
+default = "off"
 byte_offset = 0
 mask = 0x20
 shift = 5
@@ -73,6 +74,7 @@ values = [{ name = "off", bits = 0 }, { name = "sboden", bits = 1 }, { name = "n
 
 [[config.fields]]
 name = "clkouten"
+default = "off"
 byte_offset = 1
 mask = 0x08
 shift = 3
@@ -104,6 +106,7 @@ values = [{ name = "all", bits = 0 }, { name = "half", bits = 1 }, { name = "boo
 
 [[config.fields]]
 name = "vcapen"
+default = "off"
 byte_offset = 2
 mask = 0x30
 shift = 4
@@ -111,6 +114,7 @@ values = [{ name = "ra0", bits = 0 }, { name = "ra5", bits = 1 }, { name = "ra6"
 
 [[config.fields]]
 name = "pllen"
+default = "off"
 byte_offset = 3
 mask = 0x01
 shift = 0
@@ -118,6 +122,7 @@ values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
 
 [[config.fields]]
 name = "stvren"
+default = "off"
 byte_offset = 3
 mask = 0x02
 shift = 1
@@ -125,6 +130,7 @@ values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
 
 [[config.fields]]
 name = "borv"
+default = "hi"
 byte_offset = 3
 mask = 0x04
 shift = 2
