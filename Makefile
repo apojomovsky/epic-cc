@@ -63,6 +63,7 @@ help: ## List targets
 image: ## Build the dev image (only image you need locally)
 	@$(ENSURE_BUILDER)
 	@src_hash=$$({ cat Dockerfile; id -u; id -g; } | md5sum | cut -d' ' -f1); \
+	test -n "$$src_hash" || { echo "image: failed to hash the Dockerfile" >&2; exit 1; }; \
 	cur=$$(docker image inspect $(LOCAL_IMAGE) --format '{{index .Config.Labels "org.epic-cc.source-hash"}}' 2>/dev/null || true); \
 	if [ "$$cur" = "$$src_hash" ]; then \
 		echo "dev image up to date (source-hash $$src_hash), skipping rebuild"; \

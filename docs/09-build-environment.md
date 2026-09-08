@@ -111,8 +111,8 @@ make target (`exec`, `test`, `check-warnings`, `lint`, ...) depends on
 `image`, the guard is what stops the repeated `--load` re-export of an
 unchanged image that otherwise adds ~45s of "sending tarball" to every
 invocation. The first guarded build after this change is a real rebuild (it
-labels the image); every subsequent run with an unchanged Dockerfile and UID
-skips it.
+labels the image); every subsequent run with an unchanged Dockerfile and
+UID/GID skips it.
 
 ## Cargo target cache is per worktree
 
