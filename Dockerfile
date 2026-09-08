@@ -104,15 +104,25 @@ RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
 # digest-pinned, exactly like gputils. SDCC is GPL: it lives in the image as
 # an external oracle only, never linked or committed into the MIT repo. Its
 # pic14/pic16 ports need gputils (built above) and the boost graph library
-# (apt, above). The regression suite ships in the tarball under
+# (apt, above). The pic16 device library is then rebuilt with
+# --enable-floats (manual 4.10.9): the default build prints `<NO FLOAT>`
+# instead of formatting %f, which would make the %f corpus probe
+# untestable against SDCC. The regression suite ships in the tarball under
 # support/regression/ and is used by the parity harness (Tier 3), never
 # committed. Built in dev (not base) so the expensive clang-builder layer
 # stays cached when the SDCC pin changes.
+#
+# SDCC 4.6.0 #errors on boost 1.71-1.78 (SDCC bug #3772) in the
+# boost-graph register allocator used by src/pdk, whose port.a builds
+# even with every pdk port disabled. Only the pdk/z80 families use that
+# allocator; the pic14/pic16 backends use ralloc.c, so the guard is
+# downgraded to a warning for this image's disabled-pdk build.
 RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
         https://downloads.sourceforge.net/project/sdcc/sdcc/4.6.0/sdcc-src-4.6.0.tar.bz2 \
     && echo "5fd6a93e5997ce01756868fe35e441095cfb637894a80c262514a634094973b6  /tmp/sdcc.tar.bz2" | sha256sum -c - \
     && tar -xjf /tmp/sdcc.tar.bz2 -C /tmp \
     && cd /tmp/sdcc-4.6.0 \
+    && sed -i 's/^#error boost 1\.71/#warning boost 1.71/' src/SDCCsalloc.hpp \
     && ./configure --prefix=/usr/local \
         --disable-mcs51-port --disable-z80-port --disable-z180-port \
         --disable-r2k-port --disable-r2ka-port --disable-r3ka-port \
@@ -126,6 +136,12 @@ RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
     && make -j"$(nproc)" \
     && make install \
     && make -C device/non-free/lib install \
+    && cd device/lib/pic16 \
+    && ./configure --prefix=/usr/local --enable-floats \
+    && make clean > /dev/null \
+    && make -j"$(nproc)" \
+    && for i in */lib*.a; do cp -f "$i" /usr/local/share/sdcc/lib/pic16/"$(basename "$i" .a)".lib; done \
+    && cd /tmp/sdcc-4.6.0 \
     && mkdir -p /usr/local/share/sdcc/regression \
     && cp -r support/regression/* /usr/local/share/sdcc/regression/ \
     && rm -rf /tmp/sdcc-4.6.0 /tmp/sdcc.tar.bz2
