@@ -88,6 +88,9 @@ fmt: image ## Format the workspace (cargo fmt)
 lint: image ## Clippy, advisory (never fails the build)
 	@$(DOCKER_RUN) bash -c 'cargo clippy --workspace 2>&1 | tail -20'
 
+fuzz: ## Lane B (#286): coverage-guided fuzz of irparse's parser (needs nightly + cargo-fuzz)
+	@$(DOCKER_RUN) bash -c 'cargo install cargo-fuzz --version 0.12.0 2>&1 | tail -1 && cargo fuzz run irparse_parse_ll -- -max_total_time=60'
+
 check-warnings: image ## Fail if cargo build --workspace --all-targets emits any warnings
 	@mkdir -p $(CARGO_HOME_CACHE) $(WARNCHECK_TARGET_CACHE)
 	@docker run --rm --user $$(id -u):$$(id -g) \
