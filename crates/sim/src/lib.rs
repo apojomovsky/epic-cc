@@ -650,7 +650,7 @@ impl Pic14e {
     /// region and the flash window are per-core constants on this core
     /// (docs/33 D-2), so only the `Core::Pic14e` contract is checked, not
     /// per-device fields.
-    pub fn with_device(device: &'static Device, prog: Vec<u16>) -> Self {
+    pub fn with_device(device: &Device, prog: Vec<u16>) -> Self {
         assert_eq!(
             device.core,
             device::Core::Pic14e,
