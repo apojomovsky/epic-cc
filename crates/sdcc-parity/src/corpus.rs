@@ -14,8 +14,9 @@
 use crate::{CorpusProgram, Input};
 
 /// Build a corpus program from source + input/output declarations.
-fn prog(source: &str, inputs: &[(&str, u8, u32)], outputs: &[&str]) -> CorpusProgram {
+fn prog(name: &str, source: &str, inputs: &[(&str, u8, u32)], outputs: &[&str]) -> CorpusProgram {
     CorpusProgram {
+        name: name.to_string(),
         source: source.to_string(),
         inputs: inputs
             .iter()
@@ -34,12 +35,14 @@ pub fn tier1() -> Vec<CorpusProgram> {
     vec![
         // add.c: out = in + 1
         prog(
+            "add",
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) { out = in + 1; }\n",
             &[("in", 8, 7)],
             &["out"],
         ),
         // array.c: buf[i] = i+1; out = buf[i] for i = in & 7
         prog(
+            "array",
             "volatile unsigned short in;\nvolatile unsigned char out;\nvolatile unsigned char buf[8];\nvoid main(void) {\n    unsigned char i = (unsigned char)(in & 7);\n    buf[i] = (unsigned char)(i + 1);\n    out = buf[i];\n}\n",
             &[("in", 16, 3)],
             &["out"],
@@ -54,18 +57,21 @@ pub fn tier2() -> Vec<CorpusProgram> {
     vec![
         // Bit-fields: a struct with bit-fields, read/write through them.
         prog(
+            "bitfields",
             "volatile unsigned char in;\nvolatile unsigned char out;\nstruct flags { unsigned char a:2; unsigned char b:3; unsigned char c:3; };\nvoid main(void) {\n    struct flags f;\n    f.a = (unsigned char)(in & 3);\n    f.b = (unsigned char)((in >> 2) & 7);\n    f.c = (unsigned char)((in >> 5) & 7);\n    out = (unsigned char)(f.a | (f.b << 2) | (f.c << 5));\n}\n",
             &[("in", 8, 0x6D)],
             &["out"],
         ),
         // Unions: a union of u8/u16, write one read the other.
         prog(
+            "unions",
             "volatile unsigned short in;\nvolatile unsigned char out;\nunion u { unsigned char b[2]; unsigned short w; };\nvoid main(void) {\n    union u v;\n    v.w = in;\n    out = (unsigned char)(v.b[0] + v.b[1]);\n}\n",
             &[("in", 16, 0x1234)],
             &["out"],
         ),
         // 64-bit long long: add two 64-bit values, read the low byte.
         prog(
+            "i64",
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    unsigned long long a = 0x1122334455667788ULL;\n    unsigned long long b = (unsigned long long)in;\n    unsigned long long c = a + b;\n    out = (unsigned char)(c & 0xFF);\n}\n",
             &[("in", 8, 0x12)],
             &["out"],
@@ -75,24 +81,28 @@ pub fn tier2() -> Vec<CorpusProgram> {
         // type mapping; the conversion to unsigned int is the supported
         // FpToUi path.
         prog(
+            "double",
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    double a = 1.5;\n    double b = (double)in;\n    double c = a * b;\n    out = (unsigned char)((unsigned int)c & 0xFF);\n}\n",
             &[("in", 8, 2)],
             &["out"],
         ),
         // malloc: allocate, write, read back.
         prog(
+            "malloc",
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    unsigned char *p = (unsigned char *)0x20;\n    *p = in;\n    out = *p;\n}\n",
             &[("in", 8, 0x5A)],
             &["out"],
         ),
         // math: a simple arithmetic expression (no libm dependency).
         prog(
+            "math",
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    unsigned char x = in;\n    out = (unsigned char)((x * 3 + 7) & 0xFF);\n}\n",
             &[("in", 8, 0x2A)],
             &["out"],
         ),
         // Code pointer: call a function through a pointer.
         prog(
+            "fnptr",
             "volatile unsigned char in;\nvolatile unsigned char out;\nunsigned char add1(unsigned char x) { return (unsigned char)(x + 1); }\nvoid main(void) {\n    unsigned char (*fp)(unsigned char) = add1;\n    out = fp(in);\n}\n",
             &[("in", 8, 9)],
             &["out"],
@@ -103,6 +113,7 @@ pub fn tier2() -> Vec<CorpusProgram> {
         // recursion corrupts n and returns 1 (an SDCC oracle bug, not an
         // epic-cc gap). See baseline.md.
         prog(
+            "recursion",
             "volatile unsigned char in;\nvolatile unsigned char out;\nunsigned char fact(unsigned char n) {\n    if (n <= 1) return 1;\n    return (unsigned char)(n * fact((unsigned char)(n - 1)));\n}\nvoid main(void) {\n    out = fact(in);\n}\n",
             &[("in", 8, 5)],
             &["out"],
@@ -110,6 +121,7 @@ pub fn tier2() -> Vec<CorpusProgram> {
         // printf %f: format a float (SDCC's printf supports %f; epic-cc's
         // does not yet, so this is a surface probe).
         prog(
+            "printf-f",
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    out = in;\n}\n",
             &[("in", 8, 1)],
             &["out"],

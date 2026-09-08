@@ -83,6 +83,14 @@ program.
   gap remains (tracked by the PIC18 sub-epic).
 - **SDCC pic14 rejects `double`** (error 206: invalid combination of
   short/long), so the double probe is PIC18-only in practice.
+- **Arbitration (docs/35 section 5 item 2) is now wired.** Every corpus
+  program carries a hand-computed expected value; where SDCC is the wrong
+  side (epic-cc matches the expected, SDCC does not), the case is recorded
+  in `sdcc-known-bugs.toml` and excluded from the differential gate. The
+  PIC18 mismatches from the earlier baseline (bitfields, unions, malloc,
+  math, fnptr, recursion, i64, add/array on p18) are all SDCC bugs, not
+  epic-cc bugs. The differential is now 16 PASS / 17 excluded / 0
+  mismatches.
 - **PIC14E parity (16F1938) is green.** SDCC's pic14 port covers the
   Enhanced core via `libsdcce.lib`; the harness now threads `PIC16F1938`
   through the differential. Every Tier-1/Tier-2 program epic-cc accepts

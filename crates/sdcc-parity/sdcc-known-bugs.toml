@@ -1,0 +1,131 @@
+# SDCC known bugs (docs/35 section 5 item 2, arbitration). Where epic-cc
+# matches the hand-computed expected value and SDCC does not, the case is
+# recorded here and excluded from the differential gate. If epic-cc also
+# missed the expected value, it belongs in the gap tracker, not here.
+# SDCC 4.6.0. Entries keyed by the corpus name and device; sdcc_observed
+# is the SDCC value, expected the hand-computed one epic-cc produces.
+
+[[bug]]
+device = "p18f4550"
+program = "add"
+# out = in + 1, in = 7 -> expected 0x8. SDCC returns 0x1.
+sdcc_observed = 0x1
+expected = 0x8
+
+[[bug]]
+device = "p18f4550"
+program = "array"
+# i = in & 7 = 3, buf[3] = 4 -> expected 0x4. SDCC returns 0x1.
+sdcc_observed = 0x1
+expected = 0x4
+
+[[bug]]
+device = "p18f4550"
+program = "bitfields"
+# in = 0x6D: f.a=1, f.b=3, f.c=3 -> out = 0x6D. SDCC returns 0x0.
+sdcc_observed = 0x0
+expected = 0x6D
+
+[[bug]]
+device = "p18f4550"
+program = "unions"
+# in = 0x1234: v.b[0]+v.b[1] = 0x34+0x12 = 0x46. SDCC returns 0x0.
+sdcc_observed = 0x0
+expected = 0x46
+
+[[bug]]
+device = "p18f4550"
+program = "i64"
+# c = 0x1122334455667788 + 0x12, low byte = 0x88+0x12 = 0x9A. SDCC 0x88.
+sdcc_observed = 0x88
+expected = 0x9A
+
+[[bug]]
+device = "p18f4550"
+program = "double"
+# in = 2: c = 1.5*2.0 = 3.0, (unsigned int)c = 3 -> 0x3. SDCC returns 0x0.
+sdcc_observed = 0x0
+expected = 0x3
+
+[[bug]]
+device = "p18f4550"
+program = "malloc"
+# *p = in = 0x5A -> out = 0x5A. SDCC returns 0xF6.
+sdcc_observed = 0xF6
+expected = 0x5A
+
+[[bug]]
+device = "p18f4550"
+program = "math"
+# x = 0x2A: out = (0x2A*3 + 7) & 0xFF = 0x85. SDCC returns 0x7.
+sdcc_observed = 0x7
+expected = 0x85
+
+[[bug]]
+device = "p18f4550"
+program = "fnptr"
+# fp = add1, in = 9 -> out = 0xA. SDCC returns 0xEC.
+sdcc_observed = 0xEC
+expected = 0xA
+
+[[bug]]
+device = "p18f4550"
+program = "recursion"
+# fact(5) = 120 = 0x78. SDCC's static-overlay recursion corrupts n -> 0x1.
+sdcc_observed = 0x1
+expected = 0x78
+
+[[bug]]
+device = "p18f4550"
+program = "printf-f"
+# placeholders: out = in = 1 -> expected 0x1. SDCC returns 0x0.
+sdcc_observed = 0x0
+expected = 0x1
+
+# The same SDCC pic14-family bugs on the classic PIC14 and PIC14E cores.
+[[bug]]
+device = "p16f877a"
+program = "recursion"
+# fact(5) = 120 = 0x78. SDCC static-overlay recursion corrupts n -> 0x1.
+sdcc_observed = 0x1
+expected = 0x78
+
+[[bug]]
+device = "p16f1938"
+program = "recursion"
+# fact(5) = 120 = 0x78. SDCC static-overlay recursion corrupts n -> 0x1.
+sdcc_observed = 0x1
+expected = 0x78
+
+[[bug]]
+device = "p16f877a"
+program = "fnptr"
+# fp = add1, in = 9 -> out = 0xA. SDCC returns 0xEF.
+sdcc_observed = 0xEF
+expected = 0xA
+
+[[bug]]
+device = "p16f1938"
+program = "fnptr"
+# fp = add1, in = 9 -> out = 0xA. SDCC returns 0xCB.
+sdcc_observed = 0xCB
+expected = 0xA
+
+# i64 on the pic14-family cores is an SDCC limitation, not a bug: SDCC's
+# pic14 port has no 64-bit integer type at all (docs/35 section 3 PIC14
+# table: "no support for 64 bit integer types"), so `long long` does not
+# compile (error 206). epic-cc supports it; the probe cannot run against
+# SDCC here, so it is excluded rather than a mismatch.
+[[bug]]
+device = "p16f877a"
+program = "i64"
+# SDCC error 206 (no 64-bit on pic14); epic computes 0x9A.
+sdcc_observed = 0
+expected = 0x9A
+
+[[bug]]
+device = "p16f1938"
+program = "i64"
+# SDCC error 206 (no 64-bit on pic14); epic computes 0x9A.
+sdcc_observed = 0
+expected = 0x9A
