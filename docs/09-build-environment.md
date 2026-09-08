@@ -104,6 +104,16 @@ already-built clang layer from GHCR, not a recompile. Because the base image
 and the LLVM tarball are digest-pinned, the clang layer only needs a real
 rebuild (locally or in CI) when the Dockerfile or a pin changes.
 
+`make image` is idempotent: it bakes a `org.epic-cc.source-hash` label
+(from the Dockerfile text plus the host UID/GID build args) and skips the
+buildx build when the present image already carries that label. Since every
+make target (`exec`, `test`, `check-warnings`, `lint`, ...) depends on
+`image`, the guard is what stops the repeated `--load` re-export of an
+unchanged image that otherwise adds ~45s of "sending tarball" to every
+invocation. The first guarded build after this change is a real rebuild (it
+labels the image); every subsequent run with an unchanged Dockerfile and UID
+skips it.
+
 ## Cargo target cache is per worktree
 
 `CARGO_TARGET_DIR` points at `~/.cache/epic-cc/target-<worktree path with /
