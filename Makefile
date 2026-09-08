@@ -11,6 +11,26 @@ LOCAL_IMAGE := epic-cc-dev:local
 CACHE_DIR   := $(HOME)/.cache/epic-cc
 CARGO_HOME_CACHE := $(CACHE_DIR)/cargo-home
 
+# Dedicated buildx builder (docker-container driver) for every local image
+# build. Its cache — including the clang-builder layer and the LLVM ccache
+# mount — lives in this builder's own container/volume, not the default
+# docker driver's storage. `docker system prune` / `docker builder prune`
+# (no --builder flag) only ever touch the *default* builder, so a generic
+# cache cleanup can no longer reach the clang cache at all: this is the
+# fix, not the registry cache below (that's just the fallback for a fresh
+# machine or someone deleting this builder by name). Created lazily and
+# idempotently by every target that needs it.
+BUILDER := epic-cc-builder
+ENSURE_BUILDER := docker buildx inspect $(BUILDER) >/dev/null 2>&1 || \
+	docker buildx create --name $(BUILDER) --driver docker-container --bootstrap >/dev/null
+
+# Same registry cache CI warms (.github/workflows/toolchain-cache.yml).
+# Fallback path only: a fresh machine (no local builder cache yet) pulls
+# the already-built clang layer from GHCR instead of compiling it. Public
+# image, no login needed; ignore-error=true so a GHCR outage just falls
+# back to a normal (uncached) build instead of failing it.
+TOOLCHAIN_CACHE := --cache-from type=registry,ref=ghcr.io/apojomovsky/epic-cc-toolchain,ignore-error=true
+
 # Every docker invocation mounts its worktree at the identical in-container
 # path (/workspace), so a shared target dir lets cargo silently replay a
 # DIFFERENT worktree's cached artifacts here: fingerprints key on the
@@ -42,7 +62,8 @@ help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
 
 image: ## Build the dev image (only image you need locally)
-	docker build --target dev --build-arg UID=$$(id -u) --build-arg GID=$$(id -g) -t $(LOCAL_IMAGE) .
+	@$(ENSURE_BUILDER)
+	docker buildx build --builder $(BUILDER) --load --target dev $(TOOLCHAIN_CACHE) --build-arg UID=$$(id -u) --build-arg GID=$$(id -g) -t $(LOCAL_IMAGE) .
 
 shell: image ## Interactive dev shell inside the container
 	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE)
@@ -69,7 +90,8 @@ info: image ## Toolchain versions + env vars from the image
 
 release-bundle: ## Build the Linux release zip: VERSION=0.1.0
 	@test -n "$(VERSION)" || (echo "make release-bundle VERSION=x.y.z"; exit 1)
-	docker build --target release --build-arg EPIC_CC_VERSION=$(VERSION) \
+	@$(ENSURE_BUILDER)
+	docker buildx build --builder $(BUILDER) --load --target release $(TOOLCHAIN_CACHE) --build-arg EPIC_CC_VERSION=$(VERSION) \
 		-t epic-cc-release:$(VERSION) .
 	@mkdir -p dist
 	docker run --rm --user $$(id -u):$$(id -g) \
