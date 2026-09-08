@@ -8818,3 +8818,106 @@ fn config_table_crossing_window_top_is_256_aligned() {
         "table[3] = 3 through the aligned reader:\n{asm}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Lane E (docs/36): volatile access ordering and count. A differential
+// oracle compares a final checksum, which cannot see whether N stores to N
+// distinct volatile globals were coalesced or reordered: real register
+// sequencing depends on write count and order, not just the final bit
+// pattern. These pin the isel stage boundary: N distinct stores must emit N
+// MOVWFs, to distinct addresses, in program order.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn distinct_volatile_global_stores_emit_all_movwf_in_program_order() {
+    // N = 5 distinct volatile globals, each written once with its own
+    // constant, in source order. A coalescing or reordering pass must not
+    // merge them (count) nor swap their order.
+    let globals: Vec<String> = (0..5).map(|i| format!("global g{i} i8")).collect();
+    let stores: Vec<String> = (0..5)
+        .map(|i| format!("    store i8 {} @g{}", i + 1, i))
+        .collect();
+    let m = parse(&format!(
+        "{}\nfn main(void) ()\n  block entry:\n{}\n    ret void\n",
+        globals.join("\n"),
+        stores.join("\n")
+    ));
+    let addrs = addrs(&[
+        ("g0", 0x20),
+        ("g1", 0x21),
+        ("g2", 0x22),
+        ("g3", 0x23),
+        ("g4", 0x24),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+
+    // One MOVWF per distinct global, none coalesced away.
+    for i in 0..5 {
+        assert_eq!(
+            asm.matches(&format!("    MOVWF 0x{:02X}", 0x20 + i))
+                .count(),
+            1,
+            "store to g{i} must emit exactly one MOVWF:\n{asm}"
+        );
+    }
+    // MOVWF addresses appear in program (IR) order 0x20, 0x21, ... 0x24.
+    let pos: Vec<usize> = (0..5)
+        .map(|i| asm.find(&format!("    MOVWF 0x{:02X}", 0x20 + i)).unwrap())
+        .collect();
+    for w in pos.windows(2) {
+        assert!(w[0] < w[1], "stores must land in program order:\n{asm}");
+    }
+}
+
+#[test]
+fn repeated_volatile_global_stores_are_not_collapsed() {
+    // Two successive writes to the SAME volatile global must both emit a
+    // MOVWF. An optimizer may not fold them into the last write alone: the
+    // count itself is observable to a peripheral watching the register.
+    let m = parse(
+        "global g0 i8\nfn main(void) ()\n  block entry:\n    store i8 1 @g0\n    store i8 2 @g0\n    ret void\n",
+    );
+    let mut addrs = HashMap::new();
+    addrs.insert("g0".to_string(), 0x20u16);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_eq!(
+        asm.matches("    MOVWF 0x20").count(),
+        2,
+        "two stores to one volatile global must both emit:\n{asm}"
+    );
+    let first = asm.find("    MOVLW 0x01").unwrap();
+    let second = asm.find("    MOVLW 0x02").unwrap();
+    let wf = asm.find("    MOVWF 0x20").unwrap();
+    assert!(
+        first < wf && second > wf,
+        "the two values must be stored in source order:\n{asm}"
+    );
+}
+
+#[test]
+fn volatile_sfr_literal_stores_emit_in_program_order() {
+    // A literal (SFR) store from `inttoptr` emits a direct MOVWF. Two
+    // distinct SFRs written in sequence must keep their order: register
+    // sequencing (e.g. set-then-trigger) depends on it.
+    let m = parse(
+        "fn main(void) ()\n  block entry:\n    store i8 85 0x06\n    store i8 42 0x0C\n    ret void\n",
+    );
+    let addrs = addrs(&[]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_eq!(
+        asm.matches("    MOVWF 0x06").count(),
+        1,
+        "exactly one SFR store to 0x06:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("    MOVWF 0x0C").count(),
+        1,
+        "exactly one SFR store to 0x0C:\n{asm}"
+    );
+    let first = asm.find("    MOVWF 0x06").unwrap();
+    let second = asm.find("    MOVWF 0x0C").unwrap();
+    assert!(
+        first < second,
+        "SFR stores must land in program order:\n{asm}"
+    );
+}
