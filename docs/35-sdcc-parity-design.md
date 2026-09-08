@@ -224,14 +224,16 @@ differential):
   strategies, so unrelated bytes would differ. This mirrors the fuzz
   differential (crates/fuzz), which compares a single named checksum
   global rather than full RAM.
-- **Corpus portability contract.** A single `.c` source cannot be fed
-  to both toolchains unmodified. A committed `corpus_compat.h`, included
-  by every corpus program, branches on `#ifdef __SDCC` to supply: config
-  words (`#pragma config`, including the device-specific
-  `_ENHCPU_OFF_4L` vs `_XINST_OFF_4L` naming quirk on 18f4550, manual
-  4.10.20.1) vs `EPIC_CONFIG`; the correct SFR header include per
-  compiler; declarations for the output globals, input-seed globals,
-  and the halt call, under each compiler's own spelling.
+- **Corpus portability contract.** The corpus is smaller than the
+  sketch above, in the direction of less machinery: every corpus
+  program is a single plain-C source that compiles unmodified under
+  both compilers (no `corpus_compat.h`). Inputs are self-seeding,
+  assigned at the top of `main`, because SDCC's PIC18 crt0 clears all
+  of BSS before `main` and would wipe any value written into RAM ahead
+  of the run. Every program ends in an explicit `__asm__("sleep")`, the
+  simulator's halt condition on every core, so both sides' cycle counts
+  are measured to the same halt instead of to a step budget (SDCC's
+  linked output otherwise loops forever after `main` returns).
 - **Comparison protocol**, pinned so "epic-cc <= SDCC" is gradable
   rather than arguable:
   - A fixed, documented flag set per compiler per family (e.g. SDCC's
@@ -239,19 +241,28 @@ differential):
     pstack-model choices; epic-cc's equivalent), recorded alongside the
     version pins.
   - Flash words / RAM bytes / cycles are defined identically for both
-    compilers (whole image, or excluding crt0/library startup — pick
-    one and record it; comparing epic-cc's bare code against SDCC's
-    with a fixed crt0/`libsdcc` overhead baked in is not an apples-to-
-    apples win).
-  - Both compilers' cycle counts come from the *same* simulator run
-    (ours, per the gpsim note above). Mixed-simulator cycle comparisons
-    are not valid data points.
+    compilers. Recorded choices (implemented in the P0 harness):
+    flash = the extent of program-region data records in each side's
+    final Intel HEX (config words, ID locations and EEPROM data sit
+    above the program region on every supported device, so they are
+    excluded without special cases); RAM = live (non-zero) RAM bytes at
+    the `sleep` halt, the only definition computable identically for
+    two allocators that place everything differently; cycles = both
+    compilers' outputs run in *our* simulator to the program's `sleep`
+    halt, never to a step budget (a budget exhaustion is its own
+    failure class, never a measurement). Mixed-simulator cycle
+    comparisons are not valid data points.
+  - SDCC is a black-box oracle, but arbitration is not guesswork: every
+    known-bug entry is cross-checked under a second, independent
+    simulator (gpsim, external process) so the wrong side is proven to
+    be the oracle, not our harness.
 - Output: per-program table (flash, RAM, cycles, pass/fail) + aggregate
-  ratios, published to the CI step summary the way
-  `crates/driver/tests/size_regression_e2e.rs` already does (committed
-  `size_baseline.toml`, fail-on-regression, explicit
-  `UPDATE_SIZE_BASELINE=1` re-baselining) — reuse that mechanism rather
-  than inventing a second one.
+  ratios, published to the CI step summary, with SDCC/gputils/epic-cc
+  versions stamped into every output. The ratio gate reuses the driver's
+  size-regression mechanism: a committed `crates/sdcc-parity/
+  baseline.toml`, fail-on-regression (exact integer cross-multiplication
+  of the epic-cc/SDCC ratio), explicit `UPDATE_SDCC_BASELINE=1`
+  re-baselining via the `regression_gate` test.
 
 **The corpus** (committed, MIT-clean, ours):
 
