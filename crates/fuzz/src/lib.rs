@@ -2528,7 +2528,12 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14e => {
-                panic!("fuzz: pic14e core not yet implemented for {}", device.name)
+                let asm = isel_pic14e::select(device, &m, &addrs);
+                let asm = schedule::schedule(device, &asm);
+                let asm = banking::assign_banks(device, &asm);
+                let asm = peephole::optimize(&asm);
+                isel_pic14e::verify_page_fit(&m, &asm);
+                asm::assemble_file_to_hex(device, &asm)
             }
         };
         (hex, layout)
@@ -2593,7 +2598,26 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
-        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
+        device::Core::Pic14e => {
+            let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
+            for input in &prog.inputs {
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
     };
     Ok(checksum)
 }
@@ -2665,7 +2689,26 @@ fn run_pic(
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
-        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
+        device::Core::Pic14e => {
+            let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
+            for input in &program.inputs {
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
     };
     Ok(checksum)
 }
@@ -3240,10 +3283,11 @@ fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
     }
     static CACHE_P14: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     static CACHE_P18: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    static CACHE_P14E: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     let cache = match device.core {
         device::Core::Pic18 => &CACHE_P18,
         device::Core::Pic14 => &CACHE_P14,
-        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
+        device::Core::Pic14e => &CACHE_P14E,
     };
     cache.get_or_init(locate).clone()
 }
