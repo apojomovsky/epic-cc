@@ -7,7 +7,7 @@
 //! flash with its extra cycle).
 
 use asm::assemble_pic14e;
-use pic14_sim::Pic14e;
+use pic14_sim::{parse_hex_pic14e, Pic14e};
 
 /// Assemble `body` (org-anchored) with the core register symbols the
 /// source text needs, then run it to completion on the 1937.
@@ -570,4 +570,38 @@ fn interrupt_save_restores_shadow_context_on_fire_and_retfie() {
     assert_eq!(p.ram()[7], 0x44, "RETFIE restores FSR1H");
     assert_eq!(p.ram()[10], 0x50, "RETFIE restores PCLATH");
     assert_eq!(p.pc(), 3, "RETFIE returns to the interrupted instruction");
+}
+
+/// One Intel HEX record with its trailing two's-complement checksum.
+fn record(len: usize, addr: u16, rectype: u8, data: &[u8]) -> String {
+    let mut bytes = vec![len as u8, (addr >> 8) as u8, addr as u8, rectype];
+    bytes.extend_from_slice(data);
+    let sum = bytes.iter().map(|b| *b as usize).sum::<usize>();
+    bytes.push((!(sum as u8)).wrapping_add(1));
+    format!(
+        ":{}",
+        bytes.iter().map(|b| format!("{b:02X}")).collect::<String>()
+    )
+}
+
+#[test]
+fn parse_hex_pic14e_drops_the_ela_config_region() {
+    // The driver emits the two config words as a region at byte 0x1000E:
+    // an ELA record for 0x00100000, then a data record whose low-16
+    // address is 0x000E. A parser that ignores ELA records writes those
+    // bytes at word 7 of the program image (epic-cc#301).
+    let hex = format!(
+        "{}\n{}\n{}\n:00000001FF\n",
+        record(4, 0x0000, 0x00, &[0x34, 0x12, 0x78, 0x56]),
+        record(2, 0x0000, 0x04, &[0x10, 0x00]),
+        record(4, 0x000E, 0x00, &[0xFF, 0x3F, 0xFF, 0x3F]),
+    );
+    let words = parse_hex_pic14e(&hex);
+    assert_eq!(words[0], 0x1234, "program word 0 decoded");
+    assert_eq!(words[1], 0x5678, "program word 1 decoded");
+    assert_eq!(words[7], 0, "config bytes aliased program word 7");
+    assert!(
+        words.iter().all(|w| *w != 0x3FFF),
+        "an erased-config value landed in the program image"
+    );
 }

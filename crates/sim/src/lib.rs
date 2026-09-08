@@ -1307,6 +1307,65 @@ pub fn parse_hex_pic18(data: &str) -> Vec<u16> {
     words
 }
 
+/// Decode the driver's PIC14E Intel HEX output into 14-bit words, indexed
+/// by word address. Word addressing and dynamic sizing match `parse_hex`,
+/// but the ELA handling matches `parse_hex_pic18`: the driver emits
+/// CONFIG1/CONFIG2 as a separate region at byte 0x1000E (D-3), and a
+/// parser that ignores 0x04 records lets that region's low-16 address
+/// alias program words.
+pub fn parse_hex_pic14e(data: &str) -> Vec<u16> {
+    let mut max_word = 8191usize; // never shrink below the historical minimum
+    let mut extended_upper: usize = 0;
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let bytes = hex_decode(&line[1..]);
+        if bytes[3] == 0x04 {
+            extended_upper = ((bytes[4] as usize) << 8 | bytes[5] as usize) << 16;
+        }
+        if bytes[3] == 0x00 && extended_upper == 0 {
+            max_word = max_word
+                .max(((bytes[1] as usize) << 8 | bytes[2] as usize) / 2 + bytes[0] as usize / 2);
+        }
+    }
+    let mut words = vec![0u16; max_word + 1];
+    extended_upper = 0;
+    for line in data.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        assert!(line.starts_with(':'), "not Intel HEX: {line}");
+        let bytes = hex_decode(&line[1..]);
+        let len = bytes[0] as usize;
+        let addr = ((bytes[1] as usize) << 8) | (bytes[2] as usize);
+        let rectype = bytes[3];
+        let data = &bytes[4..4 + len];
+        match rectype {
+            0x00 => {
+                // Program records sit at base 0; the only other region the
+                // driver emits is the config words at 0x10000 and up, and
+                // the simulator does not model config bytes.
+                if extended_upper != 0 {
+                    continue;
+                }
+                for (i, chunk) in data.chunks(2).enumerate() {
+                    let w = (chunk[0] as u16) | ((chunk[1] as u16) << 8);
+                    words[addr / 2 + i] = w;
+                }
+            }
+            0x01 => break,
+            0x04 => {
+                extended_upper = ((data[0] as usize) << 8 | data[1] as usize) << 16;
+            }
+            other => panic!("unsupported HEX record type {other:#x}"),
+        }
+    }
+    words
+}
+
 /// PIC18F4550 (16-bit-word core) instruction-set simulator. `pc` is a
 /// **byte** address (PIC18's PC natively counts bytes, incrementing by 2
 /// per one-word instruction), unlike `Pic14::pc`, which is a word
