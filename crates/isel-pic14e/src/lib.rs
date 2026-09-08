@@ -2528,11 +2528,14 @@ impl<'m> Gen<'m> {
         self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
-                assert!(l.ty != Ty::I1, "isel: only i8/i16 loads supported");
+                // An i1 value rides in one byte (0/1) like any i8; the
+                // BinOp arm applies the same rewrite. Optimizer-shrunk
+                // `bool` traffic is ordinary i8 traffic (epic-cc#304).
+                let ty = if l.ty == Ty::I1 { Ty::I8 } else { l.ty };
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 if let Some(g) = l.ptr.strip_prefix('@') {
                     let src = self.global_addr(g);
-                    for k in 0..l.ty.bytes() {
+                    for k in 0..ty.bytes() {
                         self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
                         self.emit_w_store(dst + u16::from(k));
                     }
@@ -2544,7 +2547,7 @@ impl<'m> Gen<'m> {
                     // side is trackable even though the read just above it
                     // (of `base`, which may be a real SFR) is not.
                     let base = literal_ptr_addr(&l.ptr);
-                    for k in 0..l.ty.bytes() {
+                    for k in 0..ty.bytes() {
                         self.emit(format!("    MOVF 0x{:02X}, W", base + u16::from(k)));
                         self.emit_w_store(dst + u16::from(k));
                     }
@@ -2557,22 +2560,22 @@ impl<'m> Gen<'m> {
                         panic!("isel: pointer {:?} is not @global, %reg or a literal", l.ptr)
                     });
                     let ptr = Val::Reg(r.to_string());
-                    for k in 0..l.ty.bytes() {
+                    for k in 0..ty.bytes() {
                         self.emit_ptr_load_byte(&ptr, k);
                         self.emit_w_store(dst + u16::from(k));
                     }
                 }
             }
             Inst::Store(s) => {
-                assert!(s.ty != Ty::I1, "isel: only i8/i16 stores supported");
+                let ty = if s.ty == Ty::I1 { Ty::I8 } else { s.ty };
                 if let Some(g) = s.ptr.strip_prefix('@') {
                     let dst = self.global_addr(g);
-                    self.emit_move_val_to_slot(&s.val, s.ty, dst);
+                    self.emit_move_val_to_slot(&s.val, ty, dst);
                 } else if s.ptr.starts_with("0x") {
                     // A literal (SFR) pointer from `inttoptr`: a direct MOVWF
                     // with no FSR setup, banked by the banking pass.
                     let base = literal_ptr_addr(&s.ptr);
-                    for k in 0..s.ty.bytes() {
+                    for k in 0..ty.bytes() {
                         self.emit_load_byte(&s.val, k);
                         self.emit(format!("    MOVWF 0x{:02X}", base + u16::from(k)));
                     }
@@ -2588,7 +2591,7 @@ impl<'m> Gen<'m> {
                         );
                     }
                     let ptr = Val::Reg(r.to_string());
-                    for k in 0..s.ty.bytes() {
+                    for k in 0..ty.bytes() {
                         self.emit_ptr_store_byte(&ptr, k, &s.val);
                     }
                 }
