@@ -821,3 +821,42 @@ fn interrupt_mul_c_runs_correctly() {
     );
     assert!(p.halted());
 }
+
+// P7 end-to-end acceptance (docs/33 section 4): soft-float f32 routines,
+// a third copy per D-1 (1:1 port of the verified PIC14 bodies). The
+// fixture is byte-identical to pic18's float.c; expected values come from
+// the PIC14 e2e test of the same C source (crates/driver/tests/float_e2e.rs).
+
+#[test]
+fn float_c_runs_correctly() {
+    // Mirrors crates/driver/tests/float_e2e.rs: in = 3.0f (0x40400000) ->
+    // out1 = 3.0/2.5 = 1.2 = 0x3F99999A (RNE), out2 = 9.0 = 0x41100000
+    // (via fadd/fmul exact + fptosi/sitofp), out3 = 1.0/3.0 = 0x3EAAAAAB
+    // (RNE) via the struct sret/byval path.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/float.c"
+    ));
+    // 3.0f = 0x40400000 LE bytes 00 00 40 40
+    p.ram_mut()[globals["in"] as usize] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 1] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 2] = 0x40;
+    p.ram_mut()[globals["in"] as usize + 3] = 0x40;
+    p.run(2_000_000);
+    // out1 = 0x3F99999A LE 9A 99 99 3F
+    assert_eq!(p.ram()[globals["out1"] as usize], 0x9A);
+    assert_eq!(p.ram()[globals["out1"] as usize + 1], 0x99);
+    assert_eq!(p.ram()[globals["out1"] as usize + 2], 0x99);
+    assert_eq!(p.ram()[globals["out1"] as usize + 3], 0x3F);
+    // out2 = 0x41100000 LE 00 00 10 41
+    assert_eq!(p.ram()[globals["out2"] as usize], 0x00);
+    assert_eq!(p.ram()[globals["out2"] as usize + 1], 0x00);
+    assert_eq!(p.ram()[globals["out2"] as usize + 2], 0x10);
+    assert_eq!(p.ram()[globals["out2"] as usize + 3], 0x41);
+    // out3 = 0x3EAAAAAB LE AB AA AA 3E
+    assert_eq!(p.ram()[globals["out3"] as usize], 0xAB);
+    assert_eq!(p.ram()[globals["out3"] as usize + 1], 0xAA);
+    assert_eq!(p.ram()[globals["out3"] as usize + 2], 0xAA);
+    assert_eq!(p.ram()[globals["out3"] as usize + 3], 0x3E);
+    assert!(p.halted());
+}
