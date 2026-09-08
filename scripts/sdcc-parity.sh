@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# SDCC parity differential runner (docs/35, P0). Runs the committed corpus
-# (Tier 1 + Tier 2) through both epic-cc and SDCC, compares named outputs,
-# and writes a per-program table (flash, RAM, cycles, pass/fail) plus the
-# aggregate ratios to the GitHub step summary. The same run gates: the
-# regression_gate test fails on any ratio regression or arbitration change
-# against the committed baseline.toml. SDCC is GPL and lives in the image
-# as an external oracle only; this script never links or commits SDCC code.
-#
-# Usage: docker run --rm -v "$PWD:/workspace" -w /workspace epic-cc-ci:latest \
-#   bash scripts/sdcc-parity.sh
+# SDCC parity runner (docs/35, P0): runs the committed corpus through both
+# compilers, writes the per-program table plus aggregate ratios to the step
+# summary, and fails on a ratio regression or arbitration change against the
+# committed baseline.toml (regression_gate test). SDCC is GPL, an external
+# oracle in the image only; never linked or committed. Usage:
+#   docker run --rm -v "$PWD:/workspace" -w /workspace epic-cc-ci:latest \
+#     bash scripts/sdcc-parity.sh
 
 set -euo pipefail
 

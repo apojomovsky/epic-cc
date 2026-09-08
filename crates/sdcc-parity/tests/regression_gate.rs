@@ -15,9 +15,8 @@
 //!   compile error appeared) fails: re-arbitrate and re-baseline
 //!   deliberately.
 //!
-//! `UPDATE_SDCC_BASELINE=1` rewrites `baseline.toml` from the current run
-//! (diff it before committing, as with any snapshot change). Requires
-//! SDCC in the image; skips with a clear message otherwise.
+//! `UPDATE_SDCC_BASELINE=1` rewrites `baseline.toml` from the current
+//! run. Requires SDCC in the image; skips with a clear message otherwise.
 
 use sdcc_parity::corpus;
 use sdcc_parity::{run_differential, run_epic};
