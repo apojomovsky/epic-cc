@@ -14,6 +14,8 @@ callgraph = { path = "../callgraph" }
 alloc = { path = "../alloc" }
 isel = { path = "../isel" }
 isel-pic18 = { path = "../isel-pic18" }
+isel-pic14e = { path = "../isel-pic14e" }
+schedule = { path = "../schedule" }
 banking = { path = "../banking" }
 peephole = { path = "../peephole" }
 asm = { path = "../asm" }

@@ -2446,7 +2446,10 @@ fn ir_fold_lines(ir_reg: &str, c_local: &str, width: u8, reg: &mut u32) -> (Vec<
 /// which surfaces as a failed process or a caught pipeline panic), a
 /// non-halting sim run, or a host/PIC checksum mismatch. The classification
 /// (`FailureKind`) is what the Task-3 reducer preserves.
-pub fn run_differential(program: &Program, device: &device::Device) -> Result<u32, Failure> {
+pub fn run_differential(
+    program: &Program,
+    device: &'static device::Device,
+) -> Result<u32, Failure> {
     let dir = WorkDir::new();
     let c_path = dir.path.join("prog.c");
     std::fs::write(&c_path, &program.c_source)
@@ -2473,7 +2476,10 @@ pub fn run_differential(program: &Program, device: &device::Device) -> Result<u3
 /// (the same computation in the C discipline). A pipeline panic is a
 /// `Panic` failure (the loud-panic contract); a checksum disagreement a
 /// `Mismatch`.
-pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure> {
+pub fn run_ir_differential(
+    prog: &IrProgram,
+    device: &'static device::Device,
+) -> Result<u32, Failure> {
     let dir = WorkDir::new();
     let pic = run_ir_pic(prog, device)?;
 
@@ -2506,7 +2512,7 @@ pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<
 /// checksum read, `halted()` required. A pipeline panic (a compiler bug)
 /// is caught and reported as a `Panic` failure, so the fuzz loop survives
 /// them.
-fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure> {
+fn run_ir_pic(prog: &IrProgram, device: &'static device::Device) -> Result<u32, Failure> {
     let (hex, layout) = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut m = ir::parse(&prog.ir_text);
         m = wholeprog::merge(m);
@@ -2528,7 +2534,12 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14e => {
-                panic!("fuzz: pic14e core not yet implemented for {}", device.name)
+                let asm = isel_pic14e::select(device, &m, &addrs);
+                let asm = schedule::schedule(device, &asm);
+                let asm = banking::assign_banks(device, &asm);
+                let asm = peephole::optimize(&asm);
+                isel_pic14e::verify_page_fit(&m, &asm);
+                asm::assemble_file_to_hex(device, &asm)
             }
         };
         (hex, layout)
@@ -2593,7 +2604,26 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
-        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
+        device::Core::Pic14e => {
+            let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
+            for input in &prog.inputs {
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
     };
     Ok(checksum)
 }
@@ -2605,7 +2635,7 @@ fn run_pic(
     program: &Program,
     c_path: &Path,
     dir: &WorkDir,
-    device: &device::Device,
+    device: &'static device::Device,
 ) -> Result<u32, Failure> {
     let layout = pic_layout(c_path, device)?;
     let checksum_addr = *layout.globals.get(&program.checksum_name).ok_or_else(|| {
@@ -2665,7 +2695,26 @@ fn run_pic(
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
-        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
+        device::Core::Pic14e => {
+            let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
+            for input in &program.inputs {
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
     };
     Ok(checksum)
 }
@@ -3102,7 +3151,10 @@ fn host_clang() -> String {
 /// (mirroring `crates/driver/tests/long_e2e.rs`). Panics in the pipeline
 /// (a compiler bug) are caught and reported as a `Panic` failure, so the
 /// fuzz loop survives them.
-fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayout, Failure> {
+fn pic_layout(
+    c_path: &Path,
+    device: &'static device::Device,
+) -> Result<alloc::AllocLayout, Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let ll = Command::new(&clang)
         .args([
@@ -3161,7 +3213,11 @@ fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayo
 /// Run the driver binary (a workspace member) over the C file to produce the
 /// hex, passing the PIC clang env vars it expects. A failed driver is the
 /// loud-panic contract: a compiler panic or an unsupported construct.
-fn run_driver(c_path: &Path, hex_path: &Path, device: &device::Device) -> Result<(), Failure> {
+fn run_driver(
+    c_path: &Path,
+    hex_path: &Path,
+    device: &'static device::Device,
+) -> Result<(), Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let driver = driver_binary(device).map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let out = Command::new(&driver)
@@ -3201,7 +3257,7 @@ fn run_driver(c_path: &Path, hex_path: &Path, device: &device::Device) -> Result
 /// with an already-fixed isel panic). The nested cargo cannot deadlock on
 /// the build lock because tests run only after the outer build has finished
 /// (verified empirically).
-fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
+fn driver_binary(device: &'static device::Device) -> Result<PathBuf, String> {
     fn locate() -> Result<PathBuf, String> {
         if let Some(p) = std::env::var_os("PIC8_DRIVER") {
             return Ok(PathBuf::from(p));
@@ -3240,10 +3296,11 @@ fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
     }
     static CACHE_P14: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     static CACHE_P18: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    static CACHE_P14E: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     let cache = match device.core {
         device::Core::Pic18 => &CACHE_P18,
         device::Core::Pic14 => &CACHE_P14,
-        device::Core::Pic14e => panic!("fuzz: pic14e core not yet implemented for {}", device.name),
+        device::Core::Pic14e => &CACHE_P14E,
     };
     cache.get_or_init(locate).clone()
 }
