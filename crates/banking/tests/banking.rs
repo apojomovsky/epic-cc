@@ -1,4 +1,5 @@
 use banking::assign_banks;
+use device::PIC16F1938;
 use device::PIC16F877A;
 
 #[test]
@@ -47,6 +48,17 @@ fn inserts_banksel_when_bank_changes() {
     // then BCF RP0 before returning to a bank-0 operand.
     let asm = "    MOVF 0xA0, W\n    MOVF 0x20, W\n";
     let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF STATUS, 5\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn clear_bit_returns_to_bank0_and_reselects_for_bank1() {
+    // bank1 -> bank0 -> bank1: the BCF that clears RP0 must actually clear it,
+    // so the final bank-1 operand gets a fresh BSF. A mutation that leaves the
+    // bit set (or fails to clear it) would skip the trailing BSF and misplace
+    // the 0xA5 read (Lane C, #287: emit_banksel BCF/clear path).
+    let asm = "    MOVF 0xA0, W\n    MOVF 0x20, W\n    MOVF 0xA5, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVF 0x20, W\n    BCF STATUS, 5\n    MOVF 0x20, W\n    BSF STATUS, 5\n    MOVF 0x25, W\n";
     assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
@@ -155,6 +167,27 @@ fn banks_bcf_on_banked_gpr() {
     // the STATUS check, silently emitting the line verbatim).
     let asm = "    BCF 0xA0, 7\n";
     let expected = "    BSF STATUS, 5\n    BCF 0x20, 7\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn rp_bit_number_on_non_status_gpr_is_a_banked_operand() {
+    // A bit number equal to an RP bit (5 or 6) on a NON-STATUS file register
+    // (0xA0 is bank 1 GPR, not STATUS) is still a plain bit-oriented op, not
+    // a bank selection. bank_op_effect must only claim BCF/BSF *STATUS*, not
+    // any register (Lane C, #287: the `&& is_status` guard in bank_op_effect).
+    let asm = "    BCF 0xA0, 5\n    BSF 0x120, 6\n";
+    let expected = "    BSF STATUS, 5\n    BCF 0x20, 5\n    BCF STATUS, 5\n    BSF STATUS, 6\n    BSF 0x20, 6\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn hand_written_bsf_status_6_selects_bank_2() {
+    // A hand-written `BSF STATUS, 6` selects bank 2; the following bank-2
+    // operand needs no redundant BANKSEL (Lane C, #287: the `"6"` match arm
+    // in bank_op_effect that maps RP1 to bank 2).
+    let asm = "    BSF STATUS, 6\n    MOVF 0x120, W\n";
+    let expected = "    BSF STATUS, 6\n    MOVF 0x20, W\n";
     assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
 
@@ -441,4 +474,44 @@ fn adversarial_branching_banksel_completes_in_bounded_time() {
         elapsed.as_secs() < 5,
         "banking pass took {elapsed:?} on the adversarial fixture (regression to exponential work?)"
     );
+}
+
+/// PIC14E banking (Lane C, #287): the `MOVLB k` bank-selection path on the
+/// Enhanced core was untested. The classic-PIC14 RP-bit and PIC14E single
+/// `MOVLB` forms are distinct code paths (bank_op_effect, emit_movlb,
+/// is_bank0_only branch), so this covers the PIC14E side.
+#[test]
+fn pic14e_same_bank_needs_no_movlb() {
+    // Bank-0 operands on PIC14E need no MOVLB (bank 0 is the reset default).
+    let asm = "    MOVF 0x20, W\n    MOVWF 0x21\n";
+    assert_eq!(assign_banks(&PIC16F1938, asm), asm);
+}
+
+#[test]
+fn pic14e_bank_change_emits_movlb_and_rewrites() {
+    // A bank-1 operand (0xA0-0xEF) emits MOVLB 0x01 and rewrites to 0x20;
+    // a following bank-2 operand (0x120) emits another MOVLB.
+    let asm = "    MOVF 0xA0, W\n    MOVF 0x120, W\n";
+    let expected = "    MOVLB 0x01\n    MOVF 0x20, W\n    MOVLB 0x02\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(&PIC16F1938, asm), expected);
+}
+
+#[test]
+fn pic14e_hand_written_movlb_is_tracked() {
+    // A hand-written MOVLB 0x01 makes the following bank-1 operand need no
+    // new MOVLB; a bank-0 operand after it gets MOVLB 0x00.
+    let asm = "    MOVLB 0x01\n    MOVF 0xA5, W\n    MOVF 0x20, W\n";
+    let expected = "    MOVLB 0x01\n    MOVF 0x25, W\n    MOVLB 0x00\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(&PIC16F1938, asm), expected);
+}
+
+#[test]
+fn pic14e_status_rp_bits_are_not_bank_ops() {
+    // On PIC14E, STATUS bits 5-7 are unimplemented (DS41364E): the classic
+    // `BCF/BSF STATUS, 5|6` forms are NOT bank ops on this core and must not
+    // be turned into a MOVLB. A banked operand after a STATUS bit op still
+    // needs its own MOVLB.
+    let asm = "    BSF STATUS, 5\n    MOVF 0xA0, W\n";
+    let expected = "    BSF STATUS, 5\n    MOVLB 0x01\n    MOVF 0x20, W\n";
+    assert_eq!(assign_banks(&PIC16F1938, asm), expected);
 }

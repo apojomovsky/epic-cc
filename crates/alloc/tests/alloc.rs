@@ -440,6 +440,26 @@ fn a_single_const_select_arm_is_copied_to_ram() {
 }
 
 #[test]
+fn value_select_result_gets_a_local_slot() {
+    // A non-pointer (value) select copies the selected operand into its dst
+    // like any other value (Lane C, #287: the `Inst::Select(s) if !s.ptr`
+    // arm of def_width). It must allocate a RAM slot for %s; folding it to
+    // no-slot (dropping the value-select arm) leaves %s unallocated.
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             %c = icmp eq i8 1, 1\n\
+             %s = select i1 %c, i8 1, i8 2\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert!(
+        out.locals.contains_key("main::s"),
+        "value select %s must get a local slot"
+    );
+}
+
+#[test]
 fn const_300_byte_table_gets_no_ram_address_and_layout_unchanged() {
     // A 300-byte const table (u16 size) gets NO RAM address (its bytes live
     // in flash) but is recorded in const_globals; the surrounding RAM globals
@@ -745,6 +765,9 @@ fn isr_bytes_reports_the_disjoint_region_span() {
         "edge main m1\nedge m1 m2\nedge isr m1_isr\nedge m1_isr m2_isr\n",
     );
     assert_eq!(out.isr_bytes, 3);
+    // has_isr is true: an [isr]-annotated function is present (Lane C, #287:
+    // the `!isr_names.is_empty()` field).
+    assert!(out.has_isr, "an [isr] function must set has_isr");
     // The ISR region is included in the bank totals: the highest ISR
     // address 0x25 is in bank 0, so bank_used[0] = 0x26 - 0x20 = 6.
     assert_eq!(out.bank_used[0], 6);
