@@ -3,7 +3,8 @@
 //! Runs the committed corpus (Tier 1 + Tier 2) through both compilers and
 //! compares named outputs. Requires SDCC in the image (PIC8_SDCC); the test
 //! skips with a clear message when SDCC is absent, mirroring the gputils
-//! cross-check's opt-in pattern.
+//! cross-check's opt-in pattern. This test is informational: the committed
+//! baseline gate lives in `regression_gate.rs`.
 
 use sdcc_parity::corpus;
 use sdcc_parity::run_differential;
@@ -45,10 +46,17 @@ fn corpus_differential_clean() {
     }
 
     let bugs = known_bugs();
+    // Versions stamp every output so a baseline row is reproducible
+    // (docs/35 section 7, pinning).
+    eprintln!("versions: {}", sdcc_parity::tool_versions());
     let mut clean = 0usize;
     let mut failures = Vec::new();
     let mut excluded = 0usize;
     let mut surface_gaps = Vec::new();
+    // Comparable rows (both compilers measured, outputs agree) feed the
+    // aggregate ratios (docs/35 section 5 items 3-4): epic flash, sdcc
+    // flash, epic RAM, sdcc RAM, epic cycles, sdcc cycles.
+    let mut comparable: Vec<(usize, usize, usize, usize, usize, usize)> = Vec::new();
     for prog in corpus::corpus() {
         // Run on all three cores (PIC14, PIC18, PIC14E) where the program
         // compiles.
@@ -57,7 +65,7 @@ fn corpus_differential_clean() {
             &device::PIC18F4550,
             &device::PIC16F1938,
         ] {
-            let name = prog.outputs.first().cloned().unwrap_or_else(|| "?".into());
+            let name = prog.name.as_str();
             // Catch panics per-program (a sim panic on one SDCC program must
             // not abort the whole corpus run).
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -66,6 +74,14 @@ fn corpus_differential_clean() {
             match result {
                 Ok(Ok(r)) if r.pass => {
                     clean += 1;
+                    comparable.push((
+                        r.epic.flash_words,
+                        r.sdcc.flash_words,
+                        r.epic.ram_bytes,
+                        r.sdcc.ram_bytes,
+                        r.epic.cycles,
+                        r.sdcc.cycles,
+                    ));
                     eprintln!(
                         "PASS {name} on {}: epic {}w/{}B/{}cyc sdcc {}w/{}B/{}cyc",
                         device.name,
@@ -142,6 +158,28 @@ fn corpus_differential_clean() {
     eprintln!("{} differential mismatches:", failures.len());
     for f in &failures {
         eprintln!("  {f}");
+    }
+    // Aggregate geometric-mean ratios, epic-cc/SDCC, over comparable rows
+    // (flash and cycles; RAM is informational). These anchor the "<= SDCC"
+    // gates in docs/35 section 5 items 3-4 and the committed ratio
+    // baseline.
+    if !comparable.is_empty() {
+        let n = comparable.len() as f64;
+        let geo = |pick: fn(&(usize, usize, usize, usize, usize, usize)) -> (usize, usize)| {
+            (comparable
+                .iter()
+                .filter(|r| pick(r).1 > 0)
+                .map(|r| (pick(r).0 as f64 / pick(r).1 as f64).ln())
+                .sum::<f64>()
+                / n)
+                .exp()
+        };
+        let flash = geo(|r| (r.0, r.1));
+        let ram = geo(|r| (r.2, r.3));
+        let cycles = geo(|r| (r.4, r.5));
+        eprintln!(
+            "aggregate over {n} comparable rows: flash ratio {flash:.3}, RAM ratio {ram:.3}, cycle ratio {cycles:.3} (epic-cc/SDCC, geometric mean)"
+        );
     }
     eprintln!(
         "{} surface gaps (epic-cc cannot compile yet):",
