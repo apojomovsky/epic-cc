@@ -23,6 +23,8 @@ pub mod corpus;
 /// output globals (matched by name across both compilers' maps).
 #[derive(Debug, Clone)]
 pub struct CorpusProgram {
+    /// Stable program name, keying the sdcc-known-bugs table.
+    pub name: String,
     /// The C source text.
     pub source: String,
     /// Volatile input globals, seeded identically on both sides.
@@ -467,13 +469,7 @@ fn seed_le(ram: &mut [u8], addr: u16, width: u8, value: u32) {
 /// returning the measured result. Exposed for testing the epic-cc path in
 /// isolation when SDCC is not present.
 pub fn run_epic(prog: &CorpusProgram, device: &device::Device) -> Result<CompilerResult, String> {
-    let dir = WorkDir::new(
-        &prog
-            .outputs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "prog".into()),
-    );
+    let dir = WorkDir::new(&prog.name);
     let (epic_hex, epic_map_path, flash_words) = compile_epic(prog, &dir, device)?;
     let epic_map_text =
         std::fs::read_to_string(&epic_map_path).map_err(|e| format!("read epic map: {e}"))?;
@@ -488,13 +484,7 @@ pub fn run_differential(
     prog: &CorpusProgram,
     device: &device::Device,
 ) -> Result<DifferentialResult, String> {
-    let dir = WorkDir::new(
-        &prog
-            .outputs
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "prog".into()),
-    );
+    let dir = WorkDir::new(&prog.name);
 
     let (epic_hex, epic_map_path, epic_flash) = compile_epic(prog, &dir, device)?;
     let epic_map_text =
@@ -536,7 +526,7 @@ pub fn run_differential(
     }
 
     Ok(DifferentialResult {
-        program: prog.outputs.first().cloned().unwrap_or_default(),
+        program: prog.name.clone(),
         epic,
         sdcc,
         pass,

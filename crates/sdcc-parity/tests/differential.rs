@@ -8,6 +8,32 @@
 use sdcc_parity::corpus;
 use sdcc_parity::run_differential;
 
+/// The committed SDCC-known-bugs table (docs/35 section 5 item 2): programs
+/// where SDCC is wrong (epic-cc matches the hand-computed expected value,
+/// SDCC does not). These are excluded from the differential gate.
+#[derive(serde::Deserialize)]
+struct KnownBugs {
+    bug: Vec<KnownBug>,
+}
+
+#[derive(serde::Deserialize)]
+struct KnownBug {
+    device: String,
+    program: String,
+}
+
+fn known_bugs() -> KnownBugs {
+    let text = include_str!("../sdcc-known-bugs.toml");
+    toml::from_str(text).expect("parse sdcc-known-bugs.toml")
+}
+
+fn is_known_bug(name: &str, device: &str) -> bool {
+    known_bugs()
+        .bug
+        .iter()
+        .any(|b| b.program == name && b.device == device)
+}
+
 #[test]
 fn corpus_differential_clean() {
     // Skip when SDCC is not present (local dev without the image).
@@ -18,8 +44,10 @@ fn corpus_differential_clean() {
         return;
     }
 
+    let bugs = known_bugs();
     let mut clean = 0usize;
     let mut failures = Vec::new();
+    let mut excluded = 0usize;
     let mut surface_gaps = Vec::new();
     for prog in corpus::corpus() {
         // Run on all three cores (PIC14, PIC18, PIC14E) where the program
@@ -39,8 +67,7 @@ fn corpus_differential_clean() {
                 Ok(Ok(r)) if r.pass => {
                     clean += 1;
                     eprintln!(
-                        "PASS {} on {}: epic {}w/{}B/{}cyc sdcc {}w/{}B/{}cyc",
-                        r.program,
+                        "PASS {name} on {}: epic {}w/{}B/{}cyc sdcc {}w/{}B/{}cyc",
                         device.name,
                         r.epic.flash_words,
                         r.epic.ram_bytes,
@@ -51,14 +78,50 @@ fn corpus_differential_clean() {
                     );
                 }
                 Ok(Ok(r)) => {
-                    failures.push(format!("{} on {}: {}", r.program, device.name, r.detail));
+                    // Arbitration (docs/35 section 5 item 2): a mismatch
+                    // where SDCC is the wrong side is a recorded known bug,
+                    // excluded from the gate. Otherwise it's a real finding.
+                    if is_known_bug(&prog.name, device.name) {
+                        // Sanity: only the named programs may be excluded.
+                        let in_table = bugs
+                            .bug
+                            .iter()
+                            .any(|b| b.program == prog.name && b.device == device.name);
+                        assert!(
+                            in_table,
+                            "excluded {name} on {} not in known-bugs",
+                            device.name
+                        );
+                        excluded += 1;
+                        eprintln!(
+                            "EXCLUDED {name} on {} (SDCC known bug): {}",
+                            device.name, r.detail
+                        );
+                    } else {
+                        failures.push(format!("{name} on {}: {}", device.name, r.detail));
+                    }
                 }
                 Ok(Err(e)) => {
                     // Classify: an epic-cc compile failure is a surface gap
-                    // (tracked by the sub-epics); an sdcc/gplink failure or
-                    // a sim non-halt is a real harness or oracle problem.
+                    // (tracked by the sub-epics). An sdcc/gplink failure on
+                    // a known-bug program (e.g. SDCC pic14 has no 64-bit)
+                    // is an excluded SDCC limitation; any other sdcc/gplink
+                    // failure or a sim non-halt is a real harness/oracle
+                    // problem.
                     if e.starts_with("epic-cc failed") {
                         surface_gaps.push(format!("{name} on {}: {e}", device.name));
+                    } else if is_known_bug(&prog.name, device.name) {
+                        let in_table = bugs
+                            .bug
+                            .iter()
+                            .any(|b| b.program == prog.name && b.device == device.name);
+                        assert!(
+                            in_table,
+                            "excluded {name} on {} not in known-bugs",
+                            device.name
+                        );
+                        excluded += 1;
+                        eprintln!("EXCLUDED {name} on {} (SDCC limitation):", device.name);
                     } else {
                         failures.push(format!("{name} on {}: {e}", device.name));
                     }
@@ -75,6 +138,7 @@ fn corpus_differential_clean() {
         }
     }
     eprintln!("{clean} differential-clean runs");
+    eprintln!("{excluded} excluded (SDCC known bugs)");
     eprintln!("{} differential mismatches:", failures.len());
     for f in &failures {
         eprintln!("  {f}");

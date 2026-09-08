@@ -7,3 +7,5 @@ publish = false
 [dependencies]
 device = { path = "../device" }
 pic14-sim = { path = "../sim" }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
