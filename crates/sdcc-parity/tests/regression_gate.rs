@@ -5,9 +5,8 @@
 //! compares every row against the committed `baseline.toml`, the same
 //! fail-on-regression mechanism as the driver's size_regression suite:
 //!
-//! - a row that used to be differential-clean must stay clean, and its
-//!   epic-cc/SDCC flash and cycle ratios must not regress (improving is
-//!   free);
+//! - a differential-clean row stays clean, and its epic-cc/SDCC flash
+//!   and cycle ratios must not regress (improving is free);
 //! - a known-bug row must keep epic-cc on the hand-computed expected
 //!   value; if epic-cc also misses, that is an epic-cc bug and the gate
 //!   fails regardless of what SDCC did;
