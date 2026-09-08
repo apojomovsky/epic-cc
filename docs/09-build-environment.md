@@ -78,11 +78,31 @@ records the disabled gate in the CI step summary.
 
 ## Caching
 
-The clang build is the only expensive layer (~1 h first build). It is cached
-via the buildx registry cache (`ghcr.io/<repo>-toolchain`) in CI, and via the
-local layer cache + a ccache cache mount locally. Because the base image and
-the LLVM tarball are digest-pinned, the clang layer is rebuilt only when the
-Dockerfile or a pin changes.
+The clang build is the only expensive layer (~1 h first build). `make image`
+and `make release-bundle` build it through a **dedicated buildx builder**
+(`epic-cc-builder`, docker-container driver, created lazily by the Makefile's
+`ENSURE_BUILDER`), not the default docker-driver builder. That is the load-
+bearing decision, not an optimization: the clang-builder layer cache and the
+LLVM ccache mount (`--mount=type=cache,target=/ccache`, used for
+`LLVM_CCACHE_BUILD`) live entirely inside that builder's own container and
+volume. `docker system prune` / `docker builder prune` — with or without
+`-a` — only ever touch the *default* builder's storage, so a generic disk
+cleanup, run by a person or an agent, cannot reach the clang cache at all
+unless it explicitly targets `epic-cc-builder` by name
+(`docker buildx prune --builder epic-cc-builder`, or removes the builder
+outright). This is deliberate: a plain `docker system prune` with no flags
+has previously wiped the (then-default-builder-backed) clang cache and
+forced a full ~1-2h recompile — see the Makefile's `BUILDER` comment.
+
+As a second line of defense — for a genuinely fresh machine, or if
+`epic-cc-builder` itself is ever deleted — `make image` / `make
+release-bundle` also pass `--cache-from` against the buildx registry cache
+CI warms on every push (`ghcr.io/<repo>-toolchain`,
+`.github/workflows/toolchain-cache.yml`). That ref is a public image, no
+login needed. In that scenario a cold local cache costs a pull of the
+already-built clang layer from GHCR, not a recompile. Because the base image
+and the LLVM tarball are digest-pinned, the clang layer only needs a real
+rebuild (locally or in CI) when the Dockerfile or a pin changes.
 
 ## Cargo target cache is per worktree
 

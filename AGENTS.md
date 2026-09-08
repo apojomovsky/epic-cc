@@ -358,3 +358,19 @@ cache is ~1h, everything after is minutes. `.github/workflows/
 release.yml` builds the release bundles on tags. Both workflows use
 `packages: write` + `ignore-error=true` on the registry cache. The
 cache is an optimization, never a gate.
+
+`make image`/`make release-bundle` build through a dedicated buildx
+builder (`epic-cc-builder`), not the default docker driver
+(`docs/09-build-environment.md` Caching). The clang-builder layer cache
+and the LLVM ccache mount live entirely inside that builder's own
+container/volume, so `docker system prune` / `docker builder prune`
+(with or without `-a`) only ever touch the *default* builder and cannot
+reach the clang cache — this was a real incident (a plain, flagless
+`docker system prune` once wiped it and forced a full ~1-2h clang
+recompile) and the builder split is the fix, not a docs warning. Do
+**not**, however, run `docker buildx prune --builder epic-cc-builder`
+or remove/recreate that builder — that's the one thing that still
+reaches the clang cache directly, and there is no registry fallback
+fast enough to make it painless (`make image` would fall back to the
+GHCR registry cache, which is faster than a recompile but still a real
+download, not instant).
