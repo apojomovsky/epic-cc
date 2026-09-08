@@ -389,3 +389,56 @@ fn region_with_computed_jump_keeps_full_resets() {
     let expected = "    MOVF 0x20, W\n    CALL looper\n    BCF STATUS, 5\n    MOVF 0x21, W\nlooper:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    MOVWF PCL\ntop:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVWF 0x65\n    RETURN\n";
     assert_eq!(assign_banks(&PIC16F877A, asm), expected);
 }
+
+/// Lane G (docs/36, #291): a compile-time bound ("does not hang") test for
+/// the BANKSEL minimization dataflow. The pass is NP-hard in the worst
+/// case (docs/01, docs/12), so an adversarial control-flow shape with many
+/// distinct-bank accesses interleaved with branching could regress into a
+/// combinatorial blowup. This fixture is sized to be practical to keep in
+/// the repo (200 branch diamonds, 4 banks, ~2000 lines) and asserts the
+/// pass completes within a generous wall-clock bound. The bound is a
+/// regression tripwire, not a benchmark: it is far above the current
+/// ~10ms runtime, so a healthy pass never flirts with it, and a pass that
+/// regresses to exponential work trips it loudly in CI.
+#[test]
+fn adversarial_branching_banksel_completes_in_bounded_time() {
+    use std::time::Instant;
+
+    // Deeply branching control flow with many distinct-bank accesses
+    // interleaved: a chain of 200 branch diamonds, each touching a
+    // different bank (0x20/0xA0/0x120/0x1A0 on the 877A), so the dataflow
+    // forks at every BTFSC and joins at every label.
+    let mut asm = String::from("    org 0x0000\n    goto main\nmain:\n");
+    let banks = [0x20u16, 0xA0, 0x120, 0x1A0];
+    for i in 0..200 {
+        let b = banks[i % 4];
+        asm.push_str(&format!("    MOVF 0x{b:03X}, W\n"));
+        asm.push_str("    BTFSC 0x03, 2\n");
+        asm.push_str(&format!("    GOTO arm{i}a\n"));
+        asm.push_str(&format!("    MOVWF 0x{:03X}\n", b + 1));
+        asm.push_str(&format!("    GOTO arm{i}b\n"));
+        asm.push_str(&format!("arm{i}a:\n"));
+        asm.push_str(&format!("    MOVF 0x{:03X}, W\n", b + 2));
+        asm.push_str(&format!("    MOVWF 0x{:03X}\n", b + 3));
+        asm.push_str(&format!("arm{i}b:\n"));
+        asm.push_str(&format!("    MOVF 0x{:03X}, W\n", b + 4));
+    }
+    asm.push_str("    RETURN\n    end\n");
+
+    let start = Instant::now();
+    let out = assign_banks(&PIC16F877A, &asm);
+    let elapsed = start.elapsed();
+
+    // The pass must complete (not hang) and must have done real work
+    // (inserted BANKSELs for the bank-crossing operands).
+    assert!(
+        out.lines().count() > asm.lines().count(),
+        "banking pass should insert BANKSELs on the adversarial fixture"
+    );
+    // Generous bound: current runtime is ~10ms; 5s is a tripwire for a
+    // regression to exponential work, not a tight benchmark.
+    assert!(
+        elapsed.as_secs() < 5,
+        "banking pass took {elapsed:?} on the adversarial fixture (regression to exponential work?)"
+    );
+}
