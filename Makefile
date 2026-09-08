@@ -62,7 +62,16 @@ help: ## List targets
 
 image: ## Build the dev image (only image you need locally)
 	@$(ENSURE_BUILDER)
-	docker buildx build --builder $(BUILDER) --load --target dev $(TOOLCHAIN_CACHE) --build-arg UID=$$(id -u) --build-arg GID=$$(id -g) -t $(LOCAL_IMAGE) .
+	@src_hash=$$({ cat Dockerfile; id -u; id -g; } | md5sum | cut -d' ' -f1); \
+	test -n "$$src_hash" || { echo "image: failed to hash the Dockerfile" >&2; exit 1; }; \
+	cur=$$(docker image inspect $(LOCAL_IMAGE) --format '{{index .Config.Labels "org.epic-cc.source-hash"}}' 2>/dev/null || true); \
+	if [ "$$cur" = "$$src_hash" ]; then \
+		echo "dev image up to date (source-hash $$src_hash), skipping rebuild"; \
+	else \
+		docker buildx build --builder $(BUILDER) --load --target dev $(TOOLCHAIN_CACHE) \
+			--build-arg UID=$$(id -u) --build-arg GID=$$(id -g) \
+			--label org.epic-cc.source-hash=$$src_hash -t $(LOCAL_IMAGE) .; \
+	fi
 
 shell: image ## Interactive dev shell inside the container
 	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE)
