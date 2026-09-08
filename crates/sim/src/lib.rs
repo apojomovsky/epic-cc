@@ -1387,6 +1387,9 @@ pub struct Pic18 {
     /// A latched interrupt request awaiting INTCON GIE + INT0IE. Set by
     /// `request_interrupt`, consumed when the interrupt is taken.
     pending: bool,
+    /// A PC<7:0> write (computed jump through `PCL`) waiting to override
+    /// this instruction's linear `next`, consumed by `step`'s tail.
+    jump_target: Option<u32>,
 }
 
 impl Pic18 {
@@ -1399,6 +1402,7 @@ impl Pic18 {
             stack: Vec::new(),
             halted: false,
             pending: false,
+            jump_target: None,
         }
     }
     pub fn ram(&self) -> &[u8; 4096] {
@@ -1506,6 +1510,9 @@ impl Pic18 {
             }
             _ => panic!("sim(pic18): opcode {word:#06x} not yet implemented"),
         };
+        // A `MOVWF PCL` (computed jump) sets the whole PC from
+        // PCLATU:PCLATH:W; its linear next is void.
+        let next = self.jump_target.take().unwrap_or(next);
         self.pc = next;
         if (self.pc / 2) as usize >= self.prog.len() {
             self.halted = true;
@@ -1539,65 +1546,73 @@ impl Pic18 {
         let a = (word >> 8) & 1;
         let d = (word >> 9) & 1;
         let f = word & 0xFF;
+        // ONE operand resolve per instruction. A d=1 access on a virtual
+        // register (SDCC's `MOVF POSTINC1, F` stack-pop idiom) applies
+        // the side effect once for the whole read-modify-write;
+        // resolving again for the write-back double-incremented FSRs and
+        // corrupted every SDCC software-stack frame. epic-cc's own
+        // output never addresses a virtual register directly, so only
+        // the SDCC oracle exposed this.
+        let op = self.resolve_f(a, f);
         // No-destination-select group first (`word & 0xFE00`): CLRF/
         // CPFSEQ/CPFSGT/CPFSLT/MOVWF/MULWF/NEGF/SETF/TSTFSZ.
         match word & 0xFE00 {
             0x6A00 => {
                 // CLRF
-                self.write_f(a, f, 0);
+                self.write_phys(op, 0);
                 self.set_z(0);
                 return pc + 2;
             }
             0x6200 => {
                 // CPFSEQ: skip if f == W, no flags
-                if self.read_f(a, f) == self.w {
+                if self.read_phys(op) == self.w {
                     return self.skip_pc(pc + 2);
                 }
                 return pc + 2;
             }
             0x6E00 => {
                 // MOVWF: W -> f, no flags
-                self.write_f(a, f, self.w);
+                self.write_phys(op, self.w);
                 return pc + 2;
             }
             0x6400 => {
                 // CPFSGT: skip if f > W (unsigned), no flags
-                if self.read_f(a, f) > self.w {
+                if self.read_phys(op) > self.w {
                     return self.skip_pc(pc + 2);
                 }
                 return pc + 2;
             }
             0x6000 => {
                 // CPFSLT: skip if f < W (unsigned), no flags
-                if self.read_f(a, f) < self.w {
+                if self.read_phys(op) < self.w {
                     return self.skip_pc(pc + 2);
                 }
                 return pc + 2;
             }
             0x6C00 => {
                 // NEGF: f = 0 - f, full flags
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let r = 0u8.wrapping_sub(fv);
                 self.sub_flags(0, fv, r);
                 self.set_zn(r);
-                self.write_f(a, f, r);
+                self.write_phys(op, r);
                 return pc + 2;
             }
             0x6800 => {
                 // SETF: f = 0xFF, no flags
-                self.write_f(a, f, 0xFF);
+                self.write_phys(op, 0xFF);
                 return pc + 2;
             }
             0x6600 => {
                 // TSTFSZ: skip if f == 0, no flags
-                if self.read_f(a, f) == 0 {
+                if self.read_phys(op) == 0 {
                     return self.skip_pc(pc + 2);
                 }
                 return pc + 2;
             }
             0x0200 => {
                 // MULWF: unsigned 8x8 -> 16-bit product in PRODH:PRODL
-                let prod = (self.w as u16) * (self.read_f(a, f) as u16);
+                let prod = (self.w as u16) * (self.read_phys(op) as u16);
                 self.ram[0xFF3] = (prod & 0xFF) as u8; // PRODL
                 self.ram[0xFF4] = (prod >> 8) as u8; // PRODH
                 return pc + 2;
@@ -1608,155 +1623,155 @@ impl Pic18 {
         match word & 0xFC00 {
             0x2400 => {
                 // ADDWF: f + W
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let r = fv.wrapping_add(self.w);
                 self.add_flags(fv, self.w, r);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x5C00 => {
                 // SUBWF: f - W
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let r = fv.wrapping_sub(self.w);
                 self.sub_flags(fv, self.w, r);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x3800 => {
                 // SWAPF: nibble swap, no flags
-                let v = self.read_f(a, f);
+                let v = self.read_phys(op);
                 let r = (v << 4) | (v >> 4);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x2C00 => {
                 // DECFSZ
-                let r = self.read_f(a, f).wrapping_sub(1);
-                self.write_d(d, a, f, r);
+                let r = self.read_phys(op).wrapping_sub(1);
+                self.write_d_at(d, op, r);
                 if r == 0 {
                     return self.skip_pc(pc + 2);
                 }
             }
             0x2000 => {
                 // ADDWFC: f + W + C
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = self.addc_flags(fv, self.w, cin);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x1400 => {
                 // ANDWF: f & W
-                let r = self.read_f(a, f) & self.w;
+                let r = self.read_phys(op) & self.w;
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x1C00 => {
                 // COMF: !f
-                let r = !self.read_f(a, f);
+                let r = !self.read_phys(op);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x4C00 => {
                 // DCFSNZ: f - 1, skip if NOT zero
-                let r = self.read_f(a, f).wrapping_sub(1);
+                let r = self.read_phys(op).wrapping_sub(1);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
                 if r != 0 {
                     return self.skip_pc(pc + 2);
                 }
             }
             0x2800 => {
                 // INCF: f + 1
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let r = fv.wrapping_add(1);
                 self.add_flags(fv, 1, r);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x3C00 => {
                 // INCFSZ: f + 1, skip if zero
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let r = fv.wrapping_add(1);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
                 if r == 0 {
                     return self.skip_pc(pc + 2);
                 }
             }
             0x4800 => {
                 // INFSNZ: f + 1, skip if NOT zero
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let r = fv.wrapping_add(1);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
                 if r != 0 {
                     return self.skip_pc(pc + 2);
                 }
             }
             0x1000 => {
                 // IORWF: f | W
-                let r = self.read_f(a, f) | self.w;
+                let r = self.read_phys(op) | self.w;
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x5000 => {
                 // MOVF: f (copy), no ALU op
-                let r = self.read_f(a, f);
+                let r = self.read_phys(op);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x3400 => {
                 // RLCF: rotate left through C
-                let v = self.read_f(a, f);
+                let v = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = (v << 1) | cin;
                 self.set_c(v & 0x80 != 0);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x4400 => {
                 // RLNCF: rotate left, bit7 wraps to bit0, no carry
-                let v = self.read_f(a, f);
+                let v = self.read_phys(op);
                 let r = v.rotate_left(1);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x3000 => {
                 // RRCF: rotate right through C
-                let v = self.read_f(a, f);
+                let v = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = (v >> 1) | (cin << 7);
                 self.set_c(v & 0x01 != 0);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x4000 => {
                 // RRNCF: rotate right, bit0 wraps to bit7, no carry
-                let v = self.read_f(a, f);
+                let v = self.read_phys(op);
                 let r = v.rotate_right(1);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x5400 | 0x5800 => {
                 // SUBFWB / SUBWFB: f - W - !C, computed as f + !W + C (the
                 // ALU adder with W inverted. See the plan's note that
                 // these two mnemonics share this exact computation; no
                 // empirical evidence distinguishes them, so both use it).
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = self.addc_flags(fv, !self.w, cin);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x1800 => {
                 // XORWF: f ^ W
-                let r = self.read_f(a, f) ^ self.w;
+                let r = self.read_phys(op) ^ self.w;
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             0x0400 => {
                 // DECF: f - 1
-                let fv = self.read_f(a, f);
+                let fv = self.read_phys(op);
                 let r = fv.wrapping_sub(1);
                 self.sub_flags(fv, 1, r);
                 self.set_zn(r);
-                self.write_d(d, a, f, r);
+                self.write_d_at(d, op, r);
             }
             other => panic!(
                 "sim(pic18): byte opcode base {other:#06x} (word {word:#06x}) not yet implemented"
@@ -1769,26 +1784,29 @@ impl Pic18 {
         let a = (word >> 8) & 1;
         let f = word & 0xFF;
         let b = (word >> 9) & 0x7;
+        // One resolve for the read-modify-write, same contract as
+        // `exec_byte`'s head resolve.
+        let op = self.resolve_f(a, f);
         match (word >> 12) & 0xF {
             0x7 => {
-                let v = self.read_f(a, f);
-                self.write_f(a, f, v ^ (1 << b)); // BTG
+                let v = self.read_phys(op);
+                self.write_phys(op, v ^ (1 << b)); // BTG
             }
             0x8 => {
-                let v = self.read_f(a, f);
-                self.write_f(a, f, v | (1 << b)); // BSF
+                let v = self.read_phys(op);
+                self.write_phys(op, v | (1 << b)); // BSF
             }
             0x9 => {
-                let v = self.read_f(a, f);
-                self.write_f(a, f, v & !(1 << b)); // BCF
+                let v = self.read_phys(op);
+                self.write_phys(op, v & !(1 << b)); // BCF
             }
             0xA => {
-                if self.read_f(a, f) & (1 << b) != 0 {
+                if self.read_phys(op) & (1 << b) != 0 {
                     return self.skip_pc(pc + 2); // BTFSS: skip if set
                 }
             }
             0xB => {
-                if self.read_f(a, f) & (1 << b) == 0 {
+                if self.read_phys(op) & (1 << b) == 0 {
                     return self.skip_pc(pc + 2); // BTFSC: skip if clear
                 }
             }
@@ -2008,9 +2026,9 @@ impl Pic18 {
         // once each, and `resolve_phys` performs the post-increment as a
         // side effect of resolving the address, not as a separate step.
         let src = self.resolve_phys((word & 0xFFF) as usize);
-        let val = self.ram[src];
+        let val = self.read_phys(src);
         let dst = self.resolve_phys((word2 & 0xFFF) as usize);
-        self.ram[dst] = val;
+        self.write_phys(dst, val);
         pc + 4
     }
 
@@ -2193,16 +2211,58 @@ impl Pic18 {
             }
         }
     }
-    fn read_f(&mut self, a: u16, f: u16) -> u8 {
-        self.ram[self.resolve_f(a, f)]
+    /// WREG is the access-bank file register 0xFE8 (DS39632E table 5-1),
+    /// not separate storage: an instruction reading `f = 0xFE8` reads W,
+    /// and a write there sets W. Without this routing, SDCC's chained
+    /// `RLNCF WREG, W` / `SWAPF WREG, W` sequences read the flat RAM's
+    /// always-zero 0xFE8 byte and every W-chained computation collapsed
+    /// to zero; epic-cc's own output never addresses W as a file
+    /// register, so only the SDCC oracle exposed it.
+    fn read_phys(&mut self, addr: usize) -> u8 {
+        match addr {
+            // WREG is the access-bank file register 0xFE8 (DS39632E
+            // table 5-1), not separate storage: an instruction reading
+            // `f = 0xFE8` reads W, and a write there sets W. Without this
+            // routing, SDCC's chained `RLNCF WREG, W` / `SWAPF WREG, W`
+            // sequences read the flat RAM's always-zero 0xFE8 byte and
+            // every W-chained computation collapsed to zero; epic-cc's
+            // own output never addresses W as a file register, so only
+            // the SDCC oracle exposed it.
+            0xFE8 => self.w,
+            // PCL reads as the PC's low byte (DS39632E section 4.3).
+            0xFF9 => (self.pc & 0xFF) as u8,
+            _ => self.ram[addr],
+        }
     }
-    fn write_f(&mut self, a: u16, f: u16, v: u8) {
-        let addr = self.resolve_f(a, f);
-        self.ram[addr] = v;
+    fn write_phys(&mut self, addr: usize, v: u8) {
+        match addr {
+            0xFE8 => self.w = v,
+            // Writing PCL jumps: PC = PCLATU:PCLATH:v, the computed-call
+            // mechanism SDCC's `__sdcc_call` helpers use. The jump is
+            // latched because `step` assigns the linear next after the
+            // dispatch returns.
+            0xFF9 => {
+                let pclath = self.ram[0xFFA] as u32;
+                let pclatu = (self.ram[0xFFB] as u32) & 0x1F;
+                self.jump_target = Some((pclatu << 16) | (pclath << 8) | v as u32);
+            }
+            // TOSL/TOSH/TOSU are the hardware stack's top-of-stack view
+            // (`sync_stack_sfrs` mirrors the other direction): SDCC plants
+            // a computed-call return address by PUSHing, then overwriting
+            // the TOS registers, so the writes must land in the stack.
+            0xFFD | 0xFFE | 0xFFF => {
+                self.ram[addr] = v;
+                if let Some(top) = self.stack.last_mut() {
+                    let shift = 8 * (addr - 0xFFD);
+                    *top = (*top & !(0xFFu32 << shift)) | ((v as u32) << shift);
+                }
+            }
+            _ => self.ram[addr] = v,
+        }
     }
-    fn write_d(&mut self, d: u16, a: u16, f: u16, r: u8) {
+    fn write_d_at(&mut self, d: u16, op: usize, r: u8) {
         if d == 1 {
-            self.write_f(a, f, r);
+            self.write_phys(op, r);
         } else {
             self.w = r;
         }

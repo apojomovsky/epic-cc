@@ -49,13 +49,13 @@ fn epic_side_compiles_and_runs_corpus() {
             }
         }
     }
-    // The epic-side test asserts the harness runs the corpus; known gaps
-    // (double, recursion, printf %f) are expected to fail to compile and are
-    // reported, not asserted. Only a harness crash (no flash count, no map)
-    // is a real failure.
+    // The epic-side test asserts the harness runs the corpus; surface
+    // gaps (a capability epic-cc cannot compile yet, tracked by a
+    // sub-epic) are reported, not asserted. Only a harness crash (no map
+    // entry for a declared global) is a real failure.
     let harness_failures: Vec<_> = failures
         .iter()
-        .filter(|f| f.contains("no flash count") || f.contains("no global"))
+        .filter(|f| f.contains("no global"))
         .cloned()
         .collect();
     assert!(

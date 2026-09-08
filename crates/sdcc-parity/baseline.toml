@@ -1,0 +1,302 @@
+# SDCC parity ratio baseline (docs/35, P0). Do not hand-edit the
+# numbers; regenerate inside the dev image with:
+#   UPDATE_SDCC_BASELINE=1 cargo test -p sdcc-parity --test regression_gate
+# then diff and commit deliberately. epic-cc/SDCC flash and
+# cycle ratios must not regress against these rows; improving
+# is free.
+[[row]]
+program = "add"
+device = "p16f877a"
+status = "pass"
+epic_flash = 18
+sdcc_flash = 235
+epic_cycles = 16
+sdcc_cycles = 322
+
+[[row]]
+program = "add"
+device = "p18f4550"
+status = "pass"
+epic_flash = 16
+sdcc_flash = 106
+epic_cycles = 10
+sdcc_cycles = 6217
+
+[[row]]
+program = "add"
+device = "p16f1938"
+status = "pass"
+epic_flash = 17
+sdcc_flash = 198
+epic_cycles = 15
+sdcc_cycles = 281
+
+[[row]]
+program = "array"
+device = "p16f877a"
+status = "pass"
+epic_flash = 41
+sdcc_flash = 283
+epic_cycles = 39
+sdcc_cycles = 366
+
+[[row]]
+program = "array"
+device = "p18f4550"
+status = "pass"
+epic_flash = 44
+sdcc_flash = 133
+epic_cycles = 33
+sdcc_cycles = 6238
+
+[[row]]
+program = "array"
+device = "p16f1938"
+status = "pass"
+epic_flash = 48
+sdcc_flash = 228
+epic_cycles = 44
+sdcc_cycles = 309
+
+[[row]]
+program = "bitfields"
+device = "p16f877a"
+status = "pass"
+epic_flash = 31
+sdcc_flash = 431
+epic_cycles = 29
+sdcc_cycles = 512
+
+[[row]]
+program = "bitfields"
+device = "p18f4550"
+status = "pass"
+epic_flash = 32
+sdcc_flash = 207
+epic_cycles = 24
+sdcc_cycles = 6305
+
+[[row]]
+program = "bitfields"
+device = "p16f1938"
+status = "pass"
+epic_flash = 30
+sdcc_flash = 316
+epic_cycles = 28
+sdcc_cycles = 399
+
+[[row]]
+program = "unions"
+device = "p16f877a"
+status = "pass"
+epic_flash = 57
+sdcc_flash = 253
+epic_cycles = 54
+sdcc_cycles = 340
+
+[[row]]
+program = "unions"
+device = "p18f4550"
+status = "pass"
+epic_flash = 53
+sdcc_flash = 117
+epic_cycles = 43
+sdcc_cycles = 6228
+
+[[row]]
+program = "unions"
+device = "p16f1938"
+status = "pass"
+epic_flash = 56
+sdcc_flash = 211
+epic_cycles = 53
+sdcc_cycles = 294
+
+[[row]]
+program = "i64"
+device = "p16f877a"
+status = "known-bug"
+epic_flash = 18
+sdcc_flash = 0
+epic_cycles = 16
+sdcc_cycles = 0
+
+[[row]]
+program = "i64"
+device = "p18f4550"
+status = "pass"
+epic_flash = 16
+sdcc_flash = 106
+epic_cycles = 10
+sdcc_cycles = 6216
+
+[[row]]
+program = "i64"
+device = "p16f1938"
+status = "known-bug"
+epic_flash = 17
+sdcc_flash = 0
+epic_cycles = 15
+sdcc_cycles = 0
+
+[[row]]
+program = "double"
+device = "p16f877a"
+status = "pass"
+epic_flash = 648
+sdcc_flash = 2506
+epic_cycles = 1093
+sdcc_cycles = 8748
+
+[[row]]
+program = "double"
+device = "p18f4550"
+status = "pass"
+epic_flash = 728
+sdcc_flash = 1409
+epic_cycles = 1057
+sdcc_cycles = 8080
+
+[[row]]
+program = "double"
+device = "p16f1938"
+status = "pass"
+epic_flash = 644
+sdcc_flash = 1947
+epic_cycles = 1089
+sdcc_cycles = 6670
+
+[[row]]
+program = "malloc"
+device = "p16f877a"
+status = "pass"
+epic_flash = 13
+sdcc_flash = 260
+epic_cycles = 11
+sdcc_cycles = 354
+
+[[row]]
+program = "malloc"
+device = "p18f4550"
+status = "known-bug"
+epic_flash = 11
+sdcc_flash = 212
+epic_cycles = 7
+sdcc_cycles = 6247
+
+[[row]]
+program = "malloc"
+device = "p16f1938"
+status = "pass"
+epic_flash = 12
+sdcc_flash = 220
+epic_cycles = 10
+sdcc_cycles = 311
+
+[[row]]
+program = "math"
+device = "p16f877a"
+status = "pass"
+epic_flash = 58
+sdcc_flash = 557
+epic_cycles = 120
+sdcc_cycles = 1006
+
+[[row]]
+program = "math"
+device = "p18f4550"
+status = "pass"
+epic_flash = 29
+sdcc_flash = 112
+epic_cycles = 19
+sdcc_cycles = 6222
+
+[[row]]
+program = "math"
+device = "p16f1938"
+status = "pass"
+epic_flash = 56
+sdcc_flash = 433
+epic_cycles = 118
+sdcc_cycles = 791
+
+[[row]]
+program = "fnptr"
+device = "p16f877a"
+status = "known-bug"
+epic_flash = 19
+sdcc_flash = 260
+epic_cycles = 16
+sdcc_cycles = 347
+
+[[row]]
+program = "fnptr"
+device = "p18f4550"
+status = "pass"
+epic_flash = 17
+sdcc_flash = 146
+epic_cycles = 10
+sdcc_cycles = 6247
+
+[[row]]
+program = "fnptr"
+device = "p16f1938"
+status = "known-bug"
+epic_flash = 18
+sdcc_flash = 214
+epic_cycles = 15
+sdcc_cycles = 297
+
+[[row]]
+program = "recursion"
+device = "p16f877a"
+status = "known-bug"
+epic_flash = 96
+sdcc_flash = 308
+epic_cycles = 534
+sdcc_cycles = 1072
+
+[[row]]
+program = "recursion"
+device = "p18f4550"
+status = "pass"
+epic_flash = 60
+sdcc_flash = 145
+epic_cycles = 120
+sdcc_cycles = 6333
+
+[[row]]
+program = "recursion"
+device = "p16f1938"
+status = "known-bug"
+epic_flash = 90
+sdcc_flash = 256
+epic_cycles = 518
+sdcc_cycles = 858
+
+[[row]]
+program = "printf-f"
+device = "p16f877a"
+status = "pass"
+epic_flash = 14
+sdcc_flash = 231
+epic_cycles = 12
+sdcc_cycles = 318
+
+[[row]]
+program = "printf-f"
+device = "p18f4550"
+status = "pass"
+epic_flash = 13
+sdcc_flash = 102
+epic_cycles = 7
+sdcc_cycles = 6212
+
+[[row]]
+program = "printf-f"
+device = "p16f1938"
+status = "pass"
+epic_flash = 13
+sdcc_flash = 195
+epic_cycles = 11
+sdcc_cycles = 278

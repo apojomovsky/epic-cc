@@ -1,13 +1,13 @@
 //! SDCC parity differential harness (docs/35, P0).
 //!
-//! Compiles each corpus program with both epic-cc and SDCC, loads both
-//! outputs into our simulator, seeds identical inputs, and compares the
-//! program's named output globals (matched by name across the two compilers'
-//! symbol/map output) plus cycle count. Records flash words + RAM bytes from
-//! both. Never compares the whole RAM image: the two compilers allocate
-//! globals and locals at different addresses with different overlay
-//! strategies, so unrelated bytes would differ (mirrors the fuzz
-//! differential, which compares a single named checksum global).
+//! Compiles each corpus program with both epic-cc and SDCC, runs both
+//! images in our simulator to the program's explicit `sleep` halt, and
+//! compares the program's named output globals (matched by name across
+//! the two compilers' symbol/map output) plus cycle count. Flash words
+//! come from each side's final Intel HEX (whole image, identical
+//! definition); RAM bytes are the live (non-zero) RAM bytes at the halt,
+//! the only definition computable identically for two allocators that
+//! place everything differently. Never compares the whole RAM image.
 //!
 //! SDCC is GPL and lives in the image as an external oracle only (ADR-006
 //! boundary, docs/35 section 2). This crate never links or commits SDCC
@@ -19,27 +19,19 @@ use std::process::Command;
 
 pub mod corpus;
 
-/// A corpus program: the C source plus the names of its volatile input and
-/// output globals (matched by name across both compilers' maps).
+/// A corpus program: the C source plus the names of its volatile output
+/// globals (matched by name across both compilers' maps). Inputs are part
+/// of the source: SDCC's PIC18 crt0 clears all of BSS before `main`, so a
+/// value written into RAM ahead of the run never survives to the program.
 #[derive(Debug, Clone)]
 pub struct CorpusProgram {
     /// Stable program name, keying the sdcc-known-bugs table.
     pub name: String,
-    /// The C source text.
+    /// The C source text. `main` must end in `__asm__("sleep")`, the
+    /// simulator's halt condition on every core.
     pub source: String,
-    /// Volatile input globals, seeded identically on both sides.
-    pub inputs: Vec<Input>,
     /// Volatile output globals, compared by name after the run.
     pub outputs: Vec<String>,
-}
-
-/// One volatile input global: `volatile unsigned <width> <name>;`, seeded
-/// with `value` on both sides of the differential.
-#[derive(Debug, Clone)]
-pub struct Input {
-    pub name: String,
-    pub width: u8, // 8, 16, or 32
-    pub value: u32,
 }
 
 /// The measured result of one compiler on one program.
@@ -136,7 +128,7 @@ fn compile_epic(
     prog: &CorpusProgram,
     dir: &WorkDir,
     device: &device::Device,
-) -> Result<(PathBuf, PathBuf, usize), String> {
+) -> Result<(PathBuf, PathBuf), String> {
     let c_path = dir.path.join("prog.c");
     std::fs::write(&c_path, &prog.source).map_err(|e| format!("write prog.c: {e}"))?;
     let hex_path = dir.path.join("epic.hex");
@@ -159,20 +151,7 @@ fn compile_epic(
             String::from_utf8_lossy(&out.stderr)
         ));
     }
-    // The driver prints the size report to stderr: `flash: N/8192 words`.
-    // Parse the flash word count from it (the sim pads the hex to the full
-    // device flash, so the hex length overcounts).
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let flash_words = stderr
-        .lines()
-        .find_map(|l| {
-            let l = l.trim();
-            l.strip_prefix("flash: ")
-                .and_then(|r| r.split('/').next())
-                .and_then(|n| n.trim().parse::<usize>().ok())
-        })
-        .ok_or_else(|| format!("no flash count in epic-cc stderr: {stderr}"))?;
-    Ok((hex_path, map_path, flash_words))
+    Ok((hex_path, map_path))
 }
 
 /// Compile a program with SDCC, producing hex + map. SDCC's pic16 port
@@ -283,6 +262,96 @@ fn compile_sdcc(
     Ok((hex_path, map_path))
 }
 
+/// Program-memory words covered by the image's HEX data records,
+/// identical for both compilers: the extent of data records inside the
+/// program region (bytes below device.flash_words * 2), in words. Config
+/// words, ID locations and EEPROM data sit above that region on every
+/// supported device, so extended-address records keep them out without
+/// special cases. Replaces two asymmetric counts (epic's assembled-code
+/// report, SDCC's own-code-only map sections) that the first baseline
+/// flagged as apples-to-oranges.
+fn image_program_words(hex_text: &str, device: &device::Device) -> Result<usize, String> {
+    let flash_bytes = device.flash_words as usize * 2;
+    let mut upper = 0usize;
+    let mut max_word = 0usize;
+    let mut any = false;
+    for line in hex_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let b = ihex_record(line)?;
+        let len = b[0] as usize;
+        let addr = ((b[1] as usize) << 8) | b[2] as usize;
+        match b[3] {
+            0x00 => {
+                for i in 0..len {
+                    let byte_addr = upper + addr + i;
+                    if byte_addr < flash_bytes {
+                        max_word = max_word.max(byte_addr / 2 + 1);
+                        any = true;
+                    }
+                }
+            }
+            0x01 => break,
+            0x04 => upper = ((b[4] as usize) << 8 | b[5] as usize) << 16,
+            other => return Err(format!("unsupported HEX record type {other:#x}")),
+        }
+    }
+    if any {
+        Ok(max_word)
+    } else {
+        Err("no program data records in hex".to_string())
+    }
+}
+
+/// Decode one Intel HEX line (`:LLAAAATT...`) into its info+data bytes.
+fn ihex_record(line: &str) -> Result<Vec<u8>, String> {
+    let hex = line
+        .strip_prefix(':')
+        .ok_or_else(|| format!("not Intel HEX: {line}"))?;
+    let b = hex.as_bytes();
+    let mut out = Vec::with_capacity(b.len() / 2);
+    let mut i = 0;
+    while i + 1 < b.len() {
+        let hi = (b[i] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit in {line}"))?;
+        let lo = (b[i + 1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("bad hex digit in {line}"))?;
+        out.push(((hi << 4) | lo) as u8);
+        i += 2;
+    }
+    Ok(out)
+}
+
+/// Tool versions stamped into every output so a baseline row is
+/// reproducible (docs/35 section 7, pinning).
+pub fn tool_versions() -> String {
+    let epic = Command::new(epic_cc_binary())
+        .arg("--version")
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "epic-cc <unknown>".to_string());
+    let sdcc = first_line(Command::new(sdcc_binary()).arg("-V").output().ok());
+    let gplink = first_line(Command::new(gplink_binary()).arg("--version").output().ok());
+    format!("{epic}; {sdcc}; {gplink}")
+}
+
+fn first_line(out: Option<std::process::Output>) -> String {
+    let Some(o) = out else {
+        return "<unavailable>".to_string();
+    };
+    let mut text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if text.is_empty() {
+        text = String::from_utf8_lossy(&o.stderr).trim().to_string();
+    }
+    text.lines().next().unwrap_or("<unavailable>").to_string()
+}
+
 /// Parse an epic-cc map (`global <name> 0xNN`, `const <name>`,
 /// `local <key> 0xNN`) into a name -> address map for globals.
 fn parse_epic_map(map_text: &str) -> HashMap<String, u16> {
@@ -326,53 +395,9 @@ fn parse_sdcc_map(map_text: &str) -> HashMap<String, u16> {
     m
 }
 
-/// Parse the SDCC program size (in words) from the gplink map's Section Info
-/// table. The `program`-located sections' highest (address + size) byte is
-/// the program's code end; divide by 2 for the word count (both PIC14 and
-/// PIC18 store one word per 2 hex bytes).
-fn parse_sdcc_flash_words(map_text: &str) -> Option<usize> {
-    let mut max_end: usize = 0;
-    let mut in_sections = false;
-    for line in map_text.lines() {
-        let line = line.trim();
-        if line.starts_with("Section Info") {
-            in_sections = true;
-            continue;
-        }
-        if in_sections {
-            // Section rows: `<name> <type> <addr> <loc> <size>`. The
-            // `program`-located rows are code; track the max end byte.
-            let mut it = line.split_whitespace();
-            let _name = it.next();
-            let _type = it.next();
-            let addr = it.next();
-            let loc = it.next();
-            let size = it.next();
-            if let (Some(addr), Some(loc), Some(size)) = (addr, loc, size) {
-                if loc == "program" {
-                    if let (Ok(a), Ok(s)) = (
-                        usize::from_str_radix(addr.trim_start_matches("0x"), 16),
-                        usize::from_str_radix(size.trim_start_matches("0x"), 16),
-                    ) {
-                        max_end = max_end.max(a + s);
-                    }
-                }
-            }
-            // The symbol table follows the section table; stop there.
-            if line.starts_with("gplink-") || line.starts_with("Map File") {
-                break;
-            }
-        }
-    }
-    if max_end > 0 {
-        Some(max_end / 2)
-    } else {
-        None
-    }
-}
-
-/// Run one compiler's hex in our sim, seed inputs, read named outputs and
-/// cycle count. `map` maps global name -> address for this compiler.
+/// Run one compiler's hex in our sim to the program's `sleep` halt, then
+/// read the named outputs, the cycle count, and the live RAM bytes.
+/// `map` maps global name -> address for this compiler.
 fn run_sim(
     hex_path: &Path,
     map: &HashMap<String, u16>,
@@ -386,82 +411,54 @@ fn run_sim(
     let (cycles, ram) = match device.core {
         device::Core::Pic14 => {
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-            for input in &prog.inputs {
-                let addr = *map
-                    .get(&input.name)
-                    .ok_or_else(|| format!("no global '{}' in the map", input.name))?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
-            // Run to a fixed step budget. SDCC's linked output does not
-            // halt (its startup code loops after main returns), so we read
-            // the named outputs after the budget rather than requiring
-            // `halted()`. The outputs are stable once main has completed.
             let steps = p.run(max_steps);
+            require_halt(p.halted(), device, max_steps)?;
             (steps, p.ram().to_vec())
         }
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-            for input in &prog.inputs {
-                let addr = *map
-                    .get(&input.name)
-                    .ok_or_else(|| format!("no global '{}' in the map", input.name))?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             let steps = p.run(max_steps);
+            require_halt(p.halted(), device, max_steps)?;
             (steps, p.ram().to_vec())
         }
         device::Core::Pic14e => {
             let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
-            for input in &prog.inputs {
-                let addr = *map
-                    .get(&input.name)
-                    .ok_or_else(|| format!("no global '{}' in the map", input.name))?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             let steps = p.run(max_steps);
+            require_halt(p.halted(), device, max_steps)?;
             (steps, p.ram().to_vec())
         }
     };
+
+    // Live RAM bytes at the halt: the only RAM measure computable
+    // identically for two allocators that place globals and locals at
+    // different addresses (docs/35 section 4 comparison protocol).
+    let ram_bytes = ram.iter().filter(|b| **b != 0).count();
 
     let mut outputs = HashMap::new();
     for name in &prog.outputs {
         let addr = *map
             .get(name)
             .ok_or_else(|| format!("no global '{name}' in the map"))?;
-        // Outputs are read as the global's width; default to 1 byte unless
-        // the input widths hint otherwise. The corpus declares output widths
-        // via the input list convention: we read 1 byte for u8 outputs.
+        // Every corpus output is one byte wide by construction.
         outputs.insert(name.clone(), ram[addr as usize] as u32);
     }
 
-    // Flash words: the program's assembled word count. For epic-cc, the
-    // driver's stderr size report has it. For SDCC, the gplink map's
-    // section info lists the program size; the hex is padded to the full
-    // device flash, so the hex length overcounts.
-    let flash_words = match device.core {
-        device::Core::Pic14 => pic14_sim::parse_hex(&hex).len(),
-        device::Core::Pic18 => pic14_sim::parse_hex_pic18(&hex).len(),
-        device::Core::Pic14e => pic14_sim::parse_hex(&hex).len(),
-    };
-    let ram_bytes = ram.len();
-
     Ok(CompilerResult {
-        flash_words,
+        flash_words: image_program_words(&hex, device)?,
         ram_bytes,
         cycles,
         outputs,
     })
 }
 
-fn seed_le(ram: &mut [u8], addr: u16, width: u8, value: u32) {
-    let bytes = match width {
-        8 => 1,
-        16 => 2,
-        32 => 4,
-        w => panic!("bad input width {w}"),
-    };
-    for i in 0..bytes {
-        ram[addr as usize + i] = ((value >> (8 * i)) & 0xFF) as u8;
+/// The step budget is a guard, not the norm: a corpus program halts in
+/// `sleep`. A budget exhaustion is its own failure class (a runaway or an
+/// unimplemented opcode), never a measurement.
+fn require_halt(halted: bool, device: &device::Device, max_steps: usize) -> Result<(), String> {
+    if halted {
+        Ok(())
+    } else {
+        Err(format!("{}: no halt within {max_steps} steps", device.name))
     }
 }
 
@@ -470,13 +467,11 @@ fn seed_le(ram: &mut [u8], addr: u16, width: u8, value: u32) {
 /// isolation when SDCC is not present.
 pub fn run_epic(prog: &CorpusProgram, device: &device::Device) -> Result<CompilerResult, String> {
     let dir = WorkDir::new(&prog.name);
-    let (epic_hex, epic_map_path, flash_words) = compile_epic(prog, &dir, device)?;
+    let (epic_hex, epic_map_path) = compile_epic(prog, &dir, device)?;
     let epic_map_text =
         std::fs::read_to_string(&epic_map_path).map_err(|e| format!("read epic map: {e}"))?;
     let epic_map = parse_epic_map(&epic_map_text);
-    let mut r = run_sim(&epic_hex, &epic_map, prog, device)?;
-    r.flash_words = flash_words;
-    Ok(r)
+    run_sim(&epic_hex, &epic_map, prog, device)
 }
 
 /// Run the full differential for one program on one device.
@@ -486,21 +481,17 @@ pub fn run_differential(
 ) -> Result<DifferentialResult, String> {
     let dir = WorkDir::new(&prog.name);
 
-    let (epic_hex, epic_map_path, epic_flash) = compile_epic(prog, &dir, device)?;
+    let (epic_hex, epic_map_path) = compile_epic(prog, &dir, device)?;
     let epic_map_text =
         std::fs::read_to_string(&epic_map_path).map_err(|e| format!("read epic map: {e}"))?;
     let epic_map = parse_epic_map(&epic_map_text);
-    let mut epic = run_sim(&epic_hex, &epic_map, prog, device)?;
-    epic.flash_words = epic_flash;
+    let epic = run_sim(&epic_hex, &epic_map, prog, device)?;
 
     let (sdcc_hex, sdcc_map_path) = compile_sdcc(prog, &dir, device)?;
     let sdcc_map_text =
         std::fs::read_to_string(&sdcc_map_path).map_err(|e| format!("read sdcc map: {e}"))?;
     let sdcc_map = parse_sdcc_map(&sdcc_map_text);
-    let mut sdcc = run_sim(&sdcc_hex, &sdcc_map, prog, device)?;
-    if let Some(w) = parse_sdcc_flash_words(&sdcc_map_text) {
-        sdcc.flash_words = w;
-    }
+    let sdcc = run_sim(&sdcc_hex, &sdcc_map, prog, device)?;
 
     // Compare named outputs.
     let mut pass = true;

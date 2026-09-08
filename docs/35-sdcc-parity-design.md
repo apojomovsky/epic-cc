@@ -209,29 +209,27 @@ differential):
 
 - For each corpus program: compile with epic-cc to hex; compile with
   `sdcc --use-non-free -mpic16 -p18f4550` (or `-mpic14 -p16f877a`)
-  through gplink to hex; load both into our sim; seed identical inputs
-  by writing each compiler's named input globals (resolved from that
-  compiler's own map/symbol output) before running; run both to a
-  shared halt convention (every corpus program ends by executing
-  `SLEEP` via the compat header below, which is already epic-cc's sim's
-  stop condition) under a hard step budget, with "budget exhausted" a
-  distinct failure class from a value mismatch; then compare the
-  program's declared output globals and ports, matched by name across
-  the two compilers' symbol/map output, plus the cycle count; record
-  flash words + RAM bytes from both. The comparison is scoped to named
-  outputs, never the whole RAM image: the two compilers allocate
-  globals and locals at different addresses with different overlay
-  strategies, so unrelated bytes would differ. This mirrors the fuzz
-  differential (crates/fuzz), which compares a single named checksum
-  global rather than full RAM.
-- **Corpus portability contract.** A single `.c` source cannot be fed
-  to both toolchains unmodified. A committed `corpus_compat.h`, included
-  by every corpus program, branches on `#ifdef __SDCC` to supply: config
-  words (`#pragma config`, including the device-specific
-  `_ENHCPU_OFF_4L` vs `_XINST_OFF_4L` naming quirk on 18f4550, manual
-  4.10.20.1) vs `EPIC_CONFIG`; the correct SFR header include per
-  compiler; declarations for the output globals, input-seed globals,
-  and the halt call, under each compiler's own spelling.
+  through gplink to hex; load both into our sim and run both to the
+  program's `sleep` halt (see the corpus contract below), with "budget
+  exhausted" a distinct failure class from a value mismatch; then
+  compare the program's declared output globals and ports, matched by
+  name across the two compilers' symbol/map output, plus the cycle
+  count; record flash words + RAM bytes from both. The comparison is
+  scoped to named outputs, never the whole RAM image: the two
+  compilers allocate globals and locals at different addresses with
+  different overlay strategies, so unrelated bytes would differ. This
+  mirrors the fuzz differential (crates/fuzz), which compares a single
+  named checksum global rather than full RAM.
+- **Corpus portability contract.** The corpus is smaller than the
+  sketch above, in the direction of less machinery: every corpus
+  program is a single plain-C source that compiles unmodified under
+  both compilers (no `corpus_compat.h`). Inputs are self-seeding,
+  assigned at the top of `main`, because SDCC's PIC18 crt0 clears all
+  of BSS before `main` and would wipe any value written into RAM ahead
+  of the run. Every program ends in an explicit `__asm__("sleep")`, the
+  simulator's halt condition on every core, so both sides' cycle counts
+  are measured to the same halt instead of to a step budget (SDCC's
+  linked output otherwise loops forever after `main` returns).
 - **Comparison protocol**, pinned so "epic-cc <= SDCC" is gradable
   rather than arguable:
   - A fixed, documented flag set per compiler per family (e.g. SDCC's
@@ -239,19 +237,28 @@ differential):
     pstack-model choices; epic-cc's equivalent), recorded alongside the
     version pins.
   - Flash words / RAM bytes / cycles are defined identically for both
-    compilers (whole image, or excluding crt0/library startup — pick
-    one and record it; comparing epic-cc's bare code against SDCC's
-    with a fixed crt0/`libsdcc` overhead baked in is not an apples-to-
-    apples win).
-  - Both compilers' cycle counts come from the *same* simulator run
-    (ours, per the gpsim note above). Mixed-simulator cycle comparisons
-    are not valid data points.
+    compilers. Recorded choices (implemented in the P0 harness):
+    flash = the extent of program-region data records in each side's
+    final Intel HEX (config words, ID locations and EEPROM data sit
+    above the program region on every supported device, so they are
+    excluded without special cases); RAM = live (non-zero) RAM bytes at
+    the `sleep` halt, the only definition computable identically for
+    two allocators that place everything differently; cycles = both
+    compilers' outputs run in *our* simulator to the program's `sleep`
+    halt, never to a step budget (a budget exhaustion is its own
+    failure class, never a measurement). Mixed-simulator cycle
+    comparisons are not valid data points.
+  - SDCC is a black-box oracle, but arbitration is not guesswork: every
+    known-bug entry is cross-checked under a second, independent
+    simulator (gpsim, external process) so the wrong side is proven to
+    be the oracle, not our harness.
 - Output: per-program table (flash, RAM, cycles, pass/fail) + aggregate
-  ratios, published to the CI step summary the way
-  `crates/driver/tests/size_regression_e2e.rs` already does (committed
-  `size_baseline.toml`, fail-on-regression, explicit
-  `UPDATE_SIZE_BASELINE=1` re-baselining) — reuse that mechanism rather
-  than inventing a second one.
+  ratios, published to the CI step summary, with SDCC/gputils/epic-cc
+  versions stamped into every output. The ratio gate reuses the driver's
+  size-regression mechanism: a committed `crates/sdcc-parity/
+  baseline.toml`, fail-on-regression (exact integer cross-multiplication
+  of the epic-cc/SDCC ratio), explicit `UPDATE_SDCC_BASELINE=1`
+  re-baselining via the `regression_gate` test.
 
 **The corpus** (committed, MIT-clean, ours):
 
@@ -281,8 +288,9 @@ All five must hold:
    and sim-verifies to its hand-computed result.
 2. **Differential.** For every corpus program SDCC accepts, epic-cc's
    sim-observed final state (the program's named output globals and
-   ports, matched by name) matches SDCC's, given identical seeded
-   inputs. Cycle count is not part of this item: two compilers emit
+   ports, matched by name) matches SDCC's, with both programs fed the
+   same source (inputs are part of the source, see section 4). Cycle
+   count is not part of this item: two compilers emit
    different instruction sequences, so an exact cycle match is
    unachievable and would contradict item 4. Cycle count belongs solely
    to the <= comparison in item 4.
