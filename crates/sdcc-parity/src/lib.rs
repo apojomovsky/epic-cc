@@ -191,7 +191,11 @@ fn compile_sdcc(
     let (port, mcu) = match device.core {
         device::Core::Pic14 => ("pic14", device.name.to_lowercase()),
         device::Core::Pic18 => ("pic16", device.name.to_lowercase()),
-        device::Core::Pic14e => return Err("pic14e has no SDCC parity target yet".into()),
+        // SDCC's pic14 port covers the Enhanced core (16F193x) via the
+        // `libsdcce` library (docs/35 section 3 PIC14E table). The device
+        // libs live in the non-free dir as `pic16<rest>.lib`, same naming
+        // as classic pic14.
+        device::Core::Pic14e => ("pic14", device.name.to_lowercase()),
     };
     // SDCC device names drop the leading `p` (p16f877a -> 16f877a).
     let sdcc_mcu = mcu.strip_prefix('p').unwrap_or(&mcu).to_string();
@@ -233,7 +237,13 @@ fn compile_sdcc(
     let map_hex = dir.path.join("maponly.hex");
     let lib_dir = format!("/usr/local/share/sdcc/lib/{port}");
     let nonfree_dir = format!("/usr/local/share/sdcc/non-free/lib/{port}");
-    let lib = format!("libsdcc.lib");
+    // SDCC's pic14 port links `libsdcc.lib` for classic parts and
+    // `libsdcce.lib` for the Enhanced core (16F193x, docs/35 section 3
+    // PIC14E table); pic16 always uses `libsdcc.lib`.
+    let lib = match device.core {
+        device::Core::Pic14e => "libsdcce.lib".to_string(),
+        _ => "libsdcc.lib".to_string(),
+    };
     // Device lib names differ per port: pic14 uses `pic16<device>.lib`
     // (e.g. pic16f877a.lib), pic16 uses `libdev<device>.lib`
     // (e.g. libdev18f4550.lib).
@@ -398,7 +408,17 @@ fn run_sim(
             let steps = p.run(max_steps);
             (steps, p.ram().to_vec())
         }
-        device::Core::Pic14e => return Err("pic14e has no sim parity target yet".into()),
+        device::Core::Pic14e => {
+            let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
+            for input in &prog.inputs {
+                let addr = *map
+                    .get(&input.name)
+                    .ok_or_else(|| format!("no global '{}' in the map", input.name))?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            let steps = p.run(max_steps);
+            (steps, p.ram().to_vec())
+        }
     };
 
     let mut outputs = HashMap::new();
@@ -419,7 +439,7 @@ fn run_sim(
     let flash_words = match device.core {
         device::Core::Pic14 => pic14_sim::parse_hex(&hex).len(),
         device::Core::Pic18 => pic14_sim::parse_hex_pic18(&hex).len(),
-        device::Core::Pic14e => 0,
+        device::Core::Pic14e => pic14_sim::parse_hex(&hex).len(),
     };
     let ram_bytes = ram.len();
 

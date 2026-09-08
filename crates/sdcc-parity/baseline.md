@@ -16,26 +16,37 @@ program.
 |---|---|---|---|---|---|---|---|---|
 | add | p16f877a | 13 | 158 | 512 | 512 | 13 | 5000000 | PASS |
 | add | p18f4550 | 13 | 7 | 4096 | 4096 | 9 | 5000000 | PASS |
+| add | p16f1938 | 13 | 129 | 4096 | 4096 | 13 | 5000000 | PASS |
 | array | p16f877a | 50 | 158 | 512 | 512 | 49 | 5000000 | PASS |
 | array | p18f4550 | 48 | 15 | 4096 | 4096 | 40 | 5000000 | PASS |
+| array | p16f1938 | 50 | 129 | 4096 | 4096 | 49 | 5000000 | PASS |
 | bitfields | p16f877a | 26 | 158 | 512 | 512 | 26 | 5000000 | PASS |
 | bitfields | p18f4550 | 39 | 32 | 4096 | 4096 | 30 | 5000000 | PASS |
+| bitfields | p16f1938 | 26 | 190 | 4096 | 4096 | 26 | 5000000 | PASS |
 | union | p16f877a | 11 | 158 | 512 | 512 | 11 | 5000000 | PASS |
 | union | p18f4550 | 10 | 3 | 4096 | 4096 | 6 | 5000000 | PASS |
+| union | p16f1938 | 11 | 129 | 4096 | 4096 | 11 | 5000000 | PASS |
 | i64 | p16f877a | 51 | 158 | 512 | 512 | 115 | 5000000 | PASS |
 | i64 | p18f4550 | 26 | 13 | 4096 | 4096 | 18 | 5000000 | PASS |
+| i64 | p16f1938 | 51 | 219 | 4096 | 4096 | 115 | 5000000 | PASS |
 | double | p16f877a | 637 | 1268 | 512 | 512 | 1084 | 5000000 | PASS |
 | double | p18f4550 | - | - | - | - | - | - | PASS (epic-cc now supports double as f32) |
+| double | p16f1938 | - | - | - | - | - | - | SDCC-ERR (pic14: invalid combination of short/long) |
 | malloc | p16f877a | 9 | 158 | 512 | 512 | 9 | 5000000 | PASS |
 | malloc | p18f4550 | 10 | 3 | 4096 | 4096 | 6 | 5000000 | PASS |
+| malloc | p16f1938 | 9 | 129 | 4096 | 4096 | 9 | 5000000 | PASS |
 | math | p16f877a | 14 | 158 | 512 | 512 | 13 | 5000000 | PASS |
 | math | p18f4550 | 14 | 3 | 4096 | 4096 | 9 | 5000000 | PASS |
+| math | p16f1938 | 14 | 129 | 4096 | 4096 | 13 | 5000000 | PASS |
 | fnptr | p16f877a | 81 | 158 | 512 | 512 | 501 | 5000000 | PASS |
 | fnptr | p18f4550 | 57 | 3 | 4096 | 4096 | 119 | 5000000 | PASS |
+| fnptr | p16f1938 | 81 | 129 | 4096 | 4096 | 501 | 5000000 | PASS |
 | recursion | p16f877a | - | - | - | - | - | - | SDCC-ERR (pic14: invalid combination of short/long) |
 | recursion | p18f4550 | - | - | - | - | - | - | SDCC-WRONG (epic=0x78 sdcc=0x1; SDCC pic14 static-overlay recursion corrupts n) |
+| recursion | p16f1938 | - | - | - | - | - | - | SDCC-WRONG (epic=0x78 sdcc=0x1; SDCC pic14 static-overlay recursion corrupts n) |
 | printf-f | p16f877a | - | - | - | - | - | - | MISMATCH (epic=0xa sdcc=0xef; probe is a placeholder, %f ships in PR #295) |
 | printf-f | p18f4550 | - | - | - | - | - | - | MISMATCH (epic=0xa sdcc=0xec; probe is a placeholder, %f ships in PR #295) |
+| printf-f | p16f1938 | - | - | - | - | - | - | MISMATCH (epic=0xa sdcc=0xcb; probe is a placeholder, %f ships in PR #295) |
 
 ## Findings
 
@@ -72,3 +83,11 @@ program.
   gap remains (tracked by the PIC18 sub-epic).
 - **SDCC pic14 rejects `double`** (error 206: invalid combination of
   short/long), so the double probe is PIC18-only in practice.
+- **PIC14E parity (16F1938) is green.** SDCC's pic14 port covers the
+  Enhanced core via `libsdcce.lib`; the harness now threads `PIC16F1938`
+  through the differential. Every Tier-1/Tier-2 program epic-cc accepts
+  on PIC14E matches SDCC (8 PASS), and the three non-PASS rows mirror
+  classic PIC14 exactly: `double` rejected by SDCC pic14, the `%f`
+  placeholder, and the SDCC static-overlay recursion bug. epic-cc's
+  PIC14E flash is consistently well under SDCC's (13-81 vs 129-219
+  words).
