@@ -91,6 +91,29 @@ fn pic14e_config_words_resolve_against_the_datasheet_layout() {
 }
 
 #[test]
+fn pic14e_optional_fields_default_to_the_erased_values() {
+    // The non-board-dependent fields a consumer may omit (epic-cc
+    // #303) resolve to the same values the erased baseline and XC8's
+    // DFP apply when a `#pragma config` omits them: clkouten/pllen/
+    // stvren/vcapen/pwrt = off, borv = hi. Only the clock fields stay
+    // required: every other family's data defaults exactly those.
+    let bytes = resolve_config(&PIC16F1937.config, "osc=intosc, wdt=on");
+    // osc=intosc clears the two top FOSC bits (0b100 in a 0b111 field);
+    // the defaults whose value bits are 0 (ieso, fcmen, pllen, stvren,
+    // borv, lvp) clear their erased 1s, exactly as XC8's DFP does for
+    // an omitted pragma.
+    assert_eq!(bytes, vec![0xFC, 0x0F, 0xFF, 0x18]);
+    let names: Vec<_> = PIC16F1937
+        .config
+        .fields
+        .iter()
+        .filter(|f| f.default.is_none())
+        .map(|f| f.name)
+        .collect();
+    assert_eq!(names, ["osc"], "only osc may lack a default");
+}
+
+#[test]
 fn xinst_is_locked_off() {
     let f = PIC18F4550
         .config
