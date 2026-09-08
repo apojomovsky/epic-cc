@@ -22,8 +22,13 @@ fn corpus_differential_clean() {
     let mut failures = Vec::new();
     let mut surface_gaps = Vec::new();
     for prog in corpus::corpus() {
-        // Run on both devices (PIC14 and PIC18) where the program compiles.
-        for device in [&device::PIC16F877A, &device::PIC18F4550] {
+        // Run on all three cores (PIC14, PIC18, PIC14E) where the program
+        // compiles.
+        for device in [
+            &device::PIC16F877A,
+            &device::PIC18F4550,
+            &device::PIC16F1938,
+        ] {
             let name = prog.outputs.first().cloned().unwrap_or_else(|| "?".into());
             // Catch panics per-program (a sim panic on one SDCC program must
             // not abort the whole corpus run).
