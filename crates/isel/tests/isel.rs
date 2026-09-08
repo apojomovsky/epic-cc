@@ -8851,7 +8851,6 @@ fn distinct_volatile_global_stores_emit_all_movwf_in_program_order() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
 
-    // One MOVWF per distinct global, none coalesced away.
     for i in 0..5 {
         assert_eq!(
             asm.matches(&format!("    MOVWF 0x{:02X}", 0x20 + i))
@@ -8860,7 +8859,6 @@ fn distinct_volatile_global_stores_emit_all_movwf_in_program_order() {
             "store to g{i} must emit exactly one MOVWF:\n{asm}"
         );
     }
-    // MOVWF addresses appear in program (IR) order 0x20, 0x21, ... 0x24.
     let pos: Vec<usize> = (0..5)
         .map(|i| asm.find(&format!("    MOVWF 0x{:02X}", 0x20 + i)).unwrap())
         .collect();
