@@ -12,14 +12,13 @@ CACHE_DIR   := $(HOME)/.cache/epic-cc
 CARGO_HOME_CACHE := $(CACHE_DIR)/cargo-home
 
 # Dedicated buildx builder (docker-container driver) for every local image
-# build. Its cache — including the clang-builder layer and the LLVM ccache
-# mount — lives in this builder's own container/volume, not the default
+# build. Its cache, including the clang-builder layer and the LLVM ccache
+# mount, lives in this builder's own container/volume, not the default
 # docker driver's storage. `docker system prune` / `docker builder prune`
-# (no --builder flag) only ever touch the *default* builder, so a generic
-# cache cleanup can no longer reach the clang cache at all: this is the
-# fix, not the registry cache below (that's just the fallback for a fresh
-# machine or someone deleting this builder by name). Created lazily and
-# idempotently by every target that needs it.
+# (no --builder flag) only ever touch the default builder, so a generic
+# cache cleanup can no longer reach the clang cache at all. That is the
+# fix, not the registry cache below, which is just the fallback for a
+# fresh machine or someone deleting this builder by name.
 BUILDER := epic-cc-builder
 ENSURE_BUILDER := docker buildx inspect $(BUILDER) >/dev/null 2>&1 || \
 	docker buildx create --name $(BUILDER) --driver docker-container --bootstrap >/dev/null
