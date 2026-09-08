@@ -93,3 +93,21 @@ fn different_symbolic_operands_kept() {
     let asm = "    MOVLW PAGE(helper)\n    MOVWF PCLATH\n    CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH\n";
     assert_eq!(optimize(asm), asm);
 }
+
+/// Lane D fixpoint idempotence (docs/36): a pass meant to reach a fixpoint
+/// must be a no-op the second time it runs on its own output. The peephole
+/// collapses redundant `MOVLW k; MOVWF PCLATH` pairs; running it again on
+/// its own output must not change anything (a pass that thinks it converged
+/// but did not would emit a different second result).
+#[test]
+fn optimize_is_a_fixpoint() {
+    // A representative mix: a redundant pair (elided on the first pass), a
+    // cross-page pair (kept), a label reset, and a symbolic pair.
+    let asm = "    MOVLW 0x08\n    MOVWF PCLATH\n    CALL f\n    MOVLW 0x08\n    MOVWF PCLATH\n    MOVLW 0x00\n    MOVWF PCLATH\n    GOTO lbl\nlbl:\n    MOVLW PAGE(main)\n    MOVWF PCLATH\n    CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH\n";
+    let once = optimize(asm);
+    let twice = optimize(&once);
+    assert_eq!(
+        once, twice,
+        "peephole must be a fixpoint (second run is a no-op)"
+    );
+}

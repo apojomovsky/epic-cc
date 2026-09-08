@@ -1417,3 +1417,38 @@ fn lowers_umin_umax_to_icmp_select() {
     assert!(text.contains("%c1 = icmp ugt i16 %x %b"), "{text}");
     assert!(text.contains("%y = select i1 %c1 i16 %x i16 %b"), "{text}");
 }
+
+/// Lane D fixpoint idempotence (docs/36): a pass meant to reach a fixpoint
+/// must be a no-op the second time it runs on its own output. Legalize
+/// lowers mul/div/shift/float ops to runtime calls and injects the routine
+/// defs; running it again on its own output must not change anything (a
+/// pass that thinks it converged but did not would emit a different second
+/// result). The canonical text round-trip is the comparison surface.
+#[test]
+fn legalize_is_a_fixpoint() {
+    // A module exercising the mul/shift lowering, the float lowering, and
+    // the fcmp materialization tree (the shapes legalize rewrites).
+    let m = parse(
+        "global in i16\n\
+         global f float\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i16 @in\n\
+             %m = mul i16 %a, 7\n\
+             %v = shl i16 %a, %a\n\
+             store i16 %m, @in\n\
+             %x = load float @f\n\
+             %y = fadd float %x %x\n\
+             %c = fcmp olt float %x, %y\n\
+             store float %y, @f\n\
+             ret void\n",
+    );
+    let once = legalize(m);
+    let once_text = ir::serialize(&once);
+    let twice = legalize(once);
+    let twice_text = ir::serialize(&twice);
+    assert_eq!(
+        once_text, twice_text,
+        "legalize must be a fixpoint (second run is a no-op)"
+    );
+}
