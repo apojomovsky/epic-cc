@@ -276,7 +276,30 @@ fn corpus_matches_ratio_baseline() {
                     ));
                 }
             }
-            (Status::KnownBug, Status::KnownBug) => {}
+            (Status::KnownBug, Status::KnownBug) => {
+                // The SDCC side's measurability is part of the
+                // arbitration: a limitation row is SDCC-rejects-the-
+                // program (no numbers), a bug row is SDCC-links-and-
+                // runs. A row that switches between the two means the
+                // oracle's behavior changed and the entry is stale.
+                if (base.sdcc_flash > 0) != (row.sdcc_flash > 0) {
+                    problems.push(format!(
+                        "{} on {}: SDCC side changed ({} -> {}); re-arbitrate and re-baseline",
+                        row.program,
+                        row.device,
+                        if base.sdcc_flash > 0 {
+                            "linked"
+                        } else {
+                            "rejected"
+                        },
+                        if row.sdcc_flash > 0 {
+                            "linked"
+                        } else {
+                            "rejected"
+                        },
+                    ));
+                }
+            }
             (Status::Pass, Status::KnownBug) => problems.push(format!(
                 "{} on {}: was differential-clean, now mismatches",
                 row.program, row.device

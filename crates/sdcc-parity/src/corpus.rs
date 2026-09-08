@@ -67,8 +67,7 @@ pub fn tier2() -> Vec<CorpusProgram> {
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    in = 0x12;\n    unsigned long long a = 0x1122334455667788ULL;\n    unsigned long long b = (unsigned long long)in;\n    unsigned long long c = a + b;\n    out = (unsigned char)(c & 0xFF);\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
-        // double: 1.5 * 2.0 = 3.0 -> 0x3 (SDCC pic14 rejects `double` with
-        // error 206, so this probe runs PIC18-only in practice).
+        // double: 1.5 * 2.0 = 3.0 -> 0x3
         prog(
             "double",
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    in = 2;\n    double a = 1.5;\n    double b = (double)in;\n    double c = a * b;\n    out = (unsigned char)((unsigned int)c & 0xFF);\n    __asm__(\"sleep\");\n}\n",

@@ -71,7 +71,7 @@ cycle ratio 0.027 (epic-cc/SDCC, geometric mean).
   loop no longer inflates its cycle counts to the step budget. SDCC's
   PIC18 cycles carry its ~6K-instruction BSS-clear + `cinit` startup,
   which is the honest whole-program cost.
-- **Three simulator gaps found by the oracle, now fixed.** The first
+- **Four simulator gaps found by the oracle, now fixed.** The first
   PIC18 rows recorded SDCC as wrong on almost every program; gpsim
   (independent reference) proved the wrong side was ours. The sim did
   not model WREG as access-bank file register 0xFE8 (every chained

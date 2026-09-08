@@ -162,23 +162,21 @@ fn corpus_differential_clean() {
     // Aggregate geometric-mean ratios, epic-cc/SDCC, over comparable rows
     // (flash and cycles; RAM is informational). These anchor the "<= SDCC"
     // gates in docs/35 section 5 items 3-4 and the committed ratio
-    // baseline.
     if !comparable.is_empty() {
-        let n = comparable.len() as f64;
         let geo = |pick: fn(&(usize, usize, usize, usize, usize, usize)) -> (usize, usize)| {
-            (comparable
+            let rows: Vec<f64> = comparable
                 .iter()
                 .filter(|r| pick(r).1 > 0)
                 .map(|r| (pick(r).0 as f64 / pick(r).1 as f64).ln())
-                .sum::<f64>()
-                / n)
-                .exp()
+                .collect();
+            (rows.iter().sum::<f64>() / rows.len() as f64).exp()
         };
         let flash = geo(|r| (r.0, r.1));
         let ram = geo(|r| (r.2, r.3));
         let cycles = geo(|r| (r.4, r.5));
         eprintln!(
-            "aggregate over {n} comparable rows: flash ratio {flash:.3}, RAM ratio {ram:.3}, cycle ratio {cycles:.3} (epic-cc/SDCC, geometric mean)"
+            "aggregate over {} comparable rows: flash ratio {flash:.3}, RAM ratio {ram:.3}, cycle ratio {cycles:.3} (epic-cc/SDCC, geometric mean)",
+            comparable.len()
         );
     }
     eprintln!(

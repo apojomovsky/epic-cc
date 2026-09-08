@@ -209,21 +209,17 @@ differential):
 
 - For each corpus program: compile with epic-cc to hex; compile with
   `sdcc --use-non-free -mpic16 -p18f4550` (or `-mpic14 -p16f877a`)
-  through gplink to hex; load both into our sim; seed identical inputs
-  by writing each compiler's named input globals (resolved from that
-  compiler's own map/symbol output) before running; run both to a
-  shared halt convention (every corpus program ends by executing
-  `SLEEP` via the compat header below, which is already epic-cc's sim's
-  stop condition) under a hard step budget, with "budget exhausted" a
-  distinct failure class from a value mismatch; then compare the
-  program's declared output globals and ports, matched by name across
-  the two compilers' symbol/map output, plus the cycle count; record
-  flash words + RAM bytes from both. The comparison is scoped to named
-  outputs, never the whole RAM image: the two compilers allocate
-  globals and locals at different addresses with different overlay
-  strategies, so unrelated bytes would differ. This mirrors the fuzz
-  differential (crates/fuzz), which compares a single named checksum
-  global rather than full RAM.
+  through gplink to hex; load both into our sim and run both to the
+  program's `sleep` halt (see the corpus contract below), with "budget
+  exhausted" a distinct failure class from a value mismatch; then
+  compare the program's declared output globals and ports, matched by
+  name across the two compilers' symbol/map output, plus the cycle
+  count; record flash words + RAM bytes from both. The comparison is
+  scoped to named outputs, never the whole RAM image: the two
+  compilers allocate globals and locals at different addresses with
+  different overlay strategies, so unrelated bytes would differ. This
+  mirrors the fuzz differential (crates/fuzz), which compares a single
+  named checksum global rather than full RAM.
 - **Corpus portability contract.** The corpus is smaller than the
   sketch above, in the direction of less machinery: every corpus
   program is a single plain-C source that compiles unmodified under
@@ -292,8 +288,9 @@ All five must hold:
    and sim-verifies to its hand-computed result.
 2. **Differential.** For every corpus program SDCC accepts, epic-cc's
    sim-observed final state (the program's named output globals and
-   ports, matched by name) matches SDCC's, given identical seeded
-   inputs. Cycle count is not part of this item: two compilers emit
+   ports, matched by name) matches SDCC's, with both programs fed the
+   same source (inputs are part of the source, see section 4). Cycle
+   count is not part of this item: two compilers emit
    different instruction sequences, so an exact cycle match is
    unachievable and would contradict item 4. Cycle count belongs solely
    to the <= comparison in item 4.
