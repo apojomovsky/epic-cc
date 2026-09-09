@@ -27,6 +27,7 @@ one-line index entry here, e.g.:
 - ADR-026: PIC18 struct ABI is XC8 byte alignment (`-fpack-struct` for PIC18, irparse reads packed `<{ ... }>` types; PIC14 unchanged), 2026-08-28
 - ADR-027: Bank-aware instruction scheduler: a new `schedule` pass between isel and banking, phase 1 scoped to a single hand-verified reorder shape, 2026-09-04
 - ADR-028: Address-to-line table: thread `SrcLoc` on every `Inst` through isel/schedule/banking/peephole to a `--line-table` artifact, 2026-09-05
+- ADR-029: PIC8 flash-generation part catalog (`crates/device/catalog/parts.toml`, popularity tiers, DFP/MCP-derived facts; tracks and prioritizes, never compiler input), 2026-09-09
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

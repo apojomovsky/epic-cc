@@ -3,7 +3,7 @@
 **Start here if you are resuming cold.** This is the current-state map; the detailed
 designs and their ADRs are the source of truth.
 
-Last updated: 2026-09-06
+Last updated: 2026-09-09
 
 ---
 
@@ -46,7 +46,11 @@ now contains a complete compiler, not just documentation:
   stanza records where each field came from, and an always-on gputils cross-check
   catches drift against the oracle ([ADR-021](adr/ADR-021-device-provenance-and-cross-check.md)).
   Adding a device on an already-supported core is now a documented, twice-proven
-  runbook, [`32-adding-a-device.md`](32-adding-a-device.md). Device names
+  runbook, [`32-adding-a-device.md`](32-adding-a-device.md). What to port next
+  is triaged by the flash-generation part catalog
+  (`crates/device/catalog/parts.toml`, all 1007 F-family parts with memory
+  facts, lifecycle, datasheet URLs and GitHub popularity tiers; ADR-029), the
+  ported set staying the verified `devices/*.toml` registry. Device names
   resolve in every spelling the toolchain uses, so no caller keeps a mapping table. CI is
   stratified into a canonical job per core plus a lightweight per-device job, and a
   `hal-887` job builds epic-hal's 887 firmware inside an epic-cc job so a compiler change
