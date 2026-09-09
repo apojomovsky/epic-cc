@@ -108,8 +108,13 @@ RUN curl -fsSL https://sh.rustup.rs -o /tmp/rustup.sh \
 # --enable-floats (manual 4.10.9): the default build prints `<NO FLOAT>`
 # instead of formatting %f, which would make the %f corpus probe
 # untestable against SDCC. The regression suite ships in the tarball under
-# support/regression/ and is used by the parity harness (Tier 3), never
-# committed. Built in dev (not base) so the expensive clang-builder layer
+# regression/ and is used by the parity harness (Tier 3), never
+# committed. The two per-port support.c files use `#pragma preproc_asm -`
+# plus __asm blocks, which SDCC 4.6.0 cannot compile (error 329 stray
+# character on every line after the block, an sdcpp _sdcpp_skip_asm_block
+# regression); the sed patch switches them to `preproc_asm +` and strips
+# the now-invalid `;;` gpsim comment lines, keeping the .direct directives
+# intact. Built in dev (not base) so the expensive clang-builder layer
 # stays cached when the SDCC pin changes.
 #
 # SDCC 4.6.0 #errors on boost 1.71-1.78 (SDCC bug #3772) in the
@@ -144,19 +149,26 @@ RUN curl -fsSL -o /tmp/sdcc.tar.bz2 \
     && cd /tmp/sdcc-4.6.0 \
     && mkdir -p /usr/local/share/sdcc/regression \
     && cp -r support/regression/* /usr/local/share/sdcc/regression/ \
-    && rm -rf /tmp/sdcc-4.6.0 /tmp/sdcc.tar.bz2
+    && rm -rf /tmp/sdcc-4.6.0 /tmp/sdcc.tar.bz2 \
+    && sed -i -e 's/#pragma preproc_asm -/#pragma preproc_asm +/' \
+        -e '/^[[:space:]]*;;/d' \
+        /usr/local/share/sdcc/regression/ports/pic14/support.c \
+        /usr/local/share/sdcc/regression/ports/pic16/support.c
 
 # Test-time tooling only, no from-source build (gputils, SDCC) depends on
 # any of these, so they sit last: adding one here can only bust its own
 # apt layer, never the gputils/SDCC builds above. git/file are general
 # tooling; gdb is the debugger acceptance oracle
 # (crates/driver/tests/debug_session_e2e.rs runs it as a subprocess against
-# epic-cc-gdbserver, epic-cc#259); csmith/creduce/cvise/poppler-utils are
-# the fuzz-corpus/reduction toolchain.
+# epic-cc-gdbserver, epic-cc#259); gpsim runs the SDCC regression suite's
+# pic14/pic16 ports and serves as the independent simulator in arbitration
+# (docs/35 section 4, external process only); csmith/creduce/cvise/
+# poppler-utils are the fuzz-corpus/reduction toolchain.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         file \
         gdb \
+        gpsim \
         csmith \
         creduce \
         cvise \
