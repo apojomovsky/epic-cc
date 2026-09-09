@@ -80,6 +80,8 @@ device = "p18f4550"
 program = "printf-f"
 sdcc_observed = 0x0
 expected = 0x41
+
+[[bug]]
 # EEPROM on p18f4550: SDCC compiles the probe but its int-to-pointer
 # conversion never reaches the register window (EEDATA/EEADR/EECON2 see
 # no writes; EECON1 sees only two 0x80 writes from SDCC's own runtime,
