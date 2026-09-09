@@ -110,20 +110,20 @@ and epic-cc's tree. Items marked **verify** are ones where the corpus
 |---|---|---|---|
 | C89 core, 8/16/32-bit ints, float, pointers, arrays, structs, varargs, switch, function pointers, inline asm | ✅ | ✅ | parity already |
 | Config words | ✅ (`#pragma config`) | ✅ (`EPIC_CONFIG` macro) | different syntax, same capability; epic-cc's is ADR-012; SDCC also needs a device-specific `_ENHCPU_OFF_4L` vs `_XINST_OFF_4L` config name (manual 4.10.20.1) — matters for the corpus harness, see section 4 |
-| 64-bit `long long` | ⚠️ incomplete (manual 1.1, footnote 1: "incomplete support in the pic14 and pic16 backends") | ❌ | backend work (i64 ops); SDCC is a weak oracle here — the corpus's hand-computed expected value is the arbiter, not SDCC's output |
+| 64-bit `long long` | ⚠️ incomplete (manual 1.1, footnote 1: "incomplete support in the pic14 and pic16 backends") | partial | the `i64` probe (a 64-bit add with a volatile operand, folded to a byte) passes differentially on PIC18 and computes the hand value on PIC14/PIC14E, where SDCC has no 64-bit type at all (arbitrated); full i64 lowering stays backend work |
 | `double` | ✅ as an alias for 4-byte `float`, with a warning emitted (manual 3.1.1/3.1.5: "float is substituted for (long) double"); no `--double` flag exists | ✅ same (f32 only) | parity already, not a gap |
-| Bit-fields | ✅ | untested | clang lowers to shift/mask IR we already handle; **verify** |
-| Unions | ✅ | partial | `%union.` globals parse (#165); locals **verify** |
-| Recursion / reentrancy (FSR1/FSR2 software stack, manual 4.10.12) | ✅ | ❌ by design | `Slot::Frame` hook exists (docs/29 D-2); real gap to close |
+| Bit-fields | ✅ | ✅ | verified: clang lowers to shift/mask IR; `bitfields` probe passes on all three cores |
+| Unions | ✅ | ✅ | verified: `unions` probe passes on all three cores (#300) |
+| Recursion / reentrancy (FSR1/FSR2 software stack, manual 4.10.12) | ✅ | ✅ | `recursion` probe (fact(5)) passes on all three cores; SDCC's pic14-family static overlay corrupts (arbitrated) |
 | Memory models — code-pointer width (manual 4.10.11) | small/large | static overlay only | separate axis from the stack model above |
 | malloc / heap | ✅ | ❌ | library work |
 | math.h | ✅ | ❌ | library work |
-| `printf` `%f` | ✅, but only if `device/lib/pic16` is rebuilt with `--enable-floats` (manual 4.10.9); default build prints `<NO FLOAT>` | ❌ | stdio_c.rs: "No floats"; oracle image must rebuild the pic16 float-enabled library (section 4) |
-| Code/eeprom pointers (3-byte generic) | ✅ | ❌ | const via TBLRD only |
+| `printf` `%f` | ✅, but only if `device/lib/pic16` is rebuilt with `--enable-floats` (manual 4.10.9); default build prints `<NO FLOAT>` | ✅ | formatter shipped (#295); the `printf-f` probe formats 3.5 through printf on all three cores (conformance pinned); the p18f4550 differential is arbitrated (putchar sink-ABI incompatibility, `sdcc-known-bugs.toml`) |
+| Code/eeprom pointers (3-byte generic) | ✅ | partial | pointer-to-const traversal in flash verified at parity on all three cores (`constptr` probe, TBLRD/RETLW path); SDCC's space-qualified pointers (`__code`/`__eeprom`, runtime-selected spaces) stay open under #267 |
 | Two-vector priority interrupts | ✅ | ❌ | single-vector compat only (ADR-013 follow-up) |
 | `__shadowregs`, `__wparam` | ✅ | ❌ | perf features |
 | Real diagnostics vs panics | ✅ | ❌ | known gap |
-| EEPROM access | ✅ | ❌ | **verify** |
+| EEPROM access | ✅ | ✅ | verified: family-pinned probes write and read back through the EEADR/EEDATA/EECON1/EECON2 window on all three families (p18f4550 differential arbitrated as an SDCC inttoptr limitation) |
 
 ### PIC14 (SDCC "pic14" port): epic-cc gaps
 
@@ -134,8 +134,8 @@ and epic-cc's tree. Items marked **verify** are ones where the corpus
 | Struct/union as param/return | ❌ | ✅ | **epic-cc ahead** |
 | libc | ❌ | ✅ | **epic-cc ahead** |
 | Varargs (`printf` et al.) | ❌ (manual 4.9.9.1) | ✅ | **epic-cc ahead** |
-| Bit-fields | ✅ | untested | **verify** |
-| Unions | ✅ | partial | **verify** |
+| Bit-fields | ✅ | ✅ | verified: `bitfields` probe passes (#300) |
+| Unions | ✅ | ✅ | verified: `unions` probe passes, locals included (#300) |
 | 64-bit | ❌ (manual 3.1.3: "pic14: there is no support for 64 bit integer types") | ❌ | no gap |
 | math.h | ✅ (`libm.lib`, manual 4.9.8.1) | ❌ | library work |
 | Enhanced core (16F193x) | experimental (`libsdcce`) | in progress | the PIC14E sub-epic |
@@ -152,8 +152,10 @@ SDCC: experimental support (16F193x, 12F1822, separate `libsdcce`;
 auto-selects the `libsdcc` variant but not `libm`, per manual 4.9.8.1 —
 matters if the PIC14E corpus needs math.h). epic-cc: the port is **in
 progress** (docs/33, issue #228). P1 (asm encoder + sim core) and P2
-(integer spine + BSR/MOVLB banking) have landed; P3-P8 remain. The
-sub-epic is: finish P3-P8, then reach SDCC parity on that core. The
+(integer spine + BSR/MOVLB banking) have landed; P3 (pointers/arrays/
+structs, #272), P4 (const in flash, #278), P5 (interrupts, #283), P6
+(32-bit long and mul/div, #284), P7 (soft-float, #297) and P8 (fuzz
+in #302. The port is done; what remains is the SDCC parity surface on that core. The
 comparison device for this sub-epic is **16F1938** (matches epic-cc's
 existing PIC14E device TOMLs and test fixtures).
 
