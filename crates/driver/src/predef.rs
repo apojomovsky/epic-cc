@@ -2,11 +2,22 @@
 //! Third-party PIC sources switch on them (m-stack's usb.c errors out
 //! without `__XC8`); they ride ahead of the user's `-D`s so a user
 //! define keeps precedence by argv position.
+//!
+//! `__wparam` is empty by design (it must ride as `-D__wparam=`, not a
+//! bare `-D__wparam`): XC8 and SDCC spell the PIC18 WREG-parameter
+//! attribute `__wparam`, and SDCC's pic16 `stdio.h` declares the user
+//! sink `void putchar(char) __wparam` (the corpus `%f` probe defines
+//! exactly that so one source compiles under both compilers). Our own
+//! formatter treats it as a plain `char` argument.
 
 use device;
 
 pub fn xc8_predefines(core: device::Core, device_name: &str) -> Vec<String> {
-    let mut defs = vec!["__XC".to_string(), "__XC8".to_string()];
+    let mut defs = vec![
+        "__XC".to_string(),
+        "__XC8".to_string(),
+        "__wparam=".to_string(),
+    ];
     match core {
         device::Core::Pic14 => defs.push("_PIC14".into()),
         device::Core::Pic14e => {
@@ -34,7 +45,7 @@ mod tests {
     fn pic18_part_gets_its_xc8_set() {
         assert_eq!(
             xc8_predefines(device::Core::Pic18, "p18f4550"),
-            vec!["__XC", "__XC8", "_PIC18", "_18F4550"]
+            vec!["__XC", "__XC8", "__wparam=", "_PIC18", "_18F4550"]
         );
     }
 
@@ -42,7 +53,14 @@ mod tests {
     fn pic14e_sets_both_pic14_spellings() {
         assert_eq!(
             xc8_predefines(device::Core::Pic14e, "p16f1939"),
-            vec!["__XC", "__XC8", "_PIC14", "_PIC14E", "_16F1939"]
+            vec![
+                "__XC",
+                "__XC8",
+                "__wparam=",
+                "_PIC14",
+                "_PIC14E",
+                "_16F1939"
+            ]
         );
     }
 
@@ -50,7 +68,7 @@ mod tests {
     fn plain_pic14_names_the_core_and_part() {
         assert_eq!(
             xc8_predefines(device::Core::Pic14, "p16f877a"),
-            vec!["__XC", "__XC8", "_PIC14", "_16F877A"]
+            vec!["__XC", "__XC8", "__wparam=", "_PIC14", "_16F877A"]
         );
     }
 }

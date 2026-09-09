@@ -6,10 +6,9 @@
 volatile char g_buf[80];
 volatile int g_n = 0;
 
-int putchar(int c) {
-    g_buf[g_n] = (char)c;
+void putchar(char c) {
+    g_buf[g_n] = c;
     g_n++;
-    return c;
 }
 
 void main(void) {
