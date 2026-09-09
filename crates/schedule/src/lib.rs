@@ -72,6 +72,7 @@ pub struct Insn<'a> {
     /// instruction, never move anything into or out of this exact slot.
     pub is_skip_target: bool,
 }
+
 /// One line of the flat asm text, classified for scheduling purposes.
 /// Every variant that isn't `Insn` is a hazard boundary a reorder may
 /// never cross (see `regions`). An `Insn` touching an SFR
