@@ -14,6 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 GEN = ROOT / "scripts" / "gen-device.py"
 FIXTURE = ROOT / "scripts" / "fixtures" / "synthetic.atdf"
 PIC18_FIXTURE = ROOT / "scripts" / "fixtures" / "synthetic_pic18.atdf"
+SWEEP_PACK = ROOT / "scripts" / "fixtures" / "sweep-pack"
 
 # `gen-device.py`'s CLI only accepts one `--atdf` path, so it cannot express
 # "a real ini and a real .cfgdata, no EDC" in one invocation (the ini/cfgdata
@@ -321,6 +322,69 @@ class GenDevicePic18CfgdataTest(unittest.TestCase):
         # beta is CONFIG1H, the byte right after CONFIG1L: offset 1, not the
         # doubled-address bug's offset 2.
         self.assertIn('name = "beta"\nbyte_offset = 1', text)
+
+
+class GenDeviceSweepTest(unittest.TestCase):
+    """`--sweep` breadth proofing (docs/38 D-2): generate for every part in
+    an unpacked DFP directory, triage failures instead of stopping at the
+    first one. The fixture pack mirrors a real .atpack layout: a
+    `*_DFP`-suffixed directory holding `edc/*.PIC` files, so the pack name
+    resolves from the ancestor and the sweep needs no `--pack`."""
+
+    def run_sweep(self, *extra):
+        cmd = [sys.executable, str(GEN), "--sweep", str(SWEEP_PACK), *extra]
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def test_sweep_reports_every_part_and_exits_1_on_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            edc = pathlib.Path(d) / "Microchip.PIC16Fxxx_DFP" / "edc"
+            edc.mkdir(parents=True)
+            (edc / "PIC14SYN01.PIC").write_text(FIXTURE.read_text())
+            (edc / "PIC18SYN01.PIC").write_text(PIC18_FIXTURE.read_text())
+            (edc / "PIC14SYN02.PIC").write_text(
+                "\n".join(l for l in FIXTURE.read_text().splitlines() if "GPRDataSector" not in l)
+            )
+            (edc / "BROKEN.PIC").write_text('<edc:PIC xmlns:edc="http://crownking/edc">')
+            r = subprocess.run(
+                [sys.executable, str(GEN), "--sweep", str(pathlib.Path(d))],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertIn("ok  p14syn01", r.stdout)
+        self.assertIn("ok  p18syn01", r.stdout)
+        self.assertIn("missing-facts  p14syn02: ram_banks", r.stdout)
+        self.assertIn("error", r.stdout)
+        self.assertIn("pbroken", r.stdout)
+        self.assertIn("2/4 parts generated, 2 failed", r.stdout)
+
+    def test_sweep_exits_0_when_every_part_generates(self):
+        r = self.run_sweep()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ok  p14syn01", r.stdout)
+        self.assertIn("ok  p18syn01", r.stdout)
+        self.assertIn("2/2 parts generated, 0 failed", r.stdout)
+
+    def test_sweep_derives_pack_name_from_dfp_ancestor(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = self.run_sweep("--out-dir", d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            toml = (pathlib.Path(d) / "p14syn01.toml").read_text()
+        self.assertIn('pack = "Microchip.PIC16Fxxx_DFP"', toml)
+
+    def test_sweep_out_dir_holds_only_successful_tomls(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = self.run_sweep("--out-dir", d)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            written = sorted(p.name for p in pathlib.Path(d).iterdir())
+        self.assertEqual(written, ["p14syn01.toml", "p18syn01.toml"])
+
+    def test_sweep_rejects_a_non_directory(self):
+        r = subprocess.run(
+            [sys.executable, str(GEN), "--sweep", str(GEN)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("is not a directory", r.stderr)
 
 
 if __name__ == "__main__":
