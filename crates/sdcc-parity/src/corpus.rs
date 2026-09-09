@@ -19,10 +19,16 @@ use crate::CorpusProgram;
 
 /// Build a corpus program from source + input/output declarations.
 fn prog(name: &str, source: &str, outputs: &[&str]) -> CorpusProgram {
+    prog_for(&[], name, source, outputs)
+}
+
+/// Build a corpus program that runs only on the named devices.
+fn prog_for(devices: &[&str], name: &str, source: &str, outputs: &[&str]) -> CorpusProgram {
     CorpusProgram {
         name: name.to_string(),
         source: source.to_string(),
         outputs: outputs.iter().map(|s| s.to_string()).collect(),
+        devices: devices.iter().map(|s| s.to_string()).collect(),
     }
 }
 
@@ -100,12 +106,53 @@ pub fn tier2() -> Vec<CorpusProgram> {
             "volatile unsigned char in;\nvolatile unsigned char out;\nunsigned char fact(unsigned char n) {\n    if (n <= 1) return 1;\n    return (unsigned char)(n * fact((unsigned char)(n - 1)));\n}\nvoid main(void) {\n    in = 5;\n    out = fact(in);\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
-        // printf %f: formats a float (SDCC's printf supports %f when its
-        // pic16 library is rebuilt with --enable-floats; the probe is still
-        // a placeholder tracked by the PIC18 sub-epic's %f work).
+        // printf %f: formats 7 * 0.5 through printf into a buffer via a
+        // user putchar, then folds the first six output bytes. epic-cc
+        // prints 2 fixed decimals (#295) and SDCC's %f prints 6, but the
+        // first six bytes ("d=3.50") agree either way, so the fold
+        // compares the computed value, not the formatting policy. SDCC's
+        // pic14 port has no libc (manual 4.9.8): its pic14/pic14e rows
+        // are arbitrated as an SDCC limitation. Expected fold of
+        // "d=3.50" = 0x41.
         prog(
             "printf-f",
-            "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    in = 1;\n    out = in;\n    __asm__(\"sleep\");\n}\n",
+            "#include <stdio.h>\nvolatile unsigned char seed;\nvolatile unsigned char out;\nstatic char buf[16];\nstatic unsigned char pos;\nint putchar(int c) {\n    buf[pos] = (char)c;\n    pos++;\n    return c;\n}\nvoid main(void) {\n    seed = 7;\n    printf(\"d=%f\\r\\n\", seed * 0.5);\n    out = (unsigned char)(buf[0] ^ buf[1] ^ buf[2] ^ buf[3] ^ buf[4] ^ buf[5]);\n    __asm__(\"sleep\");\n}\n",
+            &["out"],
+        ),
+        // Data EEPROM (PIC14 family, DS39582C): write two cells through
+        // the EEADR/EEDATA/EECON1/EECON2 window, read them back through
+        // the RD cycle, fold. Only a real EEPROM array produces 0x80
+        // (0x5C ^ 0xA3 ^ 0x7F): a sim that never models the array
+        // returns the second cell for both reads and lands on 0x7F.
+        // Register addresses differ per family, so each family carries
+        // its own probe via the struct's device filter, not #if.
+        prog_for(
+            &["p16f877a"],
+            "eeprom-p14",
+            "volatile unsigned char out;\n#define EEADR  (*(volatile unsigned char *)0x010D)\n#define EEDATA (*(volatile unsigned char *)0x010C)\n#define EECON1 (*(volatile unsigned char *)0x018C)\n#define EECON2 (*(volatile unsigned char *)0x018D)\nvoid main(void) {\n    EEADR = 0x10;\n    EEDATA = 0x5C;\n    EECON1 = 0x04;\n    EECON2 = 0x55;\n    EECON2 = 0xAA;\n    EECON1 = 0x08;\n    EECON1 = 0x00;\n    EEADR = 0x11;\n    EEDATA = 0xA3;\n    EECON1 = 0x04;\n    EECON2 = 0x55;\n    EECON2 = 0xAA;\n    EECON1 = 0x08;\n    EECON1 = 0x00;\n    EEADR = 0x10;\n    EECON1 = 0x01;\n    {\n        unsigned char first = EEDATA;\n        EEADR = 0x11;\n        EECON1 = 0x01;\n        out = (unsigned char)(first ^ EEDATA ^ 0x7F);\n    }\n    __asm__(\"sleep\");\n}\n",
+            &["out"],
+        ),
+        // Data EEPROM (PIC18 family, DS39632E register set).
+        prog_for(
+            &["p18f4550"],
+            "eeprom-p18",
+            "volatile unsigned char out;\n#define EEADR  (*(volatile unsigned char *)0x0FA9)\n#define EEDATA (*(volatile unsigned char *)0x0FA8)\n#define EECON1 (*(volatile unsigned char *)0x0FA6)\n#define EECON2 (*(volatile unsigned char *)0x0FA7)\nvoid main(void) {\n    EEADR = 0x10;\n    EEDATA = 0x5C;\n    EECON1 = 0x04;\n    EECON2 = 0x55;\n    EECON2 = 0xAA;\n    EECON1 = 0x08;\n    EECON1 = 0x00;\n    EEADR = 0x11;\n    EEDATA = 0xA3;\n    EECON1 = 0x04;\n    EECON2 = 0x55;\n    EECON2 = 0xAA;\n    EECON1 = 0x08;\n    EECON1 = 0x00;\n    EEADR = 0x10;\n    EECON1 = 0x01;\n    {\n        unsigned char first = EEDATA;\n        EEADR = 0x11;\n        EECON1 = 0x01;\n        out = (unsigned char)(first ^ EEDATA ^ 0x7F);\n    }\n    __asm__(\"sleep\");\n}\n",
+            &["out"],
+        ),
+        // Data EEPROM (Enhanced Mid-range family, DS41364E register set).
+        prog_for(
+            &["p16f1938"],
+            "eeprom-p14e",
+            "volatile unsigned char out;\n#define EEADR  (*(volatile unsigned char *)0x0191)\n#define EEDATA (*(volatile unsigned char *)0x0193)\n#define EECON1 (*(volatile unsigned char *)0x0195)\n#define EECON2 (*(volatile unsigned char *)0x0196)\nvoid main(void) {\n    EEADR = 0x10;\n    EEDATA = 0x5C;\n    EECON1 = 0x04;\n    EECON2 = 0x55;\n    EECON2 = 0xAA;\n    EECON1 = 0x08;\n    EECON1 = 0x00;\n    EEADR = 0x11;\n    EEDATA = 0xA3;\n    EECON1 = 0x04;\n    EECON2 = 0x55;\n    EECON2 = 0xAA;\n    EECON1 = 0x08;\n    EECON1 = 0x00;\n    EEADR = 0x10;\n    EECON1 = 0x01;\n    {\n        unsigned char first = EEDATA;\n        EEADR = 0x11;\n        EECON1 = 0x01;\n        out = (unsigned char)(first ^ EEDATA ^ 0x7F);\n    }\n    __asm__(\"sleep\");\n}\n",
+            &["out"],
+        ),
+        // Pointer traversal of a const table in flash: epic-cc reads the
+        // cells through its TBLRD (PIC18) / RETLW (PIC14) const path,
+        // SDCC through its 3-byte generic pointers (docs/35 PIC18 table,
+        // code/eeprom pointers row). table[2] + table[3] = 107 = 0x6B.
+        prog(
+            "constptr",
+            "volatile unsigned char in;\nvolatile unsigned char out;\nconst unsigned char table[8] = {3, 14, 15, 92, 65, 35, 89, 79};\nvoid main(void) {\n    in = 2;\n    const unsigned char *p = table + (in & 3);\n    out = (unsigned char)(p[0] + p[1]);\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
     ]

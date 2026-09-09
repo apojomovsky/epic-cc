@@ -32,6 +32,20 @@ pub struct CorpusProgram {
     pub source: String,
     /// Volatile output globals, compared by name after the run.
     pub outputs: Vec<String>,
+    /// Devices the program runs on, by device name (`p16f877a`). Empty
+    /// means every device: most corpus programs are plain C that both
+    /// compilers accept anywhere. A probe pinned to one family's SFR
+    /// addresses (the data-EEPROM register file differs per family)
+    /// lists exactly those devices instead of `#if`-ing on a compiler
+    /// macro, which the corpus contract bans.
+    pub devices: Vec<String>,
+}
+
+impl CorpusProgram {
+    /// Whether this program runs on the named device.
+    pub fn runs_on(&self, device_name: &str) -> bool {
+        self.devices.is_empty() || self.devices.iter().any(|d| d == device_name)
+    }
 }
 
 /// The measured result of one compiler on one program.
