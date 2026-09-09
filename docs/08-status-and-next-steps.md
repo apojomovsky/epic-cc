@@ -50,7 +50,17 @@ now contains a complete compiler, not just documentation:
   resolve in every spelling the toolchain uses, so no caller keeps a mapping table. CI is
   stratified into a canonical job per core plus a lightweight per-device job, and a
   `hal-887` job builds epic-hal's 887 firmware inside an epic-cc job so a compiler change
-  cannot silently break the HAL.
+  cannot silently break the HAL. `Device`'s schema is closed over what the compiler needs
+  to place code and data and resolve config fuses: core, flash geometry, RAM banks,
+  config/fuse fields, and the PIC18-only `access_bank`/`fixed_retval` layout facts.
+  Peripheral register semantics are permanently out of scope; `epic-hal` owns them. The
+  core set is closed at four: Baseline, Mid-Range, Enhanced Mid-Range and PIC18, the four
+  8-bit families in Microchip's own product taxonomy (Microchip, "8-bit PIC
+  Microcontroller Solutions," DS-39630D, and the current-catalog brochure at
+  farnell.com/datasheets/1523199.pdf; no fifth 8-bit core exists in the current lineup)
+  [VERIFY]: the per-family device counts (16 baseline, 58 mid-range, 29 enhanced
+  mid-range, 193 PIC18) and the PIC17 dismissal were not independently refetched in this
+  pass.
 - **Multi-TU and distribution:** `llvm-link` merge and `epic-cc` binary naming per
   [ADR-011](adr/ADR-011-multi-tu-front-end.md); silicon-real codegen (`EPIC_AT`,
   `EPIC_CONFIG`, `EPIC_FOSC_HZ`) per [ADR-012](adr/ADR-012-cc3-silicon-real-codegen.md);
