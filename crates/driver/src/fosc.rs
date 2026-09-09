@@ -37,6 +37,10 @@ pub fn resolve_fosc_hz(device: &Device, spec: &str) -> u64 {
     match device.core {
         Core::Pic14 | Core::Pic14e => pic14_hz(&device.config, &fuse, xtal),
         Core::Pic18 => pic18_hz(&device.config, &fuse, xtal),
+        Core::PicBaseline => panic!(
+            "fosc: {} is pic-baseline; its oscillator tree lands with the backend (docs/37)",
+            device.name
+        ),
     }
 }
 

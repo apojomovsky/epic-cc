@@ -22,18 +22,27 @@ echo "--- sanity $DEVICE: add.c -> HEX + gpasm ---"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Compile add.c to HEX and to ASM for this device. Every core now has a
-# backend (P2 wired pic14e through isel-pic14e + banking), so a failed
-# compile is an error, not an expected firewall.
-cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.hex" 2>"$TMP/driver.err"
-cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.asm" --emit asm
-if [ ! -s "$TMP/out.hex" ]; then
-  echo "sanity $DEVICE: empty HEX" >&2
-  exit 1
-fi
-if [ ! -s "$TMP/out.asm" ]; then
-  echo "sanity $DEVICE: empty ASM" >&2
-  exit 1
+# Compile add.c to HEX and to ASM for this device. pic-baseline has no
+# backend yet (docs/37 P1 wires the encoder), so the driver refuses it by
+# design; the refusal is the check for that core, and the gpasm drill
+# below still proves the part name.
+if cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.hex" 2>"$TMP/driver.err"; then
+  cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.asm" --emit asm
+  if [ ! -s "$TMP/out.hex" ]; then
+    echo "sanity $DEVICE: empty HEX" >&2
+    exit 1
+  fi
+  if [ ! -s "$TMP/out.asm" ]; then
+    echo "sanity $DEVICE: empty ASM" >&2
+    exit 1
+  fi
+else
+  if ! grep -q "no backend yet" "$TMP/driver.err"; then
+    echo "sanity $DEVICE: driver failed unexpectedly:" >&2
+    cat "$TMP/driver.err" >&2
+    exit 1
+  fi
+  echo "sanity $DEVICE: driver refuses pic-baseline (no backend yet), as expected"
 fi
 
 # gpasm cross-check: the driver ASM uses PAGE()/BANKSEL pseudo-ops that

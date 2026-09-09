@@ -515,6 +515,13 @@ pub fn assign_banks_with_locs(
     asm: &str,
     locs: &[Option<SrcLoc>],
 ) -> (String, Vec<Option<SrcLoc>>) {
+    if device.core == device::Core::PicBaseline {
+        panic!(
+            "banking: {} is pic-baseline; its bank changes are FSR bit writes owned by isel-pic-baseline (docs/37 D-2), not this pass",
+            device.name
+        );
+    }
+
     // Issue #16 (left over from #13): a bank-0-only program provably never
     // leaves bank 0, so the label/CALL resets below can be skipped entirely
     // instead of emitting the dead full BANKSEL preamble after every label

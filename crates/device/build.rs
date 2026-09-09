@@ -17,6 +17,8 @@ struct DeviceToml {
     #[serde(default)]
     fixed_retval: Option<(u16, u16)>,
     stack_depth: u8,
+    #[serde(default)]
+    fsr_bank_bits: u8,
     interrupt_vectors: Vec<u16>,
     config: ConfigToml,
     #[serde(default)]
@@ -72,6 +74,36 @@ fn const_ident(name: &str) -> String {
     } else {
         name.to_ascii_uppercase()
     }
+}
+
+/// Vector-count invariants per core: one vector on the PIC14 family, two
+/// (high/low priority) on PIC18, none on baseline, which has no interrupt
+/// feature at all (DS41236E section 7.0).
+fn check_interrupt_vectors(path: &str, core: &str, vectors: &[u16]) {
+    let want = match core {
+        "pic14" | "pic14e" => 1,
+        "pic18" => 2,
+        "pic-baseline" => 0,
+        other => panic!("device: {path}: unknown core {other:?}"),
+    };
+    assert!(
+        vectors.len() == want,
+        "device: {path}: {core} must have exactly {want} interrupt vector(s), got {}",
+        vectors.len()
+    );
+}
+
+/// FSR carries bank-select bits on baseline and nowhere else (docs/37
+/// D-2/D-3); at most two, in FSR<7:5> of the baseline ISA.
+fn check_fsr_bank_bits(path: &str, core: &str, bits: u8) {
+    let legal = match core {
+        "pic-baseline" => bits <= 2,
+        _ => bits == 0,
+    };
+    assert!(
+        legal,
+        "device: {path}: {core} cannot carry fsr_bank_bits {bits}"
+    );
 }
 
 fn main() {
@@ -163,11 +195,12 @@ fn main() {
                 );
             }
         }
-        // per-core memory map checks: common_ram is PIC14 only, access_bank +
-        // fixed_retval are PIC18 only. Ensures the field never carries two
-        // meanings at once (issue #109).
+        // per-core memory map checks: common_ram is PIC14/PIC14E (and the
+        // baseline shared window), access_bank + fixed_retval are PIC18
+        // only. Ensures the field never carries two meanings at once
+        // (issue #109).
         match dev.core.as_str() {
-            "pic14" | "pic14e" => {
+            "pic14" | "pic14e" | "pic-baseline" => {
                 if dev.common_ram.is_none() {
                     panic!("device: {}: {} requires common_ram", path, dev.core);
                 }
@@ -249,34 +282,11 @@ fn main() {
                 path, dev.flash_words
             );
         }
-        if dev.interrupt_vectors.is_empty() {
-            panic!("device: {}: interrupt_vectors must not be empty", path);
-        }
         // `pic14e` keeps the single 0x0004 vector of `pic14`, so it takes the
         // same check. Having no backend is a driver-level refusal, not a
         // reason to leave its data unvalidated.
-        match dev.core.as_str() {
-            "pic14" | "pic14e" => {
-                if dev.interrupt_vectors.len() != 1 {
-                    panic!(
-                        "device: {}: {} must have exactly 1 interrupt vector, got {}",
-                        path,
-                        dev.core,
-                        dev.interrupt_vectors.len()
-                    );
-                }
-            }
-            "pic18" => {
-                if dev.interrupt_vectors.len() != 2 {
-                    panic!(
-                        "device: {}: pic18 must have exactly 2 interrupt vectors, got {}",
-                        path,
-                        dev.interrupt_vectors.len()
-                    );
-                }
-            }
-            _ => panic!("device: {}: unknown core {:?}", path, dev.core),
-        }
+        check_interrupt_vectors(path, &dev.core, &dev.interrupt_vectors);
+        check_fsr_bank_bits(path, &dev.core, dev.fsr_bank_bits);
         // field validation
         for f in &dev.config.fields {
             if f.mask == 0 {
@@ -345,6 +355,7 @@ fn main() {
             "pic14" => "Core::Pic14",
             "pic18" => "Core::Pic18",
             "pic14e" => "Core::Pic14e",
+            "pic-baseline" => "Core::PicBaseline",
             _ => unreachable!(),
         };
         // ram_banks
@@ -380,7 +391,7 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
-            "pub const {ident}: Device = Device {{\n    name: \"{name}\",\n    core: {core},\n    flash_words: 0x{flash:X},\n    ram_banks: &[{ram_banks}],\n    common_ram: {common},\n    access_bank: {access},\n    fixed_retval: {retval},\n    stack_depth: {stack},\n    interrupt_vectors: &[{vectors}],\n    config: ConfigRegion {{\n        base_byte_addr: 0x{base:X},\n        num_bytes: {num_bytes},\n        erased_baseline: &[{erased}],\n        fields: &[\n",
+            "pub const {ident}: Device = Device {{\n    name: \"{name}\",\n    core: {core},\n    flash_words: 0x{flash:X},\n    ram_banks: &[{ram_banks}],\n    common_ram: {common},\n    access_bank: {access},\n    fixed_retval: {retval},\n    stack_depth: {stack},\n    fsr_bank_bits: {fsb},\n    interrupt_vectors: &[{vectors}],\n    config: ConfigRegion {{\n        base_byte_addr: 0x{base:X},\n        num_bytes: {num_bytes},\n        erased_baseline: &[{erased}],\n        fields: &[\n",
             ident = ident,
             name = dev.name,
             core = core_variant,
@@ -390,6 +401,7 @@ fn main() {
             access = access_str,
             retval = retval_str,
             stack = dev.stack_depth,
+            fsb = dev.fsr_bank_bits,
             vectors = vectors_str,
             base = dev.config.base_byte_addr,
             num_bytes = dev.config.num_bytes,

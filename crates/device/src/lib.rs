@@ -14,6 +14,7 @@ pub enum Core {
     Pic14,
     Pic18,
     Pic14e,
+    PicBaseline,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -24,9 +25,10 @@ pub struct Device {
     pub flash_words: u32,
     /// Every banked GPR region, in address order: inclusive `(start, end)`.
     pub ram_banks: &'static [(u16, u16)],
-    /// PIC14 only: the physically mirrored common-RAM window reachable from
-    /// any bank with no `BANKSEL` (`None` on PIC18; the access bank is
-    /// modelled by `access_bank` there).
+    /// The physically mirrored common-RAM window reachable from
+    /// any bank with no `BANKSEL` (classic PIC14/PIC14E; on baseline the
+    /// shared GPR window plays the same role; `None` on PIC18, where the
+    /// access bank is modelled by `access_bank`).
     pub common_ram: Option<(u16, u16)>,
     /// PIC18 only: the hardware access bank, BSR-independent, as declared
     /// by gputils `ACCESSBANK` (`None` on PIC14, whose analogue is
@@ -40,6 +42,12 @@ pub struct Device {
     pub fixed_retval: Option<(u16, u16)>,
     /// Hardware call-stack depth; recursion beyond it is rejected at legalize.
     pub stack_depth: u8,
+    /// Baseline only: how many of `FSR`'s high bits are bank select
+    /// (`FSR<5>` on the p12f509, `FSR<6:5>` on the 16F505, unimplemented
+    /// on the 508). Zero on every other core, whose bank selection never
+    /// rides on `FSR`. Baseline bank changes are bit-granular
+    /// `BCF`/`BSF FSR` sequences (docs/37 D-2) and need this width.
+    pub fsr_bank_bits: u8,
     /// Interrupt vector word address(es): one for PIC14; two (high/low
     /// priority) for a PIC18 device with IPEN set.
     pub interrupt_vectors: &'static [u16],
@@ -81,6 +89,13 @@ const MIRRORED_SFRS: &[u16] = &[0x00, 0x02, 0x03, 0x04, 0x0A, 0x0B];
 const MIRRORED_SFRS_PIC14E: &[u16] = &[
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
 ];
+
+/// Baseline's mirrored block: the whole SFR map (INDF, TMR0, PCL, STATUS,
+/// FSR, OSCCAL, GPIO) repeats in every bank (DS41236E Figure 4-4; gputils'
+/// `12f509_g.lkr` declares the same range as a protected `SHAREBANK sfrs`).
+/// Core architecture, not device data: identical on the 508 and 16F505.
+const MIRRORED_SFRS_PIC_BASELINE: &[u16] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06];
+
 include!(concat!(env!("OUT_DIR"), "/devices.rs"));
 
 /// Resolve a device by any spelling the toolchain ecosystem uses.
@@ -147,12 +162,14 @@ impl Device {
         }
         if addr < self.gpr_start() {
             // SFR range, below the first GPR bank. The mirrored core
-            // register block differs per core (classic PIC14's six registers
-            // vs PIC14E's full 0x00-0x0B, confirmed against DS41364E Table
-            // 3-3); any other bank-0 SFR (PORTA 0x05, TMR0 0x01, ...) exists
-            // solely in bank 0, so it needs RP1:RP0 = 0.
+            // register block differs per core (classic PIC14's six registers,
+            // PIC14E's full 0x00-0x0B per DS41364E Table 3-3, baseline's
+            // whole 0x00-0x06 SFR map); any other bank-0 SFR (PORTA 0x05,
+            // TMR0 0x01, ...) exists solely in bank 0, so it needs
+            // RP1:RP0 = 0.
             let mirrored = match self.core {
                 Core::Pic14e => MIRRORED_SFRS_PIC14E,
+                Core::PicBaseline => MIRRORED_SFRS_PIC_BASELINE,
                 _ => MIRRORED_SFRS,
             };
             return if mirrored.contains(&addr) {
@@ -177,6 +194,14 @@ impl Device {
                 Some((addr >> 7) as u8)
             }
             Core::Pic18 => panic!(
+                "device: 0x{addr:03X} is not a banked GPR address on {}",
+                self.name
+            ),
+            Core::PicBaseline => panic!(
+                // Baseline GPRs live in ram_banks and the shared window;
+                // what falls through here is a gap or the protected bank-1
+                // mirror of the 0x00-0x0F block (0x20-0x2F, gputils
+                // `12f509_g.lkr`), which the allocator must never emit.
                 "device: 0x{addr:03X} is not a banked GPR address on {}",
                 self.name
             ),

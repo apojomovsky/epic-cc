@@ -126,19 +126,58 @@ fn by_name_resolves_both_devices() {
 
 #[test]
 fn all_contains_every_seed_device() {
-    assert_eq!(device::ALL.len(), 10);
+    assert_eq!(device::ALL.len(), 11);
     assert!(device::ALL.iter().any(|d| d.name == "p16f877a"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f4550"));
     assert!(device::ALL.iter().any(|d| d.name == "p16f887"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f2550"));
     for stem in [
-        "p16f1933", "p16f1934", "p16f1936", "p16f1937", "p16f1938", "p16f1939",
+        "p16f1933", "p16f1934", "p16f1936", "p16f1937", "p16f1938", "p16f1939", "p12f509",
     ] {
         assert!(
             device::ALL.iter().any(|d| d.name == stem),
             "{stem} missing from ALL"
         );
     }
+}
+
+#[test]
+fn pic12f509_carries_the_baseline_profile() {
+    let dev = device::by_name("p12f509").unwrap();
+    assert_eq!(dev.core, Core::PicBaseline);
+    assert_eq!(dev.flash_words, 1024);
+    assert_eq!(dev.stack_depth, 2);
+    assert_eq!(dev.fsr_bank_bits, 1);
+    assert_eq!(dev.interrupt_vectors, &[][..]);
+    assert_eq!(dev.ram_banks, &[(0x10, 0x1F), (0x30, 0x3F)][..]);
+    assert_eq!(dev.common_ram, Some((0x07, 0x0F)));
+}
+
+#[test]
+fn pic12f509_bank_of_knows_the_shared_window_and_both_banks() {
+    // DS41236E Figure 4-4: the SFR block 0x00-0x06 and the shared GPR
+    // 0x07-0x0F are mirrored in both banks; bank 0 owns 0x10-0x1F and
+    // bank 1 owns 0x30-0x3F (bank select = FSR<5>, fsr_bank_bits = 1).
+    let dev = device::by_name("p12f509").unwrap();
+    for addr in 0x00..=0x0F {
+        assert_eq!(
+            dev.bank_of(addr),
+            None,
+            "0x{addr:02X} must be bank-independent on the 509"
+        );
+    }
+    assert_eq!(dev.bank_of(0x10), Some(0));
+    assert_eq!(dev.bank_of(0x1F), Some(0));
+    assert_eq!(dev.bank_of(0x30), Some(1));
+    assert_eq!(dev.bank_of(0x3F), Some(1));
+}
+
+#[test]
+#[should_panic(expected = "not a banked GPR address")]
+fn pic12f509_bank_of_refuses_the_protected_alias_window() {
+    // 0x20-0x2F is the bank-1 view of the mirrored 0x00-0x0F block
+    // (gputils: protected SHAREBANK); it has no canonical GPR meaning.
+    device::by_name("p12f509").unwrap().bank_of(0x25);
 }
 
 #[test]

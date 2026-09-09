@@ -30,6 +30,12 @@ fn devices_under_test() -> Vec<&'static device::Device> {
 #[test]
 fn alloc_empty_prog_does_not_panic() {
     for dev in devices_under_test() {
+        // alloc refuses pic-baseline until its allocation model lands
+        // with the backend (docs/37 P2); the driver firewall already
+        // keeps real programs from reaching it.
+        if dev.core == device::Core::PicBaseline {
+            continue;
+        }
         let m = ir::parse("fn main(void) ()\n  block entry:\n    ret void\n");
         let _ = alloc::allocate(dev, &m, "depth 1\n");
     }
@@ -38,6 +44,11 @@ fn alloc_empty_prog_does_not_panic() {
 #[test]
 fn eighty_byte_global_lands_in_ram_banks() {
     for dev in devices_under_test() {
+        // Same refusal as the empty-program check: no baseline
+        // allocation model until docs/37 P2.
+        if dev.core == device::Core::PicBaseline {
+            continue;
+        }
         let mut m = ir::parse("global big i8\nfn main(void) ()\n  block entry:\n    ret void\n");
         // Force an 80-byte global (covers the first PIC14 bank exactly: 0x20-0x6F).
         m.globals[0].size = 80;
@@ -64,6 +75,12 @@ fn eighty_byte_global_lands_in_ram_banks() {
 #[test]
 fn asm_flash_bound_accepts_tiny_program() {
     for dev in devices_under_test() {
+        // The baseline encoder does not exist yet (docs/37 P1); the
+        // firewall panic is the deliberate refusal, so the flash-bound
+        // check cannot run for that core until the encoder lands.
+        if dev.core == device::Core::PicBaseline {
+            continue;
+        }
         // Minimal program: one NOP at org 0. NOP (0x0000) is valid on both
         // PIC14 and PIC18 and avoids label resolution (GOTO with a literal
         // trips the PIC18 label table).

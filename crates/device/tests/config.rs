@@ -1,4 +1,4 @@
-use device::{resolve_config, PIC16F1937, PIC16F877A, PIC18F4550};
+use device::{resolve_config, PIC12F509, PIC16F1937, PIC16F877A, PIC18F4550};
 
 #[test]
 fn erased_baseline_is_the_datasheet_stated_value() {
@@ -88,6 +88,21 @@ fn pic14e_config_words_resolve_against_the_datasheet_layout() {
     // DEBUG and the unimplemented bit 11 stay at their erased 1s |
     // LVP=off (0).
     assert_eq!(bytes[3], 0x1A);
+}
+
+#[test]
+fn pic12f509_config_word_resolves_against_the_datasheet_layout() {
+    // DS41227B Figure 4-1: FOSC1:FOSC0 (bits 1:0, 00=LP 01=XT 10=INTOSC
+    // 11=EXTRC), WDTE (2), CP (3, active low), MCLRE (4); bits 11-5
+    // unimplemented, read 1, so the erased word is 0x0FFF. The word lives
+    // at HEX word 0xFFF (byte 0x1FFE), per p12f509.inc and gpasm 1.5.2.
+    assert_eq!(PIC12F509.config.base_byte_addr, 0x1FFE);
+    assert_eq!(PIC12F509.config.num_bytes, 2);
+    assert_eq!(PIC12F509.config.erased_baseline, &[0xFF, 0x0F]);
+    // osc=intosc sets bits 1:0 to 10; wdt=off clears bit 2; cp=off and
+    // mclre=on leave their erased 1s (bits 3-4): 0x0FFA.
+    let bytes = resolve_config(&PIC12F509.config, "osc=intosc, wdt=off, cp=off, mclre=on");
+    assert_eq!(bytes, &[0xFA, 0x0F]);
 }
 
 #[test]

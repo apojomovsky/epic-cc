@@ -22,6 +22,7 @@ const WIDE_BANKS: Device = Device {
     access_bank: None,
     fixed_retval: None,
     stack_depth: 8,
+    fsr_bank_bits: 0,
     interrupt_vectors: &[0x0004],
     config: ConfigRegion {
         base_byte_addr: 0x400E,

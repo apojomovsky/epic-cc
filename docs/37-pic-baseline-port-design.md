@@ -226,28 +226,32 @@ core = "pic-baseline"
 flash_words = 1024           # DS41236E §4.1, page 17: 1K x 12, physically implemented
 ram_banks = [ ... ]          # 0x07-0x0F unbanked (9 GPR); 0x10-0x1F bank 0 / 0x30-0x3F
                               # bank 1 (16 GPR each), DS41236E Figure 4-4, page 19
-common_ram = [0x00, 0x06]    # SFRs mirror across banks (DS41236E Figure 4-4 note);
-                              # [VERIFY]: "common_ram" today means PIC14's BANKSEL-free
-                              # window, semantically different from "SFRs happen to
-                              # mirror"; may need its own field, not reuse of this one
-stack_depth = 2               # DS41236E §4.8, page 27, "2-deep, 12-bit wide hardware
-                              # PUSH/POP stack"
-interrupt_vectors = []        # no interrupts on this core, DS41236E §7.0
-```
+common_ram = [0x07, 0x0F]    # RESOLVED in P0 (epic-cc#323): the sketch's
+                              # [0x00, 0x06] would mark SFR space
+                              # allocatable; the field means the
+                              # allocatable BANKSEL-free window, which on
+                              # the 509 is the 9 shared GPR at 0x07-0x0F
+                              # (gputils' unprotected SHAREBANK
+                              # `gprnobnk`). The SFR mirror at 0x00-0x06
+                              # is core architecture, modelled in
+                              # `bank_of`'s mirrored block like PIC14E's.
 
-`fsr_bank_bits` (or similar, name TBD) likely needs to be a new field:
+`fsr_bank_bits` (name settled in P0) is a new field:
 how many of `FSR`'s high bits are bank-select (0 for 508, 1 for 509, 2
 for 16F505); this is a real per-device fact the way `stack_depth` and
 `ram_banks` are, not a derived quantity.
 
-**[VERIFY] before this table is trusted:** the config word's actual
-memory address (DS41236E says it is "not user addressable during
-device operation" and defers to `DS41227`/`DS41226`, the Memory
-Programming Specifications, neither vendored yet) and the exact
-GPR-only-vs-includes-INDF/TMR0/PCL/STATUS/FSR/OSCCAL/GPIO counting
-convention `ram_banks` uses elsewhere in this registry (read
-`crates/device/devices/p16f877a.toml` before copying this sketch
-literally).
+**[VERIFY] items resolved in P0 (epic-cc#323).** The config word's
+address: DS41227B section 2.3 places it at 0x7FF in the 509's config
+memory space (0x3FF for the 508), unreachable at runtime; the HEX
+convention of MPASM and gputils (`p12f509.inc`'s
+`_CONFIG EQU 0FFFh`, `.config 0xFFF` in the `.lkr`, confirmed byte for
+byte against a gpasm 1.5.2 probe) is word 0xFFF, byte 0x1FFE, which is
+what `base_byte_addr` models, exactly as word 0x2007 models the PIC14's.
+Both sources and the bit layout (DS41227B Figure 4-1) are cited in the
+TOML's comments. The `ram_banks` counting question dissolved the same
+way: the shipped convention is allocatable GPR only, and gputils' own
+`.lkr` draws the same three regions the datasheet does.
 
 ### D-4: Call-depth 2, reject not inline, matching existing policy
 
@@ -343,9 +347,12 @@ Still open:
 2. D-1's crate-sharing question (does `isel-pic-baseline` share more
    with `isel` or is it closer to clean-room), not resolved, needs a
    prototype or closer read, not blocking approval to start P0/P1.
-3. D-3's device-profile `[VERIFY]` items (config word address, the
-   `common_ram` field's semantics for this core), blocks P0, not the
-   overall design.
+3. ~~D-3's device-profile `[VERIFY]` items~~: resolved in P0
+   (epic-cc#323). Config word: 0x7FF in the 509's config memory space per
+   DS41227B section 2.3, HEX word 0xFFF per the MPASM/gputils convention
+   (gpasm-verified); `common_ram` keeps its allocatable-window meaning
+   (0x07-0x0F shared GPR), and the SFR mirror is core architecture in
+   `bank_of`, not device data. Resolutions cited in the TOML and D-3.
 4. P7's `[VERIFY]`: with 25-41 bytes of GPR total, does IEEE-754
    single-precision soft-float have anywhere to live at all? This is
    a real, unresolved feasibility question the phase table raises and

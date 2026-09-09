@@ -177,6 +177,12 @@ fn compile_sdcc(
         // libs live in the non-free dir as `pic16<rest>.lib`, same naming
         // as classic pic14.
         device::Core::Pic14e => ("pic14", device.name.to_lowercase()),
+        // SDCC has no baseline PIC support at all (docs/35 / docs/37), so a
+        // baseline device never reaches the SDCC runner.
+        device::Core::PicBaseline => panic!(
+            "sdcc-parity: {} is pic-baseline; SDCC cannot target this core",
+            device.name
+        ),
     };
     // SDCC device names drop the leading `p` (p16f877a -> 16f877a).
     let sdcc_mcu = mcu.strip_prefix('p').unwrap_or(&mcu).to_string();
@@ -427,6 +433,10 @@ fn run_sim(
             require_halt(p.halted(), device, max_steps)?;
             (steps, p.ram().to_vec())
         }
+        device::Core::PicBaseline => panic!(
+            "sdcc-parity: {} is pic-baseline; SDCC cannot target this core",
+            device.name
+        ),
     };
 
     // Live RAM bytes at the halt: the only RAM measure computable
