@@ -114,6 +114,7 @@ pub fn legalize(m: Module) -> Module {
             params: f.params,
             blocks,
             isr: f.isr,
+            irq_priority: f.irq_priority,
             naked: f.naked,
             variadic: f.variadic,
         });
@@ -2260,6 +2261,7 @@ fn routine_func(name: &str) -> Func {
             })],
         }],
         isr: false, // runtime routines stay outside the interrupt context
+        irq_priority: 0,
         naked: false,
         variadic: false,
     }

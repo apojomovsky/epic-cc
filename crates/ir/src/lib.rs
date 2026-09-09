@@ -444,6 +444,11 @@ pub struct Func {
     /// position). Serialized as a `[isr]` marker between the ret group and
     /// the params group: `fn isr(void) [isr] ()`.
     pub isr: bool,
+    /// Interrupt priority from clang's `"interrupt"="N"` function
+    /// attribute (0 = compatibility single-vector mode, 1 = high,
+    /// 2 = low). Meaningful only when `isr`. Serialized as `[irq1]` /
+    /// `[irq2]` markers next to `[isr]`; absent means 0.
+    pub irq_priority: u8,
     pub naked: bool,
     /// True for a variadic function (`fn f(...)` in the .ll prototype): a
     /// callee that reads extra args through `va_arg`. Its calls may pass
@@ -594,6 +599,11 @@ pub fn serialize(m: &Module) -> String {
         let mut markers = String::new();
         if f.isr {
             markers.push_str(" [isr]");
+        }
+        match f.irq_priority {
+            1 => markers.push_str(" [irq1]"),
+            2 => markers.push_str(" [irq2]"),
+            _ => {}
         }
         if f.naked {
             markers.push_str(" [naked]");
@@ -1020,6 +1030,13 @@ pub fn parse(text: &str) -> Module {
             let before_params = &after[..p_open];
             let isr = before_params.contains("[isr]");
             let naked = before_params.contains("[naked]");
+            let irq_priority = if before_params.contains("[irq1]") {
+                1
+            } else if before_params.contains("[irq2]") {
+                2
+            } else {
+                0
+            };
             let p_close = matching_paren(after, p_open);
             let p_str = &after[p_open + 1..p_close];
             let ret = if ret_str == "void" || ret_str.is_empty() {
@@ -1052,6 +1069,7 @@ pub fn parse(text: &str) -> Module {
                 params,
                 blocks: Vec::new(),
                 isr,
+                irq_priority,
                 naked,
                 variadic,
             });
