@@ -1,13 +1,11 @@
 #!/usr/bin/env bash
 # SDCC regression-suite pass rate (docs/35 section 4, Tier 3): runs SDCC's
-# own vendored regression suite for the pic14 and pic16 ports under SDCC
-# (gpsim as the port emulator), parses each port's aggregate summary, and
-# reports the pass rate as context next to the parity table. The suite is
-# GPL and lives in the image only (PIC8_SDCC_REGRESSION); nothing here is
-# committed or shipped. The pass rate is informational, never a gate:
-# SDCC's own pic ports have acknowledged bugs (docs/35 section 1). Usage:
-#   docker run --rm -v "$PWD:/workspace" -w /workspace epic-cc-ci:latest \
-#     bash scripts/sdcc-regression.sh
+# own vendored regression suite for the pic14 and pic16 ports under gpsim
+# and reports the pass rate as context next to the parity table. The suite
+# is GPL and lives in the image only (PIC8_SDCC_REGRESSION); nothing here
+# is committed or shipped. Informational, never a gate: SDCC's pic ports
+# have acknowledged bugs (docs/35 section 1). Run inside the image from the
+# mounted /workspace: bash scripts/sdcc-regression.sh
 
 set -euo pipefail
 
@@ -48,9 +46,11 @@ for port in pic14 pic16; do
   cat "$sum"
 done
 
-# Write a pass-rate line to the step summary next to the parity table,
-# stamped with the SDCC version (provenance, docs/35 section 7).
-if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+# Write a pass-rate line next to the parity table, stamped with the SDCC
+# version (provenance, docs/35 section 7). GITHUB_STEP_SUMMARY is a
+# runner-host path not mounted into the container, so we write to a file
+# in the bind-mounted /workspace and let the host step append it.
+if [ -n "${SUMMARY_FILE:-}" ]; then
   {
     echo ""
     echo "### SDCC regression-suite pass rate"
@@ -69,5 +69,5 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
         echo "- $port: $pass% pass ($failures failures / $tests tests)"
       fi
     done
-  } >> "$GITHUB_STEP_SUMMARY"
+  } >> "$SUMMARY_FILE"
 fi

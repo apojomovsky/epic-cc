@@ -29,7 +29,10 @@ echo "$out"
 
 # Write the tool versions, per-program table and aggregate ratios to the
 # step summary (the versions line stamps the table, docs/35 section 7).
-if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+# GITHUB_STEP_SUMMARY is a runner-host path not mounted into the
+# container, so write to a file in the bind-mounted /workspace and let
+# the host step append it.
+if [ -n "${SUMMARY_FILE:-}" ]; then
   {
     echo "$out" | grep -o 'versions: .*' | head -1 | sed 's/^/`/;s/$/`/' || true
     echo ""
@@ -39,5 +42,5 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
       -e 's/^PASS ([^ ]+) on ([^:]+): epic ([0-9]+)w\/([0-9]+)B\/([0-9]+)cyc sdcc ([0-9]+)w\/([0-9]+)B\/([0-9]+)cyc$/| \1 | \2 | \3 | \6 | \4 | \7 | \5 | \8 | PASS |/' \
       -e 's/^EXCLUDED ([^ ]+) on ([^ ]+) \(([^)]*)\).*/| \1 | \2 | - | - | - | - | - | - | \3 |/' || true
     echo "$out" | grep -E '^aggregate' | sed 's/^/`/;s/$/`/' || true
-  } >> "$GITHUB_STEP_SUMMARY"
+  } >> "$SUMMARY_FILE"
 fi

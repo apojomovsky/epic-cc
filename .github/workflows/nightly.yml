@@ -124,8 +124,16 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace \
             -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-            -e GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            -e SUMMARY_FILE=/workspace/sdcc-parity-summary.md \
             epic-cc-ci:latest bash scripts/sdcc-parity.sh
+
+      # The container writes the parity table to a file in the mounted
+      # /workspace (GITHUB_STEP_SUMMARY is a runner-host path, never visible
+      # inside the container); append it to the step summary here on host.
+      - name: Append SDCC parity table to step summary
+        run: |
+          cat sdcc-parity-summary.md >> "$GITHUB_STEP_SUMMARY"
+          rm -f sdcc-parity-summary.md
 
       # See devices-all's same-named step above.
       - name: Fix target dir ownership (container runs as root)
@@ -160,5 +168,13 @@ jobs:
       - name: Run the SDCC regression suite and report pass rate
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace \
-            -e GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            -e SUMMARY_FILE=/workspace/sdcc-regression-summary.md \
             epic-cc-ci:latest bash scripts/sdcc-regression.sh
+
+      # The container writes its summary block to a file in the mounted
+      # /workspace (GITHUB_STEP_SUMMARY is a runner-host path, never visible
+      # inside the container); append it to the step summary here on host.
+      - name: Append SDCC regression pass rate to step summary
+        run: |
+          cat sdcc-regression-summary.md >> "$GITHUB_STEP_SUMMARY"
+          rm -f sdcc-regression-summary.md
