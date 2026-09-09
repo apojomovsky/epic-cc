@@ -4,7 +4,7 @@
 //! so the image is resized to include it); PIC18 and PIC14E write config
 //! words as a separate region through `asm::to_hex_regions`, which emits
 //! the `:04` extended-linear-address record a config base above 0xFFFF
-//! needs (PIC14E's CONFIG1/CONFIG2 live at byte 0x1000E, D-3).
+//! needs (PIC14E's CONFIG1/CONFIG2 live at byte 0x1000E, docs/33 §3).
 
 use device::{Core, Device};
 

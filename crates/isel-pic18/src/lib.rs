@@ -1,14 +1,11 @@
-//! `isel-pic18`: instruction selection for the PIC18 integer spine (P2),
-//! extended by P3 (pointers, arrays, structs) and P4 (`const` in flash via
-//! `TBLRD`). See docs/29-pic18-port-design.md §4 for phasing, and
-//! docs/adr/ADR-009-pic18-pointer-model.md (P3) and
-//! docs/adr/ADR-010-pic18-const-tblrd.md (P4: `const` globals read via
-//! `TBLRD`, the 511-byte `RETLW` ceiling of PIC14 is gone, stores through
-//! a `const` base panic loudly).
-//! A separate crate from `isel` per docs/29-pic18-port-design.md §2 D-1:
-//! the instruction sets differ enough that sharing would leak an
-//! abstraction, and PIC14's working code must never be at risk from a
-//! PIC18 edit.
+//! `isel-pic18`: instruction selection for the PIC18 integer spine,
+//! extended by the pointer lowering (pointers, arrays, structs) and
+//! the flash const (`const` in flash via `TBLRD`). See docs/29 §4
+//! for phasing, ADR-009, and ADR-010. `const` globals read via
+//! `TBLRD`: the 511-byte `RETLW` ceiling of PIC14 is gone, and
+//! stores through a `const` base panic: ROM is not writable.
+//! A separate crate from `isel` per docs/29 §2: the instruction sets
+//! differ enough that sharing leaks an abstraction and risks PIC14.
 
 use std::collections::{HashMap, HashSet};
 
@@ -22,7 +19,7 @@ use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 /// `ACCESSBANK` region, `accesssfr`, on both devices this core ships).
 /// Unlike the low segment's `0x00-0x5F` (`Device::access_bank`, real
 /// per-device data), the schema has no field for this because nothing has
-/// needed one yet: it is architecture, not silicon (epic-cc#226 audit).
+/// needed one: it is architecture, not silicon. (epic-cc#226)
 const PIC18_SFR_ACCESS_LO: u16 = 0xF60;
 
 /// The result of resolving a pointer to a concrete access. `Direct`: the
@@ -39,31 +36,28 @@ struct Gen<'m> {
     addrs: &'m HashMap<String, u16>,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)` by `iselcore::resolve_pointers`; see
-    /// docs/adr/ADR-009-pic18-pointer-model.md.
+    /// ADR-009.
     resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
-    /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from
-    /// `device.fixed_retval`)  -  see the plan's "Where the retval/scratch
-    /// design comes from" section.
+    /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from `device.fixed_retval`).
+    /// Holds call results independent of the bank selection.
     retval_lo: u16,
     /// The access bank's high bound (from `device.access_bank`), soft-float
     /// runtime routines' frame-fits-in-the-access-bank assertions bound
     /// against. Every classic PIC18 device has shared this exact value
-    /// (`0x5F`) so far (epic-cc#226 audit), but it is device data, not an
-    /// architectural constant guaranteed for every future PIC18 part.
+    /// (`0x5F`) so far, but it is device data, not an
+    /// architectural constant guaranteed for every future PIC18 part. (epic-cc#226)
     access_bank_hi: u16,
     /// The `BSR` value the last-emitted `MOVLB` set, or `None` when it's
-    /// unknown (module start, or just after a label  -  branch targets can
+    /// unknown (module start, or just after a label: branch targets can
     /// be reached with any prior `BSR` state, so it must be re-established
     /// on the next banked access rather than assumed).
     bsr: Option<u8>,
     cur_func: &'m str,
-    /// True when this function is an interrupt handler: the function body
-    /// runs with a save prologue / restore epilogue and `RETFIE` instead of
-    /// a plain `RETURN` (P5, single-vector compatibility mode).
+    /// Marks an interrupt handler: the body runs a save prologue and restore
+    /// epilogue with `RETFIE` instead of `RETURN` (the single-vector mode).
     isr: bool,
-    /// Module-scoped fresh-label counter, shared across every function so
-    /// the emitted `tmp{n}:` labels stay unique in the single `.asm`
-    /// output (mirrors `isel`'s `tmp` field, `crates/isel/src/lib.rs:177`).
+    /// Shares one module-scoped label counter across functions so `tmp{n}:`
+    /// labels stay unique in the single output. Mirrors the `isel` counter.
     tmp: &'m mut u32,
     /// The source location of the instruction currently being emitted, or
     /// `None` for compiler-generated glue (prologue, `__start`, const
@@ -82,30 +76,12 @@ impl<'m> Gen<'m> {
         self.locs.push(self.cur_loc.clone());
     }
 
-    /// Emit a label line AND reset the tracked `BSR` (`self.bsr = None`).
-    /// Every label in this file  -  a real block label, a fresh
-    /// `Select`/`Icmp` branch target, or a synthesized phi-copy label
-    /// is a place code from more than one preceding path can land, and
-    /// each of those paths may have executed a different subset of the
-    /// `MOVLB`s that led here (or none at all). `operand()`'s `MOVLB`
-    /// elision is only sound when `self.bsr` reflects what's ACTUALLY
-    /// true on every path reaching the current point, so any label must
-    /// reset it  -  trusting a stale tracked value across a branch target
-    /// has been the exact root cause of three separate miscompile bugs
-    /// found across this task's review rounds (`Select`'s `l_else` and
-    /// `l_end`, `BrCond`'s synthesized `l_fcopies`, and  -  narrower, but
-    /// the same class  -  `emit_icmp_i16`'s shared `l_true`/`l_false`).
-    /// This helper makes the reset structural instead of a fact every
-    /// label call site has to individually remember: every
-    /// `self.emit(format!("{{...}}:"))`/`g.emit(format!("{{...}}:"))` in
-    /// this file routes through this instead.
-    ///
-    /// Labels are not the ONLY BSR-clobbering join point, though: a
-    /// `CALL` return is another one (the callee runs its own arbitrary
-    /// `MOVLB`s and never restores the caller's bank on `RETURN`), but it
-    /// is not itself a label, so it structurally cannot go through this
-    /// helper  -  `Inst::Call`'s arm in `emit_inst` resets `self.bsr`
-    /// directly right after emitting `CALL`.
+    /// Emit a label line and clear the tracked `BSR`.
+    /// Every label joins paths with different `MOVLB` histories, so reusing
+    /// a stale tracked bank miscompiles: the reset stays structural here
+    /// rather than repeated at each call site.
+    /// `CALL` returns join the same way but are not labels, so the call
+    /// arm clears `self.bsr` directly after emitting `CALL`.
     fn emit_label(&mut self, label: &str) {
         self.emit(format!("{label}:"));
         self.bsr = None;
@@ -200,7 +176,7 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel-pic18: no address for @{name}"))
     }
 
-    /// Whether `name` is a `const` (flash) global: read via `TBLRD`, never
+    /// Reports whether `name` is a `const` (flash) global: read via `TBLRD`, never
     /// via a RAM address. `alloc` already excludes const globals from the
     /// address map (`const <name>` lines, no address), so this is the only
     /// signal `isel-pic18` needs to route a load to the flash path.
@@ -217,10 +193,10 @@ impl<'m> Gen<'m> {
             .map(|g| g.is_const)
             .unwrap_or(false)
     }
-    /// Whether `name` is a function (a valid indirect-call target) rather
+    /// Reports whether `name` is a function (a valid indirect-call target) rather
     /// than a RAM/const global. A function's address is a link-time label
     /// literal, materialized as LOW/HIGH bytes, never looked up in the
-    /// address map (epic-cc#73).
+    /// address map. (epic-cc#73)
     fn is_function(&self, name: &str) -> bool {
         self.m.funcs.iter().any(|f| f.name == name)
     }
@@ -276,7 +252,7 @@ impl<'m> Gen<'m> {
     /// A literal pointer is either an access-bank GPR address (`0x000-
     /// 0x05F`, `a=0`) or an SFR address (`0xF60-0xFFF`, `a=0`): both need
     /// no `BSR` select, which is what makes direct SFR access one
-    /// instruction. An address past the 12-bit data space panics loudly.
+    /// instruction. An address past the 12-bit data space panics.
     fn literal_ptr_addr(&self, ptr: &str) -> u16 {
         let h = ptr
             .strip_prefix("0x")
@@ -295,8 +271,8 @@ impl<'m> Gen<'m> {
     /// result and every byval/sret/alloca seed resolves; a plain (not
     /// byval, not sret) pointer PARAMETER never does, since its value is a
     /// runtime address handed in by the caller with no compile-time base
-    /// to fold, which `resolve_pointers` has no case for yet (P3 scope: see
-    /// ADR-009). Panics loudly rather than silently emitting a bogus
+    /// to fold, which `resolve_pointers` has no case for (the pointer lowering scope: see
+    /// ADR-009). Panics rather than silently emitting a bogus
     /// access.
     fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
         let key = ssa_key(self.cur_func, r);
@@ -309,7 +285,7 @@ impl<'m> Gen<'m> {
         })
     }
 
-    /// Whether pointer-select dst `name` was seeded by iselcore as an
+    /// Reports whether pointer-select dst `name` was seeded by iselcore as an
     /// indirect slot (`Base::Slot(_, true)`): its bytes are a runtime
     /// address VALUE the select must materialize, not a folded pointer.
     fn select_is_seeded(&self, name: &str) -> bool {
@@ -319,24 +295,13 @@ impl<'m> Gen<'m> {
         )
     }
 
-    /// The `,A`/`,B` operand components `(a, f)` for a physical address
-    /// used by a `W`-routing instruction (`ADDWF`/`SUBWF`/.../`CPFSxx`/
-    /// `MOVWF`), emitting `MOVLB` first if the tracked `BSR` doesn't
-    /// already match. PIC18's Access Bank is TWO disjoint ranges: the low
-    /// general-purpose segment (`0x000-0x05F`) and the high SFR segment
-    /// (`0xF60-0xFFF`, every SFR, including
-    /// FSR0L/FSR0H/FSR1L/FSR1H/FSR2L/FSR2H, lives here), BOTH always
-    /// reachable via `a=0` with no `MOVLB`, regardless of `BSR`. Only the
-    /// MIDDLE range (`0x060-0xF5F`, ordinary banked GPR) needs a bank
-    /// select. Getting this wrong for the SFR segment would emit a
-    /// `MOVLB` before every FSR-setup write and address FSRnL/FSRnH as
-    /// `,B`, architecturally wrong; hardware requires `,A` for the SFR
-    /// segment unconditionally.
-    ///
-    /// `MOVFF`-based plain copies (`emit_copy_byte`, above) never call
-    /// this: they take full 12-bit addresses directly and need no bank
-    /// bit at all, which is why `Load`/`Store`/`Phi`-copies/`Call`-arg-
-    /// copies never touch `BSR`.
+    /// Returns the `(a, f)` components for a `W`-routing instruction,
+    /// emitting `MOVLB` when the tracked `BSR` mismatches.
+    /// Both Access Bank ranges (`0x000-0x05F` and `0xF60-0xFFF`) use `a=0`
+    /// with no `MOVLB`; only `0x060-0xF5F` needs a bank select. The SFR
+    /// segment holds FSRnL/FSRnH, so hardware requires `a=0` there.
+    /// `MOVFF` copies bypass this helper: they carry full 12-bit addresses
+    /// and need no bank bit, so `Load`/`Store`/phi/`Call` copies never touch `BSR`.
     fn operand(&mut self, addr: u16) -> (u16, u16) {
         if addr <= self.access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
             (0, addr & 0xFF)
@@ -350,7 +315,7 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// One byte, memory-to-memory, via `MOVFF`  -  no access bit, no `BSR`.
+    /// One byte, memory-to-memory, via `MOVFF`: no access bit, no `BSR`.
     fn emit_copy_byte(&mut self, src: u16, dst: u16) {
         self.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
     }
@@ -360,8 +325,8 @@ impl<'m> Gen<'m> {
     /// link-time address as two literals, a `Reg` copies the two bytes of
     /// its runtime-address slot (a seeded select dst, an IntToPtr dst, or
     /// a pointer param). Used by the pointer-select materialization
-    /// (epic-cc#147); a reg with dynamic terms is a computed address with
-    /// no single materializable value and panics.
+    /// A reg with dynamic terms is a computed address with
+    /// no single materializable value and panics. (epic-cc#147)
     fn emit_move_addr_to_slot(&mut self, val: &Val, dst: u16) {
         match val {
             Val::Const(k) => {
@@ -435,10 +400,10 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Copy `val` (width `ty.bytes()`) into the slot starting at `dst`. A
+    /// Copy `val` (width `ty.bytes`) into the slot starting at `dst`. A
     /// register/global source uses `MOVFF` (no access bit needed); a
     /// constant has no `MOVFF` literal form, so it goes through `W` via
-    /// `MOVLW`/`MOVWF` (which DOES need the access bit  -  this is the one
+    /// `MOVLW`/`MOVWF` (which DOES need the access bit: this is the one
     /// place a plain copy still touches `operand`/`BSR`).
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
         match val {
@@ -462,12 +427,12 @@ impl<'m> Gen<'m> {
                     .cloned()
                     .unwrap();
                 // A global's address is a link-time constant. ipsccp
-                // (epic-cc#193) can propagate a global argument into a
+                // can propagate a global argument into a
                 // helper's pointer parameter, so a GEP over it resolves
                 // here to `Base::Global`, not a slot. Its base bytes are
                 // literals (`MOVLW`), not a `MOVF` read, so it needs its
                 // own arm, mirroring `emit_move_addr_to_slot`'s above plus
-                // the slot case's k/terms folding.
+                // the slot case's k/terms folding. (epic-cc#193)
                 if let iselcore::Base::Global(name) = &base {
                     assert!(
                         k == 0 || terms.is_empty(),
@@ -584,7 +549,7 @@ impl<'m> Gen<'m> {
             }
             Val::Global(g) if self.is_function(g) => {
                 // A function's address is a link-time label literal: byte 0
-                // = LOW(g), byte 1 = HIGH(g) (epic-cc#73).
+                // = LOW(g), byte 1 = HIGH(g). (epic-cc#73)
                 for i in 0..ty.bytes() {
                     let lit = if i == 0 { "LOW" } else { "HIGH" };
                     self.emit(format!("    MOVLW {lit}({g})"));
@@ -597,7 +562,7 @@ impl<'m> Gen<'m> {
                 // A data global in value position is a pointer ADDRESS (a
                 // `store ptr @g, ...` or a pointer phi incoming; clang
                 // always loads scalar globals first): materialize it as two
-                // literals, never copy the pointee's contents (epic-cc#155).
+                // literals, never copy the pointee's contents. (epic-cc#155)
                 let addr = self.global_addr(g);
                 for i in 0..ty.bytes() {
                     let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
@@ -621,9 +586,9 @@ impl<'m> Gen<'m> {
     /// layer). `Val::Reg` looks up the pointer's fold via `resolved_for`:
     /// a `Base::Global`/`Base::Slot(_, false)` (byval/alloca, the slot
     /// itself IS the object) with no dynamic terms is a plain direct
-    /// address; with dynamic terms it needs FSR0 (Task 6). A
+    /// address; with dynamic terms it needs FSR0 (the dynamic-pointer setup). A
     /// `Base::Slot(_, true)` (sret, the slot holds a target ADDRESS, not
-    /// the object) always needs FSR0, regardless of terms (Task 7).
+    /// the object) always needs FSR0, regardless of terms (the sret-address setup).
     fn emit_ptr_setup(&mut self, ptr: &Val, byte_off: u8) -> Addr {
         match ptr {
             Val::Global(g) => Addr::Direct(self.global_addr(g) + u16::from(byte_off)),
@@ -786,17 +751,11 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Set `FSR0 = base_addr + k + Σ scale×%reg + byte_off` and leave the
-    /// access to go through `INDF0` (0xFEF). `LFSR` seeds the STATIC part
-    /// (`base_addr + k + byte_off`, all known at codegen time: one
-    /// two-word instruction, no addressing-mode complexity at all); the
-    /// dynamic term, if any, is then added onto `FSR0L`/`FSR0H` with
-    /// carry via `ADDWF`/`ADDWFC` (both routed through `operand()`, which
-    /// Task 2 taught to recognize FSR0L/FSR0H as the always-access-bank
-    /// SFR segment, so no `MOVLB` is ever emitted for these two writes).
-    ///
-    /// `terms.len() > 1` is out of scope for P3 (see this plan's Scope
-    /// boundary) and panics loudly rather than silently dropping a term.
+    /// Sets `FSR0 = base_addr + k + term + byte_off` for `INDF0` access.
+    /// `LFSR` seeds the static part in one instruction; a dynamic term folds
+    /// in via `ADDWF`/`ADDWFC` through `operand()`, which treats FSR0L/FSR0H
+    /// as the always-access-bank SFR segment, so no `MOVLB` emits.
+    /// Panics on multiple terms: dropping a term silently miscompiles (see ADR-009).
     fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
         assert!(
             terms.len() <= 1,
@@ -927,7 +886,7 @@ impl<'m> Gen<'m> {
     /// ADDWFC TBLPTRH,F; ADDWFC TBLPTRU,F`, plus (for a 16-bit index
     /// register) the high byte added onto `TBLPTRH` with its own carry.
     /// `MOVLW` never touches C, so the ADDWF-set carry survives into the
-    /// `ADDWFC`s, the same discipline P3's `add_term_to_fsr0` relies on.
+    /// `ADDWFC`s, the same discipline the pointer lowering's `add_term_to_fsr0` relies on.
     /// A 16-bit index needs its high byte folded in or `table[0x1XX]`
     /// reads the wrong byte, which is why `reg_width` is consulted.
     fn add_dynamic_to_tblptr(&mut self, terms: &[(u8, String)]) {
@@ -961,7 +920,7 @@ impl<'m> Gen<'m> {
 
     /// One `const` (flash) byte read: `TBLPTR = table_base + k + Σ terms +
     /// byte_off`, `TBLRD*` (no auto-increment: per-byte re-setup keeps
-    /// every read independent, mirroring P3's per-byte FSR0 re-setup), then
+    /// every read independent, mirroring the pointer lowering's per-byte FSR0 re-setup), then
     /// `MOVFF TABLAT, dst`. Multi-byte loads call this once per byte with
     /// an increasing `byte_off`.
     fn emit_const_load_byte(
@@ -985,7 +944,7 @@ impl<'m> Gen<'m> {
 
     /// Copy each call arg into the callee's `{func}::{param}` slots. Shared
     /// by the direct call path and the per-candidate arms of an indirect
-    /// call chain (epic-cc#73).
+    /// call chain. (epic-cc#73)
     fn emit_call_args(&mut self, func: &str, args: &[ir::CallArg]) {
         let callee = self
             .m
@@ -998,7 +957,7 @@ impl<'m> Gen<'m> {
         for (i, arg) in args.iter().enumerate() {
             if i >= named {
                 // Extra (variadic) arg: lands in the callee's `__va`
-                // region at the running offset (epic-cc#131).
+                // region at the running offset. (epic-cc#131)
                 let va = self
                     .addrs
                     .get(&ssa_key(&func, "__va"))
@@ -1032,18 +991,11 @@ impl<'m> Gen<'m> {
                     }
                 }
             } else if arg.sret {
-                // `sret` means "store the 2-byte ADDRESS `arg.val`
-                // points to into the callee's sret slot"  -  same
-                // const hazard as `byval` above: an sret arg is
-                // always meant to be a pointer, so a literal here
-                // has no sensible meaning. `emit_ptr_setup` resolves
-                // `arg.val` the same way every other pointer
-                // consumer does: `Addr::Direct` is a compile-time
-                // address (write its two bytes as literals);
-                // `Addr::Indirect` means FSR0 now HOLDS the
-                // resolved runtime address (a dynamic target, or a
-                // sret-of-sret target), so the slot gets FSR0's two
-                // bytes via MOVFF instead of a literal.
+                // `sret` stores the 2-byte address `arg.val` points to in the slot.
+                // A literal has no meaning as an address source. `Addr::Direct`
+                // writes the two bytes as literals; `Addr::Indirect` means FSR0
+                // holds the resolved runtime address, so the slot takes FSR0L/FSR0H
+                // via `MOVFF`. Resolves through `emit_ptr_setup` like other consumers.
                 assert!(
                     !matches!(arg.val, Val::Const(_)),
                     "isel-pic18: const sret call arg not yet supported"
@@ -1094,9 +1046,9 @@ impl<'m> Gen<'m> {
                 } else if let Val::Global(g) = &arg.val {
                     if self.is_function(g) {
                         // A function's address is a link-time label literal:
-                        // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73). A
-                        // param-forwarded callback (epic-cc#137) arrives as
-                        // such an arg.
+                        // byte 0 = LOW(g), byte 1 = HIGH(g). A
+                        // param-forwarded callback arrives as
+                        // such an arg. (epic-cc#73) (epic-cc#137)
                         let (a0, f0) = self.operand(pa);
                         self.emit(format!("    MOVLW LOW({g})"));
                         self.emit(format!(
@@ -1129,7 +1081,7 @@ impl<'m> Gen<'m> {
                     // the taskmgr `t->arg` field): the two address bytes
                     // live in the reg's slot. Copy them into the param
                     // slot; the callee's FSR-based deref resolves the
-                    // address at runtime (epic-cc#155).
+                    // address at runtime. (epic-cc#155)
                     if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) {
                         let sa = self.slot_addr(self.cur_func, r).direct();
                         self.emit_copy_byte(sa, pa);
@@ -1186,9 +1138,9 @@ impl<'m> Gen<'m> {
                     .ty
                     .expect("isel-pic18: scalar call arg must carry a type");
                 self.emit_move_val_to_slot(&arg.val, ty, pa);
-                // M15 conversion ABI: __uitofp_f32/__sitofp_f32 take a 4-byte val slot
+                // the float differential conversion ABI: __uitofp_f32/__sitofp_f32 take a 4-byte val slot
                 // but i8/i16 sources copy only their width; stale high bytes corrupt
-                // the leading-1 search (P14 fix: isel/src/lib.rs:1618-1661). Fill them.
+                // the leading-1 search (the conversion fill: isel/src/lib.rs:1618-1661). Fill them.
                 if (ty.bytes() as u16) < u16::from(callee.params[i].width) {
                     assert_eq!(
                         callee.params[i].width, 4,
@@ -1253,10 +1205,10 @@ impl<'m> Gen<'m> {
                 } else {
                     panic!("isel-pic18: malformed load pointer operand {:?}", l.ptr);
                 };
-                // P4: a load through a `const` (flash) base reads via
+                // the flash const: a load through a `const` (flash) base reads via
                 // TBLRD, one independent read per byte. Everything else
                 // (RAM globals, allocas, sret slots, dynamic pointers)
-                // keeps the P2/P3 FSR/INDF path.
+                // keeps the integer-spine/pointer-lowering FSR/INDF path.
                 if let Some((table, k, terms)) = self.const_base_of(&ptr_val) {
                     for kk in 0..l.ty.bytes() {
                         self.emit_const_load_byte(&table, k, &terms, kk, dst + u16::from(kk));
@@ -1277,7 +1229,7 @@ impl<'m> Gen<'m> {
                 // Literal-pointer (SFR) store: `inttoptr` form, a direct
                 // physical address. A register/global source copies via
                 // MOVFF (no access bit); a constant goes through W with
-                // `operand()`'s access-bit (a=0 for the SFR segment, no
+                // `operand`'s access-bit (a=0 for the SFR segment, no
                 // MOVLB).
                 if s.ptr.starts_with("0x") {
                     let base = self.literal_ptr_addr(&s.ptr);
@@ -1299,8 +1251,8 @@ impl<'m> Gen<'m> {
                 } else {
                     panic!("isel-pic18: malformed store pointer operand {:?}", s.ptr);
                 };
-                // P4: a store through a `const` (flash) base is a write to
-                // ROM. It must panic loudly (matching PIC14's
+                // the flash const: a store through a `const` (flash) base is a write to
+                // ROM. It must panic (matching PIC14's
                 // store-through-const panic), never silently emit a
                 // MOVFF/MOVWF that the simulator would apply to a RAM
                 // alias of the same low address.
@@ -1309,14 +1261,10 @@ impl<'m> Gen<'m> {
                         "isel-pic18: ROM is not writable: store through const global {ptr_val:?}"
                     );
                 }
-                // Direct case: a single emit_ptr_setup(_, 0) covers the
-                // whole value via emit_move_val_to_slot (unchanged from
-                // P2 for the common @global case). Indirect case:
-                // re-resolve per byte (each byte's FSR setup is
-                // independent; see Task 6's design note on why no
-                // auto-increment is used), materializing the source byte
-                // into W (a constant literally, a register via MOVF) and
-                // writing it through INDF0.
+                // Direct values cover the whole slot through one setup. Indirect bytes
+                // re-resolve per byte with independent FSR setups and no auto-increment,
+                // materializing each source byte into W (literals directly, registers
+                // via `MOVF`) and writing it through `INDF0`.
                 match self.emit_ptr_setup(&ptr_val, 0) {
                     Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
                     Addr::Indirect => {
@@ -1337,17 +1285,17 @@ impl<'m> Gen<'m> {
                     n == 1 || n == 2 || n == 4,
                     "isel-pic18: only i8/i16/i32 Bin ops implemented (n={n})"
                 );
-                // Milestone-8 shifts (P6): a const count inlines as a fixed
+                // the constant-count shifts: a const count inlines as a fixed
                 // RLCF/RRCF sequence; k == 0 is a plain copy; k >= width is
-                // LLVM poison and panics loudly. A variable (reg) count must
+                // LLVM poison and panics. A variable (reg) count must
                 // never reach isel: legalize rewrites it to a routine call.
                 // Without this arm a shift would hit the `(other, _)`
                 // panic below.
                 let av = self.val_addr(&b.a).direct();
                 let dst = self.slot_addr(self.cur_func, &b.dst).direct();
-                // Milestone-8 shifts (P6): a const count inlines as a fixed
+                // the constant-count shifts: a const count inlines as a fixed
                 // RLCF/RRCF sequence; k == 0 is a plain copy; k >= width is
-                // LLVM poison and panics loudly. A variable (reg) count must
+                // LLVM poison and panics. A variable (reg) count must
                 // never reach isel: legalize rewrites it to a routine call.
                 // Without this arm a shift would hit the `(other, _)`
                 // panic below.
@@ -1455,15 +1403,11 @@ impl<'m> Gen<'m> {
                             return;
                         }
                         ir::BinOp::Sub => {
-                            // `k - a` for `n > 1`: byte 0 via `SUBLW`
-                            // (k - W), bytes 1..n via `k_i + ~a_i + C0`
-                            // (the borrow-aware `k - a - !C0` chain). `C0`
-                            // is saved in a flag bit (0x0000,0 in the
-                            // reserved `fixed_retval`/`retval_lo` region, so
-                            // it is live-free across a `Bin` and an
-                            // interrupt mid-sequence cannot clobber a live
-                            // local) before the `COMF`/`ADDLW` overwrites
-                            // STATUS.
+                            // `k - a` for `n > 1`: byte 0 via `SUBLW`, upper bytes via the
+                            // borrow-aware chain. `C0` parks in flag bit (0x0000,0) of the
+                            // reserved return region: the bit stays live-free across the `Bin`,
+                            // so an interrupt mid-sequence cannot clobber a live local before
+                            // `COMF`/`ADDLW` overwrite `STATUS`.
                             let aa = self.val_addr(&b.b).direct();
                             let dst = self.slot_addr(self.cur_func, &b.dst).direct();
                             let (aacc0, af0) = self.operand(aa);
@@ -1542,35 +1486,21 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Zext(z) => {
-                // `val_addr` maps `Val::Const(k)` to a RAM ADDRESS
-                // (`k & 0xFF`), not a literal  -  same hazard already guarded
-                // for `Bin`/`Icmp` above. Not known to be reachable from
-                // clang-generated IR or the differential fuzzer (both only
-                // ever cast a loaded/computed register, never a bare
-                // literal  -  a literal cast is constant-foldable by the
-                // frontend before it ever reaches this backend), but the
-                // cheap guard costs nothing and keeps a future const-source
-                // producer from silently miscompiling instead of panicking.
+                // `val_addr` maps `Val::Const(k)` to a RAM address, not a literal:
+                // a constant source would read the byte at that address. The guard
+                // keeps a future const-source producer panicking instead of
+                // silently miscompiling.
                 assert!(
                     !matches!(z.val, Val::Const(_)),
                     "isel-pic18: const source Zext not yet supported"
                 );
-                // Mirrors `isel`'s own width guard (`crates/isel/src/lib.rs`,
-                // "isel: zext must not narrow")  -  without it, a malformed
-                // `Zext` with `to.bytes() < from.bytes()` would copy
-                // `from.bytes()` bytes into a narrower `to.bytes()` slot
-                // below, writing past the destination into whatever local
-                // sits next to it. Equal widths (e.g. `zext i1 to i8`,
-                // where both types report `.bytes() == 1` in the byte
-                // model  -  an icmp result is materialized as a byte holding
-                // exactly 0/1, so a 1-byte copy IS the zext) are legal and
-                // common (`u8 b = (a < b);`) and must be accepted: the
-                // "extra high bytes" loop from `from.bytes()..to.bytes()`
-                // below simply does not execute when the widths are equal.
-                // Not reachable from today's clang-generated IR for the
-                // narrowing case, but a real asymmetry with `isel`
-                // otherwise (silent corruption here vs. a clean panic
-                // there).
+                // Mirrors the `isel` narrowing guard: a `to.bytes() < from.bytes()`
+                // `Zext` would copy past the destination into the next local.
+                // Equal widths (`zext i1 to i8` reports 1 byte each: an `icmp`
+                // result holds exactly 0/1) are legal zexts and stay accepted; the
+                // high-byte loop simply does not execute when widths match.
+                // Without the guard a malformed narrowing corrupts the neighbor
+                // instead of panicking.
                 assert!(
                     z.to.bytes() >= z.from.bytes(),
                     "isel-pic18: zext must not narrow"
@@ -1668,18 +1598,11 @@ impl<'m> Gen<'m> {
                     !matches!(s.val, Val::Const(_)),
                     "isel-pic18: const source Sext not yet supported"
                 );
-                // Same width-relationship hazard as `Inst::Zext` above,
-                // mirroring `isel`'s own sext bounds guard
-                // (`crates/isel/src/lib.rs`, "isel: sext only supports
-                // i8/i16 -> i16/i32"): without it, `to.bytes() <=
-                // from.bytes()` would sign-fill zero or a negative number
-                // of high bytes and still have copied `from.bytes()` bytes
-                // into a same-or-narrower `to.bytes()` slot, writing past
-                // the destination.
-                // `i1 -> iN` is a 0/1 value: an i1's stored byte is exactly
-                // 0 or 1 (every i1 producer clears the high bits), so the
-                // "sign" fill is zero and a plain copy IS the sext. Panic
-                // only on equal-or-narrowing widths that would write past
+                // Mirrors the `isel` sext bounds guard: without it, `to.bytes() <=
+                // `from.bytes()` sign-fills the wrong count while still copying the
+                // full source width past the destination.
+                // `i1 -> iN` holds exactly 0/1, so a plain copy is the sext and stays
+                // accepted. Panics only on equal-or-narrowing widths that overrun
                 // the destination.
                 assert!(
                     s.to.bytes() >= s.from.bytes(),
@@ -1703,7 +1626,7 @@ impl<'m> Gen<'m> {
                 }
                 // The sign-fill byte(s) must reflect the SOURCE's actual
                 // sign bit (bit 7 of its highest byte) at the time this
-                // cast runs  -  not an assumption. `MOVLW 0x00` first, then
+                // cast runs: not an assumption. `MOVLW 0x00` first, then
                 // `BTFSC sign_byte,7` conditionally overwrites `W` with
                 // `MOVLW 0xFF` only when that bit is set, so every high
                 // byte gets the same, correctly-derived fill value.
@@ -1759,41 +1682,26 @@ impl<'m> Gen<'m> {
                 } else if s.ptr && self.select_is_seeded(&s.dst) {
                     // A pointer select whose arms are runtime address VALUES
                     // that do not fold (distinct globals, a global vs a
-                    // runtime slot, two runtime slots, epic-cc#147): iselcore
+                    // runtime slot, two runtime slots,): iselcore
                     // seeded the dst as an indirect slot, so the selected
                     // arm's address bytes must land in it. The two-byte
-                    // value select below materializes them.
+                    // value select below materializes them. (epic-cc#147)
                 } else if s.ptr {
                     // A pointer-typed select folded by iselcore into the
                     // resolved map (a GEP-chain select): emits nothing, every
                     // load/store through it lowers via the fold. PIC18 has
-                    // no const-arm fold today, so this is the GEP-arm shape.
+                    // no const-arm fold, so this is the GEP-arm shape.
                     assert!(
                         !matches!(s.cond, Val::Const(_)),
                         "isel-pic18: const cond pointer Select not yet supported"
                     );
                 }
-                // `a`/`b` route through `emit_move_val_to_slot`, which
-                // handles `Val::Const` correctly (via `MOVLW`+`MOVWF`, not
-                // as a RAM address through `val_addr`) and never branches
-                // on a flag  -  no guard needed for either. A seeded
-                // pointer select (epic-cc#147) holds an ADDRESS VALUE, so
-                // its arms go through `emit_move_addr_to_slot` instead.
-                //
-                // `cond` is different: it's loaded via `emit_load_w`, then
-                // immediately tested with `BZ`, which relies on the LOAD
-                // having set the Z flag from `cond`'s value. That's true
-                // when `cond` is `Val::Reg`/`Val::Global` (`emit_load_w`
-                // emits `MOVF ...,W`, and this project's simulator's MOVF
-                // calls `set_zn`  -  `crates/sim/src/lib.rs:779-783`). It is
-                // NOT true for `Val::Const`: `emit_load_w`'s const arm
-                // emits only `MOVLW`, and the simulator's MOVLW (PIC18
-                // opcode 0xE, `crates/sim/src/lib.rs:903`) does `self.w = k`
-                // with no `set_zn` call at all  -  so `BZ` would test
-                // whatever Z flag the PREVIOUS instruction happened to
-                // leave, silently picking the wrong side of the `Select`.
-                // Same hazard class as the const-LHS/const-source guards
-                // elsewhere in this file; guard it the same way.
+                // `a`/`b` travel via `emit_move_val_to_slot`, which handles `Const`
+                // and never branches on a flag, so neither arm needs a guard. A seeded
+                // select holds an address value and uses `emit_move_addr_to_slot`.
+                // `cond` loads via `emit_load_w` then tests `BZ`, which reads the Z
+                // flag the load sets. Only `MOVF` sets Z; `MOVLW` leaves a stale flag
+                // that selects the wrong side, so a `Const` cond panics. (epic-cc#147)
                 let seeded = s.ptr && self.select_is_seeded(&s.dst);
                 if !s.ptr || matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) || seeded {
                     assert!(
@@ -1829,25 +1737,20 @@ impl<'m> Gen<'m> {
                     // register) whose candidate list is empty cannot be a
                     // direct call: the target is a runtime value the
                     // compiler could not resolve (an opaque store into an
-                    // ISR-visible global, epic-cc#137). Emit the
+                    // ISR-visible global,). Emit the
                     // deterministic trap loop rather than panic on the
-                    // register name or silently call nothing.
+                    // register name or silently call nothing. (epic-cc#137)
                     let l_trap = self.fresh_label();
                     self.emit_label(&l_trap);
                     self.emit(format!("    BRA {l_trap}"));
                 } else {
                     self.emit_call_args(&c.func, &c.args);
                     self.emit(format!("    CALL {}", c.func));
-                    // A `CALL` return is a BSR-clobbering join point, same
-                    // reasoning as `emit_label` (see its doc comment), but it
-                    // is NOT itself a label, so `emit_label`'s reset doesn't
-                    // cover it: the callee runs its own arbitrary sequence of
-                    // `MOVLB`s and never restores the caller's bank on
-                    // `RETURN`, so `self.bsr` (which tracks the bank the MOST
-                    // RECENT `MOVLB` set) is stale the instant control returns
-                    // here. Trusting it would make `operand()` wrongly elide a
-                    // needed `MOVLB` on the next banked access after the call,
-                    // silently reading/writing the wrong physical address.
+                    // A `CALL` return clobbers the tracked bank like a label join: the
+                    // callee runs its own `MOVLB` sequence and never restores the caller
+                    // bank on `RETURN`, so the tracked value is stale at return. Trusting
+                    // it elides a needed `MOVLB` and addresses the wrong bank, so the arm
+                    // clears `self.bsr` directly (`emit_label` cannot cover a non-label).
                     self.bsr = None;
                     if let Some(d) = &c.dst {
                         let ty = c.ty.expect("isel-pic18: valued call must carry a type");
@@ -1862,23 +1765,17 @@ impl<'m> Gen<'m> {
             Inst::Alloca(_) | Inst::Gep(_) => {
                 // Virtual: Alloca's slot comes from `alloc`'s layout and
                 // Gep's result is folded away by `resolve_pointers`
-                // before codegen ever runs; see this file's module doc and
-                // docs/adr/ADR-009-pic18-pointer-model.md. Neither emits
+                // before codegen ever runs; see
+                // ADR-009. Neither emits
                 // anything of its own.
             }
             Inst::Memcpy(mc) => match &mc.len {
                 ir::MemLen::Const(n) => {
                     for i in 0..*n {
-                        // The source pointer is set up on FSR1 (an indirect
-                        // source would otherwise be clobbered by the
-                        // destination's FSR0 setup), the destination on
-                        // FSR0, and the byte moves through W. W is
-                        // ISR-saved (0x0004), so an interrupt taken
-                        // mid-copy cannot corrupt the held byte.
-                        // A `const` (flash) source has no RAM address: the
-                        // byte is read via TBLRD into TABLAT, then moved
-                        // from there (epic-cc#143: default-struct initializer
-                        // copies from `@__const.*`).
+                        // Sets the source on FSR1 so the destination FSR0 setup cannot clobber
+                        // an indirect source; the byte moves through W, which the ISR saves,
+                        // so an interrupt mid-copy keeps the held byte. A flash source has no
+                        // RAM address and reads via `TBLRD` into `TABLAT` first. (epic-cc#143)
                         if let Some((table, k, terms)) = self.const_base_of(&mc.src) {
                             // Seed TBLPTR at the flash source byte, read it
                             // into TABLAT, then move TABLAT (0xFF5) to the
@@ -1942,7 +1839,7 @@ impl<'m> Gen<'m> {
     /// are copied into that candidate's param slots and the CALL runs, then
     /// control jumps to the shared retval copy. No candidate matches (a bogus
     /// or null fp, which a valid C program never reaches) falls into a
-    /// deterministic trap loop rather than a silent wrong call (epic-cc#73).
+    /// deterministic trap loop rather than a silent wrong call. (epic-cc#73)
     fn emit_indirect_call(
         &mut self,
         dst: &Option<String>,
@@ -1983,27 +1880,17 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `dst = (a <pred> b) ? 1 : 0` for one byte, via `a - b` (SUBWF: f=a,
-    /// W=b beforehand, d=W so `a`'s slot is untouched) and a flag-based
-    /// branch. C/Z/N/OV follow PIC18's standard (ARM-style) condition-code
-    /// semantics  -  C=1 means "no borrow" (a>=b unsigned)  -  already relied
-    /// on by P1's `Pic18::sub_flags`.
-    ///
-    /// Delegates the actual flag test to `emit_cmp_branch` (shared with
-    /// the i16 path, Task 9). A single byte has no "next byte" to defer
-    /// to, so the "equal" outcome must resolve directly to this
-    /// predicate's real answer at equality: true for the non-strict/eq
-    /// predicates (`eq`, `uge`, `ule`, `sge`, `sle`), false for the
-    /// strict ones (`ne`, `ult`, `ugt`, `slt`, `sgt`)  -  NOT uniformly
-    /// `l_false`, which would silently invert `uge`/`ule`/`sge`/`sle` at
-    /// equality (e.g. `ule(5, 5)` must stay `1`).
+    /// Computes `dst = (a <pred> b) ? 1 : 0` for one byte via `a - b` and a
+    /// flag branch using standard condition codes (C=1 means no borrow).
+    /// Shares the flag test with the 16-bit compare. A lone byte resolves
+    /// equality directly to the predicate answer: true for `eq`/`uge`/`ule`/
+    /// `sge`/`sle`, false for the strict ones. Routing equality uniformly
+    /// to `l_false` inverts the non-strict predicates at equal inputs.
     fn emit_icmp_byte(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
-        // `val_addr` maps `Val::Const(k)` to a RAM ADDRESS (`k & 0xFF`),
-        // not a literal  -  a constant on the LHS (e.g. `icmp ult i8 5, %x`)
-        // would silently compare against whatever byte lives at address
-        // 0x05 instead of the literal 5. Same hazard as `Inst::Bin`'s LHS
-        // (see the `assert!` there); fail loudly until a later task adds
-        // real const-LHS canonicalization.
+        // `val_addr` maps `Val::Const(k)` to a RAM address, not a literal:
+        // a constant LHS would compare against the byte at that address
+        // instead of the literal. Same hazard as the `Bin` LHS arm;
+        // panics until later lowering adds const-LHS canonicalization.
         assert!(
             !matches!(a, Val::Const(_)),
             "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
@@ -2020,21 +1907,14 @@ impl<'m> Gen<'m> {
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 
-    /// `dst = (a <pred> b) ? 1 : 0` for two bytes: compare the high byte
-    /// (offset 1) first, with `pred`'s own signedness: if it differs,
-    /// that alone decides the whole 16-bit result, since the sign only
-    /// ever lives in the most-significant byte. Only when the high bytes
-    /// are equal does the low byte (offset 0) get compared, always
-    /// **unsigned** (`slt`->`ult`, `sle`->`ule`, `sgt`->`ugt`, `sge`->`uge`;
-    /// `ult`/`ule`/`ugt`/`uge` already are their own tie-break).
-    ///
-    /// `eq`/`ne` don't fit this "high byte decides" shape at all  -  they
-    /// need BOTH bytes equal (`eq`) or EITHER byte different (`ne`), so
-    /// they're dispatched to their own short-circuit, `emit_icmp_i16_eq_ne`,
-    /// instead of the tie-break machinery built for the eight ordering
-    /// predicates.
+    /// Computes the 16-bit predicate by comparing the high byte first with
+    /// the predicate signedness: a difference there decides the result, as
+    /// the sign lives in the top byte. Equal high bytes defer to the low
+    /// byte compared unsigned. `eq`/`ne` bypass this shape: both bytes must
+    /// match (`eq`) or either differ (`ne`), so they use the dedicated
+    /// short-circuit instead of the ordering tie-break.
     fn emit_icmp_i16(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
-        // Same const-LHS hazard as `emit_icmp_byte`  -  this is a separate
+        // Same const-LHS hazard as `emit_icmp_byte`: this is a separate
         // entry point (not routed through `emit_icmp_byte`), so it needs
         // its own guard rather than inheriting one transitively.
         assert!(
@@ -2064,7 +1944,7 @@ impl<'m> Gen<'m> {
         self.emit_cmp_branch(&a, &b, 1, pred, &l_true, &l_false, &l_check_low);
         self.emit_label(&l_check_low);
         // Low byte, unsigned tie-break. Here "equal" means the two
-        // 16-bit values are fully identical, so  -  unlike the high byte
+        // 16-bit values are fully identical, so: unlike the high byte
         // it DOES have a final answer: true for the non-strict tie-break
         // predicates (`ule`/`uge`), false for the strict ones
         // (`ult`/`ugt`).
@@ -2114,7 +1994,7 @@ impl<'m> Gen<'m> {
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 
-    /// `dst = (a <pred> b) ? 1 : 0` for four bytes: compare the high byte
+    /// `dst = (a <pred> b) ? 1: 0` for four bytes: compare the high byte
     /// (offset 3) first with `pred`'s own signedness: if it differs,
     /// that alone decides the whole 32-bit result. Only when the high
     /// bytes are equal does the next byte get compared, and so on down to
@@ -2175,22 +2055,12 @@ impl<'m> Gen<'m> {
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 
-    /// The shared flag-test core behind `emit_icmp_byte`/`emit_icmp_i16`:
-    /// computes `a - b` (SUBWF, `W = a - b`) for the byte at `byte_offset`
-    /// and branches on `pred`'s C/Z/N/OV condition  -  three ways, not two:
-    /// `l_true` if `pred` holds for this byte pair, `l_false` if it
-    /// definitely does not (the bytes differ in the "wrong" direction),
-    /// or `l_equal` if the two bytes are equal. Equality is inherently
-    /// ambiguous from a single byte's flags alone  -  the caller decides
-    /// what it means: "go check the next byte" (i16's high-byte compare),
-    /// or "that IS the final answer" (i8, and i16's low-byte tie-break),
-    /// by choosing what `l_equal` points at.
-    ///
-    /// `eq`/`ne` are exempt from the three-way split  -  a byte's equality
-    /// already IS their complete per-byte answer, so their arms use only
-    /// `l_true`/`l_false`. i16's `Icmp` lowering never calls this for
-    /// `eq`/`ne` (see `emit_icmp_i16_eq_ne`); i8's `emit_icmp_byte` does,
-    /// with `l_equal` bound to whichever of `l_true`/`l_false` matches.
+    /// Branches a byte compare three ways: `l_true` when the predicate holds,
+    /// `l_false` on a decisive mismatch, `l_equal` on equal bytes. Equality
+    /// stays ambiguous by design: the caller binds `l_equal` to defer (the
+    /// high-byte step) or to answer (single bytes and low-byte tie-breaks).
+    /// `eq`/`ne` skip the split: one byte decides them, so only `l_true` and
+    /// `l_false` apply.
     fn emit_cmp_branch(
         &mut self,
         a: &Val,
@@ -2292,7 +2162,7 @@ impl<'m> Gen<'m> {
 
     /// Common `l_false: MOVLW 0x00 / l_true: MOVLW 0x01` materialization
     /// shared by `emit_icmp_byte`, `emit_icmp_i16`, and
-    /// `emit_icmp_i16_eq_ne`  -  the only difference between the three is
+    /// `emit_icmp_i16_eq_ne`: the only difference between the three is
     /// how they arrive at `l_true`/`l_false`.
     fn emit_materialize_bool(&mut self, l_true: &str, l_false: &str, l_done: &str, dst: &str) {
         self.emit_label(l_false);
@@ -2307,7 +2177,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
     }
 
-    /// Load byte `offset` of any `Val` into `W`  -  a constant via `MOVLW`
+    /// Load byte `offset` of any `Val` into `W`: a constant via `MOVLW`
     /// (shifting the literal right by `offset*8` bytes first), a
     /// register/global via `MOVF ...,W` at the resolved address plus
     /// `offset` (which needs the access bit, same as any other
@@ -2337,7 +2207,7 @@ impl<'m> Gen<'m> {
                     // bytes: a plain pointer param's slot and a
                     // runtime-address slot (an IntToPtr or const-arm select
                     // dst); both read as `base + k + terms`. Literal bases
-                    // stay loud panics (their address is a link-time
+                    // panic (their address is a link-time
                     // constant).
                     let sa = match &base {
                         iselcore::Base::Slot(sname, indirect) => {
@@ -2419,7 +2289,7 @@ impl<'m> Gen<'m> {
             Val::Global(g) => {
                 if self.is_function(g) {
                     // A function's address is a link-time label literal:
-                    // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73).
+                    // byte 0 = LOW(g), byte 1 = HIGH(g). (epic-cc#73)
                     let lit = if offset == 0 { "LOW" } else { "HIGH" };
                     self.emit(format!("    MOVLW {lit}({g})"));
                 } else {
@@ -2472,11 +2342,11 @@ impl<'m> Gen<'m> {
 
     /// The hardware-multiply recipe for `bytes` = 1, 2, or 4: schoolbook
     /// partial products via `MULWF` (8x8 -> PRODH:PRODL, SFRs 0xFF4/0xFF3),
-    /// the P6 headline. The result is the low `bytes` bytes of the product,
+    /// the runtime routines headline. The result is the low `bytes` bytes of the product,
     /// written to the retval region:
     /// - 1 byte: one MULWF, result = PRODL.
     /// - 2 bytes: P00 (shift 0) and P01 + P10 (shift 8) contribute to the
-    ///   low 16 bits; P11 (shift 16) is dropped.
+    /// low 16 bits; P11 (shift 16) is dropped.
     fn emit_hw_mul(&mut self, name: &str, bytes: u8, scr: u16) {
         let a = self.slot_addr(name, "a").direct();
         let b = self.slot_addr(name, "b").direct();
@@ -2589,21 +2459,12 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// The restoring-division loop body: shifts `num` left one bit per
-    /// iteration (the quotient builds in its vacated bits), accumulates the
-    /// partial remainder in `rem_base..rem_base+rem_bytes`, subtracts `den`
-    /// (`SUBFWB` for the borrow chain, the exact semantics PIC14
-    /// synthesized with its BTFSS/INCFSZ dance), and restores by adding
-    /// back when the subtraction borrowed. `cnt` counts `8*den_bytes`
-    /// iterations. `BNC`/`BRA` real branches mean the frame needs no
-    /// single-GPR-bank constraint (P6 ruling). Shared by the unsigned
-    /// (`emit_divmod`) and signed (`emit_sdivmod`) wrappers.
-    ///
-    /// `rem_bytes` is the remainder width, `den_bytes` the divisor width:
-    /// the u8 case uses a 2-byte remainder ("the 8-bit rem shift can
-    /// carry", the PIC14 layout contract) with a 1-byte divisor: the
-    /// divisor's implicit high byte is 0, folded with `MOVLW 0` +
-    /// `SUBFWB`/`ADDWFC`. u16 and u32 use equal widths.
+    /// Runs one restoring-division bit: shifts `num` left, accumulates the
+    /// partial remainder, subtracts `den` with the borrow chain, and adds
+    /// back on borrow. `cnt` counts `8*den_bytes` iterations. Real `BNC`/`BRA`
+    /// branches free the frame from any single-bank constraint. Shared by the
+    /// unsigned and signed wrappers. The u8 case pairs a 2-byte remainder
+    /// with a 1-byte divisor (implicit high byte 0 via `MOVLW 0` folds).
     fn emit_divmod_loop(
         &mut self,
         num: u16,
@@ -3003,7 +2864,7 @@ impl<'m> Gen<'m> {
 
     /// Load `slot+2`'s fraction into W and OR the implicit bit unless the
     /// operand is a denormal (full 8-bit exponent 0, no implicit bit,
-    /// issue #11). The caller stores W into the mantissa's high byte.
+    /// ). The caller stores W into the mantissa's high byte. (epic-cc#11)
     fn emit_f32_mant_hi(&mut self, slot: u16) {
         let l_imp = self.fresh_label();
         let l_done = self.fresh_label();
@@ -3055,36 +2916,11 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
-    /// The __add_f32 / __sub_f32 body (both operands already extracted at the
-    /// contract offsets: sa@0, ea@1, ma@2-4, sb@5, eb@6, mb@7-9, stick@10
-    /// (bit 0 = round, bit 1 = the OR of the bits below the 24-bit fraction
-    /// window), cnt@11, ta1@12, ta2@13; `ta0` reuses the dead `eb` slot).
-    /// Extract, align the smaller exponent's mantissa right by the
-    /// difference (clamped to 31), then add or subtract at the larger
-    /// exponent's scale (the result exponent register becomes eb).
-    ///
-    /// The alignment builds the lost fraction EXACTLY: each shifted-out bit
-    /// is inserted at the top of a 24-bit window `ta` (an RRCF chain, the
-    /// last bit out, the round bit, lands at ta2 bit 7), and the bits that
-    /// overflow the window's bottom are OR'd into `stick` bit 1. The value
-    /// is the 6-byte integer `ma:ta` at the result scale.
-    ///
-    /// The ADD path is exact: the sum never normalizes (a carry shifts
-    /// right once, promoting the old round bit into the sticky), so RNE
-    /// reads round = ta2 bit 7 and sticky = OR(ta below the top bit) |
-    /// stick bit 1.
-    ///
-    /// The SUBTRACT path is exact in the same 6-byte value: the result is
-    /// |a| - |b| = (ma - mb) - frac, computed as a fractional borrow
-    /// (ma -= 1 and ta = 2^24 - ta, the deep OR folded into ta's LSB)
-    /// followed by the plain 3-byte subtract. The 6-byte value then
-    /// normalizes with a 6-byte left shift: the fraction's bits move into
-    /// the mantissa one at a time, and RNE reads the guard from ta2 bit 7,
-    /// the sticky from ta's low bits | stick bit 1. A single wrong RNE bit
-    /// is impossible. (The earlier two-bit round/sticky model was inexact
-    /// once the fraction's tail drained to a power of two: the M15 float
-    /// differential found 6/2000 SIM sub mismatches, e.g. 1.0 - 0x3EFFFFFF
-    /// over-rounded to 0x3F000001 instead of the RNE 0x3F000000.)
+    /// Implements `__add_f32`/`__sub_f32` over the contract scratch layout.
+    /// Aligns the smaller mantissa right by the clamped exponent gap, then
+    /// adds or subtracts at the larger scale. The shifted-out bits build an
+    /// exact 24-bit fraction window with round and sticky, so both paths
+    /// round RNE from the guard and sticky: no rounding bit goes missing.
     fn emit_f32_add_body(&mut self, scr: u16) {
         let (sa, ea) = (scr, scr + 1);
         let (ma0, ma1, ma2) = (scr + 2, scr + 3, scr + 4);
@@ -3124,11 +2960,11 @@ impl<'m> Gen<'m> {
         let l_a_nan_done = self.fresh_label();
         let l_b_nan_done = self.fresh_label();
         let l_inf_done = self.fresh_label();
-        // ---- IEEE specials (issue #11): NaN and infinity operands ----
+        // IEEE specials : NaN and infinity operands.
         // NaN a: exp 0xFF (ea == 0xFF) && FRACTION nonzero (the extracted
         // mantissa carries the implicit bit, so inf's 0x800000 must not
         // read as a NaN, test ma2 & 0x7F | ma1 | ma0). `cnt` is dead at
-        // this point (the alignment sets it later).
+        // this point (the alignment sets it later). (epic-cc#11)
         self.emit(format!("    MOVF 0x{ea:03X},W,A"));
         self.emit("    SUBLW 0xFF".to_string());
         self.emit("    BTFSS 0xFD8,2,A".to_string());
@@ -3189,7 +3025,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_nan}:"));
         self.emit_f32_nan(sa);
         self.emit(format!("{l_inf_done}:"));
-        // ---- zero operand handling ----
+        // zero operand handling.
         self.emit(format!("    MOVF 0x{ma0:03X},W,A"));
         self.emit(format!("    IORWF 0x{ma1:03X},W,A"));
         self.emit(format!("    IORWF 0x{ma2:03X},W,A"));
@@ -3222,7 +3058,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    CLRF 0x{stick:03X},A"));
         self.emit(format!("    CLRF 0x{ta1:03X},A"));
         self.emit(format!("    CLRF 0x{ta2:03X},A"));
-        // ---- swap so that a is the smaller-exponent operand ----
+        // swap so that a is the smaller-exponent operand.
         self.emit(format!("    MOVF 0x{eb:03X},W,A"));
         self.emit(format!("    SUBWF 0x{ea:03X},W,A"));
         self.emit("    BTFSS 0xFD8,0,A".to_string()); // C=1 (ea >= eb) -> swap
@@ -3231,10 +3067,10 @@ impl<'m> Gen<'m> {
             self.emit_xor_swap(x, y);
         }
         self.emit(format!("{l_no_swap}:"));
-        // ---- alignment: diff = eb - ea (a is the smaller exponent),
-        //      clamped to 31, shift ma right. The result exponent is the
-        //      LARGER one (eb): the sum/difference is at its scale, so the
-        //      result-exp register becomes eb. ----
+        // ---- alignment: diff = eb: ea (a is the smaller exponent),
+        // clamped to 31, shift ma right. The result exponent is the
+        // LARGER one (eb): the sum/difference is at its scale, so the
+        // result-exp register becomes eb. ----
         self.emit(format!("    MOVF 0x{ea:03X},W,A"));
         self.emit(format!("    SUBWF 0x{eb:03X},W,A"));
         self.emit(format!("    MOVWF 0x{cnt:03X},A"));
@@ -3272,7 +3108,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    DECFSZ 0x{cnt:03X},F,A"));
         self.emit(format!("    GOTO {l_align_loop}"));
         self.emit(format!("{l_align_done}:"));
-        // ---- signs equal? add : subtract ----
+        // signs equal? add: subtract.
         self.emit(format!("    MOVF 0x{sa:03X},W,A"));
         self.emit(format!("    XORWF 0x{sb:03X},W,A"));
         self.emit("    BTFSS 0xFD8,2,A".to_string());
@@ -3354,11 +3190,11 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVF 0x{sb:03X},W,A"));
         self.emit(format!("    MOVWF 0x{sa:03X},A"));
         self.emit(format!("{l_sub_done}:"));
-        // ---- fractional borrow: the exact result is (ma - mb) - frac, so
-        //      for frac != 0 the integer part borrows (ma -= 1) and the
-        //      fraction becomes 2^24 - ta (the deep OR folded into ta's
-        //      LSB first, it is below the 24-bit window, sticky-typed).
-        //      frac == 0 skips straight to the plain 3-byte subtract. ----
+        // ---- fractional borrow: the exact result is (ma: mb) - frac, so
+        // for frac != 0 the integer part borrows (ma -= 1) and the
+        // fraction becomes 2^24: ta (the deep OR folded into ta's
+        // LSB first, it is below the 24-bit window, sticky-typed).
+        // frac == 0 skips straight to the plain 3-byte subtract. ----
         self.emit(format!("    BTFSC 0x{stick:03X}, 1,A"));
         self.emit(format!("    BSF 0x{ta0:03X}, 0,A"));
         self.emit(format!("    MOVF 0x{ta0:03X},W,A"));
@@ -3399,13 +3235,13 @@ impl<'m> Gen<'m> {
         self.emit(format!("    SUBWF 0x{ma2:03X},F,A"));
         self.emit(format!("    GOTO {l_normalize}"));
         // ---- normalize the 6-byte value: while !(ma2 bit 7) && ea > 1:
-        //      (ta:ma) <<= 1 (the fraction's bits move into the mantissa),
-        //      ea--. Only the subtract path reaches this (a sum never
-        //      normalizes). The loop stops at ea == 1, NOT 0: a denormal
-        //      result is the raw fraction at the exp-1 scale (value =
-        //      frac x 2^-149), and the denormal conversion below drops it
-        //      to exp 0. Stopping at 0 would leave ma = 2 x frac, doubling
-        //      the stored value. ----
+        // (ta:ma) <<= 1 (the fraction's bits move into the mantissa),
+        // ea--. Only the subtract path reaches this (a sum never
+        // normalizes). The loop stops at ea == 1, NOT 0: a denormal
+        // result is the raw fraction at the exp-1 scale (value =
+        // frac x 2^-149), and the denormal conversion below drops it
+        // to exp 0. Stopping at 0 would leave ma = 2 x frac, doubling
+        // the stored value. ----
         self.emit(format!("{l_normalize}:"));
         self.emit(format!("    MOVF 0x{ma2:03X},W,A"));
         self.emit("    ANDLW 0x80".to_string());
@@ -3425,25 +3261,18 @@ impl<'m> Gen<'m> {
         self.emit("    MOVLW 0x01".to_string());
         self.emit(format!("    SUBWF 0x{ea:03X},F,A"));
         self.emit(format!("    GOTO {l_normalize}"));
-        // ---- subtract-path guard: the top fraction bit (ta2 bit 7) ----
+        // subtract-path guard: the top fraction bit (ta2 bit 7).
         self.emit(format!("{l_sub_guard}:"));
         self.emit(format!("    BTFSC 0x{ta2:03X}, 7,A"));
         self.emit(format!("    BSF 0x{stick:03X}, 0,A"));
         self.emit(format!("    BTFSS 0x{ta2:03X}, 7,A"));
         self.emit(format!("    BCF 0x{stick:03X}, 0,A"));
-        // ---- RNE: round up iff round && (sticky || mantissa LSB), with
-        //      sticky = OR(ta below the top bit) | stick bit 1 (the deep
-        //      OR): the add path's round/sticky are equivalent (round =
-        //      ta2 bit 7 = the last shifted-out bit; a sum carry promotes
-        //      the old round into stick bit 1). ----
-        // ---- denormal result: exp 1 with the top mantissa bit clear (the
-        //      sum/difference of denormals, or a normal that underflowed)
-        //      converts to exp 0: the mantissa is already the raw
-        //      fraction (no implicit bit), and the assemble emits it as-is
-        //      for e == 0. A rounded-up 0x800000 (the smallest normal)
-        //      keeps exp 1. Both paths reach here: the add path directly
-        //      (a denormal sum never normalizes), the sub path after its
-        //      normalize loop stops at ea == 1. ----
+        // Rounds RNE: rounds up on round plus sticky or mantissa LSB, where
+        // sticky folds the window tail and the deep OR bit. A sum carry
+        // promotes the old round into sticky, so both paths share the test.
+        // A denormal result (exp 1, top mantissa bit clear) converts to exp 0
+        // and emits the raw fraction as is; a rounded 0x800000 keeps exp 1.
+        // Both paths join here: add directly, subtract after normalizing to ea 1.
         let l_den_conv = self.fresh_label();
         let l_den_done = self.fresh_label();
         self.emit(format!("{l_round_step}:"));
@@ -3475,7 +3304,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_den_done}:"));
         self.emit(format!("{l_assemble}:"));
         self.emit_f32_assemble(sa, ea, ma0, ma1, ma2);
-        // ---- zero result: sign = sa & sb, exp 0, mantissa 0 ----
+        // zero result: sign = sa & sb, exp 0, mantissa 0.
         self.emit(format!("{l_zero}:"));
         self.emit(format!("    BTFSS 0x{sa:03X}, 7,A"));
         self.emit(format!("    GOTO {l_zs_done}"));
@@ -3492,15 +3321,10 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_assemble}"));
     }
 
-    /// The __mul_f32 body (scratch: sign@0, e@1-2 = the 16-bit result exp,
-    /// bk@3-5 = the multiplier backup, cnt@6 = 24, m@7-10 = the product's
-    /// top 25 bits (P >> 23), low@11-13 = the exact mod-2^23 product low
-    /// bits; the a/b param slots hold the shifted multiplicand addend and
-    /// the low-part register). The 24x24 shift-add runs 24 iterations (the
-    /// AN526 pattern): per set multiplier bit, low += (ma << i) mod 2^23
-    /// (exact, its carry feeds m) and m += (ma >> (23-i)); then normalize
-    /// (bit 47 of the product -> exp+1), round RNE (guard = P bit 22 /
-    /// shifted-out bit, sticky = the low bits), assemble.
+    /// Implements `__mul_f32` over the contract scratch layout with the AN526
+    /// 24-iteration shift-add: each set multiplier bit accumulates the low part
+    /// exactly while its carry feeds the product top. The result normalizes,
+    /// then rounds RNE from guard and sticky before assembly.
     fn emit_f32_mul_body(&mut self, pa: u16, pb: u16, scr: u16) {
         let (sign, e) = (scr, scr + 1);
         let (bk0, bk1, bk2) = (scr + 3, scr + 4, scr + 5);
@@ -3544,9 +3368,9 @@ impl<'m> Gen<'m> {
         self.emit(format!("    XORWF 0x{:03X},W,A", pb + 3));
         self.emit("    ANDLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{sign:03X},A"));
-        // e = ea + eb - 127 (16-bit) with the FULL 8-bit biased exponents
+        // e = ea + eb: 127 (16-bit) with the FULL 8-bit biased exponents
         // ((b3 & 0x7F) << 1 | (b2 >> 7)). S = ea8 + eb8 (9 bits: S_lo +
-        // C0); e_lo = S_lo + 0x81 (C1); e_hi = C0 - borrow (borrow = !C1).
+        // C0); e_lo = S_lo + 0x81 (C1); e_hi = C0: borrow (borrow = !C1).
         self.emit(format!("    MOVF 0x{:03X},W,A", pa + 3));
         self.emit("    ANDLW 0x7F".to_string());
         self.emit(format!("    MOVWF 0x{low0:03X},A"));
@@ -3789,12 +3613,10 @@ impl<'m> Gen<'m> {
         self.emit("    IORLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{bk2:03X},A"));
         self.emit(format!("{l_b_mant_done}:"));
-        // la = the low-part addend, maintained as la_{i+1} = (la_i >> 1) |
-        // (ma bit i << 22): the correct low contribution (ma mod 2^i) <<
-        // (23-i) at iteration i (testing mb bit 23-i). Starts at 0 (i=0:
-        // (ma mod 1) << 23 = 0). (The M15 float probe: an earlier attempt
-        // copied ma into the slot: (ma mod 2^23) << i, which is a
-        // different, wrong addend that broke every inexact product.)
+        // la tracks (ma mod 2^i) << (23-i): each step shifts right and injects
+        // ma bit i at bit 22, so the addend stays the exact low contribution
+        // for the tested multiplier bit. Seeding the full shifted value instead
+        // adds a wrong addend.
         self.emit(format!("    CLRF 0x{:03X},A", pb));
         self.emit(format!("    CLRF 0x{:03X},A", pb + 1));
         self.emit(format!("    CLRF 0x{:03X},A", pb + 2));
@@ -3811,12 +3633,9 @@ impl<'m> Gen<'m> {
         self.emit(format!("    RLCF 0x{bk2:03X},F,A"));
         self.emit("    BTFSS 0xFD8,0,A".to_string());
         self.emit(format!("    GOTO {l_skip}"));
-        // low += la (3-byte): the FIRST byte adds WITHOUT a carry-in: the
-        // C at this point is the tested multiplier bit (set by the RLCF bk
-        // chain), not a carry, so the BTFSC/INCFSZ carry-in would add a
-        // spurious +1 per set-bit iteration (the M15 float probe found the
-        // low sum came out one per set bit too high). Bytes 1-2 take the
-        // carry from the previous byte's add.
+        // Adds low plus the addend without carry-in on byte 0: C currently holds
+        // the tested multiplier bit, not a carry, so a carry-in adds a spurious
+        // plus one per set bit. Upper bytes take the previous byte carry.
         self.emit(format!("    MOVF 0x{:03X},W,A", pb));
         self.emit(format!("    ADDWF 0x{low0:03X},F,A"));
         self.emit(format!("    MOVF 0x{:03X},W,A", pb + 1));
@@ -3827,13 +3646,9 @@ impl<'m> Gen<'m> {
         self.emit("    BTFSC 0xFD8,0,A".to_string());
         self.emit(format!("    INCFSZ 0x{:03X},W,A", pb + 2));
         self.emit(format!("    ADDWF 0x{low2:03X},F,A"));
-        // m += addend (4-byte) + the low's carry-out: the carry into m is
-        // BIT 23 of the 24-bit low sum (the top byte's bit 7), NOT the
-        // byte carry-out (bit 24): the M15 float probe found the original
-        // tested STATUS C, so a sum with bit 23 set but no byte overflow
-        // (e.g. 0x700003 + 0x160000 = 0x860003) lost its carry into m and
-        // every inexact product came out one 2^23 short. The carry path
-        // also masks bit 23 out of low (low is mod 2^23).
+        // Carries BIT 23 of the 24-bit low sum into m, not the byte carry-out:
+        // bit 23 set without byte overflow still advances the product, and the
+        // path masks bit 23 out of low to keep it mod 2^23.
         self.emit(format!("    BTFSC 0x{low2:03X}, 7,A"));
         self.emit(format!("    GOTO {l_carry_in}"));
         self.emit(format!("    GOTO {l_no_carry}"));
@@ -4038,15 +3853,11 @@ impl<'m> Gen<'m> {
         self.emit(format!("{l_next}:"));
     }
 
-    /// The __div_f32 body (scratch: sign@0, e@1-2 = the 16-bit result exp,
-    /// rem@3-6 = the partial remainder, den@7-9 = the denominator copy, cnt@10,
-    /// spare@11). The numerator lives in the a param slot. 24 restoring
-    /// iterations give floor(ma/mb) (0/1, ma >= mb bumps e) with rem = ma
-    /// mod mb; 25 more iterations extend the quotient to the mantissa +
-    /// guard (the remainder at the end is the sticky). Div-by-zero (mb == 0)
-    /// -> +/-infinity (0x7F800000, deterministic, documented); ma == 0 ->
-    /// +/-0. The e is clamped by the byte arithmetic for the out-of-range
-    /// cases (deterministic; the acceptance stays in the normal range).
+    /// Implements `__div_f32` over the contract scratch layout. Restoring
+    /// iterations yield the floor quotient plus remainder, then extend to the
+    /// mantissa plus guard with the leftover remainder as sticky. Zero
+    /// divisors give infinity and zero numerators give zero; out-of-range
+    /// exponents clamp through the byte arithmetic.
     fn emit_f32_div_body(&mut self, pa: u16, pb: u16, scr: u16) {
         let (sign, e) = (scr, scr + 1);
         let (rem0, rem1, rem2, rem3) = (scr + 3, scr + 4, scr + 5, scr + 6);
@@ -4097,9 +3908,9 @@ impl<'m> Gen<'m> {
         self.emit(format!("    XORWF 0x{:03X},W,A", pb + 3));
         self.emit("    ANDLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{sign:03X},A"));
-        // e = ea - eb + 127 (16-bit) with the FULL 8-bit biased exponents
-        // ((b3 & 0x7F) << 1 | (b2 >> 7)). S = ea8 - eb8 (S_lo + borrow B);
-        // e_lo = S_lo + 0x7F (C1); e_hi = C1 - B.
+        // e = ea: eb + 127 (16-bit) with the FULL 8-bit biased exponents
+        // ((b3 & 0x7F) << 1 | (b2 >> 7)). S = ea8: eb8 (S_lo + borrow B);
+        // e_lo = S_lo + 0x7F (C1); e_hi = C1: B.
         self.emit(format!("    MOVF 0x{:03X},W,A", pa + 3));
         self.emit("    ANDLW 0x7F".to_string());
         self.emit(format!("    MOVWF 0x{spare:03X},A"));
@@ -4344,7 +4155,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVF 0x{:03X},W,A", pb + 2));
         self.emit(format!("    MOVWF 0x{den2:03X},A"));
         // ---- 24 restoring iterations: num <<= 1; rem = rem << 1 | C;
-        //      if rem >= den set the quotient bit else restore ----
+        // if rem >= den set the quotient bit else restore ----
         for addr in [rem0, rem1, rem2, rem3] {
             self.emit(format!("    CLRF 0x{addr:03X},A"));
         }
@@ -4372,7 +4183,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    BSF 0x{spare:03X}, 0,A"));
         self.emit(format!("{l_qsave}:"));
         // ---- 25 more iterations: the mantissa + guard, with the sticky in
-        //      the remainder ----
+        // the remainder ----
         for addr in [pa, pa + 1, pa + 2, pa + 3] {
             self.emit(format!("    CLRF 0x{addr:03X},A"));
         }
@@ -4397,7 +4208,7 @@ impl<'m> Gen<'m> {
         // the remainder as the sticky. For q < 1 (floor(q) == 0) the
         // mantissa = f1..f24 (f1 = 1 at bit 23) with exp-1; for q >= 1 the
         // mantissa = 1.f1..f23 = 0x800000 | (pa >> 2) with the guard f24
-        // (pa bit 1) and the sticky f25 (pa bit 0) | rem. e = ea - eb + 127.
+        // (pa bit 1) and the sticky f25 (pa bit 0) | rem. e = ea: eb + 127.
         self.emit(format!("    BTFSC 0x{spare:03X}, 0,A"));
         self.emit(format!("    GOTO {l_ge1}"));
         // q < 1: mantissa = pa >> 1; guard = old pa bit 0; sticky = rem;
@@ -4499,7 +4310,7 @@ impl<'m> Gen<'m> {
     /// The __uitofp_f32 body (scratch: cnt@0, e@1-2, guard@3, stick@4,
     /// spare@5-7; `sign_src` = the byte holding the sign for __sitofp_f32,
     /// or None for the unsigned +0). Leading-1 search: shift the value left
-    /// until bit 31 set, counting; e = 127 + 31 - shifts; the mantissa is
+    /// until bit 31 set, counting; e = 127 + 31: shifts; the mantissa is
     /// the shifted value's top 24 bits, guard = bit 7 of the low byte,
     /// sticky = its low 7 bits. Round RNE.
     fn emit_f32_uitofp_body(&mut self, val: u16, scr: u16, sign_src: Option<u16>) {
@@ -4543,7 +4354,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    INCF 0x{cnt:03X},F,A"));
         self.emit(format!("    GOTO {l_loop}"));
         self.emit(format!("{l_zero}:"));
-        // e = 158 - cnt; the mantissa is val+1..val+3 (bit 23 = val3 bit 7)
+        // e = 158: cnt; the mantissa is val+1..val+3 (bit 23 = val3 bit 7)
         self.emit(format!("    MOVF 0x{cnt:03X},W,A"));
         self.emit("    SUBLW 0x9E".to_string()); // 158 - cnt
         self.emit(format!("    MOVWF 0x{e:03X},A"));
@@ -4571,7 +4382,7 @@ impl<'m> Gen<'m> {
 
     /// The __fptoui_f32 / __fptosi_f32 body (scratch: e@0, cnt@1, m@2-4,
     /// sign@5, spare@6 = the result's 4th byte). The biased exponent maps to
-    /// a mantissa shift: right by 150 - e (truncating; e <= 150), left by
+    /// a mantissa shift: right by 150: e (truncating; e <= 150), left by
     /// e - 150 (e in 151..158, the u32 range), or a deterministic clamp
     /// (e >= 159 for fptoui -> 0xFFFFFFFF; e >= 158 for fptosi -> +/-0x7F800000
     /// style saturation). `signed` negates the result for a negative input
@@ -4623,7 +4434,7 @@ impl<'m> Gen<'m> {
         self.emit("    IORLW 0x80".to_string());
         self.emit(format!("    MOVWF 0x{m2:03X},A"));
         self.emit(format!("    CLRF 0x{m3:03X},A"));
-        // cnt = 150 - e
+        // cnt = 150: e
         self.emit(format!("    MOVF 0x{e:03X},W,A"));
         self.emit("    SUBLW 0x96".to_string()); // 150 - e
         self.emit("    BTFSS 0xFD8,0,A".to_string());
@@ -4650,7 +4461,7 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_rloop}"));
         self.emit(format!("    GOTO {l_store2}"));
         self.emit(format!("{l_left}:"));
-        // cnt = e - 150 (W = 150 - e, negate)
+        // cnt = e - 150 (W = 150: e, negate)
         self.emit("    SUBLW 0x00".to_string());
         self.emit(format!("    MOVWF 0x{cnt:03X},A"));
         // overflow clamp: fptoui cnt > 8 (e >= 159); fptosi cnt >= 8 (e >= 158)
@@ -4816,7 +4627,7 @@ impl<'m> Gen<'m> {
             self.emit(format!("    INCFSZ 0x{:03X},W,A", pb + i));
             self.emit(format!("    SUBWF 0x{:03X},W,A", pa + i));
         }
-        // equal -> 0; pa < pb -> (negative ? 2 : 1); pa > pb -> (negative ? 1 : 2)
+        // equal -> 0; pa < pb -> (negative ? 2: 1); pa > pb -> (negative ? 1: 2)
         self.emit(format!("    MOVF 0x{tmp0:03X},W,A"));
         self.emit("    BTFSC 0xFD8,2,A".to_string());
         self.emit(format!("    GOTO {l_ret0}"));
@@ -4850,20 +4661,13 @@ impl<'m> Gen<'m> {
         self.emit("    RETURN".to_string());
     }
 
-    /// The recipe body for one of the mul/div/rem/shift runtime routines,
-    /// adapted from PIC14's machine-verified epicurus asm but rewritten for
-    /// PIC18: the muls use hardware `MULWF` (8x8 -> PRODH:PRODL, schoolbook
-    /// partials, no shift-add loop), the divmod/shift loops use real branch
-    /// instructions instead of skip-sensitive idioms (PIC18 branches are
-    /// absolute, so a MOVLB between a test and its target is harmless, and
-    /// the whole routine frame has NO single-GPR-bank constraint), and
-    /// `RLCF`/`RRCF` replace `RLF`/`RRF`.
-    ///
-    /// Args arrive in the routine's `{func}::{param}` slots; the result
-    /// goes to the fixed retval slots; working state lives in
-    /// `{func}::__scr`. An `_isr` copy of a routine reads ITS OWN slots
-    /// (the `cur_func` map) so the ISR frame never overlaps the main
-    /// frame.
+    /// Emits one runtime routine body for the current function name. Muls use
+    /// hardware `MULWF` partials; divmod and shift loops use real branches,
+    /// so a `MOVLB` between test and target stays harmless and the frame
+    /// carries no bank constraint. `RLCF`/`RRCF` replace `RLF`/`RRF`. Args
+    /// arrive in param slots, results leave in the fixed retval slots, and
+    /// scratch lives in `__scr`; an `_isr` copy reads its own slots so the
+    /// ISR frame never overlaps main.
     fn emit_routine(&mut self) {
         let name = self.cur_func;
         let scr = self.slot_addr(name, "__scr").direct();
@@ -5036,16 +4840,11 @@ impl<'m> Gen<'m> {
     }
 }
 
-/// The classic iterative dominator sets for a function's CFG: `doms[b]` is
-/// the set of blocks that dominate block `b`. Used to classify phi-copy
-/// edges: `pred -> merge` is a BACK edge iff `merge` dominates `pred`  -  the
-/// pred is inside the merge's loop, so on that edge the merge's phi slots
-/// hold the CURRENT iteration's values. Ported from `isel`'s own
-/// `block_dominators` (`crates/isel/src/lib.rs:3977-4022`)  -  that function
-/// is private to the `isel` crate (not `pub`), and this task's scope is
-/// limited to `isel-pic18`'s own files, so the algorithm is duplicated
-/// here rather than shared. Covers self-loops (pred == merge) AND
-/// separate-latch back edges (pred is a latch block).
+/// Computes classic iterative dominator sets to classify phi-copy edges:
+/// `pred -> merge` is a back edge exactly when `merge` dominates `pred`,
+/// so the merge slots on that edge hold current-iteration values. The
+/// routine stays private to `isel`, so this crate duplicates the
+/// algorithm. Covers self-loops and separate-latch back edges.
 fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
     let entry = &f.blocks[0].label;
     let all: HashSet<String> = f.blocks.iter().map(|b| b.label.clone()).collect();
@@ -5094,21 +4893,11 @@ fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
     dom
 }
 
-/// Emit the dependency-ordered phi copies for one (pred -> merge) edge: a
-/// copy never overwrites a slot a later copy still needs to read. Ported
-/// from `isel`'s own `emit_phi_copies` (`crates/isel/src/lib.rs:4296-4345`,
-/// private to that crate  -  same reason as `block_dominators` above).
-///
-/// The ordering depends on whether the edge is a BACK edge into the merge
-/// (`back_edge`, from `block_dominators`  -  the merge dominates the pred):
-/// - Back edge: the merge's phi slots hold the CURRENT iteration's values,
-///   so a copy reading a slot another copy writes must run BEFORE the
-///   overwrite (reader first).
-/// - Forward edge: a phi slot is only defined by THIS edge's copies, so a
-///   copy reading a slot another copy writes must run AFTER its definer
-///   (writer first).
-/// A true cycle (%a <- %b, %b <- %a) needs a temp register, so it panics
-/// loudly rather than silently miscompile.
+/// Emits dependency-ordered phi copies for one edge: no copy clobbers a
+/// slot a later copy still reads. Back edges run readers before writers
+/// (the merge slots hold current values); forward edges run writers
+/// first (the edge defines each slot). A true cycle needs a temp
+/// register and panics: silent emission would miscompile.
 fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge: bool) {
     let pending: Vec<(u16, Option<u16>, Ty, Val)> = copies
         .iter()
@@ -5195,16 +4984,15 @@ pub fn select_with_locs(
             }
         }
     }
-    // Shared across every `Gen` below so `fresh_label()` never repeats a
+    // Shared across every `Gen` below so `fresh_label` never repeats a
     // `tmp{n}:` label across two different functions in the same output.
     let mut tmp = 0u32;
     // Every pointer reg in the module, folded once up front; later tasks'
     // pointer emitters consume it via `Gen::resolved_for`.
     let resolved = resolve_pointers(m);
-    // P5: at most one ISR (single-vector compatibility mode, the docs/29
-    // ruling this plan settles). The vector entry is the ISR body itself:
-    // the hardware jumps to 0x0008 (GIE-gated), so the ISR must be emitted
-    // FIRST at that address, before any ordinary function.
+    // At most one ISR in single-vector mode (docs/29 §2). The vector entry
+    // is the ISR body itself: hardware jumps to 0x0008, so the ISR emits
+    // first at that address, before ordinary functions.
     let isr_count = m.funcs.iter().filter(|f| f.isr).count();
     assert!(
         isr_count <= 1,
@@ -5213,7 +5001,7 @@ pub fn select_with_locs(
     let mut funcs: Vec<&Func> = m.funcs.iter().collect();
     funcs.sort_by_key(|f| !f.isr); // ISR first, then ordinary functions
     for f in funcs {
-        // P6: a runtime routine (or its `_isr` copy) emits its recipe body
+        // the runtime routines: a runtime routine (or its `_isr` copy) emits its recipe body
         // directly: its entry block holds only the `__scr` alloca, which
         // the generic block emitter would render as an empty label
         // (silently falling through into the next function). Every other
@@ -5238,7 +5026,7 @@ pub fn select_with_locs(
             locs.extend(g.locs);
             continue;
         }
-        // CC-4 naked: verbatim, no prologue, panic on non-Asm, barrier markers.
+        // Naked: verbatim, no prologue, panic on non-Asm, barrier markers.
         if f.naked {
             out.push(format!("{}:", f.name));
             locs.push(None);
@@ -5340,15 +5128,10 @@ pub fn select_with_locs(
             };
             labels.insert(b.label.clone(), lbl);
         }
-        // Phi elimination: for each (predecessor, merge) EDGE  -  not just
-        // the predecessor  -  the copies that must run when that edge is
-        // taken. Keying by predecessor alone (Task 12's original version)
-        // is a real miscompile on a `BrCond` whose two successors both
-        // consume phis: running both successors' copies unconditionally
-        // before the branch clobbers a loop header's phi slot with the
-        // next-iteration value before the exit edge's phi gets a chance to
-        // read the CURRENT one. Ported from `isel`'s own scheme
-        // (`crates/isel/src/lib.rs:4067-4086`).
+        // Keys phi copies by (predecessor, merge) edge rather than predecessor
+        // alone. Keying by predecessor runs both successors copies before the
+        // branch and clobbers a loop header slot before the exit edge reads the
+        // current value. Mirrors the `isel` scheme.
         let mut phi_copies: HashMap<(String, String), Vec<(String, Ty, Val)>> = HashMap::new();
         for b in &f.blocks {
             for inst in &b.insts {
@@ -5366,19 +5149,11 @@ pub fn select_with_locs(
         for (bi, b) in f.blocks.iter().enumerate() {
             g.emit_label(&labels[&b.label]);
             if bi == 0 && f.isr {
-                // The ISR save prologue, right after the vector entry at
-                // 0x0008. The preempted main's live state this saves:
-                //   - the in-flight return value (0x0000-0x0003): an ISR
-                //     that itself calls a value-returning function would
-                //     clobber it (PIC14 M13's identical hazard)
-                //   - STATUS/BSR/FSR0L/FSR0H: the ISR body's own banked
-                //     access and FSR0 pointer work would clobber them
-                //   - TBLPTRU/H/L: a const read is a multi-instruction
-                //     setup, so an interrupt taken mid-setup leaves a torn
-                //     pointer the ISR body's own const reads would misread
-                // W is saved LAST via MOVWF (which clobbers nothing), so
-                // the preempted main's W is intact until the very last
-                // save instruction.
+                // Saves the preempted main state after the vector entry: the in-flight
+                // return value (an ISR call would clobber it), STATUS/BSR/FSRn (banked
+                // and pointer work clobbers them), and TBLPTR (a torn mid-setup pointer
+                // would misread). W saves last via `MOVWF`, which touches nothing, so
+                // the interrupted W stays intact through the sequence.
                 for (src, dst) in [
                     (common_lo, common_lo + 12),
                     (common_lo + 1, common_lo + 13),
@@ -5415,13 +5190,13 @@ pub fn select_with_locs(
                 }
                 Some(Inst::BrCond(bc)) => {
                     g.cur_loc = bc.loc.clone();
-                    // Same hazard class as `Select`'s cond (Task 11, see
+                    // Same hazard class as `Select`'s cond (the select guard, see
                     // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
                     // `Val::Const` arm emits only `MOVLW`, which does not
                     // set the Z flag (`crates/sim/src/lib.rs`), so a
                     // literal cond here would make `BZ` test a stale flag
                     // from whatever came before instead of `cond`'s real
-                    // value. Fail loudly instead of silently miscompiling.
+                    // value. Fail instead of silently miscompiling.
                     assert!(
                         !matches!(bc.cond, Val::Const(_)),
                         "isel-pic18: const cond BrCond not yet supported"
@@ -5434,12 +5209,12 @@ pub fn select_with_locs(
                     // Unlike PIC14's BTFSC/BTFSS (a 1-instruction SKIP, so a
                     // copy sequence longer than one instruction needs an
                     // extra `lcop` block to route through), PIC18's BZ/BNZ
-                    // are real branches to a label  -  so each edge's copies
+                    // are real branches to a label: so each edge's copies
                     // can be inlined directly along that edge's own path,
                     // with no intermediate copy-block indirection needed.
                     match (t_copies, f_copies) {
                         // Plain branch, no phi consumers on either edge
-                        // exactly Task 12's original (correct) shape.
+                        // exactly the phi elimination's original (correct) shape.
                         (None, None) => {
                             g.emit(format!("    BZ {lf}"));
                             g.emit(format!("    BRA {lt}"));
@@ -5530,7 +5305,7 @@ pub fn select_with_locs(
         locs.extend(g.locs);
     }
     // `__start` calls `main` and halts; matches the shape `isel::select`
-    // uses for its own program entry, minus the ISR machinery (P5).
+    // uses for its own program entry, minus the ISR machinery (the single-vector mode).
     // Const string literals copied to RAM need init before main.
     {
         let mut init: Vec<String> = Vec::new();
@@ -5539,8 +5314,8 @@ pub fn select_with_locs(
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     let addr = base + i as u16;
-                    // A function-address field (epic-cc#154) materializes
-                    // the link-time label literal.
+                    // A function-address field materializes
+                    // the link-time label literal. (epic-cc#154)
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
                         let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
                         init.push(format!("    MOVLW {lit}({f})"));
@@ -5568,7 +5343,7 @@ pub fn select_with_locs(
         out.push("    sleep".to_string());
         locs.push(None);
     }
-    // P4: every `const` (flash) global becomes a `DB` table after the code,
+    // the flash const: every `const` (flash) global becomes a `DB` table after the code,
     // before `end`. The bytes are the flat LE blob `irparse` decoded; the
     // table label is the TBLPTR base `LOW`/`HIGH`/`UPPER` resolve. No
     // chunking and no `.align`: PIC18's `TBLRD` addresses program memory
@@ -5585,10 +5360,10 @@ pub fn select_with_locs(
         );
         out.push(format!("{}:", g.name));
         locs.push(None);
-        // Chunk the plain bytes 8 per line (the pre-#154 layout); a
-        // function-address field (epic-cc#154) materializes the link-time
+        // Chunk the plain bytes 8 per line (the earlier layout); a
+        // function-address field materializes the link-time
         // label literal, byte 0 = LOW(fn), byte 1 = HIGH(fn), resolved by
-        // the assembler's symbol table, and splits its own line.
+        // the assembler's symbol table, and splits its own line. (epic-cc#154)
         let mut chunk: Vec<String> = Vec::new();
         for (i, b) in g.bytes.iter().enumerate() {
             if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
@@ -5627,16 +5402,11 @@ pub fn select_with_locs(
 mod tests {
     use super::*;
 
-    /// Regression test for the `tmp` field's shared-borrow requirement:
-    /// `Gen::tmp` must be `&'m mut u32` backed by one counter that outlives
-    /// every function's `Gen`, not an owned `u32` reset per function  -  an
-    /// owned counter would let two functions' `fresh_label()` calls both
-    /// emit `tmp0`, a duplicate label that fails to assemble once Task 12
-    /// starts calling `fresh_label()` for real. `fresh_label()` itself has
-    /// no caller yet in Task 3's scope (Select/Icmp/Br land later), so this
-    /// constructs two `Gen`s directly  -  the way `select()` constructs one
-    /// per function  -  sharing one backing `tmp: &mut u32`, exactly as
-    /// `select()` does across its `for f in &m.funcs` loop.
+    /// Guards the shared label counter: `Gen::tmp` borrows one module counter
+    /// so `fresh_label()` never repeats `tmp{n}` across functions in one
+    /// output. A per-function counter duplicates `tmp0`, which fails to
+    /// assemble once phi elimination emits real branch labels. The test builds
+    /// two `Gen`s on one backing counter, mirroring `select()` per function.
     #[test]
     fn fresh_label_counter_is_shared_across_gens() {
         let m = ir::parse("fn f(void) ()\n  block entry:\n    ret void\n");
@@ -5752,7 +5522,7 @@ mod p3_gen_tests {
         let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
-        // FSR0L, the address this task exists to fix.
+        // FSR0L, the address this lowering exists to fix.
         assert_eq!(
             g.operand(0xFE9),
             (0, 0xE9),

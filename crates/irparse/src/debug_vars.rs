@@ -1,9 +1,8 @@
 //! The typed variable table: full `-g` metadata (`DIType`,
 //! `DILocalVariable`, `DIGlobalVariable`) joined with the SSA value
-//! operands each variable's `#dbg_value`/`#dbg_declare`/`#dbg_assign`
-//! body record names. This is the phase-2 debugger data (epic-cc#257):
-//! the driver joins it against `AllocLayout` to attach addresses; the
-//! `ssa` name is the `{func}::{ssa}` local key.
+//! operands each `#dbg_value`/`#dbg_declare`/`#dbg_assign` record names.
+//! The driver joins it against `AllocLayout` to attach addresses; the
+//! `ssa` name is the `{func}::{ssa}` local key (epic-cc#257).
 
 use std::collections::HashMap;
 
@@ -49,7 +48,7 @@ pub enum DiTypeNode {
     },
     Member {
         name: Option<String>,
-        /// Byte offset (LLVM carries bits; divided by 8 here).
+        /// Byte offset (LLVM carries bits; this divides by 8).
         offset: Option<u32>,
         ty: Option<u32>,
     },

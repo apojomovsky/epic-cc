@@ -1,14 +1,14 @@
-//! Whole-program validation for the PIC8 pipeline: N translation units have
-//! already been merged into one `.ll` by `llvm-link` (see docs/31 D-7), so
-//! this stage does not link. It checks what `llvm-link` lets through.
+//! Whole-program validation for the PIC8 pipeline: checks what `llvm-link`
+//! lets through on the merged module. Expects N translation units already
+//! merged into one `.ll` by `llvm-link` (docs/31 §7); this stage does not link.
 
 use ir::{Inst, Module, SrcLoc};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Validate the merged module and hand it on unchanged.
+/// Validates the merged module and hands it on unchanged.
 ///
-/// Panics if the module has no functions, if it does not contain exactly one
-/// `main`, or if any call target has no definition.
+/// Panics when the entry invariant breaks: empty module, missing or duplicate
+/// `main`, or a call target with no definition.
 pub fn merge(m: Module) -> Module {
     assert!(!m.funcs.is_empty(), "wholeprog: no functions in module");
     check_entry(&m);
@@ -25,8 +25,8 @@ fn check_entry(m: &Module) {
 }
 
 /// `llvm-link` leaves an unsatisfied `declare` in place rather than failing.
-/// Downstream that becomes a CALL to a label the assembler never heard of, so
-/// the error has to be raised here, while the names are still the user's.
+/// Downstream that becomes a CALL to an undefined assembler label, so this
+/// check raises the error while the names are still the user's.
 fn check_calls_resolved(m: &Module) {
     let defined: BTreeSet<&str> = m.funcs.iter().map(|f| f.name.as_str()).collect();
     let mut missing: BTreeMap<&str, Vec<&SrcLoc>> = BTreeMap::new();
@@ -37,9 +37,9 @@ fn check_calls_resolved(m: &Module) {
                     if c.func.chars().all(|ch| ch.is_ascii_digit()) {
                         continue;
                     }
-                    // An `llvm.*` intrinsic is `declare`d by clang, never
-                    // defined here; legalize lowers every supported one and
-                    // panics loudly on an unknown, so skipping keeps this a
+                    // An `llvm.*` intrinsic is `declare`d by clang without a
+                    // definition here; legalize lowers every supported one and
+                    // panics on an unknown, so skipping keeps this a
                     // user-symbol check.
                     if c.func.starts_with("llvm.") {
                         continue;
@@ -65,9 +65,8 @@ fn check_calls_resolved(m: &Module) {
     );
 }
 
-/// One entry of the undefined-symbols message. The referencing call sites
-/// ride along when the module carries debug locations; without them the
-/// message stays the bare symbol name.
+/// Formats one undefined-symbol entry. Appends call sites when the module
+/// carries debug locations; emits the bare symbol name otherwise.
 fn symbol_with_sites(name: &str, locs: &[&SrcLoc]) -> String {
     if locs.is_empty() {
         return name.to_string();

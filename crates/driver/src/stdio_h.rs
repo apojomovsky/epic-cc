@@ -1,8 +1,8 @@
 //! The `stdio.h` header epic-cc ships to user code: exactly the entry
-//! points the bundled formatter implements (epic-cc#131, ADR-018
-//! discipline: a missing entry point is a clang error at the call site,
-//! never a link-time surprise). No FILE stream surface: the target has no
-//! OS and the retargetable sink is a user-provided `putchar`.
+//! points the bundled formatter implements. A missing entry point is a
+//! clang error at the call site, never a link-time surprise (ADR-018
+//! discipline, epic-cc#131). No FILE stream surface: the target has no OS
+//! and the retargetable sink is a user-provided `putchar`.
 
 pub const STDIO_H: &str = r#"#ifndef _STDIO_H
 #define _STDIO_H

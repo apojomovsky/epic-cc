@@ -1,6 +1,6 @@
 //! A cheap, clang-free scan for `EPIC_CONFIG("...")`'s argument, run before
 //! any clang invocation so EPIC_FOSC_HZ can be added to every `-D` list
-//! from the start (docs/31 D-10). Comment- and string-literal-aware so a
+//! from the start (docs/31 §10). Comment- and string-literal-aware so a
 //! fuse string or a stray comment cannot make it misfire.
 
 /// Scan every source file's raw text for exactly one top-level
@@ -8,8 +8,8 @@
 /// `"..."` string literals along the way. Returns the quoted argument, or
 /// `None` if no invocation was found anywhere.
 ///
-/// Panics if more than one invocation is found across all files: v1
-/// supports exactly one, unconditional, per docs/31 D-10.
+/// Panics if more than one invocation is found across all files: this
+/// supports exactly one, unconditional, per docs/31 §10.
 pub fn find_epic_config(sources: &[(String, String)]) -> Option<String> {
     let mut found: Option<(String, String)> = None; // (file, spec)
     for (file, text) in sources {

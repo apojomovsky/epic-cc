@@ -1,11 +1,10 @@
-//! The ELF+DWARF sidecar encoder (`epic-cc#259`): the compile-time
-//! artifact gdb loads alongside `epic-cc-gdbserver`. It joins the phase-1
-//! line rows and the phase-2 typed variable table into one DWARF
-//! compile unit with aggregate DIEs (struct/union members, array
-//! subranges, enums), every location a `DW_OP_addr(constant)` per
-//! docs/34 section 1, inside an `EM_386` ELF container (docs/34
-//! section 3 spike: the session runs as i386, so the sidecar declares
-//! the architecture gdb will use).
+//! The ELF+DWARF sidecar encoder: the compile-time artifact gdb loads
+//! alongside `epic-cc-gdbserver` (epic-cc#259). It joins the line rows and
+//! the typed variable table into one DWARF compile unit with aggregate
+//! DIEs (struct/union members, array subranges, enums), every location a
+//! `DW_OP_addr(constant)` per docs/34 §1, inside an `EM_386` ELF container
+//! (docs/34 §3: the session runs as i386, so the sidecar declares the
+//! architecture gdb uses).
 
 use alloc::AllocLayout;
 use ir::SrcLoc;

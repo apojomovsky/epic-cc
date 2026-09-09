@@ -3,17 +3,15 @@
 //! epic-cc#210). Runs between isel and banking in the PIC14 pipeline:
 //! `isel -> schedule -> banking -> peephole -> page-fit -> asm`.
 //!
-//! Phase 1 (this crate's current scope, epic-cc#210) is the
-//! classification and region-splitting infrastructure a scheduling
-//! transform needs, wired into the pipeline as an identity transform: it
-//! classifies every line's bank demand, W/flag reads and writes, and
-//! skip-op/skip-target status, and splits the text into the same kind of
-//! straight-line regions `banking`/`peephole` already reset their own
-//! tracked state at, but does not yet move anything. The actual reorder
-//! (a follow-up PR) only ever touches the exact hand-verified shape ADR-027
-//! commits to: a single differently-banked instruction sandwiched between
-//! same-bank neighbors, with none of the hazards this module already
-//! detects.
+//! The crate has two parts: the classification and region-splitting
+//! infrastructure a scheduling transform needs (every line's bank demand,
+//! W/flag reads and writes, and skip-op/skip-target status, split into the
+//! same kind of straight-line regions `banking`/`peephole` reset their own
+//! tracked state at), and the reorder itself.
+//!
+//! The reorder only ever touches the single shape ADR-027 commits to: a
+//! differently-banked instruction sandwiched between same-bank neighbors,
+//! with none of the hazards this module detects (ADR-027, epic-cc#210).
 //!
 //! Bank and bank-select classification is `banking`'s (`operand_bank`,
 //! `bank_op_effect`, `SKIP_OPS`, `LITERAL_OPS`, all `pub` for this reason),
@@ -40,9 +38,9 @@ pub struct Insn<'a> {
     pub writes_w: bool,
     /// Coarse and sound, not precise: true if this instruction reads or
     /// sets ANY flag bit (Z/C/DC), including an arbitrary `BCF/BSF
-    /// STATUS,b` whose bit isn't one of the RP bank-select bits. Phase 1
-    /// has no per-bit lattice; any flag-touching instruction is simply
-    /// never a move candidate and never something a candidate may cross.
+    /// STATUS,b` whose bit isn't one of the RP bank-select bits. There is
+    /// no per-bit lattice; any flag-touching instruction is simply never a
+    /// move candidate and never something a candidate may cross.
     pub reads_flags: bool,
     pub writes_flags: bool,
     /// The file-register address this instruction reads/writes directly
@@ -66,10 +64,9 @@ pub struct Insn<'a> {
     /// no motion in either phase can cross it.
     pub touches_sfr: bool,
     /// True when the immediately preceding classified line is a skip op:
-    /// this instruction is the other half of an atomic, unsplittable
-    /// pair (issue #6; `crates/banking/tests/banking.rs:79-87` is the
-    /// concrete regression this invariant protects). Never move this
-    /// instruction, never move anything into or out of this exact slot.
+    /// this instruction is the other half of an atomic, unsplittable pair.
+    /// Never move this instruction, never move anything into or out of this
+    /// exact slot (epic-cc#6).
     pub is_skip_target: bool,
 }
 
@@ -261,12 +258,11 @@ fn classify_insn<'a>(device: &Device, line: &'a str, mne: &'a str, toks: &[&str]
         "ADDLW" | "SUBLW" => Line::Insn(base(true, true, false, true, false, false)),
         "ANDLW" | "IORLW" | "XORLW" => Line::Insn(base(true, true, false, true, false, false)),
         "MOVLW" => Line::Insn(base(false, true, false, false, false, false)),
-        // Everything else, including RETLW reaching here (it shouldn't:
-        // the caller classifies it as a terminator first) and a
-        // bank-select op reaching schedule's input at all (unusual --
-        // ordinary isel output has none yet; only a hand-written
-        // `; --- asm start/end ---` block could): opaque, this module's
-        // own "unknown is safe" default rather than an assumption.
+        // Everything else, including RETLW reaching here (the caller
+        // classifies it as a terminator first) and a bank-select op reaching
+        // schedule's input at all (ordinary isel output has none; only a
+        // hand-written `; --- asm start/end ---` block could): opaque, this
+        // module's own "unknown is safe" default rather than an assumption.
         _ => Line::Opaque(line),
     }
 }
@@ -351,8 +347,9 @@ pub fn regions(lines: &[Line]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// `cur` is never a move candidate unless every one of these holds: not a
-/// skip op, not a skip target (issue #6: never move the other half of an
-/// atomic pair), and touches neither W nor a flag. The last two together
+/// skip op, not a skip target, and touches neither W nor a flag
+/// (never move the other half of an atomic pair, epic-cc#6). The last
+/// two together
 /// mean moving `cur` past one neighbor can never disturb a W-chain or a
 /// flag-chain, since `cur` itself is simply not part of either chain; the
 /// only remaining hazard to check per neighbor is a shared file-register
@@ -369,22 +366,18 @@ fn is_move_candidate(cur: &Insn) -> bool {
 
 /// True when `a` and `b` name the same file-register address: swapping
 /// them would reorder a read/write against itself (RAW/WAR/WAW), unsound
-/// regardless of what `a`/`b` otherwise do. Given `phase1`'s own excursion
-/// precondition (`cur.bank != prev.bank`, and a bank is a pure function
-/// of the address), this can never actually trigger for the exact
-/// neighbor `phase1` calls it with today: same address always means same
-/// bank, so a same-address neighbor could never have satisfied the
-/// excursion check in the first place. Kept anyway as the real invariant
-/// this function is supposed to guarantee, checked directly rather than
-/// assumed, and load-bearing the moment any future phase loosens the
-/// precondition that currently makes it unreachable.
+/// regardless of what `a`/`b` otherwise do. A bank is a pure function of
+/// the address, so under `phase1`'s excursion precondition same-address
+/// neighbors never satisfy the check; the invariant is still checked
+/// directly so a phase that loosens that precondition keeps the real
+/// guarantee.
 fn file_collision(a: &Insn, b: &Insn) -> bool {
     a.file_addr.is_some() && a.file_addr == b.file_addr
 }
 
 /// Try to swap `lines[i]` with the immediately following instruction
-/// (`lines[i + 1]`), reducing an `A, cur(B), A` excursion to `A, A, cur`
-/// -- one fewer bank switch, since the two `A` operands are now adjacent
+/// (`lines[i + 1]`), reducing an `A, cur(B), A` excursion to `A, A, cur`:
+/// one fewer bank switch, since the two `A` operands are now adjacent
 /// and `cur` instead directly precedes whatever needed a switch to `B`
 /// anyway. Safe when `next` is not a skip op (swapping into the position
 /// right after a skip op would corrupt what that skip actually guards)
@@ -417,26 +410,22 @@ fn try_hoist(lines: &mut [Line], i: usize) -> bool {
     ok
 }
 
-/// Phase 1 (ADR-027, epic-cc#210): the single hand-verified reorder
-/// shape, deliberately narrower than general list scheduling (no
-/// lookahead past one neighbor on either side, no multi-instruction
-/// bundling, no flag-chain reasoning). For every `Line::Insn` at index
-/// `i` strictly inside a region (so both `i - 1` and `i + 1` exist in the
-/// same straight-line run `regions` already computed), sandwiched between
-/// two neighbors that both need the SAME bank `cur` itself doesn't:
-/// try sinking `cur` past its successor first (matching the shape found
-/// by hand during epic-cc#210's investigation), falling back to hoisting
-/// it past its predecessor when sinking is blocked. Mutates `lines` in
-/// place; returns the number of swaps performed.
+/// The single reorder shape ADR-027 commits to, deliberately narrower than
+/// general list scheduling (no lookahead past one neighbor on either side,
+/// no multi-instruction bundling, no flag-chain reasoning). For every
+/// `Line::Insn` at index `i` strictly inside a region (so both `i - 1` and
+/// `i + 1` exist in the same straight-line run `regions` already computed),
+/// sandwiched between two neighbors that both need the SAME bank `cur`
+/// itself doesn't: sink `cur` past its successor first, hoist it past its
+/// predecessor when sinking is blocked (ADR-027, epic-cc#210).
 ///
-/// Deliberately does NOT capture every hand-traced excursion from the
-/// investigation: an excursion instruction that is itself a `MOVWF` (or
-/// any op reading W) is never a move candidate here by construction
-/// (`is_move_candidate`), even when the actual fix is to move a
-/// DIFFERENT, independent instruction earlier instead (the `EPIC_IRQ_
-/// Enable` example ADR-027 cites is exactly this shape) -- that needs
-/// moving more than one instruction and is explicitly deferred to a
-/// later phase, not silently included here.
+/// Mutates `lines` in place; returns the number of swaps performed.
+///
+/// An excursion instruction that itself reads W (a `MOVWF`, most commonly)
+/// is never a move candidate here (`is_move_candidate`); moving the fix
+/// instead (a DIFFERENT, independent instruction earlier, the `EPIC_IRQ_
+/// Enable` shape ADR-027 cites) needs moving more than one instruction and
+/// belongs to a later phase, not this one.
 pub fn phase1(lines: &mut [Line]) -> usize {
     phase1_with_locs(lines, &mut [])
 }
@@ -527,7 +516,7 @@ fn run_start(lines: &[Line], region: &std::ops::Range<usize>, end: usize, bank: 
 /// A position strictly inside `run` (never its very first element: this
 /// module has no way to know what precedes the run itself, so a bundle
 /// is only ever inserted between two of the run's OWN already-known
-/// elements) where `W` is dead right before it -- the element at that
+/// elements) where `W` is dead right before it. The element at that
 /// position does not read `W`, so a `MOVLW` (which unconditionally
 /// clobbers `W`) can land immediately before it without disturbing
 /// anything. Returns the index to insert before, or `None` if the run
@@ -543,26 +532,24 @@ fn find_dead_w_gap(lines: &[Line], run: std::ops::Range<usize>) -> Option<usize>
     None
 }
 
-/// Phase 2 (ADR-027, epic-cc#210): the corrected fix for the exact shape
-/// phase 1 cannot touch -- an excursion instruction (`cur`) that itself
-/// reads `W` (a `MOVWF`, most commonly), so it can never safely move.
-/// When `cur` is immediately followed by a `MOVLW`/`MOVWF` pair (`P`,
-/// `M`) materializing an unrelated value into `M`'s own bank (the SAME
-/// bank the run before `cur` needs), and nothing right after that pair
-/// depends on `W` still holding what `P` set, hunt the PRECEDING run for
-/// a genuine dead-`W` gap (a point where the next instruction doesn't
-/// read `W` anyway) and splice `(P, M)` in there instead of leaving them
-/// stranded after `cur`.
+/// The fix for the exact shape phase 1 cannot touch: an excursion
+/// instruction (`cur`) that itself reads `W` (a `MOVWF`, most commonly), so
+/// it can never safely move (ADR-027, epic-cc#210).
 ///
-/// This is deliberately narrower than it might look: exactly one
-/// producer, exactly one consumer, both immediately adjacent to `cur` and
-/// to each other, never searched for further away. Skipping the dead-`W`
-/// check and simply hoisting `(P, M)` to sit right before `cur` (this
-/// module's own first, hand-traced attempt at fixing this shape) is
-/// unsound: `P` clobbers `W` unconditionally, and `cur` still needs
-/// whatever value was in `W` right before it. The check exists because
-/// that mistake was real, caught only by working through the exact
-/// example by hand, not a hypothetical worth guarding against.
+/// When `cur` is immediately followed by a `MOVLW`/`MOVWF` pair (`P`, `M`)
+/// materializing an unrelated value into `M`'s own bank (the SAME bank the
+/// run before `cur` needs), and nothing right after that pair depends on
+/// `W` still holding what `P` set, hunt the PRECEDING run for a genuine
+/// dead-`W` gap (a point where the next instruction doesn't read `W`
+/// anyway) and splice `(P, M)` in there instead of leaving them stranded
+/// after `cur`.
+///
+/// This is deliberately narrower than it might look: exactly one producer,
+/// exactly one consumer, both immediately adjacent to `cur` and to each
+/// other, never searched for further away. Hoisting `(P, M)` to sit right
+/// before `cur` without the dead-`W` check is unsound: `P` clobbers `W`
+/// unconditionally, and `cur` still needs whatever value was in `W` right
+/// before it.
 pub fn phase2(lines: &mut Vec<Line>) -> usize {
     phase2_with_locs(lines, &mut Vec::new())
 }
@@ -682,8 +669,7 @@ pub fn schedule_with_locs(
     // reproduces `asm`'s own trailing-newline-or-not exactly; always
     // appending one after every line (including the last) silently grew
     // isel's actual raw output by a phantom blank line, which
-    // `crates/asm` does not parse the same as no trailing line at all
-    // (found via the full fuzz corpus, seed 128).
+    // `crates/asm` does not parse the same as no trailing line at all.
     let mut out = lines.iter().map(Line::raw).collect::<Vec<_>>().join("\n");
     if asm.ends_with('\n') {
         out.push('\n');

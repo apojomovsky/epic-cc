@@ -6,10 +6,10 @@
 //! TU that guards the include behind a condition the active build never
 //! takes (epic-hal's `#ifndef __EPIC_CC__` pattern, precisely to avoid
 //! needing epic-cc's stdio runtime) still triggered the driver's injected
-//! `__epic_stdio.c`/`__epic_string.c` (epic-cc#196). clang's own `-MD`
-//! dependency output lists exactly the headers a build actually
-//! preprocessed in, guards already resolved, so `main.rs` checks that
-//! instead of the source text.
+//! `__epic_stdio.c`/`__epic_string.c`. clang's own `-MD` dependency output
+//! lists exactly the headers a build actually preprocessed in, guards
+//! already resolved, so `main.rs` checks that instead of the source text
+//! (epic-cc#196).
 
 /// True when `dep_file_text` (the contents of a clang `-MF` Makefile-style
 /// dependency file) names a header ending in `/<name>` or equal to `name`.

@@ -36,9 +36,9 @@ fn assemble_first_pass(
             // `.org` can only pad FORWARD (the isel page pads and the pinned
             // table-section start are always at or ahead of the running
             // address). A backward `.org` would overwrite already-emitted
-            // words, silently relocating code — a post-layout drift (e.g. a
+            // words, silently relocating code: a post-layout drift (e.g. a
             // banking pass inserting words) pushing a page base backwards
-            // would otherwise go unnoticed, so it must fail loudly.
+            // would otherwise go unnoticed, so it must fail.
             assert!(
                 target >= org,
                 "asm: backward .org to 0x{target:04X} from 0x{org:04X} — an .org can only pad forward; a backward target would overwrite emitted words"
@@ -76,7 +76,7 @@ fn assemble_first_pass(
             continue;
         }
         // `.align N`: pad with NOP words (zeros) to the next N-word
-        // boundary — isel emits `.align 256` before a chunked (> 255 byte)
+        // boundary. isel emits `.align 256` before a chunked (> 255 byte)
         // const table's base label so LOW(base) == 0 and chunk 1, emitted
         // immediately after chunk 0, also sits at LOW == 0.
         if let Some(n) = line.strip_prefix(".align ") {
@@ -92,9 +92,9 @@ fn assemble_first_pass(
         // base label; `org` here IS the base address (labels take no words).
         // The computed `ADDLW LOW(base); MOVWF PCL` jump wraps within the
         // 256-byte window selected by the reader's PCLATH set, so the whole
-        // table must fit one window — accepting one that doesn't (reads past
+        // table must fit one window: accepting one that doesn't (reads past
         // the boundary return the wrong window's bytes) is the exact
-        // miscompile this directive exists to prevent, so we panic loudly.
+        // miscompile this directive exists to prevent, so it panics.
         if let Some(rest) = line.strip_prefix(".table ") {
             let mut it = rest.split_whitespace();
             let name = it.next().expect("asm: .table needs a table name");
@@ -153,9 +153,9 @@ fn instruction_words_pic18(line: &str) -> usize {
 /// not an instruction, so it never reaches `encode_pic18`.
 ///
 /// **`org` and labels are BYTE addresses here, unlike PIC14's `assemble`**
-/// (confirmed against `gpasm -p p18f4550`: `org 0x0020` places the next
-/// instruction at *word* address 0x10, not 0x20) — this matches PIC18's
-/// byte-oriented program counter. The output `Vec<u16>` stays word-indexed
+/// (per `gpasm -p p18f4550`: `org 0x0020` places the next instruction at
+/// *word* address 0x10, not 0x20). This matches PIC18's byte-oriented
+/// program counter. The output `Vec<u16>` stays word-indexed
 /// (byte address / 2), so callers see the same shape as `assemble`;
 /// `encode_pic18` receives each instruction's own BYTE address and divides
 /// by 2 wherever the ISA's `k`/`n` fields need a *word* address/offset
@@ -633,7 +633,7 @@ pub fn assemble_words(device: &Device, src: &str) -> Vec<u16> {
 /// Assemble source and render the result as Intel HEX.
 ///
 /// The whole program (code + tables) must fit the device's flash: a program
-/// whose highest word address is beyond `device.flash_words` panics loudly.
+/// whose highest word address is beyond `device.flash_words` panics.
 /// `assemble`/`assemble_pic18` are layout-only and stay unasserted so
 /// isel's unit tests can inspect words of any size.
 pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
@@ -663,13 +663,13 @@ fn strip_fn<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 /// `HIGH(<label>)` resolve through the pass-2 symbol table to the low or high
 /// byte of the label's word address (a RETLW table's base, e.g. the
 /// `ADDLW LOW(table); MOVWF PCL` computed jump). `PAGE(<label>)` resolves to
-/// `(addr >> 11) << 3` — the PCLATH<4:3> page bits (bits 2:0 clear), the
+/// `(addr >> 11) << 3`: the PCLATH<4:3> page bits (bits 2:0 clear), the
 /// literal loaded into PCLATH before a cross-page CALL. `UPPER(<label>)`
 /// resolves to byte 2 of the address (`(addr >> 16) & 0xFF`), the `TBLPTRU`
 /// byte of a const table's base (zero for flash below 64 KiB, but the
 /// encoding must still be emitted). A numeric operand inside the parens:
 /// `LOW(0x2A)`, `HIGH(0x123)`, `LOW(35)`, `UPPER(0x12345)`, padded or
-/// unpadded hex — resolves as the plain literal itself (LOW = n & 0xFF,
+/// unpadded hex: resolves as the plain literal itself (LOW = n & 0xFF,
 /// HIGH = (n >> 8) & 0xFF, PAGE = (n >> 11) << 3, UPPER = (n >> 16) & 0xFF),
 /// the same semantics as the label form; gpasm accepts `LOW(<n>)`/
 /// `HIGH(<n>)`, so a numeric operand is valid assembler input and must not
@@ -817,9 +817,8 @@ fn encode_pic14e(addr: usize, line: &str, sym: &std::collections::HashMap<String
     // Destination bit for the two-operand file ops (`f, W` / `f, F`): W = 0,
     // F = 1. An absent destination defaults to F (d = 1), matching
     // gpasm/MPASM's documented default for the byte-oriented ops
-    // ("Default is d = 1", MPASM User's Guide); confirmed against
-    // `gpasm -p 16f1937` 1.5.2 (2026-09-06): `ASRF 0x20` assembles to
-    // 0x37A0. The classic `encode` defaults to W, which P1 does not touch.
+    // ("Default is d = 1", MPASM User's Guide). The classic `encode`
+    // defaults to W, which the encoder does not touch.
     let d = match parts
         .get(2)
         .map(|s| s.trim().to_ascii_uppercase())

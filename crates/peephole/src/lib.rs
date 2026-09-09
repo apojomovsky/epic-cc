@@ -1,32 +1,22 @@
-/// Peephole-optimize PIC-8 assembly.
+/// Peephole-optimizes PIC-8 assembly: elides a redundant tracked-literal PCLATH set.
 ///
-/// Milestone 11: the tracked-literal PCLATH elision. The M11 isel emits a
-/// `MOVLW PAGE(<target>); MOVWF PCLATH` set before every CALL and — except
-/// for same-page calls, which isel now skips itself — a
-/// `MOVLW PAGE(<cur_func>); MOVWF PCLATH` restore right after. Nothing else
-/// writes PCLATH: CALL/GOTO/RETURN leave it unchanged, and `MOVWF PCL`
-/// (a reader's computed goto) only reads it. So a new
-/// `MOVLW <k>; MOVWF PCLATH` pair is redundant whenever `k` equals the last
-/// PCLATH literal written — dropping it cannot change the behavior.
+/// isel emits a `MOVLW PAGE(<target>); MOVWF PCLATH` set before every CALL and a
+/// `MOVLW PAGE(<cur_func>); MOVWF PCLATH` restore after, except for same-page calls
+/// which isel skips itself. Nothing else writes PCLATH: CALL, GOTO, and RETURN leave
+/// it unchanged, and `MOVWF PCL` only reads it. A new `MOVLW <k>; MOVWF PCLATH` pair
+/// with `k` equal to the last written literal changes nothing, so the pass drops it.
 ///
-/// The elision is now a defensive/standalone pass for the driver path: isel
-/// already omits same-page restores, so the peephole's job is to collapse
-/// any residual redundant pair (e.g. a hand-written or later-pass assembly
-/// that re-sets an already-held literal) while never dropping a pair it
-/// cannot prove redundant — sound for any input.
+/// The pass acts as a defensive standalone step for the driver path: isel already
+/// omits same-page restores, so this collapses any residual redundant pair and keeps
+/// any pair it cannot prove redundant. Sound for any input.
 ///
-/// The tracked literal is forgotten at every LABEL (a branch target's
-/// runtime PCLATH depends on the path taken, not the text order) and at any
-/// standalone `MOVWF PCLATH`; only `MOVLW k; MOVWF PCLATH` pairs update it.
-/// This label reset is load-bearing for multi-page programs: a function's
-/// CALL set must never be elided because the *previous function's* restore
-/// (a different runtime context) wrote the same literal earlier in the text.
-/// Operands are compared canonically: numeric literals are normalized to
-/// `0xXX` hex (so `0x08 == 0x08`), symbolic operands (`PAGE(main)`,
-/// `HIGH(table)`) are compared as strings — an identical token resolves to
-/// an identical literal, so eliding it is sound; differing tokens are
-/// conservatively kept. A standalone `MOVWF PCLATH` (writing the unknown
-/// value currently in W) forgets the tracked literal.
+/// The tracked literal resets at every LABEL: a branch target sees the PCLATH of the
+/// path taken, not the text order. This reset keeps multi-page programs sound: a CALL
+/// set stays even when a previous function restore wrote the same literal earlier in
+/// the text. Operands compare canonically: numeric literals normalize to `0xXX` hex
+/// and symbolic operands (`PAGE(main)`, `HIGH(table)`) compare as tokens, where an
+/// identical token resolves to an identical literal. A standalone `MOVWF PCLATH`
+/// writes the unknown value in W and clears the tracked literal.
 use ir::SrcLoc;
 
 pub fn optimize(asm: &str) -> String {
@@ -73,12 +63,10 @@ pub fn optimize_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Op
             i += 1;
             continue;
         }
-        // A label is a branch target: the runtime PCLATH there depends on
-        // the path taken, not the linear text order. The tracked literal is
-        // only a sound predictor of PCLATH on straight-line code, so it is
-        // forgotten at every label — most importantly at function-boundary
-        // labels, where the previous function's restore (a *different*
-        // runtime context) must never elide the next function's CALL set.
+        // A label is a branch target: the runtime PCLATH there follows the path
+        // taken, not the linear text order. The tracked literal predicts PCLATH
+        // on straight-line code only, so it clears at every label. Clearing at
+        // function-boundary labels keeps each CALL set intact across contexts.
         if is_label(line) {
             out.push(line);
             out_locs.push(cur_loc);
@@ -87,10 +75,8 @@ pub fn optimize_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Op
             continue;
         }
         if is_movlw(line) && i + 1 < lines.len() && is_movwf_pclath(lines[i + 1]) {
-            // Inside Asm guard above already prevents this pair from being
-            // considered across a barrier; still need to ensure the pair
-            // itself is not inside asm (handled) and not crossing into asm.
-            // If the next line is an asm marker, don't elide.
+            // The asm guard above keeps pairs out of inline assembly; this also
+            // refuses a pair that would cross into an asm marker.
             let next_trimmed = lines[i + 1].trim_start();
             if next_trimmed.starts_with("; --- asm") {
                 out.push(line);
@@ -113,8 +99,8 @@ pub fn optimize_with_locs(asm: &str, locs: &[Option<SrcLoc>]) -> (String, Vec<Op
             continue;
         }
         if is_movwf_pclath(line) {
-            // Standalone write of an unknown value: keep it, forget the
-            // tracked literal (it no longer reflects PCLATH).
+            // A standalone write carries an unknown value: the pass keeps it and
+            // clears the tracked literal, which stops reflecting PCLATH.
             out.push(line);
             out_locs.push(cur_loc);
             tracked = None;

@@ -11,22 +11,21 @@ pub fn ssa_key(func: &str, name: &str) -> String {
     format!("{func}::{name}")
 }
 
-/// Where a local's bytes live. v1 only ever constructs `Direct` — introduced
-/// now (docs/29-pic18-port-design.md §2 D-2) so a later frame-pointer phase
-/// (recursion/reentrancy) never has to touch the call sites that resolve a
-/// local's address, only add a real `Frame` case here and wherever
-/// `Slot` values get constructed.
+/// Where a local's bytes live. Only `Direct` is constructed: the `Frame`
+/// case stays reserved (docs/29 §2) so frame-pointer handling for
+/// recursion and reentrancy adds a case here and at `Slot`
+/// construction sites without touching address-resolution call sites.
 pub enum Slot {
     /// Statically allocated: a direct file address.
     Direct(u16),
-    /// Frame-relative, FSR2 + offset. Reserved for the later reentrancy
-    /// phase; nothing constructs this yet.
+    /// Frame-relative, FSR2 + offset. Reserved for reentrant
+    /// handling; nothing constructs this.
     #[allow(dead_code)]
     Frame(i8),
 }
 
 impl Slot {
-    /// v1 only ever constructs `Direct`.
+    /// Only `Direct` is constructed.
     pub fn direct(&self) -> u16 {
         match self {
             Slot::Direct(a) => *a,
@@ -37,17 +36,12 @@ impl Slot {
     }
 }
 
-/// Parse an alloc-produced address-map text into `HashMap<String, u16>`:
-/// `global <name> 0xNN` and `local <func> <name> 0xNN` lines become map
-/// entries (locals keyed `{func}::{name}`); `const <name>` lines list flash
-/// globals, which have no RAM address, so they are accepted and skipped —
-/// isel reads their bytes from the `Module`, never from a RAM slot.
-///
-/// Shared between both backends (moved here from `isel`, which only ever
-/// had this because `isel-pic18` pulled it in via a hard `isel` dependency
-/// that existed for no other reason — see the plan's final-review fix
-/// notes). Nothing about this parser is PIC14-specific; it is a plain
-/// text-format parser over `alloc`'s output.
+/// Parse alloc address-map text into `HashMap<String, u16>`.
+/// `global <name> 0xNN` and `local <func> <name> 0xNN` lines become entries
+/// (locals keyed `{func}::{name}`); `const <name>` lines name flash globals
+/// with no RAM address and skip: isel reads their bytes from the `Module`.
+/// Both backends share this parser over alloc output: nothing in it is
+/// PIC14-specific.
 pub fn parse_map(text: &str) -> HashMap<String, u16> {
     let mut addrs = HashMap::new();
     for line in text.lines() {
@@ -103,29 +97,14 @@ pub enum Base {
     Slot(String, bool),
 }
 
-/// Fold every `Inst::Gep` and pointer-typed `Inst::Select` in `m` to
-/// `(base, k, terms)`: `base` is where the chain ultimately starts, `k` is
-/// the constant byte offset, `terms` is `Vec<(scale, reg)>` for every
-/// dynamic (register-indexed) offset in the chain, inner-to-outer. Keyed
-/// `{func}::{reg}` via `ssa_key`, matching every other per-function map in
-/// this pipeline.
-///
-/// Seeds first (byval/sret params, allocas, each its own `Base::Slot`
-/// with no offset), then a fixpoint scan over every `Gep` and pointer
-/// select: a `GepBase::Reg` folds in its own already-resolved entry (`k`
-/// adds, `terms` concatenate inner-first) until the chain bottoms out at a
-/// `Global` or a seed. A pointer select folds when both arms resolve to the
-/// same base with matching term sets: `select i1 c, base+kA, base+kB`
-/// (kA < kB) is `base + kA + (kB-kA)×c`: the cond reg becomes a scale-1
-/// term, its 0/1 polarity picking the low arm. A select whose arms are
-/// runtime address VALUES that do not fold (distinct globals, a global vs
-/// a runtime slot, two runtime slots) is itself a runtime address VALUE:
-/// its dst is seeded as an indirect slot whose bytes isel materializes as
-/// a 2-byte value select. A `Gep` whose base is neither a seed nor another
-/// (eventually resolvable) `Gep`/select is a bug in an earlier stage and
-/// panics loudly, as does a select with an arm that is neither foldable
-/// nor a materializable runtime value; a scan that makes no progress with
-/// unresolved entries left is a cycle and panics loudly.
+/// Fold every `Gep` and pointer-typed `Select` in `m` to `(base, k, terms)`.
+/// `base` starts the chain, `k` adds the constant offset, `terms` appends
+/// dynamic offsets inner-first, keyed `{func}::{reg}` via `ssa_key`.
+/// Seeds (byval/sret params, allocas, runtime pointer values) anchor the
+/// fixpoint; pointer selects fold when both arms share a base and term set,
+/// else seed as indirect slots holding address bytes isel materializes.
+/// A base that is neither a seed nor a pending entry breaks an earlier-stage
+/// invariant and panics, as do unmaterializable arms and stalled scans.
 pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, String)>)> {
     let mut geps: HashMap<String, ir::Gep> = HashMap::new();
     let mut selects: HashMap<String, ir::Select> = HashMap::new();
@@ -239,8 +218,8 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
     // slot) are runtime addresses themselves: phi elimination copies the
     // incoming's two bytes into the dst slot per edge, so the dst can
     // dereference indirectly. A phi with any compile-time (folded) arm
-    // keeps the loud unresolvable-chain panic below: its bytes do not live
-    // in a slot.
+    // stays pending for the unresolvable-chain panic below: its bytes do
+    // not live in a slot.
     for f in &m.funcs {
         let fname = f.name.clone();
         let mut progressed = true;

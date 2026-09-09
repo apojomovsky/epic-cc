@@ -14,11 +14,11 @@ use irparse::DebugVars;
 
 /// The address-to-source-line table: one `file:line:col <addr>` record per
 /// word of the final program, sorted by address. Compiler-generated words
-/// (no source instruction) are omitted. Built by walking the final asm
+/// (no source instruction) are omitted. Builds by walking the final asm
 /// text with the same pass-1 semantics `asm::assemble` uses (tracking
 /// `org`, labels, `.align`, `.table`, `end`), pairing each word address
-/// with the parallel per-line `locs` vector the backend threaded through.
-/// The table is the Phase-1 debugger artifact: a breakpoint on a C line
+/// with the parallel per-line `locs` vector the backend threads through.
+/// The table is the debugger artifact: a breakpoint on a C line
 /// resolves to the word addresses that line produced.
 pub fn line_table_text(device: &Device, asm: &str, locs: &[Option<SrcLoc>]) -> String {
     let mut out = String::new();
@@ -60,12 +60,11 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
 
 /// The typed variable table: `global <name> 0xNN TYPE` and
 /// `local {func}::{name} 0xNN TYPE`, one flattened record per variable
-/// the join mapped to an address. The join is `DebugVars` metadata
+/// the join maps to an address. The join reads `DebugVars` metadata
 /// against `AllocLayout`: globals by C name, locals through the SSA key
-/// their `#dbg_*` record named. A variable with no allocation (promoted,
-/// constant-folded, or otherwise optimized away) is omitted; the TYPE
-/// field is the flat debug print, the in-process table stays phase 4's
-/// DWARF source.
+/// their `#dbg_*` record names. A variable with no allocation (promoted,
+/// constant-folded, or otherwise optimized away) stays omitted; the TYPE
+/// field is the flat debug print, the in-process table stays the DWARF source.
 pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -> String {
     let mut out = String::new();
     out.push_str(&format!("; epic-cc var table for {}\n", device.name));

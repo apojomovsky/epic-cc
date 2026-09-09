@@ -1,8 +1,8 @@
 //! The `stdarg.h` stub epic-cc ships to user code. The msp430-proxy clang
 //! lowers the `__builtin_va_*` intrinsics that back the standard va_list
 //! macros to `llvm.va_start`/`va_arg`/`llvm.va_end` IR, which irparse and
-//! both backends model directly (epic-cc#131). The header itself is the
-//! standard one-liner over the builtins.
+//! both backends model directly. The header itself is the standard
+//! one-liner over the builtins (epic-cc#131).
 
 pub const STDARG_H: &str = r#"#ifndef _STDARG_H
 #define _STDARG_H
