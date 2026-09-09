@@ -76,6 +76,105 @@ pub const INTF: u8 = 1 << 1;
 /// The 14-bit core's single interrupt vector.
 pub const VECTOR: u16 = 4;
 
+/// The 16F877A data-EEPROM register file (DS39582C chapter 4): EEDATA
+/// 0x10C and EEADR 0x10D in bank 2, EECON1 0x18C and EECON2 0x18D in
+/// bank 3.
+const PIC14_EEDATA: usize = 0x10C;
+const PIC14_EEADR: usize = 0x10D;
+const PIC14_EECON1: usize = 0x18C;
+const PIC14_EECON2: usize = 0x18D;
+
+/// The 16F1938 data-EEPROM register file (DS41364E, and the SDCC
+/// pic16f1938.h non-free header): EEADRL 0x191, EEDATL 0x193, EECON1
+/// 0x195, EECON2 0x196, all in bank 1.
+const PIC14E_EEADR: usize = 0x191;
+const PIC14E_EEDATA: usize = 0x193;
+const PIC14E_EECON1: usize = 0x195;
+const PIC14E_EECON2: usize = 0x196;
+
+/// The 18F4550 data-EEPROM register file (the SDCC pic18f4550.h
+/// non-free header): EECON1 0xFA6, EECON2 0xFA7, EEDATA 0xFA8, EEADR
+/// 0xFA9, in banked space (BSR 15).
+const PIC18_EECON1: usize = 0xFA6;
+const PIC18_EECON2: usize = 0xFA7;
+const PIC18_EEDATA: usize = 0xFA8;
+const PIC18_EEADR: usize = 0xFA9;
+
+/// The data-EEPROM cell array shared by the three cores: 256 bytes,
+/// erased (0xFF), driven through each core's EEADR/EEDATA/EECON1/EECON2
+/// register file. The EECON1 bit layout does not differ across the
+/// three families (DS39582C, DS41364E, DS39632E alike: RD bit 0, WR
+/// bit 1, WREN bit 2), so one state machine serves all of them; only
+/// the register addresses do, and the caller resolves those.
+struct Eeprom {
+    cells: [u8; 256],
+    /// EECON2 unlock progress: 0 idle, 1 seen 0x55, 2 armed (0x55 then
+    /// 0xAA, the write's required sequence).
+    seq: u8,
+}
+
+impl Eeprom {
+    fn new() -> Self {
+        Eeprom {
+            cells: [0xFF; 256],
+            seq: 0,
+        }
+    }
+
+    /// Handle one core store into EECON1 or EECON2. `reg` is the store's
+    /// physical address, `con1`/`con2` the core's EECON1/EECON2
+    /// addresses, `eeadr`/`eedata` the current register values (eedata
+    /// mutable so RD can latch into it), `wren` EECON1's stored WREN
+    /// bit. Returns the value to store into `reg` (RD/WR self-clear on
+    /// EECON1), or None when the store does not touch the EEPROM
+    /// register file.
+    fn on_store(
+        &mut self,
+        reg: usize,
+        con1: usize,
+        con2: usize,
+        v: u8,
+        eeadr: u8,
+        eedata: &mut u8,
+        wren: bool,
+    ) -> Option<u8> {
+        if reg == con2 {
+            self.seq = match (self.seq, v) {
+                (0, 0x55) => 1,
+                (1, 0xAA) => 2,
+                _ => 0,
+            };
+            return Some(v);
+        }
+        if reg != con1 {
+            return None;
+        }
+        // Data-EEPROM ops only: EEPGD (bit 6) or CFGS (bit 5) set
+        // targets program flash or config space, which no compiled
+        // corpus program drives through this window; store as-is.
+        if v & 0x60 != 0 {
+            self.seq = 0;
+            return Some(v);
+        }
+        let mut out = v;
+        if v & 0x01 != 0 {
+            // RD latches the addressed cell into EEDATA and self-clears.
+            *eedata = self.cells[eeadr as usize];
+            out &= !0x01;
+        }
+        if v & 0x02 != 0 {
+            // WR commits only after the unlock sequence with WREN set,
+            // then self-clears.
+            if wren && self.seq == 2 {
+                self.cells[eeadr as usize] = *eedata;
+            }
+            out &= !0x02;
+            self.seq = 0;
+        }
+        Some(out)
+    }
+}
+
 pub struct Pic14 {
     /// Supplies the GPR map. A direct operand is banked GPR when its physical
     /// address falls inside one of this device's `ram_banks`, which is not the
@@ -91,6 +190,9 @@ pub struct Pic14 {
     /// A latched interrupt request awaiting GIE + INTE. Set by
     /// `request_interrupt`, consumed when the interrupt is taken.
     pending: bool,
+    /// The data-EEPROM cell array behind the EEADR/EEDATA/EECON1/EECON2
+    /// register file.
+    eeprom: Eeprom,
 }
 
 impl Pic14 {
@@ -113,6 +215,7 @@ impl Pic14 {
             stack: Vec::new(),
             halted: false,
             pending: false,
+            eeprom: Eeprom::new(),
         }
     }
     pub fn ram(&self) -> &[u8; 512] {
@@ -120,6 +223,29 @@ impl Pic14 {
     }
     pub fn ram_mut(&mut self) -> &mut [u8; 512] {
         &mut self.ram
+    }
+    pub fn eeprom(&self) -> &[u8; 256] {
+        &self.eeprom.cells
+    }
+    /// Route a direct store at physical address `phys` through the
+    /// data-EEPROM register file: None when the address is not one of
+    /// the EEPROM registers, else the value to store (possibly
+    /// RD/WR-adjusted).
+    fn ee_store(&mut self, phys: usize, v: u8) -> Option<u8> {
+        if phys != PIC14_EECON1 && phys != PIC14_EECON2 {
+            return None;
+        }
+        let eeadr = self.ram[PIC14_EEADR];
+        let wren = self.ram[PIC14_EECON1] & 0x04 != 0;
+        self.eeprom.on_store(
+            phys,
+            PIC14_EECON1,
+            PIC14_EECON2,
+            v,
+            eeadr,
+            &mut self.ram[PIC14_EEDATA],
+            wren,
+        )
     }
     pub fn w(&self) -> u8 {
         self.w
@@ -278,7 +404,10 @@ impl Pic14 {
                 self.ram[addr] = v; // INDF -> RAM[FSR] via IRP
             }
             _ => match self.banked_addr(f) {
-                Some(phys) => self.ram[phys] = v,
+                Some(phys) => {
+                    let v = self.ee_store(phys, v).unwrap_or(v);
+                    self.ram[phys] = v;
+                }
                 // SFR 0x01-0x1F (bank-independent) and common 0x70-0x7F
                 None => self.ram[f] = v,
             },
@@ -643,6 +772,9 @@ pub struct Pic14e {
     /// (DS41364E section 3.5.3 note 2): the step budget consumes it before
     /// the next instruction executes.
     cycle_debt: u8,
+    /// The data-EEPROM cell array behind the EEADR/EEDAT/EECON1/EECON2
+    /// register file.
+    eeprom: Eeprom,
 }
 
 impl Pic14e {
@@ -664,6 +796,7 @@ impl Pic14e {
             pc: 0,
             stack: Vec::new(),
             halted: false,
+            eeprom: Eeprom::new(),
             pending: false,
             shadow: [0; 8],
             cycle_debt: 0,
@@ -674,6 +807,27 @@ impl Pic14e {
     }
     pub fn ram_mut(&mut self) -> &mut [u8; 4096] {
         &mut self.ram
+    }
+    pub fn eeprom(&self) -> &[u8; 256] {
+        &self.eeprom.cells
+    }
+    /// Route a direct store at physical address `a` through the
+    /// data-EEPROM register file (same contract as `Pic14::ee_store`).
+    fn ee_store(&mut self, a: usize, v: u8) -> Option<u8> {
+        if a != PIC14E_EECON1 && a != PIC14E_EECON2 {
+            return None;
+        }
+        let eeadr = self.ram[PIC14E_EEADR];
+        let wren = self.ram[PIC14E_EECON1] & 0x04 != 0;
+        self.eeprom.on_store(
+            a,
+            PIC14E_EECON1,
+            PIC14E_EECON2,
+            v,
+            eeadr,
+            &mut self.ram[PIC14E_EEDATA],
+            wren,
+        )
     }
     pub fn w(&self) -> u8 {
         self.w
@@ -838,6 +992,7 @@ impl Pic14e {
             0x09 => self.w = v, // WREG
             _ => {
                 let a = self.direct_addr(f);
+                let v = self.ee_store(a, v).unwrap_or(v);
                 self.ram[a] = v;
             }
         }
@@ -1390,6 +1545,9 @@ pub struct Pic18 {
     /// A PC<7:0> write (computed jump through `PCL`) waiting to override
     /// this instruction's linear `next`, consumed by `step`'s tail.
     jump_target: Option<u32>,
+    /// The data-EEPROM cell array behind the EEADR/EEDATA/EECON1/EECON2
+    /// register file.
+    eeprom: Eeprom,
 }
 
 impl Pic18 {
@@ -1400,6 +1558,7 @@ impl Pic18 {
             w: 0,
             pc: 0,
             stack: Vec::new(),
+            eeprom: Eeprom::new(),
             halted: false,
             pending: false,
             jump_target: None,
@@ -1410,6 +1569,27 @@ impl Pic18 {
     }
     pub fn ram_mut(&mut self) -> &mut [u8; 4096] {
         &mut self.ram
+    }
+    pub fn eeprom(&self) -> &[u8; 256] {
+        &self.eeprom.cells
+    }
+    /// Route a physical store through the data-EEPROM register file
+    /// (same contract as `Pic14::ee_store`).
+    fn ee_store(&mut self, addr: usize, v: u8) -> Option<u8> {
+        if addr != PIC18_EECON1 && addr != PIC18_EECON2 {
+            return None;
+        }
+        let eeadr = self.ram[PIC18_EEADR];
+        let wren = self.ram[PIC18_EECON1] & 0x04 != 0;
+        self.eeprom.on_store(
+            addr,
+            PIC18_EECON1,
+            PIC18_EECON2,
+            v,
+            eeadr,
+            &mut self.ram[PIC18_EEDATA],
+            wren,
+        )
     }
     pub fn w(&self) -> u8 {
         self.w
@@ -2257,7 +2437,10 @@ impl Pic18 {
                     *top = (*top & !(0xFFu32 << shift)) | ((v as u32) << shift);
                 }
             }
-            _ => self.ram[addr] = v,
+            _ => {
+                let v = self.ee_store(addr, v).unwrap_or(v);
+                self.ram[addr] = v;
+            }
         }
     }
     fn write_d_at(&mut self, d: u16, op: usize, r: u8) {
@@ -2461,5 +2644,115 @@ mod parse_hex_pic18_extended {
         let words = parse_hex_pic18(hex);
         assert_eq!(words[0], 0x2211, "little-endian pair at word 0");
         assert_eq!(words[1], 0x4433, "little-endian pair at word 1");
+    }
+}
+
+#[cfg(test)]
+mod pic14_eeprom {
+    use super::*;
+
+    /// Write 0x5C to cell 0x10 through the full unlock sequence (WREN,
+    /// 0x55 then 0xAA to EECON2, WR), then read it back through RD and
+    /// copy it to RAM (DS39582C chapter 4).
+    #[test]
+    fn write_then_read_round_trips() {
+        let prog = vec![
+            0x305C, // MOVLW 0x5C
+            0x1703, // BSF STATUS, RP1 (bank 2)
+            0x008C, // MOVWF EEDATA
+            0x3010, // MOVLW 0x10
+            0x008D, // MOVWF EEADR
+            0x1683, // BSF STATUS, RP0 (bank 3)
+            0x3004, // MOVLW 0x04
+            0x008C, // MOVWF EECON1 (WREN)
+            0x3055, // MOVLW 0x55
+            0x008D, // MOVWF EECON2
+            0x30AA, // MOVLW 0xAA
+            0x008D, // MOVWF EECON2 (armed)
+            0x148C, // BSF EECON1, WR (commit)
+            0x140C, // BSF EECON1, RD (latch)
+            0x1283, // BCF STATUS, RP0 (bank 2)
+            0x080C, // MOVF EEDATA, W
+            0x1303, // BCF STATUS, RP1 (bank 0)
+            0x00A0, // MOVWF 0x20
+            0x0063, // SLEEP
+        ];
+        let mut pic = Pic14::new(prog);
+        pic.run(1000);
+        assert!(pic.halted());
+        assert_eq!(pic.eeprom()[0x10], 0x5C);
+        assert_eq!(pic.eeprom()[0x11], 0xFF, "unwritten cells stay erased");
+        assert_eq!(pic.ram()[0x20], 0x5C, "RD latches the cell into EEDATA");
+    }
+}
+
+#[cfg(test)]
+mod pic14e_eeprom {
+    use super::*;
+
+    /// The same cycle on the Enhanced core's register file (DS41364E):
+    /// EEADRL 0x191, EEDATL 0x193, EECON1 0x195, EECON2 0x196, bank 3
+    /// selected through BSR.
+    #[test]
+    fn write_then_read_round_trips() {
+        let prog = vec![
+            0x305C, // MOVLW 0x5C
+            0x0023, // MOVLB 3 (the EE register file lives at 0x19x)
+            0x0093, // MOVWF EEDATL
+            0x3010, // MOVLW 0x10
+            0x0091, // MOVWF EEADRL
+            0x3004, // MOVLW 0x04
+            0x0095, // MOVWF EECON1 (WREN)
+            0x3055, // MOVLW 0x55
+            0x0096, // MOVWF EECON2
+            0x30AA, // MOVLW 0xAA
+            0x0096, // MOVWF EECON2 (armed)
+            0x1495, // BSF EECON1, WR (commit)
+            0x0813, // MOVF EEDATL, W
+            0x0020, // MOVLB 0
+            0x00A0, // MOVWF 0x20
+            0x0063, // SLEEP
+        ];
+        let mut pic = Pic14e::with_device(&device::PIC16F1938, prog);
+        pic.run(1000);
+        assert!(pic.halted());
+        assert_eq!(pic.eeprom()[0x10], 0x5C);
+        assert_eq!(pic.ram()[0x20], 0x5C, "RD latches the cell into EEDATL");
+    }
+}
+
+#[cfg(test)]
+mod pic18_eeprom {
+    use super::*;
+
+    /// The same cycle on PIC18, register file per the SDCC 18f4550.h
+    /// non-free header: EECON1 0xFA6, EECON2 0xFA7, EEDATA 0xFA8, EEADR
+    /// 0xFA9, banked stores with BSR 15.
+    #[test]
+    fn write_then_read_round_trips() {
+        let prog = vec![
+            0x0E5C, // MOVLW 0x5C
+            0x010F, // MOVLB 15
+            0x6FA8, // MOVWF EEDATA, a
+            0x0E10, // MOVLW 0x10
+            0x6FA9, // MOVWF EEADR, a
+            0x0E04, // MOVLW 0x04
+            0x6FA6, // MOVWF EECON1, a (WREN)
+            0x0E55, // MOVLW 0x55
+            0x6FA7, // MOVWF EECON2, a
+            0x0EAA, // MOVLW 0xAA
+            0x6FA7, // MOVWF EECON2, a (armed)
+            0x83A6, // BSF EECON1, WR, a (commit)
+            0x81A6, // BSF EECON1, RD, a (latch)
+            0x50A8, // MOVF EEDATA, W, a (still banked on BSR 15)
+            0x0100, // MOVLB 0
+            0x6F20, // MOVWF 0x20, a
+            0x0003, // SLEEP
+        ];
+        let mut pic = Pic18::new(prog);
+        pic.run(1000);
+        assert!(pic.halted());
+        assert_eq!(pic.eeprom()[0x10], 0x5C);
+        assert_eq!(pic.ram()[0x20], 0x5C, "RD latches the cell into EEDATA");
     }
 }
