@@ -16,9 +16,9 @@ impl Ty {
             Ty::I1 | Ty::I8 => 1,
             Ty::I16 => 2,
             Ty::I32 | Ty::F32 => 4,
-            // i64 appears only as an aggregate load/store copy (the HAL
-            // handle-copy shape, epic-cc#125); arithmetic on it is a
-            // documented limitation and panics in legalize.
+            // i64 copies only as an aggregate load/store shape (the HAL
+            // handle copy); arithmetic on it panics: invariant holds no
+            // i64 arithmetic reaches legalize (epic-cc#125).
             Ty::I64 => 8,
         }
     }
@@ -48,8 +48,8 @@ pub enum BinOp {
     AShr,
 }
 
-/// A GEP base: a named global (`@g`) or a pointer SSA register (`%r` — the
-/// result of an alloca, a byval/sret param, or another GEP).
+/// A GEP base: a named global (`@g`) or a pointer SSA register (`%r`).
+/// The register holds an alloca, a byval/sret param, or another GEP.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GepBase {
     Global(String),
@@ -95,9 +95,9 @@ pub struct Zext {
 }
 #[derive(Clone, Debug)]
 /// `%d = inttoptr <from> <val> to ptr`: a runtime integer address becoming a
-/// pointer VALUE. Kept distinct from `Zext` (which also parses to i16/i16)
-/// because the dst slot of an `IntToPtr` holds a target ADDRESS, not an
-/// ordinary value: `iselcore` seeds it as `Base::Slot(dst, true)` so every
+/// pointer VALUE. Stays distinct from `Zext` (which also parses to i16/i16):
+/// the dst slot of an `IntToPtr` holds a target ADDRESS, not an ordinary
+/// value, so `iselcore` seeds it as `Base::Slot(dst, true)` and every
 /// load/store through it lowers as an indirect (FSR/INDF) access.
 pub struct IntToPtr {
     pub dst: String,
@@ -146,9 +146,9 @@ pub struct Select {
     pub loc: Option<SrcLoc>,
 }
 /// A C source location for diagnostics: the `file.c:line:col` of the user
-/// construct a panic refers to. Resolved in `irparse` from clang's
-/// `-g` metadata; `col` is 1 for line-level scopes that
-/// carry no column (a define's `!dbg` subprogram).
+/// construct a panic refers to. Resolves in `irparse` from clang `-g`
+/// metadata; `col` is 1 for line-level scopes that carry no column
+/// (a define `!dbg` subprogram).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SrcLoc {
     pub file: String,
@@ -162,7 +162,7 @@ impl std::fmt::Display for SrcLoc {
 }
 
 /// A call argument. `ty` is `None` for pointer (`ptr`) args (byval/sret),
-/// `Some` for scalar args. `byval`/`sret` are the phase-3 call ABI flags.
+/// `Some` for scalar args. `byval`/`sret` are the call ABI flags.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallArg {
     pub ty: Option<Ty>,
@@ -183,10 +183,9 @@ pub struct Call {
     pub callees: Vec<String>,
     /// Source location of the call in the user's C, when the module was
     /// parsed from debug-info-carrying LLVM IR. `None` means compiler
-    /// generated: legalize's runtime routines, or a canonical-text
+    /// generated: legalize runtime routines, or a canonical-text
     /// reparse. Diagnostics read it; the backend threads it through to the
-    /// address-to-line table (epic-cc#238) and the canonical text does not
-    /// carry it.
+    /// address-to-line table, which the canonical text omits (epic-cc#238).
     pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
@@ -208,9 +207,9 @@ pub struct Phi {
     pub incoming: Vec<(Val, String)>,
     /// True for a pointer-typed phi (`phi ptr [..]`): the result is a
     /// pointer VALUE. A pointer phi whose every incoming is a runtime
-    /// address (a literal `Const` or a runtime-slot reg) is seeded by
-    /// iselcore as an indirect slot; a phi with a compile-time (folded)
-    /// arm keeps the loud unresolvable-chain panic.
+    /// address (a literal `Const` or a runtime-slot reg) seeds as an
+    /// indirect slot in iselcore; a phi with a folded arm panics:
+    /// invariant holds every phi arm resolves at its use.
     pub ptr: bool,
     pub loc: Option<SrcLoc>,
 }
@@ -227,18 +226,18 @@ pub struct Gep {
 }
 /// `alloca`: a local buffer of `size` bytes (virtual, isel allocates no
 /// registers; alloc sizes the slot). `size` is a `u8` (max 255 bytes);
-/// oversized types such as `[N x T]`, `{ ... }`, `%struct.X` or literal structs
-/// exceeding 255 bytes panic at parse time in `irparse::ty_size_align`.
+/// an oversized type panics: invariant holds every alloca sizes to 255
+/// bytes or less in `irparse::ty_size_align`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Alloca {
     pub dst: String,
     pub size: u8,
     pub loc: Option<SrcLoc>,
 }
-/// `memcpy`: byte-copy `len` bytes from `src` to `dst` (defines nothing).
-/// `len` is either a compile-time constant (unrolled per byte) or a 16-bit
-/// register value (issue #4: runtime length — a counted loop; the value is
-/// SSA-dead after the copy, so isel may decrement the length slot in place).
+/// `memcpy`: byte-copies `len` bytes from `src` to `dst` (defines nothing).
+/// `len` is a compile-time constant (unrolled per byte) or a 16-bit
+/// register value (a counted loop; the value is SSA-dead after the copy,
+/// so isel decrements the length slot in place) (epic-cc#4).
 #[derive(Clone, Debug, PartialEq)]
 pub enum MemLen {
     Const(u8),
@@ -251,9 +250,9 @@ pub struct Memcpy {
     pub len: MemLen,
     pub loc: Option<SrcLoc>,
 }
-/// `freeze`: LLVM freeze (`%d = freeze <ty> <val>`). A no-op in the backend —
-/// it exists so the IR round-trips the source; isel lowers it as a plain byte
-/// copy of `val` into the `dst` slot.
+/// `freeze`: LLVM freeze (`%d = freeze <ty> <val>`). A no-op in the backend:
+/// it exists so the IR round-trips the source; isel lowers it as a plain
+/// byte copy of `val` into the `dst` slot.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Freeze {
     pub dst: String,
@@ -289,7 +288,7 @@ pub struct VaStart {
     pub loc: Option<SrcLoc>,
 }
 
-/// The four float arithmetic ops (always f32 — msp430's float == f32).
+/// The four float arithmetic ops (always f32: msp430 float is f32).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FBinOp {
     FAdd,
@@ -297,7 +296,7 @@ pub enum FBinOp {
     FMul,
     FDiv,
 }
-/// `%d = fadd float %a %b` — both operands and the dst are f32 (implicit).
+/// `%d = fadd float %a %b`: both operands and the dst are f32 (implicit).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FloatBin {
     pub dst: String,
@@ -306,7 +305,7 @@ pub struct FloatBin {
     pub b: Val,
     pub loc: Option<SrcLoc>,
 }
-/// `%d = fcmp <pred> float %a %b` — the 16 LLVM float predicates; dst is i1.
+/// `%d = fcmp <pred> float %a %b`: the 16 LLVM float predicates; dst is i1.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Fcmp {
     pub dst: String,
@@ -315,8 +314,8 @@ pub struct Fcmp {
     pub b: Val,
     pub loc: Option<SrcLoc>,
 }
-/// The int<->float conversions and the f32->f32 casts (fpext/fptrunc are
-/// no-ops on msp430 — double == float — but round-trip for the text).
+/// The int to float conversions and the f32 to f32 casts (fpext/fptrunc are
+/// no-ops on msp430: double is float, but both round-trip for the text).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FloatConvOp {
     FpToSi,
@@ -460,10 +459,10 @@ pub struct Global {
     pub is_const: bool,
     pub size: u16,
     pub bytes: Vec<u8>,
-    /// Byte offsets into `bytes` that hold a function's link-time address
-    /// (a `ptr @fn` const struct field, epic-cc#154): the table emitters
-    /// and the const-to-RAM init materialize `LOW(fn)`/`HIGH(fn)` label
-    /// literals at these offsets instead of the placeholder zero bytes.
+    /// Byte offsets into `bytes` holding a function link-time address
+    /// (a `ptr @fn` const struct field). The table emitters and the
+    /// const-to-RAM init materialize `LOW(fn)`/`HIGH(fn)` label literals
+    /// at these offsets, not the placeholder zero bytes (epic-cc#154).
     pub refs: Vec<(usize, String)>,
     pub addr: Option<u16>,
 }
@@ -652,9 +651,9 @@ fn unescape_asm(s: &str) -> String {
     out
 }
 
-/// Extract the inner content of the first quoted string in `s` (starting at
-/// the first `"`), handling `\"` and `\\` escapes, and return (unescaped
-/// content, byte index after the closing `"`).
+/// Extracts the inner content of the first quoted string in `s` (starting
+/// at the first `"`), handling `\"` and `\\` escapes. Returns the unescaped
+/// content and the byte index after the closing `"`.
 fn parse_quoted_unescaped(s: &str) -> (String, usize) {
     let bytes = s.as_bytes();
     let start = bytes
@@ -951,7 +950,7 @@ fn op_str(o: BinOp) -> &'static str {
     }
 }
 
-/// Index of the `)` matching the `(` at `open` in `s`.
+/// Returns the index of the `)` matching the `(` at `open` in `s`.
 fn matching_paren(s: &str, open: usize) -> usize {
     let mut depth = 0usize;
     for (i, c) in s[open..].char_indices() {
@@ -1059,9 +1058,9 @@ pub fn parse(text: &str) -> Module {
         } else if line == "}" || line == "{" {
             continue;
         } else if line.ends_with(':') {
-            // Support both `block foo:` (canonical) and `foo:` (brace-style test
-            // input from CC-4 Task 1). The brace style is e.g. `entry:` inside
-            // `fn foo() [naked] () { entry: asm ... }`.
+            // Accepts `block foo:` (canonical) and bare `foo:` (brace-style
+            // test input, e.g. `entry:` inside
+            // `fn foo() [naked] () { entry: asm ... }`).
             if let Some(f) = cur_func.as_mut() {
                 if let Some(b) = cur_block.take() {
                     f.blocks.push(b);
@@ -1705,7 +1704,7 @@ fn parse_inst(line: &str) -> Inst {
     }
     let mut it = body.split_whitespace();
     let op = it.next().unwrap();
-    // float binops: `%d = fadd float %a %b` (f32 is implicit — both operands
+    // float binops: `%d = fadd float %a %b` (f32 is implicit: both operands
     // and the dst are float).
     if matches!(op, "fadd" | "fsub" | "fmul" | "fdiv") {
         let t = parse_ty(it.next().unwrap());

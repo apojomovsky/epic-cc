@@ -7,14 +7,14 @@
 //! unchanged addresses. Every local of every function lives in a frame
 //! assigned from the call graph: `base(f) = max over callers of the
 //! caller's **physical** frame end` (the address just past its last placed
-//! local, bank crossings included — see `frame_end`), roots start after the
+//! local, bank crossings included; see `frame_end`), roots start after the
 //! globals, so sibling functions (never co-live) share RAM.
 //!
 //! Both allocators assign **physical** addresses and step through the
 //! device's GPR banks (`Device::region_for`); demand past the last bank
-//! panics. The device's common RAM is never used by locals (M3 decision) —
-//! the bank progression jumps past it — and holds the fixed scratch/retval
-//! bytes instead (see `isel`).
+//! panics. The liveness overlay never places locals in common RAM (the bank
+//! progression jumps past it); common RAM holds the fixed scratch and
+//! retval bytes instead (see `isel`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -68,7 +68,7 @@ fn region_for(device: &Device, addr: u16) -> (u16, u16) {
 /// The physical address just past a `width`-byte global placed at `start`:
 /// the address a following global's cursor must advance to. For a
 /// single-bank object this is `start + width`; for a bank-straddling object
-/// (PIC14E, docs/33 D-2) the bytes skip common RAM, so the physical end is
+/// (PIC14E, docs/33 §2) the bytes skip common RAM, so the physical end is
 /// `start + width` plus the skipped common-RAM bytes. Mirrors the placement
 /// walk in `try_place_straddle`.
 fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
@@ -95,14 +95,14 @@ fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
 /// address `addr`, or `None` if no region past `addr` has room (the device's
 /// last bank has been exhausted). Steps through regions via
 /// `device.region_for`, keeping the value even-aligned within its bank
-/// region (`align = width.min(2)` — only 2-byte values need even alignment).
+/// region (`align = width.min(2)`; only 2-byte values need even alignment).
 ///
 /// On PIC14E a global too large for any single GPR bank may straddle a bank
-/// boundary (docs/33 D-2): the object's bytes are placed contiguously
+/// boundary (docs/33 §2): the object's bytes are placed contiguously
 /// through the GPR banks, skipping common RAM, and `isel-pic14e` addresses
 /// it through the linear region so one FSR walks across banks. On every
 /// other core a straddling global is unrepresentable (classic PIC14's
-/// FSR+IRP cannot cross a bank), so it keeps panicking loudly.
+/// FSR+IRP cannot cross a bank), so it panics.
 fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
     let align = width.min(2);
     let mut a = addr;
@@ -129,7 +129,7 @@ fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
 /// device's last bank. The object's bytes all land in GPR banks; the
 /// physical layout is non-contiguous (the common-RAM hole between banks is
 /// skipped), which is exactly the case `isel-pic14e` addresses through the
-/// linear region (docs/33 D-2).
+/// linear region (docs/33 §2).
 fn try_place_straddle(device: &Device, addr: u16, width: u8) -> Option<u16> {
     let mut cur = addr;
     let mut remaining = u16::from(width);
@@ -151,7 +151,7 @@ fn try_place_straddle(device: &Device, addr: u16, width: u8) -> Option<u16> {
 /// The start address for a `width`-byte local placed contiguously at the next
 /// free frame byte `addr`: step across banks when `addr` has passed a
 /// region's end, and panic past the device's last bank. Locals are NOT
-/// even-aligned — the overlay frame math (M3) is a plain byte sum, so placing
+/// even-aligned: the liveness-overlay frame math is a plain byte sum, so placing
 /// locals contiguously keeps a frame's virtual footprint exactly equal to
 /// `locals_size(f)`, and a caller's physical end (see `frame_end`) is the
 /// address its callees' bases are derived from. The bank progression starts
@@ -177,7 +177,7 @@ struct BankCursor {
 }
 
 /// The physical address just past a frame whose locals, in placement order
-/// (`widths`), are placed contiguously at `base` — i.e. the final address
+/// (`widths`), are placed contiguously at `base`: the final address
 /// after walking each local through `place_contiguous`, exactly the way the
 /// locals are laid out. This is the address a callee overlaid on this frame
 /// must be derived from. A plain contiguous-blob model (`base + total_size`,
@@ -185,7 +185,7 @@ struct BankCursor {
 /// not fit in the bytes left in a region moves *wholesale* to the next region,
 /// leaving the region-tail byte unused (a 1-byte hole whenever an i16 local is
 /// placed at 0x6F/0xEF/0x16F), so the true end can trail the blob's end by one
-/// byte per crossing — and a callee based on the blob end could land exactly
+/// byte per crossing, and a callee based on the blob end could land exactly
 /// on the caller's live locals. Walking the actual placements reproduces the
 /// layout step that assigns the locals, so the result is the true physical
 /// end. When no local crosses a gap the walk reduces to `base + total_size`,
@@ -201,11 +201,10 @@ fn frame_end(device: &Device, base: u16, widths: &[u8]) -> u16 {
 /// The frame base for a runtime routine: a frame that stays inside the bank
 /// its derived base lands in keeps that base (sibling routines pack
 /// contiguously, wasting nothing); a frame that would straddle a bank
-/// boundary moves wholesale to the next bank's start. The routine recipe
-/// loops are skip-sensitive (issue #6): a BANKSEL the banking pass would
-/// insert between a test and its target, or between the two operands of a
-/// same-skip carry idiom (`INCFSZ f,W` targeting `ADDWF g,F`), would
-/// change the skip targets, so the whole frame must live in ONE GPR bank.
+/// boundary moves wholesale to the next bank's start. The recipe loops are
+/// skip-sensitive: a BANKSEL between a test and its target, or between the
+/// two operands of a same-skip carry idiom, would change the skip targets,
+/// so the whole frame must live in ONE GPR bank (epic-cc#6).
 fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
     let end = frame_end(device, base, widths);
     let (_, region_end) = device
@@ -224,10 +223,10 @@ fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
 }
 
 /// `base` unchanged for an ordinary function; `routine_base`-rounded for a
-/// runtime routine (issue #6); `float_routine_base`-pinned into the
-/// access-bank window for a float routine on a device that reserves one
-/// (ADR-015 / docs/36). Shared by the main-context and ISR-context
-/// base-assignment loops, which both need this same rounding.
+/// runtime routine, so its frame stays in one bank; `float_routine_base`
+/// pinned into the access-bank window for a float routine on a device that
+/// reserves one (ADR-015, docs/36). Shared by the main-context and
+/// ISR-context base-assignment loops (epic-cc#6).
 fn round_if_routine(
     device: &Device,
     f: &str,
@@ -249,7 +248,7 @@ fn round_if_routine(
 
 /// The PIC18 access-bank GPR window reserved for float runtime routine
 /// frames, `Some((lo, hi))` when the device declares an access bank and the
-/// module uses at least one float routine (ADR-015 / docs/36). `lo` is the
+/// module uses at least one float routine (ADR-015, docs/36). `lo` is the
 /// device's GPR start (the access bank's low SFR segment is not placeable
 /// RAM); `hi` is the access bank's high bound. `None` on PIC14 (no access
 /// bank) or when no float routine is present (the reservation would be
@@ -282,14 +281,13 @@ fn float_routine_base(device: &Device, window: (u16, u16), widths: &[u8]) -> u16
     lo
 }
 
-/// The liveness-colored frame of one function: the distinct slot widths in
+/// One function's liveness-overlay frame: the distinct slot widths in
 /// allocation order (the order `frame_end` walks) and the frame's byte size
 /// (the colored peak, not the width sum). Values whose live ranges never
 /// overlap share a slot, so a frame shrinks from the width sum to the peak
-/// simultaneous demand (M3 deferred this; epic-cc#172 is the deferral's
-/// bill). The coloring is deterministic: values are processed in (range
-/// start, placement order) and each reuses the lowest slot whose interval
-/// is disjoint.
+/// simultaneous demand. The coloring is deterministic: values are processed
+/// in (range start, placement order), each reusing the lowest slot whose
+/// interval is disjoint (epic-cc#172).
 struct FrameLayout {
     widths: Vec<u8>,
     size: u16,
@@ -712,7 +710,7 @@ fn val_name(v: &ir::Val) -> String {
 
 /// Every function transitively reachable from `roots` over the caller ->
 /// callee map `edges` (the roots included). A visited set keeps a call cycle
-/// (rejected loudly earlier by the topological sort) from looping forever.
+/// (rejected earlier by the topological sort) from looping forever.
 fn reachable<'a>(roots: &[&'a str], edges: &'a HashMap<String, Vec<String>>) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<&str> = roots.to_vec();
@@ -806,8 +804,8 @@ fn global_end(map: &HashMap<String, u16>, floating: &[&ir::Global]) -> u16 {
 /// Assign every address: globals sequential (even-aligned i16, stepping
 /// through banks), locals per the overlay algorithm over the call graph parsed
 /// from `edges_text` (`edge <caller> <callee>` lines, order-agnostic; `depth`
-/// lines are informational). Panics loudly on a cyclic or unknown-function
-/// call graph, and if total demand exceeds the device's GPR space.
+/// lines are informational). Panics on a cyclic or unknown-function call
+/// graph, and when total demand exceeds the device's GPR space.
 
 /// The byte size of each variadic callee's va region: the maximum over its
 /// call sites of the sum of extra-arg widths (the args past the named
@@ -867,7 +865,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
     // The PIC18 access-bank GPR window reserved for float runtime routine
-    // frames (ADR-015 / docs/36). When present, globals and ordinary frames
+    // frames (ADR-015, docs/36). When present, globals and ordinary frames
     // start above it and float routines pack into it.
     let access_window = access_window(device, m);
     let global_start = match access_window {
@@ -961,12 +959,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                     }
                     // A pointer select whose arms are const globals is a runtime
                     // address VALUE when the arms do not fold to a common base
-                    // (iselcore seeds it as an
-                    // indirect slot, epic-cc#147): the selected arm's bytes
-                    // are read through the slot with RAM semantics, so each
-                    // const arm must be copied to RAM. A select that folds
-                    // (same base, e.g. the ccp_sel shape) keeps its const in
-                    // flash: loads lower via the fold's RETLW/TBLRD path.
+                    // (iselcore seeds it as an indirect slot): the selected
+                    // arm's bytes are read through the slot with RAM semantics,
+                    // so each const arm must be copied to RAM. A select that
+                    // folds (same base, e.g. the ccp_sel shape) keeps its
+                    // const in flash: loads lower via the fold's RETLW/TBLRD
+                    // path (epic-cc#147).
                     if let ir::Inst::Select(s) = inst {
                         if !s.ptr {
                             continue;
@@ -1159,12 +1157,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             });
     let bank0_start = end_of_globals.max(global_start);
 
-    // 2. locals_widths(f) = the liveness-colored slot widths of f's params
+    // 2. locals_widths(f) = the liveness-overlay slot widths of f's params
     // and defined values, in allocation order (the order `frame_end` walks
     // and the locals placement reproduces). Values whose live ranges never
     // overlap share a slot, so a frame shrinks from the width sum to the
-    // peak simultaneous demand (M3 deferred this; epic-cc#172 is the
-    // deferral's bill). locals_size(f) is the colored frame's byte size.
+    // peak simultaneous demand. locals_size(f) is the colored frame's byte
+    // size (epic-cc#172).
     let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
     let mut locals_size: HashMap<String, u16> = HashMap::new();
     let va_sizes = va_sizes(m);
@@ -1209,7 +1207,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         }
     }
 
-    // 4. Topological order (recursion is rejected by callgraph; panic loudly
+    // 4. Topological order (recursion is rejected by callgraph; panics
     // if one slips through, and on any edge to an unknown function).
     let mut indeg: HashMap<String, usize> = m.funcs.iter().map(|f| (f.name.clone(), 0)).collect();
     for (caller, cs) in &edges {
@@ -1271,7 +1269,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // every caller precedes its callees. The virtual sum base(p) +
     // locals_size[p] is NOT used: a caller whose frame spills past a bank
     // region end ends beyond that sum, and a callee based on it could land in
-    // the gap at the next region's start — exactly where the caller's spill
+    // the gap at the next region's start, exactly where the caller's spill
     // locals live while both frames are live. frame_end walks the caller's
     // actual local widths through place_contiguous, so it matches the layout
     // step's placement exactly (including the unused hole byte an i16 leaves
@@ -1292,30 +1290,28 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 .expect("alloc: empty caller list"),
             None => bank0_start,
         };
-        // Issue #6: a runtime routine's frame must stay inside ONE GPR bank
-        // (its skip-sensitive recipe loops cannot tolerate a BANKSEL between
-        // a test and its target, or inside a carry idiom). The base is
-        // rounded when the derived frame would straddle a bank boundary. A
-        // float routine on a device with an access bank is pinned into the
-        // access-bank window instead (ADR-015 / docs/36).
+        // A runtime routine's frame must stay inside ONE GPR bank: its
+        // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
+        // test and its target, or inside a carry idiom. The base is rounded
+        // when the derived frame would straddle a bank boundary; a float
+        // routine on a device with an access bank is pinned into the
+        // access-bank window instead (ADR-015, docs/36; epic-cc#6).
         let b = round_if_routine(device, f, b, &locals_widths, access_window);
         base.insert(f.clone(), b);
     }
 
     // 6b. The disjoint ISR region: an ISR root's frame base is AFTER the
     // main context's total (the max physical frame end over the NON-ISR
-    // roots' contexts), not `bank0_start` — the ISR can preempt main at any
+    // roots' contexts), not `bank0_start`. The ISR can preempt main at any
     // point, so a preempted main's live frames must never overlap the ISR
-    // context's frames. The plan states this as "max depth_end over the
-    // NON-ISR roots"; the physical variant equals that when no local crosses
-    // a bank gap and is strictly larger (hence safer) when an i16 at a
-    // region tail leaves a hole, exactly the frame_end vs depth_end
-    // distinction the overlay already makes for callee bases. The main loop
-    // above is exact for every non-ISR context (no ISR-side function is
-    // reachable from them), so the disjoint base is computed from its
-    // results; the ISR contexts are then re-derived from that base in topo
-    // order (callers precede callees, and every caller of an ISR-context
-    // function is itself in the ISR context after the legalize duplication).
+    // context's frames. The physical end equals the depth sum when no local
+    // crosses a bank gap, and is strictly larger (hence safer) when an i16
+    // at a region tail leaves a hole.
+    //
+    // The main loop above is exact for every non-ISR context (no ISR-side
+    // function is reachable from them), so the disjoint base derives from
+    // its results; the ISR contexts are then re-derived from that base in
+    // topo order (callers precede callees).
     let isr_names: HashSet<&str> = m
         .funcs
         .iter()
@@ -1360,8 +1356,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                     .max()
                     .expect("alloc: empty caller list")
             };
-            // Issue #6: the ISR context's routine copies get the same
-            // single-bank frame rounding as the main context's.
+            // The ISR context's routine copies get the same single-bank
+            // frame rounding as the main context's (epic-cc#6).
             let b = round_if_routine(device, f, b, &locals_widths, access_window);
             base.insert(f.clone(), b);
         }
@@ -1424,7 +1420,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         for g in &m.globals {
             if let Some(&a) = globals.get(&g.name) {
                 // A bank-straddling global's physical end skips common RAM
-                // (docs/33 D-2), so the per-bank high-water must use
+                // (docs/33 §2), so the per-bank high-water must use
                 // physical_end, not a + size (which would overcount the
                 // first bank into the common-RAM hole and miss the later
                 // banks entirely).
@@ -1469,11 +1465,10 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
 /// for non-defining instructions. `icmp` results are i1 (1 byte) regardless
 /// of the operand type. `resolved` is iselcore's pointer resolution for
 /// the module: a pointer select gets a slot only when iselcore seeded it
-/// as an indirect slot (its two address bytes are materialized into the
-/// dst, epic-cc#117 and epic-cc#147). A folded select is virtual (iselcore
-/// folds it like a GEP) and defines no slot; allocating one would be dead
-/// space that perturbs the liveness coloring and can clobber a fold-term
-/// register the fold still reads at every load site.
+/// as an indirect slot (its two address bytes materialize into the dst).
+/// A folded select is virtual (iselcore folds it like a GEP) and defines no
+/// slot; allocating one would be dead space that perturbs the liveness
+/// coloring and can clobber a fold-term register (epic-cc#117, epic-cc#147).
 fn def_width(
     inst: &Inst,
     resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
@@ -1489,9 +1484,9 @@ fn def_width(
         Inst::Icmp(i) => Some((i.dst.clone(), 1)),
         // A pointer select iselcore seeded as an indirect slot
         // (`Base::Slot(dst, true)`) materializes its two address bytes into
-        // the dst slot (epic-cc#117 and epic-cc#147), so the dst needs a
-        // slot like any 2-byte value. A folded select is virtual and
-        // defines no slot.
+        // the dst slot, so the dst needs a slot like any 2-byte value. A
+        // folded select is virtual and defines no slot
+        // (epic-cc#117, epic-cc#147).
         Inst::Select(s)
             if matches!(
                 resolved.get(&ssa_key(fname, &s.dst)),
@@ -1530,7 +1525,7 @@ fn def_width(
     }
 }
 
-/// Render the layout as `global <name> 0xNN`, `const <name>` (no address —
+/// Render the layout as `global <name> 0xNN`, `const <name>` (no address:
 /// the global lives in flash), and `local <func> <name> 0xNN` lines,
 /// deterministically sorted by key. The internal alloc<->isel contract
 /// (the alloc bin and alloc tests consume it); the driver's user-facing

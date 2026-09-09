@@ -5,7 +5,7 @@ use device::Device;
 
 /// Decode Intel HEX (gpasm output) into 14-bit words, indexed by word address.
 pub fn parse_hex(data: &str) -> Vec<u16> {
-    let mut max_word = 8191usize; // never shrink below the historical minimum
+    let mut max_word = 8191usize; // Keeps the minimum program size for small images.
     for line in data.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -199,9 +199,9 @@ pub struct Pic14 {
 
 impl Pic14 {
     /// A simulator on the canonical PIC14 geometry (`PIC16F877A`), for callers
-    /// that only execute instructions and never depend on where GPR begins in
+    /// that only execute instructions without depending on GPR placement in
     /// a bank. Use [`Pic14::with_device`] for anything that does: a part whose
-    /// banks differ is modelled wrongly here, silently.
+    /// banks differ models wrongly here, silently.
     pub fn new(prog: Vec<u16>) -> Self {
         Self::with_device(&device::PIC16F877A, prog)
     }
@@ -264,7 +264,7 @@ impl Pic14 {
     /// program counter without modelling INTCON.
     ///
     /// `fire_interrupt` is called BETWEEN steps, so `pc` addresses an
-    /// instruction that has not executed yet: the return address is `pc`
+    /// instruction that still awaits execution: the return address is `pc`
     /// itself, and RETFIE resumes by running it. (Pushing `pc + 1` would
     /// silently drop that instruction.)
     pub fn fire_interrupt(&mut self) {
@@ -273,13 +273,13 @@ impl Pic14 {
     /// Request the interrupt through the modelled path: latch it and set
     /// INTF. It is taken at the next step boundary at which GIE and INTE are
     /// both set, so a program that masks interrupts keeps it pending until
-    /// it unmasks. The latch is consumed on entry, so a handler that never
-    /// clears INTF still runs once rather than looping.
+    /// it unmasks. The latch is consumed on entry, so a handler that leaves
+    /// INTF set still runs once rather than looping.
     pub fn request_interrupt(&mut self) {
         self.ram[INTCON] |= INTF;
         self.pending = true;
     }
-    /// Whether a requested interrupt is still latched and not yet taken.
+    /// Whether a requested interrupt remains latched and untaken.
     pub fn interrupt_pending(&self) -> bool {
         self.pending
     }
@@ -765,11 +765,11 @@ pub struct Pic14e {
     halted: bool,
     /// A latched interrupt request awaiting GIE + INTE, mirroring `Pic14`.
     pending: bool,
-    /// The hardware shadow-register context save (DS41364E section 7.5,
-    /// D-4): W, STATUS (except TO/PD), BSR, FSR0L/H, FSR1L/H, PCLATH are
+    /// The hardware shadow-register context save (DS41364E section 7.5):
+    /// W, STATUS (except TO/PD), BSR, FSR0L/H, FSR1L/H, PCLATH are
     /// snapshotted on interrupt entry and restored on RETFIE. The compiler
-    /// emits no manual save/restore for them (the P5 static assertion), so
-    /// the sim must model the shadow save for the run to be faithful.
+    /// emits no manual save/restore for them, so the sim models the shadow
+    /// save to stay faithful.
     shadow: [u8; 8],
     /// Extra cycle owed by an INDF access to the program-flash region
     /// (DS41364E section 3.5.3 note 2): the step budget consumes it before
@@ -783,7 +783,7 @@ pub struct Pic14e {
 impl Pic14e {
     /// A simulator on `device`'s memory map. The bank map, the linear
     /// region and the flash window are per-core constants on this core
-    /// (docs/33 D-2), so only the `Core::Pic14e` contract is checked, not
+    /// (docs/33 §D-2), so only the `Core::Pic14e` contract is checked, not
     /// per-device fields.
     pub fn with_device(device: &Device, prog: Vec<u16>) -> Self {
         assert_eq!(
@@ -852,7 +852,7 @@ impl Pic14e {
         self.pending
     }
     fn enter_isr(&mut self) {
-        // Hardware shadow context save (DS41364E section 7.5, D-4): W,
+        // Hardware shadow context save (DS41364E section 7.5): W,
         // STATUS (except TO and PD), BSR, FSR0, FSR1 and PCLATH. The
         // compiler relies on it (no manual save/restore), so the sim
         // restores these at RETFIE.
@@ -920,7 +920,7 @@ impl Pic14e {
     }
 
     /// The physical data-memory address an FSR selects. Program flash is
-    /// read-only, so a write path never resolves here: `write_ram` panics
+    /// read-only, so no write path resolves here: `write_ram` panics
     /// on an FSR address in the flash region.
     fn indirect_addr(&self, fsr: u16) -> usize {
         if fsr & 0x8000 != 0 {
@@ -1045,7 +1045,7 @@ impl Pic14e {
             0x0008 => return self.pop_return(), // RETURN
             0x0009 => {
                 // RETFIE: restore the hardware shadow context save
-                // (DS41364E section 7.5, D-4) and re-enable interrupts.
+                // (DS41364E section 7.5) and re-enable interrupts.
                 self.w = self.shadow[0];
                 self.ram[3] = (self.ram[3] & 0x18) | (self.shadow[1] & 0x07); // STATUS minus TO/PD
                 self.ram[8] = self.shadow[2]; // BSR
@@ -1336,7 +1336,7 @@ impl Pic14e {
             }
             0x31 => {
                 // MOVLP sets word bit 7 (`11 0001 1kk kkkk`); ADDFSR's 6-bit
-                // k never reaches it (`11 0001 0nkk kkkk`).
+                // k leaves it clear (`11 0001 0nkk kkkk`).
                 if word & 0x80 != 0 {
                     self.ram[0x0A] = (word & 0x7F) as u8; // MOVLP
                 } else {
@@ -1469,11 +1469,11 @@ pub fn parse_hex_pic18(data: &str) -> Vec<u16> {
 /// Decode the driver's PIC14E Intel HEX output into 14-bit words, indexed
 /// by word address. Word addressing and dynamic sizing match `parse_hex`,
 /// but the ELA handling matches `parse_hex_pic18`: the driver emits
-/// CONFIG1/CONFIG2 as a separate region at byte 0x1000E (D-3), and a
+/// CONFIG1/CONFIG2 as a separate region at byte 0x1000E, and a
 /// parser that ignores 0x04 records lets that region's low-16 address
 /// alias program words.
 pub fn parse_hex_pic14e(data: &str) -> Vec<u16> {
-    let mut max_word = 8191usize; // never shrink below the historical minimum
+    let mut max_word = 8191usize; // Keeps the minimum program size for small images.
     let mut extended_upper: usize = 0;
     for line in data.lines() {
         let line = line.trim();
@@ -1630,9 +1630,8 @@ impl Pic18 {
                 // of `halted = true` as the simulator's stop condition:
                 // real programs end on this, since `parse_hex_pic18`
                 // returns the full flash-sized buffer (zero-padded NOPs
-                // all the way out), so "ran off the end of `prog`" never
-                // happens for a realistic program within a normal step
-                // budget.
+                // all the way out), so running off the end of `prog`
+                // stays out of reach for programs within a step budget.
                 self.halted = true;
                 pc
             }
@@ -1717,26 +1716,21 @@ impl Pic18 {
         after_pc + if is_two_word { 4 } else { 2 }
     }
 
-    /// Byte-oriented dispatch: mask off the variable fields and match the
+    /// Byte-oriented dispatch: masks off the variable fields and matches the
     /// fixed "base" bits directly against the encoding table's hex
-    /// constants. Do not recover an opcode via shift-then-narrow-mask
-    /// arithmetic; the two groups have different-width fixed fields (the
-    /// d+a+f group's fixed bits are `word & 0xFC00`, clearing d=bit9/
-    /// a=bit8/f=bits7-0; the a+f-only group's fixed bits are
-    /// `word & 0xFE00`, clearing only a=bit8/f, because bit9 is part of
-    /// ITS fixed identifier, not a variable field). A narrower mask
-    /// silently collides unrelated opcodes.
+    /// constants. The two groups carry different-width fixed fields (the
+    /// d+a+f group's fixed bits are `word & 0xFC00`; the a+f-only group's
+    /// are `word & 0xFE00`, since bit9 belongs to its fixed identifier).
+    /// Recovering opcodes by shift-then-narrow-mask arithmetic collides
+    /// unrelated opcodes, so the match uses the wide masks directly.
     fn exec_byte(&mut self, pc: u32, word: u16) -> u32 {
         let a = (word >> 8) & 1;
         let d = (word >> 9) & 1;
         let f = word & 0xFF;
-        // ONE operand resolve per instruction. A d=1 access on a virtual
-        // register (SDCC's `MOVF POSTINC1, F` stack-pop idiom) applies
-        // the side effect once for the whole read-modify-write;
-        // resolving again for the write-back double-incremented FSRs and
-        // corrupted every SDCC software-stack frame. epic-cc's own
-        // output never addresses a virtual register directly, so only
-        // the SDCC oracle exposed this.
+        // Resolves the operand once per instruction: a d=1 access on a
+        // virtual register applies its side effect once for the whole
+        // read-modify-write. Resolving again at write-back repeats the
+        // side effect and corrupts the software-stack frame.
         let op = self.resolve_f(a, f);
         // No-destination-select group first (`word & 0xFE00`): CLRF/
         // CPFSEQ/CPFSGT/CPFSLT/MOVWF/MULWF/NEGF/SETF/TSTFSZ.
@@ -1934,9 +1928,8 @@ impl Pic18 {
             }
             0x5400 | 0x5800 => {
                 // SUBFWB / SUBWFB: f - W - !C, computed as f + !W + C (the
-                // ALU adder with W inverted. See the plan's note that
-                // these two mnemonics share this exact computation; no
-                // empirical evidence distinguishes them, so both use it).
+                // ALU adder with W inverted; both mnemonics share this
+                // computation).
                 let fv = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = self.addc_flags(fv, !self.w, cin);
@@ -2053,10 +2046,10 @@ impl Pic18 {
         self.ram[0xFFE] = ((top >> 8) & 0xFF) as u8;
         self.ram[0xFFF] = ((top >> 16) & 0xFF) as u8;
     }
-    /// Decimal-adjust W after a BCD addition: if the low nibble is > 9 or
-    /// DC is set, add 6; if the (possibly-adjusted) high nibble is > 9 or C
-    /// is set, add 0x60 and set C (C is only ever set by DAW, never
-    /// cleared, matching the datasheet's "sticky" carry-out convention).
+    /// Decimal-adjusts W after a BCD addition: if the low nibble exceeds 9
+    /// or DC is set, adds 6; if the adjusted high nibble exceeds 9 or C
+    /// is set, adds 0x60 and sets C (DAW sets C without clearing it,
+    /// matching the datasheet sticky carry-out convention).
     fn exec_daw(&mut self) {
         let dc = self.ram[self.status_addr()] & 0x02 != 0;
         let mut w = self.w;
@@ -2196,19 +2189,17 @@ impl Pic18 {
     }
 
     fn exec_movff(&mut self, pc: u32, word: u16, word2: u16) -> u32 {
-        // MOVFF's two 12-bit operands are already full physical addresses
-        // (see isel-pic18's `operand` doc comment: MOVFF bypasses the `a`
-        // bit and `BSR` entirely and addresses the whole linear data
-        // space directly) -- so they go through `resolve_phys`, not
-        // `resolve_f`. `resolve_f` would re-derive a physical address
-        // from what it assumes is an 8-bit register-file field, which
-        // double-adds `0xF00` for anything already in the SFR page and
-        // is out of range entirely for a banked GPR address above 0x5F.
+        // MOVFF's two 12-bit operands already name full physical addresses:
+        // MOVFF bypasses the `a` bit and `BSR` and addresses the whole
+        // linear data space directly, so they resolve through
+        // `resolve_phys`, not `resolve_f`. `resolve_f` re-derives a physical
+        // address from an assumed 8-bit field, which double-adds `0xF00`
+        // inside the SFR page and leaves banked GPR above 0x5F out of range.
         //
-        // Resolve `src` and read its value BEFORE resolving `dst`: a
-        // `POSTINCn`-to-`POSTINCm` copy needs both FSRs to advance exactly
-        // once each, and `resolve_phys` performs the post-increment as a
-        // side effect of resolving the address, not as a separate step.
+        // Resolves `src` and reads its value before resolving `dst`: a
+        // `POSTINCn`-to-`POSTINCm` copy advances both FSRs exactly once
+        // each, since `resolve_phys` performs the post-increment while
+        // resolving the address, not as a separate step.
         let src = self.resolve_phys((word & 0xFFF) as usize);
         let val = self.read_phys(src);
         let dst = self.resolve_phys((word2 & 0xFFF) as usize);
@@ -2216,10 +2207,9 @@ impl Pic18 {
         pc + 4
     }
 
-    /// RETFIE restores GIE (INTCON bit 7, the hardware's shadow restore)
-    /// and pops the return address, resuming the interrupted code. (The
-    /// interrupt-entry modelling that clears GIE landed with P5's interrupt
-    /// model; before that RETFIE behaved like RETURN.)
+    /// RETFIE restores GIE (INTCON bit 7, the hardware shadow restore)
+    /// and pops the return address, resuming the interrupted code. Entry
+    /// clears GIE, so this restore pairs with that clearing.
     fn exec_retfie(&mut self) -> u32 {
         self.ram[0xFF2] |= 0x80; // GIE back on
         self.pop_return()
@@ -2302,28 +2292,19 @@ impl Pic18 {
         self.set_ov(((a ^ b) & (a ^ r) & 0x80) != 0);
     }
 
-    /// Resolve a byte/bit-oriented `(a, f)` pair to its physical 12-bit
-    /// address. `a=0` (access bank): `f<=0x5F` -> `f` (low access,
-    /// `0x000-0x05F`); `f>0x5F` -> `0xF00+f` (high access/SFR,
-    /// `0xF60-0xFFF`). `a=1` (banked): `(BSR<<8)|f`. This split is a core
-    /// PIC18 architecture invariant (see the plan's reference section),
-    /// hard-coded here exactly as `Pic14::bank_base` hard-codes RP1:RP0.
+    /// Resolves a byte/bit-oriented `(a, f)` pair to its physical 12-bit
+    /// address. `a=0` (access bank): `f<=0x5F` maps to `f` (low access,
+    /// `0x000-0x05F`); `f>0x5F` maps to `0xF00+f` (high access/SFR,
+    /// `0xF60-0xFFF`). `a=1` (banked) maps to `(BSR<<8)|f`, hard-coded
+    /// here exactly as `Pic14::bank_base` hard-codes RP1:RP0.
     ///
-    /// Indirect addressing registers (`INDFn`/`POSTINCn`/`POSTDECn`/
-    /// `PREINCn`/`PLUSWn`) are checked AFTER the physical address above is
-    /// resolved, by matching the RESULT against the SFR addresses those
-    /// registers actually live at (`0xFD9-0xFEF`), never against the raw
-    /// `f` byte in isolation. `f`'s low byte alone is ambiguous: a
-    /// `BSR`-banked (`a=1`) ordinary GPR access can have a low byte that
-    /// coincidentally equals e.g. `0xE7` (INDF1) while its real physical
-    /// address (`BSR<<8 | f`) lands nowhere near the SFR page. Matching on
-    /// raw `f` treated every such GPR write as an indirect-register access
-    /// instead, corrupting unrelated FSRs and, once `cur`/`W` combined into
-    /// a negative `PLUSWn` offset, produced an `i32`-to-`usize` cast so
-    /// large it panicked `read_f`/`write_f`'s array index outright. Found
-    /// via the PIC18 P2 `banked.c` acceptance fixture (Task 15): 90+
-    /// `BSR`-banked globals meant some landed at a physical address whose
-    /// low byte fell in this range purely by chance.
+    /// Checks indirect registers (`INDFn`/`POSTINCn`/`POSTDECn`/
+    /// `PREINCn`/`PLUSWn`) against the resolved RESULT at `0xFD9-0xFEF`,
+    /// rather than against the raw `f` byte in isolation. A `BSR`-banked GPR
+    /// low byte coincidentally matches e.g. `0xE7` (INDF1) while its address
+    /// lands outside the SFR page; matching raw `f` misroutes such writes
+    /// into FSR side effects and panics the array index on a negative
+    /// `PLUSWn` offset cast. Only the resolved address decides.
     fn resolve_f(&mut self, a: u16, f: u16) -> usize {
         let phys = if a == 0 {
             if f <= 0x5F {
@@ -2337,23 +2318,20 @@ impl Pic18 {
         self.resolve_phys(phys)
     }
 
-    /// Shared back half of indirect-address resolution: given an
-    /// ALREADY-FULLY-FORMED physical address (`resolve_f`'s `phys`, or an
-    /// `exec_movff` operand: MOVFF's 12-bit operands are full physical
-    /// addresses in their own right, with no `a`/`BSR` reconstruction step
-    /// of their own), detect whether it lands on one of the
-    /// `INDFn`/`POSTINCn`/`POSTDECn`/`PREINCn`/`PLUSWn` pseudo-registers
-    /// and, if so, dereference through the `FSRn` it names (applying the
-    /// post-increment/-decrement/pre-increment side effect where
-    /// applicable). Otherwise `phys` is already the answer.
+    /// Shared back half of indirect-address resolution: given a
+    /// fully-formed physical address (`resolve_f`'s `phys`, or an
+    /// `exec_movff` operand, which already names a physical address with
+    /// no `a`/`BSR` reconstruction), detects whether it lands on one of
+    /// the `INDFn`/`POSTINCn`/`POSTDECn`/`PREINCn`/`PLUSWn`
+    /// pseudo-registers and dereferences through the named `FSRn`
+    /// (applying the increment/decrement side effect where applicable).
+    /// Otherwise `phys` is already the answer.
     ///
-    /// Matching is keyed on `phys & 0xFF` alone, exactly as `resolve_f`
-    /// does, never on a separately-threaded raw register-file byte. For
-    /// the same reason documented above `resolve_f`: a `BSR`-banked GPR
-    /// access can have a low byte that coincidentally equals e.g. `0xE7`
-    /// (INDF1) while its real physical address lands nowhere near the SFR
-    /// page, so only the resolved, guaranteed-in-page `phys` value may be
-    /// used to decide "is this actually an indirect register".
+    /// Matches on `phys & 0xFF` alone, as `resolve_f` does, rather than on
+    /// a separately-threaded raw register-file byte, for the reason above:
+    /// a `BSR`-banked GPR low byte coincidentally equals e.g. `0xE7`
+    /// (INDF1) while its physical address lands outside the SFR page, so
+    /// only the resolved in-page `phys` decides indirect identity.
     fn resolve_phys(&mut self, phys: usize) -> usize {
         if phys < 0xF00 {
             return phys;
@@ -2397,22 +2375,18 @@ impl Pic18 {
     }
     /// WREG is the access-bank file register 0xFE8 (DS39632E table 5-1),
     /// not separate storage: an instruction reading `f = 0xFE8` reads W,
-    /// and a write there sets W. Without this routing, SDCC's chained
-    /// `RLNCF WREG, W` / `SWAPF WREG, W` sequences read the flat RAM's
-    /// always-zero 0xFE8 byte and every W-chained computation collapsed
-    /// to zero; epic-cc's own output never addresses W as a file
-    /// register, so only the SDCC oracle exposed it.
+    /// and a write there sets W. Without this routing, chained `RLNCF
+    /// WREG, W` / `SWAPF WREG, W` sequences read the flat RAM's
+    /// always-zero 0xFE8 byte and every W-chained computation collapses
+    /// to zero.
     fn read_phys(&mut self, addr: usize) -> u8 {
         match addr {
             // WREG is the access-bank file register 0xFE8 (DS39632E
             // table 5-1), not separate storage: an instruction reading
             // `f = 0xFE8` reads W, and a write there sets W. Without this
-            // routing, SDCC's chained `RLNCF WREG, W` / `SWAPF WREG, W`
+            // routing, chained `RLNCF WREG, W` / `SWAPF WREG, W`
             // sequences read the flat RAM's always-zero 0xFE8 byte and
-            // every W-chained computation collapsed to zero; epic-cc's
-            // own output never addresses W as a file register, so only
-            // the SDCC oracle exposed it.
-            0xFE8 => self.w,
+            // every W-chained computation collapses to zero.
             // PCL reads as the PC's low byte (DS39632E section 4.3).
             0xFF9 => (self.pc & 0xFF) as u8,
             _ => self.ram[addr],
@@ -2460,7 +2434,7 @@ impl Pic18 {
     /// unconditional test hook, mirroring `Pic14::fire_interrupt`: use it
     /// to place an interrupt at an exact program counter without modelling
     /// INTCON. Called BETWEEN steps, so `pc` addresses an instruction that
-    /// has not executed yet; the return address is `pc` itself and RETFIE
+    /// still awaits execution; the return address is `pc` itself and RETFIE
     /// resumes by running it.
     pub fn fire_interrupt(&mut self) {
         self.enter_isr();
@@ -2469,14 +2443,14 @@ impl Pic18 {
     /// INT0IF (INTCON bit 1). It is taken at the next step boundary at
     /// which INTCON bits 7 (GIE) and 4 (INT0IE) are both set, so a program
     /// that masks interrupts keeps it pending until it unmasks. The latch
-    /// is consumed on entry, so a handler that never clears INT0IF still
+    /// is consumed on entry, so a handler that leaves INT0IF set still
     /// runs once rather than looping. (PIC18 INTCON = 0xFF2, same bit
     /// layout as PIC14's.)
     pub fn request_interrupt(&mut self) {
         self.ram[0xFF2] |= 0x02; // INT0IF
         self.pending = true;
     }
-    /// Whether a requested interrupt is still latched and not yet taken.
+    /// Whether a requested interrupt remains latched and untaken.
     pub fn interrupt_pending(&self) -> bool {
         self.pending
     }

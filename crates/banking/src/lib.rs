@@ -1,48 +1,44 @@
 /// Assign GPR banks to file-register operands.
 ///
-/// Milestone 4: the isel stage emits physical (fully-paged) addresses. This
-/// pass scans the assembly, infers each file-register operand's memory bank
-/// from its address, inserts a `BANKSEL` when the tracked current bank
-/// differs, and rewrites the operand to the 7-bit bank-relative address
+/// The isel stage emits physical (fully-paged) addresses. This pass scans
+/// the assembly, infers each file-register operand's memory bank from its
+/// address, inserts a `BANKSEL` when the tracked current bank differs, and
+/// rewrites the operand to the 7-bit bank-relative address
 /// (`physical & 0x7F`). The core registers mirrored into every bank and the
 /// common GPR block (`0x70..=0x7F`) need no banking; a non-mirrored bank-0
 /// SFR (PORTA 0x05) is banked like bank-0 GPR and a high-bank SFR (the
 /// 887's `0x188` ANSEL) is banked like a GPR. Literal-immediate ops are
 /// skipped.
 ///
-/// The tracked bank is reset to UNKNOWN at every label (a branch target — the
+/// The tracked bank resets to UNKNOWN at every label (a branch target: the
 /// runtime bank can arrive there from any arm, so the linear predecessor's
 /// bank is not reliable); the next banked operand after a reset emits a FULL
 /// `BANKSEL` that re-establishes both RP bits. Between labels the tracking
 /// still removes redundant switches on straight-line code. A CALL to a
-/// callee whose exit bank is provable (issue #13 item 2) keeps tracking that
-/// bank instead of resetting; a label whose incoming bank is provable across
-/// every path that can reach it (issue #13 item 4, `label_provable_banks`)
-/// does the same, symmetric to item 2 but for branch targets instead of
-/// CALL sites. Sound only because every control transfer in this
-/// compiler's own output is a plain, textually-visible `GOTO`/`CALL <name>`:
-/// an indirect call site lowers to a linear chain of direct `CALL`s
-/// against a finite candidate set (`isel::emit_indirect_call`), never a
-/// computed jump, and the compiler's one computed jump (`MOVWF PCL`, a
-/// `.table` byte-table reader) never targets a named label, so a label's
-/// predecessor set is always fully discoverable by scanning for `GOTO`/
-/// `CALL` references to its name (defensively, a region containing that
-/// computed jump is excluded from item 4 entirely regardless).
+/// callee whose exit bank is provable keeps tracking that bank instead of
+/// resetting; a label whose incoming bank is provable across every path
+/// that can reach it (`label_provable_banks`) does the same, symmetric for
+/// branch targets and CALL sites.
 ///
-/// Measured on `hal-pic16-encoder-full` (epic-cc#210): item 4 eliminates 18
-/// label resets (36 fewer words of raw `BANKSEL` instructions), but the
-/// fixture's final flash-word count is unchanged:
-/// every one of those savings lands before a later `.table`'s `.align 256`
-/// padding (`crates/asm/src/lib.rs`), which rounds up to the same absolute
-/// address regardless of how much slack precedes it. The savings are real
-/// (verified directly against `asm::assemble_words`, not just instruction
-/// count) and would show up as a smaller program on any layout where they
-/// don't fall inside such a padding gap; they just don't on this specific
-/// fixture's specific table layout.
+/// Sound only because every control transfer in this compiler's own output
+/// is a plain, textually-visible `GOTO` or `CALL <name>`: an indirect call
+/// site lowers to a linear chain of direct `CALL`s against a finite
+/// candidate set (`isel::emit_indirect_call`), never a computed jump, and
+/// the compiler's one computed jump (`MOVWF PCL`, a `.table` byte-table
+/// reader) never targets a named label, so a label's predecessor set is
+/// always fully discoverable by scanning for `GOTO` or `CALL` references
+/// to its name. A region containing that computed jump is excluded from the
+/// label analysis regardless (epic-cc#13).
+///
+/// The label analysis also removes resets whose savings land inside a later
+/// `.table`'s `.align 256` padding (`crates/asm/src/lib.rs`): the padding
+/// rounds up to the same absolute address however much slack precedes it,
+/// so those removals shrink the instruction count without changing the
+/// final flash-word count on that layout (epic-cc#210).
 ///
 /// `BANKSEL <n>` selects bank `n` by setting/clearing the two RP bits of
 /// `STATUS` (RP0 = bit 5, RP1 = bit 6); only the bits that change are
-/// emitted (`BCF`/`BSF STATUS, 5/6` — numeric bit operands, so no
+/// emitted (`BCF`/`BSF STATUS, 5/6` with numeric bit operands, so no
 /// `RP0`/`RP1` symbol definitions are needed anywhere). The bank-select
 /// forms recognized are `BCF/BSF STATUS, 5/6` (comma attached to either
 /// token), the same by STATUS's register address (`0x03`), and `MOVWF
@@ -61,14 +57,14 @@ use ir::SrcLoc;
 
 /// `pub`: `crates/schedule` reuses this to avoid a second, independently
 /// drifting copy of which mnemonics take a literal instead of a file
-/// register (epic-cc#210/ADR-027).
+/// register under ADR-027 (epic-cc#210).
 pub const LITERAL_OPS: [&str; 7] = [
     "MOVLW", "ADDLW", "ANDLW", "IORLW", "XORLW", "SUBLW", "RETLW",
 ];
 
 /// The skip-conditional ops: the next instruction runs only when the tested
 /// bit/byte is clear/set/zero/nonzero. A banked operand under one of these
-/// is CONDITIONAL — the exit-bank analysis must join both paths (the
+/// is CONDITIONAL: the exit-bank analysis must join both paths (the
 /// operand may or may not run, so its bank may or may not be selected).
 /// `pub`: `crates/schedule` (ADR-027) treats a skip op and its immediate
 /// successor as an atomic, unsplittable, unenterable pair, reusing this
@@ -79,7 +75,7 @@ pub const SKIP_OPS: [&str; 4] = ["BTFSC", "BTFSS", "INCFSZ", "DECFSZ"];
 const STATUS_ADDR: u16 = 0x03;
 
 /// A bank-select op's effect on the tracked bank, or `None` when the line
-/// is not a bank-select op. Recognized forms (issue #13 item 3):
+/// is not a bank-select op. Recognized forms:
 /// - `BCF/BSF STATUS, 5/6` (the comma attached to either token) and
 ///   `BCF/BSF 0x03, 5/6`, classic PIC14's RP0 = bit 5, RP1 = bit 6;
 /// - `MOVWF STATUS` / `MOVWF 0x03`, classic only: writes STATUS from W, so
@@ -93,7 +89,7 @@ const STATUS_ADDR: u16 = 0x03;
 /// so `RP0`/`RP1` symbol forms would need the equ table. The isel output
 /// always uses the numeric forms, and hand-written asm in the fixtures does
 /// too. `pub`: `crates/schedule` (ADR-027) reuses this recognizer so its
-/// own bank-select detection never drifts from banking's.
+/// own bank-select detection never drifts from banking's (epic-cc#13).
 pub fn bank_op_effect(device: &Device, mne: &str, toks: &[&str]) -> Option<Option<u8>> {
     // The comma may be attached to the register token (`STATUS,5`) or
     // separate (`STATUS, 5`); both are the same instruction.
@@ -106,7 +102,7 @@ pub fn bank_op_effect(device: &Device, mne: &str, toks: &[&str]) -> Option<Optio
             b.trim_end_matches([',', ';', ')']),
         ),
         None => {
-            // `BCF STATUS,5` — the comma is inside the single operand token.
+            // `BCF STATUS,5`: the comma is inside the single operand token.
             let t = toks.get(1).copied().unwrap_or("");
             match t.find(',') {
                 Some(i) => (t[..i].trim(), t[i + 1..].trim_end_matches([',', ';', ')'])),
@@ -167,7 +163,7 @@ pub fn operand_bank(device: &Device, mne: &str, toks: &[&str]) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #13 item 2: the CALL-exit-bank analysis
+// The CALL-exit-bank analysis (epic-cc#13)
 // ---------------------------------------------------------------------------
 
 /// A set of possible banks (bit `i` set = bank `i` possible). The join of
@@ -239,8 +235,8 @@ fn function_regions(asm: &str) -> (HashSet<String>, HashMap<String, Vec<&str>>) 
 ///
 /// `labels`, when given, also collects the join of every incoming bank
 /// state this walk observes at each of `func`'s own internal labels (see
-/// `walk_region`), used by the issue #13 item 4 label analysis; pass an
-/// empty scratch map when only the exit bank is wanted.
+/// `walk_region`), used by the label analysis below; pass an empty scratch
+/// map when only the exit bank is wanted (epic-cc#13).
 fn func_exit_bank(
     device: &Device,
     func: &str,
@@ -271,10 +267,10 @@ fn func_exit_bank(
 /// region's end without returning is not a provable exit (UNKNOWN).
 ///
 /// Every time the walk reaches one of `region`'s own labels, it joins the
-/// arriving `banks` into `labels[name]` (issue #13 item 4). A label's
-/// incoming bank is provable when this join, across every walk that ever
-/// reaches it (including transitively, through a CALL into another
-/// region), stays a single bank.
+/// arriving `banks` into `labels[name]`. A label's incoming bank is
+/// provable when this join, across every walk that ever reaches it
+/// (including transitively, through a CALL into another region), stays a
+/// single bank (epic-cc#13).
 fn walk_region(
     device: &Device,
     region: &[&str],
@@ -405,7 +401,7 @@ fn walk_region(
 /// `BCF/BSF STATUS, 5/6` bank select, and no `MOVWF STATUS` (which writes
 /// the RP bits from W, an unknowable value). Such a program can never leave
 /// bank 0: every label/CALL reset below can be skipped, because the tracked
-/// bank is provably 0 everywhere — the reset vector (bank 0) and every
+/// bank is provably 0 everywhere: the reset vector (bank 0) and every
 /// fall-through (which never changed the bank) agree, and an ISR's
 /// `MOVWF STATUS` restore is excluded by the STATUS-write check. `MOVWF
 /// STATUS` programs therefore keep the resets and their layouts are
@@ -461,17 +457,17 @@ fn region_has_computed_jump(region: &[&str]) -> bool {
     })
 }
 
-/// Issue #13 item 4: the join of every incoming bank state `walk_region`
-/// observes at each label in `regions`, entered with the fully unknown
-/// symbolic set (safe regardless of which bank any real caller happens to
-/// be in, a caller-independent invariant of the callee's own
-/// control flow, not a fact about any one call site). A CALL made during
-/// one region's walk recurses into the callee's own region and keeps
-/// accumulating into the same map, so a label's entry here already
-/// reflects every reachable path, including cross-function ones.
+/// The join of every incoming bank state `walk_region` observes at each
+/// label in `regions`, entered with the fully unknown symbolic set (safe
+/// regardless of which bank any real caller happens to be in: a
+/// caller-independent invariant of the callee's own control flow, not a
+/// fact about any one call site). A CALL made during one region's walk
+/// recurses into the callee's own region and keeps accumulating into the
+/// same map, so a label's entry here already reflects every reachable path,
+/// including cross-function ones (epic-cc#13).
 ///
 /// Skips any region `region_has_computed_jump` flags; such a region's
-/// labels are simply absent from the result and keep today's behavior
+/// labels are simply absent from the result and keep the default behavior
 /// (always reset).
 fn label_provable_banks(
     device: &Device,
@@ -498,8 +494,8 @@ fn label_provable_banks(
 }
 
 /// Insert `BANKSEL` before file-register operands whose bank differs from the
-/// tracked current bank — or whenever the tracked bank is unknown (just after
-/// a label) — and rewrite banked operands to `physical & 0x7F`.
+/// tracked current bank, or whenever the tracked bank is unknown (just after
+/// a label), and rewrite banked operands to `physical & 0x7F`.
 pub fn assign_banks(device: &Device, asm: &str) -> String {
     assign_banks_with_locs(device, asm, &[]).0
 }
@@ -522,28 +518,28 @@ pub fn assign_banks_with_locs(
         );
     }
 
-    // Issue #16 (left over from #13): a bank-0-only program provably never
-    // leaves bank 0, so the label/CALL resets below can be skipped entirely
-    // instead of emitting the dead full BANKSEL preamble after every label
-    // and CALL. The scan is conservative — any banked operand, hand-written
-    // bank select (any form), or `MOVWF STATUS` disables the skip.
+    // A bank-0-only program provably never leaves bank 0, so the
+    // label/CALL resets below are skipped entirely instead of emitting the
+    // dead full BANKSEL preamble after every label and CALL. The scan is
+    // conservative: any banked operand, hand-written bank select (any form),
+    // or `MOVWF STATUS` disables the skip (epic-cc#16).
     let bank0_only = is_bank0_only(device, asm);
-    // Issue #13 item 2: a CALL to a callee whose exit bank is provable keeps
-    // tracking that bank instead of resetting to unknown — the full BANKSEL
-    // after the CALL is redundant when the caller's next operand is in the
-    // callee's exit bank. The analysis walks each callee's region with the
-    // pass's own semantics (banked operands pin the bank, bank ops apply
-    // their effect, skips fork, GOTOs jump, CALLs join the callee's exit)
-    // and joins every path's exit; a single-bank join is provable.
+    // A CALL to a callee whose exit bank is provable keeps tracking that
+    // bank instead of resetting to unknown: the full BANKSEL after the CALL
+    // is redundant when the caller's next operand is in the callee's exit
+    // bank. The analysis walks each callee's region with the pass's own
+    // semantics (banked operands pin the bank, bank ops apply their effect,
+    // skips fork, GOTOs jump, CALLs join the callee's exit) and joins every
+    // path's exit; a single-bank join is provable (epic-cc#13).
     let (call_targets, regions) = function_regions(asm);
     let mut exit_memo: HashMap<(String, BankSet), BankSet> = HashMap::new();
-    // Issue #13 item 4: a label's incoming bank is provable when every path
-    // that can reach it agrees, regardless of caller, see
-    // `label_provable_banks`. Computed once, up front, over the whole
-    // program: a label's provable predecessors can appear anywhere in the
-    // text (a caller's CALL site may come before or after the callee's own
-    // definition), so this can't be folded into the single linear scan
-    // below the way the CALL-exit-bank check (item 2) is.
+    // A label's incoming bank is provable when every path that can reach it
+    // agrees, regardless of caller (see `label_provable_banks`). Computed
+    // once, up front, over the whole program: a label's provable
+    // predecessors can appear anywhere in the text (a caller's CALL site may
+    // come before or after the callee's own definition), so this cannot fold
+    // into the single linear scan below the way the CALL-exit-bank check
+    // does (epic-cc#13).
     let label_bank = label_provable_banks(device, &call_targets, &regions, &mut exit_memo);
     // Scratch sink for `func_exit_bank`'s label-accumulation output below:
     // this call site only wants the exit bank, `label_bank` above already
@@ -597,10 +593,10 @@ pub fn assign_banks_with_locs(
         // it; the next banked operand (when the needed bank is unknown) gets
         // a FULL BANKSEL that re-establishes both RP bits. In a bank-0-only
         // program the bank provably stays 0, so the reset is skipped.
-        // Issue #13 item 4: when every path that can reach this label
-        // agrees on a single bank (`label_bank`, computed up front over the
-        // whole program), the tracked bank becomes that bank instead,
-        // same shape as item 2's CALL-exit-bank carry-through.
+        // When every path that can reach this label agrees on a single bank
+        // (`label_bank`, computed up front over the whole program), the
+        // tracked bank becomes that bank instead, same shape as the
+        // CALL-exit-bank carry-through (epic-cc#13).
         if mne.ends_with(':') {
             let name = mne.trim_end_matches(':');
             match label_bank.get(name) {
@@ -622,14 +618,14 @@ pub fn assign_banks_with_locs(
         // A CALL is a runtime boundary just like a label: the callee's body
         // (its own BANKSELs and banked operands) can leave the RP bits in any
         // state, and its prologue/epilogue are not visible in the caller's
-        // text. The tracked bank must not cross a CALL — a caller's next
+        // text. The tracked bank must not cross a CALL: a caller's next
         // banked operand gets a FULL BANKSEL, so it is correct no matter what
         // the callee left behind. In a bank-0-only program the callee (like
         // every function) provably runs in bank 0, so the reset is skipped.
-        // Issue #13 item 2: when the callee's exit bank is PROVABLE (a
-        // single-bank join of every path), the tracked bank becomes that
-        // bank — the full BANKSEL after the CALL is redundant when the
-        // caller's next operand is in it.
+        // When the callee's exit bank is PROVABLE (a single-bank join of
+        // every path), the tracked bank becomes that bank: the full BANKSEL
+        // after the CALL is redundant when the caller's next operand is in
+        // it (epic-cc#13).
         if mne == "CALL" {
             if bank0_only {
                 known = true;
@@ -661,8 +657,8 @@ pub fn assign_banks_with_locs(
         // Directives (`org`, `.align`, `.table`, `end`, ...) are not
         // instructions: their numeric arguments are addresses or literals,
         // never file-register operands. An `.org` target in a GPR/SFR range
-        // (an M11 page pad like `.org 0x0800`, or a pinned table-section
-        // start) must pass through untouched — BANKSEL-rewriting it would
+        // (a page pad like `.org 0x0800`, or a pinned table-section
+        // start) must pass through untouched: BANKSEL-rewriting it would
         // relocate the program.
         if mne == "org" || mne == "end" || mne.starts_with('.') {
             push(&mut out, &mut out_locs, line, cur_loc.clone());

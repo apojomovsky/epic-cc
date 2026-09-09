@@ -45,7 +45,7 @@ pub fn resolve_fosc_hz(device: &Device, spec: &str) -> u64 {
 }
 
 pub fn resolve_fosc_hz_from_defaults(_device: &Device) -> u64 {
-    // Oscillator-tree fields have no default (docs/31 D-9). Without an
+    // Oscillator-tree fields have no default (docs/31 §9). Without an
     // EPIC_CONFIG the driver cannot know the board's crystal, so the
     // preprocessor macro is the inert 0 from epic-cc.h. Existing fixtures
     // have no EPIC_CONFIG and must keep compiling.
@@ -98,12 +98,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {
         // DS39632E §2.2.5: INTOSC is an 8 MHz clock that directly drives
         // the device clock in the internal-oscillator microcontroller
         // modes. CPUDIV applies only to XT/HS/EC and the PLL modes
-        // (Register 25-1), not to INTOSC. Confirmed identical for both
-        // devices this core currently ships (p18f4550, p18f2550): one
-        // datasheet, one family (epic-cc#226). A future PIC18 outside
-        // the 2455/2550/4455/4550 family (a K/Q/J-series part, whose
-        // INTOSC is independently documented as configurable, not fixed
-        // at 8 MHz) would need this re-verified, not assumed.
+        // (Register 25-1), not to INTOSC (epic-cc#226).
         return 8_000_000;
     }
     if pll {

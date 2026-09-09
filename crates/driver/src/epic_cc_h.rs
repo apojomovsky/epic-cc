@@ -1,8 +1,7 @@
 //! The header epic-cc ships to user code. Every macro reduces to
 //! `__attribute__((section(...)))`, the one attribute form clang forwards
-//! verbatim into the .ll (confirmed against the pinned clang 20.1.8,
-//! docs/31 D-2/D-9/§5), so nothing here needs clang's cooperation beyond
-//! that one already-probed fact.
+//! verbatim into the .ll (docs/31 §2, §9, §5), so nothing here needs
+//! clang's cooperation beyond that forwarding.
 
 pub const EPIC_CC_H: &str = r#"#ifndef EPIC_CC_H
 #define EPIC_CC_H

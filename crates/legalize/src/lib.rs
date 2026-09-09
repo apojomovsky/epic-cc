@@ -11,33 +11,33 @@
 //!   `__sdiv_i8`/`__sdiv_i16`/`__sdiv_i32`, `__srem_i8`/`__srem_i16`/
 //!   `__srem_i32`) with the dst/ty preserved and both operands copied as
 //!   typed args.
-//! - `shl`/`lshr`/`ashr` with a **const count stay as `Bin`** — isel inlines
-//!   the fixed RLF/RRF sequence; with a **reg count** they become a call to
-//!   the shift routine (`__shl_u8`/`__shl_u16`/`__shl_u32`,
-//!   `__lshr_u8`/`__lshr_u16`/`__lshr_u32`,
-//!   `__ashr_i8`/`__ashr_i16`/`__ashr_i32`), which masks the count and loops.
+//! `shl`/`lshr`/`ashr` with a const count stay as `Bin`: isel inlines
+//! the fixed RLF/RRF sequence. With a reg count they become a call to
+//! the shift routine (`__shl_u8`/`__shl_u16`/`__shl_u32`,
+//! `__lshr_u8`/`__lshr_u16`/`__lshr_u32`,
+//! `__ashr_i8`/`__ashr_i16`/`__ashr_i32`), which masks the count and loops.
 //! - `freeze` stays (isel lowers it as a byte copy).
-//! - Every f32 op (Milestone 15) lowers to a soft-float runtime call:
-//!   `fadd`/`fsub`/`fmul`/`fdiv` → `__add_f32`/`__sub_f32`/`__mul_f32`/
-//!   `__div_f32` (dst/ty preserved, both operands copied as float args);
-//!   `fcmp <pred>` → `%c = call i8 @__cmp_f32(a, b)` + the per-predicate
-//!   icmp/select materialization tree over the tri-state byte
-//!   (0 = equal, 1 = a < b, 2 = a > b, 3 = unordered) — an OR predicate
-//!   is `select i1 <c==k1>, i1 true, i1 <c==k2>`, never an i1 binop (isel
-//!   rejects those); `fptosi`/`fptoui`/`sitofp`/`uitofp` → the four
-//!   conversion routines; `fpext`/`fptrunc` (f32→f32 — double == float on
-//!   msp430) → a plain `freeze` copy, no call.
+//! The soft-float lowering turns every f32 op into a runtime call:
+//! `fadd`/`fsub`/`fmul`/`fdiv` become `__add_f32`/`__sub_f32`/`__mul_f32`/
+//! `__div_f32` (dst/ty preserved, both operands copied as float args);
+//! `fcmp <pred>` becomes `%c = call i8 @__cmp_f32(a, b)` plus the per-predicate
+//! icmp/select materialization tree over the tri-state byte
+//! (0 = equal, 1 = a < b, 2 = a > b, 3 = unordered). An OR predicate
+//! becomes `select i1 <c==k1>, i1 true, i1 <c==k2>`, with no i1 binop (isel
+//! rejects those); `fptosi`/`fptoui`/`sitofp`/`uitofp` become the four
+//! conversion routines; `fpext`/`fptrunc` (f32 to f32, since double equals
+//! float on msp430) become a plain `freeze` copy, no call.
 //!
 //! The used routine `Func`s are then injected into the module: ordinary
 //! functions (name/ret/params per the ABI table below) with one empty block
 //! holding only the scratch alloca, so `alloc` sizes the routine frame and
-//! Tasks 3/4's recipe emitters read their working state from
+//! the recipe emitters read their working state from
 //! `{func}::__scr` + offset. Only the routines actually used are injected
 //! (cleaner text artifacts).
 //!
 //! A routine both the main and the interrupt context reach is injected
-//! TWICE — `__mul_u8` and `__mul_u8_isr` — so the two contexts never share
-//! one frame. Without the split, an interrupt taken partway through main's
+//! twice (`__mul_u8` and `__mul_u8_isr`), so the two contexts share
+//! no frame. Without the split, an interrupt taken partway through main's
 //! multiply re-enters the same scratch bytes and main resumes against the
 //! ISR's state, with no diagnostic. See `split_isr_routines`.
 
@@ -59,7 +59,7 @@ pub fn legalize(m: Module) -> Module {
     let mut used: Vec<String> = Vec::new();
     // Fresh SSA names for the fcmp materialization intermediates (the call
     // dst and the icmp temps), seeded with every name the module defines so
-    // the trees can never collide with a user reg.
+    // each tree avoids collision with a user reg.
     let mut names = FreshNames::from_module(&m);
     for f in m.funcs {
         let mut blocks = Vec::with_capacity(f.blocks.len());
@@ -70,8 +70,8 @@ pub fn legalize(m: Module) -> Module {
                     Inst::Bin(bin) => {
                         // i64 arithmetic is a documented limitation: only
                         // the aggregate load/store copy (the HAL handle
-                        // shape, epic-cc#125) is supported. A Bin on i64
-                        // panics loudly rather than silently miscompiling.
+                        // shape) is supported. A Bin on i64
+                        // panics rather than silently miscompiling (epic-cc#125).
                         assert!(
                             bin.ty != Ty::I64,
                             "legalize: i64 arithmetic not supported (only i64 aggregate copies, epic-cc#125)"
@@ -93,8 +93,8 @@ pub fn legalize(m: Module) -> Module {
                             // A clang-emitted intrinsic (`llvm.smax.*`,
                             // `llvm.smin.*`, `llvm.abs.*`) becomes the
                             // icmp/select tree; an unknown intrinsic panics
-                            // loudly so a new one surfaces as a clear error
-                            // instead of a hole the assembler never sees.
+                            // so a new one surfaces as a clear error
+                            // instead of a hole the assembler misses.
                             insts.extend(lower_intrinsic(&c, &mut names, &mut used));
                         } else {
                             insts.push(Inst::Call(c));
@@ -148,13 +148,11 @@ pub fn legalize(m: Module) -> Module {
 /// A pointer-returning function whose body is a pure chain of cond/gep
 /// defs ending in a pointer select cannot lower through a CALL boundary:
 /// iselcore folds pointer SELECTs and GEPs inside the caller, but a pointer
-/// VALUE returned from a call has no foldable base in the caller (the
-/// callee's registers are private). Sink such a function into its call
-/// sites: each `%r = call @f(args)` is replaced by a cloned copy of the
-/// body's value-producing instructions (cond defs and the select), with
-/// the callee's params substituted by the caller's args and the select's
-/// dst renamed to the call's dst. The function is then removed when no
-/// callers remain. A non-sinkable body keeps the loud iselcore panic.
+/// value returned from a call has no foldable base in the caller (the
+/// callee's registers are private). Sinks such a function into its call
+/// sites: each `%r = call @f(args)` becomes a cloned copy of the body's
+/// value-producing instructions with params substituted by args. A
+/// non-sinkable body panics in iselcore: no lowering path exists there.
 fn sink_ptr_select_funcs(m: Module) -> Module {
     let mut sinkable: HashMap<String, Vec<Inst>> = HashMap::new();
     for f in &m.funcs {
@@ -243,7 +241,7 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
                             let call_dst = c.dst.clone().unwrap();
                             // Every body dst gets a fresh name (params were
                             // substituted above), so clones at different call
-                            // sites never collide; the final select's dst
+                            // sites stay distinct; the final select's dst
                             // becomes the call's dst.
                             let mut rename_map: HashMap<String, String> = HashMap::new();
                             for binst in body {
@@ -496,11 +494,11 @@ fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Fresh SSA name supply for the fcmp materialization trees. Seeded with
-/// every name the module defines (params + inst dsts, module-wide — names
-/// only need uniqueness inside a function, so the conservative seed merely
-/// skips a few candidates), then hands out `c0`, `c1`, … skipping anything
-/// already taken. Deterministic, so the lowered text round-trips.
+/// Fresh SSA name supply for the fcmp materialization trees. Starts from
+/// every name the module defines (params plus inst dsts, module-wide: names
+/// need uniqueness inside a function only, so the conservative seed skips
+/// a few candidates), then hands out `c0`, `c1`, … skipping taken names.
+/// Hands out names in order, so the lowered text stays stable.
 struct FreshNames {
     used: HashSet<String>,
     next: u64,
@@ -648,12 +646,11 @@ fn fcmp_icmp(pred: &str, c: &str, k: i64, dst: &str) -> Inst {
 }
 
 /// The per-predicate materialization tree over the `__cmp_f32` tri-state
-/// byte (0 = equal, 1 = a < b, 2 = a > b, 3 = unordered). Every tree is
+/// byte (0 = equal, 1 = a < b, 2 = a > b, 3 = unordered). Each tree is
 /// either a single `icmp eq/ne i8 %c, <k>` or the OR of two equality
-/// icmps materialized as `select i1 <c==k1>, i1 true, i1 <c==k2>` — no i1
-/// binops (isel rejects them). The trees are documented in the legalize
-/// tests and are the Task-3 isel contract.
-///
+/// icmps materialized as `select i1 <c==k1>, i1 true, i1 <c==k2>`: no i1
+/// binops (isel rejects them). The trees match the isel contract the
+/// legalize tests document.
 /// | predicate | tree |
 /// |---|---|
 /// | `oeq` | `(c==0)` |
@@ -671,9 +668,9 @@ fn fcmp_icmp(pred: &str, c: &str, k: i64, dst: &str) -> Inst {
 /// | `une` | `(c!=0)` |
 /// | `uno` | `(c==3)` |
 ///
-/// `fcmp true`/`fcmp false` are compile-time constants (clang never emits
-/// them) and panic loudly instead of materializing a call the isel cannot
-/// remove.
+/// `fcmp true`/`fcmp false` are compile-time constants (clang emits neither)
+/// and panic instead of materializing a call the isel cannot remove: no
+/// lowering path exists for them.
 fn fcmp_tree(pred: &str, c: &str, dst: &str, names: &mut FreshNames) -> Vec<Inst> {
     fn or(c: &str, k1: i64, k2: i64, dst: &str, names: &mut FreshNames, out: &mut Vec<Inst>) {
         let t1 = names.fresh();
@@ -714,12 +711,12 @@ fn fcmp_tree(pred: &str, c: &str, dst: &str, names: &mut FreshNames) -> Vec<Inst
     out
 }
 
-/// Rewrite one `Inst::FloatConv`. The int<->float conversions become calls
-/// to the four conversion routines — the source/target width rides on the
+/// Rewrites one `Inst::FloatConv`. The int to float conversions become calls
+/// to the four conversion routines: the source/target width rides on the
 /// call's types (the routine's slot is always 4 bytes; an i8/i16 source or
-/// result uses the low bytes). `fpext`/`fptrunc` are f32→f32 (double ==
+/// result uses the low bytes). `fpext`/`fptrunc` are f32 to f32 (double equals
 /// float on msp430) and become a plain `freeze` copy, no call. Anything
-/// touching a non-f32 type is an f64 attempt and panics loudly.
+/// touching a non-f32 type is an f64 attempt and panics: no f64 path exists.
 fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
     fn mark(func: &'static str, used: &mut Vec<String>) -> String {
         if !used.iter().any(|u| u == func) {
@@ -771,11 +768,11 @@ fn lower_fconv(c: &ir::FloatConv, used: &mut Vec<String>) -> Inst {
     }
 }
 
-/// Lower `llvm.smax/smin/abs.W` to icmp/select trees (see design spec).
+/// Lowers `llvm.smax/smin/abs.W` to icmp/select trees.
 /// smax: sgt+select, smin: slt+select, abs: slt0+sub+select.
 /// Width-parametric (i8/i16/i32) via byte-generic isel. Abs flag
 /// ignored (wraps INT_MIN for false, poison allows any value for true).
-/// Unknown `llvm.*` panics loudly.
+/// Unknown `llvm.*` panics: no lowering exists for it.
 fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<String>) -> Vec<Inst> {
     let dst = c
         .dst
@@ -1210,9 +1207,9 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
     }
 }
 
-/// Every function transitively reachable from `roots` over the caller ->
+/// Every function transitively reachable from `roots` over the caller to
 /// callee map `adj` (the roots included). A visited set keeps a call cycle
-/// (rejected loudly later by callgraph/alloc) from looping forever.
+/// (rejected later by callgraph/alloc) from looping forever.
 fn reachable(roots: &[&str], adj: &HashMap<String, Vec<String>>) -> HashSet<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut stack: Vec<&str> = roots.to_vec();
@@ -1232,15 +1229,14 @@ fn reachable(roots: &[&str], adj: &HashMap<String, Vec<String>>) -> HashSet<Stri
 /// stored field overlaps the read field; the sentinel overlaps every field.
 const ALL_FIELDS: u16 = 0xFFFF;
 
-/// Resolve a pointer operand to `(global, field_byte_offset)`, one hop
+/// Resolves a pointer operand to `(global, field_byte_offset)`, one hop
 /// through GEPs. The field is the accumulated constant byte offset modulo
-/// the innermost runtime scale: `gep @g +0 +10*%i +9` (element %i, field 9
-/// of a 10-byte TCB) resolves to field 9, `gep @g +0 +10*%i +0` (the fn
-/// field) to field 0, and a bare `@g`/`gep @g +0` to field 0. A whole-object
-/// read at an unresolvable offset degrades to `ALL_FIELDS` (a store into
-/// any field then feeds it), the conservative direction; a runtime register
-/// base (a param, an alloca, a load) resolves to nothing and the store-edge
-/// scan treats it as opaque.
+/// the innermost runtime scale: `gep @g +0 +10*%i +9` resolves to field 9,
+/// `gep @g +0 +10*%i +0` to field 0, and a bare `@g`/`gep @g +0` to field 0.
+/// A whole-object read at an unresolvable offset falls back to `ALL_FIELDS`
+/// (a store into any field then feeds it); a runtime register base (a param,
+/// an alloca, a load) resolves to nothing and the store-edge scan treats
+/// it as opaque.
 fn global_field(ptr: &str, f: &Func) -> Option<(String, u16)> {
     if let Some(g) = ptr.strip_prefix('@') {
         return Some((g.to_string(), 0));
@@ -1342,17 +1338,14 @@ fn ptr_of_val(v: &Val) -> String {
     }
 }
 
-/// The `(global, field)` pairs the ISR context READS (loads, memcpy
-/// sources): a store into one of these from anywhere in the module feeds
-/// an ISR indirect call, so the stored value must be rewritten to the
-/// `_isr` copy when duplicated. A global the ISR only writes never feeds
-/// an ISR call, and rewriting a store into it would break the epic-cc#73
-/// fixture (main's store must stay on the original). Field-sensitive: the
-/// scheduler's task table (`g_tasks`, fn/arg fields stored by main,
-/// flags/countdown/period fields read by the ISR tick) must not pull the
-/// stored task functions into the ISR context, or the main-context
-/// dispatch loses its candidates and the ISR duplication doubles flash
-/// (epic-hal#86). A memcpy source (whole object) reads `ALL_FIELDS`.
+/// The `(global, field)` pairs the ISR context reads (loads, memcpy
+/// sources): a store into one of these feeds an ISR indirect call, so the
+/// stored value rewrites to the `_isr` copy when duplicated. A global the
+/// ISR only writes feeds no ISR call, so stores into it stay on the original.
+/// Field-sensitive: the scheduler task table stores fn/arg fields from main
+/// while the ISR tick reads other fields, so those stored functions stay out
+/// of the ISR context and main-context dispatch keeps its candidates.
+/// A memcpy source (whole object) reads `ALL_FIELDS` (epic-cc#73) (epic-hal#86).
 fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<(String, u16)> {
     let mut out: HashSet<(String, u16)> = HashSet::new();
     for f in &m.funcs {
@@ -1518,22 +1511,17 @@ fn isr_context(
     (isr_ctx, read, adj, param_stores)
 }
 
-/// The interrupt shared-function duplication (the M13 ruling): every function
-/// reachable from BOTH the ISR context (the ISR + its transitive callees) and
-/// the main context (main + its transitive callees) gets an `_isr` copy — a
-/// DEEP clone of the Func, renamed `{name}_isr`, with the `isr` flag cleared
-/// (the copy is an ordinary function, not a second vector entry) — and every
-/// call inside the ISR context whose target is a duplicated function is
-/// rewritten to the `_isr` name (a copy's own calls to another shared
-/// function become its `_isr` copy too; a non-shared ISR-context callee's
-/// calls are rewritten as well — the whole ISR context runs against the
-/// copies). The original shared functions stay main-context-only with their
-/// calls untouched. Gated on the ISR's existence: a module with no ISR
-/// passes through byte-identical, and so does a module whose ISR shares
-/// nothing with main.
+/// The interrupt shared-function duplication (the interrupt duplication):
+/// every function reachable from both the ISR context (the ISR plus its
+/// transitive callees) and the main context (main plus its transitive callees)
+/// gets an `_isr` copy: a deep clone of the Func, renamed `{name}_isr`, with
+/// the `isr` flag cleared (the copy is an ordinary function, not a second
+/// vector entry). Every call inside the ISR context whose target is a
+/// duplicated function rewrites to the `_isr` name, so the whole ISR context
+/// runs against the copies. The originals stay main-context-only.
 ///
-/// The call graph is re-derived locally from the module's CALL insts rather
-/// than depending on the callgraph crate — it is a tiny, stable scan and
+/// The call graph re-derives locally from the module's CALL insts rather
+/// than depending on the callgraph crate: the scan is tiny and stable, and
 /// legalize already owns the module (no new dependency).
 fn duplicate_isr_shared(m: Module) -> Module {
     let isr_names: HashSet<&str> = m
@@ -1546,17 +1534,17 @@ fn duplicate_isr_shared(m: Module) -> Module {
         return m;
     }
 
-    // The extended ISR context (epic-cc#137): the ISR roots' reachability
-    // over direct calls and address-value edges, plus every defined function
-    // whose address is stored into an ISR-visible global (a cross-context
-    // callback: stored by main-side code, invoked by the ISR). The main
-    // context derives from the same adjacency.
+    // The extended ISR context: the ISR roots' reachability over direct
+    // calls and address-value edges, plus every defined function whose
+    // address is stored into an ISR-visible global (a cross-context callback:
+    // stored by main-side code, invoked by the ISR). The main context derives
+    // from the same adjacency (epic-cc#137).
     let (isr_ctx, isr_read, adj, param_stores) = isr_context(&m);
     let main_ctx = reachable(&["main"], &adj);
-    // main is excluded from the duplication above, so an ISR that
-    // (transitively) calls main would leave the ISR's call on the original
-    // `main` — re-entering the main context and silently collapsing the
-    // disjoint-region guarantee. Panic loudly rather than miscompile.
+    // main stays out of the duplication above, so an ISR that (transitively)
+    // calls main would leave the ISR's call on the original `main`,
+    // re-entering the main context and collapsing the disjoint-region
+    // guarantee. Panics rather than miscompiling: re-entrant main has no lowering.
     assert!(
         !isr_ctx.contains("main"),
         "isel/legalize: the ISR context must not reach main — re-entrant main is unsupported"
@@ -1572,8 +1560,9 @@ fn duplicate_isr_shared(m: Module) -> Module {
         return m;
     }
 
-    // Deep-clone each shared func as `{name}_isr` (renamed, isr flag
-    // cleared). A name collision with an existing function panics loudly.
+    // Deep-clones each shared func as `{name}_isr` (renamed, isr flag
+    // cleared). A name collision with an existing function panics: no
+    // valid emission exists for two functions sharing one name.
     let mut funcs = m.funcs;
     let mut copies: Vec<Func> = Vec::with_capacity(shared.len());
     for name in &shared {
@@ -1594,7 +1583,7 @@ fn duplicate_isr_shared(m: Module) -> Module {
 
     // Rewrite every call inside the ISR context whose target is a duplicated
     // function to the `_isr` copy. The rewrite set is the ISR context minus
-    // the original shared functions (now main-context-only — their calls stay
+    // the original shared functions (now main-context-only: their calls stay
     // on the originals) plus the copies (their internal calls become the
     // `_isr` names transitively). The ISR root itself and non-shared ISR
     // callees are in the set, so the whole ISR context runs against copies.
@@ -1632,14 +1621,13 @@ fn duplicate_isr_shared(m: Module) -> Module {
             }
         }
     }
-    // Cross-context store rewrite (epic-cc#137): a store OUTSIDE the ISR
-    // context whose value is a duplicated function and whose target is a
-    // global the ISR READS must point at the `_isr` copy, or the ISR would
-    // load the main-context original's address and dispatch it into the
-    // main region's frames. Predicated on the target being ISR-read (not
-    // merely ISR-visible): a global the ISR only writes never feeds an ISR
-    // call, and rewriting a store into it would break the epic-cc#73
-    // fixture (main's store must stay on the original).
+    // Cross-context store rewrite: a store outside the ISR context whose
+    // value is a duplicated function and whose target is a global the ISR
+    // reads points at the `_isr` copy; otherwise the ISR loads the
+    // main-context original's address and dispatches it into the main
+    // region's frames. Predicated on the target being ISR-read (not merely
+    // ISR-visible): a global the ISR only writes feeds no ISR call, so a
+    // store into it stays on the original (epic-cc#137) (epic-cc#73).
     for f in &mut funcs {
         if rewrite_set.contains(&f.name) {
             continue;
@@ -1773,16 +1761,16 @@ fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>) {
     }
 }
 
-/// Fill the `callees` candidate list of every indirect call site. The
+/// Fills the `callees` candidate list of every indirect call site. The
 /// candidate set is the whole-program address-taken set (every function whose
 /// address appears as a value), split by call-graph context so an ISR-context
-/// site only ever references `_isr` copies and a main-context site only the
+/// site references only `_isr` copies and a main-context site only the
 /// originals: the overlay allocator's disjoint-region analysis depends on it.
-/// `!callees` metadata is never consumed (clang omits it for table loads).
+/// `!callees` metadata stays unconsumed (clang omits it for table loads).
 fn fill_indirect_callees(m: &mut Module) {
     // Address-taken set: every `Val::Global(f)` where `f` is a defined
     // function. Non-const globals with `ptr` initializers are zeroinit and
-    // contribute nothing; const fp tables panic at parse (out of scope).
+    // contribute nothing; const fp tables panic at parse: outside this scope.
     let defined: HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
     let mut addr_taken: HashSet<String> = HashSet::new();
     for f in &m.funcs {
@@ -1792,21 +1780,21 @@ fn fill_indirect_callees(m: &mut Module) {
             }
         }
     }
-    // A const struct's function-pointer fields (epic-cc#154) hold function
-    // addresses in flash: the functions are address-taken, so an indirect
-    // call through a loaded field can dispatch them.
+    // A const struct's function-pointer fields hold function addresses in
+    // flash: the functions are address-taken, so an indirect call through
+    // a loaded field can dispatch them (epic-cc#154).
     for g in &m.globals {
         for (_, f) in &g.refs {
             addr_taken.insert(f.clone());
         }
     }
     // Arity and width maps for the candidate filter: an indirect call
-    // site only ever invokes a candidate with the matching number of
-    // arguments and matching widths. Without the arity check, a 1-arg ISR
-    // callback site collects 0-arg callbacks and isel panics (epic-cc#152);
-    // without the width check, an i8 arg site collects ptr-param tasks and
-    // isel panics copying a narrow arg into a 2-byte slot. An `_isr` copy
-    // shares its original's params, so both checks carry over.
+    // site invokes only a candidate with the matching argument count
+    // and matching widths. Without the arity check, a 1-arg ISR
+    // callback site collects 0-arg callbacks and isel panics with no
+    // lowering for the mismatch; without the width check, an i8 arg site
+    // collects ptr-param tasks and isel panics the same way (epic-cc#152).
+    // An `_isr` copy shares its original's params, so both checks carry over.
     let arity: HashMap<String, usize> = m
         .funcs
         .iter()
@@ -1823,10 +1811,10 @@ fn fill_indirect_callees(m: &mut Module) {
         })
         .collect();
 
-    // The extended ISR context (epic-cc#137): the ISR roots' reachability
-    // over direct calls and address-value edges, plus every defined function
-    // whose address is stored into an ISR-visible global (a cross-context
-    // callback: stored by main-side code, invoked by the ISR).
+    // The extended ISR context: the ISR roots' reachability over direct
+    // calls and address-value edges, plus every defined function whose address
+    // is stored into an ISR-visible global (a cross-context callback: stored
+    // by main-side code, invoked by the ISR) (epic-cc#137).
     let (isr_ctx, _, _, _) = isr_context(m);
 
     for f in &mut m.funcs {
@@ -1860,8 +1848,8 @@ fn fill_indirect_callees(m: &mut Module) {
                         .cloned()
                         .collect();
                     // An ISR-site candidate that is a duplicated ORIGINAL
-                    // (address-taken elsewhere, e.g. a select arm) must
-                    // dispatch the `_isr` copy: the ISR can never run a
+                    // (address-taken elsewhere, e.g. a select arm)
+                    // dispatches the `_isr` copy: the ISR runs no
                     // main-context frame (ADR-013). The copy exists because
                     // the original is in the ISR context and main also
                     // reaches it.
@@ -1949,8 +1937,8 @@ fn collect_global_vals(inst: &Inst, out: &mut HashSet<String>) {
     }
 }
 
-/// The runtime routine for a scalar binop, or `None` if legalize leaves the
-/// op as a `Bin` (add/sub/and/or/xor, and i1 forms clang never emits).
+/// The runtime routine for a scalar binop, or `None` when legalize leaves the
+/// op as a `Bin` (add/sub/and/or/xor, and i1 forms clang omits).
 fn routine_name(op: BinOp, ty: Ty) -> Option<&'static str> {
     match (op, ty) {
         (BinOp::Mul, Ty::I8) => Some("__mul_u8"),
@@ -1981,16 +1969,15 @@ fn routine_name(op: BinOp, ty: Ty) -> Option<&'static str> {
     }
 }
 
-/// Rewrite one `Inst::Bin` into the runtime call, recording the routine as
+/// Rewrites one `Inst::Bin` into the runtime call, recording the routine as
 /// used. Returns `None` when the binop stays as-is: non-lowered ops, and
-/// const-count shifts (isel inlines those — the count arrives as a `Const`).
-/// Fold a `Bin` whose operands are both `Val::Const` into an `Inst::Freeze`
+/// const-count shifts (isel inlines those: the count arrives as a `Const`).
+/// Folds a `Bin` with both operands `Val::Const` into an `Inst::Freeze`
 /// carrying the literal result. isel has no path for a const-const shape
-/// (clang folds these upstream; only hand-written IR or a compiler-generated
-/// corner reaches here with both sides constant) — several ops panic
-/// outright and `sub` silently miscompiles by reading the second constant as
-/// a file address. `Freeze` already copies a `Val::Const` into `dst`'s slot
-/// via a plain `MOVLW`, so this needs no isel changes.
+/// (clang folds these upstream, so only hand-written IR reaches here with
+/// both sides constant). Several ops panic there with no lowering, and `sub`
+/// miscompiles by reading the second constant as a file address. `Freeze`
+/// copies a `Val::Const` into `dst`'s slot via a plain `MOVLW`.
 ///
 /// Returns `None` (leave the `Bin` unfolded) when either operand isn't
 /// constant, or when folding would have to invent a result for something
@@ -2003,7 +1990,7 @@ fn fold_const_bin(b: &ir::Bin) -> Option<Inst> {
     // i1 (`b.ty != Ty::I1`, arithmetic bit-widths make no sense on a 1-bit
     // value). Ty::bytes() maps I1 to 1 byte like I8, so folding it here
     // would manufacture an out-of-range "i1" constant instead of hitting
-    // that guard — leave it unfolded so isel's existing check still fires.
+    // that guard. Leaves it unfolded so isel's existing check still fires.
     if b.ty == Ty::I1 {
         return None;
     }
@@ -2062,11 +2049,11 @@ fn canon_signed(v: u64, width: u32) -> i64 {
     sign_extend(v & const_mask(width), width)
 }
 
-/// Evaluate a binop on two constants, masked/interpreted at `width` bits to
+/// Evaluates a binop on two constants, masked/interpreted at `width` bits to
 /// match isel's own per-byte truncation convention (`(k >> idx*8) & 0xFF`).
-/// The result is re-masked to `width` bits too — the IR text has no type
-/// tag on a bare constant, so a folded `add i8 200, 100` must read as `44`,
-/// not the unmasked `300`, to be the "obvious" result the width implies.
+/// The result re-masks to `width` bits too: the IR text carries no type
+/// tag on a bare constant, so a folded `add i8 200, 100` reads as `44`,
+/// not the unmasked `300`, the result the width implies.
 fn eval_binop(op: BinOp, width: u32, a: i64, b: i64) -> Option<i64> {
     let m = const_mask(width);
     let au = (a as u64) & m;
@@ -2185,51 +2172,51 @@ fn param(name: &str, width: u8) -> Param {
 
 /// The injected runtime routine definitions. Each is an ordinary function
 /// with one empty block containing only the scratch alloca, so `alloc`
-/// places the frame and Tasks 3/4's recipe emitters can resolve every slot
+/// places the frame and the recipe emitters resolve every slot
 /// address from the map (`{func}::{param}`, `{func}::__scr`).
 ///
 /// # The scratch layout contract (sizes + offsets)
 ///
-/// These byte offsets are the cross-task contract: Task 2 injects the
-/// buffers, Task 3 emits the mul/div/rem recipe bodies against them, Task 4
-/// the shift recipe bodies. The recipes read their inputs from the param
+/// These byte offsets form the cross-emitter contract: the injection step
+/// provides the buffers, the mul/div/rem emission reads them, then the shift
+/// emission reads them. The recipes read their inputs from the param
 /// slots (`a`/`b`, `num`/`den`, `val`/`cnt`), write the result to the retval
-/// slots, and use `__scr` strictly by offset. Every routine's frame must
-/// stay inside ONE GPR bank (any bank, issue #6), because the recipes'
-/// loops are skip-sensitive: no BANKSEL may be inserted between a test and
-/// its target or inside a carry idiom. `alloc` rounds a routine's base into
-/// a single bank; `isel` verifies the placement.
+/// slots, and use `__scr` strictly by offset. Every routine's frame stays
+/// inside ONE GPR bank (any bank), because the recipes' loops are
+/// skip-sensitive: no BANKSEL sits between a test and its target or inside
+/// a carry idiom. `alloc` rounds a routine's base into a single bank; `isel`
+/// verifies the placement (epic-cc#6).
 ///
 /// | routine | `__scr` size | offsets |
 /// |---|---|---|
 /// | `__mul_u8` | 6 | `bk`@0 (multiplier backup, shifted to test bits), `cnt`@1 (loop counter, 8), `r_lo`@2 / `r_hi`@3 (16-bit running product), `t_lo`@4 / `t_hi`@5 (shifted multiplicand) |
 /// | `__mul_u16` | 14 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup), `cnt`@2 (loop counter, 16), `r`@3-6 (32-bit running product), `t`@7-10 (shifted multiplicand), `spare`@11-13 (recipe scratch) |
-/// | `__udiv_u8`, `__urem_u8` | 4 | `rem_lo`@0 / `rem_hi`@1 (partial remainder — 2 bytes: the 8-bit rem shift can carry), `cnt`@2 (loop counter, 8), `restore`@3 (restore-step scratch) |
+/// | `__udiv_u8`, `__urem_u8` | 4 | `rem_lo`@0 / `rem_hi`@1 (partial remainder: 2 bytes, since the 8-bit rem shift can carry), `cnt`@2 (loop counter, 8), `restore`@3 (restore-step scratch) |
 /// | `__udiv_u16`, `__urem_u16` | 7 | `rem`@0-1 (partial remainder), `cnt`@2 (loop counter, 16), `spare`@3 (recipe scratch), `restore`@4-6 (restore-step scratch) |
 /// | `__sdiv_i8`, `__srem_i8` | 5 | `flags`@0 (sign state: bit0 = negate quotient, bit1 = negate remainder; `\|num\|`/`\|den\|` live in the param slots), `rem_lo`@1 / `rem_hi`@2, `cnt`@3, `restore`@4 |
 /// | `__sdiv_i16`, `__srem_i16` | 7 | `flags`@0 (as i8), `rem`@1-2, `cnt`@3, `restore`@4-5, `spare`@6 |
-/// | `__shl_u8`, `__lshr_u8`, `__ashr_i8` | 3 | `cnt`@0 (masked count / loop counter — the value shifts in the `val` param slot), `spare`@1-2 (recipe scratch) |
+/// | `__shl_u8`, `__lshr_u8`, `__ashr_i8` | 3 | `cnt`@0 (masked count / loop counter: the value shifts in the `val` param slot), `spare`@1-2 (recipe scratch) |
 /// | `__shl_u16`, `__lshr_u16`, `__ashr_i16` | 4 | `cnt`@0-1 (masked count / loop counter), `spare`@2-3 (recipe scratch) |
-/// | `__mul_u32` | 11 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup — 2 bytes: the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product — the low 32 bits of the full product), `t`@7-10 (shifted multiplicand — 4 bytes, shifting left with wraparound: the shifted-out high bits are DISCARDED, i32 `mul` wraps) |
-/// | `__udiv_u32`, `__urem_u32` | 10 | `rem`@0-3 (partial remainder — full 32 bits, never carries out for a 32/32 divide), `den`@4-7 (denominator copy — the divmod subtracts/restores against this, so the param slot is untouched), `cnt`@8 (loop counter, 32), `spare`@9 (recipe scratch) |
-/// | `__sdiv_i32`, `__srem_i32` | 12 | the divmod part at the unsigned offsets — `rem`@0-3, `den`@4-7, `cnt`@8, `spare`@9 — plus `flags`@10 (sign state: bit0 = negate quotient = num<0 XOR den<0, bit1 = negate remainder = num<0), `spare`@11 |
-/// | `__shl_u32`, `__lshr_u32`, `__ashr_i32` | 2 | `cnt`@0 (masked count / loop counter — the value shifts in the `val` param slot), `spare`@1 (recipe scratch) |
+/// | `__mul_u32` | 11 | `bk_lo`@0 / `bk_hi`@1 (multiplier backup: 2 bytes, the low 16 bits first, reloaded from `b`'s high half for the second 16 of the 32 iterations), `cnt`@2 (loop counter, 32), `r`@3-6 (32-bit running product: the low 32 bits of the full product), `t`@7-10 (shifted multiplicand: 4 bytes, shifting left with wraparound, so the shifted-out high bits drop and i32 `mul` wraps) |
+/// | `__udiv_u32`, `__urem_u32` | 10 | `rem`@0-3 (partial remainder: full 32 bits, with no carry out for a 32/32 divide), `den`@4-7 (denominator copy: the divmod subtracts/restores against this, so the param slot stays untouched), `cnt`@8 (loop counter, 32), `spare`@9 (recipe scratch) |
+/// | `__sdiv_i32`, `__srem_i32` | 12 | the divmod part at the unsigned offsets: `rem`@0-3, `den`@4-7, `cnt`@8, `spare`@9, plus `flags`@10 (sign state: bit0 = negate quotient = num<0 XOR den<0, bit1 = negate remainder = num<0), `spare`@11 |
+/// | `__shl_u32`, `__lshr_u32`, `__ashr_i32` | 2 | `cnt`@0 (masked count / loop counter: the value shifts in the `val` param slot), `spare`@1 (recipe scratch) |
 /// | `__add_f32`, `__sub_f32` | 14 | `sa`@0 (sign of a), `ea`@1 (biased exponent of a), `ma`@2-4 (24-bit mantissa of a with the implicit bit), `sb`@5, `eb`@6, `mb`@7-9 (same for b), `stick`@10 (sticky collector for the right-alignment shift), `cnt`@11 (alignment/normalize shift counter), `ta1`@12 / `ta2`@13 (the 24-bit fraction window; `ta0` reuses the dead `eb` slot at offset 6) |
-/// | `__mul_f32` | 14 | `sign`@0 (result sign = sa XOR sb), `e`@1-2 (biased result exponent: e1+e2-127, 16-bit intermediate), `bk`@3-5 (multiplier backup — shifted to test bits), `cnt`@6 (loop counter, 24), `m`@7-10 (running product — the top 25 bits of the 24x24 product accumulate here), `spare`@11-13 (rounding scratch) |
-/// | `__div_f32` | 12 | `sign`@0 (result sign = sa XOR sb), `e`@1-2 (biased result exponent: e1-e2+127, 16-bit intermediate), `rem`@3-6 (partial remainder — 4 bytes: the 24-bit rem shift can carry a bit), `den`@7-9 (denominator copy — the restoring subtract/restore reads this, the param slot stays untouched), `cnt`@10 (loop counter, 24), `spare`@11 (rounding scratch) |
+/// | `__mul_f32` | 14 | `sign`@0 (result sign = sa XOR sb), `e`@1-2 (biased result exponent: e1+e2-127, 16-bit intermediate), `bk`@3-5 (multiplier backup, shifted to test bits), `cnt`@6 (loop counter, 24), `m`@7-10 (running product: the top 25 bits of the 24x24 product accumulate here), `spare`@11-13 (rounding scratch) |
+/// | `__div_f32` | 12 | `sign`@0 (result sign = sa XOR sb), `e`@1-2 (biased result exponent: e1-e2+127, 16-bit intermediate), `rem`@3-6 (partial remainder: 4 bytes, since the 24-bit rem shift can carry a bit), `den`@7-9 (denominator copy: the restoring subtract/restore reads this, the param slot stays untouched), `cnt`@10 (loop counter, 24), `spare`@11 (rounding scratch) |
 /// | `__cmp_f32` | 6 | `tmp`@0-1 (byte-compare scratch), `flags`@2 (sign-state / NaN-check flags), `spare`@3-5 |
 /// | `__uitofp_f32`, `__sitofp_f32` | 8 | `cnt`@0 (leading-1 shift counter), `e`@1-2 (biased result exponent: 127+31-shifts), `guard`@3 (the round/guard bit), `stick`@4 (sticky), `spare`@5-7 |
-/// | `__fptoui_f32`, `__fptosi_f32` | 8 | `e`@0 (biased exponent), `cnt`@1 (right-shift count: 127-e+23), `m`@2-4 (mantissa working copy — shifted right in place), `sign`@5 (fptosi only), `spare`@6-7 |
+/// | `__fptoui_f32`, `__fptosi_f32` | 8 | `e`@0 (biased exponent), `cnt`@1 (right-shift count: 127-e+23), `m`@2-4 (mantissa working copy, shifted right in place), `sign`@5 (fptosi only), `spare`@6-7 |
 ///
-/// Notes: div-by-zero is LLVM poison — the loop runs (den = 0 ⇒ quotient
+/// Notes: div-by-zero is LLVM poison: the loop runs (den = 0 gives quotient
 /// 0xFFFF, remainder 0), any value is legal, no guard. Variable-shift counts
-/// arrive unmasked and are masked to `width - 1` inside the routine. The
+/// arrive unmasked and mask to `width - 1` inside the routine. The
 /// signed wrappers abs in place in the param slots (unsigned abs, so INT_MIN
 /// is safe), run the unsigned divmod, then negate per the flags byte. The
 /// soft-float routines take their operands in 4-byte slots (`a`/`b` are the
-/// f32 bytes; `val` is the 4-byte int slot — an i8/i16 source or result uses
+/// f32 bytes; `val` is the 4-byte int slot: an i8/i16 source or result uses
 /// the low bytes), write the result to the retval slots, and use `__scr`
-/// strictly by offset (Task-3 recipe contract).
+/// strictly by offset (the recipe contract).
 fn routine_func(name: &str) -> Func {
     let (ret, params, scr) = match name {
         "__mul_u8" => (Ty::I8, vec![param("a", 1), param("b", 1)], 6),
@@ -2250,7 +2237,7 @@ fn routine_func(name: &str) -> Func {
         "__shl_u32" | "__lshr_u32" | "__ashr_i32" => {
             (Ty::I32, vec![param("val", 4), param("cnt", 4)], 2)
         }
-        // Milestone 15: the soft-float routines (f32 slots are 4 bytes).
+        // The soft-float routines (f32 slots are 4 bytes).
         "__add_f32" | "__sub_f32" | "__mul_f32" => {
             (Ty::F32, vec![param("a", 4), param("b", 4)], 14)
         }
@@ -2272,7 +2259,7 @@ fn routine_func(name: &str) -> Func {
                 loc: None,
             })],
         }],
-        isr: false, // runtime routines are never interrupt handlers
+        isr: false, // runtime routines stay outside the interrupt context
         naked: false,
         variadic: false,
     }

@@ -1,8 +1,8 @@
 //! Per-part memory-map and capability facts, threaded through `alloc`,
 //! `isel`, `banking`, and `driver` instead of being hard-coded PIC16F877A
-//! literals in each of them. See docs/29-pic18-port-design.md (§2 D-3) for
-//! the design this implements. `has_hardware_multiply`/`has_tblrd` aren't
-//! added (nothing consumes them yet).
+//! literals in each of them. See docs/29 §2 for the design this implements.
+//! `has_hardware_multiply`/`has_tblrd` aren't added (no consumer reads
+//! them).
 
 mod config;
 pub use config::resolve_config;
@@ -46,7 +46,7 @@ pub struct Device {
     /// (`FSR<5>` on the p12f509, `FSR<6:5>` on the 16F505, unimplemented
     /// on the 508). Zero on every other core, whose bank selection never
     /// rides on `FSR`. Baseline bank changes are bit-granular
-    /// `BCF`/`BSF FSR` sequences (docs/37 D-2) and need this width.
+    /// `BCF`/`BSF FSR` sequences (docs/37 §2) and need this width.
     pub fsr_bank_bits: u8,
     /// Interrupt vector word address(es): one for PIC14; two (high/low
     /// priority) for a PIC18 device with IPEN set.
@@ -62,7 +62,7 @@ pub struct Device {
 pub struct Sfr {
     pub name: &'static str,
     pub addr: u16,
-    /// Width in bytes; 1 for every PIC14 and PIC18 SFR today.
+    /// Width in bytes; 1 for every PIC14 and PIC18 SFR.
     pub width: u8,
     pub fields: &'static [SfrField],
 }
@@ -73,7 +73,7 @@ pub struct SfrField {
     pub mask: u8,
     pub shift: u8,
 }
-/// The PIC14 core registers mirrored into every bank (issue #112): only
+/// The PIC14 core registers mirrored into every bank (epic-cc#112): only
 /// these may be accessed with any RP1:RP0 value. Every other bank-0 SFR
 /// (PORTA 0x05, TMR0 0x01, ...) exists solely in bank 0, so `bank_of`
 /// returns `Some(0)` for it and the banking pass emits a BANKSEL. Mid-range
@@ -84,7 +84,7 @@ const MIRRORED_SFRS: &[u16] = &[0x00, 0x02, 0x03, 0x04, 0x0A, 0x0B];
 /// PIC14E's mirrored block, confirmed byte for byte against DS41364E's
 /// memory map (Table 3-3): every bank's first 12 bytes are `INDF0, INDF1,
 /// PCL, STATUS, FSR0L, FSR0H, FSR1L, FSR1H, BSR, WREG, PCLATH, INTCON`.
-/// The design (docs/33 D-1) names this as the P1 `MIRRORED_SFRS` growth:
+/// The design (docs/33 §1) names this as the encoder's `MIRRORED_SFRS` growth:
 /// classic PIC14's six-register subset is wrong for the Enhanced core.
 const MIRRORED_SFRS_PIC14E: &[u16] = &[
     0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B,
@@ -239,7 +239,7 @@ pub struct ConfigRegion {
     pub base_byte_addr: u32,
     pub num_bytes: u16,
     /// Raw flash content before any FuseField is applied. Confirmed
-    /// per-device, not assumed uniform; see docs/31 D-9.
+    /// per-device, not assumed uniform; see docs/31 §9.
     pub erased_baseline: &'static [u8],
     pub fields: &'static [FuseField],
 }

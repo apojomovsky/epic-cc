@@ -30,9 +30,9 @@ pub fn build(m: &Module) -> CallGraph {
                     // (numeric `func`, the SSA register) has a `callees`
                     // candidate list filled by legalize: emit one edge per
                     // candidate so the depth/recursion checks and the overlay
-                    // allocator see the conservative whole-program graph
-                    // (epic-cc#73). A numeric `func` with no candidates is a
-                    // malformed module and must not enter the graph silently.
+                    // allocator see the conservative whole-program graph. A
+                    // numeric `func` with no candidates is a malformed module
+                    // and must not enter the graph silently (epic-cc#73).
                     if c.callees.is_empty() {
                         if c.func.chars().all(|ch| ch.is_ascii_digit()) {
                             continue;

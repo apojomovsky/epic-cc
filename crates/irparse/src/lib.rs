@@ -1,14 +1,11 @@
-//! Parser for LLVM IR text (`.ll`) into the canonical `ir::Module`.
+//! Parses LLVM IR text (`.ll`) into the canonical `ir::Module`.
 //!
-//! Supports the integer-spine subset the PIC8 backend consumes: `load`/
-//! `store` (global and SSA pointer operands), `add`/`sub`/`and`/`or`/`xor`,
-//! `ret`, `zext`/`sext`/`trunc`, `icmp`, `select`, `br`/`brcond`, `call`,
-//! `phi`, plus phase-3 pointers/const/structs: `getelementptr` (paren
-//! byte-offset and multi-index forms), array/`constant` globals, named
-//! struct types (`%struct.X = type {...}`), struct globals, `alloca`,
-//! `llvm.memcpy`, and byval/sret call ABI params. Any other opcode, or any
-//! structurally malformed input, panics loudly rather than silently
-//! misparsing.
+//! Covers the integer spine the PIC8 backend consumes (`load`/`store`,
+//! `add`/`sub`/`and`/`or`/`xor`, `ret`, `zext`/`sext`/`trunc`, `icmp`,
+//! `select`, `br`/`brcond`, `call`, `phi`) plus the pointer and struct
+//! side (`getelementptr`, array and struct globals, `alloca`,
+//! `llvm.memcpy`, byval/sret call ABI params). Unknown opcodes panic:
+//! invariant holds every consumed opcode lowers to the spine.
 
 use ir::{
     Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin,
@@ -19,13 +16,11 @@ use std::collections::{HashMap, HashSet};
 
 pub mod debug_vars;
 pub use debug_vars::{parse_debug_vars, DebugVars, DiTypeNode, DiVar};
-/// Strip LLVM parameter/return attributes we do not model, e.g.
-/// `i16 noundef range(i16 -32768, 255) %1` -> `i16 %1`.
-///
-/// NOTE: this drops ALL tokens inside `range(...)`/`align(...)` paren
-/// groups. It must NEVER be applied to a getelementptr — the paren GEP
-/// `(i8, ptr @g, i16 2)` would be destroyed. GEPs are parsed from the raw
-/// line by `parse_gep_expr`.
+/// Strips LLVM parameter and return attributes outside the model, e.g.
+/// `i16 noundef range(i16 -32768, 255) %1` becomes `i16 %1`. Drops every
+/// token inside `range(...)`/`align(...)` paren groups, so it stays off
+/// getelementptr: the paren GEP `(i8, ptr @g, i16 2)` breaks under it.
+/// GEPs parse from the raw line in `parse_gep_expr`.
 fn strip_attrs(s: &str) -> String {
     let mut out = String::new();
     let mut depth = 0usize;
@@ -81,14 +76,11 @@ fn parse_val(s: &str) -> Val {
     parse_val_typed(s, None)
 }
 
-/// Type-aware constant parse. For a `float` operand clang prints constants
-/// that cannot be represented in 8 hex digits as their DOUBLE-precision
-/// promotion — `store volatile float 0x3FB99999A0000000` is the f64 bit
-/// pattern of 0.1f, NOT a 64-bit integer to truncate (the M15 float
-/// differential found the old low-32-bits truncation storing 0xA0000000
-/// instead of 0x3DCCCCCD). A >8-digit hex on an f32 operand is converted
-/// back to the f32 bit pattern; the 8-digit hex form (`0x3F800000`) is
-/// already the f32 bits; non-float types keep the full integer.
+/// Parses constants with type knowledge. Clang prints a `float` constant
+/// outside 8 hex digits as its double-precision promotion, so a >8-digit
+/// hex on an f32 operand converts back to the f32 bit pattern (the float
+/// differential); the 8-digit hex form already holds the f32 bits, and
+/// non-float types keep the full integer.
 fn parse_val_typed(s: &str, ty: Option<Ty>) -> Val {
     let s = s.trim().trim_end_matches(',');
     if let Some(r) = s.strip_prefix('%') {
@@ -144,14 +136,12 @@ fn parse_val_typed(s: &str, ty: Option<Ty>) -> Val {
         panic!("SPIKE: cannot parse value {s:?}")
     }
 }
-/// Decode a typed element-list initializer (`[i16 4660, i16 -25924]`,
-/// `[float 0x3FB99999A0000000, float 5.000000e-01]`) into the table's
-/// little-endian byte blob. clang -O1 prints const arrays of multi-byte
-/// elements this way — never as `c"..."` — so each element is decoded with
-/// the same value grammar as operands (`parse_val_typed` handles the f64
-/// promotion clang prints for float constants that do not fit 8 hex
-/// digits) and appended little-endian. The element type's byte width is
-/// the stride.
+/// Decodes a typed element-list initializer into the table little-endian
+/// byte blob. Clang prints const arrays of multi-byte elements as element
+/// lists, so each element decodes with the operand value grammar
+/// (`parse_val_typed` covers the f64 promotion clang prints for float
+/// constants outside 8 hex digits) and appends little-endian. The element
+/// type byte width is the stride.
 fn parse_array_elements(init: &str, elem: Ty) -> Vec<u8> {
     let inner = init
         .strip_prefix('[')
@@ -186,10 +176,10 @@ fn parse_array_elements(init: &str, elem: Ty) -> Vec<u8> {
     out
 }
 
-/// Size/alignment of a literal struct type string (`{ i8, i8, i16 }`,
-/// nested `{ ... }` fields, `[N x T]` fields) — same layout rules as
-/// `compute_struct`: fields at aligned offsets, size rounded up to the max
-/// field alignment. `types` resolves any named `%struct.X` field.
+/// Sizes a literal struct type string (`{ i8, i8, i16 }`, nested `{ ... }`
+/// fields, `[N x T]` fields) with the `compute_struct` layout rules:
+/// fields sit at aligned offsets, size rounds up to the max field
+/// alignment. `types` resolves any named `%struct.X` field.
 fn literal_ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8) {
     let t = t.trim();
     let inner = brace_inner(t).unwrap_or_else(|| {
@@ -217,12 +207,11 @@ fn literal_ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> 
     (round_up(off, align), align)
 }
 
-/// Strip a clang self-type prefix from a nested value. clang prints every
-/// non-scalar initializer with its own type: `{ T } { v }` for struct
-/// values, `{ T } zeroinitializer` for zero-initialized nested structs,
-/// `[N x T] c"..."` / `[N x T] [...]` for array values. The value's first
-/// brace/bracket group is that self-type — strip it when present so the
-/// remainder is the bare value the decoder expects.
+/// Strips a clang self-type prefix from a nested value. Clang prints every
+/// non-scalar initializer with its own type (`{ T } { v }`, `{ T }`
+/// zeroinitializer, `[N x T] c"..."` / `[N x T] [...]`). The value first
+/// brace/bracket group is that self-type; stripping it leaves the bare
+/// value the decoder expects.
 fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
     let value = value.trim();
     if value.starts_with('{') || value.starts_with("<{") {
@@ -249,7 +238,7 @@ fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
         };
     }
     if ty.trim().starts_with('[') && value.starts_with('[') {
-        // `[3 x i8] c"abc"` / `[2 x T] [ ... ]` — the first bracket group
+        // `[3 x i8] c"abc"` / `[2 x T] [ ... ]`: the first bracket group
         // is the self-type.
         if let Some(i) = matching_bracket(value) {
             let rest = value[i + 1..].trim();
@@ -261,12 +250,12 @@ fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
     value
 }
 
-/// Decode one constant of a literal/named type into its flat little-endian
-/// byte blob, appending any function-address references (byte offset into
-/// the blob, function name) to `refs`. `value` forms: `zeroinitializer`, a
-/// scalar (`i8 65`, `i16 4660`, `float 0x...`), a `c"..."` or `[...]`
-/// array value, or a nested `{ ... }` struct value (possibly
-/// self-type-prefixed). Unknown shapes panic loudly.
+/// Decodes one constant of a literal or named type into its flat
+/// little-endian byte blob, appending function-address references (byte
+/// offset into the blob, function name) to `refs`. `value` forms:
+/// `zeroinitializer`, a scalar, a `c"..."` or `[...]` array value, or a
+/// nested `{ ... }` struct value (possibly self-type-prefixed). Unknown
+/// shapes panic: invariant holds every global initializer takes one form.
 fn decode_typed_value(
     ty: &str,
     value: &str,
@@ -496,11 +485,10 @@ fn decode_named_struct(
     blob
 }
 
-/// Decode an LLVM string literal `c"..."` into bytes. LLVM prints every
+/// Decodes an LLVM string literal `c"..."` into bytes. LLVM prints every
 /// byte outside the printable range (plus `"` and `\`) as a `\XX` hex
-/// escape, and a literal backslash byte 0x5C as the `\\` escape — so a
-/// const table spanning the printable range contains `\\` runs, which the
-/// hex-only decoder used to choke on.
+/// escape, and a literal backslash byte as the `\\` escape, so `\\` runs
+/// decode alongside hex escapes.
 fn parse_string_literal(s: &str) -> Vec<u8> {
     let start = s.find('"').unwrap() + 1;
     let end = start + s[start..].find('"').unwrap();
@@ -1063,11 +1051,11 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
         }
     }
 }
-/// Layout a struct from its field type strings. `None` while an unresolved
-/// (mutually/forward-referenced) struct is referenced. A packed record
-/// (clang's `-fpack-struct` layout, printed `<{ ... }>`) places every field
-/// at the running offset with alignment 1; unpacked records round each
-/// field up to its natural alignment.
+/// Lays out a struct from its field type strings. Returns `None` while an
+/// unresolved (mutually/forward-referenced) struct is referenced. A packed
+/// record (clang `-fpack-struct` layout, printed `<{ ... }>`) places every
+/// field at the running offset with alignment 1; unpacked records round
+/// each field up to its natural alignment.
 fn compute_struct(fields: &[String], types: &StructTypes, packed: bool) -> Option<StructInfo> {
     let mut off: u16 = 0;
     let mut max_align: u8 = 0;
@@ -1155,8 +1143,8 @@ fn build_struct_table(src: &str) -> StructTypes {
     types
 }
 
-/// Fresh-register generator for synthesized (materialized) GEP instructions.
-/// Pre-seeded with every `%name` in the module so `__gep<N>` never collides.
+/// Generates fresh registers for synthesized (materialized) GEP insts.
+/// Pre-seeds with every `%name` in the module so `__gep<N>` avoids collision.
 struct Fresh {
     used: HashSet<String>,
     counter: usize,
@@ -1358,9 +1346,9 @@ fn lower_switch(
     }
 }
 
-/// Parse one call/function pointer operand that may be an inlined GEP:
-/// `ptr @g` / `ptr %r` -> a plain `Val`; `ptr getelementptr ...` ->
-/// materialize a Gep inst and return its fresh reg.
+/// Parses one call or function pointer operand holding an inlined GEP.
+/// A plain `ptr @g` or `ptr %r` returns a `Val`; a `ptr getelementptr`
+/// materializes a Gep inst and returns its fresh reg.
 fn parse_call_ptr_val(
     arg: &str,
     types: &StructTypes,
@@ -1391,11 +1379,10 @@ fn parse_call_ptr_val(
     }
 }
 
-/// Parse one select arm: a plain typed value (`i16 6`, `i8 %r`), an
-/// `inttoptr` constant pointer, or an inlined `getelementptr` (materialized
-/// as a fresh Gep inst so its byte offset survives; the old parse extracted
-/// only the base global and silently read the wrong element). Returns the
-/// arm's `Val`.
+/// Parses one select arm: a plain typed value, an `inttoptr` constant
+/// pointer, or an inlined `getelementptr`. An inlined GEP materializes as
+/// a fresh Gep inst so its byte offset reaches the backend. Returns the
+/// arm `Val`.
 fn parse_select_arm(
     part: &str,
     types: &StructTypes,
@@ -1552,10 +1539,10 @@ fn parse_value_with_gep(
     }
 }
 
-/// Parse a load/store pointer operand (`ptr @g`, `ptr %r`, an inlined GEP
-/// that gets materialized as a fresh Gep inst, or an `inttoptr (<ty> <k> to
-/// ptr)` constant pointer). Returns `"@name"`, `"%name"`, or the literal ptr
-/// form `"0x<K>"` (SFR access — distinct from `@global`/`%reg`).
+/// Parses a load/store pointer operand (`ptr @g`, `ptr %r`, an inlined GEP
+/// materialized as a fresh Gep inst, or an `inttoptr` constant pointer).
+/// Returns `"@name"`, `"%name"`, or the literal ptr form `"0x<K>"`
+/// (SFR access, distinct from `@global`/`%reg`).
 fn parse_ptr_operand(
     arg: &str,
     types: &StructTypes,
@@ -1584,11 +1571,10 @@ fn parse_ptr_operand(
             }
             prev = t;
         }
-        // PIC18 SFRs sit at 12-bit addresses (PORTB = 0xF81), so the
-        // literal form must carry a full `u16`, not the 8-bit byte PIC14's
-        // bank-mirrored SFRs fit in. Keep the historical 2-digit form for
-        // addresses < 0x100 (PIC14's tests pin `0x06`) and widen only when
-        // the address needs the third hex digit.
+        // PIC18 SFRs sit at 12-bit addresses, so the literal form carries
+        // a full `u16`, not the 8-bit byte of bank-mirrored SFRs. Keeps
+        // the 2-digit form below 0x100 and widens only when the address
+        // needs the third hex digit.
         let k: u16 = k
             .unwrap_or_else(|| panic!("irparse: malformed inttoptr {b:?}"))
             .parse()
@@ -1639,7 +1625,7 @@ fn stride_and_next(cur: &str, types: &StructTypes) -> (i64, String) {
     }
 }
 
-/// Offset and type of field `idx` within struct `cur`.
+/// Returns the offset and type of field `idx` within struct `cur`.
 fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
     let cur = cur.trim();
     if let Some(name) = cur.strip_prefix('%') {
@@ -1698,7 +1684,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
     let mut k: i64 = 0;
     let mut terms: Vec<(u8, String)> = Vec::new();
     let mut cur = source_ty.trim().to_string();
-    // True when the previous GEP level was an array — a struct cur is then
+    // True when the previous GEP level was an array: a struct cur is then
     // the array's ELEMENT type, so this index is an element selector
     // (stride = struct size). Without it, a struct index is a FIELD selector.
     let mut from_array = false;
@@ -1713,7 +1699,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
         let idx = parse_val(ip.split_whitespace().last().unwrap());
         if cur.starts_with('%') || cur.starts_with('{') || cur.starts_with("<{") {
             if from_array {
-                // `[N x %struct.S], i16 0, i16 %i` — the index after an
+                // `[N x %struct.S], i16 0, i16 %i`: the index after an
                 // array-of-struct descent strides by sizeof(%struct.S)
                 let (sz, _) = ty_size_align(&cur, types, None);
                 match &idx {
@@ -1774,11 +1760,11 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
     (k as u8, terms)
 }
 
-/// Parse a getelementptr into `(base, k, terms)`. Handles the paren
-/// byte-offset form `(i8, ptr @g, i16 2)`, the multi-index form
-/// `[4 x i8], ptr %1, i16 0, i16 %2`, scalar sources, reg/global bases, and
-/// chained (inlined) bases. Strips its own `inbounds`/`nuw`/`nusw`/`inrange`
-/// attrs. Runs on the RAW source (never `strip_attrs`).
+/// Parses a getelementptr into `(base, k, terms)`: the paren byte-offset
+/// form `(i8, ptr @g, i16 2)`, the multi-index form, scalar sources,
+/// reg/global bases, and chained (inlined) bases. Strips its own
+/// `inbounds`/`nuw`/`nusw`/`inrange` attrs. Runs on the RAW source,
+/// outside `strip_attrs`.
 fn parse_gep_expr(
     src: &str,
     types: &StructTypes,
@@ -1877,10 +1863,9 @@ fn parse_call_arg(
             terms,
             loc: loc.cloned(),
         }));
-        // The attr prefix before the inlined GEP can carry byval/sret
-        // (`ptr ... byval(%struct.S) align 2 getelementptr ...` — clang's
-        // shape for passing a struct element by value). Preserve them or
-        // the callee ABI silently breaks.
+        // The attr prefix before the inlined GEP carries byval/sret
+        // (clang passes a struct element by value in this shape).
+        // Preserves them: dropping them breaks the callee ABI.
         let mut byval = None;
         let mut sret = false;
         for t in tokenize_parens(&a[..gpos]) {
@@ -1948,7 +1933,7 @@ fn parse_call_arg(
                     } else if t.parse::<f32>().is_ok() || t.starts_with("0x") || t.starts_with("0X")
                     {
                         // an f32 constant (decimal `5.000000e-01` or hex bit
-                        // pattern `0x3F800000`) — parse_val materializes the bits.
+                        // pattern `0x3F800000`): parse_val materializes the bits.
                         val_tok = Some(t.clone());
                     }
                 }
@@ -1963,10 +1948,10 @@ fn parse_call_arg(
     }
 }
 
-/// Parse one function param: `ptr` (byval/sret/plain) or a scalar type, with
-/// all LLVM attrs (`dead_on_unwind`, `noalias`, `nocapture`, `writable`,
-/// `writeonly`, `readonly`, `nonnull`, `align`, `initializes(...)`, ...)
-/// stripped. `byval(%X)`/`sret(%X)` sizes come from the struct table.
+/// Parses one function param: `ptr` (byval/sret/plain) or a scalar type.
+/// Strips all LLVM attrs (`dead_on_unwind`, `noalias`, `nocapture`,
+/// `writable`, `writeonly`, `readonly`, `nonnull`, `align`, ...).
+/// `byval(%X)`/`sret(%X)` sizes come from the struct table.
 fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
     let toks = tokenize_parens(p);
     let mut scalar = None;
@@ -2035,7 +2020,7 @@ fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
     }
 }
 
-/// Parse `.ll` text into canonical IR.
+/// Parses `.ll` text into canonical IR.
 pub fn parse_ll(src: &str) -> Module {
     let types = build_struct_table(src);
     let mut fresh = Fresh::new(src);
@@ -2305,9 +2290,8 @@ pub fn parse_ll(src: &str) -> Module {
                 label: entry_label.to_string(),
                 insts: Vec::new(),
             }];
-            // Handle single-line function definitions where the body is on the
-            // same line as `define`, e.g. `define void @foo() { tail call ... ret void }`.
-            // These appear in the Task 2 acceptance tests.
+            // Handles single-line function definitions with the body on the
+            // `define` line, e.g. `define void @foo() { tail call ... ret void }`.
             let mut handled_inline = false;
             let mut pending_first_line: Option<String> = None;
             if let Some(brace_pos) = line.find('{') {
@@ -2318,9 +2302,8 @@ pub fn parse_ll(src: &str) -> Module {
                         // empty body `{}`
                         handled_inline = true;
                     } else {
-                        // Split inner into pseudo-lines. For the Task 2 tests the
-                        // inner is either `tail call void asm sideeffect "...", ""() #0 ret void`
-                        // or similar. We handle `ret void` and `unreachable` as terminators.
+                        // Splits inner into pseudo-lines; `ret void` and
+                        // `unreachable` close a pseudo-line as terminators.
                         let mut pseudo_lines: Vec<String> = Vec::new();
                         // Prefer `ret void` split
                         if inner.contains("ret void") {
@@ -2343,11 +2326,9 @@ pub fn parse_ll(src: &str) -> Module {
                             }
                             pseudo_lines.push("unreachable".to_string());
                         } else {
-                            // Fallback: treat inner as single instruction line.
-                            // It may contain `call` etc. but we push as one line;
-                            // if it actually contains two instructions without `ret`,
-                            // parse_inst will be called once and will panic, but
-                            // this path is only for the test fixtures which use ret.
+                            // Fallback treats inner as one instruction line;
+                            // more than one non-`ret` instruction there panics:
+                            // invariant holds one line holds one instruction.
                             pseudo_lines.push(inner.to_string());
                         }
                         for pl in pseudo_lines {
@@ -2460,14 +2441,13 @@ pub fn parse_ll(src: &str) -> Module {
                         }
                         continue;
                     }
-                    // clang attaches `, !dbg !N` to a naked function's
-                    // trailing `unreachable`; it stays a terminator, not an
-                    // opcode. `wholeprog_opt` (epic-cc#193) can now also
-                    // synthesize a bare `unreachable` block for an ordinary
-                    // function, and isel needs a real terminator there. LLVM
-                    // guarantees such a block is never entered at runtime,
+                    // clang attaches `, !dbg !N` to a naked function trailing
+                    // `unreachable`; it stays a terminator, not an opcode.
+                    // The whole-program pass synthesizes a bare `unreachable`
+                    // block for an ordinary function, and isel needs a real
+                    // terminator there. LLVM guarantees the block never runs,
                     // so a self-branch closes it safely, except `naked`,
-                    // whose isel requires a pure-asm body and stays dropped.
+                    // whose isel requires a pure-asm body (epic-cc#193).
                     if l == "unreachable" || l.starts_with("unreachable, !") {
                         if !naked {
                             let here = blocks.last().unwrap().label.clone();
@@ -2541,10 +2521,10 @@ pub fn parse_ll(src: &str) -> Module {
     }
 }
 
-/// Parse a single `.ll` instruction (RAW line; GEPs are never attr-stripped).
-/// Returns a `Vec` because inlined GEP operands materialize a synthetic Gep
-/// inst before the consuming instruction, and `llvm.lifetime.*` calls
-/// produce nothing.
+/// Parses one `.ll` instruction from its RAW line (GEPs skip attr stripping).
+/// Returns a `Vec`: inlined GEP operands materialize a synthetic Gep inst
+/// before the consuming instruction, and `llvm.lifetime.*` calls produce
+/// nothing.
 fn parse_inst(
     line: &str,
     types: &StructTypes,
@@ -2699,8 +2679,8 @@ fn parse_inst(
         None => (None, trimmed),
     };
 
-    // A defining or standalone `tail/fastcc call` carries its markers before
-    // the opcode; strip them so `call` is detected.
+    // A defining or standalone `tail/fastcc call` carries its markers
+    // before the opcode; strips them so `call` is detected.
     let mut rest = rest;
     loop {
         if let Some(r) = rest.strip_prefix("tail ") {
@@ -2775,7 +2755,7 @@ fn parse_inst(
         }
         "call" => {
             let body = rest["call".len()..].trim();
-            // Find the callee's '(' — the one after `@func` or `%reg`,
+            // Find the callee's `'('`: the one after `@func` or `%reg`,
             // not a '(' inside a preceding prototype `(ptr, ...)` or inside
             // an arg attribute like `dereferenceable(10)`.  The callee is
             // the first `@` or `%` in the body (the `call` already stripped
@@ -2813,10 +2793,10 @@ fn parse_inst(
                 let a = split_top_level(args_str, ',');
                 let dst = parse_call_ptr_val(a[0], types, fresh, &mut out, cur.as_ref());
                 let src = parse_call_ptr_val(a[1], types, fresh, &mut out, cur.as_ref());
-                // Len: `i16 N` (const, unrolled — the M7 form, bounded to
-                // 255 bytes) or `i16 %r` (runtime length, issue #4 — the
-                // counted loop; the value is SSA-dead after the copy, so
-                // isel may decrement the length slot in place).
+                // Len is `i16 N` (const, unrolled, bounded to 255 bytes)
+                // or `i16 %r` (runtime length: a counted loop; the value
+                // is SSA-dead after the copy, so isel decrements the
+                // length slot in place) (epic-cc#4).
                 let len_tok = a[2].split_whitespace().last().unwrap();
                 let len = if let Some(r) = len_tok.strip_prefix('%') {
                     MemLen::Reg(Val::Reg(r.to_string()))

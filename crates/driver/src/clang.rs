@@ -50,9 +50,9 @@ pub struct Options {
     /// `EPIC_FOSC_HZ` value. Added as `-D EPIC_FOSC_HZ=<hz>` when `Some`.
     pub fosc_hz: Option<u64>,
     /// `-fpack-struct`: the XC8 PIC18 record layout gives every struct
-    /// member byte alignment (epic-cc#166). irparse reads the packedness
-    /// back from the `<{ ... }>` types clang prints, so nothing past the
-    /// front end needs the flag.
+    /// member byte alignment. irparse reads the packedness back from the
+    /// `<{ ... }>` types clang prints, so nothing past the front end needs
+    /// the flag (epic-cc#166).
     pub packed_structs: bool,
 }
 

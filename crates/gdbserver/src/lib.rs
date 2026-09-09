@@ -1,10 +1,10 @@
-//! The phase-4 debugger adapter (`epic-cc#259`): a long-lived RSP server
-//! that drives the phase-3 `Pic14` control surface. Loads the compiler's
+//! The debugger adapter (epic-cc#259): a long-lived RSP server
+//! that drives the `Pic14` control surface. Loads the compiler's
 //! HEX (program words) and serves gdb over TCP; the ELF+DWARF sidecar
 //! (`--sidecar` at compile time) stays on the gdb side and is never read
 //! here.
 //!
-//! Register convention (docs/34 section 3 spike): gdb sees an i386
+//! Register convention (docs/34 §3): gdb sees an i386
 //! architecture, so PIC14 state is mapped onto the x86 core registers:
 //! `eip` <- PC (word address), `eax` <- W, `ecx` <- STATUS, `edx` <- FSR,
 //! `ebx` <- PCLATH. Memory reads/writes address the RAM image physically
@@ -218,7 +218,7 @@ impl SingleThreadBase for Pic14Target {
         let base = start_addr as usize;
         let end = base + data.len();
         // Flash is read-only through this surface; a write crossing
-        // the RAM boundary fails loudly instead of dropping its tail.
+        // the RAM boundary fails instead of dropping its tail.
         if start_addr >= RAM_SIZE || end > RAM_SIZE as usize {
             return Err(TargetError::NonFatal);
         }

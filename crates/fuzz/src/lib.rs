@@ -1,29 +1,21 @@
 //! Seeded C generator + differential runner (PIC driver+sim vs host clang)
 //! + greedy cvise-style reducer.
 //!
-//! Milestone 14's random-testing crate: the whole pipeline - a seeded
-//! generator, a differential runner, a greedy reducer, and a corpus gate.
-//! The generator emits a tiny, deterministic C program in the milestone's
-//! "discipline" (unsigned-only arithmetic in genuinely explicit-width types
-//! - `u8`/`u16`/`u32` from `TYPEDEF_PROLOGUE`, never bare `unsigned long`,
-//! which is 64-bit on LP64 hosts - guarded shifts, a volatile `u8`
-//! checksum); the differential runner compiles it twice  -
-//! through the PIC8 driver into `pic14-sim`, and through host clang into a
-//! native binary - seeds the volatile inputs identically on both sides, and
-//! compares the resulting checksums.
+//! The random-testing crate: a seeded generator, a differential runner,
+//! a greedy reducer, and a corpus gate.
+//! The generator emits a tiny deterministic C program in the explicit-width
+//! discipline (`u8`/`u16`/`u32` from `TYPEDEF_PROLOGUE`, guarded shifts,
+//! volatile `u8` checksum). The runner compiles it through the PIC8 driver
+//! into `pic14-sim` and through host clang natively, seeds volatile inputs
+//! identically on both sides, and compares checksums.
 //!
-//! The harness contracts (see docs/27-phase6-random-testing-plan.md):
-//! - `generate(seed)` is deterministic (seeded RNG, no entropy);
-//! - the C discipline keeps host and PIC semantics identical, so a checksum
-//!   mismatch (or a non-halting sim, or a compiler panic) is a real bug;
-//! - the PIC side mirrors `crates/driver/tests/long_e2e.rs`: the volatile
-//!   globals' addresses come from the same alloc layout the driver used, the
-//!   driver binary (a workspace member) produces the hex, `pic14-sim` runs
-//!   it, and the machine must halt;
-//! - the host side compiles `prog.c` (+ a generated `host_main.c` that seeds
-//!   the inputs by name) with the dev container's `clang` (the pinned clang
-//!   WITHOUT `-target`; the unwrapped `$PIC8_CLANG_UNWRAPPED` cannot find the
-//!   host's stdio.h) and reads the printed checksum.
+//! Harness contracts (docs/27 §1):
+//! `generate(seed)` stays deterministic with no entropy; the discipline
+//! keeps host and PIC semantics identical, so a checksum mismatch, a
+//! non-halting sim, or a compiler panic signals a real bug. The PIC side
+//! mirrors the driver long e2e for layout, hex, and halt; the host side
+//! compiles `prog.c` plus generated `host_main.c` with plain `clang`
+//! and reads the printed checksum.
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
@@ -32,45 +24,34 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// The volatile checksum global's name (fixed by the C discipline).
+/// The checksum global name (fixed by the C discipline).
 pub const CHECKSUM_NAME: &str = "checksum";
 
 /// The explicit-width typedef prologue emitted at the top of every generated
 /// program.
 ///
-/// WHY (the milestone's "Important" fix): Task 1 documented `unsigned long`
-/// as "32-bit on both msp430 and the host" - that equivalence is FALSE. On
-/// LP64 hosts `unsigned long` is 64-bit, so a u32 computation whose result
-/// exceeds 2^32 (e.g. `x * x` for x = 0xFFFFFFFF, or a 64-bit quotient)
-/// diverges: msp430 wraps at 2^32, the host does not. `stdint.h` was the
-/// first choice (`uint8_t`/`uint16_t`/`uint32_t` are exactly this), but it
-/// does NOT resolve under the driver's fixed flags - `-nostdinc` drops the
-/// builtin resource-dir include path (verified empirically; adding an
-/// explicit `-isystem` fixes it, but the driver's flags are not ours to
-/// change). So the robust option is self-contained typedefs guarded on the
-/// target macro clang defines for the msp430 triple:
+/// Bare `unsigned long` is 32-bit on msp430 but 64-bit on LP64 hosts, so u32
+/// work past 2^32 wraps on one side only. `stdint.h` fits semantically but
+/// fails under the driver fixed flags (`-nostdinc` drops the resource-dir
+/// path, and those flags stay fixed). Self-contained typedefs guarded on the
+/// target macro clang defines for the msp430 triple therefore carry the
+/// widths on both sides:
 ///
 /// - u8  = unsigned char  (8 bits on both targets)
 /// - u16 = unsigned short (16 bits on both targets)
-/// - u32 = msp430: `unsigned long` (msp430 int is 16-bit, so its 32-bit
-///        type is long) / host: `unsigned int` (32-bit on the pinned
-///        x86-64-linux host) - genuinely 32-bit on BOTH sides.
+/// - u32 = msp430 `unsigned long` / host `unsigned int` (32 bits both sides;
+///        msp430 int is 16-bit so its 32-bit type is long).
 ///
-/// Milestone 15 added the signed widths `s16`/`s32` for the float
-/// conversions (`sitofp` needs a signed source, `fptosi` a signed target;
-/// bare `int` is 16-bit on msp430 but 32-bit on the host): s16 = msp430
-/// `int` / host `short`, s32 = msp430 `long` / host `int` - genuinely
-/// 16/32-bit on both sides, same guard pattern.
+/// The float differential adds signed widths `s16`/`s32` for conversions
+/// (`sitofp` needs a signed source, `fptosi` a signed target; bare `int`
+/// is 16-bit on msp430 but 32-bit on the host): s16 is msp430 `int` with
+/// host `short`, s32 is msp430 `long` with host `int`.
 ///
-/// Issue #14 added `s8` for the signed differential generator (signed
-/// arithmetic/comparisons at 8 bits need an explicit s8 - `signed char` is
-/// 8-bit on both targets).
+/// The signed differential adds `s8`: signed 8-bit work needs an explicit
+/// width since `signed char` is 8-bit on both targets (epic-cc#14).
 ///
-/// With these, u8/u16/u32/s8/s16/s32 arithmetic wraps identically on both
-/// sides and the differential is meaningful for values beyond 2^16 (pinned
-/// by `u32_arithmetic_wraps_identically_on_both_sides` in tests/differential.rs
-/// and by `unsigned_long_u32_arithmetic_mismatches`, which shows the old
-/// discipline failing).
+/// With these widths arithmetic wraps identically on both sides, so the
+/// differential stays meaningful past 2^16.
 pub const TYPEDEF_PROLOGUE: &str = "\
 #ifdef __MSP430__\n\
 typedef unsigned char u8;\n\
@@ -88,7 +69,7 @@ typedef short s16;\n\
 typedef int s32;\n\
 #endif\n";
 
-/// The volatile input globals' name prefix (`in0`, `in1`, …).
+/// The input globals name prefix (`in0`, `in1`, …).
 const INPUT_PREFIX: &str = "in";
 
 /// The fixed input widths, in declaration order (`in0` u8, `in1` u16,
@@ -104,11 +85,9 @@ const MAX_SIM_STEPS: usize = 5_000_000;
 
 /// SplitMix64 - a small, self-contained, deterministic 64-bit PRNG.
 ///
-/// Chosen over a bare LCG at the same zero-dependency cost: SplitMix64 is a
-/// few lines, keeps only a 64-bit word of state, and - unlike an LCG, whose
-/// low bits cycle visibly - mixes every output bit, so adjacent seeds produce
-/// meaningfully different programs while the output stays perfectly
-/// reproducible (the corpus contract; no entropy is ever consulted).
+/// SplitMix64 costs the same as a bare LCG at zero dependencies while mixing
+/// every output bit: adjacent seeds yield distinct programs and output stays
+/// reproducible with no entropy consulted.
 struct SplitMix64 {
     state: u64,
 }
@@ -134,11 +113,10 @@ impl SplitMix64 {
 // Program model
 // ---------------------------------------------------------------------------
 
-/// One volatile input global: `volatile unsigned <width> <name>;` (or
-/// `volatile float <name>;` when `is_float`), seeded with `value` - for a
-/// float input, the 4-byte IEEE-754 bit pattern - on both sides of the
-/// differential (the sim seeds the RAM bytes; the host writes the bits
-/// through a union, see `host_main_source`).
+/// One input global: `volatile unsigned <width> <name>;` (or `volatile float`
+/// when `is_float`), seeded with `value` on both sides (a float value is the
+/// 4-byte IEEE-754 bit pattern; the sim seeds RAM bytes and the host writes
+/// bits through a union, see `host_main_source`).
 #[derive(Debug, Clone)]
 pub struct Input {
     pub name: String,
@@ -149,16 +127,15 @@ pub struct Input {
 }
 
 /// A generated program: the C source plus the metadata the differential
-/// harness needs to seed and observe it, and the generator's structural
-/// knowledge (the main-body statements) the Task-3 reducer operates on.
+/// harness needs to seed and observe it, and the generator structural
+/// knowledge (main-body statements) the reducer operates on.
 #[derive(Debug, Clone)]
 pub struct Program {
     pub c_source: String,
     pub inputs: Vec<Input>,
     pub checksum_name: String,
-    /// The seed the program was generated from (provenance: the reduced
-    /// fixture is named `reduced_<seed>.c`). Hand-written programs use a
-    /// marker seed.
+    /// The seed the program generated from (the reduced artifact records it).
+    /// Hand-written programs use a marker seed.
     pub seed: u64,
     /// The generator's structural knowledge: the main-body statements in
     /// source order. Scalar statements are single lines; block statements
@@ -171,45 +148,39 @@ pub struct Program {
     pub prologue: String,
 }
 
-/// An IR-level differential program (issue #14): canonical IR text in the
-/// `ir::parse` dialect (`global <name> <ty>` / `fn <name>(<ret>) (<params>)`
-/// / `block <label>:` / `%d = <op> <ty> <a> <b>` - no LLVM `@`-global
-/// definitions, no commas) fed DIRECTLY to the in-process pipeline  -
-/// `ir::parse` -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
-/// banking -> peephole -> asm - bypassing clang. The PIC side runs the
-/// canonical IR; the host side runs the `c_twin` C source (the same
-/// computation in the C discipline) so the differential still compares
-/// checksums.
+/// An IR-level differential program: canonical IR text in the `ir::parse`
+/// dialect fed directly to the in-process pipeline (`ir::parse` through asm,
+/// bypassing clang). The PIC side runs the canonical IR; the host side runs
+/// the `c_twin` C source (the same computation in the C discipline) so the
+/// differential still compares checksums (epic-cc#14).
 #[derive(Debug, Clone)]
 pub struct IrProgram {
     /// Canonical IR text (`ir::parse` dialect).
     pub ir_text: String,
-    /// The volatile input globals, seeded identically on both sides.
+    /// The input globals, seeded identically on both sides.
     pub inputs: Vec<Input>,
-    /// The volatile checksum global's name.
+    /// The checksum global name.
     pub checksum_name: String,
-    /// Provenance seed (the corpus contract).
+    /// Provenance seed.
     pub seed: u64,
     /// The C twin: the host-side oracle for the same computation.
     pub c_twin: String,
 }
 
 // ---------------------------------------------------------------------------
-// Differential failures (Task 3: classified so the reducer can preserve
-// the ORIGINAL failure)
+// Differential failures (classified so the reducer preserves the failure)
 // ---------------------------------------------------------------------------
 
-/// The kind of a differential failure. The reducer accepts a candidate
-/// deletion only when the failure it observed PERSISTS - the same kind - so
-/// a candidate that merely breaks the build (e.g. a deletion that orphaned
-/// a local) is rejected as a NEW failure, not the original one surviving.
+/// The kind of a differential failure. The reducer keeps a candidate deletion
+/// only when the same kind persists, so a candidate that merely breaks the
+/// build (for example an orphaned local) rejects as a new failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     /// The PIC and host checksums disagree (a miscompile - the
     /// differential's core detection).
     Mismatch,
-    /// The PIC compiler pipeline panicked or the driver failed (the
-    /// loud-panic contract - a compiler bug).
+    /// The PIC compiler pipeline panicked or the driver failed, which signals
+    /// a compiler bug.
     Panic,
     /// The simulator did not halt within the step budget.
     NoHalt,
@@ -220,9 +191,8 @@ pub enum FailureKind {
     Harness,
 }
 
-/// A differential failure: its kind (for the reducer's preservation check)
-/// plus the human-readable message (the diagnostics the Task-1/2 tests
-/// assert on).
+/// A differential failure: its kind (for the reducer preservation check)
+/// plus the human-readable diagnostic message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     pub kind: FailureKind,
@@ -242,7 +212,7 @@ impl std::fmt::Display for Failure {
 }
 
 // ---------------------------------------------------------------------------
-// Generator (Task 2: the full surface + the fixed corpus)
+// Generator (the full surface plus the fixed corpus)
 // ---------------------------------------------------------------------------
 
 /// A scalar binary op the generator can emit, with its width guard.
@@ -272,7 +242,7 @@ enum SignedBin {
     Xor,
 }
 
-/// The signed statement kinds (the forced rotation's pool).
+/// The signed statement kinds in the forced rotation pool.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SignedKind {
     Div,
@@ -286,7 +256,7 @@ enum SignedKind {
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 15: the float surface (float mode)
+// The float surface (float mode)
 // ---------------------------------------------------------------------------
 
 /// A float binary op the float generator can emit.
@@ -307,12 +277,11 @@ enum FConvKind {
     FpToSi,
 }
 
-/// The float constant pool (float-mode operands). All values are
-/// normal-range (biases 120..133) and nonzero except `0.0f`/`-0.0f`, which
-/// are safe as fadd/fsub/fmul operands and fcmp comparands (0 op x is
-/// exact) but excluded from the divisor pool. The constant pool is what
-/// makes the -0.0 == +0.0 cmp case reachable (in6's single value cannot
-/// be both signs).
+/// The float constant pool (float-mode operands). All values stay normal-range
+/// (biases 120..133) and nonzero except `0.0f`/`-0.0f`, which stay safe as
+/// add, sub, mul operands and cmp comparands but leave the divisor pool. The
+/// pool keeps the -0.0 == +0.0 cmp case reachable where one input cannot hold
+/// both signs.
 const FCONSTS: &[&str] = &[
     "0.0f",
     "-0.0f",
@@ -344,17 +313,16 @@ const FCONSTS_NONZERO: &[&str] = &[
     "0.75f",
 ];
 
-/// The RNG-mix constants separating the float generator's streams from the
-/// integer generator's (the corpus is deterministic either way; the mix
-/// keeps adjacent int/float seeds visibly distinct).
+/// The RNG-mix constants separating the float generator streams from the
+/// integer generator streams (both stay deterministic; the mix keeps adjacent
+/// int and float seeds visibly distinct).
 const FLOAT_MIX: u64 = 0xF10A_7E5C_0000_0001;
 const FLOAT_MIX2: u64 = 0xA5A5_1234_5678_9ABC;
 
-/// A random NORMAL f32 bit pattern with the biased exponent in `lo..=hi`.
-/// The band [100, 150] (values ~2^-27..2^23) is the safe arithmetic range
-/// - the corpus's documented filter: NaN/inf/denormals are excluded, and
-/// the operand pools keep every statement RESULT in the normal range too,
-/// so the differential verifies RNE rounding without IEEE edge-case noise.
+/// A random normal f32 bit pattern with the biased exponent in `lo..=hi`.
+/// The band [100, 150] (values ~2^-27..2^23) is the safe arithmetic range:
+/// NaN, inf, and denormals stay excluded and operand pools keep every result
+/// normal, so the differential verifies RNE rounding without edge-case noise.
 fn normal_bits(rng: &mut SplitMix64, lo: u32, hi: u32) -> u32 {
     let exp = lo + (rng.next_u64() as u32) % (hi - lo + 1);
     let mant = (rng.next_u64() as u32) & 0x7F_FFFF;
@@ -362,9 +330,8 @@ fn normal_bits(rng: &mut SplitMix64, lo: u32, hi: u32) -> u32 {
     sign | (exp << 23) | mant
 }
 
-/// The edge input in6: ±0, the smallest normals (0x00800000-ish - the
-/// Task-3 cmp fix's boundary values), the RNE classics 1/3 and 0.1, or a
-/// random normal with exponent 80..140 (still safe as an fadd/fsub
+/// The edge input in6: ±0, the smallest normals, the RNE classics 1/3 and
+/// 0.1, or a random normal with exponent 80..140 (safe as an add or sub
 /// B-operand and as a cmp comparand).
 fn edge_bits(rng: &mut SplitMix64) -> u32 {
     const EDGE: [u32; 8] = [
@@ -400,10 +367,10 @@ struct Gen {
     /// bank) small, the long_e2e budget is ≤ 9 i32 locals.
     locals: Vec<(String, u8)>,
     /// `(start, end)` index ranges of locals that died with their C block
-    /// (if/else arms, loop bodies) - out of scope for later statements.
+    /// (if/else arms, loop bodies) and stay out of scope for later statements.
     dead: Vec<(usize, usize)>,
     /// The generated `main` body statements, one per line where possible
-    /// (a flat, structurally-known shape for the Task-3 reducer).
+    /// (a flat, structurally known shape for the reducer).
     body: Vec<String>,
     used_fold16: bool,
     used_fold32: bool,
@@ -415,20 +382,19 @@ struct Gen {
     frame_est: u32,
     /// The biggest runtime-routine frame (bytes) the program needs so far.
     worst_routine: u32,
-    /// True while the feature-flagged (forced) statements are being emitted
-    /// (the flag-guaranteed phase): structured statements pick their
-    /// cheapest width so every flagged construct fits the frame budget.
+    /// True while the feature-flagged (forced) statements emit: structured
+    /// statements pick their cheapest width so every flagged construct fits
+    /// the frame budget.
     forced: bool,
-    /// Milestone 15 float mode: the program is a float differential program
-    /// (`generate_float`): float inputs in3..in6, float statements
-    /// (fadd/fsub/fmul/fdiv/fcmp/conversions) folded through the volatile
-    /// `fout` bits global, and its own globals-end (no array/struct, no int
-    /// locals). Frame-budget estimates in this mode are exact def counts
-    /// (measured from clang IR), so the fill margin is 0.
+    /// Float mode: the program is a float differential program
+    /// (`generate_float`): float inputs in3..in6, float statements folded
+    /// through the `fout` bits global, and its own globals end (no
+    /// array or struct, no int locals). Estimates there are exact def counts
+    /// from clang IR, so the fill margin is 0.
     float_mode: bool,
-    /// Float locals (`float tN`) emitted so far - the float operand pool
-    /// (a local's value is a normal-range float by construction, see
-    /// `emit_fbin`; int locals never exist in float mode).
+    /// Float locals (`float tN`) emitted so far: the float operand pool
+    /// (each local holds a normal-range float by construction; int locals
+    /// never exist in float mode).
     flocals: Vec<String>,
 }
 
@@ -466,12 +432,11 @@ impl Gen {
     }
 
     /// A `(width)`-cast operand: an input, a recent local, or a constant
-    /// (always inside `width`'s range - constants never truncate).
+    /// (always inside `width` range; constants never truncate).
     ///
-    /// Only SAME-WIDTH inputs/locals are drawn: a cross-width cast would
-    /// make clang materialize a zext/trunc def in main's frame, and the
-    /// frame-budget model counts the statement's own defs, not the casts  -
-    /// the corpus found the resulting bank-0 overflow (seeds 34/169/176).
+    /// Only same-width inputs and locals draw: a cross-width cast materializes
+    /// a zext or trunc def in the main frame outside the per-statement budget,
+    /// which overflows bank 0.
     fn operand(&mut self, w: u8) -> String {
         let ct = ctype(w);
         let roll = self.below(10);
@@ -494,12 +459,11 @@ impl Gen {
         format!("{v}u")
     }
 
-    /// An operand that is NEVER a constant (inputs/locals only). Used for
-    /// i8/i16 division/modulo divisors: clang strength-reduces a CONSTANT
-    /// divisor into a magic-number multiply in i9/i17 arithmetic, which the
-    /// IR pipeline cannot parse (found by the corpus at seed 2). u32
-    /// constant divisors stay legal (clang emits a plain `udiv i32`). Like
-    /// `operand`, only same-width sources (no cast defs in main's frame).
+    /// An operand that is never a constant (inputs and locals only). Division
+    /// and modulo divisors avoid constants: clang strength-reduces a constant
+    /// divisor into magic-number arithmetic the IR pipeline cannot parse, while
+    /// u32 constant divisors stay legal as plain `udiv i32`. Like `operand`,
+    /// only same-width sources draw.
     fn operand_reg(&mut self, w: u8) -> String {
         let ct = ctype(w);
         // The input of the same width (each width has exactly one input:
@@ -581,33 +545,21 @@ impl Gen {
         }
     }
 
-    /// The backend gives every SSA def (volatile loads included) its own
-    /// RAM slot, so main's frame size = the sum of its defs' widths. The
-    /// runtime routines are main's callees: their frames start at main's
-    /// frame end, and each must stay inside ONE GPR bank (issue #6, the
-    /// recipe loops are skip-sensitive; alloc rounds a straddling routine
-    /// frame into the next bank). Bank 0 holds 0x20..0x6F and the first
-    /// routine frame ends no later than 0x6F (0x70-0x7F is common RAM,
-    /// never used by locals); a larger routine frame simply spills into
-    /// bank 1 wholesale instead of fitting bank 0, so the budget is the
-    /// same 0x70 bound with the same measured routine frames (params +
-    /// scratch):
+    /// The backend gives every SSA def (volatile loads included) its own RAM
+    /// slot, so main frame size is the sum of def widths. Runtime routines are
+    /// main callees starting at main frame end, each staying inside one GPR
+    /// bank (skip-sensitive recipe loops; alloc rounds a straddling frame into
+    /// the next bank). The budget is the 0x70 bound with the routine frames:
     ///   u8 mul/div/rem/shift: 3, u16 shift: 6, u16 div/rem: 8,
-    ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 18 (14-byte scratch),
-    ///   u32 mul: 22.
+    ///   u32 shift: 12, u32 div/rem: 12, u16 mul: 18, u32 mul: 22.
     ///
-    /// Globals end (measured from the allocator): the fixed inputs
-    /// (in0 u8 @0x20, in1 u16 @0x22, in2 u32 @0x24) + checksum u8 end at
-    /// 0x29; `arr[8]` adds 8, the struct (u8 a / u16 b / u32 c, even-
-    /// aligned) adds 8. The old 0x28/6-byte-struct estimate ran low by up
-    /// to 4 bytes when both globals were used, silently eating into the
-    /// bank-0 headroom the model thinks it has.
+    /// Globals end: the fixed inputs plus checksum u8 end at 0x29; `arr[8]`
+    /// adds 8 and the even-aligned struct adds 8 (epic-cc#6).
     fn frame_budget(&self) -> u32 {
         if self.float_mode {
-            // Float-mode globals end (measured from the allocator, which
-            // places even-aligned): in0 u8 @0x20, in3 float @0x22, in6 float
-            // @0x26, checksum u8 @0x2A, fout float @0x2C - end 0x30. (No
-            // array/struct in float mode.)
+            // Float-mode globals end with even-aligned placement: in0 u8 at
+            // 0x20, in3 float at 0x22, in6 float at 0x26, checksum u8 at 0x2A,
+            // fout float at 0x2C, end 0x30. No array or struct in float mode.
             return 0x70 - self.worst_routine - 0x30;
         }
         let globals =
@@ -630,14 +582,11 @@ impl Gen {
                 }
         };
         let routine = self.worst_routine.max(routine);
-        // The 8-byte safety margin applies to the FILL phase only: the
-        // per-statement estimates are measured upper bounds (>= real), so
-        // forced statements must fit by estimate alone - the margin would
-        // reject real-fit flagged combos (e.g. array+struct: 35 est of a
-        // 41 budget). The fill statements' cumulative real cost is still
-        // bounded by est + 8 <= the hard bank-0 limit. Float mode's
-        // estimates are exact def counts (measured from clang IR for the
-        // fixed statement shapes), so no margin is needed there either.
+        // The 8-byte safety margin applies to fill statements only: estimates
+        // are upper bounds, so forced statements fit by estimate alone and the
+        // margin would reject real-fit flagged combos. Fill cost stays bounded
+        // by est + 8 under the bank-0 limit. Float-mode estimates are exact
+        // def counts for the fixed shapes, so no margin applies there either.
         let margin = if self.forced || self.float_mode { 0 } else { 8 };
         self.frame_est + frame + margin <= 0x70 - routine - globals
     }
@@ -645,11 +594,10 @@ impl Gen {
     /// The noinline byte-mix fold helpers (emitted only when used).
     fn fold_helpers_src(used16: bool, used32: bool) -> String {
         let mut s = String::new();
-        // The trailing `+ (u8)in0` is a volatile read: without it the body
-        // is pure arithmetic on the arg, so a constant-foldable arg makes
-        // clang specialize the helper and dead-arg the original call into
-        // `poison` (seed 2 - the IR pipeline cannot parse poison). in0 is
-        // seeded identically on both sides, so the fold stays deterministic.
+        // The trailing `+ (u8)in0` is a volatile read: without it a pure
+        // arithmetic body with a foldable arg lets clang specialize the helper
+        // and dead-arg the call into `poison` the IR pipeline cannot parse.
+        // in0 seeds identically on both sides, so the fold stays deterministic.
         if used16 {
             s.push_str(
                 "__attribute__((noinline)) u8 fold16(u16 v) {\n    return (u8)((u8)v ^ (u8)(v >> 8u) + (u8)in0);\n}\n",
@@ -716,13 +664,10 @@ impl Gen {
                     [self.below(5) as usize],
             },
             None => {
-                // Div/Rem/Mul/Shl/Shr weighted up so the corpus reliably
-                // exercises the whole op surface (the frame budget rejects
-                // the expensive ones often enough on its own). Add/Sub
-                // stay covered by the if/loop/helper bodies. Shl/Shr get
-                // 5 of the 10 slots: the 8 fast seeds must jointly
-                // exercise every op and the 200-seed corpus needs >= 40
-                // shifts (the pinned coverage sanity checks).
+                // Div, rem, mul, and shifts weigh up so the surface exercises
+                // evenly (the frame budget already rejects expensive ops often).
+                // Add and sub stay covered by the if, loop, and helper bodies;
+                // shifts take half the slots so the fast seeds span every op.
                 match self.below(10) {
                     0 => BinOp::Div,
                     1..=2 => BinOp::Rem,
@@ -732,13 +677,10 @@ impl Gen {
                 }
             }
         };
-        // A FORCED (flag-guaranteed) op must fit, and the later forced
-        // statements' globals (array/struct) shrink the budget, so a heavy
-        // forced op always runs at u8 - the cheapest width. The guarantee
-        // is on the OP, not the width: a u8 mul still pulls in the mul
-        // runtime routine (mul i16), and u16/u32 arith stays covered by
-        // the fill statements. Fill statements keep the random width and
-        // simply return false when the budget rejects them (best-effort).
+        // A forced op always runs at u8, the cheapest width: later forced
+        // statements add array and struct globals that shrink the budget, and
+        // the coverage promise is on the op rather than the width. Fill
+        // statements keep the random width and return false on rejection.
         if forced.is_some() {
             w = 8;
         }
@@ -820,9 +762,8 @@ impl Gen {
 
     /// A comparison statement: the i1 result stored as u8 and folded.
     fn emit_cmp(&mut self) -> bool {
-        // Main-frame cost = the two operands + the i1 result, MEASURED
-        // from clang -O1 IR: u8 6, u16 ~8, u32 12 bytes of defs (rounded
-        // up; the flat-7 estimate under-ran u32 by 5).
+        // Main-frame cost is the two operands plus the i1 result: u8 7,
+        // u16 9, u32 13 bytes of defs.
         let w = self.pick_width();
         let cost = match w {
             8 => 7,
@@ -845,14 +786,13 @@ impl Gen {
     /// the checksum (branch-conditional folding; the same seeded inputs run
     /// the same branch on both sides, and both arms' code survives).
     fn emit_ifelse(&mut self) -> bool {
-        // A forced (flag-guaranteed) if always runs at u8 - the cheapest  -
-        // so it fits alongside the other forced statements; the fill phase
-        // keeps the random width (u32 ifs are expensive, ~30 main bytes).
+        // A forced if always runs at u8, the cheapest width, so it fits
+        // alongside the other forced statements; fill keeps the random width
+        // (u32 ifs cost about 30 main bytes).
         let w = if self.forced { 8 } else { self.pick_width() };
         let ct = ctype(w);
-        // Main-frame cost = the condition's operands/result + one local
-        // per arm, MEASURED from clang -O1 IR: u8 ~8-9, u16 ~16, u32 ~30
-        // bytes of defs.
+        // Main-frame cost is the condition operands and result plus one local
+        // per arm: u8 9, u16 16, u32 30 bytes of defs.
         let cost = match w {
             8 => 9,
             16 => 16,
@@ -893,18 +833,17 @@ impl Gen {
     /// input), body = 1–2 cheap inline ops on the accumulator (no runtime
     /// routines inside the trip loop), then fold the accumulator.
     fn emit_loop(&mut self) -> bool {
-        // Bias the accumulator to u8 (a u32 loop's phi web costs ~4x a u8
-        // one in main's frame and starves the mul/div statements of budget
-        // - u32 math is covered by arith/struct/cmp instead). A forced
-        // (flag-guaranteed) loop always runs at u8.
+        // Bias the accumulator to u8 (a u32 loop phi web costs about 4x a u8
+        // one and starves mul and div of budget; u32 math stays covered by
+        // arith, struct, and cmp). A forced loop always runs at u8.
         let w = if self.forced {
             8
         } else {
             [8u8, 8, 8, 16][self.below(4) as usize]
         };
         let ct = ctype(w);
-        // Main-frame cost = i + n + acc + t + 1-2 body temps, MEASURED
-        // from clang -O1 IR: u8 11, u16 ~15 bytes of defs (rounded up).
+        // Main-frame cost is i, n, acc, t, and body temps: u8 12, u16 16
+        // bytes of defs.
         let cost = match w {
             8 => 12,
             _ => 16,
@@ -931,10 +870,9 @@ impl Gen {
         let mut body = String::new();
         // 1-2 body ops (each is a def in the phi web - keep the loop cheap).
         // NO `+`/`-` on the induction var: clang -O1 strength-reduces
-        // `acc += i` over the masked bound into a closed-form sum in i9
-        // magic arithmetic, which the IR pipeline cannot parse (found by
-        // the corpus at seed 78). `^`/`&`/`|` are not sum idioms, so the
-        // loop stays a real loop.
+        // `acc += i` over the masked bound into closed-form magic arithmetic
+        // the IR pipeline cannot parse. `^`, `&`, and `|` are not sum idioms,
+        // so the loop stays a real loop.
         let nops = 1 + self.below(2);
         for _ in 0..nops {
             let op = ["^", "&", "|"][self.below(3) as usize];
@@ -961,18 +899,15 @@ impl Gen {
 
     /// A noinline call: `t = helper(args);` (0–3 unsigned params), folded.
     fn emit_call(&mut self, helpers: &[Helper]) -> bool {
-        // Main-frame cost = the single u8 result local (+ fold), MEASURED
-        // at 3 defs from clang -O1 IR.
+        // Main-frame cost is the single u8 result local plus fold: 5 defs.
         if !self.fit(5, 0, false, false) {
             return false;
         }
         self.frame_est += 5;
         let h = &helpers[self.below(helpers.len() as u32) as usize];
-        // Constant args only: clang -O1 was observed replacing a
-        // volatile-derived call arg (a zext of a loaded value, local or
-        // input) with `poison` (seed 2 of the corpus), which the IR
-        // pipeline cannot parse. Constant args are always clean and still
-        // exercise the full call/param/return machinery.
+        // Constant args only: a volatile-derived call arg lets clang replace
+        // the arg with `poison` the IR pipeline cannot parse. Constant args
+        // stay clean and still exercise the call, param, and return path.
         let args: Vec<String> = h
             .params
             .iter()
@@ -996,10 +931,9 @@ impl Gen {
     /// power-of-two N lowers to a mask, 3/5 to a real urem), a write, a
     /// read-back folded into the checksum.
     fn emit_array(&mut self) -> bool {
-        // Main-frame cost = the x/y operands + the ix local + the index
-        // casts, MEASURED at 8-10 defs from clang -O1 IR (seed 169: the
-        // index zext pushes it to 10). `i % 3`/`i % 5` lower to a real
-        // __urem_u16 call (8-byte frame); pow2 N lowers to an `and`.
+        // Main-frame cost is the x/y operands plus the ix local and index
+        // casts: 11 defs. `i % 3` and `i % 5` lower to a real __urem_u16 call
+        // (8-byte frame); pow2 N lowers to an `and`.
         if !self.fit(11, 14, true, false) {
             return false;
         }
@@ -1023,15 +957,13 @@ impl Gen {
         true
     }
 
-    /// A struct statement: field-wise stores into the volatile global
-    /// struct `s` (u8/u16/u32 fields), then a width-mixing fold over the
-    /// fields (explicit casts; no layout dependence - names only).
+    /// A struct statement: field-wise stores into the volatile global struct
+    /// `s` (u8/u16/u32 fields), then a width-mixing fold over the fields with
+    /// explicit casts and no layout dependence.
     fn emit_struct(&mut self) -> bool {
-        // Main-frame cost = the three operand locals + the field loads +
-        // the s.c u32 shift/xor chain, MEASURED at 21-23 defs from clang
-        // -O1 IR (the u32 fold is expensive in main's frame - the old
-        // 13-byte estimate under-ran by ~10 and overflowed bank 0 once
-        // the routine frames were stacked on main's end).
+        // Main-frame cost is the three operand locals plus field loads and
+        // the s.c u32 shift and xor chain: 24 defs (the u32 fold runs in the
+        // main frame).
         if !self.fit(24, 0, false, true) {
             return false;
         }
@@ -1060,22 +992,21 @@ impl Gen {
         true
     }
 
-    // ---- Issue #14: the signed surface (signed mode only) ----
+    // ---- The signed surface (signed mode only) ----
 
-    /// A signed width (s8/s16/s32 - the same byte widths as u8/u16/u32, so
-    /// the frame-budget model and the local slots are shared).
+    /// A signed width (s8, s16, s32 share byte widths with u8, u16, u32, so
+    /// the frame-budget model and the local slots stay shared).
     fn spick_width(&mut self) -> u8 {
         [8u8, 16, 32][self.below(3) as usize]
     }
 
-    /// A signed arithmetic statement: `(sW)((uW)a op (uW)b)` - computed in
-    /// the unsigned domain so wrapping is defined on BOTH sides (C's usual
-    /// arithmetic conversions: on msp430 u16/u32 promote to the unsigned
-    /// int/long of the same width and wrap mod 2^W; on the host the wider
-    /// int holds the exact product and the cast truncates identically).
-    /// `forced` pins the op (the flag-guaranteed first statement); the fill
-    /// picks by the weighted mix. Main-frame costs mirror the unsigned
-    /// arith table (same statement shapes); mul pulls the big routines.
+    /// A signed arithmetic statement: `(sW)((uW)a op (uW)b)` computes in the
+    /// unsigned domain so wrapping stays defined on both sides (msp430
+    /// promotes to the same-width unsigned type and wraps mod 2^W; the host
+    /// holds the exact value in a wider int and truncates identically).
+    /// `forced` pins the op for the first statement; fill picks by mix.
+    /// Main-frame costs mirror the unsigned arith table; mul pulls the big
+    /// routines.
     fn emit_sarith(&mut self, forced: Option<SignedBin>) -> bool {
         let mut w = self.spick_width();
         if self.forced {
@@ -1140,20 +1071,19 @@ impl Gen {
         true
     }
 
-    /// A signed div/rem statement with a CONSTANT divisor in 2..=9: the
-    /// only signed-division UB pair is INT_MIN / -1, and the divisor is
-    /// neither 0 nor -1, so no dividend guard is needed (signed const
-    /// divisors stay plain `sdiv`/`srem` - clang does NOT magic-number
-    /// strength-reduce signed division, verified; the unsigned generator's
-    /// runtime-divisor rule is a udiv-only quirk). The dividend is a
-    /// volatile input / local (never a constant - a const would fold).
+    /// A signed div or rem statement with a constant divisor in 2..=9: the
+    /// only signed-division UB pair is INT_MIN / -1, and the divisor avoids
+    /// both, so no dividend guard applies (signed const divisors stay plain
+    /// `sdiv` and `srem`; the unsigned runtime-divisor rule is udiv-only).
+    /// The dividend is a volatile input or local and never a constant, which
+    /// would fold.
     fn emit_sdivrem(&mut self, rem: bool) -> bool {
         let mut w = self.spick_width();
         if self.forced {
             w = 8; // a flag-guaranteed statement runs at the cheapest width
         }
-        // Frames: __sdiv/__srem_i8 = 5, i16 = 7, i32 = 12 (the unsigned
-        // table's 14/14/12 over-estimates - conservative, so reuse it).
+        // Frames: __sdiv and __srem cost i8 5, i16 7, i32 12; the unsigned
+        // table over-estimates, so reusing it stays conservative.
         let (cost, routine) = match w {
             8 => (10, 14),
             16 => (12, 14),
@@ -1174,10 +1104,9 @@ impl Gen {
         true
     }
 
-    /// A signed arithmetic-shift statement: `(sW)((sW)v >> c)` - a const
-    /// count in 1..=W-1, or a masked runtime count (volatile/local - a
-    /// const count would fold the shift). ashr sign-fills, exercising the
-    /// __ashr routines' sign extension.
+    /// A signed arithmetic-shift statement: `(sW)((sW)v >> c)` with a const
+    /// count in 1..=W-1 or a masked runtime count (a const count would fold
+    /// the shift). ashr sign-fills and exercises sign extension.
     fn emit_sshift(&mut self) -> bool {
         let mut w = self.spick_width();
         if self.forced {
@@ -1234,16 +1163,13 @@ impl Gen {
         true
     }
 
-    // ---- Milestone 15: the float surface (float mode) ----
+    // ---- The float surface (float mode) ----
 
-    /// A float operand from the BAND pool: the band input in3 (the
-    /// generated normal with the exponent in 100..150, value ~2^-27..2^23),
-    /// a normal-range constant, or a recent float local. The band pool is
-    /// the safe source for every arithmetic slot: values are normal and
-    /// their arithmetic stays normal (the corpus's documented filter - no
-    /// NaN/denormal/inf INPUTS, and the operand pools keep the RESULTS
-    /// normal too, so the differential verifies RNE rounding without IEEE
-    /// edge-case noise). Returns `(text, main-frame bytes the load costs)`.
+    /// A float operand from the band pool: the band input in3 (a normal with
+    /// exponent in 100..150, value ~2^-27..2^23), a normal-range constant, or
+    /// a recent float local. Band values stay normal and their arithmetic
+    /// stays normal, so the differential verifies RNE rounding without IEEE
+    /// edge-case noise. Returns `(text, main-frame bytes the load costs)`.
     fn foperand_band(&mut self) -> (String, u32) {
         match self.below(4) {
             0 => ("in3".to_string(), 4),
@@ -1258,13 +1184,12 @@ impl Gen {
         }
     }
 
-    /// A float operand from the ANY pool: the band pool plus the edge input
-    /// in6 (±0, the smallest normals, and normals with exponents 80..140  -
-    /// the Task-3 cmp fix's boundary values). The edge input is safe as a
-    /// fcmp operand (comparisons are exact) and as an fadd/fsub B-operand
-    /// (the band A-operand dominates, so A ± B stays in the normal range),
-    /// but NOT for fmul/fdiv - the smallest normals would underflow to a
-    /// denormal and zero would divide by zero.
+    /// A float operand from the any pool: the band pool plus the edge input
+    /// in6 (zeros, smallest normals, and normals with exponents 80..140).
+    /// The edge input stays safe for fcmp (comparisons are exact) and as an
+    /// add or sub B-operand (the band A-operand dominates, so results stay
+    /// normal), but never for mul or div: smallest normals would underflow
+    /// and zero would divide by zero.
     fn foperand_any(&mut self) -> (String, u32) {
         match self.below(5) {
             0 => ("in3".to_string(), 4),
@@ -1280,11 +1205,10 @@ impl Gen {
         }
     }
 
-    /// A KNOWN-NONZERO divisor for fdiv: the band input in3 (exponent
-    /// 100..150 - never zero) or a nonzero constant. Locals are excluded:
-    /// their value is unknown to the generator, and a runtime zero divisor
-    /// would diverge - the host computes IEEE ±inf (sign of the dividend)
-    /// while the routine returns the deterministic +0x7F800000.
+    /// A known-nonzero divisor for fdiv: the band input in3 or a nonzero
+    /// constant. Locals stay excluded: their value is unknown, and a runtime
+    /// zero divisor diverges (the host yields IEEE infinity while the routine
+    /// returns a deterministic infinity encoding).
     fn fdivisor(&mut self) -> (String, u32) {
         match self.below(3) {
             0 => ("in3".to_string(), 4),
@@ -1312,12 +1236,10 @@ impl Gen {
         name
     }
 
-    /// The bits fold for a float RESULT: store it to the volatile `fout`
-    /// global, re-read the four bytes as a u32 (the type-punned
-    /// `*(volatile u32*)&fout` - LLVM opaque pointers make this a plain
-    /// `load i32` of the float global's bytes, no bitcast inst), and fold
-    /// through the shared fold32 helper. The fold is over the float's EXACT
-    /// bits - a single wrong RNE bit changes the checksum.
+    /// The bits fold for a float result: store it to the `fout` global,
+    /// re-read the four bytes as a u32 through the type-punned load, and fold
+    /// through the shared fold32 helper. The fold covers the exact bits, so a
+    /// single wrong RNE bit changes the checksum.
     fn fpush_fold(&mut self, t: &str) {
         self.used_fold32 = true;
         self.body.push(format!("  fout = {t};"));
@@ -1326,12 +1248,10 @@ impl Gen {
     }
 
     /// A float arithmetic statement: `float tN = a op b;` folded through the
-    /// fout bits. The operand pools (see `foperand_band`/`foperand_any`/
-    /// `fdivisor`) keep every RESULT in the normal range, so the routine
-    /// only ever sees in-range RNE rounding. Main-frame cost = the operand
-    /// loads + the fop def (4) + the bits fold (checksum load 1 + the i32
-    /// bits load 4 + the fold32 call 1 + the xor 1 = 7), measured from
-    /// clang IR.
+    /// fout bits. The operand pools keep every result in the normal range, so
+    /// the routine only ever sees in-range RNE rounding. Main-frame cost is
+    /// the operand loads plus the op def (4) plus the bits fold (7): 11 plus
+    /// loads.
     fn emit_fbin(&mut self, op: FBin, force_input: bool) -> bool {
         // The forced (first) statement must exercise the routine: with two
         // constant operands clang folds the op away (no call). Pin the
@@ -1347,12 +1267,10 @@ impl Gen {
             _ => self.foperand_any(), // add/sub: the edge input is safe as B
         };
         let cost = ac + bc + 4 + 7;
-        // The routine's FULL frame (params + scratch) measured from the
-        // alloc layout: __add_f32/__sub_f32/__mul_f32 = 4+4+14 = 22 bytes,
-        // __div_f32 = 4+4+12 = 20. main_end + this must stay <= 0x70 (the
-        // recipe slots are skip-sensitive; a straddling routine frame
-        // rounds into bank 1 wholesale, so the budget keeps the frame in
-        // bank 0), the M14 budget model's `worst_routine`.
+        // The routine full frame (params plus scratch) is 22 bytes, 20 for
+        // div. Main end plus this stays under 0x70: recipe slots are
+        // skip-sensitive and a straddling frame rounds into bank 1 wholesale,
+        // so the budget keeps the frame in bank 0.
         let routine = if matches!(op, FBin::Div) { 20 } else { 22 };
         if !self.fit(cost, routine, false, false) {
             return false;
@@ -1371,12 +1289,10 @@ impl Gen {
         true
     }
 
-    /// A float comparison statement: `checksum = (u8)(checksum ^ (u8)(a rel
-    /// b));` - the fcmp predicate materialized by legalize's __cmp_f32
-    /// tri-state tree (the C ordered operators cover olt/ole/ogt/oge/oeq/
-    /// one). Main-frame cost = the operand loads + the tree's worst shape
-    /// (call 1 + 2 icmps 2 + select 1 + the zext 1 + the checksum load 1 +
-    /// the xor 1 = 7), measured from clang IR.
+    /// A float comparison statement materialized by the ordered compare tree:
+    /// `checksum ^= (u8)(a rel b)`. Main-frame cost is the operand loads plus
+    /// the tree worst shape (call, icmps, select, zext, checksum load, xor):
+    /// 7 plus loads.
     fn emit_fcmp_f(&mut self, force_input: bool) -> bool {
         // The forced (first) statement must exercise __cmp_f32: pin one
         // operand to an input (two constants would fold to a constant).
@@ -1400,13 +1316,12 @@ impl Gen {
         true
     }
 
-    /// A float conversion statement. The sources are the bits of the band
-    /// input in3 read through the type-punned load (any u32 - always
-    /// defined), and the fptoui/fptosi targets are masked to ≤ 32767.5 so
-    /// the conversion is ALWAYS in range (an out-of-range fptoui/fptosi is
-    /// LLVM poison - the host could materialize anything, diverging from
-    /// the routine's clamp). The `* 0.5f` makes odd masks fractional,
-    /// exercising the truncation. Costs measured from clang IR.
+    /// A float conversion statement. Sources read the band input bits through
+    /// the type-punned load (always defined), and float-to-int targets mask
+    /// to 32767.5 or less so the conversion stays in range (out-of-range
+    /// conversion is poison and diverges from the routine clamp). The
+    /// `* 0.5f` keeps odd masks fractional and exercises truncation. Costs
+    /// come from clang IR shapes.
     fn emit_fconv(&mut self, kind: FConvKind) -> bool {
         let src = "in3";
         match kind {
@@ -1432,11 +1347,9 @@ impl Gen {
                 // load i32 (4) + and (4) + uitofp (4) + fmul (4) + the
                 // conversion (4) + the fold (checksum 1 + call 1 + xor 1).
                 let cost = 23;
-                // The shape contains an fmul (`* 0.5f`): __mul_f32's FULL
-                // frame (params 8 + scratch 14 = 22) dominates the
-                // conversion routines' 12-byte frames - counting 12 let
-                // seed 4's conv overflow bank 0 (the __mul_f32 slots at
-                // 0xA0, found by the M15 float corpus).
+                // The shape contains an fmul (`* 0.5f`), so the mul routine
+                // full frame of 22 dominates the conversion 12-byte frames and
+                // the budget counts 22.
                 if !self.fit(cost, 22, false, false) {
                     return false;
                 }
@@ -1481,15 +1394,11 @@ impl Gen {
             let name = format!("helper{k}");
             src.push_str(&format!("__attribute__((noinline)) u8 {name}({sig}) {{\n"));
             let mut prev: Vec<(String, u8)> = Vec::new();
-            // One op PER PARAM first: every param must be referenced in the
-            // body, or clang replaces the unused call arg with `poison`
-            // (found by the corpus at seed 19 - the IR pipeline cannot
-            // parse poison, so it panics loudly). The op's second operand is
-            // a VOLATILE INPUT read: that makes the body impossible to
-            // constant-fold/specialize, so clang cannot dead-arg the call
-            // into `poison` either (seen at seed 2, where a foldable helper
-            // body was specialized and its original call left with a poison
-            // arg).
+            // One op per param first: every param stays referenced in the
+            // body, or clang replaces the unused call arg with `poison` the
+            // IR pipeline cannot parse (the backend panics on it). The second
+            // operand reads a volatile input, which blocks constant folding
+            // and specialization, so clang cannot dead-arg the call either.
             for (pi, &pw) in params.iter().enumerate() {
                 let ct = ctype(pw);
                 let v = format!("v{}", prev.len());
@@ -1526,10 +1435,9 @@ impl Gen {
                 };
                 let a = pick(self, w, &prev);
                 let b = pick(self, w, &prev);
-                // No shifts inside helpers: clang matches a const-shift
-                // followed by the byte-mix return as a rotate idiom and
-                // emits `llvm.fshl.i8`, an intrinsic the whole-program
-                // compiler cannot resolve (found by the corpus at seed 1).
+                // No shifts inside helpers: clang matches a const shift plus
+                // byte mix as a rotate idiom and emits an intrinsic the
+                // whole-program compiler cannot resolve.
                 let op = ["+", "-", "&", "|", "^"][self.below(5) as usize];
                 let expr = format!("({ct})(({ct}){a} {op} ({ct}){b})");
                 let v = format!("v{}", prev.len());
@@ -1537,11 +1445,10 @@ impl Gen {
                 prev.push((v, w));
             }
             let (last, _lw) = prev.last().unwrap().clone();
-            // The return mixes in a volatile input: a pure byte-mix of the
-            // params lets clang collapse the body to `ret %0` (identity
-            // folds) and mark the param `returned`, which the IR parser
-            // cannot handle (found by the corpus at seed 2). in0 is seeded
-            // identically on both sides, so the mix is deterministic.
+            // The return mixes in a volatile input: a pure byte mix lets clang
+            // collapse the body to an identity return and mark the param
+            // returned, which the IR parser cannot handle. in0 seeds
+            // identically on both sides, so the mix stays deterministic.
             src.push_str(&format!("    return (u8)((u8){last} + (u8)in0);\n}}\n"));
             helpers.push(Helper { name, params });
         }
@@ -1559,12 +1466,10 @@ fn ctype(w: u8) -> &'static str {
 }
 
 /// (main-frame cost, runtime-routine frame) for an arith statement at a
-/// width. The main-frame costs are MEASURED from clang -O1 IR for the
-/// generated statement shapes (volatile loads + the op + the fold call),
-/// rounded up: u8 5, u16 9, u32 15 bytes of defs. Note w=8 mul lowers as
-/// mul i16 (__mul_u16, 18 bytes) and w=16 mul as mul i32 (__mul_u32, 22
-/// bytes): the width-space widening for host-overflow safety pulls in the
-/// big routines.
+/// width. Main-frame costs come from clang IR shapes (loads plus op plus
+/// fold call), rounded up: u8 5, u16 9, u32 15 bytes of defs. w=8 mul lowers
+/// as mul i16 (18 bytes) and w=16 mul as mul i32 (22 bytes): width widening
+/// for host-overflow safety pulls in the big routines.
 fn arith_cost(w: u8, op: BinOp) -> (u32, u32) {
     match (w, op) {
         (8, BinOp::Mul) => (8, 18),
@@ -1585,37 +1490,29 @@ fn arith_cost(w: u8, op: BinOp) -> (u32, u32) {
 
 /// Generate a deterministic program from `seed`.
 ///
-/// The full Task-2 surface: scalar arithmetic (+ - * / % & | ^ << >> on
-/// u8/u16/u32 with the discipline's guards), comparisons (< <= > >= == !=),
-/// if/else, bounded loops, noinline calls (0–3 unsigned params), arrays
-/// (small, dynamic `i % N` index), structs (simple u8/u16/u32 fields,
-/// field-wise access), all folded into the volatile `u8` checksum with
-/// explicit width casts. 3 fixed-width volatile inputs (in0 u8, in1 u16,
-/// in2 u32) are seeded identically on both sides of the differential. Every
-/// random choice comes from the seeded RNG in a fixed order, so `seed`
-/// fully determines the program (the corpus contract).
+/// The full integer surface: scalar arithmetic (+ - * / % & | ^ << >> on
+/// u8, u16, u32 with the discipline guards), comparisons, if and else,
+/// bounded loops, noinline calls (0..3 unsigned params), arrays (small,
+/// dynamic `i % N` index), and structs (u8, u16, u32 fields, field-wise
+/// access), all folded into the `u8` checksum with explicit width casts.
+/// Three fixed-width volatile inputs seed identically on both sides. Every
+/// random choice comes from the seeded RNG in order, so `seed` determines
+/// the program.
 pub fn generate(seed: u64) -> Program {
     let mut g = Gen::new(seed);
     let mut rng = SplitMix64::new(seed ^ 0x51_7C_C1_B7_27_22_0A_95);
 
-    // Per-seed feature flags: each construct/op is guaranteed to appear in
-    // a program when its flag is set (the RNG mix varies which programs are
-    // rich; the fixed 8-seed fast corpus and the 200-seed corpus span the
-    // surface - pinned by the tests' coverage sanity checks). The heavy ops
-    // (mul/div/rem pull in the big runtime routines) are flags too: forced
-    // FIRST, while the frame budget is empty, so the random fill cannot
-    // starve them.
+    // Per-seed feature flags: each flagged construct appears in its program.
+    // The RNG mix varies which programs are rich; the fast seeds and the
+    // wider corpus span the surface. Heavy ops (mul, div, rem pull in big
+    // runtime routines) are flags too: forced first, while the frame budget
+    // is empty, so random fill cannot starve them.
     //
-    // The flags are a BOUNDED random subset - exactly 2 of the 8, not
-    // independent bits: main's frame (and the runtime routines' frames
-    // stacked under it) is a hard hardware limit, so one program can
-    // only hold a couple of heavy constructs. An unbounded bit-draw let a
-    // seed's forced tail exceed the budget and was SILENTLY DROPPED
-    // (review finding - 'guaranteed when flagged' was false); force() now
-    // panics if a flagged construct cannot fit, so the draw must stay
-    // inside the budget by construction. The RNG mix still varies which
-    // programs are rich (which 2 of the 8), and the fill statements cover
-    // the rest of the surface.
+    // The flags are a bounded random subset: exactly 2 of the 8. Main frame
+    // plus stacked routine frames is a hard hardware limit holding only a
+    // couple of heavy constructs. force() panics when a flagged construct
+    // cannot fit, so the draw stays inside the budget by construction; fill
+    // statements cover the rest of the surface.
     let nflags = 2; // exactly 2 flags per seed (see force()'s panic)
     let mut flags = [false; 8];
     let mut pool: Vec<u8> = (0..8).collect();
@@ -1658,13 +1555,11 @@ pub fn generate(seed: u64) -> Program {
 
     let (helpers, helper_src) = g.emit_helpers();
 
-    // Feature-flagged statements FIRST (frame budget empty, so the heavy
-    // mul/div/rem and the structured constructs all fit), then a weighted
-    // random fill bounded by the frame budget - the backend gives every
-    // SSA def, volatile loads included, its own RAM slot, so main's frame,
-    // and the runtime routines' frames stacked under it, cap the program's
-    // size. While `forced` is set, the structured statements
-    // pick their cheapest width so every flagged construct fits.
+    // Feature-flagged statements run first while the frame budget is empty,
+    // then a weighted random fill bounded by the budget: every SSA def takes
+    // its own RAM slot, so main frame plus stacked routine frames caps size.
+    // While `forced` is set, structured statements pick their cheapest width
+    // so every flagged construct fits.
     let force = |g: &mut Gen, k: usize| -> bool {
         match k {
             0 => g.emit_forced_arith(BinOp::Mul),
@@ -1692,12 +1587,10 @@ pub fn generate(seed: u64) -> Program {
     .enumerate()
     {
         if *want && !force(&mut g, k) {
-            // A flagged construct is GUARANTEED to appear (the tests pin
-            // the corpus's per-seed feature coverage). Silently dropping it
-            // on a budget rejection would lose that coverage without a
-            // trace, so fail loudly instead - the frame-budget model must
-            // be recalibrated (cheaper forced variants, fewer simultaneous
-            // flags) until every flagged construct fits.
+            // A flagged construct always appears: dropping it on a budget
+            // rejection would lose coverage silently, so the build panics and
+            // the frame-budget model gets recalibrated until every flagged
+            // construct fits.
             panic!(
                 "fuzz: seed {seed}: flagged construct #{k} rejected by the frame budget \
                  (frame_est {}, worst_routine {}, budget {}) - the 'guaranteed when \
@@ -1764,38 +1657,27 @@ pub fn generate(seed: u64) -> Program {
 }
 
 // ---------------------------------------------------------------------------
-// Milestone 15: the float differential (Task 5)
+// The float differential
 // ---------------------------------------------------------------------------
 
-/// Generate a deterministic FLOAT differential program from `seed` - the
-/// milestone's RNE verification at scale. The float inputs are random
-/// IEEE-754 BIT PATTERNS under the documented corpus filter: NaN,
-/// infinities, and denormals are EXCLUDED (the routines' IEEE edge-case
-/// handling is deterministic-but-minimal and deferred - see the plan's
-/// self-review notes); in3 is a normal with the exponent in the safe band
-/// 100..150 (value ~2^-27..2^23, whose arithmetic stays in the normal
-/// range), and in6 is the edge value (±0, the smallest normals
-/// 0x00800000-ish, and normals with exponents 80..140 - covering the
-/// Task-3 cmp fix: the sign-magnitude ordering, the zero equality, and the
-/// smallest-normals boundary).
+/// Generate a deterministic float differential program from `seed` for RNE
+/// verification at scale. The float inputs are random IEEE-754 bit patterns
+/// with NaN, infinities, and denormals excluded (edge-case handling there
+/// stays minimal and deterministic); in3 is a normal with exponent in the
+/// safe band 100..150 (values whose arithmetic stays normal), and in6 is the
+/// edge value (zeros, smallest normals, and normals with exponents 80..140
+/// covering sign-magnitude ordering, zero equality, and the boundary).
 ///
-/// The statements cover the whole float surface - fadd/fsub/fmul/fdiv
-/// (the four soft-float arithmetic routines), fcmp (the ordered C
-/// predicates through legalize's __cmp_f32 tri-state tree), and the four
-/// int↔float conversions (uitofp/sitofp/fptoui/fptosi) - with the operand
-/// pools chosen so every RESULT also stays in the normal range (no
-/// overflow/underflow/denormal noise; the differential then purely verifies
-/// RNE rounding at scale). Every float result is folded over its BITS: the
-/// volatile `fout` global is re-read as u32 (the type-punned load - a
-/// single wrong RNE bit changes the fold), and the fold32 byte-mix feeds
-/// the volatile u8 checksum. `in0` (u8) stays as the fold helper's
-/// determinism anchor (same role as in the integer generator).
+/// The statements cover the whole float surface: the four soft-float arithmetic
+/// routines, fcmp (ordered C predicates through the compare tree), and the four
+/// int and float conversions, with operand pools keeping every result in the
+/// normal range. Every float result folds over its bits: the `fout` global
+/// re-reads as u32 through the type-punned load, and the fold32 byte mix feeds
+/// the u8 checksum. `in0` (u8) anchors the fold helper deterministically.
 ///
-/// Every random choice comes from the seeded RNG in a fixed order, so
-/// `seed` fully determines the program. The first (forced) statement's kind
-/// rotates over the 6 families (add/sub/mul/div/cmp/conv), so across the
-/// 50-seed corpus every float kind is guaranteed to appear (pinned by the
-/// tests' coverage sanity check); the fill statements are best-effort
+/// Every random choice comes from the seeded RNG in order, so `seed` determines
+/// the program. The first (forced) statement kind rotates over the 6 families,
+/// so the corpus spans every float kind; fill statements run best-effort
 /// against the frame budget.
 pub fn generate_float(seed: u64) -> Program {
     let mut g = Gen::new(seed ^ FLOAT_MIX);
@@ -1837,14 +1719,11 @@ pub fn generate_float(seed: u64) -> Program {
     ));
     decls.push_str("volatile float fout;\n");
 
-    // The float statement families: 6 kinds (the fptoui/fptosi conversions
-    // are part of Conv, drawn 4-way inside the dispatch).
-    // The forced first statement rotates over the families (seed % 6), so
-    // the corpus spans the surface by construction; the Conv sub-kind also
-    // rotates ((seed / 6) % 4), so uitofp/sitofp/fptoui/fptosi each get
-    // forced seeds in the corpus. Its operands come from the
-    // inputs/constants (no locals yet) and its cost (<= 23) fits the empty
-    // frame - a rejection means the budget model is broken.
+    // Six float statement families (both int-to-float directions ride in Conv,
+    // drawn 4-way in dispatch). The forced first statement rotates over the
+    // families by seed, and the Conv sub-kind rotates too, so every family and
+    // conversion gets forced seeds. Operands come from inputs and constants
+    // (no locals yet) at a cost fitting the empty frame.
     let forced: FloatKind = match seed % 6 {
         0 => FloatKind::Add,
         1 => FloatKind::Sub,
@@ -1873,8 +1752,8 @@ pub fn generate_float(seed: u64) -> Program {
             g.frame_budget()
         );
     }
-    // Best-effort fill: weighted toward the arithmetic (the RNE heart of
-    // the corpus), with cmp and the conversions as the supporting surface.
+    // Best-effort fill, weighted toward arithmetic (the RNE heart), with cmp
+    // and conversions as the supporting surface.
     for _ in 0..8 {
         let k = match g.below(100) {
             0..=9 => FloatKind::Add,
@@ -1917,9 +1796,8 @@ enum FloatKind {
     Conv,
 }
 
-/// Emit one float statement of `k`; false = the frame budget rejected it
-/// (the fill loop stops; the forced statement panics instead - see
-/// `generate_float`).
+/// Emit one float statement of `k`. False means the frame budget rejected it:
+/// the fill loop stops while the forced statement panics (see `generate_float`).
 fn emit_float_kind(g: &mut Gen, k: FloatKind, force_input: bool) -> bool {
     match k {
         FloatKind::Add => g.emit_fbin(FBin::Add, force_input),
@@ -1940,46 +1818,35 @@ fn emit_float_kind(g: &mut Gen, k: FloatKind, force_input: bool) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #14: the signed differential (wrap-safe signed arithmetic)
+// The signed differential (wrap-safe signed arithmetic)
 // ---------------------------------------------------------------------------
 
-/// The RNG-mix constants separating the signed generator's streams from the
-/// integer/float generators' (the corpus is deterministic either way; the
-/// mix keeps adjacent int/float/signed seeds visibly distinct).
+/// The RNG-mix constants separating the signed generator streams from the
+/// integer and float streams (all stay deterministic; the mix keeps adjacent
+/// seeds visibly distinct).
 const SIGNED_MIX: u64 = 0x51ED_0000_0000_0001;
 const SIGNED_MIX2: u64 = 0x51ED_0000_0000_0002;
 
-/// Generate a deterministic SIGNED differential program from `seed` - issue
-/// #14's signed surface. The inputs are the same fixed u8/u16/u32 volatile
-/// globals as the integer generator (in0/in1/in2), read through `(sW)`
-/// casts; the statements are the signed ops - sdiv/srem (const divisors
-/// 2..=9, so the only signed-division UB pair INT_MIN / -1 is excluded by
-/// construction), ashr (const or masked counts), the signed comparisons
-/// (icmp slt/sle/sgt/sge/eq/ne folded straight into the checksum), and the
-/// signed binops - all computed in the wrap-safe discipline:
+/// Generate a deterministic signed differential program from `seed` for the
+/// signed surface. Inputs reuse the fixed u8, u16, u32 globals read through
+/// `(sW)` casts; statements are the signed ops (sdiv and srem with const
+/// divisors 2..=9, ashr with const or masked counts, signed comparisons, and
+/// signed binops) computed in the wrap-safe discipline:
 ///
-/// - arithmetic computes in the UNSIGNED domain and re-casts
-///   (`(sW)((uW)a op (uW)b)`), so wrapping is defined on BOTH sides (C's
-///   usual arithmetic conversions: on msp430 u16/u32 promote to the
-///   unsigned int/long of the same width and wrap mod 2^W; on the host the
-///   wider int holds the exact result and the cast truncates identically);
-/// - mul widens to the next unsigned width (u8 -> u16, u16 -> u32) so the
-///   host's int promotion cannot overflow;
-/// - div/rem use const divisors 2..=9 (never 0, never -1 - the only
-///   host-UB pair is INT_MIN / -1, excluded by construction; signed const
-///   divisors stay plain `sdiv`/`srem` - clang does NOT magic-number
-///   strength-reduce signed division, verified);
-/// - ashr results are folded width-preservingly (a signed shift truncated
-///   to u8 would let clang prove the sign-fill irrelevant and lower it as
-///   `lshr` - the fold reads the full width, so the ashr stays).
+/// - arithmetic computes in the unsigned domain and re-casts, so wrapping
+///   stays defined on both sides (msp430 promotes same-width unsigned and
+///   wraps; the host holds the exact value wider and truncates identically);
+/// - mul widens to the next unsigned width so host promotion cannot overflow;
+/// - div and rem avoid 0 and -1, excluding the INT_MIN / -1 UB pair, and stay
+///   plain `sdiv` and `srem`;
+/// - ashr folds width-preservingly so the sign fill stays observable
+///   (epic-cc#14).
 ///
-/// Every random choice comes from the seeded RNG in a fixed order, so
-/// `seed` fully determines the program. The first (forced) statement's
-/// kind rotates over the 8 signed families (seed % 8), so across the
-/// corpus every signed kind is guaranteed to appear; the fill statements
-/// are best-effort against the frame budget (the same bank-0 model as the
-/// integer generator - the signed routines' frames are smaller than the
-/// unsigned ones, so the budget is conservative).
+/// Every random choice comes from the seeded RNG in order, so `seed` determines
+/// the program. The first (forced) statement kind rotates over the 8 signed
+/// families, so the corpus spans every signed kind; fill statements run
+/// best-effort against the frame budget (signed routine frames run smaller
+/// than unsigned ones, so the shared budget stays conservative).
 pub fn generate_signed(seed: u64) -> Program {
     let mut g = Gen::new(seed ^ SIGNED_MIX);
     let mut rng = SplitMix64::new(seed ^ SIGNED_MIX2);
@@ -2009,11 +1876,10 @@ pub fn generate_signed(seed: u64) -> Program {
         checksum = CHECKSUM_NAME
     ));
 
-    // The forced first statement rotates over the 8 signed families
-    // (seed % 8), so the corpus spans the signed surface by construction.
-    // Each forced statement runs at s8 (the cheapest width - the guarantee
-    // is on the KIND, not the width) and fits the empty frame; a rejection
-    // means the budget model is broken.
+    // The forced first statement rotates over the 8 signed families by seed,
+    // so the corpus spans the signed surface. Each forced statement runs at
+    // s8, the cheapest width (coverage is on the kind), and fits the empty
+    // frame; rejection means the budget model is broken.
     let forced: SignedKind = match seed % 8 {
         0 => SignedKind::Div,
         1 => SignedKind::Rem,
@@ -2097,37 +1963,30 @@ pub fn generate_signed(seed: u64) -> Program {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #14: the IR-level differential (canonical IR straight to the
-// in-process pipeline - no clang, no driver binary)
+// The IR-level differential (canonical IR to the in-process pipeline)
 // ---------------------------------------------------------------------------
 
-/// The RNG-mix constants separating the IR generator's streams from the
-/// integer/float/signed generators' (the corpus is deterministic either
-/// way; the mix keeps adjacent seeds visibly distinct).
+/// The RNG-mix constants separating the IR generator streams from the
+/// integer, float, and signed streams (all stay deterministic; the mix keeps
+/// adjacent seeds visibly distinct).
 const IR_MIX: u64 = 0x1A5E_0000_0000_0001;
 const IR_MIX2: u64 = 0x1A5E_0000_0000_0002;
 
-/// Generate a deterministic IR-level differential program from `seed`  -
-/// issue #14's IR mode. The PIC side runs the canonical IR text (the
-/// `ir::parse` dialect: `global <name> <ty>` / `fn <name>(<ret>) (<params>)`
-/// / `block <label>:` / `%d = <op> <ty> <a> <b>` - no LLVM `@`-global
-/// definitions, no commas) DIRECTLY through the in-process pipeline  -
-/// `ir::parse` -> wholeprog -> legalize -> callgraph -> alloc -> isel ->
-/// banking -> peephole -> asm - bypassing clang and the driver binary. The
-/// host side runs the `c_twin` C source (the same computation in the C
-/// discipline) through host clang, so the differential still compares
-/// checksums.
+/// Generate a deterministic IR-level differential program from `seed`. The PIC
+/// side runs the canonical IR text (the `ir::parse` dialect without LLVM
+/// globals or commas) directly through the in-process pipeline, bypassing
+/// clang and the driver binary. The host side runs the `c_twin` C source (the
+/// same computation in the C discipline) through host clang, so the
+/// differential still compares checksums (epic-cc#14).
 ///
-/// The statement pool covers the signed IR surface: `sdiv`/`srem` (const
-/// divisors 2..=9 - the only signed-division UB pair INT_MIN / -1 is
-/// excluded by construction), `ashr` (const counts), `icmp slt` (zext to
-/// i8), plus `add`/`trunc` as the supporting surface and a rare i32 `sdiv`.
-/// Every statement's result is folded into the volatile i8 `checksum`
-/// global byte-wise (lo ^ hi for i16, lo ^ hi ^ next ^ top for i32), and
-/// the C twin mirrors each statement and fold exactly.
+/// The statement pool covers the signed IR surface: `sdiv` and `srem` with
+/// const divisors 2..=9 (excluding the INT_MIN / -1 UB pair), `ashr` with
+/// const counts, `icmp slt` (zext to i8), plus `add` and `trunc` support and
+/// a rare i32 `sdiv`. Every result folds into the i8 `checksum` global
+/// byte-wise, and the C twin mirrors each statement and fold exactly.
 ///
-/// Every random choice comes from the seeded RNG in a fixed order, so
-/// `seed` fully determines the program (the corpus contract).
+/// Every random choice comes from the seeded RNG in order, so `seed`
+/// determines the program.
 pub fn generate_ir(seed: u64) -> IrProgram {
     let mut rng = SplitMix64::new(seed ^ IR_MIX);
     let mut rng2 = SplitMix64::new(seed ^ IR_MIX2);
@@ -2357,12 +2216,11 @@ pub fn generate_ir(seed: u64) -> IrProgram {
     }
 }
 
-/// The checksum fold for an IR statement result: xor the result's bytes
-/// into the volatile i8 `checksum` global. Returns (IR lines, C twin
-/// line). The C twin's `(u8)(t >> 8u)` etc. match the IR's `lshr`+`trunc`
-/// byte extraction: the low byte of an arithmetic shift equals the low
-/// byte of the logical shift (the sign-fill bits land in the dropped high
-/// byte).
+/// The checksum fold for an IR statement result: xor the result bytes into the
+/// i8 `checksum` global. Returns the IR lines plus the C twin line. The twin
+/// shifts match the IR `lshr` and `trunc` extraction: an arithmetic shift low
+/// byte equals the logical shift low byte (sign fill lands in the dropped
+/// high byte).
 fn ir_fold_lines(ir_reg: &str, c_local: &str, width: u8, reg: &mut u32) -> (Vec<String>, String) {
     let mut ir_lines = Vec::new();
     let c = match width {
@@ -2442,10 +2300,10 @@ fn ir_fold_lines(ir_reg: &str, c_local: &str, width: u8, reg: &mut u32) -> (Vec<
 // ---------------------------------------------------------------------------
 
 /// Run the program on both sides and return the agreed checksum, or a
-/// classified failure: a compile/driver error (including a compiler panic,
-/// which surfaces as a failed process or a caught pipeline panic), a
-/// non-halting sim run, or a host/PIC checksum mismatch. The classification
-/// (`FailureKind`) is what the Task-3 reducer preserves.
+/// classified failure: a compile or driver error (a compiler panic surfaces
+/// as a failed process or a caught pipeline panic), a non-halting sim run,
+/// or a host and PIC checksum mismatch. The reducer preserves the
+/// classification (`FailureKind`).
 pub fn run_differential(program: &Program, device: &device::Device) -> Result<u32, Failure> {
     let dir = WorkDir::new();
     let c_path = dir.path.join("prog.c");
@@ -2465,14 +2323,12 @@ pub fn run_differential(program: &Program, device: &device::Device) -> Result<u3
     }
 }
 
-/// Run an IR-level program on both sides and return the agreed checksum
-/// (issue #14's IR mode): the PIC side runs the canonical IR through the
-/// in-process pipeline - `ir::parse` -> wholeprog -> legalize -> callgraph
-/// -> alloc -> isel -> banking -> peephole -> asm - bypassing clang and
-/// the driver binary; the host side compiles the C twin with host clang
-/// (the same computation in the C discipline). A pipeline panic is a
-/// `Panic` failure (the loud-panic contract); a checksum disagreement a
-/// `Mismatch`.
+/// Run an IR-level program on both sides and return the agreed checksum: the
+/// PIC side runs the canonical IR through the in-process pipeline, bypassing
+/// clang and the driver binary; the host side compiles the C twin with host
+/// clang (the same computation in the C discipline). A pipeline panic becomes
+/// a `Panic` failure and a checksum disagreement becomes a `Mismatch`
+/// (epic-cc#14).
 pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure> {
     let dir = WorkDir::new();
     let pic = run_ir_pic(prog, device)?;
@@ -2500,12 +2356,11 @@ pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<
     }
 }
 
-/// PIC side of the IR mode: the canonical IR through the in-process
-/// pipeline (mirroring the driver's stage chain, minus clang), the hex
-/// assembled in-process, `pic14-sim` seeded at the alloc addresses, run,
-/// checksum read, `halted()` required. A pipeline panic (a compiler bug)
-/// is caught and reported as a `Panic` failure, so the fuzz loop survives
-/// them.
+/// PIC side of the IR mode: the canonical IR through the in-process pipeline
+/// (the driver stage chain minus clang), assembled in-process and run under
+/// `pic14-sim` seeded at the alloc addresses with `halted()` required. A
+/// pipeline panic (a compiler bug) reports as `Panic` so the fuzz loop
+/// survives it.
 fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure> {
     let (hex, layout) = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut m = ir::parse(&prog.ir_text);
@@ -2850,12 +2705,11 @@ fn host_main_source(program: &Program) -> Result<String, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Reducer (Task 3: the greedy cvise-style reduction)
+// Reducer (the greedy reduction)
 // ---------------------------------------------------------------------------
 
-/// The reduction budget: at most this many differential re-runs per
-/// `reduce` call (the plan's cap; the greedy fixed point normally converges
-/// far below it).
+/// The reduction budget: at most this many differential re-runs per `reduce`
+/// call. The greedy fixed point normally converges far below it.
 pub const REDUCTION_CAP: usize = 5000;
 
 /// The outcome of a reduction.
@@ -2874,19 +2728,17 @@ pub struct ReducedProgram {
 }
 
 /// Greedily reduce `program` while `failure` persists: iterate over the
-/// main-body statements (the generator's structural knowledge), try
-/// deleting each statement - or replacing its expression with a constant /
-/// one of its operands - re-run the differential, and keep the deletion
-/// only when the SAME failure kind survives. Stop at a fixed point (a full
-/// pass with no accepted change) or when `REDUCTION_CAP` re-runs are
-/// exhausted.
+/// main-body statements, try deleting each statement or replacing its
+/// expression with a constant or one of its operands, re-run the
+/// differential, and keep the change only when the same failure kind
+/// survives. Stop at a fixed point (a full pass with no accepted change) or
+/// when `REDUCTION_CAP` re-runs exhaust.
 ///
-/// `program` is verified to still exhibit `failure` first; its ACTUAL kind
-/// AND message are taken from that verification run (robust against a stale
-/// caller argument - the caller's message must not leak into the reduced
-/// failure) and a differential-clean program is an error (nothing to
-/// reduce). The reduced program is NOT written here - `write_fixture`
-/// persists it as the `reduced_<seed>.c` artifact.
+/// `program` verifies against `failure` first; the actual kind and message
+/// come from that verification run (a stale caller message never leaks into
+/// the reduced failure), and a differential-clean program errors (nothing to
+/// reduce). The reduced program writes out through `write_fixture` as the
+/// `reduced_<seed>.c` artifact.
 pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, String> {
     let fresh = match run_differential(program, &device::PIC16F877A) {
         Err(f) => f,
@@ -2962,13 +2814,10 @@ pub fn reduce(program: &Program, failure: &Failure) -> Result<ReducedProgram, St
 }
 
 /// The reduction candidates for one statement, in preference order: `None`
-/// = delete it; `Some(text)` = replace it with `text`. Deletion is always
-/// tried first; expression replacement (with the constant `0u` or one of
-/// the expression's top-level operands) applies to single-line assignments,
-/// and ONLY when the replacement is strictly shorter - the well-founded
-/// measure that makes the greedy terminate (without it, two equally-valid
-/// short forms keep replacing each other and the pass never reaches the
-/// fixed point).
+/// deletes it; `Some(text)` replaces it. Deletion tries first; replacement
+/// (with `0u` or a top-level operand) applies to single-line assignments only
+/// when strictly shorter: the well-founded measure that terminates the greedy
+/// pass (equal short forms would otherwise replace each other forever).
 fn candidates(stmt: &str) -> Vec<Option<String>> {
     let mut out = vec![None];
     if let Some((lhs, rhs)) = split_assignment(stmt) {
@@ -2986,9 +2835,8 @@ fn candidates(stmt: &str) -> Vec<Option<String>> {
     out
 }
 
-/// Split a single-line assignment statement `… = …;` into its LHS prefix
-/// (up to and including the `= `) and RHS (before the trailing `;`). Block
-/// statements (if/else, loops) and non-assignment lines return None.
+/// Split a single-line assignment `… = …;` into its LHS prefix (through `= `)
+/// and RHS (before `;`). Block statements and non-assignment lines return None.
 fn split_assignment(stmt: &str) -> Option<(String, String)> {
     if stmt.contains('\n') {
         return None;
@@ -3029,10 +2877,9 @@ fn split_assignment(stmt: &str) -> Option<(String, String)> {
     None
 }
 
-/// The top-level operands of an expression: strip a leading result-cast
-/// `(uN)( … )` (the generator's `({ct})(…)` shape), then split at the FIRST
-/// binary operator at paren depth 0. Returns [] when there is no such
-/// operator (a bare operand/constant - only constant replacement applies).
+/// The top-level operands of an expression: strip a leading result cast, then
+/// split at the first depth-0 binary operator. Returns empty when no such
+/// operator exists (only constant replacement applies).
 fn top_level_operands(expr: &str) -> Vec<String> {
     let mut inner = expr.trim();
     let b = inner.as_bytes();
@@ -3110,16 +2957,15 @@ fn top_level_operands(expr: &str) -> Vec<String> {
     Vec::new()
 }
 
-/// Rebuild the full C source from the prologue + statements (the inverse of
-/// `generate`'s assembly: `prologue + statements.join("\n") + "\n}\n"`).
+/// Rebuild the full C source from prologue plus statements (the inverse of
+/// `generate` assembly).
 fn rebuild_source(prologue: &str, statements: &[String]) -> String {
     format!("{prologue}{}\n}}\n", statements.join("\n"))
 }
 
-/// Save `program` as the `reduced_<seed>.c` fixture under `fixtures/`
-/// (creating the directory), returning the saved path. The fixture is the
-/// reduction artifact Task 4 commits for real bugs; synthetic reductions
-/// (tests) clean it up after asserting.
+/// Save `program` as the `reduced_<seed>.c` artifact under `fixtures/`
+/// (creating the directory) and return the saved path. Real bugs commit the
+/// artifact; synthetic reductions clean it up after asserting.
 pub fn write_fixture(program: &Program) -> Result<PathBuf, String> {
     let dir = Path::new("fixtures");
     std::fs::create_dir_all(dir).map_err(|e| format!("create fixtures/: {e}"))?;
@@ -3145,18 +2991,16 @@ fn pic_clang() -> Result<(String, String), String> {
     Ok((clang, resdir))
 }
 
-/// The host clang: the dev container's plain `clang` (the pinned clang WITHOUT
-/// `-target`, whose wrapper knows the host toolchain - the unwrapped
-/// `$PIC8_CLANG_UNWRAPPED` cannot find the host's stdio.h, verified during
-/// development). `PIC8_HOST_CLANG` overrides it.
+/// The host clang: the dev container plain `clang` without `-target`, whose
+/// wrapper knows the host toolchain (the unwrapped PIC clang cannot find the
+/// host stdio.h). `PIC8_HOST_CLANG` overrides it.
 fn host_clang() -> String {
     std::env::var("PIC8_HOST_CLANG").unwrap_or_else(|_| "clang".to_string())
 }
 
-/// The volatile globals' addresses: run the same pipeline the driver runs
-/// (mirroring `crates/driver/tests/long_e2e.rs`). Panics in the pipeline
-/// (a compiler bug) are caught and reported as a `Panic` failure, so the
-/// fuzz loop survives them.
+/// The globals addresses: the same pipeline the driver runs (mirroring the
+/// driver long e2e). Pipeline panics (a compiler bug) report as `Panic` so
+/// the fuzz loop survives them.
 fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayout, Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let ll = Command::new(&clang)
@@ -3214,8 +3058,8 @@ fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayo
 }
 
 /// Run the driver binary (a workspace member) over the C file to produce the
-/// hex, passing the PIC clang env vars it expects. A failed driver is the
-/// loud-panic contract: a compiler panic or an unsupported construct.
+/// hex, passing the PIC clang env vars it expects. A failed driver signals a
+/// compiler panic or an unsupported construct.
 fn run_driver(c_path: &Path, hex_path: &Path, device: &device::Device) -> Result<(), Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let driver = driver_binary(device).map_err(|e| Failure::new(FailureKind::Harness, e))?;
@@ -3240,22 +3084,18 @@ fn run_driver(c_path: &Path, hex_path: &Path, device: &device::Device) -> Result
     Ok(())
 }
 
-/// Locate the driver binary, mirroring the driver crate's e2e pattern.
+/// Locate the driver binary, mirroring the driver crate e2e pattern.
 ///
-/// The e2e tests (inside `crates/driver`) use `env!("CARGO_BIN_EXE_epic-cc")`,
-/// which Cargo sets only for the package that owns the binary; this crate
-/// instead finds the driver next to the running test executable in
-/// `target/<profile>/` (the driver is a workspace member), honoring a
-/// `PIC8_DRIVER` env override first.
+/// The e2e tests use `env!("CARGO_BIN_EXE_epic-cc")`, which Cargo sets only
+/// for the owning package; this crate instead finds the driver next to the
+/// running test executable in `target/<profile>/`, honoring a `PIC8_DRIVER`
+/// env override first.
 ///
-/// The nested `cargo build -p driver` runs on EVERY first use (cheap when
-/// up to date) - NOT only when the binary is missing: `cargo test -p fuzz`
-/// does not rebuild the driver (fuzz does not depend on it), so a stale
-/// binary from an earlier compiler build would otherwise silently run the
-/// differential against outdated code (found when the corpus kept failing
-/// with an already-fixed isel panic). The nested cargo cannot deadlock on
-/// the build lock because tests run only after the outer build has finished
-/// (verified empirically).
+/// The nested `cargo build -p driver` runs on every first use (cheap when up
+/// to date), not only when the binary is missing: `cargo test -p fuzz` does
+/// not rebuild the driver, so a stale binary would otherwise run the
+/// differential against outdated code. The nested cargo cannot deadlock on
+/// the build lock because tests run after the outer build finishes.
 fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
     fn locate() -> Result<PathBuf, String> {
         if let Some(p) = std::env::var_os("PIC8_DRIVER") {

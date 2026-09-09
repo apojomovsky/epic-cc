@@ -198,7 +198,7 @@ fn main() {
         // per-core memory map checks: common_ram is PIC14/PIC14E (and the
         // baseline shared window), access_bank + fixed_retval are PIC18
         // only. Ensures the field never carries two meanings at once
-        // (issue #109).
+        // (epic-cc#109).
         match dev.core.as_str() {
             "pic14" | "pic14e" | "pic-baseline" => {
                 if dev.common_ram.is_none() {

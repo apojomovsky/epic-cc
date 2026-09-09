@@ -16,8 +16,8 @@
 //! only live between its call and return, so two functions that are never
 //! simultaneously live can share RAM. A generic `-O2` inlines aggressively
 //! enough to merge callee locals permanently into `main`'s frame (`main`
-//! never returns, so nothing it ever contains can be reclaimed), measured
-//! to blow the 877A's 368-byte budget on this ticket's example. None of
+//! never returns, so nothing it ever contains can be reclaimed), breaking
+//! the RAM reuse. None of
 //! `internalize`/`ipsccp`/`instcombine`/`simplifycfg`/`dce` inline a
 //! multi-call-site function across a call boundary, so call-graph shape
 //! (and the RAM reuse it buys) is preserved:
@@ -34,42 +34,25 @@
 //!   - `instcombine`/`simplifycfg`/`dce`: local cleanup of the constants
 //!     `ipsccp` exposes (dead branches, now-constant arithmetic).
 //!   - `always-inline` (conditional, `always_inline_candidates`/
-//!     `mark_always_inline`, epic-cc#205): folds only the functions with
-//!     exactly one direct call site, into an ordinary (non-`main`,
-//!     non-ISR) caller, never referenced any other way. That caller
-//!     already reclaims its frame on return, so the callee's locals do
-//!     too, same as before the fold; this is free on every axis, no
-//!     RAM/flash trade, unlike inlining into `main`/an ISR root (that
-//!     shape trades flash for permanent RAM and needs the future `-O2`
-//!     "aggressive" tier's explicit budget check, epic-cc#204). Marks
-//!     candidates with `alwaysinline` textually, so LLVM's `always-inline`
-//!     pass folds exactly this set and nothing else, no cost-model
-//!     guessing. Skipped entirely (falls back to the base `PASSES` list)
-//!     when no candidates are found.
+//!     `mark_always_inline`): folds only the functions with exactly one
+//!     direct call site, into an ordinary (non-`main`, non-ISR) caller,
+//!     never referenced any other way. That caller already reclaims its
+//!     frame on return, so the callee's locals do too, same as before the
+//!     fold; this is free on every axis, no RAM/flash trade, unlike inlining
+//!     into `main`/an ISR root (that shape trades flash for permanent RAM
+//!     and needs the `-O2` "aggressive" tier's explicit budget check).
+//!     Marks candidates with `alwaysinline` textually, so LLVM's
+//!     `always-inline` pass folds exactly this set and nothing else, no
+//!     cost-model guessing. Skipped entirely (falls back to the base
+//!     `PASSES` list) when no candidates are found (epic-cc#205,
+//!     epic-cc#204).
 //!
-//! Measured on the epic-encoder full example (epic-cc#193, epic-hal's
-//! `epic-encoder` module on the 16F877A: gpio+timer0+timer2+ssp+usart+
-//! irq+wdt+dispatch+tick+encoder+serial+the example TU): 13281 -> 7519
-//! words (-43%), RAM 358 -> 350/368 bytes (still fits). That takes the
-//! full example from 62% over the 877A's real 8192-word flash budget to
-//! 7519/8192 (91.8%), it links. XC8 builds the same source combination
-//! at 5356/8192 (65.4%), so epic-cc is now within 1.4x of XC8 instead of
-//! 2.5x.
-//!
-//! Two further, independent fixes stack on top of that baseline
-//! (epic-cc#205/#206): consolidating `printf`'s per-call-site literal
-//! staging buffer into one shared buffer (apojomovsky/epic-hal#123/#124)
-//! took the full example to 7327 words / 332 bytes RAM (call depth still
-//! 8/8, the device's hard limit); adding the always-inline pass above on
-//! top of that takes it to 7240 words / 329 bytes RAM and, measured via
-//! `callgraph::build`'s own `max_depth`, drops call depth to **6/8**, two
-//! levels of margin recovered. This pass never inlines into `main` or an
-//! ISR by design, so that is not one big fold shortening the chain's
-//! `main`-adjacent hop; it is many small ordinary-caller folds each
-//! shortening one link, which compounds along chains that pass through
-//! several of them. The always-inline pass alone (no buffer fix in play)
-//! also measurably helps the plain `hal-pic16-blink` example: 690 -> 652
-//! words, 59 -> 47 bytes RAM.
+//! On top of that baseline, two further independent fixes stack:
+//! consolidating `printf`'s per-call-site literal staging buffer into one
+//! shared buffer (epic-hal#123, epic-hal#124), and the always-inline pass
+//! above. This pass never inlines into `main` or an ISR by design; each
+//! fold shortens one link, which compounds along chains that pass through
+//! several of them (epic-cc#205, epic-cc#206).
 
 use std::path::Path;
 use std::process::Command;
@@ -84,27 +67,25 @@ const PASSES: &str = "internalize,ipsccp,instcombine,simplifycfg,dce";
 ///   `msp430_intrcc` interrupt handler (the vector table's entry points,
 ///   `irparse` identifies them the same way, by that calling-convention
 ///   token on the `define` line).
-/// - Every **variadic** function (a `(...)` parameter list). Load-bearing,
-///   not caution for its own sake: measured on epic-cc#131's `printf`
-///   acceptance fixture, internalizing a single-call-site variadic
-///   function lets `ipsccp` replace every use of its named format-string
-///   parameter with the caller's literal, sound as a pure value
-///   substitution, but our `llvm.va_start` lowering locates the first
-///   vararg relative to that parameter's own frame slot, and a parameter
-///   with no remaining SSA uses doesn't reliably get one allocated. The
-///   vararg walk silently corrupts (one format byte read as 0), no panic.
-///   So the whole function stays external, since external-linkage
-///   arguments are never specialized by `ipsccp`.
+/// - Every **variadic** function (a `(...)` parameter list). Load-bearing:
+///   internalizing a single-call-site variadic function lets `ipsccp`
+///   replace every use of its named format-string parameter with the
+///   caller's literal, sound as a pure value substitution, but our
+///   `llvm.va_start` lowering locates the first vararg relative to that
+///   parameter's own frame slot, and a parameter with no remaining SSA
+///   uses doesn't reliably get one allocated. The vararg walk silently
+///   corrupts (one format byte read as 0), no panic. So the whole function
+///   stays external, since external-linkage arguments are never specialized
+///   by `ipsccp` (epic-cc#131).
 /// - Every **mutable global variable** (LLVM `global`, not `constant`).
-///   Also load-bearing: measured on epic-cc#133's pid-clamp fixture,
-///   internalizing a plain (non-`const`, non-`volatile`) global that
-///   nothing in the compiled program ever stores to lets `ipsccp` read it
-///   as permanently equal to its zero-initializer. Correct for a truly
-///   closed program, but epic-cc's own e2e harness (and real embedded
-///   code with a memory-mapped input) writes such globals from outside
-///   the compiled image, a channel no IR-level analysis can see. A
+///   Also load-bearing: internalizing a plain (non-`const`, non-`volatile`)
+///   global that nothing in the compiled program ever stores to lets
+///   `ipsccp` read it as permanently equal to its zero-initializer. Correct
+///   for a truly closed program, but epic-cc's own e2e harness (and real
+///   embedded code with a memory-mapped input) writes such globals from
+///   outside the compiled image, a channel no IR-level analysis can see. A
 ///   `constant` global has no such hazard, nothing ever writes it by
-///   construction, so those stay eligible.
+///   construction, so those stay eligible (epic-cc#133).
 fn public_api(ll_text: &str) -> Vec<String> {
     let mut api = Vec::new();
     for line in ll_text.lines() {
@@ -239,8 +220,7 @@ fn noinline_functions(lines: &[&str], funcs: &[FuncSpan]) -> std::collections::H
 /// any axis, its locals still get reclaimed when that function returns,
 /// same as before, so this list is unconditionally safe to always-inline,
 /// no RAM/flash trade to weigh, unlike a fold into `main`/an ISR (that
-/// shape is the `-O2` "aggressive" tier's job, not this one, see
-/// apojomovsky/epic-cc#204).
+/// shape is the `-O2` "aggressive" tier's job, not this one, epic-cc#204).
 fn always_inline_candidates(ll_text: &str) -> Vec<String> {
     let lines: Vec<&str> = ll_text.lines().collect();
     let funcs = function_spans(&lines);
@@ -340,9 +320,8 @@ fn mark_always_inline(ll_text: &str, candidates: &[String]) -> String {
                     // the parameter list, and metadata (` !dbg !9`, ...)
                     // must be the last thing before `{`, so insert right
                     // before the first metadata attachment (else right
-                    // before the brace): verified against a real
-                    // clang-emitted `!dbg`-carrying line, `opt` otherwise
-                    // errors "expected '{' in function body".
+                    // before the brace); `opt` otherwise errors
+                    // "expected '{' in function body".
                     if let Some(brace) = line.rfind('{') {
                         let head = &line[..brace];
                         let insert_at = head
@@ -377,7 +356,7 @@ pub fn run(opt_bin: &Path, merged_path: &Path, out_path: &Path) -> Result<String
         .map_err(|e| format!("read {}: {e}", merged_path.display()))?;
     let api = public_api(&ll_text);
     if api.is_empty() {
-        // No `main`/ISR found yet (e.g. a library-only compile that never
+        // No `main`/ISR found (e.g. a library-only compile that never
         // reaches wholeprog's "exactly one main" check), so internalizing
         // everything would be unsound; skip the stage instead, downstream
         // still gets the plain merged IR.

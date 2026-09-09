@@ -1,8 +1,8 @@
 //! The freestanding `<string.h>` implementation, compiled as an extra
-//! translation unit when a source includes the header (CC-2).
+//! translation unit when a source includes the header.
 //!
-//! Written with `size_t` index loops rather than pointer walks: an index keeps
-//! the loop-carried value an integer phi, so a pointer only ever materialises
+//! Uses `size_t` index loops rather than pointer walks: an index keeps
+//! the loop-carried value an integer phi, so a pointer materialises only
 //! as a GEP over a parameter slot, the one pointer shape both backends lower.
 
 pub const STRING_C: &str = r#"#include <stddef.h>

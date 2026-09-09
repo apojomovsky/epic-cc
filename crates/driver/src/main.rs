@@ -1,6 +1,6 @@
 //! End-to-end driver: C source -> clang (.ll) -> IR pipeline -> Intel HEX.
 //!
-//! Chains every milestone-1 stage crate: `irparse` -> `wholeprog` ->
+//! Chains every stage crate: `irparse` -> `wholeprog` ->
 //! `legalize` -> `callgraph` (depth check vs the device's stack) -> `alloc`
 //! (+ address map) -> `isel` -> `banking` -> `peephole` -> `asm`. From `isel`
 //! onward, the pipeline branches on `device.core`: PIC14 and PIC14E run
@@ -10,7 +10,7 @@
 //! directly (no banking/peephole/paging).
 //!
 //! Multiple `.c` inputs are each run through clang separately, then merged
-//! with `llvm-link` before `irparse` ever sees them (docs/31 D-7): the
+//! with `llvm-link` before `irparse` ever sees them (docs/31 §7): the
 //! merge, not this driver, resolves cross-unit symbols and renames
 //! collisions, so `wholeprog` onward sees exactly the single-module shape it
 //! always has.
@@ -344,10 +344,10 @@ fn main() {
             // PCLATH, so neither pass has anything to do for PIC18. schedule
             // (ADR-027, epic-cc#210) runs before banking so it sees
             // isel's raw instruction order before banking turns bank
-            // demand into BANKSEL/MOVLB text; phase 1 is an identity
-            // transform. The banking pass is core-aware (docs/33 D-1): it
-            // emits the classic RP-bit `BCF/BSF STATUS, 5/6` BANKSEL on
-            // PIC14 and the single `MOVLB k` on PIC14E, tracking BSR there.
+            // demand into BANKSEL/MOVLB text. The banking pass is core-aware
+            // (docs/33 §1): it emits the classic RP-bit `BCF/BSF STATUS, 5/6`
+            // BANKSEL on PIC14 and the single `MOVLB k` on PIC14E, tracking
+            // BSR there.
             let (asm, l) = schedule::schedule_with_locs(device, &asm, &locs);
             locs = l;
             let (asm, l) = banking::assign_banks_with_locs(device, &asm, &locs);
@@ -355,15 +355,15 @@ fn main() {
             let (asm, l) = peephole::optimize_with_locs(&asm, &locs);
             locs = l;
 
-            // Issue #17: the page assignment ran on pre-banking sizes; the
-            // banking pass inserts BANKSEL/MOVLB words that grow the text.
-            // Verify the FINAL layout's page fit: a function that grew
-            // across a page boundary has no `.org` anchor, so the assembler's
-            // backward-.org panic would never fire and it would silently
-            // straddle (label in the lower page, tail in the upper page,
-            // intra-function GOTOs misbranching). Panic loudly instead,
-            // before assembling. PIC14/PIC14E (both page their GOTOs via
-            // PCLATH; PIC18's 20-bit GOTO/CALL reach the whole 32KB flash).
+            // The page assignment ran on pre-banking sizes; the banking pass
+            // inserts BANKSEL/MOVLB words that grow the text. Verify the
+            // FINAL layout's page fit: a function that grew across a page
+            // boundary has no `.org` anchor, so the assembler's backward-.org
+            // panic would never fire and it would silently straddle (label in
+            // the lower page, tail in the upper page, intra-function GOTOs
+            // misbranching). Panics instead, before assembling (epic-cc#17).
+            // PIC14/PIC14E (both page their GOTOs via PCLATH; PIC18's 20-bit
+            // GOTO/CALL reach the whole 32KB flash).
             if device.core == device::Core::Pic14 {
                 isel::verify_page_fit(&m, &asm);
             } else {
