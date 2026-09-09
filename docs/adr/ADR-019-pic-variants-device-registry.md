@@ -56,7 +56,7 @@ deterministic `crates/device/devices/<stem>.toml`.
   `intosc`, etc.) documented in the script header; `gen-device
   --check` + `git diff --exit-code` in CI/nightly gates drift.
 
-## Addendum 2026-09-09 -- peripheral blindness is a decision, not an accident (epic-cc#333)
+## Addendum 2026-09-09 -- Peripheral blindness is a decision, not an accident (epic-cc#333)
 
 The schema above is closed over what the compiler needs to place code
 and data and resolve config fuses: `core`, `flash_words`, `ram_banks`,
@@ -66,9 +66,9 @@ PIC18-only `access_bank`/`fixed_retval` layout facts, and the optional
 consulted by `isel`, `asm` or `sim`. Peripheral register semantics
 (UART/SPI/ADC/timer register layouts, peripheral counts, pin muxing)
 are permanently out of scope for `Device`; `epic-hal` owns them. This
-is not a new restriction, it is what the decision above already built
-and what has kept every device addition single-file: a family with 193
-members is no harder to keep in the registry than one with 16 because
+is not a new restriction; it is what the decision above already built
+and what has kept every device addition single-file: the largest
+family is no harder to keep in the registry than the smallest because
 the compiler's device model is deliberately blind to almost everything
 that varies member-to-member. If `isel` ever needs a peripheral fact,
 that is the signal to revisit this decision, not a normal device
