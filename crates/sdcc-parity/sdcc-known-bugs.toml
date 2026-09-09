@@ -72,10 +72,9 @@ expected = 0x9A
 # verified working independently (its sprintf path formats "d=3.500000"
 # into RAM under the same image and oracle flags); what never observably
 # fires through the portable `void putchar(char) __wparam` sink is
-# printf's putchar call, so this is a sink-ABI incompatibility between
-# the two toolchains, not an SDCC conformance verdict in either
-# direction. The row pins epic-cc's hand-computed conformance value;
-# the putchar ABI question is follow-up work, not this probe.
+# printf's putchar call. The row pins epic-cc's hand-computed
+# conformance value; the putchar ABI question is tracked by epic-cc#352,
+# not this probe.
 [[bug]]
 device = "p18f4550"
 program = "printf-f"
@@ -83,9 +82,11 @@ sdcc_observed = 0x0
 expected = 0x41
 # EEPROM on p18f4550: SDCC compiles the probe but its implementation-
 # defined int-to-pointer conversion does not address the EEPROM register
-# window. The sim shows its stores landing outside EEADR/EEDATA/EECON1
-# (0x80 written to 0xFA6, the registers never written), so both reads
-# return stale EEDATA and it computes 0x7F instead of 0x80. Same
+# window. None of the probe's programmed stores ever arrives: EEDATA,
+# EEADR and EECON2 see no writes at all, and EECON1 sees only two
+# 0x80 writes from SDCC's own runtime around the probe (0x80 appears
+# nowhere in the probe source). Both reads therefore return stale
+# EEDATA and it computes 0x7F instead of 0x80. Same
 # generic-pointer dereference defect class as the arbitrated malloc
 # entry above. The wrong side is the oracle, not the harness: the stores
 # are ordinary banked MOVWF/MOVFF sequences, the same paths epic-cc's

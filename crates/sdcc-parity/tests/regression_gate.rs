@@ -133,7 +133,6 @@ fn corpus_matches_ratio_baseline() {
                 continue;
             }
             let key = format!("{} on {}", prog.name, device.name);
-            eprintln!("GATE {key} runs={}", prog.runs_on(device.name));
             let bug = known_bug_for(&prog.name, device.name);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_differential(&prog, device)

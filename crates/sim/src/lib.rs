@@ -149,10 +149,12 @@ impl Eeprom {
         if reg != con1 {
             return None;
         }
-        // Data-EEPROM ops only: EEPGD (bit 6) or CFGS (bit 5) set
+        // Data-EEPROM ops only: EEPGD (bit 7) or CFGS (bit 6) set
         // targets program flash or config space, which no compiled
-        // corpus program drives through this window; store as-is.
-        if v & 0x60 != 0 {
+        // corpus program drives through this window; store as-is. Bit 5
+        // is LWLO on the Enhanced core, a legitimate data-EEPROM
+        // modifier, so it must not divert here.
+        if v & 0xC0 != 0 {
             self.seq = 0;
             return Some(v);
         }
@@ -2710,6 +2712,9 @@ mod pic14e_eeprom {
             0x30AA, // MOVLW 0xAA
             0x0096, // MOVWF EECON2 (armed)
             0x1495, // BSF EECON1, WR (commit)
+            0x3000, // MOVLW 0x00
+            0x0093, // MOVWF EEDATL (clobber; only RD restores the cell)
+            0x1415, // BSF EECON1, RD (latch the cell into EEDATL)
             0x0813, // MOVF EEDATL, W
             0x0020, // MOVLB 0
             0x00A0, // MOVWF 0x20

@@ -56,15 +56,14 @@ pub struct Insn<'a> {
     pub reads_file: bool,
     pub writes_file: bool,
     pub is_skip: bool,
-    /// True when this instruction's literal file operand lies outside the
-    /// device's allocatable RAM (GPR banks, common RAM, fixed retval): on
-    /// the pre-banking text this pass sees, those addresses are SFR,
-    /// config, or gap windows, whose accesses may have side effects or
-    /// change out from under the program (the data-EEPROM register file
-    /// behind epic-cc#345). Immediates (`MOVLW`) carry no file access
-    /// and never mark, even when the literal equals an SFR address.
-    /// Region-splitting treats a marked instruction as a barrier, so no
-    /// motion in either phase can cross it.
+    /// True when this instruction's literal file operand (immediates
+    /// like `MOVLW` carry none and never mark) lies outside the
+    /// device's allocatable RAM: on the pre-banking text this pass
+    /// sees, those addresses are SFR, config, or gap windows, whose
+    /// accesses may have side effects or change out from under the
+    /// program (the data-EEPROM register file behind epic-cc#345).
+    /// Region-splitting treats a marked instruction as a barrier, so
+    /// no motion in either phase can cross it.
     pub touches_sfr: bool,
     /// True when the immediately preceding classified line is a skip op:
     /// this instruction is the other half of an atomic, unsplittable

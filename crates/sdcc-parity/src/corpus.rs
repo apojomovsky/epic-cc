@@ -123,18 +123,13 @@ pub fn tier2() -> Vec<CorpusProgram> {
             "volatile unsigned char in;\nvolatile unsigned char out;\nunsigned char fact(unsigned char n) {\n    if (n <= 1) return 1;\n    return (unsigned char)(n * fact((unsigned char)(n - 1)));\n}\nvoid main(void) {\n    in = 5;\n    out = fact(in);\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
-        // printf %f: formats 7 * 0.5 through printf into a buffer via a
-        // user putchar, then folds the first six output bytes. epic-cc
-        // prints 2 fixed decimals (#295) and SDCC's %f prints 6, but the
-        // first six bytes ("d=3.50") agree either way, so the fold
-        // compares the computed value, not the formatting policy. The
-        // sink is `void putchar(char) __wparam`, SDCC pic16's prototype
-        // (stdio.h:109): it is the only spelling SDCC's checker accepts
-        // for a user definition, and the driver predefines `__wparam`
-        // empty (like `__XC8`) so our clang parses it. SDCC's pic14
-        // port has no libc (manual 4.9.8): its pic14/pic14e rows are
-        // arbitrated as an SDCC limitation. Expected fold of "d=3.50" =
-        // 0x41.
+        // printf %f: formats 7 * 0.5 through printf into a buffer, then
+        // folds the first six output bytes ("d=3.50" -> 0x41). SDCC's %f
+        // prints 6 decimals to our 2; the fold compares the value, not
+        // the policy. The sink must be spelled `void putchar(char)
+        // __wparam` (SDCC pic16's prototype; the driver predefines the
+        // token empty). SDCC's pic14 port has no libc (manual 4.9.8):
+        // its pic14/pic14e rows are an arbitrated SDCC limitation.
         prog(
             "printf-f",
             0x41,

@@ -21,7 +21,7 @@ cycle count to the `sleep` halt, one definition for both compilers.
 
 | Program | Device | epic flash | sdcc flash | epic RAM | sdcc RAM | epic cyc | sdcc cyc | Result |
 |---|---|---|---|---|---|---|---|---|
-| add | p16f877a | 18 | 235 | 4 | 12 | 16 | 322 | PASS |
+| add | p16f877a | 17 | 235 | 4 | 12 | 15 | 322 | PASS |
 | add | p18f4550 | 16 | 106 | 6 | 17 | 10 | 6217 | PASS |
 | add | p16f1938 | 17 | 198 | 4 | 16 | 15 | 281 | PASS |
 | array | p16f877a | 41 | 283 | 7 | 19 | 39 | 366 | PASS |
@@ -32,7 +32,7 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | bitfields | p16f1938 | 30 | 316 | 6 | 26 | 28 | 399 | PASS |
 | unions | p16f877a | 57 | 253 | 8 | 16 | 54 | 340 | PASS |
 | unions | p18f4550 | 53 | 117 | 10 | 17 | 43 | 6228 | PASS |
-| unions | p16f1938 | 56 | 211 | 10 | 20 | 43 | 294 | PASS |
+| unions | p16f1938 | 56 | 211 | 10 | 20 | 53 | 294 | PASS |
 | i64 | p16f877a | - | - | - | - | - | - | SDCC-LIMIT (error 206: no 64-bit on pic14; epic computes 0x9A) |
 | i64 | p18f4550 | 16 | 106 | 7 | 18 | 10 | 6216 | PASS |
 | i64 | p16f1938 | - | - | - | - | - | - | SDCC-LIMIT (error 206: no 64-bit on pic14; epic computes 0x9A) |
@@ -42,7 +42,7 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | malloc | p16f877a | 13 | 260 | 1 | 13 | 11 | 354 | PASS |
 | malloc | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x5A sdcc=0xF6; SDCC generic-pointer dereference, gpsim-confirmed) |
 | malloc | p16f1938 | 12 | 220 | 1 | 14 | 10 | 311 | PASS |
-| math | p16f877a | 58 | 557 | 10 | 26 | 120 | 1006 | PASS |
+| math | p16f877a | 57 | 557 | 10 | 26 | 119 | 1006 | PASS |
 | math | p18f4550 | 29 | 112 | 11 | 19 | 19 | 6222 | PASS |
 | math | p16f1938 | 56 | 433 | 10 | 29 | 118 | 791 | PASS |
 | fnptr | p16f877a | - | - | - | - | - | - | SDCC-BUG (epic=0x0A sdcc=0xF4; SDCC pic14 computed call, gpsim-confirmed) |
@@ -52,7 +52,7 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | recursion | p18f4550 | 60 | 145 | 14 | 42 | 120 | 6333 | PASS |
 | recursion | p16f1938 | - | - | - | - | - | - | SDCC-BUG (epic=0x78 sdcc=0x1; SDCC static-overlay recursion, gpsim-confirmed) |
 | printf-f | p16f877a | - | - | - | - | - | - | SDCC-LIMIT (no libc on pic14, manual 4.9.8; epic folds 0x41) |
-| printf-f | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x41 sdcc=0x0; SDCC links and runs, but its putchar never observably fires through the portable sink; SDCC %f core verified via its sprintf path) |
+| printf-f | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x41 sdcc=0x0; putchar never observably fires through the portable sink; SDCC %f core verified via sprintf; putchar ABI tracked by #352) |
 | printf-f | p16f1938 | - | - | - | - | - | - | SDCC-LIMIT (no libc on pic14e; epic folds 0x41) |
 | eeprom-p14 | p16f877a | 65 | 482 | 7 | 19 | 63 | 775 | PASS |
 | eeprom-p18 | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x80 sdcc=0x7f; SDCC inttoptr misses the EEPROM register window, same defect class as malloc) |
