@@ -431,15 +431,16 @@ fn substitute_regs(
     }
 }
 
-/// Split the runtime routines that BOTH the main and interrupt contexts
-/// reach: each gets an `_isr` copy and every routine call inside the ISR
-/// context is rewritten to it. Returns the `_isr` names to inject, in
+/// Split the runtime routines that a second live context reaches: each
+/// gets a suffixed copy per reaching priority (`_isr` for low,
+/// `_isr_high` for high) and every routine call inside that priority's
+/// context is rewritten to it. Returns the suffixed names to inject, in
 /// `used` order so the emitted module text stays deterministic.
 ///
-/// A routine only the ISR reaches is left shared: there is no main-context
-/// caller whose frame it could clobber, and a second copy would spend flash
-/// and RAM for nothing. This mirrors `duplicate_isr_shared`'s policy for
-/// user functions, one layer down.
+/// A routine only one context reaches is left shared: there is no
+/// second-context caller whose frame it could clobber, and a second
+/// copy would spend flash and RAM for nothing. This mirrors
+/// `duplicate_isr_shared`'s policy for user functions, one layer down.
 fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
     if used.is_empty() || !funcs.iter().any(|f| f.isr) {
         return Vec::new();
@@ -457,42 +458,68 @@ fn split_isr_routines(funcs: &mut [Func], used: &[String]) -> Vec<String> {
             }
         }
     }
-    let isr_roots: Vec<&str> = funcs
+    let lo_roots: Vec<&str> = funcs
         .iter()
-        .filter(|f| f.isr)
+        .filter(|f| f.isr && f.irq_priority != 1)
         .map(|f| f.name.as_str())
         .collect();
-    let isr_ctx = reachable(&isr_roots, &adj);
+    let hi_roots: Vec<&str> = funcs
+        .iter()
+        .filter(|f| f.isr && f.irq_priority == 1)
+        .map(|f| f.name.as_str())
+        .collect();
+    let lo_ctx = reachable(&lo_roots, &adj);
+    let hi_ctx = reachable(&hi_roots, &adj);
     let main_ctx = reachable(&["main"], &adj);
-    let shared: HashSet<&str> = used
+    // A routine needs a priority's copy when that priority can run it
+    // while another context's frame for it is live: reachable from the
+    // priority and from anywhere else live at the same time.
+    let shared_lo: HashSet<&str> = used
         .iter()
         .map(String::as_str)
-        .filter(|r| isr_ctx.contains(*r) && main_ctx.contains(*r))
+        .filter(|r| lo_ctx.contains(*r) && (main_ctx.contains(*r) || hi_ctx.contains(*r)))
         .collect();
-    if shared.is_empty() {
+    let shared_hi: HashSet<&str> = used
+        .iter()
+        .map(String::as_str)
+        .filter(|r| hi_ctx.contains(*r) && (main_ctx.contains(*r) || lo_ctx.contains(*r)))
+        .collect();
+    if shared_lo.is_empty() && shared_hi.is_empty() {
         return Vec::new();
     }
-    // Rewrite the shared routines' calls inside the ISR context only. The
-    // main-context callers (including a shared user function's ORIGINAL,
-    // which duplicate_isr_shared left main-only) keep the base name.
+    // Rewrite the shared routines' calls inside each priority's context
+    // only. The main-context callers (including a shared user function's
+    // ORIGINAL, which duplicate_isr_shared left main-only) keep the base
+    // name.
     for f in funcs.iter_mut() {
-        if !isr_ctx.contains(&f.name) {
+        let in_lo = lo_ctx.contains(&f.name);
+        let in_hi = hi_ctx.contains(&f.name);
+        if !in_lo && !in_hi {
             continue;
         }
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 if let Inst::Call(c) = inst {
-                    if shared.contains(c.func.as_str()) {
+                    if in_lo && shared_lo.contains(c.func.as_str()) {
                         c.func = format!("{}_isr", c.func);
+                    } else if in_hi && shared_hi.contains(c.func.as_str()) {
+                        c.func = format!("{}_isr_high", c.func);
                     }
                 }
             }
         }
     }
-    used.iter()
-        .filter(|u| shared.contains(u.as_str()))
+    let mut out: Vec<String> = used
+        .iter()
+        .filter(|u| shared_lo.contains(u.as_str()))
         .map(|u| format!("{u}_isr"))
-        .collect()
+        .collect();
+    out.extend(
+        used.iter()
+            .filter(|u| shared_hi.contains(u.as_str()))
+            .map(|u| format!("{u}_isr_high")),
+    );
+    out
 }
 
 /// Fresh SSA name supply for the fcmp materialization trees. Starts from
@@ -1374,34 +1401,10 @@ fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<(String, u
     out
 }
 
-/// Returns `(isr_ctx, isr_read_globals, adj, param_stores)`: the extended
-/// context, the `(global, field)` pairs the context READS (the
-/// cross-context store-rewrite predicate), the caller -> callee adjacency
-/// (the main context derives from it), and the `(func, param_index)`
-/// positions whose stored value feeds an ISR-read global (the call-site
-/// argument rewrite targets).
-fn isr_context(
-    m: &Module,
-) -> (
-    HashSet<String>,
-    HashSet<(String, u16)>,
-    HashMap<String, Vec<String>>,
-    HashSet<(String, usize)>,
-) {
-    let isr_names: HashSet<&str> = m
-        .funcs
-        .iter()
-        .filter(|f| f.isr)
-        .map(|f| f.name.as_str())
-        .collect();
-    if isr_names.is_empty() {
-        return (
-            HashSet::new(),
-            HashSet::new(),
-            HashMap::new(),
-            HashSet::new(),
-        );
-    }
+/// Caller -> callee adjacency over direct calls and address-taken
+/// globals, plus the defined-function set. Priority-independent: every
+/// context (main, low-ISR, high-ISR) derives from this one graph.
+fn isr_adjacency(m: &Module) -> (HashMap<String, Vec<String>>, HashSet<String>) {
     let defined: HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
     let mut adj: HashMap<String, Vec<String>> = HashMap::new();
     for f in &m.funcs {
@@ -1421,10 +1424,27 @@ fn isr_context(
             }
         }
     }
-    let mut isr_ctx: HashSet<String> = isr_names
-        .iter()
-        .flat_map(|r| reachable(&[r], &adj))
-        .collect();
+    (adj, defined)
+}
+
+/// Extended context for ONE ISR priority root set: reachability over
+/// direct calls and address-value edges, plus the store-edge fixpoint
+/// (a defined function stored into a context-read global joins, with
+/// its callees transitively). Returns `(ctx, read, param_stores)`.
+/// Callers pass the roots of one priority; the union over priorities
+/// is NOT the same (a store feeding only one priority's read set joins
+/// only that priority), so each priority computes its own.
+fn isr_context_for(
+    m: &Module,
+    roots: &HashSet<&str>,
+    adj: &HashMap<String, Vec<String>>,
+    defined: &HashSet<String>,
+) -> (
+    HashSet<String>,
+    HashSet<(String, u16)>,
+    HashSet<(String, usize)>,
+) {
+    let mut isr_ctx: HashSet<String> = roots.iter().flat_map(|r| reachable(&[*r], adj)).collect();
     let mut param_stores: HashSet<(String, usize)> = HashSet::new();
     // Store edges, iterated to a fixpoint: a defined function (or a param
     // resolved through call sites) stored into a global the ISR context
@@ -1509,7 +1529,7 @@ fn isr_context(
     }
     let read = isr_read_globals(m, &isr_ctx);
 
-    (isr_ctx, read, adj, param_stores)
+    (isr_ctx, read, param_stores)
 }
 
 /// The interrupt shared-function duplication (the interrupt duplication):
@@ -1524,115 +1544,169 @@ fn isr_context(
 /// The call graph re-derives locally from the module's CALL insts rather
 /// than depending on the callgraph crate: the scan is tiny and stable, and
 /// legalize already owns the module (no new dependency).
+/// Copy suffix for a priority's duplicated shared callees: the low
+/// context (and the compatibility single-vector mode) keeps the
+/// historical `_isr`; the high context, which can preempt the low one
+/// mid-call, gets `_isr_high` so its frames never overlap the low's.
 fn duplicate_isr_shared(m: Module) -> Module {
-    let isr_names: HashSet<&str> = m
+    // Partition ISR roots by priority: 1 = high, anything else ISR =
+    // low (priority 0 is the compatibility single-vector mode).
+    let hi_roots: HashSet<&str> = m
         .funcs
         .iter()
-        .filter(|f| f.isr)
+        .filter(|f| f.isr && f.irq_priority == 1)
         .map(|f| f.name.as_str())
         .collect();
-    if isr_names.is_empty() {
-        return m;
-    }
-
-    // The extended ISR context: the ISR roots' reachability over direct
-    // calls and address-value edges, plus every defined function whose
-    // address is stored into an ISR-visible global (a cross-context callback:
-    // stored by main-side code, invoked by the ISR). The main context derives
-    // from the same adjacency (epic-cc#137).
-    let (isr_ctx, isr_read, adj, param_stores) = isr_context(&m);
-    let main_ctx = reachable(&["main"], &adj);
-    // main stays out of the duplication above, so an ISR that (transitively)
-    // calls main would leave the ISR's call on the original `main`,
-    // re-entering the main context and collapsing the disjoint-region
-    // guarantee. Panics rather than miscompiling: re-entrant main has no lowering.
-    assert!(
-        !isr_ctx.contains("main"),
-        "isel/legalize: the ISR context must not reach main — re-entrant main is unsupported"
-    );
-    let shared: Vec<String> = m
+    let lo_roots: HashSet<&str> = m
         .funcs
         .iter()
-        .filter(|f| !f.isr && f.name != "main")
-        .filter(|f| isr_ctx.contains(&f.name) && main_ctx.contains(&f.name))
-        .map(|f| f.name.clone())
+        .filter(|f| f.isr && f.irq_priority != 1)
+        .map(|f| f.name.as_str())
         .collect();
-    if shared.is_empty() {
+    if hi_roots.is_empty() && lo_roots.is_empty() {
         return m;
     }
 
-    // Deep-clones each shared func as `{name}_isr` (renamed, isr flag
-    // cleared). A name collision with an existing function panics: no
-    // valid emission exists for two functions sharing one name.
-    let mut funcs = m.funcs;
-    let mut copies: Vec<Func> = Vec::with_capacity(shared.len());
-    for name in &shared {
-        let copy_name = format!("{name}_isr");
-        assert!(
-            !funcs.iter().any(|f| f.name == copy_name),
-            "legalize: duplicate-interrupt name collision: {copy_name} already exists"
-        );
-        let f = funcs
-            .iter()
-            .find(|f| &f.name == name)
-            .expect("legalize: shared function vanished");
-        let mut c = f.clone();
-        c.name = copy_name;
-        c.isr = false;
-        copies.push(c);
+    // The extended contexts (epic-cc#137), computed per priority over
+    // one shared adjacency: a helper reachable from a priority's roots
+    // (directly, address-taken, or via the store-edge fixpoint) belongs
+    // to that priority's context. The main context derives from the
+    // same adjacency.
+    let (adj, defined) = isr_adjacency(&m);
+    let main_ctx = reachable(&["main"], &adj);
+    let (lo_ctx, lo_read, lo_params) = isr_context_for(&m, &lo_roots, &adj, &defined);
+    let (hi_ctx, hi_read, hi_params) = isr_context_for(&m, &hi_roots, &adj, &defined);
+    // main is excluded from the duplication above, so an ISR that
+    // (transitively) calls main would leave the ISR's call on the original
+    // `main` — re-entering the main context and silently collapsing the
+    // disjoint-region guarantee. Panic loudly rather than miscompile.
+    assert!(
+        !lo_ctx.contains("main"),
+        "isel/legalize: the low-ISR context must not reach main — re-entrant main is unsupported"
+    );
+    assert!(
+        !hi_ctx.contains("main"),
+        "isel/legalize: the high-ISR context must not reach main — re-entrant main is unsupported"
+    );
+    // A helper shared with (reachable from) another live context needs
+    // that context's own copy: the high ISR can preempt the low one
+    // (and main) mid-call, so frames must be disjoint along every
+    // preemption edge. In compatibility mode the high sets are empty
+    // and this is exactly the old single-context rule. ISR roots and
+    // `main` itself are never copied, only shared callees.
+    let is_root_or_main = |f: &Func| f.isr || f.name == "main";
+    let shared_lo: Vec<String> = m
+        .funcs
+        .iter()
+        .filter(|f| !is_root_or_main(f))
+        .filter(|f| {
+            lo_ctx.contains(&f.name) && (main_ctx.contains(&f.name) || hi_ctx.contains(&f.name))
+        })
+        .map(|f| f.name.clone())
+        .collect();
+    let shared_hi: Vec<String> = m
+        .funcs
+        .iter()
+        .filter(|f| !is_root_or_main(f))
+        .filter(|f| {
+            hi_ctx.contains(&f.name) && (main_ctx.contains(&f.name) || lo_ctx.contains(&f.name))
+        })
+        .map(|f| f.name.clone())
+        .collect();
+    if shared_lo.is_empty() && shared_hi.is_empty() {
+        return m;
     }
 
-    // Rewrite every call inside the ISR context whose target is a duplicated
-    // function to the `_isr` copy. The rewrite set is the ISR context minus
-    // the original shared functions (now main-context-only: their calls stay
-    // on the originals) plus the copies (their internal calls become the
-    // `_isr` names transitively). The ISR root itself and non-shared ISR
-    // callees are in the set, so the whole ISR context runs against copies.
-    let shared_set: HashSet<&str> = shared.iter().map(String::as_str).collect();
-    let mut rewrite_set: HashSet<String> = isr_ctx
-        .iter()
-        .filter(|n| n.as_str() != "main" && !shared_set.contains(n.as_str()))
-        .cloned()
-        .collect();
-    for c in &copies {
-        rewrite_set.insert(c.name.clone());
-    }
-    // The copies go into the module before the rewrite so their internal
-    // calls are rewritten too (a copy's call to another shared function ->
-    // its `_isr` copy, transitively).
-    funcs.extend(copies);
-    for f in &mut funcs {
-        if !rewrite_set.contains(&f.name) {
-            continue;
+    // Deep-clone each shared func with its priority's suffix (renamed,
+    // `isr` flag cleared, priority reset: a copy is an ordinary
+    // function, not a second vector entry). A name collision with an
+    // existing function panics loudly.
+    fn make_copies(funcs: &[Func], shared: &[String], suffix: &str) -> Vec<Func> {
+        let mut copies: Vec<Func> = Vec::with_capacity(shared.len());
+        for name in shared {
+            let copy_name = format!("{name}{suffix}");
+            assert!(
+                !funcs.iter().any(|f| f.name == copy_name),
+                "legalize: duplicate-interrupt name collision: {copy_name} already exists"
+            );
+            let f = funcs
+                .iter()
+                .find(|f| &f.name == name)
+                .expect("legalize: shared function vanished");
+            let mut c = f.clone();
+            c.name = copy_name;
+            c.isr = false;
+            c.irq_priority = 0;
+            copies.push(c);
         }
-        for b in &mut f.blocks {
-            for inst in &mut b.insts {
-                if let Inst::Call(c) = inst {
-                    let target = c.func.clone();
-                    if shared_set.contains(target.as_str()) {
-                        c.func = format!("{target}_isr");
+        copies
+    }
+    /// Rewrite direct call targets and function-pointer values inside
+    /// `rewrite_set` from duplicated originals to their `suffix` copies.
+    fn rewrite_calls_to_copies(
+        funcs: &mut [Func],
+        rewrite_set: &HashSet<String>,
+        shared: &HashSet<&str>,
+        suffix: &str,
+    ) {
+        for f in funcs.iter_mut() {
+            if !rewrite_set.contains(&f.name) {
+                continue;
+            }
+            for b in &mut f.blocks {
+                for inst in &mut b.insts {
+                    if let Inst::Call(c) = inst {
+                        let target = c.func.clone();
+                        if shared.contains(target.as_str()) {
+                            c.func = format!("{target}{suffix}");
+                        }
                     }
+                    rewrite_inst_vals(inst, shared, suffix);
                 }
-                // A function-pointer VALUE referencing a shared function
-                // (a `store ptr @f`, a `select ptr @f, ptr @g`, a call arg)
-                // must also point at the `_isr` copy inside the ISR context,
-                // or the ISR would call the main-context original and run in
-                // the main region's frames (epic-cc#73).
-                rewrite_inst_vals(inst, &shared_set);
             }
         }
     }
-    // Cross-context store rewrite: a store outside the ISR context whose
-    // value is a duplicated function and whose target is a global the ISR
-    // reads points at the `_isr` copy; otherwise the ISR loads the
-    // main-context original's address and dispatches it into the main
-    // region's frames. Predicated on the target being ISR-read (not merely
-    // ISR-visible): a global the ISR only writes feeds no ISR call, so a
-    // store into it stays on the original (epic-cc#137) (epic-cc#73).
+    let mut funcs = m.funcs;
+    let lo_copies = make_copies(&funcs, &shared_lo, LO_SUFFIX);
+    let hi_copies = make_copies(&funcs, &shared_hi, HI_SUFFIX);
+    let shared_lo_set: HashSet<&str> = shared_lo.iter().map(String::as_str).collect();
+    let shared_hi_set: HashSet<&str> = shared_hi.iter().map(String::as_str).collect();
+    let mut rewrite_lo: HashSet<String> = lo_ctx
+        .iter()
+        .filter(|n| n.as_str() != "main" && !shared_lo_set.contains(n.as_str()))
+        .cloned()
+        .collect();
+    for c in &lo_copies {
+        rewrite_lo.insert(c.name.clone());
+    }
+    let mut rewrite_hi: HashSet<String> = hi_ctx
+        .iter()
+        .filter(|n| n.as_str() != "main" && !shared_hi_set.contains(n.as_str()))
+        .cloned()
+        .collect();
+    for c in &hi_copies {
+        rewrite_hi.insert(c.name.clone());
+    }
+    // The copies go into the module before the rewrite so their internal
+    // calls are rewritten too (a copy's call to another shared function ->
+    // its suffixed copy, transitively).
+    let mut copies = lo_copies;
+    copies.extend(hi_copies);
+    funcs.extend(copies);
+    rewrite_calls_to_copies(&mut funcs, &rewrite_lo, &shared_lo_set, LO_SUFFIX);
+    rewrite_calls_to_copies(&mut funcs, &rewrite_hi, &shared_hi_set, HI_SUFFIX);
+    // Cross-context store rewrite (epic-cc#137), per priority: a store
+    // whose value is a duplicated function and whose target is a global
+    // one priority READS must point at that priority's copy, or the ISR
+    // would load the main-context original's address and dispatch it
+    // into the main region's frames. Predicated on the target being
+    // priority-read (not merely visible): a global the ISR only writes
+    // never feeds an ISR call, and rewriting a store into it would break
+    // the epic-cc#73 fixture (main's store must stay on the original).
+    // A store feeding BOTH priorities' read sets with a doubly-shared
+    // value has no single correct spelling (one address cannot name two
+    // frames): panic loudly rather than miscompile.
     for f in &mut funcs {
-        if rewrite_set.contains(&f.name) {
-            continue;
-        }
         // GEP bases are resolved before the mutation loop (the function is
         // borrowed mutably below).
         let mut bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = HashMap::new();
@@ -1643,48 +1717,100 @@ fn duplicate_isr_shared(m: Module) -> Module {
                 }
             }
         }
+        let in_lo = rewrite_lo.contains(&f.name);
+        let in_hi = rewrite_hi.contains(&f.name);
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 if let Inst::Store(s) = inst {
                     let Some((g, sk)) = global_field_map(&s.ptr, &bases) else {
                         continue;
                     };
-                    let feeds = isr_read
+                    let feeds_lo = lo_read
                         .iter()
                         .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
-                    if !feeds {
-                        continue;
-                    }
+                    let feeds_hi = hi_read
+                        .iter()
+                        .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
                     if let Val::Global(fn_name) = &s.val {
-                        if shared_set.contains(fn_name.as_str()) {
-                            s.val = Val::Global(format!("{fn_name}_isr"));
+                        let lo_hit = !in_lo && feeds_lo && shared_lo_set.contains(fn_name.as_str());
+                        let hi_hit = !in_hi && feeds_hi && shared_hi_set.contains(fn_name.as_str());
+                        if lo_hit && hi_hit {
+                            panic!(
+                                "legalize: store of @{fn_name} feeds both ISR priorities' read sets; no single copy serves both contexts"
+                            );
+                        } else if lo_hit {
+                            s.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
+                        } else if hi_hit {
+                            s.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
                         }
                     }
                 }
             }
         }
     }
-    // Param-forwarded call arguments (epic-cc#137): a call passing a named
-    // function into a param that a callee stores into an ISR-read global
-    // (the `EPIC_GPIO_RegisterChangeCallback(on_rb_change)` shape) must pass
-    // the `_isr` copy, or the ISR loads the original's address. The rewrite
-    // lands at the call site, outside the ISR context.
+    // Param-forwarded call arguments (epic-cc#137), per priority: a call
+    // passing a named function into a param that a callee stores into a
+    // priority-read global (the `EPIC_GPIO_RegisterChangeCallback(on_rb_change)`
+    // shape) must pass that priority's copy, or the ISR loads the
+    // original's address. The rewrite lands at the call site, outside
+    // the rewritten priority's context. A dual-feeding argument panics
+    // as above.
     for f in &mut funcs {
-        if rewrite_set.contains(&f.name) {
-            continue;
-        }
+        let in_lo = rewrite_lo.contains(&f.name);
+        let in_hi = rewrite_hi.contains(&f.name);
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 if let Inst::Call(c) = inst {
-                    // Every param of the callee that feeds an ISR-read
+                    // Every param of the callee that feeds a priority-read
                     // global must be rewritten, not just the first match
                     // (a callee may store two params into two globals).
-                    for (_, pi) in param_stores.iter().filter(|(callee, _)| callee == &c.func) {
-                        if let Some(a) = c.args.get_mut(*pi) {
-                            if let Val::Global(fn_name) = &a.val {
-                                if shared_set.contains(fn_name.as_str()) {
-                                    a.val = Val::Global(format!("{fn_name}_isr"));
+                    // Directions are collected before mutating so a
+                    // dual-feeding argument panics instead of landing
+                    // half-rewritten.
+                    let mut lo_args: Vec<usize> = Vec::new();
+                    let mut hi_args: Vec<usize> = Vec::new();
+                    if !in_lo {
+                        for (_, pi) in lo_params.iter().filter(|(callee, _)| callee == &c.func) {
+                            if let Some(a) = c.args.get(*pi) {
+                                if let Val::Global(fn_name) = &a.val {
+                                    if shared_lo_set.contains(fn_name.as_str()) {
+                                        lo_args.push(*pi);
+                                    }
                                 }
+                            }
+                        }
+                    }
+                    if !in_hi {
+                        for (_, pi) in hi_params.iter().filter(|(callee, _)| callee == &c.func) {
+                            if let Some(a) = c.args.get(*pi) {
+                                if let Val::Global(fn_name) = &a.val {
+                                    if shared_hi_set.contains(fn_name.as_str()) {
+                                        hi_args.push(*pi);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for pi in &lo_args {
+                        if hi_args.contains(pi) {
+                            panic!(
+                                "legalize: call argument feeds both ISR priorities' read sets; no single copy serves both contexts"
+                            );
+                        }
+                    }
+                    for pi in lo_args {
+                        if let Some(a) = c.args.get_mut(pi) {
+                            if let Val::Global(fn_name) = &a.val {
+                                let fn_name = fn_name.clone();
+                                a.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
+                            }
+                        }
+                    }
+                    for pi in hi_args {
+                        if let Some(a) = c.args.get_mut(pi) {
+                            if let Val::Global(fn_name) = &a.val {
+                                let fn_name = fn_name.clone();
+                                a.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
                             }
                         }
                     }
@@ -1699,65 +1825,65 @@ fn duplicate_isr_shared(m: Module) -> Module {
     }
 }
 
-/// Rewrite every `Val::Global(f)` in `inst` to `Val::Global(f_isr)` when `f`
-/// is in `shared` (a function duplicated for the ISR context). Covers every
+/// Rewrite every `Val::Global(f)` in `inst` to `Val::Global(f+suffix)`
+/// when `f` is in `shared` (a function duplicated for an ISR context). Covers every
 /// inst variant that carries a `Val`; the pointer-returning `sink_ptr_select`
 /// bodies and the `Call.func` target are handled separately.
-fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>) {
-    fn rv(v: &mut Val, shared: &HashSet<&str>) {
+fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>, suffix: &str) {
+    fn rv(v: &mut Val, shared: &HashSet<&str>, suffix: &str) {
         if let Val::Global(g) = v {
             if shared.contains(g.as_str()) {
-                *v = Val::Global(format!("{g}_isr"));
+                *v = Val::Global(format!("{g}{suffix}"));
             }
         }
     }
     match inst {
-        Inst::Store(s) => rv(&mut s.val, shared),
+        Inst::Store(s) => rv(&mut s.val, shared, suffix),
         Inst::Bin(b) => {
-            rv(&mut b.a, shared);
-            rv(&mut b.b, shared);
+            rv(&mut b.a, shared, suffix);
+            rv(&mut b.b, shared, suffix);
         }
-        Inst::Ret(Some((_, v)), _) => rv(v, shared),
-        Inst::Zext(z) => rv(&mut z.val, shared),
-        Inst::Sext(x) => rv(&mut x.val, shared),
-        Inst::Trunc(t) => rv(&mut t.val, shared),
-        Inst::IntToPtr(p) => rv(&mut p.val, shared),
+        Inst::Ret(Some((_, v)), _) => rv(v, shared, suffix),
+        Inst::Zext(z) => rv(&mut z.val, shared, suffix),
+        Inst::Sext(x) => rv(&mut x.val, shared, suffix),
+        Inst::Trunc(t) => rv(&mut t.val, shared, suffix),
+        Inst::IntToPtr(p) => rv(&mut p.val, shared, suffix),
         Inst::Icmp(i) => {
-            rv(&mut i.a, shared);
-            rv(&mut i.b, shared);
+            rv(&mut i.a, shared, suffix);
+            rv(&mut i.b, shared, suffix);
         }
         Inst::Select(s) => {
-            rv(&mut s.cond, shared);
-            rv(&mut s.a, shared);
-            rv(&mut s.b, shared);
+            rv(&mut s.cond, shared, suffix);
+            rv(&mut s.a, shared, suffix);
+            rv(&mut s.b, shared, suffix);
         }
         Inst::Call(c) => {
             for arg in &mut c.args {
-                rv(&mut arg.val, shared);
+                rv(&mut arg.val, shared, suffix);
             }
         }
         Inst::Phi(p) => {
             for (v, _) in &mut p.incoming {
-                rv(v, shared);
+                rv(v, shared, suffix);
             }
         }
         Inst::Memcpy(mc) => {
-            rv(&mut mc.dst, shared);
-            rv(&mut mc.src, shared);
+            rv(&mut mc.dst, shared, suffix);
+            rv(&mut mc.src, shared, suffix);
             if let MemLen::Reg(v) = &mut mc.len {
-                rv(v, shared);
+                rv(v, shared, suffix);
             }
         }
-        Inst::Freeze(fr) => rv(&mut fr.val, shared),
+        Inst::Freeze(fr) => rv(&mut fr.val, shared, suffix),
         Inst::FloatBin(fb) => {
-            rv(&mut fb.a, shared);
-            rv(&mut fb.b, shared);
+            rv(&mut fb.a, shared, suffix);
+            rv(&mut fb.b, shared, suffix);
         }
         Inst::Fcmp(fc) => {
-            rv(&mut fc.a, shared);
-            rv(&mut fc.b, shared);
+            rv(&mut fc.a, shared, suffix);
+            rv(&mut fc.b, shared, suffix);
         }
-        Inst::FloatConv(fc) => rv(&mut fc.val, shared),
+        Inst::FloatConv(fc) => rv(&mut fc.val, shared, suffix),
         _ => {}
     }
 }
@@ -1812,14 +1938,38 @@ fn fill_indirect_callees(m: &mut Module) {
         })
         .collect();
 
-    // The extended ISR context: the ISR roots' reachability over direct
-    // calls and address-value edges, plus every defined function whose address
-    // is stored into an ISR-visible global (a cross-context callback: stored
-    // by main-side code, invoked by the ISR) (epic-cc#137).
-    let (isr_ctx, _, _, _) = isr_context(m);
+    // Priority-partitioned reachability over the post-duplication module:
+    // the ISR roots keep their priorities (copies have `isr` cleared),
+    // and the rewritten call edges already point each context at its
+    // own copies, so reachability from each root set is exactly the set
+    // of functions that may execute in that context. Each side runs the
+    // store-edge fixpoint (a stored callback joins through the global
+    // the ISR reads, not through a direct call).
+    let (adj2, _) = isr_adjacency(m);
+    let lo_roots: HashSet<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr && f.irq_priority != 1)
+        .map(|f| f.name.as_str())
+        .collect();
+    let hi_roots: HashSet<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr && f.irq_priority == 1)
+        .map(|f| f.name.as_str())
+        .collect();
+    let (lo2, _, _) = isr_context_for(m, &lo_roots, &adj2, &defined);
+    let (hi2, _, _) = isr_context_for(m, &hi_roots, &adj2, &defined);
+    let main2: HashSet<String> = reachable(&["main"], &adj2);
 
     for f in &mut m.funcs {
-        let in_isr = isr_ctx.contains(&f.name);
+        // The contexts this site may execute in: the copies created
+        // above run in exactly one priority each, while a shared
+        // original (reachable but rewritten away from both ISR
+        // contexts) runs only in main.
+        let in_lo = lo2.contains(&f.name);
+        let in_hi = hi2.contains(&f.name);
+        let in_main = main2.contains(&f.name);
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 if let Inst::Call(c) = inst {
@@ -1832,11 +1982,9 @@ fn fill_indirect_callees(m: &mut Module) {
                     let mut cands: Vec<String> = addr_taken
                         .iter()
                         .filter(|g| {
-                            if in_isr {
-                                isr_ctx.contains(*g)
-                            } else {
-                                !isr_ctx.contains(*g)
-                            }
+                            (!in_main || (!lo2.contains(*g) && !hi2.contains(*g)))
+                                && (!in_lo || lo2.contains(*g))
+                                && (!in_hi || hi2.contains(*g))
                         })
                         .filter(|g| arity.get(*g).copied() == Some(c.args.len()))
                         .filter(|g| {
@@ -1848,20 +1996,34 @@ fn fill_indirect_callees(m: &mut Module) {
                         })
                         .cloned()
                         .collect();
-                    // An ISR-site candidate that is a duplicated ORIGINAL
-                    // (address-taken elsewhere, e.g. a select arm)
-                    // dispatches the `_isr` copy: the ISR runs no
-                    // main-context frame (ADR-013). The copy exists because
-                    // the original is in the ISR context and main also
-                    // reaches it.
-                    if in_isr {
-                        for g in &mut cands {
-                            if isr_ctx.contains(g.as_str()) && defined.contains(g.as_str()) {
-                                let copy = format!("{g}_isr");
-                                if defined.contains(&copy) {
-                                    *g = copy;
+                    // A candidate that is a duplicated ORIGINAL
+                    // (address-taken elsewhere, e.g. a select arm) must
+                    // dispatch the copy for each context this site
+                    // executes in: no context can run a foreign frame
+                    // (ADR-013). A site live in both ISR contexts whose
+                    // candidate has both copies is unrepresentable:
+                    // panic loudly.
+                    for g in &mut cands {
+                        let mut dispatched: Option<String> = None;
+                        for (executes, suffix) in [(in_lo, LO_SUFFIX), (in_hi, HI_SUFFIX)] {
+                            if !executes {
+                                continue;
+                            }
+                            let copy = format!("{g}{suffix}");
+                            if defined.contains(&copy) {
+                                if let Some(prev) = &dispatched {
+                                    if *prev != copy {
+                                        panic!(
+                                            "legalize: indirect call candidate @{g} needs both ISR priorities' copies; no single dispatch serves both contexts"
+                                        );
+                                    }
+                                } else {
+                                    dispatched = Some(copy);
                                 }
                             }
+                        }
+                        if let Some(copy) = dispatched {
+                            *g = copy;
                         }
                     }
                     cands.sort();

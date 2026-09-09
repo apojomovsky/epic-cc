@@ -1323,6 +1323,23 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             .iter()
             .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
             .collect();
+        // Priority-partitioned ISR roots: the high ISR can preempt the
+        // low one (and main) mid-call, so each priority's context needs
+        // its own disjoint overlay region. Compatibility mode has no
+        // high roots and behaves exactly as before.
+        let hi_roots: Vec<&&String> = isr_roots
+            .iter()
+            .filter(|f| {
+                m.funcs
+                    .iter()
+                    .find(|g| g.name.as_str() == f.as_str())
+                    .is_some_and(|g| g.irq_priority == 1)
+            })
+            .collect();
+        let lo_roots: Vec<&&String> = isr_roots
+            .iter()
+            .filter(|f| !hi_roots.iter().any(|h| h.as_str() == f.as_str()))
+            .collect();
         let non_isr_roots: Vec<&String> = topo
             .iter()
             .filter(|f| !callers.contains_key(*f) && !isr_names.contains(f.as_str()))
@@ -1336,31 +1353,44 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             .map(|f| frame_end(device, base[&f], &locals_widths[&f]))
             .max()
             .unwrap_or(bank0_start);
-        // Re-derive the ISR contexts from the disjoint base (topo order: an
-        // ISR root's base is fixed first, then each callee's base derives
-        // from its already-fixed callers).
-        let isr_ctx: HashSet<String> = isr_roots
-            .iter()
-            .flat_map(|r| reachable(&[r.as_str()], &edges))
-            .collect();
-        for f in &topo {
-            if !isr_ctx.contains(f) {
-                continue;
-            }
-            let b = if isr_names.contains(f.as_str()) {
-                isr_base
-            } else {
-                callers[f]
+        // Re-derive each priority's context from its disjoint base in topo
+        // order (callers precede callees, and every caller of a context
+        // function is itself in that context after the legalize
+        // duplication).
+        let assign_region =
+            |base: &mut HashMap<String, u16>, roots: &[&&String], region_base: u16| {
+                let ctx: HashSet<String> = roots
                     .iter()
-                    .map(|p| frame_end(device, base[p], &locals_widths[p]))
-                    .max()
-                    .expect("alloc: empty caller list")
+                    .flat_map(|r| reachable(&[r.as_str()], &edges))
+                    .collect();
+                for f in &topo {
+                    if !ctx.contains(f) {
+                        continue;
+                    }
+                    let b = if roots.iter().any(|r| r.as_str() == f.as_str()) {
+                        region_base
+                    } else {
+                        callers[f]
+                            .iter()
+                            .map(|p| frame_end(device, base[p], &locals_widths[p]))
+                            .max()
+                            .expect("alloc: empty caller list")
+                    };
+                    // Issue #6: the ISR context's routine copies get the same
+                    // single-bank frame rounding as the main context's.
+                    let b = round_if_routine(device, f, b, &locals_widths, access_window);
+                    base.insert(f.clone(), b);
+                }
             };
-            // The ISR context's routine copies get the same single-bank
-            // frame rounding as the main context's (epic-cc#6).
-            let b = round_if_routine(device, f, b, &locals_widths, access_window);
-            base.insert(f.clone(), b);
-        }
+        assign_region(&mut base, &lo_roots, isr_base);
+        // The high region sits above everything the high ISR can preempt
+        // (main and low frames): max frame end over all assigned bases.
+        let hi_base = base
+            .iter()
+            .map(|(f, b)| frame_end(device, *b, &locals_widths[f]))
+            .max()
+            .unwrap_or(isr_base);
+        assign_region(&mut base, &hi_roots, hi_base);
     }
 
     // 7. Local addresses: each slot of the liveness-colored frame at the
