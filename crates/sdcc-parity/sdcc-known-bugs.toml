@@ -80,20 +80,14 @@ device = "p18f4550"
 program = "printf-f"
 sdcc_observed = 0x0
 expected = 0x41
-# EEPROM on p18f4550: SDCC compiles the probe but its implementation-
-# defined int-to-pointer conversion does not address the EEPROM register
-# window. None of the probe's programmed stores ever arrives: EEDATA,
-# EEADR and EECON2 see no writes at all, and EECON1 sees only two
-# 0x80 writes from SDCC's own runtime around the probe (0x80 appears
-# nowhere in the probe source). Both reads therefore return stale
-# EEDATA and it computes 0x7F instead of 0x80. Same
-# generic-pointer dereference defect class as the arbitrated malloc
-# entry above. The wrong side is the oracle, not the harness: the stores
-# are ordinary banked MOVWF/MOVFF sequences, the same paths epic-cc's
-# own passing probe exercises, so the misrouting is in SDCC's address
-# computation, upstream of any simulator model. epic-cc performs the
-# real unlock-and-commit cycle.
-[[bug]]
+# EEPROM on p18f4550: SDCC compiles the probe but its int-to-pointer
+# conversion never reaches the register window (EEDATA/EEADR/EECON2 see
+# no writes; EECON1 sees only two 0x80 writes from SDCC's own runtime,
+# a value nowhere in the probe). Both reads return stale EEDATA:
+# 0x7F, not 0x80. Same generic-pointer defect class as malloc; the
+# misrouting is in SDCC's address computation, upstream of any sim
+# model (the stores are ordinary MOVWF/MOVFF our own probe exercises).
+# epic-cc performs the real unlock-and-commit cycle.
 device = "p18f4550"
 program = "eeprom-p18"
 sdcc_observed = 0x7F
