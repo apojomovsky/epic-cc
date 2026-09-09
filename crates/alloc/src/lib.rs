@@ -48,6 +48,13 @@ pub struct AllocLayout {
     /// its overlay region span is 0, but the backend still emits the
     /// ISR-save prologue, which the size report must count.
     pub has_isr: bool,
+    /// The low-priority ISR's 12-byte context-save area base (`Some` only
+    /// in priority mode: both a high- and a low-priority ISR exist). It
+    /// sits at the low overlay region's base, below the low frames, so it
+    /// is disjoint from every context by construction; the high ISR keeps
+    /// the device's fixed save block. `None` in compatibility mode (zero
+    /// or one ISR), where the single handler uses the fixed block.
+    pub isr_low_save: Option<u16>,
 }
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
@@ -1318,6 +1325,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         .filter(|f| f.isr)
         .map(|f| f.name.as_str())
         .collect();
+    // Set inside the ISR-region block below: `Some` only in priority mode.
+    let mut isr_low_save: Option<u16> = None;
     if !isr_names.is_empty() {
         let isr_roots: Vec<&String> = topo
             .iter()
@@ -1382,7 +1391,20 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                     base.insert(f.clone(), b);
                 }
             };
-        assign_region(&mut base, &lo_roots, isr_base);
+        // Priority mode (both priorities present): the low ISR's 12-byte
+        // context-save area sits at the low region's base, below the low
+        // frames, so it is disjoint from every context by construction
+        // (the access-window argument shows no float frame can land
+        // inside it). Compatibility mode keeps the historical layout
+        // byte-identical: no shift, no save area.
+        let priority_mode = !lo_roots.is_empty() && !hi_roots.is_empty();
+        let lo_base = if priority_mode {
+            isr_low_save = Some(isr_base);
+            isr_base + 12
+        } else {
+            isr_base
+        };
+        assign_region(&mut base, &lo_roots, lo_base);
         // The high region sits above everything the high ISR can preempt
         // (main and low frames): max frame end over all assigned bases.
         let hi_base = base
@@ -1488,6 +1510,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         bank_used,
         isr_bytes,
         has_isr: !isr_names.is_empty(),
+        isr_low_save,
     }
 }
 

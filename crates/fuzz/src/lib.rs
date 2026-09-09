@@ -2373,7 +2373,7 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
         addrs.extend(layout.locals.clone());
         let hex = match device.core {
             device::Core::Pic18 => {
-                let asm = isel_pic18::select(device, &m, &addrs);
+                let asm = isel_pic18::select(device, &m, &addrs, layout.isr_low_save);
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14 => {

@@ -481,12 +481,15 @@ pub struct Module {
 
 /// True for the legalize-injected runtime routines (the mul/div/rem/shift
 /// and soft-float recipe bodies), including the interrupt-context `_isr`
-/// copies. The recipe bodies are skip-sensitive (BTFSS/DECFSZ + GOTO,
+/// and `_isr_high` copies. The recipe bodies are skip-sensitive (BTFSS/DECFSZ + GOTO,
 /// INCFSZ + ADDWF), so a routine's frame must sit inside a single GPR bank:
 /// `alloc` rounds routine bases and `isel` verifies the placement. Shared
 /// by both stages; `legalize` injects exactly these names.
 pub fn is_runtime_routine(name: &str) -> bool {
-    let base = name.strip_suffix("_isr").unwrap_or(name);
+    let base = name
+        .strip_suffix("_isr_high")
+        .or_else(|| name.strip_suffix("_isr"))
+        .unwrap_or(name);
     matches!(
         base,
         "__mul_u8"
@@ -530,10 +533,14 @@ pub fn is_runtime_routine(name: &str) -> bool {
 /// recipes address every file operand with `a=0` (no `MOVLB`), so a
 /// `MOVLB` the banking pass would insert for a banked address would break
 /// the skip-sensitive loops. `alloc` reserves the access-bank window for
-/// exactly these routines on PIC18; integer routines use `operand()`'s
-/// `MOVLB` and may live anywhere in banked RAM. Includes the `_isr` copies.
+/// `MOVLB` and may live anywhere in banked RAM. Includes the `_isr` and
+/// `_isr_high` copies (both share the access-bank window with the base
+/// routine; cross-context float sharing is a known hazard, ticketed).
 pub fn is_float_routine(name: &str) -> bool {
-    let base = name.strip_suffix("_isr").unwrap_or(name);
+    let base = name
+        .strip_suffix("_isr_high")
+        .or_else(|| name.strip_suffix("_isr"))
+        .unwrap_or(name);
     matches!(
         base,
         "__add_f32"

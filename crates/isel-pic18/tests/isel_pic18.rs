@@ -24,7 +24,7 @@ fn with_bytes(mut m: ir::Module, name: &str, bytes: &[u8]) -> ir::Module {
 #[test]
 fn empty_function_emits_a_bare_return() {
     let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
-    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
     assert!(asm.contains("RETURN"), "asm:\n{asm}");
 }
 
@@ -43,7 +43,7 @@ fn i32_add_emits_a_four_byte_carry_chain() {
         ("main::2", 0x34),
         ("main::3", 0x38),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("ADDWF 0x030,W,A"), "byte 0 add:\n{asm}");
     assert_eq!(
         asm.matches("ADDWFC").count(),
@@ -72,7 +72,7 @@ fn i32_icmp_eq_ne_compare_all_four_bytes() {
         ("main::3", 0x38),
         ("main::4", 0x39),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert_eq!(
         asm.matches("SUBWF").count(),
         8,
@@ -96,7 +96,7 @@ fn i32_icmp_ugt_compares_high_byte_first() {
         ("main::2", 0x34),
         ("main::3", 0x38),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("SUBWF 0x033,W,A"),
         "high byte (offset 3) compared first:\n{asm}"
@@ -115,7 +115,7 @@ fn const_shl_i16_emits_rlcf_chain() {
         ("main::1", 0x26),
         ("main::2", 0x28),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert_eq!(asm.matches("RLCF").count(), 6, "3 shifts x 2 bytes:\n{asm}");
     assert_eq!(
         asm.matches("BCF 0xFD8,0,A").count(),
@@ -136,7 +136,7 @@ fn const_ashr_i32_sign_fills() {
         ("main::1", 0x28),
         ("main::2", 0x2C),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert_eq!(
         asm.matches("RRCF").count(),
         16,
@@ -156,6 +156,7 @@ fn const_shift_count_out_of_range_panics() {
         &PIC18F4550,
         &m,
         &addrs(&[("x", 0x20), ("main::1", 0x21), ("main::2", 0x22)]),
+        None,
     );
 }
 
@@ -163,7 +164,7 @@ fn const_shift_count_out_of_range_panics() {
 fn load_and_store_i8_use_movff() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x010, 0x012"),
         "load into %1's slot:\n{asm}"
@@ -190,7 +191,7 @@ fn mul_u8_recipe_uses_hardware_mulwf() {
         ("__mul_u8::b", 0x21),
         ("__mul_u8::__scr", 0x30),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MULWF"),
         "the u8 mul must use hardware MULWF:\n{asm}"
@@ -209,7 +210,7 @@ fn runtime_u16_mul_uses_schoolbook_partials() {
         ("__mul_u16::b", 0x22),
         ("__mul_u16::__scr", 0x30),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     // P00 (shift 0), P01 + P10 (shift 8) contribute to the low 16 bits;
     // P11 (shift 16) is dropped. So exactly 3 hardware MULWF partials.
     assert_eq!(
@@ -230,7 +231,7 @@ fn udiv_u16_recipe_emits_restoring_loop() {
         ("__udiv_u16::den", 0x22),
         ("__udiv_u16::__scr", 0x30),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert_eq!(
         asm.matches("RLCF").count(),
         4,
@@ -243,7 +244,7 @@ fn udiv_u16_recipe_emits_restoring_loop() {
 fn load_and_store_i16_copy_both_bytes_low_then_high() {
     let m = parse("global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @in\n    store i16 %1 @out\n    ret void\n");
     let addrs = addrs(&[("in", 0x10), ("out", 0x12), ("main::1", 0x14)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("MOVFF 0x010, 0x014"));
     assert!(asm.contains("MOVFF 0x011, 0x015"));
     assert!(asm.contains("MOVFF 0x014, 0x012"));
@@ -257,7 +258,7 @@ fn store_a_constant_uses_movlw_then_movwf() {
         "global out i8\nfn main(void) ()\n  block entry:\n    store i8 5 @out\n    ret void\n",
     );
     let addrs = addrs(&[("out", 0x11)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("MOVLW 0x05"));
     assert!(
         asm.contains("MOVWF 0x011,A") || asm.contains("MOVWF 0x11,A"),
@@ -269,7 +270,7 @@ fn store_a_constant_uses_movlw_then_movwf() {
 fn literal_ptr_store_writes_the_sfr_with_no_bank() {
     // PORTB = 0xF81 on the PIC18F4550 (SFR segment, a=0, no MOVLB).
     let m = parse("fn main(void) ()\n  block entry:\n    store i8 85 0xF81\n    ret void\n");
-    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
     assert!(
         asm.contains("MOVWF 0x081,A"),
         "SFR store must be a=0, no MOVLB:\n{asm}"
@@ -284,7 +285,7 @@ fn literal_ptr_store_writes_the_sfr_with_no_bank() {
 fn literal_ptr_load_copies_from_the_sfr() {
     let m = parse("global out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 0xF81\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("out", 0x10), ("main::1", 0x11)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0xF81, 0x011"),
         "SFR load must copy from 0xF81:\n{asm}"
@@ -295,7 +296,7 @@ fn literal_ptr_load_copies_from_the_sfr() {
 fn literal_ptr_reg_store_copies_via_movff() {
     let m = parse("global in i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 0xF81\n    ret void\n");
     let addrs = addrs(&[("in", 0x10), ("main::1", 0x11)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x011, 0xF81"),
         "SFR reg store must copy via MOVFF:\n{asm}"
@@ -308,7 +309,7 @@ fn isr_emits_vector_prologue_and_retfie() {
         "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
     assert!(
         asm.contains("org 0x0008"),
         "ISR must be placed at the high vector:\n{asm}"
@@ -343,21 +344,21 @@ fn isr_emits_vector_prologue_and_retfie() {
 #[test]
 fn non_isr_functions_still_emit_plain_return() {
     let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
-    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
     assert!(asm.contains("RETURN"));
     assert!(!asm.contains("RETFIE"));
     assert!(!asm.contains("org 0x0008"));
 }
 
 #[test]
-#[should_panic(expected = "multiple ISRs")]
+#[should_panic(expected = "at most one high- and one low-priority")]
 fn two_isrs_panic_loudly() {
     let m = parse(
         "fn isr1(void) [isr] ()\n  block entry:\n    ret void\n\
          fn isr2(void) [isr] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let _ = select(&PIC18F4550, &m, &addrs(&[]));
+    let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
 }
 
 #[test]
@@ -367,7 +368,7 @@ fn isr_returning_a_value_panics() {
         "fn isr(i8) [isr] ()\n  block entry:\n    ret i8 5\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let _ = select(&PIC18F4550, &m, &addrs(&[]));
+    let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
 }
 
 #[test]
@@ -390,7 +391,7 @@ fn i8_binops_load_b_into_w_then_operate_against_a() {
             ("main::2", 0x13),
             ("main::3", 0x14),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         assert!(
             asm.contains(&format!("{mne} 0x012,W,A")) || asm.contains(&format!("{mne} 0x12,W,A")),
             "{op}:\n{asm}"
@@ -414,7 +415,7 @@ fn i8_binop_dest_at_banked_address_routes_through_operand_with_bank_suffix() {
         ("main::2", 0x13),
         ("main::3", 0x180),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVWF 0x80,B") || asm.contains("MOVWF 0x080,B"),
         "banked dest must go through operand() with an explicit ,B suffix:\n{asm}"
@@ -435,7 +436,7 @@ fn i16_add_uses_addwfc_for_the_high_byte() {
         ("main::2", 0x16),
         ("main::3", 0x18),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("ADDWF") && asm.contains("ADDWFC"),
         "low byte plain add, high byte with carry:\n{asm}"
@@ -462,7 +463,7 @@ fn i16_sub_uses_subfwb_for_the_high_byte() {
         ("main::2", 0x16),
         ("main::3", 0x18),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     // 0x0100 - 0x0001 = 0x00FF, exercises the borrow chain.
@@ -488,7 +489,7 @@ fn i16_bitwise_ops_apply_independently_per_byte() {
             ("main::2", 0x16),
             ("main::3", 0x18),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         // Both bytes use the same plain (non-carry) mnemonic, applied twice.
         assert_eq!(asm.matches(mne).count(), 2, "{op}:\n{asm}");
     }
@@ -504,7 +505,7 @@ fn i8_binop_const_lhs_sub_emits_sublw() {
         "global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = sub i8 5, %1\n    ret void\n",
     );
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("SUBLW 0x05"),
         "sub i8 5, %x should emit SUBLW 0x05, got:\n{asm}"
@@ -523,7 +524,7 @@ fn i8_binop_const_lhs_is_rejected_not_silently_miscompiled() {
         "global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = shl i8 1, %1\n    ret void\n",
     );
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -536,7 +537,7 @@ fn icmp_eq_materializes_1_when_equal_and_0_when_not() {
         ("main::2", 0x13),
         ("main::3", 0x14),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
@@ -558,7 +559,7 @@ fn icmp_ne_distinguishes_equal_from_not_equal() {
             ("main::2", 0x13),
             ("main::3", 0x14),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = a;
@@ -586,7 +587,7 @@ fn icmp_ult_and_uge_use_the_carry_flag() {
             ("main::2", 0x13),
             ("main::3", 0x14),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = a;
@@ -614,7 +615,7 @@ fn icmp_ugt_and_ule_combine_c_and_z() {
             ("main::2", 0x13),
             ("main::3", 0x14),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = a;
@@ -647,7 +648,7 @@ fn icmp_slt_and_sge_use_n_xor_ov() {
             ("main::2", 0x13),
             ("main::3", 0x14),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = a;
@@ -675,7 +676,7 @@ fn icmp_sgt_and_sle_combine_z_and_n_xor_ov() {
             ("main::2", 0x13),
             ("main::3", 0x14),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = a;
@@ -697,7 +698,7 @@ fn icmp_i16_ties_break_on_the_low_byte() {
             ("main::2", 0x16),
             ("main::3", 0x18),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = 0x05; // a lo
@@ -720,7 +721,7 @@ fn icmp_i16_high_byte_alone_decides_when_it_differs() {
         ("main::2", 0x16),
         ("main::3", 0x18),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.ram_mut()[0x10] = 0xFF;
@@ -759,7 +760,7 @@ fn icmp_i16_full_equality_resolves_correctly_for_every_predicate() {
             ("main::2", 0x16),
             ("main::3", 0x18),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = 0x42; // a lo
@@ -793,7 +794,7 @@ fn icmp_i16_high_byte_uses_the_predicates_own_signedness() {
             ("main::2", 0x16),
             ("main::3", 0x18),
         ]);
-        let asm = select(&PIC18F4550, &m, &addrs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
         p.ram_mut()[0x10] = 0x00; // a lo
@@ -817,7 +818,7 @@ fn icmp_const_lhs_is_rejected_not_silently_miscompiled() {
         "global x i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @x\n    %2 = icmp ult i8 5, %1\n    ret void\n",
     );
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x13)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -830,14 +831,14 @@ fn icmp_i16_const_lhs_is_rejected_not_silently_miscompiled() {
         "global x i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @x\n    %2 = icmp ult i16 5, %1\n    ret void\n",
     );
     let addrs = addrs(&[("x", 0x10), ("main::1", 0x12), ("main::2", 0x14)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
 fn zext_i8_to_i16_zero_fills_the_high_byte() {
     let m = parse("global a i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = zext i8 %1 to i16\n    ret void\n");
     let addrs = addrs(&[("a", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.ram_mut()[0x10] = 0xFF;
@@ -866,7 +867,7 @@ fn zext_i1_to_i8_same_width_widen_compiles_and_runs() {
         ("main::3", 0x15),
         ("main::4", 0x16),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
@@ -881,7 +882,7 @@ fn zext_i1_to_i8_same_width_widen_compiles_and_runs() {
 fn sext_i8_to_i16_sign_fills_the_high_byte() {
     let m = parse("global a i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = sext i8 %1 to i16\n    ret void\n");
     let addrs = addrs(&[("a", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.ram_mut()[0x10] = 0xFF; // -1
@@ -894,7 +895,7 @@ fn sext_i8_to_i16_sign_fills_the_high_byte() {
 fn trunc_i16_to_i8_keeps_the_low_byte() {
     let m = parse("global a i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = trunc i16 %1 to i8\n    ret void\n");
     let addrs = addrs(&[("a", 0x10), ("main::1", 0x12), ("main::2", 0x14)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.ram_mut()[0x10] = 0x34;
@@ -913,7 +914,7 @@ fn zext_const_source_is_rejected_not_silently_miscompiled() {
     // matching the `Inst::Bin`/`Inst::Icmp` const-LHS guards.
     let m = parse("fn main(void) ()\n  block entry:\n    %1 = zext i8 5 to i16\n    ret void\n");
     let addrs = addrs(&[("main::1", 0x12)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -922,7 +923,7 @@ fn sext_const_source_is_rejected_not_silently_miscompiled() {
     // Same hazard as `zext_const_source_is_rejected_not_silently_miscompiled`.
     let m = parse("fn main(void) ()\n  block entry:\n    %1 = sext i8 5 to i16\n    ret void\n");
     let addrs = addrs(&[("main::1", 0x12)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -931,7 +932,7 @@ fn trunc_const_source_is_rejected_not_silently_miscompiled() {
     // Same hazard as `zext_const_source_is_rejected_not_silently_miscompiled`.
     let m = parse("fn main(void) ()\n  block entry:\n    %1 = trunc i16 5 to i8\n    ret void\n");
     let addrs = addrs(&[("main::1", 0x11)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -950,7 +951,7 @@ fn select_const_cond_is_rejected_not_silently_miscompiled() {
     let m =
         parse("fn main(void) ()\n  block entry:\n    %1 = select i1 1 i8 5 i8 6\n    ret void\n");
     let addrs = addrs(&[("main::1", 0x12)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -966,7 +967,7 @@ fn select_picks_a_when_cond_is_true_and_b_otherwise() {
         ("main::4", 0x16),
         ("main::5", 0x17),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     for (c, expect) in [(1u8, 0x11u8), (0, 0x22)] {
         // reuse fresh ram each run
@@ -982,7 +983,7 @@ fn select_picks_a_when_cond_is_true_and_b_otherwise() {
 #[test]
 fn br_unconditionally_jumps_to_the_target_block() {
     let m = parse("fn main(void) ()\n  block entry:\n    br skip\n  block skip:\n    ret void\n");
-    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
     // Index-based label scheme (matches isel::select exactly): the first
     // block ("entry", here) is the bare function name; every other block
     // is `{func}_L{label}` — "skip" is the second block, so `main_Lskip`.
@@ -1003,7 +1004,7 @@ fn brcond_branches_on_the_condition_byte() {
     // pass a "both paths halt" check but fails this one.
     let m = parse("global c i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    br i1 %1 t f\n  block t:\n    store i8 1 @out\n    ret void\n  block f:\n    store i8 2 @out\n    ret void\n");
     let addrs = addrs(&[("c", 0x10), ("out", 0x11), ("main::1", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     for (c, expect) in [(1u8, 1u8), (0, 2)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
@@ -1041,7 +1042,7 @@ fn phi_copies_the_incoming_value_before_the_predecessor_blocks_terminator() {
            ret void\n",
     );
     let addrs = addrs(&[("c", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     // The copy into %1's slot must appear in BOTH predecessor blocks
     // (block a gets MOVLW 5, block b gets MOVLW 7), before each one's own
     // `br j`. Blocks "a"/"b"/"j" are all non-first blocks here (block
@@ -1105,7 +1106,7 @@ fn ret_with_a_value_writes_it_into_the_fixed_retval_region() {
     // and an i16 return so both the single-byte and multi-byte loop paths
     // are exercised.
     let m = parse("fn main(void) ()\n  block entry:\n    ret i8 42\n");
-    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.run(200);
@@ -1117,7 +1118,7 @@ fn ret_with_a_value_writes_it_into_the_fixed_retval_region() {
     );
 
     let m16 = parse("fn main(void) ()\n  block entry:\n    ret i16 4660\n"); // 4660 == 0x1234
-    let asm16 = select(&PIC18F4550, &m16, &addrs(&[]));
+    let asm16 = select(&PIC18F4550, &m16, &addrs(&[]), None);
     let words16 = asm::assemble_pic18(&asm16);
     let mut p16 = pic14_sim::Pic18::new(words16);
     p16.run(200);
@@ -1169,7 +1170,7 @@ fn rotated_loop_exit_phi_reads_the_pre_increment_value_not_the_clobbered_one() {
         ("main::4", 0x13),
         ("main::5", 0x14),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.run(500);
@@ -1217,7 +1218,7 @@ fn brcond_both_edges_phi_copies_get_correct_bsr_after_the_synthesized_fcopies_la
         ("main::2", 0x210),
         ("main::3", 0x211),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     for (c, expect_t, expect_f) in [(1u8, 7u8, 0u8), (0, 0, 9)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
@@ -1248,7 +1249,7 @@ fn runtime_inttoptr_derefs_through_fsr0_indf0() {
         ("main::a", 0x26),
         ("main::v", 0x27),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x026, 0xFE9") && asm.contains("MOVFF 0x027, 0xFEA"),
         "FSR0 loaded from the address slot:\n{asm}"
@@ -1271,7 +1272,7 @@ fn runtime_ptr_select_derefs_through_fsr0() {
         ("main::p", 0x26),
         ("main::v", 0x27),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x026, 0xFE9"),
         "FSR0 loaded from the address slot:\n{asm}"
@@ -1299,7 +1300,7 @@ fn runtime_ptr_phi_derefs_through_slot_after_phi_copies() {
         ("main::p", 0x28),
         ("main::v", 0x29),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x028, 0xFE9"),
         "FSR0 loaded from the phi dst slot:\n{asm}"
@@ -1348,7 +1349,7 @@ fn select_l_end_resets_bsr_so_a_later_same_block_instruction_is_not_misbanked() 
         ("main::2", 0x12),
         ("main::3", 0x210), // bank 2: the Select's dst (b-arm's MOVLB target)
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     for c in [1u8, 0] {
         let mut p = pic14_sim::Pic18::new(words.clone());
@@ -1375,7 +1376,7 @@ fn brcond_const_cond_is_rejected_not_silently_miscompiled() {
     // the literal cond. This must fail loudly instead.
     let m = parse("fn main(void) ()\n  block entry:\n    br i1 1 t f\n  block t:\n    ret void\n  block f:\n    ret void\n");
     let addrs = addrs(&[]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -1391,7 +1392,7 @@ fn call_copies_scalar_args_and_reads_the_retval_back() {
              ret i8 %2\n",
     );
     let addrs = addrs(&[("main::1", 0x10), ("add1::x", 0x11), ("add1::2", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.run(300);
@@ -1462,7 +1463,7 @@ fn call_return_invalidates_tracked_bsr_so_a_later_banked_access_is_not_misbanked
         ("f::2", 0x211),    // bank 2
         ("f::3", 0x212),    // bank 2: f's own add dst, forces MOVLB 0x2 for real
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     p.ram_mut()[0x20] = 3; // a
@@ -1500,7 +1501,7 @@ fn call_const_byval_arg_is_rejected_not_silently_miscompiled() {
          fn f(void) (p=byval2)\n  block entry:\n    ret void\n",
     );
     let addrs = addrs(&[("f::p", 0x10)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -1519,7 +1520,7 @@ fn a_byval_arg_through_a_geped_pointer_copies_from_the_right_offset() {
              ret void\n",
     );
     let addrs = addrs(&[("g", 0x100), ("f::p", 0x120)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x102, 0x120") || asm.contains("MOVFF 0x102,0x120"),
         "the byval copy must start at g+2 (0x102), not g's base (0x100):\n{asm}"
@@ -1539,7 +1540,7 @@ fn call_const_sret_arg_is_rejected_not_silently_miscompiled() {
          fn f(void) (p=sret)\n  block entry:\n    ret void\n",
     );
     let addrs = addrs(&[("f::p", 0x10)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -1560,7 +1561,7 @@ fn an_sret_arg_through_a_geped_pointer_writes_the_target_address_into_the_callee
              ret void\n",
     );
     let addrs = addrs(&[("g", 0x100), ("f::r", 0x120)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVLW 0x00") && asm.contains("MOVWF 0x020,B"),
         "the sret slot's low byte must receive g's low address byte (0x00):\n{asm}"
@@ -1580,7 +1581,7 @@ fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
            %p = gep @arr +2\n    %v = load i8 %p\n    store i8 %v @out\n    ret void\n",
     );
     let addrs = addrs(&[("arr", 0x100), ("out", 0x110), ("main::v", 0x111)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x102, 0x111") || asm.contains("MOVFF 0x102,0x111"),
         "arr[2] must read directly from base+2 (0x102), no FSR machinery:\n{asm}"
@@ -1615,7 +1616,7 @@ fn a_dynamic_index_sets_fsr0_and_reads_through_indf0() {
         ("main::i", 0x132),
         ("main::v", 0x133),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("LFSR 0, 0x120") || asm.contains("LFSR 0,0x120"),
         "must seed FSR0 with the array base:\n{asm}"
@@ -1647,7 +1648,7 @@ fn a_scale_2_dynamic_index_unrolls_two_adds() {
         ("main::i", 0x151),
         ("main::v", 0x152),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let addwf_to_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
     assert!(
         addwf_to_fsr0l >= 2,
@@ -1682,7 +1683,7 @@ fn a_two_term_dynamic_gep_panics_loudly() {
         ("main::j", 0x133),
         ("main::v", 0x134),
     ]);
-    select(&PIC18F4550, &m, &addrs);
+    select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -1698,7 +1699,7 @@ fn an_sret_return_writes_through_the_callers_address() {
              ret void\n",
     );
     let addrs = addrs(&[("mk::r", 0x160)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         !asm.contains("LFSR 0, 0x160") && !asm.contains("LFSR 0,0x160"),
         "the store target is INSIDE the pointer at 0x160, not the literal address 0x160:\n{asm}"
@@ -1724,7 +1725,7 @@ fn a_const_length_memcpy_copies_byte_by_byte() {
              ret void\n",
     );
     let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     for i in 0..3u16 {
         let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
         let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
@@ -1758,7 +1759,7 @@ fn a_memcpy_to_a_dynamic_indexed_destination_writes_through_indf0() {
         ("idx", 0x120),
         ("main::i", 0x121),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x100, 0xFEF") || asm.contains("MOVFF 0x100,0xFEF"),
         "the copied byte must go from the direct source (0x100) through INDF0 (0xFEF):\n{asm}"
@@ -1787,7 +1788,7 @@ fn a_dynamic_length_memcpy_panics_loudly() {
         ("n", 0x120),
         ("main::len", 0x121),
     ]);
-    select(&PIC18F4550, &m, &addrs);
+    select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -1801,7 +1802,7 @@ fn alloca_and_gep_emit_nothing_of_their_own() {
              ret void\n",
     );
     let addrs = addrs(&[("main::buf", 0x110)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     // The store must land at buf+1 (0x111): proof both Alloca and Gep
     // were handled (the seed + the fold), not merely "didn't crash."
     // 0x111 is bank 1, f=0x11, so the banked emission is MOVLB 0x1 +
@@ -1820,7 +1821,7 @@ fn const_byte_load_emits_tblrd() {
         &[0x2A],
     );
     let addrs = addrs(&[("main::1", 0x10)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("TBLRD*"),
         "a const read must use TBLRD:\n{asm}"
@@ -1861,7 +1862,7 @@ fn const_dynamic_index_load_uses_tblptr_add() {
         &[10, 20, 30, 40],
     );
     let addrs = addrs(&[("in", 0x10), ("main::1", 0x11), ("main::2", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("TBLRD*"), "const read must use TBLRD:\n{asm}");
     assert!(
         asm.contains("ADDWF 0xF6,F,A"),
@@ -1887,7 +1888,7 @@ fn const_i16_load_reads_two_bytes() {
         &[0x34, 0x12],
     );
     let addrs = addrs(&[("main::1", 0x10)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     // Two independent TBLRD* reads, into dst byte 0 and byte 1.
     assert_eq!(
         asm.matches("TBLRD*").count(),
@@ -1901,7 +1902,7 @@ fn const_i16_load_reads_two_bytes() {
 fn const_store_panics() {
     let m =
         parse("const t i8\nfn main(void) ()\n  block entry:\n    store i8 5 @t\n    ret void\n");
-    let _ = select(&PIC18F4550, &m, &HashMap::new());
+    let _ = select(&PIC18F4550, &m, &HashMap::new(), None);
 }
 
 #[test]
@@ -1918,7 +1919,7 @@ fn store_through_const_gep_reg_panics() {
              ret void\n",
     );
     let addrs = addrs(&[("in", 0x10), ("main::1", 0x11)]);
-    let _ = select(&PIC18F4550, &m, &addrs);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
 }
 
 #[test]
@@ -1930,7 +1931,7 @@ fn emits_const_tables_as_db_after_start() {
         "t",
         &[0x0A, 0x14, 0x1E, 0x28],
     );
-    let asm = select(&PIC18F4550, &m, &addrs(&[]));
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
     assert!(asm.contains("t:"), "table label must be emitted:\n{asm}");
     assert!(
         asm.contains("db 0x0A, 0x14, 0x1E, 0x28"),
@@ -2034,7 +2035,7 @@ fn sim_run_bytes(
 ) -> Vec<u8> {
     let m = ir::parse(ir_text);
     let addrs: HashMap<String, u16> = map.iter().cloned().collect();
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
     for &(addr, val) in seed {
@@ -2201,7 +2202,7 @@ fn indirect_call_emits_compare_and_call_chain() {
            call void %3() callees f0 f1\n    ret void\n",
     );
     let addrs = addrs(&[("main::3", 0x10)]);
-    let asm = select(&PIC18F4550, &m, &addrs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("XORLW LOW(f0)"),
         "compare fp lo against f0:\n{asm}"
@@ -2226,6 +2227,7 @@ fn freeze_copies_bytes_like_a_noop() {
         &PIC18F4550,
         &m,
         &addrs(&[("a", 0x10), ("main::1", 0x20), ("main::2", 0x22)]),
+        None,
     );
     assert!(
         asm.contains("MOVFF 0x020, 0x022"),
@@ -2240,6 +2242,7 @@ fn inttoptr_copies_the_two_address_bytes() {
         &PIC18F4550,
         &m,
         &addrs(&[("a", 0x10), ("main::1", 0x20), ("main::2", 0x24)]),
+        None,
     );
     assert!(
         asm.contains("MOVFF 0x020, 0x024"),
@@ -2251,7 +2254,8 @@ fn inttoptr_copies_the_two_address_bytes() {
 fn inttoptr_const_source_is_rejected_not_silently_miscompiled() {
     let m =
         parse("fn main(void) ()\n  block entry:\n    %1 = inttoptr i16 12 to ptr\n    ret void\n");
-    let result = std::panic::catch_unwind(|| select(&PIC18F4550, &m, &addrs(&[("main::1", 0x20)])));
+    let result =
+        std::panic::catch_unwind(|| select(&PIC18F4550, &m, &addrs(&[("main::1", 0x20)]), None));
     assert!(result.is_err(), "const-source IntToPtr must panic loudly");
 }
 
@@ -2267,6 +2271,7 @@ fn sext_i1_to_i8_zero_fills_not_sign_fills() {
             ("main::2", 0x21),
             ("main::3", 0x22),
         ]),
+        None,
     );
     assert!(
         asm.contains("MOVFF 0x021, 0x022"),

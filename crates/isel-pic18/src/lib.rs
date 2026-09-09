@@ -4942,8 +4942,18 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
     }
 }
 
-pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
-    select_with_locs(device, m, addrs).0
+/// The low-priority ISR's context-save area base (`Some` only in priority
+/// mode: the module holds both a high- and a low-priority ISR). `None`
+/// in compatibility mode, where the single handler uses the device's fixed
+/// save block. Must agree with `alloc`'s layout for the same module: a
+/// low ISR with `None` (or `Some` without both priorities) panics below.
+pub fn select(
+    device: &Device,
+    m: &Module,
+    addrs: &HashMap<String, u16>,
+    isr_low_save: Option<u16>,
+) -> String {
+    select_with_locs(device, m, addrs, isr_low_save).0
 }
 
 /// `select` plus a parallel per-line source-location vector, index-aligned
@@ -4954,6 +4964,7 @@ pub fn select_with_locs(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
+    isr_low_save: Option<u16>,
 ) -> (String, Vec<Option<SrcLoc>>) {
     let (common_lo, _) = device
         .fixed_retval
@@ -4990,16 +5001,57 @@ pub fn select_with_locs(
     // Every pointer reg in the module, folded once up front; later tasks'
     // pointer emitters consume it via `Gen::resolved_for`.
     let resolved = resolve_pointers(m);
-    // At most one ISR in single-vector mode (docs/29 §2). The vector entry
-    // is the ISR body itself: hardware jumps to 0x0008, so the ISR emits
-    // first at that address, before ordinary functions.
-    let isr_count = m.funcs.iter().filter(|f| f.isr).count();
+    // Priority ISRs (epic-cc#346): at most one handler per vector. A lone
+    // handler of any priority keeps the P5 compatibility wiring (body at
+    // the 0x0008 vector, fixed save block); a high/low pair uses priority
+    // wiring (GOTO stubs at both vectors, floating bodies, the low ISR on
+    // its own save area). Two bodies cannot share one vector entry, so a
+    // body-at-vector layout only exists for the lone-ISR case.
+    let hi_isrs: Vec<&Func> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr && f.irq_priority == 1)
+        .collect();
+    let lo_isrs: Vec<&Func> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr && f.irq_priority != 1)
+        .collect();
     assert!(
-        isr_count <= 1,
-        "isel-pic18: {isr_count} interrupt handlers, single-vector compatibility mode supports at most 1 (multiple ISRs not yet supported; see the P5 plan ruling)"
+        hi_isrs.len() <= 1 && lo_isrs.len() <= 1,
+        "isel-pic18: at most one high- and one low-priority interrupt handler (found {} high, {} low)",
+        hi_isrs.len(),
+        lo_isrs.len()
+    );
+    let priority_mode = !hi_isrs.is_empty() && !lo_isrs.is_empty();
+    assert!(
+        isr_low_save.is_some() == priority_mode,
+        "isel-pic18: low save area must be present exactly in priority mode (both priorities present)"
     );
     let mut funcs: Vec<&Func> = m.funcs.iter().collect();
-    funcs.sort_by_key(|f| !f.isr); // ISR first, then ordinary functions
+    // High ISR first, then low ISR, then ordinary functions.
+    funcs.sort_by_key(|f| (!f.isr, f.irq_priority != 1));
+    // Priority-mode vectors are GOTO stubs: the two bodies cannot both sit
+    // at fixed vector addresses (either body overflows the 16-byte vector
+    // gap), so the stubs dispatch to the floating bodies below. The lone
+    // ISR keeps the historical body-at-vector layout, emitted in the loop.
+    if priority_mode {
+        let vectors = device
+            .interrupt_vectors
+            .get(..2)
+            .expect("isel-pic18: priority ISRs need two interrupt vectors");
+        for (isr, vector) in [
+            (hi_isrs[0].name.as_str(), vectors[0]),
+            (lo_isrs[0].name.as_str(), vectors[1]),
+        ] {
+            out.push(format!("    org 0x{vector:04X}"));
+            locs.push(None);
+            out.push(format!("    goto {isr}"));
+            locs.push(None);
+        }
+        out.push(String::new());
+        locs.push(None);
+    }
     for f in funcs {
         // the runtime routines: a runtime routine (or its `_isr` copy) emits its recipe body
         // directly: its entry block holds only the `__scr` alloca, which
@@ -5088,12 +5140,13 @@ pub fn select_with_locs(
             locs.push(None);
             continue;
         }
-        if f.isr {
+        if f.isr && !priority_mode {
             // The vector entry at 0x0008 IS the ISR body (the hardware
             // jumps there with GIE cleared; no GOTO indirection, matching
             // PIC14's vector-as-entry convention). `__start`'s reset GOTO
             // at 0x0000 reaches it regardless: PIC18 GOTO/CALL are absolute
-            // 20-bit.
+            // 20-bit. Priority mode uses GOTO stubs instead (emitted
+            // above), so the bodies float.
             out.push("    org 0x0008".to_string());
             locs.push(None);
         }
@@ -5149,27 +5202,65 @@ pub fn select_with_locs(
         for (bi, b) in f.blocks.iter().enumerate() {
             g.emit_label(&labels[&b.label]);
             if bi == 0 && f.isr {
-                // Saves the preempted main state after the vector entry: the in-flight
-                // return value (an ISR call would clobber it), STATUS/BSR/FSRn (banked
-                // and pointer work clobbers them), and TBLPTR (a torn mid-setup pointer
-                // would misread). W saves last via `MOVWF`, which touches nothing, so
-                // the interrupted W stays intact through the sequence.
-                for (src, dst) in [
-                    (common_lo, common_lo + 12),
-                    (common_lo + 1, common_lo + 13),
-                    (common_lo + 2, common_lo + 14),
-                    (common_lo + 3, common_lo + 15),
-                    (0xFD8, common_lo + 1), // STATUS
-                    (0xFE0, common_lo + 2), // BSR
-                    (0xFE9, common_lo + 3), // FSR0L
-                    (0xFEA, common_lo + 4), // FSR0H
-                    (0xFF6, common_lo + 5), // TBLPTRL
-                    (0xFF7, common_lo + 6), // TBLPTRH
-                    (0xFF8, common_lo + 7), // TBLPTRU
-                ] {
+                // The ISR save prologue, right after the vector entry at
+                // 0x0008. The preempted main's live state this saves:
+                //   - the in-flight return value (0x0000-0x0003): an ISR
+                //     that itself calls a value-returning function would
+                //     clobber it (PIC14 M13's identical hazard)
+                //   - STATUS/BSR/FSR0L/FSR0H: the ISR body's own banked
+                //     access and FSR0 pointer work would clobber them
+                //   - TBLPTRU/H/L: a const read is a multi-instruction
+                //     setup, so an interrupt taken mid-setup leaves a torn
+                //     pointer the ISR body's own const reads would misread
+                // W is saved LAST via MOVWF (which clobbers nothing), so
+                // the preempted main's W is intact until the very last
+                // save instruction.
+                // The low ISR in priority mode saves to its own 12-byte
+                // area (`alloc`'s `isr_low_save`, below the low frames):
+                // the same snapshot set, but W gets a dedicated slot at
+                // the block base. (The fixed block doubles its W slot as
+                // the FSR0H snapshot slot; the new area does not repeat
+                // that overlap.)
+                let low_save = priority_mode && f.irq_priority != 1;
+                let saves: [(u16, u16); 11] = if low_save {
+                    let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
+                    [
+                        (common_lo, s + 8),
+                        (common_lo + 1, s + 9),
+                        (common_lo + 2, s + 10),
+                        (common_lo + 3, s + 11),
+                        (0xFD8, s + 1), // STATUS
+                        (0xFE0, s + 2), // BSR
+                        (0xFE9, s + 3), // FSR0L
+                        (0xFEA, s + 4), // FSR0H
+                        (0xFF6, s + 5), // TBLPTRL
+                        (0xFF7, s + 6), // TBLPTRH
+                        (0xFF8, s + 7), // TBLPTRU
+                    ]
+                } else {
+                    [
+                        (common_lo, common_lo + 12),
+                        (common_lo + 1, common_lo + 13),
+                        (common_lo + 2, common_lo + 14),
+                        (common_lo + 3, common_lo + 15),
+                        (0xFD8, common_lo + 1), // STATUS
+                        (0xFE0, common_lo + 2), // BSR
+                        (0xFE9, common_lo + 3), // FSR0L
+                        (0xFEA, common_lo + 4), // FSR0H
+                        (0xFF6, common_lo + 5), // TBLPTRL
+                        (0xFF7, common_lo + 6), // TBLPTRH
+                        (0xFF8, common_lo + 7), // TBLPTRU
+                    ]
+                };
+                for (src, dst) in saves {
                     g.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
                 }
-                g.emit("    MOVWF 0x0004,A".to_string()); // W, last
+                if low_save {
+                    let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
+                    g.emit(format!("    MOVWF 0x{s:03X},A")); // W, last
+                } else {
+                    g.emit("    MOVWF 0x0004,A".to_string()); // W, last
+                }
             }
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
@@ -5259,23 +5350,49 @@ pub fn select_with_locs(
                     // MOVF sets Z/N from the moved value (the one accepted
                     // flag loss, same as PIC14's W-last convention). The
                     // retval snapshot is restored first, then the SFRs
-                    // (reverse of the prologue), STATUS, and W last.
-                    for (src, dst) in [
-                        (common_lo + 15, common_lo + 3),
-                        (common_lo + 14, common_lo + 2),
-                        (common_lo + 13, common_lo + 1),
-                        (common_lo + 12, common_lo),
-                        (common_lo + 7, 0xFF8), // TBLPTRU
-                        (common_lo + 6, 0xFF7), // TBLPTRH
-                        (common_lo + 5, 0xFF6), // TBLPTRL
-                        (common_lo + 4, 0xFEA), // FSR0H
-                        (common_lo + 3, 0xFE9), // FSR0L
-                        (common_lo + 2, 0xFE0), // BSR
-                        (common_lo + 1, 0xFD8), // STATUS
-                    ] {
+                    // (reverse of the prologue), STATUS, and W last. The
+                    // low ISR in priority mode restores from its own area
+                    // (mirror of its prologue above).
+                    let low_save = priority_mode && f.irq_priority != 1;
+                    let restores: [(u16, u16); 11] = if low_save {
+                        let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
+                        [
+                            (s + 11, common_lo + 3),
+                            (s + 10, common_lo + 2),
+                            (s + 9, common_lo + 1),
+                            (s + 8, common_lo),
+                            (s + 7, 0xFF8), // TBLPTRU
+                            (s + 6, 0xFF7), // TBLPTRH
+                            (s + 5, 0xFF6), // TBLPTRL
+                            (s + 4, 0xFEA), // FSR0H
+                            (s + 3, 0xFE9), // FSR0L
+                            (s + 2, 0xFE0), // BSR
+                            (s + 1, 0xFD8), // STATUS
+                        ]
+                    } else {
+                        [
+                            (common_lo + 15, common_lo + 3),
+                            (common_lo + 14, common_lo + 2),
+                            (common_lo + 13, common_lo + 1),
+                            (common_lo + 12, common_lo),
+                            (common_lo + 7, 0xFF8), // TBLPTRU
+                            (common_lo + 6, 0xFF7), // TBLPTRH
+                            (common_lo + 5, 0xFF6), // TBLPTRL
+                            (common_lo + 4, 0xFEA), // FSR0H
+                            (common_lo + 3, 0xFE9), // FSR0L
+                            (common_lo + 2, 0xFE0), // BSR
+                            (common_lo + 1, 0xFD8), // STATUS
+                        ]
+                    };
+                    for (src, dst) in restores {
                         g.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
                     }
-                    g.emit("    MOVF 0x0004, W, A".to_string()); // W last
+                    if low_save {
+                        let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
+                        g.emit(format!("    MOVF 0x{s:03X}, W, A")); // W last
+                    } else {
+                        g.emit("    MOVF 0x0004, W, A".to_string()); // W last
+                    }
                     g.emit("    RETFIE".to_string());
                 }
                 Some(Inst::Ret(Some(_), _)) if g.isr => {
