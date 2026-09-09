@@ -8,17 +8,22 @@
 > **No real consumer has appeared yet** (no PlatformIO board JSON, no
 > epic-hal baseline-core crate); this document was requested directly,
 > ahead of that condition, as a deliberate choice to have the design
-> ready rather than wait. §4 lists what user approval does not close:
-> D-2's resolution is a paper argument from the datasheet's bit-level
-> semantics, not yet simulator-proven (P1's acceptance criteria are
-> written to close that gap first); independent review, per this
-> repo's own review-gate norm, has not happened yet, and
-> `docs/33-pic14e-port-design.md`'s own history is the standing
-> caution that user approval and independent review can disagree: its
-> revision 1 and 2 were held on review despite looking finished, over
-> an uncited claim about OPTION/TRIS that turned out to be wrong. Every
-> architectural claim below cites a `DS41236E` page number except where
-> marked `[VERIFY]`.
+> ready rather than wait. An independent review pass ran on 2026-09-09
+> (per this repo's review-gate norm) and caught one substantive error:
+> D-2's original wording claimed its ordering-hazard fix followed the
+> same pattern `crates/banking` already uses for RP1:RP0/BSR, which is
+> false (`crates/banking` never touches `INDF`/`FSR`); D-2 has been
+> corrected in place to point at the real precedent, PIC14's
+> unconditional IRP handling inside `isel`. §4 lists what is still
+> open: D-2's corrected resolution is a paper argument from the
+> datasheet's bit-level semantics and the existing PIC14 code, not yet
+> simulator-proven (P1's acceptance criteria are written to close that
+> gap first). `docs/33-pic14e-port-design.md`'s own history remains the
+> standing caution that a first pass, even a reviewed one, can still
+> miss things: its revision 1 and 2 were held over an uncited claim
+> about OPTION/TRIS that turned out to be wrong. Every architectural
+> claim below cites a `DS41236E` page number except where marked
+> `[VERIFY]`.
 
 **Target:** the PIC12F508/PIC12F509 family (PIC16F505 shares the same
 core (33-instruction baseline ISA, 12-bit instruction word, 2-level
@@ -80,21 +85,32 @@ plumbing already makes device-parametric, or a net simplification
 
 ### What is adapted
 
-- `banking`: needs a fourth distinct regime (RP1:RP0 text-pass for
-  PIC14, BSR/MOVLB for PIC18 and PIC14E, now FSR-bank-bits for
-  baseline). Structurally still "a post-isel pass that inserts bank
-  setup before file-register touches," per the precedent in `docs/33`
-  D-1, but the register it writes and the interaction with pointer
-  code (D-2) are new.
 - `asm`/`sim`: new encoder and simulator core for the 12-bit word and
   the 33-instruction set (this is the same shape of work `docs/29` P1
   and `docs/33` P1 did for their cores).
-- `callgraph`: no code change anticipated, `stack_depth` is already a
-  per-device field; a baseline device just sets it to 2. **[VERIFY]**
-  by reading `callgraph`'s actual depth-check code before assuming
-  this, not just the field's existence.
+- `callgraph`: no code change needed. Confirmed by reading the actual
+  call site, not just the field's existence:
+  `crates/driver/src/main.rs:301` calls
+  `callgraph::check_depth(&cg, device.stack_depth as usize)`, already
+  fully device-parametric. A baseline device just sets `stack_depth`
+  to 2 and the existing rejection path applies unchanged.
 - `driver`: a third backend-selection arm, same shape as adding
   PIC14E's arm was in `docs/33` D-3/D-4.
+
+`crates/banking` likely needs **no** baseline-specific change at all,
+corrected from an earlier draft of this section that proposed a
+fourth banking regime there (an independent review caught that this
+contradicted D-2's actual resolution, see D-2). PIC14 itself already
+splits bank-select handling in two: `crates/banking` tracks RP1:RP0
+for *direct* accesses only, while the IRP bit for *indirect*
+(FSR-based) accesses is re-emitted unconditionally, with no tracking,
+entirely inside `isel` (`crates/isel/src/lib.rs:809-870`). Baseline
+has no such split; one register, `FSR`, carries the bank bits for
+both addressing modes, so D-2 resolves it uniformly and
+unconditionally inside `isel-pic-baseline`, the same place PIC14
+already puts its own unconditional case. `crates/banking`'s role, if
+any, is not yet known and should be revisited once P1/P2 show whether
+anything is left for it to do on this core.
 
 ### What is new
 
@@ -103,8 +119,8 @@ plumbing already makes device-parametric, or a net simplification
   `isel-pic14e`'s relationship to `iselcore` (shares `Slot`, `ssa_key`,
   `Base`, `resolve_pointers`; does not share instruction-emission code
   with either, same as the existing three backends don't share it with
-  each other).
-- The FSR-bank-bit banking pass (D-2).
+  each other). Owns D-2's unconditional `FSR` bank-bit reassertion,
+  the same way `isel` owns PIC14's unconditional IRP reassertion.
 - A device profile for `p12f509` (and, if scoped in, `p12f508`,
   `p16f505`).
 
@@ -168,23 +184,39 @@ to `BANKSEL`/`MOVLB`:
    the same shape of problem the existing PIC14 `banking` pass already
    solves: `FSR<6:5>` is one piece of "last known bank" state read by
    *both* addressing modes, so a direct access to bank B followed by
-   an indirect access through a pointer that expects bank A needs the
-   banking pass to re-assert bank A's bits (via `BCF`/`BSF`) before
-   the `INDF` touch, exactly as today's pass re-asserts `RP1:RP0`
-   before a cross-bank direct access. Same lattice-style live-bank
-   tracking, narrower state (2-3 bits instead of 2), one more
-   instruction class (`INDF`/pointer touches) added to what triggers a
-   re-assert.
+   an indirect access through a pointer that expects bank A needs bank
+   A's bits re-asserted (via `BCF`/`BSF`) before the `INDF` touch.
+   **Corrected in this pass, an independent review caught the original
+   wording:** the precedent for this is not `crates/banking`'s
+   RP1:RP0/BSR tracking (`crates/banking` never touches `INDF`/`FSR`
+   at all, checked directly). The real precedent is classic PIC14's
+   IRP handling, entirely inside `isel`
+   (`crates/isel/src/lib.rs:809-870`, `emit_fsr_to`/
+   `emit_fsr_indirect`): IRP is re-emitted **unconditionally on every
+   FSR setup**, direct or indirect, with no dataflow tracking at all
+   ("IRP is set on EVERY FSR setup", per that code's own comment).
+   Baseline should copy that strategy exactly, inside
+   `isel-pic-baseline`, not invent a new tracked/lattice mechanism in
+   `banking`: emit `BCF`/`BSF FSR,5` (and `,6` on the 16F505) before
+   every direct access to a non-zero bank and before every `INDF`
+   touch, unconditionally, the same way PIC14 never bothers proving a
+   reassert was redundant. This is simpler and lower-risk than the
+   tracked approach the previous wording proposed, and it is what both
+   existing cores that already solved an equivalent problem actually
+   do, not an analogy to what they do.
 
-Net effect: `isel-pic-baseline` never emits a masked FSR write and
-never needs new interference analysis. The banking pass gets a new
-"kind" of access to track (indirect, via `INDF`) alongside the direct
-accesses PIC14's pass already tracks, and re-asserts bank bits with
-`BCF`/`BSF` before either kind when the tracked state disagrees.
+Net effect: `isel-pic-baseline` never emits a masked FSR write, never
+needs new interference analysis, and never needs a new tracked-state
+mechanism in `crates/banking` at all. `crates/banking` for baseline
+may end up doing nothing D-1's "adapted" framing implied; revisit
+that framing once P1/P2 show whether `banking` has any role here
+beyond what `isel-pic-baseline` handles inline, PIC14's own
+IRP-in-isel precedent suggests it might not.
 **Not yet re-verified against a working prototype**: this is a
-paper resolution from the datasheet's bit-level operation semantics,
-not a simulator-confirmed one; treat as high-confidence, not proven,
-until P1's hand-written `.asm` tests exercise the sequence.
+paper resolution from the datasheet's bit-level operation semantics
+and the existing PIC14 precedent, not a simulator-confirmed one;
+treat as high-confidence, not proven, until P1's hand-written `.asm`
+tests exercise the sequence.
 
 ### D-3: Device profile sketch, corrected as datasheet facts, not final
 
@@ -260,7 +292,7 @@ and `docs/33` used, front-loaded on de-risking:
 |---|---|---|
 | P0 | Device TOML (`p12f509`, `[[VERIFY]]`-cleared per D-3), firewall-only `Core::PicBaseline` | Nothing |
 | P1 | `asm` encoder + `sim` core for the 33-instruction, 12-bit-word ISA, hand-written `.asm` only, including a P1 acceptance test that exercises D-2's `BCF`/`BSF FSR,5/6` sequencing directly (a direct access to bank 1 followed by an indirect access through a live pointer into bank 0, and the reverse) before any codegen depends on it | P0 |
-| P2 | Integer spine + the FSR-bank-bits banking pass (D-2's live-bank tracking) | P1 |
+| P2 | Integer spine + `isel-pic-baseline`'s unconditional `FSR` bank-bit reassertion (D-2) | P1 |
 | P3 | Pointers/arrays, natural `FSR`-as-flat-address representation per D-2 item 2 | P2 |
 | P4 | `const` in flash via `RETLW`, respecting the 256-word ceiling (D-5) | P2 |
 | P5 | ~~Interrupts~~: does not exist on this core, phase dropped entirely | n/a |
@@ -314,8 +346,16 @@ Still open:
 3. D-3's device-profile `[VERIFY]` items (config word address, the
    `common_ram` field's semantics for this core), blocks P0, not the
    overall design.
-4. `docs/33`'s revision history is the cautionary precedent for this
+4. P7's `[VERIFY]`: with 25-41 bytes of GPR total, does IEEE-754
+   single-precision soft-float have anywhere to live at all? This is
+   a real, unresolved feasibility question the phase table raises and
+   does not answer; P7 may turn out to be a documented non-goal
+   instead of a phase. Should be settled by P6, not deferred to P7
+   itself.
+5. `docs/33`'s revision history is the cautionary precedent for this
    whole document: two revisions were held on independent review
    before approval, for a document written by the same process this
-   one just went through once. Budget for at least one more pass here
-   before treating anything above as settled.
+   one just went through once. This document's own first independent
+   review pass (2026-09-09) already caught one such analogy error in
+   D-2 (corrected in place, see D-2); budget for at least one more
+   pass before treating anything above as settled.
