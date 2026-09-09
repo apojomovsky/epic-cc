@@ -355,15 +355,13 @@ fn main() {
             let (asm, l) = peephole::optimize_with_locs(&asm, &locs);
             locs = l;
 
-            // The page assignment ran on pre-banking sizes; the banking pass
-            // inserts BANKSEL/MOVLB words that grow the text. Verify the
-            // FINAL layout's page fit: a function that grew across a page
-            // boundary has no `.org` anchor, so the assembler's backward-.org
-            // panic would never fire and it would silently straddle (label in
-            // the lower page, tail in the upper page, intra-function GOTOs
-            // misbranching). Panics instead, before assembling (epic-cc#17).
-            // PIC14/PIC14E (both page their GOTOs via PCLATH; PIC18's 20-bit
-            // GOTO/CALL reach the whole 32KB flash).
+            // The page assignment ran on pre-banking sizes; banking inserts
+            // BANKSEL/MOVLB words that grow the text. Verify the FINAL layout's
+            // page fit: a function grown across a page boundary has no `.org`
+            // anchor, so the assembler's backward-.org panic never fires and it
+            // silently straddles (label below, tail above, GOTOs misbranch).
+            // Panics here instead, before assembling (epic-cc#17). PIC14/PIC14E
+            // page GOTOs via PCLATH; PIC18's 20-bit GOTO/CALL reach all flash.
             if device.core == device::Core::Pic14 {
                 isel::verify_page_fit(&m, &asm);
             } else {

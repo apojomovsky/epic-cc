@@ -3558,15 +3558,11 @@ impl<'m> Gen<'m> {
                 self.emit("    RETURN".to_string());
             }
             // The nine soft-float routines: hand-written IEEE754 recipes,
-            // round-to-nearest-even. The float format: 4 bytes LE: b0 =
-            // mantissa LSB, b1, b2 = mantissa MSB + the exponent's LSB (bit
-            // 7 of b2), b3 = sign | exponent[7:1]; the 24-bit mantissa =
-            // (b2 & 0x7F) << 16 | b1 << 8 | b0, plus the implicit 0x800000
-            // when the 8-bit biased exponent ((b3 & 0x7F) << 1 | (b2 >> 7))
-            // is nonzero. Args arrive in the routine's param slots; the
-            // result goes to the fixed retval region (0x71-0x74); working
-            // state lives in `__scr` at the scratch-contract offsets. All
-            // slots stay inside one GPR bank (any bank), the loops are
+            // round-to-nearest-even on 4-byte LE floats (b3 = sign |
+            // exponent[7:1], mantissa = implicit 0x800000 | (b2 & 0x7F) << 16
+            // | b1 << 8 | b0 when the biased exponent is nonzero). Args arrive
+            // in the param slots; the result goes to retval (0x71-0x74),
+            // working state to `__scr`. One GPR bank throughout, loops are
             // skip-sensitive (epic-cc#6).
             "__add_f32" | "__sub_f32" => {
                 let pa = self.slot_addr(name, "a").direct();
