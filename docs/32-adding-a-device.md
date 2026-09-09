@@ -37,7 +37,9 @@ firewall removal). PIC14E (Enhanced Mid-range) is exactly such a Path B
 port: its design of record is `docs/33-pic14e-port-design.md`, and its
 P0 phase landed the 193x device TOMLs; P1 added the asm encoder and sim
 core; P2 added the integer-spine backend and BSR banking, ending the
-driver firewall.
+driver firewall. The PIC baseline port follows the same shape: its design
+of record is `docs/37-pic-baseline-port-design.md`, and its P0 landed the
+`p12f509` TOML behind the driver firewall.
 
 Everything below assumes Path A.
 

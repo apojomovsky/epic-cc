@@ -127,6 +127,12 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
                 base
             }
         }
+        device::Core::PicBaseline => {
+            panic!(
+                "report: {} is pic-baseline; no baseline size model yet (docs/37)",
+                device.name
+            )
+        }
     }
 }
 
@@ -146,6 +152,12 @@ pub fn fixed_total(device: &Device) -> u16 {
                 .fixed_retval
                 .expect("PIC18 devices have a fixed_retval reservation");
             hi - lo + 1
+        }
+        device::Core::PicBaseline => {
+            panic!(
+                "report: {} is pic-baseline; no baseline size model yet (docs/37)",
+                device.name
+            )
         }
     }
 }
@@ -182,6 +194,10 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         device::Core::Pic14 => "common",
         device::Core::Pic18 => "fixed",
         device::Core::Pic14e => "fixed",
+        device::Core::PicBaseline => panic!(
+            "report: {} is pic-baseline; no baseline size model yet (docs/37)",
+            device.name
+        ),
     };
     out.push_str(&format!(
         "    {fixed_name}: {fixed}/{fixed_total} bytes (fixed scratch/retval/ISR save)\n"

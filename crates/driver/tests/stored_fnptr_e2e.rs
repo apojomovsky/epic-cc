@@ -82,6 +82,7 @@ fn run_one(device_name: &str, device: &device::Device, sel: u8) {
             assert!(p.halted(), "PIC18 sel={sel} must halt");
         }
         device::Core::Pic14e => panic!("stored_fnptr e2e: pic14e not implemented"),
+        device::Core::PicBaseline => panic!("stored_fnptr e2e: pic-baseline not implemented"),
     }
     let _ = std::fs::remove_file(&hex_path);
 }

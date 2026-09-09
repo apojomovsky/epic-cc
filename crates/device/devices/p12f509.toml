@@ -1,0 +1,77 @@
+# PIC12F509: baseline (12-bit instruction word) core, 1024 x 12-bit flash,
+# 41 GPR bytes in three regions. First baseline part, landed behind the
+# driver firewall; design of record is docs/37-pic-baseline-port-design.md.
+# Hand-transcribed from the datasheets and cross-checked against gputils
+# 1.5.2 (12f509_g.lkr, p12f509.inc); no DFP pack feeds gen-device for this
+# part, hence the datasheet tier below.
+name = "p12f509"
+core = "pic-baseline"
+flash_words = 1024
+# Bank 0 GPR 0x10-0x1F, bank 1 GPR 0x30-0x3F (DS41236E Figure 4-4; gputils
+# DATABANKs gpr0/gpr1 agree). 0x20-0x2F is the protected bank-1 mirror of
+# the 0x00-0x0F block and must stay out of ram_banks.
+ram_banks = [[0x0010, 0x001F], [0x0030, 0x003F]]
+# The 9 unbanked GPR at 0x07-0x0F are one physical cell visible from both
+# banks (gputils: unprotected SHAREBANK gprnobnk). This is the allocatable
+# BANKSEL-free window the field means everywhere else; it is NOT the SFR
+# mirror at 0x00-0x06, which is core architecture (bank_of's mirrored
+# block), not device data. Resolves docs/37 D-3's [VERIFY]: the sketch's
+# common_ram = [0x00, 0x06] would mark SFR space allocatable.
+common_ram = [0x0007, 0x000F]
+# FSR<5> selects the bank for direct and indirect addressing alike
+# (DS41236E Figures 4-7/4-8). Unimplemented on the 508, two bits on the
+# 16F505. Consumed by the BCF/BSF bank sequencing from docs/37 D-2 on.
+fsr_bank_bits = 1
+# "2-deep, 12-bit wide hardware PUSH/POP stack" (DS41236E section 4.8,
+# page 27); the existing callgraph rejection path applies unchanged.
+stack_depth = 2
+# No interrupt feature on this core (DS41236E section 7.0): no vector,
+# no RETFIE.
+interrupt_vectors = []
+
+[provenance]
+tier = "datasheet"
+document = "DS41236E (PIC12F508/509/16F505 Data Sheet) + DS41227B (Memory Programming Specification)"
+ticket = "epic-cc#323"
+
+[config]
+# Not user addressable at runtime. DS41227B section 2.3 places the word at
+# 0x7FF in the 509's config memory space; the HEX convention of MPASM and
+# gputils (p12f509.inc `_CONFIG EQU 0FFFh`, .lkr `.config 0xFFF`, gpasm
+# 1.5.2 emits the record at byte 0x1FFE) is word 0xFFF. Resolves docs/37
+# D-3's other [VERIFY].
+base_byte_addr = 0x1FFE
+num_bytes = 2
+# 12-bit word, bits 11-5 unimplemented (read 1), so erased = 0x0FFF.
+erased_baseline = [0xFF, 0x0F]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 0
+mask = 0x03
+shift = 0
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "intosc", bits = 2 }, { name = "extrc", bits = 3 }]
+
+[[config.fields]]
+name = "wdt"
+byte_offset = 0
+mask = 0x04
+shift = 2
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "cp"
+byte_offset = 0
+mask = 0x08
+shift = 3
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "mclre"
+byte_offset = 0
+mask = 0x10
+shift = 4
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]

@@ -39,6 +39,10 @@ pub fn emit(device: &Device, program_words: &[u16], config_bytes: Option<&[u8]>)
                 (device.config.base_byte_addr, &config_words),
             ])
         }
+        (Core::PicBaseline, _) => panic!(
+            "hex: {} is pic-baseline; baseline hex emission lands with the backend (docs/37)",
+            device.name
+        ),
         _ => asm::to_hex(program_words),
     }
 }

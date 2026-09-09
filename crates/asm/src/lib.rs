@@ -614,6 +614,10 @@ pub fn assemble_words(device: &Device, src: &str) -> Vec<u16> {
         device::Core::Pic14 => assemble(src),
         device::Core::Pic18 => assemble_pic18(src),
         device::Core::Pic14e => assemble_pic14e(src),
+        device::Core::PicBaseline => panic!(
+            "asm: {} is pic-baseline; its encoder lands in P1 (docs/37), refusing to emit another core's words",
+            device.name
+        ),
     };
     assert!(
         words.len() as u32 <= device.flash_words,

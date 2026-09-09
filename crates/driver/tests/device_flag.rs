@@ -308,3 +308,32 @@ void main(void) { }
     let _ = std::fs::remove_file(&tmp);
     let _ = std::fs::remove_file(&out14);
 }
+
+#[test]
+fn device_flag_refuses_pic_baseline_at_the_firewall() {
+    // P0 of the baseline port ships the device TOML behind the driver
+    // firewall (epic-cc#323): exit 1 with the same "no backend yet"
+    // message shape the pic14e core refused with before its P2.
+    let out = tmp_hex("p12f509-firewall");
+    let fixture = fixture_add();
+    let res = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            fixture.as_str(),
+            "-o",
+            out.to_str().unwrap(),
+            "--device",
+            "p12f509",
+        ])
+        .output()
+        .expect("run driver");
+    assert!(
+        !res.status.success(),
+        "driver must refuse pic-baseline, not compile"
+    );
+    assert!(
+        String::from_utf8_lossy(&res.stderr).contains("no backend yet"),
+        "expected the firewall message: {}",
+        String::from_utf8_lossy(&res.stderr)
+    );
+    let _ = std::fs::remove_file(&out);
+}

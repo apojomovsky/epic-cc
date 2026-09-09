@@ -72,6 +72,7 @@ fn run_fixture(
                 assert!(sim.halted(), "halted {device_name} flag={flag}");
             }
             device::Core::Pic14e => panic!("pic14e core not implemented"),
+            device::Core::PicBaseline => panic!("pic-baseline core not implemented"),
         }
     }
     let _ = std::fs::remove_file(&hex_path);

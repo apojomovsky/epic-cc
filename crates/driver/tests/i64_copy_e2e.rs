@@ -74,6 +74,7 @@ fn run_one(device_name: &str, device: &device::Device) {
             assert!(p.halted(), "PIC18 must halt");
         }
         device::Core::Pic14e => panic!("i64_copy e2e: pic14e not implemented"),
+        device::Core::PicBaseline => panic!("i64_copy e2e: pic-baseline not implemented"),
     }
     let _ = std::fs::remove_file(&hex_path);
 }

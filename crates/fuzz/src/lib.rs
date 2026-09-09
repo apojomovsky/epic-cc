@@ -2535,6 +2535,10 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 isel_pic14e::verify_page_fit(&m, &asm);
                 asm::assemble_file_to_hex(device, &asm)
             }
+            device::Core::PicBaseline => panic!(
+                "fuzz: {} is pic-baseline; no baseline differential harness until the backend lands (docs/37)",
+                device.name
+            ),
         };
         (hex, layout)
     }))
@@ -2618,6 +2622,10 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
+        device::Core::PicBaseline => panic!(
+            "fuzz: {} is pic-baseline; no baseline simulator until P1 (docs/37)",
+            device.name
+        ),
     };
     Ok(checksum)
 }
@@ -2709,6 +2717,10 @@ fn run_pic(
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
+        device::Core::PicBaseline => panic!(
+            "fuzz: {} is pic-baseline; no baseline simulator until P1 (docs/37)",
+            device.name
+        ),
     };
     Ok(checksum)
 }
@@ -3288,6 +3300,7 @@ fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
         device::Core::Pic18 => &CACHE_P18,
         device::Core::Pic14 => &CACHE_P14,
         device::Core::Pic14e => &CACHE_P14E,
+        device::Core::PicBaseline => panic!("fuzz: no clang cache arm for pic-baseline (docs/37)"),
     };
     cache.get_or_init(locate).clone()
 }

@@ -97,7 +97,7 @@ fn bank_diff(ours: &[(u16, u16)], theirs: &[(u16, u16)]) -> Vec<String> {
 fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
     let mut problems = Vec::new();
     match dev.core {
-        Core::Pic14 | Core::Pic14e => {
+        Core::Pic14 | Core::Pic14e | Core::PicBaseline => {
             // Banked GPR and the common window are compared apart. `isel`
             // derives `fsr_window` from where that boundary sits, so a merged
             // total would accept a bank that grew into the common range.
@@ -260,7 +260,9 @@ fn flash_words_matches_gputils_for_every_device() {
         // org counts words on PIC14 and bytes on PIC18, so the last valid
         // address and the first bad one differ per core.
         let (last, past) = match dev.core {
-            Core::Pic14 | Core::Pic14e => (dev.flash_words - 1, dev.flash_words),
+            Core::Pic14 | Core::Pic14e | Core::PicBaseline => {
+                (dev.flash_words - 1, dev.flash_words)
+            }
             Core::Pic18 => (dev.flash_words * 2 - 2, dev.flash_words * 2),
         };
 
