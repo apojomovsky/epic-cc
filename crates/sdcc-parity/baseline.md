@@ -51,12 +51,18 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | recursion | p16f877a | - | - | - | - | - | - | SDCC-BUG (epic=0x78 sdcc=0x1; SDCC static-overlay recursion, gpsim-confirmed) |
 | recursion | p18f4550 | 60 | 145 | 14 | 42 | 120 | 6333 | PASS |
 | recursion | p16f1938 | - | - | - | - | - | - | SDCC-BUG (epic=0x78 sdcc=0x1; SDCC static-overlay recursion, gpsim-confirmed) |
-| printf-f | p16f877a | 14 | 231 | 3 | 11 | 12 | 318 | PASS (probe is a placeholder; the real %f probe is the PIC18 sub-epic's) |
-| printf-f | p18f4550 | 13 | 102 | 5 | 18 | 7 | 6212 | PASS (placeholder, as above) |
-| printf-f | p16f1938 | 13 | 195 | 3 | 15 | 11 | 278 | PASS (placeholder, as above) |
+| printf-f | p16f877a | - | - | - | - | - | - | SDCC-LIMIT (no libc on pic14, manual 4.9.8; epic folds 0x41) |
+| printf-f | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x41 sdcc=0x0; SDCC links and runs, but its putchar never observably fires through the portable sink; SDCC %f core verified via its sprintf path) |
+| printf-f | p16f1938 | - | - | - | - | - | - | SDCC-LIMIT (no libc on pic14e; epic folds 0x41) |
+| eeprom-p14 | p16f877a | 65 | 482 | 7 | 19 | 63 | 775 | PASS |
+| eeprom-p18 | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x80 sdcc=0x7f; SDCC inttoptr misses the EEPROM register window, same defect class as malloc) |
+| eeprom-p14e | p16f1938 | 56 | 404 | 7 | 20 | 54 | 674 | PASS |
+| constptr | p16f877a | 48 | 289 | 7 | 21 | 46 | 385 | PASS |
+| constptr | p18f4550 | 71 | 216 | 10 | 22 | 58 | 6269 | PASS |
+| constptr | p16f1938 | 48 | 246 | 7 | 22 | 46 | 338 | PASS |
 
-aggregate over 26 comparable rows: flash ratio 0.151, RAM ratio 0.301,
-cycle ratio 0.027 (epic-cc/SDCC, geometric mean).
+aggregate over 28 comparable rows: flash ratio 0.167, RAM ratio 0.317,
+cycle ratio 0.034 (epic-cc/SDCC, geometric mean).
 
 ## Findings
 
@@ -79,14 +85,32 @@ cycle ratio 0.027 (epic-cc/SDCC, geometric mean).
   computed jumps (SDCC's `__sdcc_call`), did not route TOS-register
   writes into the hardware stack (SDCC plants return addresses that
   way), and resolved virtual-register operands twice in d=1
-  read-modify-write ops (`MOVF POSTINC1, F` popped twice). All four are
-  fixed and the rows they poisoned now pass.
 - **Genuine SDCC bugs remain arbitrated** in `sdcc-known-bugs.toml`,
   each verified under gpsim as well as our sim: SDCC's PIC18
-  generic-pointer dereference (malloc), its PIC14-family computed-call
+  generic-pointer dereference (malloc, and now the eeprom-p18 probe in
+  the same defect class), its PIC14-family computed-call
   bug (fnptr), and its PIC14-family static-overlay recursion corruption
   (recursion, the manual-documented no-hardware-stack limitation).
+- **Real surface probes replaced three placeholders.** `printf-f` now
+  formats 3.5 through `printf` into a buffer and folds the first six
+  bytes (epic-cc prints 2 fixed decimals, SDCC's `%f` prints 6; the
+  fold compares the value, not the policy). The probe's sink is spelled
+  `void putchar(char) __wparam`, SDCC pic16's prototype: the driver
+  predefines `__wparam` empty (like `__XC8`) and our libc uses the
+  same `void putchar(char)` contract, so one source compiles under
+  both compilers. `constptr` traverses a flash const table through a
+  pointer on all three cores. The EEPROM probes write two cells
+  through the EEADR/EEDATA/EECON1/EECON2 window and read them back;
+  they needed a data-EEPROM register model in the sim (one shared
+  RD/WR/unlock state machine, per-core addresses).
+- **The probes caught a real miscompile.** The shared scheduler's
+  phase 2 hoisted volatile SFR stores (`EEADR`/`EECON1`) across the
+  volatile SFR load (`EEDATA`), because its hazard model was
+  address-only: the eeprom-p14e probe read 0x7F where both compilers
+  agree 0x80 belongs. The fix marks every file access outside the
+  device's allocatable RAM as a motion barrier, so no reorder in
+  either phase can cross an SFR touch; regression tests pin it.
 - **epic-cc leads on all three axes** across the comparable corpus:
-  geometric-mean flash ratio 0.151, RAM ratio 0.301, cycle ratio 0.027.
-  The double probe (soft-float) is the heaviest row and still under
-  SDCC everywhere it runs.
+  geometric-mean flash ratio 0.167, RAM ratio 0.317, cycle ratio
+  0.034. The double probe (soft-float) is the heaviest row and still
+  under SDCC everywhere it runs.

@@ -8,9 +8,9 @@
 program = "add"
 device = "p16f877a"
 status = "pass"
-epic_flash = 18
+epic_flash = 17
 sdcc_flash = 235
-epic_cycles = 16
+epic_cycles = 15
 sdcc_cycles = 322
 
 [[row]]
@@ -116,9 +116,9 @@ sdcc_cycles = 294
 program = "i64"
 device = "p16f877a"
 status = "known-bug"
-epic_flash = 18
+epic_flash = 17
 sdcc_flash = 0
-epic_cycles = 16
+epic_cycles = 15
 sdcc_cycles = 0
 
 [[row]]
@@ -197,9 +197,9 @@ sdcc_cycles = 311
 program = "math"
 device = "p16f877a"
 status = "pass"
-epic_flash = 58
+epic_flash = 57
 sdcc_flash = 557
-epic_cycles = 120
+epic_cycles = 119
 sdcc_cycles = 1006
 
 [[row]]
@@ -224,9 +224,9 @@ sdcc_cycles = 791
 program = "fnptr"
 device = "p16f877a"
 status = "known-bug"
-epic_flash = 19
+epic_flash = 18
 sdcc_flash = 260
-epic_cycles = 16
+epic_cycles = 15
 sdcc_cycles = 347
 
 [[row]]
@@ -277,26 +277,80 @@ sdcc_cycles = 858
 [[row]]
 program = "printf-f"
 device = "p16f877a"
-status = "pass"
-epic_flash = 14
-sdcc_flash = 231
-epic_cycles = 12
-sdcc_cycles = 318
+status = "known-bug"
+epic_flash = 4994
+sdcc_flash = 0
+epic_cycles = 8273
+sdcc_cycles = 0
 
 [[row]]
 program = "printf-f"
 device = "p18f4550"
-status = "pass"
-epic_flash = 13
-sdcc_flash = 102
-epic_cycles = 7
-sdcc_cycles = 6212
+status = "known-bug"
+epic_flash = 4672
+sdcc_flash = 5035
+epic_cycles = 5976
+sdcc_cycles = 12453
 
 [[row]]
 program = "printf-f"
 device = "p16f1938"
+status = "known-bug"
+epic_flash = 4992
+sdcc_flash = 0
+epic_cycles = 8181
+sdcc_cycles = 0
+
+[[row]]
+program = "eeprom-p14"
+device = "p16f877a"
 status = "pass"
-epic_flash = 13
-sdcc_flash = 195
-epic_cycles = 11
-sdcc_cycles = 278
+epic_flash = 65
+sdcc_flash = 482
+epic_cycles = 63
+sdcc_cycles = 775
+
+[[row]]
+program = "eeprom-p18"
+device = "p18f4550"
+status = "known-bug"
+epic_flash = 55
+sdcc_flash = 415
+epic_cycles = 48
+sdcc_cycles = 6578
+
+[[row]]
+program = "eeprom-p14e"
+device = "p16f1938"
+status = "pass"
+epic_flash = 56
+sdcc_flash = 404
+epic_cycles = 54
+sdcc_cycles = 674
+
+[[row]]
+program = "constptr"
+device = "p16f877a"
+status = "pass"
+epic_flash = 48
+sdcc_flash = 289
+epic_cycles = 46
+sdcc_cycles = 385
+
+[[row]]
+program = "constptr"
+device = "p18f4550"
+status = "pass"
+epic_flash = 71
+sdcc_flash = 216
+epic_cycles = 58
+sdcc_cycles = 6269
+
+[[row]]
+program = "constptr"
+device = "p16f1938"
+status = "pass"
+epic_flash = 48
+sdcc_flash = 246
+epic_cycles = 46
+sdcc_cycles = 338

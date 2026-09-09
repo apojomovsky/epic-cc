@@ -32,6 +32,11 @@ pub struct CorpusProgram {
     pub source: String,
     /// Volatile output globals, compared by name after the run.
     pub outputs: Vec<String>,
+    /// The hand-computed value of the first output (docs/35 section 5
+    /// item 2): the arbiter on a differential mismatch and the
+    /// conformance target epic-cc must hit even where SDCC cannot run.
+    /// Every corpus output is one byte by construction.
+    pub expected: u8,
     /// Devices the program runs on, by device name (`p16f877a`). Empty
     /// means every device: most corpus programs are plain C that both
     /// compilers accept anywhere. A probe pinned to one family's SFR
@@ -245,6 +250,15 @@ fn compile_sdcc(
         device::Core::Pic14e => "libsdcce.lib".to_string(),
         _ => "libsdcc.lib".to_string(),
     };
+    // The pic16 C library (`libc18f.lib`: printf and friends) is a
+    // separate archive SDCC's own link pulls in automatically. The
+    // map-only re-link below must name it explicitly, or any program
+    // using libc (the `%f` probe) fails the re-link with an unresolved
+    // `_printf` even though SDCC's own link succeeded.
+    let clib: Option<&str> = match port {
+        "pic16" => Some("libc18f.lib"),
+        _ => None,
+    };
     // Device lib names differ per port: pic14 uses `pic16<device>.lib`
     // (e.g. pic16f877a.lib), pic16 uses `libdev<device>.lib`
     // (e.g. libdev18f4550.lib).
@@ -255,13 +269,17 @@ fn compile_sdcc(
         "pic16" => format!("libdev{sdcc_mcu}.lib"),
         _ => return Err(format!("unknown SDCC port {port}")),
     };
-    let out = Command::new(&gplink)
-        .arg(format!("-I{lib_dir}"))
+    let mut cmd = Command::new(&gplink);
+    cmd.arg(format!("-I{lib_dir}"))
         .arg(format!("-I{nonfree_dir}"))
         .args(["-w", "-r", "-m", "-o"])
         .arg(&map_hex)
         .arg(&obj)
-        .arg(&lib)
+        .arg(&lib);
+    if let Some(clib) = clib {
+        cmd.arg(clib);
+    }
+    let out = cmd
         .arg(&devlib)
         .current_dir(&dir.path)
         .output()

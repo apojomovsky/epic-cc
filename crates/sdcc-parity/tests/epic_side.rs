@@ -17,10 +17,26 @@ fn epic_side_compiles_and_runs_corpus() {
 
     let mut clean = 0usize;
     let mut failures = Vec::new();
+    let mut conformance: Vec<String> = Vec::new();
     for prog in corpus::corpus() {
         for device in [&device::PIC16F877A, &device::PIC18F4550] {
+            if !prog.runs_on(device.name) {
+                continue;
+            }
             match run_epic(&prog, device) {
                 Ok(r) => {
+                    // Conformance (docs/35 section 5 item 1): the run must
+                    // land on the hand-computed value, independent of what
+                    // SDCC does.
+                    let out = prog.outputs.first();
+                    let got = out.and_then(|o| r.outputs.get(o)).copied();
+                    if got != Some(prog.expected as u32) {
+                        conformance.push(format!(
+                            "{} on {}: {:?} != expected {:#04x}",
+                            prog.name, device.name, got, prog.expected
+                        ));
+                        continue;
+                    }
                     clean += 1;
                     eprintln!(
                         "epic {} on {}: {}w/{}B/{}cyc",
@@ -49,15 +65,20 @@ fn epic_side_compiles_and_runs_corpus() {
             }
         }
     }
-    // The epic-side test asserts the harness runs the corpus; surface
-    // gaps (a capability epic-cc cannot compile yet, tracked by a
-    // sub-epic) are reported, not asserted. Only a harness crash (no map
-    // entry for a declared global) is a real failure.
+    // Conformance (docs/35 section 5 item 1) is a hard gate here; the
+    // other failures are surface gaps (a capability epic-cc cannot
+    // compile yet, tracked by a sub-epic) and harness crashes.
     let harness_failures: Vec<_> = failures
         .iter()
         .filter(|f| f.contains("no global"))
         .cloned()
         .collect();
+    assert!(
+        conformance.is_empty(),
+        "{} conformance failures:\n{}",
+        conformance.len(),
+        conformance.join("\n")
+    );
     assert!(
         harness_failures.is_empty(),
         "{} harness failures:\n{}",
