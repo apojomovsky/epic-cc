@@ -124,9 +124,57 @@ jobs:
         run: |
           docker run --rm -v "$PWD:/workspace" -w /workspace \
             -v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-            -e GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" \
+            -e SUMMARY_FILE=/workspace/sdcc-parity-summary.md \
             epic-cc-ci:latest bash scripts/sdcc-parity.sh
+
+      # The container writes the parity table to a file in the mounted
+      # /workspace (GITHUB_STEP_SUMMARY is a runner-host path, never visible
+      # inside the container); append it to the step summary here on host.
+      - name: Append SDCC parity table to step summary
+        run: |
+          cat sdcc-parity-summary.md >> "$GITHUB_STEP_SUMMARY"
+          rm -f sdcc-parity-summary.md
 
       # See devices-all's same-named step above.
       - name: Fix target dir ownership (container runs as root)
         run: sudo chown -R "$(id -u):$(id -g)" target
+
+  sdcc-regression:
+    name: sdcc regression-suite pass rate (Tier 3)
+    needs: warm-toolchain-cache
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ci image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          target: ci
+          load: true
+          tags: epic-cc-ci:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+
+      - name: Run the SDCC regression suite and report pass rate
+        run: |
+          docker run --rm -v "$PWD:/workspace" -w /workspace \
+            -e SUMMARY_FILE=/workspace/sdcc-regression-summary.md \
+            epic-cc-ci:latest bash scripts/sdcc-regression.sh
+
+      # The container writes its summary block to a file in the mounted
+      # /workspace (GITHUB_STEP_SUMMARY is a runner-host path, never visible
+      # inside the container); append it to the step summary here on host.
+      - name: Append SDCC regression pass rate to step summary
+        run: |
+          cat sdcc-regression-summary.md >> "$GITHUB_STEP_SUMMARY"
+          rm -f sdcc-regression-summary.md
