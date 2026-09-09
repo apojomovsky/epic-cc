@@ -68,7 +68,7 @@ fn region_for(device: &Device, addr: u16) -> (u16, u16) {
 /// The physical address just past a `width`-byte global placed at `start`:
 /// the address a following global's cursor must advance to. For a
 /// single-bank object this is `start + width`; for a bank-straddling object
-/// (PIC14E, docs/33 §2) the bytes skip common RAM, so the physical end is
+/// (PIC14E, docs/33 §D-2) the bytes skip common RAM, so the physical end is
 /// `start + width` plus the skipped common-RAM bytes. Mirrors the placement
 /// walk in `try_place_straddle`.
 fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
@@ -98,7 +98,7 @@ fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
 /// region (`align = width.min(2)`; only 2-byte values need even alignment).
 ///
 /// On PIC14E a global too large for any single GPR bank may straddle a bank
-/// boundary (docs/33 §2): the object's bytes are placed contiguously
+/// boundary (docs/33 §D-2): the object's bytes are placed contiguously
 /// through the GPR banks, skipping common RAM, and `isel-pic14e` addresses
 /// it through the linear region so one FSR walks across banks. On every
 /// other core a straddling global is unrepresentable (classic PIC14's
@@ -129,7 +129,7 @@ fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
 /// device's last bank. The object's bytes all land in GPR banks; the
 /// physical layout is non-contiguous (the common-RAM hole between banks is
 /// skipped), which is exactly the case `isel-pic14e` addresses through the
-/// linear region (docs/33 §2).
+/// linear region (docs/33 §D-2).
 fn try_place_straddle(device: &Device, addr: u16, width: u8) -> Option<u16> {
     let mut cur = addr;
     let mut remaining = u16::from(width);
@@ -1420,7 +1420,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         for g in &m.globals {
             if let Some(&a) = globals.get(&g.name) {
                 // A bank-straddling global's physical end skips common RAM
-                // (docs/33 §2), so the per-bank high-water must use
+                // (docs/33 §D-2), so the per-bank high-water must use
                 // physical_end, not a + size (which would overcount the
                 // first bank into the common-RAM hole and miss the later
                 // banks entirely).

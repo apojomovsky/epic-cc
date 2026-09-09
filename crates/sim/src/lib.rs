@@ -2387,6 +2387,7 @@ impl Pic18 {
             // routing, chained `RLNCF WREG, W` / `SWAPF WREG, W`
             // sequences read the flat RAM's always-zero 0xFE8 byte and
             // every W-chained computation collapses to zero.
+            0xFE8 => self.w,
             // PCL reads as the PC's low byte (DS39632E section 4.3).
             0xFF9 => (self.pc & 0xFF) as u8,
             _ => self.ram[addr],

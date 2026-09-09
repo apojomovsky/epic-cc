@@ -347,8 +347,9 @@ pub fn regions(lines: &[Line]) -> Vec<std::ops::Range<usize>> {
 }
 
 /// `cur` is never a move candidate unless every one of these holds: not a
-/// skip op, not a skip target (never move the other half of an atomic pair,
-/// epic-cc#6), and touches neither W nor a flag. The last two together
+/// skip op, not a skip target, and touches neither W nor a flag
+/// (never move the other half of an atomic pair, epic-cc#6). The last
+/// two together
 /// mean moving `cur` past one neighbor can never disturb a W-chain or a
 /// flag-chain, since `cur` itself is simply not part of either chain; the
 /// only remaining hazard to check per neighbor is a shared file-register

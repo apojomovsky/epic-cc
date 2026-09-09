@@ -7116,11 +7116,10 @@ pub fn select_with_locs(
             }
         } else {
             // Single-entry table (<= 255 bytes): a base that would cross
-            // its window gets `.align 256` before the `.table` directive
-            // (epic-cc#138), so the assembler's LOW + size <= 0x100 assert
-            // never fires on a <= 255-byte table: placement never decides
-            // its fit, mirroring the chunked branch's alignment. A base
-            // that already fits emits no `.align` (no flash waste).
+            // its window gets `.align 256` before the `.table` directive,
+            // so the assembler's LOW + size <= 0x100 assert never fires
+            // on a <= 255-byte table (epic-cc#138). A base that already
+            // fits emits no `.align` (no flash waste).
             out.push(format!("__read_{}:", g.name));
             locs.push(None);
             reader(&mut out, &mut locs, &g.name);
