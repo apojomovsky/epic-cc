@@ -4662,7 +4662,7 @@ fn multi_page_module_runs_in_sim() {
     // t[x] + 1 (helper2(x) = x + 1); main: r = helper(in);
     // r2 = r == 0 ? r+1 : r; out = r2 + t[in].
     let mut pad = String::new();
-    for _ in 0..665 {
+    for _ in 0..666 {
         pad.push_str("    %a = add i8 %a, 1\n");
     }
     let m = module_with_globals(
@@ -4924,13 +4924,13 @@ fn single_table_elision_drift_folded_by_window_align() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // The elision drift is real: the reader sits at the post-elision
-    // position (0x7F4), not the pass-A 0x7FA. (epic-cc#214 shifted this by
+    // position (0x7F3), not the pass-A 0x7FA. (epic-cc#214 shifted this by
     // one word, epic-cc#217 by one more: h0's `xor i8 %x, %x` now elides
     // its own redundant reload too, same drift mechanism this test
     // exercises, just one word more of it.)
     assert_eq!(
         label_addr(&asm, "__read_t"),
-        0x7F4,
+        0x7F3,
         "reader at the post-elision start:\n{asm}"
     );
     assert!(

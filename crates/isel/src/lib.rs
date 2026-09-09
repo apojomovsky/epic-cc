@@ -885,13 +885,13 @@ impl<'m> Gen<'m> {
     /// accumulates 2×scratch + %r (silent wrong-address miscompile).
     fn emit_accum_terms(&mut self, terms: &[(u8, String)]) {
         self.emit("    MOVLW 0x00".to_string());
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        self.emit_w_store(self.scratch);
         for (scale, r) in terms {
             let a = self.val_addr(&Val::Reg(r.clone())).direct();
             for _ in 0..*scale {
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
                 self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                self.emit_w_store(self.scratch);
             }
         }
     }
@@ -917,7 +917,7 @@ impl<'m> Gen<'m> {
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit_w_load(self.scratch);
                 self.emit(format!("    ADDLW 0x{kk:02X}"));
             }
         }
@@ -2548,13 +2548,13 @@ impl<'m> Gen<'m> {
                                 let aa = self.val_addr(a).direct();
                                 self.emit(format!("    MOVF 0x{aa:02X}, W"));
                                 self.emit(format!("    ADDLW 0x{kb:02X}"));
-                                self.emit(format!("    MOVWF 0x{da:02X}"));
+                                self.emit_w_store(da);
                             }
                             _ => {
                                 let (aa, bb) = (self.val_addr(a).direct(), self.val_addr(b_op).direct());
                                 self.emit(format!("    MOVF 0x{bb:02X}, W"));
                                 self.emit(format!("    ADDWF 0x{aa:02X}, W"));
-                                self.emit(format!("    MOVWF 0x{da:02X}"));
+                                self.emit_w_store(da);
                             }
                         }
                     }
