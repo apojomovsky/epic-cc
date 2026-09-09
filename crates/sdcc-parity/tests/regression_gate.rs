@@ -128,6 +128,10 @@ fn corpus_matches_ratio_baseline() {
             &device::PIC18F4550,
             &device::PIC16F1938,
         ] {
+            // Family-pinned probes run only on their own devices.
+            if !prog.runs_on(device.name) {
+                continue;
+            }
             let key = format!("{} on {}", prog.name, device.name);
             let bug = known_bug_for(&prog.name, device.name);
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -182,6 +186,20 @@ fn corpus_matches_ratio_baseline() {
                 }
                 Ok(Ok(r)) => {
                     if r.pass {
+                        // A clean row also pins the hand-computed value:
+                        // epic-cc and SDCC agreeing on a wrong answer is
+                        // still a conformance failure (docs/35 section 5
+                        // item 2, arbitration).
+                        let out = prog.outputs.first();
+                        let got = out.and_then(|o| r.epic.outputs.get(o)).copied();
+                        if got != Some(prog.expected as u32) {
+                            problems.push(format!(
+                                "{key}: drifted off the hand-computed value \
+                                 ({got:?} != {:#04x})",
+                                prog.expected
+                            ));
+                            continue;
+                        }
                         measured.push(Row {
                             program: prog.name.clone(),
                             device: device.name.to_string(),

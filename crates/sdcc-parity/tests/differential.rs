@@ -65,6 +65,11 @@ fn corpus_differential_clean() {
             &device::PIC18F4550,
             &device::PIC16F1938,
         ] {
+            // Family-pinned probes (the data-EEPROM register file) run
+            // only on their own devices.
+            if !prog.runs_on(device.name) {
+                continue;
+            }
             let name = prog.name.as_str();
             // Catch panics per-program (a sim panic on one SDCC program must
             // not abort the whole corpus run).

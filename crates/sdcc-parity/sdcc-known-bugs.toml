@@ -66,3 +66,49 @@ program = "i64"
 # SDCC error 206 (no 64-bit on pic14); epic computes 0x9A.
 sdcc_observed = 0
 expected = 0x9A
+
+# printf %f on p18f4550: SDCC compiles, links, and runs the probe, but
+# its `out` stays 0x00 while epic-cc folds 0x41. SDCC's own %f core is
+# verified working independently (its sprintf path formats "d=3.500000"
+# into RAM under the same image and oracle flags); what never observably
+# fires through the portable `void putchar(char) __wparam` sink is
+# printf's putchar call. The row pins epic-cc's hand-computed
+# conformance value; the putchar ABI question is tracked by epic-cc#352,
+# not this probe.
+[[bug]]
+device = "p18f4550"
+program = "printf-f"
+sdcc_observed = 0x0
+expected = 0x41
+
+[[bug]]
+# EEPROM on p18f4550: SDCC compiles the probe but its int-to-pointer
+# conversion never reaches the register window (EEDATA/EEADR/EECON2 see
+# no writes; EECON1 sees only two 0x80 writes from SDCC's own runtime,
+# a value nowhere in the probe). Both reads return stale EEDATA:
+# 0x7F, not 0x80. Same generic-pointer defect class as malloc; the
+# misrouting is in SDCC's address computation, upstream of any sim
+# model (the stores are ordinary MOVWF/MOVFF our own probe exercises).
+# epic-cc performs the real unlock-and-commit cycle.
+device = "p18f4550"
+program = "eeprom-p18"
+sdcc_observed = 0x7F
+expected = 0x80
+
+# printf %f on the pic14-family cores is an SDCC limitation, same class
+# as i64: the pic14 port ships no libc at all (manual 4.9.8), so the
+# probe neither links printf nor agrees with our libc's putchar contract.
+# epic-cc's libc prints %f (the #295 formatter); the probe folds the
+# first six output bytes of "d=3.50" into 0x41.
+[[bug]]
+device = "p16f877a"
+program = "printf-f"
+sdcc_observed = 0
+expected = 0x41
+
+[[bug]]
+device = "p16f1938"
+program = "printf-f"
+# Same pic14-family libc absence on the Enhanced core.
+sdcc_observed = 0
+expected = 0x41

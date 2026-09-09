@@ -2,17 +2,21 @@
 //! translation unit when a source includes the header (epic-cc#131).
 //!
 //! The character sink is the user-provided `putchar` (the HAL's USART or
-//! the harness); the formatter never touches hardware. Written per
-//! ADR-018's pointer rule: every string walk is an INDEX loop, the only
-//! pointer read is `va_arg` (now modelled directly), and the 32-bit
-//! conversion bodies are `noinline` helpers so every function stays under
-//! the 877A's 2048-word page limit. `%f` formats an f32 (== double here)
-//! at 2 fixed decimals using the float runtime.
+//! the harness); the formatter never touches hardware. The sink contract
+//! is `void putchar(char)` (SDCC pic16's prototype, whose `__wparam`
+//! the driver predefines empty), not C's `int putchar(int)`, so one
+//! corpus source defines putchar for both compilers (docs/35 section 4).
+//! Written per ADR-018's pointer rule: every string walk is an INDEX
+//! loop, the only pointer read is `va_arg` (now modelled directly), and
+//! the 32-bit conversion bodies are `noinline` helpers so every
+//! function stays under the 877A's 2048-word page limit.
+//! `%f` formats an f32 (== double here) at 2 fixed decimals using the
+//! float runtime.
 
 pub const STDIO_C: &str = r#"#include <stdarg.h>
 #include <stddef.h>
 
-extern int putchar(int c);
+extern void putchar(char c);
 
 static int out_cstr(const char *s) {
     int w = 0;

@@ -12,7 +12,7 @@ pub const STDIO_H: &str = r#"#ifndef _STDIO_H
 
 int printf(const char *fmt, ...);
 int puts(const char *s);
-int putchar(int c);
+void putchar(char c);
 int snprintf(char *s, size_t n, const char *fmt, ...);
 int vsnprintf(char *s, size_t n, const char *fmt, va_list ap);
 int sprintf(char *s, const char *fmt, ...);
