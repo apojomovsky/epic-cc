@@ -401,6 +401,7 @@ impl Pic14 {
         match f {
             0x00 => {
                 let addr = self.indirect_addr();
+                let v = self.ee_store(addr, v).unwrap_or(v);
                 self.ram[addr] = v; // INDF -> RAM[FSR] via IRP
             }
             _ => match self.banked_addr(f) {
@@ -973,6 +974,7 @@ impl Pic14e {
             "sim(pic14e): program flash is read-only (FSR 0x{fsr:04X})"
         );
         let a = self.indirect_addr(fsr);
+        let v = self.ee_store(a, v).unwrap_or(v);
         self.ram[a] = v;
     }
     fn write_f(&mut self, f: usize, v: u8) {

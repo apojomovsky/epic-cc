@@ -56,6 +56,16 @@ pub struct Insn<'a> {
     pub reads_file: bool,
     pub writes_file: bool,
     pub is_skip: bool,
+    /// True when this instruction's literal file operand lies outside the
+    /// device's allocatable RAM (GPR banks, common RAM, fixed retval): on
+    /// the pre-banking text this pass sees, those addresses are SFR,
+    /// config, or gap windows, whose accesses may have side effects or
+    /// change out from under the program (the data-EEPROM register file
+    /// behind epic-cc#345). Immediates (`MOVLW`) carry no file access
+    /// and never mark, even when the literal equals an SFR address.
+    /// Region-splitting treats a marked instruction as a barrier, so no
+    /// motion in either phase can cross it.
+    pub touches_sfr: bool,
     /// True when the immediately preceding classified line is a skip op:
     /// this instruction is the other half of an atomic, unsplittable
     /// pair (issue #6; `crates/banking/tests/banking.rs:79-87` is the
@@ -63,10 +73,10 @@ pub struct Insn<'a> {
     /// instruction, never move anything into or out of this exact slot.
     pub is_skip_target: bool,
 }
-
 /// One line of the flat asm text, classified for scheduling purposes.
 /// Every variant that isn't `Insn` is a hazard boundary a reorder may
-/// never cross (see `regions`).
+/// never cross (see `regions`). An `Insn` touching an SFR
+/// (`touches_sfr`) is a boundary too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Line<'a> {
     Label(&'a str),
@@ -116,9 +126,10 @@ impl<'a> Line<'a> {
     }
 
     /// True for anything that must never be moved, and must never have
-    /// another instruction moved across it: every non-`Insn` variant.
+    /// another instruction moved across it: every non-`Insn` variant,
+    /// plus any `Insn` touching an SFR (`touches_sfr`).
     pub fn is_barrier(&self) -> bool {
-        !matches!(self, Line::Insn(_))
+        !matches!(self, Line::Insn(i) if !i.touches_sfr)
     }
 }
 
@@ -174,6 +185,31 @@ fn literal_addr(toks: &[&str]) -> Option<u16> {
     u16::from_str_radix(op.strip_prefix("0x")?, 16).ok()
 }
 
+/// True when a file-register access at `addr` lies outside the device's
+/// allocatable RAM (GPR banks, common RAM, fixed retval): those windows
+/// are SFR, config, or gap addresses on the pre-banking text this pass
+/// sees, and traffic through them may have side effects (the EEPROM
+/// register file's RD/WR/unlock semantics behind epic-cc#345) or change
+/// asynchronously. Immediates carry no file access (`reads_file` and
+/// `writes_file` both false) and never mark.
+fn is_non_gpr_access(
+    device: &Device,
+    addr: Option<u16>,
+    reads_file: bool,
+    writes_file: bool,
+) -> bool {
+    if !(reads_file || writes_file) {
+        return false;
+    }
+    let Some(a) = addr else {
+        return false;
+    };
+    let in_window = |w: &(u16, u16)| a >= w.0 && a <= w.1;
+    !(device.ram_banks.iter().any(|w| in_window(w))
+        || device.common_ram.is_some_and(|w| in_window(&w))
+        || device.fixed_retval.is_some_and(|w| in_window(&w)))
+}
+
 /// True when the byte-oriented instruction's destination is `f` itself
 /// (the trailing `, F` form isel emits, e.g. `RLF 0x20, F`), false when it
 /// is `W` (`, W`, e.g. `ANDWF 0x27, W`).
@@ -195,6 +231,7 @@ fn classify_insn<'a>(device: &Device, line: &'a str, mne: &'a str, toks: &[&str]
         file_addr: addr,
         reads_file,
         writes_file,
+        touches_sfr: is_non_gpr_access(device, addr, reads_file, writes_file),
         is_skip: SKIP_OPS.contains(&mne),
         is_skip_target: false, // filled in by `classify` once the sequence is known
     };
@@ -292,9 +329,9 @@ pub fn classify<'a>(device: &Device, asm: &'a str) -> Vec<Line<'a>> {
 
 /// Split `lines` (as returned by `classify`) into straight-line regions:
 /// the longest runs of consecutive `Line::Insn` entries, broken at every
-/// barrier (`is_barrier`). Each region is a half-open `[start, end)`
-/// index range into `lines`; barrier lines themselves belong to no
-/// region.
+/// barrier (`is_barrier`, which includes SFR-touching instructions).
+/// Each region is a half-open `[start, end)` index range into `lines`;
+/// barrier lines themselves belong to no region.
 pub fn regions(lines: &[Line]) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut start: Option<usize> = None;
