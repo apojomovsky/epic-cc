@@ -419,6 +419,16 @@ class GenDevicePic18CfgdataTest(unittest.TestCase):
         # doubled-address bug's offset 2.
         self.assertIn('name = "beta"\nbyte_offset = 1', text)
 
+    def test_ini_romsize_is_halved_for_pic18(self):
+        # epic-cc#351: the ini's ROMSIZE states PIC18 program memory in
+        # bytes, same as EDC's CodeSector. ROMSIZE=800 (hex) is 2048 bytes,
+        # 1024 words; the undivided bug would emit flash_words = 2048.
+        with tempfile.TemporaryDirectory() as d:
+            ini = self.write_ini(d)
+            cfg = self.write_cfgdata(d)
+            text = gen_device.generate_toml("p18cfgtest", ini, cfg, None)
+        self.assertIn("flash_words = 1024", text)
+
 
 class GenDeviceSweepTest(unittest.TestCase):
     """`--sweep` breadth proofing (docs/38 D-2): generate for every part in

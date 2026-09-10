@@ -605,13 +605,18 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
         edc.get("core"),
     )
     romsize = scalar("ROMSIZE")
+    ini_words = None
+    if romsize:
+        # ini ROMSIZE states PIC18 program memory in bytes too, same
+        # convention as EDC's CodeSector below.
+        ini_words = int(romsize, 16) // 2 if core == "pic18" else int(romsize, 16)
     edc_words = None
     if "code_end" in edc and core is not None:
         # EDC states PIC18 program memory in bytes; flash_words counts words.
         edc_words = edc["code_end"] // 2 if core == "pic18" else edc["code_end"]
     flash_words = pick(
         "flash_words (ini ROMSIZE or EDC CodeSector)",
-        int(romsize, 16) if romsize else None,
+        ini_words,
         edc_words,
     )
     if flash_words == 0:
