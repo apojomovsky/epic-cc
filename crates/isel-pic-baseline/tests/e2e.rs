@@ -160,3 +160,41 @@ fn banked_c_runs_correctly_and_reasserts_fsr5() {
         }
     }
 }
+
+/// P3 pointer/array acceptance (docs/37 section 3 P3): a runtime RAM
+/// pointer (FSR/INDF path) with a volatile index. `in` is a 16-bit
+/// volatile so clang keeps the index mask as an i16 `and`. Expected:
+/// in = 1 -> ram[1] = 2 -> out = 2.
+#[test]
+fn ptr_probe_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/ptr_probe.c");
+    p.ram_mut()[globals["in"] as usize] = 1;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 2, "out = ram[1] = 2");
+    assert!(p.halted());
+}
+
+/// P3 array acceptance: a non-const array written and read at a runtime
+/// index, the pure FSR/INDF path. Expected: in = 3 -> buf[3] = 4 -> out =
+/// 4.
+#[test]
+fn array_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/array.c");
+    p.ram_mut()[globals["in"] as usize] = 3;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 4, "out = buf[3] = 4");
+    assert!(p.halted());
+}
+
+/// P3 structs acceptance: byval call, dynamic array-in-struct, and
+/// nested-struct field math through FSR/INDF. Expected: out == 0x48.
+#[test]
+fn structs_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/structs.c");
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0x48, "structs trace");
+    assert!(p.halted());
+}
