@@ -444,6 +444,11 @@ pub struct Func {
     /// position). Serialized as a `[isr]` marker between the ret group and
     /// the params group: `fn isr(void) [isr] ()`.
     pub isr: bool,
+    /// Interrupt priority from clang's `"interrupt"="N"` function
+    /// attribute (0 = compatibility single-vector mode, 1 = high,
+    /// 2 = low). Meaningful only when `isr`. Serialized as `[irq1]` /
+    /// `[irq2]` markers next to `[isr]`; absent means 0.
+    pub irq_priority: u8,
     pub naked: bool,
     /// True for a variadic function (`fn f(...)` in the .ll prototype): a
     /// callee that reads extra args through `va_arg`. Its calls may pass
@@ -476,12 +481,15 @@ pub struct Module {
 
 /// True for the legalize-injected runtime routines (the mul/div/rem/shift
 /// and soft-float recipe bodies), including the interrupt-context `_isr`
-/// copies. The recipe bodies are skip-sensitive (BTFSS/DECFSZ + GOTO,
+/// and `_isr_high` copies. The recipe bodies are skip-sensitive (BTFSS/DECFSZ + GOTO,
 /// INCFSZ + ADDWF), so a routine's frame must sit inside a single GPR bank:
 /// `alloc` rounds routine bases and `isel` verifies the placement. Shared
 /// by both stages; `legalize` injects exactly these names.
 pub fn is_runtime_routine(name: &str) -> bool {
-    let base = name.strip_suffix("_isr").unwrap_or(name);
+    let base = name
+        .strip_suffix("_isr_high")
+        .or_else(|| name.strip_suffix("_isr"))
+        .unwrap_or(name);
     matches!(
         base,
         "__mul_u8"
@@ -525,10 +533,14 @@ pub fn is_runtime_routine(name: &str) -> bool {
 /// recipes address every file operand with `a=0` (no `MOVLB`), so a
 /// `MOVLB` the banking pass would insert for a banked address would break
 /// the skip-sensitive loops. `alloc` reserves the access-bank window for
-/// exactly these routines on PIC18; integer routines use `operand()`'s
-/// `MOVLB` and may live anywhere in banked RAM. Includes the `_isr` copies.
+/// `MOVLB` and may live anywhere in banked RAM. Includes the `_isr` and
+/// `_isr_high` copies (both share the access-bank window with the base
+/// routine; cross-context float sharing is a known hazard, ticketed).
 pub fn is_float_routine(name: &str) -> bool {
-    let base = name.strip_suffix("_isr").unwrap_or(name);
+    let base = name
+        .strip_suffix("_isr_high")
+        .or_else(|| name.strip_suffix("_isr"))
+        .unwrap_or(name);
     matches!(
         base,
         "__add_f32"
@@ -594,6 +606,11 @@ pub fn serialize(m: &Module) -> String {
         let mut markers = String::new();
         if f.isr {
             markers.push_str(" [isr]");
+        }
+        match f.irq_priority {
+            1 => markers.push_str(" [irq1]"),
+            2 => markers.push_str(" [irq2]"),
+            _ => {}
         }
         if f.naked {
             markers.push_str(" [naked]");
@@ -1020,6 +1037,13 @@ pub fn parse(text: &str) -> Module {
             let before_params = &after[..p_open];
             let isr = before_params.contains("[isr]");
             let naked = before_params.contains("[naked]");
+            let irq_priority = if before_params.contains("[irq1]") {
+                1
+            } else if before_params.contains("[irq2]") {
+                2
+            } else {
+                0
+            };
             let p_close = matching_paren(after, p_open);
             let p_str = &after[p_open + 1..p_close];
             let ret = if ret_str == "void" || ret_str.is_empty() {
@@ -1052,6 +1076,7 @@ pub fn parse(text: &str) -> Module {
                 params,
                 blocks: Vec::new(),
                 isr,
+                irq_priority,
                 naked,
                 variadic,
             });

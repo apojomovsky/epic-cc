@@ -60,7 +60,7 @@ fn layout_for_device(dev: &'static device::Device) -> alloc::AllocLayout {
     addrs.extend(layout.locals.clone());
     let asm = match dev.core {
         device::Core::Pic14 => isel::select(dev, &m, &addrs),
-        device::Core::Pic18 => isel_pic18::select(dev, &m, &addrs),
+        device::Core::Pic18 => isel_pic18::select(dev, &m, &addrs, layout.isr_low_save),
         _ => panic!("unsupported core"),
     };
     let _ = match dev.core {

@@ -1452,3 +1452,123 @@ fn legalize_is_a_fixpoint() {
         "legalize must be a fixpoint (second run is a no-op)"
     );
 }
+
+/// Priority duplication (epic-cc#346): main + a high ISR + a low ISR all
+/// calling `helper`. The module gains BOTH `helper_isr` (low) and
+/// `helper_isr_high` (high); each ISR's call targets its own priority's
+/// copy while main's call stays on the original.
+#[test]
+fn duplicates_shared_functions_per_priority() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn hi(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn lo(void) [isr] [irq2] ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"helper"), "helper must remain: {names:?}");
+    assert!(
+        names.contains(&"helper_isr"),
+        "helper_isr must be added: {names:?}"
+    );
+    assert!(
+        names.contains(&"helper_isr_high"),
+        "helper_isr_high must be added: {names:?}"
+    );
+    // Neither copy is a vector entry.
+    assert!(!func("helper_isr", &m2).isr);
+    assert!(!func("helper_isr_high", &m2).isr);
+    // Each context calls its own copy.
+    assert_eq!(call_targets(func("hi", &m2)), ["helper_isr_high"]);
+    assert_eq!(call_targets(func("lo", &m2)), ["helper_isr"]);
+    assert_eq!(call_targets(func("main", &m2)), ["helper"]);
+}
+
+/// A compatibility-mode ISR (priority 0) must not mix with an
+/// explicit-priority one: no wiring serves that combination.
+#[test]
+#[should_panic(expected = "cannot mix with explicit-priority ISRs")]
+fn compat_and_explicit_isrs_panic_loudly() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn a(void) [isr] ()\n\
+           block entry:\n\
+             ret void\n\
+         fn b(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    let _ = legalize(m);
+}
+
+/// Two handlers on the same vector have no sound wiring.
+#[test]
+#[should_panic(expected = "two high-priority interrupt handlers")]
+fn duplicate_high_isrs_panic_loudly() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn a(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             ret void\n\
+         fn b(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    let _ = legalize(m);
+}
+
+/// A runtime routine shared with the high context gets an `_isr_high`
+/// copy (injected by base name, not by a single-suffix strip): main and
+/// the high ISR multiplying means `__mul_u8` plus `__mul_u8_isr_high`,
+/// each context calling its own.
+#[test]
+fn duplicates_shared_runtime_routines_for_the_high_isr() {
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i8 @a\n\
+             %y = load i8 @b\n\
+             %p = mul i8 %x, %y\n\
+             store i8 %p @out\n\
+             ret void\n\
+         fn hi(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             %u = load i8 @a\n\
+             %v = load i8 @b\n\
+             %q = mul i8 %u, %v\n\
+             store i8 %q @out\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names.contains(&"__mul_u8"),
+        "main's routine must remain: {names:?}"
+    );
+    assert!(
+        names.contains(&"__mul_u8_isr_high"),
+        "the high ISR needs its own routine copy: {names:?}"
+    );
+    assert_eq!(call_targets(func("hi", &m2)), ["__mul_u8_isr_high"]);
+    assert_eq!(call_targets(func("main", &m2)), ["__mul_u8"]);
+    assert!(!func("__mul_u8_isr_high", &m2).isr);
+}

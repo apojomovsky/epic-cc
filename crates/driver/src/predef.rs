@@ -9,6 +9,13 @@
 //! sink `void putchar(char) __wparam` (the corpus `%f` probe defines
 //! exactly that so one source compiles under both compilers). Our own
 //! formatter treats it as a plain `char` argument.
+//!
+//! `__interrupt(n)` is SDCC's interrupt-handler keyword, which clang
+//! does not know: it rides as a function-like macro expanding to the
+//! GNU spelling clang does know (`__attribute__((interrupt(n)))`),
+//! whose number clang preserves in the `.ll` `"interrupt"` function
+//! attribute for irparse (0 = compatibility single-vector, 1 = high,
+//! 2 = low priority).
 
 use device;
 
@@ -17,6 +24,7 @@ pub fn xc8_predefines(core: device::Core, device_name: &str) -> Vec<String> {
         "__XC".to_string(),
         "__XC8".to_string(),
         "__wparam=".to_string(),
+        "__interrupt(n)=__attribute__((interrupt(n)))".to_string(),
     ];
     match core {
         device::Core::Pic14 => defs.push("_PIC14".into()),
@@ -45,7 +53,14 @@ mod tests {
     fn pic18_part_gets_its_xc8_set() {
         assert_eq!(
             xc8_predefines(device::Core::Pic18, "p18f4550"),
-            vec!["__XC", "__XC8", "__wparam=", "_PIC18", "_18F4550"]
+            vec![
+                "__XC",
+                "__XC8",
+                "__wparam=",
+                "__interrupt(n)=__attribute__((interrupt(n)))",
+                "_PIC18",
+                "_18F4550"
+            ]
         );
     }
 
@@ -57,6 +72,7 @@ mod tests {
                 "__XC",
                 "__XC8",
                 "__wparam=",
+                "__interrupt(n)=__attribute__((interrupt(n)))",
                 "_PIC14",
                 "_PIC14E",
                 "_16F1939"
@@ -68,7 +84,14 @@ mod tests {
     fn plain_pic14_names_the_core_and_part() {
         assert_eq!(
             xc8_predefines(device::Core::Pic14, "p16f877a"),
-            vec!["__XC", "__XC8", "__wparam=", "_PIC14", "_16F877A"]
+            vec![
+                "__XC",
+                "__XC8",
+                "__wparam=",
+                "__interrupt(n)=__attribute__((interrupt(n)))",
+                "_PIC14",
+                "_16F877A"
+            ]
         );
     }
 }

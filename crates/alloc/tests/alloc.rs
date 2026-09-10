@@ -1,5 +1,6 @@
 use alloc::{allocate, map_text, AllocLayout};
 use device::PIC16F877A;
+use device::PIC18F4550;
 use ir::parse;
 
 /// main calls a and b; each of a and b carries two i16 locals, main carries
@@ -1196,5 +1197,70 @@ fn indirect_call_target_stays_live_through_the_call() {
     assert_ne!(
         out.locals["f::fp"], out.locals["f::a"],
         "the arg temp reuses the fp slot while the dispatch reads it"
+    );
+}
+
+/// Priority regions (epic-cc#346): a post-legalize module with main, a
+/// high ISR and a low ISR (each with one local, each calling its own
+/// helper copy) allocates three disjoint frame regions (main below the
+/// low save area, low frames above it, high frames above the low
+/// context) and reports the low save area base.
+#[test]
+fn priority_regions_are_disjoint_with_low_save() {
+    let m = parse(
+        "fn main(void) ()\n\
+           block entry:\n\
+             %v0 = add i8 1, 2\n\
+             call void @helper()\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             %h0 = add i8 3, 4\n\
+             ret void\n\
+         fn hi(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             %i0 = add i8 5, 6\n\
+             call void @helper_isr_high()\n\
+             ret void\n\
+         fn helper_isr_high(void) ()\n\
+           block entry:\n\
+             %g0 = add i8 7, 8\n\
+             ret void\n\
+         fn lo(void) [isr] [irq2] ()\n\
+           block entry:\n\
+             %j0 = add i8 9, 10\n\
+             call void @helper_isr()\n\
+             ret void\n\
+         fn helper_isr(void) ()\n\
+           block entry:\n\
+             %l0 = add i8 11, 12\n\
+             ret void\n",
+    );
+    let out = allocate(
+        &PIC18F4550,
+        &m,
+        "edge main helper\nedge hi helper_isr_high\nedge lo helper_isr\n",
+    );
+    // The low save area exists and sits above the main context.
+    let s = out
+        .isr_low_save
+        .expect("priority mode must set isr_low_save");
+    let main_max = out.locals["main::v0"].max(out.locals["helper::h0"]);
+    assert!(
+        s > main_max,
+        "low save area must sit above main (s = {s:#X})"
+    );
+    // Low frames live above the 12-byte save area...
+    let lo_min = out.locals["lo::j0"].min(out.locals["helper_isr::l0"]);
+    let lo_max = out.locals["lo::j0"].max(out.locals["helper_isr::l0"]);
+    assert!(
+        lo_min >= s + 12,
+        "low frames must clear the save area (lo = {lo_min:#X}, s = {s:#X})"
+    );
+    // ...and high frames live above the whole low context.
+    let hi_min = out.locals["hi::i0"].min(out.locals["helper_isr_high::g0"]);
+    assert!(
+        hi_min > lo_max,
+        "high frames must sit above low frames (hi = {hi_min:#X}, lo = {lo_max:#X})"
     );
 }

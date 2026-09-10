@@ -1942,6 +1942,15 @@ pub struct Pic18 {
     /// A latched interrupt request awaiting INTCON GIE + INT0IE. Set by
     /// `request_interrupt`, consumed when the interrupt is taken.
     pending: bool,
+    /// A latched LOW-priority request awaiting INTCON GIEH + GIEL + INT0IE
+    /// (the IPEN=1 routing: firmware owns RCON.IPEN, the sim models the
+    /// post-IPEN behavior). Set by `request_low_interrupt`, consumed on
+    /// low-vector entry.
+    pending_lo: bool,
+    /// The live ISR nesting stack, outermost first: `true` = high-priority
+    /// context. Pushed on vector entry (both `fire_` hooks and the
+    /// request paths), popped by RETFIE to restore the right enable bit.
+    isr_stack: Vec<bool>,
     /// A PC<7:0> write (computed jump through `PCL`) waiting to override
     /// this instruction's linear `next`, consumed by `step`'s tail.
     jump_target: Option<u32>,
@@ -1961,6 +1970,8 @@ impl Pic18 {
             eeprom: Eeprom::new(),
             halted: false,
             pending: false,
+            pending_lo: false,
+            isr_stack: Vec::new(),
             jump_target: None,
         }
     }
@@ -2016,6 +2027,13 @@ impl Pic18 {
             self.pending = false;
             self.enter_isr();
             return; // vectoring costs its own cycle; the handler runs next
+        }
+        // The low vector is checked second: a pending high request
+        // preempts even when a low one is also latched (hardware priority).
+        if self.interrupt_ready_lo() {
+            self.pending_lo = false;
+            self.enter_isr_low();
+            return;
         }
         let word = self.prog[(self.pc / 2) as usize];
         let pc = self.pc;
@@ -2603,11 +2621,20 @@ impl Pic18 {
         pc + 4
     }
 
-    /// RETFIE restores GIE (INTCON bit 7, the hardware shadow restore)
-    /// and pops the return address, resuming the interrupted code. Entry
-    /// clears GIE, so this restore pairs with that clearing.
+    /// RETFIE restores the preempted context's enable bit (INTCON bit 7
+    /// GIEH for a high return, bit 6 GIEL for a low one: the hardware's
+    /// shadow restore) and pops the return address, resuming the
+    /// interrupted code. An empty nesting stack (a hand-written program
+    /// that RETFIEs without a modelled entry) keeps the historical
+    /// behavior: GIEH back on. (The interrupt-entry modelling that clears
+    /// GIE landed with P5's interrupt model; before that RETFIE behaved
+    /// like RETURN.)
     fn exec_retfie(&mut self) -> u32 {
-        self.ram[0xFF2] |= 0x80; // GIE back on
+        match self.isr_stack.pop() {
+            Some(true) => self.ram[0xFF2] |= 0x80,  // high return: GIEH on
+            Some(false) => self.ram[0xFF2] |= 0x40, // low return: GIEL on
+            None => self.ram[0xFF2] |= 0x80,        // unmodelled: GIE on
+        }
         self.pop_return()
     }
 
@@ -2851,6 +2878,27 @@ impl Pic18 {
     pub fn interrupt_pending(&self) -> bool {
         self.pending
     }
+    /// Fire the low-priority interrupt immediately, bypassing INTCON
+    /// gating: push the return address and jump to vector 0x0018. The
+    /// unconditional low test hook, mirroring `fire_interrupt`. Only
+    /// GIEL is cleared on entry (GIEH stays set), so a high request can
+    /// still preempt the low handler, exactly like hardware.
+    pub fn fire_low_interrupt(&mut self) {
+        self.enter_isr_low();
+    }
+    /// Request the low-priority interrupt through the modelled path:
+    /// latch it and set TMR0IF (INTCON bit 2) as the observable source
+    /// flag. It is taken at the next step boundary at which INTCON bits
+    /// 7 (GIEH), 6 (GIEL) and 4 (the modelled source enable) are all
+    /// set. The latch is consumed on entry, mirroring `request_interrupt`.
+    pub fn request_low_interrupt(&mut self) {
+        self.ram[0xFF2] |= 0x04; // TMR0IF
+        self.pending_lo = true;
+    }
+    /// Whether a requested low-priority interrupt is still latched.
+    pub fn low_interrupt_pending(&self) -> bool {
+        self.pending_lo
+    }
     /// Push the return address, clear GIE (INTCON bit 7: hardware does
     /// this on entry so the handler is not immediately re-entered) and
     /// vector to 0x0008.
@@ -2858,10 +2906,28 @@ impl Pic18 {
         self.stack.push(self.pc);
         self.ram[0xFF2] &= !0x80; // clear GIE
         self.pc = 0x0008;
+        self.isr_stack.push(true);
+    }
+    /// Push the return address, clear GIEL only (INTCON bit 6) and vector
+    /// to 0x0018. GIEH is left set: hardware keeps high interrupts
+    /// enabled inside a low handler so they can preempt it.
+    fn enter_isr_low(&mut self) {
+        self.stack.push(self.pc);
+        self.ram[0xFF2] &= !0x40; // clear GIEL
+        self.pc = 0x0018;
+        self.isr_stack.push(false);
     }
     /// A latched request whose global and source enables are both set.
     fn interrupt_ready(&self) -> bool {
         self.pending && self.ram[0xFF2] & 0x80 != 0 && self.ram[0xFF2] & 0x10 != 0
+    }
+    /// A latched low request whose master, low-global and source enables
+    /// are all set (GIEH gates everything when IPEN = 1).
+    fn interrupt_ready_lo(&self) -> bool {
+        self.pending_lo
+            && self.ram[0xFF2] & 0x80 != 0
+            && self.ram[0xFF2] & 0x40 != 0
+            && self.ram[0xFF2] & 0x10 != 0
     }
 }
 
@@ -2911,6 +2977,94 @@ mod pic18_interrupt {
         pic.run(1); // the boundary check vectors on the next step
         assert_eq!(pic.pc(), 0x0008, "must vector once GIE goes up");
         assert!(!pic.interrupt_pending(), "the latch is consumed on entry");
+    }
+
+    /// A program with NOPs at bytes 0/2/4 and ISRs at both vectors: word
+    /// 4 (byte 8) = `MOVWF 0x20,A` + `RETFIE`, word 12 (byte 0x18) =
+    /// `MOVWF 0x21,A` + `RETFIE`.
+    fn pic_with_both_isrs() -> Pic18 {
+        let mut prog = vec![0u16; 16];
+        prog[0] = 0x0000; // NOP at byte 0
+        prog[1] = 0x0000; // NOP at byte 2
+        prog[2] = 0x0000; // NOP at byte 4
+        prog[4] = 0x6E20; // high ISR at byte 8: MOVWF 0x20,A
+        prog[5] = 0x0010; // RETFIE
+        prog[12] = 0x6E21; // low ISR at byte 0x18: MOVWF 0x21,A
+        prog[13] = 0x0010; // RETFIE
+        Pic18::new(prog)
+    }
+
+    #[test]
+    fn fire_low_vectors_to_0x0018_and_keeps_gieh() {
+        let mut pic = pic_with_both_isrs();
+        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.run(2); // two NOPs, pc == 4
+        pic.w = 0x3C; // the preempted main's W
+        pic.fire_low_interrupt();
+        assert_eq!(pic.pc(), 0x0018, "low fire must vector to 0x0018");
+        assert_eq!(pic.ram[0xFF2] & 0x40, 0, "GIEL cleared on low entry");
+        assert_eq!(
+            pic.ram[0xFF2] & 0x80,
+            0x80,
+            "GIEH stays set: high can still preempt"
+        );
+        pic.step(); // the low ISR's MOVWF 0x21,A
+        pic.step(); // RETFIE (pops byte 4)
+        assert_eq!(pic.ram[0x21], 0x3C, "low ISR stored W to 0x21");
+        assert_eq!(pic.pc(), 4, "RETFIE resumes the interrupted instruction");
+        assert_eq!(pic.ram[0xFF2] & 0x40, 0x40, "GIEL re-enabled on RETFIE");
+    }
+
+    #[test]
+    fn high_preempts_low_and_both_restore() {
+        let mut pic = pic_with_both_isrs();
+        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.run(2); // pc == 4
+        pic.w = 0x11;
+        pic.fire_low_interrupt(); // -> low ISR at 0x18
+        pic.step(); // low MOVWF 0x21,A (pc now 0x1A)
+        pic.w = 0x22;
+        pic.fire_interrupt(); // high preempts the low handler
+        assert_eq!(pic.pc(), 0x0008, "high fire vectors to 0x0008");
+        assert_eq!(pic.ram[0xFF2] & 0x80, 0, "GIEH cleared on high entry");
+        pic.step(); // high MOVWF 0x20,A
+        assert_eq!(pic.ram[0x20], 0x22, "high ISR stored W to 0x20");
+        pic.step(); // high RETFIE: back into the low handler at 0x1A
+        assert_eq!(pic.pc(), 0x001A, "high RETFIE resumes the low handler");
+        assert_eq!(pic.ram[0xFF2] & 0x80, 0x80, "GIEH back on after high");
+        assert_eq!(
+            pic.ram[0xFF2] & 0x40,
+            0,
+            "GIEL still clear: the low context is live"
+        );
+        pic.step(); // low RETFIE: back to main at byte 4
+        assert_eq!(pic.pc(), 4, "low RETFIE resumes main");
+        assert_eq!(pic.ram[0xFF2] & 0x40, 0x40, "GIEL back on after low");
+        assert_eq!(pic.ram[0x21], 0x11, "low ISR's store survived preemption");
+    }
+
+    #[test]
+    fn low_request_needs_gieh_giel_and_source_enable() {
+        let mut pic = pic_with_both_isrs();
+        pic.ram[0xFF2] = 0x80; // GIEH only: GIEL clear
+        pic.request_low_interrupt();
+        assert!(pic.low_interrupt_pending(), "low request must latch");
+        pic.run(3);
+        assert_eq!(pic.pc(), 6, "must stay masked while GIEL is clear");
+        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.run(1);
+        assert_eq!(pic.pc(), 0x0018, "must vector to 0x0018 once enabled");
+        assert!(!pic.low_interrupt_pending(), "the latch is consumed");
+    }
+
+    #[test]
+    fn high_wins_when_both_requests_are_latched() {
+        let mut pic = pic_with_both_isrs();
+        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.request_interrupt();
+        pic.request_low_interrupt();
+        pic.run(1); // the boundary serves the high request first
+        assert_eq!(pic.pc(), 0x0008, "high wins over a latched low request");
     }
 }
 

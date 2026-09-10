@@ -797,6 +797,64 @@ fn func_is_naked(header_suffix: &str, attr_map: &HashMap<String, String>) -> boo
     false
 }
 
+/// Read one `"interrupt"="N"` value out of an attribute-group body, if
+/// present.
+fn parse_interrupt_attr(body: &str) -> Option<u8> {
+    let mut rest = body;
+    while let Some(pos) = rest.find("\"interrupt\"") {
+        rest = &rest[pos + "\"interrupt\"".len()..];
+        let r = rest.trim_start();
+        let Some(r) = r.strip_prefix('=') else {
+            continue;
+        };
+        let r = r.trim_start();
+        let Some(r) = r.strip_prefix('"') else {
+            continue;
+        };
+        let Some(end) = r.find('"') else {
+            continue;
+        };
+        if let Ok(n) = r[..end].parse::<u8>() {
+            return Some(n);
+        }
+        rest = &r[end..];
+    }
+    None
+}
+
+/// The interrupt priority from a function's header suffix and attr map:
+/// clang lowers `__attribute__((interrupt(N)))` to `"interrupt"="N"` in
+/// the function's attribute group. 0 when absent (compatibility
+/// single-vector mode). Mirrors `func_is_naked`'s `#N` resolution.
+fn func_irq_priority(header_suffix: &str, attr_map: &HashMap<String, String>) -> u8 {
+    let tokens: Vec<&str> = header_suffix.split_whitespace().collect();
+    for tok in tokens {
+        if !tok.starts_with('#') {
+            continue;
+        }
+        let key = tok.trim_end_matches(|c| c == ',' || c == '{' || c == '}');
+        for k in key.split(',') {
+            let k = k.trim();
+            if k.is_empty() {
+                continue;
+            }
+            let owned;
+            let k = if k.starts_with('#') {
+                k
+            } else {
+                owned = format!("#{k}");
+                &owned
+            };
+            if let Some(inner) = attr_map.get(k) {
+                if let Some(n) = parse_interrupt_attr(inner) {
+                    return n;
+                }
+            }
+        }
+    }
+    0
+}
+
 /// The bare (unquoted) token value of `name: TOKEN` in a metadata node
 /// body, e.g. `tag: DW_TAG_pointer_type`. Reads to the next top-level
 /// `,` or `)`.
@@ -2356,6 +2414,7 @@ pub fn parse_ll(src: &str) -> Module {
                             params,
                             blocks,
                             isr,
+                            irq_priority: func_irq_priority(suffix, &attr_map),
                             naked,
                             variadic,
                         });
@@ -2508,6 +2567,7 @@ pub fn parse_ll(src: &str) -> Module {
                     params,
                     blocks,
                     isr,
+                    irq_priority: func_irq_priority(suffix, &attr_map),
                     naked,
                     variadic,
                 });

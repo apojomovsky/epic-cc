@@ -93,7 +93,7 @@ fn run_one(device: &str, v: u8) {
         let mut addrs: HashMap<String, u16> = HashMap::new();
         addrs.extend(layout.globals.clone());
         addrs.extend(layout.locals.clone());
-        let _asm = isel_pic18::select(&device::PIC18F4550, &m, &addrs);
+        let _asm = isel_pic18::select(&device::PIC18F4550, &m, &addrs, layout.isr_low_save);
     }
     let _ = std::fs::remove_file(&hex_path);
 }

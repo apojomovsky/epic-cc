@@ -52,7 +52,7 @@ fn compile(c_path: &str) -> (Pic18, HashMap<String, u16>) {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
-    let asm = isel_pic18::select(&PIC18F4550, &m, &addrs);
+    let asm = isel_pic18::select(&PIC18F4550, &m, &addrs, layout.isr_low_save);
     let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
 
     (Pic18::new(parse_hex_pic18(&hex)), layout.globals)
@@ -161,7 +161,7 @@ fn banked_c_asm_contains_movlb() {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
-    let asm = isel_pic18::select(&PIC18F4550, &m, &addrs);
+    let asm = isel_pic18::select(&PIC18F4550, &m, &addrs, layout.isr_low_save);
     assert!(
         asm.lines().any(|l| l.trim().starts_with("MOVLB")),
         "banked.c must exercise BSR-banked addressing on PIC18 (found no MOVLB):\n{asm}"

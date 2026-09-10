@@ -13,6 +13,8 @@ fn main() {
     let src = fs::read_to_string(&args[1]).expect("read input");
     let map = fs::read_to_string(&args[2]).expect("read map");
     let addrs = iselcore::parse_map(&map);
-    let asm = isel_pic18::select(&device::PIC18F4550, &ir::parse(&src), &addrs);
+    // No alloc layout flows through this debug binary: compatibility mode
+    // only (a priority-mode module panics in `select`, by design).
+    let asm = isel_pic18::select(&device::PIC18F4550, &ir::parse(&src), &addrs, None);
     fs::write(&args[3], asm).expect("write output");
 }
