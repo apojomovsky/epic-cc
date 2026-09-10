@@ -106,26 +106,49 @@ fn baseline_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {
     }
 }
 
+fn has_field(region: &ConfigRegion, name: &str) -> bool {
+    region
+        .fields
+        .iter()
+        .any(|f| f.name.eq_ignore_ascii_case(name))
+}
+
 fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {
     let osc = named(region, spec, "osc");
-    let cpudiv = named(region, spec, "cpudiv");
-    let pll = matches!(osc.as_str(), "hspll" | "xtpll" | "ecpll" | "ecpio");
-    if matches!(osc.as_str(), "inths" | "intxt" | "intcko" | "intio") {
-        // DS39632E §2.2.5: INTOSC is an 8 MHz clock that directly drives
-        // the device clock in the internal-oscillator microcontroller
-        // modes. CPUDIV applies only to XT/HS/EC and the PLL modes
-        // (Register 25-1), not to INTOSC (epic-cc#226).
+    // Confirmed on PIC18F252/258/452/2525/4520/4620: the non-USB PIC18
+    // family (DS39025/DS39631) has no CPUDIV/PLLDIV/USBDIV fuses at all;
+    // Register 25-1's configurable divider chain is specific to the 96 MHz
+    // USB PLL family (2455/2550/4455/4550) already shipped. Reading cpudiv
+    // is deferred into the branch that actually needs it so a device
+    // without the fuse never has to have one just to resolve a non-PLL
+    // clock.
+    if matches!(
+        osc.as_str(),
+        "inths" | "intxt" | "intcko" | "intio" | "intio67" | "intio7"
+    ) {
+        // DS39632E §2.2.5 / DS39631E §2.2.4: INTOSC is an 8 MHz clock that
+        // directly drives the device clock in the internal-oscillator
+        // microcontroller modes on every PIC18 family that has one. CPUDIV
+        // applies only to XT/HS/EC and the PLL modes (Register 25-1), not
+        // to INTOSC (epic-cc#226).
         return 8_000_000;
     }
+    let pll = matches!(osc.as_str(), "hspll" | "xtpll" | "ecpll" | "ecpio");
     if pll {
-        let plldiv = named(region, spec, "plldiv");
-        let factor = plldiv_factor(&plldiv);
         let xtal = xtal.unwrap_or_else(|| {
             panic!(
                 "epic-cc: xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
-                 (the PLL needs a known 4 MHz input, DS39632E §2.2.4)"
+                 (the PLL needs a known input frequency)"
             )
         });
+        if !has_field(region, "plldiv") {
+            // DS39631E Register 24-1 / DS39025 §2.2.2: this family's HSPLL
+            // is a fixed 4x multiplier ahead of the CPU, no PLLDIV/CPUDIV
+            // prescaler or postscaler at all.
+            return xtal * 4;
+        }
+        let plldiv = named(region, spec, "plldiv");
+        let factor = plldiv_factor(&plldiv);
         if xtal / factor != 4_000_000 || xtal % factor != 0 {
             panic!(
                 "epic-cc: xtal_hz={xtal} with plldiv={plldiv} does not produce the \
@@ -133,16 +156,22 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {
             );
         }
         // Register 25-1, PLL modes: CPUDIV 00/01/10/11 = 96 MHz / 2,3,4,6.
+        let cpudiv = named(region, spec, "cpudiv");
         96_000_000 / pll_cpu_div(&cpudiv)
     } else {
         let xtal = xtal.unwrap_or_else(|| {
             panic!(
                 "epic-cc: xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
-                 (DS39632E Register 25-1: system clock is the primary oscillator \
-                 divided by CPUDIV)"
+                 (system clock is the primary oscillator, possibly divided by CPUDIV)"
             )
         });
+        if !has_field(region, "cpudiv") {
+            // DS39631E / DS39025: no CPUDIV fuse on this family; the
+            // primary oscillator drives the system clock directly.
+            return xtal;
+        }
         // Register 25-1, XT/HS/EC/ECIO: CPUDIV 00/01/10/11 = OSC / 1,2,3,4.
+        let cpudiv = named(region, spec, "cpudiv");
         xtal / osc_cpu_div(&cpudiv)
     }
 }
