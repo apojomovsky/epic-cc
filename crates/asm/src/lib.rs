@@ -1013,9 +1013,13 @@ fn encode_pic_baseline(line: &str, sym: &std::collections::HashMap<String, usize
         }
         "CALL" => {
             let k = sym.get(op).copied().unwrap_or_else(|| parse_num(op));
+            // The 8-bit literal is the target's low 8 bits; the page comes
+            // from STATUS PA0 at runtime, so any page's low half encodes.
+            // PA0/target agreement is the page-fit audit's job, not the
+            // encoder's (it cannot see runtime state).
             assert!(
-                k <= 0xFF,
-                "asm(pic-baseline): CALL target 0x{k:02X} out of range"
+                k <= 0x3FF && (k & 0x1FF) < 0x100,
+                "asm(pic-baseline): CALL target 0x{k:03X} escapes every page low half"
             );
             0x0900 | (k as u16 & 0xFF)
         }

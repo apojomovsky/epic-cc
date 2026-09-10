@@ -33,9 +33,9 @@ fn compile(c_path: &str) -> (PicBaseline, HashMap<String, u16>) {
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
     let asm = select(&device::PIC12F509, &m, &addrs);
-    isel_pic_baseline::verify_page_fit(&m, &asm);
+    check_const_stack(&cg, &asm);
+    isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
     let words = assemble_words(&device::PIC12F509, &asm);
-
     (
         PicBaseline::with_device(&device::PIC12F509, words),
         layout.globals,
@@ -58,14 +58,29 @@ fn compile_asm(c_path: &str) -> (PicBaseline, HashMap<String, u16>, String) {
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
     let asm = select(&device::PIC12F509, &m, &addrs);
-    isel_pic_baseline::verify_page_fit(&m, &asm);
+    check_const_stack(&cg, &asm);
+    isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
     let words = assemble_words(&device::PIC12F509, &asm);
-
     (
         PicBaseline::with_device(&device::PIC12F509, words),
         layout.globals,
         asm,
     )
+}
+
+/// The const-reader CALL costs a stack level the IR depth gate never
+/// sees: with a read present, deepest frame plus `__start -> main` plus
+/// the reader must fit the 2-level silicon stack (D-5). Mirrors the
+/// driver's product check.
+fn check_const_stack(cg: &callgraph::CallGraph, asm: &str) {
+    if asm.contains("CALL __read_") {
+        assert!(
+            cg.max_depth + 1 <= device::PIC12F509.stack_depth as usize,
+            "const reads need a __read CALL level the {}-level stack cannot take at call depth {}",
+            device::PIC12F509.stack_depth,
+            cg.max_depth
+        );
+    }
 }
 
 /// Run clang alone on `c_path`, returning the `.ll` text and the
@@ -254,4 +269,120 @@ fn indirect_store_of_banked_value_lands_in_the_right_bank() {
         "buf[0] must be 5: the store through the bank-0 pointer must not be redirected to bank 1"
     );
     assert_eq!(p.ram()[globals["src"] as usize], 5, "src must be 5");
+}
+
+/// P4 const acceptance (docs/37 section 3 P4): a 128-byte flash table
+/// read at a runtime index plus a direct scalar const read, served from
+/// the page-0 low half through RETLW tables. Expected: in = 10 -> i =
+/// 10, table[10] = 0x89, magic low byte 0x34 -> out = 0xBD.
+#[test]
+fn const_table_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/const_table.c");
+    p.ram_mut()[globals["in"] as usize] = 10;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0xBD, "out = 0x89 + 0x34");
+    assert!(p.halted());
+    // The read goes through the table's reader entry in flash, not RAM:
+    // a CALL into `__read_table` must be present, and no page-1 select
+    // (the table shares page 0 with the code, D-5).
+    assert!(
+        asm.contains("CALL __read_table"),
+        "const_table.c must CALL its RETLW reader:\n{asm}"
+    );
+    assert!(
+        !asm.contains("BSF STATUS, 5"),
+        "page-0 table needs no PA0 set:\n{asm}"
+    );
+    assert_eq!(
+        ours_hex(&asm).trim(),
+        gpasm_hex(&asm, "const_table").trim(),
+        "our HEX differs from gpasm"
+    );
+}
+
+/// P4 page-1 spill: code plus a 240-byte table exceeds the page-0 low
+/// half, so the table relocates to the page-1 low half with PA0
+/// set/restore around the read, while a second 100-byte table fits the
+/// page-0 remainder (mixed-page emission). Expected: in = 150 -> i =
+/// 134, big[134] = 0xD5, j = 6, small[6] = 0x55 -> out = 0x2A.
+#[test]
+fn const_spill_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/const_spill.c");
+    p.ram_mut()[globals["in"] as usize] = 150;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0x2A, "out = 0xD5 + 0x55");
+    assert!(p.halted());
+    // The big table spilled: an `org` past page 0 plus the PA0
+    // set/restore around the cross-page CALL must be present, and both
+    // readers must be called.
+    assert!(
+        asm.contains("org 0x200"),
+        "spilled table must org into page 1:\n{asm}"
+    );
+    assert!(
+        asm.contains("BSF STATUS, 5"),
+        "page-1 read must set PA0:\n{asm}"
+    );
+    assert!(
+        asm.contains("CALL __read_big"),
+        "const_spill.c must CALL its spilled reader:\n{asm}"
+    );
+    assert!(
+        asm.contains("CALL __read_small"),
+        "const_spill.c must CALL its page-0 reader:\n{asm}"
+    );
+}
+
+/// P4 ceiling regression: a 300-byte table fits no page low half (4-word
+/// reader + 300 RETLWs > 256), so compilation panics loudly instead of
+/// silently miscompiling (D-5).
+#[test]
+#[should_panic(expected = "too large")]
+fn huge_const_table_is_rejected() {
+    let _guard = E2E_LOCK.lock();
+    let _ = compile("tests/fixtures/const_huge.c");
+}
+
+/// P4 stack-budget regression: a const read inside a callee nests
+/// `__start -> main -> at` plus the reader CALL (3 levels) on the
+/// 2-level stack, which drops the oldest return untrapped. Compilation
+/// panics loudly instead of emitting it (D-5).
+#[test]
+#[should_panic(expected = "__read CALL level")]
+fn deep_const_read_is_rejected() {
+    let _guard = E2E_LOCK.lock();
+    let _ = compile("tests/fixtures/const_deep.c");
+}
+
+/// Assemble `asm` with our encoder to HEX text for the gpasm comparison.
+fn ours_hex(asm: &str) -> String {
+    asm::assemble_file_to_hex(&device::PIC12F509, asm)
+}
+
+/// Assemble `asm` with gpasm (the oracle, GPL, never shipped) to HEX
+/// text. Runs in the container like the `asm` crate's gpasm tests.
+fn gpasm_hex(asm: &str, stem: &str) -> String {
+    let gpasm = std::env::var("PIC8_GPASM").unwrap_or_else(|_| "gpasm".into());
+    let dir = std::env::temp_dir().join(format!("pic_baseline_p4_{stem}"));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    std::fs::write(dir.join(format!("{stem}.asm")), asm).expect("write asm");
+    let out = Command::new(gpasm)
+        .args([
+            "-p",
+            "p12f509",
+            &format!("{stem}.asm"),
+            "-o",
+            &format!("{stem}.hex"),
+        ])
+        .current_dir(&dir)
+        .output()
+        .expect("run gpasm");
+    assert!(
+        out.status.success(),
+        "gpasm: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    std::fs::read_to_string(dir.join(format!("{stem}.hex"))).expect("read hex")
 }
