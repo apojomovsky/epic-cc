@@ -1610,10 +1610,10 @@ fn duplicate_isr_shared(m: Module) -> Module {
     let main_ctx = reachable(&["main"], &adj);
     let (lo_ctx, lo_read, lo_params) = isr_context_for(&m, &lo_roots, &adj, &defined);
     let (hi_ctx, hi_read, hi_params) = isr_context_for(&m, &hi_roots, &adj, &defined);
-    // main is excluded from the duplication above, so an ISR that
-    // (transitively) calls main would leave the ISR's call on the original
-    // `main` — re-entering the main context and silently collapsing the
-    // disjoint-region guarantee. Panic loudly rather than miscompile.
+    // main stays out of the duplication above, so an ISR that (transitively)
+    // calls main would leave the ISR's call on the original `main`,
+    // re-entering the main context and collapsing the disjoint-region
+    // guarantee. Panics rather than miscompiling: re-entrant main has no lowering.
     assert!(
         !lo_ctx.contains("main"),
         "isel/legalize: the low-ISR context must not reach main; re-entrant main is unsupported"
@@ -1730,16 +1730,11 @@ fn duplicate_isr_shared(m: Module) -> Module {
     rewrite_calls_to_copies(&mut funcs, &rewrite_lo, &shared_lo_set, LO_SUFFIX);
     rewrite_calls_to_copies(&mut funcs, &rewrite_hi, &shared_hi_set, HI_SUFFIX);
     // Cross-context store rewrite (epic-cc#137), per priority: a store
-    // whose value is a duplicated function and whose target is a global
-    // one priority READS must point at that priority's copy, or the ISR
-    // would load the main-context original's address and dispatch it
-    // into the main region's frames. Predicated on the target being
-    // priority-read (not merely visible): a global the ISR only writes
-    // never feeds an ISR call, and rewriting a store into it would break
-    // the epic-cc#73 fixture (main's store must stay on the original).
-    // A store feeding BOTH priorities' read sets with a doubly-shared
-    // value has no single correct spelling (one address cannot name two
-    // frames): panic loudly rather than miscompile.
+    // of a duplicated function targets the copy of the priority that
+    // READS the global (otherwise the ISR dispatches the main-context
+    // address into main frames). Write-only globals stay on the
+    // original (epic-cc#73). A store feeding BOTH priorities has no
+    // single spelling: panic, don't miscompile.
     for f in &mut funcs {
         // GEP bases are resolved before the mutation loop (the function is
         // borrowed mutably below).

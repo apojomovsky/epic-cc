@@ -5205,25 +5205,14 @@ pub fn select_with_locs(
         for (bi, b) in f.blocks.iter().enumerate() {
             g.emit_label(&labels[&b.label]);
             if bi == 0 && f.isr {
-                // The ISR save prologue, right after the vector entry at
-                // 0x0008. The preempted main's live state this saves:
-                //   - the in-flight return value (0x0000-0x0003): an ISR
-                //     that itself calls a value-returning function would
-                //     clobber it (PIC14 M13's identical hazard)
-                //   - STATUS/BSR/FSR0L/FSR0H: the ISR body's own banked
-                //     access and FSR0 pointer work would clobber them
-                //   - TBLPTRU/H/L: a const read is a multi-instruction
-                //     setup, so an interrupt taken mid-setup leaves a torn
-                //     pointer the ISR body's own const reads would misread
-                // W is saved LAST via MOVWF (which clobbers nothing), so
-                // the preempted main's W is intact until the very last
-                // save instruction.
-                // The low ISR in priority mode saves to its own 12-byte
-                // area (`alloc`'s `isr_low_save`, below the low frames):
-                // the same snapshot set, but W gets a dedicated slot at
-                // the block base. (The fixed block doubles its W slot as
-                // the FSR0H snapshot slot; the new area does not repeat
-                // that overlap.)
+                // Saves the preempted main state after the vector entry:
+                // the in-flight return value (an ISR call would clobber
+                // it), STATUS/BSR/FSRn (banked and pointer work clobbers
+                // them), and TBLPTR (a torn mid-setup pointer would
+                // misread). W saves last via `MOVWF`, which touches
+                // nothing. The low ISR saves the same set to its own
+                // area (`isr_low_save`), with a dedicated W slot (the
+                // fixed block doubles its W slot as FSR0H's, epic-cc#356).
                 let low_save = priority_mode && f.irq_priority != 1;
                 let saves: [(u16, u16); 11] = if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
