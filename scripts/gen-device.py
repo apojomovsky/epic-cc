@@ -220,6 +220,7 @@ def find_pack_name(atdf_path: pathlib.Path) -> str | None:
     # caller must supply the pack name explicitly (--pack) or refuse.
     root = find_pack_root(atdf_path)
     return root.name if root is not None else None
+
 def find_edc_pic(stem: str):
     name = stem_to_edc_name(stem) + ".PIC"
     base = pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs")
