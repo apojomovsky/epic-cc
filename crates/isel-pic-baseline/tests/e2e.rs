@@ -161,6 +161,82 @@ fn banked_c_runs_correctly_and_reasserts_fsr5() {
     }
 }
 
+/// P3 pointer/array acceptance (docs/37 section 3 P3): a runtime RAM
+/// pointer (FSR/INDF path) with a volatile index. `in` is a 16-bit
+/// volatile so clang keeps the index mask as an i16 `and`. Expected:
+/// in = 1 -> ram[1] = 2 -> out = 2.
+#[test]
+fn ptr_probe_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/ptr_probe.c");
+    p.ram_mut()[globals["in"] as usize] = 1;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 2, "out = ram[1] = 2");
+    // Pin the indexed cell: the store must land at ram[1], not ram[0] (an
+    // index term dropped from the FSR setup would round-trip through ram[0]
+    // and still read back into out == 2).
+    assert_eq!(
+        p.ram()[globals["ram"] as usize + 1],
+        2,
+        "store landed at ram[1]"
+    );
+    assert_eq!(
+        p.ram()[globals["ram"] as usize],
+        0,
+        "ram[0] must stay untouched"
+    );
+    assert!(p.halted());
+}
+
+/// P3 array acceptance: a non-const array written and read at a runtime
+/// index, the pure FSR/INDF path. Expected: in = 3 -> buf[3] = 4 -> out =
+/// 4.
+#[test]
+fn array_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/array.c");
+    p.ram_mut()[globals["in"] as usize] = 3;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 4, "out = buf[3] = 4");
+    // Pin the indexed cell: buf[3], not buf[0] (a dropped index would
+    // round-trip through buf[0] and still give out == 4).
+    assert_eq!(
+        p.ram()[globals["buf"] as usize + 3],
+        4,
+        "store landed at buf[3]"
+    );
+    assert_eq!(
+        p.ram()[globals["buf"] as usize],
+        0,
+        "buf[0] must stay untouched"
+    );
+    assert!(p.halted());
+}
+
+/// P3 structs acceptance: byval calls (sum/pick) and a dynamic
+/// array-in-struct through FSR/INDF. Expected: out == 0x48.
+#[test]
+fn structs_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/structs.c");
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 0x48, "structs trace");
+    // Pin the dynamic array cell: arr.v[2] must be 0x11, not arr.v[0] (a
+    // dropped index from the store would round-trip through arr.v[0] and
+    // pick() would still read it back into out).
+    assert_eq!(
+        p.ram()[globals["arr"] as usize + 3],
+        0x11,
+        "arr.v[2] = 0x11"
+    );
+    assert_eq!(
+        p.ram()[globals["arr"] as usize + 1],
+        0,
+        "arr.v[0] untouched"
+    );
+    assert!(p.halted());
+}
+
 /// Regression (epic-cc#325 follow-up): a store of a bank-1 value through a
 /// runtime indirect pointer to a bank-0 destination. The value load's
 /// `BSF FSR,5` reassert must not clobber the pointer's FSR setup before
