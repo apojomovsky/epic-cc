@@ -16,6 +16,16 @@ Output: crates/device/devices/<stem>.toml deterministically formatted.
   python3 scripts/gen-device.py PIC16F887 --out crates/device/devices/p16f887.toml
   python3 scripts/gen-device.py p16f887 --check   # CI: fails if drift
 
+Sweep mode (breadth proofing, docs/38 D-2):
+  python3 scripts/gen-device.py --sweep <pack-dir> [--out-dir <scratch>] [--pack <name>]
+  Attempts generation for every part in an unpacked DFP directory and
+  prints a triage report (ok / missing-facts / error) instead of stopping
+  at the first failure. Exit 0 when every part generated, 1 when any part
+  failed, 2 on usage errors. --out-dir writes each successful TOML to a
+  scratch directory, never the registry: the sweep finds generator gaps, it
+  does not commit devices. --pack names the DFP for the provenance stanza
+  when the directory has no *_DFP ancestor.
+
 Provenance pack name: derived from the source file's nearest *_DFP ancestor
 directory (how a .atpack unzips). A file extracted elsewhere has no such
 ancestor; pass --pack <name> explicitly, or the generator refuses to write
@@ -209,9 +219,9 @@ def find_edc_pic(stem: str):
                 return p
     return None
 
-def find_ini_and_cfgdata(stem: str):
+def find_ini_and_cfgdata_in(base: pathlib.Path, stem: str):
+    """ini/cfgdata under a pack directory, the .atpack layout (ADR-020)."""
     suffix = stem_to_suffix(stem).lower()
-    base = pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs")
     ini = None
     cfg = None
     if base.exists():
@@ -222,6 +232,9 @@ def find_ini_and_cfgdata(stem: str):
             cfg = p
             break
     return ini, cfg
+
+def find_ini_and_cfgdata(stem: str):
+    return find_ini_and_cfgdata_in(pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs"), stem)
 
 def parse_ini(ini_path: pathlib.Path):
     text = ini_path.read_text()
@@ -813,6 +826,55 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
     content = "\n".join(out_lines).rstrip() + "\n"
     return content
 
+def sweep_pack(pack_dir: pathlib.Path, out_dir=None, pack=None):
+    """Attempt generation for every part in an unpacked DFP directory.
+
+    The sweep's job is breadth proofing (docs/38 D-2): surface DFP spelling
+    quirks across a whole pack cheaply, before a human meets them one
+    device at a time. It never commits anything; `out_dir` is a scratch
+    directory for the successful TOMLs, and the report is the deliverable.
+
+    Returns `(results, failures)`: `results` is a list of
+    `(stem, "ok" | "missing-facts" | "error", detail)` in directory order,
+    `failures` the count of non-ok entries. `detail` is the first missing
+    field for `missing-facts`, the exception message for `error`.
+    """
+    if not pack_dir.is_dir():
+        print(f"gen-device --sweep: {pack_dir} is not a directory", file=sys.stderr)
+        sys.exit(2)
+    if out_dir is not None and out_dir.exists() and not out_dir.is_dir():
+        print(f"gen-device --sweep: --out-dir {out_dir} is not a directory", file=sys.stderr)
+        sys.exit(2)
+    if out_dir is not None:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    results = []
+    failures = 0
+    for src in sorted(pack_dir.rglob("*.PIC")):
+        stem = normalize_stem(src.stem)
+        # The swept pack is the source of truth for ini/cfgdata too: a real
+        # .atpack carries its own xc8/pic/dat (ADR-020), so the sweep must
+        # not depend on a global XC8 install that may be absent or a
+        # different pack version. The global install stays the fallback.
+        ini, cfg = find_ini_and_cfgdata_in(pack_dir, stem)
+        if ini is None and cfg is None:
+            ini, cfg = find_ini_and_cfgdata(stem)
+        try:
+            content = generate_toml(stem, ini, cfg, src, pack)
+        except MissingFacts as e:
+            results.append((stem, "missing-facts", e.args[0][0]))
+            failures += 1
+            continue
+        except Exception as e:
+            # A malformed file must not abort the sweep: it is one row in
+            # the triage report, the same as a missing fact.
+            results.append((stem, "error", f"{type(e).__name__}: {e}"))
+            failures += 1
+            continue
+        if out_dir is not None:
+            (out_dir / f"{stem}.toml").write_text(content)
+        results.append((stem, "ok", ""))
+    return results, failures
+
 def strip_provenance_block(text: str) -> str:
     # --check compares device numbers, not origin metadata: the stanza's
     # shape is validated separately by crates/device/provenance.rs, and its
@@ -823,13 +885,36 @@ def strip_provenance_block(text: str) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description="DFP/ATDF -> TOML generator for epic-cc device registry")
-    ap.add_argument("device", help="device name: p16f887, PIC16F887, 16f887, etc.")
+    ap.add_argument("device", nargs="?", help="device name: p16f887, PIC16F887, 16f887, etc. (not used with --sweep)")
     ap.add_argument("--atdf", type=pathlib.Path, help="explicit ATDF/EDC PIC file path")
     ap.add_argument("--pack", help="DFP pack name for the provenance stanza, e.g. Microchip.PIC16Fxxx_DFP (required when --atdf has no *_DFP ancestor directory)")
     ap.add_argument("--out", type=pathlib.Path, help="output TOML path (default crates/device/devices/<stem>.toml)")
     ap.add_argument("--check", action="store_true", help="verify existing TOML matches generated; exit 1 on drift")
     ap.add_argument("--with-sfrs", action="store_true", help="include SFR table (placeholder)")
+    ap.add_argument("--sweep", metavar="PACK_DIR",
+                    help="sweep an unpacked DFP directory: generate for every part, report failures instead of stopping")
+    ap.add_argument("--out-dir", type=pathlib.Path,
+                    help="with --sweep: scratch directory for the successful TOMLs (never the registry)")
     args = ap.parse_args()
+    if args.sweep is not None:
+        # Single-part flags have no meaning here; silently ignoring them
+        # would make a carried-over habit look like it worked.
+        for flag, value in (("--atdf", args.atdf), ("--out", args.out), ("--check", args.check)):
+            if value:
+                ap.error(f"{flag} cannot be combined with --sweep (use --out-dir for sweep output)")
+        results, failures = sweep_pack(pathlib.Path(args.sweep), args.out_dir, args.pack)
+        for stem, status, detail in results:
+            if status == "ok":
+                print(f"  ok  {stem}")
+            else:
+                print(f"  {status:<14} {stem}: {detail}")
+        if not results:
+            print(f"gen-device --sweep: no *.PIC files found under {args.sweep}", file=sys.stderr)
+            sys.exit(1)
+        print(f"gen-device --sweep: {len(results) - failures}/{len(results)} parts generated, {failures} failed")
+        sys.exit(1 if failures else 0)
+    if not args.device:
+        ap.error("a device name is required unless --sweep is given")
     stem = normalize_stem(args.device)
     atdf_path = args.atdf
     ini = None
