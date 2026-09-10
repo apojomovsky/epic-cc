@@ -503,7 +503,9 @@ class GenDeviceBaselineArchTest(unittest.TestCase):
     """Baseline parts name their architecture PIC12 in ini and 16c5x in
     EDC, neither of which the core maps knew. The PIC16Fxxx mid-range
     pack ships baseline PIC16F5x EDC next to the mid-range parts, so
-    its sweep tripped over them (epic-cc#337)."""
+    its sweep tripped over them (epic-cc#337). Baseline output also
+    carries fsr_bank_bits (derived from the EDC GPR bank numbers,
+    epic-cc#338) and no interrupt vector."""
 
     def write_ini(self, d):
         ini = pathlib.Path(d) / "p12syntest.ini"
@@ -519,13 +521,43 @@ class GenDeviceBaselineArchTest(unittest.TestCase):
         )
         return cfg
 
+    def write_edc(self, d, banks=(0, 1)):
+        gprs = "\n".join(
+            f'      <edc:GPRDataSector edc:regionid="gpr{b}" '
+            f' edc:beginaddr="0x{b * 16:02X}" edc:endaddr="0x{b * 16 + 16:02X}"'
+            f' edc:bank="0x{b}"/>'
+            for b in banks
+        )
+        src = pathlib.Path(d) / "PICBASESYN.PIC"
+        src.write_text(
+            '<edc:PIC xmlns:edc="http://crownking/edc"'
+            ' edc:name="PICBASESYN" edc:arch="16c5x">\n'
+            '  <edc:ArchDef edc:name="16c5x">'
+            '<edc:MemTraits edc:hwstackdepth="0x2"/></edc:ArchDef>\n'
+            "  <edc:ProgramSpace>\n"
+            '    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>\n'
+            "  </edc:ProgramSpace>\n"
+            '  <edc:DataSpace edc:endaddr="0x100">\n'
+            "    <edc:RegardlessOfMode>\n"
+            f"{gprs}\n"
+            "    </edc:RegardlessOfMode>\n"
+            "  </edc:DataSpace>\n"
+            "</edc:PIC>\n"
+        )
+        return src
+
     def test_ini_arch_pic12_maps_to_pic_baseline(self):
         with tempfile.TemporaryDirectory() as d:
             ini = self.write_ini(d)
             cfg = self.write_cfgdata(d)
-            text = gen_device.generate_toml("p12syntest", ini, cfg, None)
+            edc = self.write_edc(d)
+            text = gen_device.generate_toml(
+                "p12syntest", ini, cfg, edc, pack="Microchip.PIC10-12Fxxx_DFP"
+            )
         self.assertIn('core = "pic-baseline"', text)
         self.assertIn("flash_words = 1024", text)
+        self.assertIn("fsr_bank_bits = 1", text)
+        self.assertIn("interrupt_vectors = []", text)
 
     def test_edc_arch_16c5x_maps_to_pic_baseline(self):
         text = FIXTURE.read_text().replace("16xxxx", "16c5x")
@@ -538,6 +570,57 @@ class GenDeviceBaselineArchTest(unittest.TestCase):
             )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('core = "pic-baseline"', out)
+
+    def test_eight_bank_baseline_part_is_missing_facts_not_capped(self):
+        # Eight GPR banks need three FSR bank bits; the device schema
+        # allows at most two for pic-baseline. Refusing names the
+        # core-code decision instead of emitting a TOML the tree
+        # cannot validate (epic-cc#338: p16f59, p16f570, p12f529t39a,
+        # p12f529t48a).
+        with tempfile.TemporaryDirectory() as d:
+            ini = self.write_ini(d)
+            cfg = self.write_cfgdata(d)
+            edc = self.write_edc(d, banks=range(8))
+            with self.assertRaises(gen_device.MissingFacts) as ctx:
+                gen_device.generate_toml(
+                    "p12syntest", ini, cfg, edc, pack="Microchip.PIC10-12Fxxx_DFP"
+                )
+        self.assertIn("fsr_bank_bits", str(ctx.exception.args[0]))
+
+    def test_dcr_impl_mismatch_ignored_off_pic18(self):
+        # The DCR covered==impl check verifies cursor math for its only
+        # consumer, pic18. Baseline PIC10F EDC states impl 0x1c against
+        # fields agreeing on 0x1d; parsing it anyway turned discarded
+        # data into a hard failure (epic-cc#338).
+        dcr = (
+            '<edc:DCRDef edc:name="CONFIG" edc:_addr="0xFFF" edc:impl="0x1c">'
+            "<edc:DCRModeList><edc:DCRMode>"
+            '<edc:DCRFieldDef edc:name="OSC" edc:mask="0x1" edc:nzwidth="0x1">'
+            '<edc:DCRFieldSemantic edc:cname="IntRC"'
+            ' edc:when="(field &amp; 0x1) == 0x1"/>'
+            "</edc:DCRFieldDef></edc:DCRMode></edc:DCRModeList></edc:DCRDef>"
+        )
+
+        def edc_with_arch(arch):
+            return (
+                '<edc:PIC xmlns:edc="http://crownking/edc"'
+                f' edc:name="SYN" edc:arch="{arch}">'
+                "  <edc:ProgramSpace>"
+                '<edc:ConfigFuseSector edc:beginaddr="0xFFF"'
+                f' edc:endaddr="0x1000">{dcr}</edc:ConfigFuseSector>'
+                "  </edc:ProgramSpace></edc:PIC>"
+            )
+
+        with tempfile.TemporaryDirectory() as d:
+            other = pathlib.Path(d) / "other.PIC"
+            other.write_text(edc_with_arch("16c5x"))
+            parsed = gen_device.parse_edc(other)
+            self.assertEqual(parsed["config_sectors"], [(0xFFF, 0x1000)])
+            self.assertNotIn("config_dcr", parsed)
+            pic18 = pathlib.Path(d) / "pic18.PIC"
+            pic18.write_text(edc_with_arch("18xxxx"))
+            with self.assertRaises(gen_device.MissingFacts):
+                gen_device.parse_edc(pic18)
 
 
 class GenDeviceSweepTest(unittest.TestCase):

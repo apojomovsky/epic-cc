@@ -2,8 +2,9 @@
 # 41 GPR bytes in three regions. First baseline part, landed behind the
 # driver firewall; design of record is docs/37-pic-baseline-port-design.md.
 # Hand-transcribed from the datasheets and cross-checked against gputils
-# 1.5.2 (12f509_g.lkr, p12f509.inc); no DFP pack feeds gen-device for this
-# part, hence the datasheet tier below.
+# 1.5.2 (12f509_g.lkr, p12f509.inc), hence the datasheet tier below; the
+# DFP (Microchip.PIC10-12Fxxx_DFP) now reproduces these device numbers
+# through gen-device.py (epic-cc#338).
 name = "p12f509"
 core = "pic-baseline"
 flash_words = 1024
