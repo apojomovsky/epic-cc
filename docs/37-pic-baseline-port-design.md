@@ -309,7 +309,7 @@ and `docs/33` used, front-loaded on de-risking:
 | P4 | `const` in flash via `RETLW`, respecting the 256-word ceiling (D-5) | P2 |
 | P5 | ~~Interrupts~~: does not exist on this core, phase dropped entirely | n/a |
 | P6 | 32-bit `long`, mul/div runtime (third or fourth copy of the same routines, per the existing per-core-copy precedent) | P2 |
-| P7 | Soft-float, if scoped in at all. **[VERIFY]**: with 25-41 bytes of RAM total, ask whether IEEE-754 single float has anywhere to live before committing to this phase; may be a documented non-goal instead | P6 |
+| P7 | ~~Soft-float~~: documented non-goal, settled NO-GO by the P6 RAM budget (see §4 item 4) | n/a |
 | P8 | Fuzz gate, device-threaded differential runner, `PicBaseline` arm in `run_pic` | P1-P7 |
 
 **gputils oracle coverage confirmed** (open question #3, formerly
@@ -361,12 +361,14 @@ Still open:
    (gpasm-verified); `common_ram` keeps its allocatable-window meaning
    (0x07-0x0F shared GPR), and the SFR mirror is core architecture in
    `bank_of`, not device data. Resolutions cited in the TOML and D-3.
-4. P7's `[VERIFY]`: with 25-41 bytes of GPR total, does IEEE-754
-   single-precision soft-float have anywhere to live at all? This is
-   a real, unresolved feasibility question the phase table raises and
-   does not answer; P7 may turn out to be a documented non-goal
-   instead of a phase. Should be settled by P6, not deferred to P7
-   itself.
+4. ~~P7's `[VERIFY]`: with 25-41 bytes of GPR total, does IEEE-754
+   single-precision soft-float have anywhere to live at all?~~ Resolved
+   NO-GO by the P6 RAM budget (epic-cc#382): p12f509 has 41 GPR bytes,
+   9 common holding fixed scratch and retval, leaving 32 bank bytes. The
+   sdiv/srem_i32 program already fills 32 of 32, and a minimal float
+   program needs 4 (one f32 global) plus 8 (main peak, measured) plus 22
+   (add/sub/mul working set) = 34 > 32. Soft-float is a non-goal here;
+   no partial or degraded float will be attempted.
 5. `docs/33`'s revision history is the cautionary precedent for this
    whole document: two revisions were held on independent review
    before approval, for a document written by the same process this
