@@ -660,20 +660,12 @@ def parse_edc(edc_path: pathlib.Path):
             gpr_banks_known = False
         else:
             gpr_banks.append(int(bank, 0))
-    # A bank whose own GPR is entirely one shadow (confirmed on PIC16F74's
-    # bank 2/3 and PIC16F84's bank 1: bit-for-bit the same silicon as
-    # another bank, addressable a second way for no compiler benefit) votes
-    # nothing: dropping it is correct regardless of what else shadows the
-    # same target. A bank that mixes a shadow alongside its own real GPR
-    # (confirmed on PIC16F628A/87/88/747/877's `gprnobnk` corner, present in
-    # every other bank at the same relative offset beside that bank's own
-    # storage) means the shadow's target really is bank-independent, so its
-    # target becomes a common_ram candidate. Grouping by bank rather than
-    # counting shadowidref references is what tells these apart: a target
-    # referenced by exactly one shadow can still be genuinely common if that
-    # lone shadow's bank is otherwise real (a 2-bank part with one small
-    # shared corner), while a target referenced twice is still a plain
-    # duplicate if each referencing bank has no other GPR of its own.
+    # A bank that is entirely one shadow (PIC16F74 bank 2/3, PIC16F84 bank
+    # 1: the same silicon as another bank, addressable a second way for no
+    # benefit) votes nothing. A bank mixing a shadow with its own real GPR
+    # (PIC16F628A/87/88/747/877's `gprnobnk` corner) means that shadow's
+    # target is genuinely bank-independent, a common_ram candidate. Bank
+    # membership, not shadow reference count, is what tells these apart.
     banks_with_primary = {bank for _, _, _, bank in sectors}
     common_candidates = {
         target for _, _, target, bank in shadows if bank in banks_with_primary
