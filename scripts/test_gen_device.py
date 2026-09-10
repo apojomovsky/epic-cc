@@ -221,20 +221,35 @@ class GenDevicePic18Test(unittest.TestCase):
         self.assertIn("does not match", r.stderr)
         self.assertEqual(text, "")
 
-    def test_noncontiguous_field_mask_is_a_hard_failure(self):
-        # ALPHA's mask (0x1) is a contiguous 1-bit run, the only shape the
-        # width/cursor reconstruction handles. A mask like 0x5 (bits 0 and 2)
-        # would silently be re-encoded as a wrong, contiguous 0x3 without
-        # this check.
+    def test_scattered_field_mask_generates(self):
+        # A mask like 0x5 (bits 0 and 2) is scattered within its span, the
+        # PIC16F628A FOSC shape (mask 0x13 over a 5-bit window). The cursor
+        # advances by span and the absolute bits are mask << cursor, so this
+        # generates with the scattered mask intact instead of being
+        # re-encoded as a wrong contiguous run.
         tampered = PIC18_FIXTURE.read_text().replace(
             'edc:name="ALPHA" edc:mask="0x1"', 'edc:name="ALPHA" edc:mask="0x5"'
         )
         with tempfile.TemporaryDirectory() as d:
-            src = pathlib.Path(d) / "bad_mask.atdf"
+            src = pathlib.Path(d) / "scattered_mask.atdf"
             src.write_text(tampered)
             r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
-        self.assertNotEqual(r.returncode, 0, "a non-contiguous field mask must not generate")
-        self.assertIn("not a contiguous run", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("mask = 0x05", text)
+
+    def test_mask_outside_nzwidth_span_is_a_hard_failure(self):
+        # A mask that does not fit its nzwidth span is inconsistent source
+        # data, not a scattered field: refusing beats placing wrong bits.
+        tampered = PIC18_FIXTURE.read_text().replace(
+            'edc:name="ALPHA" edc:mask="0x1"',
+            'edc:name="ALPHA" edc:mask="0x5" edc:nzwidth="0x1"'
+        )
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "bad_span.atdf"
+            src.write_text(tampered)
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+        self.assertNotEqual(r.returncode, 0, "a mask outside its span must not generate")
+        self.assertIn("does not fit", r.stderr)
         self.assertEqual(text, "")
 
     def test_unhandled_relational_when_is_a_hard_failure(self):

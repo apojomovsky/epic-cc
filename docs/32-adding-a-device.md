@@ -217,7 +217,8 @@ Two failure shapes to expect and fix, not route around:
 | DFP pack understates RAM banks for a device the generator otherwise handles correctly | `p18f2550`, `p18f4550`, same DFP pack | `#231`, `#232`, `scripts/gen-device.py` module docstring |
 | DFP pack revision spells config enum values (and even a field name) differently than an already-shipped sibling for the identical hardware bit | `p18f2550` vs. `p18f4550` | `#232`, `scripts/gen-device.py`'s `PART_FIELD_ALIASES`/`PART_VALUE_ALIASES` |
 | A field the backend cannot honor for every silicon-legal value needs an explicit `locked` value, not just a `default` | PIC18 `xinst` | `#232`, `crates/device/src/config.rs`'s `locked` handling |
-| Core-dispatched Rust code hardcoding a literal transcribed from the first device on a core instead of deriving it from `Device` fields | PIC18 access-bank boundary in `isel-pic18` | `#226` (issue), `#234` (fix) |
+| A config field with scattered bits (non-contiguous mask) fails generation until the DCR and cfgdata paths handle spans, not widths | `p16f628a` FOSC mask `0x13` | `#372`, `scripts/gen-device.py` span handling, `crates/device/build.rs` scattered-mask validation |
+| Single-part `--atdf` generation finds no ini/cfgdata when the pack lives outside the global XC8 install | `p16f628a` from a `/tmp` DFP cache | `#372`, `scripts/gen-device.py` pack-local ini/cfgdata lookup |
 
 This table is deliberately device-specific in its "confirmed on" column
 and generic in its "pattern" column, the same posture

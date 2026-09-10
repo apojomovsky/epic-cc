@@ -212,8 +212,9 @@ impl Device {
 #[derive(Clone, Copy, Debug)]
 pub struct FuseValue {
     pub name: &'static str,
-    /// The raw bit pattern this value encodes, already positioned at bit 0
-    /// (shifted into place by `resolve_config` using the field's `shift`).
+    /// Raw bit pattern this value encodes, positioned at bit 0 and placed
+    /// by `resolve_config` as `(bits << shift) & mask`. Values never set
+    /// bits outside `mask >> shift`.
     pub bits: u8,
 }
 
@@ -223,6 +224,8 @@ pub struct FuseField {
     /// Offset into the region, 0-based (e.g. CONFIG4L is offset 6 in the
     /// PIC18F4550's region, which starts at `base_byte_addr`).
     pub byte_offset: u16,
+    /// Bits this field owns in its byte. Usually contiguous, but may be
+    /// scattered (PIC16F628A `osc` is 0x13); `shift` is the lowest set bit.
     pub mask: u8,
     pub shift: u8,
     pub values: &'static [FuseValue],

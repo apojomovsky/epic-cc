@@ -126,11 +126,12 @@ fn by_name_resolves_both_devices() {
 
 #[test]
 fn all_contains_every_seed_device() {
-    assert_eq!(device::ALL.len(), 11);
+    assert_eq!(device::ALL.len(), 12);
     assert!(device::ALL.iter().any(|d| d.name == "p16f877a"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f4550"));
     assert!(device::ALL.iter().any(|d| d.name == "p16f887"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f2550"));
+    assert!(device::ALL.iter().any(|d| d.name == "p16f628a"));
     for stem in [
         "p16f1933", "p16f1934", "p16f1936", "p16f1937", "p16f1938", "p16f1939", "p12f509",
     ] {
@@ -203,19 +204,35 @@ fn every_device_exposes_an_sfr_table() {
 }
 
 #[test]
-fn fuse_masks_are_contiguous_at_their_shift() {
-    // build.rs rejects a mask that is not `width` contiguous bits at `shift`.
-    // Assert the shipped data satisfies the invariant the generator enforces,
-    // so a regression in either surfaces here rather than at resolve time.
+fn fuse_masks_agree_with_shift_and_hold_their_values() {
+    // build.rs rejects a mask whose lowest set bit is not `shift` and a
+    // value that does not fit inside the mask once shifted. Masks may be
+    // scattered (PIC16F628A FOSC is 0x13). Assert the shipped data satisfies
+    // the invariant the generator enforces, so a regression in either
+    // surfaces here rather than at resolve time.
     for d in device::ALL {
         for f in d.config.fields {
-            let width = f.mask.count_ones();
-            let expected = (((1u16 << width) - 1) << f.shift) as u16;
             assert_eq!(
-                f.mask as u16, expected,
-                "{}: field {} mask {:#04X} is not {} bit(s) at shift {}",
-                d.name, f.name, f.mask, width, f.shift
+                f.mask.trailing_zeros() as u8,
+                f.shift,
+                "{}: field {} mask {:#04X} lowest set bit is not shift {}",
+                d.name,
+                f.name,
+                f.mask,
+                f.shift
             );
+            for v in f.values {
+                assert_eq!(
+                    ((v.bits as u16) << f.shift) & !(f.mask as u16),
+                    0,
+                    "{}: field {} value {} bits {} outside mask {:#04X}",
+                    d.name,
+                    f.name,
+                    v.name,
+                    v.bits,
+                    f.mask
+                );
+            }
         }
     }
 }

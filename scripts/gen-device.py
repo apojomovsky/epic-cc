@@ -122,6 +122,13 @@ PART_VALUE_ALIASES = {
     "p16f877a": {
         "osc": {"extrc": "rc", "extrc_clkout": "rc"},
     },
+    "p16f628a": {
+        "osc": {
+            "extrcclk": "extrc_clkout", "extrcio": "extrc_noclkout",
+            "intoscclk": "intosc_clkout", "intoscio": "intosc_noclkout",
+            "ecio": "ec",
+        },
+    },
     "p18f2550": {
         "osc": {
             "hspll_hs": "hspll", "intosc_hs": "inths", "intosc_xt": "intxt",
@@ -200,16 +207,19 @@ PART_DEFAULTS = {
     },
 }
 
+def find_pack_root(atdf_path: pathlib.Path) -> pathlib.Path | None:
+    for parent in atdf_path.resolve().parents:
+        if "_DFP" in parent.name.upper():
+            return parent
+    return None
+
 def find_pack_name(atdf_path: pathlib.Path) -> str | None:
     # DFP directories are named *_DFP (optionally version-suffixed); the
     # immediate parent is just "edc", which would misrepresent the source.
     # None means the file was extracted outside its pack directory; the
     # caller must supply the pack name explicitly (--pack) or refuse.
-    for parent in atdf_path.resolve().parents:
-        if "_DFP" in parent.name.upper():
-            return parent.name
-    return None
-
+    root = find_pack_root(atdf_path)
+    return root.name if root is not None else None
 def find_edc_pic(stem: str):
     name = stem_to_edc_name(stem) + ".PIC"
     base = pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs")
@@ -359,11 +369,15 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
     Bit position within a byte comes from `AdjustPoint`, whose `offset`
     means "skip this many reserved bits before the next field", not an
     absolute position: a byte's fields and `AdjustPoint`s are walked in
-    document order with a running cursor. This is verified per byte against
-    the DCRDef's own `impl` bitmask (the union of every field's bit range,
-    including hidden/reserved ones, must equal `impl` exactly); a mismatch
-    means the cursor math is wrong for that byte and is a hard failure, not
-    a best-effort guess.
+    document order with a running cursor. A field's `mask` may be scattered
+    within its `nzwidth` span (PIC16F628A FOSC: mask 0x13 over a 5-bit
+    window, span bits 2:3 belong to WDTE/PWRTE overlaid via a negative
+    `AdjustPoint` rewind), so the cursor advances by span, not popcount,
+    and the absolute bits are `mask << cursor`. This is verified per byte
+    against the DCRDef's own `impl` bitmask (the union of every field's bit
+    range, including hidden/reserved ones, must equal `impl` exactly);
+    a mismatch means the cursor math is wrong for that byte and is a hard
+    failure, not a best-effort guess.
 
     Returns `(base_addr, num_bytes, fields)`, `fields` a list of raw dicts
     (`raw_name`, `byte_offset`, `mask`, `shift`, `values`), unaliased.
@@ -391,20 +405,15 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                 mask = int(child.get(ns + "mask"), 0)
                 width = bin(mask).count("1")
                 fname = child.get(ns + "name")
-                # The field's own mask must be a contiguous run from bit 0
-                # (its local, unshifted value-mask; AdjustPoint supplies the
-                # real position). A non-contiguous mask means this field's
-                # bits aren't packed the way the cursor walk assumes, and
-                # reconstructing mask/shift from width alone would silently
-                # encode the wrong bits.
-                if mask != (1 << width) - 1:
+                span = int(child.get(ns + "nzwidth", "0"), 0) or mask.bit_length()
+                if mask >= (1 << span):
                     raise MissingFacts([
                         f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
-                        f"field {fname}'s mask 0x{mask:x} is not a "
-                        f"contiguous run from bit 0, cannot place it from "
-                        f"width and cursor alone"
+                        f"field {fname}'s mask 0x{mask:x} does not fit its "
+                        f"nzwidth span {span}, cannot place it from mask and "
+                        f"cursor alone"
                     ])
-                field_bits = ((1 << width) - 1) << cursor
+                field_bits = mask << cursor
                 hidden = (
                     child.get(ns + "ishidden") == "true"
                     or child.get(ns + "islanghidden") == "true"
@@ -461,15 +470,22 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                             f"field {fname} has no non-hidden semantic, "
                             f"cannot determine its legal values"
                         ])
+                    for vname, vbits in values:
+                        if vbits & ~mask:
+                            raise MissingFacts([
+                                f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                                f"field {fname} value {vname} bits 0x{vbits:x} "
+                                f"outside mask 0x{mask:x}"
+                            ])
                     if values:
                         fields.append({
                             "raw_name": fname,
                             "byte_offset": addr - base,
-                            "mask": ((1 << width) - 1) << cursor,
+                            "mask": mask << cursor,
                             "shift": cursor,
                             "values": values,
                         })
-                cursor += width
+                cursor += span
         if covered != impl:
             raise MissingFacts([
                 f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): field bit "
@@ -792,12 +808,15 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
                 byte_in_word = word_shift // 8
                 shift_in_byte = word_shift % 8
                 mask_in_byte = (mask_word >> (byte_in_word * 8)) & 0xFF
-                width = bin(mask_in_byte).count("1")
                 byte_offset = cword_byte_base + byte_in_word
+                # Values stay scattered relative to `shift_in_byte`
+                # (PIC16F628A FOSC keeps 0x13, not compressed to 0x7);
+                # the resolver places them as `(bits << shift) & mask`.
+                rel_mask = mask_in_byte >> shift_in_byte
                 raw_values = []
                 for v in setting["values"]:
                     raw_val = v["value"]
-                    normalized = (raw_val >> word_shift) & ((1 << width) - 1) if width < 8 else (raw_val >> word_shift)
+                    normalized = (raw_val >> word_shift) & rel_mask
                     raw_values.append((v["name"], normalized))
                 f = finalize_field(setting["name"], byte_offset, mask_in_byte, shift_in_byte, raw_values)
                 if f is not None:
@@ -960,9 +979,14 @@ def main():
             print(f"gen-device: --atdf {atdf_path} not found", file=sys.stderr)
             sys.exit(2)
         edc = atdf_path
-        ini2, cfg2 = find_ini_and_cfgdata(stem)
-        ini = ini2
-        cfg = cfg2
+        ini, cfg = None, None
+        pack_root = find_pack_root(atdf_path)
+        if pack_root is not None:
+            ini, cfg = find_ini_and_cfgdata_in(pack_root, stem)
+        if ini is None or cfg is None:
+            ini2, cfg2 = find_ini_and_cfgdata(stem)
+            ini = ini if ini is not None else ini2
+            cfg = cfg if cfg is not None else cfg2
         if atdf_path.suffix.lower() == ".ini":
             ini = atdf_path
             edc = None
