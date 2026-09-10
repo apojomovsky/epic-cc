@@ -67,14 +67,14 @@ program = "i64"
 sdcc_observed = 0
 expected = 0x9A
 
-# printf %f on p18f4550: SDCC compiles, links, and runs the probe, but
-# its `out` stays 0x00 while epic-cc folds 0x41. SDCC's own %f core is
-# verified working independently (its sprintf path formats "d=3.500000"
-# into RAM under the same image and oracle flags); what never observably
-# fires through the portable `void putchar(char) __wparam` sink is
-# printf's putchar call. The row pins epic-cc's hand-computed
-# conformance value; the putchar ABI question is tracked by epic-cc#352,
-# not this probe.
+# printf %f on p18f4550 (epic-cc#352): SDCC compiles, links, and runs the
+# probe, but its `out` stays 0x00 while epic-cc folds 0x41. The %f core
+# works (sprintf formats "d=3.500000" into RAM on the same image); what
+# never fires is printf's putchar call. #352 showed the user sink links
+# once and works direct-called, yet printf and fprintf miss it for %d and
+# %f alike, with stdout NULL, rerouted to STREAM_USER, or via
+# fprintf(STREAM_USER). Breakpoints on the true-layout image show printf
+# and __stream_putchar run while neither sink ever executes; gpsim agrees.
 [[bug]]
 device = "p18f4550"
 program = "printf-f"

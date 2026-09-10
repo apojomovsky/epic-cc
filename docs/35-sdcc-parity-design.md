@@ -118,7 +118,7 @@ and epic-cc's tree. Items marked **verify** are ones where the corpus
 | Memory models — code-pointer width (manual 4.10.11) | small/large | static overlay only | separate axis from the stack model above |
 | malloc / heap | ✅ | ❌ | library work |
 | math.h | ✅ | ❌ | library work |
-| `printf` `%f` | ✅, but only if `device/lib/pic16` is rebuilt with `--enable-floats` (manual 4.10.9); default build prints `<NO FLOAT>` | ✅ | formatter shipped (#295); the `printf-f` probe formats 3.5 through printf on all three cores (conformance pinned); the p18f4550 differential is arbitrated (putchar sink-ABI incompatibility, `sdcc-known-bugs.toml`) |
+| `printf` `%f` | ✅, but only if `device/lib/pic16` is rebuilt with `--enable-floats` (manual 4.10.9); default build prints `<NO FLOAT>` | ✅ | formatter shipped (#295); the `printf-f` probe formats 3.5 through printf on all three cores (conformance pinned); the p18f4550 differential is arbitrated (SDCC libc never delivers printf output to the portable putchar sink on any stream route, gpsim-confirmed in #352; `sdcc-known-bugs.toml`) |
 | Code/eeprom pointers (3-byte generic) | ✅ | partial | pointer-to-const traversal in flash verified at parity on all three cores (`constptr` probe, TBLRD/RETLW path); SDCC's space-qualified pointers (`__code`/`__eeprom`, runtime-selected spaces) stay open under #267 |
 | Two-vector priority interrupts | ✅ | ❌ | single-vector compat only (ADR-013 follow-up) |
 | `__shadowregs`, `__wparam` | ✅ | ❌ | perf features |
