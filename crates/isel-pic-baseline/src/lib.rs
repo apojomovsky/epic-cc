@@ -549,8 +549,9 @@ impl<'m> Gen<'m> {
     }
 
     /// The multi-byte (n > 1, i16) borrow chain for `C = (a >= b)` with a
-    /// file-LHS `a`. Same wrap-correct INCFSZ folds as classic isel; the
-    /// const-LHS path uses the scratch idiom instead of SUBLW.
+    /// file-LHS `a`. Each fold keeps its skip chain atomic: the select is
+    /// preset and the subtrahend staged in scratch, so a 0xFF wrap skips
+    /// the SUBWF with C as the true borrow-out (epic-cc#383).
     fn emit_cmp_c_file_lhs_wide(&mut self, a: &Val, b: &Val, n: u8, high: u8, signed: bool) {
         let aa = self.val_addr(a).direct();
         self.emit_load_cmp_byte(b, 0, signed, high);
@@ -576,65 +577,57 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    XORWF {}, W", self.fop(aa + u16::from(high))));
                 self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                 self.emit(format!("    MOVF {}, W", self.fop(self.retval_lo)));
+                // Atomic borrow chain: both fold bytes are common RAM, so
+                // no select splits the fold (epic-cc#383, same class as
+                // the P6 mul/div review in #328).
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
                 self.emit(format!("    INCFSZ {}, W", self.fop(self.retval_lo)));
-                self.emit_bank_select(self.scratch);
                 self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
             } else {
-                match b {
-                    Val::Const(k) => {
-                        let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-                        self.emit(format!("    MOVLW 0x{kb:02X}"));
-                        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
-                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                        self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
-                    }
-                    _ => {
-                        self.emit_load_cmp_byte(b, i, signed, high);
-                        let addr = self.val_addr(b).direct() + u16::from(i);
-                        self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                        self.emit_bank_select(addr);
-                        self.emit(format!("    INCFSZ {}, W", self.fop(addr)));
-                    }
-                }
+                // Preset-select plus scratch-staged fold: the high-byte
+                // SUBWF's bank is selected before the test, and the fold
+                // runs on scratch, so the wrap skip lands on the SUBWF.
+                self.emit_load_cmp_byte(b, i, signed, high);
+                self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                 self.emit_bank_select(aa + u16::from(i));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
                 self.emit(format!("    SUBWF {}, W", self.fop(aa + u16::from(i))));
             }
         }
     }
 
     /// The multi-byte (n > 1, i16) const-LHS borrow chain. Baseline has no
-    /// `SUBLW`, so each byte's `k_i - (b_i + borrow)` lowers to the scratch
-    /// idiom: stash the b byte, load k_i, SUBWF computes k_i - W.
+    /// `SUBLW`, so each byte's `k_i - (b_i + borrow)` stages the b byte in
+    /// scratch and `k_i` in retval_lo, then folds with an atomic skip
+    /// chain: a 0xFF wrap skips the SUBWF with C as the true borrow-out.
     fn emit_cmp_c_const_lhs_wide(&mut self, k: &i64, b: &Val, n: u8, high: u8, signed: bool) {
-        self.emit_load_cmp_byte(b, 0, signed, high);
-        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
         let k0 = (k & 0xFF) as u8;
-        let k0 = if signed && high == 0 { k0 ^ 0x80 } else { k0 };
         self.emit(format!("    MOVLW 0x{k0:02X}"));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+        self.emit_load_cmp_byte(b, 0, signed, high);
         self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
         for i in 1..n {
+            let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
             if signed && i == high {
                 let addr = self.val_addr(b).direct() + u16::from(high);
                 self.emit("    MOVLW 0x80".to_string());
                 self.emit_bank_select(addr);
                 self.emit(format!("    XORWF {}, W", self.fop(addr)));
+                self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                let kb = kb ^ 0x80;
+                self.emit(format!("    MOVLW 0x{kb:02X}"));
                 self.emit(format!("    MOVWF {}", self.fop(self.retval_lo)));
-                self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ {}, W", self.fop(self.retval_lo)));
-                let kb = ((k >> (high as u32 * 8)) & 0xFF) as u8 ^ 0x80;
-                self.emit(format!("    MOVLW 0x{kb:02X}"));
-                self.emit(format!("    SUBWF {}, W", self.fop(self.retval_lo)));
             } else {
-                let addr = self.val_addr(b).direct() + u16::from(i);
-                self.emit_bank_select(addr);
-                self.emit(format!("    MOVF {}, W", self.fop(addr)));
-                self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ {}, W", self.fop(addr)));
-                let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                self.emit_load_cmp_byte(b, i, signed, high);
+                self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                 self.emit(format!("    MOVLW 0x{kb:02X}"));
-                self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
+                self.emit(format!("    MOVWF {}", self.fop(self.retval_lo)));
             }
+            self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
+            self.emit("    BTFSS STATUS, 0 ; C".to_string());
+            self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
+            self.emit(format!("    SUBWF {}, W", self.fop(self.retval_lo)));
         }
     }
 

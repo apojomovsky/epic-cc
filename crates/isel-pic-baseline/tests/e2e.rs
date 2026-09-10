@@ -639,3 +639,122 @@ fn long_div16_c_runs_correctly() {
     assert!(p.halted());
     gpasm_agrees(&asm, "long_div16");
 }
+/// P2 wide-compare regression (epic-cc#383): the high-byte borrow fold
+/// starved the carry on a 0xFF subtrahend with borrow pending, so
+/// `0x007F > 0xFF80` sim-answered 1. Pre-fix outs are [1,1,1,1,0,1] on
+/// seed set A; post-fix A is [1,1,0,0,0,1] and B is [0,1,0,0,1,1].
+#[test]
+fn cmp_wide_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let mut asm_text = None;
+    for (tag, sa, sb, ua, ub, want) in [
+        (
+            "A",
+            0x007Fu16,
+            0xFF80u16,
+            0x007Fu16,
+            0xFF80u16,
+            [1u16, 1, 0, 0, 0, 1],
+        ),
+        (
+            "B",
+            0x7F7Fu16,
+            0x7F80u16,
+            0x00FFu16,
+            0x0100u16,
+            [0u16, 1, 0, 0, 1, 1],
+        ),
+    ] {
+        let (mut p, globals, asm) = compile_asm("tests/fixtures/cmp_wide.c");
+        if asm_text.is_none() {
+            asm_text = Some(asm.clone());
+        }
+        p.ram_mut()[globals["sa"] as usize] = (sa & 0xFF) as u8;
+        p.ram_mut()[globals["sa"] as usize + 1] = (sa >> 8) as u8;
+        p.ram_mut()[globals["sb"] as usize] = (sb & 0xFF) as u8;
+        p.ram_mut()[globals["sb"] as usize + 1] = (sb >> 8) as u8;
+        p.ram_mut()[globals["ua"] as usize] = (ua & 0xFF) as u8;
+        p.ram_mut()[globals["ua"] as usize + 1] = (ua >> 8) as u8;
+        p.ram_mut()[globals["ub"] as usize] = (ub & 0xFF) as u8;
+        p.ram_mut()[globals["ub"] as usize + 1] = (ub >> 8) as u8;
+        p.run(100_000);
+        for (n, o) in ["o1", "o2", "o3", "o4", "o5", "o6"].iter().enumerate() {
+            let got = p.ram()[globals[*o] as usize] as u16
+                | ((p.ram()[globals[*o] as usize + 1] as u16) << 8);
+            assert_eq!(got, want[n], "{tag} {o} trace");
+        }
+        assert!(p.halted(), "{tag} halted");
+    }
+    let asm = asm_text.expect("two seed runs");
+    assert_eq!(
+        ours_hex(&asm).trim(),
+        gpasm_hex(&asm, "cmp_wide").trim(),
+        "our HEX differs from gpasm"
+    );
+}
+
+/// Like `compile_asm`, but parses handed IR text instead of running
+/// clang. The text must look like clang `-O1` output for the pipeline
+/// (wholeprog through alloc) to accept it.
+fn compile_ll_asm(ll: &str) -> (PicBaseline, HashMap<String, u16>, String) {
+    let mut m = irparse::parse_ll(ll);
+    m = wholeprog::merge(m);
+    m = legalize::legalize(m);
+    let cg = callgraph::build(&m);
+    callgraph::check_depth(&cg, device::PIC12F509.stack_depth as usize);
+    let layout = alloc::allocate(&device::PIC12F509, &m, &callgraph::edges_text(&cg));
+    let mut addrs: HashMap<String, u16> = HashMap::new();
+    addrs.extend(layout.globals.clone());
+    addrs.extend(layout.locals.clone());
+    let asm = select(&device::PIC12F509, &m, &addrs);
+    check_const_stack(&cg, &asm);
+    isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
+    let words = assemble_words(&device::PIC12F509, &asm);
+    (
+        PicBaseline::with_device(&device::PIC12F509, words),
+        layout.globals,
+        asm,
+    )
+}
+
+/// P2 wide-compare const-LHS regression (epic-cc#383): clang always
+/// canonicalizes constants onto the icmp RHS, so no C source reaches
+/// `emit_cmp_c_const_lhs_wide`. This test compiles the harvest fixture
+/// and swaps the four predicates to const-LHS (meaning-preserving:
+/// `x > C` is `C < x`), covering the helper's byte-0 polarity, the
+/// unsigned wrap fold, and the signed high byte. Seeds ub = 0xFF01,
+/// sb = 0x7F01 give [1,0,1,1]; pre-fix the outs are [0,1,0,0].
+#[test]
+fn cmp_wide_const_lhs_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
+    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    let (ll, _) = clang_compile(&clang, &resdir, "tests/fixtures/cmp_harvest.c");
+    let mut swapped = ll;
+    for (file_lhs, const_lhs) in [
+        ("icmp ugt i16 %1, 256", "icmp ult i16 256, %1"),
+        ("icmp ult i16 %4, 128", "icmp ugt i16 128, %4"),
+        ("icmp sgt i16 %7, 127", "icmp slt i16 127, %7"),
+        ("icmp sgt i16 %10, 32512", "icmp slt i16 32512, %10"),
+    ] {
+        assert!(swapped.contains(file_lhs), "harvest IR drifted: {file_lhs}");
+        swapped = swapped.replacen(file_lhs, const_lhs, 1);
+    }
+    let (mut p, globals, asm) = compile_ll_asm(&swapped);
+    p.ram_mut()[globals["ub"] as usize] = 0x01;
+    p.ram_mut()[globals["ub"] as usize + 1] = 0xFF;
+    p.ram_mut()[globals["sb"] as usize] = 0x01;
+    p.ram_mut()[globals["sb"] as usize + 1] = 0x7F;
+    p.run(100_000);
+    for (n, o) in ["c1", "c2", "c3", "c4"].iter().enumerate() {
+        let got = p.ram()[globals[*o] as usize] as u16
+            | ((p.ram()[globals[*o] as usize + 1] as u16) << 8);
+        assert_eq!(got, [1u16, 0, 1, 1][n], "const-lhs {o} trace");
+    }
+    assert!(p.halted());
+    assert_eq!(
+        ours_hex(&asm).trim(),
+        gpasm_hex(&asm, "cmp_wide_const_lhs").trim(),
+        "our HEX differs from gpasm"
+    );
+}
