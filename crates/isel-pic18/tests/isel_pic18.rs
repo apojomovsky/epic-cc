@@ -329,7 +329,7 @@ fn isr_emits_vector_prologue_and_retfie() {
     assert!(asm.contains("MOVFF 0xFF6, 0x005"), "TBLPTRL save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFF7, 0x006"), "TBLPTRH save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFF8, 0x007"), "TBLPTRU save:\n{asm}");
-    assert!(asm.contains("MOVWF 0x0004,A"), "W save last:\n{asm}");
+    assert!(asm.contains("MOVWF 0x008,A"), "W save last:\n{asm}");
     // The epilogue: reverse order, MOVFF-based (flags survive), W last via
     // MOVF (the one accepted flag clobber), then RETFIE.
     assert!(
@@ -337,7 +337,7 @@ fn isr_emits_vector_prologue_and_retfie() {
         "retval restore hi:\n{asm}"
     );
     assert!(asm.contains("MOVFF 0x001, 0xFD8"), "STATUS restore:\n{asm}");
-    assert!(asm.contains("MOVF 0x0004, W, A"), "W restore:\n{asm}");
+    assert!(asm.contains("MOVF 0x008, W, A"), "W restore:\n{asm}");
     assert!(asm.contains("RETFIE"), "ISR must end with RETFIE:\n{asm}");
 }
 
@@ -2301,9 +2301,10 @@ fn priority_pair_emits_both_vectors_and_save_areas() {
         asm.contains("org 0x0018") && asm.contains("goto lo"),
         "low stub at vector 0x0018:\n{asm}"
     );
-    // The high ISR keeps the fixed save block (W at 0x0004)...
+    // The high ISR keeps the fixed save block (W at 0x008, a free byte
+    // that doesn't collide with FSR0H's slot at 0x004)...
     assert!(
-        asm.contains("MOVWF 0x0004,A"),
+        asm.contains("MOVWF 0x008,A"),
         "high ISR saves W to the fixed block:\n{asm}"
     );
     // ...while the low ISR selects the save bank and addresses W banked.

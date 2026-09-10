@@ -333,6 +333,49 @@ fn interrupt_pic18_c_runs_correctly() {
 }
 
 #[test]
+fn compat_isr_preserves_fsr0h_across_w_save() {
+    // epic-cc#356 regression: the compat (non-priority) ISR prologue wrote
+    // W to the literal address 0x0004, which on PIC18F4550
+    // (`fixed_retval` starting at 0x0000) is `common_lo + 4`, the very
+    // slot the same prologue had just used to snapshot FSR0H. The W store
+    // clobbered that snapshot, so the epilogue restored FSR0H from
+    // whatever W held at interrupt entry instead of the preempted
+    // main-context pointer's high byte. Hand-built IR (no clang): a lone
+    // ISR gets the fixed-block compat prologue regardless of body.
+    let m = ir::parse(
+        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm = isel_pic18::select(&PIC18F4550, &m, &HashMap::new(), None);
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = Pic18::new(parse_hex_pic18(&hex));
+
+    // Simulate main mid-pointer-dereference: FSR0H loaded with a pointer's
+    // high byte above 0xFF. (FSR0L shares the same save/restore shape but
+    // aliases the retval-backup restore order bug tracked separately as
+    // epic-cc#362; asserting it here would conflate the two.)
+    p.ram_mut()[0xFEA] = 0xAB; // FSR0H
+
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 8, "ISR starts at the high vector");
+
+    // Step exactly through the prologue/body/epilogue: RETFIE pops the
+    // pushed return address (0, the injection point), so pc hitting 0
+    // again means the ISR just returned.
+    let mut steps = 0;
+    loop {
+        p.step();
+        steps += 1;
+        assert!(steps < 200, "ISR never returned (pc = {})", p.pc());
+        if p.pc() == 0 {
+            break;
+        }
+    }
+
+    assert_eq!(p.ram()[0xFEA], 0xAB, "FSR0H must survive the compat ISR");
+}
+
+#[test]
 fn ptr_probe_c_runs_correctly() {
     // The ORIGINAL ptr_probe.c (full parity with PIC14, per docs/29's P3
     // note): a runtime RAM pointer AND a const-table read in one program.

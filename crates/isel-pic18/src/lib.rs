@@ -5211,8 +5211,9 @@ pub fn select_with_locs(
                 // them), and TBLPTR (a torn mid-setup pointer would
                 // misread). W saves last via `MOVWF`, which touches
                 // nothing. The low ISR saves the same set to its own
-                // area (`isr_low_save`), with a dedicated W slot (the
-                // fixed block doubles its W slot as FSR0H's, epic-cc#356).
+                // area (`isr_low_save`), with a dedicated W slot; the
+                // common block uses `common_lo + 8`, the one byte free
+                // of the SFR saves and retval backup (epic-cc#356).
                 let low_save = priority_mode && f.irq_priority != 1;
                 let saves: [(u16, u16); 11] = if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
@@ -5258,7 +5259,7 @@ pub fn select_with_locs(
                     g.bsr = Some(bank);
                     g.emit(format!("    MOVWF 0x{s:03X},B")); // W, last
                 } else {
-                    g.emit("    MOVWF 0x0004,A".to_string()); // W, last
+                    g.emit(format!("    MOVWF 0x{:03X},A", common_lo + 8)); // W, last
                 }
             }
             let mut terminator: Option<&Inst> = None;
@@ -5397,7 +5398,8 @@ pub fn select_with_locs(
                         g.bsr = Some(bank);
                         g.emit(format!("    MOVF 0x{s:03X}, W, B")); // W last
                     } else {
-                        g.emit("    MOVF 0x0004, W, A".to_string()); // W last
+                        g.emit(format!("    MOVF 0x{:03X}, W, A", common_lo + 8));
+                        // W last
                     }
                     g.emit("    RETFIE".to_string());
                 }
