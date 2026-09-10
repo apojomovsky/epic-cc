@@ -261,6 +261,39 @@ class GenDevicePic18Test(unittest.TestCase):
         self.assertIn("access_bank = [0x0000, 0x005F]", text)
         self.assertIn("fixed_retval = [0x0000, 0x000F]", text)
 
+    def test_bare_accessram_under_regardless_of_mode_is_still_the_access_bank(self):
+        # Confirmed on PIC18F252/258/452: silicon that predates the Extended
+        # Instruction Set entirely states `accessram` directly under
+        # RegardlessOfMode, with empty TraditionalModeOnly/ExtendedModeOnly
+        # stubs, instead of wrapping it like every other shipped PIC18
+        # device. Without recognizing the bare form, `access_bank` goes
+        # missing and `accessram` is misread as an ordinary banked GPR.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC18SYN02" edc:arch="18xxxx">
+  <edc:ArchDef edc:name="18xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x10"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x800"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x300000" edc:endaddr="0x300001"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x100">
+    <edc:RegardlessOfMode>
+      <edc:GPRDataSector edc:regionid="accessram" edc:beginaddr="0x0" edc:endaddr="0x60" edc:bank="0x0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x60" edc:endaddr="0x100" edc:bank="0x0"/>
+    </edc:RegardlessOfMode>
+    <edc:TraditionalModeOnly/>
+    <edc:ExtendedModeOnly/>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "bare_accessram.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p18syn02", pack="Microchip.PIC18Fxxxx_DFP"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("access_bank = [0x0000, 0x005F]", text)
+
     def test_contiguous_gpr_banks_merge(self):
         # gpr0 (0x60-0x7F) and gpr1 (0x80-0x9F) are back-to-back, and the
         # schema's `ram_banks` also folds in whatever the access bank

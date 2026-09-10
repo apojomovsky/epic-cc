@@ -638,7 +638,16 @@ def parse_edc(edc_path: pathlib.Path):
         e = gs.get(ns + "endaddr")
         if not (b and e):
             continue
-        if mode_ancestor(gs) == "TraditionalModeOnly":
+        # Confirmed on PIC18F252/258/452: silicon that predates the Extended
+        # Instruction Set entirely has only ever had one addressing mode, so
+        # their DFP states `accessram` bare under RegardlessOfMode instead of
+        # wrapping it in an (empty) TraditionalModeOnly, unlike every other
+        # PIC18 device already shipped. The region name is what identifies
+        # it either way; treat it as the access window regardless of wrapper.
+        if (
+            mode_ancestor(gs) == "TraditionalModeOnly"
+            or gs.get(ns + "regionid") == "accessram"
+        ):
             access.append((int(b, 0), int(e, 0) - 1))
             continue
         bank = gs.get(ns + "bank")
