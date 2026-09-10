@@ -230,62 +230,23 @@ fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
 }
 
 /// `base` unchanged for an ordinary function; `routine_base`-rounded for a
-/// runtime routine, so its frame stays in one bank; `float_routine_base`
-/// pinned into the access-bank window for a float routine on a device that
-/// reserves one (ADR-015, docs/36). Shared by the main-context and
-/// ISR-context base-assignment loops (epic-cc#6).
+/// runtime routine (float ones included), so its frame stays in one GPR
+/// bank. The float recipes are no more window-pinned than the integer
+/// ones: their skip instructions all target the next instruction (or an
+/// explicit GOTO), and memory ops go through `operand()`'s `MOVLB`
+/// discipline, so a banked frame is sound (epic-cc#357). Shared by the
+/// main-context and ISR-context base-assignment loops (epic-cc#6).
 fn round_if_routine(
     device: &Device,
     f: &str,
     base: u16,
     locals_widths: &HashMap<String, Vec<u8>>,
-    access_window: Option<(u16, u16)>,
 ) -> u16 {
-    if ir::is_float_routine(f) {
-        match access_window {
-            Some(window) => float_routine_base(device, window, &locals_widths[f]),
-            None => routine_base(device, base, &locals_widths[f]),
-        }
-    } else if ir::is_runtime_routine(f) {
+    if ir::is_runtime_routine(f) {
         routine_base(device, base, &locals_widths[f])
     } else {
         base
     }
-}
-
-/// The PIC18 access-bank GPR window reserved for float runtime routine
-/// frames, `Some((lo, hi))` when the device declares an access bank and the
-/// module uses at least one float routine (ADR-015, docs/36). `lo` is the
-/// device's GPR start (the access bank's low SFR segment is not placeable
-/// RAM); `hi` is the access bank's high bound. `None` on PIC14 (no access
-/// bank) or when no float routine is present (the reservation would be
-/// dead weight and would move every global for nothing).
-fn access_window(device: &Device, m: &Module) -> Option<(u16, u16)> {
-    let (_, hi) = device.access_bank?;
-    let uses_float = m.funcs.iter().any(|f| ir::is_float_routine(&f.name));
-    if !uses_float {
-        return None;
-    }
-    Some((device.gpr_start(), hi))
-}
-
-/// The frame base for a float runtime routine: the access-bank window's
-/// start, so every float routine packs contiguously there (sibling float
-/// routines never co-live and never call each other, so one shared span
-/// holds all of them). The frame must stay inside the window: the recipes
-/// address every file operand with `a=0` (no `MOVLB`), so a banked address
-/// would break the skip-sensitive loops (ADR-015). Panics if the frame
-/// would exceed the window's high bound.
-fn float_routine_base(device: &Device, window: (u16, u16), widths: &[u8]) -> u16 {
-    let (lo, hi) = window;
-    let end = frame_end(device, lo, widths);
-    assert!(
-        end - 1 <= hi,
-        "alloc: float routine frame exceeds the access-bank GPR region (0x{:03X} > 0x{:03X})",
-        end - 1,
-        hi
-    );
-    lo
 }
 
 /// One function's liveness-overlay frame: the distinct slot widths in
@@ -865,14 +826,10 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
-    // The PIC18 access-bank GPR window reserved for float runtime routine
-    // frames (ADR-015, docs/36). When present, globals and ordinary frames
-    // start above it and float routines pack into it.
-    let access_window = access_window(device, m);
-    let global_start = match access_window {
-        Some((_, hi)) => hi + 1,
-        None => device.gpr_start(),
-    };
+    // Globals and frames pack from the device's GPR start: no access-bank
+    // reservation. Float routines place exactly like integer ones (single
+    // bank rounding, context-relative bases; epic-cc#357).
+    let global_start = device.gpr_start();
     // 1. Globals: sequential, aligned to at most two bytes (i16 -> even
     // address; larger arrays advance sequentially), stepping through the banks as bank 0 GPR fills up. Each global spans
     // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
@@ -1294,10 +1251,9 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         // A runtime routine's frame must stay inside ONE GPR bank: its
         // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
         // test and its target, or inside a carry idiom. The base is rounded
-        // when the derived frame would straddle a bank boundary; a float
-        // routine on a device with an access bank is pinned into the
-        // access-bank window instead (ADR-015, docs/36; epic-cc#6).
-        let b = round_if_routine(device, f, b, &locals_widths, access_window);
+        // when the derived frame would straddle a bank boundary; float
+        // routines round exactly like integer ones (epic-cc#357).
+        let b = round_if_routine(device, f, b, &locals_widths);
         base.insert(f.clone(), b);
     }
 
@@ -1381,7 +1337,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                     };
                     // Issue #6: the ISR context's routine copies get the same
                     // single-bank frame rounding as the main context's.
-                    let b = round_if_routine(device, f, b, &locals_widths, access_window);
+                    let b = round_if_routine(device, f, b, &locals_widths);
                     base.insert(f.clone(), b);
                 }
             };

@@ -528,33 +528,6 @@ pub fn is_runtime_routine(name: &str) -> bool {
     )
 }
 
-/// True for the soft-float runtime routines (the f32 recipe bodies), whose
-/// PIC18 frames must sit inside the access-bank GPR region (ADR-015): the
-/// recipes address every file operand with `a=0` (no `MOVLB`), so a
-/// `MOVLB` the banking pass would insert for a banked address would break
-/// the skip-sensitive loops. `alloc` reserves the access-bank window for
-/// `MOVLB` and may live anywhere in banked RAM. Includes the `_isr` and
-/// `_isr_high` copies (both share the access-bank window with the base
-/// routine; cross-context float sharing is a known hazard, ticketed).
-pub fn is_float_routine(name: &str) -> bool {
-    let base = name
-        .strip_suffix("_isr_high")
-        .or_else(|| name.strip_suffix("_isr"))
-        .unwrap_or(name);
-    matches!(
-        base,
-        "__add_f32"
-            | "__sub_f32"
-            | "__mul_f32"
-            | "__div_f32"
-            | "__cmp_f32"
-            | "__uitofp_f32"
-            | "__sitofp_f32"
-            | "__fptoui_f32"
-            | "__fptosi_f32"
-    )
-}
-
 fn val_str(v: &Val) -> String {
     match v {
         Val::Reg(r) => format!("%{r}"),
