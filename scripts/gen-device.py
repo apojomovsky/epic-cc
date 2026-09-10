@@ -404,7 +404,6 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                 cursor += int(child.get(ns + "offset"), 0)
             elif tag == "DCRFieldDef":
                 mask = int(child.get(ns + "mask"), 0)
-                width = bin(mask).count("1")
                 fname = child.get(ns + "name")
                 span = int(child.get(ns + "nzwidth", "0"), 0) or mask.bit_length()
                 if mask >= (1 << span):
