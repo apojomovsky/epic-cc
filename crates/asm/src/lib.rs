@@ -1005,8 +1005,12 @@ fn encode_pic_baseline(line: &str, sym: &std::collections::HashMap<String, usize
         }
         "GOTO" => {
             let k = sym.get(op).copied().unwrap_or_else(|| parse_num(op));
+            // The 9-bit literal is the target's low 9 bits; the page
+            // comes from STATUS PA0 at runtime, so any in-flash target
+            // encodes. PA0/target agreement is the page-fit audit's job,
+            // not the encoder's (it cannot see runtime state).
             assert!(
-                k <= 0x1FF,
+                k <= 0x3FF,
                 "asm(pic-baseline): GOTO target 0x{k:03X} out of range"
             );
             0x0A00 | (k as u16 & 0x1FF)
