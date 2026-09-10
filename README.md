@@ -1,18 +1,37 @@
-# epic-cc
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/epic-cc-logo-dark-mode.svg">
+    <img src="docs/assets/epic-cc-logo-light-mode.svg" width="120" alt="Epic CC logo: a chip-temple inside a laurel wreath">
+  </picture>
+</p>
 
-**A whole-program C compiler for 8-bit Microchip PIC microcontrollers, written in Rust.**
+<h1 align="center">epic-cc</h1>
 
-[![CI](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.97.1](https://img.shields.io/badge/rust-1.97.1-b7410e.svg)](rust-toolchain.toml)
-[![clang 20.1.8](https://img.shields.io/badge/clang-20.1.8%20%28pinned%29-262d3a.svg)](docs/09-build-environment.md)
-[![target PIC16F877A](https://img.shields.io/badge/target-PIC16F877A%20%28PIC14%29-c0392b.svg)](docs/01-target-pic14.md)
-[![status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#status)
+<p align="center"><em>A real C compiler for 8-bit PIC. clang front end, from-scratch backend, no Microchip toolchain.</em></p>
 
-`epic-cc` takes `.c` files and emits Intel HEX you can flash. It uses **clang as an
-out-of-process front end** and implements a **custom whole-program PIC14 backend**,
-deliberately *not* an LLVM backend. It owns every stage from LLVM IR text down to the
-assembler, with no external assembler or linker in the shipping product.
+<p align="center">
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/apojomovsky/epic-cc)](https://github.com/apojomovsky/epic-cc/releases) [![target PIC16F877A](https://img.shields.io/badge/target-PIC16F877A%20%28PIC14%29-c0392b.svg)](docs/01-target-pic14.md) [![status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#status)
+
+</p>
+
+8-bit PIC still ships in enormous volume, and the only C toolchain for it has been
+Microchip's closed-source XC8: capped optimization on the free tier, no modern
+diagnostics, nothing to inspect when it goes wrong. `epic-cc` is a real compiler
+instead: clang's front end for genuine C semantics, a from-scratch whole-program
+PIC14 backend with nothing to license, and every stage checked against a
+byte-for-byte oracle. It's the default toolchain behind
+[epic-hal](https://github.com/apojomovsky/epic-hal)'s one-command PIC projects.
+
+## Quickstart
+
+Grab the latest release and compile something. No docker and no Microchip
+download required: the bundle ships its own pinned clang.
+
+```bash
+gh release download -R apojomovsky/epic-cc --pattern '*x86_64-linux.zip'   # or *-windows.zip
+unzip epic-cc-*-x86_64-linux.zip && cd epic-cc-*-x86_64-linux/
+```
 
 ```console
 $ cat add.c
@@ -20,216 +39,48 @@ volatile unsigned char in;
 volatile unsigned char out;
 void main(void) { out = in + 1; }
 
-$ cargo run -p driver -- add.c -o add.hex --device p16f877a && cat add.hex
+$ ./epic-cc --target p16f877a add.c -o add.hex && cat add.hex
 :020000040000FA
 :10000000012800308A0005206300831203132008B2
 :0E001000A2002208013EA3002308A100080060
 :00000001FF
 ```
 
----
+No `gh` CLI? Download the zip straight from
+[Releases](https://github.com/apojomovsky/epic-cc/releases/latest). Building
+your own PIC project rather than testing the compiler? Start from
+[epic-hal](https://github.com/apojomovsky/epic-hal) instead: its installer
+downloads and wires up both.
 
-## Contents
+Building from source (contributors, or you want the bleeding edge)? Everything
+runs inside a pinned docker image, so nothing installs system-wide:
 
-- [Why this target is hard](#why-this-target-is-hard)
-- [Architecture](#architecture)
-- [What it builds on](#what-it-builds-on)
-- [How correctness is verified](#how-correctness-is-verified)
-- [Status](#status)
-- [Getting started](#getting-started)
-- [Repository layout](#repository-layout)
-- [Design documentation](#design-documentation)
-- [Non-goals](#non-goals)
-- [License](#license)
-
----
-
-## Why this target is hard
-
-Parsing C is a solved problem. The difficulty of a PIC14 compiler is concentrated almost
-entirely in **storage allocation**, because the mid-range core violates nearly every
-assumption a conventional backend is built on.
-
-| Constraint | Consequence for the compiler |
-|---|---|
-| **One accumulator (`W`), 35 instructions, no register file** | Nothing for classical register allocation to allocate. Everything is `W` ⇄ memory. |
-| **4 banks of RAM** selected via `RP1:RP0` | Every cross-bank access needs a `BANKSEL`. Minimising them is NP-hard even with fixed bank assignment. |
-| **16 bytes of common RAM** (`0x70-0x7F`, mirrored into all banks) | The only `BANKSEL`-free storage, half of what llvm-mos gets on the 6502. |
-| **8-level hardware call stack, not addressable** | No stack frames, no recursion, and call depth is a hard resource. Every local must be statically allocated and **overlaid** across the call graph. |
-| **Harvard architecture** | `const` tables live in program memory, reachable only through `RETLW` jump tables. LLVM IR assumes one flat address space. |
-| **368 bytes RAM / 8K words flash** | Code-size and RAM pressure are correctness concerns, not just quality ones. |
-
-Full detail, with the datasheet cross-references, is in
-[`docs/01-target-pic14.md`](docs/01-target-pic14.md).
-
-> **The allocator is the compiler.** That single sentence explains every architectural
-> decision below.
-
----
-
-## Architecture
-
-The compiler is a **ten-stage pipeline**, each stage its own crate. The load-bearing
-property is that **every stage boundary is a diffable text artifact**, so a miscompile can
-be bisected to a stage before anyone reads code.
-
-```mermaid
-flowchart LR
-    C[".c files"] --> CLANG["clang -S -emit-llvm<br/>(out of process)"]
-    CLANG --> LL[".ll text"]
-    LL --> IRP["irparse"]
-    IRP --> WP["wholeprog"]
-    WP --> LEG["legalize"]
-    LEG --> CG["callgraph"]
-    CG --> AL["alloc"]
-    AL --> ISEL["isel"]
-    ISEL --> BK["banking"]
-    BK --> PH["peephole"]
-    PH --> ASM["asm"]
-    ASM --> HEX[".hex"]
+```bash
+make image && make shell    # first build is slow: compiles clang from source
+cargo test --workspace
 ```
 
-| # | Stage | In → Out |
-|---|---|---|
-| 1 | [`driver`](crates/driver) | `.c` files → invokes clang → `.ll` |
-| 2 | [`irparse`](crates/irparse) | `.ll` text → our IR |
-| 3 | [`wholeprog`](crates/wholeprog) | N modules → one merged module, externs resolved |
-| 4 | [`legalize`](crates/legalize) | i16/i32/float ops → i8 sequences + runtime calls |
-| 5 | [`callgraph`](crates/callgraph) | merged IR → call graph, recursion check, ISR trees, stack-depth check |
-| 6 | [`alloc`](crates/alloc) | call graph + locals → static addresses across 4 banks |
-| 7 | [`isel`](crates/isel) | IR → PIC14 instructions |
-| 8 | [`banking`](crates/banking) | `BANKSEL` / `PAGESEL` insertion |
-| 9 | [`peephole`](crates/peephole) | pattern-driven cleanup |
-| 10 | [`asm`](crates/asm) | instructions → Intel HEX |
+See [`docs/09-build-environment.md`](docs/09-build-environment.md) for the
+pinned versions and build-cache notes.
 
-### The three decisions that shape everything
+## What you get
 
-**1. clang out-of-process, not an LLVM backend.**
-clang emits LLVM IR *as text*; we parse the `.ll` and go our own way. We never link
-libLLVM and never touch SelectionDAG, GlobalISel, TableGen, or MCTargetDesc.
-
-This is a cost argument, not a capability one. "LLVM cannot target accumulator machines" is
-false, and llvm-mos disproves it. But llvm-mos paid **22,421 lines of diff from upstream
-outside their own target directory**, and `llvm-pic` attempted *this exact target* with
-three people over ~18 months, with mentorship from the llvm-mos team, and was archived in
-November 2025 without working `CALL`/`GOTO` and without having started on banking at all.
-Text in, text out sidesteps a permanent rebase against a 30-million-line C++ tree.
-([ADR-001](docs/03-decisions.md))
-
-**2. Whole-program compilation, down to HEX.**
-All `.c` files compile in one invocation. Locals cannot live on a stack, so frames are
-statically allocated and overlaid using the *whole* call graph, which requires
-whole-program visibility by construction. This is also why we own the assembler: 35
-instructions and a fixed 14-bit encoding make it cheap, and it keeps allocation and
-encoding in one place. ([ADR-002](docs/03-decisions.md))
-
-**3. `-target msp430` as a datalayout proxy.**
-We are not generating MSP430 code. We want clang's ABI-independent type decisions, and
-MSP430's datalayout is a near-perfect match for PIC14: 8-bit `char`, 16-bit `int`, 16-bit
-pointers, byte alignment. Optimization runs at `-O1`, because `-Oz` emits arbitrary-width
-integers (`i17`) and intrinsics that a machine with no hardware multiply cannot lower
-pleasantly.
-
----
-
-## What it builds on
-
-`epic-cc` is deliberately thin on runtime dependencies and thick on test-time oracles.
-
-| Project | Role | Where |
-|---|---|---|
-| **clang** (pinned 20.1.8) | The C front end. Runs out-of-process, emits `.ll` text. The *only* build-time external dependency. | [ADR-001](docs/03-decisions.md), [ADR-007](docs/03-decisions.md) |
-| **gputils / `gpasm`** (1.5.2) | Test-time oracle. Our HEX must match `gpasm`'s **byte for byte**. Never a build dependency. | [`crates/asm/tests`](crates/asm/tests) |
-| **llvm-mos** | Prior art, techniques only: static stack allocation and imaginary registers, reimplemented rather than ported. | [ADR-003](docs/03-decisions.md) |
-| **Docker (multi-stage)** | The whole toolchain, built from a digest-pinned `ubuntu:22.04` base + the LLVM 20.1.8 source tarball + `rust-toolchain.toml`. clang's version is part of our *input format*, so a silent bump could change what the parser sees. | [`docs/09-build-environment.md`](docs/09-build-environment.md) |
-| **cvise / creduce / csmith** | Available in the dev shell for test-case reduction work. | [`docs/05-verification.md`](docs/05-verification.md) |
-
-**On XC8:** Microchip's XC8 is treated as a **black-box differential oracle only**. Compile
-the same source, compare observable behaviour. Its binaries are never disassembled or
-reverse-engineered; the licence forbids it and it is the slow path regardless
-([ADR-006](docs/03-decisions.md)). The dev shell detects an XC8 install if you have one, but
-**the XC8 differential runner is designed, not yet wired into the test suite**. Today's
-differential testing runs against host clang (see below). XC8 is never a build dependency
-and CI does not require it.
-
-**Licensing boundary:** `gputils` and `gpsim` are GPL. They are invoked as external
-processes from the test harness and never linked into the compiler.
-
----
-
-## How correctness is verified
-
-Verification was built **before** most of the compiler, so the oracle exists before the
-thing it judges. Four independent layers, all running in CI:
-
-### 1. Our own PIC14 simulator
-
-[`crates/sim`](crates/sim) is a deterministic PIC14 instruction-set simulator, embeddable
-directly in `cargo test`. Tests assert on RAM and internal state, and can inject an
-interrupt at an exact program counter to make ISR timing reproducible. Owning it keeps a
-GPL process boundary out of the inner test loop.
-
-### 2. `gpasm` byte-for-byte cross-check
-
-Our emitted `.asm` is assembled with real `gpasm` and the resulting Intel HEX must match
-our assembler's output **exactly** (a cross-check in `crates/asm/tests`). This isolates
-*"our assembler is wrong"* from *"our codegen is wrong"*, two failure modes that otherwise
-look identical.
-
-### 3. End-to-end acceptance programs
-
-End-to-end acceptance programs in [`crates/driver/tests`](crates/driver/tests) push real C
-through the entire pipeline and run the resulting HEX in the simulator, asserting
-hand-computed results. Each fixture documents its expected values and *why* the program is
-shaped the way it is:
-
-| Fixture | Exercises |
-|---|---|
-| [`scalar.c`](crates/driver/tests/fixtures/scalar.c) | 8/16-bit arithmetic, all `icmp` predicates, `select` |
-| [`overlay.c`](crates/driver/tests/fixtures/overlay.c) | Frame overlay: sibling functions sharing RAM |
-| [`banked.c`](crates/driver/tests/fixtures/banked.c) / [`banked_ptr.c`](crates/driver/tests/fixtures/banked_ptr.c) | Cross-bank access and `BANKSEL` correctness |
-| [`ptr_probe.c`](crates/driver/tests/fixtures/ptr_probe.c), [`array.c`](crates/driver/tests/fixtures/array.c), [`structs.c`](crates/driver/tests/fixtures/structs.c) | `FSR`/`INDF` indirect access, `sret`/`byval` |
-| [`const_table.c`](crates/driver/tests/fixtures/const_table.c) | Harvard `const` data via `RETLW` tables, past the 256-byte window |
-| [`multi_page.c`](crates/driver/tests/fixtures/multi_page.c) | `PCLATH` discipline across flash page boundaries |
-| [`interrupt.c`](crates/driver/tests/fixtures/interrupt.c) | ISRs, SFR access, context save, duplicated shared helpers |
-| [`long.c`](crates/driver/tests/fixtures/long.c) / [`muldiv.c`](crates/driver/tests/fixtures/muldiv.c) | 32-bit `long`, soft mul/div/mod runtime |
-| [`float.c`](crates/driver/tests/fixtures/float.c) | IEEE-754 single soft-float, incl. round-to-nearest-even |
-
-### 4. Differential fuzzing with automatic reduction
-
-[`crates/fuzz`](crates/fuzz) closes the loop that makes unsupervised work viable:
-
-```mermaid
-flowchart LR
-    GEN["seeded generator<br/>(UB-free C subset)"] --> PIC["epic-cc → sim"]
-    GEN --> HOST["host clang → native"]
-    PIC --> DIFF{"checksums<br/>match?"}
-    HOST --> DIFF
-    DIFF -- no --> RED["greedy reducer"]
-    RED --> FIX["minimal repro<br/>saved as fixture"]
-    DIFF -- yes --> OK["next seed"]
-```
-
-The generator emits **unsigned-only, layout-agnostic** C with explicit-width types so PIC
-and host semantics provably coincide: no signed overflow, shifts always below width,
-nonzero divisors, field-wise struct access only. Every program is compiled twice and the
-checksums must match. A mismatch, a panic, or a non-halting run is a bug, and the greedy
-reducer minimises it to a saved reproducer. A 200-seed integer corpus and a 50-seed float
-corpus run under `--ignored`; a fast subset gates every commit.
-
-**Loud panics, never silent miscompiles.** Every unsupported construct panics with a
-specific message rather than emitting wrong code. Recursion is rejected at compile time,
-and call depth is checked against the 8-level hardware stack.
-
----
+- **Real C, real diagnostics.** clang parses and type-checks your source; you
+  get clang's errors, not a home-grown parser's guesses.
+- **Whole-program compiler, straight to `.hex`.** One invocation, no external
+  assembler or linker: `epic-cc` owns every stage from IR to Intel HEX.
+- **Built for one architecture, not retrofit onto one.** Every register write
+  is cited to Microchip's datasheet; see [why that's the hard part](#under-the-hood).
+- **Verified, not just tested.** Emitted assembly is cross-checked byte-for-byte
+  against real `gpasm`, and a differential fuzzer runs every generated program
+  against host clang on every commit.
+- **Loud panics, never silent miscompiles.** Anything unsupported aborts with a
+  specific message instead of emitting wrong code.
 
 ## Status
 
-**Alpha.** The full integer, pointer, interrupt, `long` and soft-float spine is implemented
-and passing end-to-end. A fast subset of the suite gates every commit; the slow fuzz corpus
-runs behind `--ignored`.
-
-### Supported C surface
+**Alpha.** The full integer, pointer, interrupt, `long`, and soft-float spine is
+implemented and passing end-to-end; a fast test subset gates every commit.
 
 | Feature | State |
 |---|---|
@@ -237,153 +88,122 @@ runs behind `--ignored`.
 | 8-bit and 16-bit integers, all comparisons | ✅ |
 | Pointers, arrays, structs (`sret` / `byval`) | ✅ |
 | `const` data in flash (`RETLW` tables, >256 bytes) | ✅ |
-| Frame overlay across the call graph | ✅ |
 | Multi-bank RAM (`BANKSEL`) and multi-page flash (`PCLATH`) | ✅ |
-| Interrupts, SFR access, ISR-shared function duplication | ✅ |
-| 32-bit `long` + soft mul/div/mod runtime | ✅ |
-| IEEE-754 single-precision soft-float | ✅ |
+| Interrupts, SFR access | ✅ |
+| 32-bit `long`, IEEE-754 soft-float | ✅ |
 | Unions | ⛔ not yet |
-| Recursion | ⛔ by design: compile error, no escape hatch in v1 |
+| Recursion | ⛔ by design: compile error, no escape hatch |
 
-### Known gaps
+Devices ship as one file each (`crates/device/devices/*.toml`, generated from
+Microchip's own device packs) and the registry grows continuously. See the
+[device directory](crates/device/devices/) for the current list. Adding a
+same-core part is a file, not a feature; see
+[ADR-019](docs/adr/ADR-019-pic-variants-device-registry.md).
 
-These are deliberate and tracked, not surprises:
+<a id="under-the-hood"></a>
+<details>
+<summary><strong>Under the hood</strong>: why this target is hard, how the pipeline works, and how correctness is verified</summary>
 
-- **Diagnostics are panics.** Unsupported input aborts with a precise message instead of a
-  user-facing error. Correct, but not yet friendly.
-- **Device support is file-per-device TOML** (`crates/device/devices/*.toml`,
-  see [ADR-019](docs/adr/ADR-019-pic-variants-device-registry.md)); adding
-  a same-core part is a file add via `scripts/gen-device.py` from the
-  Microchip DFP (https://packs.download.microchip.com/, `PIC16Fxxx_DFP`;
-  the `.atdf`/`.PIC` itself is never committed, only the TOML it
-  generates). `p16f887` is the first exemplar alongside `p16f877a` and
-  `p18f4550`.
-- **`BANKSEL` minimisation is linear tracking**, reset at every label, not the published
-  CASES'06 2-approximation the design calls for.
-- **Overlay allocation is call-graph-based**, not interference-graph colouring. Common RAM
-  currently holds fixed scratch/retval bytes rather than serving as a general imaginary
-  register file.
-- **`.asm` / `.lst` output** is not yet exposed by the driver, which emits HEX only (the
-  map is: `--map <file>`).
-- **XC8 and gpsim oracles** are designed but not wired into the suite.
+### Why this target is hard
 
----
+Parsing C is solved. What's hard about a PIC14 compiler is **storage
+allocation**, because the mid-range core breaks nearly every assumption a
+conventional backend relies on:
 
-## Getting started
+| Constraint | Consequence |
+|---|---|
+| One accumulator (`W`), 35 instructions, no register file | Nothing to register-allocate: everything is `W` ⇄ memory. |
+| 4 RAM banks selected via `RP1:RP0` | Every cross-bank access needs a `BANKSEL`; minimizing them is NP-hard. |
+| 16 bytes of bank-independent common RAM | The only `BANKSEL`-free storage, half of what llvm-mos gets on 6502. |
+| 8-level hardware call stack, not addressable | No stack frames, no recursion: locals are statically allocated and overlaid across the call graph. |
+| Harvard architecture | `const` lives in program memory, reachable only through `RETLW` jump tables. |
+| 368 B RAM / 8K words flash | Code size and RAM pressure are correctness concerns, not just quality ones. |
 
-Everything runs inside a docker multi-stage build, so **install nothing system-wide.** The
-root `Makefile` is the entry point:
+Full detail with datasheet cross-references: [`docs/01-target-pic14.md`](docs/01-target-pic14.md).
 
-```bash
-make image                        # build the dev image (first build is slow: compiles clang)
-make shell                        # interactive dev shell with the whole toolchain
+### Architecture: a ten-stage pipeline
+
+Each stage is its own crate, and every stage boundary is a diffable text
+artifact: a miscompile can be bisected to a stage before anyone reads code.
+
+```mermaid
+flowchart LR
+    C[".c files"] --> CLANG["clang -S -emit-llvm"] --> LL[".ll text"]
+    LL --> IRP["irparse"] --> WP["wholeprog"] --> LEG["legalize"]
+    LEG --> CG["callgraph"] --> AL["alloc"] --> ISEL["isel"]
+    ISEL --> BK["banking"] --> PH["peephole"] --> ASM["asm"] --> HEX[".hex"]
 ```
 
-Inside the shell:
+Three decisions shape everything:
 
-```bash
-cargo test --workspace
-bash scripts/ci-test.sh           # per-crate PASS/FAIL table (what CI runs)
-```
+- **clang out-of-process, not an LLVM backend.** We parse clang's `.ll` text
+  output and go our own way: no libLLVM, no SelectionDAG, no TableGen. A prior
+  attempt at this exact target with LLVM upstream (`llvm-pic`) was archived
+  after 18 months without working `CALL`/`GOTO`. ([ADR-001](docs/03-decisions.md))
+- **Whole-program compilation, down to HEX.** Locals can't live on a stack, so
+  frames are statically overlaid using the *whole* call graph, which requires
+  whole-program visibility by construction. ([ADR-002](docs/03-decisions.md))
+- **`-target msp430` as a datalayout proxy**, for clang's ABI-independent type
+  decisions (8-bit `char`, 16-bit `int`/pointers) without generating MSP430 code.
 
-Compile a C file to Intel HEX (from the host):
-
-```bash
-make compile                      # prints the HEX of the add.c example
-make compile FILE=my/example.c
-make pre-pr-check                 # takeoff ritual before opening a PR
-```
-
-Run the slow fuzz corpora:
-
-```bash
-cargo test -p fuzz -- --ignored
-```
-
-Pinned by the Dockerfile: **rustc 1.97.1**, **clang 20.1.8** (source tarball),
-**gpasm 1.5.2** (source), plus csmith, creduce and cvise. Gotchas and the
-caching story are in [`docs/09-build-environment.md`](docs/09-build-environment.md).
-
----
-
-## Repository layout
+Repository layout:
 
 ```
 crates/
-  driver/      # stage 1:  clang invocation + full pipeline, plus the e2e acceptance suite
-  irparse/     # stage 2:  LLVM IR text parser
-  ir/          #           the IR data model (text in, text out)
-  wholeprog/   # stage 3:  module merging
-  legalize/    # stage 4:  wide/float ops -> i8 sequences + runtime calls
-  callgraph/   # stage 5:  call graph, recursion check, stack-depth check
-  alloc/       # stage 6:  static overlay allocation across 4 banks
-  isel/        # stage 7:  instruction selection
-  banking/     # stage 8:  BANKSEL / PAGESEL insertion
-  peephole/    # stage 9:  pattern cleanup
-  asm/         # stage 10: assembler -> Intel HEX (+ gpasm cross-checks)
-  sim/         #           PIC14 instruction-set simulator
-  fuzz/        #           differential generator, runner and reducer
-docs/          # design conversation, ADRs, milestone plans
-scripts/       # ci-test.sh, gen-device.py (DFP -> TOML), pre-pr-check, prose-diff
-Dockerfile     # the pinned toolchain (multi-stage)
+  driver/ irparse/ ir/ wholeprog/ legalize/   # stages 1-4: front end -> legalized IR
+  callgraph/ alloc/ isel/ banking/ peephole/   # stages 5-9: allocation, codegen, banking
+  asm/                                         # stage 10: assembler -> Intel HEX
+  sim/    fuzz/                                # PIC14 simulator, differential fuzzer
+docs/     # design conversation, ADRs, milestone plans
+```
 
----
+### How correctness is verified
 
-## Design documentation
+Four independent layers, all running in CI:
 
-The full design conversation is captured in `docs/` and is written to be sufficient on its
-own.
+1. **Our own PIC14 simulator** ([`crates/sim`](crates/sim)): asserts on real
+   register and RAM state, embeddable in `cargo test`.
+2. **`gpasm` byte-for-byte cross-check**: our emitted assembly must match a
+   real GNU PIC assembler's HEX output exactly.
+3. **End-to-end acceptance programs** ([`crates/driver/tests`](crates/driver/tests)):
+   real C through the full pipeline, run in the simulator, checked against
+   hand-computed results.
+4. **Differential fuzzing**: a seeded UB-free C generator compiles every
+   program twice (epic-cc → sim, host clang → native) and diffs the checksums;
+   mismatches auto-reduce to a minimal saved fixture.
 
-**Start here:** [`docs/08-status-and-next-steps.md`](docs/08-status-and-next-steps.md)
-(where we are), then [`docs/12-backend-design.md`](docs/12-backend-design.md) (the approved
-consolidated backend spec).
+### Known gaps
 
-| Doc | What it covers |
-|---|---|
-| [`00-charter.md`](docs/00-charter.md) | Goal, scope, non-goals |
-| [`01-target-pic14.md`](docs/01-target-pic14.md) | The PIC14 architecture and exactly why it is hostile to C |
-| [`02-prior-art.md`](docs/02-prior-art.md) | Survey: llvm-mos, llvm-pic, SDCC, XC8, gputils, gpsim, key papers |
-| [`03-decisions.md`](docs/03-decisions.md) | ADRs, with rejected alternatives and rationale |
-| [`04-pipeline-design.md`](docs/04-pipeline-design.md) | The ten-stage pipeline |
-| [`05-verification.md`](docs/05-verification.md) | Oracles, simulator, differential testing, fuzzing, reduction |
-| [`06-environment.md`](docs/06-environment.md) | Toolchain setup and reference material |
-| [`07-references.md`](docs/07-references.md) | Books, papers, datasheets |
-| [`09-build-environment.md`](docs/09-build-environment.md) | docker dev container, pinned versions, gotchas |
-| [`10-spike-findings.md`](docs/10-spike-findings.md) | Feasibility spike: is `.ll` text a workable substrate? |
-| [`11-pointer-const-findings.md`](docs/11-pointer-const-findings.md) | Feasibility spike: pointers via `FSR`/`INDF`, Harvard `const` |
-| [`12-backend-design.md`](docs/12-backend-design.md) | **The approved backend spec** |
-| [`13-`…`28-`](docs/) | Per-milestone implementation plans (harness → integer spine → pointers → interrupts → `long` → fuzzing → soft-float) |
-| [`29-pic18-port-design.md`](docs/29-pic18-port-design.md) | The PIC18 port: why it is smaller than a second compiler, and its phases |
-| [`30-distribution-design.md`](docs/30-distribution-design.md) | The docker toolchain and the release bundles |
-| [`31-ecosystem-integration-design.md`](docs/31-ecosystem-integration-design.md) | Making epic-cc epic-hal's default toolchain, and reaching PlatformIO |
+Deliberate and tracked, not surprises: diagnostics are panics rather than
+user-facing errors; `BANKSEL` minimization is linear tracking, not the
+published 2-approximation; overlay allocation is call-graph-based, not
+interference-graph coloring; `.asm`/`.lst` output isn't exposed yet (only
+`.hex` and `--map`); the XC8 differential oracle is designed but not wired
+into the suite.
 
-Working notes for contributors and agents are in [`CLAUDE.md`](CLAUDE.md).
+Full design conversation, ADRs, and per-milestone plans live in
+[`docs/`](docs/); start with
+[`docs/08-status-and-next-steps.md`](docs/08-status-and-next-steps.md).
 
----
+</details>
+
+## Documentation
+
+- [`docs/00-charter.md`](docs/00-charter.md): goal, scope, non-goals
+- [`docs/03-decisions.md`](docs/03-decisions.md): ADRs, with rejected alternatives
+- [`docs/12-backend-design.md`](docs/12-backend-design.md): the approved backend spec
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CLAUDE.md`](CLAUDE.md): conventions for contributors and agents
 
 ## Non-goals
 
-- **Separate compilation.** Whole-program is the point, because overlay allocation needs
-  the full call graph.
-- **Debugger / COFF / ELF output.** HEX, listing and map only.
-- **Being an XC8 clone.** Differential testing against XC8 is a *verification technique*,
-  not a design target. Beating XC8 free-mode optimization is a nice-to-have.
-- **Reverse-engineering XC8.** Prohibited by its licence, and unnecessary
-  ([ADR-006](docs/03-decisions.md)).
-
----
+- **Separate compilation**: whole-program is the point; overlay allocation needs the full call graph.
+- **Debugger / COFF / ELF output**: HEX, listing, and map only.
+- **Being an XC8 clone**: differential testing against XC8 is a verification technique, not a design target.
+- **Reverse-engineering XC8**: prohibited by its license, and unnecessary.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
-
-Two boundaries worth stating explicitly, because this project is a compiler that sits next
-to other people's tools:
-
-- **`gputils` and `gpsim` are GPL.** They are invoked as external processes from the test
-  harness and never linked into the compiler, so they do not affect this project's
-  licensing. Keep them behind that process boundary.
-- **Microchip's datasheets, application notes and XC8 are Microchip's property**, are not
-  vendored here, and XC8 is used only as a black-box oracle
-  ([ADR-006](docs/03-decisions.md)). User-supplied Microchip material and reference books
-  live under [`vendor/`](vendor/README.md), whose contents are gitignored.
+MIT, see [LICENSE](LICENSE). `gputils`/`gpsim` (GPL) are invoked as external
+test-time processes only, never linked into the compiler. Microchip's
+datasheets and XC8 are Microchip's property, used only as a black-box oracle,
+and are not vendored here.
