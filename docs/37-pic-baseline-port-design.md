@@ -136,15 +136,19 @@ encoding at all, unlike PIC14E which kept PIC14's byte/bit/literal
 opcode families verbatim) that sharing `isel`'s instruction-emission
 code would mean scattering baseline special cases through PIC14's
 backend. A new crate isolates the failure mode structurally, the same
-argument `docs/33` D-1 made for `isel-pic14e`. **Open question, not
-resolved here**: does
-`isel-pic-baseline` share more with `isel` (both are direct-addressing,
-no-access-bank, small-RAM cores) or is it closer to a clean-room job?
-First read of Table 8-2 suggests closer to `isel` in spirit (same
-byte/bit/literal three-way instruction split, same `d`/`f`/`b`/`k`
-field vocabulary) but with a strictly smaller instruction set and the
-FSR-bank quirk layered on top. Needs a real prototype or a more careful
-read before deciding; flagging rather than answering.
+argument `docs/33` D-1 made for `isel-pic14e`. **Resolved in P2
+(epic-cc#325)**: `isel-pic-baseline` shares the integer-spine
+*structure* with classic `isel` (the `Gen` struct, the
+`emit_inst`/`emit_terminator`/`emit_func_body` skeleton, the
+`MOVF`/`MOVWF`/`ADDLW`/`ADDWF`/`BTFSC`/`GOTO` idiom vocabulary) but owns
+its instruction-emission code, exactly as `isel-pic14e` does. It does
+not share emission with `isel-pic14e` either: the two differ in the
+bank mechanism (baseline `FSR<5>` vs PIC14E `MOVLB`/`BSR`), the return
+idiom (baseline `RETLW 0` vs PIC14E `RETURN`), and the FSR machinery
+(baseline's single 6-bit FSR vs PIC14E's 16-bit FSR0/1 with linear
+alias). The three ISA deltas from classic `isel` are `SUBLW` (absent,
+D-6), `RETURN` (absent, D-6), and the d=1 destination default; the
+FSR-bank quirk is layered on top as D-2's unconditional reassertion.
 
 ### D-2: Bank selection via `FSR` and pointer dereference share a register, resolved via bit-granular writes
 
