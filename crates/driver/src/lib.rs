@@ -9,6 +9,8 @@ pub mod fosc;
 pub mod header_detect;
 pub mod hex;
 pub mod malloc_h;
+pub mod math_c;
+pub mod math_h;
 pub mod predef;
 pub mod prescan;
 pub mod report;

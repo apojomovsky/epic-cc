@@ -122,6 +122,7 @@ fn main() {
     std::fs::write(header_dir.join("stdarg.h"), driver::stdarg_h::STDARG_H)
         .expect("write stdarg.h");
     std::fs::write(header_dir.join("stdio.h"), driver::stdio_h::STDIO_H).expect("write stdio.h");
+    std::fs::write(header_dir.join("math.h"), driver::math_h::MATH_H).expect("write math.h");
 
     let sources: Vec<(String, String)> = cli
         .inputs
@@ -247,6 +248,31 @@ fn main() {
             eprintln!("epic-cc: {cmd:?}");
         }
         let out = cmd.output().expect("run clang for stdlib.c");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
+
+    let need_math = dep_texts
+        .iter()
+        .any(|t| driver::header_detect::dep_file_includes(t, "math.h"));
+    if need_math {
+        let math_c_path = tmp.join("__epic_math.c");
+        std::fs::write(&math_c_path, driver::math_c::MATH_C).expect("write math.c");
+        let ll_path = tmp.join("__epic_math.ll");
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
+        cmd.args([
+            "-o",
+            ll_path.to_str().unwrap(),
+            math_c_path.to_str().unwrap(),
+        ]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang for math.c");
         if !out.status.success() {
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(1);

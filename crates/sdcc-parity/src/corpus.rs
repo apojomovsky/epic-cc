@@ -107,11 +107,24 @@ pub fn tier2() -> Vec<CorpusProgram> {
             "#include <malloc.h>\nunsigned char heap[64];\nvolatile unsigned char out;\nvoid main(void) {\n    unsigned char _MALLOC_SPEC *a;\n    unsigned char _MALLOC_SPEC *b;\n    _initHeap(heap, sizeof heap);\n    a = malloc(4);\n    b = malloc(4);\n    a[0] = 0x11;\n    a[3] = 0x22;\n    b[0] = 0x33;\n    b[3] = 0x44;\n    free(a);\n    {\n        unsigned char _MALLOC_SPEC *c;\n        c = malloc(3);\n        if (b == 0 || c == 0) {\n            out = 0x00;\n        } else {\n            c[0] = 0x55;\n            c[2] = 0x66;\n            out = (unsigned char)(b[0] ^ b[3] ^ c[0] ^ c[2] ^ 0x7F);\n        }\n    }\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
-        // math: x = 0x2A -> (x*3 + 7) & 0xFF = 0x85
+        // int-arith (formerly named math): x = 0x2A -> (x*3 + 7) & 0xFF =
+        // 0x85. Integer arithmetic only; the math.h surface has its own
+        // probe below.
         prog(
-            "math",
+            "int-arith",
             0x85,
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    in = 0x2A;\n    unsigned char x = in;\n    out = (unsigned char)((x * 3 + 7) & 0xFF);\n    __asm__(\"sleep\");\n}\n",
+            &["out"],
+        ),
+        // math: sqrtf(2.25) = 1.5, fabsf(-4.5) = 4.5, floorf(6.0) = 6.0,
+        // (6 ^ 1) & 0xFF = 0x07. Every argument derives from the volatile
+        // input so both compilers keep real calls. fmaxf ships in our
+        // library but has no SDCC counterpart to differential against, so
+        // the driver e2e pins it instead.
+        prog(
+            "math",
+            0x07,
+            "#include <math.h>\nvolatile float in;\nvolatile unsigned char out;\nvoid main(void) {\n    in = 2.25f;\n    float s = sqrtf(in);\n    float g = fabsf(0.0f - in * 2.0f);\n    float f = floorf(g + s);\n    out = (unsigned char)(((unsigned int)f ^ (unsigned int)s) & 0xFF);\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
         // Function pointer: add1(9) = 0xA

@@ -40,9 +40,12 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | double | p18f4550 | 727 | 1409 | 18 | 43 | 1056 | 8080 | PASS |
 | double | p16f1938 | 644 | 1947 | 14 | 53 | 1089 | 6670 | PASS |
 | malloc | p18f4550 | 666 | 736 | 30 | 36 | 1743 | 6745 | PASS |
-| math | p16f877a | 57 | 557 | 10 | 26 | 119 | 1006 | PASS |
-| math | p18f4550 | 29 | 112 | 11 | 19 | 19 | 6222 | PASS |
-| math | p16f1938 | 56 | 433 | 10 | 29 | 118 | 791 | PASS |
+| int-arith | p16f877a | 57 | 557 | 10 | 26 | 119 | 1006 | PASS |
+| int-arith | p18f4550 | 29 | 112 | 11 | 19 | 19 | 6222 | PASS |
+| int-arith | p16f1938 | 56 | 433 | 10 | 29 | 118 | 791 | PASS |
+| math | p16f877a | - | - | - | - | - | - | SDCC-LIMIT (no linkable libm on pic14, float-to-long helper has no target memory; epic computes 0x07) |
+| math | p18f4550 | 3806 | 4731 | 42 | 78 | 19824 | 15456 | PASS |
+| math | p16f1938 | 3805 | 5220 | 44 | 172 | 20780 | 20321 | PASS |
 | fnptr | p16f877a | - | - | - | - | - | - | SDCC-BUG (epic=0x0A sdcc=0xF4; SDCC pic14 computed call, gpsim-confirmed) |
 | fnptr | p18f4550 | 17 | 146 | 6 | 23 | 10 | 6247 | PASS |
 | fnptr | p16f1938 | - | - | - | - | - | - | SDCC-BUG (epic=0x0A sdcc=0xCF; SDCC pic14 computed call, gpsim-confirmed) |
