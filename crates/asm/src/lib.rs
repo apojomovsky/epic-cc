@@ -614,10 +614,7 @@ pub fn assemble_words(device: &Device, src: &str) -> Vec<u16> {
         device::Core::Pic14 => assemble(src),
         device::Core::Pic18 => assemble_pic18(src),
         device::Core::Pic14e => assemble_pic14e(src),
-        device::Core::PicBaseline => panic!(
-            "asm: {} is pic-baseline; its encoder lands in P1 (docs/37), refusing to emit another core's words",
-            device.name
-        ),
+        device::Core::PicBaseline => assemble_pic_baseline(src),
     };
     assert!(
         words.len() as u32 <= device.flash_words,
@@ -917,6 +914,112 @@ fn encode_pic14e(addr: usize, line: &str, sym: &std::collections::HashMap<String
         "SUBWFB" => 0x3B00 | (d << 7) | f(op),
         "RESET" => 0x0001,
         _ => encode(line, sym),
+    }
+}
+
+/// Assemble PIC baseline (12-bit word) assembly source into 12-bit words
+/// indexed by word address. Two-pass like `assemble`: the shared pass 1
+/// resolves labels/`org`/`equ`/directives; pass 2 encodes the 33-instruction
+/// baseline ISA (DS41236E Table 8-2). Every encoding is confirmed
+/// byte-for-byte against `gpasm -p p12f509` 1.5.2 (2026-09-09).
+pub fn assemble_pic_baseline(src: &str) -> Vec<u16> {
+    let (lines, symbols, org) = assemble_first_pass(src);
+    let mut out = vec![0u16; org];
+    for (addr, line) in &lines {
+        out[*addr] = encode_pic_baseline(line, &symbols);
+    }
+    out
+}
+
+/// Encode one PIC baseline instruction line to one 12-bit word. `f` is a
+/// 5-bit file register (0-31), `b` a 3-bit bit number, `k` an 8-bit literal
+/// (9 bits for `GOTO`). The destination default is d = 1 (file), matching
+/// gpasm/MPASM on this core (gpasm 1.5.2 Message[305], confirmed
+/// 2026-09-09), unlike classic PIC14's W default.
+fn encode_pic_baseline(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    let mne = parts[0].to_ascii_uppercase();
+    let op = parts.get(1).copied().unwrap_or("");
+    let f = |s: &str| -> u16 {
+        let t = s.trim_end_matches(',');
+        let v = match sym.get(t) {
+            Some(&v) => v,
+            None => parse_num(t),
+        };
+        assert!(
+            v <= 0x1F,
+            "asm(pic-baseline): file register 0x{v:02X} out of range"
+        );
+        v as u16 & 0x1F
+    };
+    let d = match parts
+        .get(2)
+        .map(|s| s.trim().to_ascii_uppercase())
+        .as_deref()
+    {
+        Some("W") => 0,
+        _ => 1,
+    };
+    match mne.as_str() {
+        "NOP" => 0x0000,
+        "CLRW" => 0x0040,
+        "OPTION" => 0x0002,
+        "SLEEP" => 0x0003,
+        "CLRWDT" => 0x0004,
+        "TRIS" => 0x0000 | f(op),
+        "MOVWF" => 0x0020 | f(op),
+        "CLRF" => 0x0060 | f(op),
+        "MOVF" => 0x0200 | (d << 5) | f(op),
+        "ADDWF" => 0x01C0 | (d << 5) | f(op),
+        "SUBWF" => 0x0080 | (d << 5) | f(op),
+        "ANDWF" => 0x0140 | (d << 5) | f(op),
+        "IORWF" => 0x0100 | (d << 5) | f(op),
+        "XORWF" => 0x0180 | (d << 5) | f(op),
+        "COMF" => 0x0240 | (d << 5) | f(op),
+        "DECF" => 0x00C0 | (d << 5) | f(op),
+        "DECFSZ" => 0x02C0 | (d << 5) | f(op),
+        "INCF" => 0x0280 | (d << 5) | f(op),
+        "INCFSZ" => 0x03C0 | (d << 5) | f(op),
+        "RLF" => 0x0340 | (d << 5) | f(op),
+        "RRF" => 0x0300 | (d << 5) | f(op),
+        "SWAPF" => 0x0380 | (d << 5) | f(op),
+        "MOVLW" => 0x0C00 | parse_lit(op, sym) as u16,
+        "ANDLW" => 0x0E00 | parse_lit(op, sym) as u16,
+        "IORLW" => 0x0D00 | parse_lit(op, sym) as u16,
+        "XORLW" => 0x0F00 | parse_lit(op, sym) as u16,
+        "RETLW" => 0x0800 | parse_lit(op, sym) as u16,
+        "BTFSC" | "BTFSS" | "BCF" | "BSF" => {
+            // Operands may be split across whitespace ("STATUS, 5"): join the
+            // remaining tokens back into one operand string before splitting.
+            let full = parts[1..].join(" ");
+            let (freg, b) = full.split_once(',').unwrap();
+            let b = parse_num(b.trim());
+            assert!(b <= 7, "asm(pic-baseline): bit number {b} out of range");
+            let base = match mne.as_str() {
+                "BTFSC" => 0x0600,
+                "BTFSS" => 0x0700,
+                "BCF" => 0x0400,
+                _ => 0x0500,
+            };
+            base | ((b as u16) << 5) | f(freg.trim())
+        }
+        "GOTO" => {
+            let k = sym.get(op).copied().unwrap_or_else(|| parse_num(op));
+            assert!(
+                k <= 0x1FF,
+                "asm(pic-baseline): GOTO target 0x{k:03X} out of range"
+            );
+            0x0A00 | (k as u16 & 0x1FF)
+        }
+        "CALL" => {
+            let k = sym.get(op).copied().unwrap_or_else(|| parse_num(op));
+            assert!(
+                k <= 0xFF,
+                "asm(pic-baseline): CALL target 0x{k:02X} out of range"
+            );
+            0x0900 | (k as u16 & 0xFF)
+        }
+        other => panic!("asm(pic-baseline): unsupported mnemonic {other}"),
     }
 }
 
