@@ -66,6 +66,17 @@ expected = 0x9A
 # %f alike, with stdout NULL, rerouted to STREAM_USER, or via
 # fprintf(STREAM_USER). Breakpoints on the true-layout image show printf
 # and __stream_putchar run while neither sink ever executes; gpsim agrees.
+# math on the classic pic14 core is an SDCC limitation, same class as
+# i64: SDCC links libm only with an explicit -l, and with -llibm.lib the
+# 16F877A link fails (no target memory for the float-to-long helper the
+# probe's fold needs). epic-cc computes the hand value 0x07; the p18 and
+# p14e rows stay differential.
+[[bug]]
+device = "p16f877a"
+program = "math"
+# SDCC pic14 cannot link the math probe; epic computes 0x07.
+sdcc_observed = 0
+expected = 0x07
 [[bug]]
 device = "p18f4550"
 program = "printf-f"

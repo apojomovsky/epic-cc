@@ -209,10 +209,25 @@ fn compile_sdcc(
     // SDCC full link: compiles to .o, assembles, links to hex. The output
     // name is the source basename (prog.hex) in the work dir.
     let hex_path = dir.path.join("prog.hex");
+    // SDCC's own link pulls the core and C libraries automatically but
+    // not libm: a program using math.h needs an explicit `-l` with the
+    // full archive name (pic16 `libm18f.lib`, pic14 `libm.lib`, Enhanced
+    // `libme.lib`). Unused members are never pulled, so naming it for
+    // every program is harmless.
+    let mathlib = match device.core {
+        device::Core::Pic18 => "libm18f.lib",
+        device::Core::Pic14 => "libm.lib",
+        device::Core::Pic14e => "libme.lib",
+        device::Core::PicBaseline => panic!(
+            "sdcc-parity: {} is pic-baseline; SDCC cannot target this core",
+            device.name
+        ),
+    };
     let out = Command::new(&sdcc)
         .arg(format!("-m{port}"))
         .arg(format!("-p{sdcc_mcu}"))
         .arg("--use-non-free")
+        .arg(format!("-l{mathlib}"))
         .arg(&c_path)
         .current_dir(&dir.path)
         .output()
@@ -250,14 +265,21 @@ fn compile_sdcc(
         device::Core::Pic14e => "libsdcce.lib".to_string(),
         _ => "libsdcc.lib".to_string(),
     };
-    // The pic16 C library (`libc18f.lib`: printf and friends) is a
-    // separate archive SDCC's own link pulls in automatically. The
-    // map-only re-link below must name it explicitly, or any program
-    // using libc (the `%f` probe) fails the re-link with an unresolved
-    // `_printf` even though SDCC's own link succeeded.
-    let clib: Option<&str> = match port {
-        "pic16" => Some("libc18f.lib"),
-        _ => None,
+    // The pic16 C library (`libc18f.lib`: printf and friends) and the
+    // math library (`libm18f.lib`) are separate archives SDCC's own link
+    // pulls in automatically. The map-only re-link below must name them
+    // explicitly, or any program using libc (the `%f` probe) or libm (the
+    // `math` probe) fails the re-link with an unresolved symbol even
+    // though SDCC's own link succeeded. pic14 links `libm.lib` the same
+    // way; the Enhanced core's math lives in `libme.lib`.
+    let clibs: Vec<&str> = match device.core {
+        device::Core::Pic18 => vec!["libc18f.lib", "libm18f.lib"],
+        device::Core::Pic14 => vec!["libm.lib"],
+        device::Core::Pic14e => vec!["libme.lib"],
+        device::Core::PicBaseline => panic!(
+            "sdcc-parity: {} is pic-baseline; SDCC cannot target this core",
+            device.name
+        ),
     };
     // Device lib names differ per port: pic14 uses `pic16<device>.lib`
     // (e.g. pic16f877a.lib), pic16 uses `libdev<device>.lib`
@@ -276,7 +298,7 @@ fn compile_sdcc(
         .arg(&map_hex)
         .arg(&obj)
         .arg(&lib);
-    if let Some(clib) = clib {
+    for clib in &clibs {
         cmd.arg(clib);
     }
     let out = cmd

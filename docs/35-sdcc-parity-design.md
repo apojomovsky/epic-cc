@@ -119,7 +119,7 @@ the corpus (P0) closed them, mostly through clang's frontend lowering
 | Recursion / reentrancy (FSR1/FSR2 software stack, manual 4.10.12) | ✅ | ✅ | `recursion` probe (fact(5)) passes on all three cores; SDCC's pic14-family static overlay corrupts (arbitrated) |
 | Memory models, code-pointer width (manual 4.10.11) | small/large | single static model | deliberate non-goal. SDCC's models trade code-pointer width (2 vs 3 bytes) against devices above and below 64 KB of flash. epic-cc keys every local in one whole-program static map, so pointer width is a single whole-program decision, and the `constptr` probe already verifies flash traversal on all three cores. What is lost is 3-byte generic code pointers for code spaces above 64 KB; such a program fails with a precise panic, never a silent miscompile. If a supported device ever needs it, the width becomes a per-device constant, not a user-facing flag, and the surface item stays decidable from this row. |
 | malloc / heap | ✅ | ✅ | freestanding first-fit over a caller-registered arena (#343); `malloc` Tier-2 probe differentials clean on p18f4550, libc conformance pinned on all three cores |
-| math.h | ✅ | ❌ | library work |
+| math.h | ✅ | ✅ (`sqrtf`, `fabsf`, `fmaxf`, `floorf` over the f32 runtime) | shipped (#344): the `math` probe (sqrt/fabs/floor on volatile inputs, folded to a byte) is differential-clean on p18; `fmaxf` has no SDCC counterpart so the driver e2e pins it |
 | `printf` `%f` | ✅, but only if `device/lib/pic16` is rebuilt with `--enable-floats` (manual 4.10.9); default build prints `<NO FLOAT>` | ✅ | formatter shipped (#295); the `printf-f` probe formats 3.5 through printf on all three cores (conformance pinned); the p18f4550 differential is arbitrated (SDCC libc never delivers printf output to the portable putchar sink on any stream route, gpsim-confirmed in #352; `sdcc-known-bugs.toml`) |
 | Code/eeprom pointers (3-byte generic) | ✅ | partial | pointer-to-const traversal in flash verified at parity on all three cores (`constptr` probe, TBLRD/RETLW path); SDCC's space-qualified pointers (`__code`/`__eeprom`, runtime-selected spaces) stay open under #267 |
 | Two-vector priority interrupts | ✅ | ❌ | single-vector compat only (ADR-013 follow-up) |
@@ -139,7 +139,7 @@ the corpus (P0) closed them, mostly through clang's frontend lowering
 | Bit-fields | ✅ | ✅ | verified: `bitfields` probe passes (#300) |
 | Unions | ✅ | ✅ | verified: `unions` probe passes, locals included (#300) |
 | 64-bit | ❌ (manual 3.1.3: "pic14: there is no support for 64 bit integer types") | ❌ | no gap |
-| math.h | ✅ (`libm.lib`, manual 4.9.8.1) | ❌ | library work |
+| math.h | ✅ (`libm.lib`, manual 4.9.8.1) | ✅ (same four routines) | shipped (#344): p16f1938 differential-clean; classic pic14 is conformance-only (SDCC cannot link libm there, arbitrated in `sdcc-known-bugs.toml`) |
 | Enhanced core (16F193x) | experimental (`libsdcce`) | ✅ | port landed: P3 pointers/arrays/structs (#272), P4 const in flash (#278), P5 interrupts (#283), P6 32-bit long and mul/div (#284), P7 soft-float (#297), differential parity on 16F1938 (#302). What remains on that core is this same parity surface, tracked by the PIC14E sub-epic. |
 
 PIC18-table rows not listed here (recursion/reentrancy, malloc,

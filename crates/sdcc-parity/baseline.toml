@@ -176,7 +176,7 @@ epic_cycles = 1743
 sdcc_cycles = 6745
 
 [[row]]
-program = "math"
+program = "int-arith"
 device = "p16f877a"
 status = "pass"
 epic_flash = 57
@@ -185,7 +185,7 @@ epic_cycles = 119
 sdcc_cycles = 1006
 
 [[row]]
-program = "math"
+program = "int-arith"
 device = "p18f4550"
 status = "pass"
 epic_flash = 29
@@ -194,13 +194,40 @@ epic_cycles = 19
 sdcc_cycles = 6222
 
 [[row]]
-program = "math"
+program = "int-arith"
 device = "p16f1938"
 status = "pass"
 epic_flash = 56
 sdcc_flash = 433
 epic_cycles = 118
 sdcc_cycles = 791
+
+[[row]]
+program = "math"
+device = "p16f877a"
+status = "known-bug"
+epic_flash = 3898
+sdcc_flash = 0
+epic_cycles = 20847
+sdcc_cycles = 0
+
+[[row]]
+program = "math"
+device = "p18f4550"
+status = "pass"
+epic_flash = 3806
+sdcc_flash = 4731
+epic_cycles = 19824
+sdcc_cycles = 15456
+
+[[row]]
+program = "math"
+device = "p16f1938"
+status = "pass"
+epic_flash = 3805
+sdcc_flash = 5220
+epic_cycles = 20780
+sdcc_cycles = 20321
 
 [[row]]
 program = "fnptr"
