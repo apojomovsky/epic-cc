@@ -12,6 +12,7 @@
 
 # Build / test artifacts
 __pycache__/
+.ruff_cache/
 *.hex
 *.lst
 *.cod

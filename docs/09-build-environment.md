@@ -31,8 +31,8 @@ docker run --rm -v "$PWD:/workspace" -w /workspace epic-cc-dev bash scripts/ci-t
 | **clang** | **20.1.8** (source tarball, sha256-pinned) | IR producer — **deliberately pinned, see below** |
 | rustc / cargo | 1.97.1 | via `rust-toolchain.toml` + rustup |
 | gputils (`gpasm`) | 1.5.2 (source, sha256-pinned) | assembler cross-check oracle |
+| ruff | 0.16.6 (binary, sha256-pinned) | python lint and format gate |
 | csmith / creduce | 2.3.0 / 2.10.0 (apt) | fuzzing and reduction |
-| cvise | 2.4.0 (apt) | reduction convenience (never gates tests) |
 
 ### Why clang is pinned, and built from source
 

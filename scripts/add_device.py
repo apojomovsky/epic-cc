@@ -19,6 +19,7 @@ import sys
 # tables whose `values` are inline tables. No floats, no multi-line arrays,
 # no escapes in strings. That subset is all this parser handles.
 
+
 def _split_top(s, sep=","):
     """Split on sep at bracket/brace/string depth 0."""
     parts = []
@@ -149,8 +150,14 @@ def synthesize_xtal_hz(toml_path):
     pll = osc in ("hspll", "xtpll", "ecpll", "ecpio")
     if pll:
         factor = {
-            "noprescale": 1, "div2": 2, "div3": 3, "div4": 4,
-            "div5": 5, "div6": 6, "div10": 10, "div12": 12,
+            "noprescale": 1,
+            "div2": 2,
+            "div3": 3,
+            "div4": 4,
+            "div5": 5,
+            "div6": 6,
+            "div10": 10,
+            "div12": 12,
         }.get(_spec_value(spec, "plldiv"), 1)
         return str(4_000_000 * factor)
     return "4000000"
@@ -189,7 +196,7 @@ def _lkr_ram(lkr_text):
         ):
             if line.startswith(prefix):
                 kind = k
-                rest = line[len(prefix):]
+                rest = line[len(prefix) :]
                 break
         if kind is None or "PROTECTED" in rest:
             continue
@@ -324,7 +331,11 @@ def main():
     elif cmd == "synthesize-xtal":
         print(synthesize_xtal_hz(pathlib.Path(sys.argv[2])))
     elif cmd == "correct-ram":
-        sys.exit(0 if correct_ram(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])) else 1)
+        sys.exit(
+            0
+            if correct_ram(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))
+            else 1
+        )
     elif cmd == "field-diff":
         for line in field_diff(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])):
             print(line)

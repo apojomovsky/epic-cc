@@ -199,6 +199,9 @@ Run `make pre-pr-check` before opening a PR. It is a thin wrapper around
    contains literal ``\n``/``\r``; heal with ``gh pr edit --body-file``.
 8. Hooks installed (`make setup-hooks`).
 9. `make pre-pr-check TEST=1` also runs the full suite (or `epic-tasks takeoff --test`).
+10. **Python lint.** `bash scripts/lint-python.sh` (ruff, pinned in the
+   Dockerfile) must pass: the pre-commit hook runs it on staged `.py`
+   files and CI runs it over `scripts/`. The baseline was swept in #375.
 
 The ritual exits 1 with the exact fix list while blocking items are
 outstanding. Don't skip it; the CI gate only covers the suite, not the
