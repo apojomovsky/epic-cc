@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/gdbserver", "crates/sim", "crates/ir", "crates/irparse", "crates/wholeprog", "crates/legalize", "crates/callgraph", "crates/alloc", "crates/isel", "crates/banking", "crates/peephole", "crates/schedule", "crates/asm", "crates/driver", "crates/fuzz", "crates/device", "crates/iselcore", "crates/isel-pic18", "crates/isel-pic14e", "crates/sdcc-parity"]
+members = ["crates/gdbserver", "crates/sim", "crates/ir", "crates/irparse", "crates/wholeprog", "crates/legalize", "crates/callgraph", "crates/alloc", "crates/isel", "crates/banking", "crates/peephole", "crates/schedule", "crates/asm", "crates/driver", "crates/fuzz", "crates/device", "crates/iselcore", "crates/isel-pic-baseline", "crates/isel-pic18", "crates/isel-pic14e", "crates/sdcc-parity"]
 # The cargo-fuzz crate (fuzz/) is a standalone libFuzzer harness, not a
 # workspace member: it needs its own sanitizer build flags and must not
 # be part of the normal `cargo test --workspace` run (Lane B, #286).
