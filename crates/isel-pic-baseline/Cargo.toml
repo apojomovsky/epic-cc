@@ -1,0 +1,24 @@
+[package]
+name = "isel-pic-baseline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+device = { path = "../device" }
+iselcore = { path = "../iselcore" }
+
+[dev-dependencies]
+pic14-sim = { path = "../sim" }
+asm = { path = "../asm" }
+irparse = { path = "../irparse" }
+wholeprog = { path = "../wholeprog" }
+legalize = { path = "../legalize" }
+callgraph = { path = "../callgraph" }
+alloc = { path = "../alloc" }
+parking_lot = "0.12"
+
+[[bin]]
+name = "isel-pic-baseline"
+path = "src/bin/isel-pic-baseline.rs"

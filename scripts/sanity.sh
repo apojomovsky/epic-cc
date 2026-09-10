@@ -22,10 +22,9 @@ echo "--- sanity $DEVICE: add.c -> HEX + gpasm ---"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Compile add.c to HEX and to ASM for this device. pic-baseline has no
-# backend yet (docs/37 P1 wires the encoder), so the driver refuses it by
-# design; the refusal is the check for that core, and the gpasm drill
-# below still proves the part name.
+# Compile add.c to HEX and to ASM for this device. pic-baseline's backend
+# landed in P2 (docs/37), so the driver compiles it like the other cores;
+# the gpasm drill below still proves the part name.
 if cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.hex" 2>"$TMP/driver.err"; then
   cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.asm" --emit asm
   if [ ! -s "$TMP/out.hex" ]; then
