@@ -50,8 +50,20 @@ PROTECTED = "PROTECTED"
 # Non-flash codepages by name (the rest are flash pages). Everything listed is
 # also PROTECTED in every gputils lkr, the name filter only guards against a
 # future lkr dropping the flag.
-NON_FLASH = {"idlocs", ".idlocs", "devid", "config", ".config", "eedata",
-             ".eedata", "eedata1", "eedata2", "eedata3"}
+NON_FLASH = {
+    "idlocs",
+    ".idlocs",
+    "devid",
+    "config",
+    ".config",
+    "eedata",
+    ".eedata",
+    "eedata1",
+    "eedata2",
+    "eedata3",
+}
+
+
 def classify_core(name: str, inc_text: str) -> str:
     """Core from the .inc symbol set: BSR only exists on the Enhanced
     Mid-Range core, PCLATH only above baseline (PIC16F54 has neither)."""
@@ -63,6 +75,8 @@ def classify_core(name: str, inc_text: str) -> str:
     if "PCLATH" in symbols:
         return "pic14"
     return "pic-baseline"
+
+
 def parse_lkr(text: str, core: str) -> dict:
     """Flash words, allocatable RAM bytes, EEPROM bytes from a generic lkr.
 
@@ -77,7 +91,12 @@ def parse_lkr(text: str, core: str) -> dict:
     for line in text.splitlines():
         m = CODEPAGE_ROW.match(line)
         if m:
-            name, start, end, rest = m.group(1), int(m.group(2), 16), int(m.group(3), 16), m.group(4)
+            name, start, end, rest = (
+                m.group(1),
+                int(m.group(2), 16),
+                int(m.group(3), 16),
+                m.group(4),
+            )
             protected = PROTECTED in rest
             if "eedata" in name.lower().lstrip("."):
                 eeprom += end - start + 1
@@ -92,8 +111,9 @@ def parse_lkr(text: str, core: str) -> dict:
             # byte-addressed up to 128KB (0x20000), config/idlocs/eeprom
             # spaces sit above 0x200000 and are excluded by protection or
             # name, so the cap only needs to clear real flash.
-            if name not in NON_FLASH and end < (0x100000 if core == "pic18"
-                                                 else 0x10000):
+            if name not in NON_FLASH and end < (
+                0x100000 if core == "pic18" else 0x10000
+            ):
                 flash_units = max(flash_units, end + 1)
             continue
         m = BANK_ROW.match(line)
@@ -140,14 +160,18 @@ def cmd_scan(args: argparse.Namespace) -> int:
         row.update(parse_lkr(lkr.read_text(errors="replace"), core))
         rows.append(row)
     if missing_lkr:
-        print(f"scan: {len(missing_lkr)} headers without a generic lkr, skipped: "
-              f"{', '.join(missing_lkr)}", file=sys.stderr)
+        print(
+            f"scan: {len(missing_lkr)} headers without a generic lkr, skipped: "
+            f"{', '.join(missing_lkr)}",
+            file=sys.stderr,
+        )
     Path(args.out).write_text(json.dumps(rows, indent=1))
     by_core = {}
     for r in rows:
         by_core[r["core"]] = by_core.get(r["core"], 0) + 1
     print(f"scan: {len(rows)} F parts -> {args.out} ({by_core})")
     return 0
+
 
 def curl(url: str, dest: Path) -> None:
     proc = subprocess.run(["curl", "-sL", "--max-time", "590", "-o", str(dest), url])
@@ -163,6 +187,7 @@ PIC8_PACK = re.compile(r"^Microchip\.PIC(10|12|16|18).*_DFP$")
 def select_packs(idx_path: Path) -> dict:
     """Latest version per 8-bit DFP pack from index.idx (streamed: 50MB+)."""
     import xml.etree.ElementTree as ET
+
     latest = {}
     for event, el in ET.iterparse(str(idx_path), events=("end",)):
         if not el.tag.endswith("pdsc"):
@@ -186,6 +211,7 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     the cache dir. Same posture as the gitignored vendor installers:
     Microchip downloads live outside the repo and are never committed."""
     import zipfile
+
     cache = Path(args.cache)
     cache.mkdir(parents=True, exist_ok=True)
     idx = cache / "index.idx"
@@ -204,8 +230,9 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         pack_dir.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(atpack) as zf:
             zf.extractall(pack_dir)
-    print(f"fetch: {len(list((cache / 'packs').glob('*')))} packs under "
-          f"{cache / 'packs'}")
+    print(
+        f"fetch: {len(list((cache / 'packs').glob('*')))} packs under {cache / 'packs'}"
+    )
     return 0
 
 
@@ -214,6 +241,7 @@ def cmd_scan_index(args: argparse.Namespace) -> int:
     its datasheet PDFs live. This is the Microchip-universe enumeration;
     every flash part the DFPs know appears here with its book URLs."""
     import xml.etree.ElementTree as ET
+
     wanted = select_packs(Path(args.index))
     rows = {}
     pack_of = {}
@@ -234,24 +262,29 @@ def cmd_scan_index(args: argparse.Namespace) -> int:
             pack_of[display] = name
             if not is_latest:
                 continue
-            books = [{"title": b.get("title"), "url": b.get("name")}
-                     for b in dev.iter()
-                     if b.tag.rsplit("}", 1)[-1] == "book" and b.get("name")]
-            rows[display] = {"display": display, "pack": name,
-                             "family": dev.get("family"),
-                             "core_str": dev.get("core"),
-                             "books": books}
+            books = [
+                {"title": b.get("title"), "url": b.get("name")}
+                for b in dev.iter()
+                if b.tag.rsplit("}", 1)[-1] == "book" and b.get("name")
+            ]
+            rows[display] = {
+                "display": display,
+                "pack": name,
+                "family": dev.get("family"),
+                "core_str": dev.get("core"),
+                "books": books,
+            }
         el.clear()
-    Path(args.out).write_text(json.dumps(
-        {"devices": rows, "pack_of": pack_of}, indent=1))
+    Path(args.out).write_text(
+        json.dumps({"devices": rows, "pack_of": pack_of}, indent=1)
+    )
     print(f"scan-index: {len(rows)} devices -> {args.out}")
     return 0
 
 
 # Flash generation, including the low-voltage (LF) and high-voltage (HV)
 # orderable variants of the same silicon. C (EPROM/OTP) parts never match.
-PIC8_PART = re.compile(
-    r"^PIC(10F|10LF|12F|12LF|12HV|16F|16LF|16HV|18F|18LF)")
+PIC8_PART = re.compile(r"^PIC(10F|10LF|12F|12LF|12HV|16F|16LF|16HV|18F|18LF)")
 
 
 def parse_ini_facts(ini_path: Path) -> dict:
@@ -279,6 +312,7 @@ def edc_facts(edc_path: Path):
     memory granularity, and gen-device's own header documents that PIC18
     packs can understate RAM, which the gputils backbone corrects."""
     import xml.etree.ElementTree as ET
+
     ns = "{http://crownking/edc}"
     root = ET.parse(edc_path).getroot()
     out = {"core": root.get(ns + "arch", "").lower() or None}
@@ -295,7 +329,7 @@ def edc_facts(edc_path: Path):
         cur = el
         while cur in parent_of:
             cur = parent_of[cur]
-            tag = cur.tag[len(ns):] if cur.tag.startswith(ns) else cur.tag
+            tag = cur.tag[len(ns) :] if cur.tag.startswith(ns) else cur.tag
             if tag in ("TraditionalModeOnly", "ExtendedModeOnly"):
                 return tag
         return None
@@ -334,13 +368,24 @@ def cmd_scan_dfp(args: argparse.Namespace) -> int:
     tail: Q-series, five-digit 16F1xxxx parts). ini first, EDC fallback,
     the same preference gen-device.py encodes; the EDC pass also fills
     per-field gaps (core, RAM) in ini-sourced rows."""
-    EDC_ARCH = {"16c5x": "pic-baseline", "16xxxx": "pic14",
-                "16exxx": "pic14e", "18xxxx": "pic18"}
+    EDC_ARCH = {
+        "16c5x": "pic-baseline",
+        "16xxxx": "pic14",
+        "16exxx": "pic14e",
+        "18xxxx": "pic18",
+    }
     # XC8's ini ARCH taxonomy: PIC12/PIC12E are the baseline 12F5xx core,
     # PIC14EX the extended enhanced mid-range of the newest 16F1xxxx.
-    INI_ARCH = {"PIC12": "pic-baseline", "PIC12E": "pic-baseline",
-                "PIC14": "pic14", "PIC14E": "pic14e", "PIC14EX": "pic14e",
-                "PIC18": "pic18", "PIC18XV": "pic18", "PIC16": "pic18"}
+    INI_ARCH = {
+        "PIC12": "pic-baseline",
+        "PIC12E": "pic-baseline",
+        "PIC14": "pic14",
+        "PIC14E": "pic14e",
+        "PIC14EX": "pic14e",
+        "PIC18": "pic18",
+        "PIC18XV": "pic18",
+        "PIC16": "pic18",
+    }
     rows = []
     for pack_dir in sorted(Path(args.cache).glob("packs/Microchip.PIC*")):
         ini_rows = {}
@@ -351,15 +396,24 @@ def cmd_scan_dfp(args: argparse.Namespace) -> int:
                 # Family-template sections ship inside the XC8 inis
                 # (PIC18FXXK42, PIC16F188EX, PIC16F18NVM): not orderable
                 # parts, so they never enter the union.
-                if not rom or not PIC8_PART.match(display) or "XX" in display \
-                        or "NVM" in display or display.endswith("EX"):
+                if (
+                    not rom
+                    or not PIC8_PART.match(display)
+                    or "XX" in display
+                    or "NVM" in display
+                    or display.endswith("EX")
+                ):
                     continue
                 core = INI_ARCH.get(sec.get("ARCH", "").upper())
                 # ini ROMSIZE counts words on PIC14, bytes on PIC18
                 # (4550: ROMSIZE=8000, flash_words 16384).
                 rom_words = int(rom, 16) // 2 if core == "pic18" else int(rom, 16)
-                row = {"display": display, "pack": pack_dir.name,
-                       "core": core, "flash_words": rom_words}
+                row = {
+                    "display": display,
+                    "pack": pack_dir.name,
+                    "core": core,
+                    "flash_words": rom_words,
+                }
                 if sec.get("RAMBANK"):
                     spans = []
                     for part in sec["RAMBANK"].split(","):
@@ -376,18 +430,23 @@ def cmd_scan_dfp(args: argparse.Namespace) -> int:
             core = EDC_ARCH.get(facts["core"] or "")
             flash = None
             if facts["code_end"]:
-                flash = (facts["code_end"] // 2 if core == "pic18"
-                         else facts["code_end"])
-            ram = (sum(hi - lo + 1 for lo, hi in coalesce(facts["ram_spans"]))
-                   if facts["ram_spans"] else None)
+                flash = facts["code_end"] // 2 if core == "pic18" else facts["code_end"]
+            ram = (
+                sum(hi - lo + 1 for lo, hi in coalesce(facts["ram_spans"]))
+                if facts["ram_spans"]
+                else None
+            )
             known = ini_rows.get(stem)
             if known:
                 # Per-field: a RAM-less ini row is still the ROMSIZE source.
                 # The EDC arch is the core authority: XC8's ini labels the
                 # baseline PIC10F320/322 PIC14, its EDC says 16c5x.
                 if core != known.get("core"):
-                    print(f"scan-dfp: {stem}: ini core {known.get('core')} "
-                          f"vs edc {core}, taking edc", file=sys.stderr)
+                    print(
+                        f"scan-dfp: {stem}: ini core {known.get('core')} "
+                        f"vs edc {core}, taking edc",
+                        file=sys.stderr,
+                    )
                 known["core"] = core or known.get("core")
                 known.setdefault("ram_bytes", ram)
                 continue
@@ -402,14 +461,29 @@ def cmd_scan_dfp(args: argparse.Namespace) -> int:
     Path(args.out).write_text(json.dumps(rows, indent=1))
     print(f"scan-dfp: {len(rows)} devices -> {args.out}")
     return 0
+
+
 def gh_total(query: str) -> int:
     # Transient TLS/HTTP failures are routine on a 1000-query sweep; retry
     # before giving up so one blip does not kill a long run.
     for attempt in range(3):
         proc = subprocess.run(
-            ["gh", "api", "search/code", "-X", "GET",
-             "-f", f"q={query}", "-F", "per_page=1", "--jq", ".total_count"],
-            capture_output=True, text=True)
+            [
+                "gh",
+                "api",
+                "search/code",
+                "-X",
+                "GET",
+                "-f",
+                f"q={query}",
+                "-F",
+                "per_page=1",
+                "--jq",
+                ".total_count",
+            ],
+            capture_output=True,
+            text=True,
+        )
         if proc.returncode == 0:
             return int(proc.stdout.strip())
         time.sleep(15)
@@ -422,27 +496,63 @@ def cmd_score(args: argparse.Namespace) -> int:
     out = Path(args.out)
     if out.exists():
         scores = json.loads(out.read_text())
-    todo = [r["display"] for r in rows
-            if args.refill or r["display"] not in scores]
+    todo = [r["display"] for r in rows if args.refill or r["display"] not in scores]
     # Classic tutorial parts get the first slots so a partial run covers the
     # parts that dominate community code before the run ends.
-    classic = ["PIC16F877A", "PIC16F877", "PIC16F876A", "PIC16F873A",
-               "PIC16F628A", "PIC16F627A", "PIC16F648A", "PIC16F887",
-               "PIC16F88", "PIC16F84A", "PIC16F84", "PIC16F690", "PIC16F675",
-               "PIC12F629", "PIC12F675", "PIC12F683", "PIC16F72", "PIC16F819",
-               "PIC18F4550", "PIC18F2550", "PIC18F452", "PIC18F4520",
-               "PIC18F4620", "PIC18F45K22", "PIC18F45K50", "PIC18F26K83",
-               "PIC16F18877", "PIC16F1937", "PIC16F1939", "PIC16F1788",
-               "PIC16F1827", "PIC16F1503", "PIC16F1455", "PIC16F1705",
-               "PIC16F18326", "PIC18F26Q43", "PIC12F1572", "PIC10F200"]
+    classic = [
+        "PIC16F877A",
+        "PIC16F877",
+        "PIC16F876A",
+        "PIC16F873A",
+        "PIC16F628A",
+        "PIC16F627A",
+        "PIC16F648A",
+        "PIC16F887",
+        "PIC16F88",
+        "PIC16F84A",
+        "PIC16F84",
+        "PIC16F690",
+        "PIC16F675",
+        "PIC12F629",
+        "PIC12F675",
+        "PIC12F683",
+        "PIC16F72",
+        "PIC16F819",
+        "PIC18F4550",
+        "PIC18F2550",
+        "PIC18F452",
+        "PIC18F4520",
+        "PIC18F4620",
+        "PIC18F45K22",
+        "PIC18F45K50",
+        "PIC18F26K83",
+        "PIC16F18877",
+        "PIC16F1937",
+        "PIC16F1939",
+        "PIC16F1788",
+        "PIC16F1827",
+        "PIC16F1503",
+        "PIC16F1455",
+        "PIC16F1705",
+        "PIC16F18326",
+        "PIC18F26Q43",
+        "PIC12F1572",
+        "PIC10F200",
+    ]
     flash = {r["display"]: r.get("flash_words") or 0 for r in rows}
     # Rows may carry a priority (0 first); the union builder marks Active
     # parts so a partial run fills orderable parts before the NRND tail.
     prio = {r["display"]: r.get("priority", 1) for r in rows}
-    todo.sort(key=lambda d: (classic.index(d) if d in classic
-                             else len(classic), prio[d], -flash[d], d))
+    todo.sort(
+        key=lambda d: (
+            classic.index(d) if d in classic else len(classic),
+            prio[d],
+            -flash[d],
+            d,
+        )
+    )
     if args.limit:
-        todo = todo[:args.limit]
+        todo = todo[: args.limit]
     # REST code search allows 10 authenticated req/min; pace at 6.5s so a long
     # run never trips, and write after every query so a kill loses at most one.
     for i, part in enumerate(todo):
@@ -458,24 +568,49 @@ def cmd_score(args: argparse.Namespace) -> int:
             time.sleep(6.5)
     print(f"score: {len(todo)} parts scored -> {args.out}")
     return 0
+
+
 def mcp_call(part: str) -> dict | None:
     """One Microchip ProductInfo MCP call: lifecycle + datasheet PDF URL for
     a base part number. Unauthenticated, ~2s; failures return None and stay
     retryable (nothing is cached for a failed part)."""
-    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                       "params": {"name": "get_full_product_profile",
-                                  "arguments": {"partNumber": part}}})
+    body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "get_full_product_profile",
+                "arguments": {"partNumber": part},
+            },
+        }
+    )
     try:
         proc = subprocess.run(
-            ["curl", "-s", "--max-time", "60", "-X", "POST",
-             "https://api.microchip.com/mcp/resources",
-             "-H", "Content-Type: application/json",
-             "-H", "Accept: application/json, text/event-stream",
-             "-d", body], capture_output=True, text=True)
+            [
+                "curl",
+                "-s",
+                "--max-time",
+                "60",
+                "-X",
+                "POST",
+                "https://api.microchip.com/mcp/resources",
+                "-H",
+                "Content-Type: application/json",
+                "-H",
+                "Accept: application/json, text/event-stream",
+                "-d",
+                body,
+            ],
+            capture_output=True,
+            text=True,
+        )
         if proc.returncode != 0:
             return None
-        line = next((l for l in proc.stdout.splitlines()
-                     if l.startswith("data: ")), None)
+        line = next(
+            (line for line in proc.stdout.splitlines() if line.startswith("data: ")),
+            None,
+        )
         if not line:
             return None
         inner = json.loads(json.loads(line[6:])["result"]["content"][0]["text"])
@@ -495,14 +630,14 @@ def cmd_scan_mcp(args: argparse.Namespace) -> int:
     failed parts are left out for the next run. No auth, so pacing stays
     modest instead of hammering a free endpoint."""
     from concurrent.futures import ThreadPoolExecutor
+
     gp = json.loads(Path(args.gputils).read_text())
     dfp = json.loads(Path(args.dfp).read_text())
     union = sorted({r["display"] for r in gp} | {r["display"] for r in dfp})
     out = Path(args.out)
     state = json.loads(out.read_text()) if out.exists() else {}
     todo = [p for p in union if p not in state]
-    print(f"scan-mcp: {len(todo)} of {len(union)} parts to fetch",
-          file=sys.stderr)
+    print(f"scan-mcp: {len(todo)} of {len(union)} parts to fetch", file=sys.stderr)
 
     def fetch(part):
         time.sleep(0.2)
@@ -519,6 +654,8 @@ def cmd_scan_mcp(args: argparse.Namespace) -> int:
                 print(f"scan-mcp: {done}/{len(todo)}", file=sys.stderr)
     out.write_text(json.dumps(state, indent=1, sort_keys=True))
     print(f"scan-mcp: {len(state)} parts enriched -> {args.out}")
+
+
 def tier_of(refs) -> str:
     """Popularity tier from GitHub code-search references. Thresholds split
     the observed distribution: flagship parts are orders of magnitude above
@@ -543,10 +680,11 @@ def cmd_build(args: argparse.Namespace) -> int:
     the family-prefix rule as last-resort core fallback. Every
     disagreement is printed, and the catalog test pins the shipped
     devices against their TOMLs."""
-    gp_rows = {r["display"]: r for r in
-               json.loads(Path(args.gputils).read_text())}
+    gp_rows = {r["display"]: r for r in json.loads(Path(args.gputils).read_text())}
     dfp_rows = {r["display"]: r for r in json.loads(Path(args.dfp).read_text())}
-    scores = json.loads(Path(args.scores).read_text()) if Path(args.scores).exists() else {}
+    scores = (
+        json.loads(Path(args.scores).read_text()) if Path(args.scores).exists() else {}
+    )
     mcp = json.loads(Path(args.mcp).read_text()) if Path(args.mcp).exists() else {}
 
     union = sorted(set(gp_rows) | set(dfp_rows))
@@ -555,31 +693,51 @@ def cmd_build(args: argparse.Namespace) -> int:
         gp, dfp = gp_rows.get(display), dfp_rows.get(display)
         core = (dfp or {}).get("core") or (gp or {}).get("core")
         if core is None:
-            core = ("pic-baseline" if re.match(r"^PIC(10F2|12F5|16F5)", display)
-                    else "pic18" if display.startswith("PIC18") else "pic14")
-        entry = {"name": ((gp or dfp).get("name")
-                          or "p" + display[3:].lower()), "core": core}
+            core = (
+                "pic-baseline"
+                if re.match(r"^PIC(10F2|12F5|16F5)", display)
+                else "pic18"
+                if display.startswith("PIC18")
+                else "pic14"
+            )
+        entry = {
+            "name": ((gp or dfp).get("name") or "p" + display[3:].lower()),
+            "core": core,
+        }
         if dfp:
             entry["pack"] = dfp["pack"]
-        flash = [s for s in ((dfp or {}).get("flash_words"),
-                             (gp or {}).get("flash_words")) if s]
+        flash = [
+            s
+            for s in ((dfp or {}).get("flash_words"), (gp or {}).get("flash_words"))
+            if s
+        ]
         if flash and len(set(flash)) > 1:
-            print(f"build: flash mismatch {display}: dfp={flash[0]} "
-                  f"gputils={flash[1]}", file=sys.stderr)
+            print(
+                f"build: flash mismatch {display}: dfp={flash[0]} gputils={flash[1]}",
+                file=sys.stderr,
+            )
         if flash:
             entry["flash_words"] = flash[0]
-        ram = [s for s in ((gp or {}).get("ram_bytes"),
-                           (dfp or {}).get("ram_bytes")) if s]
+        ram = [
+            s for s in ((gp or {}).get("ram_bytes"), (dfp or {}).get("ram_bytes")) if s
+        ]
         if ram and len(set(ram)) > 1:
-            print(f"build: ram mismatch {display}: gputils={ram[0]} "
-                  f"dfp={ram[1]}", file=sys.stderr)
+            print(
+                f"build: ram mismatch {display}: gputils={ram[0]} dfp={ram[1]}",
+                file=sys.stderr,
+            )
         if ram:
             entry["ram_bytes"] = ram[0]
-        ee = [s for s in ((gp or {}).get("eeprom_bytes"),
-                          (dfp or {}).get("eeprom_bytes")) if s]
+        ee = [
+            s
+            for s in ((gp or {}).get("eeprom_bytes"), (dfp or {}).get("eeprom_bytes"))
+            if s
+        ]
         if ee and len(set(ee)) > 1:
-            print(f"build: eeprom mismatch {display}: gputils={ee[0]} "
-                  f"dfp={ee[1]}", file=sys.stderr)
+            print(
+                f"build: eeprom mismatch {display}: gputils={ee[0]} dfp={ee[1]}",
+                file=sys.stderr,
+            )
         if ee:
             entry["eeprom_bytes"] = ee[0]
         merged[display] = entry
@@ -654,10 +812,12 @@ def main() -> int:
     p = sub.add_parser("score", help="fill GitHub code-search counts")
     p.add_argument("--rows", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--limit", type=int, default=None,
-                   help="score at most N parts this run")
-    p.add_argument("--refill", action="store_true",
-                   help="re-score parts that already have a count")
+    p.add_argument(
+        "--limit", type=int, default=None, help="score at most N parts this run"
+    )
+    p.add_argument(
+        "--refill", action="store_true", help="re-score parts that already have a count"
+    )
     p.set_defaults(fn=cmd_score)
 
     p = sub.add_parser("build", help="merge rows + scores -> catalog TOML")
@@ -665,8 +825,9 @@ def main() -> int:
     p.add_argument("--dfp", required=True)
     p.add_argument("--scores", required=True)
     p.add_argument("--mcp", required=True)
-    p.add_argument("--page-template",
-                   default="https://www.microchip.com/en-us/product/{display}")
+    p.add_argument(
+        "--page-template", default="https://www.microchip.com/en-us/product/{display}"
+    )
     p.add_argument("--date", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(fn=cmd_build)

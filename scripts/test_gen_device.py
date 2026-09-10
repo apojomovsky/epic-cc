@@ -54,9 +54,13 @@ class GenDeviceTest(unittest.TestCase):
         # --pack the pack name is unknowable. Writing pack = "unknown"
         # would fabricate provenance (ADR-021): refuse instead.
         r, text = run_generator(FIXTURE)
-        self.assertNotEqual(r.returncode, 0, "an unresolvable pack name must not generate")
+        self.assertNotEqual(
+            r.returncode, 0, "an unresolvable pack name must not generate"
+        )
         self.assertIn("pack", r.stderr)
-        self.assertEqual(text, "", "nothing may be written when the pack name is unknown")
+        self.assertEqual(
+            text, "", "nothing may be written when the pack name is unknown"
+        )
 
     def test_pack_name_derived_from_dfp_ancestor_directory(self):
         # A file still inside its pack directory needs no --pack: the
@@ -89,15 +93,34 @@ class GenDeviceTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = pathlib.Path(d) / "synthetic.toml"
             r = subprocess.run(
-                [sys.executable, str(GEN), "synthetic", "--atdf", str(FIXTURE),
-                 "--pack", "Microchip.PIC16Fxxx_DFP", "--out", str(out)],
-                capture_output=True, text=True,
+                [
+                    sys.executable,
+                    str(GEN),
+                    "synthetic",
+                    "--atdf",
+                    str(FIXTURE),
+                    "--pack",
+                    "Microchip.PIC16Fxxx_DFP",
+                    "--out",
+                    str(out),
+                ],
+                capture_output=True,
+                text=True,
             )
             self.assertEqual(r.returncode, 0, r.stderr)
             r = subprocess.run(
-                [sys.executable, str(GEN), "synthetic", "--atdf", str(FIXTURE),
-                 "--out", str(out), "--check"],
-                capture_output=True, text=True,
+                [
+                    sys.executable,
+                    str(GEN),
+                    "synthetic",
+                    "--atdf",
+                    str(FIXTURE),
+                    "--out",
+                    str(out),
+                    "--check",
+                ],
+                capture_output=True,
+                text=True,
             )
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -117,13 +140,17 @@ class GenDeviceTest(unittest.TestCase):
 
     def test_fails_loudly_when_the_source_omits_a_field(self):
         stripped = "\n".join(
-            l for l in FIXTURE.read_text().splitlines() if "GPRDataSector" not in l
+            line
+            for line in FIXTURE.read_text().splitlines()
+            if "GPRDataSector" not in line
         )
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "no_ram.atdf"
             src.write_text(stripped)
             r, text = run_generator(src, pack="Microchip.PIC16Fxxx_DFP")
-        self.assertNotEqual(r.returncode, 0, "a source with no RAM map must not generate")
+        self.assertNotEqual(
+            r.returncode, 0, "a source with no RAM map must not generate"
+        )
         self.assertIn("ram_banks", r.stderr)
         self.assertEqual(text, "", "nothing may be written when a field is missing")
 
@@ -136,7 +163,9 @@ class GenDevicePic18Test(unittest.TestCase):
     it silently mis-generating both the config region and the RAM map."""
 
     def generate(self):
-        r, text = run_generator(PIC18_FIXTURE, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+        r, text = run_generator(
+            PIC18_FIXTURE, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+        )
         self.assertEqual(r.returncode, 0, r.stderr)
         return text
 
@@ -216,7 +245,9 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "bad_impl.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
         self.assertNotEqual(r.returncode, 0, "an impl mismatch must not generate")
         self.assertIn("does not match", r.stderr)
         self.assertEqual(text, "")
@@ -233,7 +264,9 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "scattered_mask.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("mask = 0x05", text)
 
@@ -242,13 +275,17 @@ class GenDevicePic18Test(unittest.TestCase):
         # data, not a scattered field: refusing beats placing wrong bits.
         tampered = PIC18_FIXTURE.read_text().replace(
             'edc:name="ALPHA" edc:mask="0x1"',
-            'edc:name="ALPHA" edc:mask="0x5" edc:nzwidth="0x1"'
+            'edc:name="ALPHA" edc:mask="0x5" edc:nzwidth="0x1"',
         )
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "bad_span.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
-        self.assertNotEqual(r.returncode, 0, "a mask outside its span must not generate")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
+        self.assertNotEqual(
+            r.returncode, 0, "a mask outside its span must not generate"
+        )
         self.assertIn("does not fit", r.stderr)
         self.assertEqual(text, "")
 
@@ -256,21 +293,30 @@ class GenDevicePic18Test(unittest.TestCase):
         # A `when` using a relational form (>=, <, !=) instead of `==` must
         # not be silently skipped: dropping every semantic for GAMMA would
         # otherwise drop the whole field from the output with exit 0.
-        tampered = PIC18_FIXTURE.read_text().replace(
-            'edc:cname="THREE" edc:when="(field &amp; 0x3) == 0x3"',
-            'edc:cname="THREE" edc:when="(field &amp; 0x3) &gt;= 0x3"',
-        ).replace(
-            'edc:cname="ONE" edc:when="(field &amp; 0x3) == 0x1"',
-            'edc:cname="ONE" edc:when="(field &amp; 0x3) &gt;= 0x1"',
-        ).replace(
-            'edc:cname="ZERO" edc:when="(field &amp; 0x3) == 0x0"',
-            'edc:cname="ZERO" edc:when="(field &amp; 0x3) &gt;= 0x0"',
+        tampered = (
+            PIC18_FIXTURE.read_text()
+            .replace(
+                'edc:cname="THREE" edc:when="(field &amp; 0x3) == 0x3"',
+                'edc:cname="THREE" edc:when="(field &amp; 0x3) &gt;= 0x3"',
+            )
+            .replace(
+                'edc:cname="ONE" edc:when="(field &amp; 0x3) == 0x1"',
+                'edc:cname="ONE" edc:when="(field &amp; 0x3) &gt;= 0x1"',
+            )
+            .replace(
+                'edc:cname="ZERO" edc:when="(field &amp; 0x3) == 0x0"',
+                'edc:cname="ZERO" edc:when="(field &amp; 0x3) &gt;= 0x0"',
+            )
         )
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "relational_when.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
-        self.assertNotEqual(r.returncode, 0, "an unhandled `when` form must not generate")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
+        self.assertNotEqual(
+            r.returncode, 0, "an unhandled `when` form must not generate"
+        )
         self.assertIn("unhandled", r.stderr)
         self.assertEqual(text, "")
 
@@ -283,18 +329,20 @@ class GenDevicePic18Test(unittest.TestCase):
         # missing name; it must be dropped like a hidden field's values are.
         tampered = PIC18_FIXTURE.read_text().replace(
             '<edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x0"/>\n'
-            '            </edc:DCRFieldDef>\n'
-            '            <edc:AdjustPoint',
+            "            </edc:DCRFieldDef>\n"
+            "            <edc:AdjustPoint",
             '<edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x0"/>\n'
             '              <edc:DCRFieldSemantic edc:when="(field &amp; 0x1) == 0x1" '
             'edc:islanghidden="true"/>\n'
-            '            </edc:DCRFieldDef>\n'
-            '            <edc:AdjustPoint',
+            "            </edc:DCRFieldDef>\n"
+            "            <edc:AdjustPoint",
         )
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "hidden_semantic.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('name = "alpha"', text)
         self.assertIn('{ name = "on", bits = 1 }', text)
@@ -311,21 +359,23 @@ class GenDevicePic18Test(unittest.TestCase):
             '              <edc:DCRFieldSemantic edc:cname="THREE" edc:when="(field &amp; 0x3) == 0x3"/>\n'
             '              <edc:DCRFieldSemantic edc:cname="ONE" edc:when="(field &amp; 0x3) == 0x1"/>\n'
             '              <edc:DCRFieldSemantic edc:cname="ZERO" edc:when="(field &amp; 0x3) == 0x0"/>\n'
-            '            </edc:DCRFieldDef>',
+            "            </edc:DCRFieldDef>",
             '<edc:DCRFieldDef edc:name="GAMMA" edc:mask="0x3">\n'
             '              <edc:DCRFieldSemantic edc:cname="THREE" edc:when="(field &amp; 0x3) == 0x3"/>\n'
             '              <edc:DCRFieldSemantic edc:cname="ONE" edc:when="(field &amp; 0x3) == 0x1"/>\n'
             '              <edc:DCRFieldSemantic edc:cname="ZERO" edc:when="(field &amp; 0x3) == 0x0"/>\n'
-            '            </edc:DCRFieldDef>\n'
+            "            </edc:DCRFieldDef>\n"
             '            <edc:DCRFieldDef edc:name="RESERVED" edc:mask="0x3" '
             'edc:ishidden="true" edc:islanghidden="true">\n'
             '              <edc:DCRFieldSemantic edc:when="(field &amp; 0x3) == 0x3"/>\n'
-            '            </edc:DCRFieldDef>',
+            "            </edc:DCRFieldDef>",
         )
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "reserved_beyond_impl.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('name = "gamma"', text)
         self.assertNotIn('name = "reserved"', text)
@@ -345,7 +395,9 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "straddling_res.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('name = "alpha"', text)
         self.assertNotIn('name = "res"', text)
@@ -365,8 +417,12 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "all_hidden_semantics.atdf"
             src.write_text(tampered)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
-        self.assertNotEqual(r.returncode, 0, "a field with no non-hidden semantic must not generate")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
+        self.assertNotEqual(
+            r.returncode, 0, "a field with no non-hidden semantic must not generate"
+        )
         self.assertIn("no non-hidden semantic", r.stderr)
         self.assertEqual(text, "")
 
@@ -382,7 +438,9 @@ class GenDevicePic18Test(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             src = pathlib.Path(d) / "split_access.atdf"
             src.write_text(split)
-            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+            r, text = run_generator(
+                src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP"
+            )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("access_bank = [0x0000, 0x005F]", text)
 
@@ -399,11 +457,7 @@ class GenDevicePic18CfgdataTest(unittest.TestCase):
     def write_ini(self, d):
         ini = pathlib.Path(d) / "p18cfgtest.ini"
         ini.write_text(
-            "[18CFGTEST]\n"
-            "ARCH=PIC16\n"
-            "ROMSIZE=800\n"
-            "RAMBANK=60-FF\n"
-            "STACKDEPTH=0x1F\n"
+            "[18CFGTEST]\nARCH=PIC16\nROMSIZE=800\nRAMBANK=60-FF\nSTACKDEPTH=0x1F\n"
         )
         return ini
 
@@ -463,12 +517,19 @@ class GenDeviceSweepTest(unittest.TestCase):
             (edc / "PIC14SYN01.PIC").write_text(FIXTURE.read_text())
             (edc / "PIC18SYN01.PIC").write_text(PIC18_FIXTURE.read_text())
             (edc / "PIC14SYN02.PIC").write_text(
-                "\n".join(l for l in FIXTURE.read_text().splitlines() if "GPRDataSector" not in l)
+                "\n".join(
+                    line
+                    for line in FIXTURE.read_text().splitlines()
+                    if "GPRDataSector" not in line
+                )
             )
-            (edc / "BROKEN.PIC").write_text('<edc:PIC xmlns:edc="http://crownking/edc">')
+            (edc / "BROKEN.PIC").write_text(
+                '<edc:PIC xmlns:edc="http://crownking/edc">'
+            )
             r = subprocess.run(
                 [sys.executable, str(GEN), "--sweep", str(pathlib.Path(d))],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIn("ok  p14syn01", r.stdout)
@@ -502,7 +563,8 @@ class GenDeviceSweepTest(unittest.TestCase):
     def test_sweep_rejects_a_non_directory(self):
         r = subprocess.run(
             [sys.executable, str(GEN), "--sweep", str(GEN)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         self.assertEqual(r.returncode, 2)
         self.assertIn("is not a directory", r.stderr)
@@ -512,8 +574,16 @@ class GenDeviceSweepTest(unittest.TestCase):
             f = pathlib.Path(d) / "out"
             f.write_text("x")
             r = subprocess.run(
-                [sys.executable, str(GEN), "--sweep", str(SWEEP_PACK), "--out-dir", str(f)],
-                capture_output=True, text=True,
+                [
+                    sys.executable,
+                    str(GEN),
+                    "--sweep",
+                    str(SWEEP_PACK),
+                    "--out-dir",
+                    str(f),
+                ],
+                capture_output=True,
+                text=True,
             )
         self.assertEqual(r.returncode, 2)
         self.assertIn("is not a directory", r.stderr)
@@ -522,7 +592,8 @@ class GenDeviceSweepTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             r = subprocess.run(
                 [sys.executable, str(GEN), "--sweep", str(d)],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
         self.assertEqual(r.returncode, 1)
         self.assertIn("no *.PIC files found", r.stderr)
@@ -530,7 +601,8 @@ class GenDeviceSweepTest(unittest.TestCase):
     def test_sweep_rejects_single_part_flags(self):
         r = subprocess.run(
             [sys.executable, str(GEN), "--sweep", str(SWEEP_PACK), "--check"],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         self.assertEqual(r.returncode, 2)
         self.assertIn("--check cannot be combined with --sweep", r.stderr)
@@ -548,16 +620,13 @@ class GenDeviceSweepTest(unittest.TestCase):
             ini = pack / "ini"
             ini.mkdir()
             (ini / "14syn01.ini").write_text(
-                "[14SYN01]\n"
-                "ARCH=16xxxx\n"
-                "ROMSIZE=200\n"
-                "RAMBANK=20-6F\n"
-                "STACKDEPTH=0x8\n"
+                "[14SYN01]\nARCH=16xxxx\nROMSIZE=200\nRAMBANK=20-6F\nSTACKDEPTH=0x8\n"
             )
             out = pathlib.Path(d) / "out"
             r = subprocess.run(
                 [sys.executable, str(GEN), "--sweep", str(pack), "--out-dir", str(out)],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             )
             toml = (out / "p14syn01.toml").read_text()
         self.assertEqual(r.returncode, 0, r.stderr)

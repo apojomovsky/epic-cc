@@ -175,6 +175,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
+# ruff: the python auto-linter (scripts/lint-python.sh, the pre-commit
+# hook, and CI all call it). Pinned binary, same curl-plus-sha256 pattern
+# as the clang tarball above. Sits with the other test-time tooling so it
+# can only bust its own layer, never the gputils/SDCC builds above.
+ARG RUFF_VERSION=0.16.6
+RUN curl -fsSL -o /tmp/ruff.tar.gz \
+        https://github.com/astral-sh/ruff/releases/download/${RUFF_VERSION}/ruff-x86_64-unknown-linux-gnu.tar.gz \
+    && echo "0696335ef16615d8c7445ad438750eb0f55b3da6f153df21265a7c6d5750254f  /tmp/ruff.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/ruff.tar.gz -C /tmp \
+    && mv /tmp/ruff-x86_64-unknown-linux-gnu/ruff /usr/local/bin/ruff \
+    && rm -rf /tmp/ruff.tar.gz /tmp/ruff-x86_64-unknown-linux-gnu \
+    && ruff --version
+
 # PIC8_HOST_CLANG: the fuzz differential harness's host-reference compiler
 # (crates/fuzz/src/lib.rs host_clang()) — this same clang, no -target,
 # compiling and running native x86-64 programs.

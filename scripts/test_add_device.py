@@ -94,12 +94,15 @@ DATABANK   NAME=gpr3       START=0x300             END=0x3FF
 """
 
 # The same part with the full gpr0-gpr7 (what gputils actually ships).
-PIC18_LKR_FULL = PIC18_LKR + """\
+PIC18_LKR_FULL = (
+    PIC18_LKR
+    + """\
 DATABANK   NAME=gpr4       START=0x400             END=0x4FF
 DATABANK   NAME=gpr5       START=0x500             END=0x5FF
 DATABANK   NAME=gpr6       START=0x600             END=0x6FF
 DATABANK   NAME=gpr7       START=0x700             END=0x7FF
 """
+)
 
 # A PIC14 .lkr: banked gpr plus a shared window.
 PIC14_LKR = """\
@@ -140,9 +143,7 @@ class SynthesizeConfigTest(unittest.TestCase):
     def test_locked_without_default_does_not_false_fail(self):
         # A locked field with no default must still synthesize (docs/38
         # D-1 step 4: handle locked explicitly, not assume a default).
-        toml = PIC18_TOML.replace(
-            'default = "off"\nlocked = "off"', 'locked = "off"'
-        )
+        toml = PIC18_TOML.replace('default = "off"\nlocked = "off"', 'locked = "off"')
         with tempfile.TemporaryDirectory() as d:
             p = write(pathlib.Path(d) / "p18syn01.toml", toml)
             spec = add_device.synthesize_config(p)
@@ -158,10 +159,11 @@ class SynthesizeXtalTest(unittest.TestCase):
     def test_pll_mode_scales_by_plldiv(self):
         # osc=hspll with plldiv=div4 needs xtal = 4 MHz * 4 = 16 MHz.
         toml = PIC18_TOML.replace(
-            'name = "alpha"', 'name = "osc"\nbyte_offset = 1\nmask = 0x0F\nshift = 0\n'
+            'name = "alpha"',
+            'name = "osc"\nbyte_offset = 1\nmask = 0x0F\nshift = 0\n'
             'values = [{ name = "hspll", bits = 14 }]\n\n[[config.fields]]\nname = "plldiv"\n'
             'byte_offset = 0\nmask = 0x07\nshift = 0\nvalues = [{ name = "div4", bits = 3 }]\n\n'
-            '[[config.fields]]\nname = "alpha"'
+            '[[config.fields]]\nname = "alpha"',
         )
         with tempfile.TemporaryDirectory() as d:
             p = write(pathlib.Path(d) / "p18syn01.toml", toml)
@@ -183,7 +185,9 @@ class CorrectRamTest(unittest.TestCase):
             # TOML already widened to the lkr's gpr0-gpr3 top (0x3FF).
             toml = write(
                 pathlib.Path(d) / "p18syn01.toml",
-                PIC18_TOML.replace("ram_banks = [[0x0010, 0x009F]]", "ram_banks = [[0x0010, 0x03FF]]"),
+                PIC18_TOML.replace(
+                    "ram_banks = [[0x0010, 0x009F]]", "ram_banks = [[0x0010, 0x03FF]]"
+                ),
             )
             lkr = write(pathlib.Path(d) / "18syn01_g.lkr", PIC18_LKR)
             changed = add_device.correct_ram(toml, lkr)
@@ -224,11 +228,9 @@ class FieldDiffTest(unittest.TestCase):
             # position the generated TOML does not use.
             sib = write(
                 pathlib.Path(d) / "p18syn02.toml",
-                PIC18_TOML.replace(
-                    'name = "xinst"', 'name = "icprt"'
-                ).replace(
-                    'byte_offset = 6\nmask = 0x40\nshift = 6',
-                    'byte_offset = 6\nmask = 0x20\nshift = 5',
+                PIC18_TOML.replace('name = "xinst"', 'name = "icprt"').replace(
+                    "byte_offset = 6\nmask = 0x40\nshift = 6",
+                    "byte_offset = 6\nmask = 0x20\nshift = 5",
                 ),
             )
             lines = add_device.field_diff(gen, sib)
@@ -242,7 +244,10 @@ class SiblingTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             d = pathlib.Path(d)
             write(d / "p18syn01.toml", PIC18_TOML)
-            write(d / "p18syn02.toml", PIC18_TOML.replace('name = "p18syn01"', 'name = "p18syn02"'))
+            write(
+                d / "p18syn02.toml",
+                PIC18_TOML.replace('name = "p18syn01"', 'name = "p18syn02"'),
+            )
             write(d / "p14syn01.toml", PIC14_TOML)
             sib = add_device.sibling(d / "p18syn01.toml", d)
         self.assertEqual(sib.name, "p18syn02.toml")

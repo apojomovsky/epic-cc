@@ -39,7 +39,9 @@ def main():
         line
         for line in subprocess.run(
             ["git", "diff", "--name-only", f"{base}...HEAD"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         ).stdout.splitlines()
         if line
     ]

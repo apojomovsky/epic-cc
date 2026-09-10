@@ -71,12 +71,15 @@ def normalize_stem(raw: str) -> str:
         s = "p" + s
     return s
 
+
 def stem_to_suffix(stem: str) -> str:
     assert stem.startswith("p")
     return stem[1:]
 
+
 def stem_to_edc_name(stem: str) -> str:
     return "PIC" + stem[1:].upper()
+
 
 FIELD_ALIAS = {
     "FOSC": "osc",
@@ -104,11 +107,13 @@ PART_FIELD_ALIASES = {
     "p18f2550": {"BOR": "boren"},
 }
 
+
 def alias_field(name: str, stem: str) -> str:
     override = PART_FIELD_ALIASES.get(stem, {}).get(name)
     if override:
         return override
     return FIELD_ALIAS.get(name, name.lower())
+
 
 # Per-part cname overrides, keyed by the already-aliased field name then the
 # DFP's lowercased cname. p18f2550's entry: Microchip.PIC18Fxxxx_DFP 1.8.178
@@ -124,32 +129,56 @@ PART_VALUE_ALIASES = {
     },
     "p16f628a": {
         "osc": {
-            "extrcclk": "extrc_clkout", "extrcio": "extrc_noclkout",
-            "intoscclk": "intosc_clkout", "intoscio": "intosc_noclkout",
+            "extrcclk": "extrc_clkout",
+            "extrcio": "extrc_noclkout",
+            "intoscclk": "intosc_clkout",
+            "intoscio": "intosc_noclkout",
             "ecio": "ec",
         },
     },
     "p18f2550": {
         "osc": {
-            "hspll_hs": "hspll", "intosc_hs": "inths", "intosc_xt": "intxt",
-            "intosc_ec": "intcko", "intoscio_ec": "intio", "ecpll_ec": "ecpll",
-            "ecpllio_ec": "ecpio", "ec_ec": "ec", "ecio_ec": "ecio",
-            "xtpll_xt": "xtpll", "xt_xt": "xt",
+            "hspll_hs": "hspll",
+            "intosc_hs": "inths",
+            "intosc_xt": "intxt",
+            "intosc_ec": "intcko",
+            "intoscio_ec": "intio",
+            "ecpll_ec": "ecpll",
+            "ecpllio_ec": "ecpio",
+            "ec_ec": "ec",
+            "ecio_ec": "ecio",
+            "xtpll_xt": "xtpll",
+            "xt_xt": "xt",
         },
         "cpudiv": {
-            "osc1_pll2": "div1", "osc2_pll3": "div2", "osc3_pll4": "div3", "osc4_pll6": "div4",
+            "osc1_pll2": "div1",
+            "osc2_pll3": "div2",
+            "osc3_pll4": "div3",
+            "osc4_pll6": "div4",
         },
         "plldiv": {
-            "1": "noprescale", "2": "div2", "3": "div3", "4": "div4",
-            "5": "div5", "6": "div6", "10": "div10", "12": "div12",
+            "1": "noprescale",
+            "2": "div2",
+            "3": "div3",
+            "4": "div4",
+            "5": "div5",
+            "6": "div6",
+            "10": "div10",
+            "12": "div12",
         },
         "usbdiv": {"1": "off", "2": "on"},
-        "boren": {"off": "off", "soft": "sw", "on_active": "hw_off_in_sleep", "on": "hw_always"},
+        "boren": {
+            "off": "off",
+            "soft": "sw",
+            "on_active": "hw_off_in_sleep",
+            "on": "hw_always",
+        },
         "borv": {"0": "maximum", "1": "mid", "2": "low", "3": "minimum"},
         "wdtps": {str(2**i): f"div{2**i}" for i in range(16)},
         "ccp2mx": {"off": "rb3", "on": "rc1"},
     },
 }
+
 
 def alias_value(field: str, value: str, stem: str) -> str:
     v = value.lower()
@@ -159,6 +188,7 @@ def alias_value(field: str, value: str, stem: str) -> str:
     if override:
         return override
     return v
+
 
 # Which enum value a fuse defaults to when the user names none. This is
 # compiler policy, not device geometry: geometry has no defaults at all,
@@ -207,11 +237,13 @@ PART_DEFAULTS = {
     },
 }
 
+
 def find_pack_root(atdf_path: pathlib.Path) -> pathlib.Path | None:
     for parent in atdf_path.resolve().parents:
         if "_DFP" in parent.name.upper():
             return parent
     return None
+
 
 def find_pack_name(atdf_path: pathlib.Path) -> str | None:
     # DFP directories are named *_DFP (optionally version-suffixed); the
@@ -221,6 +253,7 @@ def find_pack_name(atdf_path: pathlib.Path) -> str | None:
     root = find_pack_root(atdf_path)
     return root.name if root is not None else None
 
+
 def find_edc_pic(stem: str):
     name = stem_to_edc_name(stem) + ".PIC"
     base = pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs")
@@ -229,6 +262,7 @@ def find_edc_pic(stem: str):
             if p.name.upper() == name.upper():
                 return p
     return None
+
 
 def find_ini_and_cfgdata_in(base: pathlib.Path, stem: str):
     """ini/cfgdata under a pack directory, the .atpack layout (ADR-020)."""
@@ -244,8 +278,12 @@ def find_ini_and_cfgdata_in(base: pathlib.Path, stem: str):
             break
     return ini, cfg
 
+
 def find_ini_and_cfgdata(stem: str):
-    return find_ini_and_cfgdata_in(pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs"), stem)
+    return find_ini_and_cfgdata_in(
+        pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs"), stem
+    )
+
 
 def parse_ini(ini_path: pathlib.Path):
     text = ini_path.read_text()
@@ -278,6 +316,7 @@ def parse_ini(ini_path: pathlib.Path):
             sections[current][k] = v
     return sections
 
+
 def parse_rambank(s: str):
     banks = []
     for part in s.split(","):
@@ -292,12 +331,14 @@ def parse_rambank(s: str):
     banks.sort(key=lambda x: x[0])
     return banks
 
+
 def parse_common(s):
     if isinstance(s, list):
         s = s[0]
     first = s.split(",")[0].strip()
     lo, hi = first.split("-", 1)
     return (int(lo, 16), int(hi, 16))
+
 
 def parse_cfgdata(cfg_path: pathlib.Path):
     cwords = []
@@ -313,7 +354,13 @@ def parse_cfgdata(cfg_path: pathlib.Path):
             mask = int(parts[2], 16)
             default = int(parts[3], 16)
             name = parts[4] if len(parts) > 4 else ""
-            current_cword = {"addr": addr, "mask": mask, "default": default, "name": name, "settings": []}
+            current_cword = {
+                "addr": addr,
+                "mask": mask,
+                "default": default,
+                "name": name,
+                "settings": [],
+            }
             cwords.append(current_cword)
             current_setting = None
         elif line.startswith("CSETTING:"):
@@ -332,6 +379,7 @@ def parse_cfgdata(cfg_path: pathlib.Path):
         else:
             continue
     return cwords
+
 
 EDC_ARCH_TO_CORE = {"16xxxx": "pic14", "16exxx": "pic14e", "18xxxx": "pic18"}
 INI_ARCH_TO_CORE = {"PIC14": "pic14", "PIC14E": "pic14e", "PIC16": "pic18"}
@@ -399,7 +447,7 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
         cursor = 0
         covered = 0
         for child in mode:
-            tag = child.tag[len(ns):] if child.tag.startswith(ns) else child.tag
+            tag = child.tag[len(ns) :] if child.tag.startswith(ns) else child.tag
             if tag == "AdjustPoint":
                 cursor += int(child.get(ns + "offset"), 0)
             elif tag == "DCRFieldDef":
@@ -407,12 +455,14 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                 fname = child.get(ns + "name")
                 span = int(child.get(ns + "nzwidth", "0"), 0) or mask.bit_length()
                 if mask >= (1 << span):
-                    raise MissingFacts([
-                        f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
-                        f"field {fname}'s mask 0x{mask:x} does not fit its "
-                        f"nzwidth span {span}, cannot place it from mask and "
-                        f"cursor alone"
-                    ])
+                    raise MissingFacts(
+                        [
+                            f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                            f"field {fname}'s mask 0x{mask:x} does not fit its "
+                            f"nzwidth span {span}, cannot place it from mask and "
+                            f"cursor alone"
+                        ]
+                    )
                 field_bits = mask << cursor
                 hidden = (
                     child.get(ns + "ishidden") == "true"
@@ -436,8 +486,10 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                         # marked hidden with no cname; skip them the same
                         # way a hidden field is skipped, not as a real
                         # named value.
-                        if (sem.get(ns + "ishidden") == "true"
-                                or sem.get(ns + "islanghidden") == "true"):
+                        if (
+                            sem.get(ns + "ishidden") == "true"
+                            or sem.get(ns + "islanghidden") == "true"
+                        ):
                             continue
                         when = sem.get(ns + "when") or ""
                         m = re.search(r"==\s*(0x[0-9a-fA-F]+|\d+)", when)
@@ -452,11 +504,13 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                         # contradict the one rule this module exists to
                         # keep: a fact it cannot read is a hard error,
                         # never an omission.
-                        raise MissingFacts([
-                            f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
-                            f"field {fname}'s semantics use an unhandled "
-                            f"`when` form: {unmatched}"
-                        ])
+                        raise MissingFacts(
+                            [
+                                f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                                f"field {fname}'s semantics use an unhandled "
+                                f"`when` form: {unmatched}"
+                            ]
+                        )
                     if semantics and not values:
                         # A visible field whose every semantic turned out
                         # to be individually hidden has no legal value
@@ -465,34 +519,42 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                         # unnamed real field silently missing from the
                         # TOML is exactly the omission this module exists
                         # to refuse.
-                        raise MissingFacts([
-                            f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
-                            f"field {fname} has no non-hidden semantic, "
-                            f"cannot determine its legal values"
-                        ])
+                        raise MissingFacts(
+                            [
+                                f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                                f"field {fname} has no non-hidden semantic, "
+                                f"cannot determine its legal values"
+                            ]
+                        )
                     for vname, vbits in values:
                         if vbits & ~mask:
-                            raise MissingFacts([
-                                f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
-                                f"field {fname} value {vname} bits 0x{vbits:x} "
-                                f"outside mask 0x{mask:x}"
-                            ])
+                            raise MissingFacts(
+                                [
+                                    f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                                    f"field {fname} value {vname} bits 0x{vbits:x} "
+                                    f"outside mask 0x{mask:x}"
+                                ]
+                            )
                     if values:
-                        fields.append({
-                            "raw_name": fname,
-                            "byte_offset": addr - base,
-                            "mask": mask << cursor,
-                            "shift": cursor,
-                            "values": values,
-                        })
+                        fields.append(
+                            {
+                                "raw_name": fname,
+                                "byte_offset": addr - base,
+                                "mask": mask << cursor,
+                                "shift": cursor,
+                                "values": values,
+                            }
+                        )
                 cursor += span
         if covered != impl:
-            raise MissingFacts([
-                f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): field bit "
-                f"layout 0x{covered:02x} does not match its own impl "
-                f"0x{impl:02x}, the AdjustPoint/DCRFieldDef walk is wrong "
-                f"for this byte"
-            ])
+            raise MissingFacts(
+                [
+                    f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): field bit "
+                    f"layout 0x{covered:02x} does not match its own impl "
+                    f"0x{impl:02x}, the AdjustPoint/DCRFieldDef walk is wrong "
+                    f"for this byte"
+                ]
+            )
     return base, max(addrs) - base + 1, fields
 
 
@@ -543,7 +605,7 @@ def parse_edc(edc_path: pathlib.Path):
         cur = el
         while cur in parent_of:
             cur = parent_of[cur]
-            tag = cur.tag[len(ns):] if cur.tag.startswith(ns) else cur.tag
+            tag = cur.tag[len(ns) :] if cur.tag.startswith(ns) else cur.tag
             if tag in ("TraditionalModeOnly", "ExtendedModeOnly", "RegardlessOfMode"):
                 return tag
         return None
@@ -573,10 +635,12 @@ def parse_edc(edc_path: pathlib.Path):
             # is `Option<(u16, u16)>`); more than one surviving span after
             # merging means the source split it in a way this generator does
             # not understand, not that picking the first is safe.
-            raise MissingFacts([
-                f"access bank: TraditionalModeOnly GPRDataSector sectors "
-                f"do not merge into one range: {merged_access}"
-            ])
+            raise MissingFacts(
+                [
+                    f"access bank: TraditionalModeOnly GPRDataSector sectors "
+                    f"do not merge into one range: {merged_access}"
+                ]
+            )
         out["access_bank"] = merged_access[0]
     if sectors:
         out["ram_banks"] = merge_contiguous(
@@ -587,7 +651,10 @@ def parse_edc(edc_path: pathlib.Path):
             out["common_ram"] = common[0]
     return out
 
-def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, require_pack=True):
+
+def generate_toml(
+    stem: str, ini_path, cfg_path, edc_path=None, pack=None, require_pack=True
+):
     ini_sections = parse_ini(ini_path) if ini_path and ini_path.exists() else {}
     suffix = stem_to_suffix(stem).upper()
     sec = ini_sections.get(suffix, {})
@@ -655,7 +722,9 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
     stack_depth = pick(
         "stack_depth (EDC MemTraits hwstackdepth or ini STACKDEPTH)",
         edc.get("hwstack"),
-        int(stack_s, 0) if stack_s and re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", stack_s) else None,
+        int(stack_s, 0)
+        if stack_s and re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", stack_s)
+        else None,
     )
     cfg_cwords = []
     dcr_result = edc.get("config_dcr") if core == "pic18" else None
@@ -706,7 +775,13 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
         # bytes read 0xFF), not per-part.
         erased_word = 0xFF if core == "pic18" else 0x3FFF
         cfg_cwords = [
-            {"addr": a, "mask": erased_word, "default": erased_word, "name": "CONFIG", "settings": []}
+            {
+                "addr": a,
+                "mask": erased_word,
+                "default": erased_word,
+                "name": "CONFIG",
+                "settings": [],
+            }
             for a in range(cfg_span[0], cfg_span[1] + 1)
         ]
     if common_ram:
@@ -729,9 +804,14 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
         interrupt_vectors = [0x0008, 0x0018]
     else:
         interrupt_vectors = [0x0004]
-    def finalize_field(raw_field_name, byte_offset, mask_in_byte, shift_in_byte, raw_values):
+
+    def finalize_field(
+        raw_field_name, byte_offset, mask_in_byte, shift_in_byte, raw_values
+    ):
         field_name = alias_field(raw_field_name, stem)
-        vals = [(alias_value(field_name, name, stem), bits) for name, bits in raw_values]
+        vals = [
+            (alias_value(field_name, name, stem), bits) for name, bits in raw_values
+        ]
         seen_bits = {}
         deduped = []
         for name, bits in vals:
@@ -774,7 +854,9 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
         base_byte_addr, num_bytes, raw_fields = dcr_result
         erased = [0xFF] * num_bytes
         for rf in raw_fields:
-            f = finalize_field(rf["raw_name"], rf["byte_offset"], rf["mask"], rf["shift"], rf["values"])
+            f = finalize_field(
+                rf["raw_name"], rf["byte_offset"], rf["mask"], rf["shift"], rf["values"]
+            )
             if f is not None:
                 fields.append(f)
     else:
@@ -797,13 +879,17 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
                 erased.append(0xFF)
             erased = erased[:num_bytes]
         for cw in cfg_cwords:
-            cword_byte_base = (cw["addr"] - base_word) if cwords_are_bytes else (cw["addr"] - base_word) * 2
+            cword_byte_base = (
+                (cw["addr"] - base_word)
+                if cwords_are_bytes
+                else (cw["addr"] - base_word) * 2
+            )
             for setting in cw["settings"]:
                 mask_word = setting["mask"]
                 if mask_word == 0:
                     continue
                 lowbit = mask_word & -mask_word
-                ctz = (lowbit.bit_length() - 1)
+                ctz = lowbit.bit_length() - 1
                 word_shift = ctz
                 byte_in_word = word_shift // 8
                 shift_in_byte = word_shift % 8
@@ -818,25 +904,35 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
                     raw_val = v["value"]
                     normalized = (raw_val >> word_shift) & rel_mask
                     raw_values.append((v["name"], normalized))
-                f = finalize_field(setting["name"], byte_offset, mask_in_byte, shift_in_byte, raw_values)
+                f = finalize_field(
+                    setting["name"],
+                    byte_offset,
+                    mask_in_byte,
+                    shift_in_byte,
+                    raw_values,
+                )
                 if f is not None:
                     fields.append(f)
     fields.sort(key=lambda f: (f["byte_offset"], f["shift"]))
     out_lines = []
     out_lines.append(f'name = "{stem}"')
     out_lines.append(f'core = "{core}"')
-    out_lines.append(f'flash_words = {flash_words}')
+    out_lines.append(f"flash_words = {flash_words}")
     banks_str = ", ".join(f"[0x{lo:04X}, 0x{hi:04X}]" for lo, hi in ram_banks)
-    out_lines.append(f'ram_banks = [{banks_str}]')
+    out_lines.append(f"ram_banks = [{banks_str}]")
     if common_ram:
-        out_lines.append(f'common_ram = [0x{common_ram[0]:04X}, 0x{common_ram[1]:04X}]')
+        out_lines.append(f"common_ram = [0x{common_ram[0]:04X}, 0x{common_ram[1]:04X}]")
     if access_bank:
-        out_lines.append(f'access_bank = [0x{access_bank[0]:04X}, 0x{access_bank[1]:04X}]')
+        out_lines.append(
+            f"access_bank = [0x{access_bank[0]:04X}, 0x{access_bank[1]:04X}]"
+        )
     if fixed_retval:
-        out_lines.append(f'fixed_retval = [0x{fixed_retval[0]:04X}, 0x{fixed_retval[1]:04X}]')
-    out_lines.append(f'stack_depth = {stack_depth}')
+        out_lines.append(
+            f"fixed_retval = [0x{fixed_retval[0]:04X}, 0x{fixed_retval[1]:04X}]"
+        )
+    out_lines.append(f"stack_depth = {stack_depth}")
     vectors_str = ", ".join(f"0x{v:04X}" for v in interrupt_vectors)
-    out_lines.append(f'interrupt_vectors = [{vectors_str}]')
+    out_lines.append(f"interrupt_vectors = [{vectors_str}]")
     if edc_path is not None:
         # edc_path is the ATDF/EDC PIC XML actually parsed; hash it so the
         # TOML is traceable to the exact pack that produced it. The pack
@@ -859,26 +955,27 @@ def generate_toml(stem: str, ini_path, cfg_path, edc_path=None, pack=None, requi
         out_lines.append(f'sha256 = "{digest}"')
     out_lines.append("")
     out_lines.append("[config]")
-    out_lines.append(f'base_byte_addr = 0x{base_byte_addr:04X}')
-    out_lines.append(f'num_bytes = {num_bytes}')
+    out_lines.append(f"base_byte_addr = 0x{base_byte_addr:04X}")
+    out_lines.append(f"num_bytes = {num_bytes}")
     erased_str = ", ".join(f"0x{b:02X}" for b in erased)
-    out_lines.append(f'erased_baseline = [{erased_str}]')
+    out_lines.append(f"erased_baseline = [{erased_str}]")
     out_lines.append("")
     for f in fields:
         out_lines.append("[[config.fields]]")
         out_lines.append(f'name = "{f["name"]}"')
-        out_lines.append(f'byte_offset = {f["byte_offset"]}')
-        out_lines.append(f'mask = 0x{f["mask"]:02X}')
-        out_lines.append(f'shift = {f["shift"]}')
+        out_lines.append(f"byte_offset = {f['byte_offset']}")
+        out_lines.append(f"mask = 0x{f['mask']:02X}")
+        out_lines.append(f"shift = {f['shift']}")
         if f["default"] is not None:
             out_lines.append(f'default = "{f["default"]}"')
         if f.get("locked") is not None:
             out_lines.append(f'locked = "{f["locked"]}"')
         vals_str = ", ".join(f'{{ name = "{n}", bits = {b} }}' for n, b in f["values"])
-        out_lines.append(f'values = [{vals_str}]')
+        out_lines.append(f"values = [{vals_str}]")
         out_lines.append("")
     content = "\n".join(out_lines).rstrip() + "\n"
     return content
+
 
 def sweep_pack(pack_dir: pathlib.Path, out_dir=None, pack=None):
     """Attempt generation for every part in an unpacked DFP directory.
@@ -897,7 +994,10 @@ def sweep_pack(pack_dir: pathlib.Path, out_dir=None, pack=None):
         print(f"gen-device --sweep: {pack_dir} is not a directory", file=sys.stderr)
         sys.exit(2)
     if out_dir is not None and out_dir.exists() and not out_dir.is_dir():
-        print(f"gen-device --sweep: --out-dir {out_dir} is not a directory", file=sys.stderr)
+        print(
+            f"gen-device --sweep: --out-dir {out_dir} is not a directory",
+            file=sys.stderr,
+        )
         sys.exit(2)
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -929,6 +1029,7 @@ def sweep_pack(pack_dir: pathlib.Path, out_dir=None, pack=None):
         results.append((stem, "ok", ""))
     return results, failures
 
+
 def strip_provenance_block(text: str) -> str:
     # --check compares device numbers, not origin metadata: the stanza's
     # shape is validated separately by crates/device/provenance.rs, and its
@@ -937,35 +1038,74 @@ def strip_provenance_block(text: str) -> str:
     blocks = [b for b in blocks if not b.startswith("[provenance]")]
     return "\n\n".join(blocks) + "\n"
 
+
 def main():
-    ap = argparse.ArgumentParser(description="DFP/ATDF -> TOML generator for epic-cc device registry")
-    ap.add_argument("device", nargs="?", help="device name: p16f887, PIC16F887, 16f887, etc. (not used with --sweep)")
+    ap = argparse.ArgumentParser(
+        description="DFP/ATDF -> TOML generator for epic-cc device registry"
+    )
+    ap.add_argument(
+        "device",
+        nargs="?",
+        help="device name: p16f887, PIC16F887, 16f887, etc. (not used with --sweep)",
+    )
     ap.add_argument("--atdf", type=pathlib.Path, help="explicit ATDF/EDC PIC file path")
-    ap.add_argument("--pack", help="DFP pack name for the provenance stanza, e.g. Microchip.PIC16Fxxx_DFP (required when --atdf has no *_DFP ancestor directory)")
-    ap.add_argument("--out", type=pathlib.Path, help="output TOML path (default crates/device/devices/<stem>.toml)")
-    ap.add_argument("--check", action="store_true", help="verify existing TOML matches generated; exit 1 on drift")
-    ap.add_argument("--with-sfrs", action="store_true", help="include SFR table (placeholder)")
-    ap.add_argument("--sweep", metavar="PACK_DIR",
-                    help="sweep an unpacked DFP directory: generate for every part, report failures instead of stopping")
-    ap.add_argument("--out-dir", type=pathlib.Path,
-                    help="with --sweep: scratch directory for the successful TOMLs (never the registry)")
+    ap.add_argument(
+        "--pack",
+        help="DFP pack name for the provenance stanza, e.g. Microchip.PIC16Fxxx_DFP (required when --atdf has no *_DFP ancestor directory)",
+    )
+    ap.add_argument(
+        "--out",
+        type=pathlib.Path,
+        help="output TOML path (default crates/device/devices/<stem>.toml)",
+    )
+    ap.add_argument(
+        "--check",
+        action="store_true",
+        help="verify existing TOML matches generated; exit 1 on drift",
+    )
+    ap.add_argument(
+        "--with-sfrs", action="store_true", help="include SFR table (placeholder)"
+    )
+    ap.add_argument(
+        "--sweep",
+        metavar="PACK_DIR",
+        help="sweep an unpacked DFP directory: generate for every part, report failures instead of stopping",
+    )
+    ap.add_argument(
+        "--out-dir",
+        type=pathlib.Path,
+        help="with --sweep: scratch directory for the successful TOMLs (never the registry)",
+    )
     args = ap.parse_args()
     if args.sweep is not None:
         # Single-part flags have no meaning here; silently ignoring them
         # would make a carried-over habit look like it worked.
-        for flag, value in (("--atdf", args.atdf), ("--out", args.out), ("--check", args.check)):
+        for flag, value in (
+            ("--atdf", args.atdf),
+            ("--out", args.out),
+            ("--check", args.check),
+        ):
             if value:
-                ap.error(f"{flag} cannot be combined with --sweep (use --out-dir for sweep output)")
-        results, failures = sweep_pack(pathlib.Path(args.sweep), args.out_dir, args.pack)
+                ap.error(
+                    f"{flag} cannot be combined with --sweep (use --out-dir for sweep output)"
+                )
+        results, failures = sweep_pack(
+            pathlib.Path(args.sweep), args.out_dir, args.pack
+        )
         for stem, status, detail in results:
             if status == "ok":
                 print(f"  ok  {stem}")
             else:
                 print(f"  {status:<14} {stem}: {detail}")
         if not results:
-            print(f"gen-device --sweep: no *.PIC files found under {args.sweep}", file=sys.stderr)
+            print(
+                f"gen-device --sweep: no *.PIC files found under {args.sweep}",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        print(f"gen-device --sweep: {len(results) - failures}/{len(results)} parts generated, {failures} failed")
+        print(
+            f"gen-device --sweep: {len(results) - failures}/{len(results)} parts generated, {failures} failed"
+        )
         sys.exit(1 if failures else 0)
     if not args.device:
         ap.error("a device name is required unless --sweep is given")
@@ -996,16 +1136,31 @@ def main():
     else:
         edc = find_edc_pic(stem)
         ini, cfg = find_ini_and_cfgdata(stem)
-    if (not edc or not edc.exists()) and (not ini or not ini.exists()) and (not cfg or not cfg.exists()):
+    if (
+        (not edc or not edc.exists())
+        and (not ini or not ini.exists())
+        and (not cfg or not cfg.exists())
+    ):
         print(f"gen-device: no DFP source found for {stem}", file=sys.stderr)
         print("  Fetch the Microchip DFP pack:", file=sys.stderr)
-        print("    https://packs.download.microchip.com/  (Microchip.PIC16Fxxx_DFP)", file=sys.stderr)
-        print("  Or install XC8 and ensure /opt/microchip/xc8/v4.00/pic/packs exists", file=sys.stderr)
-        print("  The .atdf/.PIC itself is not committed; only the generated TOML is.", file=sys.stderr)
+        print(
+            "    https://packs.download.microchip.com/  (Microchip.PIC16Fxxx_DFP)",
+            file=sys.stderr,
+        )
+        print(
+            "  Or install XC8 and ensure /opt/microchip/xc8/v4.00/pic/packs exists",
+            file=sys.stderr,
+        )
+        print(
+            "  The .atdf/.PIC itself is not committed; only the generated TOML is.",
+            file=sys.stderr,
+        )
         print("  Alternatively pass --atdf /path/to/PIC16F887.PIC", file=sys.stderr)
         sys.exit(2)
     try:
-        toml_content = generate_toml(stem, ini, cfg, edc, args.pack, require_pack=not args.check)
+        toml_content = generate_toml(
+            stem, ini, cfg, edc, args.pack, require_pack=not args.check
+        )
     except MissingFacts as e:
         # Refusing beats guessing: a TOML the generator invented would still
         # carry a real sha256 and read as attested. See ADR-021.
@@ -1019,16 +1174,28 @@ def main():
         out_path = pathlib.Path(f"crates/device/devices/{stem}.toml")
     if args.check:
         if not out_path.exists():
-            print(f"gen-device --check: {out_path} does not exist (would create)", file=sys.stderr)
+            print(
+                f"gen-device --check: {out_path} does not exist (would create)",
+                file=sys.stderr,
+            )
             print(toml_content)
             sys.exit(1)
         existing = out_path.read_text()
         existing_cmp = strip_provenance_block(existing)
         generated_cmp = strip_provenance_block(toml_content)
         if existing_cmp != generated_cmp:
-            print(f"gen-device --check: {out_path} drifts from DFP source", file=sys.stderr)
+            print(
+                f"gen-device --check: {out_path} drifts from DFP source",
+                file=sys.stderr,
+            )
             import difflib
-            diff = difflib.unified_diff(existing_cmp.splitlines(keepends=True), generated_cmp.splitlines(keepends=True), fromfile=str(out_path), tofile="generated")
+
+            diff = difflib.unified_diff(
+                existing_cmp.splitlines(keepends=True),
+                generated_cmp.splitlines(keepends=True),
+                fromfile=str(out_path),
+                tofile="generated",
+            )
             sys.stdout.writelines(diff)
             sys.exit(1)
         print(f"gen-device --check: {out_path} ok")
@@ -1037,6 +1204,7 @@ def main():
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(toml_content)
         print(f"gen-device: wrote {out_path} from {ini or edc} + {cfg}")
+
 
 if __name__ == "__main__":
     main()

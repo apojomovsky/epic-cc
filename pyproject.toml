@@ -1,0 +1,9 @@
+[tool.ruff.lint]
+# E4/E7/E9/F: errors and pyflakes (syntax, unused imports and locals,
+# ambiguous names). E501 stays off on purpose: long literals are data,
+# and wrapping them by hand is churn; layout is the formatter's job.
+# Blank lines are enforced by `ruff format`, not E302 (preview-only).
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff]
+target-version = "py310"

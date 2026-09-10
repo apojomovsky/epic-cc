@@ -58,6 +58,27 @@ if [ -n "$staged_rs" ]; then
   fi
 fi
 
+# Staged Python files get the same treatment via ruff (pinned in the
+# Dockerfile, same image): `ruff check` plus `ruff format --check` over
+# exactly the staged files, so a commit can never land python the takeoff
+# ritual would reject.
+staged_py=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
+
+if [ -n "$staged_py" ]; then
+  if docker image inspect epic-cc-dev:local >/dev/null 2>&1; then
+    if ! echo "$staged_py" | docker run --rm -i \
+      --user "$(id -u):$(id -g)" \
+      -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+      -v "$PWD":/workspace -w /workspace epic-cc-dev:local \
+      bash -c 'xargs bash scripts/lint-python.sh' >/dev/null 2>&1; then
+      echo "pre-commit: staged Python files fail ruff; run: bash scripts/lint-python.sh --fix"
+      exit 1
+    fi
+  else
+    echo "pre-commit: epic-cc-dev:local not built, skipping python lint (make image)"
+  fi
+fi
+
 # Trailing whitespace on staged files (any kind). `git diff --check` exits
 # nonzero on violations; keep its exit status (a pipe would mask it).
 if ! git diff --cached --check; then

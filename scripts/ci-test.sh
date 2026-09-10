@@ -38,6 +38,14 @@ if ! cargo fmt --check >/dev/null 2>&1; then
   exit 1
 fi
 
+# The python tree must stay ruff-clean; the baseline was swept in #375.
+# Same posture as rustfmt above: the formatter owns layout, no separate
+# style debate.
+if ! bash scripts/lint-python.sh >/dev/null 2>&1; then
+  echo "::error::python tree is not ruff-clean; run 'bash scripts/lint-python.sh --fix' inside the dev container" >&2
+  exit 1
+fi
+
 if [ -z "$crates" ]; then
   echo "::error::no workspace crates found" >&2
   exit 2
