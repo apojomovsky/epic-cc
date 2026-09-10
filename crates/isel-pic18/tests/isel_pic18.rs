@@ -322,9 +322,9 @@ fn isr_emits_vector_prologue_and_retfie() {
         asm.contains("MOVFF 0x003, 0x00F"),
         "retval snapshot hi:\n{asm}"
     );
-    assert!(asm.contains("MOVFF 0xFD8, 0x001"), "STATUS save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFE0, 0x002"), "BSR save:\n{asm}");
-    assert!(asm.contains("MOVFF 0xFE9, 0x003"), "FSR0L save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFD8, 0x009"), "STATUS save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFE0, 0x00A"), "BSR save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFE9, 0x00B"), "FSR0L save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFEA, 0x004"), "FSR0H save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFF6, 0x005"), "TBLPTRL save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFF7, 0x006"), "TBLPTRH save:\n{asm}");
@@ -336,7 +336,7 @@ fn isr_emits_vector_prologue_and_retfie() {
         asm.contains("MOVFF 0x00F, 0x003"),
         "retval restore hi:\n{asm}"
     );
-    assert!(asm.contains("MOVFF 0x001, 0xFD8"), "STATUS restore:\n{asm}");
+    assert!(asm.contains("MOVFF 0x009, 0xFD8"), "STATUS restore:\n{asm}");
     assert!(asm.contains("MOVF 0x008, W, A"), "W restore:\n{asm}");
     assert!(asm.contains("RETFIE"), "ISR must end with RETFIE:\n{asm}");
 }
