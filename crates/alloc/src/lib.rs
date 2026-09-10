@@ -242,11 +242,19 @@ fn round_if_routine(
     base: u16,
     locals_widths: &HashMap<String, Vec<u8>>,
 ) -> u16 {
-    if ir::is_runtime_routine(f) {
-        routine_base(device, base, &locals_widths[f])
-    } else {
-        base
+    if !ir::is_runtime_routine(f) {
+        return base;
     }
+    // Baseline keeps the unrounded base: its 16-byte banks cannot hold a
+    // 19-20 byte routine frame whole, and whole-frame single-bank is not
+    // the soundness condition here. Each value still places single-bank
+    // via place_contiguous, and the recipes' skip chains stay inside one
+    // value (unconditional FSR reassertion outside chains), so spanning
+    // frames stay sound while wasting no bank tails on a 41-byte device.
+    if device.core == device::Core::PicBaseline {
+        return base;
+    }
+    routine_base(device, base, &locals_widths[f])
 }
 
 /// One function's liveness-overlay frame: the distinct slot widths in

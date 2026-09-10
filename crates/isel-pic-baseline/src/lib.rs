@@ -61,6 +61,16 @@ enum Addr {
     Indirect,
 }
 
+/// Whose page a PA0 placeholder bit must select, resolved after layout.
+/// `Clone` so call sites can name both ends of a managed CALL.
+#[derive(Clone)]
+enum Pa0Page {
+    /// A function, by name (`__start` maps to page 0).
+    Func(String),
+    /// A const table, by global name.
+    Table(String),
+}
+
 /// Per-function codegen state. All addresses come from the module-wide map;
 /// `cur_func` selects the current function's local entries.
 struct Gen<'m> {
@@ -88,11 +98,11 @@ struct Gen<'m> {
     store_tmp: u16,
     retval_lo: u16,
     cur_func: &'m str,
-    /// Flash-const table pages by global name (P4 layout): the page whose
-    /// low half holds the table's `__read_` entry. The measuring pass maps
-    /// nothing (every table reads page 0); the final pass maps each placed
-    /// table. Sizes are page-independent, so the measure holds.
-    table_page: &'m HashMap<String, u8>,
+    /// PA0 fixups recorded during emission, patched after layout: each is
+    /// the index (into this buffer's `out`) of a `BCF STATUS, 5`
+    /// placeholder plus whose page its bit must select. One buffer's
+    /// fixups patch that buffer only.
+    fixups: &'m mut Vec<(usize, Pa0Page)>,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
     tmp: &'m mut u32,
@@ -933,6 +943,169 @@ impl<'m> Gen<'m> {
             Val::Global(_) => panic!("isel: sub16 with a global operand"),
         }
     }
+    /// `d = a + b` for i32: byte 0 adds with the carry out exact
+    /// (ADDWF), then each higher byte folds the carry into a scratch
+    /// copy of the addend and adds to the destination in place. The
+    /// fold uses INCFSZ's skip rather than an add-carry: when the fold
+    /// wraps, the skip leaves the destination at `a_i`, the correct
+    /// mod-256 result, with C = carry-in = 1, the true carry-out.
+    /// Byte 0's const form uses the D-6 add idiom (no ADDLW here).
+    fn emit_add32(&mut self, a: &Val, b: &Val, dst: u16) {
+        let (reg, other) = match (a, b) {
+            (Val::Reg(r), o) => (r.clone(), o),
+            (o, Val::Reg(r)) => (r.clone(), o),
+            _ => panic!("isel: add32 needs a register operand"),
+        };
+        let ra = self.val_addr(&Val::Reg(reg)).direct();
+        match other {
+            Val::Reg(rb) => {
+                let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
+                self.emit_bank_select(bb);
+                self.emit(format!("    MOVF {}, W", self.fop(bb)));
+                self.emit_bank_select(ra);
+                self.emit(format!("    ADDWF {}, W", self.fop(ra)));
+                self.emit_w_store(dst);
+                for i in 1..4u8 {
+                    // b_i is copied to scratch first (the dst preload may
+                    // overlay b), then W is reloaded from it after the
+                    // preload's MOVF clobbers W.
+                    self.emit_bank_select(bb + u16::from(i));
+                    self.emit(format!("    MOVF {}, W", self.fop(bb + u16::from(i))));
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                    self.emit_bank_select(ra + u16::from(i));
+                    self.emit(format!("    MOVF {}, W", self.fop(ra + u16::from(i))));
+                    self.emit_bank_select(dst + u16::from(i));
+                    self.emit(format!("    MOVWF {}", self.fop(dst + u16::from(i))));
+                    self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
+                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
+                    self.emit(format!("    ADDWF {}, F", self.fop(dst + u16::from(i))));
+                }
+            }
+            Val::Const(k) => {
+                self.emit_bank_select(ra);
+                self.emit(format!("    MOVF {}, W", self.fop(ra)));
+                self.emit_add_w_const((k & 0xFF) as u8);
+                self.emit_w_store(dst);
+                for i in 1..4u8 {
+                    let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit_bank_select(ra + u16::from(i));
+                    self.emit(format!("    MOVF {}, W", self.fop(ra + u16::from(i))));
+                    self.emit_bank_select(dst + u16::from(i));
+                    self.emit(format!("    MOVWF {}", self.fop(dst + u16::from(i))));
+                    self.emit(format!("    MOVLW 0x{kb:02X}"));
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
+                    self.emit(format!("    ADDWF {}, F", self.fop(dst + u16::from(i))));
+                }
+            }
+            Val::Global(_) => panic!("isel: add32 with a global operand"),
+        }
+    }
+
+    /// `d = a - b` for i32: byte 0 subtracts with the borrow out exact
+    /// (SUBWF), then each higher byte folds the borrow into a scratch
+    /// copy of the subtrahend and subtracts from the destination in
+    /// place. When the fold wraps the skip leaves the destination at
+    /// `a_i` with C = borrow-in = 0, the true borrow-out.
+    fn emit_sub32(&mut self, a: &Val, b: &Val, dst: u16) {
+        let aa = self.val_addr(a).direct();
+        match b {
+            Val::Const(k) => {
+                self.emit(format!("    MOVLW 0x{:02X}", (k & 0xFF) as u8));
+                self.emit_bank_select(aa);
+                self.emit(format!("    SUBWF {}, W", self.fop(aa)));
+                self.emit_w_store(dst);
+                for i in 1..4u8 {
+                    let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    self.emit_bank_select(aa + u16::from(i));
+                    self.emit(format!("    MOVF {}, W", self.fop(aa + u16::from(i))));
+                    self.emit_bank_select(dst + u16::from(i));
+                    self.emit(format!("    MOVWF {}", self.fop(dst + u16::from(i))));
+                    self.emit(format!("    MOVLW 0x{kb:02X}"));
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
+                    self.emit(format!("    SUBWF {}, F", self.fop(dst + u16::from(i))));
+                }
+            }
+            Val::Reg(rb) => {
+                let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
+                self.emit_bank_select(bb);
+                self.emit(format!("    MOVF {}, W", self.fop(bb)));
+                self.emit_bank_select(aa);
+                self.emit(format!("    SUBWF {}, W", self.fop(aa)));
+                self.emit_w_store(dst);
+                for i in 1..4u8 {
+                    // b_i is copied to scratch first (the dst preload may
+                    // overlay b), then W is reloaded from it after the
+                    // preload's MOVF clobbers W.
+                    self.emit_bank_select(bb + u16::from(i));
+                    self.emit(format!("    MOVF {}, W", self.fop(bb + u16::from(i))));
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                    self.emit_bank_select(aa + u16::from(i));
+                    self.emit(format!("    MOVF {}, W", self.fop(aa + u16::from(i))));
+                    self.emit_bank_select(dst + u16::from(i));
+                    self.emit(format!("    MOVWF {}", self.fop(dst + u16::from(i))));
+                    self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
+                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
+                    self.emit(format!("    SUBWF {}, F", self.fop(dst + u16::from(i))));
+                }
+            }
+            Val::Global(_) => panic!("isel: sub32 with a global operand"),
+        }
+    }
+
+    /// Const-count `shl`/`lshr`/`ashr`: copy the value into dst, then
+    /// rotate in place k times. shl goes lo to hi (carry up), lshr hi
+    /// to lo (bits down), ashr sets C from the sign bit before each
+    /// rrf so the sign fills every vacated bit. The bank select sits
+    /// before each access but never between a skip test and its branch.
+    fn emit_shift_const(&mut self, op: BinOp, a: &Val, ty: Ty, k: i64, dst: u16) {
+        let width = ty.bytes() as i64 * 8;
+        assert!(
+            (0..width).contains(&k),
+            "isel: const shift count {k} out of range [0, {width}) (LLVM poison)"
+        );
+        self.emit_move_val_to_slot(a, ty, dst);
+        let n = ty.bytes();
+        for _ in 0..k {
+            match op {
+                BinOp::Shl => {
+                    self.emit("    BCF STATUS, 0 ; C".to_string());
+                    for i in 0..n {
+                        let f = dst + u16::from(i);
+                        self.emit_bank_select(f);
+                        self.emit(format!("    RLF {}, F", self.fop(f)));
+                    }
+                }
+                BinOp::LShr => {
+                    self.emit("    BCF STATUS, 0 ; C".to_string());
+                    for i in (0..n).rev() {
+                        let f = dst + u16::from(i);
+                        self.emit_bank_select(f);
+                        self.emit(format!("    RRF {}, F", self.fop(f)));
+                    }
+                }
+                BinOp::AShr => {
+                    let hi = dst + u16::from(n - 1);
+                    self.emit_bank_select(hi);
+                    self.emit(format!("    BTFSC {}, 7", self.fop(hi)));
+                    self.emit("    BSF STATUS, 0 ; C".to_string());
+                    self.emit(format!("    BTFSS {}, 7", self.fop(hi)));
+                    self.emit("    BCF STATUS, 0 ; C".to_string());
+                    for i in (0..n).rev() {
+                        let f = dst + u16::from(i);
+                        self.emit_bank_select(f);
+                        self.emit(format!("    RRF {}, F", self.fop(f)));
+                    }
+                }
+                _ => unreachable!("isel: emit_shift_const takes a shift op"),
+            }
+        }
+    }
 
     /// How a byte access at `ptr + byte_off` completes: `Direct(a)` reads or
     /// writes the plain file register `a`; `Indirect` means FSR is already
@@ -1045,19 +1218,17 @@ impl<'m> Gen<'m> {
     }
 
     /// `W = flash[name][k + byte_off + terms]` via the table's `__read_`
-    /// entry: index to W, PA0 to the table's page, CALL, restore PA0 to the
-    /// caller page (code always lives in page 0). BSF/BCF touch only PA0,
-    /// and CALL preserves W, so the byte arrives in W with no park.
+    /// entry: index to W, then a managed CALL (PA0 to the table's page,
+    /// restore to the caller's). BSF/BCF touch only PA0, and CALL
+    /// preserves W, so the byte arrives in W with no park.
     fn emit_const_read(&mut self, name: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
         self.emit_const_index_w(k, terms, byte_off);
-        let page = self.table_page.get(name).copied().unwrap_or(0);
-        if page == 0 {
-            self.emit("    BCF STATUS, 5".to_string());
-        } else {
-            self.emit("    BSF STATUS, 5".to_string());
-        }
-        self.emit(format!("    CALL __read_{name}"));
-        self.emit("    BCF STATUS, 5".to_string());
+        let reader = format!("__read_{name}");
+        self.emit_paged_call(
+            &reader,
+            Pa0Page::Table(name.to_string()),
+            Pa0Page::Func(self.cur_func.to_string()),
+        );
     }
 
     /// `RAM[ptr + byte_off] = W`: the store side of a byte access. W is
@@ -1189,7 +1360,11 @@ impl<'m> Gen<'m> {
             self.emit("    BTFSS STATUS, 2 ; Z".to_string());
             self.emit(format!("    GOTO {l_next}"));
             self.emit_call_args(cand, args);
-            self.emit(format!("    CALL {cand}"));
+            self.emit_paged_call(
+                cand,
+                Pa0Page::Func(cand.clone()),
+                Pa0Page::Func(self.cur_func.to_string()),
+            );
             self.emit(format!("    GOTO {l_done}"));
             self.emit(format!("{l_next}:"));
         }
@@ -1207,6 +1382,18 @@ impl<'m> Gen<'m> {
                 self.emit_w_store(da + u16::from(i));
             }
         }
+    }
+
+    /// `CALL {target}` with PA0 managed: a set-bit placeholder (fixup:
+    /// the target's page), the CALL, a restore-bit placeholder (fixup:
+    /// the caller's page). Uniform 3 words so emission sizes stay
+    /// page-independent; layout patches the bits in place.
+    fn emit_paged_call(&mut self, target: &str, set: Pa0Page, restore: Pa0Page) {
+        self.emit("    BCF STATUS, 5".to_string());
+        self.fixups.push((self.out.len() - 1, set));
+        self.emit(format!("    CALL {target}"));
+        self.emit("    BCF STATUS, 5".to_string());
+        self.fixups.push((self.out.len() - 1, restore));
     }
 
     /// `dst = call func(args)`.
@@ -1229,7 +1416,11 @@ impl<'m> Gen<'m> {
             return;
         }
         self.emit_call_args(func, args);
-        self.emit(format!("    CALL {func}"));
+        self.emit_paged_call(
+            func,
+            Pa0Page::Func(func.to_string()),
+            Pa0Page::Func(self.cur_func.to_string()),
+        );
         if let Some(d) = dst {
             let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
@@ -1511,8 +1702,22 @@ impl<'m> Gen<'m> {
                             self.emit_sub16(&b.a, &b.b, da);
                         }
                     }
-                    (BinOp::Add, Ty::I32) | (BinOp::Sub, Ty::I32) => {
-                        panic!("isel: i32 arithmetic is P6 (long); not supported in P2")
+                    (BinOp::Add, Ty::I32) => self.emit_add32(&b.a, &b.b, da),
+                    (BinOp::Sub, Ty::I32) => {
+                        if let Val::Const(k) = &b.a {
+                            self.emit_sub_const_lhs(k, &b.b, da, 4);
+                        } else {
+                            self.emit_sub32(&b.a, &b.b, da);
+                        }
+                    }
+                    (BinOp::And, Ty::I32) => {
+                        self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW")
+                    }
+                    (BinOp::Or, Ty::I32) => {
+                        self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW")
+                    }
+                    (BinOp::Xor, Ty::I32) => {
+                        self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW")
                     }
                     (BinOp::Mul, _) => {
                         panic!("isel: mul reached isel; legalize must rewrite it to a routine call")
@@ -1530,7 +1735,13 @@ impl<'m> Gen<'m> {
                         "isel: srem reached isel; legalize must rewrite it to a routine call"
                     ),
                     (BinOp::Shl, _) | (BinOp::LShr, _) | (BinOp::AShr, _) => {
-                        panic!("isel: shift reached isel; legalize must rewrite it to a routine call (P6)")
+                        match &b.b {
+                            Val::Const(k) => self.emit_shift_const(b.op, &b.a, b.ty, *k, da),
+                            other => panic!(
+                                "isel: variable-count {:?} shift reached isel (count {other:?}); legalize must rewrite it to a routine call",
+                                b.op
+                            ),
+                        }
                     }
                     _ => panic!("isel: unsupported binop for P2"),
                 }
@@ -1701,6 +1912,869 @@ impl<'m> Gen<'m> {
             _ => panic!("isel: unsupported terminator for P2"),
         }
     }
+    /// Copy a multi-byte result into the fixed retval slots: `emit_call`
+    /// on the caller side reads them after CALL. Selects are unconditional
+    /// (no-ops on common RAM) per D-2.
+    fn store_retval(&mut self, src: u16, bytes: u8) {
+        for i in 0..bytes {
+            let (s, d) = (src + u16::from(i), self.retval_lo + u16::from(i));
+            self.emit_bank_select(s);
+            self.emit(format!("    MOVF {}, W", self.fop(s)));
+            self.emit_bank_select(d);
+            self.emit(format!("    MOVWF {}", self.fop(d)));
+        }
+    }
+
+    /// Shared AN526/divmod loop helpers for the routine recipes below.
+    /// One 16-iteration AN526 shift-add chunk over 4-byte r/t: test the
+    /// multiplier LSB, r += t with the INCFSZ carry idiom, t <<= 1 with
+    /// wraparound (high bits drop, i32 mul wraps), bk >>= 1. All files
+    /// share one `__scr` slot (single-bank by placement), and the
+    /// BTFSC/INCFSZ/ADDWF chains are atomic: selects never split them.
+    fn emit_mul32_loop(
+        &mut self,
+        l_loop: String,
+        l_skip: String,
+        bk_lo: u16,
+        bk_hi: u16,
+        cnt: u16,
+        r: [u16; 4],
+        t: [u16; 4],
+    ) {
+        self.emit(format!("{l_loop}:"));
+        self.emit_bank_select(bk_lo);
+        self.emit(format!("    BTFSS {}, 0", self.fop(bk_lo))); // test multiplier LSB
+        self.emit(format!("    GOTO {l_skip}"));
+        self.emit_bank_select(t[0]);
+        self.emit(format!("    MOVF {}, W", self.fop(t[0])));
+        self.emit_bank_select(r[0]);
+        self.emit(format!("    ADDWF {}, F", self.fop(r[0])));
+        for i in 1..4 {
+            self.emit_bank_select(t[i]);
+            self.emit(format!("    MOVF {}, W", self.fop(t[i])));
+            self.emit("    BTFSC STATUS, 0 ; C".to_string());
+            self.emit(format!("    INCFSZ {}, W", self.fop(t[i])));
+            self.emit_bank_select(r[i]);
+            self.emit(format!("    ADDWF {}, F", self.fop(r[i])));
+        }
+        self.emit(format!("{l_skip}:"));
+        self.emit("    BCF STATUS, 0 ; C".to_string());
+        for t_i in t {
+            self.emit_bank_select(t_i);
+            self.emit(format!("    RLF {}, F", self.fop(t_i))); // t <<= 1 (wrapping)
+        }
+        self.emit("    BCF STATUS, 0 ; C".to_string());
+        self.emit_bank_select(bk_hi);
+        self.emit(format!("    RRF {}, F", self.fop(bk_hi)));
+        self.emit_bank_select(bk_lo);
+        self.emit(format!("    RRF {}, F", self.fop(bk_lo))); // bk >>= 1
+        self.emit_bank_select(cnt);
+        self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+        self.emit(format!("    GOTO {l_loop}"));
+    }
+
+    /// The 32-iteration restoring-division loop for i32 divmod: `num`
+    /// shifts left (the quotient builds in its vacated bits), `rem`
+    /// accumulates, `den` holds the denominator copy, `cnt` counts 32.
+    /// Borrow chains are register-direct (no ADDLW); all files share one
+    /// `__scr` slot and every skip chain is atomic.
+    fn emit_divmod32(&mut self, num: u16, scr: u16) {
+        let (rem0, den0, cnt) = (scr, scr + 4, scr + 8);
+        let l_loop = self.fresh_label();
+        let l_restore = self.fresh_label();
+        let l_next = self.fresh_label();
+        for i in 0..4 {
+            let r = rem0 + i as u16;
+            self.emit_bank_select(r);
+            self.emit(format!("    CLRF {}", self.fop(r)));
+        }
+        self.emit("    MOVLW 0x20".to_string());
+        self.emit_bank_select(cnt);
+        self.emit(format!("    MOVWF {}", self.fop(cnt)));
+        self.emit(format!("{l_loop}:"));
+        self.emit("    BCF STATUS, 0 ; C".to_string());
+        for i in 0..4 {
+            let f = num + i as u16;
+            self.emit_bank_select(f);
+            self.emit(format!("    RLF {}, F", self.fop(f)));
+        }
+        for i in 0..4 {
+            let r = rem0 + i as u16;
+            self.emit_bank_select(r);
+            self.emit(format!("    RLF {}, F", self.fop(r)));
+        }
+        // rem -= den across 4 bytes (INCFSZ wrap-correct borrow folds);
+        // C = (rem >= den) after the last byte.
+        for i in 0..4 {
+            let (d, r) = (den0 + i as u16, rem0 + i as u16);
+            self.emit_bank_select(d);
+            self.emit(format!("    MOVF {}, W", self.fop(d)));
+            if i == 0 {
+                self.emit_bank_select(r);
+                self.emit(format!("    SUBWF {}, F", self.fop(r)));
+            } else {
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(d)));
+                self.emit_bank_select(r);
+                self.emit(format!("    SUBWF {}, F", self.fop(r)));
+            }
+        }
+        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+        self.emit(format!("    GOTO {l_restore}"));
+        self.emit_bank_select(num);
+        self.emit(format!("    BSF {}, 0", self.fop(num)));
+        self.emit(format!("    GOTO {l_next}"));
+        self.emit(format!("{l_restore}:"));
+        // rem += den (the exact add-back restore, carry folds).
+        for i in 0..4 {
+            let (d, r) = (den0 + i as u16, rem0 + i as u16);
+            self.emit_bank_select(d);
+            self.emit(format!("    MOVF {}, W", self.fop(d)));
+            if i == 0 {
+                self.emit_bank_select(r);
+                self.emit(format!("    ADDWF {}, F", self.fop(r)));
+            } else {
+                self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(d)));
+                self.emit_bank_select(r);
+                self.emit(format!("    ADDWF {}, F", self.fop(r)));
+            }
+        }
+        self.emit(format!("{l_next}:"));
+        self.emit_bank_select(cnt);
+        self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+        self.emit(format!("    GOTO {l_loop}"));
+    }
+
+    /// In-place two's-complement negates for the signed wrappers.
+    /// Two's-complement negate of a 16-bit value in place. The select
+    /// for the high byte sits before the BTFSC, never between it and
+    /// its INCF target.
+    fn neg16_in_place(&mut self, addr: u16) {
+        self.emit_bank_select(addr);
+        self.emit(format!("    COMF {}, F", self.fop(addr)));
+        self.emit_bank_select(addr + 1);
+        self.emit(format!("    COMF {}, F", self.fop(addr + 1)));
+        self.emit_bank_select(addr);
+        self.emit(format!("    INCF {}, F", self.fop(addr)));
+        self.emit_bank_select(addr + 1);
+        self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+        self.emit(format!("    INCF {}, F", self.fop(addr + 1)));
+    }
+
+    /// Two's-complement negate of a 32-bit value in place (the INCF
+    /// carry propagates byte-by-byte through the Z chain, cascading
+    /// skips included).
+    fn neg32_in_place(&mut self, addr: u16) {
+        for i in 0..4 {
+            let f = addr + i as u16;
+            self.emit_bank_select(f);
+            self.emit(format!("    COMF {}, F", self.fop(f)));
+        }
+        self.emit_bank_select(addr);
+        self.emit(format!("    INCF {}, F", self.fop(addr)));
+        for i in 1..4 {
+            let f = addr + i as u16;
+            self.emit_bank_select(f);
+            self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+            self.emit(format!("    INCF {}, F", self.fop(f)));
+        }
+    }
+    /// Variable-count shifts over 1/2/4 bytes, in place in the `val`
+    /// param slot. The count arrives unmasked; masking to width-1 keeps
+    /// the loop bounded (LLVM counts >= width are poison). ashr sets C
+    /// from the sign bit before each rrf. Selects never split a skip
+    /// chain (the ashr sign pair selects before the BTFSC).
+    fn emit_shift_body(&mut self, bytes: u16, op: BinOp, scr: u16) {
+        let name = self.cur_func.to_string();
+        let val = self.slot_addr(&name, "val").direct();
+        let cnt = self.slot_addr(&name, "cnt").direct();
+        let hi = val + bytes - 1;
+        let mask: u8 = match bytes {
+            1 => 0x07,
+            2 => 0x0F,
+            4 => 0x1F,
+            _ => unreachable!("isel: shift body width"),
+        }; // width - 1
+        self.emit_bank_select(cnt);
+        self.emit(format!("    MOVF {}, W", self.fop(cnt)));
+        self.emit(format!("    ANDLW 0x{mask:02X}")); // count & (width-1)
+        self.emit_bank_select(scr);
+        self.emit(format!("    MOVWF {}", self.fop(scr))); // __scr::cnt@0 = masked count
+        if bytes == 2 {
+            // The high byte of the masked 2-byte cnt slot stays 0: the
+            // masked count is < 16, so the loop counter lives in the low
+            // byte. Clear it once so a stale high byte from an earlier
+            // call cannot be misread as part of the count.
+            self.emit_bank_select(scr + 1);
+            self.emit(format!("    CLRF {}", self.fop(scr + 1)));
+        }
+        let l_loop = self.fresh_label();
+        let l_done = self.fresh_label();
+        // count == 0 shifts nothing: skip the loop entirely (a bare
+        // DECFSZ-at-bottom loop would run once on a zero counter).
+        self.emit_bank_select(scr);
+        self.emit(format!("    MOVF {}, F", self.fop(scr))); // Z = (cnt == 0)
+        self.emit("    BTFSC STATUS, 2 ; Z".to_string()); // skip the GOTO when cnt != 0
+        self.emit(format!("    GOTO {l_done}"));
+        self.emit(format!("{l_loop}:"));
+        match op {
+            BinOp::Shl => {
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                for i in 0..bytes {
+                    let f = val + u16::from(i);
+                    self.emit_bank_select(f);
+                    self.emit(format!("    RLF {}, F", self.fop(f)));
+                }
+            }
+            BinOp::LShr => {
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                for i in (0..bytes).rev() {
+                    let f = val + u16::from(i);
+                    self.emit_bank_select(f);
+                    self.emit(format!("    RRF {}, F", self.fop(f)));
+                }
+            }
+            BinOp::AShr => {
+                self.emit_bank_select(hi);
+                self.emit(format!("    BTFSC {}, 7", self.fop(hi)));
+                self.emit("    BSF STATUS, 0 ; C".to_string());
+                self.emit(format!("    BTFSS {}, 7", self.fop(hi)));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                for i in (0..bytes).rev() {
+                    let f = val + u16::from(i);
+                    self.emit_bank_select(f);
+                    self.emit(format!("    RRF {}, F", self.fop(f)));
+                }
+            }
+            _ => unreachable!("isel: shift body takes a shift op"),
+        }
+        self.emit_bank_select(scr);
+        self.emit(format!("    DECFSZ {}, F", self.fop(scr)));
+        self.emit(format!("    GOTO {l_loop}"));
+        self.emit(format!("{l_done}:"));
+        self.store_retval(val, bytes as u8);
+        self.emit("    RETLW 0x00".to_string());
+    }
+
+    /// A legalize-injected runtime routine body (P6): args arrive in the
+    /// routine's `{func}::{param}` slots (copied by `emit_call`), the
+    /// result goes to the fixed retval slots, working state lives in
+    /// `{func}::__scr`. The byte logic mirrors classic `isel`'s recipes;
+    /// every file access carries the D-2 bank select (frames may span
+    /// banks), literal-adds use the D-6 idiom, returns are `RETLW 0`,
+    /// and skip chains stay inside one `__scr` value (atomic, never
+    /// split by a select).
+    fn emit_routine(&mut self) {
+        let name = self.cur_func.to_string();
+        let recipe = routine_recipe(&name)
+            .unwrap_or_else(|| panic!("isel: @{name} is not a runtime routine"));
+        let scr = self.slot_addr(&name, "__scr").direct();
+        self.emit(format!("{name}:"));
+        match recipe {
+            // 8x8 -> 16 shift-add (AN526): t = a shifted left one bit per
+            // multiplier bit; for each set bit of bk, r += t. Store the low
+            // byte of the product (the i8 result).
+            "__mul_u8" => {
+                let a = self.slot_addr(&name, "a").direct();
+                let b = self.slot_addr(&name, "b").direct();
+                let (bk, cnt, r_lo, r_hi, t_lo, t_hi) =
+                    (scr, scr + 1, scr + 2, scr + 3, scr + 4, scr + 5);
+                let l_loop = self.fresh_label();
+                let l_skip = self.fresh_label();
+                for r in [r_lo, r_hi, t_lo, t_hi] {
+                    self.emit_bank_select(r);
+                    self.emit(format!("    CLRF {}", self.fop(r)));
+                }
+                self.emit_bank_select(a);
+                self.emit(format!("    MOVF {}, W", self.fop(a)));
+                self.emit_bank_select(t_lo);
+                self.emit(format!("    MOVWF {}", self.fop(t_lo))); // t = a
+                self.emit_bank_select(b);
+                self.emit(format!("    MOVF {}, W", self.fop(b)));
+                self.emit_bank_select(bk);
+                self.emit(format!("    MOVWF {}", self.fop(bk))); // bk = b
+                self.emit("    MOVLW 0x08".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt))); // cnt = 8
+                self.emit(format!("{l_loop}:"));
+                self.emit_bank_select(bk);
+                self.emit(format!("    BTFSS {}, 0", self.fop(bk))); // test multiplier LSB
+                self.emit(format!("    GOTO {l_skip}"));
+                self.emit_bank_select(t_lo);
+                self.emit(format!("    MOVF {}, W", self.fop(t_lo)));
+                self.emit_bank_select(r_lo);
+                self.emit(format!("    ADDWF {}, F", self.fop(r_lo)));
+                self.emit_bank_select(t_hi);
+                self.emit(format!("    MOVF {}, W", self.fop(t_hi)));
+                // The BTFSC/INCFSZ/ADDWF carry chain is atomic: no select
+                // may split it (a skip would land on the select). FSR
+                // already selects t_hi's bank from the MOVF above, and
+                // r_hi shares __scr's single-bank slot.
+                self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(t_hi))); // t_hi + carry; skip if wrapped
+                self.emit(format!("    ADDWF {}, F", self.fop(r_hi)));
+                self.emit(format!("{l_skip}:"));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                self.emit_bank_select(t_lo);
+                self.emit(format!("    RLF {}, F", self.fop(t_lo)));
+                self.emit_bank_select(t_hi);
+                self.emit(format!("    RLF {}, F", self.fop(t_hi))); // t <<= 1
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                self.emit_bank_select(bk);
+                self.emit(format!("    RRF {}, F", self.fop(bk))); // bk >>= 1
+                self.emit_bank_select(cnt);
+                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit(format!("    GOTO {l_loop}"));
+                self.store_retval(r_lo, 2);
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // 8/8 restoring division (8 iterations): num <<= 1 (C = old
+            // MSB); rem = (rem << 1) | C; if rem >= den set the quotient
+            // bit else restore (add den back). rem is 2 bytes: the 8-bit
+            // rem shift can carry. Borrow/carry folds use the D-6
+            // carry helpers (skip-safe units) instead of ADDLW.
+            "__udiv_u8" | "__urem_u8" => {
+                let num = self.slot_addr(&name, "num").direct();
+                let den = self.slot_addr(&name, "den").direct();
+                let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
+                let l_loop = self.fresh_label();
+                let l_restore = self.fresh_label();
+                let l_next = self.fresh_label();
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    CLRF {}", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    CLRF {}", self.fop(rem_hi)));
+                self.emit("    MOVLW 0x08".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt)));
+                self.emit(format!("{l_loop}:"));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                self.emit_bank_select(num);
+                self.emit(format!("    RLF {}, F", self.fop(num)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    RLF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    RLF {}, F", self.fop(rem_hi)));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_lo)));
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit_add_w_borrow(); // W = borrow
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_hi))); // C = (rem >= den)
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    GOTO {l_restore}"));
+                self.emit_bank_select(num);
+                self.emit(format!("    BSF {}, 0", self.fop(num)));
+                self.emit(format!("    GOTO {l_next}"));
+                self.emit(format!("{l_restore}:"));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_lo)));
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit_add_w_carry(); // W = carry
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_hi)));
+                self.emit(format!("{l_next}:"));
+                self.emit_bank_select(cnt);
+                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit(format!("    GOTO {l_loop}"));
+                if recipe == "__udiv_u8" {
+                    self.store_retval(num, 1);
+                } else {
+                    self.store_retval(rem_lo, 1);
+                }
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // 16x16 -> 32 shift-add, 16 iterations: t = a (32-bit, shifted
+            // left), for each set bit of bk, r += t across all 4 bytes with
+            // the incfsz carry idiom. Store the low 16 bits (the i16 result).
+            "__mul_u16" => {
+                let a = self.slot_addr(&name, "a").direct();
+                let b = self.slot_addr(&name, "b").direct();
+                let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
+                let (r0, r1, r2, r3) = (scr + 3, scr + 4, scr + 5, scr + 6);
+                let (t0, t1, t2, t3) = (scr + 7, scr + 8, scr + 9, scr + 10);
+                let l_loop = self.fresh_label();
+                let l_skip = self.fresh_label();
+                for r in [r0, r1, r2, r3] {
+                    self.emit_bank_select(r);
+                    self.emit(format!("    CLRF {}", self.fop(r)));
+                }
+                for t in [t0, t1, t2, t3] {
+                    self.emit_bank_select(t);
+                    self.emit(format!("    CLRF {}", self.fop(t)));
+                }
+                self.emit_bank_select(a);
+                self.emit(format!("    MOVF {}, W", self.fop(a)));
+                self.emit_bank_select(t0);
+                self.emit(format!("    MOVWF {}", self.fop(t0)));
+                self.emit_bank_select(a + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(a + 1)));
+                self.emit_bank_select(t1);
+                self.emit(format!("    MOVWF {}", self.fop(t1))); // t = a (32-bit, low 16)
+                self.emit_bank_select(b);
+                self.emit(format!("    MOVF {}, W", self.fop(b)));
+                self.emit_bank_select(bk_lo);
+                self.emit(format!("    MOVWF {}", self.fop(bk_lo)));
+                self.emit_bank_select(b + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(b + 1)));
+                self.emit_bank_select(bk_hi);
+                self.emit(format!("    MOVWF {}", self.fop(bk_hi))); // bk = b
+                self.emit("    MOVLW 0x10".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt))); // cnt = 16
+                self.emit(format!("{l_loop}:"));
+                self.emit_bank_select(bk_lo);
+                self.emit(format!("    BTFSS {}, 0", self.fop(bk_lo))); // test multiplier LSB
+                self.emit(format!("    GOTO {l_skip}"));
+                self.emit_bank_select(t0);
+                self.emit(format!("    MOVF {}, W", self.fop(t0)));
+                self.emit_bank_select(r0);
+                self.emit(format!("    ADDWF {}, F", self.fop(r0)));
+                for (ti, ri) in [(t1, r1), (t2, r2), (t3, r3)] {
+                    self.emit_bank_select(ti);
+                    self.emit(format!("    MOVF {}, W", self.fop(ti)));
+                    // Atomic carry chain (see __mul_u8): FSR already
+                    // selects the shared __scr bank, no reassertion inside.
+                    self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                    self.emit(format!("    INCFSZ {}, W", self.fop(ti)));
+                    self.emit(format!("    ADDWF {}, F", self.fop(ri)));
+                }
+                self.emit(format!("{l_skip}:"));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                for t in [t0, t1, t2, t3] {
+                    self.emit_bank_select(t);
+                    self.emit(format!("    RLF {}, F", self.fop(t))); // t <<= 1
+                }
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                self.emit_bank_select(bk_hi);
+                self.emit(format!("    RRF {}, F", self.fop(bk_hi)));
+                self.emit_bank_select(bk_lo);
+                self.emit(format!("    RRF {}, F", self.fop(bk_lo))); // bk >>= 1
+                self.emit_bank_select(cnt);
+                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit(format!("    GOTO {l_loop}"));
+                self.store_retval(r0, 2);
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // 32x32 -> 32 shift-add as two 16-iteration chunks (bk reloaded
+            // from b's high half between chunks): the low 32 bits of the
+            // full product (the i32 result).
+            "__mul_u32" => {
+                let a = self.slot_addr(&name, "a").direct();
+                let b = self.slot_addr(&name, "b").direct();
+                let (bk_lo, bk_hi, cnt) = (scr, scr + 1, scr + 2);
+                let r = [scr + 3, scr + 4, scr + 5, scr + 6];
+                let t = [scr + 7, scr + 8, scr + 9, scr + 10];
+                for i in 0..4 {
+                    self.emit_bank_select(r[i]);
+                    self.emit(format!("    CLRF {}", self.fop(r[i])));
+                    self.emit_bank_select(t[i]);
+                    self.emit(format!("    CLRF {}", self.fop(t[i])));
+                }
+                for i in 0..4u16 {
+                    self.emit_bank_select(a + i);
+                    self.emit(format!("    MOVF {}, W", self.fop(a + i)));
+                    self.emit_bank_select(t[usize::from(i)]);
+                    self.emit(format!("    MOVWF {}", self.fop(t[usize::from(i)])));
+                    // t = a (32-bit)
+                }
+                self.emit_bank_select(b);
+                self.emit(format!("    MOVF {}, W", self.fop(b)));
+                self.emit_bank_select(bk_lo);
+                self.emit(format!("    MOVWF {}", self.fop(bk_lo)));
+                self.emit_bank_select(b + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(b + 1)));
+                self.emit_bank_select(bk_hi);
+                self.emit(format!("    MOVWF {}", self.fop(bk_hi))); // bk = b low 16
+                self.emit("    MOVLW 0x10".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt))); // cnt = 16
+                let l_loop1 = self.fresh_label();
+                let l_skip1 = self.fresh_label();
+                self.emit_mul32_loop(l_loop1, l_skip1, bk_lo, bk_hi, cnt, r, t);
+                // Reload bk from b's high half for the second 16 iterations.
+                self.emit_bank_select(b + 2);
+                self.emit(format!("    MOVF {}, W", self.fop(b + 2)));
+                self.emit_bank_select(bk_lo);
+                self.emit(format!("    MOVWF {}", self.fop(bk_lo)));
+                self.emit_bank_select(b + 3);
+                self.emit(format!("    MOVF {}, W", self.fop(b + 3)));
+                self.emit_bank_select(bk_hi);
+                self.emit(format!("    MOVWF {}", self.fop(bk_hi)));
+                self.emit("    MOVLW 0x10".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt)));
+                let l_loop2 = self.fresh_label();
+                let l_skip2 = self.fresh_label();
+                self.emit_mul32_loop(l_loop2, l_skip2, bk_lo, bk_hi, cnt, r, t);
+                self.store_retval(scr + 3, 4);
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // 32/32 restoring division (32 iterations): den copied into
+            // __scr, the shared loop runs, udiv keeps num (quotient),
+            // urem keeps rem.
+            "__udiv_u32" | "__urem_u32" => {
+                let num = self.slot_addr(&name, "num").direct();
+                let den = self.slot_addr(&name, "den").direct();
+                for i in 0..4 {
+                    self.emit_bank_select(den + i as u16);
+                    self.emit(format!("    MOVF {}, W", self.fop(den + i as u16)));
+                    self.emit_bank_select(scr + 4 + i as u16);
+                    self.emit(format!("    MOVWF {}", self.fop(scr + 4 + i as u16))); // den copy
+                }
+                self.emit_divmod32(num, scr);
+                if recipe == "__udiv_u32" {
+                    self.store_retval(num, 4);
+                } else {
+                    self.store_retval(scr, 4);
+                }
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // 16/16 restoring division (16 iterations) with the
+            // register-direct borrow idiom (no ADDLW): udiv keeps num,
+            // urem keeps rem.
+            "__udiv_u16" | "__urem_u16" => {
+                let num = self.slot_addr(&name, "num").direct();
+                let den = self.slot_addr(&name, "den").direct();
+                let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
+                let l_loop = self.fresh_label();
+                let l_restore = self.fresh_label();
+                let l_next = self.fresh_label();
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    CLRF {}", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    CLRF {}", self.fop(rem_hi)));
+                self.emit("    MOVLW 0x10".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt)));
+                self.emit(format!("{l_loop}:"));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                self.emit_bank_select(num);
+                self.emit(format!("    RLF {}, F", self.fop(num)));
+                self.emit_bank_select(num + 1);
+                self.emit(format!("    RLF {}, F", self.fop(num + 1)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    RLF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    RLF {}, F", self.fop(rem_hi)));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(den + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_hi)));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    GOTO {l_restore}"));
+                self.emit_bank_select(num);
+                self.emit(format!("    BSF {}, 0", self.fop(num)));
+                self.emit(format!("    GOTO {l_next}"));
+                self.emit(format!("{l_restore}:"));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(den + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_hi)));
+                self.emit(format!("{l_next}:"));
+                self.emit_bank_select(cnt);
+                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit(format!("    GOTO {l_loop}"));
+                if recipe == "__udiv_u16" {
+                    self.store_retval(num, 2);
+                } else {
+                    self.store_retval(rem_lo, 2);
+                }
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // Signed 8-bit wrappers: abs both operands in place in the
+            // param slots (unsigned abs, INT_MIN safe), run the unsigned
+            // divmod, negate the quotient if the signs differed (bit0) /
+            // the remainder if the dividend was negative (bit1).
+            "__sdiv_i8" | "__srem_i8" => {
+                let num = self.slot_addr(&name, "num").direct();
+                let den = self.slot_addr(&name, "den").direct();
+                let (flags, rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2, scr + 3);
+                let l_den = self.fresh_label();
+                let l_go = self.fresh_label();
+                let l_loop = self.fresh_label();
+                let l_restore = self.fresh_label();
+                let l_next = self.fresh_label();
+                let l_store = self.fresh_label();
+                self.emit_bank_select(flags);
+                self.emit(format!("    CLRF {}", self.fop(flags)));
+                self.emit_bank_select(num);
+                self.emit(format!("    BTFSS {}, 7", self.fop(num)));
+                self.emit(format!("    GOTO {l_den}"));
+                self.emit_bank_select(flags);
+                self.emit(format!("    BSF {}, 1", self.fop(flags))); // remainder sign follows dividend
+                self.emit(format!("    BSF {}, 0", self.fop(flags))); // quotient negate: num<0
+                self.emit_bank_select(num);
+                self.emit(format!("    COMF {}, F", self.fop(num)));
+                self.emit(format!("    INCF {}, F", self.fop(num))); // num = |num|
+                self.emit(format!("{l_den}:"));
+                self.emit_bank_select(den);
+                self.emit(format!("    BTFSS {}, 7", self.fop(den)));
+                self.emit(format!("    GOTO {l_go}"));
+                self.emit_bank_select(den);
+                self.emit(format!("    COMF {}, F", self.fop(den)));
+                self.emit(format!("    INCF {}, F", self.fop(den))); // den = |den|
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit_bank_select(flags);
+                self.emit(format!("    XORWF {}, F", self.fop(flags))); // bit0 ^= den<0
+                self.emit(format!("{l_go}:"));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    CLRF {}", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    CLRF {}", self.fop(rem_hi)));
+                self.emit("    MOVLW 0x08".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt)));
+                self.emit(format!("{l_loop}:"));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                self.emit_bank_select(num);
+                self.emit(format!("    RLF {}, F", self.fop(num)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    RLF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    RLF {}, F", self.fop(rem_hi)));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_lo)));
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit_add_w_borrow(); // W = borrow
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_hi)));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    GOTO {l_restore}"));
+                self.emit_bank_select(num);
+                self.emit(format!("    BSF {}, 0", self.fop(num)));
+                self.emit(format!("    GOTO {l_next}"));
+                self.emit(format!("{l_restore}:"));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_lo)));
+                self.emit("    MOVLW 0x00".to_string());
+                self.emit_add_w_carry(); // W = carry
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_hi)));
+                self.emit(format!("{l_next}:"));
+                self.emit_bank_select(cnt);
+                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit(format!("    GOTO {l_loop}"));
+                if recipe == "__sdiv_i8" {
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 0", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.emit_bank_select(num);
+                    self.emit(format!("    COMF {}, F", self.fop(num)));
+                    self.emit(format!("    INCF {}, F", self.fop(num)));
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 1);
+                } else {
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.emit_bank_select(rem_lo);
+                    self.emit(format!("    COMF {}, F", self.fop(rem_lo)));
+                    self.emit(format!("    INCF {}, F", self.fop(rem_lo)));
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(rem_lo, 1);
+                }
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // Signed 16-bit wrappers: same structure, 16-bit abs/negate
+            // and the 16-bit divmod with the register-direct borrow idiom.
+            "__sdiv_i16" | "__srem_i16" => {
+                let num = self.slot_addr(&name, "num").direct();
+                let den = self.slot_addr(&name, "den").direct();
+                let (flags, rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2, scr + 3);
+                let l_den = self.fresh_label();
+                let l_go = self.fresh_label();
+                let l_loop = self.fresh_label();
+                let l_restore = self.fresh_label();
+                let l_next = self.fresh_label();
+                let l_store = self.fresh_label();
+                self.emit_bank_select(flags);
+                self.emit(format!("    CLRF {}", self.fop(flags)));
+                self.emit_bank_select(num + 1);
+                self.emit(format!("    BTFSS {}, 7", self.fop(num + 1)));
+                self.emit(format!("    GOTO {l_den}"));
+                self.emit_bank_select(flags);
+                self.emit(format!("    BSF {}, 1", self.fop(flags))); // remainder sign follows dividend
+                self.emit(format!("    BSF {}, 0", self.fop(flags))); // quotient negate: num<0
+                self.neg16_in_place(num); // num = |num|
+                self.emit(format!("{l_den}:"));
+                self.emit_bank_select(den + 1);
+                self.emit(format!("    BTFSS {}, 7", self.fop(den + 1)));
+                self.emit(format!("    GOTO {l_go}"));
+                self.neg16_in_place(den); // den = |den|
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit_bank_select(flags);
+                self.emit(format!("    XORWF {}, F", self.fop(flags))); // bit0 ^= den<0
+                self.emit(format!("{l_go}:"));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    CLRF {}", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    CLRF {}", self.fop(rem_hi)));
+                self.emit("    MOVLW 0x10".to_string());
+                self.emit_bank_select(cnt);
+                self.emit(format!("    MOVWF {}", self.fop(cnt)));
+                self.emit(format!("{l_loop}:"));
+                self.emit("    BCF STATUS, 0 ; C".to_string());
+                self.emit_bank_select(num);
+                self.emit(format!("    RLF {}, F", self.fop(num)));
+                self.emit_bank_select(num + 1);
+                self.emit(format!("    RLF {}, F", self.fop(num + 1)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    RLF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    RLF {}, F", self.fop(rem_hi)));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(den + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    SUBWF {}, F", self.fop(rem_hi)));
+                self.emit("    BTFSS STATUS, 0 ; C".to_string());
+                self.emit(format!("    GOTO {l_restore}"));
+                self.emit_bank_select(num);
+                self.emit(format!("    BSF {}, 0", self.fop(num)));
+                self.emit(format!("    GOTO {l_next}"));
+                self.emit(format!("{l_restore}:"));
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(rem_lo);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_lo)));
+                self.emit_bank_select(den + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit("    BTFSC STATUS, 0 ; C".to_string());
+                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
+                self.emit_bank_select(rem_hi);
+                self.emit(format!("    ADDWF {}, F", self.fop(rem_hi)));
+                self.emit(format!("{l_next}:"));
+                self.emit_bank_select(cnt);
+                self.emit(format!("    DECFSZ {}, F", self.fop(cnt)));
+                self.emit(format!("    GOTO {l_loop}"));
+                if recipe == "__sdiv_i16" {
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 0", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg16_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 2);
+                } else {
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg16_in_place(rem_lo); // -remainder
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(rem_lo, 2);
+                }
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // Signed 32-bit wrappers: abs in place, unsigned divmod,
+            // negate quotient iff signs differed / remainder iff the
+            // dividend was negative.
+            "__sdiv_i32" | "__srem_i32" => {
+                let num = self.slot_addr(&name, "num").direct();
+                let den = self.slot_addr(&name, "den").direct();
+                let (rem, den_s, flags) = (scr, scr + 4, scr + 10);
+                let l_den = self.fresh_label();
+                let l_go = self.fresh_label();
+                let l_store = self.fresh_label();
+                self.emit_bank_select(flags);
+                self.emit(format!("    CLRF {}", self.fop(flags)));
+                self.emit_bank_select(num + 3);
+                self.emit(format!("    BTFSS {}, 7", self.fop(num + 3)));
+                self.emit(format!("    GOTO {l_den}"));
+                self.emit_bank_select(flags);
+                self.emit(format!("    BSF {}, 1", self.fop(flags))); // remainder sign follows dividend
+                self.emit(format!("    BSF {}, 0", self.fop(flags))); // quotient negate: num<0
+                self.neg32_in_place(num); // num = |num|
+                self.emit(format!("{l_den}:"));
+                self.emit_bank_select(den + 3);
+                self.emit(format!("    BTFSS {}, 7", self.fop(den + 3)));
+                self.emit(format!("    GOTO {l_go}"));
+                self.neg32_in_place(den); // den = |den|
+                self.emit("    MOVLW 0x01".to_string());
+                self.emit_bank_select(flags);
+                self.emit(format!("    XORWF {}, F", self.fop(flags))); // bit0 ^= den<0
+                self.emit(format!("{l_go}:"));
+                for i in 0..4 {
+                    self.emit_bank_select(den + i as u16);
+                    self.emit(format!("    MOVF {}, W", self.fop(den + i as u16)));
+                    self.emit_bank_select(den_s + i as u16);
+                    self.emit(format!("    MOVWF {}", self.fop(den_s + i as u16))); // |den| copy
+                }
+                self.emit_divmod32(num, scr);
+                if recipe == "__sdiv_i32" {
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 0", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg32_in_place(num); // -quotient
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(num, 4);
+                } else {
+                    self.emit_bank_select(flags);
+                    self.emit(format!("    BTFSS {}, 1", self.fop(flags)));
+                    self.emit(format!("    GOTO {l_store}"));
+                    self.neg32_in_place(rem); // -remainder
+                    self.emit(format!("{l_store}:"));
+                    self.store_retval(rem, 4);
+                }
+                self.emit("    RETLW 0x00".to_string());
+            }
+            // Variable-count shifts: the value shifts in place in the
+            // `val` param slot, the masked count runs from `__scr`.
+            "__shl_u8" => {
+                self.emit_shift_body(1, BinOp::Shl, scr);
+            }
+            "__lshr_u8" => {
+                self.emit_shift_body(1, BinOp::LShr, scr);
+            }
+            "__ashr_i8" => {
+                self.emit_shift_body(1, BinOp::AShr, scr);
+            }
+            "__shl_u16" => {
+                self.emit_shift_body(2, BinOp::Shl, scr);
+            }
+            "__lshr_u16" => {
+                self.emit_shift_body(2, BinOp::LShr, scr);
+            }
+            "__ashr_i16" => {
+                self.emit_shift_body(2, BinOp::AShr, scr);
+            }
+            "__shl_u32" => {
+                self.emit_shift_body(4, BinOp::Shl, scr);
+            }
+            "__lshr_u32" => {
+                self.emit_shift_body(4, BinOp::LShr, scr);
+            }
+            "__ashr_i32" => {
+                self.emit_shift_body(4, BinOp::AShr, scr);
+            }
+            other => panic!("isel: runtime routine @{other} has no baseline recipe (float routines are P7 scope)"),
+        }
+    }
 }
 
 /// Back-edge classifier for the phi-copy ordering.
@@ -1750,14 +2824,21 @@ fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
     dom
 }
 
+/// The recipe selecting a runtime routine's body. Baseline has no
+/// interrupt context, so no `_isr` copies exist; the strip stays for
+/// shape-parity with classic `isel` (a duplicated user function strips
+/// to a non-routine and takes the ordinary path).
+fn routine_recipe(name: &str) -> Option<&str> {
+    let base = name.strip_suffix("_isr").unwrap_or(name);
+    ir::is_runtime_routine(name).then_some(base)
+}
+
 /// Emit one function's body into `g.out`.
 fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     g.cur_loc = None;
     if ir::is_runtime_routine(&f.name) {
-        panic!(
-            "isel: runtime routine @{} reached isel; mul/div/shift routines are P6",
-            f.name
-        );
+        g.emit_routine();
+        return;
     }
     if f.naked {
         g.emit(format!("{}:", f.name));
@@ -1993,39 +3074,35 @@ fn count_words(lines: &[String]) -> usize {
         .count()
 }
 
-/// Place each table's reader entry: the page-0 low half first, spill
-/// to the page-1 low half. Returns `(name, entry_addr, page)`. Code
-/// is sequential from 0x000, so a code end past 0x100 means the
-/// page-0 low half is full and tables spill to page 1 (past code when
-/// code itself reaches into page 1). A table fitting neither half
-/// panics instead of crossing the 256-word ceiling (D-5). Function
-/// entries are audited by `verify_page_fit`, not here.
-fn place_const_tables(code_words: usize, consts: &[&ir::Global]) -> Vec<(String, usize, u8)> {
-    let mut p0 = code_words;
-    let mut p1 = code_words.max(0x200);
-    let mut placed = Vec::new();
-    for g in consts {
-        let n = g.bytes.len();
+/// Patch recorded PA0 placeholder bits in `lines` after layout: each
+/// fixup names whose page its bit must select. The patched line must
+/// still be the placeholder (bit swaps never move text), so a drifted
+/// index fails loudly instead of flipping an arbitrary instruction.
+fn patch_pa0(
+    lines: &mut [String],
+    fixups: &[(usize, Pa0Page)],
+    func_page: &HashMap<String, u8>,
+    table_page: &HashMap<String, u8>,
+) {
+    for (idx, page) in fixups {
+        let p = match page {
+            Pa0Page::Func(f) if f == "__start" => 0,
+            Pa0Page::Func(f) => *func_page
+                .get(f)
+                .unwrap_or_else(|| panic!("isel: PA0 fixup for unplaced function @{f}")),
+            Pa0Page::Table(t) => *table_page
+                .get(t)
+                .unwrap_or_else(|| panic!("isel: PA0 fixup for unplaced table @{t}")),
+        };
+        let line = &mut lines[*idx];
         assert!(
-                n <= TABLE_MAX,
-                "isel: const @{} too large ({n} bytes; no page low half fits 4 reader words + {n} RETLWs, D-5)",
-                g.name
-            );
-        let need = READER_WORDS + n;
-        if p0 <= 0x100 && (p0 & 0x1FF) + need <= 0x100 {
-            placed.push((g.name.clone(), p0, 0));
-            p0 += need;
-        } else if p1 + need <= 0x300 {
-            placed.push((g.name.clone(), p1, 1));
-            p1 += need;
-        } else {
-            panic!(
-                    "isel: const @{} crosses the 256-word ceiling (page-0 low half full at {p0:#x}, page-1 low half full at {p1:#x}, D-5)",
-                    g.name
-                );
+            line.trim() == "BCF STATUS, 5",
+            "isel: PA0 fixup landed on non-placeholder {line:?}"
+        );
+        if p == 1 {
+            *line = "    BSF STATUS, 5".to_string();
         }
     }
-    placed
 }
 
 /// One sequential scan: org tracking, label addresses, CALLs with the
@@ -2034,6 +3111,7 @@ fn place_const_tables(code_words: usize, consts: &[&ir::Global]) -> Vec<(String,
 struct AsmScan {
     labels: HashMap<String, usize>,
     calls: Vec<(usize, String, u8)>,
+    gotos: Vec<(usize, String, u8)>,
     table_retlws: HashMap<String, usize>,
     words: HashMap<usize, String>,
     end_org: usize,
@@ -2044,6 +3122,7 @@ struct AsmScan {
 fn scan_asm(asm: &str, tables: &HashMap<String, usize>) -> AsmScan {
     let mut labels = HashMap::new();
     let mut calls = Vec::new();
+    let mut gotos = Vec::new();
     let mut table_retlws: HashMap<String, usize> = HashMap::new();
     let mut words: HashMap<usize, String> = HashMap::new();
     let mut org = 0usize;
@@ -2088,6 +3167,12 @@ fn scan_asm(asm: &str, tables: &HashMap<String, usize>) -> AsmScan {
                 .nth(1)
                 .unwrap_or_else(|| panic!("isel: malformed CALL {t:?}"));
             calls.push((org, target.to_string(), pa0));
+        } else if t.starts_with("GOTO ") {
+            let target = t
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_else(|| panic!("isel: malformed GOTO {t:?}"));
+            gotos.push((org, target.to_string(), pa0));
         } else if t.starts_with("RETLW") {
             if let Some(name) = &cur_table {
                 *table_retlws.entry(name.clone()).or_insert(0) += 1;
@@ -2101,17 +3186,17 @@ fn scan_asm(asm: &str, tables: &HashMap<String, usize>) -> AsmScan {
     AsmScan {
         labels,
         calls,
+        gotos,
         table_retlws,
         words,
         end_org: org,
     }
 }
-
-/// P4 page audit (D-5): entries in the page-0 low half, the rest of
-/// code in page 0, each `__read_` entry + table inside one page's low
-/// half with the full RETLW run, and each CALL targeting a low half
-/// of the PA0-selected page. Any crossing panics: a table past its
-/// ceiling is rejected here, never silently miscompiled.
+/// Page audit (D-5): entries in a page low half, each `__read_` entry +
+/// table inside one page's low half with the full RETLW run, each CALL
+/// targeting a low half of the PA0-selected page, and each GOTO
+/// targeting the PA0-selected page. Any crossing panics: a table or
+/// branch past its ceiling is rejected here, never silently miscompiled.
 pub fn verify_page_fit(m: &Module, asm: &str, addrs: &HashMap<String, u16>) {
     let tables: HashMap<String, usize> = flash_consts(m, addrs)
         .iter()
@@ -2187,13 +3272,13 @@ pub fn verify_page_fit(m: &Module, asm: &str, addrs: &HashMap<String, u16>) {
             continue;
         } else if entries.contains(name.as_str()) {
             assert!(
-                    *addr < 0x100,
-                    "isel: function entry {name} at {addr:#x} escapes the CALL-reachable page-0 low half (D-5)"
-                );
+                (*addr & 0x1FF) < 0x100,
+                "isel: function entry {name} at {addr:#x} escapes every page low half (D-5)"
+            );
         } else {
             assert!(
-                *addr < 0x200,
-                "isel: code label {name} at {addr:#x} escapes page 0 (D-5)"
+                *addr < 0x400,
+                "isel: code label {name} at {addr:#x} escapes flash (D-5)"
             );
         }
     }
@@ -2203,20 +3288,6 @@ pub fn verify_page_fit(m: &Module, asm: &str, addrs: &HashMap<String, u16>) {
             "isel: flash const @{name} has no reader entry"
         );
     }
-    // Code ends where the const section starts (or at the end of
-    // flash): fall-through must never cross into page 1, whose words
-    // a page-0 GOTO cannot reach back from.
-    let code_end = scan
-        .labels
-        .iter()
-        .filter(|(name, _)| name.starts_with("__read_"))
-        .map(|(_, addr)| *addr)
-        .min()
-        .unwrap_or(scan.end_org);
-    assert!(
-        code_end <= 0x200,
-        "isel: code (ending at {code_end:#x}) escapes page 0 (D-5)"
-    );
     for (addr, target, pa0) in &scan.calls {
         let t = scan
             .labels
@@ -2230,6 +3301,44 @@ pub fn verify_page_fit(m: &Module, asm: &str, addrs: &HashMap<String, u16>) {
             (*t >> 9) as u8,
             *pa0,
             "isel: CALL {target} targets page {} but PA0 selects {pa0} (at {addr:#x})",
+            *t >> 9
+        );
+    }
+    // GOTO targets must sit in the containing fragment's page: a GOTO
+    // loads PC<8:0> from its literal with PC<9> from PA0, and PA0
+    // inside a fragment is the fragment's own page (set by every
+    // caller before CALL). Positional PA0 tracking cannot see this
+    // (callee bodies live in other fragments), so attribute by
+    // address: the nearest entry label at or below the GOTO opens its
+    // fragment, whose page is the entry address's page. Anything
+    // before the first entry is head code in page 0.
+    let mut entries: Vec<(usize, u8)> = scan
+        .labels
+        .iter()
+        .filter(|(name, _)| {
+            name.as_str() == "__start"
+                || name.starts_with("__read_")
+                || m.funcs.iter().any(|f| f.name.as_str() == name.as_str())
+                || tables.contains_key(name.as_str())
+        })
+        .map(|(_, addr)| (*addr, (*addr >> 9) as u8))
+        .collect();
+    entries.sort();
+    for (addr, target, _) in &scan.gotos {
+        let t = scan
+            .labels
+            .get(target)
+            .unwrap_or_else(|| panic!("isel: GOTO {target} has no label (at {addr:#x})"));
+        let page = entries
+            .iter()
+            .rev()
+            .find(|(e, _)| *e <= *addr)
+            .map(|(_, p)| *p)
+            .unwrap_or(0);
+        assert_eq!(
+            (*t >> 9) as u8,
+            page,
+            "isel: GOTO {target} targets page {} but its fragment sits in page {page} (at {addr:#x})",
             *t >> 9
         );
     }
@@ -2327,83 +3436,161 @@ pub fn select_with_locs(
             }
         }
     }
+    // The head's managed CALL (`CALL main`) records fixups on `out`
+    // directly: `__start` always lives in page 0.
+    let mut head_fixes: Vec<(usize, Pa0Page)> = Vec::new();
     // `__start` opens with PA0 = 0 (page 0 is the caller page for every
     // const read) and the RAM-const init: both must execute, so both sit
     // after the label `goto __start` lands on, before `CALL main`.
     let mut start_full: Vec<String> = vec!["__start:".to_string(), "    BCF STATUS, 5".to_string()];
     start_full.extend(init);
-    start_full.extend(vec![
-        "    CALL main".to_string(),
-        "    SLEEP".to_string(),
-        "".to_string(),
-    ]);
+    // `CALL main` managed like every call: set for main's page, restore
+    // to page 0 (`__start` context). Fixups index into `out`, so record
+    // against its length once extended below.
+    start_full.push("    BCF STATUS, 5".to_string());
+    start_full.push("    CALL main".to_string());
+    start_full.push("    BCF STATUS, 5".to_string());
+    start_full.extend(vec!["    SLEEP".to_string(), "".to_string()]);
     let start_len = start_full.len();
+    let head_base = out.len();
+    head_fixes.push((head_base + start_len - 5, Pa0Page::Func("main".to_string())));
+    head_fixes.push((
+        head_base + start_len - 3,
+        Pa0Page::Func("__start".to_string()),
+    ));
     out.extend(start_full);
     locs.extend(std::iter::repeat(None).take(start_len));
     // Pointers resolve eagerly: every GEP chain folds to `(base, k, terms)`.
     let resolved = resolve_pointers(m);
-    // Emit the function bodies twice at most: a measuring pass (every
-    // table reads page 0), then, only when a table spills to page 1, a
-    // final pass with the real pages. Call-site sizes are
-    // page-independent by construction, so the measure holds.
-    let emit_code = |table_page: &HashMap<String, u8>| {
-        let mut tmp = 0u32;
-        let mut code_out = Vec::new();
-        let mut code_locs = Vec::new();
-        for f in &m.funcs {
-            let mut g = Gen {
-                m,
-                addrs,
-                device,
-                resolved: &resolved,
-                scratch,
-                scratch2,
-                store_tmp,
-                retval_lo,
-                cur_func: &f.name,
-                table_page,
-                tmp: &mut tmp,
-                w_holds: None,
-                cur_loc: None,
-                out: Vec::new(),
-                locs: Vec::new(),
-            };
-            emit_func_body(&mut g, f);
-            code_out.extend(g.out);
-            code_locs.extend(g.locs);
+    // Emit each function into its own buffer (PA0 fixups recorded per
+    // buffer); layout assigns pages after measuring, then patches the
+    // bits in place. Call sequences are uniform size, so one pass
+    // measures exactly.
+    let mut tmp = 0u32;
+    let mut frags: Vec<(
+        String,
+        Vec<String>,
+        Vec<Option<SrcLoc>>,
+        Vec<(usize, Pa0Page)>,
+    )> = Vec::new();
+    for f in &m.funcs {
+        let mut fixes = Vec::new();
+        let mut g = Gen {
+            m,
+            addrs,
+            device,
+            resolved: &resolved,
+            scratch,
+            scratch2,
+            store_tmp,
+            retval_lo,
+            cur_func: &f.name,
+            fixups: &mut fixes,
+            tmp: &mut tmp,
+            w_holds: None,
+            cur_loc: None,
+            out: Vec::new(),
+            locs: Vec::new(),
+        };
+        emit_func_body(&mut g, f);
+        frags.push((f.name.clone(), g.out, g.locs, fixes));
+    }
+    let head_words = count_words(&out);
+    // Layout: each function wholly in one page with its entry in a low
+    // half (CALL cannot reach a high half); the cursor jumps pages with
+    // `org`. Emission order is kept, so fall-through never changes
+    // neighbors.
+    let mut cursor = head_words;
+    let mut func_page: HashMap<String, u8> = HashMap::new();
+    let mut func_entry: HashMap<String, usize> = HashMap::new();
+    for (name, code, _, _) in &frags {
+        let size = count_words(code);
+        assert!(
+            size <= 0x200,
+            "isel: function @{name} ({size} words) fits no 512-word page (D-5)"
+        );
+        loop {
+            assert!(
+                cursor < 0x400,
+                "isel: function @{name} overflows the 1024-word flash (D-5)"
+            );
+            let in_low = (cursor & 0x1FF) < 0x100;
+            // The whole body must fit the current page: spanning a page
+            // boundary strands forward branch targets in the PA0-other
+            // page (GOTOs cannot cross pages).
+            let fits_page = cursor + size <= (cursor & !0x1FF) + 0x200;
+            if in_low && fits_page {
+                break;
+            }
+            cursor = (cursor & !0x1FF) + 0x200;
         }
-        (code_out, code_locs)
-    };
-    let empty_pages: HashMap<String, u8> = HashMap::new();
-    let (code_out, code_locs) = emit_code(&empty_pages);
-    // Tables follow the prologue, init, `__start` and functions: the
-    // cursor starts past the already-emitted head, not at zero.
+        func_page.insert(name.clone(), (cursor >> 9) as u8);
+        func_entry.insert(name.clone(), cursor);
+        cursor += size;
+    }
+    // Const tables pack the page low halves around the functions: occ0
+    // and occ1 track each low half's occupied end (head plus function
+    // extents clipped to the half). First-fit page 0, spill page 1.
     let consts = flash_consts(m, addrs);
-    let mut placed = place_const_tables(count_words(&out) + count_words(&code_out), &consts);
-    // Emit page-0 tables before page-1 ones: the emitter walks this
-    // vector behind a single page-1 `org`, so an unordered spill would
-    // print a page-0 table at the page-1 cursor with page-0 immediates.
+    let mut occ = [head_words.min(0x100), 0x200];
+    for (name, code, _, _) in &frags {
+        let (e, s) = (func_entry[name.as_str()], count_words(code));
+        if e < 0x100 {
+            occ[0] = occ[0].max((e + s).min(0x100));
+        } else {
+            occ[1] = occ[1].max((e + s).min(0x300));
+        }
+    }
+    let mut placed: Vec<(String, usize, u8)> = Vec::new();
+    for g in consts {
+        let n = g.bytes.len();
+        assert!(
+            n <= TABLE_MAX,
+            "isel: const @{} too large ({n} bytes; no page low half fits 4 reader words + {n} RETLWs, D-5)",
+            g.name
+        );
+        let need = READER_WORDS + n;
+        if occ[0] + need <= 0x100 {
+            placed.push((g.name.clone(), occ[0], 0));
+            occ[0] += need;
+        } else if occ[1] + need <= 0x300 {
+            placed.push((g.name.clone(), occ[1], 1));
+            occ[1] += need;
+        } else {
+            panic!(
+                "isel: const @{} crosses the 256-word ceiling (page-0 low half full at {:#x}, page-1 low half full at {:#x}, D-5)",
+                g.name, occ[0], occ[1]
+            );
+        }
+    }
+    // Emit page-0 tables before page-1 ones: the join walks this vector
+    // behind orgs, and grouped pages keep one transition.
     placed.sort_by_key(|t| t.2);
-    let pages: HashMap<String, u8> = placed
+    let table_page: HashMap<String, u8> = placed
         .iter()
         .map(|(name, _, page)| (name.clone(), *page))
         .collect();
-    let (code_out, code_locs) = if pages.values().any(|p| *p == 1) {
-        emit_code(&pages)
-    } else {
-        (code_out, code_locs)
-    };
-    out.extend(code_out);
-    locs.extend(code_locs);
-    // The const section: readers + RETLW tables, page-0 low half first,
-    // page-1 spill after an `org` at the first spilled entry. Bases are
-    // numeric (isel placed them); the page-fit audit re-derives addresses.
-    let mut page1_open = false;
-    for (name, entry, page) in &placed {
-        if *page == 1 && !page1_open {
+    // Patch every recorded PA0 bit now that pages are final. Bits patch
+    // in place (BCF/BSF swaps), so measured sizes hold.
+    patch_pa0(&mut out, &head_fixes, &func_page, &table_page);
+    let mut running = head_words;
+    for (name, code, flocs, fixes) in &mut frags {
+        let entry = func_entry[name.as_str()];
+        if entry != running {
             out.push(format!("    org 0x{entry:03X}"));
             locs.push(None);
-            page1_open = true;
+        }
+        patch_pa0(code, fixes, &func_page, &table_page);
+        running = entry + count_words(code);
+        out.extend(code.drain(..));
+        locs.extend(flocs.drain(..));
+    }
+    // The const section: readers + RETLW tables with numeric bases (isel
+    // placed them); the page-fit audit re-derives every address.
+    for (name, entry, _) in &placed {
+        if *entry != running {
+            out.push(format!("    org 0x{entry:03X}"));
+            locs.push(None);
         }
         let g = m
             .globals
@@ -2414,6 +3601,7 @@ pub fn select_with_locs(
         out.push(format!("__read_{name}:"));
         locs.push(None);
         out.push("    MOVWF 0x07".to_string());
+        locs.push(None);
         out.push(format!("    MOVLW 0x{:02X}", (base & 0xFF) as u8));
         locs.push(None);
         out.push("    ADDWF 0x07, W".to_string());
@@ -2436,6 +3624,7 @@ pub fn select_with_locs(
         }
         out.push("".to_string());
         locs.push(None);
+        running = entry + READER_WORDS + g.bytes.len();
     }
     out.push("    end".to_string());
     locs.push(None);

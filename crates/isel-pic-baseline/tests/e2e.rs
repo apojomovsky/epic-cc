@@ -386,3 +386,177 @@ fn gpasm_hex(asm: &str, stem: &str) -> String {
     );
     std::fs::read_to_string(dir.join(format!("{stem}.hex"))).expect("read hex")
 }
+
+/// Parse Intel HEX data records into word address -> 12-bit word. Our
+/// encoder emits dense images (gaps read back as zero); gpasm omits
+/// unprogrammed ranges, so gapped programs compare on the intersection.
+fn parse_hex_words(hex: &str) -> std::collections::HashMap<usize, u16> {
+    let mut words = std::collections::HashMap::new();
+    for line in hex.lines() {
+        let line = line.trim();
+        if !line.starts_with(':') {
+            continue;
+        }
+        let n = usize::from_str_radix(&line[1..3], 16).expect("hex len");
+        let addr = usize::from_str_radix(&line[3..7], 16).expect("hex addr");
+        if &line[7..9] != "00" {
+            continue;
+        }
+        for i in (0..n).step_by(2) {
+            let lo = u16::from_str_radix(&line[9 + i * 2..11 + i * 2], 16).expect("hex byte");
+            let hi = u16::from_str_radix(&line[11 + i * 2..13 + i * 2], 16).expect("hex byte");
+            words.insert((addr + i) / 2, (hi << 8) | lo);
+        }
+    }
+    words
+}
+
+/// Every word gpasm programs must match ours: the oracle cross-checks
+/// encoding on all programmed words while ignoring gap fill/omission.
+fn gpasm_agrees(asm: &str, stem: &str) {
+    let ours = parse_hex_words(&ours_hex(asm));
+    let theirs = parse_hex_words(&gpasm_hex(asm, stem));
+    assert!(!theirs.is_empty(), "gpasm emitted no words for {stem}");
+    for (addr, word) in &theirs {
+        assert_eq!(
+            ours.get(addr),
+            Some(word),
+            "word at {addr:#x} differs from gpasm"
+        );
+    }
+}
+
+/// P6 div-half acceptance (docs/37 section 3 P6): udiv/urem/sdiv/srem
+/// on i16 and i8 through the software routine copies, laid out across
+/// pages with PA0-managed CALLs. Expected: in = 301 -> out = 21.
+#[test]
+fn muldiv_div_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/muldiv_div.c");
+    p.ram_mut()[globals["in"] as usize] = 45;
+    p.ram_mut()[globals["in"] as usize + 1] = 1;
+    p.run(2_000_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 21, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "muldiv_div");
+}
+
+/// P6 mul-half acceptance: mul plus const and variable-count shifts on
+/// i16 and i8. Expected: in = 301 -> out = 616.
+#[test]
+fn muldiv_mul_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/muldiv_mul.c");
+    p.ram_mut()[globals["in"] as usize] = 45;
+    p.ram_mut()[globals["in"] as usize + 1] = 1;
+    p.run(2_000_000);
+    let out = p.ram()[globals["out"] as usize] as u16
+        | ((p.ram()[globals["out"] as usize + 1] as u16) << 8);
+    assert_eq!(out, 616, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "muldiv_mul");
+}
+
+/// P6 i32 add/mul acceptance (docs/37 section 3 P6): inline add,
+/// mul_u32 (the only routine copy), const shifts and logic.
+/// Expected: x = 0x12345678 -> 0xBF41AAC5.
+#[test]
+fn long_mul_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_mul.c");
+    p.ram_mut()[globals["x"] as usize] = 0x78;
+    p.ram_mut()[globals["x"] as usize + 1] = 0x56;
+    p.ram_mut()[globals["x"] as usize + 2] = 0x34;
+    p.ram_mut()[globals["x"] as usize + 3] = 0x12;
+    p.run(2_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 0xBF41AAC5, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_mul");
+}
+
+/// P6 i32 unsigned div acceptance: udiv/urem through the software
+/// routine copies. Expected: x = 0x12345678 -> 4.
+#[test]
+fn long_div_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_div.c");
+    p.ram_mut()[globals["x"] as usize] = 0x78;
+    p.ram_mut()[globals["x"] as usize + 1] = 0x56;
+    p.ram_mut()[globals["x"] as usize + 2] = 0x34;
+    p.ram_mut()[globals["x"] as usize + 3] = 0x12;
+    p.run(8_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 4, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_div");
+}
+
+/// P6 i32 signed div acceptance: sdiv/srem through the software
+/// routine copies, negative dividend and divisor.
+/// Expected: x = -123456789 -> -4 (0xFFFFFFFC).
+#[test]
+fn long_sdiv_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_sdiv.c");
+    p.ram_mut()[globals["x"] as usize] = 0xEB;
+    p.ram_mut()[globals["x"] as usize + 1] = 0x32;
+    p.ram_mut()[globals["x"] as usize + 2] = 0xA4;
+    p.ram_mut()[globals["x"] as usize + 3] = 0xF8;
+    p.run(8_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 0xFFFFFFFC, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_sdiv");
+}
+
+/// P6 i32 sub/compare acceptance: inline sub, unsigned compares and
+/// const shifts. Expected: x = 0x12345678 -> 0x044CD55E.
+#[test]
+fn long_cmp_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_cmp.c");
+    p.ram_mut()[globals["x"] as usize] = 0x78;
+    p.ram_mut()[globals["x"] as usize + 1] = 0x56;
+    p.ram_mut()[globals["x"] as usize + 2] = 0x34;
+    p.ram_mut()[globals["x"] as usize + 3] = 0x12;
+    p.run(2_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 0x044CD55E, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_cmp");
+}
+
+/// P6 i32 variable-shift acceptance: reg-count shifts through the
+/// shl/lshr routine copies. Expected: x = 0x12345678, n = 3 ->
+/// 0x12355779.
+#[test]
+fn long_shift_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_shift.c");
+    p.ram_mut()[globals["x"] as usize] = 0x78;
+    p.ram_mut()[globals["x"] as usize + 1] = 0x56;
+    p.ram_mut()[globals["x"] as usize + 2] = 0x34;
+    p.ram_mut()[globals["x"] as usize + 3] = 0x12;
+    p.ram_mut()[globals["n"] as usize] = 3;
+    p.run(2_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 0x12355779, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_shift");
+}
