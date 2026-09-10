@@ -17,6 +17,7 @@ wholeprog = { path = "../wholeprog" }
 legalize = { path = "../legalize" }
 callgraph = { path = "../callgraph" }
 alloc = { path = "../alloc" }
+parking_lot = "0.12"
 
 [[bin]]
 name = "isel-pic-baseline"

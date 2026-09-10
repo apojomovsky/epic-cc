@@ -111,7 +111,7 @@ impl<'m> Gen<'m> {
     fn emit_w_store(&mut self, addr: u16) {
         if self.w_holds != Some(addr) {
             self.emit_bank_select(addr);
-            self.emit(format!("    MOVWF 0x{addr:02X}"));
+            self.emit(format!("    MOVWF {}", self.fop(addr)));
         }
         self.w_holds = Some(addr);
     }
@@ -121,7 +121,7 @@ impl<'m> Gen<'m> {
     fn emit_w_load(&mut self, addr: u16) {
         if self.w_holds != Some(addr) {
             self.emit_bank_select(addr);
-            self.emit(format!("    MOVF 0x{addr:02X}, W"));
+            self.emit(format!("    MOVF {}, W", self.fop(addr)));
         }
         self.w_holds = Some(addr);
     }
@@ -131,37 +131,37 @@ impl<'m> Gen<'m> {
     /// scratch2 + k. scratch2 is dedicated to these folds, so it is always
     /// free here.
     fn emit_add_w_const(&mut self, k: u8) {
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch2)));
         self.emit(format!("    MOVLW 0x{k:02X}"));
-        self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch2));
+        self.emit(format!("    ADDWF {}, W", self.fop(self.scratch2)));
     }
 
     /// `W = W + 1` when the carry flag is set (the i16 add carry fold),
     /// without `ADDLW`. `INCF scratch2, F` sets Z but not C; the caller's
     /// next op (ADDWF/SUBWF) sets C/Z fresh.
     fn emit_add_w_carry(&mut self) {
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch2)));
         self.emit("    BTFSC STATUS, 0 ; C".to_string());
-        self.emit(format!("    INCF 0x{:02X}, F", self.scratch2));
-        self.emit(format!("    MOVF 0x{:02X}, W", self.scratch2));
+        self.emit(format!("    INCF {}, F", self.fop(self.scratch2)));
+        self.emit(format!("    MOVF {}, W", self.fop(self.scratch2)));
     }
 
     /// `W = W + 1` when the carry flag is clear (the i16 sub borrow fold).
     fn emit_add_w_borrow(&mut self) {
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch2)));
         self.emit("    BTFSS STATUS, 0 ; C".to_string());
-        self.emit(format!("    INCF 0x{:02X}, F", self.scratch2));
-        self.emit(format!("    MOVF 0x{:02X}, W", self.scratch2));
+        self.emit(format!("    INCF {}, F", self.fop(self.scratch2)));
+        self.emit(format!("    MOVF {}, W", self.fop(self.scratch2)));
     }
 
     /// `W = W + 1` when the carry flag is set, then `W = W + k` (the i16
     /// add carry fold plus a constant high byte), without `ADDLW`.
     fn emit_add_w_carry_const(&mut self, k: u8) {
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch2)));
         self.emit("    BTFSC STATUS, 0 ; C".to_string());
-        self.emit(format!("    INCF 0x{:02X}, F", self.scratch2));
+        self.emit(format!("    INCF {}, F", self.fop(self.scratch2)));
         self.emit(format!("    MOVLW 0x{k:02X}"));
-        self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch2));
+        self.emit(format!("    ADDWF {}, W", self.fop(self.scratch2)));
     }
 
     /// D-2's unconditional `FSR` bank-bit reassertion (docs/37 §2 D-2):
@@ -177,6 +177,16 @@ impl<'m> Gen<'m> {
             Some(1) => self.emit("    BSF FSR, 5".to_string()),
             _ => {}
         }
+    }
+
+    /// The 5-bit direct-operand field for a physical address: baseline's
+    /// direct addressing uses the within-bank offset (0x00-0x1F) with
+    /// `FSR<5>` selecting the bank (D-2), so a bank-1 GPR at 0x30-0x3F is
+    /// addressed as 0x00-0x0F with `BSF FSR,5`. The bank-independent SFR
+    /// block (0x00-0x06) and shared GPR (0x07-0x0F) are below 0x10, so the
+    /// mask is identity there.
+    fn fop(&self, addr: u16) -> String {
+        format!("0x{:02X}", addr & 0x1F)
     }
 
     /// Resolve `{func}::{name}` to its base byte address (lo for multi-byte).
@@ -294,7 +304,7 @@ impl<'m> Gen<'m> {
                                 let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                                 if idx == 0 {
                                     self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                                    self.emit(format!("    ADDWF {}, W", self.fop(ra)));
                                 } else {
                                     self.emit("    MOVLW 0x00".to_string());
                                 }
@@ -308,8 +318,8 @@ impl<'m> Gen<'m> {
                                 let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
                                 if idx == 0 {
                                     self.emit(format!("    MOVLW 0x{lo:02X}"));
-                                    self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                    self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
+                                    self.emit(format!("    ADDWF {}, W", self.fop(ra1)));
+                                    self.emit(format!("    ADDWF {}, W", self.fop(ra2)));
                                 } else {
                                     self.emit("    MOVLW 0x00".to_string());
                                 }
@@ -330,7 +340,7 @@ impl<'m> Gen<'m> {
                     match terms.as_slice() {
                         [] => {
                             if idx == 0 {
-                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                self.emit(format!("    MOVF {}, W", self.fop(sa)));
                                 if k != 0 {
                                     self.emit_add_w_const(k);
                                 }
@@ -341,8 +351,8 @@ impl<'m> Gen<'m> {
                         [(1, reg)] => {
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                             if idx == 0 {
-                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
-                                self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                                self.emit(format!("    MOVF {}, W", self.fop(sa)));
+                                self.emit(format!("    ADDWF {}, W", self.fop(ra)));
                             } else {
                                 self.emit("    MOVLW 0x00".to_string());
                             }
@@ -355,9 +365,9 @@ impl<'m> Gen<'m> {
                             let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
                             let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
                             if idx == 0 {
-                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
-                                self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
-                                self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
+                                self.emit(format!("    MOVF {}, W", self.fop(sa)));
+                                self.emit(format!("    ADDWF {}, W", self.fop(ra1)));
+                                self.emit(format!("    ADDWF {}, W", self.fop(ra2)));
                             } else {
                                 self.emit("    MOVLW 0x00".to_string());
                             }
@@ -397,12 +407,12 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit_bank_select(a + u16::from(idx));
-                self.emit(format!("    XORWF 0x{:02X}, W", a + u16::from(idx)));
+                self.emit(format!("    XORWF {}, W", self.fop(a + u16::from(idx))));
             }
             Val::Global(g) => {
                 let a = self.val_addr(&Val::Global(g.clone())).direct();
                 self.emit_bank_select(a + u16::from(idx));
-                self.emit(format!("    XORWF 0x{:02X}, W", a + u16::from(idx)));
+                self.emit(format!("    XORWF {}, W", self.fop(a + u16::from(idx))));
             }
         }
     }
@@ -420,12 +430,12 @@ impl<'m> Gen<'m> {
         let n = ty.bytes();
         self.emit_load_byte(a, 0);
         self.emit_xor_byte(b, 0);
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
         for i in 1..n {
             self.emit_load_byte(a, i);
             self.emit_xor_byte(b, i);
-            self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
-            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+            self.emit(format!("    IORWF {}, W", self.fop(self.scratch)));
+            self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
         }
     }
 
@@ -447,10 +457,10 @@ impl<'m> Gen<'m> {
                 if signed && i == high {
                     self.emit("    MOVLW 0x80".to_string());
                     self.emit_bank_select(addr);
-                    self.emit(format!("    XORWF 0x{addr:02X}, W"));
+                    self.emit(format!("    XORWF {}, W", self.fop(addr)));
                 } else {
                     self.emit_bank_select(addr);
-                    self.emit(format!("    MOVF 0x{addr:02X}, W"));
+                    self.emit(format!("    MOVF {}, W", self.fop(addr)));
                 }
             }
         }
@@ -475,11 +485,11 @@ impl<'m> Gen<'m> {
                 // byte; stash it, load k, SUBWF computes k - W, so
                 // C = (a >= b).
                 self.emit_load_cmp_byte(b, 0, signed, high);
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                 let k0 = (k & 0xFF) as u8;
                 let k0 = if signed && high == 0 { k0 ^ 0x80 } else { k0 };
                 self.emit(format!("    MOVLW 0x{k0:02X}"));
-                self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
             }
             _ => {
                 if n > 1 {
@@ -491,8 +501,8 @@ impl<'m> Gen<'m> {
                 if use_scratch {
                     self.emit("    MOVLW 0x80".to_string());
                     self.emit_bank_select(aa + high as u16);
-                    self.emit(format!("    XORWF 0x{:02X}, W", aa + high as u16));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit(format!("    XORWF {}, W", self.fop(aa + high as u16)));
+                    self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                 }
                 self.emit_load_cmp_byte(b, 0, signed, high);
                 self.emit_bank_select(if use_scratch && n == 1 {
@@ -517,7 +527,7 @@ impl<'m> Gen<'m> {
                         aa + i as u16
                     };
                     self.emit_bank_select(f);
-                    self.emit(format!("    SUBWF 0x{f:02X}, W"));
+                    self.emit(format!("    SUBWF {}, W", self.fop(f)));
                 }
             }
         }
@@ -530,7 +540,7 @@ impl<'m> Gen<'m> {
         let aa = self.val_addr(a).direct();
         self.emit_load_cmp_byte(b, 0, signed, high);
         self.emit_bank_select(aa);
-        self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+        self.emit(format!("    SUBWF {}, W", self.fop(aa)));
         for i in 1..n {
             if signed && i == high {
                 match b {
@@ -542,38 +552,38 @@ impl<'m> Gen<'m> {
                         let addr = self.val_addr(b).direct() + u16::from(high);
                         self.emit("    MOVLW 0x80".to_string());
                         self.emit_bank_select(addr);
-                        self.emit(format!("    XORWF 0x{addr:02X}, W"));
+                        self.emit(format!("    XORWF {}, W", self.fop(addr)));
                     }
                 }
-                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
+                self.emit(format!("    MOVWF {}", self.fop(self.retval_lo)));
                 self.emit("    MOVLW 0x80".to_string());
                 self.emit_bank_select(aa + u16::from(high));
-                self.emit(format!("    XORWF 0x{:02X}, W", aa + u16::from(high)));
-                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-                self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    XORWF {}, W", self.fop(aa + u16::from(high))));
+                self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                self.emit(format!("    MOVF {}, W", self.fop(self.retval_lo)));
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    INCFSZ {}, W", self.fop(self.retval_lo)));
                 self.emit_bank_select(self.scratch);
-                self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
             } else {
                 match b {
                     Val::Const(k) => {
                         let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
                         self.emit(format!("    MOVLW 0x{kb:02X}"));
-                        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                         self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                        self.emit(format!("    INCFSZ 0x{:02X}, W", self.scratch));
+                        self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
                     }
                     _ => {
                         self.emit_load_cmp_byte(b, i, signed, high);
                         let addr = self.val_addr(b).direct() + u16::from(i);
                         self.emit("    BTFSS STATUS, 0 ; C".to_string());
                         self.emit_bank_select(addr);
-                        self.emit(format!("    INCFSZ 0x{addr:02X}, W"));
+                        self.emit(format!("    INCFSZ {}, W", self.fop(addr)));
                     }
                 }
                 self.emit_bank_select(aa + u16::from(i));
-                self.emit(format!("    SUBWF 0x{:02X}, W", aa + u16::from(i)));
+                self.emit(format!("    SUBWF {}, W", self.fop(aa + u16::from(i))));
             }
         }
     }
@@ -583,32 +593,32 @@ impl<'m> Gen<'m> {
     /// idiom: stash the b byte, load k_i, SUBWF computes k_i - W.
     fn emit_cmp_c_const_lhs_wide(&mut self, k: &i64, b: &Val, n: u8, high: u8, signed: bool) {
         self.emit_load_cmp_byte(b, 0, signed, high);
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
         let k0 = (k & 0xFF) as u8;
         let k0 = if signed && high == 0 { k0 ^ 0x80 } else { k0 };
         self.emit(format!("    MOVLW 0x{k0:02X}"));
-        self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+        self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
         for i in 1..n {
             if signed && i == high {
                 let addr = self.val_addr(b).direct() + u16::from(high);
                 self.emit("    MOVLW 0x80".to_string());
                 self.emit_bank_select(addr);
-                self.emit(format!("    XORWF 0x{addr:02X}, W"));
-                self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo));
+                self.emit(format!("    XORWF {}, W", self.fop(addr)));
+                self.emit(format!("    MOVWF {}", self.fop(self.retval_lo)));
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    INCFSZ {}, W", self.fop(self.retval_lo)));
                 let kb = ((k >> (high as u32 * 8)) & 0xFF) as u8 ^ 0x80;
                 self.emit(format!("    MOVLW 0x{kb:02X}"));
-                self.emit(format!("    SUBWF 0x{:02X}, W", self.retval_lo));
+                self.emit(format!("    SUBWF {}, W", self.fop(self.retval_lo)));
             } else {
                 let addr = self.val_addr(b).direct() + u16::from(i);
                 self.emit_bank_select(addr);
-                self.emit(format!("    MOVF 0x{addr:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(addr)));
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ 0x{addr:02X}, W"));
+                self.emit(format!("    INCFSZ {}, W", self.fop(addr)));
                 let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
                 self.emit(format!("    MOVLW 0x{kb:02X}"));
-                self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
             }
         }
     }
@@ -641,7 +651,7 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => {
                 let ca = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit_bank_select(ca);
-                self.emit(format!("    MOVF 0x{ca:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(ca)));
                 self.emit("    BTFSC STATUS, 2 ; Z".to_string());
                 self.emit(format!("    GOTO {f}"));
                 self.emit(format!("    GOTO {t}"));
@@ -705,10 +715,10 @@ impl<'m> Gen<'m> {
                     other => panic!("isel: cannot materialize {other:?} as a select arm"),
                 };
                 self.emit_bank_select(sa);
-                self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(sa)));
                 self.emit_w_store(dst);
                 self.emit_bank_select(sa + 1);
-                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                self.emit(format!("    MOVF {}, W", self.fop(sa + 1)));
                 self.emit_w_store(dst + 1);
             }
         }
@@ -738,7 +748,7 @@ impl<'m> Gen<'m> {
             _ => unreachable!(),
         };
         self.emit_bank_select(ca);
-        self.emit(format!("    MOVF 0x{ca:02X}, W"));
+        self.emit(format!("    MOVF {}, W", self.fop(ca)));
         self.emit("    BTFSC STATUS, 2 ; Z".to_string());
         self.emit(format!("    GOTO {l_else}"));
         if addr_value {
@@ -768,26 +778,26 @@ impl<'m> Gen<'m> {
             Val::Reg(rb) => {
                 let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 self.emit_bank_select(bb);
-                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(bb)));
                 self.emit_bank_select(ra);
-                self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                self.emit(format!("    ADDWF {}, W", self.fop(ra)));
                 self.emit_w_store(dst);
                 self.emit_bank_select(bb + 1);
-                self.emit(format!("    MOVF 0x{:02X}, W", bb + 1));
+                self.emit(format!("    MOVF {}, W", self.fop(bb + 1)));
                 self.emit_add_w_carry();
                 self.emit_bank_select(ra + 1);
-                self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                self.emit(format!("    ADDWF {}, W", self.fop(ra + 1)));
                 self.emit_w_store(dst + 1);
             }
             Val::Const(k) => {
                 let lo = (k & 0xFF) as u8;
                 let hi = ((k >> 8) & 0xFF) as u8;
                 self.emit_bank_select(ra);
-                self.emit(format!("    MOVF 0x{ra:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(ra)));
                 self.emit_add_w_const(lo);
                 self.emit_w_store(dst);
                 self.emit_bank_select(ra + 1);
-                self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
+                self.emit(format!("    MOVF {}, W", self.fop(ra + 1)));
                 self.emit_add_w_carry_const(hi);
                 self.emit_w_store(dst + 1);
             }
@@ -834,15 +844,15 @@ impl<'m> Gen<'m> {
             Val::Const(k) => {
                 self.emit(format!("    MOVLW 0x{:02X}", (*k & 0xFF) as u8));
                 self.emit_bank_select(aa);
-                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    SUBWF {}, W", self.fop(aa)));
                 self.emit_w_store(dst);
             }
             Val::Reg(_) => {
                 let bb = self.val_addr(b).direct();
                 self.emit_bank_select(bb);
-                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(bb)));
                 self.emit_bank_select(aa);
-                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    SUBWF {}, W", self.fop(aa)));
                 self.emit_w_store(dst);
             }
             Val::Global(_) => panic!("isel: sub8 with a global operand"),
@@ -855,18 +865,18 @@ impl<'m> Gen<'m> {
     fn emit_sub_const_lhs(&mut self, k: &i64, a: &Val, dst: u16, bytes: u8) {
         let aa = self.val_addr(a).direct();
         self.emit_bank_select(aa);
-        self.emit(format!("    MOVF 0x{aa:02X}, W"));
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+        self.emit(format!("    MOVF {}, W", self.fop(aa)));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
         self.emit(format!("    MOVLW 0x{:02X}", (k & 0xFF) as u8));
-        self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+        self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
         self.emit_w_store(dst);
         for i in 1..bytes {
             let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
             self.emit_bank_select(aa + u16::from(i));
-            self.emit(format!("    MOVF 0x{:02X}, W", aa + u16::from(i)));
-            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+            self.emit(format!("    MOVF {}, W", self.fop(aa + u16::from(i))));
+            self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
             self.emit(format!("    MOVLW 0x{kb:02X}"));
-            self.emit(format!("    SUBWF 0x{:02X}, W", self.scratch));
+            self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
             self.emit_w_store(dst + u16::from(i));
         }
     }
@@ -880,26 +890,26 @@ impl<'m> Gen<'m> {
                 let hi = ((k >> 8) & 0xFF) as u8;
                 self.emit(format!("    MOVLW 0x{lo:02X}"));
                 self.emit_bank_select(aa);
-                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    SUBWF {}, W", self.fop(aa)));
                 self.emit_w_store(dst);
                 self.emit(format!("    MOVLW 0x{hi:02X}"));
                 self.emit_add_w_borrow();
                 self.emit_bank_select(aa + 1);
-                self.emit(format!("    SUBWF 0x{:02X}, W", aa + 1));
+                self.emit(format!("    SUBWF {}, W", self.fop(aa + 1)));
                 self.emit_w_store(dst + 1);
             }
             Val::Reg(rb) => {
                 let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 self.emit_bank_select(bb);
-                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(bb)));
                 self.emit_bank_select(aa);
-                self.emit(format!("    SUBWF 0x{aa:02X}, W"));
+                self.emit(format!("    SUBWF {}, W", self.fop(aa)));
                 self.emit_w_store(dst);
                 self.emit_bank_select(bb + 1);
-                self.emit(format!("    MOVF 0x{:02X}, W", bb + 1));
+                self.emit(format!("    MOVF {}, W", self.fop(bb + 1)));
                 self.emit_add_w_borrow();
                 self.emit_bank_select(aa + 1);
-                self.emit(format!("    SUBWF 0x{:02X}, W", aa + 1));
+                self.emit(format!("    SUBWF {}, W", self.fop(aa + 1)));
                 self.emit_w_store(dst + 1);
             }
             Val::Global(_) => panic!("isel: sub16 with a global operand"),
@@ -984,7 +994,7 @@ impl<'m> Gen<'m> {
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => {
                 self.emit_bank_select(a);
-                self.emit(format!("    MOVF 0x{a:02X}, W"))
+                self.emit(format!("    MOVF {}, W", self.fop(a)))
             }
             Addr::Indirect => {
                 self.emit("    BCF FSR, 5".to_string());
@@ -998,7 +1008,7 @@ impl<'m> Gen<'m> {
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => {
                 self.emit_bank_select(a);
-                self.emit(format!("    MOVWF 0x{a:02X}"))
+                self.emit(format!("    MOVWF {}", self.fop(a)))
             }
             Addr::Indirect => {
                 self.emit("    BCF FSR, 5".to_string());
@@ -1013,7 +1023,7 @@ impl<'m> Gen<'m> {
             Addr::Direct(a) => {
                 self.emit_load_byte(val, byte_off);
                 self.emit_bank_select(a);
-                self.emit(format!("    MOVWF 0x{a:02X}"));
+                self.emit(format!("    MOVWF {}", self.fop(a)));
             }
             Addr::Indirect => {
                 self.emit_load_byte(val, byte_off);
@@ -1033,13 +1043,13 @@ impl<'m> Gen<'m> {
             [(1, r)] => {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit_bank_select(a);
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
+                self.emit(format!("    MOVF {}, W", self.fop(a)));
                 self.emit_add_w_const(lit as u8);
                 self.emit("    MOVWF FSR".to_string());
             }
             _ => {
                 self.emit_accum_terms(terms);
-                self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
                 self.emit_add_w_const(lit as u8);
                 self.emit("    MOVWF FSR".to_string());
             }
@@ -1058,14 +1068,14 @@ impl<'m> Gen<'m> {
         );
         if terms.is_empty() {
             self.emit_bank_select(slot_addr);
-            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
+            self.emit(format!("    MOVF {}, W", self.fop(slot_addr)));
             self.emit_add_w_const(kk as u8);
             self.emit("    MOVWF FSR".to_string());
         } else {
             self.emit_accum_terms(terms);
             self.emit_bank_select(slot_addr);
-            self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
+            self.emit(format!("    MOVF {}, W", self.fop(slot_addr)));
+            self.emit(format!("    ADDWF {}, W", self.fop(self.scratch)));
             self.emit_add_w_const(kk as u8);
             self.emit("    MOVWF FSR".to_string());
         }
@@ -1079,8 +1089,8 @@ impl<'m> Gen<'m> {
             let a = self.val_addr(&Val::Reg(r.clone())).direct();
             for _ in 0..*scale {
                 self.emit_bank_select(a);
-                self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
+                self.emit(format!("    MOVF {}, W", self.fop(a)));
+                self.emit(format!("    ADDWF {}, W", self.fop(self.scratch)));
                 self.emit_w_store(self.scratch);
             }
         }
@@ -1101,12 +1111,12 @@ impl<'m> Gen<'m> {
         for cand in callees.iter() {
             let l_next = self.fresh_label();
             self.emit_bank_select(fp);
-            self.emit(format!("    MOVF 0x{fp:02X}, W"));
+            self.emit(format!("    MOVF {}, W", self.fop(fp)));
             self.emit(format!("    XORLW LOW({cand})"));
             self.emit("    BTFSS STATUS, 2 ; Z".to_string());
             self.emit(format!("    GOTO {l_next}"));
             self.emit_bank_select(fp + 1);
-            self.emit(format!("    MOVF 0x{:02X}, W", fp + 1));
+            self.emit(format!("    MOVF {}, W", self.fop(fp + 1)));
             self.emit(format!("    XORLW HIGH({cand})"));
             self.emit("    BTFSS STATUS, 2 ; Z".to_string());
             self.emit(format!("    GOTO {l_next}"));
@@ -1194,7 +1204,7 @@ impl<'m> Gen<'m> {
                 for b in 0..size {
                     self.emit_ptr_load_byte(&arg.val, b);
                     self.emit_bank_select(pa + u16::from(b));
-                    self.emit(format!("    MOVWF 0x{:02X}", pa + u16::from(b)));
+                    self.emit(format!("    MOVWF {}", self.fop(pa + u16::from(b))));
                 }
             } else if arg.sret {
                 assert!(callee.params[i].sret, "isel: sret arg for a non-sret param");
@@ -1220,10 +1230,10 @@ impl<'m> Gen<'m> {
                 };
                 self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                 self.emit_bank_select(pa);
-                self.emit(format!("    MOVWF 0x{:02X}", pa));
+                self.emit(format!("    MOVWF {}", self.fop(pa)));
                 self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
                 self.emit_bank_select(pa + 1);
-                self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                self.emit(format!("    MOVWF {}", self.fop(pa + 1)));
             } else if arg.ty.is_none() {
                 assert!(
                     !arg.sret && arg.byval.is_none(),
@@ -1238,10 +1248,10 @@ impl<'m> Gen<'m> {
                         if self.is_function(g) {
                             self.emit(format!("    MOVLW LOW({g})"));
                             self.emit_bank_select(pa);
-                            self.emit(format!("    MOVWF 0x{:02X}", pa));
+                            self.emit(format!("    MOVWF {}", self.fop(pa)));
                             self.emit(format!("    MOVLW HIGH({g})"));
                             self.emit_bank_select(pa + 1);
-                            self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                            self.emit(format!("    MOVWF {}", self.fop(pa + 1)));
                         } else {
                             if self.global_is_const(g) {
                                 panic!("isel: const global @{g} too large for RAM copy");
@@ -1249,30 +1259,30 @@ impl<'m> Gen<'m> {
                             let addr = self.global_addr(g);
                             self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                             self.emit_bank_select(pa);
-                            self.emit(format!("    MOVWF 0x{:02X}", pa));
+                            self.emit(format!("    MOVWF {}", self.fop(pa)));
                             self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
                             self.emit_bank_select(pa + 1);
-                            self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                            self.emit(format!("    MOVWF {}", self.fop(pa + 1)));
                         }
                     }
                     Val::Const(c) => {
                         assert_eq!(*c, 0, "isel: non-zero const ptr not supported");
                         self.emit_bank_select(pa);
-                        self.emit(format!("    CLRF 0x{:02X}", pa));
+                        self.emit(format!("    CLRF {}", self.fop(pa)));
                         self.emit_bank_select(pa + 1);
-                        self.emit(format!("    CLRF 0x{:02X}", pa + 1));
+                        self.emit(format!("    CLRF {}", self.fop(pa + 1)));
                     }
                     Val::Reg(r) => {
                         // A runtime pointer value: copy its two address bytes.
                         let sa = self.slot_addr(self.cur_func, r).direct();
                         self.emit_bank_select(sa);
-                        self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                        self.emit(format!("    MOVF {}, W", self.fop(sa)));
                         self.emit_bank_select(pa);
-                        self.emit(format!("    MOVWF 0x{:02X}", pa));
+                        self.emit(format!("    MOVWF {}", self.fop(pa)));
                         self.emit_bank_select(sa + 1);
-                        self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                        self.emit(format!("    MOVF {}, W", self.fop(sa + 1)));
                         self.emit_bank_select(pa + 1);
-                        self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                        self.emit(format!("    MOVWF {}", self.fop(pa + 1)));
                     }
                 }
             } else {
@@ -1292,14 +1302,14 @@ impl<'m> Gen<'m> {
                     let src = self.global_addr(g);
                     for k in 0..l.ty.bytes() {
                         self.emit_bank_select(src + u16::from(k));
-                        self.emit(format!("    MOVF 0x{:02X}, W", src + u16::from(k)));
+                        self.emit(format!("    MOVF {}, W", self.fop(src + u16::from(k))));
                         self.emit_w_store(dst + u16::from(k));
                     }
                 } else if l.ptr.starts_with("0x") {
                     let base = literal_ptr_addr(&l.ptr);
                     for k in 0..l.ty.bytes() {
                         self.emit_bank_select(base + u16::from(k));
-                        self.emit(format!("    MOVF 0x{:02X}, W", base + u16::from(k)));
+                        self.emit(format!("    MOVF {}, W", self.fop(base + u16::from(k))));
                         self.emit_w_store(dst + u16::from(k));
                     }
                 } else {
@@ -1326,7 +1336,7 @@ impl<'m> Gen<'m> {
                     for k in 0..s.ty.bytes() {
                         self.emit_load_byte(&s.val, k);
                         self.emit_bank_select(base + u16::from(k));
-                        self.emit(format!("    MOVWF 0x{:02X}", base + u16::from(k)));
+                        self.emit(format!("    MOVWF {}", self.fop(base + u16::from(k))));
                     }
                 } else {
                     let r = s.ptr.strip_prefix('%').unwrap_or_else(|| {
@@ -1381,7 +1391,7 @@ impl<'m> Gen<'m> {
                                 let kb = (*k & 0xFF) as u8;
                                 let aa = self.val_addr(a).direct();
                                 self.emit_bank_select(aa);
-                                self.emit(format!("    MOVF 0x{aa:02X}, W"));
+                                self.emit(format!("    MOVF {}, W", self.fop(aa)));
                                 self.emit_add_w_const(kb);
                                 self.emit_w_store(da);
                             }
@@ -1389,9 +1399,9 @@ impl<'m> Gen<'m> {
                                 let (aa, bb) =
                                     (self.val_addr(a).direct(), self.val_addr(b_op).direct());
                                 self.emit_bank_select(bb);
-                                self.emit(format!("    MOVF 0x{bb:02X}, W"));
+                                self.emit(format!("    MOVF {}, W", self.fop(bb)));
                                 self.emit_bank_select(aa);
-                                self.emit(format!("    ADDWF 0x{aa:02X}, W"));
+                                self.emit(format!("    ADDWF {}, W", self.fop(aa)));
                                 self.emit_w_store(da);
                             }
                         }
@@ -1465,7 +1475,7 @@ impl<'m> Gen<'m> {
                 }
                 for i in z.from.bytes()..z.to.bytes() {
                     self.emit_bank_select(da + u16::from(i));
-                    self.emit(format!("    CLRF 0x{:02X}", da + u16::from(i)));
+                    self.emit(format!("    CLRF {}", self.fop(da + u16::from(i))));
                 }
             }
             Inst::IntToPtr(p) => {
@@ -1498,7 +1508,7 @@ impl<'m> Gen<'m> {
                 let l_pos = self.fresh_label();
                 let l_fill = self.fresh_label();
                 self.emit_bank_select(a + u16::from(src_hi));
-                self.emit(format!("    BTFSS 0x{:02X}, 7", a + u16::from(src_hi)));
+                self.emit(format!("    BTFSS {}, 7", self.fop(a + u16::from(src_hi))));
                 self.emit(format!("    GOTO {l_pos}"));
                 self.emit("    MOVLW 0xFF".to_string());
                 self.emit(format!("    GOTO {l_fill}"));
@@ -1522,7 +1532,7 @@ impl<'m> Gen<'m> {
                 if t.to == Ty::I1 {
                     self.emit("    MOVLW 0x01".to_string());
                     self.emit_bank_select(da);
-                    self.emit(format!("    ANDWF 0x{da:02X}, F"));
+                    self.emit(format!("    ANDWF {}, F", self.fop(da)));
                 }
             }
             Inst::Icmp(ic) => {
@@ -1608,7 +1618,10 @@ impl<'m> Gen<'m> {
                 for i in 0..ty.bytes() {
                     self.emit_load_byte(v, i);
                     self.emit_bank_select(self.retval_lo + u16::from(i));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.retval_lo + u16::from(i)));
+                    self.emit(format!(
+                        "    MOVWF {}",
+                        self.fop(self.retval_lo + u16::from(i))
+                    ));
                 }
                 self.emit("    RETLW 0x00".to_string());
             }
@@ -1747,7 +1760,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                         Val::Reg(r) => {
                             let ca = g.val_addr(&Val::Reg(r.clone())).direct();
                             g.emit_bank_select(ca);
-                            g.emit(format!("    MOVF 0x{ca:02X}, W"));
+                            g.emit(format!("    MOVF {}, W", g.fop(ca)));
                             match (t_copies, f_copies) {
                                 (None, None) => {
                                     g.emit("    BTFSC STATUS, 2 ; Z".to_string());
