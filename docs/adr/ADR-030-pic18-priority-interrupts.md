@@ -38,8 +38,9 @@
 * Save areas: the high ISR reuses the fixed block (same bytes as compat);
   the low ISR gets a 12-byte area at its region's base, below its frames
   (disjoint by construction, carried `alloc` -> `isel-pic18` as
-  `isr_low_save`). The new area gives W a dedicated slot; it does not
-  copy the fixed block's FSR0H/W slot overlap (epic-cc#356).
+  `isr_low_save`). The new area gives W a dedicated slot at its own
+  base byte; it does not copy the fixed block's FSR0H/W slot overlap
+  (fixed separately in epic-cc#356/#363).
 * The sim models post-IPEN routing (low vector gated on GIEH+GIEL,
   high entry clears GIEH, low entry clears GIEL only, RETFIE restores the
   returning context's bit). RCON.IPEN itself is firmware-owned (user C
@@ -61,7 +62,9 @@ the sim rather than by inspection.
   feature exists to prevent.
 * Fixing the fixed block's FSR0H/W overlap in passing: a 2-line change,
   but it moves compat codegen bytes under a recorded SDCC-parity
-  baseline. Filed as epic-cc#356 instead; compat stays byte-identical.
+  baseline, so it was filed separately as epic-cc#356 rather than folded
+  into this feature. Landed in epic-cc#363: the SDCC-parity corpus
+  checks a size ratio, not exact addresses, so the byte move was safe.
 * Per-context float areas: `_isr_high` float copies share the access-bank
   window exactly like `_isr` copies (same pre-existing hazard class, no
   new one). The principled fix covers all three contexts and is filed as

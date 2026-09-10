@@ -255,6 +255,13 @@ fn main() {
                 if flo < alo || fhi > ahi {
                     panic!("device: {}: fixed_retval [{:#06X},{:#06X}] must lie inside access_bank [{:#06X},{:#06X}]", path, flo, fhi, alo, ahi);
                 }
+                // isel-pic18's compat ISR prologue/epilogue hardcodes offsets
+                // up to +15 (retval backup) and +8 (W's save slot) into this
+                // region (epic-cc#356); narrower than 16 bytes and those
+                // writes land outside the reservation, into ordinary RAM.
+                if fhi - flo + 1 < 16 {
+                    panic!("device: {}: fixed_retval [{:#06X},{:#06X}] must be at least 16 bytes (retval + ISR save area)", path, flo, fhi);
+                }
                 for (lo, hi) in &dev.ram_banks {
                     if flo <= *hi && fhi >= *lo {
                         panic!("device: {}: fixed_retval [{:#06X},{:#06X}] overlaps ram_banks [{:#06X},{:#06X}]", path, flo, fhi, lo, hi);
