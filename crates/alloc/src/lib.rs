@@ -1251,9 +1251,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         // A runtime routine's frame must stay inside ONE GPR bank: its
         // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
         // test and its target, or inside a carry idiom. The base is rounded
-        // when the derived frame would straddle a bank boundary; a float
-        // routine on a device with an access bank is pinned into the
-        // access-bank window instead (ADR-015, docs/36; epic-cc#6).
+        // when the derived frame would straddle a bank boundary; float
+        // routines round exactly like integer ones (epic-cc#357).
         let b = round_if_routine(device, f, b, &locals_widths);
         base.insert(f.clone(), b);
     }

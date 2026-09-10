@@ -5,9 +5,10 @@
 // float work; main resumes and completes with the bit-exact result the
 // un-preempted run produces.
 //
-// The result is deterministic: main computes 3.0f/2.5f + 9.0f*2.5f +
-// 1.0f/3.0f (the float.c chain) with `fire` raised before the last divide
-// so the ISR's adds land between main's division iterations.
+// The sim fires the ISR on a fixed step cadence gated on GIEH (see
+// float_isr_e2e.rs): the float recipes run hundreds of instructions, so
+// of the 8 fires several land INSIDE main's in-flight mul/div. `fire`
+// exists so the ISR can acknowledge each firing (no re-entry).
 volatile float in1;
 volatile float in2;
 volatile float out;
