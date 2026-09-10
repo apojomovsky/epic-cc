@@ -129,8 +129,9 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
         device::Core::PicBaseline => {
             // Baseline's fixed region is common RAM (0x07-0x0F): scratch
             // (1) + retval (4) + scratch2 (1, the ADDLW-replacement temp)
-            // = 6 bytes, no ISR save (no interrupts).
-            let base = 6;
+            // + store_tmp (1, the indirect-store staging byte) = 7 bytes,
+            // no ISR save (no interrupts).
+            let base = 7;
             if has_isr {
                 panic!("report: baseline has no interrupts; has_isr must be false")
             } else {

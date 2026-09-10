@@ -79,6 +79,12 @@ struct Gen<'m> {
     /// always free at a fold (the primary `scratch` byte is live across
     /// cmp accumulation and GEP offsets).
     scratch2: u16,
+    /// A third fixed common-RAM temp, dedicated to staging a store value
+    /// across the pointer's FSR setup: the FSR setup clobbers W, and a
+    /// banked value's load reasserts FSR<5>, which would clobber the
+    /// just-set pointer FSR before the INDF store (silent wrong-bank
+    /// write). Never used elsewhere, so it is always free at a store.
+    store_tmp: u16,
     retval_lo: u16,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
@@ -1013,35 +1019,42 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// `RAM[ptr + byte_off] = W`: the store side of a byte access.
+    /// `RAM[ptr + byte_off] = W`: the store side of a byte access. W is
+    /// staged in common RAM first: the FSR setup clobbers W, and a banked
+    /// value's reassert would clobber FSR (silent wrong-bank write).
+    /// `store_tmp` is dead between instructions and untouched by the FSR
+    /// setup paths; MOVWF leaves W intact, so the direct arm needs no
+    /// reload.
     fn emit_ptr_store_w(&mut self, ptr: &Val, byte_off: u8) {
+        self.emit(format!("    MOVWF {}", self.fop(self.store_tmp)));
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => {
                 self.emit_bank_select(a);
                 self.emit(format!("    MOVWF {}", self.fop(a)))
             }
             Addr::Indirect => {
-                // FSR<5> is never stale at an INDF touch (the pointer load
-                // just set it); no reassertion, or a bank-1 pointer would be
-                // redirected to bank 0.
+                self.emit(format!("    MOVF {}, W", self.fop(self.store_tmp)));
                 self.emit("    MOVWF INDF".to_string())
             }
         }
     }
 
-    /// `RAM[ptr + byte_off] = byte byte_off of val`.
+    /// `RAM[ptr + byte_off] = byte byte_off of val`. The value byte is
+    /// staged in common RAM BEFORE the FSR setup: a banked value's load
+    /// reasserts FSR<5>, which would clobber the just-set pointer FSR
+    /// before the INDF store (silent wrong-bank write). `store_tmp` is
+    /// dead between instructions and untouched by the FSR setup paths;
+    /// MOVWF leaves W intact, so the direct arm needs no reload.
     fn emit_ptr_store_byte(&mut self, ptr: &Val, byte_off: u8, val: &Val) {
+        self.emit_load_byte(val, byte_off);
+        self.emit(format!("    MOVWF {}", self.fop(self.store_tmp)));
         match self.emit_ptr_setup(ptr, byte_off) {
             Addr::Direct(a) => {
-                self.emit_load_byte(val, byte_off);
                 self.emit_bank_select(a);
                 self.emit(format!("    MOVWF {}", self.fop(a)));
             }
             Addr::Indirect => {
-                self.emit_load_byte(val, byte_off);
-                // FSR<5> is never stale at an INDF touch (the pointer load
-                // just set it); no reassertion, or a bank-1 pointer would be
-                // redirected to bank 0.
+                self.emit(format!("    MOVF {}, W", self.fop(self.store_tmp)));
                 self.emit("    MOVWF INDF".to_string());
             }
         }
@@ -1917,7 +1930,8 @@ pub fn select_with_locs(
     // The icmp scratch byte and the four retval bytes are fixed common-RAM
     // constants (bank-independent, the device's common RAM is never used by
     // locals, so no collision). Baseline's common RAM is 0x07-0x0F (9
-    // bytes): scratch at 0x07, retval at 0x08-0x0B, leaving 0x0C-0x0F free.
+    // bytes): scratch at 0x07, retval at 0x08-0x0B, scratch2 at 0x0C,
+    // store_tmp at 0x0D, leaving 0x0E-0x0F free.
     let (common_lo, common_hi) = device
         .common_ram
         .expect("isel's fixed scratch/retval layout needs a common-RAM region");
@@ -1925,16 +1939,17 @@ pub fn select_with_locs(
     let retval_lo: u16 = common_lo + 1;
     // scratch2 (the ADDLW-replacement temp) sits right after the retval
     // region: common RAM 0x07-0x0F = scratch(0x07) + retval(0x08-0x0B) +
-    // scratch2(0x0C), leaving 0x0D-0x0F free.
+    // scratch2(0x0C) + store_tmp(0x0D), leaving 0x0E-0x0F free.
     let scratch2: u16 = common_lo + 5;
+    let store_tmp: u16 = common_lo + 6;
     assert!(
         retval_lo + 4 <= common_hi + 1,
         "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must fit in common RAM",
         retval_lo + 3
     );
     assert!(
-        scratch2 <= common_hi,
-        "isel: scratch2 0x{scratch2:02X} must fit in common RAM (0x{common_lo:02X}-0x{common_hi:02X})"
+        store_tmp <= common_hi,
+        "isel: store_tmp 0x{store_tmp:02X} must fit in common RAM (0x{common_lo:02X}-0x{common_hi:02X})"
     );
     out.extend(vec![
         "; pic8 -- PIC baseline integer spine (isel-pic-baseline)".to_string(),
@@ -2008,6 +2023,7 @@ pub fn select_with_locs(
             resolved: &resolved,
             scratch,
             scratch2,
+            store_tmp,
             retval_lo,
             cur_func: &f.name,
             tmp: &mut tmp,
