@@ -87,6 +87,17 @@ impl<'m> Gen<'m> {
         self.bsr = None;
     }
 
+    /// Emit one `MOVFF src, dst` per pair, in array order. Callers that
+    /// need a fixed emission order across aliased memory (e.g. the ISR
+    /// epilogue's SFR-vs-retval-backup restores, epic-cc#362) express it
+    /// as separate calls rather than one merged array, so the order is a
+    /// statement sequence, not a fact buried in array contents.
+    fn emit_movff_pairs<const N: usize>(&mut self, pairs: [(u16, u16); N]) {
+        for (src, dst) in pairs {
+            self.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+        }
+    }
+
     fn fresh_label(&mut self) -> String {
         let s = format!("tmp{}", *self.tmp);
         *self.tmp += 1;
@@ -5355,19 +5366,19 @@ pub fn select_with_locs(
                     // (never touches STATUS), so the interrupted main's
                     // Z/N come back intact; only the final W restore via
                     // MOVF sets Z/N from the moved value (the one accepted
-                    // flag loss, same as PIC14's W-last convention). The
-                    // retval snapshot is restored first, then the SFRs
-                    // (reverse of the prologue), STATUS, and W last. The
-                    // low ISR in priority mode restores from its own area
-                    // (mirror of its prologue above).
+                    // flag loss, same as PIC14's W-last convention).
                     let low_save = priority_mode && f.irq_priority != 1;
-                    let restores: [(u16, u16); 11] = if low_save {
+                    if low_save {
                         let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
-                        [
+                        // Disjoint save area (s+1..+11), so the two halves
+                        // below don't alias and their order is free.
+                        g.emit_movff_pairs([
                             (s + 11, common_lo + 3),
                             (s + 10, common_lo + 2),
                             (s + 9, common_lo + 1),
                             (s + 8, common_lo),
+                        ]);
+                        g.emit_movff_pairs([
                             (s + 7, 0xFF8), // TBLPTRU
                             (s + 6, 0xFF7), // TBLPTRH
                             (s + 5, 0xFF6), // TBLPTRL
@@ -5375,13 +5386,13 @@ pub fn select_with_locs(
                             (s + 3, 0xFE9), // FSR0L
                             (s + 2, 0xFE0), // BSR
                             (s + 1, 0xFD8), // STATUS
-                        ]
+                        ]);
                     } else {
-                        [
-                            (common_lo + 15, common_lo + 3),
-                            (common_lo + 14, common_lo + 2),
-                            (common_lo + 13, common_lo + 1),
-                            (common_lo + 12, common_lo),
+                        // These two groups alias (both touch
+                        // common_lo+1..+3): the SFR group must run first,
+                        // or the retval group below clobbers the SFR
+                        // snapshot before it's read (epic-cc#362).
+                        g.emit_movff_pairs([
                             (common_lo + 7, 0xFF8), // TBLPTRU
                             (common_lo + 6, 0xFF7), // TBLPTRH
                             (common_lo + 5, 0xFF6), // TBLPTRL
@@ -5389,10 +5400,13 @@ pub fn select_with_locs(
                             (common_lo + 3, 0xFE9), // FSR0L
                             (common_lo + 2, 0xFE0), // BSR
                             (common_lo + 1, 0xFD8), // STATUS
-                        ]
-                    };
-                    for (src, dst) in restores {
-                        g.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+                        ]);
+                        g.emit_movff_pairs([
+                            (common_lo + 15, common_lo + 3),
+                            (common_lo + 14, common_lo + 2),
+                            (common_lo + 13, common_lo + 1),
+                            (common_lo + 12, common_lo),
+                        ]);
                     }
                     if low_save {
                         let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
