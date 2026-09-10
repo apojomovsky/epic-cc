@@ -160,3 +160,22 @@ fn banked_c_runs_correctly_and_reasserts_fsr5() {
         }
     }
 }
+
+/// Regression (epic-cc#325 follow-up): a store of a bank-1 value through a
+/// runtime indirect pointer to a bank-0 destination. The value load's
+/// `BSF FSR,5` reassert must not clobber the pointer's FSR setup before
+/// the INDF store: the value byte is staged in common RAM first. Without
+/// the staging, the store lands in bank 1 and buf[0] keeps its preload.
+#[test]
+fn indirect_store_of_banked_value_lands_in_the_right_bank() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/indirect_store_bank.c");
+    p.run(10_000);
+    assert!(p.halted());
+    assert_eq!(
+        p.ram()[globals["buf"] as usize],
+        5,
+        "buf[0] must be 5: the store through the bank-0 pointer must not be redirected to bank 1"
+    );
+    assert_eq!(p.ram()[globals["src"] as usize], 5, "src must be 5");
+}
