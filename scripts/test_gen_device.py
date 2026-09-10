@@ -259,6 +259,62 @@ class GenDevicePic18Test(unittest.TestCase):
         self.assertIn("unhandled", r.stderr)
         self.assertEqual(text, "")
 
+    def test_individually_hidden_semantic_without_cname_is_skipped(self):
+        # A semantic can be hidden on its own (an overlapping "don't care"
+        # bit pattern) even when its field is not, and carries no cname
+        # since it names no real value (Microchip.PIC18Fxxxx_DFP 1.8.178's
+        # CONFIG1H OSC field does exactly this for its 11XX/101X entries).
+        # Collecting it as a real value crashed downstream aliasing on the
+        # missing name; it must be dropped like a hidden field's values are.
+        tampered = PIC18_FIXTURE.read_text().replace(
+            '<edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x0"/>\n'
+            '            </edc:DCRFieldDef>\n'
+            '            <edc:AdjustPoint',
+            '<edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x0"/>\n'
+            '              <edc:DCRFieldSemantic edc:when="(field &amp; 0x1) == 0x1" '
+            'edc:islanghidden="true"/>\n'
+            '            </edc:DCRFieldDef>\n'
+            '            <edc:AdjustPoint',
+        )
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "hidden_semantic.atdf"
+            src.write_text(tampered)
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('name = "alpha"', text)
+        self.assertIn('{ name = "on", bits = 1 }', text)
+        self.assertIn('{ name = "off", bits = 0 }', text)
+
+    def test_hidden_field_beyond_impl_is_padding_not_a_mismatch(self):
+        # A trailing hidden RESERVED field can describe bits past the
+        # byte's own impl mask ("maintain as 1s" documentation, confirmed
+        # against Microchip.PIC18Fxxxx_DFP 1.8.178's CONFIG5L on parts like
+        # p18lf4420). Those bits are not real config bits, so they must not
+        # be forced to match impl the way a real field's bits are.
+        tampered = PIC18_FIXTURE.read_text().replace(
+            '<edc:DCRFieldDef edc:name="GAMMA" edc:mask="0x3">\n'
+            '              <edc:DCRFieldSemantic edc:cname="THREE" edc:when="(field &amp; 0x3) == 0x3"/>\n'
+            '              <edc:DCRFieldSemantic edc:cname="ONE" edc:when="(field &amp; 0x3) == 0x1"/>\n'
+            '              <edc:DCRFieldSemantic edc:cname="ZERO" edc:when="(field &amp; 0x3) == 0x0"/>\n'
+            '            </edc:DCRFieldDef>',
+            '<edc:DCRFieldDef edc:name="GAMMA" edc:mask="0x3">\n'
+            '              <edc:DCRFieldSemantic edc:cname="THREE" edc:when="(field &amp; 0x3) == 0x3"/>\n'
+            '              <edc:DCRFieldSemantic edc:cname="ONE" edc:when="(field &amp; 0x3) == 0x1"/>\n'
+            '              <edc:DCRFieldSemantic edc:cname="ZERO" edc:when="(field &amp; 0x3) == 0x0"/>\n'
+            '            </edc:DCRFieldDef>\n'
+            '            <edc:DCRFieldDef edc:name="RESERVED" edc:mask="0x3" '
+            'edc:ishidden="true" edc:islanghidden="true">\n'
+            '              <edc:DCRFieldSemantic edc:when="(field &amp; 0x3) == 0x3"/>\n'
+            '            </edc:DCRFieldDef>',
+        )
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "reserved_beyond_impl.atdf"
+            src.write_text(tampered)
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('name = "gamma"', text)
+        self.assertNotIn('name = "reserved"', text)
+
     def test_split_access_bank_sectors_merge(self):
         # Two adjacent TraditionalModeOnly sectors describing one physical
         # access bank must merge, not silently lose the second half by only
