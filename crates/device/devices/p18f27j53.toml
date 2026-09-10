@@ -1,0 +1,209 @@
+name = "p18f27j53"
+core = "pic18"
+flash_words = 65532
+# Widened past the DFP's own gpr0-gpr12 (0x10-0xCFF): it understates this
+# part's RAM, confirmed against gputils' 18f27j53_g.lkr, which carries
+# gpr0-gpr14 up to 0xEAF. Same DFP defect class as p18f2550's ram_banks
+# comment; see scripts/gen-device.py's module docstring.
+ram_banks = [[0x0010, 0x0EAF]]
+access_bank = [0x0000, 0x005F]
+fixed_retval = [0x0000, 0x000F]
+stack_depth = 31
+interrupt_vectors = [0x0008, 0x0018]
+
+[provenance]
+tier = "atdf"
+source = "PIC18F27J53.PIC"
+pack = "Microchip.PIC18F-J_DFP"
+sha256 = "7329f0eb13f14d603cd2f1af4c881f7d7bbfe56e7f3ca3fba756c6b01e31e0cf"
+
+[config]
+base_byte_addr = 0x1FFF8
+num_bytes = 8
+erased_baseline = [0xFF, 0xF7, 0xFF, 0xFF, 0xFF, 0xFB, 0xFF, 0xFB]
+
+[[config.fields]]
+name = "wdten"
+byte_offset = 0
+mask = 0x01
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "plldiv"
+byte_offset = 0
+mask = 0x0E
+shift = 1
+values = [{ name = "12", bits = 0 }, { name = "10", bits = 1 }, { name = "6", bits = 2 }, { name = "5", bits = 3 }, { name = "4", bits = 4 }, { name = "3", bits = 5 }, { name = "2", bits = 6 }, { name = "1", bits = 7 }]
+
+[[config.fields]]
+name = "cfgpllen"
+byte_offset = 0
+mask = 0x10
+shift = 4
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "stvren"
+byte_offset = 0
+mask = 0x20
+shift = 5
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "xinst"
+byte_offset = 0
+mask = 0x40
+shift = 6
+default = "off"
+locked = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "cpudiv"
+byte_offset = 1
+mask = 0x03
+shift = 0
+values = [{ name = "osc4_pll6", bits = 0 }, { name = "osc3_pll3", bits = 1 }, { name = "osc2_pll2", bits = 2 }, { name = "osc1", bits = 3 }]
+
+[[config.fields]]
+name = "cp0"
+byte_offset = 1
+mask = 0x04
+shift = 2
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 2
+mask = 0x07
+shift = 0
+values = [{ name = "intosc", bits = 0 }, { name = "intosco", bits = 1 }, { name = "intoscpll", bits = 2 }, { name = "intoscpllo", bits = 3 }, { name = "hs", bits = 4 }, { name = "hspll", bits = 5 }, { name = "ec", bits = 6 }, { name = "ecpll", bits = 7 }]
+
+[[config.fields]]
+name = "soscsel"
+byte_offset = 2
+mask = 0x18
+shift = 3
+values = [{ name = "low", bits = 1 }, { name = "dig", bits = 2 }, { name = "high", bits = 3 }]
+
+[[config.fields]]
+name = "clkoec"
+byte_offset = 2
+mask = 0x20
+shift = 5
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "fcmen"
+byte_offset = 2
+mask = 0x40
+shift = 6
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "ieso"
+byte_offset = 2
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "wdtps"
+byte_offset = 3
+mask = 0x0F
+shift = 0
+values = [{ name = "1", bits = 0 }, { name = "2", bits = 1 }, { name = "4", bits = 2 }, { name = "8", bits = 3 }, { name = "16", bits = 4 }, { name = "32", bits = 5 }, { name = "64", bits = 6 }, { name = "128", bits = 7 }, { name = "256", bits = 8 }, { name = "512", bits = 9 }, { name = "1024", bits = 10 }, { name = "2048", bits = 11 }, { name = "4096", bits = 12 }, { name = "8192", bits = 13 }, { name = "16384", bits = 14 }, { name = "32768", bits = 15 }]
+
+[[config.fields]]
+name = "dswdtosc"
+byte_offset = 4
+mask = 0x01
+shift = 0
+values = [{ name = "t1oscref", bits = 0 }, { name = "intoscref", bits = 1 }]
+
+[[config.fields]]
+name = "rtcosc"
+byte_offset = 4
+mask = 0x02
+shift = 1
+values = [{ name = "intoscref", bits = 0 }, { name = "t1oscref", bits = 1 }]
+
+[[config.fields]]
+name = "dsboren"
+byte_offset = 4
+mask = 0x04
+shift = 2
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "dswdten"
+byte_offset = 4
+mask = 0x08
+shift = 3
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "dswdtps"
+byte_offset = 4
+mask = 0xF0
+shift = 4
+values = [{ name = "2", bits = 0 }, { name = "8", bits = 1 }, { name = "32", bits = 2 }, { name = "128", bits = 3 }, { name = "512", bits = 4 }, { name = "2048", bits = 5 }, { name = "8192", bits = 6 }, { name = "k32", bits = 7 }, { name = "k131", bits = 8 }, { name = "k524", bits = 9 }, { name = "m2", bits = 10 }, { name = "m8", bits = 11 }, { name = "m33", bits = 12 }, { name = "m134", bits = 13 }, { name = "m536", bits = 14 }, { name = "g2", bits = 15 }]
+
+[[config.fields]]
+name = "iol1way"
+byte_offset = 5
+mask = 0x01
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "adcsel"
+byte_offset = 5
+mask = 0x02
+shift = 1
+values = [{ name = "bit12", bits = 0 }, { name = "bit10", bits = 1 }]
+
+[[config.fields]]
+name = "mssp7b_en"
+byte_offset = 5
+mask = 0x08
+shift = 3
+values = [{ name = "msk5", bits = 0 }, { name = "msk7", bits = 1 }]
+
+[[config.fields]]
+name = "wpfp"
+byte_offset = 6
+mask = 0x7F
+shift = 0
+values = [{ name = "page_0", bits = 0 }, { name = "page_1", bits = 1 }, { name = "page_2", bits = 2 }, { name = "page_3", bits = 3 }, { name = "page_4", bits = 4 }, { name = "page_5", bits = 5 }, { name = "page_6", bits = 6 }, { name = "page_7", bits = 7 }, { name = "page_8", bits = 8 }, { name = "page_9", bits = 9 }, { name = "page_10", bits = 10 }, { name = "page_11", bits = 11 }, { name = "page_12", bits = 12 }, { name = "page_13", bits = 13 }, { name = "page_14", bits = 14 }, { name = "page_15", bits = 15 }, { name = "page_16", bits = 16 }, { name = "page_17", bits = 17 }, { name = "page_18", bits = 18 }, { name = "page_19", bits = 19 }, { name = "page_20", bits = 20 }, { name = "page_21", bits = 21 }, { name = "page_22", bits = 22 }, { name = "page_23", bits = 23 }, { name = "page_24", bits = 24 }, { name = "page_25", bits = 25 }, { name = "page_26", bits = 26 }, { name = "page_27", bits = 27 }, { name = "page_28", bits = 28 }, { name = "page_29", bits = 29 }, { name = "page_30", bits = 30 }, { name = "page_31", bits = 31 }, { name = "page_32", bits = 32 }, { name = "page_33", bits = 33 }, { name = "page_34", bits = 34 }, { name = "page_35", bits = 35 }, { name = "page_36", bits = 36 }, { name = "page_37", bits = 37 }, { name = "page_38", bits = 38 }, { name = "page_39", bits = 39 }, { name = "page_40", bits = 40 }, { name = "page_41", bits = 41 }, { name = "page_42", bits = 42 }, { name = "page_43", bits = 43 }, { name = "page_44", bits = 44 }, { name = "page_45", bits = 45 }, { name = "page_46", bits = 46 }, { name = "page_47", bits = 47 }, { name = "page_48", bits = 48 }, { name = "page_49", bits = 49 }, { name = "page_50", bits = 50 }, { name = "page_51", bits = 51 }, { name = "page_52", bits = 52 }, { name = "page_53", bits = 53 }, { name = "page_54", bits = 54 }, { name = "page_55", bits = 55 }, { name = "page_56", bits = 56 }, { name = "page_57", bits = 57 }, { name = "page_58", bits = 58 }, { name = "page_59", bits = 59 }, { name = "page_60", bits = 60 }, { name = "page_61", bits = 61 }, { name = "page_62", bits = 62 }, { name = "page_63", bits = 63 }, { name = "page_64", bits = 64 }, { name = "page_65", bits = 65 }, { name = "page_66", bits = 66 }, { name = "page_67", bits = 67 }, { name = "page_68", bits = 68 }, { name = "page_69", bits = 69 }, { name = "page_70", bits = 70 }, { name = "page_71", bits = 71 }, { name = "page_72", bits = 72 }, { name = "page_73", bits = 73 }, { name = "page_74", bits = 74 }, { name = "page_75", bits = 75 }, { name = "page_76", bits = 76 }, { name = "page_77", bits = 77 }, { name = "page_78", bits = 78 }, { name = "page_79", bits = 79 }, { name = "page_80", bits = 80 }, { name = "page_81", bits = 81 }, { name = "page_82", bits = 82 }, { name = "page_83", bits = 83 }, { name = "page_84", bits = 84 }, { name = "page_85", bits = 85 }, { name = "page_86", bits = 86 }, { name = "page_87", bits = 87 }, { name = "page_88", bits = 88 }, { name = "page_89", bits = 89 }, { name = "page_90", bits = 90 }, { name = "page_91", bits = 91 }, { name = "page_92", bits = 92 }, { name = "page_93", bits = 93 }, { name = "page_94", bits = 94 }, { name = "page_95", bits = 95 }, { name = "page_96", bits = 96 }, { name = "page_97", bits = 97 }, { name = "page_98", bits = 98 }, { name = "page_99", bits = 99 }, { name = "page_100", bits = 100 }, { name = "page_101", bits = 101 }, { name = "page_102", bits = 102 }, { name = "page_103", bits = 103 }, { name = "page_104", bits = 104 }, { name = "page_105", bits = 105 }, { name = "page_106", bits = 106 }, { name = "page_107", bits = 107 }, { name = "page_108", bits = 108 }, { name = "page_109", bits = 109 }, { name = "page_110", bits = 110 }, { name = "page_111", bits = 111 }, { name = "page_112", bits = 112 }, { name = "page_113", bits = 113 }, { name = "page_114", bits = 114 }, { name = "page_115", bits = 115 }, { name = "page_116", bits = 116 }, { name = "page_117", bits = 117 }, { name = "page_118", bits = 118 }, { name = "page_119", bits = 119 }, { name = "page_120", bits = 120 }, { name = "page_121", bits = 121 }, { name = "page_122", bits = 122 }, { name = "page_123", bits = 123 }, { name = "page_124", bits = 124 }, { name = "page_125", bits = 125 }, { name = "page_126", bits = 126 }, { name = "page_127", bits = 127 }]
+
+[[config.fields]]
+name = "wpcfg"
+byte_offset = 6
+mask = 0x80
+shift = 7
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wpdis"
+byte_offset = 7
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "wpend"
+byte_offset = 7
+mask = 0x02
+shift = 1
+values = [{ name = "page_0", bits = 0 }, { name = "page_wpfp", bits = 1 }]
+
+[[config.fields]]
+name = "ls48mhz"
+byte_offset = 7
+mask = 0x08
+shift = 3
+values = [{ name = "sys24x4", bits = 0 }, { name = "sys48x8", bits = 1 }]
