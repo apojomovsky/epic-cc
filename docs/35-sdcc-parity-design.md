@@ -98,11 +98,13 @@ not accidental.
 ## 3. Gap inventory
 
 Verified against the SDCC 4.6.0 manual (as shipped in the pinned source
-tarball — section numbers below are from that revision, not necessarily
+tarball; section numbers below are from that revision, not necessarily
 whatever is currently posted at sdcc.sourceforge.net, since numbering
 has shifted across releases), `pic14devices.txt`, `supported-devices.ac`,
-and epic-cc's tree. Items marked **verify** are ones where the corpus
-(P0) is the arbiter: clang's frontend may already close them untested.
+and epic-cc's tree. Every row once marked **verify** is now arbitrated:
+the corpus (P0) closed them, mostly through clang's frontend lowering
+(bit-fields, unions) plus hand-value conformance where SDCC cannot run
+(i64 on the PIC14 family cores). No row below is still marked verify.
 
 ### PIC18 (SDCC "pic16" port): epic-cc gaps
 
@@ -115,14 +117,14 @@ and epic-cc's tree. Items marked **verify** are ones where the corpus
 | Bit-fields | ✅ | ✅ | verified: clang lowers to shift/mask IR; `bitfields` probe passes on all three cores |
 | Unions | ✅ | ✅ | verified: `unions` probe passes on all three cores (#300) |
 | Recursion / reentrancy (FSR1/FSR2 software stack, manual 4.10.12) | ✅ | ✅ | `recursion` probe (fact(5)) passes on all three cores; SDCC's pic14-family static overlay corrupts (arbitrated) |
-| Memory models — code-pointer width (manual 4.10.11) | small/large | static overlay only | separate axis from the stack model above |
+| Memory models, code-pointer width (manual 4.10.11) | small/large | single static model | deliberate non-goal. SDCC's models trade code-pointer width (2 vs 3 bytes) against devices above and below 64 KB of flash. epic-cc keys every local in one whole-program static map, so pointer width is a single whole-program decision, and the `constptr` probe already verifies flash traversal on all three cores. What is lost is 3-byte generic code pointers for code spaces above 64 KB; such a program fails with a precise panic, never a silent miscompile. If a supported device ever needs it, the width becomes a per-device constant, not a user-facing flag, and the surface item stays decidable from this row. |
 | malloc / heap | ✅ | ❌ | library work |
 | math.h | ✅ | ❌ | library work |
 | `printf` `%f` | ✅, but only if `device/lib/pic16` is rebuilt with `--enable-floats` (manual 4.10.9); default build prints `<NO FLOAT>` | ✅ | formatter shipped (#295); the `printf-f` probe formats 3.5 through printf on all three cores (conformance pinned); the p18f4550 differential is arbitrated (putchar sink-ABI incompatibility, `sdcc-known-bugs.toml`) |
 | Code/eeprom pointers (3-byte generic) | ✅ | partial | pointer-to-const traversal in flash verified at parity on all three cores (`constptr` probe, TBLRD/RETLW path); SDCC's space-qualified pointers (`__code`/`__eeprom`, runtime-selected spaces) stay open under #267 |
 | Two-vector priority interrupts | ✅ | ❌ | single-vector compat only (ADR-013 follow-up) |
-| `__shadowregs`, `__wparam` | ✅ | ❌ | perf features |
-| Real diagnostics vs panics | ✅ | ❌ | known gap |
+| `__shadowregs`, `__wparam` | ✅ | source-compatible, codegen open | deliberate non-goal. Both are pure performance attributes with no language surface: `__wparam` passes the first argument in WREG, `__shadowregs` takes ISR context through the hardware shadow registers, and a program using either computes identically without them. Source compatibility already holds where it matters: the corpus predefines `__wparam` empty so one `putchar` source compiles under both compilers. What is lost is cycles on call prologues and ISR entry/exit; the landed baseline already leads SDCC geometrically on cycles, so this stays a non-goal until the speed gate says otherwise. |
+| Real diagnostics vs panics | ✅ | panics with precise messages | deliberate non-goal for this epic, by the compiler's error-surface rule: unsupported input aborts with a precise message instead of risking a silent miscompile, and the conformance and differential gates rely on exactly that invariant. What is lost is SDCC-style multi-error recovery, numbered errors, and IDE-facing output. A diagnostics overhaul is cross-family work outside the parity bar; it earns its own ticket, not a parity gate. |
 | EEPROM access | ✅ | ✅ | verified: family-pinned probes write and read back through the EEADR/EEDATA/EECON1/EECON2 window on all three families (p18f4550 differential arbitrated as an SDCC inttoptr limitation) |
 
 ### PIC14 (SDCC "pic14" port): epic-cc gaps
@@ -138,7 +140,7 @@ and epic-cc's tree. Items marked **verify** are ones where the corpus
 | Unions | ✅ | ✅ | verified: `unions` probe passes, locals included (#300) |
 | 64-bit | ❌ (manual 3.1.3: "pic14: there is no support for 64 bit integer types") | ❌ | no gap |
 | math.h | ✅ (`libm.lib`, manual 4.9.8.1) | ❌ | library work |
-| Enhanced core (16F193x) | experimental (`libsdcce`) | in progress | the PIC14E sub-epic |
+| Enhanced core (16F193x) | experimental (`libsdcce`) | ✅ | port landed: P3 pointers/arrays/structs (#272), P4 const in flash (#278), P5 interrupts (#283), P6 32-bit long and mul/div (#284), P7 soft-float (#297), differential parity on 16F1938 (#302). What remains on that core is this same parity surface, tracked by the PIC14E sub-epic. |
 
 PIC18-table rows not listed here (recursion/reentrancy, malloc,
 code/eeprom pointers, two-vector interrupts, `__shadowregs`/`__wparam`,
@@ -150,14 +152,15 @@ does (bit-fields, unions) they're already tracked above.
 
 SDCC: experimental support (16F193x, 12F1822, separate `libsdcce`;
 auto-selects the `libsdcc` variant but not `libm`, per manual 4.9.8.1 —
-matters if the PIC14E corpus needs math.h). epic-cc: the port is **in
-progress** (docs/33, issue #228). P1 (asm encoder + sim core) and P2
-(integer spine + BSR/MOVLB banking) have landed; P3 (pointers/arrays/
+matters if the PIC14E corpus needs math.h). epic-cc: the port has
+landed (docs/33, issue #228): P1 (asm encoder + sim core) and P2
+(integer spine + BSR/MOVLB banking) first, then P3 (pointers/arrays/
 structs, #272), P4 (const in flash, #278), P5 (interrupts, #283), P6
-(32-bit long and mul/div, #284), P7 (soft-float, #297) and P8 (fuzz
-in #302. The port is done; what remains is the SDCC parity surface on that core. The
-comparison device for this sub-epic is **16F1938** (matches epic-cc's
-existing PIC14E device TOMLs and test fixtures).
+(32-bit long and mul/div, #284), P7 (soft-float, #297), and
+differential parity on 16F1938 (#302). What remains is the SDCC parity
+surface on that core. The comparison device for this sub-epic is
+**16F1938** (matches epic-cc's existing PIC14E device TOMLs and test
+fixtures).
 
 ## 4. The oracle infrastructure (P0)
 
