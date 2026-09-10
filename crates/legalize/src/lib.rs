@@ -1549,6 +1549,8 @@ fn isr_context_for(
 /// context (and the compatibility single-vector mode) keeps the
 /// historical `_isr`; the high context, which can preempt the low one
 /// mid-call, gets `_isr_high` so its frames never overlap the low's.
+const LO_SUFFIX: &str = "_isr";
+const HI_SUFFIX: &str = "_isr_high";
 fn duplicate_isr_shared(m: Module) -> Module {
     // Partition ISR roots by priority: 1 = high, anything else ISR =
     // low (priority 0 is the compatibility single-vector mode).
