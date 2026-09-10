@@ -15,6 +15,7 @@ gimli = { version = "0.31", features = ["read"] }
 object = { version = "0.36", default-features = false, features = ["read_core", "write_core", "elf", "std"] }
 alloc = { path = "../alloc" }
 isel = { path = "../isel" }
+isel-pic-baseline = { path = "../isel-pic-baseline" }
 isel-pic14e = { path = "../isel-pic14e" }
 isel-pic18 = { path = "../isel-pic18" }
 banking = { path = "../banking" }

@@ -68,13 +68,6 @@ fn main() {
         );
         std::process::exit(1);
     });
-    if device.core == device::Core::PicBaseline {
-        eprintln!(
-            "epic-cc: device {} has core pic-baseline which has no backend yet (need isel-pic-baseline)",
-            device.name
-        );
-        std::process::exit(1);
-    }
 
     let exe_dir = std::env::current_exe()
         .ok()
@@ -333,10 +326,7 @@ fn main() {
             isel_pic18::select_with_locs(device, &m, &addrs, layout.isr_low_save)
         }
         device::Core::Pic14e => isel_pic14e::select_with_locs(device, &m, &addrs),
-        device::Core::PicBaseline => panic!(
-            "driver: {} is pic-baseline; backend lands in P2 (docs/37)",
-            device.name
-        ),
+        device::Core::PicBaseline => isel_pic_baseline::select_with_locs(device, &m, &addrs),
     };
 
     let asm = match device.core {
@@ -372,10 +362,10 @@ fn main() {
             asm
         }
         device::Core::Pic18 => asm,
-        device::Core::PicBaseline => panic!(
-            "driver: {} is pic-baseline; backend lands in P2 (docs/37)",
-            device.name
-        ),
+        // Baseline routes straight from isel to asm (no schedule, banking,
+        // or peephole): the D-2 FSR bank-bit reassertion lives inside
+        // isel-pic-baseline (docs/37), and there is no PCLATH paging.
+        device::Core::PicBaseline => asm,
     };
 
     if cli.emit == cli::Emit::Asm {

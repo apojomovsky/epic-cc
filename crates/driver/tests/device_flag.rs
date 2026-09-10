@@ -310,11 +310,11 @@ void main(void) { }
 }
 
 #[test]
-fn device_flag_refuses_pic_baseline_at_the_firewall() {
-    // P0 of the baseline port ships the device TOML behind the driver
-    // firewall (epic-cc#323): exit 1 with the same "no backend yet"
-    // message shape the pic14e core refused with before its P2.
-    let out = tmp_hex("p12f509-firewall");
+fn device_flag_p12f509_produces_pic_baseline_hex() {
+    // P2 of the baseline port wires the third backend arm (epic-cc#325):
+    // add.c compiles for p12f509 and the HEX is non-empty. The sim
+    // execution is covered by the isel-pic-baseline e2e tests.
+    let out = tmp_hex("p12f509");
     let fixture = fixture_add();
     let res = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
@@ -327,13 +327,11 @@ fn device_flag_refuses_pic_baseline_at_the_firewall() {
         .output()
         .expect("run driver");
     assert!(
-        !res.status.success(),
-        "driver must refuse pic-baseline, not compile"
-    );
-    assert!(
-        String::from_utf8_lossy(&res.stderr).contains("no backend yet"),
-        "expected the firewall message: {}",
+        res.status.success(),
+        "driver --device p12f509 failed: {}",
         String::from_utf8_lossy(&res.stderr)
     );
+    let hex = std::fs::read_to_string(&out).expect("read hex");
+    assert!(!hex.trim().is_empty(), "p12f509 hex must be non-empty");
     let _ = std::fs::remove_file(&out);
 }

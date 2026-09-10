@@ -37,10 +37,15 @@ pub fn resolve_fosc_hz(device: &Device, spec: &str) -> u64 {
     match device.core {
         Core::Pic14 | Core::Pic14e => pic14_hz(&device.config, &fuse, xtal),
         Core::Pic18 => pic18_hz(&device.config, &fuse, xtal),
-        Core::PicBaseline => panic!(
-            "fosc: {} is pic-baseline; its oscillator tree lands with the backend (docs/37)",
-            device.name
-        ),
+        Core::PicBaseline => {
+            // Baseline: intosc is the fixed 4 MHz internal RC oscillator
+            // (DS41236E 7.2.5); lp/xt/extrc need the board's crystal.
+            let osc = named(&device.config, &fuse, "osc");
+            match osc.as_str() {
+                "intosc" => 4_000_000,
+                _ => xtal.unwrap_or_else(|| panic!("epic-cc: xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} (DS41236E: Fosc is the crystal or the declared RC frequency)")),
+            }
+        }
     }
 }
 

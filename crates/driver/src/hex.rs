@@ -39,10 +39,22 @@ pub fn emit(device: &Device, program_words: &[u16], config_bytes: Option<&[u8]>)
                 (device.config.base_byte_addr, &config_words),
             ])
         }
-        (Core::PicBaseline, _) => panic!(
-            "hex: {} is pic-baseline; baseline hex emission lands with the backend (docs/37)",
-            device.name
-        ),
+        // Baseline: the config word sits past the flash ceiling (word 0xFFF
+        // on the 509, base byte 0x1FFE), so it goes through `to_hex_regions`
+        // like PIC14E/PIC18; without config the image is the program alone.
+        (Core::PicBaseline, Some(cb)) => {
+            let mut config_words = Vec::new();
+            for chunk in cb.chunks(2) {
+                let lo = chunk[0] as u16;
+                let hi = if chunk.len() > 1 { chunk[1] as u16 } else { 0 };
+                config_words.push(lo | (hi << 8));
+            }
+            asm::to_hex_regions(&[
+                (0, program_words),
+                (device.config.base_byte_addr, &config_words),
+            ])
+        }
+        (Core::PicBaseline, None) => asm::to_hex(program_words),
         _ => asm::to_hex(program_words),
     }
 }

@@ -104,8 +104,10 @@ pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -
 /// The fixed bytes isel reserves outside the overlay: PIC14's common-RAM
 /// scratch (1) + retval (4), plus the ISR save area (9) when the program
 /// has an ISR. PIC18's access-bank retval/flag region (4), plus the ISR
-/// save area (12) when the program has an ISR. These are isel's layout
-/// constants (crates/isel/src/lib.rs, crates/isel-pic18/src/lib.rs).
+/// save area (12) when the program has an ISR. Baseline's common-RAM
+/// scratch (1) + retval (4) + tmp/tmp2 staging (2), no ISR. These are
+/// isel's layout constants (crates/isel/src/lib.rs,
+/// crates/isel-pic18/src/lib.rs, crates/isel-pic-baseline/src/lib.rs).
 pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
     match device.core {
         device::Core::Pic14 | device::Core::Pic14e => {
@@ -127,10 +129,10 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
             }
         }
         device::Core::PicBaseline => {
-            panic!(
-                "report: {} is pic-baseline; no baseline size model yet (docs/37)",
-                device.name
-            )
+            // Baseline reserves scratch (1) + retval (4) + tmp/tmp2 (2) in
+            // common RAM; no ISR save area (the core has no interrupts).
+            let _ = has_isr;
+            1 + 4 + 2
         }
     }
 }
@@ -153,10 +155,10 @@ pub fn fixed_total(device: &Device) -> u16 {
             hi - lo + 1
         }
         device::Core::PicBaseline => {
-            panic!(
-                "report: {} is pic-baseline; no baseline size model yet (docs/37)",
-                device.name
-            )
+            let (lo, hi) = device
+                .common_ram
+                .expect("baseline devices have a common-RAM region");
+            hi - lo + 1
         }
     }
 }
@@ -193,10 +195,7 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         device::Core::Pic14 => "common",
         device::Core::Pic18 => "fixed",
         device::Core::Pic14e => "fixed",
-        device::Core::PicBaseline => panic!(
-            "report: {} is pic-baseline; no baseline size model yet (docs/37)",
-            device.name
-        ),
+        device::Core::PicBaseline => "common",
     };
     out.push_str(&format!(
         "    {fixed_name}: {fixed}/{fixed_total} bytes (fixed scratch/retval/ISR save)\n"

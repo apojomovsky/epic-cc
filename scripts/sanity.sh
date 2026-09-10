@@ -22,10 +22,9 @@ echo "--- sanity $DEVICE: add.c -> HEX + gpasm ---"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Compile add.c to HEX and to ASM for this device. pic-baseline has no
-# backend yet (docs/37 P1 wires the encoder), so the driver refuses it by
-# design; the refusal is the check for that core, and the gpasm drill
-# below still proves the part name.
+# Compile add.c to HEX and to ASM for this device. P2 wires the baseline
+# backend (epic-cc#325), so p12f509 compiles like every other device; a
+# compile failure is a real failure now.
 if cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.hex" 2>"$TMP/driver.err"; then
   cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add.c -o "$TMP/out.asm" --emit asm
   if [ ! -s "$TMP/out.hex" ]; then
@@ -37,12 +36,9 @@ if cargo run -q -p driver -- --target "$DEVICE" crates/driver/tests/fixtures/add
     exit 1
   fi
 else
-  if ! grep -q "no backend yet" "$TMP/driver.err"; then
-    echo "sanity $DEVICE: driver failed unexpectedly:" >&2
-    cat "$TMP/driver.err" >&2
-    exit 1
-  fi
-  echo "sanity $DEVICE: driver refuses pic-baseline (no backend yet), as expected"
+  echo "sanity $DEVICE: driver failed unexpectedly:" >&2
+  cat "$TMP/driver.err" >&2
+  exit 1
 fi
 
 # gpasm cross-check: the driver ASM uses PAGE()/BANKSEL pseudo-ops that

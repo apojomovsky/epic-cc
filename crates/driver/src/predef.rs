@@ -33,9 +33,7 @@ pub fn xc8_predefines(core: device::Core, device_name: &str) -> Vec<String> {
             defs.push("_PIC14E".into());
         }
         device::Core::Pic18 => defs.push("_PIC18".into()),
-        device::Core::PicBaseline => {
-            panic!("predef: no XC8 define set for pic-baseline; backend lands in docs/37 P2")
-        }
+        device::Core::PicBaseline => defs.push("_PIC12".into()),
     }
     let part = device_name
         .strip_prefix('p')
@@ -92,6 +90,13 @@ mod tests {
                 "_PIC14",
                 "_16F877A"
             ]
+        );
+    }
+    #[test]
+    fn baseline_names_the_core_and_part() {
+        assert_eq!(
+            xc8_predefines(device::Core::PicBaseline, "p12f509"),
+            vec!["__XC", "__XC8", "__wparam=", "_PIC12", "_12F509"]
         );
     }
 }
