@@ -5294,16 +5294,10 @@ pub fn select_with_locs(
                     // Z/N come back intact; only the final W restore via
                     // MOVF sets Z/N from the moved value (the one accepted
                     // flag loss, same as PIC14's W-last convention).
-                    //
-                    // Restore ORDER is load-bearing in the fixed block: its
-                    // SFR snapshot slots (0x001-0x007) overlap the retval
-                    // backup's addresses (the prologue aliases them by
-                    // design), so the SFRs must come off the block BEFORE
-                    // the retval backup writes 0x000-0x003 - otherwise
-                    // STATUS is reloaded from retval byte 1 and a mid-loop
-                    // resume takes wrong branches. The low ISR's area is
-                    // disjoint (no aliasing); it keeps the same SFR-first
-                    // order for symmetry.
+                    // Both areas are non-aliased (the fixed block's slots
+                    // moved out of retval's 0x000-0x003, epic-cc#357), so
+                    // restore order is convention: SFRs first, retval
+                    // backup second, W last.
                     let low_save = priority_mode && f.irq_priority != 1;
                     if low_save {
                         let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
