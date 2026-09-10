@@ -92,11 +92,19 @@ pub fn tier2() -> Vec<CorpusProgram> {
             "volatile unsigned char in;\nvolatile unsigned char out;\nvoid main(void) {\n    in = 2;\n    double a = 1.5;\n    double b = (double)in;\n    double c = a * b;\n    out = (unsigned char)((unsigned int)c & 0xFF);\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
-        // malloc: a raw pointer round trip through fixed SRAM: 0x5A
-        prog(
+        // malloc: two blocks from the libc heap, written through both,
+        // one freed, a third allocated, observable bytes folded:
+        // b[0]^b[3]^c[0]^c[2]^0x7F = 0x33^0x44^0x55^0x66^0x7F = 0x3B.
+        // The heap array is BSS the program registers with _initHeap
+        // (SDCC pic16's model: the app provides the arena); _MALLOC_SPEC
+        // is SDCC's space qualifier, empty on epic-cc (malloc_h.rs).
+        // PIC18-only: SDCC's pic14 port has no <malloc.h>, so no shared
+        // source can exercise malloc there (epic-cc#343).
+        prog_for(
+            &["p18f4550"],
             "malloc",
-            0x5A,
-            "volatile unsigned char out;\nvoid main(void) {\n    unsigned char *p = (unsigned char *)0x20;\n    *p = 0x5A;\n    out = *p;\n    __asm__(\"sleep\");\n}\n",
+            0x3B,
+            "#include <malloc.h>\nunsigned char heap[64];\nvolatile unsigned char out;\nvoid main(void) {\n    unsigned char _MALLOC_SPEC *a;\n    unsigned char _MALLOC_SPEC *b;\n    _initHeap(heap, sizeof heap);\n    a = malloc(4);\n    b = malloc(4);\n    a[0] = 0x11;\n    a[3] = 0x22;\n    b[0] = 0x33;\n    b[3] = 0x44;\n    free(a);\n    {\n        unsigned char _MALLOC_SPEC *c;\n        c = malloc(3);\n        if (b == 0 || c == 0) {\n            out = 0x00;\n        } else {\n            c[0] = 0x55;\n            c[2] = 0x66;\n            out = (unsigned char)(b[0] ^ b[3] ^ c[0] ^ c[2] ^ 0x7F);\n        }\n    }\n    __asm__(\"sleep\");\n}\n",
             &["out"],
         ),
         // math: x = 0x2A -> (x*3 + 7) & 0xFF = 0x85

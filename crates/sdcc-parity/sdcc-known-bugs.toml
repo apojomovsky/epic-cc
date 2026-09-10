@@ -8,15 +8,6 @@
 # our simulator, so the wrong side is the oracle, not the harness.
 
 [[bug]]
-device = "p18f4550"
-program = "malloc"
-# *p = 0x5A through a raw pointer: epic-cc stores and reads back 0x5A.
-# SDCC's pic16 backend treats `unsigned char *` as a generic pointer and
-# its dereference path lands elsewhere (0xF6). gpsim agrees with our sim.
-sdcc_observed = 0xF6
-expected = 0x5A
-
-[[bug]]
 device = "p16f877a"
 program = "fnptr"
 # add1(9) via a function pointer: epic-cc computes 0xA. SDCC's pic14

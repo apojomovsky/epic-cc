@@ -37,11 +37,9 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | i64 | p18f4550 | 16 | 106 | 7 | 18 | 10 | 6216 | PASS |
 | i64 | p16f1938 | - | - | - | - | - | - | SDCC-LIMIT (error 206: no 64-bit on pic14; epic computes 0x9A) |
 | double | p16f877a | 648 | 2506 | 14 | 54 | 1093 | 8748 | PASS |
-| double | p18f4550 | 728 | 1409 | 18 | 43 | 1057 | 8080 | PASS |
+| double | p18f4550 | 727 | 1409 | 18 | 43 | 1056 | 8080 | PASS |
 | double | p16f1938 | 644 | 1947 | 14 | 53 | 1089 | 6670 | PASS |
-| malloc | p16f877a | 13 | 260 | 1 | 13 | 11 | 354 | PASS |
-| malloc | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x5A sdcc=0xF6; SDCC generic-pointer dereference, gpsim-confirmed) |
-| malloc | p16f1938 | 12 | 220 | 1 | 14 | 10 | 311 | PASS |
+| malloc | p18f4550 | 654 | 736 | 29 | 36 | 1721 | 6745 | PASS |
 | math | p16f877a | 57 | 557 | 10 | 26 | 119 | 1006 | PASS |
 | math | p18f4550 | 29 | 112 | 11 | 19 | 19 | 6222 | PASS |
 | math | p16f1938 | 56 | 433 | 10 | 29 | 118 | 791 | PASS |
@@ -61,8 +59,8 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | constptr | p18f4550 | 71 | 216 | 10 | 22 | 58 | 6269 | PASS |
 | constptr | p16f1938 | 48 | 246 | 7 | 22 | 46 | 338 | PASS |
 
-aggregate over 28 comparable rows: flash ratio 0.167, RAM ratio 0.317,
-cycle ratio 0.034 (epic-cc/SDCC, geometric mean).
+aggregate over 27 comparable rows: flash ratio 0.193, RAM ratio 0.366,
+cycle ratio 0.037 (epic-cc/SDCC, geometric mean).
 
 ## Findings
 
@@ -87,10 +85,10 @@ cycle ratio 0.034 (epic-cc/SDCC, geometric mean).
   way), and resolved virtual-register operands twice in d=1
 - **Genuine SDCC bugs remain arbitrated** in `sdcc-known-bugs.toml`,
   each verified under gpsim as well as our sim: SDCC's PIC18
-  generic-pointer dereference (malloc, and now the eeprom-p18 probe in
-  the same defect class), its PIC14-family computed-call
-  bug (fnptr), and its PIC14-family static-overlay recursion corruption
-  (recursion, the manual-documented no-hardware-stack limitation).
+  generic-pointer dereference (the eeprom-p18 probe), its
+  PIC14-family computed-call bug (fnptr), and its PIC14-family
+  static-overlay recursion corruption (recursion, the
+  manual-documented no-hardware-stack limitation).
 - **Real surface probes replaced three placeholders.** `printf-f` now
   formats 3.5 through `printf` into a buffer and folds the first six
   bytes (epic-cc prints 2 fixed decimals, SDCC's `%f` prints 6; the
@@ -111,6 +109,6 @@ cycle ratio 0.034 (epic-cc/SDCC, geometric mean).
   device's allocatable RAM as a motion barrier, so no reorder in
   either phase can cross an SFR touch; regression tests pin it.
 - **epic-cc leads on all three axes** across the comparable corpus:
-  geometric-mean flash ratio 0.167, RAM ratio 0.317, cycle ratio
-  0.034. The double probe (soft-float) is the heaviest row and still
+  geometric-mean flash ratio 0.193, RAM ratio 0.366, cycle ratio
+  0.037. The double probe (soft-float) is the heaviest row and still
   under SDCC everywhere it runs.
