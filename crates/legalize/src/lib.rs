@@ -131,8 +131,9 @@ pub fn legalize(m: Module) -> Module {
     }
     for name in &isr_used {
         let base = name
-            .strip_suffix("_isr")
-            .expect("legalize: isr routine name must end in _isr");
+            .strip_suffix("_isr_high")
+            .or_else(|| name.strip_suffix("_isr"))
+            .expect("legalize: isr routine name must end in _isr or _isr_high");
         let mut f = routine_func(base);
         f.name = name.clone();
         funcs.push(f);
@@ -1613,11 +1614,11 @@ fn duplicate_isr_shared(m: Module) -> Module {
     // disjoint-region guarantee. Panic loudly rather than miscompile.
     assert!(
         !lo_ctx.contains("main"),
-        "isel/legalize: the low-ISR context must not reach main — re-entrant main is unsupported"
+        "isel/legalize: the low-ISR context must not reach main; re-entrant main is unsupported"
     );
     assert!(
         !hi_ctx.contains("main"),
-        "isel/legalize: the high-ISR context must not reach main — re-entrant main is unsupported"
+        "isel/legalize: the high-ISR context must not reach main; re-entrant main is unsupported"
     );
     // A helper shared with (reachable from) another live context needs
     // that context's own copy: the high ISR can preempt the low one

@@ -5,16 +5,18 @@
 //! simulator with nested fires.
 //!
 //! Acceptance: `ticks == 2`, `pkts == 2`, `main_ctr == 3`,
-//! `hi_saw_lo == 1`, halted.
+//! `hi_saw_lo == 1`, `mres == 235`, `hres == 42`, `lres == 72`, halted.
 //!
 //! The injection is deterministic, not pc-pinned: run main until
 //! `main_ctr == 1`, fire low, then step until `lo_flag == 1` and fire
 //! high. The high fire lands between the low handler's `lo_flag = 1` and
 //! `lo_flag = 0` stores by construction (the sim is single-stepped), so
-//! `hi_saw_lo == 1` proves the high ISR ran while the low one was live —
-//! nesting, not sequential service. The multi-call bodies (`ticks == 2`
+//! `hi_saw_lo == 1` proves the high ISR ran while the low one was live
+//! (nesting, not sequential service). The multi-call bodies (`ticks == 2`
 //! through two `bump` calls under preemption) prove the three frame
-//! regions are disjoint: any clobber would corrupt a counter.
+//! regions are disjoint: any clobber would corrupt a counter. The three
+//! multiplies (one per context, through per-context `__mul_u8` copies)
+//! prove the runtime-routine duplication covers the high copy too.
 use std::process::Command;
 
 fn priority_layout() -> alloc::AllocLayout {
@@ -51,6 +53,7 @@ fn priority_interrupts_nest_with_disjoint_frames() {
         addr("lo_flag"),
         addr("hi_saw_lo"),
     );
+    let (mres, hres, lres) = (addr("mres"), addr("hres"), addr("lres"));
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
@@ -93,13 +96,18 @@ fn priority_interrupts_nest_with_disjoint_frames() {
         assert!(steps < 10_000, "low ISR never raised its flag");
     }
     p.fire_interrupt();
-    assert_eq!(p.pc(), 0x0008, "high ISR preempts at vector 0x0008");
-
-    // Both handlers drain, main completes, `__start` sleeps.
+    // Both handlers drain, main completes, `__start` sleeps. Halted comes
+    // first: values are only meaningful on a completed run.
     p.run(500_000);
+    assert!(p.halted(), "run did not halt (pc = {:#X})", p.pc());
     assert_eq!(p.ram()[ticks], 2, "high body: 0 -> bump -> bump = 2");
     assert_eq!(p.ram()[pkts], 2, "low body survived preemption: 2");
     assert_eq!(p.ram()[main_ctr], 3, "main's state survived both ISRs");
+    // Every context multiplied through its own `__mul_u8` copy under
+    // preemption: 47*5, 6*7, 8*9.
+    assert_eq!(p.ram()[mres], 235, "main's multiply survived both ISRs");
+    assert_eq!(p.ram()[hres], 42, "high copy multiplied while low was live");
+    assert_eq!(p.ram()[lres], 72, "low copy survived high preemption");
     assert_eq!(
         p.ram()[hi_saw_lo],
         1,

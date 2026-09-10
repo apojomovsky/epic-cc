@@ -1532,3 +1532,43 @@ fn duplicate_high_isrs_panic_loudly() {
     );
     let _ = legalize(m);
 }
+
+/// A runtime routine shared with the high context gets an `_isr_high`
+/// copy (injected by base name, not by a single-suffix strip): main and
+/// the high ISR multiplying means `__mul_u8` plus `__mul_u8_isr_high`,
+/// each context calling its own.
+#[test]
+fn duplicates_shared_runtime_routines_for_the_high_isr() {
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = load i8 @a\n\
+             %y = load i8 @b\n\
+             %p = mul i8 %x, %y\n\
+             store i8 %p @out\n\
+             ret void\n\
+         fn hi(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             %u = load i8 @a\n\
+             %v = load i8 @b\n\
+             %q = mul i8 %u, %v\n\
+             store i8 %q @out\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(
+        names.contains(&"__mul_u8"),
+        "main's routine must remain: {names:?}"
+    );
+    assert!(
+        names.contains(&"__mul_u8_isr_high"),
+        "the high ISR needs its own routine copy: {names:?}"
+    );
+    assert_eq!(call_targets(func("hi", &m2)), ["__mul_u8_isr_high"]);
+    assert_eq!(call_targets(func("main", &m2)), ["__mul_u8"]);
+    assert!(!func("__mul_u8_isr_high", &m2).isr);
+}

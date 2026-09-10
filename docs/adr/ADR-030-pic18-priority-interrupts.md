@@ -1,4 +1,4 @@
-# ADR-029 -- PIC18 two-vector priority interrupts
+# ADR-030 -- PIC18 two-vector priority interrupts
 
 **Status:** Accepted 2026-09-09<br>
 **Decides:** `epic-cc#346` (PIC18 priority interrupts)<br>
@@ -57,7 +57,7 @@ the sim rather than by inspection.
 ## Rejected alternatives
 
 * Duplicating into the existing single ISR region: the high ISR's frames
-  would overlay the low ISR's live frames — the exact clobber this
+  would overlay the low ISR's live frames, the exact clobber this
   feature exists to prevent.
 * Fixing the fixed block's FSR0H/W overlap in passing: a 2-line change,
   but it moves compat codegen bytes under a recorded SDCC-parity

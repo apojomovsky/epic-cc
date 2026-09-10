@@ -1202,9 +1202,9 @@ fn indirect_call_target_stays_live_through_the_call() {
 
 /// Priority regions (epic-cc#346): a post-legalize module with main, a
 /// high ISR and a low ISR (each with one local, each calling its own
-/// helper copy) allocates three disjoint frame regions — main below the
-/// low save area, low frames above it, high frames above the low context
-/// — and reports the low save area base.
+/// helper copy) allocates three disjoint frame regions (main below the
+/// low save area, low frames above it, high frames above the low
+/// context) and reports the low save area base.
 #[test]
 fn priority_regions_are_disjoint_with_low_save() {
     let m = parse(

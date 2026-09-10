@@ -8,13 +8,25 @@
 //     computed correctly under preemption (disjoint frames),
 //   - `main_ctr == 3` proves main's state survived both save/restores.
 // All three contexts call `bump`, so legalize emits `bump`, `bump_isr`
-// and `bump_isr_high`; `bump()` is add-only (no mul/div), so the ISRs
-// stay clear of the runtime routines' scratch.
+// and `bump_isr_high`. All three contexts also multiply volatile
+// operands, so `__mul_u8` plus both ISR copies engage the
+// injection/recipe paths for the high copy too.
 volatile unsigned char ticks;
 volatile unsigned char pkts;
 volatile unsigned char main_ctr;
 volatile unsigned char lo_flag;
 volatile unsigned char hi_saw_lo;
+// Multiply operands/results per context (volatile, so every multiply is
+// a runtime `mul i8`, engaging `__mul_u8` plus both ISR copies).
+volatile unsigned char m_a;
+volatile unsigned char m_b;
+volatile unsigned char mres;
+volatile unsigned char h_a;
+volatile unsigned char h_b;
+volatile unsigned char hres;
+volatile unsigned char l_a;
+volatile unsigned char l_b;
+volatile unsigned char lres;
 
 __attribute__((noinline)) unsigned char bump(unsigned char x) { return (unsigned char)(x + 1); }
 
@@ -22,6 +34,7 @@ __interrupt(1) void hi_isr(void) {
     unsigned char a = ticks;
     unsigned char b = bump(a);
     ticks = bump(b);
+    hres = (unsigned char)(h_a * h_b);
     hi_saw_lo = lo_flag;
 }
 
@@ -31,6 +44,7 @@ __interrupt(2) void lo_isr(void) {
     unsigned char b = bump(a);
     unsigned char c = bump(b);
     pkts = c;
+    lres = (unsigned char)(l_a * l_b);
     lo_flag = 0;
 }
 
@@ -40,7 +54,14 @@ void main(void) {
     main_ctr = 0;
     lo_flag = 0;
     hi_saw_lo = 0;
+    m_a = 47;
+    m_b = 5;
+    h_a = 6;
+    h_b = 7;
+    l_a = 8;
+    l_b = 9;
     while (main_ctr < 3) {
         main_ctr = bump(main_ctr);
     }
+    mres = (unsigned char)(m_a * m_b);
 }

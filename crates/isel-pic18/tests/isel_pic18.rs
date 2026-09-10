@@ -2289,7 +2289,10 @@ fn priority_pair_emits_both_vectors_and_save_areas() {
          fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let asm = select(&PIC18F4550, &m, &addrs(&[]), Some(0x030));
+    // A banked save area (0x120, above the access window): W goes
+    // through an explicit bank select, not `,A` (which would resolve
+    // into the SFR page).
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), Some(0x120));
     assert!(
         asm.contains("org 0x0008") && asm.contains("goto hi"),
         "high stub at vector 0x0008:\n{asm}"
@@ -2303,19 +2306,18 @@ fn priority_pair_emits_both_vectors_and_save_areas() {
         asm.contains("MOVWF 0x0004,A"),
         "high ISR saves W to the fixed block:\n{asm}"
     );
-    // ...while the low ISR saves W to its own area base (0x030) and its
-    // retval snapshot above it (0x038).
+    // ...while the low ISR selects the save bank and addresses W banked.
     assert!(
-        asm.contains("MOVWF 0x030,A"),
-        "low ISR saves W to its own area:\n{asm}"
+        asm.contains("MOVLB 0x1") && asm.contains("MOVWF 0x120,B"),
+        "low ISR saves W banked:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0x000, 0x038"),
+        asm.contains("MOVFF 0x000, 0x128"),
         "low ISR snapshots retval into its own area:\n{asm}"
     );
     assert!(
-        asm.contains("MOVF 0x030, W, A"),
-        "low ISR restores W from its own area:\n{asm}"
+        asm.contains("MOVF 0x120, W, B"),
+        "low ISR restores W banked:\n{asm}"
     );
     assert_eq!(
         asm.matches("RETFIE").count(),
@@ -2324,7 +2326,6 @@ fn priority_pair_emits_both_vectors_and_save_areas() {
     );
 }
 
-/// The save area must agree with alloc's layout: a priority pair without
 /// one (or a lone ISR with one) is an inconsistent pipeline, not a silent
 /// miscompile.
 #[test]

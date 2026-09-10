@@ -4671,7 +4671,10 @@ impl<'m> Gen<'m> {
     fn emit_routine(&mut self) {
         let name = self.cur_func;
         let scr = self.slot_addr(name, "__scr").direct();
-        let recipe = name.strip_suffix("_isr").unwrap_or(name);
+        let recipe = name
+            .strip_suffix("_isr_high")
+            .or_else(|| name.strip_suffix("_isr"))
+            .unwrap_or(name);
         if !ir::is_runtime_routine(name) {
             panic!("isel-pic18: @{name} is not a runtime routine");
         }
@@ -5257,7 +5260,14 @@ pub fn select_with_locs(
                 }
                 if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
-                    g.emit(format!("    MOVWF 0x{s:03X},A")); // W, last
+                    // The save area can sit in banked RAM (above the
+                    // access-bank window): select its bank explicitly
+                    // (`operand()`'s idiom) and keep `bsr` honest so the
+                    // body needs no re-select. MOVFF cannot read W.
+                    let bank = (s >> 8) as u8;
+                    g.emit(format!("    MOVLB 0x{bank:X}"));
+                    g.bsr = Some(bank);
+                    g.emit(format!("    MOVWF 0x{s:03X},B")); // W, last
                 } else {
                     g.emit("    MOVWF 0x0004,A".to_string()); // W, last
                 }
@@ -5389,7 +5399,14 @@ pub fn select_with_locs(
                     }
                     if low_save {
                         let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
-                        g.emit(format!("    MOVF 0x{s:03X}, W, A")); // W last
+                        // Banked save area: same explicit select as the
+                        // prologue (the body's last bank is tracked in
+                        // `bsr`, so this re-select is required, not
+                        // redundant).
+                        let bank = (s >> 8) as u8;
+                        g.emit(format!("    MOVLB 0x{bank:X}"));
+                        g.bsr = Some(bank);
+                        g.emit(format!("    MOVF 0x{s:03X}, W, B")); // W last
                     } else {
                         g.emit("    MOVF 0x0004, W, A".to_string()); // W last
                     }
