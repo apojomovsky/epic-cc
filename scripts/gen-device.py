@@ -599,12 +599,16 @@ def parse_edc(edc_path: pathlib.Path):
             cfg.append((int(b, 0), int(e, 0)))
     if cfg:
         out["config_sectors"] = cfg
-        # DCRDef/DCRFieldDef give real per-byte fields; only the first
-        # ConfigFuseSector needs it; a device with more than one would be
-        # a new fact to name, not silently ignore.
-        dcr = parse_edc_dcr_fields(next(root.iter(ns + "ConfigFuseSector")), ns)
-        if dcr is not None:
-            out["config_dcr"] = dcr
+        # The DCR walk's covered==impl check verifies cursor math for its
+        # only consumer, the pic18 path (`dcr_result` below). Other cores
+        # read config from cfgdata, so parsing DCR for them validates data
+        # nobody consumes: baseline PIC10F EDC states impl 0x1c against its
+        # own fields and cfgdata agreeing on 0x1d (epic-cc#338), which the
+        # ungated walk turned into a hard failure for a discarded fact.
+        if out.get("core") == "pic18":
+            dcr = parse_edc_dcr_fields(next(root.iter(ns + "ConfigFuseSector")), ns)
+            if dcr is not None:
+                out["config_dcr"] = dcr
     # EDC endaddr is exclusive. A GPR sector that another sector shadows is
     # the bank-independent window; the shadows are mirrors, not extra storage.
     # PIC18 states the same low window twice more, once per instruction-set
@@ -625,6 +629,8 @@ def parse_edc(edc_path: pathlib.Path):
     sectors = []
     shadowed = set()
     access = []
+    gpr_banks = []
+    gpr_banks_known = True
     for gs in root.iter(ns + "GPRDataSector"):
         if mode_ancestor(gs) == "ExtendedModeOnly":
             continue
@@ -640,6 +646,11 @@ def parse_edc(edc_path: pathlib.Path):
             shadowed.add(ref)
             continue
         sectors.append((int(b, 0), int(e, 0) - 1, gs.get(ns + "regionid")))
+        bank = gs.get(ns + "bank")
+        if bank is None:
+            gpr_banks_known = False
+        else:
+            gpr_banks.append(int(bank, 0))
     if access:
         merged_access = merge_contiguous(access)
         if len(merged_access) != 1:
@@ -661,6 +672,10 @@ def parse_edc(edc_path: pathlib.Path):
         common = sorted((lo, hi) for lo, hi, rid in sectors if rid in shadowed)
         if common:
             out["common_ram"] = common[0]
+    # Distinct GPR bank numbers, the baseline fsr_bank_bits source in
+    # generate_toml. None when a surviving sector omits the attribute,
+    # so a partial set never poses as the full bank map.
+    out["gpr_banks"] = sorted(set(gpr_banks)) if gpr_banks_known else None
     return out
 
 
@@ -738,6 +753,26 @@ def generate_toml(
         if stack_s and re.fullmatch(r"0[xX][0-9a-fA-F]+|\d+", stack_s)
         else None,
     )
+    # Baseline bank selection lives in FSR high bits, a per-part count
+    # the DFP states as GPR bank numbers (docs/37 D-3; reproduces the
+    # 0/1/2 of 508/509/16F505). More than two needs a schema and
+    # backend decision first (build.rs caps pic-baseline at two), so
+    # those parts stay MissingFacts instead of emitting TOMLs the
+    # tree cannot validate. See epic-cc#338.
+    fsr_bank_bits = None
+    if core == "pic-baseline":
+        gpr_banks = edc.get("gpr_banks")
+        if gpr_banks:
+            fsr_bank_bits = max(gpr_banks).bit_length()
+            if fsr_bank_bits > 2:
+                missing.append(
+                    f"fsr_bank_bits needs {fsr_bank_bits} bits for banks "
+                    f"{gpr_banks}, the device schema allows at most 2 for "
+                    f"pic-baseline (core-code decision, see epic-cc#338)"
+                )
+                fsr_bank_bits = None
+        else:
+            missing.append("fsr_bank_bits (EDC GPR bank attributes)")
     cfg_cwords = []
     dcr_result = edc.get("config_dcr") if core == "pic18" else None
     if cfg_path and cfg_path.exists():
@@ -814,6 +849,10 @@ def generate_toml(
         ram_banks = adjusted
     if core == "pic18":
         interrupt_vectors = [0x0008, 0x0018]
+    elif core == "pic-baseline":
+        # No interrupt feature on this core (DS41236E section 7.0):
+        # no vector, no RETFIE. Matches p12f509.toml.
+        interrupt_vectors = []
     else:
         interrupt_vectors = [0x0004]
 
@@ -942,6 +981,8 @@ def generate_toml(
         out_lines.append(
             f"fixed_retval = [0x{fixed_retval[0]:04X}, 0x{fixed_retval[1]:04X}]"
         )
+    if core == "pic-baseline":
+        out_lines.append(f"fsr_bank_bits = {fsr_bank_bits}")
     out_lines.append(f"stack_depth = {stack_depth}")
     vectors_str = ", ".join(f"0x{v:04X}" for v in interrupt_vectors)
     out_lines.append(f"interrupt_vectors = [{vectors_str}]")
