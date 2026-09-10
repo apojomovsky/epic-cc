@@ -42,3 +42,4 @@ atdf/
 # Exception: hand-authored fixtures describing no real silicon, not vendor files.
 !scripts/fixtures/synthetic.atdf
 !scripts/fixtures/synthetic_pic18.atdf
+!scripts/fixtures/sweep-pack/**/*.PIC
