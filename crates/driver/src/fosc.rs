@@ -37,10 +37,7 @@ pub fn resolve_fosc_hz(device: &Device, spec: &str) -> u64 {
     match device.core {
         Core::Pic14 | Core::Pic14e => pic14_hz(&device.config, &fuse, xtal),
         Core::Pic18 => pic18_hz(&device.config, &fuse, xtal),
-        Core::PicBaseline => panic!(
-            "fosc: {} is pic-baseline; its oscillator tree lands with the backend (docs/37)",
-            device.name
-        ),
+        Core::PicBaseline => baseline_hz(&device.config, &fuse, xtal),
     }
 }
 
@@ -88,6 +85,25 @@ fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {
              (DS39582C §14.2: Fosc is the crystal or the declared RC frequency)"
         )
     })
+}
+
+fn baseline_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {
+    // DS41236E §2.0: the 509's internal oscillator is a 4 MHz precision
+    // internal oscillator (INTRC). The `osc` fuse field selects LP/XT/
+    // INTOSC/EXTRC; the internal modes run at 4 MHz, the crystal/RC modes
+    // need the declared xtal_hz (Fosc is the crystal or the RC frequency,
+    // which cannot be derived).
+    let osc = named(region, spec, "osc");
+    if matches!(osc.as_str(), "intosc") {
+        4_000_000
+    } else {
+        xtal.unwrap_or_else(|| {
+            panic!(
+                "epic-cc: xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
+                 (DS41236E §2.0: Fosc is the crystal or the declared RC frequency)"
+            )
+        })
+    }
 }
 
 fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> u64 {

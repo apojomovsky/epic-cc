@@ -34,7 +34,8 @@ pub fn xc8_predefines(core: device::Core, device_name: &str) -> Vec<String> {
         }
         device::Core::Pic18 => defs.push("_PIC18".into()),
         device::Core::PicBaseline => {
-            panic!("predef: no XC8 define set for pic-baseline; backend lands in docs/37 P2")
+            defs.push("_PIC14".into());
+            defs.push("_PIC_BASELINE".into());
         }
     }
     let part = device_name

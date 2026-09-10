@@ -17,6 +17,7 @@ alloc = { path = "../alloc" }
 isel = { path = "../isel" }
 isel-pic14e = { path = "../isel-pic14e" }
 isel-pic18 = { path = "../isel-pic18" }
+isel-pic-baseline = { path = "../isel-pic-baseline" }
 banking = { path = "../banking" }
 schedule = { path = "../schedule" }
 peephole = { path = "../peephole" }

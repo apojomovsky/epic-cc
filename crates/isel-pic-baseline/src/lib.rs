@@ -73,6 +73,12 @@ struct Gen<'m> {
     /// pointer reg lowers the pointer at its use.
     resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
     scratch: u16,
+    /// A second fixed common-RAM temp, dedicated to the ADDLW-replacement
+    /// idioms (baseline has no literal-add op, D-6): `W = W + k` and the
+    /// carry/borrow folds stash W here. Never used elsewhere, so it is
+    /// always free at a fold (the primary `scratch` byte is live across
+    /// cmp accumulation and GEP offsets).
+    scratch2: u16,
     retval_lo: u16,
     cur_func: &'m str,
     /// Module-scoped fresh-label counter, shared across every function so the
@@ -118,6 +124,44 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVF 0x{addr:02X}, W"));
         }
         self.w_holds = Some(addr);
+    }
+
+    /// `W = W + k` without `ADDLW` (baseline has no literal-add op, D-6):
+    /// stash W in the scratch2 byte, load k, `ADDWF scratch2, W` computes
+    /// scratch2 + k. scratch2 is dedicated to these folds, so it is always
+    /// free here.
+    fn emit_add_w_const(&mut self, k: u8) {
+        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit(format!("    MOVLW 0x{k:02X}"));
+        self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch2));
+    }
+
+    /// `W = W + 1` when the carry flag is set (the i16 add carry fold),
+    /// without `ADDLW`. `INCF scratch2, F` sets Z but not C; the caller's
+    /// next op (ADDWF/SUBWF) sets C/Z fresh.
+    fn emit_add_w_carry(&mut self) {
+        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit("    BTFSC STATUS, 0 ; C".to_string());
+        self.emit(format!("    INCF 0x{:02X}, F", self.scratch2));
+        self.emit(format!("    MOVF 0x{:02X}, W", self.scratch2));
+    }
+
+    /// `W = W + 1` when the carry flag is clear (the i16 sub borrow fold).
+    fn emit_add_w_borrow(&mut self) {
+        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit("    BTFSS STATUS, 0 ; C".to_string());
+        self.emit(format!("    INCF 0x{:02X}, F", self.scratch2));
+        self.emit(format!("    MOVF 0x{:02X}, W", self.scratch2));
+    }
+
+    /// `W = W + 1` when the carry flag is set, then `W = W + k` (the i16
+    /// add carry fold plus a constant high byte), without `ADDLW`.
+    fn emit_add_w_carry_const(&mut self, k: u8) {
+        self.emit(format!("    MOVWF 0x{:02X}", self.scratch2));
+        self.emit("    BTFSC STATUS, 0 ; C".to_string());
+        self.emit(format!("    INCF 0x{:02X}, F", self.scratch2));
+        self.emit(format!("    MOVLW 0x{k:02X}"));
+        self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch2));
     }
 
     /// D-2's unconditional `FSR` bank-bit reassertion (docs/37 §2 D-2):
@@ -288,7 +332,7 @@ impl<'m> Gen<'m> {
                             if idx == 0 {
                                 self.emit(format!("    MOVF 0x{sa:02X}, W"));
                                 if k != 0 {
-                                    self.emit(format!("    ADDLW 0x{k:02X}"));
+                                    self.emit_add_w_const(k);
                                 }
                             } else {
                                 self.emit("    MOVLW 0x00".to_string());
@@ -466,8 +510,7 @@ impl<'m> Gen<'m> {
                 ));
                 for i in 1..n {
                     self.emit_load_cmp_byte(b, i, signed, high);
-                    self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                    self.emit("    ADDLW 0x01".to_string());
+                    self.emit_add_w_borrow();
                     let f = if i == high && use_scratch {
                         self.scratch
                     } else {
@@ -731,8 +774,7 @@ impl<'m> Gen<'m> {
                 self.emit_w_store(dst);
                 self.emit_bank_select(bb + 1);
                 self.emit(format!("    MOVF 0x{:02X}, W", bb + 1));
-                self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                self.emit("    ADDLW 0x01".to_string());
+                self.emit_add_w_carry();
                 self.emit_bank_select(ra + 1);
                 self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
                 self.emit_w_store(dst + 1);
@@ -742,13 +784,11 @@ impl<'m> Gen<'m> {
                 let hi = ((k >> 8) & 0xFF) as u8;
                 self.emit_bank_select(ra);
                 self.emit(format!("    MOVF 0x{ra:02X}, W"));
-                self.emit(format!("    ADDLW 0x{lo:02X}"));
+                self.emit_add_w_const(lo);
                 self.emit_w_store(dst);
                 self.emit_bank_select(ra + 1);
                 self.emit(format!("    MOVF 0x{:02X}, W", ra + 1));
-                self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                self.emit("    ADDLW 0x01".to_string());
-                self.emit(format!("    ADDLW 0x{hi:02X}"));
+                self.emit_add_w_carry_const(hi);
                 self.emit_w_store(dst + 1);
             }
             Val::Global(_) => panic!("isel: add16 with a global operand"),
@@ -843,8 +883,7 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    SUBWF 0x{aa:02X}, W"));
                 self.emit_w_store(dst);
                 self.emit(format!("    MOVLW 0x{hi:02X}"));
-                self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit("    ADDLW 0x01".to_string());
+                self.emit_add_w_borrow();
                 self.emit_bank_select(aa + 1);
                 self.emit(format!("    SUBWF 0x{:02X}, W", aa + 1));
                 self.emit_w_store(dst + 1);
@@ -858,8 +897,7 @@ impl<'m> Gen<'m> {
                 self.emit_w_store(dst);
                 self.emit_bank_select(bb + 1);
                 self.emit(format!("    MOVF 0x{:02X}, W", bb + 1));
-                self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit("    ADDLW 0x01".to_string());
+                self.emit_add_w_borrow();
                 self.emit_bank_select(aa + 1);
                 self.emit(format!("    SUBWF 0x{:02X}, W", aa + 1));
                 self.emit_w_store(dst + 1);
@@ -996,13 +1034,13 @@ impl<'m> Gen<'m> {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
                 self.emit_bank_select(a);
                 self.emit(format!("    MOVF 0x{a:02X}, W"));
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
+                self.emit_add_w_const(lit as u8);
                 self.emit("    MOVWF FSR".to_string());
             }
             _ => {
                 self.emit_accum_terms(terms);
                 self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
-                self.emit(format!("    ADDLW 0x{lit:02X}"));
+                self.emit_add_w_const(lit as u8);
                 self.emit("    MOVWF FSR".to_string());
             }
         }
@@ -1021,14 +1059,14 @@ impl<'m> Gen<'m> {
         if terms.is_empty() {
             self.emit_bank_select(slot_addr);
             self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
+            self.emit_add_w_const(kk as u8);
             self.emit("    MOVWF FSR".to_string());
         } else {
             self.emit_accum_terms(terms);
             self.emit_bank_select(slot_addr);
             self.emit(format!("    MOVF 0x{slot_addr:02X}, W"));
             self.emit(format!("    ADDWF 0x{:02X}, W", self.scratch));
-            self.emit(format!("    ADDLW 0x{kk:02X}"));
+            self.emit_add_w_const(kk as u8);
             self.emit("    MOVWF FSR".to_string());
         }
     }
@@ -1344,7 +1382,7 @@ impl<'m> Gen<'m> {
                                 let aa = self.val_addr(a).direct();
                                 self.emit_bank_select(aa);
                                 self.emit(format!("    MOVF 0x{aa:02X}, W"));
-                                self.emit(format!("    ADDLW 0x{kb:02X}"));
+                                self.emit_add_w_const(kb);
                                 self.emit_w_store(da);
                             }
                             _ => {
@@ -1862,10 +1900,18 @@ pub fn select_with_locs(
         .expect("isel's fixed scratch/retval layout needs a common-RAM region");
     let scratch: u16 = common_lo;
     let retval_lo: u16 = common_lo + 1;
+    // scratch2 (the ADDLW-replacement temp) sits right after the retval
+    // region: common RAM 0x07-0x0F = scratch(0x07) + retval(0x08-0x0B) +
+    // scratch2(0x0C), leaving 0x0D-0x0F free.
+    let scratch2: u16 = common_lo + 5;
     assert!(
         retval_lo + 4 <= common_hi + 1,
         "isel: 4-byte retval region 0x{retval_lo:02X}-0x{:02X} must fit in common RAM",
         retval_lo + 3
+    );
+    assert!(
+        scratch2 <= common_hi,
+        "isel: scratch2 0x{scratch2:02X} must fit in common RAM (0x{common_lo:02X}-0x{common_hi:02X})"
     );
     out.extend(vec![
         "; pic8 -- PIC baseline integer spine (isel-pic-baseline)".to_string(),
@@ -1930,6 +1976,7 @@ pub fn select_with_locs(
             device,
             resolved: &resolved,
             scratch,
+            scratch2,
             retval_lo,
             cur_func: &f.name,
             tmp: &mut tmp,

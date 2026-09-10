@@ -861,12 +861,6 @@ fn va_sizes(m: &Module) -> HashMap<String, u16> {
 }
 
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
-    if device.core == device::Core::PicBaseline {
-        panic!(
-            "alloc: {} is pic-baseline; its allocation model (FSR-selected banks, shared window inside the bank space) lands with the backend (docs/37)",
-            device.name
-        );
-    }
     // iselcore's pointer resolution: a pointer select seeded as an indirect
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.

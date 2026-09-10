@@ -127,10 +127,15 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
             }
         }
         device::Core::PicBaseline => {
-            panic!(
-                "report: {} is pic-baseline; no baseline size model yet (docs/37)",
-                device.name
-            )
+            // Baseline's fixed region is common RAM (0x07-0x0F): scratch
+            // (1) + retval (4) + scratch2 (1, the ADDLW-replacement temp)
+            // = 6 bytes, no ISR save (no interrupts).
+            let base = 6;
+            if has_isr {
+                panic!("report: baseline has no interrupts; has_isr must be false")
+            } else {
+                base
+            }
         }
     }
 }
@@ -153,10 +158,10 @@ pub fn fixed_total(device: &Device) -> u16 {
             hi - lo + 1
         }
         device::Core::PicBaseline => {
-            panic!(
-                "report: {} is pic-baseline; no baseline size model yet (docs/37)",
-                device.name
-            )
+            let (lo, hi) = device
+                .common_ram
+                .expect("baseline devices have a common-RAM region");
+            hi - lo + 1
         }
     }
 }
@@ -193,10 +198,7 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         device::Core::Pic14 => "common",
         device::Core::Pic18 => "fixed",
         device::Core::Pic14e => "fixed",
-        device::Core::PicBaseline => panic!(
-            "report: {} is pic-baseline; no baseline size model yet (docs/37)",
-            device.name
-        ),
+        device::Core::PicBaseline => "common",
     };
     out.push_str(&format!(
         "    {fixed_name}: {fixed}/{fixed_total} bytes (fixed scratch/retval/ISR save)\n"
