@@ -219,9 +219,9 @@ def find_edc_pic(stem: str):
                 return p
     return None
 
-def find_ini_and_cfgdata(stem: str):
+def find_ini_and_cfgdata_in(base: pathlib.Path, stem: str):
+    """ini/cfgdata under a pack directory, the .atpack layout (ADR-020)."""
     suffix = stem_to_suffix(stem).lower()
-    base = pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs")
     ini = None
     cfg = None
     if base.exists():
@@ -232,6 +232,9 @@ def find_ini_and_cfgdata(stem: str):
             cfg = p
             break
     return ini, cfg
+
+def find_ini_and_cfgdata(stem: str):
+    return find_ini_and_cfgdata_in(pathlib.Path("/opt/microchip/xc8/v4.00/pic/packs"), stem)
 
 def parse_ini(ini_path: pathlib.Path):
     text = ini_path.read_text()
@@ -839,13 +842,22 @@ def sweep_pack(pack_dir: pathlib.Path, out_dir=None, pack=None):
     if not pack_dir.is_dir():
         print(f"gen-device --sweep: {pack_dir} is not a directory", file=sys.stderr)
         sys.exit(2)
+    if out_dir is not None and out_dir.exists() and not out_dir.is_dir():
+        print(f"gen-device --sweep: --out-dir {out_dir} is not a directory", file=sys.stderr)
+        sys.exit(2)
     if out_dir is not None:
         out_dir.mkdir(parents=True, exist_ok=True)
     results = []
     failures = 0
     for src in sorted(pack_dir.rglob("*.PIC")):
         stem = normalize_stem(src.stem)
-        ini, cfg = find_ini_and_cfgdata(stem)
+        # The swept pack is the source of truth for ini/cfgdata too: a real
+        # .atpack carries its own xc8/pic/dat (ADR-020), so the sweep must
+        # not depend on a global XC8 install that may be absent or a
+        # different pack version. The global install stays the fallback.
+        ini, cfg = find_ini_and_cfgdata_in(pack_dir, stem)
+        if ini is None and cfg is None:
+            ini, cfg = find_ini_and_cfgdata(stem)
         try:
             content = generate_toml(stem, ini, cfg, src, pack)
         except MissingFacts as e:
@@ -885,12 +897,20 @@ def main():
                     help="with --sweep: scratch directory for the successful TOMLs (never the registry)")
     args = ap.parse_args()
     if args.sweep is not None:
+        # Single-part flags have no meaning here; silently ignoring them
+        # would make a carried-over habit look like it worked.
+        for flag, value in (("--atdf", args.atdf), ("--out", args.out), ("--check", args.check)):
+            if value:
+                ap.error(f"{flag} cannot be combined with --sweep (use --out-dir for sweep output)")
         results, failures = sweep_pack(pathlib.Path(args.sweep), args.out_dir, args.pack)
         for stem, status, detail in results:
             if status == "ok":
                 print(f"  ok  {stem}")
             else:
                 print(f"  {status:<14} {stem}: {detail}")
+        if not results:
+            print(f"gen-device --sweep: no *.PIC files found under {args.sweep}", file=sys.stderr)
+            sys.exit(1)
         print(f"gen-device --sweep: {len(results) - failures}/{len(results)} parts generated, {failures} failed")
         sys.exit(1 if failures else 0)
     if not args.device:

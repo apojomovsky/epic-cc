@@ -386,6 +386,62 @@ class GenDeviceSweepTest(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("is not a directory", r.stderr)
 
+    def test_sweep_rejects_out_dir_pointing_at_a_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = pathlib.Path(d) / "out"
+            f.write_text("x")
+            r = subprocess.run(
+                [sys.executable, str(GEN), "--sweep", str(SWEEP_PACK), "--out-dir", str(f)],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("is not a directory", r.stderr)
+
+    def test_sweep_exits_1_when_no_parts_found(self):
+        with tempfile.TemporaryDirectory() as d:
+            r = subprocess.run(
+                [sys.executable, str(GEN), "--sweep", str(d)],
+                capture_output=True, text=True,
+            )
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no *.PIC files found", r.stderr)
+
+    def test_sweep_rejects_single_part_flags(self):
+        r = subprocess.run(
+            [sys.executable, str(GEN), "--sweep", str(SWEEP_PACK), "--check"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("--check cannot be combined with --sweep", r.stderr)
+
+    def test_sweep_uses_pack_local_ini_and_cfgdata(self):
+        # A real .atpack carries its own xc8/pic/dat (ADR-020); the sweep
+        # must read ini/cfgdata from the swept pack, not depend on a global
+        # XC8 install. The ini's ROMSIZE (512) overrides the EDC's code_end
+        # (1024), proving the pack-local ini was the source.
+        with tempfile.TemporaryDirectory() as d:
+            pack = pathlib.Path(d) / "Microchip.PIC16Fxxx_DFP"
+            edc = pack / "edc"
+            edc.mkdir(parents=True)
+            (edc / "PIC14SYN01.PIC").write_text(FIXTURE.read_text())
+            ini = pack / "ini"
+            ini.mkdir()
+            (ini / "14syn01.ini").write_text(
+                "[14SYN01]\n"
+                "ARCH=16xxxx\n"
+                "ROMSIZE=200\n"
+                "RAMBANK=20-6F\n"
+                "STACKDEPTH=0x8\n"
+            )
+            out = pathlib.Path(d) / "out"
+            r = subprocess.run(
+                [sys.executable, str(GEN), "--sweep", str(pack), "--out-dir", str(out)],
+                capture_output=True, text=True,
+            )
+            toml = (out / "p14syn01.toml").read_text()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("flash_words = 512", toml)
+
 
 if __name__ == "__main__":
     unittest.main()
