@@ -11,16 +11,16 @@
 
 <p align="center">
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/apojomovsky/epic-cc)](https://github.com/apojomovsky/epic-cc/releases) [![target PIC16F877A](https://img.shields.io/badge/target-PIC16F877A%20%28PIC14%29-c0392b.svg)](docs/01-target-pic14.md) [![status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#status)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![CI](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/epic-cc/actions/workflows/ci.yml) [![Release](https://img.shields.io/github/v/release/apojomovsky/epic-cc)](https://github.com/apojomovsky/epic-cc/releases) [![targets: 4 PIC cores](https://img.shields.io/badge/targets-4%20PIC%20cores-c0392b.svg)](crates/device/devices/) [![status: alpha](https://img.shields.io/badge/status-alpha-yellow.svg)](#status)
 
 </p>
 
 8-bit PIC still ships in enormous volume, and the only C toolchain for it has been
-Microchip's closed-source XC8: capped optimization on the free tier, no modern
-diagnostics, nothing to inspect when it goes wrong. `epic-cc` is a real compiler
-instead: clang's front end for genuine C semantics, a from-scratch whole-program
-PIC14 backend with nothing to license, and every stage checked against a
-byte-for-byte oracle. It's the default toolchain behind
+Microchip's closed-source XC8: nothing to inspect when it miscompiles, and no
+say in how it evolves. `epic-cc` is a real compiler instead: clang's front end
+for genuine C diagnostics, a from-scratch whole-program backend with nothing
+to license, and every stage checked against a byte-for-byte oracle. It's the
+default toolchain behind
 [epic-hal](https://github.com/apojomovsky/epic-hal)'s one-command PIC projects.
 
 ## Quickstart
@@ -41,10 +41,12 @@ void main(void) { out = in + 1; }
 
 $ ./epic-cc --target p16f877a add.c -o add.hex && cat add.hex
 :020000040000FA
-:10000000012800308A0005206300831203132008B2
-:0E001000A2002208013EA3002308A100080060
+:10000000012800308A00052063002008A200220891
+:0A001000013EA3002308A100080030
 :00000001FF
 ```
+
+(That's the literal output of the `v0.1.0` release binary above, run against this exact file: not a hand-typed transcript.)
 
 No `gh` CLI? Download the zip straight from
 [Releases](https://github.com/apojomovsky/epic-cc/releases/latest). Building
@@ -69,29 +71,35 @@ pinned versions and build-cache notes.
   get clang's errors, not a home-grown parser's guesses.
 - **Whole-program compiler, straight to `.hex`.** One invocation, no external
   assembler or linker: `epic-cc` owns every stage from IR to Intel HEX.
-- **Built for one architecture, not retrofit onto one.** Every register write
+- **Built for the architecture, not retrofit onto it.** Every register write
   is cited to Microchip's datasheet; see [why that's the hard part](#under-the-hood).
-- **Verified, not just tested.** Emitted assembly is cross-checked byte-for-byte
-  against real `gpasm`, and a differential fuzzer runs every generated program
-  against host clang on every commit.
+- **Debuggable.** `--sidecar` emits an ELF+DWARF sidecar and `epic-cc-gdbserver`
+  lets real GDB attach to the built-in simulator (not a hardware probe yet).
+- **Verified against three independent oracles.** Byte-for-byte against real
+  `gpasm`, differentially against host clang, and differentially against SDCC
+  on a shared corpus; a seeded check runs on every commit, the full corpus on
+  demand.
 - **Loud panics, never silent miscompiles.** Anything unsupported aborts with a
   specific message instead of emitting wrong code.
 
 ## Status
 
 **Alpha.** The full integer, pointer, interrupt, `long`, and soft-float spine is
-implemented and passing end-to-end; a fast test subset gates every commit.
+implemented and passing end-to-end on PIC14, PIC14 Enhanced, and PIC18; the
+newer PIC-baseline core (the smallest parts) is still catching up
+feature-by-feature. A fast test subset gates every commit.
 
 | Feature | State |
 |---|---|
 | Core C89 control flow, non-recursive calls | ✅ |
 | 8-bit and 16-bit integers, all comparisons | ✅ |
 | Pointers, arrays, structs (`sret` / `byval`) | ✅ |
+| Unions, bit-fields | ✅ |
 | `const` data in flash (`RETLW` tables, >256 bytes) | ✅ |
 | Multi-bank RAM (`BANKSEL`) and multi-page flash (`PCLATH`) | ✅ |
 | Interrupts, SFR access | ✅ |
 | 32-bit `long`, IEEE-754 soft-float | ✅ |
-| Unions | ⛔ not yet |
+| PIC18 target, in addition to PIC14 | ✅ |
 | Recursion | ⛔ by design: compile error, no escape hatch |
 
 Devices ship as one file each (`crates/device/devices/*.toml`, generated from
@@ -106,9 +114,10 @@ same-core part is a file, not a feature; see
 
 ### Why this target is hard
 
-Parsing C is solved. What's hard about a PIC14 compiler is **storage
-allocation**, because the mid-range core breaks nearly every assumption a
-conventional backend relies on:
+Parsing C is solved. What's hard about a PIC14 compiler (the original and
+still the hardest target; PIC18 has a real stack, and the baseline core
+relaxes some of this) is **storage allocation**, because the mid-range core
+breaks nearly every assumption a conventional backend relies on:
 
 | Constraint | Consequence |
 |---|---|
@@ -121,16 +130,22 @@ conventional backend relies on:
 
 Full detail with datasheet cross-references: [`docs/01-target-pic14.md`](docs/01-target-pic14.md).
 
-### Architecture: a ten-stage pipeline
+### Architecture: one pipeline, one backend per core
 
-Each stage is its own crate, and every stage boundary is a diffable text
+Every stage is its own crate and every stage boundary is a diffable text
 artifact: a miscompile can be bisected to a stage before anyone reads code.
+The front end and mid-level IR pipeline are shared; only instruction
+selection is per-core, because a PIC14 accumulator machine, its enhanced
+variant, PIC18's wider core, and the smallest baseline parts need genuinely
+different instructions. Four cores are wired in today: `isel` (PIC14),
+`isel-pic14e` (PIC14 Enhanced), `isel-pic18` (PIC18), and `isel-pic-baseline`
+(the smallest baseline parts).
 
 ```mermaid
 flowchart LR
     C[".c files"] --> CLANG["clang -S -emit-llvm"] --> LL[".ll text"]
     LL --> IRP["irparse"] --> WP["wholeprog"] --> LEG["legalize"]
-    LEG --> CG["callgraph"] --> AL["alloc"] --> ISEL["isel"]
+    LEG --> CG["callgraph"] --> AL["alloc"] --> ISEL{"isel (per core)"}
     ISEL --> BK["banking"] --> PH["peephole"] --> ASM["asm"] --> HEX[".hex"]
 ```
 
@@ -150,36 +165,46 @@ Repository layout:
 
 ```
 crates/
-  driver/ irparse/ ir/ wholeprog/ legalize/   # stages 1-4: front end -> legalized IR
-  callgraph/ alloc/ isel/ banking/ peephole/   # stages 5-9: allocation, codegen, banking
-  asm/                                         # stage 10: assembler -> Intel HEX
-  sim/    fuzz/                                # PIC14 simulator, differential fuzzer
+  driver/ irparse/ ir/ wholeprog/ legalize/          # front end -> legalized IR
+  callgraph/ alloc/                                  # call graph, overlay allocation
+  isel/ isel-pic14e/ isel-pic18/ isel-pic-baseline/   # per-core instruction selection
+  schedule/ banking/ peephole/ asm/                   # bank-aware scheduling, cleanup, -> Intel HEX
+  sim/ fuzz/ sdcc-parity/                             # simulator, host-clang fuzzer, SDCC parity oracle
+  gdbserver/                                          # GDB remote-serial server (simulator-attached)
 docs/     # design conversation, ADRs, milestone plans
 ```
 
 ### How correctness is verified
 
-Four independent layers, all running in CI:
+Five independent layers:
 
-1. **Our own PIC14 simulator** ([`crates/sim`](crates/sim)): asserts on real
+1. **Our own simulator** ([`crates/sim`](crates/sim)): asserts on real
    register and RAM state, embeddable in `cargo test`.
 2. **`gpasm` byte-for-byte cross-check**: our emitted assembly must match a
    real GNU PIC assembler's HEX output exactly.
 3. **End-to-end acceptance programs** ([`crates/driver/tests`](crates/driver/tests)):
    real C through the full pipeline, run in the simulator, checked against
    hand-computed results.
-4. **Differential fuzzing**: a seeded UB-free C generator compiles every
-   program twice (epic-cc → sim, host clang → native) and diffs the checksums;
-   mismatches auto-reduce to a minimal saved fixture.
+4. **Differential fuzzing against host clang**: a seeded UB-free C generator
+   compiles every program twice (epic-cc → sim, host clang → native) and diffs
+   the checksums; mismatches auto-reduce to a minimal saved fixture. A seeded
+   subset runs on every commit; the full corpus runs on demand, not on a
+   schedule yet.
+5. **Differential parity against SDCC** ([`crates/sdcc-parity`](crates/sdcc-parity)):
+   the same corpus compiled with SDCC (invoked as an external GPL process,
+   never linked), run in the simulator, and compared on named output globals
+   plus cycle count.
 
 ### Known gaps
 
 Deliberate and tracked, not surprises: diagnostics are panics rather than
 user-facing errors; `BANKSEL` minimization is linear tracking, not the
 published 2-approximation; overlay allocation is call-graph-based, not
-interference-graph coloring; `.asm`/`.lst` output isn't exposed yet (only
-`.hex` and `--map`); the XC8 differential oracle is designed but not wired
-into the suite.
+interference-graph coloring; `.asm`/`.lst` listing output isn't exposed
+(only `.hex`, `--map`, and the `--sidecar` ELF+DWARF file the debugger
+reads); the PIC-baseline core is newer and has less test coverage than the
+other three; the XC8 differential oracle is designed but not wired into the
+suite.
 
 Full design conversation, ADRs, and per-milestone plans live in
 [`docs/`](docs/); start with
@@ -192,12 +217,13 @@ Full design conversation, ADRs, and per-milestone plans live in
 - [`docs/00-charter.md`](docs/00-charter.md): goal, scope, non-goals
 - [`docs/03-decisions.md`](docs/03-decisions.md): ADRs, with rejected alternatives
 - [`docs/12-backend-design.md`](docs/12-backend-design.md): the approved backend spec
+- [`docs/34-debugger-design.md`](docs/34-debugger-design.md): the GDB/simulator debugger design
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`CLAUDE.md`](CLAUDE.md): conventions for contributors and agents
 
 ## Non-goals
 
 - **Separate compilation**: whole-program is the point; overlay allocation needs the full call graph.
-- **Debugger / COFF / ELF output**: HEX, listing, and map only.
+- **Hardware in-circuit debugging**: `--sidecar` and `epic-cc-gdbserver` attach GDB to the built-in simulator only, never a physical probe.
 - **Being an XC8 clone**: differential testing against XC8 is a verification technique, not a design target.
 - **Reverse-engineering XC8**: prohibited by its license, and unnecessary.
 
