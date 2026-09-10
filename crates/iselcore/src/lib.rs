@@ -283,15 +283,14 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
             }
         }
     }
-    // A call result used in pointer position (a GEP base, a load/store
-    // address operand) is definitionally a pointer return: those LLVM
-    // operands are always pointer-typed. Both backends copy the retval
-    // bytes into the call dst slot on return, so the slot holds the two
-    // address bytes and the dst dereferences as an indirect slot, the
-    // same model as the load-ptr seed above (epic-cc#183). This is the
-    // shape `malloc` returns through (epic-cc#343). A call result used
-    // only as a value is not seeded, so integer math never miscompiles
-    // as addressing; anything else stays a loud panic.
+    // A call result used in pointer position (a GEP base, a load/store address
+    // operand) is definitionally a pointer return: those LLVM operands are
+    // always pointer-typed. Both backends copy the retval bytes into the call
+    // dst slot on return, so the slot holds the two address bytes and the dst
+    // dereferences as an indirect slot, the same model as the load-ptr seed
+    // above (epic-cc#183). This is the shape `malloc` returns through
+    // (epic-cc#343). A call result used only as a value is not seeded, so
+    // integer math never miscompiles as addressing; anything else stays loud.
     for f in &m.funcs {
         let fname = f.name.clone();
         let mut call_dsts = std::collections::HashSet::new();
