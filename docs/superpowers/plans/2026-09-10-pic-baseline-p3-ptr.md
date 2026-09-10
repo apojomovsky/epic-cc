@@ -51,12 +51,12 @@ the retval region (dead at a memcpy) for the countdown like classic isel
 does. The countdown is 16-bit (len is i16); idx is 1 byte (bounded by
 the 6-bit FSR space, so idx <= 0x3F).
 
-The classic loop uses `ADDWF FSR, F` to add idx to FSR — valid on
-baseline (FSR is a file register). But the FSR re-set per byte must
+The classic loop uses `ADDWF FSR, F` to add idx to FSR, valid on baseline
+(FSR is a file register). But the FSR re-set per byte must
 re-assert the bank bit: `emit_fsr_to` already loads the full flat
 address, so the idx add happens after, keeping the bank bit. The
 countdown decrement uses `MOVLW 1; SUBWF lo,F; BTFSS STATUS,0; SUBWF
-hi,F` — all common RAM, no bank reassertion needed.
+hi,F`; all common RAM, no bank reassertion needed.
 
 ## P3 fixtures (from the sibling backends, adapted to the 509's 41-byte GPR budget)
 
@@ -66,14 +66,15 @@ hi,F` — all common RAM, no bank reassertion needed.
 - `array.c`: a non-const array written and read at a runtime index, the
   pure FSR/INDF path. `in` is a 16-bit volatile so clang keeps the index
   mask as an i16 `and`.
-- `structs.c`: sret call + struct copy, byval call, dynamic
-  array-in-struct, nested-struct field math. The struct sizes must fit
-  the 509's GPR budget (struct Pair = 4 bytes, struct A = 5, struct
-  Outer = 5).
-- `banked_ptr.c`: interleaves a direct access to one bank with an
-  indirect access through a pointer into the other bank, extending the
-  P1 hand-written test to real codegen (the P2 `banked.c` already does
-  this; the P3 fixture adds array indexing on top).
+- `structs.c`: byval calls (sum/pick) plus a dynamic array-in-struct
+  (arr.v[arr.n]), sized to the 509's budget (struct Pair = 4 bytes,
+  struct A = 5). The sret call and nested Outer struct of the PIC14E
+  fixture are dropped: their return/pass-through structs would exceed
+  the budget.
+- The bank/interleave case comes from the P2 `banked.c` e2e, which
+  interleaves bank-1 direct stores with flat-loaded FSR derefs into bank
+  0 and back, with asm-level BSF/BCF assertions; P3's fixtures add the
+  runtime-index array paths on top.
 
 ## Acceptance
 

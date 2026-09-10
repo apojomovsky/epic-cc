@@ -172,6 +172,19 @@ fn ptr_probe_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize] = 1;
     p.run(10_000);
     assert_eq!(p.ram()[globals["out"] as usize], 2, "out = ram[1] = 2");
+    // Pin the indexed cell: the store must land at ram[1], not ram[0] (an
+    // index term dropped from the FSR setup would round-trip through ram[0]
+    // and still read back into out == 2).
+    assert_eq!(
+        p.ram()[globals["ram"] as usize + 1],
+        2,
+        "store landed at ram[1]"
+    );
+    assert_eq!(
+        p.ram()[globals["ram"] as usize],
+        0,
+        "ram[0] must stay untouched"
+    );
     assert!(p.halted());
 }
 
@@ -185,16 +198,41 @@ fn array_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize] = 3;
     p.run(10_000);
     assert_eq!(p.ram()[globals["out"] as usize], 4, "out = buf[3] = 4");
+    // Pin the indexed cell: buf[3], not buf[0] (a dropped index would
+    // round-trip through buf[0] and still give out == 4).
+    assert_eq!(
+        p.ram()[globals["buf"] as usize + 3],
+        4,
+        "store landed at buf[3]"
+    );
+    assert_eq!(
+        p.ram()[globals["buf"] as usize],
+        0,
+        "buf[0] must stay untouched"
+    );
     assert!(p.halted());
 }
 
-/// P3 structs acceptance: byval call, dynamic array-in-struct, and
-/// nested-struct field math through FSR/INDF. Expected: out == 0x48.
+/// P3 structs acceptance: byval calls (sum/pick) and a dynamic
+/// array-in-struct through FSR/INDF. Expected: out == 0x48.
 #[test]
 fn structs_c_runs_correctly() {
     let _guard = E2E_LOCK.lock();
     let (mut p, globals) = compile("tests/fixtures/structs.c");
     p.run(10_000);
     assert_eq!(p.ram()[globals["out"] as usize], 0x48, "structs trace");
+    // Pin the dynamic array cell: arr.v[2] must be 0x11, not arr.v[0] (a
+    // dropped index from the store would round-trip through arr.v[0] and
+    // pick() would still read it back into out).
+    assert_eq!(
+        p.ram()[globals["arr"] as usize + 3],
+        0x11,
+        "arr.v[2] = 0x11"
+    );
+    assert_eq!(
+        p.ram()[globals["arr"] as usize + 1],
+        0,
+        "arr.v[0] untouched"
+    );
     assert!(p.halted());
 }

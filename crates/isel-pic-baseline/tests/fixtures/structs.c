@@ -1,9 +1,10 @@
 // P3 structs acceptance, sized to the 509's 32-byte GPR budget (bank 0
-// 0x10-0x1F + bank 1 0x30-0x3F). Exercises byval call, dynamic
-// array-in-struct, and nested-struct field math through FSR/INDF. The
-// sret call (mk) is dropped: its 4-byte return struct plus the caller's
-// copy would exceed the budget, and the byval + dynamic-array + nested
-// paths cover the P3 struct surface.
+// 0x10-0x1F + bank 1 0x30-0x3F). Exercises byval calls (sum/pick) and a
+// dynamic array-in-struct (arr.v[arr.n]) through FSR/INDF. The sret call
+// (mk) and the nested Outer struct of the PIC14E fixture are dropped:
+// their return/pass-through structs would exceed the 509's budget, and
+// the byval + dynamic-array paths cover the P3 struct surface (nested
+// fields lower identically as folded constant GEP offsets).
 //
 // Expected: out == 0x48 for the fixed inputs. Hand trace (8-bit wraps):
 //   out = sum(g) = 3 + 0x34        -> 0x37   (b truncated to uchar by the
