@@ -52,7 +52,7 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | recursion | p18f4550 | 60 | 145 | 14 | 42 | 120 | 6333 | PASS |
 | recursion | p16f1938 | - | - | - | - | - | - | SDCC-BUG (epic=0x78 sdcc=0x1; SDCC static-overlay recursion, gpsim-confirmed) |
 | printf-f | p16f877a | - | - | - | - | - | - | SDCC-LIMIT (no libc on pic14, manual 4.9.8; epic folds 0x41) |
-| printf-f | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x41 sdcc=0x0; putchar never observably fires through the portable sink; SDCC %f core verified via sprintf; putchar ABI tracked by #352) |
+| printf-f | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x41 sdcc=0x0; SDCC libc stream dispatch never reaches the portable putchar sink, gpsim-confirmed; %f core verified via sprintf; concluded by #352) |
 | printf-f | p16f1938 | - | - | - | - | - | - | SDCC-LIMIT (no libc on pic14e; epic folds 0x41) |
 | eeprom-p14 | p16f877a | 65 | 482 | 7 | 19 | 63 | 775 | PASS |
 | eeprom-p18 | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x80 sdcc=0x7f; SDCC inttoptr misses the EEPROM register window, same defect class as malloc) |
