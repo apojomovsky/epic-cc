@@ -198,6 +198,23 @@ class CorrectRamTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertIn("ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]", text)
 
+    def test_pic14_widens_understated_ram(self):
+        # The DFP understates a PIC14 part's banked GPR; gputils wins and
+        # the TOML's ram_banks must widen to the lkr's banks (docs/32 §3).
+        with tempfile.TemporaryDirectory() as d:
+            toml = write(
+                pathlib.Path(d) / "p14syn01.toml",
+                PIC14_TOML.replace(
+                    "ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]",
+                    "ram_banks = [[0x0020, 0x006F]]",
+                ),
+            )
+            lkr = write(pathlib.Path(d) / "14syn01_g.lkr", PIC14_LKR)
+            changed = add_device.correct_ram(toml, lkr)
+            text = toml.read_text()
+        self.assertTrue(changed)
+        self.assertIn("ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]", text)
+
 
 class FieldDiffTest(unittest.TestCase):
     def test_names_new_absent_and_renamed_fields(self):

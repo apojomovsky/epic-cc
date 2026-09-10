@@ -3,16 +3,9 @@
 # a single wrapper. Generates the TOML, cross-checks it against gputils,
 # runs the per-device sanity, compiles a synthesized EPIC_CONFIG fixture,
 # and reports "ready to commit" with a field-diff vs the closest sibling,
-# or a failure list naming exactly which step failed.
-#
-# Usage: bash scripts/add-device.sh <part> --atdf <path> [--pack <name>]
-#   e.g., bash scripts/add-device.sh p18f2550 --atdf /path/PIC18F2550.PIC \
-#         --pack Microchip.PIC18Fxxxx_DFP
-#
-# Run inside the dev container (make exec / make shell): cargo and gpasm
-# live there, never on the host. DFP sourcing stays manual (account-gated,
-# docs/38 D-1): the .atdf/.PIC is a build input you fetch, use, and discard;
-# only the TOML is tracked.
+# or a failure list naming exactly which step failed. Run inside the dev
+# container (make exec / make shell); DFP sourcing stays manual (docs/38
+# D-1). Usage: bash scripts/add-device.sh <part> --atdf <path> [--pack <name>]
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -84,13 +77,13 @@ fi
 # --- step 3: gputils crosscheck ---
 echo "--- add-device $STEM: gputils crosscheck ---"
 if ! cargo test -p device --test gputils_crosscheck 2>&1 | tee "$TMP/crosscheck.out"; then
-  step_fail "2 (gputils crosscheck)" "see output above"
+  step_fail "3 (gputils crosscheck)" "see output above"
 fi
 
 # --- step 4: per-device sanity ---
 echo "--- add-device $STEM: sanity.sh ---"
 if ! bash scripts/sanity.sh "$STEM" 2>&1 | tee "$TMP/sanity.out"; then
-  step_fail "3 (sanity.sh)" "see output above"
+  step_fail "4 (sanity.sh)" "see output above"
 fi
 
 # --- step 5: synthesize + compile EPIC_CONFIG fixture ---
@@ -103,7 +96,7 @@ EPIC_CONFIG("$SPEC, xtal_hz=$XTAL");
 int main(void) { return 0; }
 EOF
 if ! cargo run -q -p driver -- --target "$STEM" "$TMP/fixture.c" -o "$TMP/out.hex" 2>&1 | tee "$TMP/fixture.out"; then
-  step_fail "4 (EPIC_CONFIG fixture)" "see output above"
+  step_fail "5 (EPIC_CONFIG fixture)" "see output above"
 fi
 
 # --- step 6: field-diff vs closest sibling ---
