@@ -219,6 +219,7 @@ Two failure shapes to expect and fix, not route around:
 | A field the backend cannot honor for every silicon-legal value needs an explicit `locked` value, not just a `default` | PIC18 `xinst` | `#232`, `crates/device/src/config.rs`'s `locked` handling |
 | A config field with scattered bits (non-contiguous mask) fails generation until the DCR and cfgdata paths handle spans, not widths | `p16f628a` FOSC mask `0x13` | `#372`, `scripts/gen-device.py` span handling, `crates/device/build.rs` scattered-mask validation |
 | Single-part `--atdf` generation finds no ini/cfgdata when the pack lives outside the global XC8 install | `p16f628a` from a `/tmp` DFP cache | `#372`, `scripts/gen-device.py` pack-local ini/cfgdata lookup |
+| A DFP pack ships EDC for parts of a different core family than the pack name suggests (baseline PIC16F5x inside the mid-range pack, `ARCH=PIC12` / `edc:arch="16c5x"`) | `p16f59`, `p16f505`, sibling baseline parts | `#337`, `scripts/gen-device.py` arch maps |
 
 This table is deliberately device-specific in its "confirmed on" column
 and generic in its "pattern" column, the same posture

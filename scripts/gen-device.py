@@ -381,8 +381,20 @@ def parse_cfgdata(cfg_path: pathlib.Path):
     return cwords
 
 
-EDC_ARCH_TO_CORE = {"16xxxx": "pic14", "16exxx": "pic14e", "18xxxx": "pic18"}
-INI_ARCH_TO_CORE = {"PIC14": "pic14", "PIC14E": "pic14e", "PIC16": "pic18"}
+# Baseline's ini/EDC architecture names are PIC12 and 16c5x, confirmed
+# against the DFPs swept in epic-cc#337.
+EDC_ARCH_TO_CORE = {
+    "16xxxx": "pic14",
+    "16exxx": "pic14e",
+    "18xxxx": "pic18",
+    "16c5x": "pic-baseline",
+}
+INI_ARCH_TO_CORE = {
+    "PIC14": "pic14",
+    "PIC14E": "pic14e",
+    "PIC16": "pic18",
+    "PIC12": "pic-baseline",
+}
 
 
 class MissingFacts(Exception):

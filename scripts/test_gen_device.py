@@ -499,6 +499,47 @@ class GenDevicePic18CfgdataTest(unittest.TestCase):
         self.assertIn("flash_words = 1024", text)
 
 
+class GenDeviceBaselineArchTest(unittest.TestCase):
+    """Baseline parts name their architecture PIC12 in ini and 16c5x in
+    EDC, neither of which the core maps knew. The PIC16Fxxx mid-range
+    pack ships baseline PIC16F5x EDC next to the mid-range parts, so
+    its sweep tripped over them (epic-cc#337)."""
+
+    def write_ini(self, d):
+        ini = pathlib.Path(d) / "p12syntest.ini"
+        ini.write_text(
+            "[12SYNTEST]\nARCH=PIC12\nROMSIZE=400\nRAMBANK=10-1F\nSTACKDEPTH=0x2\n"
+        )
+        return ini
+
+    def write_cfgdata(self, d):
+        cfg = pathlib.Path(d) / "p12syntest.cfgdata"
+        cfg.write_text(
+            "CWORD:FFF:1F:FFF:CONFIG\nCSETTING:4:WDTE\nCVALUE:4:ON\nCVALUE:0:OFF\n"
+        )
+        return cfg
+
+    def test_ini_arch_pic12_maps_to_pic_baseline(self):
+        with tempfile.TemporaryDirectory() as d:
+            ini = self.write_ini(d)
+            cfg = self.write_cfgdata(d)
+            text = gen_device.generate_toml("p12syntest", ini, cfg, None)
+        self.assertIn('core = "pic-baseline"', text)
+        self.assertIn("flash_words = 1024", text)
+
+    def test_edc_arch_16c5x_maps_to_pic_baseline(self):
+        text = FIXTURE.read_text().replace("16xxxx", "16c5x")
+        text = text.replace("PIC14SYN01", "PICBASESYN01")
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "PICBASESYN01.PIC"
+            src.write_text(text)
+            r, out = run_generator(
+                src, name="picbasesyn01", pack="Microchip.PIC10-12Fxxx_DFP"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('core = "pic-baseline"', out)
+
+
 class GenDeviceSweepTest(unittest.TestCase):
     """`--sweep` breadth proofing (docs/38 D-2): generate for every part in
     an unpacked DFP directory, triage failures instead of stopping at the
@@ -544,7 +585,8 @@ class GenDeviceSweepTest(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("ok  p14syn01", r.stdout)
         self.assertIn("ok  p18syn01", r.stdout)
-        self.assertIn("2/2 parts generated, 0 failed", r.stdout)
+        self.assertIn("ok  pbasesyn01", r.stdout)
+        self.assertIn("3/3 parts generated, 0 failed", r.stdout)
 
     def test_sweep_derives_pack_name_from_dfp_ancestor(self):
         with tempfile.TemporaryDirectory() as d:
@@ -558,7 +600,7 @@ class GenDeviceSweepTest(unittest.TestCase):
             r = self.run_sweep("--out-dir", d)
             self.assertEqual(r.returncode, 0, r.stderr)
             written = sorted(p.name for p in pathlib.Path(d).iterdir())
-        self.assertEqual(written, ["p14syn01.toml", "p18syn01.toml"])
+        self.assertEqual(written, ["p14syn01.toml", "p18syn01.toml", "pbasesyn01.toml"])
 
     def test_sweep_rejects_a_non_directory(self):
         r = subprocess.run(
