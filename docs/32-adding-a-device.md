@@ -60,45 +60,47 @@ Everything below assumes Path A.
    separate identity question, flag it and ask rather than assume the
    sibling's facts carry over.
 
-## §2. Generate the TOML
+## §2. Add the device: one command
 
 ```bash
-python3 scripts/gen-device.py <part> --atdf <path/to/PART.PIC> \
-    --pack <pack-name> --out crates/device/devices/<stem>.toml
+bash scripts/add-device.sh <part> --atdf <path/to/PART.PIC> [--pack <pack-name>]
 ```
 
-`<part>` accepts any spelling the generator normalizes (`PIC16F887`,
-`p16f887`, `16f887`); the output stem is always `p<suffix>`. This is the
-whole "add a device" step in the common case: the generator reads
-`ConfigFuseSector`'s `DCRDef`/`DCRFieldDef`/`AdjustPoint` structure
-directly for PIC18 config fields, and `GPRDataSector` (split by
-`TraditionalModeOnly`/`RegardlessOfMode`/`ExtendedModeOnly`) for RAM and
-the access bank. See the module docstring in `scripts/gen-device.py` for
-what each core's fields mean and how the alias tables normalize DFP
-spelling to this repo's `EPIC_CONFIG` vocabulary.
+Run it inside the dev container (`make exec` / `make shell`): the gputils
+oracle and every cargo step it invokes only exist there. `<part>` accepts
+any spelling the generator normalizes (`PIC16F887`, `p16f887`, `16f887`);
+the output stem is always `p<suffix>`, written to
+`crates/device/devices/<stem>.toml`. `--pack <name>` names the DFP for
+the `[provenance]` stanza (e.g. `Microchip.PIC18Fxxxx_DFP`). It is
+required whenever the `--atdf` file has no `*_DFP` ancestor directory,
+which is exactly the `vendor/microchip/device-data/` shape: the pack name
+is a directory-level fact of the `.atpack` layout, not something the XML
+states, and the generator refuses to fabricate it (ADR-021). A file still
+inside its pack directory (e.g. under a local XC8 install's
+`pic/packs/*/edc/`) needs no `--pack`; the `*_DFP` ancestor names it.
 
-`--pack <name>` names the DFP for the `[provenance]` stanza (e.g.
-`Microchip.PIC18Fxxxx_DFP`). It is required whenever the `--atdf` file
-has no `*_DFP` ancestor directory, which is exactly the
-`vendor/microchip/device-data/` shape this runbook's sources use: the
-pack name is a directory-level fact of the `.atpack` layout, not
-something the XML states, and the generator refuses to fabricate it
-(ADR-021). A file still inside its pack directory (e.g. under a local
-XC8 install's `pic/packs/*/edc/`) needs no `--pack`; the `*_DFP`
-ancestor names it.
+The script prints exactly one of two endings: `ready to commit`, with a
+field-diff against the closest same-core sibling whenever one exists in
+the registry, or `FAILED at step N (...)` naming exactly which step
+failed and why. A failed run restores the registry: a pre-existing TOML
+is put back, a newly generated one is removed. Sections 3 through 6 below
+describe what those steps do internally, so a reader can trust the
+report. They are not separate commands to run.
 
-**If the part shares an existing family's datasheet with a sibling
-already in the registry** (e.g. a second PIC18F2455/2550/4455/4550
-device), diff the generated field list against the sibling's TOML by
-`(byte_offset, shift)` before moving on. Confirmed on `p18f2550` vs.
-`p18f4550`: identical hardware bits can carry different DFP pack
-spellings for the same field (`div1` vs. `osc1_pll2` for `cpudiv`, `boren`
-vs. `bor` as the field name itself), and a genuinely absent field on the
-smaller part (`icprt`, present on `p18f4550`, reserved on `p18f2550`) can
-sit at the exact same bit position as a real field on the sibling. Don't
-assume symmetry; read what the generator actually produced.
+**The field-diff is yours to read, not the script's.** The script prints
+it by diffing the generated field list against that sibling's TOML by
+`(byte_offset, shift)`, but only a human can judge it, and it matters
+most when the new part shares a family datasheet with a sibling already
+in the registry. Confirmed on `p18f2550` vs. `p18f4550`: identical
+hardware bits can carry different DFP pack spellings for the same field
+(`div1` vs.
+`osc1_pll2` for `cpudiv`, `boren` vs. `bor` as the field name itself), and
+a genuinely absent field on the smaller part (`icprt`, present on
+`p18f4550`, reserved on `p18f2550`) can sit at the exact same bit position
+as a real field on the sibling. Don't assume symmetry; read what the
+report actually produced before committing.
 
-## §3. Cross-check against gputils, always
+## §3. What the script checks against gputils
 
 `gen-device.py` succeeding is necessary, not sufficient. **The DFP pack
 itself can be wrong.** Confirmed the hard way: `Microchip.PIC18Fxxxx_DFP`
@@ -107,8 +109,17 @@ lists only `gpr0`-`gpr3` (1024 bytes), while gputils' linker scripts and
 the datasheet agree both parts have `gpr0`-`gpr7` (2048 bytes). Nothing
 about that failure mode is specific to PIC18, or to this one pack.
 
-Run the crate's cross-check gate before trusting anything the generator
-wrote for RAM or flash size:
+When a gputils linker script exists for the part, the script first
+rewrites the generated TOML's `ram_banks` to match it wherever they
+disagree, and says so. **When that happens, gputils wins, and you owe the
+file a citing comment**: leave a comment citing the `.lkr` file and the
+specific DFP defect (see `p18f2550.toml`'s `ram_banks` comment for the
+shape this should take). This is a real, attributable correction to bad
+upstream data, not a workaround: leaving it silent is what would make the
+next person distrust the file.
+
+It then runs the crate's cross-check gate before trusting anything else
+the generator wrote for RAM or flash size:
 
 ```bash
 cargo test -p device --test gputils_crosscheck
@@ -120,16 +131,14 @@ before. gputils ships in the dev image, so this cannot be skipped for
 want of a download (ADR-021); it fails loudly rather than passing quietly
 when the oracle is genuinely absent (`PIC8_ALLOW_NO_GPUTILS` +
 `PIC8_UNVERIFIED_DEVICE_DATA`, two variables, is the explicit, logged
-opt-out, never a silent skip).
+opt-out, never a silent skip). Note the cross-check loops the whole
+device registry, not just the new part, so its cost grows with the
+registry.
 
-If it disagrees with the generator's output, **gputils wins.** Correct
-the TOML field by hand and leave a comment explaining why, citing the
-`.lkr` file and the specific DFP defect (see `p18f2550.toml`'s
-`ram_banks` comment for the shape this should take). This is a real,
-attributable correction to bad upstream data, not a workaround: leaving
-it silent is what would make the next person distrust the file.
+## §4. What the script runs for per-device sanity
 
-## §4. Per-device sanity: what CI actually runs
+As one of its steps, the script invokes the per-device sanity check for
+the new stem:
 
 ```bash
 bash scripts/sanity.sh <stem>
@@ -146,19 +155,21 @@ sanity check, an 80-byte global placement check, an `asm` flash-bound
 check, and the same thing a human would do first: compile `add.c` to HEX
 for `<stem>` and cross-check the assembly with `gpasm -p <stem>`.
 
-## §5. Drive a real `EPIC_CONFIG`, not just `add.c`
+## §5. What the script proves with a synthesized `EPIC_CONFIG`
 
 `add.c`-and-`gpasm` proves the device compiles. It does not prove every
 declared fuse field actually resolves, and `resolve_config` requires an
 explicit value for every field with no `default` (deliberately: geometry
 and policy are different classes of fact, see `scripts/gen-device.py`'s
-`SAFE_DEFAULTS` comment). Build a small fixture with an `EPIC_CONFIG(...)`
-string covering every field the new TOML declares and confirm it compiles
-without panicking:
+`SAFE_DEFAULTS` comment). So the script synthesizes an `EPIC_CONFIG`
+string covering every field the new TOML declares, using the `locked`
+value where the field has one, else the `default` where one exists, else
+the first enumerated value, plus a crystal frequency the driver's `fosc`
+derivation accepts, and compiles a throwaway fixture against the result:
 
 ```c
 #include <epic-cc.h>
-EPIC_CONFIG("field1=value1, field2=value2, ...");
+EPIC_CONFIG("field1=value1, field2=value2, ..., xtal_hz=<derived>");
 int main(void) { return 0; }
 ```
 
@@ -184,17 +195,15 @@ Two failure shapes to expect and fix, not route around:
   like it belongs in the generator the same way, not as a per-device
   TOML edit.
 
-## §6. Full verification and sign-off
+## §6. Sign-off
 
-- [ ] `cargo test -p device` passes (schema, provenance, the gputils
-      cross-check from §3).
-- [ ] `scripts/sanity.sh <stem>` passes (§4).
-- [ ] A full `EPIC_CONFIG` string covering every declared field compiles
-      without panicking (§5), and any generator/backend gap it surfaced
-      is fixed at the source (gen-device.py's alias tables, or a
-      documented `locked` field), not patched into this one TOML alone.
-- [ ] Any DFP data defect found (§3) is corrected with a citing comment,
-      not silently overridden.
+- [ ] The run ends `ready to commit`, and you have read the field-diff
+      (§2), not just seen that one exists.
+- [ ] Any RAM correction the script applied carries a citing comment
+      (§3), not a silent override.
+- [ ] Any generator or backend gap the fixture surfaced is fixed at the
+      source (gen-device.py's alias tables, or a documented `locked`
+      field), not patched into this one TOML alone.
 - [ ] If the addition surfaced a literal in `crates/driver`,
       `crates/isel-pic18`, `crates/asm` or `crates/sim` that was
       transcribed from one specific device rather than derived from
@@ -206,7 +215,7 @@ Two failure shapes to expect and fix, not route around:
       `INTOSC = 8 MHz` citation for how to write the confirmation).
       A second device on an existing core is the only thing that can
       surface this class of bug; take the check seriously even when
-      `add.c` alone compiles cleanly.
+      the script is green.
 - [ ] User has signed off on the final state before anything gets
       pushed.
 
