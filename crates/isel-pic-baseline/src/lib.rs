@@ -1952,9 +1952,11 @@ impl<'m> Gen<'m> {
         for i in 1..4 {
             self.emit_bank_select(t[i]);
             self.emit(format!("    MOVF {}, W", self.fop(t[i])));
+            // Atomic carry chain like __mul_u16: FSR already selects
+            // the shared __scr bank, no reassertion inside (a skip
+            // would land on the select and run the add with W = 0).
             self.emit("    BTFSC STATUS, 0 ; C".to_string());
             self.emit(format!("    INCFSZ {}, W", self.fop(t[i])));
-            self.emit_bank_select(r[i]);
             self.emit(format!("    ADDWF {}, F", self.fop(r[i])));
         }
         self.emit(format!("{l_skip}:"));
@@ -2013,9 +2015,10 @@ impl<'m> Gen<'m> {
                 self.emit_bank_select(r);
                 self.emit(format!("    SUBWF {}, F", self.fop(r)));
             } else {
+                // Atomic borrow chain: den and rem share __scr's bank
+                // (FSR set by the MOVF), no reassertion inside.
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
                 self.emit(format!("    INCFSZ {}, W", self.fop(d)));
-                self.emit_bank_select(r);
                 self.emit(format!("    SUBWF {}, F", self.fop(r)));
             }
         }
@@ -2034,9 +2037,9 @@ impl<'m> Gen<'m> {
                 self.emit_bank_select(r);
                 self.emit(format!("    ADDWF {}, F", self.fop(r)));
             } else {
+                // Atomic carry chain, same __scr bank as above.
                 self.emit("    BTFSC STATUS, 0 ; C".to_string());
                 self.emit(format!("    INCFSZ {}, W", self.fop(d)));
-                self.emit_bank_select(r);
                 self.emit(format!("    ADDWF {}, F", self.fop(r)));
             }
         }
@@ -2442,6 +2445,19 @@ impl<'m> Gen<'m> {
                 let num = self.slot_addr(&name, "num").direct();
                 let den = self.slot_addr(&name, "den").direct();
                 let (rem_lo, rem_hi, cnt) = (scr, scr + 1, scr + 2);
+                // Denominator copy in free __scr bytes (spare@3 and
+                // restore@4 per the legalize contract, unused below):
+                // the borrow/restore chains must stay inside one __scr
+                // value, and the param slot may sit in another bank.
+                let (den_lo, den_hi) = (scr + 3, scr + 4);
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(den_lo);
+                self.emit(format!("    MOVWF {}", self.fop(den_lo)));
+                self.emit_bank_select(den + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit_bank_select(den_hi);
+                self.emit(format!("    MOVWF {}", self.fop(den_hi)));
                 let l_loop = self.fresh_label();
                 let l_restore = self.fresh_label();
                 let l_next = self.fresh_label();
@@ -2462,15 +2478,16 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    RLF {}, F", self.fop(rem_lo)));
                 self.emit_bank_select(rem_hi);
                 self.emit(format!("    RLF {}, F", self.fop(rem_hi)));
-                self.emit_bank_select(den);
-                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(den_lo);
+                self.emit(format!("    MOVF {}, W", self.fop(den_lo)));
                 self.emit_bank_select(rem_lo);
                 self.emit(format!("    SUBWF {}, F", self.fop(rem_lo)));
-                self.emit_bank_select(den + 1);
-                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit_bank_select(den_hi);
+                self.emit(format!("    MOVF {}, W", self.fop(den_hi)));
+                // Atomic borrow chain: den copy and rem share __scr's
+                // bank (FSR set by the MOVF), no reassertion inside.
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
-                self.emit_bank_select(rem_hi);
+                self.emit(format!("    INCFSZ {}, W", self.fop(den_hi)));
                 self.emit(format!("    SUBWF {}, F", self.fop(rem_hi)));
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
                 self.emit(format!("    GOTO {l_restore}"));
@@ -2478,15 +2495,15 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BSF {}, 0", self.fop(num)));
                 self.emit(format!("    GOTO {l_next}"));
                 self.emit(format!("{l_restore}:"));
-                self.emit_bank_select(den);
-                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(den_lo);
+                self.emit(format!("    MOVF {}, W", self.fop(den_lo)));
                 self.emit_bank_select(rem_lo);
                 self.emit(format!("    ADDWF {}, F", self.fop(rem_lo)));
-                self.emit_bank_select(den + 1);
-                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit_bank_select(den_hi);
+                self.emit(format!("    MOVF {}, W", self.fop(den_hi)));
+                // Atomic carry chain, same __scr bank as above.
                 self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
-                self.emit_bank_select(rem_hi);
+                self.emit(format!("    INCFSZ {}, W", self.fop(den_hi)));
                 self.emit(format!("    ADDWF {}, F", self.fop(rem_hi)));
                 self.emit(format!("{l_next}:"));
                 self.emit_bank_select(cnt);
@@ -2627,6 +2644,19 @@ impl<'m> Gen<'m> {
                 self.emit_bank_select(flags);
                 self.emit(format!("    XORWF {}, F", self.fop(flags))); // bit0 ^= den<0
                 self.emit(format!("{l_go}:"));
+                // |den| copy in free __scr bytes (restore@4-5 per the
+                // legalize contract, unused below), taken here so the
+                // abs above is included; the chains must stay inside
+                // one __scr value.
+                let (den_lo, den_hi) = (scr + 4, scr + 5);
+                self.emit_bank_select(den);
+                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(den_lo);
+                self.emit(format!("    MOVWF {}", self.fop(den_lo)));
+                self.emit_bank_select(den + 1);
+                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit_bank_select(den_hi);
+                self.emit(format!("    MOVWF {}", self.fop(den_hi)));
                 self.emit_bank_select(rem_lo);
                 self.emit(format!("    CLRF {}", self.fop(rem_lo)));
                 self.emit_bank_select(rem_hi);
@@ -2644,15 +2674,16 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    RLF {}, F", self.fop(rem_lo)));
                 self.emit_bank_select(rem_hi);
                 self.emit(format!("    RLF {}, F", self.fop(rem_hi)));
-                self.emit_bank_select(den);
-                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(den_lo);
+                self.emit(format!("    MOVF {}, W", self.fop(den_lo)));
                 self.emit_bank_select(rem_lo);
                 self.emit(format!("    SUBWF {}, F", self.fop(rem_lo)));
-                self.emit_bank_select(den + 1);
-                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit_bank_select(den_hi);
+                self.emit(format!("    MOVF {}, W", self.fop(den_hi)));
+                // Atomic borrow chain: den copy and rem share __scr's
+                // bank (FSR set by the MOVF), no reassertion inside.
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
-                self.emit_bank_select(rem_hi);
+                self.emit(format!("    INCFSZ {}, W", self.fop(den_hi)));
                 self.emit(format!("    SUBWF {}, F", self.fop(rem_hi)));
                 self.emit("    BTFSS STATUS, 0 ; C".to_string());
                 self.emit(format!("    GOTO {l_restore}"));
@@ -2660,15 +2691,15 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    BSF {}, 0", self.fop(num)));
                 self.emit(format!("    GOTO {l_next}"));
                 self.emit(format!("{l_restore}:"));
-                self.emit_bank_select(den);
-                self.emit(format!("    MOVF {}, W", self.fop(den)));
+                self.emit_bank_select(den_lo);
+                self.emit(format!("    MOVF {}, W", self.fop(den_lo)));
                 self.emit_bank_select(rem_lo);
                 self.emit(format!("    ADDWF {}, F", self.fop(rem_lo)));
-                self.emit_bank_select(den + 1);
-                self.emit(format!("    MOVF {}, W", self.fop(den + 1)));
+                self.emit_bank_select(den_hi);
+                self.emit(format!("    MOVF {}, W", self.fop(den_hi)));
+                // Atomic carry chain, same __scr bank as above.
                 self.emit("    BTFSC STATUS, 0 ; C".to_string());
-                self.emit(format!("    INCFSZ {}, W", self.fop(den + 1)));
-                self.emit_bank_select(rem_hi);
+                self.emit(format!("    INCFSZ {}, W", self.fop(den_hi)));
                 self.emit(format!("    ADDWF {}, F", self.fop(rem_hi)));
                 self.emit(format!("{l_next}:"));
                 self.emit_bank_select(cnt);

@@ -560,3 +560,82 @@ fn long_shift_c_runs_correctly() {
     assert!(p.halted());
     gpasm_agrees(&asm, "long_shift");
 }
+
+/// P6 mul carry-fold regression (epic-cc#328 review): iteration 1
+/// folds t = 0xFF with carry set at byte 1. Expected: 0x0000FFC0
+/// -> 0x0002FF40 (pre-fix byte 2 reads 0x01).
+#[test]
+fn long_carry_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_carry.c");
+    p.ram_mut()[globals["x"] as usize] = 0xC0;
+    p.ram_mut()[globals["x"] as usize + 1] = 0xFF;
+    p.ram_mut()[globals["x"] as usize + 2] = 0x00;
+    p.ram_mut()[globals["x"] as usize + 3] = 0x00;
+    p.run(2_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 0x0002FF40, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_carry");
+}
+
+/// P6 div borrow-fold regression: den 01 00 FF 00 wraps the byte-2
+/// trial fold with borrow pending. Expected: 40000000 -> 2.
+#[test]
+fn long_divtrig_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_divtrig.c");
+    p.ram_mut()[globals["x"] as usize] = 0x00;
+    p.ram_mut()[globals["x"] as usize + 1] = 0x5A;
+    p.ram_mut()[globals["x"] as usize + 2] = 0x62;
+    p.ram_mut()[globals["x"] as usize + 3] = 0x02;
+    p.run(8_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 2, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_divtrig");
+}
+
+/// P6 div borrow-fold regression, remainder-keep path.
+/// Expected: 40000000 -> 6576638.
+#[test]
+fn long_remtrig_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_remtrig.c");
+    p.ram_mut()[globals["x"] as usize] = 0x00;
+    p.ram_mut()[globals["x"] as usize + 1] = 0x5A;
+    p.ram_mut()[globals["x"] as usize + 2] = 0x62;
+    p.ram_mut()[globals["x"] as usize + 3] = 0x02;
+    p.run(8_000_000);
+    let out = p.ram()[globals["x"] as usize] as u32
+        | ((p.ram()[globals["x"] as usize + 1] as u32) << 8)
+        | ((p.ram()[globals["x"] as usize + 2] as u32) << 16)
+        | ((p.ram()[globals["x"] as usize + 3] as u32) << 24);
+    assert_eq!(out, 6576638, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_remtrig");
+}
+
+/// P6 u16 div borrow-fold regression through the __scr den copy.
+/// Pre-fix this yields 0x8080. Expected: x = 65535, y = 65282 -> 1.
+#[test]
+fn long_div16_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm("tests/fixtures/long_div16.c");
+    p.ram_mut()[globals["x"] as usize] = 0xFF;
+    p.ram_mut()[globals["x"] as usize + 1] = 0xFF;
+    p.ram_mut()[globals["y"] as usize] = 0x02;
+    p.ram_mut()[globals["y"] as usize + 1] = 0xFF;
+    p.run(2_000_000);
+    let out =
+        p.ram()[globals["x"] as usize] as u16 | ((p.ram()[globals["x"] as usize + 1] as u16) << 8);
+    assert_eq!(out, 1, "out trace");
+    assert!(p.halted());
+    gpasm_agrees(&asm, "long_div16");
+}
