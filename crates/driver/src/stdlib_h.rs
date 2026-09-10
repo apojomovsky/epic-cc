@@ -1,11 +1,14 @@
 pub const STDLIB_H: &str = r#"#ifndef _STDLIB_H
 #define _STDLIB_H
 
-/* Freestanding stdlib.h for epic-cc. Consumers so far need only size_t
- * (m-stack's usb.h prototypes take it). Extends on demand,
- * as for the other builtin headers. */
+#include <stddef.h>
 
-typedef unsigned int size_t;
+/* Freestanding stdlib.h for epic-cc. size_t and NULL ride on stddef.h.
+ * malloc/free are real code (stdlib_c.rs), linked when this header is
+ * included, the same gating the string and stdio units use. */
+
+void *malloc(size_t n);
+void free(void *p);
 
 #endif /* _STDLIB_H */
 "#;

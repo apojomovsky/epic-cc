@@ -116,6 +116,8 @@ fn main() {
         .expect("write string.h");
     std::fs::write(header_dir.join("stdlib.h"), driver::stdlib_h::STDLIB_H)
         .expect("write stdlib.h");
+    std::fs::write(header_dir.join("malloc.h"), driver::malloc_h::MALLOC_H)
+        .expect("write malloc.h");
     std::fs::write(header_dir.join("xc.h"), driver::xc_h::XC_H).expect("write xc.h");
     std::fs::write(header_dir.join("stdarg.h"), driver::stdarg_h::STDARG_H)
         .expect("write stdarg.h");
@@ -184,6 +186,10 @@ fn main() {
     let need_stdio = dep_texts
         .iter()
         .any(|t| driver::header_detect::dep_file_includes(t, "stdio.h"));
+    let need_stdlib = dep_texts.iter().any(|t| {
+        driver::header_detect::dep_file_includes(t, "stdlib.h")
+            || driver::header_detect::dep_file_includes(t, "malloc.h")
+    });
     if need_string {
         let string_c_path = tmp.join("__epic_string.c");
         std::fs::write(&string_c_path, driver::string_c::STRING_C).expect("write string.c");
@@ -220,6 +226,27 @@ fn main() {
             eprintln!("epic-cc: {cmd:?}");
         }
         let out = cmd.output().expect("run clang for stdio.c");
+        if !out.status.success() {
+            eprint!("{}", String::from_utf8_lossy(&out.stderr));
+            std::process::exit(1);
+        }
+        units.push(ll_path);
+    }
+    if need_stdlib {
+        let stdlib_c_path = tmp.join("__epic_stdlib.c");
+        std::fs::write(&stdlib_c_path, driver::stdlib_c::STDLIB_C).expect("write stdlib.c");
+        let ll_path = tmp.join("__epic_stdlib.ll");
+        let mut cmd = clang::base_cmd(&clang, &resdir);
+        clang::apply_options(&mut cmd, &clang_opts);
+        cmd.args([
+            "-o",
+            ll_path.to_str().unwrap(),
+            stdlib_c_path.to_str().unwrap(),
+        ]);
+        if cli.verbose {
+            eprintln!("epic-cc: {cmd:?}");
+        }
+        let out = cmd.output().expect("run clang for stdlib.c");
         if !out.status.success() {
             eprint!("{}", String::from_utf8_lossy(&out.stderr));
             std::process::exit(1);
