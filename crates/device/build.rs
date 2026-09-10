@@ -1,5 +1,5 @@
 use serde::Deserialize;
-use std::{env, fs, path::Path};
+use std::{collections::HashMap, env, fs, path::Path};
 
 include!("provenance.rs");
 
@@ -295,6 +295,7 @@ fn main() {
         check_interrupt_vectors(path, &dev.core, &dev.interrupt_vectors);
         check_fsr_bank_bits(path, &dev.core, dev.fsr_bank_bits);
         // field validation
+        let mut used: HashMap<u16, u8> = HashMap::new();
         for f in &dev.config.fields {
             if f.mask == 0 {
                 panic!("device: {}: field {:?} mask must not be 0", path, f.name);
@@ -302,22 +303,24 @@ fn main() {
             if f.shift >= 8 {
                 panic!("device: {}: field {:?} shift must be < 8", path, f.name);
             }
-            // A fuse field is a contiguous run of bits at `shift`, so width and
-            // shift determine the mask. Anything else means the two disagree and
-            // the resolver would place the value wrong.
-            let width = f.mask.count_ones();
-            let expected = (((1u16 << width) - 1) << f.shift) as u16;
-            if expected > 0xFF || f.mask as u16 != expected {
+            // A fuse field's mask may be scattered (PIC16F628A FOSC is 0x13:
+            // bits 0, 1 and 4 of its byte, with WDTE/PWRTE in between), so
+            // only the lowest set bit must equal `shift` and every value
+            // must fit inside the mask once shifted. Anything else means the
+            // resolver would place the value wrong.
+            if f.mask.trailing_zeros() as u8 != f.shift {
                 panic!(
-                    "device: {}: field {:?} mask {:#04X} is not {} contiguous bit(s) \
-                     at shift {} (expected {:#04X})",
-                    path, f.name, f.mask, width, f.shift, expected
+                    "device: {}: field {:?} mask {:#04X} lowest set bit is {}, not shift {}",
+                    path,
+                    f.name,
+                    f.mask,
+                    f.mask.trailing_zeros(),
+                    f.shift
                 );
             }
-            let max_bits = if width >= 8 { 255 } else { (1u16 << width) - 1 };
             for v in &f.values {
-                if (v.bits as u16) > max_bits {
-                    panic!("device: {}: field {:?} value {:?} bits {} exceeds mask width {} (mask {:#04X})", path, f.name, v.name, v.bits, width, f.mask);
+                if ((v.bits as u16) << f.shift) & !(f.mask as u16) != 0 {
+                    panic!("device: {}: field {:?} value {:?} bits {} outside mask {:#04X} at shift {}", path, f.name, v.name, v.bits, f.mask, f.shift);
                 }
             }
             if let Some(def) = &f.default {
@@ -345,6 +348,14 @@ fn main() {
                     path, f.name, f.byte_offset, dev.config.num_bytes
                 );
             }
+            let slot = used.entry(f.byte_offset).or_insert(0);
+            if *slot & f.mask != 0 {
+                panic!(
+                    "device: {}: field {:?} mask {:#04X} overlaps another field in byte {}",
+                    path, f.name, f.mask, f.byte_offset
+                );
+            }
+            *slot |= f.mask;
         }
         // name check
         let _ = stem; // already validated
