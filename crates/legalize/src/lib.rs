@@ -1566,6 +1566,37 @@ fn duplicate_isr_shared(m: Module) -> Module {
     if hi_roots.is_empty() && lo_roots.is_empty() {
         return m;
     }
+    // Mode validation: each vector owns at most one handler, and the
+    // compatibility single-vector mode (priority 0) never mixes with
+    // explicit priorities. Anything else has no sound wiring (two bodies
+    // cannot share one vector entry), so panic here rather than emit a
+    // silently broken image downstream.
+    let compat_roots: Vec<&&str> = lo_roots
+        .iter()
+        .filter(|r| {
+            m.funcs
+                .iter()
+                .find(|f| f.name.as_str() == **r)
+                .is_some_and(|f| f.irq_priority == 0)
+        })
+        .collect();
+    let explicit_lo = lo_roots.len() - compat_roots.len();
+    assert!(
+        hi_roots.len() <= 1,
+        "legalize: two high-priority interrupt handlers (only one high vector exists)"
+    );
+    assert!(
+        explicit_lo <= 1,
+        "legalize: two low-priority interrupt handlers (only one low vector exists)"
+    );
+    assert!(
+        compat_roots.len() <= 1,
+        "legalize: two compatibility-mode interrupt handlers (only one vector exists)"
+    );
+    assert!(
+        compat_roots.is_empty() || (hi_roots.is_empty() && explicit_lo == 0),
+        "legalize: a compatibility-mode ISR cannot mix with explicit-priority ISRs (use __interrupt(1)/__interrupt(2) for every handler, or a single plain __interrupt handler)"
+    );
 
     // The extended contexts (epic-cc#137), computed per priority over
     // one shared adjacency: a helper reachable from a priority's roots

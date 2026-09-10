@@ -2278,3 +2278,62 @@ fn sext_i1_to_i8_zero_fills_not_sign_fills() {
         "i1 sext of a truncated byte is a same-byte copy:\n{asm}"
     );
 }
+
+/// Priority wiring (epic-cc#346): a high/low pair emits GOTO stubs at
+/// both vectors (the bodies cannot share one vector entry), the high
+/// ISR on the fixed save block, and the low ISR on its own save area.
+#[test]
+fn priority_pair_emits_both_vectors_and_save_areas() {
+    let m = parse(
+        "fn hi(void) [isr] [irq1] ()\n  block entry:\n    ret void\n\
+         fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), Some(0x030));
+    assert!(
+        asm.contains("org 0x0008") && asm.contains("goto hi"),
+        "high stub at vector 0x0008:\n{asm}"
+    );
+    assert!(
+        asm.contains("org 0x0018") && asm.contains("goto lo"),
+        "low stub at vector 0x0018:\n{asm}"
+    );
+    // The high ISR keeps the fixed save block (W at 0x0004)...
+    assert!(
+        asm.contains("MOVWF 0x0004,A"),
+        "high ISR saves W to the fixed block:\n{asm}"
+    );
+    // ...while the low ISR saves W to its own area base (0x030) and its
+    // retval snapshot above it (0x038).
+    assert!(
+        asm.contains("MOVWF 0x030,A"),
+        "low ISR saves W to its own area:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x000, 0x038"),
+        "low ISR snapshots retval into its own area:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0x030, W, A"),
+        "low ISR restores W from its own area:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("RETFIE").count(),
+        2,
+        "both handlers return via RETFIE:\n{asm}"
+    );
+}
+
+/// The save area must agree with alloc's layout: a priority pair without
+/// one (or a lone ISR with one) is an inconsistent pipeline, not a silent
+/// miscompile.
+#[test]
+#[should_panic(expected = "must be present exactly in priority mode")]
+fn priority_pair_without_save_area_panics() {
+    let m = parse(
+        "fn hi(void) [isr] [irq1] ()\n  block entry:\n    ret void\n\
+         fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
+}
