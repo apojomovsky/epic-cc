@@ -30,6 +30,7 @@ one-line index entry here, e.g.:
 - ADR-029: PIC8 flash-generation part catalog (`crates/device/catalog/parts.toml`, popularity tiers, DFP/MCP-derived facts; tracks and prioritizes, never compiler input), 2026-09-09
 - ADR-030: PIC18 two-vector priority interrupts (per-priority duplication, three overlay regions, GOTO stubs, per-ISR save areas; compat byte-identical), 2026-09-09
 - ADR-031: float frames place like integer ones (banked recipes via emit_banked; ADR-015's access-bank pin retired; per-context float frames), 2026-09-10
+- ADR-032: baseline const tables pack page low halves with PA0 set/restore at reads, readers audited against placement, const reads reserve a stack level, 2026-09-10
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 
