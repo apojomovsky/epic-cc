@@ -993,16 +993,32 @@ fn encode_pic_baseline(line: &str, sym: &std::collections::HashMap<String, usize
             // remaining tokens back into one operand string before splitting.
             let full = parts[1..].join(" ");
             let (freg, b) = full.split_once(',').unwrap();
+            let b = parse_num(b.trim());
+            assert!(b <= 7, "asm(pic-baseline): bit number {b} out of range");
             let base = match mne.as_str() {
                 "BTFSC" => 0x0600,
                 "BTFSS" => 0x0700,
                 "BCF" => 0x0400,
                 _ => 0x0500,
             };
-            base | ((parse_num(b.trim()) as u16 & 7) << 5) | f(freg.trim())
+            base | ((b as u16) << 5) | f(freg.trim())
         }
-        "GOTO" => 0x0A00 | (sym.get(op).copied().unwrap_or_else(|| parse_num(op)) as u16 & 0x1FF),
-        "CALL" => 0x0900 | (sym.get(op).copied().unwrap_or_else(|| parse_num(op)) as u16 & 0xFF),
+        "GOTO" => {
+            let k = sym.get(op).copied().unwrap_or_else(|| parse_num(op));
+            assert!(
+                k <= 0x1FF,
+                "asm(pic-baseline): GOTO target 0x{k:03X} out of range"
+            );
+            0x0A00 | (k as u16 & 0x1FF)
+        }
+        "CALL" => {
+            let k = sym.get(op).copied().unwrap_or_else(|| parse_num(op));
+            assert!(
+                k <= 0xFF,
+                "asm(pic-baseline): CALL target 0x{k:02X} out of range"
+            );
+            0x0900 | (k as u16 & 0xFF)
+        }
         other => panic!("asm(pic-baseline): unsupported mnemonic {other}"),
     }
 }

@@ -1725,7 +1725,6 @@ impl PicBaseline {
             }
             0x0B => {
                 let r = self.read_f(f).wrapping_sub(1); // DECFSZ
-                self.set_z(r);
                 self.write_d(d, f, r);
                 if r == 0 {
                     return pc + 2;
@@ -1746,7 +1745,6 @@ impl PicBaseline {
             }
             0x0F => {
                 let r = self.read_f(f).wrapping_add(1); // INCFSZ
-                self.set_z(r);
                 self.write_d(d, f, r);
                 if r == 0 {
                     return pc + 2;

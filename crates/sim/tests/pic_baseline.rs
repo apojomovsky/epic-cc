@@ -437,7 +437,7 @@ fn sleep_halts_the_core() {
 #[test]
 fn parse_hex_decodes_12_bit_words() {
     // MOVLW 0x10 -> 0x0C10 -> bytes 10 0C; MOVWF FSR -> 0x0024 -> 24 00.
-    let hex = ":020000040000FA\n:04000000100C2400F0\n:00000001FF\n";
+    let hex = ":020000040000FA\n:04000000100C2400BC\n:00000001FF\n";
     let words = parse_hex(hex);
     assert_eq!(words[0], 0x0C10);
     assert_eq!(words[1], 0x0024);
