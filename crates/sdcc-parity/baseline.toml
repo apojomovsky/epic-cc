@@ -152,9 +152,9 @@ sdcc_cycles = 8748
 program = "double"
 device = "p18f4550"
 status = "pass"
-epic_flash = 728
+epic_flash = 727
 sdcc_flash = 1409
-epic_cycles = 1057
+epic_cycles = 1056
 sdcc_cycles = 8080
 
 [[row]]
@@ -168,30 +168,12 @@ sdcc_cycles = 6670
 
 [[row]]
 program = "malloc"
-device = "p16f877a"
-status = "pass"
-epic_flash = 13
-sdcc_flash = 260
-epic_cycles = 11
-sdcc_cycles = 354
-
-[[row]]
-program = "malloc"
 device = "p18f4550"
-status = "known-bug"
-epic_flash = 11
-sdcc_flash = 212
-epic_cycles = 7
-sdcc_cycles = 6247
-
-[[row]]
-program = "malloc"
-device = "p16f1938"
 status = "pass"
-epic_flash = 12
-sdcc_flash = 220
-epic_cycles = 10
-sdcc_cycles = 311
+epic_flash = 666
+sdcc_flash = 736
+epic_cycles = 1743
+sdcc_cycles = 6745
 
 [[row]]
 program = "math"
@@ -287,9 +269,9 @@ sdcc_cycles = 0
 program = "printf-f"
 device = "p18f4550"
 status = "known-bug"
-epic_flash = 4672
+epic_flash = 4589
 sdcc_flash = 5035
-epic_cycles = 5976
+epic_cycles = 5900
 sdcc_cycles = 12453
 
 [[row]]

@@ -283,6 +283,63 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
             }
         }
     }
+    // A call result used in pointer position (a GEP base, a load/store address
+    // operand) is definitionally a pointer return: those LLVM operands are
+    // always pointer-typed. Both backends copy the retval bytes into the call
+    // dst slot on return, so the slot holds the two address bytes and the dst
+    // dereferences as an indirect slot, the same model as the load-ptr seed
+    // above (epic-cc#183). This is the shape `malloc` returns through
+    // (epic-cc#343). A call result used only as a value is not seeded, so
+    // integer math never miscompiles as addressing; anything else stays loud.
+    for f in &m.funcs {
+        let fname = f.name.clone();
+        let mut call_dsts = std::collections::HashSet::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Call(c) = i {
+                    if let Some(d) = &c.dst {
+                        call_dsts.insert(d.clone());
+                    }
+                }
+            }
+        }
+        if call_dsts.is_empty() {
+            continue;
+        }
+        let mut seed = |r: &str| {
+            if call_dsts.contains(r) {
+                let key = ssa_key(&fname, r);
+                if !resolved.contains_key(&key) {
+                    resolved.insert(key, (Base::Slot(r.to_string(), true), 0, Vec::new()));
+                }
+            }
+        };
+        for (key, g) in &geps {
+            if !key.starts_with(&format!("{fname}::")) {
+                continue;
+            }
+            if let GepBase::Reg(r) = &g.base {
+                seed(r);
+            }
+        }
+        for b in &f.blocks {
+            for i in &b.insts {
+                match i {
+                    Inst::Load(l) => {
+                        if let Some(r) = l.ptr.strip_prefix('%') {
+                            seed(r);
+                        }
+                    }
+                    Inst::Store(s) => {
+                        if let Some(r) = s.ptr.strip_prefix('%') {
+                            seed(r);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     for f in &m.funcs {
         let fname = f.name.clone();
         let mut pending: Vec<(String, ir::Gep)> = geps
