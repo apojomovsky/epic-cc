@@ -33,9 +33,9 @@ fn compile(c_path: &str) -> (PicBaseline, HashMap<String, u16>) {
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
     let asm = select(&device::PIC12F509, &m, &addrs);
+    check_const_stack(&cg, &asm);
     isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
     let words = assemble_words(&device::PIC12F509, &asm);
-
     (
         PicBaseline::with_device(&device::PIC12F509, words),
         layout.globals,
@@ -58,14 +58,29 @@ fn compile_asm(c_path: &str) -> (PicBaseline, HashMap<String, u16>, String) {
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
     let asm = select(&device::PIC12F509, &m, &addrs);
+    check_const_stack(&cg, &asm);
     isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
     let words = assemble_words(&device::PIC12F509, &asm);
-
     (
         PicBaseline::with_device(&device::PIC12F509, words),
         layout.globals,
         asm,
     )
+}
+
+/// The const-reader CALL costs a stack level the IR depth gate never
+/// sees: with a read present, deepest frame plus `__start -> main` plus
+/// the reader must fit the 2-level silicon stack (D-5). Mirrors the
+/// driver's product check.
+fn check_const_stack(cg: &callgraph::CallGraph, asm: &str) {
+    if asm.contains("CALL __read_") {
+        assert!(
+            cg.max_depth + 1 <= device::PIC12F509.stack_depth as usize,
+            "const reads need a __read CALL level the {}-level stack cannot take at call depth {}",
+            device::PIC12F509.stack_depth,
+            cg.max_depth
+        );
+    }
 }
 
 /// Run clang alone on `c_path`, returning the `.ll` text and the
@@ -288,18 +303,20 @@ fn const_table_c_runs_correctly() {
 
 /// P4 page-1 spill: code plus a 240-byte table exceeds the page-0 low
 /// half, so the table relocates to the page-1 low half with PA0
-/// set/restore around the read. Expected: in = 150 -> i = 134,
-/// big[134] = 0xD5 -> out = 0xD5.
+/// set/restore around the read, while a second 100-byte table fits the
+/// page-0 remainder (mixed-page emission). Expected: in = 150 -> i =
+/// 134, big[134] = 0xD5, j = 6, small[6] = 0x55 -> out = 0x2A.
 #[test]
 fn const_spill_c_runs_correctly() {
     let _guard = E2E_LOCK.lock();
     let (mut p, globals, asm) = compile_asm("tests/fixtures/const_spill.c");
     p.ram_mut()[globals["in"] as usize] = 150;
     p.run(10_000);
-    assert_eq!(p.ram()[globals["out"] as usize], 0xD5, "out = big[134]");
+    assert_eq!(p.ram()[globals["out"] as usize], 0x2A, "out = 0xD5 + 0x55");
     assert!(p.halted());
-    // The table spilled: an `org` past page 0 plus the PA0 set/restore
-    // around the cross-page CALL must be present.
+    // The big table spilled: an `org` past page 0 plus the PA0
+    // set/restore around the cross-page CALL must be present, and both
+    // readers must be called.
     assert!(
         asm.contains("org 0x200"),
         "spilled table must org into page 1:\n{asm}"
@@ -310,7 +327,11 @@ fn const_spill_c_runs_correctly() {
     );
     assert!(
         asm.contains("CALL __read_big"),
-        "const_spill.c must CALL its RETLW reader:\n{asm}"
+        "const_spill.c must CALL its spilled reader:\n{asm}"
+    );
+    assert!(
+        asm.contains("CALL __read_small"),
+        "const_spill.c must CALL its page-0 reader:\n{asm}"
     );
 }
 
@@ -322,6 +343,17 @@ fn const_spill_c_runs_correctly() {
 fn huge_const_table_is_rejected() {
     let _guard = E2E_LOCK.lock();
     let _ = compile("tests/fixtures/const_huge.c");
+}
+
+/// P4 stack-budget regression: a const read inside a callee nests
+/// `__start -> main -> at` plus the reader CALL (3 levels) on the
+/// 2-level stack, which drops the oldest return untrapped. Compilation
+/// panics loudly instead of emitting it (D-5).
+#[test]
+#[should_panic(expected = "__read CALL level")]
+fn deep_const_read_is_rejected() {
+    let _guard = E2E_LOCK.lock();
+    let _ = compile("tests/fixtures/const_deep.c");
 }
 
 /// Assemble `asm` with our encoder to HEX text for the gpasm comparison.

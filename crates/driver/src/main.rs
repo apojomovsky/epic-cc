@@ -364,6 +364,19 @@ fn main() {
         device::Core::Pic18 => asm,
         device::Core::PicBaseline => {
             isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
+            // A const read CALLs its `__read_` entry, one stack level the
+            // IR depth gate never sees. With a read present the deepest
+            // frame plus `__start -> main` plus the reader must fit the
+            // silicon stack, or the shift register drops the oldest
+            // return address with no trap (D-5).
+            if asm.contains("CALL __read_") {
+                assert!(
+                    cg.max_depth + 1 <= device.stack_depth as usize,
+                    "pic-baseline: const reads need a __read CALL level the {}-level stack cannot take at call depth {}",
+                    device.stack_depth,
+                    cg.max_depth
+                );
+            }
             asm
         }
     };

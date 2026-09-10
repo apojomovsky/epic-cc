@@ -2379,7 +2379,11 @@ pub fn select_with_locs(
     // Tables follow the prologue, init, `__start` and functions: the
     // cursor starts past the already-emitted head, not at zero.
     let consts = flash_consts(m, addrs);
-    let placed = place_const_tables(count_words(&out) + count_words(&code_out), &consts);
+    let mut placed = place_const_tables(count_words(&out) + count_words(&code_out), &consts);
+    // Emit page-0 tables before page-1 ones: the emitter walks this
+    // vector behind a single page-1 `org`, so an unordered spill would
+    // print a page-0 table at the page-1 cursor with page-0 immediates.
+    placed.sort_by_key(|t| t.2);
     let pages: HashMap<String, u8> = placed
         .iter()
         .map(|(name, _, page)| (name.clone(), *page))

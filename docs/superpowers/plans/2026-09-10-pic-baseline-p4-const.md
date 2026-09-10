@@ -84,15 +84,27 @@ only the e2e harness calls it).
 
 ## Fixtures (isel-pic-baseline e2e + sim)
 
-- `const_table.c`: ~96-byte table, runtime index reads + one u16 const
-  read, all placed page 0. Proves the read path end to end.
-- Spill fixture (~200-byte table + normal code): code + table exceeds
-  256 words, table relocates to page-1 low half with PA0
-  set/restore. Proves relocation.
+- `const_table.c`: 128-byte table, runtime index reads plus a direct
+  scalar const read, all placed page 0. Proves the read path end to end.
+- Spill fixture (`const_spill.c`): a 240-byte table exceeding the page-0
+  low half relocates to page 1 with PA0 set/restore, while a second
+  100-byte table fits the page-0 remainder (mixed-page emission, tables
+  sorted by page before printing). Proves relocation.
 - Regression (`should_panic` through the harness): 300-byte table fits
   neither low half. Proves loud rejection, never silent miscompile.
+- Stack regression (`const_deep.c`, `noinline` callee): a depth-2 const
+  read would nest 3 CALL levels on the 2-level stack. Proves the reader
+  level is budgeted.
 - gpasm HEX-identity over the emitted page-0 asm (`-p p12f509`) plus
   sim execution, mirroring `gpasm_const_table.rs`.
+
+## Review findings (addressed)
+
+- Stack budget: each const read CALLs its reader, one stack level the
+  IR depth gate never sees. Enforced in the driver baseline arm and
+  mirrored in the e2e harness.
+- Emission order: placed tables sort by page before emitting, so a
+  page-0 table after a spill never prints at the page-1 cursor.
 
 ## Non-goals
 
