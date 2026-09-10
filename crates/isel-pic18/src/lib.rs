@@ -5324,13 +5324,13 @@ pub fn select_with_locs(
                         // the group below writes - an ISR-side retval
                         // store can no longer destroy them mid-handler.
                         g.emit_movff_pairs([
-                            (common_lo + 7, 0xFF8), // TBLPTRU
-                            (common_lo + 6, 0xFF7), // TBLPTRH
-                            (common_lo + 5, 0xFF6), // TBLPTRL
-                            (common_lo + 4, 0xFEA), // FSR0H
+                            (common_lo + 7, 0xFF8),  // TBLPTRU
+                            (common_lo + 6, 0xFF7),  // TBLPTRH
+                            (common_lo + 5, 0xFF6),  // TBLPTRL
+                            (common_lo + 4, 0xFEA),  // FSR0H
                             (common_lo + 11, 0xFE9), // FSR0L
                             (common_lo + 10, 0xFE0), // BSR
-                            (common_lo + 9, 0xFD8), // STATUS
+                            (common_lo + 9, 0xFD8),  // STATUS
                         ]);
                         g.emit_movff_pairs([
                             (common_lo + 15, common_lo + 3),
