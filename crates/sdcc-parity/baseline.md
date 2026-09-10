@@ -53,7 +53,7 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | printf-f | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x41 sdcc=0x0; SDCC libc stream dispatch never reaches the portable putchar sink, gpsim-confirmed; %f core verified via sprintf; concluded by #352) |
 | printf-f | p16f1938 | - | - | - | - | - | - | SDCC-LIMIT (no libc on pic14e; epic folds 0x41) |
 | eeprom-p14 | p16f877a | 65 | 482 | 7 | 19 | 63 | 775 | PASS |
-| eeprom-p18 | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x80 sdcc=0x7f; SDCC inttoptr misses the EEPROM register window, same defect class as malloc) |
+| eeprom-p18 | p18f4550 | - | - | - | - | - | - | SDCC-BUG (epic=0x80 sdcc=0x7f; SDCC inttoptr misses the EEPROM register window, an SDCC generic-pointer defect) |
 | eeprom-p14e | p16f1938 | 56 | 404 | 7 | 20 | 54 | 674 | PASS |
 | constptr | p16f877a | 48 | 289 | 7 | 21 | 46 | 385 | PASS |
 | constptr | p18f4550 | 71 | 216 | 10 | 22 | 58 | 6269 | PASS |

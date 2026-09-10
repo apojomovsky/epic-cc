@@ -77,9 +77,9 @@ expected = 0x41
 # conversion never reaches the register window (EEDATA/EEADR/EECON2 see
 # no writes; EECON1 sees only two 0x80 writes from SDCC's own runtime,
 # a value nowhere in the probe). Both reads return stale EEDATA:
-# 0x7F, not 0x80. Same generic-pointer defect class as malloc; the
-# misrouting is in SDCC's address computation, upstream of any sim
-# model (the stores are ordinary MOVWF/MOVFF our own probe exercises).
+# 0x7F, not 0x80. An SDCC generic-pointer defect: the misrouting is in
+# SDCC's address computation, upstream of any sim model (the stores
+# are ordinary MOVWF/MOVFF our own probe exercises).
 # epic-cc performs the real unlock-and-commit cycle.
 device = "p18f4550"
 program = "eeprom-p18"
