@@ -238,7 +238,16 @@ def correct_ram(toml_path, lkr_path):
     with the banked banks, so the corrected span is fixed_retval.1+1 to
     the top of the coalesced access+banks. PIC14/PIC14E: ram_banks is the
     banked GPR alone. The rewrite is a targeted line swap that preserves
-    gen-device.py's deterministic formatting."""
+    gen-device.py's deterministic formatting.
+
+    Only ever widens. A device whose entire GPR is one gputils SHAREBANK
+    (no DATABANK gpr* entries at all, confirmed on PIC12F675/PIC12F629's
+    `gprnobank`) makes `banks` empty here even though gen-device.py's own
+    ATDF-derived ram_banks is correct: this compiler's `common_ram` is a
+    narrow, reserved-for-fixed-scratch concept (crates/alloc never places
+    globals there), not a general stand-in for "gputils called it
+    SHAREBANK", so collapsing to that empty reading would silently zero
+    out real, already-correct RAM rather than genuinely correct it."""
     data = _load(toml_path)
     core = data["core"]
     banks, shared, access = _lkr_ram(lkr_path.read_text())
@@ -251,7 +260,11 @@ def correct_ram(toml_path, lkr_path):
         new_ram = [[lo, hi]]
     else:
         new_ram = [[lo, hi] for lo, hi in banks]
-    if data["ram_banks"] == new_ram:
+    if not new_ram:
+        return False
+    old_bytes = sum(hi - lo + 1 for lo, hi in data["ram_banks"])
+    new_bytes = sum(hi - lo + 1 for lo, hi in new_ram)
+    if new_bytes <= old_bytes:
         return False
     text = toml_path.read_text()
     old = "ram_banks = " + _fmt_ram(data["ram_banks"])

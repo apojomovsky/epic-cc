@@ -112,6 +112,17 @@ DATABANK   NAME=gpr1       START=0xA0              END=0xEF
 SHAREBANK  NAME=gprnobnk   START=0x70            END=0x7F
 """
 
+# PIC12F675's shape: gputils names the device's whole (and only) GPR
+# window a SHAREBANK ("gprnobank"), not a DATABANK gpr*, because bank 1's
+# window is a full mirror of bank 0. `banks` here is empty even though
+# the device has real, already-correct RAM.
+PIC14_LKR_ALL_SHARED = """\
+DATABANK   NAME=sfr0       START=0x0               END=0x1F           PROTECTED
+DATABANK   NAME=sfr1       START=0x80              END=0x9F           PROTECTED
+SHAREBANK  NAME=gprnobank  START=0x20              END=0x5F
+SHAREBANK  NAME=gprnobank  START=0xA0              END=0xDF           PROTECTED
+"""
+
 
 def write(path, text):
     path.write_text(text)
@@ -218,6 +229,28 @@ class CorrectRamTest(unittest.TestCase):
             text = toml.read_text()
         self.assertTrue(changed)
         self.assertIn("ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]", text)
+
+    def test_pic14_keeps_ram_when_lkr_has_no_databank_gpr(self):
+        # PIC12F675: gputils calls the device's only GPR window a
+        # SHAREBANK, not a DATABANK gpr*, so `banks` parses empty. That
+        # must not overwrite gen-device.py's already-correct ram_banks
+        # with nothing (this compiler's common_ram is a narrow,
+        # fixed-scratch-only concept, never a stand-in for "gputils called
+        # it SHAREBANK").
+        with tempfile.TemporaryDirectory() as d:
+            toml = write(
+                pathlib.Path(d) / "p14syn01.toml",
+                PIC14_TOML.replace(
+                    "ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]\n"
+                    "common_ram = [0x0070, 0x007F]\n",
+                    "ram_banks = [[0x0020, 0x005F]]\n",
+                ),
+            )
+            lkr = write(pathlib.Path(d) / "14syn01_g.lkr", PIC14_LKR_ALL_SHARED)
+            changed = add_device.correct_ram(toml, lkr)
+            text = toml.read_text()
+        self.assertFalse(changed)
+        self.assertIn("ram_banks = [[0x0020, 0x005F]]", text)
 
 
 class FieldDiffTest(unittest.TestCase):
