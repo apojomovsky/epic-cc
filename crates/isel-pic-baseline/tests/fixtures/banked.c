@@ -60,4 +60,6 @@ void main(void) {
     }
     p = &g0;
     out = deref(p);
+    p = &g19;
+    out = deref(p);
 }

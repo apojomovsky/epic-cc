@@ -505,19 +505,13 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                 }
                 self.emit_load_cmp_byte(b, 0, signed, high);
-                self.emit_bank_select(if use_scratch && n == 1 {
+                let sub_f = if use_scratch && n == 1 {
                     self.scratch
                 } else {
                     aa
-                });
-                self.emit(format!(
-                    "    SUBWF 0x{:02X}, W",
-                    if use_scratch && n == 1 {
-                        self.scratch
-                    } else {
-                        aa
-                    }
-                ));
+                };
+                self.emit_bank_select(sub_f);
+                self.emit(format!("    SUBWF {}, W", self.fop(sub_f)));
                 for i in 1..n {
                     self.emit_load_cmp_byte(b, i, signed, high);
                     self.emit_add_w_borrow();
@@ -820,8 +814,9 @@ impl<'m> Gen<'m> {
                 let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
                 for i in 0..n {
                     self.emit_w_load(bb + u16::from(i));
-                    self.emit_bank_select(ra + u16::from(i));
-                    self.emit(format!("    {op} 0x{:02X}, W", ra + u16::from(i)));
+                    let f = ra + u16::from(i);
+                    self.emit_bank_select(f);
+                    self.emit(format!("    {op} {}, W", self.fop(f)));
                     self.emit_w_store(dst + u16::from(i));
                 }
             }
@@ -862,6 +857,11 @@ impl<'m> Gen<'m> {
     /// `d = k - a` (const LHS) for `bytes`-wide values. Baseline has no
     /// `SUBLW`, so each byte's `k_i - (a_i + borrow)` lowers to the scratch
     /// idiom: stash the a byte, load k_i, SUBWF computes k_i - W (D-6).
+    /// Byte 0 has no borrow-in; each higher byte folds the borrow from the
+    /// low byte with the wrap-correct INCFSZ idiom: `k_i` preloads into the
+    /// dst, `a_i` copies to scratch, and `SUBWF` computes `k_i - (a_i +
+    /// borrow)` in place. At the wrap the skip leaves dst at `k_i` with C as
+    /// the true borrow-out (epic-cc#1).
     fn emit_sub_const_lhs(&mut self, k: &i64, a: &Val, dst: u16, bytes: u8) {
         let aa = self.val_addr(a).direct();
         self.emit_bank_select(aa);
@@ -872,12 +872,19 @@ impl<'m> Gen<'m> {
         self.emit_w_store(dst);
         for i in 1..bytes {
             let kb = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+            // Subtrahend to scratch (dst preload may overlay a), k_i into
+            // dst, then W reloaded from scratch before the fold: on the
+            // no-borrow path the skip leaves k_i in W, so SUBWF would
+            // compute k_i - k_i without the reload.
             self.emit_bank_select(aa + u16::from(i));
             self.emit(format!("    MOVF {}, W", self.fop(aa + u16::from(i))));
             self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
             self.emit(format!("    MOVLW 0x{kb:02X}"));
-            self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
             self.emit_w_store(dst + u16::from(i));
+            self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
+            self.emit("    BTFSS STATUS, 0 ; C".to_string());
+            self.emit(format!("    INCFSZ {}, W", self.fop(self.scratch)));
+            self.emit(format!("    SUBWF {}, F", self.fop(dst + u16::from(i))));
         }
     }
 
@@ -997,7 +1004,10 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVF {}, W", self.fop(a)))
             }
             Addr::Indirect => {
-                self.emit("    BCF FSR, 5".to_string());
+                // The pointer was just fully loaded into FSR (bank bit and
+                // offset together, D-2 item 2), so FSR<5> is never stale at
+                // an INDF touch: no reassertion here, or a bank-1 pointer
+                // (0x30-0x3F) would be silently redirected to bank 0.
                 self.emit("    MOVF INDF, W".to_string())
             }
         }
@@ -1011,7 +1021,9 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF {}", self.fop(a)))
             }
             Addr::Indirect => {
-                self.emit("    BCF FSR, 5".to_string());
+                // FSR<5> is never stale at an INDF touch (the pointer load
+                // just set it); no reassertion, or a bank-1 pointer would be
+                // redirected to bank 0.
                 self.emit("    MOVWF INDF".to_string())
             }
         }
@@ -1027,7 +1039,9 @@ impl<'m> Gen<'m> {
             }
             Addr::Indirect => {
                 self.emit_load_byte(val, byte_off);
-                self.emit("    BCF FSR, 5".to_string());
+                // FSR<5> is never stale at an INDF touch (the pointer load
+                // just set it); no reassertion, or a bank-1 pointer would be
+                // redirected to bank 0.
                 self.emit("    MOVWF INDF".to_string());
             }
         }
@@ -1133,11 +1147,9 @@ impl<'m> Gen<'m> {
             let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
             for i in 0..t.bytes() {
-                self.emit_bank_select(self.retval_lo + u16::from(i));
-                self.emit(format!(
-                    "    MOVF 0x{:02X}, W",
-                    self.retval_lo + u16::from(i)
-                ));
+                let rv = self.retval_lo + u16::from(i);
+                self.emit_bank_select(rv);
+                self.emit(format!("    MOVF {}, W", self.fop(rv)));
                 self.emit_w_store(da + u16::from(i));
             }
         }
@@ -1168,11 +1180,9 @@ impl<'m> Gen<'m> {
             let t = ty.expect("isel: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
             for i in 0..t.bytes() {
-                self.emit_bank_select(self.retval_lo + u16::from(i));
-                self.emit(format!(
-                    "    MOVF 0x{:02X}, W",
-                    self.retval_lo + u16::from(i)
-                ));
+                let rv = self.retval_lo + u16::from(i);
+                self.emit_bank_select(rv);
+                self.emit(format!("    MOVF {}, W", self.fop(rv)));
                 self.emit_w_store(da + u16::from(i));
             }
         }
@@ -1951,7 +1961,9 @@ pub fn select_with_locs(
         }
     }
     // Const string literals copied to RAM need their bytes initialized
-    // before main runs.
+    // before main runs. Each write is a direct access, so it needs the
+    // D-2 bank reassertion and the 5-bit within-bank mask (the 509's FSR
+    // power-on reset has bit 5 = 1, so a bank-0 const needs BCF FSR,5).
     let mut init: Vec<String> = Vec::new();
     for g in &m.globals {
         if g.is_const && addrs.contains_key(&g.name) {
@@ -1963,7 +1975,13 @@ pub fn select_with_locs(
                 } else {
                     init.push(format!("    MOVLW 0x{b:02X}"));
                 }
-                init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
+                let addr = base + i as u16;
+                match device.bank_of(addr) {
+                    Some(0) => init.push("    BCF FSR, 5".to_string()),
+                    Some(1) => init.push("    BSF FSR, 5".to_string()),
+                    _ => {}
+                }
+                init.push(format!("    MOVWF 0x{:02X}", addr & 0x1F));
             }
         }
     }

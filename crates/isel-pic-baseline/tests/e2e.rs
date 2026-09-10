@@ -130,16 +130,33 @@ fn banked_c_runs_correctly_and_reasserts_fsr5() {
     let _guard = E2E_LOCK.lock();
     let (mut p, globals, asm) = compile_asm("tests/fixtures/banked.c");
     p.run(10_000);
-    assert_eq!(p.ram()[globals["out"] as usize], 1, "out = *&g0 = 1");
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        20,
+        "out = deref(&g19) = 20 (g19 is in bank 1)"
+    );
     assert!(p.halted());
     // D-2: the emitted asm must contain BSF FSR,5 (bank-1 direct access)
-    // and BCF FSR,5 (bank-0 direct access and INDF touches).
+    // and BCF FSR,5 (bank-0 direct access). The INDF touches must NOT be
+    // preceded by BCF FSR,5: the pointer load sets FSR<5>, and clearing it
+    // would redirect a bank-1 pointer to bank 0.
     assert!(
         asm.contains("BSF FSR, 5"),
         "banked.c must emit BSF FSR,5 for a bank-1 direct access:\n{asm}"
     );
     assert!(
         asm.contains("BCF FSR, 5"),
-        "banked.c must emit BCF FSR,5 for bank-0/INDF accesses:\n{asm}"
+        "banked.c must emit BCF FSR,5 for bank-0 direct accesses:\n{asm}"
     );
+    // The deref of g19 (bank 1) must read through INDF with FSR<5> set.
+    let lines: Vec<&str> = asm.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        if l.contains("MOVF INDF, W") {
+            let prev = lines[i - 1];
+            assert!(
+                !prev.contains("BCF FSR, 5"),
+                "INDF touch must not be preceded by BCF FSR,5 (would redirect a bank-1 pointer):\n{prev}"
+            );
+        }
+    }
 }
