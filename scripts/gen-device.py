@@ -404,32 +404,62 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                         f"contiguous run from bit 0, cannot place it from "
                         f"width and cursor alone"
                     ])
-                covered |= ((1 << width) - 1) << cursor
+                field_bits = ((1 << width) - 1) << cursor
                 hidden = (
                     child.get(ns + "ishidden") == "true"
                     or child.get(ns + "islanghidden") == "true"
                 )
+                # A hidden field's bits outside impl are documentary
+                # padding (a trailing RESERVED byte, or a field straddling
+                # the impl boundary): only its overlap with impl counts,
+                # same as a real bit would (p18f6520's T1OSCMX). A
+                # non-hidden field always counts in full: exact placement
+                # is what this check verifies.
+                covered |= (field_bits & impl) if hidden else field_bits
                 if not hidden:
                     semantics = child.findall(ns + "DCRFieldSemantic")
                     values = []
                     unmatched = []
                     for sem in semantics:
+                        # Some semantics document an overlapping "don't
+                        # care" bit pattern (e.g. OSC's "11XX") rather than
+                        # a distinct legal value, and are themselves
+                        # marked hidden with no cname; skip them the same
+                        # way a hidden field is skipped, not as a real
+                        # named value.
+                        if (sem.get(ns + "ishidden") == "true"
+                                or sem.get(ns + "islanghidden") == "true"):
+                            continue
                         when = sem.get(ns + "when") or ""
                         m = re.search(r"==\s*(0x[0-9a-fA-F]+|\d+)", when)
                         if m:
                             values.append((sem.get(ns + "cname"), int(m.group(1), 0)))
                         else:
                             unmatched.append(when)
-                    if semantics and not values:
-                        # Every semantic used a form this generator does not
-                        # read (a relational `when`, not `==`). Dropping the
-                        # field silently would contradict the one rule this
-                        # module exists to keep: a fact it cannot read is a
-                        # hard error, never an omission.
+                    if unmatched:
+                        # Every non-hidden semantic used a form this
+                        # generator does not read (a relational `when`,
+                        # not `==`). Dropping the field silently would
+                        # contradict the one rule this module exists to
+                        # keep: a fact it cannot read is a hard error,
+                        # never an omission.
                         raise MissingFacts([
                             f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
                             f"field {fname}'s semantics use an unhandled "
                             f"`when` form: {unmatched}"
+                        ])
+                    if semantics and not values:
+                        # A visible field whose every semantic turned out
+                        # to be individually hidden has no legal value
+                        # this generator can name. That is still a fact
+                        # it cannot read, not an empty-but-fine field: an
+                        # unnamed real field silently missing from the
+                        # TOML is exactly the omission this module exists
+                        # to refuse.
+                        raise MissingFacts([
+                            f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                            f"field {fname} has no non-hidden semantic, "
+                            f"cannot determine its legal values"
                         ])
                     if values:
                         fields.append({
