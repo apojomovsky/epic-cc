@@ -24,3 +24,15 @@ The float algorithms (decode/encode, implicit bit, RNE guard/sticky/LSB, denorma
 ## Revisit if
 
 A part with a different soft-float story appears, or the access-bank frame rule proves too tight for a larger float program (the rule could be relaxed to allow `MOVLB` outside skip windows, or the recipes could be rewritten branch-based like P6's divmod).
+
+## Update 2026-09-10 (epic-cc#357)
+
+The access-bank frame rule is superseded: float routines place exactly like
+integer ones (single-GPR-bank rounding, context-relative bases), and every
+recipe memory op goes through `operand()`'s MOVLB discipline via the
+`emit_banked` helper. The rule's real invariant was narrower than "frame
+must sit at or under 0x5F": no MOVLB between a skip test and its target.
+Every skip in the float recipes targets the next instruction or an explicit
+GOTO, so banked frames are sound. Per-context frames (each ISR priority's
+routine copies place in its own overlay region) close the cross-context
+scratch clobber this rule caused. See ADR-030 for the region scheme.
