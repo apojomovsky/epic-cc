@@ -348,9 +348,10 @@ Still open:
    stack rejects most call graphs deeper than 2 worth shipping at all,
    absent a concrete consumer? (D-4 states the technical policy;
    this asks whether it's worth it.)
-2. D-1's crate-sharing question (does `isel-pic-baseline` share more
-   with `isel` or is it closer to clean-room), not resolved, needs a
-   prototype or closer read, not blocking approval to start P0/P1.
+2. ~~D-1's crate-sharing question~~: resolved in P2 (epic-cc#325, see
+   §2). `isel-pic-baseline` shares the integer-spine *structure* with
+   classic `isel` but owns its instruction-emission code, as `isel-pic14e`
+   does.
 3. ~~D-3's device-profile `[VERIFY]` items~~: resolved in P0
    (epic-cc#323). Config word: 0x7FF in the 509's config memory space per
    DS41227B section 2.3, HEX word 0xFFF per the MPASM/gputils convention
