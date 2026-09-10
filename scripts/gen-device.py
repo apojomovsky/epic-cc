@@ -627,7 +627,7 @@ def parse_edc(edc_path: pathlib.Path):
         return None
 
     sectors = []
-    shadowed = set()
+    shadows = []  # (lo, hi, target_rid, bank), same bank as their target's mirror
     access = []
     gpr_banks = []
     gpr_banks_known = True
@@ -638,19 +638,38 @@ def parse_edc(edc_path: pathlib.Path):
         e = gs.get(ns + "endaddr")
         if not (b and e):
             continue
-        if mode_ancestor(gs) == "TraditionalModeOnly":
+        # Confirmed on PIC18F252/258/452: silicon that predates the Extended
+        # Instruction Set entirely has only ever had one addressing mode, so
+        # their DFP states `accessram` bare under RegardlessOfMode instead of
+        # wrapping it in an (empty) TraditionalModeOnly, unlike every other
+        # PIC18 device already shipped. The region name is what identifies
+        # it either way; treat it as the access window regardless of wrapper.
+        if (
+            mode_ancestor(gs) == "TraditionalModeOnly"
+            or gs.get(ns + "regionid") == "accessram"
+        ):
             access.append((int(b, 0), int(e, 0) - 1))
             continue
+        bank = gs.get(ns + "bank")
         ref = gs.get(ns + "shadowidref")
         if ref:
-            shadowed.add(ref)
+            shadows.append((int(b, 0), int(e, 0) - 1, ref, bank))
             continue
-        sectors.append((int(b, 0), int(e, 0) - 1, gs.get(ns + "regionid")))
-        bank = gs.get(ns + "bank")
+        sectors.append((int(b, 0), int(e, 0) - 1, gs.get(ns + "regionid"), bank))
         if bank is None:
             gpr_banks_known = False
         else:
             gpr_banks.append(int(bank, 0))
+    # A bank that is entirely one shadow (PIC16F74 bank 2/3, PIC16F84 bank
+    # 1: the same silicon as another bank, addressable a second way for no
+    # benefit) votes nothing. A bank mixing a shadow with its own real GPR
+    # (PIC16F628A/87/88/747/877's `gprnobnk` corner) means that shadow's
+    # target is genuinely bank-independent, a common_ram candidate. Bank
+    # membership, not shadow reference count, is what tells these apart.
+    banks_with_primary = {bank for _, _, _, bank in sectors}
+    common_candidates = {
+        target for _, _, target, bank in shadows if bank in banks_with_primary
+    }
     if access:
         merged_access = merge_contiguous(access)
         if len(merged_access) != 1:
@@ -667,9 +686,19 @@ def parse_edc(edc_path: pathlib.Path):
         out["access_bank"] = merged_access[0]
     if sectors:
         out["ram_banks"] = merge_contiguous(
-            [(lo, hi) for lo, hi, rid in sectors if rid not in shadowed]
+            [(lo, hi) for lo, hi, rid, _ in sectors if rid not in common_candidates]
         )
-        common = sorted((lo, hi) for lo, hi, rid in sectors if rid in shadowed)
+        common = sorted(
+            (lo, hi) for lo, hi, rid, _ in sectors if rid in common_candidates
+        )
+        if len(common) > 1:
+            # Device::common_ram is a single range (Option<(u16, u16)>);
+            # more than one surviving span means the source has more than
+            # one bank-independent corner, which this generator does not
+            # understand well enough to pick one and discard the rest.
+            raise MissingFacts(
+                [f"common_ram: multiple bank-independent sectors found: {common}"]
+            )
         if common:
             out["common_ram"] = common[0]
     # Distinct GPR bank numbers, the baseline fsr_bank_bits source in

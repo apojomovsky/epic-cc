@@ -1,0 +1,268 @@
+name = "p18f66j94"
+core = "pic18"
+flash_words = 32760
+ram_banks = [[0x0010, 0x0DF9]]
+access_bank = [0x0000, 0x005F]
+fixed_retval = [0x0000, 0x000F]
+stack_depth = 31
+interrupt_vectors = [0x0008, 0x0018]
+
+[provenance]
+tier = "atdf"
+source = "PIC18F66J94.PIC"
+pack = "Microchip.PIC18F-J_DFP"
+sha256 = "2ae85cbbe1dc9c13f3802f0cbe121aca4d99eec76412b619aba54005b1bf46fa"
+
+[config]
+base_byte_addr = 0xFFF0
+num_bytes = 16
+erased_baseline = [0xE0, 0xF7, 0xAF, 0xFF, 0x33, 0xF0, 0xFF, 0xF7, 0x03, 0xFF, 0xFF, 0xFF, 0x1D, 0xF0, 0xF8, 0xF3]
+
+[[config.fields]]
+name = "stvren"
+byte_offset = 0
+mask = 0x20
+shift = 5
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "xinst"
+byte_offset = 0
+mask = 0x40
+shift = 6
+default = "off"
+locked = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "boren"
+byte_offset = 1
+mask = 0x01
+shift = 0
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "borv"
+byte_offset = 1
+mask = 0x02
+shift = 1
+values = [{ name = "0", bits = 0 }, { name = "1", bits = 1 }]
+
+[[config.fields]]
+name = "cp0"
+byte_offset = 1
+mask = 0x04
+shift = 2
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 2
+mask = 0x07
+shift = 0
+values = [{ name = "frc", bits = 0 }, { name = "frcpll", bits = 1 }, { name = "pri", bits = 2 }, { name = "pripll", bits = 3 }, { name = "sosc", bits = 4 }, { name = "lprc", bits = 5 }, { name = "frc500khz", bits = 6 }, { name = "frcdiv", bits = 7 }]
+
+[[config.fields]]
+name = "soscsel"
+byte_offset = 2
+mask = 0x08
+shift = 3
+values = [{ name = "dig", bits = 0 }, { name = "low", bits = 1 }]
+
+[[config.fields]]
+name = "clkoen"
+byte_offset = 2
+mask = 0x20
+shift = 5
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "ieso"
+byte_offset = 2
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "plldiv"
+byte_offset = 3
+mask = 0x0F
+shift = 0
+values = [{ name = "nodiv", bits = 0 }, { name = "div2", bits = 1 }, { name = "div3", bits = 2 }, { name = "div4", bits = 3 }, { name = "div5", bits = 4 }, { name = "div6", bits = 5 }, { name = "div10", bits = 6 }, { name = "div12", bits = 7 }, { name = "pll4x", bits = 12 }, { name = "pll6x", bits = 13 }, { name = "pll8x", bits = 14 }, { name = "nopll", bits = 15 }]
+
+[[config.fields]]
+name = "poscmd"
+byte_offset = 4
+mask = 0x03
+shift = 0
+values = [{ name = "ec", bits = 0 }, { name = "ms", bits = 1 }, { name = "hs", bits = 2 }, { name = "none", bits = 3 }]
+
+[[config.fields]]
+name = "fscm"
+byte_offset = 4
+mask = 0x30
+shift = 4
+values = [{ name = "csecme", bits = 0 }, { name = "csecmd", bits = 1 }, { name = "csdcmd", bits = 2 }]
+
+[[config.fields]]
+name = "wpfp"
+byte_offset = 6
+mask = 0xFF
+shift = 0
+values = [{ name = "wpfp0", bits = 0 }, { name = "wpfp1", bits = 1 }, { name = "wpfp2", bits = 2 }, { name = "wpfp3", bits = 3 }, { name = "wpfp4", bits = 4 }, { name = "wpfp5", bits = 5 }, { name = "wpfp6", bits = 6 }, { name = "wpfp7", bits = 7 }, { name = "wpfp8", bits = 8 }, { name = "wpfp9", bits = 9 }, { name = "wpfp10", bits = 10 }, { name = "wpfp11", bits = 11 }, { name = "wpfp12", bits = 12 }, { name = "wpfp13", bits = 13 }, { name = "wpfp14", bits = 14 }, { name = "wpfp15", bits = 15 }, { name = "wpfp16", bits = 16 }, { name = "wpfp17", bits = 17 }, { name = "wpfp18", bits = 18 }, { name = "wpfp19", bits = 19 }, { name = "wpfp20", bits = 20 }, { name = "wpfp21", bits = 21 }, { name = "wpfp22", bits = 22 }, { name = "wpfp23", bits = 23 }, { name = "wpfp24", bits = 24 }, { name = "wpfp25", bits = 25 }, { name = "wpfp26", bits = 26 }, { name = "wpfp27", bits = 27 }, { name = "wpfp28", bits = 28 }, { name = "wpfp29", bits = 29 }, { name = "wpfp30", bits = 30 }, { name = "wpfp31", bits = 31 }, { name = "wpfp32", bits = 32 }, { name = "wpfp33", bits = 33 }, { name = "wpfp34", bits = 34 }, { name = "wpfp35", bits = 35 }, { name = "wpfp36", bits = 36 }, { name = "wpfp37", bits = 37 }, { name = "wpfp38", bits = 38 }, { name = "wpfp39", bits = 39 }, { name = "wpfp40", bits = 40 }, { name = "wpfp41", bits = 41 }, { name = "wpfp42", bits = 42 }, { name = "wpfp43", bits = 43 }, { name = "wpfp44", bits = 44 }, { name = "wpfp45", bits = 45 }, { name = "wpfp46", bits = 46 }, { name = "wpfp47", bits = 47 }, { name = "wpfp48", bits = 48 }, { name = "wpfp49", bits = 49 }, { name = "wpfp50", bits = 50 }, { name = "wpfp51", bits = 51 }, { name = "wpfp52", bits = 52 }, { name = "wpfp53", bits = 53 }, { name = "wpfp54", bits = 54 }, { name = "wpfp55", bits = 55 }, { name = "wpfp56", bits = 56 }, { name = "wpfp57", bits = 57 }, { name = "wpfp58", bits = 58 }, { name = "wpfp59", bits = 59 }, { name = "wpfp60", bits = 60 }, { name = "wpfp61", bits = 61 }, { name = "wpfp62", bits = 62 }, { name = "wpfp63", bits = 63 }, { name = "wpfp64", bits = 64 }, { name = "wpfp65", bits = 65 }, { name = "wpfp66", bits = 66 }, { name = "wpfp67", bits = 67 }, { name = "wpfp68", bits = 68 }, { name = "wpfp69", bits = 69 }, { name = "wpfp70", bits = 70 }, { name = "wpfp71", bits = 71 }, { name = "wpfp72", bits = 72 }, { name = "wpfp73", bits = 73 }, { name = "wpfp74", bits = 74 }, { name = "wpfp75", bits = 75 }, { name = "wpfp76", bits = 76 }, { name = "wpfp77", bits = 77 }, { name = "wpfp78", bits = 78 }, { name = "wpfp79", bits = 79 }, { name = "wpfp80", bits = 80 }, { name = "wpfp81", bits = 81 }, { name = "wpfp82", bits = 82 }, { name = "wpfp83", bits = 83 }, { name = "wpfp84", bits = 84 }, { name = "wpfp85", bits = 85 }, { name = "wpfp86", bits = 86 }, { name = "wpfp87", bits = 87 }, { name = "wpfp88", bits = 88 }, { name = "wpfp89", bits = 89 }, { name = "wpfp90", bits = 90 }, { name = "wpfp91", bits = 91 }, { name = "wpfp92", bits = 92 }, { name = "wpfp93", bits = 93 }, { name = "wpfp94", bits = 94 }, { name = "wpfp95", bits = 95 }, { name = "wpfp96", bits = 96 }, { name = "wpfp97", bits = 97 }, { name = "wpfp98", bits = 98 }, { name = "wpfp99", bits = 99 }, { name = "wpfp100", bits = 100 }, { name = "wpfp101", bits = 101 }, { name = "wpfp102", bits = 102 }, { name = "wpfp103", bits = 103 }, { name = "wpfp104", bits = 104 }, { name = "wpfp105", bits = 105 }, { name = "wpfp106", bits = 106 }, { name = "wpfp107", bits = 107 }, { name = "wpfp108", bits = 108 }, { name = "wpfp109", bits = 109 }, { name = "wpfp110", bits = 110 }, { name = "wpfp111", bits = 111 }, { name = "wpfp112", bits = 112 }, { name = "wpfp113", bits = 113 }, { name = "wpfp114", bits = 114 }, { name = "wpfp115", bits = 115 }, { name = "wpfp116", bits = 116 }, { name = "wpfp117", bits = 117 }, { name = "wpfp118", bits = 118 }, { name = "wpfp119", bits = 119 }, { name = "wpfp120", bits = 120 }, { name = "wpfp121", bits = 121 }, { name = "wpfp122", bits = 122 }, { name = "wpfp123", bits = 123 }, { name = "wpfp124", bits = 124 }, { name = "wpfp125", bits = 125 }, { name = "wpfp126", bits = 126 }, { name = "wpfp127", bits = 127 }, { name = "wpfp128", bits = 128 }, { name = "wpfp129", bits = 129 }, { name = "wpfp130", bits = 130 }, { name = "wpfp131", bits = 131 }, { name = "wpfp132", bits = 132 }, { name = "wpfp133", bits = 133 }, { name = "wpfp134", bits = 134 }, { name = "wpfp135", bits = 135 }, { name = "wpfp136", bits = 136 }, { name = "wpfp137", bits = 137 }, { name = "wpfp138", bits = 138 }, { name = "wpfp139", bits = 139 }, { name = "wpfp140", bits = 140 }, { name = "wpfp141", bits = 141 }, { name = "wpfp142", bits = 142 }, { name = "wpfp143", bits = 143 }, { name = "wpfp144", bits = 144 }, { name = "wpfp145", bits = 145 }, { name = "wpfp146", bits = 146 }, { name = "wpfp147", bits = 147 }, { name = "wpfp148", bits = 148 }, { name = "wpfp149", bits = 149 }, { name = "wpfp150", bits = 150 }, { name = "wpfp151", bits = 151 }, { name = "wpfp152", bits = 152 }, { name = "wpfp153", bits = 153 }, { name = "wpfp154", bits = 154 }, { name = "wpfp155", bits = 155 }, { name = "wpfp156", bits = 156 }, { name = "wpfp157", bits = 157 }, { name = "wpfp158", bits = 158 }, { name = "wpfp159", bits = 159 }, { name = "wpfp160", bits = 160 }, { name = "wpfp161", bits = 161 }, { name = "wpfp162", bits = 162 }, { name = "wpfp163", bits = 163 }, { name = "wpfp164", bits = 164 }, { name = "wpfp165", bits = 165 }, { name = "wpfp166", bits = 166 }, { name = "wpfp167", bits = 167 }, { name = "wpfp168", bits = 168 }, { name = "wpfp169", bits = 169 }, { name = "wpfp170", bits = 170 }, { name = "wpfp171", bits = 171 }, { name = "wpfp172", bits = 172 }, { name = "wpfp173", bits = 173 }, { name = "wpfp174", bits = 174 }, { name = "wpfp175", bits = 175 }, { name = "wpfp176", bits = 176 }, { name = "wpfp177", bits = 177 }, { name = "wpfp178", bits = 178 }, { name = "wpfp179", bits = 179 }, { name = "wpfp180", bits = 180 }, { name = "wpfp181", bits = 181 }, { name = "wpfp182", bits = 182 }, { name = "wpfp183", bits = 183 }, { name = "wpfp184", bits = 184 }, { name = "wpfp185", bits = 185 }, { name = "wpfp186", bits = 186 }, { name = "wpfp187", bits = 187 }, { name = "wpfp188", bits = 188 }, { name = "wpfp189", bits = 189 }, { name = "wpfp190", bits = 190 }, { name = "wpfp191", bits = 191 }, { name = "wpfp192", bits = 192 }, { name = "wpfp193", bits = 193 }, { name = "wpfp194", bits = 194 }, { name = "wpfp195", bits = 195 }, { name = "wpfp196", bits = 196 }, { name = "wpfp197", bits = 197 }, { name = "wpfp198", bits = 198 }, { name = "wpfp199", bits = 199 }, { name = "wpfp200", bits = 200 }, { name = "wpfp201", bits = 201 }, { name = "wpfp202", bits = 202 }, { name = "wpfp203", bits = 203 }, { name = "wpfp204", bits = 204 }, { name = "wpfp205", bits = 205 }, { name = "wpfp206", bits = 206 }, { name = "wpfp207", bits = 207 }, { name = "wpfp208", bits = 208 }, { name = "wpfp209", bits = 209 }, { name = "wpfp210", bits = 210 }, { name = "wpfp211", bits = 211 }, { name = "wpfp212", bits = 212 }, { name = "wpfp213", bits = 213 }, { name = "wpfp214", bits = 214 }, { name = "wpfp215", bits = 215 }, { name = "wpfp216", bits = 216 }, { name = "wpfp217", bits = 217 }, { name = "wpfp218", bits = 218 }, { name = "wpfp219", bits = 219 }, { name = "wpfp220", bits = 220 }, { name = "wpfp221", bits = 221 }, { name = "wpfp222", bits = 222 }, { name = "wpfp223", bits = 223 }, { name = "wpfp224", bits = 224 }, { name = "wpfp225", bits = 225 }, { name = "wpfp226", bits = 226 }, { name = "wpfp227", bits = 227 }, { name = "wpfp228", bits = 228 }, { name = "wpfp229", bits = 229 }, { name = "wpfp230", bits = 230 }, { name = "wpfp231", bits = 231 }, { name = "wpfp232", bits = 232 }, { name = "wpfp233", bits = 233 }, { name = "wpfp234", bits = 234 }, { name = "wpfp235", bits = 235 }, { name = "wpfp236", bits = 236 }, { name = "wpfp237", bits = 237 }, { name = "wpfp238", bits = 238 }, { name = "wpfp239", bits = 239 }, { name = "wpfp240", bits = 240 }, { name = "wpfp241", bits = 241 }, { name = "wpfp242", bits = 242 }, { name = "wpfp243", bits = 243 }, { name = "wpfp244", bits = 244 }, { name = "wpfp245", bits = 245 }, { name = "wpfp246", bits = 246 }, { name = "wpfp247", bits = 247 }, { name = "wpfp248", bits = 248 }, { name = "wpfp249", bits = 249 }, { name = "wpfp250", bits = 250 }, { name = "wpfp251", bits = 251 }, { name = "wpfp252", bits = 252 }, { name = "wpfp253", bits = 253 }, { name = "wpfp254", bits = 254 }, { name = "wpfp255", bits = 255 }]
+
+[[config.fields]]
+name = "wpdis"
+byte_offset = 7
+mask = 0x01
+shift = 0
+values = [{ name = "wpen", bits = 0 }, { name = "wpdis", bits = 1 }]
+
+[[config.fields]]
+name = "wpend"
+byte_offset = 7
+mask = 0x02
+shift = 1
+values = [{ name = "wpstartmem", bits = 0 }, { name = "wpendmem", bits = 1 }]
+
+[[config.fields]]
+name = "wpcfg"
+byte_offset = 7
+mask = 0x04
+shift = 2
+values = [{ name = "wpcfgen", bits = 0 }, { name = "wpcfgdis", bits = 1 }]
+
+[[config.fields]]
+name = "t5gsel"
+byte_offset = 8
+mask = 0x01
+shift = 0
+values = [{ name = "t3g", bits = 0 }, { name = "t5g", bits = 1 }]
+
+[[config.fields]]
+name = "cinasel"
+byte_offset = 8
+mask = 0x02
+shift = 1
+values = [{ name = "ra5", bits = 0 }, { name = "default", bits = 1 }]
+
+[[config.fields]]
+name = "iol1way"
+byte_offset = 9
+mask = 0x01
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "ls48mhz"
+byte_offset = 9
+mask = 0x02
+shift = 1
+values = [{ name = "sysx1", bits = 0 }, { name = "sysx2", bits = 1 }]
+
+[[config.fields]]
+name = "msspmsk2"
+byte_offset = 9
+mask = 0x04
+shift = 2
+values = [{ name = "msk5", bits = 0 }, { name = "msk7", bits = 1 }]
+
+[[config.fields]]
+name = "msspmsk1"
+byte_offset = 9
+mask = 0x08
+shift = 3
+values = [{ name = "msk5", bits = 0 }, { name = "msk7", bits = 1 }]
+
+[[config.fields]]
+name = "wdtwin"
+byte_offset = 10
+mask = 0x03
+shift = 0
+values = [{ name = "ps75_0", bits = 0 }, { name = "ps50_0", bits = 1 }, { name = "ps37_5", bits = 2 }, { name = "ps25_0", bits = 3 }]
+
+[[config.fields]]
+name = "wdtclk"
+byte_offset = 10
+mask = 0x0C
+shift = 2
+values = [{ name = "sys", bits = 0 }, { name = "sosc", bits = 1 }, { name = "lprc", bits = 2 }, { name = "frc", bits = 3 }]
+
+[[config.fields]]
+name = "wdtps"
+byte_offset = 10
+mask = 0xF0
+shift = 4
+values = [{ name = "1", bits = 0 }, { name = "2", bits = 1 }, { name = "4", bits = 2 }, { name = "8", bits = 3 }, { name = "16", bits = 4 }, { name = "32", bits = 5 }, { name = "64", bits = 6 }, { name = "128", bits = 7 }, { name = "256", bits = 8 }, { name = "512", bits = 9 }, { name = "1024", bits = 10 }, { name = "2048", bits = 11 }, { name = "4096", bits = 12 }, { name = "8192", bits = 13 }, { name = "16384", bits = 14 }, { name = "32768", bits = 15 }]
+
+[[config.fields]]
+name = "wdten"
+byte_offset = 11
+mask = 0x03
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "noslp", bits = 1 }, { name = "on", bits = 2 }, { name = "swdtdis", bits = 3 }]
+
+[[config.fields]]
+name = "windis"
+byte_offset = 11
+mask = 0x04
+shift = 2
+values = [{ name = "wdtwin", bits = 0 }, { name = "wdtstd", bits = 1 }]
+
+[[config.fields]]
+name = "wpsa"
+byte_offset = 11
+mask = 0x08
+shift = 3
+values = [{ name = "32", bits = 0 }, { name = "128", bits = 1 }]
+
+[[config.fields]]
+name = "reten"
+byte_offset = 12
+mask = 0x01
+shift = 0
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "vbtbor"
+byte_offset = 12
+mask = 0x04
+shift = 2
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "dsboren"
+byte_offset = 12
+mask = 0x08
+shift = 3
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "dsbiten"
+byte_offset = 12
+mask = 0x10
+shift = 4
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "dswdtps"
+byte_offset = 14
+mask = 0xF8
+shift = 3
+values = [{ name = "dswdtps0", bits = 0 }, { name = "dswdtps1", bits = 1 }, { name = "dswdtps2", bits = 2 }, { name = "dswdtps3", bits = 3 }, { name = "dswdtps4", bits = 4 }, { name = "dswdtps5", bits = 5 }, { name = "dswdtps6", bits = 6 }, { name = "dswdtps7", bits = 7 }, { name = "dswdtps8", bits = 8 }, { name = "dswdtps9", bits = 9 }, { name = "dswdtpsa", bits = 10 }, { name = "dswdtpsb", bits = 11 }, { name = "dswdtpsc", bits = 12 }, { name = "dswdtpsd", bits = 13 }, { name = "dswdtpse", bits = 14 }, { name = "dswdtpsf", bits = 15 }, { name = "dswdtps10", bits = 16 }, { name = "dswdtps11", bits = 17 }, { name = "dswdtps12", bits = 18 }, { name = "dswdtps13", bits = 19 }, { name = "dswdtps14", bits = 20 }, { name = "dswdtps15", bits = 21 }, { name = "dswdtps16", bits = 22 }, { name = "dswdtps17", bits = 23 }, { name = "dswdtps18", bits = 24 }, { name = "dswdtps19", bits = 25 }, { name = "dswdtps1a", bits = 26 }, { name = "dswdtps1b", bits = 27 }, { name = "dswdtps1c", bits = 28 }, { name = "dswdtps1d", bits = 29 }, { name = "dswdtps1e", bits = 30 }, { name = "dswdtps1f", bits = 31 }]
+
+[[config.fields]]
+name = "dswdten"
+byte_offset = 15
+mask = 0x01
+shift = 0
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "dswdtosc"
+byte_offset = 15
+mask = 0x02
+shift = 1
+values = [{ name = "sosc", bits = 0 }, { name = "lprc", bits = 1 }]

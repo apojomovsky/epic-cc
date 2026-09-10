@@ -138,6 +138,43 @@ class GenDeviceTest(unittest.TestCase):
         self.assertIn("stack_depth = 8", text)
         self.assertIn('core = "pic14"', text)
 
+    def test_full_bank_shadow_is_a_duplicate_not_common_ram(self):
+        # Confirmed on PIC16F74/PIC16F84: a bank whose *entire* GPR is one
+        # shadowidref (no real GPR of its own in that bank) is bit-for-bit
+        # the same silicon as the bank it shadows, not a bank-independent
+        # common corner (contrast the fixture's own bank1, which mixes a
+        # shadow with real GPR of its own and correctly stays common_ram).
+        # A merged ram_banks or a fabricated common_ram here would mean the
+        # generator mistook a full-bank duplicate for extra or shared RAM.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN02" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x200">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x20" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x20" edc:endaddr="0x70" edc:bank="0"/>
+      <edc:SFRDataSector edc:beginaddr="0x80" edc:endaddr="0xA0" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:beginaddr="0xA0" edc:endaddr="0xF0" edc:bank="1"/>
+      <edc:SFRDataSector edc:beginaddr="0x100" edc:endaddr="0x120" edc:bank="2"/>
+      <edc:GPRDataSector edc:regionid="gpr2" edc:shadowidref="gpr0" edc:beginaddr="0x120" edc:endaddr="0x170" edc:bank="2"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "full_alias.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p14syn02", pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]", text)
+        self.assertNotIn("common_ram", text)
+
     def test_fails_loudly_when_the_source_omits_a_field(self):
         stripped = "\n".join(
             line
@@ -223,6 +260,39 @@ class GenDevicePic18Test(unittest.TestCase):
         text = self.generate()
         self.assertIn("access_bank = [0x0000, 0x005F]", text)
         self.assertIn("fixed_retval = [0x0000, 0x000F]", text)
+
+    def test_bare_accessram_under_regardless_of_mode_is_still_the_access_bank(self):
+        # Confirmed on PIC18F252/258/452: silicon that predates the Extended
+        # Instruction Set entirely states `accessram` directly under
+        # RegardlessOfMode, with empty TraditionalModeOnly/ExtendedModeOnly
+        # stubs, instead of wrapping it like every other shipped PIC18
+        # device. Without recognizing the bare form, `access_bank` goes
+        # missing and `accessram` is misread as an ordinary banked GPR.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC18SYN02" edc:arch="18xxxx">
+  <edc:ArchDef edc:name="18xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x10"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x800"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x300000" edc:endaddr="0x300001"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x100">
+    <edc:RegardlessOfMode>
+      <edc:GPRDataSector edc:regionid="accessram" edc:beginaddr="0x0" edc:endaddr="0x60" edc:bank="0x0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x60" edc:endaddr="0x100" edc:bank="0x0"/>
+    </edc:RegardlessOfMode>
+    <edc:TraditionalModeOnly/>
+    <edc:ExtendedModeOnly/>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "bare_accessram.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p18syn02", pack="Microchip.PIC18Fxxxx_DFP"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("access_bank = [0x0000, 0x005F]", text)
 
     def test_contiguous_gpr_banks_merge(self):
         # gpr0 (0x60-0x7F) and gpr1 (0x80-0x9F) are back-to-back, and the

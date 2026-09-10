@@ -126,14 +126,35 @@ fn by_name_resolves_both_devices() {
 
 #[test]
 fn all_contains_every_seed_device() {
-    assert_eq!(device::ALL.len(), 12);
+    assert_eq!(device::ALL.len(), 27);
     assert!(device::ALL.iter().any(|d| d.name == "p16f877a"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f4550"));
     assert!(device::ALL.iter().any(|d| d.name == "p16f887"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f2550"));
     assert!(device::ALL.iter().any(|d| d.name == "p16f628a"));
     for stem in [
-        "p16f1933", "p16f1934", "p16f1936", "p16f1937", "p16f1938", "p16f1939", "p12f509",
+        "p16f1933",
+        "p16f1934",
+        "p16f1936",
+        "p16f1937",
+        "p16f1938",
+        "p16f1939",
+        "p12f509",
+        "p16f747",
+        "p16f87",
+        "p16f877",
+        "p16f88",
+        "p18f252",
+        "p18f2525",
+        "p18f258",
+        "p18f452",
+        "p18f4520",
+        "p18f4620",
+        "p18f26k22",
+        "p18lf46k22",
+        "p18f27j53",
+        "p18f66j94",
+        "p18f87j11",
     ] {
         assert!(
             device::ALL.iter().any(|d| d.name == stem),
@@ -238,14 +259,20 @@ fn fuse_masks_agree_with_shift_and_hold_their_values() {
 }
 
 #[test]
-fn flash_words_is_a_power_of_two() {
+fn pic14_flash_words_is_a_multiple_of_the_page_size() {
+    // isel/isel-pic14e page CALL/GOTO in 0x800-word blocks; pic18 (21-bit
+    // PC, no paging) and pic-baseline (isel-pic-baseline pages
+    // differently) have no such requirement. Confirmed on PIC18F2525's
+    // real, datasheet-stated 24576-word flash: not a power of two either.
     for d in device::ALL {
-        assert!(
-            d.flash_words.is_power_of_two(),
-            "{}: flash_words {} is not a power of two",
-            d.name,
-            d.flash_words
-        );
+        if matches!(d.core, device::Core::Pic14 | device::Core::Pic14e) {
+            assert!(
+                d.flash_words % 0x800 == 0,
+                "{}: flash_words {} is not a multiple of 0x800",
+                d.name,
+                d.flash_words
+            );
+        }
     }
 }
 
