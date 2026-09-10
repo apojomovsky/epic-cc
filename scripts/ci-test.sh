@@ -55,7 +55,7 @@ fi
 # The device generator is python, so no cargo invocation covers it. It gates
 # the same data the gputils cross-check does, and an unrun test is not a gate.
 echo "::group::gen-device"
-if python3 scripts/test_gen_device.py; then
+if python3 scripts/test_gen_device.py && python3 scripts/test_add_device.py; then
   echo "PASS: gen-device"
   row="| gen-device | PASS |"
 else
