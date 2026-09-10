@@ -281,11 +281,18 @@ fn main() {
         if dev.flash_words == 0 {
             panic!("device: {}: flash_words must be greater than 0", path);
         }
-        if !dev.flash_words.is_power_of_two() {
+        // `isel`/`isel-pic14e` page CALL/GOTO in 0x800-word blocks
+        // (`device.flash_words / 0x800`), so pic14/pic14e flash must divide
+        // evenly into that page size or the last page's math underflows.
+        // Confirmed no such requirement on pic18 (21-bit PC addresses flash
+        // directly, no paging) or pic-baseline (isel-pic-baseline pages
+        // differently): PIC18F2525's real, datasheet-stated 24576-word
+        // flash is neither a power of two nor a 0x800 multiple, and needs
+        // neither.
+        if matches!(dev.core.as_str(), "pic14" | "pic14e") && dev.flash_words % 0x800 != 0 {
             panic!(
-                "device: {}: flash_words {} is not a power of two; every supported \
-                 part sizes program memory in powers of two, so this is a \
-                 transcription error until a part proves otherwise",
+                "device: {}: flash_words {} is not a multiple of 0x800 words, the \
+                 CALL/GOTO page size pic14/pic14e's isel assumes",
                 path, dev.flash_words
             );
         }
