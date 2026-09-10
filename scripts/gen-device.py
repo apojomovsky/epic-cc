@@ -409,16 +409,18 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                     child.get(ns + "ishidden") == "true"
                     or child.get(ns + "islanghidden") == "true"
                 )
-                # A hidden field whose bits fall entirely outside impl is
-                # documentary padding (e.g. a trailing RESERVED "maintain
-                # as 1s" field), not a real config bit: impl is the byte's
-                # own claim of which bits are implemented, so padding
-                # beyond it must not be forced to match impl. A hidden
-                # field that does overlap impl is a real, just unnamed,
-                # bit and still counts (confirmed against p18f6520's
-                # T1OSCMX and p18f8520, both hidden and inside impl).
-                if not (hidden and field_bits & impl == 0):
-                    covered |= field_bits
+                # A hidden field's bits outside impl are documentary
+                # padding (e.g. a trailing RESERVED "maintain as 1s"
+                # field, or one that straddles the impl boundary, part
+                # real bit part padding): impl is the byte's own claim of
+                # which bits are implemented, so padding must not be
+                # forced to match it. Only the part of a hidden field
+                # that overlaps impl counts, same as a real, just
+                # unnamed, bit would (confirmed against p18f6520's
+                # T1OSCMX and p18f8520, both hidden and inside impl). A
+                # non-hidden field always counts in full: its exact
+                # placement is what this check exists to verify.
+                covered |= (field_bits & impl) if hidden else field_bits
                 if not hidden:
                     semantics = child.findall(ns + "DCRFieldSemantic")
                     values = []
@@ -450,6 +452,19 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                             f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
                             f"field {fname}'s semantics use an unhandled "
                             f"`when` form: {unmatched}"
+                        ])
+                    if semantics and not values:
+                        # A visible field whose every semantic turned out
+                        # to be individually hidden has no legal value
+                        # this generator can name. That is still a fact
+                        # it cannot read, not an empty-but-fine field: an
+                        # unnamed real field silently missing from the
+                        # TOML is exactly the omission this module exists
+                        # to refuse.
+                        raise MissingFacts([
+                            f"DCRDef {dcr.get(ns + 'name')} (0x{addr:06x}): "
+                            f"field {fname} has no non-hidden semantic, "
+                            f"cannot determine its legal values"
                         ])
                     if values:
                         fields.append({

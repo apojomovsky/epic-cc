@@ -315,6 +315,46 @@ class GenDevicePic18Test(unittest.TestCase):
         self.assertIn('name = "gamma"', text)
         self.assertNotIn('name = "reserved"', text)
 
+    def test_hidden_field_straddling_impl_only_counts_the_overlap(self):
+        # RES (hidden, bit 2, inside impl 0x05) widened to two bits (2-3):
+        # bit 2 is real, implemented and still counts; bit 3 is padding
+        # past impl and must not be. Counting the whole widened field
+        # would make covered 0x0d against impl 0x05, a false mismatch for
+        # a field that is genuinely part real bit, part padding.
+        tampered = PIC18_FIXTURE.read_text().replace(
+            '<edc:DCRFieldDef edc:name="RES" edc:mask="0x1" '
+            'edc:ishidden="true" edc:islanghidden="true">',
+            '<edc:DCRFieldDef edc:name="RES" edc:mask="0x3" '
+            'edc:ishidden="true" edc:islanghidden="true">',
+        )
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "straddling_res.atdf"
+            src.write_text(tampered)
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('name = "alpha"', text)
+        self.assertNotIn('name = "res"', text)
+
+    def test_field_with_only_hidden_semantics_is_a_hard_failure(self):
+        # ALPHA is a real, visible field; if every one of its semantics
+        # turns out to be individually hidden, the generator has no legal
+        # value left to name it with. Dropping it from the output with
+        # exit 0 would silently omit a real config field, the same
+        # failure mode the unhandled-`when` check above already refuses.
+        tampered = PIC18_FIXTURE.read_text().replace(
+            '<edc:DCRFieldSemantic edc:cname="ON" edc:when="(field &amp; 0x1) == 0x1"/>\n'
+            '              <edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x0"/>',
+            '<edc:DCRFieldSemantic edc:when="(field &amp; 0x1) == 0x1" edc:islanghidden="true"/>\n'
+            '              <edc:DCRFieldSemantic edc:when="(field &amp; 0x1) == 0x0" edc:islanghidden="true"/>',
+        )
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "all_hidden_semantics.atdf"
+            src.write_text(tampered)
+            r, text = run_generator(src, name="p18syn01", pack="Microchip.PIC18Fxxxx_DFP")
+        self.assertNotEqual(r.returncode, 0, "a field with no non-hidden semantic must not generate")
+        self.assertIn("no non-hidden semantic", r.stderr)
+        self.assertEqual(text, "")
+
     def test_split_access_bank_sectors_merge(self):
         # Two adjacent TraditionalModeOnly sectors describing one physical
         # access bank must merge, not silently lose the second half by only
