@@ -26,8 +26,12 @@ PIC18 interrupt support (port P5) uses:
    M13 documents and solves).
 4. **MOVFF-based prologue/epilogue.** MOVFF never touches STATUS, so the
    epilogue restores STATUS and then W and preserves the interrupted
-   main's Z/N, except for W's own final `MOVF 0x004,W,A` Z/N clobber (the
+   main's Z/N, except for W's own final `MOVF 0x008,W,A` Z/N clobber (the
    one accepted flag loss, same convention as PIC14's W-last swap-back).
+   W's slot is `0x0008`, not `0x0004`: the retval-backup half of the save
+   area lands at `0x000C-0x000F`, so `0x0008` is the first byte free of
+   both the SFR saves and that backup (`0x0004` collided with FSR0H's
+   own snapshot slot, epic-cc#356).
 5. **Literal SFR access.** `inttoptr` load/store targets the physical
    12-bit address; `0x000-0x05F` (access GPR) and `0xF60-0xFFF` (SFR
    segment) both route with `a=0`, no `BSR`. `irparse`'s `inttoptr`

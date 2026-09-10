@@ -4972,6 +4972,11 @@ pub fn select_with_locs(
     let (common_lo, _) = device
         .fixed_retval
         .expect("isel-pic18's fixed retval region needs a fixed_retval reservation");
+    // The compat ISR's W save, in the 16-byte fixed block: past the 7 SFR
+    // saves (common_lo+1..+7) and before the retval-snapshot backup
+    // (common_lo+12..+15), the one byte free of both (epic-cc#356; the
+    // naive common_lo+4 collides with FSR0H's own snapshot slot).
+    const ISR_W_SAVE_OFFSET: u16 = 8;
     let (_, access_bank_hi) = device
         .access_bank
         .expect("isel-pic18's access-bank frame checks need an access_bank reservation");
@@ -5211,8 +5216,8 @@ pub fn select_with_locs(
                 // them), and TBLPTR (a torn mid-setup pointer would
                 // misread). W saves last via `MOVWF`, which touches
                 // nothing. The low ISR saves the same set to its own
-                // area (`isr_low_save`), with a dedicated W slot (the
-                // fixed block doubles its W slot as FSR0H's, epic-cc#356).
+                // area (`isr_low_save`), with a dedicated W slot; the
+                // common block uses `ISR_W_SAVE_OFFSET` (see above).
                 let low_save = priority_mode && f.irq_priority != 1;
                 let saves: [(u16, u16); 11] = if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
@@ -5258,7 +5263,10 @@ pub fn select_with_locs(
                     g.bsr = Some(bank);
                     g.emit(format!("    MOVWF 0x{s:03X},B")); // W, last
                 } else {
-                    g.emit("    MOVWF 0x0004,A".to_string()); // W, last
+                    g.emit(format!(
+                        "    MOVWF 0x{:03X},A",
+                        common_lo + ISR_W_SAVE_OFFSET
+                    )); // W, last
                 }
             }
             let mut terminator: Option<&Inst> = None;
@@ -5397,7 +5405,10 @@ pub fn select_with_locs(
                         g.bsr = Some(bank);
                         g.emit(format!("    MOVF 0x{s:03X}, W, B")); // W last
                     } else {
-                        g.emit("    MOVF 0x0004, W, A".to_string()); // W last
+                        g.emit(format!(
+                            "    MOVF 0x{:03X}, W, A",
+                            common_lo + ISR_W_SAVE_OFFSET
+                        )); // W last
                     }
                     g.emit("    RETFIE".to_string());
                 }
