@@ -410,16 +410,11 @@ def parse_edc_dcr_fields(cfs_el, ns: str):
                     or child.get(ns + "islanghidden") == "true"
                 )
                 # A hidden field's bits outside impl are documentary
-                # padding (e.g. a trailing RESERVED "maintain as 1s"
-                # field, or one that straddles the impl boundary, part
-                # real bit part padding): impl is the byte's own claim of
-                # which bits are implemented, so padding must not be
-                # forced to match it. Only the part of a hidden field
-                # that overlaps impl counts, same as a real, just
-                # unnamed, bit would (confirmed against p18f6520's
-                # T1OSCMX and p18f8520, both hidden and inside impl). A
-                # non-hidden field always counts in full: its exact
-                # placement is what this check exists to verify.
+                # padding (a trailing RESERVED byte, or a field straddling
+                # the impl boundary): only its overlap with impl counts,
+                # same as a real bit would (p18f6520's T1OSCMX). A
+                # non-hidden field always counts in full: exact placement
+                # is what this check verifies.
                 covered |= (field_bits & impl) if hidden else field_bits
                 if not hidden:
                     semantics = child.findall(ns + "DCRFieldSemantic")
