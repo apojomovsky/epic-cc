@@ -96,7 +96,14 @@ mod tests {
     fn baseline_names_the_core_and_part() {
         assert_eq!(
             xc8_predefines(device::Core::PicBaseline, "p12f509"),
-            vec!["__XC", "__XC8", "__wparam=", "_PIC12", "_12F509"]
+            vec![
+                "__XC",
+                "__XC8",
+                "__wparam=",
+                "__interrupt(n)=__attribute__((interrupt(n)))",
+                "_PIC12",
+                "_12F509"
+            ]
         );
     }
 }

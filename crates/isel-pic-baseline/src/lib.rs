@@ -1141,7 +1141,10 @@ impl<'m> Gen<'m> {
                 for i in 0..n {
                     self.emit_w_load(bb + u16::from(i));
                     self.emit_bank_select(ra + u16::from(i));
-                    self.emit(format!("    {op} 0x{:02X}, W", ra + u16::from(i)));
+                    self.emit(format!(
+                        "    {op} 0x{:02X}, W",
+                        self.file_reg(ra + u16::from(i))
+                    ));
                     self.emit_w_store(dst + u16::from(i));
                 }
             }
@@ -2411,6 +2414,10 @@ pub fn select_with_locs(
             }
         }
     }
+    // The init's own word count (MOVLW + D-2 reassert + MOVWF per byte),
+    // measured from the built lines so the CALL-ceiling assert below sees
+    // the assembler's addresses, not an estimate.
+    let init_words = word_size(&init);
     let mut start_block: Vec<String> = vec!["__start:".to_string()];
     start_block.extend(init);
     start_block.extend([
@@ -2454,15 +2461,9 @@ pub fn select_with_locs(
     // The baseline CALL ceiling: CALL forces PC bit 8 to 0 (DS41236E 4.7),
     // so every CALL target must sit in the low 256 words of its page. P2
     // places all code in page 0's low half: the reset GOTO (1 word), the
-    // `__start` init (2 words per RAM-copied const byte) plus its
-    // CALL/SLEEP (2 words), and the bodies must total 0x100 words or less.
-    // A program past the ceiling panics (multi-page placement is D-5/P4).
-    let init_words: usize = m
-        .globals
-        .iter()
-        .filter(|g| g.is_const && addrs.contains_key(&g.name))
-        .map(|g| 2 * g.bytes.len())
-        .sum();
+    // `__start` init (`init_words` above) plus its CALL/SLEEP (2 words),
+    // and the bodies must total 0x100 words or less. A program past the
+    // ceiling panics (multi-page placement is D-5/P4).
     let total = 1 + init_words + 2 + body_words;
     assert!(
         total <= 0x100,
