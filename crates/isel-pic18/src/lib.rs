@@ -5355,11 +5355,7 @@ pub fn select_with_locs(
                     // (never touches STATUS), so the interrupted main's
                     // Z/N come back intact; only the final W restore via
                     // MOVF sets Z/N from the moved value (the one accepted
-                    // flag loss, same as PIC14's W-last convention). The
-                    // retval snapshot is restored first, then the SFRs
-                    // (reverse of the prologue), STATUS, and W last. The
-                    // low ISR in priority mode restores from its own area
-                    // (mirror of its prologue above).
+                    // flag loss, same as PIC14's W-last convention).
                     let low_save = priority_mode && f.irq_priority != 1;
                     let restores: [(u16, u16); 11] = if low_save {
                         let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
@@ -5377,18 +5373,21 @@ pub fn select_with_locs(
                             (s + 1, 0xFD8), // STATUS
                         ]
                     } else {
+                        // SFR restores must run before the retval-backup
+                        // restores below: both touch common_lo+1..+3, and
+                        // the backup would clobber the SFR snapshot first.
                         [
-                            (common_lo + 15, common_lo + 3),
-                            (common_lo + 14, common_lo + 2),
-                            (common_lo + 13, common_lo + 1),
-                            (common_lo + 12, common_lo),
                             (common_lo + 7, 0xFF8), // TBLPTRU
                             (common_lo + 6, 0xFF7), // TBLPTRH
                             (common_lo + 5, 0xFF6), // TBLPTRL
                             (common_lo + 4, 0xFEA), // FSR0H
                             (common_lo + 3, 0xFE9), // FSR0L
                             (common_lo + 2, 0xFE0), // BSR
-                            (common_lo + 1, 0xFD8), // STATUS
+                            (common_lo + 1, 0xFD8), // STATUS, last SFR read before the retval backup below aliases this range
+                            (common_lo + 15, common_lo + 3),
+                            (common_lo + 14, common_lo + 2),
+                            (common_lo + 13, common_lo + 1),
+                            (common_lo + 12, common_lo),
                         ]
                     };
                     for (src, dst) in restores {

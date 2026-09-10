@@ -376,6 +376,51 @@ fn compat_isr_preserves_fsr0h_across_w_save() {
 }
 
 #[test]
+fn compat_isr_preserves_status_bsr_fsr0l_across_retval_backup() {
+    // epic-cc#362 regression: the compat epilogue restored the retval
+    // backup (common_lo+12..+15 -> common_lo..+3) before restoring
+    // STATUS/BSR/FSR0L (common_lo+1..+3 -> the real SFRs). The two
+    // destination ranges alias, so the SFR restore read back whatever the
+    // retval backup had just written. Hand-built IR (no clang): a lone
+    // ISR gets the fixed-block compat prologue regardless of body.
+    let m = ir::parse(
+        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm = isel_pic18::select(&PIC18F4550, &m, &HashMap::new(), None);
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = Pic18::new(parse_hex_pic18(&hex));
+
+    p.ram_mut()[0xFD8] = 0x93; // STATUS
+    p.ram_mut()[0xFE0] = 0x27; // BSR
+    p.ram_mut()[0xFE9] = 0x5C; // FSR0L
+
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 8, "ISR starts at the high vector");
+
+    let mut steps = 0;
+    loop {
+        p.step();
+        steps += 1;
+        assert!(steps < 200, "ISR never returned (pc = {})", p.pc());
+        if p.pc() == 0 {
+            break;
+        }
+    }
+
+    // Z/N are excluded: the epilogue's final W restore is a MOVF, which
+    // legitimately sets them from the restored W value (the accepted
+    // flag loss noted above the restores array).
+    assert_eq!(
+        p.ram()[0xFD8] & !0x14,
+        0x93 & !0x14,
+        "STATUS (minus Z/N) must survive the compat ISR"
+    );
+    assert_eq!(p.ram()[0xFE0], 0x27, "BSR must survive the compat ISR");
+    assert_eq!(p.ram()[0xFE9], 0x5C, "FSR0L must survive the compat ISR");
+}
+
+#[test]
 fn ptr_probe_c_runs_correctly() {
     // The ORIGINAL ptr_probe.c (full parity with PIC14, per docs/29's P3
     // note): a runtime RAM pointer AND a const-table read in one program.
