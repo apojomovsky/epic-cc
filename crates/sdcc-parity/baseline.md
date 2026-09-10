@@ -39,7 +39,7 @@ cycle count to the `sleep` halt, one definition for both compilers.
 | double | p16f877a | 648 | 2506 | 14 | 54 | 1093 | 8748 | PASS |
 | double | p18f4550 | 727 | 1409 | 18 | 43 | 1056 | 8080 | PASS |
 | double | p16f1938 | 644 | 1947 | 14 | 53 | 1089 | 6670 | PASS |
-| malloc | p18f4550 | 654 | 736 | 29 | 36 | 1721 | 6745 | PASS |
+| malloc | p18f4550 | 666 | 736 | 30 | 36 | 1743 | 6745 | PASS |
 | math | p16f877a | 57 | 557 | 10 | 26 | 119 | 1006 | PASS |
 | math | p18f4550 | 29 | 112 | 11 | 19 | 19 | 6222 | PASS |
 | math | p16f1938 | 56 | 433 | 10 | 29 | 118 | 791 | PASS |

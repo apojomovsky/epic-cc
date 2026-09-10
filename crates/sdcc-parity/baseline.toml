@@ -170,9 +170,9 @@ sdcc_cycles = 6670
 program = "malloc"
 device = "p18f4550"
 status = "pass"
-epic_flash = 654
+epic_flash = 666
 sdcc_flash = 736
-epic_cycles = 1721
+epic_cycles = 1743
 sdcc_cycles = 6745
 
 [[row]]
