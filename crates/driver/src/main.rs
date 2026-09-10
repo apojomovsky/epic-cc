@@ -362,7 +362,10 @@ fn main() {
             asm
         }
         device::Core::Pic18 => asm,
-        device::Core::PicBaseline => asm,
+        device::Core::PicBaseline => {
+            isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
+            asm
+        }
     };
 
     if cli.emit == cli::Emit::Asm {

@@ -27,9 +27,10 @@
 //! for this core.
 //!
 //! No PCLATH: baseline's PC<9> comes from STATUS PA0 (bit 5), and
-//! CALL/RETLW are hard-limited to the low 256 words of a page (D-5). P2's
-//! fixtures fit in page 0, so PA0 stays 0 and no page management is
-//! emitted. No interrupts on this core: no ISR emission, no RETFIE.
+//! CALL/RETLW are hard-limited to the low 256 words of a page (D-5).
+//! Code lives in the page-0 low half; const tables pack the page-0 low
+//! half first and spill to the page-1 low half with PA0 set/restore at
+//! each const read. No interrupts on this core: no ISR emission, no RETFIE.
 //!
 //! Every address comes from the caller map: globals by name, locals by
 //! `{func}::{name}`. isel allocates no slots. A missing value panics:
@@ -87,6 +88,11 @@ struct Gen<'m> {
     store_tmp: u16,
     retval_lo: u16,
     cur_func: &'m str,
+    /// Flash-const table pages by global name (P4 layout): the page whose
+    /// low half holds the table's `__read_` entry. The measuring pass maps
+    /// nothing (every table reads page 0); the final pass maps each placed
+    /// table. Sizes are page-independent, so the measure holds.
+    table_page: &'m HashMap<String, u8>,
     /// Module-scoped fresh-label counter, shared across every function so the
     /// emitted `tmp{n}:` labels stay unique in the single `.asm` output.
     tmp: &'m mut u32,
@@ -95,7 +101,6 @@ struct Gen<'m> {
     /// Plain `emit` clears the cache, so staleness cannot cross other
     /// emission.
     w_holds: Option<u16>,
-    /// The source location of the instruction currently being emitted, or
     /// `None` for compiler-generated glue (prologue, `__start`).
     cur_loc: Option<SrcLoc>,
     out: Vec<String>,
@@ -980,26 +985,24 @@ impl<'m> Gen<'m> {
 
     /// `W = RAM[ptr + byte_off]`: one byte of a pointer load or a memcpy
     /// source. Direct bases read the plain file register; dynamic bases set
-    /// FSR first and read INDF.
+    /// FSR first and read INDF; a const (flash) base reads via
+    /// `CALL __read_<name>` (the RETLW table leaves the byte in W).
     fn emit_ptr_load_byte(&mut self, ptr: &Val, byte_off: u8) {
         match ptr {
             Val::Reg(r) => {
                 if let (Base::Global(name), k, terms) = self.resolved_for(r) {
                     if self.global_is_const(&name) {
-                        // Const (flash) reads are P4 (RETLW tables). P2 has
-                        // no const reads; a const base panics loudly.
-                        panic!(
-                            "isel: const (flash) read of @{name} is P4 (RETLW tables); not supported in P2"
-                        );
+                        self.emit_const_read(&name, k, &terms, byte_off);
+                        return;
                     }
-                    let _ = (k, terms);
                 }
             }
             Val::Global(g) => {
                 if self.global_is_const(g) {
-                    panic!(
-                        "isel: const (flash) read of @{g} is P4 (RETLW tables); not supported in P2"
-                    );
+                    // A const global used directly as a pointer (memcpy
+                    // src): constant byte index, no terms.
+                    self.emit_const_read(g, 0, &[], byte_off);
+                    return;
                 }
             }
             Val::Const(_) => panic!("isel: load through a constant pointer"),
@@ -1017,6 +1020,44 @@ impl<'m> Gen<'m> {
                 self.emit("    MOVF INDF, W".to_string())
             }
         }
+    }
+    /// `W = k + byte_off + terms`: the RETLW-table index for a const
+    /// (flash) read. Same fold as `emit_fsr_to`'s W computation, minus the
+    /// FSR store; the reader adds the table base itself.
+    fn emit_const_index_w(&mut self, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        let lit = k.wrapping_add(byte_off);
+        match terms {
+            [] => {
+                self.emit(format!("    MOVLW 0x{lit:02X}"));
+            }
+            [(1, r)] => {
+                let a = self.val_addr(&Val::Reg(r.clone())).direct();
+                self.emit_bank_select(a);
+                self.emit(format!("    MOVF {}, W", self.fop(a)));
+                self.emit_add_w_const(lit);
+            }
+            _ => {
+                self.emit_accum_terms(terms);
+                self.emit(format!("    MOVF {}, W", self.fop(self.scratch)));
+                self.emit_add_w_const(lit);
+            }
+        }
+    }
+
+    /// `W = flash[name][k + byte_off + terms]` via the table's `__read_`
+    /// entry: index to W, PA0 to the table's page, CALL, restore PA0 to the
+    /// caller page (code always lives in page 0). BSF/BCF touch only PA0,
+    /// and CALL preserves W, so the byte arrives in W with no park.
+    fn emit_const_read(&mut self, name: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        self.emit_const_index_w(k, terms, byte_off);
+        let page = self.table_page.get(name).copied().unwrap_or(0);
+        if page == 0 {
+            self.emit("    BCF STATUS, 5".to_string());
+        } else {
+            self.emit("    BSF STATUS, 5".to_string());
+        }
+        self.emit(format!("    CALL __read_{name}"));
+        self.emit("    BCF STATUS, 5".to_string());
     }
 
     /// `RAM[ptr + byte_off] = W`: the store side of a byte access. W is
@@ -1322,11 +1363,20 @@ impl<'m> Gen<'m> {
                 assert!(l.ty != Ty::I1, "isel: only i8/i16 loads supported");
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 if let Some(g) = l.ptr.strip_prefix('@') {
-                    let src = self.global_addr(g);
-                    for k in 0..l.ty.bytes() {
-                        self.emit_bank_select(src + u16::from(k));
-                        self.emit(format!("    MOVF {}, W", self.fop(src + u16::from(k))));
-                        self.emit_w_store(dst + u16::from(k));
+                    if self.global_is_const(g) {
+                        // A flash const with a constant index: one RETLW
+                        // call per byte (i16 reads low then high).
+                        for k in 0..l.ty.bytes() {
+                            self.emit_const_read(g, 0, &[], k);
+                            self.emit_w_store(dst + u16::from(k));
+                        }
+                    } else {
+                        let src = self.global_addr(g);
+                        for k in 0..l.ty.bytes() {
+                            self.emit_bank_select(src + u16::from(k));
+                            self.emit(format!("    MOVF {}, W", self.fop(src + u16::from(k))));
+                            self.emit_w_store(dst + u16::from(k));
+                        }
                     }
                 } else if l.ptr.starts_with("0x") {
                     let base = literal_ptr_addr(&l.ptr);
@@ -1907,11 +1957,288 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
     }
 }
 
-/// P2's page model: the fixtures fit in page 0 (PA0 stays 0), so there is
-/// no page management to verify. A no-op that keeps the driver's
-/// `verify_page_fit` call site uniform across cores. P4 (const tables)
-/// owns the real page model.
-pub fn verify_page_fit(_m: &Module, _asm: &str) {}
+/// Reader entry cost (MOVWF/MOVLW/ADDWF/MOVWF PCL) before a table's
+/// RETLWs. A table of N bytes occupies 4 + N words in its page low
+/// half, so N tops out at 252: bigger tables fit no 256-word window
+/// (D-5) and are rejected, never chunked.
+const READER_WORDS: usize = 4;
+const TABLE_MAX: usize = 252;
+
+/// Flash-resident consts: `is_const` globals with no RAM address.
+/// RAM-copied consts (in `addrs`) initialize from `__start` instead.
+fn flash_consts<'m>(m: &'m Module, addrs: &HashMap<String, u16>) -> Vec<&'m ir::Global> {
+    m.globals
+        .iter()
+        .filter(|g| g.is_const && !addrs.contains_key(&g.name))
+        .collect()
+}
+
+/// Word cost of `lines` under org/label semantics: labels, equ, org,
+/// list/radix/end, blanks and comments cost nothing; every other line
+/// is one baseline word. Placement and the page-fit audit share it, so
+/// a miscount fails the audit rather than silently shifting tables.
+fn count_words(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .filter(|l| {
+            let t = l.split(';').next().unwrap_or("").trim();
+            if t.is_empty() || t.ends_with(':') || t.contains(" equ ") {
+                return false;
+            }
+            !(t.starts_with("org ")
+                || t.starts_with("list ")
+                || t.starts_with("radix ")
+                || t == "end")
+        })
+        .count()
+}
+
+/// Place each table's reader entry: the page-0 low half first, spill
+/// to the page-1 low half. Returns `(name, entry_addr, page)`. Code
+/// is sequential from 0x000, so a code end past 0x100 means the
+/// page-0 low half is full and tables spill to page 1 (past code when
+/// code itself reaches into page 1). A table fitting neither half
+/// panics instead of crossing the 256-word ceiling (D-5). Function
+/// entries are audited by `verify_page_fit`, not here.
+fn place_const_tables(code_words: usize, consts: &[&ir::Global]) -> Vec<(String, usize, u8)> {
+    let mut p0 = code_words;
+    let mut p1 = code_words.max(0x200);
+    let mut placed = Vec::new();
+    for g in consts {
+        let n = g.bytes.len();
+        assert!(
+                n <= TABLE_MAX,
+                "isel: const @{} too large ({n} bytes; no page low half fits 4 reader words + {n} RETLWs, D-5)",
+                g.name
+            );
+        let need = READER_WORDS + n;
+        if p0 <= 0x100 && (p0 & 0x1FF) + need <= 0x100 {
+            placed.push((g.name.clone(), p0, 0));
+            p0 += need;
+        } else if p1 + need <= 0x300 {
+            placed.push((g.name.clone(), p1, 1));
+            p1 += need;
+        } else {
+            panic!(
+                    "isel: const @{} crosses the 256-word ceiling (page-0 low half full at {p0:#x}, page-1 low half full at {p1:#x}, D-5)",
+                    g.name
+                );
+        }
+    }
+    placed
+}
+
+/// One sequential scan: org tracking, label addresses, CALLs with the
+/// PA0 selecting them, RETLW runs, and every word's text (to audit
+/// reader immediates against placement).
+struct AsmScan {
+    labels: HashMap<String, usize>,
+    calls: Vec<(usize, String, u8)>,
+    table_retlws: HashMap<String, usize>,
+    words: HashMap<usize, String>,
+    end_org: usize,
+}
+
+/// Scan `asm` for the page-fit audit. `tables` maps flash-const names
+/// to byte lengths so RETLW runs count against the right table.
+fn scan_asm(asm: &str, tables: &HashMap<String, usize>) -> AsmScan {
+    let mut labels = HashMap::new();
+    let mut calls = Vec::new();
+    let mut table_retlws: HashMap<String, usize> = HashMap::new();
+    let mut words: HashMap<usize, String> = HashMap::new();
+    let mut org = 0usize;
+    let mut pa0 = 0u8;
+    let mut cur_table: Option<String> = None;
+    for raw in asm.lines() {
+        let t = raw.split(';').next().unwrap_or("").trim();
+        if t.is_empty() {
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("org ") {
+            org = usize::from_str_radix(rest.trim().trim_start_matches("0x"), 16)
+                .unwrap_or_else(|_| panic!("isel: malformed org {t:?}"));
+            cur_table = None;
+            continue;
+        }
+        if t == "end" {
+            break;
+        }
+        if t.ends_with(':') && !t.contains(' ') {
+            let name = t.trim_end_matches(':').to_string();
+            labels.insert(name.clone(), org);
+            cur_table = if tables.contains_key(&name) {
+                Some(name)
+            } else {
+                None
+            };
+            continue;
+        }
+        if t.contains(" equ ") || t.starts_with("list ") || t.starts_with("radix ") {
+            continue;
+        }
+        let nospace: String = t.chars().filter(|c| *c != ' ').collect();
+        if nospace == "BSFSTATUS,5" {
+            pa0 = 1;
+        } else if nospace == "BCFSTATUS,5" {
+            pa0 = 0;
+        }
+        if t.starts_with("CALL ") {
+            let target = t
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_else(|| panic!("isel: malformed CALL {t:?}"));
+            calls.push((org, target.to_string(), pa0));
+        } else if t.starts_with("RETLW") {
+            if let Some(name) = &cur_table {
+                *table_retlws.entry(name.clone()).or_insert(0) += 1;
+            }
+        } else {
+            cur_table = None;
+        }
+        words.insert(org, t.to_string());
+        org += 1;
+    }
+    AsmScan {
+        labels,
+        calls,
+        table_retlws,
+        words,
+        end_org: org,
+    }
+}
+
+/// P4 page audit (D-5): entries in the page-0 low half, the rest of
+/// code in page 0, each `__read_` entry + table inside one page's low
+/// half with the full RETLW run, and each CALL targeting a low half
+/// of the PA0-selected page. Any crossing panics: a table past its
+/// ceiling is rejected here, never silently miscompiled.
+pub fn verify_page_fit(m: &Module, asm: &str, addrs: &HashMap<String, u16>) {
+    let tables: HashMap<String, usize> = flash_consts(m, addrs)
+        .iter()
+        .map(|g| (g.name.clone(), g.bytes.len()))
+        .collect();
+    let scan = scan_asm(asm, &tables);
+    // Function entries are CALL targets: CALL cannot reach a high
+    // half, and P4 manages no page-1 code, so entries stay in the
+    // page-0 low half. Local labels ride GOTOs (full-page reach) and
+    // fall-through, so page 0 suffices for them.
+    let mut entries: HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
+    entries.insert("__start".to_string());
+    for (name, addr) in &scan.labels {
+        if let Some(reader) = name.strip_prefix("__read_") {
+            let n = tables
+                .get(reader)
+                .unwrap_or_else(|| panic!("isel: reader {name} has no flash const table"));
+            assert!(
+                    (addr & 0x1FF) + READER_WORDS + n <= 0x100,
+                    "isel: table @{reader} crosses the 256-word ceiling (entry at {addr:#x}, {n} bytes, D-5)"
+                );
+            let base = scan
+                .labels
+                .get(reader)
+                .unwrap_or_else(|| panic!("isel: table @{reader} has no base label"));
+            assert!(
+                *base == addr + READER_WORDS,
+                "isel: table @{reader} base at {base:#x}, expected {:#x}",
+                addr + READER_WORDS
+            );
+            assert_eq!(
+                scan.table_retlws.get(reader).copied().unwrap_or(0),
+                *n,
+                "isel: table @{reader} emits {} RETLWs, expected {n}",
+                scan.table_retlws.get(reader).copied().unwrap_or(0)
+            );
+            // The entry shape is fixed (MOVWF/MOVLW/ADDWF/MOVWF PCL):
+            // audit the base immediate against placement, closing the
+            // loop between the cursor math and the emitted text.
+            let word_at = |off: usize| {
+                scan.words
+                    .get(&(addr + off))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "isel: table @{reader} entry word {off} missing (at {:#x})",
+                            addr + off
+                        )
+                    })
+                    .clone()
+            };
+            assert!(
+                word_at(0).starts_with("MOVWF"),
+                "isel: table @{reader} entry is not MOVWF: {}",
+                word_at(0)
+            );
+            assert_eq!(
+                word_at(1),
+                format!("MOVLW 0x{:02X}", ((addr + READER_WORDS) & 0xFF) as u8),
+                "isel: table @{reader} base immediate disagrees with placement"
+            );
+            assert!(
+                word_at(2).starts_with("ADDWF"),
+                "isel: table @{reader} entry +2 is not ADDWF: {}",
+                word_at(2)
+            );
+            assert_eq!(
+                word_at(3),
+                "MOVWF PCL",
+                "isel: table @{reader} entry +3 is not MOVWF PCL: {}",
+                word_at(3)
+            );
+        } else if tables.contains_key(name.as_str()) {
+            continue;
+        } else if entries.contains(name.as_str()) {
+            assert!(
+                    *addr < 0x100,
+                    "isel: function entry {name} at {addr:#x} escapes the CALL-reachable page-0 low half (D-5)"
+                );
+        } else {
+            assert!(
+                *addr < 0x200,
+                "isel: code label {name} at {addr:#x} escapes page 0 (D-5)"
+            );
+        }
+    }
+    for name in tables.keys() {
+        assert!(
+            scan.labels.contains_key(&format!("__read_{name}")),
+            "isel: flash const @{name} has no reader entry"
+        );
+    }
+    // Code ends where the const section starts (or at the end of
+    // flash): fall-through must never cross into page 1, whose words
+    // a page-0 GOTO cannot reach back from.
+    let code_end = scan
+        .labels
+        .iter()
+        .filter(|(name, _)| name.starts_with("__read_"))
+        .map(|(_, addr)| *addr)
+        .min()
+        .unwrap_or(scan.end_org);
+    assert!(
+        code_end <= 0x200,
+        "isel: code (ending at {code_end:#x}) escapes page 0 (D-5)"
+    );
+    for (addr, target, pa0) in &scan.calls {
+        let t = scan
+            .labels
+            .get(target)
+            .unwrap_or_else(|| panic!("isel: CALL {target} has no label (at {addr:#x})"));
+        assert!(
+            *t < 0x400 && (*t & 0x1FF) < 0x100,
+            "isel: CALL {target} at {t:#x} escapes every page low half (D-5)"
+        );
+        assert_eq!(
+            (*t >> 9) as u8,
+            *pa0,
+            "isel: CALL {target} targets page {} but PA0 selects {pa0} (at {addr:#x})",
+            *t >> 9
+        );
+    }
+    assert!(
+        scan.end_org <= 0x400,
+        "isel: program ({} words) overflows the 509's 1024-word flash",
+        scan.end_org
+    );
+}
 
 /// Assemble the module into `.asm` text.
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
@@ -2000,41 +2327,111 @@ pub fn select_with_locs(
             }
         }
     }
-    let start_block: Vec<String> = vec![
-        "__start:".to_string(),
+    // `__start` opens with PA0 = 0 (page 0 is the caller page for every
+    // const read) and the RAM-const init: both must execute, so both sit
+    // after the label `goto __start` lands on, before `CALL main`.
+    let mut start_full: Vec<String> = vec!["__start:".to_string(), "    BCF STATUS, 5".to_string()];
+    start_full.extend(init);
+    start_full.extend(vec![
         "    CALL main".to_string(),
         "    SLEEP".to_string(),
         "".to_string(),
-    ];
-    let mut start_full: Vec<String> = Vec::new();
-    start_full.extend(init);
-    start_full.extend(start_block);
+    ]);
     let start_len = start_full.len();
     out.extend(start_full);
     locs.extend(std::iter::repeat(None).take(start_len));
     // Pointers resolve eagerly: every GEP chain folds to `(base, k, terms)`.
     let resolved = resolve_pointers(m);
-    let mut tmp = 0u32;
-    for f in &m.funcs {
-        let mut g = Gen {
-            m,
-            addrs,
-            device,
-            resolved: &resolved,
-            scratch,
-            scratch2,
-            store_tmp,
-            retval_lo,
-            cur_func: &f.name,
-            tmp: &mut tmp,
-            w_holds: None,
-            cur_loc: None,
-            out: Vec::new(),
-            locs: Vec::new(),
-        };
-        emit_func_body(&mut g, f);
-        out.extend(g.out);
-        locs.extend(g.locs);
+    // Emit the function bodies twice at most: a measuring pass (every
+    // table reads page 0), then, only when a table spills to page 1, a
+    // final pass with the real pages. Call-site sizes are
+    // page-independent by construction, so the measure holds.
+    let emit_code = |table_page: &HashMap<String, u8>| {
+        let mut tmp = 0u32;
+        let mut code_out = Vec::new();
+        let mut code_locs = Vec::new();
+        for f in &m.funcs {
+            let mut g = Gen {
+                m,
+                addrs,
+                device,
+                resolved: &resolved,
+                scratch,
+                scratch2,
+                store_tmp,
+                retval_lo,
+                cur_func: &f.name,
+                table_page,
+                tmp: &mut tmp,
+                w_holds: None,
+                cur_loc: None,
+                out: Vec::new(),
+                locs: Vec::new(),
+            };
+            emit_func_body(&mut g, f);
+            code_out.extend(g.out);
+            code_locs.extend(g.locs);
+        }
+        (code_out, code_locs)
+    };
+    let empty_pages: HashMap<String, u8> = HashMap::new();
+    let (code_out, code_locs) = emit_code(&empty_pages);
+    // Tables follow the prologue, init, `__start` and functions: the
+    // cursor starts past the already-emitted head, not at zero.
+    let consts = flash_consts(m, addrs);
+    let placed = place_const_tables(count_words(&out) + count_words(&code_out), &consts);
+    let pages: HashMap<String, u8> = placed
+        .iter()
+        .map(|(name, _, page)| (name.clone(), *page))
+        .collect();
+    let (code_out, code_locs) = if pages.values().any(|p| *p == 1) {
+        emit_code(&pages)
+    } else {
+        (code_out, code_locs)
+    };
+    out.extend(code_out);
+    locs.extend(code_locs);
+    // The const section: readers + RETLW tables, page-0 low half first,
+    // page-1 spill after an `org` at the first spilled entry. Bases are
+    // numeric (isel placed them); the page-fit audit re-derives addresses.
+    let mut page1_open = false;
+    for (name, entry, page) in &placed {
+        if *page == 1 && !page1_open {
+            out.push(format!("    org 0x{entry:03X}"));
+            locs.push(None);
+            page1_open = true;
+        }
+        let g = m
+            .globals
+            .iter()
+            .find(|g| &g.name == name)
+            .unwrap_or_else(|| panic!("isel: placed table @{name} is not a global"));
+        let base = entry + READER_WORDS;
+        out.push(format!("__read_{name}:"));
+        locs.push(None);
+        out.push("    MOVWF 0x07".to_string());
+        out.push(format!("    MOVLW 0x{:02X}", (base & 0xFF) as u8));
+        locs.push(None);
+        out.push("    ADDWF 0x07, W".to_string());
+        locs.push(None);
+        out.push("    MOVWF PCL".to_string());
+        locs.push(None);
+        out.push(format!("{name}:"));
+        locs.push(None);
+        for (i, b) in g.bytes.iter().enumerate() {
+            // A function-address field materializes the link-time label
+            // literal, mirroring classic isel: byte 0 = LOW(fn), byte 1 =
+            // HIGH(fn), resolved by the assembler's symbol table.
+            if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                out.push(format!("    RETLW {lit}({f})"));
+            } else {
+                out.push(format!("    RETLW 0x{b:02X}"));
+            }
+            locs.push(None);
+        }
+        out.push("".to_string());
+        locs.push(None);
     }
     out.push("    end".to_string());
     locs.push(None);
