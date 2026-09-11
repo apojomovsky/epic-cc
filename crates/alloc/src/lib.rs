@@ -830,6 +830,17 @@ fn va_sizes(m: &Module) -> HashMap<String, u16> {
 }
 
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
+    // The va region size frame_layout reserves: the widest call site, with
+    // a one-byte floor so a variadic function whose call sites pass no
+    // extra args still has a base address for its va_start (epic-cc#391).
+    fn floored_va_size(f: &ir::Func, va_sizes: &HashMap<String, u16>) -> u16 {
+        let vs = va_sizes.get(&f.name).copied().unwrap_or(0);
+        if f.variadic {
+            vs.max(1)
+        } else {
+            vs
+        }
+    }
     // iselcore's pointer resolution: a pointer select seeded as an indirect
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
@@ -1133,7 +1144,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut locals_size: HashMap<String, u16> = HashMap::new();
     let va_sizes = va_sizes(m);
     for f in &m.funcs {
-        let fl = frame_layout(f, &resolved, *va_sizes.get(&f.name).unwrap_or(&0));
+        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
         locals_widths.insert(f.name.clone(), fl.widths);
         locals_size.insert(f.name.clone(), fl.size);
     }
@@ -1383,7 +1394,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut local_width: HashMap<String, u8> = HashMap::new();
     for f in &m.funcs {
         let b = base[&f.name];
-        let fl = frame_layout(f, &resolved, *va_sizes.get(&f.name).unwrap_or(&0));
+        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
         let mut slot_addr: Vec<u16> = Vec::with_capacity(fl.widths.len());
         let mut addr = b;
         for &w in &fl.widths {
