@@ -97,6 +97,55 @@ fn check_interrupt_vectors(path: &str, core: &str, vectors: &[u16]) {
     );
 }
 
+/// isr_w_shadow/isr_home_window (docs/39 D-2): paired, substituting for
+/// common_ram on a device with none.
+fn check_isr_shadow(
+    path: &str,
+    core: &str,
+    common_ram: Option<(u16, u16)>,
+    ram_banks: &[(u16, u16)],
+    isr_w_shadow: Option<u16>,
+    isr_home_window: Option<(u16, u16)>,
+) {
+    if isr_w_shadow.is_some() != isr_home_window.is_some() {
+        panic!("device: {path}: isr_w_shadow and isr_home_window must be set together");
+    }
+    if isr_w_shadow.is_some() && common_ram.is_some() {
+        panic!("device: {path}: isr_w_shadow is only for a device with no common_ram");
+    }
+    if core == "pic-baseline" && isr_w_shadow.is_some() {
+        panic!("device: {path}: pic-baseline has no interrupts, isr_w_shadow is meaningless");
+    }
+    let Some((hlo, hhi)) = isr_home_window else {
+        return;
+    };
+    if hlo > hhi {
+        panic!("device: {path}: isr_home_window [{hlo:#06X},{hhi:#06X}] lo > hi");
+    }
+    // isel needs 14 bytes here (scratch+retval+isr_save), the same floor
+    // ADR-034's single-region carve uses.
+    if hhi - hlo + 1 < 14 {
+        panic!("device: {path}: isr_home_window [{hlo:#06X},{hhi:#06X}] must be at least 14 bytes (scratch + retval + ISR save area)");
+    }
+    // Carved OUT of ram_banks like common_ram: bank_of's addr>>7 fallback
+    // needs no ram_banks membership.
+    for (lo, hi) in ram_banks {
+        if hlo <= *hi && hhi >= *lo {
+            panic!("device: {path}: isr_home_window [{hlo:#06X},{hhi:#06X}] overlaps ram_banks [{lo:#06X},{hi:#06X}]");
+        }
+    }
+    let w = isr_w_shadow.unwrap();
+    // Proof the generator really excluded isr_w_shadow from every region,
+    // not just picked an offset and hoped.
+    for (i, (lo, hi)) in ram_banks.iter().enumerate() {
+        let region_high_bits = lo & !0x7F;
+        let shadow_addr = region_high_bits | (w & 0x7F);
+        if shadow_addr >= *lo && shadow_addr <= *hi {
+            panic!("device: {path}: isr_w_shadow 0x{w:04X} is not excluded from ram_banks region {i} [{lo:#06X},{hi:#06X}] (reconstructed address 0x{shadow_addr:04X} still falls inside it)");
+        }
+    }
+}
+
 /// FSR carries bank-select bits on baseline and nowhere else (docs/37
 /// D-2/D-3); at most two, in FSR<7:5> of the baseline ISA.
 fn check_fsr_bank_bits(path: &str, core: &str, bits: u8) {
@@ -237,56 +286,14 @@ fn main() {
                         }
                     }
                 }
-                // isr_w_shadow/isr_home_window (docs/39 D-2): paired,
-                // substituting for common_ram on a device with none.
-                if dev.isr_w_shadow.is_some() != dev.isr_home_window.is_some() {
-                    panic!(
-                        "device: {}: isr_w_shadow and isr_home_window must be set together",
-                        path
-                    );
-                }
-                if dev.isr_w_shadow.is_some() && dev.common_ram.is_some() {
-                    panic!(
-                        "device: {}: isr_w_shadow is only for a device with no common_ram",
-                        path
-                    );
-                }
-                if dev.core == "pic-baseline" && dev.isr_w_shadow.is_some() {
-                    panic!(
-                        "device: {}: pic-baseline has no interrupts, isr_w_shadow is meaningless",
-                        path
-                    );
-                }
-                if let Some((hlo, hhi)) = dev.isr_home_window {
-                    if hlo > hhi {
-                        panic!(
-                            "device: {}: isr_home_window [{:#06X},{:#06X}] lo > hi",
-                            path, hlo, hhi
-                        );
-                    }
-                    // isel needs 14 bytes here (scratch+retval+isr_save),
-                    // the same floor ADR-034's single-region carve uses.
-                    if hhi - hlo + 1 < 14 {
-                        panic!("device: {}: isr_home_window [{:#06X},{:#06X}] must be at least 14 bytes (scratch + retval + ISR save area)", path, hlo, hhi);
-                    }
-                    // Carved OUT of ram_banks like common_ram: bank_of's
-                    // addr>>7 fallback needs no ram_banks membership.
-                    for (lo, hi) in &dev.ram_banks {
-                        if hlo <= *hi && hhi >= *lo {
-                            panic!("device: {}: isr_home_window [{:#06X},{:#06X}] overlaps ram_banks [{:#06X},{:#06X}]", path, hlo, hhi, lo, hi);
-                        }
-                    }
-                    let w = dev.isr_w_shadow.unwrap();
-                    // Proof the generator really excluded isr_w_shadow from
-                    // every region, not just picked an offset and hoped.
-                    for (i, (lo, hi)) in dev.ram_banks.iter().enumerate() {
-                        let region_high_bits = lo & !0x7F;
-                        let shadow_addr = region_high_bits | (w & 0x7F);
-                        if shadow_addr >= *lo && shadow_addr <= *hi {
-                            panic!("device: {}: isr_w_shadow 0x{:04X} is not excluded from ram_banks region {} [{:#06X},{:#06X}] (reconstructed address 0x{:04X} still falls inside it)", path, w, i, lo, hi, shadow_addr);
-                        }
-                    }
-                }
+                check_isr_shadow(
+                    path,
+                    &dev.core,
+                    dev.common_ram,
+                    &dev.ram_banks,
+                    dev.isr_w_shadow,
+                    dev.isr_home_window,
+                );
             }
             "pic18" => {
                 if dev.common_ram.is_some() {
