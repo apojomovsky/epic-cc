@@ -126,7 +126,7 @@ fn by_name_resolves_both_devices() {
 
 #[test]
 fn all_contains_every_seed_device() {
-    assert_eq!(device::ALL.len(), 34);
+    assert_eq!(device::ALL.len(), 35);
     assert!(device::ALL.iter().any(|d| d.name == "p16f877a"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f4550"));
     assert!(device::ALL.iter().any(|d| d.name == "p16f887"));
@@ -162,6 +162,7 @@ fn all_contains_every_seed_device() {
         "p10f320",
         "p10f322",
         "p16f84a",
+        "p16f74",
     ] {
         assert!(
             device::ALL.iter().any(|d| d.name == stem),
