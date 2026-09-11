@@ -50,21 +50,28 @@ fn eighty_byte_global_lands_in_ram_banks() {
             continue;
         }
         let mut m = ir::parse("global big i8\nfn main(void) ()\n  block entry:\n    ret void\n");
-        // Force an 80-byte global (covers the first PIC14 bank exactly: 0x20-0x6F).
-        m.globals[0].size = 80;
+        // 80 bytes covers the first PIC14 bank exactly (0x20-0x6F) on every
+        // device shipped before PIC16F84 (docs/39 D-1): its whole
+        // ram_banks is only 52 bytes after the common_ram carve, smaller
+        // than that fixed assumption. Scale to the device's real capacity
+        // instead -- the largest single global this device can place is
+        // what the check is actually proving, not a fixed absolute size.
+        let capacity: u16 = dev.ram_banks.iter().map(|&(lo, hi)| hi - lo + 1).sum();
+        let size = capacity.min(80).max(1);
+        m.globals[0].size = size;
         let layout = alloc::allocate(dev, &m, "depth 1\n");
         let addr = *layout.globals.get("big").expect("big global missing");
         assert!(
             dev.region_for(addr).is_some(),
-            "{}: 80-byte global start {:#06x} not in ram_banks {:?}",
+            "{}: {size}-byte global start {:#06x} not in ram_banks {:?}",
             dev.name,
             addr,
             dev.ram_banks
         );
-        let end = addr + 79;
+        let end = addr + size - 1;
         assert!(
             dev.region_for(end).is_some(),
-            "{}: 80-byte global end {:#06x} not in ram_banks {:?}",
+            "{}: {size}-byte global end {:#06x} not in ram_banks {:?}",
             dev.name,
             end,
             dev.ram_banks
