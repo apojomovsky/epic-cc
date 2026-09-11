@@ -260,6 +260,26 @@ def correct_ram(toml_path, lkr_path):
         new_ram = [[lo, hi]]
     else:
         new_ram = [[lo, hi] for lo, hi in banks]
+        common = data.get("common_ram")
+        if common:
+            # docs/39 D-1: a device whose entire GPR is one gputils
+            # DATABANK (PIC10F320/322, no aliasing at all) already has
+            # part of that same DATABANK carved into common_ram by
+            # gen-device.py. Widening blindly to gputils' full DATABANK
+            # span would overlap it (build.rs's ram_banks/common_ram
+            # overlap check catches this the hard way otherwise); clip
+            # any widened span at the carved window's edges instead.
+            clo, chi = common
+            clipped = []
+            for lo, hi in new_ram:
+                if lo <= chi and hi >= clo:
+                    if lo < clo:
+                        clipped.append([lo, clo - 1])
+                    if hi > chi:
+                        clipped.append([chi + 1, hi])
+                else:
+                    clipped.append([lo, hi])
+            new_ram = clipped
     if not new_ram:
         return False
     old_bytes = sum(hi - lo + 1 for lo, hi in data["ram_banks"])
