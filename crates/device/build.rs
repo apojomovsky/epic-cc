@@ -16,6 +16,10 @@ struct DeviceToml {
     access_bank: Option<(u16, u16)>,
     #[serde(default)]
     fixed_retval: Option<(u16, u16)>,
+    #[serde(default)]
+    isr_w_shadow: Option<u16>,
+    #[serde(default)]
+    isr_home_window: Option<(u16, u16)>,
     stack_depth: u8,
     #[serde(default)]
     fsr_bank_bits: u8,
@@ -233,6 +237,70 @@ fn main() {
                         }
                     }
                 }
+                // isr_w_shadow/isr_home_window (docs/39 D-2): paired, and
+                // only meaningful on a device with no common_ram at all --
+                // a device with a real common-RAM corner already has a
+                // bank-independent home for the ISR save area, this pair
+                // only exists to substitute for one.
+                if dev.isr_w_shadow.is_some() != dev.isr_home_window.is_some() {
+                    panic!(
+                        "device: {}: isr_w_shadow and isr_home_window must be set together",
+                        path
+                    );
+                }
+                if dev.isr_w_shadow.is_some() && dev.common_ram.is_some() {
+                    panic!(
+                        "device: {}: isr_w_shadow is only for a device with no common_ram",
+                        path
+                    );
+                }
+                if dev.core == "pic-baseline" && dev.isr_w_shadow.is_some() {
+                    panic!(
+                        "device: {}: pic-baseline has no interrupts, isr_w_shadow is meaningless",
+                        path
+                    );
+                }
+                if let Some((hlo, hhi)) = dev.isr_home_window {
+                    if hlo > hhi {
+                        panic!(
+                            "device: {}: isr_home_window [{:#06X},{:#06X}] lo > hi",
+                            path, hlo, hhi
+                        );
+                    }
+                    // isel's fixed scratch(1)/retval(4)/isr_save(9) layout
+                    // needs 14 bytes (crates/isel/src/lib.rs); matches the
+                    // same floor ADR-034's single-region carve uses.
+                    if hhi - hlo + 1 < 14 {
+                        panic!("device: {}: isr_home_window [{:#06X},{:#06X}] must be at least 14 bytes (scratch + retval + ISR save area)", path, hlo, hhi);
+                    }
+                    let mut found_home = false;
+                    for (lo, hi) in &dev.ram_banks {
+                        if hlo <= *hi && hhi >= *lo {
+                            if hlo < *lo || hhi > *hi {
+                                panic!("device: {}: isr_home_window [{:#06X},{:#06X}] must lie entirely inside one ram_banks region, straddles [{:#06X},{:#06X}]", path, hlo, hhi, lo, hi);
+                            }
+                            found_home = true;
+                        }
+                    }
+                    if !found_home {
+                        panic!("device: {}: isr_home_window [{:#06X},{:#06X}] does not lie inside any ram_banks region -- it must be carved from one, not floating outside it", path, hlo, hhi);
+                    }
+                    let w = dev.isr_w_shadow.unwrap();
+                    // The W-shadow offset must actually be excluded from
+                    // every ram_banks region's own declared span -- proof
+                    // the generator really carved it out, not just picked
+                    // an offset and hoped. Confirmed by reconstructing each
+                    // region's copy of the address (its own high bits, the
+                    // shadow's low 7 bits) and checking it falls outside
+                    // that region's declared range.
+                    for (i, (lo, hi)) in dev.ram_banks.iter().enumerate() {
+                        let region_high_bits = lo & !0x7F;
+                        let shadow_addr = region_high_bits | (w & 0x7F);
+                        if shadow_addr >= *lo && shadow_addr <= *hi {
+                            panic!("device: {}: isr_w_shadow 0x{:04X} is not excluded from ram_banks region {} [{:#06X},{:#06X}] (reconstructed address 0x{:04X} still falls inside it)", path, w, i, lo, hi, shadow_addr);
+                        }
+                    }
+                }
             }
             "pic18" => {
                 if dev.common_ram.is_some() {
@@ -404,6 +472,14 @@ fn main() {
             Some((lo, hi)) => format!("Some((0x{lo:04X}, 0x{hi:04X}))"),
             None => "None".to_string(),
         };
+        let isr_w_shadow_str = match dev.isr_w_shadow {
+            Some(w) => format!("Some(0x{w:04X})"),
+            None => "None".to_string(),
+        };
+        let isr_home_window_str = match dev.isr_home_window {
+            Some((lo, hi)) => format!("Some((0x{lo:04X}, 0x{hi:04X}))"),
+            None => "None".to_string(),
+        };
         let vectors_str = dev
             .interrupt_vectors
             .iter()
@@ -418,7 +494,7 @@ fn main() {
             .collect::<Vec<_>>()
             .join(", ");
         out.push_str(&format!(
-            "pub const {ident}: Device = Device {{\n    name: \"{name}\",\n    core: {core},\n    flash_words: 0x{flash:X},\n    ram_banks: &[{ram_banks}],\n    common_ram: {common},\n    access_bank: {access},\n    fixed_retval: {retval},\n    stack_depth: {stack},\n    fsr_bank_bits: {fsb},\n    interrupt_vectors: &[{vectors}],\n    config: ConfigRegion {{\n        base_byte_addr: 0x{base:X},\n        num_bytes: {num_bytes},\n        erased_baseline: &[{erased}],\n        fields: &[\n",
+            "pub const {ident}: Device = Device {{\n    name: \"{name}\",\n    core: {core},\n    flash_words: 0x{flash:X},\n    ram_banks: &[{ram_banks}],\n    common_ram: {common},\n    access_bank: {access},\n    fixed_retval: {retval},\n    isr_w_shadow: {isr_w_shadow},\n    isr_home_window: {isr_home_window},\n    stack_depth: {stack},\n    fsr_bank_bits: {fsb},\n    interrupt_vectors: &[{vectors}],\n    config: ConfigRegion {{\n        base_byte_addr: 0x{base:X},\n        num_bytes: {num_bytes},\n        erased_baseline: &[{erased}],\n        fields: &[\n",
             ident = ident,
             name = dev.name,
             core = core_variant,
@@ -427,6 +503,8 @@ fn main() {
             common = common_str,
             access = access_str,
             retval = retval_str,
+            isr_w_shadow = isr_w_shadow_str,
+            isr_home_window = isr_home_window_str,
             stack = dev.stack_depth,
             fsb = dev.fsr_bank_bits,
             vectors = vectors_str,
