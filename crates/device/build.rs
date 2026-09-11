@@ -201,9 +201,13 @@ fn main() {
         // (epic-cc#109).
         match dev.core.as_str() {
             "pic14" | "pic14e" | "pic-baseline" => {
-                if dev.common_ram.is_none() {
-                    panic!("device: {}: {} requires common_ram", path, dev.core);
-                }
+                // common_ram is Option, not required: a device with no
+                // bank-independent byte at all (docs/39 D-2, PIC16F74's
+                // shape) is a real, valid schema state -- isel's/
+                // isel-pic14e's own `.expect(...)` is the enforcement point
+                // for devices that actually reach codegen needing one
+                // (epic-cc#393/#398; nothing else here reads common_ram as
+                // Some-only).
                 if dev.access_bank.is_some() {
                     panic!(
                         "device: {}: {} must not have access_bank (PIC18 only)",
