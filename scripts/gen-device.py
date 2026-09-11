@@ -804,6 +804,48 @@ def generate_toml(
                     "still leave ram_banks bytes for globals"
                 ]
             )
+    # Two or more real, non-aliased regions (PIC16F74: no single-region
+    # collapse above, no COMMON=/shared corner either) have no
+    # bank-independent byte at all -- docs/39 D-2 (epic-cc#393)'s
+    # isr_w_shadow/isr_home_window pair substitutes for one instead of
+    # leaving isel with nothing. The lowest region becomes the ISR's home:
+    # its top COMMON_RAM_CARVE_SIZE bytes become isr_home_window (same
+    # convention as common_ram's own carve), and the low 7 bits of every
+    # region's own first byte become isr_w_shadow -- reachable from any
+    # region because PIC14 direct addressing resolves `{RP1:RP0} ++
+    # opcode<6:0>` at execution time, so one literal operand is safe from
+    # whichever region is live, PROVIDED every region's low 7 bits at that
+    # offset really do line up (checked below, not assumed).
+    isr_w_shadow = None
+    isr_home_window = None
+    if core in ("pic14", "pic14e") and common_ram is None and len(ram_banks) >= 2:
+        ram_banks = sorted(ram_banks)
+        home_lo, home_hi = ram_banks[0]
+        candidate_shadow = home_lo
+        for lo, hi in ram_banks:
+            if lo & 0x7F != candidate_shadow & 0x7F:
+                raise MissingFacts(
+                    [
+                        f"isr_w_shadow: region 0x{lo:04X}-0x{hi:04X}'s low 7 "
+                        f"bits (0x{lo & 0x7F:02X}) do not match the home "
+                        f"region's (0x{candidate_shadow & 0x7F:02X}); this "
+                        "generator only knows the shared-first-byte shape"
+                    ]
+                )
+        if home_hi - (home_lo + 1) + 1 <= COMMON_RAM_CARVE_SIZE:
+            raise MissingFacts(
+                [
+                    f"isr_home_window: home region 0x{home_lo:04X}-0x{home_hi:04X} "
+                    f"is too small to spare 1 byte for isr_w_shadow and still "
+                    f"carve a {COMMON_RAM_CARVE_SIZE}-byte isr_home_window"
+                ]
+            )
+        isr_w_shadow = candidate_shadow
+        isr_home_window = (home_hi - COMMON_RAM_CARVE_SIZE + 1, home_hi)
+        new_banks = [(home_lo + 1, home_hi - COMMON_RAM_CARVE_SIZE)]
+        for lo, hi in ram_banks[1:]:
+            new_banks.append((lo + 1, hi))
+        ram_banks = new_banks
     stack_s = scalar("STACKDEPTH")
     stack_depth = pick(
         "stack_depth (EDC MemTraits hwstackdepth or ini STACKDEPTH)",
@@ -1032,6 +1074,12 @@ def generate_toml(
     out_lines.append(f"ram_banks = [{banks_str}]")
     if common_ram:
         out_lines.append(f"common_ram = [0x{common_ram[0]:04X}, 0x{common_ram[1]:04X}]")
+    if isr_w_shadow is not None:
+        out_lines.append(f"isr_w_shadow = 0x{isr_w_shadow:04X}")
+    if isr_home_window:
+        out_lines.append(
+            f"isr_home_window = [0x{isr_home_window[0]:04X}, 0x{isr_home_window[1]:04X}]"
+        )
     if access_bank:
         out_lines.append(
             f"access_bank = [0x{access_bank[0]:04X}, 0x{access_bank[1]:04X}]"
