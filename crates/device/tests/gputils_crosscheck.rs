@@ -121,18 +121,13 @@ fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
                 ));
             }
             // ADR-034 (docs/39 D-1): a device whose entire GPR is one
-            // physical, bank-independent region as far as gputils is
-            // concerned -- either a lone DATABANK (a true single bank, e.g.
-            // PIC10F320/322: no aliasing to protect against, so gputils
-            // never calls it a SHAREBANK) or one full-alias SHAREBANK (e.g.
-            // PIC16F84/PIC12F629/PIC12F675) -- may split that single region
-            // between common_ram and ram_banks as a compiler-policy choice.
-            // Claiming *less* bank-independence than gputils confirms is
-            // available is never a defect, only claiming more is; verify
-            // the union against gputils' single total instead of an exact
-            // per-field match, but only as a fallback when the strict
-            // per-field comparison above already disagrees, so an
-            // already-correct device keeps being held to the tighter check.
+            // region as far as gputils is concerned -- a lone DATABANK
+            // (PIC10F320/322, no aliasing) or a full-alias SHAREBANK
+            // (PIC16F84/PIC12F629/PIC12F675) -- may split it between
+            // common_ram and ram_banks (claiming less bank-independence
+            // than confirmed is safe, only claiming more is a defect).
+            // Fallback only, so an already-correct device stays on the
+            // stricter per-field check above.
             if !strict.is_empty() {
                 let their_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());
                 let mut ours = dev.ram_banks.to_vec();

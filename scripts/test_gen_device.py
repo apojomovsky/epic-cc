@@ -176,15 +176,12 @@ class GenDeviceTest(unittest.TestCase):
         self.assertNotIn("common_ram", text)
 
     def test_single_region_from_a_full_bank_shadow_gets_a_carved_common_ram(self):
-        # docs/39 D-1 / ADR-034: PIC16F84's exact shape (bank0 real GPR,
-        # bank1 100% shadow of bank0, no primary of its own). Unlike the
-        # PIC16F74-style test above, there is only ONE physical region here
-        # (no second bank a stray select-bit value could reach), so it is
-        # bank-independent in full -- the generator should carve
-        # COMMON_RAM_CARVE_SIZE bytes off the top rather than leave
-        # common_ram unset. Addresses match the real PIC16F84 prediction in
-        # docs/39's table exactly (0x0C-0x4F full region -> common_ram
-        # 0x40-0x4F, ram_banks 0x0C-0x3F).
+        # docs/39 D-1 / ADR-034: PIC16F84's shape (bank0 real GPR, bank1
+        # 100% shadow, no primary of its own) -- unlike the PIC16F74-style
+        # test above, only ONE physical region exists, so the generator
+        # should carve COMMON_RAM_CARVE_SIZE bytes off the top rather than
+        # leave common_ram unset. Addresses match docs/39's real prediction
+        # (0x0C-0x4F -> common_ram 0x40-0x4F, ram_banks 0x0C-0x3F).
         xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN03" edc:arch="16xxxx">
   <edc:ArchDef edc:name="16xxxx">
     <edc:MemTraits edc:hwstackdepth="0x8"/>

@@ -50,12 +50,10 @@ fn eighty_byte_global_lands_in_ram_banks() {
             continue;
         }
         let mut m = ir::parse("global big i8\nfn main(void) ()\n  block entry:\n    ret void\n");
-        // 80 bytes covers the first PIC14 bank exactly (0x20-0x6F) on every
-        // device shipped before PIC16F84 (docs/39 D-1): its whole
-        // ram_banks is only 52 bytes after the common_ram carve, smaller
-        // than that fixed assumption. Scale to the device's real capacity
-        // instead -- the largest single global this device can place is
-        // what the check is actually proving, not a fixed absolute size.
+        // 80 bytes covers the first PIC14 bank on every device shipped
+        // before PIC16F84 (docs/39 D-1), whose ram_banks is only 52 bytes.
+        // Scale to real capacity: the largest global that fits is what
+        // this actually proves, not a fixed absolute size.
         let capacity: u16 = dev.ram_banks.iter().map(|&(lo, hi)| hi - lo + 1).sum();
         let size = capacity.min(80).max(1);
         m.globals[0].size = size;
