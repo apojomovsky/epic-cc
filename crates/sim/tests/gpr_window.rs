@@ -21,6 +21,8 @@ const WIDE_BANKS: Device = Device {
     common_ram: Some((0x70, 0x7F)),
     access_bank: None,
     fixed_retval: None,
+    isr_w_shadow: None,
+    isr_home_window: None,
     stack_depth: 8,
     fsr_bank_bits: 0,
     interrupt_vectors: &[0x0004],

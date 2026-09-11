@@ -128,7 +128,29 @@ fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
             // than confirmed is safe, only claiming more is a defect).
             // Fallback only, so an already-correct device stays on the
             // stricter per-field check above.
-            if !strict.is_empty() {
+            //
+            // docs/39 D-2 (epic-cc#393, PIC16F74): gputils reports this as
+            // TWO separate unprotected SHAREBANKs, one per real region, so
+            // `theirs_shared.first()` above sees only one and calls it a
+            // mismatch. Reconstruct instead: ram_banks plus isr_w_shadow
+            // (rebuilt per region) plus isr_home_window must coalesce back
+            // to gputils' full total.
+            if !strict.is_empty() && dev.isr_w_shadow.is_some() {
+                let w = dev.isr_w_shadow.unwrap();
+                let their_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());
+                let mut ours = dev.ram_banks.to_vec();
+                for (lo, _) in dev.ram_banks {
+                    let addr = (lo & !0x7F) | (w & 0x7F);
+                    ours.push((addr, addr));
+                }
+                ours.extend(dev.isr_home_window);
+                let ours = coalesce(&ours);
+                if ours == their_total {
+                    // Union matches gputils' per-region totals exactly.
+                } else {
+                    problems.extend(strict);
+                }
+            } else if !strict.is_empty() {
                 let their_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());
                 let mut ours = dev.ram_banks.to_vec();
                 ours.extend(dev.common_ram);

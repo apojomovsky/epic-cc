@@ -40,6 +40,28 @@ pub struct Device {
     /// cross-checked against the `.lkr`; it is where `isel-pic18` puts
     /// `retval_lo`.
     pub fixed_retval: Option<(u16, u16)>,
+    /// PIC14/PIC14E only, and only on a device with `common_ram: None`
+    /// (docs/39 D-2, e.g. PIC16F74's two non-aliased GPR regions): the
+    /// fixed low-7-bit offset reserved out of *every* `ram_banks`
+    /// region's normal allocation pool, reachable via direct addressing
+    /// regardless of which region is currently selected (PIC14 direct
+    /// addressing resolves `{RP1:RP0} ++ opcode<6:0>` at execution time,
+    /// so one literal operand lands correctly in whichever region is
+    /// live). The ISR prologue's only truly bank-independent byte: it
+    /// stashes `W` here before it knows which region interrupted the
+    /// main program. `None` on every device with `common_ram: Some` or a
+    /// single `ram_banks` region, which have no need for it.
+    pub isr_w_shadow: Option<u16>,
+    /// Paired with `isr_w_shadow`: an ordinary (bank-selected, not
+    /// bank-independent) window inside one `ram_banks` region that
+    /// `isel` carves for the fixed scratch byte, 4-byte retval region,
+    /// and ISR save area -- the same role `common_ram` plays on every
+    /// other PIC14/PIC14E device, just reachable through `bank_of`'s
+    /// normal `Some(bank)` path (so ordinary, non-ISR access still gets
+    /// a real `BANKSEL` from `banking`, unlike true common RAM) instead
+    /// of being exempt from banking entirely. `None` unless
+    /// `isr_w_shadow` is also set.
+    pub isr_home_window: Option<(u16, u16)>,
     /// Hardware call-stack depth; recursion beyond it is rejected at legalize.
     pub stack_depth: u8,
     /// Baseline only: how many of `FSR`'s high bits are bank select
@@ -152,6 +174,11 @@ impl Device {
         }
         if let Some((lo, hi)) = self.fixed_retval {
             if addr >= lo && addr <= hi {
+                return None;
+            }
+        }
+        if let Some(w) = self.isr_w_shadow {
+            if addr & 0x7F == w & 0x7F {
                 return None;
             }
         }

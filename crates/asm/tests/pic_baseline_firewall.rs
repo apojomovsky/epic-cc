@@ -14,6 +14,8 @@ const PIC_BASELINE_STUB: Device = Device {
     common_ram: Some((0x07, 0x0F)),
     access_bank: None,
     fixed_retval: None,
+    isr_w_shadow: None,
+    isr_home_window: None,
     fsr_bank_bits: 1,
     stack_depth: 2,
     interrupt_vectors: &[],

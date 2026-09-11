@@ -147,9 +147,12 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
 pub fn fixed_total(device: &Device) -> u16 {
     match device.core {
         device::Core::Pic14 | device::Core::Pic14e => {
+            // docs/39 D-2 (epic-cc#393): a device with no common-RAM
+            // region at all substitutes isr_home_window instead.
             let (lo, hi) = device
                 .common_ram
-                .expect("PIC14/PIC14E devices have a common-RAM region");
+                .or(device.isr_home_window)
+                .expect("PIC14/PIC14E devices have a common-RAM region or an isr_home_window");
             hi - lo + 1
         }
         device::Core::Pic18 => {
