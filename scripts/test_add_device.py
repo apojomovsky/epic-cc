@@ -343,6 +343,29 @@ class SiblingTest(unittest.TestCase):
             sib = add_device.sibling(d / "p14syn01.toml", d)
         self.assertIsNone(sib)
 
+    def test_prefers_shared_name_prefix_over_equal_length(self):
+        # p16f84a's real sibling is p16f84 (a shared name prefix, the same
+        # silicon family), not p10f320: an unrelated same-core device that
+        # merely happens to have an equal-length stem. Confirmed on the
+        # real registry (docs/32 §2 diff produced only noise against
+        # p10f320 and an empty, correct diff against p16f84).
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            write(
+                d / "p16f84a.toml",
+                PIC14_TOML.replace('name = "p14syn01"', 'name = "p16f84a"'),
+            )
+            write(
+                d / "p16f84.toml",
+                PIC14_TOML.replace('name = "p14syn01"', 'name = "p16f84"'),
+            )
+            write(
+                d / "p10f320.toml",
+                PIC14_TOML.replace('name = "p14syn01"', 'name = "p10f320"'),
+            )
+            sib = add_device.sibling(d / "p16f84a.toml", d)
+        self.assertEqual(sib.name, "p16f84.toml")
+
 
 if __name__ == "__main__":
     unittest.main()

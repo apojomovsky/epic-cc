@@ -330,15 +330,27 @@ def field_diff(toml_path, sibling_path):
     return lines
 
 
+def _shared_prefix_len(a, b):
+    n = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        n += 1
+    return n
+
+
 def sibling(toml_path, devices_dir):
-    """The closest existing registry sibling on the same core, by name
-    distance (docs/38 D-1 step 5). Returns the sibling TOML path, or None
-    when no other device shares the core."""
+    """The closest existing registry sibling on the same core (docs/38 D-1
+    step 5): the device whose stem shares the longest name prefix (e.g.
+    p16f84a's real sibling is p16f84, not some other same-core device that
+    merely happens to have an equal-length name), name-length distance as
+    the tiebreaker. Returns the sibling TOML path, or None when no other
+    device shares the core."""
     data = _load(toml_path)
     core = data["core"]
     stem = pathlib.Path(toml_path).stem
     best = None
-    best_dist = None
+    best_key = None
     for p in sorted(pathlib.Path(devices_dir).glob("*.toml")):
         if p.stem == stem:
             continue
@@ -348,10 +360,10 @@ def sibling(toml_path, devices_dir):
             continue
         if other.get("core") != core:
             continue
-        dist = abs(len(p.stem) - len(stem))
-        if best is None or dist < best_dist:
+        key = (-_shared_prefix_len(p.stem, stem), abs(len(p.stem) - len(stem)))
+        if best is None or key < best_key:
             best = p
-            best_dist = dist
+            best_key = key
     return best
 
 
