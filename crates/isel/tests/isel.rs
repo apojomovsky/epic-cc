@@ -7371,6 +7371,28 @@ fn isr_prologue_body_epilogue_simulates_with_retfie_return() {
 }
 
 #[test]
+fn isr_save_area_uses_the_devices_own_common_ram_not_a_hardcoded_0x70() {
+    // Regression: the ISR prologue/epilogue used to hardcode 0x70-0x7F
+    // literally, correct only because every device shipped before
+    // ADR-034 (docs/39 D-1) happened to place common_ram there. p16f84's
+    // common_ram is 0x40-0x4F (epic-cc#398): an ISR compiled for it must
+    // save/restore through those addresses, not PIC16F877A's.
+    let m = parse(
+        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm = select(&device::PIC16F84, &m, &addrs(&[]));
+    assert!(
+        asm.contains("MOVWF 0x45") && asm.contains("SWAPF 0x45, F"),
+        "ISR prologue must save W at p16f84's own isr_save_lo (0x45):\n{asm}"
+    );
+    assert!(
+        !asm.contains("0x75") && !asm.contains("0x7D"),
+        "must not fall back to PIC16F877A's common_ram addresses:\n{asm}"
+    );
+}
+
+#[test]
 fn isr_epilogue_preserves_preempted_z_for_main_branch() {
     // The M13-T5 regression: the OLD epilogue restored STATUS (flag-safe
     // SWAPF) but then restored FSR and W with MOVF — which SETS Z from the

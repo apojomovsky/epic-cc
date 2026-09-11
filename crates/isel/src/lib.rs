@@ -5715,6 +5715,89 @@ fn block_dominators(f: &ir::Func) -> HashMap<String, HashSet<String>> {
     dom
 }
 
+/// The ISR context-save prologue, right after the vector entry (word 4):
+/// `w_save` (nibble-swapped in place) first, `SWAPF STATUS, W` captures the
+/// interrupted bank+flags without touching them, then PCLATH/FSR and the
+/// preempted main's in-flight retval/scratch (live across the interrupt in
+/// the compare/shift/multiply/call-return paths) into the shadow bytes.
+/// Two address shapes share this one emitter:
+/// - `common_ram`-backed devices (every device but PIC16F74, docs/39
+///   bucket 1): `w_save` is the fixed ISR-save area's own first byte,
+///   bank-independent like the rest of common RAM, so this is the exact
+///   assembly every one of those devices has always generated.
+/// - docs/39 D-2 devices (`common_ram: None`, `isr_w_shadow: Some`):
+///   `w_save` is the cross-region shadow slot instead, the one byte that
+///   must be touched before the bank is known; every other address here
+///   is an ordinary `ram_banks` byte inside `isr_home_window`, and
+///   `banking`'s existing `Device::bank_of`-driven `BANKSEL` insertion
+///   establishes the right bank the first time one is touched (a `Some`
+///   address right after `w_save`'s two `None`-exempt instructions) --
+///   this emitter never needs to know which case it is in.
+fn emit_isr_prologue(
+    g: &mut Gen,
+    w_save: u16,
+    status_save: u16,
+    pclath_save: u16,
+    fsr_save: u16,
+    retval_shadow: u16,
+    scratch_shadow: u16,
+    retval_lo: u16,
+    scratch: u16,
+) {
+    g.emit(format!("    MOVWF 0x{w_save:02X}"));
+    g.emit(format!("    SWAPF 0x{w_save:02X}, F"));
+    g.emit("    SWAPF STATUS, W".to_string());
+    g.emit(format!("    MOVWF 0x{status_save:02X}"));
+    g.emit("    MOVF PCLATH, W".to_string());
+    g.emit(format!("    MOVWF 0x{pclath_save:02X}"));
+    g.emit("    MOVF FSR, W".to_string());
+    g.emit(format!("    MOVWF 0x{fsr_save:02X}"));
+    for i in 0..4 {
+        g.emit(format!("    MOVF 0x{:02X}, W", retval_lo + i));
+        g.emit(format!("    MOVWF 0x{:02X}", retval_shadow + i));
+    }
+    g.emit(format!("    MOVF 0x{scratch:02X}, W"));
+    g.emit(format!("    MOVWF 0x{scratch_shadow:02X}"));
+    g.emit("    MOVLW 0x00".to_string());
+    g.emit("    MOVWF PCLATH".to_string());
+}
+
+/// The mirror-image restore, replacing the ISR's `ret`. Order is
+/// load-bearing: retval, then scratch, then PCLATH/FSR (plain `MOVF`, their
+/// `Z` clobber is fine, `STATUS` is not restored yet), then `STATUS` via the
+/// nibble swap-back (`SWAPF` is flag-safe and, for a D-2 device, also
+/// re-selects whichever region was active at interrupt entry), and `w_save`
+/// LAST via its own swap-back -- also flag-safe, and for a D-2 device now
+/// reachable again because `STATUS` just restored the correct region.
+/// `MOVF` there instead would set `Z` from the moved value after `STATUS`
+/// was already restored, corrupting the interrupted main's `Z`.
+fn emit_isr_epilogue(
+    g: &mut Gen,
+    w_save: u16,
+    status_save: u16,
+    pclath_save: u16,
+    fsr_save: u16,
+    retval_shadow: u16,
+    scratch_shadow: u16,
+    retval_lo: u16,
+    scratch: u16,
+) {
+    for i in 0..4 {
+        g.emit(format!("    MOVF 0x{:02X}, W", retval_shadow + i));
+        g.emit(format!("    MOVWF 0x{:02X}", retval_lo + i));
+    }
+    g.emit(format!("    MOVF 0x{scratch_shadow:02X}, W"));
+    g.emit(format!("    MOVWF 0x{scratch:02X}"));
+    g.emit(format!("    MOVF 0x{pclath_save:02X}, W"));
+    g.emit("    MOVWF PCLATH".to_string());
+    g.emit(format!("    MOVF 0x{fsr_save:02X}, W"));
+    g.emit("    MOVWF FSR".to_string());
+    g.emit(format!("    SWAPF 0x{status_save:02X}, W"));
+    g.emit("    MOVWF STATUS".to_string());
+    g.emit(format!("    SWAPF 0x{w_save:02X}, W"));
+    g.emit("    RETFIE".to_string());
+}
+
 /// Emit one function's body into `g.out`: runtime routines get their recipe
 /// body; ordinary functions get the block labels, phi copies, and
 /// terminators. Shared by both emission passes: pass A measures the body
@@ -5810,49 +5893,40 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     for (i, b) in f.blocks.iter().enumerate() {
         g.emit(format!("{}:", labels[&b.label]));
         if i == 0 && f.isr {
-            // The ISR save prologue, right after the vector entry (word 4):
-            // W into 0x75, nibble-swapped IN PLACE (SWAPF 0x75, F has no
-            // STATUS side effects and no W dependency, the epilogue's
-            // swap-back is the flag-safe W restore), STATUS into 0x76
-            // nibble-swapped (SWAPF reads STATUS without touching it),
-            // PCLATH and FSR into 0x77/0x78, then the preempted main's
-            // in-flight return value (0x71-0x74) into 0x79-0x7C: the ISR
-            // body's value-returning calls write the retval region, so
-            // without this save they would clobber it, and finally the
-            // fixed scratch byte 0x70 into 0x7D. The scratch is LIVE across
-            // interrupt windows in the preempted main: const reads stash
-            // their byte/index in 0x70 across the PCLATH restore, GEP
-            // offsets accumulate there, and the icmp/add/sub chains fold
-            // through it: an ISR that itself uses the scratch (a const
-            // read, a compare, an i16/i32 op) would silently corrupt that
-            // in-flight value without this save. Then PCLATH = 0 so the
-            // ISR body's GOTOs stay in page 0 (the restore literal is
-            // PAGE(isr) = 0). The save area is fixed common RAM
-            // (0x75-0x7D: W/STATUS/PCLATH/FSR/retval x4/scratch = 9 bytes),
-            // disjoint from the scratch byte (0x70) and the retval region
-            // (0x71-0x74); 0x7E-0x7F stays free. The retval/scratch MOVFs
-            // clobber the CURRENT Z, which is harmless: the interrupted
-            // STATUS is already safe in 0x76.
-            g.emit("    MOVWF 0x75");
-            g.emit("    SWAPF 0x75, F");
-            g.emit("    SWAPF STATUS, W");
-            g.emit("    MOVWF 0x76");
-            g.emit("    MOVF PCLATH, W");
-            g.emit("    MOVWF 0x77");
-            g.emit("    MOVF FSR, W");
-            g.emit("    MOVWF 0x78");
-            g.emit("    MOVF 0x71, W");
-            g.emit("    MOVWF 0x79");
-            g.emit("    MOVF 0x72, W");
-            g.emit("    MOVWF 0x7A");
-            g.emit("    MOVF 0x73, W");
-            g.emit("    MOVWF 0x7B");
-            g.emit("    MOVF 0x74, W");
-            g.emit("    MOVWF 0x7C");
-            g.emit("    MOVF 0x70, W");
-            g.emit("    MOVWF 0x7D");
-            g.emit("    MOVLW 0x00");
-            g.emit("    MOVWF PCLATH");
+            // The scratch/retval addresses are fixed, device-derived
+            // constants (docs/39): bank-independent common RAM on every
+            // device but PIC16F74 (`common_ram: Some`), an ordinary,
+            // banked home-region window there instead (`isr_w_shadow:
+            // Some`, epic-cc#393 D-2) -- either way the ISR save area sits
+            // right after the retval region, and `emit_isr_prologue` emits
+            // the correct one either way (see its own doc comment).
+            let retval_lo = g.retval_lo;
+            let scratch = g.scratch;
+            let isr_save_lo = retval_lo + 4;
+            match g.device.isr_w_shadow {
+                None => emit_isr_prologue(
+                    g,
+                    isr_save_lo,
+                    isr_save_lo + 1,
+                    isr_save_lo + 2,
+                    isr_save_lo + 3,
+                    isr_save_lo + 4,
+                    isr_save_lo + 8,
+                    retval_lo,
+                    scratch,
+                ),
+                Some(w_shadow) => emit_isr_prologue(
+                    g,
+                    w_shadow,
+                    isr_save_lo,
+                    isr_save_lo + 1,
+                    isr_save_lo + 2,
+                    isr_save_lo + 3,
+                    isr_save_lo + 7,
+                    retval_lo,
+                    scratch,
+                ),
+            }
         }
         let mut terminator = None;
         for i in &b.insts {
@@ -5956,35 +6030,37 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                 }
                 _ if f.isr => {
                     match t {
-                        // The restore epilogue replaces the ISR's `ret`. Order
-                        // is load-bearing: the retval region (0x79-0x7C ->
-                        // 0x71-0x74), then the scratch byte (0x7D -> 0x70), then
-                        // PCLATH/FSR (MOVF, their Z clobbers are fine, STATUS
-                        // is not restored), then STATUS via the nibble
-                        // swap-back (SWAPF is flag-safe), and W LAST via its
-                        // swap-back (also flag-safe, MOVF would set Z from the
-                        // moved value after STATUS was already restored,
-                        // corrupting the interrupted main's Z). RETFIE pops the
-                        // hardware-pushed return.
+                        // The restore epilogue replaces the ISR's `ret`;
+                        // see `emit_isr_epilogue`'s doc comment for the
+                        // ordering rationale and the two device shapes.
                         Inst::Ret(None, _) => {
-                            g.emit("    MOVF 0x79, W");
-                            g.emit("    MOVWF 0x71");
-                            g.emit("    MOVF 0x7A, W");
-                            g.emit("    MOVWF 0x72");
-                            g.emit("    MOVF 0x7B, W");
-                            g.emit("    MOVWF 0x73");
-                            g.emit("    MOVF 0x7C, W");
-                            g.emit("    MOVWF 0x74");
-                            g.emit("    MOVF 0x7D, W");
-                            g.emit("    MOVWF 0x70");
-                            g.emit("    MOVF 0x77, W");
-                            g.emit("    MOVWF PCLATH");
-                            g.emit("    MOVF 0x78, W");
-                            g.emit("    MOVWF FSR");
-                            g.emit("    SWAPF 0x76, W");
-                            g.emit("    MOVWF STATUS");
-                            g.emit("    SWAPF 0x75, W");
-                            g.emit("    RETFIE");
+                            let retval_lo = g.retval_lo;
+                            let scratch = g.scratch;
+                            let isr_save_lo = retval_lo + 4;
+                            match g.device.isr_w_shadow {
+                                None => emit_isr_epilogue(
+                                    g,
+                                    isr_save_lo,
+                                    isr_save_lo + 1,
+                                    isr_save_lo + 2,
+                                    isr_save_lo + 3,
+                                    isr_save_lo + 4,
+                                    isr_save_lo + 8,
+                                    retval_lo,
+                                    scratch,
+                                ),
+                                Some(w_shadow) => emit_isr_epilogue(
+                                    g,
+                                    w_shadow,
+                                    isr_save_lo,
+                                    isr_save_lo + 1,
+                                    isr_save_lo + 2,
+                                    isr_save_lo + 3,
+                                    isr_save_lo + 7,
+                                    retval_lo,
+                                    scratch,
+                                ),
+                            }
                         }
                         Inst::Ret(Some(_), _) => panic!(
                             "isel: interrupt handler @{} must be void (cannot return a value)",
@@ -6417,16 +6493,20 @@ pub fn select_with_locs(
         device.interrupt_vectors.len(),
     );
     let has_isr = !isr_names.is_empty();
-    // The icmp scratch byte and the four retval bytes are fixed common-RAM
-    // constants (bank-independent, the device's common RAM is never used by
-    // locals, so no collision). The widened i32 region must not overrun
-    // common RAM nor overlap the scratch byte, and the ISR save area (W,
-    // STATUS, PCLATH, FSR, retval x4, scratch, 9 bytes) must sit right
-    // after the retval region, disjoint from it and from scratch, leaving
-    // the last 2 bytes of common RAM free.
-    let (common_lo, common_hi) = device
-        .common_ram
-        .expect("isel's fixed scratch/retval/ISR-save layout needs a common-RAM region");
+    // The icmp scratch byte and the four retval bytes are fixed constants,
+    // carved from common RAM on every device but PIC16F74 (bank-independent,
+    // the device's common RAM is never used by locals, so no collision), or
+    // from `isr_home_window` there instead (docs/39 D-2, epic-cc#393: an
+    // ordinary, banked window `banking`'s existing BANKSEL insertion reaches
+    // correctly, since the device has no bank-independent byte to spare).
+    // The widened i32 region must not overrun this window nor overlap the
+    // scratch byte, and the ISR save area (W or STATUS, PCLATH, FSR, retval
+    // x4, scratch, 9 or 8 bytes depending on which shape this is) must sit
+    // right after the retval region, disjoint from it and from scratch.
+    let (common_lo, common_hi) = device.common_ram.or(device.isr_home_window).expect(
+        "isel's fixed scratch/retval/ISR-save layout needs a common-RAM \
+             region or an isr_home_window",
+    );
     let scratch: u16 = common_lo;
     let retval_lo: u16 = common_lo + 1;
     let isr_save_lo: u16 = common_lo + 5;
