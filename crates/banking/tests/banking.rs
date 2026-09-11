@@ -1,6 +1,69 @@
 use banking::assign_banks;
 use device::PIC16F1938;
 use device::PIC16F877A;
+use device::{ConfigRegion, Core, Device};
+
+/// PIC16F74's real shape (docs/39 D-2, epic-cc#393): two non-aliased GPR
+/// regions, no common_ram. isr_w_shadow (0x20) and isr_home_window
+/// (0x70-0x7F) are carved out of ram_banks the same way common_ram is on
+/// every other PIC14 device -- see crates/device/build.rs's isr_home_window
+/// overlap check for why they are absent from ram_banks below.
+const D2_SHAPE: Device = Device {
+    name: "banking-test-d2",
+    core: Core::Pic14,
+    flash_words: 0x800,
+    ram_banks: &[(0x21, 0x6F), (0xA1, 0xFF)],
+    common_ram: None,
+    access_bank: None,
+    fixed_retval: None,
+    isr_w_shadow: Some(0x20),
+    isr_home_window: Some((0x70, 0x7F)),
+    stack_depth: 8,
+    fsr_bank_bits: 0,
+    interrupt_vectors: &[0x0004],
+    config: ConfigRegion {
+        base_byte_addr: 0x400E,
+        num_bytes: 2,
+        erased_baseline: &[0xFF, 0x3F],
+        fields: &[],
+    },
+    sfrs: &[],
+};
+
+#[test]
+fn retval_region_gets_a_real_bankselect_on_a_docs39_d2_device() {
+    // The identical address (0x71, isel's retval_lo) needs no BANKSEL on a
+    // common_ram-backed device (bank_of returns None) but a real one on a
+    // docs/39 D-2 device, where the same address is an ordinary ram_banks
+    // byte reached through isr_home_window instead -- crates/isel's own
+    // ~148 retval/scratch call sites need no changes for this (the whole
+    // point of D-2's design, see docs/39 section 3's revised cost estimate):
+    // banking already inserts the select generically, keyed only on the
+    // address, exactly as it would for any ordinary local.
+    let asm = "    BSF STATUS, 5\n    MOVF 0xA5, W\n    MOVF 0x71, W\n";
+    let common = assign_banks(&PIC16F877A, asm);
+    assert!(
+        !common.contains("BCF STATUS, 5"),
+        "common_ram needs no bank restore:\n{common}"
+    );
+    let d2 = assign_banks(&D2_SHAPE, asm);
+    assert!(
+        d2.contains("BCF STATUS, 5"),
+        "isr_home_window is an ordinary bank, needs a real BANKSEL:\n{d2}"
+    );
+}
+
+#[test]
+fn isr_w_shadow_needs_no_bankselect_on_a_docs39_d2_device() {
+    // The one address that must stay reachable with no bank knowledge at
+    // all, on either side of the region boundary.
+    let asm = "    BSF STATUS, 5\n    MOVF 0xA5, W\n    MOVWF 0x20\n";
+    let d2 = assign_banks(&D2_SHAPE, asm);
+    assert!(
+        !d2.contains("BCF STATUS, 5") && !d2.contains("BSF STATUS, 6"),
+        "isr_w_shadow must be reachable with no prior bank knowledge:\n{d2}"
+    );
+}
 
 #[test]
 fn passes_bank0_asm_through() {

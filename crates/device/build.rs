@@ -273,17 +273,17 @@ fn main() {
                     if hhi - hlo + 1 < 14 {
                         panic!("device: {}: isr_home_window [{:#06X},{:#06X}] must be at least 14 bytes (scratch + retval + ISR save area)", path, hlo, hhi);
                     }
-                    let mut found_home = false;
+                    // Modeled exactly like common_ram (which this pair
+                    // substitutes for): carved OUT of ram_banks, not
+                    // inside it. Device::bank_of's generic addr>>7
+                    // fallback resolves any address here to the correct
+                    // bank with no ram_banks membership needed -- PIC14
+                    // paging is a direct function of the address, not a
+                    // lookup restricted to declared regions.
                     for (lo, hi) in &dev.ram_banks {
                         if hlo <= *hi && hhi >= *lo {
-                            if hlo < *lo || hhi > *hi {
-                                panic!("device: {}: isr_home_window [{:#06X},{:#06X}] must lie entirely inside one ram_banks region, straddles [{:#06X},{:#06X}]", path, hlo, hhi, lo, hi);
-                            }
-                            found_home = true;
+                            panic!("device: {}: isr_home_window [{:#06X},{:#06X}] overlaps ram_banks [{:#06X},{:#06X}]", path, hlo, hhi, lo, hi);
                         }
-                    }
-                    if !found_home {
-                        panic!("device: {}: isr_home_window [{:#06X},{:#06X}] does not lie inside any ram_banks region -- it must be carved from one, not floating outside it", path, hlo, hhi);
                     }
                     let w = dev.isr_w_shadow.unwrap();
                     // The W-shadow offset must actually be excluded from
