@@ -251,7 +251,7 @@ impl<'m> Gen<'m> {
                         }
                     }
                 }
-                Some(max_w)
+                Some(if f.variadic { max_w.max(1) } else { max_w })
             })
             .unwrap_or(0)
     }
