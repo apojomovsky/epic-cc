@@ -86,14 +86,10 @@ fn isr_fires_callback_through_function_pointer_on_p16f74() {
 
     // The ISR runs (PORTB = 0x55, stores on_event_isr, invokes it -> out =
     // 0x11), RETFIE returns to main, and main completes: out == 0x12,
-    // PORTB == 0x22, then the __start SLEEP halts the machine. This is the
-    // real proof the D-2 mechanism (isr_w_shadow/isr_home_window) works
-    // through the actual compiler: the callback's return value round-trips
-    // through isel's ordinary retval region, now an isr_home_window byte
-    // reached via crates/banking's generic BANKSEL insertion instead of
-    // common RAM, and the ISR's own W/STATUS/bank state survives via the
-    // shadow-slot technique -- regardless of which of PIC16F74's two
-    // regions was live at interrupt entry.
+    // PORTB == 0x22, then the __start SLEEP halts the machine -- the real
+    // proof the D-2 mechanism works through the actual compiler, not just
+    // in isolation (crates/sim/tests/interrupts_no_common_ram.rs) or at
+    // the banking unit level (crates/banking/tests/banking.rs).
     p.run(500_000);
     assert_eq!(
         p.ram()[out_addr],

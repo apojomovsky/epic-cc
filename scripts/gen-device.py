@@ -804,18 +804,14 @@ def generate_toml(
                     "still leave ram_banks bytes for globals"
                 ]
             )
-    # Two or more real, non-aliased regions (PIC16F74: no single-region
-    # collapse above, no COMMON=/shared corner either) have no
-    # bank-independent byte at all -- docs/39 D-2 (epic-cc#393)'s
-    # isr_w_shadow/isr_home_window pair substitutes for one instead of
-    # leaving isel with nothing. The lowest region becomes the ISR's home:
-    # its top COMMON_RAM_CARVE_SIZE bytes become isr_home_window (same
-    # convention as common_ram's own carve), and the low 7 bits of every
-    # region's own first byte become isr_w_shadow -- reachable from any
-    # region because PIC14 direct addressing resolves `{RP1:RP0} ++
-    # opcode<6:0>` at execution time, so one literal operand is safe from
-    # whichever region is live, PROVIDED every region's low 7 bits at that
-    # offset really do line up (checked below, not assumed).
+    # 2+ real, non-aliased regions (PIC16F74) have no bank-independent
+    # byte at all -- docs/39 D-2 (epic-cc#393)'s isr_w_shadow/
+    # isr_home_window pair substitutes for one. The lowest region's top
+    # COMMON_RAM_CARVE_SIZE bytes become isr_home_window; the low 7 bits
+    # of its own first byte become isr_w_shadow, reachable from any
+    # region via PIC14 direct addressing's `{RP1:RP0} ++ opcode<6:0>`
+    # execution-time resolution, PROVIDED every region's low 7 bits at
+    # that offset actually line up (checked below, not assumed).
     isr_w_shadow = None
     isr_home_window = None
     if core in ("pic14", "pic14e") and common_ram is None and len(ram_banks) >= 2:

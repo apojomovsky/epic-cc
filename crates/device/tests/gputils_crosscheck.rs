@@ -129,14 +129,12 @@ fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
             // Fallback only, so an already-correct device stays on the
             // stricter per-field check above.
             //
-            // docs/39 D-2 (epic-cc#393, PIC16F74): gputils reports this
-            // shape as TWO separate unprotected SHAREBANKs, one per real
-            // region (PIC16F74's own bank0<->bank2 and bank1<->bank3 alias
-            // pairs) -- `theirs_shared.first()` above only ever sees the
-            // first and calls it a mismatch. Reconstruct instead: our
-            // ram_banks, plus the low-7-bit isr_w_shadow byte reconstructed
-            // into every region via that region's own high bits, plus
-            // isr_home_window, must coalesce back to gputils' full total.
+            // docs/39 D-2 (epic-cc#393, PIC16F74): gputils reports this as
+            // TWO separate unprotected SHAREBANKs, one per real region, so
+            // `theirs_shared.first()` above sees only one and calls it a
+            // mismatch. Reconstruct instead: ram_banks plus isr_w_shadow
+            // (rebuilt per region) plus isr_home_window must coalesce back
+            // to gputils' full total.
             if !strict.is_empty() && dev.isr_w_shadow.is_some() {
                 let w = dev.isr_w_shadow.unwrap();
                 let their_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());

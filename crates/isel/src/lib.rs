@@ -6494,15 +6494,12 @@ pub fn select_with_locs(
     );
     let has_isr = !isr_names.is_empty();
     // The icmp scratch byte and the four retval bytes are fixed constants,
-    // carved from common RAM on every device but PIC16F74 (bank-independent,
-    // the device's common RAM is never used by locals, so no collision), or
-    // from `isr_home_window` there instead (docs/39 D-2, epic-cc#393: an
-    // ordinary, banked window `banking`'s existing BANKSEL insertion reaches
-    // correctly, since the device has no bank-independent byte to spare).
-    // The widened i32 region must not overrun this window nor overlap the
-    // scratch byte, and the ISR save area (W or STATUS, PCLATH, FSR, retval
-    // x4, scratch, 9 or 8 bytes depending on which shape this is) must sit
-    // right after the retval region, disjoint from it and from scratch.
+    // carved from common RAM (bank-independent, never used by locals) on
+    // every device but PIC16F74, or from `isr_home_window` there instead
+    // (docs/39 D-2, epic-cc#393: an ordinary window `banking`'s BANKSEL
+    // insertion already reaches correctly). Either way the ISR save area
+    // (W or STATUS, PCLATH, FSR, retval x4, scratch) sits right after the
+    // retval region, disjoint from it and from scratch.
     let (common_lo, common_hi) = device.common_ram.or(device.isr_home_window).expect(
         "isel's fixed scratch/retval/ISR-save layout needs a common-RAM \
              region or an isr_home_window",

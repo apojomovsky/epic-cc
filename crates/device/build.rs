@@ -237,11 +237,8 @@ fn main() {
                         }
                     }
                 }
-                // isr_w_shadow/isr_home_window (docs/39 D-2): paired, and
-                // only meaningful on a device with no common_ram at all --
-                // a device with a real common-RAM corner already has a
-                // bank-independent home for the ISR save area, this pair
-                // only exists to substitute for one.
+                // isr_w_shadow/isr_home_window (docs/39 D-2): paired,
+                // substituting for common_ram on a device with none.
                 if dev.isr_w_shadow.is_some() != dev.isr_home_window.is_some() {
                     panic!(
                         "device: {}: isr_w_shadow and isr_home_window must be set together",
@@ -267,32 +264,21 @@ fn main() {
                             path, hlo, hhi
                         );
                     }
-                    // isel's fixed scratch(1)/retval(4)/isr_save(9) layout
-                    // needs 14 bytes (crates/isel/src/lib.rs); matches the
-                    // same floor ADR-034's single-region carve uses.
+                    // isel needs 14 bytes here (scratch+retval+isr_save),
+                    // the same floor ADR-034's single-region carve uses.
                     if hhi - hlo + 1 < 14 {
                         panic!("device: {}: isr_home_window [{:#06X},{:#06X}] must be at least 14 bytes (scratch + retval + ISR save area)", path, hlo, hhi);
                     }
-                    // Modeled exactly like common_ram (which this pair
-                    // substitutes for): carved OUT of ram_banks, not
-                    // inside it. Device::bank_of's generic addr>>7
-                    // fallback resolves any address here to the correct
-                    // bank with no ram_banks membership needed -- PIC14
-                    // paging is a direct function of the address, not a
-                    // lookup restricted to declared regions.
+                    // Carved OUT of ram_banks like common_ram: bank_of's
+                    // addr>>7 fallback needs no ram_banks membership.
                     for (lo, hi) in &dev.ram_banks {
                         if hlo <= *hi && hhi >= *lo {
                             panic!("device: {}: isr_home_window [{:#06X},{:#06X}] overlaps ram_banks [{:#06X},{:#06X}]", path, hlo, hhi, lo, hi);
                         }
                     }
                     let w = dev.isr_w_shadow.unwrap();
-                    // The W-shadow offset must actually be excluded from
-                    // every ram_banks region's own declared span -- proof
-                    // the generator really carved it out, not just picked
-                    // an offset and hoped. Confirmed by reconstructing each
-                    // region's copy of the address (its own high bits, the
-                    // shadow's low 7 bits) and checking it falls outside
-                    // that region's declared range.
+                    // Proof the generator really excluded isr_w_shadow from
+                    // every region, not just picked an offset and hoped.
                     for (i, (lo, hi)) in dev.ram_banks.iter().enumerate() {
                         let region_high_bits = lo & !0x7F;
                         let shadow_addr = region_high_bits | (w & 0x7F);
