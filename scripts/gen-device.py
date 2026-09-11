@@ -396,6 +396,20 @@ INI_ARCH_TO_CORE = {
     "PIC12": "pic-baseline",
 }
 
+# Not a DFP-stated fact (docs/39 D-1, ADR-034): when a PIC14/PIC14E part's
+# entire GPR collapses to one physical, bank-independent region (no other
+# bank a stray select-bit value could reach -- PIC16F84/PIC12F629/PIC12F675's
+# full-bank-shadow shape, or PIC10F320/322's single declared bank), that
+# region has no DFP-declared sub-boundary the way a mixed bank's shadow
+# corner does. This is this compiler's own placement convention, matching
+# every already-shipped mixed-bank device's own common_ram corner (the top
+# of its region, e.g. p16f628a/p16f877a/p16f887's 0x70-0x7F): carve the same
+# fixed width off the top, leaving the rest for ordinary globals. Sized to
+# clear isel's and isel-pic14e's fixed scratch(1)+retval(4)+isr_save(9) = 14
+# bytes with the same 1-byte headroom every shipped device already carries;
+# re-derive from crates/isel*/src/lib.rs if this ever needs to change.
+COMMON_RAM_CARVE_SIZE = 16
+
 
 class MissingFacts(Exception):
     """Fields the source file does not state. Never defaulted: a fabricated
@@ -774,6 +788,30 @@ def generate_toml(
     else:
         missing.append("ram_banks (ini RAMBANK or EDC GPRDataSector)")
         ram_banks = []
+    # A single surviving region (no other bank exists, or the only other
+    # bank is entirely a shadow/mirror of this one -- true of both the ini
+    # RAMBANK path, e.g. PIC16F84's `RAMBANK=0C-4F` with no `COMMON=` line
+    # at all, and the EDC GPRDataSector path above) is bank-independent in
+    # full, a stronger property than a mixed bank's own shadow corner
+    # extracts anything from. Only PIC14/PIC14E's isel needs common_ram at
+    # all (PIC18 uses access_bank/fixed_retval instead; pic-baseline's is
+    # hand-curated per p12f509.toml, a different memory shape entirely) --
+    # see COMMON_RAM_CARVE_SIZE's own comment for why the split point
+    # itself is a policy choice, not a source fact.
+    if core in ("pic14", "pic14e") and common_ram is None and len(ram_banks) == 1:
+        lo, hi = ram_banks[0]
+        if hi - lo + 1 > COMMON_RAM_CARVE_SIZE:
+            common_ram = (hi - COMMON_RAM_CARVE_SIZE + 1, hi)
+            ram_banks = [(lo, hi - COMMON_RAM_CARVE_SIZE)]
+        else:
+            raise MissingFacts(
+                [
+                    f"common_ram: single bank-independent region "
+                    f"0x{lo:04X}-0x{hi:04X} is too small to carve a "
+                    f"{COMMON_RAM_CARVE_SIZE}-byte common_ram window and "
+                    "still leave ram_banks bytes for globals"
+                ]
+            )
     stack_s = scalar("STACKDEPTH")
     stack_depth = pick(
         "stack_depth (EDC MemTraits hwstackdepth or ini STACKDEPTH)",
