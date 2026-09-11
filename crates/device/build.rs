@@ -201,9 +201,13 @@ fn main() {
         // (epic-cc#109).
         match dev.core.as_str() {
             "pic14" | "pic14e" | "pic-baseline" => {
-                if dev.common_ram.is_none() {
-                    panic!("device: {}: {} requires common_ram", path, dev.core);
-                }
+                // common_ram is Option, not required: a device with no
+                // bank-independent byte at all (docs/39 D-2, PIC16F74's
+                // shape) is a real, valid schema state -- isel's/
+                // isel-pic14e's own `.expect(...)` is the enforcement point
+                // for devices that actually reach codegen needing one
+                // (epic-cc#393/#398; nothing else here reads common_ram as
+                // Some-only).
                 if dev.access_bank.is_some() {
                     panic!(
                         "device: {}: {} must not have access_bank (PIC18 only)",
@@ -281,12 +285,13 @@ fn main() {
         if dev.flash_words == 0 {
             panic!("device: {}: flash_words must be greater than 0", path);
         }
-        // `isel`/`isel-pic14e` page CALL/GOTO in 0x800-word blocks, so only
-        // pic14/pic14e flash must divide evenly into that page size. pic18
-        // (21-bit PC, no paging) and pic-baseline (pages differently) do
-        // not: PIC18F2525's real 24576-word flash is neither a power of
-        // two nor a 0x800 multiple, and needs neither.
-        if matches!(dev.core.as_str(), "pic14" | "pic14e") && dev.flash_words % 0x800 != 0 {
+        // isel pages CALL/GOTO in 0x800-word blocks; a partial last page
+        // leaves dead space it doesn't avoid. A device under one page
+        // (PIC16F84, docs/39 D-1) has no boundary to misalign.
+        if matches!(dev.core.as_str(), "pic14" | "pic14e")
+            && dev.flash_words > 0x800
+            && dev.flash_words % 0x800 != 0
+        {
             panic!(
                 "device: {}: flash_words {} is not a multiple of 0x800 words, the \
                  CALL/GOTO page size pic14/pic14e's isel assumes",

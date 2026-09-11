@@ -260,6 +260,26 @@ def correct_ram(toml_path, lkr_path):
         new_ram = [[lo, hi]]
     else:
         new_ram = [[lo, hi] for lo, hi in banks]
+        common = data.get("common_ram")
+        if common:
+            # docs/39 D-1: a device whose entire GPR is one gputils
+            # DATABANK (PIC10F320/322, no aliasing at all) already has
+            # part of that same DATABANK carved into common_ram by
+            # gen-device.py. Widening blindly to gputils' full DATABANK
+            # span would overlap it (build.rs's ram_banks/common_ram
+            # overlap check catches this the hard way otherwise); clip
+            # any widened span at the carved window's edges instead.
+            clo, chi = common
+            clipped = []
+            for lo, hi in new_ram:
+                if lo <= chi and hi >= clo:
+                    if lo < clo:
+                        clipped.append([lo, clo - 1])
+                    if hi > chi:
+                        clipped.append([chi + 1, hi])
+                else:
+                    clipped.append([lo, hi])
+            new_ram = clipped
     if not new_ram:
         return False
     old_bytes = sum(hi - lo + 1 for lo, hi in data["ram_banks"])
@@ -310,15 +330,27 @@ def field_diff(toml_path, sibling_path):
     return lines
 
 
+def _shared_prefix_len(a, b):
+    n = 0
+    for ca, cb in zip(a, b):
+        if ca != cb:
+            break
+        n += 1
+    return n
+
+
 def sibling(toml_path, devices_dir):
-    """The closest existing registry sibling on the same core, by name
-    distance (docs/38 D-1 step 5). Returns the sibling TOML path, or None
-    when no other device shares the core."""
+    """The closest existing registry sibling on the same core (docs/38 D-1
+    step 5): the device whose stem shares the longest name prefix (e.g.
+    p16f84a's real sibling is p16f84, not some other same-core device that
+    merely happens to have an equal-length name), name-length distance as
+    the tiebreaker. Returns the sibling TOML path, or None when no other
+    device shares the core."""
     data = _load(toml_path)
     core = data["core"]
     stem = pathlib.Path(toml_path).stem
     best = None
-    best_dist = None
+    best_key = None
     for p in sorted(pathlib.Path(devices_dir).glob("*.toml")):
         if p.stem == stem:
             continue
@@ -328,10 +360,10 @@ def sibling(toml_path, devices_dir):
             continue
         if other.get("core") != core:
             continue
-        dist = abs(len(p.stem) - len(stem))
-        if best is None or dist < best_dist:
+        key = (-_shared_prefix_len(p.stem, stem), abs(len(p.stem) - len(stem)))
+        if best is None or key < best_key:
             best = p
-            best_dist = dist
+            best_key = key
     return best
 
 

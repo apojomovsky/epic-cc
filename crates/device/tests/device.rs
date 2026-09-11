@@ -126,7 +126,7 @@ fn by_name_resolves_both_devices() {
 
 #[test]
 fn all_contains_every_seed_device() {
-    assert_eq!(device::ALL.len(), 28);
+    assert_eq!(device::ALL.len(), 34);
     assert!(device::ALL.iter().any(|d| d.name == "p16f877a"));
     assert!(device::ALL.iter().any(|d| d.name == "p18f4550"));
     assert!(device::ALL.iter().any(|d| d.name == "p16f887"));
@@ -156,6 +156,12 @@ fn all_contains_every_seed_device() {
         "p18f66j94",
         "p18f87j11",
         "p12f683",
+        "p16f84",
+        "p12f629",
+        "p12f675",
+        "p10f320",
+        "p10f322",
+        "p16f84a",
     ] {
         assert!(
             device::ALL.iter().any(|d| d.name == stem),
@@ -265,8 +271,11 @@ fn pic14_flash_words_is_a_multiple_of_the_page_size() {
     // PC, no paging) and pic-baseline (isel-pic-baseline pages
     // differently) have no such requirement. Confirmed on PIC18F2525's
     // real, datasheet-stated 24576-word flash: not a power of two either.
+    // A device under one page (PIC12F629/675's real 1023 words, docs/39
+    // D-1) has no page boundary to misalign in the first place -- only a
+    // multi-page device's *partial last page* is the real problem.
     for d in device::ALL {
-        if matches!(d.core, device::Core::Pic14 | device::Core::Pic14e) {
+        if matches!(d.core, device::Core::Pic14 | device::Core::Pic14e) && d.flash_words > 0x800 {
             assert!(
                 d.flash_words % 0x800 == 0,
                 "{}: flash_words {} is not a multiple of 0x800",

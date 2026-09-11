@@ -6743,10 +6743,16 @@ pub fn select_with_locs(
                 Some(p) => p,
                 None => {
                     // No open page has room: open the next page. The device
-                    // bound (flash_words) is enforced by panic.
+                    // bound (flash_words) is enforced by panic. Ceiling
+                    // division, not floor: a device narrower than one page
+                    // (PIC16F84's 1024 words, half of 0x800) still has
+                    // exactly one page, not zero -- floor division here
+                    // used to underflow computing `last_page` for such a
+                    // device (docs/39 D-1, epic-cc#398).
                     let pi = page_next.len();
-                    let last_page = device.flash_words / 0x800 - 1;
-                    if pi as u32 >= device.flash_words / 0x800 {
+                    let num_pages = device.flash_words.div_ceil(0x800);
+                    let last_page = num_pages - 1;
+                    if pi as u32 >= num_pages {
                         panic!(
                             "isel: function @{name} would start at 0x{:04X}, beyond page {last_page} (device flash is {:#06x} words)",
                             pi * 0x800,

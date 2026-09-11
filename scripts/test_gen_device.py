@@ -175,6 +175,121 @@ class GenDeviceTest(unittest.TestCase):
         self.assertIn("ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]", text)
         self.assertNotIn("common_ram", text)
 
+    def test_single_region_from_a_full_bank_shadow_gets_a_carved_common_ram(self):
+        # docs/39 D-1 / ADR-034: PIC16F84's shape (bank0 real GPR, bank1
+        # 100% shadow, no primary of its own) -- unlike the PIC16F74-style
+        # test above, only ONE physical region exists, so the generator
+        # should carve COMMON_RAM_CARVE_SIZE bytes off the top rather than
+        # leave common_ram unset. Addresses match docs/39's real prediction
+        # (0x0C-0x4F -> common_ram 0x40-0x4F, ram_banks 0x0C-0x3F).
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN03" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x100">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0xC" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0xC" edc:endaddr="0x50" edc:bank="0"/>
+      <edc:SFRDataSector edc:beginaddr="0x80" edc:endaddr="0x8C" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:shadowidref="gpr0" edc:beginaddr="0x8C" edc:endaddr="0xD0" edc:bank="1"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "full_shadow_single_region.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p14syn03", pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ram_banks = [[0x000C, 0x003F]]", text)
+        self.assertIn("common_ram = [0x0040, 0x004F]", text)
+
+    def test_single_declared_bank_with_no_shadow_at_all_gets_a_carved_common_ram(self):
+        # docs/39 D-1: PIC10F320/322's shape -- no bank1 GPRDataSector
+        # exists at all, not even a shadow. Same carve rule applies: one
+        # physical region is trivially bank-independent when there is no
+        # other bank to distinguish it from.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN04" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x100">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x40" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x40" edc:endaddr="0x80" edc:bank="0"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "single_bank_no_shadow.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p14syn04", pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ram_banks = [[0x0040, 0x006F]]", text)
+        self.assertIn("common_ram = [0x0070, 0x007F]", text)
+
+    def test_single_region_too_small_to_carve_common_ram_fails_loudly(self):
+        # A region narrower than COMMON_RAM_CARVE_SIZE would leave zero
+        # ram_banks bytes for globals (or go negative) if carved anyway;
+        # refuse instead of emitting an unusable TOML.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN05" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x100">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x40" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x40" edc:endaddr="0x48" edc:bank="0"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "too_small_single_region.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p14syn05", pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertNotEqual(r.returncode, 0, "an 8-byte region must not be carved")
+        self.assertIn("common_ram", r.stderr)
+
+    def test_ini_rambank_with_no_common_line_also_gets_a_carved_common_ram(self):
+        # The real PIC16F84 shape: its ini states `RAMBANK=0C-4F` with no
+        # `COMMON=` line at all (XC8 doesn't need one either), so
+        # generation takes the ini path (`rambank` truthy), never reaching
+        # the EDC-derived carve covered by the tests above. Confirmed the
+        # hard way generating the real device: the carve must apply on
+        # both paths, not just the EDC one.
+        with tempfile.TemporaryDirectory() as d:
+            ini = pathlib.Path(d) / "p14syn06.ini"
+            ini.write_text(
+                "[14SYN06]\nARCH=PIC14\nROMSIZE=400\nRAMBANK=0C-4F\nSTACKDEPTH=0x8\n"
+            )
+            cfg = pathlib.Path(d) / "p14syn06.cfgdata"
+            cfg.write_text(
+                "CWORD:FFF:1F:FFF:CONFIG\nCSETTING:4:WDTE\nCVALUE:4:ON\nCVALUE:0:OFF\n"
+            )
+            text = gen_device.generate_toml(
+                "p14syn06", ini, cfg, None, pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertIn('core = "pic14"', text)
+        self.assertIn("ram_banks = [[0x000C, 0x003F]]", text)
+        self.assertIn("common_ram = [0x0040, 0x004F]", text)
+
     def test_fails_loudly_when_the_source_omits_a_field(self):
         stripped = "\n".join(
             line

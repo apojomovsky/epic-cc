@@ -123,6 +123,22 @@ SHAREBANK  NAME=gprnobank  START=0x20              END=0x5F
 SHAREBANK  NAME=gprnobank  START=0xA0              END=0xDF           PROTECTED
 """
 
+# PIC10F320/322's shape: a true single bank, no aliasing at all, so
+# gputils calls the whole thing a plain DATABANK, never a SHAREBANK
+# (there is no second bank to protect against). gen-device.py's D-1 carve
+# still splits it into ram_banks + common_ram (docs/39).
+PIC14_LKR_SINGLE_BANK = """\
+DATABANK   NAME=sfr0       START=0x0               END=0x3F           PROTECTED
+DATABANK   NAME=gpr0       START=0x40              END=0x7F
+"""
+
+# A TOML already carved the D-1 way for a single-bank device: ram_banks is
+# the DATABANK minus the top 16 bytes, common_ram is that top 16.
+PIC14_SINGLE_BANK_TOML = PIC14_TOML.replace(
+    "ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]\ncommon_ram = [0x0070, 0x007F]\n",
+    "ram_banks = [[0x0040, 0x006F]]\ncommon_ram = [0x0070, 0x007F]\n",
+)
+
 
 def write(path, text):
     path.write_text(text)
@@ -252,6 +268,40 @@ class CorrectRamTest(unittest.TestCase):
         self.assertFalse(changed)
         self.assertIn("ram_banks = [[0x0020, 0x005F]]", text)
 
+    def test_pic14_single_bank_noop_when_already_split_correctly(self):
+        # PIC10F320/322: gputils' one DATABANK (0x40-0x7F) exactly equals
+        # the union of an already-carved ram_banks (0x40-0x6F) and
+        # common_ram (0x70-0x7F). Widening to the full DATABANK span would
+        # overlap common_ram; confirmed this used to happen before the
+        # common_ram-aware clip (docs/39 D-1, the p10f320 add-device.sh
+        # failure that found this).
+        with tempfile.TemporaryDirectory() as d:
+            toml = write(pathlib.Path(d) / "p14syn01.toml", PIC14_SINGLE_BANK_TOML)
+            lkr = write(pathlib.Path(d) / "14syn01_g.lkr", PIC14_LKR_SINGLE_BANK)
+            changed = add_device.correct_ram(toml, lkr)
+            text = toml.read_text()
+        self.assertFalse(changed)
+        self.assertIn("ram_banks = [[0x0040, 0x006F]]", text)
+        self.assertIn("common_ram = [0x0070, 0x007F]", text)
+
+    def test_pic14_single_bank_widens_without_touching_common_ram(self):
+        # A genuinely understated ram_banks (DFP said less GPR than
+        # gputils) on the same single-bank shape must still widen, but
+        # never past the carved common_ram window.
+        with tempfile.TemporaryDirectory() as d:
+            toml = write(
+                pathlib.Path(d) / "p14syn01.toml",
+                PIC14_SINGLE_BANK_TOML.replace(
+                    "ram_banks = [[0x0040, 0x006F]]", "ram_banks = [[0x0050, 0x006F]]"
+                ),
+            )
+            lkr = write(pathlib.Path(d) / "14syn01_g.lkr", PIC14_LKR_SINGLE_BANK)
+            changed = add_device.correct_ram(toml, lkr)
+            text = toml.read_text()
+        self.assertTrue(changed)
+        self.assertIn("ram_banks = [[0x0040, 0x006F]]", text)
+        self.assertIn("common_ram = [0x0070, 0x007F]", text)
+
 
 class FieldDiffTest(unittest.TestCase):
     def test_names_new_absent_and_renamed_fields(self):
@@ -292,6 +342,29 @@ class SiblingTest(unittest.TestCase):
             write(d / "p14syn01.toml", PIC14_TOML)
             sib = add_device.sibling(d / "p14syn01.toml", d)
         self.assertIsNone(sib)
+
+    def test_prefers_shared_name_prefix_over_equal_length(self):
+        # p16f84a's real sibling is p16f84 (a shared name prefix, the same
+        # silicon family), not p10f320: an unrelated same-core device that
+        # merely happens to have an equal-length stem. Confirmed on the
+        # real registry (docs/32 §2 diff produced only noise against
+        # p10f320 and an empty, correct diff against p16f84).
+        with tempfile.TemporaryDirectory() as d:
+            d = pathlib.Path(d)
+            write(
+                d / "p16f84a.toml",
+                PIC14_TOML.replace('name = "p14syn01"', 'name = "p16f84a"'),
+            )
+            write(
+                d / "p16f84.toml",
+                PIC14_TOML.replace('name = "p14syn01"', 'name = "p16f84"'),
+            )
+            write(
+                d / "p10f320.toml",
+                PIC14_TOML.replace('name = "p14syn01"', 'name = "p10f320"'),
+            )
+            sib = add_device.sibling(d / "p16f84a.toml", d)
+        self.assertEqual(sib.name, "p16f84.toml")
 
 
 if __name__ == "__main__":
