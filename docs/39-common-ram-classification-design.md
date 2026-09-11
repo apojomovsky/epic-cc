@@ -170,36 +170,50 @@ real and precedented, not folklore:
    byte (no bank-independence needed here at all — it's an ordinary
    `ram_banks` byte, reached because the code just forced that exact
    region) finishes the capture.
-3. **Restore is the mirror image:** force region A again (idempotent if
-   the ISR body already left it there), `MOVWF STATUS` directly from the
-   saved (still-swapped) byte restores `RP1:RP0` (and the arithmetic
-   flags) atomically in one instruction, which simultaneously
-   re-selects whichever region was active at interrupt entry — so the
-   very next instruction can safely read back the per-region `W` shadow
-   from step 1, because the region is now provably right again.
-   `RETFIE`.
+3. **Restore is the mirror image, and needs a second swap, not a direct
+   write-back.** Force region A again (idempotent if the ISR body already
+   left it there), then `SWAPF` the saved byte back into `W` (undoing
+   step 2's swap — a single swap is not its own inverse, so writing the
+   once-swapped byte straight to `STATUS` scrambles `RP1:RP0` and the
+   arithmetic flags into the wrong nibble instead of restoring them; this
+   project's own already-shipped `common_ram`-backed ISR epilogue uses
+   the identical swap-to-capture/swap-to-restore pair for exactly this
+   reason), then `MOVWF STATUS` from `W`, which atomically restores
+   `RP1:RP0` and the flags and simultaneously re-selects whichever region
+   was active at interrupt entry — so the very next instruction can
+   safely read back the per-region `W` shadow from step 1, because the
+   region is now provably right again. `RETFIE`.
+
+   Confirmed by direct simulation, not just by inspection:
+   `crates/sim/tests/interrupts_no_common_ram.rs` hand-assembles both this
+   corrected sequence (passes: W, STATUS's flags, and the bank are all
+   exactly restored across a disruptive ISR that clobbers all three) and
+   the single-swap version this section originally described (fails
+   exactly as predicted, kept as a regression test of the failure mode).
 
 This is the same idiom the classic (bucket-1) PIC16F84 tutorial cited in
 §1 uses, generalized to two *non-aliased* regions instead of one; it is
 Microchip's own documented answer to "no common RAM," not something this
-project would be inventing. Implementing it, though, is real
-`isel-pic14e` (and `isel`, `schedule`, `banking`) work: a new device-level
-fact distinct from `common_ram` (a per-region reserved offset, plus a
-designated "home region" for the `STATUS`/`retval`/`scratch` shadow), new
-codegen for the ISR prologue/epilogue, and — unlike today — an explicit
-`BANKSEL` around every `retval`/`scratch` access instead of the current
-bank-select-free fast path, since those bytes stop being reachable for
-free.
+project would be inventing.
 
-**This doc does not decide D-2.** It is one device wide today (PIC16F74),
-the fix is real but nontrivial, and the alternative — a documented
-non-goal excluding "two-or-more distinct GPR regions, none of them
-common" devices from interrupt support, `docs/35`-style — is legitimate
-and cheap. Whoever picks up the follow-up ticket should make that call
-with a concrete estimate of the `isel-pic14e` change in hand, which this
-survey does not produce. Recommend filing it as its own ticket blocked
-on nothing, scoped explicitly to "decide + possibly implement D-2,"
-separate from D-1's phase.
+**Revised cost estimate, superseding this section's original one:** the
+same simulation pass traced `crates/banking`'s actual mechanics
+(`crates/banking/src/lib.rs`'s module doc) and found it is a separate
+pass over `isel`'s raw assembly output that inserts `BANKSEL` generically
+from `Device::bank_of(addr)` for *any* file-register operand — it has no
+idea a given address is "the retval region" versus an ordinary local.
+`retval_lo`/`scratch`/the ISR save area skip banking today only because
+`bank_of` (`crates/device/src/lib.rs`) explicitly exempts `common_ram`
+and `fixed_retval`. Relocating them into an ordinary `ram_banks` region
+instead makes `bank_of` return `Some(bank_index)` for them, and the
+existing, already-shipped banking pass then inserts correct `BANKSEL`s
+at every one of their ordinary (non-ISR) use sites with **no changes to
+`isel`'s ~148 existing `retval_lo`/`scratch` call sites** — not the
+across-the-board explicit-`BANKSEL`-everywhere rewrite this section
+originally predicted. The only genuinely new fact needed is the W-shadow
+slot's own banking exemption (mirroring `common_ram`/`fixed_retval`) plus
+the new ISR prologue/epilogue codegen itself, which is what
+`epic-cc#393`'s implementation lands.
 
 ## 4. Alternatives considered and rejected
 
