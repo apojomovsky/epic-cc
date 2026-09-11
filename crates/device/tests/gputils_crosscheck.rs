@@ -101,23 +101,49 @@ fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
             // Banked GPR and the common window are compared apart. `isel`
             // derives `fsr_window` from where that boundary sits, so a merged
             // total would accept a bank that grew into the common range.
+            let mut strict = Vec::new();
             let diff = bank_diff(&coalesce(dev.ram_banks), &coalesce(&lkr.banks));
             if !diff.is_empty() {
-                problems.push(format!(
+                strict.push(format!(
                     "{}: ram_banks disagree\n{}",
                     dev.name,
                     diff.join("\n")
                 ));
             }
-            let theirs = lkr.shared.first().copied();
-            if dev.common_ram != theirs {
+            let theirs_shared = lkr.shared.first().copied();
+            if dev.common_ram != theirs_shared {
                 let show = |r: Option<(u16, u16)>| r.map_or("none".into(), |x| fmt(&[x]));
-                problems.push(format!(
+                strict.push(format!(
                     "{}: common_ram is {} but the first unprotected SHAREBANK is {}",
                     dev.name,
                     show(dev.common_ram),
-                    show(theirs)
+                    show(theirs_shared)
                 ));
+            }
+            // ADR-034 (docs/39 D-1): a device whose entire GPR is one
+            // physical, bank-independent region as far as gputils is
+            // concerned -- either a lone DATABANK (a true single bank, e.g.
+            // PIC10F320/322: no aliasing to protect against, so gputils
+            // never calls it a SHAREBANK) or one full-alias SHAREBANK (e.g.
+            // PIC16F84/PIC12F629/PIC12F675) -- may split that single region
+            // between common_ram and ram_banks as a compiler-policy choice.
+            // Claiming *less* bank-independence than gputils confirms is
+            // available is never a defect, only claiming more is; verify
+            // the union against gputils' single total instead of an exact
+            // per-field match, but only as a fallback when the strict
+            // per-field comparison above already disagrees, so an
+            // already-correct device keeps being held to the tighter check.
+            if !strict.is_empty() {
+                let their_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());
+                let mut ours = dev.ram_banks.to_vec();
+                ours.extend(dev.common_ram);
+                let ours = coalesce(&ours);
+                if their_total.len() == 1 && ours == their_total {
+                    // Union matches gputils' single region exactly: the
+                    // split is a legitimate policy choice, not a disagreement.
+                } else {
+                    problems.extend(strict);
+                }
             }
         }
         Core::Pic18 => {
@@ -209,6 +235,52 @@ fn widening_access_bank_past_0x5f_fails_the_gate() {
     assert!(
         problems.iter().any(|p| p.contains("access_bank")),
         "problems should name access_bank: {problems:?}"
+    );
+}
+
+#[test]
+fn single_region_split_passes_when_the_union_matches_gputils() {
+    // ADR-034 (docs/39 D-1): PIC16F84's exact shape -- gputils declares the
+    // whole GPR as one SHAREBANK (no DATABANK at all), our TOML carves the
+    // top 16 bytes into common_ram and leaves the rest as ram_banks.
+    let lkr = LkrRam {
+        banks: Vec::new(),
+        shared: vec![(0x0C, 0x4F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let split = device::Device {
+        ram_banks: &[(0x0C, 0x3F)],
+        common_ram: Some((0x40, 0x4F)),
+        ..base
+    };
+    let problems = compare(&split, &lkr);
+    assert!(
+        problems.is_empty(),
+        "a split that unions back to gputils' single region should pass: {problems:?}"
+    );
+}
+
+#[test]
+fn single_region_split_that_overclaims_the_region_fails_the_gate() {
+    // The same shape, but common_ram reaches past what gputils confirms is
+    // bank-independent -- claiming more than the oracle attests must still
+    // fail, only claiming less is the allowed policy choice.
+    let lkr = LkrRam {
+        banks: Vec::new(),
+        shared: vec![(0x0C, 0x4F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let overclaimed = device::Device {
+        ram_banks: &[(0x0C, 0x3F)],
+        common_ram: Some((0x40, 0x50)),
+        ..base
+    };
+    let problems = compare(&overclaimed, &lkr);
+    assert!(
+        !problems.is_empty(),
+        "common_ram reaching past gputils' confirmed region must disagree"
     );
 }
 
