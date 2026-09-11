@@ -285,12 +285,19 @@ fn main() {
         if dev.flash_words == 0 {
             panic!("device: {}: flash_words must be greater than 0", path);
         }
-        // `isel`/`isel-pic14e` page CALL/GOTO in 0x800-word blocks, so only
-        // pic14/pic14e flash must divide evenly into that page size. pic18
-        // (21-bit PC, no paging) and pic-baseline (pages differently) do
-        // not: PIC18F2525's real 24576-word flash is neither a power of
-        // two nor a 0x800 multiple, and needs neither.
-        if matches!(dev.core.as_str(), "pic14" | "pic14e") && dev.flash_words % 0x800 != 0 {
+        // `isel`/`isel-pic14e` page CALL/GOTO in 0x800-word blocks, so a
+        // multi-page pic14/pic14e device's flash must divide evenly into
+        // that page size -- a partial last page would leave dead address
+        // space inside it that isel's page-fit math does not know to avoid.
+        // A device narrower than one page (PIC16F84's 1024 words, docs/39
+        // D-1) has no such boundary to misalign: it is page 0 in full,
+        // never more. pic18 (21-bit PC, no paging) and pic-baseline (pages
+        // differently) need neither: PIC18F2525's real 24576-word flash is
+        // neither a power of two nor a 0x800 multiple, and needs neither.
+        if matches!(dev.core.as_str(), "pic14" | "pic14e")
+            && dev.flash_words > 0x800
+            && dev.flash_words % 0x800 != 0
+        {
             panic!(
                 "device: {}: flash_words {} is not a multiple of 0x800 words, the \
                  CALL/GOTO page size pic14/pic14e's isel assumes",
