@@ -229,6 +229,7 @@ Two failure shapes to expect and fix, not route around:
 | A config field with scattered bits (non-contiguous mask) fails generation until the DCR and cfgdata paths handle spans, not widths | `p16f628a` FOSC mask `0x13` | `#372`, `scripts/gen-device.py` span handling, `crates/device/build.rs` scattered-mask validation |
 | Single-part `--atdf` generation finds no ini/cfgdata when the pack lives outside the global XC8 install | `p16f628a` from a `/tmp` DFP cache | `#372`, `scripts/gen-device.py` pack-local ini/cfgdata lookup |
 | A DFP pack ships EDC for parts of a different core family than the pack name suggests (baseline PIC16F5x inside the mid-range pack, `ARCH=PIC12` / `edc:arch="16c5x"`) | `p16f59`, `p16f505`, sibling baseline parts | `#337`, `scripts/gen-device.py` arch maps |
+| gputils names a device's entire (and only) GPR window a `SHAREBANK`, not a `DATABANK gpr*`, because one bank is a full mirror of another; the `.lkr` RAM-correction script mistook the resulting empty `banks` list for "gputils says zero RAM" and wiped an already-correct `ram_banks` to nothing | `p12f675`, `p12f629` | `#395`, `scripts/add_device.py`'s `correct_ram` (only widens now, never shrinks) |
 
 This table is deliberately device-specific in its "confirmed on" column
 and generic in its "pattern" column, the same posture
