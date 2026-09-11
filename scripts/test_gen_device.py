@@ -146,6 +146,9 @@ class GenDeviceTest(unittest.TestCase):
         # shadow with real GPR of its own and correctly stays common_ram).
         # A merged ram_banks or a fabricated common_ram here would mean the
         # generator mistook a full-bank duplicate for extra or shared RAM.
+        # Two real, non-aliased regions survive (PIC16F74's own shape) with
+        # no common_ram fabricated -- docs/39 D-2 (epic-cc#393) then carves
+        # isr_w_shadow/isr_home_window out of them instead, asserted below.
         xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN02" edc:arch="16xxxx">
   <edc:ArchDef edc:name="16xxxx">
     <edc:MemTraits edc:hwstackdepth="0x8"/>
@@ -172,8 +175,45 @@ class GenDeviceTest(unittest.TestCase):
                 src, name="p14syn02", pack="Microchip.PIC16Fxxx_DFP"
             )
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn("ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]", text)
+        self.assertIn("ram_banks = [[0x0021, 0x005F], [0x00A1, 0x00EF]]", text)
+        self.assertIn("isr_w_shadow = 0x0020", text)
+        self.assertIn("isr_home_window = [0x0060, 0x006F]", text)
         self.assertNotIn("common_ram", text)
+
+    def test_misaligned_multi_region_isr_w_shadow_fails_loudly(self):
+        # docs/39 D-2 only knows how to carve isr_w_shadow when every real
+        # region shares the same low 7 bits at its own start address
+        # (PIC16F74: both regions start at low7 0x20). A region starting at
+        # a different low7 (0x90 here, low7 0x10) has no single offset this
+        # generator can prove is safe in every region -- refuse rather than
+        # guess one that might collide with real GPR in another region.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN07" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x200">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x20" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x20" edc:endaddr="0x70" edc:bank="0"/>
+      <edc:SFRDataSector edc:beginaddr="0x80" edc:endaddr="0x90" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:beginaddr="0x90" edc:endaddr="0xF0" edc:bank="1"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "misaligned_regions.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p14syn07", pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertNotEqual(
+            r.returncode, 0, "misaligned regions must not get a guessed isr_w_shadow"
+        )
+        self.assertIn("isr_w_shadow", r.stderr)
 
     def test_single_region_from_a_full_bank_shadow_gets_a_carved_common_ram(self):
         # docs/39 D-1 / ADR-034: PIC16F84's shape (bank0 real GPR, bank1
