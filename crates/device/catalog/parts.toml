@@ -344,7 +344,10 @@ page = "https://www.microchip.com/en-us/product/PIC12F617"
 name = "p12f629"
 display = "PIC12F629"
 core = "pic14"
-flash_words = 1024
+# Corrected from the DFP/ini's ROMSIZE=400 (1024): gpasm rejects the top
+# word (org 0x3FF), confirming gputils treats it as the reserved factory
+# OSCCAL word, not usable flash. Matches crates/device/devices/p12f629.toml.
+flash_words = 1023
 ram_bytes = 64
 eeprom_bytes = 128
 dfp = "Microchip.PIC10-12Fxxx_DFP"
