@@ -392,6 +392,9 @@ struct Gen {
     /// array or struct, no int locals). Estimates there are exact def counts
     /// from clang IR, so the fill margin is 0.
     float_mode: bool,
+    /// Baseline mode: the frame budget shrinks to the p12f509's GPR file
+    /// (see `frame_budget`) and the struct construct stays out of the pool.
+    baseline: bool,
     /// Float locals (`float tN`) emitted so far: the float operand pool
     /// (each local holds a normal-range float by construction; int locals
     /// never exist in float mode).
@@ -413,6 +416,7 @@ impl Gen {
             worst_routine: 0,
             forced: false,
             float_mode: false,
+            baseline: false,
             flocals: Vec::new(),
         }
     }
@@ -556,6 +560,15 @@ impl Gen {
     /// Globals end: the fixed inputs plus checksum u8 end at 0x29; `arr[8]`
     /// adds 8 and the even-aligned struct adds 8 (epic-cc#6).
     fn frame_budget(&self) -> u32 {
+        if self.baseline {
+            // p12f509: 41 GPR bytes minus 7 fixed common scratch and 8
+            // fixed inputs/checksum globals leave 26 for main's frame, the
+            // routines' frames, and the array/struct globals.
+            return 26
+                - self.worst_routine / 2
+                - if self.used_array { 8 } else { 0 }
+                - if self.used_struct { 8 } else { 0 };
+        }
         if self.float_mode {
             // Float-mode globals end with even-aligned placement: in0 u8 at
             // 0x20, in3 float at 0x22, in6 float at 0x26, checksum u8 at 0x2A,
@@ -571,24 +584,45 @@ impl Gen {
     /// `routine`-byte runtime frame still fit? (`uses_array`/`uses_struct`
     /// are the post-statement globals.)
     fn fit(&self, frame: u32, routine: u32, uses_array: bool, uses_struct: bool) -> bool {
-        let globals = if self.float_mode {
-            0x30 // the float-mode globals end (see `frame_budget`)
+        // Baseline's runtime routines run well under half the PIC14 frame
+        // constants (see `frame_budget`); the corpus is the arbiter and an
+        // underestimate surfaces as an alloc failure, never a miscompile.
+        let (worst, routine) = if self.baseline {
+            (self.worst_routine / 2, routine / 2)
         } else {
-            0x29 + if self.used_array || uses_array { 8 } else { 0 }
-                + if self.used_struct || uses_struct {
-                    8
-                } else {
-                    0
-                }
+            (self.worst_routine, routine)
         };
-        let routine = self.worst_routine.max(routine);
+        let (window, globals) = if self.baseline {
+            (
+                34,
+                8 + if self.used_array || uses_array { 8 } else { 0 }
+                    + if self.used_struct || uses_struct {
+                        8
+                    } else {
+                        0
+                    },
+            )
+        } else if self.float_mode {
+            (0x70, 0x30) // the float-mode globals end (see `frame_budget`)
+        } else {
+            (
+                0x70,
+                0x29 + if self.used_array || uses_array { 8 } else { 0 }
+                    + if self.used_struct || uses_struct {
+                        8
+                    } else {
+                        0
+                    },
+            )
+        };
+        let routine = worst.max(routine);
         // The 8-byte safety margin applies to fill statements only: estimates
         // are upper bounds, so forced statements fit by estimate alone and the
         // margin would reject real-fit flagged combos. Fill cost stays bounded
         // by est + 8 under the bank-0 limit. Float-mode estimates are exact
         // def counts for the fixed shapes, so no margin applies there either.
         let margin = if self.forced || self.float_mode { 0 } else { 8 };
-        self.frame_est + frame + margin <= 0x70 - routine - globals
+        self.frame_est + frame + margin <= window - routine - globals
     }
 
     /// The noinline byte-mix fold helpers (emitted only when used).
@@ -1498,8 +1532,9 @@ fn arith_cost(w: u8, op: BinOp) -> (u32, u32) {
 /// Three fixed-width volatile inputs seed identically on both sides. Every
 /// random choice comes from the seeded RNG in order, so `seed` determines
 /// the program.
-pub fn generate(seed: u64) -> Program {
+fn generate_impl(seed: u64, baseline: bool) -> Program {
     let mut g = Gen::new(seed);
+    g.baseline = baseline;
     let mut rng = SplitMix64::new(seed ^ 0x51_7C_C1_B7_27_22_0A_95);
 
     // Per-seed feature flags: each flagged construct appears in its program.
@@ -1513,9 +1548,13 @@ pub fn generate(seed: u64) -> Program {
     // couple of heavy constructs. force() panics when a flagged construct
     // cannot fit, so the draw stays inside the budget by construction; fill
     // statements cover the rest of the surface.
-    let nflags = 2; // exactly 2 flags per seed (see force()'s panic)
+    // Baseline draws one flag: the 509's 41-byte GPR file reliably holds a
+    // single heavy construct, and the force() contract demands certainty.
+    let nflags = if baseline { 1 } else { 2 };
     let mut flags = [false; 8];
-    let mut pool: Vec<u8> = (0..8).collect();
+    // Baseline drops the struct flag (index 7): its 24-byte frame and
+    // 8-byte global cannot fit the 509 alongside anything else.
+    let mut pool: Vec<u8> = (0..if baseline { 7 } else { 8 }).collect();
     for _ in 0..nflags {
         let i = (rng.next_u64() as usize) % pool.len();
         flags[pool.remove(i) as usize] = true;
@@ -1616,7 +1655,9 @@ pub fn generate(seed: u64) -> Program {
         }
     };
     for _ in 0..14 {
-        let ok = match stmt_kind(&mut g) {
+        let kind = stmt_kind(&mut g);
+        // Baseline remaps struct draws to arith (see the flag pool).
+        let ok = match if baseline && kind == 4 { 5 } else { kind } {
             0 => g.emit_ifelse(),
             1 => g.emit_loop(),
             2 => g.emit_call(&helpers),
@@ -1654,6 +1695,16 @@ pub fn generate(seed: u64) -> Program {
         statements,
         prologue,
     }
+}
+
+pub fn generate(seed: u64) -> Program {
+    generate_impl(seed, false)
+}
+
+/// The integer differential on the p12f509: the same seeded corpora
+/// squeezed into the 509's 41-byte GPR file (see `Gen::baseline`).
+pub fn generate_baseline(seed: u64) -> Program {
+    generate_impl(seed, true)
 }
 
 // ---------------------------------------------------------------------------
@@ -1847,8 +1898,9 @@ const SIGNED_MIX2: u64 = 0x51ED_0000_0000_0002;
 /// families, so the corpus spans every signed kind; fill statements run
 /// best-effort against the frame budget (signed routine frames run smaller
 /// than unsigned ones, so the shared budget stays conservative).
-pub fn generate_signed(seed: u64) -> Program {
+fn generate_signed_impl(seed: u64, baseline: bool) -> Program {
     let mut g = Gen::new(seed ^ SIGNED_MIX);
+    g.baseline = baseline;
     let mut rng = SplitMix64::new(seed ^ SIGNED_MIX2);
 
     // Inputs: the same fixed u8/u16/u32 mix as the integer generator (the
@@ -1962,6 +2014,15 @@ pub fn generate_signed(seed: u64) -> Program {
     }
 }
 
+pub fn generate_signed(seed: u64) -> Program {
+    generate_signed_impl(seed, false)
+}
+
+/// The signed differential on the p12f509 (see `Gen::baseline`).
+pub fn generate_signed_baseline(seed: u64) -> Program {
+    generate_signed_impl(seed, true)
+}
+
 // ---------------------------------------------------------------------------
 // The IR-level differential (canonical IR to the in-process pipeline)
 // ---------------------------------------------------------------------------
@@ -1987,7 +2048,7 @@ const IR_MIX2: u64 = 0x1A5E_0000_0000_0002;
 ///
 /// Every random choice comes from the seeded RNG in order, so `seed`
 /// determines the program.
-pub fn generate_ir(seed: u64) -> IrProgram {
+fn generate_ir_impl(seed: u64, baseline: bool) -> IrProgram {
     let mut rng = SplitMix64::new(seed ^ IR_MIX);
     let mut rng2 = SplitMix64::new(seed ^ IR_MIX2);
 
@@ -2032,7 +2093,7 @@ pub fn generate_ir(seed: u64) -> IrProgram {
     // jump at 0x70 to fit bank 0; the fixed shapes are small enough that 4
     // statements fit comfortably; the i32 sdiv (the biggest routine, 20
     // bytes) is drawn at most once).
-    let n = 2 + (rng2.next_u64() % 3) as usize;
+    let n = 2 + (rng2.next_u64() % if baseline { 2 } else { 3 }) as usize;
     let mut last16: Option<String> = None; // IR reg of the last i16 result
     let mut last16_c: Option<String> = None; // its C local
     let mut used_i32 = false;
@@ -2041,7 +2102,9 @@ pub fn generate_ir(seed: u64) -> IrProgram {
     for _ in 0..n {
         // Statement kind: 0 sdiv, 1 srem, 2 ashr, 3 add, 4 icmp slt,
         // 5 trunc, 6 i32 sdiv (rare).
-        let kind = rng2.next_u64() % 7;
+        // Baseline drops the i32 sdiv kind (6): its routine frame does not
+        // fit the 509 with any company.
+        let kind = rng2.next_u64() % if baseline { 6 } else { 7 };
         let (ir_lines, c_line, res_reg, res_c, res_w): (Vec<String>, String, String, String, u8) =
             match kind {
                 0 | 1 => {
@@ -2214,6 +2277,16 @@ pub fn generate_ir(seed: u64) -> IrProgram {
         seed,
         c_twin: c,
     }
+}
+
+pub fn generate_ir(seed: u64) -> IrProgram {
+    generate_ir_impl(seed, false)
+}
+
+/// The IR differential on the p12f509: fewer statements and no i32 sdiv
+/// kind (see the baseline branches in `generate_ir_impl`).
+pub fn generate_ir_baseline(seed: u64) -> IrProgram {
+    generate_ir_impl(seed, true)
 }
 
 /// The checksum fold for an IR statement result: xor the result bytes into the
@@ -2390,10 +2463,11 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 isel_pic14e::verify_page_fit(&m, &asm);
                 asm::assemble_file_to_hex(device, &asm)
             }
-            device::Core::PicBaseline => panic!(
-                "fuzz: {} is pic-baseline; no baseline differential harness until the backend lands (docs/37)",
-                device.name
-            ),
+            device::Core::PicBaseline => {
+                let asm = isel_pic_baseline::select(device, &m, &addrs);
+                isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
+                asm::assemble_file_to_hex(device, &asm)
+            }
         };
         (hex, layout)
     }))
@@ -2477,10 +2551,26 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
-        device::Core::PicBaseline => panic!(
-            "fuzz: {} is pic-baseline; no baseline simulator until P1 (docs/37)",
-            device.name
-        ),
+        device::Core::PicBaseline => {
+            let mut p = pic14_sim::PicBaseline::with_device(device, pic14_sim::parse_hex(&hex));
+            for input in &prog.inputs {
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
     };
     Ok(checksum)
 }
@@ -2572,10 +2662,26 @@ fn run_pic(
             }
             read_le(p.ram(), checksum_addr, 1) as u32
         }
-        device::Core::PicBaseline => panic!(
-            "fuzz: {} is pic-baseline; no baseline simulator until P1 (docs/37)",
-            device.name
-        ),
+        device::Core::PicBaseline => {
+            let mut p = pic14_sim::PicBaseline::with_device(device, pic14_sim::parse_hex(&hex));
+            for input in &program.inputs {
+                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                    Failure::new(
+                        FailureKind::Compile,
+                        format!("no global '{}' in the alloc map", input.name),
+                    )
+                })?;
+                seed_le(p.ram_mut(), addr, input.width, input.value);
+            }
+            p.run(MAX_SIM_STEPS);
+            if !p.halted() {
+                return Err(Failure::new(
+                    FailureKind::NoHalt,
+                    format!("simulator did not halt within {MAX_SIM_STEPS} steps"),
+                ));
+            }
+            read_le(p.ram(), checksum_addr, 1) as u32
+        }
     };
     Ok(checksum)
 }
@@ -3136,11 +3242,12 @@ fn driver_binary(device: &device::Device) -> Result<PathBuf, String> {
     static CACHE_P14: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     static CACHE_P18: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     static CACHE_P14E: OnceLock<Result<PathBuf, String>> = OnceLock::new();
+    static CACHE_P14B: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     let cache = match device.core {
         device::Core::Pic18 => &CACHE_P18,
         device::Core::Pic14 => &CACHE_P14,
         device::Core::Pic14e => &CACHE_P14E,
-        device::Core::PicBaseline => panic!("fuzz: no clang cache arm for pic-baseline (docs/37)"),
+        device::Core::PicBaseline => &CACHE_P14B,
     };
     cache.get_or_init(locate).clone()
 }

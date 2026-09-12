@@ -13,7 +13,7 @@ use pic14_sim::PicBaseline;
 
 /// Assemble `body` (org-anchored) with the core register symbols, then run
 /// it to completion on the 509.
-fn run_asm(body: &str) -> PicBaseline {
+fn run_asm(body: &str) -> PicBaseline<'_> {
     let src = format!(
         "INDF   equ 0x000\n\
          STATUS equ 0x003\n\

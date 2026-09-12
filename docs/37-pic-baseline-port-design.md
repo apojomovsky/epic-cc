@@ -283,10 +283,11 @@ rather than from a device-specific flash size. Applies identically to
 
 ### D-6: `ADDLW`/`SUBLW`/`RETURN` gaps are peephole/isel-level, not architectural
 
-`w := k - f` lowers to a 3-instruction idiom (`MOVWF tmp` / `MOVLW k` /
-`SUBWF tmp,W`) needing one scratch register instead of PIC14's single
-`SUBLW k`; `w := w + k` lowers to the same idiom (`MOVWF tmp` /
-`MOVLW k` / `ADDWF tmp,W`) instead of PIC14's single `ADDLW` (baseline
+`w := k - f` lowers to a 4-instruction idiom (`MOVLW k` / `MOVWF tmp` /
+`MOVF f,W` / `SUBWF tmp,W`; SUBWF is f - W per DS41236E Table 8-2) needing
+one scratch register instead of PIC14's single `SUBLW k`; `w := w + k`
+lowers to the matching idiom (`MOVWF tmp` / `MOVLW k` / `ADDWF tmp,W`)
+instead of PIC14's single `ADDLW` (baseline
 has neither literal-add op, gpasm 1.5.2 rejects `ADDLW` on p12f509,
 confirmed 2026-09-10); every `RETLW` needs an explicit literal even for
 a void-returning function (`RETLW 0` as the idiom, same as any core

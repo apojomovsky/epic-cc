@@ -30,12 +30,6 @@ fn devices_under_test() -> Vec<&'static device::Device> {
 #[test]
 fn alloc_empty_prog_does_not_panic() {
     for dev in devices_under_test() {
-        // alloc refuses pic-baseline until its allocation model lands
-        // with the backend (docs/37 P2); the driver firewall already
-        // keeps real programs from reaching it.
-        if dev.core == device::Core::PicBaseline {
-            continue;
-        }
         let m = ir::parse("fn main(void) ()\n  block entry:\n    ret void\n");
         let _ = alloc::allocate(dev, &m, "depth 1\n");
     }
@@ -44,18 +38,20 @@ fn alloc_empty_prog_does_not_panic() {
 #[test]
 fn eighty_byte_global_lands_in_ram_banks() {
     for dev in devices_under_test() {
-        // Same refusal as the empty-program check: no baseline
-        // allocation model until docs/37 P2.
-        if dev.core == device::Core::PicBaseline {
-            continue;
-        }
         let mut m = ir::parse("global big i8\nfn main(void) ()\n  block entry:\n    ret void\n");
-        // 80 bytes covers the first PIC14 bank on every device shipped
-        // before PIC16F84 (docs/39 D-1), whose ram_banks is only 52 bytes.
-        // Scale to real capacity: the largest global that fits is what
-        // this actually proves, not a fixed absolute size.
+        // The probe scales to the device: 80 bytes covers the first PIC14
+        // bank on every device shipped before PIC16F84 (docs/39 D-1, whose
+        // ram_banks is only 52 bytes). A global never spans banks (the
+        // 509's 32 GPR bytes sit in two 16-byte banks), so size also caps
+        // at the largest single window.
         let capacity: u16 = dev.ram_banks.iter().map(|&(lo, hi)| hi - lo + 1).sum();
-        let size = capacity.min(80).max(1);
+        let widest: u16 = dev
+            .ram_banks
+            .iter()
+            .map(|&(lo, hi)| hi - lo + 1)
+            .max()
+            .unwrap_or(1);
+        let size = capacity.min(80).min(widest).max(1);
         m.globals[0].size = size;
         let layout = alloc::allocate(dev, &m, "depth 1\n");
         let addr = *layout.globals.get("big").expect("big global missing");
@@ -80,12 +76,6 @@ fn eighty_byte_global_lands_in_ram_banks() {
 #[test]
 fn asm_flash_bound_accepts_tiny_program() {
     for dev in devices_under_test() {
-        // The baseline encoder does not exist yet (docs/37 P1); the
-        // firewall panic is the deliberate refusal, so the flash-bound
-        // check cannot run for that core until the encoder lands.
-        if dev.core == device::Core::PicBaseline {
-            continue;
-        }
         // Minimal program: one NOP at org 0. NOP (0x0000) is valid on both
         // PIC14 and PIC18 and avoids label resolution (GOTO with a literal
         // trips the PIC18 label table).

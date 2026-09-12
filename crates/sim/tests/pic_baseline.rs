@@ -10,7 +10,7 @@ use pic14_sim::{parse_hex, PicBaseline};
 
 /// Assemble `body` (org-anchored) with the core register symbols the
 /// source text needs, then run it to completion on the 509.
-fn run_asm(body: &str) -> PicBaseline {
+fn run_asm(body: &str) -> PicBaseline<'_> {
     let src = format!(
         "INDF   equ 0x000\n\
          PCL    equ 0x002\n\

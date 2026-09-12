@@ -1429,8 +1429,8 @@ impl Pic14e {
 /// call/return stack (D-4) is a shift register: CALL pushes PC+1 (level 1
 /// to level 2), RETLW pops level 1 into PC and copies level 2 into level 1.
 /// No interrupt vector or RETFIE on this core.
-pub struct PicBaseline {
-    device: &'static Device,
+pub struct PicBaseline<'a> {
+    device: &'a Device,
     prog: Vec<u16>,
     /// The 509's full 6-bit data space (0x00-0x3F).
     ram: [u8; 64],
@@ -1449,10 +1449,10 @@ pub struct PicBaseline {
     option: u8,
 }
 
-impl PicBaseline {
+impl<'a> PicBaseline<'a> {
     /// A simulator on `device`'s memory map. Only the `Core::PicBaseline`
     /// contract is checked; the 509's geometry is the P1 target.
-    pub fn with_device(device: &'static Device, prog: Vec<u16>) -> Self {
+    pub fn with_device(device: &'a Device, prog: Vec<u16>) -> Self {
         assert_eq!(
             device.core,
             device::Core::PicBaseline,

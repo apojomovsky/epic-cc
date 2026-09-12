@@ -138,6 +138,7 @@ dependencies = [
  "ir",
  "irparse",
  "isel",
+ "isel-pic-baseline",
  "isel-pic14e",
  "isel-pic18",
  "legalize",

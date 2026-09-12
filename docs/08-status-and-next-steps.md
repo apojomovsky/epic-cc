@@ -29,19 +29,21 @@ now contains a complete compiler, not just documentation:
   32-bit `long` with hardware `MULWF` ([ADR-014](adr/ADR-014-pic18-hw-arithmetic-routines.md)),
   soft-float ([ADR-015](adr/ADR-015-pic18-softfloat.md)),
   and a device-threaded differential fuzz gate ([ADR-016](adr/ADR-016-pic18-fuzz-gate.md)).
-- **PIC baseline core (tracking only):** the baseline ISA (PIC10F, PIC12F5xx,
-  PIC16F5x, e.g. PIC10F200, PIC12F508/509, PIC16F54/57/59) is another distinct
-  8-bit core alongside the shipped `pic14` and `pic18` backends: a 12-bit
-  instruction word, a 2-level hardware stack, no interrupts on most parts, and a
-  register-file banking model that differs from both existing cores. Supporting
-  it would need its own `Core::PicBaseline` variant and an `isel-pic-baseline`,
-  the same shape of effort as the PIC14E port (#228). Deliberately not picked up;
-  revisit if a real consumer (a PlatformIO board request, a HAL port) wants one
-  of these parts. Scope is
-  bounded to 8-bit PIC only; dsPIC, PIC24 and PIC32 remain out of scope entirely.
+- **PIC baseline backend:** P0 through P8 landed per
+  [`37-pic-baseline-port-design.md`](37-pic-baseline-port-design.md): the `p12f509` device
+  profile, the 12-bit-word `asm` encoder and `sim` core, the integer spine with D-2's
+  unconditional `FSR` bank-bit reassertion inside `isel-pic-baseline`, pointers and arrays
+  via `FSR` flat addressing, `const` via `RETLW` tables under the 256-word half-page
+  ceiling, 32-bit `long` with mul/div routines, and a device-threaded differential fuzz
+  gate on `p12f509`. Soft-float is a documented non-goal on this core (#386); interrupts
+  do not exist on it (docs/37 section 1). The family's other parts (PIC10F, PIC12F508,
+  PIC16F505) stay unprofiled until a consumer wants one. Scope remains bounded to 8-bit
+  PIC only; dsPIC, PIC24 and PIC32 remain out of scope entirely.
 - **Device registry:** file-per-device TOML under `crates/device/devices/` with
   `build.rs` codegen and a `--target` flag ([ADR-019](adr/ADR-019-pic-variants-device-registry.md)),
-  holding `p16f877a`, `p16f887`, `p18f4550` and `p18f2550`. A DFP to TOML generator
+  holding twelve profiles across all four cores: `p16f877a`, `p16f887`,
+  `p16f628a`, the `p16f193x` PIC14E family (33/34/36/37/38/39), `p18f4550`,
+  `p18f2550`, and the baseline `p12f509`. A DFP to TOML generator
   ingests Microchip ATDF ([ADR-020](adr/ADR-020-dfp-toml-generator.md)), a provenance
   stanza records where each field came from, and an always-on gputils cross-check
   catches drift against the oracle ([ADR-021](adr/ADR-021-device-provenance-and-cross-check.md)).

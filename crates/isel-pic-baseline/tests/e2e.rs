@@ -19,7 +19,7 @@ static E2E_LOCK: Mutex<()> = Mutex::new(());
 /// through the real PIC baseline pipeline, and return a freshly
 /// constructed (not yet run) `PicBaseline` plus the global address map so
 /// each test can seed input addresses by name before calling `.run()`.
-fn compile(c_path: &str) -> (PicBaseline, HashMap<String, u16>) {
+fn compile(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
@@ -44,7 +44,7 @@ fn compile(c_path: &str) -> (PicBaseline, HashMap<String, u16>) {
 
 /// Like `compile`, but also returns the emitted `.asm` text so a test can
 /// inspect the D-2 reassertion instructions.
-fn compile_asm(c_path: &str) -> (PicBaseline, HashMap<String, u16>, String) {
+fn compile_asm(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>, String) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
@@ -132,6 +132,20 @@ fn scalar_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize] = 7;
     p.run(10_000);
     assert_eq!(p.ram()[globals["out"] as usize], 174, "scalar trace");
+    assert!(p.halted());
+}
+
+/// D-6's const-LHS subtraction. SUBWF is f - W (DS41236E Table 8-2), so
+/// k - a needs k staged in a file register; the P8 fuzz corpus caught the
+/// inverted idiom here (epic-cc#330). LLVM keeps `162 - in0` const-LHS,
+/// so this reaches the fixed `emit_sub_const_lhs` byte-0 idiom.
+#[test]
+fn const_sub_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/const_sub.c");
+    p.ram_mut()[globals["in0"] as usize] = 88;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 75, "out = (162 - 88) + 1");
     assert!(p.halted());
 }
 
@@ -696,7 +710,7 @@ fn cmp_wide_c_runs_correctly() {
 /// Like `compile_asm`, but parses handed IR text instead of running
 /// clang. The text must look like clang `-O1` output for the pipeline
 /// (wholeprog through alloc) to accept it.
-fn compile_ll_asm(ll: &str) -> (PicBaseline, HashMap<String, u16>, String) {
+fn compile_ll_asm(ll: &str) -> (PicBaseline<'_>, HashMap<String, u16>, String) {
     let mut m = irparse::parse_ll(ll);
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
@@ -757,4 +771,32 @@ fn cmp_wide_const_lhs_c_runs_correctly() {
         gpasm_hex(&asm, "cmp_wide_const_lhs").trim(),
         "our HEX differs from gpasm"
     );
+}
+
+/// P8 i8 const-LHS compare regression (epic-cc#330): clang canonicalizes
+/// constants onto the icmp RHS, so no C source reaches the i8 const-LHS
+/// arm of `emit_cmp_c` - the #383 swap, one byte wide. `in0 < 200` swaps
+/// to the meaning-preserving const-LHS form; in0 = 88 keeps both true.
+/// Pre-fix the arm computed C = (b >= k) and out read 2, not 1.
+#[test]
+fn cmp_i8_const_lhs_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
+    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    let (ll, _) = clang_compile(&clang, &resdir, "tests/fixtures/cmp_i8.c");
+    // clang folds 200u to the signed byte immediate -56.
+    assert!(
+        ll.contains("icmp ult i8 %1, -56"),
+        "cmp_i8 IR drifted: no i8 const-RHS compare"
+    );
+    let swapped = ll.replacen("icmp ult i8 %1, -56", "icmp ugt i8 -56, %1", 1);
+    let (mut p, globals, _asm) = compile_ll_asm(&swapped);
+    p.ram_mut()[globals["in0"] as usize] = 88;
+    p.run(10_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        1,
+        "200 > 88 takes the then arm"
+    );
+    assert!(p.halted());
 }

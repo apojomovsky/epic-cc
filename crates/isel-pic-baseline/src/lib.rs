@@ -10,8 +10,9 @@
 //! `isel-pic14e` does (D-1, resolved in P2).
 //!
 //! The three ISA deltas from classic `isel`:
-//! 1. No `SUBLW` (D-6): `w := k - f` lowers to `MOVWF tmp` / `MOVLW k` /
-//!    `SUBWF tmp,W` needing one scratch register.
+//! 1. No `SUBLW` (D-6): `w := k - f` lowers to `MOVLW k` / `MOVWF tmp` /
+//!    `MOVF f,W` / `SUBWF tmp,W` (SUBWF is f - W, DS41236E Table 8-2),
+//!    needing one scratch register.
 //! 2. No `RETURN` (D-6): every return is `RETLW 0` (void) or `RETLW k`
 //!    (valued, after copying the value to the retval slots).
 //! 3. Destination default d = 1 (file), matching gpasm on this core
@@ -491,7 +492,8 @@ impl<'m> Gen<'m> {
     /// the SUBWF also leaves Z = (a == b); wider borrow chains leave only a
     /// byte-level Z, so equality appends `emit_cmp_eq` (C intact).
     /// Baseline has no `SUBLW`, so a const LHS lowers to the scratch idiom
-    /// `MOVWF tmp` / `MOVLW k` / `SUBWF tmp,W` (D-6).
+    /// `MOVLW k` / `MOVWF tmp` / load b into W / `SUBWF tmp,W`: SUBWF is
+    /// f - W (DS41236E Table 8-2), so C = (k >= b) = (a >= b).
     fn emit_cmp_c(&mut self, a: &Val, b: &Val, ty: Ty, signed: bool) {
         let n = ty.bytes();
         let high = n - 1;
@@ -502,14 +504,11 @@ impl<'m> Gen<'m> {
                     self.emit_cmp_c_const_lhs_wide(k, b, n, high, signed);
                     return;
                 }
-                // No SUBLW: `k - W` via the scratch idiom. W holds the b
-                // byte; stash it, load k, SUBWF computes k - W, so
-                // C = (a >= b).
-                self.emit_load_cmp_byte(b, 0, signed, high);
-                self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
                 let k0 = (k & 0xFF) as u8;
                 let k0 = if signed && high == 0 { k0 ^ 0x80 } else { k0 };
                 self.emit(format!("    MOVLW 0x{k0:02X}"));
+                self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
+                self.emit_load_cmp_byte(b, 0, signed, high);
                 self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
             }
             _ => {
@@ -869,19 +868,20 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = k - a` (const LHS) for `bytes`-wide values. Baseline has no
-    /// `SUBLW`, so each byte's `k_i - (a_i + borrow)` lowers to the scratch
-    /// idiom: stash the a byte, load k_i, SUBWF computes k_i - W (D-6).
-    /// Byte 0 has no borrow-in; each higher byte folds the borrow from the
-    /// low byte with the wrap-correct INCFSZ idiom: `k_i` preloads into the
-    /// dst, `a_i` copies to scratch, and `SUBWF` computes `k_i - (a_i +
-    /// borrow)` in place. At the wrap the skip leaves dst at `k_i` with C as
-    /// the true borrow-out (epic-cc#1).
+    /// `SUBLW`, so byte 0 stages `k_0` in scratch, loads the a byte into W,
+    /// and `SUBWF scratch, W` computes `scratch - W = k_0 - a_0` (D-6;
+    /// SUBWF is f - W per DS41236E Table 8-2). Byte 0 has no borrow-in;
+    /// each higher byte folds the borrow from the low byte with the
+    /// wrap-correct INCFSZ idiom: `k_i` preloads into the dst, `a_i` copies
+    /// to scratch, and `SUBWF` computes `k_i - (a_i + borrow)` in place. At
+    /// the wrap the skip leaves dst at `k_i` with C as the true borrow-out
+    /// (epic-cc#1).
     fn emit_sub_const_lhs(&mut self, k: &i64, a: &Val, dst: u16, bytes: u8) {
         let aa = self.val_addr(a).direct();
+        self.emit(format!("    MOVLW 0x{:02X}", (k & 0xFF) as u8));
+        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
         self.emit_bank_select(aa);
         self.emit(format!("    MOVF {}, W", self.fop(aa)));
-        self.emit(format!("    MOVWF {}", self.fop(self.scratch)));
-        self.emit(format!("    MOVLW 0x{:02X}", (k & 0xFF) as u8));
         self.emit(format!("    SUBWF {}, W", self.fop(self.scratch)));
         self.emit_w_store(dst);
         for i in 1..bytes {
