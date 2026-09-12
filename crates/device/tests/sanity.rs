@@ -43,15 +43,19 @@ fn eighty_byte_global_lands_in_ram_banks() {
         // bank on every device shipped before PIC16F84 (docs/39 D-1, whose
         // ram_banks is only 52 bytes). A global never spans banks (the
         // 509's 32 GPR bytes sit in two 16-byte banks), so size also caps
-        // at the largest single window.
+        // at the largest single window. alloc aligns every 2+-byte value to
+        // an even address, so an odd-start window holds one byte fewer;
+        // the trim belongs on the window cap before the 80-byte cap, or a
+        // device whose widest window exceeds 80 probes 79 instead of 80.
         let capacity: u16 = dev.ram_banks.iter().map(|&(lo, hi)| hi - lo + 1).sum();
-        let widest: u16 = dev
+        let (widest, widest_lo) = dev
             .ram_banks
             .iter()
-            .map(|&(lo, hi)| hi - lo + 1)
+            .map(|&(lo, hi)| (hi - lo + 1, lo))
             .max()
-            .unwrap_or(1);
-        let size = capacity.min(80).min(widest).max(1);
+            .unwrap_or((1, 0));
+        let aligned_widest = widest - u16::from(widest_lo % 2 == 1);
+        let size = capacity.min(80).min(aligned_widest).max(1);
         m.globals[0].size = size;
         let layout = alloc::allocate(dev, &m, "depth 1\n");
         let addr = *layout.globals.get("big").expect("big global missing");
