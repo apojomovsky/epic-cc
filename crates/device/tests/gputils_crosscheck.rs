@@ -216,7 +216,7 @@ fn intersect_spans(span: (u16, u16), cover: &[(u16, u16)]) -> Vec<(u16, u16)> {
 /// as coalesced span sets, kinds ignored: bank-vs-shared partitions with
 /// identical extents (p16f819's bank0) and the ADR-034/D-2 splits fold in
 /// as the empty-divergence case. Non-empty residuals classify per span:
-/// need a `# gputils-divergence:` cover, R3 (alias-redundant gputils
+/// R2 and R4 each need a `# gputils-divergence:` cover; R3 (alias-redundant gputils
 /// spans) is computational. A marker pinning a real reserved span is
 /// consumed as documentation even with no residual; anything else
 /// unused rot-fails the audit.
