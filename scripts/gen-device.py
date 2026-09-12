@@ -177,6 +177,33 @@ PART_VALUE_ALIASES = {
         "wdtps": {str(2**i): f"div{2**i}" for i in range(16)},
         "ccp2mx": {"off": "rb3", "on": "rc1"},
     },
+    "p18f1320": {
+        # The EDC splits the internal block by OSC2 use: INTIO1 is CLKO on
+        # RA6, INTIO2 is the port pin, the same split the shipped vocab
+        # carries as intcko vs intio (p18f2550's intosc_ec/intoscio_ec).
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2431": {
+        # IRC is the CLKO-on-RA6 variant, IRCIO the port-pin one (EDC descs).
+        "osc": {"irc": "intcko", "ircio": "intio"},
+    },
+    "p18f2480": {
+        # Same internal-osc modes as the landed 2520's INTIO7/INTIO67,
+        # spelled with the family's IRC prefix (EDC descs byte-identical).
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f6680": {
+        # ECIOPLL is the hardware 4x PLL (fixed x4, no PLLDIV fuse on this
+        # family), OSC2 as RA6: the shipped ecpio. The two SW-PLL modes
+        # take their PLL enable from OSCTUNE at runtime, not a fuse, so
+        # they must refuse a compile-time Fosc like intoscpll does: one
+        # refusal-arm spelling each, kept distinct so the value set stays
+        # name-unique.
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f8621": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
 }
 
 

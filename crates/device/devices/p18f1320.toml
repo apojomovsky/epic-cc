@@ -23,7 +23,7 @@ name = "osc"
 byte_offset = 0
 mask = 0x0F
 shift = 0
-values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "ec", bits = 4 }, { name = "ecio", bits = 5 }, { name = "hspll", bits = 6 }, { name = "rcio", bits = 7 }, { name = "intio2", bits = 8 }, { name = "intio1", bits = 9 }, { name = "rc", bits = 12 }]
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "ec", bits = 4 }, { name = "ecio", bits = 5 }, { name = "hspll", bits = 6 }, { name = "rcio", bits = 7 }, { name = "intio", bits = 8 }, { name = "intcko", bits = 9 }, { name = "rc", bits = 12 }]
 
 [[config.fields]]
 name = "fscm"
