@@ -1,0 +1,79 @@
+name = "p16f630"
+core = "pic14"
+# Narrowed from the ini's own ROMSIZE=400 (1024): gpasm rejects org 0x3FF
+# ("Address exceeds maximum range"), and the .lkr CODEPAGE ends at
+# 0x3FE, confirming gputils treats the top word as reserved (the
+# factory OSCCAL calibration word: this part's ini declares
+# OSCHOW=RETLW, a RETLW constant at the top of program memory), not
+# user-addressable flash. 1023 is the real usable count; the ini
+# overstates it by exactly one word.
+flash_words = 1023
+ram_banks = [[0x0020, 0x004F]]
+common_ram = [0x0050, 0x005F]
+stack_depth = 8
+interrupt_vectors = [0x0004]
+
+[provenance]
+tier = "atdf"
+source = "PIC16F630.PIC"
+pack = "Microchip.PIC16Fxxx_DFP"
+sha256 = "94207a58b7b5b2b6d839209ec98144b4ebe1267c3c25f87b54e7b23bcb0a91f2"
+
+[config]
+base_byte_addr = 0x400E
+num_bytes = 2
+erased_baseline = [0xFF, 0x3F]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 0
+mask = 0x07
+shift = 0
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "ec", bits = 3 }, { name = "intoscio", bits = 4 }, { name = "intoscclk", bits = 5 }, { name = "extrcio", bits = 6 }, { name = "extrcclk", bits = 7 }]
+
+[[config.fields]]
+name = "wdt"
+byte_offset = 0
+mask = 0x08
+shift = 3
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "pwrt"
+byte_offset = 0
+mask = 0x10
+shift = 4
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "mclre"
+byte_offset = 0
+mask = 0x20
+shift = 5
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "boren"
+byte_offset = 0
+mask = 0x40
+shift = 6
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "cp"
+byte_offset = 0
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cpd"
+byte_offset = 1
+mask = 0x01
+shift = 0
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
