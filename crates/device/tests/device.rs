@@ -181,6 +181,7 @@ fn all_contains_every_seed_device() {
         "p10f322",
         "p16f84a",
         "p16f74",
+        "p16f54",
     ] {
         assert!(
             device::ALL.iter().any(|d| d.name == stem),

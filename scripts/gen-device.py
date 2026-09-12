@@ -396,13 +396,14 @@ INI_ARCH_TO_CORE = {
     "PIC12": "pic-baseline",
 }
 
-# Not a DFP-stated fact (docs/39 D-1, ADR-034): a PIC14/PIC14E part whose
-# entire GPR is one bank-independent region (PIC16F84/PIC12F629/PIC12F675's
-# full-bank-shadow shape, or PIC10F320/322's single bank) has no DFP-stated
-# sub-boundary. Carve the same fixed width off the top as every shipped
-# mixed-bank device's own corner (e.g. 0x70-0x7F), leaving the rest for
-# globals. Clears isel's/isel-pic14e's scratch+retval+isr_save (14 bytes)
-# with 1 byte of headroom; re-derive from crates/isel*/src/lib.rs if needed.
+# Not a DFP-stated fact (docs/39 D-1, ADR-034): a PIC14/PIC14E/baseline part
+# whose entire GPR is one bank-independent region (PIC16F84/PIC12F629/
+# PIC12F675's full-bank-shadow shape, PIC10F320/322's single bank, or
+# PIC16F54's mirrored 25 bytes) has no DFP-stated sub-boundary. Carve the
+# same fixed width off the top as every shipped mixed-bank device's corner
+# (e.g. 0x70-0x7F). Clears the widest fixed layout: isel/isel-pic14e's
+# scratch+retval+isr_save at 14 bytes, isel-pic-baseline's scratch+
+# retval+scratch2+store_tmp at 7; re-derive from crates/isel*/src/lib.rs.
 COMMON_RAM_CARVE_SIZE = 16
 
 
@@ -786,17 +787,23 @@ def generate_toml(
     # A single surviving region (no other bank, or the only other bank is
     # entirely a shadow -- true of both the ini RAMBANK path, e.g. PIC16F84's
     # `RAMBANK=0C-4F` with no `COMMON=` line, and the EDC path above) is
-    # bank-independent in full. Only PIC14/PIC14E's isel needs common_ram
-    # (PIC18 uses access_bank/fixed_retval; pic-baseline is hand-curated
-    # per p12f509.toml) -- see COMMON_RAM_CARVE_SIZE's comment for why the
-    # split point is a policy choice, not a source fact.
-    if core in ("pic14", "pic14e") and common_ram is None and len(ram_banks) == 1:
+    # bank-independent in full. isel's/isel-pic14e's and isel-pic-baseline's
+    # fixed scratch/retval layout needs a common_ram home (PIC18 uses
+    # access_bank/fixed_retval instead) -- see COMMON_RAM_CARVE_SIZE's
+    # comment for why the split point is a policy choice, not a source fact.
+    if (
+        core in ("pic14", "pic14e", "pic-baseline")
+        and common_ram is None
+        and len(ram_banks) == 1
+    ):
         lo, hi = ram_banks[0]
         if hi - lo + 1 > COMMON_RAM_CARVE_SIZE:
             common_ram = (hi - COMMON_RAM_CARVE_SIZE + 1, hi)
             ram_banks = [(lo, hi - COMMON_RAM_CARVE_SIZE)]
         else:
-            raise MissingFacts(
+            # Deferred to the final raise so one run names every gap
+            # (the baseline fsr_bank_bits check below runs after this).
+            missing.append(
                 [
                     f"common_ram: single bank-independent region "
                     f"0x{lo:04X}-0x{hi:04X} is too small to carve a "
