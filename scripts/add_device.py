@@ -260,26 +260,46 @@ def correct_ram(toml_path, lkr_path):
         new_ram = [[lo, hi]]
     else:
         new_ram = [[lo, hi] for lo, hi in banks]
-        common = data.get("common_ram")
-        if common:
-            # docs/39 D-1: a device whose entire GPR is one gputils
-            # DATABANK (PIC10F320/322, no aliasing at all) already has
-            # part of that same DATABANK carved into common_ram by
-            # gen-device.py. Widening blindly to gputils' full DATABANK
-            # span would overlap it (build.rs's ram_banks/common_ram
-            # overlap check catches this the hard way otherwise); clip
-            # any widened span at the carved window's edges instead.
-            clo, chi = common
+        # docs/39 D-1 and D-2: carve-outs survive the widening. gputils'
+        # gpr* spans describe silicon; this compiler additionally
+        # reserves common_ram (hardware or policy) and the ADR-034
+        # isr_home_window span, and a widened bank re-covering a
+        # reserved byte trips build.rs's overlap checks (confirmed on
+        # p16f873, 16f873_g.lkr gpr0 START=0x20). Clip widened spans at
+        # the reserved ranges' edges instead.
+        reserved = []
+        if data.get("common_ram"):
+            reserved.append(tuple(data["common_ram"]))
+        elif data.get("isr_home_window"):
+            reserved.append(tuple(data["isr_home_window"]))
+        for rlo, rhi in reserved:
             clipped = []
             for lo, hi in new_ram:
-                if lo <= chi and hi >= clo:
-                    if lo < clo:
-                        clipped.append([lo, clo - 1])
-                    if hi > chi:
-                        clipped.append([chi + 1, hi])
+                if lo <= rhi and hi >= rlo:
+                    if lo < rlo:
+                        clipped.append([lo, rlo - 1])
+                    if hi > rhi:
+                        clipped.append([rhi + 1, hi])
                 else:
                     clipped.append([lo, hi])
             new_ram = clipped
+        # The isr_w_shadow byte is reserved once per bank window, at
+        # each region's own high bits with the shadow's low 7 bits,
+        # build.rs's reconstruction rule, so each widened span clips at
+        # its own point.
+        shadow = data.get("isr_w_shadow")
+        if shadow is not None:
+            pointed = []
+            for lo, hi in new_ram:
+                p = (lo & ~0x7F) | (shadow & 0x7F)
+                if lo <= p <= hi:
+                    if lo < p:
+                        pointed.append([lo, p - 1])
+                    if hi > p:
+                        pointed.append([p + 1, hi])
+                else:
+                    pointed.append([lo, hi])
+            new_ram = pointed
     if not new_ram:
         return False
     old_bytes = sum(hi - lo + 1 for lo, hi in data["ram_banks"])
