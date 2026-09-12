@@ -735,7 +735,7 @@ class GenDeviceBaselineArchTest(unittest.TestCase):
     def write_ini(self, d):
         ini = pathlib.Path(d) / "p12syntest.ini"
         ini.write_text(
-            "[12SYNTEST]\nARCH=PIC12\nROMSIZE=400\nRAMBANK=10-1F\nSTACKDEPTH=0x2\n"
+            "[12SYNTEST]\nARCH=PIC12\nROMSIZE=400\nRAMBANK=10-2F\nSTACKDEPTH=0x2\n"
         )
         return ini
 
@@ -783,6 +783,10 @@ class GenDeviceBaselineArchTest(unittest.TestCase):
         self.assertIn("flash_words = 1024", text)
         self.assertIn("fsr_bank_bits = 1", text)
         self.assertIn("interrupt_vectors = []", text)
+        # ADR-034: the whole 32-byte window is one bank-independent
+        # region, so the top half is carved off as common_ram.
+        self.assertIn("ram_banks = [[0x0010, 0x001F]]", text)
+        self.assertIn("common_ram = [0x0020, 0x002F]", text)
 
     def test_edc_arch_16c5x_maps_to_pic_baseline(self):
         text = FIXTURE.read_text().replace("16xxxx", "16c5x")
