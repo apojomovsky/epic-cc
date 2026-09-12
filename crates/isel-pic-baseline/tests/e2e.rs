@@ -135,10 +135,10 @@ fn scalar_c_runs_correctly() {
     assert!(p.halted());
 }
 
-/// D-6's const-LHS subtraction and comparison. SUBWF is f - W (DS41236E
-/// Table 8-2), so k - a needs k staged in a file register; the P8 fuzz
-/// corpus caught the inverted idiom here (epic-cc#330). Both legs: the
-/// value sub `162 - in0` and the const-LHS compare `200 > in0`.
+/// D-6's const-LHS subtraction. SUBWF is f - W (DS41236E Table 8-2), so
+/// k - a needs k staged in a file register; the P8 fuzz corpus caught the
+/// inverted idiom here (epic-cc#330). LLVM keeps `162 - in0` const-LHS,
+/// so this reaches the fixed `emit_sub_const_lhs` byte-0 idiom.
 #[test]
 fn const_sub_c_runs_correctly() {
     let _guard = E2E_LOCK.lock();
@@ -771,4 +771,32 @@ fn cmp_wide_const_lhs_c_runs_correctly() {
         gpasm_hex(&asm, "cmp_wide_const_lhs").trim(),
         "our HEX differs from gpasm"
     );
+}
+
+/// P8 i8 const-LHS compare regression (epic-cc#330): clang canonicalizes
+/// constants onto the icmp RHS, so no C source reaches the i8 const-LHS
+/// arm of `emit_cmp_c` - the #383 swap, one byte wide. `in0 < 200` swaps
+/// to the meaning-preserving const-LHS form; in0 = 88 keeps both true.
+/// Pre-fix the arm computed C = (b >= k) and out read 2, not 1.
+#[test]
+fn cmp_i8_const_lhs_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
+    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    let (ll, _) = clang_compile(&clang, &resdir, "tests/fixtures/cmp_i8.c");
+    // clang folds 200u to the signed byte immediate -56.
+    assert!(
+        ll.contains("icmp ult i8 %1, -56"),
+        "cmp_i8 IR drifted: no i8 const-RHS compare"
+    );
+    let swapped = ll.replacen("icmp ult i8 %1, -56", "icmp ugt i8 -56, %1", 1);
+    let (mut p, globals, _asm) = compile_ll_asm(&swapped);
+    p.ram_mut()[globals["in0"] as usize] = 88;
+    p.run(10_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        1,
+        "200 > 88 takes the then arm"
+    );
+    assert!(p.halted());
 }

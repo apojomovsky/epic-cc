@@ -587,7 +587,11 @@ impl Gen {
         // Baseline's runtime routines run well under half the PIC14 frame
         // constants (see `frame_budget`); the corpus is the arbiter and an
         // underestimate surfaces as an alloc failure, never a miscompile.
-        let routine = if self.baseline { routine / 2 } else { routine };
+        let (worst, routine) = if self.baseline {
+            (self.worst_routine / 2, routine / 2)
+        } else {
+            (self.worst_routine, routine)
+        };
         let (window, globals) = if self.baseline {
             (
                 34,
@@ -611,7 +615,7 @@ impl Gen {
                     },
             )
         };
-        let routine = self.worst_routine.max(routine);
+        let routine = worst.max(routine);
         // The 8-byte safety margin applies to fill statements only: estimates
         // are upper bounds, so forced statements fit by estimate alone and the
         // margin would reject real-fit flagged combos. Fill cost stays bounded

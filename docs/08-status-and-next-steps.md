@@ -41,7 +41,9 @@ now contains a complete compiler, not just documentation:
   PIC only; dsPIC, PIC24 and PIC32 remain out of scope entirely.
 - **Device registry:** file-per-device TOML under `crates/device/devices/` with
   `build.rs` codegen and a `--target` flag ([ADR-019](adr/ADR-019-pic-variants-device-registry.md)),
-  holding `p16f877a`, `p16f887`, `p18f4550` and `p18f2550`. A DFP to TOML generator
+  holding twelve profiles across all four cores: `p16f877a`, `p16f887`,
+  `p16f628a`, the `p16f193x` PIC14E family (33/34/36/37/38/39), `p18f4550`,
+  `p18f2550`, and the baseline `p12f509`. A DFP to TOML generator
   ingests Microchip ATDF ([ADR-020](adr/ADR-020-dfp-toml-generator.md)), a provenance
   stanza records where each field came from, and an always-on gputils cross-check
   catches drift against the oracle ([ADR-021](adr/ADR-021-device-provenance-and-cross-check.md)).
