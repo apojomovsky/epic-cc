@@ -135,6 +135,14 @@ opt-out, never a silent skip). Note the cross-check loops the whole
 device registry, not just the new part, so its cost grows with the
 registry.
 
+The gate compares coalesced span sets, not per-bank pairs (epic-cc#411).
+Two oracles disagreeing about the same silicon is a disclosed fact, not
+a failure: a reserved span the `.lkr` omits (R2) or a claimed extent past
+the `.lkr` model (R4) each needs a `# gputils-divergence:` line in the
+TOML citing the source, and the gate fails unused markers so they cannot
+rot. Alias banks gputils lists but the part mirrors away (R3) need no
+marker; the bank geometry proves them in code and unit tests.
+
 ## §4. What the script runs for per-device sanity
 
 As one of its steps, the script invokes the per-device sanity check for
@@ -232,6 +240,7 @@ Two failure shapes to expect and fix, not route around:
 | gputils names a device's entire (and only) GPR window a `SHAREBANK`, not a `DATABANK gpr*`, because one bank is a full mirror of another; the `.lkr` RAM-correction script mistook the resulting empty `banks` list for "gputils says zero RAM" and wiped an already-correct `ram_banks` to nothing | `p12f675`, `p12f629` | `#395`, `scripts/add_device.py`'s `correct_ram` (only widens now, never shrinks) |
 | `add-device.sh`'s automated §2 field-diff picked an unrelated same-core device as "closest sibling" purely because its name happened to be the same length, producing pure noise instead of a real hardware-identity check; the real sibling (same name prefix) diffed clean | `p16f84a` vs. `p10f320` (picked) / `p16f84` (real sibling) | `#398`, `scripts/add_device.py`'s `sibling` (prefix match first, length distance only as tiebreak) |
 | A device with two-or-more real, non-aliased GPR regions (no single-region collapse, no shared corner) has no bank-independent byte for `common_ram`; gputils also reports it as multiple separate unprotected `SHAREBANK`s (one per region's own alias pair), not one region the existing common_ram-vs-SHAREBANK check understood | `p16f74` | `#393`, `docs/39` D-2, `scripts/gen-device.py`'s `isr_w_shadow`/`isr_home_window` classifier, `crates/device/tests/gputils_crosscheck.rs`'s D-2 fallback |
+| gputils models a banked GPR region as `SHAREBANK` (or omits a bank, or lists alias banks as real), while XC8's own ini states the real extents; per-bank index pairing then reports a disagreement where the coalesced spans agree, and a widening to the `.lkr` extents can fragment banks below the sanity probe floor | `p16f819`, `p16f870`, `p16f873`, `p16f874` | `#411`, `crates/device/tests/gputils_crosscheck.rs` R1-R4 with `# gputils-divergence:` markers, `scripts/add_device.py` R5 floor |
 
 This table is deliberately device-specific in its "confirmed on" column
 and generic in its "pattern" column, the same posture

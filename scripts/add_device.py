@@ -13,6 +13,12 @@ import re
 import sys
 
 
+# The sanity probe's 80-byte cap (crates/device/tests/sanity.rs): the
+# largest single-window global the per-device gate tries to place. R5
+# (epic-cc#411) refuses correct-ram widenings that fragment every bank
+# below it.
+RAM_PROBE_FLOOR = 80
+
 # --- minimal TOML parser for the device-Toml subset ---------------------
 # gen-device.py emits a deterministic shape: top-level scalars and arrays,
 # a [provenance] table, a [config] table, and [[config.fields]] array-of-
@@ -288,11 +294,13 @@ def correct_ram(toml_path, lkr_path):
         # build.rs's reconstruction rule, so each widened span clips at
         # its own point.
         shadow = data.get("isr_w_shadow")
+        shadow_bytes = 0
         if shadow is not None:
             pointed = []
             for lo, hi in new_ram:
                 p = (lo & ~0x7F) | (shadow & 0x7F)
                 if lo <= p <= hi:
+                    shadow_bytes += 1
                     if lo < p:
                         pointed.append([lo, p - 1])
                     if hi > p:
@@ -306,6 +314,17 @@ def correct_ram(toml_path, lkr_path):
     new_bytes = sum(hi - lo + 1 for lo, hi in new_ram)
     if new_bytes <= old_bytes:
         return False
+    if core != "pic18":
+        # R5 (epic-cc#411) fragmentation floor: a widening whose clips
+        # leave no bank at or above the sanity probe floor strands the
+        # device (p16f874: shadow-point splits leave no 80-byte region),
+        # so refuse it and keep the generator shape. Parts whose whole
+        # GPR is below the floor are exempt (p16f54's 9 bytes).
+        whole = new_bytes + sum(hi - lo + 1 for lo, hi in reserved) + shadow_bytes
+        if whole >= RAM_PROBE_FLOOR and not any(
+            hi - lo + 1 >= RAM_PROBE_FLOOR for lo, hi in new_ram
+        ):
+            return False
     text = toml_path.read_text()
     old = "ram_banks = " + _fmt_ram(data["ram_banks"])
     new = "ram_banks = " + _fmt_ram(new_ram)
