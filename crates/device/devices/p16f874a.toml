@@ -1,7 +1,7 @@
 name = "p16f874a"
 core = "pic14"
 flash_words = 4096
-ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00FF]]
+ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00EF]]
 isr_w_shadow = 0x0020
 isr_home_window = [0x0070, 0x007F]
 stack_depth = 8
@@ -87,4 +87,4 @@ mask = 0x20
 shift = 5
 default = "off"
 values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
-# gputils-divergence: 0x00F0-0x00FF window mirror claimed past the model: 16f874a_g.lkr PROTECTED gprnobnk 0xF0-0xFF mirrors isr_home_window 0x70-0x7F (docs/39 D-2)
+# gputils-divergence: 0x0070-0x007F reserved isr_home_window, real RAM; 16f874a_g.lkr models it as unprotected SHAREBANK gprnobnk (docs/39 D-2)
