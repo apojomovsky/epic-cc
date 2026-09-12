@@ -2,9 +2,13 @@ name: cut-release
 
 # Manual trigger: computes the next semver from Conventional Commits
 # (git-cliff) and regenerates CHANGELOG.md. master's ruleset requires a PR
-# with required checks green (a direct push was tried and rejected with
-# GH013), so this opens a release PR, auto-merges it, then tags the
-# result; that tag push is what triggers release.yml's build/publish.
+# with required checks green, so this opens a release PR, auto-merges it,
+# then tags the result; that tag push is what triggers release.yml's
+# build/publish. Uses EPIC_TASKS_TOKEN (a PAT, already a repo secret) to
+# push the branch and open the PR: a PR opened with the default
+# GITHUB_TOKEN never triggers other workflows (GitHub's loop-prevention
+# rule), so its required checks would never run and it would sit BLOCKED
+# forever, confirmed the hard way (PR #417).
 
 on:
   workflow_dispatch:
@@ -32,6 +36,7 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
+          token: ${{ secrets.EPIC_TASKS_TOKEN }}
 
       - uses: ./.github/actions/install-git-cliff
 
@@ -76,7 +81,7 @@ jobs:
         id: pr
         env:
           VERSION: ${{ steps.version.outputs.version }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.EPIC_TASKS_TOKEN }}
         run: |
           branch="chore/release-${VERSION}"
           git config user.name "github-actions[bot]"
@@ -95,7 +100,7 @@ jobs:
       - name: Wait for the release PR to merge
         id: merged
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.EPIC_TASKS_TOKEN }}
         run: |
           number="${{ steps.pr.outputs.number }}"
           for _ in $(seq 1 90); do
