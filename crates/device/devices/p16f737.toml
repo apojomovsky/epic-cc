@@ -1,0 +1,109 @@
+name = "p16f737"
+core = "pic14"
+flash_words = 4096
+ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF], [0x0110, 0x016F], [0x0190, 0x01EF]]
+common_ram = [0x0070, 0x007F]
+stack_depth = 8
+interrupt_vectors = [0x0004]
+
+[provenance]
+tier = "atdf"
+source = "PIC16F737.PIC"
+pack = "Microchip.PIC16Fxxx_DFP"
+sha256 = "0effbd707ccf0abdba215d51a12cfdb7cf82854c489876c8e3b16452b5eaf402"
+
+[config]
+base_byte_addr = 0x400E
+num_bytes = 4
+erased_baseline = [0xFF, 0x3F, 0xFF, 0x3F]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 0
+mask = 0x13
+shift = 0
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "ec", bits = 3 }, { name = "intoscio", bits = 16 }, { name = "intoscclk", bits = 17 }, { name = "extrcio", bits = 18 }, { name = "extrcclk", bits = 19 }]
+
+[[config.fields]]
+name = "wdt"
+byte_offset = 0
+mask = 0x04
+shift = 2
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "pwrt"
+byte_offset = 0
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "mclre"
+byte_offset = 0
+mask = 0x20
+shift = 5
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "boren"
+byte_offset = 0
+mask = 0x40
+shift = 6
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "borv"
+byte_offset = 0
+mask = 0x80
+shift = 7
+values = [{ name = "27", bits = 0 }, { name = "20", bits = 1 }]
+
+[[config.fields]]
+name = "debug"
+byte_offset = 1
+mask = 0x08
+shift = 3
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "ccp2mx"
+byte_offset = 1
+mask = 0x10
+shift = 4
+values = [{ name = "rb3", bits = 0 }, { name = "rc1", bits = 1 }]
+
+[[config.fields]]
+name = "cp"
+byte_offset = 1
+mask = 0x20
+shift = 5
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "fcmen"
+byte_offset = 2
+mask = 0x01
+shift = 0
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "ieso"
+byte_offset = 2
+mask = 0x02
+shift = 1
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "borsen"
+byte_offset = 2
+mask = 0x40
+shift = 6
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
