@@ -302,6 +302,73 @@ class CorrectRamTest(unittest.TestCase):
         self.assertIn("ram_banks = [[0x0040, 0x006F]]", text)
         self.assertIn("common_ram = [0x0070, 0x007F]", text)
 
+    def test_pic14_refuses_widening_that_fragments_below_floor(self):
+        # p16f874: widening to gputils' four banks splits every bank at
+        # its shadow point, leaving no 80-byte region for the sanity
+        # probe. R5 refuses the widening and keeps the generator shape.
+        with tempfile.TemporaryDirectory() as d:
+            toml = write(pathlib.Path(d) / "p14syn874.toml", PIC14_D2_TOML)
+            lkr = write(pathlib.Path(d) / "14syn874_g.lkr", PIC14_LKR_FOUR_BANK)
+            changed = add_device.correct_ram(toml, lkr)
+            text = toml.read_text()
+        self.assertFalse(changed)
+        self.assertIn("ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00FF]]", text)
+
+    def test_pic14_widens_when_whole_gpr_below_floor(self):
+        # Parts whose whole GPR is below the floor are exempt: there is
+        # no 80-byte region to preserve, so an understated bank still
+        # widens (whole GPR here is 16 + 16 = 32 bytes).
+        with tempfile.TemporaryDirectory() as d:
+            toml = write(pathlib.Path(d) / "p14syntiny.toml", PIC14_TINY_TOML)
+            lkr = write(pathlib.Path(d) / "14syntiny_g.lkr", PIC14_LKR_TINY)
+            changed = add_device.correct_ram(toml, lkr)
+            text = toml.read_text()
+        self.assertTrue(changed)
+        self.assertIn("ram_banks = [[0x0040, 0x004F]]", text)
+
+
+# A D-2 TOML (p16f874's shape): two clipped banks plus the shadow byte
+# and the home window.
+PIC14_D2_TOML = """\
+name = "p14syn874"
+core = "pic14"
+flash_words = 4096
+ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00FF]]
+isr_w_shadow = 0x0020
+isr_home_window = [0x0070, 0x007F]
+stack_depth = 8
+interrupt_vectors = [0x0004]
+"""
+
+# The same silicon as gputils sees it: four full DATABANKs plus the
+# unprotected window. Widening to these extents splits every bank at
+# its shadow point (0x120, 0x1A0, ...).
+PIC14_LKR_FOUR_BANK = """\
+DATABANK   NAME=sfr0       START=0x0               END=0x1F           PROTECTED
+DATABANK   NAME=gpr0       START=0x20              END=0x6F
+DATABANK   NAME=gpr1       START=0xA0              END=0xEF
+DATABANK   NAME=gpr2       START=0x110             END=0x16F
+DATABANK   NAME=gpr3       START=0x190             END=0x1EF
+SHAREBANK  NAME=gprnobnk   START=0x70            END=0x7F
+"""
+
+# A tiny part (whole GPR below the floor): one 8-byte bank plus a
+# 16-byte common window.
+PIC14_TINY_TOML = """\
+name = "p14syntiny"
+core = "pic14"
+flash_words = 512
+ram_banks = [[0x0048, 0x004F]]
+common_ram = [0x0050, 0x005F]
+stack_depth = 8
+interrupt_vectors = [0x0004]
+"""
+
+PIC14_LKR_TINY = """\
+DATABANK   NAME=sfr0       START=0x0               END=0x3F           PROTECTED
+DATABANK   NAME=gpr0       START=0x40              END=0x5F
+"""
+
 
 class FieldDiffTest(unittest.TestCase):
     def test_names_new_absent_and_renamed_fields(self):
