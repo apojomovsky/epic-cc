@@ -216,9 +216,10 @@ fn intersect_spans(span: (u16, u16), cover: &[(u16, u16)]) -> Vec<(u16, u16)> {
 /// as coalesced span sets, kinds ignored: bank-vs-shared partitions with
 /// identical extents (p16f819's bank0) and the ADR-034/D-2 splits fold in
 /// as the empty-divergence case. Non-empty residuals classify per span:
-/// R2 (reserved spans absent from the model) and R4 (claimed excess) each
 /// need a `# gputils-divergence:` cover, R3 (alias-redundant gputils
-/// spans) is computational. Unused markers rot-fail the audit.
+/// spans) is computational. A marker pinning a real reserved span is
+/// consumed as documentation even with no residual; anything else
+/// unused rot-fails the audit.
 fn compare_pic14(dev: &Device, lkr: &LkrRam) -> Vec<String> {
     let (markers, mut problems) = load_markers(dev.name);
     problems.extend(compare_pic14_with(dev, lkr, &markers));
@@ -290,7 +291,11 @@ fn compare_pic14_with(dev: &Device, lkr: &LkrRam, markers: &[Divergence]) -> Vec
         }
     }
     for (m, used) in markers.iter().zip(consumed.iter()) {
-        if !used {
+        // A marker pinning a real reserved span is consumed as
+        // documentation even when the unions match: the span stays
+        // reserved by construction, so the claim cannot rot.
+        let pins_reserved = reserved.iter().any(|&r| contains(r, m.span));
+        if !used && !pins_reserved {
             problems.push(format!(
                 "{}: `# gputils-divergence:` {} ({}) covers no divergence and will rot",
                 dev.name,
@@ -668,6 +673,35 @@ fn alias_sfr_geometry_is_pic14_only() {
     assert!(compare_pic14_with(&baseline, &lkr, &[])
         .iter()
         .any(|p| p.contains("no claimed alias")));
+}
+
+/// Reserved-pin consumption (epic-cc#406 review): the truncated D-2
+/// shape unions clean, so its window marker covers no residual; the
+/// marker is consumed for pinning the real reserved span instead of
+/// rot-failing.
+#[test]
+fn window_marker_pins_reserved_span_without_residual() {
+    let lkr = LkrRam {
+        banks: vec![(0x20, 0x6F), (0xA0, 0xEF), (0x110, 0x16F), (0x190, 0x1EF)],
+        shared: vec![(0x70, 0x7F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x21, 0x6F), (0xA1, 0xEF)],
+        isr_w_shadow: Some(0x20),
+        isr_home_window: Some((0x70, 0x7F)),
+        ..base
+    };
+    let markers = [Divergence {
+        span: (0x70, 0x7F),
+        reason: "reserved isr_home_window, real RAM".into(),
+    }];
+    let problems = compare_pic14_with(&part, &lkr, &markers);
+    assert!(
+        problems.is_empty(),
+        "pinned window marker should pass: {problems:?}"
+    );
 }
 
 fn gpasm() -> String {
