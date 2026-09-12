@@ -1,0 +1,22 @@
+name: install-git-cliff
+description: >-
+  Download and checksum-verify the pinned git-cliff release binary, used
+  by both cut-release.yml and release.yml so the version stays in one
+  place.
+
+runs:
+  using: composite
+  steps:
+    - name: Install git-cliff
+      shell: bash
+      env:
+        GIT_CLIFF_VERSION: "2.14.1"
+        GIT_CLIFF_SHA512: "bb40f68e752db1a32526c43e0108e8eff785f7c24c67024cffe1c316e034372975fd78c9af8e9a48148235aad15c9a103f1a5b490c282f1db09a7a793794b69f"
+      run: |
+        curl -fsSL -o git-cliff.tar.gz \
+          "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+        echo "${GIT_CLIFF_SHA512}  git-cliff.tar.gz" | sha512sum -c -
+        tar xzf git-cliff.tar.gz
+        sudo mv "git-cliff-${GIT_CLIFF_VERSION}/git-cliff" /usr/local/bin/git-cliff
+        rm -rf git-cliff.tar.gz "git-cliff-${GIT_CLIFF_VERSION}"
+        git-cliff --version

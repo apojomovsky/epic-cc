@@ -1,0 +1,87 @@
+name: cut-release
+
+# Manual trigger: computes the next semver from Conventional Commits
+# (git-cliff), regenerates CHANGELOG.md, commits it straight to master
+# (no branch protection here, see AGENTS.md), and pushes the vX.Y.Z tag.
+# That tag push is what triggers release.yml's build + gh release step;
+# this workflow does nothing else, on purpose. Checkout is pinned to
+# master regardless of which branch workflow_dispatch is launched from,
+# so a run kicked off from a stale branch can't fast-forward master to
+# unreviewed history.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+permissions:
+  contents: write
+
+jobs:
+  cut-release:
+    runs-on: ubuntu-latest
+    env:
+      # git-cliff enriches commits with GitHub PR metadata over the REST
+      # API; unauthenticated it hits the 60 req/hr anonymous rate limit
+      # within a single run once a tag is in play.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - uses: ./.github/actions/install-git-cliff
+
+      - name: Resolve next version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          case "$BUMP" in
+            auto)
+              next="$(git cliff --bumped-version)"
+              ;;
+            patch|minor|major)
+              current="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)"
+              current="${current#v}"
+              IFS='.' read -r major minor patch <<< "${current:-0.0.0}"
+              case "$BUMP" in
+                patch) patch=$((patch + 1)) ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+              esac
+              next="v${major}.${minor}.${patch}"
+              ;;
+            *)
+              echo "::error::unknown bump input '$BUMP'"
+              exit 1
+              ;;
+          esac
+          echo "resolved next version: $next"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate CHANGELOG.md
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git cliff --tag "$VERSION" -o CHANGELOG.md
+          # the template leaves a trailing blank line; the pre-commit hook
+          # rejects it as trailing whitespace.
+          sed -i -e '${/^$/d}' CHANGELOG.md
+
+      - name: Commit and tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "chore(release): $VERSION"
+          git tag -a "$VERSION" -m "$VERSION"
+          git push origin HEAD:master
+          git push origin "$VERSION"
