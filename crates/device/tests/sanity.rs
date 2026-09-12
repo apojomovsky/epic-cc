@@ -39,13 +39,12 @@ fn alloc_empty_prog_does_not_panic() {
 fn eighty_byte_global_lands_in_ram_banks() {
     for dev in devices_under_test() {
         let mut m = ir::parse("global big i8\nfn main(void) ()\n  block entry:\n    ret void\n");
-        // 80 bytes covers the first PIC14 bank on every device shipped
-        // before PIC16F84 (docs/39 D-1), whose ram_banks is only 52 bytes.
-        // Scale to real capacity: the largest global that fits is what
-        // this actually proves, not a fixed absolute size.
+        // The probe scales to the device: 80 bytes covers the first PIC14
+        // bank on every device shipped before PIC16F84 (docs/39 D-1, whose
+        // ram_banks is only 52 bytes). A global never spans banks (the
+        // 509's 32 GPR bytes sit in two 16-byte banks), so size also caps
+        // at the largest single window.
         let capacity: u16 = dev.ram_banks.iter().map(|&(lo, hi)| hi - lo + 1).sum();
-        // A global never spans banks (the 509's 32 GPR bytes sit in two
-        // 16-byte banks): cap at the largest single window too.
         let widest: u16 = dev
             .ram_banks
             .iter()
