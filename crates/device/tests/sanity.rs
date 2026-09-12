@@ -44,8 +44,8 @@ fn eighty_byte_global_lands_in_ram_banks() {
         // Scale to real capacity: the largest global that fits is what
         // this actually proves, not a fixed absolute size.
         let capacity: u16 = dev.ram_banks.iter().map(|&(lo, hi)| hi - lo + 1).sum();
-        // A global never spans banks: cap at the largest single window too
-        // (the 509's 32 GPR bytes sit in two 16-byte banks).
+        // A global never spans banks (the 509's 32 GPR bytes sit in two
+        // 16-byte banks): cap at the largest single window too.
         let widest: u16 = dev
             .ram_banks
             .iter()
