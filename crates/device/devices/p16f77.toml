@@ -1,0 +1,56 @@
+name = "p16f77"
+core = "pic14"
+flash_words = 8192
+ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF], [0x0110, 0x016F], [0x0190, 0x01EF]]
+common_ram = [0x0070, 0x007F]
+stack_depth = 8
+interrupt_vectors = [0x0004]
+
+[provenance]
+tier = "atdf"
+source = "PIC16F77.PIC"
+pack = "Microchip.PIC16Fxxx_DFP"
+sha256 = "48a1ad82f441941b6c020ab7805984ac00d655a79e88b77b5372c974d93d38b4"
+
+[config]
+base_byte_addr = 0x400E
+num_bytes = 2
+erased_baseline = [0xFF, 0x3F]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 0
+mask = 0x03
+shift = 0
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "rc", bits = 3 }]
+
+[[config.fields]]
+name = "wdt"
+byte_offset = 0
+mask = 0x04
+shift = 2
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "pwrt"
+byte_offset = 0
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cp"
+byte_offset = 0
+mask = 0x10
+shift = 4
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "boren"
+byte_offset = 0
+mask = 0x40
+shift = 6
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
