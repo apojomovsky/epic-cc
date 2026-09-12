@@ -1,0 +1,80 @@
+name = "p16lf628a"
+core = "pic14"
+flash_words = 2048
+ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF], [0x0120, 0x014F]]
+common_ram = [0x0070, 0x007F]
+stack_depth = 8
+interrupt_vectors = [0x0004]
+
+[provenance]
+tier = "atdf"
+source = "PIC16LF628A.PIC"
+pack = "Microchip.PIC16Fxxx_DFP"
+sha256 = "66500a3dc7c9fcf77e79b801ea598c4dfdc509ebcf7721e66e03a0a4c83dc0de"
+
+[config]
+base_byte_addr = 0x400E
+num_bytes = 2
+erased_baseline = [0xFF, 0x3F]
+
+[[config.fields]]
+name = "osc"
+byte_offset = 0
+mask = 0x13
+shift = 0
+values = [{ name = "lp", bits = 0 }, { name = "xt", bits = 1 }, { name = "hs", bits = 2 }, { name = "ecio", bits = 3 }, { name = "intoscio", bits = 16 }, { name = "intoscclk", bits = 17 }, { name = "extrcio", bits = 18 }, { name = "extrcclk", bits = 19 }]
+
+[[config.fields]]
+name = "wdt"
+byte_offset = 0
+mask = 0x04
+shift = 2
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "pwrt"
+byte_offset = 0
+mask = 0x08
+shift = 3
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "mclre"
+byte_offset = 0
+mask = 0x20
+shift = 5
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "boren"
+byte_offset = 0
+mask = 0x40
+shift = 6
+default = "on"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "lvp"
+byte_offset = 0
+mask = 0x80
+shift = 7
+default = "off"
+values = [{ name = "off", bits = 0 }, { name = "on", bits = 1 }]
+
+[[config.fields]]
+name = "cpd"
+byte_offset = 1
+mask = 0x01
+shift = 0
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
+
+[[config.fields]]
+name = "cp"
+byte_offset = 1
+mask = 0x20
+shift = 5
+default = "off"
+values = [{ name = "on", bits = 0 }, { name = "off", bits = 1 }]
