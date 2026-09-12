@@ -1,0 +1,88 @@
+name: cut-release
+
+# Manual trigger: computes the next semver from Conventional Commits
+# (git-cliff), regenerates CHANGELOG.md, commits it straight to master
+# (no branch protection here, see AGENTS.md), and pushes the vX.Y.Z tag.
+# That tag push is what triggers release.yml's build + gh release step;
+# this workflow does nothing else, on purpose.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+
+permissions:
+  contents: write
+
+env:
+  GIT_CLIFF_VERSION: "2.14.1"
+  GIT_CLIFF_SHA512: "bb40f68e752db1a32526c43e0108e8eff785f7c24c67024cffe1c316e034372975fd78c9af8e9a48148235aad15c9a103f1a5b490c282f1db09a7a793794b69f"
+
+jobs:
+  cut-release:
+    runs-on: ubuntu-latest
+    env:
+      # git-cliff enriches commits with GitHub PR metadata over the REST
+      # API; unauthenticated it hits the 60 req/hr anonymous rate limit
+      # within a single run once a tag is in play.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install git-cliff
+        run: |
+          curl -fsSL -o git-cliff.tar.gz \
+            "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${GIT_CLIFF_SHA512}  git-cliff.tar.gz" | sha512sum -c -
+          tar xzf git-cliff.tar.gz
+          sudo mv "git-cliff-${GIT_CLIFF_VERSION}/git-cliff" /usr/local/bin/git-cliff
+          git-cliff --version
+
+      - name: Resolve next version
+        id: version
+        run: |
+          case "${{ inputs.bump }}" in
+            auto)
+              next="$(git cliff --bumped-version)"
+              ;;
+            patch|minor|major)
+              current="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | sort -V | tail -1)"
+              current="${current#v}"
+              IFS='.' read -r major minor patch <<< "${current:-0.0.0}"
+              case "${{ inputs.bump }}" in
+                patch) patch=$((patch + 1)) ;;
+                minor) minor=$((minor + 1)); patch=0 ;;
+                major) major=$((major + 1)); minor=0; patch=0 ;;
+              esac
+              next="v${major}.${minor}.${patch}"
+              ;;
+            *)
+              echo "::error::unknown bump input '${{ inputs.bump }}'"
+              exit 1
+              ;;
+          esac
+          echo "resolved next version: $next"
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate CHANGELOG.md
+        run: |
+          git cliff --tag "${{ steps.version.outputs.version }}" -o CHANGELOG.md
+          # the template leaves a trailing blank line; the pre-commit hook
+          # rejects it as trailing whitespace.
+          sed -i -e '${/^$/d}' CHANGELOG.md
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "chore(release): ${{ steps.version.outputs.version }}"
+          git tag -a "${{ steps.version.outputs.version }}" -m "${{ steps.version.outputs.version }}"
+          git push origin HEAD:master
+          git push origin "${{ steps.version.outputs.version }}"

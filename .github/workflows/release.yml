@@ -15,6 +15,10 @@ permissions:
   contents: write
   packages: write
 
+env:
+  GIT_CLIFF_VERSION: "2.14.1"
+  GIT_CLIFF_SHA512: "bb40f68e752db1a32526c43e0108e8eff785f7c24c67024cffe1c316e034372975fd78c9af8e9a48148235aad15c9a103f1a5b490c282f1db09a7a793794b69f"
+
 jobs:
   # See ci.yml's warm-toolchain-cache job / toolchain-cache.yml.
   warm-toolchain-cache:
@@ -130,10 +134,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v5
         with:
           pattern: '*-bundle'
           path: dist
+
+      - name: Install git-cliff
+        run: |
+          curl -fsSL -o git-cliff.tar.gz \
+            "https://github.com/orhun/git-cliff/releases/download/v${GIT_CLIFF_VERSION}/git-cliff-${GIT_CLIFF_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${GIT_CLIFF_SHA512}  git-cliff.tar.gz" | sha512sum -c -
+          tar xzf git-cliff.tar.gz
+          sudo mv "git-cliff-${GIT_CLIFF_VERSION}/git-cliff" /usr/local/bin/git-cliff
+          git-cliff --version
+
+      - name: Generate release notes
+        env:
+          # git-cliff enriches commits with GitHub PR metadata over the
+          # REST API; unauthenticated it hits the 60 req/hr anonymous
+          # rate limit within a single run once a tag is in play.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: git cliff --tag "$GITHUB_REF_NAME" --latest --strip header -o notes.md
 
       - name: Create GitHub release
         env:
@@ -144,4 +167,4 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             linux-bundle/*.zip windows-bundle/*.zip SHA256SUMS \
             --title "epic-cc ${GITHUB_REF_NAME#v}" \
-            --generate-notes
+            --notes-file ../notes.md
