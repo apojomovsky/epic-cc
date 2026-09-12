@@ -77,91 +77,229 @@ fn fmt(rs: &[(u16, u16)]) -> String {
         .join(" ")
 }
 
-/// Reports every bank whose bounds differ, plus any bank one side does not
-/// have at all, so a diff names the range rather than a bare boolean.
-fn bank_diff(ours: &[(u16, u16)], theirs: &[(u16, u16)]) -> Vec<String> {
+/// Spans of `a` not covered by `b` (both coalesced, sorted). Span-set
+/// subtraction: the residual language R2-R4 classify.
+fn subtract(a: &[(u16, u16)], b: &[(u16, u16)]) -> Vec<(u16, u16)> {
     let mut out = Vec::new();
-    for i in 0..ours.len().max(theirs.len()) {
-        match (ours.get(i), theirs.get(i)) {
-            (Some(a), Some(b)) if a == b => {}
-            (a, b) => out.push(format!(
-                "  bank {i}: ours {} vs gputils {}",
-                a.map_or("absent".into(), |r| fmt(&[*r])),
-                b.map_or("absent".into(), |r| fmt(&[*r]))
-            )),
+    for &(lo, hi) in a {
+        let mut cur = u32::from(lo);
+        let end = u32::from(hi);
+        for &(blo, bhi) in b {
+            let (blo, bhi) = (u32::from(blo), u32::from(bhi));
+            if bhi < cur || blo > end {
+                continue;
+            }
+            if blo > cur {
+                out.push((cur as u16, (blo - 1) as u16));
+            }
+            cur = cur.max(bhi + 1);
+            if cur > end {
+                break;
+            }
+        }
+        if cur <= end {
+            out.push((cur as u16, hi));
         }
     }
     out
+}
+
+fn contains(span: (u16, u16), sub: (u16, u16)) -> bool {
+    span.0 <= sub.0 && sub.1 <= span.1
+}
+
+/// A `# gputils-divergence:` marker parsed from the device TOML: the span
+/// it discloses plus the free-text reason (which cites the .lkr or the
+/// datasheet; citation quality is review's job, presence is the gate's).
+struct Divergence {
+    span: (u16, u16),
+    reason: String,
+}
+
+/// Machine-greppable disclosures in the raw TOML text. Malformed lines
+/// fail loudly rather than reading as absent.
+fn parse_markers(name: &str, text: &str) -> (Vec<Divergence>, Vec<String>) {
+    let mut markers = Vec::new();
+    let mut problems = Vec::new();
+    for line in text.lines().map(str::trim) {
+        let Some(rest) = line.strip_prefix("# gputils-divergence:") else {
+            continue;
+        };
+        let rest = rest.trim();
+        let (span_text, reason) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+        let span = span_text.split_once('-').and_then(|(a, b)| {
+            let lo = a
+                .trim()
+                .strip_prefix("0x")
+                .and_then(|h| u16::from_str_radix(h, 16).ok());
+            let hi = b
+                .trim()
+                .strip_prefix("0x")
+                .and_then(|h| u16::from_str_radix(h, 16).ok());
+            lo.zip(hi)
+        });
+        match (span, reason.trim().is_empty()) {
+            (Some((lo, hi)), false) if lo <= hi => markers.push(Divergence {
+                span: (lo, hi),
+                reason: reason.trim().into(),
+            }),
+            _ => problems.push(format!(
+                "{name}: malformed `# gputils-divergence:` line: {line}"
+            )),
+        }
+    }
+    (markers, problems)
+}
+
+/// The raw registry TOML behind a device, the marker source. Synthetic
+/// test devices read their base name's real file, which carries no
+/// markers today, so unit-test verdicts cannot consume stray disclosures.
+fn load_markers(name: &str) -> (Vec<Divergence>, Vec<String>) {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("devices")
+        .join(format!("{name}.toml"));
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_markers(name, &text),
+        Err(_) => (Vec::new(), Vec::new()),
+    }
+}
+
+/// R3: a gputils span the TOML does not claim is accepted when it aliases
+/// a claimed span under the part's bank modulus. A span in a bank the
+/// TOML already claims is only excused for its SFR prefix (an unclaimed
+/// banked extent there is a real underclaim, not an alias); a span in an
+/// unclaimed bank may image onto any claimed home bank, and whatever the
+/// image leaves uncovered must sit inside that bank page's SFR prefix
+/// (0x20 wide on every PIC14, the SFRDataSector shape), never in GPR.
+fn alias_redundant(dev: &Device, ours_total: &[(u16, u16)], t: (u16, u16)) -> bool {
+    let mut homes: Vec<u16> = dev.ram_banks.iter().map(|(lo, _)| lo >> 7).collect();
+    homes.sort_unstable();
+    homes.dedup();
+    let len = t.1 - t.0 + 1;
+    let tbank = t.0 >> 7;
+    let candidates: Vec<u16> = if homes.contains(&tbank) {
+        vec![tbank]
+    } else {
+        homes
+    };
+    candidates.iter().any(|hb| {
+        let ilo = (t.0 & 0x7F) | (hb << 7);
+        let image = (ilo, ilo + len - 1);
+        let page = ilo & !0x7F;
+        let sfr = (page, page + 0x1F);
+        subtract(&[image], ours_total)
+            .into_iter()
+            .all(|gap| contains(sfr, gap))
+    })
+}
+
+/// Pieces of `span` covered by `cover` (coalesced, sorted).
+fn intersect_spans(span: (u16, u16), cover: &[(u16, u16)]) -> Vec<(u16, u16)> {
+    let mut out = Vec::new();
+    for &(lo, hi) in cover {
+        if hi < span.0 || lo > span.1 {
+            continue;
+        }
+        out.push((lo.max(span.0), hi.min(span.1)));
+    }
+    out
+}
+
+/// R1-R4 span-set reconciliation (epic-cc#411). R1 compares total coverage
+/// as coalesced span sets, kinds ignored: bank-vs-shared partitions with
+/// identical extents (p16f819's bank0) and the ADR-034/D-2 splits fold in
+/// as the empty-divergence case. Non-empty residuals classify per span:
+/// R2 (reserved spans absent from the model) and R4 (claimed excess) each
+/// need a `# gputils-divergence:` cover, R3 (alias-redundant gputils
+/// spans) is computational. Unused markers rot-fail the audit.
+fn compare_pic14(dev: &Device, lkr: &LkrRam) -> Vec<String> {
+    let (markers, mut problems) = load_markers(dev.name);
+    problems.extend(compare_pic14_with(dev, lkr, &markers));
+    problems
+}
+
+fn compare_pic14_with(dev: &Device, lkr: &LkrRam, markers: &[Divergence]) -> Vec<String> {
+    let mut problems = Vec::new();
+    // Reserved spans: the fixed common window, the D-2 home window, and
+    // the W-shadow byte once per region (docs/39 D-2's reconstruction).
+    let mut reserved: Vec<(u16, u16)> = Vec::new();
+    reserved.extend(dev.common_ram);
+    reserved.extend(dev.isr_home_window);
+    if let Some(w) = dev.isr_w_shadow {
+        reserved.push((w, w));
+        for (lo, _) in dev.ram_banks {
+            let s = (lo & !0x7F) | (w & 0x7F);
+            reserved.push((s, s));
+        }
+    }
+    let reserved = coalesce(&reserved);
+    let mut ours = dev.ram_banks.to_vec();
+    ours.extend(reserved.iter().copied());
+    let ours_total = coalesce(&ours);
+    let theirs_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());
+    let mut consumed = vec![false; markers.len()];
+    let cover = |span: (u16, u16), consumed: &mut [bool]| {
+        markers.iter().zip(consumed.iter_mut()).any(|(m, used)| {
+            if contains(m.span, span) {
+                *used = true;
+                true
+            } else {
+                false
+            }
+        })
+    };
+    // Each ours-only residual classifies on its own side of the
+    // reserved/claimed boundary: R2 for reserved spans the model omits,
+    // R4 for claimed spans past the model.
+    for q in subtract(&ours_total, &theirs_total) {
+        for r in intersect_spans(q, &reserved) {
+            if !cover(r, &mut consumed) {
+                problems.push(format!(
+                    "{}: reserved {} absent from gputils' model with no `# gputils-divergence:` cover (cite {}_g.lkr)",
+                    dev.name,
+                    fmt(&[r]),
+                    dev.name.trim_start_matches('p'),
+                ));
+            }
+        }
+        for c in subtract(&[q], &reserved) {
+            if !cover(c, &mut consumed) {
+                problems.push(format!(
+                    "{}: claims {} past gputils' model with no `# gputils-divergence:` cover (cite the datasheet extent)",
+                    dev.name,
+                    fmt(&[c]),
+                ));
+            }
+        }
+    }
+    for t in subtract(&theirs_total, &ours_total) {
+        if !alias_redundant(dev, &ours_total, t) {
+            problems.push(format!(
+                "{}: gputils {} has no claimed alias (not a bank-mirror of {})",
+                dev.name,
+                fmt(&[t]),
+                fmt(&ours_total),
+            ));
+        }
+    }
+    for (m, used) in markers.iter().zip(consumed.iter()) {
+        if !used {
+            problems.push(format!(
+                "{}: `# gputils-divergence:` {} ({}) covers no divergence and will rot",
+                dev.name,
+                fmt(&[m.span]),
+                m.reason,
+            ));
+        }
+    }
+    problems
 }
 
 fn compare(dev: &Device, lkr: &LkrRam) -> Vec<String> {
     let mut problems = Vec::new();
     match dev.core {
         Core::Pic14 | Core::Pic14e | Core::PicBaseline => {
-            // Banked GPR and the common window are compared apart. `isel`
-            // derives `fsr_window` from where that boundary sits, so a merged
-            // total would accept a bank that grew into the common range.
-            let mut strict = Vec::new();
-            let diff = bank_diff(&coalesce(dev.ram_banks), &coalesce(&lkr.banks));
-            if !diff.is_empty() {
-                strict.push(format!(
-                    "{}: ram_banks disagree\n{}",
-                    dev.name,
-                    diff.join("\n")
-                ));
-            }
-            let theirs_shared = lkr.shared.first().copied();
-            if dev.common_ram != theirs_shared {
-                let show = |r: Option<(u16, u16)>| r.map_or("none".into(), |x| fmt(&[x]));
-                strict.push(format!(
-                    "{}: common_ram is {} but the first unprotected SHAREBANK is {}",
-                    dev.name,
-                    show(dev.common_ram),
-                    show(theirs_shared)
-                ));
-            }
-            // ADR-034 (docs/39 D-1): a device whose entire GPR is one
-            // region as far as gputils is concerned -- a lone DATABANK
-            // (PIC10F320/322, no aliasing) or a full-alias SHAREBANK
-            // (PIC16F84/PIC12F629/PIC12F675) -- may split it between
-            // common_ram and ram_banks (claiming less bank-independence
-            // than confirmed is safe, only claiming more is a defect).
-            // Fallback only, so an already-correct device stays on the
-            // stricter per-field check above.
-            //
-            // docs/39 D-2 (epic-cc#393, PIC16F74): gputils reports this as
-            // TWO separate unprotected SHAREBANKs, one per real region, so
-            // `theirs_shared.first()` above sees only one and calls it a
-            // mismatch. Reconstruct instead: ram_banks plus isr_w_shadow
-            // (rebuilt per region) plus isr_home_window must coalesce back
-            // to gputils' full total.
-            if !strict.is_empty() && dev.isr_w_shadow.is_some() {
-                let w = dev.isr_w_shadow.unwrap();
-                let their_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());
-                let mut ours = dev.ram_banks.to_vec();
-                for (lo, _) in dev.ram_banks {
-                    let addr = (lo & !0x7F) | (w & 0x7F);
-                    ours.push((addr, addr));
-                }
-                ours.extend(dev.isr_home_window);
-                let ours = coalesce(&ours);
-                if ours == their_total {
-                    // Union matches gputils' per-region totals exactly.
-                } else {
-                    problems.extend(strict);
-                }
-            } else if !strict.is_empty() {
-                let their_total = coalesce(&[lkr.banks.clone(), lkr.shared.clone()].concat());
-                let mut ours = dev.ram_banks.to_vec();
-                ours.extend(dev.common_ram);
-                let ours = coalesce(&ours);
-                if their_total.len() == 1 && ours == their_total {
-                    // Union matches gputils' single region exactly: the
-                    // split is a legitimate policy choice, not a disagreement.
-                } else {
-                    problems.extend(strict);
-                }
-            }
+            problems.extend(compare_pic14(dev, lkr));
         }
         Core::Pic18 => {
             // PIC18 has two hardware regions: ACCESSBANK (0x0-0x5F) and the
@@ -301,6 +439,202 @@ fn single_region_split_that_overclaims_the_region_fails_the_gate() {
     );
 }
 
+/// R1 (epic-cc#411): p16f819's shape, bank0 banked here but SHAREBANK
+/// there. Identical extents, different partitions: the union matches, so
+/// no allowance is consumed and no disclosure is needed.
+#[test]
+fn partition_difference_with_identical_extents_passes() {
+    let lkr = LkrRam {
+        banks: vec![(0xA0, 0xEF), (0x120, 0x16F)],
+        shared: vec![(0x20, 0x6F), (0x70, 0x7F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x20, 0x6F), (0xA0, 0xEF), (0x120, 0x16F)],
+        common_ram: Some((0x70, 0x7F)),
+        ..base
+    };
+    let problems = compare(&part, &lkr);
+    assert!(
+        problems.is_empty(),
+        "union-equal partitions should pass: {problems:?}"
+    );
+}
+
+/// R2: a reserved window the oracle omits passes with a disclosure.
+#[test]
+fn absent_reserved_window_passes_with_disclosure() {
+    let lkr = LkrRam {
+        banks: vec![(0x20, 0x6F)],
+        shared: Vec::new(),
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x20, 0x6F)],
+        common_ram: Some((0x70, 0x7F)),
+        ..base
+    };
+    let markers = [Divergence {
+        span: (0x70, 0x7F),
+        reason: "window omitted from remedy_g.lkr".into(),
+    }];
+    let problems = compare_pic14_with(&part, &lkr, &markers);
+    assert!(
+        problems.is_empty(),
+        "disclosed omission should pass: {problems:?}"
+    );
+}
+
+#[test]
+fn absent_reserved_window_fails_undisclosed() {
+    let lkr = LkrRam {
+        banks: vec![(0x20, 0x6F)],
+        shared: Vec::new(),
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x20, 0x6F)],
+        common_ram: Some((0x70, 0x7F)),
+        ..base
+    };
+    let problems = compare_pic14_with(&part, &lkr, &[]);
+    assert!(
+        problems.iter().any(|p| p.contains("reserved")),
+        "undisclosed omission should name the reserved span: {problems:?}"
+    );
+}
+/// R3: p16f873's shape without the window-mirror excess, so the alias
+/// banks alone decide. gpr2 aliases bank0's cells (SFR prefix aside).
+#[test]
+fn alias_mirror_span_passes_without_disclosure() {
+    let lkr = LkrRam {
+        banks: vec![(0x20, 0x6F), (0xA0, 0xEF), (0x110, 0x16F)],
+        shared: vec![(0x70, 0x7F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x21, 0x6F), (0xA1, 0xEF)],
+        isr_w_shadow: Some(0x20),
+        isr_home_window: Some((0x70, 0x7F)),
+        ..base
+    };
+    let problems = compare_pic14_with(&part, &lkr, &[]);
+    assert!(problems.is_empty(), "alias banks should pass: {problems:?}");
+}
+
+/// R3 negative: genuinely unclaimed banked extents are a defect, whether
+/// in a claimed bank (byte 0x20 here) or in an unclaimed one whose home
+/// image lands outside claimed GPR (0xA0-0xAF images onto 0x20-0x2F,
+/// unclaimed and outside every SFR prefix).
+#[test]
+fn non_alias_extra_span_fails_the_gate() {
+    let lkr = LkrRam {
+        banks: vec![(0x20, 0x6F), (0xA0, 0xAF)],
+        shared: vec![(0x70, 0x7F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x21, 0x6F)],
+        common_ram: Some((0x70, 0x7F)),
+        ..base
+    };
+    let problems = compare_pic14_with(&part, &lkr, &[]);
+    assert!(
+        problems.iter().any(|p| p.contains("no claimed alias")),
+        "unclaimed GPR extent should fail: {problems:?}"
+    );
+}
+
+/// R4: the window mirror the TOML claims past the model passes disclosed.
+#[test]
+fn claimed_excess_passes_with_disclosure() {
+    let lkr = LkrRam {
+        banks: vec![(0x20, 0x6F), (0xA0, 0xEF)],
+        shared: vec![(0x70, 0x7F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x21, 0x6F), (0xA1, 0xFF)],
+        isr_w_shadow: Some(0x20),
+        isr_home_window: Some((0x70, 0x7F)),
+        ..base
+    };
+    let markers = [Divergence {
+        span: (0xF0, 0xFF),
+        reason: "window mirror per 16f873_g.lkr PROTECTED gprnobnk".into(),
+    }];
+    let problems = compare_pic14_with(&part, &lkr, &markers);
+    assert!(
+        problems.is_empty(),
+        "disclosed excess should pass: {problems:?}"
+    );
+}
+
+#[test]
+fn claimed_excess_fails_undisclosed() {
+    let lkr = LkrRam {
+        banks: vec![(0x20, 0x6F), (0xA0, 0xEF)],
+        shared: vec![(0x70, 0x7F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x21, 0x6F), (0xA1, 0xFF)],
+        isr_w_shadow: Some(0x20),
+        isr_home_window: Some((0x70, 0x7F)),
+        ..base
+    };
+    let problems = compare_pic14_with(&part, &lkr, &[]);
+    assert!(
+        problems.iter().any(|p| p.contains("past gputils' model")),
+        "undisclosed excess should fail: {problems:?}"
+    );
+}
+
+/// The audit: a disclosure covering no divergence rots the file.
+#[test]
+fn unused_marker_fails_the_gate() {
+    let lkr = LkrRam {
+        banks: vec![(0xA0, 0xEF)],
+        shared: vec![(0x20, 0x6F), (0x70, 0x7F)],
+        access: Vec::new(),
+    };
+    let base = device::PIC16F887;
+    let part = device::Device {
+        ram_banks: &[(0x20, 0x6F), (0xA0, 0xEF)],
+        common_ram: Some((0x70, 0x7F)),
+        ..base
+    };
+    let markers = [Divergence {
+        span: (0xF0, 0xFF),
+        reason: "stale".into(),
+    }];
+    let problems = compare_pic14_with(&part, &lkr, &markers);
+    assert!(
+        problems.iter().any(|p| p.contains("will rot")),
+        "unused disclosure should fail: {problems:?}"
+    );
+}
+
+#[test]
+fn malformed_marker_fails_loudly() {
+    let (_, problems) = parse_markers(
+        "psyn",
+        "# gputils-divergence: not-a-span\n# gputils-divergence: 0x0070-0x006F backwards",
+    );
+    assert_eq!(problems.len(), 2, "both lines should fail: {problems:?}");
+    let (markers, problems) = parse_markers(
+        "psyn",
+        "# gputils-divergence: 0x0070-0x007F window omitted from syn_g.lkr",
+    );
+    assert!(problems.is_empty() && markers.len() == 1);
+}
 fn gpasm() -> String {
     std::env::var("PIC8_GPASM").unwrap_or_else(|_| "gpasm".into())
 }
