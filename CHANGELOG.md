@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented here, generated from
 Conventional Commits. Dates are UTC.
-## [Unreleased]
+## [0.3.0] - 2026-09-12
 
 ### Bug Fixes
 
@@ -11,6 +11,7 @@ Conventional Commits. Dates are UTC.
 - Sweep baseline DFP pack, derive fsr_bank_bits, gate DCR to pic18 (#381)
 - Keep wide-compare skip chains atomic on 0xFF folds (#384)
 - Floor variadic va regions to one byte for va_start base (#400)
+- Route cut-release through a PR to satisfy the master ruleset (#414)
 
 ### Documentation
 
@@ -31,6 +32,10 @@ Conventional Commits. Dates are UTC.
 - Implement ADR-034 single-region common_ram split (#399)
 - PIC16F74 full interrupt support (docs/39 D-2) (#401)
 - Pic-baseline differential fuzz gate and PicBaseline arm in run_pic (#402)
+- Git-cliff changelog and automated release-cutting workflow (#404)
+- Mid-range groundwork, exemplar parts and the ISR carve-out widening fix (#412)
+- Add p16f54 (#413)
+- Add the nine PIC18 exemplar parts (#415)
 ## [0.2.0] - 2026-09-10
 
 ### Bug Fixes
