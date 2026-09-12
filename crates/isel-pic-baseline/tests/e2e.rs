@@ -19,7 +19,7 @@ static E2E_LOCK: Mutex<()> = Mutex::new(());
 /// through the real PIC baseline pipeline, and return a freshly
 /// constructed (not yet run) `PicBaseline` plus the global address map so
 /// each test can seed input addresses by name before calling `.run()`.
-fn compile(c_path: &str) -> (PicBaseline, HashMap<String, u16>) {
+fn compile(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
@@ -44,7 +44,7 @@ fn compile(c_path: &str) -> (PicBaseline, HashMap<String, u16>) {
 
 /// Like `compile`, but also returns the emitted `.asm` text so a test can
 /// inspect the D-2 reassertion instructions.
-fn compile_asm(c_path: &str) -> (PicBaseline, HashMap<String, u16>, String) {
+fn compile_asm(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>, String) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
     let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
@@ -132,6 +132,20 @@ fn scalar_c_runs_correctly() {
     p.ram_mut()[globals["in"] as usize] = 7;
     p.run(10_000);
     assert_eq!(p.ram()[globals["out"] as usize], 174, "scalar trace");
+    assert!(p.halted());
+}
+
+/// D-6's const-LHS subtraction and comparison. SUBWF is f - W (DS41236E
+/// Table 8-2), so k - a needs k staged in a file register; the P8 fuzz
+/// corpus caught the inverted idiom here (epic-cc#330). Both legs: the
+/// value sub `162 - in0` and the const-LHS compare `200 > in0`.
+#[test]
+fn const_sub_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals) = compile("tests/fixtures/const_sub.c");
+    p.ram_mut()[globals["in0"] as usize] = 88;
+    p.run(10_000);
+    assert_eq!(p.ram()[globals["out"] as usize], 75, "out = (162 - 88) + 1");
     assert!(p.halted());
 }
 
@@ -696,7 +710,7 @@ fn cmp_wide_c_runs_correctly() {
 /// Like `compile_asm`, but parses handed IR text instead of running
 /// clang. The text must look like clang `-O1` output for the pipeline
 /// (wholeprog through alloc) to accept it.
-fn compile_ll_asm(ll: &str) -> (PicBaseline, HashMap<String, u16>, String) {
+fn compile_ll_asm(ll: &str) -> (PicBaseline<'_>, HashMap<String, u16>, String) {
     let mut m = irparse::parse_ll(ll);
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
