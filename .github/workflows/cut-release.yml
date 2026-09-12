@@ -1,18 +1,10 @@
 name: cut-release
 
 # Manual trigger: computes the next semver from Conventional Commits
-# (git-cliff), regenerates CHANGELOG.md, and pushes the vX.Y.Z tag once
-# that change lands on master. master's ruleset requires every change to
-# go through a PR with its required status checks green (classic branch
-# protection reports none, but `gh api repos/.../rules/branches/master`
-# does; a direct push was tried and rejected with GH013 before this PR
-# based workflow replaced it), so this opens a release PR, enables
-# auto-merge, waits for it to actually merge, then tags the resulting
-# commit. That tag push is what triggers release.yml's build + gh release
-# step; this workflow does nothing else, on purpose. Checkout is pinned to
-# master regardless of which branch workflow_dispatch is launched from,
-# so a run kicked off from a stale branch can't base the release PR on
-# unreviewed history.
+# (git-cliff) and regenerates CHANGELOG.md. master's ruleset requires a PR
+# with required checks green (a direct push was tried and rejected with
+# GH013), so this opens a release PR, auto-merges it, then tags the
+# result; that tag push is what triggers release.yml's build/publish.
 
 on:
   workflow_dispatch:
