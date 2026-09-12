@@ -799,15 +799,29 @@ def generate_toml(
         missing.append("flash_words (source states 0)")
     # common_ram is read from whichever source supplied ram_banks, so a part
     # with no shared window yields none instead of borrowing another part's.
+    # R6 (epic-cc#411): a stated shared window classifies common_ram (the
+    # landed 877A convention) even when the ini supplies no RAMBANK --
+    # shapes with no stated window keep the D-2 carve below.
     rambank = scalar("RAMBANK")
+    common = scalar("COMMON")
     common_ram = None
     if rambank:
         ram_banks = parse_rambank(rambank)
-        common = scalar("COMMON")
         common_ram = parse_common(common) if common else None
     elif "ram_banks" in edc:
         ram_banks = edc["ram_banks"]
-        common_ram = edc.get("common_ram")
+        if common:
+            common_ram = parse_common(common)
+            if not any(
+                lo <= common_ram[1] and hi >= common_ram[0] for lo, hi in ram_banks
+            ):
+                missing.append(
+                    f"common_ram: stated COMMON window 0x{common_ram[0]:04X}-"
+                    f"0x{common_ram[1]:04X} touches no ram bank"
+                )
+                common_ram = None
+        else:
+            common_ram = edc.get("common_ram")
     else:
         missing.append("ram_banks (ini RAMBANK or EDC GPRDataSector)")
         ram_banks = []

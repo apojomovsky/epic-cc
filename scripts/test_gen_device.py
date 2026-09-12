@@ -330,6 +330,104 @@ class GenDeviceTest(unittest.TestCase):
         self.assertIn("ram_banks = [[0x000C, 0x003F]]", text)
         self.assertIn("common_ram = [0x0040, 0x004F]", text)
 
+    def test_ini_common_without_rambank_classifies_common_ram(self):
+        # R6 (epic-cc#411): a stated shared window classifies common_ram
+        # (the landed 877A convention) even when the ini supplies no
+        # RAMBANK -- the EDC supplies the banks, the COMMON line the
+        # window, instead of falling through to the D-2 carve.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYNR6" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x200">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x20" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x20" edc:endaddr="0x80" edc:bank="0"/>
+      <edc:SFRDataSector edc:beginaddr="0x80" edc:endaddr="0xA0" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:beginaddr="0xA0" edc:endaddr="0xF0" edc:bank="1"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            ini = pathlib.Path(d) / "p14synr6.ini"
+            ini.write_text(
+                "[14SYNR6]\nARCH=PIC14\nROMSIZE=400\nCOMMON=70-7F\nSTACKDEPTH=0x8\n"
+            )
+            cfg = pathlib.Path(d) / "p14synr6.cfgdata"
+            cfg.write_text(
+                "CWORD:FFF:1F:FFF:CONFIG\nCSETTING:4:WDTE\nCVALUE:4:ON\nCVALUE:0:OFF\n"
+            )
+            src = pathlib.Path(d) / "PIC14SYNR6.PIC"
+            src.write_text(xml)
+            text = gen_device.generate_toml(
+                "p14synr6", ini, cfg, src, pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertIn('core = "pic14"', text)
+        self.assertIn("ram_banks = [[0x0020, 0x006F], [0x00A0, 0x00EF]]", text)
+        self.assertIn("common_ram = [0x0070, 0x007F]", text)
+        self.assertNotIn("isr_w_shadow", text)
+
+    def test_ini_rambank_without_common_keeps_the_d2_carve(self):
+        # R6 keep clause: the 873's actual input shape (RAMBANK spans, no
+        # COMMON line) still classifies D-2, not common_ram.
+        with tempfile.TemporaryDirectory() as d:
+            ini = pathlib.Path(d) / "p14synr6b.ini"
+            ini.write_text(
+                "[14SYNR6B]\nARCH=PIC14\nROMSIZE=800\nRAMBANK=20-7F,A0-FF\nSTACKDEPTH=0x8\n"
+            )
+            cfg = pathlib.Path(d) / "p14synr6b.cfgdata"
+            cfg.write_text(
+                "CWORD:FFF:1F:FFF:CONFIG\nCSETTING:4:WDTE\nCVALUE:4:ON\nCVALUE:0:OFF\n"
+            )
+            text = gen_device.generate_toml(
+                "p14synr6b", ini, cfg, None, pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertIn("ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00FF]]", text)
+        self.assertIn("isr_w_shadow = 0x0020", text)
+        self.assertIn("isr_home_window = [0x0070, 0x007F]", text)
+        self.assertNotIn("common_ram", text)
+
+    def test_ini_common_touching_no_bank_fails_loudly(self):
+        # R6 extents guard: a stated window over undeclared RAM is not a
+        # fact the generator may use -- refuse instead of fabricating it.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYNR6C" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x200">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x20" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x20" edc:endaddr="0x70" edc:bank="0"/>
+      <edc:SFRDataSector edc:beginaddr="0x80" edc:endaddr="0xA0" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:beginaddr="0xA0" edc:endaddr="0xF0" edc:bank="1"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            ini = pathlib.Path(d) / "p14synr6c.ini"
+            ini.write_text(
+                "[14SYNR6C]\nARCH=PIC14\nROMSIZE=400\nCOMMON=70-7F\nSTACKDEPTH=0x8\n"
+            )
+            cfg = pathlib.Path(d) / "p14synr6c.cfgdata"
+            cfg.write_text(
+                "CWORD:FFF:1F:FFF:CONFIG\nCSETTING:4:WDTE\nCVALUE:4:ON\nCVALUE:0:OFF\n"
+            )
+            src = pathlib.Path(d) / "PIC14SYNR6C.PIC"
+            src.write_text(xml)
+            with self.assertRaises(gen_device.MissingFacts) as ctx:
+                gen_device.generate_toml(
+                    "p14synr6c", ini, cfg, src, pack="Microchip.PIC16Fxxx_DFP"
+                )
+        self.assertIn("common_ram", str(ctx.exception.args[0]))
+
     def test_fails_loudly_when_the_source_omits_a_field(self):
         stripped = "\n".join(
             line
