@@ -172,6 +172,13 @@ fn load_markers(name: &str) -> (Vec<Divergence>, Vec<String>) {
 /// image leaves uncovered must sit inside that bank page's SFR prefix
 /// (0x20 wide on every PIC14, the SFRDataSector shape), never in GPR.
 fn alias_redundant(dev: &Device, ours_total: &[(u16, u16)], t: (u16, u16)) -> bool {
+    if matches!(dev.core, Core::PicBaseline) {
+        // Baseline has no GPR alias banks: only the architectural SFR
+        // window (0x00-0x06, mirrored per 0x20 bank page, DS41236E
+        // Figure 4-4) is excusable. Anything else unclaimed is real.
+        let page = (t.0 / 0x20) * 0x20;
+        return contains((page, page + 6), t);
+    }
     let mut homes: Vec<u16> = dev.ram_banks.iter().map(|(lo, _)| lo >> 7).collect();
     homes.sort_unstable();
     homes.dedup();
@@ -635,6 +642,34 @@ fn malformed_marker_fails_loudly() {
     );
     assert!(problems.is_empty() && markers.len() == 1);
 }
+
+/// R3 scoping (review): the 0x00-0x1F SFR-prefix excuse is PIC14
+/// geometry. The same span pair passes on pic14 but fails on baseline,
+/// where 0x07-0x0F is real GPR behind a 0x00-0x06 SFR window.
+#[test]
+fn alias_sfr_geometry_is_pic14_only() {
+    let lkr = LkrRam {
+        banks: vec![(0x00, 0x1F)],
+        shared: vec![],
+        access: vec![],
+    };
+    let pic14 = device::Device {
+        ram_banks: &[(0x10, 0x1F)],
+        common_ram: None,
+        ..device::PIC16F887
+    };
+    assert!(compare_pic14_with(&pic14, &lkr, &[]).is_empty());
+    let baseline = device::Device {
+        core: Core::PicBaseline,
+        ram_banks: &[(0x10, 0x1F)],
+        common_ram: None,
+        ..device::PIC16F887
+    };
+    assert!(compare_pic14_with(&baseline, &lkr, &[])
+        .iter()
+        .any(|p| p.contains("no claimed alias")));
+}
+
 fn gpasm() -> String {
     std::env::var("PIC8_GPASM").unwrap_or_else(|_| "gpasm".into())
 }
