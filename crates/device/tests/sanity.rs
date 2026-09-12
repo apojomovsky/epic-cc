@@ -57,11 +57,47 @@ fn probe_reason_none_when_placeable() {
 }
 
 #[test]
+fn probe_reason_silent_when_clips_did_not_cause_it() {
+    // Fifteen-byte windows: unplaceable with or without the clips,
+    // so alloc's own error stands.
+    let small: &[(u16, u16)] = &[(0x21, 0x2F), (0xA1, 0xAF)];
+    assert!(probe_unplaceable_reason(&probe_device(small, true), 80).is_none());
+}
+
+#[test]
 fn alloc_empty_prog_does_not_panic() {
     for dev in devices_under_test() {
         let m = ir::parse("fn main(void) ()\n  block entry:\n    ret void\n");
         let _ = alloc::allocate(dev, &m, "depth 1\n");
     }
+}
+
+/// Causation backstop for the probe check (epic-cc#411 P3): the clips
+/// caused an unplaceable probe only if restoring every reserved span as
+/// ordinary RAM makes it placeable. A map unplaceable either way fails
+/// in alloc with its own error, not with a clip-blaming message.
+fn clips_caused_it(dev: &device::Device, size: u16) -> bool {
+    let align = u32::from(size.min(2));
+    let mut whole = dev.ram_banks.to_vec();
+    whole.extend(dev.common_ram);
+    whole.extend(dev.isr_home_window);
+    if let Some(w) = dev.isr_w_shadow {
+        whole.push((w, w));
+        for (lo, _) in dev.ram_banks {
+            let s = (lo & !0x7F) | (w & 0x7F);
+            whole.push((s, s));
+        }
+    }
+    let whole = device::gputils::coalesce(&whole);
+    whole.iter().any(|&(lo, hi)| {
+        let lo = u32::from(lo);
+        let base = if lo % align == 0 {
+            lo
+        } else {
+            lo + (align - (lo % align))
+        };
+        base + u32::from(size) - 1 <= u32::from(hi)
+    })
 }
 
 /// R5 (epic-cc#411): when reserved-span clips fragment the map below the
@@ -93,7 +129,7 @@ fn probe_unplaceable_reason(dev: &device::Device, size: u16) -> Option<String> {
     if let Some(w) = dev.isr_w_shadow {
         clips.push(format!("isr_w_shadow {w:#06X}"));
     }
-    if clips.is_empty() {
+    if clips.is_empty() || !clips_caused_it(dev, size) {
         return None;
     }
     Some(format!(
@@ -171,8 +207,8 @@ fn asm_flash_bound_accepts_tiny_program() {
 
 #[test]
 fn probe_reason_names_clip_when_unplaceable() {
-    let small: &[(u16, u16)] = &[(0x21, 0x2F), (0xA1, 0xAF)];
-    let r = probe_unplaceable_reason(&probe_device(small, true), 80).expect("x");
+    // Fits the unclipped map but no clipped window: names the clip.
+    let one: &[(u16, u16)] = &[(0x21, 0x6F)];
+    let r = probe_unplaceable_reason(&probe_device(one, true), 80).expect("x");
     assert!(r.contains("isr_home_window"), "{r}");
-    assert!(r.contains("isr_w_shadow"), "{r}");
 }
