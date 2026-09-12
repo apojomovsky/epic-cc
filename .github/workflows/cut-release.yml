@@ -1,13 +1,10 @@
 name: cut-release
 
 # Manual trigger: computes the next semver from Conventional Commits
-# (git-cliff), regenerates CHANGELOG.md, commits it straight to master
-# (no branch protection here, see AGENTS.md), and pushes the vX.Y.Z tag.
-# That tag push is what triggers release.yml's build + gh release step;
-# this workflow does nothing else, on purpose. Checkout is pinned to
-# master regardless of which branch workflow_dispatch is launched from,
-# so a run kicked off from a stale branch can't fast-forward master to
-# unreviewed history.
+# (git-cliff) and regenerates CHANGELOG.md. master's ruleset requires a PR
+# with required checks green (a direct push was tried and rejected with
+# GH013), so this opens a release PR, auto-merges it, then tags the
+# result; that tag push is what triggers release.yml's build/publish.
 
 on:
   workflow_dispatch:
@@ -20,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   cut-release:
@@ -74,14 +72,53 @@ jobs:
           # rejects it as trailing whitespace.
           sed -i -e '${/^$/d}' CHANGELOG.md
 
-      - name: Commit and tag
+      - name: Open the release PR and enable auto-merge
+        id: pr
         env:
           VERSION: ${{ steps.version.outputs.version }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          branch="chore/release-${VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
           git add CHANGELOG.md
           git commit -m "chore(release): $VERSION"
-          git tag -a "$VERSION" -m "$VERSION"
-          git push origin HEAD:master
+          git push origin "$branch"
+          url="$(gh pr create --base master --head "$branch" \
+            --title "chore(release): $VERSION" \
+            --body "Automated release PR (cut-release.yml). Merging tags the resulting commit as $VERSION.")"
+          number="${url##*/}"
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          gh pr merge "$number" --auto --squash
+
+      - name: Wait for the release PR to merge
+        id: merged
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          number="${{ steps.pr.outputs.number }}"
+          for _ in $(seq 1 90); do
+            state="$(gh pr view "$number" --json state --jq .state)"
+            if [ "$state" = "MERGED" ]; then
+              sha="$(gh pr view "$number" --json mergeCommit --jq .mergeCommit.oid)"
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$state" = "CLOSED" ]; then
+              echo "::error::release PR #$number was closed without merging"
+              exit 1
+            fi
+            sleep 20
+          done
+          echo "::error::release PR #$number did not merge within 30 minutes"
+          exit 1
+
+      - name: Tag the merged release commit
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA: ${{ steps.merged.outputs.sha }}
+        run: |
+          git fetch origin "$SHA"
+          git tag -a "$VERSION" "$SHA" -m "$VERSION"
           git push origin "$VERSION"
