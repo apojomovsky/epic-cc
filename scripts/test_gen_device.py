@@ -180,6 +180,43 @@ class GenDeviceTest(unittest.TestCase):
         self.assertIn("isr_home_window = [0x0060, 0x006F]", text)
         self.assertNotIn("common_ram", text)
 
+    def test_d2_bank_tops_exclude_the_home_window_mirror(self):
+        # P1 (epic-cc#406 review): a page-top home window mirrors into
+        # every bank above (F0-FF here), and those cells are the same
+        # silicon as the reserved window, never claimable RAM. The
+        # banked region above is truncated at the mirror; the mid-page
+        # window shape in the test above keeps its old extents.
+        xml = """<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN08" edc:arch="16xxxx">
+  <edc:ArchDef edc:name="16xxxx">
+    <edc:MemTraits edc:hwstackdepth="0x8"/>
+  </edc:ArchDef>
+  <edc:ProgramSpace>
+    <edc:CodeSector edc:beginaddr="0x0" edc:endaddr="0x400"/>
+    <edc:ConfigFuseSector edc:beginaddr="0x2007" edc:endaddr="0x2008"/>
+  </edc:ProgramSpace>
+  <edc:DataSpace edc:endaddr="0x200">
+    <edc:RegardlessOfMode>
+      <edc:SFRDataSector edc:beginaddr="0x0" edc:endaddr="0x20" edc:bank="0"/>
+      <edc:GPRDataSector edc:regionid="gpr0" edc:beginaddr="0x20" edc:endaddr="0x80" edc:bank="0"/>
+      <edc:SFRDataSector edc:beginaddr="0x80" edc:endaddr="0xA0" edc:bank="1"/>
+      <edc:GPRDataSector edc:regionid="gpr1" edc:beginaddr="0xA0" edc:endaddr="0x100" edc:bank="1"/>
+      <edc:SFRDataSector edc:beginaddr="0x100" edc:endaddr="0x120" edc:bank="2"/>
+      <edc:GPRDataSector edc:regionid="gpr2" edc:shadowidref="gpr0" edc:beginaddr="0x120" edc:endaddr="0x180" edc:bank="2"/>
+    </edc:RegardlessOfMode>
+  </edc:DataSpace>
+</edc:PIC>"""
+        with tempfile.TemporaryDirectory() as d:
+            src = pathlib.Path(d) / "mirror_clip.atdf"
+            src.write_text(xml)
+            r, text = run_generator(
+                src, name="p14syn08", pack="Microchip.PIC16Fxxx_DFP"
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00EF]]", text)
+        self.assertIn("isr_w_shadow = 0x0020", text)
+        self.assertIn("isr_home_window = [0x0070, 0x007F]", text)
+        self.assertNotIn("common_ram", text)
+
     def test_misaligned_multi_region_isr_w_shadow_fails_loudly(self):
         # docs/39 D-2 only knows how to carve isr_w_shadow when every real
         # region shares the same low 7 bits at its own start address
@@ -373,7 +410,9 @@ class GenDeviceTest(unittest.TestCase):
 
     def test_ini_rambank_without_common_keeps_the_d2_carve(self):
         # R6 keep clause: the 873's actual input shape (RAMBANK spans, no
-        # COMMON line) still classifies D-2, not common_ram.
+        # COMMON line) still classifies D-2, not common_ram. The page-top
+        # home window's mirror is clipped from the upper bank (P1 review:
+        # F0-FF mirrors the reserved window, never claimable RAM).
         with tempfile.TemporaryDirectory() as d:
             ini = pathlib.Path(d) / "p14synr6b.ini"
             ini.write_text(
@@ -386,7 +425,7 @@ class GenDeviceTest(unittest.TestCase):
             text = gen_device.generate_toml(
                 "p14synr6b", ini, cfg, None, pack="Microchip.PIC16Fxxx_DFP"
             )
-        self.assertIn("ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00FF]]", text)
+        self.assertIn("ram_banks = [[0x0021, 0x006F], [0x00A1, 0x00EF]]", text)
         self.assertIn("isr_w_shadow = 0x0020", text)
         self.assertIn("isr_home_window = [0x0070, 0x007F]", text)
         self.assertNotIn("common_ram", text)

@@ -887,8 +887,24 @@ def generate_toml(
         isr_w_shadow = candidate_shadow
         isr_home_window = (home_hi - COMMON_RAM_CARVE_SIZE + 1, home_hi)
         new_banks = [(home_lo + 1, home_hi - COMMON_RAM_CARVE_SIZE)]
+        # The home window mirrors into every bank above the home bank
+        # (page offsets 0x70-0x7F land on F0-FF, 170-17F, 1F0-1FF),
+        # and a mirrored cell is the same silicon as the reserved
+        # window, never claimable RAM (the 877A convention for common
+        # mirrors). Clip it wherever a higher bank's region covers it.
+        # Only a page-top window has mirrors; anything else keeps the
+        # old shape.
+        mirror_window = home_hi & 0x7F == 0x7F
+        home_bank = home_lo >> 7
+        wlo = isr_home_window[0]
         for lo, hi in ram_banks[1:]:
-            new_banks.append((lo + 1, hi))
+            lo, hi = lo + 1, hi
+            bank = lo >> 7
+            if mirror_window and bank > home_bank:
+                mlo = wlo + (bank - home_bank) * 0x80
+                if hi >= mlo:
+                    hi = mlo - 1
+            new_banks.append((lo, hi))
         ram_banks = new_banks
     stack_s = scalar("STACKDEPTH")
     stack_depth = pick(
