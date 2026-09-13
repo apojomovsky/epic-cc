@@ -261,9 +261,22 @@ def correct_ram(toml_path, lkr_path):
         fixed_retval = data.get("fixed_retval")
         if not fixed_retval:
             return False
-        lo = fixed_retval[1] + 1
-        hi = max([b[1] for b in banks] + [a[1] for a in access] + [lo])
-        new_ram = [[lo, hi]]
+        left = fixed_retval[1] + 1
+        # The .lkr's own bank extents win, gaps included: PIC18F2450's
+        # banks skip 0x200-0x3FF entirely (unimplemented, not mirrored),
+        # and a single lo..hi collapse would claim that hole as RAM.
+        # Adjacent spans still merge, so contiguous maps keep the
+        # one-span shape they always had.
+        spans = []
+        if access:
+            spans.append([left, max(a[1] for a in access)])
+        spans += [[lo, hi] for lo, hi in banks]
+        new_ram = []
+        for lo, hi in sorted(spans):
+            if new_ram and lo <= new_ram[-1][1] + 1:
+                new_ram[-1][1] = max(new_ram[-1][1], hi)
+            else:
+                new_ram.append([lo, hi])
     else:
         new_ram = [[lo, hi] for lo, hi in banks]
         # docs/39 D-1 and D-2: carve-outs survive the widening. gputils'

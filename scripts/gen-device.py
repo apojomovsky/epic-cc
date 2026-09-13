@@ -177,6 +177,124 @@ PART_VALUE_ALIASES = {
         "wdtps": {str(2**i): f"div{2**i}" for i in range(16)},
         "ccp2mx": {"off": "rb3", "on": "rc1"},
     },
+    "p18f2450": {
+        # Same USB-family spellings as the 2550 (xt_xt, hspll_hs,
+        # intosc_ec, ...); cpudiv/plldiv feed the PLL arithmetic in
+        # fosc.rs, so their raw DFP names must normalize too.
+        "osc": {
+            "hspll_hs": "hspll",
+            "intosc_hs": "inths",
+            "intosc_xt": "intxt",
+            "intosc_ec": "intcko",
+            "intoscio_ec": "intio",
+            "ecpll_ec": "ecpll",
+            "ecpllio_ec": "ecpio",
+            "ec_ec": "ec",
+            "ecio_ec": "ecio",
+            "xtpll_xt": "xtpll",
+            "xt_xt": "xt",
+        },
+        "cpudiv": {
+            "osc1_pll2": "div1",
+            "osc2_pll3": "div2",
+            "osc3_pll4": "div3",
+            "osc4_pll6": "div4",
+        },
+        "plldiv": {
+            "1": "noprescale",
+            "2": "div2",
+            "3": "div3",
+            "4": "div4",
+            "5": "div5",
+            "6": "div6",
+            "10": "div10",
+            "12": "div12",
+        },
+    },
+    # 2455/4455 share the 2550's datasheet and pack spellings (DS39632E),
+    # so they need the identical value normalization the landed 2550 got.
+    "p18f2455": {
+        "osc": {
+            "hspll_hs": "hspll",
+            "intosc_hs": "inths",
+            "intosc_xt": "intxt",
+            "intosc_ec": "intcko",
+            "intoscio_ec": "intio",
+            "ecpll_ec": "ecpll",
+            "ecpllio_ec": "ecpio",
+            "ec_ec": "ec",
+            "ecio_ec": "ecio",
+            "xtpll_xt": "xtpll",
+            "xt_xt": "xt",
+        },
+        "cpudiv": {
+            "osc1_pll2": "div1",
+            "osc2_pll3": "div2",
+            "osc3_pll4": "div3",
+            "osc4_pll6": "div4",
+        },
+        "plldiv": {
+            "1": "noprescale",
+            "2": "div2",
+            "3": "div3",
+            "4": "div4",
+            "5": "div5",
+            "6": "div6",
+            "10": "div10",
+            "12": "div12",
+        },
+        "usbdiv": {"1": "off", "2": "on"},
+        "boren": {
+            "off": "off",
+            "soft": "sw",
+            "on_active": "hw_off_in_sleep",
+            "on": "hw_always",
+        },
+        "borv": {"0": "maximum", "1": "mid", "2": "low", "3": "minimum"},
+        "wdtps": {str(2**i): f"div{2**i}" for i in range(16)},
+        "ccp2mx": {"off": "rb3", "on": "rc1"},
+    },
+    "p18f4455": {
+        "osc": {
+            "hspll_hs": "hspll",
+            "intosc_hs": "inths",
+            "intosc_xt": "intxt",
+            "intosc_ec": "intcko",
+            "intoscio_ec": "intio",
+            "ecpll_ec": "ecpll",
+            "ecpllio_ec": "ecpio",
+            "ec_ec": "ec",
+            "ecio_ec": "ecio",
+            "xtpll_xt": "xtpll",
+            "xt_xt": "xt",
+        },
+        "cpudiv": {
+            "osc1_pll2": "div1",
+            "osc2_pll3": "div2",
+            "osc3_pll4": "div3",
+            "osc4_pll6": "div4",
+        },
+        "plldiv": {
+            "1": "noprescale",
+            "2": "div2",
+            "3": "div3",
+            "4": "div4",
+            "5": "div5",
+            "6": "div6",
+            "10": "div10",
+            "12": "div12",
+        },
+        "usbdiv": {"1": "off", "2": "on"},
+        "boren": {
+            "off": "off",
+            "soft": "sw",
+            "on_active": "hw_off_in_sleep",
+            "on": "hw_always",
+        },
+        "borv": {"0": "maximum", "1": "mid", "2": "low", "3": "minimum"},
+        "wdtps": {str(2**i): f"div{2**i}" for i in range(16)},
+        "ccp2mx": {"off": "rb3", "on": "rc1"},
+    },
     "p18f1320": {
         # The EDC splits the internal block by OSC2 use: INTIO1 is CLKO on
         # RA6, INTIO2 is the port pin, the same split the shipped vocab
@@ -202,6 +320,69 @@ PART_VALUE_ALIASES = {
         "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
     },
     "p18f8621": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f1220": {
+        # Same INTIO1/INTIO2 CLKO-vs-port split as the landed 1320.
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2220": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2320": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2321": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f4220": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f4320": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2331": {
+        # IRC is the CLKO-on-RA6 variant, IRCIO the port-pin one (EDC descs).
+        "osc": {"irc": "intcko", "ircio": "intio"},
+    },
+    "p18f4331": {
+        "osc": {"irc": "intcko", "ircio": "intio"},
+    },
+    "p18f4431": {
+        "osc": {"irc": "intcko", "ircio": "intio"},
+    },
+    "p18f2580": {
+        # Same internal-osc modes as the landed 2520's INTIO7/INTIO67,
+        # spelled with the family's IRC prefix (EDC descs byte-identical).
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f2680": {
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f4580": {
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f2585": {
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f6525": {
+        # Hardware 4x PLL -> ecpio; SW-PLL (runtime OSCTUNE enable)
+        # refuses like intoscpll, one refusal-arm spelling each.
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f6621": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f8525": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f6585": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f8585": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f8680": {
         "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
     },
 }
@@ -810,7 +991,10 @@ def generate_toml(
         common_ram = parse_common(common) if common else None
     elif "ram_banks" in edc:
         ram_banks = edc["ram_banks"]
-        if common:
+        if common and core != "pic18":
+            # R6's window rule is a PIC14-family fact: on PIC18 the ini's
+            # COMMON names the access bank, not a shared GPR window, and
+            # common_ram never applies to that core.
             common_ram = parse_common(common)
             if not any(
                 lo <= common_ram[1] and hi >= common_ram[0] for lo, hi in ram_banks
