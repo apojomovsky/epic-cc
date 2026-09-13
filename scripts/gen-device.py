@@ -362,6 +362,9 @@ PART_VALUE_ALIASES = {
     "p18f4580": {
         "osc": {"ircio7": "intio7", "ircio67": "intio67"},
     },
+    "p18f2585": {
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
     "p18f6525": {
         # Hardware 4x PLL -> ecpio; SW-PLL (runtime OSCTUNE enable)
         # refuses like intoscpll, one refusal-arm spelling each.
