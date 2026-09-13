@@ -288,6 +288,66 @@ PART_VALUE_ALIASES = {
     "p18f8621": {
         "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
     },
+    "p18f1220": {
+        # Same INTIO1/INTIO2 CLKO-vs-port split as the landed 1320.
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2220": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2320": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2321": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f4220": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f4320": {
+        "osc": {"intio1": "intcko", "intio2": "intio"},
+    },
+    "p18f2331": {
+        # IRC is the CLKO-on-RA6 variant, IRCIO the port-pin one (EDC descs).
+        "osc": {"irc": "intcko", "ircio": "intio"},
+    },
+    "p18f4331": {
+        "osc": {"irc": "intcko", "ircio": "intio"},
+    },
+    "p18f4431": {
+        "osc": {"irc": "intcko", "ircio": "intio"},
+    },
+    "p18f2580": {
+        # Same internal-osc modes as the landed 2520's INTIO7/INTIO67,
+        # spelled with the family's IRC prefix (EDC descs byte-identical).
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f2680": {
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f4580": {
+        "osc": {"ircio7": "intio7", "ircio67": "intio67"},
+    },
+    "p18f6525": {
+        # Hardware 4x PLL -> ecpio; SW-PLL (runtime OSCTUNE enable)
+        # refuses like intoscpll, one refusal-arm spelling each.
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f6621": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f8525": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f6585": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f8585": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
+    "p18f8680": {
+        "osc": {"eciopll": "ecpio", "ecioswpll": "intoscpll", "hsswpll": "intoscpllo"},
+    },
 }
 
 
