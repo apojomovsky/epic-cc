@@ -177,6 +177,40 @@ PART_VALUE_ALIASES = {
         "wdtps": {str(2**i): f"div{2**i}" for i in range(16)},
         "ccp2mx": {"off": "rb3", "on": "rc1"},
     },
+    "p18f2450": {
+        # Same USB-family spellings as the 2550 (xt_xt, hspll_hs,
+        # intosc_ec, ...); cpudiv/plldiv feed the PLL arithmetic in
+        # fosc.rs, so their raw DFP names must normalize too.
+        "osc": {
+            "hspll_hs": "hspll",
+            "intosc_hs": "inths",
+            "intosc_xt": "intxt",
+            "intosc_ec": "intcko",
+            "intoscio_ec": "intio",
+            "ecpll_ec": "ecpll",
+            "ecpllio_ec": "ecpio",
+            "ec_ec": "ec",
+            "ecio_ec": "ecio",
+            "xtpll_xt": "xtpll",
+            "xt_xt": "xt",
+        },
+        "cpudiv": {
+            "osc1_pll2": "div1",
+            "osc2_pll3": "div2",
+            "osc3_pll4": "div3",
+            "osc4_pll6": "div4",
+        },
+        "plldiv": {
+            "1": "noprescale",
+            "2": "div2",
+            "3": "div3",
+            "4": "div4",
+            "5": "div5",
+            "6": "div6",
+            "10": "div10",
+            "12": "div12",
+        },
+    },
     # 2455/4455 share the 2550's datasheet and pack spellings (DS39632E),
     # so they need the identical value normalization the landed 2550 got.
     "p18f2455": {
