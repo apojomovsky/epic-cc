@@ -1,6 +1,9 @@
 name = "p18f4455"
 core = "pic18"
 flash_words = 12288
+# Widened from the EDC's own gpr0-gpr3 (0x60-0x3FF): 18f4455_g.lkr
+# declares gpr0-gpr7 through 0x7FF, and gputils wins where the DFP
+# understates RAM (the p18f2550 defect, docs/32 §3).
 ram_banks = [[0x0010, 0x07FF]]
 access_bank = [0x0000, 0x005F]
 fixed_retval = [0x0000, 0x000F]
