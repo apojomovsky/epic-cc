@@ -810,7 +810,10 @@ def generate_toml(
         common_ram = parse_common(common) if common else None
     elif "ram_banks" in edc:
         ram_banks = edc["ram_banks"]
-        if common:
+        if common and core != "pic18":
+            # R6's window rule is a PIC14-family fact: on PIC18 the ini's
+            # COMMON names the access bank, not a shared GPR window, and
+            # common_ram never applies to that core.
             common_ram = parse_common(common)
             if not any(
                 lo <= common_ram[1] and hi >= common_ram[0] for lo, hi in ram_banks
