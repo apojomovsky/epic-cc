@@ -139,6 +139,19 @@ fn probe_unplaceable_reason(dev: &device::Device, size: u16) -> Option<String> {
     ))
 }
 
+/// epic-cc#420: the 74's bank1 keeps its full A1-FF extent (real
+/// region-B silicon, not the home-window mirror), so a bank1-filling
+/// global legitimately covers 0xF0-0xFF. Fails if anyone truncates it.
+#[test]
+fn p16f74_bank1_filling_global_covers_the_mirror_range() {
+    let dev = by_name("p16f74").expect("p16f74 ships");
+    let mut m = ir::parse("global big i8\nfn main(void) ()\n  block entry:\n    ret void\n");
+    m.globals[0].size = 94;
+    let layout = alloc::allocate(dev, &m, "depth 1\n");
+    let addr = *layout.globals.get("big").expect("big global missing");
+    assert_eq!((addr, addr + 94 - 1), (0xA2, 0xFF));
+}
+
 #[test]
 fn eighty_byte_global_lands_in_ram_banks() {
     for dev in devices_under_test() {
