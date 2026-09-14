@@ -44,6 +44,33 @@ fn compile(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>) {
 
 /// Like `compile`, but also returns the emitted `.asm` text so a test can
 /// inspect the D-2 reassertion instructions.
+
+/// Like `compile_asm`, but for an explicit device: the pipeline is fully
+/// device-parametric except the clang front end, so upper-bank parts
+/// reuse the same stages with their own map and page fit.
+fn compile_asm_for(
+    device: &'static device::Device,
+    c_path: &str,
+) -> (PicBaseline<'static>, HashMap<String, u16>, String) {
+    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
+    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
+    let (ll, _dep) = clang_compile(&clang, &resdir, c_path);
+    let mut m = irparse::parse_ll(&ll);
+    m = wholeprog::merge(m);
+    m = legalize::legalize(m);
+    let cg = callgraph::build(&m);
+    callgraph::check_depth(&cg, device.stack_depth as usize);
+    let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
+    let mut addrs: HashMap<String, u16> = HashMap::new();
+    addrs.extend(layout.globals.clone());
+    addrs.extend(layout.locals.clone());
+    let asm = select(device, &m, &addrs);
+    check_const_stack(&cg, &asm);
+    isel_pic_baseline::verify_page_fit(&m, &asm, &addrs);
+    let words = assemble_words(device, &asm);
+    (PicBaseline::with_device(device, words), layout.globals, asm)
+}
+
 fn compile_asm(c_path: &str) -> (PicBaseline<'_>, HashMap<String, u16>, String) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
@@ -797,6 +824,27 @@ fn cmp_i8_const_lhs_c_runs_correctly() {
         p.ram()[globals["out"] as usize],
         1,
         "200 > 88 takes the then arm"
+    );
+    assert!(p.halted());
+}
+
+/// epic-cc#429: a program whose globals spill into bank 2 on a 2-bit
+/// part (p16f505: e lands at 0x50). Direct accesses there need FSR,6
+/// selection and INDF touches need the full flat FSR; both fail on the
+/// 1-bit backend (no select emitted, sim wraps to bank 0).
+#[test]
+fn banked2_c_selects_upper_banks_and_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, globals, asm) = compile_asm_for(&device::PIC16F505, "tests/fixtures/banked2.c");
+    assert!(
+        asm.contains("BSF FSR, 6"),
+        "banked2.c must emit BSF FSR, 6 for a bank-2 direct access:\n{asm}"
+    );
+    p.run(10_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        15,
+        "out = 1+2+3+4+5 (e lives in bank 2)"
     );
     assert!(p.halted());
 }
