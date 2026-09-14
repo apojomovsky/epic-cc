@@ -92,6 +92,7 @@ jobs:
           Copy-Item "$src\bin\opt.exe" "$bundle\clang\bin\"
           Copy-Item -Recurse "$src\lib\clang" "$bundle\clang\lib\clang"
           Copy-Item "target\release\epic-cc.exe" "$bundle\"
+          python scripts\gen_devices_manifest.py "$bundle\devices.json"
           # The MSVC archive does not ship LICENSE.TXT; fetch the pinned
           # source license, same file and checksum the Linux bundle uses.
           curl.exe -fsSL -o "$bundle\LICENSE.clang.txt" "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-20.1.8/llvm/LICENSE.TXT"

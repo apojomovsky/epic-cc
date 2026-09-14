@@ -246,6 +246,8 @@ WORKDIR /workspace
 # driver finds it.
 RUN cargo build --release -p driver -p epic-cc-gdbserver \
     && mkdir -p "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin" \
+    && python3 scripts/gen_devices_manifest.py \
+        "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/devices.json" \
     && cp target/release/epic-cc "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && cp target/release/epic-cc-gdbserver "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && cp /opt/clang/bin/clang "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
