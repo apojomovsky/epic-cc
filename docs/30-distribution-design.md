@@ -94,6 +94,7 @@ Caching strategy, in order of stickiness:
 ```
 epic-cc-<ver>-x86_64-linux/          epic-cc-<ver>-x86_64-windows/
 ├── epic-cc                        ├── epic-cc.exe
+├── devices.json                   ├── devices.json
 ├── clang/                         ├── clang/
 │   ├── bin/clang                  │   ├── bin/clang.exe
 │   ├── bin/llvm-link              │   ├── bin/llvm-link.exe
@@ -104,6 +105,14 @@ epic-cc-<ver>-x86_64-linux/          epic-cc-<ver>-x86_64-windows/
 
 License note: LLVM is Apache-2.0-with-LLVM-exception, explicitly redistributable; the
 bundle ships its LICENSE alongside, as every clang vendor does.
+
+`devices.json` (epic-cc#416) is `crates/device/devices/*.toml` flattened by
+`scripts/gen_devices_manifest.py`, a JSON array of `{name, core, pack}`
+objects (`pack` is `null` for a device with no `[provenance]` section at
+all, the three originals that predate the stanza, or a `tier =
+"datasheet"` entry with no pack, hand-transcribed straight from the
+datasheet instead): the device list as data for a consumer that cannot
+link the `device` crate, like epic-platformio's board generator (PIO-6).
 
 ## Driver rework (the only pipeline code change)
 
