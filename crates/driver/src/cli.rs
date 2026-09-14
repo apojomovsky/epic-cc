@@ -47,6 +47,9 @@ usage: epic-cc [options] <input.c>...
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
   --version, -V        print the compiler identity (e.g. epic-cc 0.0.0-master-<sha>)
+  --resolve-device     resolve the next argument to a canonical device name
+                       and print it, no input files needed (same resolution
+                       --target uses, e.g. 16F877A and PIC16F877A -> p16f877a)
 ";
 /// Parse an argument list that does NOT include `argv[0]`.
 pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
