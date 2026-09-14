@@ -24,10 +24,33 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
+/// Resolve `name` via `device::resolve()` or print the same "unknown
+/// device" diagnostic and exit 1, whichever call site is asking: the
+/// normal compile path and `--resolve-device` (main.rs) both need it.
+fn resolve_or_exit(name: &str) -> &'static device::Device {
+    device::resolve(name).unwrap_or_else(|| {
+        let available = device::ALL
+            .iter()
+            .map(|d| d.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!("epic-cc: unknown device {name} (available: {available})");
+        std::process::exit(1);
+    })
+}
+
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|a| a == "--version" || a == "-V") {
         println!("epic-cc {}", env!("EPIC_CC_STAMP"));
+        return;
+    }
+    if let Some(pos) = argv.iter().position(|a| a == "--resolve-device") {
+        let name = argv.get(pos + 1).unwrap_or_else(|| {
+            eprintln!("epic-cc: --resolve-device needs a value");
+            std::process::exit(2);
+        });
+        println!("{}", resolve_or_exit(name).name);
         return;
     }
     let has_device_flag = argv
@@ -56,18 +79,7 @@ fn main() {
         }
     }
 
-    let device = device::resolve(&cli.device).unwrap_or_else(|| {
-        let available = device::ALL
-            .iter()
-            .map(|d| d.name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "epic-cc: unknown device {} (available: {})",
-            cli.device, available
-        );
-        std::process::exit(1);
-    });
+    let device = resolve_or_exit(&cli.device);
 
     let exe_dir = std::env::current_exe()
         .ok()
