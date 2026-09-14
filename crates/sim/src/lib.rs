@@ -1432,8 +1432,9 @@ impl Pic14e {
 pub struct PicBaseline<'a> {
     device: &'a Device,
     prog: Vec<u16>,
-    /// The 509's full 6-bit data space (0x00-0x3F).
-    ram: [u8; 64],
+    /// Room for the whole 8-bit file (0x00-0xFF); landed 2-bit parts
+    /// address through 0x7F (epic-cc#429).
+    ram: [u8; 256],
     w: u8,
     /// 11-bit program counter; PC<9> comes from STATUS PA0, PC<8> is forced
     /// to 0 by every PCL-modifying instruction except GOTO (DS41236E
@@ -1462,7 +1463,7 @@ impl<'a> PicBaseline<'a> {
         PicBaseline {
             device,
             prog,
-            ram: [0; 64],
+            ram: [0; 256],
             w: 0,
             pc: 0,
             stack: [0; 2],
@@ -1471,10 +1472,10 @@ impl<'a> PicBaseline<'a> {
             option: 0,
         }
     }
-    pub fn ram(&self) -> &[u8; 64] {
+    pub fn ram(&self) -> &[u8; 256] {
         &self.ram
     }
-    pub fn ram_mut(&mut self) -> &mut [u8; 64] {
+    pub fn ram_mut(&mut self) -> &mut [u8; 256] {
         &mut self.ram
     }
     pub fn w(&self) -> u8 {
@@ -1536,9 +1537,13 @@ impl<'a> PicBaseline<'a> {
         }
     }
     /// The physical address `INDF` selects: the full flat `FSR` value
-    /// (bank bits and offset together, DS41236E Figure 4-7).
+    /// (bank bits and offset together, DS41236E Figure 4-7). The
+    /// addressable width is the 5-bit offset plus the device's bank
+    /// bits; unimplemented high bits never carry compiler-written
+    /// values (epic-cc#429: a fixed `& 0x3F` aliased banks 2+ onto
+    /// bank 0's row).
     fn indirect_addr(&self) -> usize {
-        (self.ram[0x04] & 0x3F) as usize
+        (u16::from(self.ram[0x04]) & ((1u16 << (5 + self.device.fsr_bank_bits)) - 1)) as usize
     }
     fn read_f(&self, f: usize) -> u8 {
         match f {

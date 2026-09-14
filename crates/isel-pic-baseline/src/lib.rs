@@ -119,6 +119,24 @@ struct Gen<'m> {
     locs: Vec<Option<SrcLoc>>,
 }
 
+/// D-2 bank-bit reassertion for one address, generalized to the device's
+/// bank-bit count: one `BCF`/`BSF` per `FSR` bank bit (`FSR<5>` upward),
+/// low bit first, set from the target bank's bits. Bank-independent
+/// addresses select nothing. The one-bit case emits exactly the
+/// historical single instruction; the `max(1)` keeps the legacy no-op
+/// select on bankless parts instead of changing their output.
+fn bank_select_lines(device: &Device, addr: u16) -> Vec<String> {
+    let Some(bank) = device.bank_of(addr) else {
+        return Vec::new();
+    };
+    (0..device.fsr_bank_bits.max(1))
+        .map(|bit| {
+            let set = (bank >> bit) & 1 == 1;
+            format!("    {} FSR, {}", if set { "BSF" } else { "BCF" }, 5 + bit)
+        })
+        .collect()
+}
+
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.w_holds = None;
@@ -187,17 +205,16 @@ impl<'m> Gen<'m> {
     }
 
     /// D-2's unconditional `FSR` bank-bit reassertion (docs/37 §2 D-2):
-    /// on baseline, `FSR<5>` is the bank select for both direct and
-    /// indirect addressing. A direct operand whose physical address is a
-    /// banked GPR needs `FSR<5>` set to its bank before the access; the
-    /// shared GPR (0x07-0x0F) and the SFR block (0x00-0x06) are
-    /// bank-independent and need no reassertion. Emitted unconditionally,
-    /// no dataflow tracking, exactly like classic PIC14's IRP reassertion.
+    /// on baseline, `FSR`'s high bits select the bank for both direct
+    /// and indirect addressing. A direct operand whose physical address
+    /// is a banked GPR needs those bits set to its bank before the
+    /// access; the shared GPR (0x07-0x0F) and the SFR block (0x00-0x06)
+    /// are bank-independent and need no reassertion. Emitted
+    /// unconditionally, no dataflow tracking, exactly like classic
+    /// PIC14's IRP reassertion.
     fn emit_bank_select(&mut self, addr: u16) {
-        match self.device.bank_of(addr) {
-            Some(0) => self.emit("    BCF FSR, 5".to_string()),
-            Some(1) => self.emit("    BSF FSR, 5".to_string()),
-            _ => {}
+        for line in bank_select_lines(self.device, addr) {
+            self.emit(line);
         }
     }
 
@@ -1266,11 +1283,17 @@ impl<'m> Gen<'m> {
     }
 
     /// `FSR = base + k + byte_off + Σ terms`: baseline's FSR is the full
-    /// 6-bit flat address (bank bits and offset together, D-2 item 2), so
+    /// flat address (bank bits and offset together, D-2 item 2), so
     /// one MOVLW/MOVWF loads it. No FSR0H/FSR0L split, no linear alias, no
     /// IRP.
     fn emit_fsr_to(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
-        let lit = (u16::from(base_addr) + u16::from(k) + u16::from(byte_off)) & 0x3F;
+        // The literal keeps the full flat address: mask to the 5-bit
+        // offset plus the device's bank bits, never narrower than the
+        // historical 6-bit window (a fixed `& 0x3F` truncated bank-2/3
+        // bases like 0x50 to bank-0 0x10, epic-cc#429).
+        let width = 5 + self.device.fsr_bank_bits.max(1);
+        let mask = (1u16 << width) - 1;
+        let lit = (u16::from(base_addr) + u16::from(k) + u16::from(byte_off)) & mask;
         match terms {
             [(1, r)] => {
                 let a = self.val_addr(&Val::Reg(r.clone())).direct();
@@ -1290,8 +1313,8 @@ impl<'m> Gen<'m> {
 
     /// Indirect (sret) FSR setup: `FSR = [slot] + k + byte_off + Σ terms`.
     /// The slot holds the target address (the caller stores LOW then HIGH
-    /// of it into the two slot bytes). Baseline's FSR is 6 bits, so only the
-    /// low byte of the stored address is used; the high byte is ignored.
+    /// of it into the two slot bytes). The address spans the offset plus
+    /// the device's bank bits; only the low byte of the stored address is used.
     fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
@@ -3451,11 +3474,7 @@ pub fn select_with_locs(
                     init.push(format!("    MOVLW 0x{b:02X}"));
                 }
                 let addr = base + i as u16;
-                match device.bank_of(addr) {
-                    Some(0) => init.push("    BCF FSR, 5".to_string()),
-                    Some(1) => init.push("    BSF FSR, 5".to_string()),
-                    _ => {}
-                }
+                init.extend(bank_select_lines(device, addr));
                 init.push(format!("    MOVWF 0x{:02X}", addr & 0x1F));
             }
         }

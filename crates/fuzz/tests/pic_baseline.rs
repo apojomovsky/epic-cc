@@ -6,7 +6,7 @@
 
 use alloc;
 use callgraph;
-use device::PIC12F509;
+use device::{PIC12F509, PIC16F505};
 use fuzz::{
     generate_baseline, generate_ir_baseline, generate_signed_baseline, run_differential,
     run_ir_differential, IrProgram,
@@ -26,6 +26,23 @@ fn pic_baseline_integer_fast_corpus_differential_clean() {
         }
     }
     assert_eq!(clean, 8, "all 8 integer seeds clean");
+}
+
+/// epic-cc#429: the same integer fast corpus on the second-shipped
+/// 2-bit part. The 509-fitted programs stay in banks 0-1, so this pins
+/// the `max(1)` preservation (identical small-program codegen); bank-2
+/// coverage comes from the deterministic e2e test, not the corpus.
+#[test]
+fn pic_baseline_505_integer_fast_corpus_differential_clean() {
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate_baseline(seed);
+        match run_differential(&prog, &PIC16F505) {
+            Ok(_) => clean += 1,
+            Err(e) => panic!("pic-baseline/505 integer seed {seed} not differential-clean: {e}"),
+        }
+    }
+    assert_eq!(clean, 8, "all 8 integer seeds clean on p16f505");
 }
 
 #[test]
