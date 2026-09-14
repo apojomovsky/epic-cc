@@ -152,16 +152,14 @@ New `release.yml`, tag-triggered:
 Existing CI (`.github/workflows/ci.yml`) continues to gate every commit with the full test
 suite, now running inside the `ci` image.
 
-### Rolling master bundles (ADR-023)
+### Rolling master bundles (ADR-023), retired
 
-`.github/workflows/rolling-release.yml` publishes the Linux bundle as a
-`ci-<sha>` prerelease on every push to master, so downstream CI (epic-hal#80)
-can pin a compiler by tag and run it without building clang. The binary
-identifies itself: the driver's `build.rs` stamps `EPIC_CC_VERSION` (the
-release stage's build ARG) into the build, and `epic-cc --version` prints
-`epic-cc 0.0.0-master-<sha>` (crate version when the ARG is unset). The gate runs
-the downloaded zip on a bare runner with no clang environment, which is
-exactly the consumer's shape. Windows stays tag-only until a consumer exists.
+The per-commit `ci-<sha>` prerelease mechanism (rolling-release.yml) was
+retired in epic-cc#435: its sole consumer, epic-hal's `epiccc-gate`, now
+pins the stable v0.3.0 release. Version stamping is unchanged: the
+driver's `build.rs` stamps `EPIC_CC_VERSION` (the release stage's build
+ARG) into the build and `epic-cc --version` prints it, a path tag
+releases share. Windows stays tag-only.
 
 ## Testing
 

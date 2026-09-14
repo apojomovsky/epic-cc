@@ -2,9 +2,9 @@ name: toolchain-cache
 
 # Warms ghcr.io/<repo>-toolchain's registry cache once per workflow run.
 # Without this, every job that builds the ci/release image against that
-# same cache ref (up to 5 across ci.yml, nightly.yml, rolling-release.yml,
-# release.yml) would race to rebuild and push it independently on a cold
-# cache, paying the ~2h LLVM build several times over instead of once.
+# same cache ref (across ci.yml, nightly.yml, release.yml) would race to
+# rebuild and push it independently on a cold cache, paying the ~2h LLVM
+# build several times over instead of once.
 # Callers add `needs: <job-name-that-calls-this>` ahead of their own
 # image-building jobs.
 
