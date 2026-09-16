@@ -1,8 +1,15 @@
+# PIC16F54: baseline core, one flat 25-byte GPR bank at 0x07-0x1F, no
+# banking (EDC edc:GPRDataSector bank=0x0, 0x07-0x20 exclusive; DS41213D
+# 1.0/4.0). isel-pic-baseline's fixed scratch/retval layout needs a
+# common_ram region of at least 7 bytes (select_with_locs' asserts), so
+# the flat span is split at that minimum, common_ram at the bottom like
+# the other pic-baseline devices (p12f509, p16f57), leaving 18 bytes
+# for locals.
 name = "p16f54"
 core = "pic-baseline"
 flash_words = 512
-ram_banks = [[0x0007, 0x000F]]
-common_ram = [0x0010, 0x001F]
+ram_banks = [[0x000E, 0x001F]]
+common_ram = [0x0007, 0x000D]
 fsr_bank_bits = 0
 stack_depth = 2
 interrupt_vectors = []
