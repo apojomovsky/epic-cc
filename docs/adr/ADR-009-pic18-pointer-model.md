@@ -44,6 +44,20 @@ PIC18 pointer/array/struct support (port P3) uses:
    **Superseded in part by ADR-018:** plain pointer params now resolve,
    so a callee that indexes a caller-supplied pointer compiles on both
    backends. The other boundaries in this item still hold.
+   **Superseded in part (epic-cc#442, 2026-09-17):** the one-term limit
+   is lifted. `add_term_to_fsr0`/`add_term_to_fsr1` now loop over every
+   entry in `terms`, not just the first, mirroring PIC14 isel's
+   `emit_accum_terms`: each term's `MOVF %reg,W; ADDWF FSRnL,F; MOVLW 0;
+   ADDWFC FSRnH,F` sequence is a self-contained 16-bit add-with-carry
+   against the running `FSRnL`/`FSRnH` value, so terms compose
+   additively regardless of order or count (a doubly-indexed pointer
+   expression, e.g. `&arr[i][j]`, now compiles instead of panicking).
+   This was a real gap, not a deliberate non-goal: single-FSR
+   per-byte re-setup (item 3) and no-`PLUSWn` (item 4) are unaffected,
+   and no second FSR was needed since this is multiple terms feeding
+   one FSR0 setup, not two simultaneously indirect pointers (the
+   "Revisit if" section's actual FSR1 trigger, still open). The other
+   boundaries in this item still hold.
 
 ## Rationale
 
