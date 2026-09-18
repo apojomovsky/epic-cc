@@ -735,6 +735,50 @@ fn decodes_self_typed_zeroinit_array_fields() {
     assert_eq!(m.bytes, vec![9, 0, 0x34, 0x12, 0x78, 0x56, 0, 0, 0, 0]);
 }
 
+// Issue #444: a multi-dimensional const array global (`char M[2][3]`)
+// reaches the global handler as `[2 x [3 x i8]] [[3 x i8] c"...", ...]`,
+// whose element type is itself an array, not a scalar. Both the array-global
+// handler and decode_typed_value's array branch must descend into the
+// nested element type instead of assuming a scalar.
+const NESTED_ARRAY_GLOBAL: &str = r#"
+@M = dso_local constant [2 x [3 x i8]] [[3 x i8] c"\01\02\03", [3 x i8] c"\04\05\06"], align 1
+@N = dso_local constant [2 x [2 x i16]] [[2 x i16] [i16 1, i16 2], [2 x i16] [i16 3, i16 4]], align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_multi_dimensional_const_array_globals() {
+    let m = parse_ll(NESTED_ARRAY_GLOBAL);
+    let g = |n: &str| m.globals.iter().find(|g| g.name == n).unwrap();
+
+    let mm = g("M");
+    assert_eq!(mm.size, 6);
+    assert_eq!(mm.bytes, vec![1, 2, 3, 4, 5, 6]);
+
+    let n = g("N");
+    assert_eq!(n.size, 8);
+    assert_eq!(n.bytes, vec![1, 0, 2, 0, 3, 0, 4, 0]);
+}
+
+// The nesting depth is not special-cased: a third array dimension and a
+// zeroed nested array element must decode through the same recursive path.
+const TRIPLE_NESTED_ARRAY_GLOBAL: &str = r#"
+@P = dso_local constant [2 x [2 x [2 x i8]]] [[2 x [2 x i8]] [[2 x i8] c"\01\02", [2 x i8] c"\03\04"], [2 x [2 x i8]] [[2 x i8] zeroinitializer, [2 x i8] c"\05\06"]], align 1
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_triple_nested_array_global_with_zeroed_element() {
+    let m = parse_ll(TRIPLE_NESTED_ARRAY_GLOBAL);
+    let p = m.globals.iter().find(|g| g.name == "P").unwrap();
+    assert_eq!(p.size, 8);
+    assert_eq!(p.bytes, vec![1, 2, 3, 4, 0, 0, 5, 6]);
+}
+
 // Issue #5: clang -O1 lowers `&CARR[i]` on a const struct array to
 // `getelementptr [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i` — the index
 // after an array-of-struct descent is the ELEMENT selector, striding by
