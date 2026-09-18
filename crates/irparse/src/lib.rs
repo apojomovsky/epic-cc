@@ -2081,6 +2081,24 @@ fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
     }
 }
 
+// A label on a function's first body line names the entry block itself,
+// not a second block: whole-program opt renames the surviving entry after
+// an inlined callee (epic-cc#446), and an unnamed entry never prints a
+// label line at all. Restricting adoption to the untouched numeric
+// placeholder keeps invalid consecutive-label text failing downstream
+// instead of silently collapsing labels; the placeholder stays
+// unreferenced because a named block is referred to by its printed name.
+fn adopt_entry_label(blocks: &mut Vec<Block>, label: &str, placeholder: &str) {
+    if blocks.len() == 1 && blocks[0].insts.is_empty() && blocks[0].label == placeholder {
+        blocks[0].label = label.to_string();
+    } else {
+        blocks.push(Block {
+            label: label.to_string(),
+            insts: Vec::new(),
+        });
+    }
+}
+
 /// Parses `.ll` text into canonical IR.
 pub fn parse_ll(src: &str) -> Module {
     let types = build_struct_table(src);
@@ -2343,12 +2361,13 @@ pub fn parse_ll(src: &str) -> Module {
             // The unlabelled entry block shares LLVM's unnamed-value counter with
             // the parameters, so it is %N for N unnamed params, not always %0.
             // Phi incomings name it, and the backends key phi copies on the edge.
-            let entry_label = params
+            let entry_placeholder = params
                 .iter()
                 .filter(|p| p.name.parse::<u32>().is_ok())
-                .count();
+                .count()
+                .to_string();
             let mut blocks: Vec<Block> = vec![Block {
-                label: entry_label.to_string(),
+                label: entry_placeholder.clone(),
                 insts: Vec::new(),
             }];
             // Handles single-line function definitions with the body on the
@@ -2461,10 +2480,7 @@ pub fn parse_ll(src: &str) -> Module {
                                     .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
                                 && !l.starts_with('%')
                             {
-                                blocks.push(Block {
-                                    label: head.to_string(),
-                                    insts: Vec::new(),
-                                });
+                                adopt_entry_label(&mut blocks, head, &entry_placeholder);
                             } else {
                                 let insts = parse_inst(l, &types, &mut fresh, &dbg);
                                 blocks.last_mut().unwrap().insts.extend(insts);
@@ -2531,10 +2547,7 @@ pub fn parse_ll(src: &str) -> Module {
                                 .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_')
                             && !l.starts_with('%')
                         {
-                            blocks.push(Block {
-                                label: head.to_string(),
-                                insts: Vec::new(),
-                            });
+                            adopt_entry_label(&mut blocks, head, &entry_placeholder);
                             continue;
                         }
                     }

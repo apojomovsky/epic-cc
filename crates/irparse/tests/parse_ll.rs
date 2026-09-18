@@ -2126,3 +2126,78 @@ fn parses_variadic_prototype_va_start_and_va_arg() {
         other => panic!("expected VaArg, got {other:?}"),
     }
 }
+
+// Whole-program opt renames the surviving entry block after an inlined
+// callee (epic-cc#446): the label line on the first body line is the
+// entry block itself, not a second block after an empty synthetic entry.
+const NAMED_ENTRY: &str = r#"
+define internal void @attach(i8 noundef zeroext %0, i16 noundef %1) {
+EPIC_TIMER0_Init.exit:
+  %2 = add i16 %1, 1
+  %3 = icmp eq i16 %2, 0
+  br i1 %3, label %4, label %6
+
+4:                                                ; preds = %EPIC_TIMER0_Init.exit
+  br label %6
+
+6:                                                ; preds = %4, %EPIC_TIMER0_Init.exit
+  %7 = phi i16 [ 1, %4 ], [ 2, %EPIC_TIMER0_Init.exit ]
+  ret void
+}
+"#;
+
+#[test]
+fn adopts_first_body_label_into_entry_block() {
+    let m = parse_ll(NAMED_ENTRY);
+    let f = &m.funcs[0];
+    let labels: Vec<&str> = f.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["EPIC_TIMER0_Init.exit", "4", "6"]);
+
+    // The instructions that follow the label belong to the entry, so it
+    // ends in a terminator instead of staying empty.
+    assert_eq!(f.blocks[0].insts.len(), 3);
+    match &f.blocks[0].insts[2] {
+        Inst::BrCond(br) => {
+            assert_eq!(br.t, "4");
+            assert_eq!(br.f, "6");
+        }
+        other => panic!("expected BrCond, got {other:?}"),
+    }
+
+    // The phi's incoming edge from the entry names it by the adopted label.
+    let phi = &f.blocks[2].insts[0];
+    match phi {
+        Inst::Phi(p) => assert_eq!(
+            p.incoming,
+            [
+                (Val::Const(1), "4".to_string()),
+                (Val::Const(2), "EPIC_TIMER0_Init.exit".to_string()),
+            ]
+        ),
+        other => panic!("expected Phi, got {other:?}"),
+    }
+}
+
+#[test]
+fn adopts_entry_label_when_body_starts_on_define_line() {
+    let ll = "define void @f(i8 %0) { entry:\n  ret void\n}\n";
+    let m = parse_ll(ll);
+    let f = &m.funcs[0];
+    let labels: Vec<&str> = f.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["entry"]);
+    assert_eq!(f.blocks[0].insts.len(), 1);
+}
+
+// Consecutive label lines are invalid LLVM the pinned clang never emits;
+// the placeholder guard keeps them failing downstream (empty blocks without
+// a terminator) instead of silently collapsing the labels into one block.
+#[test]
+fn pushes_consecutive_labels_instead_of_merging_them() {
+    let ll = "define void @f(i8 %0) {\na:\nb:\n  ret void\n}\n";
+    let m = parse_ll(ll);
+    let f = &m.funcs[0];
+    let labels: Vec<&str> = f.blocks.iter().map(|b| b.label.as_str()).collect();
+    assert_eq!(labels, ["a", "b"]);
+    assert_eq!(f.blocks[0].insts.len(), 0);
+    assert_eq!(f.blocks[1].insts.len(), 1);
+}
