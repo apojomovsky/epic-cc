@@ -762,6 +762,23 @@ fn decodes_multi_dimensional_const_array_globals() {
     assert_eq!(n.bytes, vec![1, 0, 2, 0, 3, 0, 4, 0]);
 }
 
+// The nesting depth is not special-cased: a third array dimension and a
+// zeroed nested array element must decode through the same recursive path.
+const TRIPLE_NESTED_ARRAY_GLOBAL: &str = r#"
+@P = dso_local constant [2 x [2 x [2 x i8]]] [[2 x [2 x i8]] [[2 x i8] c"\01\02", [2 x i8] c"\03\04"], [2 x [2 x i8]] [[2 x i8] zeroinitializer, [2 x i8] c"\05\06"]], align 1
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_triple_nested_array_global_with_zeroed_element() {
+    let m = parse_ll(TRIPLE_NESTED_ARRAY_GLOBAL);
+    let p = m.globals.iter().find(|g| g.name == "P").unwrap();
+    assert_eq!(p.size, 8);
+    assert_eq!(p.bytes, vec![1, 2, 3, 4, 0, 0, 5, 6]);
+}
+
 // Issue #5: clang -O1 lowers `&CARR[i]` on a const struct array to
 // `getelementptr [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i` — the index
 // after an array-of-struct descent is the ELEMENT selector, striding by
