@@ -21,6 +21,18 @@ fn with_bytes(mut m: ir::Module, name: &str, bytes: &[u8]) -> ir::Module {
     m
 }
 
+/// Set the ref entries of a const global the way irparse records a
+/// `ptr @target` field: one entry per byte of the pointer, at absolute
+/// blob offsets. The canonical IR text carries no refs.
+fn with_refs(mut m: ir::Module, name: &str, refs: &[(usize, &str)]) -> ir::Module {
+    for g in &mut m.globals {
+        if g.name == name {
+            g.refs = refs.iter().map(|(o, f)| (*o, f.to_string())).collect();
+        }
+    }
+    m
+}
+
 #[test]
 fn empty_function_emits_a_bare_return() {
     let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
@@ -1995,6 +2007,93 @@ fn emits_const_tables_as_db_after_start() {
             .map(|i| asm[i..].contains("db"))
             .unwrap_or(false),
         "the db bytes must come after the label:\n{asm}"
+    );
+}
+
+#[test]
+fn const_table_ram_ref_materializes_the_alloc_address() {
+    // A `static const` struct field initialized with a RAM global's
+    // ADDRESS (epic-hal's combo-modbus register-map shape): the refs
+    // name a RAM global, which has no assembler label. Before #443 the
+    // table emitted `db LOW(holding_regs)` and the assembler panicked.
+    // holding_regs sits at 0x210: LOW = 0x10, HIGH = 0x02.
+    let m = with_refs(
+        with_bytes(
+            parse("const map i8\nfn main(void) ()\n  block entry:\n    ret void\n"),
+            "map",
+            &[0x00, 0x00, 0x04],
+        ),
+        "map",
+        &[(0, "holding_regs"), (1, "holding_regs")],
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[("holding_regs", 0x210)]), None);
+    assert!(
+        asm.contains("db 0x10\n    db 0x02"),
+        "each ref byte must materialize its address half:\n{asm}"
+    );
+    assert!(
+        !asm.contains("LOW(holding_regs)"),
+        "a RAM global has no label to resolve:\n{asm}"
+    );
+    // Pass 2 resolving every operand is the exact stage #443 panicked in.
+    asm::assemble_pic18(&asm);
+}
+
+#[test]
+fn const_table_function_ref_keeps_the_label_literal() {
+    // A function-address field is a link-time value: it must stay a
+    // label literal the assembler resolves (epic-cc#154). #443's
+    // alloc-address path must not capture it: a function is never in
+    // the address map.
+    let m = with_refs(
+        with_bytes(
+            parse(
+                "const vt i8\n\
+                 fn f0(void) ()\n  block entry:\n    ret void\n\
+                 fn main(void) ()\n  block entry:\n    ret void\n",
+            ),
+            "vt",
+            &[0x00, 0x00],
+        ),
+        "vt",
+        &[(0, "f0"), (1, "f0")],
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
+    assert!(
+        asm.contains("db LOW(f0)\n    db HIGH(f0)"),
+        "a function address stays a link-time label:\n{asm}"
+    );
+    asm::assemble_pic18(&asm);
+}
+
+#[test]
+fn const_to_ram_init_ram_ref_materializes_the_alloc_address() {
+    // A const global copied to RAM whose ref names a RAM global: the
+    // __start init must write the address bytes numerically (epic-cc#443),
+    // not a `MOVLW LOW(...)` label the assembler cannot resolve for a RAM
+    // global. cfg at 0x040 (access bank), arr at 0x210.
+    let m = with_refs(
+        with_bytes(
+            parse("const cfg i8\nfn main(void) ()\n  block entry:\n    ret void\n"),
+            "cfg",
+            &[0x00, 0x00],
+        ),
+        "cfg",
+        &[(0, "arr"), (1, "arr")],
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("cfg", 0x040), ("arr", 0x210)]),
+        None,
+    );
+    assert!(
+        asm.contains("MOVLW 0x10\n    MOVWF 0x040,A\n    MOVLW 0x02\n    MOVWF 0x041,A"),
+        "init must write the alloc-address bytes into the RAM copy:\n{asm}"
+    );
+    assert!(
+        !asm.contains("LOW(arr)"),
+        "a RAM global has no label to resolve:\n{asm}"
     );
 }
 // P7 float tests: bit-exact sim per recipe (add, mul, div, cmp, conversions, RNE)

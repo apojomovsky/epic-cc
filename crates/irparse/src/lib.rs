@@ -348,9 +348,10 @@ fn decode_typed_value(
             let uv = k as u64;
             (0..w).map(|i| ((uv >> (8 * i)) & 0xFF) as u8).collect()
         }
-        // A `ptr @fn` field holds the function's link-time address: the
-        // bytes are a placeholder (the emitters materialize LOW/HIGH
-        // label literals at the recorded offsets, epic-cc#154).
+        // A `ptr @g` field holds a global's address (a function label or
+        // a RAM address): the bytes are a placeholder (the emitters
+        // materialize the LOW/HIGH bytes at the recorded offsets,
+        // epic-cc#154, epic-cc#443).
         Val::Global(g) => {
             for o in 0..w {
                 refs.push((o, g.clone()));

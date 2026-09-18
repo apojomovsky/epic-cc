@@ -464,10 +464,12 @@ pub struct Global {
     pub is_const: bool,
     pub size: u16,
     pub bytes: Vec<u8>,
-    /// Byte offsets into `bytes` holding a function link-time address
-    /// (a `ptr @fn` const struct field). The table emitters and the
-    /// const-to-RAM init materialize `LOW(fn)`/`HIGH(fn)` label literals
-    /// at these offsets, not the placeholder zero bytes (epic-cc#154).
+    /// Byte offsets into `bytes` holding a global's address (a `ptr @fn`
+    /// function label or a `ptr @ram` RAM-global field). The table
+    /// emitters and the const-to-RAM init materialize the address's low
+    /// and high byte at these offsets, not the placeholder zero bytes: a
+    /// label literal for flash targets, resolved numeric bytes for RAM
+    /// targets (epic-cc#154, epic-cc#443).
     pub refs: Vec<(usize, String)>,
     pub addr: Option<u16>,
 }
