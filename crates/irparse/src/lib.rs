@@ -285,24 +285,16 @@ fn decode_typed_value(
         let bytes = if elem == "i8" && value.starts_with('c') && value.contains('"') {
             parse_string_literal(value)
         } else if value.starts_with('[') {
-            if elem.starts_with('{') || elem.starts_with("<{") {
-                let inner_list = value
-                    .strip_prefix('[')
-                    .and_then(|s| matching_bracket(value).map(|i| &s[..i.saturating_sub(1)]))
-                    .unwrap_or_else(|| panic!("SPIKE LIMIT: struct array value {value:?}"));
-                let mut out = Vec::new();
-                for elt in split_top_level(inner_list, ',') {
-                    let elt = elt.trim();
-                    if elt.is_empty() {
-                        continue;
-                    }
-                    let base = out.len();
-                    let mut elt_refs = Vec::new();
-                    out.extend(decode_typed_value(elem, elt, types, &mut elt_refs));
-                    refs.extend(elt_refs.into_iter().map(|(o, f)| (base + o, f)));
-                }
-                out
-            } else if elem.starts_with('%') {
+            // Non-scalar element type (nested struct, named struct, or a
+            // further-nested array, epic-cc#444): each element recurses
+            // through decode_typed_value rather than the scalar
+            // parse_array_elements path, since only decode_typed_value knows
+            // how to unwrap the element's own self-type prefix.
+            if elem.starts_with('{')
+                || elem.starts_with("<{")
+                || elem.starts_with('%')
+                || elem.starts_with('[')
+            {
                 let inner_list = value
                     .strip_prefix('[')
                     .and_then(|s| matching_bracket(value).map(|i| &s[..i.saturating_sub(1)]))
@@ -2145,8 +2137,17 @@ pub fn parse_ll(src: &str) -> Module {
                 let mut pit = inner.splitn(2, 'x').map(|s| s.trim());
                 let n: usize = pit.next().unwrap().parse().unwrap();
                 let elem_str = pit.next().unwrap();
-                if elem_str.starts_with('{') || elem_str.starts_with("<{") {
-                    let (es, _) = literal_ty_size_align(elem_str, &types, None);
+                if elem_str.starts_with('{')
+                    || elem_str.starts_with("<{")
+                    || elem_str.starts_with('%')
+                    || elem_str.starts_with('[')
+                {
+                    // Non-scalar element type: literal struct, named struct,
+                    // or a nested array (`[2 x [3 x i8]]`, epic-cc#444).
+                    // ty_size_align already descends into every one of these
+                    // shapes, so a single call sizes the whole array; the
+                    // decode side mirrors it through decode_typed_value.
+                    let (es, _) = ty_size_align(elem_str, &types, None);
                     let size = n * es as usize;
                     if is_const {
                         assert!(
@@ -2164,51 +2165,17 @@ pub fn parse_ll(src: &str) -> Module {
                     let bytes = if init.starts_with("zeroinitializer") {
                         vec![0u8; size as usize]
                     } else {
-                        let decoded =
-                            decode_typed_value(&rest[..close + 1], init, &types, &mut refs);
-                        assert_eq!(
-                            decoded.len(),
-                            size as usize,
-                            "SPIKE LIMIT: literal array global @{name} initializer decoded to {} bytes, expected {size} for {:?}",
-                            decoded.len(),
-                            &rest[..close + 1]
-                        );
-                        decoded
-                    };
-                    (Ty::I8, size, bytes)
-                } else if elem_str.starts_with('%') {
-                    let info = types
-                        .get(elem_str.trim_start_matches('%'))
-                        .unwrap_or_else(|| {
-                            panic!("irparse: unknown struct type {elem_str} for @{name}")
-                        });
-                    let size = n * usize::from(info.size);
-                    if is_const {
-                        assert!(
-                            size <= 65535,
-                            "irparse: const array @{name} too large ({size} bytes; max 65535)"
-                        );
-                    } else {
-                        assert!(
-                            size <= 255,
-                            "irparse: array @{name} too large ({size} bytes)"
-                        );
-                    }
-                    let init = rest[close + 1..].trim();
-                    let bytes = if init.starts_with("zeroinitializer") {
-                        vec![0u8; size as usize]
-                    } else {
                         let ty_str = &rest[..close + 1];
                         let decoded = decode_typed_value(ty_str, init, &types, &mut refs);
                         assert_eq!(
                             decoded.len(),
-                            size,
+                            size as usize,
                             "SPIKE LIMIT: array global @{name} initializer decoded to {} bytes, expected {size} for {ty_str:?}",
                             decoded.len()
                         );
                         decoded
                     };
-                    (Ty::I8, size as u16, bytes)
+                    (Ty::I8, size, bytes)
                 } else {
                     let elem = ty_of(elem_str, None);
                     let size = n * elem.bytes() as usize;
