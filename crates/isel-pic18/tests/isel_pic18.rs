@@ -187,6 +187,49 @@ fn load_and_store_i8_use_movff() {
     );
 }
 
+// clang's own -O1 GlobalOpt narrows an internal flag only ever written 0/1
+// down to `global i1` (epic-cc#462), so i1 reaches isel as a memory type and
+// must lower exactly like the one-byte i8 path.
+#[test]
+fn load_and_store_i1_use_the_byte_path() {
+    let m = parse("global in i1\nglobal out i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    store i1 %1 @out\n    ret void\n");
+    let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x12)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x010, 0x012"),
+        "one-byte load into %1's slot:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x012, 0x011"),
+        "one-byte store to out:\n{asm}"
+    );
+}
+
+#[test]
+fn store_an_i1_constant_writes_the_byte_value() {
+    let m = parse(
+        "global out i1\nfn main(void) ()\n  block entry:\n    store i1 1 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("out", 0x11)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVLW 0x01"), "asm:\n{asm}");
+    assert!(asm.contains("MOVWF 0x011,A"), "asm:\n{asm}");
+}
+
+// The SFR literal-pointer branch MOVFF-copies the raw byte (no masking),
+// so pin it for i1 too: the address needs no bank select on the access
+// bank, and the one-byte width is the whole store.
+#[test]
+fn store_an_i1_through_a_literal_pointer_writes_the_sfr() {
+    let m = parse("fn main(void) ()\n  block entry:\n    store i1 1 0xF81\n    ret void\n");
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
+    assert!(asm.contains("MOVLW 0x01"), "asm:\n{asm}");
+    assert!(
+        asm.contains("MOVWF 0x081,A"),
+        "SFR store must be a=0, no MOVLB:\n{asm}"
+    );
+}
+
 /// Build a module with a runtime routine (name, param widths, __scr size)
 /// plus a main that calls it, so the recipe-emission path is exercised
 /// through `select` exactly as legalize's injected modules reach it.

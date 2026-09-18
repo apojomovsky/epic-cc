@@ -1188,7 +1188,13 @@ impl<'m> Gen<'m> {
         self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
-                assert!(l.ty != Ty::I1, "isel-pic18: only i8/i16 loads supported");
+                // An i1 global is real: clang's own -O1 GlobalOpt narrows an
+                // internal flag only ever written 0/1 down to `global i1`
+                // (epic-cc#462). i1 is one byte in the byte model, so the
+                // byte loop below is the whole story. The literal-pointer
+                // arm copies an SFR byte raw (MOVFF cannot mask), which
+                // stays sound only while that byte is 0/1: the same
+                // exactly-0/1 premise the Zext and Sext arms state.
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 // Literal-pointer (SFR) load: `inttoptr` form, a direct
                 // physical address: MOVFF copies byte-wise with no access
@@ -1227,7 +1233,9 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Store(s) => {
-                assert!(s.ty != Ty::I1, "isel-pic18: only i8/i16 stores supported");
+                // Same i1-in-memory story as the Load arm above (epic-cc#462);
+                // `trunc` normalizes an i1 byte to 0/1, so the stored byte
+                // keeps the convention every i1 consumer relies on.
                 // Literal-pointer (SFR) store: `inttoptr` form, a direct
                 // physical address. A register/global source copies via
                 // MOVFF (no access bit); a constant goes through W with
