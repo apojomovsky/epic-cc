@@ -699,6 +699,42 @@ fn decodes_nested_zeroinit_and_array_field_structs() {
     assert_eq!(o2.bytes, expect);
 }
 
+// Issue #441 regression: clang prints a zeroed fixed-size array field as a
+// self-type-prefixed `[N x T] zeroinitializer` inside the parent's value.
+// The self-type must be stripped so the field decodes as zeros, not fed to
+// the element-list parser (which read the element count "4" as a type).
+const CONST_ARRAY_FIELD_ZEROREGRESSIONS: &str = r#"
+%struct.cfg = type { i8, i8, [4 x i8] }
+@CONFIG = dso_local constant %struct.cfg { i8 16, i8 2, [4 x i8] zeroinitializer }, align 1
+@L = dso_local constant { i8, [4 x i16] } { i8 7, [4 x i16] zeroinitializer }, align 2
+@M = dso_local constant { i8, [2 x i16], [3 x i8] } { i8 9, [2 x i16] [i16 4660, i16 22136], [3 x i8] zeroinitializer }, align 2
+define dso_local void @main() {
+  ret void
+}
+"#;
+
+#[test]
+fn decodes_self_typed_zeroinit_array_fields() {
+    let m = parse_ll(CONST_ARRAY_FIELD_ZEROREGRESSIONS);
+    let g = |n: &str| m.globals.iter().find(|g| g.name == n).unwrap();
+
+    // CONFIG = { 16, 2, {0,0,0,0} } -> size 6
+    let config = g("CONFIG");
+    assert_eq!(config.size, 6);
+    assert_eq!(config.bytes, vec![16, 2, 0, 0, 0, 0]);
+
+    // L = { 7, {0,0,0,0} } -> i8 at 0, i16-aligned array at 2, size 10
+    let l = g("L");
+    assert_eq!(l.size, 10);
+    assert_eq!(l.bytes, vec![7, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+
+    // M pins coexistence: non-zeroed element list and zeroed array fields
+    // in one struct -> [9, pad, 0x1234, 0x5678, 0,0,0, pad], size 10
+    let m = g("M");
+    assert_eq!(m.size, 10);
+    assert_eq!(m.bytes, vec![9, 0, 0x34, 0x12, 0x78, 0x56, 0, 0, 0, 0]);
+}
+
 // Issue #5: clang -O1 lowers `&CARR[i]` on a const struct array to
 // `getelementptr [2 x %struct.Pair], ptr @CARR, i16 0, i16 %i` — the index
 // after an array-of-struct descent is the ELEMENT selector, striding by
