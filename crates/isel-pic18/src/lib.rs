@@ -692,11 +692,6 @@ impl<'m> Gen<'m> {
     /// access to go through `INDF1` (0xFE7). FSR1 mirror of
     /// `emit_fsr0_dynamic` (LFSR 1, FSR1L/FSR1H = 0xFE1/0xFE2).
     fn emit_fsr1_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
-        assert!(
-            terms.len() <= 1,
-            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
-            terms.len()
-        );
         let static_part = u16::from(k) + u16::from(byte_off);
         let lit = (base_addr + static_part) & 0xFFF;
         self.emit(format!("    LFSR 1, 0x{lit:03X}"));
@@ -704,7 +699,7 @@ impl<'m> Gen<'m> {
     }
     /// `slot_addr` holds a 2-byte ADDRESS (an sret param's contents), not
     /// the object itself: load THAT address into FSR1, then add the static
-    /// offset and any dynamic term. FSR1 mirror of `emit_fsr0_indirect_slot`.
+    /// offset and any dynamic terms. FSR1 mirror of `emit_fsr0_indirect_slot`.
     fn emit_fsr1_indirect_slot(
         &mut self,
         slot_addr: u16,
@@ -712,11 +707,6 @@ impl<'m> Gen<'m> {
         terms: &[(u8, String)],
         byte_off: u8,
     ) {
-        assert!(
-            terms.len() <= 1,
-            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
-            terms.len()
-        );
         self.emit_copy_byte(slot_addr, 0xFE1); // FSR1L = low byte of the stored address
         self.emit_copy_byte(slot_addr + 1, 0xFE2); // FSR1H = high byte
         let static_part = u16::from(k) + u16::from(byte_off);
@@ -736,10 +726,15 @@ impl<'m> Gen<'m> {
         }
         self.add_term_to_fsr1(terms);
     }
-    /// Add the single dynamic term (if any) onto `FSR1L`/`FSR1H` with
-    /// carry, `scale` times. FSR1 mirror of `add_term_to_fsr0`.
+    /// Add every dynamic term onto `FSR1L`/`FSR1H` with carry, `scale`
+    /// times each, in order. FSR1 mirror of `add_term_to_fsr0`. Each
+    /// term's `MOVF %reg,W; ADDWF FSR1L,F; MOVLW 0; ADDWFC FSR1H,F`
+    /// sequence is a self-contained 16-bit add-with-carry against the
+    /// running FSR1L/FSR1H value, so terms accumulate correctly in any
+    /// order (mirrors PIC14 isel's `emit_accum_terms`, which sums all
+    /// terms the same way).
     fn add_term_to_fsr1(&mut self, terms: &[(u8, String)]) {
-        if let Some((scale, reg)) = terms.first() {
+        for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
             for _ in 0..*scale {
                 let (ra, rf) = self.operand(a);
@@ -762,17 +757,13 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Sets `FSR0 = base_addr + k + term + byte_off` for `INDF0` access.
-    /// `LFSR` seeds the static part in one instruction; a dynamic term folds
-    /// in via `ADDWF`/`ADDWFC` through `operand()`, which treats FSR0L/FSR0H
-    /// as the always-access-bank SFR segment, so no `MOVLB` emits.
-    /// Panics on multiple terms: dropping a term silently miscompiles (see ADR-009).
+    /// Sets `FSR0 = base_addr + k + Σ terms + byte_off` for `INDF0` access.
+    /// `LFSR` seeds the static part in one instruction; every dynamic term
+    /// folds in via `ADDWF`/`ADDWFC` through `operand()`, which treats
+    /// FSR0L/FSR0H as the always-access-bank SFR segment, so no `MOVLB`
+    /// emits. See ADR-009 item 6 and its follow-up note on multi-term
+    /// support.
     fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
-        assert!(
-            terms.len() <= 1,
-            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
-            terms.len()
-        );
         let static_part = u16::from(k) + u16::from(byte_off);
         let lit = (base_addr + static_part) & 0xFFF;
         self.emit(format!("    LFSR 0, 0x{lit:03X}"));
@@ -782,7 +773,7 @@ impl<'m> Gen<'m> {
     /// the object itself: load THAT address into FSR0 (`MOVFF slot,
     /// FSR0L` / `MOVFF slot+1, FSR0H`, both plain memory-to-memory, no
     /// access bit needed since MOVFF never uses one), then add the static
-    /// offset (`k + byte_off`) and any dynamic term the same way
+    /// offset (`k + byte_off`) and every dynamic term the same way
     /// `emit_fsr0_dynamic` does, and access through `INDF0`.
     fn emit_fsr0_indirect_slot(
         &mut self,
@@ -791,11 +782,6 @@ impl<'m> Gen<'m> {
         terms: &[(u8, String)],
         byte_off: u8,
     ) {
-        assert!(
-            terms.len() <= 1,
-            "isel-pic18: multi-term dynamic pointer offsets not yet supported (P3 scope; {} terms)",
-            terms.len()
-        );
         self.emit_copy_byte(slot_addr, 0xFE9); // FSR0L = low byte of the stored address
         self.emit_copy_byte(slot_addr + 1, 0xFEA); // FSR0H = high byte
         let static_part = u16::from(k) + u16::from(byte_off);
@@ -815,13 +801,18 @@ impl<'m> Gen<'m> {
         }
         self.add_term_to_fsr0(terms);
     }
-    /// Add the single dynamic term (if any) onto `FSR0L`/`FSR0H` with
-    /// carry, `scale` times: `MOVF %reg,W; ADDWF FSR0L,F; MOVLW 0;
-    /// ADDWFC FSR0H,F`. Shared by `emit_fsr0_dynamic` and
-    /// `emit_fsr0_indirect_slot`, the only two FSR0 setups that carry a
-    /// runtime term.
+    /// Add every dynamic term onto `FSR0L`/`FSR0H` with carry, `scale`
+    /// times each, in order: `MOVF %reg,W; ADDWF FSR0L,F; MOVLW 0;
+    /// ADDWFC FSR0H,F` per term. Shared by `emit_fsr0_dynamic` and
+    /// `emit_fsr0_indirect_slot`, the two FSR0 setups that carry runtime
+    /// terms. Each term's 4-instruction sequence is a self-contained
+    /// 16-bit add-with-carry against the running FSR0L/FSR0H value (the
+    /// `ADDWF` sets carry, the following `ADDWFC` consumes it), so
+    /// multiple terms accumulate correctly regardless of order: the same
+    /// reasoning PIC14 isel's `emit_accum_terms` already relies on for
+    /// its 8-bit scratch-byte sum.
     fn add_term_to_fsr0(&mut self, terms: &[(u8, String)]) {
-        if let Some((scale, reg)) = terms.first() {
+        for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
             for _ in 0..*scale {
                 let (ra, rf) = self.operand(a);

@@ -1657,12 +1657,15 @@ fn a_scale_2_dynamic_index_unrolls_two_adds() {
 }
 
 #[test]
-#[should_panic(expected = "multi-term")]
-fn a_two_term_dynamic_gep_panics_loudly() {
-    // P3's scope boundary is ONE dynamic term per pointer (see the
-    // `emit_fsr0_dynamic` assert): a GEP with two register-indexed terms
-    // must panic loudly rather than silently drop a term and read the
-    // wrong address.
+fn a_two_term_dynamic_gep_accumulates_both_terms_onto_fsr0() {
+    // epic-cc#442: a GEP with two register-indexed dynamic terms (the
+    // doubly-indexed shape, e.g. `&arr[i][j]` or `&arr[i].field[j]` after
+    // GEP-chain folding) must add BOTH terms onto FSR0L/FSR0H, not just
+    // the first (dropping a term silently mis-addresses, ADR-009's
+    // concern). Formerly a documented P3 scope boundary that panicked
+    // (`a_two_term_dynamic_gep_panics_loudly`); now supported by looping
+    // `add_term_to_fsr0` over every term, mirroring PIC14 isel's
+    // `emit_accum_terms`.
     let m = parse(
         "global arr i8\n\
          global idx1 i8\n\
@@ -1683,7 +1686,57 @@ fn a_two_term_dynamic_gep_panics_loudly() {
         ("main::j", 0x133),
         ("main::v", 0x134),
     ]);
-    select(&PIC18F4550, &m, &addrs, None);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("LFSR 0, 0x120") || asm.contains("LFSR 0,0x120"),
+        "must seed FSR0 with the array base before accumulating terms:\n{asm}"
+    );
+    assert!(
+        asm.contains("0x132") && asm.contains("0x133"),
+        "both dynamic terms (%i at 0x132, %j at 0x133) must be read and added, not just the first:\n{asm}"
+    );
+    let addwf_to_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
+    assert!(
+        addwf_to_fsr0l >= 2,
+        "two scale-1 terms must unroll two adds onto FSR0L:\n{asm}"
+    );
+}
+
+#[test]
+fn a_three_term_dynamic_gep_is_not_hardcoded_to_two() {
+    // Guard against a fix that special-cases exactly two terms (the
+    // minimum repro epic-cc#442 needed): a third dynamic term must also
+    // compile and accumulate onto FSR0.
+    let m = parse(
+        "global arr i8\n\
+         global idx1 i8\n\
+         global idx2 i8\n\
+         global idx3 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx1\n\
+             %j = load i8 @idx2\n\
+             %k = load i8 @idx3\n\
+             %p = gep @arr +0 +1*%i +1*%j +1*%k\n\
+             %v = load i8 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("arr", 0x120),
+        ("idx1", 0x130),
+        ("idx2", 0x131),
+        ("idx3", 0x135),
+        ("main::i", 0x132),
+        ("main::j", 0x133),
+        ("main::k", 0x136),
+        ("main::v", 0x134),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let addwf_to_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
+    assert!(
+        addwf_to_fsr0l >= 3,
+        "three scale-1 terms must unroll three adds onto FSR0L:\n{asm}"
+    );
 }
 
 #[test]
