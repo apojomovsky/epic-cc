@@ -1264,9 +1264,13 @@ const ALL_FIELDS: u16 = 0xFFFF;
 /// `gep @g +0 +10*%i +0` to field 0, and a bare `@g`/`gep @g +0` to field 0.
 /// A whole-object read at an unresolvable offset falls back to `ALL_FIELDS`
 /// (a store into any field then feeds it); a runtime register base (a param,
-/// an alloca, a load) resolves to nothing and the store-edge scan treats
-/// it as opaque.
-fn global_field(ptr: &str, f: &Func) -> Option<(String, u16)> {
+/// an alloca) resolves to nothing and the store-edge scan treats it as
+/// opaque. A register loaded from a global POINTER variable resolves
+/// through `aliases` (built by `global_ptr_aliases`) when that variable's
+/// only assignment is another global's address (the HAL `g_handle =
+/// &g_storage;` idiom, epic-cc#463): the walk continues from the aliased
+/// global exactly as if the load's pointer operand had been a GEP of it.
+fn global_field(ptr: &str, f: &Func, aliases: &HashMap<String, String>) -> Option<(String, u16)> {
     if let Some(g) = ptr.strip_prefix('@') {
         return Some((g.to_string(), 0));
     }
@@ -1299,6 +1303,15 @@ fn global_field(ptr: &str, f: &Func) -> Option<(String, u16)> {
                         }
                     }
                 }
+                if let Inst::Load(l) = inst {
+                    if l.dst == cur {
+                        if let Some(g_ptr) = l.ptr.strip_prefix('@') {
+                            if let Some(target) = aliases.get(g_ptr) {
+                                return Some((target.clone(), field_of(k, min_scale)));
+                            }
+                        }
+                    }
+                }
             }
             if found {
                 break;
@@ -1309,6 +1322,46 @@ fn global_field(ptr: &str, f: &Func) -> Option<(String, u16)> {
         }
     }
     None
+}
+
+/// Global pointer variables whose only role is holding another global's
+/// address (`g_handle = &g_storage;`, IR `store i16 @g_storage @g_handle`):
+/// `g_handle -> g_storage`. A pointer variable assigned two different
+/// globals anywhere is dropped (ambiguous, opaque like any other unresolved
+/// case) rather than picking one arbitrarily.
+fn global_ptr_aliases(m: &Module) -> HashMap<String, String> {
+    let globals: HashSet<&str> = m.globals.iter().map(|g| g.name.as_str()).collect();
+    let mut aliases: HashMap<String, String> = HashMap::new();
+    let mut ambiguous: HashSet<String> = HashSet::new();
+    for f in &m.funcs {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Store(s) = inst {
+                    let Some(g_ptr) = s.ptr.strip_prefix('@') else {
+                        continue;
+                    };
+                    let Val::Global(target) = &s.val else {
+                        continue;
+                    };
+                    if !globals.contains(target.as_str()) {
+                        continue;
+                    }
+                    match aliases.get(g_ptr) {
+                        Some(prev) if prev != target => {
+                            ambiguous.insert(g_ptr.to_string());
+                        }
+                        _ => {
+                            aliases.insert(g_ptr.to_string(), target.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for g in ambiguous {
+        aliases.remove(&g);
+    }
+    aliases
 }
 
 /// The field a constant byte offset selects, given the innermost runtime
@@ -1357,6 +1410,29 @@ fn global_field_map(
     None
 }
 
+/// Like `global_field_map` but for a LOCAL base: walks `ptr`'s GEP chain
+/// through `bases` and returns the ultimate register it is rooted at (its
+/// own name if `ptr` is already an unresolved register), instead of giving
+/// up when the chain never reaches a global. The caller checks the
+/// returned register against a known set of alloca registers (e.g. a
+/// memcpy source, epic-cc#463); an opaque non-alloca root simply never
+/// matches that set, so this stays as safe as `global_field_map`'s "opaque"
+/// fallback elsewhere in this pass.
+fn alloca_root_map(
+    ptr: &str,
+    bases: &HashMap<String, (GepBase, u8, Vec<(u8, String)>)>,
+) -> Option<String> {
+    let mut cur = ptr.strip_prefix('%')?.to_string();
+    for _ in 0..8 {
+        match bases.get(&cur) {
+            Some((GepBase::Reg(r), _, _)) => cur = r.clone(),
+            Some((GepBase::Global(_), _, _)) => return None,
+            None => return Some(cur),
+        }
+    }
+    None
+}
+
 /// The `@g`/`%r` pointer text of a `Val` (memcpy operands are pointer
 /// values). A non-pointer val has no pointer text.
 fn ptr_of_val(v: &Val) -> String {
@@ -1367,6 +1443,47 @@ fn ptr_of_val(v: &Val) -> String {
     }
 }
 
+/// Whether `ptr` (a GEP chain, one hop like `global_field`) resolves to a
+/// field of `alloca_reg`'s own object, or to `alloca_reg` itself. Mirrors
+/// `global_field`'s walk but the root is a local alloca register instead of
+/// a global, so a memcpy's source struct can be matched against the field
+/// stores that built it (epic-cc#463).
+fn alloca_field(ptr: &str, f: &Func, alloca_reg: &str) -> Option<u16> {
+    if ptr.strip_prefix('%') == Some(alloca_reg) {
+        return Some(0);
+    }
+    let mut cur = ptr.strip_prefix('%')?.to_string();
+    let mut k: u16 = 0;
+    for _ in 0..8 {
+        let mut found = false;
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Gep(g) = inst {
+                    if g.dst == cur {
+                        let GepBase::Reg(r) = &g.base else {
+                            return None;
+                        };
+                        k = k.wrapping_add(u16::from(g.k));
+                        if r == alloca_reg {
+                            return Some(k);
+                        }
+                        cur = r.clone();
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            if found {
+                break;
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+    None
+}
+
 /// The `(global, field)` pairs the ISR context reads (loads, memcpy
 /// sources): a store into one of these feeds an ISR indirect call, so the
 /// stored value rewrites to the `_isr` copy when duplicated. A global the
@@ -1375,7 +1492,11 @@ fn ptr_of_val(v: &Val) -> String {
 /// while the ISR tick reads other fields, so those stored functions stay out
 /// of the ISR context and main-context dispatch keeps its candidates.
 /// A memcpy source (whole object) reads `ALL_FIELDS` (epic-cc#73) (epic-hal#86).
-fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<(String, u16)> {
+fn isr_read_globals(
+    m: &Module,
+    isr_ctx: &HashSet<String>,
+    aliases: &HashMap<String, String>,
+) -> HashSet<(String, u16)> {
     let mut out: HashSet<(String, u16)> = HashSet::new();
     for f in &m.funcs {
         if !isr_ctx.contains(&f.name) {
@@ -1385,12 +1506,12 @@ fn isr_read_globals(m: &Module, isr_ctx: &HashSet<String>) -> HashSet<(String, u
             for inst in &b.insts {
                 match inst {
                     Inst::Load(l) => {
-                        if let Some((g, k)) = global_field(&l.ptr, f) {
+                        if let Some((g, k)) = global_field(&l.ptr, f, aliases) {
                             out.insert((g, k));
                         }
                     }
                     Inst::Memcpy(mc) => {
-                        if let Some((g, _)) = global_field(&ptr_of_val(&mc.src), f) {
+                        if let Some((g, _)) = global_field(&ptr_of_val(&mc.src), f, aliases) {
                             out.insert((g, ALL_FIELDS));
                         }
                     }
@@ -1447,6 +1568,7 @@ fn isr_context_for(
 ) {
     let mut isr_ctx: HashSet<String> = roots.iter().flat_map(|r| reachable(&[*r], adj)).collect();
     let mut param_stores: HashSet<(String, usize)> = HashSet::new();
+    let aliases = global_ptr_aliases(m);
     // Store edges, iterated to a fixpoint: a defined function (or a param
     // resolved through call sites) stored into a global the ISR context
     // READS joins the ISR context, and its own callees join transitively
@@ -1456,13 +1578,13 @@ fn isr_context_for(
     // recomputed over the grown context each round, so a global read only
     // by a store-edge-added function is still seen.
     loop {
-        let read = isr_read_globals(m, &isr_ctx);
+        let read = isr_read_globals(m, &isr_ctx, &aliases);
         let mut grew = false;
         for f in &m.funcs {
             for b in &f.blocks {
                 for inst in &b.insts {
                     if let Inst::Store(s) = inst {
-                        let Some((g, sk)) = global_field(&s.ptr, f) else {
+                        let Some((g, sk)) = global_field(&s.ptr, f, &aliases) else {
                             continue;
                         };
                         let feeds = read
@@ -1511,6 +1633,57 @@ fn isr_context_for(
                             _ => {}
                         }
                     }
+                    // A memcpy of a local struct into an ISR-read global: the
+                    // HAL "Init(&h)" idiom builds a local handle via field
+                    // stores then memcpy's the whole struct into a global the
+                    // ISR reads (e.g. `g_t0_storage = *h;`). The direct-store
+                    // case above misses this, since the store that actually
+                    // writes the function targets the LOCAL alloca, not the
+                    // global; any function-valued field of that alloca joins
+                    // the ISR context here instead (epic-cc#463).
+                    if let Inst::Memcpy(mc) = inst {
+                        let Some((g, _)) = global_field(&ptr_of_val(&mc.dst), f, &aliases) else {
+                            continue;
+                        };
+                        // The destination is written whole-object, not just
+                        // the one field `global_field`'s 0-offset default
+                        // reports for a bare `@g`, so a read of ANY field of
+                        // `g` means this write may feed it: unlike the
+                        // field-sensitive direct-store case above, which
+                        // knows exactly which field it touches.
+                        let feeds = read.iter().any(|(rg, _)| *rg == g);
+                        if !feeds {
+                            continue;
+                        }
+                        let Some(src_reg) =
+                            ptr_of_val(&mc.src).strip_prefix('%').map(str::to_string)
+                        else {
+                            continue;
+                        };
+                        let is_alloca = f
+                            .blocks
+                            .iter()
+                            .flat_map(|b| &b.insts)
+                            .any(|i| matches!(i, Inst::Alloca(a) if a.dst == src_reg));
+                        if !is_alloca {
+                            continue;
+                        }
+                        for b2 in &f.blocks {
+                            for inst2 in &b2.insts {
+                                let Inst::Store(s2) = inst2 else { continue };
+                                if alloca_field(&s2.ptr, f, &src_reg).is_none() {
+                                    continue;
+                                }
+                                if let Val::Global(fn_name) = &s2.val {
+                                    if defined.contains(fn_name.as_str())
+                                        && isr_ctx.insert(fn_name.clone())
+                                    {
+                                        grew = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1528,7 +1701,7 @@ fn isr_context_for(
         }
         isr_ctx = grown;
     }
-    let read = isr_read_globals(m, &isr_ctx);
+    let read = isr_read_globals(m, &isr_ctx, &aliases);
 
     (isr_ctx, read, param_stores)
 }
@@ -1746,26 +1919,75 @@ fn duplicate_isr_shared(m: Module) -> Module {
                 }
             }
         }
+        // Local allocas fed whole-object into a priority-read global via a
+        // memcpy (the HAL `Init(&h)` idiom, epic-cc#463): a store into any
+        // field of such an alloca needs the same rewrite as a direct store
+        // into the global would, since the memcpy carries it there. No
+        // field granularity here (the memcpy already flattens the struct),
+        // so this is alloca-whole-object, not field-sensitive like the
+        // direct-store case below.
+        let mut alloca_feeds_lo: HashSet<String> = HashSet::new();
+        let mut alloca_feeds_hi: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let Inst::Memcpy(mc) = inst else { continue };
+                let Some((g, _)) = global_field_map(&ptr_of_val(&mc.dst), &bases) else {
+                    continue;
+                };
+                let Some(src_reg) = ptr_of_val(&mc.src).strip_prefix('%').map(str::to_string)
+                else {
+                    continue;
+                };
+                if lo_read.iter().any(|(rg, _)| *rg == g) {
+                    alloca_feeds_lo.insert(src_reg.clone());
+                }
+                if hi_read.iter().any(|(rg, _)| *rg == g) {
+                    alloca_feeds_hi.insert(src_reg);
+                }
+            }
+        }
         let in_lo = rewrite_lo.contains(&f.name);
         let in_hi = rewrite_hi.contains(&f.name);
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 if let Inst::Store(s) = inst {
-                    let Some((g, sk)) = global_field_map(&s.ptr, &bases) else {
+                    if let Some((g, sk)) = global_field_map(&s.ptr, &bases) {
+                        let feeds_lo = lo_read
+                            .iter()
+                            .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
+                        let feeds_hi = hi_read
+                            .iter()
+                            .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
+                        if let Val::Global(fn_name) = &s.val {
+                            let lo_hit =
+                                !in_lo && feeds_lo && shared_lo_set.contains(fn_name.as_str());
+                            let hi_hit =
+                                !in_hi && feeds_hi && shared_hi_set.contains(fn_name.as_str());
+                            if lo_hit && hi_hit {
+                                panic!(
+                                    "legalize: store of @{fn_name} feeds both ISR priorities' read sets; no single copy serves both contexts"
+                                );
+                            } else if lo_hit {
+                                s.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
+                            } else if hi_hit {
+                                s.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
+                            }
+                        }
+                        continue;
+                    }
+                    let Some(root) = alloca_root_map(&s.ptr, &bases) else {
                         continue;
                     };
-                    let feeds_lo = lo_read
-                        .iter()
-                        .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
-                    let feeds_hi = hi_read
-                        .iter()
-                        .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
                     if let Val::Global(fn_name) = &s.val {
-                        let lo_hit = !in_lo && feeds_lo && shared_lo_set.contains(fn_name.as_str());
-                        let hi_hit = !in_hi && feeds_hi && shared_hi_set.contains(fn_name.as_str());
+                        let lo_hit = !in_lo
+                            && alloca_feeds_lo.contains(&root)
+                            && shared_lo_set.contains(fn_name.as_str());
+                        let hi_hit = !in_hi
+                            && alloca_feeds_hi.contains(&root)
+                            && shared_hi_set.contains(fn_name.as_str());
                         if lo_hit && hi_hit {
                             panic!(
-                                "legalize: store of @{fn_name} feeds both ISR priorities' read sets; no single copy serves both contexts"
+                                "legalize: store of @{fn_name} (via a memcpy'd local) feeds both ISR priorities' read sets; no single copy serves both contexts"
                             );
                         } else if lo_hit {
                             s.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));

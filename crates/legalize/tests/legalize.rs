@@ -540,6 +540,76 @@ fn main_only_stored_callback_stays_main_only() {
     );
 }
 
+/// A callback that flows into an ISR-read global through a whole-struct
+/// memcpy (the HAL `Init(&h)` idiom, epic-cc#463): main builds a local
+/// handle via a field store (`h.OverflowCallback = cb;`), then a memcpy
+/// copies the whole struct into a global the ISR reads through, one field
+/// at a time. The direct-store cross-context rewrite alone never sees the
+/// callback (the store that actually writes it targets the local alloca,
+/// not the global), so before the fix `cb` was never duplicated and ran
+/// with a main-context frame when the real ISR called it, corrupting
+/// whatever main frame it collided with (PIC18F4550 tick ISR hang under
+/// MPLAB SIM: the ISR never reached RETFIE).
+#[test]
+fn fills_memcpy_struct_copy_callback_candidates() {
+    let m = parse(
+        "global g_storage i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %h = alloca 4\n\
+             %f1 = gep %h +2\n\
+             store i16 @cb %f1\n\
+             memcpy @g_storage %h 4\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %p = gep @g_storage +2\n\
+             %1 = load i16 %p\n\
+             call void @1()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    // The struct-copied callback got an `_isr` copy.
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing: the memcpy write-edge was not detected"
+    );
+    // The ISR's indirect call site lists the callback as a candidate.
+    let isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    let call = isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("isr call");
+    assert_eq!(call.callees, vec!["cb_isr".to_string()]);
+    // main's field store into the local handle now points at the `_isr`
+    // copy: this is the rewrite that actually mattered for epic-cc#463,
+    // since the candidate list alone is not enough if the runtime value stored
+    // into the struct is still the original's address, which trips the
+    // indirect call's "no matching candidate" trap at runtime instead of
+    // reaching the callback.
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let main_store = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Store(s) => Some(s),
+            _ => None,
+        })
+        .expect("main store");
+    assert_eq!(
+        main_store.val,
+        ir::Val::Global("cb_isr".to_string()),
+        "main's struct-field store must point at the _isr copy"
+    );
+}
+
 /// A callback that flows into an ISR-read global through a function
 /// parameter (the `EPIC_GPIO_RegisterChangeCallback(on_rb_change)` shape):
 /// the call site's argument is rewritten to the `_isr` copy and the ISR
