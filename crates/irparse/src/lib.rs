@@ -209,9 +209,9 @@ fn literal_ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> 
 
 /// Strips a clang self-type prefix from a nested value. Clang prints every
 /// non-scalar initializer with its own type (`{ T } { v }`, `{ T }`
-/// zeroinitializer, `[N x T] c"..."` / `[N x T] [...]`). The value first
-/// brace/bracket group is that self-type; stripping it leaves the bare
-/// value the decoder expects.
+/// zeroinitializer, `[N x T] c"..."` / `[N x T] [...]` /
+/// `[N x T] zeroinitializer`). The value first brace/bracket group is that
+/// self-type; stripping it leaves the bare value the decoder expects.
 fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
     let value = value.trim();
     if value.starts_with('{') || value.starts_with("<{") {
@@ -238,11 +238,14 @@ fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
         };
     }
     if ty.trim().starts_with('[') && value.starts_with('[') {
-        // `[3 x i8] c"abc"` / `[2 x T] [ ... ]`: the first bracket group
-        // is the self-type.
+        // `[3 x i8] c"abc"` / `[2 x T] [ ... ]` / `[4 x i8] zeroinitializer`:
+        // the first bracket group is the self-type. Without the strip the
+        // type prefix would reach the element-list parser as if it were the
+        // value (epic-cc#441).
         if let Some(i) = matching_bracket(value) {
             let rest = value[i + 1..].trim();
-            if rest.starts_with('c') || rest.starts_with('[') {
+            if rest.starts_with('c') || rest.starts_with('[') || rest.starts_with("zeroinitializer")
+            {
                 return rest;
             }
         }
