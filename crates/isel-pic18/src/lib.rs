@@ -5384,11 +5384,27 @@ pub fn select_with_locs(
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     let addr = base + i as u16;
-                    // A function-address field materializes
-                    // the link-time label literal. (epic-cc#154)
+                    // A ref byte is the high or low half of a pointer
+                    // VALUE: a RAM target resolves through `addrs` right
+                    // here (RAM globals have no assembler label to
+                    // resolve, epic-cc#443); a flash target (function or
+                    // const table) keeps its link-time label literal
+                    // (epic-cc#154).
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                        init.push(format!("    MOVLW {lit}({f})"));
+                        match addrs.get(f) {
+                            Some(&a) => {
+                                let byte = if i % 2 == 0 {
+                                    a & 0xFF
+                                } else {
+                                    (a >> 8) & 0xFF
+                                };
+                                init.push(format!("    MOVLW 0x{byte:02X}"));
+                            }
+                            None => {
+                                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                                init.push(format!("    MOVLW {lit}({f})"));
+                            }
+                        }
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
@@ -5430,20 +5446,35 @@ pub fn select_with_locs(
         );
         out.push(format!("{}:", g.name));
         locs.push(None);
-        // Chunk the plain bytes 8 per line (the earlier layout); a
-        // function-address field materializes the link-time
-        // label literal, byte 0 = LOW(fn), byte 1 = HIGH(fn), resolved by
-        // the assembler's symbol table, and splits its own line. (epic-cc#154)
+        // Chunk the plain bytes 8 per line (the earlier layout); a ref
+        // byte materializes its own line (see the ref match below).
         let mut chunk: Vec<String> = Vec::new();
         for (i, b) in g.bytes.iter().enumerate() {
+            // A ref byte is the high or low half of a pointer VALUE: a
+            // RAM target resolves through `addrs` right here (RAM
+            // globals have no assembler label to resolve, epic-cc#443);
+            // a flash target (function or const table) keeps its
+            // link-time label literal (epic-cc#154).
             if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
                 if !chunk.is_empty() {
                     out.push(format!("    db {}", chunk.join(", ")));
                     locs.push(None);
                     chunk.clear();
                 }
-                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                out.push(format!("    db {lit}({f})"));
+                match addrs.get(f) {
+                    Some(&a) => {
+                        let byte = if i % 2 == 0 {
+                            a & 0xFF
+                        } else {
+                            (a >> 8) & 0xFF
+                        };
+                        out.push(format!("    db 0x{byte:02X}"));
+                    }
+                    None => {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        out.push(format!("    db {lit}({f})"));
+                    }
+                }
                 locs.push(None);
             } else {
                 chunk.push(format!("0x{b:02X}"));
