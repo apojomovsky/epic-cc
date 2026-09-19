@@ -918,3 +918,30 @@ fn ptr_call_forward_c_runs_correctly_and_skips_fsr0() {
         "expected FSR0H touched exactly once (inside callee only):\n{asm}"
     );
 }
+
+#[test]
+fn float_frames_above_the_access_window_select_the_bank() {
+    // The narrow-to-wide float conversion fills (__uitofp_f32's CLRF
+    // loop, __sitofp_f32's MOVF/MOVWF fill and its BTFSC+MOVLW 0xFF sign
+    // fill) address the callee's `val` param slot, which sits wherever
+    // the overlay put the routine's frame: the 0x60-byte pad forces every
+    // frame past the access window, so the fill must go through the bank
+    // select. The sim proves the conversions: in = 3.0f gives 4.0 + 5.0
+    // + 6.0 - 1.0 = 14.0f (0x41600000).
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/float_frame_high.c"
+    ));
+    p.ram_mut()[globals["in"] as usize] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 1] = 0x00;
+    p.ram_mut()[globals["in"] as usize + 2] = 0x40;
+    p.ram_mut()[globals["in"] as usize + 3] = 0x40;
+    p.run(2_000_000);
+    // out = 14.0f = 0x41600000 LE 00 00 60 41
+    assert_eq!(p.ram()[globals["out"] as usize], 0x00);
+    assert_eq!(p.ram()[globals["out"] as usize + 1], 0x00);
+    assert_eq!(p.ram()[globals["out"] as usize + 2], 0x60);
+    assert_eq!(p.ram()[globals["out"] as usize + 3], 0x41);
+    assert_eq!(p.ram()[globals["sc"] as usize], 0xFF, "sc holds -1");
+    assert!(p.halted());
+}

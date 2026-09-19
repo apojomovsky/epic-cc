@@ -1711,28 +1711,33 @@ impl<'m> Gen<'m> {
                         i, func
                     );
                     let aw = ty.bytes() as u16;
+                    // The fill addresses the callee's param slot through
+                    // operand(): a routine frame lives in one GPR bank
+                    // (round_if_routine), so the bank select rides the
+                    // first operand and no MOVLB can land between the
+                    // BTFSC and its skipped MOVLW.
                     match func {
                         "__uitofp_f32" => {
                             for j in aw..4 {
-                                self.emit(format!("    CLRF 0x{:03X},A", pa + j));
+                                self.emit_banked("CLRF", pa + j, "");
                             }
                         }
                         "__sitofp_f32" => {
                             let sign = pa + aw - 1;
                             if aw == 2 {
-                                self.emit(format!("    MOVF 0x{sign:03X},W,A"));
-                                self.emit(format!("    MOVWF 0x{:03X},A", pa + 2));
-                                self.emit(format!("    MOVWF 0x{:03X},A", pa + 3));
+                                self.emit_banked("MOVF", sign, ",W");
+                                self.emit_banked("MOVWF", pa + 2, "");
+                                self.emit_banked("MOVWF", pa + 3, "");
                             } else {
                                 assert_eq!(
                                     aw, 1,
                                     "isel-pic18: unexpected narrow width for @__sitofp_f32"
                                 );
                                 self.emit("    MOVLW 0x00".to_string());
-                                self.emit(format!("    BTFSC 0x{sign:03X},7,A"));
+                                self.emit_banked("BTFSC", sign, ", 7");
                                 self.emit("    MOVLW 0xFF".to_string());
                                 for j in 1..4 {
-                                    self.emit(format!("    MOVWF 0x{:03X},A", pa + j));
+                                    self.emit_banked("MOVWF", pa + j, "");
                                 }
                             }
                         }
@@ -2449,7 +2454,7 @@ impl<'m> Gen<'m> {
                                     Some(a) => self.emit_copy_byte(a, dst),
                                     None => {
                                         self.emit("    MOVF 0xFE7,W,A".to_string()); // INDF1
-                                        self.emit(format!("    MOVWF 0x{dst:03X},A"));
+                                        self.emit_banked("MOVWF", dst, "");
                                     }
                                 }
                             }
