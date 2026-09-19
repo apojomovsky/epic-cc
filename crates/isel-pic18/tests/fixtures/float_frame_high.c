@@ -5,15 +5,19 @@
 // access window on the 4550, so the fill would read access-RAM garbage
 // instead of the param bytes without the bank select.
 // in = 3.0f: c = (u8)(4.0) = 4, k = (int)(5.0) = 5, u = (uint)(6.0) = 6,
-// out = 4.0 + 5.0 + 6.0 = 15.0f = 0x41700000.
+// sc = (schar)(-1.0) = -1: the negative case forces 0xFF sign fills that
+// zero-initialized RAM cannot mimic, and covers __sitofp_f32's aw==1
+// BTFSC+MOVLW 0xFF path. out = 4.0 + 5.0 + 6.0 - 1.0 = 14.0f.
 volatile unsigned char pad[0x60];
 volatile float in;
 volatile float out;
+volatile signed char sc;
 
 void main(void) {
     float a = in;                            // 3.0
     unsigned char c = (unsigned char)(a + 1.0f);
     int k = (int)(a + 2.0f);
     unsigned int u = (unsigned int)(a + 3.0f);
-    out = (float)c + (float)k + (float)u;
+    sc = (signed char)(a - 4.0f);
+    out = (float)c + (float)k + (float)u + (float)sc;
 }

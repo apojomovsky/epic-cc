@@ -927,7 +927,7 @@ fn float_frames_above_the_access_window_select_the_bank() {
     // the overlay put the routine's frame: the 0x60-byte pad forces every
     // frame past the access window, so the fill must go through the bank
     // select. The sim proves the conversions: in = 3.0f gives 4.0 + 5.0
-    // + 6.0 = 15.0f (0x41700000).
+    // + 6.0 - 1.0 = 14.0f (0x41600000).
     let (mut p, globals) = compile(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/float_frame_high.c"
@@ -937,10 +937,11 @@ fn float_frames_above_the_access_window_select_the_bank() {
     p.ram_mut()[globals["in"] as usize + 2] = 0x40;
     p.ram_mut()[globals["in"] as usize + 3] = 0x40;
     p.run(2_000_000);
-    // out = 15.0f = 0x41700000 LE 00 00 70 41
+    // out = 14.0f = 0x41600000 LE 00 00 60 41
     assert_eq!(p.ram()[globals["out"] as usize], 0x00);
     assert_eq!(p.ram()[globals["out"] as usize + 1], 0x00);
-    assert_eq!(p.ram()[globals["out"] as usize + 2], 0x70);
+    assert_eq!(p.ram()[globals["out"] as usize + 2], 0x60);
     assert_eq!(p.ram()[globals["out"] as usize + 3], 0x41);
+    assert_eq!(p.ram()[globals["sc"] as usize], 0xFF, "sc holds -1");
     assert!(p.halted());
 }

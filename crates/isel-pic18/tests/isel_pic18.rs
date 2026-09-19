@@ -3316,6 +3316,8 @@ fn const_nonzero_store_still_stages_through_w() {
     assert!(asm.contains("MOVWF 0x020,A"), "non-zero byte:\n{asm}");
     assert!(!asm.contains("CLRF 0x020,"), "non-zero byte:\n{asm}");
 }
+
+#[test]
 fn memcpy_indirect_src_to_banked_direct_dst_selects_the_bank() {
     // A memcpy from an FSR1-indirect source (an sret pointer param) into
     // a banked direct global must select the bank: the stale access-bank
