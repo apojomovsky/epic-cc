@@ -743,6 +743,33 @@ fn ptr_postinc_c_runs_correctly_and_seeds_fsr0_once() {
         postinc_uses, 6,
         "expected 6 POSTINC0 uses (3 per 4-byte access x 2 accesses):\n{asm}"
     );
+#[test]
+fn stride_chain_c_runs_correctly() {
+    // Runtime indices over a 12-byte-stride struct array, on both scaled
+    // pointer paths: FSR0/INDF0 for the volatile RAM array and
+    // TBLPTR/TBLRD for the flash const array. The shift-add chain must
+    // land every access exactly where the naive unrolled adds did.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stride_chain.c"
+    ));
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x4E,
+        "out == hand-computed 0x4E (fixture comment's trace)"
+    );
+    // The written element itself: recs[3] = base + 3*12, val = 0x1234.
+    let recs = globals["recs"] as usize;
+    assert_eq!(p.ram()[recs + 3 * 12], 0x34, "recs[3].val low byte");
+    assert_eq!(p.ram()[recs + 3 * 12 + 1], 0x12, "recs[3].val high byte");
+    assert_eq!(p.ram()[recs + 3 * 12 + 2], 0x00, "recs[3].tag untouched");
+    assert_eq!(
+        p.ram()[recs + 5 * 12 + 2],
+        7,
+        "recs[5].tag written via the constant index"
+    );
+    assert!(p.halted());
 }
 
 #[test]
