@@ -31,6 +31,23 @@ enum Addr {
     Indirect,
 }
 
+/// Identifies what an `emit_fsr0_dynamic`/`emit_fsr0_indirect_slot` setup
+/// grounds FSR0 in, for the cross-access reuse check in `fsr0_holds`
+/// (epic-cc#472). Two setups are the "same base" only when this matches
+/// exactly.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fsr0Origin {
+    /// A compile-time-constant base address (a global's link-time
+    /// address, or an alloca/byval slot's own fixed address) --
+    /// `emit_fsr0_dynamic`'s `base_addr` parameter.
+    Absolute(u16),
+    /// A runtime pointer VALUE loaded fresh from the 2-byte slot at this
+    /// address -- `emit_fsr0_indirect_slot`'s `slot_addr` parameter.
+    /// Reuse is only sound while nothing has written to this slot since
+    /// the value was loaded.
+    SlotValue(u16),
+}
+
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
@@ -52,6 +69,19 @@ struct Gen<'m> {
     /// be reached with any prior `BSR` state, so it must be re-established
     /// on the next banked access rather than assumed).
     bsr: Option<u8>,
+    /// What FSR0 currently addresses, if known: `Some((origin, offset))`
+    /// where `offset` is the `k + byte_off` most recently set up on top of
+    /// `origin`. Lets a later access through the *same* base skip
+    /// re-deriving the address from scratch and instead add only the
+    /// forward delta (epic-cc#472). `None` when unknown: module start,
+    /// just after a label (mirrors `bsr`'s exact reasoning: a branch
+    /// target can be reached with any prior FSR0 state), just after a
+    /// `CALL` (the callee almost certainly used FSR0 for its own pointer
+    /// accesses), or just after this codegen itself writes to a tracked
+    /// `SlotValue`'s slot (the one case straight-line code can change the
+    /// pointer value an already-resolved access still depends on -- see
+    /// `invalidate_fsr0_if_slot_written`).
+    fsr0_holds: Option<(Fsr0Origin, u16)>,
     cur_func: &'m str,
     /// Marks an interrupt handler: the body runs a save prologue and restore
     /// epilogue with `RETFIE` instead of `RETURN` (the single-vector mode).
@@ -76,15 +106,16 @@ impl<'m> Gen<'m> {
         self.locs.push(self.cur_loc.clone());
     }
 
-    /// Emit a label line and clear the tracked `BSR`.
-    /// Every label joins paths with different `MOVLB` histories, so reusing
-    /// a stale tracked bank miscompiles: the reset stays structural here
-    /// rather than repeated at each call site.
+    /// Emit a label line and clear the tracked `BSR` and `FSR0` state.
+    /// Every label joins paths with different `MOVLB`/FSR0 histories, so
+    /// reusing a stale tracked bank or FSR0 position miscompiles: the
+    /// reset stays structural here rather than repeated at each call site.
     /// `CALL` returns join the same way but are not labels, so the call
-    /// arm clears `self.bsr` directly after emitting `CALL`.
+    /// arm clears `self.bsr`/`self.fsr0_holds` directly after emitting `CALL`.
     fn emit_label(&mut self, label: &str) {
         self.emit(format!("{label}:"));
         self.bsr = None;
+        self.fsr0_holds = None;
     }
 
     /// Emit one `MOVFF src, dst` per pair, in array order. Callers that
@@ -296,6 +327,38 @@ impl<'m> Gen<'m> {
         })
     }
 
+    /// Whether `ptr` is a runtime pointer *value* already sitting, fully
+    /// formed, as two bytes in a frame slot -- the common case of
+    /// forwarding a plain pointer parameter/local as a call argument (as
+    /// opposed to a `gep` off it, or an indexed/computed address). When so,
+    /// returns that slot's address: the caller can copy the two bytes
+    /// there directly into a callee's param slot instead of routing them
+    /// through FSR0 via `emit_ptr_setup` (whose general address-computation
+    /// machinery, needed for a real GEP/index, is pure overhead on an
+    /// address that is already finished). Mirrors the `Base::Slot`/
+    /// `holds_addr` logic in `emit_ptr_setup`'s own resolution, restricted
+    /// to the zero-offset, no-dynamic-terms case. (epic-cc#473)
+    fn direct_ptr_forward_src(&self, ptr: &Val) -> Option<u16> {
+        let Val::Reg(r) = ptr else {
+            return None;
+        };
+        let (base, k, terms) = self.resolved.get(&ssa_key(self.cur_func, r))?;
+        if *k != 0 || !terms.is_empty() {
+            return None;
+        }
+        let Base::Slot(sname, indirect) = base else {
+            return None;
+        };
+        let holds_addr = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| f.params.iter().any(|p| p.name == *sname && p.ptr))
+            .unwrap_or(false);
+        (*indirect || holds_addr).then(|| self.slot_addr(self.cur_func, sname).direct())
+    }
+
     /// Reports whether pointer-select dst `name` was seeded by iselcore as an
     /// indirect slot (`Base::Slot(_, true)`): its bytes are a runtime
     /// address VALUE the select must materialize, not a folded pointer.
@@ -328,7 +391,35 @@ impl<'m> Gen<'m> {
 
     /// One byte, memory-to-memory, via `MOVFF`: no access bit, no `BSR`.
     fn emit_copy_byte(&mut self, src: u16, dst: u16) {
+        self.invalidate_fsr0_if_slot_written(dst, 1);
         self.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+    }
+
+    /// If `fsr0_holds` is grounded in a `SlotValue` whose slot overlaps
+    /// `[dst, dst+nbytes)`, drop the tracked state: this codegen is about
+    /// to overwrite the very pointer value a later access's reuse check
+    /// would otherwise trust as unchanged (epic-cc#472). A pointer local
+    /// that isn't promoted to a pure SSA register (the common case: its
+    /// value is reloaded fresh from its slot at every use, exactly the
+    /// pattern this reuse optimization targets) is reassigned by an
+    /// ordinary write to that same slot, so this is the one place
+    /// straight-line code (no label, no `CALL`) can invalidate the
+    /// tracked state; `emit_copy_byte` and `emit_move_val_to_slot` are the
+    /// two functions every plain "materialize a value into a slot" path
+    /// funnels through (direct `Store`, phi-copy resolution, etc.), so
+    /// hooking both here covers every write site without threading this
+    /// check through each individual caller. A `SlotValue` origin whose
+    /// slot does not overlap is untouched; an `Absolute` origin is a
+    /// link-time-constant address that no write can ever change, so it is
+    /// never invalidated here.
+    fn invalidate_fsr0_if_slot_written(&mut self, dst: u16, nbytes: u16) {
+        if let Some((Fsr0Origin::SlotValue(slot), _)) = self.fsr0_holds {
+            let dst_end = dst + nbytes; // exclusive
+            let slot_end = slot + 2; // a pointer value is always 2 bytes
+            if dst < slot_end && slot < dst_end {
+                self.fsr0_holds = None;
+            }
+        }
     }
 
     /// Copy the two-byte ADDRESS VALUE of `val` into the slot at `dst`:
@@ -417,6 +508,7 @@ impl<'m> Gen<'m> {
     /// `MOVLW`/`MOVWF` (which DOES need the access bit: this is the one
     /// place a plain copy still touches `operand`/`BSR`).
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
+        self.invalidate_fsr0_if_slot_written(dst, u16::from(ty.bytes()));
         match val {
             Val::Const(k) => {
                 for i in 0..ty.bytes() {
@@ -757,17 +849,78 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Try to reuse FSR0's currently tracked contents for a new access
+    /// grounded in `origin` at offset `target_off`, emitting only the
+    /// forward delta (one `ADDWF`/`ADDWFC` pair, or nothing at all when
+    /// the delta is zero) instead of a full base-plus-offset setup.
+    /// Returns `true` when it reused (the caller's full setup is skipped
+    /// entirely); `false` when the tracked state doesn't match (unknown,
+    /// a different origin, or `target_off` is behind the tracked
+    /// position -- going backward would need a second instruction form
+    /// (`SUBWF`) this conservative version doesn't bother with, since
+    /// forward struct-field/array-element access is the overwhelmingly
+    /// common shape). A `false` caller performs its normal full setup and
+    /// is responsible for recording the new position itself. (epic-cc#472)
+    fn try_reuse_fsr0(&mut self, origin: Fsr0Origin, target_off: u16) -> bool {
+        let Some((cur_origin, cur_off)) = self.fsr0_holds else {
+            return false;
+        };
+        if cur_origin != origin || target_off < cur_off {
+            return false;
+        }
+        let delta = target_off - cur_off;
+        if delta != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", (delta & 0xFF) as u8));
+            let (fa, ff) = self.operand(0xFE9);
+            self.emit(format!(
+                "    ADDWF 0x{ff:03X},F,{}",
+                if fa == 0 { "A" } else { "B" }
+            ));
+            self.emit(format!("    MOVLW 0x{:02X}", (delta >> 8) as u8));
+            let (ha, hf) = self.operand(0xFEA);
+            self.emit(format!(
+                "    ADDWFC 0x{hf:03X},F,{}",
+                if ha == 0 { "A" } else { "B" }
+            ));
+        }
+        true
+    }
+
+    /// After a multi-byte indirect `Load`/`Store` walks `n` bytes via
+    /// `POSTINC0` (epic-cc#471), FSR0 physically ends up `n - 1` past
+    /// where `emit_ptr_setup` left it recorded (the setup records the
+    /// *first* byte's offset; the loop's own `POSTINC0` steps advance
+    /// past every byte but the last, which stays on `INDF0`). Reflect
+    /// that in `fsr0_holds` so the next access's delta is computed from
+    /// where FSR0 truly is. A no-op when `fsr0_holds` is `None` (the
+    /// access had dynamic terms, so nothing was tracked to begin with).
+    fn bump_fsr0_tracked_offset(&mut self, n: u8) {
+        if let Some((origin, off)) = self.fsr0_holds {
+            self.fsr0_holds = Some((origin, off + u16::from(n) - 1));
+        }
+    }
+
     /// Sets `FSR0 = base_addr + k + Σ terms + byte_off` for `INDF0` access.
     /// `LFSR` seeds the static part in one instruction; every dynamic term
     /// folds in via `ADDWF`/`ADDWFC` through `operand()`, which treats
     /// FSR0L/FSR0H as the always-access-bank SFR segment, so no `MOVLB`
     /// emits. See ADR-009 item 6 and its follow-up note on multi-term
     /// support.
+    ///
+    /// When `terms` is empty and FSR0 already holds this same `base_addr`
+    /// at or before the target offset, `try_reuse_fsr0` emits the forward
+    /// delta instead of the full `LFSR` (epic-cc#472); a non-empty `terms`
+    /// always takes the full setup, since the reuse check has no way to
+    /// represent a previously-added dynamic term's runtime contribution.
     fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
         let static_part = u16::from(k) + u16::from(byte_off);
-        let lit = (base_addr + static_part) & 0xFFF;
-        self.emit(format!("    LFSR 0, 0x{lit:03X}"));
-        self.add_term_to_fsr0(terms);
+        let origin = Fsr0Origin::Absolute(base_addr);
+        if !(terms.is_empty() && self.try_reuse_fsr0(origin, static_part)) {
+            let lit = (base_addr + static_part) & 0xFFF;
+            self.emit(format!("    LFSR 0, 0x{lit:03X}"));
+            self.add_term_to_fsr0(terms);
+        }
+        self.fsr0_holds = terms.is_empty().then_some((origin, static_part));
     }
     /// `slot_addr` holds a 2-byte ADDRESS (an sret param's contents), not
     /// the object itself: load THAT address into FSR0 (`MOVFF slot,
@@ -775,6 +928,12 @@ impl<'m> Gen<'m> {
     /// access bit needed since MOVFF never uses one), then add the static
     /// offset (`k + byte_off`) and every dynamic term the same way
     /// `emit_fsr0_dynamic` does, and access through `INDF0`.
+    ///
+    /// Same `try_reuse_fsr0` shortcut as `emit_fsr0_dynamic`: when `terms`
+    /// is empty and FSR0 already holds a value loaded from this same
+    /// `slot_addr` (and nothing has written to that slot since, tracked by
+    /// `invalidate_fsr0_if_slot_written`), skip the base reload and add
+    /// only the forward delta (epic-cc#472).
     fn emit_fsr0_indirect_slot(
         &mut self,
         slot_addr: u16,
@@ -782,24 +941,28 @@ impl<'m> Gen<'m> {
         terms: &[(u8, String)],
         byte_off: u8,
     ) {
-        self.emit_copy_byte(slot_addr, 0xFE9); // FSR0L = low byte of the stored address
-        self.emit_copy_byte(slot_addr + 1, 0xFEA); // FSR0H = high byte
         let static_part = u16::from(k) + u16::from(byte_off);
-        if static_part != 0 {
-            self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
-            let (fa, ff) = self.operand(0xFE9);
-            self.emit(format!(
-                "    ADDWF 0x{ff:03X},F,{}",
-                if fa == 0 { "A" } else { "B" }
-            ));
-            self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
-            let (ha, hf) = self.operand(0xFEA);
-            self.emit(format!(
-                "    ADDWFC 0x{hf:03X},F,{}",
-                if ha == 0 { "A" } else { "B" }
-            ));
+        let origin = Fsr0Origin::SlotValue(slot_addr);
+        if !(terms.is_empty() && self.try_reuse_fsr0(origin, static_part)) {
+            self.emit_copy_byte(slot_addr, 0xFE9); // FSR0L = low byte of the stored address
+            self.emit_copy_byte(slot_addr + 1, 0xFEA); // FSR0H = high byte
+            if static_part != 0 {
+                self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
+                let (fa, ff) = self.operand(0xFE9);
+                self.emit(format!(
+                    "    ADDWF 0x{ff:03X},F,{}",
+                    if fa == 0 { "A" } else { "B" }
+                ));
+                self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
+                let (ha, hf) = self.operand(0xFEA);
+                self.emit(format!(
+                    "    ADDWFC 0x{hf:03X},F,{}",
+                    if ha == 0 { "A" } else { "B" }
+                ));
+            }
+            self.add_term_to_fsr0(terms);
         }
-        self.add_term_to_fsr0(terms);
+        self.fsr0_holds = terms.is_empty().then_some((origin, static_part));
     }
     /// Add every dynamic term onto `FSR0L`/`FSR0H` with carry, `scale`
     /// times each, in order: `MOVF %reg,W; ADDWF FSR0L,F; MOVLW 0;
@@ -1002,24 +1165,29 @@ impl<'m> Gen<'m> {
                     !matches!(arg.val, Val::Const(_)),
                     "isel-pic18: const sret call arg not yet supported"
                 );
-                match self.emit_ptr_setup(&arg.val, 0) {
-                    Addr::Direct(addr) => {
-                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                        let (a0, f0) = self.operand(pa);
-                        self.emit(format!(
-                            "    MOVWF 0x{f0:03X},{}",
-                            if a0 == 0 { "A" } else { "B" }
-                        ));
-                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
-                        let (a1, f1) = self.operand(pa + 1);
-                        self.emit(format!(
-                            "    MOVWF 0x{f1:03X},{}",
-                            if a1 == 0 { "A" } else { "B" }
-                        ));
-                    }
-                    Addr::Indirect => {
-                        self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
-                        self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
+                if let Some(sa) = self.direct_ptr_forward_src(&arg.val) {
+                    self.emit_copy_byte(sa, pa);
+                    self.emit_copy_byte(sa + 1, pa + 1);
+                } else {
+                    match self.emit_ptr_setup(&arg.val, 0) {
+                        Addr::Direct(addr) => {
+                            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                            let (a0, f0) = self.operand(pa);
+                            self.emit(format!(
+                                "    MOVWF 0x{f0:03X},{}",
+                                if a0 == 0 { "A" } else { "B" }
+                            ));
+                            self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                            let (a1, f1) = self.operand(pa + 1);
+                            self.emit(format!(
+                                "    MOVWF 0x{f1:03X},{}",
+                                if a1 == 0 { "A" } else { "B" }
+                            ));
+                        }
+                        Addr::Indirect => {
+                            self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
+                            self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
+                        }
                     }
                 }
             } else if arg.ty.is_none() {
@@ -1086,6 +1254,9 @@ impl<'m> Gen<'m> {
                     // address at runtime. (epic-cc#155)
                     if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) {
                         let sa = self.slot_addr(self.cur_func, r).direct();
+                        self.emit_copy_byte(sa, pa);
+                        self.emit_copy_byte(sa + 1, pa + 1);
+                    } else if let Some(sa) = self.direct_ptr_forward_src(&arg.val) {
                         self.emit_copy_byte(sa, pa);
                         self.emit_copy_byte(sa + 1, pa + 1);
                     } else {
@@ -1243,6 +1414,7 @@ impl<'m> Gen<'m> {
                                 dst + u16::from(k)
                             ));
                         }
+                        self.bump_fsr0_tracked_offset(n);
                     }
                 }
             }
@@ -1300,6 +1472,7 @@ impl<'m> Gen<'m> {
                             let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
                             self.emit(format!("    MOVWF 0x{reg:03X},A"));
                         }
+                        self.bump_fsr0_tracked_offset(n);
                     }
                 }
             }
@@ -1834,7 +2007,11 @@ impl<'m> Gen<'m> {
                     // bank on `RETURN`, so the tracked value is stale at return. Trusting
                     // it elides a needed `MOVLB` and addresses the wrong bank, so the arm
                     // clears `self.bsr` directly (`emit_label` cannot cover a non-label).
+                    // The callee almost certainly used FSR0 for its own pointer
+                    // accesses too, so the tracked FSR0 position is equally stale
+                    // (epic-cc#472).
                     self.bsr = None;
+                    self.fsr0_holds = None;
                     if let Some(d) = &c.dst {
                         let ty = c.ty.expect("isel-pic18: valued call must carry a type");
                         let dst = self.slot_addr(self.cur_func, d).direct();
@@ -1946,6 +2123,7 @@ impl<'m> Gen<'m> {
             self.emit_call_args(cand, args);
             self.emit(format!("    CALL {cand}"));
             self.bsr = None;
+            self.fsr0_holds = None;
             self.emit(format!("    BRA {l_done}"));
             self.emit_label(&l_next);
         }
@@ -5076,6 +5254,7 @@ pub fn select_with_locs(
                 retval_lo: common_lo,
                 access_bank_hi,
                 bsr: None,
+                fsr0_holds: None,
                 cur_func: &f.name,
                 isr: f.isr,
                 tmp: &mut tmp,
@@ -5167,6 +5346,7 @@ pub fn select_with_locs(
             retval_lo: common_lo,
             access_bank_hi,
             bsr: None,
+            fsr0_holds: None,
             cur_func: &f.name,
             isr: f.isr,
             tmp: &mut tmp,
@@ -5603,6 +5783,7 @@ mod tests {
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
+                fsr0_holds: None,
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
@@ -5620,6 +5801,7 @@ mod tests {
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
+                fsr0_holds: None,
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
@@ -5651,6 +5833,7 @@ mod p3_gen_tests {
             retval_lo: 0,
             access_bank_hi: 0x5F,
             bsr: None,
+            fsr0_holds: None,
             cur_func: "main",
             isr: false,
             tmp,

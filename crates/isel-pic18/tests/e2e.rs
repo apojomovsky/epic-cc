@@ -744,3 +744,106 @@ fn ptr_postinc_c_runs_correctly_and_seeds_fsr0_once() {
         "expected 6 POSTINC0 uses (3 per 4-byte access x 2 accesses):\n{asm}"
     );
 }
+
+#[test]
+fn ptr_fields_reuse_c_runs_correctly_and_reuses_fsr0() {
+    // epic-cc#472: `p->a = 1; p->b = 2; p->c = 3; p->d = 4;` through the
+    // same unchanged runtime pointer must seed FSR0's base (FSR0L/FSR0H,
+    // 0xFE9/0xFEA) exactly once, for the first field, and reuse it for the
+    // other three via a forward delta add (ADDWF/ADDWFC against FSR0L/H's
+    // 8-bit SFR-segment form, 0x0E9/0x0EA) instead of re-deriving the
+    // address from scratch each time.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptr_fields_reuse.c"
+    ));
+
+    let vp = globals["vp"] as usize;
+    let buf = globals["buf"] as usize;
+    p.ram_mut()[vp] = (buf & 0xFF) as u8;
+    p.ram_mut()[vp + 1] = (buf >> 8) as u8;
+
+    p.run(2_000);
+
+    assert_eq!(p.ram()[buf], 1, "buf.a");
+    assert_eq!(p.ram()[buf + 1], 2, "buf.b");
+    assert_eq!(p.ram()[buf + 2], 3, "buf.c");
+    assert_eq!(p.ram()[buf + 3], 4, "buf.d");
+    assert!(p.halted());
+
+    // FSR0L/FSR0H must be seeded from the pointer's slot exactly once
+    // (for field `a`) -- before the fix each of the 4 field stores
+    // re-seeded FSR0 independently, so this would read 4 instead of 1.
+    let fsr0l_seeds = asm.matches("0xFE9").count();
+    let fsr0h_seeds = asm.matches("0xFEA").count();
+    assert_eq!(
+        fsr0l_seeds, 1,
+        "expected FSR0L seeded exactly once (first field only):\n{asm}"
+    );
+    assert_eq!(
+        fsr0h_seeds, 1,
+        "expected FSR0H seeded exactly once (first field only):\n{asm}"
+    );
+
+    // The other 3 fields (b, c, d) must each reuse FSR0 via a forward
+    // delta add instead of a full reload: 3 ADDWF/ADDWFC pairs against
+    // FSR0L/FSR0H's 8-bit SFR-segment form.
+    let delta_lo = asm.matches("0x0E9").count();
+    let delta_hi = asm.matches("0x0EA").count();
+    assert_eq!(
+        delta_lo, 3,
+        "expected 3 forward-delta adds to FSR0L (fields b, c, d):\n{asm}"
+    );
+    assert_eq!(
+        delta_hi, 3,
+        "expected 3 forward-delta adds to FSR0H (fields b, c, d):\n{asm}"
+    );
+
+    // Every field write still goes through INDF0 (0xFEF): reuse only
+    // changes how FSR0 gets to the right address, never the access itself.
+    let indf0_writes = asm.matches("0xFEF").count();
+    assert_eq!(
+        indf0_writes, 4,
+        "expected 4 INDF0 writes (one per field):\n{asm}"
+    );
+}
+
+#[test]
+fn ptr_call_forward_c_runs_correctly_and_skips_fsr0() {
+    // epic-cc#473: `fwd(s_t *p) { callee(p); }` forwarding its own pointer
+    // param as a call argument must copy the two bytes directly into
+    // `callee`'s param slot, not round-trip them through FSR0L/FSR0H
+    // (0xFE9/0xFEA). Same for `main`'s `fwd(vp)` (a loaded global pointer
+    // forwarded straight into a call). The only place FSR0 is genuinely
+    // needed is inside `callee`, which actually dereferences the pointer.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptr_call_forward.c"
+    ));
+
+    let vp = globals["vp"] as usize;
+    let buf = globals["buf"] as usize;
+    p.ram_mut()[vp] = (buf & 0xFF) as u8;
+    p.ram_mut()[vp + 1] = (buf >> 8) as u8;
+
+    p.run(2_000);
+
+    assert_eq!(p.ram()[buf], 1, "buf.a");
+    assert!(p.halted());
+
+    // FSR0L/FSR0H must be seeded exactly once in the whole program: inside
+    // `callee`, to dereference `p->a`. Before the fix, `fwd`'s forwarding
+    // of its own param and `main`'s forwarding of the loaded global each
+    // added their own (unneeded) FSR0 round-trip, so this would read 3
+    // instead of 1.
+    let fsr0l_seeds = asm.matches("0xFE9").count();
+    let fsr0h_seeds = asm.matches("0xFEA").count();
+    assert_eq!(
+        fsr0l_seeds, 1,
+        "expected FSR0L touched exactly once (inside callee only):\n{asm}"
+    );
+    assert_eq!(
+        fsr0h_seeds, 1,
+        "expected FSR0H touched exactly once (inside callee only):\n{asm}"
+    );
+}

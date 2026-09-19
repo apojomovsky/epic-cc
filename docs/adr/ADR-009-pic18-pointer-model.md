@@ -17,6 +17,17 @@ PIC18 pointer/array/struct support (port P3) uses:
    `Indirect` (FSR0 set up, access through `INDF0`). An sret param's
    slot holds a 2-byte target ADDRESS, not the object itself
    (`Base::Slot(name, true)`), and always goes indirect.
+   **Narrowed (epic-cc#473, 2026-09-19):** forwarding a pointer *value*
+   as a call argument (a plain-ptr/sret argument whose resolved base is
+   an indirect slot at offset 0 with no dynamic terms -- i.e. the
+   argument's two bytes are already sitting, fully formed, in a frame
+   slot) is neither `Direct` nor a genuine `Indirect` dereference: it is
+   a plain 2-byte memory-to-memory copy from that slot into the callee's
+   param slot. `emit_call_args` now recognizes this degenerate case
+   (`direct_ptr_forward_src`) and copies the two bytes with `MOVFF`
+   directly, skipping FSR0 entirely; `emit_ptr_setup`'s FSR0 path is
+   reached only when the argument needs a real address computation
+   (a GEP or dynamic index).
 3. **Exactly one indirection register, FSR0, with per-byte re-setup.**
    Every dynamic access recomputes `FSR0 = base + k + Σ scale×%reg +
    byte_off` from scratch per byte (`LFSR` for the static part, unrolled
@@ -30,6 +41,29 @@ PIC18 pointer/array/struct support (port P3) uses:
    applies *across* separate accesses (no auto-increment carries state
    from one `Inst::Load`/`Inst::Store` to the next) -- see the "Rejected
    alternatives" note below for the boundary this draws.
+   **Narrowed further (epic-cc#472, 2026-09-19):** re-setup *across*
+   separate accesses through the same base is no longer always a full
+   `LFSR`/base-reload. `Gen.fsr0_holds` tracks `(origin, offset)` --
+   what `emit_fsr0_dynamic`/`emit_fsr0_indirect_slot` last grounded FSR0
+   in, and at what compile-time offset -- and a later access with `terms
+   = []` against the *same* origin and a `target_off >= offset` emits
+   only the forward delta (`MOVLW`/`ADDWF`/`ADDWFC`, 4 words, or nothing
+   at all when the delta is zero) instead of the full setup. This is not
+   auto-increment: it is still one explicit, self-contained add computed
+   from tracked compile-time state, the same shape item 3's per-term
+   `ADDWF`/`ADDWFC` already uses, not a new addressing mode. `fsr0_holds`
+   clears at every label and every `CALL` (mirrors `bsr`'s exact
+   invalidation surface: a branch target or a callee's own FSR0 use can
+   leave anything there) and additionally whenever this codegen writes to
+   a tracked `SlotValue` origin's own slot (`emit_copy_byte`/
+   `emit_move_val_to_slot` both check this on every write) -- the one
+   straight-line-code case that can change the pointer value a later
+   access's reuse check would otherwise wrongly trust, since a pointer
+   local not promoted to a pure SSA register is reassigned by an ordinary
+   store to that same slot. Backward offsets (`target_off < offset`) fall
+   back to the full setup rather than adding a `SUBWF` path, since forward
+   struct-field/array-element access is the overwhelmingly common shape
+   and the conservative default costs nothing but a missed optimization.
 4. **No `PLUSWn` for dynamic-offset writes.** `PLUSWn` computes its
    effective address from `FSRn + W` at execution time; a write needs `W`
    to hold the byte being stored, colliding with using `W` as the offset.
@@ -113,5 +147,21 @@ A P4+ fixture needs two simultaneously indirect pointers (add FSR1).
 The per-byte re-setup showed up in profiling (epic-cc#469/#471, 2026-09-19)
 and was addressed: auto-increment within one access, with an explicit
 ordering contract (single-loop, consecutive, ascending, nothing else
-touching FSR0 in between). Re-seeding across separate accesses is
-unchanged and untouched by this.
+touching FSR0 in between).
+
+The re-seeding-across-separate-accesses cost also showed up in profiling
+(epic-cc#469/#472, 2026-09-19) and was addressed: a tracked `(origin,
+offset)` state lets a same-base access reuse FSR0 via a forward delta
+add instead of a full reload, invalidated at labels, `CALL`s, and writes
+to a tracked slot's own address (item 3). `PLUSWn` remains unused (item
+4's write-collision reasoning is untouched by this) and no second FSR was
+introduced.
+
+A third profiling finding (epic-cc#469/#473, 2026-09-19) showed call
+sites forwarding a pointer value as a plain-ptr/sret argument round-tripping
+it through FSR0 for no reason: the argument was already a finished 2-byte
+address sitting in a slot, not something needing FSR0's address-computation
+machinery at all. Addressed by recognizing that degenerate case in
+`emit_call_args` and copying the two bytes directly (item 2). This is
+unrelated to FSR0's own setup/reuse machinery (items 3-4): it simply
+avoids invoking FSR0 where no dereference is happening.
