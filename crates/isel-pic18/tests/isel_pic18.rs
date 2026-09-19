@@ -2091,7 +2091,7 @@ fn a_large_stride_gep_scales_via_shift_add_chain() {
     // 12 = 1100b: bit pattern gives exactly 3 doublings and 2 index
     // adds (the initial one plus bit 2's conditional one).
     let rlcf_fsr0l = asm.matches("RLCF 0x0E9").count() + asm.matches("RLCF 0x0e9").count();
-    assert_eq!(rlcf_fsr0l, 3, "three doublings for an 4-bit stride:\n{asm}");
+    assert_eq!(rlcf_fsr0l, 3, "three doublings for a 4-bit stride:\n{asm}");
     // Two chain index adds (initial + one set bit below the MSW) plus
     // the base re-add, all onto FSR0L: 3 total, not the naive 12.
     let addwf_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
@@ -2109,44 +2109,6 @@ fn a_large_stride_gep_scales_via_shift_add_chain() {
     assert!(
         !asm.contains("RLCF 0x0E9,F,B") && !asm.contains("ADDWF 0x0E9,F,B"),
         "FSR pair updates must stay access-mode:\n{asm}"
-    );
-}
-
-#[test]
-fn a_large_stride_const_gep_scales_tblptr_via_shift_add_chain() {
-    // The TBLPTR counterpart: a 12-byte-stride const array indexed at
-    // runtime scales via the three-register chain (carry into
-    // TBLPTRU), seeded by three CLRFs, instead of 12 unrolled adds.
-    let m = with_bytes(
-        parse(
-            "const recs i8\n\
-             global idx i8\n\
-             fn main(void) ()\n\
-               block entry:\n\
-                 %i = load i8 @idx\n\
-                 %p = gep @recs +0 +12*%i\n\
-                 %v = load i8 %p\n\
-                 ret void\n",
-        ),
-        "recs",
-        &[0x11; 64],
-    );
-    let addrs = addrs(&[("idx", 0x10), ("main::i", 0x11), ("main::v", 0x12)]);
-    let asm = select(&PIC18F4550, &m, &addrs, None);
-    assert!(
-        asm.contains("CLRF 0xF6,A"),
-        "the TBLPTR chain must zero-seed TBLPTRL:\n{asm}"
-    );
-    let addwf_tbll = asm.matches("ADDWF 0x0F6,F,A").count();
-    assert_eq!(
-        addwf_tbll, 2,
-        "two index adds onto TBLPTRL for stride 12, not 12:\n{asm}"
-    );
-    let rlcf_tblh = asm.matches("RLCF 0x0F7,F,A").count();
-    assert_eq!(rlcf_tblh, 3, "three doublings through TBLPTRH:\n{asm}");
-    assert!(
-        asm.contains("TBLRD*"),
-        "the read itself is unchanged:\n{asm}"
     );
 }
 

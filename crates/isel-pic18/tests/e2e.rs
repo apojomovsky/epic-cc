@@ -743,12 +743,15 @@ fn ptr_postinc_c_runs_correctly_and_seeds_fsr0_once() {
         postinc_uses, 6,
         "expected 6 POSTINC0 uses (3 per 4-byte access x 2 accesses):\n{asm}"
     );
+}
+
 #[test]
 fn stride_chain_c_runs_correctly() {
-    // Runtime indices over a 12-byte-stride struct array, on both scaled
-    // pointer paths: FSR0/INDF0 for the volatile RAM array and
-    // TBLPTR/TBLRD for the flash const array. The shift-add chain must
-    // land every access exactly where the naive unrolled adds did.
+    // Runtime indices over a 12-byte-stride struct array: the volatile
+    // RAM reads and writes go through the FSR0 shift-add chain, the
+    // flash const reads through the naive TBLPTR lowering (clang's i16
+    // gep indices keep the width-1 chain out of reach there). The chain
+    // must land every access exactly where the unrolled adds did.
     let (mut p, globals) = compile(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/stride_chain.c"

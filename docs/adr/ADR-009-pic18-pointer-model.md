@@ -33,6 +33,11 @@ PIC18 pointer/array/struct support (port P3) uses:
    byte_off` from scratch per byte (`LFSR` for the static part, unrolled
    `ADDWF`/`ADDWFC` for the dynamic term). No FSR auto-increment, no
    second FSR.
+   **Superseded in part (epic-cc#469, 2026-09-19):** a dynamic term
+   whose scale is big enough that a shift-add chain beats its unrolled
+   adds is scaled as `scale×idx` from a zero-seeded `LFSR 0, 0x000`
+   (doublings plus conditional adds), with the static part re-joining
+   as a literal add afterwards. The one-FSR rule still holds.
    **Narrowed (epic-cc#471, 2026-09-19):** FSR0 is now seeded once per
    *access* (one `Inst::Load`/`Inst::Store`) and walked with `POSTINC0`
    across that access's own bytes, since those bytes are emitted by a
@@ -41,6 +46,12 @@ PIC18 pointer/array/struct support (port P3) uses:
    applies *across* separate accesses (no auto-increment carries state
    from one `Inst::Load`/`Inst::Store` to the next) -- see the "Rejected
    alternatives" note below for the boundary this draws.
+   **Superseded in part (epic-cc#469, 2026-09-19):** a dynamic term
+   whose scale is big enough that a shift-add chain beats its unrolled
+   adds is scaled as `scale×idx` from a zero-seeded `LFSR 0, 0x000`
+   (doublings plus conditional adds), with the static part re-joining
+   as a literal add afterwards. The one-FSR rule and the
+   no-auto-increment-across-accesses boundary still hold.
    **Narrowed further (epic-cc#472, 2026-09-19):** re-setup *across*
    separate accesses through the same base is no longer always a full
    `LFSR`/base-reload. `Gen.fsr0_holds` tracks `(origin, offset)` --
@@ -64,6 +75,12 @@ PIC18 pointer/array/struct support (port P3) uses:
    back to the full setup rather than adding a `SUBWF` path, since forward
    struct-field/array-element access is the overwhelmingly common shape
    and the conservative default costs nothing but a missed optimization.
+   **Superseded in part (epic-cc#469, 2026-09-19):** a dynamic term
+   whose scale is big enough that a shift-add chain beats its unrolled
+   adds is scaled as `scale×idx` from a zero-seeded `LFSR 0, 0x000`
+   (doublings plus conditional adds), with the static part re-joining
+   as a literal add afterwards. The from-scratch per-byte re-setup and
+   the one-FSR rule still hold.
 4. **No `PLUSWn` for dynamic-offset writes.** `PLUSWn` computes its
    effective address from `FSRn + W` at execution time; a write needs `W`
    to hold the byte being stored, colliding with using `W` as the offset.
