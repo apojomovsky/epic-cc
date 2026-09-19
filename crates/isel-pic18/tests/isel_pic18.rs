@@ -2952,3 +2952,32 @@ fn priority_pair_without_save_area_panics() {
     );
     let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
 }
+
+#[test]
+fn const_zero_store_emits_clrf_without_w_staging() {
+    let m = parse(
+        "global g i8\nglobal h i16\n\
+         fn main(void) ()\n  block entry:\n    store i8 0 @g\n    store i16 0 @h\n    ret void\n",
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[("g", 0x20), ("h", 0x21)]), None);
+    assert!(asm.contains("CLRF 0x020,A"), "i8 zero store:\n{asm}");
+    assert!(asm.contains("CLRF 0x021,A"), "i16 zero low byte:\n{asm}");
+    assert!(asm.contains("CLRF 0x022,A"), "i16 zero high byte:\n{asm}");
+    assert_eq!(
+        asm.matches("MOVLW 0x00").count(),
+        0,
+        "zero bytes must not stage through W:\n{asm}"
+    );
+}
+
+#[test]
+fn const_nonzero_store_still_stages_through_w() {
+    let m = parse(
+        "global g i8\n\
+         fn main(void) ()\n  block entry:\n    store i8 7 @g\n    ret void\n",
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[("g", 0x20)]), None);
+    assert!(asm.contains("MOVLW 0x07"), "non-zero byte:\n{asm}");
+    assert!(asm.contains("MOVWF 0x020,A"), "non-zero byte:\n{asm}");
+    assert!(!asm.contains("CLRF 0x020,"), "non-zero byte:\n{asm}");
+}
