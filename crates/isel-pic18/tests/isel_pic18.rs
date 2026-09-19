@@ -1918,6 +1918,118 @@ fn a_const_length_memcpy_copies_byte_by_byte() {
 }
 
 #[test]
+fn a_long_consecutive_copy_run_becomes_a_postinc_loop() {
+    // Twelve consecutive src+i -> dst+i pairs cost 2 words each
+    // straight-line; past COPY_LOOP_MIN_PAIRS the drain replaces the run
+    // with one LFSR-seeded POSTINC loop whose count lives in WREG
+    // (0xFE8, a file register the ISR save area covers) (epic-cc#486).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 12\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("LFSR 0, 0x100"), "source seed missing:\n{asm}");
+    assert!(
+        asm.contains("LFSR 1, 0x110"),
+        "destination seed missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x0C"),
+        "the 12-byte count is missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the POSTINC0 -> POSTINC1 body is missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("DECFSZ 0xFE8,F,A"),
+        "the WREG-counted loop tail is missing:\n{asm}"
+    );
+    assert!(
+        !(asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110")),
+        "the loop replaces the run, straight copies must not coexist:\n{asm}"
+    );
+}
+
+#[test]
+fn a_short_copy_run_stays_straight_line() {
+    // Below COPY_LOOP_MIN_PAIRS the 9-word loop loses to the straight
+    // 2-words-per-byte form: a 4-byte copy stays four MOVFFs.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 4\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    for i in 0..4u16 {
+        let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
+        let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
+        assert!(
+            asm.contains(&expect) || asm.contains(&expect_nospace),
+            "byte {i} missing:\n{asm}"
+        );
+    }
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "no POSTINC loop below the threshold:\n{asm}"
+    );
+}
+
+#[test]
+fn an_isr_reachable_fsr1_memcpy_keeps_copy_runs_straight() {
+    // The loop holds FSR1 across its iterations and FSR1 is not in the
+    // ISR save area (ADR-013): when an ISR-reachable function seeds FSR1
+    // (here a dynamically indexed memcpy source), every copy run falls
+    // back to straight MOVFFs (epic-cc#486).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global arr i8\n\
+         global idx i8\n\
+         fn feeder(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @arr +0 +1*%i\n\
+             memcpy @dst %p 8\n\
+             ret void\n\
+         fn tick(void) [isr] ()\n\
+           block entry:\n\
+             call void @feeder()\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 12\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("arr", 0x120),
+        ("idx", 0x130),
+        ("feeder::i", 0x131),
+        ("feeder::p", 0x132),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "no POSTINC loop may run when an ISR can clobber FSR1:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110"),
+        "main's copy stays straight-line under the guard:\n{asm}"
+    );
+}
+
+#[test]
 fn a_memcpy_to_a_dynamic_indexed_destination_writes_through_indf0() {
     // dst behind a dynamic index (`%dp = gep @dst +0 +1*%i`): the
     // destination resolves to FSR0/INDF0, so each copied byte must be
