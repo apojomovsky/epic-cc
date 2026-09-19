@@ -244,10 +244,11 @@ impl<'m> Gen<'m> {
     }
 
     /// The byte width of a value-defining register in the current function
-    /// (its slot is `bytes` wide), for scaling a dynamic const-table index
-    /// when the index register is 16-bit. Mirrors `alloc::def_width`'s
-    /// width rules (an `icmp` result is i1 -> 1 byte) so the addition code
-    /// knows whether to propagate into a high byte.
+    /// (its slot is `bytes` wide), for folding a 16-bit index register's
+    /// high byte into scaled GEP terms (RAM and const-table paths).
+    /// Mirrors `alloc::def_width`'s width rules (an `icmp` result is i1
+    /// -> 1 byte) so the addition code knows whether to propagate into a
+    /// high byte.
     fn reg_width(&self, reg: &str) -> u8 {
         let f = self
             .m
@@ -280,6 +281,10 @@ impl<'m> Gen<'m> {
                     Inst::Phi(p) if p.dst == reg => Some(p.ty.bytes()),
                     Inst::Alloca(a) if a.dst == reg => Some(a.size),
                     Inst::Freeze(f) if f.dst == reg => Some(f.ty.bytes()),
+                    Inst::FloatBin(b) if b.dst == reg => Some(4),
+                    Inst::Fcmp(c) if c.dst == reg => Some(1),
+                    Inst::FloatConv(c) if c.dst == reg => Some(c.to.bytes()),
+                    Inst::VaArg(v) if v.dst == reg => Some(v.ty.bytes()),
                     _ => None,
                 };
                 if let Some(w) = d {
@@ -797,7 +802,7 @@ impl<'m> Gen<'m> {
         self.emit("    LFSR 1, 0x000".to_string());
         let (scale, reg) = &terms[ci];
         let a = self.slot_addr(self.cur_func, reg).direct();
-        self.emit_scale_chain(0xFE1, 0xFE2, *scale, a);
+        self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, self.reg_width(reg) == 2);
         self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, base_addr.wrapping_add(u16::from(static_part)));
         self.add_terms_except(terms, chain, 0xFE1, 0xFE2);
     }
@@ -821,7 +826,7 @@ impl<'m> Gen<'m> {
             self.emit("    CLRF 0x0E2,A".to_string()); // FSR1H = 0
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
-            self.emit_scale_chain(0xFE1, 0xFE2, *scale, a);
+            self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, self.reg_width(reg) == 2);
             self.emit_fsr_pair_add_mem16(0xFE1, 0xFE2, slot_addr, slot_addr + 1);
             if static_part != 0 {
                 self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, u16::from(static_part));
@@ -838,12 +843,14 @@ impl<'m> Gen<'m> {
     }
     /// The naive accumulation loop for `FSR1`, mirroring
     /// `add_term_to_fsr0`: small scales and residual terms after a
-    /// shift-add chain.
+    /// shift-add chain, with a 16-bit index's high byte folded into
+    /// every repetition.
     fn add_term_to_fsr1(&mut self, terms: &[(u8, String)]) {
         for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
+            let wide = self.reg_width(reg) == 2;
             for _ in 0..*scale {
-                self.emit_fsr_pair_add(0xFE1, 0xFE2, a);
+                self.emit_fsr_pair_add(0xFE1, 0xFE2, a, wide);
             }
         }
     }
@@ -934,7 +941,7 @@ impl<'m> Gen<'m> {
         self.emit("    LFSR 0, 0x000".to_string());
         let (scale, reg) = &terms[ci];
         let a = self.slot_addr(self.cur_func, reg).direct();
-        self.emit_scale_chain(0xFE9, 0xFEA, *scale, a);
+        self.emit_scale_chain(0xFE9, 0xFEA, *scale, a, self.reg_width(reg) == 2);
         self.emit_fsr_pair_add_lit(0xFE9, 0xFEA, base_addr.wrapping_add(u16::from(static_part)));
         self.add_terms_except(terms, chain, 0xFE9, 0xFEA);
         // The tracker cannot represent a runtime term's contribution.
@@ -973,7 +980,7 @@ impl<'m> Gen<'m> {
             self.emit("    CLRF 0x0EA,A".to_string()); // FSR0H = 0
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
-            self.emit_scale_chain(0xFE9, 0xFEA, *scale, a);
+            self.emit_scale_chain(0xFE9, 0xFEA, *scale, a, self.reg_width(reg) == 2);
             // The chain only holds scale*idx; fold in the pointer's own
             // runtime value, which the zero seed couldn't carry.
             self.emit_fsr_pair_add_mem16(0xFE9, 0xFEA, slot_addr, slot_addr + 1);
@@ -998,23 +1005,28 @@ impl<'m> Gen<'m> {
     /// Add every dynamic term onto `FSR0L`/`FSR0H` with carry, `scale`
     /// times each per term: the naive path for small scales and residual
     /// terms after a chain. Each 4-instruction sequence is a
-    /// self-contained 16-bit add-with-carry against the running FSR0
-    /// value (the `ADDWF` sets carry, the following `ADDWFC` consumes
-    /// it), so multiple terms accumulate correctly in any order.
+    /// self-contained add-with-carry against the running FSR0 value (the
+    /// `ADDWF` sets carry, the following `ADDWFC` consumes it), so
+    /// multiple terms accumulate correctly in any order. A 16-bit index
+    /// register folds its high byte into every repetition.
     fn add_term_to_fsr0(&mut self, terms: &[(u8, String)]) {
         for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
+            let wide = self.reg_width(reg) == 2;
             for _ in 0..*scale {
-                self.emit_fsr_pair_add(0xFE9, 0xFEA, a);
+                self.emit_fsr_pair_add(0xFE9, 0xFEA, a, wide);
             }
         }
     }
 
-    /// One 4-word 16-bit add of the byte at `idx_addr` onto the SFR pair
-    /// at (`lo`, `hi`), both always-access-bank (`MOVF idx,W; ADDWF lo,F;
-    /// MOVLW 0; ADDWFC hi,F`). The `ADDWF`-sets-carry / `ADDWFC`-consumes
-    /// discipline lets sequences compose in any order.
-    fn emit_fsr_pair_add(&mut self, lo: u16, hi: u16, idx_addr: u16) {
+    /// One 4-word add of a dynamic index onto the SFR pair at (`lo`,
+    /// `hi`), both always-access-bank: `MOVF idx,W; ADDWF lo,F` seeds the
+    /// carry, and the high add consumes either the index's real second
+    /// byte (`wide`, `MOVF idx_hi,W; ADDWFC hi,F`) or a zero (`MOVLW 0`,
+    /// same word cost). Neither `MOVF` nor `MOVLW` touches C, so the
+    /// `ADDWF`-sets-carry / `ADDWFC`-consumes discipline lets sequences
+    /// compose in any order.
+    fn emit_fsr_pair_add(&mut self, lo: u16, hi: u16, idx_addr: u16, wide: bool) {
         let (ra, rf) = self.operand(idx_addr);
         self.emit(format!(
             "    MOVF 0x{rf:03X},W,{}",
@@ -1025,7 +1037,15 @@ impl<'m> Gen<'m> {
             "    ADDWF 0x{ff:03X},F,{}",
             if fa == 0 { "A" } else { "B" }
         ));
-        self.emit("    MOVLW 0x00".to_string());
+        if wide {
+            let (wa, wf) = self.operand(idx_addr + 1);
+            self.emit(format!(
+                "    MOVF 0x{wf:03X},W,{}",
+                if wa == 0 { "A" } else { "B" }
+            ));
+        } else {
+            self.emit("    MOVLW 0x00".to_string());
+        }
         let (ha, hf) = self.operand(hi);
         self.emit(format!(
             "    ADDWFC 0x{hf:03X},F,{}",
@@ -1084,9 +1104,11 @@ impl<'m> Gen<'m> {
     /// shift left and a conditional index add. Doubling from a zero
     /// seed is what lets the pair hold the running product, so the
     /// static base cannot ride the seed and re-joins as a literal add
-    /// afterwards.
-    fn emit_scale_chain(&mut self, lo: u16, hi: u16, scale: u8, idx_addr: u16) {
-        self.emit_fsr_pair_add(lo, hi, idx_addr);
+    /// afterwards. A 16-bit index (`wide`) rides the same chain: its
+    /// high byte replaces the carry-fill zero in every index add, at
+    /// the identical word cost.
+    fn emit_scale_chain(&mut self, lo: u16, hi: u16, scale: u8, idx_addr: u16, wide: bool) {
+        self.emit_fsr_pair_add(lo, hi, idx_addr, wide);
         let bits = 8 - scale.leading_zeros();
         for i in (0..bits - 1).rev() {
             self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS,C = 0
@@ -1101,7 +1123,7 @@ impl<'m> Gen<'m> {
                 if ha == 0 { "A" } else { "B" }
             ));
             if (scale >> i) & 1 == 1 {
-                self.emit_fsr_pair_add(lo, hi, idx_addr);
+                self.emit_fsr_pair_add(lo, hi, idx_addr, wide);
             }
         }
     }
@@ -1112,38 +1134,45 @@ impl<'m> Gen<'m> {
         4 + (bits - 1) * 3 + (scale.count_ones() as u16 - 1) * 4
     }
 
-    /// Pick the term to run as a shift-add chain: the largest-scale
-    /// term, and only when the chain plus `extra` words of zero-seed and
-    /// static re-add overhead beats its own naive loop by at least 2
-    /// words (small scales keep the unrolled adds some tests pin). The
-    /// chain scales the term's LOW byte only, exactly like the naive
-    /// loop it replaces, so a wide index reg lowers identically either
-    /// way. Returns the term's index.
-    fn chain_term_index(&self, terms: &[(u8, String)], extra: u16) -> Option<usize> {
+    /// The only chain candidate: the largest-scale term, and only when
+    /// its scale is at least 2 (a scale below 2 cannot win, since the
+    /// chain costs at least the initial add plus the seed overhead, and
+    /// 0 would underflow the bit math below).
+    fn biggest_chainable_term(terms: &[(u8, String)]) -> Option<(usize, u8)> {
         let mut best: Option<(usize, u8)> = None;
         for (i, (scale, _)) in terms.iter().enumerate() {
-            // A scale below 2 cannot win (the chain costs at least the
-            // initial add plus the seed overhead), and 0 would underflow
-            // the bit math below.
             if *scale < 2 || best.is_some_and(|(_, bs)| bs >= *scale) {
                 continue;
             }
             best = Some((i, *scale));
         }
-        let (i, scale) = best?;
+        best
+    }
+
+    /// Pick the term to run as a shift-add chain: the largest-scale
+    /// term, and only when the chain plus `extra` words of zero-seed and
+    /// static re-add overhead beats its own naive loop by at least 2
+    /// words (small scales keep the unrolled adds some tests pin). The
+    /// naive loop folds a 16-bit index's high byte at the same 4
+    /// words per repetition, so both widths share this gate.
+    /// Returns the term's index.
+    fn chain_term_index(&self, terms: &[(u8, String)], extra: u16) -> Option<usize> {
+        let (i, scale) = Self::biggest_chainable_term(terms)?;
         (Self::scale_chain_words(scale) + extra + 2 <= 4 * u16::from(scale)).then_some(i)
     }
 
     /// The naive accumulation for every term except `skip`, shared by
-    /// the chain-capable setup paths.
+    /// the chain-capable setup paths. A 16-bit index register folds its
+    /// high byte into every repetition.
     fn add_terms_except(&mut self, terms: &[(u8, String)], skip: Option<usize>, lo: u16, hi: u16) {
         for (i, (scale, reg)) in terms.iter().enumerate() {
             if Some(i) == skip {
                 continue;
             }
             let a = self.slot_addr(self.cur_func, reg).direct();
+            let wide = self.reg_width(reg) == 2;
             for _ in 0..*scale {
-                self.emit_fsr_pair_add(lo, hi, a);
+                self.emit_fsr_pair_add(lo, hi, a, wide);
             }
         }
     }
@@ -1197,17 +1226,17 @@ impl<'m> Gen<'m> {
     }
 
     /// Add the single dynamic term (if any) onto `TBLPTR` with carry,
-    /// `scale` times: `MOVF %reg_lo,W; ADDWF TBLPTRL,F; MOVLW 0;
-    /// ADDWFC TBLPTRH,F; ADDWFC TBLPTRU,F`, plus (for a 16-bit index
-    /// register) the high byte added onto `TBLPTRH` with its own carry.
-    /// `MOVLW` never touches C, so the ADDWF-set carry survives into the
-    /// `ADDWFC`s, the same discipline the pointer lowering's `add_term_to_fsr0` relies on.
+    /// `scale` times. One repetition is `MOVF %reg_lo,W; ADDWF TBLPTRL,F`
+    /// seeding the carry, then `TBLPTRH` consumes either the index's real
+    /// high byte (`MOVF %reg_hi,W; ADDWFC TBLPTRH,F`) or a zero
+    /// (`MOVLW 0`, same word cost), and `TBLPTRU` consumes the running
+    /// carry (`ADDWFC TBLPTRU,F`; `W` still holds 0 in the width-1 case).
     /// A 16-bit index needs its high byte folded in or `table[0x1XX]`
     /// reads the wrong byte, which is why `reg_width` is consulted.
     fn add_dynamic_to_tblptr(&mut self, terms: &[(u8, String)]) {
         if let Some((scale, reg)) = terms.first() {
             let lo = self.slot_addr(self.cur_func, reg).direct();
-            let width = self.reg_width(reg);
+            let wide = self.reg_width(reg) == 2;
             for _ in 0..*scale {
                 let (ra, rf) = self.operand(lo);
                 self.emit(format!(
@@ -1215,21 +1244,134 @@ impl<'m> Gen<'m> {
                     if ra == 0 { "A" } else { "B" }
                 ));
                 self.emit("    ADDWF 0xF6,F,A".to_string()); // TBLPTRL += idx_lo
-                self.emit("    MOVLW 0x00".to_string());
-                self.emit("    ADDWFC 0xF7,F,A".to_string());
-                self.emit("    MOVLW 0x00".to_string());
-                self.emit("    ADDWFC 0xF8,F,A".to_string());
-                if width == 2 {
+                if wide {
                     let (ha, hf) = self.operand(lo + 1);
                     self.emit(format!(
                         "    MOVF 0x{hf:03X},W,{}",
                         if ha == 0 { "A" } else { "B" }
                     ));
-                    self.emit("    ADDWF 0xF7,F,A".to_string());
+                    self.emit("    ADDWFC 0xF7,F,A".to_string()); // += idx_hi + C
                     self.emit("    MOVLW 0x00".to_string());
-                    self.emit("    ADDWFC 0xF8,F,A".to_string());
+                } else {
+                    self.emit("    MOVLW 0x00".to_string());
+                    self.emit("    ADDWFC 0xF7,F,A".to_string()); // += 0 + C
                 }
+                self.emit("    ADDWFC 0xF8,F,A".to_string()); // TBLPTRU += C
             }
+        }
+    }
+
+    /// Word cost of one naive `add_dynamic_to_tblptr` repetition.
+    fn tblptr_naive_words(wide: bool) -> u16 {
+        if wide {
+            6
+        } else {
+            5
+        }
+    }
+
+    /// Word cost of the zero-seeded TBLPTR shift-add chain for `scale`:
+    /// the 3-byte seed, one index add, per lower bit of `scale` a 4-word
+    /// 3-byte doubling, per further set bit an index add, then the table
+    /// base bytes and the static part re-joining as literal adds.
+    fn tblptr_chain_words(scale: u8, wide: bool, static_part: u16) -> u16 {
+        let bits = 8 - scale.leading_zeros() as u16;
+        let add = if wide { 6 } else { 5 };
+        3 + add
+            + (bits - 1) * 4
+            + (scale.count_ones() as u16 - 1) * add
+            + 6
+            + if static_part != 0 { 6 } else { 0 }
+    }
+
+    /// Pick the single term for a TBLPTR shift-add chain, the same
+    /// largest-scale-2-word-win policy as `chain_term_index`, against
+    /// the 3-byte accumulator's costs. Returns the term's index and
+    /// scale.
+    fn tblptr_chain_term(&self, terms: &[(u8, String)], static_part: u16) -> Option<(usize, u8)> {
+        let (i, scale) = Self::biggest_chainable_term(terms)?;
+        let wide = self.reg_width(&terms[i].1) == 2;
+        (Self::tblptr_chain_words(scale, wide, static_part) + 2
+            <= Self::tblptr_naive_words(wide) * u16::from(scale))
+        .then_some((i, scale))
+    }
+
+    /// Seed `TBLPTR = table_base + k + Σ terms + byte_off` for one flash
+    /// byte access: static seeding plus the naive term loop for small
+    /// scales, or the zero-seeded shift-add chain when a big stride wins.
+    fn emit_tblptr_setup(&mut self, table: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        let static_part = u16::from(k) + u16::from(byte_off);
+        if let Some((i, scale)) = self.tblptr_chain_term(terms, static_part) {
+            self.emit_tblptr_dynamic_chain(table, static_part, scale, &terms[i].1);
+            return;
+        }
+        self.emit_tblptr_static(table, k, byte_off);
+        self.add_dynamic_to_tblptr(terms);
+    }
+
+    /// `TBLPTR = table_base + static_part + scale*idx` for a big-enough
+    /// stride: zero-seed the triple, run the shift-add chain directly on
+    /// it (doublings carry L->H->U; each index add carries the lo byte's
+    /// result into `TBLPTRH`, the high byte's or zero's into `TBLPTRU`),
+    /// then re-add the table base bytes and the static part as literal
+    /// adds. The zero seed is what lets the triple hold the running
+    /// product, mirroring the FSR pair's chain shape.
+    fn emit_tblptr_dynamic_chain(&mut self, table: &str, static_part: u16, scale: u8, reg: &str) {
+        let lo = self.slot_addr(self.cur_func, reg).direct();
+        let wide = self.reg_width(reg) == 2;
+        self.emit("    CLRF 0xF6,A".to_string()); // TBLPTRL = 0
+        self.emit("    CLRF 0xF7,A".to_string()); // TBLPTRH = 0
+        self.emit("    CLRF 0xF8,A".to_string()); // TBLPTRU = 0
+        let emit_idx_add = |g: &mut Self| {
+            let (ra, rf) = g.operand(lo);
+            g.emit(format!(
+                "    MOVF 0x{rf:03X},W,{}",
+                if ra == 0 { "A" } else { "B" }
+            ));
+            g.emit("    ADDWF 0xF6,F,A".to_string());
+            if wide {
+                let (ha, hf) = g.operand(lo + 1);
+                g.emit(format!(
+                    "    MOVF 0x{hf:03X},W,{}",
+                    if ha == 0 { "A" } else { "B" }
+                ));
+                g.emit("    ADDWFC 0xF7,F,A".to_string());
+                g.emit("    MOVLW 0x00".to_string());
+            } else {
+                g.emit("    MOVLW 0x00".to_string());
+                g.emit("    ADDWFC 0xF7,F,A".to_string());
+            }
+            g.emit("    ADDWFC 0xF8,F,A".to_string());
+        };
+        emit_idx_add(self);
+        let bits = 8 - scale.leading_zeros();
+        for i in (0..bits - 1).rev() {
+            self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS,C = 0
+            self.emit("    RLCF 0xF6,F,A".to_string());
+            self.emit("    RLCF 0xF7,F,A".to_string());
+            self.emit("    RLCF 0xF8,F,A".to_string());
+            if (scale >> i) & 1 == 1 {
+                emit_idx_add(self);
+            }
+        }
+        // The table base re-joins after the chain as literal adds
+        // (MOVLW never touches C, so the carry chain stays intact).
+        for (lit, reg) in [
+            (format!("LOW({table})"), "0xF6"),
+            (format!("HIGH({table})"), "0xF7"),
+            (format!("UPPER({table})"), "0xF8"),
+        ] {
+            self.emit(format!("    MOVLW {lit}"));
+            let op = if reg == "0xF6" { "ADDWF" } else { "ADDWFC" };
+            self.emit(format!("    {op} {reg},F,A"));
+        }
+        if static_part != 0 {
+            self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
+            self.emit("    ADDWF 0xF6,F,A".to_string());
+            self.emit(format!("    MOVLW 0x{:02X}", static_part >> 8));
+            self.emit("    ADDWFC 0xF7,F,A".to_string());
+            self.emit("    MOVLW 0x00".to_string());
+            self.emit("    ADDWFC 0xF8,F,A".to_string());
         }
     }
 
@@ -1251,8 +1393,7 @@ impl<'m> Gen<'m> {
             "isel-pic18: multi-term dynamic pointer offsets not yet supported (P4 scope; {} terms)",
             terms.len()
         );
-        self.emit_tblptr_static(table, k, byte_off);
-        self.add_dynamic_to_tblptr(terms);
+        self.emit_tblptr_setup(table, k, terms, byte_off);
         self.emit("    TBLRD*".to_string());
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
     }
@@ -2190,8 +2331,7 @@ impl<'m> Gen<'m> {
                             // Seed TBLPTR at the flash source byte, read it
                             // into TABLAT, then move TABLAT (0xFF5) to the
                             // destination (direct or FSR0-indirect).
-                            self.emit_tblptr_static(&table, k, i as u8);
-                            self.add_dynamic_to_tblptr(&terms);
+                            self.emit_tblptr_setup(&table, k, &terms, i as u8);
                             self.emit("    TBLRD*".to_string());
                             match self.emit_ptr_setup(&mc.dst, i) {
                                 Addr::Direct(dst) => {

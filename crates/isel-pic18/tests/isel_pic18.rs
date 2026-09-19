@@ -2113,6 +2113,298 @@ fn a_large_stride_gep_scales_via_shift_add_chain() {
 }
 
 #[test]
+fn a_width2_index_chain_folds_the_high_byte_into_fsr0() {
+    // A 12-byte stride with a 16-bit index (clang zero-extends every GEP
+    // index, so width 2 is the real frontend shape): the chain's index
+    // adds must read the index's HIGH byte where the width-1 chain emits
+    // its carry-fill MOVLW, at the identical word cost. Same shape as
+    // the width-1 test: seed, 3 doublings (12 = 1100b), 2 chain index
+    // adds plus the base re-add.
+    let m = parse(
+        "global recs i8\n\
+         global idx i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i16 @idx\n\
+             %p = gep @recs +0 +12*%i\n\
+             %v = load i8 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("recs", 0x120),
+        ("idx", 0x150),
+        ("main::i", 0x152),
+        ("main::v", 0x154),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("LFSR 0, 0x000") || asm.contains("LFSR 0,0x000"),
+        "the chain must seed FSR0 with zero, not the base:\n{asm}"
+    );
+    let rlcf_fsr0l = asm.matches("RLCF 0x0E9").count() + asm.matches("RLCF 0x0e9").count();
+    assert_eq!(rlcf_fsr0l, 3, "three doublings for a 4-bit stride:\n{asm}");
+    let addwf_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
+    assert_eq!(
+        addwf_fsr0l, 3,
+        "two chain index adds plus the base re-add, not 12 unrolled adds:\n{asm}"
+    );
+    // The wide fold: the index's high byte (slot 0x152 + 1, banked so
+    // operand() spells the in-bank file address 0x053) must be read once
+    // per chain index add. The width-1 chain reads it zero times.
+    let movf_idx_hi = asm.matches("MOVF 0x053").count();
+    assert_eq!(movf_idx_hi, 2, "both chain adds must read idx_hi:\n{asm}");
+}
+
+#[test]
+fn a_width2_chain_index_reads_the_high_byte_in_sim() {
+    // idx = 0x0114 (276): scale 5 gives 0x564, so recs (0x120) + 0x564
+    // = 0x684. A high-byte-dropping term would read 0x120 + 5*0x14 =
+    // 0x184 instead. Stride 5 keeps the chain gate satisfied (14 + 2 <=
+    // 20 naive words) while the addressed byte stays inside the 4550's
+    // 2 KiB RAM, which no stride-12 high byte allows.
+    let m = parse(
+        "global recs i8\n\
+         global idx i16\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i16 @idx\n\
+             %p = gep @recs +0 +5*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("recs", 0x120),
+        ("idx", 0x150),
+        ("out", 0x152),
+        ("main::i", 0x153),
+        ("main::v", 0x155),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("LFSR 0, 0x000") || asm.contains("LFSR 0,0x000"),
+        "stride 5 must take the chain, not the naive loop:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x150] = 0x14; // idx lo byte
+    p.ram_mut()[0x151] = 0x01; // idx hi byte: 0x0114 = 276
+    p.ram_mut()[0x684] = 0x5A; // the byte the address math must land on
+    p.ram_mut()[0x184] = 0xA5; // the byte a low-byte-only term reads
+    p.run(500);
+    assert_eq!(p.ram()[0x152], 0x5A, "out must be recs[5*0x0114]:\n");
+}
+
+#[test]
+fn a_width2_small_scale_index_adds_the_high_byte_in_sim() {
+    // Stride 2 stays below the chain gate (naive 8 words vs chain 7 + 2
+    // overhead), so every unrolled repetition must fold idx_hi itself:
+    // idx = 0x0130 scales to 0x260, recs (0x120) + 0x260 = 0x380, while
+    // a low-byte-only term lands at 0x120 + 2*0x30 = 0x180.
+    let m = parse(
+        "global recs i8\n\
+         global idx i16\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i16 @idx\n\
+             %p = gep @recs +0 +2*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("recs", 0x120),
+        ("idx", 0x150),
+        ("out", 0x152),
+        ("main::i", 0x153),
+        ("main::v", 0x155),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("LFSR 0, 0x000") && !asm.contains("LFSR 0,0x000"),
+        "stride 2 must keep the naive unrolled adds:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x150] = 0x30; // idx lo byte
+    p.ram_mut()[0x151] = 0x01; // idx hi byte: 0x0130 = 304
+    p.ram_mut()[0x380] = 0x3C; // the byte the address math must land on
+    p.ram_mut()[0x180] = 0xC3; // the byte a low-byte-only term reads
+    p.run(500);
+    assert_eq!(p.ram()[0x152], 0x3C, "out must be recs[2*0x0130]:\n");
+}
+
+#[test]
+fn a_width2_const_index_chains_on_tblptr() {
+    // A 12-byte-stride const read with a 16-bit runtime index: the naive
+    // TBLPTR loop would cost 72 words; the zero-seeded TBLPTR chain (33)
+    // wins. The static MOVLW/MOVWF seeding is replaced by CLRFs and the
+    // table base re-joins as literal adds after the chain.
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i16\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i16 @idx\n\
+                 %p = gep @tab +0 +12*%i\n\
+                 %v = load i8 %p\n\
+                 ret void\n",
+        ),
+        "tab",
+        &[0],
+    );
+    let addrs = addrs(&[("idx", 0x150), ("main::i", 0x152), ("main::v", 0x154)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVWF 0xF6"),
+        "the chain must zero-seed TBLPTR, not statically seed it:\n{asm}"
+    );
+    assert!(
+        asm.contains("CLRF 0xF6,A") && asm.contains("CLRF 0xF7,A") && asm.contains("CLRF 0xF8,A"),
+        "the chain must zero-seed the TBLPTR triple:\n{asm}"
+    );
+    let rlcf_tblptrl = asm.matches("RLCF 0xF6").count();
+    assert_eq!(
+        rlcf_tblptrl, 3,
+        "three doublings for a 4-bit stride:\n{asm}"
+    );
+    let addwf_tblptrl = asm.matches("ADDWF 0xF6").count();
+    assert_eq!(
+        addwf_tblptrl, 3,
+        "two chain index adds plus the base re-add:\n{asm}"
+    );
+    let movf_idx_hi = asm.matches("MOVF 0x053").count();
+    assert_eq!(movf_idx_hi, 2, "both chain adds must read idx_hi:\n{asm}");
+    assert!(
+        asm.contains("MOVLW LOW(tab)") && asm.contains("ADDWFC 0xF8"),
+        "the table base must re-join after the chain, carries reaching TBLPTRU:\n{asm}"
+    );
+}
+
+#[test]
+fn a_width2_const_index_stays_naive_below_the_gate() {
+    // Stride 2 on the 3-byte accumulator: naive 12 words vs chain
+    // 19 + 2 overhead, so the unrolled loop stays and folds idx_hi per
+    // repetition.
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i16\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i16 @idx\n\
+                 %p = gep @tab +0 +2*%i\n\
+                 %v = load i8 %p\n\
+                 ret void\n",
+        ),
+        "tab",
+        &[0],
+    );
+    let addrs = addrs(&[("idx", 0x150), ("main::i", 0x152), ("main::v", 0x154)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("CLRF 0xF6,A"),
+        "stride 2 must keep the naive TBLPTR loop:\n{asm}"
+    );
+    let addwf_tblptrl = asm.matches("ADDWF 0xF6").count();
+    assert_eq!(addwf_tblptrl, 2, "two unrolled repetitions:\n{asm}");
+    let movf_idx_hi = asm.matches("MOVF 0x053").count();
+    assert_eq!(movf_idx_hi, 2, "both repetitions must read idx_hi:\n{asm}");
+}
+
+#[test]
+fn a_width1_const_index_chains_on_tblptr_in_sim() {
+    // The width-1 variant of the TBLPTR chain, reachable from in-tree IR
+    // text (only real clang output always zexts GEP indices to i16): an
+    // i8 index over stride 6 clears the 3-byte gate (27 + 2 <= 30 naive
+    // words), so the zero-seeded chain must scale idx = 200 to byte
+    // offset 1200 exactly.
+    let mut bytes = vec![0u8; 1201];
+    bytes[1200] = 0x96;
+    bytes[6 * 199] = 0x69;
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i8\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %p = gep @tab +0 +6*%i\n\
+                 %v = load i8 %p\n\
+                 store i8 %v @out\n\
+                 ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let addrs = addrs(&[
+        ("idx", 0x150),
+        ("out", 0x151),
+        ("main::i", 0x152),
+        ("main::v", 0x153),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF 0xF6,A"),
+        "stride 6 must take the TBLPTR chain:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    p.ram_mut()[0x150] = 200;
+    p.run(1000);
+    assert_eq!(p.ram()[0x151], 0x96, "out must be tab[6*200]:\n");
+}
+
+#[test]
+fn a_width2_const_index_reads_the_high_byte_in_sim() {
+    // The flash-side miscompile proof: tab is 2323 bytes, idx = 0x0102,
+    // scale 9 -> byte offset 0x912 (2322), the table's last byte. A
+    // high-byte-dropping term reads tab[9*2] = tab[18] instead. Stride 9
+    // clears the TBLPTR chain gate (33 + 2 <= 54 naive words) where
+    // stride 5 does not (31 > 30).
+    let mut bytes = vec![0u8; 2323];
+    bytes[2322] = 0x96;
+    bytes[18] = 0x69;
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i16\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i16 @idx\n\
+                 %p = gep @tab +0 +9*%i\n\
+                 %v = load i8 %p\n\
+                 store i8 %v @out\n\
+                 ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let addrs = addrs(&[
+        ("idx", 0x150),
+        ("out", 0x152),
+        ("main::i", 0x153),
+        ("main::v", 0x155),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF 0xF6,A"),
+        "stride 9 must take the TBLPTR chain:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    p.ram_mut()[0x150] = 0x02; // idx lo byte
+    p.ram_mut()[0x151] = 0x01; // idx hi byte: 0x0102 = 258
+    p.run(1000);
+    assert_eq!(p.ram()[0x152], 0x96, "out must be tab[9*0x0102]:\n");
+}
+
+#[test]
 fn const_i16_load_reads_two_bytes() {
     let m = with_bytes(
         parse(
