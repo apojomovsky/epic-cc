@@ -20,8 +20,9 @@
 //! it catches boilerplate/startup regressions cheaply; the vendored
 //! `hal-pic16-encoder-full` case is the large multi-driver stress case
 //! that actually caught #193's regression, a small slice alone would
-//! not have. See `fixtures/vendor/hal-pic16-encoder-full/PROVENANCE.md`
-//! for where that fixture comes from.
+//! not have, and the vendored `hal-pic18-menu-demo` case (epic-cc#469)
+//! is the PIC18 counterpart, the largest whole-program PIC18 entry.
+//! See each fixture's `PROVENANCE.md` for where it comes from.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -80,6 +81,7 @@ fn fixture(p: &str) -> PathBuf {
 
 fn cases() -> Vec<Case> {
     let encoder_full = "vendor/hal-pic16-encoder-full";
+    let menu_demo = "vendor/hal-pic18-menu-demo";
     vec![
         Case {
             name: "add-16f877a",
@@ -164,6 +166,50 @@ fn cases() -> Vec<Case> {
             ]
             .iter()
             .map(|f| fixture(&format!("{encoder_full}/{f}")))
+            .collect(),
+        },
+        Case {
+            name: "hal-pic18-menu-demo-18f4550",
+            device: "18F4550",
+            includes: [
+                "pic18fxx5x-hal/include/epiccc",
+                "pic18fxx5x-hal/include",
+                "epic-common/include",
+                "epic-taskmgr/include",
+                "epic-tick/include",
+                "epic-lcd/include",
+                "epic-serial/include",
+                "epic-menu-demo/include",
+            ]
+            .iter()
+            .map(|d| fixture(&format!("{menu_demo}/{d}")))
+            .collect(),
+            defines: vec!["PIC18F4550", "FOSC_HZ=48000000", "__EPIC_CC__"],
+            inputs: [
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c",
+                "pic18fxx5x-hal/src/core/pic18_irq.c",
+                "pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c",
+                "pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
+                "pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c",
+                "pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
+                "pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c",
+                "epic-taskmgr/src/epic_taskmgr.c",
+                "epic-tick/src/epic_tick.c",
+                "epic-lcd/src/epic_lcd.c",
+                "epic-lcd/src/epic_lcd_gpio4.c",
+                "epic-serial/src/epic_serial.c",
+                "epic-menu-demo/src/menu_demo_core.c",
+                "epic-menu-demo/tests/sim_menu_demo.c",
+                "config_18F4550.c",
+            ]
+            .iter()
+            .map(|f| fixture(&format!("{menu_demo}/{f}")))
             .collect(),
         },
     ]
