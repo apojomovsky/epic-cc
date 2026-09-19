@@ -750,7 +750,7 @@ fn stride_chain_c_runs_correctly() {
     // Runtime indices over a 12-byte-stride struct array: the volatile
     // RAM accesses scale through the FSR0 shift-add chain, and the flash
     // const reads scale through the TBLPTR chain (stride 12 clears the
-    // 3-byte gate: 29 + 2 <= 60 naive words). Every access must land
+    // 3-byte gate: 39 + 2 <= 72 naive words). Every access must land
     // exactly where the unrolled adds did.
     let (mut p, globals) = compile(concat!(
         env!("CARGO_MANIFEST_DIR"),

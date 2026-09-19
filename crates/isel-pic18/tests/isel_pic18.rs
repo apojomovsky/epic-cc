@@ -2286,8 +2286,9 @@ fn a_width2_const_index_chains_on_tblptr() {
 
 #[test]
 fn a_width2_const_index_stays_naive_below_the_gate() {
-    // Stride 2 on the 3-byte accumulator: naive 12 words vs chain 13,
-    // so the unrolled loop stays and folds idx_hi per repetition.
+    // Stride 2 on the 3-byte accumulator: naive 12 words vs chain
+    // 19 + 2 overhead, so the unrolled loop stays and folds idx_hi per
+    // repetition.
     let m = with_bytes(
         parse(
             "const tab i8\n\
@@ -2312,6 +2313,50 @@ fn a_width2_const_index_stays_naive_below_the_gate() {
     assert_eq!(addwf_tblptrl, 2, "two unrolled repetitions:\n{asm}");
     let movf_idx_hi = asm.matches("MOVF 0x053").count();
     assert_eq!(movf_idx_hi, 2, "both repetitions must read idx_hi:\n{asm}");
+}
+
+#[test]
+fn a_width1_const_index_chains_on_tblptr_in_sim() {
+    // The width-1 variant of the TBLPTR chain, reachable from in-tree IR
+    // text (only real clang output always zexts GEP indices to i16): an
+    // i8 index over stride 6 clears the 3-byte gate (27 + 2 <= 30 naive
+    // words), so the zero-seeded chain must scale idx = 200 to byte
+    // offset 1200 exactly.
+    let mut bytes = vec![0u8; 1201];
+    bytes[1200] = 0x96;
+    bytes[6 * 199] = 0x69;
+    let m = with_bytes(
+        parse(
+            "const tab i8\n\
+             global idx i8\n\
+             global out i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %p = gep @tab +0 +6*%i\n\
+                 %v = load i8 %p\n\
+                 store i8 %v @out\n\
+                 ret void\n",
+        ),
+        "tab",
+        &bytes,
+    );
+    let addrs = addrs(&[
+        ("idx", 0x150),
+        ("out", 0x151),
+        ("main::i", 0x152),
+        ("main::v", 0x153),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF 0xF6,A"),
+        "stride 6 must take the TBLPTR chain:\n{asm}"
+    );
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    p.ram_mut()[0x150] = 200;
+    p.run(1000);
+    assert_eq!(p.ram()[0x151], 0x96, "out must be tab[6*200]:\n");
 }
 
 #[test]

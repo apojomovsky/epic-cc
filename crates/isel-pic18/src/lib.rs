@@ -1229,13 +1229,10 @@ impl<'m> Gen<'m> {
     /// `scale` times. One repetition is `MOVF %reg_lo,W; ADDWF TBLPTRL,F`
     /// seeding the carry, then `TBLPTRH` consumes either the index's real
     /// high byte (`MOVF %reg_hi,W; ADDWFC TBLPTRH,F`) or a zero
-    /// (`MOVLW 0`), and `TBLPTRU` consumes the running carry
-    /// (`ADDWFC TBLPTRU,F`; `W` still holds 0 in the width-1 case).
-    /// `MOVF`/`MOVLW` never touch C, so the ADDWF-set carry survives
-    /// into the `ADDWFC`s, the same discipline the pointer lowering's
-    /// `emit_fsr_pair_add` relies on. A 16-bit index needs its high byte
-    /// folded in or `table[0x1XX]` reads the wrong byte, which is why
-    /// `reg_width` is consulted.
+    /// (`MOVLW 0`, same word cost), and `TBLPTRU` consumes the running
+    /// carry (`ADDWFC TBLPTRU,F`; `W` still holds 0 in the width-1 case).
+    /// A 16-bit index needs its high byte folded in or `table[0x1XX]`
+    /// reads the wrong byte, which is why `reg_width` is consulted.
     fn add_dynamic_to_tblptr(&mut self, terms: &[(u8, String)]) {
         if let Some((scale, reg)) = terms.first() {
             let lo = self.slot_addr(self.cur_func, reg).direct();
