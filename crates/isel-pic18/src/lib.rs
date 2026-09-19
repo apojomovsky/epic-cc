@@ -812,6 +812,8 @@ impl<'m> Gen<'m> {
         byte_off: u8,
     ) {
         let static_part = u16::from(k) + u16::from(byte_off);
+        // Same accounting as `emit_fsr0_indirect_slot`: CLRF pair plus a
+        // runtime re-add of the pointer's own value.
         let extra = 2 + if static_part != 0 { 4 } else { 0 };
         let chain = self.chain_term_index(terms, extra);
         if let Some(ci) = chain {
@@ -820,6 +822,7 @@ impl<'m> Gen<'m> {
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
             self.emit_scale_chain(0xFE1, 0xFE2, *scale, a);
+            self.emit_fsr_pair_add_mem16(0xFE1, 0xFE2, slot_addr, slot_addr + 1);
             if static_part != 0 {
                 self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, u16::from(static_part));
             }
@@ -958,8 +961,11 @@ impl<'m> Gen<'m> {
     ) {
         let origin = Fsr0Origin::SlotValue(slot_addr);
         let static_part = u16::from(k) + u16::from(byte_off);
-        // Chain overhead: two CLRFs replace the freshly loaded address
-        // pair, plus the static re-add when one exists.
+        // Chain overhead: two CLRFs plus a runtime re-add of the pointer's
+        // own value (the chain's zero seed can't carry it, unlike
+        // `emit_fsr0_dynamic`'s compile-time `base_addr`) replace the
+        // freshly loaded address pair, plus the static re-add when one
+        // exists.
         let extra = 2 + if static_part != 0 { 4 } else { 0 };
         let chain = self.chain_term_index(terms, extra);
         if let Some(ci) = chain {
@@ -968,6 +974,9 @@ impl<'m> Gen<'m> {
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
             self.emit_scale_chain(0xFE9, 0xFEA, *scale, a);
+            // The chain only holds scale*idx; fold in the pointer's own
+            // runtime value, which the zero seed couldn't carry.
+            self.emit_fsr_pair_add_mem16(0xFE9, 0xFEA, slot_addr, slot_addr + 1);
             if static_part != 0 {
                 self.emit_fsr_pair_add_lit(0xFE9, 0xFEA, u16::from(static_part));
             }
@@ -1017,6 +1026,36 @@ impl<'m> Gen<'m> {
             if fa == 0 { "A" } else { "B" }
         ));
         self.emit("    MOVLW 0x00".to_string());
+        let (ha, hf) = self.operand(hi);
+        self.emit(format!(
+            "    ADDWFC 0x{hf:03X},F,{}",
+            if ha == 0 { "A" } else { "B" }
+        ));
+    }
+
+    /// Add the 16-bit value stored at (`mem_lo`, `mem_hi`) onto the SFR
+    /// pair at (`lo`, `hi`), with carry (`MOVF mem_lo,W; ADDWF lo,F; MOVF
+    /// mem_hi,W; ADDWFC hi,F`). Used to fold a runtime pointer's own
+    /// value into a chain-scaled FSR pair: the chain's zero seed can only
+    /// hold the running `scale*idx` product, so a `SlotValue` origin's
+    /// base (unlike `Absolute`'s compile-time `base_addr`) must be added
+    /// as a memory operand after the chain, not folded into the seed.
+    fn emit_fsr_pair_add_mem16(&mut self, lo: u16, hi: u16, mem_lo: u16, mem_hi: u16) {
+        let (ma, mf) = self.operand(mem_lo);
+        self.emit(format!(
+            "    MOVF 0x{mf:03X},W,{}",
+            if ma == 0 { "A" } else { "B" }
+        ));
+        let (fa, ff) = self.operand(lo);
+        self.emit(format!(
+            "    ADDWF 0x{ff:03X},F,{}",
+            if fa == 0 { "A" } else { "B" }
+        ));
+        let (ma2, mf2) = self.operand(mem_hi);
+        self.emit(format!(
+            "    MOVF 0x{mf2:03X},W,{}",
+            if ma2 == 0 { "A" } else { "B" }
+        ));
         let (ha, hf) = self.operand(hi);
         self.emit(format!(
             "    ADDWFC 0x{hf:03X},F,{}",
