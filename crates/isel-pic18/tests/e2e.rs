@@ -764,3 +764,43 @@ fn ptr_fields_reuse_c_runs_correctly_and_reuses_fsr0() {
         "expected 4 INDF0 writes (one per field):\n{asm}"
     );
 }
+
+#[test]
+fn ptr_call_forward_c_runs_correctly_and_skips_fsr0() {
+    // epic-cc#473: `fwd(s_t *p) { callee(p); }` forwarding its own pointer
+    // param as a call argument must copy the two bytes directly into
+    // `callee`'s param slot, not round-trip them through FSR0L/FSR0H
+    // (0xFE9/0xFEA). Same for `main`'s `fwd(vp)` (a loaded global pointer
+    // forwarded straight into a call). The only place FSR0 is genuinely
+    // needed is inside `callee`, which actually dereferences the pointer.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptr_call_forward.c"
+    ));
+
+    let vp = globals["vp"] as usize;
+    let buf = globals["buf"] as usize;
+    p.ram_mut()[vp] = (buf & 0xFF) as u8;
+    p.ram_mut()[vp + 1] = (buf >> 8) as u8;
+
+    p.run(2_000);
+
+    assert_eq!(p.ram()[buf], 1, "buf.a");
+    assert!(p.halted());
+
+    // FSR0L/FSR0H must be seeded exactly once in the whole program: inside
+    // `callee`, to dereference `p->a`. Before the fix, `fwd`'s forwarding
+    // of its own param and `main`'s forwarding of the loaded global each
+    // added their own (unneeded) FSR0 round-trip, so this would read 3
+    // instead of 1.
+    let fsr0l_seeds = asm.matches("0xFE9").count();
+    let fsr0h_seeds = asm.matches("0xFEA").count();
+    assert_eq!(
+        fsr0l_seeds, 1,
+        "expected FSR0L touched exactly once (inside callee only):\n{asm}"
+    );
+    assert_eq!(
+        fsr0h_seeds, 1,
+        "expected FSR0H touched exactly once (inside callee only):\n{asm}"
+    );
+}

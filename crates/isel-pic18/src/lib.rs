@@ -327,6 +327,38 @@ impl<'m> Gen<'m> {
         })
     }
 
+    /// Whether `ptr` is a runtime pointer *value* already sitting, fully
+    /// formed, as two bytes in a frame slot -- the common case of
+    /// forwarding a plain pointer parameter/local as a call argument (as
+    /// opposed to a `gep` off it, or an indexed/computed address). When so,
+    /// returns that slot's address: the caller can copy the two bytes
+    /// there directly into a callee's param slot instead of routing them
+    /// through FSR0 via `emit_ptr_setup` (whose general address-computation
+    /// machinery, needed for a real GEP/index, is pure overhead on an
+    /// address that is already finished). Mirrors the `Base::Slot`/
+    /// `holds_addr` logic in `emit_ptr_setup`'s own resolution, restricted
+    /// to the zero-offset, no-dynamic-terms case. (epic-cc#473)
+    fn direct_ptr_forward_src(&self, ptr: &Val) -> Option<u16> {
+        let Val::Reg(r) = ptr else {
+            return None;
+        };
+        let (base, k, terms) = self.resolved.get(&ssa_key(self.cur_func, r))?;
+        if *k != 0 || !terms.is_empty() {
+            return None;
+        }
+        let Base::Slot(sname, indirect) = base else {
+            return None;
+        };
+        let holds_addr = self
+            .m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| f.params.iter().any(|p| p.name == *sname && p.ptr))
+            .unwrap_or(false);
+        (*indirect || holds_addr).then(|| self.slot_addr(self.cur_func, sname).direct())
+    }
+
     /// Reports whether pointer-select dst `name` was seeded by iselcore as an
     /// indirect slot (`Base::Slot(_, true)`): its bytes are a runtime
     /// address VALUE the select must materialize, not a folded pointer.
@@ -1133,24 +1165,29 @@ impl<'m> Gen<'m> {
                     !matches!(arg.val, Val::Const(_)),
                     "isel-pic18: const sret call arg not yet supported"
                 );
-                match self.emit_ptr_setup(&arg.val, 0) {
-                    Addr::Direct(addr) => {
-                        self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
-                        let (a0, f0) = self.operand(pa);
-                        self.emit(format!(
-                            "    MOVWF 0x{f0:03X},{}",
-                            if a0 == 0 { "A" } else { "B" }
-                        ));
-                        self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
-                        let (a1, f1) = self.operand(pa + 1);
-                        self.emit(format!(
-                            "    MOVWF 0x{f1:03X},{}",
-                            if a1 == 0 { "A" } else { "B" }
-                        ));
-                    }
-                    Addr::Indirect => {
-                        self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
-                        self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
+                if let Some(sa) = self.direct_ptr_forward_src(&arg.val) {
+                    self.emit_copy_byte(sa, pa);
+                    self.emit_copy_byte(sa + 1, pa + 1);
+                } else {
+                    match self.emit_ptr_setup(&arg.val, 0) {
+                        Addr::Direct(addr) => {
+                            self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
+                            let (a0, f0) = self.operand(pa);
+                            self.emit(format!(
+                                "    MOVWF 0x{f0:03X},{}",
+                                if a0 == 0 { "A" } else { "B" }
+                            ));
+                            self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
+                            let (a1, f1) = self.operand(pa + 1);
+                            self.emit(format!(
+                                "    MOVWF 0x{f1:03X},{}",
+                                if a1 == 0 { "A" } else { "B" }
+                            ));
+                        }
+                        Addr::Indirect => {
+                            self.emit_copy_byte(0xFE9, pa); // FSR0L -> sret slot lo
+                            self.emit_copy_byte(0xFEA, pa + 1); // FSR0H -> sret slot hi
+                        }
                     }
                 }
             } else if arg.ty.is_none() {
@@ -1217,6 +1254,9 @@ impl<'m> Gen<'m> {
                     // address at runtime. (epic-cc#155)
                     if !self.resolved.contains_key(&ssa_key(self.cur_func, r)) {
                         let sa = self.slot_addr(self.cur_func, r).direct();
+                        self.emit_copy_byte(sa, pa);
+                        self.emit_copy_byte(sa + 1, pa + 1);
+                    } else if let Some(sa) = self.direct_ptr_forward_src(&arg.val) {
                         self.emit_copy_byte(sa, pa);
                         self.emit_copy_byte(sa + 1, pa + 1);
                     } else {

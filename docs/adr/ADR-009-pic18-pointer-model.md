@@ -17,6 +17,17 @@ PIC18 pointer/array/struct support (port P3) uses:
    `Indirect` (FSR0 set up, access through `INDF0`). An sret param's
    slot holds a 2-byte target ADDRESS, not the object itself
    (`Base::Slot(name, true)`), and always goes indirect.
+   **Narrowed (epic-cc#473, 2026-09-19):** forwarding a pointer *value*
+   as a call argument (a plain-ptr/sret argument whose resolved base is
+   an indirect slot at offset 0 with no dynamic terms -- i.e. the
+   argument's two bytes are already sitting, fully formed, in a frame
+   slot) is neither `Direct` nor a genuine `Indirect` dereference: it is
+   a plain 2-byte memory-to-memory copy from that slot into the callee's
+   param slot. `emit_call_args` now recognizes this degenerate case
+   (`direct_ptr_forward_src`) and copies the two bytes with `MOVFF`
+   directly, skipping FSR0 entirely; `emit_ptr_setup`'s FSR0 path is
+   reached only when the argument needs a real address computation
+   (a GEP or dynamic index).
 3. **Exactly one indirection register, FSR0, with per-byte re-setup.**
    Every dynamic access recomputes `FSR0 = base + k + Σ scale×%reg +
    byte_off` from scratch per byte (`LFSR` for the static part, unrolled
@@ -145,3 +156,12 @@ add instead of a full reload, invalidated at labels, `CALL`s, and writes
 to a tracked slot's own address (item 3). `PLUSWn` remains unused (item
 4's write-collision reasoning is untouched by this) and no second FSR was
 introduced.
+
+A third profiling finding (epic-cc#469/#473, 2026-09-19) showed call
+sites forwarding a pointer value as a plain-ptr/sret argument round-tripping
+it through FSR0 for no reason: the argument was already a finished 2-byte
+address sitting in a slot, not something needing FSR0's address-computation
+machinery at all. Addressed by recognizing that degenerate case in
+`emit_call_args` and copying the two bytes directly (item 2). This is
+unrelated to FSR0's own setup/reuse machinery (items 3-4): it simply
+avoids invoking FSR0 where no dereference is happening.
