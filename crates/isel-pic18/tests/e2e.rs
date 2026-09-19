@@ -21,8 +21,8 @@ fn compile(c_path: &str) -> (Pic18, HashMap<String, u16>) {
 }
 
 /// The pipeline itself, plus the generated asm text so a test can assert on
-/// the instructions selected, not just the simulated result (epic-cc#470: a
-/// shift-by-multiple-of-8 must not emit RLCF/RRCF).
+/// the instructions selected, not just the simulated result (epic-cc#470:
+/// shift byte moves; epic-cc#471: FSR0 seeded once per indirect access).
 fn compile_with_asm(c_path: &str) -> (Pic18, HashMap<String, u16>, String) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
@@ -677,5 +677,70 @@ fn shift_bytes_c_runs_correctly_and_skips_the_rotate_loop() {
         rrcf_count, 13,
         "expected exactly 13 RRCF (u32_lshr11's 3x3 plus s16_ashr12's \
          4x1), got {rrcf_count}:\n{asm}"
+    );
+}
+
+#[test]
+fn ptr_postinc_c_runs_correctly_and_seeds_fsr0_once() {
+    // epic-cc#471: `*p = 0x12345678UL` and `out32 = *q` through runtime
+    // pointers must each seed FSR0 (FSR0L/FSR0H, 0xFE9/0xFEA) exactly once
+    // and walk the remaining bytes with POSTINC0 (0xFEE), not re-seed FSR0
+    // from scratch per byte.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptr_postinc.c"
+    ));
+
+    let vp32 = globals["vp32"] as usize;
+    let buf32 = globals["buf32"] as usize;
+    p.ram_mut()[vp32] = (buf32 & 0xFF) as u8;
+    p.ram_mut()[vp32 + 1] = (buf32 >> 8) as u8;
+
+    let vp32in = globals["vp32in"] as usize;
+    let buf32in = globals["buf32in"] as usize;
+    p.ram_mut()[vp32in] = (buf32in & 0xFF) as u8;
+    p.ram_mut()[vp32in + 1] = (buf32in >> 8) as u8;
+    p.ram_mut()[buf32in] = 0x78;
+    p.ram_mut()[buf32in + 1] = 0x56;
+    p.ram_mut()[buf32in + 2] = 0x34;
+    p.ram_mut()[buf32in + 3] = 0x12;
+
+    p.run(2_000);
+
+    // Store: buf32 must hold the stored 0x12345678, little-endian.
+    assert_eq!(p.ram()[buf32], 0x78);
+    assert_eq!(p.ram()[buf32 + 1], 0x56);
+    assert_eq!(p.ram()[buf32 + 2], 0x34);
+    assert_eq!(p.ram()[buf32 + 3], 0x12);
+
+    // Load: out32 must hold what buf32in held.
+    let out32 = globals["out32"] as usize;
+    assert_eq!(p.ram()[out32], 0x78);
+    assert_eq!(p.ram()[out32 + 1], 0x56);
+    assert_eq!(p.ram()[out32 + 2], 0x34);
+    assert_eq!(p.ram()[out32 + 3], 0x12);
+
+    assert!(p.halted());
+
+    // FSR0L/FSR0H must be seeded exactly once per access (once for the
+    // store, once for the load) -- before the fix each 4-byte access
+    // re-seeded FSR0 four times, so this would read 4 instead of 1 each.
+    let fsr0l_seeds = asm.matches("0xFE9").count();
+    let fsr0h_seeds = asm.matches("0xFEA").count();
+    assert_eq!(
+        fsr0l_seeds, 2,
+        "expected FSR0L seeded exactly once per access (store + load):\n{asm}"
+    );
+    assert_eq!(
+        fsr0h_seeds, 2,
+        "expected FSR0H seeded exactly once per access (store + load):\n{asm}"
+    );
+
+    // The remaining 3 bytes of each 4-byte access (store and load) must
+    // walk POSTINC0, not re-seed FSR0: 3 POSTINC0 uses per access, 6 total.
+    let postinc_uses = asm.matches("0xFEE").count();
+    assert_eq!(
+        postinc_uses, 6,
+        "expected 6 POSTINC0 uses (3 per 4-byte access x 2 accesses):\n{asm}"
     );
 }
