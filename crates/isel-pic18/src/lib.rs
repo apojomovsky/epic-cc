@@ -140,7 +140,11 @@ impl<'m> Gen<'m> {
         }
         let pairs = std::mem::take(&mut self.pending_copies);
         let n = pairs.len();
-        if self.allow_copy_loops && n >= COPY_LOOP_MIN_PAIRS {
+        // One memcpy is bounded to 255 bytes by irparse, but chained
+        // adjacent copies can stage a longer run; a byte-counted loop
+        // cannot hold that count in the MOVLW literal, so long runs
+        // replay straight, the pre-loop form.
+        if self.allow_copy_loops && n >= COPY_LOOP_MIN_PAIRS && n <= 255 {
             let (src0, dst0, loc) = &pairs[0];
             let (src0, dst0) = (*src0, *dst0);
             let l_loop = self.fresh_label();
@@ -1009,6 +1013,10 @@ impl<'m> Gen<'m> {
     /// always takes the full setup, since the reuse check has no way to
     /// represent a previously-added dynamic term's runtime contribution.
     fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        // A staged run may drain here as a POSTINC loop that moves FSR0
+        // wholesale; the tracked position is only sound after the drain,
+        // so every reuse decision below sees post-drain state.
+        self.flush_copies();
         let static_part = u16::from(k) + u16::from(byte_off);
         let origin = Fsr0Origin::Absolute(base_addr);
         let chain = self.chain_term_index(terms, 0);
@@ -1053,6 +1061,10 @@ impl<'m> Gen<'m> {
         terms: &[(u8, String)],
         byte_off: u8,
     ) {
+        // Same drain-before-decision as `emit_fsr0_dynamic`: a pending
+        // run draining as a POSTINC loop moves FSR0, so the reuse check
+        // must run against post-drain state.
+        self.flush_copies();
         let origin = Fsr0Origin::SlotValue(slot_addr);
         let static_part = u16::from(k) + u16::from(byte_off);
         // Chain overhead: two CLRFs plus a runtime re-add of the pointer's

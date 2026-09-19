@@ -2030,6 +2030,109 @@ fn an_isr_reachable_fsr1_memcpy_keeps_copy_runs_straight() {
 }
 
 #[test]
+fn a_run_draining_before_an_fsr0_reuse_forces_a_reseed() {
+    // epic-cc#486 review: access through an sret pointer seeds FSR0 and
+    // records the tracked position; a staged 12-pair run emits nothing
+    // yet; a second access through the same pointer would reuse FSR0
+    // (delta 0) except the drain at its own emission moves FSR0
+    // wholesale. The setup must drain before the reuse decision, so the
+    // second access re-seeds from the slot instead of reading through a
+    // stale pointer.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global out i8\n\
+         fn probe(void) (r=sret)\n\
+           block entry:\n\
+             %a = load i8 %r\n\
+             memcpy @dst @src 12\n\
+             %b = load i8 %r\n\
+             store i8 %b @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("out", 0x120),
+        ("probe::r", 0x130),
+        ("probe::a", 0x132),
+        ("probe::b", 0x133),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVFF 0x130, 0xFE9").count(),
+        2,
+        "the second access through the same pointer must re-seed FSR0 \
+         after the loop drained:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the staged run must still lower to the loop:\n{asm}"
+    );
+}
+
+#[test]
+fn a_run_longer_than_a_byte_count_stays_straight() {
+    // irparse bounds one memcpy at 255 bytes, but chained adjacent
+    // copies can stage a longer run; the loop count lives in one MOVLW
+    // literal, so the 510-pair chain replays straight rather than
+    // emitting an out-of-range count (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global src2 i8\n\
+         global dst i8\n\
+         global dst2 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 255\n\
+             memcpy @dst2 @src2 255\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("src2", 0x1FF),
+        ("dst", 0x400),
+        ("dst2", 0x4FF),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "a 510-pair run exceeds the byte-counted loop and must replay \
+         straight:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVLW 0x1FE"),
+        "no out-of-range MOVLW count may be emitted:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x1FE, 0x4FE") && asm.contains("MOVFF 0x1FF, 0x4FF"),
+        "the chained copies replay as straight MOVFFs across the pair \
+         boundary:\n{asm}"
+    );
+}
+
+#[test]
+fn a_255_byte_run_still_loops() {
+    // The gate's upper edge: exactly 255 pairs fits the MOVLW literal
+    // and must keep the loop (regression for an off-by-one in the
+    // n <= 255 bound).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 255\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x400)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVLW 0xFF") && asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "a 255-pair run keeps the loop:\n{asm}"
+    );
+}
+
+#[test]
 fn a_memcpy_to_a_dynamic_indexed_destination_writes_through_indf0() {
     // dst behind a dynamic index (`%dp = gep @dst +0 +1*%i`): the
     // destination resolves to FSR0/INDF0, so each copied byte must be
