@@ -33,6 +33,22 @@ PIC18 pointer/array/struct support (port P3) uses:
    byte_off` from scratch per byte (`LFSR` for the static part, unrolled
    `ADDWF`/`ADDWFC` for the dynamic term). No FSR auto-increment, no
    second FSR.
+   **Superseded in part (epic-cc#469, 2026-09-19):** a dynamic term
+   whose scale is big enough that a shift-add chain beats its unrolled
+   adds is scaled as `scale×idx` from a zero-seeded `LFSR 0, 0x000`
+   (doublings plus conditional adds), with the static part re-joining
+   as a literal add afterwards. The one-FSR rule still holds.
+   **Correction (epic-cc#469 review, 2026-09-19):** the chain's zero
+   seed can only hold the running `scale×idx` product, so a `SlotValue`
+   origin's own runtime pointer value (unlike `Absolute`'s compile-time
+   `base_addr`, which rides the post-chain literal add) cannot ride
+   that same add. The first cut of this chain dropped it entirely for
+   `emit_fsr0_indirect_slot`/`emit_fsr1_indirect_slot`, landing writes
+   near address 0 instead of inside the pointed-to object whenever the
+   chain fired through a runtime pointer parameter. Fixed by folding
+   the pointer's own two bytes onto the chain-scaled pair with a
+   dedicated runtime 16-bit add (`emit_fsr_pair_add_mem16`), after the
+   chain and any static offset.
    **Narrowed (epic-cc#471, 2026-09-19):** FSR0 is now seeded once per
    *access* (one `Inst::Load`/`Inst::Store`) and walked with `POSTINC0`
    across that access's own bytes, since those bytes are emitted by a
@@ -41,6 +57,18 @@ PIC18 pointer/array/struct support (port P3) uses:
    applies *across* separate accesses (no auto-increment carries state
    from one `Inst::Load`/`Inst::Store` to the next) -- see the "Rejected
    alternatives" note below for the boundary this draws.
+   **Superseded in part (epic-cc#469, 2026-09-19):** a dynamic term
+   whose scale is big enough that a shift-add chain beats its unrolled
+   adds is scaled as `scale×idx` from a zero-seeded `LFSR 0, 0x000`
+   (doublings plus conditional adds), with the static part re-joining
+   as a literal add afterwards. The one-FSR rule and the
+   no-auto-increment-across-accesses boundary still hold.
+   **Correction (epic-cc#469 review, 2026-09-19):** see item 3's first
+   "Superseded in part" note above -- the chain's zero seed cannot
+   carry a `SlotValue` origin's runtime pointer value the way
+   `Absolute`'s compile-time `base_addr` does; fixed by folding the
+   pointer's own two bytes onto the chain-scaled pair with a dedicated
+   runtime 16-bit add (`emit_fsr_pair_add_mem16`) after the chain.
    **Narrowed further (epic-cc#472, 2026-09-19):** re-setup *across*
    separate accesses through the same base is no longer always a full
    `LFSR`/base-reload. `Gen.fsr0_holds` tracks `(origin, offset)` --
@@ -64,6 +92,18 @@ PIC18 pointer/array/struct support (port P3) uses:
    back to the full setup rather than adding a `SUBWF` path, since forward
    struct-field/array-element access is the overwhelmingly common shape
    and the conservative default costs nothing but a missed optimization.
+   **Superseded in part (epic-cc#469, 2026-09-19):** a dynamic term
+   whose scale is big enough that a shift-add chain beats its unrolled
+   adds is scaled as `scale×idx` from a zero-seeded `LFSR 0, 0x000`
+   (doublings plus conditional adds), with the static part re-joining
+   as a literal add afterwards. The from-scratch per-byte re-setup and
+   the one-FSR rule still hold.
+   **Correction (epic-cc#469 review, 2026-09-19):** see item 3's first
+   "Superseded in part" note above -- the chain's zero seed cannot
+   carry a `SlotValue` origin's runtime pointer value the way
+   `Absolute`'s compile-time `base_addr` does; fixed by folding the
+   pointer's own two bytes onto the chain-scaled pair with a dedicated
+   runtime 16-bit add (`emit_fsr_pair_add_mem16`) after the chain.
 4. **No `PLUSWn` for dynamic-offset writes.** `PLUSWn` computes its
    effective address from `FSRn + W` at execution time; a write needs `W`
    to hold the byte being stored, colliding with using `W` as the offset.

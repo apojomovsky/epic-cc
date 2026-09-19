@@ -746,6 +746,77 @@ fn ptr_postinc_c_runs_correctly_and_seeds_fsr0_once() {
 }
 
 #[test]
+fn stride_chain_c_runs_correctly() {
+    // Runtime indices over a 12-byte-stride struct array: the volatile
+    // RAM reads and writes go through the FSR0 shift-add chain, the
+    // flash const reads through the naive TBLPTR lowering (clang's i16
+    // gep indices keep the width-1 chain out of reach there). The chain
+    // must land every access exactly where the unrolled adds did.
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/stride_chain.c"
+    ));
+    p.run(2_000_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x4E,
+        "out == hand-computed 0x4E (fixture comment's trace)"
+    );
+    // The written element itself: recs[3] = base + 3*12, val = 0x1234.
+    let recs = globals["recs"] as usize;
+    assert_eq!(p.ram()[recs + 3 * 12], 0x34, "recs[3].val low byte");
+    assert_eq!(p.ram()[recs + 3 * 12 + 1], 0x12, "recs[3].val high byte");
+    assert_eq!(p.ram()[recs + 3 * 12 + 2], 0x00, "recs[3].tag untouched");
+    assert_eq!(
+        p.ram()[recs + 5 * 12 + 2],
+        7,
+        "recs[5].tag written via the constant index"
+    );
+    assert!(p.halted());
+}
+
+#[test]
+fn ptr_param_stride_chain_c_folds_the_pointer_into_the_chain() {
+    // epic-cc#469 review fix: a runtime POINTER PARAMETER (SlotValue),
+    // not a fixed global, indexed with a wide-enough stride to trigger
+    // the chain. It must still add the pointer's own two bytes onto the
+    // chain-scaled pair -- dropping that landed writes near address 0.
+    // Two call sites, different pointers: keeps the parameter from
+    // constant-folding to a single global (the unrelated, already-fine
+    // Absolute-origin path).
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/ptr_param_stride_chain.c"
+    ));
+    // The chain fires (RLCF doubling present) and the pointer's slot
+    // bytes are read back onto the FSR0 pair after it (a plain MOVF,
+    // never MOVLW, feeding the post-chain ADDWF/ADDWFC pair).
+    assert!(
+        asm.contains("RLCF 0x0E9"),
+        "expected the shift-add chain to fire for a 12-byte stride:\n{asm}"
+    );
+    p.run(2_000_000);
+    assert!(p.halted());
+    let storage_a = globals["storage_a"] as usize;
+    let storage_b = globals["storage_b"] as usize;
+    assert_eq!(
+        p.ram()[storage_a + 2 * 12 + 2],
+        0,
+        "storage_a[2].tag must stay untouched (touch was called on storage_b)"
+    );
+    assert_eq!(
+        p.ram()[storage_b + 2 * 12 + 2],
+        0x42,
+        "storage_b[2].tag must be written at the correct element, not near address 0"
+    );
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x42,
+        "out == storage_a[2].tag (0) + storage_b[2].tag (0x42)"
+    );
+}
+
+#[test]
 fn ptr_fields_reuse_c_runs_correctly_and_reuses_fsr0() {
     // epic-cc#472: `p->a = 1; p->b = 2; p->c = 3; p->d = 4;` through the
     // same unchanged runtime pointer must seed FSR0's base (FSR0L/FSR0H,

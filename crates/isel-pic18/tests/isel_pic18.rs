@@ -2060,6 +2060,59 @@ fn const_dynamic_index_load_uses_tblptr_add() {
 }
 
 #[test]
+fn a_large_stride_gep_scales_via_shift_add_chain() {
+    // A 12-byte struct stride makes the naive per-add loop (12 x 4
+    // words) cost more than the zero-seeded shift-add chain: seed
+    // LFSR 0 with 0, one index add, three doublings (12 = 1100b), one
+    // conditional add, then the base re-joining as a 16-bit literal
+    // add. FSR0 must end at base + 12*i, the same value the unrolled
+    // adds produce.
+    let m = parse(
+        "global recs i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @recs +0 +12*%i\n\
+             %v = load i8 %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("recs", 0x120),
+        ("idx", 0x150),
+        ("main::i", 0x151),
+        ("main::v", 0x152),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("LFSR 0, 0x000") || asm.contains("LFSR 0,0x000"),
+        "the chain must seed FSR0 with zero, not the base:\n{asm}"
+    );
+    // 12 = 1100b: bit pattern gives exactly 3 doublings and 2 index
+    // adds (the initial one plus bit 2's conditional one).
+    let rlcf_fsr0l = asm.matches("RLCF 0x0E9").count() + asm.matches("RLCF 0x0e9").count();
+    assert_eq!(rlcf_fsr0l, 3, "three doublings for a 4-bit stride:\n{asm}");
+    // Two chain index adds (initial + one set bit below the MSW) plus
+    // the base re-add, all onto FSR0L: 3 total, not the naive 12.
+    let addwf_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
+    assert_eq!(
+        addwf_fsr0l, 3,
+        "two index adds plus the base re-add, not 12 unrolled adds:\n{asm}"
+    );
+    // The base (0x120) re-joins after the chain as a literal add.
+    assert!(
+        asm.contains("MOVLW 0x20") && asm.contains("ADDWF 0x0E9"),
+        "base must re-join as a literal add after the chain:\n{asm}"
+    );
+    // The chain must spell the FSR pair in access mode, never banked:
+    // operand() sees 0xFE9/0xFEA as SFR-segment addresses.
+    assert!(
+        !asm.contains("RLCF 0x0E9,F,B") && !asm.contains("ADDWF 0x0E9,F,B"),
+        "FSR pair updates must stay access-mode:\n{asm}"
+    );
+}
+
+#[test]
 fn const_i16_load_reads_two_bytes() {
     let m = with_bytes(
         parse(
