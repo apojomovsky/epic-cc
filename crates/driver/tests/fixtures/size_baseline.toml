@@ -24,7 +24,7 @@ ram_bytes = 47
 [[entry]]
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
-flash_words = 435
+flash_words = 419
 ram_bytes = 34
 
 [[entry]]
@@ -36,5 +36,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 15997
+flash_words = 15505
 ram_bytes = 736

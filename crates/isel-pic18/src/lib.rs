@@ -509,19 +509,30 @@ impl<'m> Gen<'m> {
 
     /// Copy `val` (width `ty.bytes`) into the slot starting at `dst`. A
     /// register/global source uses `MOVFF` (no access bit needed); a
-    /// constant has no `MOVFF` literal form, so it goes through `W` via
-    /// `MOVLW`/`MOVWF` (which DOES need the access bit: this is the one
-    /// place a plain copy still touches `operand`/`BSR`).
+    /// constant has no `MOVFF` literal form: a zero byte writes a
+    /// one-word `CLRF`, any other byte stages through `W` via
+    /// `MOVLW`/`MOVWF` (both forms touch `operand`/`BSR` the same way:
+    /// this is the one place a plain copy still touches `operand`).
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
         self.invalidate_fsr0_if_slot_written(dst, u16::from(ty.bytes()));
         match val {
             Val::Const(k) => {
                 for i in 0..ty.bytes() {
                     let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
-                    self.emit(format!("    MOVLW 0x{byte:02X}"));
                     let (a, f) = self.operand(dst + u16::from(i));
                     let bank = if a == 0 { "A" } else { "B" };
-                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    if byte == 0 {
+                        // A zero byte needs no W staging: CLRF writes it
+                        // in one word where the pair costs two. CLRF
+                        // sets Z, which is safe here: no lowering reads
+                        // STATUS across insts, every consumer sets its
+                        // own flags first (compare chains, shift
+                        // carries).
+                        self.emit(format!("    CLRF 0x{f:03X},{bank}"));
+                    } else {
+                        self.emit(format!("    MOVLW 0x{byte:02X}"));
+                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    }
                 }
             }
             Val::Reg(r)
