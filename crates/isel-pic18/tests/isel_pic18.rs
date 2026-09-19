@@ -3316,3 +3316,40 @@ fn const_nonzero_store_still_stages_through_w() {
     assert!(asm.contains("MOVWF 0x020,A"), "non-zero byte:\n{asm}");
     assert!(!asm.contains("CLRF 0x020,"), "non-zero byte:\n{asm}");
 }
+fn memcpy_indirect_src_to_banked_direct_dst_selects_the_bank() {
+    // A memcpy from an FSR1-indirect source (an sret pointer param) into
+    // a banked direct global must select the bank: the stale access-bank
+    // spelling reads access-RAM 0x80 instead of bank-1 0x180. The pad
+    // globals push `dst` into bank 1 the way a real layout would.
+    let mut src = String::new();
+    for i in 0..0x70u16 {
+        src.push_str(&format!("global pad{i:03} i8\n"));
+    }
+    src.push_str(
+        "global dst i32\n\
+         fn f(void) (p=sret)\n\
+           block entry:\n\
+             memcpy @dst %p 4\n\
+             ret void\n",
+    );
+    let m = parse(&src);
+    let mut addrs: HashMap<String, u16> = HashMap::new();
+    for i in 0..0x70u16 {
+        addrs.insert(format!("pad{i:03}"), 0x10 + i);
+    }
+    addrs.insert("dst".to_string(), 0x180);
+    addrs.insert("f::p".to_string(), 0x300);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVLB 0x1"),
+        "the bank-1 destination needs a bank select:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVWF 0x080,B"),
+        "the destination store must be banked:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x080,A"),
+        "the stale access-bank spelling must be gone:\n{asm}"
+    );
+}
