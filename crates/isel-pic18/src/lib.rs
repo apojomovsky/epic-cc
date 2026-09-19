@@ -5944,7 +5944,9 @@ pub fn select_with_locs(
             for inst in &b.insts {
                 match inst {
                     Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
-                    Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(inst),
+                    Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) | Inst::Ret(..) => {
+                        terminator = Some(inst)
+                    }
                     other => g.emit_inst(other),
                 }
             }
@@ -6018,6 +6020,179 @@ pub fn select_with_locs(
                             emit_phi_copies(&mut g, &cf, doms[&b.label].contains(&bc.f));
                             g.emit(format!("    BRA {lf}"));
                         }
+                    }
+                }
+                Some(Inst::Switch(sw)) => {
+                    g.cur_loc = sw.loc.clone();
+                    assert!(
+                        !matches!(sw.val, Val::Const(_)),
+                        "isel-pic18: constant switch value reached the backend (fold it before isel)"
+                    );
+                    let l_default = labels[&sw.default].clone();
+                    let edge_copies = |l: &str| phi_copies.get(&(b.label.clone(), l.to_string()));
+                    let n = sw.cases.len();
+                    let base = sw.cases.first().map(|(k, _)| *k).unwrap_or(0);
+                    // Table shape: dense-contiguous values base..base+n-1
+                    // (irparse sorts them), enough cases for the dispatch
+                    // plus table to beat the chain.
+
+                    // Phi-carrying edges route through a per-edge
+                    // trampoline (copies, then a branch to the target);
+                    // copy-free edges jump straight to their target.
+
+                    // The cost gate compares the table (dispatch words
+                    // plus 2 per entry, padding included) against roughly
+                    // 6 words per chain link. Negative bases would index
+                    // the table backwards while the entry math counts
+                    // forward from zero: reject them (the chain handles
+                    // negatives fine).
+                    let dense = sw.ty.bytes() <= 2
+                        && base >= 0
+                        && base <= 0xFF
+                        && n >= 6
+                        && 2 * base + 16 < 4 * n as i64
+                        && 4 * (base + n as i64) <= 200
+                        && sw
+                            .cases
+                            .iter()
+                            .enumerate()
+                            .all(|(i, (k, _))| *k == base + i as i64);
+                    // Trampolines for phi-carrying table edges: the table
+                    // points at the trampoline, which runs that edge's
+                    // copies and branches to the real target.
+                    let mut tramps: Vec<(String, Vec<(String, Ty, Val)>, String, String)> =
+                        Vec::new();
+                    if dense {
+                        let l_tbl = g.fresh_label();
+                        // Alignment anchor for the assembler's page
+                        // fixup: if dispatch plus table would straddle a
+                        // 256-byte page, the assembler pads NOPs here to
+                        // push the block onto the next page.
+                        g.emit("    .pclalign".to_string());
+                        // Bounds check, then `ADDWF PCL,F` into a table of
+                        // absolute 2-word GOTO entries (4 bytes each, so
+                        // the selector needs W = 2 + 4*idx: the +2 covers
+                        // the gap between the PCL write and the table
+                        // start). PCLATH names the table's page; the
+                        // `.pcltbl` marker makes the assembler assert
+                        // dispatch and the whole table share that page.
+
+                        // Default-edge trampoline when the default edge
+                        // carries phi copies; the bounds branches target
+                        // it instead of the bare default label.
+                        let l_def = if let Some(c) = edge_copies(&sw.default) {
+                            let t = g.fresh_label();
+                            tramps.push((
+                                t.clone(),
+                                c.clone(),
+                                l_default.clone(),
+                                sw.default.clone(),
+                            ));
+                            t
+                        } else {
+                            l_default.clone()
+                        };
+                        if sw.ty.bytes() == 2 {
+                            g.emit_load_w(&sw.val, 1);
+                            g.emit(format!("    BNZ {l_def}"));
+                        }
+                        let slot = g.val_addr(&sw.val).direct();
+                        let (a, f) = g.operand(slot);
+                        let bank = if a == 0 { "A" } else { "B" };
+                        if base == 0 {
+                            g.emit_load_w(&sw.val, 0);
+                            g.emit(format!("    SUBLW 0x{:02X}", (n - 1) as u8));
+                            g.emit(format!("    BNC {l_def}"));
+                        } else {
+                            // Reject idx < base (W = d = idx - base), then
+                            // finish the same upper bound on d.
+                            g.emit(format!("    MOVLW 0x{base:02X}"));
+                            g.emit(format!("    SUBWF 0x{f:03X},W,{bank}"));
+                            g.emit(format!("    BNC {l_def}"));
+                            g.emit(format!("    SUBLW 0x{:02X}", (n - 1) as u8));
+                            g.emit(format!("    BNC {l_def}"));
+                        }
+                        // Bounds went through W (SUBLW overwrites it), so
+                        // the page set comes next and the offset math runs
+                        // last, with W live straight into the PCL write.
+                        // `slot`/`bank` above still hold: nothing between
+                        // touched BSR.
+                        g.emit(format!("    MOVLW HIGH({l_tbl})"));
+                        g.emit("    MOVWF 0xFFA,A".to_string()); // PCLATH
+                                                                 // W = 2 + 4*idx (the +2 covers the gap between the
+                                                                 // PCL write and the table start): three
+                                                                 // accumulations of the index plus the literal, no
+                                                                 // scratch byte, and no flag consumer follows.
+                        g.emit_load_w(&sw.val, 0);
+                        g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
+                        g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
+                        g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
+                        g.emit("    ADDLW 0x02".to_string());
+                        g.emit("    ADDWF 0xFF9,F,A".to_string()); // PCL: the jump
+                        g.emit_label(&l_tbl);
+                        let span = (base + n as i64) * 4;
+                        g.emit(format!("    .pcltbl {l_tbl} {span}"));
+                        // Entries for values 0..base cover the gap to a
+                        // nonzero base (the bounds check rejects them):
+                        // they target the default edge, so a stray index
+                        // still lands on defined behavior.
+                        let total = (base + n as i64) as usize;
+                        let mut tramp_targets: Vec<String> = Vec::with_capacity(total);
+                        for _ in 0..base {
+                            tramp_targets.push(l_def.clone());
+                        }
+                        for (_, l) in &sw.cases {
+                            if let Some(c) = edge_copies(l) {
+                                let t = g.fresh_label();
+                                tramps.push((t.clone(), c.clone(), labels[l].clone(), l.clone()));
+                                tramp_targets.push(t);
+                            } else {
+                                tramp_targets.push(labels[l].clone());
+                            }
+                        }
+                        for t in &tramp_targets {
+                            g.emit(format!("    GOTO {t}"));
+                        }
+                        for (t, c, target, orig) in tramps {
+                            g.emit_label(&t);
+                            emit_phi_copies(&mut g, &c, doms[&b.label].contains(&orig));
+                            g.emit(format!("    BRA {target}"));
+                        }
+                    } else {
+                        // Linear equality chain, irparse's expansion
+                        // shape emitted in place: each case tests every
+                        // byte of the value against the case constant,
+                        // mismatches skip to the next case, the hit
+                        // edge's phi copies run before its branch.
+                        let mask: i64 = match sw.ty.bytes() {
+                            1 => 0xFF,
+                            2 => 0xFFFF,
+                            other => {
+                                panic!("isel-pic18: {other}-byte switch not supported (max 2)")
+                            }
+                        };
+                        for (k, l) in &sw.cases {
+                            let k = *k & mask;
+                            let l_next = g.fresh_label();
+                            for b_i in 0..sw.ty.bytes() {
+                                let kb = ((k >> (b_i as u32 * 8)) & 0xFF) as u8;
+                                g.emit_load_w(&sw.val, b_i);
+                                g.emit(format!("    SUBLW 0x{kb:02X}"));
+                                if b_i as u8 + 1 != sw.ty.bytes() {
+                                    g.emit(format!("    BNZ {l_next}"));
+                                }
+                            }
+                            g.emit(format!("    BNZ {l_next}"));
+                            if let Some(c) = edge_copies(l) {
+                                emit_phi_copies(&mut g, c, doms[&b.label].contains(l));
+                            }
+                            g.emit(format!("    BRA {}", labels[l]));
+                            g.emit_label(&l_next);
+                        }
+                        if let Some(c) = edge_copies(&sw.default) {
+                            emit_phi_copies(&mut g, c, doms[&b.label].contains(&sw.default));
+                        }
+                        g.emit(format!("    BRA {l_default}"));
                     }
                 }
                 Some(Inst::Ret(None, loc)) if g.isr => {

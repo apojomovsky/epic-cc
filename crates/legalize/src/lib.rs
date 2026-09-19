@@ -584,7 +584,12 @@ fn inst_dst(inst: &Inst) -> Option<&str> {
         Inst::Fcmp(c) => Some(&c.dst),
         Inst::FloatConv(c) => Some(&c.dst),
         Inst::Asm(_) => None,
-        Inst::Ret(_, _) | Inst::Store(_) | Inst::Br(_) | Inst::BrCond(_) | Inst::Memcpy(_) => None,
+        Inst::Ret(_, _)
+        | Inst::Store(_)
+        | Inst::Br(_)
+        | Inst::BrCond(_)
+        | Inst::Switch(_)
+        | Inst::Memcpy(_) => None,
     }
 }
 

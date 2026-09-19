@@ -201,6 +201,17 @@ pub struct BrCond {
     pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
+pub struct Switch {
+    pub val: Val,
+    pub ty: Ty,
+    pub default: String,
+    /// `(case value, target block label)`, ascending. Dense-contiguous
+    /// runs are the backend's table-eligibility signal, never a
+    /// correctness requirement: every case list must lower correctly.
+    pub cases: Vec<(i64, String)>,
+    pub loc: Option<SrcLoc>,
+}
+#[derive(Clone, Debug)]
 pub struct Phi {
     pub dst: String,
     pub ty: Ty,
@@ -369,6 +380,7 @@ pub enum Inst {
     Call(Call),
     Br(Br),
     BrCond(BrCond),
+    Switch(Switch),
     Phi(Phi),
     Gep(Gep),
     Alloca(Alloca),
@@ -401,6 +413,7 @@ impl Inst {
             Inst::Call(i) => i.loc.as_ref(),
             Inst::Br(i) => i.loc.as_ref(),
             Inst::BrCond(i) => i.loc.as_ref(),
+            Inst::Switch(i) => i.loc.as_ref(),
             Inst::Phi(i) => i.loc.as_ref(),
             Inst::Gep(i) => i.loc.as_ref(),
             Inst::Alloca(i) => i.loc.as_ref(),
@@ -778,6 +791,17 @@ fn inst_str(i: &Inst) -> String {
         },
         Inst::Br(b) => format!("br {}", b.target),
         Inst::BrCond(b) => format!("br i1 {} {} {}", val_str(&b.cond), b.t, b.f),
+        Inst::Switch(s) => format!(
+            "switch {} {}, default {}, cases {}",
+            ty_str(s.ty),
+            val_str(&s.val),
+            s.default,
+            s.cases
+                .iter()
+                .map(|(k, l)| format!("{k} {l}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         Inst::Phi(p) => format!(
             "%{} = phi {} {}",
             p.dst,
@@ -1455,6 +1479,49 @@ fn parse_inst(line: &str) -> Inst {
                 .unwrap_or(rest)
                 .trim_start_matches('%')
                 .to_string(),
+            loc: None,
+        });
+    }
+    if let Some(rest) = line.strip_prefix("switch ") {
+        // Canonical form: `switch i16 %v, default %d, cases 0 %a, 1 %b`.
+        let mut it = rest.split_whitespace();
+        let ty = parse_ty(it.next().unwrap());
+        let val = parse_val(it.next().unwrap().trim_end_matches(','));
+        let mut default = it.next().unwrap().to_string();
+        if default == "default" {
+            default = it.next().unwrap().to_string();
+        }
+        let default = default
+            .trim_start_matches('%')
+            .trim_end_matches(',')
+            .to_string();
+        let mut cases = Vec::new();
+        let mut expect_val = false;
+        let mut pending_k: Option<i64> = None;
+        for tok in it {
+            let tok = tok.trim_end_matches(',');
+            if tok == "cases" {
+                continue;
+            }
+            if expect_val {
+                cases.push((pending_k.unwrap(), tok.trim_start_matches('%').to_string()));
+                expect_val = false;
+            } else {
+                pending_k = Some(tok.parse::<i64>().unwrap_or_else(|_| {
+                    panic!("ir: malformed switch case value {tok:?} in {line:?}")
+                }));
+                expect_val = true;
+            }
+        }
+        // A dangling case value with no label leaves `expect_val` set.
+        if expect_val || cases.is_empty() {
+            panic!("ir: malformed switch with no cases: {line:?}");
+        }
+        return Inst::Switch(Switch {
+            val,
+            ty,
+            default,
+            cases,
             loc: None,
         });
     }

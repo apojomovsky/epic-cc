@@ -321,3 +321,35 @@ fn far_unconditional_bra_becomes_goto() {
     assert_eq!(words[1], 0xF000 | 0x04, "GOTO word 1 (high byte 0x04)");
     assert_eq!(words.len(), 1102, "1100 NOPs + 2-word GOTO (+ label)");
 }
+
+#[test]
+fn pcltbl_fitting_table_assembles_without_padding() {
+    // epic-cc#479: dispatch plus an 8-byte table fitting one page: no
+    // NOPs are inserted and the entries encode as absolute GOTOs.
+    let src = "    org 0x0000\n    MOVLW 0x00\n    ADDWF 0xFF9,F,A\ntbl:\n    .pcltbl tbl 8\n    GOTO c0\n    GOTO c1\nc0:\n    RETURN\nc1:\n    RETURN\n";
+    let words = assemble_pic18(src);
+    // MOVLW, ADDWF, two GOTOs (2 words each), two RETURNs: 8 words, no pad.
+    assert_eq!(words.len(), 8, "words: {words:04X?}");
+    assert_eq!(words[0], 0x0E00);
+    assert_eq!(words[1] & 0xFC00, 0x2400, "ADDWF PCL,F writes PCL");
+}
+
+#[test]
+fn pcltbl_straddling_table_is_padded_onto_the_next_page() {
+    // epic-cc#479: a table that would cross the 0x0100 page edge is
+    // pushed whole onto the next page with NOPs at its `.pclalign`
+    // anchor instead of failing: entry 0xFC plus 8 bytes overflows, so
+    // 4 NOP words land at 0xF8 and the table starts at 0x100.
+    let src = "    org 0x00F8\n    .pclalign\n    MOVLW 0x00\n    ADDWF 0xFF9,F,A\ntbl:\n    .pcltbl tbl 8\n    GOTO c0\n    GOTO c1\nc0:\n    RETURN\nc1:\n    RETURN\n";
+    let words = assemble_pic18(src);
+    assert_eq!(
+        words.len(),
+        0x88,
+        "4 pad NOPs shift the block: {len}",
+        len = words.len()
+    );
+    assert_eq!(words[0x7C], 0x0000, "NOP pad at the anchor");
+    assert_eq!(words[0x7F], 0x0000, "NOP pad ends at the page edge");
+    assert_eq!(words[0x80], 0x0E00, "dispatch follows the pad");
+    assert_eq!(words[0x81] & 0xFC00, 0x2400, "the PCL write itself");
+}

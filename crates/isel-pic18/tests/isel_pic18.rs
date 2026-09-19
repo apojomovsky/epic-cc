@@ -3355,3 +3355,213 @@ fn memcpy_indirect_src_to_banked_direct_dst_selects_the_bank() {
         "the stale access-bank spelling must be gone:\n{asm}"
     );
 }
+
+#[test]
+fn dense_switch_lowers_to_pcl_table() {
+    // epic-cc#479: eight dense cases table through a PCL computed jump:
+    // bounds check against n-1, PCLATH named by HIGH(), a `.pcltbl`
+    // marker for the assembler's page check, and one absolute GOTO per
+    // case.
+    let cases = [
+        "0 %c0", "1 %c1", "2 %c2", "3 %c3", "4 %c4", "5 %c5", "6 %c6", "7 %c7",
+    ];
+    let mut blocks = String::new();
+    for (i, _) in cases.iter().enumerate() {
+        blocks.push_str(&format!(
+            "  block c{i}:\n    store i8 {i} @out\n    ret void\n"
+        ));
+    }
+    let m = parse(&format!(
+        "global sel i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @sel\n    \
+         switch i16 %1, default %def, cases {}\n{blocks}  \
+         block def:\n    store i8 99 @out\n    ret void\n",
+        cases.join(", ")
+    ));
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("sel", 0x20), ("out", 0x28), ("main::1", 0x30)]),
+        None,
+    );
+    assert!(asm.contains("ADDWF 0xFF9,F,A"), "PCL dispatch:\n{asm}");
+    assert!(
+        asm.contains("MOVLW HIGH("),
+        "table page into PCLATH:\n{asm}"
+    );
+    assert!(asm.contains(".pcltbl "), "page-check marker:\n{asm}");
+    assert!(
+        asm.contains("SUBLW 0x07"),
+        "bounds check against n-1:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("\n    GOTO ").count(),
+        8,
+        "one absolute GOTO per case:\n{asm}"
+    );
+}
+
+#[test]
+fn small_dense_switch_keeps_the_compare_chain() {
+    // Three dense cases: below the table crossover, the chain costs
+    // less than the dispatch-plus-table shape.
+    let m = parse(
+        "global sel i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @sel\n    \
+         switch i16 %1, default %def, cases 0 %c0, 1 %c1, 2 %c2\n  \
+         block c0:\n    store i8 0 @out\n    ret void\n  \
+         block c1:\n    store i8 1 @out\n    ret void\n  \
+         block c2:\n    store i8 2 @out\n    ret void\n  \
+         block def:\n    store i8 99 @out\n    ret void\n",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("sel", 0x20), ("out", 0x28), ("main::1", 0x30)]),
+        None,
+    );
+    assert!(!asm.contains("ADDWF 0xFF9"), "no PCL dispatch:\n{asm}");
+    assert!(!asm.contains(".pcltbl"), "no table marker:\n{asm}");
+    assert_eq!(
+        asm.matches("\n    BRA ").count(),
+        4,
+        "one branch per case plus the default:\n{asm}"
+    );
+}
+
+#[test]
+fn sparse_switch_keeps_the_compare_chain() {
+    // Contiguous-looking but gapped values never table: the table is
+    // indexed by the raw value, so gaps would jump wild.
+    let m = parse(
+        "global sel i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @sel\n    \
+         switch i16 %1, default %def, cases 0 %c0, 5 %c1, 9 %c2, 10 %c3, 11 %c4, 12 %c5\n  \
+         block c0:\n    store i8 0 @out\n    ret void\n  \
+         block c1:\n    store i8 1 @out\n    ret void\n  \
+         block c2:\n    store i8 2 @out\n    ret void\n  \
+         block c3:\n    store i8 3 @out\n    ret void\n  \
+         block c4:\n    store i8 4 @out\n    ret void\n  \
+         block c5:\n    store i8 5 @out\n    ret void\n  \
+         block def:\n    store i8 99 @out\n    ret void\n",
+    );
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("sel", 0x20), ("out", 0x28), ("main::1", 0x30)]),
+        None,
+    );
+    assert!(!asm.contains("ADDWF 0xFF9"), "no PCL dispatch:\n{asm}");
+    assert!(asm.contains("SUBLW 0x00"), "chain equality tests:\n{asm}");
+}
+
+#[test]
+fn nonzero_base_switch_tables_with_padding() {
+    // epic-cc#479: base 4, eight cases: the entry stride still indexes
+    // the raw value, so values 0..3 need padding entries (targeting the
+    // default) and the span covers the whole padded table.
+    let cases = [
+        "4 %c4", "5 %c5", "6 %c6", "7 %c7", "8 %c8", "9 %c9", "10 %c10", "11 %c11",
+    ];
+    let mut blocks = String::new();
+    for i in 4..12 {
+        blocks.push_str(&format!(
+            "  block c{i}:\n    store i8 {i} @out\n    ret void\n"
+        ));
+    }
+    let m = parse(&format!(
+        "global sel i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @sel\n    \
+         switch i16 %1, default %def, cases {}\n{blocks}  \
+         block def:\n    store i8 99 @out\n    ret void\n",
+        cases.join(", ")
+    ));
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("sel", 0x20), ("out", 0x28), ("main::1", 0x30)]),
+        None,
+    );
+    assert!(asm.contains("ADDWF 0xFF9,F,A"), "PCL dispatch:\n{asm}");
+    assert!(
+        asm.contains(".pcltbl "),
+        "page-check marker with padded span:\n{asm}"
+    );
+    // 4 padding GOTOs plus one per case: base + n entries.
+    assert_eq!(
+        asm.matches("\n    GOTO ").count(),
+        12,
+        "padding plus case entries:\n{asm}"
+    );
+    assert!(asm.contains("SUBWF"), "low bound against the base:\n{asm}");
+}
+
+#[test]
+fn i16_dense_switch_checks_the_high_byte() {
+    // epic-cc#479: an i16 switch tables like the i8 shape, with a high-
+    // byte reject up front (a nonzero high byte can never match a
+    // 0..n-1 case). Pinned here rather than in the simulator: clang
+    // folds an i16 switch of e2e-fixture shape into a const lookup
+    // before isel runs.
+    let cases = ["0 %c0", "1 %c1", "2 %c2", "3 %c3", "4 %c4", "5 %c5"];
+    let mut blocks = String::new();
+    for (i, _) in cases.iter().enumerate() {
+        blocks.push_str(&format!(
+            "  block c{i}:\n    store i8 {i} @out\n    ret void\n"
+        ));
+    }
+    let m = parse(&format!(
+        "global sel i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @sel\n    \
+         switch i16 %1, default %def, cases {}\n{blocks}  \
+         block def:\n    store i8 99 @out\n    ret void\n",
+        cases.join(", ")
+    ));
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("sel", 0x20), ("out", 0x28), ("main::1", 0x30)]),
+        None,
+    );
+    assert!(asm.contains("ADDWF 0xFF9,F,A"), "PCL dispatch:\n{asm}");
+    assert!(asm.contains(".pcltbl "), "page-check marker:\n{asm}");
+    assert_eq!(
+        asm.matches("\n    GOTO ").count(),
+        6,
+        "one absolute GOTO per case:\n{asm}"
+    );
+    assert!(
+        asm.matches("\n    BNZ ").count() >= 1,
+        "high-byte reject for i16 values above 255:\n{asm}"
+    );
+}
+
+#[test]
+fn negative_base_switch_keeps_the_compare_chain() {
+    // A dense negative-base switch must never table: the entry math
+    // indexes the raw value forward from zero, so a negative base
+    // would jump outside the table while every check passes. The
+    // chain compares full two's-complement values and handles it.
+    let cases = ["-8 %c0", "-7 %c1", "-6 %c2", "-5 %c3", "-4 %c4", "-3 %c5"];
+    let mut blocks = String::new();
+    for (i, _) in cases.iter().enumerate() {
+        blocks.push_str(&format!(
+            "  block c{i}:\n    store i8 {i} @out\n    ret void\n"
+        ));
+    }
+    let m = parse(&format!(
+        "global sel i16\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i16 @sel\n    \
+         switch i16 %1, default %def, cases {}\n{blocks}  \
+         block def:\n    store i8 99 @out\n    ret void\n",
+        cases.join(", ")
+    ));
+    let asm = select(
+        &PIC18F4550,
+        &m,
+        &addrs(&[("sel", 0x20), ("out", 0x28), ("main::1", 0x30)]),
+        None,
+    );
+    assert!(!asm.contains("ADDWF 0xFF9"), "no PCL dispatch:\n{asm}");
+    assert!(!asm.contains(".pcltbl"), "no table marker:\n{asm}");
+}

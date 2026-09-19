@@ -355,7 +355,11 @@ fn main() {
 
     // 3-5. irparse -> wholeprog -> legalize -> callgraph (depth check vs the
     // device's hardware stack)
-    let mut m = irparse::parse_ll(&ll_text);
+    // Only the PIC18 backend tables dense switches; every other core keeps
+    // irparse's compare-chain expansion (irparse is target-agnostic, the
+    // driver is where the core is known).
+    let preserve_switches = device.core == device::Core::Pic18;
+    let mut m = irparse::parse_ll_opts(&ll_text, preserve_switches);
     m = wholeprog::merge(m);
     if cli.emit == cli::Emit::Ir {
         std::fs::write(&cli.output, ir::serialize(&m)).expect("write ir");

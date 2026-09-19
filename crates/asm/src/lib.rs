@@ -239,6 +239,13 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
                     .split(',')
                     .filter(|t| !t.trim().is_empty())
                     .count();
+            } else if line.starts_with(".pcltbl ") {
+                // A `.pcltbl` marker (see the page check after the fix
+                // point): marks a PCL computed-jump dispatch, consumes
+                // no words.
+            } else if line.starts_with(".pclalign") {
+                // The dispatch-start anchor for the page fixup below:
+                // also consumes no words.
             } else {
                 org += instruction_words_pic18(line) * 2;
             }
@@ -257,6 +264,12 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
                 continue;
             }
             if line.starts_with("equ ") {
+                continue;
+            }
+            if line.starts_with(".pcltbl ") {
+                continue;
+            }
+            if line.starts_with(".pclalign") {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("org ") {
@@ -327,7 +340,9 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
                 let is_db = line.to_ascii_lowercase().starts_with("db ");
                 let is_org = line.starts_with("org ");
                 let is_equ = line.starts_with("equ ");
-                if is_label || is_db || is_org || is_equ {
+                let is_pcltbl = line.starts_with(".pcltbl ");
+                let is_pclalign = line.starts_with(".pclalign");
+                if is_label || is_db || is_org || is_equ || is_pcltbl || is_pclalign {
                     li += 1;
                     continue;
                 }
@@ -356,6 +371,113 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
             expanded = true;
             break;
         }
+        // A branch expansion just mutated the stream: the symbols above
+        // no longer describe it, so re-resolve before checking tables
+        // rather than validating against stale addresses.
+        if expanded {
+            continue;
+        }
+        // PCL computed-jump page fixup: a `.pcltbl` table must start
+        // at the dispatch entry and stay inside its 256-byte page
+        // (the entry jumps to `(PCLATH<<8) | (low(entry) + W)`).
+        // When a table straddles the edge, pad NOPs at its
+        // `.pclalign` anchor to push the block onto the next page;
+        // the span cap in the backend keeps every padded block under
+        // one page, so one alignment always fits. First violation
+        // per round, then re-resolve.
+        {
+            let mut addr = 0usize;
+            let mut last_align: Option<(usize, usize)> = None;
+            let mut last_instr: Option<(usize, String)> = None;
+            let mut li = 0usize;
+            let mut fix: Option<(usize, usize)> = None; // (insert-at, nop-words)
+            for line in &lines {
+                if line.strip_suffix(':').is_some() {
+                    li += 1;
+                    continue;
+                }
+                if line.starts_with("equ ") {
+                    li += 1;
+                    continue;
+                }
+                if line.starts_with(".pclalign") {
+                    last_align = Some((li, addr));
+                    li += 1;
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix("org ") {
+                    addr = parse_num(rest.trim());
+                    li += 1;
+                    continue;
+                }
+                if line.to_ascii_lowercase().starts_with("db ") {
+                    addr += line[3..]
+                        .split(',')
+                        .filter(|t| !t.trim().is_empty())
+                        .count();
+                    li += 1;
+                    continue;
+                }
+                if let Some(rest) = line.strip_prefix(".pcltbl ") {
+                    let (daddr, dtext) = last_instr.clone().unwrap_or_else(|| {
+                        panic!("asm: .pcltbl with no preceding dispatch instruction")
+                    });
+                    let (mne, opnd) = dtext
+                        .split_once(char::is_whitespace)
+                        .unwrap_or((dtext.as_str(), ""));
+                    if !mne.eq_ignore_ascii_case("ADDWF") || !opnd.starts_with("0xFF9") {
+                        panic!(
+                            "asm: .pcltbl must directly follow the ADDWF 0xFF9,F,A dispatch, found {dtext:?}"
+                        );
+                    }
+                    let mut it = rest.split_whitespace();
+                    let table_label = it.next().unwrap_or("");
+                    let span = parse_num(it.next().unwrap_or(""));
+                    if span > 0x100 {
+                        panic!(
+                            "asm: .pcltbl table {table_label} spans {span} bytes, more than one 256-byte page; split it before assembling"
+                        );
+                    }
+                    let entry = daddr + 2;
+                    let table = *symbols_now
+                        .get(table_label)
+                        .unwrap_or_else(|| panic!("asm(pic18): undefined label {table_label}"));
+                    if table != entry {
+                        panic!(
+                            "asm: .pcltbl table {table_label} at 0x{table:04X} is not adjacent to the dispatch entry at 0x{entry:04X}"
+                        );
+                    }
+                    if (table & 0xFF00) != (entry & 0xFF00) || (table & 0xFF) + span > 0x100 {
+                        let (ai, aaddr) =
+                            last_align.expect("asm: .pcltbl table without a .pclalign anchor");
+                        // Already page-aligned yet still overflowing, or
+                        // anchored at the last byte of a page (which pads
+                        // zero words and re-detects forever): the block
+                        // cannot fit and no padding can fix it. Fail
+                        // loudly instead of padding forever.
+                        let pad = (0x100 - (aaddr & 0xFF)) / 2;
+                        if (aaddr & 0xFF) == 0 || pad == 0 {
+                            panic!(
+                                "asm: .pcltbl table at 0x{table:04X} spans {span} bytes past its page even page-aligned; shrink the table"
+                            );
+                        }
+                        fix = Some((ai, pad));
+                        break;
+                    }
+                    li += 1;
+                    continue;
+                }
+                last_instr = Some((addr, line.clone()));
+                addr += instruction_words_pic18(line) * 2;
+                li += 1;
+            }
+            if let Some((ai, pad)) = fix {
+                for _ in 0..pad {
+                    lines.insert(ai + 1, "NOP".to_string());
+                }
+                expanded = true;
+            }
+        }
         if !expanded {
             break;
         }
@@ -363,6 +485,7 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
 
     let (symbols_final, total_bytes) = resolve_labels(&lines, &symbols);
     let (instrs, dbs, _) = layout_addrs(&lines);
+
     let mut out = vec![0u16; (total_bytes + 1) / 2];
     for (addr, line) in &instrs {
         let word_addr = addr / 2;

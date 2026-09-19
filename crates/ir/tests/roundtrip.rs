@@ -570,3 +570,13 @@ fn roundtrips_variadic_va_start_and_va_arg() {
     assert!(f2.variadic);
     assert_eq!(serialize(&m2), out, "stable fixed point");
 }
+
+#[test]
+fn switch_terminator_roundtrips() {
+    let text = "global sel i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i16 @sel\n    switch i16 %1, default %def, cases 0 %c0, 1 %c1, 2 %c2\n  block c0:\n    store i8 0 @out\n    ret void\n  block c1:\n    store i8 1 @out\n    ret void\n  block c2:\n    store i8 2 @out\n    ret void\n  block def:\n    store i8 99 @out\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    assert!(out.contains("switch i16 %1, default def, cases 0 c0, 1 c1, 2 c2"));
+    // stable fixed point
+    assert_eq!(serialize(&parse(&out)), out);
+}

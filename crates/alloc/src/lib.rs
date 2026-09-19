@@ -428,6 +428,12 @@ fn frame_layout(
                     ss.push(idx[&norm(&bc.t)[..]]);
                     ss.push(idx[&norm(&bc.f)[..]]);
                 }
+                ir::Inst::Switch(sw) => {
+                    ss.push(idx[&norm(&sw.default)[..]]);
+                    for (_, l) in &sw.cases {
+                        ss.push(idx[&norm(l)[..]]);
+                    }
+                }
                 _ => {}
             }
         }
@@ -639,6 +645,7 @@ fn inst_vals(inst: &ir::Inst) -> Vec<String> {
         }
         Inst::Br(_) => Vec::new(),
         Inst::BrCond(b) => vec![val_name(&b.cond)],
+        Inst::Switch(s) => vec![val_name(&s.val)],
         Inst::Phi(p) => p.incoming.iter().map(|(v, _)| val_name(v)).collect(),
         Inst::Gep(g) => {
             let mut vs = Vec::new();
@@ -1526,7 +1533,12 @@ fn def_width(
             _ => None,
         },
         Inst::Phi(p) => Some((p.dst.clone(), p.ty.bytes())),
-        Inst::Store(_) | Inst::Ret(..) | Inst::Br(_) | Inst::BrCond(_) | Inst::VaStart(_) => None,
+        Inst::Store(_)
+        | Inst::Ret(..)
+        | Inst::Br(_)
+        | Inst::BrCond(_)
+        | Inst::Switch(_)
+        | Inst::VaStart(_) => None,
         // Gep computes a virtual pointer address (isel turns it into FSR/INDF
         // or a RETLW table read); it defines no value needing a RAM slot.
         Inst::Gep(_) => None,
