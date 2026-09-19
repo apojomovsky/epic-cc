@@ -1337,40 +1337,98 @@ impl<'m> Gen<'m> {
                         (0..width).contains(&k),
                         "isel-pic18: const shift count {k} out of range [0, {width}) (LLVM poison)"
                     );
-                    // Copy the value into the dst slot, then rotate the dst
-                    // in place k times. shl: lo then hi (carry goes up);
-                    // lshr: hi then lo (bits come down); ashr: set C from
-                    // the sign bit before each rrcf so the sign fills every
-                    // vacated bit.
-                    self.emit_move_val_to_slot(&b.a, b.ty, dst);
-                    for _ in 0..k {
+                    // No barrel shifter: RLCF/RRCF rotate one bit, so a
+                    // multiple-of-8 shift is just a byte move (MOVFF), not
+                    // 8 rotates per byte. Split k = 8*m + r: move the m
+                    // surviving bytes, fill the m vacated ones (zero, or
+                    // the sign byte for ashr), then bit-rotate only the
+                    // residual r over the live bytes -- the filled ones
+                    // are quiescent under further rotation. epic-cc#470.
+                    let m = (k / 8) as u16;
+                    let r = k % 8;
+                    let n16 = u16::from(n);
+                    if m == 0 {
+                        // Sub-byte shift only: no whole-byte move to
+                        // make, so copy the operand and rotate every
+                        // byte.
+                        self.emit_move_val_to_slot(&b.a, b.ty, dst);
+                    } else {
+                        // The byte-move path reads the operand straight
+                        // out of RAM, but `val_addr` maps a literal to
+                        // the truncated address k & 0xFF: a const-LHS
+                        // shift would move whatever bytes live at that
+                        // address. Fail loudly like the other const-LHS
+                        // arms.
+                        assert!(
+                            !matches!(b.a, Val::Const(_)),
+                            "isel-pic18: const-LHS byte-granular shift (constant as the first operand) not yet supported"
+                        );
+                        match b.op {
+                            ir::BinOp::Shl => {
+                                // dst[n-1..m] = a[n-1-m..0]; dst[m-1..0] = 0.
+                                // High-to-low so an in-place shift (av ==
+                                // dst) never reads a byte already overwritten.
+                                for i in (m..n16).rev() {
+                                    self.emit_copy_byte(av + (i - m), dst + i);
+                                }
+                                for i in 0..m {
+                                    self.emit_banked("CLRF", dst + i, "");
+                                }
+                            }
+                            ir::BinOp::LShr | ir::BinOp::AShr => {
+                                // dst[0..n-m) = a[m..n); dst[n-m..n) = 0
+                                // (lshr) or the sign fill (ashr). Low-to-high
+                                // is the mirror in-place safety argument.
+                                for i in 0..(n16 - m) {
+                                    self.emit_copy_byte(av + i + m, dst + i);
+                                }
+                                if matches!(b.op, ir::BinOp::AShr) {
+                                    let (ha, hf) = self.operand(av + n16 - 1);
+                                    let hbank = if ha == 0 { "A" } else { "B" };
+                                    self.emit("    MOVLW 0x00".to_string());
+                                    self.emit(format!("    BTFSC 0x{hf:03X},7,{hbank}"));
+                                    self.emit("    MOVLW 0xFF".to_string());
+                                    for i in (n16 - m)..n16 {
+                                        self.emit_banked("MOVWF", dst + i, "");
+                                    }
+                                } else {
+                                    for i in (n16 - m)..n16 {
+                                        self.emit_banked("CLRF", dst + i, "");
+                                    }
+                                }
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    let active = n16 - m;
+                    for _ in 0..r {
                         match b.op {
                             ir::BinOp::Shl => {
                                 self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
-                                for i in 0..n {
-                                    let (da, df) = self.operand(dst + u16::from(i));
+                                for i in 0..active {
+                                    let (da, df) = self.operand(dst + m + i);
                                     let dbank = if da == 0 { "A" } else { "B" };
                                     self.emit(format!("    RLCF 0x{df:03X},F,{dbank}"));
                                 }
                             }
                             ir::BinOp::LShr => {
                                 self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
-                                for i in (0..n).rev() {
-                                    let (da, df) = self.operand(dst + u16::from(i));
+                                for i in (0..active).rev() {
+                                    let (da, df) = self.operand(dst + i);
                                     let dbank = if da == 0 { "A" } else { "B" };
                                     self.emit(format!("    RRCF 0x{df:03X},F,{dbank}"));
                                 }
                             }
                             ir::BinOp::AShr => {
-                                let hi = dst + u16::from(n - 1);
+                                let hi = dst + active - 1;
                                 let (ha, hf) = self.operand(hi);
                                 let hbank = if ha == 0 { "A" } else { "B" };
                                 self.emit(format!("    BTFSC 0x{hf:03X},7,{hbank}"));
                                 self.emit("    BSF 0xFD8,0,A".to_string()); // STATUS C
                                 self.emit(format!("    BTFSS 0x{hf:03X},7,{hbank}"));
                                 self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
-                                for i in (0..n).rev() {
-                                    let (da, df) = self.operand(dst + u16::from(i));
+                                for i in (0..active).rev() {
+                                    let (da, df) = self.operand(dst + i);
                                     let dbank = if da == 0 { "A" } else { "B" };
                                     self.emit(format!("    RRCF 0x{df:03X},F,{dbank}"));
                                 }
