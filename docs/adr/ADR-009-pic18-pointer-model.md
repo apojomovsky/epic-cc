@@ -30,6 +30,29 @@ PIC18 pointer/array/struct support (port P3) uses:
    applies *across* separate accesses (no auto-increment carries state
    from one `Inst::Load`/`Inst::Store` to the next) -- see the "Rejected
    alternatives" note below for the boundary this draws.
+   **Narrowed further (epic-cc#472, 2026-09-19):** re-setup *across*
+   separate accesses through the same base is no longer always a full
+   `LFSR`/base-reload. `Gen.fsr0_holds` tracks `(origin, offset)` --
+   what `emit_fsr0_dynamic`/`emit_fsr0_indirect_slot` last grounded FSR0
+   in, and at what compile-time offset -- and a later access with `terms
+   = []` against the *same* origin and a `target_off >= offset` emits
+   only the forward delta (`MOVLW`/`ADDWF`/`ADDWFC`, 4 words, or nothing
+   at all when the delta is zero) instead of the full setup. This is not
+   auto-increment: it is still one explicit, self-contained add computed
+   from tracked compile-time state, the same shape item 3's per-term
+   `ADDWF`/`ADDWFC` already uses, not a new addressing mode. `fsr0_holds`
+   clears at every label and every `CALL` (mirrors `bsr`'s exact
+   invalidation surface: a branch target or a callee's own FSR0 use can
+   leave anything there) and additionally whenever this codegen writes to
+   a tracked `SlotValue` origin's own slot (`emit_copy_byte`/
+   `emit_move_val_to_slot` both check this on every write) -- the one
+   straight-line-code case that can change the pointer value a later
+   access's reuse check would otherwise wrongly trust, since a pointer
+   local not promoted to a pure SSA register is reassigned by an ordinary
+   store to that same slot. Backward offsets (`target_off < offset`) fall
+   back to the full setup rather than adding a `SUBWF` path, since forward
+   struct-field/array-element access is the overwhelmingly common shape
+   and the conservative default costs nothing but a missed optimization.
 4. **No `PLUSWn` for dynamic-offset writes.** `PLUSWn` computes its
    effective address from `FSRn + W` at execution time; a write needs `W`
    to hold the byte being stored, colliding with using `W` as the offset.
@@ -113,5 +136,12 @@ A P4+ fixture needs two simultaneously indirect pointers (add FSR1).
 The per-byte re-setup showed up in profiling (epic-cc#469/#471, 2026-09-19)
 and was addressed: auto-increment within one access, with an explicit
 ordering contract (single-loop, consecutive, ascending, nothing else
-touching FSR0 in between). Re-seeding across separate accesses is
-unchanged and untouched by this.
+touching FSR0 in between).
+
+The re-seeding-across-separate-accesses cost also showed up in profiling
+(epic-cc#469/#472, 2026-09-19) and was addressed: a tracked `(origin,
+offset)` state lets a same-base access reuse FSR0 via a forward delta
+add instead of a full reload, invalidated at labels, `CALL`s, and writes
+to a tracked slot's own address (item 3). `PLUSWn` remains unused (item
+4's write-collision reasoning is untouched by this) and no second FSR was
+introduced.
