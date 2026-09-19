@@ -2133,6 +2133,126 @@ fn a_255_byte_run_still_loops() {
 }
 
 #[test]
+fn an_isr_reachable_indirect_slot_memcpy_also_gates_the_loop() {
+    // The guard's second disjunct: an ISR-reachable function seeding
+    // FSR1 through an sret/pointer-param slot (emit_fsr1_indirect_slot's
+    // two-byte seed, not the dynamic-terms path) must gate the loop too
+    // (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global buf i8\n\
+         fn feeder(void) (r=sret)\n\
+           block entry:\n\
+             memcpy @dst %r 8\n\
+             ret void\n\
+         fn tick(void) [isr] ()\n\
+           block entry:\n\
+             call void @feeder(sret @buf)\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 12\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("buf", 0x120),
+        ("feeder::r", 0x121),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the slot-seeded FSR1 writer must gate the loop like the \
+         dynamic-terms one:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110"),
+        "main's copy stays straight-line under the guard:\n{asm}"
+    );
+}
+
+#[test]
+fn a_call_splits_staged_runs_at_the_call_boundary() {
+    // Copies staged before a CALL must reach the callee in program
+    // order: the run drains as a loop before the CALL emits, and the
+    // post-call run seeds afresh (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global src2 i8\n\
+         global dst2 i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 6\n\
+             call void @f()\n\
+             memcpy @dst2 @src2 6\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("src2", 0x140),
+        ("dst2", 0x150),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let call = asm.find("CALL f").expect("the call is present");
+    let first_loop_tail = asm.find("BRA tmp0").expect("the first run loops");
+    let second_seed = asm.find("LFSR 0, 0x140").expect("the second run loops");
+    assert!(
+        first_loop_tail < call && call < second_seed,
+        "the first run must drain before the CALL and the second must \
+         seed after it:\n{asm}"
+    );
+}
+
+#[test]
+fn a_branch_splits_staged_runs_at_the_block_boundary() {
+    // Same contract across a conditional branch: the entry block's run
+    // drains before the branch is emitted, so it lands on the
+    // predecessor side of the target label, and a run staged in the
+    // target block drains after it (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global src2 i8\n\
+         global dst2 i8\n\
+         global flag i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 6\n\
+             %c = load i8 @flag\n\
+             br i1 %c t f\n\
+           block t:\n\
+             memcpy @dst2 @src2 6\n\
+             ret void\n\
+           block f:\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("src2", 0x140),
+        ("dst2", 0x150),
+        ("flag", 0x180),
+        ("main::c", 0x181),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let first_loop_tail = asm.find("BRA tmp0").expect("the entry run loops");
+    let target_label = asm.find("main_Lt:").expect("the branch target label");
+    let last_loop_body = asm.rfind("MOVFF 0xFEE, 0xFE6").expect("block t loops");
+    assert!(
+        first_loop_tail < target_label && target_label < last_loop_body,
+        "the entry run must drain on the predecessor side of the label \
+         and block t's run after it:\n{asm}"
+    );
+}
+
+#[test]
 fn a_memcpy_to_a_dynamic_indexed_destination_writes_through_indf0() {
     // dst behind a dynamic index (`%dp = gep @dst +0 +1*%i`): the
     // destination resolves to FSR0/INDF0, so each copied byte must be
