@@ -22,6 +22,13 @@ use iselcore::{resolve_pointers, ssa_key, Base, Slot};
 /// needed one: it is architecture, not silicon. (epic-cc#226)
 const PIC18_SFR_ACCESS_LO: u16 = 0xF60;
 
+/// A straight `MOVFF` copy costs 2 words per byte; a seeded POSTINC copy
+/// loop costs 9 words for any length (two 2-word LFSRs, MOVLW, the 2-word
+/// POSTINC pair, DECFSZ, BRA), so it only pays from 5 bytes on. The floor
+/// is 6: at 5 the loop wins one word while executing roughly 3x slower
+/// per byte. (epic-cc#486)
+const COPY_LOOP_MIN_PAIRS: usize = 6;
+
 /// The result of resolving a pointer to a concrete access. `Direct`: the
 /// address is statically known, so a plain `MOVFF`/`MOVF`/`MOVWF` reaches
 /// it. `Indirect`: `FSR0` has been set up and the access goes through
@@ -82,6 +89,17 @@ struct Gen<'m> {
     /// pointer value an already-resolved access still depends on -- see
     /// `invalidate_fsr0_if_slot_written`).
     fsr0_holds: Option<(Fsr0Origin, u16)>,
+    /// Direct-to-direct `MOVFF` byte copies staged by `emit_copy_byte`,
+    /// drained as straight MOVFFs or, once long enough, as one
+    /// LFSR-seeded POSTINC copy loop (epic-cc#486). Each entry carries
+    /// the source location active when it was staged so the parallel
+    /// `locs` vector stays index-aligned whichever way the drain goes.
+    pending_copies: Vec<(u16, u16, Option<SrcLoc>)>,
+    /// Whether a POSTINC copy loop may emit at all. The loop holds FSR1
+    /// across its iterations and FSR1 is not in the ISR save area
+    /// (ADR-013), so it is sound only while no ISR-reachable function
+    /// seeds FSR1 (an indirect-source memcpy); computed once per module.
+    allow_copy_loops: bool,
     cur_func: &'m str,
     /// Marks an interrupt handler: the body runs a save prologue and restore
     /// epilogue with `RETFIE` instead of `RETURN` (the single-vector mode).
@@ -102,8 +120,59 @@ struct Gen<'m> {
 
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
+        self.flush_copies();
         self.out.push(s.into());
         self.locs.push(self.cur_loc.clone());
+    }
+
+    /// Drains `pending_copies`. A run that reached `COPY_LOOP_MIN_PAIRS`
+    /// (the buffer only extends while each pair is consecutive with the
+    /// first, src and dst each advancing by one) lowers to the seeded
+    /// loop; anything shorter replays as the straight MOVFFs it would
+    /// have been. The loop label is a pure straight-line cycle (reached
+    /// only by the MOVLW above and the BRA below, body free of banked
+    /// operands), so the tracked `bsr` survives it; the POSTINC walk does
+    /// move FSR0 n bytes past its seed, so the tracked FSR0 position does
+    /// not. Raw pushes, not `emit`: flush runs from inside `emit`.
+    fn flush_copies(&mut self) {
+        if self.pending_copies.is_empty() {
+            return;
+        }
+        let pairs = std::mem::take(&mut self.pending_copies);
+        let n = pairs.len();
+        // One memcpy is bounded to 255 bytes by irparse, but chained
+        // adjacent copies can stage a longer run; a byte-counted loop
+        // cannot hold that count in the MOVLW literal, so long runs
+        // replay straight, the pre-loop form.
+        if self.allow_copy_loops && n >= COPY_LOOP_MIN_PAIRS && n <= 255 {
+            let (src0, dst0, loc) = &pairs[0];
+            let (src0, dst0) = (*src0, *dst0);
+            let l_loop = self.fresh_label();
+            for (text, line_loc) in [
+                (format!("    LFSR 0, 0x{src0:03X}"), loc.clone()),
+                (format!("    LFSR 1, 0x{dst0:03X}"), loc.clone()),
+                (format!("    MOVLW 0x{n:02X}"), loc.clone()),
+                (format!("{l_loop}:"), loc.clone()),
+                // POSTINC0 -> POSTINC1: one word pair per byte, both
+                // pointers advancing exactly once (the sim resolves the
+                // read before the post-increment).
+                ("    MOVFF 0xFEE, 0xFE6".to_string(), loc.clone()),
+                // The count lives in WREG (file register 0xFE8), which
+                // the ISR save area covers, unlike any GPR scratch isel
+                // does not own.
+                ("    DECFSZ 0xFE8,F,A".to_string(), loc.clone()),
+                (format!("    BRA {l_loop}"), loc.clone()),
+            ] {
+                self.out.push(text);
+                self.locs.push(line_loc);
+            }
+            self.fsr0_holds = None;
+            return;
+        }
+        for (src, dst, loc) in pairs {
+            self.out.push(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+            self.locs.push(loc);
+        }
     }
 
     /// Emit a label line and clear the tracked `BSR` and `FSR0` state.
@@ -394,10 +463,21 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// One byte, memory-to-memory, via `MOVFF`: no access bit, no `BSR`.
+    /// One byte, memory-to-memory. Staged into `pending_copies` instead
+    /// of emitted: consecutive pairs drain as a single POSTINC copy loop
+    /// once long enough (epic-cc#486). A pair that breaks consecutivity
+    /// drains what is staged first, so the buffer is always one maximal
+    /// run. The FSR0-slot invalidation still happens eagerly, at the
+    /// copy's logical position, because later address computations read
+    /// the tracked state before the drain.
     fn emit_copy_byte(&mut self, src: u16, dst: u16) {
         self.invalidate_fsr0_if_slot_written(dst, 1);
-        self.emit(format!("    MOVFF 0x{src:03X}, 0x{dst:03X}"));
+        if let Some(&(last_src, last_dst, _)) = self.pending_copies.last() {
+            if src != last_src.wrapping_add(1) || dst != last_dst.wrapping_add(1) {
+                self.flush_copies();
+            }
+        }
+        self.pending_copies.push((src, dst, self.cur_loc.clone()));
     }
 
     /// If `fsr0_holds` is grounded in a `SlotValue` whose slot overlaps
@@ -933,6 +1013,10 @@ impl<'m> Gen<'m> {
     /// always takes the full setup, since the reuse check has no way to
     /// represent a previously-added dynamic term's runtime contribution.
     fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+        // A staged run may drain here as a POSTINC loop that moves FSR0
+        // wholesale; the tracked position is only sound after the drain,
+        // so every reuse decision below sees post-drain state.
+        self.flush_copies();
         let static_part = u16::from(k) + u16::from(byte_off);
         let origin = Fsr0Origin::Absolute(base_addr);
         let chain = self.chain_term_index(terms, 0);
@@ -977,6 +1061,10 @@ impl<'m> Gen<'m> {
         terms: &[(u8, String)],
         byte_off: u8,
     ) {
+        // Same drain-before-decision as `emit_fsr0_dynamic`: a pending
+        // run draining as a POSTINC loop moves FSR0, so the reuse check
+        // must run against post-drain state.
+        self.flush_copies();
         let origin = Fsr0Origin::SlotValue(slot_addr);
         let static_part = u16::from(k) + u16::from(byte_off);
         // Chain overhead: two CLRFs plus a runtime re-add of the pointer's
@@ -2358,9 +2446,7 @@ impl<'m> Gen<'m> {
                         match self.emit_ptr_setup(&mc.dst, i) {
                             Addr::Direct(dst) => {
                                 match src_direct {
-                                    Some(a) => {
-                                        self.emit(format!("    MOVFF 0x{a:03X}, 0x{dst:03X}"))
-                                    }
+                                    Some(a) => self.emit_copy_byte(a, dst),
                                     None => {
                                         self.emit("    MOVF 0xFE7,W,A".to_string()); // INDF1
                                         self.emit(format!("    MOVWF 0x{dst:03X},A"));
@@ -5440,6 +5526,87 @@ pub fn select(
     select_with_locs(device, m, addrs, isr_low_save).0
 }
 
+/// Whether `f` contains a memcpy whose source would seed FSR1, i.e. whose
+/// resolved base is not a plain compile-time address: an indirect slot (a
+/// pointer VALUE, or an sret/pointer param holding an address), or any
+/// base carrying dynamic terms. Mirrors `emit_memcpy_src_setup`'s split;
+/// keep the two in sync. A const (flash) source never reaches the FSR1
+/// path (the TBLRD arm runs first) but is conservatively counted here.
+fn func_may_seed_fsr1(f: &Func, resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>) -> bool {
+    f.blocks.iter().any(|b| {
+        b.insts.iter().any(|inst| match inst {
+            Inst::Memcpy(mc) => match &mc.src {
+                Val::Reg(r) => match resolved.get(&ssa_key(&f.name, r)) {
+                    Some((Base::Global(_), _, terms)) => !terms.is_empty(),
+                    Some((Base::Slot(sname, indirect), _, terms)) => {
+                        *indirect
+                            || f.params.iter().any(|p| p.name == *sname && p.ptr)
+                            || !terms.is_empty()
+                    }
+                    None => false,
+                },
+                _ => false,
+            },
+            _ => false,
+        })
+    })
+}
+
+/// Whether any ISR-reachable function may seed FSR1. FSR1 is not in the
+/// ISR save area (ADR-013), so a function that holds meaningful FSR1
+/// state across an interruptible window is only sound while the
+/// interrupting side cannot clobber it; the copy loop (epic-cc#486)
+/// holds FSR1 for its whole iteration count. Callees come from direct
+/// calls (`c.func`) and, conservatively, the full candidate list of an
+/// indirect call.
+fn isr_reachable_may_seed_fsr1(
+    m: &Module,
+    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+) -> bool {
+    let by_name: HashMap<&str, &Func> = m.funcs.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut seen: HashSet<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
+    let mut work: Vec<&str> = seen.iter().copied().collect();
+    while let Some(name) = work.pop() {
+        let Some(f) = by_name.get(name) else { continue };
+        if func_may_seed_fsr1(f, resolved) {
+            return true;
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Call(c) = inst {
+                    if c.callees.is_empty() {
+                        if let Some(fresh) = by_name
+                            .contains_key(c.func.as_str())
+                            .then_some(c.func.as_str())
+                            .filter(|n| !seen.contains(n))
+                        {
+                            seen.insert(fresh);
+                            work.push(fresh);
+                        }
+                    } else {
+                        for cand in &c.callees {
+                            if let Some(fresh) = by_name
+                                .contains_key(cand.as_str())
+                                .then_some(cand.as_str())
+                                .filter(|n| !seen.contains(n))
+                            {
+                                seen.insert(fresh);
+                                work.push(fresh);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 /// `select` plus a parallel per-line source-location vector, index-aligned
 /// with the returned asm text. `None` marks a compiler-generated line (the
 /// header, `__start`, const tables, prologue glue). The driver threads this
@@ -5517,6 +5684,9 @@ pub fn select_with_locs(
         isr_low_save.is_some() == priority_mode,
         "isel-pic18: low save area must be present exactly in priority mode (both priorities present)"
     );
+    // One decision for the whole module: the copy loop (epic-cc#486) is
+    // sound only while no ISR can interrupt it holding a stale FSR1.
+    let allow_copy_loops = !isr_reachable_may_seed_fsr1(m, &resolved);
     let mut funcs: Vec<&Func> = m.funcs.iter().collect();
     // High ISR first, then low ISR, then ordinary functions.
     funcs.sort_by_key(|f| (!f.isr, f.irq_priority != 1));
@@ -5556,6 +5726,8 @@ pub fn select_with_locs(
                 access_bank_hi,
                 bsr: None,
                 fsr0_holds: None,
+                pending_copies: Vec::new(),
+                allow_copy_loops,
                 cur_func: &f.name,
                 isr: f.isr,
                 tmp: &mut tmp,
@@ -5564,6 +5736,7 @@ pub fn select_with_locs(
                 locs: Vec::new(),
             };
             g.emit_routine();
+            g.flush_copies();
             out.extend(g.out);
             locs.extend(g.locs);
             continue;
@@ -5648,6 +5821,8 @@ pub fn select_with_locs(
             access_bank_hi,
             bsr: None,
             fsr0_holds: None,
+            pending_copies: Vec::new(),
+            allow_copy_loops,
             cur_func: &f.name,
             isr: f.isr,
             tmp: &mut tmp,
@@ -5933,6 +6108,7 @@ pub fn select_with_locs(
                 _ => panic!("isel-pic18: block has no terminator"),
             }
         }
+        g.flush_copies();
         out.extend(g.out);
         locs.extend(g.locs);
     }
@@ -6085,6 +6261,8 @@ mod tests {
                 access_bank_hi: 0x5F,
                 bsr: None,
                 fsr0_holds: None,
+                pending_copies: Vec::new(),
+                allow_copy_loops: false,
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
@@ -6103,6 +6281,8 @@ mod tests {
                 access_bank_hi: 0x5F,
                 bsr: None,
                 fsr0_holds: None,
+                pending_copies: Vec::new(),
+                allow_copy_loops: false,
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
@@ -6135,6 +6315,8 @@ mod p3_gen_tests {
             access_bank_hi: 0x5F,
             bsr: None,
             fsr0_holds: None,
+            pending_copies: Vec::new(),
+            allow_copy_loops: true,
             cur_func: "main",
             isr: false,
             tmp,

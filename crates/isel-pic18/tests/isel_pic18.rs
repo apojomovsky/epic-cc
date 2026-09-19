@@ -1918,6 +1918,341 @@ fn a_const_length_memcpy_copies_byte_by_byte() {
 }
 
 #[test]
+fn a_long_consecutive_copy_run_becomes_a_postinc_loop() {
+    // Twelve consecutive src+i -> dst+i pairs cost 2 words each
+    // straight-line; past COPY_LOOP_MIN_PAIRS the drain replaces the run
+    // with one LFSR-seeded POSTINC loop whose count lives in WREG
+    // (0xFE8, a file register the ISR save area covers) (epic-cc#486).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 12\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("LFSR 0, 0x100"), "source seed missing:\n{asm}");
+    assert!(
+        asm.contains("LFSR 1, 0x110"),
+        "destination seed missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x0C"),
+        "the 12-byte count is missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the POSTINC0 -> POSTINC1 body is missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("DECFSZ 0xFE8,F,A"),
+        "the WREG-counted loop tail is missing:\n{asm}"
+    );
+    assert!(
+        !(asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110")),
+        "the loop replaces the run, straight copies must not coexist:\n{asm}"
+    );
+}
+
+#[test]
+fn a_short_copy_run_stays_straight_line() {
+    // Below COPY_LOOP_MIN_PAIRS the 9-word loop loses to the straight
+    // 2-words-per-byte form: a 4-byte copy stays four MOVFFs.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 4\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    for i in 0..4u16 {
+        let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
+        let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
+        assert!(
+            asm.contains(&expect) || asm.contains(&expect_nospace),
+            "byte {i} missing:\n{asm}"
+        );
+    }
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "no POSTINC loop below the threshold:\n{asm}"
+    );
+}
+
+#[test]
+fn an_isr_reachable_fsr1_memcpy_keeps_copy_runs_straight() {
+    // The loop holds FSR1 across its iterations and FSR1 is not in the
+    // ISR save area (ADR-013): when an ISR-reachable function seeds FSR1
+    // (here a dynamically indexed memcpy source), every copy run falls
+    // back to straight MOVFFs (epic-cc#486).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global arr i8\n\
+         global idx i8\n\
+         fn feeder(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @arr +0 +1*%i\n\
+             memcpy @dst %p 8\n\
+             ret void\n\
+         fn tick(void) [isr] ()\n\
+           block entry:\n\
+             call void @feeder()\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 12\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("arr", 0x120),
+        ("idx", 0x130),
+        ("feeder::i", 0x131),
+        ("feeder::p", 0x132),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "no POSTINC loop may run when an ISR can clobber FSR1:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110"),
+        "main's copy stays straight-line under the guard:\n{asm}"
+    );
+}
+
+#[test]
+fn a_run_draining_before_an_fsr0_reuse_forces_a_reseed() {
+    // epic-cc#486 review: access through an sret pointer seeds FSR0 and
+    // records the tracked position; a staged 12-pair run emits nothing
+    // yet; a second access through the same pointer would reuse FSR0
+    // (delta 0) except the drain at its own emission moves FSR0
+    // wholesale. The setup must drain before the reuse decision, so the
+    // second access re-seeds from the slot instead of reading through a
+    // stale pointer.
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global out i8\n\
+         fn probe(void) (r=sret)\n\
+           block entry:\n\
+             %a = load i8 %r\n\
+             memcpy @dst @src 12\n\
+             %b = load i8 %r\n\
+             store i8 %b @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("out", 0x120),
+        ("probe::r", 0x130),
+        ("probe::a", 0x132),
+        ("probe::b", 0x133),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVFF 0x130, 0xFE9").count(),
+        2,
+        "the second access through the same pointer must re-seed FSR0 \
+         after the loop drained:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the staged run must still lower to the loop:\n{asm}"
+    );
+}
+
+#[test]
+fn a_run_longer_than_a_byte_count_stays_straight() {
+    // irparse bounds one memcpy at 255 bytes, but chained adjacent
+    // copies can stage a longer run; the loop count lives in one MOVLW
+    // literal, so the 510-pair chain replays straight rather than
+    // emitting an out-of-range count (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global src2 i8\n\
+         global dst i8\n\
+         global dst2 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 255\n\
+             memcpy @dst2 @src2 255\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("src2", 0x1FF),
+        ("dst", 0x400),
+        ("dst2", 0x4FF),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "a 510-pair run exceeds the byte-counted loop and must replay \
+         straight:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVLW 0x1FE"),
+        "no out-of-range MOVLW count may be emitted:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x1FE, 0x4FE") && asm.contains("MOVFF 0x1FF, 0x4FF"),
+        "the chained copies replay as straight MOVFFs across the pair \
+         boundary:\n{asm}"
+    );
+}
+
+#[test]
+fn a_255_byte_run_still_loops() {
+    // The gate's upper edge: exactly 255 pairs fits the MOVLW literal
+    // and must keep the loop (regression for an off-by-one in the
+    // n <= 255 bound).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 255\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x400)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVLW 0xFF") && asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "a 255-pair run keeps the loop:\n{asm}"
+    );
+}
+
+#[test]
+fn an_isr_reachable_indirect_slot_memcpy_also_gates_the_loop() {
+    // The guard's second disjunct: an ISR-reachable function seeding
+    // FSR1 through an sret/pointer-param slot (emit_fsr1_indirect_slot's
+    // two-byte seed, not the dynamic-terms path) must gate the loop too
+    // (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global buf i8\n\
+         fn feeder(void) (r=sret)\n\
+           block entry:\n\
+             memcpy @dst %r 8\n\
+             ret void\n\
+         fn tick(void) [isr] ()\n\
+           block entry:\n\
+             call void @feeder(sret @buf)\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 12\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("buf", 0x120),
+        ("feeder::r", 0x121),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the slot-seeded FSR1 writer must gate the loop like the \
+         dynamic-terms one:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110"),
+        "main's copy stays straight-line under the guard:\n{asm}"
+    );
+}
+
+#[test]
+fn a_call_splits_staged_runs_at_the_call_boundary() {
+    // Copies staged before a CALL must reach the callee in program
+    // order: the run drains as a loop before the CALL emits, and the
+    // post-call run seeds afresh (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global src2 i8\n\
+         global dst2 i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 6\n\
+             call void @f()\n\
+             memcpy @dst2 @src2 6\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("src2", 0x140),
+        ("dst2", 0x150),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let call = asm.find("CALL f").expect("the call is present");
+    let first_loop_tail = asm.find("BRA tmp0").expect("the first run loops");
+    let second_seed = asm.find("LFSR 0, 0x140").expect("the second run loops");
+    assert!(
+        first_loop_tail < call && call < second_seed,
+        "the first run must drain before the CALL and the second must \
+         seed after it:\n{asm}"
+    );
+}
+
+#[test]
+fn a_branch_splits_staged_runs_at_the_block_boundary() {
+    // Same contract across a conditional branch: the entry block's run
+    // drains before the branch is emitted, so it lands on the
+    // predecessor side of the target label, and a run staged in the
+    // target block drains after it (epic-cc#486 review).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global src2 i8\n\
+         global dst2 i8\n\
+         global flag i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 6\n\
+             %c = load i8 @flag\n\
+             br i1 %c t f\n\
+           block t:\n\
+             memcpy @dst2 @src2 6\n\
+             ret void\n\
+           block f:\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("src2", 0x140),
+        ("dst2", 0x150),
+        ("flag", 0x180),
+        ("main::c", 0x181),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let first_loop_tail = asm.find("BRA tmp0").expect("the entry run loops");
+    let target_label = asm.find("main_Lt:").expect("the branch target label");
+    let last_loop_body = asm.rfind("MOVFF 0xFEE, 0xFE6").expect("block t loops");
+    assert!(
+        first_loop_tail < target_label && target_label < last_loop_body,
+        "the entry run must drain on the predecessor side of the label \
+         and block t's run after it:\n{asm}"
+    );
+}
+
+#[test]
 fn a_memcpy_to_a_dynamic_indexed_destination_writes_through_indf0() {
     // dst behind a dynamic index (`%dp = gep @dst +0 +1*%i`): the
     // destination resolves to FSR0/INDF0, so each copied byte must be

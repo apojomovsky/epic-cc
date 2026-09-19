@@ -36,5 +36,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 15505
+flash_words = 15470
 ram_bytes = 736
