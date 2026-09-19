@@ -583,6 +583,79 @@ fn i8_binop_const_lhs_is_rejected_not_silently_miscompiled() {
 }
 
 #[test]
+#[should_panic(expected = "const-LHS")]
+fn shift_byte_granular_const_lhs_is_rejected_not_silently_miscompiled() {
+    // `shl i32 7, 8` takes the m > 0 byte-move arm, which reads the
+    // operand straight out of RAM via `val_addr` -- and `val_addr` maps
+    // `Val::Const(k)` to the truncated RAM ADDRESS `k & 0xFF`. Without
+    // the guard the MOVFF chain would move whatever bytes live at 0x007
+    // instead of the literal 7. This must fail loudly instead.
+    let m = parse(
+        "global out i32\nfn main(void) ()\n  block entry:\n    %1 = shl i32 7, 8\n    store i32 %1 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("out", 0x20), ("main::1", 0x24), ("main::2", 0x28)]);
+    let _ = select(&PIC18F4550, &m, &addrs, None);
+}
+
+#[test]
+fn sub_byte_const_lhs_shift_still_materializes_the_literal() {
+    // The const-LHS guard must stay inside the m > 0 arm: a sub-byte
+    // const-count shift still routes the operand through
+    // `emit_move_val_to_slot`, whose `Val::Const` arm materializes the
+    // literal bytes, so `shl i8 7, 2` is 28, not a read of address 0x07.
+    let m = parse(
+        "global out i8\nfn main(void) ()\n  block entry:\n    %1 = shl i8 7, 2\n    store i8 %1 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("out", 0x20), ("main::1", 0x21), ("main::2", 0x22)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.run(200);
+    assert_eq!(p.ram()[0x20], 28, "7 << 2 == 28");
+    assert!(p.halted());
+}
+
+#[test]
+fn in_place_i32_shl8_byte_moves_survive_their_own_overwrite() {
+    // The `x = x << 8` shape after allocation: the shift's dst slot IS
+    // the operand's storage (av == dst, both main::1 and main::2 at
+    // 0x24). The copy order is load-bearing: shl must move high-to-low
+    // so no source byte is read after the move that overwrites it.
+    let m = parse(
+        "global a i32\nfn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = shl i32 %1, 8\n    store i32 %2 @a\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("main::1", 0x24), ("main::2", 0x24)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let (hi, mid, lo) = (
+        asm.find("MOVFF 0x026, 0x027")
+            .expect("byte 2 -> byte 3 move"),
+        asm.find("MOVFF 0x025, 0x026")
+            .expect("byte 1 -> byte 2 move"),
+        asm.find("MOVFF 0x024, 0x025")
+            .expect("byte 0 -> byte 1 move"),
+    );
+    assert!(
+        hi < mid && mid < lo,
+        "in-place shl byte moves must run high-to-low:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    // a = 0x12345678, LE bytes 78 56 34 12.
+    p.ram_mut()[0x20] = 0x78;
+    p.ram_mut()[0x21] = 0x56;
+    p.ram_mut()[0x22] = 0x34;
+    p.ram_mut()[0x23] = 0x12;
+    p.run(500);
+    // a = a << 8 = 0x34567800, LE bytes 00 78 56 34.
+    assert_eq!(p.ram()[0x20], 0x00);
+    assert_eq!(p.ram()[0x21], 0x78);
+    assert_eq!(p.ram()[0x22], 0x56);
+    assert_eq!(p.ram()[0x23], 0x34);
+    assert!(p.halted());
+}
+
+#[test]
 fn icmp_eq_materializes_1_when_equal_and_0_when_not() {
     let m = parse("global a i8\nglobal b i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp eq i8 %1, %2\n    ret void\n");
     let addrs = addrs(&[

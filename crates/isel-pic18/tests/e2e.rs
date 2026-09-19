@@ -16,51 +16,13 @@ use std::process::Command;
 /// run) `Pic18` plus the global address map so each test can seed input
 /// addresses by name before calling `.run()`.
 fn compile(c_path: &str) -> (Pic18, HashMap<String, u16>) {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
-    let ll = Command::new(clang)
-        .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-g",
-            "-resource-dir",
-            &resdir,
-            "-o",
-            "-",
-            c_path,
-        ])
-        .output()
-        .expect("run clang");
-    assert!(
-        ll.status.success(),
-        "clang: {}",
-        String::from_utf8_lossy(&ll.stderr)
-    );
-    let ll_text = String::from_utf8(ll.stdout).unwrap();
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    callgraph::check_depth(&cg, PIC18F4550.stack_depth as usize);
-    let layout = alloc::allocate(&PIC18F4550, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel_pic18::select(&PIC18F4550, &m, &addrs, layout.isr_low_save);
-    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
-
-    (Pic18::new(parse_hex_pic18(&hex)), layout.globals)
+    let (p, globals, _asm) = compile_with_asm(c_path);
+    (p, globals)
 }
 
-/// Same pipeline as `compile`, but also returns the generated asm text so a
-/// test can assert on the instructions selected, not just the simulated
-/// result (epic-cc#470: a shift-by-multiple-of-8 must not emit RLCF/RRCF).
+/// The pipeline itself, plus the generated asm text so a test can assert on
+/// the instructions selected, not just the simulated result (epic-cc#470: a
+/// shift-by-multiple-of-8 must not emit RLCF/RRCF).
 fn compile_with_asm(c_path: &str) -> (Pic18, HashMap<String, u16>, String) {
     let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("PIC8_CLANG_UNWRAPPED");
     let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("PIC8_CLANG_RESOURCE_DIR");
@@ -642,8 +604,10 @@ fn shift_bytes_c_runs_correctly_and_skips_the_rotate_loop() {
     // bit-serial rotate loop. u16in=0xBEEF, u32in=0x12345678, s16in=0xEDCC.
     // Expected (hand-computed, see shift_bytes.c): u16_lshr8=0x00BE,
     // u16_shl8=0xEF00, u32_lshr16=0x1234, u32_shl16=0x56780000,
-    // u32_lshr11=0x2468A (non-multiple-of-8, exercises the residual
-    // rotate), s16_ashr8=0xFFED (sign-extended -19).
+    // u32_lshr11=0x2468A, s16_ashr8=0xFFED (sign-extended -19),
+    // u32_shl12=0x45678000, s16_ashr12=0xFFFE (sign-extended -2). The
+    // three non-multiple-of-8 cases exercise the residual rotate for
+    // every op, including the r > 0 index bases the multiples never hit.
     let (mut p, globals, asm) = compile_with_asm(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/shift_bytes.c"
@@ -682,23 +646,36 @@ fn shift_bytes_c_runs_correctly_and_skips_the_rotate_loop() {
     assert_eq!(p.ram()[globals["s16_ashr8"] as usize], 0xED);
     assert_eq!(p.ram()[globals["s16_ashr8"] as usize + 1], 0xFF);
 
+    assert_eq!(p.ram()[globals["u32_shl12"] as usize], 0x00);
+    assert_eq!(p.ram()[globals["u32_shl12"] as usize + 1], 0x80);
+    assert_eq!(p.ram()[globals["u32_shl12"] as usize + 2], 0x67);
+    assert_eq!(p.ram()[globals["u32_shl12"] as usize + 3], 0x45);
+
+    assert_eq!(p.ram()[globals["s16_ashr12"] as usize], 0xFE);
+    assert_eq!(p.ram()[globals["s16_ashr12"] as usize + 1], 0xFF);
+
     assert!(p.halted());
 
-    // No RLCF at all: both shl cases (u16_shl8, u32_shl16) are exact
-    // multiples of 8 (r == 0), so neither needs any residual bit-rotate.
-    assert!(
-        !asm.contains("RLCF"),
-        "shl-by-multiple-of-8 must lower to pure byte moves, no RLCF:\n{asm}"
+    // RLCF exactly 12: only u32_shl12 (<<12 = 8*1 + 4) has a nonzero
+    // shl residual, 4 rotate iterations over the 3 bytes the byte-move
+    // left live. The exact-multiple shl cases (u16_shl8, u32_shl16)
+    // must contribute zero: a higher count means a multiple-of-8 shift
+    // is still falling through to the bit-serial loop.
+    let rlcf_count = asm.matches("RLCF").count();
+    assert_eq!(
+        rlcf_count, 12,
+        "expected exactly 12 RLCF (u32_shl12's 4 iterations x 3 active \
+         bytes only), got {rlcf_count}:\n{asm}"
     );
-    // RRCF must appear exactly 9 times: only u32_lshr11 (>>11 = 8*1 + 3)
-    // has a nonzero residual, 3 rotate iterations over the 3 active
-    // (post-byte-move) bytes. u16_lshr8 and s16_ashr8 (both r == 0) must
-    // contribute zero RRCF -- if this count is higher than 9, a
-    // multiple-of-8 case is still falling through to the bit-serial loop.
+    // RRCF exactly 13: u32_lshr11 (>>11 = 8*1 + 3, 3 iterations x 3
+    // active bytes) and s16_ashr12 (>>12 = 8*1 + 4, 4 iterations over
+    // the 1 surviving byte). u16_lshr8 and s16_ashr8 (both r == 0) must
+    // contribute zero: a higher count means a multiple-of-8 case is
+    // still falling through to the bit-serial loop.
     let rrcf_count = asm.matches("RRCF").count();
     assert_eq!(
-        rrcf_count, 9,
-        "expected exactly 9 RRCF (u32_lshr11's 3 iterations x 3 active \
-         bytes only), got {rrcf_count}:\n{asm}"
+        rrcf_count, 13,
+        "expected exactly 13 RRCF (u32_lshr11's 3x3 plus s16_ashr12's \
+         4x1), got {rrcf_count}:\n{asm}"
     );
 }

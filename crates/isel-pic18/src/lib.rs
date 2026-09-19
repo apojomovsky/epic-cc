@@ -1333,10 +1333,21 @@ impl<'m> Gen<'m> {
                     let r = k % 8;
                     let n16 = u16::from(n);
                     if m == 0 {
-                        // Sub-byte shift only: identical to the pre-fix
-                        // path (copy, then rotate every byte).
+                        // Sub-byte shift only: no whole-byte move to
+                        // make, so copy the operand and rotate every
+                        // byte.
                         self.emit_move_val_to_slot(&b.a, b.ty, dst);
                     } else {
+                        // The byte-move path reads the operand straight
+                        // out of RAM, but `val_addr` maps a literal to
+                        // the truncated address k & 0xFF: a const-LHS
+                        // shift would move whatever bytes live at that
+                        // address. Fail loudly like the other const-LHS
+                        // arms.
+                        assert!(
+                            !matches!(b.a, Val::Const(_)),
+                            "isel-pic18: const-LHS byte-granular shift (constant as the first operand) not yet supported"
+                        );
                         match b.op {
                             ir::BinOp::Shl => {
                                 // dst[n-1..m] = a[n-1-m..0]; dst[m-1..0] = 0.
