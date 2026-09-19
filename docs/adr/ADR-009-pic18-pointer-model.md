@@ -22,6 +22,14 @@ PIC18 pointer/array/struct support (port P3) uses:
    byte_off` from scratch per byte (`LFSR` for the static part, unrolled
    `ADDWF`/`ADDWFC` for the dynamic term). No FSR auto-increment, no
    second FSR.
+   **Narrowed (epic-cc#471, 2026-09-19):** FSR0 is now seeded once per
+   *access* (one `Inst::Load`/`Inst::Store`) and walked with `POSTINC0`
+   across that access's own bytes, since those bytes are emitted by a
+   single loop, consecutive and ascending by construction, with nothing
+   emitted between them that could touch FSR0. Per-byte re-setup still
+   applies *across* separate accesses (no auto-increment carries state
+   from one `Inst::Load`/`Inst::Store` to the next) -- see the "Rejected
+   alternatives" note below for the boundary this draws.
 4. **No `PLUSWn` for dynamic-offset writes.** `PLUSWn` computes its
    effective address from `FSRn + W` at execution time; a write needs `W`
    to hold the byte being stored, colliding with using `W` as the offset.
@@ -88,11 +96,22 @@ PIC18 pointer/array/struct support (port P3) uses:
 - **FSR auto-increment (`POSTINC0`) for multi-byte accesses.** Implicit
   ordering between setup calls; rejected for the same reason as the
   `BSR`-tracking hazards.
+  **Narrowed (epic-cc#471):** the objection holds for auto-increment
+  *across* separate `Inst::Load`/`Inst::Store` accesses (an implicit
+  ordering dependency between them would be exactly the hazard this
+  rejected). It does not hold *within* one access's own byte loop, which
+  is a single, self-contained emission with a fixed, compiler-known
+  byte order and nothing else touching FSR0 in between -- `POSTINC0` is
+  now used there (item 3).
 - **Porting PIC14's `fsr_window`/window half of `object_span`.** Dead
   machinery on PIC18's flat address space.
 
 ## Revisit if
 
-A P4+ fixture needs two simultaneously indirect pointers (add FSR1), or
-the per-byte re-setup shows up in profiling (revisit auto-increment with
-an explicit ordering contract).
+A P4+ fixture needs two simultaneously indirect pointers (add FSR1).
+
+The per-byte re-setup showed up in profiling (epic-cc#469/#471, 2026-09-19)
+and was addressed: auto-increment within one access, with an explicit
+ordering contract (single-loop, consecutive, ascending, nothing else
+touching FSR0 in between). Re-seeding across separate accesses is
+unchanged and untouched by this.

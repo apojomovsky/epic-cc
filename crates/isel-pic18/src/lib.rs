@@ -1223,11 +1223,25 @@ impl<'m> Gen<'m> {
                     }
                     return;
                 }
-                for k in 0..l.ty.bytes() {
-                    match self.emit_ptr_setup(&ptr_val, k) {
-                        Addr::Direct(src) => self.emit_copy_byte(src, dst + u16::from(k)),
-                        Addr::Indirect => {
-                            self.emit(format!("    MOVFF 0xFEF, 0x{:03X}", dst + u16::from(k)))
+                // FSR0 seeds once (byte_off 0); indirect bytes walk
+                // POSTINC0 (this loop is the whole ordering contract
+                // ADR-009 needed, epic-cc#471). Direct addresses are
+                // linear in byte_off, so base_addr + k already matches
+                // re-resolving at byte_off = k.
+                let n = l.ty.bytes();
+                match self.emit_ptr_setup(&ptr_val, 0) {
+                    Addr::Direct(base_addr) => {
+                        for k in 0..n {
+                            self.emit_copy_byte(base_addr + u16::from(k), dst + u16::from(k));
+                        }
+                    }
+                    Addr::Indirect => {
+                        for k in 0..n {
+                            let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
+                            self.emit(format!(
+                                "    MOVFF 0x{reg:03X}, 0x{:03X}",
+                                dst + u16::from(k)
+                            ));
                         }
                     }
                 }
@@ -1271,19 +1285,20 @@ impl<'m> Gen<'m> {
                         "isel-pic18: ROM is not writable: store through const global {ptr_val:?}"
                     );
                 }
-                // Direct values cover the whole slot through one setup. Indirect bytes
-                // re-resolve per byte with independent FSR setups and no auto-increment,
-                // materializing each source byte into W (literals directly, registers
-                // via `MOVF`) and writing it through `INDF0`.
+                // Direct values cover the whole slot through one setup.
+                // Indirect bytes seed FSR0 once and walk POSTINC0 (same
+                // single-loop ordering contract as the Load arm above,
+                // epic-cc#471). Each source byte still materializes into
+                // W (literals directly, registers via MOVF) before the
+                // write.
                 match self.emit_ptr_setup(&ptr_val, 0) {
                     Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
                     Addr::Indirect => {
-                        for k in 0..s.ty.bytes() {
-                            if k > 0 {
-                                self.emit_ptr_setup(&ptr_val, k);
-                            }
+                        let n = s.ty.bytes();
+                        for k in 0..n {
                             self.emit_load_w(&s.val, k);
-                            self.emit("    MOVWF 0xFEF,A".to_string()); // INDF0
+                            let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
+                            self.emit(format!("    MOVWF 0x{reg:03X},A"));
                         }
                     }
                 }
