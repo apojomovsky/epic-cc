@@ -31,6 +31,8 @@ one-line index entry here, e.g.:
 - ADR-031: float frames place like integer ones (banked recipes via emit_banked; ADR-015's access-bank pin retired; per-context float frames), 2026-09-10
 - ADR-032: baseline const tables pack page low halves with PA0 set/restore at reads, readers audited against placement, const reads reserve a stack level, 2026-09-10
 - ADR-033: freestanding malloc/free over a caller-registered arena (first-fit table, volatile free probe, call-result seed in iselcore), 2026-09-10
+- ADR-034: Devices whose entire GPR collapses to one physical region get a carved-out common_ram corner, 2026-09-11
+- ADR-035: Switch is a first-class IR terminator; PIC18 lowers dense switches to PCL jump tables, 2026-09-19
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

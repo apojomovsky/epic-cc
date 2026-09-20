@@ -51,7 +51,7 @@ fn compile_with_asm(c_path: &str) -> (Pic18, HashMap<String, u16>, String) {
     );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
 
-    let mut m = irparse::parse_ll(&ll_text);
+    let mut m = irparse::parse_ll_opts(&ll_text, true);
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
@@ -161,7 +161,7 @@ fn banked_c_asm_contains_movlb() {
         String::from_utf8_lossy(&ll.stderr)
     );
     let ll_text = String::from_utf8(ll.stdout).unwrap();
-    let mut m = irparse::parse_ll(&ll_text);
+    let mut m = irparse::parse_ll_opts(&ll_text, true);
     m = wholeprog::merge(m);
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
@@ -943,5 +943,56 @@ fn float_frames_above_the_access_window_select_the_bank() {
     assert_eq!(p.ram()[globals["out"] as usize + 2], 0x60);
     assert_eq!(p.ram()[globals["out"] as usize + 3], 0x41);
     assert_eq!(p.ram()[globals["sc"] as usize], 0xFF, "sc holds -1");
+    assert!(p.halted());
+}
+
+#[test]
+fn switch_dense_table_runs_correctly() {
+    // epic-cc#479: two dense switches lower to PCL jump tables, one
+    // base-0 and one base-4 with padding; the run drives every case
+    // plus each default through the real simulator, so a wrong table
+    // entry, bound, offset, or trampoline copy fails the byte
+    // assertions below. The whole-program pipeline folds the inlined
+    // case bodies into a value phi, so every table edge runs through
+    // a trampoline: this gates the copies too.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/switch_dense.c"
+    ));
+    assert!(
+        asm.contains("ADDWF 0xFF9,F,A"),
+        "expected a PCL computed-jump dispatch:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches(".pcltbl").count(),
+        2,
+        "one page-checked table per surviving dispatch:\n{asm}"
+    );
+    p.run(500_000);
+    // dispatch: h_k(k) for k in 0..7, 99 for the default (k == 8).
+    let expect: [u8; 9] = [10, 3, 88, 103, 196, 12, 134, 207, 99];
+    for (k, want) in expect.iter().enumerate() {
+        assert_eq!(
+            p.ram()[globals["results"] as usize + k],
+            *want,
+            "dispatch({k}) into results[{k}]"
+        );
+    }
+    // dispatch2 (base 4): k == 3 takes the default (7); cases 4..10
+    // dispatch their values. This gates the low-bound reject and the
+    // padding entries.
+    let expect2: [u8; 8] = [7, 44, 10, 53, 193, 17, 137, 210];
+    for (i, want) in expect2.iter().enumerate() {
+        assert_eq!(
+            p.ram()[globals["results2"] as usize + i],
+            *want,
+            "dispatch2({}) into results2[{i}]",
+            i + 3
+        );
+    }
+    // No i16 dispatch here: clang folds an i16 switch of this shape
+    // into a const lookup before isel runs, so the high-byte reject
+    // is pinned by unit test (`i16_dense_switch_checks_the_high_byte`)
+    // instead of through the simulator.
     assert!(p.halted());
 }

@@ -10,7 +10,7 @@
 use ir::{
     Alloca, Asm, AsmOperand, Bin, BinOp, Block, Br, BrCond, Call, CallArg, FBinOp, Fcmp, FloatBin,
     FloatConv, FloatConvOp, Func, Gep, GepBase, Global, Icmp, Inst, IntToPtr, Load, MemLen, Memcpy,
-    Module, Param, Phi, Select, Sext, SrcLoc, Store, Trunc, Ty, VaArg, VaStart, Val, Zext,
+    Module, Param, Phi, Select, Sext, SrcLoc, Store, Switch, Trunc, Ty, VaArg, VaStart, Val, Zext,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -1263,6 +1263,21 @@ impl Fresh {
     }
 }
 
+/// Dense-contiguous case values: sorted, every value in `min..=max`
+/// present. The backend tables exactly this shape; anything sparse or
+/// small stays on the compare-chain expansion.
+fn dense_contiguous(cases: &[(Ty, Val, String)]) -> bool {
+    let mut ks: Vec<i64> = cases
+        .iter()
+        .map(|(_, v, _)| match v {
+            Val::Const(k) => *k,
+            other => panic!("irparse: non-constant switch case {other:?}"),
+        })
+        .collect();
+    ks.sort_unstable();
+    ks.windows(2).all(|w| w[1] == w[0] + 1)
+}
+
 /// Lower an LLVM `switch` terminator text into a chain of `icmp eq` +
 /// `brcond` blocks. `switch_text` is the full `switch ... [ ... ]` line(s)
 /// flattened into one string (the aggregator ensures the closing `]` is
@@ -1273,6 +1288,7 @@ fn lower_switch(
     switch_text: &str,
     fresh: &mut Fresh,
     dbg: &DebugInfoTable,
+    preserve_dense: bool,
 ) {
     let loc = dbg_loc(switch_text, dbg);
     let body = switch_text
@@ -1356,6 +1372,33 @@ fn lower_switch(
     if cases.is_empty() {
         blocks.last_mut().unwrap().insts.push(Inst::Br(Br {
             target: default_label,
+            loc: loc.clone(),
+        }));
+        return;
+    }
+    // A dense-contiguous case list (every value in min..=max present,
+    // enough cases for a dispatch table to beat the compare chain) is
+    // preserved as a `Switch` terminator when the caller targets a
+    // backend with table lowering; everything else keeps the chain
+    // expansion below. Narrow types only: the backend chain handles
+    // wider values, but a preserved wide switch would be a new,
+    // unlowered shape on every core.
+    if preserve_dense && cond_ty.bytes() <= 2 && cases.len() >= 6 && dense_contiguous(&cases) {
+        let mut case_pairs: Vec<(i64, String)> = cases
+            .iter()
+            .map(|(_, v, l)| match v {
+                Val::Const(k) => (*k, l.clone()),
+                other => {
+                    panic!("irparse: non-constant switch case {other:?} in {switch_text:?}")
+                }
+            })
+            .collect();
+        case_pairs.sort_by_key(|(k, _)| *k);
+        blocks.last_mut().unwrap().insts.push(Inst::Switch(Switch {
+            val: cond_val.clone(),
+            ty: cond_ty,
+            default: default_label,
+            cases: case_pairs,
             loc: loc.clone(),
         }));
         return;
@@ -2094,6 +2137,14 @@ fn adopt_entry_label(blocks: &mut Vec<Block>, label: &str, placeholder: &str) {
 
 /// Parses `.ll` text into canonical IR.
 pub fn parse_ll(src: &str) -> Module {
+    parse_ll_opts(src, false)
+}
+
+/// `parse_ll` with backend-driven switch preservation: a target whose
+/// backend has table lowering (PIC18) keeps dense-contiguous switches
+/// as `Switch` terminators; every other switch, and every other target,
+/// keeps the compare-chain expansion.
+pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
     let types = build_struct_table(src);
     let mut fresh = Fresh::new(src);
     let attr_map = build_attr_map(src);
@@ -2388,7 +2439,13 @@ pub fn parse_ll(src: &str) -> Module {
                                 continue;
                             }
                             if pl.trim_start().starts_with("switch") {
-                                lower_switch(&mut blocks, pl, &mut fresh, &dbg);
+                                lower_switch(
+                                    &mut blocks,
+                                    pl,
+                                    &mut fresh,
+                                    &dbg,
+                                    preserve_dense_switches,
+                                );
                                 continue;
                             }
                             // Labels inside single-line bodies are not expected
@@ -2439,7 +2496,13 @@ pub fn parse_ll(src: &str) -> Module {
                                     break;
                                 }
                             }
-                            lower_switch(&mut blocks, &switch_text, &mut fresh, &dbg);
+                            lower_switch(
+                                &mut blocks,
+                                &switch_text,
+                                &mut fresh,
+                                &dbg,
+                                preserve_dense_switches,
+                            );
                         } else if let Some(colon) = l.find(':') {
                             let head = &l[..colon];
                             if !head.is_empty()
@@ -2533,7 +2596,13 @@ pub fn parse_ll(src: &str) -> Module {
                                 break;
                             }
                         }
-                        lower_switch(&mut blocks, &switch_text, &mut fresh, &dbg);
+                        lower_switch(
+                            &mut blocks,
+                            &switch_text,
+                            &mut fresh,
+                            &dbg,
+                            preserve_dense_switches,
+                        );
                         if has_trailing_brace {
                             break;
                         }
