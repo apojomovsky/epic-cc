@@ -976,13 +976,13 @@ impl<'m> Gen<'m> {
     }
 
     /// One memcpy body for already-resolved (`src`, `dst`) positions.
-    /// With `walk`, every walked pointer advances on every byte, so each
-    /// byte lands on a fresh address; without it every byte reads INDF,
-    /// the pre-walk form. An indirect destination closes with INDF on
-    /// the last byte (the `Load`/`Store` walk shape), leaving FSR0
-    /// exactly on the last byte for `bump_fsr0_tracked_offset`. Direct
-    /// addresses arrive fully resolved; the driver advances them between
-    /// bytes, so no offset is ever applied twice. (epic-cc#492)
+    /// With `walk`, every walked pointer advances on every byte;
+    /// without it every byte reads INDF, the pre-walk form. Dynamic
+    /// terms fold into the byte-0 seed once (they must be loop-invariant
+    /// across the copy, the `Load`/`Store` contract). An indirect
+    /// destination closes with INDF on the last byte, leaving FSR0 on
+    /// it for `bump_fsr0_tracked_offset`; direct addresses arrive fully
+    /// resolved. (epic-cc#492)
     fn emit_memcpy_body(&mut self, last: bool, src: &McSrc, dst: &Addr, walk: bool) {
         match (*src, *dst) {
             (McSrc::Direct(a), Addr::Direct(d)) => {

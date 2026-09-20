@@ -2482,8 +2482,123 @@ fn memcpy_to_dynamic_dst_walks_postinc0() {
     assert_eq!(
         asm.matches(", 0xFEE").count(),
         3,
-        "bytes 1-3 must walk POSTINC0 from the direct src:\n{asm}"
+        "bytes 0-2 must walk POSTINC0 from the direct src:\n{asm}"
     );
+    assert!(
+        asm.contains("MOVFF 0x103, 0xFEF"),
+        "the last byte must close with INDF0, leaving FSR0 on it:\n{asm}"
+    );
+}
+
+#[test]
+fn indirect_to_indirect_walk_covers_the_n2_edge() {
+    // No middle bytes at n=2: byte 0 advances both pointers, the last
+    // byte advances the source and closes the destination with INDF0.
+    // (epic-cc#492 review)
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @src +0 +1*%i\n\
+             %dp = gep @dst +0 +1*%i\n\
+             memcpy %dp %p 2\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("idx", 0x120),
+        ("main::i", 0x121),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("LFSR 1,").count(),
+        1,
+        "FSR1 must seed exactly once:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("LFSR 0,").count(),
+        1,
+        "FSR0 must seed exactly once:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFE6, 0xFEE"),
+        "byte 0 must advance both pointers:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFE6, 0xFEF"),
+        "the last byte must advance the source and close INDF0:\n{asm}"
+    );
+}
+
+#[test]
+fn const_to_indirect_walk_covers_the_n2_edge() {
+    // Flash source into a dynamic destination at n=2: TBLRD*+ on both
+    // bytes, POSTINC0 then INDF0 on the destination side.
+    // (epic-cc#492 review)
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global dst i8\n\
+             global idx i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %i = load i8 @idx\n\
+                 %dp = gep @dst +0 +1*%i\n\
+                 memcpy %dp @t 2\n\
+                 ret void\n",
+        ),
+        "t",
+        &[0x11, 0x22],
+    );
+    let addrs = addrs(&[("dst", 0x110), ("idx", 0x120), ("main::i", 0x121)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("TBLRD*+").count(),
+        2,
+        "both bytes must advance TBLPTR:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFF5, 0xFEE"),
+        "byte 0 must advance the destination:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFF5, 0xFEF"),
+        "the last byte must close INDF0:\n{asm}"
+    );
+}
+
+#[test]
+fn indirect_source_walk_covers_the_n2_edge() {
+    // Indirect source into a direct destination at n=2: both bytes read
+    // POSTINC1 through W. (epic-cc#492 review)
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @src +0 +1*%i\n\
+             memcpy @dst %p 2\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("idx", 0x120),
+        ("main::i", 0x121),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVF 0xFE6,W,A").count(),
+        2,
+        "both bytes must advance through POSTINC1:\n{asm}"
+    );
+    assert!(!asm.contains("0xFE7"), "no INDF1 read remains:\n{asm}");
 }
 
 #[test]
