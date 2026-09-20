@@ -2072,11 +2072,13 @@ fn a_run_draining_before_an_fsr0_reuse_forces_a_reseed() {
 }
 
 #[test]
-fn a_run_longer_than_a_byte_count_stays_straight() {
-    // irparse bounds one memcpy at 255 bytes, but chained adjacent
-    // copies can stage a longer run; the loop count lives in one MOVLW
-    // literal, so the 510-pair chain replays straight rather than
-    // emitting an out-of-range count (epic-cc#486 review).
+fn chained_maximal_copies_split_into_byte_sized_loops() {
+    // irparse bounds one memcpy at 255 bytes. Two adjacent 255-byte
+    // copies stage 510 consecutive pairs, but the second copy's arm
+    // drains the first 255 before its own setup runs (the
+    // drain-before-decision rule), so each half loops with a byte-sized
+    // count instead of one straight replay or an out-of-range MOVLW.
+    // (epic-cc#486 review, split refined by epic-cc#492.)
     let m = parse(
         "global src i8\n\
          global src2 i8\n\
@@ -2095,19 +2097,19 @@ fn a_run_longer_than_a_byte_count_stays_straight() {
         ("dst2", 0x4FF),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
-    assert!(
-        !asm.contains("MOVFF 0xFEE, 0xFE6"),
-        "a 510-pair run exceeds the byte-counted loop and must replay \
-         straight:\n{asm}"
+    assert_eq!(
+        asm.matches("MOVLW 0xFF").count(),
+        2,
+        "each 255-pair half loops with a byte-sized count:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVFF 0xFEE, 0xFE6").count(),
+        2,
+        "each half walks POSTINC:\n{asm}"
     );
     assert!(
         !asm.contains("MOVLW 0x1FE"),
         "no out-of-range MOVLW count may be emitted:\n{asm}"
-    );
-    assert!(
-        asm.contains("MOVFF 0x1FE, 0x4FE") && asm.contains("MOVFF 0x1FF, 0x4FF"),
-        "the chained copies replay as straight MOVFFs across the pair \
-         boundary:\n{asm}"
     );
 }
 
@@ -2279,6 +2281,244 @@ fn a_memcpy_to_a_dynamic_indexed_destination_writes_through_indf0() {
     assert!(
         asm.contains("MOVFF 0x100, 0xFEF") || asm.contains("MOVFF 0x100,0xFEF"),
         "the copied byte must go from the direct source (0x100) through INDF0 (0xFEF):\n{asm}"
+    );
+}
+
+#[test]
+fn memcpy_with_indirect_source_walks_postinc1() {
+    // Source behind a dynamic index resolves to FSR1/INDF1: byte 0
+    // seeds FSR1 once and later bytes walk POSTINC1 instead of
+    // re-seeding per byte. (epic-cc#492)
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @src +0 +1*%i\n\
+             memcpy @dst %p 4\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("idx", 0x120),
+        ("main::i", 0x121),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("LFSR 1,").count(),
+        1,
+        "FSR1 must seed exactly once for the whole copy:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVF 0xFE6,W,A").count(),
+        4,
+        "all four bytes must advance through POSTINC1 (the banked dst \
+         keeps the W-staged form):\n{asm}"
+    );
+    assert!(
+        !asm.contains("0xFE7"),
+        "no INDF1 read remains once the walk advances:\n{asm}"
+    );
+    for i in 0..4u16 {
+        let expect = format!("MOVWF 0x{:03X},B", 0x10 + i);
+        assert!(
+            asm.contains(&expect),
+            "walk byte {i} must write 0x{:03X}:\n{asm}",
+            0x110 + i
+        );
+    }
+}
+
+#[test]
+fn const_memcpy_walks_tblrd_postinc() {
+    // Flash source: TBLPTR seeds once and later bytes read TBLRD*+
+    // instead of re-seeding per byte. (epic-cc#492)
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global dst i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 memcpy @dst @t 4\n\
+                 ret void\n",
+        ),
+        "t",
+        &[0x11, 0x22, 0x33, 0x44],
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[("dst", 0x110)]), None);
+    let tblrd: Vec<&str> = asm
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("TBLRD"))
+        .collect();
+    assert_eq!(
+        tblrd,
+        vec!["TBLRD*+", "TBLRD*+", "TBLRD*+", "TBLRD*+"],
+        "every byte advances through post-increment, byte 0 included:\n{asm}"
+    );
+}
+
+#[test]
+fn single_byte_indirect_memcpy_does_not_walk() {
+    // One byte has nothing to walk from: byte 0's full path is the
+    // whole copy, with no POSTINC form emitted. (epic-cc#492)
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @src +0 +1*%i\n\
+             memcpy @dst %p 1\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("idx", 0x120),
+        ("main::i", 0x121),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("0xFE6"),
+        "no POSTINC1 form in a one-byte copy:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0xFE7,W,A"),
+        "the byte still moves through W:\n{asm}"
+    );
+}
+
+#[test]
+fn isr_reachable_fsr1_seeder_falls_back_to_per_byte_memcpy() {
+    // The walk holds FSR1 across the copy; when the module guard
+    // reports an ISR-reachable FSR1 seeder, an indirect-source copy
+    // keeps the per-byte re-seed instead. (epic-cc#492)
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global arr i8\n\
+         global idx i8\n\
+         fn feeder(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @arr +0 +1*%i\n\
+             memcpy @dst %p 8\n\
+             ret void\n\
+         fn tick(void) [isr] ()\n\
+           block entry:\n\
+             call void @feeder()\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %j = load i8 @idx\n\
+             %q = gep @src +0 +1*%j\n\
+             memcpy @dst %q 4\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("arr", 0x120),
+        ("idx", 0x130),
+        ("feeder::i", 0x131),
+        ("main::j", 0x132),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("0xFE6"),
+        "no POSTINC1 walk may run when an ISR can clobber FSR1:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("LFSR 1,").count(),
+        12,
+        "both copies re-seed per byte (8 + 4):\n{asm}"
+    );
+    // Fallback bodies must land on consecutive addresses, not the
+    // doubled offsets a twice-applied byte index would produce
+    // (0x110 is banked, so the form is MOVWF low-byte,B).
+    for i in 0..4u16 {
+        let expect = format!("MOVWF 0x{:03X},B", 0x10 + i);
+        assert!(
+            asm.contains(&expect),
+            "fallback byte {i} must write 0x{:03X}:\n{asm}",
+            0x110 + i
+        );
+    }
+}
+
+#[test]
+fn memcpy_to_dynamic_dst_walks_postinc0() {
+    // Destination behind a dynamic index resolves to FSR0/INDF0: byte
+    // 0 seeds FSR0 once and later bytes walk POSTINC0, re-grounding
+    // the tracked position afterwards. (epic-cc#492)
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %dp = gep @dst +0 +1*%i\n\
+             memcpy %dp @src 4\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("idx", 0x120),
+        ("main::i", 0x121),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("LFSR 0,").count(),
+        1,
+        "FSR0 must seed exactly once for the whole copy:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches(", 0xFEE").count(),
+        3,
+        "bytes 1-3 must walk POSTINC0 from the direct src:\n{asm}"
+    );
+}
+
+#[test]
+fn staged_run_drains_before_a_memcpy_setup() {
+    // A direct copy stages a loop-sized run; the next copy's arm must
+    // drain it before byte 0's own FSR0 setup runs, so the seed cannot
+    // read a stale tracked position. (epic-cc#486 review rule)
+    let m = parse(
+        "global s1 i8\n\
+         global d1 i8\n\
+         global s2 i8\n\
+         global d2 i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @d1 @s1 8\n\
+             %i = load i8 @idx\n\
+             %dp = gep @d2 +0 +1*%i\n\
+             memcpy %dp @s2 4\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("s1", 0x100),
+        ("d1", 0x110),
+        ("s2", 0x140),
+        ("d2", 0x150),
+        ("idx", 0x160),
+        ("main::i", 0x161),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let loop_tail = asm.find("BRA tmp0").expect("the staged run loops");
+    let seed = asm.find("LFSR 0, 0x150").expect("the walk seeds FSR0");
+    assert!(
+        loop_tail < seed,
+        "the staged run must drain before the next copy's seed:\n{asm}"
     );
 }
 
