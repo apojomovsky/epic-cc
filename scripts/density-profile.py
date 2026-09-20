@@ -222,6 +222,9 @@ def parse_listing(text, table):
     high_water = 0
     function = "<prologue>"
     pending_region = None
+    # A `.table` marks the labelled region that follows as const data, and
+    # only that region: the next function label ends it.
+    active_region = None
 
     for line_no, raw in enumerate(text.splitlines(), start=1):
         line = raw.split(";", 1)[0].strip()
@@ -240,10 +243,7 @@ def parse_listing(text, table):
             label = m.group("label")
             if not _is_internal_label(label, function):
                 function = label
-                if pending_region is not None:
-                    items.append(
-                        Item("region", "", "", 0, function, line_no, pending_region)
-                    )
+                active_region = pending_region
             pending_region = None
             line = m.group("rest").strip()
             if not line:
@@ -307,7 +307,7 @@ def parse_listing(text, table):
                 words,
                 function,
                 line_no,
-                pending_region or "",
+                active_region or "",
             )
         )
         org += words * unit
@@ -645,25 +645,13 @@ def categorize(items, cfg=None):
 # --------------------------------------------------------------------------
 
 
-def _region_carry(items):
-    """Propagate a `.table` region marker to the instructions that follow it."""
-    region = None
-    for item in items:
-        if item.kind == "region":
-            region = item.category
-            continue
-        if item.kind == "instr" and region:
-            item.category = region
-    return items
-
-
 def summarize(items, total_words):
     cells = {}
     per_function = {}
     per_category = {}
     remainder = {}
     for item in items:
-        if item.kind == "region" or not item.words:
+        if not item.words:
             continue
         key = (item.function, item.category)
         cells[key] = cells.get(key, 0) + item.words
@@ -809,7 +797,6 @@ def profile_text(text, args):
     family = detect_family(text, args.device)
     table = word_table(family)
     items, total = parse_listing(text, table)
-    _region_carry(items)
     categorize(
         items,
         Config(

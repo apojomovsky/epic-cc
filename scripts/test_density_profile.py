@@ -27,7 +27,6 @@ def profile(text, device=None, **cfg):
     family = dp.detect_family(text, device)
     table = dp.word_table(family)
     items, total = dp.parse_listing(text, table)
-    dp._region_carry(items)
     dp.categorize(items, dp.Config(**cfg))
     return items, dp.summarize(items, total)
 
@@ -159,6 +158,18 @@ class AttributionTest(unittest.TestCase):
         _, summary = profile(listing)
         self.assertEqual(summary["categories"][dp.CAT_PAD], 255)
         self.assertEqual(summary["categories"][dp.CAT_DATA], 1)
+
+    def test_a_const_table_region_ends_at_the_next_function(self):
+        # Code emitted after a table is code, not more table: a region
+        # that never closes would swallow the rest of the program.
+        listing = PIC14_HEADER + (
+            "    .table T 2\nT:\n    RETLW 0x00\n    RETLW 0x01\n"
+            "after:\n    MOVLB 0x2\n    RETURN\n"
+        )
+        _, summary = profile(listing)
+        self.assertEqual(summary["categories"][dp.CAT_DATA], 2)
+        self.assertEqual(summary["functions"]["after"], 2)
+        self.assertEqual(summary["categories"]["bank-switch"], 1)
 
 
 class CategorizationTest(unittest.TestCase):
