@@ -1,14 +1,19 @@
 //! Overlay address allocation for the PIC8 pipeline.
 //!
-//! Globals get sequential, even-aligned (i16) addresses starting at the
-//! device's first GPR bank. A bin-packing fallback (largest-first,
-//! independent per-bank cursors) activates only when sequential placement
-//! would otherwise fail, so every program that already succeeds keeps
-//! unchanged addresses. Every local of every function lives in a frame
-//! assigned from the call graph: `base(f) = max over callers of the
-//! caller's **physical** frame end` (the address just past its last placed
-//! local, bank crossings included; see `frame_end`), roots start after the
-//! globals, so sibling functions (never co-live) share RAM.
+//! Globals get sequential, even-aligned (i16) addresses. A bin-packing
+//! fallback (largest-first, independent per-bank cursors) activates only
+//! when sequential placement would otherwise fail, so every program that
+//! already succeeds keeps unchanged addresses. Every local of every
+//! function lives in a frame assigned from the call graph: `base(f) = max
+//! over callers of the caller's **physical** frame end` (the address just
+//! past its last placed local, bank crossings included; see `frame_end`),
+//! so sibling functions (never co-live) share RAM.
+//!
+//! Which block starts at the device's first GPR bank is the core's call:
+//! PIC14 puts the globals there and the frames above them, PIC18 the
+//! reverse. Only PIC18's low RAM (the access bank) is reachable with no
+//! bank select, and frames are what direct file-register operands name
+//! (epic-cc#482).
 //!
 //! Both allocators assign **physical** addresses and step through the
 //! device's GPR banks (`Device::region_for`); demand past the last bank
@@ -255,6 +260,21 @@ fn round_if_routine(
         return base;
     }
     routine_base(device, base, &locals_widths[f])
+}
+
+/// The address just past the highest frame byte in `base`, floored at
+/// `region_start` so an empty overlay still reports its own start.
+fn overlay_end(
+    device: &Device,
+    base: &HashMap<String, u16>,
+    locals_widths: &HashMap<String, Vec<u8>>,
+    region_start: u16,
+) -> u16 {
+    base.iter()
+        .map(|(f, &b)| frame_end(device, b, &locals_widths[f]))
+        .max()
+        .unwrap_or(region_start)
+        .max(region_start)
 }
 
 /// One function's liveness-overlay frame: the distinct slot widths in
@@ -852,11 +872,301 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
-    // Globals and frames pack from the device's GPR start: no access-bank
-    // reservation. Float routines place exactly like integer ones (single
-    // bank rounding, context-relative bases; epic-cc#357).
-    let global_start = device.gpr_start();
-    // 1. Globals: sequential, aligned to at most two bytes (i16 -> even
+
+    // Steps 1-5 shape the frame overlay over a region whose start is still
+    // open. Nothing here depends on where the globals land, which is what
+    // lets PIC18 place the overlay BELOW them (step 5's caller).
+
+    // 1. locals_widths(f) = the liveness-overlay slot widths of f's params
+    // and defined values, in allocation order (the order `frame_end` walks
+    // and the locals placement reproduces). Values whose live ranges never
+    // overlap share a slot, so a frame shrinks from the width sum to the
+    // peak simultaneous demand. locals_size(f) is the colored frame's byte
+    // size (epic-cc#172).
+    let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut locals_size: HashMap<String, u16> = HashMap::new();
+    let va_sizes = va_sizes(m);
+    for f in &m.funcs {
+        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
+        locals_widths.insert(f.name.clone(), fl.widths);
+        locals_size.insert(f.name.clone(), fl.size);
+    }
+
+    // 2. Call graph from the edge text.
+    let mut edges: HashMap<String, Vec<String>> = HashMap::new(); // caller -> callees
+    let mut callees: HashSet<String> = HashSet::new();
+    for line in edges_text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("edge ") {
+            let mut it = rest.split_whitespace();
+            let caller = it
+                .next()
+                .unwrap_or_else(|| panic!("alloc: malformed edge line: {line}"))
+                .to_string();
+            let callee = it
+                .next()
+                .unwrap_or_else(|| panic!("alloc: malformed edge line: {line}"))
+                .to_string();
+            assert!(it.next().is_none(), "alloc: malformed edge line: {line}");
+            let list = edges.entry(caller).or_default();
+            if !list.contains(&callee) {
+                list.push(callee.clone());
+            }
+            callees.insert(callee);
+        } else if line.starts_with("depth ") {
+            // Informational; ignored.
+        } else if line.starts_with("fn ") {
+            // The callgraph binary emits one `fn <name>` line per function
+            // (after `depth`). It carries no info needed for allocation, so
+            // skip it.
+        } else {
+            panic!("alloc: unrecognized callgraph line: {line}");
+        }
+    }
+
+    // 3. Topological order (recursion is rejected by callgraph; panics
+    // if one slips through, and on any edge to an unknown function).
+    let mut indeg: HashMap<String, usize> = m.funcs.iter().map(|f| (f.name.clone(), 0)).collect();
+    for (caller, cs) in &edges {
+        assert!(
+            indeg.contains_key(caller),
+            "alloc: edge from unknown function {caller}"
+        );
+        for c in cs {
+            let d = indeg
+                .get_mut(c)
+                .unwrap_or_else(|| panic!("alloc: edge to unknown function {c}"));
+            *d += 1;
+        }
+    }
+    let mut ready: Vec<String> = indeg
+        .iter()
+        .filter(|(_, &d)| d == 0)
+        .map(|(f, _)| f.clone())
+        .collect();
+    ready.sort();
+    let mut topo: Vec<String> = Vec::new();
+    while let Some(f) = ready.pop() {
+        topo.push(f.clone());
+        if let Some(cs) = edges.get(&f) {
+            for c in cs {
+                let d = indeg.get_mut(c).expect("alloc: stale topo edge");
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(c.clone());
+                }
+            }
+        }
+    }
+    assert!(
+        topo.len() == m.funcs.len(),
+        "alloc: call graph contains a cycle ({} of {} functions placed)",
+        topo.len(),
+        m.funcs.len()
+    );
+
+    // 4. depth_end(f) = locals_size(f) + max(0, max over callees depth_end(c)).
+    // Reverse topo order: every callee precedes its callers.
+    let mut depth_end: HashMap<String, u16> = HashMap::new();
+    for f in topo.iter().rev() {
+        let deepest = edges
+            .get(f)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .map(|c| depth_end[c])
+            .max()
+            .unwrap_or(0);
+        depth_end.insert(f.clone(), locals_size[f] + deepest);
+    }
+
+    let mut callers: HashMap<String, Vec<String>> = HashMap::new();
+    for (p, cs) in &edges {
+        for c in cs {
+            callers.entry(c.clone()).or_default().push(p.clone());
+        }
+    }
+    let isr_names: HashSet<&str> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr)
+        .map(|f| f.name.as_str())
+        .collect();
+
+    // Steps 5 and 5b as one operation over a frame-region start, so the
+    // region can be derived before the globals (PIC18, below) or after
+    // them (PIC14) without the derivation existing twice.
+    let assign_bases = |region_start: u16| -> (HashMap<String, u16>, Option<u16>) {
+        // 5. base(f) = max over direct callers of the caller's PHYSICAL
+        // frame end; roots at region_start, in forward topo order so every
+        // caller precedes its callees.
+
+        // The virtual sum base(p) + locals_size[p] is NOT used: a caller
+        // whose frame spills past a bank region end ends beyond that sum,
+        // and a callee based on it could land in the gap at the next
+        // region's start, exactly where the caller's spill locals live
+        // while both frames are live. frame_end walks the caller's actual
+        // widths through place_contiguous, so it matches step 7's
+        // placement exactly, hole bytes included.
+        let mut base: HashMap<String, u16> = HashMap::new();
+        for f in &topo {
+            let b = match callers.get(f) {
+                Some(ps) => ps
+                    .iter()
+                    .map(|p| frame_end(device, base[p], &locals_widths[p]))
+                    .max()
+                    .expect("alloc: empty caller list"),
+                None => region_start,
+            };
+            // A runtime routine's frame must stay inside ONE GPR bank: its
+            // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
+            // test and its target, or inside a carry idiom. The base is rounded
+            // when the derived frame would straddle a bank boundary; float
+            // routines round exactly like integer ones (epic-cc#357).
+            let b = round_if_routine(device, f, b, &locals_widths);
+            base.insert(f.clone(), b);
+        }
+
+        // 5b. The disjoint ISR region: an ISR root's frame base is AFTER
+        // the main context's total (the max physical frame end over the
+        // NON-ISR roots' contexts), not the region start. The ISR can
+        // preempt main at any point, so a preempted main's live frames must
+        // never overlap the ISR context's. The physical end equals the
+        // depth sum when no local crosses a bank gap and is strictly larger
+        // (hence safer) when an i16 at a region tail leaves a hole.
+
+        // The loop above is exact for every non-ISR context (no ISR-side
+        // function is reachable from them), so the disjoint base derives
+        // from its results; each ISR context is then re-derived from that
+        // base in topo order.
+
+        // Set inside the ISR-region block below: `Some` only in priority mode.
+        let mut isr_low_save: Option<u16> = None;
+        if !isr_names.is_empty() {
+            let isr_roots: Vec<&String> = topo
+                .iter()
+                .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
+                .collect();
+            // Priority-partitioned ISR roots: the high ISR can preempt the
+            // low one (and main) mid-call, so each priority's context needs
+            // its own disjoint overlay region. Compatibility mode has no
+            // high roots and behaves exactly as before.
+            let hi_roots: Vec<&&String> = isr_roots
+                .iter()
+                .filter(|f| {
+                    m.funcs
+                        .iter()
+                        .find(|g| g.name.as_str() == f.as_str())
+                        .is_some_and(|g| g.irq_priority == 1)
+                })
+                .collect();
+            let lo_roots: Vec<&&String> = isr_roots
+                .iter()
+                .filter(|f| !hi_roots.iter().any(|h| h.as_str() == f.as_str()))
+                .collect();
+            let non_isr_roots: Vec<&String> = topo
+                .iter()
+                .filter(|f| !callers.contains_key(*f) && !isr_names.contains(f.as_str()))
+                .collect();
+            // The disjoint base = max physical frame end over the non-ISR roots'
+            // contexts (the main context's total). No non-ISR root: the ISR is
+            // the only root, so it simply starts at region_start.
+            let isr_base = non_isr_roots
+                .iter()
+                .flat_map(|r| reachable(&[r.as_str()], &edges))
+                .map(|f| frame_end(device, base[&f], &locals_widths[&f]))
+                .max()
+                .unwrap_or(region_start);
+            // Re-derive each priority's context from its disjoint base in topo
+            // order (callers precede callees, and every caller of a context
+            // function is itself in that context after the legalize
+            // duplication).
+            let assign_region =
+                |base: &mut HashMap<String, u16>, roots: &[&&String], region_base: u16| {
+                    let ctx: HashSet<String> = roots
+                        .iter()
+                        .flat_map(|r| reachable(&[r.as_str()], &edges))
+                        .collect();
+                    for f in &topo {
+                        if !ctx.contains(f) {
+                            continue;
+                        }
+                        let b = if roots.iter().any(|r| r.as_str() == f.as_str()) {
+                            region_base
+                        } else {
+                            callers[f]
+                                .iter()
+                                .map(|p| frame_end(device, base[p], &locals_widths[p]))
+                                .max()
+                                .expect("alloc: empty caller list")
+                        };
+                        // Issue #6: the ISR context's routine copies get the same
+                        // single-bank frame rounding as the main context's.
+                        let b = round_if_routine(device, f, b, &locals_widths);
+                        base.insert(f.clone(), b);
+                    }
+                };
+            // Priority mode (both priorities present): the low ISR's 12-byte
+            // context-save area sits at the low region's base, below the low
+            // frames, so it is disjoint from every context by construction
+            // (the access-window argument shows no float frame can land
+            // inside it). Compatibility mode keeps the historical layout
+            // byte-identical: no shift, no save area.
+            let priority_mode = !lo_roots.is_empty() && !hi_roots.is_empty();
+            let lo_base = if priority_mode {
+                isr_low_save = Some(isr_base);
+                isr_base + 12
+            } else {
+                isr_base
+            };
+            assign_region(&mut base, &lo_roots, lo_base);
+            // The high region sits above everything the high ISR can preempt
+            // (main and low frames): max frame end over all assigned bases.
+            let hi_base = base
+                .iter()
+                .map(|(f, b)| frame_end(device, *b, &locals_widths[f]))
+                .max()
+                .unwrap_or(isr_base);
+            assign_region(&mut base, &hi_roots, hi_base);
+        }
+        (base, isr_low_save)
+    };
+
+    // PIC18 puts the frame overlay BELOW the globals. The access bank
+    // (0x000-0x05F) is the only RAM `isel-pic18`'s `operand()` reaches with
+    // no `MOVLB`, and frames are what its direct file-register operands
+    // name: globals mostly move through `MOVFF` and `FSR`, which carry a
+    // full 12-bit address and never touch `BSR`. Globals first therefore
+    // spends the window on the operands that do not need it.
+
+    // Swapping the two blocks moves no byte of demand, only its order, so
+    // the total holds up to each block's own alignment and any pinned
+    // global. PIC14 has no access bank (common RAM, its analogue, is
+    // carved out of every bank already) and keeps the historical order.
+    let placed_frames = device
+        .access_bank
+        .is_some()
+        .then(|| assign_bases(device.gpr_start()));
+    // A global pinned by address (`__at`) inside the overlay's span has
+    // nowhere to go, so those modules keep the globals-first layout, where
+    // the frames start above every pinned address. The scan is over every
+    // pinned global, const included: whether a const ends up in RAM is
+    // decided below, and falling back is the safe way to be wrong.
+    let placed_frames = placed_frames.filter(|(base, _)| {
+        let top = overlay_end(device, base, &locals_widths, device.gpr_start());
+        !m.globals
+            .iter()
+            .any(|g| matches!(g.addr, Some(a) if a < top))
+    });
+    let global_start = match &placed_frames {
+        Some((b, _)) => overlay_end(device, b, &locals_widths, device.gpr_start()),
+        None => device.gpr_start(),
+    };
+
+    // 6. Globals: sequential, aligned to at most two bytes (i16 -> even
     // address; larger arrays advance sequentially), stepping through the banks as bank 0 GPR fills up. Each global spans
     // `size` bytes (an `[N x T]` array takes N addresses, not one), so a
     // sized array advances the free pointer by its byte count. Const globals
@@ -1009,8 +1319,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     for (name, addr, _) in &fixed {
         globals.insert(name.clone(), *addr);
     }
-    let floating_map: HashMap<String, u16> = if floating.is_empty() {
-        HashMap::new()
+    let (floating_map, frames_fit): (HashMap<String, u16>, bool) = if floating.is_empty() {
+        (HashMap::new(), true)
     } else {
         // Sort fixed by address for overlap checks.
         fixed.sort_by_key(|(_, a, _)| *a);
@@ -1084,15 +1394,6 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             }
             Some(out)
         };
-        let seq = {
-            let mut start = global_start;
-            for (_, fa, fs) in &fixed {
-                if start >= *fa && start < *fa + *fs {
-                    start = *fa + *fs;
-                }
-            }
-            try_float(start)
-        };
         // Prefer the arrangement with the lower footprint. The sequential
         // order preserves the .ll order, but a large global after small
         // ones wastes the tail of the first bank (epic-taskmgr's 80-byte
@@ -1100,30 +1401,65 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         // the last bank, epic-hal#86). The largest-first bin-pack closes
         // that gap; when both fit, the tighter end wins and the layout
         // stays otherwise unchanged (small fixtures place identically).
-        let bin = bin_pack(device, &fixed, &floating, global_start);
-        let floating_map: HashMap<String, u16> = match (&seq, &bin) {
-            (Some(s), Some(b)) if global_end(b, &floating) < global_end(s, &floating) => b.clone(),
-            (Some(s), _) => s.clone(),
-            (None, Some(b)) => b.clone(),
-            (None, None) => {
-                let demand: u32 = floating.iter().map(|g| u32::from(g.size)).sum::<u32>()
-                    + fixed.iter().map(|(_, _, s)| u32::from(*s)).sum::<u32>();
-                let capacity: u32 = device
-                    .ram_banks
-                    .iter()
-                    .map(|&(s, e)| u32::from(e) - u32::from(s) + 1)
-                    .sum();
-                let bank_count = device.ram_banks.len();
-                panic!(
-                    "alloc: no arrangement of {} global(s) fits {}'s {bank_count} GPR bank window(s) \
-                     (total demand {demand} bytes, total capacity {capacity} bytes, no arrangement this \
-                     allocator tries, sequential then largest-first bin-packing, fits)",
-                    floating.len() + fixed.len(),
-                    device.name,
-                );
+        let best_at = |start: u16| -> Option<HashMap<String, u16>> {
+            let seq = {
+                let mut start = start;
+                for (_, fa, fs) in &fixed {
+                    if start >= *fa && start < *fa + *fs {
+                        start = *fa + *fs;
+                    }
+                }
+                try_float(start)
+            };
+            let bin = bin_pack(device, &fixed, &floating, start);
+            match (&seq, &bin) {
+                (Some(s), Some(b)) if global_end(b, &floating) < global_end(s, &floating) => {
+                    Some(b.clone())
+                }
+                (Some(s), _) => Some(s.clone()),
+                (None, Some(b)) => Some(b.clone()),
+                (None, None) => None,
             }
         };
-        floating_map
+        let no_fit = |start: u16| -> String {
+            let demand: u32 = floating.iter().map(|g| u32::from(g.size)).sum::<u32>()
+                + fixed.iter().map(|(_, _, s)| u32::from(*s)).sum::<u32>();
+            let capacity: u32 = device
+                .ram_banks
+                .iter()
+                .map(|&(s, e)| u32::from(e.max(start).max(s)) - u32::from(s.max(start)) + 1)
+                .sum();
+            format!(
+                "alloc: no arrangement of {} global(s) fits {}'s {} GPR bank window(s) from \
+                 0x{start:X} up (total demand {demand} bytes, capacity above that start \
+                 {capacity} bytes, neither sequential nor largest-first bin-packing fits)",
+                floating.len() + fixed.len(),
+                device.name,
+                device.ram_banks.len(),
+            )
+        };
+        // The frames-first order hands the globals a shorter window than
+        // the historical one, and the two pack differently around region
+        // holes and pinned addresses. A density win is never worth failing
+        // to compile, so a module whose globals no longer fit above the
+        // overlay goes back to globals-first rather than panicking.
+        match best_at(global_start) {
+            Some(map) => (map, true),
+            None if global_start != device.gpr_start() => (
+                best_at(device.gpr_start())
+                    .unwrap_or_else(|| panic!("{}", no_fit(device.gpr_start()))),
+                false,
+            ),
+            None => panic!("{}", no_fit(global_start)),
+        }
+    };
+    // Re-bind both when the fallback fired: the frames must follow the
+    // globals again, exactly as they do on a core with no access bank.
+    let placed_frames = if frames_fit { placed_frames } else { None };
+    let global_start = if frames_fit {
+        global_start
+    } else {
+        device.gpr_start()
     };
     globals.extend(floating_map);
 
@@ -1139,257 +1475,17 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 Some(&a) => end.max(physical_end(device, a, u16::from(g.size))),
                 None => end,
             });
-    let bank0_start = end_of_globals.max(global_start);
 
-    // 2. locals_widths(f) = the liveness-overlay slot widths of f's params
-    // and defined values, in allocation order (the order `frame_end` walks
-    // and the locals placement reproduces). Values whose live ranges never
-    // overlap share a slot, so a frame shrinks from the width sum to the
-    // peak simultaneous demand. locals_size(f) is the colored frame's byte
-    // size (epic-cc#172).
-    let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut locals_size: HashMap<String, u16> = HashMap::new();
-    let va_sizes = va_sizes(m);
-    for f in &m.funcs {
-        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
-        locals_widths.insert(f.name.clone(), fl.widths);
-        locals_size.insert(f.name.clone(), fl.size);
-    }
-
-    // 3. Call graph from the edge text.
-    let mut edges: HashMap<String, Vec<String>> = HashMap::new(); // caller -> callees
-    let mut callees: HashSet<String> = HashSet::new();
-    for line in edges_text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("edge ") {
-            let mut it = rest.split_whitespace();
-            let caller = it
-                .next()
-                .unwrap_or_else(|| panic!("alloc: malformed edge line: {line}"))
-                .to_string();
-            let callee = it
-                .next()
-                .unwrap_or_else(|| panic!("alloc: malformed edge line: {line}"))
-                .to_string();
-            assert!(it.next().is_none(), "alloc: malformed edge line: {line}");
-            let list = edges.entry(caller).or_default();
-            if !list.contains(&callee) {
-                list.push(callee.clone());
-            }
-            callees.insert(callee);
-        } else if line.starts_with("depth ") {
-            // Informational; ignored.
-        } else if line.starts_with("fn ") {
-            // The callgraph binary emits one `fn <name>` line per function
-            // (after `depth`). It carries no info needed for allocation, so
-            // skip it.
-        } else {
-            panic!("alloc: unrecognized callgraph line: {line}");
-        }
-    }
-
-    // 4. Topological order (recursion is rejected by callgraph; panics
-    // if one slips through, and on any edge to an unknown function).
-    let mut indeg: HashMap<String, usize> = m.funcs.iter().map(|f| (f.name.clone(), 0)).collect();
-    for (caller, cs) in &edges {
-        assert!(
-            indeg.contains_key(caller),
-            "alloc: edge from unknown function {caller}"
-        );
-        for c in cs {
-            let d = indeg
-                .get_mut(c)
-                .unwrap_or_else(|| panic!("alloc: edge to unknown function {c}"));
-            *d += 1;
-        }
-    }
-    let mut ready: Vec<String> = indeg
-        .iter()
-        .filter(|(_, &d)| d == 0)
-        .map(|(f, _)| f.clone())
-        .collect();
-    ready.sort();
-    let mut topo: Vec<String> = Vec::new();
-    while let Some(f) = ready.pop() {
-        topo.push(f.clone());
-        if let Some(cs) = edges.get(&f) {
-            for c in cs {
-                let d = indeg.get_mut(c).expect("alloc: stale topo edge");
-                *d -= 1;
-                if *d == 0 {
-                    ready.push(c.clone());
-                }
-            }
-        }
-    }
-    assert!(
-        topo.len() == m.funcs.len(),
-        "alloc: call graph contains a cycle ({} of {} functions placed)",
-        topo.len(),
-        m.funcs.len()
-    );
-
-    // 5. depth_end(f) = locals_size(f) + max(0, max over callees depth_end(c)).
-    // Reverse topo order: every callee precedes its callers.
-    let mut depth_end: HashMap<String, u16> = HashMap::new();
-    for f in topo.iter().rev() {
-        let deepest = edges
-            .get(f)
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-            .iter()
-            .map(|c| depth_end[c])
-            .max()
-            .unwrap_or(0);
-        depth_end.insert(f.clone(), locals_size[f] + deepest);
-    }
-
-    // 6. base(f) = max over direct callers of the caller's PHYSICAL frame
-    // end (the address just past its last *placed* local, bank crossings and
-    // region-tail holes included); roots at bank0_start. Forward topo order:
-    // every caller precedes its callees. The virtual sum base(p) +
-    // locals_size[p] is NOT used: a caller whose frame spills past a bank
-    // region end ends beyond that sum, and a callee based on it could land in
-    // the gap at the next region's start, exactly where the caller's spill
-    // locals live while both frames are live. frame_end walks the caller's
-    // actual local widths through place_contiguous, so it matches the layout
-    // step's placement exactly (including the unused hole byte an i16 leaves
-    // when it cannot fit in the region tail).
-    let mut callers: HashMap<String, Vec<String>> = HashMap::new();
-    for (p, cs) in &edges {
-        for c in cs {
-            callers.entry(c.clone()).or_default().push(p.clone());
-        }
-    }
-    let mut base: HashMap<String, u16> = HashMap::new();
-    for f in &topo {
-        let b = match callers.get(f) {
-            Some(ps) => ps
-                .iter()
-                .map(|p| frame_end(device, base[p], &locals_widths[p]))
-                .max()
-                .expect("alloc: empty caller list"),
-            None => bank0_start,
-        };
-        // A runtime routine's frame must stay inside ONE GPR bank: its
-        // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
-        // test and its target, or inside a carry idiom. The base is rounded
-        // when the derived frame would straddle a bank boundary; float
-        // routines round exactly like integer ones (epic-cc#357).
-        let b = round_if_routine(device, f, b, &locals_widths);
-        base.insert(f.clone(), b);
-    }
-
-    // 6b. The disjoint ISR region: an ISR root's frame base is AFTER the
-    // main context's total (the max physical frame end over the NON-ISR
-    // roots' contexts), not `bank0_start`. The ISR can preempt main at any
-    // point, so a preempted main's live frames must never overlap the ISR
-    // context's frames. The physical end equals the depth sum when no local
-    // crosses a bank gap, and is strictly larger (hence safer) when an i16
-    // at a region tail leaves a hole.
-    //
-    // The main loop above is exact for every non-ISR context (no ISR-side
-    // function is reachable from them), so the disjoint base derives from
-    // its results; the ISR contexts are then re-derived from that base in
-    // topo order (callers precede callees).
-    let isr_names: HashSet<&str> = m
-        .funcs
-        .iter()
-        .filter(|f| f.isr)
-        .map(|f| f.name.as_str())
-        .collect();
-    // Set inside the ISR-region block below: `Some` only in priority mode.
-    let mut isr_low_save: Option<u16> = None;
-    if !isr_names.is_empty() {
-        let isr_roots: Vec<&String> = topo
-            .iter()
-            .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
-            .collect();
-        // Priority-partitioned ISR roots: the high ISR can preempt the
-        // low one (and main) mid-call, so each priority's context needs
-        // its own disjoint overlay region. Compatibility mode has no
-        // high roots and behaves exactly as before.
-        let hi_roots: Vec<&&String> = isr_roots
-            .iter()
-            .filter(|f| {
-                m.funcs
-                    .iter()
-                    .find(|g| g.name.as_str() == f.as_str())
-                    .is_some_and(|g| g.irq_priority == 1)
-            })
-            .collect();
-        let lo_roots: Vec<&&String> = isr_roots
-            .iter()
-            .filter(|f| !hi_roots.iter().any(|h| h.as_str() == f.as_str()))
-            .collect();
-        let non_isr_roots: Vec<&String> = topo
-            .iter()
-            .filter(|f| !callers.contains_key(*f) && !isr_names.contains(f.as_str()))
-            .collect();
-        // The disjoint base = max physical frame end over the non-ISR roots'
-        // contexts (the main context's total). No non-ISR root: the ISR is
-        // the only root, so it simply starts at bank0_start.
-        let isr_base = non_isr_roots
-            .iter()
-            .flat_map(|r| reachable(&[r.as_str()], &edges))
-            .map(|f| frame_end(device, base[&f], &locals_widths[&f]))
-            .max()
-            .unwrap_or(bank0_start);
-        // Re-derive each priority's context from its disjoint base in topo
-        // order (callers precede callees, and every caller of a context
-        // function is itself in that context after the legalize
-        // duplication).
-        let assign_region =
-            |base: &mut HashMap<String, u16>, roots: &[&&String], region_base: u16| {
-                let ctx: HashSet<String> = roots
-                    .iter()
-                    .flat_map(|r| reachable(&[r.as_str()], &edges))
-                    .collect();
-                for f in &topo {
-                    if !ctx.contains(f) {
-                        continue;
-                    }
-                    let b = if roots.iter().any(|r| r.as_str() == f.as_str()) {
-                        region_base
-                    } else {
-                        callers[f]
-                            .iter()
-                            .map(|p| frame_end(device, base[p], &locals_widths[p]))
-                            .max()
-                            .expect("alloc: empty caller list")
-                    };
-                    // Issue #6: the ISR context's routine copies get the same
-                    // single-bank frame rounding as the main context's.
-                    let b = round_if_routine(device, f, b, &locals_widths);
-                    base.insert(f.clone(), b);
-                }
-            };
-        // Priority mode (both priorities present): the low ISR's 12-byte
-        // context-save area sits at the low region's base, below the low
-        // frames, so it is disjoint from every context by construction
-        // (the access-window argument shows no float frame can land
-        // inside it). Compatibility mode keeps the historical layout
-        // byte-identical: no shift, no save area.
-        let priority_mode = !lo_roots.is_empty() && !hi_roots.is_empty();
-        let lo_base = if priority_mode {
-            isr_low_save = Some(isr_base);
-            isr_base + 12
-        } else {
-            isr_base
-        };
-        assign_region(&mut base, &lo_roots, lo_base);
-        // The high region sits above everything the high ISR can preempt
-        // (main and low frames): max frame end over all assigned bases.
-        let hi_base = base
-            .iter()
-            .map(|(f, b)| frame_end(device, *b, &locals_widths[f]))
-            .max()
-            .unwrap_or(isr_base);
-        assign_region(&mut base, &hi_roots, hi_base);
-    }
+    // The overlay's start: the GPR start when the frames were placed ahead
+    // of the globals, the first byte past them otherwise.
+    let bank0_start = match &placed_frames {
+        Some(_) => device.gpr_start(),
+        None => end_of_globals.max(global_start),
+    };
+    let (base, isr_low_save) = match placed_frames {
+        Some(r) => r,
+        None => assign_bases(bank0_start),
+    };
 
     // 7. Local addresses: each slot of the liveness-colored frame at the
     // next free frame byte, stepping through the banks via
@@ -1469,7 +1565,9 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
 
     // 8. Total bank-0 demand = max over roots of depth_end(root), with an
     // ISR root's disjoint base offset included (its region starts after the
-    // main context's total, not at bank0_start).
+    // main context's total, not at bank0_start). The arithmetic is relative
+    // to the region start, so it reads the same whichever end of RAM the
+    // overlay was placed at.
     let total_bank0 = m
         .funcs
         .iter()
