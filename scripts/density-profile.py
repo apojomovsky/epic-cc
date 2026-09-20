@@ -12,7 +12,7 @@ from zero.
   python3 scripts/density-profile.py out.asm --json > before.json
   python3 scripts/density-profile.py out.asm --compare before.json
   python3 scripts/density-profile.py --compile --device 18F4550 \
-      --cflag -Iinclude -- src/*.c
+      --cflag=-Iinclude src/*.c
 
 Word counts are not hand-maintained here. The per-mnemonic table is read
 out of `crates/asm/src/lib.rs`, the assembler that actually lays the
@@ -82,7 +82,13 @@ class WordTable:
 
 
 def _fn_body(text, signature):
-    """The brace-matched body of the first `fn` whose text starts `signature`."""
+    """The brace-matched body of the first `fn` whose text starts `signature`.
+
+    Braces inside string literals are counted, so an unbalanced `{` in a
+    `panic!` format string would end the walk early. Every function this
+    reads has balanced format strings; the failure mode is a spurious
+    `ProfileError`, never a silently truncated body.
+    """
     start = text.find(signature)
     if start < 0:
         raise ProfileError(
@@ -104,11 +110,19 @@ def _fn_body(text, signature):
 
 
 def pic18_word_table(asm_source):
-    """Read the PIC18 per-mnemonic word counts out of the assembler."""
+    """Read the PIC18 per-mnemonic word counts out of the assembler.
+
+    Every `=>` line in the body must parse as a literal mnemonic arm. A
+    partial read is the dangerous failure: one arm silently dropped (a
+    trailing comment, a guard arm, a set lookup) halves the cost of every
+    mnemonic it carried and quietly reranks the whole profile.
+    """
     body = _fn_body(asm_source, _FN_PIC18)
     sizes = {}
     default = None
+    consumed = set()
     for arm in _MATCH_ARM.finditer(body):
+        consumed.add(arm.group(0).strip())
         words = int(arm.group("words"))
         for pat in arm.group("pats").split("|"):
             pat = pat.strip()
@@ -116,21 +130,38 @@ def pic18_word_table(asm_source):
                 default = words
             else:
                 sizes[pat.strip('"').upper()] = words
-    if default is None or not sizes:
+    unread = [
+        line.strip()
+        for line in body.splitlines()
+        if "=>" in line and line.strip() not in consumed
+    ]
+    if default is None or not sizes or unread:
+        detail = f"; unread arms: {unread}" if unread else ""
         raise ProfileError(
             f"{ASM_SOURCE.name}: `{_FN_PIC18}` no longer reads as a literal match "
-            "over mnemonics; update the parser rather than hardcoding a table"
+            f"over mnemonics{detail}; update the parser rather than hardcoding "
+            "a table"
         )
     return WordTable("pic18", sizes, default, f"{ASM_SOURCE.name}:{_FN_PIC18}")
 
 
+_ORG_STEP = re.compile(r"org\s*\+=\s*([^;]+);")
+
+
 def pic14_word_table(asm_source):
-    """Confirm PIC14 is still the single-word ISA this profile assumes."""
+    """Confirm PIC14 is still the single-word ISA this profile assumes.
+
+    The premise is that every instruction line advances `org` by exactly
+    one, with no per-mnemonic size lookup anywhere. A two-word form added
+    later would show up as either a lookup call or an `org += n`.
+    """
     body = _fn_body(asm_source, _FN_PIC14)
-    if "instruction_words" in body or "org += 1;" not in body:
+    steps = {m.group(1).strip() for m in _ORG_STEP.finditer(body)}
+    if "instruction_words" in body or steps != {"1"}:
         raise ProfileError(
             f"{ASM_SOURCE.name}: `{_FN_PIC14}` no longer advances `org` by exactly "
-            "one word per instruction; PIC14 needs a real word table now"
+            f"one word per instruction (steps: {sorted(steps) or 'none'}); PIC14 "
+            "needs a real word table now"
         )
     return WordTable("pic14", {}, 1, f"{ASM_SOURCE.name}:{_FN_PIC14}")
 
@@ -143,9 +174,18 @@ def word_table(family, asm_source=None):
     return pic14_word_table(asm_source)
 
 
-_LIST_DIRECTIVE = re.compile(r"\blist\s+p\s*=\s*p?(?P<part>[0-9a-z]+)", re.I)
+_LIST_DIRECTIVE = re.compile(r"\blist\s+p\s*=\s*(?P<part>[0-9a-z]+)", re.I)
+_PART_FAMILY = re.compile(r"^(?:pic)?p?(10|12|14|16|18)[fl]")
 _LABEL = re.compile(r"^(?P<label>[A-Za-z_.$][A-Za-z0-9_.$]*)\s*:\s*(?P<rest>.*)$")
 _BACKEND_LABEL = re.compile(r"^(tmp\d+|__far_skip\d+)$")
+
+# What each family's pass 1 actually handles. Anything else is an error
+# rather than a silent zero: the word table is derived from the assembler,
+# but directive handling is mirrored by hand and has nothing to catch drift.
+_DIRECTIVES = {
+    "pic18": (".pcltbl", ".pclalign"),
+    "pic14": (".align", ".table"),
+}
 _NUMBER = re.compile(r"^(0[xX][0-9a-fA-F]+|\d+)$")
 
 # Categories a region's kind assigns directly, before any pattern rule.
@@ -153,6 +193,7 @@ CAT_DATA = "const-data"
 CAT_PAD = "align-padding"
 CAT_GAP = "reserved-gap"
 CAT_OTHER = "other"
+CAT_RESIDUAL = "not-in-listing"
 
 
 @dataclasses.dataclass
@@ -169,7 +210,13 @@ class Item:
 
 
 def detect_family(text, device=None):
-    """pic14 or pic18, from the listing's own `list p=` line or `--device`."""
+    """pic14 or pic18, from the listing's own `list p=` line or `--device`.
+
+    `--target` accepts `p18f4550`, `18F4550` and `PIC18F4550` alike
+    (`crates/driver/src/cli.rs`), so all three have to land on pic18. An
+    unrecognised part is an error: defaulting to pic14 would silently
+    count every two-word PIC18 instruction as one.
+    """
     part = None
     m = _LIST_DIRECTIVE.search(text)
     if m:
@@ -181,7 +228,10 @@ def detect_family(text, device=None):
             "cannot tell the device family: the listing has no `list p=` line, "
             "pass --device"
         )
-    return "pic18" if part.lower().lstrip("p").startswith("18") else "pic14"
+    m = _PART_FAMILY.match(part.lower())
+    if not m:
+        raise ProfileError(f"unrecognised device {part!r}: expected e.g. 18F4550")
+    return "pic18" if m.group(1) == "18" else "pic14"
 
 
 def _parse_int(token):
@@ -253,6 +303,14 @@ def parse_listing(text, table):
             org = target
             high_water = max(high_water, org)
             continue
+        if low.startswith("."):
+            directive = low.split(None, 1)[0]
+            if directive not in _DIRECTIVES.get(table.family, ()):
+                raise ProfileError(
+                    f"line {line_no}: `{directive}` is not a {table.family} "
+                    f"directive this profile knows; it would be counted as zero "
+                    "words. Mirror the assembler's handling for it first."
+                )
         if low.startswith(".align "):
             n = _parse_int(line[len(".align ") :])
             if n is None:
@@ -280,9 +338,16 @@ def parse_listing(text, table):
             # `.pcltbl`/`.pclalign`: dispatch markers, no words of their own.
             continue
         if low.startswith("db "):
+            if table.family != "pic18":
+                raise ProfileError(
+                    f"line {line_no}: `db` on {table.family}, where "
+                    "`assemble_first_pass` has no `db` handler; const tables "
+                    "there are RETLW"
+                )
             count = len([t for t in line[3:].split(",") if t.strip()])
-            items.append(Item("data", "", "", 0, function, line_no, CAT_DATA))
-            items[-1].words = count / 2  # PIC18 packs two `db` bytes per word
+            # PIC18 packs two `db` bytes per word, so an odd run ends on a
+            # half word; the program's total rounds up, as the assembler does.
+            items.append(Item("data", "", "", count / 2, function, line_no, CAT_DATA))
             org += count
             high_water = max(high_water, org)
             continue
@@ -305,7 +370,9 @@ def parse_listing(text, table):
         org += words * unit
         high_water = max(high_water, org)
 
-    return items, high_water // unit
+    # Round up, matching `assemble_pic18`'s own `vec![0u16; (bytes + 1) / 2]`:
+    # an odd trailing `db` byte still occupies a whole flash word.
+    return items, -(-high_water // unit)
 
 
 COND_BRANCH = {"BZ", "BNZ", "BC", "BNC", "BN", "BNN", "BOV", "BNOV"}
@@ -315,8 +382,17 @@ LITERAL_LOAD = {"MOVLW", "SUBLW", "XORLW"}
 LANE_ALU = {"ADDWF", "ADDWFC", "SUBWF", "SUBWFB", "XORWF", "IORWF", "ANDWF"}
 ROTATE = {"RLCF", "RRCF", "RLNCF", "RRNCF", "RLF", "RRF"}
 
-_PIC14_BANK_BIT = re.compile(r"^(STATUS|0x0*3)\s*,\s*[56]\b", re.I)
-_CARRY_CLEAR = re.compile(r"^(STATUS|0x0*3|0xFD8)\s*,\s*0\b", re.I)
+# STATUS is file 0x03 on PIC14 and 0xFD8 on PIC18, and each family's other
+# address is an ordinary GPR, so these patterns are not interchangeable:
+# `BSF 0x003,5` is a bank select on PIC14 and an ISR save-slot poke on PIC18.
+_BANK_BIT = {"pic14": re.compile(r"^(STATUS|0x0*3)\s*,\s*[56]\b", re.I)}
+_CARRY_BIT = {
+    "pic14": re.compile(r"^(STATUS|0x0*3)\s*,\s*0\b", re.I),
+    "pic18": re.compile(r"^(STATUS|0xFD8)\s*,\s*0\b", re.I),
+}
+
+# PIC18 SFRs live at 0xF80 and up; a MOVFF touching one is not a struct copy.
+PIC18_SFR_BASE = 0xF80
 
 
 @dataclasses.dataclass(frozen=True)
@@ -327,15 +403,17 @@ class Config:
     jump_table_run: int = 4
     compare_chain_units: int = 3
     shift_run: int = 3
+    family: str = "pic18"
 
 
-def is_bank_switch(item):
+def is_bank_switch(item, family):
     """A bank-select write: `MOVLB`/`BANKSEL`, or a PIC14 STATUS RP0/RP1 poke."""
     if item.mnemonic in ("MOVLB", "BANKSEL"):
         return True
-    return item.mnemonic in ("BSF", "BCF") and bool(
-        _PIC14_BANK_BIT.match(item.operands)
-    )
+    pattern = _BANK_BIT.get(family)
+    if pattern is None or item.mnemonic not in ("BSF", "BCF"):
+        return False
+    return bool(pattern.match(item.operands))
 
 
 def _first_operand(operands):
@@ -358,6 +436,26 @@ def _literal(item):
     return None
 
 
+def _in_scope(items, anchor, j):
+    """True when `j` is a real instruction still inside `anchor`'s function.
+
+    Matchers walk one flat list, so without this a run crosses function
+    boundaries: five adjacent one-instruction trap stubs (`f: GOTO f`) read
+    as a dispatch table, and a store/reload pair could straddle a label no
+    value survives.
+    """
+    return (
+        j < len(items)
+        and items[j].kind == "instr"
+        and items[j].function == items[anchor].function
+    )
+
+
+def _movff_operands(item):
+    """Both file addresses of a `MOVFF src, dst`, skipping symbolic ones."""
+    return [_parse_int(tok) for tok in item.operands.split(",")]
+
+
 def match_dead_roundtrip(items, i, cfg):
     """A value parked in a slot and read straight back out of it.
 
@@ -367,7 +465,7 @@ def match_dead_roundtrip(items, i, cfg):
     the W-tracking that fixed it.
     """
     del cfg
-    if i + 1 >= len(items) or items[i].mnemonic != "MOVWF":
+    if not _in_scope(items, i, i + 1) or items[i].mnemonic != "MOVWF":
         return 0
     slot = _dest_address(items[i])
     nxt = items[i + 1]
@@ -379,41 +477,65 @@ def match_dead_roundtrip(items, i, cfg):
     return 2 if nxt.mnemonic == "MOVF" and reads_into_w else 0
 
 
+def _movff_run(items, i, cfg):
+    """(length, touches_sfr) of the `MOVFF` run at `i`, or (0, False)."""
+    j = i
+    sfr = True
+    while _in_scope(items, i, j) and items[j].mnemonic == "MOVFF":
+        addrs = [a for a in _movff_operands(items[j]) if a is not None]
+        if not any(a >= PIC18_SFR_BASE for a in addrs):
+            sfr = False
+        j += 1
+    span = j - i
+    return (span, sfr) if span >= cfg.movff_run else (0, False)
+
+
+def match_sfr_context_save(items, i, cfg):
+    """A `MOVFF` run where every move touches an SFR: a context save.
+
+    The interrupt entry stub shuttles STATUS/BSR/FSR/PROD and the scratch
+    slots around its dispatch call. Counting that as a struct copy points
+    the reader at an aggregate-copy fix, and the actual fix is a narrower
+    live set or a shared save stub.
+    """
+    if cfg.family != "pic18":
+        return 0
+    span, sfr = _movff_run(items, i, cfg)
+    return span if sfr else 0
+
+
 def match_struct_copy(items, i, cfg):
     """MOVFF runs: a by-value struct or aggregate copy, 2 words per byte."""
-    j = i
-    while j < len(items) and items[j].mnemonic == "MOVFF":
-        j += 1
-    return j - i if j - i >= cfg.movff_run else 0
+    return _movff_run(items, i, cfg)[0]
 
 
 def match_jump_table(items, i, cfg):
     """A computed-jump dispatch table: a run of bare GOTOs, 2 words each."""
     j = i
-    while j < len(items) and items[j].mnemonic == "GOTO":
+    while _in_scope(items, i, j) and items[j].mnemonic == "GOTO":
         j += 1
     return j - i if j - i >= cfg.jump_table_run else 0
 
 
-def _compare_unit(items, i):
+def _compare_unit(items, anchor, i, family):
     """Length of one compare-against-literal-then-branch unit at `i`, else 0."""
     j = i
-    if j < len(items) and is_bank_switch(items[j]):
+    if _in_scope(items, anchor, j) and is_bank_switch(items[j], family):
         j += 1
-    if j >= len(items) or items[j].mnemonic not in LITERAL_LOAD:
+    if not _in_scope(items, anchor, j) or items[j].mnemonic not in LITERAL_LOAD:
         return 0
     j += 1
     alu = 0
-    while j < len(items) and items[j].mnemonic in COMPARE_ALU and alu < 3:
+    while _in_scope(items, anchor, j) and items[j].mnemonic in COMPARE_ALU and alu < 3:
         j += 1
         alu += 1
-    if j >= len(items):
+    if not _in_scope(items, anchor, j):
         return 0
     if items[j].mnemonic in COND_BRANCH:
         return j + 1 - i
     if items[j].mnemonic in SKIP_TEST:
         j += 1
-        if j < len(items) and items[j].mnemonic in ("GOTO", "BRA"):
+        if _in_scope(items, anchor, j) and items[j].mnemonic in ("GOTO", "BRA"):
             return j + 1 - i
     return 0
 
@@ -430,7 +552,7 @@ def match_compare_chain(items, i, cfg):
     units = 0
     tested = set()
     while True:
-        step = _compare_unit(items, j)
+        step = _compare_unit(items, i, j, cfg.family)
         if not step:
             break
         for k in range(j, j + step):
@@ -445,9 +567,9 @@ def match_compare_chain(items, i, cfg):
     return j - i if units >= cfg.compare_chain_units else 0
 
 
-def _store_unit(items, i):
+def _store_unit(items, anchor, i):
     """`MOVLW k; MOVWF f` as (length, literal, destination), else None."""
-    if i + 1 >= len(items):
+    if not _in_scope(items, anchor, i) or not _in_scope(items, anchor, i + 1):
         return None
     if items[i].mnemonic != "MOVLW" or items[i + 1].mnemonic != "MOVWF":
         return None
@@ -466,14 +588,14 @@ def match_wide_const(items, i, cfg):
     rule, which names the cheaper missed lowering.
     """
     del cfg
-    first = _store_unit(items, i)
+    first = _store_unit(items, i, i)
     if first is None:
         return 0
     _, lit, dest = first
     literals = [lit]
     j = i + 2
     while True:
-        nxt = _store_unit(items, j)
+        nxt = _store_unit(items, i, j)
         if nxt is None or nxt[2] != dest + 1:
             break
         literals.append(nxt[1])
@@ -495,9 +617,9 @@ def match_bool_materialization(items, i, cfg):
     """
     del cfg
     j = i
-    if j < len(items) and items[j].mnemonic == "BRA":
+    if items[j].mnemonic == "BRA":
         j += 1
-    if j + 2 >= len(items):
+    if not all(_in_scope(items, i, k) for k in (j, j + 1, j + 2)):
         return 0
     if items[j].mnemonic != "MOVLW" or items[j + 1].mnemonic != "BRA":
         return 0
@@ -511,25 +633,37 @@ def match_bool_materialization(items, i, cfg):
 
 def match_shift_chain(items, i, cfg):
     """A shift by a constant unrolled into one rotate per bit position."""
+    carry = _CARRY_BIT.get(cfg.family)
     j = i
-    while j < len(items):
+    end = i  # one past the last rotate, so a trailing carry clear that
+    # belongs to the next sequence is not absorbed
+    while _in_scope(items, i, j):
         mne = items[j].mnemonic
-        carry_clear = mne in ("BCF", "BSF") and _CARRY_CLEAR.match(items[j].operands)
-        if mne in ROTATE or carry_clear:
+        if mne in ROTATE:
+            j += 1
+            end = j
+            continue
+        if mne in ("BCF", "BSF") and carry and carry.match(items[j].operands):
             j += 1
             continue
         break
-    span = j - i
+    span = end - i
     if span < cfg.shift_run:
-        return 0
-    if not any(items[k].mnemonic in ROTATE for k in range(i, j)):
         return 0
     return span
 
 
-def _lane_unit(items, i):
-    """`MOVLW k; <alu> f,W` as (length, file address), else None."""
-    if i + 1 >= len(items):
+_WRITES_W = re.compile(r",\s*W\b", re.I)
+
+
+def _lane_unit(items, anchor, i):
+    """`MOVLW k; <alu> f,W` as (length, file address), else None.
+
+    The store is only part of the lane when the ALU op put its result in
+    W. With an `F` destination there is no W result, so a following
+    `MOVWF`/`MOVFF` belongs to something else.
+    """
+    if not _in_scope(items, anchor, i) or not _in_scope(items, anchor, i + 1):
         return None
     if items[i].mnemonic != "MOVLW" or items[i + 1].mnemonic not in LANE_ALU:
         return None
@@ -537,7 +671,10 @@ def _lane_unit(items, i):
     if addr is None:
         return None
     length = 2
-    if i + 2 < len(items) and items[i + 2].mnemonic in ("MOVWF", "MOVFF"):
+    stores_w = _WRITES_W.search(items[i + 1].operands) and _in_scope(
+        items, anchor, i + 2
+    )
+    if stores_w and items[i + 2].mnemonic in ("MOVWF", "MOVFF"):
         length = 3
     return length, addr
 
@@ -551,14 +688,14 @@ def match_wide_literal_arith(items, i, cfg):
     one value.
     """
     del cfg
-    first = _lane_unit(items, i)
+    first = _lane_unit(items, i, i)
     if first is None:
         return 0
     length, addr = first
     j = i + length
     lanes = 1
     while True:
-        nxt = _lane_unit(items, j)
+        nxt = _lane_unit(items, i, j)
         if nxt is None or nxt[1] != addr + 1:
             break
         addr = nxt[1]
@@ -570,7 +707,7 @@ def match_wide_literal_arith(items, i, cfg):
 def match_zero_init(items, i, cfg):
     """Zero written as `MOVLW 0x00` + `MOVWF`, where `CLRF` is one word."""
     del cfg
-    unit = _store_unit(items, i)
+    unit = _store_unit(items, i, i)
     if unit is None or unit[1] != 0:
         return 0
     return 2
@@ -578,8 +715,7 @@ def match_zero_init(items, i, cfg):
 
 def match_bank_switch(items, i, cfg):
     """A bank select. One word each, but the count tracks slot placement."""
-    del cfg
-    return 1 if is_bank_switch(items[i]) else 0
+    return 1 if is_bank_switch(items[i], cfg.family) else 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -593,6 +729,7 @@ class Rule:
 # reported as one materialisation, not a pair plus a stray store.
 SINK_RULES = (
     Rule("dead-store-reload", match_dead_roundtrip),
+    Rule("sfr-context-save", match_sfr_context_save),
     Rule("struct-copy-movff", match_struct_copy),
     Rule("switch-jump-table", match_jump_table),
     Rule("switch-compare-chain", match_compare_chain),
@@ -666,6 +803,7 @@ def render(summary, table, args):
     out.append(f"epic-cc density profile: {args.label}")
     out.append(f"word table  {table.describe()}")
     out.append(f"program     {_fmt_words(total)} flash words in the listing")
+    categories = dict(summary["categories"])
     if args.flash_words:
         residual = args.flash_words - total
         out.append(
@@ -674,6 +812,8 @@ def render(summary, table, args):
             "(far-branch expansion, PCL alignment padding)"
         )
         total = args.flash_words
+        if residual:
+            categories[CAT_RESIDUAL] = residual
     if args.xc8_words:
         ratio = total / args.xc8_words
         out.append(
@@ -684,7 +824,7 @@ def render(summary, table, args):
 
     out.append("By category")
     out.append(f"  {'category':<28}{'words':>9}{'%':>8}")
-    for cat, words in sorted(summary["categories"].items(), key=lambda kv: -kv[1]):
+    for cat, words in sorted(categories.items(), key=lambda kv: -kv[1]):
         out.append(f"  {cat:<28}{_fmt_words(words):>9}{_pct(words, total):>7.1f}%")
     out.append("")
 
@@ -782,6 +922,7 @@ def profile_text(text, args):
             jump_table_run=args.jump_table_run,
             compare_chain_units=args.compare_chain_units,
             shift_run=args.shift_run,
+            family=family,
         ),
     )
     return table, summarize(items, total)
@@ -797,7 +938,11 @@ def build_parser():
     p.add_argument("--compile", action="store_true", help="run epic-cc on the inputs")
     p.add_argument("--epic-cc", default="epic-cc", help="driver binary for --compile")
     p.add_argument(
-        "--cflag", action="append", default=[], help="extra driver flag (repeatable)"
+        "--cflag",
+        action="append",
+        default=[],
+        help="extra driver flag, repeatable, written --cflag=-Iinc so argparse "
+        "does not read the value as an option of its own",
     )
     p.add_argument("--device", help="device, e.g. 18F4550 (else read from `list p=`)")
     p.add_argument("--xc8-words", type=int, help="XC8 reference word count for a ratio")
@@ -836,11 +981,18 @@ def main(argv=None):
                 path = pathlib.Path(args.inputs[0])
             args.label = str(path if not args.compile else f"{args.device} build")
             table, summary = profile_text(path.read_text(), args)
+        if args.compare:
+            previous = json.loads(pathlib.Path(args.compare).read_text())
     except (ProfileError, OSError) as e:
         print(f"density-profile: {e}", file=sys.stderr)
         return 2
+    except json.JSONDecodeError as e:
+        print(
+            f"density-profile: {args.compare} is not --json output: {e}",
+            file=sys.stderr,
+        )
+        return 2
     if args.compare:
-        previous = json.loads(pathlib.Path(args.compare).read_text())
         print(render_compare(summary, previous, args.top))
         return 0
     if args.json:

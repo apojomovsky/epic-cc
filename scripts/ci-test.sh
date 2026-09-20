@@ -60,9 +60,10 @@ if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   } >> "$GITHUB_STEP_SUMMARY"
 fi
 
-# The device generator and the density profiler are python, so no cargo
-# invocation covers them. They gate the same data the gputils cross-check
-# does, and an unrun test is not a gate.
+# These tools are python, so no cargo invocation covers them, and an unrun
+# test is not a gate. The device generator gates the same data the gputils
+# cross-check does; the density profiler derives its word table from the
+# `asm` crate, so a change there has to keep it readable.
 echo "::group::python-tools"
 if python3 scripts/test_gen_device.py && python3 scripts/test_add_device.py && python3 scripts/test_gen_devices_manifest.py && python3 scripts/test_density_profile.py; then
   echo "PASS: python-tools"
