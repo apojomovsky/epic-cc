@@ -50,10 +50,6 @@ class ProfileError(RuntimeError):
     """A malformed input, or an asm-crate shape the word table cannot read."""
 
 
-# --------------------------------------------------------------------------
-# Word table, sourced from the asm crate
-# --------------------------------------------------------------------------
-
 _FN_PIC18 = "fn instruction_words_pic18"
 _FN_PIC14 = "fn assemble_first_pass"
 
@@ -146,10 +142,6 @@ def word_table(family, asm_source=None):
         return pic18_word_table(asm_source)
     return pic14_word_table(asm_source)
 
-
-# --------------------------------------------------------------------------
-# Parsing and attribution
-# --------------------------------------------------------------------------
 
 _LIST_DIRECTIVE = re.compile(r"\blist\s+p\s*=\s*p?(?P<part>[0-9a-z]+)", re.I)
 _LABEL = re.compile(r"^(?P<label>[A-Za-z_.$][A-Za-z0-9_.$]*)\s*:\s*(?P<rest>.*)$")
@@ -315,10 +307,6 @@ def parse_listing(text, table):
 
     return items, high_water // unit
 
-
-# --------------------------------------------------------------------------
-# Sink categorisation
-# --------------------------------------------------------------------------
 
 COND_BRANCH = {"BZ", "BNZ", "BC", "BNC", "BN", "BNN", "BOV", "BNOV"}
 SKIP_TEST = {"BTFSC", "BTFSS"}
@@ -640,11 +628,6 @@ def categorize(items, cfg=None):
     return items
 
 
-# --------------------------------------------------------------------------
-# Reporting
-# --------------------------------------------------------------------------
-
-
 def summarize(items, total_words):
     cells = {}
     per_function = {}
@@ -773,11 +756,6 @@ def render_compare(summary, previous, top):
     if not rows:
         out.append("  (no change)")
     return "\n".join(out)
-
-
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
 
 
 def compile_to_asm(args, workdir):
