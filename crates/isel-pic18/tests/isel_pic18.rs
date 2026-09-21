@@ -4743,6 +4743,33 @@ fn icmp_preclears_the_result_for_a_resolved_pointer_operand() {
 }
 
 #[test]
+fn join_agreement_elides_the_redundant_movlb() {
+    // Both arms leave BSR at bank 0, so the merge block's banked store
+    // must not re-select it. Without join tracking this emits 4 MOVLBs
+    // (entry, t, f, merge); with it, exactly 1. Both paths run in the
+    // simulator to prove the elision is sound, not just present.
+    let m = parse(
+        "global c i8\nglobal g i8\nglobal h i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    store i8 7 @g\n    br i1 %1 t f\n  block t:\n    store i8 8 @g\n    br merge\n  block f:\n    store i8 9 @g\n    br merge\n  block merge:\n    store i8 10 @h\n    ret void\n",
+    );
+    let addrs = addrs(&[("c", 0x10), ("g", 0x090), ("h", 0x091), ("main::1", 0x12)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        1,
+        "one MOVLB for the whole diamond:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect_g) in [(1u8, 8u8), (0, 9)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = c;
+        p.run(500);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x090], expect_g, "cond={c} took the wrong arm");
+        assert_eq!(p.ram()[0x091], 10, "merge store lost on cond={c}");
+    }
+}
+
+#[test]
 fn icmp_declines_when_the_result_slot_is_what_operand_b_reads() {
     // The soundness direction: `read` must contain every byte the compare
     // reads, so a result slot landing on them must decline. B's read here is
@@ -4766,5 +4793,119 @@ fn icmp_declines_when_the_result_slot_is_what_operand_b_reads() {
     assert!(
         !asm.contains("CLRF 0x033") && !asm.contains("CLRF 0x133"),
         "the guard must not clear a slot operand B is read from:\n{asm}"
+    );
+}
+
+#[test]
+fn join_disagreement_keeps_the_movlb() {
+    // Arms leave BSR at different banks, so the merge block must
+    // re-select. Total is 3: entry selects 0, f selects 1, merge
+    // re-selects 0. t's store elides through entry agreement.
+    let m = parse(
+        "global c i8\nglobal g i8\nglobal k i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    store i8 7 @g\n    br i1 %1 t f\n  block t:\n    store i8 8 @g\n    br merge\n  block f:\n    store i8 9 @k\n    br merge\n  block merge:\n    store i8 10 @g\n    ret void\n",
+    );
+    let addrs = addrs(&[("c", 0x10), ("g", 0x090), ("k", 0x190), ("main::1", 0x12)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        3,
+        "entry, f-arm, and merge each select:\n{asm}"
+    );
+    assert!(
+        block_section(&asm, "main_Lmerge").contains("MOVLB 0x0"),
+        "merge must re-select bank 0:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect_k) in [(1u8, 0u8), (0, 9)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = c;
+        p.run(500);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x090], 10, "merge store lost on cond={c}");
+        assert_eq!(p.ram()[0x190], expect_k, "k wrong on cond={c}");
+    }
+}
+
+#[test]
+fn loop_header_join_stays_unknown() {
+    // The latch back-edge is unrecorded when the header emits, so the
+    // header must not inherit the entry block's bank: its store
+    // re-selects. c=0 exits immediately; c=1 would loop forever, so
+    // only the exiting path runs.
+    let m = parse(
+        "global c i8\nglobal g i8\nglobal k i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @c\n    store i8 7 @g\n    br loop\n  block loop:\n    store i8 8 @k\n    br i1 %1 loop exit\n  block exit:\n    store i8 9 @g\n    ret void\n",
+    );
+    let addrs = addrs(&[("c", 0x10), ("g", 0x090), ("k", 0x190), ("main::1", 0x12)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        block_section(&asm, "main_Lloop").contains("MOVLB 0x1"),
+        "header must select bank 1 despite entry leaving 0:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x10] = 0;
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x190], 8, "loop body store lost");
+    assert_eq!(p.ram()[0x090], 9, "exit store lost");
+}
+
+#[test]
+fn dirty_terminator_poison_single_pred_taken_target() {
+    // The reviewer's trigger, end to end: the t edge exits the entry
+    // block before the f edge's phi copies run, and those copies select
+    // bank 1 while the taken path never selected anything (the cond
+    // load stages through MOVFF). Recording one end state per block
+    // would agree the taken target to bank 1 and elide its select,
+    // storing through the wrong bank. The dirty flag forces unknown
+    // instead: 2 MOVLBs (phi copy, taken store). Without it the count
+    // is 1 and the simulator catches the misbanked store.
+    let m = parse(
+        "global cond i8\nglobal out1 i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @cond\n    br i1 %1 t f\n  block t:\n    store i8 1 @out1\n    ret void\n  block f:\n    %2 = phi i8 9 entry\n    store i8 %2 @out1\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("cond", 0x090),
+        ("out1", 0x190),
+        ("main::1", 0x12),
+        ("main::2", 0x191),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        2,
+        "phi copy and taken store each select:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect) in [(1u8, 1u8), (0, 9)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x090] = c;
+        p.run(500);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x190], expect, "out1 wrong on cond={c}");
+    }
+}
+
+#[test]
+fn low_priority_epilogue_restores_bsr_after_the_banked_w_restore() {
+    // The W save slot lives in banked RAM, so its restore selects the
+    // save bank; without the re-restore that follows, main would resume
+    // against the save bank instead of its own (epic-cc#534 makes
+    // tracked agreement load-bearing there).
+    let m = parse(
+        "fn hi(void) [isr] [irq1] ()\n  block entry:\n    ret void\n\
+         fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm =
+        isel_pic18::select_with_locs(&PIC18F4550, &m, &addrs(&[]), Some(0x140), None, Some(0x150))
+            .0;
+    let w = asm.find("MOVF 0x140, W, B").expect("banked W restore");
+    let after_w = &asm[w..];
+    let re = after_w
+        .find("MOVFF 0x142, 0xFE0")
+        .expect("BSR re-restore after the W restore");
+    assert!(
+        after_w[re..].contains("RETFIE"),
+        "RETFIE follows the re-restore:\n{asm}"
     );
 }
