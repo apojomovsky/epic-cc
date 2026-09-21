@@ -2365,6 +2365,32 @@ impl<'m> Gen<'m> {
                             }
                             return;
                         }
+                        // 4-lane fused forms for amounts 6 and 7, verified
+                        // in crates/superopt (#549): rotate each byte right
+                        // by 8-r, then recombine high-to-low, each lane's
+                        // high r bits from its own byte and low 8-r bits from
+                        // the byte below. 25 words at r=6, 21 at r=7, against
+                        // the 30/35-word unroll. W-only. Only 6 and 7 clear
+                        // the `5r` unroll, so r=4/5 stay on their own arms.
+                        if n16 == 4 && m == 0 && (r == 6 || r == 7) {
+                            let rot = 8 - r;
+                            let (himask, lomask) = if r == 6 { (0xC0, 0x3F) } else { (0x80, 0x7F) };
+                            for _ in 0..rot {
+                                for b in (0..4u16).rev() {
+                                    self.emit_banked("RRNCF", dst + b, ",F");
+                                }
+                            }
+                            for b in (1..4u16).rev() {
+                                self.emit(format!("    MOVLW 0x{himask:02X}"));
+                                self.emit_banked("ANDWF", dst + b, ",F");
+                                self.emit_banked("MOVF", dst + b - 1, ",W");
+                                self.emit(format!("    ANDLW 0x{lomask:02X}"));
+                                self.emit_banked("IORWF", dst + b, ",F");
+                            }
+                            self.emit(format!("    MOVLW 0x{himask:02X}"));
+                            self.emit_banked("ANDWF", dst, ",F");
+                            return;
+                        }
                     }
                     for _ in 0..r {
                         match b.op {

@@ -202,3 +202,141 @@ fn left_shift_32bit_by_5_is_correct_and_also_loses() {
         "21 + 5 = 26 words against the 25-word unroll: the cost model is 5r+1 vs 5r"
     );
 }
+
+// epic-cc#549: fused 32-bit left shifts at amounts 6 and 7. The ticket's
+// amount-7 byte-move form is unsound (the byte move drops bits 24-25 of x);
+// the sound construction is the 4-lane generalisation of the landed 16-bit
+// amount-6 family. Full derivation and measured word counts are in
+// docs/41-superopt-spike-findings.md, Target 3; the tests below are the
+// gate that keeps those claims honest.
+
+/// A much wider operand set than `sample_words`, for the fused forms that
+/// actually win and so will be wired: every value in each byte lane
+/// independently (4 * 256 cases, catching any per-lane mask or index error),
+/// a few cross-lane patterns, and a deterministic pseudo-random sweep for
+/// the carry interactions across lane boundaries. Still not the full 2^32
+/// domain (days at this crate's per-case cost), but structurally exhaustive
+/// in the dimension a fixed construction can get wrong: which bits of which
+/// byte land where.
+fn swept_words() -> Vec<[u8; 4]> {
+    let mut v: Vec<[u8; 4]> = Vec::new();
+    // Baseline pattern with distinctive bytes in every position.
+    let base = [0x12u8, 0x34, 0x56, 0x78];
+    for lane in 0..4usize {
+        for b in 0..=u8::MAX {
+            let mut w = base;
+            w[lane] = b;
+            v.push(w);
+        }
+    }
+    // Boundary and alternating patterns.
+    for w in [
+        [0x00, 0x00, 0x00, 0x00],
+        [0xFF, 0xFF, 0xFF, 0xFF],
+        [0x01, 0x00, 0x00, 0x80],
+        [0x80, 0x00, 0x00, 0x01],
+        [0xAA, 0x55, 0xAA, 0x55],
+    ] {
+        v.push(w);
+    }
+    // Deterministic LCG: no dependency on a thread RNG, reproducible across
+    // runs so a failure is always replayable.
+    let mut state: u32 = 0x1234_5678;
+    for _ in 0..4096 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        v.push(state.to_le_bytes());
+    }
+    v
+}
+
+/// The general 4-lane left-shift family: rotate every byte right by `8 - r`
+/// with `RRNCF`, then recombine high-to-low. The `MOVLW` literals are static
+/// because `Candidate` holds `&'static str`.
+fn construction_shl_family(r: u32) -> Candidate {
+    // (rotate count, MOVLW hi, MOVLW lo) per amount with a fused form.
+    let (rot, hi, lo) = match r {
+        6 => (2, "movlw 0xC0", "andlw 0x3F"),
+        7 => (1, "movlw 0x80", "andlw 0x7F"),
+        _ => unreachable!("only the amounts with a fused form"),
+    };
+    let mut c: Candidate = Vec::new();
+    for _ in 0..rot {
+        for a in [
+            "rrncf 0x023,F,A",
+            "rrncf 0x022,F,A",
+            "rrncf 0x021,F,A",
+            "rrncf 0x020,F,A",
+        ] {
+            c.push(a);
+        }
+    }
+    // Combine high-to-low so each lane reads its pristine lower neighbour
+    // before that neighbour is rewritten.
+    for b in (1..4usize).rev() {
+        // Lane `b` lives at 0x020 + b; its lower neighbour at 0x020 + b - 1.
+        c.push(hi);
+        c.push(["andwf 0x021,F,A", "andwf 0x022,F,A", "andwf 0x023,F,A"][b - 1]);
+        c.push(["movf 0x020,W,A", "movf 0x021,W,A", "movf 0x022,W,A"][b - 1]);
+        c.push(lo);
+        c.push(["iorwf 0x021,F,A", "iorwf 0x022,F,A", "iorwf 0x023,F,A"][b - 1]);
+    }
+    c.push(hi);
+    c.push("andwf 0x020,F,A");
+    c
+}
+
+#[test]
+fn left_shift_32bit_by_6_fused_form_wins() {
+    let c = construction_shl_family(6);
+    assert_eq!(c.len(), 25, "4*2 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shl, 6, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-6 form must be correct over the sample"
+    );
+    assert!(c.len() < 5 * 6, "25 words beats the 30-word unroll");
+}
+
+#[test]
+fn left_shift_32bit_by_7_fused_form_wins() {
+    let c = construction_shl_family(7);
+    assert_eq!(c.len(), 21, "4*1 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shl, 7, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-7 form must be correct over the sample"
+    );
+    assert!(c.len() < 5 * 7, "21 words beats the 35-word unroll");
+}
+
+#[test]
+fn the_tickets_amount7_byte_move_form_is_unsound() {
+    // The decomposition the ticket proposed, implemented as a byte move plus
+    // a rotate. It must FAIL verification: that failure is the reason the
+    // family form above exists. If this ever passes, the sample has gone
+    // blind to the lost-bits witness and needs widening.
+    let c: Candidate = vec![
+        // x <<= 8 as a byte move: dst[3..1] = src[2..0], dst[0] = 0
+        "movff 0x022,0x023",
+        "movff 0x021,0x022",
+        "movff 0x020,0x021",
+        "clrf 0x020,A",
+        // >>= 1
+        "bcf 0xFD8,0,A",
+        "rrcf 0x023,F,A",
+        "rrcf 0x022,F,A",
+        "rrcf 0x021,F,A",
+        "rrcf 0x020,F,A",
+    ];
+    assert!(
+        !verify(
+            &c,
+            &cases_with(u32::wrapping_shl, 7, &swept_words(), W_SAMPLE)
+        ),
+        "the byte-move form drops bits 24-25 of x and must not verify"
+    );
+}
