@@ -2955,11 +2955,10 @@ impl<'m> Gen<'m> {
     ///
     /// Zeroing first lets the compare's branches select between "leave it
     /// zero" and a single `INCF`, which is what removes the diamond. It is
-    /// only sound when `dst` overlaps nothing the compare reads: `alloc`
-    /// genuinely overlays a definition with a dead operand of the same
-    /// value (see the in-place shift test), so an `icmp` whose result slot
-    /// aliases an operand byte would have that operand cleared before it
-    /// was ever compared.
+    /// only sound when `dst` overlaps nothing the compare reads: the
+    /// layout may place a definition over an operand's storage, and
+    /// clearing such a slot would destroy the operand before it is ever
+    /// compared.
     fn bool_result_preclear(&self, a: &Val, b: &Val, dst: &str, bytes: u8) -> Option<u16> {
         /// The bytes `v` is read from, or `None` when that cannot be
         /// pinned to one base: a literal and a function label read no
