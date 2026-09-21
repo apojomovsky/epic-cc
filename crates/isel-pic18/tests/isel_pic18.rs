@@ -142,6 +142,225 @@ fn const_shl_i16_emits_rlcf_chain() {
     );
 }
 
+/// Compiles `out = a << k` (i16) through the real selector, assembles, and
+/// simulates every 16-bit input against the shift's arithmetic meaning,
+/// with a per-case entry W so a construction that depends on stale W
+/// fails loudly instead of only on curated inputs.
+fn assert_shl16_domain_exact(k: i64) {
+    let m = parse(&format!(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = shl i16 %1, {k}\n    store i16 %2 @out\n    ret void\n"
+    ));
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..=u16::MAX {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x20] = x as u8;
+        p.ram_mut()[0x21] = (x >> 8) as u8;
+        p.set_w((x as u8) ^ ((x >> 8) as u8));
+        p.run(200);
+        let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+        assert_eq!(got, x << k, "a={x:#06x} << {k}");
+        assert!(p.halted(), "program must run to completion (a={x:#06x})");
+    }
+}
+
+#[test]
+fn const_shl_i16_constructions_are_exact_for_amounts_4_to_7() {
+    for k in [4, 5, 6, 7] {
+        assert_shl16_domain_exact(k);
+    }
+}
+
+#[test]
+fn const_shl_i16_by_4_drops_the_per_bit_unroll() {
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = shl i16 %1, 4\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
+    assert_eq!(asm.matches("SWAPF").count(), 3, "nibble swap x3:\n{asm}");
+    assert_eq!(asm.matches("ANDWF").count(), 2, "two masks:\n{asm}");
+    assert_eq!(
+        asm.matches("IORWF").count(),
+        1,
+        "one straddled-nibble recombine:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("BCF 0xFD8,0,A").count(),
+        0,
+        "no carry clears:\n{asm}"
+    );
+}
+
+#[test]
+fn const_shl_i16_by_7_becomes_a_right_shift_and_byte_move() {
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = shl i16 %1, 7\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
+    assert_eq!(
+        asm.matches("RRCF").count(),
+        3,
+        "x >> 1 twice through C, then place the last bit:\n{asm}"
+    );
+}
+
+#[test]
+fn const_shl_i16_by_2_keeps_the_unrolled_form() {
+    // Amounts 2 and 3 have no verified shortcut: superopt found nothing
+    // within a tractable search bound (docs/41). Pin that no special case
+    // silently fires for them.
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = shl i16 %1, 2\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("RLCF").count(), 4, "2 steps x 2 bytes:\n{asm}");
+    assert_eq!(
+        asm.matches("BCF 0xFD8,0,A").count(),
+        2,
+        "clear carry before each shift step:\n{asm}"
+    );
+}
+
+#[test]
+fn const_shl_i32_by_4_keeps_the_unrolled_form() {
+    // The 16-bit constructions do not extend to 4 lanes without their own
+    // superopt verification (docs/41 defers this); the unroll must stay.
+    let m = parse(
+        "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+         %1 = load i32 @a\n    %2 = shl i32 %1, 4\n    store i32 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("RLCF").count(), 16, "4 steps x 4 bytes:\n{asm}");
+    assert_eq!(
+        asm.matches("BCF 0xFD8,0,A").count(),
+        4,
+        "clear carry before each shift step:\n{asm}"
+    );
+}
+
+#[test]
+fn const_lshr_i16_by_4_keeps_the_unrolled_form() {
+    // Only left shifts have superopt-verified constructions so far; a
+    // right shift must not fire the left-shift special cases.
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = lshr i16 %1, 4\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("RRCF").count(), 8, "4 steps x 2 bytes:\n{asm}");
+    assert_eq!(
+        asm.matches("BCF 0xFD8,0,A").count(),
+        4,
+        "clear carry before each shift step:\n{asm}"
+    );
+}
+
+#[test]
+fn const_shl_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
+    let m = parse(
+        "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+         %1 = load i8 @a\n    %2 = shl i8 %1, 4\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
+    assert_eq!(
+        asm.matches("SWAPF 0x023,W,A").count(),
+        1,
+        "swap through W, mask, store:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for b in 0..=u8::MAX {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x20] = b;
+        p.set_w(!b);
+        p.run(200);
+        assert_eq!(p.ram()[0x21], b << 4, "a={b:#04x} << 4");
+        assert!(p.halted(), "program must run to completion (a={b:#04x})");
+    }
+}
+
+#[test]
+fn const_shl_i16_by_12_rotates_only_the_surviving_lane() {
+    // k = 12 splits into a one-byte move plus a 4-bit residual over the
+    // single surviving lane: the SWAPF trick applies there, not the
+    // 16-bit construction, and no RLCF step may remain.
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+         %1 = load i16 @a\n    %2 = shl i16 %1, 12\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
+    assert_eq!(
+        asm.matches("SWAPF 0x029,W,A").count(),
+        1,
+        "residual on the surviving lane only:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..=u16::MAX {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x20] = x as u8;
+        p.ram_mut()[0x21] = (x >> 8) as u8;
+        p.set_w((x as u8) & ((x >> 8) as u8));
+        p.run(200);
+        let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+        assert_eq!(got, x << 12, "a={x:#06x} << 12");
+    }
+}
+
 #[test]
 fn const_ashr_i32_sign_fills() {
     let m = parse(

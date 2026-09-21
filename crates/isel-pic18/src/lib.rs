@@ -2112,12 +2112,6 @@ impl<'m> Gen<'m> {
                 // panic below.
                 let av = self.val_addr(&b.a).direct();
                 let dst = self.slot_addr(self.cur_func, &b.dst).direct();
-                // the constant-count shifts: a const count inlines as a fixed
-                // RLCF/RRCF sequence; k == 0 is a plain copy; k >= width is
-                // LLVM poison and panics. A variable (reg) count must
-                // never reach isel: legalize rewrites it to a routine call.
-                // Without this arm a shift would hit the `(other, _)`
-                // panic below.
                 if matches!(b.op, ir::BinOp::Shl | ir::BinOp::LShr | ir::BinOp::AShr) {
                     let width = i64::from(n) * 8;
                     let k = match &b.b {
@@ -2195,6 +2189,72 @@ impl<'m> Gen<'m> {
                         }
                     }
                     let active = n16 - m;
+                    // Nibble-boundary left shifts have shorter, sim-verified
+                    // forms than the per-bit unroll (crates/superopt, docs/41):
+                    // one lane shifts by 4 as SWAPF+mask, and an in-place
+                    // 16-bit pair has a canned construction per amount 4-7,
+                    // each checked over the full 65536-input domain. They
+                    // clobber W, dead at statement entry (no lowering reads W
+                    // before writing it; W tracking is #502), and STATUS no
+                    // worse than the unroll they replace.
+                    if b.op == ir::BinOp::Shl && r > 0 {
+                        if active == 1 && r == 4 {
+                            let (a, f) = self.operand(dst + m);
+                            let bank = if a == 0 { "A" } else { "B" };
+                            self.emit(format!("    SWAPF 0x{f:03X},W,{bank}"));
+                            self.emit("    ANDLW 0xF0".to_string());
+                            self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                            return;
+                        }
+                        if n16 == 2 && m == 0 && (4..=7).contains(&r) {
+                            let (la, lf) = self.operand(dst);
+                            let (ha, hf) = self.operand(dst + 1);
+                            let lbank = if la == 0 { "A" } else { "B" };
+                            let hbank = if ha == 0 { "A" } else { "B" };
+                            match r {
+                                4 | 5 => {
+                                    self.emit(format!("    SWAPF 0x{hf:03X},F,{hbank}"));
+                                    self.emit("    MOVLW 0xF0".to_string());
+                                    self.emit(format!("    ANDWF 0x{hf:03X},F,{hbank}"));
+                                    self.emit(format!("    SWAPF 0x{lf:03X},W,{lbank}"));
+                                    self.emit("    ANDLW 0x0F".to_string());
+                                    self.emit(format!("    IORWF 0x{hf:03X},F,{hbank}"));
+                                    self.emit(format!("    SWAPF 0x{lf:03X},F,{lbank}"));
+                                    self.emit("    MOVLW 0xF0".to_string());
+                                    self.emit(format!("    ANDWF 0x{lf:03X},F,{lbank}"));
+                                    if r == 5 {
+                                        self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+                                        self.emit(format!("    RLCF 0x{lf:03X},F,{lbank}"));
+                                        self.emit(format!("    RLCF 0x{hf:03X},F,{hbank}"));
+                                    }
+                                }
+                                6 => {
+                                    self.emit(format!("    RRNCF 0x{hf:03X},F,{hbank}"));
+                                    self.emit(format!("    RRNCF 0x{hf:03X},F,{hbank}"));
+                                    self.emit("    MOVLW 0xC0".to_string());
+                                    self.emit(format!("    ANDWF 0x{hf:03X},F,{hbank}"));
+                                    self.emit(format!("    RRNCF 0x{lf:03X},F,{lbank}"));
+                                    self.emit(format!("    RRNCF 0x{lf:03X},F,{lbank}"));
+                                    self.emit(format!("    MOVF 0x{lf:03X},W,{lbank}"));
+                                    self.emit("    ANDLW 0x3F".to_string());
+                                    self.emit(format!("    IORWF 0x{hf:03X},F,{hbank}"));
+                                    self.emit("    MOVLW 0xC0".to_string());
+                                    self.emit(format!("    ANDWF 0x{lf:03X},F,{lbank}"));
+                                }
+                                7 => {
+                                    self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+                                    self.emit(format!("    RRCF 0x{hf:03X},F,{hbank}"));
+                                    self.emit(format!("    RRCF 0x{lf:03X},F,{lbank}"));
+                                    self.emit(format!("    MOVF 0x{lf:03X},W,{lbank}"));
+                                    self.emit(format!("    MOVWF 0x{hf:03X},{hbank}"));
+                                    self.emit(format!("    CLRF 0x{lf:03X},{lbank}"));
+                                    self.emit(format!("    RRCF 0x{lf:03X},F,{lbank}"));
+                                }
+                                _ => unreachable!(),
+                            }
+                            return;
+                        }
+                    }
                     for _ in 0..r {
                         match b.op {
                             ir::BinOp::Shl => {
