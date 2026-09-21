@@ -1264,3 +1264,83 @@ fn priority_regions_are_disjoint_with_low_save() {
         "high frames must sit above low frames (hi = {hi_min:#X}, lo = {lo_max:#X})"
     );
 }
+
+/// epic-cc#482: PIC18's access bank is the low 0x000-0x05F of RAM, the only
+/// window `isel-pic18` addresses without a `MOVLB`. The frame overlay is what
+/// direct file-register operands name, so it goes there and the globals move
+/// above it, the reverse of the PIC14 order.
+#[test]
+fn pic18_places_the_frame_overlay_below_the_globals() {
+    let m = overlay_module();
+    let out = allocate(&PIC18F4550, &m, "edge main a\nedge main b\n");
+    // main's i8 takes the GPR start; a and b never co-live, so both take
+    // the i16 slot above it (a0 and a1 are dead defs and share it). The
+    // overlay therefore ends at 0x13, which is where the only global goes.
+    assert_eq!(out.locals["main::m0"], 0x10);
+    assert_eq!(out.locals["a::a0"], 0x11);
+    assert_eq!(out.locals["b::b0"], 0x11);
+    assert_eq!(out.globals["in"], 0x13);
+}
+
+/// A global pinned by address inside the span the overlay wants has nowhere
+/// to go, so that module keeps the globals-first layout and the frames start
+/// above every pinned address.
+#[test]
+fn pic18_keeps_globals_first_when_a_pinned_global_blocks_the_overlay() {
+    let m = parse(
+        "global pinned i8 @0x12\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %m0 = load i8 @pinned\n\
+             call void @a()\n\
+             ret void\n\
+         fn a(void) ()\n\
+           block entry:\n\
+             %a0 = add i16 1, 2\n\
+             %a1 = add i16 3, 4\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC18F4550, &m, "edge main a\n");
+    assert_eq!(
+        out.globals["pinned"], 0x12,
+        "a pinned global keeps its address"
+    );
+    let frame_low = out.locals.values().copied().min().expect("locals");
+    assert!(
+        frame_low > 0x12,
+        "frames must clear the pinned global (lowest frame byte {frame_low:#X})"
+    );
+}
+
+/// PIC14 has no access bank, so its layout is untouched: globals from the
+/// GPR start, frames above them.
+#[test]
+fn pic14_keeps_globals_first() {
+    let m = overlay_module();
+    let out = allocate(&PIC16F877A, &m, "edge main a\nedge main b\n");
+    assert_eq!(out.globals["in"], PIC16F877A.gpr_start());
+    let frame_low = out.locals.values().copied().min().expect("locals");
+    assert!(
+        frame_low > out.globals["in"],
+        "PIC14 frames still follow the globals"
+    );
+}
+
+/// A PIC18 whose RAM is two GPR regions with a hole between them
+/// (`p18f2450`) has to keep the globals above the overlay's PHYSICAL end,
+/// which `place_contiguous` may have lifted across the hole, not above the
+/// byte count of its frames.
+#[test]
+fn pic18_two_region_device_keeps_the_globals_above_the_overlay() {
+    let dev = device::resolve("p18f2450").expect("p18f2450 is a known device");
+    assert_eq!(dev.ram_banks.len(), 2, "the point of this fixture");
+    let m = overlay_module();
+    let out = allocate(dev, &m, "edge main a\nedge main b\n");
+    assert_eq!(out.locals["main::m0"], dev.gpr_start());
+    let frame_top = out.locals.values().copied().max().expect("locals") + 2;
+    assert!(
+        out.globals["in"] >= frame_top,
+        "globals must clear the overlay (in = {:#X}, frame top = {frame_top:#X})",
+        out.globals["in"]
+    );
+}

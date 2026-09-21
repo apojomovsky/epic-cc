@@ -11,82 +11,35 @@
 
 use std::process::Command;
 
-fn header_dir() -> std::path::PathBuf {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tid = format!("{:?}", std::thread::current().id());
-    let dir = std::env::temp_dir()
-        .join(format!("cc2-test-{}-{}-{}", std::process::id(), tid, ns))
-        .join("include");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("stdint.h"), driver::stdint_h::STDINT_H).unwrap();
-    std::fs::write(dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H).unwrap();
-    std::fs::write(dir.join("stddef.h"), driver::stddef_h::STDDEF_H).unwrap();
-    std::fs::write(dir.join("string.h"), driver::string_h::STRING_H).unwrap();
-    std::fs::write(dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).unwrap();
-    dir
-}
-
-fn compile_ll(clang: &str, resdir: &str, hdir: &std::path::Path, src: &str) -> String {
-    driver::clang::compile_to_stdout(
-        std::path::Path::new(clang),
-        std::path::Path::new(resdir),
-        std::path::Path::new(src),
-        &driver::clang::Options {
-            header_dir: Some(hdir.to_path_buf()),
-            ..Default::default()
-        },
-    )
-}
-
-/// Rebuild the address map the driver computes for `fixture`, mirroring
-/// `main.rs`: the extra `string.h` translation unit is appended to the user's
-/// module before the whole-program stages run.
-fn layout_for(device: &device::Device, fixture: &str) -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let hdir = header_dir();
-    let mut m = irparse::parse_ll(&compile_ll(
-        clang.to_str().unwrap(),
-        resdir.to_str().unwrap(),
-        &hdir,
-        fixture,
-    ));
-
-    let src_text = std::fs::read_to_string(fixture).unwrap_or_default();
-    if src_text
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
         .lines()
-        .any(|l| l.contains("#include") && l.contains("string.h"))
-    {
-        let c_path = hdir.parent().unwrap().join("__epic_string.c");
-        std::fs::write(&c_path, driver::string_c::STRING_C).unwrap();
-        let mut sm = irparse::parse_ll(&compile_ll(
-            clang.to_str().unwrap(),
-            resdir.to_str().unwrap(),
-            &hdir,
-            c_path.to_str().unwrap(),
-        ));
-        m.funcs.extend(sm.funcs.drain(..));
-        m.globals.extend(sm.globals.drain(..));
-        m.module_asm.extend(sm.module_asm.drain(..));
-    }
-
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    alloc::allocate(device, &m, &callgraph::edges_text(&cg))
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 fn run_cc2(device_name: &str, device: &device::Device) {
     let fixture = "tests/fixtures/cc2_string.c";
     let hex_path = format!("tests/fixtures/cc2_string_{device_name}.hex");
-    let layout = layout_for(device, fixture);
-    let in_addr = *layout.globals.get("in").expect("in") as usize;
-    let out_addr = *layout.globals.get("out").expect("out") as usize;
+    let map_path = format!("tests/fixtures/cc2_string_{device_name}.map");
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([fixture, "-o", &hex_path, "--device", device_name])
+        .args([
+            fixture,
+            "-o",
+            &hex_path,
+            "--map",
+            &map_path,
+            "--device",
+            device_name,
+        ])
         .output()
         .expect("run driver");
     assert!(
@@ -95,6 +48,9 @@ fn run_cc2(device_name: &str, device: &device::Device) {
         String::from_utf8_lossy(&out.stderr)
     );
     let hex = std::fs::read_to_string(&hex_path).expect("read hex");
+    let map = std::fs::read_to_string(&map_path).expect("read map");
+    let _ = std::fs::remove_file(&map_path);
+    let (in_addr, out_addr) = (map_addr(&map, "in"), map_addr(&map, "out"));
 
     // in = 7, so every check passing sums to 26 (see the fixture).
     let expected: u8 = 26;

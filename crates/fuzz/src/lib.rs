@@ -2584,16 +2584,16 @@ fn run_pic(
     dir: &WorkDir,
     device: &device::Device,
 ) -> Result<u32, Failure> {
-    let layout = pic_layout(c_path, device)?;
-    let checksum_addr = *layout.globals.get(&program.checksum_name).ok_or_else(|| {
+    let hex_path = dir.path.join("prog.hex");
+    let map_path = dir.path.join("prog.map");
+    run_driver(c_path, &hex_path, &map_path, device)?;
+    let layout = driver_globals(&map_path)?;
+    let checksum_addr = *layout.get(&program.checksum_name).ok_or_else(|| {
         Failure::new(
             FailureKind::Compile,
             format!("no global '{}' in the alloc map", program.checksum_name),
         )
     })?;
-
-    let hex_path = dir.path.join("prog.hex");
-    run_driver(c_path, &hex_path, device)?;
 
     let hex = std::fs::read_to_string(&hex_path).map_err(|e| {
         Failure::new(
@@ -2605,7 +2605,7 @@ fn run_pic(
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
             for input in &program.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                let addr = *layout.get(&input.name).ok_or_else(|| {
                     Failure::new(
                         FailureKind::Compile,
                         format!("no global '{}' in the alloc map", input.name),
@@ -2625,7 +2625,7 @@ fn run_pic(
         device::Core::Pic14 => {
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
             for input in &program.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                let addr = *layout.get(&input.name).ok_or_else(|| {
                     Failure::new(
                         FailureKind::Compile,
                         format!("no global '{}' in the alloc map", input.name),
@@ -2645,7 +2645,7 @@ fn run_pic(
         device::Core::Pic14e => {
             let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
             for input in &program.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                let addr = *layout.get(&input.name).ok_or_else(|| {
                     Failure::new(
                         FailureKind::Compile,
                         format!("no global '{}' in the alloc map", input.name),
@@ -2665,7 +2665,7 @@ fn run_pic(
         device::Core::PicBaseline => {
             let mut p = pic14_sim::PicBaseline::with_device(device, pic14_sim::parse_hex(&hex));
             for input in &program.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
+                let addr = *layout.get(&input.name).ok_or_else(|| {
                     Failure::new(
                         FailureKind::Compile,
                         format!("no global '{}' in the alloc map", input.name),
@@ -3104,88 +3104,72 @@ fn host_clang() -> String {
     std::env::var("PIC8_HOST_CLANG").unwrap_or_else(|_| "clang".to_string())
 }
 
-/// The globals addresses: the same pipeline the driver runs (mirroring the
-/// driver long e2e). Pipeline panics (a compiler bug) report as `Panic` so
-/// the fuzz loop survives them.
-fn pic_layout(c_path: &Path, device: &device::Device) -> Result<alloc::AllocLayout, Failure> {
-    let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
-    let ll = Command::new(&clang)
-        .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-g",
-            "-resource-dir",
-            &resdir,
-            "-o",
-            "-",
-        ])
-        .arg(c_path)
-        .output()
-        .map_err(|e| {
+/// The global addresses the driver actually used, read off its own `--map`
+/// output. Re-deriving them from a second in-process pipeline drifts the
+/// moment the driver's differs by one option (PIC18 alone parses with
+/// switches preserved), and since the frames sit below the globals on PIC18
+/// a difference that far upstream moves every global address, so the
+/// seeding and the checksum read would land on the wrong bytes.
+fn driver_globals(map_path: &Path) -> Result<HashMap<String, u16>, Failure> {
+    let text = std::fs::read_to_string(map_path)
+        .map_err(|e| Failure::new(FailureKind::Harness, format!("read the driver map: {e}")))?;
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("global ") else {
+            continue;
+        };
+        let mut it = rest.split_whitespace();
+        let (Some(name), Some(addr)) = (it.next(), it.next()) else {
+            continue;
+        };
+        let addr = addr.strip_prefix("0x").unwrap_or(addr);
+        let addr = u16::from_str_radix(addr, 16).map_err(|e| {
             Failure::new(
                 FailureKind::Harness,
-                format!("run clang for the layout: {e}"),
+                format!("map line {line:?} has no hex address: {e}"),
             )
         })?;
-    if !ll.status.success() {
-        return Err(Failure::new(
-            FailureKind::Compile,
-            format!(
-                "clang (layout) failed: {}",
-                String::from_utf8_lossy(&ll.stderr)
-            ),
-        ));
+        out.insert(name.to_string(), addr);
     }
-    let ll_text = String::from_utf8(ll.stdout)
-        .map_err(|e| Failure::new(FailureKind::Harness, format!("clang stdout: {e}")))?;
-    std::panic::catch_unwind(AssertUnwindSafe(|| {
-        let mut m = irparse::parse_ll(&ll_text);
-        m = wholeprog::merge(m);
-        m = legalize::legalize(m);
-        let cg = callgraph::build(&m);
-        alloc::allocate(device, &m, &callgraph::edges_text(&cg))
-    }))
-    .map_err(|p| {
-        let msg = p
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| p.downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("unknown panic");
-        Failure::new(
-            FailureKind::Panic,
-            format!("compiler pipeline panic: {msg}"),
-        )
-    })
+    Ok(out)
 }
 
 /// Run the driver binary (a workspace member) over the C file to produce the
 /// hex, passing the PIC clang env vars it expects. A failed driver signals a
 /// compiler panic or an unsupported construct.
-fn run_driver(c_path: &Path, hex_path: &Path, device: &device::Device) -> Result<(), Failure> {
+fn run_driver(
+    c_path: &Path,
+    hex_path: &Path,
+    map_path: &Path,
+    device: &device::Device,
+) -> Result<(), Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let driver = driver_binary(device).map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let out = Command::new(&driver)
         .arg(c_path)
         .arg("-o")
         .arg(hex_path)
+        .arg("--map")
+        .arg(map_path)
         .args(["--device", device.name])
         .env("PIC8_CLANG_UNWRAPPED", &clang)
         .env("PIC8_CLANG_RESOURCE_DIR", &resdir)
         .output()
         .map_err(|e| Failure::new(FailureKind::Harness, format!("run the driver: {e}")))?;
     if !out.status.success() {
-        return Err(Failure::new(
-            FailureKind::Panic,
-            format!(
-                "driver failed (a compiler panic or an unsupported construct): {}",
-                String::from_utf8_lossy(&out.stderr)
-            ),
-        ));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Compiler-side failure versus clang rejecting the source. The
+        // reducer keys off the kind, so calling a front-end error a
+        // compiler panic lets it reduce a panic case down to a program
+        // that no longer compiles. Both compiler-side shapes count: an
+        // actual panic, and the driver's own `epic-cc:` diagnostics, which
+        // exit non-zero without unwinding.
+        let kind = if stderr.contains("panicked at") || stderr.contains("epic-cc:") {
+            FailureKind::Panic
+        } else {
+            FailureKind::Compile
+        };
+        return Err(Failure::new(kind, format!("driver failed: {stderr}")));
     }
     Ok(())
 }

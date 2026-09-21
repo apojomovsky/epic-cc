@@ -2927,6 +2927,117 @@ fn a_width2_small_scale_index_adds_the_high_byte_in_sim() {
 }
 
 #[test]
+fn a_call_defined_index_width_folds_the_high_byte() {
+    // The real frontend shape for a float-derived index: legalize
+    // rewrites `(int)f` into a `__fptosi_f32` call, so the index
+    // register is defined by a Call, not a FloatConv. Its width rides
+    // the call's type, and the naive term must fold the high byte.
+    // (epic-cc#488)
+    let m = parse(
+        "global recs i8\n\
+         global fv float\n\
+         global out i8\n\
+         fn __fptosi_f32(i16) (val=i32)\n\
+           block entry:\n\
+             %__scr = alloca 8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %f = load float @fv\n\
+             %i = call i16 @__fptosi_f32(float %f)\n\
+             %p = gep @recs +0 +2*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("recs", 0x120),
+        ("fv", 0x150),
+        ("out", 0x154),
+        ("main::f", 0x156),
+        ("main::i", 0x15A),
+        ("main::v", 0x15C),
+        ("__fptosi_f32::val", 0x160),
+        ("__fptosi_f32::__scr", 0x164),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("LFSR 0, 0x000") && !asm.contains("LFSR 0,0x000"),
+        "stride 2 keeps the naive unrolled adds:\n{asm}"
+    );
+    // The index slot 0x15A is banked, so the high byte reads as 0x05B.
+    assert_eq!(
+        asm.matches("MOVF 0x05B").count(),
+        2,
+        "both unrolled adds must fold the index high byte:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    // 304.0f = 0x43980000 at @fv: the routine converts it to index
+    // 0x0130, so the high byte is nonzero and a width-1 fold lands
+    // elsewhere.
+    for (i, b) in 304.0f32.to_le_bytes().iter().enumerate() {
+        p.ram_mut()[0x150 + i] = *b;
+    }
+    p.ram_mut()[0x380] = 0x6E; // recs + 2*0x0130
+    p.ram_mut()[0x180] = 0x91; // the byte a dropped high byte would read
+    p.run(100_000);
+    assert_eq!(
+        p.ram()[0x154],
+        0x6E,
+        "out must be recs[2*0x0130], not the low-byte-only address"
+    );
+}
+
+#[test]
+fn a_va_arg_defined_index_width_folds_the_high_byte() {
+    // The one width arm among the ticket's four that is reachable in the
+    // driver pipeline: a `va_arg i16` result used as a GEP index folds
+    // its high byte. `fptosi`/`fcmp` results arrive as Call/i1 instead.
+    // (epic-cc#488)
+    let m = parse(
+        "global recs i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = va_arg %list i16\n\
+             %p = gep @recs +0 +2*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("recs", 0x120),
+        ("out", 0x154),
+        ("main::list", 0x150),
+        ("main::i", 0x158),
+        ("main::v", 0x15A),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // The index slot 0x158 is banked, so the high byte reads as 0x059.
+    assert_eq!(
+        asm.matches("MOVF 0x059").count(),
+        2,
+        "both unrolled adds must fold the va_arg index high byte:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    // The va_list slot holds a runtime pointer the read walks: point it
+    // at 0x200, where the i16 argument 0x0130 sits.
+    p.ram_mut()[0x150] = 0x00;
+    p.ram_mut()[0x151] = 0x02;
+    p.ram_mut()[0x200] = 0x30;
+    p.ram_mut()[0x201] = 0x01;
+    p.ram_mut()[0x380] = 0x7D; // recs + 2*0x0130
+    p.ram_mut()[0x180] = 0xD7; // the byte a dropped high byte would read
+    p.run(100_000);
+    assert_eq!(
+        p.ram()[0x154],
+        0x7D,
+        "out must be recs[2*0x0130], not the low-byte-only address"
+    );
+}
+
+#[test]
 fn a_width2_const_index_chains_on_tblptr() {
     // A 12-byte-stride const read with a 16-bit runtime index: the naive
     // TBLPTR loop would cost 72 words; the zero-seeded TBLPTR chain (33)
@@ -3952,6 +4063,35 @@ fn icmp_result_needs_no_literal_diamond() {
 }
 
 #[test]
+fn icmp_eq_zero_skips_the_literal_subtract() {
+    // `x == 0` consumes only Z, and `MOVF f,W` sets Z from `f` itself. The
+    // `MOVLW 0x00`/`SUBWF` pair it replaces is the epic-cc#503 sink.
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp eq i8 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVF 0x012,W,A"), "Z from the byte:\n{asm}");
+    assert!(
+        !asm.contains("SUBWF"),
+        "a zero compare needs no subtract:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (xv, expect) in [(0u8, 1u8), (7, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x11], expect, "eq({xv},0)");
+    }
+}
+
+#[test]
 fn icmp_ordering_predicates_also_skip_the_diamond() {
     // The pre-clear is sound for every predicate, not just eq/ne: it only
     // relies on `dst` overlapping nothing the compare reads.
@@ -4100,4 +4240,199 @@ fn icmp_result_aliasing_an_operand_keeps_the_diamond() {
         p.run(200);
         assert_eq!(p.ram()[0x20], expect, "in-place eq({av},4)");
     }
+}
+
+#[test]
+fn icmp_ne_zero_skips_the_literal_subtract() {
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp ne i8 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVF 0x012,W,A"), "Z from the byte:\n{asm}");
+    assert!(
+        !asm.contains("SUBWF"),
+        "a zero compare needs no subtract:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (xv, expect) in [(0u8, 0u8), (7, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x11], expect, "ne({xv},0)");
+    }
+}
+
+#[test]
+fn icmp_eq_zero_uses_the_banked_operand_form() {
+    // Place both operands above the access bank: the emitted form must
+    // carry the banked `,B` operand and its `MOVLB`, the shape every
+    // menu-demo site actually takes, not only the `,A` one.
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp eq i8 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x112),
+        ("out", 0x113),
+        ("main::1", 0x114),
+        ("main::2", 0x115),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // The operand prints as the bank-relative byte plus the `,B` bit.
+    assert!(
+        asm.contains("MOVF 0x014,W,B"),
+        "banked zero compare:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLB 0x1"),
+        "bank selected for the load:\n{asm}"
+    );
+    assert!(!asm.contains("SUBWF"), "no subtract:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (xv, expect) in [(0u8, 1u8), (7, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x112] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x113], expect, "banked eq({xv},0)");
+    }
+}
+
+#[test]
+fn icmp_i32_eq_zero_converts_every_lane() {
+    let m = parse(
+        "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i32 @x\n    %2 = icmp eq i32 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x28),
+        ("main::2", 0x2C),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(!asm.contains("SUBWF"), "no lane subtracts:\n{asm}");
+    // `MOVF` for each of the four compared lanes; the two `MOVLW` that
+    // remain belong to the shared 0/1 materialization, not the compare.
+    assert_eq!(asm.matches("MOVF 0x0").count(), 4, "one per byte:\n{asm}");
+    assert_eq!(asm.matches("BNZ").count(), 4, "one branch per byte:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (bytes, expect) in [
+        ([0u8, 0, 0, 0], 1u8),
+        ([0, 0, 0, 1], 0),
+        ([1, 0, 0, 0], 0),
+        ([0, 0, 1, 0], 0),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        for (i, b) in bytes.iter().enumerate() {
+            p.ram_mut()[0x20 + i] = *b;
+        }
+        p.run(300);
+        assert_eq!(p.ram()[0x24], expect, "eq({bytes:?}, 0)");
+    }
+}
+
+#[test]
+fn icmp_ordering_against_zero_keeps_the_carry_producing_subtract() {
+    // The gate is "the consumer reads only Z", not "the literal is zero":
+    // `uge`/`ult`/`ugt`/`ule` branch on C and `slt`/`sge`/`sgt`/`sle` on
+    // N/OV, none of which `MOVF` writes. Dropping the subtract there would
+    // leave those branches reading a stale flag.
+    for (pred, xv, expect) in [
+        ("uge", 0u8, 1u8),
+        ("uge", 7, 1),
+        ("ult", 0, 0),
+        ("ult", 7, 0),
+        ("ugt", 0, 0),
+        ("ugt", 7, 1),
+        ("ule", 0, 1),
+        ("ule", 7, 0),
+        ("sge", 0xFF, 0),
+        ("slt", 0xFF, 1),
+        ("sgt", 0xFF, 0),
+        ("sle", 0xFF, 1),
+    ] {
+        let m = parse(&format!(
+            "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load i8 @x\n    %2 = icmp {pred} i8 %1, 0\n    store i8 %2 @out\n    ret void\n"
+        ));
+        let addrs = addrs(&[
+            ("x", 0x10),
+            ("out", 0x11),
+            ("main::1", 0x12),
+            ("main::2", 0x13),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert!(
+            asm.contains("SUBWF 0x012,W,A"),
+            "{pred} keeps its subtract:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x11], expect, "{pred}({xv}, 0)");
+    }
+}
+
+#[test]
+fn icmp_i16_eq_zero_compares_the_high_byte_with_movf_but_keeps_its_subtract() {
+    // A multi-byte equality still needs the subtract on bytes whose value
+    // can make the difference, but a byte the literal leaves zero can use
+    // `MOVF`. The high byte is the zero one here, so it converts and the
+    // low byte (literal 0x07) does not.
+    let m = parse(
+        "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %2 = icmp eq i16 %1, 7\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x12),
+        ("main::1", 0x13),
+        ("main::2", 0x14),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVF 0x014,W,A"),
+        "zero high byte compares via MOVF:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x07"),
+        "non-zero low byte still stages its literal:\n{asm}"
+    );
+    assert!(
+        asm.contains("SUBWF 0x013,W,A"),
+        "non-zero low byte still subtracts:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, expect) in [(7u8, 0u8, 1u8), (6, 0, 0), (7, 1, 0), (0, 0, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = lo;
+        p.ram_mut()[0x11] = hi;
+        p.run(300);
+        assert_eq!(p.ram()[0x12], expect, "eq(0x{hi:02X}{lo:02X}, 7)");
+    }
+}
+
+#[test]
+fn icmp_nonzero_byte_compare_still_subtracts_the_literal() {
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp eq i8 %1, 4\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVLW 0x04"), "literal staged:\n{asm}");
+    assert!(asm.contains("SUBWF 0x012,W,A"), "subtract kept:\n{asm}");
 }

@@ -4,6 +4,16 @@
 > clause, docs/adr/ADR-015-pic18-softfloat.md). Ticket: PIC18 parity
 > sub-epic #267, the `%f` printf gap. Supersedes neither ADR-015 nor
 > docs/29; this is the allocator-side half ADR-015 deferred.
+>
+> **Stale premise (2026-09-20, ADR-036 / epic-cc#482).** Section 3.2
+> proposes starting globals and ordinary frames at `access_bank_hi + 1`
+> so the window below is free. `alloc` went the other way: on PIC18 the
+> whole frame overlay now starts at `gpr_start()` and the globals follow
+> it, which can only LOWER a float routine's frame and so makes the
+> `0x10-0x5F` assertion easier to satisfy, not harder. The problem
+> statement below (`__cmp_f32` at `0xCC-0xD4`) was measured against the
+> globals-first layout and no longer describes the tree. Re-measure the
+> `%f` printf path before implementing any of section 3.
 
 **Problem:** on PIC18 a program that calls a float runtime routine
 (`__add_f32`, `__mul_f32`, `__cmp_f32`, ...) only compiles when the routine's
