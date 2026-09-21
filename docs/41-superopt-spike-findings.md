@@ -158,6 +158,18 @@ correctness finding distinct from the density work: landing #501 by
 implementing its own suggested fix literally would be a miscompile, not a
 density win. Filed as a comment on epic-cc#501 directly.
 
+**Postscript, epic-cc#518: the diamond this section measured against is
+gone from the common compare-and-store shape.** `isel-pic18` now preclears
+the result slot before the compare (`bool_result_preclear`) and lets the
+compare's own branches select a single `INCF` on the true arm: 2 words of
+materialization, no diamond, no trailing `MOVWF`. That beats this spike's
+4-word floor, and it can only be seen by a compiler, not by this spike's
+straight-line contract: the win comes from emitting the clear before the
+flag-setting compare, a reordering no fixed candidate sequence can
+express. The shipped lowering also sidesteps the `CLRF`-first hazard
+above purely by ordering, so the ticket's candidate was never implemented
+as written.
+
 This spike does not confirm or deny the ticket's other speculation, a
 2-word carry-based sequence: that reshapes the *comparison* itself
 (producing carry instead of just Z), a different, wider contract than the
@@ -268,6 +280,10 @@ exist loses at these amounts specifically.
 not catch this: `W` is excepted from it by design, the same as `STATUS`
 (see the Method section above). Whoever lands one of these in
 `isel-pic18` needs to confirm `W` is dead at the call site first.
+(Confirmed at the epic-cc#505 landing: no `isel-pic18` lowering reads `W`
+before writing it within the same statement, there is no cross-statement
+W tracking (#502 is the ticket to add one), and WREG sits inside the ISR
+save area, so an interrupt cannot lose it either.)
 
 ## Recommendation
 
@@ -282,7 +298,8 @@ follow-up, not attempted here:
 
 - ~~Generalize target 2 to the 16-bit case #505 actually reports
   against, and to shift amounts other than 4~~: done, epic-cc#520 (see the
-  results table above). Amounts 4-7 each save a real, verified 3 words;
+  results table above). Amounts 4-7 each beat the baseline by a real,
+  verified margin (3 to 14 words, per the table);
   amounts 2 and 3 got no answer either way within a tractable search
   bound, and no comparable algebraic shortcut was found for them.
 - ~~Widen target 1's case set~~ and ~~widen the verification check to the
@@ -298,6 +315,26 @@ follow-up, not attempted here:
   prerequisite once a superoptimizer result is trusted enough to change
   shipped codegen, rather than just to confirm or disprove a human's
   hand-derived candidate.
+- ~~Whether any of these verified sequences are worth landing in
+  `isel-pic18`~~: landed for the shift targets, epic-cc#505. The
+  single-lane `SWAPF`+mask form covers any width's 4-bit residual, and
+  the 16-bit amount 4-7 constructions emit directly; every landed form is
+  re-verified in `crates/isel-pic18`'s own tests by simulating the real
+  selector's output over the full input domain (65536 values per 16-bit
+  amount, 256 per byte lane), not by trusting the superopt suite's
+  candidate text. Target 1 needed no landing: the #518 postscript above
+  records the common shape already beating its floor. #505's own second
+  lowering, a counted loop above a word-count threshold, was rejected on
+  arithmetic: `DECFSZ`+`BRA` costs 2 more words per iteration than the
+  unrolled step it replaces, plus setup, so no width or amount reaches a
+  break-even point.
+- The gpsim-parity question is resolved for this landing, not in general:
+  the shift sequences shipped without an independent PIC18 oracle, on the
+  argument that a fixed candidate checked by full-domain simulation
+  carries a much smaller risk class than sampled-oracle codegen, and that
+  the gap weighs on every PIC18 lowering equally, not specially on
+  superoptimizer-sourced ones. Whether to close the gap anyway stays open
+  as its own ticket.
 
 **Not recommended for this spike's stretch goals yet:** an LLM in the
 search loop, or an SMT-based prover in place of exhaustive-input

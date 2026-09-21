@@ -2112,12 +2112,6 @@ impl<'m> Gen<'m> {
                 // panic below.
                 let av = self.val_addr(&b.a).direct();
                 let dst = self.slot_addr(self.cur_func, &b.dst).direct();
-                // the constant-count shifts: a const count inlines as a fixed
-                // RLCF/RRCF sequence; k == 0 is a plain copy; k >= width is
-                // LLVM poison and panics. A variable (reg) count must
-                // never reach isel: legalize rewrites it to a routine call.
-                // Without this arm a shift would hit the `(other, _)`
-                // panic below.
                 if matches!(b.op, ir::BinOp::Shl | ir::BinOp::LShr | ir::BinOp::AShr) {
                     let width = i64::from(n) * 8;
                     let k = match &b.b {
@@ -2195,6 +2189,71 @@ impl<'m> Gen<'m> {
                         }
                     }
                     let active = n16 - m;
+                    // Nibble-boundary left shifts have shorter, sim-verified
+                    // forms than the per-bit unroll (crates/superopt, docs/41):
+                    // one lane shifts by 4 as SWAPF+mask, and an in-place
+                    // 16-bit pair has a canned construction per amount 4-7,
+                    // each checked over the full 65536-input domain. They
+                    // clobber W, dead at statement entry (no lowering reads W
+                    // before writing it; W tracking is #502), and STATUS no
+                    // worse than the unroll they replace.
+                    if b.op == ir::BinOp::Shl && r > 0 {
+                        if active == 1 && r == 4 {
+                            self.emit_banked("SWAPF", dst + m, ",W");
+                            self.emit("    ANDLW 0xF0".to_string());
+                            self.emit_banked("MOVWF", dst + m, "");
+                            return;
+                        }
+                        if n16 == 2 && m == 0 && (4..=7).contains(&r) {
+                            // Every lane op fetches its operand fresh so a
+                            // dst straddling a bank boundary re-selects BSR
+                            // exactly where the unrolled loop would; caching
+                            // both lanes' bank letters up front misaddresses
+                            // the far lane.
+                            match r {
+                                4 | 5 => {
+                                    self.emit_banked("SWAPF", dst + 1, ",F");
+                                    self.emit("    MOVLW 0xF0".to_string());
+                                    self.emit_banked("ANDWF", dst + 1, ",F");
+                                    self.emit_banked("SWAPF", dst, ",W");
+                                    self.emit("    ANDLW 0x0F".to_string());
+                                    self.emit_banked("IORWF", dst + 1, ",F");
+                                    self.emit_banked("SWAPF", dst, ",F");
+                                    self.emit("    MOVLW 0xF0".to_string());
+                                    self.emit_banked("ANDWF", dst, ",F");
+                                    if r == 5 {
+                                        self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+                                        self.emit_banked("RLCF", dst, ",F");
+                                        self.emit_banked("RLCF", dst + 1, ",F");
+                                    }
+                                }
+                                6 => {
+                                    self.emit_banked("RRNCF", dst + 1, ",F");
+                                    self.emit_banked("RRNCF", dst + 1, ",F");
+                                    self.emit("    MOVLW 0xC0".to_string());
+                                    self.emit_banked("ANDWF", dst + 1, ",F");
+                                    self.emit_banked("RRNCF", dst, ",F");
+                                    self.emit_banked("RRNCF", dst, ",F");
+                                    self.emit_banked("MOVF", dst, ",W");
+                                    self.emit("    ANDLW 0x3F".to_string());
+                                    self.emit_banked("IORWF", dst + 1, ",F");
+                                    self.emit("    MOVLW 0xC0".to_string());
+                                    self.emit_banked("ANDWF", dst, ",F");
+                                }
+                                7 => {
+                                    self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+                                    self.emit_banked("RRCF", dst + 1, ",F");
+                                    self.emit_banked("RRCF", dst, ",F");
+                                    self.emit_banked("MOVF", dst, ",W");
+                                    self.emit_banked("MOVWF", dst + 1, "");
+                                    self.emit_banked("CLRF", dst, "");
+                                    self.emit_banked("RRCF", dst, ",F");
+                                }
+                                _ => unreachable!(),
+                            }
+                            return;
+                        }
+                    }
                     for _ in 0..r {
                         match b.op {
                             ir::BinOp::Shl => {
