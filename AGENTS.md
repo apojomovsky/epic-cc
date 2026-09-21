@@ -233,6 +233,22 @@ mechanical rules fails the ritual and blocks the push.
 - **Never reverse-engineer or disassemble XC8 binaries.** XC8 is a
   black-box differential oracle only: compile the same source with
   `xc8-cc` and diff observable behaviour. Its licence forbids more.
+- **XC8 is in the `epic-hal-toolchain:local` image, not this one.** The
+  epic-cc dev image sets `PIC8_XC8_ROOT` but installs nothing there, so
+  `xc8-cc` fails with `command not found` inside `make exec`. Run it
+  through the sibling image instead, and pass `-mdfp` pointing at the
+  pack's `xc8` subdirectory (XC8 v4.00 does not auto-discover device
+  files):
+
+  ```bash
+  docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" \
+    -w /workspace epic-hal-toolchain:local \
+    xc8-cc -mdfp=/opt/microchip/xc8/v4.00/pic/packs/Microchip.PIC18Fxxxx_DFP/xc8 \
+           -mcpu=18f4550 -O2 -c file.c -o file.p1
+  ```
+
+  Never install XC8 (or anything else) on the host. Details and the
+  verified PIC18 recipe: `docs/06-environment.md`.
 - **GPL boundary.** `gputils`/`gpasm` and `gpsim` are GPL: invoking
   them as external processes in tests is fine; linking them into the
   compiler is not.

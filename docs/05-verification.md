@@ -15,9 +15,16 @@ random program generator ──► our compiler ──┐
 
 ### 1. XC8 (`xc8-cc`)
 
-Installed at `/opt/microchip/xc8/v4.00/` — see [`06-environment.md`](06-environment.md).
-Compile the same source with XC8, run both outputs on our simulator, compare observable
-state (RAM contents, port writes, cycle counts).
+**Available, not yet wired.** XC8 v4.00 lives in the `epic-hal-toolchain:local` image, not
+in the epic-cc dev image; [`06-environment.md`](06-environment.md) has the exact invocation
+(the `-mdfp` path matters). The differential runner described here is **not built**:
+`docs/13` defers it to phase 6, and no `xc8-cc` invocation exists in this repo. epic-hal's
+`build-cmp` scripts are the only working XC8 users in the family, and they use it for size
+comparison, not correctness differencing.
+
+When built, it compiles the same source with XC8, runs both outputs on our simulator, and
+compares observable state (RAM contents, port writes, cycle counts). Until then, no
+program in this repo has been differenced against XC8.
 
 **Black-box only.** Never disassemble or reverse-engineer the XC8 binaries — see
 [ADR-006](03-decisions.md). We observe its *output*, not its internals.

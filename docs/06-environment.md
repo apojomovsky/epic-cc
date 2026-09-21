@@ -25,20 +25,50 @@ Two things are **not** yet packaged and need their own packages later: `gpsim` a
 
 ## The XC8 install
 
-Located at **`/opt/microchip/xc8/v4.00/`**. Confirmed to support the **PIC16F877A**
-(`grep 16F877A bin/deviceSupport.xml`).
+**XC8 is not in `epic-cc-dev`. It lives in `epic-hal-toolchain:local`, and that is where
+you must run it.** The epic-cc dev image sets `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00`
+but does not install anything at that path, so invoking `xc8-cc` there fails with
+`command not found`. Do not `apt install` or run the Microchip installer on the host: it
+is licence-gated and the image boundary is the point.
+
+```bash
+# Version 4.00, PIC18 DFP 1.7.171 already unpacked in this image.
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
+  epic-hal-toolchain:local \
+  xc8-cc -mdfp=/opt/microchip/xc8/v4.00/pic/packs/Microchip.PIC18Fxxxx_DFP/xc8 \
+         -mcpu=18f4550 -O2 -c file.c -o file.p1
+```
+
+The three facts that cost time to rediscover:
+
+1. **`-mdfp` is mandatory and must point at the pack's `xc8` subdirectory**, not the pack
+   root and not `/opt/dfp`. XC8 v4.00 does not auto-discover its device files, and the
+   wrong suffix fails with `error: (2104) no device-support files found`.
+2. **The image is `epic-hal-toolchain:local`**, built from `epic-hal`'s
+   `docker/ci-toolchain/Dockerfile` (which installs XC8 plus the DFPs from
+   `packs.download.microchip.com`). Its Makefile has the working invocation in
+   `build-cmp/*/build.sh`. If the local tag is stale it may lack the packs; `docker images`
+   shows what is actually present.
+3. **Nothing in epic-cc reads `PIC8_XC8_ROOT` yet.** The XC8 differential described in
+   [`05-verification.md`](05-verification.md) is not built: `docs/13` defers it to phase 6,
+   and epic-hal's `build-cmp` scripts are the only XC8 invocations in the tree.
+
+The install layout, for reference (paths inside the epic-hal image):
 
 ```
 /opt/microchip/xc8/v4.00/
-├── bin/          xc8-cc, xc8-ar, xc8-clangd, pic-objdump, pic-objcopy,
-│                 avr-objdump, avr-objcopy, deviceSupport.xml, verifyinst, xc-ccov
-├── pic/bin/      aspic aspic18 cgpic cgpic18 clang clist cromwell driver
-│                 driver18 dump hexmate hlink libr
+├── bin/              xc8-cc, xc8-ar, pic-objdump, pic-objcopy, deviceSupport.xml, …
+├── pic/bin/          aspic aspic18 cgpic cgpic18 clang clist cromwell driver
+│                     driver18 dump hexmate hlink libr
+├── pic/packs/        Microchip.PIC16Fxxx_DFP, Microchip.PIC18Fxxxx_DFP,
+│                     Microchip.PIC12-16F1xxx_DFP (each with an `xc8/` subdir)
 ├── pic-as/
 ├── avr/
-└── docs/         MPLAB_XC8_C_Compiler_License.rtf, LLVM_LICENSE.txt,
-                  Hexmate_User_Guide.pdf, MPASM_to_MPLAB_XC8_..._Migration_Guide.pdf, …
+└── docs/             MPLAB_XC8_C_Compiler_License.rtf, LLVM_LICENSE.txt, …
 ```
+
+Verified working for PIC18: the recipe above compiles, links (`-ginhx32`), and prints the
+`18F4550 Memory Summary` that the size references quote.
 
 ### Two critical facts about this install
 

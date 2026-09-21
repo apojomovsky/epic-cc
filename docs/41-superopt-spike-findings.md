@@ -24,10 +24,13 @@ re-checked.
 
 ## Step 0: is the simulator a faithful oracle for this?
 
-`Pic18` is already used as a behavioral gate elsewhere (XC8-differential
-whole-program runs, sim-verified e2e fixtures), but that is a different,
-weaker claim than what this spike needs: correct output across every input
-of a bare ALU/data-movement sequence with no peripheral involvement.
+`Pic18` is already used as a behavioral gate elsewhere (sim-verified e2e
+fixtures, the gpasm HEX cross-check, hand-worked expected state), but that
+is a different, weaker claim than what this spike needs: correct output
+across every input of a bare ALU/data-movement sequence with no peripheral
+involvement. (This document previously cited "XC8-differential whole-program
+runs" as one of those gates; no such runs exist, for either core. See
+`docs/05-verification.md` and epic-cc#527.)
 
 Two things support trusting it for that narrower claim:
 

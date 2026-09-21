@@ -133,9 +133,17 @@ a sibling branch's bytes.
 
 ## XC8 is not a build dependency
 
-XC8 is a **test oracle only** ([`05-verification.md`](05-verification.md)). It
-is proprietary and cannot be part of the image. It is detected at runtime via
-`$PIC8_XC8_ROOT`; differential tests skip with a clear message when absent.
+XC8 is a **test oracle only** ([`05-verification.md`](05-verification.md)). It is
+proprietary and licence-gated, so it is kept out of the epic-cc dev image: the image
+merely *declares* `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00` without installing anything
+there. The working copy lives in the sibling `epic-hal-toolchain:local` image, built by
+`epic-hal`'s `docker/ci-toolchain/Dockerfile`; run `xc8-cc` through that image rather than
+installing it on the host ([`06-environment.md`](06-environment.md) has the exact
+invocation).
+
+**No test in this repo invokes XC8 yet.** The differential runner is deferred (`docs/13`,
+phase 6), so nothing currently reads `$PIC8_XC8_ROOT` and there is no skip-when-absent path
+to exercise. An early revision of this doc described one; it was aspirational.
 
 ## Device TOML authoring (DFP -> TOML)
 
