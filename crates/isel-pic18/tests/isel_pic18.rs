@@ -290,26 +290,48 @@ fn const_shl_i32_by_4_keeps_the_unrolled_form() {
 }
 
 #[test]
-fn const_lshr_i16_by_4_keeps_the_unrolled_form() {
-    // Only left shifts have superopt-verified constructions so far; a
-    // right shift must not fire the left-shift special cases.
-    let m = parse(
-        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
-         %1 = load i16 @a\n    %2 = lshr i16 %1, 4\n    store i16 %2 @out\n    ret void\n",
-    );
-    let addrs = addrs(&[
-        ("a", 0x20),
-        ("out", 0x24),
-        ("main::1", 0x26),
-        ("main::2", 0x28),
-    ]);
-    let asm = select(&PIC18F4550, &m, &addrs, None);
-    assert_eq!(asm.matches("RRCF").count(), 8, "4 steps x 2 bytes:\n{asm}");
-    assert_eq!(
-        asm.matches("BCF 0xFD8,0,A").count(),
-        4,
-        "clear carry before each shift step:\n{asm}"
-    );
+fn const_lshr_i16_by_4_uses_the_verified_nibble_form() {
+    // dst at 0x0FF puts the second lane in the next bank, exercising the
+    // banked operand text the construction emits for each lane.
+    for dst in [0x28, 0x0FF] {
+        let m = parse(
+            "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+             %1 = load i16 @a\n    %2 = lshr i16 %1, 4\n    store i16 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x26),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RRCF").count(), 0, "no per-bit unroll:\n{asm}");
+        assert_eq!(
+            asm.matches("SWAPF").count(),
+            3,
+            "three nibble swaps:\n{asm}"
+        );
+        assert_eq!(
+            asm.matches("BCF 0xFD8,0,A").count(),
+            0,
+            "no carry clears:\n{asm}"
+        );
+        // The opcode counts above are the shape; this is the contract: the
+        // emitted asm, simulated over every 16-bit input, must compute the
+        // shift. Entry W is set to a value the construction must not depend
+        // on (it clobbers W), same as the i8 test.
+        let words = asm::assemble_pic18(&asm);
+        for x in 0..=u16::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = x as u8;
+            p.ram_mut()[0x21] = (x >> 8) as u8;
+            p.set_w((x as u8) ^ ((x >> 8) as u8));
+            p.run(200);
+            let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+            assert_eq!(got, x >> 4, "a={x:#06x} >> 4 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={x:#06x})");
+        }
+    }
 }
 
 #[test]
@@ -343,6 +365,112 @@ fn const_shl_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
             p.set_w(!b);
             p.run(200);
             assert_eq!(p.ram()[0x21], b << 4, "a={b:#04x} << 4 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
+    }
+}
+
+#[test]
+fn const_lshr_i16_by_12_shifts_only_the_surviving_lane() {
+    // k = 12 -> m = 1 byte move plus r = 4 residual over the single
+    // surviving lane at dst[0] (right shifts keep dst[0..n-m)). Distinct
+    // code path from the two-lane amount-4 form: active == 1 with m > 0.
+    for dst in [0x28, 0x0FF] {
+        let m = parse(
+            "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+             %1 = load i16 @a\n    %2 = lshr i16 %1, 12\n    store i16 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x26),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RRCF").count(), 0, "no unroll steps:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        for x in 0..=u16::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = x as u8;
+            p.ram_mut()[0x21] = (x >> 8) as u8;
+            p.set_w((x as u8) ^ ((x >> 8) as u8));
+            p.run(200);
+            let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+            assert_eq!(got, x >> 12, "a={x:#06x} >> 12 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={x:#06x})");
+        }
+    }
+}
+
+#[test]
+fn const_lshr_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
+    // Mirror of const_shl_i8_by_4: the single-lane right shift by 4 keeps
+    // the low nibble of the nibble-swapped byte, 3 words against the
+    // 8-word unroll.
+    for dst in [0x21, 0x1FF] {
+        let m = parse(
+            "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+             %1 = load i8 @a\n    %2 = lshr i8 %1, 4\n    store i8 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x21),
+            ("main::1", 0x22),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RRCF").count(), 0, "no unroll steps:\n{asm}");
+        assert_eq!(asm.matches("SWAPF").count(), 1, "swap through W:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = b;
+            p.set_w(!b);
+            p.run(200);
+            assert_eq!(p.ram()[0x21], b >> 4, "a={b:#04x} >> 4 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
+    }
+}
+
+#[test]
+fn const_lshr_i32_by_28_rotates_only_the_surviving_lane() {
+    // Mirror of const_shl_i32_by_28: k = 28 -> m = 3 byte moves plus r = 4
+    // residual. For a right shift the surviving lane is dst[0] (not the top
+    // lane the left form uses), and the residual is a nibble down-shift.
+    // Domain is the same 256 derived byte patterns the left test uses;
+    // dst at 0x0FF puts the lane in the next bank.
+    for dst in [0x2C, 0x0FF] {
+        let m = parse(
+            "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+             %1 = load i32 @a\n    %2 = lshr i32 %1, 28\n    store i32 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x40),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RRCF").count(), 0, "no unroll steps:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = b;
+            p.ram_mut()[0x21] = b ^ 0x5A;
+            p.ram_mut()[0x22] = !b;
+            p.ram_mut()[0x23] = b.rotate_left(3);
+            p.set_w(b);
+            p.run(300);
+            let got = u32::from(p.ram()[0x24])
+                | u32::from(p.ram()[0x25]) << 8
+                | u32::from(p.ram()[0x26]) << 16
+                | u32::from(p.ram()[0x27]) << 24;
+            let x = u32::from(b)
+                | u32::from(b ^ 0x5A) << 8
+                | u32::from(!b) << 16
+                | u32::from(b.rotate_left(3)) << 24;
+            assert_eq!(got, x >> 28, "a={x:#010x} >> 28 (dst={dst:#06x})");
             assert!(p.halted(), "program must run to completion (a={b:#04x})");
         }
     }
