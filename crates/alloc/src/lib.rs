@@ -53,13 +53,24 @@ pub struct AllocLayout {
     /// its overlay region span is 0, but the backend still emits the
     /// ISR-save prologue, which the size report must count.
     pub has_isr: bool,
-    /// The low-priority ISR's 12-byte context-save area base (`Some` only
+    /// The low-priority ISR's 16-byte context-save area base (`Some` only
     /// in priority mode: both a high- and a low-priority ISR exist). It
     /// sits at the low overlay region's base, below the low frames, so it
     /// is disjoint from every context by construction; the high ISR keeps
     /// the device's fixed save block. `None` in compatibility mode (zero
     /// or one ISR), where the single handler uses the fixed block.
     pub isr_low_save: Option<u16>,
+    /// The compatibility-mode ISR's 4-byte area for the PROD/FSR1 save
+    /// bytes (`Some` only when the module has an ISR, is PIC18, and does
+    /// not run priority mode). Carved from the ISR context's own region,
+    /// like `isr_low_save`, because the fixed access-bank block is pinned
+    /// at 16 bytes by `ram_banks` starting at 0x0010 on every device and
+    /// has no room for them. (epic-cc#477)
+    pub isr_save: Option<u16>,
+    /// The high-priority ISR's 4-byte area for the same bytes, carved from
+    /// its own region so the two ISRs' areas stay disjoint. `Some` only in
+    /// priority mode. (epic-cc#477)
+    pub isr_hi_save: Option<u16>,
 }
 
 /// Inclusive physical-address range of the GPR region that contains `addr`,
@@ -1023,141 +1034,169 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // Steps 5 and 5b as one operation over a frame-region start, so the
     // region can be derived before the globals (PIC18, below) or after
     // them (PIC14) without the derivation existing twice.
-    let assign_bases = |region_start: u16| -> (HashMap<String, u16>, Option<u16>) {
-        // 5. base(f) = max over direct callers of the caller's PHYSICAL
-        // frame end; roots at region_start, in forward topo order so every
-        // caller precedes its callees.
+    let assign_bases =
+        |region_start: u16| -> (HashMap<String, u16>, Option<u16>, Option<u16>, Option<u16>) {
+            // 5. base(f) = max over direct callers of the caller's PHYSICAL
+            // frame end; roots at region_start, in forward topo order so every
+            // caller precedes its callees.
 
-        // The virtual sum base(p) + locals_size[p] is NOT used: a caller
-        // whose frame spills past a bank region end ends beyond that sum,
-        // and a callee based on it could land in the gap at the next
-        // region's start, exactly where the caller's spill locals live
-        // while both frames are live. frame_end walks the caller's actual
-        // widths through place_contiguous, so it matches step 7's
-        // placement exactly, hole bytes included.
-        let mut base: HashMap<String, u16> = HashMap::new();
-        for f in &topo {
-            let b = match callers.get(f) {
-                Some(ps) => ps
-                    .iter()
-                    .map(|p| frame_end(device, base[p], &locals_widths[p]))
-                    .max()
-                    .expect("alloc: empty caller list"),
-                None => region_start,
-            };
-            // A runtime routine's frame must stay inside ONE GPR bank: its
-            // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
-            // test and its target, or inside a carry idiom. The base is rounded
-            // when the derived frame would straddle a bank boundary; float
-            // routines round exactly like integer ones (epic-cc#357).
-            let b = round_if_routine(device, f, b, &locals_widths);
-            base.insert(f.clone(), b);
-        }
-
-        // 5b. The disjoint ISR region: an ISR root's frame base is AFTER
-        // the main context's total (the max physical frame end over the
-        // NON-ISR roots' contexts), not the region start. The ISR can
-        // preempt main at any point, so a preempted main's live frames must
-        // never overlap the ISR context's. The physical end equals the
-        // depth sum when no local crosses a bank gap and is strictly larger
-        // (hence safer) when an i16 at a region tail leaves a hole.
-
-        // The loop above is exact for every non-ISR context (no ISR-side
-        // function is reachable from them), so the disjoint base derives
-        // from its results; each ISR context is then re-derived from that
-        // base in topo order.
-
-        // Set inside the ISR-region block below: `Some` only in priority mode.
-        let mut isr_low_save: Option<u16> = None;
-        if !isr_names.is_empty() {
-            let isr_roots: Vec<&String> = topo
-                .iter()
-                .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
-                .collect();
-            // Priority-partitioned ISR roots: the high ISR can preempt the
-            // low one (and main) mid-call, so each priority's context needs
-            // its own disjoint overlay region. Compatibility mode has no
-            // high roots and behaves exactly as before.
-            let hi_roots: Vec<&&String> = isr_roots
-                .iter()
-                .filter(|f| {
-                    m.funcs
+            // The virtual sum base(p) + locals_size[p] is NOT used: a caller
+            // whose frame spills past a bank region end ends beyond that sum,
+            // and a callee based on it could land in the gap at the next
+            // region's start, exactly where the caller's spill locals live
+            // while both frames are live. frame_end walks the caller's actual
+            // widths through place_contiguous, so it matches step 7's
+            // placement exactly, hole bytes included.
+            let mut base: HashMap<String, u16> = HashMap::new();
+            for f in &topo {
+                let b = match callers.get(f) {
+                    Some(ps) => ps
                         .iter()
-                        .find(|g| g.name.as_str() == f.as_str())
-                        .is_some_and(|g| g.irq_priority == 1)
-                })
-                .collect();
-            let lo_roots: Vec<&&String> = isr_roots
-                .iter()
-                .filter(|f| !hi_roots.iter().any(|h| h.as_str() == f.as_str()))
-                .collect();
-            let non_isr_roots: Vec<&String> = topo
-                .iter()
-                .filter(|f| !callers.contains_key(*f) && !isr_names.contains(f.as_str()))
-                .collect();
-            // The disjoint base = max physical frame end over the non-ISR roots'
-            // contexts (the main context's total). No non-ISR root: the ISR is
-            // the only root, so it simply starts at region_start.
-            let isr_base = non_isr_roots
-                .iter()
-                .flat_map(|r| reachable(&[r.as_str()], &edges))
-                .map(|f| frame_end(device, base[&f], &locals_widths[&f]))
-                .max()
-                .unwrap_or(region_start);
-            // Re-derive each priority's context from its disjoint base in topo
-            // order (callers precede callees, and every caller of a context
-            // function is itself in that context after the legalize
-            // duplication).
-            let assign_region =
-                |base: &mut HashMap<String, u16>, roots: &[&&String], region_base: u16| {
-                    let ctx: HashSet<String> = roots
-                        .iter()
-                        .flat_map(|r| reachable(&[r.as_str()], &edges))
-                        .collect();
-                    for f in &topo {
-                        if !ctx.contains(f) {
-                            continue;
-                        }
-                        let b = if roots.iter().any(|r| r.as_str() == f.as_str()) {
-                            region_base
-                        } else {
-                            callers[f]
-                                .iter()
-                                .map(|p| frame_end(device, base[p], &locals_widths[p]))
-                                .max()
-                                .expect("alloc: empty caller list")
-                        };
-                        // Issue #6: the ISR context's routine copies get the same
-                        // single-bank frame rounding as the main context's.
-                        let b = round_if_routine(device, f, b, &locals_widths);
-                        base.insert(f.clone(), b);
-                    }
+                        .map(|p| frame_end(device, base[p], &locals_widths[p]))
+                        .max()
+                        .expect("alloc: empty caller list"),
+                    None => region_start,
                 };
-            // Priority mode (both priorities present): the low ISR's 12-byte
-            // context-save area sits at the low region's base, below the low
-            // frames, so it is disjoint from every context by construction
-            // (the access-window argument shows no float frame can land
-            // inside it). Compatibility mode keeps the historical layout
-            // byte-identical: no shift, no save area.
-            let priority_mode = !lo_roots.is_empty() && !hi_roots.is_empty();
-            let lo_base = if priority_mode {
-                isr_low_save = Some(isr_base);
-                isr_base + 12
-            } else {
-                isr_base
-            };
-            assign_region(&mut base, &lo_roots, lo_base);
-            // The high region sits above everything the high ISR can preempt
-            // (main and low frames): max frame end over all assigned bases.
-            let hi_base = base
-                .iter()
-                .map(|(f, b)| frame_end(device, *b, &locals_widths[f]))
-                .max()
-                .unwrap_or(isr_base);
-            assign_region(&mut base, &hi_roots, hi_base);
-        }
-        (base, isr_low_save)
-    };
+                // A runtime routine's frame must stay inside ONE GPR bank: its
+                // skip-sensitive recipe loops cannot tolerate a BANKSEL between a
+                // test and its target, or inside a carry idiom. The base is rounded
+                // when the derived frame would straddle a bank boundary; float
+                // routines round exactly like integer ones (epic-cc#357).
+                let b = round_if_routine(device, f, b, &locals_widths);
+                base.insert(f.clone(), b);
+            }
+
+            // 5b. The disjoint ISR region: an ISR root's frame base is AFTER
+            // the main context's total (the max physical frame end over the
+            // NON-ISR roots' contexts), not the region start. The ISR can
+            // preempt main at any point, so a preempted main's live frames must
+            // never overlap the ISR context's. The physical end equals the
+            // depth sum when no local crosses a bank gap and is strictly larger
+            // (hence safer) when an i16 at a region tail leaves a hole.
+
+            // The loop above is exact for every non-ISR context (no ISR-side
+            // function is reachable from them), so the disjoint base derives
+            // from its results; each ISR context is then re-derived from that
+            // base in topo order.
+
+            // Set inside the ISR-region block below: `Some` only in priority mode.
+            let mut isr_low_save: Option<u16> = None;
+            // The compat/high ISR's area for the PROD/FSR1 bytes epic-cc#477
+            // adds: the fixed block has no room, so it is carved here.
+            let mut isr_save: Option<u16> = None;
+            let mut isr_hi_save: Option<u16> = None;
+            if !isr_names.is_empty() {
+                let isr_roots: Vec<&String> = topo
+                    .iter()
+                    .filter(|f| !callers.contains_key(*f) && isr_names.contains(f.as_str()))
+                    .collect();
+                // Priority-partitioned ISR roots: the high ISR can preempt the
+                // low one (and main) mid-call, so each priority's context needs
+                // its own disjoint overlay region. Compatibility mode has no
+                // high roots and behaves exactly as before.
+                let hi_roots: Vec<&&String> = isr_roots
+                    .iter()
+                    .filter(|f| {
+                        m.funcs
+                            .iter()
+                            .find(|g| g.name.as_str() == f.as_str())
+                            .is_some_and(|g| g.irq_priority == 1)
+                    })
+                    .collect();
+                let lo_roots: Vec<&&String> = isr_roots
+                    .iter()
+                    .filter(|f| !hi_roots.iter().any(|h| h.as_str() == f.as_str()))
+                    .collect();
+                let non_isr_roots: Vec<&String> = topo
+                    .iter()
+                    .filter(|f| !callers.contains_key(*f) && !isr_names.contains(f.as_str()))
+                    .collect();
+                // The disjoint base = max physical frame end over the non-ISR roots'
+                // contexts (the main context's total). No non-ISR root: the ISR is
+                // the only root, so it simply starts at region_start.
+                let isr_base = non_isr_roots
+                    .iter()
+                    .flat_map(|r| reachable(&[r.as_str()], &edges))
+                    .map(|f| frame_end(device, base[&f], &locals_widths[&f]))
+                    .max()
+                    .unwrap_or(region_start);
+                // Re-derive each priority's context from its disjoint base in topo
+                // order (callers precede callees, and every caller of a context
+                // function is itself in that context after the legalize
+                // duplication).
+                let assign_region =
+                    |base: &mut HashMap<String, u16>, roots: &[&&String], region_base: u16| {
+                        let ctx: HashSet<String> = roots
+                            .iter()
+                            .flat_map(|r| reachable(&[r.as_str()], &edges))
+                            .collect();
+                        for f in &topo {
+                            if !ctx.contains(f) {
+                                continue;
+                            }
+                            let b = if roots.iter().any(|r| r.as_str() == f.as_str()) {
+                                region_base
+                            } else {
+                                callers[f]
+                                    .iter()
+                                    .map(|p| frame_end(device, base[p], &locals_widths[p]))
+                                    .max()
+                                    .expect("alloc: empty caller list")
+                            };
+                            // Issue #6: the ISR context's routine copies get the same
+                            // single-bank frame rounding as the main context's.
+                            let b = round_if_routine(device, f, b, &locals_widths);
+                            base.insert(f.clone(), b);
+                        }
+                    };
+                // Priority mode (both priorities present): the low ISR's 16-byte
+                // context-save area sits at the low region's base, below the low
+                // frames, so it is disjoint from every context by construction
+                // (the access-window argument shows no float frame can land
+                // inside it). Compatibility mode keeps the historical layout
+                // byte-identical: no shift, no save area.
+                let priority_mode = !lo_roots.is_empty() && !hi_roots.is_empty();
+                // Every ISR context needs the four PROD/FSR1 bytes, whichever
+                // priority it runs at, so each region's base gets its own
+                // carved area of the same size (epic-cc#477). PIC14/PIC14E
+                // have no MULWF/PROD and no FSR1 copy loop, so their layout
+                // stays byte-identical.
+                let needs_prod_save = device.core == device::Core::Pic18;
+                const ISR_SAVE_BYTES: u16 = 4;
+                const LOW_SAVE_BYTES: u16 = 16;
+                let lo_base = if priority_mode {
+                    isr_low_save = Some(isr_base);
+                    isr_base + LOW_SAVE_BYTES
+                } else if needs_prod_save {
+                    // Compatibility mode: the lone handler's own save area,
+                    // carved above the ISR context base so it is disjoint from
+                    // main's frames by the same construction the priority path
+                    // uses.
+                    isr_save = Some(isr_base);
+                    isr_base + ISR_SAVE_BYTES
+                } else {
+                    isr_base
+                };
+                assign_region(&mut base, &lo_roots, lo_base);
+                // The high region sits above everything the high ISR can preempt
+                // (main and low frames): max frame end over all assigned bases.
+                let hi_base = base
+                    .iter()
+                    .map(|(f, b)| frame_end(device, *b, &locals_widths[f]))
+                    .max()
+                    .unwrap_or(isr_base);
+                let hi_base = if priority_mode && needs_prod_save {
+                    // The high handler needs the same four bytes; carve them
+                    // from its own region so the two ISRs' areas stay disjoint.
+                    isr_hi_save = Some(hi_base);
+                    hi_base + ISR_SAVE_BYTES
+                } else {
+                    hi_base
+                };
+                assign_region(&mut base, &hi_roots, hi_base);
+            }
+            (base, isr_low_save, isr_save, isr_hi_save)
+        };
 
     // PIC18 puts the frame overlay BELOW the globals. The access bank
     // (0x000-0x05F) is the only RAM `isel-pic18`'s `operand()` reaches with
@@ -1179,14 +1218,14 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // the frames start above every pinned address. The scan is over every
     // pinned global, const included: whether a const ends up in RAM is
     // decided below, and falling back is the safe way to be wrong.
-    let placed_frames = placed_frames.filter(|(base, _)| {
+    let placed_frames = placed_frames.filter(|(base, _, _, _)| {
         let top = overlay_end(device, base, &locals_widths, device.gpr_start());
         !m.globals
             .iter()
             .any(|g| matches!(g.addr, Some(a) if a < top))
     });
     let global_start = match &placed_frames {
-        Some((b, _)) => overlay_end(device, b, &locals_widths, device.gpr_start()),
+        Some((b, _, _, _)) => overlay_end(device, b, &locals_widths, device.gpr_start()),
         None => device.gpr_start(),
     };
 
@@ -1506,7 +1545,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         Some(_) => device.gpr_start(),
         None => end_of_globals.max(global_start),
     };
-    let (base, isr_low_save) = match placed_frames {
+    let (base, isr_low_save, isr_save, isr_hi_save) = match placed_frames {
         Some(r) => r,
         None => assign_bases(bank0_start),
     };
@@ -1609,6 +1648,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         isr_bytes,
         has_isr: !isr_names.is_empty(),
         isr_low_save,
+        isr_save,
+        isr_hi_save,
     }
 }
 
