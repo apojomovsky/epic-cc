@@ -6463,6 +6463,26 @@ fn measure_end_org(text: &str) -> usize {
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
     select_with_locs(device, m, addrs).0
 }
+// A ref byte's operand: a RAM target's address half straight from the
+// alloc map (RAM globals have no assembler label to resolve, epic-cc#450
+// mirrors #443); a flash target (function, const table) keeps its
+// link-time label literal (epic-cc#154).
+fn ref_byte_operand(addrs: &HashMap<String, u16>, offset: usize, target: &str) -> String {
+    match addrs.get(target) {
+        Some(&a) => {
+            let byte = if offset % 2 == 0 {
+                a & 0xFF
+            } else {
+                (a >> 8) & 0xFF
+            };
+            format!("0x{byte:02X}")
+        }
+        None => {
+            let lit = if offset % 2 == 0 { "LOW" } else { "HIGH" };
+            format!("{lit}({target})")
+        }
+    }
+}
 
 /// `select` plus a parallel per-line source-location vector, index-aligned
 /// with the returned asm text. `None` marks a compiler-generated line (the
@@ -6565,11 +6585,11 @@ pub fn select_with_locs(
             if g.is_const && addrs.contains_key(&g.name) {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    // A function-address field (epic-cc#154) materializes
-                    // the link-time label literal.
+                    // A ref byte materializes its address half from the
+                    // alloc map for RAM targets, else the link-time label
+                    // literal (epic-cc#154).
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                        init.push(format!("    MOVLW {lit}({f})"));
+                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f)));
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
@@ -6664,11 +6684,11 @@ pub fn select_with_locs(
             if g.is_const && addrs.contains_key(&g.name) {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    // A function-address field (epic-cc#154) materializes
-                    // the link-time label literal.
+                    // A ref byte materializes its address half from the
+                    // alloc map for RAM targets, else the link-time label
+                    // literal (epic-cc#154).
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                        init.push(format!("    MOVLW {lit}({f})"));
+                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f)));
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
@@ -6697,11 +6717,11 @@ pub fn select_with_locs(
                 if g.is_const && addrs.contains_key(&g.name) {
                     let base = addrs[&g.name];
                     for (idx, b) in g.bytes.iter().enumerate() {
-                        // A function-address field (epic-cc#154) materializes
-                        // the link-time label literal.
+                        // A ref byte materializes its address half from the
+                        // alloc map for RAM targets, else the link-time label
+                        // literal (epic-cc#154).
                         if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == idx) {
-                            let lit = if idx % 2 == 0 { "LOW" } else { "HIGH" };
-                            init.push(format!("    MOVLW {lit}({f})"));
+                            init.push(format!("    MOVLW {}", ref_byte_operand(addrs, idx, f)));
                         } else {
                             init.push(format!("    MOVLW 0x{b:02X}"));
                         }
@@ -7153,8 +7173,7 @@ pub fn select_with_locs(
             locs.push(None);
             for (i, b) in g.bytes[..256].iter().enumerate() {
                 if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                    let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                    out.push(format!("    RETLW {lit}({f})"));
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f)));
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }
@@ -7173,8 +7192,7 @@ pub fn select_with_locs(
                 for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
                     let abs = start + i;
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == abs) {
-                        let lit = if abs % 2 == 0 { "LOW" } else { "HIGH" };
-                        out.push(format!("    RETLW {lit}({f})"));
+                        out.push(format!("    RETLW {}", ref_byte_operand(addrs, abs, f)));
                     } else {
                         out.push(format!("    RETLW 0x{b:02X}"));
                     }
@@ -7216,12 +7234,11 @@ pub fn select_with_locs(
             out.push(format!("{}:", g.name));
             locs.push(None);
             for (i, b) in g.bytes[..size].iter().enumerate() {
-                // A function-address field (epic-cc#154) materializes the
-                // link-time label literal: byte 0 = LOW(fn), byte 1 =
-                // HIGH(fn), resolved by the assembler's symbol table.
+                // A ref byte materializes its address half from the alloc
+                // map for RAM targets, else the link-time label literal
+                // (epic-cc#154).
                 if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                    let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                    out.push(format!("    RETLW {lit}({f})"));
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f)));
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }
