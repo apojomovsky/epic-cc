@@ -208,44 +208,66 @@ amount N is N steps of `BCF STATUS,C` + `RLCF lo,F` + `RLCF hi,F`, 3
 words/step, so **the baseline to beat is 3*N words for every amount**.
 
 Exhaustive search over this contract does not stay tractable at the
-baseline's own length: the alphabet needed (rotate ops plus the nibble-
-swap family, ~21 symbols) makes `21^9` (amount 4's baseline length) far
-beyond a bounded-effort search. Two methods instead of one:
+baseline's own length: the alphabet needed (rotate ops in both
+directions plus the nibble-swap family, ~28 symbols) makes `28^9`
+(amount 4's baseline length) far beyond a bounded-effort search, and even
+a length-4 bound at that alphabet size is too slow for the default test
+suite (measured: 2.5 minutes for the file, against 5s at length 3). Two
+methods instead of one:
 
-- **Bounded exhaustive search**, up to length 4, over the combined
-  alphabet, run for every amount. Amount 1's 3-word baseline is inside
-  this bound, so a confirmed floor there is a real answer; amounts 2-7
-  mostly find nothing this short, the honest result of the bound, not
-  evidence the baseline is optimal.
+- **Bounded exhaustive search**, up to length 3, over the combined
+  alphabet. Amount 1's 3-word baseline is inside this bound, so a
+  confirmed floor there is a real answer; amounts 2-7 find nothing this
+  short, the honest result of the bound, not evidence the baseline is
+  optimal.
 - **A constructed candidate, verified with the same `verify()` the
-  search engine uses**, not hand-traced: for amount 4, the 8-bit nibble-
-  swap trick generalized across both bytes (`SWAPF` both, mask, recombine
-  the nibble that straddles the byte boundary). For amounts 5-7, that
-  same construction with (amount - 4) more standard rotate steps appended
-  -- valid because a left shift by 4 then k never needs a bit the first
-  step already discarded, so the two compose cleanly.
+  search engine uses**, not hand-traced, checked against the full
+  65536-input domain (not a curated sample, since a construction is one
+  fixed candidate rather than a combinatorial search): for amount 4, the
+  8-bit nibble-swap trick generalized across both bytes (`SWAPF` both,
+  mask, recombine the nibble that straddles the byte boundary). This is
+  one instance of a general family, rotate each byte left by `n`, mask,
+  recombine the bits that straddle the byte boundary, costing
+  `2 * rotate_cost(n) + 7` words; `SWAPF` makes `rotate_cost(4) == 1`.
+
+**A first draft of this section significantly under-found amounts 6 and
+7, and misstated why.** The first draft's alphabet had no right-rotate
+instructions (`RRCF`/`RRNCF`) at all, so it could not express the family
+for any `n` other than 4, at any search length, and the constructed
+candidates for 5-7 were the amount-4 construction with more standard
+rotate steps appended rather than the family's own instance at the
+right `n`. `RRNCF` makes `rotate_cost(6) == 2` (two single-bit right
+rotates equal one left rotate by 6), giving an 11-word amount-6
+construction against the 15 the first draft reported. Amount 7 does
+better still with a different trick (not the family): a 16-bit logical
+right-shift-by-1 (`BCF C` then `RRCF hi,F` then `RRCF lo,F`, carry seeded
+0) turns `x << 7` into a byte move plus one more rotate, 7 words against
+the first draft's 18.
 
 **Results:**
 
-| amount | baseline | bounded search (<=4) | constructed | delta |
+| amount | baseline | bounded search (<=3) | constructed | delta |
 |---|---|---|---|---|
-| 1 | 3 | floor 3 (confirmed minimal) | -- | 0 |
+| 1 | 3 | floor 3 (confirmed minimal, this alphabet, this bound) | -- | 0 |
 | 2 | 6 | nothing found | -- | unknown |
 | 3 | 9 | nothing found | -- | unknown |
 | 4 | 12 | nothing found | **9** | **-3 (25%)** |
-| 5 | 15 | nothing found | **12** | **-3 (20%)** |
-| 6 | 18 | nothing found | **15** | **-3 (16.7%)** |
-| 7 | 21 | nothing found | **18** | **-3 (14.3%)** |
+| 5 | 15 | nothing found | **12** (family instance is 13, worse) | **-3 (20%)** |
+| 6 | 18 | nothing found | **11** | **-7 (38.9%)** |
+| 7 | 21 | nothing found | **7** | **-14 (66.7%)** |
 
-Every amount 4-7 saves exactly 3 words: the nibble-swap construction
-itself is what saves the 3 words (9 vs the 12 a from-scratch unrolled
-amount-4 would cost), and composing further rotate steps on top carries
-that fixed saving forward unchanged, since those extra steps cost the
-standard 3 words each either way. Amounts 2 and 3 have no result either
-way (baseline low enough that a real answer might exist, but the search
-bound could not reach it, and no construction was attempted for them: no
-comparably clean algebraic shortcut exists for a shift that does not
-land on a nibble boundary).
+Amounts 2 and 3 have no result either way: the family construction
+exists at every `n` (cost `2 * rotate_cost(n) + 7`), it simply costs more
+than the `3*n` baseline for `n <= 3`, so nothing was constructed for
+them, not because no shortcut exists off the nibble boundary (the first
+draft's stated reason here was wrong) but because the shortcut that does
+exist loses at these amounts specifically.
+
+**Every constructed candidate above clobbers `W`**, unlike the baseline
+(`BCF`+`RLCF`+`RLCF` never touches it). `run_case`'s clobber check does
+not catch this: `W` is excepted from it by design, the same as `STATUS`
+(see the Method section above). Whoever lands one of these in
+`isel-pic18` needs to confirm `W` is dead at the call site first.
 
 ## Recommendation
 
