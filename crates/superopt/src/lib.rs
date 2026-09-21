@@ -17,15 +17,28 @@ use pic14_sim::Pic18;
 /// One verification case: an entry `W` value, memory pokes to apply to a
 /// fresh `Pic18` before running (typically STATUS flag bits and/or a
 /// poisoned destination byte, to catch a candidate that only works by
-/// accident), and a predicate the halted machine must satisfy. `entry_w` is
-/// its own field rather than folded into `pokes`: `W` is a CPU register,
-/// not a RAM byte, so `Pic18::set_w` is the only way to seed it (a lesson
-/// from epic-cc#514's review: an earlier version of this file looped over
+/// accident), the RAM addresses the candidate is allowed to write to, and
+/// a predicate the halted machine must satisfy. `entry_w` is its own
+/// field rather than folded into `pokes`: `W` is a CPU register, not a RAM
+/// byte, so `Pic18::set_w` is the only way to seed it (a lesson from
+/// epic-cc#514's review: an earlier version of this file looped over
 /// candidate `W` values without ever applying them, which made every
 /// candidate that reads entry `W` a silent false positive).
+///
+/// `allowed_changes` closes a related gap (epic-cc#521): earlier, `check`
+/// was the only thing a candidate had to satisfy, and both targets' checks
+/// only ever looked at their one named destination byte. A candidate that
+/// produced the right answer there while also clobbering some unrelated
+/// RAM byte (a real bug once inlined into real code, since that byte could
+/// be a live value in the caller) would have "verified" anyway.
+/// `run_case` now rejects any byte outside this list that changed from its
+/// post-poke value, `STATUS_ADDR` excepted (flag side effects are
+/// expected and harmless: this crate never claims to find a
+/// flag-preserving sequence, only a value-correct one).
 pub struct Case {
     pub entry_w: u8,
     pub pokes: Vec<(usize, u8)>,
+    pub allowed_changes: &'static [usize],
     pub check: Box<dyn Fn(&Pic18) -> bool>,
 }
 
@@ -82,11 +95,26 @@ fn run_case(words: &[u16], case: &Case) -> bool {
         for &(addr, val) in &case.pokes {
             sim.ram_mut()[addr] = val;
         }
+        let before = *sim.ram();
         sim.run(MAX_STEPS);
         let genuinely_halted = sim.halted() && sim.pc() == sleep_addr;
-        genuinely_halted && (case.check)(&sim)
+        genuinely_halted
+            && no_unexpected_clobber(&before, sim.ram(), case.allowed_changes)
+            && (case.check)(&sim)
     }));
     outcome.unwrap_or(false)
+}
+
+/// Every RAM byte that changed between `before` and `after` is either in
+/// `allowed` or is `STATUS_ADDR` (flag side effects from ALU/skip
+/// instructions are expected and never what a candidate is judged on).
+/// Anything else that moved is a clobber this candidate must not pass on.
+fn no_unexpected_clobber(before: &[u8; 4096], after: &[u8; 4096], allowed: &[usize]) -> bool {
+    before
+        .iter()
+        .zip(after.iter())
+        .enumerate()
+        .all(|(addr, (b, a))| b == a || addr == STATUS_ADDR || allowed.contains(&addr))
 }
 
 /// Restores the previous panic hook on drop, including on unwind: without
@@ -243,6 +271,7 @@ mod tests {
         let cases = vec![Case {
             entry_w: 0,
             pokes: vec![],
+            allowed_changes: &[],
             check: Box::new(|_| true),
         }];
         assert!(!verify(&candidate, &cases));
@@ -260,6 +289,7 @@ mod tests {
             let cases = vec![Case {
                 entry_w: w,
                 pokes: vec![(0x020, 0x55)],
+                allowed_changes: &[0x020],
                 check: Box::new(move |sim: &Pic18| sim.ram()[0x020] == w),
             }];
             assert!(
@@ -282,8 +312,42 @@ mod tests {
         let cases = vec![Case {
             entry_w: 0,
             pokes: vec![],
+            allowed_changes: &[],
             check: Box::new(|_| true), // even an always-true check must not save it
         }];
         assert!(!verify(&candidate, &cases));
+    }
+
+    /// The clobber check itself (epic-cc#521): a candidate that produces
+    /// the right destination value while also writing an unrelated byte
+    /// must not verify, even though `check` only ever looks at the
+    /// destination.
+    #[test]
+    fn a_candidate_that_clobbers_an_unrelated_byte_does_not_verify() {
+        // `CLRF 0x021,A` zeroes a byte the case set never allows to change,
+        // then `MOVWF 0x020,A` correctly stores W to the actual destination.
+        let candidate: Candidate = vec!["clrf 0x021,A", "movwf 0x020,A"];
+        let cases = vec![Case {
+            entry_w: 0x2A,
+            pokes: vec![(0x020, 0x55), (0x021, 0x55)],
+            allowed_changes: &[0x020], // 0x021 is deliberately not listed
+            check: Box::new(|sim: &Pic18| sim.ram()[0x020] == 0x2A),
+        }];
+        assert!(!verify(&candidate, &cases));
+    }
+
+    /// The same candidate verifies once the clobbered byte is declared, so
+    /// the previous test is checking the clobber gate specifically, not
+    /// some other accidental failure.
+    #[test]
+    fn declaring_the_clobbered_byte_lets_it_verify() {
+        let candidate: Candidate = vec!["clrf 0x021,A", "movwf 0x020,A"];
+        let cases = vec![Case {
+            entry_w: 0x2A,
+            pokes: vec![(0x020, 0x55), (0x021, 0x55)],
+            allowed_changes: &[0x020, 0x021],
+            check: Box::new(|sim: &Pic18| sim.ram()[0x020] == 0x2A),
+        }];
+        assert!(verify(&candidate, &cases));
     }
 }
