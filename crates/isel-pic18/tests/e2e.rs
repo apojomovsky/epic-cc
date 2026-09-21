@@ -1018,6 +1018,26 @@ fn switch_dense_table_runs_correctly() {
             i + 3
         );
     }
+    // Each case also writes a second global; asserting it pins per-case
+    // side effects, not just the dispatched value. epic-cc#497 reported
+    // those vanishing on switch-shaped code and no other test covers them.
+    let markers: [u8; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+    for (k, want) in markers.iter().enumerate() {
+        assert_eq!(
+            p.ram()[globals["markers"] as usize + k],
+            *want,
+            "dispatch({k})'s second store into markers[{k}]"
+        );
+    }
+    let markers2: [u8; 8] = [19, 11, 12, 13, 14, 15, 16, 17];
+    for (i, want) in markers2.iter().enumerate() {
+        assert_eq!(
+            p.ram()[globals["markers2"] as usize + i],
+            *want,
+            "dispatch2({})'s second store into markers2[{i}]",
+            i + 3
+        );
+    }
     // No i16 dispatch here: clang folds an i16 switch of this shape
     // into a const lookup before isel runs, so the high-byte reject
     // is pinned by unit test (`i16_dense_switch_checks_the_high_byte`)
