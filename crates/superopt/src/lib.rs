@@ -146,6 +146,17 @@ impl Drop for PanicHookGuard {
     }
 }
 
+/// The panic hook is process-global state: two `shortest` calls racing
+/// from different test threads (epic-cc#520 was the first target file to
+/// call `shortest` from more than one `#[test]` in the same binary) can
+/// interleave `take_hook`/`set_hook`, so one call's `Drop` guard restores
+/// the *other* call's silencing hook instead of the real one, permanently
+/// silencing every later panic in the process, including a genuine
+/// assertion failure's message (found in epic-cc#520's review). Serializes
+/// every `shortest` call on this lock so the hook swap is never observed
+/// mid-flight by another thread.
+static HOOK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Breadth-first over `alphabet`: try every length from 1 up to and
 /// including `max_len`, return every candidate at the first length with at
 /// least one verified hit (not just the first found), so ties are visible.
@@ -153,6 +164,9 @@ impl Drop for PanicHookGuard {
 /// sweep are expected to fail to assemble, and that is not worth a stack
 /// trace per attempt.
 pub fn shortest(alphabet: &[&'static str], cases: &[Case], max_len: usize) -> Vec<Candidate> {
+    let _lock = HOOK_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let _guard = PanicHookGuard(Some(std::panic::take_hook()));
     std::panic::set_hook(Box::new(|_| {}));
     (1..=max_len)
@@ -383,5 +397,35 @@ mod tests {
             check: Box::new(|sim: &Pic18| sim.ram()[0x020] == 0x2A),
         }];
         assert!(!verify(&candidate, &cases));
+    }
+
+    /// `shortest` from more than one thread at once must neither deadlock
+    /// nor corrupt a search's result (epic-cc#520's review: the panic-hook
+    /// swap `shortest` does internally is process-global state, and two
+    /// concurrent calls racing on it previously left the silencing hook
+    /// installed permanently, which this test cannot observe directly
+    /// without risking the std test harness's own `#[should_panic]`
+    /// hook, so it stays scoped to deadlock-freedom and per-call
+    /// correctness: `HOOK_LOCK` serializing the hook swap is the actual
+    /// fix, this is a smoke test that using it works at all).
+    #[test]
+    fn concurrent_shortest_calls_do_not_deadlock_or_corrupt_results() {
+        let handles: Vec<_> = (0..6)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let cases = vec![Case {
+                        entry_w: 0,
+                        pokes: vec![(0x020, 0x55)],
+                        allowed_changes: vec![0x020],
+                        check: Box::new(|sim: &Pic18| sim.ram()[0x020] == 0x00),
+                    }];
+                    shortest(&["clrf 0x020,A", "setf 0x020,A"], &cases, 1)
+                })
+            })
+            .collect();
+        for h in handles {
+            let hits = h.join().expect("shortest panicked or deadlocked");
+            assert_eq!(hits, vec![vec!["clrf 0x020,A"]]);
+        }
     }
 }
