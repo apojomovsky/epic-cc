@@ -53,17 +53,27 @@ TARGET      ?= p16f877a
 # main checkout this is belt and braces, since `.git` is a real mount.
 EPIC_CC_GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null)
 
-# Shared container invocation, so every docker entry point (exec, test,
-# compile, shell) carries the same mounts and the EPIC_CC_GIT_SHA stamp.
-DOCKER_ARGS := --rm \
+# Shared container invocation, so every docker entry point on the dev image
+# (exec, test, compile, shell, check-warnings) carries the same mounts and the
+# EPIC_CC_GIT_SHA stamp. Each bespoke copy was a place to forget one: `shell`
+# lost the sha (#543), and `check-warnings` lost it too. The target-cache mount
+# is the one thing a caller may override, since check-warnings builds into its
+# own dir so a warnings probe cannot poison the normal build cache.
+TARGET_CACHE_MOUNT ?= $(TARGET_CACHE)
+
+# Recursively expanded (=), not immediate, so a target-specific
+# TARGET_CACHE_MOUNT override is still in effect when a recipe expands
+# DOCKER_RUN. With := the value is baked in at parse time and check-warnings
+# would silently build into the shared target dir instead of its own.
+DOCKER_ARGS = --rm \
 	--user $$(id -u):$$(id -g) \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
 	-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-	-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
+	-v $(TARGET_CACHE_MOUNT):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
 	-e "EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA)" \
 	-v $(CURDIR):/workspace -w /workspace
 
-DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
+DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT) && docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
 
 .PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check
 
@@ -157,13 +167,9 @@ lint: image ## Clippy, advisory (never fails the build)
 fuzz: ## Lane B (#286): coverage-guided fuzz of irparse's parser (needs nightly + cargo-fuzz)
 	@$(DOCKER_RUN) bash -c 'cargo install cargo-fuzz --version 0.12.0 2>&1 | tail -1 && cargo fuzz run irparse_parse_ll -- -max_total_time=60'
 
+check-warnings: TARGET_CACHE_MOUNT := $(WARNCHECK_TARGET_CACHE)
 check-warnings: image ## Fail if cargo build --workspace --all-targets emits any warnings
-	@mkdir -p $(CARGO_HOME_CACHE) $(WARNCHECK_TARGET_CACHE)
-	@docker run --rm --user $$(id -u):$$(id -g) \
-		-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
-		-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-		-v $(WARNCHECK_TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
-		-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE) bash -c '\
+	@$(DOCKER_RUN) bash -c '\
 		out=$$(cargo build --workspace --all-targets 2>&1); \
 		warnings=$$(printf "%s\n" "$$out" | grep "^warning:" || true); \
 		if [ -n "$$warnings" ]; then \
