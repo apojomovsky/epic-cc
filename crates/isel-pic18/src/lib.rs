@@ -2199,56 +2199,55 @@ impl<'m> Gen<'m> {
                     // worse than the unroll they replace.
                     if b.op == ir::BinOp::Shl && r > 0 {
                         if active == 1 && r == 4 {
-                            let (a, f) = self.operand(dst + m);
-                            let bank = if a == 0 { "A" } else { "B" };
-                            self.emit(format!("    SWAPF 0x{f:03X},W,{bank}"));
+                            self.emit_banked("SWAPF", dst + m, ",W");
                             self.emit("    ANDLW 0xF0".to_string());
-                            self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                            self.emit_banked("MOVWF", dst + m, "");
                             return;
                         }
                         if n16 == 2 && m == 0 && (4..=7).contains(&r) {
-                            let (la, lf) = self.operand(dst);
-                            let (ha, hf) = self.operand(dst + 1);
-                            let lbank = if la == 0 { "A" } else { "B" };
-                            let hbank = if ha == 0 { "A" } else { "B" };
+                            // Every lane op fetches its operand fresh so a
+                            // dst straddling a bank boundary re-selects BSR
+                            // exactly where the unrolled loop would; caching
+                            // both lanes' bank letters up front misaddresses
+                            // the far lane.
                             match r {
                                 4 | 5 => {
-                                    self.emit(format!("    SWAPF 0x{hf:03X},F,{hbank}"));
+                                    self.emit_banked("SWAPF", dst + 1, ",F");
                                     self.emit("    MOVLW 0xF0".to_string());
-                                    self.emit(format!("    ANDWF 0x{hf:03X},F,{hbank}"));
-                                    self.emit(format!("    SWAPF 0x{lf:03X},W,{lbank}"));
+                                    self.emit_banked("ANDWF", dst + 1, ",F");
+                                    self.emit_banked("SWAPF", dst, ",W");
                                     self.emit("    ANDLW 0x0F".to_string());
-                                    self.emit(format!("    IORWF 0x{hf:03X},F,{hbank}"));
-                                    self.emit(format!("    SWAPF 0x{lf:03X},F,{lbank}"));
+                                    self.emit_banked("IORWF", dst + 1, ",F");
+                                    self.emit_banked("SWAPF", dst, ",F");
                                     self.emit("    MOVLW 0xF0".to_string());
-                                    self.emit(format!("    ANDWF 0x{lf:03X},F,{lbank}"));
+                                    self.emit_banked("ANDWF", dst, ",F");
                                     if r == 5 {
                                         self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
-                                        self.emit(format!("    RLCF 0x{lf:03X},F,{lbank}"));
-                                        self.emit(format!("    RLCF 0x{hf:03X},F,{hbank}"));
+                                        self.emit_banked("RLCF", dst, ",F");
+                                        self.emit_banked("RLCF", dst + 1, ",F");
                                     }
                                 }
                                 6 => {
-                                    self.emit(format!("    RRNCF 0x{hf:03X},F,{hbank}"));
-                                    self.emit(format!("    RRNCF 0x{hf:03X},F,{hbank}"));
+                                    self.emit_banked("RRNCF", dst + 1, ",F");
+                                    self.emit_banked("RRNCF", dst + 1, ",F");
                                     self.emit("    MOVLW 0xC0".to_string());
-                                    self.emit(format!("    ANDWF 0x{hf:03X},F,{hbank}"));
-                                    self.emit(format!("    RRNCF 0x{lf:03X},F,{lbank}"));
-                                    self.emit(format!("    RRNCF 0x{lf:03X},F,{lbank}"));
-                                    self.emit(format!("    MOVF 0x{lf:03X},W,{lbank}"));
+                                    self.emit_banked("ANDWF", dst + 1, ",F");
+                                    self.emit_banked("RRNCF", dst, ",F");
+                                    self.emit_banked("RRNCF", dst, ",F");
+                                    self.emit_banked("MOVF", dst, ",W");
                                     self.emit("    ANDLW 0x3F".to_string());
-                                    self.emit(format!("    IORWF 0x{hf:03X},F,{hbank}"));
+                                    self.emit_banked("IORWF", dst + 1, ",F");
                                     self.emit("    MOVLW 0xC0".to_string());
-                                    self.emit(format!("    ANDWF 0x{lf:03X},F,{lbank}"));
+                                    self.emit_banked("ANDWF", dst, ",F");
                                 }
                                 7 => {
                                     self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
-                                    self.emit(format!("    RRCF 0x{hf:03X},F,{hbank}"));
-                                    self.emit(format!("    RRCF 0x{lf:03X},F,{lbank}"));
-                                    self.emit(format!("    MOVF 0x{lf:03X},W,{lbank}"));
-                                    self.emit(format!("    MOVWF 0x{hf:03X},{hbank}"));
-                                    self.emit(format!("    CLRF 0x{lf:03X},{lbank}"));
-                                    self.emit(format!("    RRCF 0x{lf:03X},F,{lbank}"));
+                                    self.emit_banked("RRCF", dst + 1, ",F");
+                                    self.emit_banked("RRCF", dst, ",F");
+                                    self.emit_banked("MOVF", dst, ",W");
+                                    self.emit_banked("MOVWF", dst + 1, "");
+                                    self.emit_banked("CLRF", dst, "");
+                                    self.emit_banked("RRCF", dst, ",F");
                                 }
                                 _ => unreachable!(),
                             }

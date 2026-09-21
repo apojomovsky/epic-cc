@@ -145,8 +145,10 @@ fn const_shl_i16_emits_rlcf_chain() {
 /// Compiles `out = a << k` (i16) through the real selector, assembles, and
 /// simulates every 16-bit input against the shift's arithmetic meaning,
 /// with a per-case entry W so a construction that depends on stale W
-/// fails loudly instead of only on curated inputs.
-fn assert_shl16_domain_exact(k: i64) {
+/// fails loudly instead of only on curated inputs. `dst` is the shift's
+/// temp base: access-bank layouts hide bank-selection bugs, so straddle
+/// layouts must go through here too.
+fn assert_shl16_domain_exact(k: i64, dst: u16) {
     let m = parse(&format!(
         "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
          %1 = load i16 @a\n    %2 = shl i16 %1, {k}\n    store i16 %2 @out\n    ret void\n"
@@ -155,7 +157,7 @@ fn assert_shl16_domain_exact(k: i64) {
         ("a", 0x20),
         ("out", 0x24),
         ("main::1", 0x26),
-        ("main::2", 0x28),
+        ("main::2", dst),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
@@ -166,7 +168,7 @@ fn assert_shl16_domain_exact(k: i64) {
         p.set_w((x as u8) ^ ((x >> 8) as u8));
         p.run(200);
         let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
-        assert_eq!(got, x << k, "a={x:#06x} << {k}");
+        assert_eq!(got, x << k, "a={x:#06x} << {k} (dst={dst:#06x})");
         assert!(p.halted(), "program must run to completion (a={x:#06x})");
     }
 }
@@ -174,7 +176,20 @@ fn assert_shl16_domain_exact(k: i64) {
 #[test]
 fn const_shl_i16_constructions_are_exact_for_amounts_4_to_7() {
     for k in [4, 5, 6, 7] {
-        assert_shl16_domain_exact(k);
+        assert_shl16_domain_exact(k, 0x28);
+    }
+}
+
+#[test]
+fn const_shl_i16_constructions_survive_bank_straddle_layouts() {
+    // dst at 0x05F crosses the access-bank edge, 0x0FF and 0x1FF put the
+    // two lanes in different banks: every construction op must address
+    // its lane through a freshly fetched operand, not a cached bank
+    // letter, or the far lane silently lands 0x100 bytes away.
+    for dst in [0x05F, 0x0FF, 0x1FF] {
+        for k in [4, 5, 6, 7] {
+            assert_shl16_domain_exact(k, dst);
+        }
     }
 }
 
@@ -299,31 +314,37 @@ fn const_lshr_i16_by_4_keeps_the_unrolled_form() {
 
 #[test]
 fn const_shl_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
-    let m = parse(
-        "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
-         %1 = load i8 @a\n    %2 = shl i8 %1, 4\n    store i8 %2 @out\n    ret void\n",
-    );
-    let addrs = addrs(&[
-        ("a", 0x20),
-        ("out", 0x21),
-        ("main::1", 0x22),
-        ("main::2", 0x23),
-    ]);
-    let asm = select(&PIC18F4550, &m, &addrs, None);
-    assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
-    assert_eq!(
-        asm.matches("SWAPF 0x023,W,A").count(),
-        1,
-        "swap through W, mask, store:\n{asm}"
-    );
-    let words = asm::assemble_pic18(&asm);
-    for b in 0..=u8::MAX {
-        let mut p = pic14_sim::Pic18::new(words.clone());
-        p.ram_mut()[0x20] = b;
-        p.set_w(!b);
-        p.run(200);
-        assert_eq!(p.ram()[0x21], b << 4, "a={b:#04x} << 4");
-        assert!(p.halted(), "program must run to completion (a={b:#04x})");
+    // dst at 0x1FF checks the banked form of the same trick; the access
+    // layout additionally pins the exact access-mode operand text.
+    for dst in [0x23, 0x1FF] {
+        let m = parse(
+            "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+             %1 = load i8 @a\n    %2 = shl i8 %1, 4\n    store i8 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x21),
+            ("main::1", 0x22),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
+        if dst == 0x23 {
+            assert_eq!(
+                asm.matches("SWAPF 0x023,W,A").count(),
+                1,
+                "swap through W, mask, store:\n{asm}"
+            );
+        }
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = b;
+            p.set_w(!b);
+            p.run(200);
+            assert_eq!(p.ram()[0x21], b << 4, "a={b:#04x} << 4 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
     }
 }
 
@@ -331,33 +352,71 @@ fn const_shl_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
 fn const_shl_i16_by_12_rotates_only_the_surviving_lane() {
     // k = 12 splits into a one-byte move plus a 4-bit residual over the
     // single surviving lane: the SWAPF trick applies there, not the
-    // 16-bit construction, and no RLCF step may remain.
-    let m = parse(
-        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
-         %1 = load i16 @a\n    %2 = shl i16 %1, 12\n    store i16 %2 @out\n    ret void\n",
-    );
-    let addrs = addrs(&[
-        ("a", 0x20),
-        ("out", 0x24),
-        ("main::1", 0x26),
-        ("main::2", 0x28),
-    ]);
-    let asm = select(&PIC18F4550, &m, &addrs, None);
-    assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
-    assert_eq!(
-        asm.matches("SWAPF 0x029,W,A").count(),
-        1,
-        "residual on the surviving lane only:\n{asm}"
-    );
-    let words = asm::assemble_pic18(&asm);
-    for x in 0..=u16::MAX {
-        let mut p = pic14_sim::Pic18::new(words.clone());
-        p.ram_mut()[0x20] = x as u8;
-        p.ram_mut()[0x21] = (x >> 8) as u8;
-        p.set_w((x as u8) & ((x >> 8) as u8));
-        p.run(200);
-        let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
-        assert_eq!(got, x << 12, "a={x:#06x} << 12");
+    // 16-bit construction, and no RLCF step may remain. dst at 0x0FF
+    // puts that lane in the next bank.
+    for dst in [0x28, 0x0FF] {
+        let m = parse(
+            "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n\
+             %1 = load i16 @a\n    %2 = shl i16 %1, 12\n    store i16 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x26),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        for x in 0..=u16::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = x as u8;
+            p.ram_mut()[0x21] = (x >> 8) as u8;
+            p.set_w((x as u8) & ((x >> 8) as u8));
+            p.run(200);
+            let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+            assert_eq!(got, x << 12, "a={x:#06x} << 12 (dst={dst:#06x})");
+        }
+    }
+}
+
+#[test]
+fn const_shl_i32_by_28_rotates_only_the_surviving_lane() {
+    // m = 3 leaves one live lane, so the SWAPF trick fires there too.
+    // dst at 0x0FD puts that lane (dst+3 = 0x100) in a fresh bank.
+    for dst in [0x30, 0x0FD] {
+        let m = parse(
+            "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+             %1 = load i32 @a\n    %2 = shl i32 %1, 28\n    store i32 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x40),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RLCF").count(), 0, "no unroll steps:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = b;
+            p.ram_mut()[0x21] = b ^ 0x5A;
+            p.ram_mut()[0x22] = !b;
+            p.ram_mut()[0x23] = b.rotate_left(3);
+            p.set_w(b);
+            p.run(300);
+            let got = u32::from(p.ram()[0x24])
+                | u32::from(p.ram()[0x25]) << 8
+                | u32::from(p.ram()[0x26]) << 16
+                | u32::from(p.ram()[0x27]) << 24;
+            let x = u32::from(b)
+                | u32::from(b ^ 0x5A) << 8
+                | u32::from(!b) << 16
+                | u32::from(b.rotate_left(3)) << 24;
+            assert_eq!(got, x << 28, "a={x:#010x} << 28 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
     }
 }
 
