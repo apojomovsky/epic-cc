@@ -1,16 +1,27 @@
 //! Target 1 (epic-cc#514, epic-cc#501): materialize `dst = (Z ? 1 : 0)`
 //! after some prior comparison has already set STATUS.Z. #501's repro
-//! (`y = (x == 4u)`) currently lowers to a 4-word branch diamond:
+//! (`y = (x == 4u)`) currently lowers to, word for word:
 //!
 //! ```text
-//! BRA tmp0 / MOVLW 0x00 / BRA tmp2 / MOVLW 0x01 / (MOVWF, outside the diamond)
+//! BRA tmp0 / MOVLW 0x00 / BRA tmp2 / MOVLW 0x01 / MOVWF dst
 //! ```
 //!
-//! and the ticket names two hand-derived candidates to confirm: `CLRF dst;
-//! B<inv> skip; INCF dst,F` (3 words) and, speculatively, a 2-word
-//! carry-based sequence. This is a pure post-compare tail: the contract
-//! never re-derives the comparison, it only consumes the Z bit a prior
-//! SUBWF already set.
+//! 4 words for the diamond plus the `MOVWF` that stores it, 5 words total;
+//! the ticket's own text is explicit that the diamond count (4) excludes
+//! that store. This spike's contract always ends with the value in RAM
+//! (the diamond is only useful once stored), so every count in this file
+//! is "including the store", and the isel-pic18 baseline to beat is **5**,
+//! not 4.
+//!
+//! The ticket also names a hand-derived 3-word candidate, `CLRF dst; B<inv>
+//! skip; INCF dst,F`. **It does not verify**: `CLRF` always sets Z (the
+//! result of clearing anything to zero is zero), so it destroys the very
+//! Z bit the branch right after it needs to read. Confirmed both by this
+//! search (candidates built from `clrf` never verify against a case set
+//! that varies incoming Z independently of the `clrf`) and by hand: `CLRF
+//! dst` given entry Z=0 leaves Z=1 after the `CLRF`, so `B<inv>` reads the
+//! wrong flag. Landing that fix as literally written would be a
+//! miscompile, not a density win; see docs/41-superopt-spike-findings.md.
 //!
 //! Destination register: 0x020 (an arbitrary access-bank GPR; which
 //! physical address `alloc` actually picks does not affect which
@@ -21,12 +32,16 @@ use superopt::{shortest, Case, STATUS_ADDR, STATUS_C_BIT, STATUS_Z_BIT};
 
 const DST: usize = 0x020;
 
-/// Every (Z, C, W, poisoned-dst) combination this contract must survive.
-/// Z is the actual signal; C and W are dimensions a correct candidate must
-/// not depend on (a candidate that happens to reuse a stale C or W value
-/// would pass a Z-only case set by accident). The destination starts
-/// poisoned to a value that is wrong for *both* outcomes (0x55), so a
-/// candidate that silently leaves it untouched also fails.
+/// Every (Z, C, entry-W, poisoned-dst) combination this contract must
+/// survive. Z is the actual signal; C and entry W are dimensions a correct
+/// candidate must not depend on. `entry_w` reaches the machine via
+/// `Case::entry_w` (`Pic18::set_w`), not a RAM poke: an earlier version of
+/// this file looped over W values without ever applying them, which made
+/// every candidate that reads entry W (e.g. `MOVWF dst` with no preceding
+/// `MOVLW`) a silent false positive, caught in epic-cc#514's review. The
+/// destination starts poisoned to a value that is wrong for *both*
+/// outcomes (0x55), so a candidate that silently leaves it untouched also
+/// fails.
 fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for z in [false, true] {
@@ -41,10 +56,10 @@ fn cases() -> Vec<Case> {
                 }
                 let expect: u8 = if z { 1 } else { 0 };
                 cases.push(Case {
+                    entry_w: w,
                     pokes: vec![(STATUS_ADDR, status), (DST, 0x55)],
                     check: Box::new(move |sim: &Pic18| sim.ram()[DST] == expect),
                 });
-                let _ = w; // W is not poked (candidates never read stale W here); kept named for the case matrix's documentation value.
             }
         }
     }
@@ -76,28 +91,24 @@ const ALPHABET: &[&str] = &[
 #[test]
 fn shortest_z_to_byte_materialization() {
     let cases = cases();
-    let hits = shortest(ALPHABET, &cases, 4);
+    let hits = shortest(ALPHABET, &cases, 5);
     assert!(
         !hits.is_empty(),
-        "no verified candidate up to length 4; isel-pic18's own 4-word diamond \
+        "no verified candidate up to length 5; isel-pic18's own 5-word diamond+store \
          would then already be shortest-known within this alphabet"
     );
     let len = hits[0].len();
     eprintln!(
-        "bool-materialize: {} word(s), {} candidate(s) at that length (isel-pic18 today: 4 words)",
+        "bool-materialize (incl. store): {} word(s), {} candidate(s) at that length \
+         (isel-pic18 today: 5 words, diamond + MOVWF)",
         len,
         hits.len()
     );
     for hit in &hits {
         eprintln!("  {hit:?}");
     }
-    // The ticket's own hand-derived 3-word candidate is a plausible floor;
-    // assert the search does at least as well as that, so a regression in
-    // the alphabet or case set (one that accidentally makes verification
-    // easier) would show up as "found nothing" rather than as silently
-    // reporting something worse than the human already had.
     assert!(
-        len <= 3,
-        "expected the search to match or beat the ticket's hand-derived 3-word candidate, got {len}"
+        len < 5,
+        "expected the search to beat isel-pic18's current 5-word diamond+store, got {len}"
     );
 }

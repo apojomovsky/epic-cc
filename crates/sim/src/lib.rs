@@ -2010,6 +2010,12 @@ impl Pic18 {
     pub fn w(&self) -> u8 {
         self.w
     }
+    /// Set `W` before running, for a caller that needs to seed a specific
+    /// entry state rather than relying on `new`'s always-zero reset
+    /// (`crates/superopt`'s verification cases, epic-cc#514).
+    pub fn set_w(&mut self, w: u8) {
+        self.w = w;
+    }
     pub fn pc(&self) -> u32 {
         self.pc
     }

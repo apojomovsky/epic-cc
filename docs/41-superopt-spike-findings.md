@@ -15,6 +15,13 @@ The tool lives in `crates/superopt`. It reads `crates/asm`'s encoder
 needing its own syntax checker) and `crates/sim`'s `Pic18` simulator as the
 equivalence oracle. It does not touch `crates/isel-pic18`.
 
+**This document went through one internal review round before merge.** A
+first draft of the search reported false-positive results on 3 of 5
+published sequences because the entry `W` register was never actually
+seeded (see "A soundness bug the review caught" below); the numbers and
+candidates in this document are all post-fix, re-run, and independently
+re-checked.
+
 ## Step 0: is the simulator a faithful oracle for this?
 
 `Pic18` is already used as a behavioral gate elsewhere (XC8-differential
@@ -54,12 +61,40 @@ instructions, no peripherals, no interrupts), with the gpsim-parity gap on
 PIC18 as a known, not eliminated, residual risk.** A production
 integration should not skip past this; see Recommendation.
 
+## A soundness bug the review caught
+
+The first draft's `Case` type carried only RAM pokes, and both target
+tests looped over candidate entry-`W` values without any way to apply
+them: `Pic18::new` hard-codes `w: 0`, so every run silently started with
+`W == 0` regardless of what the test loop intended. Concretely, this made
+`MOVWF dst` (store W to the destination) verify as correct in both
+targets, because the only W value ever exercised was the one already
+sitting in a fresh machine, not because the candidate was actually
+independent of entry W. 3 of the 5 sequences the first draft reported were
+false positives on that account, and the bool-materialization target's
+headline word count was wrong as a result (see below).
+
+Fixed by giving `Case` a real `entry_w: u8` field and `Pic18::set_w`
+(`crates/sim/src/lib.rs`) to apply it before each run, plus two new tests
+(`entry_w_reaches_the_machine`, and widening both targets' case sets to
+vary entry `W` for real). The review also caught two smaller soundness
+gaps in the same pass, both fixed: `run_case` accepted `Pic18::halted()`
+on its own, but the simulator also reports `halted` when `pc` merely runs
+off the end of `prog`, which happens for a candidate whose last
+instruction is a taken skip that jumps past the appended `sleep` entirely;
+`run_case` now additionally checks that `pc` lands exactly on the `sleep`
+instruction's own address. And `shortest`'s panic-hook silencing (most
+candidates in a brute-force sweep are expected to fail to assemble, which
+is not worth a stack trace per attempt) now restores the previous hook via
+a `Drop` guard, so a panic that somehow escapes `verify`'s own
+`catch_unwind` cannot leave every later panic in the same process silent.
+
 ## Method
 
 - A candidate is plain PIC18 asm text from a curated alphabet (not the full
   ISA; see each target's scoping note), assembled for real, run on a fresh
   `Pic18` per case with `SLEEP` appended so the run has a deterministic
-  stop point.
+  stop point, checked with entry `W` seeded via `Pic18::set_w`.
 - No labels: the alphabet's conditional instructions are `BTFSC`/`BTFSS`,
   which skip exactly the next line on real hardware, so no branch-target
   resolution is needed to search straight-line sequences.
@@ -68,64 +103,87 @@ integration should not skip past this; see Recommendation.
   any verified hit is reported in full (every candidate at that length, not
   just the first).
 - A "verified" candidate matches every case in a curated case set, not
-  every possible input: each target's test names exactly what the case set
-  covers and what it deliberately does not (see below).
+  every possible input: each target's test names what the case set
+  covers. Neither target's `check` predicate inspects anything beyond the
+  destination byte; a candidate that also clobbers `W`, `STATUS`, or an
+  unrelated GPR would still "verify" here. That did not matter for either
+  contract's actual winners in practice (checked by hand against each
+  reported sequence below), but it is a real limitation of the harness,
+  not a claim this spike makes and keeps: a wider follow-up should check
+  the full machine state a caller could observe, not just one byte.
 
 ## Target 1: bool-materialization (epic-cc#501)
 
 Contract: after some prior comparison has already set `STATUS.Z`,
-materialize `dst = (Z ? 1 : 0)`. `isel-pic18` currently emits a 4-word
-branch diamond (`BRA`/`MOVLW`/`BRA`/`MOVLW`) for this, the largest single
-sink the density profiler named besides struct copies (816 words, 204
-sites). The ticket names two hand-derived candidates to check: `CLRF dst;
-B<inv> skip; INCF dst,F` (3 words), and speculates a 2-word carry-based
-sequence might exist.
+materialize `dst = (Z ? 1 : 0)`, store included. `isel-pic18`'s current
+`BRA tmp0 / MOVLW 0x00 / BRA tmp2 / MOVLW 0x01` diamond is 4 words, and
+the `MOVWF` that stores it (outside the diamond in the ticket's own count)
+is a 5th; this spike's contract always ends with the value in RAM, so
+every count here is "including the store", and **the isel-pic18 baseline
+to beat is 5 words, not 4.**
 
-Case set: every combination of Z, C, and W (`false`/`true` x
-`false`/`true` x three W values), with the destination byte poisoned to
-`0x55` before each run, 12 cases. C and W are dimensions a correct
-candidate must not depend on; poisoning the destination catches a
-candidate that silently leaves it untouched.
+Case set: every combination of Z, C, and entry W (2 x 2 x 3 = 12 cases),
+with the destination byte poisoned to `0x55` before each run. C and W are
+dimensions a correct candidate must not depend on; poisoning the
+destination catches a candidate that silently leaves it untouched.
 
-**Result: exhaustive search up to length 4 finds a floor of 3 words**, two
-candidates:
+**Result: exhaustive search up to length 5 finds a floor of 4 words**, 9
+candidates, e.g.:
 
 ```
-btfsc 0xFD8,2,A / movlw 0x01 / movwf 0x020,A
-movwf 0x020,A   / btfsc 0xFD8,2,A / incf 0x020,F,A
+movlw 0x01 / movwf 0x020,A / btfss 0xFD8,2,A / clrf 0x020,A
+movlw 0x00 / btfsc 0xFD8,2,A / movlw 0x01 / movwf 0x020,A
 ```
 
-This matches the ticket's hand-derived candidate and, within this
-alphabet and case set, rules out anything shorter: no 1- or 2-word
-sequence verifies. It does **not** confirm or deny the ticket's 2-word
-carry-based speculation, since that reshapes the *comparison* itself
+One word better than isel-pic18's current 5, across 204 sites (per the
+density profiler's count on `hal-pic18-menu-demo-18f4550`): roughly 200
+words, not the larger number the first (buggy) draft of this document
+reported.
+
+**The ticket's own hand-derived 3-word candidate, `CLRF dst; B<inv> skip;
+INCF dst,F`, does not verify, and should not be implemented as written.**
+`CLRF` always sets `Z` (clearing anything to zero always produces zero),
+so it destroys the incoming `Z` bit the very next instruction needs to
+read, before that instruction ever reads it. Confirmed both by the search
+(no `clrf`-first candidate verifies against a case set that varies
+incoming Z independently) and by hand-tracing the sequence. This is a
+correctness finding distinct from the density work: landing #501 by
+implementing its own suggested fix literally would be a miscompile, not a
+density win. Filed as a comment on epic-cc#501 directly.
+
+This spike does not confirm or deny the ticket's other speculation, a
+2-word carry-based sequence: that reshapes the *comparison* itself
 (producing carry instead of just Z), a different, wider contract than the
 one searched here.
 
 ## Target 2: shift-left-4 (epic-cc#505), scoped to 8-bit
 
 epic-cc#505's repro is 16-bit (`x <<= 4` on `unsigned int`, 12 words: four
-`BCF STATUS,C` + two `RLCF` steps). This spike scopes down to a single
-byte shifted in place, the natural first slice: the unrolled baseline for
-one byte's worth of the same pattern is 4 steps of `BCF`+`RLCF`, 8 words.
+steps of `BCF STATUS,C` + `RLCF`/`RLCF`). This spike scopes down to a
+single byte shifted in place, the natural first slice: the unrolled
+baseline for one byte's worth of the same pattern is 4 steps of
+`BCF`+`RLCF`, 8 words.
 
-Case set: 20 cases crossing a curated set of low nibbles (0x0, 0x1, 0x7,
-0x8, 0xF: zero, a lone low bit, a lone high bit within the nibble, all
-ones) against a curated set of high nibbles (0x0, 0x3, 0x8, 0xF), checking
-that the incoming high nibble never leaks into the shifted-out result.
-This is deliberately not exhaustive over all 256 byte values; masks for
-nibble/byte-boundary bit operations are naturally power-of-two shaped, so
-the alphabet's literals (`0xF0`, `0x0F`) are curated the same way, and the
+Case set: 5 low nibbles (0x0, 0x1, 0x7, 0x8, 0xF: zero, a lone low bit, a
+lone high bit within the nibble, all ones) x 4 high nibbles (0x0, 0x3,
+0x8, 0xF, checking the incoming high nibble never leaks into the shifted
+result) x 3 entry-W values x 2 entry-C values, 120 cases. Not exhaustive
+over all 256 byte values or all 256 W values; masks for nibble/byte-
+boundary bit operations are naturally power-of-two shaped, so the
+alphabet's literals (`0xF0`, `0x0F`) are curated the same way, and the
 case set matches that scope.
 
-**Result: exhaustive search up to length 4 finds a floor of 3 words**,
-three candidates, all built on `SWAPF`:
+**Result: exhaustive search up to length 4 finds a floor of 3 words, one
+candidate, genuinely W- and C-independent:**
 
 ```
 swapf 0x020,W,A / andlw 0xF0 / movwf 0x020,A
-iorlw 0xF0 / swapf 0x020,F,A / andwf 0x020,F,A
-swapf 0x020,F,A / iorlw 0xF0 / andwf 0x020,F,A
 ```
+
+(Two other 3-word candidates the first draft of this document reported,
+built on `IORLW 0xF0` after a `SWAPF ...,F`, turned out to depend on entry
+W's low nibble already being clear; they no longer verify against the
+corrected case set and are not real.)
 
 `SWAPF` (nibble swap, one instruction, no flags) plus a mask beats the
 unrolled rotate loop by 5 of 8 words (62.5%) for the single-byte case. This
@@ -135,31 +193,36 @@ scoped to.
 
 ## Recommendation
 
-**Worth a follow-up integration ticket, scoped narrowly.** Both targets
-found real, verified wins within budget, and target 2 in particular
-(`SWAPF`+mask for a nibble-aligned shift) is a concrete, unclaimed codegen
-opportunity distinct from what #505 already proposed (which only covers
-shift-by-a-multiple-of-8 today, per #470). Recommended scope for that
+**Worth a follow-up integration ticket, scoped narrowly.** Target 2 in
+particular (`SWAPF`+mask for a nibble-aligned shift) is a concrete,
+unclaimed codegen opportunity distinct from what #505 already proposed
+(which only covers shift-by-a-multiple-of-8 today, per #470). Target 1's
+win is smaller than first reported (1 word/site, not more) but still real,
+and more importantly the search disproved the ticket's own proposed fix
+before it could ship as a correctness bug. Recommended scope for that
 follow-up, not attempted here:
 
 - Generalize target 2 to the 16-bit case #505 actually reports against,
   and to shift amounts other than 4 (shift-by-4-mod-8 is the case
   `SWAPF` wins outright; other amounts likely need a different, possibly
   worse, trade).
-- Widen target 1's case set from curated W/C values to the full 256 x 2 x
-  2 domain now that the search itself is proven fast (the current run
-  finishes in well under a second; full coverage is cheap).
+- Widen target 1's case set from a curated 12 cases to the full 256 x 2 x
+  2 W/Z/C domain; the search itself is fast at this alphabet size, so this
+  is a small extension, not a redesign.
+- Widen `Case::check` to inspect the whole observable machine state
+  (`W`, `STATUS`, and any GPR outside the destination), not just the
+  destination byte, before trusting a wider alphabet's results.
 - Decide, before wiring anything into `isel-pic18`: does closing the
   gpsim-parity gap on PIC18 (an independent semantic cross-check, not just
   the acceptance test and this spike's three direct checks) become a
   prerequisite once a superoptimizer result is trusted enough to change
-  shipped codegen, rather than just to confirm a human's hand-derived
-  candidate.
+  shipped codegen, rather than just to confirm or disprove a human's
+  hand-derived candidate.
 
 **Not recommended for this spike's stretch goals yet:** an LLM in the
 search loop, or an SMT-based prover in place of exhaustive-input
 simulation. Both alphabets here were small enough that brute force finished
-before either would have mattered; reach for them only once a target
+well within a normal test run; reach for either only once a target
 primitive's input or instruction-alphabet domain is too large to enumerate
 directly, and say so explicitly when that happens rather than reaching for
 either as a default.

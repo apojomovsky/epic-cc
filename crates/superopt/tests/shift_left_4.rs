@@ -1,8 +1,8 @@
 //! Target 2 (epic-cc#514, epic-cc#505): `x <<= 4` on a single byte,
 //! in place. epic-cc#505's repro is 16-bit (`x << 4` on `unsigned int`,
-//! 12 words: four `BCF STATUS,C` + `RLCF`/`RLCF` steps). This spike scopes
-//! down to the 8-bit, single-register case rather than the full 16-bit
-//! contract: the unrolled baseline for one byte's worth of that same
+//! 12 words: four steps of `BCF STATUS,C` + `RLCF`/`RLCF`). This spike
+//! scopes down to the 8-bit, single-register case rather than the full
+//! 16-bit contract: the unrolled baseline for one byte's worth of that same
 //! pattern is 4 steps of `BCF`+`RLCF`, 8 words, and the nibble-swap trick
 //! below is a byte-local operation, so it is the natural first slice to
 //! verify before claiming anything about the 16-bit generalization (left
@@ -12,26 +12,37 @@
 //! in place, matching how `x <<= n` compiles: same address in and out).
 
 use pic14_sim::Pic18;
-use superopt::{shortest, Case};
+use superopt::{shortest, Case, STATUS_ADDR, STATUS_C_BIT};
 
 const REG: usize = 0x020;
 
-/// A curated, non-exhaustive set of (low nibble, high nibble) pairs: every
-/// low nibble that appears (0x0, 0x1, 0x7, 0x8, 0xF covers 0, a lone low
-/// bit, a lone high bit within the nibble, and all-ones) crossed with a
-/// few high nibbles, to catch a candidate that incorrectly lets the
-/// incoming high nibble leak into the result (it must not: shifted-out
-/// bits are gone, not wrapped).
+/// A curated, non-exhaustive set of (low nibble, high nibble) pairs crossed
+/// with entry `W` and entry `C`, dimensions a correct candidate must not
+/// depend on (the alphabet includes `RLCF`, which reads `C`, and several
+/// `W`-touching instructions; epic-cc#514's review found the original
+/// version of this file fixed both at their sim-default values instead of
+/// varying them, which would have hidden a candidate that only worked by
+/// accident). Low nibbles 0x0, 0x1, 0x7, 0x8, 0xF cover zero, a lone low
+/// bit, a lone high bit within the nibble, and all-ones; high nibbles
+/// 0x0/0x3/0x8/0xF catch a candidate that lets the incoming high nibble
+/// leak into the result (it must not: shifted-out bits are gone, not
+/// wrapped).
 fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
     for lo in [0x0u8, 0x1, 0x7, 0x8, 0xF] {
         for hi in [0x0u8, 0x3, 0x8, 0xF] {
-            let v = (hi << 4) | lo;
-            let expect = (lo << 4) & 0xFF;
-            cases.push(Case {
-                pokes: vec![(REG, v)],
-                check: Box::new(move |sim: &Pic18| sim.ram()[REG] == expect),
-            });
+            for w in [0x00u8, 0xFF, 0x2A] {
+                for c in [false, true] {
+                    let v = (hi << 4) | lo;
+                    let expect = (lo << 4) & 0xFF;
+                    let status = if c { STATUS_C_BIT } else { 0 };
+                    cases.push(Case {
+                        entry_w: w,
+                        pokes: vec![(REG, v), (STATUS_ADDR, status)],
+                        check: Box::new(move |sim: &Pic18| sim.ram()[REG] == expect),
+                    });
+                }
+            }
         }
     }
     cases
