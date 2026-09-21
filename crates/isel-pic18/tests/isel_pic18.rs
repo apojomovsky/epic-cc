@@ -4033,6 +4033,36 @@ fn negative_base_switch_keeps_the_compare_chain() {
 }
 
 #[test]
+fn icmp_result_needs_no_literal_diamond() {
+    // epic-cc#503's sink: the comparison result reaches its byte slot
+    // through `BRA join / MOVLW 0 / BRA out / MOVLW 1`. Clearing the slot
+    // before the compare leaves the branches selecting between "already
+    // zero" and one `INCF`, so no literal is loaded at all.
+    let m = parse(
+        "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @a\n    %2 = icmp eq i8 %1, 4\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVLW 0x00") && !asm.contains("MOVLW 0x01"),
+        "no literal arms:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (av, expect) in [(4u8, 1u8), (3, 0), (5, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x20] = av;
+        p.run(200);
+        assert_eq!(p.ram()[0x21], expect, "eq({av},4)");
+    }
+}
+
+#[test]
 fn icmp_eq_zero_skips_the_literal_subtract() {
     // `x == 0` consumes only Z, and `MOVF f,W` sets Z from `f` itself. The
     // `MOVLW 0x00`/`SUBWF` pair it replaces is the epic-cc#503 sink.
@@ -4058,6 +4088,157 @@ fn icmp_eq_zero_skips_the_literal_subtract() {
         p.ram_mut()[0x10] = xv;
         p.run(200);
         assert_eq!(p.ram()[0x11], expect, "eq({xv},0)");
+    }
+}
+
+#[test]
+fn icmp_ordering_predicates_also_skip_the_diamond() {
+    // The pre-clear is sound for every predicate, not just eq/ne: it only
+    // relies on `dst` overlapping nothing the compare reads.
+    for (pred, av, expect) in [
+        ("ult", 3u8, 1u8),
+        ("ult", 4, 0),
+        ("ugt", 5, 1),
+        ("ugt", 4, 0),
+        ("ule", 4, 1),
+        ("ule", 5, 0),
+        ("uge", 5, 1),
+        ("uge", 3, 0),
+        ("slt", 0xFF, 1),
+        ("sge", 0xFF, 0),
+        ("sgt", 0x80, 0),
+        ("sle", 0x80, 1),
+    ] {
+        let m = parse(&format!(
+            "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load i8 @a\n    %2 = icmp {pred} i8 %1, 4\n    store i8 %2 @out\n    ret void\n"
+        ));
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x21),
+            ("main::1", 0x22),
+            ("main::2", 0x23),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert!(
+            !asm.contains("MOVLW 0x00") && !asm.contains("MOVLW 0x01"),
+            "{pred} has no literal diamond:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        for (v, e) in [
+            (av, expect),
+            (4, u8::from(matches!(pred, "ule" | "uge" | "sle" | "sge"))),
+        ] {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = v;
+            p.run(200);
+            assert_eq!(p.ram()[0x21], e, "{pred}({v}, 4)");
+        }
+    }
+}
+
+#[test]
+fn icmp_i32_result_needs_no_literal_diamond() {
+    // The widest equality path: four byte compares feeding one result slot.
+    // Both operands are registers so the literal arms the ticket removes
+    // are the only `MOVLW`s a correct lowering could emit.
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i32 @a\n    %2 = load i32 @b\n    %3 = icmp eq i32 %1, %2\n    \
+         store i8 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::3", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVLW 0x00") && !asm.contains("MOVLW 0x01"),
+        "no literal arms:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (bytes, expect) in [([2u8, 1, 0, 0], 1u8), ([2, 1, 0, 1], 1), ([0, 0, 0, 0], 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        for (i, v) in bytes.iter().enumerate() {
+            p.ram_mut()[0x20 + i] = *v;
+            p.ram_mut()[0x24 + i] = *v;
+        }
+        p.run(300);
+        assert_eq!(p.ram()[0x28], expect, "eq equal inputs {bytes:?}");
+    }
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x20] = 1;
+    p.ram_mut()[0x24] = 2;
+    p.run(300);
+    assert_eq!(p.ram()[0x28], 0, "eq differing inputs");
+}
+
+#[test]
+fn icmp_i32_ordering_result_needs_no_literal_diamond() {
+    // The ordering shape chains four `emit_cmp_branch` calls through
+    // tie-break labels, so the pre-clear has to survive every one of them.
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i32 @a\n    %2 = load i32 @b\n    %3 = icmp ugt i32 %1, %2\n    \
+         store i8 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::3", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVLW 0x00") && !asm.contains("MOVLW 0x01"),
+        "no literal arms:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (av, bv, expect) in [
+        ([0u8, 0, 1, 0], [0u8, 0, 0, 0], 1u8),
+        ([0, 0, 0, 0], [0, 0, 1, 0], 0),
+        ([5, 0, 0, 0], [5, 0, 0, 0], 0),
+        ([0, 0, 2, 0], [0, 0, 1, 0], 1),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        for (i, v) in av.iter().enumerate() {
+            p.ram_mut()[0x20 + i] = *v;
+        }
+        for (i, v) in bv.iter().enumerate() {
+            p.ram_mut()[0x24 + i] = *v;
+        }
+        p.run(300);
+        assert_eq!(p.ram()[0x28], expect, "ugt({av:?}, {bv:?})");
+    }
+}
+
+#[test]
+fn icmp_result_aliasing_an_operand_keeps_the_diamond() {
+    // The guard's refusal check. The aliasing is written into the address
+    // map rather than reached through `alloc`, so this pins the fallback
+    // itself: clearing a slot the compare reads would destroy the operand
+    // before it is compared.
+    let m = parse(
+        "global a i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @a\n    %2 = icmp eq i8 %1, 4\n    store i8 %2 @a\n    ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("main::1", 0x21), ("main::2", 0x21)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVLW 0x00"), "join form kept:\n{asm}");
+    assert!(asm.contains("MOVLW 0x01"), "both arms kept:\n{asm}");
+    assert!(!asm.contains("CLRF 0x021"), "no clear:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (av, expect) in [(4u8, 1u8), (3, 0), (9, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x20] = av;
+        p.run(200);
+        assert_eq!(p.ram()[0x20], expect, "in-place eq({av},4)");
     }
 }
 

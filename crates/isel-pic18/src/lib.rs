@@ -2646,8 +2646,12 @@ impl<'m> Gen<'m> {
         } else {
             l_false.clone()
         };
+        let pre = self.bool_result_preclear(&a, &b, dst, 1);
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
         self.emit_cmp_branch(&a, &b, 0, pred, &l_true, &l_false, &l_equal);
-        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
     }
 
     /// Computes the 16-bit predicate by comparing the high byte first with
@@ -2679,6 +2683,10 @@ impl<'m> Gen<'m> {
         let l_false = self.fresh_label();
         let l_done = self.fresh_label();
         let l_check_low = self.fresh_label();
+        let pre = self.bool_result_preclear(&a, &b, dst, 2);
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
 
         // High byte, `pred`'s own signedness. Equal high bytes never
         // decide the outcome by themselves (a lower byte could still flip
@@ -2705,7 +2713,7 @@ impl<'m> Gen<'m> {
             &l_false,
             &l_low_equal,
         );
-        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
     }
 
     /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
@@ -2724,6 +2732,10 @@ impl<'m> Gen<'m> {
         let l_false = self.fresh_label();
         let l_done = self.fresh_label();
         let l_mismatch = if pred == "eq" { &l_false } else { &l_true };
+        let pre = self.bool_result_preclear(&a, &b, dst, bytes);
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
         for offset in 0..bytes {
             self.emit_cmp_flags(&a, &b, offset, pred);
             self.emit(format!("    BNZ {l_mismatch}"));
@@ -2731,7 +2743,7 @@ impl<'m> Gen<'m> {
         // Every byte matched: `eq` is true, `ne` is false.
         let l_all_matched = if pred == "eq" { &l_true } else { &l_false };
         self.emit(format!("    BRA {l_all_matched}"));
-        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
     }
 
     /// `dst = (a <pred> b) ? 1: 0` for four bytes: compare the high byte
@@ -2768,6 +2780,10 @@ impl<'m> Gen<'m> {
         let l_check_b2 = self.fresh_label();
         let l_check_b1 = self.fresh_label();
         let l_check_b0 = self.fresh_label();
+        let pre = self.bool_result_preclear(&a, &b, dst, 4);
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
 
         self.emit_cmp_branch(&a, &b, 3, pred, &l_true, &l_false, &l_check_b2);
         self.emit_label(&l_check_b2);
@@ -2792,7 +2808,7 @@ impl<'m> Gen<'m> {
             &l_false,
             &l_low_equal,
         );
-        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
+        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
     }
 
     /// Compares `a`'s byte at `byte_offset` against `b`'s, leaving the
@@ -2924,7 +2940,25 @@ impl<'m> Gen<'m> {
     /// shared by `emit_icmp_byte`, `emit_icmp_i16`, and
     /// `emit_icmp_i16_eq_ne`: the only difference between the three is
     /// how they arrive at `l_true`/`l_false`.
-    fn emit_materialize_bool(&mut self, l_true: &str, l_false: &str, l_done: &str, dst: &str) {
+    ///
+    /// `precleared` is the result slot a caller has already zeroed before
+    /// the compare (see `bool_result_preclear`). Then the compare's own
+    /// branches already land on opposite sides of a single `INCF`, so the
+    /// whole `MOVLW`/`BRA`/`MOVLW`/`MOVWF` diamond collapses into it.
+    fn emit_materialize_bool(
+        &mut self,
+        l_true: &str,
+        l_false: &str,
+        l_done: &str,
+        dst: &str,
+        precleared: Option<u16>,
+    ) {
+        if let Some(d) = precleared {
+            self.emit_label(l_true);
+            self.emit_banked("INCF", d, ",F");
+            self.emit_label(l_false);
+            return;
+        }
         self.emit_label(l_false);
         self.emit("    MOVLW 0x00".to_string());
         self.emit(format!("    BRA {l_done}"));
@@ -2935,6 +2969,47 @@ impl<'m> Gen<'m> {
         let (da, df) = self.operand(d);
         let dbank = if da == 0 { "A" } else { "B" };
         self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+    }
+
+    /// The result slot to zero before the compare, or `None` when zeroing
+    /// it is not provably safe and the caller must keep the join form.
+    ///
+    /// Zeroing first lets the compare's branches select between "leave it
+    /// zero" and a single `INCF`, which is what removes the diamond. It is
+    /// only sound when `dst` overlaps nothing the compare reads: the
+    /// layout may place a definition over an operand's storage, and
+    /// clearing such a slot would destroy the operand before it is ever
+    /// compared.
+    fn bool_result_preclear(&self, a: &Val, b: &Val, dst: &str, bytes: u8) -> Option<u16> {
+        /// The bytes `v` is read from, or `None` when that cannot be
+        /// pinned to one base: a literal and a function label read no
+        /// memory at all, while a GEP-derived pointer is read through its
+        /// own address computation rather than the `val_addr` slot.
+        fn read_base(gen: &Gen, v: &Val) -> Option<Option<u16>> {
+            match v {
+                Val::Const(_) => Some(None),
+                Val::Global(g) if gen.is_function(g) => Some(None),
+                Val::Reg(r) if gen.resolved.contains_key(&ssa_key(gen.cur_func, r)) => None,
+                other => Some(Some(gen.val_addr(other).direct())),
+            }
+        }
+        let d = self.slot_addr(self.cur_func, dst).direct();
+        let mut read = Vec::with_capacity(bytes as usize * 2);
+        for (v, must_read) in [(a, true), (b, false)] {
+            match read_base(self, v) {
+                Some(Some(base)) => {
+                    for i in 0..u16::from(bytes) {
+                        read.push(base + i);
+                    }
+                }
+                // A literal `a` never reaches here (every entry point
+                // asserts it), and neither literal form is a byte slot the
+                // clear could disturb.
+                Some(None) if !must_read => {}
+                _ => return None,
+            }
+        }
+        (!read.contains(&d)).then_some(d)
     }
 
     /// Load byte `offset` of any `Val` into `W`: a constant via `MOVLW`
