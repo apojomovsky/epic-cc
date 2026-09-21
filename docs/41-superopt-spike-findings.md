@@ -104,13 +104,16 @@ a `Drop` guard, so a panic that somehow escapes `verify`'s own
   just the first).
 - A "verified" candidate matches every case in a curated case set, not
   every possible input: each target's test names what the case set
-  covers. Neither target's `check` predicate inspects anything beyond the
-  destination byte; a candidate that also clobbers `W`, `STATUS`, or an
-  unrelated GPR would still "verify" here. That did not matter for either
-  contract's actual winners in practice (checked by hand against each
-  reported sequence below), but it is a real limitation of the harness,
-  not a claim this spike makes and keeps: a wider follow-up should check
-  the full machine state a caller could observe, not just one byte.
+  covers. `run_case` (epic-cc#521) rejects any RAM byte outside a case's
+  declared `allowed_changes` that changed from its post-poke value, so a
+  candidate that clobbers an unrelated GPR no longer "verifies" by
+  accident. `STATUS` and `W` are the two deliberate exceptions: both are
+  treated as scratch, never part of either target's correctness contract,
+  so a candidate is free to touch them. `run_case` also poisons all of RAM
+  to a non-zero sentinel before applying a case's pokes, a fix from
+  epic-cc#521's own review: without it, a clobbering write that happens to
+  store zero to a byte no case ever pokes is invisible, since RAM already
+  reads zero there by default.
 
 ## Target 1: bool-materialization (epic-cc#501)
 
@@ -122,10 +125,14 @@ is a 5th; this spike's contract always ends with the value in RAM, so
 every count here is "including the store", and **the isel-pic18 baseline
 to beat is 5 words, not 4.**
 
-Case set: every combination of Z, C, and entry W (2 x 2 x 3 = 12 cases),
-with the destination byte poisoned to `0x55` before each run. C and W are
-dimensions a correct candidate must not depend on; poisoning the
-destination catches a candidate that silently leaves it untouched.
+Case set: every combination of Z, C, and entry W, the full 2 x 2 x 256 =
+1024-case domain (epic-cc#521 widened this from a curated 12-case sample;
+`no_unexpected_clobber`'s array-equality check keeps the full domain fast
+enough, under 5s in a debug build, that a separate `--ignored` variant
+turned out unnecessary), with the destination byte poisoned to `0x55`
+before each run. C and W are dimensions a correct candidate must not
+depend on; poisoning the destination catches a candidate that silently
+leaves it untouched.
 
 **Result: exhaustive search up to length 5 finds a floor of 4 words**, 9
 candidates, e.g.:
@@ -205,13 +212,14 @@ follow-up, not attempted here:
 - Generalize target 2 to the 16-bit case #505 actually reports against,
   and to shift amounts other than 4 (shift-by-4-mod-8 is the case
   `SWAPF` wins outright; other amounts likely need a different, possibly
-  worse, trade).
-- Widen target 1's case set from a curated 12 cases to the full 256 x 2 x
-  2 W/Z/C domain; the search itself is fast at this alphabet size, so this
-  is a small extension, not a redesign.
-- Widen `Case::check` to inspect the whole observable machine state
-  (`W`, `STATUS`, and any GPR outside the destination), not just the
-  destination byte, before trusting a wider alphabet's results.
+  worse, trade). Tracked as epic-cc#520.
+- ~~Widen target 1's case set~~ and ~~widen the verification check to the
+  whole machine state~~: done, epic-cc#521. Both surfaced real soundness
+  gaps of their own on the way (a `W` register that was never actually
+  seeded, then a RAM-clobber check blind to writes that happen to store
+  zero), the same category of bug this spike's own #514 review found once
+  already. Worth naming as a pattern: this crate has now found a real
+  soundness bug in itself on both rounds it has been reviewed.
 - Decide, before wiring anything into `isel-pic18`: does closing the
   gpsim-parity gap on PIC18 (an independent semantic cross-check, not just
   the acceptance test and this spike's three direct checks) become a

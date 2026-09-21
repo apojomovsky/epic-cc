@@ -39,6 +39,7 @@ fn cases() -> Vec<Case> {
                     cases.push(Case {
                         entry_w: w,
                         pokes: vec![(REG, v), (STATUS_ADDR, status)],
+                        allowed_changes: vec![REG],
                         check: Box::new(move |sim: &Pic18| sim.ram()[REG] == expect),
                     });
                 }

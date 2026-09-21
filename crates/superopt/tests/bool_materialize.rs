@@ -32,21 +32,23 @@ use superopt::{shortest, Case, STATUS_ADDR, STATUS_C_BIT, STATUS_Z_BIT};
 
 const DST: usize = 0x020;
 
-/// Every (Z, C, entry-W, poisoned-dst) combination this contract must
-/// survive. Z is the actual signal; C and entry W are dimensions a correct
-/// candidate must not depend on. `entry_w` reaches the machine via
-/// `Case::entry_w` (`Pic18::set_w`), not a RAM poke: an earlier version of
-/// this file looped over W values without ever applying them, which made
-/// every candidate that reads entry W (e.g. `MOVWF dst` with no preceding
-/// `MOVLW`) a silent false positive, caught in epic-cc#514's review. The
-/// destination starts poisoned to a value that is wrong for *both*
-/// outcomes (0x55), so a candidate that silently leaves it untouched also
-/// fails.
-fn cases() -> Vec<Case> {
+/// Every (Z, C) combination crossed with `w_values`, so the default test
+/// and the exhaustive one below share one definition of what a case looks
+/// like (epic-cc#521). Z is the actual signal; C and entry W are
+/// dimensions a correct candidate must not depend on. `entry_w` reaches
+/// the machine via `Case::entry_w` (`Pic18::set_w`), not a RAM poke: an
+/// earlier version of this file looped over W values without ever
+/// applying them, which made every candidate that reads entry W (e.g.
+/// `MOVWF dst` with no preceding `MOVLW`) a silent false positive, caught
+/// in epic-cc#514's review. The destination starts poisoned to a value
+/// that is wrong for *both* outcomes (0x55), so a candidate that silently
+/// leaves it untouched also fails; `allowed_changes` (epic-cc#521) rejects
+/// any candidate that writes a byte outside `DST` at all, poisoned or not.
+fn cases(w_values: &[u8]) -> Vec<Case> {
     let mut cases = Vec::new();
     for z in [false, true] {
         for c in [false, true] {
-            for w in [0x00u8, 0xFFu8, 0x2Au8] {
+            for &w in w_values {
                 let mut status = 0u8;
                 if z {
                     status |= STATUS_Z_BIT;
@@ -58,6 +60,7 @@ fn cases() -> Vec<Case> {
                 cases.push(Case {
                     entry_w: w,
                     pokes: vec![(STATUS_ADDR, status), (DST, 0x55)],
+                    allowed_changes: vec![DST],
                     check: Box::new(move |sim: &Pic18| sim.ram()[DST] == expect),
                 });
             }
@@ -88,19 +91,28 @@ const ALPHABET: &[&str] = &[
     "btfss 0xFD8,0,A", // skip next if C set
 ];
 
+/// Runs the full 2 x 2 x 256 domain by default: `no_unexpected_clobber`'s
+/// array-equality check (epic-cc#521's review) keeps this fast enough
+/// (under 5s alongside `shift_left_4.rs` in a debug build) that there is
+/// no need for a separate, easy-to-forget `--ignored --release` variant
+/// the way an earlier version of this file had. That earlier, slower,
+/// per-byte clobber check is also what made a 3-value W sample look
+/// necessary for the default suite; it was not a property of the case
+/// count itself.
 #[test]
 fn shortest_z_to_byte_materialization() {
-    let cases = cases();
+    let cases = cases(&(0..=255u8).collect::<Vec<_>>());
     let hits = shortest(ALPHABET, &cases, 5);
     assert!(
         !hits.is_empty(),
-        "no verified candidate up to length 5; isel-pic18's own 5-word diamond+store \
-         would then already be shortest-known within this alphabet"
+        "no verified candidate up to length 5; isel-pic18's own 5-word \
+         diamond+store would then already be shortest-known within this \
+         alphabet"
     );
     let len = hits[0].len();
     eprintln!(
-        "bool-materialize (incl. store): {} word(s), {} candidate(s) at that length \
-         (isel-pic18 today: 5 words, diamond + MOVWF)",
+        "bool-materialize (incl. store): {} word(s), {} candidate(s) at \
+         that length (isel-pic18 today: 5 words, diamond + MOVWF)",
         len,
         hits.len()
     );
