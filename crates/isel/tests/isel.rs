@@ -8941,3 +8941,109 @@ fn volatile_sfr_literal_stores_emit_in_program_order() {
         "SFR stores must land in program order:\n{asm}"
     );
 }
+
+#[test]
+fn const_table_ram_ref_materializes_the_alloc_address() {
+    // A `static const` field initialized with a RAM global's ADDRESS:
+    // refs name a RAM global, which has no assembler label. Before the
+    // fix the table emitted `RETLW LOW(holding_regs)` and the assembler
+    // panicked. holding_regs sits at 0x20: LOW = 0x20, HIGH = 0x00.
+    let mut m = module_with_globals(
+        "fn main(void) ()\n  block entry:\n    ret void\n",
+        vec![const_table_global("map", 3)],
+    );
+    for g in &mut m.globals {
+        if g.name == "map" {
+            g.bytes = vec![0x00, 0x00, 0x04];
+            g.refs = vec![(0, "holding_regs".into()), (1, "holding_regs".into())];
+        }
+    }
+    // The map itself lives in flash (no alloc address): table path.
+    let asm = select(&PIC16F877A, &m, &addrs(&[("holding_regs", 0x20)]));
+    assert!(
+        asm.contains("RETLW 0x20") && asm.contains("RETLW 0x00"),
+        "each ref byte must materialize its address half:\n{asm}"
+    );
+    assert!(
+        !asm.contains("LOW(holding_regs)"),
+        "a RAM global has no label to resolve:\n{asm}"
+    );
+    asm::assemble(&asm);
+}
+
+#[test]
+fn const_table_function_ref_keeps_the_label_literal() {
+    // A function-address field is a link-time value: it must stay a
+    // label literal the assembler resolves. The alloc-address path must
+    // not capture it: a function is never in the address map.
+    let mut m = module_with_globals(
+        "fn f0(void) ()\n  block entry:\n    ret void\nfn main(void) ()\n  block entry:\n    ret void\n",
+        vec![const_table_global("vt", 2)],
+    );
+    for g in &mut m.globals {
+        if g.name == "vt" {
+            g.bytes = vec![0x00, 0x00];
+            g.refs = vec![(0, "f0".into()), (1, "f0".into())];
+        }
+    }
+    let asm = select(&PIC16F877A, &m, &addrs(&[("vt", 0x30)]));
+    assert!(
+        asm.contains("LOW(f0)") && asm.contains("HIGH(f0)"),
+        "function refs stay label literals:\n{asm}"
+    );
+    asm::assemble(&asm);
+}
+
+#[test]
+fn const_init_ram_ref_materializes_the_alloc_address() {
+    // Same shape through the `__start` init path (const in the alloc
+    // map): `MOVLW` numeric halves, never a label literal.
+    let mut m = module_with_globals(
+        "fn main(void) ()\n  block entry:\n    ret void\n",
+        vec![const_table_global("map", 3)],
+    );
+    for g in &mut m.globals {
+        if g.name == "map" {
+            g.bytes = vec![0x00, 0x00, 0x04];
+            g.refs = vec![(0, "holding_regs".into()), (1, "holding_regs".into())];
+        }
+    }
+    let asm = select(
+        &PIC16F877A,
+        &m,
+        &addrs(&[("map", 0x30), ("holding_regs", 0x20)]),
+    );
+    assert!(
+        asm.contains("MOVLW 0x20") && asm.contains("MOVLW 0x00"),
+        "each ref byte must materialize its address half:\n{asm}"
+    );
+    assert!(
+        !asm.contains("LOW(holding_regs)"),
+        "a RAM global has no label to resolve:\n{asm}"
+    );
+    asm::assemble(&asm);
+}
+
+#[test]
+fn chunked_table_ram_ref_uses_absolute_offsets() {
+    // A RAM ref past the first chunk: the chunk loop must pass the
+    // absolute offset (not the in-chunk index) for the LOW/HIGH half
+    // split, matching how refs are recorded. Ref at 260 (even: LOW
+    // half) to a RAM global at 0x21.
+    let mut m = module_with_globals(
+        "fn main(void) ()\n  block entry:\n    ret void\n",
+        vec![const_table_global("big", 262)],
+    );
+    for g in &mut m.globals {
+        if g.name == "big" {
+            g.refs = vec![(260, "holding_regs".into()), (261, "holding_regs".into())];
+        }
+    }
+    let asm = select(&PIC16F877A, &m, &addrs(&[("holding_regs", 0x21)]));
+    assert!(
+        !asm.contains("LOW(holding_regs)"),
+        "a RAM global has no label to resolve:\n{asm}"
+    );
+    let words = asm::assemble(&asm);
+    assert!(!words.is_empty(), "chunked table must assemble");
+}
