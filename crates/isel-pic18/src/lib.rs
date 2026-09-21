@@ -2619,8 +2619,8 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Computes `dst = (a <pred> b) ? 1 : 0` for one byte via `a - b` and a
-    /// flag branch using standard condition codes (C=1 means no borrow).
+    /// Computes `dst = (a <pred> b) ? 1 : 0` for one byte via a flag
+    /// branch using standard condition codes (C=1 means no borrow).
     /// Shares the flag test with the 16-bit compare. A lone byte resolves
     /// equality directly to the predicate answer: true for `eq`/`uge`/`ule`/
     /// `sge`/`sle`, false for the strict ones. Routing equality uniformly
@@ -2705,11 +2705,12 @@ impl<'m> Gen<'m> {
     }
 
     /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
-    /// byte matches; `ne` is the mirror. Direct per-byte equality checks
-    /// (`SUBWF` + `BNZ`), independent of the signed/unsigned tie-break
-    /// machinery used for the eight ordering predicates: a partial match
-    /// (some byte equal, another different) is decisive here in a way it
-    /// never is for `slt`/`ult`/etc.
+    /// byte matches; `ne` is the mirror. Per-byte checks through
+    /// `emit_cmp_flags` (`MOVF` for a zero literal lane, `SUBWF` otherwise)
+    /// then `BNZ`, independent of the signed/unsigned tie-break machinery
+    /// used for the eight ordering predicates: a partial match (some byte
+    /// equal, another different) is decisive here in a way it never is for
+    /// `slt`/`ult`/etc.
     fn emit_icmp_i16_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
         self.emit_icmp_eq_ne(a, b, pred, dst, 2);
     }
