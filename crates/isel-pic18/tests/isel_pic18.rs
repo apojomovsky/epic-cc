@@ -2273,11 +2273,12 @@ fn a_short_copy_run_stays_straight_line() {
 }
 
 #[test]
-fn an_isr_reachable_fsr1_memcpy_keeps_copy_runs_straight() {
-    // The loop holds FSR1 across its iterations and FSR1 is not in the
-    // ISR save area (ADR-013): when an ISR-reachable function seeds FSR1
-    // (here a dynamically indexed memcpy source), every copy run falls
-    // back to straight MOVFFs (epic-cc#486).
+fn a_loop_runs_even_with_an_isr_reachable_fsr1_seeder() {
+    // #486 gated the copy loop on "no ISR-reachable function seeds FSR1",
+    // because FSR1 was outside the ISR save area (ADR-013). epic-cc#477
+    // added FSR1L/FSR1H to every ISR prologue/epilogue, so the loop holds
+    // FSR1 safely; the gate is gone and the loop must now run regardless
+    // of what the ISR does. (epic-cc#493)
     let m = parse(
         "global src i8\n\
          global dst i8\n\
@@ -2308,12 +2309,13 @@ fn an_isr_reachable_fsr1_memcpy_keeps_copy_runs_straight() {
     ]);
     let asm = select_isr(&PIC18F4550, &m, &addrs);
     assert!(
-        !asm.contains("MOVFF 0xFEE, 0xFE6"),
-        "no POSTINC loop may run when an ISR can clobber FSR1:\n{asm}"
+        asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the copy loop must run even when an ISR-reachable function seeds \
+         FSR1, now that FSR1 is saved:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110"),
-        "main's copy stays straight-line under the guard:\n{asm}"
+        asm.contains("0xFE1") && asm.contains("0xFE2"),
+        "the ISR must save and restore FSR1:\n{asm}"
     );
 }
 
@@ -2423,11 +2425,10 @@ fn a_255_byte_run_still_loops() {
 }
 
 #[test]
-fn an_isr_reachable_indirect_slot_memcpy_also_gates_the_loop() {
-    // The guard's second disjunct: an ISR-reachable function seeding
-    // FSR1 through an sret/pointer-param slot (emit_fsr1_indirect_slot's
-    // two-byte seed, not the dynamic-terms path) must gate the loop too
-    // (epic-cc#486 review).
+fn a_loop_runs_even_with_an_isr_reachable_slot_seeder() {
+    // The #486 guard's other disjunct: an ISR-reachable function seeding
+    // FSR1 through an sret/pointer-param slot. With FSR1 saved on every
+    // ISR entry (epic-cc#477), this loops too. (epic-cc#493)
     let m = parse(
         "global src i8\n\
          global dst i8\n\
@@ -2453,13 +2454,9 @@ fn an_isr_reachable_indirect_slot_memcpy_also_gates_the_loop() {
     ]);
     let asm = select_isr(&PIC18F4550, &m, &addrs);
     assert!(
-        !asm.contains("MOVFF 0xFEE, 0xFE6"),
-        "the slot-seeded FSR1 writer must gate the loop like the \
-         dynamic-terms one:\n{asm}"
-    );
-    assert!(
-        asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110"),
-        "main's copy stays straight-line under the guard:\n{asm}"
+        asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the copy loop must run even when an ISR-reachable function seeds \
+         FSR1 through a slot:\n{asm}"
     );
 }
 
@@ -2682,10 +2679,10 @@ fn single_byte_indirect_memcpy_does_not_walk() {
 }
 
 #[test]
-fn isr_reachable_fsr1_seeder_falls_back_to_per_byte_memcpy() {
-    // The walk holds FSR1 across the copy; when the module guard
-    // reports an ISR-reachable FSR1 seeder, an indirect-source copy
-    // keeps the per-byte re-seed instead. (epic-cc#492)
+fn indirect_memcpy_walks_even_with_an_isr_reachable_fsr1_seeder() {
+    // The per-byte fallback existed only because FSR1 was unsaved. Now
+    // the indirect-source copy walks POSTINC1 in every module, and the
+    // ISR that seeds FSR1 saves and restores it. (epic-cc#493)
     let m = parse(
         "global src i8\n\
          global dst i8\n\
@@ -2717,23 +2714,17 @@ fn isr_reachable_fsr1_seeder_falls_back_to_per_byte_memcpy() {
         ("main::j", 0x132),
     ]);
     let asm = select_isr(&PIC18F4550, &m, &addrs);
+    // main's 4-byte indirect-source copy: byte 0 seeds FSR1 once and the
+    // other three walk POSTINC1 into consecutive destination bytes.
     assert!(
-        !asm.contains("0xFE6"),
-        "no POSTINC1 walk may run when an ISR can clobber FSR1:\n{asm}"
+        asm.contains("0xFE6"),
+        "the indirect-source copy must walk POSTINC1:\n{asm}"
     );
-    assert_eq!(
-        asm.matches("LFSR 1,").count(),
-        12,
-        "both copies re-seed per byte (8 + 4):\n{asm}"
-    );
-    // Fallback bodies must land on consecutive addresses, not the
-    // doubled offsets a twice-applied byte index would produce
-    // (0x110 is banked, so the form is MOVWF low-byte,B).
     for i in 0..4u16 {
         let expect = format!("MOVWF 0x{:03X},B", 0x10 + i);
         assert!(
             asm.contains(&expect),
-            "fallback byte {i} must write 0x{:03X}:\n{asm}",
+            "walk byte {i} must write 0x{:03X} (each address computed once):\n{asm}",
             0x110 + i
         );
     }
