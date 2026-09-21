@@ -763,9 +763,24 @@ impl<'m> Gen<'m> {
                                     self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
                                 }
                             }
-                            _ => panic!(
-                                "isel-pic18: multi-term GEP move with {terms:?} not supported"
-                            ),
+                            _ => {
+                                // A scaled or multi-term index has no ADDWF
+                                // form: seed FSR0 with the full address
+                                // through the shared load/store scaler
+                                // (MULWF or shift-add chain) and read back
+                                // FSR0L/H. Immediate emits, never staged
+                                // copy_bytes: FSR0 only holds this address
+                                // right here. (epic-cc#468)
+                                if i == 0 {
+                                    self.emit_fsr0_dynamic(self.global_addr(name), k, &terms, 0);
+                                }
+                                let sfr = if i == 0 { 0xFE9 } else { 0xFEA };
+                                let (sa, sf) = self.operand(sfr);
+                                self.emit(format!(
+                                    "    MOVF 0x{sf:03X},W,{}",
+                                    if sa == 0 { "A" } else { "B" }
+                                ));
+                            }
                         }
                         let (a, f) = self.operand(dst + u16::from(i));
                         let bank = if a == 0 { "A" } else { "B" };

@@ -250,6 +250,34 @@ fn banked_ptr_c_runs_correctly() {
 }
 
 #[test]
+fn struct_global_index_c_runs_correctly() {
+    // epic-cc#468: struct copy into a runtime-indexed global array
+    // element plus the address of such an element taken as a value;
+    // isel-pic18 panicked materializing that GEP-over-Global address.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/struct_global_index.c"
+    ));
+    p.run(200_000);
+    assert_eq!(
+        p.ram()[globals["out"] as usize],
+        0x9A,
+        "out == hand-computed 0x9A"
+    );
+    assert!(p.halted());
+    // The stored element address must route through the scaled-index
+    // arm: seed FSR0, read back FSR0L (8-bit SFR-segment form 0x0E9).
+    // (The copy itself walks POSTINC0/POSTINC1 off FSR-seeded pointers
+    // and materializes no value.) A future routing change that folds
+    // the address move away reads 0 instead of 1.
+    let fsr0l_readbacks = asm.matches("MOVF 0x0E9,W,A").count();
+    assert_eq!(
+        fsr0l_readbacks, 1,
+        "expected 1 FSR0L read-back (stored element address):\n{asm}"
+    );
+}
+
+#[test]
 fn structs_c_runs_correctly() {
     // Mirrors crates/driver/tests/structs_e2e.rs: no input seeding, every
     // value is a fixed constant, so out == 0x4E (hand trace in the
