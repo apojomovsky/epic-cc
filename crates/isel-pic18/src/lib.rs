@@ -3176,18 +3176,65 @@ impl<'m> Gen<'m> {
         /// pinned to one base: a literal and a function label read no
         /// memory at all, while a GEP-derived pointer is read through its
         /// own address computation rather than the `val_addr` slot.
-        fn read_base(gen: &Gen, v: &Val) -> Option<Option<u16>> {
+        fn read_base(gen: &Gen, v: &Val, b_operand: bool) -> Option<Option<u16>> {
             match v {
                 Val::Const(_) => Some(None),
                 Val::Global(g) if gen.is_function(g) => Some(None),
-                Val::Reg(r) if gen.resolved.contains_key(&ssa_key(gen.cur_func, r)) => None,
+                Val::Reg(r) if b_operand => {
+                    // Only B reaches `emit_load_w`, which reads a
+                    // `resolved` value through its own address computation
+                    // rather than the `val_addr` slot. A goes through
+                    // `val_addr` whatever `resolved` says, so modelling it
+                    // as the pointed-to base would be wrong. Model B for the
+                    // one shape where the read stays inside a single slot
+                    // plus a constant offset, and decline the rest so the
+                    // join form is kept. (epic-cc#519)
+                    let Some((base, k, terms)) = gen
+                        .resolved
+                        .get(&iselcore::ssa_key(gen.cur_func, r))
+                        .cloned()
+                    else {
+                        return Some(Some(gen.val_addr(v).direct()));
+                    };
+                    if !terms.is_empty() {
+                        // A dynamic term adds an index register, so the
+                        // read is not bounded by this slot's own bytes.
+                        return None;
+                    }
+                    // `emit_load_w`'s resolved arm asserts `holds_addr` and
+                    // panics otherwise, so only an indirect (sret) slot or a
+                    // pointer param is a read at all.
+                    let iselcore::Base::Slot(sname, indirect) = &base else {
+                        return None;
+                    };
+                    let holds_addr = *indirect
+                        || gen
+                            .m
+                            .funcs
+                            .iter()
+                            .find(|f| f.name == gen.cur_func)
+                            .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
+                            .unwrap_or(false);
+                    if !holds_addr {
+                        return None;
+                    }
+                    // The read is the SLOT's own bytes: `emit_load_w` emits
+                    // `MOVF sa,W` and folds the constant offset in W with
+                    // `ADDLW`, so `k` never shifts the memory address.
+                    // (epic-cc#519 review)
+                    let _ = k;
+                    Some(Some(gen.slot_addr(gen.cur_func, sname).direct()))
+                }
                 other => Some(Some(gen.val_addr(other).direct())),
             }
         }
         let d = self.slot_addr(self.cur_func, dst).direct();
         let mut read = Vec::with_capacity(bytes as usize * 2);
         for (v, must_read) in [(a, true), (b, false)] {
-            match read_base(self, v) {
+            // `must_read` is true for A and false for B; B is the
+            // operand `emit_load_w` lowers, so it is the only one whose
+            // read bytes may be modelled through its address computation.
+            match read_base(self, v, !must_read) {
                 Some(Some(base)) => {
                     for i in 0..u16::from(bytes) {
                         read.push(base + i);

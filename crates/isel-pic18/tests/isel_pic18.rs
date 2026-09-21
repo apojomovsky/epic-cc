@@ -4704,3 +4704,67 @@ fn icmp_nonzero_byte_compare_still_subtracts_the_literal() {
     assert!(asm.contains("MOVLW 0x04"), "literal staged:\n{asm}");
     assert!(asm.contains("SUBWF 0x012,W,A"), "subtract kept:\n{asm}");
 }
+
+#[test]
+fn icmp_preclears_the_result_for_a_resolved_pointer_operand() {
+    // epic-cc#519. The operand is a pointer VALUE (`inttoptr` seeds a
+    // runtime-address slot, so `%a` has a `resolved` entry), which the guard
+    // used to refuse wholesale, leaving the literal diamond. Fails against
+    // the pre-patch source, so it pins the change.
+    let m = parse(
+        "global off i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %o = load i16 @off\n\
+             %a = inttoptr i16 %o to ptr\n\
+             %c = icmp eq ptr %a, 0\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("off", 0x120),
+        ("main::o", 0x131),
+        ("main::a", 0x133),
+        ("main::c", 0x140),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF 0x040,B") || asm.contains("CLRF 0x040,A"),
+        "a resolved pointer operand must let the result pre-clear:\n{asm}"
+    );
+    // The predicate must still hold: 1 iff the address is zero.
+    let words = asm::assemble_pic18(&asm);
+    for (val, expect) in [(0u16, 1u8), (0x0123, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x120] = (val & 0xFF) as u8;
+        p.ram_mut()[0x121] = (val >> 8) as u8;
+        p.run(500);
+        assert_eq!(p.ram()[0x140], expect, "icmp eq(ptr {val:#06x}, 0)");
+    }
+}
+
+#[test]
+fn icmp_declines_when_the_result_slot_is_what_operand_b_reads() {
+    // The soundness direction: `read` must contain every byte the compare
+    // reads, so a result slot landing on them must decline. B's read here is
+    // the resolved pointer's own slot bytes.
+    let m = parse(
+        "global off i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %o = load i16 @off\n\
+             %a = inttoptr i16 %o to ptr\n\
+             %c = icmp eq ptr %a, 0\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("off", 0x120),
+        ("main::o", 0x131),
+        ("main::a", 0x133),
+        ("main::c", 0x133), // the slot B's read comes from
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("CLRF 0x033") && !asm.contains("CLRF 0x133"),
+        "the guard must not clear a slot operand B is read from:\n{asm}"
+    );
+}
