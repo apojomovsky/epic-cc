@@ -368,8 +368,15 @@ bit pass) matches the unroll's exactly, so the amount-4 nibble saving is
 consumed by the time the fifth bit is counted. A form that fuses the extra
 bits into the nibble pass, the way the 16-bit target found separate
 constructions for amounts 6 and 7, was not searched; if one exists it
-would be the first 32-bit win, and the amounts 5-7 unrolls are where it
-would pay.
+would be the first 32-bit win. The review that gated this landing derived
+two candidates by analogy with the landed 16-bit forms, both unverified
+hand derivations for a follow-up: amount 6 as `4 + 3*7` = 25 words
+(`RRNCF` twice plus a mask per lane, reading the rotated lower lane before
+masking, the same shape as the isel amount-6 block) against the 30-word
+unroll, and amount 7 as `x << 7` = `(x << 8) >> 1`: three byte moves,
+`CLRF`, `BCF`, four `RRCF` = 12 words against 35. Those pencil out
+favorably, which is why the expected first 32-bit win sits at amounts 6
+and 7, not 5.
 
 The 32-bit constructions are verified over a curated 4-byte sample
 (`crates/superopt/tests/shift_32bit.rs`), not the full 2^32 domain: a
