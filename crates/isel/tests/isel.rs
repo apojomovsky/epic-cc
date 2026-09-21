@@ -9023,3 +9023,27 @@ fn const_init_ram_ref_materializes_the_alloc_address() {
     );
     asm::assemble(&asm);
 }
+
+#[test]
+fn chunked_table_ram_ref_uses_absolute_offsets() {
+    // A RAM ref past the first chunk: the chunk loop must pass the
+    // absolute offset (not the in-chunk index) for the LOW/HIGH half
+    // split, matching how refs are recorded. Ref at 260 (even: LOW
+    // half) to a RAM global at 0x21.
+    let mut m = module_with_globals(
+        "fn main(void) ()\n  block entry:\n    ret void\n",
+        vec![const_table_global("big", 262)],
+    );
+    for g in &mut m.globals {
+        if g.name == "big" {
+            g.refs = vec![(260, "holding_regs".into()), (261, "holding_regs".into())];
+        }
+    }
+    let asm = select(&PIC16F877A, &m, &addrs(&[("holding_regs", 0x21)]));
+    assert!(
+        !asm.contains("LOW(holding_regs)"),
+        "a RAM global has no label to resolve:\n{asm}"
+    );
+    let words = asm::assemble(&asm);
+    assert!(!words.is_empty(), "chunked table must assemble");
+}
