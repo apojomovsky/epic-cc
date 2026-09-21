@@ -33,6 +33,12 @@ fn with_refs(mut m: ir::Module, name: &str, refs: &[(usize, &str)]) -> ir::Modul
     m
 }
 
+/// A hand-built ISR module needs an epic-cc#477 save area for PROD/FSR1
+/// (the fixed block has no room); any disjoint address works here.
+fn select_isr(device: &device::Device, m: &ir::Module, addrs: &HashMap<String, u16>) -> String {
+    isel_pic18::select_with_locs(device, m, addrs, None, Some(0x0040), None).0
+}
+
 #[test]
 fn empty_function_emits_a_bare_return() {
     let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
@@ -364,7 +370,7 @@ fn isr_emits_vector_prologue_and_retfie() {
         "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
+    let asm = select_isr(&PIC18F4550, &m, &addrs(&[]));
     assert!(
         asm.contains("org 0x0008"),
         "ISR must be placed at the high vector:\n{asm}"
@@ -413,7 +419,7 @@ fn two_isrs_panic_loudly() {
          fn isr2(void) [isr] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
+    let _ = select_isr(&PIC18F4550, &m, &addrs(&[]));
 }
 
 #[test]
@@ -423,7 +429,7 @@ fn isr_returning_a_value_panics() {
         "fn isr(i8) [isr] ()\n  block entry:\n    ret i8 5\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
+    let _ = select_isr(&PIC18F4550, &m, &addrs(&[]));
 }
 
 #[test]
@@ -1756,10 +1762,11 @@ fn a_dynamic_index_sets_fsr0_and_reads_through_indf0() {
 }
 
 #[test]
-fn a_scale_2_dynamic_index_unrolls_two_adds() {
-    // A u16 array element: ram16[i] with element width 2: the offset
-    // into the array is 2*i, unrolled as two ADDWFs onto FSR0L (with
-    // carry into FSR0H), mirroring PIC14's emit_accum_terms.
+fn a_scale_2_dynamic_index_scales_through_mulwf() {
+    // `ram16[i]` with element width 2: the offset is 2*i. A scale-2 term
+    // takes the MULWF form (6 words) over the two unrolled
+    // ADDWF-onto-FSR0L adds (8 words) on any PIC18 with the multiplier.
+    // (epic-cc#477)
     let m = parse(
         "global ram16 i16\n\
          global idx i8\n\
@@ -1777,10 +1784,13 @@ fn a_scale_2_dynamic_index_unrolls_two_adds() {
         ("main::v", 0x152),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
-    let addwf_to_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
     assert!(
-        addwf_to_fsr0l >= 2,
-        "a scale-2 term must unroll two adds onto FSR0L:\n{asm}"
+        asm.contains("MOVLW 0x02") && asm.contains("MULWF"),
+        "a scale-2 term must scale through MULWF:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0xFF3,W,A") && asm.contains("MOVF 0xFF4,W,A"),
+        "the product must fold onto the FSR0 pair:\n{asm}"
     );
 }
 
@@ -2018,7 +2028,7 @@ fn an_isr_reachable_fsr1_memcpy_keeps_copy_runs_straight() {
         ("feeder::i", 0x131),
         ("feeder::p", 0x132),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let asm = select_isr(&PIC18F4550, &m, &addrs);
     assert!(
         !asm.contains("MOVFF 0xFEE, 0xFE6"),
         "no POSTINC loop may run when an ISR can clobber FSR1:\n{asm}"
@@ -2163,7 +2173,7 @@ fn an_isr_reachable_indirect_slot_memcpy_also_gates_the_loop() {
         ("buf", 0x120),
         ("feeder::r", 0x121),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let asm = select_isr(&PIC18F4550, &m, &addrs);
     assert!(
         !asm.contains("MOVFF 0xFEE, 0xFE6"),
         "the slot-seeded FSR1 writer must gate the loop like the \
@@ -2428,7 +2438,7 @@ fn isr_reachable_fsr1_seeder_falls_back_to_per_byte_memcpy() {
         ("feeder::i", 0x131),
         ("main::j", 0x132),
     ]);
-    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let asm = select_isr(&PIC18F4550, &m, &addrs);
     assert!(
         !asm.contains("0xFE6"),
         "no POSTINC1 walk may run when an ISR can clobber FSR1:\n{asm}"
@@ -2750,7 +2760,7 @@ fn const_dynamic_index_load_uses_tblptr_add() {
 }
 
 #[test]
-fn a_large_stride_gep_scales_via_shift_add_chain() {
+fn a_large_stride_gep_scales_through_mulwf() {
     // A 12-byte struct stride makes the naive per-add loop (12 x 4
     // words) cost more than the zero-seeded shift-add chain: seed
     // LFSR 0 with 0, one index add, three doublings (12 = 1100b), one
@@ -2774,36 +2784,26 @@ fn a_large_stride_gep_scales_via_shift_add_chain() {
         ("main::v", 0x152),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
+    // A 12-byte stride now takes the MULWF form (6 words flat) rather
+    // than the shift-add chain (17+). (epic-cc#477)
     assert!(
-        asm.contains("LFSR 0, 0x000") || asm.contains("LFSR 0,0x000"),
-        "the chain must seed FSR0 with zero, not the base:\n{asm}"
+        asm.contains("MOVLW 0x0C") && asm.contains("MULWF"),
+        "stride 12 must scale through MULWF:\n{asm}"
     );
-    // 12 = 1100b: bit pattern gives exactly 3 doublings and 2 index
-    // adds (the initial one plus bit 2's conditional one).
-    let rlcf_fsr0l = asm.matches("RLCF 0x0E9").count() + asm.matches("RLCF 0x0e9").count();
-    assert_eq!(rlcf_fsr0l, 3, "three doublings for a 4-bit stride:\n{asm}");
-    // Two chain index adds (initial + one set bit below the MSW) plus
-    // the base re-add, all onto FSR0L: 3 total, not the naive 12.
-    let addwf_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
-    assert_eq!(
-        addwf_fsr0l, 3,
-        "two index adds plus the base re-add, not 12 unrolled adds:\n{asm}"
-    );
-    // The base (0x120) re-joins after the chain as a literal add.
+    // The base (0x120) still seeds FSR0, and the product folds onto the
+    // pair in access mode (operand() sees 0xFE9/0xFEA as SFR addresses).
     assert!(
-        asm.contains("MOVLW 0x20") && asm.contains("ADDWF 0x0E9"),
-        "base must re-join as a literal add after the chain:\n{asm}"
+        asm.contains("LFSR 0, 0x120") || asm.contains("LFSR 0,0x120"),
+        "the base must seed FSR0:\n{asm}"
     );
-    // The chain must spell the FSR pair in access mode, never banked:
-    // operand() sees 0xFE9/0xFEA as SFR-segment addresses.
     assert!(
-        !asm.contains("RLCF 0x0E9,F,B") && !asm.contains("ADDWF 0x0E9,F,B"),
+        !asm.contains("ADDWF 0x0E9,F,B") && !asm.contains("ADDWFC 0x0EA,F,B"),
         "FSR pair updates must stay access-mode:\n{asm}"
     );
 }
 
 #[test]
-fn a_width2_index_chain_folds_the_high_byte_into_fsr0() {
+fn a_width2_index_folds_its_high_byte_through_mulwf() {
     // A 12-byte stride with a 16-bit index (clang zero-extends every GEP
     // index, so width 2 is the real frontend shape): the chain's index
     // adds must read the index's HIGH byte where the width-1 chain emits
@@ -2827,22 +2827,19 @@ fn a_width2_index_chain_folds_the_high_byte_into_fsr0() {
         ("main::v", 0x154),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
+    // Stride 12 takes MULWF; a 16-bit index costs a second MULWF on the
+    // high byte (so the whole stride is exact). (epic-cc#477)
     assert!(
-        asm.contains("LFSR 0, 0x000") || asm.contains("LFSR 0,0x000"),
-        "the chain must seed FSR0 with zero, not the base:\n{asm}"
-    );
-    let rlcf_fsr0l = asm.matches("RLCF 0x0E9").count() + asm.matches("RLCF 0x0e9").count();
-    assert_eq!(rlcf_fsr0l, 3, "three doublings for a 4-bit stride:\n{asm}");
-    let addwf_fsr0l = asm.matches("ADDWF 0x0E9").count() + asm.matches("ADDWF 0x0e9").count();
-    assert_eq!(
-        addwf_fsr0l, 3,
-        "two chain index adds plus the base re-add, not 12 unrolled adds:\n{asm}"
+        asm.contains("MULWF"),
+        "stride 12 must scale through MULWF:\n{asm}"
     );
     // The wide fold: the index's high byte (slot 0x152 + 1, banked so
-    // operand() spells the in-bank file address 0x053) must be read once
-    // per chain index add. The width-1 chain reads it zero times.
-    let movf_idx_hi = asm.matches("MOVF 0x053").count();
-    assert_eq!(movf_idx_hi, 2, "both chain adds must read idx_hi:\n{asm}");
+    // operand() spells 0x053) must be read for its own product. The
+    // width-1 form has no second MULWF.
+    assert!(
+        asm.contains("MULWF 0x053") || asm.contains("MULWF 0x53"),
+        "the index high byte must reach the multiplier:\n{asm}"
+    );
 }
 
 #[test]
@@ -2873,8 +2870,8 @@ fn a_width2_chain_index_reads_the_high_byte_in_sim() {
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
-        asm.contains("LFSR 0, 0x000") || asm.contains("LFSR 0,0x000"),
-        "stride 5 must take the chain, not the naive loop:\n{asm}"
+        asm.contains("MULWF"),
+        "stride 5 must scale through MULWF, not the naive loop:\n{asm}"
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
@@ -3706,7 +3703,9 @@ fn priority_pair_emits_both_vectors_and_save_areas() {
     // A banked save area (0x120, above the access window): W goes
     // through an explicit bank select, not `,A` (which would resolve
     // into the SFR page).
-    let asm = select(&PIC18F4550, &m, &addrs(&[]), Some(0x120));
+    let asm =
+        isel_pic18::select_with_locs(&PIC18F4550, &m, &addrs(&[]), Some(0x120), None, Some(0x160))
+            .0;
     assert!(
         asm.contains("org 0x0008") && asm.contains("goto hi"),
         "high stub at vector 0x0008:\n{asm}"
@@ -3751,7 +3750,7 @@ fn priority_pair_without_save_area_panics() {
          fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let _ = select(&PIC18F4550, &m, &addrs(&[]), None);
+    let _ = select_isr(&PIC18F4550, &m, &addrs(&[]));
 }
 
 #[test]

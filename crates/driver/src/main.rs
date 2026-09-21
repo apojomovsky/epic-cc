@@ -391,9 +391,14 @@ fn main() {
     addrs.extend(layout.locals.iter().map(|(k, &v)| (k.clone(), v)));
     let (asm, mut locs) = match device.core {
         device::Core::Pic14 => isel::select_with_locs(device, &m, &addrs),
-        device::Core::Pic18 => {
-            isel_pic18::select_with_locs(device, &m, &addrs, layout.isr_low_save)
-        }
+        device::Core::Pic18 => isel_pic18::select_with_locs(
+            device,
+            &m,
+            &addrs,
+            layout.isr_low_save,
+            layout.isr_save,
+            layout.isr_hi_save,
+        ),
         device::Core::Pic14e => isel_pic14e::select_with_locs(device, &m, &addrs),
         device::Core::PicBaseline => isel_pic_baseline::select_with_locs(device, &m, &addrs),
     };

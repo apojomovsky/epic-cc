@@ -60,7 +60,15 @@ fn compile_with_asm(c_path: &str) -> (Pic18, HashMap<String, u16>, String) {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
-    let asm = isel_pic18::select(&PIC18F4550, &m, &addrs, layout.isr_low_save);
+    let asm = isel_pic18::select_with_locs(
+        &PIC18F4550,
+        &m,
+        &addrs,
+        layout.isr_low_save,
+        layout.isr_save,
+        layout.isr_hi_save,
+    )
+    .0;
     let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
 
     (Pic18::new(parse_hex_pic18(&hex)), layout.globals, asm)
@@ -169,7 +177,15 @@ fn banked_c_asm_contains_movlb() {
     let mut addrs: HashMap<String, u16> = HashMap::new();
     addrs.extend(layout.globals.clone());
     addrs.extend(layout.locals.clone());
-    let asm = isel_pic18::select(&PIC18F4550, &m, &addrs, layout.isr_low_save);
+    let asm = isel_pic18::select_with_locs(
+        &PIC18F4550,
+        &m,
+        &addrs,
+        layout.isr_low_save,
+        layout.isr_save,
+        layout.isr_hi_save,
+    )
+    .0;
     assert!(
         asm.lines().any(|l| l.trim().starts_with("MOVLB")),
         "banked.c must exercise BSR-banked addressing on PIC18 (found no MOVLB):\n{asm}"
@@ -354,7 +370,10 @@ fn compat_isr_preserves_fsr0h_across_w_save() {
         "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let asm = isel_pic18::select(&PIC18F4550, &m, &HashMap::new(), None);
+    // A lone ISR needs its PROD/FSR1 save area (epic-cc#477); any
+    // disjoint RAM address works for this hand-built module.
+    let asm =
+        isel_pic18::select_with_locs(&PIC18F4550, &m, &HashMap::new(), None, Some(0x0040), None).0;
     let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
     let mut p = Pic18::new(parse_hex_pic18(&hex));
 
@@ -395,7 +414,10 @@ fn compat_isr_preserves_status_bsr_fsr0l_across_retval_backup() {
         "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
          fn main(void) ()\n  block entry:\n    ret void\n",
     );
-    let asm = isel_pic18::select(&PIC18F4550, &m, &HashMap::new(), None);
+    // A lone ISR needs its PROD/FSR1 save area (epic-cc#477); any
+    // disjoint RAM address works for this hand-built module.
+    let asm =
+        isel_pic18::select_with_locs(&PIC18F4550, &m, &HashMap::new(), None, Some(0x0040), None).0;
     let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
     let mut p = Pic18::new(parse_hex_pic18(&hex));
 
@@ -788,12 +810,18 @@ fn ptr_param_stride_chain_c_folds_the_pointer_into_the_chain() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/ptr_param_stride_chain.c"
     ));
-    // The chain fires (RLCF doubling present) and the pointer's slot
-    // bytes are read back onto the FSR0 pair after it (a plain MOVF,
-    // never MOVLW, feeding the post-chain ADDWF/ADDWFC pair).
+    // A 12-byte stride with a 16-bit index takes the MULWF form
+    // (epic-cc#477): `MOVLW 12; MULWF idx` then the PRODL/PRODH bytes
+    // folded onto the FSR0 pair. The scale-12 chain (17+ words) is no
+    // longer the winner at this stride; the sim assertions below are what
+    // pin correctness.
     assert!(
-        asm.contains("RLCF 0x0E9"),
-        "expected the shift-add chain to fire for a 12-byte stride:\n{asm}"
+        asm.contains("MULWF") && asm.contains("MOVLW 0x0C"),
+        "expected the MULWF scaling for a 12-byte stride:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVF 0xFF3,W,A") && asm.contains("MOVF 0xFF4,W,A"),
+        "the product must fold PRODL and PRODH onto the FSR0 pair:\n{asm}"
     );
     p.run(2_000_000);
     assert!(p.halted());

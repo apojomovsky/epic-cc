@@ -39,6 +39,14 @@ enum Addr {
     Indirect,
 }
 
+/// Which scaled-term form won: the hardware multiplier, or the
+/// shift-add chain. (epic-cc#477)
+#[derive(Clone, Copy)]
+enum Scaled {
+    Mulwf,
+    Chain,
+}
+
 /// A memcpy source's resolved shape: a plain address, an FSR1-indirect
 /// pointer, or a flash table read through `TBLPTR`/`TABLAT`. Byte 0's
 /// setup reports it so later bytes can walk instead of re-seeding.
@@ -899,19 +907,33 @@ impl<'m> Gen<'m> {
         let static_part = u16::from(k) + u16::from(byte_off);
         let lit = (base_addr + static_part) & 0xFFF;
         let chain = self.chain_term_index(terms, 0);
-        let Some(ci) = chain else {
+        let Some((ci, form)) = chain else {
             self.emit(format!("    LFSR 1, 0x{lit:03X}"));
             self.add_term_to_fsr1(terms);
             return;
         };
-        // Same zero-seed shape as `emit_fsr0_dynamic`: the chain needs a
-        // zeroed pair, so the static base re-joins as a literal add.
-        self.emit("    LFSR 1, 0x000".to_string());
+        // Same seed-first shape as `emit_fsr0_dynamic`: MULWF loads the
+        // static base then adds the scaled term onto it, the chain
+        // zero-seeds and re-adds the base as a literal afterwards.
         let (scale, reg) = &terms[ci];
         let a = self.slot_addr(self.cur_func, reg).direct();
-        self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, self.reg_width(reg) == 2);
-        self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, base_addr.wrapping_add(u16::from(static_part)));
-        self.add_terms_except(terms, chain, 0xFE1, 0xFE2);
+        let wide = self.reg_width(reg) == 2;
+        match form {
+            Scaled::Mulwf => {
+                self.emit(format!("    LFSR 1, 0x{lit:03X}"));
+                self.emit_mulwf_scale(0xFE1, 0xFE2, *scale, a, wide);
+            }
+            Scaled::Chain => {
+                self.emit("    LFSR 1, 0x000".to_string());
+                self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, wide);
+                self.emit_fsr_pair_add_lit(
+                    0xFE1,
+                    0xFE2,
+                    base_addr.wrapping_add(u16::from(static_part)),
+                );
+            }
+        }
+        self.add_terms_except(terms, Some(ci), 0xFE1, 0xFE2);
     }
     /// `slot_addr` holds a 2-byte ADDRESS (an sret param's contents), not
     /// the object itself: load THAT address into FSR1, then add the static
@@ -928,17 +950,33 @@ impl<'m> Gen<'m> {
         // runtime re-add of the pointer's own value.
         let extra = 2 + if static_part != 0 { 4 } else { 0 };
         let chain = self.chain_term_index(terms, extra);
-        if let Some(ci) = chain {
-            self.emit("    CLRF 0x0E1,A".to_string()); // FSR1L = 0
-            self.emit("    CLRF 0x0E2,A".to_string()); // FSR1H = 0
+        if let Some((ci, form)) = chain {
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
-            self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, self.reg_width(reg) == 2);
-            self.emit_fsr_pair_add_mem16(0xFE1, 0xFE2, slot_addr, slot_addr + 1);
-            if static_part != 0 {
-                self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, u16::from(static_part));
+            let wide = self.reg_width(reg) == 2;
+            match form {
+                Scaled::Mulwf => {
+                    // Seed the pointer's own value, then add the scaled
+                    // term onto it. No zero-seed dance is needed, so the
+                    // static part keeps the two-byte load form.
+                    self.emit_copy_byte(slot_addr, 0xFE1); // FSR1L
+                    self.emit_copy_byte(slot_addr + 1, 0xFE2); // FSR1H
+                    if static_part != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, u16::from(static_part));
+                    }
+                    self.emit_mulwf_scale(0xFE1, 0xFE2, *scale, a, wide);
+                }
+                Scaled::Chain => {
+                    self.emit("    CLRF 0x0E1,A".to_string()); // FSR1L = 0
+                    self.emit("    CLRF 0x0E2,A".to_string()); // FSR1H = 0
+                    self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, wide);
+                    self.emit_fsr_pair_add_mem16(0xFE1, 0xFE2, slot_addr, slot_addr + 1);
+                    if static_part != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, u16::from(static_part));
+                    }
+                }
             }
-            self.add_terms_except(terms, chain, 0xFE1, 0xFE2);
+            self.add_terms_except(terms, Some(ci), 0xFE1, 0xFE2);
             return;
         }
         self.emit_copy_byte(slot_addr, 0xFE1); // FSR1L = low byte of the stored address
@@ -1105,7 +1143,7 @@ impl<'m> Gen<'m> {
         let static_part = u16::from(k) + u16::from(byte_off);
         let origin = Fsr0Origin::Absolute(base_addr);
         let chain = self.chain_term_index(terms, 0);
-        let Some(ci) = chain else {
+        let Some((ci, form)) = chain else {
             if !(terms.is_empty() && self.try_reuse_fsr0(origin, static_part)) {
                 let lit = (base_addr + static_part) & 0xFFF;
                 self.emit(format!("    LFSR 0, 0x{lit:03X}"));
@@ -1117,13 +1155,28 @@ impl<'m> Gen<'m> {
         // The doubling stage needs a zero-seeded FSR0, so the static
         // base cannot ride the LFSR literal; it re-joins as one 16-bit
         // literal add after the chain, still far cheaper than the naive
-        // loop it replaces once the stride is big enough.
-        self.emit("    LFSR 0, 0x000".to_string());
+        // loop it replaces once the stride is big enough. MULWF instead
+        // seeds the base first and adds the scaled term onto it.
         let (scale, reg) = &terms[ci];
         let a = self.slot_addr(self.cur_func, reg).direct();
-        self.emit_scale_chain(0xFE9, 0xFEA, *scale, a, self.reg_width(reg) == 2);
-        self.emit_fsr_pair_add_lit(0xFE9, 0xFEA, base_addr.wrapping_add(u16::from(static_part)));
-        self.add_terms_except(terms, chain, 0xFE9, 0xFEA);
+        let wide = self.reg_width(reg) == 2;
+        match form {
+            Scaled::Mulwf => {
+                let lit = (base_addr + static_part) & 0xFFF;
+                self.emit(format!("    LFSR 0, 0x{lit:03X}"));
+                self.emit_mulwf_scale(0xFE9, 0xFEA, *scale, a, wide);
+            }
+            Scaled::Chain => {
+                self.emit("    LFSR 0, 0x000".to_string());
+                self.emit_scale_chain(0xFE9, 0xFEA, *scale, a, wide);
+                self.emit_fsr_pair_add_lit(
+                    0xFE9,
+                    0xFEA,
+                    base_addr.wrapping_add(u16::from(static_part)),
+                );
+            }
+        }
+        self.add_terms_except(terms, Some(ci), 0xFE9, 0xFEA);
         // The tracker cannot represent a runtime term's contribution.
         self.fsr0_holds = None;
     }
@@ -1159,19 +1212,34 @@ impl<'m> Gen<'m> {
         // exists.
         let extra = 2 + if static_part != 0 { 4 } else { 0 };
         let chain = self.chain_term_index(terms, extra);
-        if let Some(ci) = chain {
-            self.emit("    CLRF 0x0E9,A".to_string()); // FSR0L = 0
-            self.emit("    CLRF 0x0EA,A".to_string()); // FSR0H = 0
+        if let Some((ci, form)) = chain {
             let (scale, reg) = &terms[ci];
             let a = self.slot_addr(self.cur_func, reg).direct();
-            self.emit_scale_chain(0xFE9, 0xFEA, *scale, a, self.reg_width(reg) == 2);
-            // The chain only holds scale*idx; fold in the pointer's own
-            // runtime value, which the zero seed couldn't carry.
-            self.emit_fsr_pair_add_mem16(0xFE9, 0xFEA, slot_addr, slot_addr + 1);
-            if static_part != 0 {
-                self.emit_fsr_pair_add_lit(0xFE9, 0xFEA, u16::from(static_part));
+            let wide = self.reg_width(reg) == 2;
+            match form {
+                Scaled::Mulwf => {
+                    // Seed the pointer's own value, then add the scaled
+                    // term onto it (no zero-seed needed).
+                    self.emit_copy_byte(slot_addr, 0xFE9); // FSR0L
+                    self.emit_copy_byte(slot_addr + 1, 0xFEA); // FSR0H
+                    if static_part != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE9, 0xFEA, u16::from(static_part));
+                    }
+                    self.emit_mulwf_scale(0xFE9, 0xFEA, *scale, a, wide);
+                }
+                Scaled::Chain => {
+                    self.emit("    CLRF 0x0E9,A".to_string()); // FSR0L = 0
+                    self.emit("    CLRF 0x0EA,A".to_string()); // FSR0H = 0
+                    self.emit_scale_chain(0xFE9, 0xFEA, *scale, a, wide);
+                    // The chain only holds scale*idx; fold in the pointer's
+                    // own runtime value, which the zero seed couldn't carry.
+                    self.emit_fsr_pair_add_mem16(0xFE9, 0xFEA, slot_addr, slot_addr + 1);
+                    if static_part != 0 {
+                        self.emit_fsr_pair_add_lit(0xFE9, 0xFEA, u16::from(static_part));
+                    }
+                }
             }
-            self.add_terms_except(terms, chain, 0xFE9, 0xFEA);
+            self.add_terms_except(terms, Some(ci), 0xFE9, 0xFEA);
             // The tracker cannot represent a runtime term's contribution.
             self.fsr0_holds = None;
             return;
@@ -1318,6 +1386,67 @@ impl<'m> Gen<'m> {
         4 + (bits - 1) * 3 + (scale.count_ones() as u16 - 1) * 4
     }
 
+    /// `FSR pair += scale * idx` through the hardware multiplier, the
+    /// cheapest scaled term on any PIC18 with `MULWF` (epic-cc#477):
+    /// `MOVLW scale; MULWF idx; MOVF PRODL,W; ADDWF lo,F; MOVF PRODH,W;
+    /// ADDWFC hi,F`, 6 words flat. A 16-bit index adds its own scaled
+    /// high byte (`MOVLW scale; MULWF idx_hi; MOVF PRODL,W; ADDWF hi,F`),
+    /// 4 more, since `MULWF`'s product is 8x8 and the shifted high term
+    /// only contributes to `hi` mod 2^16. No scratch byte: `MULWF` takes
+    /// its operand as a file register, so scale rides W both times and
+    /// PROD staging stays inside one instruction pair.
+    fn emit_mulwf_scale(&mut self, lo: u16, hi: u16, scale: u8, idx_addr: u16, wide: bool) {
+        self.emit(format!("    MOVLW 0x{scale:02X}"));
+        let (ia, iff) = self.operand(idx_addr);
+        self.emit(format!(
+            "    MULWF 0x{iff:03X},{}",
+            if ia == 0 { "A" } else { "B" }
+        ));
+        self.emit("    MOVF 0xFF3,W,A".to_string()); // PRODL
+        let (la, lf) = self.operand(lo);
+        self.emit(format!(
+            "    ADDWF 0x{lf:03X},F,{}",
+            if la == 0 { "A" } else { "B" }
+        ));
+        self.emit("    MOVF 0xFF4,W,A".to_string()); // PRODH
+        let (ha, hf) = self.operand(hi);
+        self.emit(format!(
+            "    ADDWFC 0x{hf:03X},F,{}",
+            if ha == 0 { "A" } else { "B" }
+        ));
+        if wide {
+            self.emit(format!("    MOVLW 0x{scale:02X}"));
+            let (ia, iff) = self.operand(idx_addr + 1);
+            self.emit(format!(
+                "    MULWF 0x{iff:03X},{}",
+                if ia == 0 { "A" } else { "B" }
+            ));
+            self.emit("    MOVF 0xFF3,W,A".to_string()); // PRODL << 8
+            let (ha, hf) = self.operand(hi);
+            self.emit(format!(
+                "    ADDWF 0x{hf:03X},F,{}",
+                if ha == 0 { "A" } else { "B" }
+            ));
+        }
+    }
+
+    /// Word cost of `emit_mulwf_scale`.
+    fn mulwf_scale_words(wide: bool) -> u16 {
+        if wide {
+            10
+        } else {
+            6
+        }
+    }
+
+    /// Whether a scaled term should take the `MULWF` form: at least 2 (a
+    /// scale-1 or -0 term cannot need a multiply) and no worse than the
+    /// naive 4-words-per-step loop. The chain still wins over it at the
+    /// strides where its own cost is lower, so callers rank all three.
+    fn mulwf_scale_wins(scale: u8, wide: bool) -> bool {
+        scale >= 2 && Self::mulwf_scale_words(wide) <= 4 * u16::from(scale)
+    }
+
     /// The only chain candidate: the largest-scale term, and only when
     /// its scale is at least 2 (a scale below 2 cannot win, since the
     /// chain costs at least the initial add plus the seed overhead, and
@@ -1333,16 +1462,28 @@ impl<'m> Gen<'m> {
         best
     }
 
-    /// Pick the term to run as a shift-add chain: the largest-scale
-    /// term, and only when the chain plus `extra` words of zero-seed and
-    /// static re-add overhead beats its own naive loop by at least 2
-    /// words (small scales keep the unrolled adds some tests pin). The
-    /// naive loop folds a 16-bit index's high byte at the same 4
-    /// words per repetition, so both widths share this gate.
-    /// Returns the term's index.
-    fn chain_term_index(&self, terms: &[(u8, String)], extra: u16) -> Option<usize> {
+    /// Pick the term to run through the hardware multiplier or as a
+    /// shift-add chain: the largest-scale term that a scaled form beats
+    /// the naive loop on by at least 2 words (the chain also carries its
+    /// caller's `extra` seed/static overhead; `MULWF` needs none).
+    /// `MULWF` is preferred when it is the cheaper of the two at this
+    /// scale, and it is width-aware (a 16-bit index costs 4 more words).
+    /// Returns the term's index and which form won.
+    fn chain_term_index(&self, terms: &[(u8, String)], extra: u16) -> Option<(usize, Scaled)> {
         let (i, scale) = Self::biggest_chainable_term(terms)?;
-        (Self::scale_chain_words(scale) + extra + 2 <= 4 * u16::from(scale)).then_some(i)
+        let wide = self.reg_width(&terms[i].1) == 2;
+        let mut best: Option<(Scaled, u16)> = None;
+        if Self::mulwf_scale_wins(scale, wide) {
+            best = Some((Scaled::Mulwf, Self::mulwf_scale_words(wide)));
+        }
+        let chain_extra = if best.is_some() { 0 } else { extra };
+        if Self::scale_chain_words(scale) + chain_extra + 2 <= 4 * u16::from(scale) {
+            let cost = Self::scale_chain_words(scale) + extra;
+            if best.is_none_or(|(_, c)| cost < c) {
+                best = Some((Scaled::Chain, cost));
+            }
+        }
+        best.map(|(form, _)| (i, form))
     }
 
     /// The naive accumulation for every term except `skip`, shared by
@@ -5704,13 +5845,20 @@ fn emit_phi_copies<'m>(g: &mut Gen<'m>, copies: &[(String, Ty, Val)], back_edge:
 /// in compatibility mode, where the single handler uses the device's fixed
 /// save block. Must agree with `alloc`'s layout for the same module: a
 /// low ISR with `None` (or `Some` without both priorities) panics below.
+///
+/// The two epic-cc#477 save areas are `None` here. The driver and every
+/// end-to-end harness pass `alloc`'s values through `select_with_locs`;
+/// this wrapper exists for unit tests of hand-built modules, which do
+/// not model a layout. A module that reaches the prologue without an
+/// area panics loudly, so a test cannot silently emit an ISR that saves
+/// PROD/FSR1 nowhere.
 pub fn select(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
     isr_low_save: Option<u16>,
 ) -> String {
-    select_with_locs(device, m, addrs, isr_low_save).0
+    select_with_locs(device, m, addrs, isr_low_save, None, None).0
 }
 
 /// Whether `f` contains a memcpy whose source would seed FSR1, i.e. whose
@@ -5803,6 +5951,8 @@ pub fn select_with_locs(
     m: &Module,
     addrs: &HashMap<String, u16>,
     isr_low_save: Option<u16>,
+    isr_save: Option<u16>,
+    isr_hi_save: Option<u16>,
 ) -> (String, Vec<Option<SrcLoc>>) {
     let (common_lo, _) = device
         .fixed_retval
@@ -5871,6 +6021,31 @@ pub fn select_with_locs(
         isr_low_save.is_some() == priority_mode,
         "isel-pic18: low save area must be present exactly in priority mode (both priorities present)"
     );
+    // The ISR's own area for the PROD/FSR1 bytes epic-cc#477 adds (PIC18
+    // only: PIC14/PIC14E have no MULWF/PROD, so alloc leaves their layout
+    // byte-identical). The fixed block has no room, so each ISR context
+    // uses an area carved from its region.
+    let has_isr = m.funcs.iter().any(|f| f.isr);
+    let needs_prod_save = device.core == device::Core::Pic18;
+    assert!(
+        !needs_prod_save || isr_save.is_some() == (has_isr && !priority_mode),
+        "isel-pic18: the compat save area must be present exactly for a non-priority ISR module"
+    );
+    assert!(
+        !needs_prod_save || isr_hi_save.is_some() == priority_mode,
+        "isel-pic18: the high save area must be present exactly in priority mode"
+    );
+    let prod_save = |high: bool| -> u16 {
+        if priority_mode {
+            if high {
+                isr_hi_save.expect("isel-pic18: high ISR without a high save area")
+            } else {
+                isr_low_save.expect("isel-pic18: low ISR without a low save area") + 16
+            }
+        } else {
+            isr_save.expect("isel-pic18: ISR without a save area")
+        }
+    };
     // One decision for the whole module: the copy loop (epic-cc#486) is
     // sound only while no ISR can interrupt it holding a stale FSR1.
     let allow_copy_loops = !isr_reachable_may_seed_fsr1(m, &resolved);
@@ -6064,20 +6239,25 @@ pub fn select_with_locs(
                 // area (`isr_low_save`), with a dedicated W slot; the
                 // common block uses `ISR_W_SAVE_OFFSET` (see above).
                 let low_save = priority_mode && f.irq_priority != 1;
-                let saves: [(u16, u16); 11] = if low_save {
+                let prod = prod_save(f.irq_priority == 1);
+                let saves: [(u16, u16); 15] = if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
                     [
                         (common_lo, s + 8),
                         (common_lo + 1, s + 9),
                         (common_lo + 2, s + 10),
                         (common_lo + 3, s + 11),
-                        (0xFD8, s + 1), // STATUS
-                        (0xFE0, s + 2), // BSR
-                        (0xFE9, s + 3), // FSR0L
-                        (0xFEA, s + 4), // FSR0H
-                        (0xFF6, s + 5), // TBLPTRL
-                        (0xFF7, s + 6), // TBLPTRH
-                        (0xFF8, s + 7), // TBLPTRU
+                        (0xFD8, s + 1),  // STATUS
+                        (0xFE0, s + 2),  // BSR
+                        (0xFE9, s + 3),  // FSR0L
+                        (0xFEA, s + 4),  // FSR0H
+                        (0xFE1, s + 12), // FSR1L
+                        (0xFE2, s + 13), // FSR1H
+                        (0xFF3, s + 14), // PRODL
+                        (0xFF4, s + 15), // PRODH
+                        (0xFF6, s + 5),  // TBLPTRL
+                        (0xFF7, s + 6),  // TBLPTRH
+                        (0xFF8, s + 7),  // TBLPTRU
                     ]
                 } else {
                     // The fixed block's slots must NOT alias the retval
@@ -6087,7 +6267,14 @@ pub fn select_with_locs(
                     // would destroy any snapshot parked there (STATUS was;
                     // epic-cc#357). Layout: TBLPTR 0x005-0x007, FSR0H
                     // 0x004, W 0x008, STATUS/BSR/FSR0L 0x009-0x00B, retval
-                    // backup 0x00C-0x00F.
+                    // backup 0x00C-0x00F. FSR1 and PRODL/PRODH joined in
+                    // epic-cc#477 and live in the carved `prod` area, not
+                    // here: the block has no free byte, and bytes above it
+                    // belong to `ram_banks`. The mul routines leave a
+                    // product in PROD across instructions, and the copy
+                    // loop holds FSR1 across one, so an ISR that
+                    // multiplies or memcpys would otherwise corrupt the
+                    // preempted context silently.
                     [
                         (0xFF6, common_lo + 5),  // TBLPTRL
                         (0xFF7, common_lo + 6),  // TBLPTRH
@@ -6096,6 +6283,10 @@ pub fn select_with_locs(
                         (0xFD8, common_lo + 9),  // STATUS
                         (0xFE0, common_lo + 10), // BSR
                         (0xFE9, common_lo + 11), // FSR0L
+                        (0xFE1, prod + 0),       // FSR1L
+                        (0xFE2, prod + 1),       // FSR1H
+                        (0xFF3, prod + 2),       // PRODL
+                        (0xFF4, prod + 3),       // PRODH
                         (common_lo, common_lo + 12),
                         (common_lo + 1, common_lo + 13),
                         (common_lo + 2, common_lo + 14),
@@ -6389,6 +6580,7 @@ pub fn select_with_locs(
                     // restore order is convention: SFRs first, retval
                     // backup second, W last.
                     let low_save = priority_mode && f.irq_priority != 1;
+                    let prod = prod_save(f.irq_priority == 1);
                     if low_save {
                         let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
                         // Disjoint save area (s+1..+11), so the two halves
@@ -6407,6 +6599,15 @@ pub fn select_with_locs(
                             (s + 3, 0xFE9), // FSR0L
                             (s + 2, 0xFE0), // BSR
                             (s + 1, 0xFD8), // STATUS
+                        ]);
+                        // The same four additions as the compat block
+                        // (epic-cc#477): the low save area grew from 12 to
+                        // 16 bytes for them.
+                        g.emit_movff_pairs([
+                            (s + 12, 0xFE1), // FSR1L
+                            (s + 13, 0xFE2), // FSR1H
+                            (s + 14, 0xFF3), // PRODL
+                            (s + 15, 0xFF4), // PRODH
                         ]);
                     } else {
                         // Dealiased slots (epic-cc#357): STATUS/BSR/FSR0L
@@ -6427,6 +6628,17 @@ pub fn select_with_locs(
                             (common_lo + 14, common_lo + 2),
                             (common_lo + 13, common_lo + 1),
                             (common_lo + 12, common_lo),
+                        ]);
+                        // FSR1 and PROD, restored before the retval backup
+                        // and W (both groups below touch the retval region
+                        // through the caller's live result, not these
+                        // slots). Order against the SFR group above is
+                        // free: the ranges are disjoint. (epic-cc#477)
+                        g.emit_movff_pairs([
+                            (prod + 0, 0xFE1), // FSR1L
+                            (prod + 1, 0xFE2), // FSR1H
+                            (prod + 2, 0xFF3), // PRODL
+                            (prod + 3, 0xFF4), // PRODH
                         ]);
                     }
                     if low_save {
