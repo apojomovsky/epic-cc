@@ -34,6 +34,7 @@ one-line index entry here, e.g.:
 - ADR-034: Devices whose entire GPR collapses to one physical region get a carved-out common_ram corner, 2026-09-11
 - ADR-035: Switch is a first-class IR terminator; PIC18 lowers dense switches to PCL jump tables, 2026-09-19
 - ADR-036: PIC18 places the local frame overlay below the globals so the access bank holds frames, 2026-09-20
+- ADR-037: PIC18 runtime-routine frames round on the 256-byte BSR bank, not an ram_banks region (routine_base), 2026-09-21
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

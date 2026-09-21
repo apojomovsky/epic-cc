@@ -996,3 +996,46 @@ fn switch_dense_table_runs_correctly() {
     // instead of through the simulator.
     assert!(p.halted());
 }
+
+#[test]
+fn routine_frame_straddling_a_bsr_bank_is_snapped_and_runs() {
+    // epic-cc#509: PIC18's `operand()` banks on the 256-byte BSR boundary,
+    // but every PIC18 device declares its whole RAM as one `ram_banks`
+    // region, so `round_if_routine`'s region-based check never fired and a
+    // frame crossing 0x100 got a MOVLB emitted inside its own skip-sensitive
+    // recipe. The fixture's overlay puts `__add_f32` astride 0x100 (base
+    // 0xEE..0x103 before the fix); alloc must snap it to 0x100 instead.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/routine_frame_straddle.c"
+    ));
+    // No MOVLB immediately followed by nothing, and no MOVLB between a skip
+    // and the instruction it skips: the two are the same failure here.
+    let lines: Vec<&str> = asm.lines().collect();
+    for (i, l) in lines.iter().enumerate() {
+        let op = l.split_whitespace().next().unwrap_or("");
+        if matches!(
+            op,
+            "BTFSC" | "BTFSS" | "INCFSZ" | "INFSNZ" | "DECFSZ" | "DCFSNZ"
+        ) {
+            assert!(
+                !lines
+                    .get(i + 1)
+                    .map(|n| n.trim_start().starts_with("MOVLB"))
+                    .unwrap_or(false),
+                "a MOVLB lands inside a skip window at line {}:\n{asm}",
+                i + 1
+            );
+        }
+    }
+    p.ram_mut()[globals["in"] as usize] = 3;
+    p.run(2_000_000);
+    let o = globals["out"] as usize;
+    // 3.0 + 1.5 + (float)pad[7], pad[7] = 7 + 3 = 10 -> 14.5f.
+    assert_eq!(
+        [p.ram()[o], p.ram()[o + 1], p.ram()[o + 2], p.ram()[o + 3]],
+        [0x00, 0x00, 0x68, 0x41],
+        "out must be 14.5f"
+    );
+    assert!(p.halted());
+}

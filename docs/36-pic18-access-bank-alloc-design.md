@@ -14,6 +14,13 @@
 > statement below (`__cmp_f32` at `0xCC-0xD4`) was measured against the
 > globals-first layout and no longer describes the tree. Re-measure the
 > `%f` printf path before implementing any of section 3.
+>
+> **Further (2026-09-21, epic-cc#509).** The access-bank window this doc
+> proposes reserving is dead: the float recipes no longer need `a=0`
+> operands (ADR-031, `emit_banked`), so the only surviving constraint is
+> "one 256-byte BSR bank", which `routine_base` now enforces directly. A
+> `float_routine_base` bound to `access_bank_hi` would be a second,
+> redundant mechanism; do not implement section 3.
 
 **Problem:** on PIC18 a program that calls a float runtime routine
 (`__add_f32`, `__mul_f32`, `__cmp_f32`, ...) only compiles when the routine's
