@@ -4884,3 +4884,28 @@ fn dirty_terminator_poison_single_pred_taken_target() {
         assert_eq!(p.ram()[0x190], expect, "out1 wrong on cond={c}");
     }
 }
+
+#[test]
+fn low_priority_epilogue_restores_bsr_after_the_banked_w_restore() {
+    // The W save slot lives in banked RAM, so its restore selects the
+    // save bank; without the re-restore that follows, main would resume
+    // against the save bank instead of its own (epic-cc#534 makes
+    // tracked agreement load-bearing there).
+    let m = parse(
+        "fn hi(void) [isr] [irq1] ()\n  block entry:\n    ret void\n\
+         fn lo(void) [isr] [irq2] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm =
+        isel_pic18::select_with_locs(&PIC18F4550, &m, &addrs(&[]), Some(0x140), None, Some(0x150))
+            .0;
+    let w = asm.find("MOVF 0x140, W, B").expect("banked W restore");
+    let after_w = &asm[w..];
+    let re = after_w
+        .find("MOVFF 0x142, 0xFE0")
+        .expect("BSR re-restore after the W restore");
+    assert!(
+        after_w[re..].contains("RETFIE"),
+        "RETFIE follows the re-restore:\n{asm}"
+    );
+}
