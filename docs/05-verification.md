@@ -85,6 +85,35 @@ Because every pipeline stage boundary is a text artifact ([`04-pipeline-design.m
 snapshot tests (`insta`) can pin each stage's output. A miscompile is then bisected to a
 stage *before* anyone reads code.
 
+## Flash size: a gate and a profile
+
+Two separate jobs, deliberately split. `crates/driver/tests/size_regression_e2e.rs`
+is the **gate**: a checked-in baseline per fixture, failing when a program
+grows. It says that something got bigger, never where.
+
+`scripts/density-profile.py` is the **profile**, and answers where. It reads
+an `--emit asm` listing, sizes every instruction with the word table it
+parses out of the `asm` crate itself (so it cannot drift from the encoder),
+attributes each instruction to its nearest preceding function label, and
+buckets the result into named codegen sinks: struct-copy `MOVFF` runs, wide
+constant materialisation, bank switches, boolean diamonds, unrolled shift
+chains, dead store/reload round trips, switch dispatch. Output is a table
+ranked by words, optionally against an XC8 reference count.
+
+```bash
+epic-cc --target 18F4550 --emit asm -o out.asm src/*.c
+python3 scripts/density-profile.py out.asm --xc8-words 9068 --show-other
+python3 scripts/density-profile.py out.asm --json > before.json
+# ... land a codegen fix, rebuild ...
+python3 scripts/density-profile.py after.asm --compare before.json
+```
+
+The listing is the assembler's *input*: far-branch expansion and PCL
+alignment padding land during assembly, so a PIC18 total reads a little
+under the driver's own flash report. `--flash-words` prints that residual
+rather than hiding it. Sink categories live in one precedence-ordered rule
+table (`SINK_RULES`); a new category is one entry and one matcher.
+
 ## Hardware-in-the-loop
 
 The final oracle is real silicon. HEX files can be flashed via MPLAB IPE. This is out of
