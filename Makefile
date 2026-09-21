@@ -8,6 +8,9 @@
 # live under ~/.cache/, so the host's own target/ is never touched.
 
 LOCAL_IMAGE := epic-cc-dev:local
+# XC8 test-oracle image (epic-cc#527): separate from the dev image because XC8
+# is licence-gated and cannot ride in an image `release`/`ci` derive from.
+ORACLE_IMAGE := epic-cc-xc8-oracle:local
 CACHE_DIR   := $(HOME)/.cache/epic-cc
 CARGO_HOME_CACHE := $(CACHE_DIR)/cargo-home
 
@@ -59,6 +62,30 @@ doctor: ## Report what first-time setup is missing, change nothing
 
 help: ## List targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-16s %s\n", $$1, $$2}'
+
+oracle-image: ## Build the XC8 oracle image (needs vendor/microchip/installers/xc8-installer.run)
+	@installer="vendor/microchip/installers/xc8-installer.run"; \
+	if [ ! -f "$$installer" ]; then \
+		echo "oracle-image: missing $$installer" >&2; \
+		echo "  XC8 is licence-gated: the installer is user-supplied, never committed." >&2; \
+		echo "  Download the XC8 v4.00 Linux installer (.run) from Microchip and" >&2; \
+		echo "  place it there, or link an existing copy from another checkout." >&2; \
+		echo "  See vendor/README.md." >&2; \
+		exit 2; \
+	fi; \
+	stage="$$(mktemp -d)"; \
+	trap 'rm -rf "$$stage"' EXIT; \
+	cp docker/xc8-oracle/Dockerfile "$$stage/Dockerfile"; \
+	cp "$$installer" "$$stage/xc8-installer.run"; \
+	$(ENSURE_BUILDER); \
+	docker buildx build --builder $(BUILDER) --load \
+		-t $(ORACLE_IMAGE) "$$stage"
+
+oracle-exec: oracle-image ## Run a command in the XC8 oracle image: make oracle-exec CMD='xc8-cc -mcpu=18f4550 ...'
+	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE)
+	docker run --rm --user $$(id -u):$$(id -g) \
+		-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
+		-v $(CURDIR):/workspace -w /workspace $(ORACLE_IMAGE) bash -c '$(CMD)'
 
 image: ## Build the dev image (only image you need locally)
 	@$(ENSURE_BUILDER)

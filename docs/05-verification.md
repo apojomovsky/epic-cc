@@ -15,9 +15,9 @@ random program generator ──► our compiler ──┐
 
 ### 1. XC8 (`xc8-cc`)
 
-**Available, not yet wired.** XC8 v4.00 lives in the `epic-hal-toolchain:local` image, not
-in the epic-cc dev image; [`06-environment.md`](06-environment.md) has the exact invocation
-(the `-mdfp` path matters). The differential runner described here is **not built**:
+**Available, not yet wired.** XC8 v4.00 lives in its own opt-in image,
+`epic-cc-xc8-oracle:local` (`make oracle-image`; [`06-environment.md`](06-environment.md)),
+not in the epic-cc dev image. The differential runner described here is **not built**:
 `docs/13` defers it to phase 6, and no `xc8-cc` invocation exists in this repo. epic-hal's
 `build-cmp` scripts are the only working XC8 users in the family, and they use it for size
 comparison, not correctness differencing.

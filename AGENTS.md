@@ -233,22 +233,20 @@ mechanical rules fails the ritual and blocks the push.
 - **Never reverse-engineer or disassemble XC8 binaries.** XC8 is a
   black-box differential oracle only: compile the same source with
   `xc8-cc` and diff observable behaviour. Its licence forbids more.
-- **XC8 is in the `epic-hal-toolchain:local` image, not this one.** The
-  epic-cc dev image sets `PIC8_XC8_ROOT` but installs nothing there, so
-  `xc8-cc` fails with `command not found` inside `make exec`. Run it
-  through the sibling image instead, and pass `-mdfp` pointing at the
-  pack's `xc8` subdirectory (XC8 v4.00 does not auto-discover device
-  files):
+- **XC8 lives in its own opt-in image, not the dev one.** The epic-cc dev
+  image sets `PIC8_XC8_ROOT` but installs nothing there, so `xc8-cc` is
+  `command not found` inside `make exec`. Build the oracle image once and
+  run XC8 through it:
 
   ```bash
-  docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" \
-    -w /workspace epic-hal-toolchain:local \
-    xc8-cc -mdfp=/opt/microchip/xc8/v4.00/pic/packs/Microchip.PIC18Fxxxx_DFP/xc8 \
-           -mcpu=18f4550 -O2 -c file.c -o file.p1
+  make oracle-image    # needs vendor/microchip/installers/xc8-installer.run
+  make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 file.c -o file.p1'
   ```
 
-  Never install XC8 (or anything else) on the host. Details and the
-  verified PIC18 recipe: `docs/06-environment.md`.
+  It is a separate image because XC8 is licence-gated and must not ride in
+  an image `release`/`ci` derive from. Never install XC8 on the host. The
+  image's `xc8-cc` wraps the `-mdfp` path callers would otherwise get
+  wrong; details in `docs/06-environment.md`.
 - **GPL boundary.** `gputils`/`gpasm` and `gpsim` are GPL: invoking
   them as external processes in tests is fine; linking them into the
   compiler is not.

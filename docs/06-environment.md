@@ -25,50 +25,36 @@ Two things are **not** yet packaged and need their own packages later: `gpsim` a
 
 ## The XC8 install
 
-**XC8 is not in `epic-cc-dev`. It lives in `epic-hal-toolchain:local`, and that is where
-you must run it.** The epic-cc dev image sets `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00`
-but does not install anything at that path, so invoking `xc8-cc` there fails with
-`command not found`. Do not `apt install` or run the Microchip installer on the host: it
-is licence-gated and the image boundary is the point.
+**XC8 is not in `epic-cc-dev`. It has its own opt-in image, `epic-cc-xc8-oracle:local`,
+because it is licence-gated and cannot ride in an image `release`/`ci` derive from.** The
+dev image merely *declares* `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00` without installing
+anything there, so `xc8-cc` is `command not found` inside `make exec`. Never install XC8
+on the host.
 
 ```bash
-# Version 4.00, PIC18 DFP 1.7.171 already unpacked in this image.
-docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace" -w /workspace \
-  epic-hal-toolchain:local \
-  xc8-cc -mdfp=/opt/microchip/xc8/v4.00/pic/packs/Microchip.PIC18Fxxxx_DFP/xc8 \
-         -mcpu=18f4550 -O2 -c file.c -o file.p1
+make oracle-image           # once; needs vendor/microchip/installers/xc8-installer.run
+make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 file.c -o file.p1'
 ```
 
-The three facts that cost time to rediscover:
+`oracle-image` stages the installer from `vendor/microchip/installers/` (gitignored, so it
+never enters the repo or a public image) and installs XC8 v4.00 plus the three DFP
+families from Microchip's pack server. `oracle-exec` runs any command in that image with
+your uid, so files written through it stay host-owned.
 
-1. **`-mdfp` is mandatory and must point at the pack's `xc8` subdirectory**, not the pack
-   root and not `/opt/dfp`. XC8 v4.00 does not auto-discover its device files, and the
-   wrong suffix fails with `error: (2104) no device-support files found`.
-2. **The image is `epic-hal-toolchain:local`**, built from `epic-hal`'s
-   `docker/ci-toolchain/Dockerfile` (which installs XC8 plus the DFPs from
-   `packs.download.microchip.com`). Its Makefile has the working invocation in
-   `build-cmp/*/build.sh`. If the local tag is stale it may lack the packs; `docker images`
-   shows what is actually present.
-3. **Nothing in epic-cc reads `PIC8_XC8_ROOT` yet.** The XC8 differential described in
-   [`05-verification.md`](05-verification.md) is not built: `docs/13` defers it to phase 6,
-   and epic-hal's `build-cmp` scripts are the only XC8 invocations in the tree.
+Two details that cost time to rediscover:
 
-The install layout, for reference (paths inside the epic-hal image):
+1. **`-mdfp` is mandatory in XC8 v4.00 and must name a pack's `xc8` subdirectory**, not
+   the pack root (`error: (2104) no device-support files found`). The image ships a
+   `/usr/local/bin/xc8-cc` wrapper that supplies the PIC18 pack by default and takes
+   `XC8C_DFP=...` to switch families, so callers need only `-mcpu=`. XC8's own `bin` is
+   deliberately not on `PATH` ahead of that wrapper.
+2. **The standalone installer bundles no DFPs.** They are fetched from
+   `packs.download.microchip.com` at build time; without network access the build fails
+   rather than producing an image that cannot target anything.
 
-```
-/opt/microchip/xc8/v4.00/
-├── bin/              xc8-cc, xc8-ar, pic-objdump, pic-objcopy, deviceSupport.xml, …
-├── pic/bin/          aspic aspic18 cgpic cgpic18 clang clist cromwell driver
-│                     driver18 dump hexmate hlink libr
-├── pic/packs/        Microchip.PIC16Fxxx_DFP, Microchip.PIC18Fxxxx_DFP,
-│                     Microchip.PIC12-16F1xxx_DFP (each with an `xc8/` subdir)
-├── pic-as/
-├── avr/
-└── docs/             MPLAB_XC8_C_Compiler_License.rtf, LLVM_LICENSE.txt, …
-```
-
-Verified working for PIC18: the recipe above compiles, links (`-ginhx32`), and prints the
-`18F4550 Memory Summary` that the size references quote.
+Verified working for PIC18: `make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 f.c -o f.hex
+-ginhx32'` compiles, links, and the size report prints the `18F4550 Memory Summary` the
+size references quote.
 
 ### Two critical facts about this install
 
