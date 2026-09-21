@@ -25,20 +25,36 @@ Two things are **not** yet packaged and need their own packages later: `gpsim` a
 
 ## The XC8 install
 
-Located at **`/opt/microchip/xc8/v4.00/`**. Confirmed to support the **PIC16F877A**
-(`grep 16F877A bin/deviceSupport.xml`).
+**XC8 is not in `epic-cc-dev`. It has its own opt-in image, `epic-cc-xc8-oracle:local`,
+because it is licence-gated and cannot ride in an image `release`/`ci` derive from.** The
+dev image merely *declares* `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00` without installing
+anything there, so `xc8-cc` is `command not found` inside `make exec`. Never install XC8
+on the host.
 
+```bash
+make oracle-image           # once; needs vendor/microchip/installers/xc8-installer.run
+make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 file.c -o file.p1'
 ```
-/opt/microchip/xc8/v4.00/
-├── bin/          xc8-cc, xc8-ar, xc8-clangd, pic-objdump, pic-objcopy,
-│                 avr-objdump, avr-objcopy, deviceSupport.xml, verifyinst, xc-ccov
-├── pic/bin/      aspic aspic18 cgpic cgpic18 clang clist cromwell driver
-│                 driver18 dump hexmate hlink libr
-├── pic-as/
-├── avr/
-└── docs/         MPLAB_XC8_C_Compiler_License.rtf, LLVM_LICENSE.txt,
-                  Hexmate_User_Guide.pdf, MPASM_to_MPLAB_XC8_..._Migration_Guide.pdf, …
-```
+
+`oracle-image` stages the installer from `vendor/microchip/installers/` (gitignored, so it
+never enters the repo or a public image) and installs XC8 v4.00 plus the three DFP
+families from Microchip's pack server. `oracle-exec` runs any command in that image with
+your uid, so files written through it stay host-owned.
+
+Two details that cost time to rediscover:
+
+1. **`-mdfp` is mandatory in XC8 v4.00 and must name a pack's `xc8` subdirectory**, not
+   the pack root (`error: (2104) no device-support files found`). The image ships a
+   `/usr/local/bin/xc8-cc` wrapper that supplies the PIC18 pack by default and takes
+   `XC8C_DFP=...` to switch families, so callers need only `-mcpu=`. XC8's own `bin` is
+   deliberately not on `PATH` ahead of that wrapper.
+2. **The standalone installer bundles no DFPs.** They are fetched from
+   `packs.download.microchip.com` at build time; without network access the build fails
+   rather than producing an image that cannot target anything.
+
+Verified working for PIC18: `make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 f.c -o f.hex
+-ginhx32'` compiles, links, and the size report prints the `18F4550 Memory Summary` the
+size references quote.
 
 ### Two critical facts about this install
 
