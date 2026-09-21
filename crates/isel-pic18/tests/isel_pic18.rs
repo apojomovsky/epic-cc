@@ -4031,3 +4031,227 @@ fn negative_base_switch_keeps_the_compare_chain() {
     assert!(!asm.contains("ADDWF 0xFF9"), "no PCL dispatch:\n{asm}");
     assert!(!asm.contains(".pcltbl"), "no table marker:\n{asm}");
 }
+
+#[test]
+fn icmp_eq_zero_skips_the_literal_subtract() {
+    // `x == 0` consumes only Z, and `MOVF f,W` sets Z from `f` itself. The
+    // `MOVLW 0x00`/`SUBWF` pair it replaces is the epic-cc#503 sink.
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp eq i8 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVF 0x012,W,A"), "Z from the byte:\n{asm}");
+    assert!(
+        !asm.contains("SUBWF"),
+        "a zero compare needs no subtract:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (xv, expect) in [(0u8, 1u8), (7, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x11], expect, "eq({xv},0)");
+    }
+}
+
+#[test]
+fn icmp_ne_zero_skips_the_literal_subtract() {
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp ne i8 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVF 0x012,W,A"), "Z from the byte:\n{asm}");
+    assert!(
+        !asm.contains("SUBWF"),
+        "a zero compare needs no subtract:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (xv, expect) in [(0u8, 0u8), (7, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x11], expect, "ne({xv},0)");
+    }
+}
+
+#[test]
+fn icmp_eq_zero_uses_the_banked_operand_form() {
+    // Place both operands above the access bank: the emitted form must
+    // carry the banked `,B` operand and its `MOVLB`, the shape every
+    // menu-demo site actually takes, not only the `,A` one.
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp eq i8 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x112),
+        ("out", 0x113),
+        ("main::1", 0x114),
+        ("main::2", 0x115),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // The operand prints as the bank-relative byte plus the `,B` bit.
+    assert!(
+        asm.contains("MOVF 0x014,W,B"),
+        "banked zero compare:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLB 0x1"),
+        "bank selected for the load:\n{asm}"
+    );
+    assert!(!asm.contains("SUBWF"), "no subtract:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (xv, expect) in [(0u8, 1u8), (7, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x112] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x113], expect, "banked eq({xv},0)");
+    }
+}
+
+#[test]
+fn icmp_i32_eq_zero_converts_every_lane() {
+    let m = parse(
+        "global x i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i32 @x\n    %2 = icmp eq i32 %1, 0\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x28),
+        ("main::2", 0x2C),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(!asm.contains("SUBWF"), "no lane subtracts:\n{asm}");
+    // `MOVF` for each of the four compared lanes; the two `MOVLW` that
+    // remain belong to the shared 0/1 materialization, not the compare.
+    assert_eq!(asm.matches("MOVF 0x0").count(), 4, "one per byte:\n{asm}");
+    assert_eq!(asm.matches("BNZ").count(), 4, "one branch per byte:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for (bytes, expect) in [
+        ([0u8, 0, 0, 0], 1u8),
+        ([0, 0, 0, 1], 0),
+        ([1, 0, 0, 0], 0),
+        ([0, 0, 1, 0], 0),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        for (i, b) in bytes.iter().enumerate() {
+            p.ram_mut()[0x20 + i] = *b;
+        }
+        p.run(300);
+        assert_eq!(p.ram()[0x24], expect, "eq({bytes:?}, 0)");
+    }
+}
+
+#[test]
+fn icmp_ordering_against_zero_keeps_the_carry_producing_subtract() {
+    // The gate is "the consumer reads only Z", not "the literal is zero":
+    // `uge`/`ult`/`ugt`/`ule` branch on C and `slt`/`sge`/`sgt`/`sle` on
+    // N/OV, none of which `MOVF` writes. Dropping the subtract there would
+    // leave those branches reading a stale flag.
+    for (pred, xv, expect) in [
+        ("uge", 0u8, 1u8),
+        ("uge", 7, 1),
+        ("ult", 0, 0),
+        ("ult", 7, 0),
+        ("ugt", 0, 0),
+        ("ugt", 7, 1),
+        ("ule", 0, 1),
+        ("ule", 7, 0),
+        ("sge", 0xFF, 0),
+        ("slt", 0xFF, 1),
+        ("sgt", 0xFF, 0),
+        ("sle", 0xFF, 1),
+    ] {
+        let m = parse(&format!(
+            "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load i8 @x\n    %2 = icmp {pred} i8 %1, 0\n    store i8 %2 @out\n    ret void\n"
+        ));
+        let addrs = addrs(&[
+            ("x", 0x10),
+            ("out", 0x11),
+            ("main::1", 0x12),
+            ("main::2", 0x13),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert!(
+            asm.contains("SUBWF 0x012,W,A"),
+            "{pred} keeps its subtract:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        let mut p = pic14_sim::Pic18::new(words);
+        p.ram_mut()[0x10] = xv;
+        p.run(200);
+        assert_eq!(p.ram()[0x11], expect, "{pred}({xv}, 0)");
+    }
+}
+
+#[test]
+fn icmp_i16_eq_zero_compares_the_high_byte_with_movf_but_keeps_its_subtract() {
+    // A multi-byte equality still needs the subtract on bytes whose value
+    // can make the difference, but a byte the literal leaves zero can use
+    // `MOVF`. The high byte is the zero one here, so it converts and the
+    // low byte (literal 0x07) does not.
+    let m = parse(
+        "global x i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @x\n    %2 = icmp eq i16 %1, 7\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x12),
+        ("main::1", 0x13),
+        ("main::2", 0x14),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVF 0x014,W,A"),
+        "zero high byte compares via MOVF:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x07"),
+        "non-zero low byte still stages its literal:\n{asm}"
+    );
+    assert!(
+        asm.contains("SUBWF 0x013,W,A"),
+        "non-zero low byte still subtracts:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (lo, hi, expect) in [(7u8, 0u8, 1u8), (6, 0, 0), (7, 1, 0), (0, 0, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = lo;
+        p.ram_mut()[0x11] = hi;
+        p.run(300);
+        assert_eq!(p.ram()[0x12], expect, "eq(0x{hi:02X}{lo:02X}, 7)");
+    }
+}
+
+#[test]
+fn icmp_nonzero_byte_compare_still_subtracts_the_literal() {
+    let m = parse(
+        "global x i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i8 @x\n    %2 = icmp eq i8 %1, 4\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("x", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVLW 0x04"), "literal staged:\n{asm}");
+    assert!(asm.contains("SUBWF 0x012,W,A"), "subtract kept:\n{asm}");
+}

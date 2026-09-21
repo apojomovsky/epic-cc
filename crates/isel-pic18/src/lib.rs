@@ -2623,8 +2623,8 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Computes `dst = (a <pred> b) ? 1 : 0` for one byte via `a - b` and a
-    /// flag branch using standard condition codes (C=1 means no borrow).
+    /// Computes `dst = (a <pred> b) ? 1 : 0` for one byte via a flag
+    /// branch using standard condition codes (C=1 means no borrow).
     /// Shares the flag test with the 16-bit compare. A lone byte resolves
     /// equality directly to the predicate answer: true for `eq`/`uge`/`ule`/
     /// `sge`/`sle`, false for the strict ones. Routing equality uniformly
@@ -2709,11 +2709,12 @@ impl<'m> Gen<'m> {
     }
 
     /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
-    /// byte matches; `ne` is the mirror. Direct per-byte equality checks
-    /// (`SUBWF` + `BNZ`), independent of the signed/unsigned tie-break
-    /// machinery used for the eight ordering predicates: a partial match
-    /// (some byte equal, another different) is decisive here in a way it
-    /// never is for `slt`/`ult`/etc.
+    /// byte matches; `ne` is the mirror. Per-byte checks through
+    /// `emit_cmp_flags` (`MOVF` for a zero literal lane, `SUBWF` otherwise)
+    /// then `BNZ`, independent of the signed/unsigned tie-break machinery
+    /// used for the eight ordering predicates: a partial match (some byte
+    /// equal, another different) is decisive here in a way it never is for
+    /// `slt`/`ult`/etc.
     fn emit_icmp_i16_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
         self.emit_icmp_eq_ne(a, b, pred, dst, 2);
     }
@@ -2724,11 +2725,7 @@ impl<'m> Gen<'m> {
         let l_done = self.fresh_label();
         let l_mismatch = if pred == "eq" { &l_false } else { &l_true };
         for offset in 0..bytes {
-            self.emit_load_w(&b, offset);
-            let av = self.val_addr(&a).direct() + u16::from(offset);
-            let (acc, af) = self.operand(av);
-            let bank = if acc == 0 { "A" } else { "B" };
-            self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
+            self.emit_cmp_flags(&a, &b, offset, pred);
             self.emit(format!("    BNZ {l_mismatch}"));
         }
         // Every byte matched: `eq` is true, `ne` is false.
@@ -2798,6 +2795,34 @@ impl<'m> Gen<'m> {
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst);
     }
 
+    /// Compares `a`'s byte at `byte_offset` against `b`'s, leaving the
+    /// STATUS flags the predicate's branches read. `eq`/`ne` consume only
+    /// Z, so a zero literal byte skips the subtract: `MOVF f,W` sets Z
+    /// from `f` itself, one word where the staged pair costs two. The
+    /// ordering predicates branch on C or N/OV, which `MOVF` leaves
+    /// alone, so the gate is "reads only Z", not "the literal is zero".
+    fn emit_cmp_flags(&mut self, a: &Val, b: &Val, byte_offset: u8, pred: &str) {
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        let av = self.val_addr(a).direct() + u16::from(byte_offset);
+        if matches!(pred, "eq" | "ne") {
+            if let Val::Const(k) = b {
+                if (k >> (u32::from(byte_offset) * 8)) & 0xFF == 0 {
+                    let (acc, af) = self.operand(av);
+                    let bank = if acc == 0 { "A" } else { "B" };
+                    self.emit(format!("    MOVF 0x{af:03X},W,{bank}")); // Z = (a == 0)
+                    return;
+                }
+            }
+        }
+        self.emit_load_w(b, byte_offset);
+        let (acc, af) = self.operand(av);
+        let bank = if acc == 0 { "A" } else { "B" };
+        self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
+    }
+
     /// Branches a byte compare three ways: `l_true` when the predicate holds,
     /// `l_false` on a decisive mismatch, `l_equal` on equal bytes. Equality
     /// stays ambiguous by design: the caller binds `l_equal` to defer (the
@@ -2814,15 +2839,7 @@ impl<'m> Gen<'m> {
         l_false: &str,
         l_equal: &str,
     ) {
-        assert!(
-            !matches!(a, Val::Const(_)),
-            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
-        );
-        self.emit_load_w(b, byte_offset);
-        let av = self.val_addr(a).direct() + u16::from(byte_offset);
-        let (acc, af) = self.operand(av);
-        let bank = if acc == 0 { "A" } else { "B" };
-        self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
+        self.emit_cmp_flags(a, b, byte_offset, pred);
 
         match pred {
             "eq" => {
