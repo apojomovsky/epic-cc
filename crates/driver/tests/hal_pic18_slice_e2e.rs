@@ -10,7 +10,7 @@
 //! the "both programs run correctly on the Pic18 simulator, from a
 //! `make test` run" acceptance criterion.
 
-use std::process::Command;
+use std::collections::HashMap;
 
 // PIC18F4550 SFRs (DS39632E, via the vendored hal_pic18.h).
 const INTCON: usize = 0xFF2;
@@ -24,14 +24,22 @@ fn fixture(path: &str) -> String {
 }
 
 /// Run the real `epic-cc` binary over the given slice sources (with the
-/// config TU, exercising CC-3) targeting the 4550. Returns the parsed
-/// program words for the simulator.
-fn compile_slice(sources: &[&str], tag: &str) -> Vec<u16> {
-    let hex_path = std::env::temp_dir().join(format!("hal_pic18_{tag}_{}.hex", std::process::id()));
+/// config TU, exercising CC-3) targeting the 4550. Returns the program
+/// words for the simulator and the global addresses off the compiler's own
+/// `--map`. Re-deriving the addresses from a second in-process pipeline
+/// would be a copy of `main.rs` that drifts: PIC18 alone parses with
+/// switches preserved, and since the frames sit below the globals there, a
+/// difference that far upstream moves every global address.
+fn compile_slice(sources: &[&str], tag: &str) -> (Vec<u16>, HashMap<String, usize>) {
+    let stem = std::env::temp_dir().join(format!("hal_pic18_{tag}_{}", std::process::id()));
+    let hex_path = stem.with_extension("hex");
+    let map_path = stem.with_extension("map");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--target", "18F4550", "-I", "tests/fixtures/hal-pic18"])
         .arg("-o")
         .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
         .arg(fixture("hal_pic18_config.c"))
         .args(sources.iter().map(|s| fixture(s)))
         .output()
@@ -42,92 +50,19 @@ fn compile_slice(sources: &[&str], tag: &str) -> Vec<u16> {
         String::from_utf8_lossy(&out.stderr)
     );
     let produced = std::fs::read_to_string(&hex_path).expect("read produced hex");
+    let map = std::fs::read_to_string(&map_path).expect("read produced map");
     let _ = std::fs::remove_file(&hex_path);
-    pic14_sim::parse_hex_pic18(&produced)
-}
-
-/// Rebuild the address map the driver computes for the slice, mirroring
-/// `crates/driver/src/main.rs`: every .c input through clang + llvm-link,
-/// then the whole-program stages, so the e2e can locate observable globals
-/// by name (the same pattern `multi_tu_e2e.rs` and `cc2_headers_e2e.rs`
-/// use).
-/// The driver ships the freestanding headers (`stdint.h`, `epic-cc.h`,
-/// ...) in a temp include dir; the layout helper needs them too so clang
-/// parses the slice exactly as the real driver does.
-fn header_dir() -> std::path::PathBuf {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tid = format!("{:?}", std::thread::current().id());
-    let dir = std::env::temp_dir()
-        .join(format!(
-            "hal-slice-test-{}-{}-{}",
-            std::process::id(),
-            tid,
-            ns
-        ))
-        .join("include");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("stdint.h"), driver::stdint_h::STDINT_H).unwrap();
-    std::fs::write(dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H).unwrap();
-    std::fs::write(dir.join("stddef.h"), driver::stddef_h::STDDEF_H).unwrap();
-    std::fs::write(dir.join("string.h"), driver::string_h::STRING_H).unwrap();
-    std::fs::write(dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).unwrap();
-    dir
-}
-
-fn slice_layout(sources: &[&str]) -> alloc::AllocLayout {
-    use driver::clang_discovery;
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let llvm_link = clang_discovery::resolve_llvm_link(&clang).expect("resolve_llvm_link");
-    let hdir = header_dir();
-
-    let tid = format!("{:?}", std::thread::current().id());
-    let tmp = std::env::temp_dir().join(format!("epiccc-hal-slice-{}-{}", std::process::id(), tid));
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    let mut units = Vec::new();
-    for (n, input) in sources.iter().enumerate() {
-        let ll_path = tmp.join(format!("{n:03}.ll"));
-        driver::clang::compile_to_file(
-            &clang,
-            &resdir,
-            std::path::Path::new(&fixture(input)),
-            &ll_path,
-            &driver::clang::Options {
-                includes: vec![
-                    "tests/fixtures/hal-pic18".to_string(),
-                    hdir.to_str().unwrap().to_string(),
-                ],
-                header_dir: Some(hdir.clone()),
-                ..Default::default()
-            },
-        );
-        units.push(ll_path);
-    }
-
-    let merged_path = tmp.join("merged.ll");
-    let mut cmd = Command::new(&llvm_link);
-    cmd.arg("-S");
-    for u in &units {
-        cmd.arg(u);
-    }
-    cmd.args(["-o", merged_path.to_str().unwrap()]);
-    let out = cmd.output().expect("run llvm-link");
-    assert!(
-        out.status.success(),
-        "llvm-link: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let ll_text =
-        irparse::sanitize_symbols(&std::fs::read_to_string(&merged_path).expect("read merged .ll"));
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    alloc::allocate(&device::PIC18F4550, &m, &callgraph::edges_text(&cg))
+    let _ = std::fs::remove_file(&map_path);
+    let globals = map
+        .lines()
+        .filter_map(|l| l.strip_prefix("global "))
+        .filter_map(|rest| {
+            let (name, addr) = rest.split_once(' ')?;
+            let addr = usize::from_str_radix(addr.trim().strip_prefix("0x")?, 16).ok()?;
+            Some((name.to_string(), addr))
+        })
+        .collect();
+    (pic14_sim::parse_hex_pic18(&produced), globals)
 }
 
 #[test]
@@ -138,13 +73,8 @@ fn blink_slice_toggles_rb0_on_tmr0_overflow() {
         "hal_pic18_timer0.c",
         "hal_pic18_irq.c",
     ];
-    let layout = slice_layout(&sources);
-    let count_addr = *layout
-        .globals
-        .get("g_toggle_count")
-        .expect("g_toggle_count") as usize;
-
-    let prog = compile_slice(&sources, "blink");
+    let (prog, globals) = compile_slice(&sources, "blink");
+    let count_addr = globals["g_toggle_count"];
     let mut sim = pic14_sim::Pic18::new(prog);
 
     // Run past init first (EPIC_TIMER0_Init clears TMR0IF), then drive
@@ -182,12 +112,9 @@ fn tick_slice_advances_1ms_per_tmr2_overflow() {
         "hal_pic18_timer2.c",
         "hal_pic18_irq.c",
     ];
-    let layout = slice_layout(&sources);
-    let e10 = *layout.globals.get("g_tick_e10").expect("g_tick_e10") as usize;
-    let e5 = *layout.globals.get("g_tick_e5").expect("g_tick_e5") as usize;
-    let result = *layout.globals.get("g_tick_result").expect("g_tick_result") as usize;
-
-    let prog = compile_slice(&sources, "tick");
+    let (prog, globals) = compile_slice(&sources, "tick");
+    let (e10, e5) = (globals["g_tick_e10"], globals["g_tick_e5"]);
+    let result = globals["g_tick_result"];
     let mut sim = pic14_sim::Pic18::new(prog);
 
     // Run to just past init (epic_tick_init clears TMR2IF), then pump the
