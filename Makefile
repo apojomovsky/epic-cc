@@ -55,7 +55,7 @@ DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
 	-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
 	-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
-	-e EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA) \
+	-e "EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA)" \
 	-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE)
 
 .PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check

@@ -33,21 +33,37 @@ fn stamp() -> String {
 }
 
 /// The commit of the checkout `cargo` is building in, read the same way
-/// build.rs reads it (EPIC_CC_GIT_SHA first, then the tree's own git).
+/// build.rs reads it: EPIC_CC_GIT_SHA first, then the source tree's own git,
+/// and only when git confirms the tree really is the epic-cc checkout (not a
+/// git-less copy nested inside some other repo, which build.rs refuses to
+/// stamp).
 fn checkout_head() -> Option<String> {
     if let Ok(sha) = std::env::var("EPIC_CC_GIT_SHA") {
         if !sha.is_empty() {
             return Some(sha);
         }
     }
-    let out = Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..");
+    let run = |args: &[&str]| -> Option<String> {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let toplevel = std::fs::canonicalize(run(&["rev-parse", "--show-toplevel"])?).ok()?;
+    let expected = std::fs::canonicalize(&root).ok()?;
+    if toplevel != expected {
+        return None;
+    }
+    run(&["rev-parse", "--short", "HEAD"])
 }
 
 #[test]
@@ -88,8 +104,14 @@ fn a_git_build_reports_the_checkout_sha() {
         return;
     }
     let Some(head) = checkout_head() else {
-        // No git checkout (a source tarball): the stamp is the bare crate
-        // version, which is the honest answer and must still be non-empty.
+        // No git checkout (a source tarball): the identity must be the bare
+        // crate version. Asserting the exact value, not just non-emptiness,
+        // is what rejects a dishonest stamp such as `0.1.0+unknown`.
+        assert_eq!(
+            stamp(),
+            env!("CARGO_PKG_VERSION"),
+            "a build with no checkout must report the bare crate version"
+        );
         return;
     };
     let stamp = stamp();
