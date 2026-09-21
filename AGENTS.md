@@ -233,6 +233,20 @@ mechanical rules fails the ritual and blocks the push.
 - **Never reverse-engineer or disassemble XC8 binaries.** XC8 is a
   black-box differential oracle only: compile the same source with
   `xc8-cc` and diff observable behaviour. Its licence forbids more.
+- **XC8 lives in its own opt-in image, not the dev one.** The epic-cc dev
+  image sets `PIC8_XC8_ROOT` but installs nothing there, so `xc8-cc` is
+  `command not found` inside `make exec`. Build the oracle image once and
+  run XC8 through it:
+
+  ```bash
+  make oracle-image    # needs vendor/microchip/installers/xc8-installer.run
+  make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 file.c -o file.p1'
+  ```
+
+  It is a separate image because XC8 is licence-gated and must not ride in
+  an image `release`/`ci` derive from. Never install XC8 on the host. The
+  image's `xc8-cc` wraps the `-mdfp` path callers would otherwise get
+  wrong; details in `docs/06-environment.md`.
 - **GPL boundary.** `gputils`/`gpasm` and `gpsim` are GPL: invoking
   them as external processes in tests is fine; linking them into the
   compiler is not.
