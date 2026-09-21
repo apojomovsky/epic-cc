@@ -14,31 +14,25 @@
 
 use pic14_sim::Pic18;
 
-/// One verification case: an entry `W` value, memory pokes to apply to a
-/// fresh `Pic18` before running (typically STATUS flag bits and/or a
-/// poisoned destination byte, to catch a candidate that only works by
-/// accident), the RAM addresses the candidate is allowed to write to, and
-/// a predicate the halted machine must satisfy. `entry_w` is its own
-/// field rather than folded into `pokes`: `W` is a CPU register, not a RAM
-/// byte, so `Pic18::set_w` is the only way to seed it (a lesson from
-/// epic-cc#514's review: an earlier version of this file looped over
-/// candidate `W` values without ever applying them, which made every
-/// candidate that reads entry `W` a silent false positive).
+/// One verification case: an entry `W` value (`Pic18::set_w`, since `W` is
+/// a CPU register, not a RAM byte `pokes` could reach), memory pokes to
+/// apply to a fresh `Pic18` before running, the RAM addresses the
+/// candidate is allowed to write to, and a predicate the halted machine
+/// must satisfy. `allowed_changes` is owned (`Vec`, not `&'static
+/// [usize]`), matching `pokes`: a caller building cases from a runtime
+/// parameter (a target address, e.g. epic-cc#520's generalization) cannot
+/// produce a `'static` slice from it.
 ///
-/// `allowed_changes` closes a related gap (epic-cc#521): earlier, `check`
-/// was the only thing a candidate had to satisfy, and both targets' checks
-/// only ever looked at their one named destination byte. A candidate that
-/// produced the right answer there while also clobbering some unrelated
-/// RAM byte (a real bug once inlined into real code, since that byte could
-/// be a live value in the caller) would have "verified" anyway.
-/// `run_case` now rejects any byte outside this list that changed from its
-/// post-poke value, `STATUS_ADDR` excepted (flag side effects are
-/// expected and harmless: this crate never claims to find a
-/// flag-preserving sequence, only a value-correct one).
+/// `run_case` rejects any RAM byte outside `allowed_changes` that changed
+/// from its post-poke value, `STATUS_ADDR` and `W` excepted: both are
+/// treated as scratch, never part of the correctness contract these
+/// targets search for. See `docs/41-superopt-spike-findings.md` for the
+/// design history (two review rounds found real soundness gaps here) and
+/// the caveat this scratch exception implies for a wider alphabet.
 pub struct Case {
     pub entry_w: u8,
     pub pokes: Vec<(usize, u8)>,
-    pub allowed_changes: &'static [usize],
+    pub allowed_changes: Vec<usize>,
     pub check: Box<dyn Fn(&Pic18) -> bool>,
 }
 
@@ -50,6 +44,12 @@ pub struct Case {
 pub type Candidate = Vec<&'static str>;
 
 const MAX_STEPS: usize = 64;
+
+/// The non-zero sentinel `run_case` poisons RAM with before applying a
+/// case's `pokes`. Any value works as long as it is not `0x00` (RAM's own
+/// reset value) and callers do not rely on an unpoked byte reading as
+/// this specific value; no current alphabet or check does.
+const POISON: u8 = 0xA5;
 
 /// Assemble `candidate` plus a trailing `sleep`, run it once per case in
 /// `cases`, and return whether every case's predicate held against the
@@ -91,6 +91,11 @@ fn run_case(words: &[u16], case: &Case) -> bool {
     let sleep_addr = ((words.len() - 1) * 2) as u32;
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let mut sim = Pic18::new(words.to_vec());
+        // Poison before pokes: a poke's own value always wins for its own
+        // address, and every other byte starts at a value no legitimate
+        // write coincides with, so a write that happens to store zero is
+        // still visible as a change (see `Case`'s doc for why this matters).
+        sim.ram_mut().fill(POISON);
         sim.set_w(case.entry_w);
         for &(addr, val) in &case.pokes {
             sim.ram_mut()[addr] = val;
@@ -99,7 +104,7 @@ fn run_case(words: &[u16], case: &Case) -> bool {
         sim.run(MAX_STEPS);
         let genuinely_halted = sim.halted() && sim.pc() == sleep_addr;
         genuinely_halted
-            && no_unexpected_clobber(&before, sim.ram(), case.allowed_changes)
+            && no_unexpected_clobber(&before, sim.ram(), &case.allowed_changes)
             && (case.check)(&sim)
     }));
     outcome.unwrap_or(false)
@@ -109,12 +114,20 @@ fn run_case(words: &[u16], case: &Case) -> bool {
 /// `allowed` or is `STATUS_ADDR` (flag side effects from ALU/skip
 /// instructions are expected and never what a candidate is judged on).
 /// Anything else that moved is a clobber this candidate must not pass on.
+///
+/// Builds `expected` (a copy of `before` with only `STATUS_ADDR` and
+/// `allowed`'s addresses overwritten from `after`) and compares it to
+/// `after` with one array equality, instead of a per-byte `enumerate` plus
+/// an `allowed.contains` linear scan at every one of 4096 bytes: the
+/// latter measured 6-24x slower in epic-cc#521's review for no benefit,
+/// since the two express the same predicate.
 fn no_unexpected_clobber(before: &[u8; 4096], after: &[u8; 4096], allowed: &[usize]) -> bool {
-    before
-        .iter()
-        .zip(after.iter())
-        .enumerate()
-        .all(|(addr, (b, a))| b == a || addr == STATUS_ADDR || allowed.contains(&addr))
+    let mut expected = *before;
+    expected[STATUS_ADDR] = after[STATUS_ADDR];
+    for &addr in allowed {
+        expected[addr] = after[addr];
+    }
+    &expected == after
 }
 
 /// Restores the previous panic hook on drop, including on unwind: without
@@ -271,7 +284,7 @@ mod tests {
         let cases = vec![Case {
             entry_w: 0,
             pokes: vec![],
-            allowed_changes: &[],
+            allowed_changes: vec![],
             check: Box::new(|_| true),
         }];
         assert!(!verify(&candidate, &cases));
@@ -289,7 +302,7 @@ mod tests {
             let cases = vec![Case {
                 entry_w: w,
                 pokes: vec![(0x020, 0x55)],
-                allowed_changes: &[0x020],
+                allowed_changes: vec![0x020],
                 check: Box::new(move |sim: &Pic18| sim.ram()[0x020] == w),
             }];
             assert!(
@@ -312,7 +325,7 @@ mod tests {
         let cases = vec![Case {
             entry_w: 0,
             pokes: vec![],
-            allowed_changes: &[],
+            allowed_changes: vec![],
             check: Box::new(|_| true), // even an always-true check must not save it
         }];
         assert!(!verify(&candidate, &cases));
@@ -330,7 +343,7 @@ mod tests {
         let cases = vec![Case {
             entry_w: 0x2A,
             pokes: vec![(0x020, 0x55), (0x021, 0x55)],
-            allowed_changes: &[0x020], // 0x021 is deliberately not listed
+            allowed_changes: vec![0x020], // 0x021 is deliberately not listed
             check: Box::new(|sim: &Pic18| sim.ram()[0x020] == 0x2A),
         }];
         assert!(!verify(&candidate, &cases));
@@ -345,9 +358,30 @@ mod tests {
         let cases = vec![Case {
             entry_w: 0x2A,
             pokes: vec![(0x020, 0x55), (0x021, 0x55)],
-            allowed_changes: &[0x020, 0x021],
+            allowed_changes: vec![0x020, 0x021],
             check: Box::new(|sim: &Pic18| sim.ram()[0x020] == 0x2A),
         }];
         assert!(verify(&candidate, &cases));
+    }
+
+    /// The clobber this crate's own review found a hole for: a `CLRF` on a
+    /// byte the case never pokes at all. `Pic18::new` zeroes RAM, so an
+    /// unpoked byte's before-value and this write's after-value are both
+    /// `0x00`, an unpoisoned before/after comparison sees no change, and
+    /// the clobber passes silently. `run_case`'s RAM poisoning (this fix)
+    /// makes every unpoked byte start at a value no legitimate write
+    /// coincides with, so the same write is now visible.
+    #[test]
+    fn a_clobber_of_an_unpoked_byte_does_not_verify() {
+        // 0x022 is never poked, so its pre-poison, pre-fix value would
+        // have been 0x00, identical to what CLRF leaves it at.
+        let candidate: Candidate = vec!["clrf 0x022,A", "movwf 0x020,A"];
+        let cases = vec![Case {
+            entry_w: 0x2A,
+            pokes: vec![(0x020, 0x55)],
+            allowed_changes: vec![0x020],
+            check: Box::new(|sim: &Pic18| sim.ram()[0x020] == 0x2A),
+        }];
+        assert!(!verify(&candidate, &cases));
     }
 }
