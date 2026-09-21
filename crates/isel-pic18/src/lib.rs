@@ -96,6 +96,15 @@ struct Gen<'m> {
     /// be reached with any prior `BSR` state, so it must be re-established
     /// on the next banked access rather than assumed).
     bsr: Option<u8>,
+    /// Forward-only join states for internal (fresh) labels, keyed by
+    /// label: `Some(v)` when every recorded branch to the label left
+    /// `BSR` at `v`, `None` once any disagrees. Central `emit` records
+    /// every single-operand branch to a `tmp` label; block labels never
+    /// match, loop bodies bypass `emit` through raw pushes or stay
+    /// unknown by the loop-header audit below. A back-edge re-creates
+    /// an entry after its label's decision, which is never consulted
+    /// again, so it cannot contribute.
+    fwd_join: HashMap<String, Option<u8>>,
     /// What FSR0 currently addresses, if known: `Some((origin, offset))`
     /// where `offset` is the `k + byte_off` most recently set up on top of
     /// `origin`. Lets a later access through the *same* base skip
@@ -136,7 +145,18 @@ struct Gen<'m> {
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.flush_copies();
-        self.out.push(s.into());
+        let line = s.into();
+        if let Some(t) = Self::fwd_target(&line) {
+            // A user function literally named `tmp` plus digits would
+            // collide with fresh labels; tail calls to one must not
+            // record. The check runs only on tmp-shaped targets, so the
+            // linear scan never touches the hot path.
+            if !self.is_function(t) {
+                let t = t.to_string();
+                self.note_branch(&t);
+            }
+        }
+        self.out.push(line);
         self.locs.push(self.cur_loc.clone());
     }
 
@@ -196,10 +216,68 @@ impl<'m> Gen<'m> {
     /// reset stays structural here rather than repeated at each call site.
     /// `CALL` returns join the same way but are not labels, so the call
     /// arm clears `self.bsr`/`self.fsr0_holds` directly after emitting `CALL`.
+    /// A recorded forward join (`note_branch`) restores agreement: the
+    /// fall-through state always joins the recorded branch states, and a
+    /// dead fall-through can only add agreement, never break it, so it
+    /// joins unconditionally.
     fn emit_label(&mut self, label: &str) {
+        let fall = self.bsr;
         self.emit(format!("{label}:"));
         self.bsr = None;
         self.fsr0_holds = None;
+        if let Some(agreed) = self.fwd_join.remove(label) {
+            // The fall-through state always joins the recorded branch
+            // states. A dead fall-through (previous line unconditional)
+            // can only add agreement, never break it, so it joins
+            // unconditionally rather than detected.
+            if let (Some(a), Some(f)) = (agreed, fall) {
+                if a == f {
+                    self.bsr = Some(a);
+                }
+            }
+        }
+    }
+
+    /// Record the tracked bank on a forward edge to a fresh label. Only
+    /// forward edges may record: a back-edge lands after its label's
+    /// decision, so it must never contribute. Central `emit` calls this
+    /// for every single-operand branch to a `tmp` label; block labels
+    /// (`{func}_L*`, entries) never match, so IR-pred joins are
+    /// unaffected, and loop headers stay unknown because every loop in
+    /// this backend enters its header by fall-through or back-edge,
+    /// never by a recorded forward branch (audited per loop site).
+    fn note_branch(&mut self, label: &str) {
+        let cur = self.bsr;
+        self.fwd_join
+            .entry(label.to_string())
+            .and_modify(|e| {
+                if *e != cur {
+                    *e = None;
+                }
+            })
+            .or_insert(cur);
+    }
+
+    /// A branch target that joins through the forward map: a `tmp`
+    /// label reached by single-operand branches only. Block labels,
+    /// calls, and anything with more than one operand never qualify.
+    fn fwd_target(line: &str) -> Option<&str> {
+        let mut words = line.split_whitespace();
+        let mnem = words.next()?;
+        let target = words.next()?;
+        if words.next().is_some() {
+            return None;
+        }
+        match mnem {
+            "BRA" | "GOTO" | "BZ" | "BNZ" | "BC" | "BNC" | "BN" | "BNN" | "BOV" | "BNOV" => {
+                if target.starts_with("tmp") && target[3..].bytes().all(|c| c.is_ascii_digit()) {
+                    Some(target)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
     }
 
     /// Emit one `MOVFF src, dst` per pair, in array order. Callers that
@@ -6099,6 +6177,7 @@ pub fn select_with_locs(
                 retval_lo: common_lo,
                 access_bank_hi,
                 bsr: None,
+                fwd_join: HashMap::new(),
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: &f.name,
@@ -6193,6 +6272,7 @@ pub fn select_with_locs(
             retval_lo: common_lo,
             access_bank_hi,
             bsr: None,
+            fwd_join: HashMap::new(),
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: &f.name,
@@ -6237,8 +6317,59 @@ pub fn select_with_locs(
             }
         }
         let doms = block_dominators(f);
+        // Join-bank tracking (epic-cc#534): predecessor labels per block
+        // from terminator targets. Every block ends with a terminator
+        // (the match below panics otherwise), so no fall-through edges
+        // exist. Switch dispatch preserves BSR through its table and
+        // trampolines (GOTO/MOVFF only), so the dispatch block itself
+        // contributes its end state to each case.
+        let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
+        for b in &f.blocks {
+            let targets: Vec<&str> = match b.insts.last() {
+                Some(Inst::Br(br)) => vec![br.target.as_str()],
+                Some(Inst::BrCond(bc)) => vec![bc.t.as_str(), bc.f.as_str()],
+                Some(Inst::Switch(sw)) => {
+                    let mut v: Vec<&str> = sw.cases.iter().map(|(_, l)| l.as_str()).collect();
+                    v.push(sw.default.as_str());
+                    v.push(b.label.as_str());
+                    v
+                }
+                _ => vec![],
+            };
+            for t in targets {
+                preds.entry(t).or_default().push(b.label.as_str());
+            }
+        }
+        let mut block_end: HashMap<String, Option<u8>> = HashMap::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             g.emit_label(&labels[&b.label]);
+            // Join agreement: keep the tracked bank only when every
+            // predecessor's recorded end state is present and equal.
+            // Unrecorded predecessors are back-edges decided later, so
+            // loop headers stay unknown, decided once here. The entry
+            // block keeps the cleared state: callers leave any bank.
+            if bi > 0 {
+                if let Some(ps) = preds.get(b.label.as_str()) {
+                    let mut agreed: Option<u8> = None;
+                    let mut known = false;
+                    let mut ok = true;
+                    for p in ps {
+                        match block_end.get(*p) {
+                            Some(Some(v)) if !known || agreed == Some(*v) => {
+                                agreed = Some(*v);
+                                known = true;
+                            }
+                            _ => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok && known {
+                        g.bsr = agreed;
+                    }
+                }
+            }
             if bi == 0 && f.isr {
                 // Saves the preempted main state after the vector entry:
                 // the in-flight return value (an ISR call would clobber
@@ -6695,6 +6826,10 @@ pub fn select_with_locs(
                 }
                 _ => panic!("isel-pic18: block has no terminator"),
             }
+            // Record for join agreement at successor labels. Internal
+            // labels inside this block's lowering already reset the
+            // tracked state where they join, so only the end counts.
+            block_end.insert(b.label.clone(), g.bsr);
         }
         g.flush_copies();
         out.extend(g.out);
@@ -6848,6 +6983,7 @@ mod tests {
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
+                fwd_join: HashMap::new(),
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -6867,6 +7003,7 @@ mod tests {
                 retval_lo: 0,
                 access_bank_hi: 0x5F,
                 bsr: None,
+                fwd_join: HashMap::new(),
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -6900,6 +7037,7 @@ mod p3_gen_tests {
             retval_lo: 0,
             access_bank_hi: 0x5F,
             bsr: None,
+            fwd_join: HashMap::new(),
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: "main",
