@@ -370,3 +370,25 @@ fn shift_left_7() {
     report(7, &hits, Some(&constructed));
     assert_eq!(constructed.len(), 7);
 }
+
+/// epic-cc#528: the deep run docs/41's table left unanswered. Lengths 4 and
+/// 5 over the 28-symbol alphabet, curated case sample, timing recorded.
+/// Length 3 is the previous bound and already covered by the unit tests
+/// above, so this starts at 4.
+#[test]
+#[ignore = "deep run (minutes): epic-cc#528, run with --ignored"]
+fn deep_search_amounts_2_and_3() {
+    for amount in [2u32, 3] {
+        let baseline = 3 * amount as usize;
+        let t0 = std::time::Instant::now();
+        let hits = search(amount, 5);
+        let el = t0.elapsed();
+        eprintln!(
+            "DEEP amount={amount} baseline={baseline} words: {} hit(s) in {el:?}",
+            hits.len()
+        );
+        for h in hits.iter().take(5) {
+            eprintln!("   {} words: {}", h.len(), h.join(" ; "));
+        }
+    }
+}
