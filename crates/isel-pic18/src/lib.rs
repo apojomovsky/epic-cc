@@ -33,9 +33,21 @@ const COPY_LOOP_MIN_PAIRS: usize = 6;
 /// address is statically known, so a plain `MOVFF`/`MOVF`/`MOVWF` reaches
 /// it. `Indirect`: `FSR0` has been set up and the access goes through
 /// `INDF0`.
+#[derive(Clone, Copy)]
 enum Addr {
     Direct(u16),
     Indirect,
+}
+
+/// A memcpy source's resolved shape: a plain address, an FSR1-indirect
+/// pointer, or a flash table read through `TBLPTR`/`TABLAT`. Byte 0's
+/// setup reports it so later bytes can walk instead of re-seeding.
+/// (epic-cc#492)
+#[derive(Clone, Copy)]
+enum McSrc {
+    Direct(u16),
+    Indirect,
+    Tblrd,
 }
 
 /// Identifies what an `emit_fsr0_dynamic`/`emit_fsr0_indirect_slot` setup
@@ -942,6 +954,75 @@ impl<'m> Gen<'m> {
             let wide = self.reg_width(reg) == 2;
             for _ in 0..*scale {
                 self.emit_fsr_pair_add(0xFE1, 0xFE2, a, wide);
+            }
+        }
+    }
+
+    /// Memcpy setups only, for the byte at `byte_off`: seed the source
+    /// (`TBLPTR` or FSR1) then the destination (FSR0), in that order,
+    /// reporting the resolved kinds. Bodies live in `emit_memcpy_body`
+    /// so one seed can serve a whole walk. (epic-cc#492)
+    fn emit_memcpy_setups(&mut self, mc: &ir::Memcpy, byte_off: u8) -> (McSrc, Addr) {
+        // Sets the source on FSR1 so the destination FSR0 setup cannot clobber
+        // an indirect source (epic-cc#143); a flash source has no RAM
+        // address and seeds `TBLPTR` instead.
+        if let Some((table, k, terms)) = self.const_base_of(&mc.src) {
+            self.emit_tblptr_setup(&table, k, &terms, byte_off);
+            return (McSrc::Tblrd, self.emit_ptr_setup(&mc.dst, byte_off));
+        }
+        let src_direct = self.emit_memcpy_src_setup(&mc.src, byte_off);
+        let dst = self.emit_ptr_setup(&mc.dst, byte_off);
+        (src_direct.map_or(McSrc::Indirect, McSrc::Direct), dst)
+    }
+
+    /// One memcpy body for already-resolved (`src`, `dst`) positions.
+    /// With `walk`, every walked pointer advances on every byte;
+    /// without it every byte reads INDF, the pre-walk form. Dynamic
+    /// terms fold into the byte-0 seed once (they must be loop-invariant
+    /// across the copy, the `Load`/`Store` contract). An indirect
+    /// destination closes with INDF on the last byte, leaving FSR0 on
+    /// it for `bump_fsr0_tracked_offset`; direct addresses arrive fully
+    /// resolved. (epic-cc#492)
+    fn emit_memcpy_body(&mut self, last: bool, src: &McSrc, dst: &Addr, walk: bool) {
+        match (*src, *dst) {
+            (McSrc::Direct(a), Addr::Direct(d)) => {
+                self.emit_copy_byte(a, d);
+            }
+            (McSrc::Indirect, Addr::Direct(d)) => {
+                // The byte moves through W, which the ISR saves, so an
+                // interrupt mid-copy keeps the held byte. (epic-cc#143)
+                let f = if walk { "0xFE6" } else { "0xFE7" }; // POSTINC1 : INDF1
+                self.emit(format!("    MOVF {f},W,A"));
+                self.emit_banked("MOVWF", d, "");
+            }
+            (McSrc::Direct(a), Addr::Indirect) => {
+                let d = if walk && !last { "0xFEE" } else { "0xFEF" }; // POSTINC0 : INDF0
+                self.emit(format!("    MOVFF 0x{a:03X}, {d}"));
+            }
+            (McSrc::Indirect, Addr::Indirect) => {
+                let (s, d) = if walk {
+                    ("0xFE6", if !last { "0xFEE" } else { "0xFEF" })
+                } else {
+                    ("0xFE7", "0xFEF")
+                };
+                self.emit(format!("    MOVFF {s}, {d}"));
+            }
+            (McSrc::Tblrd, Addr::Direct(d)) => {
+                self.emit(if walk {
+                    "    TBLRD*+".to_string()
+                } else {
+                    "    TBLRD*".to_string()
+                });
+                self.emit(format!("    MOVFF 0xFF5, 0x{d:03X}"));
+            }
+            (McSrc::Tblrd, Addr::Indirect) => {
+                self.emit(if walk {
+                    "    TBLRD*+".to_string()
+                } else {
+                    "    TBLRD*".to_string()
+                });
+                let d = if walk && !last { "0xFEE" } else { "0xFEF" }; // POSTINC0 : INDF0
+                self.emit(format!("    MOVFF 0xFF5, {d}"));
             }
         }
     }
@@ -2426,46 +2507,51 @@ impl<'m> Gen<'m> {
             }
             Inst::Memcpy(mc) => match &mc.len {
                 ir::MemLen::Const(n) => {
-                    for i in 0..*n {
-                        // Sets the source on FSR1 so the destination FSR0 setup cannot clobber
-                        // an indirect source; the byte moves through W, which the ISR saves,
-                        // so an interrupt mid-copy keeps the held byte. A flash source has no
-                        // RAM address and reads via `TBLRD` into `TABLAT` first. (epic-cc#143)
-                        if let Some((table, k, terms)) = self.const_base_of(&mc.src) {
-                            // Seed TBLPTR at the flash source byte, read it
-                            // into TABLAT, then move TABLAT (0xFF5) to the
-                            // destination (direct or FSR0-indirect).
-                            self.emit_tblptr_setup(&table, k, &terms, i as u8);
-                            self.emit("    TBLRD*".to_string());
-                            match self.emit_ptr_setup(&mc.dst, i) {
-                                Addr::Direct(dst) => {
-                                    self.emit(format!("    MOVFF 0xFF5, 0x{dst:03X}"));
-                                }
-                                Addr::Indirect => {
-                                    self.emit("    MOVFF 0xFF5, 0xFEF".to_string());
-                                }
+                    let n = *n;
+                    // A staged run draining mid-copy would invalidate the
+                    // setup decisions byte 0 makes; drain first (the
+                    // epic-cc#486 review's drain-before-decision rule).
+                    self.flush_copies();
+                    if n >= 1 {
+                        // Byte 0's setups resolve the copy's kinds once;
+                        // later bytes walk from those positions instead
+                        // of re-seeding per byte. (epic-cc#492)
+                        let (src0, dst0) = self.emit_memcpy_setups(mc, 0);
+                        let walk = n >= 2
+                            && match (src0, dst0) {
+                                // Pure address math per byte, and #486
+                                // staging owns the bodies: nothing to
+                                // save by walking.
+                                (McSrc::Direct(_), Addr::Direct(_)) => false,
+                                // FSR1 is outside the ISR save area:
+                                // walk only while no ISR-reachable
+                                // function can clobber it mid-copy.
+                                (McSrc::Indirect, _) => self.allow_copy_loops,
+                                _ => true,
+                            };
+                        self.emit_memcpy_body(n == 1, &src0, &dst0, walk);
+                        for i in 1..n {
+                            let last = i + 1 == n;
+                            if walk {
+                                // Advance byte-0's direct addresses; the
+                                // walked pointers advance themselves, so
+                                // each address is computed exactly once.
+                                let s = match src0 {
+                                    McSrc::Direct(a) => McSrc::Direct(a + u16::from(i)),
+                                    s => s,
+                                };
+                                let d = match dst0 {
+                                    Addr::Direct(d) => Addr::Direct(d + u16::from(i)),
+                                    d => d,
+                                };
+                                self.emit_memcpy_body(last, &s, &d, true);
+                            } else {
+                                let (s, d) = self.emit_memcpy_setups(mc, i);
+                                self.emit_memcpy_body(last, &s, &d, false);
                             }
-                            continue;
                         }
-                        let src_direct = self.emit_memcpy_src_setup(&mc.src, i);
-                        match self.emit_ptr_setup(&mc.dst, i) {
-                            Addr::Direct(dst) => {
-                                match src_direct {
-                                    Some(a) => self.emit_copy_byte(a, dst),
-                                    None => {
-                                        self.emit("    MOVF 0xFE7,W,A".to_string()); // INDF1
-                                        self.emit_banked("MOVWF", dst, "");
-                                    }
-                                }
-                            }
-                            Addr::Indirect => match src_direct {
-                                Some(a) => {
-                                    self.emit(format!("    MOVFF 0x{a:03X}, 0xFEF"));
-                                }
-                                None => {
-                                    self.emit("    MOVFF 0xFE7, 0xFEF".to_string());
-                                }
-                            },
+                        if walk && matches!(dst0, Addr::Indirect) {
+                            self.bump_fsr0_tracked_offset(n);
                         }
                     }
                 }
