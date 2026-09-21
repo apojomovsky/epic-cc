@@ -42,11 +42,20 @@ WARNCHECK_TARGET_CACHE := $(CACHE_DIR)/target-warncheck$(WT_KEY)
 FILE        ?= crates/driver/tests/fixtures/add.c
 TARGET      ?= p16f877a
 
+# The driver stamps its commit into `epic-cc --version` (epic-hal#240, #260).
+# Inside the container a worktree's `.git` is a gitfile holding an absolute
+# host path outside the mount, so `git rev-parse` fails there and the stamp
+# would lose its sha on exactly the build the consumer is told to run.
+# Resolve it on the host, where that path is valid, and pass it in; in the
+# main checkout this is belt and braces, since `.git` is a real mount.
+EPIC_CC_GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null)
+
 DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
 	--user $$(id -u):$$(id -g) \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
 	-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
 	-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
+	-e EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA) \
 	-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE)
 
 .PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check

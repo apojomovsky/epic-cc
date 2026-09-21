@@ -156,10 +156,15 @@ suite, now running inside the `ci` image.
 
 The per-commit `ci-<sha>` prerelease mechanism (rolling-release.yml) was
 retired in epic-cc#435: its sole consumer, epic-hal's `epiccc-gate`, now
-pins the stable v0.3.0 release. Version stamping is unchanged: the
-driver's `build.rs` stamps `EPIC_CC_VERSION` (the release stage's build
-ARG) into the build and `epic-cc --version` prints it, a path tag
-releases share. Windows stays tag-only.
+pins the stable v0.3.0 release. Version stamping: the driver's
+`build.rs` stamps `EPIC_CC_VERSION` (the release stage's build ARG) into
+the build and `epic-cc --version` prints it, a path tag releases share.
+A build with no such version stamps the crate version plus the
+checkout's commit as build metadata (`0.1.0+<sha>`), so a consumer such
+as epic-hal's driver guard can compare identity instead of timestamps
+(epic-hal#240, #260). The release stage has no `.git` (`.dockerignore`
+excludes it) and so keeps reporting its release version alone. Windows
+stays tag-only.
 
 ## Testing
 
