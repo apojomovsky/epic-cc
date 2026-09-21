@@ -6035,13 +6035,12 @@ pub fn select_with_locs(
         !needs_prod_save || isr_hi_save.is_some() == priority_mode,
         "isel-pic18: the high save area must be present exactly in priority mode"
     );
-    let prod_save = |high: bool| -> u16 {
+    // The carved area a *compat or high* ISR uses for its PROD/FSR1 bytes.
+    // The low ISR needs no closure arm: its four bytes are the tail of its
+    // own 16-byte area (`s+12..s+15`), not a separate carve.
+    let prod_save = || -> u16 {
         if priority_mode {
-            if high {
-                isr_hi_save.expect("isel-pic18: high ISR without a high save area")
-            } else {
-                isr_low_save.expect("isel-pic18: low ISR without a low save area") + 16
-            }
+            isr_hi_save.expect("isel-pic18: high ISR without a high save area")
         } else {
             isr_save.expect("isel-pic18: ISR without a save area")
         }
@@ -6239,7 +6238,7 @@ pub fn select_with_locs(
                 // area (`isr_low_save`), with a dedicated W slot; the
                 // common block uses `ISR_W_SAVE_OFFSET` (see above).
                 let low_save = priority_mode && f.irq_priority != 1;
-                let prod = prod_save(f.irq_priority == 1);
+                let prod = prod_save();
                 let saves: [(u16, u16); 15] = if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
                     [
@@ -6580,7 +6579,7 @@ pub fn select_with_locs(
                     // restore order is convention: SFRs first, retval
                     // backup second, W last.
                     let low_save = priority_mode && f.irq_priority != 1;
-                    let prod = prod_save(f.irq_priority == 1);
+                    let prod = prod_save();
                     if low_save {
                         let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
                         // Disjoint save area (s+1..+11), so the two halves
