@@ -53,13 +53,17 @@ TARGET      ?= p16f877a
 # main checkout this is belt and braces, since `.git` is a real mount.
 EPIC_CC_GIT_SHA := $(shell git rev-parse --short HEAD 2>/dev/null)
 
-DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run --rm \
+# Shared container invocation, so every docker entry point (exec, test,
+# compile, shell) carries the same mounts and the EPIC_CC_GIT_SHA stamp.
+DOCKER_ARGS := --rm \
 	--user $$(id -u):$$(id -g) \
 	-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
 	-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
 	-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
 	-e "EPIC_CC_GIT_SHA=$(EPIC_CC_GIT_SHA)" \
-	-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE)
+	-v $(CURDIR):/workspace -w /workspace
+
+DOCKER_RUN := mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE) && docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
 
 .PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check
 
@@ -111,11 +115,7 @@ image: ## Build the dev image (only image you need locally)
 
 shell: image ## Interactive dev shell inside the container
 	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE)
-	docker run --rm -it --user $$(id -u):$$(id -g) \
-		-v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
-		-v $(CARGO_HOME_CACHE):/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
-		-v $(TARGET_CACHE):/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
-		-v $(CURDIR):/workspace -w /workspace $(LOCAL_IMAGE) bash
+	docker run -it $(DOCKER_ARGS) $(LOCAL_IMAGE) bash
 
 exec: image ## One-off command: make exec CMD='cargo test -p asm'
 	@$(DOCKER_RUN) bash -c '$(CMD)'

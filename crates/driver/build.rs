@@ -112,8 +112,19 @@ fn emit_rerun_hints() {
     }
     if let Some(ref_name) = git(&root, &["rev-parse", "--symbolic-full-name", "HEAD"]) {
         if let Some(path) = git(&root, &["rev-parse", "--git-path", &ref_name]) {
-            if Path::new(&path).exists() {
-                paths.push(path);
+            // In a normal checkout --git-path answers repo-root-relative
+            // (`.git/refs/heads/main`); in a linked worktree it is already
+            // absolute (the ref lives in the common dir). Resolve relative
+            // output against the root git was run in, or the existence check
+            // below would test it under the package root and drop a path that
+            // is there, leaving freshness to a directory mtime alone.
+            let path = if Path::new(&path).is_absolute() {
+                PathBuf::from(path)
+            } else {
+                root.join(path)
+            };
+            if path.exists() {
+                paths.push(path.display().to_string());
             }
         }
     }
