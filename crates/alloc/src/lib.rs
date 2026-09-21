@@ -53,21 +53,21 @@ pub struct AllocLayout {
     /// its overlay region span is 0, but the backend still emits the
     /// ISR-save prologue, which the size report must count.
     pub has_isr: bool,
-    /// The low-priority ISR's 16-byte context-save area base (`Some` only
+    /// The low-priority ISR's 17-byte context-save area base (`Some` only
     /// in priority mode: both a high- and a low-priority ISR exist). It
     /// sits at the low overlay region's base, below the low frames, so it
     /// is disjoint from every context by construction; the high ISR keeps
     /// the device's fixed save block. `None` in compatibility mode (zero
     /// or one ISR), where the single handler uses the fixed block.
     pub isr_low_save: Option<u16>,
-    /// The compatibility-mode ISR's 4-byte area for the PROD/FSR1 save
+    /// The compatibility-mode ISR's 5-byte area for the PROD/FSR1/TABLAT save
     /// bytes (`Some` only when the module has an ISR, is PIC18, and does
     /// not run priority mode). Carved from the ISR context's own region,
     /// like `isr_low_save`, because the fixed access-bank block is pinned
     /// at 16 bytes by `ram_banks` starting at 0x0010 on every device and
     /// has no room for them. (epic-cc#477)
     pub isr_save: Option<u16>,
-    /// The high-priority ISR's 4-byte area for the same bytes, carved from
+    /// The high-priority ISR's 5-byte area for the same bytes, carved from
     /// its own region so the two ISRs' areas stay disjoint. `Some` only in
     /// priority mode. (epic-cc#477)
     pub isr_hi_save: Option<u16>,
@@ -1156,14 +1156,15 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 // inside it). Compatibility mode keeps the historical layout
                 // byte-identical: no shift, no save area.
                 let priority_mode = !lo_roots.is_empty() && !hi_roots.is_empty();
-                // Every ISR context needs the four PROD/FSR1 bytes, whichever
+                // Every ISR context needs these save bytes, whichever
                 // priority it runs at, so each region's base gets its own
-                // carved area of the same size (epic-cc#477). PIC14/PIC14E
-                // have no MULWF/PROD and no FSR1 copy loop, so their layout
-                // stays byte-identical.
+                // carved area of the same size (epic-cc#477, epic-cc#532:
+                // FSR1, PROD and TABLAT). PIC14/PIC14E have no MULWF/PROD,
+                // no FSR1 copy loop and no TBLRD, so their layout stays
+                // byte-identical.
                 let needs_prod_save = device.core == device::Core::Pic18;
-                const ISR_SAVE_BYTES: u16 = 4;
-                const LOW_SAVE_BYTES: u16 = 16;
+                const ISR_SAVE_BYTES: u16 = 5;
+                const LOW_SAVE_BYTES: u16 = 17;
                 let lo_base = if priority_mode {
                     isr_low_save = Some(isr_base);
                     isr_base + LOW_SAVE_BYTES

@@ -6203,7 +6203,7 @@ pub fn select_with_locs(
                 // common block uses `ISR_W_SAVE_OFFSET` (see above).
                 let low_save = priority_mode && f.irq_priority != 1;
                 let prod = prod_save();
-                let saves: [(u16, u16); 15] = if low_save {
+                let saves: [(u16, u16); 16] = if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
                     [
                         (common_lo, s + 8),
@@ -6218,6 +6218,7 @@ pub fn select_with_locs(
                         (0xFE2, s + 13), // FSR1H
                         (0xFF3, s + 14), // PRODL
                         (0xFF4, s + 15), // PRODH
+                        (0xFF5, s + 16), // TABLAT
                         (0xFF6, s + 5),  // TBLPTRL
                         (0xFF7, s + 6),  // TBLPTRH
                         (0xFF8, s + 7),  // TBLPTRU
@@ -6250,6 +6251,7 @@ pub fn select_with_locs(
                         (0xFE2, prod + 1),       // FSR1H
                         (0xFF3, prod + 2),       // PRODL
                         (0xFF4, prod + 3),       // PRODH
+                        (0xFF5, prod + 4),       // TABLAT
                         (common_lo, common_lo + 12),
                         (common_lo + 1, common_lo + 13),
                         (common_lo + 2, common_lo + 14),
@@ -6571,6 +6573,7 @@ pub fn select_with_locs(
                             (s + 13, 0xFE2), // FSR1H
                             (s + 14, 0xFF3), // PRODL
                             (s + 15, 0xFF4), // PRODH
+                            (s + 16, 0xFF5), // TABLAT
                         ]);
                     } else {
                         // Dealiased slots (epic-cc#357): STATUS/BSR/FSR0L
@@ -6602,6 +6605,7 @@ pub fn select_with_locs(
                             (prod + 1, 0xFE2), // FSR1H
                             (prod + 2, 0xFF3), // PRODL
                             (prod + 3, 0xFF4), // PRODH
+                            (prod + 4, 0xFF5), // TABLAT
                         ]);
                     }
                     if low_save {
