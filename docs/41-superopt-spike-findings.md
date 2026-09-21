@@ -261,22 +261,32 @@ the first draft's 18.
 
 **Results:**
 
-| amount | baseline | bounded search (<=3) | constructed | delta |
-|---|---|---|---|---|
-| 1 | 3 | floor 3 (confirmed minimal, this alphabet, this bound) | -- | 0 |
-| 2 | 6 | nothing found | -- | unknown |
-| 3 | 9 | nothing found | -- | unknown |
-| 4 | 12 | nothing found | **9** | **-3 (25%)** |
-| 5 | 15 | nothing found | **12** (family instance is 13, worse) | **-3 (20%)** |
-| 6 | 18 | nothing found | **11** | **-7 (38.9%)** |
-| 7 | 21 | nothing found | **7** | **-14 (66.7%)** |
+| amount | baseline | bounded search (<=3) | deep search (<=5) | constructed | delta |
+|---|---|---|---|---|---|
+| 1 | 3 | floor 3 (confirmed minimal, this alphabet, this bound) | -- | -- | 0 |
+| 2 | 6 | nothing found | **nothing found (exhaustive, epic-cc#528)** | -- | 0 (baseline stands) |
+| 3 | 9 | nothing found | **nothing found (exhaustive, epic-cc#528)** | -- | 0 (baseline stands) |
+| 4 | 12 | nothing found | -- | **9** | **-3 (25%)** |
+| 5 | 15 | nothing found | -- | **12** (family instance is 13, worse) | **-3 (20%)** |
+| 6 | 18 | nothing found | -- | **11** | **-7 (38.9%)** |
+| 7 | 21 | nothing found | -- | **7** | **-14 (66.7%)** |
 
-Amounts 2 and 3 have no result either way: the family construction
-exists at every `n` (cost `2 * rotate_cost(n) + 7`), it simply costs more
-than the `3*n` baseline for `n <= 3`, so nothing was constructed for
-them, not because no shortcut exists off the nibble boundary (the first
-draft's stated reason here was wrong) but because the shortcut that does
-exist loses at these amounts specifically.
+Amounts 2 and 3 are now answered exhaustively (epic-cc#528): the deep
+run enumerated every candidate of lengths 4 and 5 over this alphabet,
+17,825,024 per amount, and found **none**. Combined with length 3 from
+the bounded search, no sequence of 5 instructions or fewer computes
+either shift, so the `3*n` baseline (6 words at amount 2, 9 at amount 3)
+is minimal at that bound. Cost was 852.8s and 856.1s, matching the
+48.3us/candidate rate measured beforehand (a no-hit run pays the full
+4+5 sweep: 614,656 + 17,210,368 candidates). The family construction
+exists at every `n` (cost `2 * rotate_cost(n) + 7`) but costs more than
+baseline for `n <= 3`, which is why nothing was constructed for them.
+
+This closes the "no answer either way" the table previously recorded, and
+retires the question: a shorter form would have to be at least 6
+instructions, longer than the baseline it would replace at these amounts.
+The deep run is `#[ignore]`d in `crates/superopt/tests/shift_16bit.rs`
+(`deep_search_amounts_2_and_3`), so it costs the default suite nothing.
 
 **Every constructed candidate above clobbers `W`**, unlike the baseline
 (`BCF`+`RLCF`+`RLCF` never touches it). `run_case`'s clobber check does
