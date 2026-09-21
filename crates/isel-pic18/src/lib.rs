@@ -362,9 +362,12 @@ impl<'m> Gen<'m> {
                     Inst::Phi(p) if p.dst == reg => Some(p.ty.bytes()),
                     Inst::Alloca(a) if a.dst == reg => Some(a.size),
                     Inst::Freeze(f) if f.dst == reg => Some(f.ty.bytes()),
-                    Inst::FloatBin(b) if b.dst == reg => Some(4),
-                    Inst::Fcmp(c) if c.dst == reg => Some(1),
-                    Inst::FloatConv(c) if c.dst == reg => Some(c.to.bytes()),
+                    // No FloatBin/Fcmp/FloatConv arms: legalize rewrites
+                    // every float op into a runtime Call before isel runs,
+                    // and `emit_inst` panics on the raw forms, so a width
+                    // arm here could only be read for an instruction about
+                    // to panic. A conversion result's width arrives on its
+                    // call's type (the `Inst::Call` arm above). (epic-cc#488)
                     Inst::VaArg(v) if v.dst == reg => Some(v.ty.bytes()),
                     _ => None,
                 };
