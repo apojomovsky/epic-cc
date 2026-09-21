@@ -27,12 +27,21 @@
 ## Rationale
 
 ADR-015's real invariant was narrower than its rule: what the recipes
-need is "no MOVLB between a skip test and its target". Auditing every
-skip in the float bodies shows each targets the very next instruction or
-an explicit GOTO, so a MOVLB can never land inside a skip window and
-banked frames are sound. Pinning every float frame (base plus ISR copies)
-to one window start made all contexts share scratch, so any interrupt
-preempting main mid-float-op silently corrupted main's computation.
+need is "no MOVLB between a skip test and its target". Pinning every float
+frame (base plus ISR copies) to one window start made all contexts share
+scratch, so any interrupt preempting main mid-float-op silently corrupted
+main's computation.
+
+The "every skip targets the next instruction" half of that rationale was
+wrong and is retracted (epic-cc#509). Several recipe skips do target a
+frame operand: `BTFSC <frame byte>,7` / `BTFSS` guarding an `INCF`/`BSF`
+that names another frame byte, and the `__fptoui_f32`/`__fptosi_f32`
+guards. Emitted asm shows `BTFSC <lo-byte>,7` immediately followed by
+`MOVLB` whenever the frame crosses a 256-byte BSR boundary, which is what
+`round_if_routine` exists to prevent. So a banked frame is sound only if it
+stays inside ONE 256-byte bank, which is exactly what `routine_base` now
+enforces (it checked the device's `ram_banks` region before; PIC18 declares
+all of RAM as one region, so the check never fired).
 
 ## Rejected alternatives
 

@@ -1344,3 +1344,68 @@ fn pic18_two_region_device_keeps_the_globals_above_the_overlay() {
         out.globals["in"]
     );
 }
+
+/// epic-cc#509: a runtime routine's frame must not straddle a PIC18 BSR bank
+/// (256 bytes), which is `isel-pic18`'s `operand()` granularity, not the
+/// device's single giant `ram_banks` region. A caller whose frame ends just
+/// below 0x100 would otherwise put `__add_f32`'s 22 bytes across it.
+#[test]
+fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
+    // main's 212 live i8 locals end at 0xEB, so `__add_f32`'s derived base
+    // is 0xEB and its 22-byte frame would span 0xEB..0x100, crossing the
+    // boundary; it must snap to 0x100.
+    let mut src = String::from("global sink i8\nglobal in float\n");
+    src.push_str("fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14\n");
+    src.push_str("fn main(void) ()\n  block entry:\n");
+    for i in 0..212 {
+        src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
+    }
+    for i in 0..212 {
+        src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
+    }
+    src.push_str(
+        "    %x = load float @in\n    %y = load float @in\n    %r = call float @__add_f32(float %x, float %y)\n    ret void\n",
+    );
+    let m = parse(&src);
+    let out = allocate(&PIC18F4550, &m, "edge main __add_f32\n");
+    let a = out.locals["__add_f32::a"];
+    let scr = out.locals["__add_f32::__scr"];
+    assert_eq!(a, 0x100, "the frame must start on the next BSR bank");
+    assert_eq!(out.locals["__add_f32::b"], 0x104);
+    assert_eq!(scr, 0x108);
+    assert_eq!(a >> 8, (scr + 13) >> 8, "the whole frame in one BSR bank");
+}
+
+/// The snap must not walk a frame back down: on a PIC18 whose `ram_banks`
+/// region spans many 256-byte banks, "the next bank's start" is the next
+/// 0x100 boundary, not the region's own start (which is where the frame
+/// already was).
+#[test]
+fn pic18_routine_frame_does_not_snap_back_to_the_region_start() {
+    for k in [210usize, 212] {
+        let mut src = String::from("global sink i8\nglobal in float\n");
+        src.push_str(
+            "fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14\n",
+        );
+        src.push_str("fn main(void) ()\n  block entry:\n");
+        for i in 0..k {
+            src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
+        }
+        for i in 0..k {
+            src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
+        }
+        src.push_str(
+            "    %x = load float @in\n    %y = load float @in\n    %r = call float @__add_f32(float %x, float %y)\n    ret void\n",
+        );
+        let m = parse(&src);
+        let out = allocate(&PIC18F4550, &m, "edge main __add_f32\n");
+        let a = out.locals["__add_f32::a"];
+        let scr = out.locals["__add_f32::__scr"];
+        assert!(a >= 0x100, "k={k}: the frame must clear 0x100 (a = {a:#X})");
+        assert_eq!(
+            a >> 8,
+            (scr + 13) >> 8,
+            "k={k}: the whole frame in one BSR bank"
+        );
+    }
+}

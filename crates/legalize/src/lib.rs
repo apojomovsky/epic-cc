@@ -2600,11 +2600,15 @@ fn param(name: &str, width: u8) -> Param {
 /// provides the buffers, the mul/div/rem emission reads them, then the shift
 /// emission reads them. The recipes read their inputs from the param
 /// slots (`a`/`b`, `num`/`den`, `val`/`cnt`), write the result to the retval
-/// slots, and use `__scr` strictly by offset. Every routine's frame stays
-/// inside ONE GPR bank (any bank), because the recipes' loops are
-/// skip-sensitive: no BANKSEL sits between a test and its target or inside
-/// a carry idiom. `alloc` rounds a routine's base into a single bank; `isel`
-/// verifies the placement (epic-cc#6).
+/// slots, and use `__scr` strictly by offset. On PIC14 every routine's frame
+/// stays inside ONE GPR bank, because the recipes' loops are skip-sensitive:
+/// no BANKSEL sits between a test and its target or inside a carry idiom.
+/// PIC18 needs the same guarantee for a narrower set of routines: the i16/i32
+/// signed wrappers, the float bodies and the conversions test a frame byte
+/// and skip an instruction that names another. Its bank is the
+/// 256-byte `BSR` bank rather than a `ram_banks` region. `alloc`
+/// (`routine_base`) rounds a routine's base accordingly; `isel` verifies the
+/// placement (epic-cc#6, epic-cc#509).
 ///
 /// | routine | `__scr` size | offsets |
 /// |---|---|---|

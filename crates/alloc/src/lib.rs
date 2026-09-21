@@ -217,16 +217,37 @@ fn frame_end(device: &Device, base: u16, widths: &[u8]) -> u16 {
 /// skip-sensitive: a BANKSEL between a test and its target, or between the
 /// two operands of a same-skip carry idiom, would change the skip targets,
 /// so the whole frame must live in ONE GPR bank (epic-cc#6).
+///
+/// PIC18's bank is `operand()`'s 256-byte `BSR` bank (`addr >> 8`), not an
+/// `ram_banks` region: every PIC18 device declares its whole RAM as a single
+/// region (`p18f4550` is `[[0x0010, 0x07FF]]`), so a region-based check
+/// never fires and a frame crossing `0x100` gets its `MOVLB` emitted in the
+/// middle of its own recipe (epic-cc#509). Its snap target is therefore the
+/// next `0x100` boundary, not the next region's start, which on a
+/// single-region device is the same address the frame just left.
 fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
-    let end = frame_end(device, base, widths);
     let (_, region_end) = device
         .region_for(base)
         .expect("alloc: routine frame base in a device GPR bank");
+    let end = frame_end(device, base, widths);
+    if device.core == device::Core::Pic18 {
+        // Capped at the region end so a partially-mapped bank does not claim
+        // the bytes past it. A routine frame is at most 22 bytes, so one
+        // step past the current bank always fits.
+        let bank_end = (base | 0x00FF).min(region_end);
+        if end - 1 <= bank_end {
+            return base;
+        }
+        let next = (base | 0x00FF) + 1;
+        let (start, _) = device
+            .region_for(next)
+            .unwrap_or_else(|| panic!("alloc: routine frame needs a bank past 0x{bank_end:X}"));
+        return next.max(start); // skip any unmapped gap between regions
+    }
     if end - 1 <= region_end {
         return base; // the whole frame fits in the base's bank
     }
-    // The frame would straddle: snap to the next bank's start (it always
-    // fits there, a routine frame is at most 22 bytes, far under a bank).
+    // The frame would straddle: snap to the next bank's start.
     let next = region_end + 1;
     device
         .region_for(next)
@@ -236,10 +257,13 @@ fn routine_base(device: &Device, base: u16, widths: &[u8]) -> u16 {
 
 /// `base` unchanged for an ordinary function; `routine_base`-rounded for a
 /// runtime routine (float ones included), so its frame stays in one GPR
-/// bank. The float recipes are no more window-pinned than the integer
-/// ones: their skip instructions all target the next instruction (or an
-/// explicit GOTO), and memory ops go through `operand()`'s `MOVLB`
-/// discipline, so a banked frame is sound (epic-cc#357). Shared by the
+/// bank. The recipes are genuinely skip-sensitive and banked: the mul/div
+/// chains end their loops with real `BNC`/`BRA` branches, but the float,
+/// signed-divmod and conversion bodies test a frame byte with `BTFSC`/
+/// `BTFSS` and skip the instruction that follows, and that instruction
+/// reads a frame byte too. A `MOVLB` between the two changes the operand
+/// the skipped instruction names, not just its position, so the whole frame
+/// must sit in one bank (epic-cc#357, epic-cc#509). Shared by the
 /// main-context and ISR-context base-assignment loops (epic-cc#6).
 fn round_if_routine(
     device: &Device,
@@ -1696,5 +1720,28 @@ mod tests {
         // PIC16F877A's last bank ends at 0x1EF; nothing at or past 0x1F0 has
         // a region, so placing even a 1-byte value there must fail cleanly.
         assert_eq!(try_place_at(&PIC16F877A, 0x1F0, 1), None);
+    }
+
+    /// epic-cc#509: the PIC18 snap target is the next `0x100` boundary, not
+    /// the next region's start, and a boundary that lands in an unmapped gap
+    /// resolves forward into the region that actually contains it.
+    /// `p18f2450` is the two-region PIC18 (`[[0x0010,0x01FF],[0x0400,0x04FF]]`),
+    /// so a frame derived at the end of its first region snaps over the
+    /// `0x200-0x3FF` hole. Reached only directly: `allocate` resolves a
+    /// routine's slots through `place_contiguous`, which masks the gap value
+    /// before it can show in the map, so no module-level test observes it.
+    #[test]
+    fn pic18_routine_base_snaps_over_an_unmapped_gap() {
+        let dev = device::resolve("p18f2450").expect("p18f2450 is a known device");
+        // A 22-byte frame (the widest routine) based at 0x1EE straddles the
+        // 0x1FF region end; the next 0x100 boundary is 0x200, inside the gap.
+        assert_eq!(routine_base(dev, 0x1EE, &[22]), 0x400);
+        // A base whose frame fits its bank is untouched.
+        assert_eq!(routine_base(dev, 0x1D0, &[22]), 0x1D0);
+        // Single-region PIC18: base 0xEB + 22 crosses 0x100, so it snaps to
+        // the next boundary, which is inside the same region.
+        let dev = device::resolve("p18f4550").expect("p18f4550 is a known device");
+        assert_eq!(routine_base(dev, 0xEB, &[22]), 0x100);
+        assert_eq!(routine_base(dev, 0xE7, &[22]), 0xE7);
     }
 }

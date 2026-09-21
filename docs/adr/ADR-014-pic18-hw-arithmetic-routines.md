@@ -20,10 +20,15 @@ PIC18 32-bit `long` and hardware-multiply support (port P6):
    - **Branch-based restoring division.** The PIC14 skip-sensitive
      `BTFSS`/`INCFSZ` borrow folds become real `BNC`/`BRA` branches and
      `SUBFWB` (f - W - !C), the exact PIC18 instruction that expresses
-     the borrow chain. **No single-GPR-bank constraint**: PIC18 branches
-     are absolute, so a `MOVLB` between a test and its target is
-     harmless, and `alloc`'s routine-base rounding already no-ops on the
-     single contiguous PIC18 region.
+     the borrow chain. The unsigned mul/div/shift loops carry no
+     single-GPR-bank constraint: PIC18 branches are absolute, so a
+     `MOVLB` between a test and its target is harmless there. (The
+     i16/i32 signed wrappers' `BTFSC STATUS,2` carry folds, `__cmp_f32`
+     and every float conversion do carry it, so `alloc`'s routine-base
+     rounding does fire on PIC18; epic-cc#509 corrected the "already
+     no-ops on the single contiguous PIC18 region" claim, which was true
+     of the region check but not of the 256-byte bank the rounding now
+     measures.)
    - **`RLCF`/`RRCF` shifts** (through-carry rotates, the PIC18 names of
      `RLF`/`RRF`), and the Z-chain negate (COMF all, INCF low, `BTFSC
      STATUS,2` before each higher `INCF`).
@@ -49,8 +54,14 @@ PIC18 32-bit `long` and hardware-multiply support (port P6):
   heritage), ported instruction-for-semantics.
 - **The single-bank constraint is a PIC14 skip artifact.** The PIC14
   routines' frames must fit one GPR bank because a `BANKSEL` between a
-  skip-test and its target changes the skip. PIC18 branches have no such
-  hazard, so the constraint and `alloc`'s rounding die together.
+  skip-test and its target changes the skip. PIC18's *branch-based*
+  bodies have no such hazard for their loops, so the *loop* constraint
+  and its rounding do not apply to them. Retracted in part by
+  epic-cc#509: the i16/i32 signed wrappers, `__cmp_f32`, the float
+  conversions and the arithmetic float bodies still use `BTFSC`/`BTFSS`
+  skip folds on frame bytes, so the constraint survives on PIC18 and
+  `alloc` rounds there too. It is not dead, only narrower than the PIC14
+  version.
 
 ## Rejected alternatives
 

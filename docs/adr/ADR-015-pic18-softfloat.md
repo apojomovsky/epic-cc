@@ -32,7 +32,17 @@ integer ones (single-GPR-bank rounding, context-relative bases), and every
 recipe memory op goes through `operand()`'s MOVLB discipline via the
 `emit_banked` helper. The rule's real invariant was narrower than "frame
 must sit at or under 0x5F": no MOVLB between a skip test and its target.
-Every skip in the float recipes targets the next instruction or an explicit
-GOTO, so banked frames are sound. Per-context frames (each ISR priority's
-routine copies place in its own overlay region) close the cross-context
-scratch clobber this rule caused. See ADR-030 for the region scheme.
+Per-context frames (each ISR priority's routine copies place in its own
+overlay region) close the cross-context scratch clobber this rule caused.
+See ADR-030 for the region scheme.
+
+## Correction 2026-09-21 (epic-cc#509)
+
+The claim above that every skip targets the next instruction was wrong.
+`BTFSC`/`BTFSS` on a frame byte does guard an `INCF`/`BSF`/`GOTO` that
+names another frame byte, so a `MOVLB` inside the frame changes the skipped
+operand. The "one bank" invariant therefore still holds and is enforced by
+`routine_base`, which now measures the bank as `operand()`'s 256-byte `BSR`
+boundary rather than an `ram_banks` region (every PIC18 device declares all
+of RAM as one region, so the region check never fired and a frame crossing
+`0x100` got the MOVLB).
