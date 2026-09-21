@@ -105,6 +105,13 @@ struct Gen<'m> {
     /// an entry after its label's decision, which is never consulted
     /// again, so it cannot contribute.
     fwd_join: HashMap<String, Option<u8>>,
+    /// Whether `operand()` selected a bank since the flag was last
+    /// cleared. Terminator lowerings with per-edge phi copies can leave
+    /// each exit holding a different bank, so a block whose terminator
+    /// lowering selected any bank records unknown instead of its end
+    /// state. Straight-line prefix selects affect every exit equally:
+    /// the flag resets immediately before each terminator lowering.
+    bsr_dirty: bool,
     /// What FSR0 currently addresses, if known: `Some((origin, offset))`
     /// where `offset` is the `k + byte_off` most recently set up on top of
     /// `origin`. Lets a later access through the *same* base skip
@@ -555,6 +562,7 @@ impl<'m> Gen<'m> {
             if self.bsr != Some(bank) {
                 self.emit(format!("    MOVLB 0x{bank:X}"));
                 self.bsr = Some(bank);
+                self.bsr_dirty = true;
             }
             (1, addr & 0xFF)
         }
@@ -6178,6 +6186,7 @@ pub fn select_with_locs(
                 access_bank_hi,
                 bsr: None,
                 fwd_join: HashMap::new(),
+                bsr_dirty: false,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: &f.name,
@@ -6273,6 +6282,7 @@ pub fn select_with_locs(
             access_bank_hi,
             bsr: None,
             fwd_join: HashMap::new(),
+            bsr_dirty: false,
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: &f.name,
@@ -6320,9 +6330,9 @@ pub fn select_with_locs(
         // Join-bank tracking (epic-cc#534): predecessor labels per block
         // from terminator targets. Every block ends with a terminator
         // (the match below panics otherwise), so no fall-through edges
-        // exist. Switch dispatch preserves BSR through its table and
-        // trampolines (GOTO/MOVFF only), so the dispatch block itself
-        // contributes its end state to each case.
+        // exist. Switch cases additionally list their dispatch block,
+        // whose end state they carry when its lowering selected no
+        // banks (when it did, `bsr_dirty` already forced unknown).
         let mut preds: HashMap<&str, Vec<&str>> = HashMap::new();
         for b in &f.blocks {
             let targets: Vec<&str> = match b.insts.last() {
@@ -6466,6 +6476,10 @@ pub fn select_with_locs(
                     other => g.emit_inst(other),
                 }
             }
+            // Only bank selects inside the terminator lowering below can
+            // leave exits holding different banks; prefix selects are
+            // identical on every path out of this block.
+            g.bsr_dirty = false;
             match terminator {
                 Some(Inst::Br(br)) => {
                     g.cur_loc = br.loc.clone();
@@ -6796,6 +6810,13 @@ pub fn select_with_locs(
                         g.emit(format!("    MOVLB 0x{bank:X}"));
                         g.bsr = Some(bank);
                         g.emit(format!("    MOVF 0x{s:03X}, W, B")); // W last
+                                                                     // The select above leaves hardware BSR on the save
+                                                                     // area's bank, not the preempted value: restore it
+                                                                     // through BSR-independent MOVFF before returning,
+                                                                     // or main resumes against the wrong bank (epic-cc#534
+                                                                     // makes tracked agreement load-bearing there).
+                        g.emit(format!("    MOVFF 0x{:03X}, 0xFE0", s + 2));
+                        g.bsr = None;
                     } else {
                         g.emit(format!(
                             "    MOVF 0x{:03X}, W, A",
@@ -6826,10 +6847,13 @@ pub fn select_with_locs(
                 }
                 _ => panic!("isel-pic18: block has no terminator"),
             }
-            // Record for join agreement at successor labels. Internal
-            // labels inside this block's lowering already reset the
-            // tracked state where they join, so only the end counts.
-            block_end.insert(b.label.clone(), g.bsr);
+            // Record for join agreement at successor labels: the end
+            // state, unless the terminator lowering selected banks (then
+            // exits may disagree and the block contributes unknown).
+            // Internal labels inside this block's lowering already reset
+            // the tracked state where they join, so only the end counts.
+            let end = if g.bsr_dirty { None } else { g.bsr };
+            block_end.insert(b.label.clone(), end);
         }
         g.flush_copies();
         out.extend(g.out);
@@ -6984,6 +7008,7 @@ mod tests {
                 access_bank_hi: 0x5F,
                 bsr: None,
                 fwd_join: HashMap::new(),
+                bsr_dirty: false,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -7004,6 +7029,7 @@ mod tests {
                 access_bank_hi: 0x5F,
                 bsr: None,
                 fwd_join: HashMap::new(),
+                bsr_dirty: false,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -7038,6 +7064,7 @@ mod p3_gen_tests {
             access_bank_hi: 0x5F,
             bsr: None,
             fwd_join: HashMap::new(),
+            bsr_dirty: false,
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: "main",
@@ -7080,6 +7107,54 @@ mod p3_gen_tests {
             g.out.iter().any(|l| l.contains("MOVLB")),
             "the banked range needs a MOVLB"
         );
+    }
+
+    #[test]
+    fn forward_join_restores_agreement() {
+        // Two recorded edges and the fall-through all hold bank 2: the
+        // label restores it instead of resetting. Guards the meet
+        // against regressions that drop the fall-through candidate.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let mut tmp = 0u32;
+        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        g.bsr = Some(2);
+        g.note_branch("tmp7");
+        g.note_branch("tmp7");
+        g.emit_label("tmp7");
+        assert_eq!(g.bsr, Some(2), "agreeing join must restore the bank");
+    }
+
+    #[test]
+    fn forward_join_poison_on_disagreement() {
+        // Recorded edges disagree (or the fall-through does): the label
+        // stays unknown so the next banked access re-selects. Guards
+        // the meet against regressions that overwrite instead of
+        // poisoning, which would elide a needed MOVLB.
+        let m = Module {
+            globals: Vec::new(),
+            funcs: Vec::new(),
+            module_asm: Vec::new(),
+        };
+        let addrs = HashMap::new();
+        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let mut tmp = 0u32;
+        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        g.bsr = Some(0);
+        g.note_branch("tmp8");
+        g.bsr = Some(1);
+        g.emit_label("tmp8");
+        assert_eq!(g.bsr, None, "divergent join must stay unknown");
+        g.bsr = Some(1);
+        g.note_branch("tmp9");
+        g.bsr = None;
+        g.emit_label("tmp9");
+        assert_eq!(g.bsr, None, "unknown fall-through must poison");
     }
 
     #[test]

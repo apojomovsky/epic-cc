@@ -4849,3 +4849,38 @@ fn loop_header_join_stays_unknown() {
     assert_eq!(p.ram()[0x190], 8, "loop body store lost");
     assert_eq!(p.ram()[0x090], 9, "exit store lost");
 }
+
+#[test]
+fn dirty_terminator_poison_single_pred_taken_target() {
+    // The reviewer's trigger, end to end: the t edge exits the entry
+    // block before the f edge's phi copies run, and those copies select
+    // bank 1 while the taken path never selected anything (the cond
+    // load stages through MOVFF). Recording one end state per block
+    // would agree the taken target to bank 1 and elide its select,
+    // storing through the wrong bank. The dirty flag forces unknown
+    // instead: 2 MOVLBs (phi copy, taken store). Without it the count
+    // is 1 and the simulator catches the misbanked store.
+    let m = parse(
+        "global cond i8\nglobal out1 i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @cond\n    br i1 %1 t f\n  block t:\n    store i8 1 @out1\n    ret void\n  block f:\n    %2 = phi i8 9 entry\n    store i8 %2 @out1\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("cond", 0x090),
+        ("out1", 0x190),
+        ("main::1", 0x12),
+        ("main::2", 0x191),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        2,
+        "phi copy and taken store each select:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (c, expect) in [(1u8, 1u8), (0, 9)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x090] = c;
+        p.run(500);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x190], expect, "out1 wrong on cond={c}");
+    }
+}
