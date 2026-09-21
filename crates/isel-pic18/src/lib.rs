@@ -115,11 +115,6 @@ struct Gen<'m> {
     /// the source location active when it was staged so the parallel
     /// `locs` vector stays index-aligned whichever way the drain goes.
     pending_copies: Vec<(u16, u16, Option<SrcLoc>)>,
-    /// Whether a POSTINC copy loop may emit at all. The loop holds FSR1
-    /// across its iterations and FSR1 is not in the ISR save area
-    /// (ADR-013), so it is sound only while no ISR-reachable function
-    /// seeds FSR1 (an indirect-source memcpy); computed once per module.
-    allow_copy_loops: bool,
     cur_func: &'m str,
     /// Marks an interrupt handler: the body runs a save prologue and restore
     /// epilogue with `RETFIE` instead of `RETURN` (the single-vector mode).
@@ -164,7 +159,7 @@ impl<'m> Gen<'m> {
         // adjacent copies can stage a longer run; a byte-counted loop
         // cannot hold that count in the MOVLW literal, so long runs
         // replay straight, the pre-loop form.
-        if self.allow_copy_loops && n >= COPY_LOOP_MIN_PAIRS && n <= 255 {
+        if n >= COPY_LOOP_MIN_PAIRS && n <= 255 {
             let (src0, dst0, loc) = &pairs[0];
             let (src0, dst0) = (*src0, *dst0);
             let l_loop = self.fresh_label();
@@ -2727,10 +2722,6 @@ impl<'m> Gen<'m> {
                                 // staging owns the bodies: nothing to
                                 // save by walking.
                                 (McSrc::Direct(_), Addr::Direct(_)) => false,
-                                // FSR1 is outside the ISR save area:
-                                // walk only while no ISR-reachable
-                                // function can clobber it mid-copy.
-                                (McSrc::Indirect, _) => self.allow_copy_loops,
                                 _ => true,
                             };
                         self.emit_memcpy_body(n == 1, &src0, &dst0, walk);
@@ -5920,87 +5911,6 @@ pub fn select(
     select_with_locs(device, m, addrs, isr_low_save, None, None).0
 }
 
-/// Whether `f` contains a memcpy whose source would seed FSR1, i.e. whose
-/// resolved base is not a plain compile-time address: an indirect slot (a
-/// pointer VALUE, or an sret/pointer param holding an address), or any
-/// base carrying dynamic terms. Mirrors `emit_memcpy_src_setup`'s split;
-/// keep the two in sync. A const (flash) source never reaches the FSR1
-/// path (the TBLRD arm runs first) but is conservatively counted here.
-fn func_may_seed_fsr1(f: &Func, resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>) -> bool {
-    f.blocks.iter().any(|b| {
-        b.insts.iter().any(|inst| match inst {
-            Inst::Memcpy(mc) => match &mc.src {
-                Val::Reg(r) => match resolved.get(&ssa_key(&f.name, r)) {
-                    Some((Base::Global(_), _, terms)) => !terms.is_empty(),
-                    Some((Base::Slot(sname, indirect), _, terms)) => {
-                        *indirect
-                            || f.params.iter().any(|p| p.name == *sname && p.ptr)
-                            || !terms.is_empty()
-                    }
-                    None => false,
-                },
-                _ => false,
-            },
-            _ => false,
-        })
-    })
-}
-
-/// Whether any ISR-reachable function may seed FSR1. FSR1 is not in the
-/// ISR save area (ADR-013), so a function that holds meaningful FSR1
-/// state across an interruptible window is only sound while the
-/// interrupting side cannot clobber it; the copy loop (epic-cc#486)
-/// holds FSR1 for its whole iteration count. Callees come from direct
-/// calls (`c.func`) and, conservatively, the full candidate list of an
-/// indirect call.
-fn isr_reachable_may_seed_fsr1(
-    m: &Module,
-    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
-) -> bool {
-    let by_name: HashMap<&str, &Func> = m.funcs.iter().map(|f| (f.name.as_str(), f)).collect();
-    let mut seen: HashSet<&str> = m
-        .funcs
-        .iter()
-        .filter(|f| f.isr)
-        .map(|f| f.name.as_str())
-        .collect();
-    let mut work: Vec<&str> = seen.iter().copied().collect();
-    while let Some(name) = work.pop() {
-        let Some(f) = by_name.get(name) else { continue };
-        if func_may_seed_fsr1(f, resolved) {
-            return true;
-        }
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Inst::Call(c) = inst {
-                    if c.callees.is_empty() {
-                        if let Some(fresh) = by_name
-                            .contains_key(c.func.as_str())
-                            .then_some(c.func.as_str())
-                            .filter(|n| !seen.contains(n))
-                        {
-                            seen.insert(fresh);
-                            work.push(fresh);
-                        }
-                    } else {
-                        for cand in &c.callees {
-                            if let Some(fresh) = by_name
-                                .contains_key(cand.as_str())
-                                .then_some(cand.as_str())
-                                .filter(|n| !seen.contains(n))
-                            {
-                                seen.insert(fresh);
-                                work.push(fresh);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    false
-}
-
 /// `select` plus a parallel per-line source-location vector, index-aligned
 /// with the returned asm text. `None` marks a compiler-generated line (the
 /// header, `__start`, const tables, prologue glue). The driver threads this
@@ -6104,9 +6014,6 @@ pub fn select_with_locs(
             isr_save.expect("isel-pic18: ISR without a save area")
         }
     };
-    // One decision for the whole module: the copy loop (epic-cc#486) is
-    // sound only while no ISR can interrupt it holding a stale FSR1.
-    let allow_copy_loops = !isr_reachable_may_seed_fsr1(m, &resolved);
     let mut funcs: Vec<&Func> = m.funcs.iter().collect();
     // High ISR first, then low ISR, then ordinary functions.
     funcs.sort_by_key(|f| (!f.isr, f.irq_priority != 1));
@@ -6147,7 +6054,6 @@ pub fn select_with_locs(
                 bsr: None,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
-                allow_copy_loops,
                 cur_func: &f.name,
                 isr: f.isr,
                 tmp: &mut tmp,
@@ -6242,7 +6148,6 @@ pub fn select_with_locs(
             bsr: None,
             fsr0_holds: None,
             pending_copies: Vec::new(),
-            allow_copy_loops,
             cur_func: &f.name,
             isr: f.isr,
             tmp: &mut tmp,
@@ -6894,7 +6799,6 @@ mod tests {
                 bsr: None,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
-                allow_copy_loops: false,
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
@@ -6914,7 +6818,6 @@ mod tests {
                 bsr: None,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
-                allow_copy_loops: false,
                 cur_func: "f",
                 isr: false,
                 tmp: &mut tmp,
@@ -6948,7 +6851,6 @@ mod p3_gen_tests {
             bsr: None,
             fsr0_holds: None,
             pending_copies: Vec::new(),
-            allow_copy_loops: true,
             cur_func: "main",
             isr: false,
             tmp,
