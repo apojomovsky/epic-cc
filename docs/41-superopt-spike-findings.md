@@ -298,6 +298,78 @@ before writing it within the same statement, there is no cross-statement
 W tracking (#502 is the ticket to add one), and WREG sits inside the ISR
 save area, so an interrupt cannot lose it either.)
 
+## Target 3: right shifts, and the 32-bit generalisation (epic-cc#526)
+
+epic-cc#505 landed the left-shift forms; everything else still unrolled per
+bit, because nothing better was verified. #526 is the request to close that
+gap with the same discipline: construct, verify, then wire. Three results.
+
+**Right shifts, single lane, amount 4 (any width): landed.** The mirror of
+the landed left form. A left shift by 4 is `SWAPF lane,W ; ANDLW 0xF0 ;
+MOVWF lane` (keep the high nibble, move it up); a right shift by 4 is
+`SWAPF lane,W ; ANDLW 0x0F ; MOVWF lane` (keep the low nibble, which after
+the swap is the source's high nibble, now in the low position). Three
+words against the unroll's `4 * (BCF + RRCF)` = 8 for a byte and 12 for a
+16-bit pair. Verified over the full 256-input byte domain and independent
+of entry `W` and `C` (`crates/superopt/tests/shift_right_4.rs`), and the
+landed `isel-pic18` form is re-checked by simulating the real selector's
+output over the same domain. W-only, so it shares the landed left forms'
+dead-`W` precondition.
+
+**Right shifts, 16-bit pair, amount 4: landed, 9 words.** The two-lane
+mirror is not a composition of the single-lane form (bits carry across the
+byte boundary), but it is still W-only:
+
+```
+lo' = (lo >> 4) | ((hi & 0x0F) << 4)      hi' = hi >> 4
+```
+
+Nine words against the 12-word unroll, verified over the full 65536-input
+domain plus a `W` sample (`crates/superopt/tests/shift_right_16bit.rs`).
+Both forms fire on any width's single surviving lane at `r == 4`, including
+`m > 0` cases (`lshr i16, 12`, `lshr i32, 28`), so the landed selector is
+simulated over the whole domain for each of those too
+(`crates/isel-pic18/tests/isel_pic18.rs`).
+Getting this far caught a real trap: a first draft had a malformed
+operand (`movf 0x022,A`, no `F`/`W`), which the assembler rejects by
+panicking, and `verify()` treats a panicking candidate as *not verified*.
+A malformed line and a wrong derivation look identical from the outside,
+so the fix was to check which branch the test actually took rather than
+trusting its green.
+
+**Measured on the epic's own fixture: -59 flash words.** The menu-demo
+ladder entry drops from 11890 to 11831 words after these forms land
+(`crates/driver/tests/fixtures/size_baseline.toml`). Attribution is
+exact, not inferred: with the right-shift fast path compiled out the same
+tree measures 11890, master's number to the word, and with it in, 11831.
+The fixture's right shifts by 4 (`epic_lcd_gpio4.c`'s
+`(uint8_t)(byte >> 4u)`, `sim_menu_demo.c`'s `(v >> 4) & 0xFU`) are the
+whole delta.
+
+**32-bit shifts by 4, both directions: verified, and they lose.** The
+natural in-place, W-only 4-lane generalisation of the 16-bit family is 21
+words (`3 * 6 + 3`: each lane above the lowest becomes `(lane << 4) |
+(lower >> 4)` in 6 words, the lowest `<< 4` in 3). The unroll it would
+replace is `r * 5` = 20 words at amount 4. So the construction **loses by
+one word**, and does so at every nibble-boundary amount: the construction
+grows 6 words per lane while the unroll grows 5 per step. That is the
+opposite of the 16-bit case, where the construction grows 6 per lane and
+the baseline only 2 per step, which is exactly why the 16-bit forms win
+and the 32-bit ones do not.
+
+The 32-bit constructions are verified over a curated 4-byte sample
+(`crates/superopt/tests/shift_32bit.rs`), not the full 2^32 domain: a
+full-domain run at this crate's per-case cost is days, and the ticket
+names the curated-sample treatment for this width. They are **not wired
+into `isel-pic18`**, because a form that costs more than the code it
+replaces is not worth landing; `const_shl_i32_by_4_keeps_the_unrolled_form`
+still pins the unroll, and a companion test records that the 4-lane form
+is correct and one word too long, so the negative is checked rather than
+asserted. The search bound at this width is hopeless
+(`28^10` candidates, ~4 million hours on the measured 48.3us/candidate
+rate), so no exhaustive answer is claimed for 4 lanes: the result is
+"this construction loses", not "nothing shorter exists".
+
 ## Recommendation
 
 **Worth a follow-up integration ticket, scoped narrowly.** Target 2 in
@@ -335,7 +407,15 @@ follow-up, not attempted here:
   re-verified in `crates/isel-pic18`'s own tests by simulating the real
   selector's output over the full input domain (65536 values per 16-bit
   amount, 256 per byte lane), not by trusting the superopt suite's
-  candidate text. Target 1 needed no landing: the #518 postscript above
+  candidate text.
+- ~~Right shifts, all widths, and the 32-bit generalisation~~: done,
+  epic-cc#526 (Target 3 above). Single-lane and 16-bit right shifts by 4
+  are verified and landed (3 and 9 words against 8 and 12); the 32-bit
+  left and right 4-lane forms are verified *and lose* (21 against 20), so
+  they are deliberately not landed. The general lesson recorded there:
+  the 16-bit family wins because it grows 6 words per lane against a
+  baseline growing 2 per step, and that advantage inverts at 4 lanes
+  (baseline 5 per step). Target 1 needed no landing: the #518 postscript above
   records the common shape already beating its floor. #505's own second
   lowering, a counted loop above a word-count threshold, was rejected on
   arithmetic: `DECFSZ`+`BRA` costs 2 more words per iteration than the

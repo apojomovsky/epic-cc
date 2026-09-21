@@ -2270,14 +2270,47 @@ impl<'m> Gen<'m> {
                         }
                     }
                     let active = n16 - m;
-                    // Nibble-boundary left shifts have shorter, sim-verified
+                    // Nibble-boundary shifts have shorter, sim-verified
                     // forms than the per-bit unroll (crates/superopt, docs/41):
-                    // one lane shifts by 4 as SWAPF+mask, and an in-place
-                    // 16-bit pair has a canned construction per amount 4-7,
-                    // each checked over the full 65536-input domain. They
-                    // clobber W, dead at statement entry (no lowering reads W
-                    // before writing it; W tracking is #502), and STATUS no
-                    // worse than the unroll they replace.
+                    // one lane shifts by 4 as SWAPF+mask, an in-place 16-bit
+                    // pair has a canned construction per amount 4-7 (left) or
+                    // at amount 4 (right), each checked over the full
+                    // 65536-input domain. They clobber W, dead at statement
+                    // entry (no lowering reads W before writing it; W tracking
+                    // is #502), and STATUS no worse than the unroll they
+                    // replace.
+                    if b.op == ir::BinOp::LShr && r == 4 {
+                        if active == 1 {
+                            // Mirror of the single-lane left form: a right
+                            // shift by 4 moves the high nibble down, i.e.
+                            // SWAPF then keep the low nibble. The lane is
+                            // `dst` (right shifts keep dst[0..n-m)), not
+                            // `dst + m` as the left form uses. The byte-move
+                            // above already placed the surviving source byte
+                            // there, and with no higher live lane to rotate
+                            // bits in from, the residual is a plain nibble
+                            // down-shift.
+                            self.emit_banked("SWAPF", dst, ",W");
+                            self.emit("    ANDLW 0x0F".to_string());
+                            self.emit_banked("MOVWF", dst, "");
+                            return;
+                        }
+                        if n16 == 2 && m == 0 {
+                            // lo' = (lo>>4) | ((hi&0x0F)<<4), hi' = hi>>4, both
+                            // as nibble-swaps plus a mask. W-only, so the same
+                            // dead-W precondition as the left forms.
+                            self.emit_banked("SWAPF", dst, ",F");
+                            self.emit("    MOVLW 0x0F".to_string());
+                            self.emit_banked("ANDWF", dst, ",F");
+                            self.emit_banked("SWAPF", dst + 1, ",W");
+                            self.emit("    ANDLW 0xF0".to_string());
+                            self.emit_banked("IORWF", dst, ",F");
+                            self.emit_banked("SWAPF", dst + 1, ",W");
+                            self.emit("    ANDLW 0x0F".to_string());
+                            self.emit_banked("MOVWF", dst + 1, "");
+                            return;
+                        }
+                    }
                     if b.op == ir::BinOp::Shl && r > 0 {
                         if active == 1 && r == 4 {
                             self.emit_banked("SWAPF", dst + m, ",W");
