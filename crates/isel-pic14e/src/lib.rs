@@ -421,11 +421,12 @@ impl<'m> Gen<'m> {
                     Inst::Call(c) if c.dst.as_deref() == Some(name) => {
                         c.ty.map(|t| t.bytes()).unwrap_or(1)
                     }
-                    // No float arms: legalize rewrites every float op into
-                    // a runtime Call before isel runs, and the raw forms
-                    // panic in `emit_inst`, so a width arm here could only
-                    // be read for an instruction about to panic. A
-                    // conversion result's width rides its call's type.
+                    // No float arms: legalize rewrites every float op
+                    // before isel runs (a runtime Call, or a Freeze for
+                    // fpext/fptrunc), and the raw forms panic in
+                    // `emit_inst`, so a width arm here could only be read
+                    // for an instruction about to panic. An integer
+                    // conversion's width rides its call's type.
                     // (epic-cc#488)
                     _ => continue,
                 };

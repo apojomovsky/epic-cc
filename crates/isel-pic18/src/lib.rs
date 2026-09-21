@@ -363,11 +363,12 @@ impl<'m> Gen<'m> {
                     Inst::Alloca(a) if a.dst == reg => Some(a.size),
                     Inst::Freeze(f) if f.dst == reg => Some(f.ty.bytes()),
                     // No FloatBin/Fcmp/FloatConv arms: legalize rewrites
-                    // every float op into a runtime Call before isel runs,
-                    // and `emit_inst` panics on the raw forms, so a width
-                    // arm here could only be read for an instruction about
-                    // to panic. A conversion result's width arrives on its
-                    // call's type (the `Inst::Call` arm above). (epic-cc#488)
+                    // every float op before isel runs (a runtime Call, or a
+                    // Freeze for fpext/fptrunc), and `emit_inst` panics on
+                    // the raw forms, so a width arm here could only be read
+                    // for an instruction about to panic. An integer
+                    // conversion's width arrives on its call's type (the
+                    // `Inst::Call` arm above). (epic-cc#488)
                     Inst::VaArg(v) if v.dst == reg => Some(v.ty.bytes()),
                     _ => None,
                 };
