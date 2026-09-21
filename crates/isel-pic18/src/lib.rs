@@ -2281,15 +2281,13 @@ impl<'m> Gen<'m> {
                     // replace.
                     if b.op == ir::BinOp::LShr && r == 4 {
                         if active == 1 {
-                            // Mirror of the single-lane left form: a right
-                            // shift by 4 moves the high nibble down, i.e.
-                            // SWAPF then keep the low nibble. The lane is
-                            // `dst` (right shifts keep dst[0..n-m)), not
-                            // `dst + m` as the left form uses. The byte-move
-                            // above already placed the surviving source byte
-                            // there, and with no higher live lane to rotate
-                            // bits in from, the residual is a plain nibble
-                            // down-shift.
+                            // Mirror of the single-lane left form: SWAPF
+                            // then keep the low nibble. The lane is `dst`
+                            // (right shifts keep dst[0..n-m)), not `dst + m`
+                            // as the left form uses; the byte-move above
+                            // already put the surviving byte there, and no
+                            // higher lane rotates bits in, so the residual
+                            // is a plain nibble down-shift.
                             self.emit_banked("SWAPF", dst, ",W");
                             self.emit("    ANDLW 0x0F".to_string());
                             self.emit_banked("MOVWF", dst, "");

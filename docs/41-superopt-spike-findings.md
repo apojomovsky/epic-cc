@@ -348,14 +348,28 @@ whole delta.
 
 **32-bit shifts by 4, both directions: verified, and they lose.** The
 natural in-place, W-only 4-lane generalisation of the 16-bit family is 21
-words (`3 * 6 + 3`: each lane above the lowest becomes `(lane << 4) |
-(lower >> 4)` in 6 words, the lowest `<< 4` in 3). The unroll it would
-replace is `r * 5` = 20 words at amount 4. So the construction **loses by
-one word**, and does so at every nibble-boundary amount: the construction
-grows 6 words per lane while the unroll grows 5 per step. That is the
-opposite of the 16-bit case, where the construction grows 6 per lane and
-the baseline only 2 per step, which is exactly why the 16-bit forms win
-and the 32-bit ones do not.
+words at amount 4 (`3 * 6 + 3`: each lane above the lowest becomes
+`(lane << 4) | (lower >> 4)` in 6 words, the lowest `<< 4` in 3). The
+unroll it would replace is `r * 5` words (`r` steps of one `BCF` plus one
+rotate per live lane), 20 at amount 4. So the construction **loses by one
+word** at amount 4.
+
+The tempting reading is that the same 21-word form would win at amounts
+5-7, where the unroll is 25/30/35. That reading is wrong, and checking it
+is why amount 5 is also built and verified here: a shift by 5 needs the
+nibble form *plus* a fifth single-bit pass, 5 more words, so the
+construction is `21 + 5*(r-4)` = `5r + 1` against the unroll's `5r`. It
+loses by exactly one word at every amount, not only at amount 4
+(`construction_shl5`, verified over the same sample). The asymmetry with
+the 16-bit case is the point: there the construction grows 6 words per
+lane while the baseline grows only 2 per step, so the 16-bit forms win at
+every amount; here the construction's per-step cost (5 words, the extra
+bit pass) matches the unroll's exactly, so the amount-4 nibble saving is
+consumed by the time the fifth bit is counted. A form that fuses the extra
+bits into the nibble pass, the way the 16-bit target found separate
+constructions for amounts 6 and 7, was not searched; if one exists it
+would be the first 32-bit win, and the amounts 5-7 unrolls are where it
+would pay.
 
 The 32-bit constructions are verified over a curated 4-byte sample
 (`crates/superopt/tests/shift_32bit.rs`), not the full 2^32 domain: a

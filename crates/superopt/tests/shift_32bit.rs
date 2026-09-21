@@ -18,11 +18,12 @@
 //! - Unroll: `r` steps of `BCF` + one `RLCF` per live lane, `r * 5` = 20 at
 //!   r == 4.
 //!
-//! So the construction grows 6 words per added lane while the unroll it
-//! replaces grows `r` words per added lane; at 4 lanes the construction
-//! loses at every nibble-boundary amount. This is the opposite of the
-//! 16-bit case, where the construction grows 6 per lane and the baseline
-//! only `2*r` per step.
+//! Extending to amount 5 costs the nibble form plus one more single-bit
+//! pass, 5 words, so the construction is `5r + 1` against the unroll's
+//! `5r` and loses by exactly one word at every amount (both are built and
+//! verified here). This is the opposite of the 16-bit case, where the
+//! construction grows 6 per lane and the baseline only `2*r` per step, so
+//! the 16-bit forms win at every amount while these never do.
 //!
 //! The 4-lane construction is verified over a curated 4-byte sample rather
 //! than the full 2^32 domain: `2^32` cases at this crate's per-case cost is
@@ -162,4 +163,42 @@ fn right_shift_32bit_by_4_construction_is_correct_and_loses() {
         "the 4-lane right generalization must be a correct candidate"
     );
     assert!(c.len() >= 5 * 4, "21 words >= the 20-word unroll: it loses");
+}
+
+/// The straightforward amount-5 extension: the amount-4 nibble form followed
+/// by one more single-bit pass (`BCF` + one rotate per lane, 5 words). This is
+/// what makes the cost model explicit: the construction does not stay 21
+/// words, it grows 5 per additional amount (21 + 5*(r-4) = 5r + 1) while the
+/// unroll is 5r, so it loses by exactly one word at *every* amount, not just
+/// amount 4. A cleverer per-amount form (the 16-bit target found one for
+/// 6 and 7) was not searched here.
+fn construction_shl5() -> Candidate {
+    let mut c = construction_shl4();
+    c.push("bcf 0xFD8,0,A");
+    for a in [
+        "rlcf 0x020,F,A",
+        "rlcf 0x021,F,A",
+        "rlcf 0x022,F,A",
+        "rlcf 0x023,F,A",
+    ] {
+        c.push(a);
+    }
+    c
+}
+
+#[test]
+fn left_shift_32bit_by_5_is_correct_and_also_loses() {
+    let c = construction_shl5();
+    assert_eq!(c.len(), 21 + 5, "amount 4 form plus one bit pass");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shl, 5, &sample_words(), W_SAMPLE)
+        ),
+        "the amount-5 extension must be a correct candidate"
+    );
+    assert!(
+        c.len() > 5 * 5,
+        "21 + 5 = 26 words against the 25-word unroll: the cost model is 5r+1 vs 5r"
+    );
 }
