@@ -198,6 +198,55 @@ is a real, actionable result for the byte-boundary special case, not yet a
 claim about the general 16-bit shift-by-N contract #505 is actually
 scoped to.
 
+## Target 2, generalized to 16 bits and shift amounts 1-7 (epic-cc#520)
+
+The 8-bit result above deliberately stopped short of #505's actual
+contract. `crates/superopt/tests/shift_16bit.rs` covers it: two registers
+(`LO`/`HI`, in place, matching how `x <<= n` compiles), shift amounts 1-7
+(8 is already #470's byte-move case). `isel-pic18`'s baseline for any
+amount N is N steps of `BCF STATUS,C` + `RLCF lo,F` + `RLCF hi,F`, 3
+words/step, so **the baseline to beat is 3*N words for every amount**.
+
+Exhaustive search over this contract does not stay tractable at the
+baseline's own length: the alphabet needed (rotate ops plus the nibble-
+swap family, ~21 symbols) makes `21^9` (amount 4's baseline length) far
+beyond a bounded-effort search. Two methods instead of one:
+
+- **Bounded exhaustive search**, up to length 4, over the combined
+  alphabet, run for every amount. Amount 1's 3-word baseline is inside
+  this bound, so a confirmed floor there is a real answer; amounts 2-7
+  mostly find nothing this short, the honest result of the bound, not
+  evidence the baseline is optimal.
+- **A constructed candidate, verified with the same `verify()` the
+  search engine uses**, not hand-traced: for amount 4, the 8-bit nibble-
+  swap trick generalized across both bytes (`SWAPF` both, mask, recombine
+  the nibble that straddles the byte boundary). For amounts 5-7, that
+  same construction with (amount - 4) more standard rotate steps appended
+  -- valid because a left shift by 4 then k never needs a bit the first
+  step already discarded, so the two compose cleanly.
+
+**Results:**
+
+| amount | baseline | bounded search (<=4) | constructed | delta |
+|---|---|---|---|---|
+| 1 | 3 | floor 3 (confirmed minimal) | -- | 0 |
+| 2 | 6 | nothing found | -- | unknown |
+| 3 | 9 | nothing found | -- | unknown |
+| 4 | 12 | nothing found | **9** | **-3 (25%)** |
+| 5 | 15 | nothing found | **12** | **-3 (20%)** |
+| 6 | 18 | nothing found | **15** | **-3 (16.7%)** |
+| 7 | 21 | nothing found | **18** | **-3 (14.3%)** |
+
+Every amount 4-7 saves exactly 3 words: the nibble-swap construction
+itself is what saves the 3 words (9 vs the 12 a from-scratch unrolled
+amount-4 would cost), and composing further rotate steps on top carries
+that fixed saving forward unchanged, since those extra steps cost the
+standard 3 words each either way. Amounts 2 and 3 have no result either
+way (baseline low enough that a real answer might exist, but the search
+bound could not reach it, and no construction was attempted for them: no
+comparably clean algebraic shortcut exists for a shift that does not
+land on a nibble boundary).
+
 ## Recommendation
 
 **Worth a follow-up integration ticket, scoped narrowly.** Target 2 in
@@ -209,10 +258,11 @@ and more importantly the search disproved the ticket's own proposed fix
 before it could ship as a correctness bug. Recommended scope for that
 follow-up, not attempted here:
 
-- Generalize target 2 to the 16-bit case #505 actually reports against,
-  and to shift amounts other than 4 (shift-by-4-mod-8 is the case
-  `SWAPF` wins outright; other amounts likely need a different, possibly
-  worse, trade). Tracked as epic-cc#520.
+- ~~Generalize target 2 to the 16-bit case #505 actually reports
+  against, and to shift amounts other than 4~~: done, epic-cc#520 (see the
+  results table above). Amounts 4-7 each save a real, verified 3 words;
+  amounts 2 and 3 got no answer either way within a tractable search
+  bound, and no comparable algebraic shortcut was found for them.
 - ~~Widen target 1's case set~~ and ~~widen the verification check to the
   whole machine state~~: done, epic-cc#521. Both surfaced real soundness
   gaps of their own on the way (a `W` register that was never actually
