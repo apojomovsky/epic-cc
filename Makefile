@@ -124,7 +124,7 @@ image: ## Build the dev image (only image you need locally)
 	fi
 
 shell: image ## Interactive dev shell inside the container
-	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE)
+	@mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT)
 	docker run -it $(DOCKER_ARGS) $(LOCAL_IMAGE) bash
 
 exec: image ## One-off command: make exec CMD='cargo test -p asm'
