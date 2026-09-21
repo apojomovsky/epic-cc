@@ -374,9 +374,42 @@ hand derivations for a follow-up: amount 6 as `4 + 3*7` = 25 words
 (`RRNCF` twice plus a mask per lane, reading the rotated lower lane before
 masking, the same shape as the isel amount-6 block) against the 30-word
 unroll, and amount 7 as `x << 7` = `(x << 8) >> 1`: three byte moves,
-`CLRF`, `BCF`, four `RRCF` = 12 words against 35. Those pencil out
-favorably, which is why the expected first 32-bit win sits at amounts 6
-and 7, not 5.
+`CLRF`, `BCF`, four `RRCF` = 12 words against 35.
+
+**Resolved in epic-cc#549, and the second candidate was unsound.** The
+amount-7 byte-move form is arithmetically fine as a 32-bit identity only if
+the `<< 8` is a real 32-bit shift; implemented as a byte move it discards
+the top byte, so it drops bits 24-25 of `x`. `x = 0x01000000` witnesses it:
+`x << 7` is `0x80000000`, the byte-trick form gives `0`. A test asserts it
+fails verification (`the_tickets_amount7_byte_move_form_is_unsound`),
+because that failure is the reason the landed form differs.
+
+The sound form, now verified and wired, is the general family the 16-bit
+amount-6 construction already belongs to, at 4 lanes. Rotate every byte
+right within itself by `8 - r` with `RRNCF` (rotate-right-no-carry, so
+`8 - r` is a left shift by `r` modulo the byte), then recombine
+high-to-low. Each lane above the lowest takes its high `r` bits from its
+own rotated byte and its low `8 - r` bits from the rotated byte below
+(reading the lower lane before it is rewritten is why the combine runs
+high-to-low); the lowest lane only keeps its own high `r` bits. Per upper
+lane that is `MOVLW hi ; ANDWF ; MOVF lower,W ; ANDLW lo ; IORWF` = 5
+words, the lowest 2, and the rotation `4 * (8 - r)`:
+
+| r | rotate | combine | total | unroll | delta |
+|---|---|---|---|---|---|
+| 6 | 8 | 17 | **25** | 30 | **-5** |
+| 7 | 4 | 17 | **21** | 35 | **-14** |
+
+Both are verified over a swept operand set (each byte lane swept through
+0..255, plus a deterministic 4096-case pseudo-random sweep) in
+`crates/superopt/tests/shift_32bit.rs`, and the emitted selector asm is
+re-verified by simulation over 256 derived byte patterns for each amount in
+`crates/isel-pic18/tests/isel_pic18.rs`. Amounts 4 and 5 do not reach this
+arm: their rotation is 8 and 12 words, so the total loses there, which is
+why #526's amount-4/5 forms stay on their own arms. The earlier
+-59-word menu-demo figure belongs to #526's right-shift forms alone; this
+change measures exactly zero on that fixture, whose only `<< 6` sites are
+`uint8_t` masks, not `i32` shifts.
 
 The 32-bit constructions are verified over a curated 4-byte sample
 (`crates/superopt/tests/shift_32bit.rs`), not the full 2^32 domain: a
