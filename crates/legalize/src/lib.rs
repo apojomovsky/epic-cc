@@ -1942,11 +1942,17 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
     }
     /// Rewrite direct call targets and function-pointer values inside
     /// `rewrite_set` from duplicated originals to their `suffix` copies.
+    /// Every rewritten address VALUE (a store into a global, a forwarded
+    /// call argument) is recorded in `stored`: the storage it lands in is
+    /// read by this priority, but nothing keeps OTHER contexts that
+    /// dispatch through the same storage from holding the copy's address,
+    /// so the candidate filler must know the rewrite happened (epic-cc#568).
     fn rewrite_calls_to_copies(
         funcs: &mut [Func],
         rewrite_set: &HashSet<String>,
         shared: &HashSet<&str>,
         suffix: &str,
+        stored: &mut HashSet<String>,
     ) {
         for f in funcs.iter_mut() {
             if !rewrite_set.contains(&f.name) {
@@ -1960,7 +1966,7 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                             c.func = format!("{target}{suffix}");
                         }
                     }
-                    rewrite_inst_vals(inst, shared, suffix);
+                    rewrite_inst_vals(inst, shared, suffix, stored);
                 }
             }
         }
@@ -1992,8 +1998,20 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
     let mut copies = lo_copies;
     copies.extend(hi_copies);
     funcs.extend(copies);
-    rewrite_calls_to_copies(&mut funcs, &rewrite_lo, &shared_lo_set, LO_SUFFIX);
-    rewrite_calls_to_copies(&mut funcs, &rewrite_hi, &shared_hi_set, HI_SUFFIX);
+    rewrite_calls_to_copies(
+        &mut funcs,
+        &rewrite_lo,
+        &shared_lo_set,
+        LO_SUFFIX,
+        &mut stored_lo,
+    );
+    rewrite_calls_to_copies(
+        &mut funcs,
+        &rewrite_hi,
+        &shared_hi_set,
+        HI_SUFFIX,
+        &mut stored_hi,
+    );
     // Cross-context store rewrite (epic-cc#137), per priority: a store
     // of a duplicated function targets the copy of the priority that
     // READS the global (otherwise the ISR dispatches the main-context
@@ -2245,61 +2263,67 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
 /// when `f` is in `shared` (a function duplicated for an ISR context). Covers every
 /// inst variant that carries a `Val`; the pointer-returning `sink_ptr_select`
 /// bodies and the `Call.func` target are handled separately.
-fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>, suffix: &str) {
-    fn rv(v: &mut Val, shared: &HashSet<&str>, suffix: &str) {
+fn rewrite_inst_vals(
+    inst: &mut Inst,
+    shared: &HashSet<&str>,
+    suffix: &str,
+    stored: &mut HashSet<String>,
+) {
+    fn rv(v: &mut Val, shared: &HashSet<&str>, suffix: &str, stored: &mut HashSet<String>) {
         if let Val::Global(g) = v {
             if shared.contains(g.as_str()) {
+                stored.insert(g.clone());
                 *v = Val::Global(format!("{g}{suffix}"));
             }
         }
     }
     match inst {
-        Inst::Store(s) => rv(&mut s.val, shared, suffix),
+        Inst::Store(s) => rv(&mut s.val, shared, suffix, stored),
         Inst::Bin(b) => {
-            rv(&mut b.a, shared, suffix);
-            rv(&mut b.b, shared, suffix);
+            rv(&mut b.a, shared, suffix, stored);
+            rv(&mut b.b, shared, suffix, stored);
         }
-        Inst::Ret(Some((_, v)), _) => rv(v, shared, suffix),
-        Inst::Zext(z) => rv(&mut z.val, shared, suffix),
-        Inst::Sext(x) => rv(&mut x.val, shared, suffix),
-        Inst::Trunc(t) => rv(&mut t.val, shared, suffix),
-        Inst::IntToPtr(p) => rv(&mut p.val, shared, suffix),
+        Inst::Ret(Some((_, v)), _) => rv(v, shared, suffix, stored),
+        Inst::Zext(z) => rv(&mut z.val, shared, suffix, stored),
+        Inst::Sext(x) => rv(&mut x.val, shared, suffix, stored),
+        Inst::Trunc(t) => rv(&mut t.val, shared, suffix, stored),
+        Inst::IntToPtr(p) => rv(&mut p.val, shared, suffix, stored),
         Inst::Icmp(i) => {
-            rv(&mut i.a, shared, suffix);
-            rv(&mut i.b, shared, suffix);
+            rv(&mut i.a, shared, suffix, stored);
+            rv(&mut i.b, shared, suffix, stored);
         }
         Inst::Select(s) => {
-            rv(&mut s.cond, shared, suffix);
-            rv(&mut s.a, shared, suffix);
-            rv(&mut s.b, shared, suffix);
+            rv(&mut s.cond, shared, suffix, stored);
+            rv(&mut s.a, shared, suffix, stored);
+            rv(&mut s.b, shared, suffix, stored);
         }
         Inst::Call(c) => {
             for arg in &mut c.args {
-                rv(&mut arg.val, shared, suffix);
+                rv(&mut arg.val, shared, suffix, stored);
             }
         }
         Inst::Phi(p) => {
             for (v, _) in &mut p.incoming {
-                rv(v, shared, suffix);
+                rv(v, shared, suffix, stored);
             }
         }
         Inst::Memcpy(mc) => {
-            rv(&mut mc.dst, shared, suffix);
-            rv(&mut mc.src, shared, suffix);
+            rv(&mut mc.dst, shared, suffix, stored);
+            rv(&mut mc.src, shared, suffix, stored);
             if let MemLen::Reg(v) = &mut mc.len {
-                rv(v, shared, suffix);
+                rv(v, shared, suffix, stored);
             }
         }
-        Inst::Freeze(fr) => rv(&mut fr.val, shared, suffix),
+        Inst::Freeze(fr) => rv(&mut fr.val, shared, suffix, stored),
         Inst::FloatBin(fb) => {
-            rv(&mut fb.a, shared, suffix);
-            rv(&mut fb.b, shared, suffix);
+            rv(&mut fb.a, shared, suffix, stored);
+            rv(&mut fb.b, shared, suffix, stored);
         }
         Inst::Fcmp(fc) => {
-            rv(&mut fc.a, shared, suffix);
-            rv(&mut fc.b, shared, suffix);
+            rv(&mut fc.a, shared, suffix, stored);
+            rv(&mut fc.b, shared, suffix, stored);
         }
-        Inst::FloatConv(fc) => rv(&mut fc.val, shared, suffix),
+        Inst::FloatConv(fc) => rv(&mut fc.val, shared, suffix, stored),
         _ => {}
     }
 }

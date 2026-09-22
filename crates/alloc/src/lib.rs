@@ -1074,10 +1074,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             // depth sum when no local crosses a bank gap and is strictly larger
             // (hence safer) when an i16 at a region tail leaves a hole.
 
-            // The loop above is exact for every non-ISR context (no ISR-side
-            // function is reachable from them), so the disjoint base derives
-            // from its results; each ISR context is then re-derived from that
-            // base in topo order.
+            // The loop above is exact for every non-ISR context (a main-side
+            // function can reach an ISR-context copy only through a dispatch
+            // on a shared-storage callback address, whose frame the ISR
+            // region then absorbs via the max over the reachable sets), so
+            // the disjoint base derives from its results; each ISR context is
+            // then re-derived from that base in topo order.
 
             // Set inside the ISR-region block below: `Some` only in priority mode.
             let mut isr_low_save: Option<u16> = None;

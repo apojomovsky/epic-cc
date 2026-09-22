@@ -1,20 +1,17 @@
 //! epic-cc#568: a callback stored into a storage global that BOTH contexts
-//! dispatch through (the HAL `g_usart->RxCpltCallback(data)` shape, where a
-//! param-source struct copy carries the handle into `g_usart`) must appear
-//! in every dispatching context's candidate list as the value the store
-//! rewrite actually put there. The store rewrite (#137) puts the ISR
-//! priority's copy into the shared storage, so MAIN's dispatch sites must
-//! list the copy; filtering it out empties the site and isel lowers an
-//! empty candidate list to a trap loop.
-//!
-//! Asserted over the full vendored `hal-pic18-menu-demo` fixture through
-//! `merge` + `legalize` in-process, for BOTH contexts' dispatchers, so a
-//! single-knob change (classifying without keeping the other context's
-//! list sound) fails loudly instead of trading one context's dispatch for
-//! the other's.
+//! dispatch through must appear in every dispatching context's candidate
+//! list as the value the store rewrite (#137) put there. Filtering the copy
+//! out of the main-context sites empties them, and isel lowers an empty
+//! candidate list to a trap loop. Asserted over the full vendored
+//! `hal-pic18-menu-demo` fixture through `merge` + `legalize` in-process,
+//! for BOTH contexts' dispatchers, so a single-knob change (sounding one
+//! context's list by breaking the other's) fails loudly.
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static LL_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 /// Compile the fixture to LLVM IR with the real binary, then run
 /// merge + legalize in-process and return the module.
@@ -53,7 +50,11 @@ fn legalized_module() -> ir::Module {
         "epic-menu-demo/tests/sim_menu_demo.c",
         "config_18F4550.c",
     ];
-    let ll_path = std::env::temp_dir().join(format!("cb_dispatch_568_{}.ll", std::process::id()));
+    // Unique per invocation: cargo runs this binary's tests on parallel
+    // threads in one process, and each spawns its own epic-cc compile.
+    let seq = LL_SEQ.fetch_add(1, Ordering::SeqCst);
+    let ll_path =
+        std::env::temp_dir().join(format!("cb_dispatch_568_{}_{seq}.ll", std::process::id()));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
     cmd.arg("--target").arg("18F4550").arg("--emit").arg("ll");
     for d in includes {
