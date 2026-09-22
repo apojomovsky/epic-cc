@@ -80,13 +80,18 @@ fn add_const_lhs_uses_addlw() {
     );
 }
 
+// epic-cc#465 retired the i1 assertion this test used to pin. The i1 load
+// now lowers through the same one-byte path as i8, so what was a panic is a
+// plain global read: `in` at its map address, into %1's slot.
 #[test]
-#[should_panic(expected = "only i8/i16 loads supported")]
-fn panics_on_i1_load() {
+fn i1_load_lowers_through_the_byte_path_instead_of_panicking() {
     let m = parse(
-        "global in i8\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    ret void\n",
+        "global in i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    ret void\n",
     );
-    select(&PIC16F877A, &m, &HashMap::new());
+    let addrs = addrs(&[("in", 0x20), ("main::1", 0x25)]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("MOVF 0x20, W"), "one-byte read of in:\n{asm}");
+    assert!(asm.contains("MOVWF 0x25"), "byte lands in %1:\n{asm}");
 }
 
 #[test]
@@ -9046,4 +9051,42 @@ fn chunked_table_ram_ref_uses_absolute_offsets() {
     );
     let words = asm::assemble(&asm);
     assert!(!words.is_empty(), "chunked table must assemble");
+}
+
+// clang's own -O1 GlobalOpt narrows an internal flag only ever written 0/1
+// down to `global i1` (epic-cc#462), so i1 reaches isel as a memory type and
+// must lower exactly like the one-byte i8 path. Mirrors the PIC18 tests
+// epic-cc#464 added (epic-cc#465).
+#[test]
+fn load_and_store_i1_use_the_byte_path() {
+    let m = parse("global in i1\nglobal out i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    store i1 %1 @out\n    ret void\n");
+    let addrs = addrs(&[("in", 0x20), ("out", 0x21), ("main::1", 0x25)]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("MOVF 0x20, W"), "one-byte load of in:\n{asm}");
+    assert!(
+        asm.contains("MOVWF 0x25"),
+        "the loaded byte lands in %1's slot:\n{asm}"
+    );
+    assert!(asm.contains("MOVWF 0x21"), "one-byte store to out:\n{asm}");
+}
+
+#[test]
+fn store_an_i1_constant_writes_the_byte_value() {
+    let m = parse(
+        "global out i1\nfn main(void) ()\n  block entry:\n    store i1 1 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[("out", 0x21)]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("MOVLW 0x01"), "asm:\n{asm}");
+    assert!(asm.contains("MOVWF 0x21"), "asm:\n{asm}");
+}
+
+// The literal-pointer (SFR) branch writes the raw byte with no masking, so
+// pin it for i1 too: one byte is the whole store.
+#[test]
+fn store_an_i1_through_a_literal_pointer_writes_the_sfr() {
+    let m = parse("fn main(void) ()\n  block entry:\n    store i1 1 0x01\n    ret void\n");
+    let asm = select(&PIC16F877A, &m, &addrs(&[]));
+    assert!(asm.contains("MOVLW 0x01"), "asm:\n{asm}");
+    assert!(asm.contains("MOVWF 0x01"), "asm:\n{asm}");
 }
