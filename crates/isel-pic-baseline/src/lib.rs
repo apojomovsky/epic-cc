@@ -3467,9 +3467,25 @@ pub fn select_with_locs(
         if addrs.contains_key(&g.name) && g.needs_ram_init() {
             let base = addrs[&g.name];
             for (i, b) in g.bytes.iter().enumerate() {
+                // A ref byte is one half of a pointer VALUE: a RAM
+                // target resolves through `addrs` right here (RAM
+                // globals have no assembler label, epic-cc#452); a
+                // flash target keeps its link-time label literal.
                 if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                    let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                    init.push(format!("    MOVLW {lit}({f})"));
+                    match addrs.get(f) {
+                        Some(&a) => {
+                            let byte = if i % 2 == 0 {
+                                a & 0xFF
+                            } else {
+                                (a >> 8) & 0xFF
+                            };
+                            init.push(format!("    MOVLW 0x{byte:02X}"));
+                        }
+                        None => {
+                            let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                            init.push(format!("    MOVLW {lit}({f})"));
+                        }
+                    }
                 } else {
                     init.push(format!("    MOVLW 0x{b:02X}"));
                 }
@@ -3654,12 +3670,25 @@ pub fn select_with_locs(
         out.push(format!("{name}:"));
         locs.push(None);
         for (i, b) in g.bytes.iter().enumerate() {
-            // A function-address field materializes the link-time label
-            // literal, mirroring classic isel: byte 0 = LOW(fn), byte 1 =
-            // HIGH(fn), resolved by the assembler's symbol table.
+            // A ref byte is one half of a pointer VALUE: a RAM target
+            // resolves through `addrs` right here (RAM globals have no
+            // assembler label, epic-cc#452); a flash target (function or
+            // const table) keeps its link-time label literal.
             if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                out.push(format!("    RETLW {lit}({f})"));
+                match addrs.get(f) {
+                    Some(&a) => {
+                        let byte = if i % 2 == 0 {
+                            a & 0xFF
+                        } else {
+                            (a >> 8) & 0xFF
+                        };
+                        out.push(format!("    RETLW 0x{byte:02X}"));
+                    }
+                    None => {
+                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        out.push(format!("    RETLW {lit}({f})"));
+                    }
+                }
             } else {
                 out.push(format!("    RETLW 0x{b:02X}"));
             }

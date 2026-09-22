@@ -848,3 +848,31 @@ fn banked2_c_selects_upper_banks_and_runs_correctly() {
     );
     assert!(p.halted());
 }
+/// epic-cc#452: a `static const` struct whose pointer field holds a RAM
+/// global's ADDRESS (the register-map shape). The table's refs name a
+/// RAM global, which has no assembler label: the bytes must be the
+/// alloc-time address, not LOW()/HIGH() label literals (the assembler
+/// panics on those). Mirrors the pic18 #443 test, including its
+/// restraint: the sim runs to halt, but the runtime value is unclaimed,
+/// const-table reads ride on the separately-filed #454 hole.
+#[test]
+fn const_ramref_struct_materializes_the_alloc_address() {
+    let _guard = E2E_LOCK.lock();
+    let (mut p, _globals, asm) = compile_asm("tests/fixtures/const_ramref_struct.c");
+    assert!(
+        !asm.contains("LOW(holding_regs)") && !asm.contains("HIGH(holding_regs)"),
+        "a RAM global has no label to resolve:\n{asm}"
+    );
+    let table = asm.split("\nmap:\n").nth(1).expect("map table label");
+    let table = table.split("\n    end").next().expect("table before end");
+    assert!(
+        !table.contains("LOW(") && !table.contains("HIGH("),
+        "table bytes must be numeric:\n{asm}"
+    );
+    assert!(
+        table.matches("RETLW 0x").count() >= 3,
+        "two address bytes plus the count byte:\n{asm}"
+    );
+    p.run(10_000);
+    assert!(p.halted());
+}
