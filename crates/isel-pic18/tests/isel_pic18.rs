@@ -2483,6 +2483,68 @@ fn a_short_copy_run_stays_straight_line() {
 }
 
 #[test]
+fn a_five_byte_copy_run_stays_straight_line() {
+    // At 5 bytes the loop would win one word (9 vs 10) while running
+    // roughly 3x slower per byte, so the floor keeps it straight:
+    // five MOVFFs, no POSTINC loop (epic-cc#577).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 5\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    for i in 0..5u16 {
+        let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
+        let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
+        assert!(
+            asm.contains(&expect) || asm.contains(&expect_nospace),
+            "byte {i} missing:\n{asm}"
+        );
+    }
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "no POSTINC loop at the 5-byte floor:\n{asm}"
+    );
+}
+
+#[test]
+fn a_six_byte_copy_run_becomes_a_postinc_loop() {
+    // At 6 bytes the loop wins three words (9 vs 12): the smallest run
+    // the drain loops (epic-cc#577).
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 6\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("src", 0x100), ("dst", 0x110)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("LFSR 0, 0x100"), "source seed missing:\n{asm}");
+    assert!(
+        asm.contains("LFSR 1, 0x110"),
+        "destination seed missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVLW 0x06"),
+        "the 6-byte count is missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the POSTINC0 -> POSTINC1 body is missing:\n{asm}"
+    );
+    assert!(
+        !(asm.contains("MOVFF 0x100, 0x110") || asm.contains("MOVFF 0x100,0x110")),
+        "the loop replaces the run, straight copies must not coexist:\n{asm}"
+    );
+}
+
+#[test]
 fn a_loop_runs_even_with_an_isr_reachable_fsr1_seeder() {
     // #486 gated the copy loop on "no ISR-reachable function seeds FSR1",
     // because FSR1 was outside the ISR save area (ADR-013). epic-cc#477
