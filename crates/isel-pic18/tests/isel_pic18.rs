@@ -4169,6 +4169,90 @@ fn sext_i1_to_i8_zero_fills_not_sign_fills() {
     );
 }
 
+#[test]
+fn sext_i1_to_i16_widening_zero_fills_the_high_byte() {
+    // An i1 holds exactly 0/1, so widening zero-fills the high bytes
+    // (one CLRF each, not the sign fill): sim-gated over both icmp
+    // outcomes, with the CLRF pinned in text.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp eq i8 %1, %2\n    %4 = sext i1 %3 to i16\n    store i16 %4 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x10),
+        ("b", 0x11),
+        ("out", 0x12),
+        ("main::1", 0x14),
+        ("main::2", 0x15),
+        ("main::3", 0x16),
+        ("main::4", 0x17),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF"),
+        "i1 widening must clear high bytes with CLRF:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (av, bv, expect_lo) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = av;
+        p.ram_mut()[0x11] = bv;
+        p.run(200);
+        assert_eq!(p.ram()[0x12], expect_lo, "sext(icmp eq({av},{bv})) lo");
+        assert_eq!(p.ram()[0x13], 0x00, "sext(icmp eq({av},{bv})) hi");
+    }
+}
+
+#[test]
+fn widening_zext_between_compare_and_branch_keeps_the_branch_sound() {
+    // A widening cast scheduled between a compare and its consuming
+    // branch: the high-byte fill emits CLRF, which sets Z, after the
+    // compare's flag-setting sequence and before the branch. The branch
+    // stays sound because `BrCond` reloads the condition with `MOVF`
+    // (which sets Z fresh) immediately before `BZ`, so it never
+    // observes the fill's Z. Each arm stores a distinguishable value
+    // so a wrong-target branch fails, not just a non-halting one.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal w i8\nglobal out i8\nglobal wide i16\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n    %3 = icmp eq i8 %1, %2\n    %4 = load i8 @w\n    %5 = zext i8 %4 to i16\n    store i16 %5 @wide\n    br i1 %3 t f\n  block t:\n    store i8 1 @out\n    ret void\n  block f:\n    store i8 2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x10),
+        ("b", 0x11),
+        ("w", 0x12),
+        ("out", 0x13),
+        ("wide", 0x14),
+        ("main::1", 0x16),
+        ("main::2", 0x17),
+        ("main::3", 0x18),
+        ("main::4", 0x19),
+        ("main::5", 0x1A),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("CLRF"),
+        "the interleaved widening zext must emit a CLRF fill:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVLW 0x00"),
+        "the widening fill must not keep the stale two-word shape:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 2)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x10] = av;
+        p.ram_mut()[0x11] = bv;
+        p.ram_mut()[0x12] = 0x5A;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(
+            p.ram()[0x13],
+            expect,
+            "br on icmp eq({av},{bv}) took the wrong target"
+        );
+        assert_eq!(p.ram()[0x14], 0x5A, "zext low byte");
+        assert_eq!(p.ram()[0x15], 0x00, "zext high byte");
+    }
+}
+
 /// Priority wiring (epic-cc#346): a high/low pair emits GOTO stubs at
 /// both vectors (the bodies cannot share one vector entry), the high
 /// ISR on the fixed save block, and the low ISR on its own save area.

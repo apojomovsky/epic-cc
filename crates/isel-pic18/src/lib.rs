@@ -2599,11 +2599,12 @@ impl<'m> Gen<'m> {
                 for i in 0..z.from.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
                 }
+                // A zero high byte needs no W staging: one CLRF word
+                // where the pair costs two. CLRF sets Z, which is dead
+                // here: this lowering reads no flags, and every lowering
+                // sets its own flags before reading them.
                 for i in z.from.bytes()..z.to.bytes() {
-                    self.emit("    MOVLW 0x00".to_string());
-                    let (a, f) = self.operand(dst + u16::from(i));
-                    let bank = if a == 0 { "A" } else { "B" };
-                    self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    self.emit_banked("CLRF", dst + u16::from(i), "");
                 }
             }
             Inst::IntToPtr(p) => {
@@ -2702,12 +2703,12 @@ impl<'m> Gen<'m> {
                 for i in 0..s.from.bytes() {
                     self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
                 }
+                // An i1 holds exactly 0/1, so widening zero-fills the
+                // high bytes: one CLRF word each, same Z-dead argument
+                // as the `Zext` fill above.
                 if s.from == Ty::I1 && s.to.bytes() > s.from.bytes() {
                     for i in s.from.bytes()..s.to.bytes() {
-                        self.emit("    MOVLW 0x00".to_string());
-                        let (a, f) = self.operand(dst + u16::from(i));
-                        let bank = if a == 0 { "A" } else { "B" };
-                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                        self.emit_banked("CLRF", dst + u16::from(i), "");
                     }
                     // the i1 widening already zero-filled: skip the
                     // sign-fill loop below
