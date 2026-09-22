@@ -83,6 +83,38 @@ fn dense_switch_still_chains_by_default() {
 }
 
 #[test]
+fn dense_run_with_sparse_tail_splits_table_from_chain() {
+    // epic-cc#578: cases 0..5 form a dense run of six under the far 200
+    // outlier (the bench-switch shape). The run is preserved as a
+    // `Switch` whose default feeds a fresh block chaining the leftover,
+    // instead of one outlier dragging the whole dispatch onto the chain.
+    let mixed = DENSE_LL.replace("    i8 6, label %9", "    i8 200, label %9");
+    let m = parse_ll_opts(&mixed, true);
+    let dispatch = m.funcs.iter().find(|f| f.name == "dispatch").unwrap();
+    let sw = dispatch.blocks[0]
+        .insts
+        .last()
+        .expect("switch is the entry block's terminator");
+    match sw {
+        Inst::Switch(s) => {
+            assert_eq!(s.cases.len(), 6);
+            assert_eq!(s.cases[0], (0, "3".to_string()));
+            assert_eq!(s.cases[5], (5, "8".to_string()));
+            assert_ne!(
+                s.default, "10",
+                "the run default must chain the leftover first"
+            );
+        }
+        other => panic!("expected a preserved Switch run, got {other:?}"),
+    }
+    // The leftover 200 case chains behind the run default.
+    assert!(dispatch
+        .blocks
+        .iter()
+        .any(|b| b.insts.iter().any(|i| matches!(i, Inst::BrCond(_)))));
+}
+
+#[test]
 fn sparse_switch_chains_even_when_asked() {
     // Cases 0,1,9: gapped, so the table would jump wild; irparse must
     // keep the chain expansion regardless of the flag.

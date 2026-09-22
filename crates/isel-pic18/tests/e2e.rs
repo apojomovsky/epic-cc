@@ -1074,6 +1074,51 @@ fn switch_dense_table_runs_correctly() {
 }
 
 #[test]
+fn switch_sparse_tail_tables_the_run_and_chains_the_tail() {
+    // epic-cc#578: a dense 0..5 run under a sparse 200 tail lowers to
+    // one PCL table for the run plus a compare chain behind the table
+    // default. The run drives every table entry, the holes around the
+    // tail, the sparse hit, and the far default through the simulator,
+    // so a wrong entry, bound, offset, or residual compare fails a byte
+    // assertion below.
+    let (mut p, globals, asm) = compile_with_asm(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/switch_sparse_tail.c"
+    ));
+    assert!(
+        asm.contains("ADDWF 0xFF9,F,A"),
+        "expected a PCL computed-jump dispatch:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches(".pcltbl").count(),
+        1,
+        "one page-checked table for the dense run:\n{asm}"
+    );
+    p.run(2_000_000);
+    // h0..h5 on 0..5, default 99 on the holes and far values, hs on 200.
+    let expect: [u8; 12] = [10, 3, 88, 103, 196, 12, 99, 99, 99, 146, 99, 99];
+    let keys: [u8; 12] = [0, 1, 2, 3, 4, 5, 6, 100, 199, 200, 201, 255];
+    for (i, want) in expect.iter().enumerate() {
+        assert_eq!(
+            p.ram()[globals["results"] as usize + i],
+            *want,
+            "dispatch({}) into results[{i}]",
+            keys[i]
+        );
+    }
+    let markers: [u8; 12] = [1, 2, 3, 4, 5, 6, 8, 8, 8, 7, 8, 8];
+    for (i, want) in markers.iter().enumerate() {
+        assert_eq!(
+            p.ram()[globals["markers"] as usize + i],
+            *want,
+            "dispatch({})'s second store into markers[{i}]",
+            keys[i]
+        );
+    }
+    assert!(p.halted());
+}
+
+#[test]
 fn routine_frame_straddling_a_bsr_bank_is_snapped_and_runs() {
     // epic-cc#509: PIC18's `operand()` banks on the 256-byte BSR boundary,
     // but every PIC18 device declares its whole RAM as one `ram_banks`

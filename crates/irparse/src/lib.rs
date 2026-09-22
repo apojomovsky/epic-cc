@@ -1278,6 +1278,33 @@ fn dense_contiguous(cases: &[(Ty, Val, String)]) -> bool {
     ks.windows(2).all(|w| w[1] == w[0] + 1)
 }
 
+/// Longest dense-contiguous run in a case list, as `(start, len)` into
+/// the value-sorted order. `None` when no run reaches six cases, the
+/// count where a dispatch table beats the compare chain.
+fn longest_dense_run(cases: &[(Ty, Val, String)], switch_text: &str) -> Option<(usize, usize)> {
+    let mut ks: Vec<i64> = cases
+        .iter()
+        .map(|(_, v, _)| match v {
+            Val::Const(k) => *k,
+            other => panic!("irparse: non-constant switch case {other:?} in {switch_text:?}"),
+        })
+        .collect();
+    ks.sort_unstable();
+    let mut best: Option<(usize, usize)> = None;
+    let mut start = 0;
+    for i in 1..=ks.len() {
+        if i < ks.len() && ks[i] == ks[i - 1] + 1 {
+            continue;
+        }
+        let len = i - start;
+        if len >= 6 && best.map_or(true, |(_, b)| len > b) {
+            best = Some((start, len));
+        }
+        start = i;
+    }
+    best
+}
+
 /// Lower an LLVM `switch` terminator text into a chain of `icmp eq` +
 /// `brcond` blocks. `switch_text` is the full `switch ... [ ... ]` line(s)
 /// flattened into one string (the aggregator ensures the closing `]` is
@@ -1402,6 +1429,49 @@ fn lower_switch(
             loc: loc.clone(),
         }));
         return;
+    }
+    // A sparse list can still hide a dense run long enough to table
+    // (bench-switch's 0..5 under the far 200 outlier): preserve the
+    // longest such run as a `Switch` whose default feeds a fresh block
+    // chaining the leftovers, so one outlier stops dragging the whole
+    // dispatch onto the compare chain. The backend cost gate still
+    // decides table versus chain for the run itself.
+    if preserve_dense && cond_ty.bytes() <= 2 && cases.len() > 6 {
+        if let Some((start, len)) = longest_dense_run(&cases, switch_text) {
+            let mut pairs: Vec<(i64, String)> = cases
+                .iter()
+                .map(|(_, v, l)| match v {
+                    Val::Const(k) => (*k, l.clone()),
+                    other => {
+                        panic!("irparse: non-constant switch case {other:?} in {switch_text:?}")
+                    }
+                })
+                .collect();
+            pairs.sort_by_key(|(k, _)| *k);
+            let run: Vec<(i64, String)> = pairs[start..start + len].to_vec();
+            let residual = fresh.switch_label();
+            blocks.last_mut().unwrap().insts.push(Inst::Switch(Switch {
+                val: cond_val.clone(),
+                ty: cond_ty,
+                default: residual.clone(),
+                cases: run.clone(),
+                loc: loc.clone(),
+            }));
+            blocks.push(Block {
+                label: residual,
+                insts: Vec::new(),
+            });
+            let keys: Vec<i64> = run.iter().map(|(k, _)| *k).collect();
+            cases = cases
+                .into_iter()
+                .filter(|(_, v, _)| match v {
+                    Val::Const(k) => !keys.contains(k),
+                    other => {
+                        panic!("irparse: non-constant switch case {other:?} in {switch_text:?}")
+                    }
+                })
+                .collect();
+        }
     }
     let n = cases.len();
     let mut cur_idx = blocks.len() - 1;
@@ -2142,8 +2212,10 @@ pub fn parse_ll(src: &str) -> Module {
 
 /// `parse_ll` with backend-driven switch preservation: a target whose
 /// backend has table lowering (PIC18) keeps dense-contiguous switches
-/// as `Switch` terminators; every other switch, and every other target,
-/// keeps the compare-chain expansion.
+/// as `Switch` terminators, and preserves a sparse switch's longest
+/// dense run (six cases or more) the same way with the leftovers
+/// chained behind its default; every other switch, and every other
+/// target, keeps the compare-chain expansion.
 pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
     let types = build_struct_table(src);
     let mut fresh = Fresh::new(src);
