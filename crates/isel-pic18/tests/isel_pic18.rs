@@ -434,6 +434,99 @@ fn const_lshr_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
 }
 
 #[test]
+fn const_shl_i8_by_5_6_7_extend_the_nibble_form() {
+    // epic-cc#573: the single-lane nibble form plus one BCF-seeded RLCF
+    // per extra bit, 5/7/9 words against the 10/12/14-word unroll. Same
+    // two layouts as the amount-4 test, simulated over the byte domain
+    // with hostile entry W (the construction clobbers W).
+    for r in [5, 6, 7] {
+        for dst in [0x23, 0x1FF] {
+            let m = parse(&format!(
+                "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+                 %1 = load i8 @a\n    %2 = shl i8 %1, {r}\n    store i8 %2 @out\n    ret void\n",
+            ));
+            let addrs = addrs(&[
+                ("a", 0x20),
+                ("out", 0x21),
+                ("main::1", 0x22),
+                ("main::2", dst),
+            ]);
+            let asm = select(&PIC18F4550, &m, &addrs, None);
+            assert_eq!(asm.matches("SWAPF").count(), 1, "one nibble swap:\n{asm}");
+            assert_eq!(
+                asm.matches("RLCF").count(),
+                (r - 4) as usize,
+                "one rotate per extra bit:\n{asm}"
+            );
+            assert_eq!(
+                asm.matches("BCF 0xFD8,0,A").count(),
+                (r - 4) as usize,
+                "one carry seed per extra bit:\n{asm}"
+            );
+            let words = asm::assemble_pic18(&asm);
+            for b in 0..=u8::MAX {
+                let mut p = pic14_sim::Pic18::new(words.clone());
+                p.ram_mut()[0x20] = b;
+                p.set_w(!b);
+                p.run(200);
+                assert_eq!(
+                    p.ram()[0x21],
+                    b.wrapping_shl(r as u32),
+                    "a={b:#04x} << {r} (dst={dst:#06x})"
+                );
+                assert!(p.halted(), "program must run to completion (a={b:#04x})");
+            }
+        }
+    }
+}
+
+#[test]
+fn const_lshr_i8_by_5_6_7_extend_the_nibble_form() {
+    // Mirror of the left test: nibble down-shift plus one BCF-seeded
+    // RRCF per extra bit. Covers the EPIC_IRQ_GetFlag situs (>>5/>>6
+    // on one byte) at i8 directly.
+    for r in [5, 6, 7] {
+        for dst in [0x21, 0x1FF] {
+            let m = parse(&format!(
+                "global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n\
+                 %1 = load i8 @a\n    %2 = lshr i8 %1, {r}\n    store i8 %2 @out\n    ret void\n",
+            ));
+            let addrs = addrs(&[
+                ("a", 0x20),
+                ("out", 0x21),
+                ("main::1", 0x22),
+                ("main::2", dst),
+            ]);
+            let asm = select(&PIC18F4550, &m, &addrs, None);
+            assert_eq!(asm.matches("SWAPF").count(), 1, "one nibble swap:\n{asm}");
+            assert_eq!(
+                asm.matches("RRCF").count(),
+                (r - 4) as usize,
+                "one rotate per extra bit:\n{asm}"
+            );
+            assert_eq!(
+                asm.matches("BCF 0xFD8,0,A").count(),
+                (r - 4) as usize,
+                "one carry seed per extra bit:\n{asm}"
+            );
+            let words = asm::assemble_pic18(&asm);
+            for b in 0..=u8::MAX {
+                let mut p = pic14_sim::Pic18::new(words.clone());
+                p.ram_mut()[0x20] = b;
+                p.set_w(!b);
+                p.run(200);
+                assert_eq!(
+                    p.ram()[0x21],
+                    b.wrapping_shr(r as u32),
+                    "a={b:#04x} >> {r} (dst={dst:#06x})"
+                );
+                assert!(p.halted(), "program must run to completion (a={b:#04x})");
+            }
+        }
+    }
+}
+
+#[test]
 fn const_lshr_i32_by_28_rotates_only_the_surviving_lane() {
     // Mirror of const_shl_i32_by_28: k = 28 -> m = 3 byte moves plus r = 4
     // residual. For a right shift the surviving lane is dst[0] (not the top
@@ -625,6 +718,97 @@ fn const_shl_i32_by_28_rotates_only_the_surviving_lane() {
                 | u32::from(!b) << 16
                 | u32::from(b.rotate_left(3)) << 24;
             assert_eq!(got, x << 28, "a={x:#010x} << 28 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
+    }
+}
+
+#[test]
+fn const_shl_i32_by_30_rotates_only_the_surviving_lane() {
+    // epic-cc#573: k = 30 -> m = 3 byte moves plus r = 6 residual over the
+    // single surviving lane (nibble plus two seeded rotates, 7 words
+    // against the 12-word unroll). Same derived patterns as the by-28
+    // test; dst at 0x0FD puts the lane in a fresh bank.
+    for dst in [0x30, 0x0FD] {
+        let m = parse(
+            "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+             %1 = load i32 @a\n    %2 = shl i32 %1, 30\n    store i32 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x40),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("SWAPF").count(), 1, "one nibble swap:\n{asm}");
+        assert_eq!(
+            asm.matches("RLCF").count(),
+            2,
+            "two residual rotates:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = b;
+            p.ram_mut()[0x21] = b ^ 0x5A;
+            p.ram_mut()[0x22] = !b;
+            p.ram_mut()[0x23] = b.rotate_left(3);
+            p.set_w(b);
+            p.run(300);
+            let got = u32::from(p.ram()[0x24])
+                | u32::from(p.ram()[0x25]) << 8
+                | u32::from(p.ram()[0x26]) << 16
+                | u32::from(p.ram()[0x27]) << 24;
+            let x = u32::from(b)
+                | u32::from(b ^ 0x5A) << 8
+                | u32::from(!b) << 16
+                | u32::from(b.rotate_left(3)) << 24;
+            assert_eq!(got, x << 30, "a={x:#010x} << 30 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
+    }
+}
+
+#[test]
+fn const_lshr_i32_by_30_rotates_only_the_surviving_lane() {
+    // Mirror of the left test: k = 30 -> m = 3 plus r = 6 over dst[0].
+    for dst in [0x30, 0x0FD] {
+        let m = parse(
+            "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+             %1 = load i32 @a\n    %2 = lshr i32 %1, 30\n    store i32 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x40),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("SWAPF").count(), 1, "one nibble swap:\n{asm}");
+        assert_eq!(
+            asm.matches("RRCF").count(),
+            2,
+            "two residual rotates:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            p.ram_mut()[0x20] = b;
+            p.ram_mut()[0x21] = b ^ 0x5A;
+            p.ram_mut()[0x22] = !b;
+            p.ram_mut()[0x23] = b.rotate_left(3);
+            p.set_w(b);
+            p.run(300);
+            let got = u32::from(p.ram()[0x24])
+                | u32::from(p.ram()[0x25]) << 8
+                | u32::from(p.ram()[0x26]) << 16
+                | u32::from(p.ram()[0x27]) << 24;
+            let x = u32::from(b)
+                | u32::from(b ^ 0x5A) << 8
+                | u32::from(!b) << 16
+                | u32::from(b.rotate_left(3)) << 24;
+            assert_eq!(got, x >> 30, "a={x:#010x} >> 30 (dst={dst:#06x})");
             assert!(p.halted(), "program must run to completion (a={b:#04x})");
         }
     }

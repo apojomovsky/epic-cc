@@ -424,6 +424,54 @@ asserted. The search bound at this width is hopeless
 rate), so no exhaustive answer is claimed for 4 lanes: the result is
 "this construction loses", not "nothing shorter exists".
 
+## Target 4: the shift-chain residual (epic-cc#573)
+
+Two questions: (a) fuse the 32-bit nibble-plus-bit pass at amounts 4-5
+so it stops losing by one word; (b) anything the density profiler still
+attributes to shift-chain on the menu demo or the benches.
+
+**(a) Fusion loses, twice over.** The rotate-plus-recombine family
+extended down to amounts 4-5 verifies over the swept domain
+(`crates/superopt/tests/shift_32bit.rs`) at 33 and 29 words against
+unrolls of 20 and 25, worse than the dedicated nibble forms (21 and 26)
+it would replace. The fused rotation phase alone costs `4 * (8 - r)`
+words (16 at amount 4, 12 at amount 5), and the two passes sweep
+opposite directions (combine high-to-low so no lane reads an
+overwritten neighbour, bit pass low-to-high so carry propagates up)
+with no shared subexpression, so interleaving cannot undercut the
+concatenation either. The amount-4/5 unroll pins stay. Writing these
+tests caught one real derivation slip first: an `0xF8`/`0x07` mask pair
+at amount 5 (the top-`r`-bits reading of the family prose) that
+`verify()` rejected; the correct windows are the nonzero ones, `0xE0`
+for the own part and `0x1F` for the cross part.
+
+**(b) One residual was real: single-lane amounts 5-7.** The menu demo
+carries 182 shift-chain words. Most are settled ground: single-lane
+amounts 1-3, the 16-bit amount-2/3 unrolls, one 16-bit shift by 3, and
+the variable-count routine bodies, which are loops, not const shifts.
+`bench-shift` contributes 16 more, but clang folds both its statements
+(`<<4` then `>>2`, `<<6` then `>>4`) into shift-by-2 plus a mask, so
+those are settled amount-2 sites too. What is left is eight single-lane
+const shifts at amounts 5-7: five right shifts (`EPIC_IRQ_GetFlag` and
+its ISR copy extract bit fields `>>5`/`>>6` per switch arm, one `>>7`
+in `gpio4_send`) and one left shift (`<<6` in `menu_demo_init`), each
+unrolled at `2*r` words.
+
+The construction is the landed nibble form plus one carry-seeded
+rotate per extra bit, `3 + 2*(r-4)` words against `2*r` (5/7/9 against
+10/12/14), verified over the full 256-input byte domain crossed with
+entry `W` and `C` (`crates/superopt/tests/shift_single_567.rs`) and
+wired into `isel-pic18` for any width's single surviving lane, with the
+selector output re-simulated over the byte domain and over derived
+32-bit patterns for the byte-moved cases. Each extra rotate needs its
+own `BCF`: a lone lane takes carry from nowhere, so sharing one seed
+would shift the previous step's bit 7 into bit 0. W-only, under the
+established dead-`W` precondition. Amounts 2-3 are untouched per the
+ticket's exclusion (the amount-3 sites stay on the unroll, the amount-2
+sites tie either way), and `ashr` is untouched: the profile shows no
+const `ashr` sites. Menu demo listing drops 40 words on this change
+alone.
+
 ## Recommendation
 
 **Worth a follow-up integration ticket, scoped narrowly.** Target 2 in
