@@ -4231,6 +4231,10 @@ fn widening_zext_between_compare_and_branch_keeps_the_branch_sound() {
         asm.contains("CLRF"),
         "the interleaved widening zext must emit a CLRF fill:\n{asm}"
     );
+    assert!(
+        !asm.contains("MOVLW 0x00"),
+        "the widening fill must not keep the stale two-word shape:\n{asm}"
+    );
     let words = asm::assemble_pic18(&asm);
     for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 2)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
