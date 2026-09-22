@@ -27,8 +27,11 @@ same shape for about half that.
   per-edge copies. A constant switch value is a backend panic: fold
   it before isel.
 - Table shape: bounds check (with a low-bound reject for nonzero
-  bases), then W = 2 + 4*idx accumulated from the index slot with no
-  scratch byte, `PCLATH` set from `HIGH()` before the offset math so
+  bases), then W = 4*idx accumulated from the index slot with no
+  scratch byte -- PCL reads as the next instruction's address, which
+  is where the table starts, so no gap word exists (the earlier
+  `+2` re-entered the next case; epic-cc#484) -- `PCLATH` set from
+  `HIGH()` before the offset math so
   W stays live into `ADDWF PCL,F`. Entries are 2-word absolute
   GOTOs; values below a nonzero base get padding entries targeting
   the default edge. Edges carrying phi copies route through
