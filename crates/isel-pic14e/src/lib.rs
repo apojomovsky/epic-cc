@@ -5923,6 +5923,28 @@ fn window_align(base: usize, size: usize) -> usize {
     }
 }
 
+/// The operand for one const-init ref byte: the high or low half of a
+/// pointer VALUE. A RAM target resolves through `addrs` right here
+/// (RAM globals have no assembler label to resolve, epic-cc#451); a
+/// flash target (function or const table) keeps its link-time label
+/// literal (epic-cc#154). Mirrors isel's `ref_byte_operand`.
+fn ref_byte_operand(addrs: &HashMap<String, u16>, offset: usize, target: &str) -> String {
+    match addrs.get(target) {
+        Some(&a) => {
+            let byte = if offset % 2 == 0 {
+                a & 0xFF
+            } else {
+                (a >> 8) & 0xFF
+            };
+            format!("0x{byte:02X}")
+        }
+        None => {
+            let lit = if offset % 2 == 0 { "LOW" } else { "HIGH" };
+            format!("{lit}({target})")
+        }
+    }
+}
+
 /// Measures the final address after text with assembler pass-1 semantics.
 /// Stops at program end or the const section start.
 fn measure_end_org(text: &str) -> usize {
@@ -6059,27 +6081,8 @@ pub fn select_with_locs(
             if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    // A ref byte is the high or low half of a pointer
-                    // VALUE: a RAM target resolves through `addrs` right
-                    // here (RAM globals have no assembler label to
-                    // resolve, epic-cc#451); a flash target (function or
-                    // const table) keeps its link-time label literal
-                    // (epic-cc#154).
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        match addrs.get(f) {
-                            Some(&a) => {
-                                let byte = if i % 2 == 0 {
-                                    a & 0xFF
-                                } else {
-                                    (a >> 8) & 0xFF
-                                };
-                                init.push(format!("    MOVLW 0x{byte:02X}"));
-                            }
-                            None => {
-                                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                                init.push(format!("    MOVLW {lit}({f})"));
-                            }
-                        }
+                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f)));
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
@@ -6160,27 +6163,8 @@ pub fn select_with_locs(
             if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    // A ref byte is the high or low half of a pointer
-                    // VALUE: a RAM target resolves through `addrs` right
-                    // here (RAM globals have no assembler label to
-                    // resolve, epic-cc#451); a flash target (function or
-                    // const table) keeps its link-time label literal
-                    // (epic-cc#154).
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        match addrs.get(f) {
-                            Some(&a) => {
-                                let byte = if i % 2 == 0 {
-                                    a & 0xFF
-                                } else {
-                                    (a >> 8) & 0xFF
-                                };
-                                init.push(format!("    MOVLW 0x{byte:02X}"));
-                            }
-                            None => {
-                                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                                init.push(format!("    MOVLW {lit}({f})"));
-                            }
-                        }
+                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f)));
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
@@ -6209,27 +6193,8 @@ pub fn select_with_locs(
                 if addrs.contains_key(&g.name) && g.needs_ram_init() {
                     let base = addrs[&g.name];
                     for (idx, b) in g.bytes.iter().enumerate() {
-                        // A ref byte is the high or low half of a
-                        // pointer VALUE: a RAM target resolves through
-                        // `addrs` right here (RAM globals have no
-                        // assembler label to resolve, epic-cc#451); a
-                        // flash target (function or const table) keeps
-                        // its link-time label literal (epic-cc#154).
                         if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == idx) {
-                            match addrs.get(f) {
-                                Some(&a) => {
-                                    let byte = if idx % 2 == 0 {
-                                        a & 0xFF
-                                    } else {
-                                        (a >> 8) & 0xFF
-                                    };
-                                    init.push(format!("    MOVLW 0x{byte:02X}"));
-                                }
-                                None => {
-                                    let lit = if idx % 2 == 0 { "LOW" } else { "HIGH" };
-                                    init.push(format!("    MOVLW {lit}({f})"));
-                                }
-                            }
+                            init.push(format!("    MOVLW {}", ref_byte_operand(addrs, idx, f)));
                         } else {
                             init.push(format!("    MOVLW 0x{b:02X}"));
                         }
@@ -6613,26 +6578,8 @@ pub fn select_with_locs(
             out.push(format!("{}:", g.name));
             locs.push(None);
             for (i, b) in g.bytes[..256].iter().enumerate() {
-                // A ref byte is the high or low half of a pointer VALUE:
-                // a RAM target resolves through `addrs` right here (RAM
-                // globals have no assembler label to resolve,
-                // epic-cc#451); a flash target (function or const table)
-                // keeps its link-time label literal (epic-cc#154).
                 if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                    match addrs.get(f) {
-                        Some(&a) => {
-                            let byte = if i % 2 == 0 {
-                                a & 0xFF
-                            } else {
-                                (a >> 8) & 0xFF
-                            };
-                            out.push(format!("    RETLW 0x{byte:02X}"));
-                        }
-                        None => {
-                            let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                            out.push(format!("    RETLW {lit}({f})"));
-                        }
-                    }
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f)));
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }
@@ -6650,22 +6597,8 @@ pub fn select_with_locs(
                 locs.push(None);
                 for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
                     let abs = start + i;
-                    // Same ref rule as chunk 0 (epic-cc#451, epic-cc#154).
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == abs) {
-                        match addrs.get(f) {
-                            Some(&a) => {
-                                let byte = if abs % 2 == 0 {
-                                    a & 0xFF
-                                } else {
-                                    (a >> 8) & 0xFF
-                                };
-                                out.push(format!("    RETLW 0x{byte:02X}"));
-                            }
-                            None => {
-                                let lit = if abs % 2 == 0 { "LOW" } else { "HIGH" };
-                                out.push(format!("    RETLW {lit}({f})"));
-                            }
-                        }
+                        out.push(format!("    RETLW {}", ref_byte_operand(addrs, abs, f)));
                     } else {
                         out.push(format!("    RETLW 0x{b:02X}"));
                     }
@@ -6705,26 +6638,8 @@ pub fn select_with_locs(
             out.push(format!("{}:", g.name));
             locs.push(None);
             for (i, b) in g.bytes[..size].iter().enumerate() {
-                // A ref byte is the high or low half of a pointer VALUE:
-                // a RAM target resolves through `addrs` right here (RAM
-                // globals have no assembler label to resolve,
-                // epic-cc#451); a flash target (function or const table)
-                // keeps its link-time label literal (epic-cc#154).
                 if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                    match addrs.get(f) {
-                        Some(&a) => {
-                            let byte = if i % 2 == 0 {
-                                a & 0xFF
-                            } else {
-                                (a >> 8) & 0xFF
-                            };
-                            out.push(format!("    RETLW 0x{byte:02X}"));
-                        }
-                        None => {
-                            let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                            out.push(format!("    RETLW {lit}({f})"));
-                        }
-                    }
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f)));
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }
