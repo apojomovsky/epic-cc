@@ -6672,12 +6672,13 @@ pub fn select_with_locs(
                         // push the block onto the next page.
                         g.emit("    .pclalign".to_string());
                         // Bounds check, then `ADDWF PCL,F` into a table of
-                        // absolute 2-word GOTO entries (4 bytes each, so
-                        // the selector needs W = 2 + 4*idx: the +2 covers
-                        // the gap between the PCL write and the table
-                        // start). PCLATH names the table's page; the
-                        // `.pcltbl` marker makes the assembler assert
-                        // dispatch and the whole table share that page.
+                        // absolute 2-word GOTO entries (4 bytes each, so the
+                        // selector needs W = 4*idx). PCL reads as the address
+                        // of the next instruction, already one word past the
+                        // ADDWF where the table starts: a stray +2 lands
+                        // every case on its GOTO's second word and falls
+                        // into the next case (epic-cc#484). PCLATH names the
+                        // page; `.pcltbl` asserts one-page adjacency.
 
                         // Default-edge trampoline when the default edge
                         // carries phi copies; the bounds branches target
@@ -6721,15 +6722,18 @@ pub fn select_with_locs(
                         // touched BSR.
                         g.emit(format!("    MOVLW HIGH({l_tbl})"));
                         g.emit("    MOVWF 0xFFA,A".to_string()); // PCLATH
-                                                                 // W = 2 + 4*idx (the +2 covers the gap between the
-                                                                 // PCL write and the table start): three
-                                                                 // accumulations of the index plus the literal, no
-                                                                 // scratch byte, and no flag consumer follows.
+                                                                 // W = 4*idx: PCL reads as the
+                                                                 // address of the next
+                                                                 // instruction, which is where
+                                                                 // the table starts, so the
+                                                                 // index needs no gap word.
+                                                                 // Three accumulations of the
+                                                                 // index, no scratch byte, and
+                                                                 // no flag consumer follows.
                         g.emit_load_w(&sw.val, 0);
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
-                        g.emit("    ADDLW 0x02".to_string());
                         g.emit("    ADDWF 0xFF9,F,A".to_string()); // PCL: the jump
                         g.emit_label(&l_tbl);
                         let span = (base + n as i64) * 4;
