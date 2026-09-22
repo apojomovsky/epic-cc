@@ -1757,3 +1757,59 @@ fn duplicates_shared_runtime_routines_for_the_high_isr() {
     assert_eq!(call_targets(func("main", &m2)), ["__mul_u8"]);
     assert!(!func("__mul_u8_isr_high", &m2).isr);
 }
+
+/// A callback stored into a storage global both contexts dispatch through
+/// (the HAL `g_usart->RxCpltCallback(data)` shape with a polled main): the
+/// store rewrite puts the `_isr` copy in that shared storage, so MAIN's
+/// dispatch site must list the copy too; the strict per-context filter
+/// alone would empty the main site and lower it to a trap (epic-cc#568).
+#[test]
+fn main_site_lists_stored_copy_for_shared_dispatch_storage() {
+    let m = parse(
+        "global g_storage i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = gep @g_storage +2\n\
+             store i16 @cb %p\n\
+             %q = gep @g_storage +2\n\
+             %1 = load i16 %q\n\
+             call void @1()\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %r = gep @g_storage +2\n\
+             %2 = load i16 %r\n\
+             call void @2()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing: the shared-storage callback was not classified"
+    );
+    let sites = |fname: &str| {
+        m2.funcs
+            .iter()
+            .find(|f| f.name == fname)
+            .unwrap()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Call(c) if !c.callees.is_empty() => Some(c.callees.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sites("main"),
+        vec![vec!["cb_isr".to_string()]],
+        "main dispatches the shared storage, so its site must list the copy"
+    );
+    assert_eq!(
+        sites("isr"),
+        vec![vec!["cb_isr".to_string()]],
+        "the ISR site must dispatch the copy"
+    );
+}
