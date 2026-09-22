@@ -725,6 +725,64 @@ fn fills_param_handle_memcpy_callback_candidates() {
     assert_eq!(call.callees, vec!["cb_isr".to_string()]);
 }
 
+/// Two priorities dispatching through separate storages: each site lists
+/// exactly its own priority's copy. The pre-#582 context-scoped filter
+/// listed both spellings at both sites, so the other priority's copy rode
+/// along as a dead candidate; storage scoping pins each list to the
+/// storages the site actually reads (ADR-038).
+#[test]
+fn per_priority_storages_list_only_their_own_copies() {
+    let m = parse(
+        "global g_lo i8\n\
+         global g_hi i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = gep @g_lo +2\n\
+             store i16 @cb %p\n\
+             %q = gep @g_hi +2\n\
+             store i16 @cb %q\n\
+             ret void\n\
+         fn isr_lo(void) [isr] [irq2] ()\n\
+           block entry:\n\
+             %p = gep @g_lo +2\n\
+             %1 = load i16 %p\n\
+             call void @1()\n\
+             ret void\n\
+         fn isr_hi(void) [isr] [irq1] ()\n\
+           block entry:\n\
+             %q = gep @g_hi +2\n\
+             %2 = load i16 %q\n\
+             call void @2()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    let sites = |fname: &str| {
+        m2.funcs
+            .iter()
+            .find(|f| f.name == fname)
+            .unwrap()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Call(c) if !c.callees.is_empty() => Some(c.callees.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        sites("isr_lo"),
+        vec![vec!["cb_isr".to_string()]],
+        "the lo site must list only the lo copy"
+    );
+    assert_eq!(
+        sites("isr_hi"),
+        vec![vec!["cb_isr_high".to_string()]],
+        "the hi site must list only the hi copy"
+    );
+}
+
 /// A callback that flows into an ISR-read global through a function
 /// parameter (the `EPIC_GPIO_RegisterChangeCallback(on_rb_change)` shape):
 /// the call site's argument is rewritten to the `_isr` copy and the ISR
