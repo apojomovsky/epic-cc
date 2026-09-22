@@ -97,6 +97,36 @@ fn const_table_ram_ref_materializes_the_alloc_address() {
 }
 
 #[test]
+fn chunked_table_ram_ref_materializes_absolute_address_halves() {
+    // Past 256 bytes the table splits into chunks and the ref lookup
+    // uses the ABSOLUTE blob offset, so an odd absolute offset must
+    // yield HIGH even when the offset inside its chunk slice is even.
+    // A ref at 260/261 into holding_regs at 0x210: LOW = 0x10, HIGH = 0x02.
+    let mut bytes = vec![0u8; 300];
+    bytes[260] = 0x00;
+    bytes[261] = 0x00;
+    let m = with_refs(
+        with_bytes(
+            parse("const big i8\nfn main(void) ()\n  block entry:\n    ret void\n"),
+            "big",
+            &bytes,
+        ),
+        "big",
+        &[(260, "holding_regs"), (261, "holding_regs")],
+    );
+    let asm = select(&PIC16F1937, &m, &addrs(&[("holding_regs", 0x210)]));
+    assert!(
+        asm.contains("RETLW 0x10\n    RETLW 0x02"),
+        "the chunked path must materialize both address halves:\n{asm}"
+    );
+    assert!(
+        !asm.contains("LOW(holding_regs)"),
+        "a RAM global has no label to resolve:\n{asm}"
+    );
+    assemble_pic14e(&asm);
+}
+
+#[test]
 fn const_table_function_ref_keeps_the_label_literal() {
     // A function-address field is a link-time value: it must stay a
     // label literal the assembler resolves (epic-cc#154). The
