@@ -2337,20 +2337,17 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                     .next()
                     .unwrap_or("")
                     .trim();
-                // An explicit scalar zero (`i8 0`, `i16 0`) and the
-                // implicit `zeroinitializer` both decode to all-zero bytes
-                // here; dropping them keeps `bytes` empty so the emitters
-                // emit no init code for a global RAM already clears. Any
-                // other value (including a pointer `@g` ref) decodes.
-                let decoded = if init.is_empty() {
+                // Decode the value as it is written, including an explicit
+                // or implicit zero: `bytes` is this global's initializer,
+                // and a `const` scalar's zero still needs its table byte
+                // emitted (epic-cc#557). Whether a zero needs any *RAM*
+                // init code is a different question, answered by
+                // `Global::needs_ram_init` at the emitter, so the parser
+                // keeps no opinion about it.
+                let bytes = if init.is_empty() {
                     Vec::new()
                 } else {
                     decode_typed_value(ty_str, init, &types, &mut refs)
-                };
-                let bytes = if decoded.iter().all(|&b| b == 0) && refs.is_empty() {
-                    Vec::new()
-                } else {
-                    decoded
                 };
                 (ty, size, bytes)
             };

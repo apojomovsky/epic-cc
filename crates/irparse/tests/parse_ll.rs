@@ -2264,13 +2264,18 @@ fn scalar_i16_global_decodes_two_little_endian_bytes() {
 }
 
 #[test]
-fn scalar_zero_initializer_keeps_bytes_empty() {
-    // An all-zero initializer must not gain init code: RAM already holds 0,
-    // and `needs_ram_init` keys off a non-zero byte or a ref.
+fn scalar_zero_initializer_decodes_its_zero_byte() {
+    // `bytes` is the global's initializer, so an explicit zero decodes to a
+    // zero byte (epic-cc#557: a `const` scalar's table needs that byte).
+    // Whether a zero needs RAM init *code* is `needs_ram_init`'s call, and
+    // it still says no: RAM already holds zero.
     let m = parse_ll("@x = global i8 0\ndefine void @main() { ret void }\n");
     let g = m.globals.iter().find(|g| g.name == "x").expect("x");
-    assert!(g.bytes.is_empty(), "explicit zero stays empty");
-    assert!(!g.needs_ram_init(), "a zero scalar needs no init write");
+    assert_eq!(g.bytes, vec![0u8], "explicit zero decodes to its byte");
+    assert!(
+        !g.needs_ram_init(),
+        "a zero scalar still needs no init write"
+    );
 }
 
 #[test]

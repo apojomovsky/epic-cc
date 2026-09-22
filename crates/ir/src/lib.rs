@@ -493,14 +493,16 @@ impl Global {
     ///
     /// A `const` global in RAM is a const-to-RAM copy and always needs its
     /// bytes written. A mutable global needs them only when it has a real
-    /// initializer: `irparse` leaves `bytes` empty for a scalar zero, but an
-    /// array `zeroinitializer` decodes to non-empty all-zero bytes, and RAM
-    /// already holds zero, so testing `bytes` for emptiness alone would emit
-    /// init code for every zeroed buffer (a measured 1455-word regression on
-    /// the menu demo before this predicate existed). A pointer initializer
-    /// (`ptr @g`) carries its addresses in `refs`, so `refs` being non-empty
-    /// also requires the write even when the placeholder bytes are zero
-    /// (epic-cc#454).
+    /// initializer: RAM already holds zero, and `irparse` decodes an
+    /// initializer exactly as written, so an all-zero one (an explicit
+    /// scalar zero or an array `zeroinitializer`) arrives as non-empty
+    /// zero bytes. Testing `bytes` for emptiness therefore cannot tell a
+    /// zeroed buffer from an initialized one, and would emit init code for
+    /// every zeroed buffer (a measured 1455-word regression on the menu demo
+    /// before this predicate existed). Testing the *values* is what keeps
+    /// that out. A pointer initializer (`ptr @g`) carries its addresses in
+    /// `refs`, so `refs` being non-empty also requires the write even when
+    /// the placeholder bytes are zero (epic-cc#454, epic-cc#557).
     pub fn needs_ram_init(&self) -> bool {
         self.is_const || !self.refs.is_empty() || self.bytes.iter().any(|&b| b != 0)
     }
