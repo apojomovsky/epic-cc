@@ -1554,6 +1554,60 @@ fn isr_adjacency(m: &Module) -> (HashMap<String, Vec<String>>, HashSet<String>) 
     (adj, defined)
 }
 
+/// Function-valued stores into `handle` (any field, any function) join the
+/// ISR context: the handle is memcpy'd whole-object into an ISR-read
+/// storage global, so field sensitivity would be false precision (the same
+/// stance as the alloca path). Returns whether anything new joined.
+fn join_stores_into_global(
+    m: &Module,
+    handle: &str,
+    aliases: &HashMap<String, String>,
+    defined: &HashSet<String>,
+    isr_ctx: &mut HashSet<String>,
+) -> bool {
+    let mut grew = false;
+    for sf in &m.funcs {
+        for sb in &sf.blocks {
+            for si in &sb.insts {
+                let Inst::Store(s) = si else { continue };
+                let Some((g, _)) = global_field(&s.ptr, sf, aliases) else {
+                    continue;
+                };
+                if g != handle {
+                    continue;
+                }
+                if let Val::Global(fn_name) = &s.val {
+                    if defined.contains(fn_name.as_str()) && isr_ctx.insert(fn_name.clone()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    grew
+}
+
+/// The globals passed as argument `pi` to `f` across every call site: the
+/// callers' handle globals behind a memcpy whose source is `f`'s param
+/// (the `Init(&h)` idiom before clang promotes the param).
+fn globals_passed_as_param(m: &Module, f_name: &str, pi: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for cf in &m.funcs {
+        for cb in &cf.blocks {
+            for ci in &cb.insts {
+                if let Inst::Call(c) = ci {
+                    if c.func == f_name {
+                        if let Some(Val::Global(g)) = c.args.get(pi).map(|a| &a.val) {
+                            out.push(g.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Extended context for ONE ISR priority root set: reachability over
 /// direct calls and address-value edges, plus the store-edge fixpoint
 /// (a defined function stored into a context-read global joins, with
@@ -1660,32 +1714,56 @@ fn isr_context_for(
                         if !feeds {
                             continue;
                         }
-                        let Some(src_reg) =
-                            ptr_of_val(&mc.src).strip_prefix('%').map(str::to_string)
-                        else {
-                            continue;
-                        };
-                        let is_alloca = f
-                            .blocks
-                            .iter()
-                            .flat_map(|b| &b.insts)
-                            .any(|i| matches!(i, Inst::Alloca(a) if a.dst == src_reg));
-                        if !is_alloca {
-                            continue;
-                        }
-                        for b2 in &f.blocks {
-                            for inst2 in &b2.insts {
-                                let Inst::Store(s2) = inst2 else { continue };
-                                if alloca_field(&s2.ptr, f, &src_reg).is_none() {
-                                    continue;
+                        // The source struct carries the callback into the
+                        // ISR-read storage; resolve it by shape: an alloca
+                        // the caller field-stored (epic-cc#463), the handle
+                        // as a file-scope static (`memcpy @g_storage, @h`,
+                        // clang promoting Init's param), or that same
+                        // param un-promoted. All three were a silent hole
+                        // before epic-cc#484.
+                        let src_ptr = ptr_of_val(&mc.src);
+                        if let Some(src_reg) = src_ptr.strip_prefix('%').map(str::to_string) {
+                            let is_alloca = f
+                                .blocks
+                                .iter()
+                                .flat_map(|b| &b.insts)
+                                .any(|i| matches!(i, Inst::Alloca(a) if a.dst == src_reg));
+                            if is_alloca {
+                                for b2 in &f.blocks {
+                                    for inst2 in &b2.insts {
+                                        let Inst::Store(s2) = inst2 else { continue };
+                                        if alloca_field(&s2.ptr, f, &src_reg).is_none() {
+                                            continue;
+                                        }
+                                        if let Val::Global(fn_name) = &s2.val {
+                                            if defined.contains(fn_name.as_str())
+                                                && isr_ctx.insert(fn_name.clone())
+                                            {
+                                                grew = true;
+                                            }
+                                        }
+                                    }
                                 }
-                                if let Val::Global(fn_name) = &s2.val {
-                                    if defined.contains(fn_name.as_str())
-                                        && isr_ctx.insert(fn_name.clone())
-                                    {
+                                continue;
+                            }
+                            if let Some(pi) = f.params.iter().position(|p| p.name == src_reg) {
+                                for handle in globals_passed_as_param(m, &f.name.clone(), pi) {
+                                    if join_stores_into_global(
+                                        m,
+                                        &handle,
+                                        &aliases,
+                                        defined,
+                                        &mut isr_ctx,
+                                    ) {
                                         grew = true;
                                     }
                                 }
+                            }
+                            continue;
+                        }
+                        if let Some((src_g, _)) = global_field(&src_ptr, f, &aliases) {
+                            if join_stores_into_global(m, &src_g, &aliases, defined, &mut isr_ctx) {
+                                grew = true;
                             }
                         }
                     }
@@ -1913,6 +1991,65 @@ fn duplicate_isr_shared(m: Module) -> Module {
     // address into main frames). Write-only globals stay on the
     // original (epic-cc#73). A store feeding BOTH priorities has no
     // single spelling: panic, don't miscompile.
+    // A handle global memcpy'd whole-object into a priority-read storage
+    // global (the `Init(&h)` idiom with a file-scope static handle,
+    // epic-cc#484): a function-valued store into any field of the handle
+    // feeds the storage global like a direct store would, so it needs the
+    // same cross-context rewrite. The memcpy source resolves by shape: a
+    // global (the promoted idiom) or a param pointing at the caller's
+    // global; the alloca form stays per-function below (epic-cc#463).
+    // Module-wide: the memcpy lives in Init, the stores in main.
+    let mut handle_feeds_lo: HashSet<String> = HashSet::new();
+    let mut handle_feeds_hi: HashSet<String> = HashSet::new();
+    for sf in funcs.iter() {
+        let mut bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = HashMap::new();
+        for b in &sf.blocks {
+            for inst in &b.insts {
+                if let Inst::Gep(g) = inst {
+                    bases.insert(g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()));
+                }
+            }
+        }
+        for b in &sf.blocks {
+            for inst in &b.insts {
+                let Inst::Memcpy(mc) = inst else { continue };
+                let Some((g, _)) = global_field_map(&ptr_of_val(&mc.dst), &bases) else {
+                    continue;
+                };
+                let src_ptr = ptr_of_val(&mc.src);
+                let mut handles: Vec<String> = Vec::new();
+                if let Some((sg, _)) = global_field_map(&src_ptr, &bases) {
+                    handles.push(sg);
+                } else if let Some(src_reg) = src_ptr.strip_prefix('%') {
+                    if let Some(pi) = sf.params.iter().position(|p| &p.name == src_reg) {
+                        for cf in funcs.iter() {
+                            for cb in &cf.blocks {
+                                for ci in &cb.insts {
+                                    if let Inst::Call(c) = ci {
+                                        if c.func == sf.name {
+                                            if let Some(Val::Global(h)) =
+                                                c.args.get(pi).map(|a| &a.val)
+                                            {
+                                                handles.push(h.clone());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for h in handles {
+                    if lo_read.iter().any(|(rg, _)| *rg == g) {
+                        handle_feeds_lo.insert(h.clone());
+                    }
+                    if hi_read.iter().any(|(rg, _)| *rg == g) {
+                        handle_feeds_hi.insert(h.clone());
+                    }
+                }
+            }
+        }
+    }
     for f in &mut funcs {
         // GEP bases are resolved before the mutation loop (the function is
         // borrowed mutably below).
@@ -1957,12 +2094,16 @@ fn duplicate_isr_shared(m: Module) -> Module {
             for inst in &mut b.insts {
                 if let Inst::Store(s) = inst {
                     if let Some((g, sk)) = global_field_map(&s.ptr, &bases) {
+                        // A handle feed is whole-object (the memcpy carries
+                        // every field), so it matches regardless of `sk`.
                         let feeds_lo = lo_read
                             .iter()
-                            .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
+                            .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk))
+                            || handle_feeds_lo.contains(&g);
                         let feeds_hi = hi_read
                             .iter()
-                            .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk));
+                            .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk))
+                            || handle_feeds_hi.contains(&g);
                         if let Val::Global(fn_name) = &s.val {
                             let lo_hit =
                                 !in_lo && feeds_lo && shared_lo_set.contains(fn_name.as_str());
