@@ -1062,6 +1062,69 @@ fn i8_binop_const_lhs_sub_emits_sublw() {
 }
 
 #[test]
+fn wide_const_lhs_sub_skipped_lane_flags_match_unskipped() {
+    // epic-cc#575 review: with the saved bit clear the surviving flags
+    // come from `COMF` rather than the skipped `ADDLW 0x00`, so `C`/`Z`
+    // coincidence is sim-asserted here, differentially: the unskipped
+    // listing is the skipped one with the dead `ADDLW` put back, and
+    // both must leave the same `C`/`Z` for saved-set and saved-clear
+    // inputs (`x` low byte below/above `0x12` decides the saved bit).
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = sub i16 18, %1\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("ADDLW 0x00"),
+        "skipped listing must have no ADDLW 0x00:\n{asm}"
+    );
+    let mut unskipped = String::new();
+    let mut restored = 0;
+    for line in asm.lines() {
+        unskipped.push_str(line);
+        unskipped.push('\n');
+        if line.trim_start().starts_with("COMF ") {
+            unskipped.push_str("    ADDLW 0x00\n");
+            restored += 1;
+        }
+    }
+    assert_eq!(restored, 1, "exactly one zero lane to restore:\n{asm}");
+    let skipped_words = asm::assemble_pic18(&asm);
+    let unskipped_words = asm::assemble_pic18(&unskipped);
+    for x in [0x0012u16, 0x0013, 0x0000, 0x00FF, 0xFFFF] {
+        let run = |words: &[u16]| {
+            let mut p = pic14_sim::Pic18::new(words.to_vec());
+            p.ram_mut()[0x20] = x as u8;
+            p.ram_mut()[0x21] = (x >> 8) as u8;
+            p.set_w((x as u8) ^ ((x >> 8) as u8));
+            p.run(200);
+            assert!(p.halted(), "program must run to completion ({x:#06x})");
+            let out = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+            (out, p.ram()[0xFD8])
+        };
+        let (got_skip, st_skip) = run(&skipped_words);
+        let (got_unskip, st_unskip) = run(&unskipped_words);
+        assert_eq!(got_skip, 0x0012u16.wrapping_sub(x), "result ({x:#06x})");
+        assert_eq!(got_skip, got_unskip, "same result ({x:#06x})");
+        assert_eq!(
+            st_skip & 0x01,
+            st_unskip & 0x01,
+            "C must coincide ({x:#06x})"
+        );
+        assert_eq!(
+            st_skip & 0x04,
+            st_unskip & 0x04,
+            "Z must coincide ({x:#06x})"
+        );
+    }
+}
+
+#[test]
 fn wide_const_lhs_sub_zero_lane_skips_addlw() {
     // epic-cc#575: `sub i16 0x0012, %x` has a zero high lane whose
     // `ADDLW 0x00` adds nothing to `~a`. The fold drops it and stays
