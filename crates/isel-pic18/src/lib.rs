@@ -2515,7 +2515,14 @@ impl<'m> Gen<'m> {
                                 let (aacc, af) = self.operand(aa + u16::from(i));
                                 let abank = if aacc == 0 { "A" } else { "B" };
                                 self.emit(format!("    COMF 0x{af:03X},W,{abank}"));
-                                self.emit(format!("    ADDLW 0x{kb:02X}"));
+                                // A zero lane adds nothing to `~a`, so its `ADDLW`
+                                // is dead: with the saved bit clear the untouched
+                                // `C` already equals the correct carry out (adding
+                                // zero cannot carry), and with it set the
+                                // `ADDLW 0x01` below recomputes it (epic-cc#575).
+                                if kb != 0 {
+                                    self.emit(format!("    ADDLW 0x{kb:02X}"));
+                                }
                                 self.emit("    BTFSC 0x0000,0,A".to_string());
                                 self.emit("    ADDLW 0x01".to_string());
                                 let (dacc, df) = self.operand(dst + u16::from(i));
