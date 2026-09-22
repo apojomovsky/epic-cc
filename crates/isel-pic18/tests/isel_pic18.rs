@@ -1062,6 +1062,93 @@ fn i8_binop_const_lhs_sub_emits_sublw() {
 }
 
 #[test]
+fn wide_const_lhs_sub_zero_lane_skips_addlw() {
+    // epic-cc#575: `sub i16 0x0012, %x` has a zero high lane whose
+    // `ADDLW 0x00` adds nothing to `~a`. The fold drops it and stays
+    // exact over the full 16-bit domain, with a garbage entry W so a
+    // construction that depends on stale W fails loudly.
+    let m = parse(
+        "global a i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = sub i16 18, %1\n    store i16 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x26),
+        ("main::2", 0x28),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("ADDLW 0x00"),
+        "zero high lane must skip its ADDLW:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..=u16::MAX {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        p.ram_mut()[0x20] = x as u8;
+        p.ram_mut()[0x21] = (x >> 8) as u8;
+        p.set_w((x as u8) ^ ((x >> 8) as u8));
+        p.run(200);
+        let got = u16::from(p.ram()[0x24]) | (u16::from(p.ram()[0x25]) << 8);
+        assert_eq!(got, 0x0012u16.wrapping_sub(x), "0x0012 - {x:#06x}");
+        assert!(p.halted(), "program must run to completion ({x:#06x})");
+    }
+}
+
+#[test]
+fn wide_const_lhs_sub_i32_zero_lanes_skip_addlw() {
+    // epic-cc#575: the i32 version (`0x12000012 - a`) drops both zero
+    // lanes. The full domain is too large to simulate, so the corners
+    // that stress the borrow chain (lane boundaries, all-ones, k
+    // itself) stand in for it.
+    let m = parse(
+        "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n    %1 = load i32 @a\n    %2 = sub i32 301989906, %1\n    store i32 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("out", 0x24),
+        ("main::1", 0x28),
+        ("main::2", 0x2C),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("ADDLW 0x00").count(),
+        0,
+        "both zero lanes must skip their ADDLW:\n{asm}"
+    );
+    assert!(
+        asm.contains("ADDLW 0x12"),
+        "nonzero lanes keep their ADDLW:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in [
+        0x00000000u32,
+        0x00000001,
+        0x00000012,
+        0x00000013,
+        0x000000FF,
+        0x00000100,
+        0x0000FFFF,
+        0x00010000,
+        0x0011FFFF,
+        0x12000011,
+        0x12000012,
+        0x12000013,
+        0xEDCBA987,
+        0xFFFFFFFF,
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        for (i, b) in x.to_le_bytes().iter().enumerate() {
+            p.ram_mut()[0x20 + i] = *b;
+        }
+        p.set_w((x as u8) ^ ((x >> 24) as u8));
+        p.run(400);
+        let got = u32::from_le_bytes([p.ram()[0x24], p.ram()[0x25], p.ram()[0x26], p.ram()[0x27]]);
+        assert_eq!(got, 0x12000012u32.wrapping_sub(x), "0x12000012 - {x:#010x}");
+        assert!(p.halted(), "program must run to completion ({x:#010x})");
+    }
+}
+
+#[test]
 #[should_panic(expected = "variable-count")]
 fn i8_binop_const_lhs_is_rejected_not_silently_miscompiled() {
     // `shl i8 1, %x` has a const LHS (`b.a = 1`) and a variable count
