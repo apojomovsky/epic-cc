@@ -62,3 +62,36 @@ make xc8-build MODULE=epic-encoder MCU=16F877A
 
 then read the flash/RAM line from the `xc8-cc` link step's own
 `16F877A Memory Summary` output.
+
+## Microbench ladder (epic-cc#581)
+
+XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the eight
+`size-bench` programs, measured 2026-09-22 on the
+`epic-cc-xc8-oracle:local` image. Each bench compiled standalone:
+
+```
+xc8-cc -mcpu=18f4550 -O2 bench-<stem>.c -o <stem>.hex
+```
+
+Program space bytes halve to flash words (PIC18 words are 2 bytes);
+Data space bytes are RAM bytes directly. epic-cc columns quote the
+`size_baseline.toml` rows of the same date; the switch row still
+predates #590 (94 words, 64 after it merges).
+
+| Bench | XC8 flash | XC8 RAM | epic-cc flash | epic-cc RAM | Gap (epic minus XC8) |
+|---|---|---|---|---|---|
+| `bench-shift` | 108 (216 B) | 16 | 85 | 26 | -23 |
+| `bench-wide-const` | 28 (56 B) | 6 | 16 | 10 | -12 |
+| `bench-zero-init` | 38 (76 B) | 12 | 18 | 16 | -20 |
+| `bench-struct-copy` | 36 (72 B) | 41 | 40 | 51 | +4 |
+| `bench-switch` | 55 (110 B) | 2 | 94 (64 post-#590) | 8 | +39 (+9 post-#590) |
+| `bench-bool` | 29 (58 B) | 2 | 36 | 9 | +7 |
+| `bench-dead-store` | 16 (32 B) | 3 | 12 | 8 | -4 |
+| `bench-bank` | 30 (60 B) | 10 | 26 | 15 | -4 |
+
+Negative gap means epic-cc is smaller. Three benches still trail XC8
+(switch, bool, struct-copy) and rank the remaining codegen work; the
+rest lead by 4 to 23 words. The same v4.00 license reasoning as the
+encoder row above applies: no license file present, but licenses are
+free and unlimited since July 2026, so these rows are XC8's genuine
+`-O2` output.
