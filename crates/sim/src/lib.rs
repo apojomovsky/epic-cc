@@ -2822,8 +2822,13 @@ impl Pic18 {
             // sequences read the flat RAM's always-zero 0xFE8 byte and
             // every W-chained computation collapses to zero.
             0xFE8 => self.w,
-            // PCL reads as the PC's low byte (DS39632E section 4.3).
-            0xFF9 => (self.pc & 0xFF) as u8,
+            // PCL reads as the PC's low byte with the two prefetch bytes
+            // already consumed (DS39632E section 4.3): while an
+            // instruction executes, the PC points at the NEXT
+            // instruction, so a computed `ADDWF PCL,F` lands at
+            // `pc + 2 + W` and a jump table placed right after the
+            // dispatch takes W = 4*idx with no gap word.
+            0xFF9 => ((self.pc + 2) & 0xFF) as u8,
             _ => self.ram[addr],
         }
     }
