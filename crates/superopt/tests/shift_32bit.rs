@@ -318,15 +318,13 @@ fn left_shift_32bit_by_7_fused_form_wins() {
     assert!(c.len() < 5 * 7, "21 words beats the 35-word unroll");
 }
 
-// epic-cc#573: the fusion verdict at amounts 4 and 5. Fusing the extra
-// bits into the nibble pass as one rotation phase costs 4*(8-r) rotate
-// words plus the 17-word combine: 33 at amount 4, 29 at amount 5. Both
-// verify (same swept domain as the winning amounts), and both lose to
-// the unroll (20/25) by more than the dedicated nibble forms do (21/26).
-// The rotation phase alone already spends most of the budget, and the two
-// passes sweep opposite directions (combine high-to-low, bit pass
-// low-to-high) with no shared subexpression, so interleaving cannot
-// undercut the concatenation either. Amounts 4 and 5 stay unrolled.
+// epic-cc#573: the fusion verdict at amounts 4 and 5. One rotation
+// phase covering nibble and extra bits costs 4*(8-r) rotate words plus
+// the 17-word combine: 33 at amount 4, 29 at amount 5. Both verify, and
+// both lose to the unroll (20/25) by more than the nibble forms (21/26).
+// The passes sweep opposite directions with no shared subexpression, so
+// interleaving cannot undercut the concatenation either. Amounts 4 and 5
+// stay unrolled.
 #[test]
 fn left_shift_32bit_by_4_fused_form_is_correct_and_loses() {
     let c = construction_shl_family(4);
