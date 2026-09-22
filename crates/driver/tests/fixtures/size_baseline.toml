@@ -16,6 +16,54 @@ flash_words = 13
 ram_bytes = 8
 
 [[entry]]
+name = "bench-shift-18f4550"
+device = "18F4550"
+flash_words = 85
+ram_bytes = 26
+
+[[entry]]
+name = "bench-wide-const-18f4550"
+device = "18F4550"
+flash_words = 16
+ram_bytes = 10
+
+[[entry]]
+name = "bench-zero-init-18f4550"
+device = "18F4550"
+flash_words = 18
+ram_bytes = 16
+
+[[entry]]
+name = "bench-struct-copy-18f4550"
+device = "18F4550"
+flash_words = 40
+ram_bytes = 51
+
+[[entry]]
+name = "bench-switch-18f4550"
+device = "18F4550"
+flash_words = 94
+ram_bytes = 8
+
+[[entry]]
+name = "bench-bool-18f4550"
+device = "18F4550"
+flash_words = 36
+ram_bytes = 9
+
+[[entry]]
+name = "bench-dead-store-18f4550"
+device = "18F4550"
+flash_words = 12
+ram_bytes = 8
+
+[[entry]]
+name = "bench-bank-18f4550"
+device = "18F4550"
+flash_words = 26
+ram_bytes = 15
+
+[[entry]]
 name = "hal-pic16-blink-16f877a"
 device = "16F877A"
 flash_words = 622
