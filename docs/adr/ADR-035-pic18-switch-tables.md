@@ -21,7 +21,11 @@ same shape for about half that.
 - `irparse` preserves dense-contiguous switches (all values in
   `min..=max` present, at least six cases, 2 bytes or narrower) as
   `Switch` when the caller asks for it (`parse_ll_opts`); the driver
-  asks only for PIC18, the only core with table lowering.
+  asks only for PIC18, the only core with table lowering. A sparse
+  switch keeps the chain, except its longest dense run of six cases
+  or more is preserved the same way with the leftover cases chained
+  behind its default (epic-cc#578), so one far outlier stops dragging
+  the whole dispatch off the table.
 - `isel-pic18` tables switches that are dense from any base the cost
   gate accepts; sparse, small, or wide switches chain in place with
   per-edge copies. A constant switch value is a backend panic: fold
