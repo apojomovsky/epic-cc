@@ -487,6 +487,25 @@ pub struct Global {
     pub addr: Option<u16>,
 }
 
+impl Global {
+    /// Whether this global's bytes must be written to RAM before `main`
+    /// runs, given that it is RAM-resident (present in the alloc map).
+    ///
+    /// A `const` global in RAM is a const-to-RAM copy and always needs its
+    /// bytes written. A mutable global needs them only when it has a real
+    /// initializer: `irparse` leaves `bytes` empty for a scalar zero, but an
+    /// array `zeroinitializer` decodes to non-empty all-zero bytes, and RAM
+    /// already holds zero, so testing `bytes` for emptiness alone would emit
+    /// init code for every zeroed buffer (a measured 1455-word regression on
+    /// the menu demo before this predicate existed). A pointer initializer
+    /// (`ptr @g`) carries its addresses in `refs`, so `refs` being non-empty
+    /// also requires the write even when the placeholder bytes are zero
+    /// (epic-cc#454).
+    pub fn needs_ram_init(&self) -> bool {
+        self.is_const || !self.refs.is_empty() || self.bytes.iter().any(|&b| b != 0)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Module {
     pub globals: Vec<Global>,
