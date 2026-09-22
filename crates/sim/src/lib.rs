@@ -75,6 +75,19 @@ pub const INTE: u8 = 1 << 4;
 pub const INTF: u8 = 1 << 1;
 /// The 14-bit core's single interrupt vector.
 pub const VECTOR: u16 = 4;
+/// PIC18 INTCON layout (DS39632E table 9-1): the register lives at 0xFF2,
+/// not at the PIC14 0x0B above, and the vectors are 0x0008/0x0018, not
+/// word 4. The enable/flag bit positions match the PIC14 names bit for
+/// bit, with Timer0 on bits 5/2 alongside INT0 on bits 4/1.
+pub const PIC18_INTCON: usize = 0xFF2;
+pub const PIC18_GIEH: u8 = 1 << 7;
+pub const PIC18_GIEL: u8 = 1 << 6;
+pub const PIC18_TMR0IE: u8 = 1 << 5;
+pub const PIC18_INT0IE: u8 = 1 << 4;
+pub const PIC18_TMR0IF: u8 = 1 << 2;
+pub const PIC18_INT0IF: u8 = 1 << 1;
+pub const PIC18_HI_VECTOR: u32 = 0x0008;
+pub const PIC18_LO_VECTOR: u32 = 0x0018;
 
 /// The 16F877A data-EEPROM register file (DS39582C chapter 4): EEDATA
 /// 0x10C and EEADR 0x10D in bank 2, EECON1 0x18C and EECON2 0x18D in
@@ -1944,13 +1957,14 @@ pub struct Pic18 {
     /// storing it twice.
     stack: Vec<u32>,
     halted: bool,
-    /// A latched interrupt request awaiting INTCON GIE + INT0IE. Set by
-    /// `request_interrupt`, consumed when the interrupt is taken.
+    /// A latched interrupt request awaiting INTCON GIEH plus an enabled
+    /// source (INT0IE or TMR0IE). Set by `request_interrupt`, consumed
+    /// when the interrupt is taken.
     pending: bool,
-    /// A latched LOW-priority request awaiting INTCON GIEH + GIEL + INT0IE
-    /// (the IPEN=1 routing: firmware owns RCON.IPEN, the sim models the
-    /// post-IPEN behavior). Set by `request_low_interrupt`, consumed on
-    /// low-vector entry.
+    /// A latched LOW-priority request awaiting INTCON GIEH + GIEL plus an
+    /// enabled source (the IPEN=1 routing: firmware owns RCON.IPEN, the
+    /// sim models the post-IPEN behavior). Set by `request_low_interrupt`,
+    /// consumed on low-vector entry.
     pending_lo: bool,
     /// The live ISR nesting stack, outermost first: `true` = high-priority
     /// context. Pushed on vector entry (both `fire_` hooks and the
@@ -2642,9 +2656,9 @@ impl Pic18 {
     /// like RETURN.)
     fn exec_retfie(&mut self) -> u32 {
         match self.isr_stack.pop() {
-            Some(true) => self.ram[0xFF2] |= 0x80,  // high return: GIEH on
-            Some(false) => self.ram[0xFF2] |= 0x40, // low return: GIEL on
-            None => self.ram[0xFF2] |= 0x80,        // unmodelled: GIE on
+            Some(true) => self.ram[PIC18_INTCON] |= PIC18_GIEH, // high: GIEH on
+            Some(false) => self.ram[PIC18_INTCON] |= PIC18_GIEL, // low: GIEL on
+            None => self.ram[PIC18_INTCON] |= PIC18_GIEH,       // unmodelled: GIE on
         }
         self.pop_return()
     }
@@ -2880,14 +2894,13 @@ impl Pic18 {
         self.enter_isr();
     }
     /// Request the interrupt through the modelled path: latch it and set
-    /// INT0IF (INTCON bit 1). It is taken at the next step boundary at
-    /// which INTCON bits 7 (GIE) and 4 (INT0IE) are both set, so a program
-    /// that masks interrupts keeps it pending until it unmasks. The latch
-    /// is consumed on entry, so a handler that leaves INT0IF set still
-    /// runs once rather than looping. (PIC18 INTCON = 0xFF2, same bit
-    /// layout as PIC14's.)
+    /// both source flags (INT0IF and TMR0IF). It is taken at the next step
+    /// boundary with GIE set and either source enabled, so Timer0-driven
+    /// firmware (the tick pipeline) is serviced exactly like INT0-driven
+    /// firmware. The latch is consumed on entry, so a handler that leaves
+    /// a flag set still runs once rather than looping.
     pub fn request_interrupt(&mut self) {
-        self.ram[0xFF2] |= 0x02; // INT0IF
+        self.ram[PIC18_INTCON] |= PIC18_INT0IF | PIC18_TMR0IF;
         self.pending = true;
     }
     /// Whether a requested interrupt remains latched and untaken.
@@ -2903,53 +2916,63 @@ impl Pic18 {
         self.enter_isr_low();
     }
     /// Request the low-priority interrupt through the modelled path:
-    /// latch it and set TMR0IF (INTCON bit 2) as the observable source
-    /// flag. It is taken at the next step boundary at which INTCON bits
-    /// 7 (GIEH), 6 (GIEL) and 4 (the modelled source enable) are all
-    /// set. The latch is consumed on entry, mirroring `request_interrupt`.
+    /// latch it and set both source flags. It is taken at the next step
+    /// boundary with GIEH and GIEL set and either source enabled,
+    /// mirroring `request_interrupt`.
     pub fn request_low_interrupt(&mut self) {
-        self.ram[0xFF2] |= 0x04; // TMR0IF
+        self.ram[PIC18_INTCON] |= PIC18_INT0IF | PIC18_TMR0IF;
         self.pending_lo = true;
     }
     /// Whether a requested low-priority interrupt is still latched.
     pub fn low_interrupt_pending(&self) -> bool {
         self.pending_lo
     }
-    /// Push the return address, clear GIE (INTCON bit 7: hardware does
-    /// this on entry so the handler is not immediately re-entered) and
-    /// vector to 0x0008.
+    /// Push the return address, clear GIEH (hardware does this on entry so
+    /// the handler is not immediately re-entered) and vector to 0x0008. No
+    /// W/STATUS/BSR shadow save: codegen emits manual MOVFF saves with a
+    /// plain RETFIE, so the sim follows the emitted convention.
     fn enter_isr(&mut self) {
         self.stack.push(self.pc);
-        self.ram[0xFF2] &= !0x80; // clear GIE
-        self.pc = 0x0008;
+        self.ram[PIC18_INTCON] &= !PIC18_GIEH;
+        self.pc = PIC18_HI_VECTOR;
         self.isr_stack.push(true);
     }
-    /// Push the return address, clear GIEL only (INTCON bit 6) and vector
-    /// to 0x0018. GIEH is left set: hardware keeps high interrupts
-    /// enabled inside a low handler so they can preempt it.
+    /// Push the return address, clear GIEL only and vector to 0x0018.
+    /// GIEH is left set: hardware keeps high interrupts enabled inside a
+    /// low handler so they can preempt it.
     fn enter_isr_low(&mut self) {
         self.stack.push(self.pc);
-        self.ram[0xFF2] &= !0x40; // clear GIEL
-        self.pc = 0x0018;
+        self.ram[PIC18_INTCON] &= !PIC18_GIEL;
+        self.pc = PIC18_LO_VECTOR;
         self.isr_stack.push(false);
     }
-    /// A latched request whose global and source enables are both set.
+    /// A latched request with GIEH set and either modelled source enabled
+    /// (INT0IE or TMR0IE). Readiness keys off the enables, not the flag
+    /// bits: firmware unmasks with wholesale INTCON writes that clear the
+    /// flags, while the latch itself records the peripheral event.
     fn interrupt_ready(&self) -> bool {
-        self.pending && self.ram[0xFF2] & 0x80 != 0 && self.ram[0xFF2] & 0x10 != 0
+        let intcon = self.ram[PIC18_INTCON];
+        self.pending
+            && intcon & PIC18_GIEH != 0
+            && (intcon & PIC18_INT0IE != 0 || intcon & PIC18_TMR0IE != 0)
     }
-    /// A latched low request whose master, low-global and source enables
-    /// are all set (GIEH gates everything when IPEN = 1).
+    /// A latched low request with GIEH and GIEL set and either modelled
+    /// source enabled (GIEH gates everything when IPEN = 1).
     fn interrupt_ready_lo(&self) -> bool {
+        let intcon = self.ram[PIC18_INTCON];
         self.pending_lo
-            && self.ram[0xFF2] & 0x80 != 0
-            && self.ram[0xFF2] & 0x40 != 0
-            && self.ram[0xFF2] & 0x10 != 0
+            && intcon & PIC18_GIEH != 0
+            && intcon & PIC18_GIEL != 0
+            && (intcon & PIC18_INT0IE != 0 || intcon & PIC18_TMR0IE != 0)
     }
 }
 
 #[cfg(test)]
 mod pic18_interrupt {
-    use super::Pic18;
+    use super::{
+        Pic18, PIC18_GIEH, PIC18_GIEL, PIC18_HI_VECTOR, PIC18_INT0IE, PIC18_INTCON,
+        PIC18_LO_VECTOR, PIC18_TMR0IE,
+    };
 
     /// A program with NOPs at bytes 0/2/4 (words 0-2) and an ISR at the
     /// high vector: word 4 (byte 8) = `MOVWF 0x20,A`, word 5 (byte 10) =
@@ -2972,26 +2995,79 @@ mod pic18_interrupt {
         assert_eq!(pic.pc(), 4);
         pic.w = 0x2A; // the preempted main's W
         pic.fire_interrupt();
-        assert_eq!(pic.pc(), 0x0008, "fire must vector to 0x0008");
-        assert_eq!(pic.ram()[0xFF2] & 0x80, 0, "GIE cleared on entry");
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "fire must vector to 0x0008");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEH,
+            0,
+            "GIE cleared on entry"
+        );
         pic.step(); // the ISR's MOVWF 0x20,A (byte 8 -> pc 10)
         pic.step(); // RETFIE (byte 10 -> pops byte 4)
         assert_eq!(pic.ram[0x20], 0x2A, "ISR stored W to 0x20");
         assert_eq!(pic.pc(), 4, "RETFIE resumes the interrupted instruction");
-        assert_eq!(pic.ram[0xFF2] & 0x80, 0x80, "GIE re-enabled on RETFIE");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEH,
+            PIC18_GIEH,
+            "GIE re-enabled on RETFIE"
+        );
     }
 
     #[test]
     fn request_interrupt_is_gated_by_gie_and_int0ie() {
         let mut pic = pic_with_isr();
-        pic.ram[0xFF2] = 0x10; // INT0IE only, GIE clear
+        pic.ram[PIC18_INTCON] = PIC18_INT0IE; // INT0IE only, GIE clear
         pic.request_interrupt();
         assert!(pic.interrupt_pending(), "requested interrupt must latch");
         pic.run(3); // three NOPs (bytes 0,2,4), pc == 6
         assert_eq!(pic.pc(), 6, "must stay masked while GIE is clear");
-        pic.ram[0xFF2] = 0x90; // GIE | INT0IE
+        pic.ram[PIC18_INTCON] = PIC18_GIEH | PIC18_INT0IE; // unmask
         pic.run(1); // the boundary check vectors on the next step
-        assert_eq!(pic.pc(), 0x0008, "must vector once GIE goes up");
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "must vector once GIE goes up");
+        assert!(!pic.interrupt_pending(), "the latch is consumed on entry");
+    }
+
+    #[test]
+    fn timer0_request_vectors_through_tmr0ie() {
+        // The epic-cc#484 diagnosis shape: Timer0-driven firmware runs
+        // with GIEH + TMR0IE (INT0IE clear), so an INT0-only model latches
+        // the request forever. The widened model must vector it.
+        let mut pic = pic_with_isr();
+        pic.ram[PIC18_INTCON] = PIC18_GIEH | PIC18_TMR0IE;
+        pic.request_interrupt();
+        assert!(pic.interrupt_pending(), "requested interrupt must latch");
+        pic.run(1); // the boundary check vectors on the next step
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "must vector on TMR0IE");
+        assert!(!pic.interrupt_pending(), "the latch is consumed on entry");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEH,
+            0,
+            "GIEH cleared on entry"
+        );
+        pic.w = 0x2A;
+        pic.step(); // the ISR's MOVWF 0x20,A (byte 8 -> pc 10)
+        pic.step(); // RETFIE (byte 10 -> pops byte 0)
+        assert_eq!(pic.ram[0x20], 0x2A, "ISR stored W to 0x20");
+        assert_eq!(pic.pc(), 0, "RETFIE resumes the interrupted instruction");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEH,
+            PIC18_GIEH,
+            "GIEH back on after RETFIE"
+        );
+    }
+
+    #[test]
+    fn request_stays_pending_without_any_source_enable() {
+        // GIEH alone enables nothing: the request waits for a source
+        // enable, then vectors once firmware sets TMR0IE.
+        let mut pic = pic_with_isr();
+        pic.ram[PIC18_INTCON] = PIC18_GIEH;
+        pic.request_interrupt();
+        pic.run(3); // three NOPs (bytes 0,2,4), pc == 6
+        assert_eq!(pic.pc(), 6, "no source enabled: must not vector");
+        assert!(pic.interrupt_pending(), "still latched without an enable");
+        pic.ram[PIC18_INTCON] |= PIC18_TMR0IE;
+        pic.run(1);
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "must vector once TMR0IE goes up");
         assert!(!pic.interrupt_pending(), "the latch is consumed on entry");
     }
 
@@ -3013,74 +3089,131 @@ mod pic18_interrupt {
     #[test]
     fn fire_low_vectors_to_0x0018_and_keeps_gieh() {
         let mut pic = pic_with_both_isrs();
-        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.ram[PIC18_INTCON] = PIC18_GIEH | PIC18_GIEL | PIC18_INT0IE;
         pic.run(2); // two NOPs, pc == 4
         pic.w = 0x3C; // the preempted main's W
         pic.fire_low_interrupt();
-        assert_eq!(pic.pc(), 0x0018, "low fire must vector to 0x0018");
-        assert_eq!(pic.ram[0xFF2] & 0x40, 0, "GIEL cleared on low entry");
+        assert_eq!(pic.pc(), PIC18_LO_VECTOR, "low fire must vector to 0x0018");
         assert_eq!(
-            pic.ram[0xFF2] & 0x80,
-            0x80,
+            pic.ram()[PIC18_INTCON] & PIC18_GIEL,
+            0,
+            "GIEL cleared on entry"
+        );
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEH,
+            PIC18_GIEH,
             "GIEH stays set: high can still preempt"
         );
         pic.step(); // the low ISR's MOVWF 0x21,A
         pic.step(); // RETFIE (pops byte 4)
         assert_eq!(pic.ram[0x21], 0x3C, "low ISR stored W to 0x21");
         assert_eq!(pic.pc(), 4, "RETFIE resumes the interrupted instruction");
-        assert_eq!(pic.ram[0xFF2] & 0x40, 0x40, "GIEL re-enabled on RETFIE");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEL,
+            PIC18_GIEL,
+            "GIEL re-enabled on RETFIE"
+        );
     }
 
     #[test]
     fn high_preempts_low_and_both_restore() {
         let mut pic = pic_with_both_isrs();
-        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.ram[PIC18_INTCON] = PIC18_GIEH | PIC18_GIEL | PIC18_INT0IE;
         pic.run(2); // pc == 4
         pic.w = 0x11;
         pic.fire_low_interrupt(); // -> low ISR at 0x18
         pic.step(); // low MOVWF 0x21,A (pc now 0x1A)
         pic.w = 0x22;
         pic.fire_interrupt(); // high preempts the low handler
-        assert_eq!(pic.pc(), 0x0008, "high fire vectors to 0x0008");
-        assert_eq!(pic.ram[0xFF2] & 0x80, 0, "GIEH cleared on high entry");
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "high fire vectors to 0x0008");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEH,
+            0,
+            "GIEH cleared on entry"
+        );
         pic.step(); // high MOVWF 0x20,A
         assert_eq!(pic.ram[0x20], 0x22, "high ISR stored W to 0x20");
         pic.step(); // high RETFIE: back into the low handler at 0x1A
         assert_eq!(pic.pc(), 0x001A, "high RETFIE resumes the low handler");
-        assert_eq!(pic.ram[0xFF2] & 0x80, 0x80, "GIEH back on after high");
         assert_eq!(
-            pic.ram[0xFF2] & 0x40,
+            pic.ram()[PIC18_INTCON] & PIC18_GIEH,
+            PIC18_GIEH,
+            "GIEH back on after high"
+        );
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEL,
             0,
             "GIEL still clear: the low context is live"
         );
         pic.step(); // low RETFIE: back to main at byte 4
         assert_eq!(pic.pc(), 4, "low RETFIE resumes main");
-        assert_eq!(pic.ram[0xFF2] & 0x40, 0x40, "GIEL back on after low");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEL,
+            PIC18_GIEL,
+            "GIEL back on after low"
+        );
         assert_eq!(pic.ram[0x21], 0x11, "low ISR's store survived preemption");
     }
 
     #[test]
     fn low_request_needs_gieh_giel_and_source_enable() {
         let mut pic = pic_with_both_isrs();
-        pic.ram[0xFF2] = 0x80; // GIEH only: GIEL clear
+        pic.ram[PIC18_INTCON] = PIC18_GIEH; // GIEH only: GIEL clear
         pic.request_low_interrupt();
         assert!(pic.low_interrupt_pending(), "low request must latch");
         pic.run(3);
         assert_eq!(pic.pc(), 6, "must stay masked while GIEL is clear");
-        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.ram[PIC18_INTCON] = PIC18_GIEH | PIC18_GIEL | PIC18_INT0IE;
         pic.run(1);
-        assert_eq!(pic.pc(), 0x0018, "must vector to 0x0018 once enabled");
+        assert_eq!(pic.pc(), PIC18_LO_VECTOR, "must vector once enabled");
         assert!(!pic.low_interrupt_pending(), "the latch is consumed");
+    }
+
+    #[test]
+    fn low_request_vectors_through_tmr0ie() {
+        let mut pic = pic_with_both_isrs();
+        pic.ram[PIC18_INTCON] = PIC18_GIEH | PIC18_GIEL | PIC18_TMR0IE;
+        pic.request_low_interrupt();
+        assert!(pic.low_interrupt_pending(), "low request must latch");
+        pic.run(1);
+        assert_eq!(pic.pc(), PIC18_LO_VECTOR, "must vector to 0x0018 on TMR0IE");
+        assert!(!pic.low_interrupt_pending(), "the latch is consumed");
+        assert_eq!(
+            pic.ram()[PIC18_INTCON] & PIC18_GIEL,
+            0,
+            "GIEL cleared on low entry"
+        );
     }
 
     #[test]
     fn high_wins_when_both_requests_are_latched() {
         let mut pic = pic_with_both_isrs();
-        pic.ram[0xFF2] = 0xD0; // GIEH | GIEL | INT0IE
+        pic.ram[PIC18_INTCON] = PIC18_GIEH | PIC18_GIEL | PIC18_INT0IE;
         pic.request_interrupt();
         pic.request_low_interrupt();
         pic.run(1); // the boundary serves the high request first
-        assert_eq!(pic.pc(), 0x0008, "high wins over a latched low request");
+        assert_eq!(pic.pc(), PIC18_HI_VECTOR, "high wins over a latched low");
+    }
+}
+
+#[cfg(test)]
+mod pic18_halt {
+    use super::Pic18;
+
+    /// The byte-PC halt boundary: `pc` counts bytes while `prog` counts
+    /// words, so the stop predicate must halve `pc` first. A linear run
+    /// past byte address `prog.len()` must not halt (epic-cc#499).
+    #[test]
+    fn linear_run_past_word_count_does_not_halt() {
+        let mut prog = vec![0x0000u16; 16];
+        prog[12] = 0x0003; // SLEEP at byte 24
+        let mut pic = Pic18::new(prog);
+        pic.run(8); // eight NOPs, pc == 16 == the prog word count
+        assert_eq!(pic.pc(), 16, "reached the word-count boundary");
+        assert!(!pic.halted(), "bytes are not words: must keep running");
+        pic.run(100);
+        assert!(pic.halted(), "SLEEP still stops the run");
+        assert_eq!(pic.pc(), 24, "halted at SLEEP, past the boundary");
     }
 }
 
