@@ -251,10 +251,15 @@ fn swept_words() -> Vec<[u8; 4]> {
 
 /// The general 4-lane left-shift family: rotate every byte right by `8 - r`
 /// with `RRNCF`, then recombine high-to-low. The `MOVLW` literals are static
-/// because `Candidate` holds `&'static str`.
+/// because `Candidate` holds `&'static str`. Amounts 4 and 5 are included
+/// as the fusion attempt for epic-cc#573: one rotation phase covering the
+/// nibble and the extra bits together, instead of a nibble pass plus a
+/// single-bit pass.
 fn construction_shl_family(r: u32) -> Candidate {
     // (rotate count, MOVLW hi, MOVLW lo) per amount with a fused form.
     let (rot, hi, lo) = match r {
+        4 => (4, "movlw 0xF0", "andlw 0x0F"),
+        5 => (3, "movlw 0xE0", "andlw 0x1F"),
         6 => (2, "movlw 0xC0", "andlw 0x3F"),
         7 => (1, "movlw 0x80", "andlw 0x7F"),
         _ => unreachable!("only the amounts with a fused form"),
@@ -311,6 +316,43 @@ fn left_shift_32bit_by_7_fused_form_wins() {
         "the fused amount-7 form must be correct over the sample"
     );
     assert!(c.len() < 5 * 7, "21 words beats the 35-word unroll");
+}
+
+// epic-cc#573: the fusion verdict at amounts 4 and 5. Fusing the extra
+// bits into the nibble pass as one rotation phase costs 4*(8-r) rotate
+// words plus the 17-word combine: 33 at amount 4, 29 at amount 5. Both
+// verify (same swept domain as the winning amounts), and both lose to
+// the unroll (20/25) by more than the dedicated nibble forms do (21/26).
+// The rotation phase alone already spends most of the budget, and the two
+// passes sweep opposite directions (combine high-to-low, bit pass
+// low-to-high) with no shared subexpression, so interleaving cannot
+// undercut the concatenation either. Amounts 4 and 5 stay unrolled.
+#[test]
+fn left_shift_32bit_by_4_fused_form_is_correct_and_loses() {
+    let c = construction_shl_family(4);
+    assert_eq!(c.len(), 33, "4*4 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shl, 4, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-4 form must be correct over the sample"
+    );
+    assert!(c.len() > 5 * 4, "33 words against the 20-word unroll");
+}
+
+#[test]
+fn left_shift_32bit_by_5_fused_form_is_correct_and_loses() {
+    let c = construction_shl_family(5);
+    assert_eq!(c.len(), 29, "4*3 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shl, 5, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-5 form must be correct over the sample"
+    );
+    assert!(c.len() > 5 * 5, "29 words against the 25-word unroll");
 }
 
 #[test]
