@@ -56,7 +56,7 @@ pub fn legalize(m: Module) -> Module {
     // originals whose stored address was rewritten to a copy, so the
     // candidate filler can accept the copy at every other context's site
     // (they all read the same shared storage, epic-cc#568).
-    let (m, stored_lo, stored_hi) = duplicate_isr_shared(m);
+    let (m, stored_lo, stored_hi, spellings) = duplicate_isr_shared(m);
     let m = sink_ptr_select_funcs(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
@@ -146,7 +146,7 @@ pub fn legalize(m: Module) -> Module {
         funcs,
         module_asm: m.module_asm,
     };
-    fill_indirect_callees(&mut m, &stored_lo, &stored_hi);
+    fill_indirect_callees(&mut m, &stored_lo, &stored_hi, &spellings);
     m
 }
 
@@ -1626,10 +1626,10 @@ fn isr_context_for(
 ) -> (
     HashSet<String>,
     HashSet<(String, u16)>,
-    HashSet<(String, usize)>,
+    HashSet<(String, usize, String)>,
 ) {
     let mut isr_ctx: HashSet<String> = roots.iter().flat_map(|r| reachable(&[*r], adj)).collect();
-    let mut param_stores: HashSet<(String, usize)> = HashSet::new();
+    let mut param_stores: HashSet<(String, usize, String)> = HashSet::new();
     let aliases = global_ptr_aliases(m);
     // Store edges, iterated to a fixpoint: a defined function (or a param
     // resolved through call sites) stored into a global the ISR context
@@ -1668,7 +1668,7 @@ fn isr_context_for(
                                 let param_idx =
                                     f.params.iter().position(|param| param.name == *reg_name);
                                 if let Some(pi) = param_idx {
-                                    param_stores.insert((f.name.clone(), pi));
+                                    param_stores.insert((f.name.clone(), pi, g.clone()));
                                     for cf in &m.funcs {
                                         for cb in &cf.blocks {
                                             for ci in &cb.insts {
@@ -1810,13 +1810,36 @@ fn isr_context_for(
 /// mid-call, gets `_isr_high` so its frames never overlap the low's.
 const LO_SUFFIX: &str = "_isr";
 const HI_SUFFIX: &str = "_isr_high";
-fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>) {
+/// The spelling a storage global holds after the cross-context rewrite:
+/// storage -> [(dispatched name, owning priority)]. Dispatch sites scope
+/// their candidate lists through this map, so a site never lists a frame
+/// from the other priority's region (ADR-038).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SpellPrio {
+    Lo,
+    Hi,
+    Main,
+}
+
+fn duplicate_isr_shared(
+    m: Module,
+) -> (
+    Module,
+    HashSet<String>,
+    HashSet<String>,
+    HashMap<String, Vec<(String, SpellPrio)>>,
+) {
     // Originals whose stored address was rewritten to this priority's
     // copy: the storage they were stored into is read by that priority,
     // so every OTHER context reading the same storage now holds the
     // copy's address and its dispatch sites must list it (epic-cc#568).
     let mut stored_lo: HashSet<String> = HashSet::new();
     let mut stored_hi: HashSet<String> = HashSet::new();
+    let mut spellings: HashMap<String, Vec<(String, SpellPrio)>> = HashMap::new();
+    // Storage keys are canonicalized through the pointer aliases so a
+    // store into `g_handle = &g_storage` records under the same key the
+    // dispatch site's load resolves to.
+    let aliases = global_ptr_aliases(&m);
     // Partition ISR roots by priority: 1 = high, anything else ISR =
     // low (priority 0 is the compatibility single-vector mode).
     let hi_roots: HashSet<&str> = m
@@ -1832,7 +1855,7 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
         .map(|f| f.name.as_str())
         .collect();
     if hi_roots.is_empty() && lo_roots.is_empty() {
-        return (m, stored_lo, stored_hi);
+        return (m, stored_lo, stored_hi, spellings);
     }
     // Mode validation: each vector owns at most one handler, and the
     // compatibility single-vector mode (priority 0) never mixes with
@@ -1913,7 +1936,7 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
         .map(|f| f.name.clone())
         .collect();
     if shared_lo.is_empty() && shared_hi.is_empty() {
-        return (m, stored_lo, stored_hi);
+        return (m, stored_lo, stored_hi, spellings);
     }
 
     // Deep-clone each shared func with its priority's suffix (renamed,
@@ -2095,8 +2118,8 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
         // field granularity here (the memcpy already flattens the struct),
         // so this is alloca-whole-object, not field-sensitive like the
         // direct-store case below.
-        let mut alloca_feeds_lo: HashSet<String> = HashSet::new();
-        let mut alloca_feeds_hi: HashSet<String> = HashSet::new();
+        let mut alloca_feeds_lo: HashMap<String, Vec<String>> = HashMap::new();
+        let mut alloca_feeds_hi: HashMap<String, Vec<String>> = HashMap::new();
         for b in &f.blocks {
             for inst in &b.insts {
                 let Inst::Memcpy(mc) = inst else { continue };
@@ -2108,10 +2131,13 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                     continue;
                 };
                 if lo_read.iter().any(|(rg, _)| *rg == g) {
-                    alloca_feeds_lo.insert(src_reg.clone());
+                    alloca_feeds_lo
+                        .entry(src_reg.clone())
+                        .or_default()
+                        .push(g.clone());
                 }
                 if hi_read.iter().any(|(rg, _)| *rg == g) {
-                    alloca_feeds_hi.insert(src_reg);
+                    alloca_feeds_hi.entry(src_reg).or_default().push(g);
                 }
             }
         }
@@ -2132,6 +2158,7 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                             .any(|(rg, rk)| *rg == g && (*rk == ALL_FIELDS || *rk == sk))
                             || handle_feeds_hi.contains(&g);
                         if let Val::Global(fn_name) = &s.val {
+                            let fn_name = fn_name.clone();
                             let lo_hit =
                                 !in_lo && feeds_lo && shared_lo_set.contains(fn_name.as_str());
                             let hi_hit =
@@ -2140,12 +2167,28 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                                 panic!(
                                     "legalize: store of @{fn_name} feeds both ISR priorities' read sets; no single copy serves both contexts"
                                 );
-                            } else if lo_hit {
+                            }
+                            let (spelling, prio) = if lo_hit {
                                 stored_lo.insert(fn_name.clone());
-                                s.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
+                                (format!("{fn_name}{LO_SUFFIX}"), SpellPrio::Lo)
                             } else if hi_hit {
                                 stored_hi.insert(fn_name.clone());
-                                s.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
+                                (format!("{fn_name}{HI_SUFFIX}"), SpellPrio::Hi)
+                            } else {
+                                (fn_name.clone(), SpellPrio::Main)
+                            };
+                            s.val = Val::Global(spelling.clone());
+                            // Only defined functions are dispatchable
+                            // callbacks: pointer stores whose value is
+                            // another global (the `g_handle = &g_storage`
+                            // idiom) are address plumbing, not a
+                            // registrable spelling.
+                            if defined.contains(fn_name.as_str()) {
+                                let key = aliases
+                                    .get(g.as_str())
+                                    .cloned()
+                                    .unwrap_or_else(|| g.clone());
+                                spellings.entry(key).or_default().push((spelling, prio));
                             }
                         }
                         continue;
@@ -2154,22 +2197,59 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                         continue;
                     };
                     if let Val::Global(fn_name) = &s.val {
+                        let fn_name = fn_name.clone();
                         let lo_hit = !in_lo
-                            && alloca_feeds_lo.contains(&root)
+                            && alloca_feeds_lo.contains_key(&root)
                             && shared_lo_set.contains(fn_name.as_str());
                         let hi_hit = !in_hi
-                            && alloca_feeds_hi.contains(&root)
+                            && alloca_feeds_hi.contains_key(&root)
                             && shared_hi_set.contains(fn_name.as_str());
                         if lo_hit && hi_hit {
                             panic!(
                                 "legalize: store of @{fn_name} (via a memcpy'd local) feeds both ISR priorities' read sets; no single copy serves both contexts"
                             );
-                        } else if lo_hit {
+                        }
+                        let (spelling, prio) = if lo_hit {
                             stored_lo.insert(fn_name.clone());
-                            s.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
+                            (format!("{fn_name}{LO_SUFFIX}"), SpellPrio::Lo)
                         } else if hi_hit {
                             stored_hi.insert(fn_name.clone());
-                            s.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
+                            (format!("{fn_name}{HI_SUFFIX}"), SpellPrio::Hi)
+                        } else {
+                            (fn_name.clone(), SpellPrio::Main)
+                        };
+                        s.val = Val::Global(spelling.clone());
+                        // The alloca feeds one storage per priority side;
+                        // each of those storages now holds this spelling.
+                        let storages = match prio {
+                            SpellPrio::Lo => alloca_feeds_lo.get(&root).cloned(),
+                            SpellPrio::Hi => alloca_feeds_hi.get(&root).cloned(),
+                            // A main-band spelling is occupiable at every
+                            // site, so it is recorded under every storage
+                            // the alloca feeds, like the direct-store arm.
+                            SpellPrio::Main => {
+                                let mut fed: Vec<String> =
+                                    alloca_feeds_lo.get(&root).cloned().unwrap_or_default();
+                                fed.extend(alloca_feeds_hi.get(&root).cloned().unwrap_or_default());
+                                Some(fed)
+                            }
+                        };
+                        if let Some(storages) = storages {
+                            for storage in storages {
+                                // Only defined functions are dispatchable
+                                // callbacks (see the direct-store case).
+                                if !defined.contains(fn_name.as_str()) {
+                                    continue;
+                                }
+                                let key = aliases
+                                    .get(storage.as_str())
+                                    .cloned()
+                                    .unwrap_or_else(|| storage.clone());
+                                spellings
+                                    .entry(key)
+                                    .or_default()
+                                    .push((spelling.clone(), prio));
+                            }
                         }
                     }
                 }
@@ -2198,7 +2278,9 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                     let mut lo_args: Vec<usize> = Vec::new();
                     let mut hi_args: Vec<usize> = Vec::new();
                     if !in_lo {
-                        for (_, pi) in lo_params.iter().filter(|(callee, _)| callee == &c.func) {
+                        for (_, pi, _) in
+                            lo_params.iter().filter(|(callee, _, _)| callee == &c.func)
+                        {
                             if let Some(a) = c.args.get(*pi) {
                                 if let Val::Global(fn_name) = &a.val {
                                     if shared_lo_set.contains(fn_name.as_str()) {
@@ -2209,7 +2291,9 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                         }
                     }
                     if !in_hi {
-                        for (_, pi) in hi_params.iter().filter(|(callee, _)| callee == &c.func) {
+                        for (_, pi, _) in
+                            hi_params.iter().filter(|(callee, _, _)| callee == &c.func)
+                        {
                             if let Some(a) = c.args.get(*pi) {
                                 if let Val::Global(fn_name) = &a.val {
                                     if shared_hi_set.contains(fn_name.as_str()) {
@@ -2227,21 +2311,53 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
                         }
                     }
                     for pi in lo_args {
+                        let fn_name = match c.args.get(pi).map(|a| &a.val) {
+                            Some(Val::Global(g)) => g.clone(),
+                            _ => continue,
+                        };
+                        let storages: Vec<String> = lo_params
+                            .iter()
+                            .filter(|(callee, p, _)| callee == &c.func && *p == pi)
+                            .map(|(_, _, s)| s.clone())
+                            .collect();
+                        for storage in &storages {
+                            let key = aliases
+                                .get(storage.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| storage.clone());
+                            spellings
+                                .entry(key)
+                                .or_default()
+                                .push((format!("{fn_name}{LO_SUFFIX}"), SpellPrio::Lo));
+                        }
+                        stored_lo.insert(fn_name.clone());
                         if let Some(a) = c.args.get_mut(pi) {
-                            if let Val::Global(fn_name) = &a.val {
-                                let fn_name = fn_name.clone();
-                                stored_lo.insert(fn_name.clone());
-                                a.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
-                            }
+                            a.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
                         }
                     }
                     for pi in hi_args {
+                        let fn_name = match c.args.get(pi).map(|a| &a.val) {
+                            Some(Val::Global(g)) => g.clone(),
+                            _ => continue,
+                        };
+                        let storages: Vec<String> = hi_params
+                            .iter()
+                            .filter(|(callee, p, _)| callee == &c.func && *p == pi)
+                            .map(|(_, _, s)| s.clone())
+                            .collect();
+                        for storage in &storages {
+                            let key = aliases
+                                .get(storage.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| storage.clone());
+                            spellings
+                                .entry(key)
+                                .or_default()
+                                .push((format!("{fn_name}{HI_SUFFIX}"), SpellPrio::Hi));
+                        }
+                        stored_hi.insert(fn_name.clone());
                         if let Some(a) = c.args.get_mut(pi) {
-                            if let Val::Global(fn_name) = &a.val {
-                                let fn_name = fn_name.clone();
-                                stored_hi.insert(fn_name.clone());
-                                a.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
-                            }
+                            a.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
                         }
                     }
                 }
@@ -2256,6 +2372,7 @@ fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>)
         },
         stored_lo,
         stored_hi,
+        spellings,
     )
 }
 
@@ -2339,7 +2456,12 @@ fn rewrite_inst_vals(
 /// runtime, so its dispatch sites must list the copy, not the vanished
 /// original (epic-cc#568).
 /// `!callees` metadata stays unconsumed (clang omits it for table loads).
-fn fill_indirect_callees(m: &mut Module, stored_lo: &HashSet<String>, stored_hi: &HashSet<String>) {
+fn fill_indirect_callees(
+    m: &mut Module,
+    stored_lo: &HashSet<String>,
+    stored_hi: &HashSet<String>,
+    spellings: &HashMap<String, Vec<(String, SpellPrio)>>,
+) {
     // A candidate is a rewritten copy of a stored original: `f_isr` with
     // `f` in `stored_lo` (symmetrically for the high suffix).
     let stored_copy = |g: &str, stored: &HashSet<String>, suffix: &str| {
@@ -2397,6 +2519,10 @@ fn fill_indirect_callees(m: &mut Module, stored_lo: &HashSet<String>, stored_hi:
     // store-edge fixpoint (a stored callback joins through the global
     // the ISR reads, not through a direct call).
     let (adj2, _) = isr_adjacency(m);
+    // Storage keys are canonicalized through the pointer aliases so a
+    // site loading through `g_handle = &g_storage` scopes to the same
+    // spellings a direct store into `g_storage` recorded.
+    let aliases = global_ptr_aliases(m);
     let lo_roots: HashSet<&str> = m
         .funcs
         .iter()
@@ -2421,6 +2547,29 @@ fn fill_indirect_callees(m: &mut Module, stored_lo: &HashSet<String>, stored_hi:
         let in_lo = lo2.contains(&f.name);
         let in_hi = hi2.contains(&f.name);
         let in_main = main2.contains(&f.name);
+        // Per-site dispatch storages: the global field each indirect
+        // pointer is loaded from (ADR-038). Resolvable sites scope their
+        // candidates to that storage's spellings; unresolvable sites
+        // keep the context-scoped whole-program list.
+        let bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Gep(g) => Some((g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()))),
+                _ => None,
+            })
+            .collect();
+        let load_storages: HashMap<String, String> = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Load(l) => global_field_map(&l.ptr, &bases)
+                    .map(|(g, _)| (l.dst.clone(), aliases.get(g.as_str()).cloned().unwrap_or(g))),
+                _ => None,
+            })
+            .collect();
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 if let Inst::Call(c) = inst {
@@ -2430,30 +2579,74 @@ fn fill_indirect_callees(m: &mut Module, stored_lo: &HashSet<String>, stored_hi:
                     if defined.contains(c.func.as_str()) {
                         continue;
                     }
-                    let mut cands: Vec<String> = addr_taken
-                        .iter()
-                        .filter(|g| {
-                            (!in_main
-                                || (!lo2.contains(*g) && !hi2.contains(*g))
-                                || stored_copy(g, stored_lo, LO_SUFFIX)
-                                || stored_copy(g, stored_hi, HI_SUFFIX))
-                                && (!in_lo
-                                    || lo2.contains(*g)
+                    let scoped = load_storages
+                        .get(&c.func)
+                        .and_then(|s| spellings.get(s))
+                        .filter(|entries| !entries.is_empty());
+                    let mut cands: Vec<String> = match scoped {
+                        Some(entries) => entries
+                            .iter()
+                            .filter(|(_, prio)| match prio {
+                                // A site must not execute a frame from the
+                                // priority that can preempt it: the higher
+                                // context re-enters the lower one's static
+                                // frame mid-callback (ADR-038). A site with
+                                // no execution context (an uncalled
+                                // original) admits everything.
+                                SpellPrio::Main => true,
+                                SpellPrio::Lo => !in_hi,
+                                SpellPrio::Hi => !in_lo,
+                            })
+                            .map(|(n, _)| n.clone())
+                            .collect(),
+                        None => addr_taken
+                            .iter()
+                            .filter(|g| {
+                                (!in_main
+                                    || (!lo2.contains(*g) && !hi2.contains(*g))
+                                    || stored_copy(g, stored_lo, LO_SUFFIX)
                                     || stored_copy(g, stored_hi, HI_SUFFIX))
-                                && (!in_hi
-                                    || hi2.contains(*g)
-                                    || stored_copy(g, stored_lo, LO_SUFFIX))
-                        })
-                        .filter(|g| arity.get(*g).copied() == Some(c.args.len()))
-                        .filter(|g| {
-                            let widths = param_widths.get(*g).map(Vec::as_slice).unwrap_or(&[]);
-                            c.args
-                                .iter()
-                                .zip(widths.iter())
-                                .all(|(a, &w)| u16::from(a.ty.map(|t| t.bytes()).unwrap_or(2)) == w)
-                        })
-                        .cloned()
-                        .collect();
+                                    && (!in_lo
+                                        || lo2.contains(*g)
+                                        || stored_copy(g, stored_hi, HI_SUFFIX))
+                                    && (!in_hi
+                                        || hi2.contains(*g)
+                                        || stored_copy(g, stored_lo, LO_SUFFIX))
+                            })
+                            .cloned()
+                            .collect(),
+                    };
+                    cands.retain(|g| arity.get(g).copied() == Some(c.args.len()));
+                    cands.retain(|g| {
+                        let widths = param_widths.get(g).map(Vec::as_slice).unwrap_or(&[]);
+                        c.args
+                            .iter()
+                            .zip(widths.iter())
+                            .all(|(a, &w)| u16::from(a.ty.map(|t| t.bytes()).unwrap_or(2)) == w)
+                    });
+                    // ADR-038: a priority site whose dispatch storage holds
+                    // only the other priority's spelling cannot dispatch
+                    // soundly (the higher context re-enters the lower's
+                    // static frame). Fail loudly instead of skipping the
+                    // call (epic-cc#467's silent-skip class). Checked after
+                    // the arity and width retains so the guarantee covers
+                    // the final list.
+                    if (in_lo || in_hi)
+                        && scoped.map_or(false, |e| !e.is_empty())
+                        && cands.is_empty()
+                    {
+                        eprintln!(
+                            "DBG panic site={} in_lo={in_lo} in_hi={in_hi} entries={:?} storage={}",
+                            f.name,
+                            scoped.unwrap(),
+                            load_storages[&c.func]
+                        );
+                        panic!(
+                            "legalize: dispatch site in @{} reads @{} whose stored callback serves only the other priority; register per-priority spellings or confine the dispatch (ADR-038)",
+                            f.name,
+                            load_storages[&c.func]
+                        );
+                    }
                     // A candidate that is a duplicated ORIGINAL
                     // (address-taken elsewhere, e.g. a select arm) must
                     // dispatch the copy for each context this site
