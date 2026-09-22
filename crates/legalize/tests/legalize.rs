@@ -610,6 +610,121 @@ fn fills_memcpy_struct_copy_callback_candidates() {
     );
 }
 
+/// A callback that flows into an ISR-read global through a handle GLOBAL
+/// memcpy'd whole-object inside an Init helper (the HAL `Init(&h)` idiom
+/// with the handle as a file-scope static, epic-cc#484): main stores the
+/// callback into the handle's callback field, `init` memcpy's the handle
+/// into the ISR-read storage global, and the ISR calls through the
+/// storage's field. Here the memcpy source is the handle global itself
+/// (clang promotes Init's param when one call site feeds it).
+#[test]
+fn fills_global_handle_memcpy_callback_candidates() {
+    let m = parse(
+        "global g_h i8\n\
+         global g_storage i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = gep @g_h +2\n\
+             store i16 @cb %p\n\
+             call void @init()\n\
+             ret void\n\
+         fn init(void) ()\n\
+           block entry:\n\
+             memcpy @g_storage @g_h 4\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %q = gep @g_storage +2\n\
+             %1 = load i16 %q\n\
+             call void @1()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing: the handle-global memcpy write-edge was not detected"
+    );
+    let isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    let call = isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("isr call");
+    assert_eq!(
+        call.callees,
+        vec!["cb_isr".to_string()],
+        "the ISR site must dispatch the copy"
+    );
+    // main's store into the handle global points at the `_isr` copy: at
+    // runtime the storage field carries the copy's address, so the ISR
+    // enters the disjoint ISR-region frame, not the preemptable original.
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let main_store = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Store(s) => Some(s),
+            _ => None,
+        })
+        .expect("main store");
+    assert_eq!(
+        main_store.val,
+        ir::Val::Global("cb_isr".to_string()),
+        "main's handle-field store must point at the _isr copy"
+    );
+}
+
+/// The same handle-memcpy flow with the memcpy source still Init's param
+/// (the idiom before clang promotes it, e.g. several call sites): the
+/// handle global is recovered from the call sites, and the callback joins
+/// the ISR context exactly as in the promoted form.
+#[test]
+fn fills_param_handle_memcpy_callback_candidates() {
+    let m = parse(
+        "global g_h i8\n\
+         global g_storage i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = gep @g_h +2\n\
+             store i16 @cb %p\n\
+             call void @init(i16 @g_h)\n\
+             ret void\n\
+         fn init(i16) (0=i16)\n\
+           block entry:\n\
+             memcpy @g_storage %0 4\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %q = gep @g_storage +2\n\
+             %1 = load i16 %q\n\
+             call void @1()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing: the param-pointed handle memcpy write-edge was not detected"
+    );
+    let isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    let call = isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("isr call");
+    assert_eq!(call.callees, vec!["cb_isr".to_string()]);
+}
+
 /// A callback that flows into an ISR-read global through a function
 /// parameter (the `EPIC_GPIO_RegisterChangeCallback(on_rb_change)` shape):
 /// the call site's argument is rewritten to the `_isr` copy and the ISR
