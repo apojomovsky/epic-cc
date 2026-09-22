@@ -876,3 +876,44 @@ fn const_ramref_struct_materializes_the_alloc_address() {
     p.run(10_000);
     assert!(p.halted());
 }
+
+/// epic-cc#559: an i1 global through the baseline backend. clang's own -O1
+/// GlobalOpt narrows an internal flag only ever written 0/1 down to
+/// `global i1` (epic-cc#462), so this is a shape real programs produce.
+/// The backend used to panic with "isel: only i8/i16 loads supported";
+/// PIC14 (epic-cc#465) and PIC18 (epic-cc#464) already handled it.
+///
+/// `flag` starts true; clang inverts the representation and emits
+/// `xor (load i1 @flag), true`, so what reaches `out` through a `zext` is
+/// the inverted loaded byte, 1 here. The observable contract is that the i1
+/// load lowers at all (pre-fix the backend panicked) and that the byte stays
+/// a normalized 0/1.
+///
+/// Run on two of the four baseline parts: the lowering is device-generic,
+/// and p16f505 additionally exercises a 2-bit bank layout.
+#[test]
+fn i1_memory_c_runs_correctly() {
+    let _guard = E2E_LOCK.lock();
+    for (device, name) in [
+        (&device::PIC12F509, "i1_memory_509"),
+        (&device::PIC16F505, "i1_memory_505"),
+    ] {
+        let (mut p, globals, asm) = compile_asm_for(device, "tests/fixtures/i1_memory.c");
+        p.run(200_000);
+        assert!(p.halted(), "{name}: program must halt");
+        assert_eq!(
+            p.ram()[globals["out"] as usize],
+            1,
+            "{name}: the i1 load must lower and reach out; pre-fix the              backend panicked"
+        );
+        // The flag byte must be a normalized 0/1, the convention every i1
+        // consumer relies on (they test the whole byte for nonzero).
+        let flag = p.ram()[globals["flag"] as usize];
+        assert!(
+            flag == 0 || flag == 1,
+            "{name}: an i1 store must write 0/1, got {flag:#04x}"
+        );
+        // Independent cross-check: gpasm must assemble the same words.
+        gpasm_agrees(&asm, name);
+    }
+}

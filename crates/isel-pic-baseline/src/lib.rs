@@ -1567,7 +1567,12 @@ impl<'m> Gen<'m> {
         self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
-                assert!(l.ty != Ty::I1, "isel: only i8/i16 loads supported");
+                // An i1 global is real: clang's own -O1 GlobalOpt narrows
+                // an internal flag only ever written 0/1 down to `global i1`
+                // (epic-cc#462). i1 is one byte in the byte model, so the
+                // arms below (`bytes()` is 1) are the whole story; this
+                // mirrors the PIC14 (epic-cc#465) and PIC18 (epic-cc#464)
+                // backends.
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 if let Some(g) = l.ptr.strip_prefix('@') {
                     if self.global_is_const(g) {
@@ -1607,7 +1612,13 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Store(s) => {
-                assert!(s.ty != Ty::I1, "isel: only i8/i16 stores supported");
+                // Same i1-in-memory story as the Load arm above
+                // (epic-cc#462). The byte path is exact because producers
+                // normalize to 0/1 (`icmp` materializes 0x00/0x01, `trunc`
+                // to i1 masks with 0x01, constants are 0/1, and `__start`
+                // writes `g.bytes`), so consumers are correct whether they
+                // test the byte for nonzero (`brcond`, `select`) or copy it
+                // numerically (`zext`).
                 if let Some(g) = s.ptr.strip_prefix('@') {
                     let dst = self.global_addr(g);
                     self.emit_move_val_to_slot(&s.val, s.ty, dst);
