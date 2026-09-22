@@ -2245,3 +2245,57 @@ fn pushes_consecutive_labels_instead_of_merging_them() {
     assert_eq!(f.blocks[0].insts.len(), 0);
     assert_eq!(f.blocks[1].insts.len(), 1);
 }
+
+#[test]
+fn scalar_global_with_a_nonzero_initializer_decodes_its_bytes() {
+    // epic-cc#454: the scalar branch used to discard the initializer, so a
+    // mutable global with a value never left the parser with its bytes and
+    // no emitter could initialize it.
+    let m = parse_ll("@x = global i8 7\ndefine void @main() { ret void }\n");
+    let g = m.globals.iter().find(|g| g.name == "x").expect("x");
+    assert_eq!(g.bytes, vec![7u8], "i8 7 decodes to its byte");
+}
+
+#[test]
+fn scalar_i16_global_decodes_two_little_endian_bytes() {
+    let m = parse_ll("@x = global i16 258\ndefine void @main() { ret void }\n");
+    let g = m.globals.iter().find(|g| g.name == "x").expect("x");
+    assert_eq!(g.bytes, vec![0x02u8, 0x01], "0x0102 little-endian");
+}
+
+#[test]
+fn scalar_zero_initializer_keeps_bytes_empty() {
+    // An all-zero initializer must not gain init code: RAM already holds 0,
+    // and `needs_ram_init` keys off a non-zero byte or a ref.
+    let m = parse_ll("@x = global i8 0\ndefine void @main() { ret void }\n");
+    let g = m.globals.iter().find(|g| g.name == "x").expect("x");
+    assert!(g.bytes.is_empty(), "explicit zero stays empty");
+    assert!(!g.needs_ram_init(), "a zero scalar needs no init write");
+}
+
+#[test]
+fn scalar_pointer_initializer_records_both_address_halves() {
+    let m = parse_ll("@p = global ptr @x\n@x = global i8 1\ndefine void @main() { ret void }\n");
+    let g = m.globals.iter().find(|g| g.name == "p").expect("p");
+    assert_eq!(
+        g.refs,
+        vec![(0usize, "x".to_string()), (1, "x".to_string())],
+        "a ptr global records a ref at each address half"
+    );
+    assert!(g.needs_ram_init(), "a pointer initializer needs its write");
+}
+
+#[test]
+fn nonzero_scalar_survives_a_trailing_attribute_tail() {
+    // The value ends at the first top-level comma: `, align 2, !dbg !0` is
+    // the attribute tail, not part of the initializer.
+    let m = parse_ll(
+        "@x = dso_local global i16 5, align 2, !dbg !0\ndefine void @main() { ret void }\n",
+    );
+    let g = m.globals.iter().find(|g| g.name == "x").expect("x");
+    assert_eq!(
+        g.bytes,
+        vec![5u8, 0],
+        "align/!dbg tail does not corrupt the value"
+    );
+}

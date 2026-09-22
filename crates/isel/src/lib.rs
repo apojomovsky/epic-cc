@@ -6205,7 +6205,7 @@ fn word_size(lines: &[String]) -> usize {
 fn start_init_words(m: &Module, addrs: &HashMap<String, u16>) -> usize {
     m.globals
         .iter()
-        .filter(|g| g.is_const && addrs.contains_key(&g.name))
+        .filter(|g| addrs.contains_key(&g.name) && g.needs_ram_init())
         .map(|g| 2 * g.bytes.len())
         .sum()
 }
@@ -6582,7 +6582,7 @@ pub fn select_with_locs(
         // need their bytes initialized before main runs.
         let mut init: Vec<String> = Vec::new();
         for g in &m.globals {
-            if g.is_const && addrs.contains_key(&g.name) {
+            if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     // A ref byte materializes its address half from the
@@ -6681,7 +6681,7 @@ pub fn select_with_locs(
     if !has_isr {
         let mut init: Vec<String> = Vec::new();
         for g in &m.globals {
-            if g.is_const && addrs.contains_key(&g.name) {
+            if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     // A ref byte materializes its address half from the
@@ -6714,7 +6714,7 @@ pub fn select_with_locs(
         if has_isr && name == isr_names[0] {
             let mut init: Vec<String> = Vec::new();
             for g in &m.globals {
-                if g.is_const && addrs.contains_key(&g.name) {
+                if addrs.contains_key(&g.name) && g.needs_ram_init() {
                     let base = addrs[&g.name];
                     for (idx, b) in g.bytes.iter().enumerate() {
                         // A ref byte materializes its address half from the
@@ -6950,10 +6950,23 @@ pub fn select_with_locs(
                     // page 0 per the ISR fit check above.
                     let mut init: Vec<String> = Vec::new();
                     for g in &m.globals {
-                        if g.is_const && addrs.contains_key(&g.name) {
+                        if addrs.contains_key(&g.name) && g.needs_ram_init() {
                             let base = addrs[&g.name];
                             for (i, b) in g.bytes.iter().enumerate() {
-                                init.push(format!("    MOVLW 0x{b:02X}"));
+                                // A ref byte materializes its address half
+                                // from the alloc map for RAM targets, else
+                                // the link-time label literal; the raw byte
+                                // is a placeholder zero (epic-cc#454). This
+                                // must match the measure-pass twin above, or
+                                // word counts agree while values differ.
+                                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                                    init.push(format!(
+                                        "    MOVLW {}",
+                                        ref_byte_operand(addrs, i, f)
+                                    ));
+                                } else {
+                                    init.push(format!("    MOVLW 0x{b:02X}"));
+                                }
                                 init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                             }
                         }

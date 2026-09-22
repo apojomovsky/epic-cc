@@ -3464,7 +3464,7 @@ pub fn select_with_locs(
     // power-on reset has bit 5 = 1, so a bank-0 const needs BCF FSR,5).
     let mut init: Vec<String> = Vec::new();
     for g in &m.globals {
-        if g.is_const && addrs.contains_key(&g.name) {
+        if addrs.contains_key(&g.name) && g.needs_ram_init() {
             let base = addrs[&g.name];
             for (i, b) in g.bytes.iter().enumerate() {
                 if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {

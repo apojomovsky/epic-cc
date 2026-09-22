@@ -2316,8 +2316,43 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 };
                 (Ty::I8, size, bytes)
             } else {
-                let ty = ty_of(rest.split_whitespace().next().unwrap(), None);
-                (ty, u16::from(ty.bytes()), Vec::new())
+                // Scalar global: `i8 7`, `i16 258`, `i8 0`, or a pointer
+                // initializer `ptr @g`. The value after the type token must
+                // be decoded, not dropped: a mutable global with an
+                // initializer is only miscompiled silently if its bytes
+                // never leave the parser (epic-cc#454). `zeroinitializer`
+                // and the implicit `i8 0` spelling both decode to zero
+                // bytes, which is what RAM already holds, so a plain
+                // `static uint8_t x;` still costs no init code.
+                let ty_str = rest.split_whitespace().next().unwrap();
+                let ty = ty_of(ty_str, None);
+                let size = u16::from(ty.bytes());
+                // The value runs to the first top-level comma; everything
+                // after it is the attribute tail (`align 2`, `!dbg !0`,
+                // `section "..."`), which is not part of the initializer.
+                // The array/struct branches above delimit their value with
+                // `matching_bracket`; a scalar has no delimiter of its own.
+                let init = split_top_level(&rest[ty_str.len()..], ',')
+                    .into_iter()
+                    .next()
+                    .unwrap_or("")
+                    .trim();
+                // An explicit scalar zero (`i8 0`, `i16 0`) and the
+                // implicit `zeroinitializer` both decode to all-zero bytes
+                // here; dropping them keeps `bytes` empty so the emitters
+                // emit no init code for a global RAM already clears. Any
+                // other value (including a pointer `@g` ref) decodes.
+                let decoded = if init.is_empty() {
+                    Vec::new()
+                } else {
+                    decode_typed_value(ty_str, init, &types, &mut refs)
+                };
+                let bytes = if decoded.iter().all(|&b| b == 0) && refs.is_empty() {
+                    Vec::new()
+                } else {
+                    decoded
+                };
+                (ty, size, bytes)
             };
             let addr = line
                 .find("section \".epicat.")

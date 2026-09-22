@@ -5778,7 +5778,7 @@ fn word_size(lines: &[String]) -> usize {
 fn start_init_words(m: &Module, addrs: &HashMap<String, u16>) -> usize {
     m.globals
         .iter()
-        .filter(|g| g.is_const && addrs.contains_key(&g.name))
+        .filter(|g| addrs.contains_key(&g.name) && g.needs_ram_init())
         .map(|g| 2 * g.bytes.len())
         .sum()
 }
@@ -6056,7 +6056,7 @@ pub fn select_with_locs(
         // const bytes before main runs.
         let mut init: Vec<String> = Vec::new();
         for g in &m.globals {
-            if g.is_const && addrs.contains_key(&g.name) {
+            if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     // A ref byte is the high or low half of a pointer
@@ -6157,7 +6157,7 @@ pub fn select_with_locs(
     if !has_isr {
         let mut init: Vec<String> = Vec::new();
         for g in &m.globals {
-            if g.is_const && addrs.contains_key(&g.name) {
+            if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     // A ref byte is the high or low half of a pointer
@@ -6206,7 +6206,7 @@ pub fn select_with_locs(
         if has_isr && name == isr_names[0] {
             let mut init: Vec<String> = Vec::new();
             for g in &m.globals {
-                if g.is_const && addrs.contains_key(&g.name) {
+                if addrs.contains_key(&g.name) && g.needs_ram_init() {
                     let base = addrs[&g.name];
                     for (idx, b) in g.bytes.iter().enumerate() {
                         // A ref byte is the high or low half of a
@@ -6429,10 +6429,35 @@ pub fn select_with_locs(
                     // in reset reach.
                     let mut init: Vec<String> = Vec::new();
                     for g in &m.globals {
-                        if g.is_const && addrs.contains_key(&g.name) {
+                        if addrs.contains_key(&g.name) && g.needs_ram_init() {
                             let base = addrs[&g.name];
                             for (i, b) in g.bytes.iter().enumerate() {
-                                init.push(format!("    MOVLW 0x{b:02X}"));
+                                // A ref byte is the high or low half of a
+                                // pointer VALUE: a RAM target resolves
+                                // numerically through `addrs`, a flash
+                                // target keeps its label literal; the raw
+                                // byte is a placeholder zero (epic-cc#451,
+                                // epic-cc#154, epic-cc#454). This must match
+                                // the non-ISR emitter above, or word counts
+                                // agree while values differ.
+                                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                                    match addrs.get(f) {
+                                        Some(&a) => {
+                                            let byte = if i % 2 == 0 {
+                                                a & 0xFF
+                                            } else {
+                                                (a >> 8) & 0xFF
+                                            };
+                                            init.push(format!("    MOVLW 0x{byte:02X}"));
+                                        }
+                                        None => {
+                                            let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                                            init.push(format!("    MOVLW {lit}({f})"));
+                                        }
+                                    }
+                                } else {
+                                    init.push(format!("    MOVLW 0x{b:02X}"));
+                                }
                                 init.push(format!("    MOVWF 0x{:02X}", base + i as u16));
                             }
                         }

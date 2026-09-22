@@ -6937,7 +6937,12 @@ pub fn select_with_locs(
     {
         let mut init: Vec<String> = Vec::new();
         for g in &m.globals {
-            if g.is_const && addrs.contains_key(&g.name) {
+            // Const globals living in RAM copy their bytes down; a mutable
+            // global with an initializer also needs its bytes written, or it
+            // silently reads as zero (epic-cc#454). `irparse` keeps `bytes`
+            // empty for a zero-initialized global, so there is nothing to
+            // emit for one and no init cost is added.
+            if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     let addr = base + i as u16;
