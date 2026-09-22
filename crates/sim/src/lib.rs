@@ -88,6 +88,28 @@ pub const PIC18_TMR0IF: u8 = 1 << 2;
 pub const PIC18_INT0IF: u8 = 1 << 1;
 pub const PIC18_HI_VECTOR: u32 = 0x0008;
 pub const PIC18_LO_VECTOR: u32 = 0x0018;
+/// PIC18 power-on reset latches (DS39632E Table 5-1, as recorded in the
+/// vendored HAL's POR block): the nonzero SFR resets over a zero-filled
+/// RAM. Polled firmware reads these before writing anything (TXSTA TRMT
+/// gates the first transmit), so zero-fill alone deadlocks whole-program
+/// runs that pass on hardware. Zero-POR registers are omitted: the fill
+/// already matches them.
+const PIC18_POR: &[(usize, u8)] = &[
+    (0xFAC, 0x02), // TXSTA: TRMT set, TSR empty
+    (0xFD5, 0xFF), // T0CON: on, 8-bit, external, no prescaler
+    (0xFD0, 0x57), // RCON: IPEN clear, reset-cause latches set
+    (0xFF1, 0xFB), // INTCON2: pull-ups off, INT edges rising
+    (0xFF0, 0xC0), // INTCON3: INT1/INT2 high priority
+    (0xF9F, 0xFF), // IPR1: peripherals high priority
+    (0xFA2, 0xFF), // IPR2: peripherals high priority
+    (0xFCB, 0xFF), // PR2: Timer2 period reset
+    (0xFB4, 0x07), // CMCON: comparators off
+    (0xF92, 0xFF), // TRISA: pins are inputs
+    (0xF93, 0xFF), // TRISB: pins are inputs
+    (0xF94, 0xFF), // TRISC: pins are inputs
+    (0xF95, 0xFF), // TRISD: pins are inputs
+    (0xF96, 0xFF), // TRISE: pins are inputs
+];
 
 /// The 16F877A data-EEPROM register file (DS39582C chapter 4): EEDATA
 /// 0x10C and EEADR 0x10D in bank 2, EECON1 0x18C and EECON2 0x18D in
@@ -1980,9 +2002,13 @@ pub struct Pic18 {
 
 impl Pic18 {
     pub fn new(prog: Vec<u16>) -> Self {
+        let mut ram = [0; 4096];
+        for &(addr, v) in PIC18_POR {
+            ram[addr] = v;
+        }
         Pic18 {
             prog,
-            ram: [0; 4096],
+            ram,
             w: 0,
             pc: 0,
             stack: Vec::new(),
@@ -3214,6 +3240,26 @@ mod pic18_halt {
         pic.run(100);
         assert!(pic.halted(), "SLEEP still stops the run");
         assert_eq!(pic.pc(), 24, "halted at SLEEP, past the boundary");
+    }
+}
+
+#[cfg(test)]
+mod pic18_reset {
+    use super::Pic18;
+
+    /// Power-on latches over zero-filled RAM: polled firmware reads these
+    /// before writing anything, so they must match the device at `new`
+    /// (epic-cc#565). GPR stays zero-filled around them.
+    #[test]
+    fn reset_applies_por_latches_and_keeps_gpr_zero() {
+        let pic = Pic18::new(vec![0x0000; 4]);
+        // Every PIC18_POR entry, so a typo in any latch fails the suite.
+        // TXSTA TRMT set means a polled first-transmit wait proceeds with
+        // no SFR write (epic-cc#565).
+        for &(addr, want) in super::PIC18_POR {
+            assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#06X}");
+        }
+        assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
     }
 }
 
