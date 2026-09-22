@@ -52,8 +52,11 @@ pub fn legalize(m: Module) -> Module {
     // Interrupt duplication happens in two layers. User functions split
     // here, before the lowering loop, because their calls already exist.
     // The runtime routines split after it (`split_isr_routines`), because
-    // the loop is what creates their calls.
-    let m = duplicate_isr_shared(m);
+    // the loop is what creates their calls. The returned sets record the
+    // originals whose stored address was rewritten to a copy, so the
+    // candidate filler can accept the copy at every other context's site
+    // (they all read the same shared storage, epic-cc#568).
+    let (m, stored_lo, stored_hi) = duplicate_isr_shared(m);
     let m = sink_ptr_select_funcs(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
@@ -143,7 +146,7 @@ pub fn legalize(m: Module) -> Module {
         funcs,
         module_asm: m.module_asm,
     };
-    fill_indirect_callees(&mut m);
+    fill_indirect_callees(&mut m, &stored_lo, &stored_hi);
     m
 }
 
@@ -1807,7 +1810,13 @@ fn isr_context_for(
 /// mid-call, gets `_isr_high` so its frames never overlap the low's.
 const LO_SUFFIX: &str = "_isr";
 const HI_SUFFIX: &str = "_isr_high";
-fn duplicate_isr_shared(m: Module) -> Module {
+fn duplicate_isr_shared(m: Module) -> (Module, HashSet<String>, HashSet<String>) {
+    // Originals whose stored address was rewritten to this priority's
+    // copy: the storage they were stored into is read by that priority,
+    // so every OTHER context reading the same storage now holds the
+    // copy's address and its dispatch sites must list it (epic-cc#568).
+    let mut stored_lo: HashSet<String> = HashSet::new();
+    let mut stored_hi: HashSet<String> = HashSet::new();
     // Partition ISR roots by priority: 1 = high, anything else ISR =
     // low (priority 0 is the compatibility single-vector mode).
     let hi_roots: HashSet<&str> = m
@@ -1823,7 +1832,7 @@ fn duplicate_isr_shared(m: Module) -> Module {
         .map(|f| f.name.as_str())
         .collect();
     if hi_roots.is_empty() && lo_roots.is_empty() {
-        return m;
+        return (m, stored_lo, stored_hi);
     }
     // Mode validation: each vector owns at most one handler, and the
     // compatibility single-vector mode (priority 0) never mixes with
@@ -1904,7 +1913,7 @@ fn duplicate_isr_shared(m: Module) -> Module {
         .map(|f| f.name.clone())
         .collect();
     if shared_lo.is_empty() && shared_hi.is_empty() {
-        return m;
+        return (m, stored_lo, stored_hi);
     }
 
     // Deep-clone each shared func with its priority's suffix (renamed,
@@ -1933,11 +1942,17 @@ fn duplicate_isr_shared(m: Module) -> Module {
     }
     /// Rewrite direct call targets and function-pointer values inside
     /// `rewrite_set` from duplicated originals to their `suffix` copies.
+    /// Every rewritten address VALUE (a store into a global, a forwarded
+    /// call argument) is recorded in `stored`: the storage it lands in is
+    /// read by this priority, but nothing keeps OTHER contexts that
+    /// dispatch through the same storage from holding the copy's address,
+    /// so the candidate filler must know the rewrite happened (epic-cc#568).
     fn rewrite_calls_to_copies(
         funcs: &mut [Func],
         rewrite_set: &HashSet<String>,
         shared: &HashSet<&str>,
         suffix: &str,
+        stored: &mut HashSet<String>,
     ) {
         for f in funcs.iter_mut() {
             if !rewrite_set.contains(&f.name) {
@@ -1951,7 +1966,7 @@ fn duplicate_isr_shared(m: Module) -> Module {
                             c.func = format!("{target}{suffix}");
                         }
                     }
-                    rewrite_inst_vals(inst, shared, suffix);
+                    rewrite_inst_vals(inst, shared, suffix, stored);
                 }
             }
         }
@@ -1983,8 +1998,20 @@ fn duplicate_isr_shared(m: Module) -> Module {
     let mut copies = lo_copies;
     copies.extend(hi_copies);
     funcs.extend(copies);
-    rewrite_calls_to_copies(&mut funcs, &rewrite_lo, &shared_lo_set, LO_SUFFIX);
-    rewrite_calls_to_copies(&mut funcs, &rewrite_hi, &shared_hi_set, HI_SUFFIX);
+    rewrite_calls_to_copies(
+        &mut funcs,
+        &rewrite_lo,
+        &shared_lo_set,
+        LO_SUFFIX,
+        &mut stored_lo,
+    );
+    rewrite_calls_to_copies(
+        &mut funcs,
+        &rewrite_hi,
+        &shared_hi_set,
+        HI_SUFFIX,
+        &mut stored_hi,
+    );
     // Cross-context store rewrite (epic-cc#137), per priority: a store
     // of a duplicated function targets the copy of the priority that
     // READS the global (otherwise the ISR dispatches the main-context
@@ -2114,8 +2141,10 @@ fn duplicate_isr_shared(m: Module) -> Module {
                                     "legalize: store of @{fn_name} feeds both ISR priorities' read sets; no single copy serves both contexts"
                                 );
                             } else if lo_hit {
+                                stored_lo.insert(fn_name.clone());
                                 s.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
                             } else if hi_hit {
+                                stored_hi.insert(fn_name.clone());
                                 s.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
                             }
                         }
@@ -2136,8 +2165,10 @@ fn duplicate_isr_shared(m: Module) -> Module {
                                 "legalize: store of @{fn_name} (via a memcpy'd local) feeds both ISR priorities' read sets; no single copy serves both contexts"
                             );
                         } else if lo_hit {
+                            stored_lo.insert(fn_name.clone());
                             s.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
                         } else if hi_hit {
+                            stored_hi.insert(fn_name.clone());
                             s.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
                         }
                     }
@@ -2199,6 +2230,7 @@ fn duplicate_isr_shared(m: Module) -> Module {
                         if let Some(a) = c.args.get_mut(pi) {
                             if let Val::Global(fn_name) = &a.val {
                                 let fn_name = fn_name.clone();
+                                stored_lo.insert(fn_name.clone());
                                 a.val = Val::Global(format!("{fn_name}{LO_SUFFIX}"));
                             }
                         }
@@ -2207,6 +2239,7 @@ fn duplicate_isr_shared(m: Module) -> Module {
                         if let Some(a) = c.args.get_mut(pi) {
                             if let Val::Global(fn_name) = &a.val {
                                 let fn_name = fn_name.clone();
+                                stored_hi.insert(fn_name.clone());
                                 a.val = Val::Global(format!("{fn_name}{HI_SUFFIX}"));
                             }
                         }
@@ -2215,72 +2248,82 @@ fn duplicate_isr_shared(m: Module) -> Module {
             }
         }
     }
-    Module {
-        globals: m.globals,
-        funcs,
-        module_asm: m.module_asm,
-    }
+    (
+        Module {
+            globals: m.globals,
+            funcs,
+            module_asm: m.module_asm,
+        },
+        stored_lo,
+        stored_hi,
+    )
 }
 
 /// Rewrite every `Val::Global(f)` in `inst` to `Val::Global(f+suffix)`
 /// when `f` is in `shared` (a function duplicated for an ISR context). Covers every
 /// inst variant that carries a `Val`; the pointer-returning `sink_ptr_select`
 /// bodies and the `Call.func` target are handled separately.
-fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>, suffix: &str) {
-    fn rv(v: &mut Val, shared: &HashSet<&str>, suffix: &str) {
+fn rewrite_inst_vals(
+    inst: &mut Inst,
+    shared: &HashSet<&str>,
+    suffix: &str,
+    stored: &mut HashSet<String>,
+) {
+    fn rv(v: &mut Val, shared: &HashSet<&str>, suffix: &str, stored: &mut HashSet<String>) {
         if let Val::Global(g) = v {
             if shared.contains(g.as_str()) {
+                stored.insert(g.clone());
                 *v = Val::Global(format!("{g}{suffix}"));
             }
         }
     }
     match inst {
-        Inst::Store(s) => rv(&mut s.val, shared, suffix),
+        Inst::Store(s) => rv(&mut s.val, shared, suffix, stored),
         Inst::Bin(b) => {
-            rv(&mut b.a, shared, suffix);
-            rv(&mut b.b, shared, suffix);
+            rv(&mut b.a, shared, suffix, stored);
+            rv(&mut b.b, shared, suffix, stored);
         }
-        Inst::Ret(Some((_, v)), _) => rv(v, shared, suffix),
-        Inst::Zext(z) => rv(&mut z.val, shared, suffix),
-        Inst::Sext(x) => rv(&mut x.val, shared, suffix),
-        Inst::Trunc(t) => rv(&mut t.val, shared, suffix),
-        Inst::IntToPtr(p) => rv(&mut p.val, shared, suffix),
+        Inst::Ret(Some((_, v)), _) => rv(v, shared, suffix, stored),
+        Inst::Zext(z) => rv(&mut z.val, shared, suffix, stored),
+        Inst::Sext(x) => rv(&mut x.val, shared, suffix, stored),
+        Inst::Trunc(t) => rv(&mut t.val, shared, suffix, stored),
+        Inst::IntToPtr(p) => rv(&mut p.val, shared, suffix, stored),
         Inst::Icmp(i) => {
-            rv(&mut i.a, shared, suffix);
-            rv(&mut i.b, shared, suffix);
+            rv(&mut i.a, shared, suffix, stored);
+            rv(&mut i.b, shared, suffix, stored);
         }
         Inst::Select(s) => {
-            rv(&mut s.cond, shared, suffix);
-            rv(&mut s.a, shared, suffix);
-            rv(&mut s.b, shared, suffix);
+            rv(&mut s.cond, shared, suffix, stored);
+            rv(&mut s.a, shared, suffix, stored);
+            rv(&mut s.b, shared, suffix, stored);
         }
         Inst::Call(c) => {
             for arg in &mut c.args {
-                rv(&mut arg.val, shared, suffix);
+                rv(&mut arg.val, shared, suffix, stored);
             }
         }
         Inst::Phi(p) => {
             for (v, _) in &mut p.incoming {
-                rv(v, shared, suffix);
+                rv(v, shared, suffix, stored);
             }
         }
         Inst::Memcpy(mc) => {
-            rv(&mut mc.dst, shared, suffix);
-            rv(&mut mc.src, shared, suffix);
+            rv(&mut mc.dst, shared, suffix, stored);
+            rv(&mut mc.src, shared, suffix, stored);
             if let MemLen::Reg(v) = &mut mc.len {
-                rv(v, shared, suffix);
+                rv(v, shared, suffix, stored);
             }
         }
-        Inst::Freeze(fr) => rv(&mut fr.val, shared, suffix),
+        Inst::Freeze(fr) => rv(&mut fr.val, shared, suffix, stored),
         Inst::FloatBin(fb) => {
-            rv(&mut fb.a, shared, suffix);
-            rv(&mut fb.b, shared, suffix);
+            rv(&mut fb.a, shared, suffix, stored);
+            rv(&mut fb.b, shared, suffix, stored);
         }
         Inst::Fcmp(fc) => {
-            rv(&mut fc.a, shared, suffix);
-            rv(&mut fc.b, shared, suffix);
+            rv(&mut fc.a, shared, suffix, stored);
+            rv(&mut fc.b, shared, suffix, stored);
         }
-        Inst::FloatConv(fc) => rv(&mut fc.val, shared, suffix),
+        Inst::FloatConv(fc) => rv(&mut fc.val, shared, suffix, stored),
         _ => {}
     }
 }
@@ -2290,8 +2333,19 @@ fn rewrite_inst_vals(inst: &mut Inst, shared: &HashSet<&str>, suffix: &str) {
 /// address appears as a value), split by call-graph context so an ISR-context
 /// site references only `_isr` copies and a main-context site only the
 /// originals: the overlay allocator's disjoint-region analysis depends on it.
+/// The exception, derived from the same decision as the store rewrite: when
+/// the rewrite stored a priority's copy into a shared storage global, every
+/// other context reading that storage now holds the copy's address at
+/// runtime, so its dispatch sites must list the copy, not the vanished
+/// original (epic-cc#568).
 /// `!callees` metadata stays unconsumed (clang omits it for table loads).
-fn fill_indirect_callees(m: &mut Module) {
+fn fill_indirect_callees(m: &mut Module, stored_lo: &HashSet<String>, stored_hi: &HashSet<String>) {
+    // A candidate is a rewritten copy of a stored original: `f_isr` with
+    // `f` in `stored_lo` (symmetrically for the high suffix).
+    let stored_copy = |g: &str, stored: &HashSet<String>, suffix: &str| {
+        g.strip_suffix(suffix)
+            .is_some_and(|orig| stored.contains(orig))
+    };
     // Address-taken set: every `Val::Global(f)` where `f` is a defined
     // function. Non-const globals with `ptr` initializers are zeroinit and
     // contribute nothing; const fp tables panic at parse: outside this scope.
@@ -2379,9 +2433,16 @@ fn fill_indirect_callees(m: &mut Module) {
                     let mut cands: Vec<String> = addr_taken
                         .iter()
                         .filter(|g| {
-                            (!in_main || (!lo2.contains(*g) && !hi2.contains(*g)))
-                                && (!in_lo || lo2.contains(*g))
-                                && (!in_hi || hi2.contains(*g))
+                            (!in_main
+                                || (!lo2.contains(*g) && !hi2.contains(*g))
+                                || stored_copy(g, stored_lo, LO_SUFFIX)
+                                || stored_copy(g, stored_hi, HI_SUFFIX))
+                                && (!in_lo
+                                    || lo2.contains(*g)
+                                    || stored_copy(g, stored_hi, HI_SUFFIX))
+                                && (!in_hi
+                                    || hi2.contains(*g)
+                                    || stored_copy(g, stored_lo, LO_SUFFIX))
                         })
                         .filter(|g| arity.get(*g).copied() == Some(c.args.len()))
                         .filter(|g| {

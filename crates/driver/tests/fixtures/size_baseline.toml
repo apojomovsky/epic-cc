@@ -30,11 +30,11 @@ ram_bytes = 34
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
 device = "16F877A"
-flash_words = 7002
+flash_words = 7071
 ram_bytes = 329
 
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 12032
+flash_words = 12137
 ram_bytes = 741
