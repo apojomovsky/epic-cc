@@ -2287,14 +2287,15 @@ impl<'m> Gen<'m> {
                     let active = n16 - m;
                     // Nibble-boundary shifts have shorter, sim-verified
                     // forms than the per-bit unroll (crates/superopt, docs/41):
-                    // one lane shifts by 4 as SWAPF+mask, an in-place 16-bit
+                    // one lane shifts by 4-7 as SWAPF+mask plus one seeded
+                    // rotate per extra bit (epic-cc#573), an in-place 16-bit
                     // pair has a canned construction per amount 4-7 (left) or
-                    // at amount 4 (right), each checked over the full
-                    // 65536-input domain. They clobber W, dead at statement
+                    // at amount 4 (right), each checked over its full
+                    // input domain. They clobber W, dead at statement
                     // entry (no lowering reads W before writing it; W tracking
                     // is #502), and STATUS no worse than the unroll they
                     // replace.
-                    if b.op == ir::BinOp::LShr && r == 4 {
+                    if b.op == ir::BinOp::LShr && (4..=7).contains(&r) {
                         if active == 1 {
                             // Mirror of the single-lane left form: SWAPF
                             // then keep the low nibble. The lane is `dst`
@@ -2302,13 +2303,21 @@ impl<'m> Gen<'m> {
                             // as the left form uses; the byte-move above
                             // already put the surviving byte there, and no
                             // higher lane rotates bits in, so the residual
-                            // is a plain nibble down-shift.
+                            // is a plain nibble down-shift. Amounts 5-7
+                            // (epic-cc#573) add one carry-seeded rotate per
+                            // extra bit; each needs its own BCF, same as
+                            // the left form, since a lone lane takes carry
+                            // from nowhere.
                             self.emit_banked("SWAPF", dst, ",W");
                             self.emit("    ANDLW 0x0F".to_string());
                             self.emit_banked("MOVWF", dst, "");
+                            for _ in 4..r {
+                                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+                                self.emit_banked("RRCF", dst, ",F");
+                            }
                             return;
                         }
-                        if n16 == 2 && m == 0 {
+                        if r == 4 && n16 == 2 && m == 0 {
                             // lo' = (lo>>4) | ((hi&0x0F)<<4), hi' = hi>>4, both
                             // as nibble-swaps plus a mask. W-only, so the same
                             // dead-W precondition as the left forms.
@@ -2325,10 +2334,19 @@ impl<'m> Gen<'m> {
                         }
                     }
                     if b.op == ir::BinOp::Shl && r > 0 {
-                        if active == 1 && r == 4 {
+                        if active == 1 && (4..=7).contains(&r) {
                             self.emit_banked("SWAPF", dst + m, ",W");
                             self.emit("    ANDLW 0xF0".to_string());
                             self.emit_banked("MOVWF", dst + m, "");
+                            // Amounts 5-7 (epic-cc#573): one BCF-seeded
+                            // rotate per extra bit. The seed cannot be
+                            // shared across steps the way the 16-bit
+                            // amount-5 arm shares one BCF across lanes: a
+                            // lone lane's bit 0 must read 0 every step.
+                            for _ in 4..r {
+                                self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS C
+                                self.emit_banked("RLCF", dst + m, ",F");
+                            }
                             return;
                         }
                         if n16 == 2 && m == 0 && (4..=7).contains(&r) {
