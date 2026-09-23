@@ -1284,7 +1284,7 @@ fn global_field(ptr: &str, f: &Func, aliases: &HashMap<String, String>) -> Optio
     }
     let mut cur = ptr.strip_prefix('%')?.to_string();
     let mut k: u16 = 0;
-    let mut min_scale: Option<u8> = None;
+    let mut min_scale: Option<u16> = None;
     for _ in 0..8 {
         let mut found = false;
         for b in &f.blocks {
@@ -1375,7 +1375,7 @@ fn global_ptr_aliases(m: &Module) -> HashMap<String, String> {
 /// The field a constant byte offset selects, given the innermost runtime
 /// scale: `offset % scale` when a scale is known (an array-of-struct
 /// element stride), the bare offset otherwise (a direct struct or global).
-fn field_of(offset: u16, min_scale: Option<u8>) -> u16 {
+fn field_of(offset: u16, min_scale: Option<u16>) -> u16 {
     match min_scale {
         Some(s) if s > 0 => offset % u16::from(s),
         _ => offset,
@@ -1388,14 +1388,14 @@ fn field_of(offset: u16, min_scale: Option<u8>) -> u16 {
 /// entries.
 fn global_field_map(
     ptr: &str,
-    bases: &HashMap<String, (GepBase, u8, Vec<(u8, String)>)>,
+    bases: &HashMap<String, (GepBase, u16, Vec<(u16, String)>)>,
 ) -> Option<(String, u16)> {
     if let Some(g) = ptr.strip_prefix('@') {
         return Some((g.to_string(), 0));
     }
     let mut cur = ptr.strip_prefix('%')?.to_string();
     let mut k: u16 = 0;
-    let mut min_scale: Option<u8> = None;
+    let mut min_scale: Option<u16> = None;
     for _ in 0..8 {
         match bases.get(&cur) {
             Some((GepBase::Global(n), gk, terms)) => {
@@ -1428,7 +1428,7 @@ fn global_field_map(
 /// fallback elsewhere in this pass.
 fn alloca_root_map(
     ptr: &str,
-    bases: &HashMap<String, (GepBase, u8, Vec<(u8, String)>)>,
+    bases: &HashMap<String, (GepBase, u16, Vec<(u16, String)>)>,
 ) -> Option<String> {
     let mut cur = ptr.strip_prefix('%')?.to_string();
     for _ in 0..8 {
@@ -2053,7 +2053,7 @@ fn duplicate_isr_shared(
     let mut handle_feeds_lo: HashSet<String> = HashSet::new();
     let mut handle_feeds_hi: HashSet<String> = HashSet::new();
     for sf in funcs.iter() {
-        let mut bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = HashMap::new();
+        let mut bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = HashMap::new();
         for b in &sf.blocks {
             for inst in &b.insts {
                 if let Inst::Gep(g) = inst {
@@ -2104,7 +2104,7 @@ fn duplicate_isr_shared(
     for f in &mut funcs {
         // GEP bases are resolved before the mutation loop (the function is
         // borrowed mutably below).
-        let mut bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = HashMap::new();
+        let mut bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = HashMap::new();
         for b in &f.blocks {
             for inst in &b.insts {
                 if let Inst::Gep(g) = inst {
@@ -2400,7 +2400,7 @@ fn duplicate_isr_shared(
     {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for sf in &funcs {
-            let mut bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = HashMap::new();
+            let mut bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = HashMap::new();
             for b in &sf.blocks {
                 for inst in &b.insts {
                     if let Inst::Gep(g) = inst {
@@ -2643,7 +2643,7 @@ fn fill_indirect_callees(
         // pointer is loaded from (ADR-038). Resolvable sites scope their
         // candidates to that storage's spellings; unresolvable sites
         // keep the context-scoped whole-program list.
-        let bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = f
+        let bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = f
             .blocks
             .iter()
             .flat_map(|b| &b.insts)

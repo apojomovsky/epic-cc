@@ -40,7 +40,7 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{resolve_pointers, ssa_key, Base, Slot};
+use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
 use std::collections::{HashMap, HashSet};
 
 /// The recipe a routine function emits, or `None` if the name is not a
@@ -156,7 +156,7 @@ struct Gen<'m> {
     /// bases (byval/sret params and allocas). `gep`/`alloca` themselves
     /// emit nothing; each `load`/`store`/`memcpy` through a pointer reg
     /// lowers the pointer at its use.
-    resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    resolved: &'m PtrResolution,
     scratch: u16,
     retval_lo: u16,
     cur_func: &'m str,
@@ -519,7 +519,7 @@ impl<'m> Gen<'m> {
     /// The resolved `(base, k, terms)` for a pointer reg `%r`: a GEP dst,
     /// or a seeded byval/sret param / alloca. Anything else is a missing
     /// pointer and panics.
-    fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
+    fn resolved_for(&self, r: &str) -> (Base, u16, Vec<(u16, String)>) {
         let key = ssa_key(self.cur_func, r);
         self.resolved
             .get(&key)
@@ -722,7 +722,7 @@ impl<'m> Gen<'m> {
                         !g.global_is_const(gname),
                         "isel: memcpy into const (flash) global @{gname}"
                     );
-                    (Base::Global(gname.clone()), 0u8, Vec::new())
+                    (Base::Global(gname.clone()), 0u16, Vec::new())
                 }
                 _ => panic!("isel: dynamic memcpy ptr must be a reg or global"),
             };
@@ -799,8 +799,8 @@ impl<'m> Gen<'m> {
     fn emit_fsr_to(
         &mut self,
         base_addr: u16,
-        k: u8,
-        terms: &[(u8, String)],
+        k: u16,
+        terms: &[(u16, String)],
         byte_off: u8,
         span: u16,
     ) {
@@ -837,7 +837,7 @@ impl<'m> Gen<'m> {
     /// stored address. IRP is set on EVERY indirect FSR setup (a prior
     /// bank-2/3 target leaves STATUS bit 7 = 1). The static k + off must
     /// fit the ADDLW literal.
-    fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
@@ -866,7 +866,7 @@ impl<'m> Gen<'m> {
     /// ADDWF f,W computes W = f + W, so W holds %r only until the first
     /// ADDWF: it MUST be reloaded before each repetition or a scaled term
     /// accumulates 2×scratch + %r (silent wrong-address miscompile).
-    fn emit_accum_terms(&mut self, terms: &[(u8, String)]) {
+    fn emit_accum_terms(&mut self, terms: &[(u16, String)]) {
         self.emit("    MOVLW 0x00".to_string());
         self.emit_w_store(self.scratch);
         for (scale, r) in terms {
@@ -883,7 +883,7 @@ impl<'m> Gen<'m> {
     /// (flash) table before `CALL __read_<name>`. A single scale-1 term
     /// keeps the `MOVF %r,W` shape (ADDLW only when k + off is nonzero);
     /// general sums accumulate in scratch.
-    fn emit_ptr_index_w(&mut self, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_ptr_index_w(&mut self, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
@@ -918,7 +918,7 @@ impl<'m> Gen<'m> {
     /// the restore. Reads leave the byte in W like the small-table path.
     /// Const-only and multi-term 16-bit indices panic since neither has a
     /// reader shape that keeps W as the in-chunk index (epic-cc#8).
-    fn emit_const_read_large(&mut self, name: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_const_read_large(&mut self, name: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,

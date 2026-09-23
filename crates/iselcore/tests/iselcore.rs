@@ -24,7 +24,7 @@ fn resolves_a_global_array_gep() {
     let (base, k, terms) = r.get("main::p").expect("gep must resolve");
     assert!(matches!(base, Base::Global(n) if n == "arr"));
     assert_eq!(*k, 0);
-    assert_eq!(terms, &[(1u8, "i".to_string())]);
+    assert_eq!(terms, &[(1u16, "i".to_string())]);
 }
 
 #[test]
@@ -82,7 +82,7 @@ fn folds_a_pointer_select_over_a_const_base() {
     let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
     assert!(matches!(base, Base::Global(n) if n == "addrs"));
     assert_eq!(*k, 0);
-    assert_eq!(terms, &[(4u8, "c".to_string())]);
+    assert_eq!(terms, &[(4u16, "c".to_string())]);
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn folds_a_pointer_select_with_arm_order_swapped() {
     let (base, k, terms) = r.get("main::s").expect("pointer select must resolve");
     assert!(matches!(base, Base::Global(n) if n == "addrs"));
     assert_eq!(*k, 0);
-    assert_eq!(terms, &[(4u8, "c".to_string())]);
+    assert_eq!(terms, &[(4u16, "c".to_string())]);
 }
 
 #[test]

@@ -5734,3 +5734,49 @@ fn low_priority_epilogue_restores_bsr_after_the_banked_w_restore() {
         "RETFIE follows the re-restore:\n{asm}"
     );
 }
+
+#[test]
+fn ram_global_over_255_bytes_reads_across_the_bank_boundary() {
+    // epic-cc#608: a 259-byte RAM global must place and address through
+    // the 0x200 hardware-bank boundary. Constant field offsets fold to
+    // absolute addresses; the sim asserts one byte per region: below,
+    // near, and past offset 255.
+    let mut m = parse(
+        "global g i8\nglobal o0 i8\nglobal o1 i8\nglobal o2 i8\nglobal o3 i8\nfn main(void) ()\n  block entry:\n\
+           %p0 = gep @g +0\n    %v0 = load i8 %p0\n    store i8 %v0 @o0\n\
+           %p1 = gep @g +199\n    %v1 = load i8 %p1\n    store i8 %v1 @o1\n\
+           %p2 = gep @g +256\n    %v2 = load i8 %p2\n    store i8 %v2 @o2\n\
+           %p3 = gep @g +258\n    %v3 = load i8 %p3\n    store i8 %v3 @o3\n\
+           ret void\n",
+    );
+    for g in &mut m.globals {
+        if g.name == "g" {
+            g.size = 259;
+        }
+    }
+    let addrs = addrs(&[
+        ("g", 0x100),
+        ("o0", 0x250),
+        ("o1", 0x251),
+        ("o2", 0x252),
+        ("o3", 0x253),
+        ("main::v0", 0x254),
+        ("main::v1", 0x255),
+        ("main::v2", 0x256),
+        ("main::v3", 0x257),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x100] = 0xA5;
+    p.ram_mut()[0x100 + 199] = 0x5A;
+    p.ram_mut()[0x100 + 256] = 0x77;
+    p.ram_mut()[0x100 + 258] = 0x99;
+    p.run(2000);
+    assert!(p.halted(), "program must run to completion");
+    assert_eq!(p.ram()[0x250], 0xA5, "offset 0");
+    assert_eq!(p.ram()[0x251], 0x5A, "offset 199");
+    assert_eq!(p.ram()[0x252], 0x77, "offset 256, past the old ceiling");
+    assert_eq!(p.ram()[0x253], 0x99, "offset 258, across the bank boundary");
+}
