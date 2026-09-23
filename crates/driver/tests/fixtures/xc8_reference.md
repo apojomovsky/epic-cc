@@ -94,7 +94,7 @@ predates #590 (94 words, 64 after it merges).
 | `bench-u16-dec` | 126 (252 B) | 17 | 140 | 39 | +14 |
 | `bench-bank` | 30 (60 B) | 10 | 26 | 15 | -4 |
 | `bench-struct-scan` | 88 (176 B) | 96 | 205 | 99 | +117 |
-| `bench-bitmask` | 45 (90 B) | 11 | 133 | 19 | +88 |
+| `bench-bitmask` | 54 (108 B) | 13 | 161 | 20 | +107 |
 | `bench-hoist` | 137 (274 B) | 13 | 140 | 18 | +3 |
 
 Negative gap means epic-cc is smaller. Eight benches still trail XC8
@@ -114,7 +114,7 @@ concentration, not per-site lowering. Small-bench startup noise
 applies (both toolchains count their own startup here).
 
 The three rows above (epic-cc#624) were measured 2026-09-23 on the same
-image and flags. `bench-struct-scan` (+117) and `bench-bitmask` (+88)
+image and flags. `bench-struct-scan` (+117) and `bench-bitmask` (+107)
 confirm real per-site gaps behind the overflow/stimulus and USART_Init
 clusters; `bench-hoist` (+3) shows the pin-reload sequence itself is at
 parity, so the gpio4_send gap is accumulation across its twelve calls,

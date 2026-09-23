@@ -96,8 +96,8 @@ ram_bytes = 99
 [[entry]]
 name = "bench-bitmask-18f4550"
 device = "18F4550"
-flash_words = 133
-ram_bytes = 19
+flash_words = 161
+ram_bytes = 20
 
 [[entry]]
 name = "bench-hoist-18f4550"

@@ -17,6 +17,7 @@ typedef struct {
 volatile UartConfig g_cfg;
 volatile unsigned char g_txsta;
 volatile unsigned char g_rcsta;
+volatile unsigned char g_baudcon;
 
 void main(void) {
     uint8_t txsta = 0x02U;
@@ -30,4 +31,8 @@ void main(void) {
     if (g_cfg.RxCallback) rcsta |= 0x10U;
     g_txsta = txsta;
     g_rcsta = rcsta;
+    uint8_t baudcon = 0x00U;
+    if (g_cfg.BaudHigh == 1U) baudcon |= 0x08U;
+    if (g_cfg.AutoBaud) baudcon |= 0x01U;
+    g_baudcon = baudcon;
 }

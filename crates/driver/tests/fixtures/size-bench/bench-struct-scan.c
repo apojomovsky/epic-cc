@@ -1,6 +1,6 @@
 /* Task-table scan: struct array with non-power-of-two stride,
  * flag tests, and countdown arm. Menu-demo triage (epic-cc#624):
- * epic_taskmgr_tick (inlined into the overflow path, 166 vs XC8 15
+ * epic_taskmgr_tick (inlined into the overflow path, 166 vs XC8 19
  * plus an 88-word outlined tick) walks a 10-byte task table testing
  * flags and arming countdowns; task_stimulus walks a script table
  * the same way. The stride multiply per access is the shape. */
