@@ -344,6 +344,14 @@ impl<'m> Gen<'m> {
         if c.dst != *cond || c.ty.bytes() < 2 {
             return None;
         }
+        // The same width guard `emit_inst`'s `Inst::Icmp` arm applies
+        // (`n == 1 || n == 2 || n == 4`). Fusing an i64 compare would
+        // route it to the chain and compile, while the identical compare
+        // with any other use still panics; keep the two paths consistent
+        // and the unsupported width loud.
+        if !matches!(c.ty.bytes(), 2 | 4) {
+            return None;
+        }
         // Only the predicates with a fused lowering. The signed ordering
         // cascades have none (their answer needs the top lane's sign
         // relation), so they keep the materializing path.
@@ -3147,7 +3155,7 @@ impl<'m> Gen<'m> {
         }
         // The unsigned predicates go through the borrow chain, which has
         // one shared exit rather than a per-lane cascade (see
-        // `emit_icmp_u16_chain`). Signed ones keep the cascade: their
+        // `emit_icmp_chain`). Signed ones keep the cascade: their
         // answer needs the top lanes' sign equality, which a single final
         // borrow does not carry. A rhs whose lane load writes STATUS,C
         // would break the chain's carried flag, so that shape keeps the
@@ -3313,7 +3321,7 @@ impl<'m> Gen<'m> {
     /// `fuse` carries the two exit labels of a consuming `BrCond` in this
     /// function, when this compare's result has no other use. With it, the
     /// per-byte exits branch straight to the branch targets and no 0/1
-    /// byte is materialized (see `fused_cond_icmp`).
+    /// byte is materialized (see `emit_fused_branch`).
     fn emit_icmp_eq_ne(
         &mut self,
         a: Val,
