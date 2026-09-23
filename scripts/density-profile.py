@@ -531,7 +531,7 @@ def match_runtime_routine(items, i, cfg):
         return 1
     if items[i].mnemonic == "CALL":
         target = items[i].operands.split(",", 1)[0].strip()
-        if target.startswith("__"):
+        if target.startswith("__") and target not in _RUNTIME_KEEP:
             return 1
     return 0
 
@@ -1048,6 +1048,7 @@ def profile_text(text, args):
             jump_table_run=args.jump_table_run,
             compare_chain_units=args.compare_chain_units,
             shift_run=args.shift_run,
+            reload_gap=args.reload_gap,
             family=family,
         ),
     )
@@ -1085,6 +1086,7 @@ def build_parser():
         "--compare-chain-units", type=int, default=Config.compare_chain_units
     )
     p.add_argument("--shift-run", type=int, default=Config.shift_run)
+    p.add_argument("--reload-gap", type=int, default=Config.reload_gap)
     p.add_argument(
         "--show-other",
         action="store_true",

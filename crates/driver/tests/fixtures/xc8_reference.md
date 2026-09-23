@@ -65,9 +65,10 @@ then read the flash/RAM line from the `xc8-cc` link step's own
 
 ## Microbench ladder (epic-cc#581)
 
-XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the eight
-`size-bench` programs, measured 2026-09-22 on the
-`epic-cc-xc8-oracle:local` image. Each bench compiled standalone:
+XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the twelve
+`size-bench` programs (eight from epic-cc#581, four from epic-cc#617),
+measured 2026-09-22 and 2026-09-23 on the `epic-cc-xc8-oracle:local`
+image. Each bench compiled standalone:
 
 ```
 xc8-cc -mcpu=18f4550 -O2 bench-<stem>.c -o <stem>.hex

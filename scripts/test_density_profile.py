@@ -351,6 +351,13 @@ class CategorizationTest(unittest.TestCase):
         )
         self.assertNotIn("store-reload-gap", words_by_category(not_into_w))
 
+    def test_store_reload_gap_stays_inside_one_function(self):
+        listing = PIC18_HEADER + (
+            "f:\n    MOVWF 0x010,B\n    MOVFF 0x020, 0x021\n"
+            "g:\n    MOVF 0x010,W,B\n    RETURN\n"
+        )
+        self.assertNotIn("store-reload-gap", words_by_category(listing))
+
     def test_wide_compare_branch(self):
         listing = PIC18_HEADER + (
             "f:\n    SUBWF 0x011,W,B\n    BNC t\n"
