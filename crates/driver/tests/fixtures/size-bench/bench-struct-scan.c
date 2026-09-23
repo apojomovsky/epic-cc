@@ -28,7 +28,7 @@ static uint16_t arm_countdown(uint16_t period) {
 void main(void) {
     uint8_t i;
     for (i = 0; i < MAX_TASKS; i++) {
-        Task *t = (Task *)&g_tasks[i];
+        volatile Task *t = &g_tasks[i];
         uint8_t f = t->flags;
         if ((f & 0x03U) == 0x03U) {
             if (t->countdown == 0U) {

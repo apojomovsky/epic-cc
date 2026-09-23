@@ -68,7 +68,7 @@ then read the flash/RAM line from the `xc8-cc` link step's own
 XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the fifteen
 `size-bench` programs (eight from epic-cc#581, four from epic-cc#617,
 three from epic-cc#624), measured 2026-09-22 and 2026-09-23 on the
-image. Each bench compiled standalone:
+`epic-cc-xc8-oracle:local` image. Each bench compiled standalone:
 
 ```
 xc8-cc -mcpu=18f4550 -O2 bench-<stem>.c -o <stem>.hex
@@ -93,13 +93,14 @@ predates #590 (94 words, 64 after it merges).
 | `bench-u32-loop` | 49 (98 B) | 9 | 105 | 23 | +56 |
 | `bench-u16-dec` | 126 (252 B) | 17 | 140 | 39 | +14 |
 | `bench-bank` | 30 (60 B) | 10 | 26 | 15 | -4 |
-| `bench-struct-scan` | 88 (176 B) | 96 | 174 | 101 | +86 |
+| `bench-struct-scan` | 88 (176 B) | 96 | 205 | 99 | +117 |
 | `bench-bitmask` | 45 (90 B) | 11 | 133 | 19 | +88 |
-| `bench-hoist` | 137 (274 B) | 13 | 128 | 20 | -9 |
+| `bench-hoist` | 137 (274 B) | 13 | 140 | 18 | +3 |
 
-Negative gap means epic-cc is smaller. Seven benches still trail XC8
-(switch, bool, struct-copy, u32-loop, u16-dec, struct-scan, bitmask)
-and rank the remaining codegen work; the rest lead by 4 to 63 words.
+Negative gap means epic-cc is smaller. Eight benches still trail XC8
+(switch, bool, struct-copy, u32-loop, u16-dec, struct-scan, bitmask,
+hoist) and rank the remaining codegen work; the rest lead by 4 to 63
+words.
 The same v4.00 license reasoning as the encoder row above applies: no
 license file present, but licenses are free and unlimited since July
 2026, so these rows are XC8's genuine `-O2` output.
@@ -113,9 +114,9 @@ concentration, not per-site lowering. Small-bench startup noise
 applies (both toolchains count their own startup here).
 
 The three rows above (epic-cc#624) were measured 2026-09-23 on the same
-image and flags. `bench-struct-scan` (+86) and `bench-bitmask` (+88)
+image and flags. `bench-struct-scan` (+117) and `bench-bitmask` (+88)
 confirm real per-site gaps behind the overflow/stimulus and USART_Init
-clusters; `bench-hoist` (-9) shows the pin-reload sequence itself is at
+clusters; `bench-hoist` (+3) shows the pin-reload sequence itself is at
 parity, so the gpio4_send gap is accumulation across its twelve calls,
 not one shape. Small-bench startup noise applies as above.
 
