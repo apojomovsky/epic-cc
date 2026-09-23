@@ -782,6 +782,56 @@ fn per_priority_storages_list_only_their_own_copies() {
         "the hi site must list only the hi copy"
     );
 }
+/// A storage with two callback fields where only one holds a tracked
+/// spelling (the USART Tx/Rx shape: the harness registers Tx, Rx stays
+/// null): the TX site scopes to its field's spelling, and the RX site,
+/// loading a field with no tracked spelling, degrades to the legacy
+/// list instead of panicking (epic-cc#467).
+#[test]
+fn unregistered_field_falls_back_instead_of_panicking() {
+    let m = parse(
+        "global g_usart i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %p = gep @g_usart +2\n\
+             store i16 @tx_cb %p\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %q = gep @g_usart +2\n\
+             %1 = load i16 %q\n\
+             call void @1()\n\
+             %r = gep @g_usart +4\n\
+             %2 = load i16 %r\n\
+             call void @2(i16 7)\n\
+             ret void\n\
+         fn tx_cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    let sites = |fname: &str| {
+        m2.funcs
+            .iter()
+            .find(|f| f.name == fname)
+            .unwrap()
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|i| match i {
+                Inst::Call(c) if !c.callees.is_empty() => Some(c.callees.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // The TX site (0-arg call into the registered field) lists exactly
+    // its tracked spelling; the RX site's unregistered field degrades
+    // to the legacy list, which admits nothing with matching arity, so
+    // only the TX site appears. No panic either way.
+    assert_eq!(
+        sites("isr"),
+        vec![vec!["tx_cb_isr".to_string()]],
+        "the TX site must list its tracked spelling"
+    );
+}
 
 /// A callback that flows into an ISR-read global through a function
 /// parameter (the `EPIC_GPIO_RegisterChangeCallback(on_rb_change)` shape):

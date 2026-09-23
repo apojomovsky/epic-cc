@@ -1593,9 +1593,9 @@ fn join_stores_into_global(
 /// The globals passed as argument `pi` to `f` across every call site: the
 /// callers' handle globals behind a memcpy whose source is `f`'s param
 /// (the `Init(&h)` idiom before clang promotes the param).
-fn globals_passed_as_param(m: &Module, f_name: &str, pi: usize) -> Vec<String> {
+fn globals_passed_as_param(funcs: &[Func], f_name: &str, pi: usize) -> Vec<String> {
     let mut out = Vec::new();
-    for cf in &m.funcs {
+    for cf in funcs {
         for cb in &cf.blocks {
             for ci in &cb.insts {
                 if let Inst::Call(c) = ci {
@@ -1750,7 +1750,8 @@ fn isr_context_for(
                                 continue;
                             }
                             if let Some(pi) = f.params.iter().position(|p| p.name == src_reg) {
-                                for handle in globals_passed_as_param(m, &f.name.clone(), pi) {
+                                for handle in globals_passed_as_param(&m.funcs, &f.name.clone(), pi)
+                                {
                                     if join_stores_into_global(
                                         m,
                                         &handle,
@@ -1827,7 +1828,7 @@ fn duplicate_isr_shared(
     Module,
     HashSet<String>,
     HashSet<String>,
-    HashMap<String, Vec<(String, SpellPrio)>>,
+    HashMap<String, Vec<(String, SpellPrio, u16)>>,
 ) {
     // Originals whose stored address was rewritten to this priority's
     // copy: the storage they were stored into is read by that priority,
@@ -1835,7 +1836,7 @@ fn duplicate_isr_shared(
     // copy's address and its dispatch sites must list it (epic-cc#568).
     let mut stored_lo: HashSet<String> = HashSet::new();
     let mut stored_hi: HashSet<String> = HashSet::new();
-    let mut spellings: HashMap<String, Vec<(String, SpellPrio)>> = HashMap::new();
+    let mut spellings: HashMap<String, Vec<(String, SpellPrio, u16)>> = HashMap::new();
     // Storage keys are canonicalized through the pointer aliases so a
     // store into `g_handle = &g_storage` records under the same key the
     // dispatch site's load resolves to.
@@ -2188,13 +2189,37 @@ fn duplicate_isr_shared(
                                     .get(g.as_str())
                                     .cloned()
                                     .unwrap_or_else(|| g.clone());
-                                spellings.entry(key).or_default().push((spelling, prio));
+                                spellings.entry(key).or_default().push((spelling, prio, sk));
                             }
                         }
                         continue;
                     }
                     let Some(root) = alloca_root_map(&s.ptr, &bases) else {
                         continue;
+                    };
+                    // The store's field inside the alloca object, summed
+                    // over the GEP chain back to the root (mirrors
+                    // alloca_field, which needs an immutable Func): the
+                    // memcpy carries every field, so the store's field
+                    // selects the spelling.
+                    let fk = {
+                        let mut cur = s.ptr.strip_prefix('%').map(str::to_string);
+                        let mut k: u16 = 0;
+                        let mut field = None;
+                        while let Some(c) = cur {
+                            if c == root {
+                                field = Some(k);
+                                break;
+                            }
+                            match bases.get(&c) {
+                                Some((GepBase::Reg(r), gk, _)) => {
+                                    k = k.wrapping_add(u16::from(*gk));
+                                    cur = Some(r.clone());
+                                }
+                                _ => break,
+                            }
+                        }
+                        field.unwrap_or(ALL_FIELDS)
                     };
                     if let Val::Global(fn_name) = &s.val {
                         let fn_name = fn_name.clone();
@@ -2245,10 +2270,11 @@ fn duplicate_isr_shared(
                                     .get(storage.as_str())
                                     .cloned()
                                     .unwrap_or_else(|| storage.clone());
-                                spellings
-                                    .entry(key)
-                                    .or_default()
-                                    .push((spelling.clone(), prio));
+                                spellings.entry(key).or_default().push((
+                                    spelling.clone(),
+                                    prio,
+                                    fk,
+                                ));
                             }
                         }
                     }
@@ -2325,10 +2351,11 @@ fn duplicate_isr_shared(
                                 .get(storage.as_str())
                                 .cloned()
                                 .unwrap_or_else(|| storage.clone());
-                            spellings
-                                .entry(key)
-                                .or_default()
-                                .push((format!("{fn_name}{LO_SUFFIX}"), SpellPrio::Lo));
+                            spellings.entry(key).or_default().push((
+                                format!("{fn_name}{LO_SUFFIX}"),
+                                SpellPrio::Lo,
+                                ALL_FIELDS,
+                            ));
                         }
                         stored_lo.insert(fn_name.clone());
                         if let Some(a) = c.args.get_mut(pi) {
@@ -2350,10 +2377,11 @@ fn duplicate_isr_shared(
                                 .get(storage.as_str())
                                 .cloned()
                                 .unwrap_or_else(|| storage.clone());
-                            spellings
-                                .entry(key)
-                                .or_default()
-                                .push((format!("{fn_name}{HI_SUFFIX}"), SpellPrio::Hi));
+                            spellings.entry(key).or_default().push((
+                                format!("{fn_name}{HI_SUFFIX}"),
+                                SpellPrio::Hi,
+                                ALL_FIELDS,
+                            ));
                         }
                         stored_hi.insert(fn_name.clone());
                         if let Some(a) = c.args.get_mut(pi) {
@@ -2361,6 +2389,70 @@ fn duplicate_isr_shared(
                         }
                     }
                 }
+            }
+        }
+    }
+    // Spelling forwarding across the whole-object memcpys (the
+    // `Init(&h)` idiom's second hop): spellings recorded under a handle
+    // or alloca source also land in the ISR-read storage the memcpy
+    // copies into, with the field preserved. Without this the dispatch
+    // site loading that storage scopes to an empty list and falls back.
+    {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for sf in &funcs {
+            let mut bases: HashMap<String, (GepBase, u8, Vec<(u8, String)>)> = HashMap::new();
+            for b in &sf.blocks {
+                for inst in &b.insts {
+                    if let Inst::Gep(g) = inst {
+                        bases.insert(g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()));
+                    }
+                }
+            }
+            for b in &sf.blocks {
+                for inst in &b.insts {
+                    let Inst::Memcpy(mc) = inst else { continue };
+                    let Some((dst, _)) = global_field_map(&ptr_of_val(&mc.dst), &bases) else {
+                        continue;
+                    };
+                    let dst_key = aliases.get(dst.as_str()).cloned().unwrap_or(dst);
+                    let src_ptr = ptr_of_val(&mc.src);
+                    if let Some((src_g, _)) = global_field_map(&src_ptr, &bases) {
+                        let src_key = aliases.get(src_g.as_str()).cloned().unwrap_or(src_g);
+                        if src_key != dst_key {
+                            pairs.push((dst_key, src_key));
+                        }
+                    } else if let Some(src_reg) = src_ptr.strip_prefix('%') {
+                        if let Some(pi) = sf.params.iter().position(|p| p.name == src_reg) {
+                            for handle in globals_passed_as_param(&funcs, &sf.name, pi) {
+                                let src_key =
+                                    aliases.get(handle.as_str()).cloned().unwrap_or(handle);
+                                if src_key != dst_key {
+                                    pairs.push((dst_key.clone(), src_key));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Chained handle copies converge: repeat until no list grows.
+        loop {
+            let mut grew = false;
+            for (dst, src) in &pairs {
+                let entries = spellings.get(src).cloned().unwrap_or_default();
+                for (name, prio, field) in entries {
+                    let slot = spellings.entry(dst.clone()).or_default();
+                    if !slot
+                        .iter()
+                        .any(|(n, p, f)| n == &name && p == &prio && f == &field)
+                    {
+                        slot.push((name, prio, field));
+                        grew = true;
+                    }
+                }
+            }
+            if !grew {
+                break;
             }
         }
     }
@@ -2460,7 +2552,7 @@ fn fill_indirect_callees(
     m: &mut Module,
     stored_lo: &HashSet<String>,
     stored_hi: &HashSet<String>,
-    spellings: &HashMap<String, Vec<(String, SpellPrio)>>,
+    spellings: &HashMap<String, Vec<(String, SpellPrio, u16)>>,
 ) {
     // A candidate is a rewritten copy of a stored original: `f_isr` with
     // `f` in `stored_lo` (symmetrically for the high suffix).
@@ -2560,13 +2652,17 @@ fn fill_indirect_callees(
                 _ => None,
             })
             .collect();
-        let load_storages: HashMap<String, String> = f
+        let load_storages: HashMap<String, (String, u16)> = f
             .blocks
             .iter()
             .flat_map(|b| &b.insts)
             .filter_map(|i| match i {
-                Inst::Load(l) => global_field_map(&l.ptr, &bases)
-                    .map(|(g, _)| (l.dst.clone(), aliases.get(g.as_str()).cloned().unwrap_or(g))),
+                Inst::Load(l) => global_field_map(&l.ptr, &bases).map(|(g, fk)| {
+                    (
+                        l.dst.clone(),
+                        (aliases.get(g.as_str()).cloned().unwrap_or(g), fk),
+                    )
+                }),
                 _ => None,
             })
             .collect();
@@ -2579,14 +2675,22 @@ fn fill_indirect_callees(
                     if defined.contains(c.func.as_str()) {
                         continue;
                     }
-                    let scoped = load_storages
-                        .get(&c.func)
-                        .and_then(|s| spellings.get(s))
-                        .filter(|entries| !entries.is_empty());
-                    let mut cands: Vec<String> = match scoped {
-                        Some(entries) => entries
+                    // The spellings this site's storage holds for the field
+                    // the site loads: a site loading an unregistered field
+                    // degrades to the legacy list, since no tracked spelling
+                    // claims that value (epic-cc#467's USART RX shape).
+                    let scoped = load_storages.get(&c.func).and_then(|(s, fk)| {
+                        spellings.get(s).map(|entries| {
+                            entries
+                                .iter()
+                                .filter(|(_, _, f)| *f == ALL_FIELDS || *f == *fk)
+                                .collect::<Vec<_>>()
+                        })
+                    });
+                    let mut cands: Vec<String> = match &scoped {
+                        Some(entries) if !entries.is_empty() => entries
                             .iter()
-                            .filter(|(_, prio)| match prio {
+                            .filter(|(_, prio, _)| match prio {
                                 // A site must not execute a frame from the
                                 // priority that can preempt it: the higher
                                 // context re-enters the lower one's static
@@ -2597,9 +2701,9 @@ fn fill_indirect_callees(
                                 SpellPrio::Lo => !in_hi,
                                 SpellPrio::Hi => !in_lo,
                             })
-                            .map(|(n, _)| n.clone())
+                            .map(|(n, _, _)| n.clone())
                             .collect(),
-                        None => addr_taken
+                        _ => addr_taken
                             .iter()
                             .filter(|g| {
                                 (!in_main
@@ -2624,27 +2728,22 @@ fn fill_indirect_callees(
                             .zip(widths.iter())
                             .all(|(a, &w)| u16::from(a.ty.map(|t| t.bytes()).unwrap_or(2)) == w)
                     });
-                    // ADR-038: a priority site whose dispatch storage holds
-                    // only the other priority's spelling cannot dispatch
-                    // soundly (the higher context re-enters the lower's
-                    // static frame). Fail loudly instead of skipping the
-                    // call (epic-cc#467's silent-skip class). Checked after
-                    // the arity and width retains so the guarantee covers
-                    // the final list.
+                    // ADR-038: a priority site whose dispatch storage field
+                    // holds only the other priority's spelling cannot
+                    // dispatch soundly (the higher context re-enters the
+                    // lower's static frame). Fail loudly instead of skipping
+                    // the call (epic-cc#467's silent-skip class). Checked
+                    // after the arity and width retains so the guarantee
+                    // covers the final list.
                     if (in_lo || in_hi)
-                        && scoped.map_or(false, |e| !e.is_empty())
+                        && scoped.as_ref().map_or(false, |e| !e.is_empty())
                         && cands.is_empty()
                     {
-                        eprintln!(
-                            "DBG panic site={} in_lo={in_lo} in_hi={in_hi} entries={:?} storage={}",
-                            f.name,
-                            scoped.unwrap(),
-                            load_storages[&c.func]
-                        );
+                        let (s, _) = &load_storages[&c.func];
                         panic!(
                             "legalize: dispatch site in @{} reads @{} whose stored callback serves only the other priority; register per-priority spellings or confine the dispatch (ADR-038)",
                             f.name,
-                            load_storages[&c.func]
+                            s
                         );
                     }
                     // A candidate that is a duplicated ORIGINAL
