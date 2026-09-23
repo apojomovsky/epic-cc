@@ -36,8 +36,10 @@ run is the analysis.
    Recursion is already a compile error upstream, so the graph is a DAG.
 2. Functions are emitted into per-function buffers in reverse
    topological order, callees first. Buffers are concatenated in the
-   original module order, so the `asm` stage boundary sees byte
-   identical text apart from elided MOVLBs.
+   original module order, so the `asm` stage boundary sees the same
+   text apart from elided MOVLBs and a possible renumbering of the
+   shared `tmp{n}` labels: they are unique across the output and
+   resolved by name, never by position.
 3. After a function's buffer is complete, its exit bank is the join
    (meet) over the already recorded end states of its RETURN-ending
    blocks. All recorded ends equal and present gives a known bank; a
