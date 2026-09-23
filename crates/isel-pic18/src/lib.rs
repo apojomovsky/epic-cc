@@ -112,6 +112,11 @@ struct Gen<'m> {
     /// state. Straight-line prefix selects affect every exit equally:
     /// the flag resets immediately before each terminator lowering.
     bsr_dirty: bool,
+    /// Callee name -> the bank every return path leaves live, from the
+    /// buffered reverse-topological emission. A caller relies on an entry
+    /// only after the map proved it from the code as actually emitted;
+    /// absent or `None` entries clear the tracked bank exactly as master.
+    exit_banks: &'m HashMap<String, Option<u8>>,
     /// What FSR0 currently addresses, if known: `Some((origin, offset))`
     /// where `offset` is the `k + byte_off` most recently set up on top of
     /// `origin`. Lets a later access through the *same* base skip
@@ -2881,15 +2886,14 @@ impl<'m> Gen<'m> {
                 } else {
                     self.emit_call_args(&c.func, &c.args);
                     self.emit(format!("    CALL {}", c.func));
-                    // A `CALL` return clobbers the tracked bank like a label join: the
-                    // callee runs its own `MOVLB` sequence and never restores the caller
-                    // bank on `RETURN`, so the tracked value is stale at return. Trusting
-                    // it elides a needed `MOVLB` and addresses the wrong bank, so the arm
-                    // clears `self.bsr` directly (`emit_label` cannot cover a non-label).
-                    // The callee almost certainly used FSR0 for its own pointer
-                    // accesses too, so the tracked FSR0 position is equally stale
-                    // (epic-cc#472).
-                    self.bsr = None;
+                    // A `CALL` return joins like a label: the callee ran its
+                    // own `MOVLB` sequence. With the exit-bank map the join
+                    // is precise: a callee whose every return path ends at
+                    // one bank leaves that bank live, so the tracked value
+                    // carries; an unknown exit clears. FSR0 has no such
+                    // contract: the callee used it for its own pointer
+                    // accesses (epic-cc#472). (epic-cc#495)
+                    self.bsr = self.exit_banks.get(&c.func).copied().flatten();
                     self.fsr0_holds = None;
                     if let Some(d) = &c.dst {
                         let ty = c.ty.expect("isel-pic18: valued call must carry a type");
@@ -6166,6 +6170,23 @@ fn emission_order<'a>(funcs: &[&'a Func], edges: &HashMap<&str, Vec<&str>>) -> V
     }
 }
 
+/// The bank a function leaves live on return: the join over its
+/// RETURN-ending blocks' recorded end states. Unanimous known ends
+/// give the bank; any dirty, missing, or disagreeing end gives
+/// unknown.
+fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
+    let mut known: Option<u8> = None;
+    for e in ends {
+        match (known, e) {
+            (_, None) => return None,
+            (None, Some(v)) => known = Some(*v),
+            (Some(v), Some(w)) if v == *w => {}
+            (Some(_), Some(_)) => return None,
+        }
+    }
+    known
+}
+
 /// Emits dependency-ordered phi copies for one edge: no copy clobbers a
 /// slot a later copy still reads. Back edges run readers before writers
 /// (the merge slots hold current values); forward edges run writers
@@ -6381,6 +6402,7 @@ pub fn select_with_locs(
     let edges = call_edges(&funcs);
     let order = emission_order(&funcs, &edges);
     let mut bodies: HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
+    let mut exits: HashMap<String, Option<u8>> = HashMap::new();
     // Priority-mode vectors are GOTO stubs: the two bodies cannot both sit
     // at fixed vector addresses (either body overflows the 16-byte vector
     // gap), so the stubs dispatch to the floating bodies below. The lone
@@ -6418,6 +6440,7 @@ pub fn select_with_locs(
             bsr: None,
             fwd_join: HashMap::new(),
             bsr_dirty: false,
+            exit_banks: &exits,
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: &f.name,
@@ -6486,6 +6509,7 @@ pub fn select_with_locs(
             }
         }
         let mut block_end: HashMap<String, Option<u8>> = HashMap::new();
+        let mut ret_ends: Vec<Option<u8>> = Vec::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             g.emit_label(&labels[&b.label]);
             // Join agreement: keep the tracked bank only when every
@@ -6993,9 +7017,15 @@ pub fn select_with_locs(
             // the tracked state where they join, so only the end counts.
             let end = if g.bsr_dirty { None } else { g.bsr };
             block_end.insert(b.label.clone(), end);
+            if matches!(b.insts.last(), Some(Inst::Ret(..))) {
+                ret_ends.push(end);
+            }
         }
         g.flush_copies();
+        // After `bodies` takes `g.out`/`g.locs`: `g` holds `&exits`, so the
+        // map may only be mutated once the body has moved out of `g`.
         bodies.insert(f.name.as_str(), (g.out, g.locs));
+        exits.insert(f.name.to_string(), exit_bank(&ret_ends));
     }
     // Pass B streams in module order: the recipe and naked arms keep
     // their verbatim bodies, the ISR vector line keeps its position,
@@ -7016,6 +7046,7 @@ pub fn select_with_locs(
                 bsr: None,
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
+                exit_banks: &exits,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: &f.name,
@@ -7295,6 +7326,7 @@ mod tests {
         let m = ir::parse("fn f(void) ()\n  block entry:\n    ret void\n");
         let addrs: HashMap<String, u16> = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
         let mut tmp = 0u32;
         let l1 = {
             let mut g = Gen {
@@ -7306,6 +7338,7 @@ mod tests {
                 bsr: None,
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
+                exit_banks: &exits,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -7327,6 +7360,7 @@ mod tests {
                 bsr: None,
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
+                exit_banks: &exits,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -7351,6 +7385,7 @@ mod p3_gen_tests {
         m: &'a Module,
         addrs: &'a HashMap<String, u16>,
         resolved: &'a PtrResolution,
+        exits: &'a HashMap<String, Option<u8>>,
         tmp: &'a mut u32,
     ) -> Gen<'a> {
         Gen {
@@ -7362,6 +7397,7 @@ mod p3_gen_tests {
             bsr: None,
             fwd_join: HashMap::new(),
             bsr_dirty: false,
+            exit_banks: exits,
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: "main",
@@ -7383,7 +7419,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         assert_eq!(g.operand(0x05F), (0, 0x5F));
         assert!(g.out.is_empty(), "no MOVLB for the low access-bank range");
     }
@@ -7398,7 +7435,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         assert_eq!(g.operand(0x0090), (1, 0x90));
         assert!(
             g.out.iter().any(|l| l.contains("MOVLB")),
@@ -7419,7 +7457,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         g.bsr = Some(2);
         g.note_branch("tmp7");
         g.note_branch("tmp7");
@@ -7441,7 +7480,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         g.bsr = Some(0);
         g.note_branch("tmp8");
         g.bsr = Some(1);
@@ -7464,7 +7504,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         // FSR0L, the address this lowering exists to fix.
         assert_eq!(
             g.operand(0xFE9),
@@ -7475,5 +7516,13 @@ mod p3_gen_tests {
             g.out.is_empty(),
             "no MOVLB for an SFR address, regardless of the tracked BSR"
         );
+    }
+
+    #[test]
+    fn exit_bank_joins_return_ends() {
+        assert_eq!(exit_bank(&[Some(2), Some(2)]), Some(2));
+        assert_eq!(exit_bank(&[Some(1), Some(2)]), None);
+        assert_eq!(exit_bank(&[None]), None);
+        assert_eq!(exit_bank(&[]), None);
     }
 }
