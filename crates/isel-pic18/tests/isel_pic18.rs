@@ -5780,3 +5780,51 @@ fn ram_global_over_255_bytes_reads_across_the_bank_boundary() {
     assert_eq!(p.ram()[0x252], 0x77, "offset 256, past the old ceiling");
     assert_eq!(p.ram()[0x253], 0x99, "offset 258, across the bank boundary");
 }
+
+#[test]
+fn bodies_concatenate_in_module_order_even_when_emission_reorders() {
+    // main calls a helper defined after it. The carry analysis (epic-cc#495)
+    // must emit helper first, but the output stream keeps master's order:
+    // helper's body may not float above main's.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal c i8\nglobal d i8\nglobal e i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %1, %2\n\
+             call void @helper()\n\
+             store i8 %3 @c\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @d\n\
+             store i8 %1 @e\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("c", 0x22),
+        ("d", 0x23),
+        ("e", 0x24),
+        ("main::1", 0x30),
+        ("main::2", 0x31),
+        ("main::3", 0x32),
+        ("helper::1", 0x33),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_at = asm.find("\nmain:").expect("main label");
+    let helper_at = asm.find("\nhelper:").expect("helper label");
+    assert!(
+        helper_at > main_at,
+        "helper body must stay after main:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.ram_mut()[0x20] = 3;
+    p.ram_mut()[0x21] = 4;
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x22], 7, "the post-call store must land");
+}
