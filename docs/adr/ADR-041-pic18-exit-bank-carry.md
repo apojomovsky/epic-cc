@@ -40,8 +40,10 @@ keep that bank live across the call.
   because its linear fall-through comes from the trap block, whose bank is
   unknown.
 - **Unknown clears.** An absent map entry (runtime recipe, naked body,
-  forward reference outside the graph) or an unknown exit clears the
-  tracked bank exactly as master did.
+  ISR body, forward reference outside the graph) or an unknown exit
+  clears the tracked bank exactly as master did. ISR bodies record no
+  entry because their epilogue restores the interrupted context's BSR
+  in hardware, a state the tracked model never sees.
 
 ## Rationale
 

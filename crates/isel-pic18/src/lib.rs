@@ -7039,7 +7039,13 @@ pub fn select_with_locs(
         // After `bodies` takes `g.out`/`g.locs`: `g` holds `&exits`, so the
         // map may only be mutated once the body has moved out of `g`.
         bodies.insert(f.name.as_str(), (g.out, g.locs));
-        exits.insert(f.name.to_string(), exit_bank(&ret_ends));
+        // An ISR's epilogue restores the interrupted context's BSR in
+        // hardware (`MOVFF ..., BSR`) without the tracked model seeing it,
+        // so its recorded end can lie; ISR callees must read as unknown.
+        exits.insert(
+            f.name.to_string(),
+            if f.isr { None } else { exit_bank(&ret_ends) },
+        );
     }
     // Pass B streams in module order: the recipe and naked arms keep
     // their verbatim bodies, the ISR vector line keeps its position,

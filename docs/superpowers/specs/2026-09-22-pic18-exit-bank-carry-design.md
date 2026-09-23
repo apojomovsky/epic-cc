@@ -49,9 +49,11 @@ run is the analysis.
    bank to the callee's map entry when known, and clear it when not,
    which is exactly today's behavior. An indirect call takes the meet
    over all candidates: any unknown candidate clears.
-5. Runtime recipes and ISR-suffixed copies are not IR driven, so they
-   are absent from the map and callers treat them as unknown. No call
-   site is ever less conservative than master.
+5. Runtime recipes, ISR-suffixed copies, and ISR bodies record no map
+   entry, so callers treat them as unknown. The recipes are not IR
+   driven, and an ISR's epilogue restores the interrupted context's BSR
+   in hardware without the tracked model seeing it, so its recorded end
+   cannot be trusted. No call site is ever less conservative than master.
 
 Nothing else changes. No instruction is added at any return site, the
 entry-block assumption stays "callers leave any bank", alloc and the
