@@ -4618,6 +4618,79 @@ fn indirect_call_emits_compare_and_call_chain() {
 }
 
 #[test]
+fn indirect_candidates_with_unanimous_exit_carry_at_the_join() {
+    // Both candidates end on bank 1, so the done label's true entry bank
+    // is 1 (only the candidate arms' BRAs reach it; the trap loops). The
+    // meet is restored directly after the label: the forward join cannot
+    // do it, because the label's linear fall-through comes from the trap
+    // block, whose bank is unknown. Without carry this emits a MOVLB in
+    // main after the chain; with it, exactly the candidates' two.
+    let m = parse(
+        "global a i8\nglobal g i8\n\
+         fn f0(void) ()\n\
+           block entry:\n\
+             store i8 1 @h\n\
+             ret void\n\
+         fn f1(void) ()\n\
+           block entry:\n\
+             store i8 2 @h\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void %3() callees f0 f1\n\
+             store i8 9 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("g", 0x110), // bank 1: the post-chain store under test
+        ("h", 0x190), // bank 1: both candidates select it and exit on it
+        ("main::3", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        2,
+        "one MOVLB per candidate body, none in main:\n{asm}"
+    );
+}
+
+#[test]
+fn mixed_indirect_candidates_clear_at_the_join() {
+    // f1 exits on bank 2, f0 on bank 1: the join must collapse and the
+    // post-chain store must re-select bank 1.
+    let m = parse(
+        "global a i8\nglobal g i8\n\
+         fn f0(void) ()\n\
+           block entry:\n\
+             store i8 1 @h\n\
+             ret void\n\
+         fn f1(void) ()\n\
+           block entry:\n\
+             store i8 2 @k\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void %3() callees f0 f1\n\
+             store i8 9 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("g", 0x110), // bank 1
+        ("h", 0x190), // bank 1: f0's exit
+        ("k", 0x290), // bank 2: f1's exit
+        ("main::3", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        3,
+        "one MOVLB per candidate body plus main's re-select; nothing carries:\n{asm}"
+    );
+}
+
+#[test]
 fn freeze_copies_bytes_like_a_noop() {
     let m = parse("global a i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = freeze i16 %1\n    ret void\n");
     let asm = select(

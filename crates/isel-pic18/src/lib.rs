@@ -2990,7 +2990,11 @@ impl<'m> Gen<'m> {
         callees: &[String],
     ) {
         let l_done = self.fresh_label();
-        for cand in callees.iter() {
+        let cand_exits: Vec<Option<u8>> = callees
+            .iter()
+            .map(|cand| self.exit_banks.get(cand).copied().flatten())
+            .collect();
+        for (cand, exit) in callees.iter().zip(cand_exits.iter()) {
             let l_next = self.fresh_label();
             // Compare the fp value's two bytes against the candidate's
             // address. MOVF sets Z; XORLW leaves it; BNZ skips on mismatch.
@@ -3003,7 +3007,9 @@ impl<'m> Gen<'m> {
             // Matched: copy args into this candidate's slots and call it.
             self.emit_call_args(cand, args);
             self.emit(format!("    CALL {cand}"));
-            self.bsr = None;
+            // Same contract as the direct arm, per candidate: a proven
+            // exit bank carries, an unknown one clears.
+            self.bsr = *exit;
             self.fsr0_holds = None;
             self.emit(format!("    BRA {l_done}"));
             self.emit_label(&l_next);
@@ -3013,6 +3019,14 @@ impl<'m> Gen<'m> {
         self.emit_label(&l_trap);
         self.emit(format!("    BRA {l_trap}"));
         self.emit_label(&l_done);
+        // Only the candidate arms' BRAs reach the done label (the trap
+        // loops), so the candidate exit meet is the label's true entry
+        // bank. Restore it directly: the forward join cannot, because
+        // the label's linear fall-through comes from the trap block,
+        // whose bank is unknown. (epic-cc#495)
+        if let Some(bank) = exit_bank(&cand_exits) {
+            self.bsr = Some(bank);
+        }
         if let Some(d) = dst {
             let t = ty.expect("isel-pic18: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
