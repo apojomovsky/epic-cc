@@ -403,6 +403,7 @@ class Config:
     jump_table_run: int = 4
     compare_chain_units: int = 3
     shift_run: int = 3
+    reload_gap: int = 3
     family: str = "pic18"
 
 
@@ -509,6 +510,88 @@ def match_struct_copy(items, i, cfg):
     return _movff_run(items, i, cfg)[0]
 
 
+_RUNTIME_KEEP = ("__start", "__epic_config")
+
+
+def match_runtime_routine(items, i, cfg):
+    """Lowering delegated to a runtime helper: routine bodies and calls.
+
+    Division and wide multiply survive whole-program lowering as
+    `__udiv_*`/`__mul_*` bodies plus 2-word `CALL`s (`bench-u16-dec`
+    pins the u16 half). Naming both sides separately from user code
+    shows what a better inline lowering would reclaim. Startup
+    (`__start`, `__epic_config`) and const pools (`__const*`) keep
+    their own attribution.
+    """
+    del cfg
+    fn = items[i].function
+    if fn.startswith("__"):
+        if fn in _RUNTIME_KEEP or fn.startswith("__const"):
+            return 0
+        return 1
+    if items[i].mnemonic == "CALL":
+        target = items[i].operands.split(",", 1)[0].strip()
+        if target.startswith("__"):
+            return 1
+    return 0
+
+
+_GAP_NEUTRAL = ("MOVFF", "CLRF")
+
+
+def _touches_slot(item, slot):
+    """True when the instruction may read or write file address `slot`.
+
+    Symbolic operands (unresolvable `LOW()` tokens) count as touching:
+    the rule measures missed W-tracking, and a maybe-clobber gaps the
+    proof the backend would need.
+    """
+    if item.mnemonic == "MOVFF":
+        addrs = _movff_operands(item)
+        return any(a is None or a == slot for a in addrs)
+    if item.mnemonic == "CLRF":
+        dest = _dest_address(item)
+        return dest is None or dest == slot
+    return True
+
+
+def match_store_reload_gap(items, i, cfg):
+    """A store, W-preserving gap moves, then a reload of the same slot.
+
+    `MOVWF f`, one to three `MOVFF`/`CLRF` moves that provably avoid `f`
+    and preserve W, then `MOVF f,W`: the reload is one word the
+    W-tracking in epic-cc#502 removes. The adjacency half already
+    belongs to `dead-store-reload`; this is only its near-miss shape
+    (epic-cc#531 measured 20 sites plus 42 near-miss words). SFR slots
+    are excluded: `TABLAT`/`POSTINC` readback is load-bearing.
+    """
+    if not _in_scope(items, i, i + 1) or items[i].mnemonic != "MOVWF":
+        return 0
+    slot = _dest_address(items[i])
+    if slot is None:
+        return 0
+    if cfg.family == "pic18" and slot >= PIC18_SFR_BASE:
+        return 0
+    j = i + 1
+    steps = 0
+    while (
+        steps < cfg.reload_gap
+        and _in_scope(items, i, j)
+        and items[j].mnemonic in _GAP_NEUTRAL
+        and not _touches_slot(items[j], slot)
+    ):
+        j += 1
+        steps += 1
+    if steps == 0 or not _in_scope(items, i, j):
+        return 0
+    nxt = items[j]
+    if nxt.mnemonic != "MOVF" or _dest_address(nxt) != slot:
+        return 0
+    if not re.match(r"^[^,]+,\s*W\b", nxt.operands, re.I):
+        return 0
+    return j + 1 - i
+
+
 def match_jump_table(items, i, cfg):
     """A computed-jump dispatch table: a run of bare GOTOs, 2 words each."""
     j = i
@@ -565,6 +648,46 @@ def match_compare_chain(items, i, cfg):
         j += step
         units += 1
     return j - i if units >= cfg.compare_chain_units else 0
+
+
+WIDE_COMPARE_ALU = {"SUBWF", "SUBFWB", "SUBWFB", "CPFSEQ", "CPFSGT", "CPFSLT"}
+
+
+def match_wide_compare_branch(items, i, cfg):
+    """A multi-byte compare against a variable, closed by a branch.
+
+    One lane per byte (`MOVF` reload, `SUBWF`, per-lane `BNC`/`BZ`
+    exits) is how a 32-bit loop bound (`bench-u32-loop`) and variable
+    if-chains lower today, where a borrow-chain compare with one shared
+    exit would do. Literal-led chains belong to `switch-compare-chain`;
+    a `MOVLW` breaks a lane run, so this only sees variable compares.
+    """
+    del cfg
+    j = i
+    lanes = 0
+    while True:
+        if (
+            _in_scope(items, i, j)
+            and items[j].mnemonic == "MOVF"
+            and re.match(r"^[^,]+,\s*W\b", items[j].operands, re.I)
+        ):
+            j += 1
+        if not _in_scope(items, i, j) or items[j].mnemonic not in WIDE_COMPARE_ALU:
+            break
+        j += 1
+        branches = 0
+        while _in_scope(items, i, j) and (
+            items[j].mnemonic in COND_BRANCH or items[j].mnemonic == "BRA"
+        ):
+            if items[j].mnemonic in COND_BRANCH:
+                branches += 1
+            j += 1
+        if branches == 0:
+            break
+        lanes += 1
+    if lanes >= 2:
+        return j - i
+    return 0
 
 
 def _store_unit(items, anchor, i):
@@ -728,11 +851,14 @@ class Rule:
 # Wide-const runs ahead of zero-init so a half-zero 16-bit constant is
 # reported as one materialisation, not a pair plus a stray store.
 SINK_RULES = (
+    Rule("runtime-routine", match_runtime_routine),
     Rule("dead-store-reload", match_dead_roundtrip),
     Rule("sfr-context-save", match_sfr_context_save),
     Rule("struct-copy-movff", match_struct_copy),
+    Rule("store-reload-gap", match_store_reload_gap),
     Rule("switch-jump-table", match_jump_table),
     Rule("switch-compare-chain", match_compare_chain),
+    Rule("wide-compare-branch", match_wide_compare_branch),
     Rule("bool-materialization", match_bool_materialization),
     Rule("shift-chain", match_shift_chain),
     Rule("wide-const-materialization", match_wide_const),

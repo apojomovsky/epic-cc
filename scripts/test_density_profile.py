@@ -330,6 +330,52 @@ class CategorizationTest(unittest.TestCase):
         spread += "t:\n    RETURN\n"
         self.assertNotIn("switch-compare-chain", words_by_category(spread))
 
+    def test_store_reload_gap(self):
+        listing = PIC18_HEADER + (
+            "f:\n    MOVWF 0x010,B\n    MOVFF 0x020, 0x021\n"
+            "    MOVF 0x010,W,B\n    RETURN\n"
+        )
+        self.assertEqual(words_by_category(listing)["store-reload-gap"], 4)
+        adjacent = PIC18_HEADER + (
+            "f:\n    MOVWF 0x010,B\n    MOVF 0x010,W,B\n    RETURN\n"
+        )
+        self.assertNotIn("store-reload-gap", words_by_category(adjacent))
+        clobbered = PIC18_HEADER + (
+            "f:\n    MOVWF 0x010,B\n    MOVFF 0x010, 0x021\n"
+            "    MOVF 0x010,W,B\n    RETURN\n"
+        )
+        self.assertNotIn("store-reload-gap", words_by_category(clobbered))
+        not_into_w = PIC18_HEADER + (
+            "f:\n    MOVWF 0x010,B\n    MOVFF 0x020, 0x021\n"
+            "    MOVF 0x010,F,B\n    RETURN\n"
+        )
+        self.assertNotIn("store-reload-gap", words_by_category(not_into_w))
+
+    def test_wide_compare_branch(self):
+        listing = PIC18_HEADER + (
+            "f:\n    SUBWF 0x011,W,B\n    BNC t\n"
+            "    SUBWF 0x010,W,B\n    BZ t\nt:\n    RETURN\n"
+        )
+        self.assertEqual(words_by_category(listing)["wide-compare-branch"], 4)
+        single = PIC18_HEADER + ("f:\n    SUBWF 0x010,W,B\n    BZ t\nt:\n    RETURN\n")
+        self.assertNotIn("wide-compare-branch", words_by_category(single))
+        open_run = PIC18_HEADER + (
+            "f:\n    SUBWF 0x011,W,B\n    SUBWF 0x010,W,B\n    RETURN\n"
+        )
+        self.assertNotIn("wide-compare-branch", words_by_category(open_run))
+
+    def test_runtime_routine_body_and_call(self):
+        listing = PIC18_HEADER + (
+            "f:\n    CALL __udiv_u16\n    RETURN\n"
+            "__udiv_u16:\n    MOVWF 0x010,B\n    RETURN\n"
+        )
+        self.assertEqual(words_by_category(listing)["runtime-routine"], 4)
+        startup = PIC18_HEADER + (
+            "__start:\n    MOVLW 0x00\n    RETURN\n"
+            "__const_f_x:\n    MOVLW 0x01\n    RETURN\n"
+        )
+        self.assertNotIn("runtime-routine", words_by_category(startup))
+
     def test_bool_materialization_diamond(self):
         # The arms are `tmp<n>` labels, as the backend emits them: a
         # diamond split by two ordinary labels would be two functions.
