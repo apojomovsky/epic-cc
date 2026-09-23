@@ -6338,3 +6338,69 @@ fn a_multi_use_compare_keeps_its_result_byte() {
     );
     assert_eq!(p.ram()[0x28], 1, "and the branch must agree with it");
 }
+
+/// The shared-exit borrow chain (epic-cc#621) holds STATUS,C across lanes,
+/// so a rhs lane load that writes C corrupts it. The one such load is a
+/// GEP-derived pointer value: `emit_load_w`'s resolved arm materializes
+/// `base + k` with `ADDLW` (and the lane-1 carry fill with `BTFSC`/`ADDLW`).
+/// `%a` is an `inttoptr` runtime-address slot and `%p = gep %a +4` is a
+/// pointer VALUE, so the compare must route to the per-lane cascade, which
+/// consumes C from its own `SUBWF` right after each load.
+///
+/// Reviewer finding on the #621 diff: the chain form returned 1 for
+/// `ult 0x0144, 0x0144`.
+#[test]
+fn an_unsigned_compare_against_a_gep_value_keeps_the_cascade() {
+    let m = parse(
+        "global off i16\n\
+         global lhs i16\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %o = load i16 @off\n\
+             %a = inttoptr i16 %o to ptr\n\
+             %p = gep %a +4\n\
+             %1 = load i16 @lhs\n\
+             %2 = icmp ult i16 %1, %p\n\
+             br i1 %2 10 20\n\
+           block 10:\n\
+             store i8 1 @out\n\
+             ret void\n\
+           block 20:\n\
+             store i8 0 @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("off", 0x110),
+        ("lhs", 0x112),
+        ("out", 0x120),
+        ("main::o", 0x124),
+        ("main::a", 0x126),
+        ("main::1", 0x128),
+        ("main::2", 0x12A),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // The fused chain must not have fired: the result byte is materialized
+    // and reloaded for the branch.
+    assert!(
+        asm.contains("INCF 0x02A") && asm.contains("MOVF 0x02A,W"),
+        "a carry-clobbering rhs must keep the materializing cascade:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
+    // `%a` holds 0x0140, so the gep value is 0x0144.
+    for (lhs, expect) in [(0x0140u16, 1u8), (0x0144, 0), (0x0148, 0), (0x013F, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start);
+        p.ram_mut()[0x110] = 0x40;
+        p.ram_mut()[0x111] = 0x01;
+        p.ram_mut()[0x112] = (lhs & 0xFF) as u8;
+        p.ram_mut()[0x113] = (lhs >> 8) as u8;
+        p.run(500);
+        assert_eq!(
+            p.ram()[0x120],
+            expect,
+            "icmp ult {lhs:#06x}, (gep %a+4 = 0x0144)"
+        );
+    }
+}

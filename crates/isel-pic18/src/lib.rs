@@ -334,7 +334,7 @@ impl<'m> Gen<'m> {
     /// A fused compare emits its exits as the branch's own targets and
     /// never writes the result slot, so the 0/1 byte, its preclear, and
     /// the reload (`MOVF`/`BZ`) all disappear.
-    fn fusable_icmp<'f>(f: &'f Func, b: &'f Block) -> Option<&'f Icmp> {
+    fn fusable_icmp<'f>(g: &Gen, f: &'f Func, b: &'f Block) -> Option<&'f Icmp> {
         let [.., Inst::Icmp(c), Inst::BrCond(bc)] = b.insts.as_slice() else {
             return None;
         };
@@ -348,6 +348,14 @@ impl<'m> Gen<'m> {
         // cascades have none (their answer needs the top lane's sign
         // relation), so they keep the materializing path.
         if !matches!(c.pred.as_str(), "eq" | "ne" | "ult" | "uge" | "ugt" | "ule") {
+            return None;
+        }
+        // The unsigned ordering compares lower to the borrow chain, which
+        // holds STATUS,C across lanes; a rhs lane load that writes C would
+        // corrupt it. The materializing path routes that shape to the
+        // per-lane cascade instead (see `emit_icmp_i16`), but fusion has
+        // no cascade lowering, so decline to fuse it.
+        if matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule") && g.load_w_writes_carry(&c.b) {
             return None;
         }
         // The compare's sole consumer must be this branch. Find `b`'s own
@@ -3141,8 +3149,10 @@ impl<'m> Gen<'m> {
         // one shared exit rather than a per-lane cascade (see
         // `emit_icmp_u16_chain`). Signed ones keep the cascade: their
         // answer needs the top lanes' sign equality, which a single final
-        // borrow does not carry.
-        if matches!(pred, "ult" | "uge" | "ugt" | "ule") {
+        // borrow does not carry. A rhs whose lane load writes STATUS,C
+        // would break the chain's carried flag, so that shape keeps the
+        // cascade too (epic-cc#621).
+        if matches!(pred, "ult" | "uge" | "ugt" | "ule") && !self.load_w_writes_carry(&b) {
             self.emit_icmp_chain(a, b, pred, dst, 2, None);
             return;
         }
@@ -3366,8 +3376,9 @@ impl<'m> Gen<'m> {
         }
         // Same routing as the 16-bit entry point: the unsigned predicates
         // use the shared-exit borrow chain at any width, the signed ones
-        // keep the cascade (see `emit_icmp_i16`).
-        if matches!(pred, "ult" | "uge" | "ugt" | "ule") {
+        // keep the cascade (see `emit_icmp_i16`). A rhs lane load that
+        // writes STATUS,C keeps the cascade as well.
+        if matches!(pred, "ult" | "uge" | "ugt" | "ule") && !self.load_w_writes_carry(&b) {
             self.emit_icmp_chain(a, b, pred, dst, 4, None);
             return;
         }
@@ -3667,11 +3678,56 @@ impl<'m> Gen<'m> {
         (!read.contains(&d)).then_some(d)
     }
 
+    /// Whether `emit_load_w(v, i)` writes STATUS,C for any lane in
+    /// `0..bytes`.
+    ///
+    /// The shared-exit borrow chain (epic-cc#621) holds `C` live from one
+    /// lane to the next, and across the lane-0 borrow-in seed, so a lane
+    /// load that touches `C` corrupts it. The one `emit_load_w` arm that
+    /// writes `C` is the resolved-GEP address materialization: `ADDLW` for
+    /// the constant offset, `ADDWF` for a dynamic term, and the
+    /// `BTFSC`/`ADDLW` carry fill on lane 1. Every other arm is `MOVF`,
+    /// `MOVLW` or `MOVLB`, none of which touch `C`. A compare whose rhs
+    /// load writes `C` falls back to the per-lane cascade, which consumes
+    /// `C` from its own `SUBWF` immediately after each load and so is
+    /// immune (epic-cc#519's `read_base` models the same arm).
+    fn load_w_writes_carry(&self, v: &Val) -> bool {
+        let Val::Reg(r) = v else {
+            return false;
+        };
+        let Some((base, k, terms)) = self.resolved.get(&iselcore::ssa_key(self.cur_func, r)) else {
+            return false;
+        };
+        // A literal base panics inside `emit_load_w` rather than emitting
+        // anything, so it is not a clobber source.
+        let iselcore::Base::Slot(sname, indirect) = base else {
+            return false;
+        };
+        let holds_addr = *indirect
+            || self
+                .m
+                .funcs
+                .iter()
+                .find(|f| f.name == self.cur_func)
+                .map(|f| f.params.iter().any(|pp| pp.name == *sname && pp.ptr))
+                .unwrap_or(false);
+        if !holds_addr {
+            // `emit_load_w` asserts here; nothing is emitted.
+            return false;
+        }
+        // Constant offset only, or a dynamic term: both reach a carry-
+        // writing add.
+        *k != 0 || !terms.is_empty()
+    }
+
     /// Load byte `offset` of any `Val` into `W`: a constant via `MOVLW`
     /// (shifting the literal right by `offset*8` bytes first), a
     /// register/global via `MOVF ...,W` at the resolved address plus
     /// `offset` (which needs the access bit, same as any other
     /// `W`-routing instruction).
+    ///
+    /// The resolved-GEP arm can write STATUS,C (see
+    /// `load_w_writes_carry`); every other arm leaves it alone.
     fn emit_load_w(&mut self, v: &Val, offset: u8) {
         match v {
             Val::Const(k) => {
@@ -6924,7 +6980,7 @@ pub fn select_with_locs(
             // `fusable_icmp`): its lowering moves into the `BrCond` arm
             // below, which knows the branch targets. Emitting it here
             // would materialize a byte nobody reads.
-            let fused = Gen::fusable_icmp(f, b).map(|c| c.dst.clone());
+            let fused = Gen::fusable_icmp(&g, f, b).map(|c| c.dst.clone());
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
                 match inst {
