@@ -6125,4 +6125,14 @@ fn a_recipe_callee_keeps_the_post_call_movlb() {
         block_section(&asm, "main").contains("MOVLB 0x0"),
         "main must re-select after the recipe call:\n{asm}"
     );
+    let lines: Vec<&str> = asm.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| l.trim() == "__mul_u16:")
+        .unwrap_or_else(|| panic!("recipe label missing:\n{asm}"));
+    let next = lines.get(i + 1).copied().unwrap_or("");
+    assert!(
+        !next.trim().is_empty() && !next.trim_end().ends_with(':'),
+        "stub entry block leaked as an empty label:\n{asm}"
+    );
 }
