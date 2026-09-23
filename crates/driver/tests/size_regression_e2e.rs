@@ -182,6 +182,27 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("size-bench/bench-u16-dec.c")],
         },
         Case {
+            name: "bench-struct-scan-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-struct-scan.c")],
+        },
+        Case {
+            name: "bench-bitmask-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-bitmask.c")],
+        },
+        Case {
+            name: "bench-hoist-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-hoist.c")],
+        },
+        Case {
             name: "hal-pic16-blink-16f877a",
             device: "16F877A",
             includes: vec![fixture("hal-pic16")],

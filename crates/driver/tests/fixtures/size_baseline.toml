@@ -88,6 +88,24 @@ flash_words = 140
 ram_bytes = 39
 
 [[entry]]
+name = "bench-struct-scan-18f4550"
+device = "18F4550"
+flash_words = 205
+ram_bytes = 99
+
+[[entry]]
+name = "bench-bitmask-18f4550"
+device = "18F4550"
+flash_words = 161
+ram_bytes = 20
+
+[[entry]]
+name = "bench-hoist-18f4550"
+device = "18F4550"
+flash_words = 140
+ram_bytes = 18
+
+[[entry]]
 name = "hal-pic16-blink-16f877a"
 device = "16F877A"
 flash_words = 622
