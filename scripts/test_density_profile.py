@@ -483,6 +483,61 @@ class CategorizationTest(unittest.TestCase):
         self.assertTrue(all(i.category for i in items if i.kind == "instr"))
 
 
+class ClusterTest(unittest.TestCase):
+    LISTING = PIC18_HEADER + (
+        "f:\n    MOVLW 0x01\n    CALL g\n    RETURN\ng:\n    MOVLW 0x02\n    RETURN\n"
+    )
+
+    def clustered(self, inline_map):
+        _, summary = profile(self.LISTING)
+        return dp.cluster_summary(summary, inline_map)
+
+    def test_folded_callee_rolls_into_caller(self):
+        clusters = self.clustered({"f": ["g"]})
+        self.assertEqual(clusters["f"]["words"], 6)
+        self.assertEqual(clusters["f"]["members"], ["f", "g"])
+        self.assertEqual(clusters["f"]["folded"], [])
+        self.assertNotIn("g", clusters)
+
+    def test_absent_member_names_the_fold(self):
+        clusters = self.clustered({"f": ["ghost"]})
+        self.assertEqual(clusters["f"]["words"], 4)
+        self.assertEqual(clusters["f"]["members"], ["f"])
+        self.assertEqual(clusters["f"]["folded"], ["ghost"])
+
+    def test_missing_members_and_callers_are_ignored(self):
+        clusters = self.clustered({"nobody": ["g"]})
+        self.assertNotIn("nobody", clusters)
+        self.assertNotIn("g", clusters)
+        self.assertEqual(clusters["f"]["words"], 4)
+
+    def test_unmapped_functions_rank_as_singletons(self):
+        clusters = self.clustered({})
+        self.assertEqual(clusters["f"]["words"], 4)
+        self.assertEqual(clusters["g"]["words"], 2)
+
+    def test_categories_do_not_move_with_clusters(self):
+        _, summary = profile(self.LISTING)
+        before = dict(summary["categories"])
+        self.clustered({"f": ["g"]})
+        self.assertEqual(summary["categories"], before)
+
+    def test_cli_inline_map_renders_cluster_table(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = pathlib.Path(d) / "case.asm"
+            path.write_text(self.LISTING)
+            mapping = pathlib.Path(d) / "inline.json"
+            mapping.write_text('{"f": ["ghost"]}')
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT), str(path), "--inline-map", str(mapping)],
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("By cluster", r.stdout)
+        self.assertIn("+1 folded", r.stdout)
+
+
 class CliTest(unittest.TestCase):
     LISTING = PIC18_HEADER + (
         "f:\n    MOVFF 0x001, 0x010\n    MOVFF 0x002, 0x011\n    RETURN\n"

@@ -896,6 +896,7 @@ def summarize(items, total_words):
     per_function = {}
     per_category = {}
     remainder = {}
+    func_remainder = {}
     for item in items:
         if not item.words:
             continue
@@ -905,6 +906,8 @@ def summarize(items, total_words):
         per_category[item.category] = per_category.get(item.category, 0) + item.words
         if item.category == CAT_OTHER:
             remainder[item.mnemonic] = remainder.get(item.mnemonic, 0) + item.words
+            by_mne = func_remainder.setdefault(item.function, {})
+            by_mne[item.mnemonic] = by_mne.get(item.mnemonic, 0) + item.words
     return {
         "total_words": total_words,
         "counted_words": sum(per_function.values()),
@@ -912,7 +915,59 @@ def summarize(items, total_words):
         "functions": per_function,
         "categories": per_category,
         "remainder": remainder,
+        "func_remainder": func_remainder,
     }
+
+
+def cluster_summary(summary, inline_map):
+    """Roll folded callees back into their caller for ranking.
+
+    `inline_map` is `{caller: [members]}` from `scripts/inline-map.py`:
+    functions `wholeprog_opt` folded into a single caller. Folded
+    bodies have no labels left in the listing, so their words already
+    sit inside the caller's total; the cluster names which callees
+    were absorbed (`folded`) so a per-function XC8 comparison adds the
+    same bodies on the oracle side instead of comparing 2171 against
+    189. Roots with no members rank as singletons, so the table covers
+    the whole program, not just folded code.
+    """
+    functions = summary["functions"]
+    cells = summary["cells"]
+    func_remainder = summary.get("func_remainder", {})
+    member_of = {}
+    for caller, members in inline_map.items():
+        for m in members:
+            member_of.setdefault(m, caller)
+    clusters = {}
+    for fn, words in functions.items():
+        if fn in member_of:
+            continue
+        root = fn
+        total = words
+        members = [fn]
+        folded = []
+        for m in inline_map.get(fn, []):
+            if m in functions:
+                total += functions[m]
+                members.append(m)
+            else:
+                folded.append(m)
+        cluster_cells = {}
+        cluster_remainder = {}
+        for member in members:
+            for (cfn, cat), w in cells.items():
+                if cfn == member:
+                    cluster_cells[cat] = cluster_cells.get(cat, 0) + w
+            for mne, w in func_remainder.get(member, {}).items():
+                cluster_remainder[mne] = cluster_remainder.get(mne, 0) + w
+        clusters[root] = {
+            "words": total,
+            "members": members,
+            "folded": folded,
+            "cells": cluster_cells,
+            "remainder": cluster_remainder,
+        }
+    return clusters
 
 
 def _pct(words, total):
@@ -961,6 +1016,19 @@ def render(summary, table, args):
     ]:
         out.append(f"  {fn:<44}{_fmt_words(words):>9}{_pct(words, total):>7.1f}%")
     out.append("")
+    clusters = summary.get("clusters")
+    if clusters:
+        out.append(f"By cluster, folded callees rolled into caller (top {args.top})")
+        out.append(f"  {'cluster':<36}{'words':>9}{'%':>8}")
+        for root, info in sorted(clusters.items(), key=lambda kv: -kv[1]["words"])[
+            : args.top
+        ]:
+            extra = "" if not info["folded"] else f"  +{len(info['folded'])} folded"
+            out.append(
+                f"  {root:<36}{_fmt_words(info['words']):>9}"
+                f"{_pct(info['words'], total):>7.1f}%{extra}"
+            )
+        out.append("")
 
     out.append(f"Top sinks, function x category (top {args.top})")
     out.append(f"  {'function':<36}{'category':<28}{'words':>9}{'%':>8}")
@@ -980,11 +1048,30 @@ def render(summary, table, args):
             : args.top
         ]:
             out.append(f"  {mne:<28}{_fmt_words(words):>9}{_pct(words, total):>7.1f}%")
+    if args.show_other and summary.get("clusters"):
+        out.append("")
+        out.append("Cluster remainder by mnemonic names the next blocker:")
+        out.append(f"  {'cluster':<36}{'other':>9}  top mnemonics")
+        ranked_other = sorted(
+            (
+                (root, info["cells"].get(CAT_OTHER, 0))
+                for root, info in summary["clusters"].items()
+            ),
+            key=lambda kv: -kv[1],
+        )
+        for root, other_words in ranked_other[:8]:
+            if other_words < args.min_words:
+                break
+            top_mne = sorted(
+                summary["clusters"][root]["remainder"].items(), key=lambda kv: -kv[1]
+            )[:3]
+            detail = ", ".join(f"{mne} {_fmt_words(w)}" for mne, w in top_mne)
+            out.append(f"  {root:<36}{_fmt_words(other_words):>9}  {detail}")
     return "\n".join(out)
 
 
 def to_json(summary):
-    return {
+    doc = {
         "total_words": summary["total_words"],
         "counted_words": summary["counted_words"],
         "categories": summary["categories"],
@@ -996,6 +1083,17 @@ def to_json(summary):
             )
         ],
     }
+    if summary.get("clusters"):
+        doc["clusters"] = {
+            root: {
+                "words": info["words"],
+                "members": info["members"],
+                "folded": info["folded"],
+                "cells": info["cells"],
+            }
+            for root, info in summary["clusters"].items()
+        }
+    return doc
 
 
 def render_compare(summary, previous, top):
@@ -1052,7 +1150,15 @@ def profile_text(text, args):
             family=family,
         ),
     )
-    return table, summarize(items, total)
+    summary = summarize(items, total)
+    if getattr(args, "inline_map", None):
+        try:
+            with open(args.inline_map) as f:
+                inline_map = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ProfileError(f"{args.inline_map} is not JSON: {e}")
+        summary["clusters"] = cluster_summary(summary, inline_map)
+    return table, summary
 
 
 def build_parser():
@@ -1094,6 +1200,11 @@ def build_parser():
     )
     p.add_argument("--json", action="store_true", help="emit JSON instead of a table")
     p.add_argument("--compare", help="an earlier --json file to diff against")
+    p.add_argument(
+        "--inline-map",
+        help="folded-callee map from scripts/inline-map.py: rank callers "
+        "with their callees rolled back in",
+    )
     return p
 
 
