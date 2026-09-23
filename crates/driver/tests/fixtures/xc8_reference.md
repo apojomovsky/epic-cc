@@ -65,9 +65,10 @@ then read the flash/RAM line from the `xc8-cc` link step's own
 
 ## Microbench ladder (epic-cc#581)
 
-XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the eight
-`size-bench` programs, measured 2026-09-22 on the
-`epic-cc-xc8-oracle:local` image. Each bench compiled standalone:
+XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the twelve
+`size-bench` programs (eight from epic-cc#581, four from epic-cc#617),
+measured 2026-09-22 and 2026-09-23 on the `epic-cc-xc8-oracle:local`
+image. Each bench compiled standalone:
 
 ```
 xc8-cc -mcpu=18f4550 -O2 bench-<stem>.c -o <stem>.hex
@@ -87,14 +88,25 @@ predates #590 (94 words, 64 after it merges).
 | `bench-switch` | 55 (110 B) | 2 | 94 (64 post-#590) | 8 | +39 (+9 post-#590) |
 | `bench-bool` | 29 (58 B) | 2 | 36 | 9 | +7 |
 | `bench-dead-store` | 16 (32 B) | 3 | 12 | 8 | -4 |
+| `bench-handle-init` | 87 (173 B) | 47 | 24 | 9 | -63 |
+| `bench-switch-calls` | 63 (126 B) | 3 | 50 | 10 | -13 |
+| `bench-u32-loop` | 49 (98 B) | 9 | 105 | 23 | +56 |
+| `bench-u16-dec` | 126 (252 B) | 17 | 140 | 39 | +14 |
 | `bench-bank` | 30 (60 B) | 10 | 26 | 15 | -4 |
 
-Negative gap means epic-cc is smaller. Three benches still trail XC8
-(switch, bool, struct-copy) and rank the remaining codegen work; the
-rest lead by 4 to 23 words. The same v4.00 license reasoning as the
-encoder row above applies: no license file present, but licenses are
-free and unlimited since July 2026, so these rows are XC8's genuine
-`-O2` output.
+Negative gap means epic-cc is smaller. Five benches still trail XC8
+(switch, bool, struct-copy, u32-loop, u16-dec) and rank the remaining
+codegen work; the rest lead by 4 to 63 words. The same v4.00 license
+reasoning as the encoder row above applies: no license file present,
+free and unlimited since July 2026, so these rows are XC8's genuine `-O2` output.
+
+The four rows above (epic-cc#617) were measured 2026-09-23 on the same
+image and flags. `bench-u32-loop` (+56) and `bench-u16-dec` (+14)
+confirm real per-site gaps behind the taskmgr_run and heartbeat
+clusters; `bench-handle-init` and `bench-switch-calls` lead XC8, so
+the init and redraw cluster gaps come from scale and inlining
+concentration, not per-site lowering. Small-bench startup noise
+applies (both toolchains count their own startup here).
 
 ## Whole-program ladder (epic-cc#595)
 
