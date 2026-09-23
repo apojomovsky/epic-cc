@@ -350,6 +350,29 @@ fn edge_bits(rng: &mut SplitMix64) -> u32 {
     }
 }
 
+/// Render finite f32 bits as an exact C99 hex-float literal: normals as
+/// 0x1.MMMMMMpE, zeros signed. Lets a `volatile float` input carry its
+/// bits through a source initializer (epic-cc#561: __start clears
+/// zero-initialized RAM, so sim-side seeds would not survive).
+pub fn f32_hexfloat(bits: u32) -> String {
+    let sign = if bits >> 31 == 1 { "-" } else { "" };
+    let exp = (bits >> 23) & 0xFF;
+    let frac = bits & 0x7F_FFFF;
+    if exp == 0xFF || (exp == 0 && frac != 0) {
+        panic!("fuzz: non-finite f32 bits {bits:#010X} have no exact literal");
+    }
+    if exp == 0 {
+        return format!("{sign}0.0f");
+    }
+    // Six hex digits are 24 fraction bits but f32 holds 23: shift the
+    // field left one so the digits name frac / 2^23, not frac / 2^24.
+    format!(
+        "{sign}0x1.{:06X}p{:}f",
+        (frac << 1) & 0xFF_FFFF,
+        exp as i32 - 127
+    )
+}
+
 /// A generated noinline helper's signature.
 struct Helper {
     name: String,
@@ -1574,12 +1597,15 @@ fn generate_impl(seed: u64, baseline: bool) -> Program {
     let mut decls = String::new();
     for (i, w) in [(0usize, 8u8), (1, 16), (2, 32)] {
         let name = format!("{INPUT_PREFIX}{i}");
-        decls.push_str(&format!("volatile {} {name};\n", ctype(w)));
         let value = match w {
             8 => rng.next_u64() as u8 as u32,
             16 => rng.next_u64() as u16 as u32,
             _ => rng.next_u64() as u32,
         };
+        // The initializer carries the input: __start's zero-clear would
+        // erase a sim-side seed (epic-cc#561). The same value the seeds
+        // used to write, so every core behaves identically.
+        decls.push_str(&format!("volatile {} {name} = 0x{value:X}u;\n", ctype(w)));
         inputs.push(Input {
             name,
             value,
@@ -1760,9 +1786,17 @@ pub fn generate_float(seed: u64) -> Program {
     });
 
     let mut decls = String::new();
-    decls.push_str("volatile u8 in0;\n");
+    decls.push_str(&format!(
+        "volatile u8 in0 = 0x{:X}u;\n",
+        inputs[0].value & 0xFF
+    ));
     for n in ["in3", "in6"] {
-        decls.push_str(&format!("volatile float {n};\n"));
+        let bits = inputs
+            .iter()
+            .find(|i| i.name == n)
+            .expect("float input")
+            .value;
+        decls.push_str(&format!("volatile float {n} = {};\n", f32_hexfloat(bits)));
     }
     decls.push_str(&format!(
         "volatile u8 {checksum};\n",
@@ -1910,12 +1944,13 @@ fn generate_signed_impl(seed: u64, baseline: bool) -> Program {
     let mut decls = String::new();
     for (i, w) in [(0usize, 8u8), (1, 16), (2, 32)] {
         let name = format!("{INPUT_PREFIX}{i}");
-        decls.push_str(&format!("volatile {} {name};\n", ctype(w)));
         let value = match w {
             8 => rng.next_u64() as u8 as u32,
             16 => rng.next_u64() as u16 as u32,
             _ => rng.next_u64() as u32,
         };
+        // The initializer carries the input (epic-cc#561; see generate).
+        decls.push_str(&format!("volatile {} {name} = 0x{value:X}u;\n", ctype(w)));
         inputs.push(Input {
             name,
             value,
@@ -2431,12 +2466,26 @@ pub fn run_ir_differential(prog: &IrProgram, device: &device::Device) -> Result<
 
 /// PIC side of the IR mode: the canonical IR through the in-process pipeline
 /// (the driver stage chain minus clang), assembled in-process and run under
-/// `pic14-sim` seeded at the alloc addresses with `halted()` required. A
-/// pipeline panic (a compiler bug) reports as `Panic` so the fuzz loop
-/// survives it.
+/// `pic14-sim` with `halted()` required. Inputs ride in as initializer
+/// bytes (see above), not sim-side seeds. A pipeline panic (a compiler
+/// bug) reports as `Panic` so the fuzz loop survives it.
 fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure> {
     let (hex, layout) = std::panic::catch_unwind(AssertUnwindSafe(|| {
         let mut m = ir::parse(&prog.ir_text);
+        // The inputs ride in as initializer bytes (epic-cc#561): __start
+        // clears zero-initialized globals, so sim-side seeds would not
+        // survive. `needs_ram_init` then emits the init stores pre-main.
+        for input in &prog.inputs {
+            let g = m
+                .globals
+                .iter_mut()
+                .find(|g| g.name == input.name)
+                .expect("input global");
+            let n = (input.width / 8) as usize;
+            g.bytes = (0..n)
+                .map(|i| ((input.value >> (8 * i)) & 0xFF) as u8)
+                .collect();
+        }
         m = wholeprog::merge(m);
         m = legalize::legalize(m);
         let cg = callgraph::build(&m);
@@ -2493,15 +2542,6 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
     let checksum = match device.core {
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-            for input in &prog.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -2513,15 +2553,6 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
         }
         device::Core::Pic14 => {
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-            for input in &prog.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -2533,15 +2564,6 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
         }
         device::Core::Pic14e => {
             let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
-            for input in &prog.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -2553,15 +2575,6 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
         }
         device::Core::PicBaseline => {
             let mut p = pic14_sim::PicBaseline::with_device(device, pic14_sim::parse_hex(&hex));
-            for input in &prog.inputs {
-                let addr = *layout.globals.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -2576,8 +2589,9 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
 }
 
 /// PIC side: alloc layout (in-process, mirroring the driver's e2e) for the
-/// input/checksum addresses, the driver binary for the hex, `pic14-sim`
-/// seeded at those addresses, run, checksum read, `halted()` required.
+/// checksum address, the driver binary for the hex, `pic14-sim` run,
+/// checksum read, `halted()` required. Inputs ride in as source
+/// initializers (see the generators), not sim-side seeds.
 fn run_pic(
     program: &Program,
     c_path: &Path,
@@ -2604,15 +2618,6 @@ fn run_pic(
     let checksum = match device.core {
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-            for input in &program.inputs {
-                let addr = *layout.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -2624,15 +2629,6 @@ fn run_pic(
         }
         device::Core::Pic14 => {
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-            for input in &program.inputs {
-                let addr = *layout.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -2644,15 +2640,6 @@ fn run_pic(
         }
         device::Core::Pic14e => {
             let mut p = pic14_sim::Pic14e::with_device(device, pic14_sim::parse_hex(&hex));
-            for input in &program.inputs {
-                let addr = *layout.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -2664,15 +2651,6 @@ fn run_pic(
         }
         device::Core::PicBaseline => {
             let mut p = pic14_sim::PicBaseline::with_device(device, pic14_sim::parse_hex(&hex));
-            for input in &program.inputs {
-                let addr = *layout.get(&input.name).ok_or_else(|| {
-                    Failure::new(
-                        FailureKind::Compile,
-                        format!("no global '{}' in the alloc map", input.name),
-                    )
-                })?;
-                seed_le(p.ram_mut(), addr, input.width, input.value);
-            }
             p.run(MAX_SIM_STEPS);
             if !p.halted() {
                 return Err(Failure::new(
@@ -3265,20 +3243,6 @@ fn width_mask(width: u8) -> u32 {
         16 => 0xFFFF,
         32 => 0xFFFF_FFFF,
         w => panic!("bad input width {w}"),
-    }
-}
-
-/// Seed `width` little-endian bytes of `value` at `addr` (the sim side of
-/// the harness's identical seeding; the host side uses `host_main_source`).
-fn seed_le(ram: &mut [u8], addr: u16, width: u8, value: u32) {
-    let bytes = match width {
-        8 => 1,
-        16 => 2,
-        32 => 4,
-        w => panic!("bad input width {w}"),
-    };
-    for i in 0..bytes {
-        ram[addr as usize + i] = ((value >> (8 * i)) & 0xFF) as u8;
     }
 }
 

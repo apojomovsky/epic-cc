@@ -10,10 +10,10 @@
 // Both indices are volatile so neither read folds to a MOVLW constant.
 const unsigned char tbl[8] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
 
-volatile unsigned char idx;
+volatile unsigned char idx = 1;      /* main reads tbl[1] == 0x22 */
 volatile unsigned char out;
 
-volatile unsigned char isr_idx;
+volatile unsigned char isr_idx = 7;  /* handler reads tbl[7] == 0x88 */
 volatile unsigned char isr_out;
 
 __attribute__((interrupt(0))) void isr(void) {

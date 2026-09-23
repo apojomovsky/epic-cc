@@ -26,7 +26,6 @@ fn layout_for(device: &device::Device) -> alloc::AllocLayout {
 
 fn run_on(device: &device::Device, device_name: &str) {
     let layout = layout_for(device);
-    let in_addr = *layout.globals.get("in").expect("in global") as usize;
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
     let out2_addr = *layout.globals.get("out2").expect("out2 global") as usize;
 
@@ -47,10 +46,11 @@ fn run_on(device: &device::Device, device_name: &str) {
     let _ = std::fs::remove_file(&hex_path);
 
     match device.core {
+        // `in` arrives initialized to 0x1234 via the fixture's init store
+        // (epic-cc#561): __start clears zero-initialized globals, so a
+        // sim-side seed would not survive.
         device::Core::Pic14 => {
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-            p.ram_mut()[in_addr] = 0x34;
-            p.ram_mut()[in_addr + 1] = 0x12;
             p.run(200_000);
             assert_eq!(p.ram()[out_addr], 0x46, "out mismatch on {device_name}");
             assert_eq!(p.ram()[out2_addr], 0x34, "out2 mismatch on {device_name}");
@@ -58,8 +58,6 @@ fn run_on(device: &device::Device, device_name: &str) {
         }
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-            p.ram_mut()[in_addr] = 0x34;
-            p.ram_mut()[in_addr + 1] = 0x12;
             p.run(200_000);
             assert_eq!(p.ram()[out_addr], 0x46, "out mismatch on {device_name}");
             assert_eq!(p.ram()[out2_addr], 0x34, "out2 mismatch on {device_name}");

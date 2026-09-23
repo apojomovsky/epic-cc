@@ -44,7 +44,7 @@
 
 #define PORTB (*(volatile unsigned char *)0xF81) // SFR access via inttoptr
 volatile unsigned char out;
-volatile unsigned char in;
+volatile unsigned char in = 0x10;
 
 __attribute__((noinline)) unsigned char bump(unsigned char x) { return (unsigned char)(x + 1); }
 

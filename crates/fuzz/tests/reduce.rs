@@ -50,7 +50,7 @@ const CULPRIT: &str = "(int)in0 * 300 > 40000";
 fn synthetic_mismatch_program() -> Program {
     let prologue = format!(
         "{TYPEDEF_PROLOGUE}\n\
-         volatile u8 in0;\n\
+         volatile u8 in0 = 200u;\n\
          volatile u8 checksum;\n\
          void main(void) {{\n"
     );

@@ -26,7 +26,6 @@ fn layout_for(device: &device::Device) -> alloc::AllocLayout {
 
 fn run_on(device: &device::Device, device_name: &str) {
     let layout = layout_for(device);
-    let in_addr = *layout.globals.get("in").expect("in global") as usize;
     let out_addr = *layout.globals.get("out").expect("out global") as usize;
     let out2_addr = *layout.globals.get("out2").expect("out2 global") as usize;
 
@@ -50,8 +49,10 @@ fn run_on(device: &device::Device, device_name: &str) {
 
     match device.core {
         device::Core::Pic14 => {
+            // `in` arrives initialized (0x6D): the fixture's init store
+            // carries the input, since __start clears zero-initialized
+            // globals before main (epic-cc#561).
             let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-            p.ram_mut()[in_addr] = 0x6D;
             p.run(200_000);
             assert_eq!(p.ram()[out_addr], 0x6D, "out mismatch on {device_name}");
             assert_eq!(p.ram()[out2_addr], 7, "out2 mismatch on {device_name}");
@@ -59,7 +60,6 @@ fn run_on(device: &device::Device, device_name: &str) {
         }
         device::Core::Pic18 => {
             let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-            p.ram_mut()[in_addr] = 0x6D;
             p.run(200_000);
             assert_eq!(p.ram()[out_addr], 0x6D, "out mismatch on {device_name}");
             assert_eq!(p.ram()[out2_addr], 7, "out2 mismatch on {device_name}");

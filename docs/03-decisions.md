@@ -36,6 +36,7 @@ one-line index entry here, e.g.:
 - ADR-036: PIC18 places the local frame overlay below the globals so the access bank holds frames, 2026-09-20
 - ADR-037: PIC18 runtime-routine frames round on the 256-byte BSR bank, not an ram_banks region (routine_base), 2026-09-21
 - ADR-038: dispatch-storage frame policy: per-priority copies, no foreign frames on a priority's dispatch sites, 2026-09-22
+- ADR-039: __start clears zero-initialized RAM on PIC18 (one CLRF loop per run), 2026-09-23
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

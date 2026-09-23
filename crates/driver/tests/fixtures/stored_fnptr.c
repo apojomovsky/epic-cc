@@ -16,7 +16,10 @@ struct tcb {
 static struct tcb g_tasks[1];
 static unsigned char g_payload;
 volatile static unsigned char g_seen;
-volatile unsigned char g_sel;
+#ifndef G_SEL
+#define G_SEL 0
+#endif
+volatile unsigned char g_sel = G_SEL; /* the tests compile with -D G_SEL=n */
 __attribute__((noinline)) static void task_blink(void *arg) {
     g_seen = *(unsigned char *)arg;
 }

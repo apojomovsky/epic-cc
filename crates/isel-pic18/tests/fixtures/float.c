@@ -51,7 +51,7 @@
 volatile float out1;
 volatile float out2;
 volatile float out3;
-volatile float in;
+volatile float in = 3.0f;
 
 struct S { unsigned char c; float f; };
 

@@ -40,7 +40,7 @@
 //
 // Expected for in == 290: out = (0x33 + 0x02 + 0x3C + 0x11) & 0xFF = 0x82
 // (hand-traced against the emitted IR in const_table_e2e.rs).
-volatile unsigned short in;          // 0x20-0x21: 16-bit index input
+volatile unsigned short in = 290;    // 0x20-0x21: 16-bit index input
 volatile unsigned char out;
 
 const unsigned char pad[40] = {

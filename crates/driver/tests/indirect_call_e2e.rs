@@ -28,7 +28,13 @@ fn run_one(device_name: &str, device: &device::Device, sel: u8) {
             &hex_path,
             "--device",
             device_name,
+            // `sel`'s input rides in as a real initializer (`volatile
+            // unsigned char sel = SEL`): __start clears zero-initialized
+            // globals before main (epic-cc#561), which would erase a
+            // sim-side seed.
+            "-D",
         ])
+        .arg(format!("SEL={sel}"))
         .output()
         .expect("run driver");
     assert!(
@@ -45,7 +51,10 @@ fn run_one(device_name: &str, device: &device::Device, sel: u8) {
         &clang,
         &resdir,
         std::path::Path::new("tests/fixtures/indirect_call.c"),
-        &driver::clang::Options::default(),
+        &driver::clang::Options {
+            defines: vec![format!("SEL={sel}")],
+            ..driver::clang::Options::default()
+        },
     );
     let mut m = irparse::parse_ll(&ll_text);
     m = wholeprog::merge(m);

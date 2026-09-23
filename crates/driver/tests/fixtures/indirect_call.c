@@ -11,7 +11,10 @@ typedef unsigned char (*cb_t)(void);
 struct dev {
     cb_t cb;
 };
-volatile unsigned char sel;
+#ifndef SEL
+#define SEL 0
+#endif
+volatile unsigned char sel = SEL; /* the tests compile with -D SEL=n */
 volatile unsigned char out;
 struct dev g_dev;
 

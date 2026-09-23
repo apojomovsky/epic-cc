@@ -6964,7 +6964,46 @@ pub fn select_with_locs(
     // `__start` calls `main` and halts; matches the shape `isel::select`
     // uses for its own program entry, minus the ISR machinery (the single-vector mode).
     // Const string literals copied to RAM need init before main.
+    // Zero-initialized RAM globals are cleared by one LFSR-seeded CLRF
+    // loop per contiguous run (the #486 loop shape with the count in
+    // WREG, so no scratch byte and no MOVLB traffic). Runs join adjacent
+    // zero-init globals and split at 255 for the one-byte MOVLW count;
+    // every run loops, even short ones, to keep a single emission path.
+    // (epic-cc#561)
     {
+        let mut sorted: Vec<(u16, usize)> = m
+            .globals
+            .iter()
+            .filter(|g| {
+                addrs.contains_key(&g.name) && !g.is_const && !g.needs_ram_init() && g.size > 0
+            })
+            .map(|g| (addrs[&g.name], g.size as usize))
+            .collect();
+        sorted.sort();
+        let mut runs: Vec<(u32, usize)> = Vec::new();
+        for (base, len) in sorted {
+            match runs.last_mut() {
+                Some((rb, rn)) if *rb + *rn as u32 == base as u32 => *rn += len,
+                _ => runs.push((base as u32, len)),
+            }
+        }
+        let mut init_zero: Vec<String> = Vec::new();
+        for (base, len) in runs {
+            let (mut b, mut n) = (base, len);
+            while n > 0 {
+                let take = n.min(255);
+                let l = format!("tmp{tmp}");
+                tmp += 1;
+                init_zero.push(format!("    LFSR 0, 0x{b:03X}"));
+                init_zero.push(format!("    MOVLW 0x{take:02X}"));
+                init_zero.push(format!("{l}:"));
+                init_zero.push("    CLRF 0xFEE,A".to_string());
+                init_zero.push("    DECFSZ 0xFE8,F,A".to_string());
+                init_zero.push(format!("    BRA {l}"));
+                b += take as u32;
+                n -= take;
+            }
+        }
         let mut init: Vec<String> = Vec::new();
         for g in &m.globals {
             // Const globals living in RAM copy their bytes down; a mutable
@@ -7013,6 +7052,9 @@ pub fn select_with_locs(
         }
         out.push("__start:".to_string());
         locs.push(None);
+        let zero_len = init_zero.len();
+        out.extend(init_zero);
+        locs.extend(std::iter::repeat(None).take(zero_len));
         let init_len = init.len();
         out.extend(init);
         locs.extend(std::iter::repeat(None).take(init_len));

@@ -17,13 +17,20 @@ use fuzz::{
 };
 
 /// The brief's tiny program: one u8 volatile input, one scalar expression.
-const TINY: &str = "volatile unsigned char in0;\n\
-                    volatile unsigned char checksum;\n\
-                    void main(void){ checksum = (unsigned char)(in0 * 7 + 3); }\n";
+/// The input rides in as a real initializer (epic-cc#561: __start clears
+/// zero-initialized RAM, so a sim-side seed would not survive).
+fn tiny_source(in0: u32) -> String {
+    format!(
+        "volatile unsigned char in0 = {in0}u;\n\
+         volatile unsigned char checksum;\n\
+         void main(void){{ checksum = (unsigned char)(in0 * 7 + 3); }}\n"
+    )
+}
 
 fn tiny_program(in0: u32) -> Program {
+    let c_source = tiny_source(in0);
     Program {
-        c_source: TINY.to_string(),
+        c_source: c_source.clone(),
         inputs: vec![Input {
             name: "in0".into(),
             value: in0,
@@ -33,7 +40,7 @@ fn tiny_program(in0: u32) -> Program {
         checksum_name: "checksum".into(),
         seed: 0,
         statements: Vec::new(),
-        prologue: TINY.to_string(),
+        prologue: c_source,
     }
 }
 
@@ -50,10 +57,9 @@ fn tiny_program_differential_clean() {
 #[test]
 fn mismatching_variant_fails() {
     // A discipline violation: `int` is 16-bit on msp430 but 32-bit on the
-    // host, so `(int)in0 * 300` wraps to -5536 on the PIC (and clang folds
-    // the comparison `-5536 > 40000` to constant 0) while the host keeps
-    // 60000 (60000 > 40000 == 1). The harness MUST report the difference.
-    let c_source = "volatile unsigned char in0;\n\
+    // host (see comment above the original spelling). The input rides in
+    // as a real initializer (epic-cc#561).
+    let c_source = "volatile unsigned char in0 = 200u;\n\
                    volatile unsigned char checksum;\n\
                    void main(void){ checksum = (unsigned char)((int)in0 * 300 > 40000); }\n"
         .to_string();
@@ -125,7 +131,7 @@ fn u32_arithmetic_wraps_identically_on_both_sides() {
     // x*x wraps to 1, 1 > 0xFFFFFFFFu is 0 -> checksum = 0.
     let c_source = format!(
         "{TYPEDEF_PROLOGUE}\n\
-         volatile u32 in0;\n\
+         volatile u32 in0 = 0xFFFFFFFFu;\n\
          volatile u8 checksum;\n\
          void main(void) {{\n\
            u32 x = in0;\n\
@@ -159,7 +165,7 @@ fn unsigned_long_u32_arithmetic_mismatches() {
     // differential-clean once u32 values exceed 2^16  -  the host computes
     // `x * x` in 64 bits (0xFFFFFFFE00000001 > 0xFFFFFFFFu -> 1), msp430 in
     // 32 (wraps to 1, 1 > 0xFFFFFFFFu -> 0). The harness MUST report it.
-    let c_source = "volatile unsigned long in0;\n\
+    let c_source = "volatile unsigned long in0 = 0xFFFFFFFFu;\n\
                    volatile unsigned char checksum;\n\
                    void main(void) {\n\
                      unsigned long x = in0;\n\
@@ -301,8 +307,8 @@ fn generate_is_deterministic_and_disciplined() {
         "same seed must give the same source"
     );
     assert!(
-        a.c_source.contains("volatile u8 in0;"),
-        "volatile u8 input decl"
+        a.c_source.contains("volatile u8 in0 = "),
+        "volatile u8 input decl with initializer"
     );
     assert!(
         a.c_source.contains("checksum = (u8)(checksum ^ "),
@@ -352,18 +358,28 @@ fn generator_20_seed_smoke() {
 /// bytes under LLVM's opaque pointers (no bitcast inst, so the PIC
 /// pipeline parses it)  -  and the fold32 byte-mix feeds the checksum. A
 /// single wrong RNE bit in any float result changes the fold.
-const FLOAT_GLOBALS: &str = "\
-volatile u8 in0;\n\
-volatile float in3;\n\
-volatile float in4;\n\
-volatile float in5;\n\
-volatile float in6;\n\
-volatile u8 checksum;\n\
-volatile float fout;\n\
-__attribute__((noinline)) u8 fold32(u32 v) {\n\
-    return (u8)((u8)v ^ (u8)(v >> 8u) ^ (u8)(v >> 16u) ^ (u8)(v >> 24u) + (u8)in0);\n\
-}\n";
-
+/// The float-fold globals with inputs initialized (epic-cc#561: __start
+/// clears zero-initialized RAM, so sim-side seeds would not survive).
+/// Fixed values: in0 = 0, in4 = 2.0f, in5 = 3.0f; in3 and in6 are the
+/// parameterized pins, rendered by `fuzz::f32_hexfloat`.
+fn float_globals(in3: u32, in6: u32) -> String {
+    format!(
+        "volatile u8 in0 = 0u;\n\
+         volatile float in3 = {};\n\
+         volatile float in4 = {};\n\
+         volatile float in5 = {};\n\
+         volatile float in6 = {};\n\
+         volatile u8 checksum;\n\
+         volatile float fout;\n\
+         __attribute__((noinline)) u8 fold32(u32 v) {{\n\
+             return (u8)((u8)v ^ (u8)(v >> 8u) ^ (u8)(v >> 16u) ^ (u8)(v >> 24u) + (u8)in0);\n\
+         }}\n",
+        fuzz::f32_hexfloat(in3),
+        fuzz::f32_hexfloat(0x4000_0000),
+        fuzz::f32_hexfloat(0x4040_0000),
+        fuzz::f32_hexfloat(in6),
+    )
+}
 /// A fixed float test program: the float-fold globals + `body` in main.
 /// The fixed programs are kept to ~2 statements: main's frame holds every
 /// SSA def, and it must leave bank-0 room for the soft-float routine slots
@@ -372,7 +388,14 @@ __attribute__((noinline)) u8 fold32(u32 v) {\n\
 /// budget the generator models. `in3` is parameterized for the 1-ulp
 /// sensitivity pin.
 fn float_prog(body: &str, in3: u32) -> Program {
-    let c_source = format!("{TYPEDEF_PROLOGUE}{FLOAT_GLOBALS}void main(void) {{\n{body}}}\n");
+    float_prog_in(body, in3, 0x3DCC_CCCD)
+}
+
+fn float_prog_in(body: &str, in3: u32, in6: u32) -> Program {
+    let c_source = format!(
+        "{TYPEDEF_PROLOGUE}{}void main(void) {{\n{body}}}\n",
+        float_globals(in3, in6)
+    );
     Program {
         c_source: c_source.clone(),
         inputs: vec![
@@ -402,10 +425,10 @@ fn float_prog(body: &str, in3: u32) -> Program {
             }, // 3.0f
             Input {
                 name: "in6".into(),
-                value: 0x3DCC_CCCD,
+                value: in6,
                 width: 32,
                 is_float: true,
-            }, // 0.1f
+            },
         ],
         checksum_name: "checksum".into(),
         seed: 0,
@@ -476,8 +499,7 @@ fn float_fixed_cmp_clean() {
     let body = "\
   checksum = (u8)(checksum ^ (u8)(in3 < in4));\n\
   checksum = (u8)(checksum ^ (u8)(in6 == 0.0f));\n";
-    let mut prog = float_prog(body, 0x3F80_0000);
-    prog.inputs[4].value = 0x8000_0000; // in6 = -0.0
+    let prog = float_prog_in(body, 0x3F80_0000, 0x8000_0000); // in6 = -0.0
     let got = run_differential(&prog, &device::PIC16F877A)
         .unwrap_or_else(|e| panic!("float fixed fcmp not differential-clean: {e}"));
     assert_eq!(got, 0x00, "-0.0 == +0.0 (and 1.0 < 2.0)");
@@ -568,7 +590,7 @@ fn generate_float_is_deterministic_and_spanning() {
     // directly).
     let srcs: Vec<String> = (0..8u64).map(|s| generate_float(s).c_source).collect();
     for s in &srcs {
-        assert!(s.contains("volatile float in3;"), "float input decl");
+        assert!(s.contains("volatile float in3 = "), "float input decl");
         assert!(s.contains("volatile float fout;"), "the bits-fold global");
     }
     assert!(
@@ -681,21 +703,16 @@ const SIGNED_BODY: &str = "\
   s16 t3 = (s16)((s16)in1 >> 3);\n\
   s32 t4 = (s32)((u32)in2 + 5u);\n\
   checksum = (u8)(checksum ^ (u8)t0 ^ (u8)t1 ^ (u8)t2 ^ (u8)t3 ^ (u8)t4);\n\
-  checksum = (u8)(checksum ^ (u8)((s16)in1 < (s16)0) ^ (u8)((s32)in2 >= (s32)0));\n";
-
+";
 /// A fixed signed program with the standard globals (u8/u16/u32 inputs +
-/// checksum). `in1 = 0x8000` seeds the wrap edge: `t3 = -32768 >> 3`
-/// exercises ashr sign-fill, and the negative comparisons (slt/sge) run
-/// against the sign-bit set. The body is kept lean (const divisors, no
-/// runtime-divisor guards) so main's frame leaves bank-0 room for the
-/// sdiv/srem i16 routine slots (a straddling routine frame rounds into
-/// bank 1 wholesale).
+/// checksum). `in1 = 0x8000` seeds the wrap edge. Inputs ride in as real
+/// initializers (epic-cc#561).
 fn signed_prog() -> Program {
     let prologue = format!(
         "{TYPEDEF_PROLOGUE}\
-         volatile u8 in0;\n\
-         volatile u16 in1;\n\
-         volatile u32 in2;\n\
+         volatile u8 in0 = 200u;\n\
+         volatile u16 in1 = 0x8000u;\n\
+         volatile u32 in2 = 0x80000000u;\n\
          volatile u8 checksum;\n\
          void main(void) {{\n"
     );

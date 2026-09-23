@@ -39,6 +39,54 @@ fn select_isr(device: &device::Device, m: &ir::Module, addrs: &HashMap<String, u
     isel_pic18::select_with_locs(device, m, addrs, None, Some(0x0040), None).0
 }
 
+/// Count the instructions `select` emits between the `__start:` label and
+/// `call main` (epic-cc#561): per zero-run of `take` bytes, one LFSR and
+/// one MOVLW plus a body of `3*take - 1` (CLRF and DECFSZ `take` times,
+/// BRA `take - 1` times: the last DECFSZ skips); per initializer byte,
+/// MOVLW and MOVWF, plus an MOVLB when the target is banked.
+fn start_steps(asm: &str) -> usize {
+    let window = asm
+        .split("__start:")
+        .nth(1)
+        .expect("__start label")
+        .split("    call main")
+        .next()
+        .expect("__start must call main");
+    let mut steps = 1; // the call itself
+    let mut zero_run = false; // the MOVLW after an LFSR carries the take
+    for line in window.lines() {
+        let line = line.trim();
+        if line.starts_with("LFSR") {
+            zero_run = true;
+            steps += 1;
+        } else if let Some(take) = line.strip_prefix("MOVLW 0x") {
+            if zero_run {
+                // the MOVLW itself plus the clear-loop body
+                steps += 3 * usize::from(u8::from_str_radix(take, 16).unwrap());
+                zero_run = false;
+            } else {
+                steps += 1;
+            }
+        } else if line.starts_with("MOVWF") || line.starts_with("MOVLB") {
+            steps += 1;
+        }
+    }
+    steps
+}
+
+/// Advance a fresh simulator through `__start`'s clear/init window
+/// (`start_steps` instructions), leaving it parked at main's entry: the
+/// clear would otherwise erase a `ram_mut` poke made before `run`.
+/// Seeding from here is sim-observable behavior identical to a debugger
+/// poking RAM after reset-init.
+fn step_past_start(p: &mut pic14_sim::Pic18, steps: usize) {
+    assert!(!p.halted());
+    for _ in 0..steps {
+        p.step();
+    }
+    assert!(!p.halted(), "__start window must not halt the machine");
+}
+
 #[test]
 fn empty_function_emits_a_bare_return() {
     let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
@@ -161,8 +209,10 @@ fn assert_shl16_domain_exact(k: i64, dst: u16) {
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
     for x in 0..=u16::MAX {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start);
         p.ram_mut()[0x20] = x as u8;
         p.ram_mut()[0x21] = (x >> 8) as u8;
         p.set_w((x as u8) ^ ((x >> 8) as u8));
@@ -323,6 +373,7 @@ fn const_lshr_i16_by_4_uses_the_verified_nibble_form() {
         let words = asm::assemble_pic18(&asm);
         for x in 0..=u16::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = x as u8;
             p.ram_mut()[0x21] = (x >> 8) as u8;
             p.set_w((x as u8) ^ ((x >> 8) as u8));
@@ -361,6 +412,7 @@ fn const_shl_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.set_w(!b);
             p.run(200);
@@ -391,6 +443,7 @@ fn const_lshr_i16_by_12_shifts_only_the_surviving_lane() {
         let words = asm::assemble_pic18(&asm);
         for x in 0..=u16::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = x as u8;
             p.ram_mut()[0x21] = (x >> 8) as u8;
             p.set_w((x as u8) ^ ((x >> 8) as u8));
@@ -424,6 +477,7 @@ fn const_lshr_i8_by_4_is_a_swapf_mask_and_matches_across_the_byte() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.set_w(!b);
             p.run(200);
@@ -466,6 +520,9 @@ fn const_shl_i8_by_5_6_7_extend_the_nibble_form() {
             let words = asm::assemble_pic18(&asm);
             for b in 0..=u8::MAX {
                 let mut p = pic14_sim::Pic18::new(words.clone());
+                // Park past __start's zero-clear (epic-cc#561) before the
+                // poke: the clear would otherwise erase it.
+                step_past_start(&mut p, start_steps(&asm));
                 p.ram_mut()[0x20] = b;
                 p.set_w(!b);
                 p.run(200);
@@ -512,6 +569,9 @@ fn const_lshr_i8_by_5_6_7_extend_the_nibble_form() {
             let words = asm::assemble_pic18(&asm);
             for b in 0..=u8::MAX {
                 let mut p = pic14_sim::Pic18::new(words.clone());
+                // Park past __start's zero-clear (epic-cc#561) before the
+                // poke: the clear would otherwise erase it.
+                step_past_start(&mut p, start_steps(&asm));
                 p.ram_mut()[0x20] = b;
                 p.set_w(!b);
                 p.run(200);
@@ -549,6 +609,7 @@ fn const_lshr_i32_by_28_rotates_only_the_surviving_lane() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.ram_mut()[0x21] = b ^ 0x5A;
             p.ram_mut()[0x22] = !b;
@@ -591,6 +652,7 @@ fn const_shl_i16_by_12_rotates_only_the_surviving_lane() {
         let words = asm::assemble_pic18(&asm);
         for x in 0..=u16::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = x as u8;
             p.ram_mut()[0x21] = (x >> 8) as u8;
             p.set_w((x as u8) & ((x >> 8) as u8));
@@ -623,6 +685,7 @@ fn const_shl_i32_by_7_uses_the_fused_form() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.ram_mut()[0x21] = b ^ 0x5A;
             p.ram_mut()[0x22] = !b;
@@ -663,6 +726,7 @@ fn const_shl_i32_by_6_uses_the_fused_form() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.ram_mut()[0x21] = b ^ 0x5A;
             p.ram_mut()[0x22] = !b;
@@ -703,6 +767,7 @@ fn const_shl_i32_by_28_rotates_only_the_surviving_lane() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.ram_mut()[0x21] = b ^ 0x5A;
             p.ram_mut()[0x22] = !b;
@@ -750,6 +815,9 @@ fn const_shl_i32_by_30_rotates_only_the_surviving_lane() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            // Park past __start's zero-clear (epic-cc#561) before the
+            // poke: the clear would otherwise erase it.
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.ram_mut()[0x21] = b ^ 0x5A;
             p.ram_mut()[0x22] = !b;
@@ -794,6 +862,9 @@ fn const_lshr_i32_by_30_rotates_only_the_surviving_lane() {
         let words = asm::assemble_pic18(&asm);
         for b in 0..=u8::MAX {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            // Park past __start's zero-clear (epic-cc#561) before the
+            // poke: the clear would otherwise erase it.
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = b;
             p.ram_mut()[0x21] = b ^ 0x5A;
             p.ram_mut()[0x22] = !b;
@@ -1176,6 +1247,7 @@ fn i16_add_uses_addwfc_for_the_high_byte() {
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     // seed a=0x00FF, b=0x0001 -> 0x0100, exercises the carry chain.
     p.ram_mut()[0x10] = 0xFF;
     p.ram_mut()[0x11] = 0x00;
@@ -1199,6 +1271,7 @@ fn i16_sub_uses_subfwb_for_the_high_byte() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     // 0x0100 - 0x0001 = 0x00FF, exercises the borrow chain.
     p.ram_mut()[0x10] = 0x00;
     p.ram_mut()[0x11] = 0x01;
@@ -1283,6 +1356,7 @@ fn wide_const_lhs_sub_skipped_lane_flags_match_unskipped() {
     for x in [0x0012u16, 0x0013, 0x0000, 0x00FF, 0xFFFF] {
         let run = |words: &[u16]| {
             let mut p = pic14_sim::Pic18::new(words.to_vec());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = x as u8;
             p.ram_mut()[0x21] = (x >> 8) as u8;
             p.set_w((x as u8) ^ ((x >> 8) as u8));
@@ -1331,6 +1405,7 @@ fn wide_const_lhs_sub_zero_lane_skips_addlw() {
     let words = asm::assemble_pic18(&asm);
     for x in 0..=u16::MAX {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x20] = x as u8;
         p.ram_mut()[0x21] = (x >> 8) as u8;
         p.set_w((x as u8) ^ ((x >> 8) as u8));
@@ -1384,6 +1459,7 @@ fn wide_const_lhs_sub_i32_zero_lanes_skip_addlw() {
         0xFFFFFFFF,
     ] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         for (i, b) in x.to_le_bytes().iter().enumerate() {
             p.ram_mut()[0x20 + i] = *b;
         }
@@ -1469,6 +1545,7 @@ fn in_place_i32_shl8_byte_moves_survive_their_own_overwrite() {
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     // a = 0x12345678, LE bytes 78 56 34 12.
     p.ram_mut()[0x20] = 0x78;
     p.ram_mut()[0x21] = 0x56;
@@ -1497,6 +1574,7 @@ fn icmp_eq_materializes_1_when_equal_and_0_when_not() {
     let words = asm::assemble_pic18(&asm);
     for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = av;
         p.ram_mut()[0x11] = bv;
         p.run(200);
@@ -1518,6 +1596,7 @@ fn icmp_ne_distinguishes_equal_from_not_equal() {
         let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = a;
         p.ram_mut()[0x11] = b;
         p.run(200);
@@ -1546,6 +1625,7 @@ fn icmp_ult_and_uge_use_the_carry_flag() {
         let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = a;
         p.ram_mut()[0x11] = b;
         p.run(200);
@@ -1574,6 +1654,7 @@ fn icmp_ugt_and_ule_combine_c_and_z() {
         let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = a;
         p.ram_mut()[0x11] = b;
         p.run(200);
@@ -1607,6 +1688,7 @@ fn icmp_slt_and_sge_use_n_xor_ov() {
         let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = a;
         p.ram_mut()[0x11] = b;
         p.run(200);
@@ -1635,6 +1717,7 @@ fn icmp_sgt_and_sle_combine_z_and_n_xor_ov() {
         let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = a;
         p.ram_mut()[0x11] = b;
         p.run(200);
@@ -1657,6 +1740,7 @@ fn icmp_i16_ties_break_on_the_low_byte() {
         let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = 0x05; // a lo
         p.ram_mut()[0x11] = 0x01; // a hi
         p.ram_mut()[0x12] = 0x03; // b lo
@@ -1680,6 +1764,7 @@ fn icmp_i16_high_byte_alone_decides_when_it_differs() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x10] = 0xFF;
     p.ram_mut()[0x11] = 0x00;
     p.ram_mut()[0x12] = 0x00;
@@ -1753,6 +1838,7 @@ fn icmp_i16_high_byte_uses_the_predicates_own_signedness() {
         let asm = select(&PIC18F4550, &m, &addrs, None);
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = 0x00; // a lo
         p.ram_mut()[0x11] = 0xFF; // a hi
         p.ram_mut()[0x12] = 0x00; // b lo
@@ -1797,6 +1883,7 @@ fn zext_i8_to_i16_zero_fills_the_high_byte() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x10] = 0xFF;
     p.run(50);
     assert_eq!(p.ram()[0x12], 0xFF);
@@ -1827,6 +1914,7 @@ fn zext_i1_to_i8_same_width_widen_compiles_and_runs() {
     let words = asm::assemble_pic18(&asm);
     for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = av;
         p.ram_mut()[0x11] = bv;
         p.run(200);
@@ -1841,6 +1929,7 @@ fn sext_i8_to_i16_sign_fills_the_high_byte() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x10] = 0xFF; // -1
     p.run(50);
     assert_eq!(p.ram()[0x12], 0xFF);
@@ -1854,6 +1943,7 @@ fn trunc_i16_to_i8_keeps_the_low_byte() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x10] = 0x34;
     p.ram_mut()[0x11] = 0x12;
     p.run(50);
@@ -1928,6 +2018,7 @@ fn select_picks_a_when_cond_is_true_and_b_otherwise() {
     for (c, expect) in [(1u8, 0x11u8), (0, 0x22)] {
         // reuse fresh ram each run
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = c;
         p.ram_mut()[0x11] = 0x11;
         p.ram_mut()[0x12] = 0x22;
@@ -1964,6 +2055,7 @@ fn brcond_branches_on_the_condition_byte() {
     let words = asm::assemble_pic18(&asm);
     for (c, expect) in [(1u8, 1u8), (0, 2)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = c;
         p.run(200);
         assert!(p.halted());
@@ -2178,6 +2270,7 @@ fn brcond_both_edges_phi_copies_get_correct_bsr_after_the_synthesized_fcopies_la
     let words = asm::assemble_pic18(&asm);
     for (c, expect_t, expect_f) in [(1u8, 7u8, 0u8), (0, 0, 9)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = c;
         p.run(200);
         assert!(p.halted());
@@ -2422,6 +2515,7 @@ fn call_return_invalidates_tracked_bsr_so_a_later_banked_access_is_not_misbanked
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x20] = 3; // a
     p.ram_mut()[0x21] = 4; // b
     p.ram_mut()[0x22] = 0x11; // c (f's own operands; must not leak into main::4)
@@ -2543,8 +2637,10 @@ fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
         "arr[2] must read directly from base+2 (0x102), no FSR machinery:\n{asm}"
     );
     assert!(
-        !asm.contains("LFSR"),
-        "a fully-constant GEP needs no FSR setup:\n{asm}"
+        // Scoped to main's body: `__start`'s zero-clear (epic-cc#561)
+        // contributes its own LFSR-seeded loop.
+        !asm.split("__start:").next().unwrap().contains("LFSR"),
+        "a fully-constant GEP needs no FSR setup in main's body:\n{asm}"
     );
 }
 
@@ -3359,13 +3455,16 @@ fn memcpy_to_dynamic_dst_walks_postinc0() {
         ("main::i", 0x121),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
+    // Counted in main's body only: `__start`'s zero-clear (epic-cc#561)
+    // also walks POSTINC0 (CLRF 0xFEE,A) while wiping the globals.
+    let main_asm = asm.split("__start:").next().unwrap();
     assert_eq!(
-        asm.matches("LFSR 0,").count(),
+        main_asm.matches("LFSR 0,").count(),
         1,
         "FSR0 must seed exactly once for the whole copy:\n{asm}"
     );
     assert_eq!(
-        asm.matches(", 0xFEE").count(),
+        main_asm.matches(", 0xFEE").count(),
         3,
         "bytes 0-2 must walk POSTINC0 from the direct src:\n{asm}"
     );
@@ -3405,7 +3504,13 @@ fn indirect_to_indirect_walk_covers_the_n2_edge() {
         "FSR1 must seed exactly once:\n{asm}"
     );
     assert_eq!(
-        asm.matches("LFSR 0,").count(),
+        // Counted in main's body only: `__start`'s zero-clear
+        // (epic-cc#561) contributes its own LFSR 0 loop.
+        asm.split("__start:")
+            .next()
+            .unwrap()
+            .matches("LFSR 0,")
+            .count(),
         1,
         "FSR0 must seed exactly once:\n{asm}"
     );
@@ -3750,6 +3855,7 @@ fn a_width2_chain_index_reads_the_high_byte_in_sim() {
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x150] = 0x14; // idx lo byte
     p.ram_mut()[0x151] = 0x01; // idx hi byte: 0x0114 = 276
     p.ram_mut()[0x684] = 0x5A; // the byte the address math must land on
@@ -3790,6 +3896,7 @@ fn a_width2_small_scale_index_adds_the_high_byte_in_sim() {
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x150] = 0x30; // idx lo byte
     p.ram_mut()[0x151] = 0x01; // idx hi byte: 0x0130 = 304
     p.ram_mut()[0x380] = 0x3C; // the byte the address math must land on
@@ -3844,6 +3951,7 @@ fn a_call_defined_index_width_folds_the_high_byte() {
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     // 304.0f = 0x43980000 at @fv: the routine converts it to index
     // 0x0130, so the high byte is nonzero and a width-1 fold lands
     // elsewhere.
@@ -4027,6 +4135,7 @@ fn a_width1_const_index_chains_on_tblptr_in_sim() {
     );
     let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
     let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x150] = 200;
     p.run(1000);
     assert_eq!(p.ram()[0x151], 0x96, "out must be tab[6*200]:\n");
@@ -4071,6 +4180,7 @@ fn a_width2_const_index_reads_the_high_byte_in_sim() {
     );
     let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
     let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x150] = 0x02; // idx lo byte
     p.ram_mut()[0x151] = 0x01; // idx hi byte: 0x0102 = 258
     p.run(1000);
@@ -4324,6 +4434,7 @@ fn sim_run_bytes(
     let asm = select(&PIC18F4550, &m, &addrs, None);
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     for &(addr, val) in seed {
         p.ram_mut()[addr as usize] = val;
     }
@@ -4590,6 +4701,7 @@ fn sext_i1_to_i16_widening_zero_fills_the_high_byte() {
     let words = asm::assemble_pic18(&asm);
     for (av, bv, expect_lo) in [(5u8, 5u8, 1u8), (5, 6, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = av;
         p.ram_mut()[0x11] = bv;
         p.run(200);
@@ -4634,6 +4746,7 @@ fn widening_zext_between_compare_and_branch_keeps_the_branch_sound() {
     let words = asm::assemble_pic18(&asm);
     for (av, bv, expect) in [(5u8, 5u8, 1u8), (5, 6, 2)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = av;
         p.ram_mut()[0x11] = bv;
         p.ram_mut()[0x12] = 0x5A;
@@ -4847,7 +4960,13 @@ fn small_dense_switch_keeps_the_compare_chain() {
     assert!(!asm.contains("ADDWF 0xFF9"), "no PCL dispatch:\n{asm}");
     assert!(!asm.contains(".pcltbl"), "no table marker:\n{asm}");
     assert_eq!(
-        asm.matches("\n    BRA ").count(),
+        // Counted in main's body only: `__start`'s zero-clear
+        // (epic-cc#561) contributes its own BRA loop.
+        asm.split("__start:")
+            .next()
+            .unwrap()
+            .matches("\n    BRA ")
+            .count(),
         4,
         "one branch per case plus the default:\n{asm}"
     );
@@ -5014,6 +5133,7 @@ fn icmp_result_needs_no_literal_diamond() {
     let words = asm::assemble_pic18(&asm);
     for (av, expect) in [(4u8, 1u8), (3, 0), (5, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x20] = av;
         p.run(200);
         assert_eq!(p.ram()[0x21], expect, "eq({av},4)");
@@ -5043,6 +5163,7 @@ fn icmp_eq_zero_skips_the_literal_subtract() {
     let words = asm::assemble_pic18(&asm);
     for (xv, expect) in [(0u8, 1u8), (7, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = xv;
         p.run(200);
         assert_eq!(p.ram()[0x11], expect, "eq({xv},0)");
@@ -5088,6 +5209,7 @@ fn icmp_ordering_predicates_also_skip_the_diamond() {
             (4, u8::from(matches!(pred, "ule" | "uge" | "sle" | "sge"))),
         ] {
             let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
             p.ram_mut()[0x20] = v;
             p.run(200);
             assert_eq!(p.ram()[0x21], e, "{pred}({v}, 4)");
@@ -5121,6 +5243,7 @@ fn icmp_i32_result_needs_no_literal_diamond() {
     let words = asm::assemble_pic18(&asm);
     for (bytes, expect) in [([2u8, 1, 0, 0], 1u8), ([2, 1, 0, 1], 1), ([0, 0, 0, 0], 1)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         for (i, v) in bytes.iter().enumerate() {
             p.ram_mut()[0x20 + i] = *v;
             p.ram_mut()[0x24 + i] = *v;
@@ -5129,6 +5252,7 @@ fn icmp_i32_result_needs_no_literal_diamond() {
         assert_eq!(p.ram()[0x28], expect, "eq equal inputs {bytes:?}");
     }
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x20] = 1;
     p.ram_mut()[0x24] = 2;
     p.run(300);
@@ -5165,6 +5289,7 @@ fn icmp_i32_ordering_result_needs_no_literal_diamond() {
         ([0, 0, 2, 0], [0, 0, 1, 0], 1),
     ] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         for (i, v) in av.iter().enumerate() {
             p.ram_mut()[0x20 + i] = *v;
         }
@@ -5194,6 +5319,7 @@ fn icmp_result_aliasing_an_operand_keeps_the_diamond() {
     let words = asm::assemble_pic18(&asm);
     for (av, expect) in [(4u8, 1u8), (3, 0), (9, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x20] = av;
         p.run(200);
         assert_eq!(p.ram()[0x20], expect, "in-place eq({av},4)");
@@ -5221,6 +5347,7 @@ fn icmp_ne_zero_skips_the_literal_subtract() {
     let words = asm::assemble_pic18(&asm);
     for (xv, expect) in [(0u8, 0u8), (7, 1)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = xv;
         p.run(200);
         assert_eq!(p.ram()[0x11], expect, "ne({xv},0)");
@@ -5256,6 +5383,7 @@ fn icmp_eq_zero_uses_the_banked_operand_form() {
     let words = asm::assemble_pic18(&asm);
     for (xv, expect) in [(0u8, 1u8), (7, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x112] = xv;
         p.run(200);
         assert_eq!(p.ram()[0x113], expect, "banked eq({xv},0)");
@@ -5288,6 +5416,7 @@ fn icmp_i32_eq_zero_converts_every_lane() {
         ([0, 0, 1, 0], 0),
     ] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         for (i, b) in bytes.iter().enumerate() {
             p.ram_mut()[0x20 + i] = *b;
         }
@@ -5333,6 +5462,7 @@ fn icmp_ordering_against_zero_keeps_the_carry_producing_subtract() {
         );
         let words = asm::assemble_pic18(&asm);
         let mut p = pic14_sim::Pic18::new(words);
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = xv;
         p.run(200);
         assert_eq!(p.ram()[0x11], expect, "{pred}({xv}, 0)");
@@ -5371,6 +5501,7 @@ fn icmp_i16_eq_zero_compares_the_high_byte_with_movf_but_keeps_its_subtract() {
     let words = asm::assemble_pic18(&asm);
     for (lo, hi, expect) in [(7u8, 0u8, 1u8), (6, 0, 0), (7, 1, 0), (0, 0, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = lo;
         p.ram_mut()[0x11] = hi;
         p.run(300);
@@ -5425,6 +5556,7 @@ fn icmp_preclears_the_result_for_a_resolved_pointer_operand() {
     let words = asm::assemble_pic18(&asm);
     for (val, expect) in [(0u16, 1u8), (0x0123, 0)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x120] = (val & 0xFF) as u8;
         p.ram_mut()[0x121] = (val >> 8) as u8;
         p.run(500);
@@ -5451,6 +5583,7 @@ fn join_agreement_elides_the_redundant_movlb() {
     let words = asm::assemble_pic18(&asm);
     for (c, expect_g) in [(1u8, 8u8), (0, 9)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = c;
         p.run(500);
         assert!(p.halted());
@@ -5508,6 +5641,7 @@ fn join_disagreement_keeps_the_movlb() {
     let words = asm::assemble_pic18(&asm);
     for (c, expect_k) in [(1u8, 0u8), (0, 9)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x10] = c;
         p.run(500);
         assert!(p.halted());
@@ -5568,6 +5702,7 @@ fn dirty_terminator_poison_single_pred_taken_target() {
     let words = asm::assemble_pic18(&asm);
     for (c, expect) in [(1u8, 1u8), (0, 9)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x090] = c;
         p.run(500);
         assert!(p.halted());

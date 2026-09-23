@@ -12,7 +12,7 @@
 // where 14.5f is due (3.0 + 1.5 + pad[7]=10.0).
 //
 // in = 3.0f -> out = 3.0 + 1.5 + 10.0 = 14.5f = 0x41680000.
-volatile unsigned char in;
+volatile unsigned char in = 3;
 volatile float out;
 
 __attribute__((noinline)) float big(float x) {

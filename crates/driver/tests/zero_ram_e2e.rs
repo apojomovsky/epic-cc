@@ -1,21 +1,14 @@
-//! epic-cc#557: the zero-initialization contract, pinned as a test.
+//! epic-cc#561: the zero-initialization contract, pinned as a test.
 //!
-//! RAM-resident globals are not cleared at startup: no `__start` code writes
-//! zeros, and the convention everywhere is that RAM reads zero before any
-//! write. That holds in the simulator (RAM starts at 0) but NOT on real
-//! silicon, where PIC RAM is indeterminate at power-on.
+//! `__start` clears every zero-initialized RAM global with one LFSR-seeded
+//! CLRF loop per contiguous run before `main`, so an uninitialized global
+//! reads 0 on real silicon, not just in the simulator (whose RAM starts at
+//! 0 and whose POR table now also latches the nonzero SFR resets).
 //!
-//! The cost of changing it is measured, not assumed. On the epic menu-demo
-//! fixture there are 43 zero-initialized mutable globals totalling about
-//! 520-522 bytes (the figure depends on how struct padding is counted), so
-//! clearing them costs on the order of a thousand flash words on an
-//! 11831-word program, roughly +9%. The decision is therefore deliberate:
-//! keep relying on zeroed RAM until there is a reason to pay for it. Filing
-//! the clearing work is epic-cc#561.
-//!
-//! What this test guards is that the reliance stays VISIBLE. If someone later
-//! emits a clearing loop, this test fails and must be rewritten, which is the
-//! point: the assumption should not be able to change silently.
+//! What this test guards is that the clearing stays TOTAL. Seeding a byte
+//! non-zero before the run, the way real silicon may power up, must still
+//! read back 0: if a global ever drops out of the clearing set, the seed
+//! survives and this fails.
 
 use std::process::Command;
 
@@ -64,27 +57,25 @@ fn mapped(map: &str, name: &str) -> usize {
         .unwrap_or_else(|| panic!("{name} not in map:\n{map}"))
 }
 
-/// An uninitialized mutable global is NEVER written, so `__start` contains no
-/// store for it and its first byte holds whatever RAM was seeded with. The
-/// simulator seeds zero, which is why the program still reads 0 here.
+/// An uninitialized mutable global is cleared by `__start`, so its first
+/// byte reads 0 even without any store in `main`.
 #[test]
-fn an_uninitialized_global_gets_no_init_code_and_reads_the_ram_seed() {
+fn an_uninitialized_global_reads_zero() {
     let (sim, map) = build_and_run("tests/fixtures/zero_ram.c", "18F4550");
     assert!(sim.halted(), "program must halt");
-    let buf = mapped(&map, "buf");
+    let out_at = mapped(&map, "out");
     assert_eq!(
-        sim.ram()[buf],
+        sim.ram()[out_at],
         0,
-        "the sim seeds RAM with zero, so the uninitialized global reads 0"
+        "the clearing loop ran before main, so the global reads 0"
     );
 }
 
 /// The load-bearing half: seed the byte with a non-zero value BEFORE the
-/// program runs, the way real silicon may power up. Nothing in `__start`
-/// clears it, so the program reads the seed straight back. This is the
-/// hazard the reliance above creates, made observable.
+/// program runs, the way real silicon may power up. `__start` clears it,
+/// so the program reads 0 rather than the seed.
 #[test]
-fn an_uninitialized_global_reflects_a_nonzero_power_on_seed() {
+fn an_uninitialized_global_does_not_reflect_a_nonzero_power_on_seed() {
     let hex = std::env::temp_dir().join(format!("zero_ram_seed-{}.hex", std::process::id()));
     let map = std::env::temp_dir().join(format!("zero_ram_seed-{}.map", std::process::id()));
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
@@ -111,9 +102,7 @@ fn an_uninitialized_global_reflects_a_nonzero_power_on_seed() {
     assert!(p.halted(), "program must halt");
     assert_eq!(
         p.ram()[out_at],
-        0xAB,
-        "no init code clears the global, so a non-zero power-on seed survives \
-         into the program: this is why the zero-RAM reliance is documented \
-         rather than assumed away"
+        0,
+        "the clearing loop erased the power-on seed before main read it"
     );
 }

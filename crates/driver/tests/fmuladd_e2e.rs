@@ -33,18 +33,6 @@ fn run_on(device_name: &str) {
     let _ = std::fs::remove_file(&hex_path);
     let map = std::fs::read_to_string(&map_path).expect("read map");
     let _ = std::fs::remove_file(&map_path);
-    let in_addr = map
-        .lines()
-        .find_map(|l| {
-            let mut it = l.split_whitespace();
-            if it.next() == Some("global") && it.next() == Some("in") {
-                it.next()
-                    .and_then(|a| u16::from_str_radix(a.trim_start_matches("0x"), 16).ok())
-            } else {
-                None
-            }
-        })
-        .expect("in in map") as usize;
     let out_addr = map
         .lines()
         .find_map(|l| {
@@ -58,21 +46,17 @@ fn run_on(device_name: &str) {
         })
         .expect("out8 in map") as usize;
 
-    let seed = |x: f32| x.to_bits().to_le_bytes();
+    // `in` arrives initialized to 3.0f via the fixture's init store: __start
+    // clears zero-initialized globals before main (epic-cc#561), which
+    // would erase a sim-side seed.
     match device_name {
         "16F877A" => {
             let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&produced));
-            for (i, b) in seed(3.0f32).iter().enumerate() {
-                sim.ram_mut()[in_addr + i] = *b;
-            }
             sim.run(300_000);
             assert_eq!(sim.ram()[out_addr], 9, "out mismatch on {device_name}");
         }
         "18F4550" => {
             let mut sim = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&produced));
-            for (i, b) in seed(3.0f32).iter().enumerate() {
-                sim.ram_mut()[in_addr + i] = *b;
-            }
             sim.run(300_000);
             assert_eq!(sim.ram()[out_addr], 9, "out mismatch on {device_name}");
         }

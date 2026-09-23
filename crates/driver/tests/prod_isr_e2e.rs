@@ -56,10 +56,8 @@ fn run() {
 
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
-    p.ram_mut()[sym("in_a")] = 47;
-    p.ram_mut()[sym("in_b")] = 5;
-    p.ram_mut()[sym("isr_in_a")] = 3;
-    p.ram_mut()[sym("isr_in_b")] = 7;
+    // Inputs arrive via the fixture's init stores (epic-cc#561): __start
+    // clears zero-initialized globals, so sim-side seeds would not survive.
 
     // Run until the routine has written main's first partial product to
     // PRODL and main has not yet stored its result, then interrupt there:

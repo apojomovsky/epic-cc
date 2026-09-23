@@ -50,21 +50,23 @@ fn run_cc2(device_name: &str, device: &device::Device) {
     let hex = std::fs::read_to_string(&hex_path).expect("read hex");
     let map = std::fs::read_to_string(&map_path).expect("read map");
     let _ = std::fs::remove_file(&map_path);
-    let (in_addr, out_addr) = (map_addr(&map, "in"), map_addr(&map, "out"));
+    let out_addr = map_addr(&map, "out");
 
     // in = 7, so every check passing sums to 26 (see the fixture).
     let expected: u8 = 26;
     match device.core {
         device::Core::Pic14 => {
+            // `in` arrives initialized to 7 (the fixture), so the program
+            // itself carries the input: __start clears zero-initialized
+            // globals before main (epic-cc#561), which would erase a
+            // sim-side seed.
             let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-            sim.ram_mut()[in_addr] = 7;
             sim.run(200_000);
             assert_eq!(sim.ram()[out_addr], expected, "out for {device_name} in=7");
             assert!(sim.halted(), "halted {device_name}");
         }
         device::Core::Pic18 => {
             let mut sim = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-            sim.ram_mut()[in_addr] = 7;
             sim.run(200_000);
             assert_eq!(sim.ram()[out_addr], expected, "out for {device_name} in=7");
             assert!(sim.halted(), "halted {device_name}");
