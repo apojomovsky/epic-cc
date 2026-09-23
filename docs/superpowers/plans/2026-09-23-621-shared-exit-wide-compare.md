@@ -56,11 +56,18 @@ The direction is load-bearing: a borrow propagates upward, so the chain
 must start at lane 0. High-to-low compares each lane against a borrow
 that has not happened yet and is wrong on 0x0100 against 0x00FF.
 
-`ult`/`uge` read that carry directly. `ugt`/`ule` are the same chain with
-the operands swapped (compare `b < a`) and the branch polarity flipped,
-which keeps the shared exit for the non-strict predicates too. Cost is
-`2n` words plus 2 for the exit, against today's `2n` plus `3n`: 10 against
-20 at four lanes, 6 against 10 at two.
+`ult`/`uge` read that carry directly. `ugt`/`ule` are the same chain
+with one extra borrow seeded in: clearing C before lane 0 makes its
+`SUBWFB` subtract `b0 + 1`, so the chain computes `a - b - 1` and its
+carry is `a > b` rather than `a >= b`. Cost is `2n` words plus 1 for the
+seed and 2 for the exit, against today's `2n` plus `3n`: 11 against 20 at
+four lanes, 7 against 10 at two.
+
+The operands are deliberately never swapped. `a` must stay the memory
+operand, because a swapped constant on the left would resolve through
+`val_addr` to its RAM address instead of a literal: the first draft did
+exactly that and miscompiled `long.c`'s `icmp ult i32 %1, 0x20000000`.
+The `long.c` sim test caught it.
 
 Signed ordering predicates stay on today's high-to-low cascade. The
 signed answer needs the sign-equality of the top lane, which the borrow
@@ -84,38 +91,52 @@ over the menu-demo sites.
 
 A local use scan over the function's instruction list is enough for the
 single-use test; `alloc`'s liveness data is not reachable from
-`isel-pic18` and does not need to be.
+`isel-pic18` and does not need to be. The scan uses the shared
+`ir::read_vals` enumeration (lifted out of `alloc`, which had the only
+copy).
 
-## Expected result
+## Measured result
 
-| shape | today | after | delta |
+| shape | before | after | delta |
 |---|---|---|---|
-| 4-lane `ult` bound check, bench-u32-loop | 24 | 10 | -14 |
-| 4-lane `eq` zero guard, bench-u32-loop | 13 | 9 | -4 |
 | bench-u32-loop flash | 105 | 87 | -18 |
-| menu-demo `wide-compare-branch` | 150 + 27 | about 90 | about -87 |
+| bench-u32-loop `wide-compare-branch` | 20 | 0 | -20 |
+| menu-demo flash (driver) | 11886 | 11380 | -506 |
+| menu-demo listing words | 11863 | 11299 | -564 |
+| menu-demo `wide-compare-branch` | 150 | 40 | -110 |
+| menu-demo `dead-store-reload` | 303 | 303 | 0 |
+| menu-demo `put_u16` / `runtime-routine` | 254 | 254 | 0 |
 
-The menu-demo figure is the fusion applied to every site; sites whose
-compare leaves the function or feeds a non-branch consumer keep today's
-lowering and are counted as unchanged.
+`dead-store-reload` and `runtime-routine` are unchanged, as expected:
+neither is this ticket's shape. `wide-literal-arith` rose 762 to 870 on
+the listing with no change in the program's total: the profiler's rules
+consume windows in precedence order, so words that were previously read
+as the tail of a compare cascade now fall into the next rule. The ladder
+confirms it, since every affected entry shrank.
+
+The menu-demo figure is 86 fused sites out of 95 multi-byte compares
+(measured from `--emit ir`: 91 have a single branch consumer, and 86 of
+those are adjacent to their branch). The other 9 are multi-use and keep
+today's lowering.
 
 ## What this does not reach
 
 `bench-u32-loop` does not land at XC8's 49 words on this change. The
-remaining distance is not compare shape:
+remaining distance is not compare shape. Measured on the 87-word result:
 
-- 24 words are `MOVFF` staging between globals and local slots (the
-  `limit` load, the loop counter write-back, and the two `tick`
-  read-modify-writes). W-tracking across a store and reload is
-  epic-cc#502's scope.
+- 24 words touch the `volatile` globals `limit` and `tick` (`MOVFF`
+  staging for the bound load, the loop counter write-back, and the two
+  `tick` read-modify-writes). `volatile` forces those accesses, so
+  epic-cc#502's W-tracking cannot remove most of them: only the `tick`
+  read-modify-write's reload is its shape, about 8 words.
 - 12 words are the 32-bit increment lowered as four `MOVLW`/`ADDWF`/
-  `MOVWF` groups (`wide-literal-arith`).
-- 12 words are the `__start` zero-fill loop and prologue, which XC8 does
-  not carry at this size.
+  `MOVWF` groups (`wide-literal-arith`), which is an increment-width
+  question, not a compare one.
+- 11 words are the `__start` zero-fill loop, prologue, and `RETURN`,
+  which XC8 does not carry at this size.
 
-Compare shape is 24 of the 105 words. Reaching 49 needs the staged copies
-and the increment width as well, which are separate tickets with their
-own areas.
+Compare shape was 36 of the original 105 words and is now 19. The
+remaining 68 words are staged copies, increment width, and startup.
 
 ## Verification
 
