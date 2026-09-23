@@ -13,7 +13,7 @@
 // size); the value written is `in`'s low byte itself, then read back
 // through the same pointer, so a wrong FSR/INDF sequence shows up as a
 // wrong `out` rather than merely a crash.
-volatile unsigned short in;
+volatile unsigned short in = 0x0035;
 volatile unsigned char out;
 volatile unsigned char ram[8];
 void main(void) {

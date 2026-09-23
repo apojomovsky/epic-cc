@@ -8,9 +8,13 @@
 // `in` is a volatile runtime double so clang cannot constant-fold the
 // mul+add away. Expected (in = 3.0): r = 3.0*3.0 + 0.5 = 9.5f = 0x41180000,
 // out = (unsigned char)((int)r & 0xFF) = 9.
+//
+// `in` carries its input as a real initializer (3.0f): __start clears
+// zero-initialized globals before main (epic-cc#561), so an uninitialized
+// global can no longer double as a harness-input channel.
 volatile float out;
 volatile unsigned char out8;
-volatile double in;
+volatile double in = 3.0;
 
 void main(void) {
     double a = in;                        // runtime 3.0

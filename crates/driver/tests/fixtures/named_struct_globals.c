@@ -6,7 +6,10 @@ typedef struct { unsigned char a; unsigned char b; unsigned char c; unsigned cha
 const Desc tbl[2] = { { 11, 22, 33, 44 }, { 55, 66, 77, 88 } };
 const Desc single = { 99, 101, 103, 105 };
 
-volatile unsigned char idx;
+#ifndef IDX
+#define IDX 0
+#endif
+volatile unsigned char idx = IDX; /* the tests compile with -D IDX=n */
 volatile unsigned char out0, out1, out2, out3, out4, out5, out6, out7;
 volatile unsigned char out_s0, out_s1, out_s2, out_s3;
 

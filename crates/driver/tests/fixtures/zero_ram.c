@@ -1,7 +1,7 @@
-/* epic-cc#557: `buf` has no initializer, so it is never written by __start.
- * The program reads it and forwards the value. On a simulator that seeds RAM
- * with zero this reads 0; on real silicon the byte is indeterminate, and
- * seeding it non-zero in the test shows the value survives untouched. */
+/* epic-cc#561: `buf` has no initializer, so __start clears it with the
+ * zero-run loop instead of storing to it. The program reads it and forwards
+ * the value. On real silicon the byte is indeterminate at power-on, and the
+ * test seeds it non-zero to prove the clearing loop erased the seed. */
 unsigned char buf[1];
 volatile unsigned char out = 0;
 

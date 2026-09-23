@@ -15,7 +15,7 @@
 //   i=5 odd : s = (166-5)^0x55 = 0xF4; i==1 no; s<10 no                -> 244
 //   i=6 even: s = 244+6 = 250; i>2 -> |0x10 (no change); i!=4 -> 251;
 //             251^0x55 = 0xAE                                            -> 174
-volatile unsigned char in;
+volatile unsigned char in = 7;
 volatile unsigned char out;
 void main(void) {
     unsigned char n = in & 0x07;

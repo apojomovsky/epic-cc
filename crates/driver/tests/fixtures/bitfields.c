@@ -6,7 +6,11 @@
 // f.c = (in>>5) & 7 = 3. out = f.a | (f.b<<2) | (f.c<<5) = 1 | 12 | 96 = 109
 // = 0x6D. The read-back path (f.a + f.b + f.c = 7) is exercised by the
 // second store.
-volatile unsigned char in;
+//
+// `in` carries its input as a real initializer: `__start` clears
+// zero-initialized globals before main (epic-cc#561), so an uninitialized
+// global can no longer double as a harness-input channel.
+volatile unsigned char in = 0x6D;
 volatile unsigned char out;
 volatile unsigned char out2;
 struct flags { unsigned char a:2; unsigned char b:3; unsigned char c:3; };

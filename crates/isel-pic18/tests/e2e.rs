@@ -13,8 +13,10 @@ use std::process::Command;
 
 /// Run clang + the full IR pipeline (through `asm::assemble_file_to_hex`) on
 /// `c_path`, targeting PIC18F4550, and return a freshly constructed (not yet
-/// run) `Pic18` plus the global address map so each test can seed input
-/// addresses by name before calling `.run()`.
+/// run) `Pic18` plus the global address map so each test can locate globals
+/// by name when asserting on `.run()` results. Input globals carry their
+/// values via C initializers in the fixtures (epic-cc#561: `__start` clears
+/// zero-initialized RAM before main).
 fn compile(c_path: &str) -> (Pic18, HashMap<String, u16>) {
     let (p, globals, _asm) = compile_with_asm(c_path);
     (p, globals)
@@ -77,7 +79,6 @@ fn compile_with_asm(c_path: &str) -> (Pic18, HashMap<String, u16>, String) {
 #[test]
 fn add_c_runs_correctly() {
     let (mut p, globals) = compile(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/add.c"));
-    p.ram_mut()[globals["in"] as usize] = 5;
     p.run(200);
     assert_eq!(p.ram()[globals["out"] as usize], 6);
     assert!(p.halted());
@@ -90,7 +91,6 @@ fn scalar_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/scalar.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 7;
     p.run(200_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
@@ -194,9 +194,11 @@ fn banked_c_asm_contains_movlb() {
 
 // P3 end-to-end acceptance: the pointer/array/struct fixtures from Tasks
 // 3-11, compiled through the real PIC18 pipeline and run in the `Pic18`
-// simulator. Seeding and expected values are transcribed verbatim from the
+// simulator. Input and expected values are transcribed verbatim from the
 // working PIC14 tests of the same byte-identical C source
-// (crates/driver/tests/{array,banked_ptr,structs,ptr_probe}_e2e.rs).
+// (crates/driver/tests/{array,banked_ptr,structs,ptr_probe}_e2e.rs); the
+// inputs ride in the fixtures' initializers (epic-cc#561 clears
+// zero-initialized RAM before main).
 
 #[test]
 fn ptr_probe_pic18_c_runs_correctly() {
@@ -205,9 +207,6 @@ fn ptr_probe_pic18_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/ptr_probe_pic18.c"
     ));
-    let in_addr = globals["in"] as usize;
-    p.ram_mut()[in_addr] = 0x35; // in low byte
-    p.ram_mut()[in_addr + 1] = 0x00; // in high byte
     p.run(200_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
@@ -225,7 +224,6 @@ fn array_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/array.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 3; // in low byte = 3 (high byte stays 0)
     p.run(200_000);
     assert_eq!(p.ram()[globals["out"] as usize], 4, "out == buf[3] == 3+1");
     assert!(p.halted());
@@ -239,7 +237,6 @@ fn banked_ptr_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/banked_ptr.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 3; // in low byte = 3 (high byte stays 0)
     p.run(2_000_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
@@ -312,8 +309,6 @@ fn const_table_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/const_table.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 0x22; // 290 = 0x0122, lo byte
-    p.ram_mut()[globals["in"] as usize + 1] = 0x01; // hi byte
     p.run(500_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
@@ -340,9 +335,7 @@ fn interrupt_pic18_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/interrupt_pic18.c"
     ));
-    let in_addr = globals["in"] as usize;
     let out_addr = globals["out"] as usize;
-    p.ram_mut()[in_addr] = 0x10;
 
     // Run main to the injection point: right after the `PORTB = 0x11`
     // store (the PIC14 test.s word 77 equivalent, detected by PORTB's
@@ -488,7 +481,6 @@ fn ptr_probe_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/ptr_probe.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 1; // in = 1 (16-bit; hi byte zero by default)
     p.run(200_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
@@ -512,14 +504,6 @@ fn long_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/long.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 0x78; // 0x12345678
-    p.ram_mut()[globals["in"] as usize + 1] = 0x56;
-    p.ram_mut()[globals["in"] as usize + 2] = 0x34;
-    p.ram_mut()[globals["in"] as usize + 3] = 0x12;
-    p.ram_mut()[globals["sin"] as usize] = 0xED; // -19 = 0xFFFFFFED
-    p.ram_mut()[globals["sin"] as usize + 1] = 0xFF;
-    p.ram_mut()[globals["sin"] as usize + 2] = 0xFF;
-    p.ram_mut()[globals["sin"] as usize + 3] = 0xFF;
     p.run(2_000_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
@@ -540,8 +524,6 @@ fn muldiv_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/muldiv.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 0x2D; // 301 = 0x012D, lo byte
-    p.ram_mut()[globals["in"] as usize + 1] = 0x01; // hi byte
     p.run(500_000);
     assert_eq!(
         p.ram()[globals["out"] as usize],
@@ -560,10 +542,6 @@ fn interrupt_mul_pic18_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/interrupt_mul_pic18.c"
     ));
-    p.ram_mut()[globals["in_a"] as usize] = 47;
-    p.ram_mut()[globals["in_b"] as usize] = 5;
-    p.ram_mut()[globals["isr_a"] as usize] = 0xAB;
-    p.ram_mut()[globals["isr_b"] as usize] = 3;
     p.run(1_000_000);
     // main's context: 47 * 5 = 235 (0xEB), 47 / (5|1) = 47/5 = 9.
     assert_eq!(p.ram()[globals["out"] as usize], 235, "main mul");
@@ -624,11 +602,6 @@ fn float_c_runs_correctly() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/float.c"
     ));
-    // 3.0f = 0x40400000 LE bytes 00 00 40 40
-    p.ram_mut()[globals["in"] as usize] = 0x00;
-    p.ram_mut()[globals["in"] as usize + 1] = 0x00;
-    p.ram_mut()[globals["in"] as usize + 2] = 0x40;
-    p.ram_mut()[globals["in"] as usize + 3] = 0x40;
     p.run(2_000_000);
     // out1 = 0x3F99999A LE 9A 99 99 3F
     assert_eq!(p.ram()[globals["out1"] as usize], 0x9A);
@@ -662,14 +635,6 @@ fn shift_bytes_c_runs_correctly_and_skips_the_rotate_loop() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/shift_bytes.c"
     ));
-    p.ram_mut()[globals["u16in"] as usize] = 0xEF;
-    p.ram_mut()[globals["u16in"] as usize + 1] = 0xBE;
-    p.ram_mut()[globals["u32in"] as usize] = 0x78;
-    p.ram_mut()[globals["u32in"] as usize + 1] = 0x56;
-    p.ram_mut()[globals["u32in"] as usize + 2] = 0x34;
-    p.ram_mut()[globals["u32in"] as usize + 3] = 0x12;
-    p.ram_mut()[globals["s16in"] as usize] = 0xCC;
-    p.ram_mut()[globals["s16in"] as usize + 1] = 0xED;
     p.run(500_000);
 
     assert_eq!(p.ram()[globals["u16_lshr8"] as usize], 0xBE);
@@ -741,19 +706,7 @@ fn ptr_postinc_c_runs_correctly_and_seeds_fsr0_once() {
         "/tests/fixtures/ptr_postinc.c"
     ));
 
-    let vp32 = globals["vp32"] as usize;
     let buf32 = globals["buf32"] as usize;
-    p.ram_mut()[vp32] = (buf32 & 0xFF) as u8;
-    p.ram_mut()[vp32 + 1] = (buf32 >> 8) as u8;
-
-    let vp32in = globals["vp32in"] as usize;
-    let buf32in = globals["buf32in"] as usize;
-    p.ram_mut()[vp32in] = (buf32in & 0xFF) as u8;
-    p.ram_mut()[vp32in + 1] = (buf32in >> 8) as u8;
-    p.ram_mut()[buf32in] = 0x78;
-    p.ram_mut()[buf32in + 1] = 0x56;
-    p.ram_mut()[buf32in + 2] = 0x34;
-    p.ram_mut()[buf32in + 3] = 0x12;
 
     p.run(2_000);
 
@@ -788,7 +741,10 @@ fn ptr_postinc_c_runs_correctly_and_seeds_fsr0_once() {
 
     // The remaining 3 bytes of each 4-byte access (store and load) must
     // walk POSTINC0, not re-seed FSR0: 3 POSTINC0 uses per access, 6 total.
-    let postinc_uses = asm.matches("0xFEE").count();
+    // Counted in main's body only: __start's zero-clear loop also walks
+    // POSTINC0 (CLRF 0xFEE,A) while wiping the zero-init globals.
+    let main_asm = asm.split("__start:").next().unwrap();
+    let postinc_uses = main_asm.matches("0xFEE").count();
     assert_eq!(
         postinc_uses, 6,
         "expected 6 POSTINC0 uses (3 per 4-byte access x 2 accesses):\n{asm}"
@@ -885,10 +841,7 @@ fn ptr_fields_reuse_c_runs_correctly_and_reuses_fsr0() {
         "/tests/fixtures/ptr_fields_reuse.c"
     ));
 
-    let vp = globals["vp"] as usize;
     let buf = globals["buf"] as usize;
-    p.ram_mut()[vp] = (buf & 0xFF) as u8;
-    p.ram_mut()[vp + 1] = (buf >> 8) as u8;
 
     p.run(2_000);
 
@@ -948,10 +901,7 @@ fn ptr_call_forward_c_runs_correctly_and_skips_fsr0() {
         "/tests/fixtures/ptr_call_forward.c"
     ));
 
-    let vp = globals["vp"] as usize;
     let buf = globals["buf"] as usize;
-    p.ram_mut()[vp] = (buf & 0xFF) as u8;
-    p.ram_mut()[vp + 1] = (buf >> 8) as u8;
 
     p.run(2_000);
 
@@ -988,10 +938,6 @@ fn float_frames_above_the_access_window_select_the_bank() {
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/float_frame_high.c"
     ));
-    p.ram_mut()[globals["in"] as usize] = 0x00;
-    p.ram_mut()[globals["in"] as usize + 1] = 0x00;
-    p.ram_mut()[globals["in"] as usize + 2] = 0x40;
-    p.ram_mut()[globals["in"] as usize + 3] = 0x40;
     p.run(2_000_000);
     // out = 14.0f = 0x41600000 LE 00 00 60 41
     assert_eq!(p.ram()[globals["out"] as usize], 0x00);
@@ -1149,7 +1095,6 @@ fn routine_frame_straddling_a_bsr_bank_is_snapped_and_runs() {
             );
         }
     }
-    p.ram_mut()[globals["in"] as usize] = 3;
     p.run(2_000_000);
     let o = globals["out"] as usize;
     // 3.0 + 1.5 + (float)pad[7], pad[7] = 7 + 3 = 10 -> 14.5f.

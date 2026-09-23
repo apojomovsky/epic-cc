@@ -3,7 +3,7 @@
 #include <stddef.h>
 #include <string.h>
 
-volatile uint8_t in;
+volatile uint8_t in = 7;
 volatile uint8_t out;
 
 volatile char src[8];

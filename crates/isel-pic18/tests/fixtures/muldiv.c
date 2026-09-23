@@ -26,7 +26,7 @@
 // exact emitted IR; the plan's shape recomputed  -  clang strength-reduced
 // `a % 7`, folded the constant `b`, and widened the i8 chain).
 volatile unsigned int out;
-volatile unsigned int in;
+volatile unsigned int in = 301;
 volatile unsigned char gate;
 
 void main(void) {

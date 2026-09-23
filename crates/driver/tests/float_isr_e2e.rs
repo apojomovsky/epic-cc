@@ -66,11 +66,16 @@ fn float_isr_preempts_main_mid_op_without_corruption() {
     // the float recipes run hundreds of instructions, so of the 8 fires
     // several land INSIDE main's in-flight mul/div (the exact hazard
     // epic-cc#357 removes).
+    // Fires also wait for `main` to be running (steps >= 400 is past
+    // __start's clear/init lines): real firmware arms interrupts after
+    // the startup zero-clear has finished, so the startup loop must
+    // never be preempted. (`fire` cannot gate this: the ISR itself
+    // clears it on acknowledge.)
     p.ram_mut()[0xFF2] = 0x80;
     let mut steps = 0usize;
     let mut fired = 0u32;
     while !p.halted() {
-        if steps % 250 == 100 && fired < 8 && p.ram()[0xFF2] & 0x80 != 0 {
+        if steps % 250 == 100 && fired < 8 && steps >= 400 && p.ram()[0xFF2] & 0x80 != 0 {
             p.fire_interrupt();
             fired += 1;
         }

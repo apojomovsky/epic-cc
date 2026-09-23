@@ -30,7 +30,7 @@
 // Expected: out == 0xB8 for in == 3 (hand trace in banked_ptr_e2e.rs).
 struct P { unsigned char a; unsigned char b; };
 
-volatile unsigned short in;          // 0x20-0x21 (bank 0): index input
+volatile unsigned short in = 3;      // 0x20-0x21 (bank 0): index input
 volatile unsigned char filler[78];   // 0x22-0x6F: fills bank 0 (region_for)
 volatile unsigned char arrB1[16];    // 0xA0-0xAF (bank 1)
 volatile unsigned char fill1[64];    // 0xB0-0xEF: fills bank 1

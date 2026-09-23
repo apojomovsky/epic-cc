@@ -66,8 +66,9 @@ fn run() {
 
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
-    p.ram_mut()[sym("idx")] = 1; // main reads tbl[1] == 0x22
-    p.ram_mut()[sym("isr_idx")] = 7; // handler reads tbl[7] == 0x88
+    // idx/isr_idx arrive via the fixture's init stores (epic-cc#561):
+    // __start clears zero-initialized globals, so sim-side seeds would
+    // not survive.
 
     // Interrupt at the instruction right after main's TBLRD*: TABLAT holds
     // main's 0x22 and the consumer has not run yet.

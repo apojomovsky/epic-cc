@@ -31,13 +31,13 @@
 // exercises the recipe-selection path: a copy that matched on its own
 // `__udiv_u8_isr` name would fall through to the remainder store and return
 // the wrong number.
-volatile unsigned char in_a;
-volatile unsigned char in_b;
+volatile unsigned char in_a = 47;
+volatile unsigned char in_b = 5;
 volatile unsigned char out;
 volatile unsigned char out_q;
 
-volatile unsigned char isr_a;
-volatile unsigned char isr_b;
+volatile unsigned char isr_a = 0xAB;
+volatile unsigned char isr_b = 3;
 volatile unsigned char isr_out;
 volatile unsigned char isr_out_q;
 

@@ -11,7 +11,7 @@ typedef struct {
 __attribute__((noinline)) void callee(s_t *p) { p->a = 1; }
 __attribute__((noinline)) void fwd(s_t *p) { callee(p); }
 
-s_t *volatile vp; // set by the test to point at buf
 s_t buf;
+s_t *volatile vp = &buf; // points at buf
 
 void main(void) { fwd(vp); }

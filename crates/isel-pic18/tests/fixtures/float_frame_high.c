@@ -9,7 +9,7 @@
 // zero-initialized RAM cannot mimic, and covers __sitofp_f32's aw==1
 // BTFSC+MOVLW 0xFF path. out = 4.0 + 5.0 + 6.0 - 1.0 = 14.0f.
 volatile unsigned char pad[0x60];
-volatile float in;
+volatile float in = 3.0f;
 volatile float out;
 volatile signed char sc;
 

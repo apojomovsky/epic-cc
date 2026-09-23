@@ -7,51 +7,56 @@
 //!   - ok_flag = 0: out = 'F' (0x46)
 use std::process::Command;
 
-/// Compile `fixture` for `device` and run it in the sim with `ok_flag` set
-/// to each `(flag, expected_out)` pair, asserting `out` and `halted`.
+/// Compile `fixture` for `device` and run it in the sim with `ok_flag`
+/// compiled in as a real initializer for each `(flag, expected_out)` pair,
+/// asserting `out` and `halted`. The flag rides in via `-D OK_FLAG=n`
+/// (epic-cc#561: __start clears zero-initialized globals, so a sim-side
+/// seed would not survive).
 fn run_fixture(
     device_name: &str,
     device: &'static device::Device,
     fixture: &str,
     cases: &[(u8, u8)],
 ) {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new(fixture),
-        &driver::clang::Options::default(),
-    );
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
-    let ok_addr = *layout.globals.get("ok_flag").expect("ok_flag") as usize;
-    let out_addr = *layout.globals.get("out").expect("out") as usize;
-
-    let stem = std::path::Path::new(fixture)
-        .file_stem()
-        .expect("fixture file name")
-        .to_str()
-        .expect("fixture name utf8");
-    let hex_path = format!("tests/fixtures/{stem}_{device_name}.hex");
-    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([fixture, "-o", &hex_path, "--device", device_name])
-        .output()
-        .expect("run driver");
-    assert!(
-        out.status.success(),
-        "driver {device_name}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let hex = std::fs::read_to_string(&hex_path).expect("read hex");
-
     for &(flag, expected) in cases {
+        let (clang, resdir) = driver::clang::pic_clang_from_env();
+        let ll_text = driver::clang::compile_to_stdout(
+            &clang,
+            &resdir,
+            std::path::Path::new(fixture),
+            &driver::clang::Options {
+                defines: vec![format!("OK_FLAG={flag}")],
+                ..driver::clang::Options::default()
+            },
+        );
+        let mut m = irparse::parse_ll(&ll_text);
+        m = wholeprog::merge(m);
+        m = legalize::legalize(m);
+        let cg = callgraph::build(&m);
+        let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
+        let out_addr = *layout.globals.get("out").expect("out") as usize;
+
+        let stem = std::path::Path::new(fixture)
+            .file_stem()
+            .expect("fixture file name")
+            .to_str()
+            .expect("fixture name utf8");
+        let hex_path = format!("tests/fixtures/{stem}_{device_name}_{flag}.hex");
+        let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+            .args([fixture, "-o", &hex_path, "--device", device_name, "-D"])
+            .arg(format!("OK_FLAG={flag}"))
+            .output()
+            .expect("run driver");
+        assert!(
+            out.status.success(),
+            "driver {device_name}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let hex = std::fs::read_to_string(&hex_path).expect("read hex");
+
         match device.core {
             device::Core::Pic14 => {
                 let mut sim = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
-                sim.ram_mut()[ok_addr] = flag;
                 sim.run(200_000);
                 assert_eq!(
                     sim.ram()[out_addr],
@@ -62,7 +67,6 @@ fn run_fixture(
             }
             device::Core::Pic18 => {
                 let mut sim = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
-                sim.ram_mut()[ok_addr] = flag;
                 sim.run(200_000);
                 assert_eq!(
                     sim.ram()[out_addr],
@@ -74,8 +78,8 @@ fn run_fixture(
             device::Core::Pic14e => panic!("pic14e core not implemented"),
             device::Core::PicBaseline => panic!("pic-baseline core not implemented"),
         }
+        let _ = std::fs::remove_file(&hex_path);
     }
-    let _ = std::fs::remove_file(&hex_path);
 }
 
 fn run_select_globals(device_name: &str, device: &'static device::Device) {

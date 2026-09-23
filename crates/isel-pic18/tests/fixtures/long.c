@@ -38,8 +38,8 @@
 struct P { unsigned char a; unsigned long b; };   // {i8,i32}: a@0, b@2, size 6
 
 volatile unsigned long  out;
-volatile unsigned long  in;
-volatile long           sin;
+volatile unsigned long  in = 0x12345678;
+volatile long           sin = -19;
 volatile struct P       sp;
 volatile unsigned char  g8;
 volatile unsigned short g16;

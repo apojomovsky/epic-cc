@@ -9,7 +9,10 @@
 // Expected (sim sets `ok_flag` before run):
 //   - ok_flag = 1: out = 'P' (0x50)
 //   - ok_flag = 0: out = 'F' (0x46)
-volatile unsigned char ok_flag;
+#ifndef OK_FLAG
+#define OK_FLAG 1
+#endif
+volatile unsigned char ok_flag = OK_FLAG; /* tests compile with -D OK_FLAG=n */
 volatile unsigned char out;
 
 __attribute__((noinline)) static void putstr(const char *s)

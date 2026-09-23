@@ -10,7 +10,10 @@
 // Expected (sim sets `ok_flag` before run):
 //   - ok_flag = 1: out = 'P' (0x50)
 //   - ok_flag = 0: out = 'R' (0x52, ram_buf[0])
-volatile unsigned char ok_flag;
+#ifndef OK_FLAG
+#define OK_FLAG 1
+#endif
+volatile unsigned char ok_flag = OK_FLAG; /* tests compile with -D OK_FLAG=n */
 volatile unsigned char out;
 volatile unsigned char ram_buf[4];
 

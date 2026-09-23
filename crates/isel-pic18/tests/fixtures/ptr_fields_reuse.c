@@ -10,8 +10,8 @@ typedef struct {
     unsigned char d;
 } cfg_t;
 
-cfg_t *volatile vp; // set by the test to point at buf
 cfg_t buf;
+cfg_t *volatile vp = &buf; // points at buf
 
 void main(void) {
     cfg_t *p = vp;

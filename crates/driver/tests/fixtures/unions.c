@@ -4,7 +4,11 @@
 //
 // in = 0x1234: v.w = in, out = v.b[0] + v.b[1] = 0x34 + 0x12 = 0x46 (little
 // endian). Then v.b[0] = 0x34, v.b[1] = 0x12, out2 = v.w & 0xFF = 0x34.
-volatile unsigned short in;
+//
+// `in` carries its input as a real initializer (0x1234): __start clears
+// zero-initialized globals before main (epic-cc#561), so an uninitialized
+// global can no longer double as a harness-input channel.
+volatile unsigned short in = 0x1234;
 volatile unsigned char out;
 volatile unsigned char out2;
 union u { unsigned char b[2]; unsigned short w; };

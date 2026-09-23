@@ -3,7 +3,7 @@
 // 16-bit volatile so clang keeps the index mask `& 7` as an i16 `and` (isel
 // lowers i16 and; it has no i8 and). Expected: in = 3 -> buf[3] = 4 -> out =
 // 4.
-volatile unsigned short in;
+volatile unsigned short in = 3;
 volatile unsigned char out;
 volatile unsigned char buf[8];
 void main(void) {
