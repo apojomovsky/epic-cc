@@ -9,11 +9,12 @@ epic-cc#600 profiled `hal-pic16-encoder-full-16f877a` with
 `scripts/density-profile.py`: 6909 flash words, 978 bank-switch words,
 of which 272 sit in `epic_dispatch_all_irqs` (130) and its `_isr` twin
 (142). A tracked-bank simulation over the emitted asm attributes the
-main function's 130 as 52 SFR-to-frame flips (INTCON/PIR flag reads in
-bank 0 against a bank-2 frame), 30 callback-global-to-frame flips
-(`g_t0_overflow_cb` and kin in bank 1 against the same frame), and the
-rest label-join full BANKSELs. The twin mirrors this with its frame in
-bank 3.
+main function's 130 switch words as 52 SFR-to-frame flips (INTCON/PIR
+flag reads in bank 0 against a bank-2 frame, one word each) plus 30
+callback-global-to-frame flip words (`g_t0_overflow_cb` and kin in
+bank 1 against the same frame, 15 transitions at two words each) plus
+the rest label-join full BANKSELs. The twin mirrors this with its
+frame in bank 3.
 
 The issue proposed beating the pair down by half or more through
 placement (co-locate dispatch spills with flag banks), scheduling, or
@@ -50,9 +51,9 @@ reverted. Figures are listing words from the same profile run.
   than the dispatch saves, plus alignment padding growth.
 - **Heat split (alloc).** ISR-context-referenced globals of 8 bytes or
   fewer ahead of the frames, frames next, cold globals last. Pair 272
-  to 188, program total 978 to 1033. The structural limit: bank-0 GPR
-  is 80 bytes and cannot hold both hot contexts. The main dispatch
-  fits (frame 0x5A, callbacks 0x20 to 0x28, SFR flips gone) but the
+  to 188, program bank-switch total 978 to 1033. The structural limit:
+  bank-0 GPR is 80 bytes and cannot hold both hot contexts. The main
+  dispatch fits (frame 0x5A, callbacks 0x20 to 0x28, SFR flips gone) but the
   ISR region starts after the whole main context, so the twin lands in
   bank 1 and keeps flip-flopping every flag.
 
@@ -70,7 +71,7 @@ reverted. Figures are listing words from the same profile run.
   full-BANKSEL words per dispatch function today), an ISR-region-first
   variant (zeroes the twin, restores the main dispatch to about 130,
   marginal either way), and the larger oracle-gap slices on the same
-  program (dead-store-reload 216, zero-init-pair 136).
+  program (dead-store-reload 216, zero-init-pair 136, const-data 274).
 
 ## Revisit if
 
