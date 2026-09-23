@@ -5895,6 +5895,7 @@ fn bodies_concatenate_in_module_order_even_when_emission_reorders() {
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x20] = 3;
     p.ram_mut()[0x21] = 4;
     p.run(500);
@@ -5946,6 +5947,7 @@ fn a_provable_callee_exit_bank_carries_across_the_call() {
     );
     let words = asm::assemble_pic18(&asm);
     let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
     p.ram_mut()[0x20] = 3;
     p.ram_mut()[0x21] = 4;
     p.ram_mut()[0x22] = 3; // c: f's add must also produce 7
@@ -6006,6 +6008,7 @@ fn a_terminator_selected_callee_exit_keeps_the_post_call_movlb() {
     let words = asm::assemble_pic18(&asm);
     for c in [1u8, 0] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x20] = c;
         p.run(500);
         assert!(p.halted());
@@ -6053,6 +6056,7 @@ fn disagreeing_callee_returns_keep_the_post_call_movlb() {
     let words = asm::assemble_pic18(&asm);
     for (c, want_k, want_slot) in [(1u8, 1u8, 0u8), (0u8, 0u8, 2u8)] {
         let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
         p.ram_mut()[0x21] = c; // c: f's branch condition picks the arm
         p.run(500);
         assert!(p.halted());
