@@ -28,8 +28,8 @@ keep that bank live across the call.
 - **Buffered reverse-topological emission.** Functions emit into
   per-function buffers, callees before callers (call-graph order, recipes
   and naked bodies excluded), and the buffers concatenate in the original
-  module order, so the output stream keeps master's layout apart from
-  `tmp{n}` label renumbering.
+  module order, so the output stream keeps master's layout, other than a
+  possible `tmp{n}` label renumbering.
 - **Exit-bank map from recorded return ends.** After each function's `Gen`
   run, the recorded end states of its RETURN-ending blocks join by
   unanimity: all known and equal gives the bank, any dirty, missing, or
@@ -73,8 +73,9 @@ fallback.
   `Gen` run and no map entry. The residual provable-exit sites in the
   post-change listing are exactly the `__mul_u32`/`__mul_u16` callers.
   Giving recipes recorded exit banks is deferred, not decided here.
-- Callees with valued returns or terminator-selected banks (per-edge phi
-  copies) poison their end state and stay unknown. Expected and
+- A banked select inside the terminator lowering (per-edge phi copies,
+  banked retval routing) sets `bsr_dirty`, which poisons the block's
+  end state and leaves the callee's exit unknown. Expected and
   conservative.
 - The call graph must be a DAG for the ordering to be total (recursion is
   a compile error upstream); a defensive cycle break degrades to module
