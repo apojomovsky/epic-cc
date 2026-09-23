@@ -1921,3 +1921,98 @@ fn main_site_lists_stored_copy_for_shared_dispatch_storage() {
         "the ISR site must dispatch the copy"
     );
 }
+
+/// The decimal div-rem expansion clang emits for `v % 10` computes its
+/// remainder through a `mul i16 q, 246` whose high half is discarded by a
+/// `trunc i16 to i8`. Modular arithmetic lets the whole tail run at i8, so
+/// the 19-word `__mul_u16` becomes the 5-word `__mul_u8` and the argument
+/// staging halves (epic-cc#622).
+#[test]
+fn narrows_a_low_byte_only_div_rem_tail_to_i8() {
+    let m = parse(
+        "global in i16\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = load i16 @in\n\
+             %q = udiv i16 %v, 10\n\
+             %m = mul i16 %q, 246\n\
+             %s = add i16 %m, %v\n\
+             %r = trunc i16 %s to i8\n\
+             store i8 %r @out\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    // The surviving multiply is the 8-bit routine, and the 16-bit one is
+    // not injected at all.
+    assert!(
+        text.contains("@__mul_u8("),
+        "the narrowed tail must call __mul_u8:\n{text}"
+    );
+    assert!(
+        !text.contains("@__mul_u16("),
+        "the 16-bit multiply must be gone:\n{text}"
+    );
+    assert!(
+        text.contains("@__udiv_u16("),
+        "the divide itself is untouched:\n{text}"
+    );
+    // The i8 sum carries the trunc's own dst, so the consumer reads the
+    // same value it did before.
+    assert!(
+        text.contains("%r = add i8 "),
+        "the sum must be the i8 result under the trunc's name:\n{text}"
+    );
+}
+
+/// A second use of the multiply or the sum keeps the i16 form: the
+/// narrowing is only sound when the low byte is the whole observable
+/// result.
+#[test]
+fn keeps_the_i16_tail_when_the_product_has_another_use() {
+    let m = parse(
+        "global in i16\n\
+         global out i8\n\
+         global wide i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = load i16 @in\n\
+             %q = udiv i16 %v, 10\n\
+             %m = mul i16 %q, 246\n\
+             %s = add i16 %m, %v\n\
+             %r = trunc i16 %s to i8\n\
+             store i8 %r @out\n\
+             store i16 %s @wide\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__mul_u16("),
+        "a sum with a 16-bit consumer must keep the wide multiply:\n{text}"
+    );
+}
+
+/// The narrowed tail needs a register addend: the rewrite emits a `trunc`
+/// of it, and isel rejects a const source. A literal addend keeps the wide
+/// form rather than producing IR that cannot be selected.
+#[test]
+fn keeps_the_i16_tail_when_the_addend_is_a_literal() {
+    let m = parse(
+        "global in i16\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = load i16 @in\n\
+             %q = udiv i16 %v, 10\n\
+             %m = mul i16 %q, 246\n\
+             %s = add i16 %m, 7\n\
+             %r = trunc i16 %s to i8\n\
+             store i8 %r @out\n\
+             ret void\n",
+    );
+    let text = ir::serialize(&legalize(m));
+    assert!(
+        text.contains("@__mul_u16("),
+        "a literal addend must keep the wide multiply:\n{text}"
+    );
+}
