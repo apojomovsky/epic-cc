@@ -112,6 +112,11 @@ struct Gen<'m> {
     /// state. Straight-line prefix selects affect every exit equally:
     /// the flag resets immediately before each terminator lowering.
     bsr_dirty: bool,
+    /// Callee name -> the bank every return path leaves live, from the
+    /// buffered reverse-topological emission. A caller relies on an entry
+    /// only after the map proved it from the code as actually emitted;
+    /// absent or `None` entries clear the tracked bank exactly as master.
+    exit_banks: &'m HashMap<String, Option<u8>>,
     /// What FSR0 currently addresses, if known: `Some((origin, offset))`
     /// where `offset` is the `k + byte_off` most recently set up on top of
     /// `origin`. Lets a later access through the *same* base skip
@@ -2881,15 +2886,14 @@ impl<'m> Gen<'m> {
                 } else {
                     self.emit_call_args(&c.func, &c.args);
                     self.emit(format!("    CALL {}", c.func));
-                    // A `CALL` return clobbers the tracked bank like a label join: the
-                    // callee runs its own `MOVLB` sequence and never restores the caller
-                    // bank on `RETURN`, so the tracked value is stale at return. Trusting
-                    // it elides a needed `MOVLB` and addresses the wrong bank, so the arm
-                    // clears `self.bsr` directly (`emit_label` cannot cover a non-label).
-                    // The callee almost certainly used FSR0 for its own pointer
-                    // accesses too, so the tracked FSR0 position is equally stale
-                    // (epic-cc#472).
-                    self.bsr = None;
+                    // A `CALL` return joins like a label: the callee ran its
+                    // own `MOVLB` sequence. With the exit-bank map the join
+                    // is precise: a callee whose every return path ends at
+                    // one bank leaves that bank live, so the tracked value
+                    // carries; an unknown exit clears. FSR0 has no such
+                    // contract: the callee used it for its own pointer
+                    // accesses (epic-cc#472). (epic-cc#495)
+                    self.bsr = self.exit_banks.get(&c.func).copied().flatten();
                     self.fsr0_holds = None;
                     if let Some(d) = &c.dst {
                         let ty = c.ty.expect("isel-pic18: valued call must carry a type");
@@ -2986,7 +2990,11 @@ impl<'m> Gen<'m> {
         callees: &[String],
     ) {
         let l_done = self.fresh_label();
-        for cand in callees.iter() {
+        let cand_exits: Vec<Option<u8>> = callees
+            .iter()
+            .map(|cand| self.exit_banks.get(cand).copied().flatten())
+            .collect();
+        for (cand, exit) in callees.iter().zip(cand_exits.iter()) {
             let l_next = self.fresh_label();
             // Compare the fp value's two bytes against the candidate's
             // address. MOVF sets Z; XORLW leaves it; BNZ skips on mismatch.
@@ -2999,7 +3007,9 @@ impl<'m> Gen<'m> {
             // Matched: copy args into this candidate's slots and call it.
             self.emit_call_args(cand, args);
             self.emit(format!("    CALL {cand}"));
-            self.bsr = None;
+            // Same contract as the direct arm, per candidate: a proven
+            // exit bank carries, an unknown one clears.
+            self.bsr = *exit;
             self.fsr0_holds = None;
             self.emit(format!("    BRA {l_done}"));
             self.emit_label(&l_next);
@@ -3009,6 +3019,14 @@ impl<'m> Gen<'m> {
         self.emit_label(&l_trap);
         self.emit(format!("    BRA {l_trap}"));
         self.emit_label(&l_done);
+        // Only the candidate arms' BRAs reach the done label (the trap
+        // loops), so the candidate exit meet is the label's true entry
+        // bank. Restore it directly: the forward join cannot, because
+        // the label's linear fall-through comes from the trap block,
+        // whose bank is unknown. (epic-cc#495)
+        if let Some(bank) = exit_bank(&cand_exits) {
+            self.bsr = Some(bank);
+        }
         if let Some(d) = dst {
             let t = ty.expect("isel-pic18: valued call must carry a type");
             let da = self.slot_addr(self.cur_func, d).direct();
@@ -6092,6 +6110,97 @@ fn block_dominators(f: &Func) -> HashMap<String, HashSet<String>> {
     dom
 }
 
+/// Direct and indirect call edges between module functions, for the
+/// emission ordering. Recipes and naked bodies have no `Gen` run, so
+/// they are neither sources nor targets: they never enter the exit-bank
+/// map, and a caller must treat them as unknown exits.
+fn call_edges<'a>(funcs: &[&'a Func]) -> HashMap<&'a str, Vec<&'a str>> {
+    let known: std::collections::HashSet<&str> = funcs
+        .iter()
+        .filter(|f| !ir::is_runtime_routine(&f.name) && !f.naked)
+        .map(|f| f.name.as_str())
+        .collect();
+    let mut edges: HashMap<&str, Vec<&str>> = HashMap::new();
+    for f in funcs {
+        if !known.contains(f.name.as_str()) {
+            continue;
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let Inst::Call(c) = inst else { continue };
+                let targets: Vec<&str> = if c.callees.is_empty() {
+                    vec![c.func.as_str()]
+                } else {
+                    c.callees.iter().map(|s| s.as_str()).collect()
+                };
+                for t in targets {
+                    if known.contains(t) {
+                        edges.entry(f.name.as_str()).or_default().push(t);
+                    }
+                }
+            }
+        }
+    }
+    edges
+}
+
+/// Callees before callers, ties in module order. The call graph is a
+/// DAG (recursion is a compile error upstream), so the scan always
+/// progresses; the fallback branch is a defensive cycle break that
+/// degrades to master's order and an absent map entry.
+fn emission_order<'a>(funcs: &[&'a Func], edges: &HashMap<&str, Vec<&str>>) -> Vec<&'a Func> {
+    let mut done: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut ordered = Vec::with_capacity(funcs.len());
+    loop {
+        let mut next = None;
+        for f in funcs {
+            if done.contains(f.name.as_str()) {
+                continue;
+            }
+            let ready = edges
+                .get(f.name.as_str())
+                .map(|ts| ts.iter().all(|t| done.contains(t)))
+                .unwrap_or(true);
+            if ready {
+                next = Some(f);
+                break;
+            }
+        }
+        match next {
+            Some(f) => {
+                done.insert(f.name.as_str());
+                ordered.push(*f);
+            }
+            None => {
+                for f in funcs {
+                    if !done.contains(f.name.as_str()) {
+                        done.insert(f.name.as_str());
+                        ordered.push(*f);
+                    }
+                }
+                return ordered;
+            }
+        }
+    }
+}
+
+/// The bank a function leaves live on return: the join over its
+/// RETURN-ending blocks' recorded end states. Unanimous known ends
+/// give the bank; any dirty, missing, or disagreeing end gives
+/// unknown.
+fn exit_bank(ends: &[Option<u8>]) -> Option<u8> {
+    let mut known: Option<u8> = None;
+    for e in ends {
+        match (known, e) {
+            (_, None) => return None,
+            (None, Some(v)) => known = Some(*v),
+            (Some(v), Some(w)) if v == *w => {}
+            (Some(_), Some(_)) => return None,
+        }
+    }
+    known
+}
+
 /// Emits dependency-ordered phi copies for one edge: no copy clobbers a
 /// slot a later copy still reads. Back edges run readers before writers
 /// (the merge slots hold current values); forward edges run writers
@@ -6300,6 +6409,14 @@ pub fn select_with_locs(
     let mut funcs: Vec<&Func> = m.funcs.iter().collect();
     // High ISR first, then low ISR, then ordinary functions.
     funcs.sort_by_key(|f| (!f.isr, f.irq_priority != 1));
+    // The Gen pass walks callees before callers so a later task can
+    // carry each callee's exit banks into its callers; the streamed
+    // pass below still concatenates in `funcs` (module) order, so the
+    // output text keeps its historical layout.
+    let edges = call_edges(&funcs);
+    let order = emission_order(&funcs, &edges);
+    let mut bodies: HashMap<&str, (Vec<String>, Vec<Option<SrcLoc>>)> = HashMap::new();
+    let mut exits: HashMap<String, Option<u8>> = HashMap::new();
     // Priority-mode vectors are GOTO stubs: the two bodies cannot both sit
     // at fixed vector addresses (either body overflows the 16-byte vector
     // gap), so the stubs dispatch to the floating bodies below. The lone
@@ -6321,108 +6438,12 @@ pub fn select_with_locs(
         out.push(String::new());
         locs.push(None);
     }
-    for f in funcs {
-        // the runtime routines: a runtime routine (or its `_isr` copy) emits its recipe body
-        // directly: its entry block holds only the `__scr` alloca, which
-        // the generic block emitter would render as an empty label
-        // (silently falling through into the next function). Every other
-        // function takes the ordinary path.
-        if ir::is_runtime_routine(&f.name) {
-            let mut g = Gen {
-                m,
-                addrs,
-                resolved: &resolved,
-                retval_lo: common_lo,
-                access_bank_hi,
-                bsr: None,
-                fwd_join: HashMap::new(),
-                bsr_dirty: false,
-                fsr0_holds: None,
-                pending_copies: Vec::new(),
-                cur_func: &f.name,
-                isr: f.isr,
-                tmp: &mut tmp,
-                cur_loc: None,
-                out: Vec::new(),
-                locs: Vec::new(),
-            };
-            g.emit_routine();
-            g.flush_copies();
-            out.extend(g.out);
-            locs.extend(g.locs);
-            continue;
-        }
-        // Naked: verbatim, no prologue, panic on non-Asm, barrier markers.
-        if f.naked {
-            out.push(format!("{}:", f.name));
-            locs.push(None);
-            out.push("; --- asm start ---".to_string());
-            locs.push(None);
-            for b in &f.blocks {
-                for inst in &b.insts {
-                    match inst {
-                        Inst::Asm(a) => {
-                            // Substitute $0/%0 for rung 4 memory operands
-                            let mut substituted = a.template.clone();
-                            if !a.operands.is_empty() {
-                                for op in &a.operands {
-                                    if let Some(reg) = op.ptr.strip_prefix('%') {
-                                        if let Some((_, k, terms)) = resolved.get(&ssa_key(&f.name, reg)) {
-                                            if *k != 0 || !terms.is_empty() {
-                                                panic!("asm: GEP-derived pointers are not supported; operand {} is derived via getelementptr (only direct locals and globals are allowed)", op.ptr);
-                                            }
-                                        }
-                                    }
-                                }
-                                let mut res = String::with_capacity(substituted.len() + a.operands.len() * 6);
-                                let mut chars = substituted.chars().peekable();
-                                while let Some(c) = chars.next() {
-                                    if c == '$' || c == '%' {
-                                        if let Some(&n) = chars.peek() {
-                                            if n == '%' || n == '$' { chars.next(); res.push(n); continue; }
-                                            if n.is_ascii_digit() {
-                                                let mut idx_str = String::new();
-                                                while let Some(&d) = chars.peek() { if d.is_ascii_digit() { idx_str.push(d); chars.next(); } else { break; } }
-                                                let idx: usize = idx_str.parse().unwrap();
-                                                if idx >= a.operands.len() { panic!("asm: placeholder ${idx} out of range for {} operands in template {:?}", a.operands.len(), a.template); }
-                                                let ptr = &a.operands[idx].ptr;
-                                                let addr = if let Some(g) = ptr.strip_prefix('@') { *addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}")) } else if let Some(r) = ptr.strip_prefix('%') { *addrs.get(&ssa_key(&f.name, r)).unwrap_or_else(|| panic!("isel-pic18: no slot for {}::{}", f.name, r)) } else { panic!("asm: malformed operand ptr {ptr:?}") };
-                                                res.push_str(&format!("0x{addr:02X}"));
-                                                continue;
-                                            }
-                                        }
-                                        res.push(c);
-                                    } else { res.push(c); }
-                                }
-                                substituted = res;
-                            }
-                            for line in substituted.split('\n') {
-                                out.push(line.to_string());
-                                locs.push(None);
-                            }
-                        }
-                        _ => panic!(
-                            "isel-pic18: naked function '{}' contains non-asm instruction; naked bodies must be pure assembly",
-                            f.name
-                        ),
-                    }
-                }
-            }
-            out.push("; --- asm end ---".to_string());
-            locs.push(None);
-            out.push("".to_string());
-            locs.push(None);
-            continue;
-        }
-        if f.isr && !priority_mode {
-            // The vector entry at 0x0008 IS the ISR body (the hardware
-            // jumps there with GIE cleared; no GOTO indirection, matching
-            // PIC14's vector-as-entry convention). `__start`'s reset GOTO
-            // at 0x0000 reaches it regardless: PIC18 GOTO/CALL are absolute
-            // 20-bit. Priority mode uses GOTO stubs instead (emitted
-            // above), so the bodies float.
-            out.push("    org 0x0008".to_string());
-            locs.push(None);
+    // Pass A buffers each ordinary function's body, walking emission
+    // order; pass B streams the output in module order. Recipes and
+    // naked bodies have no `Gen` run and no buffered body.
+    for f in &order {
+        if ir::is_runtime_routine(&f.name) || f.naked {
+            continue; // streamed by pass B, no Gen run, no map entry
         }
         let mut g = Gen {
             m,
@@ -6433,6 +6454,7 @@ pub fn select_with_locs(
             bsr: None,
             fwd_join: HashMap::new(),
             bsr_dirty: false,
+            exit_banks: &exits,
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: &f.name,
@@ -6501,6 +6523,7 @@ pub fn select_with_locs(
             }
         }
         let mut block_end: HashMap<String, Option<u8>> = HashMap::new();
+        let mut ret_ends: Vec<Option<u8>> = Vec::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             g.emit_label(&labels[&b.label]);
             // Join agreement: keep the tracked bank only when every
@@ -7008,10 +7031,134 @@ pub fn select_with_locs(
             // the tracked state where they join, so only the end counts.
             let end = if g.bsr_dirty { None } else { g.bsr };
             block_end.insert(b.label.clone(), end);
+            if matches!(b.insts.last(), Some(Inst::Ret(..))) {
+                ret_ends.push(end);
+            }
         }
         g.flush_copies();
-        out.extend(g.out);
-        locs.extend(g.locs);
+        // After `bodies` takes `g.out`/`g.locs`: `g` holds `&exits`, so the
+        // map may only be mutated once the body has moved out of `g`.
+        bodies.insert(f.name.as_str(), (g.out, g.locs));
+        // An ISR's epilogue restores the interrupted context's BSR in
+        // hardware (`MOVFF ..., BSR`) without the tracked model seeing it,
+        // so its recorded end can lie; ISR callees must read as unknown.
+        exits.insert(
+            f.name.to_string(),
+            if f.isr { None } else { exit_bank(&ret_ends) },
+        );
+    }
+    // Pass B streams in module order: the recipe and naked arms keep
+    // their verbatim bodies, the ISR vector line keeps its position,
+    // and each remaining function pulls its buffered body.
+    for f in funcs {
+        // the runtime routines: a runtime routine (or its `_isr` copy) emits its recipe body
+        // directly: its entry block holds only the `__scr` alloca, which
+        // the generic block emitter would render as an empty label
+        // (silently falling through into the next function). Every other
+        // function takes the ordinary path.
+        if ir::is_runtime_routine(&f.name) {
+            let mut g = Gen {
+                m,
+                addrs,
+                resolved: &resolved,
+                retval_lo: common_lo,
+                access_bank_hi,
+                bsr: None,
+                fwd_join: HashMap::new(),
+                bsr_dirty: false,
+                exit_banks: &exits,
+                fsr0_holds: None,
+                pending_copies: Vec::new(),
+                cur_func: &f.name,
+                isr: f.isr,
+                tmp: &mut tmp,
+                cur_loc: None,
+                out: Vec::new(),
+                locs: Vec::new(),
+            };
+            g.emit_routine();
+            g.flush_copies();
+            out.extend(g.out);
+            locs.extend(g.locs);
+            continue;
+        }
+        // Naked: verbatim, no prologue, panic on non-Asm, barrier markers.
+        if f.naked {
+            out.push(format!("{}:", f.name));
+            locs.push(None);
+            out.push("; --- asm start ---".to_string());
+            locs.push(None);
+            for b in &f.blocks {
+                for inst in &b.insts {
+                    match inst {
+                        Inst::Asm(a) => {
+                            // Substitute $0/%0 for rung 4 memory operands
+                            let mut substituted = a.template.clone();
+                            if !a.operands.is_empty() {
+                                for op in &a.operands {
+                                    if let Some(reg) = op.ptr.strip_prefix('%') {
+                                        if let Some((_, k, terms)) = resolved.get(&ssa_key(&f.name, reg)) {
+                                            if *k != 0 || !terms.is_empty() {
+                                                panic!("asm: GEP-derived pointers are not supported; operand {} is derived via getelementptr (only direct locals and globals are allowed)", op.ptr);
+                                            }
+                                        }
+                                    }
+                                }
+                                let mut res = String::with_capacity(substituted.len() + a.operands.len() * 6);
+                                let mut chars = substituted.chars().peekable();
+                                while let Some(c) = chars.next() {
+                                    if c == '$' || c == '%' {
+                                        if let Some(&n) = chars.peek() {
+                                            if n == '%' || n == '$' { chars.next(); res.push(n); continue; }
+                                            if n.is_ascii_digit() {
+                                                let mut idx_str = String::new();
+                                                while let Some(&d) = chars.peek() { if d.is_ascii_digit() { idx_str.push(d); chars.next(); } else { break; } }
+                                                let idx: usize = idx_str.parse().unwrap();
+                                                if idx >= a.operands.len() { panic!("asm: placeholder ${idx} out of range for {} operands in template {:?}", a.operands.len(), a.template); }
+                                                let ptr = &a.operands[idx].ptr;
+                                                let addr = if let Some(g) = ptr.strip_prefix('@') { *addrs.get(g).unwrap_or_else(|| panic!("isel-pic18: no address for @{g}")) } else if let Some(r) = ptr.strip_prefix('%') { *addrs.get(&ssa_key(&f.name, r)).unwrap_or_else(|| panic!("isel-pic18: no slot for {}::{}", f.name, r)) } else { panic!("asm: malformed operand ptr {ptr:?}") };
+                                                res.push_str(&format!("0x{addr:02X}"));
+                                                continue;
+                                            }
+                                        }
+                                        res.push(c);
+                                    } else { res.push(c); }
+                                }
+                                substituted = res;
+                            }
+                            for line in substituted.split('\n') {
+                                out.push(line.to_string());
+                                locs.push(None);
+                            }
+                        }
+                        _ => panic!(
+                            "isel-pic18: naked function '{}' contains non-asm instruction; naked bodies must be pure assembly",
+                            f.name
+                        ),
+                    }
+                }
+            }
+            out.push("; --- asm end ---".to_string());
+            locs.push(None);
+            out.push("".to_string());
+            locs.push(None);
+            continue;
+        }
+        if f.isr && !priority_mode {
+            // The vector entry at 0x0008 IS the ISR body (the hardware
+            // jumps there with GIE cleared; no GOTO indirection, matching
+            // PIC14's vector-as-entry convention). `__start`'s reset GOTO
+            // at 0x0000 reaches it regardless: PIC18 GOTO/CALL are absolute
+            // 20-bit. Priority mode uses GOTO stubs instead (emitted
+            // above), so the bodies float.
+            out.push("    org 0x0008".to_string());
+            locs.push(None);
+        }
+        let (lines, ls) = bodies
+            .get(f.name.as_str())
+            .expect("every non-recipe, non-naked function has a buffered body");
+        out.extend(lines.clone());
+        locs.extend(ls.iter().cloned());
     }
     // `__start` calls `main` and halts; matches the shape `isel::select`
     // uses for its own program entry, minus the ISR machinery (the single-vector mode).
@@ -7199,6 +7346,7 @@ mod tests {
         let m = ir::parse("fn f(void) ()\n  block entry:\n    ret void\n");
         let addrs: HashMap<String, u16> = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
         let mut tmp = 0u32;
         let l1 = {
             let mut g = Gen {
@@ -7210,6 +7358,7 @@ mod tests {
                 bsr: None,
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
+                exit_banks: &exits,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -7231,6 +7380,7 @@ mod tests {
                 bsr: None,
                 fwd_join: HashMap::new(),
                 bsr_dirty: false,
+                exit_banks: &exits,
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
@@ -7255,6 +7405,7 @@ mod p3_gen_tests {
         m: &'a Module,
         addrs: &'a HashMap<String, u16>,
         resolved: &'a PtrResolution,
+        exits: &'a HashMap<String, Option<u8>>,
         tmp: &'a mut u32,
     ) -> Gen<'a> {
         Gen {
@@ -7266,6 +7417,7 @@ mod p3_gen_tests {
             bsr: None,
             fwd_join: HashMap::new(),
             bsr_dirty: false,
+            exit_banks: exits,
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: "main",
@@ -7287,7 +7439,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         assert_eq!(g.operand(0x05F), (0, 0x5F));
         assert!(g.out.is_empty(), "no MOVLB for the low access-bank range");
     }
@@ -7302,7 +7455,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         assert_eq!(g.operand(0x0090), (1, 0x90));
         assert!(
             g.out.iter().any(|l| l.contains("MOVLB")),
@@ -7323,7 +7477,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         g.bsr = Some(2);
         g.note_branch("tmp7");
         g.note_branch("tmp7");
@@ -7345,7 +7500,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         g.bsr = Some(0);
         g.note_branch("tmp8");
         g.bsr = Some(1);
@@ -7368,7 +7524,8 @@ mod p3_gen_tests {
         let addrs = HashMap::new();
         let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
-        let mut g = gen(&m, &addrs, &resolved, &mut tmp);
+        let exits: HashMap<String, Option<u8>> = HashMap::new();
+        let mut g = gen(&m, &addrs, &resolved, &exits, &mut tmp);
         // FSR0L, the address this lowering exists to fix.
         assert_eq!(
             g.operand(0xFE9),
@@ -7379,5 +7536,13 @@ mod p3_gen_tests {
             g.out.is_empty(),
             "no MOVLB for an SFR address, regardless of the tracked BSR"
         );
+    }
+
+    #[test]
+    fn exit_bank_joins_return_ends() {
+        assert_eq!(exit_bank(&[Some(2), Some(2)]), Some(2));
+        assert_eq!(exit_bank(&[Some(1), Some(2)]), None);
+        assert_eq!(exit_bank(&[None]), None);
+        assert_eq!(exit_bank(&[]), None);
     }
 }

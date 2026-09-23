@@ -4618,6 +4618,79 @@ fn indirect_call_emits_compare_and_call_chain() {
 }
 
 #[test]
+fn indirect_candidates_with_unanimous_exit_carry_at_the_join() {
+    // Both candidates end on bank 1, so the done label's true entry bank
+    // is 1 (only the candidate arms' BRAs reach it; the trap loops). The
+    // meet is restored directly after the label: the forward join cannot
+    // do it, because the label's linear fall-through comes from the trap
+    // block, whose bank is unknown. Without carry this emits a MOVLB in
+    // main after the chain; with it, exactly the candidates' two.
+    let m = parse(
+        "global a i8\nglobal g i8\n\
+         fn f0(void) ()\n\
+           block entry:\n\
+             store i8 1 @h\n\
+             ret void\n\
+         fn f1(void) ()\n\
+           block entry:\n\
+             store i8 2 @h\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void %3() callees f0 f1\n\
+             store i8 9 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("g", 0x110), // bank 1: the post-chain store under test
+        ("h", 0x190), // bank 1: both candidates select it and exit on it
+        ("main::3", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        2,
+        "one MOVLB per candidate body, none in main:\n{asm}"
+    );
+}
+
+#[test]
+fn mixed_indirect_candidates_clear_at_the_join() {
+    // f1 exits on bank 2, f0 on bank 1: the join must collapse and the
+    // post-chain store must re-select bank 1.
+    let m = parse(
+        "global a i8\nglobal g i8\n\
+         fn f0(void) ()\n\
+           block entry:\n\
+             store i8 1 @h\n\
+             ret void\n\
+         fn f1(void) ()\n\
+           block entry:\n\
+             store i8 2 @k\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void %3() callees f0 f1\n\
+             store i8 9 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("g", 0x110), // bank 1
+        ("h", 0x190), // bank 1: f0's exit
+        ("k", 0x290), // bank 2: f1's exit
+        ("main::3", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        3,
+        "one MOVLB per candidate body plus main's re-select; nothing carries:\n{asm}"
+    );
+}
+
+#[test]
 fn freeze_copies_bytes_like_a_noop() {
     let m = parse("global a i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @a\n    %2 = freeze i16 %1\n    ret void\n");
     let asm = select(
@@ -5779,4 +5852,291 @@ fn ram_global_over_255_bytes_reads_across_the_bank_boundary() {
     assert_eq!(p.ram()[0x251], 0x5A, "offset 199");
     assert_eq!(p.ram()[0x252], 0x77, "offset 256, past the old ceiling");
     assert_eq!(p.ram()[0x253], 0x99, "offset 258, across the bank boundary");
+}
+
+#[test]
+fn bodies_concatenate_in_module_order_even_when_emission_reorders() {
+    // main calls a helper defined after it. The carry analysis (epic-cc#495)
+    // must emit helper first, but the output stream keeps master's order:
+    // helper's body may not float above main's.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal c i8\nglobal d i8\nglobal e i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %1, %2\n\
+             call void @helper()\n\
+             store i8 %3 @c\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @d\n\
+             store i8 %1 @e\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("c", 0x22),
+        ("d", 0x23),
+        ("e", 0x24),
+        ("main::1", 0x30),
+        ("main::2", 0x31),
+        ("main::3", 0x32),
+        ("helper::1", 0x33),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_at = asm.find("\nmain:").expect("main label");
+    let helper_at = asm.find("\nhelper:").expect("helper label");
+    assert!(
+        helper_at > main_at,
+        "helper body must stay after main:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 3;
+    p.ram_mut()[0x21] = 4;
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x22], 7, "the post-call store must land");
+}
+
+#[test]
+fn a_provable_callee_exit_bank_carries_across_the_call() {
+    // f ends on bank 2 on its only return path, so main's tracked bank
+    // after `CALL f` is 2 and the bank-2 store re-selects nothing.
+    // Without carry this emits a MOVLB after the call; with it, the whole
+    // module has exactly the one MOVLB f's own body needs.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal c i8\nglobal d i8\nglobal g i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %1, %2\n\
+             call void @f()\n\
+             store i8 7 @g\n\
+             ret void\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @c\n\
+             %2 = load i8 @d\n\
+             %3 = add i8 %1, %2\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x21),
+        ("c", 0x22),
+        ("d", 0x23),
+        ("g", 0x290), // bank 2: the post-call store under test
+        ("main::1", 0x30),
+        ("main::2", 0x31),
+        ("main::3", 0x32),
+        ("f::1", 0x210), // bank 2
+        ("f::2", 0x211), // bank 2
+        ("f::3", 0x212), // bank 2: f's add dst selects the bank it exits on
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        1,
+        "only f's own MOVLB; main's post-call store carries bank 2:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 3;
+    p.ram_mut()[0x21] = 4;
+    p.ram_mut()[0x22] = 3; // c: f's add must also produce 7
+    p.ram_mut()[0x23] = 4; // d
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x212], 7, "f's add landed in f's slot");
+    assert_eq!(
+        p.ram()[0x290],
+        7,
+        "main's store landed in bank 2 without re-selecting"
+    );
+}
+
+#[test]
+fn a_terminator_selected_callee_exit_keeps_the_post_call_movlb() {
+    // f's phi copies land in a BANKED merge slot, so both predecessor
+    // terminators select a bank while lowering their edge's copy
+    // (bsr_dirty), the exit join is unknown, and main must still
+    // re-select after the call. The incoming values themselves live in
+    // slots on two different banks (q1 bank 1, q2 bank 2). (A mid-block
+    // bank select would NOT do this: it is cleared before the
+    // terminator lowering and leaves the end state provable.)
+    let m = parse(
+        "global c i8\nglobal q1 i8\nglobal q2 i8\nglobal g i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f()\n\
+             store i8 7 @g\n\
+             ret void\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @c\n\
+             br i1 %1 t u\n\
+           block t:\n\
+             br merge\n\
+           block u:\n\
+             br merge\n\
+           block merge:\n\
+             %2 = phi i8 @q1 t @q2 u\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("c", 0x20),
+        ("q1", 0x110), // bank 1: the t-edge incoming value's slot
+        ("q2", 0x290), // bank 2: the u-edge incoming value's slot
+        ("g", 0x090),  // bank 0: the post-call store must re-select it
+        ("f::1", 0x30),
+        ("f::2", 0x110), // bank 1: the banked phi merge slot
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        3,
+        "each edge's copy selects the merge slot's bank 1 and main's \
+         re-select; nothing carries:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for c in [1u8, 0] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x20] = c;
+        p.run(500);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x090], 7, "main's store lost on cond={c}");
+    }
+}
+
+#[test]
+fn disagreeing_callee_returns_keep_the_post_call_movlb() {
+    // f's two arms return on different banks, so the exit join is
+    // unknown and main re-selects. Both arms run in the simulator.
+    let m = parse(
+        "global a i8\nglobal c i8\nglobal g i8\nglobal k i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             call void @f()\n\
+             store i8 7 @g\n\
+             ret void\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @c\n\
+             br i1 %1 t u\n\
+           block t:\n\
+             store i8 1 @k\n\
+             ret void\n\
+           block u:\n\
+             store i8 2 @slot\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("c", 0x21),
+        ("g", 0x090),    // bank 0: main must re-select it after the call
+        ("k", 0x110),    // bank 1: arm t exits here
+        ("slot", 0x290), // bank 2: arm u exits here
+        ("main::1", 0x30),
+        ("f::1", 0x31),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        block_section(&asm, "main").contains("MOVLB 0x0"),
+        "main must re-select bank 0 after the unknown exit:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (c, want_k, want_slot) in [(1u8, 1u8, 0u8), (0u8, 0u8, 2u8)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x21] = c; // c: f's branch condition picks the arm
+        p.run(500);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x090], 7, "main's store lost on cond={c}");
+        assert_eq!(p.ram()[0x110], want_k, "arm t's store wrong on cond={c}");
+        assert_eq!(p.ram()[0x290], want_slot, "arm u's store wrong on cond={c}");
+    }
+}
+
+#[test]
+fn a_forward_defined_callee_with_provable_exit_still_carries() {
+    // helper is defined after main. The map is filled by the buffered
+    // reverse-topological emission, so the textual order must not matter.
+    let m = parse(
+        "global a i8\nglobal g i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             store i8 7 @g\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             store i8 1 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[("a", 0x20), ("g", 0x090)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLB").count(),
+        1,
+        "helper selects bank 0; main's store carries it:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    p.run(500);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x090], 7);
+}
+
+#[test]
+fn a_recipe_callee_keeps_the_post_call_movlb() {
+    // __mul_u16 has no Gen run: its body streams from the recipe in the
+    // concat loop and its exit never enters the map, so main must
+    // re-select after the call. The stub's alloca-only entry block must
+    // not leak into the output as an empty label either.
+    let m = parse(
+        "global a i16\nglobal g i8\n\
+         fn __mul_u16(i16) (a=i16, b=i16)\n\
+           block entry:\n\
+             %__scr = alloca 14\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i16 @a\n\
+             %2 = call i16 @__mul_u16(i16 %1, i16 %1)\n\
+             store i8 7 @g\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("g", 0x090),
+        ("main::1", 0x30),
+        ("main::2", 0x32),
+        ("__mul_u16::a", 0x40),
+        ("__mul_u16::b", 0x42),
+        ("__mul_u16::__scr", 0x50),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("    CALL __mul_u16"), "recipe call:\n{asm}");
+    assert!(
+        block_section(&asm, "main").contains("MOVLB 0x0"),
+        "main must re-select after the recipe call:\n{asm}"
+    );
+    let lines: Vec<&str> = asm.lines().collect();
+    let i = lines
+        .iter()
+        .position(|l| l.trim() == "__mul_u16:")
+        .unwrap_or_else(|| panic!("recipe label missing:\n{asm}"));
+    let next = lines.get(i + 1).copied().unwrap_or("");
+    assert!(
+        !next.trim().is_empty() && !next.trim_end().ends_with(':'),
+        "stub entry block leaked as an empty label:\n{asm}"
+    );
 }
