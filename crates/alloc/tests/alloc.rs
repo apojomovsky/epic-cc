@@ -1409,3 +1409,49 @@ fn pic18_routine_frame_does_not_snap_back_to_the_region_start() {
         );
     }
 }
+
+#[test]
+fn oversized_global_places_without_overlap_on_pic18() {
+    // epic-cc#608: a 259-byte global must survive the largest-first
+    // bin-pack without truncating to width 3 (the old `as u8` put the
+    // next global inside it for silent RAM overlap). Sizes declared in
+    // ll order; the pack may reorder, so assert pairwise disjointness
+    // and containment in the 4550's single GPR region instead of exact
+    // addresses.
+    let mut src = String::new();
+    for i in 0..3 {
+        src.push_str(&format!("global g{i} i8\n"));
+    }
+    src.push_str("fn main(void) ()\n  block entry:\n    ret void\n");
+    let mut m = parse(&src);
+    let sizes = [259u16, 100, 100];
+    for i in 0..3 {
+        m.globals[i].size = sizes[i];
+    }
+    let out = allocate(&PIC18F4550, &m, "");
+    assert_eq!(out.globals.len(), 3);
+    let mut spans: Vec<(u16, u16)> = (0..3)
+        .map(|i| {
+            let start = out.globals[&format!("g{i}")];
+            (start, start + sizes[i] - 1)
+        })
+        .collect();
+    for &(start, end) in &spans {
+        assert!(
+            PIC18F4550
+                .ram_banks
+                .iter()
+                .any(|&(bs, be)| start >= bs && end <= be),
+            "global at 0x{start:03X}..=0x{end:03X} outside GPR"
+        );
+    }
+    spans.sort();
+    for w in spans.windows(2) {
+        assert!(
+            w[0].1 < w[1].0,
+            "overlapping placements: {:?} and {:?}",
+            w[0],
+            w[1]
+        );
+    }
+}

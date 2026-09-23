@@ -39,7 +39,7 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{resolve_pointers, ssa_key, Base, Slot};
+use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
 use std::collections::{HashMap, HashSet};
 
 /// The byte address of a literal-pointer operand (`"0x<K>"`, the
@@ -83,7 +83,7 @@ struct Gen<'m> {
     /// seeded pointer bases (byval/sret params and allocas). `gep`/`alloca`
     /// themselves emit nothing; each `load`/`store`/`memcpy` through a
     /// pointer reg lowers the pointer at its use.
-    resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    resolved: &'m PtrResolution,
     scratch: u16,
     /// A second fixed common-RAM temp, dedicated to the ADDLW-replacement
     /// idioms (baseline has no literal-add op, D-6): `W = W + k` and the
@@ -170,6 +170,8 @@ impl<'m> Gen<'m> {
     /// stash W in the scratch2 byte, load k, `ADDWF scratch2, W` computes
     /// scratch2 + k. scratch2 is dedicated to these folds, so it is always
     /// free here.
+    /// `k` is a frame-relative slot offset, always under 256 bytes:
+    /// frames sit inside one GPR bank and allocas cap at 255.
     fn emit_add_w_const(&mut self, k: u8) {
         self.emit(format!("    MOVWF {}", self.fop(self.scratch2)));
         self.emit(format!("    MOVLW 0x{k:02X}"));
@@ -287,7 +289,7 @@ impl<'m> Gen<'m> {
     }
 
     /// True when `name` is a plain pointer param of the current function,
-    fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
+    fn resolved_for(&self, r: &str) -> (Base, u16, Vec<(u16, String)>) {
         let key = ssa_key(self.cur_func, r);
         self.resolved
             .get(&key)
@@ -381,7 +383,10 @@ impl<'m> Gen<'m> {
                             if idx == 0 {
                                 self.emit(format!("    MOVF {}, W", self.fop(sa)));
                                 if k != 0 {
-                                    self.emit_add_w_const(k);
+                                    let k8 = u8::try_from(k).unwrap_or_else(|_| {
+                                        panic!("isel: slot offset {k} exceeds 255")
+                                    });
+                                    self.emit_add_w_const(k8);
                                 }
                             } else {
                                 self.emit("    MOVLW 0x00".to_string());
@@ -1207,8 +1212,14 @@ impl<'m> Gen<'m> {
     /// `W = k + byte_off + terms`: the RETLW-table index for a const
     /// (flash) read. Same fold as `emit_fsr_to`'s W computation, minus the
     /// FSR store; the reader adds the table base itself.
-    fn emit_const_index_w(&mut self, k: u8, terms: &[(u8, String)], byte_off: u8) {
-        let lit = k.wrapping_add(byte_off);
+    fn emit_const_index_w(&mut self, k: u16, terms: &[(u16, String)], byte_off: u8) {
+        // Baseline tables address one 8-bit page: a larger static part
+        // cannot lower through this single-MOVLW path.
+        let lit = k.wrapping_add(u16::from(byte_off));
+        if lit > 255 {
+            panic!("isel: baseline const index {lit} exceeds 255");
+        }
+        let lit = lit as u8;
         match terms {
             [] => {
                 self.emit(format!("    MOVLW 0x{lit:02X}"));
@@ -1231,7 +1242,7 @@ impl<'m> Gen<'m> {
     /// entry: index to W, then a managed CALL (PA0 to the table's page,
     /// restore to the caller's). BSF/BCF touch only PA0, and CALL
     /// preserves W, so the byte arrives in W with no park.
-    fn emit_const_read(&mut self, name: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_const_read(&mut self, name: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
         self.emit_const_index_w(k, terms, byte_off);
         let reader = format!("__read_{name}");
         self.emit_paged_call(
@@ -1286,7 +1297,7 @@ impl<'m> Gen<'m> {
     /// flat address (bank bits and offset together, D-2 item 2), so
     /// one MOVLW/MOVWF loads it. No FSR0H/FSR0L split, no linear alias, no
     /// IRP.
-    fn emit_fsr_to(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_fsr_to(&mut self, base_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
         // The literal keeps the full flat address: mask to the 5-bit
         // offset plus the device's bank bits, never narrower than the
         // historical 6-bit window (a fixed `& 0x3F` truncated bank-2/3
@@ -1315,7 +1326,7 @@ impl<'m> Gen<'m> {
     /// The slot holds the target address (the caller stores LOW then HIGH
     /// of it into the two slot bytes). The address spans the offset plus
     /// the device's bank bits; only the low byte of the stored address is used.
-    fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0x3F,
@@ -1337,7 +1348,7 @@ impl<'m> Gen<'m> {
     }
 
     /// `scratch = Σ scale×%reg`.
-    fn emit_accum_terms(&mut self, terms: &[(u8, String)]) {
+    fn emit_accum_terms(&mut self, terms: &[(u16, String)]) {
         self.emit("    MOVLW 0x00".to_string());
         self.emit_w_store(self.scratch);
         for (scale, r) in terms {

@@ -97,6 +97,10 @@ pub enum Base {
     Slot(String, bool),
 }
 
+/// Resolved pointer chains: `(base, constant offset, dynamic terms)` per SSA key.
+/// Offsets are `u16`: globals can exceed the 255-byte stack-slot ceiling.
+pub type PtrResolution = HashMap<String, (Base, u16, Vec<(u16, String)>)>;
+
 /// Fold every `Gep` and pointer-typed `Select` in `m` to `(base, k, terms)`.
 /// `base` starts the chain, `k` adds the constant offset, `terms` appends
 /// dynamic offsets inner-first, keyed `{func}::{reg}` via `ssa_key`.
@@ -105,10 +109,10 @@ pub enum Base {
 /// else seed as indirect slots holding address bytes isel materializes.
 /// A base that is neither a seed nor a pending entry breaks an earlier-stage
 /// invariant and panics, as do unmaterializable arms and stalled scans.
-pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, String)>)> {
+pub fn resolve_pointers(m: &Module) -> PtrResolution {
     let mut geps: HashMap<String, ir::Gep> = HashMap::new();
     let mut selects: HashMap<String, ir::Select> = HashMap::new();
-    let mut resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+    let mut resolved: PtrResolution = HashMap::new();
     for f in &m.funcs {
         for p in &f.params {
             if p.byval.is_some() {
@@ -393,8 +397,7 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
             // same base with matching term sets. The cond reg becomes a
             // scale-1 term, so `select c, base+kA, base+kB` (kA < kB) is
             // `base + kA + (kB-kA)×c`: c = 0 picks kA, c = 1 adds the
-            // difference. The scale is the difference of two u8 offsets, so
-            // it always fits. A select whose arms are runtime address
+            // difference. A select whose arms are runtime address
             // VALUES that do not fold (distinct globals, a global vs a
             // runtime slot, two runtime slots) is itself a runtime address
             // VALUE: seed the dst as an indirect slot, whose bytes isel
@@ -451,10 +454,10 @@ pub fn resolve_pointers(m: &Module) -> HashMap<String, (Base, u8, Vec<(u8, Strin
 /// fold to a common base, the term sets differ, or the cond is not a reg.
 fn fold_select(
     s: &ir::Select,
-    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    resolved: &PtrResolution,
     fname: &str,
-) -> Option<(Base, u8, Vec<(u8, String)>)> {
-    let arm = |v: &ir::Val| -> Option<(Base, u8, Vec<(u8, String)>)> {
+) -> Option<(Base, u16, Vec<(u16, String)>)> {
+    let arm = |v: &ir::Val| -> Option<(Base, u16, Vec<(u16, String)>)> {
         match v {
             ir::Val::Reg(r) => resolved.get(&ssa_key(fname, r)).cloned(),
             ir::Val::Global(g) => Some((Base::Global(g.clone()), 0, Vec::new())),
@@ -488,11 +491,7 @@ fn fold_select(
 /// address) or a plain global base (a link-time literal). A reg with a
 /// constant offset or dynamic terms is a computed address with no single
 /// materializable value and is not a runtime value.
-fn select_arm_is_runtime_value(
-    v: &ir::Val,
-    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
-    fname: &str,
-) -> bool {
+fn select_arm_is_runtime_value(v: &ir::Val, resolved: &PtrResolution, fname: &str) -> bool {
     match v {
         ir::Val::Const(_) | ir::Val::Global(_) => true,
         ir::Val::Reg(r) => match resolved.get(&ssa_key(fname, r)) {

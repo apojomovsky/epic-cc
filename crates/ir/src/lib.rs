@@ -226,13 +226,14 @@ pub struct Phi {
 }
 /// A getelementptr, reworked for structs/arrays: `base` is a global or a
 /// pointer reg, `k` a constant byte offset, and `terms` scaled dynamic
-/// offsets (`Σ scale×%reg`).
+/// offsets (`Σ scale×%reg`). Offsets are `u16`: globals can exceed the
+/// 255-byte stack-slot ceiling (allocas and byval params stay `u8`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gep {
     pub dst: String,
     pub base: GepBase,
-    pub k: u8,
-    pub terms: Vec<(u8, String)>,
+    pub k: u16,
+    pub terms: Vec<(u16, String)>,
     pub loc: Option<SrcLoc>,
 }
 /// `alloca`: a local buffer of `size` bytes (virtual, isel allocates no
@@ -1302,7 +1303,7 @@ fn parse_call(rest: &str) -> (Option<Ty>, String, Vec<CallArg>, Vec<String>) {
     (ty, func, args, callees)
 }
 
-fn parse_gep_expr(rest: &str) -> (GepBase, u8, Vec<(u8, String)>) {
+fn parse_gep_expr(rest: &str) -> (GepBase, u16, Vec<(u16, String)>) {
     let mut it = rest.split_whitespace();
     let base_tok = it.next().unwrap();
     let base = if let Some(g) = base_tok.strip_prefix('@') {
@@ -1314,13 +1315,13 @@ fn parse_gep_expr(rest: &str) -> (GepBase, u8, Vec<(u8, String)>) {
         .next()
         .unwrap()
         .trim_start_matches('+')
-        .parse::<u8>()
+        .parse::<u16>()
         .unwrap();
     let mut terms = Vec::new();
     for t in it {
         let t = t.trim_start_matches('+');
         let star = t.find('*').unwrap();
-        let s = t[..star].parse::<u8>().unwrap();
+        let s = t[..star].parse::<u16>().unwrap();
         let r = t[star + 1..].trim_start_matches('%').to_string();
         terms.push((s, r));
     }

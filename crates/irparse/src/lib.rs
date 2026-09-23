@@ -981,7 +981,10 @@ fn tokenize_parens(s: &str) -> Vec<String> {
 
 #[derive(Clone, Debug)]
 struct StructInfo {
-    size: u8,
+    /// Total size in bytes (`u16`): globals can exceed the 255-byte
+    /// stack-slot ceiling (allocas and byval params stay `u8`, with
+    /// their own precise panics).
+    size: u16,
     align: u8,
     fields: Vec<String>,
     /// clang packed the record (printed `<{ ... }>`): fields sit at running
@@ -1118,21 +1121,15 @@ fn compute_struct(fields: &[String], types: &StructTypes, packed: bool) -> Optio
         if !packed {
             off = round_up(off, falign);
         }
-        assert!(
-            off <= 255,
-            "irparse: struct field offset {off} exceeds 255 (byte-addressed)"
-        );
-        off += fsize;
+        off = off
+            .checked_add(fsize)
+            .unwrap_or_else(|| panic!("irparse: struct size exceeds 65535 bytes"));
         max_align = max_align.max(falign);
     }
     let align = if packed { 1 } else { max_align };
     let size = round_up(off, align);
-    assert!(
-        size <= 255,
-        "irparse: struct size {size} exceeds 255 (byte-addressed)"
-    );
     Some(StructInfo {
-        size: size as u8,
+        size,
         align,
         fields: fields.to_vec(),
         packed,
@@ -1780,10 +1777,19 @@ fn parse_ptr_operand(
 fn stride_and_next(cur: &str, types: &StructTypes) -> (i64, String) {
     let cur = cur.trim();
     if cur.starts_with('[') {
-        let close = cur.find(']').unwrap();
+        // Balanced match: a nested element (`[6 x [17 x i8]]`) contains
+        // inner brackets a first-`]` cut would mistake for the end.
+        let close = matching_bracket(cur)
+            .unwrap_or_else(|| panic!("irparse: unbalanced array type {cur:?}"));
         let inner = &cur[1..close];
         let (sz, _) = ty_size_align(cur, types, None);
-        let elem = inner.splitn(2, "x").nth(1).unwrap().trim().to_string();
+        // Element follows the count and `x` (`6 x [17 x i8]`); the count
+        // itself never contains `x`, so splitting there is sound even
+        // when the element nests further.
+        let x = inner
+            .find('x')
+            .unwrap_or_else(|| panic!("irparse: malformed array type {cur:?}"));
+        let elem = inner[x + 1..].trim().to_string();
         (i64::from(sz), elem)
     } else {
         // scalar (i1/i8/i16): stride = its size, no further descent
@@ -1847,9 +1853,13 @@ fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
 /// Fold GEP indices into `(k, terms)`: constant indices × their stride fold
 /// into the byte offset `k`; register indices become scaled `(scale, reg)`
 /// terms.
-fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, Vec<(u8, String)>) {
+fn fold_gep(
+    source_ty: &str,
+    index_parts: &[&str],
+    types: &StructTypes,
+) -> (u16, Vec<(u16, String)>) {
     let mut k: i64 = 0;
-    let mut terms: Vec<(u8, String)> = Vec::new();
+    let mut terms: Vec<(u16, String)> = Vec::new();
     let mut cur = source_ty.trim().to_string();
     // True when the previous GEP level was an array: a struct cur is then
     // the array's ELEMENT type, so this index is an element selector
@@ -1871,7 +1881,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
                 let (sz, _) = ty_size_align(&cur, types, None);
                 match &idx {
                     Val::Const(c) => k += c * i64::from(sz),
-                    Val::Reg(r) => terms.push((sz as u8, r.clone())),
+                    Val::Reg(r) => terms.push((sz, r.clone())),
                     Val::Global(_) => panic!("irparse: gep index cannot be a global"),
                 }
                 from_array = false;
@@ -1886,7 +1896,7 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
                 let (sz, _) = ty_size_align(&cur, types, None);
                 match &idx {
                     Val::Const(c) => k += c * i64::from(sz),
-                    Val::Reg(r) => terms.push((sz as u8, r.clone())),
+                    Val::Reg(r) => terms.push((sz, r.clone())),
                     Val::Global(_) => panic!("irparse: gep index cannot be a global"),
                 }
                 struct_array_done = true;
@@ -1914,17 +1924,21 @@ fn fold_gep(source_ty: &str, index_parts: &[&str], types: &StructTypes) -> (u8, 
         from_array = cur.starts_with('[');
         match &idx {
             Val::Const(c) => k += c * stride,
-            Val::Reg(r) => terms.push((stride as u8, r.clone())),
+            Val::Reg(r) => terms.push((
+                u16::try_from(stride)
+                    .unwrap_or_else(|_| panic!("irparse: gep stride {stride} out of range")),
+                r.clone(),
+            )),
             Val::Global(_) => panic!("irparse: gep index cannot be a global"),
         }
         cur = next;
         struct_array_done = false;
     }
     assert!(
-        k >= -128 && k <= 255,
+        k >= -128 && k <= 65535,
         "irparse: gep byte offset {k} out of range"
     );
-    (k as u8, terms)
+    ((k & 0xFFFF) as u16, terms)
 }
 
 /// Parses a getelementptr into `(base, k, terms)`: the paren byte-offset
@@ -1937,7 +1951,7 @@ fn parse_gep_expr(
     types: &StructTypes,
     fresh: &mut Fresh,
     out: &mut Vec<Inst>,
-) -> (GepBase, u8, Vec<(u8, String)>) {
+) -> (GepBase, u16, Vec<(u16, String)>) {
     let mut s = src.trim();
     loop {
         let t = s.split_whitespace().next().unwrap_or("");
@@ -2003,6 +2017,17 @@ fn parse_base(
     }
 }
 
+/// byval size for the call ABI: stack-passed, so capped at 255 bytes
+/// (`ir::Arg.byval` is `u8`). Larger structs must pass by pointer.
+fn byval_size(info: &StructInfo, inner: &str) -> u8 {
+    u8::try_from(info.size).unwrap_or_else(|_| {
+        panic!(
+            "irparse: byval %{inner} too large ({} bytes; max 255)",
+            info.size
+        )
+    })
+}
+
 /// Parse one call argument (may carry an inlined GEP, byval, or sret).
 fn parse_call_arg(
     a: &str,
@@ -2041,7 +2066,7 @@ fn parse_call_arg(
                 let info = types
                     .get(inner.trim_start_matches('%'))
                     .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
-                byval = Some(info.size);
+                byval = Some(byval_size(info, inner));
             } else if t.starts_with("sret(") {
                 sret = true;
             }
@@ -2078,7 +2103,7 @@ fn parse_call_arg(
                         let info = types
                             .get(inner.trim_start_matches('%'))
                             .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
-                        byval = Some(info.size);
+                        byval = Some(byval_size(info, inner));
                     } else if t.starts_with("sret(") {
                         sret = true;
                     } else if t.starts_with('%') || t.starts_with('@') {
@@ -2145,7 +2170,7 @@ fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
                     let info = types
                         .get(inner.trim_start_matches('%'))
                         .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
-                    byval = Some(info.size);
+                    byval = Some(byval_size(info, inner));
                 } else if t.starts_with("sret(") {
                     sret = true;
                 } else if t.starts_with('%') {
@@ -2298,8 +2323,8 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                         );
                     } else {
                         assert!(
-                            size <= 255,
-                            "irparse: array @{name} too large ({size} bytes)"
+                            size <= 65535,
+                            "irparse: array @{name} too large ({size} bytes; max 65535)"
                         );
                     }
                     let size = size as u16;
@@ -2328,8 +2353,8 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                         );
                     } else {
                         assert!(
-                            size <= 255,
-                            "irparse: array @{name} too large ({size} bytes)"
+                            size <= 65535,
+                            "irparse: array @{name} too large ({size} bytes; max 65535)"
                         );
                     }
                     let size = size as u16;
@@ -2959,9 +2984,17 @@ fn parse_inst(
         "store" => {
             let args = split_top_level(&rest["store".len()..], ',');
             let a0 = strip_attrs(args[0]);
-            let mut it = a0.trim().split_whitespace();
-            let ty = ty_of(it.next().unwrap(), cur.as_ref());
-            let val = parse_val_typed(it.next().unwrap(), Some(ty));
+            let a0t = a0.trim();
+            let ty_tok = a0t.split_whitespace().next().unwrap();
+            let ty = ty_of(ty_tok, cur.as_ref());
+            let val_str = a0t[ty_tok.len()..].trim();
+            // e.g. a callback table holding `&s.field`) materializes like
+            // a call argument; anything else keeps the scalar reading.
+            let val = if val_str.contains("getelementptr") {
+                parse_call_ptr_val(val_str, types, fresh, &mut out, cur.as_ref())
+            } else {
+                parse_val_typed(val_str.split_whitespace().next().unwrap(), Some(ty))
+            };
             let ptr = parse_ptr_operand(args[1], types, fresh, &mut out, cur.as_ref());
             out.push(Inst::Store(Store {
                 ty,

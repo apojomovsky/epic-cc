@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 use ir::{Func, Inst, Module, SrcLoc, Ty, Val};
-use iselcore::{resolve_pointers, ssa_key, Base, Slot};
+use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
 /// live at `0xF60-0xFFF` (160 bytes) by the core's own linear-addressing
@@ -81,7 +81,7 @@ struct Gen<'m> {
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)` by `iselcore::resolve_pointers`; see
     /// ADR-009.
-    resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    resolved: &'m PtrResolution,
     /// Fixed, `BSR`-independent return-value region (up to 4 bytes, from `device.fixed_retval`).
     /// Holds call results independent of the bank selection.
     retval_lo: u16,
@@ -494,7 +494,7 @@ impl<'m> Gen<'m> {
     /// to fold, which `resolve_pointers` has no case for (the pointer lowering scope: see
     /// ADR-009). Panics rather than silently emitting a bogus
     /// access.
-    fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
+    fn resolved_for(&self, r: &str) -> (Base, u16, Vec<(u16, String)>) {
         let key = ssa_key(self.cur_func, r);
         self.resolved.get(&key).cloned().unwrap_or_else(|| {
             panic!(
@@ -999,7 +999,7 @@ impl<'m> Gen<'m> {
     /// Set `FSR1 = base_addr + k + Σ scale×%reg + byte_off` and leave the
     /// access to go through `INDF1` (0xFE7). FSR1 mirror of
     /// `emit_fsr0_dynamic` (LFSR 1, FSR1L/FSR1H = 0xFE1/0xFE2).
-    fn emit_fsr1_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_fsr1_dynamic(&mut self, base_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let static_part = u16::from(k) + u16::from(byte_off);
         let lit = (base_addr + static_part) & 0xFFF;
         let chain = self.chain_term_index(terms, 0);
@@ -1037,8 +1037,8 @@ impl<'m> Gen<'m> {
     fn emit_fsr1_indirect_slot(
         &mut self,
         slot_addr: u16,
-        k: u8,
-        terms: &[(u8, String)],
+        k: u16,
+        terms: &[(u16, String)],
         byte_off: u8,
     ) {
         let static_part = u16::from(k) + u16::from(byte_off);
@@ -1086,7 +1086,7 @@ impl<'m> Gen<'m> {
     /// `add_term_to_fsr0`: small scales and residual terms after a
     /// shift-add chain, with a 16-bit index's high byte folded into
     /// every repetition.
-    fn add_term_to_fsr1(&mut self, terms: &[(u8, String)]) {
+    fn add_term_to_fsr1(&mut self, terms: &[(u16, String)]) {
         for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
             let wide = self.reg_width(reg) == 2;
@@ -1231,7 +1231,7 @@ impl<'m> Gen<'m> {
     /// delta instead of the full `LFSR` (epic-cc#472); a non-empty `terms`
     /// always takes the full setup, since the reuse check has no way to
     /// represent a previously-added dynamic term's runtime contribution.
-    fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_fsr0_dynamic(&mut self, base_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
         // A staged run may drain here as a POSTINC loop that moves FSR0
         // wholesale; the tracked position is only sound after the drain,
         // so every reuse decision below sees post-drain state.
@@ -1291,8 +1291,8 @@ impl<'m> Gen<'m> {
     fn emit_fsr0_indirect_slot(
         &mut self,
         slot_addr: u16,
-        k: u8,
-        terms: &[(u8, String)],
+        k: u16,
+        terms: &[(u16, String)],
         byte_off: u8,
     ) {
         // Same drain-before-decision as `emit_fsr0_dynamic`: a pending
@@ -1357,7 +1357,7 @@ impl<'m> Gen<'m> {
     /// `ADDWF` sets carry, the following `ADDWFC` consumes it), so
     /// multiple terms accumulate correctly in any order. A 16-bit index
     /// register folds its high byte into every repetition.
-    fn add_term_to_fsr0(&mut self, terms: &[(u8, String)]) {
+    fn add_term_to_fsr0(&mut self, terms: &[(u16, String)]) {
         for (scale, reg) in terms {
             let a = self.slot_addr(self.cur_func, reg).direct();
             let wide = self.reg_width(reg) == 2;
@@ -1455,9 +1455,9 @@ impl<'m> Gen<'m> {
     /// afterwards. A 16-bit index (`wide`) rides the same chain: its
     /// high byte replaces the carry-fill zero in every index add, at
     /// the identical word cost.
-    fn emit_scale_chain(&mut self, lo: u16, hi: u16, scale: u8, idx_addr: u16, wide: bool) {
+    fn emit_scale_chain(&mut self, lo: u16, hi: u16, scale: u16, idx_addr: u16, wide: bool) {
         self.emit_fsr_pair_add(lo, hi, idx_addr, wide);
-        let bits = 8 - scale.leading_zeros();
+        let bits = 16 - scale.leading_zeros();
         for i in (0..bits - 1).rev() {
             self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS,C = 0
             let (la, lf) = self.operand(lo);
@@ -1477,8 +1477,8 @@ impl<'m> Gen<'m> {
     }
 
     /// Word cost of `emit_scale_chain` for `scale`.
-    fn scale_chain_words(scale: u8) -> u16 {
-        let bits = 8 - scale.leading_zeros() as u16;
+    fn scale_chain_words(scale: u16) -> u16 {
+        let bits = 16 - scale.leading_zeros() as u16;
         4 + (bits - 1) * 3 + (scale.count_ones() as u16 - 1) * 4
     }
 
@@ -1491,7 +1491,11 @@ impl<'m> Gen<'m> {
     /// only contributes to `hi` mod 2^16. No scratch byte: `MULWF` takes
     /// its operand as a file register, so scale rides W both times and
     /// PROD staging stays inside one instruction pair.
-    fn emit_mulwf_scale(&mut self, lo: u16, hi: u16, scale: u8, idx_addr: u16, wide: bool) {
+    fn emit_mulwf_scale(&mut self, lo: u16, hi: u16, scale: u16, idx_addr: u16, wide: bool) {
+        // `MULWF` multiplies 8x8: larger scales never reach here, the
+        // chooser (`mulwf_scale_wins`) routes them to the shift-add chain.
+        let scale = u8::try_from(scale)
+            .unwrap_or_else(|_| panic!("isel-pic18: MULWF scale {scale} exceeds 255"));
         self.emit(format!("    MOVLW 0x{scale:02X}"));
         let (ia, iff) = self.operand(idx_addr);
         self.emit(format!(
@@ -1539,16 +1543,18 @@ impl<'m> Gen<'m> {
     /// scale-1 or -0 term cannot need a multiply) and no worse than the
     /// naive 4-words-per-step loop. The chain still wins over it at the
     /// strides where its own cost is lower, so callers rank all three.
-    fn mulwf_scale_wins(scale: u8, wide: bool) -> bool {
-        scale >= 2 && Self::mulwf_scale_words(wide) <= 4 * u16::from(scale)
+    fn mulwf_scale_wins(scale: u16, wide: bool) -> bool {
+        scale >= 2
+            && u32::from(Self::mulwf_scale_words(wide)) <= 4 * u32::from(scale)
+            && scale <= u16::from(u8::MAX)
     }
 
     /// The only chain candidate: the largest-scale term, and only when
     /// its scale is at least 2 (a scale below 2 cannot win, since the
     /// chain costs at least the initial add plus the seed overhead, and
     /// 0 would underflow the bit math below).
-    fn biggest_chainable_term(terms: &[(u8, String)]) -> Option<(usize, u8)> {
-        let mut best: Option<(usize, u8)> = None;
+    fn biggest_chainable_term(terms: &[(u16, String)]) -> Option<(usize, u16)> {
+        let mut best: Option<(usize, u16)> = None;
         for (i, (scale, _)) in terms.iter().enumerate() {
             if *scale < 2 || best.is_some_and(|(_, bs)| bs >= *scale) {
                 continue;
@@ -1565,7 +1571,7 @@ impl<'m> Gen<'m> {
     /// `MULWF` is preferred when it is the cheaper of the two at this
     /// scale, and it is width-aware (a 16-bit index costs 4 more words).
     /// Returns the term's index and which form won.
-    fn chain_term_index(&self, terms: &[(u8, String)], extra: u16) -> Option<(usize, Scaled)> {
+    fn chain_term_index(&self, terms: &[(u16, String)], extra: u16) -> Option<(usize, Scaled)> {
         let (i, scale) = Self::biggest_chainable_term(terms)?;
         let wide = self.reg_width(&terms[i].1) == 2;
         let mut best: Option<(Scaled, u16)> = None;
@@ -1573,7 +1579,9 @@ impl<'m> Gen<'m> {
             best = Some((Scaled::Mulwf, Self::mulwf_scale_words(wide)));
         }
         let chain_extra = if best.is_some() { 0 } else { extra };
-        if Self::scale_chain_words(scale) + chain_extra + 2 <= 4 * u16::from(scale) {
+        if u32::from(Self::scale_chain_words(scale)) + u32::from(chain_extra) + 2
+            <= 4 * u32::from(scale)
+        {
             let cost = Self::scale_chain_words(scale) + extra;
             if best.is_none_or(|(_, c)| cost < c) {
                 best = Some((Scaled::Chain, cost));
@@ -1585,7 +1593,7 @@ impl<'m> Gen<'m> {
     /// The naive accumulation for every term except `skip`, shared by
     /// the chain-capable setup paths. A 16-bit index register folds its
     /// high byte into every repetition.
-    fn add_terms_except(&mut self, terms: &[(u8, String)], skip: Option<usize>, lo: u16, hi: u16) {
+    fn add_terms_except(&mut self, terms: &[(u16, String)], skip: Option<usize>, lo: u16, hi: u16) {
         for (i, (scale, reg)) in terms.iter().enumerate() {
             if Some(i) == skip {
                 continue;
@@ -1605,7 +1613,7 @@ impl<'m> Gen<'m> {
     /// from `resolve_pointers`. This is the flash-side counterpart of
     /// `emit_ptr_setup`: every const read/store routes through it, and a
     /// const `store` panics (ROM is not writable).
-    fn const_base_of(&self, ptr: &Val) -> Option<(String, u8, Vec<(u8, String)>)> {
+    fn const_base_of(&self, ptr: &Val) -> Option<(String, u16, Vec<(u16, String)>)> {
         match ptr {
             Val::Global(g) if self.global_is_const(g) => Some((g.clone(), 0, Vec::new())),
             Val::Reg(r) => match self.resolved_for(r) {
@@ -1626,7 +1634,7 @@ impl<'m> Gen<'m> {
     /// PIC18 program memory is byte-packed (two bytes per 16-bit word),
     /// which is exactly the address `LOW`/`HIGH`/`UPPER` resolve from the
     /// table label's byte address.
-    fn emit_tblptr_static(&mut self, table: &str, k: u8, byte_off: u8) {
+    fn emit_tblptr_static(&mut self, table: &str, k: u16, byte_off: u8) {
         for (lit, reg) in [
             (format!("LOW({table})"), 0xF6),
             (format!("HIGH({table})"), 0xF7),
@@ -1654,7 +1662,7 @@ impl<'m> Gen<'m> {
     /// carry (`ADDWFC TBLPTRU,F`; `W` still holds 0 in the width-1 case).
     /// A 16-bit index needs its high byte folded in or `table[0x1XX]`
     /// reads the wrong byte, which is why `reg_width` is consulted.
-    fn add_dynamic_to_tblptr(&mut self, terms: &[(u8, String)]) {
+    fn add_dynamic_to_tblptr(&mut self, terms: &[(u16, String)]) {
         if let Some((scale, reg)) = terms.first() {
             let lo = self.slot_addr(self.cur_func, reg).direct();
             let wide = self.reg_width(reg) == 2;
@@ -1695,8 +1703,8 @@ impl<'m> Gen<'m> {
     /// the 3-byte seed, one index add, per lower bit of `scale` a 4-word
     /// 3-byte doubling, per further set bit an index add, then the table
     /// base bytes and the static part re-joining as literal adds.
-    fn tblptr_chain_words(scale: u8, wide: bool, static_part: u16) -> u16 {
-        let bits = 8 - scale.leading_zeros() as u16;
+    fn tblptr_chain_words(scale: u16, wide: bool, static_part: u16) -> u16 {
+        let bits = 16 - scale.leading_zeros() as u16;
         let add = if wide { 6 } else { 5 };
         3 + add
             + (bits - 1) * 4
@@ -1709,18 +1717,18 @@ impl<'m> Gen<'m> {
     /// largest-scale-2-word-win policy as `chain_term_index`, against
     /// the 3-byte accumulator's costs. Returns the term's index and
     /// scale.
-    fn tblptr_chain_term(&self, terms: &[(u8, String)], static_part: u16) -> Option<(usize, u8)> {
+    fn tblptr_chain_term(&self, terms: &[(u16, String)], static_part: u16) -> Option<(usize, u16)> {
         let (i, scale) = Self::biggest_chainable_term(terms)?;
         let wide = self.reg_width(&terms[i].1) == 2;
-        (Self::tblptr_chain_words(scale, wide, static_part) + 2
-            <= Self::tblptr_naive_words(wide) * u16::from(scale))
+        (u32::from(Self::tblptr_chain_words(scale, wide, static_part)) + 2
+            <= u32::from(Self::tblptr_naive_words(wide)) * u32::from(scale))
         .then_some((i, scale))
     }
 
     /// Seed `TBLPTR = table_base + k + Σ terms + byte_off` for one flash
     /// byte access: static seeding plus the naive term loop for small
     /// scales, or the zero-seeded shift-add chain when a big stride wins.
-    fn emit_tblptr_setup(&mut self, table: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_tblptr_setup(&mut self, table: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let static_part = u16::from(k) + u16::from(byte_off);
         if let Some((i, scale)) = self.tblptr_chain_term(terms, static_part) {
             self.emit_tblptr_dynamic_chain(table, static_part, scale, &terms[i].1);
@@ -1737,7 +1745,7 @@ impl<'m> Gen<'m> {
     /// then re-add the table base bytes and the static part as literal
     /// adds. The zero seed is what lets the triple hold the running
     /// product, mirroring the FSR pair's chain shape.
-    fn emit_tblptr_dynamic_chain(&mut self, table: &str, static_part: u16, scale: u8, reg: &str) {
+    fn emit_tblptr_dynamic_chain(&mut self, table: &str, static_part: u16, scale: u16, reg: &str) {
         let lo = self.slot_addr(self.cur_func, reg).direct();
         let wide = self.reg_width(reg) == 2;
         self.emit("    CLRF 0xF6,A".to_string()); // TBLPTRL = 0
@@ -1765,7 +1773,7 @@ impl<'m> Gen<'m> {
             g.emit("    ADDWFC 0xF8,F,A".to_string());
         };
         emit_idx_add(self);
-        let bits = 8 - scale.leading_zeros();
+        let bits = 16 - scale.leading_zeros();
         for i in (0..bits - 1).rev() {
             self.emit("    BCF 0xFD8,0,A".to_string()); // STATUS,C = 0
             self.emit("    RLCF 0xF6,F,A".to_string());
@@ -1804,8 +1812,8 @@ impl<'m> Gen<'m> {
     fn emit_const_load_byte(
         &mut self,
         table: &str,
-        k: u8,
-        terms: &[(u8, String)],
+        k: u16,
+        terms: &[(u16, String)],
         byte_off: u8,
         dst: u16,
     ) {
@@ -7146,7 +7154,7 @@ mod tests {
     fn fresh_label_counter_is_shared_across_gens() {
         let m = ir::parse("fn f(void) ()\n  block entry:\n    ret void\n");
         let addrs: HashMap<String, u16> = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
         let l1 = {
             let mut g = Gen {
@@ -7202,7 +7210,7 @@ mod p3_gen_tests {
     fn gen<'a>(
         m: &'a Module,
         addrs: &'a HashMap<String, u16>,
-        resolved: &'a HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+        resolved: &'a PtrResolution,
         tmp: &'a mut u32,
     ) -> Gen<'a> {
         Gen {
@@ -7233,7 +7241,7 @@ mod p3_gen_tests {
             module_asm: Vec::new(),
         };
         let addrs = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         assert_eq!(g.operand(0x05F), (0, 0x5F));
@@ -7248,7 +7256,7 @@ mod p3_gen_tests {
             module_asm: Vec::new(),
         };
         let addrs = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         assert_eq!(g.operand(0x0090), (1, 0x90));
@@ -7269,7 +7277,7 @@ mod p3_gen_tests {
             module_asm: Vec::new(),
         };
         let addrs = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         g.bsr = Some(2);
@@ -7291,7 +7299,7 @@ mod p3_gen_tests {
             module_asm: Vec::new(),
         };
         let addrs = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         g.bsr = Some(0);
@@ -7314,7 +7322,7 @@ mod p3_gen_tests {
             module_asm: Vec::new(),
         };
         let addrs = HashMap::new();
-        let resolved: HashMap<String, (Base, u8, Vec<(u8, String)>)> = HashMap::new();
+        let resolved: PtrResolution = HashMap::new();
         let mut tmp = 0u32;
         let mut g = gen(&m, &addrs, &resolved, &mut tmp);
         // FSR0L, the address this lowering exists to fix.

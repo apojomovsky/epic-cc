@@ -25,7 +25,7 @@ use std::collections::{HashMap, HashSet};
 
 use device::Device;
 use ir::{Inst, Module};
-use iselcore::{resolve_pointers, ssa_key, Base};
+use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution};
 
 /// Complete address map: globals keyed by name, locals keyed `{func}::{name}`,
 /// plus the total overlay span (in bytes) across all banks. `const_globals`
@@ -126,7 +126,7 @@ fn physical_end(device: &Device, start: u16, width: u16) -> u16 {
 /// it through the linear region so one FSR walks across banks. On every
 /// other core a straddling global is unrepresentable (classic PIC14's
 /// FSR+IRP cannot cross a bank), so it panics.
-fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
+fn try_place_at(device: &Device, addr: u16, width: u16) -> Option<u16> {
     let align = width.min(2);
     let mut a = addr;
     loop {
@@ -153,7 +153,7 @@ fn try_place_at(device: &Device, addr: u16, width: u8) -> Option<u16> {
 /// physical layout is non-contiguous (the common-RAM hole between banks is
 /// skipped), which is exactly the case `isel-pic14e` addresses through the
 /// linear region (docs/33 §D-2).
-fn try_place_straddle(device: &Device, addr: u16, width: u8) -> Option<u16> {
+fn try_place_straddle(device: &Device, addr: u16, width: u16) -> Option<u16> {
     let mut cur = addr;
     let mut remaining = u16::from(width);
     while remaining > 0 {
@@ -339,11 +339,7 @@ struct FrameLayout {
 /// immediately reusable. Greedy first-fit coloring reuses the lowest slot
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
-fn frame_layout(
-    f: &ir::Func,
-    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
-    va_size: u16,
-) -> FrameLayout {
+fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLayout {
     // Block order: the entry block (unlabeled) first, then label order.
     let mut order: Vec<&ir::Block> = f.blocks.iter().collect();
     // The entry block (label `entry` in hand-written IR, a numeric label in
@@ -797,7 +793,7 @@ fn bin_pack(
     order.sort_by(|a, b| b.size.cmp(&a.size));
     let mut out = HashMap::new();
     for g in order {
-        let width = g.size as u8;
+        let width = g.size;
         let align = width.min(2);
         let mut placed = None;
         for cursor in cursors.iter_mut() {
@@ -1361,21 +1357,17 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             }
         }
     }
+    // RAM globals have no 255-byte ceiling: `Global.size` is `u16` and
+    // placement below packs (and, on PIC14E, straddles) them like any
+    // other width. A global nothing fits still fails precisely at the
+    // `no arrangement fits` panic below, never silently.
     for g in &m.globals {
         if g.is_const && !const_to_ram.contains(&g.name) {
             const_globals.insert(g.name.clone());
+        } else if let Some(a) = g.addr {
+            fixed.push((g.name.clone(), a, g.size));
         } else {
-            assert!(
-                g.size <= 255,
-                "alloc: RAM global @{} too large ({} bytes; RAM is byte-addressed, max 255)",
-                g.name,
-                g.size
-            );
-            if let Some(a) = g.addr {
-                fixed.push((g.name.clone(), a, g.size));
-            } else {
-                floating.push(g);
-            }
+            floating.push(g);
         }
     }
     // Floating globals are placed with the same sequential -> bin-pack
@@ -1400,7 +1392,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 }
             }
             for g in &floating {
-                let width = g.size as u8;
+                let width = g.size;
                 // If the next placement would overlap a fixed region, bump
                 // past it before asking try_place_at.
                 let mut candidate = addr;
@@ -1664,11 +1656,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
 /// A folded select is virtual (iselcore folds it like a GEP) and defines no
 /// slot; allocating one would be dead space that perturbs the liveness
 /// coloring and can clobber a fold-term register (epic-cc#117, epic-cc#147).
-fn def_width(
-    inst: &Inst,
-    resolved: &HashMap<String, (Base, u8, Vec<(u8, String)>)>,
-    fname: &str,
-) -> Option<(String, u8)> {
+fn def_width(inst: &Inst, resolved: &PtrResolution, fname: &str) -> Option<(String, u8)> {
     match inst {
         Inst::Load(l) => Some((l.dst.clone(), l.ty.bytes())),
         Inst::Bin(b) => Some((b.dst.clone(), b.ty.bytes())),

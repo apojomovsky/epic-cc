@@ -1086,17 +1086,21 @@ define dso_local void @main() {
     let _ = parse_ll(ll);
 }
 
-// Fix (3): struct sizes/offsets exceeding 255 must assert.
+// epic-cc#608: structs over 255 bytes are globals-legal (the 255 ceiling
+// now covers only stack allocas and byval params, which keep precise
+// panics). A 300-byte struct global decodes with its full size.
 #[test]
-#[should_panic(expected = "255")]
-fn oversized_struct_panics() {
+fn large_struct_global_parses_with_full_size() {
     let ll = r#"
 %struct.Big = type { [300 x i8] }
+@big = dso_local global %struct.Big zeroinitializer, align 1
 define dso_local void @main() {
   ret void
 }
 "#;
-    let _ = parse_ll(ll);
+    let m = parse_ll(ll);
+    assert_eq!(m.globals.len(), 1);
+    assert_eq!(m.globals[0].size, 300);
 }
 
 // Milestone 8: mul/udiv/shl/lshr (m3) and sdiv/srem/ashr (m4) probe shapes,
@@ -1405,10 +1409,14 @@ fn const_array_65535_bytes_parses() {
 }
 
 #[test]
-#[should_panic(expected = "array @ram too large")]
-fn ram_array_300_bytes_panics() {
+fn ram_array_300_bytes_parses_with_full_size() {
+    // epic-cc#608: like large structs, RAM arrays over 255 bytes are
+    // globals-legal; only allocas and byval params keep the 255 ceiling.
     let src = "@ram = dso_local global [300 x i8] zeroinitializer, align 1\n";
-    let _ = parse_ll(&src);
+    let m = parse_ll(src);
+    assert_eq!(m.globals.len(), 1);
+    assert_eq!(m.globals[0].size, 300);
+    assert_eq!(m.globals[0].bytes.len(), 300);
 }
 
 #[test]
@@ -2303,4 +2311,34 @@ fn nonzero_scalar_survives_a_trailing_attribute_tail() {
         vec![5u8, 0],
         "align/!dbg tail does not corrupt the value"
     );
+}
+
+#[test]
+fn store_of_address_of_field_materializes_a_gep() {
+    // epic-cc#608: `store ptr getelementptr (i8, ptr @g, i16 12), ...`
+    // (an address-of-field value, e.g. a table holding `&s.field`) must
+    // materialize a Gep inst like a call argument does, not panic in the
+    // scalar value reader.
+    let ll = r#"
+%struct.S = type { [300 x i8] }
+@dst = dso_local global ptr null, align 2
+define dso_local void @main() {
+  store ptr getelementptr inbounds (i8, ptr @dst, i16 12), ptr @dst, align 2
+  ret void
+}
+"#;
+    let m = parse_ll(ll);
+    let body = &m.funcs[0].blocks[0].insts;
+    assert_eq!(body.len(), 3);
+    match &body[0] {
+        Inst::Gep(g) => {
+            assert!(matches!(g.base, GepBase::Global(_)));
+            assert_eq!(g.k, 12);
+        }
+        other => panic!("expected a materialized Gep, got {other:?}"),
+    }
+    match &body[1] {
+        Inst::Store(s) => assert!(matches!(s.val, Val::Reg(_))),
+        other => panic!("expected the store, got {other:?}"),
+    }
 }

@@ -45,7 +45,7 @@
 
 use device::Device;
 use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Ty, Val};
-use iselcore::{resolve_pointers, ssa_key, Base, Slot};
+use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
 use std::collections::{HashMap, HashSet};
 
 /// Returns the recipe for a runtime routine name, or `None` for other names.
@@ -123,7 +123,7 @@ struct Gen<'m> {
     /// bases (byval/sret params and allocas). `gep`/`alloca` themselves
     /// emit nothing; each `load`/`store`/`memcpy` through a pointer reg
     /// lowers the pointer at its use.
-    resolved: &'m HashMap<String, (Base, u8, Vec<(u8, String)>)>,
+    resolved: &'m PtrResolution,
     scratch: u16,
     retval_lo: u16,
     cur_func: &'m str,
@@ -348,7 +348,7 @@ impl<'m> Gen<'m> {
     /// Uses the linear alias for straddling objects (docs/33 §D-2), else
     /// the physical address. The linear base keeps later FSR derefs clear
     /// of the common-RAM hole.
-    fn ptr_value_addr(&self, name: &str, k: u8) -> u16 {
+    fn ptr_value_addr(&self, name: &str, k: u16) -> u16 {
         let addr = self.global_addr(name);
         let span = self.global_size(name);
         if object_straddles(self.device, addr, span) {
@@ -481,7 +481,7 @@ impl<'m> Gen<'m> {
 
     /// Returns the folded `(base, k, terms)` for pointer reg `%r`. A name
     /// outside the resolved map panics: lowering covers every live pointer.
-    fn resolved_for(&self, r: &str) -> (Base, u8, Vec<(u8, String)>) {
+    fn resolved_for(&self, r: &str) -> (Base, u16, Vec<(u16, String)>) {
         let key = ssa_key(self.cur_func, r);
         self.resolved
             .get(&key)
@@ -690,7 +690,7 @@ impl<'m> Gen<'m> {
                         !g.global_is_const(gname),
                         "isel: memcpy into const (flash) global @{gname}"
                     );
-                    (Base::Global(gname.clone()), 0u8, Vec::new())
+                    (Base::Global(gname.clone()), 0u16, Vec::new())
                 }
                 _ => panic!("isel: dynamic memcpy ptr must be a reg or global"),
             };
@@ -762,8 +762,8 @@ impl<'m> Gen<'m> {
     fn emit_fsr_to(
         &mut self,
         base_addr: u16,
-        k: u8,
-        terms: &[(u8, String)],
+        k: u16,
+        terms: &[(u16, String)],
         byte_off: u8,
         span: u16,
     ) {
@@ -811,7 +811,7 @@ impl<'m> Gen<'m> {
     /// Sets FSR0 from an indirect slot plus offset and terms. Loads both
     /// address bytes from the slot, then adds the offset with carry. Uses
     /// the physical address: sret targets fit one bank by construction.
-    fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
@@ -856,7 +856,7 @@ impl<'m> Gen<'m> {
     /// Accumulates scaled terms into scratch. Reloads W per repetition:
     /// ADDWF consumes W, so reuse without reload folds the wrong sum and
     /// mis-addresses.
-    fn emit_accum_terms(&mut self, terms: &[(u8, String)]) {
+    fn emit_accum_terms(&mut self, terms: &[(u16, String)]) {
         self.emit("    MOVLW 0x00".to_string());
         self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
         for (scale, r) in terms {
@@ -871,7 +871,7 @@ impl<'m> Gen<'m> {
 
     /// Computes the const-table byte index into W. One scale-1 term keeps
     /// the fast register shape. General sums accumulate in scratch.
-    fn emit_ptr_index_w(&mut self, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_ptr_index_w(&mut self, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
@@ -900,7 +900,7 @@ impl<'m> Gen<'m> {
     /// across the PCLATH set and the byte across the restore. Leaves the
     /// byte in W like the small path. Other index shapes panic: the index
     /// set is closed.
-    fn emit_const_read_large(&mut self, name: &str, k: u8, terms: &[(u8, String)], byte_off: u8) {
+    fn emit_const_read_large(&mut self, name: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
         let kk = u16::from(k) + u16::from(byte_off);
         assert!(
             kk <= 0xFF,
