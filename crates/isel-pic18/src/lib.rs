@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 
 use device::Device;
-use ir::{Func, Inst, Module, SrcLoc, Ty, Val};
+use ir::{Block, Func, Icmp, Inst, Module, SrcLoc, Ty, Val};
 use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution, Slot};
 
 /// The high Access Bank segment's start: every classic-mode PIC18's SFRs
@@ -316,6 +316,58 @@ impl<'m> Gen<'m> {
                 .get(&ssa_key(func, name))
                 .unwrap_or_else(|| panic!("isel-pic18: no slot for {func}::{name}")),
         )
+    }
+
+    /// The `icmp` a block's terminator can absorb, when that is the
+    /// compare's only use in the function.
+    ///
+    /// Requirements, each of which is load-bearing:
+    /// - the terminator is a `BrCond` on a `Reg`;
+    /// - the compare is in the *same* block, immediately before the
+    ///   terminator. Any instruction between them would be skipped by the
+    ///   fused exits, so adjacency is what makes the fusion sound rather
+    ///   than merely likely;
+    /// - the compare is multi-byte (an i8 compare is already 1 word per
+    ///   lane and gains nothing);
+    /// - nothing else in the function reads the result.
+    ///
+    /// A fused compare emits its exits as the branch's own targets and
+    /// never writes the result slot, so the 0/1 byte, its preclear, and
+    /// the reload (`MOVF`/`BZ`) all disappear.
+    fn fusable_icmp<'f>(f: &'f Func, b: &'f Block) -> Option<&'f Icmp> {
+        let [.., Inst::Icmp(c), Inst::BrCond(bc)] = b.insts.as_slice() else {
+            return None;
+        };
+        let Val::Reg(cond) = &bc.cond else {
+            return None;
+        };
+        if c.dst != *cond || c.ty.bytes() < 2 {
+            return None;
+        }
+        // Only the predicates with a fused lowering. The signed ordering
+        // cascades have none (their answer needs the top lane's sign
+        // relation), so they keep the materializing path.
+        if !matches!(c.pred.as_str(), "eq" | "ne" | "ult" | "uge" | "ugt" | "ule") {
+            return None;
+        }
+        // The compare's sole consumer must be this branch. Find `b`'s own
+        // index so the scan can skip exactly that terminator (the compare
+        // itself is a def, not a use, so `read_vals` never counts it).
+        let Some(bi_own) = f.blocks.iter().position(|bb| std::ptr::eq(bb, b)) else {
+            return None;
+        };
+        let branch_idx = b.insts.len() - 1;
+        for (bi, bb) in f.blocks.iter().enumerate() {
+            for (ii, inst) in bb.insts.iter().enumerate() {
+                if bi == bi_own && ii == branch_idx {
+                    continue;
+                }
+                if ir::read_vals(inst).iter().any(|v| v == cond) {
+                    return None;
+                }
+            }
+        }
+        Some(c)
     }
     fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
         for op in operands {
@@ -3085,6 +3137,15 @@ impl<'m> Gen<'m> {
             self.emit_icmp_i16_eq_ne(a, b, pred, dst);
             return;
         }
+        // The unsigned predicates go through the borrow chain, which has
+        // one shared exit rather than a per-lane cascade (see
+        // `emit_icmp_u16_chain`). Signed ones keep the cascade: their
+        // answer needs the top lanes' sign equality, which a single final
+        // borrow does not carry.
+        if matches!(pred, "ult" | "uge" | "ugt" | "ule") {
+            self.emit_icmp_chain(a, b, pred, dst, 2, None);
+            return;
+        }
         let unsigned_tiebreak = match pred {
             "slt" => "ult",
             "sle" => "ule",
@@ -3129,6 +3190,105 @@ impl<'m> Gen<'m> {
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
     }
 
+    /// Unsigned ordering compare as one low-to-high borrow chain with a
+    /// single exit. `a - b` propagates the borrow upward, so the final
+    /// carry is `a >= b` for every width; the chain never inspects a lane
+    /// a higher lane could still decide, and it needs no per-lane exit.
+    /// `pred` must be one of `ult`/`uge`/`ugt`/`ule`.
+    ///
+    /// `ugt`/`ule` are `uge`/`ult` with one extra borrow: injecting a
+    /// borrow-in of 1 at lane 0 computes `a - b - 1`, so its carry is
+    /// `a >= b + 1`, i.e. exactly `a > b`. The operands are never swapped:
+    /// `a` must stay the memory operand, because a swapped constant on the
+    /// left would resolve through `val_addr` to its RAM address instead of
+    /// as a literal (the hazard every `Icmp` entry point asserts against).
+    ///
+    /// Costs `2n` words plus 1 for a borrow-in predicate and 3 for the
+    /// exit, against the cascade's `2n + 3n`. `fuse` carries a consuming
+    /// `BrCond`'s exit labels, when this compare's result has no other use.
+    fn emit_icmp_chain(
+        &mut self,
+        a: Val,
+        b: Val,
+        pred: &str,
+        dst: &str,
+        bytes: u8,
+        fuse: Option<(String, String)>,
+    ) {
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        debug_assert!(matches!(pred, "ult" | "uge" | "ugt" | "ule"));
+        // Both chains subtract `b` from `a`. The plain chain's C=1 means
+        // `a >= b` (giving `uge` at C=1 and `ult` at C=0); the strict chain
+        // injects a borrow-in of 1, computing `a - b - 1`, whose C=1 means
+        // `a > b` (giving `ugt` at C=1 and `ule` at C=0).
+        let borrow_in = matches!(pred, "ugt" | "ule");
+        // Which side of the branch the two outcomes go to: for the
+        // materializing path they are the true/false labels, for a fused
+        // one they are the branch's own targets.
+        let (l_true, l_false, l_done);
+        match fuse {
+            Some((t, f)) => {
+                l_true = t;
+                l_false = f;
+                l_done = None;
+            }
+            None => {
+                l_true = self.fresh_label();
+                l_false = self.fresh_label();
+                l_done = Some(self.fresh_label());
+            }
+        }
+        // `l_ge` is the C=1 target and `l_lt` the C=0 one. The non-strict
+        // chain's C=1 means `a >= b` and the strict chain's means `a > b`,
+        // so the two "greater" predicates and the two "less" ones pair up
+        // across the strictness split, not within it:
+        //   uge (a>=b) -> C=1, ugt (a>b) -> C=1
+        //   ult (a<b)  -> C=0, ule (a<=b) -> C=0
+        let (l_ge, l_lt) = if matches!(pred, "uge" | "ugt") {
+            (l_true.clone(), l_false.clone())
+        } else {
+            (l_false.clone(), l_true.clone())
+        };
+        // The materializing path writes a 0/1 byte only; a fused compare
+        // leaves the slot alone entirely, so the preclear is skipped.
+        let pre = if l_done.is_some() {
+            self.bool_result_preclear(&a, &b, dst, bytes)
+        } else {
+            None
+        };
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
+        if borrow_in {
+            // C = 0 makes lane 0's SUBWFB subtract `b0 + 1`.
+            self.emit("    BCF 0xFD8,0,A".to_string());
+        }
+        for i in 0..bytes {
+            self.emit_load_w(&b, i);
+            let av = self.val_addr(&a).direct() + u16::from(i);
+            let (acc, af) = self.operand(av);
+            let bank = if acc == 0 { "A" } else { "B" };
+            // Lane 0 uses SUBWF for the plain chain (which sets C
+            // outright) and SUBWFB for the borrow-in one (which consumes
+            // the carry cleared above, so it cannot be the plain form).
+            let mne = if i == 0 && !borrow_in {
+                "SUBWF"
+            } else {
+                "SUBWFB"
+            };
+            self.emit(format!("    {mne} 0x{af:03X},W,{bank}"));
+        }
+        // C=1 is always the `>=`/`>` side, whichever chain ran.
+        self.emit(format!("    BNC {l_lt}"));
+        self.emit(format!("    BRA {l_ge}"));
+        if let Some(done) = l_done {
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
+        }
+    }
+
     /// `eq`/`ne` for multi-byte values: true (for `eq`) only when every
     /// byte matches; `ne` is the mirror. Per-byte checks through
     /// `emit_cmp_flags` (`MOVF` for a zero literal lane, `SUBWF` otherwise)
@@ -3137,15 +3297,41 @@ impl<'m> Gen<'m> {
     /// equal, another different) is decisive here in a way it never is for
     /// `slt`/`ult`/etc.
     fn emit_icmp_i16_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str) {
-        self.emit_icmp_eq_ne(a, b, pred, dst, 2);
+        self.emit_icmp_eq_ne(a, b, pred, dst, 2, None);
     }
 
-    fn emit_icmp_eq_ne(&mut self, a: Val, b: Val, pred: &str, dst: &str, bytes: u8) {
-        let l_true = self.fresh_label();
-        let l_false = self.fresh_label();
-        let l_done = self.fresh_label();
+    /// `fuse` carries the two exit labels of a consuming `BrCond` in this
+    /// function, when this compare's result has no other use. With it, the
+    /// per-byte exits branch straight to the branch targets and no 0/1
+    /// byte is materialized (see `fused_cond_icmp`).
+    fn emit_icmp_eq_ne(
+        &mut self,
+        a: Val,
+        b: Val,
+        pred: &str,
+        dst: &str,
+        bytes: u8,
+        fuse: Option<(String, String)>,
+    ) {
+        let (l_true, l_false, l_done);
+        match fuse {
+            Some((t, f)) => {
+                l_true = t;
+                l_false = f;
+                l_done = None;
+            }
+            None => {
+                l_true = self.fresh_label();
+                l_false = self.fresh_label();
+                l_done = Some(self.fresh_label());
+            }
+        }
         let l_mismatch = if pred == "eq" { &l_false } else { &l_true };
-        let pre = self.bool_result_preclear(&a, &b, dst, bytes);
+        let pre = if l_done.is_some() {
+            self.bool_result_preclear(&a, &b, dst, bytes)
+        } else {
+            None
+        };
         if let Some(d) = pre {
             self.emit_banked("CLRF", d, "");
         }
@@ -3156,7 +3342,9 @@ impl<'m> Gen<'m> {
         // Every byte matched: `eq` is true, `ne` is false.
         let l_all_matched = if pred == "eq" { &l_true } else { &l_false };
         self.emit(format!("    BRA {l_all_matched}"));
-        self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
+        if let Some(done) = l_done {
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
+        }
     }
 
     /// `dst = (a <pred> b) ? 1: 0` for four bytes: compare the high byte
@@ -3173,7 +3361,14 @@ impl<'m> Gen<'m> {
             "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
         );
         if pred == "eq" || pred == "ne" {
-            self.emit_icmp_eq_ne(a, b, pred, dst, 4);
+            self.emit_icmp_eq_ne(a, b, pred, dst, 4, None);
+            return;
+        }
+        // Same routing as the 16-bit entry point: the unsigned predicates
+        // use the shared-exit borrow chain at any width, the signed ones
+        // keep the cascade (see `emit_icmp_i16`).
+        if matches!(pred, "ult" | "uge" | "ugt" | "ule") {
+            self.emit_icmp_chain(a, b, pred, dst, 4, None);
             return;
         }
         let unsigned_tiebreak = match pred {
@@ -6057,6 +6252,92 @@ impl<'m> Gen<'m> {
     }
 }
 
+/// Emit a `BrCond`'s branch lines for the materializing path: the cond byte
+/// has already been loaded into `W`, so `BZ`/`BNZ` test it. Each edge's phi
+/// copies run on that edge's own path, and PIC18's conditional branches are
+/// real label branches (not PIC14's one-instruction skips), so the copies
+/// inline directly with no intermediate copy block.
+fn emit_cond_branches<'m>(
+    g: &mut Gen<'m>,
+    lt: &str,
+    lf: &str,
+    t_copies: &Option<Vec<(String, Ty, Val)>>,
+    f_copies: &Option<Vec<(String, Ty, Val)>>,
+    b: &ir::Block,
+    doms: &HashMap<String, HashSet<String>>,
+    bc: &ir::BrCond,
+) {
+    match (t_copies, f_copies) {
+        (None, None) => {
+            g.emit(format!("    BZ {lf}"));
+            g.emit(format!("    BRA {lt}"));
+        }
+        (None, Some(cf)) => {
+            g.emit(format!("    BNZ {lt}"));
+            emit_phi_copies(g, cf, doms[&b.label].contains(&bc.f));
+            g.emit(format!("    BRA {lf}"));
+        }
+        (Some(ct), None) => {
+            g.emit(format!("    BZ {lf}"));
+            emit_phi_copies(g, ct, doms[&b.label].contains(&bc.t));
+            g.emit(format!("    BRA {lt}"));
+        }
+        (Some(ct), Some(cf)) => {
+            let l_fcopies = g.fresh_label();
+            g.emit(format!("    BZ {l_fcopies}"));
+            emit_phi_copies(g, ct, doms[&b.label].contains(&bc.t));
+            g.emit(format!("    BRA {lt}"));
+            g.emit_label(&l_fcopies);
+            emit_phi_copies(g, cf, doms[&b.label].contains(&bc.f));
+            g.emit(format!("    BRA {lf}"));
+        }
+    }
+}
+
+/// Lower the compare a `BrCond` absorbs, with the branch's two edges as the
+/// compare's exits. Each edge that carries phi copies gets a trampoline
+/// (copies, then a branch to the real target); copy-free edges branch
+/// straight. The compare's own lowering never writes its result slot.
+fn emit_fused_branch<'m>(
+    g: &mut Gen<'m>,
+    c: &ir::Icmp,
+    lt: &str,
+    lf: &str,
+    t_copies: Option<&[(String, Ty, Val)]>,
+    f_copies: Option<&[(String, Ty, Val)]>,
+    t_dom: bool,
+    f_dom: bool,
+) {
+    // The exits the compare branches to, per edge. A copy-carrying edge
+    // routes through a trampoline whose label is emitted after the compare.
+    let mut tramps: Vec<(String, Vec<(String, Ty, Val)>, bool, String)> = Vec::new();
+    let mut exit = |copies: Option<&[(String, Ty, Val)]>, target: &str, dom: bool| -> String {
+        match copies {
+            None => target.to_string(),
+            Some(cs) => {
+                let l = g.fresh_label();
+                tramps.push((l.clone(), cs.to_vec(), dom, target.to_string()));
+                l
+            }
+        }
+    };
+    let l_t = exit(t_copies, lt, t_dom);
+    let l_f = exit(f_copies, lf, f_dom);
+    let n = c.ty.bytes();
+    let fuse = Some((l_t, l_f));
+    if c.pred == "eq" || c.pred == "ne" {
+        g.emit_icmp_eq_ne(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+    } else {
+        debug_assert!(matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule"));
+        g.emit_icmp_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+    }
+    for (l, copies, dom, target) in tramps {
+        g.emit_label(&l);
+        emit_phi_copies(g, &copies, dom);
+        g.emit(format!("    BRA {target}"));
+    }
+}
+
 /// Computes classic iterative dominator sets to classify phi-copy edges:
 /// `pred -> merge` is a back edge exactly when `merge` dominates `pred`,
 /// so the merge slots on that edge hold current-iteration values. The
@@ -6639,6 +6920,11 @@ pub fn select_with_locs(
                     )); // W, last
                 }
             }
+            // A compare this block's terminator absorbs (see
+            // `fusable_icmp`): its lowering moves into the `BrCond` arm
+            // below, which knows the branch targets. Emitting it here
+            // would materialize a byte nobody reads.
+            let fused = Gen::fusable_icmp(f, b).map(|c| c.dst.clone());
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
                 match inst {
@@ -6646,6 +6932,7 @@ pub fn select_with_locs(
                     Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) | Inst::Ret(..) => {
                         terminator = Some(inst)
                     }
+                    Inst::Icmp(c) if fused.as_deref() == Some(c.dst.as_str()) => {}
                     other => g.emit_inst(other),
                 }
             }
@@ -6664,64 +6951,46 @@ pub fn select_with_locs(
                 }
                 Some(Inst::BrCond(bc)) => {
                     g.cur_loc = bc.loc.clone();
-                    // Same hazard class as `Select`'s cond (the select guard, see
-                    // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
-                    // `Val::Const` arm emits only `MOVLW`, which does not
-                    // set the Z flag (`crates/sim/src/lib.rs`), so a
-                    // literal cond here would make `BZ` test a stale flag
-                    // from whatever came before instead of `cond`'s real
-                    // value. Fail instead of silently miscompiling.
-                    assert!(
-                        !matches!(bc.cond, Val::Const(_)),
-                        "isel-pic18: const cond BrCond not yet supported"
-                    );
                     let lt = labels[&bc.t].clone();
                     let lf = labels[&bc.f].clone();
                     let t_copies = phi_copies.get(&(b.label.clone(), bc.t.clone())).cloned();
                     let f_copies = phi_copies.get(&(b.label.clone(), bc.f.clone())).cloned();
-                    g.emit_load_w(&bc.cond, 0);
-                    // Unlike PIC14's BTFSC/BTFSS (a 1-instruction SKIP, so a
-                    // copy sequence longer than one instruction needs an
-                    // extra `lcop` block to route through), PIC18's BZ/BNZ
-                    // are real branches to a label: so each edge's copies
-                    // can be inlined directly along that edge's own path,
-                    // with no intermediate copy-block indirection needed.
-                    match (t_copies, f_copies) {
-                        // Plain branch, no phi consumers on either edge
-                        // exactly the phi elimination's original (correct) shape.
-                        (None, None) => {
-                            g.emit(format!("    BZ {lf}"));
-                            g.emit(format!("    BRA {lt}"));
-                        }
-                        // Only the f (cond==0) edge feeds a phi: BZ can't
-                        // jump straight to `lf` anymore (the copies must
-                        // run first), so it falls through into the copies
-                        // instead; the t edge, needing none, still gets a
-                        // direct branch.
-                        (None, Some(cf)) => {
-                            g.emit(format!("    BNZ {lt}"));
-                            emit_phi_copies(&mut g, &cf, doms[&b.label].contains(&bc.f));
-                            g.emit(format!("    BRA {lf}"));
-                        }
-                        // Only the t (cond!=0) edge feeds a phi: BZ still
-                        // jumps straight to `lf` (no copies needed there);
-                        // falling through (cond!=0) runs t's copies first.
-                        (Some(ct), None) => {
-                            g.emit(format!("    BZ {lf}"));
-                            emit_phi_copies(&mut g, &ct, doms[&b.label].contains(&bc.t));
-                            g.emit(format!("    BRA {lt}"));
-                        }
-                        // Both edges feed a phi: BZ routes to a fresh local
-                        // label that runs the f-edge's copies, so neither
-                        // edge's copies ever run on the other edge's path.
-                        (Some(ct), Some(cf)) => {
-                            let l_fcopies = g.fresh_label();
-                            g.emit(format!("    BZ {l_fcopies}"));
-                            emit_phi_copies(&mut g, &ct, doms[&b.label].contains(&bc.t));
-                            g.emit(format!("    BRA {lt}"));
-                            g.emit_label(&l_fcopies);
-                            emit_phi_copies(&mut g, &cf, doms[&b.label].contains(&bc.f));
-                            g.emit(format!("    BRA {lf}"));
+                    // The absorbed compare, when this branch is its only
+                    // consumer: lower it here so its exits are the branch
+                    // edges, skipping the 0/1 slot entirely.
+                    let fused_icmp = fused.as_deref().and_then(|dst| {
+                        b.insts.iter().find_map(|i| match i {
+                            Inst::Icmp(ic) if ic.dst == dst => Some(ic),
+                            _ => None,
+                        })
+                    });
+                    match fused_icmp {
+                        Some(c) => emit_fused_branch(
+                            &mut g,
+                            c,
+                            &lt,
+                            &lf,
+                            t_copies.as_deref(),
+                            f_copies.as_deref(),
+                            doms[&b.label].contains(&bc.t),
+                            doms[&b.label].contains(&bc.f),
+                        ),
+                        None => {
+                            // Same hazard class as `Select`'s cond (the select guard, see
+                            // `emit_inst`'s `Inst::Select` arm): `emit_load_w`'s
+                            // `Val::Const` arm emits only `MOVLW`, which does not
+                            // set the Z flag (`crates/sim/src/lib.rs`), so a
+                            // literal cond here would make `BZ` test a stale flag
+                            // from whatever came before instead of `cond`'s real
+                            // value. Fail instead of silently miscompiling.
+                            assert!(
+                                !matches!(bc.cond, Val::Const(_)),
+                                "isel-pic18: const cond BrCond not yet supported"
+                            );
+                            g.emit_load_w(&bc.cond, 0);
+                            emit_cond_branches(
+                                &mut g, &lt, &lf, &t_copies, &f_copies, b, &doms, bc,
+                            );
                         }
                     }
                 }

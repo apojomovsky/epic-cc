@@ -430,6 +430,88 @@ impl Inst {
     }
 }
 
+/// The SSA value name of a `Val` operand, or empty for a constant or global:
+/// neither is a frame local, so neither is a def key.
+pub fn val_name(v: &Val) -> String {
+    match v {
+        Val::Reg(r) => r.clone(),
+        Val::Const(_) | Val::Global(_) => String::new(),
+    }
+}
+
+/// The SSA values an instruction reads, for liveness and single-use
+/// analysis. Mirrors the operand shapes of every `Inst` variant; a value
+/// that is only defined (never read) contributes no use.
+pub fn read_vals(inst: &Inst) -> Vec<String> {
+    match inst {
+        // Load/Store pointers are canonical prefixed forms (`%x`/`@g`);
+        // strip the prefix so a local pointer matches the defs keys (a
+        // global pointer is never a def and is filtered by the caller).
+        Inst::Load(l) => vec![l.ptr.strip_prefix('%').unwrap_or(&l.ptr).to_string()],
+        Inst::Store(s) => vec![
+            s.ptr.strip_prefix('%').unwrap_or(&s.ptr).to_string(),
+            val_name(&s.val),
+        ],
+        Inst::Bin(b) => vec![val_name(&b.a), val_name(&b.b)],
+        Inst::Ret(Some((_, v)), _) => vec![val_name(v)],
+        Inst::Ret(None, _) => Vec::new(),
+        Inst::Zext(z) => vec![val_name(&z.val)],
+        Inst::Sext(s) => vec![val_name(&s.val)],
+        Inst::Trunc(t) => vec![val_name(&t.val)],
+        Inst::IntToPtr(p) => vec![val_name(&p.val)],
+        Inst::Icmp(i) => vec![val_name(&i.a), val_name(&i.b)],
+        Inst::Select(s) => vec![val_name(&s.cond), val_name(&s.a), val_name(&s.b)],
+        Inst::Call(c) => {
+            let mut vs: Vec<String> = c.args.iter().map(|a| val_name(&a.val)).collect();
+            // An indirect call's `func` is the SSA register holding the
+            // function pointer; isel reads it at dispatch time (after the
+            // args are loaded), so it is a use here. A direct call's `func`
+            // is a function name, never a def key, and is filtered by the
+            // caller.
+            if !c.callees.is_empty() {
+                vs.push(c.func.clone());
+            }
+            vs
+        }
+        Inst::Br(_) => Vec::new(),
+        Inst::BrCond(b) => vec![val_name(&b.cond)],
+        Inst::Switch(s) => vec![val_name(&s.val)],
+        Inst::Phi(p) => p.incoming.iter().map(|(v, _)| val_name(v)).collect(),
+        Inst::Gep(g) => {
+            let mut vs = Vec::new();
+            if let GepBase::Reg(r) = &g.base {
+                vs.push(r.clone());
+            }
+            vs.extend(g.terms.iter().map(|(_, r)| r.clone()));
+            vs
+        }
+        Inst::Alloca(_) => Vec::new(),
+        // va_arg reads the list slot to index the va region; va_start
+        // writes the list slot's offset.
+        Inst::VaArg(v) => vec![v.ptr.clone()],
+        Inst::VaStart(v) => vec![v.list.clone()],
+        Inst::Memcpy(m) => vec![val_name(&m.dst), val_name(&m.src)]
+            .into_iter()
+            .chain(match &m.len {
+                MemLen::Const(_) => None,
+                MemLen::Reg(v) => Some(val_name(v)),
+            })
+            .collect(),
+        Inst::Freeze(f) => vec![val_name(&f.val)],
+        Inst::FloatBin(b) => vec![val_name(&b.a), val_name(&b.b)],
+        Inst::Fcmp(c) => vec![val_name(&c.a), val_name(&c.b)],
+        Inst::FloatConv(c) => vec![val_name(&c.val)],
+        // Asm operand pointers are canonical prefixed forms (`%x`/`@g`);
+        // strip the prefix so a local operand matches the defs keys (a
+        // global operand is never a def and is filtered by the caller).
+        Inst::Asm(a) => a
+            .operands
+            .iter()
+            .map(|o| o.ptr.strip_prefix('%').unwrap_or(&o.ptr).to_string())
+            .collect(),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Block {
     pub label: String,
