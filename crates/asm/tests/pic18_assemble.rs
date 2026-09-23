@@ -353,3 +353,50 @@ fn pcltbl_straddling_table_is_padded_onto_the_next_page() {
     assert_eq!(words[0x80], 0x0E00, "dispatch follows the pad");
     assert_eq!(words[0x81] & 0xFC00, 0x2400, "the PCL write itself");
 }
+
+#[test]
+fn banksel_selects_the_symbols_bank_like_movlb() {
+    // MPASM `BANKSEL sym` (no gputils equivalent): the HAL math
+    // routines bank-select per routine (epic-cc#610). Encoded exactly
+    // like `MOVLB` with the symbol's BSR bank (bits 11:8).
+    let words =
+        assemble_pic18("    org 0x000\n    BANKSEL far\n    org 0x250\nfar:\n    NOP\n    end\n");
+    assert_eq!(words[0], 0x0102, "bank of 0x250 is 2");
+}
+
+#[test]
+fn underscore_alias_and_offset_operands_resolve() {
+    // XC8 names a C static `x` as `_x` in inline asm (epic-cc#610);
+    // multi-byte state addresses it as `_x+N`. Both resolve through
+    // the label table (plus the alias) with offset arithmetic.
+    let words =
+        assemble_pic18("foo:\n    NOP\n    MOVF _foo+1, W, A\n    MOVF foo, W, A\n    end\n");
+    assert_eq!(words[1], 0x5001, "MOVF _foo+1,W reads foo+1");
+    assert_eq!(words[2], 0x5000, "MOVF foo,W reads foo");
+}
+
+#[test]
+fn hex_offsets_split_at_the_sign_not_the_x() {
+    // `sym+0x1` must split at the `+`: the reverse scan steps over the
+    // hex `x` instead of stopping at it (epic-cc#610).
+    let words = assemble_pic18(
+        "foo:
+    NOP
+    MOVF foo+0x1, W, A
+    end\n",
+    );
+    assert_eq!(words[1], 0x5001, "MOVF foo+0x1,W reads foo+1");
+}
+
+#[test]
+fn omitted_access_bit_follows_the_file_address() {
+    // `a=0` is the access bank, `a=1` is BSR-selected (epic-cc#610):
+    // 0x20 sits in access RAM, 0xF82 (INTCON-adjacent SFR range) with SFRs.
+    let words = assemble_pic18("    CLRF 0x20\n    CLRF 0xF82\n    end\n");
+    assert_eq!(words[0], 0x6A00 | 0x20);
+    assert_eq!(words[1], 0x6A00 | 0x82);
+    // Banked GPRs default to BSR-selected so the explicit `banksel`s
+    // isel-pic18 emits keep working.
+    let words = assemble_pic18("    CLRF 0x100\n    end\n");
+    assert_eq!(words[0], 0x6A00 | 0x0100 | 0x00);
+}

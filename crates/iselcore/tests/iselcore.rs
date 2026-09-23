@@ -296,3 +296,136 @@ fn seeds_a_ptr_phi_with_param_and_self_gep_incomings() {
     assert_eq!(*k, 1);
     assert!(terms.is_empty());
 }
+
+#[test]
+fn seeds_a_ptr_phi_with_a_global_and_self_gep_arm() {
+    // The console strcmp walk (epic-cc#610): `%10 = phi ptr [%16, %14],
+    // [@lit, %5]` whose incomings are a link-time global address and a
+    // GEP over the phi's own dst (the loop increment). The global arm
+    // materializes as literals on its edge, so the phi seeds as an
+    // indirect slot exactly like the param/self-gep shape, and the
+    // self-GEP then resolves against that seed.
+    let m = parse(
+        "global lit i8\n\
+         fn scan(void) ()\n\
+           block entry:\n\
+             br loop\n\
+         block loop:\n\
+             %10 = phi ptr %16 loop @lit entry\n\
+             %16 = gep %10 +1\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("scan::10").expect("ptr phi seeds");
+    assert!(matches!(base, Base::Slot(n, true) if n == "10"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+    let (base, k, terms) = r.get("scan::16").expect("self-gep resolves");
+    assert!(matches!(base, Base::Slot(n, true) if n == "10"));
+    assert_eq!(*k, 1);
+    assert!(terms.is_empty());
+}
+
+#[test]
+fn seeds_a_ptr_phi_with_a_const_gep_and_self_gep_arm() {
+    // epic-cc#610: `%207 = phi ptr [%211, %210], [%__gepN, %193]`
+    // where `%__gepN = gep @g_line +4` is a materialized inlined-GEP
+    // arm (a link-time constant address) and `%211 = gep %207 +1` is
+    // the loop increment. The constant arm counts as a runtime address
+    // value like a bare global, so the phi seeds and the increment
+    // resolves against that seed.
+    let m = parse(
+        "global lit i8\n\
+         fn scan(void) ()\n\
+           block entry:\n\
+             br loop\n\
+         block loop:\n\
+             %g1 = gep @lit +4\n\
+             %10 = phi ptr %16 loop %g1 entry\n\
+             %16 = gep %10 +1\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("scan::10").expect("ptr phi seeds");
+    assert!(matches!(base, Base::Slot(n, true) if n == "10"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+    let (base, k, terms) = r.get("scan::16").expect("self-gep resolves");
+    assert!(matches!(base, Base::Slot(n, true) if n == "10"));
+    assert_eq!(*k, 1);
+    assert!(terms.is_empty());
+    let (base, k, terms) = r.get("scan::g1").expect("const-gep resolves");
+    assert!(matches!(base, Base::Global(n) if n == "lit"));
+    assert_eq!(*k, 4);
+    assert!(terms.is_empty());
+}
+
+#[test]
+fn seeds_a_ptr_phi_over_a_folded_select_and_self_gep() {
+    // epic-cc#610: `%256 = phi ptr [%270, %266], [%250, %244]` where
+    // `%250 = select i1 %c, @g+8, @g+7` folds to a shared base plus a
+    // cond term, and `%270 = gep %256 +1` is the loop increment. The
+    // folded select counts as a runtime address value, so the phi
+    // seeds and the increment resolves against that seed.
+    let m = parse(
+        "global g i8\n\
+         fn scan(void) ()\n\
+           block entry:\n\
+             %a = gep @g +8\n\
+             %b = gep @g +7\n\
+             br loop\n\
+         block loop:\n\
+             %s = select i1 %c, ptr %a, ptr %b\n\
+             %10 = phi ptr %16 loop %s entry\n\
+             %16 = gep %10 +1\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("scan::10").expect("ptr phi seeds");
+    assert!(matches!(base, Base::Slot(n, true) if n == "10"));
+    assert_eq!(
+        *k, 0,
+        "entry select carries no offset; the +1 lives on the loop arm"
+    );
+    assert!(terms.is_empty());
+}
+
+#[test]
+fn folds_a_select_over_const_gep_arms() {
+    let m = parse(
+        "global g i8\n\
+         fn scan(void) ()\n\
+           block entry:\n\
+             %a = gep @g +8\n\
+             %b = gep @g +7\n\
+             %s = select i1 %c, ptr %a, ptr %b\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("scan::s").expect("select folds");
+    assert!(matches!(base, Base::Global(n) if n == "g"));
+    assert_eq!(*k, 7);
+    assert_eq!(terms.len(), 1);
+    assert_eq!(terms[0].0, 1);
+}
+
+#[test]
+fn seeds_a_ptr_phi_over_a_folded_select() {
+    let m = parse(
+        "global g i8\n\
+         fn scan(void) ()\n\
+           block entry:\n\
+             %a = gep @g +8\n\
+             %b = gep @g +7\n\
+             %s = select i1 %c, ptr %a, ptr %b\n\
+             br loop\n\
+         block loop:\n\
+             %10 = phi ptr %s loop @g entry\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let (base, k, terms) = r.get("scan::10").expect("ptr phi seeds");
+    assert!(matches!(base, Base::Slot(n, true) if n == "10"));
+    assert_eq!(*k, 0);
+    assert!(terms.is_empty());
+}
