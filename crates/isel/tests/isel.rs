@@ -53,6 +53,28 @@ fn store_const_emits_movlw_not_movf() {
 }
 
 #[test]
+fn store_zero_const_emits_clrf() {
+    let m = parse(
+        "global out i16\nfn main(void) ()\n  block entry:\n    store i16 1 @out\n    ret void\n",
+    );
+    let mut addrs = HashMap::new();
+    addrs.insert("out".to_string(), 0x21u16);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(
+        asm.contains("MOVLW 0x01\n    MOVWF 0x21"),
+        "nonzero lo byte stores normally:\n{asm}"
+    );
+    assert!(
+        asm.contains("CLRF 0x22"),
+        "zero hi byte clears with one CLRF, not MOVLW 0 + MOVWF:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVWF 0x22"),
+        "no two-word zero store for the hi byte:\n{asm}"
+    );
+}
+
+#[test]
 fn add_const_lhs_uses_addlw() {
     let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %x = add i8 5, %1\n    store i8 %x @out\n    ret void\n");
     let addrs = addrs(&[
