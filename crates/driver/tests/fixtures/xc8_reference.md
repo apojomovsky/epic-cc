@@ -95,3 +95,42 @@ rest lead by 4 to 23 words. The same v4.00 license reasoning as the
 encoder row above applies: no license file present, but licenses are
 free and unlimited since July 2026, so these rows are XC8's genuine
 `-O2` output.
+
+## Whole-program ladder (epic-cc#595)
+
+XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the two large
+ladder entries, measured 2026-09-23 on the
+`epic-cc-xc8-oracle:local` image against epic-hal at `74d21c6`.
+Sources are the manifest-resolved XC8 file sets (`scripts/epic_build.py
+build --module <name> --mcu <mcu>` in that checkout), per-TU compile
+with the manifest flags (`-mcpu=<mcu> -O2` plus the triaged warning
+set) and link with `-mcpu=<mcu> -O2` only; the image wrapper supplies
+`-mdfp`. epic-cc columns quote the `size_baseline.toml` rows at
+`ca6d8b1`.
+
+| Entry | XC8 flash | XC8 RAM | epic-cc flash | epic-cc RAM | Gap (epic minus XC8) |
+|---|---|---|---|---|---|
+| `hal-pic18-menu-demo-18f4550` | 8797 (17593 B) | 599 | 12137 | 741 | +3340 flash, +142 RAM |
+| `hal-pic16-encoder-full-16f877a` | 5477 | 344 | 7071 | 329 | +1594 flash, -15 RAM |
+
+The XC8 file sets are not the vendored epic-cc input lists verbatim:
+the 21 menu-demo inputs use the `epiccc` vector, dispatch, and config
+shims plus the sim harness and a peripheral subset, none of which XC8
+accepts, so the oracle build uses the `target` vector, dispatch, and
+WDT slices, the full peripheral set, a generated config source, and
+`examples/example_menu_demo.c` (25 TUs). The encoder side differs the
+same way (`target` slices, full set, generated config, the example
+main). XC8 also links its own runtime startup, so exact parity stays
+noisy: treat the gaps as directional, not per-word bills.
+
+Program space on PIC18 reads in bytes, and the menu-demo count is odd
+(17593 B), so the word figure rounds up one half-word. The encoder row
+re-measures the older 2026-09-02 snapshot above (5356 words, same 344
+RAM bytes): +121 words of source drift since September 2 plus a
+different build image. The same v4.00 license reasoning as the rows
+above applies: no license file present, but licenses are free and
+unlimited since July 2026, so these rows are XC8's genuine `-O2`
+output. Method note: `make oracle-exec` re-demands the
+licence-gated installer through its `oracle-image` prerequisite even
+when the image is already built, so these builds ran through
+`docker run` on the existing image directly.
