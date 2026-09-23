@@ -1019,7 +1019,7 @@ def render(summary, table, args):
     clusters = summary.get("clusters")
     if clusters:
         out.append(f"By cluster, folded callees rolled into caller (top {args.top})")
-        out.append(f"  {'cluster':<36}{'words':>9}{'%':>8}  members")
+        out.append(f"  {'cluster':<36}{'words':>9}{'%':>8}")
         for root, info in sorted(clusters.items(), key=lambda kv: -kv[1]["words"])[
             : args.top
         ]:
@@ -1152,8 +1152,11 @@ def profile_text(text, args):
     )
     summary = summarize(items, total)
     if getattr(args, "inline_map", None):
-        with open(args.inline_map) as f:
-            inline_map = json.load(f)
+        try:
+            with open(args.inline_map) as f:
+                inline_map = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ProfileError(f"{args.inline_map} is not JSON: {e}")
         summary["clusters"] = cluster_summary(summary, inline_map)
     return table, summary
 
