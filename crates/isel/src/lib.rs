@@ -1283,9 +1283,11 @@ impl<'m> Gen<'m> {
     /// Copy `val` (width `ty`) into the slot starting at `dst`.
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
         for i in 0..ty.bytes() {
-            // Zero bytes clear with one CLRF, not MOVLW 0 + MOVWF: both
-            // leave Z set with C/DC untouched, and the plain emit clears
-            // w_holds, which is load-bearing since W keeps its old value.
+            // Zero bytes clear with one CLRF, not MOVLW 0 + MOVWF. The pair
+            // leaves every flag alone (MOVLW/MOVWF touch none on PIC14)
+            // while CLRF sets Z, so this is safe only where flags are dead:
+            // every call site stores outside flag-live windows, and the
+            // plain emit clears w_holds since W keeps its old value.
             if let Val::Const(k) = val {
                 if ((k >> (u32::from(i) * 8)) & 0xFF) == 0 {
                     self.emit(format!("    CLRF 0x{:02X}", dst + u16::from(i)));
