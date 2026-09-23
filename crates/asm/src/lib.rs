@@ -12,6 +12,17 @@ use device::Device;
 /// at `end`, returning the instruction lines with their word addresses,
 /// the final address (the program size in words), and the symbol table.
 /// Both cores share the same directives and word-addressed layout.
+/// Insert a label definition, plus its XC8 underscore alias: XC8
+/// addresses a C static `x` as `_x` in inline asm, sharing one asm
+/// namespace, so `_x` resolves to `x` unless `_x` is itself defined
+/// (an explicit definition always wins via `or_insert`).
+fn insert_label(symbols: &mut std::collections::HashMap<String, usize>, name: &str, addr: usize) {
+    symbols.insert(name.to_string(), addr);
+    if !name.starts_with('_') {
+        symbols.entry(format!("_{name}")).or_insert(addr);
+    }
+}
+
 fn assemble_first_pass(
     src: &str,
 ) -> (
@@ -54,7 +65,7 @@ fn assemble_first_pass(
             let label = line[..colon].trim();
             let rest = line[colon + 1..].trim();
             if !label.is_empty() && !label.contains(' ') && !label.contains('\t') {
-                symbols.insert(label.to_string(), org);
+                insert_label(&mut symbols, label, org);
                 if rest.is_empty() {
                     continue;
                 }
@@ -64,13 +75,14 @@ fn assemble_first_pass(
             }
         }
         if let Some(label) = line.strip_suffix(':') {
-            symbols.insert(label.trim().to_string(), org);
+            insert_label(&mut symbols, label.trim(), org);
             continue;
         }
         if let Some(eq) = line.find(" equ ") {
             let (name, val) = line.split_at(eq);
-            symbols.insert(
-                name.trim().to_string(),
+            insert_label(
+                &mut symbols,
+                name.trim(),
                 parse_num(val[" equ ".len()..].trim()),
             );
             continue;
@@ -226,12 +238,12 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         let mut org = 0usize; // byte address
         for line in lines {
             if line.strip_suffix(':').is_some() {
-                symbols.insert(line.trim_end_matches(':').to_string(), org);
+                insert_label(&mut symbols, line.trim_end_matches(':'), org);
             } else if let Some(rest) = line.strip_prefix("equ ") {
                 let mut it = rest.splitn(2, char::is_whitespace);
                 let name = it.next().unwrap().to_string();
                 let val = it.next().unwrap_or("");
-                symbols.insert(name, parse_num(val.trim()));
+                insert_label(&mut symbols, &name, parse_num(val.trim()));
             } else if let Some(rest) = line.strip_prefix("org ") {
                 org = parse_num(rest.trim());
             } else if line.to_ascii_lowercase().starts_with("db ") {
@@ -503,10 +515,22 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
 }
 
 /// Parse a PIC18 byte/bit-oriented operand's `f` field (the first
-/// comma-separated token after the mnemonic).
+/// comma-separated token after the mnemonic). Plain symbols (with the
+/// XC8 underscore alias and `sym+N` offsets) resolve through the
+/// symbol table; `LOW(`/`HIGH(` forms keep the literal reader.
+/// Raw (unmasked) file address behind `rest`'s first operand: the access-bit
+/// default needs the full bank, the 8-bit `f` field does not carry it.
+fn file_addr(rest: &str, symbols: &std::collections::HashMap<String, usize>) -> usize {
+    let tok = rest.split(',').next().unwrap().trim();
+    if tok.contains('(') {
+        parse_lit(tok, symbols)
+    } else {
+        sym_addr(symbols, tok)
+    }
+}
+
 fn parse_f_field(rest: &str, symbols: &std::collections::HashMap<String, usize>) -> u16 {
-    let f = parse_lit(rest.split(',').next().unwrap().trim(), symbols);
-    (f & 0xFF) as u16
+    (file_addr(rest, symbols) & 0xFF) as u16
 }
 
 fn parse_a_bit(rest: &str) -> u16 {
@@ -514,6 +538,24 @@ fn parse_a_bit(rest: &str) -> u16 {
         "A" => 0,
         "B" => 1,
         other => panic!("asm(pic18): expected A or B, got {other}"),
+    }
+}
+
+/// The access bit at `ops[idx]`, derived from the file address when omitted:
+/// `a=0` is the access bank, `a=1` is BSR-selected. Inside the access bank
+/// (access RAM `0x000-0x05F`, SFRs `0xF60-0xFFF`) the omitted bit means
+/// direct (`0`); everywhere else it means BSR-selected (`1`), matching the
+/// explicit `banksel`s isel-pic18 emits around banked accesses (epic-cc#610).
+fn parse_a_bit_opt(ops: &[&str], idx: usize, f: usize) -> u16 {
+    match ops.get(idx) {
+        Some(s) => parse_a_bit(s),
+        None => {
+            if f < 0x60 || f >= 0xF60 {
+                0
+            } else {
+                1
+            }
+        }
     }
 }
 
@@ -548,7 +590,7 @@ fn encode_pic18(
         | "SUBFWB" | "SUBWF" | "SUBWFB" | "SWAPF" | "XORWF" => {
             let f = parse_f_field(rest, symbols);
             let d = parse_d_bit(ops[1]);
-            let a = parse_a_bit(ops[2]);
+            let a = parse_a_bit_opt(&ops, 2, file_addr(rest, symbols));
             let base: u16 = match mne.as_str() {
                 "ADDWF" => 0x2400,
                 "ADDWFC" => 0x2000,
@@ -578,7 +620,7 @@ fn encode_pic18(
         "CLRF" | "CPFSEQ" | "CPFSGT" | "CPFSLT" | "MOVWF" | "MULWF" | "NEGF" | "SETF"
         | "TSTFSZ" => {
             let f = parse_f_field(rest, symbols);
-            let a = parse_a_bit(ops[1]);
+            let a = parse_a_bit_opt(&ops, 1, file_addr(rest, symbols));
             let base: u16 = match mne.as_str() {
                 "CLRF" => 0x6A00,
                 "CPFSEQ" => 0x6200,
@@ -599,7 +641,7 @@ fn encode_pic18(
                 .parse()
                 .unwrap_or_else(|_| panic!("asm(pic18): bad bit number {}", ops[1]));
             assert!(b <= 7, "asm(pic18): bit number {b} out of range 0-7");
-            let a = parse_a_bit(ops[2]);
+            let a = parse_a_bit_opt(&ops, 2, file_addr(rest, symbols));
             let base: u16 = match mne.as_str() {
                 "BCF" => 0x9000,
                 "BSF" => 0x8000,
@@ -647,6 +689,17 @@ fn encode_pic18(
         "MOVLB" => {
             let k = (parse_lit(rest, symbols) & 0xF) as u16;
             vec![0x0100 | k]
+        }
+        "BANKSEL" => {
+            // MPASM pseudo-op (no gputils equivalent): select the bank
+            // containing `sym`, encoded exactly like the `MOVLB` above.
+            // HAL math routines use it per routine (epic-cc#610); the
+            // symbol table holds byte addresses, BSR is bits 11:8.
+            let addr = *symbols
+                .get(rest)
+                .unwrap_or_else(|| panic!("asm(pic18): undefined symbol {rest}"))
+                as u16;
+            vec![0x0100 | ((addr >> 8) & 0xF)]
         }
         "BZ" | "BNZ" | "BC" | "BNC" | "BOV" | "BNOV" | "BN" | "BNN" => {
             let target = *symbols
@@ -760,6 +813,43 @@ pub fn assemble_file_to_hex(device: &Device, src: &str) -> String {
     to_hex(&assemble_words(device, src))
 }
 
+/// Resolve a file-register operand: a plain symbol, or `sym+N` / `sym-N`
+/// with a decimal or hex offset (the `_m_a+1` shape hand-written math
+/// routines use for multi-byte state). A bare number keeps the old
+/// `parse_num` behavior; anything else panics loudly.
+fn sym_addr(sym: &std::collections::HashMap<String, usize>, tok: &str) -> usize {
+    let t = tok.trim_end_matches(',');
+    if let Some(&v) = sym.get(t) {
+        return v;
+    }
+    // Split a trailing `+N` / `-N`, where `N` is decimal or `0x`-hex:
+    // scan from the end past hex digits, stepping over the `x` of a
+    // `0x` offset so `sym+0x1` still splits at the `+` (epic-cc#610).
+    let mut cut = None;
+    for (i, c) in t.char_indices().rev() {
+        if c == '+' || c == '-' {
+            cut = Some((i, c));
+            break;
+        }
+        if c == 'x' || c == 'X' {
+            continue;
+        }
+        if !c.is_ascii_hexdigit() {
+            break;
+        }
+    }
+    if let Some((i, op)) = cut {
+        let (name, off) = (&t[..i], &t[i + 1..]);
+        if let (Some(&base), Some(n)) = (sym.get(name), parse_num_opt(off)) {
+            return if op == '+' { base + n } else { base - n };
+        }
+    }
+    if let Some(n) = parse_num_opt(t) {
+        return n;
+    }
+    panic!("asm: unresolvable file operand {t:?}");
+}
+
 fn parse_num(s: &str) -> usize {
     if let Some(h) = s.strip_prefix("0x") {
         usize::from_str_radix(h, 16).unwrap()
@@ -835,7 +925,7 @@ fn encode(line: &str, sym: &std::collections::HashMap<String, usize>) -> u16 {
         let t = s.trim_end_matches(',');
         let v = match sym.get(t) {
             Some(&v) => v,
-            None => parse_num(t),
+            None => sym_addr(sym, t),
         };
         assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
         v as u16 & 0x7F
@@ -929,7 +1019,7 @@ fn encode_pic14e(addr: usize, line: &str, sym: &std::collections::HashMap<String
         let t = s.trim_end_matches(',');
         let v = match sym.get(t) {
             Some(&v) => v,
-            None => parse_num(t),
+            None => sym_addr(sym, t),
         };
         assert!(v <= 0x7F, "asm: file register 0x{v:02X} out of range");
         v as u16 & 0x7F
@@ -1067,7 +1157,7 @@ fn encode_pic_baseline(line: &str, sym: &std::collections::HashMap<String, usize
         let t = s.trim_end_matches(',');
         let v = match sym.get(t) {
             Some(&v) => v,
-            None => parse_num(t),
+            None => sym_addr(sym, t),
         };
         assert!(
             v <= 0x1F,

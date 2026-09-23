@@ -217,13 +217,106 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
             }
         }
     }
-    // Pointer-typed phis whose every incoming is a runtime-address value
-    // (a `Const` literal address or a register already seeded as a runtime
-    // slot) are runtime addresses themselves: phi elimination copies the
-    // incoming's two bytes into the dst slot per edge, so the dst can
-    // dereference indirectly. A phi with any compile-time (folded) arm
-    // stays pending for the unresolvable-chain panic below: its bytes do
-    // not live in a slot.
+    /// Try seeding one pointer-typed phi (`phi ptr [...]`) as an indirect
+    /// slot: succeeds when every incoming is a runtime-address value.
+    /// Accepted arms: `Const`/`Global` link-time addresses; regs already
+    /// seeded as address slots (indirect slots outright, plain slots only
+    /// for pointer params whose slot holds the address); regs resolving to
+    /// a folded global base (literals plus dynamic terms move per edge, and
+    /// SSA dominance keeps every term live on the incoming edge); a GEP
+    /// over the phi's own dst (the loop-carried increment, resolved
+    /// against this seed by the GEP fixpoint); a link-time-constant GEP
+    /// over a global; or a select that folds right now. Anything else
+    /// (notably a folded dynamic GEP reg) stays pending for the
+    /// unresolvable-chain panic. Returns true when it seeded.
+    fn seed_phi(
+        f: &ir::Func,
+        fname: &str,
+        p: &ir::Phi,
+        geps: &HashMap<String, ir::Gep>,
+        selects: &HashMap<String, ir::Select>,
+        resolved: &mut PtrResolution,
+    ) -> bool {
+        // Only a pointer-typed phi (`phi ptr [...]`) is a pointer VALUE; a
+        // plain i16 value phi (clang emits `phi i8`/`phi i16` for value
+        // merges everywhere) must never be seeded as an indirect slot.
+        if !p.ptr {
+            return false;
+        }
+        let key = ssa_key(fname, &p.dst);
+        if resolved.contains_key(&key) {
+            return false;
+        }
+        // A qualifying reg is one already seeded as a runtime-address slot
+        // (`Base::Slot(_, true)` with any offset: its bytes live in a slot
+        // the phi copy can move, folding k/terms onto them) or a plain
+        // pointer PARAM (whose slot holds the address, `Base::Slot(_,
+        // false)` per the ADR-009 ptr-param seeding).
+        let param_holds_addr = |n: &str| f.params.iter().any(|p| p.name == *n && p.ptr);
+        let self_gep = |r: &str| {
+            // A GEP over the phi's own dst is the loop-carried pointer
+            // increment (`%18 = gep %7 +1` feeding `%7 = phi ptr [%18,
+            // %5]`): its address bytes are the phi slot's bytes plus
+            // k/terms, so it is a runtime address value once the phi seeds
+            // as an indirect slot (the GEP fixpoint then resolves it
+            // against that seed).
+            matches!(
+                geps.get(&ssa_key(fname, r)),
+                Some(g) if g.base == ir::GepBase::Reg(p.dst.clone())
+            )
+        };
+        let const_gep = |r: &str| {
+            // A materialized GEP over a global with no dynamic terms is a
+            // link-time constant address (an inlined `getelementptr` phi
+            // arm): phi elimination moves its bytes as literals, so it
+            // counts as a runtime address value like a bare global.
+            matches!(
+                geps.get(&ssa_key(fname, r)),
+                Some(g)
+                    if matches!(g.base, ir::GepBase::Global(_))
+                        && g.terms.is_empty()
+            )
+        };
+        // A select arm that folds right now (shared link-time base,
+        // evaluated on demand because select folding otherwise runs after
+        // phi seeding): its bytes move as literals plus dynamic terms,
+        // like any folded global base.
+        let foldable_select = |r: &str| -> bool {
+            match selects.get(&ssa_key(fname, r)) {
+                Some(s) => matches!(
+                    fold_select(s, resolved, fname, geps),
+                    Some((Base::Global(_), _, _))
+                ),
+                None => false,
+            }
+        };
+        let runtime = p.incoming.iter().all(|(v, _)| match v {
+            ir::Val::Const(_) | ir::Val::Global(_) => true,
+            ir::Val::Reg(r) => match resolved.get(&ssa_key(fname, r)) {
+                // An indirect slot holds address bytes; the edge copy
+                // folds any k/terms onto them (or panics precisely where
+                // the move shape is unsupported).
+                Some((Base::Slot(_, true), _, _)) => true,
+                Some((Base::Slot(n, false), _, _)) if param_holds_addr(n) => true,
+                // A folded global base (a folded select or GEP over a
+                // global): phi elimination moves its bytes as literals
+                // plus dynamic terms, and SSA dominance keeps every term
+                // live on the incoming edge by construction.
+                Some((Base::Global(_), _, _)) => true,
+                _ => self_gep(r) || const_gep(r) || foldable_select(r),
+            },
+        });
+        if runtime && !p.incoming.is_empty() {
+            resolved.insert(key, (Base::Slot(p.dst.clone(), true), 0, Vec::new()));
+            return true;
+        }
+        false
+    }
+
+    // Pointer-typed phis seed as indirect slots when every
+    // incoming is a runtime-address value (see `seed_phi`); the GEP
+    // fixpoint below re-runs seeding to convergence for chains that
+    // only resolve across passes (a phi feeding a GEP feeding a phi).
     for f in &m.funcs {
         let fname = f.name.clone();
         let mut progressed = true;
@@ -232,54 +325,7 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
             for b in &f.blocks {
                 for i in &b.insts {
                     if let Inst::Phi(p) = i {
-                        // Only a pointer-typed phi (`phi ptr [...]`) is a
-                        // pointer VALUE; a plain i16 value phi (clang emits
-                        // `phi i8`/`phi i16` for value merges everywhere)
-                        // must never be seeded as an indirect slot.
-                        if !p.ptr {
-                            continue;
-                        }
-                        let key = ssa_key(&fname, &p.dst);
-                        if resolved.contains_key(&key) {
-                            continue;
-                        }
-                        // A qualifying reg is one already seeded as a
-                        // runtime-address slot (`Base::Slot(_, true)` with
-                        // no offset) or a plain pointer PARAM (whose slot
-                        // holds the address, `Base::Slot(_, false)` per the
-                        // ADR-009 ptr-param seeding): its bytes live in a
-                        // slot the phi copy can move. A folded
-                        // (compile-time) pointer reg has no slot and cannot
-                        // be an incoming here.
-                        let param_holds_addr =
-                            |n: &str| f.params.iter().any(|p| p.name == *n && p.ptr);
-                        let self_gep = |r: &str| {
-                            // A GEP over the phi's own dst is the
-                            // loop-carried pointer increment (`%18 = gep
-                            // %7 +1` feeding `%7 = phi ptr [%18, %5]`):
-                            // its address bytes are the phi slot's bytes
-                            // plus k/terms, so it is a runtime address
-                            // value once the phi seeds as an indirect slot
-                            // (the GEP fixpoint then resolves it against
-                            // that seed).
-                            matches!(
-                                geps.get(&ssa_key(&fname, r)),
-                                Some(g) if g.base == ir::GepBase::Reg(p.dst.clone())
-                            )
-                        };
-                        let runtime = p.incoming.iter().all(|(v, _)| match v {
-                            ir::Val::Const(_) => true,
-                            ir::Val::Reg(r) => match resolved.get(&ssa_key(&fname, r)) {
-                                Some((Base::Slot(_, true), 0, t)) if t.is_empty() => true,
-                                Some((Base::Slot(n, false), 0, t)) if t.is_empty() => {
-                                    param_holds_addr(n)
-                                }
-                                _ => self_gep(r),
-                            },
-                            ir::Val::Global(_) => false,
-                        });
-                        if runtime && !p.incoming.is_empty() {
-                            resolved.insert(key, (Base::Slot(p.dst.clone(), true), 0, Vec::new()));
+                        if seed_phi(f, &fname, p, &geps, &selects, &mut resolved) {
                             progressed = true;
                         }
                     }
@@ -356,6 +402,16 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
             .filter(|(k, _)| k.starts_with(&format!("{fname}::")))
             .map(|(k, s)| (k.clone(), s.clone()))
             .collect();
+        let mut pending_phis: Vec<(String, ir::Phi)> = Vec::new();
+        for b in &f.blocks {
+            for i in &b.insts {
+                if let Inst::Phi(p) = i {
+                    if p.ptr {
+                        pending_phis.push((ssa_key(&fname, &p.dst), p.clone()));
+                    }
+                }
+            }
+        }
         let mut progressed = true;
         while progressed {
             progressed = false;
@@ -414,7 +470,7 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                 if matches!((&s.a, &s.b), (ir::Val::Const(_), ir::Val::Const(_))) {
                     continue;
                 }
-                if let Some(folded) = fold_select(&s, &resolved, &fname) {
+                if let Some(folded) = fold_select(&s, &resolved, &fname, &geps) {
                     assert!(
                         !resolved.contains_key(&key),
                         "iselcore: duplicate definition of pointer reg {key}"
@@ -435,6 +491,27 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                 }
             }
             pending_selects = rest_selects;
+            // Phi seeding joins the fixpoint: a phi whose arms resolve
+            // across passes (a phi feeding a GEP feeding a phi) seeds
+            // here once its arms do, and its seed unblocks the GEPs
+            // over it next round.
+            let mut rest_phis = Vec::new();
+            for (key, p) in pending_phis {
+                if resolved.contains_key(&key) {
+                    continue;
+                }
+                if seed_phi(f, &fname, &p, &geps, &selects, &mut resolved) {
+                    progressed = true;
+                    continue;
+                }
+                rest_phis.push((key, p));
+            }
+            pending_phis = rest_phis;
+            // Pending phis stay out of the stall check on purpose: dead or
+            // value-only phis (e.g. strchr's in the cc2 fixture) never seed
+            // and isel never queries them, so stalling on them would fail
+            // working programs. A phi that IS used but never seeds still
+            // panics downstream at isel with its precise "no resolved base".
             if !progressed && (!pending.is_empty() || !pending_selects.is_empty()) {
                 let gnames: Vec<&str> = pending.iter().map(|(k, _)| k.as_str()).collect();
                 let snames: Vec<&str> = pending_selects.iter().map(|(k, _)| k.as_str()).collect();
@@ -456,10 +533,29 @@ fn fold_select(
     s: &ir::Select,
     resolved: &PtrResolution,
     fname: &str,
+    geps: &HashMap<String, ir::Gep>,
 ) -> Option<(Base, u16, Vec<(u16, String)>)> {
+    // A materialized GEP over a global with no dynamic terms is a
+    // link-time constant address (an inlined-`getelementptr` select
+    // arm): fold it as its base plus offset instead of waiting for
+    // the GEP fixpoint, which runs after select folding.
+    let const_gep = |r: &str| -> Option<(Base, u16, Vec<(u16, String)>)> {
+        match geps.get(&ssa_key(fname, r)) {
+            Some(g) if matches!(g.base, ir::GepBase::Global(_)) && g.terms.is_empty() => {
+                match &g.base {
+                    ir::GepBase::Global(n) => Some((Base::Global(n.clone()), g.k, Vec::new())),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    };
     let arm = |v: &ir::Val| -> Option<(Base, u16, Vec<(u16, String)>)> {
         match v {
-            ir::Val::Reg(r) => resolved.get(&ssa_key(fname, r)).cloned(),
+            ir::Val::Reg(r) => resolved
+                .get(&ssa_key(fname, r))
+                .cloned()
+                .or_else(|| const_gep(r)),
             ir::Val::Global(g) => Some((Base::Global(g.clone()), 0, Vec::new())),
             _ => None,
         }

@@ -738,11 +738,11 @@ impl<'m> Gen<'m> {
                 // own arm, mirroring `emit_move_addr_to_slot`'s above plus
                 // the slot case's k/terms folding. (epic-cc#193)
                 if let iselcore::Base::Global(name) = &base {
-                    assert!(
-                        k == 0 || terms.is_empty(),
-                        "isel-pic18: GEP with both k and terms not supported in move"
-                    );
-                    let addr = self.global_addr(name).wrapping_add(k as u16);
+                    // k and terms compose freely here: the `[]` arm folds
+                    // k into the literal, `[(1, reg)]` adds the term
+                    // onto it, and anything else seeds FSR0 with the
+                    // full address below (epic-cc#610).
+                    let addr = self.global_addr(name).wrapping_add(k);
                     for i in 0..ty.bytes() {
                         let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
                         match terms.as_slice() {
@@ -882,6 +882,18 @@ impl<'m> Gen<'m> {
                 // `store ptr @g, ...` or a pointer phi incoming; clang
                 // always loads scalar globals first): materialize it as two
                 // literals, never copy the pointee's contents. (epic-cc#155)
+                // A const (flash) global has no RAM address: its table
+                // label is the link-time literal, like a function above.
+                if self.global_is_const(g) {
+                    for i in 0..ty.bytes() {
+                        let lit = if i == 0 { "LOW" } else { "HIGH" };
+                        self.emit(format!("    MOVLW {lit}({g})"));
+                        let (a, f) = self.operand(dst + u16::from(i));
+                        let bank = if a == 0 { "A" } else { "B" };
+                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                    }
+                    return;
+                }
                 let addr = self.global_addr(g);
                 for i in 0..ty.bytes() {
                     let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
@@ -6186,6 +6198,38 @@ pub fn select_with_locs(
         "".to_string(),
     ]);
     locs.extend(std::iter::repeat(None).take(8));
+    // RAM globals as `equ` names so hand-written inline asm can reference
+    // them XC8-style (`movf _m_a+0,w`): the assembler aliases `_x` to `x`
+    // and evaluates `sym+N`, so no label emission is needed (epic-cc#610).
+    // Sorted for deterministic output; consts keep their table labels.
+    let mut ram_globals: Vec<(&String, &u16)> = m
+        .globals
+        .iter()
+        .filter(|g| !g.is_const)
+        .filter_map(|g| addrs.get(&g.name).map(|a| (&g.name, a)))
+        .collect();
+    ram_globals.sort();
+    for (name, addr) in ram_globals {
+        // A RAM global sharing a fixed SFR name would silently resolve to
+        // the wrong address either way; fail loudly instead (epic-cc#610).
+        if matches!(name.as_str(), "STATUS" | "PRODL" | "PRODH" | "INTCON") {
+            panic!("isel-pic18: global {name} collides with a fixed SFR name");
+        }
+        out.push(format!("{name} equ 0x{addr:03X}"));
+        locs.push(None);
+    }
+    // Core SFR names used by hand-written math asm (`movf PRODL,w`):
+    // PRODL/PRODH/STATUS sit at architecture-fixed addresses on every
+    // PIC18 (DS39632E Table 5-2), so they are literals here, not device
+    // data. INTCON above stays as the historical first equ.
+    for (name, addr) in [
+        ("STATUS", 0xFD8u16),
+        ("PRODL", 0xFF3u16),
+        ("PRODH", 0xFF4u16),
+    ] {
+        out.push(format!("{name} equ 0x{addr:03X}"));
+        locs.push(None);
+    }
     if !m.module_asm.is_empty() {
         out.push("; module asm".to_string());
         locs.push(None);
