@@ -1,5 +1,5 @@
 /* Invariant struct fields reloaded across a call sequence.
- * Menu-demo triage (epic-cc#624): gpio4_send (546 vs XC8 291) reads
+ * Menu-demo triage (epic-cc#624): gpio4_send (546 words) reads
  * the same pin-map fields about twelve times through a context
  * pointer, once per WritePin call, instead of hoisting them into
  * temporaries; EPIC_USART_Init and menu_demo_task_ui reload handle

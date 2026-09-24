@@ -2,9 +2,10 @@
 """Render SIZE_REPORT.md from measured sizes plus reference snapshots.
 
 Reads the JSON dump `size_regression_e2e.rs` prints under SIZE_REPORT_JSON=1,
-the checked-in size baseline, an XC8 snapshot (refreshed by
-size-refresh-xc8.py when the oracle image is present), and optionally a
-density-profile --json run with clusters, and writes the ladder report.
+the checked-in size baseline, optionally a density-profile --json run
+with clusters, and writes the ladder report. The XC8 snapshot is optional
+and lives in the private epic-benchmarks repo: XC8 benchmark results are
+licence-confidential (ADR-006), so the public report omits XC8 columns.
 
 Pure rendering: every number is measured elsewhere, nothing is compiled
 here. Run through `make size-report`, which gathers the inputs first.
@@ -84,7 +85,7 @@ def micro_rows(sizes, baseline, xc8):
         base = baseline.get(entry["name"], {})
         # Every XC8 row was measured on 18F4550; other devices get no
         # join rather than a wrong one (struct-scan runs on both cores).
-        if entry["device"] == "18F4550":
+        if xc8 is not None and entry["device"] == "18F4550":
             ref = xc8["benches"].get(stem(entry["name"]), {})
             xdate = ref.get("measured", "n/a")
         else:
@@ -115,7 +116,7 @@ def program_rows(sizes, baseline, xc8):
         if entry["name"].startswith("bench-"):
             continue
         base = baseline.get(entry["name"], {})
-        ref = xc8["programs"].get(entry["name"], {})
+        ref = xc8["programs"].get(entry["name"], {}) if xc8 is not None else {}
         rows.append(
             {
                 "name": entry["name"],
@@ -130,6 +131,22 @@ def program_rows(sizes, baseline, xc8):
                     entry["flash_words"] - ref["flash"] if "flash" in ref else "n/a"
                 ),
                 "xprov": ref.get("provenance", "no XC8 counterpart"),
+            }
+        )
+    return rows
+
+
+def own_cluster_rows(density):
+    """Top clusters by listing words, epic-cc side only."""
+    clusters = density.get("clusters", {})
+    ranked = sorted(clusters.items(), key=lambda kv: -kv[1].get("words", 0))
+    rows = []
+    for root, info in ranked[:CLUSTER_CAP]:
+        folded = info.get("folded", [])
+        rows.append(
+            {
+                "cluster": root + (f" +{len(folded)} folded" if folded else ""),
+                "ours": info.get("words", 0),
             }
         )
     return rows
@@ -195,18 +212,24 @@ def render(args, sizes, density, baseline, xc8):
     out = []
     out.append("# Size ladder report")
     out.append("")
-    out.append(
+    intro = (
         "Generated from the tree, not by hand. Every epic-cc number below "
-        "was measured by `size_regression_e2e.rs` on this commit; XC8 "
-        "numbers quote the snapshot unless the oracle image was present."
+        "was measured by `size_regression_e2e.rs` on this commit"
     )
+    if xc8 is not None:
+        intro += "; XC8 numbers quote the snapshot unless the oracle image was present."
+    else:
+        intro += "."
+    out.append(intro)
     out.append("")
     out.append(f"- Date (UTC): {args.date}")
     out.append(f"- Commit: {args.sha}")
     out.append(f"- Baseline: {args.baseline} (checked in)")
-    out.append(
-        f"- XC8 snapshot: measured {xc8.get('generated', 'unknown')} ({args.oracle})"
-    )
+    if xc8 is not None:
+        out.append(
+            f"- XC8 snapshot: measured {xc8.get('generated', 'unknown')} "
+            f"({args.oracle})"
+        )
     if density is not None:
         out.append(
             f"- Menu-demo listing: {density['total_words']:.0f} words "
@@ -216,48 +239,58 @@ def render(args, sizes, density, baseline, xc8):
     out.append("")
     out.append("## Micro benches (flash / RAM)")
     out.append("")
-    out.append(
-        "| bench | device | epic-cc flash | epic-cc RAM | "
-        "vs baseline | XC8 flash | XC8 RAM | gap | XC8 measured |"
-    )
-    out.append("|---|---|---|---|---|---|---|---|---|")
+    head = "| bench | device | epic-cc flash | epic-cc RAM | vs baseline |"
+    rule = "|---|---|---|---|---|"
+    if xc8 is not None:
+        head += " XC8 flash | XC8 RAM | gap | XC8 measured |"
+        rule += "---|---|---|---|"
+    out.append(head)
+    out.append(rule)
     for row in micro_rows(sizes, baseline, xc8):
-        gap = f"{row['gap']:+d}" if isinstance(row["gap"], int) else row["gap"]
-        out.append(
+        line = (
             f"| {row['bench']} | {row['device']} | {row['flash']} | "
-            f"{row['ram']} | {row['dflash']} / {row['dram']} | "
-            f"{row['xflash']} | {row['xram']} | {gap} | {row['xdate']} |"
+            f"{row['ram']} | {row['dflash']} / {row['dram']} |"
         )
+        if xc8 is not None:
+            gap = f"{row['gap']:+d}" if isinstance(row["gap"], int) else row["gap"]
+            line += f" {row['xflash']} | {row['xram']} | {gap} | {row['xdate']} |"
+        out.append(line)
     out.append("")
-    out.append(
-        "Negative gap means epic-cc is smaller. `vs baseline` is flash / "
-        "RAM delta against the checked-in pins."
-    )
+    note = "`vs baseline` is flash / RAM delta against the checked-in pins."
+    if xc8 is not None:
+        note = "Negative gap means epic-cc is smaller. " + note
+    out.append(note)
     out.append("")
     out.append("## Whole programs (flash / RAM)")
     out.append("")
-    out.append(
-        "| program | device | epic-cc flash | epic-cc RAM | "
-        "vs baseline | XC8 flash | XC8 RAM | gap | XC8 provenance |"
-    )
-    out.append("|---|---|---|---|---|---|---|---|---|")
+    head = "| program | device | epic-cc flash | epic-cc RAM | vs baseline |"
+    rule = "|---|---|---|---|---|"
+    if xc8 is not None:
+        head += " XC8 flash | XC8 RAM | gap | XC8 provenance |"
+        rule += "---|---|---|---|"
+    out.append(head)
+    out.append(rule)
     for row in program_rows(sizes, baseline, xc8):
-        gap = f"{row['gap']:+d}" if isinstance(row["gap"], int) else row["gap"]
-        out.append(
+        line = (
             f"| {row['name']} | {row['device']} | {row['flash']} | "
-            f"{row['ram']} | {row['dflash']} / {row['dram']} | "
-            f"{row['xflash']} | {row['xram']} | {gap} | {row['xprov']} |"
+            f"{row['ram']} | {row['dflash']} / {row['dram']} |"
         )
+        if xc8 is not None:
+            gap = f"{row['gap']:+d}" if isinstance(row["gap"], int) else row["gap"]
+            line += f" {row['xflash']} | {row['xram']} | {gap} | {row['xprov']} |"
+        out.append(line)
     out.append("")
     if density is not None:
         for key in ("total_words", "categories"):
             if key not in density:
                 raise SystemExit(f"size-report: density profile is missing {key!r}")
         menu = menu_entry(sizes)
-        program = xc8.get("programs", {}).get("hal-pic18-menu-demo-18f4550")
-        if program is None:
-            raise SystemExit("size-report: snapshot has no menu-demo program row")
-        sim = program.get("sim_xc8")
+        sim = None
+        if xc8 is not None:
+            program = xc8.get("programs", {}).get("hal-pic18-menu-demo-18f4550")
+            if program is None:
+                raise SystemExit("size-report: snapshot has no menu-demo program row")
+            sim = program.get("sim_xc8")
         out.append("## Menu-demo clusters (listing words)")
         out.append("")
         if sim:
@@ -274,13 +307,19 @@ def render(args, sizes, density, baseline, xc8):
                 f"same merge `docs/43-menu-triage-findings.md` does by hand)."
             )
             out.append("")
-        out.append("| cluster | ours | XC8 | ratio | gap |")
-        out.append("|---|---|---|---|---|")
-        for row in cluster_rows(density, xc8):
-            out.append(
-                f"| {row['cluster']} | {row['ours']:.0f} | {row['xc8']} | "
-                f"{row['ratio']} | {row['gap']} |"
-            )
+        if xc8 is not None:
+            out.append("| cluster | ours | XC8 | ratio | gap |")
+            out.append("|---|---|---|---|---|")
+            for row in cluster_rows(density, xc8):
+                out.append(
+                    f"| {row['cluster']} | {row['ours']:.0f} | {row['xc8']} | "
+                    f"{row['ratio']} | {row['gap']} |"
+                )
+        else:
+            out.append("| cluster | ours |")
+            out.append("|---|---|")
+            for row in own_cluster_rows(density):
+                out.append(f"| {row['cluster']} | {row['ours']:.0f} |")
         out.append("")
         out.append("Top profiler categories on the same listing:")
         out.append("")
@@ -298,11 +337,9 @@ def render(args, sizes, density, baseline, xc8):
     out.append("")
     out.append(
         "The target recompiles every ladder case through the real driver, "
-        "rebuilds the menu-demo listing for the cluster table, refreshes "
-        "the XC8 bench rows when the oracle image exists, and rewrites "
-        "this file. XC8 whole-program and cluster rows stay snapshot "
-        "quotes: they need different file sets and a manual `.map` join, "
-        "so refreshing them is a deliberate act, not a side effect."
+        "rebuilds the menu-demo listing for the cluster table, and rewrites "
+        "this file. XC8 comparisons render from the private epic-benchmarks "
+        "repo through this same script."
     )
     out.append("")
     return "\n".join(out)
@@ -326,10 +363,10 @@ def main(argv=None):
     parser.add_argument("--sizes", required=True, help="sizes JSON from the test")
     parser.add_argument("--density", help="density-profile --json with clusters")
     parser.add_argument("--baseline", required=True, help="size_baseline.toml")
-    parser.add_argument("--xc8", required=True, help="XC8 snapshot JSON")
+    parser.add_argument("--xc8", help="XC8 snapshot JSON (private runs only)")
     parser.add_argument("--sha", required=True, help="commit sha stamped")
     parser.add_argument("--date", required=True, help="UTC date stamped")
-    parser.add_argument("--oracle", required=True, help="oracle status stamped")
+    parser.add_argument("--oracle", default="", help="oracle status stamped")
     parser.add_argument("--out", required=True, help="report path to write")
     parser.add_argument("--asm-inputs", help="built listing inputs, drift-checked")
     args = parser.parse_args(argv)
@@ -337,7 +374,7 @@ def main(argv=None):
     if args.asm_inputs:
         check_asm_inputs(sizes, args.asm_inputs)
     baseline = parse_baseline(pathlib.Path(args.baseline).read_text())
-    xc8 = load_json(args.xc8, "XC8 snapshot")
+    xc8 = load_json(args.xc8, "XC8 snapshot") if args.xc8 else None
     density = None
     if args.density:
         density = load_json(args.density, "density profile")

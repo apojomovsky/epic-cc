@@ -14,8 +14,8 @@ minimal at the searched bound, 32-bit amount 4-5 verified and losing
 (deliberately not landed), the amount-7 byte-move form proven unsound.
 The current menu-demo baseline lives in
 `crates/driver/tests/fixtures/size_baseline.toml`.
-XC8 reference numbers live in
-`crates/driver/tests/fixtures/xc8_reference.md` (one snapshot row).
+XC8 reference numbers live in the private epic-benchmarks repo
+(benchmark results are licence-confidential, ADR-006).
 
 ## Non-goals
 

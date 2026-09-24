@@ -109,7 +109,7 @@ ranked by words, optionally against an XC8 reference count.
 
 ```bash
 epic-cc --target 18F4550 --emit asm -o out.asm src/*.c
-python3 scripts/density-profile.py out.asm --xc8-words 9068 --show-other
+python3 scripts/density-profile.py out.asm --xc8-words <N> --show-other
 python3 scripts/density-profile.py out.asm --json > before.json
 # ... land a codegen fix, rebuild ...
 python3 scripts/density-profile.py after.asm --compare before.json
@@ -123,7 +123,9 @@ table (`SINK_RULES`); a new category is one entry and one matcher.
 
 `make size-report` runs the ladder and the profiler over the tree and
 rewrites `crates/driver/tests/fixtures/SIZE_REPORT.md` (numbers, date,
-commit, XC8 snapshot) from those same tools, so the report never rots.
+commit) from those same tools, so the report never rots. XC8 comparisons
+render from the private epic-benchmarks repo through the same
+`scripts/size-report.py --xc8`.
 
 ## Hardware-in-the-loop
 

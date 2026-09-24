@@ -1,5 +1,5 @@
 /* Bitmask build from config struct fields through if-chains.
- * Menu-demo triage (epic-cc#624): EPIC_USART_Init (445 vs XC8 181)
+ * Menu-demo triage (epic-cc#624): EPIC_USART_Init (445 words)
  * builds TXSTA/RCSTA/BAUDCON bitmasks from one if-chain per bit,
  * reloading the same handle fields for every test. */
 typedef unsigned char uint8_t;

@@ -1,6 +1,6 @@
 /* Handle-default plus field overrides plus by-pointer init call.
  * Menu-demo triage (epic-cc#617): menu_demo_init's cluster (init of the
- * ADC/TIMER2/CCP handle structs) is 2171 vs XC8 1402 words. The shape is
+ * ADC/TIMER2/CCP handle structs) is 2171 words. The shape is
  * a large default-initialized struct, scalar field overrides, and one
  * by-pointer init call, repeated per peripheral. */
 typedef unsigned char uint8_t;
