@@ -241,6 +241,25 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Whether `name` is a local object in the current function: an
+    /// `alloca`'s slot IS the object, so a pointer to it is that slot's
+    /// own frame address rather than an address value stored in the slot
+    /// (epic-cc#645).
+    fn is_local_object(&self, name: &str) -> bool {
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| {
+                f.blocks.iter().any(|b| {
+                    b.insts
+                        .iter()
+                        .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Resolve `{func}::{name}` to its base byte address (lo for multi-byte).
     /// Every address comes from the caller-supplied map; a missing value
     /// panics rather than being allocated internally.
@@ -553,7 +572,9 @@ impl<'m> Gen<'m> {
                             // Constant offset only: the address is statically
                             // known, a plain file-register access, no FSR.
                             Addr::Direct(
-                                self.global_addr(name) + u16::from(k) + u16::from(byte_off),
+                                self.global_addr(name)
+                                    .wrapping_add(k)
+                                    .wrapping_add(u16::from(byte_off)),
                             )
                         } else {
                             let span = self.object_span(&base);
@@ -570,7 +591,7 @@ impl<'m> Gen<'m> {
                             self.emit_fsr_indirect(sa, k, &terms, byte_off);
                             Addr::Indirect
                         } else if terms.is_empty() {
-                            Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
+                            Addr::Direct(sa.wrapping_add(k).wrapping_add(u16::from(byte_off)))
                         } else {
                             let span = self.object_span(&base);
                             self.emit_fsr_to(sa, k, &terms, byte_off, span);
@@ -805,7 +826,13 @@ impl<'m> Gen<'m> {
         span: u16,
     ) {
         let (irp, base_lo) = fsr_window(self.device, base_addr, span);
-        let lit = (u16::from(base_lo) + u16::from(k) + u16::from(byte_off)) & 0xFF;
+        // The sum is modular by design (FSR holds the low byte); irparse
+        // wraps a negative GEP offset into `k`, so a plain `+` can
+        // overflow on loop-reduce's backward walks (epic-cc#645).
+        let lit = u16::from(base_lo)
+            .wrapping_add(k)
+            .wrapping_add(u16::from(byte_off))
+            & 0xFF;
         self.emit(if irp {
             "    BSF STATUS, 7".to_string()
         } else {
@@ -838,11 +865,15 @@ impl<'m> Gen<'m> {
     /// bank-2/3 target leaves STATUS bit 7 = 1). The static k + off must
     /// fit the ADDLW literal.
     fn emit_fsr_indirect(&mut self, slot_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        let kk = u16::from(k) + u16::from(byte_off);
-        assert!(
-            kk <= 0xFF,
-            "isel: indirect offset k {k} + off {byte_off} out of byte range"
-        );
+        // `k` can arrive wrapped from a negative GEP, so a plain sum could
+        // overflow past the bound check below; `checked_add` keeps the
+        // rejection honest instead of wrapping into range (epic-cc#645).
+        let kk = k
+            .checked_add(u16::from(byte_off))
+            .filter(|kk| *kk <= 0xFF)
+            .unwrap_or_else(|| {
+                panic!("isel: indirect offset k {k} + off {byte_off} out of byte range")
+            });
         let hi = slot_addr + 1;
         self.emit(format!("    BTFSC 0x{hi:02X}, 0"));
         self.emit("    BSF STATUS, 7".to_string());
@@ -884,11 +915,15 @@ impl<'m> Gen<'m> {
     /// keeps the `MOVF %r,W` shape (ADDLW only when k + off is nonzero);
     /// general sums accumulate in scratch.
     fn emit_ptr_index_w(&mut self, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        let kk = u16::from(k) + u16::from(byte_off);
-        assert!(
-            kk <= 0xFF,
-            "isel: const index k {k} + off {byte_off} out of byte range"
-        );
+        // `k` can arrive wrapped from a negative GEP, so a plain sum could
+        // overflow past the bound check below; `checked_add` keeps the
+        // rejection honest instead of wrapping into range (epic-cc#645).
+        let kk = k
+            .checked_add(u16::from(byte_off))
+            .filter(|kk| *kk <= 0xFF)
+            .unwrap_or_else(|| {
+                panic!("isel: indirect offset k {k} + off {byte_off} out of byte range")
+            });
         match terms {
             [] => self.emit(format!("    MOVLW 0x{kk:02X}")),
             [(1, r)] => {
@@ -919,7 +954,15 @@ impl<'m> Gen<'m> {
     /// Const-only and multi-term 16-bit indices panic since neither has a
     /// reader shape that keeps W as the in-chunk index (epic-cc#8).
     fn emit_const_read_large(&mut self, name: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        let kk = u16::from(k) + u16::from(byte_off);
+        // `k` can arrive wrapped from a negative GEP, so a plain sum could
+        // overflow past the bound check below; `checked_add` keeps the
+        // rejection honest instead of wrapping into range (epic-cc#645).
+        let kk = k
+            .checked_add(u16::from(byte_off))
+            .filter(|kk| *kk <= 0xFF)
+            .unwrap_or_else(|| {
+                panic!("isel: indirect offset k {k} + off {byte_off} out of byte range")
+            });
         assert!(
             kk <= 0xFF,
             "isel: const index k {k} + off {byte_off} out of byte range"
@@ -1125,6 +1168,37 @@ impl<'m> Gen<'m> {
                     // here to `Base::Global`, materialized below like
                     // `emit_move_addr_to_slot`'s own arm (epic-cc#193).
                     if let Base::Global(name) = &base {
+                        // A flash const table has no RAM address: its bytes
+                        // are a link-time label, so materialize
+                        // `LOW()/HIGH()` literals with k folded in
+                        // (epic-cc#645). A dynamic term cannot ride a
+                        // literal and still takes the address path below.
+                        if self.global_is_const(name) && terms.is_empty() {
+                            // `LOW`/`HIGH` are 8-bit link-time literals, so
+                            // the low byte's carry into the high byte is not
+                            // knowable at compile time. `MOVLW` leaves
+                            // STATUS.C alone, so the carry test sits right
+                            // after it, before the high byte's own `ADDLW`
+                            // overwrites C (epic-cc#645).
+                            let lit = if idx == 0 { "LOW" } else { "HIGH" };
+                            self.emit(format!("    MOVLW {lit}({name})"));
+                            if idx == 0 {
+                                let lo = (k & 0xFF) as u8;
+                                if lo != 0 {
+                                    self.emit(format!("    ADDLW 0x{lo:02X}"));
+                                }
+                            } else {
+                                if (k & 0xFF) != 0 {
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                }
+                                let hi = (k >> 8) as u8;
+                                if hi != 0 {
+                                    self.emit(format!("    ADDLW 0x{hi:02X}"));
+                                }
+                            }
+                            return;
+                        }
                         let addr = self.global_addr(name).wrapping_add(k as u16);
                         let lo = (addr & 0xFF) as u8;
                         let hi = ((addr >> 8) & 0xFF) as u8;
@@ -1171,8 +1245,15 @@ impl<'m> Gen<'m> {
                     }
                     let sa = match &base {
                         Base::Slot(sname, indirect) => {
+                            // A local object (`alloca`): the slot IS the
+                            // object, so the pointer is that slot's own
+                            // frame address, a compile-time constant that
+                            // the `[]`/`[(1, reg)]` arms below fold as a
+                            // literal exactly like a param's (epic-cc#645).
                             assert!(
-                                *indirect || self.param_holds_addr(sname),
+                                *indirect
+                                    || self.param_holds_addr(sname)
+                                    || self.is_local_object(sname),
                                 "isel: cannot take the value of a GEP over {base:?}"
                             );
                             self.slot_addr(self.cur_func, sname).direct()
@@ -1243,9 +1324,10 @@ impl<'m> Gen<'m> {
                 self.emit_w_load(a + u16::from(idx));
             }
             Val::Global(g) => {
-                if self.is_function(g) {
+                if self.is_function(g) || self.global_is_const(g) {
                     // A function's address is a link-time label literal:
-                    // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73).
+                    // byte 0 = LOW(g), byte 1 = HIGH(g) (epic-cc#73). A
+                    // flash const table is the same shape (epic-cc#645).
                     let lit = if idx == 0 { "LOW" } else { "HIGH" };
                     self.emit(format!("    MOVLW {lit}({g})"));
                 } else {
@@ -1615,7 +1697,11 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
             }
             Val::Global(g) => {
-                if self.is_function(g) {
+                if self.is_function(g) || self.global_is_const(g) {
+                    // A function's address and a flash const table's address
+                    // are both link-time label literals (epic-cc#645: a
+                    // const string reached through a pointer phi has no RAM
+                    // address to materialize).
                     self.emit(format!("    MOVLW LOW({g})"));
                     self.emit(format!("    MOVWF 0x{:02X}", dst));
                     self.emit(format!("    MOVLW HIGH({g})"));
@@ -2132,7 +2218,7 @@ impl<'m> Gen<'m> {
                         let Base::Global(name) = &base else {
                             unreachable!()
                         };
-                        let addr = self.global_addr(name) + u16::from(k);
+                        let addr = self.global_addr(name).wrapping_add(k);
                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                         self.emit(format!("    MOVWF 0x{:02X}", pa));
                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
@@ -2154,7 +2240,10 @@ impl<'m> Gen<'m> {
                                 let k_hi = (u16::from(k) >> 8) as u8;
                                 match terms.as_slice() {
                                     [] => {
-                                        let addr = base_addr + u16::from(k);
+                                        // A wrapped `k` (a negative GEP) is
+                                        // a legitimate address, so the sum
+                                        // is modular (epic-cc#645).
+                                        let addr = base_addr.wrapping_add(k);
                                         self.emit(format!("    MOVLW 0x{:02X}", (addr & 0xFF) as u8));
                                         self.emit(format!("    MOVWF 0x{:02X}", pa));
                                         self.emit(format!("    MOVLW 0x{:02X}", ((addr >> 8) & 0xFF) as u8));
