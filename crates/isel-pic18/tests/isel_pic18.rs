@@ -148,7 +148,11 @@ fn i32_icmp_eq_ne_compare_all_four_bytes() {
 }
 
 #[test]
-fn i32_icmp_ugt_compares_high_byte_first() {
+fn i32_icmp_ugt_uses_the_low_to_high_borrow_chain() {
+    // epic-cc#621: the unsigned ordering compares are one borrow chain,
+    // low lane to high, single exit. The chain's direction is load-bearing
+    // (a borrow propagates upward), so the low lane's `SUBWF` is what the
+    // high-to-low cascade used to put last.
     let m = parse(
         "global a i32\nglobal b i32\nglobal o1 i8\nfn main(void) ()\n  block entry:\n\
          %1 = load i32 @a\n    %2 = load i32 @b\n\
@@ -163,10 +167,25 @@ fn i32_icmp_ugt_compares_high_byte_first() {
         ("main::3", 0x38),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
-    assert!(
-        asm.contains("SUBWF 0x033,W,A"),
-        "high byte (offset 3) compared first:\n{asm}"
+    let body = asm.split("\nmain:").nth(1).expect("main").to_string();
+    let body = body.split("\n__start:").next().unwrap();
+    // Low lane first, through to the high lane; one exit pair after it.
+    let low = body.find("SUBWFB 0x030,W,A").expect("low lane");
+    let high = body.find("SUBWFB 0x033,W,A").expect("high lane");
+    assert!(low < high, "lane 0 before lane 3:\n{asm}");
+    assert_eq!(
+        body.matches("SUBWFB").count(),
+        4,
+        "one borrow-aware lane op per byte:\n{asm}"
     );
+    // One shared exit: a single conditional out of the chain.
+    assert_eq!(
+        body.matches("\n    BNC ").count(),
+        1,
+        "one shared exit, not a per-lane cascade:\n{asm}"
+    );
+    // The borrow-in for `ugt` is one explicit clear, not a lane.
+    assert!(body.contains("BCF 0xFD8,0,A"), "borrow-in seed:\n{asm}");
 }
 
 #[test]
@@ -6139,4 +6158,249 @@ fn a_recipe_callee_keeps_the_post_call_movlb() {
         !next.trim().is_empty() && !next.trim_end().ends_with(':'),
         "stub entry block leaked as an empty label:\n{asm}"
     );
+}
+
+/// Every predicate the fused compare handles, simulating the emitted asm
+/// with the branch targets as the compare's exits. The IR shape is the one
+/// `fusable_icmp` recognizes: a multi-byte `icmp` immediately followed by
+/// the `br i1` that is its only consumer.
+#[test]
+fn fused_cond_icmp_branches_on_the_chain_without_a_result_byte() {
+    for (ty, bytes, pred, cases) in [
+        (
+            "i16",
+            2usize,
+            "ult",
+            vec![
+                ((0x0100u16, 0x00FFu16), 0u8),
+                ((0x00FF, 0x0100), 1),
+                ((0x0100, 0x0100), 0),
+            ],
+        ),
+        (
+            "i16",
+            2,
+            "ugt",
+            vec![((0x0100, 0x00FF), 1), ((0x00FF, 0x0100), 0), ((5, 5), 0)],
+        ),
+        (
+            "i16",
+            2,
+            "ule",
+            vec![((0x0100, 0x00FF), 0), ((0x00FF, 0x0100), 1), ((5, 5), 1)],
+        ),
+        (
+            "i16",
+            2,
+            "uge",
+            vec![((0x0100, 0x00FF), 1), ((0x00FF, 0x0100), 0), ((5, 5), 1)],
+        ),
+        (
+            "i16",
+            2,
+            "eq",
+            vec![((0x0102, 0x0102), 1), ((0x0102, 0x0103), 0), ((0, 0), 1)],
+        ),
+        (
+            "i16",
+            2,
+            "ne",
+            vec![((0x0102, 0x0102), 0), ((0x0102, 0x0103), 1)],
+        ),
+    ] {
+        let m = parse(&format!(
+            "global a {ty}\nglobal b {ty}\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load {ty} @a\n    %2 = load {ty} @b\n    %3 = icmp {pred} {ty} %1, %2\n    \
+             br i1 %3 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+             block 20:\n    store i8 0 @out\n    ret void\n",
+        ));
+        let mut pairs = vec![("a", 0x20), ("b", 0x24), ("out", 0x28)];
+        pairs.push(("main::1", 0x30));
+        pairs.push(("main::2", 0x34));
+        let addrs = addrs(&pairs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        // The fusion must have fired. Two independent signals: the compare
+        // result slot is never written (no preclear, no `INCF`, no
+        // `MOVWF`/`MOVFF` into it), and the branch goes straight to the
+        // two block labels off the compare's own exit.
+        assert!(
+            !asm.contains("INCF 0x38") && !asm.contains("CLRF 0x38"),
+            "{pred} i16 was not fused:\n{asm}"
+        );
+        let block = {
+            let rest = asm.split("\nmain:").nth(1).expect("main");
+            rest.split("\n__start:").next().unwrap()
+        };
+        assert!(
+            !block.contains("MOVWF 0x038") && !block.contains("MOVFF 0x030, 0x038"),
+            "{pred} i16 still materializes its result byte:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        for &((a, b), expect) in &cases {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
+            for i in 0..bytes {
+                p.ram_mut()[0x20 + i] = (a >> (8 * i)) as u8;
+                p.ram_mut()[0x24 + i] = (b >> (8 * i)) as u8;
+            }
+            p.run(300);
+            assert_eq!(p.ram()[0x28], expect, "{pred} i16 {a:#06x} vs {b:#06x}");
+        }
+    }
+}
+
+/// The 32-bit chain, fused, over the derived lane patterns that decide the
+/// high lane last (the shape a high-to-low chain gets wrong).
+#[test]
+fn fused_cond_icmp_i32_chain_break_the_tie_at_the_top_lane() {
+    for pred in ["ult", "ugt", "uge", "ule"] {
+        let m = parse(&format!(
+            "global a i32\nglobal b i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load i32 @a\n    %2 = load i32 @b\n    %3 = icmp {pred} i32 %1, %2\n    \
+             br i1 %3 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+             block 20:\n    store i8 0 @out\n    ret void\n",
+        ));
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("b", 0x24),
+            ("out", 0x28),
+            ("main::1", 0x30),
+            ("main::2", 0x34),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        let words = asm::assemble_pic18(&asm);
+        // 0x0100_0000 vs 0x00FF_FFFF: the whole decision is the top lane.
+        let cases: [(u32, u32); 3] = [
+            (0x0100_0000, 0x00FF_FFFF),
+            (0x00FF_FFFF, 0x0100_0000),
+            (0x0100_0000, 0x0100_0000),
+        ];
+        for (a, b) in cases {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
+            for i in 0..4usize {
+                p.ram_mut()[0x20 + i] = (a >> (8 * i)) as u8;
+                p.ram_mut()[0x24 + i] = (b >> (8 * i)) as u8;
+            }
+            p.run(300);
+            let got = p.ram()[0x28];
+            let expect = match (a.cmp(&b), pred) {
+                (std::cmp::Ordering::Less, "ult") => 1,
+                (std::cmp::Ordering::Less, "ule") => 1,
+                (std::cmp::Ordering::Less, "uge") => 0,
+                (std::cmp::Ordering::Less, "ugt") => 0,
+                (std::cmp::Ordering::Greater, "ugt") => 1,
+                (std::cmp::Ordering::Greater, "uge") => 1,
+                (std::cmp::Ordering::Greater, "ult") => 0,
+                (std::cmp::Ordering::Greater, "ule") => 0,
+                // Equal inputs: the non-strict predicates hold, strict ones
+                // do not.
+                (std::cmp::Ordering::Equal, "ule" | "uge") => 1,
+                (std::cmp::Ordering::Equal, _) => 0,
+                (_, other) => panic!("unexpected predicate {other}"),
+            };
+            assert_eq!(got, expect, "{pred} i32 {a:#010x} vs {b:#010x}");
+        }
+    }
+}
+
+/// A compare whose result is read by something other than the single branch
+/// must keep the materializing lowering; the fused path would skip the slot
+/// write the other consumer reads.
+#[test]
+fn a_multi_use_compare_keeps_its_result_byte() {
+    let m = parse(
+        "global a i16\nglobal b i16\nglobal out i8\nglobal seen i8\nfn main(void) ()\n  \
+         block entry:\n    %1 = load i16 @a\n    %2 = load i16 @b\n    \
+         %3 = icmp ult i16 %1, %2\n    store i8 %3 @seen\n    br i1 %3 10 20\n  \
+         block 10:\n    store i8 1 @out\n    ret void\n  block 20:\n    store i8 0 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("seen", 0x29),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::3", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0x20] = 1;
+    p.ram_mut()[0x24] = 2;
+    p.run(300);
+    assert_eq!(
+        p.ram()[0x29],
+        1,
+        "the stored compare byte must still be written"
+    );
+    assert_eq!(p.ram()[0x28], 1, "and the branch must agree with it");
+}
+
+/// The shared-exit borrow chain (epic-cc#621) holds STATUS,C across lanes,
+/// so a rhs lane load that writes C corrupts it. The one such load is a
+/// GEP-derived pointer value: `emit_load_w`'s resolved arm materializes
+/// `base + k` with `ADDLW` (and the lane-1 carry fill with `BTFSC`/`ADDLW`).
+/// `%a` is an `inttoptr` runtime-address slot and `%p = gep %a +4` is a
+/// pointer VALUE, so the compare must route to the per-lane cascade, which
+/// consumes C from its own `SUBWF` right after each load.
+///
+/// Reviewer finding on the #621 diff: the chain form returned 1 for
+/// `ult 0x0144, 0x0144`.
+#[test]
+fn an_unsigned_compare_against_a_gep_value_keeps_the_cascade() {
+    let m = parse(
+        "global off i16\n\
+         global lhs i16\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %o = load i16 @off\n\
+             %a = inttoptr i16 %o to ptr\n\
+             %p = gep %a +4\n\
+             %1 = load i16 @lhs\n\
+             %2 = icmp ult i16 %1, %p\n\
+             br i1 %2 10 20\n\
+           block 10:\n\
+             store i8 1 @out\n\
+             ret void\n\
+           block 20:\n\
+             store i8 0 @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("off", 0x110),
+        ("lhs", 0x112),
+        ("out", 0x120),
+        ("main::o", 0x124),
+        ("main::a", 0x126),
+        ("main::1", 0x128),
+        ("main::2", 0x12A),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // The fused chain must not have fired: the result byte is materialized
+    // and reloaded for the branch.
+    assert!(
+        asm.contains("INCF 0x02A") && asm.contains("MOVF 0x02A,W"),
+        "a carry-clobbering rhs must keep the materializing cascade:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let start = start_steps(&asm);
+    // `%a` holds 0x0140, so the gep value is 0x0144.
+    for (lhs, expect) in [(0x0140u16, 1u8), (0x0144, 0), (0x0148, 0), (0x013F, 1)] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start);
+        p.ram_mut()[0x110] = 0x40;
+        p.ram_mut()[0x111] = 0x01;
+        p.ram_mut()[0x112] = (lhs & 0xFF) as u8;
+        p.ram_mut()[0x113] = (lhs >> 8) as u8;
+        p.run(500);
+        assert_eq!(
+            p.ram()[0x120],
+            expect,
+            "icmp ult {lhs:#06x}, (gep %a+4 = 0x0144)"
+        );
+    }
 }

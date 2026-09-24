@@ -78,13 +78,13 @@ ram_bytes = 10
 [[entry]]
 name = "bench-u32-loop-18f4550"
 device = "18F4550"
-flash_words = 105
+flash_words = 87
 ram_bytes = 23
 
 [[entry]]
 name = "bench-u16-dec-18f4550"
 device = "18F4550"
-flash_words = 120
+flash_words = 116
 ram_bytes = 33
 
 [[entry]]
@@ -114,7 +114,7 @@ ram_bytes = 47
 [[entry]]
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
-flash_words = 411
+flash_words = 397
 ram_bytes = 34
 
 [[entry]]
@@ -126,5 +126,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 11838
+flash_words = 11295
 ram_bytes = 739
