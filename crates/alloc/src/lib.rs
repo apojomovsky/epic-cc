@@ -340,12 +340,13 @@ fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
         .blocks
         .split_first()
         .expect("alloc: a function has an entry block");
-    let mut order: Vec<&ir::Block> = rest.iter().collect();
-    order.sort_by_key(|b| match b.label.parse::<u64>() {
+    let mut order: Vec<&ir::Block> = Vec::with_capacity(f.blocks.len());
+    order.push(entry);
+    order.extend(rest);
+    order[1..].sort_by_key(|b| match b.label.parse::<u64>() {
         Ok(v) => (1u8, v),
         Err(_) => (0u8, 0),
     });
-    order.insert(0, entry);
     order
 }
 
