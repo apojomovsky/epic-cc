@@ -233,6 +233,9 @@ mechanical rules fails the ritual and blocks the push.
 - **Never reverse-engineer or disassemble XC8 binaries.** XC8 is a
   black-box differential oracle only: compile the same source with
   `xc8-cc` and diff observable behaviour. Its licence forbids more.
+  Optimization ideas come from public sources (the XC8 user guide,
+  the literature) or our own output, never from mining XC8's listings
+  for its techniques (ADR-006, licence section 7).
 - **XC8 lives in its own opt-in image, not the dev one.** The epic-cc dev
   image sets `PIC8_XC8_ROOT` but installs nothing there, so `xc8-cc` is
   `command not found` inside `make exec`. Build the oracle image once and
