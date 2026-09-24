@@ -7159,6 +7159,64 @@ fn runtime_ptr_phi_derefs_through_slot_after_phi_copies() {
 }
 
 #[test]
+fn alloca_ptr_phi_two_term_literal_propagates_low_byte_carry() {
+    // A two-dynamic-term GEP over an alloca as a pointer-phi incoming: the
+    // phi copy materializes the pointer value through `emit_load_byte`'s
+    // two-term literal arm. Byte 0's carry into byte 1 must be consumed
+    // before byte 1's own adds, or the pointer lands 0x100 low when the low
+    // bytes overflow (epic-cc#647 review finding). The literal base leaves
+    // the low byte's carry in STATUS.C; the high byte must test it.
+    let m = parse(
+        "global i1v i8\nglobal a i8\nfn main(void) ()\n  block entry:\n    %b = alloca 8\n    %i = load i8 @i1v\n    %j = load i8 @a\n    %q = gep %b +0 +1*%i +1*%j\n    br 2\n  block 2:\n    %p = phi ptr %q entry\n    store i8 7 %p\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("i1v", 0x20),
+        ("a", 0x21),
+        ("main::b", 0x30),
+        ("main::i", 0x38),
+        ("main::j", 0x39),
+        ("main::q", 0x3A),
+        ("main::p", 0x3C),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    // Byte 1's literal arm must test the carry the low byte's adds left.
+    assert!(
+        asm.contains("BTFSC STATUS, 0"),
+        "byte 1 must consume byte 0's carry into the two-term literal:\n{asm}"
+    );
+}
+
+#[test]
+fn alloca_ptr_phi_materializes_frame_address_not_contents() {
+    // A pointer phi over an alloca (the loop-reduce walk shape): the
+    // alloca's slot IS the object, so its pointer value is that slot's own
+    // frame address, a literal. Reading the slot's two bytes instead (the
+    // pre-epic-cc#647 behavior) produced the object's stored data, so the
+    // walk wrote through address 0 and the digits were never found.
+    let m = parse(
+        "global c i8\nfn main(void) ()\n  block entry:\n    %b = alloca 4\n    %c = load i8 @c\n    br i1 %c t f\n  block t:\n    br merge\n  block f:\n    br merge\n  block merge:\n    %p = phi ptr %b t %b f\n    store i8 7 %p\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("c", 0x20),
+        ("main::b", 0x30),
+        ("main::c", 0x22),
+        ("main::p", 0x34),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    // The entry-edge phi copy materializes the alloca's frame address 0x30
+    // as `MOVLW 0x30`, never `MOVF 0x30, W` (which would read the object's
+    // first byte).
+    assert!(
+        asm.contains("MOVLW 0x30"),
+        "the alloca pointer value must be its frame address literal:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVF 0x30, W"),
+        "the alloca's contents must not be read as its address:\n{asm}"
+    );
+}
+
+#[test]
 fn banking_selects_bank0_for_sfr_and_leaves_save_area_untouched() {
     // The common GPR block (0x70-0x7F) and the mirrored core registers need
     // no banking; a non-mirrored bank-0 SFR (PORTB 0x06) is reachable only

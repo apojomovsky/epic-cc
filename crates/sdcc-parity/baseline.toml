@@ -206,9 +206,9 @@ sdcc_cycles = 791
 program = "math"
 device = "p16f877a"
 status = "known-bug"
-epic_flash = 3809
+epic_flash = 3898
 sdcc_flash = 0
-epic_cycles = 20784
+epic_cycles = 20857
 sdcc_cycles = 0
 
 [[row]]
@@ -224,9 +224,9 @@ sdcc_cycles = 15456
 program = "math"
 device = "p16f1938"
 status = "pass"
-epic_flash = 3805
+epic_flash = 3893
 sdcc_flash = 5220
-epic_cycles = 20780
+epic_cycles = 20852
 sdcc_cycles = 20321
 
 [[row]]
@@ -287,9 +287,9 @@ sdcc_cycles = 858
 program = "printf-f"
 device = "p16f877a"
 status = "known-bug"
-epic_flash = 4994
+epic_flash = 5070
 sdcc_flash = 0
-epic_cycles = 7817
+epic_cycles = 7899
 sdcc_cycles = 0
 
 [[row]]
@@ -305,9 +305,9 @@ sdcc_cycles = 12453
 program = "printf-f"
 device = "p16f1938"
 status = "known-bug"
-epic_flash = 4992
+epic_flash = 5030
 sdcc_flash = 0
-epic_cycles = 7766
+epic_cycles = 7801
 sdcc_cycles = 0
 
 [[row]]

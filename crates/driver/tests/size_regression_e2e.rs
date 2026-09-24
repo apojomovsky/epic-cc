@@ -203,6 +203,17 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("size-bench/bench-struct-scan.c")],
         },
         Case {
+            // The same walk on the 14-bit core, which has no hardware
+            // multiply: the non-power-of-two stride is a shift-add chain
+            // re-emitted per access, so hoisting it out of the loop is
+            // worth far more here than the PIC18 row above (epic-cc#647).
+            name: "bench-struct-scan-16f877a",
+            device: "16F877A",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-struct-scan.c")],
+        },
+        Case {
             name: "bench-bitmask-18f4550",
             device: "18F4550",
             includes: vec![],
