@@ -121,6 +121,10 @@ under the driver's own flash report. `--flash-words` prints that residual
 rather than hiding it. Sink categories live in one precedence-ordered rule
 table (`SINK_RULES`); a new category is one entry and one matcher.
 
+`make size-report` runs the ladder and the profiler over the tree and
+rewrites `crates/driver/tests/fixtures/SIZE_REPORT.md` (numbers, date,
+commit, XC8 snapshot) from those same tools, so the report never rots.
+
 ## Hardware-in-the-loop
 
 The final oracle is real silicon. HEX files can be flashed via MPLAB IPE. This is out of

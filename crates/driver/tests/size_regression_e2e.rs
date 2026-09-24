@@ -16,6 +16,11 @@
 //! --test size_regression_e2e` run to accept it (rewrites the file; diff
 //! it before committing, same as reviewing any other snapshot change).
 //!
+//! `SIZE_REPORT_JSON=1` turns the measurement pass into a machine-readable
+//! dump (one JSON array between marker lines, needs `-- --nocapture`) for
+//! `make size-report`. It prints and returns before any assertion, so a
+//! report never fails the gate and the gate never shapes the report.
+//!
 //! Because shrinking is free by default, a baseline row can sit above
 //! what the tree produces and silently absorb a later regression of that
 //! size. `STRICT_SIZE_BASELINE=1` (set in CI) fails on such a row instead,
@@ -404,6 +409,50 @@ fn drift_report(name: &str, metric: &str, baseline: u32, measured: u32) -> Optio
          UPDATE_SIZE_BASELINE=1 and diff the result."
     ))
 }
+/// Machine-readable dump of this run's measurements for `make size-report`.
+///
+/// `includes`/`inputs` are manifest-relative, so the report runner can
+/// rebuild a listing (the menu-demo cluster table) without duplicating
+/// the `cases()` file lists. Formatting is by hand: every field is
+/// path-safe, so no escaping is needed, and this avoids a serde_json
+/// dev-dependency for one aid.
+fn rel(path: &std::path::Path) -> String {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    path.strip_prefix(manifest)
+        .map(|r| r.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+}
+
+fn print_report_json(measured: &[BaselineEntry], cases: &[Case]) {
+    println!("SIZE_REPORT_JSON_BEGIN");
+    println!("[");
+    for (i, e) in measured.iter().enumerate() {
+        let c = &cases[i];
+        let list = |ps: &[std::path::PathBuf]| {
+            ps.iter()
+                .map(|p| format!("\"{}\"", rel(p)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        println!(
+            "  {{\"name\": \"{}\", \"device\": \"{}\", \"flash_words\": {}, \"ram_bytes\": {}, \"defines\": [{}], \"includes\": [{}], \"inputs\": [{}]}}{}",
+            e.name,
+            e.device,
+            e.flash_words,
+            e.ram_bytes,
+            c.defines
+                .iter()
+                .map(|d| format!("\"{d}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+            list(&c.includes),
+            list(&c.inputs),
+            if i + 1 == measured.len() { "" } else { "," }
+        );
+    }
+    println!("]");
+    println!("SIZE_REPORT_JSON_END");
+}
 
 #[test]
 fn flash_and_ram_do_not_regress() {
@@ -417,8 +466,9 @@ fn flash_and_ram_do_not_regress() {
     let mut rows = Vec::new();
     let mut failures = Vec::new();
 
-    for c in cases() {
-        let report = measure(&c);
+    let cases = cases();
+    for c in &cases {
+        let report = measure(c);
         let flash_words = parse_after(&report, "flash: ");
         let ram_bytes = parse_after(&report, "RAM: ");
         let base = baseline.entry.iter().find(|e| e.name == c.name).cloned();
@@ -475,8 +525,11 @@ fn flash_and_ram_do_not_regress() {
             ram_bytes,
         });
     }
-
     write_step_summary(&rows);
+    if std::env::var("SIZE_REPORT_JSON").is_ok() {
+        print_report_json(&measured, &cases);
+        return;
+    }
 
     if update {
         save_baseline(&Baseline { entry: measured });
