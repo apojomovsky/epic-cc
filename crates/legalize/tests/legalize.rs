@@ -2016,3 +2016,66 @@ fn keeps_the_i16_tail_when_the_addend_is_a_literal() {
         "a literal addend must keep the wide multiply:\n{text}"
     );
 }
+
+/// A callback stored through a loaded handle pointer (`g_handle =
+/// &g_storage`, then `%o = load @g_handle; store @cb (gep %o)`) into an
+/// ISR-read storage rewrites to the `_isr` copy and the ISR site scopes
+/// to it, exactly like the direct-store shape. Before the fix the store
+/// kept the main-frame address while the ISR site dispatched the copy,
+/// so the compare chain trapped at runtime (epic-cc#642).
+#[test]
+fn rewrites_callback_stored_through_loaded_handle() {
+    let m = parse(
+        "global g_storage i16\n\
+         global g_handle i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i16 @g_storage @g_handle\n\
+             %o = load i16 @g_handle\n\
+             %p = gep %o +0\n\
+             store i16 @cb %p\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %o2 = load i16 @g_handle\n\
+             %p2 = gep %o2 +0\n\
+             %fp = load i16 %p2\n\
+             call void @fp()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "cb_isr"),
+        "cb_isr missing"
+    );
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let stores: Vec<_> = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter_map(|i| match i {
+            Inst::Store(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    let cb_store = stores
+        .iter()
+        .find(|s| matches!(&s.val, ir::Val::Global(v) if v == "cb" || v == "cb_isr"));
+    assert_eq!(
+        cb_store.map(|s| &s.val),
+        Some(&ir::Val::Global("cb_isr".to_string())),
+        "store through the loaded handle must point at the _isr copy"
+    );
+    let isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    let call = isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("isr call");
+    assert_eq!(call.callees, vec!["cb_isr".to_string()]);
+}
