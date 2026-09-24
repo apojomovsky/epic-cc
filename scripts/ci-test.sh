@@ -18,6 +18,13 @@
 
 set -uo pipefail
 
+# The size ladder is strict here: a baseline row that records more than the
+# tree produces is a failure, not free headroom, so a shrink that was never
+# re-baselined cannot silently absorb a later regression (epic-cc#629). The
+# inner loop leaves this unset, so shrinking a program mid-iteration does
+# not demand a re-baseline before the change is even finished.
+export STRICT_SIZE_BASELINE=1
+
 if ! command -v cargo >/dev/null 2>&1; then
   echo "::error::cargo not on PATH; run inside the dev container (see docs/09-build-environment.md)" >&2
   exit 2
