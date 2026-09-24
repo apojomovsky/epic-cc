@@ -8,7 +8,7 @@ into a table, paste it into an issue comment. This is that method as one
 command, so a density pass starts from the previous profile instead of
 from zero.
 
-  python3 scripts/density-profile.py out.asm --xc8-words 9068
+  python3 scripts/density-profile.py out.asm --xc8-words <N>
   python3 scripts/density-profile.py out.asm --json > before.json
   python3 scripts/density-profile.py out.asm --compare before.json
   python3 scripts/density-profile.py --compile --device 18F4550 \

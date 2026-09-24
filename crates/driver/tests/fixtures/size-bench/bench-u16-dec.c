@@ -1,6 +1,6 @@
 /* u16 decimal emission: repeated divide/modulo by 10 into a sink.
  * Menu-demo triage (epic-cc#617): the put_u16 cluster (decimal engine
- * inlined into a one-line wrapper) is 244 vs XC8 85 words, and the
+ * inlined into a one-line wrapper) is 244 words, and the
  * heartbeat task repeats the shape six times per pass. */
 typedef unsigned short uint16_t;
 

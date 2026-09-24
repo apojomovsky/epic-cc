@@ -1,6 +1,6 @@
 /* Switch dispatching calls with distinct constant arguments.
  * Menu-demo triage (epic-cc#617): the redraw cluster (switch on screen
- * id, one helper call per case) is 669 vs XC8 ~235 words. The existing
+ * id, one helper call per case) is 669 words. The existing
  * bench-switch covers value stores per case; this one covers calls. */
 volatile unsigned char in;
 volatile unsigned char out;

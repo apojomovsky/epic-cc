@@ -14,10 +14,8 @@ shape as `docs/41`, narrower oracle.
 
 Baseline (current master): the `--emit asm` listing profiles at 12099
 words and assembles to exactly 12214 flash words, matching
-`fixtures/size_baseline.toml`. XC8 builds the same firmware in 9068
-words, so this listing sits at 1.35x; the 1.5-1.76x framing elsewhere
-covers the real-target variant (13820 words) and tree drift between
-measurements. All counts below are against the 12214 baseline.
+`fixtures/size_baseline.toml`. The real-target variant is larger
+(13820 words). All counts below are against the 12214 baseline.
 
 ## Experiment 1: bank tracking (informs #495)
 
