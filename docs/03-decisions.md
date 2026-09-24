@@ -233,12 +233,23 @@ do, which removes the main reason to choose it.
 
 ## ADR-006 -- XC8 is a black-box oracle, never a reverse-engineering target
 
-**Status:** Accepted 2026-08-14 (user-accepted after being raised as a concern)
+**Status:** Accepted 2026-08-14 (user-accepted after being raised as a concern), amended
+2026-09-24 (idea sourcing, benchmark publication)
 
 ### Decision
 
 Never disassemble or reverse-engineer XC8 binaries. Use `xc8-cc` only by compiling source
 and observing its output and behaviour.
+
+Optimization ideas come from public sources (the XC8 user guide, the literature) or our
+own analysis of our own output, never from mining XC8's listings for its techniques. The
+licence (section 7) treats the compiler's "algorithms, know-how and ideas" as
+confidential, with an exception for public information. Size and behaviour comparisons
+stay in scope.
+
+Publishing XC8 benchmark numbers is the project owner's decision, taken knowingly: the
+licence (section 8) treats benchmark results as confidential without Microchip's written
+permission.
 
 ### Rationale
 
