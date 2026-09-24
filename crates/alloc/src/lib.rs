@@ -328,6 +328,28 @@ struct FrameLayout {
     slot_of: HashMap<String, usize>,
 }
 
+/// Blocks of `f` in liveness and placement order: the entry (the function's
+/// first block) is index 0, the rest follow in label order.
+///
+/// Pinning the entry is load-bearing: opt can leave an unnamed numeric entry
+/// next to a block an inline named (`merged.exit`, epic-cc#446), and ranking
+/// a name below a number would sort it off index 0, where `frame_layout`
+/// reads params and entry live-ins from (epic-cc#448).
+fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
+    let (entry, rest) = f
+        .blocks
+        .split_first()
+        .expect("alloc: a function has an entry block");
+    let mut order: Vec<&ir::Block> = Vec::with_capacity(f.blocks.len());
+    order.push(entry);
+    order.extend(rest);
+    order[1..].sort_by_key(|b| match b.label.parse::<u64>() {
+        Ok(v) => (1u8, v),
+        Err(_) => (0u8, 0),
+    });
+    order
+}
+
 /// Compute a function's liveness-colored frame from its IR. Each value's
 /// live interval is `[min(def, uses, phi pred ends), max(...)]` in linear
 /// block order (entry first, then label order). Phi incoming values are
@@ -340,14 +362,7 @@ struct FrameLayout {
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
 fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLayout {
-    // Block order: the entry block (unlabeled) first, then label order.
-    let mut order: Vec<&ir::Block> = f.blocks.iter().collect();
-    // The entry block (label `entry` in hand-written IR, a numeric label in
-    // irparse output) is always first; the rest follow in label order.
-    order.sort_by_key(|b| match b.label.parse::<u64>() {
-        Ok(v) => (1u8, v),
-        Err(_) => (0u8, 0),
-    });
+    let order = block_order(f);
     let idx: HashMap<&str, usize> = order
         .iter()
         .enumerate()
