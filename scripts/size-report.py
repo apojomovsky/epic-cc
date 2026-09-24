@@ -14,6 +14,9 @@ import argparse
 import json
 import pathlib
 import re
+import sys
+
+CLUSTER_CAP = 13
 
 SUFFIX_RE = re.compile(r"-(16f877a|18f4550)$", re.IGNORECASE)
 
@@ -57,6 +60,20 @@ def delta(current, base):
 
 def approx(value, is_approx):
     return f"~{value}" if is_approx else str(value)
+
+
+def load_json(path, what):
+    try:
+        return json.loads(pathlib.Path(path).read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"size-report: cannot read {what} from {path}: {e}")
+
+
+def menu_entry(sizes):
+    menu = next((e for e in sizes if e["name"] == "hal-pic18-menu-demo-18f4550"), None)
+    if menu is None:
+        raise SystemExit("size-report: no hal-pic18-menu-demo-18f4550 in sizes")
+    return menu
 
 
 def micro_rows(sizes, baseline, xc8):
@@ -122,26 +139,49 @@ def cluster_rows(density, xc8):
     """Top clusters by listing words that have an XC8 counterpart.
 
     Startup and const pools have no oracle side, so they are skipped by
-    construction, not by a hardcoded skip list.
+    construction, not by a hardcoded skip list. Skips print to stderr so
+    a new hot function missing from the snapshot is noticed, not hidden.
     """
     clusters = density.get("clusters", {})
     refs = xc8.get("clusters", {})
     ranked = []
     for root, info in clusters.items():
-        if root not in refs:
+        ref = refs.get(root)
+        if ref is None:
+            print(
+                f"size-report: no XC8 counterpart for cluster {root} "
+                f"({info.get('words', 0):.0f} words), skipping",
+                file=sys.stderr,
+            )
+            continue
+        if ref.get("xc8") is None:
+            print(
+                f"size-report: no XC8 word count for cluster {root}, skipping",
+                file=sys.stderr,
+            )
             continue
         ranked.append((root, info))
-    ranked.sort(key=lambda kv: -kv[1]["words"])
+    ranked.sort(key=lambda kv: -kv[1].get("words", 0))
+    if len(ranked) > CLUSTER_CAP:
+        print(
+            f"size-report: showing top {CLUSTER_CAP} of {len(ranked)} "
+            "clusters with XC8 counterparts",
+            file=sys.stderr,
+        )
     rows = []
-    for root, info in ranked[:13]:
+    for root, info in ranked[:CLUSTER_CAP]:
         ref = refs[root]
         is_approx = bool(ref.get("approx"))
-        ours = info["words"]
+        ours = info.get("words", 0)
         rows.append(
             {
                 "cluster": root
                 + (f" ({ref['suffix']})" if ref.get("suffix") else "")
-                + (f" +{len(info['folded'])} folded" if info["folded"] else ""),
+                + (
+                    f" +{len(info.get('folded', []))} folded"
+                    if info.get("folded")
+                    else ""
+                ),
                 "ours": ours,
                 "xc8": approx(ref["xc8"], is_approx),
                 "ratio": approx(f"{ours / ref['xc8']:.2f}", is_approx),
@@ -210,13 +250,19 @@ def render(args, sizes, density, baseline, xc8):
         )
     out.append("")
     if density is not None:
-        menu = next(e for e in sizes if e["name"] == "hal-pic18-menu-demo-18f4550")
-        sim = xc8["programs"]["hal-pic18-menu-demo-18f4550"].get("sim_xc8")
+        for key in ("total_words", "categories"):
+            if key not in density:
+                raise SystemExit(f"size-report: density profile is missing {key!r}")
+        menu = menu_entry(sizes)
+        program = xc8.get("programs", {}).get("hal-pic18-menu-demo-18f4550")
+        if program is None:
+            raise SystemExit("size-report: snapshot has no menu-demo program row")
+        sim = program.get("sim_xc8")
         out.append("## Menu-demo clusters (listing words)")
         out.append("")
         if sim:
             folded = sum(
-                len(info["members"]) - 1 + len(info["folded"])
+                len(info.get("members", [])) - 1 + len(info.get("folded", []))
                 for info in density.get("clusters", {}).values()
             )
             out.append(
@@ -264,9 +310,7 @@ def render(args, sizes, density, baseline, xc8):
 
 def check_asm_inputs(sizes, path):
     """Fail loudly when MENU_DEMO_SRCS drifts from the ladder case."""
-    want = next(e for e in sizes if e["name"] == "hal-pic18-menu-demo-18f4550")[
-        "inputs"
-    ]
+    want = menu_entry(sizes)["inputs"]
     got = pathlib.Path(path).read_text().split()
     missing = [w for w in want if not any(g.endswith("/" + w) for g in got)]
     extra = [g for g in got if not any(g.endswith("/" + w) for w in want)]
@@ -289,14 +333,14 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="report path to write")
     parser.add_argument("--asm-inputs", help="built listing inputs, drift-checked")
     args = parser.parse_args(argv)
-    sizes = json.loads(pathlib.Path(args.sizes).read_text())
+    sizes = load_json(args.sizes, "sizes")
     if args.asm_inputs:
         check_asm_inputs(sizes, args.asm_inputs)
     baseline = parse_baseline(pathlib.Path(args.baseline).read_text())
-    xc8 = json.loads(pathlib.Path(args.xc8).read_text())
+    xc8 = load_json(args.xc8, "XC8 snapshot")
     density = None
     if args.density:
-        density = json.loads(pathlib.Path(args.density).read_text())
+        density = load_json(args.density, "density profile")
     pathlib.Path(args.out).write_text(render(args, sizes, density, baseline, xc8))
     return 0
 

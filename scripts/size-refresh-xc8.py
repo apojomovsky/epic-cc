@@ -3,9 +3,10 @@
 
 Compiles each size-bench/ program with `xc8-cc -mcpu=18f4550 -O2` in the
 oracle image and reads the Memory Summary (program bytes halve to PIC18
-words, data bytes are RAM bytes). Without the image, or without docker,
-it copies the checked-in snapshot through unchanged and says so, so
-`make size-report` never needs the licence-gated toolchain.
+words, data bytes are RAM bytes), writing the result back to the
+checked-in snapshot. Without the image, or without docker, the snapshot
+is left untouched and the render quotes it as-is, so `make size-report`
+never needs the licence-gated toolchain.
 
 Whole-program and cluster rows are never touched here: they need
 different file sets and a manual `.map` join, so refreshing them stays
@@ -78,12 +79,14 @@ def main(argv=None):
     args = parser.parse_args(argv)
     snapshot = json.loads(pathlib.Path(args.snapshot).read_text())
     if not image_present(args.image):
-        pathlib.Path(args.out).write_text(json.dumps(snapshot, indent=2) + "\n")
         print(f"size-refresh-xc8: no {args.image}, quoting snapshot", flush=True)
         return 0
+    sources = sorted(pathlib.Path(args.bench_dir).glob("bench-*.c"))
+    if not sources:
+        raise SystemExit(f"size-refresh-xc8: no bench-*.c under {args.bench_dir}")
     today = datetime.date.today().isoformat()
     benches = {}
-    for source in sorted(pathlib.Path(args.bench_dir).glob("bench-*.c")):
+    for source in sources:
         words, ram = measure(args.repo, args.image, source)
         benches[source.stem] = {"flash": words, "ram": ram, "measured": today}
     snapshot["benches"] = benches

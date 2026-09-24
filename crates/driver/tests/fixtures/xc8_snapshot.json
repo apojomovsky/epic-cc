@@ -3,22 +3,86 @@
   "image": "epic-cc-xc8-oracle:local",
   "note": "XC8 v4.00 -O2 rows transcribed from crates/driver/tests/fixtures/xc8_reference.md and docs/43-menu-triage-findings.md. Bench and program rows refresh via scripts/size-refresh-xc8.py when the oracle image is present; cluster rows need a manual .map join.",
   "benches": {
-    "bench-shift": {"flash": 108, "ram": 16, "measured": "2026-09-22"},
-    "bench-wide-const": {"flash": 28, "ram": 6, "measured": "2026-09-22"},
-    "bench-zero-init": {"flash": 38, "ram": 12, "measured": "2026-09-22"},
-    "bench-struct-copy": {"flash": 36, "ram": 41, "measured": "2026-09-22"},
-    "bench-switch": {"flash": 55, "ram": 2, "measured": "2026-09-22"},
-    "bench-bool": {"flash": 29, "ram": 2, "measured": "2026-09-22"},
-    "bench-dead-store": {"flash": 16, "ram": 3, "measured": "2026-09-24"},
-    "bench-bank": {"flash": 30, "ram": 10, "measured": "2026-09-22"},
-    "bench-handle-init": {"flash": 87, "ram": 47, "measured": "2026-09-23"},
-    "bench-switch-calls": {"flash": 63, "ram": 3, "measured": "2026-09-23"},
-    "bench-u32-loop": {"flash": 49, "ram": 9, "measured": "2026-09-23"},
-    "bench-u16-dec": {"flash": 126, "ram": 17, "measured": "2026-09-23"},
-    "bench-struct-scan": {"flash": 88, "ram": 96, "measured": "2026-09-23"},
-    "bench-bitmask": {"flash": 54, "ram": 13, "measured": "2026-09-23"},
-    "bench-hoist": {"flash": 137, "ram": 13, "measured": "2026-09-23"},
-    "bench-w-roundtrip": {"flash": 16, "ram": 3, "measured": "2026-09-24"}
+    "bench-shift": {
+      "flash": 108,
+      "ram": 16,
+      "measured": "2026-09-22"
+    },
+    "bench-wide-const": {
+      "flash": 28,
+      "ram": 6,
+      "measured": "2026-09-22"
+    },
+    "bench-zero-init": {
+      "flash": 38,
+      "ram": 12,
+      "measured": "2026-09-22"
+    },
+    "bench-struct-copy": {
+      "flash": 36,
+      "ram": 41,
+      "measured": "2026-09-22"
+    },
+    "bench-switch": {
+      "flash": 55,
+      "ram": 2,
+      "measured": "2026-09-22"
+    },
+    "bench-bool": {
+      "flash": 29,
+      "ram": 2,
+      "measured": "2026-09-22"
+    },
+    "bench-dead-store": {
+      "flash": 16,
+      "ram": 3,
+      "measured": "2026-09-24"
+    },
+    "bench-bank": {
+      "flash": 30,
+      "ram": 10,
+      "measured": "2026-09-22"
+    },
+    "bench-handle-init": {
+      "flash": 87,
+      "ram": 47,
+      "measured": "2026-09-23"
+    },
+    "bench-switch-calls": {
+      "flash": 63,
+      "ram": 3,
+      "measured": "2026-09-23"
+    },
+    "bench-u32-loop": {
+      "flash": 49,
+      "ram": 9,
+      "measured": "2026-09-23"
+    },
+    "bench-u16-dec": {
+      "flash": 126,
+      "ram": 17,
+      "measured": "2026-09-23"
+    },
+    "bench-struct-scan": {
+      "flash": 88,
+      "ram": 96,
+      "measured": "2026-09-23"
+    },
+    "bench-bitmask": {
+      "flash": 54,
+      "ram": 13,
+      "measured": "2026-09-23"
+    },
+    "bench-hoist": {
+      "flash": 137,
+      "ram": 13,
+      "measured": "2026-09-23"
+    },
+    "bench-w-roundtrip": {
+      "flash": 16,
+      "ram": 3,
+      "measured": "2026-09-24"
+    }
   },
   "programs": {
     "hal-pic18-menu-demo-18f4550": {
@@ -40,18 +104,52 @@
     }
   },
   "clusters": {
-    "menu_demo_init": {"xc8": 1402, "suffix": "CCP/ADC/LCD/gpio4/serial/tick inits"},
-    "main": {"xc8": 156},
-    "redraw": {"xc8": 235, "approx": true, "suffix": "brightness/about inlined"},
-    "epic_taskmgr_run": {"xc8": 37, "suffix": "u32 tick loop"},
-    "menu_demo_task_heartbeat": {"xc8": 154, "suffix": "SetPWMDuty"},
-    "redraw_status": {"xc8": 105},
-    "epic_dispatch_all_irqs": {"xc8": 239, "suffix": "5 IRQ handlers"},
-    "epic_serial_put_u16": {"xc8": 85, "suffix": "put_udec"},
-    "gpio4_send": {"xc8": 291},
-    "EPIC_USART_Init": {"xc8": 181},
-    "task_stimulus": {"xc8": 76, "suffix": "push_event"},
-    "epic_taskmgr_on_timer0_overflow": {"xc8": 19},
-    "epic_taskmgr_attach_timer0": {"xc8": 141}
+    "menu_demo_init": {
+      "xc8": 1402,
+      "suffix": "CCP/ADC/LCD/gpio4/serial/tick inits"
+    },
+    "main": {
+      "xc8": 156
+    },
+    "redraw": {
+      "xc8": 235,
+      "approx": true,
+      "suffix": "brightness/about inlined"
+    },
+    "epic_taskmgr_run": {
+      "xc8": 37,
+      "suffix": "u32 tick loop"
+    },
+    "menu_demo_task_heartbeat": {
+      "xc8": 154,
+      "suffix": "SetPWMDuty"
+    },
+    "redraw_status": {
+      "xc8": 105
+    },
+    "epic_dispatch_all_irqs": {
+      "xc8": 239,
+      "suffix": "5 IRQ handlers"
+    },
+    "epic_serial_put_u16": {
+      "xc8": 85,
+      "suffix": "put_udec"
+    },
+    "gpio4_send": {
+      "xc8": 291
+    },
+    "EPIC_USART_Init": {
+      "xc8": 181
+    },
+    "task_stimulus": {
+      "xc8": 76,
+      "suffix": "push_event"
+    },
+    "epic_taskmgr_on_timer0_overflow": {
+      "xc8": 19
+    },
+    "epic_taskmgr_attach_timer0": {
+      "xc8": 141
+    }
   }
 }
