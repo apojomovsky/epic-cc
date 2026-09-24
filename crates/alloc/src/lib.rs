@@ -53,23 +53,24 @@ pub struct AllocLayout {
     /// its overlay region span is 0, but the backend still emits the
     /// ISR-save prologue, which the size report must count.
     pub has_isr: bool,
-    /// The low-priority ISR's 17-byte context-save area base (`Some` only
+    /// The low-priority ISR's 19-byte context-save area base (`Some` only
     /// in priority mode: both a high- and a low-priority ISR exist). It
     /// sits at the low overlay region's base, below the low frames, so it
     /// is disjoint from every context by construction; the high ISR keeps
     /// the device's fixed save block. `None` in compatibility mode (zero
     /// or one ISR), where the single handler uses the fixed block.
     pub isr_low_save: Option<u16>,
-    /// The compatibility-mode ISR's 5-byte area for the PROD/FSR1/TABLAT save
-    /// bytes (`Some` only when the module has an ISR, is PIC18, and does
-    /// not run priority mode). Carved from the ISR context's own region,
-    /// like `isr_low_save`, because the fixed access-bank block is pinned
-    /// at 16 bytes by `ram_banks` starting at 0x0010 on every device and
-    /// has no room for them. (epic-cc#477)
+    /// The compatibility-mode ISR's 7-byte area for the PROD/FSR1/TABLAT
+    /// and PCLATH/PCLATU save bytes (`Some` only when the module has an
+    /// ISR, is PIC18, and does not run priority mode). Carved from the
+    /// ISR context's own region, like `isr_low_save`, because the fixed
+    /// access-bank block is pinned at 16 bytes by `ram_banks` starting at
+    /// 0x0010 on every device and has no room for them. (epic-cc#477,
+    /// epic-cc#641)
     pub isr_save: Option<u16>,
-    /// The high-priority ISR's 5-byte area for the same bytes, carved from
+    /// The high-priority ISR's 7-byte area for the same bytes, carved from
     /// its own region so the two ISRs' areas stay disjoint. `Some` only in
-    /// priority mode. (epic-cc#477)
+    /// priority mode. (epic-cc#477, epic-cc#641)
     pub isr_hi_save: Option<u16>,
 }
 
@@ -1141,7 +1142,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                             base.insert(f.clone(), b);
                         }
                     };
-                // Priority mode (both priorities present): the low ISR's 16-byte
+                // Priority mode (both priorities present): the low ISR's 19-byte
                 // context-save area sits at the low region's base, below the low
                 // frames, so it is disjoint from every context by construction
                 // (the access-window argument shows no float frame can land
@@ -1150,13 +1151,13 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 let priority_mode = !lo_roots.is_empty() && !hi_roots.is_empty();
                 // Every ISR context needs these save bytes, whichever
                 // priority it runs at, so each region's base gets its own
-                // carved area of the same size (epic-cc#477, epic-cc#532:
-                // FSR1, PROD and TABLAT). PIC14/PIC14E have no MULWF/PROD,
-                // no FSR1 copy loop and no TBLRD, so their layout stays
-                // byte-identical.
+                // carved area of the same size (epic-cc#477, epic-cc#532,
+                // epic-cc#641: FSR1, PROD, TABLAT, PCLATH, PCLATU).
+                // PIC14/PIC14E have no MULWF/PROD, no FSR1 copy loop and no
+                // TBLRD, so their layout stays byte-identical.
                 let needs_prod_save = device.core == device::Core::Pic18;
-                const ISR_SAVE_BYTES: u16 = 5;
-                const LOW_SAVE_BYTES: u16 = 17;
+                const ISR_SAVE_BYTES: u16 = 7;
+                const LOW_SAVE_BYTES: u16 = 19;
                 let lo_base = if priority_mode {
                     isr_low_save = Some(isr_base);
                     isr_base + LOW_SAVE_BYTES
@@ -1179,7 +1180,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                     .max()
                     .unwrap_or(isr_base);
                 let hi_base = if priority_mode && needs_prod_save {
-                    // The high handler needs the same four bytes; carve them
+                    // The high handler needs the same seven bytes; carve them
                     // from its own region so the two ISRs' areas stay disjoint.
                     isr_hi_save = Some(hi_base);
                     hi_base + ISR_SAVE_BYTES
