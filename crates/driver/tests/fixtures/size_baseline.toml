@@ -100,6 +100,12 @@ flash_words = 147
 ram_bytes = 99
 
 [[entry]]
+name = "bench-struct-scan-16f877a"
+device = "16F877A"
+flash_words = 177
+ram_bytes = 108
+
+[[entry]]
 name = "bench-bitmask-18f4550"
 device = "18F4550"
 flash_words = 160

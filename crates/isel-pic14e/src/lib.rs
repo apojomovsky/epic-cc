@@ -209,6 +209,25 @@ impl<'m> Gen<'m> {
             .unwrap_or(false)
     }
 
+    /// Whether `name` is a local object in the current function: an
+    /// `alloca`'s slot IS the object, so a pointer to it is that slot's
+    /// own frame address rather than an address value stored in the slot
+    /// (epic-cc#647).
+    fn is_local_object(&self, name: &str) -> bool {
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| {
+                f.blocks.iter().any(|b| {
+                    b.insts
+                        .iter()
+                        .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     fn slot_addr(&self, func: &str, name: &str) -> Slot {
         Slot::Direct(
             *self
@@ -1091,6 +1110,31 @@ impl<'m> Gen<'m> {
                     // link-time literal, so it panics there. A propagated
                     // global materializes like an address slot (epic-cc#193).
                     if let Base::Global(name) = &base {
+                        // A flash const table has no RAM address: its bytes
+                        // are a link-time label, so materialize
+                        // `LOW()/HIGH()` literals (epic-cc#647, matching
+                        // `isel`'s arm). A dynamic term cannot ride a literal
+                        // and still takes the address path below.
+                        if self.global_is_const(name) && terms.is_empty() {
+                            let lit = if idx == 0 { "LOW" } else { "HIGH" };
+                            self.emit(format!("    MOVLW {lit}({name})"));
+                            if idx == 0 {
+                                let lo = (k & 0xFF) as u8;
+                                if lo != 0 {
+                                    self.emit(format!("    ADDLW 0x{lo:02X}"));
+                                }
+                            } else {
+                                if (k & 0xFF) != 0 {
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                }
+                                let hi = (k >> 8) as u8;
+                                if hi != 0 {
+                                    self.emit(format!("    ADDLW 0x{hi:02X}"));
+                                }
+                            }
+                            return;
+                        }
                         let addr = self.ptr_value_addr(name, k);
                         let lo = (addr & 0xFF) as u8;
                         let hi = ((addr >> 8) & 0xFF) as u8;
@@ -1135,13 +1179,25 @@ impl<'m> Gen<'m> {
                         }
                         return;
                     }
-                    let sa = match &base {
+                    let (sa, holds_addr) = match &base {
                         Base::Slot(sname, indirect) => {
+                            // The slot's two bytes are read two ways. A
+                            // pointer param's slot or an indirect slot HOLDS
+                            // a runtime address, so its bytes ARE the value.
+                            // A local object (`alloca`) IS the object: its
+                            // value is the slot's own frame address, a
+                            // compile-time literal that must never be read as
+                            // data (epic-cc#647).
                             assert!(
-                                *indirect || self.param_holds_addr(sname),
+                                *indirect
+                                    || self.param_holds_addr(sname)
+                                    || self.is_local_object(sname),
                                 "isel: cannot take the value of a GEP over {base:?}"
                             );
-                            self.slot_addr(self.cur_func, sname).direct()
+                            (
+                                self.slot_addr(self.cur_func, sname).direct(),
+                                *indirect || self.param_holds_addr(sname),
+                            )
                         }
                         other => panic!("isel: cannot take the value of a GEP over {other:?}"),
                     };
@@ -1154,9 +1210,16 @@ impl<'m> Gen<'m> {
                         "isel: GEP with both a constant offset and dynamic terms \
                          loses the term's carry; not supported"
                     );
+                    // An object slot (`alloca`) materializes its frame address
+                    // as a LITERAL; an address-holding slot reads its two bytes
+                    // at runtime (epic-cc#647).
+                    let base_lit = (!holds_addr).then(|| sa.wrapping_add(k));
                     match terms.as_slice() {
                         [] => {
-                            if idx == 0 {
+                            if let Some(addr) = base_lit {
+                                let b = ((addr >> (u32::from(idx) * 8)) & 0xFF) as u8;
+                                self.emit(format!("    MOVLW 0x{b:02X}"));
+                            } else if idx == 0 {
                                 self.emit(format!("    MOVF 0x{sa:02X}, W"));
                                 if k != 0 {
                                     self.emit(format!("    ADDLW 0x{k:02X}"));
@@ -1171,14 +1234,29 @@ impl<'m> Gen<'m> {
                         }
                         [(1, reg)] => {
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
-                            if idx == 0 {
-                                self.emit(format!("    MOVF 0x{sa:02X}, W"));
-                                self.emit(format!("    ADDWF 0x{ra:02X}, W"));
-                            } else {
-                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
-                                self.emit("    BTFSC STATUS, 0".to_string());
-                                self.emit("    ADDLW 0x01".to_string());
-                                self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                            match (base_lit, idx == 0) {
+                                (Some(addr), true) => {
+                                    let b = (addr & 0xFF) as u8;
+                                    self.emit(format!("    MOVLW 0x{b:02X}"));
+                                    self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                                }
+                                (Some(addr), false) => {
+                                    let b = ((addr >> 8) & 0xFF) as u8;
+                                    self.emit(format!("    MOVLW 0x{b:02X}"));
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                }
+                                (None, true) => {
+                                    self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                                    self.emit(format!("    ADDWF 0x{ra:02X}, W"));
+                                }
+                                (None, false) => {
+                                    self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                                    self.emit("    BTFSC STATUS, 0".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                    self.emit(format!("    ADDWF 0x{:02X}, W", ra + 1));
+                                }
                             }
                         }
                         _ => {
@@ -1188,14 +1266,28 @@ impl<'m> Gen<'m> {
                             );
                             let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
                             let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
-                            if idx == 0 {
+                            if let Some(addr) = base_lit {
+                                let b = ((addr >> (u32::from(idx) * 8)) & 0xFF) as u8;
+                                self.emit(format!("    MOVLW 0x{b:02X}"));
+                            } else if idx == 0 {
                                 self.emit(format!("    MOVF 0x{sa:02X}, W"));
+                            } else {
+                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
+                            }
+                            // Byte 0's carry into byte 1 must be consumed
+                            // before byte 1's own adds: both the literal base
+                            // and the runtime slot read leave the low byte's
+                            // carry in STATUS.C, and the two ADDWFs below do
+                            // not (the first ADDWF sets C itself, but only
+                            // after the high byte is already in W).
+                            if idx != 0 {
+                                self.emit("    BTFSC STATUS, 0".to_string());
+                                self.emit("    ADDLW 0x01".to_string());
+                            }
+                            if idx == 0 {
                                 self.emit(format!("    ADDWF 0x{ra1:02X}, W"));
                                 self.emit(format!("    ADDWF 0x{ra2:02X}, W"));
                             } else {
-                                self.emit(format!("    MOVF 0x{:02X}, W", sa + 1));
-                                self.emit("    BTFSC STATUS, 0".to_string());
-                                self.emit("    ADDLW 0x01".to_string());
                                 self.emit(format!("    ADDWF 0x{:02X}, W", ra1 + 1));
                                 self.emit(format!("    ADDWF 0x{:02X}, W", ra2 + 1));
                             }

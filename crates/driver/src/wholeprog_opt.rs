@@ -54,31 +54,29 @@
 //! fold shortens one link, which compounds along chains that pass through
 //! several of them (epic-cc#205, epic-cc#206).
 //!
-//! `loop-reduce` (LSR) is added for PIC18 only (see [`PIC18_PASSES`]). It
-//! leaves call-graph shape alone, so the RAM-reuse invariant above still
-//! holds, but it rewrites walked pointers as scalar-evolution phis
-//! (`%lsr.iv = phi ptr ...`) whose shapes the PIC14 backend miscompiles in
-//! the float/vararg path. PIC18 handles them, so the pass is gated rather
-//! than enabled globally (epic-cc#645 carries the repro and the measured
-//! gains).
+//! `loop-reduce` (LSR) rides in the baseline list too. It leaves call-graph
+//! shape alone, so the RAM-reuse invariant above still holds. It rewrites
+//! walked pointers as scalar-evolution phis (`%lsr.iv = phi ptr ...`); the
+//! PIC14 backend used to miscompile those, reading an `alloca`'s bytes
+//! where the walk needed its frame address, which is fixed (epic-cc#647),
+//! so both cores run it now.
 
 use std::path::Path;
 use std::process::Command;
 
 /// The curated, RAM-safe pass list (see module docs for why each pass is
 /// here and none of them inline across a call boundary).
-const PASSES: &str = "internalize,ipsccp,instcombine,simplifycfg,dce";
-
-/// `loop-reduce` (LSR) on top of [`PASSES`], PIC18 only for now.
 ///
-/// LSR is the largest measured density lever left on PIC18: it hoists a
-/// struct-array stride multiply out of the loop, worth 49 words on
-/// `bench-struct-scan` and 132 on `hal-pic18-menu-demo-18f4550`. It
+/// `loop-reduce` (LSR) is the largest measured density lever left: it
+/// hoists a struct-array stride multiply out of the loop. On PIC18 (which
+/// has `MULWF`) that is 49 words on `bench-struct-scan` and 132 on
+/// `hal-pic18-menu-demo-18f4550`; on PIC14, which has no hardware multiply
+/// and re-emits a shift-add chain per access, hoisting it is worth an order
+/// of magnitude more (roughly -494 words on the same scan shape). It
 /// rewrites walked pointers as scalar-evolution phis (`%lsr.iv = phi ptr
-/// ...`), which the PIC14 backend miscompiles today in the float/vararg
-/// path (epic-cc#645 has the repro and the measurements); PIC18 passes
-/// every suite, so the pass is gated to it rather than enabled globally.
-const PIC18_PASSES: &str =
+/// ...`), a shape PIC14 used to miscompile by reading an `alloca`'s bytes
+/// in place of its frame address (epic-cc#647).
+const PASSES: &str =
     "internalize,ipsccp,instcombine,simplifycfg,dce,loop-reduce,instcombine,simplifycfg,dce";
 
 /// Symbols `internalize` must never touch:
@@ -389,11 +387,13 @@ pub fn run(
     }
     let candidates = always_inline_candidates(&ll_text);
     let marked = mark_always_inline(&ll_text, &candidates);
-    let base = if core == device::Core::Pic18 {
-        PIC18_PASSES
-    } else {
-        PASSES
-    };
+    // Both cores run LSR now (epic-cc#647 fixed the PIC14 alloca-address
+    // defect that gated it, epic-cc#645 measured the gains), so the base
+    // list is core-independent. `core` stays a parameter: the call site is
+    // core-agnostic by design, and a future core-specific deviation has its
+    // hook here.
+    let _ = core;
+    let base = PASSES;
     let passes = if candidates.is_empty() {
         base.to_string()
     } else {
