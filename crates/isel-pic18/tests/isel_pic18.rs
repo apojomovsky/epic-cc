@@ -1216,6 +1216,26 @@ fn non_isr_functions_still_emit_plain_return() {
 }
 
 #[test]
+fn start_parks_past_sleep_in_a_halt_loop() {
+    // epic-cc#643: a simulator that runs past SLEEP executed the const
+    // tables as code (`retlw` underflowed the empty stack). __start ends
+    // `call main`, `sleep`, then a self-loop backstop that hangs loudly.
+    let m = parse("fn main(void) ()\n  block entry:\n    ret void\n");
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
+    let tail = asm
+        .split("    call main")
+        .nth(1)
+        .expect("__start must call main");
+    let sleep = tail.find("    sleep").expect("__start must sleep");
+    let halt = tail.find("__halt:").expect("halt backstop label");
+    let bra = tail.find("    BRA __halt").expect("halt backstop branch");
+    assert!(
+        sleep < halt && halt < bra,
+        "sleep, halt label, halt branch, in order:\n{asm}"
+    );
+}
+
+#[test]
 #[should_panic(expected = "at most one high- and one low-priority")]
 fn two_isrs_panic_loudly() {
     let m = parse(
