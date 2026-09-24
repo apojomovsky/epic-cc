@@ -326,6 +326,11 @@ struct FrameLayout {
     /// slot; the locals placement reads this to put each value at its
     /// slot's address.
     slot_of: HashMap<String, usize>,
+    /// Per-slot access heat, parallel to `widths`: the operand reads plus
+    /// the defining write of every value the slot holds. `window_order`
+    /// reads it to rank the slots of a frame whose access-window prefix is
+    /// worth filling (epic-cc#535).
+    heat: Vec<u32>,
 }
 
 /// Blocks of `f` in liveness and placement order: the entry (the function's
@@ -666,12 +671,69 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
         }
     }
     let widths: Vec<u8> = slots.iter().map(|&(_, _, w)| w).collect();
+    // Per-slot access heat: the operand reads plus the defining write of
+    // every value the slot holds. A memory object (alloca, byval/sret param,
+    // va region) is touched through derived pointers, so count one so it
+    // still ranks, but never above a real value.
+    //
+    // The `widths` order stays as the coloring left it: it feeds
+    // `frame_end`, which on a split-bank device can move a callee's base.
+    let mut heat: Vec<u32> = vec![0; widths.len()];
+    for (v, &(_, _, _, _, mem)) in &defs {
+        let slot = slot_of[v];
+        let reads = if mem {
+            0
+        } else {
+            uses.get(v).map_or(0, |u| u.len() as u32)
+        };
+        heat[slot] += reads + 1;
+    }
     let size: u16 = widths.iter().map(|&w| u16::from(w)).sum();
     FrameLayout {
         widths,
         size,
         slot_of,
+        heat,
     }
+}
+
+/// `fl.widths` reordered by the permutation `perm` (`perm[new] = old`), the
+/// width vector the placed order would produce.
+fn perm_widths(fl: &FrameLayout, perm: &[usize]) -> Vec<u8> {
+    perm.iter().map(|&old| fl.widths[old]).collect()
+}
+
+/// The slot permutation for a frame placed at `base`, or `None` to leave the
+/// coloring's own order alone.
+///
+/// `win_end` is the exclusive end of the device's access window (`0x60` on
+/// PIC18, whose window is `0x000-0x05F`). `operand()` reaches an address in
+/// that window with no `MOVLB`; the frame overlay sits at `gpr_start`, so a
+/// frame's low bytes are the bank-free ones and a frame that ends past the
+/// window spends `MOVLB` on its tail. Permuting the slots by heat puts the
+/// hottest bytes in that prefix.
+///
+/// Two guards keep this from hurting anything:
+///
+/// - Only a frame that STRADDLES the window's end can gain: a frame wholly
+///   inside it is already bank-free byte for byte, and one wholly outside it
+///   is banked throughout, so in both cases reordering changes nothing but
+///   the `MOVFF` copy runs it can break (a run of adjacent slots a memcpy
+///   walks as one looped move; splitting it costs one instruction per byte,
+///   epic-cc#535's measured 3-word `math` regression).
+/// - The permutation is stable, so equal heat keeps the coloring's order and
+///   a frame whose accesses do not distinguish its slots lays out exactly as
+///   before.
+///
+/// Returns `perm` with `perm[new_position] = old_slot`.
+fn window_order(base: u16, win_end: u16, fl: &FrameLayout) -> Option<Vec<usize>> {
+    let frame_end = u32::from(base) + u32::from(fl.size);
+    if base >= win_end || frame_end <= u32::from(win_end) {
+        return None;
+    }
+    let mut perm: Vec<usize> = (0..fl.widths.len()).collect();
+    perm.sort_by_key(|&i| std::cmp::Reverse(fl.heat[i]));
+    Some(perm)
 }
 
 /// Every function transitively reachable from `roots` over the caller ->
@@ -1485,16 +1547,34 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // end equals the physical end the callee bases were derived from.
     let mut locals: HashMap<String, u16> = HashMap::new();
     let mut local_width: HashMap<String, u8> = HashMap::new();
+    // The exclusive end of the device's access window, when it has one: the
+    // last bank-free byte is `win_end - 1` (epic-cc#535).
+    let win_end = device.access_bank.map(|(_, hi)| hi + 1);
     for f in &m.funcs {
         let b = base[&f.name];
         let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
-        let mut slot_addr: Vec<u16> = Vec::with_capacity(fl.widths.len());
+        // The frame end the coloring's own slot order produces; every callee
+        // base is derived from it (`frame_end` over `locals_widths`), so a
+        // permutation that moved it would silently rebase the callees.
+        let size_end = frame_end(device, b, &fl.widths);
+        // Slot order: heat-first when this frame straddles the access
+        // window's end, the coloring's order otherwise. A permutation keeps
+        // the frame's byte size but can in principle move the end where a
+        // slot crosses a region boundary (p18f2450, the one PIC18 with a
+        // split `ram_banks`); fall back rather than rebase the callees.
+        let order: Vec<usize> = match win_end.and_then(|we| window_order(b, we, &fl)) {
+            Some(p) if frame_end(device, b, &perm_widths(&fl, &p)) == size_end => p,
+            _ => (0..fl.widths.len()).collect(),
+        };
+        let mut slot_addr: Vec<u16> = vec![0; fl.widths.len()];
         let mut addr = b;
-        for &w in &fl.widths {
+        for &slot in &order {
+            let w = fl.widths[slot];
             let start = place_contiguous(device, addr, w);
-            slot_addr.push(start);
+            slot_addr[slot] = start;
             addr = start + u16::from(w);
         }
+        debug_assert_eq!(addr, size_end, "frame end moved for {}", f.name);
         for (name, &slot) in &fl.slot_of {
             let key = format!("{}::{name}", f.name);
             locals.insert(key.clone(), slot_addr[slot]);
@@ -1707,5 +1787,35 @@ mod tests {
         let dev = device::resolve("p18f4550").expect("p18f4550 is a known device");
         assert_eq!(routine_base(dev, 0xEB, &[22]), 0x100);
         assert_eq!(routine_base(dev, 0xE7, &[22]), 0xE7);
+    }
+
+    /// epic-cc#535: the reorder applies only when the frame straddles the
+    /// window's end. A frame wholly inside the window is already bank-free
+    /// byte for byte, so permuting it can only break the `MOVFF` copy runs it
+    /// walks (the measured `math` regression); a frame wholly outside it is
+    /// banked throughout and likewise gains nothing. The placement path only
+    /// ever sees PIC18 frames based at `gpr_start` inside the window, so the
+    /// boundary cases have no module-level expression and are pinned here.
+    #[test]
+    fn window_order_fires_only_for_a_straddling_frame() {
+        let layout = |widths: Vec<u8>, heat: Vec<u32>| FrameLayout {
+            size: widths.iter().map(|&w| u16::from(w)).sum(),
+            widths,
+            slot_of: HashMap::new(),
+            heat,
+        };
+        // A window of [0x10, 0x60) with frames based at 0x10, the PIC18 shape.
+        // Wholly inside: 1 + 2 = 3 bytes, ending at 0x13, well under 0x60.
+        assert!(window_order(0x10, 0x60, &layout(vec![1, 2], vec![9, 1])).is_none());
+        // Straddling: 0x58 + 0x10 = 0x68 past the window end, and the hotter
+        // 2-byte slot (heat 9) must come first.
+        let straddling = layout(vec![8, 8], vec![1, 9]);
+        assert_eq!(
+            window_order(0x58, 0x60, &straddling),
+            Some(vec![1, 0]),
+            "the hotter slot takes the window-resident low bytes"
+        );
+        // Wholly above the window: no frame byte is bank-free, so leave it.
+        assert!(window_order(0x60, 0x60, &straddling).is_none());
     }
 }
