@@ -43,7 +43,7 @@ ram_bytes = 51
 name = "bench-switch-18f4550"
 device = "18F4550"
 flash_words = 70
-ram_bytes = 8
+ram_bytes = 9
 
 [[entry]]
 name = "bench-bool-18f4550"
@@ -126,5 +126,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 11295
-ram_bytes = 739
+flash_words = 11306
+ram_bytes = 735
