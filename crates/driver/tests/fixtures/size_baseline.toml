@@ -12,13 +12,13 @@ ram_bytes = 9
 [[entry]]
 name = "add-18f4550"
 device = "18F4550"
-flash_words = 19
+flash_words = 18
 ram_bytes = 8
 
 [[entry]]
 name = "bench-shift-18f4550"
 device = "18F4550"
-flash_words = 91
+flash_words = 89
 ram_bytes = 26
 
 [[entry]]
@@ -36,7 +36,7 @@ ram_bytes = 16
 [[entry]]
 name = "bench-struct-copy-18f4550"
 device = "18F4550"
-flash_words = 46
+flash_words = 45
 ram_bytes = 51
 
 [[entry]]
@@ -48,7 +48,7 @@ ram_bytes = 9
 [[entry]]
 name = "bench-bool-18f4550"
 device = "18F4550"
-flash_words = 42
+flash_words = 41
 ram_bytes = 9
 
 [[entry]]
@@ -56,6 +56,12 @@ name = "bench-dead-store-18f4550"
 device = "18F4550"
 flash_words = 18
 ram_bytes = 8
+
+[[entry]]
+name = "bench-w-roundtrip-18f4550"
+device = "18F4550"
+flash_words = 20
+ram_bytes = 10
 
 [[entry]]
 name = "bench-bank-18f4550"
@@ -66,7 +72,7 @@ ram_bytes = 15
 [[entry]]
 name = "bench-handle-init-18f4550"
 device = "18F4550"
-flash_words = 24
+flash_words = 23
 ram_bytes = 9
 
 [[entry]]
@@ -78,7 +84,7 @@ ram_bytes = 10
 [[entry]]
 name = "bench-u32-loop-18f4550"
 device = "18F4550"
-flash_words = 87
+flash_words = 85
 ram_bytes = 23
 
 [[entry]]
@@ -96,13 +102,13 @@ ram_bytes = 99
 [[entry]]
 name = "bench-bitmask-18f4550"
 device = "18F4550"
-flash_words = 161
+flash_words = 160
 ram_bytes = 20
 
 [[entry]]
 name = "bench-hoist-18f4550"
 device = "18F4550"
-flash_words = 140
+flash_words = 134
 ram_bytes = 18
 
 [[entry]]
@@ -114,7 +120,7 @@ ram_bytes = 47
 [[entry]]
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
-flash_words = 397
+flash_words = 395
 ram_bytes = 34
 
 [[entry]]
@@ -126,5 +132,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 11306
+flash_words = 11290
 ram_bytes = 735

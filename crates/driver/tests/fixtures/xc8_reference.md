@@ -65,10 +65,11 @@ then read the flash/RAM line from the `xc8-cc` link step's own
 
 ## Microbench ladder (epic-cc#581)
 
-XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the fifteen
+XC8 v4.00 (build date Jun 14 2026) `-O2` numbers for the sixteen
 `size-bench` programs (eight from epic-cc#581, four from epic-cc#617,
-three from epic-cc#624), measured 2026-09-22 and 2026-09-23 on the
-`epic-cc-xc8-oracle:local` image. Each bench compiled standalone:
+three from epic-cc#624, one from epic-cc#502), measured 2026-09-22,
+2026-09-23 and 2026-09-24 on the `epic-cc-xc8-oracle:local` image.
+Each bench compiled standalone:
 
 ```
 xc8-cc -mcpu=18f4550 -O2 bench-<stem>.c -o <stem>.hex
@@ -96,6 +97,7 @@ predates #590 (94 words, 64 after it merges).
 | `bench-struct-scan` | 88 (176 B) | 96 | 205 | 99 | +117 |
 | `bench-bitmask` | 54 (108 B) | 13 | 161 | 20 | +107 |
 | `bench-hoist` | 137 (274 B) | 13 | 140 | 18 | +3 |
+| `bench-w-roundtrip` | 16 (32 B) | 3 | 20 | 10 | +4 |
 
 Negative gap means epic-cc is smaller. Eight benches still trail XC8
 (switch, bool, struct-copy, u32-loop, u16-dec, struct-scan, bitmask,

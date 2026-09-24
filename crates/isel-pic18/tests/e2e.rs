@@ -1105,3 +1105,46 @@ fn routine_frame_straddling_a_bsr_bank_is_snapped_and_runs() {
     );
     assert!(p.halted());
 }
+
+/// epic-cc#502 acceptance: a volatile global read twice, with a store in
+/// between, must reach the file register both times. The cache tracks slot
+/// addresses only, and a global's address is deliberately never tracked:
+/// an ISR can rewrite it while the epilogue restores the interrupted W, so
+/// a cached byte would be stale. The frame-slot elision is covered by the
+/// unit tests; this is the negative case that keeps it honest.
+#[test]
+fn volatile_global_reads_are_never_served_from_the_w_cache() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/w_cache_volatile.c"
+    );
+    let (mut p, globals, asm) = compile_with_asm(fixture);
+    // `in` is read twice and never written. Neither read may be served
+    // from the cache, so both must name the global as their source.
+    let in_addr = globals["in"];
+    let in_reads = asm
+        .lines()
+        .map(str::trim)
+        .filter(|l| {
+            l.starts_with(&format!("MOVFF 0x{in_addr:03X}, "))
+                || l.starts_with(&format!("MOVF 0x{in_addr:03X},"))
+        })
+        .count();
+    assert!(
+        in_reads >= 2,
+        "every volatile read of in must survive:\n{asm}"
+    );
+    p.run(400);
+    let out = globals["out"];
+    let slot = globals["slot"];
+    assert_eq!(
+        p.ram()[slot as usize],
+        p.ram()[in_addr as usize],
+        "slot mirrors the first read"
+    );
+    assert_eq!(
+        p.ram()[out as usize],
+        p.ram()[in_addr as usize],
+        "out mirrors the second read"
+    );
+}
