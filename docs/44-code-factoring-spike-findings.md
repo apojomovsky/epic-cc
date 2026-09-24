@@ -24,11 +24,16 @@ repeated instruction sequences in the listing:
 
 A sequence is outlinable when it has no label inside, no branch, skip,
 call, return or data, touches none of PCL, PCLATH, PCLATU, STKPTR or
-TOS (including their access-bank aliases), and does not start right
-after a skip. Matching is textual, which is exact here: allocation is
+TOS (operands resolved to addresses first, access-bank aliases
+included), and is not the textual successor of a skip, labels
+notwithstanding: a skip over one instruction must not start skipping a
+`CALL` that stands for several. Indirect accesses (`INDF`, `POSTINC`,
+`PLUSW`) are assumed never to reach those registers, which C cannot
+produce without inline assembly. Matching is textual, which is exact here: allocation is
 static, so identical text means identical effect. `CALL` and `RETURN`
 preserve W, STATUS and BSR, so a body runs under its caller's state
-exactly like the inline copy did.
+exactly like the inline copy did. The pass must never emit the `FAST`
+forms, whose shadow registers an interrupt handler may own.
 
 A pick is priced `k*W - (k*c + W + 1)` for `k` sites of `W` words and
 call cost `c`. The selector takes the best pick, marks its sites, and
@@ -47,7 +52,8 @@ Both rows with numbers are exact: the rewritten listing assembled
 through `assemble_pic18`. The 1-word bound fails assembly because
 bodies at the end of the program are out of `RCALL` reach.
 
-Where the saving comes from (the `CALL` row):
+Where the saving comes from (the selector's estimate for the `CALL`
+row, 1159 words against the measured 1193):
 
 - 80% repeats inside a single function: inlined bodies and unrolled
   address arithmetic, which is also why local `RCALL` placement pays.
@@ -59,25 +65,27 @@ Where the saving comes from (the `CALL` row):
 
 ## Behaviour check
 
-A layout-preserving variant pads each replaced site with `NOP`s to its
-original size and puts the shared bodies after the code, so every
-existing address, table and stored pointer stays put. Our PIC18
-simulator ran it next to the original, comparing the ordered stream of
-RAM writes (excluding PCL and the stack SFRs):
+Each variant has a layout-preserving twin: every replaced site is padded
+with `NOP`s to its original size and the shared bodies go after the
+code with long `CALL`/`GOTO` forms, so every existing address, table
+and stored pointer stays put. Our PIC18 simulator ran each twin next
+to the original, comparing the ordered stream of RAM writes (excluding
+PCL and the stack SFRs). For the 1487-word selection:
 
 - no interrupts: both images reach their halt with the same 76005
   writes, no mismatch;
 - interrupts requested every 500, 97 and 13 writes: no mismatch over
-  540K to 1.2M writes across 3M instructions;
-- 63 of the 87 outlined bodies executed, carrying 831 of their 1146
-  words.
+  510K to 1.1M writes across 3M instructions;
+- 90 of its 127 outlined bodies executed, the bodies behind 1099 of
+  the 1463 words outlining saves.
 
-The unpadded images cannot be compared write for write: moving code
-moves the constant tables, so TBLPTR values and const pointers stored
-in RAM differ by design. They differ from the padded image only in the
-call opcode and body placement: `RCALL` reach is checked by the
-assembler, and every body placed between functions sits after an
-unconditional `RETURN`, `BRA` or `GOTO`, checked on the listing.
+The 1193-word selection passes the same runs. The unpadded images
+cannot be compared write for write: moving code moves the constant
+tables, so TBLPTR values and const pointers stored in RAM differ by
+design. Each differs from its padded twin only in call opcodes and
+body placement: `RCALL` reach is checked by the assembler, and every
+body placed between functions sits after an unconditional `RETURN`,
+`BRA` or `GOTO`, checked on the listing.
 
 ## Costs
 
@@ -85,9 +93,9 @@ unconditional `RETURN`, `BRA` or `GOTO`, checked on the listing.
   address. The deepest main-line chain is 7 and the ISR chain 3; the
   worst case stays far below the 31-entry PIC18 stack. PIC14's 8-level
   stack is a different story and is not priced here.
-- **Cycles:** the full harness run executes 6.0% (`CALL` variant) to
-  7.2% (local `RCALL`) more instructions, each added one a 2-cycle call
-  or return.
+- **Cycles:** run to halt, the unpadded images execute 6.0% (1193-word
+  image) and 7.2% (1487-word image) more instructions than the
+  original, each added one a 2-cycle call or return.
 - **Interrupt latency:** about 127 of the 1487 words sit in code
   reachable from the interrupt handler. Excluding that tree keeps
   latency unchanged for about 1360 words.
