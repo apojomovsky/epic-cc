@@ -545,12 +545,14 @@ fn i32_param_and_def_get_four_bytes() {
     );
     let out = allocate(&PIC16F877A, &m, "depth 1\n");
     // p i32 at 0x20, q at 0x24, r at 0x28 (contiguous 4-byte slots); s
-    // reuses q's slot (q is dead once r and s are computed).
+    // reuses q's slot (q is dead once r and s are computed). The heat
+    // reorder (epic-cc#535) only fires on a device with an access window,
+    // and PIC16F877A has none, so the per-name addresses stay pinned here.
+    assert_eq!(out.total_bank0, 4 + 4 + 4);
     assert_eq!(out.locals["f::p"], 0x20);
     assert_eq!(out.locals["f::q"], 0x24);
     assert_eq!(out.locals["f::r"], 0x28);
     assert_eq!(out.locals["f::s"], 0x24);
-    assert_eq!(out.total_bank0, 4 + 4 + 4);
 }
 
 #[test]
@@ -1480,4 +1482,52 @@ fn numeric_entry_lays_out_like_a_named_entry() {
     let numeric = allocate(&PIC16F877A, &parse(&shape("0")), "depth 1\n");
     let named = allocate(&PIC16F877A, &parse(&shape("entry")), "depth 1\n");
     assert_eq!(numeric.locals, named.locals);
+}
+
+/// epic-cc#535: a frame that straddles the access window's end gets its
+/// hottest slots first, so the bank-free window prefix carries the bytes
+/// that would otherwise spend `MOVLB`.
+///
+/// The frame must be wider than PIC18F4550's 80-byte window (0x010-0x05F)
+/// for the reorder to apply at all, so this builds one: every value is read
+/// by a final chain sum, which keeps them all live at once and forces each
+/// into its own slot. `%v0` additionally feeds many stores, making it the
+/// frame's hottest value.
+#[test]
+fn the_hottest_slot_sits_at_the_frame_base() {
+    const N: usize = 45;
+    let mut src = String::from("global sink i16\nfn f(i16) (p=i16)\nblock entry:\n");
+    for i in 0..N {
+        src.push_str(&format!("  %v{i} = add i16 %p, {i}\n"));
+    }
+    // Feed %v0 to many stores up front; its range already reaches the sum
+    // below, so this only raises its heat. Two per value against the
+    // parameter's one gives %v0 an unambiguous margin over it.
+    for _ in 0..2 * N {
+        src.push_str("  store i16 %v0, ptr @sink\n");
+    }
+    // Chain-sum every value, keeping all N live to this point.
+    src.push_str("  %s0 = add i16 %v0, %v1\n");
+    for i in 1..N {
+        src.push_str(&format!("  %s{i} = add i16 %s{}, %v{i}\n", i - 1));
+    }
+    src.push_str(&format!("  store i16 %s{}, ptr @sink\n  ret void\n", N - 1));
+
+    let out = allocate(&PIC18F4550, &parse(&src), "depth 1\n");
+    // The frame really does straddle, or the reorder is inert and this test
+    // proves nothing.
+    assert!(
+        out.locals.values().any(|&a| a > 0x5F),
+        "the frame must reach past the access window end"
+    );
+    // The hottest value takes the window's first byte; a cold one does not.
+    assert_eq!(
+        out.locals["f::v0"], 0x10,
+        "the hottest value takes the frame base"
+    );
+    assert!(
+        out.locals["f::v43"] > 0x5F,
+        "a cold value spills past the window: {:#x}",
+        out.locals["f::v43"]
+    );
 }
