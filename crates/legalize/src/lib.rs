@@ -58,6 +58,7 @@ pub fn legalize(m: Module) -> Module {
     // (they all read the same shared storage, epic-cc#568).
     let (m, stored_lo, stored_hi, spellings) = duplicate_isr_shared(m);
     let m = sink_ptr_select_funcs(m);
+    let m = narrow_div_rem_tails(m);
     let mut funcs = Vec::with_capacity(m.funcs.len() + 16);
     let mut used: Vec<String> = Vec::new();
     // Fresh SSA names for the fcmp materialization intermediates (the call
@@ -297,6 +298,211 @@ fn sink_ptr_select_funcs(m: Module) -> Module {
     }
 }
 
+/// Rewrite the decimal div-rem expansion so its remainder is computed at
+/// the width it is actually observed at (epic-cc#622).
+///
+/// clang emits `v % 10` as `q = udiv i16 v, 10`, `m = mul i16 q, 246`
+/// (246 is the low byte of -10), `s = add i16 m, v`, `r = trunc i16 s to
+/// i8`. Only `r`'s low byte is ever used. Modular arithmetic lets the
+/// whole tail run at i8: `(m + v) mod 256 == ((q mod 256)*246 + (v mod
+/// 256)) mod 256`, because a product and a sum only depend on their
+/// operands' low bytes modulo 256. Narrowing `mul i16` to `mul i8` lets
+/// the existing 4-word `__mul_u8` replace the 19-word `__mul_u16`, and
+/// drops the 2-byte argument staging to 1 byte per operand.
+///
+/// The rewrite fires only when the shape is exact and single-use: the
+/// `add`'s sole consumer is the `trunc`, and the `mul`'s sole consumer is
+/// the `add`. A second use of either keeps the i16 form, which is always
+/// correct.
+fn narrow_div_rem_tails(m: Module) -> Module {
+    let mut fresh = FreshNames::from_module(&m);
+    let mut funcs = Vec::with_capacity(m.funcs.len());
+    for f in m.funcs {
+        // dst -> defining inst, for the operand lookup.
+        let defs: HashMap<String, Inst> = f
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter())
+            .filter_map(|i| inst_dst(i).map(|d| (d.to_string(), i.clone())))
+            .collect();
+        // Uses of each reg, so a shape is rewritten only when it is the
+        // sole consumer chain.
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in inst_reads(inst) {
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        // For each qualifying shape: the `mul`'s dst takes the narrowed
+        // multiply, the `add`'s dst takes the narrowed sum (under the
+        // trunc's own dst), and the trunc itself disappears.
+        let mut replace: HashMap<String, Vec<Inst>> = HashMap::new();
+        let mut drop: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                let Inst::Trunc(t) = inst else { continue };
+                if t.to != Ty::I8 {
+                    continue;
+                }
+                // Only i16/i32 tails: those are the routine-backed
+                // multiplies (`__mul_u16`/`__mul_u32`) this shortens.
+                if !matches!(t.from, Ty::I16 | Ty::I32) {
+                    continue;
+                }
+                let w = t.from;
+                let Val::Reg(sum) = &t.val else { continue };
+                if uses.get(sum) != Some(&1) {
+                    continue;
+                }
+                let Some(Inst::Bin(add)) = defs.get(sum) else {
+                    continue;
+                };
+                if add.op != BinOp::Add || add.ty != w {
+                    continue;
+                }
+                // One arm is the `mul w q, K`; the other is `v`.
+                let (mul_dst, other) = match (&add.a, &add.b) {
+                    (Val::Reg(r), o) if defs.get(r).is_some_and(|d| is_mul_const(d, w)) => {
+                        (r.clone(), o.clone())
+                    }
+                    (o, Val::Reg(r)) if defs.get(r).is_some_and(|d| is_mul_const(d, w)) => {
+                        (r.clone(), o.clone())
+                    }
+                    _ => continue,
+                };
+                // The narrowed tail needs the addend to be a register: the
+                // rewrite emits `trunc <w> <addend> to i8`, and isel rejects
+                // a const source outright (`const source Trunc not yet
+                // supported`) while a global would be read as an address.
+                // The clang shape is always `add w %m, %v` with `%v` a
+                // loaded register, so the guard costs nothing real.
+                if !matches!(other, Val::Reg(_)) {
+                    continue;
+                }
+                if uses.get(&mul_dst) != Some(&1) {
+                    continue;
+                }
+                let Some(Inst::Bin(mul)) = defs.get(&mul_dst) else {
+                    continue;
+                };
+                let (Val::Reg(qreg), Val::Const(k)) = (&mul.a, &mul.b) else {
+                    continue;
+                };
+                // `q`'s own use count is irrelevant: it keeps its width
+                // and every other use reads the full value. Only the
+                // multiply and the sum must be single-use, because those
+                // are the results this rewrite changes the width of.
+                // The narrowed tail stands where the multiply did: the low
+                // byte of `q`, the 8x8 product, the low byte of `v`, then
+                // the 8-bit sum carrying the trunc's own name.
+                let q8 = fresh.fresh();
+                let p8 = fresh.fresh();
+                let v8 = fresh.fresh();
+                replace.insert(
+                    mul_dst.clone(),
+                    vec![
+                        Inst::Trunc(Trunc {
+                            dst: q8.clone(),
+                            from: w,
+                            val: Val::Reg(qreg.clone()),
+                            to: Ty::I8,
+                            loc: mul.loc.clone(),
+                        }),
+                        Inst::Bin(Bin {
+                            dst: p8.clone(),
+                            op: BinOp::Mul,
+                            ty: Ty::I8,
+                            a: Val::Reg(q8),
+                            b: Val::Const(*k),
+                            loc: mul.loc.clone(),
+                        }),
+                    ],
+                );
+                replace.insert(
+                    sum.clone(),
+                    vec![
+                        Inst::Trunc(Trunc {
+                            dst: v8.clone(),
+                            from: w,
+                            val: other,
+                            to: Ty::I8,
+                            loc: add.loc.clone(),
+                        }),
+                        Inst::Bin(Bin {
+                            dst: t.dst.clone(),
+                            op: BinOp::Add,
+                            ty: Ty::I8,
+                            a: Val::Reg(p8),
+                            b: Val::Reg(v8),
+                            loc: t.loc.clone(),
+                        }),
+                    ],
+                );
+                drop.insert(t.dst.clone());
+            }
+        }
+        if replace.is_empty() {
+            funcs.push(f);
+            continue;
+        }
+        let mut blocks = Vec::with_capacity(f.blocks.len());
+        for b in f.blocks {
+            let mut insts: Vec<Inst> = Vec::with_capacity(b.insts.len());
+            for inst in b.insts {
+                if let Some(d) = inst_dst(&inst) {
+                    if let Some(repl) = replace.get(d) {
+                        insts.extend(repl.iter().cloned());
+                        continue;
+                    }
+                    if drop.contains(d) {
+                        continue;
+                    }
+                }
+                insts.push(inst);
+            }
+            blocks.push(Block {
+                label: b.label,
+                insts,
+            });
+        }
+        funcs.push(Func {
+            name: f.name,
+            ret: f.ret,
+            params: f.params,
+            blocks,
+            isr: f.isr,
+            irq_priority: f.irq_priority,
+            naked: f.naked,
+            variadic: f.variadic,
+        });
+    }
+    Module {
+        globals: m.globals,
+        funcs,
+        module_asm: m.module_asm,
+    }
+}
+
+/// Whether `inst` is `mul <ty> <reg>, <const>` at `ty`.
+fn is_mul_const(inst: &Inst, ty: Ty) -> bool {
+    matches!(
+        inst,
+        Inst::Bin(Bin {
+            op: BinOp::Mul,
+            ty: t,
+            b: Val::Const(_),
+            ..
+        }) if *t == ty
+    )
+}
+
+/// The SSA registers an instruction reads, as the pointer-sinking pass
+/// has always enumerated them. Deliberately left as it was: making this
+/// enumeration stricter would turn some currently-sinkable functions into
+/// non-sinkable ones, and a non-sinkable body has no iselcore lowering
+/// (it panics). The narrowing pass uses `inst_reads`, which is complete.
 fn inst_regs(inst: &Inst) -> Vec<String> {
     let mut regs = Vec::new();
     let mut push = |v: &Val| {
@@ -330,6 +536,100 @@ fn inst_regs(inst: &Inst) -> Vec<String> {
             }
         }
         _ => {}
+    }
+    regs
+}
+
+/// Every SSA register an instruction reads, across all operand shapes.
+///
+/// The narrowing pass is only sound when the widened tail's low byte is
+/// the whole observable result, so a use it fails to see would drop a
+/// live 16-bit value: the enumeration must cover every variant, not just
+/// the value operands (`Store`'s value, `Ret`'s operand, `Phi`'s incoming
+/// arms, `Switch`'s scrutinee, `Memcpy`'s operands). Kept separate from
+/// `inst_regs` so a caller with its own established semantics is not
+/// perturbed by this one's completeness (epic-cc#622).
+fn inst_reads(inst: &Inst) -> Vec<String> {
+    fn push(v: &Val, regs: &mut Vec<String>) {
+        if let Val::Reg(r) = v {
+            regs.push(r.clone());
+        }
+    }
+    let mut regs = Vec::new();
+    match inst {
+        Inst::Load(l) => regs.push(l.ptr.strip_prefix('%').unwrap_or(&l.ptr).to_string()),
+        Inst::Store(s) => {
+            regs.push(s.ptr.strip_prefix('%').unwrap_or(&s.ptr).to_string());
+            push(&s.val, &mut regs);
+        }
+        Inst::Bin(b) => {
+            push(&b.a, &mut regs);
+            push(&b.b, &mut regs);
+        }
+        Inst::Ret(Some((_, v)), _) => push(v, &mut regs),
+        Inst::Ret(None, _) => {}
+        Inst::Zext(z) => push(&z.val, &mut regs),
+        Inst::Sext(x) => push(&x.val, &mut regs),
+        Inst::Trunc(t) => push(&t.val, &mut regs),
+        Inst::IntToPtr(p) => push(&p.val, &mut regs),
+        Inst::Icmp(c) => {
+            push(&c.a, &mut regs);
+            push(&c.b, &mut regs);
+        }
+        Inst::Select(s) => {
+            push(&s.cond, &mut regs);
+            push(&s.a, &mut regs);
+            push(&s.b, &mut regs);
+        }
+        Inst::Call(c) => {
+            for a in &c.args {
+                push(&a.val, &mut regs);
+            }
+            if !c.callees.is_empty() {
+                regs.push(c.func.clone());
+            }
+        }
+        Inst::Br(_) => {}
+        Inst::BrCond(b) => push(&b.cond, &mut regs),
+        Inst::Switch(s) => push(&s.val, &mut regs),
+        Inst::Phi(p) => {
+            for (v, _) in &p.incoming {
+                push(v, &mut regs);
+            }
+        }
+        Inst::Gep(g) => {
+            if let GepBase::Reg(r) = &g.base {
+                regs.push(r.clone());
+            }
+            for (_, t) in &g.terms {
+                regs.push(t.clone());
+            }
+        }
+        Inst::Alloca(_) => {}
+        Inst::Memcpy(mc) => {
+            push(&mc.dst, &mut regs);
+            push(&mc.src, &mut regs);
+            if let MemLen::Reg(v) = &mc.len {
+                push(v, &mut regs);
+            }
+        }
+        Inst::Freeze(f) => push(&f.val, &mut regs),
+        Inst::VaArg(v) => regs.push(v.ptr.clone()),
+        Inst::VaStart(v) => regs.push(v.list.clone()),
+        Inst::FloatBin(b) => {
+            push(&b.a, &mut regs);
+            push(&b.b, &mut regs);
+        }
+        Inst::Fcmp(c) => {
+            push(&c.a, &mut regs);
+            push(&c.b, &mut regs);
+        }
+        Inst::FloatConv(c) => push(&c.val, &mut regs),
+        Inst::Asm(a) => {
+            for op in &a.operands {
+                regs.push(op.ptr.strip_prefix('%').unwrap_or(&op.ptr).to_string());
+            }
+        }
     }
     regs
 }
