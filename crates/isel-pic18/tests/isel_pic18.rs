@@ -3375,6 +3375,87 @@ fn const_memcpy_walks_tblrd_postinc() {
 }
 
 #[test]
+fn a_long_const_memcpy_runs_as_one_loop() {
+    // Above the copy-loop floor a const-source copy stops unrolling its
+    // `TBLRD*+`+`MOVFF` pairs and becomes one counted loop: the table's
+    // own bytes are paid once, so the per-site cost drops from 3 words a
+    // byte to a 12-word loop (epic-cc#504).
+    let bytes: Vec<u8> = (0..12u8)
+        .map(|b| b.wrapping_mul(7).wrapping_add(3))
+        .collect();
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global dst i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 memcpy @dst @t 12\n\
+                 ret void\n",
+        ),
+        "t",
+        &bytes,
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[("dst", 0x110)]), None);
+    assert_eq!(
+        asm.matches("TBLRD*+").count(),
+        1,
+        "one TBLRD in the loop body, not one per byte:\n{asm}"
+    );
+    assert!(
+        asm.contains("LFSR 1, 0x110"),
+        "the destination seed is missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0xFF5, 0xFE6"),
+        "the TABLAT -> POSTINC1 body is missing:\n{asm}"
+    );
+    assert!(
+        asm.contains("DECFSZ 0xFE8,F,A"),
+        "the WREG-counted loop tail is missing:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0xFF5, 0x110"),
+        "the unrolled pairs must not coexist with the loop:\n{asm}"
+    );
+}
+
+#[test]
+fn a_short_const_memcpy_stays_inline() {
+    // Below the floor the fixed loop cannot repay itself, so the unrolled
+    // TBLRD walk stays (a 2-byte const init must not grow).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global dst i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 memcpy @dst @t 2\n\
+                 ret void\n",
+        ),
+        "t",
+        &[0xAB, 0xCD],
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[("dst", 0x110)]), None);
+    assert_eq!(
+        asm.matches("TBLRD*+").count(),
+        2,
+        "no loop below the floor:\n{asm}"
+    );
+    // Scoped to main: `__start`'s zero-init loop also uses DECFSZ, so a
+    // whole-listing search would match the wrong loop.
+    let main_body = asm
+        .split("main:")
+        .nth(1)
+        .and_then(|rest| rest.split("RETURN").next())
+        .expect("main body");
+    assert!(
+        !main_body.contains("DECFSZ"),
+        "no counted loop below the floor:\n{asm}"
+    );
+    assert!(asm.contains("MOVFF 0xFF5, 0x110"), "byte 0 inline:\n{asm}");
+}
+
+#[test]
 fn single_byte_indirect_memcpy_does_not_walk() {
     // One byte has nothing to walk from: byte 0's full path is the
     // whole copy, with no POSTINC form emitted. (epic-cc#492)

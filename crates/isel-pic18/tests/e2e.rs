@@ -1148,3 +1148,41 @@ fn volatile_global_reads_are_never_served_from_the_w_cache() {
         "out mirrors the second read"
     );
 }
+
+/// epic-cc#504 acceptance: a local aggregate with a constant initializer
+/// whose address escapes (here through a function pointer) is copied in
+/// from a clang-synthesized flash table. Above the copy-loop floor that
+/// copy runs as one counted TBLRD loop, and the bytes it lands must be
+/// exactly the initializer's.
+///
+/// Expected: 0x10 ^ 0x87 ^ 0x0F ^ (0x1234 & 0xFF) = 0x10 ^ 0x87 ^ 0x0F ^ 0x34.
+#[test]
+fn a_const_initialized_aggregate_copies_by_loop_and_reads_back_its_bytes() {
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/const_agg_loop.c"
+    );
+    let (mut p, globals, asm) = compile_with_asm(fixture);
+    let main_body = asm
+        .split("main:")
+        .nth(1)
+        .and_then(|rest| rest.split("RETURN").next())
+        .expect("main body");
+    assert_eq!(
+        main_body.matches("TBLRD").count(),
+        1,
+        "the 18-byte copy must run as one loop, not 18 unrolled reads:\n{asm}"
+    );
+    assert!(
+        main_body.contains("LFSR 1, 0x010"),
+        "the loop seeds the destination pointer:\n{asm}"
+    );
+    p.run(400_000);
+    let expected = 0x10u8 ^ 0x87 ^ 0x0F ^ 0x34;
+    assert_eq!(
+        p.ram()[globals["sink"] as usize],
+        expected,
+        "the loop must have landed the initializer's bytes intact"
+    );
+    assert!(p.halted());
+}

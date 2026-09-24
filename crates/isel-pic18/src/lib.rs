@@ -1300,6 +1300,36 @@ impl<'m> Gen<'m> {
         (src_direct.map_or(McSrc::Indirect, McSrc::Direct), dst)
     }
 
+    /// Whether a const-source copy of `n` bytes should run as one loop
+    /// rather than `n` unrolled `TBLRD`+`MOVFF` pairs: the table costs
+    /// `ceil(n/2)` flash words of its own plus a 14-word loop, against the
+    /// unrolled form's 3 words per byte (epic-cc#486's loop shape with
+    /// `TBLRD*+` as the reader). Reuses the same floor as the RAM copy
+    /// loop so both copy families switch at one place.
+    fn const_copy_loops(&self, n: u8) -> bool {
+        usize::from(n) >= COPY_LOOP_MIN_PAIRS
+    }
+
+    /// `n` bytes from the const table `TBLPTR` already points at into a
+    /// direct destination `dst`, as one counted loop. `TBLRD*+` advances
+    /// the table pointer, the count lives in WREG (covered by the ISR save
+    /// area), and the body writes through POSTINC1 so one `LFSR` covers
+    /// the whole destination (epic-cc#504).
+    fn emit_const_copy_loop(&mut self, dst: u16, n: u8) {
+        let l_loop = self.fresh_label();
+        self.emit(format!("    LFSR 1, 0x{dst:03X}"));
+        self.emit(format!("    MOVLW 0x{n:02X}"));
+        self.emit_label(&l_loop);
+        self.emit("    TBLRD*+".to_string());
+        // TABLAT -> POSTINC1: one word pair per byte, the destination
+        // pointer advancing once (the sim resolves the read first).
+        self.emit("    MOVFF 0xFF5, 0xFE6".to_string());
+        self.emit("    DECFSZ 0xFE8,F,A".to_string());
+        self.emit(format!("    BRA {l_loop}"));
+        // FSR1 is dead after the walk (nothing reuses it), but FSR0 is not
+        // touched, so the tracked state survives.
+    }
+
     /// One memcpy body for already-resolved (`src`, `dst`) positions.
     /// With `walk`, every walked pointer advances on every byte;
     /// without it every byte reads INDF, the pre-walk form. Dynamic
@@ -3090,6 +3120,19 @@ impl<'m> Gen<'m> {
                         // later bytes walk from those positions instead
                         // of re-seeding per byte. (epic-cc#492)
                         let (src0, dst0) = self.emit_memcpy_setups(mc, 0);
+                        // A long const-source copy into a direct slot runs
+                        // as one counted loop: the byte-0 setup already
+                        // seeded TBLPTR, so only the destination pointer
+                        // and the count are needed (epic-cc#504).
+                        if matches!(src0, McSrc::Tblrd)
+                            && self.const_copy_loops(n)
+                            && matches!(dst0, Addr::Direct(_))
+                        {
+                            if let Addr::Direct(d) = dst0 {
+                                self.emit_const_copy_loop(d, n);
+                            }
+                            return;
+                        }
                         let walk = n >= 2
                             && match (src0, dst0) {
                                 // Pure address math per byte, and #486
