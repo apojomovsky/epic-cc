@@ -1455,3 +1455,29 @@ fn oversized_global_places_without_overlap_on_pic18() {
         );
     }
 }
+
+/// epic-cc#448: whole-program opt can leave an unnamed numeric entry (the
+/// `irparse` placeholder) beside a later block an inlined callee named. A
+/// label-keyed sort that ranks any name ahead of any number then puts that
+/// named block at index 0, which `frame_layout` reserves for the entry, and
+/// the frame's slot order changes. The entry label's spelling must not reach
+/// placement, so the numeric-entry shape lays out exactly like the same CFG
+/// with a named entry.
+#[test]
+fn numeric_entry_lays_out_like_a_named_entry() {
+    let shape = |entry: &str| {
+        format!(
+            "fn f(i16) (p=i16)\n\
+             block {entry}:\n\
+               %1 = add i16 %p, 1\n\
+               %2 = add i16 %1, 3\n\
+               br label %merged.exit\n\
+             block merged.exit:\n\
+               %3 = add i16 %2, 5\n\
+               ret i16 %3\n"
+        )
+    };
+    let numeric = allocate(&PIC16F877A, &parse(&shape("0")), "depth 1\n");
+    let named = allocate(&PIC16F877A, &parse(&shape("entry")), "depth 1\n");
+    assert_eq!(numeric.locals, named.locals);
+}
