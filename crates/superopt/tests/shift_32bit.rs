@@ -380,3 +380,135 @@ fn the_tickets_amount7_byte_move_form_is_unsound() {
         "the byte-move form drops bits 24-25 of x and must not verify"
     );
 }
+
+/// The 4-lane right-shift family (epic-cc#551): the mirror of
+/// `construction_shl_family`. Rotate every byte left by `8 - r` with
+/// `RLNCF`, then recombine low-to-high. Each lane keeps its own low
+/// `8 - r` bits and takes its high `r` bits from the rotated byte above,
+/// which the ascending combine order makes safe: the upper neighbour is
+/// read before the walk rewrites it.
+fn construction_shr_family(r: u32) -> Candidate {
+    // (rotate count, MOVLW hi, MOVLW lo) per amount with a fused form.
+    let (rot, hi, lo) = match r {
+        4 => (4, "movlw 0xF0", "movlw 0x0F"),
+        5 => (3, "movlw 0xF8", "movlw 0x07"),
+        6 => (2, "movlw 0xFC", "movlw 0x03"),
+        7 => (1, "movlw 0xFE", "movlw 0x01"),
+        _ => unreachable!("only the amounts with a fused form"),
+    };
+    let mut c: Candidate = Vec::new();
+    for _ in 0..rot {
+        for a in [
+            "rlncf 0x023,F,A",
+            "rlncf 0x022,F,A",
+            "rlncf 0x021,F,A",
+            "rlncf 0x020,F,A",
+        ] {
+            c.push(a);
+        }
+    }
+    // Combine low-to-high so each lane reads its still-pristine upper
+    // neighbour. Mask the lane being written first, then take the upper
+    // neighbour's high `r` bits into W (`ANDWF` with d=0 leaves the
+    // neighbour untouched for its own turn).
+    for b in 0..3usize {
+        // Lane `b` lives at 0x020 + b; its upper neighbour at 0x020 + b + 1.
+        c.push(lo);
+        c.push(["andwf 0x020,F,A", "andwf 0x021,F,A", "andwf 0x022,F,A"][b]);
+        c.push(hi);
+        c.push(["andwf 0x021,W,A", "andwf 0x022,W,A", "andwf 0x023,W,A"][b]);
+        c.push(["iorwf 0x020,F,A", "iorwf 0x021,F,A", "iorwf 0x022,F,A"][b]);
+    }
+    c.push(lo);
+    c.push("andwf 0x023,F,A");
+    c
+}
+
+#[test]
+fn right_shift_32bit_by_6_fused_form_wins() {
+    let c = construction_shr_family(6);
+    assert_eq!(c.len(), 25, "4*2 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shr, 6, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-6 form must be correct over the sample"
+    );
+    assert!(c.len() < 5 * 6, "25 words beats the 30-word unroll");
+}
+
+#[test]
+fn right_shift_32bit_by_7_fused_form_wins() {
+    let c = construction_shr_family(7);
+    assert_eq!(c.len(), 21, "4*1 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shr, 7, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-7 form must be correct over the sample"
+    );
+    assert!(c.len() < 5 * 7, "21 words beats the 35-word unroll");
+}
+
+// epic-cc#551's trap, mirrored from #549's: `x >> 7` as `(x >> 8) << 1`
+// with the `>> 8` a byte move discards x bit 7, so `x = 0x80` comes back
+// zero instead of one. Deliberately unsound; the family form above is the
+// sound replacement.
+#[test]
+fn the_mirrored_byte_move_form_for_amount7_is_unsound() {
+    let c: Candidate = vec![
+        // x >>= 8 as a byte move: dst[2..0] = src[3..1], dst[3] = 0
+        "movff 0x021,0x020",
+        "movff 0x022,0x021",
+        "movff 0x023,0x022",
+        "clrf 0x023,A",
+        // <<= 1
+        "bcf 0xFD8,0,A",
+        "rlcf 0x020,F,A",
+        "rlcf 0x021,F,A",
+        "rlcf 0x022,F,A",
+        "rlcf 0x023,F,A",
+    ];
+    assert!(
+        !verify(
+            &c,
+            &cases_with(u32::wrapping_shr, 7, &swept_words(), W_SAMPLE)
+        ),
+        "the byte-move form drops bit 7 of x and must not verify"
+    );
+}
+
+// The amount-4/5 rows exist for a future wiring (the same extension #549 to
+// #551 made), so their masks are verified rather than left as documentation:
+// a wrong constant would otherwise surface as a misleading "the family is
+// wrong" from a later amount-5 attempt. Both lose to their unrolls, matching
+// the left family's verdicts.
+#[test]
+fn right_shift_32bit_by_4_fused_form_is_correct_and_loses() {
+    let c = construction_shr_family(4);
+    assert_eq!(c.len(), 33, "4*4 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shr, 4, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-4 form must be correct over the sample"
+    );
+    assert!(c.len() > 5 * 4, "33 words against the 20-word unroll");
+}
+
+#[test]
+fn right_shift_32bit_by_5_fused_form_is_correct_and_loses() {
+    let c = construction_shr_family(5);
+    assert_eq!(c.len(), 29, "4*3 rotate + 3*5 combine + 2");
+    assert!(
+        verify(
+            &c,
+            &cases_with(u32::wrapping_shr, 5, &swept_words(), W_SAMPLE)
+        ),
+        "the fused amount-5 form must be correct over the sample"
+    );
+    assert!(c.len() > 5 * 5, "29 words against the 25-word unroll");
+}

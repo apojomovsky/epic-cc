@@ -6553,3 +6553,89 @@ fn an_isr_visible_global_is_still_re_read_between_uses() {
         "both global reads must name the global:\n{asm}"
     );
 }
+
+#[test]
+fn const_lshr_i32_by_7_uses_the_fused_form() {
+    // Mirror of const_shl_i32_by_7 (epic-cc#551): m = 0, r = 7 over four
+    // lanes takes the fused family (21 words against the 35-word unroll).
+    // One RLNCF pass, and the combine runs low-to-high so each lane reads
+    // its upper neighbour before that neighbour is rewritten. dst at 0x0FD
+    // puts the top lane (dst+3 = 0x100) in a fresh bank.
+    for dst in [0x30, 0x0FD] {
+        let m = parse(
+            "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+             %1 = load i32 @a\n    %2 = lshr i32 %1, 7\n    store i32 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x40),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RRCF").count(), 0, "no unroll steps:\n{asm}");
+        assert_eq!(asm.matches("RLNCF").count(), 4, "one rotate pass:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
+            p.ram_mut()[0x20] = b;
+            p.ram_mut()[0x21] = b ^ 0x5A;
+            p.ram_mut()[0x22] = !b;
+            p.ram_mut()[0x23] = b.rotate_left(3);
+            p.set_w(b.wrapping_add(0x99));
+            p.run(400);
+            let got = u32::from(p.ram()[0x24])
+                | u32::from(p.ram()[0x25]) << 8
+                | u32::from(p.ram()[0x26]) << 16
+                | u32::from(p.ram()[0x27]) << 24;
+            let x = u32::from(b)
+                | u32::from(b ^ 0x5A) << 8
+                | u32::from(!b) << 16
+                | u32::from(b.rotate_left(3)) << 24;
+            assert_eq!(got, x >> 7, "a={x:#010x} >> 7 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
+    }
+}
+
+#[test]
+fn const_lshr_i32_by_6_uses_the_fused_form() {
+    // r = 6 over four lanes: two rotate passes (8 words) plus the combine.
+    for dst in [0x30, 0x0FD] {
+        let m = parse(
+            "global a i32\nglobal out i32\nfn main(void) ()\n  block entry:\n\
+             %1 = load i32 @a\n    %2 = lshr i32 %1, 6\n    store i32 %2 @out\n    ret void\n",
+        );
+        let addrs = addrs(&[
+            ("a", 0x20),
+            ("out", 0x24),
+            ("main::1", 0x40),
+            ("main::2", dst),
+        ]);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert_eq!(asm.matches("RRCF").count(), 0, "no unroll steps:\n{asm}");
+        assert_eq!(asm.matches("RLNCF").count(), 8, "two rotate passes:\n{asm}");
+        let words = asm::assemble_pic18(&asm);
+        for b in 0..=u8::MAX {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
+            p.ram_mut()[0x20] = b;
+            p.ram_mut()[0x21] = b ^ 0x5A;
+            p.ram_mut()[0x22] = !b;
+            p.ram_mut()[0x23] = b.rotate_left(3);
+            p.set_w(b.wrapping_add(0x99));
+            p.run(400);
+            let got = u32::from(p.ram()[0x24])
+                | u32::from(p.ram()[0x25]) << 8
+                | u32::from(p.ram()[0x26]) << 16
+                | u32::from(p.ram()[0x27]) << 24;
+            let x = u32::from(b)
+                | u32::from(b ^ 0x5A) << 8
+                | u32::from(!b) << 16
+                | u32::from(b.rotate_left(3)) << 24;
+            assert_eq!(got, x >> 6, "a={x:#010x} >> 6 (dst={dst:#06x})");
+            assert!(p.halted(), "program must run to completion (a={b:#04x})");
+        }
+    }
+}

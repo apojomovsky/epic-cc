@@ -2650,6 +2650,33 @@ impl<'m> Gen<'m> {
                             return;
                         }
                     }
+                    if b.op == ir::BinOp::LShr && r > 0 {
+                        // 4-lane fused forms for amounts 6 and 7 (#551),
+                        // mirroring the left family: rotate each byte left
+                        // by 8-r, then recombine low-to-high. 25 words at
+                        // r=6 and 21 at r=7, against the 30/35-word unroll;
+                        // W-only, and the ascending combine reads each
+                        // upper neighbour before the walk rewrites it.
+                        if n16 == 4 && m == 0 && (r == 6 || r == 7) {
+                            let rot = 8 - r;
+                            let (himask, lomask) = if r == 6 { (0xFC, 0x03) } else { (0xFE, 0x01) };
+                            for _ in 0..rot {
+                                for b in (0..4u16).rev() {
+                                    self.emit_banked("RLNCF", dst + b, ",F");
+                                }
+                            }
+                            for b in 0..3u16 {
+                                self.emit(format!("    MOVLW 0x{lomask:02X}"));
+                                self.emit_banked("ANDWF", dst + b, ",F");
+                                self.emit(format!("    MOVLW 0x{himask:02X}"));
+                                self.emit_banked("ANDWF", dst + b + 1, ",W");
+                                self.emit_banked("IORWF", dst + b, ",F");
+                            }
+                            self.emit(format!("    MOVLW 0x{lomask:02X}"));
+                            self.emit_banked("ANDWF", dst + 3, ",F");
+                            return;
+                        }
+                    }
                     for _ in 0..r {
                         match b.op {
                             ir::BinOp::Shl => {
