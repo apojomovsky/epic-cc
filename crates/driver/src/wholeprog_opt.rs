@@ -53,6 +53,14 @@
 //! above. This pass never inlines into `main` or an ISR by design; each
 //! fold shortens one link, which compounds along chains that pass through
 //! several of them (epic-cc#205, epic-cc#206).
+//!
+//! `loop-reduce` (LSR) is added for PIC18 only (see [`PIC18_PASSES`]). It
+//! leaves call-graph shape alone, so the RAM-reuse invariant above still
+//! holds, but it rewrites walked pointers as scalar-evolution phis
+//! (`%lsr.iv = phi ptr ...`) whose shapes the PIC14 backend miscompiles in
+//! the float/vararg path. PIC18 handles them, so the pass is gated rather
+//! than enabled globally (epic-cc#645 carries the repro and the measured
+//! gains).
 
 use std::path::Path;
 use std::process::Command;
@@ -60,6 +68,18 @@ use std::process::Command;
 /// The curated, RAM-safe pass list (see module docs for why each pass is
 /// here and none of them inline across a call boundary).
 const PASSES: &str = "internalize,ipsccp,instcombine,simplifycfg,dce";
+
+/// `loop-reduce` (LSR) on top of [`PASSES`], PIC18 only for now.
+///
+/// LSR is the largest measured density lever left on PIC18: it hoists a
+/// struct-array stride multiply out of the loop, worth 49 words on
+/// `bench-struct-scan` and 132 on `hal-pic18-menu-demo-18f4550`. It
+/// rewrites walked pointers as scalar-evolution phis (`%lsr.iv = phi ptr
+/// ...`), which the PIC14 backend miscompiles today in the float/vararg
+/// path (epic-cc#645 has the repro and the measurements); PIC18 passes
+/// every suite, so the pass is gated to it rather than enabled globally.
+const PIC18_PASSES: &str =
+    "internalize,ipsccp,instcombine,simplifycfg,dce,loop-reduce,instcombine,simplifycfg,dce";
 
 /// Symbols `internalize` must never touch:
 ///
@@ -351,7 +371,12 @@ fn mark_always_inline(ll_text: &str, candidates: &[String]) -> String {
 /// Run the curated whole-program cleanup over `merged_path` (the
 /// `llvm-link` output), writing the result to `out_path`. Returns the
 /// optimized `.ll` text.
-pub fn run(opt_bin: &Path, merged_path: &Path, out_path: &Path) -> Result<String, String> {
+pub fn run(
+    opt_bin: &Path,
+    merged_path: &Path,
+    out_path: &Path,
+    core: device::Core,
+) -> Result<String, String> {
     let ll_text = std::fs::read_to_string(merged_path)
         .map_err(|e| format!("read {}: {e}", merged_path.display()))?;
     let api = public_api(&ll_text);
@@ -364,10 +389,15 @@ pub fn run(opt_bin: &Path, merged_path: &Path, out_path: &Path) -> Result<String
     }
     let candidates = always_inline_candidates(&ll_text);
     let marked = mark_always_inline(&ll_text, &candidates);
-    let passes = if candidates.is_empty() {
-        PASSES.to_string()
+    let base = if core == device::Core::Pic18 {
+        PIC18_PASSES
     } else {
-        format!("{PASSES},always-inline,instcombine,simplifycfg,dce")
+        PASSES
+    };
+    let passes = if candidates.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base},always-inline,instcombine,simplifycfg,dce")
     };
     std::fs::write(merged_path, &marked)
         .map_err(|e| format!("write {}: {e}", merged_path.display()))?;

@@ -555,6 +555,25 @@ impl<'m> Gen<'m> {
             .unwrap_or_else(|| panic!("isel-pic18: no address for @{name}"))
     }
 
+    /// Whether `name` is a local object in the current function: an
+    /// `alloca`'s slot IS the object, so a pointer to it is that slot's
+    /// own frame address rather than an address value stored in the slot
+    /// (epic-cc#645).
+    fn is_local_object(&self, name: &str) -> bool {
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| {
+                f.blocks.iter().any(|b| {
+                    b.insts
+                        .iter()
+                        .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// Reports whether `name` is a `const` (flash) global: read via `TBLRD`, never
     /// via a RAM address. `alloc` already excludes const globals from the
     /// address map (`const <name>` lines, no address), so this is the only
@@ -805,7 +824,12 @@ impl<'m> Gen<'m> {
                 }
             }
             Val::Global(g) => {
-                if self.is_function(g) {
+                if self.is_function(g) || self.global_is_const(g) {
+                    // A function's address and a flash const table's address
+                    // are both link-time label literals (epic-cc#645 for the
+                    // const case: `loop-reduce` can turn a const string into
+                    // a pointer phi, which then needs the table's flash
+                    // address materialized rather than a RAM address).
                     self.emit(format!("    MOVLW LOW({g})"));
                     let (a0, f0) = self.operand(dst);
                     self.emit(format!(
@@ -917,6 +941,48 @@ impl<'m> Gen<'m> {
                     // k into the literal, `[(1, reg)]` adds the term
                     // onto it, and anything else seeds FSR0 with the
                     // full address below (epic-cc#610).
+                    //
+                    // A const (flash) global has no RAM address: its bytes
+                    // are a link-time label, so it materializes as
+                    // `LOW()/HIGH()` literals the way `emit_move_addr_to_slot`
+                    // does (epic-cc#645). A dynamic term cannot ride a
+                    // literal, so that combination still needs the FSR0
+                    // path below.
+                    if self.global_is_const(name) && terms.is_empty() {
+                        // `LOW`/`HIGH` are 8-bit link-time literals, so a
+                        // constant offset above 255 still needs the carry
+                        // out of byte 0 in byte 1: `ADDLW` sets STATUS,C
+                        // and the byte-1 pass adds it back, the same idiom
+                        // the `[]` arm below uses for a literal base.
+                        let adds_in_byte0 = (k & 0xFF) != 0;
+                        for i in 0..ty.bytes() {
+                            let lit = if i == 0 { "LOW" } else { "HIGH" };
+                            self.emit(format!("    MOVLW {lit}({name})"));
+                            if i == 0 {
+                                let lo = (k & 0xFF) as u8;
+                                if lo != 0 {
+                                    self.emit(format!("    ADDLW 0x{lo:02X}"));
+                                }
+                            } else {
+                                // Carry-FIRST: byte 0's `ADDLW` set C, and
+                                // `MOVLW` leaves it alone, so the low-byte
+                                // carry must be consumed before the high
+                                // byte's own `ADDLW` overwrites STATUS.C.
+                                if adds_in_byte0 {
+                                    self.emit("    BTFSC 0xFD8,0,A".to_string());
+                                    self.emit("    ADDLW 0x01".to_string());
+                                }
+                                let hi = (k >> 8) as u8;
+                                if hi != 0 {
+                                    self.emit(format!("    ADDLW 0x{hi:02X}"));
+                                }
+                            }
+                            let (a, f) = self.operand(dst + u16::from(i));
+                            let bank = if a == 0 { "A" } else { "B" };
+                            self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                        }
+                        return;
+                    }
                     let addr = self.global_addr(name).wrapping_add(k);
                     for i in 0..ty.bytes() {
                         let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
@@ -965,6 +1031,38 @@ impl<'m> Gen<'m> {
                 }
                 let sa = match &base {
                     iselcore::Base::Slot(sname, indirect) => {
+                        // A local object (`alloca`): the slot IS the object,
+                        // so the pointer is the slot's own frame address, a
+                        // compile-time constant. Fold it as literals rather
+                        // than reading the object's first bytes as if they
+                        // were an address (epic-cc#645).
+                        if !*indirect && self.is_local_object(sname) {
+                            // The slot IS the object, so its base is a
+                            // compile-time frame address. Fold `k` into it
+                            // like the literal-base path below; a dynamic
+                            // term cannot ride a literal, so that shape
+                            // still needs the FSR path.
+                            assert!(
+                                terms.is_empty(),
+                                "isel-pic18: GEP over a local object with dynamic terms ({terms:?}) is not supported in a move"
+                            );
+                            let addr = self
+                                .slot_addr(self.cur_func, sname)
+                                .direct()
+                                .wrapping_add(k);
+                            for i in 0..ty.bytes() {
+                                let byte = ((addr >> (i as u32 * 8)) & 0xFF) as u8;
+                                let (aa, af) = self.operand(dst + u16::from(i));
+                                let bank = if aa == 0 { "A" } else { "B" };
+                                if byte == 0 {
+                                    self.emit(format!("    CLRF 0x{af:03X},{bank}"));
+                                } else {
+                                    self.emit(format!("    MOVLW 0x{byte:02X}"));
+                                    self.emit(format!("    MOVWF 0x{af:03X},{bank}"));
+                                }
+                            }
+                            return;
+                        }
                         let holds_addr = if *indirect {
                             true
                         } else {
@@ -1097,14 +1195,16 @@ impl<'m> Gen<'m> {
     /// the object) always needs FSR0, regardless of terms (the sret-address setup).
     fn emit_ptr_setup(&mut self, ptr: &Val, byte_off: u8) -> Addr {
         match ptr {
-            Val::Global(g) => Addr::Direct(self.global_addr(g) + u16::from(byte_off)),
+            Val::Global(g) => Addr::Direct(self.global_addr(g).wrapping_add(u16::from(byte_off))),
             Val::Reg(r) => {
                 let (base, k, terms) = self.resolved_for(r);
                 match &base {
                     Base::Global(name) => {
                         if terms.is_empty() {
                             Addr::Direct(
-                                self.global_addr(name) + u16::from(k) + u16::from(byte_off),
+                                self.global_addr(name)
+                                    .wrapping_add(k)
+                                    .wrapping_add(u16::from(byte_off)),
                             )
                         } else {
                             self.emit_fsr0_dynamic(self.global_addr(name), k, &terms, byte_off);
@@ -1127,7 +1227,7 @@ impl<'m> Gen<'m> {
                             self.emit_fsr0_indirect_slot(sa, k, &terms, byte_off);
                             Addr::Indirect
                         } else if terms.is_empty() {
-                            Addr::Direct(sa + u16::from(k) + u16::from(byte_off))
+                            Addr::Direct(sa.wrapping_add(k).wrapping_add(u16::from(byte_off)))
                         } else {
                             self.emit_fsr0_dynamic(sa, k, &terms, byte_off);
                             Addr::Indirect
@@ -1152,7 +1252,11 @@ impl<'m> Gen<'m> {
                 match &base {
                     Base::Global(name) => {
                         if terms.is_empty() {
-                            Some(self.global_addr(name) + u16::from(k) + u16::from(byte_off))
+                            Some(
+                                self.global_addr(name)
+                                    .wrapping_add(k)
+                                    .wrapping_add(u16::from(byte_off)),
+                            )
                         } else {
                             self.emit_fsr1_dynamic(self.global_addr(name), k, &terms, byte_off);
                             None
@@ -1171,7 +1275,10 @@ impl<'m> Gen<'m> {
                             self.emit_fsr1_indirect_slot(sa, k, &terms, byte_off);
                             None
                         } else if terms.is_empty() {
-                            Some(sa + u16::from(k) + u16::from(byte_off))
+                            // `k` can arrive wrapped from a negative GEP
+                            // (a loop-reduce back edge), so the sum is
+                            // modular like every sibling arm (epic-cc#645).
+                            Some(sa.wrapping_add(k).wrapping_add(u16::from(byte_off)))
                         } else {
                             self.emit_fsr1_dynamic(sa, k, &terms, byte_off);
                             None
@@ -1187,8 +1294,8 @@ impl<'m> Gen<'m> {
     /// access to go through `INDF1` (0xFE7). FSR1 mirror of
     /// `emit_fsr0_dynamic` (LFSR 1, FSR1L/FSR1H = 0xFE1/0xFE2).
     fn emit_fsr1_dynamic(&mut self, base_addr: u16, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        let static_part = u16::from(k) + u16::from(byte_off);
-        let lit = (base_addr + static_part) & 0xFFF;
+        let static_part = k.wrapping_add(u16::from(byte_off));
+        let lit = base_addr.wrapping_add(static_part) & 0xFFF;
         let chain = self.chain_term_index(terms, 0);
         let Some((ci, form)) = chain else {
             self.emit(format!("    LFSR 1, 0x{lit:03X}"));
@@ -1209,11 +1316,7 @@ impl<'m> Gen<'m> {
             Scaled::Chain => {
                 self.emit("    LFSR 1, 0x000".to_string());
                 self.emit_scale_chain(0xFE1, 0xFE2, *scale, a, wide);
-                self.emit_fsr_pair_add_lit(
-                    0xFE1,
-                    0xFE2,
-                    base_addr.wrapping_add(u16::from(static_part)),
-                );
+                self.emit_fsr_pair_add_lit(0xFE1, 0xFE2, base_addr.wrapping_add(static_part));
             }
         }
         self.add_terms_except(terms, Some(ci), 0xFE1, 0xFE2);
@@ -1228,7 +1331,7 @@ impl<'m> Gen<'m> {
         terms: &[(u16, String)],
         byte_off: u8,
     ) {
-        let static_part = u16::from(k) + u16::from(byte_off);
+        let static_part = k.wrapping_add(u16::from(byte_off));
         // Same accounting as `emit_fsr0_indirect_slot`: CLRF pair plus a
         // runtime re-add of the pointer's own value.
         let extra = 2 + if static_part != 0 { 4 } else { 0 };
@@ -1429,7 +1532,12 @@ impl<'m> Gen<'m> {
     /// access had dynamic terms, so nothing was tracked to begin with).
     fn bump_fsr0_tracked_offset(&mut self, n: u8) {
         if let Some((origin, off)) = self.fsr0_holds {
-            self.fsr0_holds = Some((origin, off + u16::from(n) - 1));
+            // Saturating: `off` is a byte offset within the origin's
+            // object and `n` a multi-byte access width, so the sum can
+            // exceed `u16` on a high frame. `try_reuse_fsr0` only compares
+            // this and emits the difference, so a saturated value can only
+            // refuse a reuse, never mis-offset an access.
+            self.fsr0_holds = Some((origin, off.saturating_add(u16::from(n) - 1)));
         }
     }
 
@@ -1453,12 +1561,12 @@ impl<'m> Gen<'m> {
         // wholesale; the tracked position is only sound after the drain,
         // so every reuse decision below sees post-drain state.
         self.flush_copies();
-        let static_part = u16::from(k) + u16::from(byte_off);
+        let static_part = k.wrapping_add(u16::from(byte_off));
         let origin = Fsr0Origin::Absolute(base_addr);
         let chain = self.chain_term_index(terms, 0);
         let Some((ci, form)) = chain else {
             if !(terms.is_empty() && self.try_reuse_fsr0(origin, static_part)) {
-                let lit = (base_addr + static_part) & 0xFFF;
+                let lit = base_addr.wrapping_add(static_part) & 0xFFF;
                 self.emit(format!("    LFSR 0, 0x{lit:03X}"));
                 self.add_term_to_fsr0(terms);
             }
@@ -1475,18 +1583,14 @@ impl<'m> Gen<'m> {
         let wide = self.reg_width(reg) == 2;
         match form {
             Scaled::Mulwf => {
-                let lit = (base_addr + static_part) & 0xFFF;
+                let lit = base_addr.wrapping_add(static_part) & 0xFFF;
                 self.emit(format!("    LFSR 0, 0x{lit:03X}"));
                 self.emit_mulwf_scale(0xFE9, 0xFEA, *scale, a, wide);
             }
             Scaled::Chain => {
                 self.emit("    LFSR 0, 0x000".to_string());
                 self.emit_scale_chain(0xFE9, 0xFEA, *scale, a, wide);
-                self.emit_fsr_pair_add_lit(
-                    0xFE9,
-                    0xFEA,
-                    base_addr.wrapping_add(u16::from(static_part)),
-                );
+                self.emit_fsr_pair_add_lit(0xFE9, 0xFEA, base_addr.wrapping_add(static_part));
             }
         }
         self.add_terms_except(terms, Some(ci), 0xFE9, 0xFEA);
@@ -1517,7 +1621,7 @@ impl<'m> Gen<'m> {
         // must run against post-drain state.
         self.flush_copies();
         let origin = Fsr0Origin::SlotValue(slot_addr);
-        let static_part = u16::from(k) + u16::from(byte_off);
+        let static_part = k.wrapping_add(u16::from(byte_off));
         // Chain overhead: two CLRFs plus a runtime re-add of the pointer's
         // own value (the chain's zero seed can't carry it, unlike
         // `emit_fsr0_dynamic`'s compile-time `base_addr`) replace the
@@ -1860,7 +1964,7 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVLW {lit}"));
             self.emit(format!("    MOVWF 0x{reg:02X},A"));
         }
-        let static_part = u16::from(k) + u16::from(byte_off);
+        let static_part = k.wrapping_add(u16::from(byte_off));
         if static_part != 0 {
             self.emit(format!("    MOVLW 0x{:02X}", static_part & 0xFF));
             self.emit("    ADDWF 0xF6,F,A".to_string()); // TBLPTRL
@@ -1946,7 +2050,7 @@ impl<'m> Gen<'m> {
     /// byte access: static seeding plus the naive term loop for small
     /// scales, or the zero-seeded shift-add chain when a big stride wins.
     fn emit_tblptr_setup(&mut self, table: &str, k: u16, terms: &[(u16, String)], byte_off: u8) {
-        let static_part = u16::from(k) + u16::from(byte_off);
+        let static_part = k.wrapping_add(u16::from(byte_off));
         if let Some((i, scale)) = self.tblptr_chain_term(terms, static_part) {
             self.emit_tblptr_dynamic_chain(table, static_part, scale, &terms[i].1);
             return;

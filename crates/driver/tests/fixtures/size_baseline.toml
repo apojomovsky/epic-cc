@@ -96,7 +96,7 @@ ram_bytes = 33
 [[entry]]
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
-flash_words = 196
+flash_words = 147
 ram_bytes = 99
 
 [[entry]]
@@ -132,5 +132,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 11123
-ram_bytes = 735
+flash_words = 10991
+ram_bytes = 755

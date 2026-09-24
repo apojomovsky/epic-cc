@@ -320,13 +320,14 @@ fn main() {
     // crates/driver/src/wholeprog_opt.rs for the pass list and why it
     // preserves the overlay allocator's frame boundaries.
     let opt_path = tmp.join("merged_opt.ll");
-    let merged_ll_text = match driver::wholeprog_opt::run(&opt_bin, &merged_path, &opt_path) {
-        Ok(text) => text,
-        Err(msg) => {
-            eprintln!("epic-cc: whole-program opt: {msg}");
-            std::process::exit(1);
-        }
-    };
+    let merged_ll_text =
+        match driver::wholeprog_opt::run(&opt_bin, &merged_path, &opt_path, device.core) {
+            Ok(text) => text,
+            Err(msg) => {
+                eprintln!("epic-cc: whole-program opt: {msg}");
+                std::process::exit(1);
+            }
+        };
 
     let ll_text = irparse::sanitize_symbols(&merged_ll_text);
     let canonical_spec = ll_text

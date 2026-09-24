@@ -253,6 +253,16 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
         // pointer PARAM (whose slot holds the address, `Base::Slot(_,
         // false)` per the ADR-009 ptr-param seeding).
         let param_holds_addr = |n: &str| f.params.iter().any(|p| p.name == *n && p.ptr);
+        // A local object's own address (`alloca`): its slot IS the object,
+        // so a pointer to it is the slot's own compile-time address, which
+        // the backends materialize as literals like a global's.
+        let is_alloca = |n: &str| {
+            f.blocks.iter().any(|b| {
+                b.insts
+                    .iter()
+                    .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == n))
+            })
+        };
         let self_gep = |r: &str| {
             // A GEP over the phi's own dst is the loop-carried pointer
             // increment (`%18 = gep %7 +1` feeding `%7 = phi ptr [%18,
@@ -297,7 +307,10 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                 // folds any k/terms onto them (or panics precisely where
                 // the move shape is unsupported).
                 Some((Base::Slot(_, true), _, _)) => true,
-                Some((Base::Slot(n, false), _, _)) if param_holds_addr(n) => true,
+                // A pointer param's slot holds an address; an alloca's
+                // slot IS the object, and its address is likewise a
+                // compile-time constant (k/terms ride the edge copy).
+                Some((Base::Slot(n, false), _, _)) if param_holds_addr(n) || is_alloca(n) => true,
                 // A folded global base (a folded select or GEP over a
                 // global): phi elimination moves its bytes as literals
                 // plus dynamic terms, and SSA dominance keeps every term
