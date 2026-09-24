@@ -309,6 +309,25 @@ impl<'m> Gen<'m> {
             .unwrap_or(false)
     }
 
+    /// Whether `name` is a local object in the current function: an
+    /// `alloca`'s slot IS the object, so a pointer to it is that slot's
+    /// own frame address rather than an address value stored in the slot
+    /// (epic-cc#652).
+    fn is_local_object(&self, name: &str) -> bool {
+        self.m
+            .funcs
+            .iter()
+            .find(|f| f.name == self.cur_func)
+            .map(|f| {
+                f.blocks.iter().any(|b| {
+                    b.insts
+                        .iter()
+                        .any(|i| matches!(i, ir::Inst::Alloca(a) if a.dst == name))
+                })
+            })
+            .unwrap_or(false)
+    }
+
     /// A fresh local label for intra-block jumps (select branches).
     fn fresh_label(&mut self) -> String {
         let s = format!("tmp{}", *self.tmp);
@@ -368,25 +387,50 @@ impl<'m> Gen<'m> {
                         }
                         return;
                     }
-                    let sa = match &base {
+                    // Whose bytes the slot's two bytes are: an indirect
+                    // slot or a pointer param HOLDS a runtime address, so its
+                    // bytes ARE the value. A local object (`alloca`) IS the
+                    // object, so its value is the slot's own frame address, a
+                    // compile-time literal that must never be read as data
+                    // (epic-cc#652, matching PIC14/PIC14E in epic-cc#647).
+                    let (sa, holds_addr) = match &base {
                         Base::Slot(sname, indirect) => {
                             assert!(
-                                *indirect || self.param_holds_addr(sname),
+                                *indirect
+                                    || self.param_holds_addr(sname)
+                                    || self.is_local_object(sname),
                                 "isel: cannot take the value of a GEP over {base:?}"
                             );
-                            self.slot_addr(self.cur_func, sname).direct()
+                            (
+                                self.slot_addr(self.cur_func, sname).direct(),
+                                *indirect || self.param_holds_addr(sname),
+                            )
                         }
                         other => panic!("isel: cannot take the value of a GEP over {other:?}"),
+                    };
+                    // An object slot materializes its frame address as a
+                    // LITERAL. Baseline pointers are 6-bit flat FSR values,
+                    // so byte 1 is always 0 either way (same as the runtime
+                    // arm's `MOVLW 0x00`).
+                    let base_lit = if holds_addr {
+                        None
+                    } else {
+                        assert!(k <= 0xFF, "isel: slot offset {k} exceeds 255");
+                        Some((sa.wrapping_add(k) & 0xFF) as u8)
                     };
                     match terms.as_slice() {
                         [] => {
                             if idx == 0 {
-                                self.emit(format!("    MOVF {}, W", self.fop(sa)));
-                                if k != 0 {
-                                    let k8 = u8::try_from(k).unwrap_or_else(|_| {
-                                        panic!("isel: slot offset {k} exceeds 255")
-                                    });
-                                    self.emit_add_w_const(k8);
+                                if let Some(lo) = base_lit {
+                                    self.emit(format!("    MOVLW 0x{lo:02X}"));
+                                } else {
+                                    self.emit(format!("    MOVF {}, W", self.fop(sa)));
+                                    if k != 0 {
+                                        let k8 = u8::try_from(k).unwrap_or_else(|_| {
+                                            panic!("isel: slot offset {k} exceeds 255")
+                                        });
+                                        self.emit_add_w_const(k8);
+                                    }
                                 }
                             } else {
                                 self.emit("    MOVLW 0x00".to_string());
@@ -395,8 +439,16 @@ impl<'m> Gen<'m> {
                         [(1, reg)] => {
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                             if idx == 0 {
-                                self.emit(format!("    MOVF {}, W", self.fop(sa)));
-                                self.emit(format!("    ADDWF {}, W", self.fop(ra)));
+                                match base_lit {
+                                    Some(lo) => {
+                                        self.emit(format!("    MOVLW 0x{lo:02X}"));
+                                        self.emit(format!("    ADDWF {}, W", self.fop(ra)));
+                                    }
+                                    None => {
+                                        self.emit(format!("    MOVF {}, W", self.fop(sa)));
+                                        self.emit(format!("    ADDWF {}, W", self.fop(ra)));
+                                    }
+                                }
                             } else {
                                 self.emit("    MOVLW 0x00".to_string());
                             }
@@ -409,7 +461,14 @@ impl<'m> Gen<'m> {
                             let ra1 = self.val_addr(&Val::Reg(terms[0].1.clone())).direct();
                             let ra2 = self.val_addr(&Val::Reg(terms[1].1.clone())).direct();
                             if idx == 0 {
-                                self.emit(format!("    MOVF {}, W", self.fop(sa)));
+                                match base_lit {
+                                    Some(lo) => {
+                                        self.emit(format!("    MOVLW 0x{lo:02X}"));
+                                    }
+                                    None => {
+                                        self.emit(format!("    MOVF {}, W", self.fop(sa)));
+                                    }
+                                }
                                 self.emit(format!("    ADDWF {}, W", self.fop(ra1)));
                                 self.emit(format!("    ADDWF {}, W", self.fop(ra2)));
                             } else {

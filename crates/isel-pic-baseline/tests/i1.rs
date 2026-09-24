@@ -43,3 +43,34 @@ fn store_an_i1_constant_writes_the_byte_value() {
     assert!(asm.contains("MOVLW 0x01"), "constant byte:\n{asm}");
     assert!(asm.contains("MOVWF 0x11"), "store target:\n{asm}");
 }
+
+#[test]
+fn alloca_ptr_phi_materializes_the_frame_address_not_its_contents() {
+    // A pointer phi over an alloca (the loop-reduce walk shape): the
+    // alloca's slot IS the object, so its pointer value is that slot's own
+    // frame address, a literal. The backend used to assert here
+    // (`cannot take the value of a GEP over Slot("b", false)`), and
+    // relaxing the assert without this arm would read the object's first
+    // bytes as its address (epic-cc#647's defect, epic-cc#652 for this
+    // backend).
+    let m = parse(
+        "global c i8\nfn main(void) ()\n  block entry:\n    %b = alloca 4\n    %c = load i8 @c\n    br i1 %c t f\n  block t:\n    br merge\n  block f:\n    br merge\n  block merge:\n    %p = phi ptr %b t %b f\n    store i8 7 %p\n    ret void\n",
+    );
+    let a = addrs(&[
+        ("c", 0x07),
+        ("main::b", 0x10),
+        ("main::c", 0x0E),
+        ("main::p", 0x11),
+    ]);
+    let asm = select(&PIC12F509, &m, &a);
+    // The phi edge copies the alloca's frame address 0x10 as a literal,
+    // never `MOVF 0x10, W` (which would read the object's first byte).
+    assert!(
+        asm.contains("MOVLW 0x10"),
+        "the alloca pointer value must be its frame address literal:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVF 0x10, W"),
+        "the alloca's contents must not be read as its address:\n{asm}"
+    );
+}
