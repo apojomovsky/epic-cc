@@ -1159,6 +1159,8 @@ fn isr_emits_vector_prologue_and_retfie() {
     assert!(asm.contains("MOVFF 0xFF6, 0x005"), "TBLPTRL save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFF7, 0x006"), "TBLPTRH save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFF8, 0x007"), "TBLPTRU save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFFA, 0x045"), "PCLATH save:\n{asm}");
+    assert!(asm.contains("MOVFF 0xFFB, 0x046"), "PCLATU save:\n{asm}");
     assert!(asm.contains("MOVWF 0x008,A"), "W save last:\n{asm}");
     // The epilogue: MOVFF-based (flags survive); W restores before STATUS
     // because MOVF sets Z/N, so STATUS comes last and the ISR return is
@@ -1178,6 +1180,30 @@ fn isr_emits_vector_prologue_and_retfie() {
         w < st && st < ret,
         "W restores before STATUS, STATUS last before RETFIE:\n{asm}"
     );
+}
+
+#[test]
+fn isr_save_set_covers_pclath_pclatu() {
+    // epic-cc#641: an IRQ inside a main-line switch-dispatch window
+    // mis-jumps on return unless the ISR saves PCLATH/PCLATU. The lone
+    // ISR below uses the fixed block plus the 0x040 carve (`select_isr`),
+    // so the two bytes land at 0x045/0x046.
+    let m = parse(
+        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm = select_isr(&PIC18F4550, &m, &addrs(&[]));
+    for line in [
+        "MOVFF 0xFFA, 0x045",
+        "MOVFF 0xFFB, 0x046",
+        "MOVFF 0x045, 0xFFA",
+        "MOVFF 0x046, 0xFFB",
+    ] {
+        assert!(
+            asm.contains(line),
+            "ISR save set must contain {line}:\n{asm}"
+        );
+    }
 }
 
 #[test]

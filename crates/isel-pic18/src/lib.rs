@@ -7035,9 +7035,10 @@ pub fn select_with_locs(
         !needs_prod_save || isr_hi_save.is_some() == priority_mode,
         "isel-pic18: the high save area must be present exactly in priority mode"
     );
-    // The carved area a *compat or high* ISR uses for its PROD/FSR1 bytes.
-    // The low ISR needs no closure arm: its four bytes are the tail of its
-    // own 16-byte area (`s+12..s+15`), not a separate carve.
+    // The carved area a *compat or high* ISR uses for its PROD/FSR1/TABLAT/
+    // PCLATH/PCLATU bytes. The low ISR needs no closure arm: its seven
+    // bytes are the tail of its own 19-byte area (`s+12..s+18`), not a
+    // separate carve.
     let prod_save = || -> u16 {
         if priority_mode {
             isr_hi_save.expect("isel-pic18: high ISR without a high save area")
@@ -7205,7 +7206,7 @@ pub fn select_with_locs(
                 // common block uses `ISR_W_SAVE_OFFSET` (see above).
                 let low_save = priority_mode && f.irq_priority != 1;
                 let prod = prod_save();
-                let saves: [(u16, u16); 16] = if low_save {
+                let saves: [(u16, u16); 18] = if low_save {
                     let s = isr_low_save.expect("isel-pic18: low ISR without a low save area");
                     [
                         (common_lo, s + 8),
@@ -7221,6 +7222,8 @@ pub fn select_with_locs(
                         (0xFF3, s + 14), // PRODL
                         (0xFF4, s + 15), // PRODH
                         (0xFF5, s + 16), // TABLAT
+                        (0xFFA, s + 17), // PCLATH
+                        (0xFFB, s + 18), // PCLATU
                         (0xFF6, s + 5),  // TBLPTRL
                         (0xFF7, s + 6),  // TBLPTRH
                         (0xFF8, s + 7),  // TBLPTRU
@@ -7254,6 +7257,8 @@ pub fn select_with_locs(
                         (0xFF3, prod + 2),       // PRODL
                         (0xFF4, prod + 3),       // PRODH
                         (0xFF5, prod + 4),       // TABLAT
+                        (0xFFA, prod + 5),       // PCLATH
+                        (0xFFB, prod + 6),       // PCLATU
                         (common_lo, common_lo + 12),
                         (common_lo + 1, common_lo + 13),
                         (common_lo + 2, common_lo + 14),
@@ -7561,15 +7566,17 @@ pub fn select_with_locs(
                             (s + 3, 0xFE9), // FSR0L
                             (s + 2, 0xFE0), // BSR
                         ]);
-                        // The same four additions as the compat block
-                        // (epic-cc#477): the low save area grew from 12 to
-                        // 16 bytes for them.
+                        // The same seven additions as the compat block
+                        // (epic-cc#477, epic-cc#532, epic-cc#641): the low
+                        // save area grew for them.
                         g.emit_movff_pairs([
                             (s + 12, 0xFE1), // FSR1L
                             (s + 13, 0xFE2), // FSR1H
                             (s + 14, 0xFF3), // PRODL
                             (s + 15, 0xFF4), // PRODH
                             (s + 16, 0xFF5), // TABLAT
+                            (s + 17, 0xFFA), // PCLATH
+                            (s + 18, 0xFFB), // PCLATU
                         ]);
                     } else {
                         // Dealiased slots (epic-cc#357): STATUS/BSR/FSR0L
@@ -7590,17 +7597,20 @@ pub fn select_with_locs(
                             (common_lo + 13, common_lo + 1),
                             (common_lo + 12, common_lo),
                         ]);
-                        // FSR1 and PROD, restored before the retval backup
-                        // and W (both groups below touch the retval region
-                        // through the caller's live result, not these
-                        // slots). Order against the SFR group above is
-                        // free: the ranges are disjoint. (epic-cc#477)
+                        // FSR1, PROD and PCLATH/PCLATU, restored before the
+                        // retval backup and W (both groups below touch the
+                        // retval region through the caller's live result,
+                        // not these slots). Order against the SFR group
+                        // above is free: the ranges are disjoint.
+                        // (epic-cc#477, epic-cc#641)
                         g.emit_movff_pairs([
                             (prod + 0, 0xFE1), // FSR1L
                             (prod + 1, 0xFE2), // FSR1H
                             (prod + 2, 0xFF3), // PRODL
                             (prod + 3, 0xFF4), // PRODH
                             (prod + 4, 0xFF5), // TABLAT
+                            (prod + 5, 0xFFA), // PCLATH
+                            (prod + 6, 0xFFB), // PCLATU
                         ]);
                     }
                     if low_save {
