@@ -7905,6 +7905,13 @@ pub fn select_with_locs(
         locs.push(None);
         out.push("    sleep".to_string());
         locs.push(None);
+        // A simulator that runs past SLEEP (or a spurious wake with no
+        // enabled source) must not execute the const tables that follow:
+        // hang loudly here instead of running data as code (epic-cc#643).
+        out.push("__halt:".to_string());
+        locs.push(None);
+        out.push("    BRA __halt".to_string());
+        locs.push(None);
     }
     // the flash const: every `const` (flash) global becomes a `DB` table after the code,
     // before `end`. The bytes are the flat LE blob `irparse` decoded; the
