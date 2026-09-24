@@ -7430,14 +7430,13 @@ pub fn select_with_locs(
                 Some(Inst::Ret(None, loc)) if g.isr => {
                     g.cur_loc = loc.clone();
                     // The ISR restore epilogue replaces `ret`. MOVFF-based
-                    // (never touches STATUS), so the interrupted main's
-                    // Z/N come back intact; only the final W restore via
-                    // MOVF sets Z/N from the moved value (the one accepted
-                    // flag loss, same as PIC14's W-last convention).
+                    // (never touches flags); W restores before STATUS
+                    // because MOVF sets Z/N from the moved value. STATUS
+                    // last keeps every ISR return flag-transparent: a
+                    // Timer2 IRQ inside a main-line XORLW/BNZ dispatch
+                    // window mis-dispatched while W came last (epic-cc#604).
                     // Both areas are non-aliased (the fixed block's slots
-                    // moved out of retval's 0x000-0x003, epic-cc#357), so
-                    // restore order is convention: SFRs first, retval
-                    // backup second, W last.
+                    // moved out of retval's 0x000-0x003, epic-cc#357).
                     let low_save = priority_mode && f.irq_priority != 1;
                     let prod = prod_save();
                     if low_save {
@@ -7457,7 +7456,6 @@ pub fn select_with_locs(
                             (s + 4, 0xFEA), // FSR0H
                             (s + 3, 0xFE9), // FSR0L
                             (s + 2, 0xFE0), // BSR
-                            (s + 1, 0xFD8), // STATUS
                         ]);
                         // The same four additions as the compat block
                         // (epic-cc#477): the low save area grew from 12 to
@@ -7481,7 +7479,6 @@ pub fn select_with_locs(
                             (common_lo + 4, 0xFEA),  // FSR0H
                             (common_lo + 11, 0xFE9), // FSR0L
                             (common_lo + 10, 0xFE0), // BSR
-                            (common_lo + 9, 0xFD8),  // STATUS
                         ]);
                         g.emit_movff_pairs([
                             (common_lo + 15, common_lo + 3),
@@ -7511,19 +7508,25 @@ pub fn select_with_locs(
                         let bank = (s >> 8) as u8;
                         g.emit(format!("    MOVLB 0x{bank:X}"));
                         g.bsr = Some(bank);
-                        g.emit(format!("    MOVF 0x{s:03X}, W, B")); // W last
-                                                                     // The select above leaves hardware BSR on the save
-                                                                     // area's bank, not the preempted value: restore it
-                                                                     // through BSR-independent MOVFF before returning,
-                                                                     // or main resumes against the wrong bank (epic-cc#534
-                                                                     // makes tracked agreement load-bearing there).
+                        g.emit(format!("    MOVF 0x{s:03X}, W, B"));
+                        // MOVF sets Z/N from W, so STATUS restores after it
+                        // (MOVFF leaves flags alone; epic-cc#604).
+                        g.emit(format!("    MOVFF 0x{:03X}, 0xFD8", s + 1));
+                        // The select above leaves hardware BSR on the save
+                        // area's bank, not the preempted value: restore it
+                        // through BSR-independent MOVFF before returning,
+                        // or main resumes against the wrong bank (epic-cc#534
+                        // makes tracked agreement load-bearing there).
                         g.emit(format!("    MOVFF 0x{:03X}, 0xFE0", s + 2));
                         g.bsr = None;
                     } else {
                         g.emit(format!(
                             "    MOVF 0x{:03X}, W, A",
                             common_lo + ISR_W_SAVE_OFFSET
-                        )); // W last
+                        ));
+                        // MOVF sets Z/N from W, so STATUS restores after it
+                        // (MOVFF leaves flags alone; epic-cc#604).
+                        g.emit(format!("    MOVFF 0x{:03X}, 0xFD8", common_lo + 9));
                     }
                     g.emit("    RETFIE".to_string());
                 }

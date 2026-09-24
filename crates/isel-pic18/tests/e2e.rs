@@ -459,16 +459,54 @@ fn compat_isr_preserves_status_bsr_fsr0l_across_retval_backup() {
         }
     }
 
-    // Z/N are excluded: the epilogue's final W restore is a MOVF, which
-    // legitimately sets them from the restored W value (the accepted
-    // flag loss noted above the restores array).
+    // Z/N included: the epilogue restores W before STATUS, so the final
+    // MOVF cannot clobber the restored flags (epic-cc#604).
     assert_eq!(
-        p.ram()[0xFD8] & !0x14,
-        0x93 & !0x14,
-        "STATUS (minus Z/N) must survive the compat ISR"
+        p.ram()[0xFD8],
+        0x93,
+        "STATUS (including Z/N) must survive the compat ISR"
     );
     assert_eq!(p.ram()[0xFE0], 0x27, "BSR must survive the compat ISR");
     assert_eq!(p.ram()[0xFE9], 0x5C, "FSR0L must survive the compat ISR");
+}
+
+#[test]
+fn compat_isr_preserves_zero_flag_when_w_is_nonzero() {
+    // epic-cc#604 regression: the compat epilogue restored STATUS before W,
+    // and the W restore via MOVF sets Z/N from W. A Timer2 IRQ landing in a
+    // main-line XORLW/BNZ indirect-call dispatch window then mis-dispatched.
+    // W nonzero with Z set separates the two orders: W-last returns Z clear.
+    let m = ir::parse(
+        "fn isr(void) [isr] ()\n  block entry:\n    ret void\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let asm =
+        isel_pic18::select_with_locs(&PIC18F4550, &m, &HashMap::new(), None, Some(0x0040), None).0;
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = Pic18::new(parse_hex_pic18(&hex));
+
+    p.set_w(0x55);
+    p.ram_mut()[0xFD8] = 0x1D; // STATUS with C, Z, OV, N set
+
+    p.fire_interrupt();
+    assert_eq!(p.pc(), 8, "ISR starts at the high vector");
+
+    let mut steps = 0;
+    loop {
+        p.step();
+        steps += 1;
+        assert!(steps < 200, "ISR never returned (pc = {})", p.pc());
+        if p.pc() == 0 {
+            break;
+        }
+    }
+
+    assert_eq!(p.w(), 0x55, "W must survive the compat ISR");
+    assert_eq!(
+        p.ram()[0xFD8],
+        0x1D,
+        "STATUS (including Z/N) must survive the compat ISR"
+    );
 }
 
 #[test]
