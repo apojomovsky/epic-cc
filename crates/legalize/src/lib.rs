@@ -1741,6 +1741,40 @@ fn alloca_root_map(
     None
 }
 
+/// GEP bases plus Load-from-aliased-global entries: a register loaded
+/// from a global pointer variable holding another global's address
+/// (`g_handle = &g_storage`) resolves as that global with offset 0, so
+/// pointer-carried chains (`%o = load @g_handle; %p = gep %o +k`)
+/// settle in the map-based arms exactly as in `global_field`
+/// (epic-cc#642). The four `bases` construction sites share this.
+fn bases_with_alias_loads(
+    f: &Func,
+    aliases: &HashMap<String, String>,
+) -> HashMap<String, (GepBase, u16, Vec<(u16, String)>)> {
+    let mut bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            match inst {
+                Inst::Gep(g) => {
+                    bases.insert(g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()));
+                }
+                Inst::Load(l) => {
+                    if let Some(g_ptr) = l.ptr.strip_prefix('@') {
+                        if let Some(target) = aliases.get(g_ptr) {
+                            bases.insert(
+                                l.dst.clone(),
+                                (GepBase::Global(target.clone()), 0, Vec::new()),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    bases
+}
+
 /// The `@g`/`%r` pointer text of a `Val` (memcpy operands are pointer
 /// values). A non-pointer val has no pointer text.
 fn ptr_of_val(v: &Val) -> String {
@@ -2353,14 +2387,7 @@ fn duplicate_isr_shared(
     let mut handle_feeds_lo: HashSet<String> = HashSet::new();
     let mut handle_feeds_hi: HashSet<String> = HashSet::new();
     for sf in funcs.iter() {
-        let mut bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = HashMap::new();
-        for b in &sf.blocks {
-            for inst in &b.insts {
-                if let Inst::Gep(g) = inst {
-                    bases.insert(g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()));
-                }
-            }
-        }
+        let bases = bases_with_alias_loads(sf, &aliases);
         for b in &sf.blocks {
             for inst in &b.insts {
                 let Inst::Memcpy(mc) = inst else { continue };
@@ -2403,15 +2430,8 @@ fn duplicate_isr_shared(
     }
     for f in &mut funcs {
         // GEP bases are resolved before the mutation loop (the function is
-        // borrowed mutably below).
-        let mut bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = HashMap::new();
-        for b in &f.blocks {
-            for inst in &b.insts {
-                if let Inst::Gep(g) = inst {
-                    bases.insert(g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()));
-                }
-            }
-        }
+        // borrowed mutably below), now with the alias-load entries.
+        let bases = bases_with_alias_loads(f, &aliases);
         // Local allocas fed whole-object into a priority-read global via a
         // memcpy (the HAL `Init(&h)` idiom, epic-cc#463): a store into any
         // field of such an alloca needs the same rewrite as a direct store
@@ -2700,14 +2720,7 @@ fn duplicate_isr_shared(
     {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for sf in &funcs {
-            let mut bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = HashMap::new();
-            for b in &sf.blocks {
-                for inst in &b.insts {
-                    if let Inst::Gep(g) = inst {
-                        bases.insert(g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()));
-                    }
-                }
-            }
+            let bases = bases_with_alias_loads(sf, &aliases);
             for b in &sf.blocks {
                 for inst in &b.insts {
                     let Inst::Memcpy(mc) = inst else { continue };
@@ -2943,15 +2956,7 @@ fn fill_indirect_callees(
         // pointer is loaded from (ADR-038). Resolvable sites scope their
         // candidates to that storage's spellings; unresolvable sites
         // keep the context-scoped whole-program list.
-        let bases: HashMap<String, (GepBase, u16, Vec<(u16, String)>)> = f
-            .blocks
-            .iter()
-            .flat_map(|b| &b.insts)
-            .filter_map(|i| match i {
-                Inst::Gep(g) => Some((g.dst.clone(), (g.base.clone(), g.k, g.terms.clone()))),
-                _ => None,
-            })
-            .collect();
+        let bases = bases_with_alias_loads(f, &aliases);
         let load_storages: HashMap<String, (String, u16)> = f
             .blocks
             .iter()
