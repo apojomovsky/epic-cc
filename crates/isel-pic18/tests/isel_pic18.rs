@@ -1160,15 +1160,24 @@ fn isr_emits_vector_prologue_and_retfie() {
     assert!(asm.contains("MOVFF 0xFF7, 0x006"), "TBLPTRH save:\n{asm}");
     assert!(asm.contains("MOVFF 0xFF8, 0x007"), "TBLPTRU save:\n{asm}");
     assert!(asm.contains("MOVWF 0x008,A"), "W save last:\n{asm}");
-    // The epilogue: reverse order, MOVFF-based (flags survive), W last via
-    // MOVF (the one accepted flag clobber), then RETFIE.
+    // The epilogue: MOVFF-based (flags survive); W restores before STATUS
+    // because MOVF sets Z/N, so STATUS comes last and the ISR return is
+    // flag-transparent (epic-cc#604).
     assert!(
         asm.contains("MOVFF 0x00F, 0x003"),
         "retval restore hi:\n{asm}"
     );
-    assert!(asm.contains("MOVFF 0x009, 0xFD8"), "STATUS restore:\n{asm}");
-    assert!(asm.contains("MOVF 0x008, W, A"), "W restore:\n{asm}");
-    assert!(asm.contains("RETFIE"), "ISR must end with RETFIE:\n{asm}");
+    let w = asm.find("MOVF 0x008, W, A").expect("W restore:\n{asm}");
+    let st = asm
+        .find("MOVFF 0x009, 0xFD8")
+        .expect("STATUS restore:\n{asm}");
+    let ret = asm
+        .find("RETFIE")
+        .expect("ISR must end with RETFIE:\n{asm}");
+    assert!(
+        w < st && st < ret,
+        "W restores before STATUS, STATUS last before RETFIE:\n{asm}"
+    );
 }
 
 #[test]
