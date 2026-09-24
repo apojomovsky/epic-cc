@@ -154,6 +154,13 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("size-bench/bench-dead-store.c")],
         },
         Case {
+            name: "bench-w-roundtrip-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-w-roundtrip.c")],
+        },
+        Case {
             name: "bench-bank-18f4550",
             device: "18F4550",
             includes: vec![],

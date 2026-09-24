@@ -116,7 +116,14 @@ fn i32_add_emits_a_four_byte_carry_chain() {
         3,
         "bytes 1-3 carry adds:\n{asm}"
     );
-    assert_eq!(asm.matches("MOVWF").count(), 4, "four result bytes:\n{asm}");
+    // The arithmetic writes all four result-slot bytes. Counted per
+    // address rather than as a `MOVWF` total: the copy out to `@out`
+    // reuses W for its last byte (epic-cc#502), so a bare mnemonic count
+    // measures the copy's form, not the add's width.
+    let slot_writes = (0x038..=0x03B)
+        .filter(|a| asm.contains(&format!("MOVWF 0x{a:03X},A")))
+        .count();
+    assert_eq!(slot_writes, 4, "four result bytes:\n{asm}");
 }
 
 #[test]
@@ -6403,4 +6410,65 @@ fn an_unsigned_compare_against_a_gep_value_keeps_the_cascade() {
             "icmp ult {lhs:#06x}, (gep %a+4 = 0x0144)"
         );
     }
+}
+#[test]
+fn a_stored_result_reload_is_elided_from_the_same_slot() {
+    // epic-cc#502: `MOVWF f` then a reload of `f` into W is two words for
+    // nothing, and a `MOVFF f,g` after the store is three where `MOVWF g`
+    // is one. Both fold here: the add's result lands in `main::3`, which
+    // the store to `@out` then reuses straight out of W.
+    let m = parse(
+        "global a i8\nglobal b i8\nglobal c i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n\
+         %3 = add i8 %1, %2\n    store i8 %3 @c\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x13),
+        ("b", 0x14),
+        ("c", 0x15),
+        ("main::1", 0x10),
+        ("main::2", 0x11),
+        ("main::3", 0x12),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0x012, 0x015"),
+        "the copy must not reload through MOVFF:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVWF 0x015,A").count(),
+        1,
+        "the store writes W straight to the destination:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVWF").count(),
+        2,
+        "one result store plus one destination store, no reload:\n{asm}"
+    );
+}
+
+#[test]
+fn an_isr_visible_global_is_still_re_read_between_uses() {
+    // The cache's negative case: a global's address is never recorded, so
+    // two reads of one still emit two accesses. An interrupt can change the
+    // global while the epilogue restores W, so a cached byte would be
+    // stale.
+    let m = parse(
+        "global in i8\nglobal slot i8\nglobal out i8\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @slot\n\
+         %2 = load i8 @in\n    store i8 %2 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x11),
+        ("slot", 0x12),
+        ("out", 0x13),
+        ("main::1", 0x10),
+        ("main::2", 0x10),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVFF 0x011,").count(),
+        2,
+        "both global reads must name the global:\n{asm}"
+    );
 }

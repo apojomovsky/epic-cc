@@ -136,6 +136,28 @@ struct Gen<'m> {
     /// the source location active when it was staged so the parallel
     /// `locs` vector stays index-aligned whichever way the drain goes.
     pending_copies: Vec<(u16, u16, Option<SrcLoc>)>,
+    /// Every RAM address a global occupies. The W cache never records or
+    /// reuses one: an interrupt can write a global between the store and
+    /// the reload, while the ISR epilogue restores W to its pre-interrupt
+    /// value, so eliding the read would return the stale byte. Only a
+    /// function-private frame slot is safe to track, the same structural
+    /// rule PIC14's cache states (epic-cc#214).
+    global_addrs: &'m HashSet<u16>,
+    /// The GPR slot whose byte `emit_w_store`/`emit_w_load` last left in
+    /// W, or `None` when unknown. When it is set, a reload of the same
+    /// slot folds away and a memory-to-memory copy out of it becomes one
+    /// `MOVWF` instead of a 2-word `MOVFF` (epic-cc#502).
+    ///
+    /// Only a slot's own byte is ever recorded: an SFR or literal address
+    /// is read through the plain `emit` arms, so no hardware register's
+    /// readback can be elided, and the IR's missing volatile flag needs
+    /// no separate rule (epic-cc#214's argument, restated for this core).
+    /// Every other emission path clears it, so a stale belief never
+    /// survives a flag-setting, W-clobbering or label-joining instruction.
+    /// `MOVF f,W` also sets STATUS Z from the byte it loaded, which
+    /// `MOVWF` does not, so a reload whose Z a branch consumes passes
+    /// `need_z` and is never elided.
+    w_holds: Option<u16>,
     cur_func: &'m str,
     /// Marks an interrupt handler: the body runs a save prologue and restore
     /// epilogue with `RETFIE` instead of `RETURN` (the single-vector mode).
@@ -157,6 +179,10 @@ struct Gen<'m> {
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.flush_copies();
+        // Any instruction this sink did not route through `emit_w_store`/
+        // `emit_w_load` may move W or set a flag, so the cache cannot
+        // survive it (epic-cc#502).
+        self.w_holds = None;
         let line = s.into();
         if let Some(t) = Self::fwd_target(&line) {
             // A user function literally named `tmp` plus digits would
@@ -170,6 +196,72 @@ impl<'m> Gen<'m> {
         }
         self.out.push(line);
         self.locs.push(self.cur_loc.clone());
+    }
+
+    /// `MOVWF f`, unless the byte at `f` already equals W from an
+    /// immediately preceding `emit_w_store`/`emit_w_load` of the same
+    /// address (a genuine no-op then). Marks `f` as holding W either way.
+    ///
+    /// The operand is resolved only when the store is actually emitted:
+    /// `operand` can emit a `MOVLB`, and any emission clears the cache,
+    /// so resolving on the cache-hit path would both waste the bank
+    /// decision and destroy the belief it was about to reuse.
+    fn emit_w_store(&mut self, addr: u16) {
+        if self.w_holds != Some(addr) {
+            let (a, f) = self.operand(addr);
+            let bank = if a == 0 { "A" } else { "B" };
+            self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+        }
+        self.mark_w(addr);
+    }
+
+    /// Record that W holds the byte at `addr`, unless the address belongs
+    /// to a global: an ISR can rewrite a global at any time and its
+    /// epilogue restores the interrupted W, so a global's cached byte is
+    /// never trustworthy across the next instruction boundary.
+    fn mark_w(&mut self, addr: u16) {
+        self.w_holds = if self.global_addrs.contains(&addr) {
+            None
+        } else {
+            Some(addr)
+        };
+    }
+
+    /// `MOVF f,W`, unless W is already known to hold exactly this byte
+    /// from an immediately preceding `emit_w_store`/`emit_w_load` of the
+    /// same address (epic-cc#502).
+    ///
+    /// `need_z` marks a site whose next instruction consumes STATUS Z set
+    /// by this load (the `BrCond`/`Select`/switch selectors). `MOVWF`
+    /// leaves Z alone, so eliding the load there would branch on a stale
+    /// flag; `need_z` forces the `MOVF`, which is what sets Z.
+    fn emit_w_load(&mut self, addr: u16, need_z: bool) {
+        if !need_z && self.w_holds == Some(addr) {
+            return;
+        }
+        let (a, f) = self.operand(addr);
+        let bank = if a == 0 { "A" } else { "B" };
+        self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+        // `MOVF` with a file source and d=0 sets Z from the byte it read,
+        // which is exactly the flag a following `BZ` wants.
+        self.mark_w(addr);
+    }
+
+    /// Memory-to-memory byte copy, preferring the one-word `MOVWF` when W
+    /// already holds the source byte (epic-cc#502 measured this shape as
+    /// `MOVWF f` followed by `MOVFF f,g`: three words where one does).
+    /// Falls back to the staged `emit_copy_byte` otherwise, so a long run
+    /// of ordinary copies still drains as one LFSR-seeded loop.
+    fn emit_copy_byte_or_w(&mut self, src: u16, dst: u16) {
+        if self.w_holds == Some(src) && !self.global_addrs.contains(&src) {
+            // The shortcut still writes `dst`, and a byte write to a
+            // pointer slot must invalidate a tracked FSR0 grounded in it;
+            // `emit_copy_byte` is otherwise the only place that does.
+            self.invalidate_fsr0_if_slot_written(dst, 1);
+            self.emit_w_store(dst);
+            return;
+        }
+        self.emit_copy_byte(src, dst);
     }
 
     /// Drains `pending_copies`. A run that reached `COPY_LOOP_MIN_PAIRS`
@@ -192,6 +284,9 @@ impl<'m> Gen<'m> {
         // cannot hold that count in the MOVLW literal, so long runs
         // replay straight, the pre-loop form.
         if n >= COPY_LOOP_MIN_PAIRS && n <= 255 {
+            // The count rides in WREG, so the drained form clobbers W
+            // (epic-cc#502).
+            self.w_holds = None;
             let (src0, dst0, loc) = &pairs[0];
             let (src0, dst0) = (*src0, *dst0);
             let l_loop = self.fresh_label();
@@ -650,6 +745,13 @@ impl<'m> Gen<'m> {
     /// the tracked state before the drain.
     fn emit_copy_byte(&mut self, src: u16, dst: u16) {
         self.invalidate_fsr0_if_slot_written(dst, 1);
+        // A staged copy replays as a raw `MOVFF` push, which the plain
+        // `emit` cannot see, so a copy into the tracked slot must drop the
+        // belief here: after the drain the byte there is the source's, not
+        // W's (epic-cc#502).
+        if self.w_holds == Some(dst) {
+            self.w_holds = None;
+        }
         if let Some(&(last_src, last_dst, _)) = self.pending_copies.last() {
             if src != last_src.wrapping_add(1) || dst != last_dst.wrapping_add(1) {
                 self.flush_copies();
@@ -789,7 +891,7 @@ impl<'m> Gen<'m> {
                         self.emit(format!("    CLRF 0x{f:03X},{bank}"));
                     } else {
                         self.emit(format!("    MOVLW 0x{byte:02X}"));
-                        self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
+                        self.emit_w_store(dst + u16::from(i));
                     }
                 }
             }
@@ -979,7 +1081,7 @@ impl<'m> Gen<'m> {
             _ => {
                 let src = self.val_addr(val).direct();
                 for i in 0..ty.bytes() {
-                    self.emit_copy_byte(src + u16::from(i), dst + u16::from(i));
+                    self.emit_copy_byte_or_w(src + u16::from(i), dst + u16::from(i));
                 }
             }
         }
@@ -2278,7 +2380,7 @@ impl<'m> Gen<'m> {
                     Addr::Indirect => {
                         let n = s.ty.bytes();
                         for k in 0..n {
-                            self.emit_load_w(&s.val, k);
+                            self.emit_load_w(&s.val, k, false);
                             let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
                             self.emit(format!("    MOVWF 0x{reg:03X},A"));
                         }
@@ -2580,7 +2682,7 @@ impl<'m> Gen<'m> {
                             // directly here to avoid recursion.
                             let av = self.val_addr(&swapped.a).direct();
                             for i in 0..n {
-                                self.emit_load_w(&swapped.b, i);
+                                self.emit_load_w(&swapped.b, i, false);
                                 let carry =
                                     i > 0 && matches!(swapped.op, ir::BinOp::Add | ir::BinOp::Sub);
                                 let mne = match (swapped.op, carry) {
@@ -2596,9 +2698,7 @@ impl<'m> Gen<'m> {
                                 let (aacc, af) = self.operand(av + u16::from(i));
                                 let abank = if aacc == 0 { "A" } else { "B" };
                                 self.emit(format!("    {mne} 0x{af:03X},W,{abank}"));
-                                let (dacc, df) = self.operand(dst + u16::from(i));
-                                let dbank = if dacc == 0 { "A" } else { "B" };
-                                self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                                self.emit_w_store(dst + u16::from(i));
                             }
                             return;
                         }
@@ -2652,7 +2752,7 @@ impl<'m> Gen<'m> {
                 for i in 0..n {
                     // SUBWF computes f - W; the IR's `sub a, b` is `a - b`,
                     // so `a` must be `f` and `b` must go into `W` first.
-                    self.emit_load_w(&b.b, i);
+                    self.emit_load_w(&b.b, i, false);
                     // Byte 0 of add/sub is a plain ADDWF/SUBWF; every byte
                     // past it must fold in the carry/borrow from the
                     // previous byte via ADDWFC/SUBFWB. and/or/xor apply
@@ -2673,9 +2773,7 @@ impl<'m> Gen<'m> {
                     let (aacc, af) = self.operand(av + u16::from(i));
                     let abank = if aacc == 0 { "A" } else { "B" };
                     self.emit(format!("    {mne} 0x{af:03X},W,{abank}"));
-                    let (dacc, df) = self.operand(dst + u16::from(i));
-                    let dbank = if dacc == 0 { "A" } else { "B" };
-                    self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+                    self.emit_w_store(dst + u16::from(i));
                 }
             }
             Inst::Icmp(c) => {
@@ -2920,7 +3018,7 @@ impl<'m> Gen<'m> {
                     let addr_value = seeded;
                     let l_else = self.fresh_label();
                     let l_end = self.fresh_label();
-                    self.emit_load_w(&s.cond, 0);
+                    self.emit_load_w(&s.cond, 0, true);
                     self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
                     if addr_value {
                         self.emit_move_addr_to_slot(&s.a, dst);
@@ -3066,10 +3164,10 @@ impl<'m> Gen<'m> {
             let l_next = self.fresh_label();
             // Compare the fp value's two bytes against the candidate's
             // address. MOVF sets Z; XORLW leaves it; BNZ skips on mismatch.
-            self.emit_load_w(&Val::Reg(func.to_string()), 0);
+            self.emit_load_w(&Val::Reg(func.to_string()), 0, false);
             self.emit(format!("    XORLW LOW({cand})"));
             self.emit(format!("    BNZ {l_next}"));
-            self.emit_load_w(&Val::Reg(func.to_string()), 1);
+            self.emit_load_w(&Val::Reg(func.to_string()), 1, false);
             self.emit(format!("    XORLW HIGH({cand})"));
             self.emit(format!("    BNZ {l_next}"));
             // Matched: copy args into this candidate's slots and call it.
@@ -3285,7 +3383,7 @@ impl<'m> Gen<'m> {
             self.emit("    BCF 0xFD8,0,A".to_string());
         }
         for i in 0..bytes {
-            self.emit_load_w(&b, i);
+            self.emit_load_w(&b, i, false);
             let av = self.val_addr(&a).direct() + u16::from(i);
             let (acc, af) = self.operand(av);
             let bank = if acc == 0 { "A" } else { "B" };
@@ -3460,7 +3558,7 @@ impl<'m> Gen<'m> {
                 }
             }
         }
-        self.emit_load_w(b, byte_offset);
+        self.emit_load_w(b, byte_offset, false);
         let (acc, af) = self.operand(av);
         let bank = if acc == 0 { "A" } else { "B" };
         self.emit(format!("    SUBWF 0x{af:03X},W,{bank}")); // W = a - b
@@ -3736,7 +3834,13 @@ impl<'m> Gen<'m> {
     ///
     /// The resolved-GEP arm can write STATUS,C (see
     /// `load_w_writes_carry`); every other arm leaves it alone.
-    fn emit_load_w(&mut self, v: &Val, offset: u8) {
+    ///
+    /// `need_z` is forwarded to `emit_w_load` for the plain slot arms: a
+    /// caller whose next instruction consumes the Z this load sets (the
+    /// `BrCond`/`Select`/switch selectors) passes `true` so the reload is
+    /// never elided. A caller feeding an ALU op passes `false`, since
+    /// that op sets its own flags.
+    fn emit_load_w(&mut self, v: &Val, offset: u8, need_z: bool) {
         match v {
             Val::Const(k) => {
                 let byte = ((*k >> (u32::from(offset) * 8)) & 0xFF) as u8;
@@ -3836,9 +3940,7 @@ impl<'m> Gen<'m> {
                     }
                 }
                 let addr = self.val_addr(v).direct() + u16::from(offset);
-                let (a, f) = self.operand(addr);
-                let bank = if a == 0 { "A" } else { "B" };
-                self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                self.emit_w_load(addr, need_z);
             }
             Val::Global(g) => {
                 if self.is_function(g) {
@@ -3848,9 +3950,7 @@ impl<'m> Gen<'m> {
                     self.emit(format!("    MOVLW {lit}({g})"));
                 } else {
                     let addr = self.val_addr(v).direct() + u16::from(offset);
-                    let (a, f) = self.operand(addr);
-                    let bank = if a == 0 { "A" } else { "B" };
-                    self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
+                    self.emit_w_load(addr, need_z);
                 }
             }
         }
@@ -6655,14 +6755,34 @@ pub fn select_with_locs(
     // RAM globals as `equ` names so hand-written inline asm can reference
     // them XC8-style (`movf _m_a+0,w`): the assembler aliases `_x` to `x`
     // and evaluates `sym+N`, so no label emission is needed (epic-cc#610).
-    // Sorted for deterministic output; consts keep their table labels.
+    // Sorted for deterministic output; a const that alloc kept in flash has
+    // no RAM address and is absent here, so it keeps its table label.
     let mut ram_globals: Vec<(&String, &u16)> = m
         .globals
         .iter()
-        .filter(|g| !g.is_const)
+        // Every global alloc gave a RAM address, const or not: a const that
+        // is used as a plain pointer argument is placed in RAM
+        // (epic-cc#443), and `map_text` then emits it as a `global` line, so
+        // it is RAM for the W cache and for the `equ` names alike.
         .filter_map(|g| addrs.get(&g.name).map(|a| (&g.name, a)))
         .collect();
     ram_globals.sort();
+    // Every byte a RAM global occupies, so no W-cache entry can be
+    // grounded in storage an ISR may rewrite behind the compiler's back
+    // (epic-cc#502).
+    let mut global_addrs: HashSet<u16> = HashSet::new();
+    for (name, addr) in &ram_globals {
+        // Width by name, from the module, not by re-matching the address.
+        let size = m
+            .globals
+            .iter()
+            .find(|g| &g.name == *name)
+            .map(|g| g.size as u16)
+            .unwrap_or(1);
+        for i in 0..size {
+            global_addrs.insert(**addr + i);
+        }
+    }
     for (name, addr) in ram_globals {
         // A RAM global sharing a fixed SFR name would silently resolve to
         // the wrong address either way; fail loudly instead (epic-cc#610).
@@ -6803,6 +6923,8 @@ pub fn select_with_locs(
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: &f.name,
+            global_addrs: &global_addrs,
+            w_holds: None,
             isr: f.isr,
             tmp: &mut tmp,
             cur_loc: None,
@@ -7051,7 +7173,7 @@ pub fn select_with_locs(
                                 !matches!(bc.cond, Val::Const(_)),
                                 "isel-pic18: const cond BrCond not yet supported"
                             );
-                            g.emit_load_w(&bc.cond, 0);
+                            g.emit_load_w(&bc.cond, 0, true);
                             emit_cond_branches(
                                 &mut g, &lt, &lf, &t_copies, &f_copies, b, &doms, bc,
                             );
@@ -7130,14 +7252,14 @@ pub fn select_with_locs(
                             l_default.clone()
                         };
                         if sw.ty.bytes() == 2 {
-                            g.emit_load_w(&sw.val, 1);
+                            g.emit_load_w(&sw.val, 1, true);
                             g.emit(format!("    BNZ {l_def}"));
                         }
                         let slot = g.val_addr(&sw.val).direct();
                         let (a, f) = g.operand(slot);
                         let bank = if a == 0 { "A" } else { "B" };
                         if base == 0 {
-                            g.emit_load_w(&sw.val, 0);
+                            g.emit_load_w(&sw.val, 0, false);
                             g.emit(format!("    SUBLW 0x{:02X}", (n - 1) as u8));
                             g.emit(format!("    BNC {l_def}"));
                         } else {
@@ -7164,7 +7286,7 @@ pub fn select_with_locs(
                                                                  // Three accumulations of the
                                                                  // index, no scratch byte, and
                                                                  // no flag consumer follows.
-                        g.emit_load_w(&sw.val, 0);
+                        g.emit_load_w(&sw.val, 0, false);
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
                         g.emit(format!("    ADDWF 0x{f:03X},W,{bank}"));
@@ -7216,7 +7338,7 @@ pub fn select_with_locs(
                             let l_next = g.fresh_label();
                             for b_i in 0..sw.ty.bytes() {
                                 let kb = ((k >> (b_i as u32 * 8)) & 0xFF) as u8;
-                                g.emit_load_w(&sw.val, b_i);
+                                g.emit_load_w(&sw.val, b_i, true);
                                 g.emit(format!("    SUBLW 0x{kb:02X}"));
                                 if b_i as u8 + 1 != sw.ty.bytes() {
                                     g.emit(format!("    BNZ {l_next}"));
@@ -7348,7 +7470,7 @@ pub fn select_with_locs(
                 Some(Inst::Ret(Some((ty, v)), loc)) => {
                     g.cur_loc = loc.clone();
                     for i in 0..ty.bytes() {
-                        g.emit_load_w(v, i);
+                        g.emit_load_w(v, i, false);
                         let (a, f2) = g.operand(g.retval_lo + u16::from(i));
                         let bank = if a == 0 { "A" } else { "B" };
                         g.emit(format!("    MOVWF 0x{f2:03X},{bank}"));
@@ -7403,6 +7525,8 @@ pub fn select_with_locs(
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: &f.name,
+                global_addrs: &global_addrs,
+                w_holds: None,
                 isr: f.isr,
                 tmp: &mut tmp,
                 cur_loc: None,
@@ -7665,6 +7789,15 @@ pub fn select_with_locs(
     (out.join("\n") + "\n", locs)
 }
 
+/// The W cache's global-address exclusion set for the unit tests below:
+/// they exercise emitters directly, with no module-level placement, so no
+/// address is a global (epic-cc#502).
+#[cfg(test)]
+fn empty_global_addrs() -> &'static HashSet<u16> {
+    static EMPTY: std::sync::OnceLock<HashSet<u16>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(HashSet::new)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7695,6 +7828,8 @@ mod tests {
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
+                global_addrs: empty_global_addrs(),
+                w_holds: None,
                 isr: false,
                 tmp: &mut tmp,
                 cur_loc: None,
@@ -7717,6 +7852,8 @@ mod tests {
                 fsr0_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
+                global_addrs: empty_global_addrs(),
+                w_holds: None,
                 isr: false,
                 tmp: &mut tmp,
                 cur_loc: None,
@@ -7754,6 +7891,8 @@ mod p3_gen_tests {
             fsr0_holds: None,
             pending_copies: Vec::new(),
             cur_func: "main",
+            global_addrs: empty_global_addrs(),
+            w_holds: None,
             isr: false,
             tmp,
             cur_loc: None,
