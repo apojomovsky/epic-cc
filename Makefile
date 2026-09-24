@@ -75,7 +75,7 @@ DOCKER_ARGS = --rm \
 
 DOCKER_RUN = mkdir -p $(CARGO_HOME_CACHE) $(TARGET_CACHE_MOUNT) && docker run $(DOCKER_ARGS) $(LOCAL_IMAGE)
 
-.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check
+.PHONY: help bootstrap doctor image shell exec test compile info release-bundle clean-containers setup-hooks fmt lint check-warnings pre-pr-check size-report
 
 bootstrap: ## First-time setup: host deps, git hooks, dev image
 	@bash scripts/bootstrap.sh
@@ -132,6 +132,50 @@ exec: image ## One-off command: make exec CMD='cargo test -p asm'
 
 test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	@$(DOCKER_RUN) bash -c '$(if $(CRATE),cargo test -p $(CRATE) --no-fail-fast,bash scripts/ci-test.sh)'
+# Menu-demo ladder inputs. Must match the hal-pic18-menu-demo-18f4550 case
+# in crates/driver/tests/size_regression_e2e.rs; size-report.py fails the
+# render if this list drifts from the sizes.json inputs it records.
+MENU_DEMO_FIX := crates/driver/tests/fixtures/vendor/hal-pic18-menu-demo
+MENU_DEMO_INCLUDES := $(addprefix $(MENU_DEMO_FIX)/, \
+	pic18fxx5x-hal/include/epiccc \
+	pic18fxx5x-hal/include \
+	epic-common/include \
+	epic-taskmgr/include \
+	epic-tick/include \
+	epic-lcd/include \
+	epic-serial/include \
+	epic-menu-demo/include)
+MENU_DEMO_DEFINES := PIC18F4550 FOSC_HZ=48000000 __EPIC_CC__
+MENU_DEMO_SRCS := $(addprefix $(MENU_DEMO_FIX)/, \
+	pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c \
+	pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c \
+	pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c \
+	pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c \
+	pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c \
+	pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c \
+	pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c \
+	pic18fxx5x-hal/src/core/pic18_irq.c \
+	pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c \
+	pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c \
+	pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c \
+	pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c \
+	pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c \
+	epic-taskmgr/src/epic_taskmgr.c \
+	epic-tick/src/epic_tick.c \
+	epic-lcd/src/epic_lcd.c \
+	epic-lcd/src/epic_lcd_gpio4.c \
+	epic-serial/src/epic_serial.c \
+	epic-menu-demo/src/menu_demo_core.c \
+	epic-menu-demo/tests/sim_menu_demo.c \
+	config_18F4550.c)
+REPORT_DATE := $(shell date -u +%F)
+
+size-report: image ## Regenerate crates/driver/tests/fixtures/SIZE_REPORT.md from the tree
+	@mkdir -p scratch/size-report
+	@$(DOCKER_RUN) bash -c 'set -o pipefail; SIZE_REPORT_JSON=1 cargo test -q -p driver --test size_regression_e2e -- --nocapture 2>/dev/null | sed -n /SIZE_REPORT_JSON_BEGIN/,/SIZE_REPORT_JSON_END/p | grep -v SIZE_REPORT_JSON > scratch/size-report/sizes.json'
+	@$(DOCKER_RUN) bash -c 'cargo run -q -p driver -- --target 18F4550 $(addprefix -I ,$(MENU_DEMO_INCLUDES)) $(addprefix -D ,$(MENU_DEMO_DEFINES)) --emit asm --save-temps scratch/size-report/temps -o scratch/size-report/menu-demo.asm $(MENU_DEMO_SRCS) && printf "%s\n" $(MENU_DEMO_SRCS) | sort > scratch/size-report/asm-inputs.txt && python3 scripts/inline-map.py scratch/size-report/temps/merged.ll scratch/size-report/temps/merged_opt.ll > scratch/size-report/inline.json 2>scratch/size-report/inline.err && python3 scripts/density-profile.py scratch/size-report/menu-demo.asm --inline-map scratch/size-report/inline.json --json > scratch/size-report/density.json'
+	@note=$$(python3 scripts/size-refresh-xc8.py --snapshot crates/driver/tests/fixtures/xc8_snapshot.json --out scratch/size-report/xc8.json --bench-dir crates/driver/tests/fixtures/size-bench --repo $(CURDIR)); \
+	python3 scripts/size-report.py --sizes scratch/size-report/sizes.json --density scratch/size-report/density.json --baseline crates/driver/tests/fixtures/size_baseline.toml --xc8 scratch/size-report/xc8.json --sha $(EPIC_CC_GIT_SHA) --date $(REPORT_DATE) --oracle "$$note" --asm-inputs scratch/size-report/asm-inputs.txt --out crates/driver/tests/fixtures/SIZE_REPORT.md && echo "wrote crates/driver/tests/fixtures/SIZE_REPORT.md ($$note)"
 
 ci-local: image ## EXACT CI, locally: docker epic-cc-ci bash scripts/ci-test.sh, run before git push (see #99)
 	@$(DOCKER_RUN) bash scripts/ci-test.sh
