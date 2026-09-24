@@ -400,8 +400,33 @@ words, the lowest 2, and the rotation `4 * (8 - r)`:
 | 6 | 8 | 17 | **25** | 30 | **-5** |
 | 7 | 4 | 17 | **21** | 35 | **-14** |
 
-Both are verified over a swept operand set (each byte lane swept through
-0..255, plus a deterministic 4096-case pseudo-random sweep) in
+The mirrored right-shift family (epic-cc#551) is the same construction
+turned around: rotate each byte left by `8 - r` with `RLNCF`, then
+recombine low-to-high, each lane keeping its own low `8 - r` bits and
+taking its high `r` bits from the byte above. The ascending combine reads
+each upper neighbour before the walk rewrites it, which is what makes the
+in-place form safe. Cost is identical to the left family, and both
+amounts clear the unroll by the same margins:
+
+| r | rotate | combine | total | unroll | delta |
+|---|---|---|---|---|---|
+| 6 | 8 | 17 | **25** | 30 | **-5** |
+| 7 | 4 | 17 | **21** | 35 | **-14** |
+
+Its own byte-move trap is mirrored too: `x >> 7` as `(x >> 8) << 1` with
+the `>> 8` a byte move discards x bit 7, so `x = 0x80` comes back zero
+instead of one, asserted failing in
+`the_mirrored_byte_move_form_for_amount7_is_unsound`.
+
+The family's amount-4/5 rows are verified as well even though only 6 and 7
+are wired, for the reason the left family gives: a table entry a later
+extension could read must be checked, not trusted. Both verify and both
+lose to their unrolls (33 against 20 at amount 4, 29 against 25 at amount
+5), matching the left family's verdicts, so the two families agree at
+every amount they tabulate.
+
+Both directions are verified over a swept operand set (each byte lane
+swept through 0..255, plus a deterministic 4096-case pseudo-random sweep) in
 `crates/superopt/tests/shift_32bit.rs`, and the emitted selector asm is
 re-verified by simulation over 256 derived byte patterns for each amount in
 `crates/isel-pic18/tests/isel_pic18.rs`. Amounts 4 and 5 do not reach this
@@ -414,8 +439,9 @@ change measures exactly zero on that fixture, whose only `<< 6` sites are
 The 32-bit constructions are verified over a curated 4-byte sample
 (`crates/superopt/tests/shift_32bit.rs`), not the full 2^32 domain: a
 full-domain run at this crate's per-case cost is days, and the ticket
-names the curated-sample treatment for this width. They are **not wired
-into `isel-pic18`**, because a form that costs more than the code it
+names the curated-sample treatment for this width. Amounts 6 and 7 are
+wired in both directions (epic-cc#549, epic-cc#551). The amount-4/5
+forms stay unwired, because a form that costs more than the code it
 replaces is not worth landing; `const_shl_i32_by_4_keeps_the_unrolled_form`
 still pins the unroll, and a companion test records that the 4-lane form
 is correct and one word too long, so the negative is checked rather than
