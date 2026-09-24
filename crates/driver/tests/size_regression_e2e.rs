@@ -16,6 +16,13 @@
 //! --test size_regression_e2e` run to accept it (rewrites the file; diff
 //! it before committing, same as reviewing any other snapshot change).
 //!
+//! Because shrinking is free by default, a baseline row can sit above
+//! what the tree produces and silently absorb a later regression of that
+//! size. `STRICT_SIZE_BASELINE=1` (set in CI) fails on such a row instead,
+//! naming the headroom; see epic-cc#629. That rewrite regenerates every
+//! row, so a re-baseline must be diffed row by row: absorbing a row the
+//! change did not affect is how headroom accumulates in the first place.
+//!
 //! The ladder mixes program sizes deliberately: `add.c` is near-zero, so
 //! it catches boilerplate/startup regressions cheaply; the vendored
 //! `hal-pic16-encoder-full` case is the large multi-driver stress case
@@ -365,9 +372,28 @@ fn parse_after(report: &str, marker: &str) -> u32 {
         .unwrap_or_else(|e| panic!("bad number after {marker:?}: {e}\n{report}"))
 }
 
+/// A baseline row that records more than the tree produces, so the ladder
+/// would absorb a regression of up to `headroom` before noticing. Reported
+/// (not fatal) unless the run is strict.
+fn drift_report(name: &str, metric: &str, baseline: u32, measured: u32) -> Option<String> {
+    if baseline <= measured {
+        return None;
+    }
+    let headroom = baseline - measured;
+    Some(format!(
+        "{name}: {metric} baseline {baseline} is {headroom} above measured {measured}; \
+         a regression of up to {headroom} would go undetected. Re-baseline with \
+         UPDATE_SIZE_BASELINE=1 and diff the result."
+    ))
+}
+
 #[test]
 fn flash_and_ram_do_not_regress() {
     let update = std::env::var("UPDATE_SIZE_BASELINE").is_ok();
+    // Strict mode turns a stale baseline row into a failure. CI sets it so
+    // headroom cannot accumulate unnoticed; the default stays permissive so
+    // a perf change may shrink a program without re-baselining mid-iteration.
+    let strict = std::env::var("STRICT_SIZE_BASELINE").is_ok();
     let baseline = load_baseline();
     let mut measured = Vec::new();
     let mut rows = Vec::new();
@@ -398,6 +424,15 @@ fn flash_and_ram_do_not_regress() {
                         ram_bytes,
                         ram_bytes - base.ram_bytes
                     ));
+                }
+                if strict {
+                    if let Some(msg) = drift_report(c.name, "flash", base.flash_words, flash_words)
+                    {
+                        failures.push(msg);
+                    }
+                    if let Some(msg) = drift_report(c.name, "RAM", base.ram_bytes, ram_bytes) {
+                        failures.push(msg);
+                    }
                 }
             }
         } else if !update {
@@ -504,4 +539,36 @@ fn write_step_summary(rows: &[Row]) {
         .expect("open GITHUB_STEP_SUMMARY");
     f.write_all(out.as_bytes())
         .expect("write GITHUB_STEP_SUMMARY");
+}
+
+/// The strict-mode verdict is pure arithmetic on the two numbers, so it is
+/// tested without compiling anything: equal or ahead is no finding, behind
+/// is one naming the headroom a regression could hide in.
+#[test]
+fn drift_report_flags_a_baseline_above_the_measured_value() {
+    assert_eq!(
+        drift_report("x", "flash", 100, 100),
+        None,
+        "an exact match has no headroom to hide a regression in"
+    );
+    assert_eq!(
+        drift_report("x", "flash", 100, 120),
+        None,
+        "a baseline below the measured value is a growth, reported elsewhere"
+    );
+    // The headroom must be a number that appears nowhere else in the
+    // message, or asserting on it proves nothing: a headroom of 9 against
+    // measured 196 satisfies `contains('9')` even if the headroom is never
+    // printed. 12 against measured 188 keeps it distinct, and the phrase
+    // pins where it lands (the message names the headroom twice, in "is 12
+    // above" and "up to 12", so counting occurrences would be brittle).
+    let msg =
+        drift_report("bench-x", "flash", 200, 188).expect("12 words of headroom must be reported");
+    assert!(
+        msg.contains("bench-x")
+            && msg.contains("200")
+            && msg.contains("188")
+            && msg.contains("is 12 above"),
+        "the message must name the row, both numbers and the headroom: {msg}"
+    );
 }
