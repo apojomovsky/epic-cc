@@ -3,84 +3,84 @@
   "image": "epic-cc-xc8-oracle:local",
   "note": "XC8 v4.00 -O2 rows transcribed from crates/driver/tests/fixtures/xc8_reference.md and docs/43-menu-triage-findings.md. Bench and program rows refresh via scripts/size-refresh-xc8.py when the oracle image is present; cluster rows need a manual .map join.",
   "benches": {
-    "bench-shift": {
-      "flash": 108,
-      "ram": 16,
-      "measured": "2026-09-22"
+    "bench-bank": {
+      "flash": 30,
+      "ram": 10,
+      "measured": "2026-09-24"
     },
-    "bench-wide-const": {
-      "flash": 28,
-      "ram": 6,
-      "measured": "2026-09-22"
-    },
-    "bench-zero-init": {
-      "flash": 38,
-      "ram": 12,
-      "measured": "2026-09-22"
-    },
-    "bench-struct-copy": {
-      "flash": 36,
-      "ram": 41,
-      "measured": "2026-09-22"
-    },
-    "bench-switch": {
-      "flash": 55,
-      "ram": 2,
-      "measured": "2026-09-22"
+    "bench-bitmask": {
+      "flash": 54,
+      "ram": 13,
+      "measured": "2026-09-24"
     },
     "bench-bool": {
       "flash": 29,
       "ram": 2,
-      "measured": "2026-09-22"
+      "measured": "2026-09-24"
     },
     "bench-dead-store": {
       "flash": 16,
       "ram": 3,
       "measured": "2026-09-24"
     },
-    "bench-bank": {
-      "flash": 30,
-      "ram": 10,
-      "measured": "2026-09-22"
-    },
     "bench-handle-init": {
       "flash": 87,
       "ram": 47,
-      "measured": "2026-09-23"
-    },
-    "bench-switch-calls": {
-      "flash": 63,
-      "ram": 3,
-      "measured": "2026-09-23"
-    },
-    "bench-u32-loop": {
-      "flash": 49,
-      "ram": 9,
-      "measured": "2026-09-23"
-    },
-    "bench-u16-dec": {
-      "flash": 126,
-      "ram": 17,
-      "measured": "2026-09-23"
-    },
-    "bench-struct-scan": {
-      "flash": 88,
-      "ram": 96,
-      "measured": "2026-09-23"
-    },
-    "bench-bitmask": {
-      "flash": 54,
-      "ram": 13,
-      "measured": "2026-09-23"
+      "measured": "2026-09-24"
     },
     "bench-hoist": {
       "flash": 137,
       "ram": 13,
-      "measured": "2026-09-23"
+      "measured": "2026-09-24"
+    },
+    "bench-shift": {
+      "flash": 108,
+      "ram": 16,
+      "measured": "2026-09-24"
+    },
+    "bench-struct-copy": {
+      "flash": 36,
+      "ram": 41,
+      "measured": "2026-09-24"
+    },
+    "bench-struct-scan": {
+      "flash": 88,
+      "ram": 96,
+      "measured": "2026-09-24"
+    },
+    "bench-switch-calls": {
+      "flash": 63,
+      "ram": 3,
+      "measured": "2026-09-24"
+    },
+    "bench-switch": {
+      "flash": 55,
+      "ram": 2,
+      "measured": "2026-09-24"
+    },
+    "bench-u16-dec": {
+      "flash": 126,
+      "ram": 17,
+      "measured": "2026-09-24"
+    },
+    "bench-u32-loop": {
+      "flash": 49,
+      "ram": 9,
+      "measured": "2026-09-24"
     },
     "bench-w-roundtrip": {
       "flash": 16,
       "ram": 3,
+      "measured": "2026-09-24"
+    },
+    "bench-wide-const": {
+      "flash": 28,
+      "ram": 6,
+      "measured": "2026-09-24"
+    },
+    "bench-zero-init": {
+      "flash": 38,
+      "ram": 12,
       "measured": "2026-09-24"
     }
   },

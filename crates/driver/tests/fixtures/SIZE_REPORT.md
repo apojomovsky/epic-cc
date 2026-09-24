@@ -3,7 +3,7 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit; XC8 numbers quote the snapshot unless the oracle image was present.
 
 - Date (UTC): 2026-09-24
-- Commit: 3dec834
+- Commit: 1b899a1
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
 - XC8 snapshot: measured 2026-09-24 (size-refresh-xc8: refreshed 16 benches)
 - Menu-demo listing: 10914 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
