@@ -83,6 +83,8 @@ struct Ins {
     after_skip: bool,
     in_asm: bool,
     func: usize,
+    /// `CALL`/`RCALL` target, for the depth budget.
+    target: Option<String>,
 }
 
 struct Listing {
@@ -94,6 +96,15 @@ struct Listing {
     texts: Vec<String>,
     call_edges: BTreeMap<usize, BTreeSet<usize>>,
     isr_roots: Vec<usize>,
+}
+
+/// The instruction part of a `label: instr` line (inline asm writes them
+/// unindented and on one line), or the line itself.
+fn strip_label(t: &str) -> &str {
+    match t.split_whitespace().next() {
+        Some(first) if first.ends_with(':') => t.trim_start()[first.len()..].trim(),
+        _ => t.trim(),
+    }
 }
 
 fn upper_mnem(body: &str) -> String {
@@ -169,6 +180,7 @@ fn parse(asm: &str) -> Listing {
             }
             continue;
         }
+        let t = strip_label(t);
         let m = upper_mnem(t);
         if m == "CALL" || m == "RCALL" {
             if let Some(x) = t.split_whitespace().nth(1) {
@@ -211,15 +223,23 @@ fn parse(asm: &str) -> Listing {
     let mut cur = 0usize;
     let mut in_asm = false;
     let mut prev_skip = false;
+    let mut asm_last_instr = true;
     for raw in &lines {
         let trimmed = raw.trim_start();
         if trimmed.starts_with("; --- asm start ---") {
             in_asm = true;
+            asm_last_instr = true;
             kinds.push(Kind::AsmMarker);
             continue;
         }
         if trimmed.starts_with("; --- asm end ---") {
             in_asm = false;
+            // Asm ending in something other than an instruction (raw data
+            // words, a directive) could encode a skip this parser cannot
+            // read: its successor never starts a site.
+            if !asm_last_instr {
+                prev_skip = true;
+            }
             kinds.push(Kind::AsmMarker);
             continue;
         }
@@ -228,7 +248,20 @@ fn parse(asm: &str) -> Listing {
             kinds.push(Kind::Other);
             continue;
         }
-        if !t.starts_with(char::is_whitespace) {
+        // Inline asm is emitted unindented, often as `label: instr`: inside
+        // the markers a line is classified by content, not indentation.
+        let t: &str = if in_asm {
+            let rest = strip_label(t);
+            if rest.is_empty() {
+                asm_last_instr = false;
+                kinds.push(Kind::Label);
+                continue;
+            }
+            rest
+        } else {
+            t
+        };
+        if !in_asm && !t.starts_with(char::is_whitespace) {
             let label = t.trim().trim_end_matches(':').to_string();
             if func_names.contains(&label) {
                 cur = *func_idx.entry(label.clone()).or_insert_with(|| {
@@ -243,11 +276,13 @@ fn parse(asm: &str) -> Listing {
         let m = upper_mnem(body);
         let low = body.to_ascii_lowercase();
         if low.starts_with("org ") {
+            asm_last_instr = false;
             kinds.push(Kind::Barrier { org: true });
             continue;
         }
         if m.starts_with('.') || m == "END" || m == "LIST" || m == "RADIX" || m == "DB" || m == "DW"
         {
+            asm_last_instr = false;
             kinds.push(Kind::Barrier { org: false });
             continue;
         }
@@ -266,6 +301,9 @@ fn parse(asm: &str) -> Listing {
             && !CONTROL.contains(&m.as_str())
             && !touches_stacky(&m, ops, &equs);
         let words = if TWO_WORD.contains(&m.as_str()) { 2 } else { 1 };
+        let target = (m == "CALL" || m == "RCALL")
+            .then(|| ops.split(',').next().unwrap_or("").trim().to_string());
+        asm_last_instr = true;
         kinds.push(Kind::Instr(Ins {
             mnem: m.clone(),
             key,
@@ -274,21 +312,17 @@ fn parse(asm: &str) -> Listing {
             after_skip: prev_skip,
             in_asm,
             func: cur,
+            target,
         }));
         prev_skip = SKIPS.contains(&m.as_str());
     }
     let mut func_words = vec![0u32; funcs.len()];
     let mut call_edges: BTreeMap<usize, BTreeSet<usize>> = BTreeMap::new();
-    for (i, k) in kinds.iter().enumerate() {
+    for k in &kinds {
         if let Kind::Instr(ins) = k {
             func_words[ins.func] += ins.words;
-            if ins.mnem == "CALL" || ins.mnem == "RCALL" {
-                let t = lines[i].split(';').next().unwrap_or("");
-                if let Some(x) = t.split_whitespace().nth(1) {
-                    if let Some(&g) = func_idx.get(x.trim_end_matches(',')) {
-                        call_edges.entry(ins.func).or_default().insert(g);
-                    }
-                }
+            if let Some(g) = ins.target.as_deref().and_then(|t| func_idx.get(t)) {
+                call_edges.entry(ins.func).or_default().insert(*g);
             }
         }
     }
@@ -337,10 +371,10 @@ fn chain(
 fn isr_context(l: &Listing) -> BTreeSet<usize> {
     let mut out = BTreeSet::new();
     let mut stack: Vec<usize> = l.isr_roots.clone();
-    // ISR-context clones carry the `_isr` suffix (ADR-024) even when only
-    // an indirect dispatch reaches them.
+    // ISR-context clones carry the `_isr` / `_isr_high` suffix (ADR-024,
+    // ADR-030) even when only an indirect dispatch reaches them.
     for (i, f) in l.funcs.iter().enumerate() {
-        if f.ends_with("_isr") {
+        if f.ends_with("_isr") || f.ends_with("_isr_high") {
             stack.push(i);
         }
     }
@@ -393,15 +427,16 @@ pub fn factor_with_locs(
     else {
         return unchanged();
     };
-    let mut isr_chain: Option<usize> = None;
+    // In priority mode the high handler can preempt the low one, so every
+    // vector's chain stacks: sum them rather than take the deepest.
+    let mut isr_need = 0;
     for &r in &l.isr_roots {
         let Some(c) = chain(&l, r, &mut memo, &mut Vec::new()) else {
             return unchanged();
         };
-        isr_chain = Some(isr_chain.map_or(c, |m| m.max(c)));
+        isr_need += 1 + c.max(opts.ir_depth);
     }
-    let need =
-        main_chain.max(opts.ir_depth) + 1 + isr_chain.map_or(0, |c| 1 + c.max(opts.ir_depth));
+    let need = main_chain.max(opts.ir_depth) + 1 + isr_need;
     if need > opts.stack_depth {
         return unchanged();
     }
@@ -586,7 +621,8 @@ fn placement_spots(l: &Listing) -> BTreeMap<usize, usize> {
         let Kind::Instr(x) = &l.kinds[i] else {
             continue;
         };
-        if x.in_asm || !TERMINATORS.contains(&x.mnem.as_str()) || f == 0 {
+        // A skipped terminator falls through into whatever follows it.
+        if x.in_asm || x.after_skip || !TERMINATORS.contains(&x.mnem.as_str()) || f == 0 {
             continue;
         }
         let mut blocked = false;

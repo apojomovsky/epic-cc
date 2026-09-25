@@ -314,8 +314,8 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
     // (`B<!cond> skip / BRA far / skip:`), an out-of-range `BRA` becomes
     // an absolute `GOTO` and an out-of-range `RCALL` an absolute `CALL`
     // (the outline pass emits `RCALL` optimistically). The pass iterates
-    // to a fixpoint; each
-    // replacement is always in range, so it terminates.
+    // to a fixpoint; each replacement is always in range, so it
+    // terminates.
     let mut serial = 0usize;
     loop {
         let (symbols_now, _) = resolve_labels(&lines, &symbols);
