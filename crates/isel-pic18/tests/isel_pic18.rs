@@ -2761,12 +2761,13 @@ fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
 }
 
 #[test]
-fn a_dynamic_index_sets_fsr0_and_reads_through_indf0() {
-    // ram[i]: base = @ram (0x120), k = 0, terms = [(1, "i")] (scale 1,
-    // a byte array). Must LFSR the base then read through INDF0, no
-    // constant-offset direct MOVFF this time.
+fn a_byte_index_reads_through_plusw0() {
+    // ram[i]: base = @ram (0x120), k = 0, terms = [(1, "i")] over an
+    // 8-byte global. One `LFSR` seeds the base, then `MOVF i,W` +
+    // `MOVFF PLUSW0,dst` per read instead of the 16-bit FSR add around
+    // `INDF0`. Simulated over every valid index (epic-cc#665).
     let m = parse(
-        "global ram i8\n\
+        "global ram i64\n\
          global out i8\n\
          global idx i8\n\
          fn main(void) ()\n\
@@ -2785,14 +2786,184 @@ fn a_dynamic_index_sets_fsr0_and_reads_through_indf0() {
         ("main::v", 0x133),
     ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
+    // Scope to `main`: `__start` zero-init legitimately uses its own
+    // `LFSR`/`POSTINC0` to clear RAM.
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
     assert!(
-        asm.contains("LFSR 0, 0x120") || asm.contains("LFSR 0,0x120"),
+        main_asm.contains("LFSR 0, 0x120"),
         "must seed FSR0 with the array base:\n{asm}"
     );
     assert!(
-        asm.contains("0xFEF") || asm.contains("INDF0"),
-        "must read through INDF0:\n{asm}"
+        main_asm.contains("MOVFF 0xFEB"),
+        "must read through PLUSW0 (0xFEB):\n{asm}"
     );
+    assert!(
+        !main_asm.contains("0xFEF") && !main_asm.contains("0xFEE"),
+        "must not touch INDF0/POSTINC0:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..8u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for b in 0..8u8 {
+            p.ram_mut()[0x120 + b as usize] = 10 * b + 1;
+        }
+        p.ram_mut()[0x131] = x;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x130], 10 * x + 1, "plusw read at index {x}");
+    }
+}
+
+#[test]
+fn a_negative_static_offset_keeps_the_indf0_lowering() {
+    // ram[i - 50] folded as k = -50 over a 100-byte global: valid i runs
+    // 50..149, past W's signed range, so PLUSW0 would read 107 bytes below
+    // the array for i = 149. The access must keep the 16-bit FSR add.
+    let mut m = parse(
+        "global ram i64\n\
+         global out i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +65486 +1*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    m.globals.iter_mut().find(|g| g.name == "ram").unwrap().size = 100;
+    let addrs = addrs(&[
+        ("ram", 0x100),
+        ("out", 0x170),
+        ("idx", 0x171),
+        ("main::i", 0x172),
+        ("main::v", 0x173),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(!main_asm.contains("0xFEB"), "must not use PLUSW0:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for x in [50u8, 127, 128, 149] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for b in 0..100u8 {
+            p.ram_mut()[0x100 + b as usize] = b + 1;
+        }
+        p.ram_mut()[0x171] = x;
+        p.run(400);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x170], x - 50 + 1, "ram[{x} - 50]");
+    }
+}
+
+#[test]
+fn consecutive_plusw0_reads_share_one_lfsr() {
+    // Two reads off the same base in one straight line seed `FSR0`
+    // once: the second access reuses the resident pointer, which a
+    // `PLUSW0` access never moves (epic-cc#665).
+    let m = parse(
+        "global ram i64\n\
+         global out i8\n\
+         global idx i8\n\
+         global jdx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +0 +1*%i\n\
+             %v = load i8 %p\n\
+             %j = load i8 @jdx\n\
+             %q = gep @ram +0 +1*%j\n\
+             %w = load i8 %q\n\
+             %s = add i8 %v, %w\n\
+             store i8 %s @out\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("out", 0x130),
+        ("idx", 0x131),
+        ("jdx", 0x134),
+        ("main::i", 0x132),
+        ("main::v", 0x133),
+        ("main::j", 0x135),
+        ("main::w", 0x136),
+        ("main::q", 0x137),
+        ("main::s", 0x138),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert_eq!(
+        main_asm.matches("LFSR 0,").count(),
+        1,
+        "one resident FSR0 for both reads:\n{asm}"
+    );
+    assert_eq!(
+        main_asm.matches("MOVFF 0xFEB").count(),
+        2,
+        "both reads through PLUSW0:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    for b in 0..8u8 {
+        p.ram_mut()[0x120 + b as usize] = b + 1;
+    }
+    p.ram_mut()[0x131] = 2;
+    p.ram_mut()[0x134] = 5;
+    p.run(200);
+    assert!(p.halted());
+    assert_eq!(p.ram()[0x130], 3 + 6, "resident reads sum both lanes");
+}
+
+#[test]
+fn a_byte_index_store_moves_through_plusw0() {
+    // `ram[i] = v`: `MOVF i,W` then `MOVFF v,PLUSW0`, which preserves
+    // `W` (the write collision ADR-009 item 4 feared). Simulated over
+    // every valid index (epic-cc#665).
+    let m = parse(
+        "global ram i64\n\
+         global idx i8\n\
+         global val i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %v = load i8 @val\n\
+             %p = gep @ram +0 +1*%i\n\
+             store i8 %v %p\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("ram", 0x120),
+        ("idx", 0x131),
+        ("val", 0x132),
+        ("main::i", 0x133),
+        ("main::v", 0x134),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains(", 0xFEB"),
+        "must store through PLUSW0 (0xFEB):\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..8u8 {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for b in 0..8u8 {
+            p.ram_mut()[0x120 + b as usize] = 0;
+        }
+        p.ram_mut()[0x131] = x;
+        p.ram_mut()[0x132] = 0xA0 + x;
+        p.run(200);
+        assert!(p.halted());
+        for b in 0..8u8 {
+            assert_eq!(
+                p.ram()[0x120 + b as usize],
+                if b == x { 0xA0 + x } else { 0 },
+                "plusw store at index {x} touches only lane {x}"
+            );
+        }
+    }
 }
 
 #[test]
