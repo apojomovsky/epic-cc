@@ -474,6 +474,44 @@ fn plusw0_reads_fsr0_plus_signed_w_without_side_effect() {
 }
 
 #[test]
+fn plusw0_offset_is_signed_w_over_the_full_byte() {
+    // The `PLUSW0` offset is `W` as a SIGNED byte: `W` below 128 reads
+    // above the base, `W` at or above 128 reads below it. isel-pic18's
+    // indexed lowering (epic-cc#665) only feeds valid indices below 128
+    // of small arrays, where both readings agree; this test pins the
+    // model it relies on so a sim change cannot silently invalidate it.
+    let src = "    LFSR 0, 0x100\n    MOVF 0xFEB,W,A";
+    let words = asm::assemble_pic18(src);
+    for w in 0..=u8::MAX {
+        let mut p = Pic18::new(words.clone());
+        for i in 0..=u8::MAX {
+            p.ram_mut()[0x80 + i as usize] = i.wrapping_add(0x80);
+        }
+        p.set_w(w);
+        p.run(10);
+        let eff = 0x100i16 + (w as i8 as i16);
+        assert_eq!(p.w(), eff as u8, "PLUSW0 read with W={w:#04X}");
+        assert_eq!(p.ram()[0xFE9], 0x00, "FSR0L unchanged by PLUSW0");
+    }
+}
+
+#[test]
+fn movff_to_plusw0_writes_through_the_offset() {
+    // A `MOVFF` to `PLUSW0` stores through `FSR0 + W` without touching
+    // `W` itself, which is what lets indexed stores keep the offset
+    // (epic-cc#665, ADR-009 item 4).
+    let src = "    LFSR 0, 0x100\n    MOVLW 0x03\n    MOVFF 0x20, 0xFEB";
+    let words = asm::assemble_pic18(src);
+    let mut p = Pic18::new(words);
+    p.ram_mut()[0x20] = 0x77;
+    p.ram_mut()[0x103] = 0x00;
+    p.run(10);
+    assert_eq!(p.ram()[0x103], 0x77, "store landed at FSR0+W");
+    assert_eq!(p.w(), 0x03, "W still holds the offset");
+    assert_eq!(p.ram()[0xFE9], 0x00, "FSR0L unchanged by the write");
+}
+
+#[test]
 fn mulwf_produces_an_unsigned_16_bit_product_in_prodh_prodl() {
     let src = "    MOVLW 0x10\n    MOVWF 0x20,A\n    MOVLW 0x10\n    MULWF 0x20,A\n"; // 0x10*0x10=0x100
     let words = asm::assemble_pic18(src);
