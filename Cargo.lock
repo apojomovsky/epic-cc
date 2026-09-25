@@ -91,6 +91,7 @@ dependencies = [
  "isel-pic18",
  "legalize",
  "object",
+ "outline",
  "peephole",
  "pic14-sim",
  "schedule",
@@ -353,6 +354,13 @@ dependencies = [
  "hashbrown 0.15.5",
  "indexmap",
  "memchr",
+]
+
+[[package]]
+name = "outline"
+version = "0.1.0"
+dependencies = [
+ "ir",
 ]
 
 [[package]]

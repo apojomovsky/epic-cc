@@ -1,0 +1,12 @@
+[package]
+name = "outline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ir = { path = "../ir" }
+
+[[bin]]
+name = "outline"
+path = "src/bin/outline.rs"
