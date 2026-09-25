@@ -2106,3 +2106,31 @@ fn rewrites_callback_stored_through_loaded_handle() {
         .expect("isr call");
     assert_eq!(call.callees, vec!["cb_isr".to_string()]);
 }
+
+#[test]
+fn delay_call_collects_no_callees() {
+    // `_delay` is declared, never defined: without the exemption it would
+    // collect `cb` (same arity and width) as an indirect candidate and
+    // the backends would refuse the call. isel expands it inline instead.
+    let m = parse(
+        "global g i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             store i16 @cb @g\n\
+             call void @_delay(i32 100)\n\
+             ret void\n\
+         fn cb(i32) (0=i32)\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let call = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            ir::Inst::Call(c) if c.func == "_delay" => Some(c),
+            _ => None,
+        })
+        .expect("_delay call");
+    assert!(call.callees.is_empty(), "_delay must keep no callees");
+}

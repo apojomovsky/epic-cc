@@ -1,6 +1,8 @@
 //! `iselcore` — shared instruction-selection primitives used by both the
 //! PIC14 (`isel`) and PIC18 (`isel-pic18`) backends.
 
+pub mod delay;
+
 use ir::{GepBase, Inst, Module};
 use std::collections::HashMap;
 

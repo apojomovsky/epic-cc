@@ -2333,6 +2333,95 @@ impl<'m> Gen<'m> {
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
     }
 
+    /// `_delay(cycles)` with a constant argument: an inline counted loop
+    /// taking exactly that many instruction cycles (epic-cc#700). Counters
+    /// are the retval bytes (`retval_lo..`, dead at a void call and covered
+    /// by the ISR save area), so the fixed-region size never grows. Raw
+    /// pushes, not `emit`: the loop preserves BSR and FSR0 (access-bank
+    /// counters, no pointer use) and stays linear, so the tracked state
+    /// survives it exactly like the drained copy loop; only the W cache
+    /// is cleared. A non-constant argument panics: XC8 rejects it too.
+    fn emit_delay(&mut self, c: &ir::Call) {
+        // Drain staged copies first: a retval copy parked in
+        // `pending_copies` must land before the loop reuses the retval
+        // bytes as counters, and program order must survive (the drain
+        // is what `emit` would have run before the next line anyway).
+        self.flush_copies();
+        assert!(
+            c.dst.is_none(),
+            "isel-pic18: _delay must be a void call (its cycles are the effect)"
+        );
+        let cycles = match c.args.as_slice() {
+            [a] => match a.val {
+                ir::Val::Const(n) => {
+                    assert!(
+                        n >= 0,
+                        "isel-pic18: _delay argument must be non-negative, got {n}"
+                    );
+                    n as u64
+                }
+                _ => panic!(
+                    "isel-pic18: _delay argument must be a compile-time constant, got a runtime value"
+                ),
+            },
+            args => panic!(
+                "isel-pic18: _delay takes exactly one argument, got {}",
+                args.len()
+            ),
+        };
+        let plan = iselcore::delay::plan_delay(cycles);
+        let depth = plan.nests.iter().map(Vec::len).max().unwrap_or(0);
+        assert!(
+            depth <= 3,
+            "isel-pic18: _delay plan needs {depth} counters but the retval region holds 3 free"
+        );
+        for d in 0..depth {
+            assert!(
+                self.retval_lo + d as u16 <= self.access_bank_hi,
+                "isel-pic18: _delay counter must stay in the access bank"
+            );
+        }
+        let loc = self.cur_loc.clone();
+        self.w_holds = None;
+        let mut lines: Vec<String> = Vec::new();
+        for nest in &plan.nests {
+            let mut labels: Vec<String> = Vec::new();
+            for _ in nest {
+                labels.push(self.fresh_label());
+            }
+            for ((d, &count), l_loop) in nest.iter().enumerate().zip(&labels) {
+                let cnt = self.retval_lo + d as u16;
+                // A bare `MOVLW k; MOVWF cnt` pair is a shareable
+                // straight-line run: at four identical sites outline
+                // would factor it into `RCALL` plus a shared body,
+                // adding 4 cycles per site. The free label between the
+                // two halves the run below factoring length.
+                lines.push(format!("    MOVLW 0x{:02X}", count as u8));
+                lines.push(format!("{}:", self.fresh_label()));
+                lines.push(format!("    MOVWF 0x{cnt:03X},A"));
+                lines.push(format!("{l_loop}:"));
+            }
+            for ((d, _), l_loop) in nest.iter().enumerate().zip(&labels).rev() {
+                let cnt = self.retval_lo + d as u16;
+                lines.push(format!("    DECFSZ 0x{cnt:03X},F,A"));
+                lines.push(format!("    BRA {l_loop}"));
+            }
+        }
+        // Trailing `NOP`s are shareable the same way; a free label
+        // between each pair keeps every run at length one.
+        let mut first_nop = true;
+        for _ in 0..plan.tail_nops {
+            if !first_nop {
+                lines.push(format!("{}:", self.fresh_label()));
+            }
+            first_nop = false;
+            lines.push("    NOP".to_string());
+        }
+        for line in lines {
+            self.out.push(line);
+            self.locs.push(loc.clone());
+        }
+    }
     /// Copy each call arg into the callee's `{func}::{param}` slots. Shared
     /// by the direct call path and the per-candidate arms of an indirect
     /// call chain. (epic-cc#73)
@@ -3419,6 +3508,9 @@ impl<'m> Gen<'m> {
                     }
                     self.emit_label(&l_end);
                 }
+            }
+            Inst::Call(c) if c.func == "_delay" && c.callees.is_empty() => {
+                self.emit_delay(&c);
             }
             Inst::Call(c) => {
                 if !c.callees.is_empty() {

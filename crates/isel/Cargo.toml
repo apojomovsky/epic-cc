@@ -15,6 +15,7 @@ peephole = { path = "../peephole" }
 pic14-sim = { path = "../sim" }
 asm = { path = "../asm" }
 legalize = { path = "../legalize" }
+schedule = { path = "../schedule" }
 
 [[bin]]
 name = "isel"

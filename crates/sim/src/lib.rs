@@ -212,6 +212,46 @@ impl Eeprom {
     }
 }
 
+/// Instruction-cycle cost of one 14-bit-core step (PIC14, PIC14E) or one
+/// 12-bit-core step (baseline): fall-through costs 1, a taken skip or any
+/// redirect (branch, call, return, computed jump) costs 2. `GOTO`/`CALL`
+/// (and baseline `RETLW`) are classified by opcode so a `GOTO $+1` still
+/// costs its 2 cycles instead of reading as fall-through. All three cores
+/// share this rule; only the class mask differs (0x3000 vs 0xC00).
+fn cost14(word: u16, pc: u16, next: u16) -> u64 {
+    cost14_masked(word, pc, next, 0x3000, 0x2000)
+}
+fn cost14_masked(word: u16, pc: u16, next: u16, mask: u16, cls: u16) -> u64 {
+    if word & mask == cls {
+        2
+    } else if next == pc.wrapping_add(1) {
+        1
+    } else {
+        2
+    }
+}
+/// Instruction-cycle cost of one PIC18 step. `pc`/`next` are byte
+/// addresses (+2 per word). Fixed classes first: `SLEEP`/`RESET` cost 1,
+/// `PUSH`/`POP` cost 2, `TBLRD*` costs 2, `GOTO`/`CALL`/`LFSR` cost 2
+/// over two words. Anything else follows the delta: fall-through 1, a
+/// one-word skip or any redirect 2, a skip over a two-word form 3.
+/// `MOVFF` needs no arm: two words advance `pc` by 4, which the delta
+/// already charges 2.
+fn cost18(word: u16, pc: u32, next: u32, jumped: bool) -> u64 {
+    if jumped {
+        return 2;
+    }
+    match word {
+        0x0003 | 0x00FF => 1,
+        0x0005 | 0x0006 => 2,
+        0x0008..=0x000B => 2,
+        0xEC00..=0xEFFF => 2,
+        _ if next == pc + 2 => 1,
+        _ if next == pc + 4 => 2,
+        _ if next == pc + 6 => 3,
+        _ => 2,
+    }
+}
 pub struct Pic14 {
     /// Supplies the GPR map. A direct operand is banked GPR when its physical
     /// address falls inside one of this device's `ram_banks`, which is not the
@@ -224,6 +264,10 @@ pub struct Pic14 {
     pc: u16,
     stack: Vec<u16>,
     halted: bool,
+    /// Instruction cycles executed so far (epic-cc#700): fall-through costs
+    /// 1, a taken skip or any redirect costs 2. Tests proving cycle-exact
+    /// delays read this; `run` still counts steps.
+    cycles: u64,
     /// A latched interrupt request awaiting GIE + INTE. Set by
     /// `request_interrupt`, consumed when the interrupt is taken.
     pending: bool,
@@ -251,6 +295,7 @@ impl Pic14 {
             pc: 0,
             stack: Vec::new(),
             halted: false,
+            cycles: 0,
             pending: false,
             eeprom: Eeprom::new(),
         }
@@ -292,6 +337,9 @@ impl Pic14 {
     }
     pub fn halted(&self) -> bool {
         self.halted
+    }
+    pub fn cycles(&self) -> u64 {
+        self.cycles
     }
     /// Fire the F877A's single interrupt immediately, bypassing GIE and the
     /// enable bits: push the return address and jump to the vector. The
@@ -344,7 +392,8 @@ impl Pic14 {
         if self.interrupt_ready() {
             self.pending = false;
             self.enter_isr();
-            return; // vectoring costs its own cycle; the handler runs next
+            self.cycles += 2; // vector entry; the handler runs next
+            return;
         }
         let word = self.prog[self.pc as usize];
         let pc = self.pc;
@@ -355,6 +404,7 @@ impl Pic14 {
             3 => self.exec_literal(pc, word),
             _ => unreachable!(),
         };
+        self.cycles += cost14(word, pc, next);
         self.pc = next;
         if self.pc as usize >= self.prog.len() {
             self.halted = true;
@@ -798,6 +848,10 @@ pub struct Pic14e {
     pc: u16,
     stack: Vec<u16>,
     halted: bool,
+    /// Instruction cycles executed so far (epic-cc#700): same 1-or-2 rule
+    /// as `Pic14::cycles`, plus the flash-INDF extra cycle, which lands
+    /// here when the debt step runs.
+    cycles: u64,
     /// A latched interrupt request awaiting GIE + INTE, mirroring `Pic14`.
     pending: bool,
     /// The hardware shadow-register context save (DS41364E section 7.5):
@@ -834,6 +888,7 @@ impl Pic14e {
             pc: 0,
             stack: Vec::new(),
             halted: false,
+            cycles: 0,
             eeprom: Eeprom::new(),
             pending: false,
             shadow: [0; 8],
@@ -876,6 +931,9 @@ impl Pic14e {
     pub fn halted(&self) -> bool {
         self.halted
     }
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
     pub fn fire_interrupt(&mut self) {
         self.enter_isr();
     }
@@ -917,11 +975,13 @@ impl Pic14e {
         // next instruction (DS41364E section 3.5.3).
         if self.cycle_debt > 0 {
             self.cycle_debt -= 1;
+            self.cycles += 1;
             return;
         }
         if self.interrupt_ready() {
             self.pending = false;
             self.enter_isr();
+            self.cycles += 2; // vector entry; the handler runs next
             return;
         }
         let word = self.prog[self.pc as usize];
@@ -933,6 +993,7 @@ impl Pic14e {
             3 => self.exec_literal(pc, word),
             _ => unreachable!(),
         };
+        self.cycles += cost14(word, pc, next);
         self.pc = next;
         if self.pc as usize >= self.prog.len() {
             self.halted = true;
@@ -1478,6 +1539,9 @@ pub struct PicBaseline<'a> {
     /// The 2-deep hardware stack, level 1 at index 0 (DS41236E section 4.8).
     stack: [u16; 2],
     halted: bool,
+    /// Instruction cycles executed so far (epic-cc#700): fall-through
+    /// costs 1, a taken skip or any redirect costs 2.
+    cycles: u64,
     /// Write-only shadow registers: TRISGPIO (TRIS f) and OPTION. Neither is
     /// addressable in the file map (DS41236E Table 4-1), so they live
     /// outside `ram`.
@@ -1503,6 +1567,7 @@ impl<'a> PicBaseline<'a> {
             pc: 0,
             stack: [0; 2],
             halted: false,
+            cycles: 0,
             tris: 0,
             option: 0,
         }
@@ -1521,6 +1586,9 @@ impl<'a> PicBaseline<'a> {
     }
     pub fn halted(&self) -> bool {
         self.halted
+    }
+    pub fn cycles(&self) -> u64 {
+        self.cycles
     }
     /// The write-only TRISGPIO shadow register.
     pub fn tris(&self) -> u8 {
@@ -1548,13 +1616,15 @@ impl<'a> PicBaseline<'a> {
             3 => self.exec_literal(pc, word),
             _ => unreachable!(),
         };
+        // The 12-bit `RETLW`/`CALL`/`GOTO` class costs 2 cycles; anything
+        // else costs 1 on fall-through, 2 on a taken skip or redirect.
+        self.cycles += cost14_masked(word, pc, next, 0xC00, 0x800);
         self.pc = next;
         if self.pc as usize >= self.prog.len() {
             self.halted = true;
         }
     }
 
-    /// The bank selected by `FSR`'s high bits: `FSR<5>` on the 509, masked
     /// to `fsr_bank_bits` so a wider part (16F505's `FSR<6:5>`) resolves
     /// the same way.
     fn fsr_bank(&self) -> usize {
@@ -1979,6 +2049,10 @@ pub struct Pic18 {
     /// storing it twice.
     stack: Vec<u32>,
     halted: bool,
+    /// Instruction cycles executed so far (epic-cc#700): most cost 1, a
+    /// taken skip or any redirect costs 2, a skip over a two-word form
+    /// costs 3. `run` still counts steps.
+    cycles: u64,
     /// A latched interrupt request awaiting INTCON GIEH plus an enabled
     /// source (INT0IE or TMR0IE). Set by `request_interrupt`, consumed
     /// when the interrupt is taken.
@@ -2014,6 +2088,7 @@ impl Pic18 {
             stack: Vec::new(),
             eeprom: Eeprom::new(),
             halted: false,
+            cycles: 0,
             pending: false,
             pending_lo: false,
             isr_stack: Vec::new(),
@@ -2062,6 +2137,9 @@ impl Pic18 {
     pub fn halted(&self) -> bool {
         self.halted
     }
+    pub fn cycles(&self) -> u64 {
+        self.cycles
+    }
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         while !self.halted && steps < max_steps {
@@ -2077,13 +2155,15 @@ impl Pic18 {
         if self.interrupt_ready() {
             self.pending = false;
             self.enter_isr();
-            return; // vectoring costs its own cycle; the handler runs next
+            self.cycles += 2; // vector entry; the handler runs next
+            return;
         }
         // The low vector is checked second: a pending high request
         // preempts even when a low one is also latched (hardware priority).
         if self.interrupt_ready_lo() {
             self.pending_lo = false;
             self.enter_isr_low();
+            self.cycles += 2; // vector entry; the handler runs next
             return;
         }
         let word = self.prog[(self.pc / 2) as usize];
@@ -2160,7 +2240,9 @@ impl Pic18 {
         };
         // A `MOVWF PCL` (computed jump) sets the whole PC from
         // PCLATU:PCLATH:W; its linear next is void.
-        let next = self.jump_target.take().unwrap_or(next);
+        let jumped = self.jump_target.take();
+        let next = jumped.unwrap_or(next);
+        self.cycles += cost18(word, pc, next, jumped.is_some());
         self.pc = next;
         if (self.pc / 2) as usize >= self.prog.len() {
             self.halted = true;

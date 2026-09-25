@@ -232,6 +232,7 @@ dependencies = [
  "legalize",
  "peephole",
  "pic14-sim",
+ "schedule",
 ]
 
 [[package]]
@@ -282,6 +283,7 @@ dependencies = [
  "irparse",
  "iselcore",
  "legalize",
+ "outline",
  "pic14-sim",
  "wholeprog",
 ]

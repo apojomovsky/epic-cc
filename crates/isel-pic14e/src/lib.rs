@@ -2248,6 +2248,64 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// `_delay(cycles)` with a constant argument: an inline counted loop
+    /// taking exactly that many instruction cycles (epic-cc#700). Counters
+    /// are the retval bytes (`retval_lo..`, dead at a void call and saved
+    /// across interrupts), so the fixed-region size never grows. Common-RAM
+    /// targets need no bank selection, so plain emits keep every skip pair
+    /// atomic. A non-constant argument panics: XC8 rejects it too.
+    fn emit_delay(&mut self, c: &ir::Call) {
+        assert!(
+            c.callees.is_empty(),
+            "isel: _delay through a function pointer is not supported"
+        );
+        assert!(
+            c.dst.is_none(),
+            "isel: _delay must be a void call (its cycles are the effect)"
+        );
+        let cycles = match c.args.as_slice() {
+            [a] => match a.val {
+                ir::Val::Const(n) => {
+                    assert!(
+                        n >= 0,
+                        "isel: _delay argument must be non-negative, got {n}"
+                    );
+                    n as u64
+                }
+                _ => panic!(
+                    "isel: _delay argument must be a compile-time constant, got a runtime value"
+                ),
+            },
+            args => panic!(
+                "isel: _delay takes exactly one argument, got {}",
+                args.len()
+            ),
+        };
+        let plan = iselcore::delay::plan_delay(cycles);
+        let depth = plan.nests.iter().map(Vec::len).max().unwrap_or(0);
+        assert!(
+            depth <= 3,
+            "isel: _delay plan needs {depth} counters but the retval region holds 3 free"
+        );
+        for nest in &plan.nests {
+            let mut tails: Vec<(String, u16)> = Vec::new();
+            for (d, &count) in nest.iter().enumerate() {
+                let cnt = self.retval_lo + d as u16;
+                self.emit(format!("    MOVLW 0x{:02X}", count as u8));
+                self.emit(format!("    MOVWF 0x{cnt:02X}"));
+                let l_loop = self.fresh_label();
+                self.emit(format!("{l_loop}:"));
+                tails.push((l_loop, cnt));
+            }
+            for (l_loop, cnt) in tails.iter().rev() {
+                self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
+                self.emit(format!("    GOTO {l_loop}"));
+            }
+        }
+        for _ in 0..plan.tail_nops {
+            self.emit("    NOP".to_string());
+        }
+    }
     /// Calls `func` with args in callee slots, then copies retval bytes
     /// into `dst`. Skips the copy for void calls.
     fn emit_call(
@@ -2723,6 +2781,7 @@ impl<'m> Gen<'m> {
                     self.emit_select(&s.dst, &s.cond, s.ty, &s.a, &s.b);
                 }
             }
+            Inst::Call(c) if c.func == "_delay" => self.emit_delay(&c),
             Inst::Call(c) => self.emit_call(&c.dst, c.ty, &c.func, &c.args, &c.callees),
             Inst::VaStart(v) => {
                 // Stores the region base into the list slot. Forwarded lists

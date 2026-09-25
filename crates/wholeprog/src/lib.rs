@@ -40,8 +40,10 @@ fn check_calls_resolved(m: &Module) {
                     // An `llvm.*` intrinsic is `declare`d by clang without a
                     // definition here; legalize lowers every supported one and
                     // panics on an unknown, so skipping keeps this a
-                    // user-symbol check.
-                    if c.func.starts_with("llvm.") {
+                    // user-symbol check. `_delay` is the same shape: the user
+                    // declares it with no definition and isel expands the
+                    // call inline (epic-cc#700).
+                    if c.func.starts_with("llvm.") || c.func == "_delay" {
                         continue;
                     }
                     if !defined.contains(c.func.as_str()) {
