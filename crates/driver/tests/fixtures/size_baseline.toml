@@ -112,6 +112,12 @@ flash_words = 52
 ram_bytes = 27
 
 [[entry]]
+name = "bench-branch-computed-18f4550"
+device = "18F4550"
+flash_words = 43
+ram_bytes = 9
+
+[[entry]]
 name = "bench-bitmask-18f4550"
 device = "18F4550"
 flash_words = 157
@@ -144,5 +150,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9426
+flash_words = 9413
 ram_bytes = 755

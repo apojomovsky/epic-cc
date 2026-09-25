@@ -228,6 +228,14 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("size-bench/bench-plusw.c")],
         },
         Case {
+            // Branch on a just-computed byte with no reload (epic-cc#668).
+            name: "bench-branch-computed-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-branch-computed.c")],
+        },
+        Case {
             name: "bench-bitmask-18f4550",
             device: "18F4550",
             includes: vec![],
