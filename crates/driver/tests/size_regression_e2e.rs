@@ -364,6 +364,103 @@ fn cases() -> Vec<Case> {
             .map(|f| fixture(&format!("{menu_demo}/{f}")))
             .collect(),
         },
+        Case {
+            name: "hal-pic18-control-demo-18f4550",
+            device: "18F4550",
+            includes: [
+                "pic18fxx5x-hal/include/epiccc",
+                "pic18fxx5x-hal/include",
+                "epic-common/include",
+                "epic-taskmgr/include",
+                "epic-math/include",
+                "epic-pid/include",
+                "epic-adcfilter/include",
+                "epic-serial/include",
+                "epic-control-demo/include",
+            ]
+            .iter()
+            .map(|d| fixture(&format!("vendor/hal-pic18-control-demo/{d}")))
+            .collect(),
+            defines: vec!["PIC18F4550", "FOSC_HZ=48000000", "__EPIC_CC__"],
+            inputs: [
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c",
+                "pic18fxx5x-hal/src/core/pic18_irq.c",
+                "pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c",
+                "pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
+                "pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c",
+                "pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
+                "pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c",
+                "epic-taskmgr/src/epic_taskmgr.c",
+                "epic-math/src/common/epic_math_numeric.c",
+                "epic-math/src/common/epic_math_rand.c",
+                "epic-math/src/common/epic_math_sqrt.c",
+                "epic-math/src/pic18/epic_math_addsub.c",
+                "epic-math/src/pic18/epic_math_bcd.c",
+                "epic-math/src/pic18/epic_math_div.c",
+                "epic-math/src/pic18/epic_math_mul.c",
+                "epic-pid/src/pid.c",
+                "epic-adcfilter/src/epic_adcfilter.c",
+                "epic-serial/src/epic_serial.c",
+                "epic-control-demo/src/control_demo_core.c",
+                "epic-control-demo/tests/sim_control_demo.c",
+                "config_18F4550.c",
+            ]
+            .iter()
+            .map(|f| fixture(&format!("vendor/hal-pic18-control-demo/{f}")))
+            .collect(),
+        },
+        Case {
+            name: "hal-pic18-pid-18f4550",
+            device: "18F4550",
+            includes: [
+                "pic18fxx5x-hal/include/epiccc",
+                "pic18fxx5x-hal/include",
+                "epic-common/include",
+                "epic-math/include",
+                "epic-pid/include",
+                "epic-tick/include",
+                "epic-serial/include",
+            ]
+            .iter()
+            .map(|d| fixture(&format!("vendor/hal-pic18-pid/{d}")))
+            .collect(),
+            defines: vec!["PIC18F4550", "FOSC_HZ=48000000", "__EPIC_CC__"],
+            inputs: [
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_ssp.c",
+                "pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c",
+                "pic18fxx5x-hal/src/core/pic18_irq.c",
+                "pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c",
+                "pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
+                "pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c",
+                "pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
+                "pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c",
+                "epic-math/src/common/epic_math_numeric.c",
+                "epic-math/src/common/epic_math_rand.c",
+                "epic-math/src/common/epic_math_sqrt.c",
+                "epic-math/src/pic18/epic_math_addsub.c",
+                "epic-math/src/pic18/epic_math_bcd.c",
+                "epic-math/src/pic18/epic_math_div.c",
+                "epic-math/src/pic18/epic_math_mul.c",
+                "epic-pid/src/pid.c",
+                "epic-tick/src/epic_tick.c",
+                "epic-serial/src/epic_serial.c",
+                "epic-pid/tests/sim_pid.c",
+                "config_18F4550.c",
+            ]
+            .iter()
+            .map(|f| fixture(&format!("vendor/hal-pic18-pid/{f}")))
+            .collect(),
+        },
     ]
 }
 
