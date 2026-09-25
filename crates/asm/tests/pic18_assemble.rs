@@ -323,6 +323,28 @@ fn far_unconditional_bra_becomes_goto() {
 }
 
 #[test]
+fn far_rcall_becomes_call() {
+    // `RCALL` shares `BRA`'s +/-1024-word reach; beyond it the outline
+    // pass's optimistic short call must become an absolute 2-word `CALL`.
+    let mut asm = String::from("    RCALL far\n");
+    for _ in 0..1100 {
+        asm.push_str("    NOP\n");
+    }
+    asm.push_str("far:\n    RETURN\n    end\n");
+    let words = assemble_pic18(&asm);
+    assert_eq!(words[0], 0xEC00 | 0x4E, "CALL word 0 (s=0, low byte 0x4E)");
+    assert_eq!(words[1], 0xF000 | 0x04, "CALL word 1 (high byte 0x04)");
+    assert_eq!(words.len(), 1103, "2-word CALL + 1100 NOPs + RETURN");
+}
+
+#[test]
+fn near_rcall_stays_one_word() {
+    let words = assemble_pic18("    RCALL sub\n    NOP\nsub:\n    RETURN\n    end\n");
+    assert_eq!(words[0], 0xD800 | 0x001, "RCALL skips the NOP");
+    assert_eq!(words.len(), 3);
+}
+
+#[test]
 fn pcltbl_fitting_table_assembles_without_padding() {
     // epic-cc#479: dispatch plus an 8-byte table fitting one page: no
     // NOPs are inserted and the entries encode as absolute GOTOs.

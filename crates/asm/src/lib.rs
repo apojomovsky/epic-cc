@@ -310,9 +310,11 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
     let symbols: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
 
     // Far conditional branches: a PIC18 `B<cond>` reaches +/-128 words,
-    // `BRA` +/-1024. A larger body expands the branch in place
-    // (`B<!cond> skip / BRA far / skip:`), and an out-of-range `BRA`
-    // becomes an absolute `GOTO`. The pass iterates to a fixpoint; each
+    // `BRA` and `RCALL` +/-1024. A larger body expands the branch in place
+    // (`B<!cond> skip / BRA far / skip:`), an out-of-range `BRA` becomes
+    // an absolute `GOTO` and an out-of-range `RCALL` an absolute `CALL`
+    // (the outline pass emits `RCALL` optimistically). The pass iterates
+    // to a fixpoint; each
     // replacement is always in range, so it terminates.
     let mut serial = 0usize;
     loop {
@@ -326,7 +328,8 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
                 mne.as_str(),
                 "BZ" | "BNZ" | "BC" | "BNC" | "BOV" | "BNOV" | "BN" | "BNN"
             );
-            let is_bra = mne == "BRA";
+            let is_rcall = mne == "RCALL";
+            let is_bra = mne == "BRA" || is_rcall;
             if !is_cond && !is_bra {
                 continue;
             }
@@ -371,7 +374,8 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
                 // replacement is a different mnemonic, so the round's
                 // other branches shift by at most 2 bytes and this BRA is
                 // gone forever.
-                lines[li] = format!("GOTO {target_label}");
+                let far = if is_rcall { "CALL" } else { "GOTO" };
+                lines[li] = format!("{far} {target_label}");
             } else {
                 let inv = invert_cond(&mne).to_string();
                 let skip = format!("__far_skip{serial}");
