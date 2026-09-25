@@ -516,5 +516,15 @@ fn main() {
         "{}",
         driver::report::render_size(&device, &layout, program_words.len())
     );
+    if let Some(report_path) = &cli.report {
+        let json = driver::report::report_json(
+            &device,
+            &layout,
+            program_words.len(),
+            config_bytes.as_deref(),
+            fosc_hz,
+        );
+        std::fs::write(report_path, json).expect("write report");
+    }
     std::fs::write(&cli.output, hex).expect("write hex");
 }

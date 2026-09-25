@@ -25,6 +25,7 @@ pub struct Cli {
     pub line_table: Option<String>,
     pub var_table: Option<String>,
     pub sidecar: Option<String>,
+    pub report: Option<String>,
     /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
     pub outline: bool,
 }
@@ -48,6 +49,8 @@ usage: epic-cc [options] <input.c>...
   --no-outline         PIC18: keep repeated code inline instead of sharing it
                        (smaller flash by default; opt out for timing-critical
                        code or stepping through inline copies)
+  --report <file>      write the build report as JSON into <file>: flash and
+                       RAM use, the clock, and every config field's value
   --var-table <file>   write the typed variable table into <file>
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
@@ -71,6 +74,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut line_table = None;
     let mut var_table = None;
     let mut sidecar = None;
+    let mut report = None;
     let mut outline = true;
     let mut i = 0;
     while i < argv.len() {
@@ -124,6 +128,13 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     .cloned()
                     .ok_or("epic-cc: --save-temps needs a value")?,
             );
+        } else if a == "--report" {
+            i += 1;
+            report = Some(
+                argv.get(i)
+                    .cloned()
+                    .ok_or("epic-cc: --report needs a value")?,
+            );
         } else if a == "--map" {
             i += 1;
             map = Some(argv.get(i).cloned().ok_or("epic-cc: --map needs a value")?);
@@ -174,6 +185,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         save_temps,
         var_table,
         sidecar,
+        report,
         verbose,
         map,
         line_table,
