@@ -2816,6 +2816,48 @@ fn a_byte_index_reads_through_plusw0() {
 }
 
 #[test]
+fn a_negative_static_offset_keeps_the_indf0_lowering() {
+    // ram[i - 50] folded as k = -50 over a 100-byte global: valid i runs
+    // 50..149, past W's signed range, so PLUSW0 would read 107 bytes below
+    // the array for i = 149. The access must keep the 16-bit FSR add.
+    let mut m = parse(
+        "global ram i64\n\
+         global out i8\n\
+         global idx i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %i = load i8 @idx\n\
+             %p = gep @ram +65486 +1*%i\n\
+             %v = load i8 %p\n\
+             store i8 %v @out\n\
+             ret void\n",
+    );
+    m.globals.iter_mut().find(|g| g.name == "ram").unwrap().size = 100;
+    let addrs = addrs(&[
+        ("ram", 0x100),
+        ("out", 0x170),
+        ("idx", 0x171),
+        ("main::i", 0x172),
+        ("main::v", 0x173),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(!main_asm.contains("0xFEB"), "must not use PLUSW0:\n{asm}");
+    let words = asm::assemble_pic18(&asm);
+    for x in [50u8, 127, 128, 149] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for b in 0..100u8 {
+            p.ram_mut()[0x100 + b as usize] = b + 1;
+        }
+        p.ram_mut()[0x171] = x;
+        p.run(400);
+        assert!(p.halted());
+        assert_eq!(p.ram()[0x170], x - 50 + 1, "ram[{x} - 50]");
+    }
+}
+
+#[test]
 fn consecutive_plusw0_reads_share_one_lfsr() {
     // Two reads off the same base in one straight line seed `FSR0`
     // once: the second access reuses the resident pointer, which a
