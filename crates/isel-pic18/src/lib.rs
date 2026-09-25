@@ -46,6 +46,15 @@ enum Scaled {
     Mulwf,
     Chain,
 }
+/// A byte access completable through `PLUSW0` (`FSR0L/H` = 0xFE9/0xFEA,
+/// `PLUSW0` = 0xFEB): the static part rides one `LFSR`, the byte index
+/// rides `W`. Valid only for small static arrays (see `plusw_shape`).
+/// (epic-cc#665)
+struct PluswShape {
+    idx_slot: u16,
+    base: u16,
+    k: u16,
+}
 
 /// A memcpy source's resolved shape: a plain address, an FSR1-indirect
 /// pointer, or a flash table read through `TBLPTR`/`TABLAT`. Byte 0's
@@ -1246,6 +1255,67 @@ impl<'m> Gen<'m> {
         }
     }
 
+    /// Whether `ptr` is a byte-indexed access into a small RAM global:
+    /// `Base::Global` with exactly one scale-1 term. The global must hold
+    /// 1 to 128 bytes: a valid index stays below 128, where the `PLUSW0`
+    /// offset (signed `W`, like the simulator models it) agrees with the
+    /// unsigned address arithmetic it replaces. Out-of-bounds indices are
+    /// C UB, so the valid domain is the whole contract. Const (flash)
+    /// globals never qualify: they read through `TBLRD` on an earlier
+    /// arm. Frame arrays and multi-term/scaled accesses keep the `INDF0`
+    /// lowering. (epic-cc#665)
+    fn plusw_shape(&self, ptr_val: &Val) -> Option<PluswShape> {
+        let Val::Reg(r) = ptr_val else {
+            return None;
+        };
+        let (base, k, terms) = self.resolved_for(r);
+        let Base::Global(name) = &base else {
+            return None;
+        };
+        if self.global_is_const(name) {
+            return None;
+        }
+        if terms.len() != 1 || terms[0].0 != 1 {
+            return None;
+        }
+        let size = self.m.globals.iter().find(|g| &g.name == name)?.size;
+        if size == 0 || size > 128 {
+            return None;
+        }
+        // The index must be a plain data value with a slot. Address-valued
+        // regs (a stored GEP, epic-cc#468) materialize through `FSR0`,
+        // not through a slot, so there is nothing to load `W` from.
+        let idx_slot = *self.addrs.get(&ssa_key(self.cur_func, &terms[0].1))?;
+        Some(PluswShape {
+            idx_slot,
+            base: self.global_addr(name),
+            k,
+        })
+    }
+
+    /// Seed `FSR0` with the access's static part (reusing a resident
+    /// pointer through `try_reuse_fsr0`, which is sound here because a
+    /// `PLUSW0` access never moves `FSR0`) and load the byte index into
+    /// `W`, last so a reuse delta's `MOVLW` cannot clobber it. The caller
+    /// completes the access through `PLUSW0` (0xFEB) in the same straight
+    /// line: `FSR0`, `W`, and the index slot must not be touched between
+    /// this setup and that access. (epic-cc#665)
+    fn emit_plusw_setup(&mut self, shape: &PluswShape, byte_off: u8) {
+        self.flush_copies();
+        let static_part = shape.k.wrapping_add(u16::from(byte_off));
+        let origin = Fsr0Origin::Absolute(shape.base);
+        if !self.try_reuse_fsr0(origin, static_part) {
+            let lit = shape.base.wrapping_add(static_part) & 0xFFF;
+            self.emit(format!("    LFSR 0, 0x{lit:03X}"));
+        }
+        self.fsr0_holds = Some((origin, static_part));
+        let (ia, iff) = self.operand(shape.idx_slot);
+        self.emit(format!(
+            "    MOVF 0x{iff:03X},W,{}",
+            if ia == 0 { "A" } else { "B" }
+        ));
+    }
+
     /// Set up the memcpy SOURCE pointer on FSR1 (an indirect source would
     /// otherwise be clobbered by the destination's FSR0 setup) and return
     /// `Some(direct_addr)` for a direct source, `None` for an indirect one
@@ -1494,15 +1564,11 @@ impl<'m> Gen<'m> {
 
     /// Try to reuse FSR0's currently tracked contents for a new access
     /// grounded in `origin` at offset `target_off`, emitting only the
-    /// forward delta (one `ADDWF`/`ADDWFC` pair, or nothing at all when
-    /// the delta is zero) instead of a full base-plus-offset setup.
-    /// Returns `true` when it reused (the caller's full setup is skipped
+    /// forward delta instead of a full base-plus-offset setup. Returns
+    /// `true` when it reused (the caller's full setup is skipped
     /// entirely); `false` when the tracked state doesn't match (unknown,
     /// a different origin, or `target_off` is behind the tracked
-    /// position -- going backward would need a second instruction form
-    /// (`SUBWF`) this conservative version doesn't bother with, since
-    /// forward struct-field/array-element access is the overwhelmingly
-    /// common shape). A `false` caller performs its normal full setup and
+    /// position). A `false` caller performs its normal full setup and
     /// is responsible for recording the new position itself. (epic-cc#472)
     fn try_reuse_fsr0(&mut self, origin: Fsr0Origin, target_off: u16) -> bool {
         let Some((cur_origin, cur_off)) = self.fsr0_holds else {
@@ -1512,6 +1578,13 @@ impl<'m> Gen<'m> {
             return false;
         }
         let delta = target_off - cur_off;
+        // A nonzero delta costs `MOVLW`/`ADDWF`/`MOVLW`/`ADDWFC` (4
+        // words) against a fresh `LFSR` (2), so an absolute base never
+        // takes it. A slot-held pointer has no literal to seed from,
+        // so only it walks forward. (epic-cc#665)
+        if delta != 0 && matches!(origin, Fsr0Origin::Absolute(_)) {
+            return false;
+        }
         if delta != 0 {
             self.emit(format!("    MOVLW 0x{:02X}", (delta & 0xFF) as u8));
             let (fa, ff) = self.operand(0xFE9);
@@ -2453,21 +2526,36 @@ impl<'m> Gen<'m> {
                 // linear in byte_off, so base_addr + k already matches
                 // re-resolving at byte_off = k.
                 let n = l.ty.bytes();
-                match self.emit_ptr_setup(&ptr_val, 0) {
-                    Addr::Direct(base_addr) => {
-                        for k in 0..n {
-                            self.emit_copy_byte(base_addr + u16::from(k), dst + u16::from(k));
-                        }
+                // Byte-indexed small-array reads go through `PLUSW0` (one
+                // `LFSR` per resident run, then `MOVF idx,W` +
+                // `MOVFF PLUSW0,dst` per byte) instead of the 16-bit FSR
+                // add around `INDF0`. Raw emission, never the staged copy
+                // path: a staged `PLUSW0` read would replay against a later
+                // `FSR0`/`W`. (epic-cc#665)
+                if let Some(shape) = self.plusw_shape(&ptr_val) {
+                    for k in 0..n {
+                        self.emit_plusw_setup(&shape, k);
+                        let d = dst + u16::from(k);
+                        self.invalidate_fsr0_if_slot_written(d, 1);
+                        self.emit(format!("    MOVFF 0xFEB, 0x{d:03X}"));
                     }
-                    Addr::Indirect => {
-                        for k in 0..n {
-                            let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
-                            self.emit(format!(
-                                "    MOVFF 0x{reg:03X}, 0x{:03X}",
-                                dst + u16::from(k)
-                            ));
+                } else {
+                    match self.emit_ptr_setup(&ptr_val, 0) {
+                        Addr::Direct(base_addr) => {
+                            for k in 0..n {
+                                self.emit_copy_byte(base_addr + u16::from(k), dst + u16::from(k));
+                            }
                         }
-                        self.bump_fsr0_tracked_offset(n);
+                        Addr::Indirect => {
+                            for k in 0..n {
+                                let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
+                                self.emit(format!(
+                                    "    MOVFF 0x{reg:03X}, 0x{:03X}",
+                                    dst + u16::from(k)
+                                ));
+                            }
+                            self.bump_fsr0_tracked_offset(n);
+                        }
                     }
                 }
             }
@@ -2516,16 +2604,34 @@ impl<'m> Gen<'m> {
                 // epic-cc#471). Each source byte still materializes into
                 // W (literals directly, registers via MOVF) before the
                 // write.
-                match self.emit_ptr_setup(&ptr_val, 0) {
-                    Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
-                    Addr::Indirect => {
-                        let n = s.ty.bytes();
-                        for k in 0..n {
-                            self.emit_load_w(&s.val, k, false);
-                            let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
-                            self.emit(format!("    MOVWF 0x{reg:03X},A"));
+                // Byte-indexed small-array stores go through `PLUSW0` like
+                // the Load arm above: `MOVF idx,W` then
+                // `MOVFF value,PLUSW0`, which preserves `W` (the write
+                // collision ADR-009 item 4 feared). Only register values
+                // with a slot move directly; address-valued regs and
+                // constants keep the `INDF0` lowering. (epic-cc#665)
+                let val_slot = match &s.val {
+                    Val::Reg(r) => self.addrs.get(&ssa_key(self.cur_func, r)).copied(),
+                    _ => None,
+                };
+                if let (Some(shape), Some(vslot)) = (self.plusw_shape(&ptr_val), val_slot) {
+                    let n = s.ty.bytes();
+                    for k in 0..n {
+                        self.emit_plusw_setup(&shape, k);
+                        self.emit(format!("    MOVFF 0x{:03X}, 0xFEB", vslot + u16::from(k)));
+                    }
+                } else {
+                    match self.emit_ptr_setup(&ptr_val, 0) {
+                        Addr::Direct(dst) => self.emit_move_val_to_slot(&s.val, s.ty, dst),
+                        Addr::Indirect => {
+                            let n = s.ty.bytes();
+                            for k in 0..n {
+                                self.emit_load_w(&s.val, k, false);
+                                let reg = if k + 1 == n { 0xFEF } else { 0xFEE }; // INDF0 : POSTINC0
+                                self.emit(format!("    MOVWF 0x{reg:03X},A"));
+                            }
+                            self.bump_fsr0_tracked_offset(n);
                         }
-                        self.bump_fsr0_tracked_offset(n);
                     }
                 }
             }

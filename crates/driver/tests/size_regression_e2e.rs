@@ -219,6 +219,15 @@ fn cases() -> Vec<Case> {
             inputs: vec![fixture("size-bench/bench-struct-scan.c")],
         },
         Case {
+            // Byte-indexed static arrays for the `LFSR` + `PLUSW0`
+            // lowering with a resident pointer (epic-cc#665).
+            name: "bench-plusw-18f4550",
+            device: "18F4550",
+            includes: vec![],
+            defines: vec![],
+            inputs: vec![fixture("size-bench/bench-plusw.c")],
+        },
+        Case {
             name: "bench-bitmask-18f4550",
             device: "18F4550",
             includes: vec![],

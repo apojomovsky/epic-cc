@@ -109,6 +109,17 @@ PIC18 pointer/array/struct support (port P3) uses:
    to hold the byte being stored, colliding with using `W` as the offset.
    All dynamic accesses physically advance `FSRnL`/`FSRnH` and go through
    plain `INDFn`, for reads and writes alike.
+   **Narrowed (epic-cc#665):** the collision holds only when the value
+   travels in `W`. A byte-indexed access into a RAM global of at most
+   128 bytes reads through `PLUSW0` (`MOVF idx,W` + `MOVF PLUSW0,W`),
+   and a register-valued store moves through it (`MOVF idx,W` +
+   `MOVFF value,PLUSW0`), which preserves `W` and never collides. The
+   128-byte ceiling is the signed `W` offset: a valid index stays below
+   it, where signed and unsigned address arithmetic agree, and an
+   out-of-bounds index is C UB. The rule is safe under either offset
+   reading, so no hardware gamble rides on it. `FSR0` stays resident
+   across consecutive such accesses (a `PLUSW0` access never moves it)
+   under the existing `(origin, offset)` tracking and invalidation.
 5. **No FSR-window checks.** PIC14's `fsr_window`/`object_span` window
    half exists only because PIC14's four RAM banks are non-contiguous.
    PIC18's `FSRn` is a flat 12-bit register over the whole data space, so
@@ -157,6 +168,9 @@ PIC18 pointer/array/struct support (port P3) uses:
 - **`PLUSWn` is a write hazard, not an optimization.** The plan applies
   the no-`PLUSWn` rule uniformly so a later "optimization" cannot
   reintroduce the write collision by special-casing reads.
+  **Narrowed (epic-cc#665):** reads are no longer the concern (item 4),
+  and `MOVFF`-through-`PLUSW0` stores keep the offset in `W`, so the
+  uniform ban is lifted for byte-indexed small-array accesses only.
 - **The IR carries sizes directly.** `object_span` (PIC14's "how big is
   the pointed-to object" query) was planned for P3 but ended up with
   zero production callers: sret copies size by `s.ty.bytes()` and byval
@@ -193,9 +207,12 @@ The re-seeding-across-separate-accesses cost also showed up in profiling
 (epic-cc#469/#472, 2026-09-19) and was addressed: a tracked `(origin,
 offset)` state lets a same-base access reuse FSR0 via a forward delta
 add instead of a full reload, invalidated at labels, `CALL`s, and writes
-to a tracked slot's own address (item 3). `PLUSWn` remains unused (item
-4's write-collision reasoning is untouched by this) and no second FSR was
-introduced.
+  to a tracked slot's own address (item 3). `PLUSWn` remains unused (item
+  4's write-collision reasoning is untouched by this) and no second FSR was
+  introduced.
+  **Extended (epic-cc#665):** `PLUSW0` now serves byte-indexed accesses
+  into RAM globals of at most 128 bytes (item 4), reusing the same
+  resident-pointer tracking across consecutive accesses.
 
 A third profiling finding (epic-cc#469/#473, 2026-09-19) showed call
 sites forwarding a pointer value as a plain-ptr/sret argument round-tripping
