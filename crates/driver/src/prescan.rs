@@ -20,24 +20,7 @@ pub struct PragmaSetting {
     pub col: u32,
 }
 
-use super::diag;
-
-/// One `EPIC_CONFIG("...")` hit with its source site, so config errors can
-/// point at it as `file:line:col`.
-pub struct FoundConfig {
-    /// The quoted argument.
-    pub spec: String,
-    /// The input file holding it.
-    pub file: String,
-    /// 1-based line and column of the `EPIC_CONFIG` token.
-    pub line: u32,
-    pub col: u32,
-}
-
-/// Scan every source file's raw text for top-level `EPIC_CONFIG("...")`
-/// invocations, skipping `//` and `/* */` comments and `"..."` string
-/// literals along the way.
-pub fn find_epic_configs(sources: &[(String, String)]) -> Vec<FoundConfig> {
+ @ours
     let mut out = Vec::new();
     for (file, text) in sources {
         for (spec, line, col) in find_in_one_file(text) {
@@ -109,7 +92,11 @@ pub fn pragma_spec(region: &device::ConfigRegion, settings: &[PragmaSetting]) ->
     let mut pairs = Vec::new();
     for s in settings {
         let field = device::find_field(region, &s.name).unwrap_or_else(|| {
-            let names: Vec<&str> = region.fields.iter().map(|f| f.name).collect();
+            let names: Vec<&str> = region
+                .fields
+                .iter()
+                .flat_map(|f| std::iter::once(f.name).chain(f.aliases.iter().copied()))
+                .collect();
             panic!(
                 "{}:{}:{}: error: unknown config field '{}' in #pragma config \
                  (expected one of: {})",
@@ -236,8 +223,8 @@ fn find_in_one_file(text: &str) -> Vec<(String, u32, u32)> {
     out
 }
 
-/// If offset `i` opens a `//` or `/* */` comment or a `"..."` string
-/// literal, the offset just past it; otherwise `None`.
+/// If offset `i` opens a line comment, a block comment, or a `"..."`
+/// string literal, the offset just past it; otherwise `None`.
 fn skip_trivia(b: &[u8], i: usize) -> Option<usize> {
     // A `//` line comment runs to the newline.
     if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
@@ -247,7 +234,7 @@ fn skip_trivia(b: &[u8], i: usize) -> Option<usize> {
         }
         return Some(j);
     }
-    // A `/*` block comment runs to its closer.
+    // A block comment runs to its closer.
     if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
         let mut j = i + 2;
         while j + 1 < b.len() && !(b[j] == b'*' && b[j + 1] == b'/') {
@@ -316,6 +303,9 @@ fn match_pragma(text: &str, b: &[u8], i: usize) -> Option<(Vec<(String, String)>
         return None;
     }
     let mut j = i + 1;
+    while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+        j += 1;
+    }
     if text[j..]
         .get(..6)
         .is_none_or(|w| !w.eq_ignore_ascii_case("pragma"))
@@ -379,6 +369,35 @@ fn match_pragma(text: &str, b: &[u8], i: usize) -> Option<(Vec<(String, String)>
         }
         break;
     }
+    // Past the last pair only whitespace, a comment, or end of line may
+    // follow; anything else is a malformed directive, not a prefix of one.
+    let mut k = j;
+    loop {
+        while k < b.len() && (b[k] == b' ' || b[k] == b'\t' || b[k] == b'\r') {
+            k += 1;
+        }
+        if k >= b.len() || b[k] == b'\n' {
+            break;
+        }
+        if b[k] == b'/' && b.get(k + 1) == Some(&b'/') {
+            break;
+        }
+        if b[k] == b'/' && b.get(k + 1) == Some(&b'*') {
+            k += 2;
+            while k + 1 < b.len() && !(b[k] == b'*' && b[k + 1] == b'/') {
+                if b[k] == b'\n' {
+                    break;
+                }
+                k += 1;
+            }
+            if k + 1 < b.len() && b[k] == b'*' && b[k + 1] == b'/' {
+                k += 2;
+                continue;
+            }
+            break;
+        }
+        return None;
+    }
     Some((pairs, j))
 }
 
@@ -400,7 +419,7 @@ fn find_pragma_in_one_file(file: &str, text: &str) -> Vec<PragmaSetting> {
         }
         if let Some(j) = skip_trivia(b, i) {
             // A block comment ends mid-line without resetting the
-            // directive position: `#` after `/* */` still opens one.
+            // directive position: `#` past one still opens a directive.
             if text.as_bytes()[i..j].contains(&b'\n') {
                 line_start = true;
             }

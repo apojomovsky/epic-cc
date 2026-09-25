@@ -211,3 +211,27 @@ fn pragma_spec_accepts_repeated_equal_values() {
     );
     assert_eq!(spec, "FOSC=XT");
 }
+
+#[test]
+fn accepts_a_trailing_comment_after_pairs() {
+    let found = pragma_in(
+        "#pragma config FOSC = HS // crystal\n#pragma config WDTE = OFF /* watchdog */\n",
+    );
+    assert_eq!(found.len(), 2);
+}
+
+#[test]
+#[should_panic(expected = "malformed #pragma config")]
+fn panics_on_trailing_garbage_after_pairs() {
+    pragma_in("#pragma config FOSC = HS junk\n");
+}
+
+#[test]
+fn accepts_whitespace_between_hash_and_pragma() {
+    let found = pragma_in("#  pragma   config   FOSC = HS\n# pragma config WDTE=OFF\n");
+    assert_eq!(found.len(), 2);
+    assert_eq!(
+        (found[0].name.as_str(), found[1].name.as_str()),
+        ("FOSC", "WDTE")
+    );
+}

@@ -104,7 +104,7 @@ fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
     // as xtal_hz.
     let _osc = named(region, spec, "osc")?;
     xtal.ok_or_else(|| {
-        "xtal_hz=<Hz> is required in EPIC_CONFIG \
+        "xtal_hz=<Hz> is required to derive the clock \
          (DS39582C §14.2: Fosc is the crystal or the declared RC frequency)"
             .to_string()
     })
@@ -122,7 +122,7 @@ fn baseline_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u
     } else {
         xtal.ok_or_else(|| {
             format!(
-                "xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
+                "xtal_hz=<Hz> is required to derive the clock when osc={osc} \
                  (DS41236E §2.0: Fosc is the crystal or the declared RC frequency)"
             )
         })
@@ -180,7 +180,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
     if pll {
         let xtal = xtal.ok_or_else(|| {
             format!(
-                "xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
+                "xtal_hz=<Hz> is required to derive the clock when osc={osc} \
                  (the PLL needs a known input frequency)"
             )
         })?;
@@ -210,7 +210,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
     } else {
         let xtal = xtal.ok_or_else(|| {
             format!(
-                "xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
+                "xtal_hz=<Hz> is required to derive the clock when osc={osc} \
                  (system clock is the primary oscillator, possibly divided by CPUDIV)"
             )
         })?;
