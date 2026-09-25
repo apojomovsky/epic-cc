@@ -95,10 +95,12 @@ pub fn legalize(m: Module) -> Module {
                     Inst::Call(c) => {
                         if c.func.starts_with("llvm.") {
                             // A clang-emitted intrinsic (`llvm.smax.*`,
-                            // `llvm.smin.*`, `llvm.abs.*`) becomes the
-                            // icmp/select tree; an unknown intrinsic panics
-                            // so a new one surfaces as a clear error
-                            // instead of a hole the assembler misses.
+                            // `llvm.smin.*`, `llvm.abs.*`,
+                            // `llvm.bitreverse.i6`) becomes the
+                            // icmp/select or logic tree; an unknown
+                            // intrinsic panics so a new one surfaces as a
+                            // clear error instead of a hole the assembler
+                            // misses.
                             insts.extend(lower_intrinsic(&c, &mut names, &mut used));
                         } else {
                             insts.push(Inst::Call(c));
@@ -1115,8 +1117,14 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
         .dst
         .clone()
         .unwrap_or_else(|| panic!("legalize: intrinsic {} must carry a dst", c.func));
-    let ty =
-        c.ty.unwrap_or_else(|| panic!("legalize: intrinsic {} must carry a result type", c.func));
+    let ty = match c.func.as_str() {
+        // `llvm.bitreverse.i6` carries no parsed result type: its
+        // widened type is stated, not read (epic-cc#679).
+        "llvm.bitreverse.i6" => Ty::I8,
+        _ => c
+            .ty
+            .unwrap_or_else(|| panic!("legalize: intrinsic {} must carry a result type", c.func)),
+    };
     let cond = names.fresh();
     match c.func.as_str() {
         "llvm.smax.i8" | "llvm.smax.i16" | "llvm.smax.i32" => {
@@ -1536,6 +1544,75 @@ fn lower_intrinsic(c: &Call, names: &mut FreshNames, used_routines: &mut Vec<Str
                 ty,
                 a: Val::Reg(shl_dst),
                 b: Val::Reg(shr_sel),
+                loc: None,
+            }));
+            insts
+        }
+        "llvm.bitreverse.i6" => {
+            // A 6-bit reversal widens into a byte slot (irparse parses
+            // `i6` as `I8`): reverse the low six bits with `i8` logic.
+            // The input mask re-applies the `trunc`-to-i6 semantics, so
+            // callers that skipped the mask stay sound (epic-cc#679).
+            let a = c.args[0].val.clone();
+            let masked = names.fresh();
+            let mut insts = vec![Inst::Bin(ir::Bin {
+                dst: masked.clone(),
+                op: BinOp::And,
+                ty,
+                a,
+                b: Val::Const(63),
+                loc: None,
+            })];
+            // Lane k moves bit k to bit 5-k: masks and shifts pair up.
+            let lanes: [(i64, i64, BinOp); 6] = [
+                (1, 5, BinOp::Shl),
+                (2, 3, BinOp::Shl),
+                (4, 1, BinOp::Shl),
+                (8, 1, BinOp::LShr),
+                (16, 3, BinOp::LShr),
+                (32, 5, BinOp::LShr),
+            ];
+            let mut moved = Vec::new();
+            for (mask, shift, op) in lanes {
+                let bit = names.fresh();
+                let out = names.fresh();
+                insts.push(Inst::Bin(ir::Bin {
+                    dst: bit.clone(),
+                    op: BinOp::And,
+                    ty,
+                    a: Val::Reg(masked.clone()),
+                    b: Val::Const(mask),
+                    loc: None,
+                }));
+                insts.push(Inst::Bin(ir::Bin {
+                    dst: out.clone(),
+                    op,
+                    ty,
+                    a: Val::Reg(bit),
+                    b: Val::Const(shift),
+                    loc: None,
+                }));
+                moved.push(out);
+            }
+            let mut acc = moved[0].clone();
+            for m in moved.iter().skip(1).take(4) {
+                let joined = names.fresh();
+                insts.push(Inst::Bin(ir::Bin {
+                    dst: joined.clone(),
+                    op: BinOp::Or,
+                    ty,
+                    a: Val::Reg(acc),
+                    b: Val::Reg(m.clone()),
+                    loc: None,
+                }));
+                acc = joined;
+            }
+            insts.push(Inst::Bin(ir::Bin {
+                dst,
+                op: BinOp::Or,
+                ty,
+                a: Val::Reg(acc),
+                b: Val::Reg(moved[5].clone()),
                 loc: None,
             }));
             insts

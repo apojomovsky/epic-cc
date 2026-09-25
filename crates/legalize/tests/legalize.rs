@@ -1575,6 +1575,33 @@ fn lowers_smax_smin_abs_to_icmp_select() {
     assert!(text2.contains("icmp slt i32"), "{text2}");
 }
 
+/// `llvm.bitreverse.i6` (clang 2-bit deposit idiom, epic-cc#679)
+/// widens into a byte slot: the input is masked to six bits, each lane
+/// is isolated and shifted to its mirror position, and the lanes are
+/// or-ed together. Assertions are text-level like the other intrinsic tests.
+#[test]
+fn lowers_bitreverse_i6_to_masked_lanes() {
+    let m = parse(
+        "global a i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %a = load i8 @a\n\
+             %r = call i8 @llvm.bitreverse.i6(i8 %a)\n\
+             store i8 %r, @a\n\
+             ret void\n\
+",
+    );
+    let text = ir::serialize(&legalize(m));
+    // The input mask re-applies trunc-to-i6 semantics.
+    assert!(text.contains("and i8 %a 63"), "{text}");
+    // One lane per bit: isolate, shift to the mirror position.
+    assert!(text.contains("shl i8"), "{text}");
+    assert!(text.contains("lshr i8"), "{text}");
+    // The dst is the or of all six lanes; no intrinsic call remains.
+    assert!(text.contains("%r = or i8"), "{text}");
+    assert!(!text.contains("bitreverse"), "{text}");
+}
+
 /// An unknown `llvm.*` intrinsic panics loudly so a new clang-emitted
 /// intrinsic surfaces as a clear error instead of a silent hole.
 #[test]

@@ -59,6 +59,11 @@ fn ty_of(s: &str, loc: Option<&SrcLoc>) -> Ty {
     match base {
         "i1" => Ty::I1,
         "i8" => Ty::I8,
+        // A sub-byte int rides in a byte slot; the truncation mask is
+        // applied where the value narrows (`trunc` to i6, `and` on i6),
+        // never here. Only the shapes those rewrites accept exist
+        // downstream; anything else stays loud there (epic-cc#679).
+        "i6" => Ty::I8,
         "i16" => Ty::I16,
         "i32" => Ty::I32,
         "i64" => Ty::I64,
@@ -1038,12 +1043,11 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
                 loc_prefix(loc)
             );
         }
-        if n == 0 {
-            panic!(
-                "{}irparse: zero-length array type {t:?} is not supported",
-                loc_prefix(loc)
-            );
-        }
+        // A zero-length array (`[0 x T]`, clang's form of an `extern`
+        // incomplete array: a table declared in one TU and defined in
+        // another, epic-cc#679) has no bytes here, so its size is 0
+        // while its alignment stays the element's: GEPs over it need
+        // only the element stride, which resolves below as usual.
         let (es, ea) = ty_size_align(elem, types, loc);
         let size = n.checked_mul(u32::from(es)).unwrap_or_else(|| {
             panic!(
@@ -1071,7 +1075,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
         literal_ty_size_align(t, types, loc)
     } else {
         match t {
-            "i1" | "i8" => (1, 1),
+            "i1" | "i8" | "i6" => (1, 1),
             "i16" | "ptr" => (2, 2),
             "i32" | "float" | "f32" | "double" => (4, 2),
             "i64" => (8, 2),
@@ -1100,7 +1104,7 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
         types.get(n).map(|s| (u16::from(s.size), s.align))
     } else {
         match t {
-            "i1" | "i8" => Some((1, 1)),
+            "i1" | "i8" | "i6" => Some((1, 1)),
             "i16" | "ptr" => Some((2, 2)),
             "i32" | "float" | "f32" | "double" => Some((4, 2)),
             "i64" => Some((8, 2)),
@@ -3222,15 +3226,14 @@ fn parse_inst(
             let body = body_str.as_str().trim();
             let to_i = body.rfind(" to ").unwrap();
             let (lhs, rhs) = (body[..to_i].trim(), body[to_i + 4..].trim());
-            let to = ty_of(
-                rhs.trim_start_matches('(')
-                    .trim_end_matches(')')
-                    .trim()
-                    .split_whitespace()
-                    .next()
-                    .unwrap(),
-                cur.as_ref(),
-            );
+            let to_tok = rhs
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .trim()
+                .split_whitespace()
+                .next()
+                .unwrap();
+            let to = ty_of(to_tok, cur.as_ref());
             let (from, val) = if lhs.contains("getelementptr") {
                 let first = lhs
                     .split_whitespace()
@@ -3272,6 +3275,24 @@ fn parse_inst(
                     to,
                     loc: cur.clone(),
                 })),
+                _ if op == "trunc" && to_tok == "i6" => {
+                    // Narrowing into a sub-byte int is the mask itself:
+                    // the i6 rides in a byte slot, so `trunc iN to i6`
+                    // is `and 63`. The masked value is below 64, so its
+                    // low byte is the whole value downstream (epic-cc#679).
+                    let ty = match from {
+                        Ty::I8 | Ty::I16 => from,
+                        _ => panic!("irparse: trunc to i6 from {from:?} is not supported"),
+                    };
+                    out.push(Inst::Bin(Bin {
+                        dst: dst.unwrap(),
+                        op: BinOp::And,
+                        ty,
+                        a: val,
+                        b: Val::Const(63),
+                        loc: cur.clone(),
+                    }));
+                }
                 _ => out.push(Inst::Trunc(Trunc {
                     dst: dst.unwrap(),
                     from,
@@ -3421,6 +3442,17 @@ fn parse_inst(
                 .find(|c: char| c.is_whitespace())
                 .unwrap_or_else(|| panic!("irparse: malformed binop operand {first:?}"));
             let ty_tok = first[..sp].trim();
+            // Bitwise logic on a sub-byte int stays in its byte slot; the
+            // constant folds the 6-bit wrap (`C & 63` equals `(%a mod 64)
+            // & C` on every bit). Only the `and`-constant shape exists
+            // today; anything else on i6 stays loud (epic-cc#679).
+            if ty_tok == "i6" {
+                assert_eq!(
+                    op.as_str(),
+                    "and",
+                    "irparse: only `and` is supported on i6, got {op}"
+                );
+            }
             let ty = ty_of(ty_tok, cur.as_ref());
             let val_str_a = first[sp..].trim();
             let a = parse_value_with_gep(val_str_a, ty, types, fresh, &mut out, cur.as_ref());
@@ -3448,6 +3480,14 @@ fn parse_inst(
                 parse_value_with_gep(val_str_b, ty, types, fresh, &mut out, cur.as_ref())
             } else {
                 parse_value_with_gep(second_raw, ty, types, fresh, &mut out, cur.as_ref())
+            };
+            let b = if ty_tok == "i6" {
+                match b {
+                    Val::Const(c) => Val::Const(c & 63),
+                    other => panic!("irparse: `and` on i6 needs a constant mask, got {other:?}"),
+                }
+            } else {
+                b
             };
             let o = match op.as_str() {
                 "add" => BinOp::Add,
