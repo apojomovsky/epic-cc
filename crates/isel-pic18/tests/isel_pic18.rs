@@ -1686,6 +1686,41 @@ fn icmp_ne_distinguishes_equal_from_not_equal() {
 }
 
 #[test]
+fn icmp_eq_i8_mask_compare_fuses_into_the_branch() {
+    // epic-cc#625: a single-byte `eq` feeding a `BrCond` skips the 0/1
+    // result byte (preclear, set, reload and test) and branches straight
+    // from the compare flags. The mask-compare is the struct-scan flag
+    // test (`(f & 0x03) == 0x03`); the full byte domain runs so a
+    // polarity inversion fails loudly.
+    let m = parse("global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = and i8 %1, 3\n    %3 = icmp eq i8 %2, 3\n    br i1 %3 t f\n  block t:\n    store i8 1 @out\n    ret void\n  block f:\n    store i8 2 @out\n    ret void\n");
+    let addrs = addrs(&[
+        ("f", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+        ("main::3", 0x14),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("INCF"),
+        "fused i8 eq must not materialize a 0/1 byte, got:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..=u8::MAX {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = x;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(
+            p.ram()[0x11],
+            if x & 3 == 3 { 1 } else { 2 },
+            "mask-compare(f={x}) took the wrong target"
+        );
+    }
+}
+
+#[test]
 fn icmp_ult_and_uge_use_the_carry_flag() {
     for (pred, a, b, expect) in [
         ("ult", 3u8, 5u8, 1u8),

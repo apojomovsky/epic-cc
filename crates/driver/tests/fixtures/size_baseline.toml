@@ -42,7 +42,7 @@ ram_bytes = 51
 [[entry]]
 name = "bench-switch-18f4550"
 device = "18F4550"
-flash_words = 71
+flash_words = 66
 ram_bytes = 9
 
 [[entry]]
@@ -96,7 +96,7 @@ ram_bytes = 33
 [[entry]]
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
-flash_words = 119
+flash_words = 114
 ram_bytes = 99
 
 [[entry]]
@@ -126,7 +126,7 @@ ram_bytes = 47
 [[entry]]
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
-flash_words = 359
+flash_words = 354
 ram_bytes = 34
 
 [[entry]]
@@ -138,5 +138,5 @@ ram_bytes = 329
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9677
+flash_words = 9533
 ram_bytes = 755

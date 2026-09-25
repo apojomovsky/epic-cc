@@ -422,9 +422,11 @@ impl<'m> Gen<'m> {
     ///   terminator. Any instruction between them would be skipped by the
     ///   fused exits, so adjacency is what makes the fusion sound rather
     ///   than merely likely;
-    /// - the compare is multi-byte (an i8 compare is already 1 word per
-    ///   lane and gains nothing);
-    /// - nothing else in the function reads the result.
+    /// - the compare is multi-byte, or a single-byte `eq`/`ne`. Fusing
+    ///   skips the 0/1 result byte (preclear, set, reload and test), which
+    ///   is an i8 compare's real cost: its own lane is already one word.
+    ///   Single-byte ordering compares keep the materializing path, which
+    ///   routes them to the per-lane cascade (epic-cc#625).
     ///
     /// A fused compare emits its exits as the branch's own targets and
     /// never writes the result slot, so the 0/1 byte, its preclear, and
@@ -436,21 +438,26 @@ impl<'m> Gen<'m> {
         let Val::Reg(cond) = &bc.cond else {
             return None;
         };
-        if c.dst != *cond || c.ty.bytes() < 2 {
+        if c.dst != *cond {
             return None;
         }
+        let is_eq_ne = matches!(c.pred.as_str(), "eq" | "ne");
         // The same width guard `emit_inst`'s `Inst::Icmp` arm applies
         // (`n == 1 || n == 2 || n == 4`). Fusing an i64 compare would
         // route it to the chain and compile, while the identical compare
         // with any other use still panics; keep the two paths consistent
         // and the unsupported width loud.
-        if !matches!(c.ty.bytes(), 2 | 4) {
+        if !matches!(c.ty.bytes(), 1 | 2 | 4) {
             return None;
         }
         // Only the predicates with a fused lowering. The signed ordering
         // cascades have none (their answer needs the top lane's sign
-        // relation), so they keep the materializing path.
-        if !matches!(c.pred.as_str(), "eq" | "ne" | "ult" | "uge" | "ugt" | "ule") {
+        // relation), so they keep the materializing path. Single-byte
+        // unsigned orderings join them: fusion has no single-lane
+        // ordering lowering, only the borrow chain.
+        if !matches!(c.pred.as_str(), "eq" | "ne" | "ult" | "uge" | "ugt" | "ule")
+            || (c.ty.bytes() == 1 && !is_eq_ne)
+        {
             return None;
         }
         // The unsigned ordering compares lower to the borrow chain, which
