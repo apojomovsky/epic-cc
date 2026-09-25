@@ -132,42 +132,45 @@ exec: image ## One-off command: make exec CMD='cargo test -p asm'
 
 test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	@$(DOCKER_RUN) bash -c '$(if $(CRATE),cargo test -p $(CRATE) --no-fail-fast,bash scripts/ci-test.sh)'
-# Menu-demo ladder inputs. Must match the hal-pic18-menu-demo-18f4550 case
-# in crates/driver/tests/size_regression_e2e.rs; size-report.py fails the
-# render if this list drifts from the sizes.json inputs it records.
-MENU_DEMO_FIX := crates/driver/tests/fixtures/vendor/hal-pic18-menu-demo
-MENU_DEMO_INCLUDES := $(addprefix $(MENU_DEMO_FIX)/, \
-	pic18fxx5x-hal/include/epiccc \
-	pic18fxx5x-hal/include \
-	epic-common/include \
-	epic-taskmgr/include \
-	epic-tick/include \
-	epic-lcd/include \
-	epic-serial/include \
-	epic-menu-demo/include)
-MENU_DEMO_DEFINES := PIC18F4550 FOSC_HZ=48000000 __EPIC_CC__
-MENU_DEMO_SRCS := $(addprefix $(MENU_DEMO_FIX)/, \
-	pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c \
-	pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c \
-	pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c \
-	pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c \
-	pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c \
-	pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c \
-	pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c \
-	pic18fxx5x-hal/src/core/pic18_irq.c \
-	pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c \
-	pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c \
-	pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c \
-	pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c \
-	pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c \
-	epic-taskmgr/src/epic_taskmgr.c \
-	epic-tick/src/epic_tick.c \
-	epic-lcd/src/epic_lcd.c \
-	epic-lcd/src/epic_lcd_gpio4.c \
-	epic-serial/src/epic_serial.c \
-	epic-menu-demo/src/menu_demo_core.c \
-	epic-menu-demo/tests/sim_menu_demo.c \
-	config_18F4550.c)
+ # Menu-demo ladder inputs. Must match the hal-pic18-menu-demo-18f4550 case
+ # in crates/driver/tests/size_regression_e2e.rs; size-report.py fails the
+ # render if this list drifts from the sizes.json inputs it records.
+ # Shared files live once in hal-pic18-base; the demo dir holds only its own
+ # sources plus its config.
+ MENU_DEMO_BASE := crates/driver/tests/fixtures/vendor/hal-pic18-base
+ MENU_DEMO_FIX := crates/driver/tests/fixtures/vendor/hal-pic18-menu-demo
+ MENU_DEMO_INCLUDES := \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/include/epiccc \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/include \
+	$(MENU_DEMO_BASE)/epic-common/include \
+	$(MENU_DEMO_BASE)/epic-taskmgr/include \
+	$(MENU_DEMO_BASE)/epic-tick/include \
+	$(MENU_DEMO_FIX)/epic-lcd/include \
+	$(MENU_DEMO_BASE)/epic-serial/include \
+	$(MENU_DEMO_FIX)/epic-menu-demo/include
+ MENU_DEMO_DEFINES := PIC18F4550 FOSC_HZ=48000000 __EPIC_CC__
+ MENU_DEMO_SRCS := \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/core/pic18_irq.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c \
+	$(MENU_DEMO_BASE)/pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c \
+	$(MENU_DEMO_FIX)/pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c \
+	$(MENU_DEMO_BASE)/epic-taskmgr/src/epic_taskmgr.c \
+	$(MENU_DEMO_BASE)/epic-tick/src/epic_tick.c \
+	$(MENU_DEMO_FIX)/epic-lcd/src/epic_lcd.c \
+	$(MENU_DEMO_FIX)/epic-lcd/src/epic_lcd_gpio4.c \
+	$(MENU_DEMO_BASE)/epic-serial/src/epic_serial.c \
+	$(MENU_DEMO_FIX)/epic-menu-demo/src/menu_demo_core.c \
+	$(MENU_DEMO_FIX)/epic-menu-demo/tests/sim_menu_demo.c \
+	$(MENU_DEMO_FIX)/config_18F4550.c
 REPORT_DATE := $(shell date -u +%F)
 
 size-report: image ## Regenerate crates/driver/tests/fixtures/SIZE_REPORT.md from the tree

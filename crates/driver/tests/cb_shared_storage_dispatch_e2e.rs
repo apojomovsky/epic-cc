@@ -16,39 +16,47 @@ static LL_SEQ: AtomicUsize = AtomicUsize::new(0);
 /// Compile the fixture to LLVM IR with the real binary, then run
 /// merge + legalize in-process and return the module.
 fn legalized_module() -> ir::Module {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let base = "tests/fixtures/vendor/hal-pic18-base";
     let menu_demo = "tests/fixtures/vendor/hal-pic18-menu-demo";
     let includes = [
-        "pic18fxx5x-hal/include/epiccc",
-        "pic18fxx5x-hal/include",
-        "epic-common/include",
-        "epic-taskmgr/include",
-        "epic-tick/include",
-        "epic-lcd/include",
-        "epic-serial/include",
-        "epic-menu-demo/include",
+        (base, "pic18fxx5x-hal/include/epiccc"),
+        (base, "pic18fxx5x-hal/include"),
+        (base, "epic-common/include"),
+        (base, "epic-taskmgr/include"),
+        (base, "epic-tick/include"),
+        (menu_demo, "epic-lcd/include"),
+        (base, "epic-serial/include"),
+        (menu_demo, "epic-menu-demo/include"),
     ];
     let inputs = [
-        "pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c",
-        "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c",
-        "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c",
-        "pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c",
-        "pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c",
-        "pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c",
-        "pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c",
-        "pic18fxx5x-hal/src/core/pic18_irq.c",
-        "pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c",
-        "pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
-        "pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c",
-        "pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
-        "pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c",
-        "epic-taskmgr/src/epic_taskmgr.c",
-        "epic-tick/src/epic_tick.c",
-        "epic-lcd/src/epic_lcd.c",
-        "epic-lcd/src/epic_lcd_gpio4.c",
-        "epic-serial/src/epic_serial.c",
-        "epic-menu-demo/src/menu_demo_core.c",
-        "epic-menu-demo/tests/sim_menu_demo.c",
-        "config_18F4550.c",
+        (base, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c"),
+        (base, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c"),
+        (base, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c"),
+        (base, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c"),
+        (base, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c"),
+        (base, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c"),
+        (base, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c"),
+        (base, "pic18fxx5x-hal/src/core/pic18_irq.c"),
+        (base, "pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c"),
+        (
+            base,
+            "pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
+        ),
+        (base, "pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c"),
+        (
+            base,
+            "pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
+        ),
+        (menu_demo, "pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c"),
+        (base, "epic-taskmgr/src/epic_taskmgr.c"),
+        (base, "epic-tick/src/epic_tick.c"),
+        (menu_demo, "epic-lcd/src/epic_lcd.c"),
+        (menu_demo, "epic-lcd/src/epic_lcd_gpio4.c"),
+        (base, "epic-serial/src/epic_serial.c"),
+        (menu_demo, "epic-menu-demo/src/menu_demo_core.c"),
+        (menu_demo, "epic-menu-demo/tests/sim_menu_demo.c"),
+        (menu_demo, "config_18F4550.c"),
     ];
     // Unique per invocation: cargo runs this binary's tests on parallel
     // threads in one process, and each spawns its own epic-cc compile.
@@ -57,15 +65,15 @@ fn legalized_module() -> ir::Module {
         std::env::temp_dir().join(format!("cb_dispatch_568_{}_{seq}.ll", std::process::id()));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
     cmd.arg("--target").arg("18F4550").arg("--emit").arg("ll");
-    for d in includes {
-        cmd.arg("-I").arg(Path::new(menu_demo).join(d));
+    for (r, d) in includes {
+        cmd.arg("-I").arg(manifest.join(r).join(d));
     }
     for def in ["PIC18F4550", "FOSC_HZ=48000000", "__EPIC_CC__"] {
         cmd.arg("-D").arg(def);
     }
     cmd.arg("-o").arg(&ll_path);
-    for f in inputs {
-        cmd.arg(Path::new(menu_demo).join(f));
+    for (r, f) in inputs {
+        cmd.arg(manifest.join(r).join(f));
     }
     let out = cmd.output().expect("run epic-cc --emit ll");
     assert!(

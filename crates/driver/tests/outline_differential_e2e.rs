@@ -8,43 +8,50 @@ use pic14_sim::Pic18;
 use std::path::PathBuf;
 use std::process::Command;
 
+const BASE: &str = "tests/fixtures/vendor/hal-pic18-base";
 const MENU: &str = "tests/fixtures/vendor/hal-pic18-menu-demo";
-const INCLUDES: &[&str] = &[
-    "pic18fxx5x-hal/include/epiccc",
-    "pic18fxx5x-hal/include",
-    "epic-common/include",
-    "epic-taskmgr/include",
-    "epic-tick/include",
-    "epic-lcd/include",
-    "epic-serial/include",
-    "epic-menu-demo/include",
+const INCLUDES: &[(&str, &str)] = &[
+    (BASE, "pic18fxx5x-hal/include/epiccc"),
+    (BASE, "pic18fxx5x-hal/include"),
+    (BASE, "epic-common/include"),
+    (BASE, "epic-taskmgr/include"),
+    (BASE, "epic-tick/include"),
+    (MENU, "epic-lcd/include"),
+    (BASE, "epic-serial/include"),
+    (MENU, "epic-menu-demo/include"),
 ];
-const SOURCES: &[&str] = &[
-    "pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c",
-    "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c",
-    "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c",
-    "pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c",
-    "pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c",
-    "pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c",
-    "pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c",
-    "pic18fxx5x-hal/src/core/pic18_irq.c",
-    "pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c",
-    "pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
-    "pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c",
-    "pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
-    "pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c",
-    "epic-taskmgr/src/epic_taskmgr.c",
-    "epic-tick/src/epic_tick.c",
-    "epic-lcd/src/epic_lcd.c",
-    "epic-lcd/src/epic_lcd_gpio4.c",
-    "epic-serial/src/epic_serial.c",
-    "epic-menu-demo/src/menu_demo_core.c",
-    "epic-menu-demo/tests/sim_menu_demo.c",
-    "config_18F4550.c",
+const SOURCES: &[(&str, &str)] = &[
+    (BASE, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_gpio.c"),
+    (BASE, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer0.c"),
+    (BASE, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_timer2.c"),
+    (BASE, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_usart.c"),
+    (BASE, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_adc.c"),
+    (BASE, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_ccp.c"),
+    (BASE, "pic18fxx5x-hal/src/peripherals/pic18fxx5x_eeprom.c"),
+    (BASE, "pic18fxx5x-hal/src/core/pic18_irq.c"),
+    (BASE, "pic18fxx5x-hal/src/core/pic18fxx5x_wdt_sleep.c"),
+    (
+        BASE,
+        "pic18fxx5x-hal/src/epiccc/pic18fxx5x_wdt_sleep_epiccc.c",
+    ),
+    (BASE, "pic18fxx5x-hal/src/epiccc/pic18_isr_vector.c"),
+    (
+        BASE,
+        "pic18fxx5x-hal/src/epiccc/pic18_irq_dispatch_epiccc_tick.c",
+    ),
+    (MENU, "pic18fxx5x-hal/src/mdb/pic18_harness_mdb.c"),
+    (BASE, "epic-taskmgr/src/epic_taskmgr.c"),
+    (BASE, "epic-tick/src/epic_tick.c"),
+    (MENU, "epic-lcd/src/epic_lcd.c"),
+    (MENU, "epic-lcd/src/epic_lcd_gpio4.c"),
+    (BASE, "epic-serial/src/epic_serial.c"),
+    (MENU, "epic-menu-demo/src/menu_demo_core.c"),
+    (MENU, "epic-menu-demo/tests/sim_menu_demo.c"),
+    (MENU, "config_18F4550.c"),
 ];
 
 fn menu_listing(extra: &[&str]) -> String {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(MENU);
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let out = std::env::temp_dir().join(format!(
         "outline-diff-{}-{}.asm",
         std::process::id(),
@@ -56,12 +63,12 @@ fn menu_listing(extra: &[&str]) -> String {
     for d in ["PIC18F4550", "FOSC_HZ=48000000", "__EPIC_CC__"] {
         cmd.args(["-D", d]);
     }
-    for i in INCLUDES {
-        cmd.arg("-I").arg(root.join(i));
+    for (r, i) in INCLUDES {
+        cmd.arg("-I").arg(manifest.join(r).join(i));
     }
     cmd.args(extra);
-    for s in SOURCES {
-        cmd.arg(root.join(s));
+    for (r, s) in SOURCES {
+        cmd.arg(manifest.join(r).join(s));
     }
     let run = cmd.output().expect("spawn epic-cc");
     assert!(
