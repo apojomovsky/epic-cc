@@ -44,9 +44,9 @@ sdcc_cycles = 366
 program = "array"
 device = "p18f4550"
 status = "pass"
-epic_flash = 50
+epic_flash = 47
 sdcc_flash = 133
-epic_cycles = 66
+epic_cycles = 70
 sdcc_cycles = 6238
 
 [[row]]
@@ -152,9 +152,9 @@ sdcc_cycles = 8748
 program = "double"
 device = "p18f4550"
 status = "pass"
-epic_flash = 732
+epic_flash = 731
 sdcc_flash = 1409
-epic_cycles = 1061
+epic_cycles = 1065
 sdcc_cycles = 8080
 
 [[row]]
@@ -170,9 +170,9 @@ sdcc_cycles = 6670
 program = "malloc"
 device = "p18f4550"
 status = "pass"
-epic_flash = 491
+epic_flash = 454
 sdcc_flash = 736
-epic_cycles = 1597
+epic_cycles = 1769
 sdcc_cycles = 6745
 
 [[row]]
@@ -215,9 +215,9 @@ sdcc_cycles = 0
 program = "math"
 device = "p18f4550"
 status = "pass"
-epic_flash = 3691
+epic_flash = 3557
 sdcc_flash = 4731
-epic_cycles = 19778
+epic_cycles = 19889
 sdcc_cycles = 15456
 
 [[row]]
@@ -296,9 +296,9 @@ sdcc_cycles = 0
 program = "printf-f"
 device = "p18f4550"
 status = "known-bug"
-epic_flash = 3930
+epic_flash = 3723
 sdcc_flash = 5035
-epic_cycles = 5537
+epic_cycles = 5611
 sdcc_cycles = 12453
 
 [[row]]
@@ -323,9 +323,9 @@ sdcc_cycles = 775
 program = "eeprom-p18"
 device = "p18f4550"
 status = "known-bug"
-epic_flash = 59
+epic_flash = 52
 sdcc_flash = 415
-epic_cycles = 50
+epic_cycles = 54
 sdcc_cycles = 6578
 
 [[row]]
@@ -350,9 +350,9 @@ sdcc_cycles = 385
 program = "constptr"
 device = "p18f4550"
 status = "pass"
-epic_flash = 68
+epic_flash = 61
 sdcc_flash = 216
-epic_cycles = 56
+epic_cycles = 64
 sdcc_cycles = 6269
 
 [[row]]
