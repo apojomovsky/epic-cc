@@ -269,11 +269,25 @@ impl<'m> Gen<'m> {
             Some(s) => *s,
             None => return false,
         };
-        if self.out.len() < 2 {
+        // Staged copies drain at the next emit, between these lines and
+        // the branch; today's drain forms leave STATUS alone, but the skip
+        // must not depend on that.
+        if !self.pending_copies.is_empty() || self.out.len() < 2 {
             return false;
         }
         let movwf = self.out[self.out.len() - 1].trim();
         let alu = self.out[self.out.len() - 2].trim();
+        // A skip in front of the ALU op may have bypassed it, leaving `Z`
+        // from older code while the slot holds whatever `W` was.
+        if let Some(prev) = self.out.len().checked_sub(3).map(|i| self.out[i].trim()) {
+            const SKIPS: [&str; 10] = [
+                "BTFSC", "BTFSS", "DECFSZ", "INCFSZ", "DCFSNZ", "INFSNZ", "CPFSEQ", "CPFSGT",
+                "CPFSLT", "TSTFSZ",
+            ];
+            if SKIPS.contains(&prev.split_whitespace().next().unwrap_or("")) {
+                return false;
+            }
+        }
         if movwf.ends_with(':') || alu.ends_with(':') {
             return false;
         }
