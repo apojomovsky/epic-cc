@@ -40,6 +40,24 @@ fn resolve_or_exit(name: &str) -> &'static device::Device {
     })
 }
 
+/// The effective header dir: the `include/` shipped beside the executable
+/// when present, else a materialized per-run fallback (docs/46 D-6). The
+/// fallback parent is a per-pid temp dir, the same shape the compile path
+/// uses for its stage artifacts.
+fn include_dir_path() -> std::path::PathBuf {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(|| Path::new(".").to_path_buf());
+    let fallback_parent = std::env::temp_dir().join(format!("epic-cc-{}", std::process::id()));
+    match driver::include_dir::resolve(&exe_dir, &fallback_parent) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("epic-cc: materialize headers: {e}");
+            std::process::exit(1);
+        }
+    }
+}
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|a| a == "--version" || a == "-V") {
@@ -52,6 +70,25 @@ fn main() {
             std::process::exit(2);
         });
         println!("{}", resolve_or_exit(name).name);
+        return;
+    }
+    if argv.iter().any(|a| a == "--print-include-dir") {
+        println!("{}", include_dir_path().display());
+        return;
+    }
+    if let Some(pos) = argv.iter().position(|a| a == "--dump-include-dir") {
+        let dir = argv.get(pos + 1).unwrap_or_else(|| {
+            eprintln!("epic-cc: --dump-include-dir needs a value");
+            std::process::exit(2);
+        });
+        let dir = std::path::PathBuf::from(dir);
+        match driver::include_dir::materialize(&dir) {
+            Ok(()) => println!("{}", dir.display()),
+            Err(e) => {
+                eprintln!("epic-cc: write {}: {e}", dir.display());
+                std::process::exit(1);
+            }
+        }
         return;
     }
     let has_device_flag = argv
@@ -115,27 +152,16 @@ fn main() {
         None => std::env::temp_dir().join(format!("epic-cc-{}", std::process::id())),
     };
     std::fs::create_dir_all(&tmp).expect("create temp dir");
-    let header_dir = tmp.join("include");
-    std::fs::create_dir_all(&header_dir).expect("create header dir");
-    std::fs::write(header_dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H)
-        .expect("write epic-cc.h");
-    std::fs::write(header_dir.join("stdint.h"), driver::stdint_h::STDINT_H)
-        .expect("write stdint.h");
-    std::fs::write(header_dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H)
-        .expect("write stdbool.h");
-    std::fs::write(header_dir.join("stddef.h"), driver::stddef_h::STDDEF_H)
-        .expect("write stddef.h");
-    std::fs::write(header_dir.join("string.h"), driver::string_h::STRING_H)
-        .expect("write string.h");
-    std::fs::write(header_dir.join("stdlib.h"), driver::stdlib_h::STDLIB_H)
-        .expect("write stdlib.h");
-    std::fs::write(header_dir.join("malloc.h"), driver::malloc_h::MALLOC_H)
-        .expect("write malloc.h");
-    std::fs::write(header_dir.join("xc.h"), driver::xc_h::XC_H).expect("write xc.h");
-    std::fs::write(header_dir.join("stdarg.h"), driver::stdarg_h::STDARG_H)
-        .expect("write stdarg.h");
-    std::fs::write(header_dir.join("stdio.h"), driver::stdio_h::STDIO_H).expect("write stdio.h");
-    std::fs::write(header_dir.join("math.h"), driver::math_h::MATH_H).expect("write math.h");
+    // Shipped `include/` beside the binary when present (docs/46 D-6);
+    // otherwise the same headers materialized under the temp dir.
+    let header_dir = match driver::include_dir::bundled(&exe_dir) {
+        Some(dir) => dir,
+        None => {
+            let dir = tmp.join("include");
+            driver::include_dir::materialize(&dir).expect("write headers");
+            dir
+        }
+    };
 
     let sources: Vec<(String, String)> = cli
         .inputs

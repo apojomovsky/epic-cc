@@ -92,6 +92,7 @@ jobs:
           Copy-Item "$src\bin\opt.exe" "$bundle\clang\bin\"
           Copy-Item -Recurse "$src\lib\clang" "$bundle\clang\lib\clang"
           Copy-Item "target\release\epic-cc.exe" "$bundle\"
+          & ".\$bundle\epic-cc.exe" --dump-include-dir "$bundle\include"
           python scripts\gen_devices_manifest.py "$bundle\devices.json"
           # The MSVC archive does not ship LICENSE.TXT; fetch the pinned
           # source license, same file and checksum the Linux bundle uses.
@@ -113,6 +114,10 @@ jobs:
           & ".\$bundle\epic-cc.exe" crates\driver\tests\fixtures\add.c -o bundled.hex
           if ((Get-FileHash env.hex).Hash -ne (Get-FileHash bundled.hex).Hash) {
             throw "smoke mismatch: env-path and bundled-discovery HEX differ"
+          }
+          $inc = & ".\$bundle\epic-cc.exe" --print-include-dir
+          if ($inc -ne "$PWD\$bundle\include") {
+            throw "print-include-dir mismatch: $inc"
           }
 
       - name: Zip

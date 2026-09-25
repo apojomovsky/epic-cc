@@ -95,6 +95,8 @@ Caching strategy, in order of stickiness:
 epic-cc-<ver>-x86_64-linux/          epic-cc-<ver>-x86_64-windows/
 ├── epic-cc                        ├── epic-cc.exe
 ├── devices.json                   ├── devices.json
+├── include/                       ├── include/
+│   └── epic-cc.h, stdint.h, ...   │   └── epic-cc.h, stdint.h, ...
 ├── clang/                         ├── clang/
 │   ├── bin/clang                  │   ├── bin/clang.exe
 │   ├── bin/llvm-link              │   ├── bin/llvm-link.exe
@@ -102,6 +104,13 @@ epic-cc-<ver>-x86_64-linux/          epic-cc-<ver>-x86_64-windows/
 │   └── lib/clang/20/              │   └── lib/clang/20/   ← builtin headers
 └── LICENSE (LLVM Apache-2.0)      └── LICENSE (LLVM Apache-2.0)
 ```
+
+`include/` (epic-cc#690, docs/46 D-6) is the eleven headers the driver
+would otherwise materialize into a per-run temp dir, dumped at bundle
+time by `epic-cc --dump-include-dir` from the same constants the
+compiler burns. The driver resolves it exe-relative and falls back to
+the temp materialization only when absent; `--print-include-dir`
+reports the effective dir for the PlatformIO builder's CPPPATH.
 
 License note: LLVM is Apache-2.0-with-LLVM-exception, explicitly redistributable; the
 bundle ships its LICENSE alongside, as every clang vendor does.
