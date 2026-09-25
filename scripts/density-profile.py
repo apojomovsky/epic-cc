@@ -510,6 +510,23 @@ def match_struct_copy(items, i, cfg):
     return _movff_run(items, i, cfg)[0]
 
 
+_SHARED_BODY = re.compile(r"^__pa\d+$")
+
+
+def match_shared_code(items, i, cfg):
+    """Code-factoring output: shared `__pa<N>` bodies and the calls or
+    branches that reach them (docs/44). Ranked ahead of runtime-routine,
+    whose `__` prefix rule would otherwise swallow the bodies."""
+    del cfg
+    if _SHARED_BODY.match(items[i].function):
+        return 1
+    if items[i].mnemonic in ("CALL", "RCALL", "BRA", "GOTO"):
+        target = items[i].operands.split(",", 1)[0].strip()
+        if _SHARED_BODY.match(target):
+            return 1
+    return 0
+
+
 _RUNTIME_KEEP = ("__start", "__epic_config")
 
 
@@ -851,6 +868,7 @@ class Rule:
 # Wide-const runs ahead of zero-init so a half-zero 16-bit constant is
 # reported as one materialisation, not a pair plus a stray store.
 SINK_RULES = (
+    Rule("shared-code", match_shared_code),
     Rule("runtime-routine", match_runtime_routine),
     Rule("dead-store-reload", match_dead_roundtrip),
     Rule("sfr-context-save", match_sfr_context_save),
