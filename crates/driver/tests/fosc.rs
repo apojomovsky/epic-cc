@@ -25,16 +25,19 @@ const NO_CPUDIV_PIC18: Device = Device {
         erased_baseline: &[0xFF],
         fields: &[FuseField {
             name: "osc",
+            aliases: &[],
             byte_offset: 0,
             mask: 0x07,
             shift: 0,
             values: &[
                 FuseValue {
                     name: "hs",
+                    aliases: &[],
                     bits: 2,
                 },
                 FuseValue {
                     name: "hspll",
+                    aliases: &[],
                     bits: 6,
                 },
             ],
@@ -71,24 +74,29 @@ const J_SERIES_PIC18: Device = Device {
         fields: &[
             FuseField {
                 name: "osc",
+                aliases: &[],
                 byte_offset: 0,
                 mask: 0x07,
                 shift: 0,
                 values: &[
                     FuseValue {
                         name: "hs",
+                        aliases: &[],
                         bits: 4,
                     },
                     FuseValue {
                         name: "hspll",
+                        aliases: &[],
                         bits: 5,
                     },
                     FuseValue {
                         name: "intosc",
+                        aliases: &[],
                         bits: 0,
                     },
                     FuseValue {
                         name: "intoscpll",
+                        aliases: &[],
                         bits: 2,
                     },
                 ],
@@ -97,36 +105,50 @@ const J_SERIES_PIC18: Device = Device {
             },
             FuseField {
                 name: "plldiv",
+                aliases: &[],
                 byte_offset: 0,
                 mask: 0x38,
                 shift: 3,
                 values: &[
-                    FuseValue { name: "1", bits: 7 },
-                    FuseValue { name: "4", bits: 4 },
+                    FuseValue {
+                        name: "1",
+                        aliases: &[],
+                        bits: 7,
+                    },
+                    FuseValue {
+                        name: "4",
+                        aliases: &[],
+                        bits: 4,
+                    },
                 ],
                 default: Some("1"),
                 locked: None,
             },
             FuseField {
                 name: "cpudiv",
+                aliases: &[],
                 byte_offset: 0,
                 mask: 0xC0,
                 shift: 6,
                 values: &[
                     FuseValue {
                         name: "osc1",
+                        aliases: &[],
                         bits: 3,
                     },
                     FuseValue {
                         name: "osc2_pll2",
+                        aliases: &[],
                         bits: 2,
                     },
                     FuseValue {
                         name: "osc3_pll3",
+                        aliases: &[],
                         bits: 1,
                     },
                     FuseValue {
                         name: "osc4_pll6",
+                        aliases: &[],
                         bits: 0,
                     },
                 ],

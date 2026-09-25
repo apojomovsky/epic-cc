@@ -203,6 +203,27 @@ Two failure shapes to expect and fix, not route around:
   like it belongs in the generator the same way, not as a per-device
   TOML edit.
 
+## §5a. Register names, for parts with generated headers
+
+A part whose generated headers carry XC8's SFR spelling (docs/46 D-3)
+also needs the pack's names in its TOML: the `[[sfrs]]` table and the
+pack spellings of its config fields and values (`FOSC`, `HS`) as
+`aliases`. `scripts/device_names.py` adds both to the existing TOML
+instead of regenerating it, so hand-curated facts survive:
+
+```bash
+python3 scripts/device_names.py p16f887 --atdf <pack>/edc/PIC16F887.PIC
+python3 scripts/device_names.py p16f887 --atdf <pack>/edc/PIC16F887.PIC --check
+```
+
+Config fields are matched to the pack by byte and mask, never by name,
+so the run also reports any TOML field or value the pack does not have
+at the same bits: read that list, it is the cross-check between a
+transcribed config and the pack's. `sfr_tables_match_gputils_headers`
+(`crates/device/tests/gputils_crosscheck.rs`) then holds every register
+address and single-bit position that gputils' `header/p<part>.inc` also
+names.
+
 ## §6. Sign-off
 
 - [ ] The run ends `ready to commit`, and you have read the field-diff

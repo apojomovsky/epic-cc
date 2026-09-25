@@ -40,6 +40,8 @@ struct ConfigToml {
 #[derive(Debug, Deserialize)]
 struct FieldToml {
     name: String,
+    #[serde(default)]
+    aliases: Vec<String>,
     byte_offset: u16,
     mask: u8,
     shift: u8,
@@ -54,6 +56,8 @@ struct FieldToml {
 struct ValueToml {
     name: String,
     bits: u8,
+    #[serde(default)]
+    aliases: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -61,6 +65,8 @@ struct SfrToml {
     name: String,
     addr: u16,
     width: u8,
+    #[serde(default)]
+    aliases: Vec<String>,
     fields: Vec<SfrFieldToml>,
 }
 
@@ -69,6 +75,13 @@ struct SfrFieldToml {
     name: String,
     mask: u8,
     shift: u8,
+    #[serde(default)]
+    mode: u8,
+}
+
+fn str_slice(items: &[String]) -> String {
+    let quoted: Vec<String> = items.iter().map(|s| format!("\"{s}\"")).collect();
+    format!("&[{}]", quoted.join(", "))
 }
 
 fn const_ident(name: &str) -> String {
@@ -515,16 +528,18 @@ fn main() {
                 None => "None".to_string(),
             };
             out.push_str(&format!(
-                "            FuseField {{ name: \"{name}\", byte_offset: {off}, mask: 0x{mask:02X}, shift: {shift}, values: &[\n",
+                "            FuseField {{ name: \"{name}\", aliases: {aliases}, byte_offset: {off}, mask: 0x{mask:02X}, shift: {shift}, values: &[\n",
                 name = f.name,
+                aliases = str_slice(&f.aliases),
                 off = f.byte_offset,
                 mask = f.mask,
                 shift = f.shift
             ));
             for v in &f.values {
                 out.push_str(&format!(
-                    "                FuseValue {{ name: \"{name}\", bits: {bits} }},\n",
+                    "                FuseValue {{ name: \"{name}\", aliases: {aliases}, bits: {bits} }},\n",
                     name = v.name,
+                    aliases = str_slice(&v.aliases),
                     bits = v.bits
                 ));
             }
@@ -537,17 +552,19 @@ fn main() {
         out.push_str("        ],\n    },\n    sfrs: &[\n");
         for s in &dev.sfrs {
             out.push_str(&format!(
-                "        Sfr {{ name: \"{name}\", addr: 0x{addr:04X}, width: {width}, fields: &[\n",
+                "        Sfr {{ name: \"{name}\", addr: 0x{addr:04X}, width: {width}, aliases: {aliases}, fields: &[\n",
                 name = s.name,
+                aliases = str_slice(&s.aliases),
                 addr = s.addr,
                 width = s.width
             ));
             for f in &s.fields {
                 out.push_str(&format!(
-                    "            SfrField {{ name: \"{name}\", mask: 0x{mask:02X}, shift: {shift} }},\n",
+                    "            SfrField {{ name: \"{name}\", mask: 0x{mask:02X}, shift: {shift}, mode: {mode} }},\n",
                     name = f.name,
                     mask = f.mask,
-                    shift = f.shift
+                    shift = f.shift,
+                    mode = f.mode
                 ));
             }
             out.push_str("        ] },\n");

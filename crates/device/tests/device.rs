@@ -241,13 +241,84 @@ fn by_name_case_insensitive_helper() {
     );
 }
 
+/// The public beta's parts (docs/46 D-2): their generated headers need a
+/// register table, so an empty one is a regression, not a gap.
+const BETA_PARTS: &[&str] = &[
+    "p16f877a", "p16f887", "p16f628a", "p12f675", "p16f1937", "p18f4550",
+];
+
 #[test]
-fn every_device_exposes_an_sfr_table() {
-    // The table is the contract epic-hal generates its per family SFR headers
-    // from. The compiler never reads an SFR name, so it stays empty here; what
-    // matters is that the field exists and survives codegen.
+fn every_beta_part_carries_an_sfr_table() {
+    for name in BETA_PARTS {
+        let d = device::by_name(name).unwrap_or_else(|| panic!("{name} not in the registry"));
+        assert!(!d.sfrs.is_empty(), "{name} has no sfrs table");
+    }
+}
+
+#[test]
+fn sfr_tables_are_well_formed() {
+    // A header generator emits one union member per mode and one C name per
+    // register, so a duplicate name in either scope, or a mask that
+    // disagrees with its shift, would surface as a compile error in user
+    // code rather than here.
     for d in device::ALL {
-        assert!(d.sfrs.is_empty(), "{} ships a non-empty sfrs table", d.name);
+        let mut names = std::collections::HashSet::new();
+        for s in d.sfrs {
+            assert!(
+                names.insert(s.name),
+                "{}: SFR {} listed twice",
+                d.name,
+                s.name
+            );
+            for a in s.aliases {
+                assert!(names.insert(a), "{}: alias {a} collides", d.name);
+            }
+            assert!(
+                (1..=3).contains(&s.width),
+                "{}: {} width {}",
+                d.name,
+                s.name,
+                s.width
+            );
+            if s.width > 1 {
+                assert!(
+                    s.fields.is_empty(),
+                    "{}: joined {} carries fields",
+                    d.name,
+                    s.name
+                );
+            }
+            let mut fields = std::collections::HashSet::new();
+            let mut used = std::collections::HashMap::new();
+            for f in s.fields {
+                assert!(
+                    fields.insert(f.name),
+                    "{}: {}.{} listed twice",
+                    d.name,
+                    s.name,
+                    f.name
+                );
+                assert!(
+                    f.mask != 0 && f.mask.trailing_zeros() == u32::from(f.shift),
+                    "{}: {}.{} mask 0x{:02X} disagrees with shift {}",
+                    d.name,
+                    s.name,
+                    f.name,
+                    f.mask,
+                    f.shift
+                );
+                let taken = used.entry(f.mode).or_insert(0u8);
+                assert!(
+                    *taken & f.mask == 0,
+                    "{}: {}.{} overlaps in mode {}",
+                    d.name,
+                    s.name,
+                    f.name,
+                    f.mode
+                );
+                *taken |= f.mask;
+            }
+        }
     }
 }
 

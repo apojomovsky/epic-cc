@@ -72,7 +72,7 @@ fi
 # cross-check does; the density profiler derives its word table from the
 # `asm` crate, so a change there has to keep it readable.
 echo "::group::python-tools"
-if python3 scripts/test_gen_device.py && python3 scripts/test_add_device.py && python3 scripts/test_gen_devices_manifest.py && python3 scripts/test_density_profile.py && python3 scripts/test_inline_map.py; then
+if python3 scripts/test_gen_device.py && python3 scripts/test_device_names.py && python3 scripts/test_add_device.py && python3 scripts/test_gen_devices_manifest.py && python3 scripts/test_density_profile.py && python3 scripts/test_inline_map.py; then
   echo "PASS: python-tools"
   row="| python-tools | PASS |"
 else

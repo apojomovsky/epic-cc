@@ -790,3 +790,59 @@ fn flash_words_matches_gputils_for_every_device() {
         );
     }
 }
+
+/// The pack-derived SFR table against gputils' own headers: wherever both
+/// name a register or a single-bit field, the address and bit position must
+/// agree. Names only one side has are legacy or MPASM spellings, not errors,
+/// but most of the header must be found, or the join matched nothing.
+#[test]
+fn sfr_tables_match_gputils_headers() {
+    let Some(share) = gputils_share() else {
+        return;
+    };
+    for dev in device::ALL.iter().filter(|d| !d.sfrs.is_empty()) {
+        let stem = dev.name.strip_prefix('p').unwrap_or(dev.name);
+        let path = share.join("header").join(format!("p{stem}.inc"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: cannot read {}: {e}", dev.name, path.display()));
+        let inc = device::gputils::names_from_inc(&text);
+        let find = |name: &str| {
+            dev.sfrs
+                .iter()
+                .find(|s| s.name == name || s.aliases.contains(&name))
+        };
+
+        let mut found = 0;
+        for (name, addr) in &inc.registers {
+            if let Some(s) = find(name) {
+                found += 1;
+                assert_eq!(
+                    s.addr, *addr,
+                    "{}: {name} is at 0x{:04X} in the TOML, 0x{addr:04X} in gputils",
+                    dev.name, s.addr
+                );
+            }
+        }
+        assert!(
+            found * 10 >= inc.registers.len() * 9,
+            "{}: only {found} of {} gputils registers found in the sfrs table",
+            dev.name,
+            inc.registers.len()
+        );
+
+        for (reg, bit, pos) in &inc.bits {
+            let Some(s) = find(reg) else { continue };
+            let field = s
+                .fields
+                .iter()
+                .find(|f| f.name == bit && f.mask.count_ones() == 1);
+            if let Some(f) = field {
+                assert_eq!(
+                    f.shift, *pos,
+                    "{}: {reg}.{bit} is bit {} in the TOML, bit {pos} in gputils",
+                    dev.name, f.shift
+                );
+            }
+        }
+    }
+}

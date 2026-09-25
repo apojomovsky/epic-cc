@@ -74,9 +74,9 @@ pub struct Device {
     /// priority) for a PIC18 device with IPEN set.
     pub interrupt_vectors: &'static [u16],
     pub config: ConfigRegion,
-    /// The one artifact this registry shares with `epic-hal`, which generates
-    /// its per family SFR headers from it. Empty for every device `cc` ships:
-    /// the compiler needs the memory map and the config words, never a name.
+    /// The pack's register names, filled by `scripts/device_names.py` for the
+    /// devices whose generated headers carry XC8's SFR spelling (docs/46
+    /// D-3); empty elsewhere. Code generation never reads a name from it.
     pub sfrs: &'static [Sfr],
 }
 
@@ -84,8 +84,13 @@ pub struct Device {
 pub struct Sfr {
     pub name: &'static str,
     pub addr: u16,
-    /// Width in bytes; 1 for every PIC14 and PIC18 SFR.
+    /// Width in bytes: 1 for a plain SFR, 2 or 3 for a joined register
+    /// (`TMR1` over `TMR1L:TMR1H`) at its low byte's address, which carries
+    /// no fields.
     pub width: u8,
+    /// Legacy names the pack keeps for the same register (`DDRA` for the
+    /// PIC18 `TRISA`), which older tutorial code still uses.
+    pub aliases: &'static [&'static str],
     pub fields: &'static [SfrField],
 }
 
@@ -94,6 +99,10 @@ pub struct SfrField {
     pub name: &'static str,
     pub mask: u8,
     pub shift: u8,
+    /// Which alternate naming of the register this field belongs to: mode 0
+    /// is the datasheet's, higher modes rename the same bits (`R_W` over
+    /// `R_nW`), one `<REG>bits` union member each.
+    pub mode: u8,
 }
 /// The PIC14 core registers mirrored into every bank (epic-cc#112): only
 /// these may be accessed with any RP1:RP0 value. Every other bank-0 SFR
@@ -239,6 +248,9 @@ impl Device {
 #[derive(Clone, Copy, Debug)]
 pub struct FuseValue {
     pub name: &'static str,
+    /// The pack's own spellings (`HS`, `OSC1_PLL2`) where they differ from
+    /// `name`, so `#pragma config` values resolve too.
+    pub aliases: &'static [&'static str],
     /// Raw bit pattern this value encodes, positioned at bit 0 and placed
     /// by `resolve_config` as `(bits << shift) & mask`. Values never set
     /// bits outside `mask >> shift`.
@@ -248,6 +260,9 @@ pub struct FuseValue {
 #[derive(Clone, Copy, Debug)]
 pub struct FuseField {
     pub name: &'static str,
+    /// The pack's own field names (`FOSC`, `WDTE`) where they differ from
+    /// `name`, matched to it by bit position, not by spelling.
+    pub aliases: &'static [&'static str],
     /// Offset into the region, 0-based (e.g. CONFIG4L is offset 6 in the
     /// PIC18F4550's region, which starts at `base_byte_addr`).
     pub byte_offset: u16,
