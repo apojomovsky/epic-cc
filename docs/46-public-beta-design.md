@@ -1,9 +1,9 @@
 # 46: Public beta through PlatformIO
 
-> **Approval status:** draft, awaiting the user's approval. The scope
+> **Approval status:** approved by the user on 2026-09-25. The scope
 > answers (audience, host OSes, board set, programmers, XC8
 > conventions, tool redistribution) were given by the user during
-> brainstorming on 2026-09-25; the rest are proposals marked as such.
+> brainstorming the same day.
 > Spans three repos (epic-cc, epic-platformio, and a new `epic8-tools`)
 > and supersedes, for the beta, the "every device, no curation" board
 > decision in epic-platformio's `docs/platform-decisions.md`.
@@ -14,8 +14,8 @@ with a programmer they already own, on Linux. Code written the way PIC
 tutorials write it compiles unchanged.
 
 **Definition of done:** each beta board builds its examples and is
-flashed and run on silicon with each programmer that can physically
-reach it (section 4, D-11), from a clean Linux machine that has only
+flashed and run on silicon with each programmer that supports it
+(D-11), from a clean Linux machine that has only
 PlatformIO installed.
 
 ---
@@ -47,8 +47,9 @@ one host keeps the hardware sign-off matrix small enough to finish.
 ### D-2: A curated beta board set
 
 `pic16f877a`, `pic16f887`, `pic16f628a`, `pic12f675`, `pic16f1937`,
-`pic18f4550`. These cover all three production cores (PIC14, PIC14E,
-PIC18), the parts hobbyists actually stock, and the two
+`pic18f4550`. These cover the three cores with a
+HAL family behind them (PIC14, PIC14E, PIC18; the baseline core is not
+in the beta), the parts hobbyists actually stock, and the two
 programming hazards worth exercising (18F4550's LVP pin, 12F675's
 calibration words).
 
@@ -63,8 +64,9 @@ lost and nothing unverified is advertised.
 listed board is equally usable; the beta makes a support promise per
 board, which a generated list cannot back.
 
-**Rejected, ship all 115 with a visible tier field.** `pio boards` has no
-place to show a tier, so a user sees 115 equal-looking boards.
+**Rejected, ship every generated board with a visible tier field.**
+`pio boards` has no place to show a tier, so every board looks equally
+supported.
 
 ### D-3: XC8 source conventions, generated from pack data
 
@@ -74,43 +76,54 @@ Tutorial code compiles unchanged. The surface, all in the beta:
 |---|---|
 | SFR names and `<REG>bits.<BIT>` unions | Generated per-device headers, dispatched from a real `<xc.h>` on the device macro |
 | `_XTAL_FREQ`, `__delay_ms()`, `__delay_us()` | `xc.h` macros over a cycle-exact delay intrinsic |
-| `void __interrupt() isr(void)` (and `high_priority`/`low_priority` on PIC18) | `xc.h` macro onto the existing interrupt section spelling |
+| `void __interrupt() isr(void)` (and `high_priority`/`low_priority` on PIC18) | Widen the driver's existing `__interrupt(n)` predefine (the SDCC form, `predef.rs`) to a variadic macro onto `__attribute__((interrupt(...)))` that accepts the empty, priority and numeric spellings alike |
 | `#pragma config NAME = VALUE` | Driver lowers it into the same resolution `EPIC_CONFIG` uses |
 
 The data comes from the Microchip device packs, which are Apache-2.0
 (ADR-029): the ADR-020 generator already reads the `.PIC` files; it
 grows an SFR/bitfield table and keeps the pack's native config field
 and value names as aliases of the normalized ones. Headers ship with the
-pack's attribution. `p16f877a` is `tier = "datasheet"` with no pack, so
-its SFR table and aliases are transcribed from the datasheet, same as
-its config data.
+pack's attribution. Three beta parts (877A, 887, 4550) have
+datasheet-transcribed TOMLs, but all six are in a pack
+(`crates/device/catalog/parts.toml`), so their SFR tables and aliases
+come from the pack too, with the aliases checked against the
+transcribed config fields.
 
 `#pragma config` needs the driver because clang drops unknown pragmas
 before the `.ll`. Mixing it with `EPIC_CONFIG` in one program is an
 error, not a merge.
 
-**Proposed:** stop predefining `__XC8` and define `__EPIC_CC__`. Code
-that tests `__XC8` usually goes on to use surface we do not have
-(`__at()`, `__eeprom`, `__section`), so the predefine promises too
-much. The m-stack sources that need it get `-D__XC8` in their own build.
+The driver already predefines XC8's macro set (`__XC`, `__XC8`, the
+core and part macros, `predef.rs`) on purpose, and epic-hal relies on
+it; that stays. The driver also predefines `__EPIC_CC__`, which
+epic-platformio and epic-hal inject with `-D` today, so code can tell
+the two compilers apart without a build system's help.
 
 **Rejected, epic-cc-only spellings.** Every tutorial, book and forum
 answer uses these names; a hobbyist would have to translate before the
 first blink.
 
-### D-4: Config bits in the source are the single source of truth
+### D-4: One clock, from whichever source the code gives, checked
 
-The driver already derives the system clock from the config
-(`crates/driver/src/fosc.rs`). Proposed:
+Config bits alone rarely fix the clock: XT, HS and PLL modes need the
+crystal frequency, which no fuse encodes. The driver already derives
+the clock from an `EPIC_CONFIG` that carries `xtal_hz`, or from an
+internal-oscillator setting (`crates/driver/src/fosc.rs`). XC8-style
+code states it as `#define _XTAL_FREQ`, and a board may carry `f_cpu`.
+For the epic-cc toolchain:
 
-- `board_build.f_cpu` becomes optional; when set, the build fails if it
-  disagrees with the derived clock.
-- A user `#define _XTAL_FREQ` that disagrees with the derived clock is a
-  warning, since tutorial code always defines it.
-- The build header prints the result: `PIC16F877A @ 4 MHz (HS)`.
+- The clock comes from the first of: a clock derivable from the config
+  (internal oscillator, or `EPIC_CONFIG` with `xtal_hz`), the code's
+  `_XTAL_FREQ`, the board's `board_build.f_cpu`.
+- Every other source present must agree with it, or the build fails
+  naming both values.
+- No source at all is fine until something needs the clock; a delay
+  macro then fails with a message naming the three ways to give one.
+- The build prints the result: `PIC16F877A @ 20 MHz (HS)`.
 
 Rationale: config travels with the code and builds the same outside
-PlatformIO; two sources that must agree always eventually disagree.
+PlatformIO; the tutorial spelling keeps working; and several sources
+that must agree are checked rather than trusted.
 
 ### D-5: Distribution through the registry under a personal owner
 
@@ -127,9 +140,10 @@ PlatformIO; two sources that must agree always eventually disagree.
 
 The toolchain package ships `include/` next to the binary. The driver
 resolves it exe-relative (the same chain as clang discovery, doc 30
-D-6) and materializes to a temp dir only as the fallback. The builder
-adds it to `CPPPATH`, so PlatformIO's generated IntelliSense config
-finds every header.
+D6) and materializes to a temp dir only as the fallback. The builder
+adds it to `CPPPATH` only when the toolchain is epic-cc, so a project
+built with `board_build.toolchain = xc8` keeps XC8's own `xc.h` first,
+and PlatformIO's generated IntelliSense config finds every header.
 
 ### D-7: Build UX
 
@@ -146,26 +160,32 @@ finds every header.
 ### D-8: An upload layer with per-tool device names
 
 Protocols in the beta: `minipro` (XGecu T48, TL866II Plus), `pk2cmd`
-(PICkit2, PICkit3 and "3.5" clones), `picpro` (K150 and siblings,
+(PICkit2, PICkit3 and "3.5" clones; a PICkit3 may need the PK2-style
+firmware flashed once, `docs/getting-started.md#upload` in
+epic-platformio), `picpro` (K150 and siblings,
 firmware protocol P18A), and `custom` (`upload_command`). `upload_flags`
 passes through on every protocol.
 
-Boards carry `upload.devices.<tool>` (the name each tool expects) and
-the package facts the checks in D-9 need (DIP availability, LVP
-default, calibration words). Targets: `upload`, `erase`, and
+Boards carry `upload.devices.<tool>` (the name each tool expects,
+replacing today's `upload.minipro_device`/`upload.pk2cmd_device`) and
+the per-part facts the checks in D-9 need (PGM pin or LVP scheme,
+OSCCAL location, bandgap bits). A tool with no entry for the board's
+part is refused with the list of tools that have one; picpro, for
+example, has no 16F887 or 16F1xxx support. Targets: `upload`, `erase`, and
 `readback` (dump flash to a HEX file).
 
 ### D-9: Programming hazards are warned, not refused
 
-The builder warns before flashing when:
+The builder warns before flashing when the resolved config (from the
+driver's build report, CC-g) shows:
 
-- the target is a DIP-only socket programmer (K150) and the board's
-  package is not DIP;
-- the config leaves LVP on for a part whose PGM pin then needs a
-  pull-down (18F4550 RB5, 877A RB3);
-- the part stores calibration words in flash (12F629/675 OSCCAL and
-  bandgap) and the tool is not known to preserve them;
-- MCLR is disabled with the internal oscillator, so recovery needs a
+- LVP left on where the PGM pin then needs a pull-down, per part
+  (18F4550 RB5, 877A and 887 RB3, 628A RB4; the 1937 uses a key
+  sequence instead and 12F675 has no LVP);
+- a 12F629/675 flashed with a tool not known to restore the OSCCAL
+  `RETLW` in the last program word, or to keep the factory bandgap bits
+  (BG1:BG0) in the config word;
+- MCLR disabled with the internal oscillator, so recovery needs a
   Vpp-before-Vdd programmer.
 
 None of the beta programmers is LVP-only, so there is no lockout case
@@ -193,10 +213,10 @@ bring-your-own `EPIC8_PK2CMD_PATH` stays available regardless.
 ### D-11: Hardware sign-off gates the beta
 
 The user flashes and runs each board's blink example with each
-programmer that can reach it (K150 and T48 socket: DIP parts; T48 ICSP
-and PICkit: all). A board whose row is green gets `"support":
+programmer whose tool supports the part: T48 and PICkit 3.5 for all
+six, the K150 for 877A, 628A, 12F675 and 4550 (picpro's device list). A board whose row is green gets `"support":
 "hardware"` in its JSON and a row in the support table; the others
-ship as `"simulator"`. All software work in sections 3 and 4 lands
+ship as `"simulator"`. All software work in section 3 lands
 before the hardware arrives, so sign-off is the last step, not a
 blocker mid-way.
 
@@ -216,13 +236,13 @@ dependencies.
 
 | # | Work | Depends on |
 |---|---|---|
-| CC-a | DFP generator emits SFR/bitfield tables and pack-native config aliases; 877A transcribed | |
-| CC-b | Generated device headers and a real `xc.h` (SFRs, bits, `_XTAL_FREQ`, delays, `__interrupt()`); `__EPIC_CC__` replaces the `__XC8` predefine | CC-a |
+| CC-a | DFP generator emits SFR/bitfield tables and pack-native config aliases, for datasheet-tier parts too | |
+| CC-b | Generated device headers and a real `xc.h` (SFRs, bits, `_XTAL_FREQ`, delays), the variadic `__interrupt`, the `__EPIC_CC__` predefine | CC-a |
 | CC-c | `#pragma config` lowering in the driver | CC-a |
 | CC-d | On-disk `include/` in the bundle, exe-relative resolution | |
-| CC-e | Clock consistency checks (`f_cpu` flag, `_XTAL_FREQ`) and the header line | |
+| CC-e | Clock resolution and consistency checks (D-4) and the header line | CC-b, CC-c |
 | CC-f | Internal-error panic hook and `file:line:col` diagnostics | |
-| CC-g | Machine-readable size report the builder can parse | |
+| CC-g | Machine-readable build report: sizes, resolved config fields, clock | |
 | CC-h | Release v0.4.0 carrying all of the above | CC-a..g |
 
 **epic8-tools** (new repo)
@@ -241,8 +261,8 @@ dependencies.
 | P-a | `platform.py`: per-host toolchain, on-demand tool packages | |
 | P-b | Curated boards (ids, `upload.devices.*`, sizes, hazard facts), `boards-experimental/`, generator update | |
 | P-c | Upload layer: `picpro` and `custom` protocols, `erase`/`readback`, `upload_flags` | P-b, T-b..d |
-| P-d | Hazard warnings | P-b |
-| P-e | Size bar, `CPPPATH` for IntelliSense, clock line | CC-h |
+| P-d | Hazard warnings from the build report | P-b, CC-h |
+| P-e | Size bar, `CPPPATH` for IntelliSense (epic-cc toolchain only), `f_cpu` to the clock check | CC-h |
 | P-f | udev rules (PICkit, T48, K150 serial) and per-programmer guides | P-c |
 | P-g | Examples in tutorial style (no HAL) and with the HAL, per beta board | CC-h |
 | P-h | README and getting-started refresh, compatibility table, registry publication of platform, toolchain, framework | all above |
@@ -250,7 +270,8 @@ dependencies.
 **Sign-off:** D-11 matrix on silicon, then the beta announcement.
 
 **Windows phase:** toolchain and tool packages for `windows_amd64`,
-USB driver notes (WinUSB via Zadig for PICkit and T48).
+USB driver notes (the PICkit enumerates as HID and needs none; the
+T48 needs WinUSB via Zadig, to be confirmed on hardware).
 
 ## 4. Open items
 
