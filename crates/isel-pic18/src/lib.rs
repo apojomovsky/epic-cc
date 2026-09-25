@@ -1358,6 +1358,12 @@ impl<'m> Gen<'m> {
         if size == 0 || size > 128 {
             return None;
         }
+        // `W` is a signed offset, so every valid index must fit -128..127.
+        // With 0 <= k <= size <= 128 it does; a negative `k` (a static part
+        // before the array) shifts valid indices up past 127.
+        if (k as i16) < 0 || k > size {
+            return None;
+        }
         // The index must be a plain data value with a slot. Address-valued
         // regs (a stored GEP, epic-cc#468) materialize through `FSR0`,
         // not through a slot, so there is nothing to load `W` from.
