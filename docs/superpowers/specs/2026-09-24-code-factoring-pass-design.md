@@ -55,9 +55,10 @@ the same PR to lock the gain in.
    labels notwithstanding. A run may end in `RETURN`: that is a tail
    candidate.
 5. **Selection:** greedy by gain, `k*W - (k*c + W + 1)` for outlines,
-   `(k-1)*(W - j)` for tails, over non-overlapping sites, with a total
-   order on ties (gain, then first site position) so output is
-   deterministic.
+   `(k-1)*(W - j)` for tails, over non-overlapping sites. Candidates
+   are sorted once (first site's position in its block, then block,
+   then text) and an equal gain keeps the earlier candidate, so output
+   is deterministic.
 6. **Placement:** a body whose sites all sit in one function no larger
    than the reach budget goes right after that function's last
    unconditional `RETURN`/`BRA`/`GOTO`, and its sites use `RCALL`/`BRA`.
@@ -77,13 +78,19 @@ emits `FAST` forms.
 - **Assembler:** out-of-range `RCALL` relaxes to `CALL`, the same
   fixpoint rule that already turns a far `BRA` into `GOTO`. A reach
   heuristic that misjudges costs a word, never correctness.
-- **Depth:** the pass recomputes the return-stack depth on its own
-  output (main chain plus the interrupt chain stacked on top, helpers
-  included) and panics if it exceeds the device stack. The IR-level
-  check cannot see listing-only calls.
-- **Determinism:** candidates are ordered before selection and ties
-  break on listing position, so the same listing always factors the same
-  way; a unit test pins it. The pass is not idempotent (a second run may
+- **Depth:** before selecting anything, the pass computes the return
+  stack from the listing's own call graph (inline asm calls included):
+  the main chain plus the new leaf, plus every interrupt vector's chain
+  stacked on top, since a high handler can preempt a low one. The IR
+  depth is the floor for each, because indirect calls are invisible in
+  the listing. If that exceeds the device stack the pass declines and
+  returns the listing unchanged, never a panic.
+- **Inline asm:** lines between the asm markers are classified by
+  content, not indentation (asm is emitted unindented, often as
+  `label: instr`), and the first instruction after an asm block is
+  treated as a skip successor whatever the block ends with.
+- **Determinism:** the same listing always factors the same way; a unit
+  test pins it. The pass is not idempotent (a second run may
   find repeats a better overlapping pick displaced) and runs once.
 
 ## Tests
