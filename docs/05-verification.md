@@ -15,10 +15,10 @@ random program generator ──► our compiler ──┐
 
 ### 1. XC8 (`xc8-cc`)
 
-**Available, not yet wired.** XC8 v4.00 lives in its own opt-in image,
-`epic-cc-xc8-oracle:local` (`make oracle-image`; [`06-environment.md`](06-environment.md)),
-not in the epic-cc dev image. The differential runner described here is **not built**:
-`docs/13` defers it to phase 6, and no `xc8-cc` invocation exists in this repo. epic-hal's
+**Not in this repo.** XC8 is licence-gated and its benchmark results are confidential
+([ADR-006](03-decisions.md)), so its oracle image and every XC8 comparison live in the
+private epic-benchmarks repository (epic-cc#682). The differential runner described here
+is **not built**: `docs/13` defers it to phase 6, and if it is built it belongs there too. epic-hal's
 `build-cmp` scripts are the only working XC8 users in the family, and they use it for size
 comparison, not correctness differencing.
 

@@ -235,22 +235,12 @@ mechanical rules fails the ritual and blocks the push.
   `xc8-cc` and diff observable behaviour. Its licence forbids more.
   Optimization ideas come from public sources (the XC8 user guide,
   the literature) or our own analysis of our own output, never from
-  mining XC8's listings
-  for its techniques (ADR-006, licence section 7).
-- **XC8 lives in its own opt-in image, not the dev one.** The epic-cc dev
-  image sets `PIC8_XC8_ROOT` but installs nothing there, so `xc8-cc` is
-  `command not found` inside `make exec`. Build the oracle image once and
-  run XC8 through it:
-
-  ```bash
-  make oracle-image    # needs vendor/microchip/installers/xc8-installer.run
-  make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 file.c -o file.p1'
-  ```
-
-  It is a separate image because XC8 is licence-gated and must not ride in
-  an image `release`/`ci` derive from. Never install XC8 on the host. The
-  image's `xc8-cc` wraps the `-mdfp` path callers would otherwise get
-  wrong; details in `docs/06-environment.md`.
+  mining XC8's listings for its techniques (ADR-006, licence section 7).
+- **XC8 is not part of this repo.** Its oracle image and every XC8
+  comparison live in the private epic-benchmarks repository (XC8
+  benchmark results are licence-confidential, ADR-006). The dev image
+  sets `PIC8_XC8_ROOT` but installs nothing there, so `xc8-cc` is
+  `command not found` inside `make exec`. Never install XC8 on the host.
 - **GPL boundary.** `gputils`/`gpasm` and `gpsim` are GPL: invoking
   them as external processes in tests is fine; linking them into the
   compiler is not.

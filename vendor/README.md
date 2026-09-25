@@ -25,17 +25,10 @@ vendor/
 
 Proprietary installers, kept so the environment can be rebuilt on another machine.
 
-- `xc8-installer.run`: the XC8 v4.00 Linux installer (`make oracle-image` reads exactly
-  this name). The upstream filename is
-  `xc8-v4.00-full-install-linux-x64-installer.run`; rename or symlink it to
-  `xc8-installer.run`, or the target exits 2 with a message naming the expected path.
 - MPLAB IPE / MPLAB X installers, if you want flashing tooling reproducible
 
-**Note:** XC8 is never installed on the host and never enters the dev image. It is
-installed *into its own image* at build time from this file (`make oracle-image`), which is
-why the file lives here: licence-gated material that cannot be committed but must be
-rebuildable on another machine. That build also fetches the device family packs from
-Microchip's pack server, so it needs network access.
+XC8 is not used by this repository. Its oracle image and installer live in the private
+epic-benchmarks repository (epic-cc#682); see [ADR-006](../docs/03-decisions.md) for why.
 
 ### `microchip/datasheets/`
 
