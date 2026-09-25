@@ -143,6 +143,57 @@ fn factored_menu_demo_is_smaller_and_behaves_identically() {
     }
 }
 
+fn fixture_listing(name: &str, extra: &[&str]) -> String {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    let out = std::env::temp_dir().join(format!(
+        "outline-{name}-{}-{}.asm",
+        std::process::id(),
+        extra.len()
+    ));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
+    cmd.args(["--target", "18F4550", "--emit", "asm", "-o"])
+        .arg(&out);
+    cmd.args(extra).arg(src);
+    let run = cmd.output().expect("spawn epic-cc");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let text = std::fs::read_to_string(&out).expect("listing");
+    let _ = std::fs::remove_file(&out);
+    text
+}
+
+/// The default layout itself (near `RCALL` bodies between functions, far
+/// `CALL` bodies, tail-merge jumps), unpadded: this program keeps no code
+/// address in RAM, so moving code cannot change a single RAM write.
+#[test]
+fn default_layout_behaves_identically_without_padding() {
+    let plain = fixture_listing("outline_mix.c", &["--no-outline"]);
+    let factored = fixture_listing("outline_mix.c", &[]);
+    for shape in ["RCALL __pa", "    CALL __pa", "GOTO __pa"] {
+        assert!(
+            factored.contains(shape),
+            "fixture no longer exercises {shape}:\n{factored}"
+        );
+    }
+    let w_plain = asm::assemble_pic18(&plain);
+    let w_factored = asm::assemble_pic18(&factored);
+    assert!(w_factored.len() < w_plain.len());
+    let (a, a_halt) = writes(w_plain, 2_000_000, 0);
+    let (b, b_halt) = writes(w_factored, 2_000_000, 0);
+    assert!(a_halt && b_halt, "both runs reach the halt");
+    assert!(
+        a.len() > 1000,
+        "too few writes to mean anything ({})",
+        a.len()
+    );
+    assert_eq!(a, b);
+}
+
 #[test]
 fn driver_factors_by_default() {
     let listing = menu_listing(&[]);
