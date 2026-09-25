@@ -791,10 +791,10 @@ fn flash_words_matches_gputils_for_every_device() {
     }
 }
 
-/// The pack-derived SFR table against gputils' own headers: wherever both
-/// name a register or a single-bit field, the address and bit position must
-/// agree. Names only one side has are legacy or MPASM spellings, not errors,
-/// but most of the header must be found, or the join matched nothing.
+/// The pack-derived SFR table against gputils' own headers: every register
+/// gputils names must be in the table, by name or pack alias, at the same
+/// address, and every single-bit field both name must sit at the same bit.
+/// Bits only one side names are MPASM spellings (`R_NOT_W`), not errors.
 #[test]
 fn sfr_tables_match_gputils_headers() {
     let Some(share) = gputils_share() else {
@@ -812,23 +812,19 @@ fn sfr_tables_match_gputils_headers() {
                 .find(|s| s.name == name || s.aliases.contains(&name))
         };
 
-        let mut found = 0;
         for (name, addr) in &inc.registers {
-            if let Some(s) = find(name) {
-                found += 1;
-                assert_eq!(
-                    s.addr, *addr,
-                    "{}: {name} is at 0x{:04X} in the TOML, 0x{addr:04X} in gputils",
-                    dev.name, s.addr
-                );
-            }
+            let s = find(name).unwrap_or_else(|| {
+                panic!(
+                    "{}: gputils register {name} is not in the sfrs table",
+                    dev.name
+                )
+            });
+            assert_eq!(
+                s.addr, *addr,
+                "{}: {name} is at 0x{:04X} in the TOML, 0x{addr:04X} in gputils",
+                dev.name, s.addr
+            );
         }
-        assert!(
-            found * 10 >= inc.registers.len() * 9,
-            "{}: only {found} of {} gputils registers found in the sfrs table",
-            dev.name,
-            inc.registers.len()
-        );
 
         for (reg, bit, pos) in &inc.bits {
             let Some(s) = find(reg) else { continue };

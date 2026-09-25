@@ -33,7 +33,11 @@ pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
             .iter()
             .find(|v| names_match(v.name, v.aliases, val))
             .unwrap_or_else(|| {
-                let opts: Vec<&str> = field.values.iter().map(|v| v.name).collect();
+                let opts: Vec<&str> = field
+                    .values
+                    .iter()
+                    .flat_map(|v| std::iter::once(v.name).chain(v.aliases.iter().copied()))
+                    .collect();
                 panic!(
                     "device: unknown value '{val}' for field '{}', expected one of {opts:?}",
                     field.name

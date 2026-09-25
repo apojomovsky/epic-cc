@@ -220,9 +220,11 @@ Config fields are matched to the pack by byte and mask, never by name,
 so the run also reports any TOML field or value the pack does not have
 at the same bits: read that list, it is the cross-check between a
 transcribed config and the pack's. `sfr_tables_match_gputils_headers`
-(`crates/device/tests/gputils_crosscheck.rs`) then holds every register
-address and single-bit position that gputils' `header/p<part>.inc` also
-names.
+(`crates/device/tests/gputils_crosscheck.rs`) then requires every
+register gputils' `header/p<part>.inc` names, at the same address, and
+every single-bit position both name. `gen-device.py` rewrites the whole
+file and drops these names (its `--check` ignores them), so rerun
+`device_names.py` after any regeneration.
 
 ## §6. Sign-off
 

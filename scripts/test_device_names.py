@@ -6,8 +6,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 import unittest
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from add_device import parse_toml  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "device_names.py"
@@ -77,7 +79,7 @@ class DeviceNames(unittest.TestCase):
         self.path = self.dir / "psyn02.toml"
         self.path.write_text(TOML)
         self.result = run(self.path)
-        self.data = tomllib.loads(self.path.read_text())
+        self.data = parse_toml(self.path.read_text())
 
     def tearDown(self):
         shutil.rmtree(self.dir)
@@ -104,7 +106,8 @@ class DeviceNames(unittest.TestCase):
         self.assertEqual((fields["RB3"]["mask"], fields["RB3"]["shift"]), (0x08, 3))
         self.assertEqual((fields["HI"]["mask"], fields["HI"]["shift"]), (0x30, 4))
         self.assertEqual((fields["ALT1"]["shift"], fields["ALT1"]["mode"]), (1, 1))
-        self.assertEqual(list(fields).count("RB0"), 1)
+        names = [f["name"] for f in self.sfr("PORTB")["fields"]]
+        self.assertEqual(names.count("RB0"), 1)
 
     def test_register_shapes(self):
         self.assertEqual(self.sfr("PORTB")["aliases"], ["GPIO"])

@@ -18,17 +18,21 @@ the same bits, is reported, which is the cross-check between transcribed
 and pack config data.
 
   python3 scripts/device_names.py p16f877a --atdf <pack>/edc/PIC16F877A.PIC
-  python3 scripts/device_names.py p16f877a --atdf ... --check   # CI drift
+  python3 scripts/device_names.py p16f877a --atdf ... --check   # stale?
 
-Stdlib only (python 3.11+).
+Stdlib only, and runs on the dev container's Python 3.10: it reads TOML
+with add_device.py's subset parser, which is why every value it writes,
+`fields` included, stays on one line.
 """
 
 import argparse
 import pathlib
 import re
 import sys
-import tomllib
 import xml.etree.ElementTree as ET
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from add_device import parse_toml  # noqa: E402
 
 NS = "{http://crownking/edc}"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -100,9 +104,13 @@ def parse_sfrs(root):
             width_bits = num(attr(el, "nzwidth"))
             width = width_bits // 8
             fields = _sfr_fields(el, width_bits) if width == 1 else []
-            legacy = [
-                attr(a, "cname") for a in el.findall(f"{NS}AliasList/{NS}LegacyAlias")
-            ]
+            # Legacy, migration and HI-TECH aliases are all spellings older
+            # code uses (`SPBRG` on the 1937's `SP1BRGL`).
+            alias_list = el.find(NS + "AliasList")
+            legacy = (
+                [] if alias_list is None else [attr(a, "cname") for a in alias_list]
+            )
+            legacy = [a for a in dict.fromkeys(legacy) if a != name]
             out.append(
                 {
                     "name": name,
@@ -146,6 +154,12 @@ def parse_config(root, core, base_byte_addr):
                     if m:
                         bits = num(m.group(2)) << cursor
                         values.setdefault(bits, []).append(attr(sem, "cname"))
+                if word_mask & 0xFF and word_mask >> 8:
+                    print(
+                        f"device_names: pack field {name} straddles the bytes of "
+                        f"0x{addr:X} and is not matched",
+                        file=sys.stderr,
+                    )
                 for lane in (0, 1):
                     mask = (word_mask >> (8 * lane)) & 0xFF
                     if mask and (mask << (8 * lane)) == word_mask:
@@ -214,23 +228,20 @@ def render_sfrs(sfrs):
         out.append(f"width = {s['width']}")
         if s["aliases"]:
             out.append(f"aliases = {_str_list(s['aliases'])}")
-        if not s["fields"]:
-            out.append("fields = []")
-            continue
-        out.append("fields = [")
+        parts = []
         for name, mask, shift, mode in s["fields"]:
             m = f", mode = {mode}" if mode else ""
-            out.append(
-                f'    {{ name = "{name}", mask = 0x{mask:02X}, shift = {shift}{m} }},'
+            parts.append(
+                f'{{ name = "{name}", mask = 0x{mask:02X}, shift = {shift}{m} }}'
             )
-        out.append("]")
+        out.append("fields = [" + ", ".join(parts) + "]")
     return out
 
 
 def rewrite(text, toml, aliases, sfrs):
-    """Strip what this script owns (`aliases` lines, alias-bearing value
-    lines, the `[[sfrs]]` tail) and write it back fresh, so a rerun is
-    idempotent and `--check` is a plain text comparison."""
+    """Strip what this script owns (`aliases` lines and value lines inside
+    `[[config.fields]]` blocks, the `[[sfrs]]` tail) and write it back fresh,
+    so a rerun is idempotent and `--check` is a plain text comparison."""
     lines = text.split("\n")
     sfr_at = next((i for i, ln in enumerate(lines) if ln == "[[sfrs]]"), None)
     if sfr_at is not None:
@@ -240,21 +251,23 @@ def rewrite(text, toml, aliases, sfrs):
     fields = toml["config"].get("fields", [])
     out = []
     k = -1
+    in_field = False
+    anchored = set()
     for ln in lines:
-        if ln == "[[config.fields]]":
-            k += 1
-        elif k >= 0 and ln.startswith("aliases = "):
+        if ln.startswith("["):
+            in_field = ln == "[[config.fields]]"
+            k += in_field
+        elif in_field and ln.startswith("aliases = "):
             continue
-        elif k >= 0 and ln.startswith("values = ["):
+        elif in_field and ln.startswith("values = ["):
             ln = render_values(fields[k]["values"], aliases[k][1])
         out.append(ln)
-        if (
-            k >= 0
-            and ln.startswith("name = ")
-            and out[-2] == "[[config.fields]]"
-            and aliases[k][0]
-        ):
-            out.append(f"aliases = {_str_list(aliases[k][0])}")
+        if in_field and ln.startswith("name = ") and k not in anchored:
+            anchored.add(k)
+            if aliases[k][0]:
+                out.append(f"aliases = {_str_list(aliases[k][0])}")
+    if anchored != set(range(len(fields))):
+        sys.exit("device_names: a [[config.fields]] block has no name line")
     out.extend(render_sfrs(sfrs))
     return "\n".join(out) + "\n"
 
@@ -279,14 +292,16 @@ def main():
 
     path = args.toml or ROOT / "crates" / "device" / "devices" / f"{args.device}.toml"
     text = path.read_text()
-    toml = tomllib.loads(text)
+    # Only the part this script does not own is read back, so a table
+    # written in an older layout never has to parse.
+    toml = parse_toml(text.split("\n[[sfrs]]\n", 1)[0])
     root = ET.parse(args.atdf).getroot()
     pack = parse_config(root, toml["core"], toml["config"]["base_byte_addr"])
     aliases, problems = config_aliases(toml, pack)
     for p in problems:
         print(f"device_names: {args.device}: {p}", file=sys.stderr)
     new = rewrite(text, toml, aliases, parse_sfrs(root))
-    tomllib.loads(new)
+    parse_toml(new)
     if args.check:
         if new != text:
             print(
