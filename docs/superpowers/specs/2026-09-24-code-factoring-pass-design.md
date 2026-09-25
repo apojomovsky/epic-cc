@@ -44,7 +44,9 @@ the same PR to lock the gain in.
    STKPTR, TOSL/H/U.
 3. **Excluded regions:** inline-assembly regions (`; --- asm start/end
    ---`), naked functions, the vector region, and every function
-   reachable from an interrupt vector (latency). Roots are the code at
+   reachable from an interrupt vector (latency), and the runtime helpers
+   (`__`-prefixed routines other than `__start`), which are the inner
+   loops of multiply, divide and float. Roots are the code at
    `org 0x0008`/`0x0018`, or the `GOTO` target of a vector stub in
    priority mode.
 4. **Candidates:** runs of 2 or more eligible instructions inside one
@@ -79,14 +81,15 @@ emits `FAST` forms.
   output (main chain plus the interrupt chain stacked on top, helpers
   included) and panics if it exceeds the device stack. The IR-level
   check cannot see listing-only calls.
-- **Idempotence:** running the pass on its own output selects nothing
-  new of positive gain; a unit test pins it.
+- **Determinism:** candidates are ordered before selection and ties
+  break on listing position, so the same listing always factors the same
+  way; a unit test pins it. The pass is not idempotent (a second run may
+  find repeats a better overlapping pick displaced) and runs once.
 
 ## Tests
 
 - Unit (crate): each eligibility and exclusion rule on micro-listings,
-  skip successors across labels, placement next to `org`, tie-order
-  determinism, idempotence.
+  skip successors across labels, placement next to `org`, determinism.
 - **Differential e2e** (the spike's method): compile the menu demo
   with and without the pass, build the layout-preserving twin (sites
   padded with `NOP`s, bodies at the end), and compare the ordered RAM
@@ -94,7 +97,9 @@ emits `FAST` forms.
   Plus small programs aimed at tail merges and skip successors.
 - The existing PIC18 e2e suite and the fuzz gate run through the pass
   by default.
-- `size_baseline.toml` refreshed to the new numbers.
+- `size_baseline.toml` refreshed to the new numbers, and the SDCC-parity
+  cycle ratios re-baselined: size over cycles is the owner's call
+  (ADR-042 records the measured alternatives).
 
 ## Rejected alternatives
 
