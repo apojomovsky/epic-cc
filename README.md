@@ -149,6 +149,11 @@ flowchart LR
     ISEL --> BK["banking"] --> PH["peephole"] --> ASM["asm"] --> HEX[".hex"]
 ```
 
+That is the PIC14-family path. PIC18 goes from `isel-pic18` through
+`outline`, which shares repeated instruction runs as subroutines
+(about 12% smaller flash on the menu demo; `--no-outline` opts out),
+straight to `asm`.
+
 Three decisions shape everything:
 
 - **clang out-of-process, not an LLVM backend.** We parse clang's `.ll` text

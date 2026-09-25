@@ -383,6 +383,16 @@ class CategorizationTest(unittest.TestCase):
         )
         self.assertNotIn("runtime-routine", words_by_category(startup))
 
+    def test_shared_code_bodies_and_sites(self):
+        listing = PIC18_HEADER + (
+            "f:\n    RCALL __pa0\n    CALL __pa0\n    BRA __pa1\n    RETURN\n"
+            "__pa0:\n    MOVWF 0x010,B\n    RETURN\n"
+            "__pa1:\n    CLRF 0x011,B\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["shared-code"], 1 + 2 + 1 + 4)
+        self.assertNotIn("runtime-routine", cats)
+
     def test_bool_materialization_diamond(self):
         # The arms are `tmp<n>` labels, as the backend emits them: a
         # diamond split by two ordinary labels would be two functions.

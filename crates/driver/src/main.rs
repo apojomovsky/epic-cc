@@ -6,8 +6,9 @@
 //! onward, the pipeline branches on `device.core`: PIC14 and PIC14E run
 //! `isel`/`isel-pic14e` -> `schedule` -> `banking` -> `peephole` ->
 //! page-fit verification -> `asm` (banking emits `MOVLB`/`BSR` on PIC14E,
-//! RP-bit `BANKSEL` on classic PIC14); PIC18 runs `isel-pic18` -> `asm`
-//! directly (no banking/peephole/paging).
+//! RP-bit `BANKSEL` on classic PIC14); PIC18 runs `isel-pic18` ->
+//! `outline` (code factoring, `--no-outline` skips it) -> `asm` (no
+//! banking/peephole/paging).
 //!
 //! Multiple `.c` inputs are each run through clang separately, then merged
 //! with `llvm-link` before `irparse` ever sees them (docs/31 §7): the
@@ -434,6 +435,19 @@ fn main() {
             } else {
                 isel_pic14e::verify_page_fit(&m, &asm);
             }
+            asm
+        }
+        // Code factoring shares repeated runs as leaf bodies; its own
+        // budget check adds one return level to the IR depth, so it backs
+        // off rather than overflow the stack (docs/44, epic-cc#662).
+        device::Core::Pic18 if cli.outline => {
+            let opts = outline::Options {
+                stack_depth: device.stack_depth as usize,
+                ir_depth: cg.max_depth,
+                ..outline::Options::default()
+            };
+            let (asm, l) = outline::factor_with_locs(&asm, &locs, &opts);
+            locs = l;
             asm
         }
         device::Core::Pic18 => asm,

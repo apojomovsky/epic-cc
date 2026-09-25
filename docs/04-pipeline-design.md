@@ -21,6 +21,11 @@
 | 9 | `peephole` | pattern-driven cleanup |
 | 10 | `asm` | instructions → `.hex` + `.lst` + `.map` |
 
+PIC18 skips `banking` and `peephole` (its encoder carries the access and
+BSR bits itself) and instead runs `outline` between `isel-pic18` and
+`asm`: repeated instruction runs become shared subroutines, listing in and
+listing out ([ADR-042](adr/ADR-042-pic18-code-factoring.md)).
+
 ### Why every boundary is text
 
 Every arrow is a snapshottable, diffable artifact. When the agent hits a miscompile, it

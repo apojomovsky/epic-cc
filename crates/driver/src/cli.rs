@@ -25,6 +25,8 @@ pub struct Cli {
     pub line_table: Option<String>,
     pub var_table: Option<String>,
     pub sidecar: Option<String>,
+    /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
+    pub outline: bool,
 }
 
 pub const USAGE: &str = "\
@@ -43,6 +45,9 @@ usage: epic-cc [options] <input.c>...
                        (one `file:line:col <addr>` record per word)
   -v                   echo the clang and llvm-link commands
   --sidecar <file>     write the ELF+DWARF sidecar for gdb into <file>
+  --no-outline         PIC18: keep repeated code inline instead of sharing it
+                       (smaller flash by default; opt out for timing-critical
+                       code or stepping through inline copies)
   --var-table <file>   write the typed variable table into <file>
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
@@ -66,6 +71,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut line_table = None;
     let mut var_table = None;
     let mut sidecar = None;
+    let mut outline = true;
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -130,6 +136,8 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
             );
         } else if a == "-v" {
             verbose = true;
+        } else if a == "--no-outline" {
+            outline = false;
         } else if a == "--sidecar" {
             i += 1;
             sidecar = Some(
@@ -169,5 +177,6 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         verbose,
         map,
         line_table,
+        outline,
     })
 }
