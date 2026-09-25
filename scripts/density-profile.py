@@ -380,7 +380,7 @@ SKIP_TEST = {"BTFSC", "BTFSS"}
 COMPARE_ALU = {"SUBWF", "XORWF", "SUBWFB", "ADDWF", "IORWF", "ANDWF", "MOVF", "CPFSEQ"}
 LITERAL_LOAD = {"MOVLW", "SUBLW", "XORLW"}
 LANE_ALU = {"ADDWF", "ADDWFC", "SUBWF", "SUBWFB", "XORWF", "IORWF", "ANDWF"}
-ROTATE = {"RLCF", "RRCF", "RLNCF", "RRNCF", "RLF", "RRF"}
+ROTATE = {"RLCF", "RRCF", "RLNCF", "RRNCF", "RLF", "RRF", "RLF", "RRF"}
 
 # STATUS is file 0x03 on PIC14 and 0xFD8 on PIC18, and each family's other
 # address is an ordinary GPR, so these patterns are not interchangeable:
@@ -858,6 +858,201 @@ def match_bank_switch(items, i, cfg):
     return 1 if is_bank_switch(items[i], cfg.family) else 0
 
 
+_CALL_OPS = frozenset({"CALL", "RCALL"})
+
+
+def match_call_sequence(items, i, cfg):
+    """A call instruction. Argument setup stays wherever it was
+    (struct copies, single moves); the call word itself is the sink
+    this names. Shared outlined calls are claimed earlier."""
+    del cfg
+    return 1 if items[i].mnemonic in _CALL_OPS else 0
+
+
+_BRANCH_OPS = frozenset({"BRA", "GOTO", "RETURN", "RETFIE"})
+
+
+def match_branch(items, i, cfg):
+    """An unconditional jump or function exit left over after the
+    jump-table rule took its dispatches: loop latches and join
+    trampolines."""
+    del cfg
+    return 1 if items[i].mnemonic in _BRANCH_OPS else 0
+
+
+_COMPARE_BRANCH_OPS = frozenset(
+    {
+        "BNZ",
+        "BZ",
+        "BC",
+        "BNC",
+        "BN",
+        "BNN",
+        "BNOV",
+        "BOV",
+        "BG",
+        "BGE",
+        "BL",
+        "BLE",
+        "BTFSS",
+        "BTFSC",
+    }
+)
+
+
+def match_cond_branch(items, i, cfg):
+    """A condition test left over after the compare-chain,
+    jump-table, wide-compare, and bool-materialization rules took
+    theirs: flag tests and bit-test skips feeding short branches."""
+    del cfg
+    return 1 if items[i].mnemonic in _COMPARE_BRANCH_OPS else 0
+
+
+# PIC18 indirect-register file addresses (full 12-bit) named by our own
+# backend: FSR0/FSR1 pairs, their INDF/POSTINC/POSTDEC/PREINC/PLUSW
+# pseudos, and the TBLPTR triple plus TABLAT. The single-byte emitters
+# spell these as access-bank aliases (`ADDWF 0x0E9,F,A` for FSR0L), so
+# both forms match.
+_FSR_REGS = frozenset(
+    {
+        0xFE9,
+        0xFEA,
+        0xFE1,
+        0xFE2,
+        0xFEB,
+        0xFEC,
+        0xFED,
+        0xFEE,
+        0xFEF,
+        0xFE3,
+        0xFE4,
+        0xFE5,
+        0xFE6,
+        0xFE7,
+    }
+)
+_FLASH_REGS = frozenset({0xFF3, 0xFF4, 0xFF5, 0xFF6, 0xFF7, 0xFF8})
+
+
+def _reg_operand_addresses(item):
+    """Every numeric operand that names a file register, resolving the
+    access-bank alias (`0xE9` with `,A` addresses `0xFE9`)."""
+    found = []
+    accesses_bank = ",A" in item.operands.upper().replace(" ", "")
+    for tok in item.operands.split(","):
+        v = _parse_int(tok)
+        if v is None:
+            continue
+        if v >= 0xF00:
+            found.append(v & 0xFFF)
+        elif accesses_bank and v >= 0x80:
+            found.append(0xF00 | v)
+    return found
+
+
+def match_indirect_access(items, i, cfg):
+    """Pointer traffic: `LFSR` seeds plus any instruction touching an
+    FSR register. The 16-bit FSR adds (`ADDWF`/`ADDWFC` onto `FSR0L/H`)
+    that #665 replaces with `PLUSW0` live here, which is what makes
+    the bucket worth watching across that change."""
+    if items[i].mnemonic == "LFSR":
+        return 1
+    if cfg.family != "pic18":
+        return 0
+    return 1 if any(a in _FSR_REGS for a in _reg_operand_addresses(items[i])) else 0
+
+
+def match_flash_access(items, i, cfg):
+    """Program-memory reads: `TBLRD*` and the `TBLPTR`/`TABLAT` setup
+    around them. Const-table dirges that are not outlined bodies."""
+    if items[i].mnemonic in (
+        "TBLRD",
+        "TBLRD*",
+        "TBLRD*+",
+        "TBLRD*-",
+        "TBLWT",
+        "TBLWT*",
+        "TBLWT*+",
+        "TBLWT*-",
+    ):
+        return 1
+    if cfg.family != "pic18":
+        return 0
+    return 1 if any(a in _FLASH_REGS for a in _reg_operand_addresses(items[i])) else 0
+
+
+def match_slot_copy(items, i, cfg):
+    """One `MOVFF` outside a run: return values, merge-point copies,
+    and temporaries (the copy-coalescing surface from #664). Runs
+    belong to struct-copy, SFR runs to context-save, both earlier."""
+    del cfg
+    return 1 if items[i].mnemonic == "MOVFF" else 0
+
+
+def match_literal_load(items, i, cfg):
+    """One `MOVLW`: literal staging left over after the wide lanes
+    took theirs."""
+    del cfg
+    return 1 if items[i].mnemonic == "MOVLW" else 0
+
+
+_DATA_MOVE_OPS = frozenset({"MOVF", "MOVWF", "CLRF", "SETF"})
+
+
+def match_data_move(items, i, cfg):
+    """One single-byte load, store, or clear. Flag-setting loads
+    (`MOVF` sets Z) share the bucket with plain stores; the profiler
+    counts words, not flag discipline."""
+    del cfg
+    return 1 if items[i].mnemonic in _DATA_MOVE_OPS else 0
+
+
+_SCALAR_ALU_OPS = frozenset(
+    {
+        "ADDWF",
+        "ADDWFC",
+        "ADDLW",
+        "SUBWF",
+        "SUBWFB",
+        "SUBFWB",
+        "SUBLW",
+        "ANDWF",
+        "ANDLW",
+        "IORWF",
+        "IORLW",
+        "XORWF",
+        "XORLW",
+        "INCF",
+        "DECF",
+        "INFSNZ",
+        "DCFSNZ",
+        "INCFSZ",
+        "DECFSZ",
+        "COMF",
+        "NEGF",
+        "SWAPF",
+        "RLCF",
+        "RRCF",
+        "RLNCF",
+        "RRNCF",
+        "RLF",
+        "RRF",
+        "BCF",
+        "BSF",
+        "MULLW",
+    }
+)
+
+
+def match_scalar_alu(items, i, cfg):
+    """One scalar ALU, bit, or rotate op left over after the wide
+    lanes, shift chains, and compare cascades took theirs: the actual
+    computation, as small as it is. Bank-bit pokes claimed by the
+    bank-switch rule never reach here."""
+    del cfg
+    return 1 if items[i].mnemonic in _SCALAR_ALU_OPS else 0
+
+
 @dataclasses.dataclass(frozen=True)
 class Rule:
     name: str
@@ -883,12 +1078,22 @@ SINK_RULES = (
     Rule("wide-literal-arith", match_wide_literal_arith),
     Rule("zero-init-pair", match_zero_init),
     Rule("bank-switch", match_bank_switch),
+    Rule("call-sequence", match_call_sequence),
+    Rule("branch", match_branch),
+    Rule("cond-branch", match_cond_branch),
+    Rule("indirect-access", match_indirect_access),
+    Rule("flash-access", match_flash_access),
+    Rule("slot-copy", match_slot_copy),
+    Rule("literal-load", match_literal_load),
+    Rule("data-move", match_data_move),
+    Rule("scalar-alu", match_scalar_alu),
 )
 
 
 def categorize(items, cfg=None):
     """Stamp `item.category` on every instruction item, in place."""
     cfg = cfg or Config()
+
     i = 0
     while i < len(items):
         item = items[i]

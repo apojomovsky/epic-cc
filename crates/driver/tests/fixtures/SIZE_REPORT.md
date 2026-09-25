@@ -3,7 +3,7 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-09-25
-- Commit: c7a493e
+- Commit: 2c249bf
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
 - Menu-demo listing: 9585 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
@@ -62,14 +62,14 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `other`: 4799 (50.1%)
 - `shared-code`: 1427 (14.9%)
 - `struct-copy-movff`: 1342 (14.0%)
-- `wide-literal-arith`: 465 (4.9%)
-- `const-data`: 356 (3.7%)
-- `wide-const-materialization`: 262 (2.7%)
-- `runtime-routine`: 236 (2.5%)
-- `switch-jump-table`: 212 (2.2%)
+- `data-move`: 1330 (13.9%)
+- `branch`: 777 (8.1%)
+- `scalar-alu`: 535 (5.6%)
+- `cond-branch`: 533 (5.6%)
+- `literal-load`: 478 (5.0%)
+- `slot-copy`: 472 (4.9%)
 
 ## Regenerating
 
