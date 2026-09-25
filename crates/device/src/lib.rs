@@ -5,7 +5,7 @@
 //! them).
 
 mod config;
-pub use config::resolve_config;
+pub use config::{resolve_config, try_resolve_config};
 
 pub mod gputils;
 

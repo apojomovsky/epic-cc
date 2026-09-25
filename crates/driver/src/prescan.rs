@@ -3,6 +3,38 @@
 //! from the start (docs/31 §10). Comment- and string-literal-aware so a
 //! fuse string or a stray comment cannot make it misfire.
 
+use super::diag;
+
+/// One `EPIC_CONFIG("...")` hit with its source site, so config errors can
+/// point at it as `file:line:col`.
+pub struct FoundConfig {
+    /// The quoted argument.
+    pub spec: String,
+    /// The input file holding it.
+    pub file: String,
+    /// 1-based line and column of the `EPIC_CONFIG` token.
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Scan every source file's raw text for top-level `EPIC_CONFIG("...")`
+/// invocations, skipping `//` and `/* */` comments and `"..."` string
+/// literals along the way.
+pub fn find_epic_configs(sources: &[(String, String)]) -> Vec<FoundConfig> {
+    let mut out = Vec::new();
+    for (file, text) in sources {
+        for (spec, line, col) in find_in_one_file(text) {
+            out.push(FoundConfig {
+                spec,
+                file: file.clone(),
+                line,
+                col,
+            });
+        }
+    }
+    out
+}
+
 /// Scan every source file's raw text for exactly one top-level
 /// `EPIC_CONFIG("...")` invocation, skipping `//` and `/* */` comments and
 /// `"..."` string literals along the way. Returns the quoted argument, or
@@ -11,22 +43,41 @@
 /// Panics if more than one invocation is found across all files: this
 /// supports exactly one, unconditional, per docs/31 §10.
 pub fn find_epic_config(sources: &[(String, String)]) -> Option<String> {
-    let mut found: Option<(String, String)> = None; // (file, spec)
-    for (file, text) in sources {
-        for spec in find_in_one_file(text) {
-            if let Some((prev_file, _)) = &found {
-                panic!(
-                    "epic-cc: more than one EPIC_CONFIG(...) invocation found \
-                     ({prev_file} and {file}); exactly one is supported"
-                );
-            }
-            found = Some((file.clone(), spec));
-        }
+    let found = find_epic_configs(sources);
+    if found.len() > 1 {
+        let first = &found[0];
+        let second = &found[1];
+        panic!(
+            "{}more than one EPIC_CONFIG(...) invocation found \
+             ({}:{}:{} and {}:{}:{}); exactly one is supported",
+            diag::USER_PREFIX,
+            first.file,
+            first.line,
+            first.col,
+            second.file,
+            second.line,
+            second.col,
+        );
     }
-    found.map(|(_, spec)| spec)
+    found.into_iter().next().map(|f| f.spec)
 }
 
-fn find_in_one_file(text: &str) -> Vec<String> {
+/// Line and column (both 1-based) of byte offset `idx` in `text`.
+fn line_col(text: &str, idx: usize) -> (u32, u32) {
+    let mut line = 1u32;
+    let mut col = 1u32;
+    for &b in text.as_bytes().iter().take(idx) {
+        if b == b'\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+fn find_in_one_file(text: &str) -> Vec<(String, u32, u32)> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
@@ -67,7 +118,8 @@ fn find_in_one_file(text: &str) -> Vec<String> {
                 let rest = rest.trim_start();
                 if let Some(rest) = rest.strip_prefix('"') {
                     if let Some(end) = rest.find('"') {
-                        out.push(rest[..end].to_string());
+                        let (line, col) = line_col(text, i);
+                        out.push((rest[..end].to_string(), line, col));
                         i += "EPIC_CONFIG".len();
                         continue;
                     }
