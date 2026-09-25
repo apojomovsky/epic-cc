@@ -20,6 +20,23 @@ fn resolves_a_representative_override_and_matches_hand_computation() {
 }
 
 #[test]
+fn pack_names_resolve_like_the_normalized_ones() {
+    // The spellings `#pragma config` uses (DS39582C Register 14-1 names),
+    // matched to fields by bit position when the TOML was annotated.
+    let pack = resolve_config(
+        &PIC16F877A.config,
+        "FOSC=XT, WDTE=OFF, PWRTE=ON, BOREN=ON, LVP=OFF, CPD=OFF, WRT=OFF, DEBUG=OFF, CP=OFF",
+    );
+    assert_eq!(pack, vec![0x71, 0x3F]);
+}
+
+#[test]
+fn a_pack_value_alias_resolves() {
+    let pack = resolve_config(&PIC16F877A.config, "FOSC=EXTRC");
+    assert_eq!(pack, resolve_config(&PIC16F877A.config, "osc=rc"));
+}
+
+#[test]
 #[should_panic(expected = "field 'osc' has no default")]
 fn panics_when_the_required_oscillator_field_is_missing() {
     resolve_config(&PIC16F877A.config, "wdt=off");

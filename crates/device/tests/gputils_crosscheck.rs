@@ -790,3 +790,55 @@ fn flash_words_matches_gputils_for_every_device() {
         );
     }
 }
+
+/// The pack-derived SFR table against gputils' own headers: every register
+/// gputils names must be in the table, by name or pack alias, at the same
+/// address, and every single-bit field both name must sit at the same bit.
+/// Bits only one side names are MPASM spellings (`R_NOT_W`), not errors.
+#[test]
+fn sfr_tables_match_gputils_headers() {
+    let Some(share) = gputils_share() else {
+        return;
+    };
+    for dev in device::ALL.iter().filter(|d| !d.sfrs.is_empty()) {
+        let stem = dev.name.strip_prefix('p').unwrap_or(dev.name);
+        let path = share.join("header").join(format!("p{stem}.inc"));
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: cannot read {}: {e}", dev.name, path.display()));
+        let inc = device::gputils::names_from_inc(&text);
+        let find = |name: &str| {
+            dev.sfrs
+                .iter()
+                .find(|s| s.name == name || s.aliases.contains(&name))
+        };
+
+        for (name, addr) in &inc.registers {
+            let s = find(name).unwrap_or_else(|| {
+                panic!(
+                    "{}: gputils register {name} is not in the sfrs table",
+                    dev.name
+                )
+            });
+            assert_eq!(
+                s.addr, *addr,
+                "{}: {name} is at 0x{:04X} in the TOML, 0x{addr:04X} in gputils",
+                dev.name, s.addr
+            );
+        }
+
+        for (reg, bit, pos) in &inc.bits {
+            let Some(s) = find(reg) else { continue };
+            let field = s
+                .fields
+                .iter()
+                .find(|f| f.name == bit && f.mask.count_ones() == 1);
+            if let Some(f) = field {
+                assert_eq!(
+                    f.shift, *pos,
+                    "{}: {reg}.{bit} is bit {} in the TOML, bit {pos} in gputils",
+                    dev.name, f.shift
+                );
+            }
+        }
+    }
+}

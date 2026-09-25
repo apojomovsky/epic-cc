@@ -162,3 +162,60 @@ ACCESSBANK NAME=accesssfr  START=0xF60             END=0xFFF          PROTECTED
         assert_eq!(ram.banks, vec![(0x60, 0xFF)], "gpre is the dead arm");
     }
 }
+
+/// Register and bit names an MPASM-style gputils `.inc` header declares.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct IncNames {
+    /// `(name, address)` from the "Register Files" section.
+    pub registers: Vec<(String, u16)>,
+    /// `(register, bit, position)` from each "<REG> Bits" section.
+    pub bits: Vec<(String, String, u8)>,
+}
+
+/// Reads a gputils `header/p<part>.inc`. Sections open with a
+/// `;----- Title ---` rule; bank sub-rules (`;-----Bank0---`) stay inside
+/// "Register Files", and a section that is neither registers nor bits
+/// (configuration, RAM) is skipped.
+pub fn names_from_inc(text: &str) -> IncNames {
+    enum Section {
+        Registers,
+        Bits(String),
+        Other,
+    }
+    let mut out = IncNames::default();
+    let mut section = Section::Other;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rule) = line.strip_prefix(";-----") {
+            let title = rule.trim_matches(|c: char| c == '-' || c.is_whitespace());
+            if title.starts_with("Bank") {
+                continue;
+            }
+            section = if title == "Register Files" {
+                Section::Registers
+            } else if let Some(reg) = title.strip_suffix(" Bits") {
+                Section::Bits(reg.to_string())
+            } else {
+                Section::Other
+            };
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let (Some(name), Some("EQU"), Some(value)) = (words.next(), words.next(), words.next())
+        else {
+            continue;
+        };
+        let Some(hex) = value.strip_prefix("H'").and_then(|v| v.strip_suffix('\'')) else {
+            continue;
+        };
+        let Ok(value) = u16::from_str_radix(hex, 16) else {
+            continue;
+        };
+        match &section {
+            Section::Registers => out.registers.push((name.to_string(), value)),
+            Section::Bits(reg) => out.bits.push((reg.clone(), name.to_string(), value as u8)),
+            Section::Other => {}
+        }
+    }
+    out
+}

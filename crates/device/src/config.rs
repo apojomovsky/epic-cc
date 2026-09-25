@@ -5,7 +5,8 @@ use crate::ConfigRegion;
 
 /// Resolve a comma-separated `key=value, key=value` spec against `region`,
 /// starting from `region.erased_baseline` and applying each mentioned
-/// field, each unmentioned field's default, in that order.
+/// field, each unmentioned field's default, in that order. A field or value
+/// may be named by any of its pack aliases (`FOSC=HS`), ignoring case.
 ///
 /// Panics if: a required field (`default: None`) is never mentioned; a
 /// mentioned field name does not exist in `region`; a mentioned value name
@@ -24,11 +25,27 @@ pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
         let field = region
             .fields
             .iter()
-            .find(|f| f.name.eq_ignore_ascii_case(key))
+            .find(|f| names_match(f.name, f.aliases, key))
             .unwrap_or_else(|| panic!("device: unknown field '{key}' in EPIC_CONFIG"));
 
+        let fv = field
+            .values
+            .iter()
+            .find(|v| names_match(v.name, v.aliases, val))
+            .unwrap_or_else(|| {
+                let opts: Vec<&str> = field
+                    .values
+                    .iter()
+                    .flat_map(|v| std::iter::once(v.name).chain(v.aliases.iter().copied()))
+                    .collect();
+                panic!(
+                    "device: unknown value '{val}' for field '{}', expected one of {opts:?}",
+                    field.name
+                )
+            });
+
         if let Some(only) = field.locked {
-            if !val.eq_ignore_ascii_case(only) {
+            if !fv.name.eq_ignore_ascii_case(only) {
                 panic!(
                     "device: field '{}' is locked to {only:?} (epic-cc's backend cannot honor \
                      other values); got {val:?}",
@@ -36,18 +53,6 @@ pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
                 );
             }
         }
-
-        let fv = field
-            .values
-            .iter()
-            .find(|v| v.name.eq_ignore_ascii_case(val))
-            .unwrap_or_else(|| {
-                let opts: Vec<&str> = field.values.iter().map(|v| v.name).collect();
-                panic!(
-                    "device: unknown value '{val}' for field '{}', expected one of {opts:?}",
-                    field.name
-                )
-            });
 
         apply(&mut bytes, field, fv.bits);
         seen.insert(field.name);
@@ -74,6 +79,10 @@ pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
     }
 
     bytes
+}
+
+fn names_match(name: &str, aliases: &[&str], given: &str) -> bool {
+    name.eq_ignore_ascii_case(given) || aliases.iter().any(|a| a.eq_ignore_ascii_case(given))
 }
 
 fn apply(bytes: &mut [u8], field: &crate::FuseField, bits: u8) {

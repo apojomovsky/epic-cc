@@ -1443,6 +1443,14 @@ def strip_provenance_block(text: str) -> str:
     return "\n\n".join(blocks) + "\n"
 
 
+def strip_names(text: str) -> str:
+    # The pack names scripts/device_names.py adds (config aliases, the
+    # [[sfrs]] tail) are not this generator's output, so --check ignores them.
+    text = text.split("\n\n[[sfrs]]\n", 1)[0].rstrip("\n") + "\n"
+    text = re.sub(r"^aliases = \[.*\]\n", "", text, flags=re.M)
+    return re.sub(r", aliases = \[[^\]]*\]", "", text)
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="DFP/ATDF -> TOML generator for epic-cc device registry"
@@ -1585,7 +1593,7 @@ def main():
             print(toml_content)
             sys.exit(1)
         existing = out_path.read_text()
-        existing_cmp = strip_provenance_block(existing)
+        existing_cmp = strip_provenance_block(strip_names(existing))
         generated_cmp = strip_provenance_block(toml_content)
         if existing_cmp != generated_cmp:
             print(
@@ -1605,8 +1613,14 @@ def main():
         print(f"gen-device --check: {out_path} ok")
         sys.exit(0)
     else:
+        had_names = out_path.exists() and "[[sfrs]]" in out_path.read_text()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(toml_content)
+        if had_names:
+            print(
+                f"gen-device: {out_path} lost its pack names; rerun scripts/device_names.py",
+                file=sys.stderr,
+            )
         print(f"gen-device: wrote {out_path} from {ini or edc} + {cfg}")
 
 
