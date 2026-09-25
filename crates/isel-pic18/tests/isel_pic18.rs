@@ -3009,6 +3009,84 @@ fn a_byte_index_store_moves_through_plusw0() {
 }
 
 #[test]
+fn branch_on_computed_byte_skips_the_reload() {
+    // `if (a & 3)`: the `ANDWF,W` already sets `Z` from the result
+    // byte, and the `MOVWF` into the result slot preserves it, so the
+    // branch needs no `MOVF` reload. Simulated over the full byte
+    // domain so a polarity inversion fails loudly. (epic-cc#668)
+    let m = parse("global a i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = and i8 %1, 3\n    br i1 %2 t f\n  block t:\n    store i8 1 @out\n    ret void\n  block f:\n    store i8 2 @out\n    ret void\n");
+    let addrs = addrs(&[
+        ("a", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert!(
+        !main_asm
+            .lines()
+            .any(|l| l.trim_start().starts_with("MOVF ")),
+        "no reload may remain between the compute and the branch:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..=u8::MAX {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = x;
+        p.run(200);
+        assert!(p.halted());
+        assert_eq!(
+            p.ram()[0x11],
+            if x & 3 == 0 { 2 } else { 1 },
+            "branch on (a & 3) with a={x}"
+        );
+    }
+}
+
+#[test]
+fn staged_copies_before_the_branch_keep_the_reload() {
+    // `c = a & 3; v = src; if (c) dst = v`: the 8-byte load is staged, not yet
+    // emitted, when the branch is lowered, so the last emitted lines still
+    // read `ANDWF,W` + `MOVWF c`. The copy then drains ahead of the `BZ`;
+    // the reload keeps the branch independent of the drain's flag effects.
+    let m = parse("global a i8\nglobal out i8\nglobal src i64\nglobal dst i64\nfn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = and i8 %1, 3\n    %3 = load i64 @src\n    br i1 %2 t f\n  block t:\n    store i64 %3 @dst\n    store i8 1 @out\n    ret void\n  block f:\n    store i64 %3 @dst\n    store i8 2 @out\n    ret void\n");
+    let addrs = addrs(&[
+        ("a", 0x10),
+        ("out", 0x11),
+        ("main::1", 0x12),
+        ("main::2", 0x13),
+        ("src", 0x20),
+        ("dst", 0x28),
+        ("main::3", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    let bz = main_asm.find("BZ ").expect("a BZ");
+    assert!(
+        main_asm[..bz].trim_end().ends_with("MOVF 0x013,W,A"),
+        "the drained copy sits between the compute and the branch, so the reload must stay:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for x in 0..=u8::MAX {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        p.ram_mut()[0x10] = x;
+        for b in 0..8u8 {
+            p.ram_mut()[0x20 + b as usize] = b + 1;
+        }
+        p.run(400);
+        assert!(p.halted());
+        assert_eq!(
+            p.ram()[0x11],
+            if x & 3 == 0 { 2 } else { 1 },
+            "branch on (a & 3) with a={x} after a staged copy:\n{asm}"
+        );
+        assert_eq!(p.ram()[0x28..0x30], [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+}
+
+#[test]
 fn a_scale_2_dynamic_index_scales_through_mulwf() {
     // `ram16[i]` with element width 2: the offset is 2*i. A scale-2 term
     // takes the MULWF form (6 words) over the two unrolled

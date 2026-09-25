@@ -255,6 +255,90 @@ impl<'m> Gen<'m> {
         // which is exactly the flag a following `BZ` wants.
         self.mark_w(addr);
     }
+    /// Whether a `MOVF slot,W` reload for a branch can be skipped: the
+    /// two previous lines are a Z-setting ALU op into `W` and a
+    /// flag-neutral `MOVWF` of that same slot, so `STATUS Z` already
+    /// answers the branch. Labels break the chain; callers use this
+    /// only where the branch consumes `Z` and `W` is dead afterwards.
+    /// (epic-cc#668)
+    fn branch_reload_redundant(&self, cond: &Val) -> bool {
+        let Val::Reg(r) = cond else {
+            return false;
+        };
+        let slot = match self.addrs.get(&ssa_key(self.cur_func, r)) {
+            Some(s) => *s,
+            None => return false,
+        };
+        // Staged copies drain at the next emit, between these lines and
+        // the branch; today's drain forms leave STATUS alone, but the skip
+        // must not depend on that.
+        if !self.pending_copies.is_empty() || self.out.len() < 2 {
+            return false;
+        }
+        let movwf = self.out[self.out.len() - 1].trim();
+        let alu = self.out[self.out.len() - 2].trim();
+        // A skip in front of the ALU op may have bypassed it, leaving `Z`
+        // from older code while the slot holds whatever `W` was.
+        if let Some(prev) = self.out.len().checked_sub(3).map(|i| self.out[i].trim()) {
+            const SKIPS: [&str; 10] = [
+                "BTFSC", "BTFSS", "DECFSZ", "INCFSZ", "DCFSNZ", "INFSNZ", "CPFSEQ", "CPFSGT",
+                "CPFSLT", "TSTFSZ",
+            ];
+            if SKIPS.contains(&prev.split_whitespace().next().unwrap_or("")) {
+                return false;
+            }
+        }
+        if movwf.ends_with(':') || alu.ends_with(':') {
+            return false;
+        }
+        let mut movwf_parts = movwf.split_whitespace();
+        if movwf_parts.next() != Some("MOVWF") {
+            return false;
+        }
+        let movwf_addr = match movwf_parts.next() {
+            Some(ops) => {
+                let parts: Vec<&str> = ops.split(',').collect();
+                match parts.as_slice() {
+                    [file, bank] => {
+                        let low = match u16::from_str_radix(file.trim_start_matches("0x"), 16) {
+                            Ok(v) => v,
+                            Err(_) => return false,
+                        };
+                        // Same resolution as `operand()`: access-bank
+                        // lows stay, SFR aliases re gain their page,
+                        // banked bytes rejoin the tracked `BSR`.
+                        match *bank {
+                            "A" => {
+                                if low <= self.access_bank_hi {
+                                    low
+                                } else {
+                                    0xF00 | low
+                                }
+                            }
+                            "B" => match self.bsr {
+                                Some(b) => (u16::from(b) << 8) | low,
+                                None => return false,
+                            },
+                            _ => return false,
+                        }
+                    }
+                    _ => return false,
+                }
+            }
+            None => return false,
+        };
+        if movwf_addr != slot {
+            return false;
+        }
+        let mut alu_parts = alu.split_whitespace();
+        const ZSET: [&str; 10] = [
+            "ADDWF", "ADDWFC", "SUBWF", "SUBFWB", "ANDWF", "IORWF", "XORWF", "MOVF", "COMF", "NEGF",
+        ];
+        if !ZSET.contains(&alu_parts.next().unwrap_or("")) {
+            return false;
+        }
+        matches!(alu_parts.next(), Some(dest) if dest.split(',').nth(1) == Some("W"))
+    }
 
     /// Memory-to-memory byte copy, preferring the one-word `MOVWF` when W
     /// already holds the source byte (epic-cc#502 measured this shape as
@@ -3304,7 +3388,13 @@ impl<'m> Gen<'m> {
                     let addr_value = seeded;
                     let l_else = self.fresh_label();
                     let l_end = self.fresh_label();
-                    self.emit_load_w(&s.cond, 0, true);
+                    // A reload of a just-computed byte only feeds this
+                    // branch's `Z` test; when the two previous lines
+                    // already set `Z` from that same byte, skip it.
+                    // (epic-cc#668)
+                    if !self.branch_reload_redundant(&s.cond) {
+                        self.emit_load_w(&s.cond, 0, true);
+                    }
                     self.emit(format!("    BZ {l_else}")); // cond byte == 0 -> else
                     if addr_value {
                         self.emit_move_addr_to_slot(&s.a, dst);
@@ -7477,7 +7567,12 @@ pub fn select_with_locs(
                                 !matches!(bc.cond, Val::Const(_)),
                                 "isel-pic18: const cond BrCond not yet supported"
                             );
-                            g.emit_load_w(&bc.cond, 0, true);
+                            // Same skip as the Select arm above: a reload
+                            // of a just-computed byte only feeds this
+                            // branch's `Z` test. (epic-cc#668)
+                            if !g.branch_reload_redundant(&bc.cond) {
+                                g.emit_load_w(&bc.cond, 0, true);
+                            }
                             emit_cond_branches(
                                 &mut g, &lt, &lf, &t_copies, &f_copies, b, &doms, bc,
                             );
