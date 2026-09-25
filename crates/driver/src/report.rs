@@ -222,9 +222,7 @@ fn json_str(s: &str) -> String {
 
 /// The `--report` file: the build's facts as JSON for tools that act on
 /// them (the PlatformIO size bar and pre-flash checks, docs/46 D-7, D-9).
-/// `config` is `None` when the source set no configuration: the HEX then
-/// carries no config words, so the part keeps its erased configuration,
-/// and that is what `fields` decodes. `clock_hz` is `null` when unknown.
+/// The format is a contract; ADR-025 defines every key and null.
 pub fn report_json(
     device: &Device,
     layout: &AllocLayout,
@@ -233,9 +231,14 @@ pub fn report_json(
     clock_hz: u64,
 ) -> String {
     let (ram_used, ram_total) = ram_usage(device, layout);
-    let (source, bytes) = match config {
-        Some(b) => ("program", b),
-        None => ("erased", device.config.erased_baseline),
+    // With no configuration the HEX carries no config words, so the part
+    // keeps its erased state. The baseline is that state on PIC14-family
+    // parts; on PIC18 it is gpasm's all-ones fill, not the silicon default
+    // (DS39632E Table 25-1 has zeros), so nothing is claimed there.
+    let (source, bytes) = match (config, device.core) {
+        (Some(b), _) => ("program", Some(b)),
+        (None, device::Core::Pic18) => ("unset", None),
+        (None, _) => ("erased", Some(device.config.erased_baseline)),
     };
     let core = match device.core {
         device::Core::Pic14 => "pic14",
@@ -248,20 +251,26 @@ pub fn report_json(
     } else {
         clock_hz.to_string()
     };
-    let byte_list: Vec<String> = bytes.iter().map(|b| b.to_string()).collect();
-    let fields: Vec<String> = decode_config(&device.config, bytes)
-        .into_iter()
-        .map(|(name, value)| {
+    let byte_list = bytes.map_or("null".to_string(), |b| {
+        let items: Vec<String> = b.iter().map(|x| x.to_string()).collect();
+        format!("[{}]", items.join(", "))
+    });
+    let fields: Vec<String> = device
+        .config
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let value = bytes.and_then(|b| decode_config(&device.config, b)[i].1);
             let v = value.map_or("null".to_string(), json_str);
-            format!("      {}: {v}", json_str(name))
+            format!("      {}: {v}", json_str(f.name))
         })
         .collect();
     format!(
-        "{{\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": [{}],\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
+        "{{\n  \"version\": 1,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
         json_str(device.name),
         device.flash_words,
         device.config.base_byte_addr,
-        byte_list.join(", "),
         fields.join(",\n"),
     )
 }

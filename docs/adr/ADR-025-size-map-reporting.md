@@ -36,6 +36,24 @@
   frames, so its span is 0, but the backend still emits the ISR-save
   prologue.
 
+## Amendment 2026-09-25: the `--report` JSON (epic-cc#693)
+
+`--report <file>` writes the same facts, plus the configuration, as JSON
+for tools that act on them (epic-platformio's size bar and pre-flash
+checks, docs/46 D-7 and D-9). Hex builds only. The keys are a contract:
+a change that removes or re-means one bumps `version`.
+
+| Key | Meaning |
+|---|---|
+| `version` | Format version, `1`. |
+| `device`, `core` | Canonical device name; `pic14`, `pic14e`, `pic18` or `pic-baseline`. |
+| `flash_words.used`, `.total` | Program words before config insertion, and the device's flash, both in words (a board's `maximum_size` is bytes, two per word). |
+| `ram_bytes.used`, `.total` | The RAM line's definition above, in bytes. |
+| `clock_hz` | The system clock the driver derived from `EPIC_CONFIG`; `null` when it has none. |
+| `config.source` | `program`: the build set a configuration. `erased`: it set none, so the part keeps its erased state, which `bytes` then holds (PIC14, PIC14E, baseline, where the registry's baseline is the datasheet erased value). `unset`: none set on PIC18, whose registry baseline is gpasm's all-ones fill rather than the silicon default, so `bytes` and every field are `null`. |
+| `config.base_byte_addr`, `.bytes` | The config region's first byte address (`0x400E` on the 877A, word `0x2007` times two) and its bytes in order. |
+| `config.fields.<name>` | Each registry field's value by canonical name; `null` when the bits match no modeled value (a don't-care encoding such as PIC18 FOSC `111x`), in which case `bytes` is the fact. Bits the registry does not model as fields, such as the 12F629/675 bandgap BG1:BG0 (config bits 13:12), are only in `bytes`, and an `erased` report shows their erased value, not the factory calibration. |
+
 ## Rationale
 
 * PlatformIO parses build output for size after every build (PIO-1's
