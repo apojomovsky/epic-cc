@@ -23,38 +23,14 @@ Host-provided and used as-is: `git`, `gh`, `curl`, `docker`.
 Two things are **not** yet packaged and need their own packages later: `gpsim` and
 `yarpgen`. Both are deferred; see [`09-build-environment.md`](09-build-environment.md).
 
-## The XC8 install
+## XC8
 
-**XC8 is not in `epic-cc-dev`. It has its own opt-in image, `epic-cc-xc8-oracle:local`,
-because it is licence-gated and cannot ride in an image `release`/`ci` derive from.** The
-dev image merely *declares* `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00` without installing
-anything there, so `xc8-cc` is `command not found` inside `make exec`. Never install XC8
-on the host.
-
-```bash
-make oracle-image           # once; needs vendor/microchip/installers/xc8-installer.run
-make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 file.c -o file.p1'
-```
-
-`oracle-image` stages the installer from `vendor/microchip/installers/` (gitignored, so it
-never enters the repo or a public image) and installs XC8 v4.00 plus the three DFP
-families from Microchip's pack server. `oracle-exec` runs any command in that image with
-your uid, so files written through it stay host-owned.
-
-Two details that cost time to rediscover:
-
-1. **`-mdfp` is mandatory in XC8 v4.00 and must name a pack's `xc8` subdirectory**, not
-   the pack root (`error: (2104) no device-support files found`). The image ships a
-   `/usr/local/bin/xc8-cc` wrapper that supplies the PIC18 pack by default and takes
-   `XC8C_DFP=...` to switch families, so callers need only `-mcpu=`. XC8's own `bin` is
-   deliberately not on `PATH` ahead of that wrapper.
-2. **The standalone installer bundles no DFPs.** They are fetched from
-   `packs.download.microchip.com` at build time; without network access the build fails
-   rather than producing an image that cannot target anything.
-
-Verified working for PIC18: `make oracle-exec CMD='xc8-cc -mcpu=18f4550 -O2 f.c -o f.hex
--ginhx32'` compiles, links, and the size report prints the `18F4550 Memory Summary` the
-size references quote.
+**XC8 is not part of this repository's environment.** It is licence-gated and its
+benchmark results are confidential ([ADR-006](03-decisions.md)), so its oracle image, the
+installer and every XC8 comparison live in the private epic-benchmarks repository
+(epic-cc#682). The dev image merely *declares* `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00`
+(an alternate device-pack path for `scripts/gen-device.py`) without installing anything
+there. Never install XC8 on the host.
 
 ### Two critical facts about this install
 

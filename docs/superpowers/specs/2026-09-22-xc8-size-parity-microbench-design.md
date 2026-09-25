@@ -46,8 +46,8 @@ fixtures), so they are durable coverage, not scratch probes.
 ## Runner
 
 Each bench compiles twice for `18F4550`: once with `epic-cc`, once with
-`xc8-cc -mcpu=18f4550 -O2` through the `xc8-oracle` image wrapper
-(`make oracle-image` once, `make oracle-exec`), which supplies `-mdfp`.
+`xc8-cc -mcpu=18f4550 -O2` through the XC8 oracle image, which lives in
+the private epic-benchmarks repository (epic-cc#682).
 Flash words come from each toolchain's own size report. A compare step
 ranks the per-bench gap in words and refreshes the XC8 snapshot row
 deliberately, never per run.

@@ -136,10 +136,8 @@ a sibling branch's bytes.
 XC8 is a **test oracle only** ([`05-verification.md`](05-verification.md)). It is
 proprietary and licence-gated, so it is kept out of the epic-cc dev image: that image
 merely *declares* `PIC8_XC8_ROOT=/opt/microchip/xc8/v4.00` without installing anything
-there. It lives in its own opt-in image instead, `epic-cc-xc8-oracle:local`, built by
-`make oracle-image` from the gitignored installer under `vendor/microchip/installers/`.
-Run `xc8-cc` through that image rather than installing it on the host
-([`06-environment.md`](06-environment.md)).
+there. Its oracle image lives in the private epic-benchmarks repository
+(epic-cc#682), never on the host ([`06-environment.md`](06-environment.md)).
 
 **No test in this repo invokes XC8 yet.** The differential runner is deferred (`docs/13`,
 phase 6), so nothing currently reads `$PIC8_XC8_ROOT` and there is no skip-when-absent path

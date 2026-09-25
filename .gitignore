@@ -19,14 +19,6 @@ __pycache__/
 *.map
 *.o
 *.ll
-# XC8 oracle outputs (epic-cc#527): the linker drops these next to its
-# input in the mounted workspace, so a run through `make oracle-exec`
-# leaves them in the tree root.
-*.rlf
-*.sdb
-*.hxl
-*.cmf
-/startup.s
 /scratch/
 
 # Root scratch asm dumps (crates/asm/tests/fixtures/*.asm are tracked fixtures)
