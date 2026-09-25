@@ -266,8 +266,11 @@ class CategorizationTest(unittest.TestCase):
         )
         cats = words_by_category(listing)
         self.assertEqual(cats["zero-init-pair"], 2)
-        # CLRF is already the cheap form and must not be counted as a sink.
-        self.assertEqual(cats[dp.CAT_OTHER], 2)
+        # CLRF is already the cheap form; it now counts as a data move,
+        # and the trailing RETURN as a branch, leaving other empty.
+        self.assertEqual(cats["data-move"], 1)
+        self.assertEqual(cats["branch"], 1)
+        self.assertNotIn(dp.CAT_OTHER, cats)
 
     def test_wide_const_materialization_needs_consecutive_slots(self):
         adjacent = PIC18_HEADER + (
@@ -295,18 +298,25 @@ class CategorizationTest(unittest.TestCase):
         )
         cats = words_by_category(listing)
         self.assertEqual(cats["zero-init-pair"], 4)
+        self.assertEqual(cats["branch"], 1)
         self.assertNotIn("wide-const-materialization", cats)
+        self.assertNotIn(dp.CAT_OTHER, cats)
 
     def test_bank_switches_on_both_families(self):
         pic18 = PIC18_HEADER + "f:\n    MOVLB 0x2\n    RETURN\n"
-        self.assertEqual(words_by_category(pic18)["bank-switch"], 1)
+        cats = words_by_category(pic18)
+        self.assertEqual(cats["bank-switch"], 1)
+        self.assertEqual(cats["branch"], 1)
+        self.assertNotIn(dp.CAT_OTHER, cats)
         pic14 = PIC14_HEADER + (
             "f:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    BCF STATUS, 0\n    RETURN\n"
         )
         cats = words_by_category(pic14)
         self.assertEqual(cats["bank-switch"], 2)
-        # STATUS bit 0 is carry, not a bank select.
-        self.assertEqual(cats[dp.CAT_OTHER], 2)
+        # STATUS bit 0 is carry, not a bank select: a scalar ALU op now.
+        self.assertEqual(cats["scalar-alu"], 1)
+        self.assertEqual(cats["branch"], 1)
+        self.assertNotIn(dp.CAT_OTHER, cats)
 
     def test_jump_table_run(self):
         listing = PIC18_HEADER + "f:\n" + "    GOTO t\n" * 4 + "t:\n    RETURN\n"
@@ -450,7 +460,10 @@ class CategorizationTest(unittest.TestCase):
         )
         cats = words_by_category(listing)
         self.assertEqual(cats["wide-literal-arith"], 4)
-        self.assertEqual(cats[dp.CAT_OTHER], 3)
+        # The INDF0 read is indirect access now, the RETURN a branch.
+        self.assertEqual(cats["indirect-access"], 2)
+        self.assertEqual(cats["branch"], 1)
+        self.assertNotIn(dp.CAT_OTHER, cats)
 
     def test_a_run_does_not_cross_a_function_boundary(self):
         # Five one-instruction trap stubs are not a dispatch table.
@@ -480,7 +493,9 @@ class CategorizationTest(unittest.TestCase):
         cats = words_by_category(listing)
         self.assertNotIn("bank-switch", cats)
         self.assertEqual(cats["shift-chain"], 3)
-        self.assertEqual(cats[dp.CAT_OTHER], 3)
+        self.assertEqual(cats["scalar-alu"], 2)
+        self.assertEqual(cats["branch"], 1)
+        self.assertNotIn(dp.CAT_OTHER, cats)
 
     def test_every_word_is_attributed_exactly_once(self):
         listing = PIC18_HEADER + (
@@ -491,6 +506,103 @@ class CategorizationTest(unittest.TestCase):
         items, summary = profile(listing)
         self.assertEqual(sum(summary["categories"].values()), summary["total_words"])
         self.assertTrue(all(i.category for i in items if i.kind == "instr"))
+
+    def test_call_sequence_counts_the_call_word(self):
+        listing = PIC18_HEADER + (
+            "f:\n    MOVFF 0x010, 0x020\n    CALL beta\n    RETURN\nbeta:\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["call-sequence"], 2)
+        # Argument setup stays a slot copy, not part of the call.
+        self.assertEqual(cats["slot-copy"], 2)
+
+    def test_branch_counts_jumps_and_exits(self):
+        listing = PIC18_HEADER + "f:\n    BRA t\nt:\n    GOTO u\nu:\n    RETURN\n"
+        # BRA 1 + GOTO 2 + RETURN 1.
+        self.assertEqual(words_by_category(listing)["branch"], 4)
+
+    def test_cond_branch_counts_tests_and_skips(self):
+        listing = PIC18_HEADER + (
+            "f:\n    BNZ t\n    BZ t\n    BC t\n    BN t\n    BTFSC 0x020,0,A\nt:\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["cond-branch"], 5)
+        self.assertEqual(cats["branch"], 1)
+
+    def test_indirect_access_covers_lfsr_and_fsr_aliases(self):
+        listing = PIC18_HEADER + (
+            "f:\n    LFSR 0, 0x100\n    ADDWF 0x0E9,F,A\n"
+            "    MOVFF 0xFEB, 0x020\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        # LFSR 2 + ADDWF-alias 1 + PLUSW0 MOVFF 2.
+        self.assertEqual(cats["indirect-access"], 5)
+        self.assertNotIn("slot-copy", cats)
+
+    def test_indirect_access_ignores_plain_ram_aliases(self):
+        # 0x010 is ordinary RAM, not an FSR register: a data move.
+        listing = PIC18_HEADER + "f:\n    MOVF 0x010,W,A\n    RETURN\n"
+        cats = words_by_category(listing)
+        self.assertEqual(cats["data-move"], 1)
+        self.assertNotIn("indirect-access", cats)
+
+    def test_flash_access_counts_tblrd_and_tblptr(self):
+        listing = PIC18_HEADER + (
+            "f:\n    MOVLW LOW(t)\n    MOVWF 0xF6,A\n"
+            "    TBLRD*+\n    MOVFF 0xFF5, 0x020\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["flash-access"], 4)
+
+    def test_slot_copy_is_a_lone_movff(self):
+        listing = PIC18_HEADER + "f:\n    MOVFF 0x001, 0x010\n    RETURN\n"
+        cats = words_by_category(listing)
+        self.assertEqual(cats["slot-copy"], 2)
+        self.assertNotIn("struct-copy-movff", cats)
+
+    def test_literal_load_is_a_lone_movlw(self):
+        listing = PIC18_HEADER + "f:\n    MOVLW 0x05\n    MOVWF 0x010,A\n    RETURN\n"
+        cats = words_by_category(listing)
+        self.assertEqual(cats["literal-load"], 1)
+        self.assertEqual(cats["data-move"], 1)
+
+    def test_data_move_covers_loads_stores_and_clears(self):
+        listing = PIC18_HEADER + (
+            "f:\n    MOVF 0x010,W,A\n    MOVWF 0x011,A\n    CLRF 0x012,A\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        self.assertEqual(cats["data-move"], 3)
+
+    def test_scalar_alu_covers_single_alu_ops(self):
+        listing = PIC18_HEADER + (
+            "f:\n    ADDWF 0x010,W,A\n    INCF 0x011,F,A\n"
+            "    ANDLW 0x03\n    RLF 0x012,F\n    RETURN\n"
+        )
+        self.assertEqual(words_by_category(listing)["scalar-alu"], 4)
+
+    def test_pic14_calls_and_branches_categorize(self):
+        listing = PIC14_HEADER + "f:\n    CALL g\n    RETURN\ng:\n    RETURN\n"
+        cats = words_by_category(listing)
+        # The PIC14 table counts every instruction as one word.
+        self.assertEqual(cats["call-sequence"], 1)
+        self.assertEqual(cats["branch"], 2)
+        self.assertNotIn(dp.CAT_OTHER, cats)
+
+    def test_mixed_listing_stays_below_thirty_percent_other(self):
+        # Guard rail for the ticket's acceptance target on a fixed
+        # shape: a small listing exercising every new rule must leave
+        # almost nothing uncategorized.
+        listing = PIC18_HEADER + (
+            "f:\n    LFSR 0, 0x100\n    MOVF 0x010,W,A\n"
+            "    MOVFF 0xFEB, 0x020\n    MOVLW 0x05\n"
+            "    ADDWF 0x021,W,A\n    BNZ f\n    CALL g\n"
+            "    BRA f\n"
+            "g:\n    RETURN\n"
+        )
+        cats = words_by_category(listing)
+        total = sum(cats.values())
+        other = cats.get(dp.CAT_OTHER, 0)
+        self.assertLess(other / total, 0.30)
 
 
 class ClusterTest(unittest.TestCase):
