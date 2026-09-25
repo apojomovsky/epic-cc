@@ -1,0 +1,67 @@
+<!--
+  Hand-authored fixture, not a Microchip file: an imaginary PIC14 part that
+  exercises device_names.py. It covers mode dedupe, AdjustPoint gaps,
+  a joined 16-bit register, a muxed address, a legacy alias, a hidden SFR,
+  and one config word matched by bit position.
+-->
+<edc:PIC xmlns:edc="http://crownking/edc" edc:name="PIC14SYN02" edc:arch="16xxxx">
+  <edc:ConfigFuseSector>
+    <edc:DCRDef edc:cname="CONFIG" edc:nzwidth="0xE" edc:_addr="0x2007">
+      <edc:DCRModeList>
+        <edc:DCRMode edc:id="DS.0">
+          <edc:DCRFieldDef edc:cname="FOSC" edc:mask="0x3" edc:nzwidth="0x2">
+            <edc:DCRFieldSemantic edc:cname="LP" edc:when="(field &amp; 0x3) == 0x0"/>
+            <edc:DCRFieldSemantic edc:cname="HS" edc:when="(field &amp; 0x3) == 0x2"/>
+            <edc:DCRFieldSemantic edc:cname="EXTRC" edc:when="(field &amp; 0x3) == 0x3"/>
+          </edc:DCRFieldDef>
+          <edc:DCRFieldDef edc:cname="WDTE" edc:mask="0x1" edc:nzwidth="0x1">
+            <edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x0"/>
+            <edc:DCRFieldSemantic edc:cname="ON" edc:when="(field &amp; 0x1) == 0x1"/>
+          </edc:DCRFieldDef>
+          <edc:AdjustPoint edc:offset="5"/>
+          <edc:DCRFieldDef edc:cname="CPD" edc:mask="0x1" edc:nzwidth="0x1">
+            <edc:DCRFieldSemantic edc:cname="ON" edc:when="(field &amp; 0x1) == 0x0"/>
+            <edc:DCRFieldSemantic edc:cname="OFF" edc:when="(field &amp; 0x1) == 0x1"/>
+          </edc:DCRFieldDef>
+        </edc:DCRMode>
+      </edc:DCRModeList>
+    </edc:DCRDef>
+  </edc:ConfigFuseSector>
+  <edc:SFRDataSector edc:bank="0">
+    <edc:SFRDef edc:cname="WREG" edc:nzwidth="0x8"/>
+    <edc:SFRDef edc:cname="PORTB" edc:nzwidth="0x8" edc:_addr="0x6">
+      <edc:AliasList><edc:LegacyAlias edc:cname="GPIO"/></edc:AliasList>
+      <edc:SFRModeList>
+        <edc:SFRMode edc:id="DS.0">
+          <edc:SFRFieldDef edc:cname="RB0" edc:mask="0x1" edc:nzwidth="0x1"/>
+          <edc:AdjustPoint edc:offset="2"/>
+          <edc:SFRFieldDef edc:cname="RB3" edc:mask="0x1" edc:nzwidth="0x1"/>
+          <edc:SFRFieldDef edc:cname="HI" edc:mask="0x3" edc:nzwidth="0x2"/>
+        </edc:SFRMode>
+        <edc:SFRMode edc:id="LT.0">
+          <edc:SFRFieldDef edc:cname="RB0" edc:mask="0x1" edc:nzwidth="0x1"/>
+          <edc:SFRFieldDef edc:cname="ALT1" edc:mask="0x1" edc:nzwidth="0x1"/>
+        </edc:SFRMode>
+      </edc:SFRModeList>
+    </edc:SFRDef>
+    <edc:SFRDef edc:cname="SECRET" edc:ishidden="true" edc:nzwidth="0x8" edc:_addr="0x7"/>
+    <edc:JoinedSFRDef edc:cname="TMR1" edc:nzwidth="0x10" edc:_addr="0xE">
+      <edc:SFRModeList>
+        <edc:SFRMode edc:id="DS.0">
+          <edc:SFRFieldDef edc:cname="TMR1" edc:mask="0xffff" edc:nzwidth="0x10"/>
+        </edc:SFRMode>
+      </edc:SFRModeList>
+      <edc:SFRDef edc:cname="TMR1L" edc:nzwidth="0x8" edc:_addr="0xE">
+        <edc:SFRModeList>
+          <edc:SFRMode edc:id="DS.0">
+            <edc:SFRFieldDef edc:cname="TMR1L" edc:islanghidden="true" edc:mask="0xff" edc:nzwidth="0x8"/>
+          </edc:SFRMode>
+        </edc:SFRModeList>
+      </edc:SFRDef>
+    </edc:JoinedSFRDef>
+    <edc:MuxedSFRDef edc:nzwidth="8" edc:_addr="0x13">
+      <edc:SelectSFR><edc:SFRDef edc:cname="SSPADD" edc:nzwidth="0x8" edc:_addr="0x13"/></edc:SelectSFR>
+      <edc:SelectSFR><edc:SFRDef edc:cname="SSPMSK" edc:nzwidth="8" edc:_addr="0x13"/></edc:SelectSFR>
+    </edc:MuxedSFRDef>
+  </edc:SFRDataSector>
+</edc:PIC>
