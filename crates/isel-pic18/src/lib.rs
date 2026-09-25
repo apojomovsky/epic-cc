@@ -910,9 +910,10 @@ impl<'m> Gen<'m> {
     /// Copy `val` (width `ty.bytes`) into the slot starting at `dst`. A
     /// register/global source uses `MOVFF` (no access bit needed); a
     /// constant has no `MOVFF` literal form: a zero byte writes a
-    /// one-word `CLRF`, any other byte stages through `W` via
-    /// `MOVLW`/`MOVWF` (both forms touch `operand`/`BSR` the same way:
-    /// this is the one place a plain copy still touches `operand`).
+    /// one-word `CLRF`, an all-ones byte a one-word `SETF`, and any
+    /// other byte stages through `W` via `MOVLW`/`MOVWF` (all forms
+    /// touch `operand`/`BSR` the same way: this is the one place a
+    /// plain copy still touches `operand`).
     fn emit_move_val_to_slot(&mut self, val: &Val, ty: Ty, dst: u16) {
         self.invalidate_fsr0_if_slot_written(dst, u16::from(ty.bytes()));
         match val {
@@ -929,6 +930,11 @@ impl<'m> Gen<'m> {
                         // own flags first (compare chains, shift
                         // carries).
                         self.emit(format!("    CLRF 0x{f:03X},{bank}"));
+                    } else if byte == 0xFF {
+                        // An all-ones byte is the same shape with no
+                        // flag hazard at all: SETF touches no STATUS
+                        // bit. (epic-cc#666)
+                        self.emit(format!("    SETF 0x{f:03X},{bank}"));
                     } else {
                         self.emit(format!("    MOVLW 0x{byte:02X}"));
                         self.emit_w_store(dst + u16::from(i));

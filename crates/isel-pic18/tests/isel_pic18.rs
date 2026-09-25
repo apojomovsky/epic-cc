@@ -1112,6 +1112,48 @@ fn literal_ptr_store_writes_the_sfr_with_no_bank() {
 }
 
 #[test]
+fn const_store_ff_and_zero_lanes_use_setf_and_clrf() {
+    // `store i32 0x00FF00FF`: each 0xFF lane is one `SETF`, each zero
+    // lane one `CLRF`, against two words per `MOVLW`/`MOVWF` pair.
+    // `SETF` touches no STATUS bit, so unlike the zero lane it needs
+    // no flag discipline argument. The destination sits in bank 1, so
+    // the banked operand form is exercised too. (epic-cc#666)
+    let m = parse("global out i32\nfn main(void) ()\n  block entry:\n    store i32 16711935 @out\n    ret void\n");
+    let addrs = addrs(&[("out", 0x120)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    let main_asm = asm.split("__start:").next().unwrap_or(&asm);
+    assert_eq!(
+        main_asm.matches("SETF").count(),
+        2,
+        "two 0xFF lanes must use SETF:\n{asm}"
+    );
+    assert_eq!(
+        main_asm.matches("CLRF").count(),
+        2,
+        "two zero lanes must use CLRF:\n{asm}"
+    );
+    assert!(
+        !main_asm.contains("MOVLW"),
+        "no literal staging must remain:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    let mut p = pic14_sim::Pic18::new(words);
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(200);
+    assert!(p.halted());
+    assert_eq!(
+        [
+            p.ram()[0x120],
+            p.ram()[0x121],
+            p.ram()[0x122],
+            p.ram()[0x123]
+        ],
+        [0xFF, 0x00, 0xFF, 0x00],
+        "banked const lanes must land exactly"
+    );
+}
+
+#[test]
 fn literal_ptr_load_copies_from_the_sfr() {
     let m = parse("global out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 0xF81\n    store i8 %1 @out\n    ret void\n");
     let addrs = addrs(&[("out", 0x10), ("main::1", 0x11)]);
