@@ -12,34 +12,75 @@ pub const ISSUE_URL: &str = "https://github.com/apojomovsky/epic-cc/issues";
 /// payloads verbatim instead of wrapping them as internal errors.
 pub const USER_PREFIX: &str = "epic-cc: error:";
 
+/// Payloads that are deliberate user errors rather than bugs. Each entry is
+/// a message shape the pipeline emits for bad input, never for an
+/// invariant violation: recursion and depth (callgraph emits only those),
+/// missing or dangling entry points (wholeprog), programs that do not fit
+/// RAM, pages, or flash (alloc, isel, asm), and unsupported constructs
+/// (`not supported`, the marker the fuzz classifier also keys on). A new
+/// user-error panic earns an entry here plus a unit test below; anything
+/// unlisted stays an internal error.
+const USER_PATTERNS: &[&str] = &[
+    "epic-cc: error:",
+    "callgraph:",
+    "wholeprog: expected exactly one",
+    "wholeprog: undefined symbols",
+    "GPR demand exceeds",
+    "needs a bank past",
+    "no arrangement of",
+    "post-banking page-fit failure",
+    "isel: function @",
+    "crosses the 256-word ceiling",
+    "slot offset ",
+    "baseline const index ",
+    "exceeds device flash",
+    "not supported",
+    "unsupported",
+];
+
 /// Whether a panic payload is a deliberate user error, not a bug.
 pub fn is_user_error(msg: &str) -> bool {
     let text = msg.trim_start();
-    if text.starts_with(USER_PREFIX) {
-        return true;
-    }
     if has_error_at(text) {
         return true;
     }
-    if text.starts_with("callgraph:") {
-        return true;
+    // A located payload (`file:line:col: ...`) classifies on the message
+    // past the location: callgraph reports recursion at its call site.
+    let inner;
+    let inner_ref = match split_loc(text) {
+        Some((_, rest)) => {
+            inner = rest;
+            &inner
+        }
+        None => text,
+    };
+    USER_PATTERNS.iter().any(|p| inner_ref.contains(p))
+}
+
+/// Split a leading `<file>:<line>:<col>:` location off `msg`.
+fn split_loc(msg: &str) -> Option<(String, String)> {
+    let mut parts = msg.splitn(4, ':');
+    let (Some(file), Some(line), Some(col), Some(rest)) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    if file.is_empty() || line.trim().parse::<u32>().is_err() || col.trim().parse::<u32>().is_err()
+    {
+        return None;
     }
-    let lower = text.to_ascii_lowercase();
-    lower.contains("not supported") || lower.contains("unsupported")
+    Some((
+        format!("{}:{}:{}", file, line.trim(), col.trim()),
+        rest.trim_start().to_string(),
+    ))
 }
 
 /// Whether `msg` already reads `<file>:<line>:<col>: error: ...`.
 fn has_error_at(msg: &str) -> bool {
-    let first = msg.lines().next().unwrap_or("");
-    let mut parts = first.splitn(4, ':');
-    let (Some(_), Some(line), Some(col), Some(rest)) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    line.trim().parse::<u32>().is_ok()
-        && col.trim().parse::<u32>().is_ok()
-        && rest.trim_start().starts_with("error:")
+    match split_loc(msg) {
+        Some((_, rest)) => rest.starts_with("error:"),
+        None => false,
+    }
 }
 
 /// Pull the panic payload out as text.
@@ -86,8 +127,17 @@ pub fn format_internal_error(msg: &str, version: &str, at: Option<&str>) -> Stri
 pub fn install_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
         let msg = payload(info);
-        if is_user_error(&msg) {
-            eprintln!("{msg}");
+        if let Some(line) = user_error_line(&msg) {
+            eprintln!("{}", line.text);
+            // Provenance for heuristically recognized backend panics: the
+            // fuzz classifier keys compiler-side failures on `panicked
+            // at` or `epic-cc:`, and the line preserves that without a
+            // backtrace. Explicitly marked errors stay one line.
+            if line.heuristic {
+                if let Some(loc) = info.location() {
+                    eprintln!("panicked at {loc}");
+                }
+            }
             return;
         }
         let at = info.location().map(|l| l.to_string());
@@ -97,6 +147,38 @@ pub fn install_panic_hook() {
         );
         eprintln!("{}", backtrace_footer());
     }));
+}
+
+/// A user-error payload rendered as its diagnostic line, plus whether the
+/// recognition was heuristic (backend pattern) rather than explicit (the
+/// `epic-cc: error:` mark or a `file:line:col: error:` shape).
+struct UserLine {
+    text: String,
+    heuristic: bool,
+}
+
+fn user_error_line(msg: &str) -> Option<UserLine> {
+    let text = msg.trim_start();
+    if text.starts_with(USER_PREFIX) || has_error_at(text) {
+        return Some(UserLine {
+            text: text.to_string(),
+            heuristic: false,
+        });
+    }
+    if !is_user_error(text) {
+        return None;
+    }
+    // Located payloads keep the location first so editors link them.
+    if let Some((loc, rest)) = split_loc(text) {
+        return Some(UserLine {
+            text: format!("{loc}: error: {rest}"),
+            heuristic: true,
+        });
+    }
+    Some(UserLine {
+        text: format!("{USER_PREFIX} {text}"),
+        heuristic: true,
+    })
 }
 
 /// A user error with no source location. Exits 1, never an ICE.
@@ -138,12 +220,73 @@ mod tests {
             "isel: GEP-derived pointers are not supported; operand %1 is derived"
         ));
         assert!(is_user_error("callgraph: recursion detected (call cycle)"));
+        assert!(is_user_error(
+            "rec.c:4:51: callgraph: recursion detected (call cycle involving f)"
+        ));
+        assert!(is_user_error("callgraph: depth 9 exceeds hardware stack 8"));
+        assert!(is_user_error(
+            "wholeprog: expected exactly one `main`, found 0"
+        ));
+        assert!(is_user_error(
+            "wholeprog: undefined symbols: frobnicate (called at undef.c:2:18)"
+        ));
+        assert!(is_user_error(
+            "alloc: no arrangement of 355 global(s) fits p16f877a's 4 GPR bank window(s)"
+        ));
+        assert!(is_user_error(
+            "isel: post-banking page-fit failure: f spans pages (0x1000-0x1800)"
+        ));
+        assert!(is_user_error(
+            "asm: program of 8200 words exceeds device flash (highest address 0x4000)"
+        ));
     }
 
     #[test]
     fn plain_bug_payloads_are_internal_errors() {
         assert!(!is_user_error("isel: no slot for main::x"));
         assert!(!is_user_error("index out of bounds: the len is 4"));
+        assert!(!is_user_error("wholeprog: no functions in module"));
+        assert!(!is_user_error("alloc: unrecognized callgraph line: foo"));
+        assert!(!is_user_error("asm: file register 0xFF out of range"));
+        // Backend invariant, not input: the scale comes from lowering.
+        assert!(!is_user_error("isel-pic18: MULWF scale 300 exceeds 255"));
+    }
+
+    #[test]
+    fn oversized_baseline_programs_stay_errors() {
+        assert!(is_user_error("isel: slot offset 300 exceeds 255"));
+        assert!(is_user_error("isel: baseline const index 300 exceeds 255"));
+    }
+
+    #[test]
+    fn located_user_errors_keep_the_location_first() {
+        let line =
+            user_error_line("rec.c:4:51: callgraph: recursion detected (call cycle involving f)")
+                .expect("located recursion is a user error");
+        assert_eq!(
+            line.text,
+            "rec.c:4:51: error: callgraph: recursion detected (call cycle involving f)"
+        );
+        assert!(line.heuristic);
+    }
+
+    #[test]
+    fn unlocated_user_errors_carry_the_tool_mark() {
+        let line = user_error_line("callgraph: depth 9 exceeds hardware stack 8")
+            .expect("depth is a user error");
+        assert_eq!(
+            line.text,
+            "epic-cc: error: callgraph: depth 9 exceeds hardware stack 8"
+        );
+        assert!(line.heuristic);
+    }
+
+    #[test]
+    fn marked_errors_print_verbatim() {
+        let line = user_error_line("epic-cc: error: unknown field 'wat'")
+            .expect("marked error is a user error");
+        assert_eq!(line.text, "epic-cc: error: unknown field 'wat'");
+        assert!(!line.heuristic);
     }
 
     #[test]

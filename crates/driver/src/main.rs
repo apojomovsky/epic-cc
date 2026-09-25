@@ -375,7 +375,14 @@ fn main() {
     }
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
-    callgraph::check_depth(&cg, device.stack_depth as usize);
+    // A too-deep call chain is the program's fault (recursion or nesting
+    // past the silicon stack), so it reports as an error, not an ICE.
+    if cg.max_depth > device.stack_depth as usize {
+        diag::error(&format!(
+            "callgraph: depth {} exceeds hardware stack {} (recursion is rejected on this device)",
+            cg.max_depth, device.stack_depth
+        ));
+    }
 
     // 6. alloc: complete overlay address map (globals + locals per function)
     let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
@@ -464,13 +471,11 @@ fn main() {
             // frame plus `__start -> main` plus the reader must fit the
             // silicon stack, or the shift register drops the oldest
             // return address with no trap (D-5).
-            if asm.contains("CALL __read_") {
-                assert!(
-                    cg.max_depth + 1 <= device.stack_depth as usize,
+            if asm.contains("CALL __read_") && cg.max_depth + 1 > device.stack_depth as usize {
+                diag::error(&format!(
                     "pic-baseline: const reads need a __read CALL level the {}-level stack cannot take at call depth {}",
-                    device.stack_depth,
-                    cg.max_depth
-                );
+                    device.stack_depth, cg.max_depth
+                ));
             }
             asm
         }

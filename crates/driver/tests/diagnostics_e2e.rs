@@ -123,3 +123,31 @@ fn unsupported_asm_stays_an_error_not_an_ice() {
     );
     assert!(!err.contains("internal compiler error"), "{err}");
 }
+
+#[test]
+fn recursion_reports_a_located_error_not_an_ice() {
+    let src = tmp_c(
+        "rec.c",
+        "volatile int sink;\nint is_even(int n);\n\
+         int is_odd(int n) { if (n == 0) return 0; return is_even(n - 1) + sink; }\n\
+         int is_even(int n) { if (n == 0) return 1; return is_odd(n - 1) + sink; }\n\
+         int main(void) { return is_odd(3); }\n",
+    );
+    let out = driver()
+        .args([
+            src.as_str(),
+            "-o",
+            "/tmp/epic-diag-rec.hex",
+            "--device",
+            "p16f877a",
+        ])
+        .output()
+        .expect("run driver");
+    let _ = std::fs::remove_file(&src);
+    assert!(!out.status.success());
+    let err = stderr_of(&out);
+    assert!(err.contains(": error:"), "{err}");
+    assert!(err.contains("recursion detected"), "{err}");
+    assert!(err.contains("rec.c:4:51"), "{err}");
+    assert!(!err.contains("internal compiler error"), "{err}");
+}

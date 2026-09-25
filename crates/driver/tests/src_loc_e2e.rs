@@ -33,7 +33,7 @@ fn unsupported_type_panic_names_the_definition_site() {
     );
     assert!(!ok, "_Complex float must be rejected, not compiled");
     assert!(
-        stderr.contains("spike_complex.c:1:1: SPIKE: unsupported type"),
+        stderr.contains("spike_complex.c:1:1: error: SPIKE: unsupported type"),
         "panic must carry the C location:\n{stderr}"
     );
 }
