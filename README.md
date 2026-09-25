@@ -206,9 +206,9 @@ Deliberate and tracked, not surprises: diagnostics are panics rather than
 user-facing errors; `BANKSEL` minimization is linear tracking, not the
 published 2-approximation; overlay allocation is call-graph-based, not
 interference-graph coloring; `.asm`/`.lst` listing output isn't exposed
-(only `.hex`, `--map`, and the `--sidecar` ELF+DWARF file the debugger
-reads); the PIC-baseline core is newer and has less test coverage than the
-other three; the XC8 differential oracle is designed but not wired into the
+(only `.hex`, `--map`, the `--report` JSON, and the `--sidecar`
+ELF+DWARF file the debugger reads); the PIC-baseline core is newer and
+has less test coverage than the other three; the XC8 differential oracle is designed but not wired into the
 suite.
 
 Full design conversation, ADRs, and per-milestone plans live in

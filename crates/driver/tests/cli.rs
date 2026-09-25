@@ -99,3 +99,14 @@ fn map_defaults_to_none() {
     let c = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
     assert_eq!(c.map, None);
 }
+
+#[test]
+fn parses_a_report_file() {
+    let c = parse_args(&args(&[
+        "a.c", "--device", "p16f877a", "--report", "b.json",
+    ]))
+    .unwrap();
+    assert_eq!(c.report.as_deref(), Some("b.json"));
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
+    assert_eq!(c.report, None);
+}

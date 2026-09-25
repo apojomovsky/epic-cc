@@ -170,6 +170,111 @@ pub fn fixed_total(device: &Device) -> u16 {
     }
 }
 
+/// RAM `(used, total)` in bytes: every GPR bank plus the fixed region, the
+/// same definition the size report states on its RAM line.
+pub fn ram_usage(device: &Device, layout: &AllocLayout) -> (u16, u16) {
+    let total = device
+        .ram_banks
+        .iter()
+        .map(|&(s, e)| e - s + 1)
+        .sum::<u16>()
+        + fixed_total(device);
+    let used = layout.bank_used.iter().sum::<u16>() + fixed_bytes(device, layout.has_isr);
+    (used, total)
+}
+
+/// Each config field's value in `bytes`, by canonical name; `None` when the
+/// bits match no named value. A scattered mask (628A `osc`, 0x13) cannot be
+/// inverted with a shift, so values are matched by placing their bits the
+/// way `resolve_config` does.
+pub fn decode_config<'a>(
+    region: &'a device::ConfigRegion,
+    bytes: &[u8],
+) -> Vec<(&'a str, Option<&'a str>)> {
+    region
+        .fields
+        .iter()
+        .map(|f| {
+            let have = bytes[f.byte_offset as usize] & f.mask;
+            let value = f
+                .values
+                .iter()
+                .find(|v| (v.bits << f.shift) & f.mask == have)
+                .map(|v| v.name);
+            (f.name, value)
+        })
+        .collect()
+}
+
+fn json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The `--report` file: the build's facts as JSON for tools that act on
+/// them (the PlatformIO size bar and pre-flash checks, docs/46 D-7, D-9).
+/// The format is a contract; ADR-025 defines every key and null.
+pub fn report_json(
+    device: &Device,
+    layout: &AllocLayout,
+    flash_used: usize,
+    config: Option<&[u8]>,
+    clock_hz: u64,
+) -> String {
+    let (ram_used, ram_total) = ram_usage(device, layout);
+    // With no configuration the HEX carries no config words, so the part
+    // keeps its erased state. The baseline is that state on PIC14-family
+    // parts; on PIC18 it is gpasm's all-ones fill, not the silicon default
+    // (DS39632E Table 25-1 has zeros), so nothing is claimed there.
+    let (source, bytes) = match (config, device.core) {
+        (Some(b), _) => ("program", Some(b)),
+        (None, device::Core::Pic18) => ("unset", None),
+        (None, _) => ("erased", Some(device.config.erased_baseline)),
+    };
+    let core = match device.core {
+        device::Core::Pic14 => "pic14",
+        device::Core::Pic14e => "pic14e",
+        device::Core::Pic18 => "pic18",
+        device::Core::PicBaseline => "pic-baseline",
+    };
+    let clock = if clock_hz == 0 {
+        "null".to_string()
+    } else {
+        clock_hz.to_string()
+    };
+    let byte_list = bytes.map_or("null".to_string(), |b| {
+        let items: Vec<String> = b.iter().map(|x| x.to_string()).collect();
+        format!("[{}]", items.join(", "))
+    });
+    let fields: Vec<String> = device
+        .config
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            let value = bytes.and_then(|b| decode_config(&device.config, b)[i].1);
+            let v = value.map_or("null".to_string(), json_str);
+            format!("      {}: {v}", json_str(f.name))
+        })
+        .collect();
+    format!(
+        "{{\n  \"version\": 1,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
+        json_str(device.name),
+        device.flash_words,
+        device.config.base_byte_addr,
+        fields.join(",\n"),
+    )
+}
+
 /// Render the size report. `flash_used` is the program's assembled word
 /// count (before config-word insertion); `layout` carries the RAM facts.
 pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> String {
@@ -180,13 +285,7 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         device.flash_words,
         flash_used as f64 * 100.0 / device.flash_words as f64
     ));
-    let ram_total: u16 = device
-        .ram_banks
-        .iter()
-        .map(|&(s, e)| e - s + 1)
-        .sum::<u16>()
-        + fixed_total(device);
-    let ram_used: u16 = layout.bank_used.iter().sum::<u16>() + fixed_bytes(device, layout.has_isr);
+    let (ram_used, ram_total) = ram_usage(device, layout);
     out.push_str(&format!(
         "  RAM: {ram_used}/{ram_total} bytes ({:.1}%) (overlay: a byte can be live in several frames; used = the bytes of RAM the program's allocation occupies)\n",
         ram_used as f64 * 100.0 / ram_total as f64
