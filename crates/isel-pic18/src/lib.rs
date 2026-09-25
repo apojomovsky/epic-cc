@@ -1217,7 +1217,12 @@ impl<'m> Gen<'m> {
                             let bank = if a == 0 { "A" } else { "B" };
                             self.emit(format!("    MOVWF 0x{f:03X},{bank}"));
                         }
-                        [(1, reg)] => {
+                        [(s, reg)] => {
+                            // One dynamic term `s * reg` (a stride-`s` LSR
+                            // walk, epic-cc#678): add the term byte `s`
+                            // times. Each ADDWF updates the carry, so the
+                            // final carry out of byte 0 is exactly the
+                            // carry into byte 1, like the scale-1 shape.
                             let ra = self.val_addr(&Val::Reg(reg.clone())).direct();
                             let (ra_a, ra_f) = self.operand(ra);
                             let ra_bank = if ra_a == 0 { "A" } else { "B" };
@@ -1228,14 +1233,18 @@ impl<'m> Gen<'m> {
                                 let (a, f) = self.operand(sa);
                                 let bank = if a == 0 { "A" } else { "B" };
                                 self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
-                                self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                                for _ in 0..*s {
+                                    self.emit(format!("    ADDWF 0x{ra_f:03X},W,{ra_bank}"));
+                                }
                             } else {
                                 let (a, f) = self.operand(sa + 1);
                                 let bank = if a == 0 { "A" } else { "B" };
                                 self.emit(format!("    MOVF 0x{f:03X},W,{bank}"));
                                 self.emit("    BTFSC 0xFD8,0,A".to_string());
                                 self.emit("    ADDLW 0x01".to_string());
-                                self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                                for _ in 0..*s {
+                                    self.emit(format!("    ADDWF 0x{ra1_f:03X},W,{ra1_bank}"));
+                                }
                             }
                             let (a, f) = self.operand(dst + u16::from(i));
                             let bank = if a == 0 { "A" } else { "B" };

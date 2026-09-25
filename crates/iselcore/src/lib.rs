@@ -455,6 +455,14 @@ pub fn resolve_pointers(m: &Module) -> PtrResolution {
                             progressed = true;
                         } else if geps.contains_key(&rkey) || selects.contains_key(&rkey) {
                             rest.push((key, g));
+                        } else if pending_phis.iter().any(|(k, _)| k == &rkey) {
+                            // A GEP over a pointer phi that has not seeded
+                            // yet (an LSR walk whose entry arm resolves in
+                            // this same fixpoint, epic-cc#678) waits for the
+                            // phi seeding below instead of dying: the seed
+                            // unblocks it next round, and a phi that never
+                            // seeds still fails loud at the stall check.
+                            rest.push((key, g));
                         } else {
                             panic!("iselcore: no gep for pointer %{r} (chain base missing, key {rkey})");
                         }
