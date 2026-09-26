@@ -4,6 +4,7 @@
 pub mod clang;
 pub mod clang_discovery;
 pub mod cli;
+pub mod diag;
 pub mod epic_cc_h;
 pub mod fosc;
 pub mod header_detect;

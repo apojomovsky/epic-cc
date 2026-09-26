@@ -16,11 +16,11 @@
 //! collisions, so `wholeprog` onward sees exactly the single-module shape it
 //! always has.
 
+use clang_discovery::{resolve_clang, resolve_llvm_link, resolve_opt};
 use driver::clang;
 use driver::clang_discovery;
 use driver::cli;
-
-use clang_discovery::{resolve_clang, resolve_llvm_link, resolve_opt};
+use driver::diag;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
@@ -35,12 +35,12 @@ fn resolve_or_exit(name: &str) -> &'static device::Device {
             .map(|d| d.name)
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!("epic-cc: unknown device {name} (available: {available})");
-        std::process::exit(1);
+        diag::error(&format!("unknown device {name} (available: {available})"))
     })
 }
 
 fn main() {
+    diag::install_panic_hook();
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.iter().any(|a| a == "--version" || a == "-V") {
         println!("epic-cc {}", env!("EPIC_CC_STAMP"));
@@ -48,7 +48,7 @@ fn main() {
     }
     if let Some(pos) = argv.iter().position(|a| a == "--resolve-device") {
         let name = argv.get(pos + 1).unwrap_or_else(|| {
-            eprintln!("epic-cc: --resolve-device needs a value");
+            eprintln!("epic-cc: error: --resolve-device needs a value");
             std::process::exit(2);
         });
         println!("{}", resolve_or_exit(name).name);
@@ -74,7 +74,7 @@ fn main() {
         let lower = input.to_ascii_lowercase();
         if lower.ends_with(".asm") || lower.ends_with(".s") {
             eprintln!(
-                "epic-cc: .asm inputs are not supported in this build; use EPIC_NAKED functions"
+                "epic-cc: error: .asm inputs are not supported in this build; use EPIC_NAKED functions"
             );
             std::process::exit(2);
         }
@@ -88,24 +88,15 @@ fn main() {
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     let (clang, resdir) = match resolve_clang(&std::env::vars().collect(), &exe_dir) {
         Ok(pair) => pair,
-        Err(msg) => {
-            eprintln!("epic-cc: {msg}");
-            std::process::exit(1);
-        }
+        Err(msg) => diag::error(&msg),
     };
     let llvm_link = match resolve_llvm_link(&clang) {
         Ok(p) => p,
-        Err(msg) => {
-            eprintln!("epic-cc: {msg}");
-            std::process::exit(1);
-        }
+        Err(msg) => diag::error(&msg),
     };
     let opt_bin = match resolve_opt(&clang) {
         Ok(p) => p,
-        Err(msg) => {
-            eprintln!("epic-cc: {msg}");
-            std::process::exit(1);
-        }
+        Err(msg) => diag::error(&msg),
     };
 
     // Temp directory for the per-unit .ll files and the merged one. With
@@ -143,17 +134,32 @@ fn main() {
         .map(|p| {
             (
                 p.clone(),
-                std::fs::read_to_string(p).unwrap_or_else(|e| {
-                    eprintln!("epic-cc: read {p}: {e}");
-                    std::process::exit(1);
-                }),
+                std::fs::read_to_string(p)
+                    .unwrap_or_else(|e| diag::error(&format!("read {p}: {e}"))),
             )
         })
         .collect();
-    let prescan_spec = driver::prescan::find_epic_config(&sources);
-    let fosc_hz: u64 = match &prescan_spec {
-        Some(spec) => driver::fosc::resolve_fosc_hz(device, spec),
-        None => driver::fosc::resolve_fosc_hz_from_defaults(device),
+    let found = driver::prescan::find_epic_configs(&sources);
+    let prescan_spec: Option<String> = match found.as_slice() {
+        [] => None,
+        [one] => Some(one.spec.clone()),
+        [first, second, ..] => diag::error_at(
+            &second.file,
+            second.line,
+            second.col,
+            &format!(
+                "more than one EPIC_CONFIG(...) invocation found \
+                 ({}:{}:{} and {}:{}:{}); exactly one is supported",
+                first.file, first.line, first.col, second.file, second.line, second.col,
+            ),
+        ),
+    };
+    let prescan_loc = found.into_iter().next().map(|f| (f.file, f.line, f.col));
+    let fosc_hz: u64 = match (&prescan_spec, &prescan_loc) {
+        (Some(spec), Some((file, line, col))) => driver::fosc::try_resolve_fosc_hz(device, spec)
+            .unwrap_or_else(|e| diag::error_at(file, *line, *col, &e)),
+        (Some(_), None) => unreachable!("a prescan spec always carries its site"),
+        (None, _) => driver::fosc::resolve_fosc_hz_from_defaults(device),
     };
 
     // 1. clang: one invocation per translation unit.
@@ -324,10 +330,7 @@ fn main() {
     let merged_ll_text =
         match driver::wholeprog_opt::run(&opt_bin, &merged_path, &opt_path, device.core) {
             Ok(text) => text,
-            Err(msg) => {
-                eprintln!("epic-cc: whole-program opt: {msg}");
-                std::process::exit(1);
-            }
+            Err(msg) => diag::error(&format!("whole-program opt: {msg}")),
         };
 
     let ll_text = irparse::sanitize_symbols(&merged_ll_text);
@@ -337,15 +340,18 @@ fn main() {
         .and_then(|rest| rest.split('"').next())
         .map(str::to_string);
 
-    match (&prescan_spec, &canonical_spec) {
-        (Some(p), Some(c)) if p != c => panic!(
-            "epic-cc: internal inconsistency, the pre-scan found EPIC_CONFIG({p:?}) but the \
-             compiled program's actual config is {c:?}; this is a pre-scanner bug, please report it"
+    match (&prescan_spec, &prescan_loc, &canonical_spec) {
+        (Some(p), _, Some(c)) if p != c => panic!(
+            "internal inconsistency, the pre-scan found EPIC_CONFIG({p:?}) but the \
+             compiled program's actual config is {c:?}; this is a pre-scanner bug"
         ),
-        (Some(_), None) => panic!(
-            "epic-cc: the pre-scan found an EPIC_CONFIG(...) invocation that did not survive \
+        (Some(_), Some((file, line, col)), None) => diag::error_at(
+            file,
+            *line,
+            *col,
+            "the EPIC_CONFIG(...) invocation did not survive \
              into the compiled program (likely behind an #ifdef the pre-scan cannot see); v1 \
-             requires an unconditional top-level invocation"
+             requires an unconditional top-level invocation",
         ),
         _ => {}
     }
@@ -369,7 +375,14 @@ fn main() {
     }
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
-    callgraph::check_depth(&cg, device.stack_depth as usize);
+    // A too-deep call chain is the program's fault (recursion or nesting
+    // past the silicon stack), so it reports as an error, not an ICE.
+    if cg.max_depth > device.stack_depth as usize {
+        diag::error(&format!(
+            "callgraph: depth {} exceeds hardware stack {} (recursion is rejected on this device)",
+            cg.max_depth, device.stack_depth
+        ));
+    }
 
     // 6. alloc: complete overlay address map (globals + locals per function)
     let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
@@ -458,13 +471,11 @@ fn main() {
             // frame plus `__start -> main` plus the reader must fit the
             // silicon stack, or the shift register drops the oldest
             // return address with no trap (D-5).
-            if asm.contains("CALL __read_") {
-                assert!(
-                    cg.max_depth + 1 <= device.stack_depth as usize,
+            if asm.contains("CALL __read_") && cg.max_depth + 1 > device.stack_depth as usize {
+                diag::error(&format!(
                     "pic-baseline: const reads need a __read CALL level the {}-level stack cannot take at call depth {}",
-                    device.stack_depth,
-                    cg.max_depth
-                );
+                    device.stack_depth, cg.max_depth
+                ));
             }
             asm
         }
@@ -484,7 +495,13 @@ fn main() {
         .map(|s| driver::fosc::fuse_spec(s))
         .unwrap_or_default();
     let config_bytes: Option<Vec<u8>> = if canonical_spec.is_some() {
-        Some(device::resolve_config(&device.config, &fuse_spec))
+        let bytes = device::try_resolve_config(&device.config, &fuse_spec).unwrap_or_else(|e| {
+            match &prescan_loc {
+                Some((file, line, col)) => diag::error_at(file, *line, *col, &e),
+                None => diag::error(&e),
+            }
+        });
+        Some(bytes)
     } else {
         None
     };

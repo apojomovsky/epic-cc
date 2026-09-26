@@ -13,44 +13,53 @@ use crate::ConfigRegion;
 /// does not exist for that field; a field is `locked` to a different value
 /// than the one given.
 pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
+    try_resolve_config(region, spec).unwrap_or_else(|e| panic!("epic-cc: error: {e}"))
+}
+
+/// Fallible `resolve_config`, so the driver can point the error at the
+/// `EPIC_CONFIG` site instead of panicking bare.
+pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, String> {
     let mut bytes = region.erased_baseline.to_vec();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for pair in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-        let (key, val) = pair.split_once('=').unwrap_or_else(|| {
-            panic!("device: malformed EPIC_CONFIG entry {pair:?} (expected key=value)")
-        });
+        let (key, val) = pair
+            .split_once('=')
+            .ok_or_else(|| format!("malformed EPIC_CONFIG entry {pair:?} (expected key=value)"))?;
         let (key, val) = (key.trim(), val.trim());
 
         let field = region
             .fields
             .iter()
             .find(|f| names_match(f.name, f.aliases, key))
-            .unwrap_or_else(|| panic!("device: unknown field '{key}' in EPIC_CONFIG"));
+            .ok_or_else(|| {
+                let names: Vec<&str> = region.fields.iter().map(|f| f.name).collect();
+                format!("unknown field '{key}' in EPIC_CONFIG, expected one of {names:?}")
+            })?;
 
         let fv = field
             .values
             .iter()
             .find(|v| names_match(v.name, v.aliases, val))
-            .unwrap_or_else(|| {
+            .ok_or_else(|| {
                 let opts: Vec<&str> = field
                     .values
                     .iter()
                     .flat_map(|v| std::iter::once(v.name).chain(v.aliases.iter().copied()))
                     .collect();
-                panic!(
-                    "device: unknown value '{val}' for field '{}', expected one of {opts:?}",
+                format!(
+                    "unknown value '{val}' for field '{}', expected one of {opts:?}",
                     field.name
                 )
-            });
+            })?;
 
         if let Some(only) = field.locked {
             if !fv.name.eq_ignore_ascii_case(only) {
-                panic!(
-                    "device: field '{}' is locked to {only:?} (epic-cc's backend cannot honor \
+                return Err(format!(
+                    "field '{}' is locked to {only:?} (epic-cc's backend cannot honor \
                      other values); got {val:?}",
                     field.name
-                );
+                ));
             }
         }
 
@@ -62,23 +71,28 @@ pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
         if seen.contains(field.name) {
             continue;
         }
-        let default_name = field.default.unwrap_or_else(|| {
-            panic!(
-                "device: field '{}' has no default and was not set by EPIC_CONFIG; \
+        let default_name = field.default.ok_or_else(|| {
+            format!(
+                "field '{}' has no default and was not set by EPIC_CONFIG; \
                  this device cannot boot without an explicit value. Valid values: {:?}",
                 field.name,
                 field.values.iter().map(|v| v.name).collect::<Vec<_>>()
             )
-        });
+        })?;
         let fv = field
             .values
             .iter()
             .find(|v| v.name == default_name)
-            .unwrap_or_else(|| panic!("device: field {:?}'s own default {default_name:?} is not one of its values (data bug)", field.name));
+            .ok_or_else(|| {
+                format!(
+                    "field {:?}'s own default {default_name:?} is not one of its values (data bug)",
+                    field.name
+                )
+            })?;
         apply(&mut bytes, field, fv.bits);
     }
 
-    bytes
+    Ok(bytes)
 }
 
 fn names_match(name: &str, aliases: &[&str], given: &str) -> bool {
