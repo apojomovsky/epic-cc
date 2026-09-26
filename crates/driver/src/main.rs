@@ -165,22 +165,43 @@ fn main() {
             )
         })
         .collect();
-    let found = driver::prescan::find_epic_configs(&sources);
-    let prescan_spec: Option<String> = match found.as_slice() {
-        [] => None,
-        [one] => Some(one.spec.clone()),
-        [first, second, ..] => diag::error_at(
-            &second.file,
-            second.line,
-            second.col,
+    // Config comes from exactly one spelling: `EPIC_CONFIG("...")` or
+    // `#pragma config` lines. clang drops unknown pragmas before the
+    // `.ll`, so the driver recovers them from the raw sources here and
+    // lowers them through the same resolution below.
+    let epics = driver::prescan::find_epic_configs(&sources);
+    let pragmas = driver::prescan::find_pragma_config(&sources);
+    let epic = driver::prescan::single_epic(epics);
+    if epic.is_some() && !pragmas.is_empty() {
+        let e = epic.as_ref().expect("checked above");
+        let p = &pragmas[0];
+        diag::error_at(
+            &p.file,
+            p.line,
+            p.col,
             &format!(
-                "more than one EPIC_CONFIG(...) invocation found \
-                 ({}:{}:{} and {}:{}:{}); exactly one is supported",
-                first.file, first.line, first.col, second.file, second.line, second.col,
+                "#pragma config cannot be mixed with EPIC_CONFIG in one program \
+                 (EPIC_CONFIG at {}:{}:{}); use one spelling",
+                e.file, e.line, e.col,
             ),
-        ),
+        );
+    }
+    let pragma_spec: Option<String> = if pragmas.is_empty() {
+        None
+    } else {
+        Some(driver::prescan::pragma_spec(&device.config, &pragmas))
     };
-    let prescan_loc = found.into_iter().next().map(|f| (f.file, f.line, f.col));
+    // The second element of each arm is unreachable: mixing already
+    // errored above, so an epic hit means no pragma hit.
+    let (prescan_spec, prescan_loc): (Option<String>, Option<(String, u32, u32)>) =
+        match (epic, &pragma_spec) {
+            (Some(e), _) => (Some(e.spec), Some((e.file, e.line, e.col))),
+            (None, Some(s)) => {
+                let p = &pragmas[0];
+                (Some(s.clone()), Some((p.file.clone(), p.line, p.col)))
+            }
+            (None, None) => (None, None),
+        };
     let fosc_hz: u64 = match (&prescan_spec, &prescan_loc) {
         (Some(spec), Some((file, line, col))) => driver::fosc::try_resolve_fosc_hz(device, spec)
             .unwrap_or_else(|e| diag::error_at(file, *line, *col, &e)),
@@ -365,13 +386,24 @@ fn main() {
         .map(|i| &ll_text[i + "section \".epiccfg.".len()..])
         .and_then(|rest| rest.split('"').next())
         .map(str::to_string);
-
-    match (&prescan_spec, &prescan_loc, &canonical_spec) {
-        (Some(p), _, Some(c)) if p != c => panic!(
+    match (&prescan_spec, &pragma_spec, &prescan_loc, &canonical_spec) {
+        // All three means the macro hid in a header the pre-scan never
+        // reads while the sources carry `#pragma config`: `EPIC_CONFIG`
+        // text beside pragma text already errored before clang, so this
+        // arm is exactly the header-hidden mixing case. It sorts first
+        // because the joined pragma spec never equals the compiled one.
+        (_, Some(_), Some((file, line, col)), Some(_)) => diag::error_at(
+            file,
+            *line,
+            *col,
+            "the compiled program contains an EPIC_CONFIG section but the \
+             sources use #pragma config; mixing the two spellings in one program is an error",
+        ),
+        (Some(p), None, _, Some(c)) if p != c => panic!(
             "internal inconsistency, the pre-scan found EPIC_CONFIG({p:?}) but the \
              compiled program's actual config is {c:?}; this is a pre-scanner bug"
         ),
-        (Some(_), Some((file, line, col)), None) => diag::error_at(
+        (Some(_), None, Some((file, line, col)), None) => diag::error_at(
             file,
             *line,
             *col,
@@ -516,11 +548,14 @@ fn main() {
     // program words are captured before config insertion: the PIC14 config
     // word lives past the flash ceiling (0x2007 on the 877A), so the hex
     // vec is resized to include it and its length would overcount flash.
+    // The fuse half comes from the compiled section on the `EPIC_CONFIG`
+    // path, or from the recovered pragma pairs when clang dropped them.
     let fuse_spec = canonical_spec
         .as_deref()
+        .or(pragma_spec.as_deref())
         .map(|s| driver::fosc::fuse_spec(s))
         .unwrap_or_default();
-    let config_bytes: Option<Vec<u8>> = if canonical_spec.is_some() {
+    let config_bytes: Option<Vec<u8>> = if canonical_spec.is_some() || pragma_spec.is_some() {
         let bytes = device::try_resolve_config(&device.config, &fuse_spec).unwrap_or_else(|e| {
             match &prescan_loc {
                 Some((file, line, col)) => diag::error_at(file, *line, *col, &e),

@@ -33,8 +33,15 @@ pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, 
             .iter()
             .find(|f| names_match(f.name, f.aliases, key))
             .ok_or_else(|| {
-                let names: Vec<&str> = region.fields.iter().map(|f| f.name).collect();
-                format!("unknown field '{key}' in EPIC_CONFIG, expected one of {names:?}")
+                let names: Vec<&str> = region
+                    .fields
+                    .iter()
+                    .flat_map(|f| std::iter::once(f.name).chain(f.aliases.iter().copied()))
+                    .collect();
+                format!(
+                    "unknown field '{key}' in EPIC_CONFIG (expected one of: {})",
+                    names.join(", ")
+                )
             })?;
 
         let fv = field
@@ -93,6 +100,17 @@ pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, 
     }
 
     Ok(bytes)
+}
+
+/// Find the config field named `name`, matching normalized names and pack
+/// aliases case-insensitively (`FOSC` finds `osc`). Used where a spec may
+/// use either spelling: the driver's clock derivation over `#pragma
+/// config` pairs.
+pub fn find_field<'a>(region: &'a ConfigRegion, name: &str) -> Option<&'a crate::FuseField> {
+    region
+        .fields
+        .iter()
+        .find(|f| names_match(f.name, f.aliases, name))
 }
 
 fn names_match(name: &str, aliases: &[&str], given: &str) -> bool {

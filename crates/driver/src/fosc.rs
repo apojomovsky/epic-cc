@@ -63,25 +63,37 @@ pub fn resolve_fosc_hz_from_defaults(_device: &Device) -> u64 {
 }
 
 fn named(region: &ConfigRegion, spec: &str, field: &str) -> Result<String, String> {
+    // The spec may spell fields and values either way (`osc=intio` or
+    // `FOSC = INTOSCIO_EC`): match the pair key through the field's
+    // aliases and return the value's canonical name, so the derived clock
+    // is the same from `EPIC_CONFIG` and `#pragma config`. An unknown
+    // value passes through raw; `resolve_config` reports it with options.
+    let target = field_of(region, field)?;
     for pair in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         if let Some((k, v)) = pair.split_once('=') {
-            if k.trim().eq_ignore_ascii_case(field) {
-                return Ok(v.trim().to_ascii_lowercase());
+            let k = k.trim();
+            if k.eq_ignore_ascii_case(target.name)
+                || target.aliases.iter().any(|a| a.eq_ignore_ascii_case(k))
+            {
+                let raw = v.trim();
+                if let Some(canon) = target.values.iter().find(|c| {
+                    c.name.eq_ignore_ascii_case(raw)
+                        || c.aliases.iter().any(|a| a.eq_ignore_ascii_case(raw))
+                }) {
+                    return Ok(canon.name.to_ascii_lowercase());
+                }
+                return Ok(raw.to_ascii_lowercase());
             }
         }
     }
-    let f = field_of(region, field)?;
-    f.default
-        .ok_or_else(|| format!("field '{field}' has no default and was not set by EPIC_CONFIG"))
+    target
+        .default
+        .ok_or_else(|| format!("field '{field}' has no default and was not set by the config"))
         .map(|d| d.to_ascii_lowercase())
 }
 
 fn field_of<'a>(region: &'a ConfigRegion, name: &str) -> Result<&'a FuseField, String> {
-    region
-        .fields
-        .iter()
-        .find(|f| f.name.eq_ignore_ascii_case(name))
-        .ok_or_else(|| format!("no fuse field '{name}' on this device"))
+    device::find_field(region, name).ok_or_else(|| format!("no fuse field '{name}' on this device"))
 }
 
 fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64, String> {
@@ -91,7 +103,7 @@ fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
     // as xtal_hz.
     let _osc = named(region, spec, "osc")?;
     xtal.ok_or_else(|| {
-        "xtal_hz=<Hz> is required in EPIC_CONFIG \
+        "xtal_hz=<Hz> is required to derive the clock \
          (DS39582C §14.2: Fosc is the crystal or the declared RC frequency)"
             .to_string()
     })
@@ -109,7 +121,7 @@ fn baseline_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u
     } else {
         xtal.ok_or_else(|| {
             format!(
-                "xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
+                "xtal_hz=<Hz> is required to derive the clock when osc={osc} \
                  (DS41236E §2.0: Fosc is the crystal or the declared RC frequency)"
             )
         })
@@ -167,7 +179,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
     if pll {
         let xtal = xtal.ok_or_else(|| {
             format!(
-                "xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
+                "xtal_hz=<Hz> is required to derive the clock when osc={osc} \
                  (the PLL needs a known input frequency)"
             )
         })?;
@@ -197,7 +209,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
     } else {
         let xtal = xtal.ok_or_else(|| {
             format!(
-                "xtal_hz=<Hz> is required in EPIC_CONFIG when osc={osc} \
+                "xtal_hz=<Hz> is required to derive the clock when osc={osc} \
                  (system clock is the primary oscillator, possibly divided by CPUDIV)"
             )
         })?;
