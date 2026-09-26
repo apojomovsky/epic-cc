@@ -76,6 +76,50 @@ fn pic18_erased_baseline_is_all_ff_confirmed_against_gpasm() {
 }
 
 #[test]
+fn pragma_leaves_a_defaultless_omitted_field_erased() {
+    // epic-cc#706 option 2: the 4550's oscillator-tree fields have no
+    // default, so `#pragma config FOSC = INTOSCIO_EC` resolves byte 0 to
+    // the erased baseline instead of erroring, the way XC8 does.
+    let bytes = device::try_resolve_config_in(
+        &PIC18F4550.config,
+        "osc=intio",
+        device::ConfigSpelling::Pragma,
+    )
+    .unwrap();
+    assert_eq!(bytes[0], 0xFF);
+    assert_eq!(bytes[1], 0x38);
+}
+
+#[test]
+fn epic_config_stays_strict_on_a_defaultless_omitted_field() {
+    let err = device::try_resolve_config_in(
+        &PIC18F4550.config,
+        "osc=intio",
+        device::ConfigSpelling::EpicConfig,
+    )
+    .unwrap_err();
+    assert!(err.contains("EPIC_CONFIG"), "message: {err}");
+}
+
+#[test]
+fn errors_name_the_spelling_actually_used() {
+    let pragma = device::try_resolve_config_in(
+        &PIC18F4550.config,
+        "osc=intio, wat=off",
+        device::ConfigSpelling::Pragma,
+    )
+    .unwrap_err();
+    assert!(pragma.contains("#pragma config"), "message: {pragma}");
+    let epic = device::try_resolve_config_in(
+        &PIC18F4550.config,
+        "osc=intio, wat=off",
+        device::ConfigSpelling::EpicConfig,
+    )
+    .unwrap_err();
+    assert!(epic.contains("EPIC_CONFIG"), "message: {epic}");
+}
+
+#[test]
 fn pic14e_config_words_resolve_against_the_datasheet_layout() {
     // DS41364E Register 4-1/4-2 (1934/6/7; DS40001574D is identical for
     // 1938/9): CONFIG1 at word 0x8007 (byte 0x1000E) and CONFIG2 at word
