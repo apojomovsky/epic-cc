@@ -38,7 +38,10 @@ pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, 
                     .iter()
                     .flat_map(|f| std::iter::once(f.name).chain(f.aliases.iter().copied()))
                     .collect();
-                format!("unknown field '{key}' in EPIC_CONFIG (expected one of: {})", names.join(", "))
+                format!(
+                    "unknown field '{key}' in EPIC_CONFIG (expected one of: {})",
+                    names.join(", ")
+                )
             })?;
 
         let fv = field

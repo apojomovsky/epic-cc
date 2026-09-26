@@ -20,7 +20,24 @@ pub struct PragmaSetting {
     pub col: u32,
 }
 
- @ours
+use super::diag;
+
+/// One `EPIC_CONFIG("...")` hit with its source site, so config errors can
+/// point at it as `file:line:col`.
+pub struct FoundConfig {
+    /// The quoted argument.
+    pub spec: String,
+    /// The input file holding it.
+    pub file: String,
+    /// 1-based line and column of the `EPIC_CONFIG` token.
+    pub line: u32,
+    pub col: u32,
+}
+
+/// Scan every source file's raw text for top-level `EPIC_CONFIG("...")`
+/// invocations, skipping line and block comments and `"..."` string
+/// literals along the way.
+pub fn find_epic_configs(sources: &[(String, String)]) -> Vec<FoundConfig> {
     let mut out = Vec::new();
     for (file, text) in sources {
         for (spec, line, col) in find_in_one_file(text) {
@@ -39,7 +56,6 @@ pub struct PragmaSetting {
 /// `EPIC_CONFIG("...")` invocation, skipping `//` and `/* */` comments and
 /// `"..."` string literals along the way. Returns the quoted argument, or
 /// `None` if no invocation was found anywhere.
-///
 /// Panics if more than one invocation is found across all files: this
 /// supports exactly one, unconditional, per docs/31 §10.
 pub fn find_epic_config(sources: &[(String, String)]) -> Option<String> {
@@ -55,7 +71,7 @@ pub fn single_epic(found: Vec<FoundConfig>) -> Option<FoundConfig> {
         let first = &found[0];
         let second = &found[1];
         panic!(
-            "{}more than one EPIC_CONFIG(...) invocation found \
+            "{} more than one EPIC_CONFIG(...) invocation found \
              ({}:{}:{} and {}:{}:{}); exactly one is supported",
             diag::USER_PREFIX,
             first.file,

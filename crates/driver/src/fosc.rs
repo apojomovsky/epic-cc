@@ -93,8 +93,7 @@ fn named(region: &ConfigRegion, spec: &str, field: &str) -> Result<String, Strin
 }
 
 fn field_of<'a>(region: &'a ConfigRegion, name: &str) -> Result<&'a FuseField, String> {
-    device::find_field(region, name)
-        .ok_or_else(|| format!("no fuse field '{name}' on this device"))
+    device::find_field(region, name).ok_or_else(|| format!("no fuse field '{name}' on this device"))
 }
 
 fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64, String> {
