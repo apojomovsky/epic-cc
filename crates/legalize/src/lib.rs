@@ -3053,8 +3053,10 @@ fn fill_indirect_callees(
                 if let Inst::Call(c) = inst {
                     // A direct call's `func` is a defined function name; an
                     // indirect call's `func` is the SSA register (numeric),
-                    // not a defined function. Only the latter gets candidates.
-                    if defined.contains(c.func.as_str()) {
+                    // not a defined function. Only the latter gets
+                    // candidates. `_delay` is neither: isel expands it
+                    // inline, so it must not collect any (epic-cc#700).
+                    if defined.contains(c.func.as_str()) || c.func == "_delay" {
                         continue;
                     }
                     // The spellings this site's storage holds for the field

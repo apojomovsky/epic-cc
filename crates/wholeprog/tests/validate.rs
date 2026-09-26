@@ -102,3 +102,18 @@ fn main(void) ()
     }
     merge(m);
 }
+
+#[test]
+fn accepts_an_undefined_delay_declaration() {
+    // `_delay` is declared but never defined: isel expands the call
+    // inline, so wholeprog accepts it like an `llvm.*` intrinsic.
+    let out = merge(parse(
+        "\
+fn main(void) ()
+  block 0:
+    call void @_delay(i32 100)
+    ret void
+",
+    ));
+    assert_eq!(out.funcs.len(), 1);
+}

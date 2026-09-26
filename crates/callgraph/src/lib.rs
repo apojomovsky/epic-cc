@@ -27,12 +27,14 @@ pub fn build(m: &Module) -> CallGraph {
             for inst in &b.insts {
                 if let Inst::Call(c) = inst {
                     // A direct call has a static target. An indirect call
-                    // (numeric `func`, the SSA register) has a `callees`
-                    // candidate list filled by legalize: emit one edge per
-                    // candidate so the depth/recursion checks and the overlay
-                    // allocator see the conservative whole-program graph. A
-                    // numeric `func` with no candidates is a malformed module
-                    // and must not enter the graph silently (epic-cc#73).
+                    // (numeric `func`) carries legalize's `callees` list:
+                    // one edge per candidate for the depth and overlay
+                    // checks; a numeric `func` with none is malformed
+                    // (epic-cc#73). `_delay` expands inline in isel (no
+                    // CALL, no frame), so it takes no edge (epic-cc#700).
+                    if c.func == "_delay" {
+                        continue;
+                    }
                     if c.callees.is_empty() {
                         if c.func.chars().all(|ch| ch.is_ascii_digit()) {
                             continue;
