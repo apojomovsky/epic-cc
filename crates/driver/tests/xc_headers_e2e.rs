@@ -1,8 +1,8 @@
 //! Generated headers acceptance (epic-cc#688): an XC8 tutorial blink per
 //! beta core, through the whole pipeline and run in the simulator. `mid`
-//! and `done` pin the `<REG>bits` reads; the two `__delay_ms(1)` calls at
-//! 4 MHz contribute exactly 2000 instruction cycles, so the window below
-//! proves the delays ran instead of compiling to nothing.
+//! and `done` pin the `<REG>bits` reads; the two `__delay_ms(1)` calls
+//! contribute 2000 instruction cycles at 4 MHz (PIC14/PIC14E) and 4000
+//! at 8 MHz (PIC18), so each window proves its delays ran.
 
 use std::process::Command;
 

@@ -3,12 +3,12 @@
 // mid and done pin the bit reads; the delays dominate the cycle count.
 // Configuration rides on EPIC_CONFIG until #691 derives the clock from
 // _XTAL_FREQ; the header surface is the tutorial one either way.
+#define _XTAL_FREQ 4000000
+
 #include <xc.h>
 #include <epic-cc.h>
 
 EPIC_CONFIG("osc=xt, xtal_hz=4000000, wdt=off, lvp=off");
-
-#define _XTAL_FREQ 4000000
 
 volatile unsigned char mid;
 volatile unsigned char done;

@@ -49,15 +49,18 @@ fn dump_include_dir_materializes_every_header() {
         "stdarg.h",
         "stdio.h",
         "math.h",
-        "pic12f675.h",
-        "pic16f1937.h",
-        "pic16f628a.h",
-        "pic16f877a.h",
-        "pic16f887.h",
-        "pic18f4550.h",
     ] {
         assert!(dir.join(name).is_file(), "missing {name} in {dir:?}");
     }
+    let mut pics = 0;
+    for dev in device::ALL {
+        if driver::headers::pic_header(dev).is_some() {
+            let name = driver::headers::pic_filename(dev);
+            assert!(dir.join(&name).is_file(), "missing {name} in {dir:?}");
+            pics += 1;
+        }
+    }
+    assert!(pics > 0, "no device headers in {dir:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

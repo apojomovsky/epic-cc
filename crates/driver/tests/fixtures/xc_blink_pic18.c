@@ -2,11 +2,11 @@
 // the internal oscillator, so no crystal frequency is needed to derive
 // the clock. The oscillator-tree fields have no defaults, so every one
 // is set explicitly (epic-cc#706 relaxes the omission later).
+#define _XTAL_FREQ 8000000
+
 #include <xc.h>
 
 #pragma config FOSC = INTOSCIO_EC, USBDIV = OFF, CPUDIV = DIV1, PLLDIV = NOPRESCALE, WDT = OFF, LVP = OFF, XINST = OFF
-
-#define _XTAL_FREQ 8000000
 
 volatile unsigned char mid;
 volatile unsigned char done;

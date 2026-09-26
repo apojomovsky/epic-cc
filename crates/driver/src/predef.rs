@@ -15,10 +15,8 @@
 //! and numeric all reach `__attribute__((interrupt(...)))`, whose value
 //! clang preserves in the `.ll` `"interrupt"` function attribute for
 //! irparse (0 = compatibility single-vector, 1 = high, 2 = low). Empty
-//! means 0 via `__VA_OPT__` (`interrupt(0)`); any spelling present adds
-//! `+ 0`, which clang folds before the attribute is read. The priority
-//! words ride as plain defines on PIC18 only, expanding to their numbers
-//! before the attribute sees them.
+//! means 0 via `__VA_OPT__`; any spelling present adds `+ 0`, which clang
+//! folds first. The priority words ride as PIC18-only defines.
 
 use device;
 
