@@ -4,17 +4,20 @@
 //! the release bundle ships `include/` next to the binary and the driver
 //! resolves it exe-relative, the same chain shape as clang discovery. The
 //! temp materialization stays as the fallback for dev/CI runs whose
-//! executable has no bundle beside it. One table drives the dump, the
-//! fallback and the presence check, so the three cannot drift apart.
+//! executable has no bundle beside it. `HEADERS` plus the generated
+//! `xc.h` and per-device headers drive the dump, the fallback and the
+//! presence check together, so the three cannot drift apart.
 
 use std::path::{Path, PathBuf};
 
 use super::{
-    epic_cc_h, malloc_h, math_h, stdarg_h, stdbool_h, stddef_h, stdint_h, stdio_h, stdlib_h,
-    string_h, xc_h,
+    epic_cc_h, headers, malloc_h, math_h, stdarg_h, stdbool_h, stddef_h, stdint_h, stdio_h,
+    stdlib_h, string_h,
 };
 
-/// Every shipped header: filename plus its compiled-in text.
+/// Every static shipped header: filename plus its compiled-in text. The
+/// generated `xc.h` and `pic<part>.h` headers ride beside these (see
+/// `materialize`), so this table plus `headers` is the whole set.
 const HEADERS: &[(&str, &str)] = &[
     ("epic-cc.h", epic_cc_h::EPIC_CC_H),
     ("stdint.h", stdint_h::STDINT_H),
@@ -23,7 +26,6 @@ const HEADERS: &[(&str, &str)] = &[
     ("string.h", string_h::STRING_H),
     ("stdlib.h", stdlib_h::STDLIB_H),
     ("malloc.h", malloc_h::MALLOC_H),
-    ("xc.h", xc_h::XC_H),
     ("stdarg.h", stdarg_h::STDARG_H),
     ("stdio.h", stdio_h::STDIO_H),
     ("math.h", math_h::MATH_H),
@@ -36,6 +38,12 @@ pub fn materialize(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     for (name, text) in HEADERS {
         std::fs::write(dir.join(name), text)?;
+    }
+    std::fs::write(dir.join("xc.h"), headers::xc_h())?;
+    for dev in device::ALL {
+        if let Some(text) = headers::pic_header(dev) {
+            std::fs::write(dir.join(headers::pic_filename(dev)), text)?;
+        }
     }
     Ok(())
 }
