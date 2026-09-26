@@ -250,6 +250,7 @@ RUN cargo build --release -p driver -p epic-cc-gdbserver \
         "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/devices.json" \
     && cp target/release/epic-cc "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
     && cp target/release/epic-cc-gdbserver "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/" \
+    && ./target/release/epic-cc --dump-include-dir "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/include" \
     && cp /opt/clang/bin/clang "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && cp /opt/clang/bin/llvm-link "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
     && cp /opt/clang/bin/opt "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/clang/bin/" \
@@ -262,4 +263,5 @@ RUN cargo build --release -p driver -p epic-cc-gdbserver \
     && ./epic-cc /workspace/crates/driver/tests/fixtures/add.c -o /tmp/env.hex \
     && env -u PIC8_CLANG_UNWRAPPED -u PIC8_CLANG_RESOURCE_DIR \
        ./epic-cc /workspace/crates/driver/tests/fixtures/add.c -o /tmp/bundled.hex \
-    && cmp /tmp/env.hex /tmp/bundled.hex
+    && cmp /tmp/env.hex /tmp/bundled.hex \
+    && test "$(./epic-cc --print-include-dir)" = "/out/epic-cc-${EPIC_CC_VERSION}-x86_64-linux/include"

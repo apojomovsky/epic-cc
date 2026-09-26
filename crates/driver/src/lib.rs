@@ -9,6 +9,7 @@ pub mod epic_cc_h;
 pub mod fosc;
 pub mod header_detect;
 pub mod hex;
+pub mod include_dir;
 pub mod malloc_h;
 pub mod math_c;
 pub mod math_h;

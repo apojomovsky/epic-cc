@@ -59,6 +59,13 @@ usage: epic-cc [options] <input.c>...
   --resolve-device     resolve the next argument to a canonical device name
                        and print it, no input files needed (same resolution
                        --target uses, e.g. 16F877A and PIC16F877A -> p16f877a)
+  --print-include-dir  print the effective header dir (the `include/`
+                       shipped beside the binary, else the materialized
+                       fallback) for the PlatformIO builder's CPPPATH
+  --dump-include-dir <dir>
+                       write every shipped header into <dir> (release-bundle
+                       tooling; the bundle carries exactly what the driver
+                       would materialize)
 ";
 /// Parse an argument list that does NOT include `argv[0]`.
 pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
