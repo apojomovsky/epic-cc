@@ -5,7 +5,9 @@
 //! them).
 
 mod config;
-pub use config::{find_field, resolve_config, try_resolve_config};
+pub use config::{
+    find_field, resolve_config, try_resolve_config, try_resolve_config_in, ConfigSpelling,
+};
 
 pub mod gputils;
 
