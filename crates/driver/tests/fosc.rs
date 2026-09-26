@@ -262,19 +262,12 @@ fn pragma_falls_back_to_erased_before_needing_xtal() {
     // epic-cc#706: an 877A pragma without FOSC reads the erased nibble
     // (rc), so the failure names the missing crystal, not a missing
     // default. The strict spelling still reports EPIC_CONFIG.
-    let err = driver::fosc::try_resolve_fosc_hz(
-        &PIC16F877A,
-        "",
-        device::ConfigSpelling::Pragma,
-    )
-    .unwrap_err();
+    let err = driver::fosc::try_resolve_fosc_hz(&PIC16F877A, "", device::ConfigSpelling::Pragma)
+        .unwrap_err();
     assert!(err.contains("xtal_hz"), "message: {err}");
-    let err = driver::fosc::try_resolve_fosc_hz(
-        &PIC16F877A,
-        "",
-        device::ConfigSpelling::EpicConfig,
-    )
-    .unwrap_err();
+    let err =
+        driver::fosc::try_resolve_fosc_hz(&PIC16F877A, "", device::ConfigSpelling::EpicConfig)
+            .unwrap_err();
     assert!(err.contains("EPIC_CONFIG"), "message: {err}");
 }
 
@@ -283,11 +276,8 @@ fn pragma_names_itself_when_erased_names_no_value() {
     // The 4550's erased osc nibble (0xF) is past the last mode, so a
     // pragma that omits FOSC cannot derive a clock: the error must name
     // the spelling actually used.
-    let err = driver::fosc::try_resolve_fosc_hz(
-        &PIC18F4550,
-        "wdt=off",
-        device::ConfigSpelling::Pragma,
-    )
-    .unwrap_err();
+    let err =
+        driver::fosc::try_resolve_fosc_hz(&PIC18F4550, "wdt=off", device::ConfigSpelling::Pragma)
+            .unwrap_err();
     assert!(err.contains("#pragma config"), "message: {err}");
 }
