@@ -85,7 +85,7 @@ pub fn try_resolve_config_in(
                     .flat_map(|v| std::iter::once(v.name).chain(v.aliases.iter().copied()))
                     .collect();
                 format!(
-                    "unknown value '{val}' for field '{}', expected one of {opts:?}",
+                    "unknown value '{val}' for field '{}' in {sp}, expected one of {opts:?}",
                     field.name
                 )
             })?;
@@ -94,7 +94,7 @@ pub fn try_resolve_config_in(
             if !fv.name.eq_ignore_ascii_case(only) {
                 return Err(format!(
                     "field '{}' is locked to {only:?} (epic-cc's backend cannot honor \
-                     other values); got {val:?}",
+                     other values); got {val:?} via {sp}",
                     field.name
                 ));
             }
