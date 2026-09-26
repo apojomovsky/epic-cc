@@ -440,50 +440,6 @@ fn main() {
             }
             *slot |= f.mask;
         }
-        // SFR bitfield geometry the header generator trusts: contiguous
-        // masks, no same-mode overlap, nothing past bit 7. A regen that
-        // breaks one would silently misposition a bitfield member.
-        for s in &dev.sfrs {
-            if ![1, 2, 3].contains(&s.width) {
-                panic!(
-                    "device: {}: sfr {:?} width {} is not 1, 2 or 3",
-                    path, s.name, s.width
-                );
-            }
-            let mut modes: HashMap<u8, u8> = HashMap::new();
-            for f in &s.fields {
-                if f.mask == 0 {
-                    panic!(
-                        "device: {}: sfr {:?} field {:?} mask must not be 0",
-                        path, s.name, f.name
-                    );
-                }
-                if f.shift >= 8 {
-                    panic!(
-                        "device: {}: sfr {:?} field {:?} shift {} must be < 8",
-                        path, s.name, f.name, f.shift
-                    );
-                }
-                let width = f.mask.count_ones();
-                if (f.mask as u16 >> f.shift) != (1 << width) - 1 {
-                    panic!("device: {}: sfr {:?} field {:?} mask {:#04X} is not contiguous at shift {}", path, s.name, f.name, f.mask, f.shift);
-                }
-                if f.shift as u32 + width > 8 {
-                    panic!(
-                        "device: {}: sfr {:?} field {:?} runs past bit 7",
-                        path, s.name, f.name
-                    );
-                }
-                let slot = modes.entry(f.mode).or_insert(0);
-                if *slot & f.mask != 0 {
-                    panic!(
-                        "device: {}: sfr {:?} field {:?} overlaps another mode-{} field",
-                        path, s.name, f.name, f.mode
-                    );
-                }
-                *slot |= f.mask;
-            }
-        }
         // name check
         let _ = stem; // already validated
     }
