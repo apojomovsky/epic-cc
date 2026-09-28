@@ -1,14 +1,10 @@
 name: mdb-oracle
 
-# MPLAB SIM (mdb) execution oracle for the superopt-landed sequences
-# (epic-cc#712). Per-PR runs the pr tier when oracle inputs change;
-# nightly runs the wider sweep. Microchip tooling stays an external
-# process: the session runs in epic-hal's private toolchain image,
-# pulled the same way epic-hal's own family-check pulls it.
-#
-# One human setup step, not code: ghcr.io/<owner>/epic-hal-ci must grant
-# read access to this repo (package Settings > Manage access), otherwise
-# the pull below 401s on a token that is otherwise sufficient.
+# MPLAB SIM execution oracle for superopt sequences (epic-cc#712): per-PR
+# pr tier on oracle-input changes, nightly sweep on schedule. Sessions run
+# in epic-hal's private toolchain image (same pull as its family-check).
+# Setup, not code: ghcr.io/<owner>/epic-hal-ci must grant this repo read
+# access, else the pull 401s (legacy pic8-hal-ci fallback included).
 
 on:
   pull_request:
@@ -115,8 +111,16 @@ jobs:
           mplabx_version="$(grep -m1 '^ARG MPLABX_VERSION=' epic-hal/docker/ci-toolchain/Dockerfile | cut -d= -f2)"
           tag="xc8-v${xc8_version}-dfp${pic16_dfp_version}-${pic18_dfp_version}-${pic1216f1_dfp_version}-mplabx${mplabx_version}"
           image="ghcr.io/${{ github.repository_owner }}/epic-hal-ci:${tag}"
-          docker pull "$image"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
+          legacy_image="ghcr.io/${{ github.repository_owner }}/pic8-hal-ci:${tag}"
+          if docker pull "$image"; then
+            echo "image=$image" >> "$GITHUB_OUTPUT"
+          elif docker pull "$legacy_image"; then
+            echo "note: pulled legacy $legacy_image (epic-hal-ci not yet published; see epic-hal#55)" >&2
+            echo "image=$legacy_image" >> "$GITHUB_OUTPUT"
+          else
+            echo "error: neither $image nor $legacy_image is on GHCR" >&2
+            exit 1
+          fi
 
       - name: Run the oracle
         run: |

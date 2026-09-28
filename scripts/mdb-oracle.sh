@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# MDB execution oracle for superopt-landed sequences (epic-cc#712).
-# Emits a hardware replay batch via the superopt driver, runs it under
-# MPLAB SIM through epic-hal's mdb-hex gate, and diffs the readback
-# against the in-tree simulator. Microchip tooling stays an external
-# process behind epic-hal's own Makefile target; nothing is vendored here.
-#
-# Usage: scripts/mdb-oracle.sh --spec <name> [--tier pr|nightly] [--hal <dir>] [--mutate] [--keep]
-#   --mutate corrupts chunk 0's program only, so its check must fail
-#     (the fail-closed proof: exit 0 iff the mismatch is caught).
-#   EPIC_HAL_ROOT overrides --hal (default: ../epic-hal beside this checkout).
-#   EPIC_MDB_GATE=1 makes an unavailable mdb fail instead of skip: local
-#     runs skip, the gating CI job fails.
+# MDB execution oracle for superopt sequences (epic-cc#712): emit a replay
+# batch, run it under MPLAB SIM via epic-hal's mdb-hex gate, diff against
+# the in-tree sim. Microchip tooling stays an external process.
+# Usage: mdb-oracle.sh --spec <name> [--tier pr|nightly] [--hal <dir>]
+#   [--mutate] [--keep]. --mutate corrupts chunk 0 (check must fail);
+#   EPIC_MDB_GATE=1 turns unavailable-mdb from local skip to CI failure.
 
 set -euo pipefail
 
@@ -79,6 +73,9 @@ MUT_FLAG=""
 [ "$MUTATE" -eq 1 ] && MUT_FLAG="--mutate"
 COUNT="$(cc_bin count --spec $SPEC --tier $TIER | grep -E '^[0-9]+ [0-9]+$')"
 read -r CASES PER_CHUNK <<< "$COUNT"
+# Zero cases must fail, never vacuous-pass: an empty tier list would
+# otherwise skip the chunk loop and exit 0 with no hardware evidence.
+[ "$CASES" -gt 0 ] || { echo "mdb-oracle: FAIL: $SPEC/$TIER has no cases" >&2; exit 1; }
 NCHUNKS=$(( (CASES + PER_CHUNK - 1) / PER_CHUNK ))
 [ "$MUTATE" -eq 1 ] && NCHUNKS=1
 echo "mdb-oracle: $SPEC/$TIER: $CASES cases in $NCHUNKS chunk(s)"
