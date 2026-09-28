@@ -4,7 +4,7 @@
 > answers (audience, host OSes, board set, programmers, XC8
 > conventions, tool redistribution) were given by the user during
 > brainstorming the same day.
-> Spans three repos (epic-cc, epic-platformio, and a new `epic8-tools`)
+> Spans three repos (epic-cc, epic-platformio, and a new `epic-tools`)
 > and supersedes, for the beta, the "every device, no curation" board
 > decision in epic-platformio's `docs/platform-decisions.md`.
 
@@ -191,7 +191,7 @@ driver's build report, CC-g) shows:
 None of the beta programmers is LVP-only, so there is no lockout case
 to refuse; that rule arrives with the first LVP-only protocol.
 
-### D-10: `epic8-tools`, pinned upstream plus a patch queue
+### D-10: `epic-tools`, pinned upstream plus a patch queue
 
 A new repo builds the programmer tools as PlatformIO tool packages from
 **pinned upstream tags plus a small patch directory**, not long-lived
@@ -245,7 +245,7 @@ dependencies.
 | CC-g | Machine-readable build report: sizes, resolved config fields, clock | |
 | CC-h | Release v0.4.0 carrying all of the above | CC-a..g |
 
-**epic8-tools** (new repo)
+**epic-tools** (new repo)
 
 | # | Work | Depends on |
 |---|---|---|
