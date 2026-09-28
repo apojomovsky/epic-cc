@@ -207,14 +207,69 @@ fn main() {
     } else {
         device::ConfigSpelling::EpicConfig
     };
-    let fosc_hz: u64 = match (&prescan_spec, &prescan_loc) {
-        (Some(spec), Some((file, line, col))) => {
-            driver::fosc::try_resolve_fosc_hz(device, spec, spelling)
-                .unwrap_or_else(|e| diag::error_at(file, *line, *col, &e))
+    let xtal_def = driver::prescan::find_xtal_freq(&sources);
+    // A `-D_XTAL_FREQ=<Hz>` feeds clang the same macro, so it counts as a
+    // source too; a source `#define` wins, matching clang's order. It has
+    // no file site for errors.
+    let mut dash_xtal: Option<Option<u64>> = None;
+    for def in &cli.defines {
+        if let Some(rest) = def.strip_prefix("_XTAL_FREQ") {
+            if rest.is_empty() {
+                dash_xtal = Some(None);
+            } else if let Some(val) = rest.strip_prefix('=') {
+                dash_xtal = Some(driver::prescan::parse_c_int(val));
+            }
         }
-        (Some(_), None) => unreachable!("a prescan spec always carries its site"),
-        (None, _) => driver::fosc::resolve_fosc_hz_from_defaults(device),
-    };
+    }
+    let xtal_value = xtal_def
+        .as_ref()
+        .and_then(|x| x.value)
+        .or_else(|| dash_xtal.flatten());
+    let xtal_present = xtal_def.is_some() || dash_xtal.is_some();
+    let spec_opt = prescan_spec.as_deref().map(|s| (s, spelling));
+    let clock = driver::fosc::try_resolve_clock(device, spec_opt, xtal_value, cli.f_cpu)
+        .unwrap_or_else(|e| match &prescan_loc {
+            Some((file, line, col)) => diag::error_at(file, *line, *col, &e),
+            None => match &xtal_def {
+                Some(x) => diag::error_at(&x.file, x.line, x.col, &e),
+                None => diag::error(&e),
+            },
+        });
+    let fosc_hz = clock.hz;
+    eprintln!("{}", driver::fosc::header_line(device, &clock));
+    if let Some(use_) = driver::prescan::find_delay_use(&sources) {
+        if !xtal_present {
+            if clock.hz == 0 {
+                diag::error_at(
+                    &use_.file,
+                    use_.line,
+                    use_.col,
+                    &format!(
+                        "{}() needs a clock but none is fixed: give one with \
+                         #define _XTAL_FREQ <Hz>, derive it from the config (an \
+                         internal-oscillator mode, or EPIC_CONFIG with xtal_hz=<Hz>), \
+                         or pass --f-cpu <Hz>",
+                        use_.name
+                    ),
+                );
+            } else {
+                let from = clock
+                    .from
+                    .map(|f| f.name())
+                    .expect("a nonzero clock always has a source");
+                diag::error_at(
+                    &use_.file,
+                    use_.line,
+                    use_.col,
+                    &format!(
+                        "{}() expands _XTAL_FREQ, which is not defined: add \
+                         #define _XTAL_FREQ {} to match the {from} clock",
+                        use_.name, clock.hz
+                    ),
+                );
+            }
+        }
+    }
 
     // 1. clang: one invocation per translation unit.
     let clang_opts = clang::Options {
