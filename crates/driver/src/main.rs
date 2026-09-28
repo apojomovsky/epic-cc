@@ -236,7 +236,6 @@ fn main() {
             },
         });
     let fosc_hz = clock.hz;
-    eprintln!("{}", driver::fosc::header_line(device, &clock));
     if let Some(use_) = driver::prescan::find_delay_use(&sources) {
         if !xtal_present {
             if clock.hz == 0 {
@@ -302,7 +301,7 @@ fn main() {
         units.push(ll_path);
         dep_paths.push(dep_path);
     }
-
+    eprintln!("{}", driver::fosc::header_line(device, &clock));
     // See `driver::header_detect` (epic-cc#196) for why this reads clang's
     // `-MD` dependency output rather than grepping the raw source text.
     let dep_texts: Vec<String> = dep_paths
