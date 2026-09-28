@@ -2444,11 +2444,12 @@ impl Pic18 {
                 self.write_d_at(d, op, r);
             }
             0x3400 => {
-                // RLCF: rotate left through C
+                // RLCF: rotate left through C; affects C, N, Z.
                 let v = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = (v << 1) | cin;
                 self.set_c(v & 0x80 != 0);
+                self.set_zn(r);
                 self.write_d_at(d, op, r);
             }
             0x4400 => {
@@ -2459,11 +2460,12 @@ impl Pic18 {
                 self.write_d_at(d, op, r);
             }
             0x3000 => {
-                // RRCF: rotate right through C
+                // RRCF: rotate right through C, same C/N/Z surface as RLCF.
                 let v = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = (v >> 1) | (cin << 7);
                 self.set_c(v & 0x01 != 0);
+                self.set_zn(r);
                 self.write_d_at(d, op, r);
             }
             0x4000 => {
@@ -3342,6 +3344,39 @@ mod pic18_reset {
             assert_eq!(pic.ram()[addr], want, "POR latch at {addr:#06X}");
         }
         assert_eq!(pic.ram()[0x20], 0x00, "GPR still zero-filled");
+    }
+}
+
+#[cfg(test)]
+mod pic18_rotate_flags {
+    use super::Pic18;
+
+    const STATUS: usize = 0xFD8;
+
+    fn run(prog: &str, reg: u8, c: bool) -> (u8, u8) {
+        let words = asm::assemble_pic18(prog);
+        let mut pic = Pic18::new(words);
+        pic.ram_mut()[0x020] = reg;
+        if c {
+            pic.ram_mut()[STATUS] |= 0x01;
+        }
+        pic.run(8);
+        (pic.ram()[0x020], pic.ram()[STATUS])
+    }
+
+    /// RLCF affects C, N, Z, not just C.
+    #[test]
+    fn rlcf_sets_c_n_z() {
+        assert_eq!(run("rlcf 0x020,F,A\nsleep\n", 0x80, false), (0x00, 0x05));
+        assert_eq!(run("rlcf 0x020,F,A\nsleep\n", 0x40, false), (0x80, 0x10));
+        assert_eq!(run("rlcf 0x020,F,A\nsleep\n", 0x00, true), (0x01, 0x00));
+    }
+
+    /// RRCF affects C, N, Z, not just C.
+    #[test]
+    fn rrcf_sets_c_n_z() {
+        assert_eq!(run("rrcf 0x020,F,A\nsleep\n", 0x01, true), (0x80, 0x11));
+        assert_eq!(run("rrcf 0x020,F,A\nsleep\n", 0x01, false), (0x00, 0x05));
     }
 }
 
