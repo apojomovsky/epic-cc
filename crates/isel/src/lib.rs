@@ -216,6 +216,10 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVWF 0x{addr:02X}"));
         }
         self.w_holds = Some(addr);
+        // The skipped-MOVWF path never hits `emit`, so the flag relation
+        // from an earlier materialize would survive into a later branch on
+        // a different slot; W is this store's value now, not the compare's.
+        self.z_rel = None;
     }
 
     /// `MOVF addr, W`, unless `addr`'s value is already known to be in W:
@@ -228,6 +232,10 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVF 0x{addr:02X}, W"));
         }
         self.w_holds = Some(addr);
+        // Same reason as emit_w_store: a skipped MOVF skips its `emit`, so
+        // a stale flag relation must not outlive the reload; a MOVF also
+        // resets Z to (addr == 0), which is not the compare's Z.
+        self.z_rel = None;
     }
 
     /// The restore pair: `MOVLW PAGE(<cur_func>); MOVWF PCLATH`, right
@@ -6243,7 +6251,10 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 g.emit_w_load(ca);
                                 g.emit(format!("    {skip} STATUS, {bit} ; Z"));
                             } else {
-                                g.emit_w_load(ca);
+                                // Unconditional reload: the phi-copy shapes'
+                                // hardcoded BTFx read the MOVF's own Z
+                                // (dst == 0), never the compare's relation.
+                                g.emit(format!("    MOVF 0x{ca:02X}, W"));
                             }
                             match (t_copies, f_copies) {
                                 // Plain branch: the classic skip shape, its
