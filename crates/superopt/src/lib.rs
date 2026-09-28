@@ -43,6 +43,9 @@ pub struct Case {
 /// need resolving.
 pub type Candidate = Vec<&'static str>;
 
+pub mod mdb;
+pub mod specs;
+
 const MAX_STEPS: usize = 64;
 
 /// The non-zero sentinel `run_case` poisons RAM with before applying a

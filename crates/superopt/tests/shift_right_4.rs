@@ -16,51 +16,17 @@
 //! by review (epic-cc#501). So the construction is checked before any
 //! `isel-pic18` change, over the full 8-bit input domain.
 
-use pic14_sim::Pic18;
-use superopt::{verify, Candidate, Case, STATUS_ADDR, STATUS_C_BIT};
-
-const LANE: usize = 0x020;
-
-/// Cases for a single-lane right shift by `amount`, over `pairs` x `w_values`
-/// x both `C` values. Mirrors `shift_16bit.rs`'s `cases_over` for the
-/// opposite direction, with the lane's own byte as the only payload.
-fn cases_over(amount: u32, pairs: &[u8], w_values: &[u8]) -> Vec<Case> {
-    let mut cases = Vec::new();
-    for &lane in pairs {
-        for &w in w_values {
-            for c in [false, true] {
-                let expect = lane.wrapping_shr(amount);
-                let status = if c { STATUS_C_BIT } else { 0 };
-                cases.push(Case {
-                    entry_w: w,
-                    pokes: vec![(LANE, lane), (STATUS_ADDR, status)],
-                    allowed_changes: vec![LANE],
-                    check: Box::new(move |sim: &Pic18| sim.ram()[LANE] == expect),
-                });
-            }
-        }
-    }
-    cases
-}
-
-/// Every byte value, crossed with a single `W`/`C`: the bit-pattern
-/// dimension, which is what a nibble trick can get wrong.
-fn cases_exhaustive(amount: u32) -> Vec<Case> {
-    let all: Vec<u8> = (0..=255u8).collect();
-    cases_over(amount, &all, &[0x00])
-}
-
-/// The 4-bit single-lane right shift. Three words against the unroll's 12,
-/// and it clobbers `W` (like the landed left-shift forms).
-fn construction_r4() -> Candidate {
-    vec!["swapf 0x020,W,A", "andlw 0x0F", "movwf 0x020,A"]
-}
+use superopt::specs::{
+    shift_right_4_candidate as construction_r4, shift_right_4_cases_over as cases_over,
+    shift_right_4_exhaustive as cases_exhaustive,
+};
+use superopt::verify;
 
 #[test]
 fn right_shift_4_single_lane_is_exact_over_the_byte_domain() {
     let c = construction_r4();
     assert!(
-        verify(&c, &cases_exhaustive(4)),
+        verify(&c, &cases_exhaustive()),
         "r==4 construction must be exact over all 256 inputs"
     );
 }

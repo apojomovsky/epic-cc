@@ -30,10 +30,12 @@
 //! days, and the ticket names the curated-sample treatment for exactly this
 //! width.
 
-use pic14_sim::Pic18;
-use superopt::{verify, Candidate, Case, STATUS_ADDR, STATUS_C_BIT};
+use superopt::specs::{
+    cases_with32 as cases_with, shift_32bit_family as construction_shl_family,
+    swept_words32 as swept_words,
+};
+use superopt::{verify, Candidate};
 
-const BASE: usize = 0x020;
 const W_SAMPLE: &[u8] = &[0x00, 0xFF, 0x2A];
 
 /// Curated 4-byte operands: all-zero, all-one, nibble-swapped lanes, a
@@ -52,46 +54,6 @@ fn sample_words() -> Vec<[u8; 4]> {
         [0x55, 0xAA, 0x55, 0xAA],
         [0x01, 0x80, 0x40, 0x20],
     ]
-}
-
-fn cases_with(
-    shift: fn(u32, u32) -> u32,
-    amount: u32,
-    words: &[[u8; 4]],
-    w_values: &[u8],
-) -> Vec<Case> {
-    let mut cases = Vec::new();
-    for &[b0, b1, b2, b3] in words {
-        for &w in w_values {
-            for c in [false, true] {
-                let x = u32::from(b0)
-                    | (u32::from(b1) << 8)
-                    | (u32::from(b2) << 16)
-                    | (u32::from(b3) << 24);
-                let expect = shift(x, amount);
-                let e = expect.to_le_bytes();
-                let status = if c { STATUS_C_BIT } else { 0 };
-                cases.push(Case {
-                    entry_w: w,
-                    pokes: vec![
-                        (BASE, b0),
-                        (BASE + 1, b1),
-                        (BASE + 2, b2),
-                        (BASE + 3, b3),
-                        (STATUS_ADDR, status),
-                    ],
-                    allowed_changes: vec![BASE, BASE + 1, BASE + 2, BASE + 3],
-                    check: Box::new(move |sim: &Pic18| {
-                        sim.ram()[BASE] == e[0]
-                            && sim.ram()[BASE + 1] == e[1]
-                            && sim.ram()[BASE + 2] == e[2]
-                            && sim.ram()[BASE + 3] == e[3]
-                    }),
-                });
-            }
-        }
-    }
-    cases
 }
 
 /// In-place, W-only, high-to-low (so no lane reads a byte already
@@ -210,85 +172,8 @@ fn left_shift_32bit_by_5_is_correct_and_also_loses() {
 // docs/41-superopt-spike-findings.md, Target 3; the tests below are the
 // gate that keeps those claims honest.
 
-/// A much wider operand set than `sample_words`, for the fused forms that
-/// actually win and so will be wired: every value in each byte lane
-/// independently (4 * 256 cases, catching any per-lane mask or index error),
-/// a few cross-lane patterns, and a deterministic pseudo-random sweep for
-/// the carry interactions across lane boundaries. Still not the full 2^32
-/// domain (days at this crate's per-case cost), but structurally exhaustive
-/// in the dimension a fixed construction can get wrong: which bits of which
-/// byte land where.
-fn swept_words() -> Vec<[u8; 4]> {
-    let mut v: Vec<[u8; 4]> = Vec::new();
-    // Baseline pattern with distinctive bytes in every position.
-    let base = [0x12u8, 0x34, 0x56, 0x78];
-    for lane in 0..4usize {
-        for b in 0..=u8::MAX {
-            let mut w = base;
-            w[lane] = b;
-            v.push(w);
-        }
-    }
-    // Boundary and alternating patterns.
-    for w in [
-        [0x00, 0x00, 0x00, 0x00],
-        [0xFF, 0xFF, 0xFF, 0xFF],
-        [0x01, 0x00, 0x00, 0x80],
-        [0x80, 0x00, 0x00, 0x01],
-        [0xAA, 0x55, 0xAA, 0x55],
-    ] {
-        v.push(w);
-    }
-    // Deterministic LCG: no dependency on a thread RNG, reproducible across
-    // runs so a failure is always replayable.
-    let mut state: u32 = 0x1234_5678;
-    for _ in 0..4096 {
-        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-        v.push(state.to_le_bytes());
-    }
-    v
-}
-
-/// The general 4-lane left-shift family: rotate every byte right by `8 - r`
-/// with `RRNCF`, then recombine high-to-low. The `MOVLW` literals are static
-/// because `Candidate` holds `&'static str`. Amounts 4 and 5 are included
-/// as the fusion attempt for epic-cc#573: one rotation phase covering the
-/// nibble and the extra bits together, instead of a nibble pass plus a
-/// single-bit pass.
-fn construction_shl_family(r: u32) -> Candidate {
-    // (rotate count, MOVLW hi, MOVLW lo) per amount with a fused form.
-    let (rot, hi, lo) = match r {
-        4 => (4, "movlw 0xF0", "andlw 0x0F"),
-        5 => (3, "movlw 0xE0", "andlw 0x1F"),
-        6 => (2, "movlw 0xC0", "andlw 0x3F"),
-        7 => (1, "movlw 0x80", "andlw 0x7F"),
-        _ => unreachable!("only the amounts with a fused form"),
-    };
-    let mut c: Candidate = Vec::new();
-    for _ in 0..rot {
-        for a in [
-            "rrncf 0x023,F,A",
-            "rrncf 0x022,F,A",
-            "rrncf 0x021,F,A",
-            "rrncf 0x020,F,A",
-        ] {
-            c.push(a);
-        }
-    }
-    // Combine high-to-low so each lane reads its pristine lower neighbour
-    // before that neighbour is rewritten.
-    for b in (1..4usize).rev() {
-        // Lane `b` lives at 0x020 + b; its lower neighbour at 0x020 + b - 1.
-        c.push(hi);
-        c.push(["andwf 0x021,F,A", "andwf 0x022,F,A", "andwf 0x023,F,A"][b - 1]);
-        c.push(["movf 0x020,W,A", "movf 0x021,W,A", "movf 0x022,W,A"][b - 1]);
-        c.push(lo);
-        c.push(["iorwf 0x021,F,A", "iorwf 0x022,F,A", "iorwf 0x023,F,A"][b - 1]);
-    }
-    c.push(hi);
-    c.push("andwf 0x020,F,A");
-    c
-}
+/// `swept_words`, the 4-lane family, and their derivation notes moved to
+/// `superopt::specs`, shared with the MDB oracle.
 
 #[test]
 fn left_shift_32bit_by_6_fused_form_wins() {
