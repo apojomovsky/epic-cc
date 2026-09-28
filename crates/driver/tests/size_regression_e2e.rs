@@ -15,7 +15,10 @@
 //! requires a conscious `UPDATE_SIZE_BASELINE=1 cargo test -p driver
 //! --test size_regression_e2e` run to accept it (rewrites the file; diff
 //! it before committing, same as reviewing any other snapshot change).
-//!
+//! `SIZE_BASELINE_ONLY=a,b` scopes the rewrite to the named rows (exact
+//! `Case.name` match); other rows keep their recorded values and foreign
+//! drift is printed by name instead of absorbed. Every update run prints
+//! which rows changed, so run with `-- --nocapture` to see the report.
 //! `SIZE_REPORT_JSON=1` turns the measurement pass into a machine-readable
 //! dump (one JSON array between marker lines, needs `-- --nocapture`) for
 //! `make size-report`. It prints and returns before any assertion, so a
@@ -72,6 +75,85 @@ fn save_baseline(b: &Baseline) {
     );
     text.push_str(&toml::to_string_pretty(b).expect("serialize baseline"));
     std::fs::write(baseline_path(), text).expect("write size_baseline.toml");
+}
+fn parse_only_filter(valid: &[String]) -> Option<std::collections::HashSet<String>> {
+    let raw = std::env::var("SIZE_BASELINE_ONLY").ok()?;
+    let names: std::collections::HashSet<String> = raw
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    for n in &names {
+        assert!(
+            valid.iter().any(|v| v == n),
+            "SIZE_BASELINE_ONLY={n} matches no size case"
+        );
+    }
+    Some(names)
+}
+
+/// Merge measured values over the loaded baseline. Without a filter every
+/// row comes from measured. With a filter only listed rows are taken from
+/// measured; every other row keeps its baseline value verbatim, so a
+/// stacked branch cannot absorb foreign rows. A non-filter row that shrank
+/// keeps its higher baseline value on purpose: shrinking is free under the
+/// gate, and the gain lands when its owner re-baselines. A new case not in
+/// the filter is skipped, not added. Returns rows to save plus updated and
+/// skipped report lines; updated lines carry old->new values for the PR body.
+fn merge_baseline(
+    baseline: &Baseline,
+    measured: &[BaselineEntry],
+    filter: Option<&std::collections::HashSet<String>>,
+) -> (Vec<BaselineEntry>, Vec<String>, Vec<String>) {
+    let mut to_save = Vec::with_capacity(measured.len());
+    let mut updated = Vec::new();
+    let mut skipped = Vec::new();
+    for m in measured {
+        let base = baseline.entry.iter().find(|e| e.name == m.name);
+        if filter.is_some_and(|f| !f.contains(&m.name)) {
+            match base {
+                Some(b) => {
+                    to_save.push(b.clone());
+                    if b.flash_words != m.flash_words || b.ram_bytes != m.ram_bytes {
+                        skipped.push(format!(
+                            "SKIPPED (not in SIZE_BASELINE_ONLY) {}: measured flash {} RAM {}, kept baseline flash {} RAM {}",
+                            m.name, m.flash_words, m.ram_bytes, b.flash_words, b.ram_bytes
+                        ));
+                    }
+                }
+                None => {
+                    skipped.push(format!(
+                        "SKIPPED (not in SIZE_BASELINE_ONLY) {}: new case, not added (measured flash {} RAM {})",
+                        m.name, m.flash_words, m.ram_bytes
+                    ));
+                }
+            }
+            continue;
+        }
+        match base {
+            Some(b) if b.flash_words == m.flash_words && b.ram_bytes == m.ram_bytes => {
+                to_save.push(m.clone());
+            }
+            Some(b) => {
+                updated.push(format!(
+                    "UPDATED {}: flash {}->{} RAM {}->{}",
+                    m.name, b.flash_words, m.flash_words, b.ram_bytes, m.ram_bytes
+                ));
+                to_save.push(m.clone());
+            }
+            None => {
+                updated.push(format!(
+                    "UPDATED {}: new entry (flash {} RAM {})",
+                    m.name, m.flash_words, m.ram_bytes
+                ));
+                to_save.push(m.clone());
+            }
+        }
+    }
+    (to_save, updated, skipped)
 }
 
 /// One ladder entry: what to compile, and under which device.
@@ -580,6 +662,10 @@ fn flash_and_ram_do_not_regress() {
     let mut failures = Vec::new();
 
     let cases = cases();
+    // Validate the filter before measuring: a typo must fail fast, not
+    // after minutes of compiling every case.
+    let valid: Vec<String> = cases.iter().map(|c| c.name.to_string()).collect();
+    let filter = update.then(|| parse_only_filter(&valid)).flatten();
     for c in &cases {
         let report = measure(c);
         let flash_words = parse_after(&report, "flash: ");
@@ -645,7 +731,17 @@ fn flash_and_ram_do_not_regress() {
     }
 
     if update {
-        save_baseline(&Baseline { entry: measured });
+        let (to_save, updated, skipped) = merge_baseline(&baseline, &measured, filter.as_ref());
+        save_baseline(&Baseline { entry: to_save });
+        if updated.is_empty() && skipped.is_empty() {
+            println!("size baseline: no changes");
+        }
+        for line in &updated {
+            println!("size baseline: {line}");
+        }
+        for line in &skipped {
+            println!("size baseline: {line}");
+        }
         return;
     }
 
@@ -755,4 +851,101 @@ fn drift_report_flags_a_baseline_above_the_measured_value() {
             && msg.contains("is 12 above"),
         "the message must name the row, both numbers and the headroom: {msg}"
     );
+}
+
+#[test]
+fn merge_baseline_scoped_filter_keeps_foreign_rows() {
+    let baseline = Baseline {
+        entry: vec![
+            BaselineEntry {
+                name: "a".into(),
+                device: "d".into(),
+                flash_words: 100,
+                ram_bytes: 10,
+            },
+            BaselineEntry {
+                name: "b".into(),
+                device: "d".into(),
+                flash_words: 200,
+                ram_bytes: 20,
+            },
+        ],
+    };
+    let measured = vec![
+        BaselineEntry {
+            name: "a".into(),
+            device: "d".into(),
+            flash_words: 110,
+            ram_bytes: 10,
+        },
+        BaselineEntry {
+            name: "b".into(),
+            device: "d".into(),
+            flash_words: 190,
+            ram_bytes: 20,
+        },
+    ];
+    let filter: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
+    let (saved, updated, skipped) = merge_baseline(&baseline, &measured, Some(&filter));
+    assert_eq!(
+        saved[0].flash_words, 110,
+        "filtered row takes the measured value"
+    );
+    assert_eq!(
+        saved[1].flash_words, 200,
+        "foreign shrink is kept at baseline, the gain lands with its owner"
+    );
+    assert!(
+        updated
+            .iter()
+            .any(|l| l.contains("a") && l.contains("100->110")),
+        "updated rows quote old->new for the PR body"
+    );
+    assert!(
+        skipped.iter().any(|l| l.contains('b')),
+        "foreign drift is reported by name"
+    );
+}
+
+#[test]
+fn merge_baseline_skips_new_case_outside_filter() {
+    let baseline = Baseline { entry: vec![] };
+    let measured = vec![BaselineEntry {
+        name: "new-case".into(),
+        device: "d".into(),
+        flash_words: 50,
+        ram_bytes: 5,
+    }];
+    let filter: std::collections::HashSet<String> = ["other".to_string()].into_iter().collect();
+    let (saved, _, skipped) = merge_baseline(&baseline, &measured, Some(&filter));
+    assert!(
+        saved.is_empty(),
+        "a new case outside the filter must not be added"
+    );
+    assert!(
+        skipped.iter().any(|l| l.contains("new-case")),
+        "the skipped new case is reported by name"
+    );
+}
+
+#[test]
+fn merge_baseline_without_filter_rewrites_changed_rows() {
+    let baseline = Baseline {
+        entry: vec![BaselineEntry {
+            name: "a".into(),
+            device: "d".into(),
+            flash_words: 100,
+            ram_bytes: 10,
+        }],
+    };
+    let measured = vec![BaselineEntry {
+        name: "a".into(),
+        device: "d".into(),
+        flash_words: 105,
+        ram_bytes: 10,
+    }];
+    let (saved, updated, skipped) = merge_baseline(&baseline, &measured, None);
+    assert_eq!(saved[0].flash_words, 105);
+    assert_eq!(updated.len(), 1);
+    assert!(skipped.is_empty());
 }
