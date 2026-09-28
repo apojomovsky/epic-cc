@@ -283,11 +283,17 @@ fn zext_i1_to_i8_copies_the_icmp_byte() {
         ("main::z", 0x29),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // The zext copies the icmp result byte into %z: MOVF 0x28, W; MOVWF 0x29.
-    assert!(asm.contains("MOVF 0x28, W"), "load the icmp byte:\n{asm}");
+    // The zext copies the icmp result byte into %z: MOVWF 0x28 puts it
+    // there and tracks it in W, so the old MOVF 0x28, W reload elides
+    // (epic-cc#602) and MOVWF 0x29 alone re-stores W's value.
+    assert!(asm.contains("MOVWF 0x28"), "materialize stores %c:\n{asm}");
     assert!(
         asm.contains("MOVWF 0x29"),
         "copy into %z (i1 is 1 byte, so the zext IS the copy):\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVF 0x28, W"),
+        "reload elided (W already holds %c):\n{asm}"
     );
 }
 

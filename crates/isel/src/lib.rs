@@ -179,6 +179,15 @@ struct Gen<'m> {
     /// it, so a stale belief survives only across adjacent `emit_w_*` calls
     /// within one function (epic-cc#214, epic-cc#217).
     w_holds: Option<u16>,
+    /// The flag relation `emit_materialize` left in dst, as the STATUS bit
+    /// and the BTFSC/BTFSS choice that tests it, valid only until the next
+    /// plain `emit` (same lifetime as `w_holds`). `emit_cond_branch` uses it
+    /// to branch on the compare's own flag instead of reloading the
+    /// materialized i1: for a Z-materialized eq the reload is what inverts
+    /// the relation (Z = Z_cmp but the branch needs !Z_cmp), so elision
+    /// must flip the skip polarity, not just skip the MOVF. `None` for
+    /// composites (`C&&!Z`, `!C||Z`), whose dst is not a single flag.
+    z_rel: Option<(u8, &'static str)>,
     /// The source location of the instruction currently being emitted, or
     /// `None` for compiler-generated glue (prologue, `__start`, const init,
     /// runtime routines). `emit` records it on the line it pushes, so the
@@ -193,6 +202,7 @@ struct Gen<'m> {
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
         self.w_holds = None;
+        self.z_rel = None;
         self.out.push(s.into());
         self.locs.push(self.cur_loc.clone());
     }
@@ -206,6 +216,10 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVWF 0x{addr:02X}"));
         }
         self.w_holds = Some(addr);
+        // The skipped-MOVWF path never hits `emit`, so the flag relation
+        // from an earlier materialize would survive into a later branch on
+        // a different slot; W is this store's value now, not the compare's.
+        self.z_rel = None;
     }
 
     /// `MOVF addr, W`, unless `addr`'s value is already known to be in W:
@@ -218,6 +232,10 @@ impl<'m> Gen<'m> {
             self.emit(format!("    MOVF 0x{addr:02X}, W"));
         }
         self.w_holds = Some(addr);
+        // Same reason as emit_w_store: a skipped MOVF skips its `emit`, so
+        // a stale flag relation must not outlive the reload; a MOVF also
+        // resets Z to (addr == 0), which is not the compare's Z.
+        self.z_rel = None;
     }
 
     /// The restore pair: `MOVLW PAGE(<cur_func>); MOVWF PCLATH`, right
@@ -1688,7 +1706,21 @@ impl<'m> Gen<'m> {
             self.emit("    BTFSC STATUS, 2 ; Z".to_string());
             self.emit(format!("    {adj2}"));
         }
-        self.emit(format!("    MOVWF 0x{dst:02X}"));
+        // Store the i1 through the tracker, then record which single flag it
+        // reflects (after the store: emit_w_store's emit() would clear it).
+        // The branch path can then test that flag directly with the polarity
+        // below instead of reloading dst. For "Z" dst holds !Z_cmp (1 when
+        // equal), so the flip: BTFSS STATUS,2 skips GOTO f exactly when
+        // Z_cmp is set, i.e. dst != 0, cond true. Composites leave None:
+        // dst is not one flag's value, so the branch must reload.
+        self.emit_w_store(dst);
+        self.z_rel = match cond {
+            "Z" => Some((2, "BTFSS")),
+            "!Z" => Some((2, "BTFSC")),
+            "C" => Some((0, "BTFSS")),
+            "!C" => Some((0, "BTFSC")),
+            _ => None,
+        };
     }
 
     /// Branch on `cond`: Z = (cond == 0); if Z is set (cond == 0) go to `f`,
@@ -1697,8 +1729,25 @@ impl<'m> Gen<'m> {
         match cond {
             Val::Reg(r) => {
                 let ca = self.val_addr(&Val::Reg(r.clone())).direct();
-                self.emit(format!("    MOVF 0x{ca:02X}, W"));
-                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                // A just-materialized cond leaves both z_rel (the compare's
+                // STATUS bit + skip polarity) and w_holds == dst. MOVLW/MOVWF
+                // touch no STATUS bits on mid-range PIC14, so branch on the
+                // flag directly. Composites leave z_rel None (their BTFx must
+                // test the MOVF's own Z, dst == 0, not the compare's raw flag):
+                // force the MOVF for them.
+                let rel = match self.z_rel {
+                    Some(r) if self.w_holds == Some(ca) => Some(r),
+                    _ => None,
+                };
+                match rel {
+                    Some((bit, skip)) => {
+                        self.emit(format!("    {skip} STATUS, {bit} ; Z"));
+                    }
+                    None => {
+                        self.emit(format!("    MOVF 0x{ca:02X}, W"));
+                        self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                    }
+                }
                 self.emit(format!("    GOTO {f}"));
                 self.emit(format!("    GOTO {t}"));
             }
@@ -1818,8 +1867,19 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => self.val_addr(&Val::Reg(r.clone())).direct(),
             _ => unreachable!(),
         };
-        self.emit(format!("    MOVF 0x{ca:02X}, W"));
-        self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+        // Same flag-relation rule as emit_cond_branch: branch on the
+        // compare's own STATUS bit only when the materialize left a real
+        // relation and W still holds dst; composites take an unconditional
+        // MOVF whose own Z the BTFSC tests.
+        match self.z_rel.filter(|_| self.w_holds == Some(ca)) {
+            Some((bit, skip)) => {
+                self.emit(format!("    {skip} STATUS, {bit} ; Z"));
+            }
+            None => {
+                self.emit(format!("    MOVF 0x{ca:02X}, W"));
+                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+            }
+        }
         self.emit(format!("    GOTO {l_else}"));
         if addr_value {
             self.emit_move_addr_to_slot(a, da);
@@ -6178,17 +6238,43 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                     match &bc.cond {
                         Val::Reg(r) => {
                             let ca = g.val_addr(&Val::Reg(r.clone())).direct();
-                            g.emit(format!("    MOVF 0x{ca:02X}, W"));
+                            // Same flag-relation elision as emit_cond_branch:
+                            // a just-materialized cond branches on the
+                            // compare's own STATUS bit (skip polarity from
+                            // emit_materialize), everything else takes an
+                            // UNCONDITIONAL reload (never emit_w_load, which
+                            // would skip the MOVF when w_holds already holds
+                            // dst and leave the compare's raw Z in place).
+                            let rel = match g.z_rel {
+                                Some(r) if g.w_holds == Some(ca) => Some(r),
+                                _ => None,
+                            };
+                            // Emission lives in the shape arms below. The
+                            // phi-copy shapes ALWAYS reload unconditionally:
+                            // their hardcoded BTFx read the MOVF's Z, and a
+                            // composite's materialize leaves W holding dst so
+                            // even emit_w_load would skip it. Their elision
+                            // is epic-cc#714.
                             match (t_copies, f_copies) {
-                                // Plain branch: the classic BTFSC skip shape.
-                                (None, None) => {
-                                    g.emit("    BTFSC STATUS, 2 ; Z".to_string());
-                                    g.emit(format!("    GOTO {lf}"));
-                                    g.emit(format!("    GOTO {lt}"));
-                                }
+                                (None, None) => match rel {
+                                    // The classic skip shape: branch on the
+                                    // live relation when set, else the MOVF's Z.
+                                    Some((bit, skip)) => {
+                                        g.emit(format!("    {skip} STATUS, {bit} ; Z"));
+                                        g.emit(format!("    GOTO {lf}"));
+                                        g.emit(format!("    GOTO {lt}"));
+                                    }
+                                    None => {
+                                        g.emit(format!("    MOVF 0x{ca:02X}, W"));
+                                        g.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                                        g.emit(format!("    GOTO {lf}"));
+                                        g.emit(format!("    GOTO {lt}"));
+                                    }
+                                },
                                 // Both targets are merges: f falls through to
                                 // its copies, t jumps to a copy block.
                                 (Some(ct), Some(cf)) => {
+                                    g.emit(format!("    MOVF 0x{ca:02X}, W"));
                                     let lcop = g.fresh_label();
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lcop}"));
@@ -6205,6 +6291,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 // The copies feed the f (cond==0 fall-through)
                                 // edge: skip over them to t when cond != 0.
                                 (_, Some(c)) => {
+                                    g.emit(format!("    MOVF 0x{ca:02X}, W"));
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lt}"));
                                     g.emit(format!(
@@ -6217,6 +6304,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 // The copies feed the t (cond!=0 jump) edge:
                                 // skip over f to them when cond == 0.
                                 (Some(c), None) => {
+                                    g.emit(format!("    MOVF 0x{ca:02X}, W"));
                                     g.emit("    BTFSC STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lf}"));
                                     g.emit(format!(
@@ -6865,6 +6953,7 @@ pub fn select_with_locs(
                 tmp: &mut tmp,
                 page_of: None,
                 w_holds: None,
+                z_rel: None,
                 cur_loc: None,
                 out: Vec::new(),
                 locs: Vec::new(),
@@ -7151,6 +7240,7 @@ pub fn select_with_locs(
                     tmp: &mut tmp,
                     page_of: Some(&pages),
                     w_holds: None,
+                    z_rel: None,
                     cur_loc: None,
                     out: Vec::new(),
                     locs: Vec::new(),
