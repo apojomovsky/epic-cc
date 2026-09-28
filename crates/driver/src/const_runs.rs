@@ -25,9 +25,12 @@ const STORE_RUN_MIN_BYTES: usize = 10;
 /// A memcpy length rides one byte; longer runs split into several tables.
 const MAX_COPY_LEN: usize = 255;
 
-/// Table flash-target constant copies. No-op on every core but PIC18.
+/// Table flash-target constant copies. No-op on every core but PIC18, and
+/// in ISR modules: legalize's cross-context rewrite matches stored values
+/// and call args, never table refs, so a tabled function address would
+/// keep its main-context spelling in ISR code.
 pub fn run(m: &mut Module, core: Core) {
-    if !matches!(core, Core::Pic18) {
+    if !matches!(core, Core::Pic18) || m.funcs.iter().any(|f| f.isr) {
         return;
     }
     forward_const_loads(m);
@@ -302,13 +305,13 @@ fn table_store_runs(m: &mut Module) {
     for f in &mut m.funcs {
         for b in &mut f.blocks {
             // Member idxs to remove, and (last member idx, replacement
-            // insts, table global): collected during the read-only scan.
+            // insts): collected during the read-only scan.
             let mut removals: Vec<usize> = Vec::new();
-            let mut inserts: Vec<(usize, Vec<Inst>, Global)> = Vec::new();
+            let mut inserts: Vec<(usize, Vec<Inst>)> = Vec::new();
             let mut open: Option<Run> = None;
             let flush = |open: &mut Option<Run>,
                          removals: &mut Vec<usize>,
-                         inserts: &mut Vec<(usize, Vec<Inst>, Global)>,
+                         inserts: &mut Vec<(usize, Vec<Inst>)>,
                          table: &mut Vec<Global>,
                          ctr: &mut usize| {
                 let Some(run) = open.take() else { return };
@@ -371,8 +374,8 @@ fn table_store_runs(m: &mut Module) {
                 for member in &run.members {
                     removals.push(member.idx);
                 }
-                table.push(global.clone());
-                inserts.push((last, insts, global));
+                table.push(global);
+                inserts.push((last, insts));
             };
             for (idx, inst) in b.insts.iter().enumerate() {
                 match inst {
@@ -440,9 +443,9 @@ fn table_store_runs(m: &mut Module) {
             for idx in removals.iter().rev() {
                 b.insts.remove(*idx);
             }
-            inserts.sort_by_key(|(last, _, _)| *last);
+            inserts.sort_by_key(|(last, _)| *last);
             let mut shift = 0usize;
-            for (last, insts, _) in inserts {
+            for (last, insts) in inserts {
                 // `last` is a pre-removal index: subtract the members
                 // removed before it, then add the insts already inserted.
                 let removed_before = removals.iter().filter(|r| **r < last).count();
@@ -485,6 +488,61 @@ mod tests {
             naked: false,
             variadic: false,
         }
+    }
+
+    /// ISR modules keep pre-pass IR: legalize's cross-context rewrite
+    /// matches stored values and call args, never table refs, so a tabled
+    /// function address would keep its main-context spelling in ISR code.
+    #[test]
+    fn isr_modules_keep_their_ir() {
+        let mut m = empty_module();
+        m.funcs.push(Func {
+            name: "f".to_string(),
+            ret: None,
+            params: Vec::new(),
+            blocks: vec![Block {
+                label: "entry".to_string(),
+                insts: vec![Inst::Ret(None, None)],
+            }],
+            isr: false,
+            irq_priority: 0,
+            naked: false,
+            variadic: false,
+        });
+        let mut insts = vec![Inst::Alloca(Alloca {
+            dst: "a".to_string(),
+            size: 12,
+            loc: None,
+        })];
+        insts.push(Inst::Store(Store {
+            ty: Ty::I16,
+            val: Val::Global("f".to_string()),
+            ptr: "%a".to_string(),
+            loc: None,
+        }));
+        for (g, k) in [("g2", 2u16), ("g3", 6u16), ("g4", 10u16)] {
+            insts.push(Inst::Gep(Gep {
+                dst: g.to_string(),
+                base: GepBase::Reg("a".to_string()),
+                k,
+                terms: Vec::new(),
+                loc: None,
+            }));
+            let ty = if k == 10 { Ty::I16 } else { Ty::I32 };
+            insts.push(Inst::Store(Store {
+                ty,
+                val: Val::Const(0x01020304),
+                ptr: format!("%{g}"),
+                loc: None,
+            }));
+        }
+        let mut isr = main_func(insts);
+        isr.name = "isr".to_string();
+        isr.isr = true;
+        m.funcs.push(isr);
+        run(&mut m, Core::Pic18);
+        assert!(m.globals.is_empty(), "no table may form in an ISR module");
+        assert_eq!(m.funcs[1].blocks[0].insts.len(), 8, "stores stay inline");
     }
 
     #[test]
