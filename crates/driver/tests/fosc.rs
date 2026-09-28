@@ -95,6 +95,11 @@ const J_SERIES_PIC18: Device = Device {
                         bits: 0,
                     },
                     FuseValue {
+                        name: "intosco",
+                        aliases: &[],
+                        bits: 1,
+                    },
+                    FuseValue {
                         name: "intoscpll",
                         aliases: &[],
                         bits: 2,
@@ -193,9 +198,11 @@ fn pic18_hs_no_pll_cpudiv2_divides_the_crystal() {
 }
 
 #[test]
-#[should_panic(expected = "xtal_hz")]
-fn pic14_xt_without_xtal_hz_panics() {
-    resolve_fosc_hz(&PIC16F877A, "osc=xt");
+fn pic14_xt_without_xtal_hz_is_unknown_until_needed() {
+    // docs/46 D-4: no source at all is fine until something needs the
+    // clock; the crystal-less config fixes nothing, so hz stays 0.
+    let hz = resolve_fosc_hz(&PIC16F877A, "osc=xt");
+    assert_eq!(hz, 0);
 }
 
 #[test]
@@ -230,6 +237,11 @@ fn j_series_intosc_is_8mhz() {
     let hz = resolve_fosc_hz(&J_SERIES_PIC18, "osc=intosc");
     assert_eq!(hz, 8_000_000);
 }
+#[test]
+fn j_series_intosco_is_8mhz() {
+    let hz = resolve_fosc_hz(&J_SERIES_PIC18, "osc=intosco");
+    assert_eq!(hz, 8_000_000);
+}
 
 #[test]
 fn j_series_hspll_divides_the_fixed_48mhz_usb_clock_not_96mhz() {
@@ -258,26 +270,195 @@ fn j_series_intoscpll_refuses_rather_than_guesses() {
 }
 
 #[test]
-fn pragma_falls_back_to_erased_before_needing_xtal() {
-    // epic-cc#706: an 877A pragma without FOSC reads the erased nibble
-    // (rc), so the failure names the missing crystal, not a missing
-    // default. The strict spelling still reports EPIC_CONFIG.
-    let err = driver::fosc::try_resolve_fosc_hz(&PIC16F877A, "", device::ConfigSpelling::Pragma)
-        .unwrap_err();
-    assert!(err.contains("xtal_hz"), "message: {err}");
-    let err =
-        driver::fosc::try_resolve_fosc_hz(&PIC16F877A, "", device::ConfigSpelling::EpicConfig)
-            .unwrap_err();
+fn pragma_without_a_derivable_clock_is_unknown() {
+    // epic-cc#706 left the erased fallback in resolution; docs/46 D-4
+    // turns the old missing-crystal error into an unknown clock: an 877A
+    // pragma without FOSC reads the erased nibble (rc) and still needs a
+    // crystal, while the strict spelling keeps reporting EPIC_CONFIG.
+    let clock = driver::fosc::try_resolve_clock(
+        &PIC16F877A,
+        Some(("", device::ConfigSpelling::Pragma)),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(clock.hz, 0);
+    let err = driver::fosc::try_resolve_clock(
+        &PIC16F877A,
+        Some(("", device::ConfigSpelling::EpicConfig)),
+        None,
+        None,
+    )
+    .unwrap_err();
     assert!(err.contains("EPIC_CONFIG"), "message: {err}");
 }
 
 #[test]
-fn pragma_names_itself_when_erased_names_no_value() {
-    // The 4550's erased osc nibble (0xF) is past the last mode, so a
-    // pragma that omits FOSC cannot derive a clock: the error must name
-    // the spelling actually used.
-    let err =
-        driver::fosc::try_resolve_fosc_hz(&PIC18F4550, "wdt=off", device::ConfigSpelling::Pragma)
-            .unwrap_err();
-    assert!(err.contains("#pragma config"), "message: {err}");
+fn pragma_falls_through_to_xtal_freq() {
+    // The 4550's erased osc nibble (0xF) names no value, so the config
+    // fixes nothing and the code's _XTAL_FREQ wins without an error.
+    let clock = driver::fosc::try_resolve_clock(
+        &PIC18F4550,
+        Some(("wdt=off", device::ConfigSpelling::Pragma)),
+        Some(8_000_000),
+        None,
+    )
+    .unwrap();
+    assert_eq!(clock.hz, 8_000_000);
+    assert_eq!(clock.from, Some(driver::fosc::ClockFrom::XtalFreq));
+    assert_eq!(clock.mode, None);
+}
+
+#[test]
+fn disagreeing_sources_fail_naming_both_values() {
+    let err = driver::fosc::try_resolve_clock(
+        &PIC16F877A,
+        Some((
+            "osc=xt, xtal_hz=4000000",
+            device::ConfigSpelling::EpicConfig,
+        )),
+        Some(8_000_000),
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("4000000"), "message: {err}");
+    assert!(err.contains("8000000"), "message: {err}");
+    assert!(err.contains("the config"), "message: {err}");
+    assert!(err.contains("_XTAL_FREQ"), "message: {err}");
+}
+
+#[test]
+fn agreeing_sources_resolve_once() {
+    let clock = driver::fosc::try_resolve_clock(
+        &PIC16F877A,
+        Some((
+            "osc=xt, xtal_hz=4000000",
+            device::ConfigSpelling::EpicConfig,
+        )),
+        Some(4_000_000),
+        Some(4_000_000),
+    )
+    .unwrap();
+    assert_eq!(clock.hz, 4_000_000);
+    assert_eq!(clock.from, Some(driver::fosc::ClockFrom::Config));
+    assert_eq!(clock.mode.as_deref(), Some("xt"));
+}
+
+#[test]
+fn f_cpu_is_the_last_resort_source() {
+    let clock = driver::fosc::try_resolve_clock(&PIC16F877A, None, None, Some(16_000_000)).unwrap();
+    assert_eq!(clock.hz, 16_000_000);
+    assert_eq!(clock.from, Some(driver::fosc::ClockFrom::BoardCpu));
+}
+
+#[test]
+fn intosc_on_pic14_parts_runs_at_4mhz() {
+    // epic-cc#691: the 628A and 12F675 select the factory-calibrated 4 MHz
+    // internal oscillator, which used to demand an xtal_hz and panic.
+    for (part, value) in [("p16f628a", "intosc_noclkout"), ("p12f675", "intoscio")] {
+        let dev = device::by_name(part).unwrap();
+        let clock = driver::fosc::try_resolve_clock(
+            dev,
+            Some((
+                &format!("osc={value}, pwrt=on"),
+                device::ConfigSpelling::EpicConfig,
+            )),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(clock.hz, 4_000_000, "{part}");
+    }
+}
+
+#[test]
+fn tunable_intosc_falls_through_instead_of_guessing() {
+    // The 887 tunes its internal rate via OSCCON/IRCF, so its fuses fix
+    // no rate: the declared crystal wins, and silence without one.
+    let dev = device::by_name("p16f887").unwrap();
+    let clock = driver::fosc::try_resolve_clock(
+        dev,
+        Some((
+            "osc=intosc_noclkout, xtal_hz=8000000",
+            device::ConfigSpelling::EpicConfig,
+        )),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(clock.hz, 8_000_000);
+    let clock = driver::fosc::try_resolve_clock(
+        dev,
+        Some(("osc=intosc_noclkout", device::ConfigSpelling::EpicConfig)),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(clock.hz, 0);
+}
+
+#[test]
+fn contradictory_internal_xtal_fails_naming_both() {
+    let dev = device::by_name("p16f628a").unwrap();
+    let err = driver::fosc::try_resolve_clock(
+        dev,
+        Some((
+            "osc=intosc_noclkout, pwrt=on, xtal_hz=8000000",
+            device::ConfigSpelling::EpicConfig,
+        )),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(err.contains("4000000"), "message: {err}");
+    assert!(err.contains("8000000"), "message: {err}");
+}
+
+#[test]
+fn software_selected_hfintosc_falls_through_to_the_declared_rate() {
+    // Bare `intosc` (the Enhanced family's HFINTOSC) names no fixed rate,
+    // so the config fixes nothing: the declared crystal wins when present,
+    // otherwise the clock stays unknown instead of guessing.
+    let dev = device::by_name("p16f1937").unwrap();
+    let clock = driver::fosc::try_resolve_clock(
+        dev,
+        Some((
+            "osc=intosc, xtal_hz=16000000",
+            device::ConfigSpelling::EpicConfig,
+        )),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(clock.hz, 16_000_000);
+    let clock = driver::fosc::try_resolve_clock(
+        dev,
+        Some(("osc=intosc", device::ConfigSpelling::EpicConfig)),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(clock.hz, 0);
+}
+
+#[test]
+fn header_line_names_part_rate_and_mode() {
+    let clock = driver::fosc::Clock {
+        hz: 20_000_000,
+        from: Some(driver::fosc::ClockFrom::Config),
+        mode: Some("hs".to_string()),
+    };
+    assert_eq!(
+        driver::fosc::header_line(&PIC16F877A, &clock),
+        "epic-cc: PIC16F877A @ 20 MHz (HS)"
+    );
+    let unknown = driver::fosc::Clock {
+        hz: 0,
+        from: None,
+        mode: None,
+    };
+    assert_eq!(
+        driver::fosc::header_line(&PIC16F877A, &unknown),
+        "epic-cc: PIC16F877A @ unknown"
+    );
 }
