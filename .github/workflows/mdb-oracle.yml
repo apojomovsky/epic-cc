@@ -1,0 +1,142 @@
+name: mdb-oracle
+
+# MPLAB SIM execution oracle for superopt sequences (epic-cc#712): per-PR
+# pr tier on oracle-input changes, nightly sweep on schedule. Sessions run
+# in epic-hal's private toolchain image (same pull as its family-check).
+# Setup, not code: ghcr.io/<owner>/epic-hal-ci must grant this repo read
+# access, else the pull 401s (legacy pic8-hal-ci fallback included).
+
+on:
+  pull_request:
+    paths:
+      - crates/superopt/**
+      - crates/sim/**
+      - crates/asm/**
+      - crates/isel-pic18/**
+      - scripts/mdb-oracle.sh
+      - Makefile
+      - .github/workflows/mdb-oracle.yml
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+    inputs:
+      tier:
+        description: "Case tier"
+        default: "pr"
+        type: choice
+        options: [pr, nightly]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  warm-toolchain-cache:
+    uses: ./.github/workflows/toolchain-cache.yml
+
+  oracle:
+    name: mdb ${{ matrix.spec }}
+    needs: warm-toolchain-cache
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        spec:
+          - shift-left-4
+          - shift-right-4
+          - single-shl-5
+          - single-shl-6
+          - single-shl-7
+          - single-shr-5
+          - single-shr-6
+          - single-shr-7
+          - shift-16bit-4
+          - shift-16bit-5
+          - shift-16bit-6
+          - shift-16bit-7
+          - shift-16bit-r4
+          - shift-32bit-6
+          - shift-32bit-7
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out epic-hal (mdb gate scripts only)
+        uses: actions/checkout@v5
+        with:
+          repository: apojomovsky/epic-hal
+          ref: master
+          path: epic-hal
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ci image (cached)
+        uses: docker/build-push-action@v6
+        with:
+          target: ci
+          load: true
+          tags: epic-cc-ci:latest
+          cache-from: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,ignore-error=true
+          cache-to: type=registry,ref=ghcr.io/${{ github.repository }}-toolchain,mode=max,ignore-error=true
+
+      - name: Cache cargo target dir
+        uses: actions/cache@v5
+        with:
+          path: target
+          key: cargo-${{ runner.os }}-mdb-${{ matrix.spec }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-mdb-${{ matrix.spec }}-
+            cargo-${{ runner.os }}-
+
+      - name: Cache cargo home
+        uses: actions/cache@v5
+        with:
+          path: /tmp/cargo-home
+          key: cargo-home-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Pull epic-hal toolchain image
+        id: hal-image
+        run: |
+          xc8_version="$(grep -m1 '^ARG XC8_VERSION=' epic-hal/docker/ci-toolchain/Dockerfile | cut -d= -f2)"
+          pic16_dfp_version="$(grep -m1 '^ARG PIC16FXXX_DFP_VERSION=' epic-hal/docker/ci-toolchain/Dockerfile | cut -d= -f2)"
+          pic18_dfp_version="$(grep -m1 '^ARG PIC18FXXXX_DFP_VERSION=' epic-hal/docker/ci-toolchain/Dockerfile | cut -d= -f2)"
+          pic1216f1_dfp_version="$(grep -m1 '^ARG PIC12_16F1XXX_DFP_VERSION=' epic-hal/docker/ci-toolchain/Dockerfile | cut -d= -f2)"
+          mplabx_version="$(grep -m1 '^ARG MPLABX_VERSION=' epic-hal/docker/ci-toolchain/Dockerfile | cut -d= -f2)"
+          tag="xc8-v${xc8_version}-dfp${pic16_dfp_version}-${pic18_dfp_version}-${pic1216f1_dfp_version}-mplabx${mplabx_version}"
+          image="ghcr.io/${{ github.repository_owner }}/epic-hal-ci:${tag}"
+          legacy_image="ghcr.io/${{ github.repository_owner }}/pic8-hal-ci:${tag}"
+          if docker pull "$image"; then
+            echo "image=$image" >> "$GITHUB_OUTPUT"
+          elif docker pull "$legacy_image"; then
+            echo "note: pulled legacy $legacy_image (epic-hal-ci not yet published; see epic-hal#55)" >&2
+            echo "image=$legacy_image" >> "$GITHUB_OUTPUT"
+          else
+            echo "error: neither $image nor $legacy_image is on GHCR" >&2
+            exit 1
+          fi
+
+      - name: Run the oracle
+        run: |
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            tier=nightly
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tier="${{ inputs.tier }}"
+          else
+            tier=pr
+          fi
+          EPIC_MDB_GATE=1 \
+          MDB_ORACLE_CC_IMAGE=epic-cc-ci:latest \
+          MDB_ORACLE_CC_CACHE_MOUNT="-v /tmp/cargo-home:/opt/cargo-home -e CARGO_HOME=/opt/cargo-home" \
+          MDB_ORACLE_HAL_IMAGE="${{ steps.hal-image.outputs.image }}" \
+            bash scripts/mdb-oracle.sh --spec "${{ matrix.spec }}" --tier "$tier" --hal "$PWD/epic-hal"
+
+      - name: Fix target dir ownership (container runs as root)
+        if: always()
+        run: sudo chown -R "$(id -u):$(id -g)" target scratch

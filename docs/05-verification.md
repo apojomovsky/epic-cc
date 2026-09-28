@@ -46,6 +46,39 @@ and diff the resulting HEX against our own assembler's output. This isolates
 "our assembler is wrong" from "our codegen is wrong" — two failure modes that otherwise
 look identical.
 
+### 4. MPLAB SIM (`mdb`), the PIC18 execution oracle
+
+gpsim covers the 14-bit core only, so PIC18 sequences verified in-sim had
+no independent executor: a second run of the same model. `mdb` (MPLAB SIM,
+driven headless through epic-hal's `make mdb-hex` gate) replays every
+superopt-landed sequence on the 18F4550 and diffs final RAM, `W`, and
+`STATUS` against `Pic18`, byte for byte. Microchip tooling stays an
+external process behind epic-hal's own target; nothing is vendored here,
+and XC8 remains black-box per ADR-006.
+
+Harness (`crates/superopt/src/mdb.rs`, specs in `src/specs.rs`, driver
+`src/bin/mdb_oracle.rs`, `scripts/mdb-oracle.sh`, `make mdb-oracle`):
+each spec emits unrolled replay programs (setup, candidate, result
+save, spin) assembled with `asm::assemble_pic18` and rendered with
+`asm::to_hex`, one MDB session per chunk, read back with `x /1xbr`
+(`print` needs symbol names; bare addresses return null). Two tiers:
+`pr` (small domains whole, large domains stratified) gating landings,
+`nightly` (wider sweeps) in `.github/workflows/mdb-oracle.yml`, which
+pulls epic-hal's private toolchain image the way its family-check does.
+Full 65536-pair and 2^32 domains stay sim-only: they exceed 16K-word
+flash and 2 KB RAM as unrolled HEX, and executor divergence is
+systematic, so structured edges plus deterministic LCG samples catch it.
+
+Three hardware facts the harness depends on: reset `STATUS` reads `0x00`
+in both SIM and model (no TO/PD masking needed); the device proof reads
+`TRISB`, never `TRISA` (RA6/RA7 are oscillator pins and the SIM returns
+its unimplemented bit set); access-bank GPR is `0x000-0x07F` only, so
+`0x080-0x0FF` goes through `movff` (an access-bit write there aliases
+the SFR region). A wrong sequence is caught by construction: `--mutate`
+drops the candidate's first line after confirming in-sim that the mutant
+fails the chunk, and `EPIC_MDB_GATE=1` turns "mdb unavailable" from a
+local skip into a gating-job failure.
+
 ## Our own simulator
 
 Despite gpsim existing, we plan our own PIC14 instruction-set simulator.

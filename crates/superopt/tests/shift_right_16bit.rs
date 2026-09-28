@@ -13,6 +13,7 @@
 //! candidate (epic-cc#501) is the reason.
 
 use pic14_sim::Pic18;
+use superopt::specs::shift_16bit_r4 as construction_r4;
 use superopt::{verify, Candidate, Case, STATUS_ADDR, STATUS_C_BIT};
 
 const LO: usize = 0x020;
@@ -68,23 +69,8 @@ fn verify_construction(amount: u32, candidate: &Candidate) -> bool {
         && verify(candidate, &cases_over(amount, &pairs, W_SAMPLE))
 }
 
-/// 16-bit right shift by 4, W-only (no scratch byte, the same precondition
-/// as the landed left-shift forms). Derivation: `lo' = (lo>>4) | ((hi&0x0F)<<4)`
-/// and `hi' = hi>>4`, both expressible as nibble-swaps plus a mask. Nine
-/// words against the 12-word unroll.
-fn construction_r4() -> Candidate {
-    vec![
-        "swapf 0x020,F,A", // lo = nibble-swapped orig lo
-        "movlw 0x0F",
-        "andwf 0x020,F,A", // lo = orig_lo >> 4 (low nibble only)
-        "swapf 0x021,W,A", // W = nibble-swapped hi
-        "andlw 0xF0",      // W = (orig_hi & 0x0F) << 4
-        "iorwf 0x020,F,A", // lo' complete
-        "swapf 0x021,W,A", // W = nibble-swapped hi
-        "andlw 0x0F",      // W = orig_hi >> 4 = hi'
-        "movwf 0x021,A",
-    ]
-}
+/// `construction_r4` and its derivation moved to `superopt::specs`,
+/// shared with the MDB oracle.
 
 #[test]
 fn right_shift_16bit_amount4_is_exact() {

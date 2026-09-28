@@ -11,10 +11,9 @@
 //! Destination/source register: 0x020 (arbitrary access-bank GPR, shifted
 //! in place, matching how `x <<= n` compiles: same address in and out).
 
-use pic14_sim::Pic18;
-use superopt::{shortest, Case, STATUS_ADDR, STATUS_C_BIT};
-
-const REG: usize = 0x020;
+use superopt::shortest;
+use superopt::specs::shift_left_4_cases;
+use superopt::Case;
 
 /// A curated, non-exhaustive set of (low nibble, high nibble) pairs crossed
 /// with entry `W` and entry `C`, dimensions a correct candidate must not
@@ -28,25 +27,7 @@ const REG: usize = 0x020;
 /// leak into the result (it must not: shifted-out bits are gone, not
 /// wrapped).
 fn cases() -> Vec<Case> {
-    let mut cases = Vec::new();
-    for lo in [0x0u8, 0x1, 0x7, 0x8, 0xF] {
-        for hi in [0x0u8, 0x3, 0x8, 0xF] {
-            for w in [0x00u8, 0xFF, 0x2A] {
-                for c in [false, true] {
-                    let v = (hi << 4) | lo;
-                    let expect = (lo << 4) & 0xFF;
-                    let status = if c { STATUS_C_BIT } else { 0 };
-                    cases.push(Case {
-                        entry_w: w,
-                        pokes: vec![(REG, v), (STATUS_ADDR, status)],
-                        allowed_changes: vec![REG],
-                        check: Box::new(move |sim: &Pic18| sim.ram()[REG] == expect),
-                    });
-                }
-            }
-        }
-    }
-    cases
+    shift_left_4_cases()
 }
 
 /// Curated alphabet: the nibble-swap family (`SWAPF`) plus mask literals

@@ -56,6 +56,10 @@
 //! little-endian, `LO` at the lower address).
 
 use pic14_sim::Pic18;
+use superopt::specs::{
+    shift_16bit_4 as construction_amount_4, shift_16bit_5 as construction_amount_5,
+    shift_16bit_6 as construction_amount_6, shift_16bit_7 as construction_amount_7,
+};
 use superopt::{shortest, verify, Candidate, Case, STATUS_ADDR, STATUS_C_BIT};
 
 const LO: usize = 0x020;
@@ -184,79 +188,8 @@ fn search(amount: u32, max_len: usize) -> Vec<Candidate> {
     shortest(ALPHABET, &cases, max_len)
 }
 
-/// Amount 4's construction: `SWAPF` both bytes, mask, recombine the
-/// straddling nibble. `rotate_cost(4) == 1` (`SWAPF` is a single
-/// instruction), so the general family's `2 * rotate_cost(n) + 7` gives
-/// 9 words.
-fn construction_amount_4() -> Candidate {
-    vec![
-        "swapf 0x021,F,A",
-        "movlw 0xF0",
-        "andwf 0x021,F,A",
-        "swapf 0x020,W,A",
-        "andlw 0x0F",
-        "iorwf 0x021,F,A",
-        "swapf 0x020,F,A",
-        "movlw 0xF0",
-        "andwf 0x020,F,A",
-    ]
-}
-
-/// Amount 5: the amount-4 construction plus one more standard rotate step
-/// (12 words). Valid because a left shift by 4 then 1 never needs a bit
-/// the first step already discarded. The family's own amount-5 instance
-/// (`rotate_cost(5) == 3`, three `RLCF`s or `RRNCF`+`RRCF`) costs 13,
-/// worse than composing, so this is the better of the two, not a
-/// shortcut taken for lack of trying the family.
-fn construction_amount_5() -> Candidate {
-    let mut c = construction_amount_4();
-    c.push("bcf 0xFD8,0,A");
-    c.push("rlcf 0x020,F,A");
-    c.push("rlcf 0x021,F,A");
-    c
-}
-
-/// Amount 6: the general family's own instance, `rotate_cost(6) == 2`
-/// (`RRNCF` applied twice per byte is a rotate-right-2, equal to
-/// rotate-left-6), giving `2*2 + 7 = 11` words. Masks are `0xFF << 6 =
-/// 0xC0` (keep the top 2 bits after rotation) and `(1 << 6) - 1 = 0x3F`
-/// (the 6 bits that straddle into the next byte).
-fn construction_amount_6() -> Candidate {
-    vec![
-        "rrncf 0x021,F,A",
-        "rrncf 0x021,F,A",
-        "movlw 0xC0",
-        "andwf 0x021,F,A",
-        "rrncf 0x020,F,A",
-        "rrncf 0x020,F,A",
-        "movf 0x020,W,A",
-        "andlw 0x3F",
-        "iorwf 0x021,F,A",
-        "movlw 0xC0",
-        "andwf 0x020,F,A",
-    ]
-}
-
-/// Amount 7: not the family (`rotate_cost(7) == 1` via one `RRNCF` would
-/// give 9 words), but a shorter trick specific to being one bit short of
-/// a byte boundary. `x << 7` mod 65536 keeps only `x`'s low 9 bits,
-/// shifted up by 7; a 16-bit logical right-shift-by-1 (`BCF C` then
-/// `RRCF hi,F` then `RRCF lo,F`, carry seeded 0 so no bit wraps back in)
-/// produces exactly `x >> 1` across the pair, and the byte that lands in
-/// `LO` after that shift is precisely the byte `HI` needs post-shift-left-7,
-/// with `LO` itself then cleared and rotated once more to place the one
-/// remaining bit. 7 words total.
-fn construction_amount_7() -> Candidate {
-    vec![
-        "bcf 0xFD8,0,A",
-        "rrcf 0x021,F,A",
-        "rrcf 0x020,F,A",
-        "movf 0x020,W,A",
-        "movwf 0x021,A",
-        "clrf 0x020,A",
-        "rrcf 0x020,F,A",
-    ]
-}
+/// Amount constructions live in `superopt::specs`, shared with the MDB
+/// oracle; the derivation notes moved with them.
 
 fn report(amount: u32, search_hits: &[Candidate], constructed: Option<&Candidate>) {
     let baseline = 3 * amount as usize;

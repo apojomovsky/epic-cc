@@ -103,6 +103,9 @@ shell: image ## Interactive dev shell inside the container
 exec: image ## One-off command: make exec CMD='cargo test -p asm'
 	@$(DOCKER_RUN) bash -c '$(CMD)'
 
+mdb-oracle: ## MDB execution oracle: make mdb-oracle SPEC=<name> [TIER=pr|nightly]
+	@bash scripts/mdb-oracle.sh --spec $(SPEC) --tier $(or $(TIER),pr)
+
 test: image ## Full suite (ci-test.sh, what CI runs); CRATE=asm scopes to one
 	@$(DOCKER_RUN) bash -c '$(if $(CRATE),cargo test -p $(CRATE) --no-fail-fast,bash scripts/ci-test.sh)'
  # Menu-demo ladder inputs. Must match the hal-pic18-menu-demo-18f4550 case
