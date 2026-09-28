@@ -1070,6 +1070,54 @@ fn phi_destinations_are_live_at_pred_ends() {
     assert_ne!(out.locals["f::p"], out.locals["f::x"]);
 }
 
+/// Phi-edge coalescing (epic-cc#727): one incoming slot dead after the
+/// join lets the destination reuse it, so isel's phi copy becomes a
+/// self-copy skip instead of a MOVFF.
+#[test]
+fn phi_dst_coalesces_with_dead_incoming() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %x = add i8 1, 2\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             br label %m\n\
+           block ff:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i8 %x t %x ff\n\
+             store i8 %p, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::p"]);
+}
+
+/// The same diamond with the incoming read after the merge: the source
+/// is live past the copy point, so the destination keeps its own slot.
+#[test]
+fn phi_dst_keeps_slot_when_incoming_live_after() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %x = add i8 1, 2\n\
+             br i1 %c, label %t, label %ff\n\
+           block t:\n\
+             br label %m\n\
+           block ff:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi i8 %x t %x ff\n\
+             %q = add i8 %x, %p\n\
+             store i8 %q, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::x"], out.locals["f::p"]);
+}
+
 /// A loop-carried value (use before def in linear order) spans the loop and
 /// cannot alias a value it is co-live with: the back-edge phi and the
 /// induction value stay in distinct slots.

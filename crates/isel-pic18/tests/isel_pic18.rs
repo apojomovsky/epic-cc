@@ -7020,3 +7020,23 @@ fn const_lshr_i32_by_6_uses_the_fused_form() {
         }
     }
 }
+
+/// Self-copy skip (epic-cc#727): a copy whose sides coalesced to one slot
+/// emits nothing. MOVFF sets no flags, so no tracking needs updating, and
+/// the skipped pair just shortens the staged copy run.
+#[test]
+fn coalesced_self_copy_emits_nothing() {
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
+    // Hand-aliased map: the load's destination is its own source slot,
+    // the shape alloc coalescing produces for a dead-after join.
+    let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x10)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0x010, 0x010"),
+        "self-copy must be skipped:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVFF 0x010, 0x011"),
+        "the live store still emits:\n{asm}"
+    );
+}
