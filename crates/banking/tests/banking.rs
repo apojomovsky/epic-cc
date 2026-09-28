@@ -578,3 +578,78 @@ fn pic14e_status_rp_bits_are_not_bank_ops() {
     let expected = "    BSF STATUS, 5\n    MOVLB 0x01\n    MOVF 0x20, W\n";
     assert_eq!(assign_banks(&PIC16F1938, asm), expected);
 }
+
+#[test]
+fn page_select_does_not_exclude_region_from_label_analysis() {
+    // `MOVWF PCLATH` is a page select, not a computed jump: a region
+    // containing one still gets the label-join analysis, so `done` (reached
+    // only with bank 1 live) keeps the tracked bank instead of a full
+    // reset (epic-cc#718). Before the fix the `MOVWF PCL` prefix match
+    // excluded every page-crossing function. (0xA0/0xE5 are bank 1: the
+    // full select is BSF RP0, BCF RP1.)
+    let asm = "main:\n    CALL f\n    RETURN\nf:\n    MOVWF PCLATH\n    MOVF 0xA0, W\n    GOTO done\ndone:\n    MOVWF 0xE5\n    RETURN\n";
+    let expected = "main:\n    CALL f\n    RETURN\nf:\n    MOVWF PCLATH\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    GOTO done\ndone:\n    MOVWF 0x65\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn root_labels_before_first_call_target_get_regions() {
+    // The ISR vector opens before the first CALL target, so it is never
+    // CALLed and used to have no region: every internal label reset the
+    // tracked bank. With root regions `isr_L1` proves bank 0 (its only
+    // arrival pins it), so the bank-0 operand after it needs no select
+    // (epic-cc#718). The trailing call target gives the realistic shape
+    // (the listing always has calls) without recursion.
+    let asm = "    org 0x0004\nPIC16_IRQ_Handler:\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\n    GOTO isr_L1\n    MOVF 0xA0, W\n    GOTO isr_done\nisr_L1:\n    MOVF 0x20, W\nisr_done:\n    RETFIE\nmain:\n    CALL leaf\n    RETURN\nleaf:\n    MOVF 0x20, W\n    RETURN\n";
+    let expected = "    org 0x0004\nPIC16_IRQ_Handler:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\n    GOTO isr_L1\n    BSF STATUS, 5\n    MOVF 0x20, W\n    GOTO isr_done\nisr_L1:\n    MOVF 0x20, W\nisr_done:\n    RETFIE\nmain:\n    CALL leaf\n    RETURN\nleaf:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn banked_skip_test_pins_before_fork() {
+    // A banked skip test (BTFSS 0x51,7 needs bank 0) forces a select at
+    // runtime exactly like any other banked operand, so the fork arms must
+    // carry the pinned bank, not the arrival bank: otherwise `t2` proves
+    // bank 1 while the hardware holds bank 0 and the select vanishes
+    // (epic-cc#718 caught this shape in the long e2e).
+    let asm = "main:\n    CALL f\n    RETURN\nf:\n    MOVF 0xA0, W\n    BTFSS 0x51, 7\n    GOTO t1\n    MOVLW 0xFF\n    GOTO t2\nt1:\n    MOVLW 0x00\nt2:\n    MOVWF 0xA5\n    RETURN\n";
+    let expected = "main:\n    CALL f\n    RETURN\nf:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    BCF STATUS, 5\n    BTFSS 0x51, 7\n    GOTO t1\n    MOVLW 0xFF\n    GOTO t2\nt1:\n    MOVLW 0x00\nt2:\n    BSF STATUS, 5\n    MOVWF 0x25\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn call_after_unknown_label_uses_unknown_entry() {
+    // A label with a wide join resets the tracked bank to unknown with a
+    // stale `cur_bank` behind it; a CALL there must seed the callee walk
+    // with UNKNOWN, not the stale bank. `nop2` is entry-transparent
+    // (`RETURN` alone exits with the entry), so seeding it stale would
+    // launder bank 1 back into `known` and elide the select the hardware
+    // bank 0 path needs (epic-cc#718 review).
+    let asm = "main:\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\n    GOTO alt\n    MOVF 0xA0, W\n    GOTO lbl\nalt:\n    MOVF 0x20, W\nlbl:\n    CALL nop2\n    MOVF 0xA0, W\n    RETURN\nnop2:\n    RETURN\n";
+    let expected = "main:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\n    GOTO alt\n    BSF STATUS, 5\n    MOVF 0x20, W\n    GOTO lbl\nalt:\n    MOVF 0x20, W\nlbl:\n    CALL nop2\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    RETURN\nnop2:\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}
+
+#[test]
+fn bare_movwf_pcl_region_still_excluded() {
+    // The true computed jump (`MOVWF PCL` with the bare register, beside a
+    // `.table` reader) still excludes its region: `top` keeps the full
+    // reset even though every visible path agrees (epic-cc#718).
+    let asm = "main:\n    CALL reader\n    RETURN\nreader:\n    MOVF 0xA0, W\n    MOVWF PCL\n    .table t 2\nt:\n    RETLW 0x01\n    RETLW 0x02\ntop:\n    MOVWF 0xE5\n    RETURN\n";
+    let out = assign_banks(&PIC16F877A, asm);
+    assert!(
+        out.contains("top:\n    BSF STATUS, 5\n    BCF STATUS, 6\n    MOVWF 0x65"),
+        "computed-jump region must keep the full reset:\n{out}"
+    );
+}
+
+#[test]
+fn skip_fork_joins_labels_between_test_and_target() {
+    // Labels sitting between a skip test and its first real instruction
+    // join the arrival banks (epic-cc#718): `mid` sees only bank 0, so the
+    // bank-0 operand after the skip needs no select even though the taken
+    // path skips over it.
+    let asm = "main:\n    CALL f\n    RETURN\nf:\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\nmid:\n    GOTO done\ndone:\n    MOVF 0x21, W\n    RETURN\n";
+    let expected = "main:\n    CALL f\n    RETURN\nf:\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\nmid:\n    GOTO done\ndone:\n    MOVF 0x21, W\n    RETURN\n";
+    assert_eq!(assign_banks(&PIC16F877A, asm), expected);
+}

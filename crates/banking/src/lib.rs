@@ -27,8 +27,8 @@
 /// the compiler's one computed jump (`MOVWF PCL`, a `.table` byte-table
 /// reader) never targets a named label, so a label's predecessor set is
 /// always fully discoverable by scanning for `GOTO` or `CALL` references
-/// to its name. A region containing that computed jump is excluded from the
-/// label analysis regardless (epic-cc#13).
+/// to its name. Regions containing that computed jump are skipped as
+/// label-analysis seeds (see `region_has_computed_jump`).
 ///
 /// The label analysis also removes resets whose savings land inside a later
 /// `.table`'s `.align 256` padding (`crates/asm/src/lib.rs`): the padding
@@ -193,11 +193,12 @@ impl BankSet {
 }
 
 /// Split the text into per-function regions: every `CALL <name>` target's
-/// body, from its label to the next CALL-target label (or the end of the
-/// text). Internal labels (`tmpN`, `{func}_L{label}`) are never CALL
-/// targets, so they stay inside their function's region; the ISR and
-/// `__start` are never CALLed, so they have no region (their exit banks
-/// are never needed). Returns the CALL-target set and the regions.
+/// body, plus the true entries opened before the first CALL target (the
+/// ISR vector and `__start`, never CALLed: without a region every one of
+/// their labels resets the tracked bank, epic-cc#718). A root is neither
+/// internal-shaped nor GOTO-referenced from the function area, so its span
+/// never overlaps a CALL-target span and no provable join can widen.
+/// Returns the CALL-target set and the regions.
 fn function_regions(asm: &str) -> (HashSet<String>, HashMap<String, Vec<&str>>) {
     let mut call_targets: HashSet<String> = HashSet::new();
     for line in asm.lines() {
@@ -209,23 +210,70 @@ fn function_regions(asm: &str) -> (HashSet<String>, HashMap<String, Vec<&str>>) 
         }
     }
     let lines: Vec<&str> = asm.lines().collect();
-    let mut regions: HashMap<String, Vec<&str>> = HashMap::new();
-    let mut cur: Option<(String, usize)> = None;
+    let mut defs: Vec<(usize, &str)> = Vec::new();
     for (i, line) in lines.iter().enumerate() {
         let t = line.trim_start();
+        if t.starts_with(';') {
+            continue;
+        }
         if let Some(name) = t.strip_suffix(':') {
-            if call_targets.contains(name) {
-                if let Some((f, s)) = cur.take() {
-                    regions.insert(f, lines[s..i].to_vec());
-                }
-                cur = Some((name.to_string(), i));
+            defs.push((i, name));
+        }
+    }
+    let first_ct = defs
+        .iter()
+        .find_map(|(i, n)| call_targets.contains(*n).then_some(*i));
+    let first_label = defs.first().map(|(i, _)| *i).unwrap_or(usize::MAX);
+    // GOTO targets referenced from the function area (at or after the
+    // first label definition): join points, not entries. References from
+    // the reset stub before it do not count, so `goto __start` never
+    // disqualifies the reset entry itself.
+    let mut inner_goto: HashSet<&str> = HashSet::new();
+    for (i, line) in lines.iter().enumerate() {
+        if i < first_label {
+            continue;
+        }
+        let toks: Vec<&str> = line.trim_start().split_whitespace().collect();
+        if toks.first() == Some(&"GOTO") {
+            if let Some(t) = toks.get(1) {
+                inner_goto.insert(t.trim_end_matches([',', ';', ')']));
             }
         }
     }
-    if let Some((f, s)) = cur.take() {
-        regions.insert(f, lines[s..].to_vec());
+    let mut openers: Vec<(usize, String)> = Vec::new();
+    for (i, name) in &defs {
+        if call_targets.contains(*name) {
+            openers.push((*i, name.to_string()));
+        } else if first_ct.is_some_and(|f| *i < f)
+            && !is_internal_label(name)
+            && !inner_goto.contains(*name)
+        {
+            openers.push((*i, name.to_string()));
+        }
+    }
+    let mut regions: HashMap<String, Vec<&str>> = HashMap::new();
+    for (k, (s, name)) in openers.iter().enumerate() {
+        let e = openers.get(k + 1).map(|(i, _)| *i).unwrap_or(lines.len());
+        regions.insert(name.clone(), lines[*s..e].to_vec());
     }
     (call_targets, regions)
+}
+
+/// True for isel's internal labels (`tmpN`, `{func}_L{label}`): branch
+/// targets that never open a function. Over-matching is the safe
+/// direction: a misread entry just keeps today's behavior for its span.
+fn is_internal_label(name: &str) -> bool {
+    if let Some(rest) = name.strip_prefix("tmp") {
+        if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    if let Some((_, suffix)) = name.rsplit_once("_L") {
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The provable exit bank of `func` entered with `entry`, or UNKNOWN when
@@ -368,11 +416,24 @@ fn walk_region(
             continue;
         }
         if SKIP_OPS.contains(&mne) {
+            // The skip test itself always executes, and a banked test
+            // operand forces a select at runtime exactly like any other
+            // banked operand does: pin it before forking, or the arms
+            // carry a stale bank the scan's inserted select has already
+            // overwritten and a later join proves wrong (epic-cc#718).
+            let mut banks = banks;
+            if let Some(b) = operand_bank(device, mne, &toks) {
+                banks = BankSet::single(b);
+            }
             // The next instruction is conditional: fork into the skip-taken
             // path (the instruction does not run) and the not-taken path
             // (it runs, applying its own effect).
             let mut j = i + 1;
             while j < region.len() && region[j].trim_start().ends_with(':') {
+                if let Some(name) = region[j].trim_start().strip_suffix(':') {
+                    let joined = labels.get(name).copied().unwrap_or(BankSet(0)).join(banks);
+                    labels.insert(name.to_string(), joined);
+                }
                 j += 1;
             }
             work.push((j + 1, banks));
@@ -440,20 +501,27 @@ fn is_bank0_only(device: &Device, asm: &str) -> bool {
     true
 }
 
-/// True when `region` contains a computed jump (`MOVWF PCL`, isel's
-/// `.table`-directive-demarcated `RETLW` byte-table reader). Such a jump's
-/// target is a runtime-computed offset into the table, never a textual
-/// `GOTO`/`CALL <label>` reference, so it is invisible to the label
-/// analysis below by construction: every predecessor the walk finds for a
-/// label is therefore exhaustive, *unless* the table's landing offsets
-/// could ever coincide with a real branch-target label sharing the same
-/// region. Nothing in this codebase's table layout does that, but the
-/// check costs little and removes the need to prove it never will:
-/// disqualify the whole region defensively rather than reason it through.
+/// True when `region` contains a computed jump: `MOVWF PCL` with the bare
+/// PCL register (isel's `.table`-demarcated `RETLW` reader), or a `.table`
+/// directive itself. `MOVWF PCLATH` is a page select, not a jump: matching
+/// it would exclude nearly the whole program (epic-cc#718). The gate is
+/// seed-only (see `label_provable_banks`): a transitive CALL walk still
+/// enters such a region, which is sound only because no table landing ever
+/// coincides with a named label in this codebase's table layout.
 fn region_has_computed_jump(region: &[&str]) -> bool {
     region.iter().any(|line| {
         let t = line.trim_start();
-        t.starts_with("MOVWF PCL") || t.starts_with(".table")
+        if t.starts_with(".table") {
+            return true;
+        }
+        let mut toks = t.split_whitespace();
+        if toks.next() != Some("MOVWF") {
+            return false;
+        }
+        matches!(
+            toks.next().map(|op| op.trim_end_matches([',', ';', ')'])),
+            Some("PCL")
+        )
     })
 }
 
@@ -466,9 +534,9 @@ fn region_has_computed_jump(region: &[&str]) -> bool {
 /// same map, so a label's entry here already reflects every reachable path,
 /// including cross-function ones (epic-cc#13).
 ///
-/// Skips any region `region_has_computed_jump` flags; such a region's
-/// labels are simply absent from the result and keep the default behavior
-/// (always reset).
+/// Skips flagged regions as walk seeds; a transitive CALL walk still
+/// enters one, so the gate is defense-in-depth behind the table-layout
+/// invariant, not an airtight exclusion.
 fn label_provable_banks(
     device: &Device,
     call_targets: &HashSet<String>,
@@ -631,7 +699,15 @@ pub fn assign_banks_with_locs(
                 known = true;
             } else if let Some(target) = toks.get(1) {
                 let callee = target.trim_end_matches([',', ';', ')']);
-                let cur = BankSet::single(cur_bank);
+                // A stale `cur_bank` must not seed the callee walk when the
+                // tracked bank is unknown (a wide label join just reset
+                // it): an entry-transparent callee would launder the stale
+                // bank back into `known` (epic-cc#718 review).
+                let cur = if known {
+                    BankSet::single(cur_bank)
+                } else {
+                    BankSet::UNKNOWN
+                };
                 let eb = func_exit_bank(
                     device,
                     callee,
