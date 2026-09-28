@@ -594,11 +594,9 @@ fn page_select_does_not_exclude_region_from_label_analysis() {
 
 #[test]
 fn root_labels_before_first_call_target_get_regions() {
-    // The ISR vector opens before the first CALL target, so it is never
-    // CALLed and used to have no region: every internal label reset the
-    // tracked bank. With root regions `isr_L1` proves bank 0 (its only
-    // arrival pins it), so the bank-0 operand after it needs no select
-    // (epic-cc#718).
+    // A never-CALLed entry (the ISR vector opens before the first CALL
+    // target) carries bank state across its labels only through a root
+    // region: `isr_L1` arrives with bank 0 on every path (epic-cc#718).
     let asm = "    org 0x0004\nPIC16_IRQ_Handler:\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\n    GOTO isr_L1\n    MOVF 0xA0, W\n    GOTO isr_done\nisr_L1:\n    MOVF 0x20, W\nisr_done:\n    RETFIE\nmain:\n    CALL leaf\n    RETURN\nleaf:\n    MOVF 0x20, W\n    RETURN\n";
     let expected = "    org 0x0004\nPIC16_IRQ_Handler:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    BTFSC 0x0C, 0\n    GOTO isr_L1\n    BSF STATUS, 5\n    MOVF 0x20, W\n    GOTO isr_done\nisr_L1:\n    MOVF 0x20, W\nisr_done:\n    RETFIE\nmain:\n    CALL leaf\n    RETURN\nleaf:\n    BCF STATUS, 5\n    BCF STATUS, 6\n    MOVF 0x20, W\n    RETURN\n";
     assert_eq!(assign_banks(&PIC16F877A, asm), expected);
