@@ -235,3 +235,100 @@ fn accepts_whitespace_between_hash_and_pragma() {
         ("FOSC", "WDTE")
     );
 }
+
+#[test]
+fn finds_a_plain_xtal_freq_with_its_site() {
+    let found = driver::prescan::find_xtal_freq(&src(&[(
+        "main.c",
+        "#include <xc.h>\n#define _XTAL_FREQ 4000000\n",
+    )]))
+    .unwrap();
+    assert_eq!(found.value, Some(4_000_000));
+    assert_eq!((found.line, found.col), (2, 1));
+}
+
+#[test]
+fn xtal_freq_accepts_hex_suffixes_and_parens() {
+    for (body, want) in [
+        ("#define _XTAL_FREQ 0x3D0900\n", 4_000_000),
+        ("#define _XTAL_FREQ 4000000UL\n", 4_000_000),
+        ("#define _XTAL_FREQ (8000000)\n", 8_000_000),
+    ] {
+        let found = driver::prescan::find_xtal_freq(&src(&[("main.c", body)])).unwrap();
+        assert_eq!(found.value, Some(want), "{body}");
+    }
+}
+
+#[test]
+fn xtal_freq_last_definition_wins_and_comments_do_not_count() {
+    let found = driver::prescan::find_xtal_freq(&src(&[(
+        "main.c",
+        "// #define _XTAL_FREQ 1000000\n#define _XTAL_FREQ 4000000\n#define _XTAL_FREQ 8000000\n",
+    )]))
+    .unwrap();
+    assert_eq!(found.value, Some(8_000_000));
+    assert_eq!(found.line, 3);
+}
+
+#[test]
+fn xtal_freq_computed_definition_is_present_but_unknown() {
+    let found =
+        driver::prescan::find_xtal_freq(&src(&[("main.c", "#define _XTAL_FREQ (8000000/2)\n")]))
+            .unwrap();
+    assert_eq!(found.value, None);
+}
+
+#[test]
+fn finds_a_delay_call_but_not_a_comment_or_its_name_alone() {
+    let hit = driver::prescan::find_delay_use(&src(&[(
+        "main.c",
+        "// __delay_ms(1);\nvoid main(void) { __delay_us (10); }\n",
+    )]))
+    .unwrap();
+    assert_eq!(hit.name, "__delay_us");
+    assert_eq!(hit.line, 2);
+    assert!(driver::prescan::find_delay_use(&src(&[("main.c", "int __delay_ms;\n")])).is_none());
+}
+
+#[test]
+fn xtal_freq_ignores_a_trailing_comment() {
+    let found = driver::prescan::find_xtal_freq(&src(&[(
+        "main.c",
+        "#define _XTAL_FREQ 4000000 // 4 MHz\n",
+    )]))
+    .unwrap();
+    assert_eq!(found.value, Some(4_000_000));
+}
+
+#[test]
+fn xtal_freq_ignores_a_function_like_macro() {
+    assert!(driver::prescan::find_xtal_freq(&src(&[(
+        "main.c",
+        "#define _XTAL_FREQ(x) ((x) * 1000)\n"
+    )]))
+    .is_none());
+}
+
+#[test]
+fn xtal_freq_undef_clears_the_last_definition() {
+    assert!(driver::prescan::find_xtal_freq(&src(&[(
+        "main.c",
+        "#define _XTAL_FREQ 4000000\n#undef _XTAL_FREQ\n"
+    )]))
+    .is_none());
+    let found = driver::prescan::find_xtal_freq(&src(&[(
+        "main.c",
+        "#define _XTAL_FREQ 4000000\n#undef _XTAL_FREQ\n#define _XTAL_FREQ 8000000\n",
+    )]))
+    .unwrap();
+    assert_eq!(found.value, Some(8_000_000));
+}
+
+#[test]
+fn delay_use_ignores_directive_lines() {
+    assert!(driver::prescan::find_delay_use(&src(&[(
+        "main.c",
+        "#ifdef __delay_ms\n#endif\nvoid main(void) {}\n"
+    )]))
+    .is_none());
+}

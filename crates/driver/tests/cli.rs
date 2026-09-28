@@ -14,6 +14,17 @@ fn parses_a_minimal_invocation() {
 }
 
 #[test]
+fn parses_an_f_cpu_board_clock() {
+    let c = parse_args(&args(&[
+        "a.c", "--device", "p16f877a", "--f-cpu", "4000000",
+    ]))
+    .unwrap();
+    assert_eq!(c.f_cpu, Some(4_000_000));
+    let minimal = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
+    assert_eq!(minimal.f_cpu, None);
+}
+
+#[test]
 fn collects_multiple_inputs_includes_and_defines() {
     let c = parse_args(&args(&[
         "a.c", "b.c", "-I", "inc", "-I", "inc2", "-D", "F=1", "-D", "G", "-o", "out.hex",
@@ -88,6 +99,7 @@ fn rejects_a_flag_missing_its_value() {
     let e = parse_args(&args(&["a.c", "--device"])).unwrap_err();
     assert!(e.contains("--device"), "{e}");
 }
+
 #[test]
 fn parses_a_map_file() {
     let c = parse_args(&args(&["a.c", "--device", "p16f877a", "--map", "out.map"])).unwrap();
@@ -109,4 +121,20 @@ fn parses_a_report_file() {
     assert_eq!(c.report.as_deref(), Some("b.json"));
     let c = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
     assert_eq!(c.report, None);
+}
+
+#[test]
+fn rejects_a_bad_or_zero_f_cpu() {
+    assert!(parse_args(&args(&["a.c", "--device", "p16f877a", "--f-cpu", "abc"])).is_err());
+    assert!(parse_args(&args(&["a.c", "--device", "p16f877a", "--f-cpu", "0"])).is_err());
+    assert!(parse_args(&args(&["a.c", "--device", "p16f877a", "--f-cpu"])).is_err());
+    let c = parse_args(&args(&[
+        "a.c",
+        "--device",
+        "p16f877a",
+        "--f-cpu",
+        "4_000_000",
+    ]))
+    .unwrap();
+    assert_eq!(c.f_cpu, Some(4_000_000));
 }

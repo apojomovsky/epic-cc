@@ -2,7 +2,8 @@
 //! `#pragma config` settings, run before any clang invocation so
 //! EPIC_FOSC_HZ can be added to every `-D` list from the start (docs/31
 //! §10). Comment- and string-literal-aware so a fuse string or a stray
-//! comment cannot make it misfire.
+//! comment cannot make it misfire. Preprocessor-blind by design: `#if` arms
+//! never taken still count, the same contract as the config scanners.
 //!
 //! clang drops unknown pragmas before the `.ll`, so `#pragma config NAME
 //! = VALUE` never survives to the compiled program: the driver recovers
@@ -478,4 +479,258 @@ fn find_pragma_in_one_file(file: &str, text: &str) -> Vec<PragmaSetting> {
         i += 1;
     }
     out
+}
+
+/// One `#define _XTAL_FREQ ...` hit with its source site. `value` is the
+/// plain integer when the replacement list is one (`4000000`, `0x3D0900`,
+/// optionally parenthesized with `U`/`L` suffixes); `None` means defined
+/// but computed, which clang still evaluates for the delay macros while
+/// the driver cannot use it for agreement.
+pub struct XtalFreq {
+    pub value: Option<u64>,
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// The last live `#define _XTAL_FREQ` across all sources, if any.
+/// Comment-, string- and line-aware like the other scanners; definitions
+/// and `#undef`s fold in order with last-wins, matching the preprocessor.
+pub fn find_xtal_freq(sources: &[(String, String)]) -> Option<XtalFreq> {
+    let mut out: Option<XtalFreq> = None;
+    for (file, text) in sources {
+        for hit in find_xtal_in_one_file(file, text) {
+            out = hit;
+        }
+    }
+    out
+}
+
+/// One `__delay_ms(` / `__delay_us(` use with its source site, for the
+/// error that names the three clock spellings when `_XTAL_FREQ` is absent.
+pub struct DelayUse {
+    pub name: String,
+    pub file: String,
+    pub line: u32,
+    pub col: u32,
+}
+
+/// The first delay-macro call across all sources, if any.
+pub fn find_delay_use(sources: &[(String, String)]) -> Option<DelayUse> {
+    for (file, text) in sources {
+        if let Some(hit) = find_delay_in_one_file(file, text) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+fn find_xtal_in_one_file(file: &str, text: &str) -> Vec<Option<XtalFreq>> {
+    // Events in order: Some on `#define`, None on `#undef`. The caller
+    // folds them with last-wins, matching the preprocessor.
+    let b = text.as_bytes();
+    let mut out = Vec::new();
+    let mut line_start = true;
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'\n' {
+            line_start = true;
+            i += 1;
+            continue;
+        }
+        if b[i] == b' ' || b[i] == b'\t' || b[i] == b'\r' {
+            i += 1;
+            continue;
+        }
+        if let Some(j) = skip_trivia(b, i) {
+            if b[i..j].contains(&b'\n') {
+                line_start = true;
+            }
+            i = j;
+            continue;
+        }
+        if b[i] == b'#' && line_start {
+            let mut j = i + 1;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            let directive = read_word(text, b, &mut j);
+            if directive == "define" {
+                while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                    j += 1;
+                }
+                let ns = j;
+                while j < b.len() && is_ident(b[j]) {
+                    j += 1;
+                }
+                // A `(` glued to the name is a function-like macro, not
+                // the object-like `_XTAL_FREQ` the delays expand.
+                if text.get(ns..j) == Some("_XTAL_FREQ") && b.get(j) != Some(&b'(') {
+                    let (line, col) = line_col(text, i);
+                    let mut k = j;
+                    while k < b.len() && b[k] != b'\n' {
+                        k += 1;
+                    }
+                    let value = parse_c_int(&strip_comments(text, &text[j..k]));
+                    out.push(Some(XtalFreq {
+                        value,
+                        file: file.to_string(),
+                        line,
+                        col,
+                    }));
+                    i = k;
+                    line_start = false;
+                    continue;
+                }
+            } else if directive == "undef" {
+                while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                    j += 1;
+                }
+                let ns = j;
+                while j < b.len() && is_ident(b[j]) {
+                    j += 1;
+                }
+                if text.get(ns..j) == Some("_XTAL_FREQ") {
+                    out.push(None);
+                }
+            }
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        line_start = false;
+        i += 1;
+    }
+    out
+}
+
+/// A plain C integer literal: decimal, `0x` hex or `0` octal, one optional
+/// parenthesis layer, `'` separators and `U`/`L` suffixes allowed.
+/// Anything else (an expression, an empty replacement list) is `None`.
+/// Shared with the `-D_XTAL_FREQ=` handling, which feeds clang the same macro.
+pub fn parse_c_int(token: &str) -> Option<u64> {
+    let mut s = token.trim();
+    if s.starts_with('(') && s.ends_with(')') && s.len() >= 2 {
+        s = s[1..s.len() - 1].trim();
+    }
+    let s: String = s
+        .trim_end_matches(|c: char| c == 'u' || c == 'U' || c == 'l' || c == 'L')
+        .chars()
+        .filter(|c| *c != '\'')
+        .collect();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        if hex.is_empty() || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        return u64::from_str_radix(hex, 16).ok();
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        if !s.bytes().all(|c| matches!(c, b'0'..=b'7')) {
+            return None;
+        }
+        return u64::from_str_radix(&s, 8).ok();
+    }
+    if !s.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    s.parse().ok()
+}
+/// The identifier word at `*j`, advancing past it. Used for directive
+/// names on `#` lines.
+fn read_word(text: &str, b: &[u8], j: &mut usize) -> String {
+    let ns = *j;
+    while *j < b.len() && is_ident(b[*j]) {
+        *j += 1;
+    }
+    text.get(ns..*j).unwrap_or("").to_string()
+}
+
+/// `line` with comment runs blanked to spaces, so a trailing comment on a
+/// `#define` line cannot poison the value parse. (String spans blank out
+/// too; any string in the replacement already defeats integer parse.)
+fn strip_comments(text: &str, line: &str) -> String {
+    let b = text.as_bytes();
+    let base = line.as_ptr() as usize - b.as_ptr() as usize;
+    let mut out = line.to_string().into_bytes();
+    let mut i = 0;
+    while i < out.len() {
+        if let Some(j) = skip_trivia(&b[base + i..], 0) {
+            for k in i..i + j {
+                if out[k] != b'\n' {
+                    out[k] = b' ';
+                }
+            }
+            i += j;
+            continue;
+        }
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_default()
+}
+
+fn find_delay_in_one_file(file: &str, text: &str) -> Option<DelayUse> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let mut line_start = true;
+    while i < b.len() {
+        if b[i] == b'\n' {
+            line_start = true;
+            i += 1;
+            continue;
+        }
+        if b[i] == b' ' || b[i] == b'\t' || b[i] == b'\r' {
+            i += 1;
+            continue;
+        }
+        if let Some(j) = skip_trivia(b, i) {
+            i = j;
+            continue;
+        }
+        if b[i] == b'#' && line_start {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b[i] == b'_' || b[i].is_ascii_alphabetic() {
+            let ns = i;
+            while i < b.len() && is_ident(b[i]) {
+                i += 1;
+            }
+            let word = &text[ns..i];
+            if word == "__delay_ms" || word == "__delay_us" {
+                let mut j = i;
+                loop {
+                    while j < b.len()
+                        && (b[j] == b' ' || b[j] == b'\t' || b[j] == b'\n' || b[j] == b'\r')
+                    {
+                        j += 1;
+                    }
+                    if let Some(k) = skip_trivia(b, j) {
+                        j = k;
+                        continue;
+                    }
+                    break;
+                }
+                if b.get(j) == Some(&b'(') {
+                    let (line, col) = line_col(text, ns);
+                    return Some(DelayUse {
+                        name: word.to_string(),
+                        file: file.to_string(),
+                        line,
+                        col,
+                    });
+                }
+            }
+            line_start = false;
+            continue;
+        }
+        line_start = false;
+        i += 1;
+    }
+    None
 }

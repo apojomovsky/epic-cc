@@ -26,6 +26,8 @@ pub struct Cli {
     pub var_table: Option<String>,
     pub sidecar: Option<String>,
     pub report: Option<String>,
+    /// Board clock in Hz (`board_build.f_cpu`); the last-resort D-4 source.
+    pub f_cpu: Option<u64>,
     /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
     pub outline: bool,
 }
@@ -51,6 +53,8 @@ usage: epic-cc [options] <input.c>...
                        code or stepping through inline copies)
   --report <file>      write the build report as JSON into <file>: flash and
                        RAM use, the clock, and every config field's value
+  --f-cpu <hz>         board clock in Hz, the last-resort D-4 source: it must
+                       agree with the config/_XTAL_FREQ clock when they also fix one
   --var-table <file>   write the typed variable table into <file>
                        (`global <name> 0xNN TYPE` / `local {func}::{name}
                        0xNN TYPE`, one flattened record per mapped var)
@@ -82,6 +86,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut var_table = None;
     let mut sidecar = None;
     let mut report = None;
+    let mut f_cpu: Option<u64> = None;
     let mut outline = true;
     let mut i = 0;
     while i < argv.len() {
@@ -142,6 +147,21 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     .cloned()
                     .ok_or("epic-cc: --report needs a value")?,
             );
+        } else if a == "--f-cpu" {
+            i += 1;
+            let v = argv
+                .get(i)
+                .cloned()
+                .ok_or("epic-cc: --f-cpu needs a value")?;
+            let hz: u64 = v.replace('_', "").parse().map_err(|_| {
+                format!("epic-cc: --f-cpu value {v:?} is not an integer frequency in Hz")
+            })?;
+            if hz == 0 {
+                return Err(format!(
+                    "epic-cc: --f-cpu value {v:?} is not a positive frequency"
+                ));
+            }
+            f_cpu = Some(hz);
         } else if a == "--map" {
             i += 1;
             map = Some(argv.get(i).cloned().ok_or("epic-cc: --map needs a value")?);
@@ -193,6 +213,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         var_table,
         sidecar,
         report,
+        f_cpu,
         verbose,
         map,
         line_table,
