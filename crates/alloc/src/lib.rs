@@ -644,13 +644,134 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
         vals.push((v, lo, hi, w, o));
     }
     vals.sort_by(|a, b| a.1.cmp(&b.1).then(a.4.cmp(&b.4)));
+    // Phi-edge coalescing (epic-cc#727): a phi dst reuses its incoming
+    // slot on a dead-after join. The copy point touches both intervals
+    // so plain disjointness never fires; the src test is positional.
+    // GEP-extended uses already cover FSR-indexed reads of src. A merge
+    // on a CFG cycle repeats the copy each iteration, which linear order
+    // cannot see, so cyclic merges punt (docs/45 twin-differential gate
+    // backstops the rest). The pair shares one slot index, so the heat
+    // permutation below never splits it. Byval and retval stay out.
+    let mut coalesce: HashMap<String, String> = HashMap::new();
+    for (mi, b) in order.iter().enumerate() {
+        for inst in &b.insts {
+            if let ir::Inst::Phi(p) = inst {
+                let Some(&(_, _, w_d, _, mem_d)) = defs.get(&p.dst) else {
+                    continue;
+                };
+                if mem_d {
+                    continue;
+                }
+                // Pointer phis seed indirect slots in iselcore, not plain
+                // value slots, so they never pin.
+                if p.ptr {
+                    continue;
+                }
+                let mut src: Option<String> = None;
+                let mut mixed = false;
+                let mut edges: Vec<usize> = Vec::new();
+                let mut src_edges: Vec<usize> = Vec::new();
+                for (v, pred) in &p.incoming {
+                    let pi = idx[pred.as_str()];
+                    edges.push(pi);
+                    match v {
+                        ir::Val::Reg(r) => match defs.get(r) {
+                            Some(&(_, _, w_s, _, mem_s)) if !mem_s && w_s == w_d => match &src {
+                                None => src = Some(r.clone()),
+                                Some(s) if s == r => {}
+                                _ => mixed = true,
+                            },
+                            _ => mixed = true,
+                        },
+                        _ => {}
+                    }
+                    if matches!(v, ir::Val::Reg(r) if Some(r) == src.as_ref()) {
+                        src_edges.push(pi);
+                    }
+                }
+                let Some(s) = src else { continue };
+                if mixed {
+                    continue;
+                }
+                // Merge on a CFG cycle repeats the copy each iteration, and
+                // linear dead-after cannot see the dynamic-after use, so
+                // punt. Straight-line diamonds in loopy functions stay
+                // eligible: only a cycle through this merge disqualifies.
+                let mut on_cycle = false;
+                let mut stack: Vec<usize> = succ.get(&mi).cloned().unwrap_or_default();
+                let mut seen: HashSet<usize> = HashSet::new();
+                while let Some(n) = stack.pop() {
+                    if n == mi {
+                        on_cycle = true;
+                        break;
+                    }
+                    if seen.insert(n) {
+                        stack.extend(succ.get(&n).cloned().unwrap_or_default());
+                    }
+                }
+                if on_cycle || edges.iter().any(|&pi| pi >= mi) {
+                    continue;
+                }
+                let mut ok = true;
+                for &pi in &edges {
+                    if live_out[pi].contains(&s) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if let Some(us) = uses.get(&s) {
+                    // Incoming uses sit exactly at the pred end; anything
+                    // past the latest src-carrying edge is still live.
+                    let mut latest: Option<(usize, u16)> = None;
+                    for &pi in &src_edges {
+                        let c = (pi, block_len[pi]);
+                        latest = Some(latest.map_or(c, |e| e.max(c)));
+                    }
+                    if let Some(last) = latest {
+                        if us.iter().any(|&u| u > last) {
+                            ok = false;
+                        }
+                    }
+                }
+                if ok {
+                    coalesce.insert(p.dst.clone(), s);
+                }
+            }
+        }
+    }
 
     // Greedy first-fit coloring: reuse the lowest slot whose interval is
     // disjoint from the new value's; the slot's width grows to the widest
     // occupant.
     let mut slots: Vec<((usize, u16), (usize, u16), u8)> = Vec::new();
     let mut slot_of: HashMap<String, usize> = HashMap::new();
+    let interval_of: HashMap<&str, ((usize, u16), (usize, u16))> = vals
+        .iter()
+        .map(|(v, lo, hi, _, _)| (v.as_str(), (*lo, *hi)))
+        .collect();
     for (v, lo, hi, w, _) in &vals {
+        if let Some(s) = coalesce.get((*v).as_str()) {
+            if let Some(&si) = slot_of.get(s.as_str()) {
+                // A second pair pinning the same slot falls back unless the
+                // destination is disjoint from every other occupant; the
+                // source overlap is covered by the dead-after guards above.
+                let clash = slot_of.iter().any(|(o, &osi)| {
+                    osi == si
+                        && o != s
+                        && match interval_of.get(o.as_str()) {
+                            Some(&(olo, ohi)) => !(hi < &olo || &ohi < lo),
+                            None => true,
+                        }
+                });
+                if !clash {
+                    slots[si].0 = slots[si].0.min(*lo);
+                    slots[si].1 = slots[si].1.max(*hi);
+                    slots[si].2 = slots[si].2.max(*w);
+                    slot_of.insert((*v).clone(), si);
+                    continue;
+                }
+            }
+        }
         let mut placed = None;
         for (i, (slo, shi, _)) in slots.iter().enumerate() {
             if hi < slo || shi < lo {
