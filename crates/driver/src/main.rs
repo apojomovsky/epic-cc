@@ -202,9 +202,16 @@ fn main() {
             }
             (None, None) => (None, None),
         };
+    let spelling = if pragma_spec.is_some() {
+        device::ConfigSpelling::Pragma
+    } else {
+        device::ConfigSpelling::EpicConfig
+    };
     let fosc_hz: u64 = match (&prescan_spec, &prescan_loc) {
-        (Some(spec), Some((file, line, col))) => driver::fosc::try_resolve_fosc_hz(device, spec)
-            .unwrap_or_else(|e| diag::error_at(file, *line, *col, &e)),
+        (Some(spec), Some((file, line, col))) => {
+            driver::fosc::try_resolve_fosc_hz(device, spec, spelling)
+                .unwrap_or_else(|e| diag::error_at(file, *line, *col, &e))
+        }
         (Some(_), None) => unreachable!("a prescan spec always carries its site"),
         (None, _) => driver::fosc::resolve_fosc_hz_from_defaults(device),
     };
@@ -556,12 +563,11 @@ fn main() {
         .map(|s| driver::fosc::fuse_spec(s))
         .unwrap_or_default();
     let config_bytes: Option<Vec<u8>> = if canonical_spec.is_some() || pragma_spec.is_some() {
-        let bytes = device::try_resolve_config(&device.config, &fuse_spec).unwrap_or_else(|e| {
-            match &prescan_loc {
+        let bytes = device::try_resolve_config_in(&device.config, &fuse_spec, spelling)
+            .unwrap_or_else(|e| match &prescan_loc {
                 Some((file, line, col)) => diag::error_at(file, *line, *col, &e),
                 None => diag::error(&e),
-            }
-        });
+            });
         Some(bytes)
     } else {
         None

@@ -128,3 +128,23 @@ fn unknown_pragma_value_lists_the_valid_values() {
     assert!(err.contains("unknown config value 'TURBO'"), "{err}");
     assert!(err.contains("expected one of:"), "{err}");
 }
+
+#[test]
+fn pragma_omitted_oscillator_tree_fields_stay_erased() {
+    // epic-cc#706 option 2: the program from the issue omits the 4550's
+    // defaultless usbdiv/cpudiv/plldiv, which XC8 leaves erased. The
+    // resolved bytes must equal the erased baseline except where set.
+    let (c, hex) = write_c(
+        "defaults",
+        "#pragma config FOSC = INTOSCIO_EC, WDT = OFF, LVP = OFF, XINST = OFF\nvoid main(void) {}\n",
+    );
+    let out = driver()
+        .args([c.as_str(), "-o", hex.as_str(), "--device", "p18f4550"])
+        .output()
+        .expect("run driver");
+    let _ = std::fs::remove_dir_all(std::path::Path::new(&c).parent().unwrap());
+    let err = stderr_of(&out);
+    assert!(out.status.success(), "driver failed: {err}");
+    assert!(err.contains("byte 0x300000 = 0xFF"), "{err}");
+    assert!(err.contains("byte 0x300001 = 0x38"), "{err}");
+}

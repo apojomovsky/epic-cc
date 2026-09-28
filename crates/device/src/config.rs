@@ -3,6 +3,24 @@
 
 use crate::ConfigRegion;
 
+/// Which spelling the spec came from. `#pragma config` leaves an omitted
+/// field without a default at its erased value, the way XC8 does;
+/// `EPIC_CONFIG` keeps the strict rule and errors instead (epic-cc#706).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfigSpelling {
+    EpicConfig,
+    Pragma,
+}
+
+impl ConfigSpelling {
+    fn name(&self) -> &'static str {
+        match self {
+            ConfigSpelling::EpicConfig => "EPIC_CONFIG",
+            ConfigSpelling::Pragma => "#pragma config",
+        }
+    }
+}
+
 /// Resolve a comma-separated `key=value, key=value` spec against `region`,
 /// starting from `region.erased_baseline` and applying each mentioned
 /// field, each unmentioned field's default, in that order. A field or value
@@ -19,13 +37,25 @@ pub fn resolve_config(region: &ConfigRegion, spec: &str) -> Vec<u8> {
 /// Fallible `resolve_config`, so the driver can point the error at the
 /// `EPIC_CONFIG` site instead of panicking bare.
 pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, String> {
+    try_resolve_config_in(region, spec, ConfigSpelling::EpicConfig)
+}
+
+/// Fallible `resolve_config` for a known spelling: the errors name it,
+/// and `#pragma config` lets an omitted field without a default keep the
+/// erased baseline the bytes start from.
+pub fn try_resolve_config_in(
+    region: &ConfigRegion,
+    spec: &str,
+    spelling: ConfigSpelling,
+) -> Result<Vec<u8>, String> {
+    let sp = spelling.name();
     let mut bytes = region.erased_baseline.to_vec();
     let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
 
     for pair in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
         let (key, val) = pair
             .split_once('=')
-            .ok_or_else(|| format!("malformed EPIC_CONFIG entry {pair:?} (expected key=value)"))?;
+            .ok_or_else(|| format!("malformed {sp} entry {pair:?} (expected key=value)"))?;
         let (key, val) = (key.trim(), val.trim());
 
         let field = region
@@ -39,7 +69,7 @@ pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, 
                     .flat_map(|f| std::iter::once(f.name).chain(f.aliases.iter().copied()))
                     .collect();
                 format!(
-                    "unknown field '{key}' in EPIC_CONFIG (expected one of: {})",
+                    "unknown field '{key}' in {sp} (expected one of: {})",
                     names.join(", ")
                 )
             })?;
@@ -55,7 +85,7 @@ pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, 
                     .flat_map(|v| std::iter::once(v.name).chain(v.aliases.iter().copied()))
                     .collect();
                 format!(
-                    "unknown value '{val}' for field '{}', expected one of {opts:?}",
+                    "unknown value '{val}' for field '{}' in {sp}, expected one of {opts:?}",
                     field.name
                 )
             })?;
@@ -64,7 +94,7 @@ pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, 
             if !fv.name.eq_ignore_ascii_case(only) {
                 return Err(format!(
                     "field '{}' is locked to {only:?} (epic-cc's backend cannot honor \
-                     other values); got {val:?}",
+                     other values); got {val:?} via {sp}",
                     field.name
                 ));
             }
@@ -78,14 +108,17 @@ pub fn try_resolve_config(region: &ConfigRegion, spec: &str) -> Result<Vec<u8>, 
         if seen.contains(field.name) {
             continue;
         }
-        let default_name = field.default.ok_or_else(|| {
-            format!(
+        let Some(default_name) = field.default else {
+            if spelling == ConfigSpelling::Pragma {
+                continue;
+            }
+            return Err(format!(
                 "field '{}' has no default and was not set by EPIC_CONFIG; \
                  this device cannot boot without an explicit value. Valid values: {:?}",
                 field.name,
                 field.values.iter().map(|v| v.name).collect::<Vec<_>>()
-            )
-        })?;
+            ));
+        };
         let fv = field
             .values
             .iter()

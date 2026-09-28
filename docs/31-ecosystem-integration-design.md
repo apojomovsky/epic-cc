@@ -487,8 +487,10 @@ token and the valid options. A field not mentioned takes its `default`, if it ha
 **Oscillator-related fields have no default.** `FOSC` (both devices) and, on the PIC18F4550,
 `PLLDIV`/`CPUDIV`/`USBDIV`, get `default: None`. A wrong guess here does not produce a
 suboptimal chip, it produces one that does not run at all, since the right value depends
-entirely on the board's crystal. `default: None` and unset panics with a clear message
-naming the field and its valid values, rather than silently picking something. Every other
+entirely on the board's crystal. Under `EPIC_CONFIG`, `default: None` and unset panics
+with a clear message naming the field and its valid values, rather than silently picking
+something. Under `#pragma config` (epic-cc#706), an omitted defaultless field instead
+keeps its erased baseline value, the way XC8 leaves unprogrammed fuses erased. Every other
 field (`WDT`, `LVP`, `BOR`, `PWRTEN`, protection, `DEBUG`, pin-mux fields) keeps a concrete
 safe default per D-4's original intent (watchdog off, low-voltage programming off, brownout
 on, no code protection, debug off).

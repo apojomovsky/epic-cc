@@ -38,19 +38,24 @@ pub fn fuse_spec(spec: &str) -> String {
 
 /// System clock in Hz from a full EPIC_CONFIG spec (may include `xtal_hz`).
 pub fn resolve_fosc_hz(device: &Device, spec: &str) -> u64 {
-    try_resolve_fosc_hz(device, spec).unwrap_or_else(|e| panic!("{} {e}", diag::USER_PREFIX))
+    try_resolve_fosc_hz(device, spec, device::ConfigSpelling::EpicConfig)
+        .unwrap_or_else(|e| panic!("{} {e}", diag::USER_PREFIX))
 }
 
 /// Fallible `resolve_fosc_hz`, so the driver can point the error at the
-/// `EPIC_CONFIG` site instead of panicking bare.
-pub fn try_resolve_fosc_hz(device: &Device, spec: &str) -> Result<u64, String> {
+/// config site instead of panicking bare.
+pub fn try_resolve_fosc_hz(
+    device: &Device,
+    spec: &str,
+    spelling: device::ConfigSpelling,
+) -> Result<u64, String> {
     let (fuse, xtal) = try_split_xtal_hz(spec)?;
     // Validate the fuse half (required oscillator fields, locked, etc.).
-    device::try_resolve_config(&device.config, &fuse)?;
+    device::try_resolve_config_in(&device.config, &fuse, spelling)?;
     match device.core {
-        Core::Pic14 | Core::Pic14e => pic14_hz(&device.config, &fuse, xtal),
-        Core::Pic18 => pic18_hz(&device.config, &fuse, xtal),
-        Core::PicBaseline => baseline_hz(&device.config, &fuse, xtal),
+        Core::Pic14 | Core::Pic14e => pic14_hz(&device.config, &fuse, xtal, spelling),
+        Core::Pic18 => pic18_hz(&device.config, &fuse, xtal, spelling),
+        Core::PicBaseline => baseline_hz(&device.config, &fuse, xtal, spelling),
     }
 }
 
@@ -62,7 +67,12 @@ pub fn resolve_fosc_hz_from_defaults(_device: &Device) -> u64 {
     0
 }
 
-fn named(region: &ConfigRegion, spec: &str, field: &str) -> Result<String, String> {
+fn named(
+    region: &ConfigRegion,
+    spec: &str,
+    field: &str,
+    spelling: device::ConfigSpelling,
+) -> Result<String, String> {
     // The spec may spell fields and values either way (`osc=intio` or
     // `FOSC = INTOSCIO_EC`): match the pair key through the field's
     // aliases and return the value's canonical name, so the derived clock
@@ -86,22 +96,51 @@ fn named(region: &ConfigRegion, spec: &str, field: &str) -> Result<String, Strin
             }
         }
     }
+    if let Some(default) = target.default {
+        return Ok(default.to_ascii_lowercase());
+    }
+    if spelling == device::ConfigSpelling::Pragma {
+        if let Some(erased) = erased_value_name(region, target) {
+            return Ok(erased);
+        }
+    }
+    Err(format!(
+        "field '{field}' has no default and was not set by {}",
+        match spelling {
+            device::ConfigSpelling::EpicConfig => "EPIC_CONFIG",
+            device::ConfigSpelling::Pragma => "#pragma config",
+        }
+    ))
+}
+
+/// The value name the erased baseline encodes for `target`, if any. Some
+/// erased patterns name no value (an all-ones nibble past the last mode),
+/// and then there is nothing to derive a clock from.
+fn erased_value_name(region: &ConfigRegion, target: &FuseField) -> Option<String> {
+    let byte = region.erased_baseline.get(target.byte_offset as usize)?;
+    let placed = (*byte as u16) & (target.mask as u16);
     target
-        .default
-        .ok_or_else(|| format!("field '{field}' has no default and was not set by the config"))
-        .map(|d| d.to_ascii_lowercase())
+        .values
+        .iter()
+        .find(|v| ((v.bits as u16) << target.shift) & (target.mask as u16) == placed)
+        .map(|v| v.name.to_ascii_lowercase())
 }
 
 fn field_of<'a>(region: &'a ConfigRegion, name: &str) -> Result<&'a FuseField, String> {
     device::find_field(region, name).ok_or_else(|| format!("no fuse field '{name}' on this device"))
 }
 
-fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64, String> {
+fn pic14_hz(
+    region: &ConfigRegion,
+    spec: &str,
+    xtal: Option<u64>,
+    spelling: device::ConfigSpelling,
+) -> Result<u64, String> {
     // DS39582C §14.2.1: LP/XT/HS/RC. Crystal modes have no PLL; Fosc is
     // the crystal. RC frequency is a function of R, C, Vdd and temperature
     // (§14.2.3) and cannot be derived, so the user must still declare it
     // as xtal_hz.
-    let _osc = named(region, spec, "osc")?;
+    let _osc = named(region, spec, "osc", spelling)?;
     xtal.ok_or_else(|| {
         "xtal_hz=<Hz> is required to derive the clock \
          (DS39582C §14.2: Fosc is the crystal or the declared RC frequency)"
@@ -109,13 +148,18 @@ fn pic14_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
     })
 }
 
-fn baseline_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64, String> {
+fn baseline_hz(
+    region: &ConfigRegion,
+    spec: &str,
+    xtal: Option<u64>,
+    spelling: device::ConfigSpelling,
+) -> Result<u64, String> {
     // DS41236E §2.0: the 509's internal oscillator is a 4 MHz precision
     // internal oscillator (INTRC). The `osc` fuse field selects LP/XT/
     // INTOSC/EXTRC; the internal modes run at 4 MHz, the crystal/RC modes
     // need the declared xtal_hz (Fosc is the crystal or the RC frequency,
     // which cannot be derived).
-    let osc = named(region, spec, "osc")?;
+    let osc = named(region, spec, "osc", spelling)?;
     if matches!(osc.as_str(), "intosc") {
         Ok(4_000_000)
     } else {
@@ -144,8 +188,13 @@ fn is_j_series_pll(region: &ConfigRegion) -> bool {
     has_field(region, "plldiv") && has_field(region, "cpudiv") && !has_field(region, "usbdiv")
 }
 
-fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64, String> {
-    let osc = named(region, spec, "osc")?;
+fn pic18_hz(
+    region: &ConfigRegion,
+    spec: &str,
+    xtal: Option<u64>,
+    spelling: device::ConfigSpelling,
+) -> Result<u64, String> {
+    let osc = named(region, spec, "osc", spelling)?;
     // Confirmed on PIC18F252/258/452/2525/4520/4620: the non-USB PIC18
     // family (DS39025/DS39631) has no CPUDIV/PLLDIV/USBDIV fuses at all;
     // Register 25-1's configurable divider chain is specific to the 96 MHz
@@ -189,7 +238,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
             // prescaler or postscaler at all.
             return Ok(xtal * 4);
         }
-        let plldiv = named(region, spec, "plldiv")?;
+        let plldiv = named(region, spec, "plldiv", spelling)?;
         let factor = plldiv_factor(&plldiv)?;
         if xtal / factor != 4_000_000 || xtal % factor != 0 {
             return Err(format!(
@@ -197,7 +246,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
                  PLL's required 4 MHz input (DS39632E Register 25-1 / §2.2.4)"
             ));
         }
-        let cpudiv = named(region, spec, "cpudiv")?;
+        let cpudiv = named(region, spec, "cpudiv", spelling)?;
         if is_j_series_pll(region) {
             // DS30009964C Register 28-2 / Table: CPDIV<1:0> divides the
             // fixed 48 MHz USB clock (11/10/01/00 = /1,/2,/3,/6), not the
@@ -218,7 +267,7 @@ fn pic18_hz(region: &ConfigRegion, spec: &str, xtal: Option<u64>) -> Result<u64,
             // primary oscillator drives the system clock directly.
             return Ok(xtal);
         }
-        let cpudiv = named(region, spec, "cpudiv")?;
+        let cpudiv = named(region, spec, "cpudiv", spelling)?;
         if is_j_series_pll(region) {
             // Register 28-2's CPDIV<1:0> table is not qualified by
             // oscillator mode; with no PLL engaged it divides the raw
