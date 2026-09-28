@@ -857,12 +857,12 @@ impl<'m> Gen<'m> {
 
     /// One byte, memory-to-memory. Staged into `pending_copies` instead
     /// of emitted: consecutive pairs drain as a single POSTINC copy loop
-    /// once long enough (epic-cc#486). A pair that breaks consecutivity
-    /// drains what is staged first, so the buffer is always one maximal
-    /// run. A coalesced self-copy (epic-cc#727) emits nothing (MOVFF sets
-    /// no flags). The FSR0-slot invalidation still happens eagerly, at the
-    /// copy's logical position, because later address computations read
-    /// the tracked state before the drain.
+    /// once long enough (epic-cc#486); a breaking pair drains first, so the
+    /// buffer is always one maximal run. A coalesced self-copy (epic-cc#727)
+    /// emits nothing (MOVFF sets no flags, so the skip returns before any
+    /// invalidation); emitted copies still invalidate eagerly, at the copy's
+    /// logical position, because later address computations read the tracked
+    /// state before the drain.
     fn emit_copy_byte(&mut self, src: u16, dst: u16) {
         // Shared with every staged path (phi copies included): a skipped
         // pair just shortens the pending run, which may replay straight.

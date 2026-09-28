@@ -84,6 +84,20 @@ fn add_c_runs_correctly() {
     assert!(p.halted());
 }
 
+/// Coalesced diamond (epic-cc#727): the phi incoming is dead after the
+/// join, so destination and source share one slot through the backend.
+/// The sim proves the value, not just the missing MOVFF.
+#[test]
+fn coalesce_c_runs_correctly() {
+    let (mut p, globals) = compile(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/coalesce.c"
+    ));
+    p.run(500);
+    assert_eq!(p.ram()[globals["out"] as usize], 43);
+    assert!(p.halted());
+}
+
 #[test]
 fn scalar_c_runs_correctly() {
     // Hand trace in the fixture's own comment: in = 7 -> n = 7 -> out = 174.
