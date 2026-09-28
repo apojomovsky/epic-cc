@@ -9,10 +9,11 @@
 //! must not reshape their IR.
 //!
 //! Store runs convert only with a flash-symbol ref aboard: pure-const runs
-//! are #504/#487 territory (clang memcpy and CLRF coalescing already serve
-//! them at better economics than a synthesized table). Zero bytes ride the
-//! table at half a word against a 1-word inline CLRF, so the savings check
-//! prices zeros honestly instead of assuming 2 words per byte.
+//! are #504/#487 territory (clang memcpy and CLRF/SETF coalescing already
+//! serve them at better economics than a synthesized table). Zero and 0xFF
+//! bytes ride the table at half a word against a 1-word inline CLRF/SETF,
+//! so the savings check prices them honestly instead of assuming 2 words
+//! per byte.
 use std::collections::{HashMap, HashSet};
 
 use device::Core;
@@ -321,13 +322,13 @@ fn table_store_runs(m: &mut Module) {
                 let n = run.len();
                 let mut bytes: Vec<u8> = Vec::with_capacity(n);
                 let mut refs: Vec<(usize, String)> = Vec::new();
-                let mut zeros = 0usize;
+                let mut cheap = 0usize;
                 for member in &run.members {
                     for rb in &member.bytes {
                         match rb {
-                            RunByte::Lit(0) => {
-                                zeros += 1;
-                                bytes.push(0);
+                            RunByte::Lit(v) if *v == 0 || *v == 0xFF => {
+                                cheap += 1;
+                                bytes.push(*v);
                             }
                             RunByte::Lit(v) => bytes.push(*v),
                             RunByte::Ref(sym) => {
@@ -338,15 +339,15 @@ fn table_store_runs(m: &mut Module) {
                     }
                 }
                 // Pure-const runs are #504/#487 territory (clang memcpy and
-                // CLRF coalescing already serve them); this pass tables only
-                // runs carrying flash-symbol refs, the #639 scope. Inline
-                // costs 2 words per byte but 1 per zero (CLRF), against a
-                // 14-word loop plus half a word per table byte: convert only
-                // strictly profitable runs.
+                // CLRF/SETF coalescing already serve them); this pass tables
+                // only runs carrying flash-symbol refs, the #639 scope.
+                // Inline costs 2 words per byte but 1 per zero (CLRF) or
+                // 0xFF (SETF), against a 14-word loop plus half a word per
+                // table byte: convert only strictly profitable runs.
                 if refs.is_empty() {
                     return;
                 }
-                if 2 * n - zeros < 14 + (n + 1) / 2 + 1 {
+                if 2 * n - cheap < 14 + (n + 1) / 2 + 1 {
                     return;
                 }
                 let name = format!("__tbl.init.{}.{ctr}", f.name);
@@ -837,5 +838,58 @@ mod tests {
         m.funcs.push(main_func(insts));
         run(&mut m, Core::Pic18);
         assert!(m.globals.is_empty(), "a zero-heavy run must not table");
+    }
+
+    /// Two ref bytes drowned in ten 0xFF bytes stay inline: 0xFF costs 1
+    /// word inline (SETF), so the honest math loses here just like zeros.
+    #[test]
+    fn ff_heavy_ref_run_stays_inline() {
+        let mut m = empty_module();
+        m.funcs.push(Func {
+            name: "f".to_string(),
+            ret: None,
+            params: Vec::new(),
+            blocks: vec![Block {
+                label: "entry".to_string(),
+                insts: vec![Inst::Ret(None, None)],
+            }],
+            isr: false,
+            irq_priority: 0,
+            naked: false,
+            variadic: false,
+        });
+        let mut insts = vec![Inst::Alloca(Alloca {
+            dst: "a".to_string(),
+            size: 12,
+            loc: None,
+        })];
+        insts.push(Inst::Store(Store {
+            ty: Ty::I16,
+            val: Val::Global("f".to_string()),
+            ptr: "%a".to_string(),
+            loc: None,
+        }));
+        for (g, k, ty, val) in [
+            ("g2", 2u16, Ty::I32, Val::Const(-1)),
+            ("g3", 6u16, Ty::I32, Val::Const(-1)),
+            ("g4", 10u16, Ty::I16, Val::Const(-1)),
+        ] {
+            insts.push(Inst::Gep(Gep {
+                dst: g.to_string(),
+                base: GepBase::Reg("a".to_string()),
+                k,
+                terms: Vec::new(),
+                loc: None,
+            }));
+            insts.push(Inst::Store(Store {
+                ty,
+                val,
+                ptr: format!("%{g}"),
+                loc: None,
+            }));
+        }
+        m.funcs.push(main_func(insts));
+        run(&mut m, Core::Pic18);
+        assert!(m.globals.is_empty(), "a 0xFF-heavy run must not table");
     }
 }
