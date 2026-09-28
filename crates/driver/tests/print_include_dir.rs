@@ -52,6 +52,15 @@ fn dump_include_dir_materializes_every_header() {
     ] {
         assert!(dir.join(name).is_file(), "missing {name} in {dir:?}");
     }
+    let mut pics = 0;
+    for dev in device::ALL {
+        if driver::headers::pic_header(dev).is_some() {
+            let name = driver::headers::pic_filename(dev);
+            assert!(dir.join(&name).is_file(), "missing {name} in {dir:?}");
+            pics += 1;
+        }
+    }
+    assert!(pics > 0, "no device headers in {dir:?}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
