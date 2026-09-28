@@ -492,6 +492,10 @@ fn main() {
         std::fs::write(&cli.output, ir::serialize(&m)).expect("write ir");
         return;
     }
+    // Table PIC18 constant copies in flash before legalize sees them, so the
+    // ISR analysis reads the same memcpy shapes clang emits (epic-cc#639).
+    // Core-gated inside: every other core keeps byte-identical IR.
+    driver::const_runs::run(&mut m, device.core);
     m = legalize::legalize(m);
     let cg = callgraph::build(&m);
     // A too-deep call chain is the program's fault (recursion or nesting

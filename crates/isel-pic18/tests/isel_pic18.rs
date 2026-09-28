@@ -4799,6 +4799,33 @@ fn const_table_function_ref_keeps_the_label_literal() {
 }
 
 #[test]
+fn const_table_odd_placed_function_ref_labels_by_half() {
+    // A function address at an odd table offset (a packed struct's leading
+    // byte pushes it there): the half follows the symbol's own byte run,
+    // low half first, never the table index (epic-cc#639). Index parity
+    // would print HIGH then LOW here.
+    let m = with_refs(
+        with_bytes(
+            parse(
+                "const vt i8\n\
+                 fn f0(void) ()\n  block entry:\n    ret void\n\
+                 fn main(void) ()\n  block entry:\n    ret void\n",
+            ),
+            "vt",
+            &[0x7E, 0x00, 0x00],
+        ),
+        "vt",
+        &[(1, "f0"), (2, "f0")],
+    );
+    let asm = select(&PIC18F4550, &m, &addrs(&[]), None);
+    assert!(
+        asm.contains("db LOW(f0)\n    db HIGH(f0)"),
+        "an odd-placed address still labels low half first:\n{asm}"
+    );
+    asm::assemble_pic18(&asm);
+}
+
+#[test]
 fn const_to_ram_init_ram_ref_materializes_the_alloc_address() {
     // A const global copied to RAM whose ref names a RAM global: the
     // __start init must write the address bytes numerically (epic-cc#443),

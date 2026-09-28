@@ -89,6 +89,7 @@ dependencies = [
  "isel-pic-baseline",
  "isel-pic14e",
  "isel-pic18",
+ "iselcore",
  "legalize",
  "object",
  "outline",
