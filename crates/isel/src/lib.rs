@@ -1729,21 +1729,25 @@ impl<'m> Gen<'m> {
         match cond {
             Val::Reg(r) => {
                 let ca = self.val_addr(&Val::Reg(r.clone())).direct();
-                // A just-materialized cond carries the compare's flag
-                // relation, and w_holds still holds dst (both set at the end
-                // of emit_materialize, neither cleared since). MOVLW/MOVWF
-                // touch no STATUS bits, so branch on the flag directly with
-                // the skip-when-true polarity from emit_materialize and drop
-                // the reload. Without BOTH markers (dst not a single flag,
-                // or something emitted in between) take the standard reload:
-                // the MOVF resets Z to (ca == 0), which the plain BTFSC
-                // below tests.
-                let (bit, skip) = match self.z_rel {
-                    Some((b, s)) if self.w_holds == Some(ca) => (b, s),
-                    _ => (2, "BTFSC"),
+                // A just-materialized cond leaves both z_rel (the compare's
+                // STATUS bit + skip polarity) and w_holds == dst. MOVLW/MOVWF
+                // touch no STATUS bits on mid-range PIC14, so branch on the
+                // flag directly. Composites leave z_rel None (their BTFx must
+                // test the MOVF's own Z, dst == 0, not the compare's raw flag):
+                // force the MOVF for them.
+                let rel = match self.z_rel {
+                    Some(r) if self.w_holds == Some(ca) => Some(r),
+                    _ => None,
                 };
-                self.emit_w_load(ca);
-                self.emit(format!("    {skip} STATUS, {bit} ; Z"));
+                match rel {
+                    Some((bit, skip)) => {
+                        self.emit(format!("    {skip} STATUS, {bit} ; Z"));
+                    }
+                    None => {
+                        self.emit(format!("    MOVF 0x{ca:02X}, W"));
+                        self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                    }
+                }
                 self.emit(format!("    GOTO {f}"));
                 self.emit(format!("    GOTO {t}"));
             }
@@ -1863,8 +1867,19 @@ impl<'m> Gen<'m> {
             Val::Reg(r) => self.val_addr(&Val::Reg(r.clone())).direct(),
             _ => unreachable!(),
         };
-        self.emit(format!("    MOVF 0x{ca:02X}, W"));
-        self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+        // Same flag-relation rule as emit_cond_branch: branch on the
+        // compare's own STATUS bit only when the materialize left a real
+        // relation and W still holds dst; composites take an unconditional
+        // MOVF whose own Z the BTFSC tests.
+        match self.z_rel.filter(|_| self.w_holds == Some(ca)) {
+            Some((bit, skip)) => {
+                self.emit(format!("    {skip} STATUS, {bit} ; Z"));
+            }
+            None => {
+                self.emit(format!("    MOVF 0x{ca:02X}, W"));
+                self.emit("    BTFSC STATUS, 2 ; Z".to_string());
+            }
+        }
         self.emit(format!("    GOTO {l_else}"));
         if addr_value {
             self.emit_move_addr_to_slot(a, da);
@@ -6226,47 +6241,40 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                             // Same flag-relation elision as emit_cond_branch:
                             // a just-materialized cond branches on the
                             // compare's own STATUS bit (skip polarity from
-                            // emit_materialize), everything else reloads and
-                            // tests the MOVF's Z. The per-edge skip shapes
-                            // below invert the polarity where they swap which
-                            // edge falls through.
-                            let (bit, skip) = match g.z_rel {
-                                Some((b, s)) if g.w_holds == Some(ca) => (b, s),
-                                _ => (2, "BTFSC"),
+                            // emit_materialize), everything else takes an
+                            // UNCONDITIONAL reload (never emit_w_load, which
+                            // would skip the MOVF when w_holds already holds
+                            // dst and leave the compare's raw Z in place).
+                            let rel = match g.z_rel {
+                                Some(r) if g.w_holds == Some(ca) => Some(r),
+                                _ => None,
                             };
-                            // Elision is exercised only in the plain
-                            // (no phi copies) shape: there the polarity
-                            // from emit_materialize applies directly
-                            // (skip-when-true). The copy shapes hardcode
-                            // their skip around which edge falls through
-                            // and a reload always precedes them, so they
-                            // keep the standard MOVF + STATUS-2 test
-                            // (epic-cc#602 follow-up covers them).
-                            // The plain shape's skip is decided here from the
-                            // flag relation (skip-when-true); the phi-copy
-                            // shapes emit their own hardcoded skip below
-                            // around which edge falls through, so nothing is
-                            // pre-emitted for them.
-                            if t_copies.is_none() && f_copies.is_none() {
-                                g.emit_w_load(ca);
-                                g.emit(format!("    {skip} STATUS, {bit} ; Z"));
-                            } else {
-                                // Unconditional reload: the phi-copy shapes'
-                                // hardcoded BTFx read the MOVF's own Z
-                                // (dst == 0), never the compare's relation.
-                                g.emit(format!("    MOVF 0x{ca:02X}, W"));
-                            }
+                            // Emission lives in the shape arms below. The
+                            // phi-copy shapes ALWAYS reload unconditionally:
+                            // their hardcoded BTFx read the MOVF's Z, and a
+                            // composite's materialize leaves W holding dst so
+                            // even emit_w_load would skip it. Their elision
+                            // is epic-cc#714.
                             match (t_copies, f_copies) {
-                                // Plain branch: the classic skip shape, its
-                                // BTFx already emitted above with the
-                                // polarity from the flag relation.
-                                (None, None) => {
-                                    g.emit(format!("    GOTO {lf}"));
-                                    g.emit(format!("    GOTO {lt}"));
-                                }
+                                (None, None) => match rel {
+                                    // The classic skip shape: branch on the
+                                    // live relation when set, else the MOVF's Z.
+                                    Some((bit, skip)) => {
+                                        g.emit(format!("    {skip} STATUS, {bit} ; Z"));
+                                        g.emit(format!("    GOTO {lf}"));
+                                        g.emit(format!("    GOTO {lt}"));
+                                    }
+                                    None => {
+                                        g.emit(format!("    MOVF 0x{ca:02X}, W"));
+                                        g.emit("    BTFSC STATUS, 2 ; Z".to_string());
+                                        g.emit(format!("    GOTO {lf}"));
+                                        g.emit(format!("    GOTO {lt}"));
+                                    }
+                                },
                                 // Both targets are merges: f falls through to
                                 // its copies, t jumps to a copy block.
                                 (Some(ct), Some(cf)) => {
+                                    g.emit(format!("    MOVF 0x{ca:02X}, W"));
                                     let lcop = g.fresh_label();
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lcop}"));
@@ -6283,6 +6291,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 // The copies feed the f (cond==0 fall-through)
                                 // edge: skip over them to t when cond != 0.
                                 (_, Some(c)) => {
+                                    g.emit(format!("    MOVF 0x{ca:02X}, W"));
                                     g.emit("    BTFSS STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lt}"));
                                     g.emit(format!(
@@ -6295,6 +6304,7 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                 // The copies feed the t (cond!=0 jump) edge:
                                 // skip over f to them when cond == 0.
                                 (Some(c), None) => {
+                                    g.emit(format!("    MOVF 0x{ca:02X}, W"));
                                     g.emit("    BTFSC STATUS, 2 ; Z".to_string());
                                     g.emit(format!("    GOTO {lf}"));
                                     g.emit(format!(
