@@ -255,6 +255,13 @@ mechanical rules fails the ritual and blocks the push.
   refuses it. If the guard is triggered, rebase onto master and get
   the human's explicit go-ahead before re-running with
   `EPIC_FORCE_PUSH_APPROVED=1 git push --force-with-lease`.
+- **Never post to a third-party repository.** No issue, pull request,
+  comment, review or fork outside the `apojomovsky/epic-*`
+  repositories, and no contact with upstream maintainers, unless the
+  human explicitly asks for that specific post, separately from any
+  plan. Upstream work worth doing becomes a `dispatch-only` issue with
+  the draft text, and stops there (canonical: epic-tasks' `AGENTS.md`,
+  "Third-party repositories").
 
 ## Expression conventions (comments and docs)
 
