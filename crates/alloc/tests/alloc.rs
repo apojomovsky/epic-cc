@@ -1118,6 +1118,95 @@ fn phi_dst_keeps_slot_when_incoming_live_after() {
     assert_ne!(out.locals["f::x"], out.locals["f::p"]);
 }
 
+/// Straight-line range copies (epic-cc#739): a freeze source dead after
+/// the copy lets the destination share its slot, so isel's per-lane
+/// copies become self-copy skips instead of MOVFFs.
+#[test]
+fn freeze_dst_coalesces_with_dead_source() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %d = freeze i16 %x\n\
+             store i16 %d, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::d"]);
+}
+
+/// The same freeze with the source read after the copy: the source is
+/// live past the copy point, so the destination keeps its own slot.
+#[test]
+fn freeze_dst_keeps_slot_when_source_live_after() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %d = freeze i16 %x\n\
+             %q = add i16 %x, %d\n\
+             store i16 %q, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::x"], out.locals["f::d"]);
+}
+
+/// A narrowing cast shares the source base for its copy lane: the
+/// destination's low byte is the source's low byte once the source dies.
+#[test]
+fn trunc_dst_shares_dead_source_base() {
+    let m = parse(
+        "const sink i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %x = add i16 1, 2\n\
+             %d = trunc i16 %x to i8\n\
+             store i8 %d, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::d"]);
+}
+
+/// A widening cast shares the source base the same way: the copy lanes
+/// skip and only the fill lane emits.
+#[test]
+fn zext_dst_shares_dead_source_base() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %x = add i8 1, 2\n\
+             %d = zext i8 %x to i16\n\
+             store i16 %d, ptr @sink\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::x"], out.locals["f::d"]);
+}
+
+/// A copy inside a loop body repeats each iteration, which linear order
+/// cannot see: the merge punts even when the source looks dead after.
+#[test]
+fn copy_merge_punts_on_cycle() {
+    let m = parse(
+        "const sink i16\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             br label %top\n\
+           block top:\n\
+             %x = add i16 1, 2\n\
+             %d = freeze i16 %x\n\
+             store i16 %d, ptr @sink\n\
+             br label %top\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::x"], out.locals["f::d"]);
+}
+
 /// A loop-carried value (use before def in linear order) spans the loop and
 /// cannot alias a value it is co-live with: the back-edge phi and the
 /// induction value stay in distinct slots.
