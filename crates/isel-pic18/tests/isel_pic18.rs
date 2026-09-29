@@ -4734,11 +4734,94 @@ fn const_i16_load_reads_two_bytes() {
     );
     let addrs = addrs(&[("main::1", 0x10)]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
-    // Two independent TBLRD* reads, into dst byte 0 and byte 1.
+    // One shared seed walks both bytes with `TBLRD*+` (epic-cc#745).
     assert_eq!(
-        asm.matches("TBLRD*").count(),
+        asm.matches("TBLRD*+").count(),
         2,
-        "two bytes need two TBLRD reads:\n{asm}"
+        "two bytes need two walked reads:\n{asm}"
+    );
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "adjacent bytes share one TBLPTR seed:\n{asm}"
+    );
+}
+#[test]
+fn adjacent_const_loads_across_statements_share_one_seed() {
+    // Two separate loads from one table's adjacent bytes share the seed
+    // the same way one wide load's lanes do, and the sim proves each byte
+    // lands in its own slot (epic-cc#745).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @t\n\
+                 %p = gep @t +1\n\
+                 %2 = load i8 %p\n\
+                 store i8 %1 @a\n\
+                 store i8 %2 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[0xAA, 0xBB],
+    );
+    let addrs = addrs(&[
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x10),
+        ("main::2", 0x11),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count(),
+        1,
+        "adjacent statements share one TBLPTR seed:\n{asm}"
+    );
+    assert_eq!(asm.matches("TBLRD*+").count(), 2, "both reads walk:\n{asm}");
+    let hex = asm::assemble_file_to_hex(&PIC18F4550, &asm);
+    let mut p = pic14_sim::Pic18::new(pic14_sim::parse_hex_pic18(&hex));
+    step_past_start(&mut p, start_steps(&asm));
+    p.run(1000);
+    assert_eq!(p.ram()[0x110], 0xAA, "first byte must be t[0]:\n{asm}");
+    assert_eq!(p.ram()[0x111], 0xBB, "second byte must be t[1]:\n{asm}");
+}
+
+#[test]
+fn const_reads_from_different_tables_seed_each() {
+    // Sharing keys on the table: adjacent offsets from two tables must
+    // seed twice, or the second read walks the wrong table (epic-cc#745).
+    let m = with_bytes(
+        parse(
+            "const t i8\n\
+             const u i8\n\
+             global a i8\n\
+             global b i8\n\
+             fn main(void) ()\n\
+               block entry:\n\
+                 %1 = load i8 @t\n\
+                 %2 = load i8 @u\n\
+                 store i8 %1 @a\n\
+                 store i8 %2 @b\n\
+                 ret void\n",
+        ),
+        "t",
+        &[0x11],
+    );
+    let m = with_bytes(m, "u", &[0x22]);
+    let addrs = addrs(&[
+        ("a", 0x110),
+        ("b", 0x111),
+        ("main::1", 0x10),
+        ("main::2", 0x11),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(
+        asm.matches("MOVLW LOW(t)").count() + asm.matches("MOVLW LOW(u)").count(),
+        2,
+        "each table seeds its own read:\n{asm}"
     );
 }
 
