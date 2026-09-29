@@ -195,8 +195,9 @@ to refuse; that rule arrives with the first LVP-only protocol.
 
 A new repo builds the programmer tools as PlatformIO tool packages from
 **pinned upstream tags plus a small patch directory**, not long-lived
-forks: patches are sent upstream so the queue stays short, which is
-what keeps maintenance cheap. CI builds per host and publishes to the
+forks: patches are offered upstream so the queue stays short, which is
+what keeps maintenance cheap. Offering one is the human's step, never an
+agent's (epic-tasks' `AGENTS.md`, "Third-party repositories"). CI builds per host and publishes to the
 registry; each package ships its licence and source reference.
 
 | Tool | Upstream | Licence | Redistribution |

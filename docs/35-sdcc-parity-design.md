@@ -307,7 +307,7 @@ All five must hold:
    expected result; that value is the arbiter. On a mismatch: if
    epic-cc matches the expected value and SDCC does not, the case is
    recorded in a committed `sdcc-known-bugs.toml` (program, SDCC
-   version, observed vs. expected, upstream bug link if filed) and
+   version, observed vs. expected, upstream bug link if the human filed one) and
    excluded from the differential gate. If epic-cc does not match the
    expected value, it's an epic-cc bug regardless of what SDCC did.
    Item 2 is green when every non-excluded program agrees with SDCC.
