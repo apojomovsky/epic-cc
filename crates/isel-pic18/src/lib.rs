@@ -115,6 +115,14 @@ struct BitLane {
     acc: String,
     loc: Option<SrcLoc>,
 }
+/// A fused compare reading its lanes in place (epic-cc#721). `icmp`
+/// carries the chain's lane sources with each consumed single-use load
+/// replaced by its global; `consumed` names the load dsts the block
+/// loop skips instead of staging through temps.
+struct FusedChain {
+    icmp: Icmp,
+    consumed: Vec<String>,
+}
 
 struct Gen<'m> {
     m: &'m Module,
@@ -616,6 +624,82 @@ impl<'m> Gen<'m> {
             }
         }
         Some(c)
+    }
+    /// Rewrites a fused compare's lane sources to read in place: either
+    /// side defined by a single-use same-block `Load` from a RAM global
+    /// becomes that global, and the load joins `consumed`. The chain
+    /// emitters already address any direct operand, so only the
+    /// producers forced the temp. A gap holding a call, an asm blob, or
+    /// any store keeps the slot path: the load may be volatile, and its
+    /// read count is preserved either way, but its position must not
+    /// move past observable behavior.
+    fn fused_chain_sources(g: &Gen, f: &Func, b: &Block, c: &Icmp) -> FusedChain {
+        let mut icmp = c.clone();
+        let mut consumed = Vec::new();
+        let ci = b
+            .insts
+            .iter()
+            .position(|i| matches!(i, Inst::Icmp(x) if x.dst == c.dst))
+            .unwrap_or(usize::MAX);
+        for side in [&mut icmp.a, &mut icmp.b] {
+            let Val::Reg(r) = side.clone() else { continue };
+            let Some(li) = b
+                .insts
+                .iter()
+                .position(|i| matches!(i, Inst::Load(l) if l.dst == r))
+            else {
+                continue;
+            };
+            if li >= ci {
+                continue;
+            }
+            let Inst::Load(l) = &b.insts[li] else {
+                continue;
+            };
+            if l.ty.bytes() != c.ty.bytes() || l.ptr_ty {
+                continue;
+            }
+            let Some(name) = l.ptr.strip_prefix('@') else {
+                continue;
+            };
+            if g.addrs.get(name).is_none() || g.global_is_const(name) {
+                continue;
+            }
+            let users = f
+                .blocks
+                .iter()
+                .flat_map(|bb| bb.insts.iter())
+                .filter(|inst| !matches!(inst, Inst::Icmp(x) if x.dst == c.dst))
+                .filter(|inst| ir::read_vals(inst).iter().any(|v| v == &r))
+                .count();
+            if users != 0 {
+                continue;
+            }
+            // A gap holding a call, an asm blob, or any memory write
+            // keeps the slot path: the load may be volatile, and its
+            // read count is preserved either way, but its position must
+            // not move past observable behavior. `Memcpy` writes memory
+            // without being a `Store`, so it joins the reject set.
+            let gap_clean = b.insts[li + 1..ci].iter().all(|inst| {
+                !matches!(
+                    inst,
+                    Inst::Call(_)
+                        | Inst::Asm(_)
+                        | Inst::Store(_)
+                        | Inst::Memcpy(_)
+                        | Inst::VaStart(_)
+                        | Inst::Br(_)
+                        | Inst::BrCond(_)
+                        | Inst::Switch(_)
+                )
+            });
+            if !gap_clean {
+                continue;
+            }
+            *side = Val::Global(name.to_string());
+            consumed.push(r);
+        }
+        FusedChain { icmp, consumed }
     }
 
     /// SSA regs an instruction defines, for same-block lane lookup. `Asm`
@@ -8253,7 +8337,9 @@ pub fn select_with_locs(
             // `fusable_icmp`): its lowering moves into the `BrCond` arm
             // below, which knows the branch targets. Emitting it here
             // would materialize a byte nobody reads.
-            let fused = Gen::fusable_icmp(&g, f, b).map(|c| c.dst.clone());
+            let fused: Option<FusedChain> = Gen::fusable_icmp(&g, f, b)
+                .cloned()
+                .map(|c| Gen::fused_chain_sources(&g, f, b, &c));
             let mut terminator: Option<&Inst> = None;
             for inst in &b.insts {
                 match inst {
@@ -8261,7 +8347,11 @@ pub fn select_with_locs(
                     Inst::Br(_) | Inst::BrCond(_) | Inst::Switch(_) | Inst::Ret(..) => {
                         terminator = Some(inst)
                     }
-                    Inst::Icmp(c) if fused.as_deref() == Some(c.dst.as_str()) => {}
+                    Inst::Icmp(c) if fused.as_ref().is_some_and(|fc| fc.icmp.dst == c.dst) => {}
+                    Inst::Load(l)
+                        if fused
+                            .as_ref()
+                            .is_some_and(|fc| fc.consumed.contains(&l.dst)) => {}
                     other => g.emit_inst(other),
                 }
             }
@@ -8287,12 +8377,7 @@ pub fn select_with_locs(
                     // The absorbed compare, when this branch is its only
                     // consumer: lower it here so its exits are the branch
                     // edges, skipping the 0/1 slot entirely.
-                    let fused_icmp = fused.as_deref().and_then(|dst| {
-                        b.insts.iter().find_map(|i| match i {
-                            Inst::Icmp(ic) if ic.dst == dst => Some(ic),
-                            _ => None,
-                        })
-                    });
+                    let fused_icmp = fused.as_ref().map(|fc| &fc.icmp);
                     match fused_icmp {
                         Some(c) => emit_fused_branch(
                             &mut g,
