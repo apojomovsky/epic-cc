@@ -8185,24 +8185,23 @@ pub fn select_with_locs(
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
                     let addr = base + i as u16;
-                    // A ref byte is the high or low half of a pointer
-                    // VALUE: a RAM target resolves through `addrs` right
-                    // here (RAM globals have no assembler label to
-                    // resolve, epic-cc#443); a flash target (function or
-                    // const table) keeps its link-time label literal
-                    // (epic-cc#154).
+                    // A ref byte is the low or high half of a pointer VALUE,
+                    // low half first: the half is the position inside the
+                    // symbol's own byte run, not the table index, so an
+                    // odd-placed pointer still labels correctly (epic-cc#639).
+                    // A RAM target resolves through `addrs` right here (RAM
+                    // globals have no assembler label to resolve, epic-cc#443);
+                    // a flash target (function or const table) keeps its
+                    // link-time label literal (epic-cc#154).
                     if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                        let half = g.refs.iter().filter(|(o, s)| *o < i && s == f).count() % 2;
                         match addrs.get(f) {
                             Some(&a) => {
-                                let byte = if i % 2 == 0 {
-                                    a & 0xFF
-                                } else {
-                                    (a >> 8) & 0xFF
-                                };
+                                let byte = if half == 0 { a & 0xFF } else { (a >> 8) & 0xFF };
                                 init.push(format!("    MOVLW 0x{byte:02X}"));
                             }
                             None => {
-                                let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                                let lit = if half == 0 { "LOW" } else { "HIGH" };
                                 init.push(format!("    MOVLW {lit}({f})"));
                             }
                         }
@@ -8261,28 +8260,27 @@ pub fn select_with_locs(
         // byte materializes its own line (see the ref match below).
         let mut chunk: Vec<String> = Vec::new();
         for (i, b) in g.bytes.iter().enumerate() {
-            // A ref byte is the high or low half of a pointer VALUE: a
-            // RAM target resolves through `addrs` right here (RAM
-            // globals have no assembler label to resolve, epic-cc#443);
-            // a flash target (function or const table) keeps its
-            // link-time label literal (epic-cc#154).
+            // A ref byte is the low or high half of a pointer VALUE, low
+            // half first: the half is the position inside the symbol's own
+            // byte run, not the table index, so an odd-placed pointer still
+            // labels correctly (epic-cc#639). A RAM target resolves through
+            // `addrs` right here (RAM globals have no assembler label to
+            // resolve, epic-cc#443); a flash target (function or const
+            // table) keeps its link-time label literal (epic-cc#154).
             if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
                 if !chunk.is_empty() {
                     out.push(format!("    db {}", chunk.join(", ")));
                     locs.push(None);
                     chunk.clear();
                 }
+                let half = g.refs.iter().filter(|(o, s)| *o < i && s == f).count() % 2;
                 match addrs.get(f) {
                     Some(&a) => {
-                        let byte = if i % 2 == 0 {
-                            a & 0xFF
-                        } else {
-                            (a >> 8) & 0xFF
-                        };
+                        let byte = if half == 0 { a & 0xFF } else { (a >> 8) & 0xFF };
                         out.push(format!("    db 0x{byte:02X}"));
                     }
                     None => {
-                        let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
+                        let lit = if half == 0 { "LOW" } else { "HIGH" };
                         out.push(format!("    db {lit}({f})"));
                     }
                 }
