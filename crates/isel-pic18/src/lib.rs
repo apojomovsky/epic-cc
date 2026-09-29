@@ -739,7 +739,9 @@ impl<'m> Gen<'m> {
     /// Picks the field read for one lane: the direct address when its
     /// gap is clean, else the slot when it exists, is not the establish
     /// target, and its own gap is clean. Returns the address override
-    /// and the consumed load, if any.
+    /// and the consumed load, if any. `extra` names consumed
+    /// intermediates defined inside the gap (the or-temp, the zext):
+    /// they never emit, so sharing the field slot is harmless for them.
     fn lane_read(
         g: &Gen,
         b: &Block,
@@ -750,12 +752,14 @@ impl<'m> Gen<'m> {
         direct: Option<u16>,
         load: Option<String>,
         slot: Option<u16>,
+        extra: &[String],
     ) -> Option<(Option<u16>, Option<String>)> {
         if direct.is_some() {
             let mut probe = vec![cnd.to_string()];
             if let Some(ld) = &load {
                 probe.push(ld.clone());
             }
+            probe.extend(extra.iter().cloned());
             if Self::lane_gap_clean(g, b, ci, final_ii, None, &probe) {
                 return Some((direct, load));
             }
@@ -764,7 +768,9 @@ impl<'m> Gen<'m> {
         if s == target {
             return None;
         }
-        if Self::lane_gap_clean(g, b, ci, final_ii, Some(s), &[cnd.to_string()]) {
+        let mut probe = vec![cnd.to_string()];
+        probe.extend(extra.iter().cloned());
+        if Self::lane_gap_clean(g, b, ci, final_ii, Some(s), &probe) {
             return Some((None, None));
         }
         None
@@ -809,7 +815,19 @@ impl<'m> Gen<'m> {
         field_slot: Option<u16>,
         consumed: &[String],
     ) -> bool {
+        let dbg = std::env::var("PIC8_LANE_DEBUG").is_ok();
         for inst in &b.insts[from + 1..to] {
+            if dbg {
+                let kind = match inst {
+                    Inst::Store(_) => "store",
+                    Inst::Call(_) => "call",
+                    Inst::Asm(_) => "asm",
+                    Inst::Memcpy(_) => "memcpy",
+                    Inst::VaStart(_) => "vastart",
+                    _ => "other",
+                };
+                eprintln!("lane gap scan: {kind}");
+            }
             match inst {
                 // A direct read observes any memory write. A slot read is
                 // immune to global stores (frame slots and globals never
@@ -868,22 +886,8 @@ impl<'m> Gen<'m> {
         let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &s.dst)) else {
             return None;
         };
-        let Some((faddr, load)) =
-            Self::lane_read(g, b, cnd, ci, final_ii, dst_slot, direct, load_opt, slot)
-        else {
-            return None;
-        };
         let eq = c.pred == "eq";
         let loc = s.loc.clone();
-        let mut eaten = vec![cnd.clone()];
-        if let Some(ld) = &load {
-            eaten.push(ld.clone());
-        }
-        let eaten_or = |or_r: &String| {
-            let mut v = eaten.clone();
-            v.push(or_r.clone());
-            v
-        };
         // Or-select: one arm is a single-use `Or` over the other arm,
         // which must be the same accumulator reg on both sides.
         for (or_v, acc_v, holds) in [(&s.a, &s.b, true), (&s.b, &s.a, false)] {
@@ -913,15 +917,23 @@ impl<'m> Gen<'m> {
             if g.addrs.get(&ssa_key(g.cur_func, acc_r)).is_none() {
                 continue;
             };
-            let gap = eaten_or(or_r);
-            // The test reads the field at the select: anything in between
-            // that could change the observed value keeps the old lowering.
-            let fslot = match faddr {
-                Some(_) => None,
-                None => g.addrs.get(&ssa_key(g.cur_func, fname)).copied(),
-            };
-            if !Self::lane_gap_clean(g, b, ci, final_ii, fslot, &gap) {
+            let Some((faddr, load)) = Self::lane_read(
+                g,
+                b,
+                cnd,
+                ci,
+                final_ii,
+                dst_slot,
+                direct.clone(),
+                load_opt.clone(),
+                slot,
+                std::slice::from_ref(or_r),
+            ) else {
                 continue;
+            };
+            let mut eaten = vec![cnd.clone(), or_r.clone()];
+            if let Some(ld) = &load {
+                eaten.push(ld.clone());
             }
             return Some((
                 BitLane {
@@ -936,7 +948,7 @@ impl<'m> Gen<'m> {
                     acc: acc_r.clone(),
                     loc: loc.clone(),
                 },
-                gap,
+                eaten,
             ));
         }
         // Const-select: literal arms differing in exactly one bit, with
@@ -955,12 +967,23 @@ impl<'m> Gen<'m> {
         let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &s.dst)) else {
             return None;
         };
-        let fslot = match faddr {
-            Some(_) => None,
-            None => g.addrs.get(&ssa_key(g.cur_func, fname)).copied(),
-        };
-        if !Self::lane_gap_clean(g, b, ci, final_ii, fslot, &eaten) {
+        let Some((faddr, load)) = Self::lane_read(
+            g,
+            b,
+            cnd,
+            ci,
+            final_ii,
+            dst_slot,
+            direct,
+            load_opt,
+            slot,
+            &[],
+        ) else {
             return None;
+        };
+        let mut eaten = vec![cnd.clone()];
+        if let Some(ld) = &load {
+            eaten.push(ld.clone());
         }
         Some((
             BitLane {
@@ -1033,21 +1056,23 @@ impl<'m> Gen<'m> {
         if g.addrs.get(&ssa_key(g.cur_func, acc_r)).is_none() {
             return None;
         }
-        let Some((faddr, load)) =
-            Self::lane_read(g, b, cnd, ci, final_ii, dst_slot, direct, load_opt, slot)
-        else {
+        let Some((faddr, load)) = Self::lane_read(
+            g,
+            b,
+            cnd,
+            ci,
+            final_ii,
+            dst_slot,
+            direct,
+            load_opt,
+            slot,
+            std::slice::from_ref(z_r),
+        ) else {
             return None;
         };
         let mut eaten = vec![cnd.clone(), z_r.clone()];
         if let Some(ld) = load {
             eaten.push(ld);
-        }
-        let fslot = match faddr {
-            Some(_) => None,
-            None => g.addrs.get(&ssa_key(g.cur_func, fname)).copied(),
-        };
-        if !Self::lane_gap_clean(g, b, ci, final_ii, fslot, &eaten) {
-            return None;
         }
         Some((
             BitLane {
