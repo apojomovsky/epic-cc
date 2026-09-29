@@ -40,18 +40,65 @@ pub struct Batch {
     pub stepi: usize,
 }
 
+/// Suffixes a candidate-local label with the case index so one candidate
+/// can replay per case in a single program: without it the second
+/// repetition redefines the label and the batch does not assemble.
+/// Label-free candidates (every spec before the bitmask lanes) pass
+/// through unchanged.
+fn gensym(line: &str, case_idx: usize, labels: &[&str]) -> String {
+    let trimmed = line.trim();
+    if let Some(name) = trimmed.strip_suffix(':') {
+        if !name.contains(char::is_whitespace) {
+            return format!("{name}_c{case_idx}:");
+        }
+    }
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let op = parts.next().unwrap_or("");
+    let operand = parts.next().unwrap_or("").trim();
+    if matches!(
+        op.to_ascii_lowercase().as_str(),
+        "bra" | "bz" | "bnz" | "goto" | "rcall" | "call"
+    ) && labels.contains(&operand)
+    {
+        return format!("{op} {operand}_c{case_idx}");
+    }
+    line.to_string()
+}
+
 /// Replay `cases` against `candidate` on hardware. `out_base` is the
 /// first output-table byte (banked GPR, e.g. 0x100); each case occupies
 /// one `W` slot, one `STATUS` slot, then one slot per allowed address.
 pub fn build_batch(candidate: &Candidate, cases: &[Case], out_base: usize) -> Batch {
+    // Labels this candidate defines: branch targets get the case index
+    // below so repetitions never redefine one another.
+    let labels: Vec<&str> = candidate
+        .iter()
+        .filter_map(|l| {
+            let name = l.trim().strip_suffix(':')?;
+            (!name.contains(char::is_whitespace)).then_some(name)
+        })
+        .collect();
+
     let mut src = String::from("goto start\nstart:\n");
     let mut reads = vec![PROOF_ADDR];
     let mut expected = vec![PROOF_POR];
     let mut guards: Vec<usize> = Vec::new();
+    // A guard asserts its byte still reads poison: it must never cover
+    // an address a case pokes (every replay overwrites it), only
+    // neighbours the candidate must leave alone. Shift specs never trip
+    // this because their pokes sit inside `allowed_changes`.
+    let poked: Vec<usize> = cases
+        .iter()
+        .flat_map(|c| c.pokes.iter().map(|(a, _)| *a))
+        .collect();
     for case in cases {
         for &addr in &case.allowed_changes {
             for g in [addr.wrapping_sub(1), addr + 1] {
-                if g < SFR_FLOOR && !case.allowed_changes.contains(&g) && !guards.contains(&g) {
+                if g < SFR_FLOOR
+                    && !case.allowed_changes.contains(&g)
+                    && !poked.contains(&g)
+                    && !guards.contains(&g)
+                {
                     guards.push(g);
                 }
             }
@@ -95,7 +142,7 @@ pub fn build_batch(candidate: &Candidate, cases: &[Case], out_base: usize) -> Ba
         }
         src.push_str(&format!("movlw 0x{:02X}\n", case.entry_w));
         for line in candidate {
-            src.push_str(line);
+            src.push_str(&gensym(line, i, &labels));
             src.push('\n');
         }
         let slot = out_base + i * slots;
@@ -299,5 +346,23 @@ mod tests {
         values[10] ^= 0xFF;
         assert!(compare_batch(&batch, &values).is_err());
         assert!(compare_batch(&batch, &batch.expected).is_ok());
+    }
+
+    #[test]
+    fn gensym_uniquifies_branch_labels_per_case() {
+        let candidate: Candidate = vec![
+            "decfsz 0x020,W,A",
+            "bra lane_skip",
+            "bsf 0x021,2,A",
+            "lane_skip:",
+        ];
+        let cases = specs::bitmask_eq1_pr();
+        let batch = build_batch(&candidate, &cases[..2], 0x100);
+        assert!(batch.src.contains("lane_skip_c0:"));
+        assert!(batch.src.contains("lane_skip_c1:"));
+        assert!(batch.src.contains("bra lane_skip_c0"));
+        assert!(!batch.src.contains("lane_skip:"));
+        let words = asm::assemble_pic18(&batch.src);
+        assert!(!words.is_empty());
     }
 }
