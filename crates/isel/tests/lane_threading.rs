@@ -8,6 +8,11 @@
 //! construction, flushed everywhere else). A future change to the fold
 //! order or the freshness witness that breaks values or flags fails here
 //! even when the shape pins still pass.
+//!
+//! Encodings follow the simulator's own conventions, which invert the
+//! datasheet's `d` (0 routes to W in `write_d`): every helper pins an
+//! absolute value (RAM, W, or STATUS) somewhere, so a mis-encoded opcode
+//! fails instead of passing vacuously.
 
 use pic14_sim::Pic14;
 
@@ -34,7 +39,7 @@ fn iorlw(k: u8) -> u16 {
     0x3800 | k as u16
 }
 fn iorwf_w(f: usize) -> u16 {
-    0x1000 | f as u16
+    0x0400 | f as u16
 }
 
 fn run(words: &[u16], s_val: u8, entry_w: u8, entry_status: u8) -> Pic14 {
@@ -89,12 +94,17 @@ fn lane_reassociations_hold_over_all_inputs() {
                     );
                     cases += 1;
                 }
-                // Dead scratch store: trailing MOVWF vanishes, W and flags
-                // identical, scratch stale by design.
+                // Dead scratch store: the trailing MOVWF vanishes, W and
+                // flags identical, scratch stale by design. The W pin also
+                // proves the opcode decoded as IORWF: any impostor (a bit
+                // op, a literal) would leave entry W instead of s | 0xA5.
                 let old = run(&[movf_w(S), iorwf_w(D), movwf(D)], s, w, st);
                 let new = run(&[movf_w(S), iorwf_w(D)], s, w, st);
+                assert_eq!(new.w(), s | 0xA5, "IORWF executed s={s:02X}");
                 assert_eq!(old.w(), new.w(), "dead-store W s={s:02X}");
                 assert_eq!(old.status(), new.status(), "dead-store STATUS s={s:02X}");
+                assert_eq!(old.ram()[D], s | 0xA5, "stored result s={s:02X}");
+                assert_eq!(new.ram()[D], 0xA5, "scratch stale s={s:02X}");
                 cases += 1;
             }
         }
