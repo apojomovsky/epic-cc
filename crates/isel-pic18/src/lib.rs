@@ -815,19 +815,7 @@ impl<'m> Gen<'m> {
         field_slot: Option<u16>,
         consumed: &[String],
     ) -> bool {
-        let dbg = std::env::var("PIC8_LANE_DEBUG").is_ok();
         for inst in &b.insts[from + 1..to] {
-            if dbg {
-                let kind = match inst {
-                    Inst::Store(_) => "store",
-                    Inst::Call(_) => "call",
-                    Inst::Asm(_) => "asm",
-                    Inst::Memcpy(_) => "memcpy",
-                    Inst::VaStart(_) => "vastart",
-                    _ => "other",
-                };
-                eprintln!("lane gap scan: {kind}");
-            }
             match inst {
                 // A direct read observes any memory write. A slot read is
                 // immune to global stores (frame slots and globals never
