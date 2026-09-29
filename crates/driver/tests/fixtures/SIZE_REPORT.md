@@ -3,9 +3,9 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-09-29
-- Commit: 3af4744
+- Commit: 56b8912
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 9309 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9301 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -22,7 +22,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | bench-bank | 18F4550 | 33 | 15 | = / = |
 | bench-handle-init | 18F4550 | 24 | 9 | = / = |
 | bench-switch-calls | 18F4550 | 51 | 10 | = / = |
-| bench-u32-loop | 18F4550 | 86 | 23 | = / = |
+| bench-u32-loop | 18F4550 | 70 | 23 | = / = |
 | bench-u16-dec | 18F4550 | 113 | 33 | = / = |
 | bench-struct-scan | 18F4550 | 110 | 99 | = / = |
 | bench-struct-scan | 16F877A | 175 | 108 | = / = |
@@ -42,9 +42,9 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | hal-pic16-blink-16f877a | 16F877A | 598 | 47 | = / = |
 | hal-pic18-blink-18f4550 | 18F4550 | 344 | 34 | = / = |
 | hal-pic16-encoder-full-16f877a | 16F877A | 6559 | 329 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9356 | 755 | = / = |
-| hal-pic18-control-demo-18f4550 | 18F4550 | 10450 | 977 | = / = |
-| hal-pic18-pid-18f4550 | 18F4550 | 3407 | 500 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 9354 | 755 | = / = |
+| hal-pic18-control-demo-18f4550 | 18F4550 | 10439 | 977 | = / = |
+| hal-pic18-pid-18f4550 | 18F4550 | 3406 | 500 | = / = |
 
 ## Menu-demo clusters (listing words)
 
@@ -52,7 +52,7 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 |---|---|
 | menu_demo_init +7 folded | 1539 |
 | redraw | 523 |
-| main | 392 |
+| main | 390 |
 | redraw_status | 366 |
 | EPIC_USART_Init | 331 |
 | epic_taskmgr_run +1 folded | 328 |
@@ -66,14 +66,14 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `struct-copy-movff`: 1366 (14.7%)
-- `shared-code`: 1355 (14.6%)
-- `data-move`: 1270 (13.6%)
+- `struct-copy-movff`: 1374 (14.8%)
+- `shared-code`: 1344 (14.5%)
+- `data-move`: 1270 (13.7%)
 - `branch`: 743 (8.0%)
 - `cond-branch`: 496 (5.3%)
 - `scalar-alu`: 496 (5.3%)
 - `literal-load`: 471 (5.1%)
-- `wide-literal-arith`: 470 (5.0%)
+- `wide-literal-arith`: 470 (5.1%)
 
 ## Regenerating
 

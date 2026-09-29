@@ -6800,6 +6800,79 @@ fn fused_cond_icmp_i32_chain_break_the_tie_at_the_top_lane() {
     }
 }
 
+/// A fused chain whose operands are single-use global loads reads the
+/// globals in place (epic-cc#721): no MOVFF staging temp, the lane
+/// `MOVF` sources are the global addresses themselves.
+#[test]
+fn fused_cond_icmp_i32_reads_single_use_loads_in_place() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i32 @a\n    %2 = load i32 @b\n    %3 = icmp ult i32 %1, %2\n    \
+         br i1 %3 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+         block 20:\n    store i8 0 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        !asm.contains("MOVFF 0x020") && !asm.contains("MOVFF 0x024"),
+        "fused chain stages its globals through temps:\n{asm}"
+    );
+    assert!(
+        asm.contains("SUBWF 0x020,W") && asm.contains("MOVF 0x024,W"),
+        "fused chain does not read its globals in place:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    for (a, b, expect) in [
+        (0x0000_0001u32, 0x0000_0002u32, 1),
+        (0x0000_0002u32, 0x0000_0001u32, 0),
+    ] {
+        let mut p = pic14_sim::Pic18::new(words.clone());
+        step_past_start(&mut p, start_steps(&asm));
+        for i in 0..4usize {
+            p.ram_mut()[0x20 + i] = (a >> (8 * i)) as u8;
+            p.ram_mut()[0x24 + i] = (b >> (8 * i)) as u8;
+        }
+        p.run(300);
+        assert_eq!(p.ram()[0x28], expect, "in-place ult {a:#010x} vs {b:#010x}");
+    }
+}
+
+/// A store between the load and the compare keeps the slot path for that
+/// side only: moving the read past observable behavior is never sound.
+/// The other side, loaded adjacently, still threads in place.
+#[test]
+fn fused_cond_icmp_i32_keeps_slot_when_store_sits_in_gap() {
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i32 @a\n    store i8 0 @out\n    %2 = load i32 @b\n    %4 = icmp ult i32 %1, %2\n    \
+         br i1 %4 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+         block 20:\n    store i8 0 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::4", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(
+        asm.contains("MOVFF 0x020"),
+        "store in gap wrongly consumed the load:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0x024"),
+        "adjacent load was not read in place:\n{asm}"
+    );
+}
+
 /// A compare whose result is read by something other than the single branch
 /// must keep the materializing lowering; the fused path would skip the slot
 /// write the other consumer reads.
