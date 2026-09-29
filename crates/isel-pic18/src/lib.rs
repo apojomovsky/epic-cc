@@ -84,6 +84,38 @@ enum Fsr0Origin {
     SlotValue(u16),
 }
 
+/// One `acc |= mask` lane over a single bit (epic-cc#626). The test reads
+/// the field once: from its source address when the lane consumes a
+/// single-use load, else from its slot. Either way every source-level
+/// volatile read still emits exactly once; only the bool materialization
+/// and the select diamond go away.
+#[derive(Clone)]
+struct BitLane {
+    /// Tested byte, always a slot-backed `Reg`.
+    field: Val,
+    /// Source address when the lane consumed a single-use load: the
+    /// test reads it directly instead of the field slot. `None` keeps
+    /// the slot read (multi-use fields, non-load producers).
+    faddr: Option<u16>,
+    /// Compare constant, 0 or 1.
+    k: u8,
+    /// True for `eq` (skip on `BNZ`), false for `ne` (skip on `BZ`).
+    eq: bool,
+    /// Set the bit exactly when the predicate holds (vs on its false
+    /// side, for lanes whose set-arm is the false one).
+    set_on_hold: bool,
+    /// Slot the `BSF` updates: the lane's own dst slot.
+    target: u16,
+    /// Bit number to set.
+    bit: u8,
+    /// Const-lane default written before the test; `None` when the
+    /// accumulator already holds the base value.
+    base: Option<u8>,
+    /// Or-lane accumulator reg copied into the dst; empty for const-lanes.
+    acc: String,
+    loc: Option<SrcLoc>,
+}
+
 struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
@@ -179,6 +211,11 @@ struct Gen<'m> {
     /// tables, runtime routines). `emit` records it on the line it pushes,
     /// so the parallel `locs` vector stays index-aligned with `out`.
     cur_loc: Option<SrcLoc>,
+    /// Bitmask lanes fused by the per-function pre-scan (epic-cc#626).
+    /// `bit_lanes` keys the final instruction's dst to its lane and
+    /// `lane_consumed` holds skipped intermediate dsts.
+    bit_lanes: HashMap<String, BitLane>,
+    lane_consumed: HashSet<String>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -580,6 +617,511 @@ impl<'m> Gen<'m> {
         }
         Some(c)
     }
+
+    /// SSA regs an instruction defines, for same-block lane lookup. `Asm`
+    /// operands count as defined (outputs alias the same pointer) and
+    /// `VaStart` writes its list; both choices only ever reject a lane,
+    /// never wrongly keep one.
+    fn lane_defs(inst: &Inst) -> Vec<String> {
+        match inst {
+            Inst::Load(l) => vec![l.dst.clone()],
+            Inst::Bin(b) => vec![b.dst.clone()],
+            Inst::Zext(z) => vec![z.dst.clone()],
+            Inst::Sext(s) => vec![s.dst.clone()],
+            Inst::Trunc(t) => vec![t.dst.clone()],
+            Inst::IntToPtr(p) => vec![p.dst.clone()],
+            Inst::Icmp(i) => vec![i.dst.clone()],
+            Inst::Select(s) => vec![s.dst.clone()],
+            Inst::Call(c) => c.dst.clone().into_iter().collect(),
+            Inst::Phi(p) => vec![p.dst.clone()],
+            Inst::Gep(g) => vec![g.dst.clone()],
+            Inst::Alloca(a) => vec![a.dst.clone()],
+            Inst::Freeze(f) => vec![f.dst.clone()],
+            Inst::FloatBin(b) => vec![b.dst.clone()],
+            Inst::Fcmp(c) => vec![c.dst.clone()],
+            Inst::FloatConv(c) => vec![c.dst.clone()],
+            Inst::VaArg(v) => vec![v.dst.clone()],
+            Inst::VaStart(v) => vec![v.list.clone()],
+            Inst::Asm(a) => a
+                .operands
+                .iter()
+                .map(|o| o.ptr.strip_prefix('%').unwrap_or(&o.ptr).to_string())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Splits an `eq`/`ne` byte compare with a 0/1 literal side into the
+    /// tested value and the constant.
+    fn lane_cmp(c: &Icmp) -> Option<(Val, u8)> {
+        if c.ty != Ty::I8 || (c.pred != "eq" && c.pred != "ne") {
+            return None;
+        }
+        match (&c.a, &c.b) {
+            (Val::Reg(_), Val::Const(k)) if *k == 0 || *k == 1 => Some((c.a.clone(), *k as u8)),
+            (Val::Const(k), Val::Reg(_)) if *k == 0 || *k == 1 => Some((c.b.clone(), *k as u8)),
+            _ => None,
+        }
+    }
+
+    /// Source address for a single-use i8 load, mirroring the `Load`
+    /// arm's direct cases without emitting anything: plain globals and
+    /// constant-offset global folds. Anything else (flash tables,
+    /// indexed/indirect forms, SFR pointers) keeps the slot path.
+    fn lane_load_addr(g: &Gen, l: &ir::Load) -> Option<u16> {
+        if l.ty != Ty::I8 || l.ptr.starts_with("0x") {
+            return None;
+        }
+        let ptr_val = if let Some(gb) = l.ptr.strip_prefix('@') {
+            Val::Global(gb.to_string())
+        } else if let Some(r) = l.ptr.strip_prefix('%') {
+            Val::Reg(r.to_string())
+        } else {
+            return None;
+        };
+        if g.const_base_of(&ptr_val).is_some() {
+            return None;
+        }
+        match ptr_val {
+            Val::Global(gb) => g.addrs.get(&gb).copied(),
+            Val::Reg(r) => {
+                let (base, k, terms) = g.resolved.get(&ssa_key(g.cur_func, &r)).cloned()?;
+                if !terms.is_empty() {
+                    return None;
+                }
+                match base {
+                    Base::Global(name) => g.addrs.get(&name).map(|a| a.wrapping_add(k)),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Resolves the tested field's read options: a consumed single-use
+    /// load's source address (preferred, one `MOVF` replaces the copy
+    /// plus test) plus its dst for the use count, and the field slot.
+    /// The caller picks direct first and falls back to the slot, running
+    /// the gap check for each: a failed direct read must not reject the
+    /// sound slot path.
+    /// Returns `(direct address, load dst, slot)`, each empty when its
+    /// shape does not apply (adjacency for direct, allocation for slot).
+    fn lane_field(
+        g: &Gen,
+        b: &Block,
+        defs: &HashMap<String, usize>,
+        uses: &HashMap<String, usize>,
+        fname: &str,
+        use_ii: usize,
+    ) -> (Option<u16>, Option<String>, Option<u16>) {
+        // The direct read moves the volatile load to the lane position,
+        // so the load must immediately precede the compare: any
+        // instruction between them (a store to the same address, a call)
+        // could change what the test observes.
+        let mut direct = None;
+        let mut load = None;
+        if let Some(&li) = defs.get(fname) {
+            if li + 1 == use_ii {
+                if let Inst::Load(l) = &b.insts[li] {
+                    if l.dst == fname && uses.get(fname).copied().unwrap_or(0) == 1 {
+                        if let Some(addr) = Self::lane_load_addr(g, l) {
+                            direct = Some(addr);
+                            load = Some(fname.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let slot = g.addrs.get(&ssa_key(g.cur_func, fname)).copied();
+        (direct, load, slot)
+    }
+
+    /// Picks the field read for one lane: the direct address when its
+    /// gap is clean, else the slot when it exists, is not the establish
+    /// target, and its own gap is clean. Returns the address override
+    /// and the consumed load, if any. `extra` names consumed
+    /// intermediates defined inside the gap (the or-temp, the zext):
+    /// they never emit, so sharing the field slot is harmless for them.
+    fn lane_read(
+        g: &Gen,
+        b: &Block,
+        cnd: &str,
+        ci: usize,
+        final_ii: usize,
+        target: u16,
+        direct: Option<u16>,
+        load: Option<String>,
+        slot: Option<u16>,
+        extra: &[String],
+    ) -> Option<(Option<u16>, Option<String>)> {
+        if direct.is_some() {
+            let mut probe = vec![cnd.to_string()];
+            if let Some(ld) = &load {
+                probe.push(ld.clone());
+            }
+            probe.extend(extra.iter().cloned());
+            if Self::lane_gap_clean(g, b, ci, final_ii, None, &probe) {
+                return Some((direct, load));
+            }
+        }
+        let s = slot?;
+        if s == target {
+            return None;
+        }
+        let mut probe = vec![cnd.to_string()];
+        probe.extend(extra.iter().cloned());
+        if Self::lane_gap_clean(g, b, ci, final_ii, Some(s), &probe) {
+            return Some((None, None));
+        }
+        None
+    }
+
+    /// The bank `operand()` would select for `addr`, or `None` when it
+    /// selects none (both access-bank ranges ride `a=0`). Mirrors that
+    /// predicate without emitting, for the lane test choice below.
+    fn lane_bank(&self, addr: u16) -> Option<u8> {
+        if addr <= self.access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
+            None
+        } else {
+            Some((addr >> 8) as u8)
+        }
+    }
+
+    /// Whether an eq-1 lane may use the `DECFSZ` test: its
+    /// single-instruction skip leaves no room for a bank select between
+    /// test and branch, so a banked target must already share the
+    /// field's bank (access-bank targets never select at all).
+    /// Flag-form tests read flags through any `MOVLB`, so they fuse
+    /// regardless of banks.
+    fn lane_decfsz_ok(g: &Gen, fslot: u16, target: u16) -> bool {
+        match g.lane_bank(target) {
+            None => true,
+            Some(tb) => g.lane_bank(fslot) == Some(tb),
+        }
+    }
+
+    /// Whether the lane may read the field at its final instruction. A
+    /// direct read observes any memory write in between, so only the
+    /// compare itself may precede it. A slot read survives global stores
+    /// (slots never alias globals) but not indirect ones, and no other
+    /// definition may reuse its slot there. Consumed intermediates never
+    /// emit, so they are exempt. `field_slot` is `None` for direct-read
+    /// lanes, which have no slot to reuse.
+    fn lane_gap_clean(
+        g: &Gen,
+        b: &Block,
+        from: usize,
+        to: usize,
+        field_slot: Option<u16>,
+        consumed: &[String],
+    ) -> bool {
+        for inst in &b.insts[from + 1..to] {
+            match inst {
+                // A direct read observes any memory write. A slot read is
+                // immune to global stores (frame slots and globals never
+                // share an address), but not to indirect ones.
+                Inst::Store(s) if field_slot.is_none() => return false,
+                Inst::Store(s) if !s.ptr.starts_with('@') => return false,
+                Inst::Call(_) | Inst::Asm(_) | Inst::Memcpy(_) | Inst::VaStart(_) => return false,
+                _ => {}
+            }
+            if let Some(fs) = field_slot {
+                for d in Self::lane_defs(inst) {
+                    if consumed.iter().any(|x| x == &d) {
+                        continue;
+                    }
+                    if g.addrs.get(&ssa_key(g.cur_func, &d)).copied() == Some(fs) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// Matches the or-select and const-select lane shapes at one `Select`.
+    /// Returns the lane plus its consumed intermediates.
+    fn match_select_lane(
+        g: &Gen,
+        b: &Block,
+        defs: &HashMap<String, usize>,
+        uses: &HashMap<String, usize>,
+        s: &ir::Select,
+        final_ii: usize,
+    ) -> Option<(BitLane, Vec<String>)> {
+        if s.ptr || s.ty != Ty::I8 {
+            return None;
+        }
+        let Val::Reg(cnd) = &s.cond else {
+            return None;
+        };
+        if uses.get(cnd.as_str()).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let Some(&ci) = defs.get(cnd.as_str()) else {
+            return None;
+        };
+        let Inst::Icmp(c) = &b.insts[ci] else {
+            return None;
+        };
+        let Some((field, k)) = Self::lane_cmp(c) else {
+            return None;
+        };
+        let Val::Reg(fname) = &field else {
+            return None;
+        };
+        let (direct, load_opt, slot) = Self::lane_field(g, b, defs, uses, fname, ci);
+        let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &s.dst)) else {
+            return None;
+        };
+        let eq = c.pred == "eq";
+        let loc = s.loc.clone();
+        // Or-select: one arm is a single-use `Or` over the other arm,
+        // which must be the same accumulator reg on both sides.
+        for (or_v, acc_v, holds) in [(&s.a, &s.b, true), (&s.b, &s.a, false)] {
+            let (Val::Reg(or_r), Val::Reg(acc_r)) = (or_v, acc_v) else {
+                continue;
+            };
+            if uses.get(or_r.as_str()).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(&oi) = defs.get(or_r.as_str()) else {
+                continue;
+            };
+            let Inst::Bin(ob) = &b.insts[oi] else {
+                continue;
+            };
+            if ob.op != ir::BinOp::Or || ob.ty != Ty::I8 {
+                continue;
+            }
+            let mask = match (&ob.a, &ob.b) {
+                (Val::Reg(a), Val::Const(m)) if a == acc_r => *m,
+                (Val::Const(m), Val::Reg(a)) if a == acc_r => *m,
+                _ => continue,
+            };
+            if mask <= 0 || mask > 0xFF || (mask as u8).count_ones() != 1 {
+                continue;
+            }
+            if g.addrs.get(&ssa_key(g.cur_func, acc_r)).is_none() {
+                continue;
+            };
+            let Some((faddr, load)) = Self::lane_read(
+                g,
+                b,
+                cnd,
+                ci,
+                final_ii,
+                dst_slot,
+                direct.clone(),
+                load_opt.clone(),
+                slot,
+                std::slice::from_ref(or_r),
+            ) else {
+                continue;
+            };
+            let mut eaten = vec![cnd.clone(), or_r.clone()];
+            if let Some(ld) = &load {
+                eaten.push(ld.clone());
+            }
+            return Some((
+                BitLane {
+                    field: field.clone(),
+                    faddr,
+                    k,
+                    eq,
+                    set_on_hold: holds,
+                    target: dst_slot,
+                    bit: (mask as u8).trailing_zeros() as u8,
+                    base: None,
+                    acc: acc_r.clone(),
+                    loc: loc.clone(),
+                },
+                eaten,
+            ));
+        }
+        // Const-select: literal arms differing in exactly one bit, with
+        // the true arm carrying the extra bit a `BSF` can add.
+        let (Val::Const(ca), Val::Const(cb)) = (&s.a, &s.b) else {
+            return None;
+        };
+        if !(-128..=255).contains(ca) || !(-128..=255).contains(cb) {
+            return None;
+        }
+        let (ca8, cb8) = (*ca as u8, *cb as u8);
+        let diff = ca8 ^ cb8;
+        if diff.count_ones() != 1 || cb8 | diff != ca8 {
+            return None;
+        }
+        let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &s.dst)) else {
+            return None;
+        };
+        let Some((faddr, load)) = Self::lane_read(
+            g,
+            b,
+            cnd,
+            ci,
+            final_ii,
+            dst_slot,
+            direct,
+            load_opt,
+            slot,
+            &[],
+        ) else {
+            return None;
+        };
+        let mut eaten = vec![cnd.clone()];
+        if let Some(ld) = &load {
+            eaten.push(ld.clone());
+        }
+        Some((
+            BitLane {
+                field: field.clone(),
+                faddr,
+                k,
+                eq,
+                set_on_hold: true,
+                target: dst_slot,
+                bit: diff.trailing_zeros() as u8,
+                base: Some(cb8),
+                acc: String::new(),
+                loc,
+            },
+            eaten,
+        ))
+    }
+
+    /// Matches the `Or(acc, Zext(Icmp))` tail: bit 0 set exactly when the
+    /// predicate holds, no select involved.
+    fn match_or_bool(
+        g: &Gen,
+        b: &Block,
+        defs: &HashMap<String, usize>,
+        uses: &HashMap<String, usize>,
+        ob: &ir::Bin,
+        final_ii: usize,
+    ) -> Option<(BitLane, Vec<String>)> {
+        if ob.op != ir::BinOp::Or || ob.ty != Ty::I8 {
+            return None;
+        }
+        let (acc_r, z_r) = match (&ob.a, &ob.b) {
+            (Val::Reg(a), Val::Reg(z)) => (a, z),
+            _ => return None,
+        };
+        if uses.get(z_r.as_str()).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let Some(&zi) = defs.get(z_r.as_str()) else {
+            return None;
+        };
+        let Inst::Zext(z) = &b.insts[zi] else {
+            return None;
+        };
+        if z.from != Ty::I1 || z.to != Ty::I8 {
+            return None;
+        }
+        let Val::Reg(cnd) = &z.val else {
+            return None;
+        };
+        if uses.get(cnd.as_str()).copied().unwrap_or(0) != 1 {
+            return None;
+        }
+        let Some(&ci) = defs.get(cnd.as_str()) else {
+            return None;
+        };
+        let Inst::Icmp(c) = &b.insts[ci] else {
+            return None;
+        };
+        let Some((field, k)) = Self::lane_cmp(c) else {
+            return None;
+        };
+        let Val::Reg(fname) = &field else {
+            return None;
+        };
+        let (direct, load_opt, slot) = Self::lane_field(g, b, defs, uses, fname, ci);
+        let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &ob.dst)) else {
+            return None;
+        };
+        if g.addrs.get(&ssa_key(g.cur_func, acc_r)).is_none() {
+            return None;
+        }
+        let Some((faddr, load)) = Self::lane_read(
+            g,
+            b,
+            cnd,
+            ci,
+            final_ii,
+            dst_slot,
+            direct,
+            load_opt,
+            slot,
+            std::slice::from_ref(z_r),
+        ) else {
+            return None;
+        };
+        let mut eaten = vec![cnd.clone(), z_r.clone()];
+        if let Some(ld) = load {
+            eaten.push(ld);
+        }
+        Some((
+            BitLane {
+                field: field.clone(),
+                faddr,
+                k,
+                eq: c.pred == "eq",
+                set_on_hold: true,
+                target: dst_slot,
+                bit: 0,
+                base: None,
+                acc: acc_r.clone(),
+                loc: ob.loc.clone(),
+            },
+            eaten,
+        ))
+    }
+
+    /// Per-function lane pre-scan: every matched lane is self-contained
+    /// (copies and defaults land before the test, the `BSF` hits the
+    /// lane's own dst), so committing needs no cross-lane reasoning and
+    /// unmatched shapes keep the existing lowering untouched.
+    fn find_bit_lanes(g: &Gen, f: &Func) -> (HashMap<String, BitLane>, HashSet<String>) {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        let mut block_defs: Vec<HashMap<String, usize>> = Vec::new();
+        for b in &f.blocks {
+            let mut defs = HashMap::new();
+            for (ii, inst) in b.insts.iter().enumerate() {
+                for d in Self::lane_defs(inst) {
+                    defs.insert(d, ii);
+                }
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+            block_defs.push(defs);
+        }
+        let mut lanes: HashMap<String, BitLane> = HashMap::new();
+        let mut consumed: HashSet<String> = HashSet::new();
+        for (bi, b) in f.blocks.iter().enumerate() {
+            let defs = &block_defs[bi];
+            for (ii, inst) in b.insts.iter().enumerate() {
+                let found = match inst {
+                    Inst::Select(s) => Self::match_select_lane(g, b, defs, &uses, s, ii)
+                        .map(|(lane, eaten)| (lane, eaten, s.dst.clone())),
+                    Inst::Bin(ob) => Self::match_or_bool(g, b, defs, &uses, ob, ii)
+                        .map(|(lane, eaten)| (lane, eaten, ob.dst.clone())),
+                    _ => None,
+                };
+                if let Some((lane, eaten, emit_dst)) = found {
+                    consumed.extend(eaten);
+                    lanes.insert(emit_dst, lane);
+                }
+            }
+        }
+        (lanes, consumed)
+    }
+
     fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
         for op in operands {
             if let Some(reg) = op.ptr.strip_prefix('%') {
@@ -2685,6 +3227,9 @@ impl<'m> Gen<'m> {
         self.cur_loc = i.loc().cloned();
         match i {
             Inst::Load(l) => {
+                if self.lane_consumed.contains(&l.dst) {
+                    return;
+                }
                 // An i1 global is real: clang's own -O1 GlobalOpt narrows an
                 // internal flag only ever written 0/1 down to `global i1`
                 // (epic-cc#462). i1 is one byte in the byte model, so the
@@ -2836,6 +3381,13 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Bin(b) => {
+                if self.lane_consumed.contains(&b.dst) {
+                    return;
+                }
+                if let Some(lane) = self.bit_lanes.remove(&b.dst) {
+                    self.emit_bit_lane(&lane);
+                    return;
+                }
                 let n = b.ty.bytes();
 
                 assert!(
@@ -3251,6 +3803,9 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Icmp(c) => {
+                if self.lane_consumed.contains(&c.dst) {
+                    return;
+                }
                 let n = c.ty.bytes();
                 assert!(
                     n == 1 || n == 2 || n == 4,
@@ -3265,6 +3820,9 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Zext(z) => {
+                if self.lane_consumed.contains(&z.dst) {
+                    return;
+                }
                 // `val_addr` maps `Val::Const(k)` to a RAM address, not a literal:
                 // a constant source would read the byte at that address. The guard
                 // keeps a future const-source producer panicking instead of
@@ -3451,6 +4009,10 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Select(s) => {
+                if let Some(lane) = self.bit_lanes.remove(&s.dst) {
+                    self.emit_bit_lane(&lane);
+                    return;
+                }
                 if s.ptr && matches!((&s.a, &s.b), (Val::Const(_), Val::Const(_))) {
                     // A pointer select over two runtime address LITERALS
                     // (the HAL's `pir_reg_addr(d)` arms): the selected arm's
@@ -4190,6 +4752,79 @@ impl<'m> Gen<'m> {
         let (da, df) = self.operand(d);
         let dbank = if da == 0 { "A" } else { "B" };
         self.emit(format!("    MOVWF 0x{df:03X},{dbank}"));
+    }
+
+    /// Whole-lane emission for a `BitLane`. Or-lanes first copy the
+    /// accumulator into the dst slot (skipped when both already share
+    /// one), const-lanes write their default there instead, then one
+    /// test reads the field and the branch skips exactly one `BSF`.
+    /// `MOVFF`/`MOVLW`/`MOVWF` touch no flags and need no bank, so the
+    /// test always observes the field; the bank select for the `BSF`
+    /// rides ahead of the branch, keeping `BSR` identical on both paths.
+    fn emit_bit_lane(&mut self, lane: &BitLane) {
+        self.cur_loc = lane.loc.clone();
+        if !lane.acc.is_empty() {
+            let acc = self.slot_addr(self.cur_func, &lane.acc).direct();
+            if acc != lane.target {
+                self.emit(format!("    MOVFF 0x{acc:03X}, 0x{t:03X}", t = lane.target));
+            }
+        } else if let Some(c0) = lane.base {
+            self.emit(format!("    MOVLW 0x{c0:02X}"));
+            let (a, df) = self.operand(lane.target);
+            let bank = if a == 0 { "A" } else { "B" };
+            self.emit(format!("    MOVWF 0x{df:03X},{bank}"));
+        }
+        let fslot = match lane.faddr {
+            Some(a) => a,
+            None => self.val_addr(&lane.field).direct(),
+        };
+        // Eq-1 lanes test with `DECFSZ f,W` when the target shares the
+        // field's bank: it skips exactly when the field is 1, never
+        // writes the field, and costs one word where the `MOVLW`/`SUBWF`
+        // pair costs two. Otherwise the flag-setting pair keeps the
+        // lane fused at one word more. Either way the skip target is
+        // reached with plain control flow, so no flag discipline is
+        // needed past the test.
+        let decfsz = lane.eq && lane.k == 1 && Self::lane_decfsz_ok(self, fslot, lane.target);
+        if decfsz {
+            let (a, ff) = self.operand(fslot);
+            let bank = if a == 0 { "A" } else { "B" };
+            self.emit(format!("    DECFSZ 0x{ff:03X},W,{bank}"));
+        } else if lane.k == 0 {
+            self.emit_w_load(fslot, true);
+        } else {
+            self.emit("    MOVLW 0x01".to_string());
+            let (a, ff) = self.operand(fslot);
+            let bank = if a == 0 { "A" } else { "B" };
+            self.emit(format!("    SUBWF 0x{ff:03X},W,{bank}"));
+        }
+        // The `BSF` must not select banks itself: a `MOVLB` on only one
+        // path would desync the tracked `BSR`. Selecting up front is
+        // flag-safe (`MOVLB` touches `BSR` alone).
+        let _ = self.operand(lane.target);
+        let skip = self.fresh_label();
+        if decfsz {
+            if !lane.set_on_hold {
+                self.emit_banked("BSF", lane.target, &format!(", {}", lane.bit));
+            }
+            self.emit(format!("    BRA {skip}"));
+            if lane.set_on_hold {
+                self.emit_banked("BSF", lane.target, &format!(", {}", lane.bit));
+            }
+        } else {
+            let base = if lane.eq { "BNZ" } else { "BZ" };
+            let op = if lane.set_on_hold {
+                base
+            } else if base == "BNZ" {
+                "BZ"
+            } else {
+                "BNZ"
+            };
+            self.emit(format!("    {op} {skip}"));
+            self.emit_banked("BSF", lane.target, &format!(", {}", lane.bit));
+        }
+        self.emit_label(&skip);
+        self.invalidate_fsr0_if_slot_written(lane.target, 1);
     }
 
     /// The result slot to zero before the compare, or `None` when zeroing
@@ -7425,9 +8060,16 @@ pub fn select_with_locs(
             isr: f.isr,
             tmp: &mut tmp,
             cur_loc: None,
+            bit_lanes: HashMap::new(),
+            lane_consumed: HashSet::new(),
             out: Vec::new(),
             locs: Vec::new(),
         };
+        // Bitmask lanes for this function (epic-cc#626): the block loop
+        // below skips consumed intermediates and emits whole lanes.
+        let (bit_lanes, lane_consumed) = Gen::find_bit_lanes(&g, f);
+        g.bit_lanes = bit_lanes;
+        g.lane_consumed = lane_consumed;
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -8044,6 +8686,8 @@ pub fn select_with_locs(
                 isr: f.isr,
                 tmp: &mut tmp,
                 cur_loc: None,
+                bit_lanes: HashMap::new(),
+                lane_consumed: HashSet::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -8352,6 +8996,8 @@ mod tests {
                 isr: false,
                 tmp: &mut tmp,
                 cur_loc: None,
+                bit_lanes: HashMap::new(),
+                lane_consumed: HashSet::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -8376,6 +9022,8 @@ mod tests {
                 isr: false,
                 tmp: &mut tmp,
                 cur_loc: None,
+                bit_lanes: HashMap::new(),
+                lane_consumed: HashSet::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -8415,6 +9063,8 @@ mod p3_gen_tests {
             isr: false,
             tmp,
             cur_loc: None,
+            bit_lanes: HashMap::new(),
+            lane_consumed: HashSet::new(),
             out: Vec::new(),
             locs: Vec::new(),
         }

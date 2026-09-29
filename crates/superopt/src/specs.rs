@@ -160,6 +160,34 @@ pub fn all_specs() -> Vec<Spec> {
             nightly_cases: shift_32bit_7_nightly,
             chunk_cases: 250,
         },
+        Spec {
+            name: "bitmask-eq1",
+            candidate: bitmask_eq1_candidate,
+            pr_cases: bitmask_eq1_pr,
+            nightly_cases: bitmask_eq1_nightly,
+            chunk_cases: 500,
+        },
+        Spec {
+            name: "bitmask-eq1-inv",
+            candidate: bitmask_eq1_inv_candidate,
+            pr_cases: bitmask_eq1_inv_pr,
+            nightly_cases: bitmask_eq1_inv_nightly,
+            chunk_cases: 500,
+        },
+        Spec {
+            name: "bitmask-truthy",
+            candidate: bitmask_truthy_candidate,
+            pr_cases: bitmask_truthy_pr,
+            nightly_cases: bitmask_truthy_nightly,
+            chunk_cases: 500,
+        },
+        Spec {
+            name: "bitmask-base",
+            candidate: bitmask_base_candidate,
+            pr_cases: bitmask_base_pr,
+            nightly_cases: bitmask_base_nightly,
+            chunk_cases: 500,
+        },
     ]
 }
 
@@ -708,6 +736,198 @@ pub fn shift_32bit_7_nightly() -> Vec<Case> {
         7,
         &sample32_pr_words(),
         &[0xFF, 0x2A],
+    ));
+    cases
+}
+
+/// Bitmask lanes (epic-cc#626): the exact skip-over-`BSF` sequences
+/// `isel-pic18` emits for `if (field == k) acc |= mask`, verified in-sim
+/// here and replayed on hardware by the `mdb_oracle` bin. Candidates use
+/// one fixed label; `mdb::build_batch` uniquifies it per case.
+const LANE_FIELD: usize = 0x020;
+const LANE_ACC: usize = 0x021;
+
+/// `if (field == 1) acc |= 0x04`: `DECFSZ` skips the branch exactly on 1.
+pub fn bitmask_eq1_candidate() -> Candidate {
+    vec![
+        "decfsz 0x020,W,A",
+        "bra lane_skip",
+        "bsf 0x021,2,A",
+        "lane_skip:",
+    ]
+}
+
+/// Inverted order (`BSF` first): the same test with the set-arm on the
+/// predicate's false side.
+pub fn bitmask_eq1_inv_candidate() -> Candidate {
+    vec![
+        "decfsz 0x020,W,A",
+        "bsf 0x021,2,A",
+        "bra lane_skip",
+        "lane_skip:",
+    ]
+}
+
+/// `if (field) acc |= 0x20`: a `MOVF` truthiness test over the branch.
+pub fn bitmask_truthy_candidate() -> Candidate {
+    vec![
+        "movf 0x020,W,A",
+        "bz lane_skip",
+        "bsf 0x021,5,A",
+        "lane_skip:",
+    ]
+}
+
+/// Conditional base: default byte materialized first, then the test
+/// selects between keeping it and setting one bit.
+pub fn bitmask_base_candidate() -> Candidate {
+    vec![
+        "movlw 0x02",
+        "movwf 0x021,A",
+        "decfsz 0x020,W,A",
+        "bra lane_skip",
+        "bsf 0x021,4,A",
+        "lane_skip:",
+    ]
+}
+
+/// Lane cases over field and accumulator samples: entry `W` and `C` vary
+/// because neither may leak into the result. `expect` maps
+/// `(field, acc)` to the accumulator's final byte.
+fn bitmask_cases_over(fields: &[u8], accs: &[u8], expect: fn(u8, u8) -> u8) -> Vec<Case> {
+    let mut cases = Vec::new();
+    for &f in fields {
+        for &a in accs {
+            for &w in W_SAMPLE {
+                for c in [false, true] {
+                    let e = expect(f, a);
+                    let status = if c { STATUS_C_BIT } else { 0 };
+                    cases.push(Case {
+                        entry_w: w,
+                        pokes: vec![(LANE_FIELD, f), (LANE_ACC, a), (STATUS_ADDR, status)],
+                        allowed_changes: vec![LANE_ACC],
+                        check: Box::new(move |sim: &Pic18| sim.ram()[LANE_ACC] == e),
+                    });
+                }
+            }
+        }
+    }
+    cases
+}
+
+/// Edge field values (0, 1, neighbours, sign boundary, extremes) crossed
+/// with an accumulator sample per outcome class.
+fn bitmask_edge_fields() -> Vec<u8> {
+    vec![0x00, 0x01, 0x02, 0x7E, 0x7F, 0x80, 0x81, 0xFE, 0xFF]
+}
+
+/// Nightly adds deterministic LCG field samples to the `pr` edges: same
+/// shape, wider net, still one chunk.
+fn bitmask_nightly_fields() -> Vec<u8> {
+    let mut state = 0x626u32;
+    let mut out = Vec::new();
+    for _ in 0..32 {
+        out.push((lcg_next(&mut state) & 0xFF) as u8);
+    }
+    out
+}
+
+fn bitmask_eq1_expect(f: u8, a: u8) -> u8 {
+    if f == 1 {
+        a | 0x04
+    } else {
+        a
+    }
+}
+
+fn bitmask_eq1_inv_expect(f: u8, a: u8) -> u8 {
+    if f == 1 {
+        a
+    } else {
+        a | 0x04
+    }
+}
+
+fn bitmask_truthy_expect(f: u8, a: u8) -> u8 {
+    if f != 0 {
+        a | 0x20
+    } else {
+        a
+    }
+}
+
+fn bitmask_base_expect(f: u8, _: u8) -> u8 {
+    if f == 1 {
+        0x12
+    } else {
+        0x02
+    }
+}
+
+pub fn bitmask_eq1_pr() -> Vec<Case> {
+    bitmask_cases_over(
+        &bitmask_edge_fields(),
+        &[0x00, 0x04, 0xFB, 0xFF],
+        bitmask_eq1_expect,
+    )
+}
+
+pub fn bitmask_eq1_nightly() -> Vec<Case> {
+    let mut cases = bitmask_eq1_pr();
+    cases.extend(bitmask_cases_over(
+        &bitmask_nightly_fields(),
+        &[0x00, 0xFF],
+        bitmask_eq1_expect,
+    ));
+    cases
+}
+
+pub fn bitmask_eq1_inv_pr() -> Vec<Case> {
+    bitmask_cases_over(
+        &bitmask_edge_fields(),
+        &[0x00, 0x04, 0xFB, 0xFF],
+        bitmask_eq1_inv_expect,
+    )
+}
+
+pub fn bitmask_eq1_inv_nightly() -> Vec<Case> {
+    let mut cases = bitmask_eq1_inv_pr();
+    cases.extend(bitmask_cases_over(
+        &bitmask_nightly_fields(),
+        &[0x00, 0xFF],
+        bitmask_eq1_inv_expect,
+    ));
+    cases
+}
+
+pub fn bitmask_truthy_pr() -> Vec<Case> {
+    bitmask_cases_over(
+        &bitmask_edge_fields(),
+        &[0x00, 0x20, 0xDF, 0xFF],
+        bitmask_truthy_expect,
+    )
+}
+
+pub fn bitmask_truthy_nightly() -> Vec<Case> {
+    let mut cases = bitmask_truthy_pr();
+    cases.extend(bitmask_cases_over(
+        &bitmask_nightly_fields(),
+        &[0x00, 0xFF],
+        bitmask_truthy_expect,
+    ));
+    cases
+}
+
+pub fn bitmask_base_pr() -> Vec<Case> {
+    bitmask_cases_over(&bitmask_edge_fields(), &[0x00, 0xFF], bitmask_base_expect)
+}
+
+pub fn bitmask_base_nightly() -> Vec<Case> {
+    let mut cases = bitmask_base_pr();
+    cases.extend(bitmask_cases_over(
+        &bitmask_nightly_fields(),
+        &[0x00, 0xFF],
+        bitmask_base_expect,
     ));
     cases
 }

@@ -7067,3 +7067,205 @@ fn coalesced_self_copy_emits_nothing() {
         "the live store still emits:\n{asm}"
     );
 }
+
+/// Bitmask lanes (epic-cc#626): `if (field == k) acc |= mask` lowers to a
+/// skip-over-`BSF`, never a bool materialization plus select diamond. Each
+/// test compiles one lane shape through the real selector, asserts the
+/// fused shape in the listing, then simulates the full field domain
+/// against the C meaning with a per-case entry W, so any dependence on
+/// stale W fails loudly. Startup contributes no `BSF`/`INCF`/`IORWF`,
+/// so those counts pin the lane lowering exactly.
+fn assert_lane_domain(asm: &str, field: u16, out: u16, expect: &dyn Fn(u8, u8) -> u8) {
+    assert_eq!(asm.matches("BSF").count(), 1, "one fused set:\n{asm}");
+    assert_eq!(asm.matches("INCF").count(), 0, "no bool diamond:\n{asm}");
+    assert_eq!(asm.matches("IORWF").count(), 0, "no select-side OR:\n{asm}");
+    let words = asm::assemble_pic18(asm);
+    let start = start_steps(asm);
+    for f in 0..=255u16 {
+        for &o in &[0x00u8, 0x04, 0xBB, 0xFF] {
+            for &w in &[0x00u8, 0xFF] {
+                let mut p = pic14_sim::Pic18::new(words.clone());
+                step_past_start(&mut p, start);
+                p.ram_mut()[field as usize] = f as u8;
+                p.ram_mut()[out as usize] = o;
+                p.set_w(w);
+                p.run(200);
+                assert!(p.halted(), "lane must halt (f={f:#04x} out={o:#04x})");
+                assert_eq!(
+                    p.ram()[out as usize],
+                    expect(f as u8, o),
+                    "f={f:#04x} out={o:#04x}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn bitmask_eq1_or_lane_sets_bit_iff_field_is_one() {
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    %3 = load i8 @out\n    %4 = or i8 %3 4\n    %5 = select i1 %2 i8 %4 i8 %3\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+        ("main::3", 0x24),
+        ("main::4", 0x25),
+        ("main::5", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f == 1 { o | 0x04 } else { o });
+}
+
+#[test]
+fn bitmask_truthy_lane_sets_bit_iff_field_nonzero() {
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 0\n    %3 = load i8 @out\n    %4 = or i8 %3 32\n    %5 = select i1 %2 i8 %3 i8 %4\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+        ("main::3", 0x24),
+        ("main::4", 0x25),
+        ("main::5", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f != 0 { o | 0x20 } else { o });
+}
+
+#[test]
+fn bitmask_const_base_selects_between_two_literals() {
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    %3 = select i1 %2 i8 18 i8 2\n    store i8 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+        ("main::3", 0x24),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_lane_domain(&asm, 0x20, 0x21, &|f, _| if f == 1 { 18 } else { 2 });
+}
+
+#[test]
+fn bitmask_ne_tail_ors_bit_zero_iff_field_nonzero() {
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp ne i8 %1 0\n    %3 = zext i1 %2 to i8\n    %4 = load i8 @out\n    %5 = or i8 %4 %3\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+        ("main::3", 0x24),
+        ("main::4", 0x25),
+        ("main::5", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f != 0 { o | 0x01 } else { o });
+}
+
+#[test]
+fn bitmask_eq1_lane_survives_banked_layouts() {
+    // Field, accumulator, and result all banked: every lane memory op
+    // must carry its own bank select instead of riding the access bank.
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    %3 = load i8 @out\n    %4 = or i8 %3 4\n    %5 = select i1 %2 i8 %4 i8 %3\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x120),
+        ("out", 0x121),
+        ("main::1", 0x122),
+        ("main::2", 0x123),
+        ("main::3", 0x124),
+        ("main::4", 0x125),
+        ("main::5", 0x126),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_lane_domain(&asm, 0x120, 0x121, &|f, o| {
+        if f == 1 {
+            o | 0x04
+        } else {
+            o
+        }
+    });
+}
+
+#[test]
+fn bitmask_inverted_eq1_lane_sets_bit_iff_field_differs() {
+    // Or-arm on the false side: the `BSF` leads and the `BRA` trails,
+    // the mirror of the hold order above.
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    %3 = load i8 @out\n    %4 = or i8 %3 4\n    %5 = select i1 %2 i8 %3 i8 %4\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+        ("main::3", 0x24),
+        ("main::4", 0x25),
+        ("main::5", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f == 1 { o } else { o | 0x04 });
+}
+
+#[test]
+fn bitmask_eq1_lane_across_banks_uses_flag_test() {
+    // Field in bank 1, accumulator in bank 2: the `DECFSZ` single-skip
+    // form has no room for the target's bank select, so the lane keeps
+    // the flag-setting `SUBWF` test (one word more) instead of fusing
+    // unsoundly. Startup owns the only `DECFSZ`.
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    %3 = load i8 @out\n    %4 = or i8 %3 4\n    %5 = select i1 %2 i8 %4 i8 %3\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x120),
+        ("out", 0x21),
+        ("main::1", 0x122),
+        ("main::2", 0x123),
+        ("main::3", 0x220),
+        ("main::4", 0x224),
+        ("main::5", 0x221),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("BSF").count(), 1, "still fused:\n{asm}");
+    // The lane test itself is the flag-setting pair: startup owns no
+    // `SUBWF`, so this count pins the fallback form exactly.
+    assert_eq!(asm.matches("SUBWF").count(), 1, "flag-form test:\n{asm}");
+    assert_eq!(asm.matches("INCF").count(), 0, "no bool diamond:\n{asm}");
+    assert_lane_domain(&asm, 0x120, 0x21, &|f, o| if f == 1 { o | 0x04 } else { o });
+}
+
+#[test]
+fn bitmask_lane_across_store_reads_loaded_slot() {
+    // A store to the field between the compare and the select rules out
+    // the direct read: the lane tests the loaded slot instead, which the
+    // store cannot reach.
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    store i8 7 @f\n    %3 = load i8 @out\n    %4 = or i8 %3 4\n    %5 = select i1 %2 i8 %4 i8 %3\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+        ("main::3", 0x24),
+        ("main::4", 0x25),
+        ("main::5", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("BSF").count(), 1, "still fused:\n{asm}");
+    assert!(
+        asm.contains("MOVFF 0x020, 0x022"),
+        "field load copy survives:\n{asm}"
+    );
+    assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f == 1 { o | 0x04 } else { o });
+}

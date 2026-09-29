@@ -57,6 +57,10 @@ jobs:
           - shift-16bit-r4
           - shift-32bit-6
           - shift-32bit-7
+          - bitmask-eq1
+          - bitmask-eq1-inv
+          - bitmask-truthy
+          - bitmask-base
     steps:
       - uses: actions/checkout@v5
 
