@@ -3381,6 +3381,54 @@ fn a_six_byte_copy_run_becomes_a_postinc_loop() {
     );
 }
 
+/// A coalesced lane shortens the pending run before the drain decides:
+/// five staged lanes plus one self lane replay straight. The 6-lane loop
+/// never forms (epic-cc#739). The skip returns before the consecutivity
+/// gate, so the self lane neither flushes nor joins the run.
+#[test]
+fn a_coalesced_lane_shortens_the_run_below_the_loop_floor() {
+    let m = parse(
+        "global src i8\n\
+         global dst i8\n\
+         global sink i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             memcpy @dst @src 5\n\
+             %f = add i8 1, 2\n\
+             %e = zext i8 %f to i16\n\
+             store i16 %e @sink\n\
+             ret void\n",
+    );
+    let addrs = addrs(&[
+        ("src", 0x100),
+        ("dst", 0x110),
+        ("sink", 0x120),
+        ("main::f", 0x105),
+        ("main::e", 0x105),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    for i in 0..5u16 {
+        let expect = format!("MOVFF 0x{:03X}, 0x{:03X}", 0x100 + i, 0x110 + i);
+        let expect_nospace = format!("MOVFF 0x{:03X},0x{:03X}", 0x100 + i, 0x110 + i);
+        assert!(
+            asm.contains(&expect) || asm.contains(&expect_nospace),
+            "byte {i} missing:\n{asm}"
+        );
+    }
+    assert!(
+        !asm.contains("MOVFF 0xFEE, 0xFE6"),
+        "the shortened run must replay straight:\n{asm}"
+    );
+    assert!(
+        !(asm.contains("MOVFF 0x105, 0x105") || asm.contains("MOVFF 0x105,0x105")),
+        "the self lane must skip, not emit:\n{asm}"
+    );
+    assert!(
+        asm.contains("CLRF 0x006,B") || asm.contains("CLRF 0x106"),
+        "the zext fill lane still emits:\n{asm}"
+    );
+}
+
 #[test]
 fn a_loop_runs_even_with_an_isr_reachable_fsr1_seeder() {
     // #486 gated the copy loop on "no ISR-reachable function seeds FSR1",

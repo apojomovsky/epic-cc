@@ -644,6 +644,21 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
         vals.push((v, lo, hi, w, o));
     }
     vals.sort_by(|a, b| a.1.cmp(&b.1).then(a.4.cmp(&b.4)));
+    // A block reachable from itself runs more than once, so linear
+    // dead-after cannot see dynamic-after uses across the back edge.
+    let on_cycle = |mi: usize| -> bool {
+        let mut stack: Vec<usize> = succ.get(&mi).cloned().unwrap_or_default();
+        let mut seen: HashSet<usize> = HashSet::new();
+        while let Some(n) = stack.pop() {
+            if n == mi {
+                return true;
+            }
+            if seen.insert(n) {
+                stack.extend(succ.get(&n).cloned().unwrap_or_default());
+            }
+        }
+        false
+    };
     // Phi-edge coalescing (epic-cc#727): a phi dst reuses its incoming
     // slot on a dead-after join. The copy point touches both intervals
     // so plain disjointness never fires; the src test is positional.
@@ -697,19 +712,7 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
                 // linear dead-after cannot see the dynamic-after use, so
                 // punt. Straight-line diamonds in loopy functions stay
                 // eligible: only a cycle through this merge disqualifies.
-                let mut on_cycle = false;
-                let mut stack: Vec<usize> = succ.get(&mi).cloned().unwrap_or_default();
-                let mut seen: HashSet<usize> = HashSet::new();
-                while let Some(n) = stack.pop() {
-                    if n == mi {
-                        on_cycle = true;
-                        break;
-                    }
-                    if seen.insert(n) {
-                        stack.extend(succ.get(&n).cloned().unwrap_or_default());
-                    }
-                }
-                if on_cycle || edges.iter().any(|&pi| pi >= mi) {
+                if on_cycle(mi) || edges.iter().any(|&pi| pi >= mi) {
                     continue;
                 }
                 let mut ok = true;
@@ -737,6 +740,50 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
                     coalesce.insert(p.dst.clone(), s);
                 }
             }
+        }
+    }
+
+    // Straight-line range copies (epic-cc#739): freeze and the casts copy
+    // lane 0 byte-for-byte through staged copy lanes, so a dead-after
+    // source lets the destination share its slot base and isel skips the
+    // self lanes. Same positional test as the phi pin: the copy point
+    // touches both intervals, and a cycle repeats the copy. Upper cast
+    // lanes fill in place and never stage, so base sharing stays exact.
+    for (mi, b) in order.iter().enumerate() {
+        for (pos, inst) in b.insts.iter().enumerate() {
+            let (dst, src) = match inst {
+                ir::Inst::Freeze(f) => (&f.dst, &f.val),
+                ir::Inst::Zext(z) => (&z.dst, &z.val),
+                ir::Inst::Sext(s) => (&s.dst, &s.val),
+                ir::Inst::Trunc(t) => (&t.dst, &t.val),
+                _ => continue,
+            };
+            let ir::Val::Reg(s) = src else { continue };
+            let Some(&(_, _, w_s, _, mem_s)) = defs.get(s) else {
+                continue;
+            };
+            let Some(&(_, _, w_d, _, mem_d)) = defs.get(dst) else {
+                continue;
+            };
+            if mem_s || mem_d {
+                continue;
+            }
+            if matches!(inst, ir::Inst::Freeze(_)) && w_s != w_d {
+                continue;
+            }
+            if on_cycle(mi) {
+                continue;
+            }
+            if live_out[mi].contains(s) {
+                continue;
+            }
+            let pt = (mi, pos as u16);
+            if let Some(us) = uses.get(s) {
+                if us.iter().any(|&u| u > pt) {
+                    continue;
+                }
+            }
+            coalesce.insert(dst.clone(), s.clone());
         }
     }
 

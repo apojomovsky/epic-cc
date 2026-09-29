@@ -86,7 +86,9 @@ fn add_c_runs_correctly() {
 
 /// Coalesced diamond (epic-cc#727): the phi incoming is dead after the
 /// join, so destination and source share one slot through the backend.
-/// The sim proves the value, not just the missing MOVFF.
+/// The trunc chain (epic-cc#739) rides along: the call result is dead
+/// after the narrowing, so the trunc destination shares its base. The
+/// sim proves both values, not just the missing MOVFFs.
 #[test]
 fn coalesce_c_runs_correctly() {
     let (mut p, globals) = compile(concat!(
@@ -95,6 +97,7 @@ fn coalesce_c_runs_correctly() {
     ));
     p.run(500);
     assert_eq!(p.ram()[globals["out"] as usize], 43);
+    assert_eq!(p.ram()[globals["tprobe"] as usize], 0x35);
     assert!(p.halted());
 }
 
