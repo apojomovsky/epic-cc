@@ -441,6 +441,133 @@ fn a_single_const_select_arm_is_copied_to_ram() {
 }
 
 #[test]
+fn const_direct_ptr_call_arg_is_copied_to_ram() {
+    // Menu-demo `.str` (epic-cc#754): a const passed directly as a plain
+    // pointer call argument is read through the generic pointer path, so
+    // it needs a RAM address; flash tables need TBLPTR, not FSR/INDF.
+    let mut m = parse(
+        "const c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8], like menu-demo .str
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "const ptr call arg @c must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
+
+#[test]
+fn const_gep_ptr_call_arg_is_copied_to_ram() {
+    // Same need one GEP hop out: the scan walks reg chains to the const
+    // base, so a derived pointer passed as a plain call arg copies it too.
+    let mut m = parse(
+        "const c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(%g)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 4; // c: [4 x i8]
+    m.funcs[0].blocks[0].insts.insert(
+        0,
+        ir::Inst::Gep(ir::Gep {
+            dst: "g".into(),
+            base: ir::GepBase::Global("c".into()),
+            k: 1,
+            terms: vec![],
+            loc: None,
+        }),
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "const base @c behind a GEP call arg must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
+
+#[test]
+fn const_to_ram_set_holds_only_pointer_path_consts() {
+    // The surviving set, pinned: a const flowing through a generic pointer
+    // path is copied, one that never does stays in flash. A future const
+    // joining RAM must update this test, never slip in silently.
+    let mut m = parse(
+        "const used i8\n\
+         const table i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@used)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // used: [2 x i8]
+    m.globals[1].size = 4; // table: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("used"),
+        "const ptr call arg @used must be copied to RAM"
+    );
+    assert!(
+        !out.globals.contains_key("table"),
+        "flash-only const @table must get no RAM address"
+    );
+    assert!(
+        out.const_globals.contains("table"),
+        "flash-only const @table must stay in the flash set"
+    );
+    assert!(
+        !out.const_globals.contains("used"),
+        "copied const @used must leave the flash set"
+    );
+}
+
+#[test]
+fn const_large_ptr_call_arg_stays_in_flash() {
+    // The 255-byte ceiling on every const_to_ram insertion: a large const
+    // used as a plain call arg still gets no RAM address. Deleting the
+    // guard must fail here, not just on the unreferenced 300-byte table.
+    let mut m = parse(
+        "const big i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@big)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 300; // big: [300 x i8] const table, referenced
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        !out.globals.contains_key("big"),
+        "large const @big must not be copied to RAM"
+    );
+    assert!(
+        out.const_globals.contains("big"),
+        "large const @big must stay in the flash set"
+    );
+}
+
+#[test]
 fn value_select_result_gets_a_local_slot() {
     // A non-pointer (value) select copies the selected operand into its dst
     // like any other value (Lane C, #287: the `Inst::Select(s) if !s.ptr`
