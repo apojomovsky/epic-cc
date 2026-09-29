@@ -13,9 +13,10 @@ set -uo pipefail
 # leniency as the pre-commit hook. Mount the repo root, not $PWD, so this
 # works from any subdirectory.
 root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-if docker image inspect epic-cc-dev:local >/dev/null 2>&1; then
+dev_image="$(bash "$root/scripts/dev-image-tag.sh" 2>/dev/null || true)"
+if [ -n "$dev_image" ] && docker image inspect "$dev_image" >/dev/null 2>&1; then
   docker run --rm \
-    -v "$root":/workspace -w /workspace epic-cc-dev:local \
+    -v "$root":/workspace -w /workspace "$dev_image" \
     bash scripts/lint-python.sh || exit 1
 fi
 

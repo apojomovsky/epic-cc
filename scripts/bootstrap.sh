@@ -71,11 +71,12 @@ else
 fi
 
 # ---- docker dev image ----
-# Same tag as the Makefile's LOCAL_IMAGE. Building it compiles clang
-# from a digest-pinned tarball, so the first build is slow.
+# Content-addressed tag (epic-cc#736) via the single script, same tag
+# as the Makefile's LOCAL_IMAGE. First build compiles clang, so slow.
+dev_image="$(bash "$repo_root/scripts/dev-image-tag.sh" 2>/dev/null || true)"
 if [ "$check_only" = 1 ]; then
-    if docker image inspect epic-cc-dev:local >/dev/null 2>&1; then
-        echo "bootstrap: docker dev image present (epic-cc-dev:local)."
+    if [ -n "$dev_image" ] && docker image inspect "$dev_image" >/dev/null 2>&1; then
+        echo "bootstrap: docker dev image present ($dev_image)."
     else
         echo "bootstrap: docker dev image not built yet (run ./scripts/bootstrap.sh"
         echo "  or 'make image')."

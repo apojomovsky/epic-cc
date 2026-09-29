@@ -7,7 +7,10 @@
 # backs that up for any docker run bypassing --user. Cargo caches
 # live under ~/.cache/, so the host's own target/ is never touched.
 
-LOCAL_IMAGE := epic-cc-dev:local
+# Content-addressed dev tag (epic-cc#736): the Dockerfile plus uid/gid
+# hash rides in the tag, so worktrees with different Dockerfiles build
+# distinct images. scripts/dev-image-tag.sh is the single definition.
+LOCAL_IMAGE := $(shell bash $(dir $(lastword $(MAKEFILE_LIST)))scripts/dev-image-tag.sh)
 CACHE_DIR   := $(HOME)/.cache/epic-cc
 CARGO_HOME_CACHE := $(CACHE_DIR)/cargo-home
 
@@ -85,15 +88,15 @@ help: ## List targets
 
 image: ## Build the dev image (only image you need locally)
 	@$(ENSURE_BUILDER)
-	@src_hash=$$({ cat Dockerfile; id -u; id -g; } | md5sum | cut -d' ' -f1); \
-	test -n "$$src_hash" || { echo "image: failed to hash the Dockerfile" >&2; exit 1; }; \
-	cur=$$(docker image inspect $(LOCAL_IMAGE) --format '{{index .Config.Labels "org.epic-cc.source-hash"}}' 2>/dev/null || true); \
-	if [ "$$cur" = "$$src_hash" ]; then \
-		echo "dev image up to date (source-hash $$src_hash), skipping rebuild"; \
+	@img="$(LOCAL_IMAGE)"; \
+	test -n "$$img" || { echo "image: empty dev tag" >&2; exit 1; }; \
+	if docker image inspect "$$img" >/dev/null 2>&1; then \
+		echo "dev image up to date ($$img), skipping rebuild"; \
 	else \
+		src_hash=$${img##*-}; \
 		docker buildx build --builder $(BUILDER) --load --target dev $(TOOLCHAIN_CACHE) \
 			--build-arg UID=$$(id -u) --build-arg GID=$$(id -g) \
-			--label org.epic-cc.source-hash=$$src_hash -t $(LOCAL_IMAGE) .; \
+			--label org.epic-cc.source-hash=$$src_hash -t "$$img" .; \
 	fi
 
 shell: image ## Interactive dev shell inside the container

@@ -21,6 +21,9 @@ CARGO_HOME_CACHE="$CACHE_DIR/cargo-home"
 # dir lets cargo silently replay a DIFFERENT worktree's cached warnings
 # here. A hard gate on stale output is worse than a slow one.
 WARNCHECK_TARGET_CACHE="$CACHE_DIR/target-warncheck$(printf '%s' "$PWD" | tr '/' '-')"
+# Content-addressed dev image (epic-cc#736): resolve once via the single
+# script so the hook never trails the Makefile's tag.
+DEV_IMAGE="$(bash "$(git rev-parse --show-toplevel 2>/dev/null)/scripts/dev-image-tag.sh" 2>/dev/null || true)"
 
 # Only check files that are actually staged; respect the dev container's
 # existence (skip format checks if the image isn't built yet, e.g. first
@@ -28,11 +31,11 @@ WARNCHECK_TARGET_CACHE="$CACHE_DIR/target-warncheck$(printf '%s' "$PWD" | tr '/'
 staged_rs=$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')
 
 if [ -n "$staged_rs" ]; then
-  if docker image inspect epic-cc-dev:local >/dev/null 2>&1; then
+  if [ -n "$DEV_IMAGE" ] && docker image inspect "$DEV_IMAGE" >/dev/null 2>&1; then
     if ! echo "$staged_rs" | docker run --rm -i \
       --user "$(id -u):$(id -g)" \
       -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
-      -v "$PWD":/workspace -w /workspace epic-cc-dev:local \
+      -v "$PWD":/workspace -w /workspace "$DEV_IMAGE" \
       bash -c 'xargs rustfmt --check --edition 2021' >/dev/null 2>&1; then
       echo "pre-commit: staged Rust files are not rustfmt-clean; run: make fmt"
       exit 1
@@ -44,7 +47,7 @@ if [ -n "$staged_rs" ]; then
       -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
       -v "$CARGO_HOME_CACHE":/opt/cargo-home -e CARGO_HOME=/opt/cargo-home \
       -v "$WARNCHECK_TARGET_CACHE":/tmp/cargo-target -e CARGO_TARGET_DIR=/tmp/cargo-target \
-      -v "$PWD":/workspace -w /workspace epic-cc-dev:local \
+      -v "$PWD":/workspace -w /workspace "$DEV_IMAGE" \
       bash -c 'cargo build --workspace --all-targets 2>&1')
     warnings=$(printf '%s\n' "$build_out" | grep '^warning:' || true)
     if [ -n "$warnings" ]; then
@@ -54,7 +57,7 @@ if [ -n "$staged_rs" ]; then
       exit 1
     fi
   else
-    echo "pre-commit: epic-cc-dev:local not built, skipping rustfmt/warnings checks (make image)"
+    echo "pre-commit: $DEV_IMAGE not built, skipping rustfmt/warnings checks (make image)"
   fi
 fi
 
@@ -65,17 +68,17 @@ fi
 staged_py=$(git diff --cached --name-only --diff-filter=ACM -- '*.py')
 
 if [ -n "$staged_py" ]; then
-  if docker image inspect epic-cc-dev:local >/dev/null 2>&1; then
+  if [ -n "$DEV_IMAGE" ] && docker image inspect "$DEV_IMAGE" >/dev/null 2>&1; then
     if ! echo "$staged_py" | docker run --rm -i \
       --user "$(id -u):$(id -g)" \
       -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro \
-      -v "$PWD":/workspace -w /workspace epic-cc-dev:local \
+      -v "$PWD":/workspace -w /workspace "$DEV_IMAGE" \
       bash -c 'xargs bash scripts/lint-python.sh' >/dev/null 2>&1; then
       echo "pre-commit: staged Python files fail ruff; run: bash scripts/lint-python.sh --fix"
       exit 1
     fi
   else
-    echo "pre-commit: epic-cc-dev:local not built, skipping python lint (make image)"
+    echo "pre-commit: $DEV_IMAGE not built, skipping python lint (make image)"
   fi
 fi
 

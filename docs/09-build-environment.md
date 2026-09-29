@@ -6,22 +6,20 @@ installed system-wide.** Decision recorded as [ADR-008](03-decisions.md)
 
 ## Getting in
 
-Build the dev image (first build is slow — it compiles clang; see Caching):
+Build the dev image with `make image` (first build is slow, it compiles
+clang; see Caching). The tag is content-addressed
+(`epic-cc-dev:local-<hash>` from the Dockerfile plus uid/gid, printed by
+`scripts/dev-image-tag.sh`), so worktrees with different Dockerfiles hold
+distinct images. Then either an interactive shell:
 
 ```bash
-docker build --target dev -t epic-cc-dev .
-```
-
-Then either an interactive shell:
-
-```bash
-docker run --rm -it -v "$PWD:/workspace" -w /workspace epic-cc-dev bash
+make shell
 ```
 
 or one-shot for automation:
 
 ```bash
-docker run --rm -v "$PWD:/workspace" -w /workspace epic-cc-dev bash scripts/ci-test.sh
+make exec CMD='bash scripts/ci-test.sh'
 ```
 
 ## What is pinned
@@ -104,15 +102,15 @@ already-built clang layer from GHCR, not a recompile. Because the base image
 and the LLVM tarball are digest-pinned, the clang layer only needs a real
 rebuild (locally or in CI) when the Dockerfile or a pin changes.
 
-`make image` is idempotent: it bakes a `org.epic-cc.source-hash` label
-(from the Dockerfile text plus the host UID/GID build args) and skips the
-buildx build when the present image already carries that label. Since every
+`make image` is idempotent: the tag itself carries the `Dockerfile` plus
+UID/GID hash, so a present tag means an up to date image and a missing
+tag means a build. The same hash rides as the `org.epic-cc.source-hash`
+label for inspectors comparing a checkout against its image. Since every
 make target (`exec`, `test`, `check-warnings`, `lint`, ...) depends on
 `image`, the guard is what stops the repeated `--load` re-export of an
 unchanged image that otherwise adds ~45s of "sending tarball" to every
-invocation. The first guarded build after this change is a real rebuild (it
-labels the image); every subsequent run with an unchanged Dockerfile and
-UID/GID skips it.
+invocation. Old tags are never pruned automatically; drop them by hand
+(`docker images 'epic-cc-dev:local-*'`) when their Dockerfile is gone.
 
 ## Cargo target cache is per worktree
 
