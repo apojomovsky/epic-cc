@@ -227,13 +227,16 @@ fn and16_reg_const_uses_andlw() {
         ("main::r", 0x29),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // %a=0x27/%r=0x29.
-    assert!(asm.contains("MOVF 0x27, W"), "load a_lo:\n{asm}");
-    assert!(asm.contains("ANDLW 0x34"), "and k_lo:\n{asm}");
-    assert!(asm.contains("MOVWF 0x29"), "store d_lo:\n{asm}");
-    assert!(asm.contains("MOVF 0x28, W"), "load a_hi:\n{asm}");
+    // %a=0x27/%r=0x29. Bytes emit high-first with byte 0 last, and the
+    // single-use lo byte threads through W to the consumer: the hi load
+    // elides (W still holds the 0x28 store), the lo store vanishes.
     assert!(asm.contains("ANDLW 0x12"), "and k_hi:\n{asm}");
     assert!(asm.contains("MOVWF 0x2A"), "store d_hi:\n{asm}");
+    assert!(asm.contains("ANDLW 0x34"), "and k_lo:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x29"),
+        "single-use lo byte threads through W:\n{asm}"
+    );
 }
 
 #[test]
@@ -469,8 +472,10 @@ fn icmp_eq_i8_materializes_i1() {
     // %1's own reload for the XOR is redundant (still in W right after
     // Inst::Load's own store to 0x25) and gets elided, so "load a" is no
     // longer its own instruction; the XOR itself is still the real check.
+    // The single-byte accumulation never stores to scratch (epic-cc#750):
+    // materialize branches on the live Z, so the dead store is gone.
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
-    assert!(asm.contains("MOVWF 0x70"), "store xor to scratch:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x70"), "no dead scratch store:\n{asm}");
     assert!(asm.contains("MOVLW 0x00"), "materialize 0:\n{asm}");
     assert!(asm.contains("BTFSC STATUS, 2"), "Z test:\n{asm}");
     assert!(asm.contains("MOVLW 0x01"), "materialize 1:\n{asm}");
@@ -600,10 +605,11 @@ fn locals_use_map_addresses_around_scratch_and_retval() {
     );
     let addrs = addrs(&[("in", 0x6F), ("main::a0", 0x73), ("main::c", 0x74)]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // Fixed common RAM: scratch 0x70, retval 0x71/0x72.
+    // Fixed common RAM: scratch 0x70, retval 0x71/0x72. The single-byte
+    // compare leaves scratch alone (epic-cc#750: the dead store is gone).
     assert!(
-        asm.contains("MOVWF 0x70"),
-        "icmp writes the fixed scratch 0x70:\n{asm}"
+        !asm.contains("MOVWF 0x70"),
+        "no scratch write collides with locals:\n{asm}"
     );
     assert!(
         !asm.contains("MOVWF 0x71") && !asm.contains("MOVWF 0x72"),
@@ -1742,10 +1748,11 @@ fn separate_latch_back_edge_cross_referencing_phis_simulates() {
 
 #[test]
 fn and_i8_uses_andwf_andlw() {
-    // reg-reg: ANDWF a,W; MOVWF d (b's own reload is elided: epic-cc#217
-    // wires emit_commutative through the W-tracking cache #214 established,
-    // and b's value is still in W from its own immediately preceding
-    // store). reg-const: MOVF a,W; ANDLW k.
+    // reg-reg: ANDWF a,W with b's reload elided (epic-cc#217 wires
+    // emit_commutative through the W-tracking cache #214 established, and
+    // b's value is still in W from its own immediately preceding store).
+    // reg-const: MOVF a,W; ANDLW k. Both results are single-use lane
+    // temporaries, so their stores defer to the consumer (epic-cc#750).
     let m = parse(
         "global x i8\nglobal y i8\nglobal o1 i8\nglobal o2 i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @x\n    %b = load i8 @y\n    %r1 = and i8 %a, %b\n    store i8 %r1 @o1\n    %r2 = and i8 %a, 5\n    store i8 %r2 @o2\n    ret void\n",
     );
@@ -1769,12 +1776,20 @@ fn and_i8_uses_andwf_andlw() {
         "b's reload should be elided:\n{asm}"
     );
     assert!(asm.contains("ANDWF 0x27, W"), "a & b:\n{asm}");
-    assert!(asm.contains("MOVWF 0x29"), "store d1:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x29"),
+        "single-use %r1 threads through W:\n{asm}"
+    );
+    assert!(asm.contains("MOVWF 0x22"), "store to o1:\n{asm}");
     // reg-const: %a=0x27, %r2=0x2A. a's reload is not elided here: a
     // global store to @o1 sits between it and a's own last load.
     assert!(asm.contains("MOVF 0x27, W"), "reload a:\n{asm}");
     assert!(asm.contains("ANDLW 0x05"), "a & 5:\n{asm}");
-    assert!(asm.contains("MOVWF 0x2A"), "store d2:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x2A"),
+        "single-use %r2 threads through W:\n{asm}"
+    );
+    assert!(asm.contains("MOVWF 0x23"), "store to o2:\n{asm}");
 }
 
 #[test]
@@ -1799,13 +1814,21 @@ fn or_i8_and_i16_use_ior() {
         ("main::s", 0x34),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F.
+    // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F. %r is single-use, so its
+    // store defers to the consumer (epic-cc#750).
     assert!(asm.contains("IORWF 0x2D, W"), "i8 or:\n{asm}");
-    assert!(asm.contains("MOVWF 0x2F"), "i8 or dst:\n{asm}");
-    // i16 reg-reg: %c=0x30/31, %d=0x32/33, %s=0x34/35.
+    assert!(
+        !asm.contains("MOVWF 0x2F"),
+        "single-use i8 or threads through W:\n{asm}"
+    );
+    // i16 reg-reg: %c=0x30/31, %d=0x32/33, %s=0x34/35. The single-use lo
+    // byte threads through W (epic-cc#750); the hi byte stores normally.
     assert!(asm.contains("IORWF 0x30, W"), "i16 or lo:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x34"),
+        "single-use lo byte threads through W:\n{asm}"
+    );
     assert!(asm.contains("IORWF 0x31, W"), "i16 or hi:\n{asm}");
-    assert!(asm.contains("MOVWF 0x34"), "i16 or dst_lo:\n{asm}");
     assert!(asm.contains("MOVWF 0x35"), "i16 or dst_hi:\n{asm}");
 }
 
@@ -1829,8 +1852,12 @@ fn or_const_lhs_swaps_to_iorlw() {
         "const-LHS or should use the IORLW path:\n{asm}"
     );
     assert!(
-        asm.contains("MOVWF 0x26"),
-        "the result lands at its map address:\n{asm}"
+        !asm.contains("MOVWF 0x26"),
+        "single-use %r threads through W to the store:\n{asm}"
+    );
+    assert!(
+        asm.contains("MOVWF 0x21"),
+        "the result lands in out:\n{asm}"
     );
     assert!(
         !asm.contains("IORWF 0x05"),
@@ -1860,13 +1887,21 @@ fn xor_i8_and_i16_use_xor() {
         ("main::s", 0x34),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F.
+    // i8 reg-reg: %a=0x2D, %b=0x2E, %r=0x2F. %r is single-use, so its
+    // store defers to the consumer (epic-cc#750).
     assert!(asm.contains("XORWF 0x2D, W"), "i8 xor:\n{asm}");
-    assert!(asm.contains("MOVWF 0x2F"), "i8 xor dst:\n{asm}");
-    // i16 reg-reg: %c=0x30/31, %d=0x32/33, %s=0x34/35.
+    assert!(
+        !asm.contains("MOVWF 0x2F"),
+        "single-use i8 xor threads through W:\n{asm}"
+    );
+    // i16 reg-reg: %c=0x30/31, %d=0x32/33, %s=0x34/35. The single-use lo
+    // byte threads through W (epic-cc#750); the hi byte stores normally.
     assert!(asm.contains("XORWF 0x30, W"), "i16 xor lo:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x34"),
+        "single-use lo byte threads through W:\n{asm}"
+    );
     assert!(asm.contains("XORWF 0x31, W"), "i16 xor hi:\n{asm}");
-    assert!(asm.contains("MOVWF 0x34"), "i16 xor dst_lo:\n{asm}");
     assert!(asm.contains("MOVWF 0x35"), "i16 xor dst_hi:\n{asm}");
 }
 
@@ -2066,7 +2101,10 @@ fn icmp_ne_i8_inverts_eq_materialization() {
     // XOR is redundant (still in W right after Inst::Load's own store to
     // 0x25) and gets elided, so "load a" is no longer its own instruction.
     assert!(asm.contains("XORLW 0x01"), "xor with const b:\n{asm}");
-    assert!(asm.contains("MOVWF 0x70"), "store xor to scratch:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x70"),
+        "no dead scratch store (epic-cc#750):\n{asm}"
+    );
     assert!(
         asm.contains("BTFSS STATUS, 2"),
         "ne tests Z inverted (BTFSS):\n{asm}"
@@ -2129,9 +2167,10 @@ fn icmp_ugt_i16_accumulates_equality_for_z() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // Chain first (C), then the eq accumulation (Z = a == b), then
-    // C && !Z. %a=0x29/2A, %b=0x2B/2C, scratch=0x70.
+    // C && !Z. %a=0x29/2A, %b=0x2B/2C, scratch=0x70. The accumulation's
+    // last store is dead (epic-cc#750): only the IORWF input stores.
     assert!(
-        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x2C, W\n    SUBWF 0x2A, W\n    MOVF 0x29, W\n    XORWF 0x2B, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    XORWF 0x2C, W\n    IORWF 0x70, W\n    MOVWF 0x70"),
+        asm.contains("MOVF 0x2B, W\n    SUBWF 0x29, W\n    MOVF 0x2C, W\n    BTFSS STATUS, 0 ; C\n    INCFSZ 0x2C, W\n    SUBWF 0x2A, W\n    MOVF 0x29, W\n    XORWF 0x2B, W\n    MOVWF 0x70\n    MOVF 0x2A, W\n    XORWF 0x2C, W\n    IORWF 0x70, W"),
         "chain then equality accumulation:\n{asm}"
     );
     assert!(
@@ -4956,16 +4995,10 @@ fn single_table_elision_drift_folded_by_window_align() {
         ("last::a", 0x31),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    // The elision drift is real: the reader sits at the post-elision
-    // position (0x7F3), not the pass-A 0x7FA. (epic-cc#214 shifted this by
-    // one word, epic-cc#217 by one more: h0's `xor i8 %x, %x` now elides
-    // its own redundant reload too, same drift mechanism this test
-    // exercises, just one word more of it.)
-    assert_eq!(
-        label_addr(&asm, "__read_t"),
-        0x7F3,
-        "reader at the post-elision start:\n{asm}"
-    );
+    // The reader sits wherever post-elision drift puts it; that magnitude
+    // is incidental (epic-cc#750 moved it again by threading h0's xor
+    // through W), so only the structural claims pin: no `.org` pin is
+    // needed, because the window align absorbs the drift.
     assert!(
         !asm.contains("    org 0x07FA"),
         "no pin needed when the window align absorbs the drift:\n{asm}"
@@ -5568,9 +5601,10 @@ fn icmp_ugt_i32_accumulates_four_byte_equality_for_z() {
     let asm = select(&PIC16F877A, &m, &addrs(&map));
     // The 4-byte chain first (C), then the 4-byte equality accumulation
     // (Z = a == b) — the chain's final Z reflects only byte 3 — then
-    // C && !Z. a=0x30/31/32/33, b=0x34/35/36/37, scratch=0x70.
+    // C && !Z. a=0x30/31/32/33, b=0x34/35/36/37, scratch=0x70. The last
+    // store is dead (epic-cc#750): only the IORWF inputs store.
     assert!(
-        asm.contains("    MOVF 0x30, W\n    XORWF 0x34, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    XORWF 0x35, W\n    IORWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x32, W\n    XORWF 0x36, W\n    IORWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x33, W\n    XORWF 0x37, W\n    IORWF 0x70, W\n    MOVWF 0x70"),
+        asm.contains("    MOVF 0x30, W\n    XORWF 0x34, W\n    MOVWF 0x70\n    MOVF 0x31, W\n    XORWF 0x35, W\n    IORWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x32, W\n    XORWF 0x36, W\n    IORWF 0x70, W\n    MOVWF 0x70\n    MOVF 0x33, W\n    XORWF 0x37, W\n    IORWF 0x70, W"),
         "4-byte equality accumulation:\n{asm}"
     );
     assert!(
@@ -9175,4 +9209,63 @@ fn store_an_i1_through_a_literal_pointer_writes_the_sfr() {
     let asm = select(&PIC16F877A, &m, &addrs(&[]));
     assert!(asm.contains("MOVLW 0x01"), "asm:\n{asm}");
     assert!(asm.contains("MOVWF 0x01"), "asm:\n{asm}");
+}
+
+#[test]
+fn xor_with_zero_byte_threads_through_w() {
+    // Dispatch lanes xor lane bytes with 0x00 (icmp-eq lowering over wide
+    // masks); x ^ 0 is a value and flag nop, and %2 is single-use, so the
+    // whole temporary stays in W from the %1 load to the store: no XORLW,
+    // no MOVWF to the temp slot.
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = xor i8 %1, 0\n    store i8 %2 @out\n    ret void");
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x25),
+        ("main::2", 0x26),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(!asm.contains("XORLW"), "no identity xor:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x26"),
+        "single-use %2 never lands in its slot:\n{asm}"
+    );
+    assert!(asm.contains("MOVWF 0x21"), "store to out:\n{asm}");
+}
+
+#[test]
+fn and_with_zero_byte_lowers_as_clrf() {
+    // A wide mask's zero bytes (dispatch `and i16 %x, 4` high byte) make 0
+    // with Z set, exactly what CLRF leaves, in one word not three.
+    let m = parse("global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %a = load i16 @in\n    %r = and i16 %a, 4\n    store i16 %r @out\n    ret void");
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::a", 0x27),
+        ("main::r", 0x29),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(!asm.contains("ANDLW 0x00"), "no annihilator and:\n{asm}");
+    assert!(asm.contains("CLRF 0x2A"), "hi byte clears:\n{asm}");
+    assert!(asm.contains("ANDLW 0x04"), "lo mask stays:\n{asm}");
+}
+
+#[test]
+fn cmp_eq_against_zero_skips_the_xor() {
+    // `icmp eq %a, 0` xors each byte with 0x00; over a slot load that xor
+    // is a nop (Z already (W == 0)), so the compare keeps load and drop.
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %a = load i8 @in\n    %c = icmp eq i8 %a, 0\n    %z = zext i1 %c to i8\n    store i8 %z @out\n    ret void");
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::a", 0x25),
+        ("main::c", 0x26),
+        ("main::z", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(!asm.contains("XORLW 0x00"), "no identity xor:\n{asm}");
+    assert!(
+        !asm.contains("MOVWF 0x70"),
+        "no dead scratch store (epic-cc#750):\n{asm}"
+    );
 }

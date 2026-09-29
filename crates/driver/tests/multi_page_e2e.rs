@@ -40,16 +40,16 @@
 //! ```text
 //! __start        0x0001  page 0
 //! f1             0x0005  page 0   (chain root)
-//! F1             0x0170  page 0   (filler)
-//! f2             0x0527  page 0   (calls f1   -> same page)
-//! f3             0x0663  page 0   (calls f2   -> same page; reads table)
-//! __mul_u8       0x06E6  page 0
-//! __udiv_u8      0x0704  page 0
+//! F1             0x016E  page 0   (filler)
+//! f2             0x0605  page 0   (calls f1   -> same page)
+//! f3             0x0740  page 0   (calls f2   -> same page; reads table)
+//! __mul_u8       0x07C0  page 0
+//! __udiv_u8      0x07DE  page 0
 //! F2             0x0800  page 1   (filler, .org-padded)
-//! F3             0x0BB7  page 1   (filler)
+//! F3             0x0BB5  page 1   (filler)
 //! main           0x1000  page 2   (calls f3/f1 cross-page; reads table)
-//! F4             0x1125  page 2   (filler)
-//! __read_table   0x14DC  page 2   (cross-page from f3; same-page from main)
+//! F4             0x1114  page 2   (filler)
+//! __read_table   0x14C9  page 2   (cross-page from f3; same-page from main)
 //! table          0x1500  page 2   (256-byte window 0x15, the reader's
 //!                                   `MOVLW HIGH(table); MOVWF PCLATH` is
 //!                                   load-bearing: without it the computed
@@ -59,6 +59,9 @@
 //! ```
 //!
 //! Total program: 0x1632 = 5682 words (> 0x800, < 0x2000 device bound).
+//! F1 carries extra padding rounds (epic-cc#750): lane threading shrank the
+//! chain enough that main fell into page 0, so the filler grew back to
+//! refill page 0 and keep main (and its nonzero PAGE literal) in page 2.
 //!
 //! Cross-page CALL sites in the final asm: f2 -> f1 (page 0 -> 0, same
 //! page), f3 -> f2 (0 -> 0, same page), f3 -> __read_table (0 -> 2), main

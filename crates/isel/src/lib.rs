@@ -179,6 +179,24 @@ struct Gen<'m> {
     /// it, so a stale belief survives only across adjacent `emit_w_*` calls
     /// within one function (epic-cc#214, epic-cc#217).
     w_holds: Option<u16>,
+    /// Per-function read counts keyed `{func}::{ssa}`, from `read_vals`
+    /// over every instruction. A count of 1 marks a lane temporary whose
+    /// single consumer can take it straight from W (see deferred_store).
+    /// Over-counting only loses the optimization; under-counting would
+    /// drop a needed store, so every operand shape must stay mirrored.
+    use_count: HashMap<String, u32>,
+    /// Slot whose store is deferred: W holds its value, the slot does not
+    /// yet. Only a single-use lane temporary's last-emitted byte defers,
+    /// and only the consumer's `emit_w_load` of that slot adopts it. Any
+    /// other line flushes first (see emit): the value lands in its slot
+    /// before anything can observe W, a slot, or STATUS, so deferral never
+    /// crosses calls, branches, or labels.
+    deferred_store: Option<u16>,
+    /// Reads still outstanding on the deferred slot. The consumer's load of
+    /// that slot consumes one; a flush with none left drops the store, the
+    /// value already reached its only consumer through W. Reads through
+    /// file operands never decrement (they flush first): over-counts, safe.
+    deferred_uses: u32,
     /// The flag relation `emit_materialize` left in dst, as the STATUS bit
     /// and the BTFSC/BTFSS choice that tests it, valid only until the next
     /// plain `emit` (same lifetime as `w_holds`). `emit_cond_branch` uses it
@@ -201,10 +219,26 @@ struct Gen<'m> {
 
 impl<'m> Gen<'m> {
     fn emit(&mut self, s: impl Into<String>) {
+        self.flush_deferred();
         self.w_holds = None;
         self.z_rel = None;
         self.out.push(s.into());
         self.locs.push(self.cur_loc.clone());
+    }
+
+    /// Emit a deferred single-use store, if one is pending with reads left.
+    /// With no reads left the value already reached its only consumer
+    /// through W, so the store drops. The MOVWF is flag-neutral, so a live
+    /// flag relation survives it; `w_holds` tracks the flushed slot, since
+    /// W still holds exactly that value.
+    fn flush_deferred(&mut self) {
+        if let Some(slot) = self.deferred_store.take() {
+            if self.deferred_uses > 0 {
+                self.out.push(format!("    MOVWF 0x{slot:02X}"));
+                self.locs.push(self.cur_loc.clone());
+                self.w_holds = Some(slot);
+            }
+        }
     }
 
     /// `MOVWF addr`, unless `addr` is already known to hold W's value from
@@ -212,6 +246,16 @@ impl<'m> Gen<'m> {
     /// address (a genuine no-op then: the byte there already equals W).
     /// Marks `addr` as holding W's value either way.
     fn emit_w_store(&mut self, addr: u16) {
+        if self.deferred_store == Some(addr) {
+            // The deferred write IS this store: materialize it. The slot
+            // gets W's value exactly once, as if it had never deferred.
+            self.deferred_store = None;
+            self.emit(format!("    MOVWF 0x{addr:02X}"));
+            self.w_holds = Some(addr);
+            self.z_rel = None;
+            return;
+        }
+        self.flush_deferred();
         if self.w_holds != Some(addr) {
             self.emit(format!("    MOVWF 0x{addr:02X}"));
         }
@@ -225,9 +269,20 @@ impl<'m> Gen<'m> {
     /// `MOVF addr, W`, unless `addr`'s value is already known to be in W:
     /// W holds exactly what a preceding `emit_w_store`/`emit_w_load` of the
     /// same address put there, with nothing emitted since (epic-cc#214).
-    /// Marks `addr` as holding W's value either way, so a repeated load of
-    /// the same address collapses too.
+    /// A deferred store of `addr` adopts the same way: the value never
+    /// left W, so both the store and the reload vanish. The slot itself
+    /// stays stale, which is safe: the temp is single-use (consumed here),
+    /// and every lowering observes W before any same-slot store, so the
+    /// stale `w_holds` belief cannot elide a foreign store into it.
     fn emit_w_load(&mut self, addr: u16) {
+        if self.deferred_store == Some(addr) {
+            self.deferred_store = None;
+            self.deferred_uses = self.deferred_uses.saturating_sub(1);
+            self.w_holds = Some(addr);
+            self.z_rel = None;
+            return;
+        }
+        self.flush_deferred();
         if self.w_holds != Some(addr) {
             self.emit(format!("    MOVF 0x{addr:02X}, W"));
         }
@@ -1452,14 +1507,131 @@ impl<'m> Gen<'m> {
     fn emit_cmp_eq(&mut self, a: &Val, b: &Val, ty: Ty) {
         let n = ty.bytes();
         self.emit_load_byte(a, 0);
-        self.emit_xor_byte(b, 0);
-        self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
-        for i in 1..n {
-            self.emit_load_byte(a, i);
-            self.emit_xor_byte(b, i);
-            self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
+        self.emit_xor_byte_unless_nop(b, 0);
+        // The accumulation's last store is dead: every scratch reader
+        // writes it first in its own sequence (pointer accumulation, FSR
+        // setup, const-reader dispatch, sub borrow folds), and materialize
+        // branches on the live Z without reloading scratch. Only the IORWF
+        // inputs (every byte but the last) still store.
+        if n > 1 {
             self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
         }
+        for i in 1..n {
+            self.emit_load_byte(a, i);
+            self.emit_xor_byte_unless_nop(b, i);
+            self.emit(format!("    IORWF 0x{:02X}, W", self.scratch));
+            if i + 1 < n {
+                self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+            }
+        }
+    }
+
+    /// Whether the tail just emitted witnesses Z == (W == 0) right now: an
+    /// unskipped `MOVF s, W` load, or a Z-setting ALU op (`*LW`, or a `, W`
+    /// file op) whose result a `MOVWF` just stored (the store preserves
+    /// both W and Z). Anything else refuses, notably an elided load after
+    /// a MOVLW+MOVWF const store, whose Z is stale: the literal op would
+    /// have refreshed it, so the skip must not fire there.
+    fn alu_result_fresh(&self) -> bool {
+        let n = self.out.len();
+        if n == 0 {
+            return false;
+        }
+        let last = self.out[n - 1].trim_start();
+        if Self::is_movf_w(last) {
+            return !self.prev_is_skip(n - 1);
+        }
+        // W just computed: a Z-setting ALU op leaves Z == (W == 0) with
+        // nothing since. A deferred lane store emits no line, so this tail
+        // is what the consumer's xor sees after an adoption.
+        if Self::sets_z_from_w(last) {
+            return !self.prev_is_skip(n - 1);
+        }
+        // A just-stored result: the store preserves W and Z, so the tail
+        // proves freshness when the stored value's own line does. A MOVF;
+        // MOVWF copy chain counts (the load is the proof); a MOVLW+MOVWF
+        // const store does not (stale Z). Either line skipped vetoes.
+        if Self::is_movwf(last) && n >= 2 && !self.prev_is_skip(n - 1) {
+            let prev = self.out[n - 2].trim_start();
+            if Self::is_movf_w(prev) {
+                return !self.prev_is_skip(n - 2);
+            }
+            if Self::sets_z_from_w(prev) {
+                return !self.prev_is_skip(n - 2);
+            }
+        }
+        false
+    }
+
+    /// A `MOVF s, W` load line: W holds s and Z is (W == 0).
+    fn is_movf_w(line: &str) -> bool {
+        line.starts_with("MOVF ") && line.ends_with(", W")
+    }
+
+    /// Whether line `i` is skipped at runtime by a skip instruction. Only
+    /// the immediately preceding line can skip it (every skip takes exactly
+    /// one line), so a BTFSC/BTFSS/DECFSZ/INCFSZ there vetoes.
+    fn prev_is_skip(&self, i: usize) -> bool {
+        if i == 0 {
+            return false;
+        }
+        let prev = self.out[i - 1].trim_start();
+        ["BTFSC", "BTFSS", "DECFSZ", "INCFSZ"]
+            .iter()
+            .any(|s| prev.starts_with(s) && prev[s.len()..].starts_with([' ', '\t']))
+    }
+
+    /// A plain `MOVWF d` GPR store line. Special destinations never count:
+    /// STATUS/FSR/PCL/PCLATH writes change bank, FSR, or control flow, so
+    /// the linear tail proves nothing after them.
+    fn is_movwf(line: &str) -> bool {
+        let rest = match line.strip_prefix("MOVWF ") {
+            Some(r) => r.trim(),
+            None => return false,
+        };
+        if let Some(hex) = rest.strip_prefix("0x") {
+            if let Ok(addr) = u16::from_str_radix(hex, 16) {
+                return !matches!(addr, 0x00 | 0x02 | 0x03 | 0x04 | 0x0A);
+            }
+            return false;
+        }
+        false
+    }
+
+    /// ALU lines that leave Z == (W == 0): the literal ops, and the `, W`
+    /// file ops. `, F` destinations, Z-from-file ops like CLRF/INCF, and
+    /// C-only rotates never count.
+    fn sets_z_from_w(line: &str) -> bool {
+        for op in ["ANDLW", "IORLW", "XORLW", "ADDLW", "SUBLW"] {
+            if line.starts_with(op) && line[op.len()..].starts_with([' ', '\t']) {
+                return true;
+            }
+        }
+        for op in [
+            "ANDWF", "IORWF", "XORWF", "ADDWF", "SUBWF", "ADDWFC", "SUBWFB",
+        ] {
+            if line.starts_with(op)
+                && line[op.len()..].starts_with([' ', '\t'])
+                && line.ends_with(", W")
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// W ^= byte `idx` of `val`, except a zero byte over a witnessed-fresh
+    /// W is skipped: W ^ 0 is W, and XORLW would set the Z the tail
+    /// already holds ((W == 0)), with C/DC untouched by both.
+    fn emit_xor_byte_unless_nop(&mut self, val: &Val, idx: u8) {
+        if self.alu_result_fresh() {
+            if let Val::Const(k) = val {
+                if ((k >> (idx as u32 * 8)) & 0xFF) as u8 == 0 {
+                    return;
+                }
+            }
+        }
+        self.emit_xor_byte(val, idx);
     }
 
     /// W = byte `i` of `v`, with the sign bit complemented (XOR 0x80) when
@@ -1943,12 +2115,27 @@ impl<'m> Gen<'m> {
     }
 
     /// `d = a OP b` bytewise, for the commutative binops and/or/xor at i8 or
-    /// i16. One operand is a register (the file operand), the other a
+    /// wider. One operand is a register (the file operand), the other a
     /// register or const; a const LHS is swapped to the RHS so the literal
     /// path (`opw`) is used, never reading a const as a file-register
     /// address. `op` is the reg-file mnemonic (`ANDWF`/`IORWF`/`XORWF`),
-    /// `opw` the literal mnemonic (`ANDLW`/`IORLW`/`XORLW`).
-    fn emit_commutative(&mut self, a: &Val, b: &Val, ty: Ty, dst: u16, op: &str, opw: &str) {
+    /// `opw` the literal mnemonic (`ANDLW`/`IORLW`/`XORLW`). Bytes emit
+    /// high-first with byte 0 last: every consumer (compare, add, move)
+    /// reads low-first, so W ends holding the byte the consumer loads
+    /// first and its reload elides. Logic bytes are independent, so the
+    /// order changes no trailing carry (none exists) and the trailing Z
+    /// no consumer reads (flag consumers reload first, except materialize
+    /// relations, which this never runs between).
+    fn emit_commutative(
+        &mut self,
+        a: &Val,
+        b: &Val,
+        ty: Ty,
+        dst: u16,
+        dst_name: &str,
+        op: &str,
+        opw: &str,
+    ) {
         let n = ty.bytes();
         let (reg, other) = match (a, b) {
             (Val::Reg(r), o) => (r.clone(), o),
@@ -1956,24 +2143,73 @@ impl<'m> Gen<'m> {
             _ => panic!("isel: {op} needs a register operand"),
         };
         let ra = self.val_addr(&Val::Reg(reg)).direct();
+        // Byte 0 last; the single-byte case keeps its order.
+        let order: Vec<u8> = (1..n).chain(std::iter::once(0)).collect();
         match other {
             Val::Reg(rb) => {
                 let bb = self.val_addr(&Val::Reg(rb.clone())).direct();
-                for i in 0..n {
+                for i in order {
                     self.emit_w_load(bb + u16::from(i));
                     self.emit(format!("    {op} 0x{:02X}, W", ra + u16::from(i)));
-                    self.emit_w_store(dst + u16::from(i));
+                    self.emit_lane_store(dst + u16::from(i), dst_name, n, i);
                 }
             }
             Val::Const(k) => {
-                for i in 0..n {
+                for i in order {
                     let byte = ((k >> (i as u32 * 8)) & 0xFF) as u8;
+                    if byte == 0 {
+                        if op == "ANDWF" {
+                            // x & 0 is 0 with Z set, exactly what CLRF
+                            // leaves (value 0, Z set, C/DC untouched).
+                            // W differs (kept, not zeroed), so the plain
+                            // emit's tracker clear is load-bearing.
+                            self.emit(format!("    CLRF 0x{:02X}", dst + u16::from(i)));
+                            continue;
+                        }
+                        if op == "XORWF" || op == "IORWF" {
+                            // x ^ 0 and x | 0 leave W and Z exactly as the
+                            // load left them, so over a witnessed-fresh W
+                            // the literal op drops and the byte lowers as a
+                            // plain copy. Without the witness the full
+                            // three lines stay: an elided load can carry a
+                            // stale Z the literal op would have refreshed.
+                            self.emit_w_load(ra + u16::from(i));
+                            if self.alu_result_fresh() {
+                                self.emit_lane_store(dst + u16::from(i), dst_name, n, i);
+                                continue;
+                            }
+                        }
+                    }
                     self.emit_w_load(ra + u16::from(i));
                     self.emit(format!("    {opw} 0x{byte:02X}"));
-                    self.emit_w_store(dst + u16::from(i));
+                    self.emit_lane_store(dst + u16::from(i), dst_name, n, i);
                 }
             }
             Val::Global(_) => panic!("isel: {op} with a global operand"),
+        }
+    }
+
+    /// The result store of a lane op: a single-use temporary's last-emitted
+    /// byte defers (its value stays in W for the consumer's load to adopt,
+    /// and both the store and the reload vanish). Anything shared, or any
+    /// wider byte but the last, stores normally. A pending older deferral
+    /// flushes first: W holds only one value.
+    fn emit_lane_store(&mut self, dst: u16, dst_name: &str, bytes: u8, idx: u8) {
+        let func = self.cur_func;
+        let single = (bytes == 1 || idx == 0)
+            && self
+                .use_count
+                .get(&ssa_key(func, dst_name))
+                .copied()
+                .unwrap_or(0)
+                == 1;
+        if single {
+            self.flush_deferred();
+            self.deferred_store = Some(dst);
+            self.deferred_uses = 1;
+            self.w_holds = Some(dst);
+        } else {
+            self.emit_w_store(dst);
         }
     }
 
@@ -2811,15 +3047,15 @@ impl<'m> Gen<'m> {
                     // Commutative bytewise binops (and/or/xor) share one
                     // emitter for both widths; a const LHS is swapped to the
                     // RHS by emit_commutative.
-                    (BinOp::And, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
-                    (BinOp::And, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
-                    (BinOp::And, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "ANDWF", "ANDLW"),
-                    (BinOp::Or, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
-                    (BinOp::Or, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
-                    (BinOp::Or, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "IORWF", "IORLW"),
-                    (BinOp::Xor, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
-                    (BinOp::Xor, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
-                    (BinOp::Xor, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, "XORWF", "XORLW"),
+                    (BinOp::And, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "ANDWF", "ANDLW"),
+                    (BinOp::And, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "ANDWF", "ANDLW"),
+                    (BinOp::And, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "ANDWF", "ANDLW"),
+                    (BinOp::Or, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "IORWF", "IORLW"),
+                    (BinOp::Or, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "IORWF", "IORLW"),
+                    (BinOp::Or, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "IORWF", "IORLW"),
+                    (BinOp::Xor, Ty::I8) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "XORWF", "XORLW"),
+                    (BinOp::Xor, Ty::I16) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "XORWF", "XORLW"),
+                    (BinOp::Xor, Ty::I32) => self.emit_commutative(&b.a, &b.b, b.ty, da, &b.dst, "XORWF", "XORLW"),
                     // sub is NOT commutative: a const LHS (d = k - a) cannot
                     // reuse the reg-const lowering (which computes a - k):
                     // SUBLW k computes k - W, so the const-LHS path mirrors
@@ -6092,6 +6328,27 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
     // instruction owns them, so they must not inherit a stale loc from the
     // previous function's last instruction.
     g.cur_loc = None;
+    // Single-use lane temporaries defer their store (see deferred_store):
+    // count every SSA read in the function up front. Phi incomings count
+    // even when their edge never takes them; that only over-counts, which
+    // is the safe direction (an over-counted temp keeps its store).
+    let mut use_count: HashMap<String, u32> = HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            for v in ir::read_vals(inst) {
+                // Most shapes already strip to the bare SSA name; pointer
+                // operands can stay canonical (`%x`), so strip here too. A
+                // missed strip only over-counts (that temp keeps its store).
+                let bare = v.strip_prefix('%').unwrap_or(&v);
+                if !bare.is_empty() {
+                    *use_count.entry(ssa_key(&f.name, bare)).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    g.use_count = use_count;
+    g.deferred_store = None;
+    g.deferred_uses = 0;
     // Runtime routines (legalize-injected): the entry block holds only the
     // scratch alloca, so instead of the (empty) block emission the recipe
     // body goes here: the label, the adapted epicurus asm, and the RETURN
@@ -6385,6 +6642,9 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             }
         }
     }
+    // Safety net: a deferred store never outlives its function. Every
+    // terminator already flushed through `emit`, so this is normally empty.
+    g.flush_deferred();
     g.emit("".to_string());
 }
 
@@ -6953,6 +7213,9 @@ pub fn select_with_locs(
                 tmp: &mut tmp,
                 page_of: None,
                 w_holds: None,
+                use_count: HashMap::new(),
+                deferred_store: None,
+                deferred_uses: 0,
                 z_rel: None,
                 cur_loc: None,
                 out: Vec::new(),
@@ -7240,6 +7503,9 @@ pub fn select_with_locs(
                     tmp: &mut tmp,
                     page_of: Some(&pages),
                     w_holds: None,
+                    use_count: HashMap::new(),
+                    deferred_store: None,
+                    deferred_uses: 0,
                     z_rel: None,
                     cur_loc: None,
                     out: Vec::new(),
