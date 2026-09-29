@@ -85,6 +85,7 @@ while [ "$i" -lt "$NCHUNKS" ]; do
   OUT="$OUT_BASE/chunk$i"
   mkdir -p "$OUT"
   cc_bin emit --spec $SPEC --tier $TIER --chunk $i/$NCHUNKS --out-dir /workspace/$OUT $MUT_FLAG
+  mkdir -p "$HAL/build/epiccc"
   cp "$OUT/prog.hex" "$HAL/build/epiccc/mdb-oracle.hex"
   EXTRA_MDB="$(awk '{printf "x /1xbr %s\\n", $1}' "$OUT/reads.txt")"
   # Deterministic backstop: the runner's wall-clock run+wait once stalled
