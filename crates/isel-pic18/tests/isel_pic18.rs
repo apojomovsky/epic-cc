@@ -7189,3 +7189,56 @@ fn bitmask_inverted_eq1_lane_sets_bit_iff_field_differs() {
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f == 1 { o } else { o | 0x04 });
 }
+
+#[test]
+fn bitmask_eq1_lane_across_banks_uses_flag_test() {
+    // Field in bank 1, accumulator in bank 2: the `DECFSZ` single-skip
+    // form has no room for the target's bank select, so the lane keeps
+    // the flag-setting `SUBWF` test (one word more) instead of fusing
+    // unsoundly. Startup owns the only `DECFSZ`.
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    %3 = load i8 @out\n    %4 = or i8 %3 4\n    %5 = select i1 %2 i8 %4 i8 %3\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x120),
+        ("out", 0x21),
+        ("main::1", 0x122),
+        ("main::2", 0x123),
+        ("main::3", 0x220),
+        ("main::4", 0x224),
+        ("main::5", 0x221),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("BSF").count(), 1, "still fused:\n{asm}");
+    // The lane test itself is the flag-setting pair: startup owns no
+    // `SUBWF`, so this count pins the fallback form exactly.
+    assert_eq!(asm.matches("SUBWF").count(), 1, "flag-form test:\n{asm}");
+    assert_eq!(asm.matches("INCF").count(), 0, "no bool diamond:\n{asm}");
+    assert_lane_domain(&asm, 0x120, 0x21, &|f, o| if f == 1 { o | 0x04 } else { o });
+}
+
+#[test]
+fn bitmask_lane_across_store_reads_loaded_slot() {
+    // A store to the field between the compare and the select rules out
+    // the direct read: the lane tests the loaded slot instead, which the
+    // store cannot reach.
+    let m = parse(
+        "global f i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @f\n    %2 = icmp eq i8 %1 1\n    store i8 7 @f\n    %3 = load i8 @out\n    %4 = or i8 %3 4\n    %5 = select i1 %2 i8 %4 i8 %3\n    store i8 %5 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("f", 0x20),
+        ("out", 0x21),
+        ("main::1", 0x22),
+        ("main::2", 0x23),
+        ("main::3", 0x24),
+        ("main::4", 0x25),
+        ("main::5", 0x26),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert_eq!(asm.matches("BSF").count(), 1, "still fused:\n{asm}");
+    assert!(
+        asm.contains("MOVFF 0x020, 0x022"),
+        "field load copy survives:\n{asm}"
+    );
+    assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f == 1 { o | 0x04 } else { o });
+}

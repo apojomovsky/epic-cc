@@ -698,10 +698,14 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Resolves the tested field to a direct read: a consumed single-use
+    /// Resolves the tested field's read options: a consumed single-use
     /// load's source address (preferred, one `MOVF` replaces the copy
-    /// plus test) or the field slot. Returns the address override and
-    /// the consumed load dst, if any.
+    /// plus test) plus its dst for the use count, and the field slot.
+    /// The caller picks direct first and falls back to the slot, running
+    /// the gap check for each: a failed direct read must not reject the
+    /// sound slot path.
+    /// Returns `(direct address, load dst, slot)`, each empty when its
+    /// shape does not apply (adjacency for direct, allocation for slot).
     fn lane_field(
         g: &Gen,
         b: &Block,
@@ -709,27 +713,124 @@ impl<'m> Gen<'m> {
         uses: &HashMap<String, usize>,
         fname: &str,
         use_ii: usize,
-    ) -> Option<(Option<u16>, Option<String>)> {
+    ) -> (Option<u16>, Option<String>, Option<u16>) {
         // The direct read moves the volatile load to the lane position,
         // so the load must immediately precede the compare: any
         // instruction between them (a store to the same address, a call)
-        // could change what the test observes. Otherwise the slot read
-        // keeps source order trivially.
+        // could change what the test observes.
+        let mut direct = None;
+        let mut load = None;
         if let Some(&li) = defs.get(fname) {
             if li + 1 == use_ii {
                 if let Inst::Load(l) = &b.insts[li] {
                     if l.dst == fname && uses.get(fname).copied().unwrap_or(0) == 1 {
                         if let Some(addr) = Self::lane_load_addr(g, l) {
-                            return Some((Some(addr), Some(fname.to_string())));
+                            direct = Some(addr);
+                            load = Some(fname.to_string());
                         }
                     }
                 }
             }
         }
-        if g.addrs.get(&ssa_key(g.cur_func, fname)).is_some() {
+        let slot = g.addrs.get(&ssa_key(g.cur_func, fname)).copied();
+        (direct, load, slot)
+    }
+
+    /// Picks the field read for one lane: the direct address when its
+    /// gap is clean, else the slot when it exists, is not the establish
+    /// target, and its own gap is clean. Returns the address override
+    /// and the consumed load, if any.
+    fn lane_read(
+        g: &Gen,
+        b: &Block,
+        cnd: &str,
+        ci: usize,
+        final_ii: usize,
+        target: u16,
+        direct: Option<u16>,
+        load: Option<String>,
+        slot: Option<u16>,
+    ) -> Option<(Option<u16>, Option<String>)> {
+        if direct.is_some() {
+            let mut probe = vec![cnd.to_string()];
+            if let Some(ld) = &load {
+                probe.push(ld.clone());
+            }
+            if Self::lane_gap_clean(g, b, ci, final_ii, None, &probe) {
+                return Some((direct, load));
+            }
+        }
+        let s = slot?;
+        if s == target {
+            return None;
+        }
+        if Self::lane_gap_clean(g, b, ci, final_ii, Some(s), &[cnd.to_string()]) {
             return Some((None, None));
         }
         None
+    }
+
+    /// The bank `operand()` would select for `addr`, or `None` when it
+    /// selects none (both access-bank ranges ride `a=0`). Mirrors that
+    /// predicate without emitting, for the lane test choice below.
+    fn lane_bank(&self, addr: u16) -> Option<u8> {
+        if addr <= self.access_bank_hi || addr >= PIC18_SFR_ACCESS_LO {
+            None
+        } else {
+            Some((addr >> 8) as u8)
+        }
+    }
+
+    /// Whether an eq-1 lane may use the `DECFSZ` test: its
+    /// single-instruction skip leaves no room for a bank select between
+    /// test and branch, so a banked target must already share the
+    /// field's bank (access-bank targets never select at all).
+    /// Flag-form tests read flags through any `MOVLB`, so they fuse
+    /// regardless of banks.
+    fn lane_decfsz_ok(g: &Gen, fslot: u16, target: u16) -> bool {
+        match g.lane_bank(target) {
+            None => true,
+            Some(tb) => g.lane_bank(fslot) == Some(tb),
+        }
+    }
+
+    /// Whether the lane may read the field at its final instruction. A
+    /// direct read observes any memory write in between, so only the
+    /// compare itself may precede it. A slot read survives global stores
+    /// (slots never alias globals) but not indirect ones, and no other
+    /// definition may reuse its slot there. Consumed intermediates never
+    /// emit, so they are exempt. `field_slot` is `None` for direct-read
+    /// lanes, which have no slot to reuse.
+    fn lane_gap_clean(
+        g: &Gen,
+        b: &Block,
+        from: usize,
+        to: usize,
+        field_slot: Option<u16>,
+        consumed: &[String],
+    ) -> bool {
+        for inst in &b.insts[from + 1..to] {
+            match inst {
+                // A direct read observes any memory write. A slot read is
+                // immune to global stores (frame slots and globals never
+                // share an address), but not to indirect ones.
+                Inst::Store(s) if field_slot.is_none() => return false,
+                Inst::Store(s) if !s.ptr.starts_with('@') => return false,
+                Inst::Call(_) | Inst::Asm(_) | Inst::Memcpy(_) | Inst::VaStart(_) => return false,
+                _ => {}
+            }
+            if let Some(fs) = field_slot {
+                for d in Self::lane_defs(inst) {
+                    if consumed.iter().any(|x| x == &d) {
+                        continue;
+                    }
+                    if g.addrs.get(&ssa_key(g.cur_func, &d)).copied() == Some(fs) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Matches the or-select and const-select lane shapes at one `Select`.
@@ -740,6 +841,7 @@ impl<'m> Gen<'m> {
         defs: &HashMap<String, usize>,
         uses: &HashMap<String, usize>,
         s: &ir::Select,
+        final_ii: usize,
     ) -> Option<(BitLane, Vec<String>)> {
         if s.ptr || s.ty != Ty::I8 {
             return None;
@@ -762,18 +864,15 @@ impl<'m> Gen<'m> {
         let Val::Reg(fname) = &field else {
             return None;
         };
-        let Some((faddr, load)) = Self::lane_field(g, b, defs, uses, fname, ci) else {
-            return None;
-        };
+        let (direct, load_opt, slot) = Self::lane_field(g, b, defs, uses, fname, ci);
         let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &s.dst)) else {
             return None;
         };
-        // The establish-write lands before the test, so a slot-read
-        // field sharing the dst would be destroyed first. Direct-read
-        // lanes have no slot to clobber.
-        if faddr.is_none() && g.addrs.get(&ssa_key(g.cur_func, fname)).copied() == Some(dst_slot) {
+        let Some((faddr, load)) =
+            Self::lane_read(g, b, cnd, ci, final_ii, dst_slot, direct, load_opt, slot)
+        else {
             return None;
-        }
+        };
         let eq = c.pred == "eq";
         let loc = s.loc.clone();
         let mut eaten = vec![cnd.clone()];
@@ -814,6 +913,16 @@ impl<'m> Gen<'m> {
             if g.addrs.get(&ssa_key(g.cur_func, acc_r)).is_none() {
                 continue;
             };
+            let gap = eaten_or(or_r);
+            // The test reads the field at the select: anything in between
+            // that could change the observed value keeps the old lowering.
+            let fslot = match faddr {
+                Some(_) => None,
+                None => g.addrs.get(&ssa_key(g.cur_func, fname)).copied(),
+            };
+            if !Self::lane_gap_clean(g, b, ci, final_ii, fslot, &gap) {
+                continue;
+            }
             return Some((
                 BitLane {
                     field: field.clone(),
@@ -827,7 +936,7 @@ impl<'m> Gen<'m> {
                     acc: acc_r.clone(),
                     loc: loc.clone(),
                 },
-                eaten_or(or_r),
+                gap,
             ));
         }
         // Const-select: literal arms differing in exactly one bit, with
@@ -846,6 +955,13 @@ impl<'m> Gen<'m> {
         let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &s.dst)) else {
             return None;
         };
+        let fslot = match faddr {
+            Some(_) => None,
+            None => g.addrs.get(&ssa_key(g.cur_func, fname)).copied(),
+        };
+        if !Self::lane_gap_clean(g, b, ci, final_ii, fslot, &eaten) {
+            return None;
+        }
         Some((
             BitLane {
                 field: field.clone(),
@@ -871,6 +987,7 @@ impl<'m> Gen<'m> {
         defs: &HashMap<String, usize>,
         uses: &HashMap<String, usize>,
         ob: &ir::Bin,
+        final_ii: usize,
     ) -> Option<(BitLane, Vec<String>)> {
         if ob.op != ir::BinOp::Or || ob.ty != Ty::I8 {
             return None;
@@ -909,21 +1026,28 @@ impl<'m> Gen<'m> {
         let Val::Reg(fname) = &field else {
             return None;
         };
-        let Some((faddr, load)) = Self::lane_field(g, b, defs, uses, fname, ci) else {
-            return None;
-        };
+        let (direct, load_opt, slot) = Self::lane_field(g, b, defs, uses, fname, ci);
         let Some(&dst_slot) = g.addrs.get(&ssa_key(g.cur_func, &ob.dst)) else {
             return None;
         };
         if g.addrs.get(&ssa_key(g.cur_func, acc_r)).is_none() {
             return None;
         }
-        if faddr.is_none() && g.addrs.get(&ssa_key(g.cur_func, fname)).copied() == Some(dst_slot) {
+        let Some((faddr, load)) =
+            Self::lane_read(g, b, cnd, ci, final_ii, dst_slot, direct, load_opt, slot)
+        else {
             return None;
-        }
+        };
         let mut eaten = vec![cnd.clone(), z_r.clone()];
         if let Some(ld) = load {
             eaten.push(ld);
+        }
+        let fslot = match faddr {
+            Some(_) => None,
+            None => g.addrs.get(&ssa_key(g.cur_func, fname)).copied(),
+        };
+        if !Self::lane_gap_clean(g, b, ci, final_ii, fslot, &eaten) {
+            return None;
         }
         Some((
             BitLane {
@@ -968,11 +1092,11 @@ impl<'m> Gen<'m> {
         let mut consumed: HashSet<String> = HashSet::new();
         for (bi, b) in f.blocks.iter().enumerate() {
             let defs = &block_defs[bi];
-            for inst in &b.insts {
+            for (ii, inst) in b.insts.iter().enumerate() {
                 let found = match inst {
-                    Inst::Select(s) => Self::match_select_lane(g, b, defs, &uses, s)
+                    Inst::Select(s) => Self::match_select_lane(g, b, defs, &uses, s, ii)
                         .map(|(lane, eaten)| (lane, eaten, s.dst.clone())),
-                    Inst::Bin(ob) => Self::match_or_bool(g, b, defs, &uses, ob)
+                    Inst::Bin(ob) => Self::match_or_bool(g, b, defs, &uses, ob, ii)
                         .map(|(lane, eaten)| (lane, eaten, ob.dst.clone())),
                     _ => None,
                 };
@@ -4641,12 +4765,14 @@ impl<'m> Gen<'m> {
             Some(a) => a,
             None => self.val_addr(&lane.field).direct(),
         };
-        // Eq-1 lanes test with `DECFSZ f,W`: it skips exactly when the
-        // field is 1, never writes the field, and costs one word where
-        // the `MOVLW`/`SUBWF` pair costs two. Either way the skip target
-        // is reached with plain control flow, so no flag discipline is
+        // Eq-1 lanes test with `DECFSZ f,W` when the target shares the
+        // field's bank: it skips exactly when the field is 1, never
+        // writes the field, and costs one word where the `MOVLW`/`SUBWF`
+        // pair costs two. Otherwise the flag-setting pair keeps the
+        // lane fused at one word more. Either way the skip target is
+        // reached with plain control flow, so no flag discipline is
         // needed past the test.
-        let decfsz = lane.eq && lane.k == 1;
+        let decfsz = lane.eq && lane.k == 1 && Self::lane_decfsz_ok(self, fslot, lane.target);
         if decfsz {
             let (a, ff) = self.operand(fslot);
             let bank = if a == 0 { "A" } else { "B" };
