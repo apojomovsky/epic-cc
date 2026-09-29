@@ -48,7 +48,7 @@ ram_bytes = 9
 [[entry]]
 name = "bench-bool-18f4550"
 device = "18F4550"
-flash_words = 42
+flash_words = 38
 ram_bytes = 9
 
 [[entry]]
@@ -78,7 +78,7 @@ ram_bytes = 9
 [[entry]]
 name = "bench-switch-calls-18f4550"
 device = "18F4550"
-flash_words = 51
+flash_words = 49
 ram_bytes = 10
 
 [[entry]]
@@ -90,7 +90,7 @@ ram_bytes = 23
 [[entry]]
 name = "bench-u16-dec-18f4550"
 device = "18F4550"
-flash_words = 113
+flash_words = 109
 ram_bytes = 33
 
 [[entry]]
@@ -108,7 +108,7 @@ ram_bytes = 108
 [[entry]]
 name = "bench-plusw-18f4550"
 device = "18F4550"
-flash_words = 52
+flash_words = 50
 ram_bytes = 27
 
 [[entry]]
@@ -138,29 +138,29 @@ ram_bytes = 47
 [[entry]]
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
-flash_words = 344
+flash_words = 338
 ram_bytes = 34
 
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
 device = "16F877A"
 flash_words = 6216
-ram_bytes = 329
+ram_bytes = 326
 
 [[entry]]
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
-flash_words = 9354
+flash_words = 9255
 ram_bytes = 755
 
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 10439
+flash_words = 10293
 ram_bytes = 977
 
 [[entry]]
 name = "hal-pic18-pid-18f4550"
 device = "18F4550"
-flash_words = 3406
+flash_words = 3424
 ram_bytes = 500
