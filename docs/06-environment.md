@@ -9,8 +9,8 @@ Machine: **Ubuntu 26.04**, x86-64. Repo: `/home/alexis/projects/pic8_compiler`.
 version:
 
 ```bash
-docker build --target dev -t epic-cc-dev .   # first build is slow (clang)
-docker run --rm -it -v "$PWD:/workspace" -w /workspace epic-cc-dev bash
+make image   # first build is slow (clang); tag is content-addressed, see 09
+make shell
 ```
 
 This provides pinned `clang` 20.1.8, `rustc`/`cargo` 1.97.1, `gpasm` 1.5.2, `cvise`,
