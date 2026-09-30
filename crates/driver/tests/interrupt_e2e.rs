@@ -114,7 +114,7 @@ fn interrupt_runs_correctly_with_mid_run_fire() {
     assert_eq!(p.pc(), VECTOR, "the ISR starts at the vector (word 4)");
 
     // The ISR runs (PORTB = 0x55, out = bump_isr(out)), RETFIE returns to
-    // word 76, and main completes: out == 0x16, PORTB == 0x22, then the
+    // word 72, and main completes: out == 0x16, PORTB == 0x22, then the
     // __start SLEEP halts the machine.
     p.run(500_000);
     assert_eq!(
