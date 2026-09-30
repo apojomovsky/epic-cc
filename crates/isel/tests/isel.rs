@@ -607,11 +607,28 @@ fn brcond_collapses_adjacent_and_icmp_triple() {
         ("main::c", 0x27),
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
-    assert_branch(&asm, "BTFSS 0x25, 2", "main_Lend", "main_Lthen");
+    assert_branch(&asm, "BTFSC 0x25, 2", "main_Lend", "main_Lthen");
     assert!(!asm.contains("ANDLW 0x04"), "AND skipped:\n{asm}");
     assert!(!asm.contains("MOVWF 0x27"), "materialize skipped:\n{asm}");
 }
 
+#[test]
+fn brcond_collapses_ne_triple_with_inverted_skip() {
+    // `ne` takes when the bit is set: BTFSS, the mirror of the eq shape.
+    let m = parse(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %f = load i8 @in\n    %a = and i8 %f, 4\n    %c = icmp ne i8 %a, 0\n    br i1 %c then end\n  block then:\n    store i8 %f @out\n    br end\n  block end:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::f", 0x25),
+        ("main::a", 0x26),
+        ("main::c", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_branch(&asm, "BTFSS 0x25, 2", "main_Lend", "main_Lthen");
+    assert!(!asm.contains("ANDLW 0x04"), "AND skipped:\n{asm}");
+}
 #[test]
 fn select_labels_are_unique_across_functions() {
     // Two functions, each containing a select. Fresh labels are file-scoped

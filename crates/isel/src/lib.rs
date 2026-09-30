@@ -6375,6 +6375,8 @@ struct BitTestCollapse {
     icmp_dst: String,
     slot: u16,
     bit: u8,
+    /// True for `ne` (taken when the bit is set), false for `eq`.
+    taken_on_set: bool,
 }
 
 fn find_bit_test_collapse(
@@ -6465,6 +6467,7 @@ fn find_bit_test_collapse(
         icmp_dst: icmp.dst.clone(),
         slot: slot + u16::from((bit / 8) as u8),
         bit: (bit % 8) as u8,
+        taken_on_set: icmp.pred == "ne",
     })
 }
 
@@ -6686,6 +6689,9 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                     // pending deferred AND store has no
                                     // consumer left, so drop it; W still
                                     // holds its value, which nothing reads.
+                                    // Skip polarity follows the predicate:
+                                    // `ne` takes when the bit is set, `eq`
+                                    // when it is clear.
                                     None if collapse.is_some() => {
                                         let c = collapse.as_ref().unwrap();
                                         let and_slot = g.slot_addr(&f.name, &c.and_dst).direct();
@@ -6693,7 +6699,8 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                             g.deferred_store = None;
                                             g.deferred_uses = 0;
                                         }
-                                        g.emit(format!("    BTFSS 0x{:02X}, {}", c.slot, c.bit));
+                                        let skip = if c.taken_on_set { "BTFSS" } else { "BTFSC" };
+                                        g.emit(format!("    {skip} 0x{:02X}, {}", c.slot, c.bit));
                                         g.emit(format!("    GOTO {lf}"));
                                         g.emit(format!("    GOTO {lt}"));
                                     }
