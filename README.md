@@ -154,6 +154,11 @@ That is the PIC14-family path. PIC18 goes from `isel-pic18` through
 (about 12% smaller flash on the menu demo; `--no-outline` opts out),
 straight to `asm`.
 
+Optimization profiles pick the tradeoff: `-Os` (the default) is the
+size-first pipeline above, `-O2` trades flash for speed (no factoring,
+single-use helpers folded even into `main`), `-O0` keeps the IR closest
+to source for debugging, `-O1` sits between. ([ADR-045](docs/adr/ADR-045-optimization-profiles.md))
+
 Three decisions shape everything:
 
 - **clang out-of-process, not an LLVM backend.** We parse clang's `.ll` text
