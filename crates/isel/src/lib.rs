@@ -706,9 +706,9 @@ impl<'m> Gen<'m> {
                             self.emit("    MOVWF PCLATH".to_string());
                             self.emit_ptr_index_w(k, &terms, byte_off);
                             self.emit(format!("    CALL __read_{name}"));
-                            self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                            self.emit_w_store(self.scratch);
                             self.emit_pclath_restore(&format!("__read_{name}"));
-                            self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                            self.emit_w_load(self.scratch);
                         }
                         return;
                     }
@@ -730,9 +730,9 @@ impl<'m> Gen<'m> {
                     self.emit("    MOVWF PCLATH".to_string());
                     self.emit(format!("    MOVLW 0x{byte_off:02X}"));
                     self.emit(format!("    CALL __read_{g}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_w_store(self.scratch);
                     self.emit_pclath_restore(&format!("__read_{g}"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit_w_load(self.scratch);
                     return;
                 }
             }
@@ -1064,9 +1064,9 @@ impl<'m> Gen<'m> {
             g.emit("    MOVWF PCLATH".to_string());
             g.emit(format!("    MOVF 0x{:02X}, W", g.retval_lo));
             g.emit(format!("    CALL {e}"));
-            g.emit(format!("    MOVWF 0x{:02X}", g.scratch));
+            g.emit_w_store(g.scratch);
             g.emit_pclath_restore(&e);
-            g.emit(format!("    MOVF 0x{:02X}, W", g.scratch));
+            g.emit_w_load(g.scratch);
             g.emit(format!("    GOTO {l_done}"));
         };
         // The 3+ chunk dispatch chain: descending `scratch >= c` tests
@@ -1117,18 +1117,18 @@ impl<'m> Gen<'m> {
                     self.emit("    MOVWF PCLATH".to_string());
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_w_store(self.scratch);
                     self.emit_pclath_restore(&format!("__read_{name}"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit_w_load(self.scratch);
                     self.emit(format!("    GOTO {l_done}"));
                     self.emit(format!("{l_hi}:"));
                     self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
                     self.emit("    MOVWF PCLATH".to_string());
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}_hi"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_w_store(self.scratch);
                     self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit_w_load(self.scratch);
                 } else {
                     emit_chain(self, &l_done);
                 }
@@ -1195,18 +1195,18 @@ impl<'m> Gen<'m> {
                     self.emit("    MOVWF PCLATH".to_string());
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_w_store(self.scratch);
                     self.emit_pclath_restore(&format!("__read_{name}"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit_w_load(self.scratch);
                     self.emit(format!("    GOTO {l_done}"));
                     self.emit(format!("{l_hi}:"));
                     self.emit(format!("    MOVLW PAGE(__read_{name}_hi)"));
                     self.emit("    MOVWF PCLATH".to_string());
                     self.emit(format!("    MOVF 0x{:02X}, W", self.retval_lo));
                     self.emit(format!("    CALL __read_{name}_hi"));
-                    self.emit(format!("    MOVWF 0x{:02X}", self.scratch));
+                    self.emit_w_store(self.scratch);
                     self.emit_pclath_restore(&format!("__read_{name}_hi"));
-                    self.emit(format!("    MOVF 0x{:02X}, W", self.scratch));
+                    self.emit_w_load(self.scratch);
                 } else {
                     emit_chain(self, &l_done);
                 }
@@ -2803,6 +2803,27 @@ impl<'m> Gen<'m> {
             self.emit("    NOP".to_string());
         }
     }
+    /// Whether a valued CALL to `func` returns with W holding the last
+    /// declared retval byte. User functions (`Ret` stores low to high)
+    /// and the integer runtime recipes (one trailing `store_retval` of
+    /// the declared width) do. The f32 recipes predate the invariant:
+    /// several exits RETURN with scratch or a constant in W (epic-cc#775),
+    /// so their callers keep the reload.
+    fn call_returns_in_w(func: &str) -> bool {
+        let base = func.strip_suffix("_isr").unwrap_or(func);
+        !matches!(
+            base,
+            "__add_f32"
+                | "__sub_f32"
+                | "__mul_f32"
+                | "__div_f32"
+                | "__uitofp_f32"
+                | "__sitofp_f32"
+                | "__fptoui_f32"
+                | "__fptosi_f32"
+        )
+    }
+
     /// `dst = call func(args)`: copy each arg into the callee's
     /// `{func}::{param}` slots, `CALL func`, then copy the retval slots
     /// (`retval_lo` .. `retval_lo + bytes - 1`, 0x71-0x74 for i32) into
@@ -2842,20 +2863,31 @@ impl<'m> Gen<'m> {
         self.emit(format!("    MOVLW PAGE({func})"));
         self.emit("    MOVWF PCLATH".to_string());
         self.emit(format!("    CALL {func}"));
-        self.emit_pclath_restore(func);
         if let Some(d) = dst {
             let t = ty.expect("isel: valued call must carry a type");
+            // A valued callee leaves its last retval byte in W: valued
+            // `Ret` stores low to high through W-preserving MOVWF, and
+            // the integer recipes end on `store_retval` the same way.
+            // Seed before the restore (no deferred store straddles the
+            // call, `emit` flushes it): a cross-page restore's MOVLW
+            // clears the seed, a same-page skip keeps it for the copy.
+            // Float callees keep the reload (see `call_returns_in_w`).
+            if Self::call_returns_in_w(func) {
+                self.w_holds = Some(self.retval_lo + u16::from(t.bytes()) - 1);
+            }
             // Copy the retval region (0x71..0x71+bytes-1, up to 0x74 for
-            // i32) into dst.
+            // i32) into dst ahead of the restore: the copy is MOVF/MOVWF
+            // only, it reads neither PCLATH nor a flag relation, so it
+            // runs identically on either page while W is still live.
+            // High byte first: W holds the last retval byte, so the
+            // first load elides for every width, not just single-byte.
             let da = self.slot_addr(self.cur_func, d).direct();
-            for i in 0..t.bytes() {
-                self.emit(format!(
-                    "    MOVF 0x{:02X}, W",
-                    self.retval_lo + u16::from(i)
-                ));
-                self.emit(format!("    MOVWF 0x{:02X}", da + u16::from(i)));
+            for i in (0..t.bytes()).rev() {
+                self.emit_w_load(self.retval_lo + u16::from(i));
+                self.emit_w_store(da + u16::from(i));
             }
         }
+        self.emit_pclath_restore(func);
     }
 
     /// `dst = call %fp(args)` through a function pointer: an inline
@@ -3658,7 +3690,10 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    RRF 0x{bk:02X}, F")); // bk >>= 1
                 self.emit(format!("    DECFSZ 0x{cnt:02X}, F"));
                 self.emit(format!("    GOTO {l_loop}"));
-                self.store_retval(r_lo, 2);
+                // One byte, not two: the declared result is i8, so the
+                // high product byte is dead. Storing only the low byte
+                // also leaves it in W for the caller's return-value copy.
+                self.store_retval(r_lo, 1);
                 self.emit("    RETURN".to_string());
             }
             // 16x16 -> 32 shift-add, 16 iterations: t = a (32-bit, shifted
@@ -6165,6 +6200,9 @@ impl<'m> Gen<'m> {
         self.emit(format!("    GOTO {l_ret1}"));
         self.emit(format!("{l_ret0}:"));
         self.emit(format!("    CLRF 0x{r:02X}"));
+        // CLRF leaves W untouched, so load the result for the caller:
+        // every exit leaves W holding the i8 return value.
+        self.emit("    MOVLW 0x00".to_string());
         self.emit("    RETURN".to_string());
         self.emit(format!("{l_ret1}:"));
         self.emit("    MOVLW 0x01".to_string());
