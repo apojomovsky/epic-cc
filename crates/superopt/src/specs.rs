@@ -39,6 +39,68 @@ pub fn shift_left_4_cases() -> Vec<Case> {
     cases
 }
 
+/// PIC18 STATUS N bit (bit 4): set from bit 7 of ALU results, the flag
+/// the signed-compare sign check (epic-cc#782) reads after `XORWF`.
+const STATUS_N_BIT: u8 = 0x10;
+
+/// The signed-chain sign check's novel flag belief (epic-cc#782):
+/// `XORWF f,W` sets N exactly when the result's bit 7 is set. The
+/// borrow lanes reuse long-landed `SUBWF`/`SUBWFB` semantics; only this
+/// N bit is new, so only it gets a hardware spec.
+pub fn xorwf_n_flag_candidate() -> Candidate {
+    vec!["xorwf 0x020,W,A"]
+}
+
+/// Sign edges crossed with entry `W` and entry flags: bit 7 set/clear
+/// on each side of the XOR, so a candidate that only works for one
+/// polarity fails. Every case pokes STATUS because the batch poisons
+/// RAM (unimplemented STATUS bits read 0 on silicon but keep poison
+/// in-sim, so an unpoked STATUS can never byte-match); 0x00 and 0x1F
+/// cover clear and set flag entry states with those bits clear.
+pub fn xorwf_n_flag_cases() -> Vec<Case> {
+    let mut cases = Vec::new();
+    for a in [0x00u8, 0x01, 0x7F, 0x80, 0x81, 0xFE, 0xFF] {
+        for w in [0x00u8, 0x01, 0x7F, 0x80, 0xFF] {
+            for st in [0x00u8, 0x1F] {
+                let r = w ^ a;
+                let n = r & 0x80 != 0;
+                cases.push(Case {
+                    entry_w: w,
+                    pokes: vec![(REG, a), (STATUS_ADDR, st)],
+                    allowed_changes: vec![],
+                    check: Box::new(move |sim: &Pic18| {
+                        sim.w() == r && (sim.ram()[STATUS_ADDR] & STATUS_N_BIT != 0) == n
+                    }),
+                });
+            }
+        }
+    }
+    cases
+}
+
+/// Full `a` domain with a `W` sample: every bit-7 combination appears
+/// many times over, deterministically.
+pub fn xorwf_n_flag_nightly() -> Vec<Case> {
+    let mut cases = Vec::new();
+    for a in 0..=255u8 {
+        for w in [0x00u8, 0xFF, 0x2A, 0x55] {
+            for st in [0x00u8, 0x1F] {
+                let r = w ^ a;
+                let n = r & 0x80 != 0;
+                cases.push(Case {
+                    entry_w: w,
+                    pokes: vec![(REG, a), (STATUS_ADDR, st)],
+                    allowed_changes: vec![],
+                    check: Box::new(move |sim: &Pic18| {
+                        sim.w() == r && (sim.ram()[STATUS_ADDR] & STATUS_N_BIT != 0) == n
+                    }),
+                });
+            }
+        }
+    }
+    cases
+}
+
 /// One oracle spec: a landed candidate plus the case lists each tier
 /// replays on hardware. `pr_cases` fits few sessions; `nightly_cases` is
 /// the wider sweep. `chunk_cases` caps one HEX below 18F4550 flash and its
@@ -186,6 +248,13 @@ pub fn all_specs() -> Vec<Spec> {
             candidate: bitmask_base_candidate,
             pr_cases: bitmask_base_pr,
             nightly_cases: bitmask_base_nightly,
+            chunk_cases: 500,
+        },
+        Spec {
+            name: "xorwf-n-flag",
+            candidate: xorwf_n_flag_candidate,
+            pr_cases: xorwf_n_flag_cases,
+            nightly_cases: xorwf_n_flag_nightly,
             chunk_cases: 500,
         },
     ]

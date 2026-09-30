@@ -600,13 +600,15 @@ impl<'m> Gen<'m> {
         if !matches!(c.ty.bytes(), 1 | 2 | 4) {
             return None;
         }
-        // Only the predicates with a fused lowering. The signed ordering
-        // cascades have none (their answer needs the top lane's sign
-        // relation), so they keep the materializing path. Single-byte
-        // unsigned orderings join them: fusion has no single-lane
-        // ordering lowering, only the borrow chain.
-        if !matches!(c.pred.as_str(), "eq" | "ne" | "ult" | "uge" | "ugt" | "ule")
-            || (c.ty.bytes() == 1 && !is_eq_ne)
+        // Only the predicates with a fused lowering. Single-byte orderings
+        // have none: fusion has no single-lane ordering lowering, only the
+        // borrow chain, so single-byte unsigned orderings keep the
+        // materializing path with the signed ones below.
+        // (`emit_icmp_signed_chain` covers the multi-byte signed half.)
+        if !matches!(
+            c.pred.as_str(),
+            "eq" | "ne" | "ult" | "uge" | "ugt" | "ule" | "slt" | "sle" | "sgt" | "sge"
+        ) || (c.ty.bytes() == 1 && !is_eq_ne)
         {
             return None;
         }
@@ -616,6 +618,14 @@ impl<'m> Gen<'m> {
         // per-lane cascade instead (see `emit_icmp_i16`), but fusion has
         // no cascade lowering, so decline to fuse it.
         if matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule") && g.load_w_writes_carry(&c.b) {
+            return None;
+        }
+        // The signed chain re-reads both high bytes in its sign check, so
+        // SFR operands and address-math rhs loads keep the cascade; fusion
+        // has no cascade lowering, so decline those too.
+        if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
+            && !g.signed_chain_ok(&c.a, &c.b, c.ty.bytes() - 1)
+        {
             return None;
         }
         // The compare's sole consumer must be this branch. Find `b`'s own
@@ -4619,13 +4629,17 @@ impl<'m> Gen<'m> {
         }
         // The unsigned predicates go through the borrow chain, which has
         // one shared exit rather than a per-lane cascade (see
-        // `emit_icmp_chain`). Signed ones keep the cascade: their
-        // answer needs the top lanes' sign equality, which a single final
-        // borrow does not carry. A rhs whose lane load writes STATUS,C
-        // would break the chain's carried flag, so that shape keeps the
-        // cascade too (epic-cc#621).
+        // `emit_icmp_chain`). The signed ones join it through
+        // `emit_icmp_signed_chain`: a sign check plus the same lanes. A
+        // rhs whose lane load writes STATUS,C would break the chain's
+        // carried flag, and an SFR high byte cannot take the sign check's
+        // second read, so those shapes keep the cascade too (epic-cc#621).
         if matches!(pred, "ult" | "uge" | "ugt" | "ule") && !self.load_w_writes_carry(&b) {
             self.emit_icmp_chain(a, b, pred, dst, 2, None);
+            return;
+        }
+        if matches!(pred, "slt" | "sle" | "sgt" | "sge") && self.signed_chain_ok(&a, &b, 1) {
+            self.emit_icmp_signed_chain(a, b, pred, dst, 2, None);
             return;
         }
         let unsigned_tiebreak = match pred {
@@ -4672,7 +4686,42 @@ impl<'m> Gen<'m> {
         self.emit_materialize_bool(&l_true, &l_false, &l_done, dst, pre);
     }
 
-    /// Unsigned ordering compare as one low-to-high borrow chain with a
+    /// Maps an unsigned chain predicate to its lane shape: whether lane 0
+    /// injects a borrow-in, and whether C=1 answers true (`uge`/`ugt`) or
+    /// false (`ult`/`ule`). Shared by the unsigned chain and the signed
+    /// chain, which runs the same lanes after its sign check.
+    fn chain_shape(pred: &str) -> (bool, bool) {
+        debug_assert!(matches!(pred, "ult" | "uge" | "ugt" | "ule"));
+        let borrow_in = matches!(pred, "ugt" | "ule");
+        let ge_is_true = matches!(pred, "uge" | "ugt");
+        (borrow_in, ge_is_true)
+    }
+
+    /// The lane half of `emit_icmp_chain` without labels or exits: one
+    /// low-to-high borrow lane per byte. Extracted so the signed chain
+    /// runs identical lanes after its sign check.
+    fn emit_chain_lanes(&mut self, a: &Val, b: &Val, bytes: u8, borrow_in: bool) {
+        if borrow_in {
+            // C = 0 makes lane 0's SUBWFB subtract `b0 + 1`.
+            self.emit("    BCF 0xFD8,0,A".to_string());
+        }
+        for i in 0..bytes {
+            self.emit_load_w(b, i, false);
+            let av = self.val_addr(a).direct() + u16::from(i);
+            let (acc, af) = self.operand(av);
+            let bank = if acc == 0 { "A" } else { "B" };
+            // Lane 0 uses SUBWF for the plain chain (which sets C
+            // outright) and SUBWFB for the borrow-in one (which consumes
+            // the carry cleared above, so it cannot be the plain form).
+            let mne = if i == 0 && !borrow_in {
+                "SUBWF"
+            } else {
+                "SUBWFB"
+            };
+            self.emit(format!("    {mne} 0x{af:03X},W,{bank}"));
+        }
+    }
+
     /// single exit. `a - b` propagates the borrow upward, so the final
     /// carry is `a >= b` for every width; the chain never inspects a lane
     /// a higher lane could still decide, and it needs no per-lane exit.
@@ -4706,10 +4755,14 @@ impl<'m> Gen<'m> {
         // `a >= b` (giving `uge` at C=1 and `ult` at C=0); the strict chain
         // injects a borrow-in of 1, computing `a - b - 1`, whose C=1 means
         // `a > b` (giving `ugt` at C=1 and `ule` at C=0).
-        let borrow_in = matches!(pred, "ugt" | "ule");
+        let (borrow_in, ge_is_true) = Self::chain_shape(pred);
         // Which side of the branch the two outcomes go to: for the
         // materializing path they are the true/false labels, for a fused
-        // one they are the branch's own targets.
+        // one they are the branch's own targets. `l_ge` is the C=1 target
+        // and `l_lt` the C=0 one; the two "greater" predicates and the two
+        // "less" ones pair up across the strictness split, not within it:
+        //   uge (a>=b) -> C=1, ugt (a>b) -> C=1
+        //   ult (a<b)  -> C=0, ule (a<=b) -> C=0
         let (l_true, l_false, l_done);
         match fuse {
             Some((t, f)) => {
@@ -4723,13 +4776,7 @@ impl<'m> Gen<'m> {
                 l_done = Some(self.fresh_label());
             }
         }
-        // `l_ge` is the C=1 target and `l_lt` the C=0 one. The non-strict
-        // chain's C=1 means `a >= b` and the strict chain's means `a > b`,
-        // so the two "greater" predicates and the two "less" ones pair up
-        // across the strictness split, not within it:
-        //   uge (a>=b) -> C=1, ugt (a>b) -> C=1
-        //   ult (a<b)  -> C=0, ule (a<=b) -> C=0
-        let (l_ge, l_lt) = if matches!(pred, "uge" | "ugt") {
+        let (l_ge, l_lt) = if ge_is_true {
             (l_true.clone(), l_false.clone())
         } else {
             (l_false.clone(), l_true.clone())
@@ -4744,28 +4791,121 @@ impl<'m> Gen<'m> {
         if let Some(d) = pre {
             self.emit_banked("CLRF", d, "");
         }
-        if borrow_in {
-            // C = 0 makes lane 0's SUBWFB subtract `b0 + 1`.
-            self.emit("    BCF 0xFD8,0,A".to_string());
-        }
-        for i in 0..bytes {
-            self.emit_load_w(&b, i, false);
-            let av = self.val_addr(&a).direct() + u16::from(i);
-            let (acc, af) = self.operand(av);
-            let bank = if acc == 0 { "A" } else { "B" };
-            // Lane 0 uses SUBWF for the plain chain (which sets C
-            // outright) and SUBWFB for the borrow-in one (which consumes
-            // the carry cleared above, so it cannot be the plain form).
-            let mne = if i == 0 && !borrow_in {
-                "SUBWF"
-            } else {
-                "SUBWFB"
-            };
-            self.emit(format!("    {mne} 0x{af:03X},W,{bank}"));
-        }
+        self.emit_chain_lanes(&a, &b, bytes, borrow_in);
         // C=1 is always the `>=`/`>` side, whichever chain ran.
         self.emit(format!("    BNC {l_lt}"));
         self.emit(format!("    BRA {l_ge}"));
+        if let Some(done) = l_done {
+            self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
+        }
+    }
+
+    /// Whether the signed chain may run for these operands: the sign check
+    /// re-reads both high bytes ahead of the lanes, so either side in SFR
+    /// space (a read can have side effects there) or a rhs lane load with
+    /// address math (re-evaluated reads, and it writes STATUS,C) keeps the
+    /// single-read cascade. GPR slots and globals read the same bytes the
+    /// cascade would, one extra pass over the top byte only.
+    fn signed_chain_ok(&self, a: &Val, b: &Val, hi: u8) -> bool {
+        if self.load_w_writes_carry(b) {
+            return false;
+        }
+        let ahi = self.val_addr(a).direct() + u16::from(hi);
+        if ahi >= PIC18_SFR_ACCESS_LO {
+            return false;
+        }
+        match b {
+            Val::Const(_) => true,
+            Val::Global(g) if self.is_function(g) => true,
+            Val::Global(g) => self.global_addr(g) + u16::from(hi) < PIC18_SFR_ACCESS_LO,
+            Val::Reg(_) => true,
+        }
+    }
+
+    /// Signed ordering compare as a sign check plus the unsigned borrow
+    /// chain with one shared exit. Equal signs order exactly like the
+    /// unsigned values, so the chain decides those; differing signs are
+    /// decided by `a`'s sign alone. `pred` must be one of
+    /// `slt`/`sle`/`sgt`/`sge`; `bytes` is 2 or 4.
+    ///
+    /// Costs the sign check (6 words) plus the chain (`2n` plus 1 for a
+    /// borrow-in predicate and 3 for the exit, fused or materialized),
+    /// against the cascade's per-lane exits plus materialization. `fuse`
+    /// carries a consuming `BrCond`'s exit labels, as in `emit_icmp_chain`.
+    fn emit_icmp_signed_chain(
+        &mut self,
+        a: Val,
+        b: Val,
+        pred: &str,
+        dst: &str,
+        bytes: u8,
+        fuse: Option<(String, String)>,
+    ) {
+        assert!(
+            !matches!(a, Val::Const(_)),
+            "isel-pic18: const-LHS Icmp (constant as the first operand) not yet supported"
+        );
+        debug_assert!(matches!(pred, "slt" | "sle" | "sgt" | "sge"));
+        debug_assert!(matches!(bytes, 2 | 4));
+        // The unsigned chain deciding the equal-signs case, and whether
+        // the differing-signs answer follows `a < 0` (`slt`/`sle`) or its
+        // negation (`sgt`/`sge`).
+        let (chain_pred, differ_is_a_neg) = match pred {
+            "slt" => ("ult", true),
+            "sle" => ("ule", true),
+            "sgt" => ("ugt", false),
+            _ => ("uge", false),
+        };
+        let (borrow_in, ge_is_true) = Self::chain_shape(chain_pred);
+        let (l_true, l_false, l_done);
+        match fuse {
+            Some((t, f)) => {
+                l_true = t;
+                l_false = f;
+                l_done = None;
+            }
+            None => {
+                l_true = self.fresh_label();
+                l_false = self.fresh_label();
+                l_done = Some(self.fresh_label());
+            }
+        }
+        let (l_ge, l_lt) = if ge_is_true {
+            (l_true.clone(), l_false.clone())
+        } else {
+            (l_false.clone(), l_true.clone())
+        };
+        let (l_dtrue, l_dfalse) = if differ_is_a_neg {
+            (l_true.clone(), l_false.clone())
+        } else {
+            (l_false.clone(), l_true.clone())
+        };
+        let pre = if l_done.is_some() {
+            self.bool_result_preclear(&a, &b, dst, bytes)
+        } else {
+            None
+        };
+        if let Some(d) = pre {
+            self.emit_banked("CLRF", d, "");
+        }
+        // N names the differing-signs case: XOR leaves bit 7 set exactly
+        // when the top bytes disagree. The chain's lane 0 resets C after,
+        // so nothing the sign check touches survives into the lanes.
+        let hi = bytes - 1;
+        self.emit_load_w(&b, hi, false);
+        let av = self.val_addr(&a).direct() + u16::from(hi);
+        let (acc, af) = self.operand(av);
+        let bank = if acc == 0 { "A" } else { "B" };
+        self.emit(format!("    XORWF 0x{af:03X},W,{bank}"));
+        let l_differ = self.fresh_label();
+        self.emit(format!("    BN {l_differ}"));
+        self.emit_chain_lanes(&a, &b, bytes, borrow_in);
+        self.emit(format!("    BNC {l_lt}"));
+        self.emit(format!("    BRA {l_ge}"));
+        self.emit_label(&l_differ);
+        self.emit(format!("    BTFSS 0x{af:03X},7,{bank}"));
+        self.emit(format!("    BRA {l_dfalse}"));
+        self.emit(format!("    BRA {l_dtrue}"));
         if let Some(done) = l_done {
             self.emit_materialize_bool(&l_true, &l_false, &done, dst, pre);
         }
@@ -4848,10 +4988,14 @@ impl<'m> Gen<'m> {
         }
         // Same routing as the 16-bit entry point: the unsigned predicates
         // use the shared-exit borrow chain at any width, the signed ones
-        // keep the cascade (see `emit_icmp_i16`). A rhs lane load that
-        // writes STATUS,C keeps the cascade as well.
+        // join it through `emit_icmp_signed_chain` (see `emit_icmp_i16`).
+        // A rhs lane load that writes STATUS,C keeps the cascade as well.
         if matches!(pred, "ult" | "uge" | "ugt" | "ule") && !self.load_w_writes_carry(&b) {
             self.emit_icmp_chain(a, b, pred, dst, 4, None);
+            return;
+        }
+        if matches!(pred, "slt" | "sle" | "sgt" | "sge") && self.signed_chain_ok(&a, &b, 3) {
+            self.emit_icmp_signed_chain(a, b, pred, dst, 4, None);
             return;
         }
         let unsigned_tiebreak = match pred {
@@ -7930,6 +8074,8 @@ fn emit_fused_branch<'m>(
     let fuse = Some((l_t, l_f));
     if c.pred == "eq" || c.pred == "ne" {
         g.emit_icmp_eq_ne(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
+    } else if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge") {
+        g.emit_icmp_signed_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);
     } else {
         debug_assert!(matches!(c.pred.as_str(), "ult" | "uge" | "ugt" | "ule"));
         g.emit_icmp_chain(c.a.clone(), c.b.clone(), &c.pred, &c.dst, n, fuse);

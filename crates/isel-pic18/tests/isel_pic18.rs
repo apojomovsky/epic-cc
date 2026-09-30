@@ -6919,6 +6919,195 @@ fn fused_cond_icmp_branches_on_the_chain_without_a_result_byte() {
     }
 }
 
+/// Signed ordering compares fuse to the sign check plus the unsigned
+/// borrow chain (epic-cc#782), simulating the emitted asm the same way
+/// the unsigned fused test does. Values are u32 throughout so i16 and
+/// i32 share one table; the sign edges (0x8000, 0x7FFF, -1) are the
+/// cases a magnitude-only chain gets wrong.
+#[test]
+fn fused_signed_icmp_branches_on_sign_check_plus_chain() {
+    for (ty, bytes, pred, cases) in [
+        (
+            "i16",
+            2usize,
+            "slt",
+            vec![
+                ((0x8000u32, 0x0000u32), 1u8),
+                ((0x0000, 0x8000), 0),
+                ((0xFFFF, 0x0000), 1),
+                ((0x0000, 0xFFFF), 0),
+                ((0x7FFF, 0x8000), 0),
+                ((0x8000, 0x7FFF), 1),
+                ((0x8100, 0x80FF), 0),
+                ((0x80FF, 0x8100), 1),
+                ((5, 5), 0),
+            ],
+        ),
+        (
+            "i16",
+            2,
+            "sge",
+            vec![
+                ((0x8000u32, 0x0000u32), 0u8),
+                ((0x0000, 0x8000), 1),
+                ((0xFFFF, 0x0000), 0),
+                ((0x0000, 0xFFFF), 1),
+                ((0x7FFF, 0x8000), 1),
+                ((5, 5), 1),
+            ],
+        ),
+        (
+            "i16",
+            2,
+            "sgt",
+            vec![
+                ((0x7FFFu32, 0x8000u32), 1u8),
+                ((0x8000, 0x7FFF), 0),
+                ((0x0000, 0xFFFF), 1),
+                ((0xFFFF, 0x0000), 0),
+                ((5, 5), 0),
+            ],
+        ),
+        (
+            "i16",
+            2,
+            "sle",
+            vec![
+                ((0x7FFFu32, 0x8000u32), 0u8),
+                ((0x8000, 0x7FFF), 1),
+                ((0x0000, 0xFFFF), 0),
+                ((0xFFFF, 0x0000), 1),
+                ((5, 5), 1),
+            ],
+        ),
+        (
+            "i32",
+            4,
+            "slt",
+            vec![
+                ((0x80000000u32, 0x00000000u32), 1u8),
+                ((0x00000000, 0x80000000), 0),
+                ((0xFFFFFFFF, 0x00000000), 1),
+                ((0x7FFFFFFF, 0x80000000), 0),
+                ((7, 7), 0),
+            ],
+        ),
+        (
+            "i32",
+            4,
+            "sge",
+            vec![
+                ((0x80000000u32, 0x00000000u32), 0u8),
+                ((0x00000000, 0x80000000), 1),
+                ((0xFFFFFFFF, 0x00000000), 0),
+                ((0x7FFFFFFF, 0x80000000), 1),
+                ((7, 7), 1),
+            ],
+        ),
+    ] {
+        let m = parse(&format!(
+            "global a {ty}\nglobal b {ty}\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load {ty} @a\n    %2 = load {ty} @b\n    %3 = icmp {pred} {ty} %1, %2\n    \
+             br i1 %3 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+             block 20:\n    store i8 0 @out\n    ret void\n",
+        ));
+        let mut pairs = vec![("a", 0x20), ("b", 0x24), ("out", 0x28)];
+        pairs.push(("main::1", 0x30));
+        pairs.push(("main::2", 0x34));
+        let addrs = addrs(&pairs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        // The fusion must have fired: the sign check plus chain shape is
+        // present, the overflow-bit cascade is gone, and no result byte
+        // is materialized.
+        assert!(
+            asm.contains("XORWF") && asm.contains("BTFSS"),
+            "{pred} {ty} did not take the signed chain:\n{asm}"
+        );
+        assert!(
+            !asm.contains("BOV "),
+            "{pred} {ty} still uses the overflow cascade:\n{asm}"
+        );
+        assert!(
+            !asm.contains("INCF 0x38") && !asm.contains("CLRF 0x38"),
+            "{pred} {ty} was not fused:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        for &((a, b), expect) in &cases {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
+            for i in 0..bytes {
+                p.ram_mut()[0x20 + i] = (a >> (8 * i)) as u8;
+                p.ram_mut()[0x24 + i] = (b >> (8 * i)) as u8;
+            }
+            p.run(300);
+            assert_eq!(p.ram()[0x28], expect, "{pred} {ty} {a:#06x} vs {b:#06x}");
+        }
+    }
+}
+
+/// The materializing signed compare (a result byte with another use, the
+/// task_control shape) takes the same sign-check-plus-chain lanes with
+/// the 0/1 byte kept, never the overflow cascade.
+#[test]
+fn materializing_signed_icmp_uses_sign_check_not_overflow() {
+    for (ty, bytes, pred, cases) in [
+        (
+            "i16",
+            2usize,
+            "slt",
+            vec![
+                ((0x8000u32, 0x0000u32), 1u8),
+                ((0x0000, 0x8000), 0),
+                ((0xFFFF, 0x7FFF), 1),
+                ((0x0100, 0x00FF), 0),
+                ((9, 9), 0),
+            ],
+        ),
+        (
+            "i16",
+            2,
+            "sge",
+            vec![
+                ((0x8000u32, 0x0000u32), 0u8),
+                ((0x7FFF, 0x8000), 1),
+                ((0x0100, 0x00FF), 1),
+                ((9, 9), 1),
+            ],
+        ),
+    ] {
+        let m = parse(&format!(
+            "global a {ty}\nglobal b {ty}\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+             %1 = load {ty} @a\n    %2 = load {ty} @b\n    %3 = icmp {pred} {ty} %1, %2\n    \
+             store i8 %3 @out\n    ret void\n",
+        ));
+        let mut pairs = vec![("a", 0x20), ("b", 0x24), ("out", 0x28)];
+        pairs.push(("main::1", 0x30));
+        pairs.push(("main::2", 0x34));
+        pairs.push(("main::3", 0x38));
+        let addrs = addrs(&pairs);
+        let asm = select(&PIC18F4550, &m, &addrs, None);
+        assert!(
+            asm.contains("XORWF") && asm.contains("BTFSS") && asm.contains("INCF"),
+            "{pred} {ty} did not take the materializing signed chain:\n{asm}"
+        );
+        assert!(
+            !asm.contains("BOV "),
+            "{pred} {ty} still uses the overflow cascade:\n{asm}"
+        );
+        let words = asm::assemble_pic18(&asm);
+        for &((a, b), expect) in &cases {
+            let mut p = pic14_sim::Pic18::new(words.clone());
+            step_past_start(&mut p, start_steps(&asm));
+            for i in 0..bytes {
+                p.ram_mut()[0x20 + i] = (a >> (8 * i)) as u8;
+                p.ram_mut()[0x24 + i] = (b >> (8 * i)) as u8;
+            }
+            p.run(300);
+            assert_eq!(p.ram()[0x28], expect, "{pred} {ty} {a:#06x} vs {b:#06x}");
+        }
+    }
+}
+
 /// The 32-bit chain, fused, over the derived lane patterns that decide the
 /// high lane last (the shape a high-to-low chain gets wrong).
 #[test]
