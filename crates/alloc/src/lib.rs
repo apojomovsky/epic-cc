@@ -42,6 +42,13 @@ pub struct AllocLayout {
     /// sites. Empty on cores that copy, and whenever the set would not
     /// pay for its buffer.
     pub staged_consts: HashSet<String>,
+
+    /// Address-taken const globals (the pre-demotion `const_to_ram`
+    /// candidate set, staged members included): the pooled string
+    /// table's input. Flash-bound today; their uses resolve through
+    /// the pool from epic-cc#816 on (epic-cc#815).
+    pub address_taken_consts: HashSet<String>,
+
     /// Per-bank high-water bytes (both main and ISR contexts): the highest
     /// allocated address in each GPR bank minus the bank start, floored at
     /// 0. The allocator places sequentially from each bank start, so this
@@ -1411,6 +1418,9 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut fixed: Vec<(String, u16, u16)> = Vec::new(); // (name, addr, size)
     let mut floating: Vec<&ir::Global> = Vec::new();
     let mut const_to_ram: HashSet<String> = HashSet::new();
+    // The pool constructor's input (epic-cc#815): every address-taken
+    // const, captured before staging demotes its members below.
+    let mut address_taken_consts: HashSet<String> = HashSet::new();
     // Direct triggers: a const global named outright as a plain call arg
     // or an unfolding select arm. Derived triggers: reached through a
     // GEP/reg chain. The split feeds staging below.
@@ -1931,6 +1941,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 }
             }
         }
+        address_taken_consts = const_to_ram.clone();
         if staged.len() < 2 {
             staged.clear();
             stage_max = 0;
@@ -2261,6 +2272,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         total_bank0,
         const_globals,
         staged_consts: staged,
+        address_taken_consts,
         bank_used,
         isr_bytes,
         has_isr: !isr_names.is_empty(),

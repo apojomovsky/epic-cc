@@ -7246,6 +7246,95 @@ fn measure_end_org(text: &str) -> usize {
     org
 }
 
+/// One pooled-table chunk (epic-cc#815): concatenated member bytes with
+/// chunk-local ref offsets. Chunks never exceed 255 bytes, so every pool
+/// table takes the single-entry shape, never the multi-chunk one.
+pub struct PoolChunk {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub refs: Vec<(usize, String, u16)>,
+}
+
+/// Pooled flash string table: address-taken const bytes under one base,
+/// emitted alongside the per-const tables. Empty unless the driver was
+/// asked (`--const-pool`), so unflagged output is bit-identical.
+pub struct ConstPool {
+    pub chunks: Vec<PoolChunk>,
+}
+
+impl ConstPool {
+    pub fn empty() -> Self {
+        ConstPool { chunks: Vec::new() }
+    }
+
+    /// Synthesized table globals, one per chunk, for the per-const
+    /// emission path below: chunk labels, readers, page planning, and
+    /// the collision guard all treat them as ordinary const tables.
+    fn globals(&self) -> Vec<ir::Global> {
+        self.chunks
+            .iter()
+            .map(|c| ir::Global {
+                name: c.name.clone(),
+                ty: ir::Ty::I8,
+                is_const: true,
+                size: c.bytes.len() as u16,
+                bytes: c.bytes.clone(),
+                refs: c.refs.clone(),
+                addr: None,
+            })
+            .collect()
+    }
+}
+
+/// Build the pool (epic-cc#815): members in name order, byte-identical
+/// members (bytes plus member-local refs) pooled once, whole members
+/// greedy-packed into ≤255-byte chunks. Refs rebase to chunk-local
+/// offsets; targets and addends ride along, since LOW/HIGH literals
+/// resolve independently of where the bytes sit. Deterministic by
+/// construction: epic-cc#816 reuses this to resolve const to
+/// (chunk, offset). Non-flash candidates (mapped, pinned, empty, or
+/// over 255 bytes) never pool.
+pub fn build_pool(m: &Module, candidates: &HashSet<String>) -> ConstPool {
+    let mut names: Vec<&String> = candidates.iter().collect();
+    names.sort();
+    let mut chunks: Vec<PoolChunk> = Vec::new();
+    let mut seen: Vec<(Vec<u8>, Vec<(usize, String, u16)>)> = Vec::new();
+    for name in names {
+        let Some(g) = m.globals.iter().find(|g| &g.name == name) else {
+            continue;
+        };
+        if !g.is_const || g.addr.is_some() || g.bytes.is_empty() || g.bytes.len() > 255 {
+            continue;
+        }
+        if seen.iter().any(|(b, r)| *b == g.bytes && *r == g.refs) {
+            continue;
+        }
+        seen.push((g.bytes.clone(), g.refs.clone()));
+        let start_new = chunks
+            .last()
+            .map_or(true, |c: &PoolChunk| c.bytes.len() + g.bytes.len() > 255);
+        if start_new {
+            let n = chunks.len();
+            chunks.push(PoolChunk {
+                name: if n == 0 {
+                    "__const_pool".to_string()
+                } else {
+                    format!("__const_pool_{n}")
+                },
+                bytes: Vec::new(),
+                refs: Vec::new(),
+            });
+        }
+        let chunk = chunks.last_mut().expect("isel: pool chunk just pushed");
+        let base = chunk.bytes.len();
+        chunk.bytes.extend_from_slice(&g.bytes);
+        chunk
+            .refs
+            .extend(g.refs.iter().map(|(o, t, a)| (base + o, t.clone(), *a)));
+    }
+    ConstPool { chunks }
+}
+
 /// Select instructions for the whole module, producing PIC14 assembly text.
 ///
 /// `addrs` is the complete address map from `alloc`: globals by name, locals
@@ -7271,7 +7360,7 @@ fn measure_end_org(text: &str) -> usize {
 /// explicit set, so hand-mapped const call args keep today's behavior
 /// (a RAM copy if mapped, a loud panic if address-less).
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
-    select_with_locs(device, m, addrs, &HashSet::new()).0
+    select_with_locs(device, m, addrs, &HashSet::new(), &ConstPool::empty()).0
 }
 // A ref byte's operand: a RAM target's address half straight from the
 // alloc map (RAM globals have no assembler label to resolve, epic-cc#450
@@ -7310,6 +7399,7 @@ pub fn select_with_locs(
     m: &Module,
     addrs: &HashMap<String, u16>,
     staged: &HashSet<String>,
+    pool: &ConstPool,
 ) -> (String, Vec<Option<SrcLoc>>) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
@@ -7712,6 +7802,11 @@ pub fn select_with_locs(
         .iter()
         .filter(|g| g.is_const && !addrs.contains_key(&g.name))
         .collect();
+    // Pooled chunks table exactly like per-const tables from here on:
+    // reader pages, chunking, the collision guard, and both emission
+    // passes all reuse the per-const path (epic-cc#815).
+    let pool_globals = pool.globals();
+    consts.extend(pool_globals.iter());
     consts.sort_by_key(|g| g.name.clone());
     let table_start = page_next
         .last()

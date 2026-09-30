@@ -2499,7 +2499,13 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14 => {
-                let (asm, _) = isel::select_with_locs(device, &m, &addrs, &layout.staged_consts);
+                let (asm, _) = isel::select_with_locs(
+                    device,
+                    &m,
+                    &addrs,
+                    &layout.staged_consts,
+                    &isel::ConstPool::empty(),
+                );
                 let asm = banking::assign_banks(device, &asm);
                 let asm = peephole::optimize(&asm);
                 asm::assemble_file_to_hex(device, &asm)
