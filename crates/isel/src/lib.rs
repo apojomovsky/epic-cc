@@ -2787,18 +2787,15 @@ impl<'m> Gen<'m> {
     /// taking exactly that many instruction cycles (epic-cc#700). Counters
     /// are the retval bytes (`retval_lo..`, dead at a void call and saved
     /// across interrupts), so the fixed-region size never grows. A
-    /// non-constant argument panics: XC8 rejects it too.
+    /// non-constant argument panics: XC8 rejects it too. Parts without
+    /// common RAM address those bytes through bank 0's `isr_home_window`,
+    /// so the loop is pinned there explicitly (epic-cc#800).
     fn emit_delay(&mut self, c: &ir::Call) {
-        // Counters are common-RAM retval bytes (bank-independent, so the
-        // banking pass inserts nothing inside the loop). Parts with no
-        // common RAM (docs/39 bucket 1: F74 class) address the fixed
-        // region through a bank instead, which would pad the loop with
-        // selects: refuse loudly rather than drift off count.
-        assert!(
-            self.device.common_ram.is_some(),
-            "isel: _delay needs common RAM for its counters; {} has none",
-            self.device.name
-        );
+        // No common RAM: the counters live in banked `isr_home_window`,
+        // so the loop is pinned to bank 0 explicitly below. Banking
+        // tracks the pin and adds nothing inside the loop; the plan is
+        // solved for the pin's own 2 cycles less (epic-cc#800).
+        let pinned = self.device.common_ram.is_none();
         assert!(
             c.callees.is_empty(),
             "isel: _delay through a function pointer is not supported"
@@ -2825,7 +2822,19 @@ impl<'m> Gen<'m> {
                 args.len()
             ),
         };
-        let plan = iselcore::delay::plan_delay(cycles);
+        // The pin costs 2 cycles in every context, so the loop proper is
+        // planned for 2 less. Below the pin nothing is plannable: a bare
+        // pin already spends the whole budget.
+        if pinned {
+            assert!(
+                cycles >= 2,
+                "isel: _delay({cycles}) on {} needs at least 2 cycles for the bank-0 pin",
+                self.device.name
+            );
+            self.emit("    BCF 0x03,5".to_string());
+            self.emit("    BCF 0x03,6".to_string());
+        }
+        let plan = iselcore::delay::plan_delay(cycles - if pinned { 2 } else { 0 });
         let depth = plan.nests.iter().map(Vec::len).max().unwrap_or(0);
         assert!(
             depth <= 3,
