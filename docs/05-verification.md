@@ -160,6 +160,15 @@ commit) from those same tools, so the report never rots. XC8 comparisons
 render from the private epic-benchmarks repo through the same
 `scripts/size-report.py --xc8`.
 
+Micro-savings are invisible unless measured on the final packed image.
+Small code-word wins routinely vanish before the ladder: epic-cc#714
+removed 22 reload words for a net-zero row (page packing and alignment
+absorbed them), #732 found nothing reorderable in straight-line runs,
+and #805 fired exactly once. Price a density ticket on the ladder rows
+(`size_baseline.toml` through the e2e suite), never on listing diffs or
+profiler bucket deltas, and re-measure after every rebase: the padding
+baseline moves under you.
+
 ## Hardware-in-the-loop
 
 The final oracle is real silicon. HEX files can be flashed via MPLAB IPE. This is out of
