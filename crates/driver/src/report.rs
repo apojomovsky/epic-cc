@@ -138,8 +138,10 @@ pub struct FixedUses {
 /// The fixed bytes the module's lowering can touch, per core. Every arm
 /// mirrors an isel emission site, so a site missing here undercounts RAM:
 /// the `fixed_uses` e2e test scans emitted asm for fixed-range refs over
-/// the fixture corpus and fails any row the scan beats. Each predicate
-/// fires on shapes that MIGHT touch, so misses default to counted.
+/// the fixture corpus and fails any row the scan beats. Verbatim inline
+/// asm is outside the model: it can name any byte, fixed or otherwise.
+/// Each predicate fires on shapes that MIGHT touch, so misses default
+/// to counted.
 ///
 /// PIC18 (isel-pic18): valued calls load `retval_lo..`, `Ret` stores the
 /// same width, the `k - a` chain parks C0 in the flag bit, `_delay`
