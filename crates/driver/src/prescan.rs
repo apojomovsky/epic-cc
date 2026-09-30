@@ -1,9 +1,10 @@
 //! A cheap, clang-free scan for `EPIC_CONFIG("...")`'s argument and for
 //! `#pragma config` settings, run before any clang invocation so
 //! EPIC_FOSC_HZ can be added to every `-D` list from the start (docs/31
-//! §10). Comment- and string-literal-aware so a fuse string or a stray
-//! comment cannot make it misfire. Preprocessor-blind by design: `#if` arms
-//! never taken still count, the same contract as the config scanners.
+//! §10). Comment-, string- and char-literal-aware so a fuse string, a
+//! `'"'` initializer, or a stray comment cannot make it misfire.
+//! Preprocessor-blind by design: `#if` arms never taken still count,
+//! the same contract as the config scanners.
 //!
 //! clang drops unknown pragmas before the `.ll`, so `#pragma config NAME
 //! = VALUE` never survives to the compiled program: the driver recovers
@@ -36,8 +37,8 @@ pub struct FoundConfig {
 }
 
 /// Scan every source file's raw text for top-level `EPIC_CONFIG("...")`
-/// invocations, skipping line and block comments and `"..."` string
-/// literals along the way.
+/// invocations, skipping line and block comments plus `"..."` and
+/// `'...'` literals along the way.
 pub fn find_epic_configs(sources: &[(String, String)]) -> Vec<FoundConfig> {
     let mut out = Vec::new();
     for (file, text) in sources {
@@ -54,9 +55,9 @@ pub fn find_epic_configs(sources: &[(String, String)]) -> Vec<FoundConfig> {
 }
 
 /// Scan every source file's raw text for exactly one top-level
-/// `EPIC_CONFIG("...")` invocation, skipping `//` and `/* */` comments and
-/// `"..."` string literals along the way. Returns the quoted argument, or
-/// `None` if no invocation was found anywhere.
+/// `EPIC_CONFIG("...")` invocation, skipping `//` and `/* */` comments
+/// plus `"..."` and `'...'` literals along the way. Returns the quoted
+/// argument, or `None` if no invocation was found anywhere.
 /// Panics if more than one invocation is found across all files: this
 /// supports exactly one, unconditional, per docs/31 §10.
 pub fn find_epic_config(sources: &[(String, String)]) -> Option<String> {
@@ -191,33 +192,10 @@ fn find_in_one_file(text: &str) -> Vec<(String, u32, u32)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < b.len() {
-        // Skip // line comments.
-        if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-            continue;
-        }
-        // Skip /* block comments */.
-        if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
-            continue;
-        }
-        // Skip "string literals", so a comment delimiter or the word
-        // EPIC_CONFIG inside one is not mistaken for real source.
-        if b[i] == b'"' {
-            i += 1;
-            while i < b.len() && b[i] != b'"' {
-                if b[i] == b'\\' {
-                    i += 1;
-                }
-                i += 1;
-            }
-            i += 1;
+        // Trivia (comments, strings, char literals) cannot hold a real
+        // invocation; one shared helper skips all of it.
+        if let Some(j) = skip_trivia(b, i) {
+            i = j;
             continue;
         }
         if text[i..].starts_with("EPIC_CONFIG") {
@@ -240,8 +218,9 @@ fn find_in_one_file(text: &str) -> Vec<(String, u32, u32)> {
     out
 }
 
-/// If offset `i` opens a line comment, a block comment, or a `"..."`
-/// string literal, the offset just past it; otherwise `None`.
+/// If offset `i` opens a line comment, a block comment, a `"..."`
+/// string literal, or a `'...'` character literal, the offset just
+/// past it; otherwise `None`.
 fn skip_trivia(b: &[u8], i: usize) -> Option<usize> {
     // A `//` line comment runs to the newline.
     if b[i] == b'/' && b.get(i + 1) == Some(&b'/') {
@@ -270,6 +249,26 @@ fn skip_trivia(b: &[u8], i: usize) -> Option<usize> {
             j += 1;
         }
         return Some((j + 1).min(b.len()));
+    }
+    // A character literal hides a quote-like byte (`'"'`) the same way a
+    // string does. A `'` right after a digit is a C23 digit separator
+    // (`4'000'000`), which the integer parse already accepts, so it never
+    // opens a literal. The scan stays on this line: an unterminated `'`
+    // is not a literal either.
+    if b[i] == b'\'' && (i == 0 || !b[i - 1].is_ascii_digit()) {
+        let mut j = i + 1;
+        while j < b.len() && b[j] != b'\'' && b[j] != b'\n' {
+            if b[j] == b'\\' {
+                j += 1;
+                if j < b.len() && b[j] == b'\n' {
+                    break;
+                }
+            }
+            j += 1;
+        }
+        if b.get(j) == Some(&b'\'') {
+            return Some(j + 1);
+        }
     }
     None
 }
@@ -494,8 +493,9 @@ pub struct XtalFreq {
 }
 
 /// The last live `#define _XTAL_FREQ` across all sources, if any.
-/// Comment-, string- and line-aware like the other scanners; definitions
-/// and `#undef`s fold in order with last-wins, matching the preprocessor.
+/// Comment-, string-, char- and line-aware like the other scanners;
+/// definitions and `#undef`s fold in order with last-wins, matching the
+/// preprocessor.
 pub fn find_xtal_freq(sources: &[(String, String)]) -> Option<XtalFreq> {
     let mut out: Option<XtalFreq> = None;
     for (file, text) in sources {
@@ -658,13 +658,14 @@ fn strip_comments(text: &str, line: &str) -> String {
     let mut out = line.to_string().into_bytes();
     let mut i = 0;
     while i < out.len() {
-        if let Some(j) = skip_trivia(&b[base + i..], 0) {
-            for k in i..i + j {
+        // Absolute index: the `'` look-behind needs the real predecessor.
+        if let Some(end) = skip_trivia(b, base + i) {
+            for k in i..end - base {
                 if out[k] != b'\n' {
                     out[k] = b' ';
                 }
             }
-            i += j;
+            i = end - base;
             continue;
         }
         i += 1;
