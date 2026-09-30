@@ -33,7 +33,7 @@ pub struct Cli {
 }
 
 pub const USAGE: &str = "\
-usage: epic-cc [options] <input.c>...
+usage: epic-cc [options] <input.c|input.cpp>...
 
   -o <file>            output file (default: a.hex)
   -I <dir>             include path, repeatable, forwarded to clang

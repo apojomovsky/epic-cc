@@ -81,7 +81,8 @@ const PASSES: &str =
 
 /// Symbols `internalize` must never touch:
 ///
-/// - `main` (the whole program's one entry point) and every
+/// - The program entry: `main`, or its C++-mangled form `_Z4mainv` (what
+///   `int main()` lowers to on the `.cpp` path, epic-cc#457), and every
 ///   `msp430_intrcc` interrupt handler (the vector table's entry points,
 ///   `irparse` identifies them the same way, by that calling-convention
 ///   token on the `define` line).
@@ -104,6 +105,14 @@ const PASSES: &str =
 ///   outside the compiled image, a channel no IR-level analysis can see. A
 ///   `constant` global has no such hazard, nothing ever writes it by
 ///   construction, so those stay eligible (epic-cc#133).
+
+/// Entry-point name: plain `main`, or the C++-mangled `_Z4mainv` the `.cpp`
+/// path emits for `int main()` (epic-cc#457). Both match sites share it so
+/// the mangled entry gets the same `internalize` protection as `main`.
+fn is_entry_name(name: &str) -> bool {
+    name == "main" || name == "_Z4mainv"
+}
+
 fn public_api(ll_text: &str) -> Vec<String> {
     let mut api = Vec::new();
     for line in ll_text.lines() {
@@ -117,7 +126,10 @@ fn public_api(ll_text: &str) -> Vec<String> {
             let name = &line[name_start..name_end];
             let variadic =
                 line.contains(", ...)") || line[name_end..].trim_start().starts_with("(...)");
-            if name == "main" || line.split_whitespace().any(|t| t == "msp430_intrcc") || variadic {
+            if is_entry_name(name)
+                || line.split_whitespace().any(|t| t == "msp430_intrcc")
+                || variadic
+            {
                 api.push(name.to_string());
             }
         } else if line.starts_with('@') && line.split_whitespace().any(|t| t == "global") {
@@ -134,10 +146,11 @@ fn public_api(ll_text: &str) -> Vec<String> {
     api
 }
 
-/// One `define`d function's name, entry-point status (`main` or a
-/// `msp430_intrcc` ISR), and line range `[start, end]` (the `define`
-/// line through its closing `}`, which clang always emits alone on its
-/// own unindented line, never sharing a line with a struct-literal `}`).
+/// One `define`d function's name, entry-point status (the C `main` or the
+/// C++ `_Z4mainv`, or a `msp430_intrcc` ISR), and line range `[start, end]`
+/// (the `define` line through its closing `}`, which clang always emits
+/// alone on its own unindented line, never sharing a line with a
+/// struct-literal `}`).
 struct FuncSpan {
     name: String,
     is_entry: bool,
@@ -159,7 +172,7 @@ fn function_spans(lines: &[&str]) -> Vec<FuncSpan> {
                     .unwrap_or(line.len());
                 let name = line[name_start..name_end].to_string();
                 let is_entry =
-                    name == "main" || line.split_whitespace().any(|t| t == "msp430_intrcc");
+                    is_entry_name(&name) || line.split_whitespace().any(|t| t == "msp430_intrcc");
                 let start = i;
                 let mut j = i + 1;
                 while j < lines.len() && lines[j] != "}" {
@@ -466,6 +479,33 @@ define dso_local i16 @main() #0 {
     fn public_api_empty_without_main() {
         let ll = "define dso_local void @helper() #0 {\n}\n";
         assert!(public_api(ll).is_empty());
+    }
+
+    #[test]
+    fn public_api_keeps_mangled_cpp_entry() {
+        let ll = "\
+define dso_local noundef i16 @_Z4mainv() #0 {
+}
+define dso_local void @helper() #0 {
+}
+";
+        assert_eq!(public_api(ll), vec!["_Z4mainv".to_string()]);
+        let lines: Vec<&str> = ll.lines().collect();
+        let spans = function_spans(&lines);
+        assert!(
+            spans
+                .iter()
+                .find(|s| s.name == "_Z4mainv")
+                .expect("span")
+                .is_entry
+        );
+        assert!(
+            !spans
+                .iter()
+                .find(|s| s.name == "helper")
+                .expect("span")
+                .is_entry
+        );
     }
 
     #[test]
