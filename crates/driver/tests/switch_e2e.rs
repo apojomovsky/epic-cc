@@ -5,8 +5,21 @@
 // - fallthrough (case 1 falls into case 2) behaves like the equivalent
 //   if/else chain (by construction the lowering is the if/else chain).
 
-use std::collections::HashMap;
 use std::process::Command;
+
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
 
 fn expected(v: u8) -> u8 {
     let r: u8 = match v {
@@ -28,11 +41,14 @@ fn expected(v: u8) -> u8 {
 
 fn run_one(device: &str, v: u8) {
     let hex_path = format!("tests/fixtures/switch_{device}.hex");
+    let map_path = format!("tests/fixtures/switch_{device}.map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/switch.c",
             "-o",
             &hex_path,
+            "--map",
+            &map_path,
             "--device",
             device,
         ])
@@ -44,26 +60,13 @@ fn run_one(device: &str, v: u8) {
         String::from_utf8_lossy(&out.stderr)
     );
     let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).unwrap();
+    let _ = std::fs::remove_file(&map_path);
+    // The p18 driver run above already gates alloc+isel success; only
+    // the PIC14 sim asserts values.
     if device == "p16f877a" {
-        let (clang, resdir) = driver::clang::pic_clang_from_env();
-        let ll_text = driver::clang::compile_to_stdout(
-            &clang,
-            &resdir,
-            std::path::Path::new("tests/fixtures/switch.c"),
-            &driver::clang::Options::default(),
-        );
-        let mut m = irparse::parse_ll(&ll_text);
-        m = wholeprog::merge(m);
-        m = legalize::legalize(m);
-        let cg = callgraph::build(&m);
-        let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-        let mut addrs: HashMap<String, u16> = HashMap::new();
-        addrs.extend(layout.globals.clone());
-        addrs.extend(layout.locals.clone());
-        let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-        let _ = banking::assign_banks(&device::PIC16F877A, &asm);
-        let in_addr = *layout.globals.get("in").unwrap() as usize;
-        let out_addr = *layout.globals.get("out").unwrap() as usize;
+        let in_addr = map_addr(&map, "in");
+        let out_addr = map_addr(&map, "out");
         let prog = pic14_sim::parse_hex(&hex);
         let mut p = pic14_sim::Pic14::new(prog);
         p.ram_mut()[in_addr] = v;
@@ -76,24 +79,6 @@ fn run_one(device: &str, v: u8) {
             p.ram()[out_addr]
         );
         assert!(p.halted());
-    } else {
-        // p18: ensure alloc+isel succeeds (sim gate lives in PIC14)
-        let (clang, resdir) = driver::clang::pic_clang_from_env();
-        let ll_text = driver::clang::compile_to_stdout(
-            &clang,
-            &resdir,
-            std::path::Path::new("tests/fixtures/switch.c"),
-            &driver::clang::Options::default(),
-        );
-        let mut m = irparse::parse_ll(&ll_text);
-        m = wholeprog::merge(m);
-        m = legalize::legalize(m);
-        let cg = callgraph::build(&m);
-        let layout = alloc::allocate(&device::PIC18F4550, &m, &callgraph::edges_text(&cg));
-        let mut addrs: HashMap<String, u16> = HashMap::new();
-        addrs.extend(layout.globals.clone());
-        addrs.extend(layout.locals.clone());
-        let _asm = isel_pic18::select(&device::PIC18F4550, &m, &addrs, layout.isr_low_save);
     }
     let _ = std::fs::remove_file(&hex_path);
 }

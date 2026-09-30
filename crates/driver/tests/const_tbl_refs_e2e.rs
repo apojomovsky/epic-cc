@@ -11,22 +11,18 @@
 use std::collections::HashMap;
 use std::process::Command;
 
-fn layout_for(fixture: &str) -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new(fixture),
-        &driver::clang::Options::default(),
-    );
-    let m = irparse::parse_ll(&ll_text);
-    let mut m = wholeprog::merge(m);
-    // Mirror main.rs exactly: the pass drops the forwarded load slot, which
-    // moves the frame overlay, so addresses must come from post-pass IR.
-    driver::const_runs::run(&mut m, device::Core::Pic18);
-    let m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    alloc::allocate(&device::PIC18F4550, &m, &callgraph::edges_text(&cg))
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 fn asm_for(fixture: &str) -> String {
@@ -59,15 +55,17 @@ fn main_body<'a>(asm: &'a str) -> &'a str {
 }
 
 fn run_hex(fixture: &str) -> (Vec<u8>, HashMap<String, u16>) {
-    let layout = layout_for(fixture);
     let hex_path = std::env::temp_dir().join(format!(
         "const_tbl_refs_{}_{}.hex",
         std::process::id(),
         fixture.replace('/', "_")
     ));
+    let map_path = hex_path.with_extension("map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--device", "p18f4550", "-o"])
         .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
         .arg(fixture)
         .output()
         .expect("run driver");
@@ -77,12 +75,17 @@ fn run_hex(fixture: &str) -> (Vec<u8>, HashMap<String, u16>) {
         String::from_utf8_lossy(&out.stderr)
     );
     let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).expect("read map");
     let _ = std::fs::remove_file(&hex_path);
+    let _ = std::fs::remove_file(&map_path);
     let prog = pic14_sim::parse_hex_pic18(&hex);
     let mut p = pic14_sim::Pic18::new(prog);
     p.run(400_000);
     assert!(p.halted(), "{fixture} must halt");
-    (p.ram().to_vec(), layout.globals.clone())
+    let mut globals = HashMap::new();
+    globals.insert("called".to_string(), map_addr(&map, "called") as u16);
+    globals.insert("sink".to_string(), map_addr(&map, "sink") as u16);
+    (p.ram().to_vec(), globals)
 }
 
 #[test]

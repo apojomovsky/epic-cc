@@ -26,48 +26,31 @@
 //! The map classifies the runtime address slots as ordinary RAM locals; the
 //! table stays const (flash): `irq_table` has no RAM address.
 
-use std::collections::HashMap;
 use std::process::Command;
 
-fn runtime_sfr_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/runtime_sfr.c"),
-        &driver::clang::Options::default(),
-    );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-    let _ = peephole::optimize(&asm);
-    layout
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn runtime_sfr_shapes_read_and_write_the_right_address() {
-    let layout = runtime_sfr_layout();
-    let addr = |n: &str| *layout.globals.get(n).expect(n) as usize;
-
-    // The table stays const (flash): no RAM allocation.
-    assert!(
-        !layout.globals.contains_key("irq_table"),
-        "irq_table must stay in flash (no RAM address)"
-    );
-
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/runtime_sfr.c",
             "-o",
             "tests/fixtures/runtime_sfr.hex",
+            "--map",
+            "tests/fixtures/runtime_sfr.map",
             "--device",
             "p16f877a",
         ])
@@ -80,6 +63,16 @@ fn runtime_sfr_shapes_read_and_write_the_right_address() {
     );
 
     let hex = std::fs::read_to_string("tests/fixtures/runtime_sfr.hex").unwrap();
+    let map = std::fs::read_to_string("tests/fixtures/runtime_sfr.map").unwrap();
+    let _ = std::fs::remove_file("tests/fixtures/runtime_sfr.map");
+    let addr = |n: &str| map_addr(&map, n);
+
+    // The table stays const (flash): no RAM allocation.
+    assert!(
+        !map.lines().any(|l| l.starts_with("global irq_table 0x")),
+        "irq_table must stay in flash (no RAM address)"
+    );
+
     let prog = pic14_sim::parse_hex(&hex);
 
     // irq = 0 (RB, INTCON): INTCON preloaded with RBIF; PIR1/PIR2 idle.

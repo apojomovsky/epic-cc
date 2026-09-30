@@ -6,7 +6,24 @@
 
 use std::process::Command;
 
-fn layout_for(device: &device::Device, fixture: &str) -> alloc::AllocLayout {
+/// `cfg` and `ep`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
+
+/// The descriptors keep their wire sizes in IR (`cfg` 9, `ep` 14); the
+/// RAM addresses below come from the binary's `--map`, not a second
+/// pipeline.
+fn assert_wire_sizes(fixture: &str) {
     let (clang, resdir) = driver::clang::pic_clang_from_env();
     let ll_text = driver::clang::compile_to_stdout(
         &clang,
@@ -33,23 +50,19 @@ fn layout_for(device: &device::Device, fixture: &str) -> alloc::AllocLayout {
             .expect("ep global");
         assert_eq!(gep.size, 14, "two endpoint descriptors stride 7");
     }
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
-    layout
 }
 
 #[test]
 fn pic18_struct_wire_format() {
     let fixture = "tests/fixtures/struct_wire_pic18.c";
-    let layout = layout_for(&device::PIC18F4550, fixture);
-    let addr = |n: &str| *layout.globals.get(n).expect(n) as usize;
+    assert_wire_sizes(fixture);
 
     let hex_name = "tests/fixtures/struct_wire_pic18_p18f4550.hex";
+    let map_name = "tests/fixtures/struct_wire_pic18_p18f4550.map";
     let output = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-        .args([fixture, "-o", hex_name, "--device", "p18f4550"])
+        .args([
+            fixture, "-o", hex_name, "--map", map_name, "--device", "p18f4550",
+        ])
         .output()
         .expect("run driver");
     assert!(
@@ -57,6 +70,10 @@ fn pic18_struct_wire_format() {
         "driver failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+
+    let map = std::fs::read_to_string(map_name).expect("read map");
+    let _ = std::fs::remove_file(map_name);
+    let addr = |n: &str| map_addr(&map, n);
 
     let hex = std::fs::read_to_string(hex_name).unwrap();
     let prog = pic14_sim::parse_hex_pic18(&hex);

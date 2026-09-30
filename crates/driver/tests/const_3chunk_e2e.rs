@@ -22,30 +22,20 @@
 //!   o16_1 = t16b[128]  = 0x1080 (byte 256, chunk 1 — scale-2 carry)
 //!   o16_2 = t16b[256]  = 0x1100 (byte 512, chunk 2 — scale-2 hi-byte carry!)
 
-use std::collections::HashMap;
 use std::process::Command;
 
-fn three_chunk_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/const_3chunk.c"),
-        &driver::clang::Options::default(),
-    );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-    let _ = peephole::optimize(&asm);
-    layout
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 fn read_le4(ram: &[u8], addr: usize) -> u32 {
@@ -58,19 +48,13 @@ fn read_le4(ram: &[u8], addr: usize) -> u32 {
 
 #[test]
 fn three_chunk_const_tables_run_correctly() {
-    let layout = three_chunk_layout();
-    let in_addr = *layout.globals.get("in").expect("in global") as usize;
-    let a = |n: &str| *layout.globals.get(n).expect(n) as usize;
-    let out8 = a("out8");
-    let o16_0 = a("o16_0");
-    let o16_1 = a("o16_1");
-    let o16_2 = a("o16_2");
-
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/const_3chunk.c",
             "-o",
             "tests/fixtures/const_3chunk.hex",
+            "--map",
+            "tests/fixtures/const_3chunk.map",
             "--device",
             "p16f877a",
         ])
@@ -83,6 +67,15 @@ fn three_chunk_const_tables_run_correctly() {
     );
 
     let hex = std::fs::read_to_string("tests/fixtures/const_3chunk.hex").unwrap();
+    let map = std::fs::read_to_string("tests/fixtures/const_3chunk.map").expect("read map");
+    let _ = std::fs::remove_file("tests/fixtures/const_3chunk.map");
+    let in_addr = map_addr(&map, "in");
+    let a = |n: &str| map_addr(&map, n);
+    let out8 = a("out8");
+    let o16_0 = a("o16_0");
+    let o16_1 = a("o16_1");
+    let o16_2 = a("o16_2");
+
     let prog = pic14_sim::parse_hex(&hex);
     let mut p = pic14_sim::Pic14::new(prog);
     p.ram_mut()[in_addr] = 0x22; // in = 290

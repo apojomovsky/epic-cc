@@ -12,50 +12,45 @@
 //! the quotient's last bits).
 use std::process::Command;
 
-fn float_isr_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let opts = driver::clang::Options {
-        defines: driver::predef::xc8_predefines(device::Core::Pic18, device::PIC18F4550.name),
-        ..Default::default()
-    };
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/float_isr.c"),
-        &opts,
-    );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    callgraph::check_depth(&cg, device::PIC18F4550.stack_depth as usize);
-    alloc::allocate(&device::PIC18F4550, &m, &callgraph::edges_text(&cg))
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn float_isr_preempts_main_mid_op_without_corruption() {
-    let layout = float_isr_layout();
-    let addr = |name: &str| *layout.globals.get(name).expect("global") as usize;
-    let out = addr("out");
-
-    let out_p = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/float_isr.c",
             "-o",
             "tests/fixtures/float_isr.hex",
+            "--map",
+            "tests/fixtures/float_isr.map",
             "--device",
             "p18f4550",
         ])
         .output()
         .expect("run driver");
     assert!(
-        out_p.status.success(),
+        out.status.success(),
         "driver: {}",
-        String::from_utf8_lossy(&out_p.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
 
     let hex = std::fs::read_to_string("tests/fixtures/float_isr.hex").unwrap();
+    let map = std::fs::read_to_string("tests/fixtures/float_isr.map").expect("read map");
+    let _ = std::fs::remove_file("tests/fixtures/float_isr.map");
+    let out_addr = map_addr(&map, "out");
+
     let prog = pic14_sim::parse_hex_pic18(&hex);
     let mut p = pic14_sim::Pic18::new(prog);
 
@@ -89,10 +84,10 @@ fn float_isr_preempts_main_mid_op_without_corruption() {
     // out = 34.0333328 = 0x42082222, LE 22 22 08 42: bit-exact despite the
     // ISR running its own float adds inside main's divide.
     let got = u32::from_le_bytes([
-        p.ram()[out],
-        p.ram()[out + 1],
-        p.ram()[out + 2],
-        p.ram()[out + 3],
+        p.ram()[out_addr],
+        p.ram()[out_addr + 1],
+        p.ram()[out_addr + 2],
+        p.ram()[out_addr + 3],
     ]);
     assert_eq!(got, 0x4208_2222, "main's float chain must be unperturbed");
 }
