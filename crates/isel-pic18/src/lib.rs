@@ -179,6 +179,13 @@ struct Gen<'m> {
     /// pointer value an already-resolved access still depends on -- see
     /// `invalidate_fsr0_if_slot_written`).
     fsr0_holds: Option<(Fsr0Origin, u16)>,
+    /// What `TBLPTR` points at, if known: `Some((table, off))`. Lets a later
+    /// const read from the same table at `off` skip its 6-word seed and walk
+    /// on with `TBLRD*+` (epic-cc#745). `None` at module start, after a label
+    /// or `CALL` (the `fsr0_holds` join rule), or after a dynamically indexed
+    /// read. The ISR prologue saves `TBLPTR`/`TABLAT`, so a walked sequence
+    /// survives interrupts like the memcpy walk does (epic-cc#492).
+    tblptr_holds: Option<(String, u16)>,
     /// Direct-to-direct `MOVFF` byte copies staged by `emit_copy_byte`,
     /// drained as straight MOVFFs or, once long enough, as one
     /// LFSR-seeded POSTINC copy loop (epic-cc#486). Each entry carries
@@ -455,21 +462,18 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// Emit a label line and clear the tracked `BSR` and `FSR0` state.
-    /// Every label joins paths with different `MOVLB`/FSR0 histories, so
-    /// reusing a stale tracked bank or FSR0 position miscompiles: the
-    /// reset stays structural here rather than repeated at each call site.
-    /// `CALL` returns join the same way but are not labels, so the call
-    /// arm clears `self.bsr`/`self.fsr0_holds` directly after emitting `CALL`.
-    /// A recorded forward join (`note_branch`) restores agreement: the
-    /// fall-through state always joins the recorded branch states, and a
-    /// dead fall-through can only add agreement, never break it, so it
-    /// joins unconditionally.
+    /// Emit a label line and clear the tracked `BSR`, `FSR0`, and `TBLPTR`
+    /// state. Every label joins paths with different histories, so reusing
+    /// a stale tracked position miscompiles: the reset stays structural here
+    /// rather than repeated at each call site. `CALL` returns join the same
+    /// way but are not labels, so the call arm clears the tracked state
+    /// directly after emitting `CALL`.
     fn emit_label(&mut self, label: &str) {
         let fall = self.bsr;
         self.emit(format!("{label}:"));
         self.bsr = None;
         self.fsr0_holds = None;
+        self.tblptr_holds = None;
         if let Some(agreed) = self.fwd_join.remove(label) {
             // The fall-through state always joins the recorded branch
             // states. A dead fall-through (previous line unconditional)
@@ -2209,7 +2213,7 @@ impl<'m> Gen<'m> {
         // an indirect source (epic-cc#143); a flash source has no RAM
         // address and seeds `TBLPTR` instead.
         if let Some((table, k, terms)) = self.const_base_of(&mc.src) {
-            self.emit_tblptr_setup(&table, k, &terms, byte_off);
+            self.emit_tblptr_setup_shared(&table, k, &terms, byte_off);
             return (McSrc::Tblrd, self.emit_ptr_setup(&mc.dst, byte_off));
         }
         let src_direct = self.emit_memcpy_src_setup(&mc.src, byte_off);
@@ -2280,19 +2284,21 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVFF {s}, {d}"));
             }
             (McSrc::Tblrd, Addr::Direct(d)) => {
-                self.emit(if walk {
-                    "    TBLRD*+".to_string()
-                } else {
-                    "    TBLRD*".to_string()
-                });
+                // Flash reads always walk: `TBLRD*+` costs the same word as
+                // `TBLRD*` and leaves `TBLPTR` on the next byte, so a later
+                // adjacent const read shares the seed (epic-cc#745). `walk`
+                // still picks the destination side for the other arms.
+                self.emit("    TBLRD*+".to_string());
+                if let Some((_, off)) = self.tblptr_holds.as_mut() {
+                    *off = off.wrapping_add(1);
+                }
                 self.emit(format!("    MOVFF 0xFF5, 0x{d:03X}"));
             }
             (McSrc::Tblrd, Addr::Indirect) => {
-                self.emit(if walk {
-                    "    TBLRD*+".to_string()
-                } else {
-                    "    TBLRD*".to_string()
-                });
+                self.emit("    TBLRD*+".to_string());
+                if let Some((_, off)) = self.tblptr_holds.as_mut() {
+                    *off = off.wrapping_add(1);
+                }
                 let d = if walk && !last { "0xFEE" } else { "0xFEF" }; // POSTINC0 : INDF0
                 self.emit(format!("    MOVFF 0xFF5, {d}"));
             }
@@ -2875,6 +2881,41 @@ impl<'m> Gen<'m> {
         self.emit_tblptr_static(table, k, byte_off);
         self.add_dynamic_to_tblptr(terms);
     }
+    /// Seed `TBLPTR` for `(table, k + byte_off)` unless it already points
+    /// there from the previous const read, then the 6-word static seed is
+    /// skipped and the caller walks on with `TBLRD*+` (epic-cc#745). Only
+    /// static reads share: a dynamic term or chain seed clears the tracked
+    /// state and seeds from scratch. Records the position either way, so
+    /// the next adjacent read can share in turn.
+    fn emit_tblptr_setup_shared(
+        &mut self,
+        table: &str,
+        k: u16,
+        terms: &[(u16, String)],
+        byte_off: u8,
+    ) {
+        if !terms.is_empty() {
+            self.emit_tblptr_setup(table, k, terms, byte_off);
+            self.tblptr_holds = None;
+            return;
+        }
+        let want = k.wrapping_add(u16::from(byte_off));
+        if self
+            .tblptr_holds
+            .as_ref()
+            .is_some_and(|(t, off)| t == table && *off == want)
+        {
+            return;
+        }
+        self.emit_tblptr_static(table, k, byte_off);
+        self.tblptr_holds = Some((table.to_string(), want));
+    }
+
+    /// Record that a `TBLRD*+` just advanced `TBLPTR` past table byte `off`,
+    /// so a later read of the next byte can share the seed.
+    fn note_tblptr_walked(&mut self, table: &str, off: u16) {
+        self.tblptr_holds = Some((table.to_string(), off.wrapping_add(1)));
+    }
 
     /// `TBLPTR = table_base + static_part + scale*idx` for a big-enough
     /// stride: zero-seed the triple, run the shift-add chain directly on
@@ -2942,11 +2983,11 @@ impl<'m> Gen<'m> {
         }
     }
 
-    /// One `const` (flash) byte read: `TBLPTR = table_base + k + Σ terms +
-    /// byte_off`, `TBLRD*` (no auto-increment: per-byte re-setup keeps
-    /// every read independent, mirroring the pointer lowering's per-byte FSR0 re-setup), then
-    /// `MOVFF TABLAT, dst`. Multi-byte loads call this once per byte with
-    /// an increasing `byte_off`.
+    /// One `const` (flash) byte read: `TBLPTR = table_base + k + terms +
+    /// byte_off`, then `TABLAT` to `dst`. Static reads share one seed across
+    /// adjacent bytes and walk with `TBLRD*+`; dynamic reads keep the old
+    /// per-byte seed with `TBLRD*`. Multi-byte loads call this once per byte
+    /// with an increasing `byte_off`.
     fn emit_const_load_byte(
         &mut self,
         table: &str,
@@ -2960,8 +3001,13 @@ impl<'m> Gen<'m> {
             "isel-pic18: multi-term dynamic pointer offsets not yet supported (P4 scope; {} terms)",
             terms.len()
         );
-        self.emit_tblptr_setup(table, k, terms, byte_off);
-        self.emit("    TBLRD*".to_string());
+        self.emit_tblptr_setup_shared(table, k, terms, byte_off);
+        if terms.is_empty() {
+            self.emit("    TBLRD*+".to_string());
+            self.note_tblptr_walked(table, k.wrapping_add(u16::from(byte_off)));
+        } else {
+            self.emit("    TBLRD*".to_string());
+        }
         self.emit_copy_byte(0xFF5, dst); // TABLAT -> dst
     }
 
@@ -4190,6 +4236,7 @@ impl<'m> Gen<'m> {
                     // accesses (epic-cc#472). (epic-cc#495)
                     self.bsr = self.exit_banks.get(&c.func).copied().flatten();
                     self.fsr0_holds = None;
+                    self.tblptr_holds = None;
                     if let Some(d) = &c.dst {
                         let ty = c.ty.expect("isel-pic18: valued call must carry a type");
                         let dst = self.slot_addr(self.cur_func, d).direct();
@@ -4229,6 +4276,15 @@ impl<'m> Gen<'m> {
                         {
                             if let Addr::Direct(d) = dst0 {
                                 self.emit_const_copy_loop(d, n);
+                                // The loop walks `TBLRD*+` over bytes
+                                // `k..k+n`, so `TBLPTR` ends one past the
+                                // last byte for the next adjacent read.
+                                // Dynamic terms leave no static position.
+                                if let Some((table, k, terms)) = self.const_base_of(&mc.src) {
+                                    self.tblptr_holds = terms
+                                        .is_empty()
+                                        .then(|| (table, k.wrapping_add(u16::from(n))));
+                                }
                             }
                             return;
                         }
@@ -4319,6 +4375,7 @@ impl<'m> Gen<'m> {
             // exit bank carries, an unknown one clears.
             self.bsr = *exit;
             self.fsr0_holds = None;
+            self.tblptr_holds = None;
             self.emit(format!("    BRA {l_done}"));
             self.emit_label(&l_next);
         }
@@ -8137,6 +8194,7 @@ pub fn select_with_locs(
             bsr_dirty: false,
             exit_banks: &exits,
             fsr0_holds: None,
+            tblptr_holds: None,
             pending_copies: Vec::new(),
             cur_func: &f.name,
             global_addrs: &global_addrs,
@@ -8764,6 +8822,7 @@ pub fn select_with_locs(
                 bsr_dirty: false,
                 exit_banks: &exits,
                 fsr0_holds: None,
+                tblptr_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: &f.name,
                 global_addrs: &global_addrs,
@@ -9074,6 +9133,7 @@ mod tests {
                 bsr_dirty: false,
                 exit_banks: &exits,
                 fsr0_holds: None,
+                tblptr_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
@@ -9100,6 +9160,7 @@ mod tests {
                 bsr_dirty: false,
                 exit_banks: &exits,
                 fsr0_holds: None,
+                tblptr_holds: None,
                 pending_copies: Vec::new(),
                 cur_func: "f",
                 global_addrs: empty_global_addrs(),
@@ -9141,6 +9202,7 @@ mod p3_gen_tests {
             bsr_dirty: false,
             exit_banks: exits,
             fsr0_holds: None,
+            tblptr_holds: None,
             pending_copies: Vec::new(),
             cur_func: "main",
             global_addrs: empty_global_addrs(),
