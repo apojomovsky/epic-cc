@@ -6,7 +6,8 @@
 
 use device::PIC18F4550;
 use fuzz::{
-    generate, generate_float, generate_ir, generate_signed, run_differential, run_ir_differential,
+    generate, generate_float, generate_ir, generate_signed, run_differential,
+    run_differential_with_profile, run_ir_differential,
 };
 
 #[test]
@@ -20,6 +21,21 @@ fn pic18_integer_fast_corpus_differential_clean() {
         }
     }
     assert_eq!(clean, 8, "all 8 integer seeds clean");
+}
+
+#[test]
+fn pic18_integer_fast_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the PIC18 gate (epic-cc#839): same fast integer
+    // seeds under the speed profile.
+    let mut clean = 0usize;
+    for seed in 0..8 {
+        let prog = generate(seed);
+        match run_differential_with_profile(&prog, &PIC18F4550, Some("O2")) {
+            Ok(_) => clean += 1,
+            Err(e) => panic!("pic18 integer seed {seed} not differential-clean under -O2: {e}"),
+        }
+    }
+    assert_eq!(clean, 8, "all 8 integer seeds clean under -O2");
 }
 
 #[test]
