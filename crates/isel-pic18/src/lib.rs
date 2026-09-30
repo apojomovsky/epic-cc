@@ -622,7 +622,12 @@ impl<'m> Gen<'m> {
         }
         // The signed chain re-reads both high bytes in its sign check, so
         // SFR operands and address-math rhs loads keep the cascade; fusion
-        // has no cascade lowering, so decline those too.
+        // has no cascade lowering, so decline those too. A same-block
+        // single-use load feeding the compare is fine to fuse: the lanes
+        // then read a GPR global twice, and GPR reads have no side
+        // effects (only SFRs do, and those never fuse). The rewrite that
+        // could expose an SFR global directly keeps slot reads instead
+        // (see `fused_chain_sources`).
         if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
             && !g.signed_chain_ok(&c.a, &c.b, c.ty.bytes() - 1)
         {
@@ -685,6 +690,17 @@ impl<'m> Gen<'m> {
                 continue;
             };
             if g.addrs.get(name).is_none() || g.global_is_const(name) {
+                continue;
+            }
+            // A signed ordering compare re-reads the high byte (sign check
+            // plus chain), so a load from an SFR global must stay a slot
+            // read: rewriting it to a direct global read would turn one IR
+            // read into two machine reads of a side-effecting register.
+            // GPR globals read twice are side-effect free (only torn reads,
+            // the cascade's own class), so only the SFR floor declines.
+            if matches!(c.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
+                && g.addrs.get(name).is_some_and(|a| *a >= PIC18_SFR_ACCESS_LO)
+            {
                 continue;
             }
             let users = f
