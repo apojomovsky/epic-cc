@@ -9445,6 +9445,18 @@ fn staged_const_call_args_deliver_table_bytes_in_sim() {
     let mut addrs = layout.globals.clone();
     addrs.extend(layout.locals.clone());
     let asm = isel::select_with_locs(&PIC16F877A, &m, &addrs, &layout.staged_consts).0;
+    for name in ["a", "b"] {
+        let start = asm
+            .find(&format!("__stage_{name}:\n"))
+            .expect("staging routine label");
+        let end = asm[start..].find("\n    RETURN").expect("routine end") + start;
+        let routine = &asm[start..end];
+        assert_eq!(
+            routine.matches(&format!("CALL __read_{name}")).count(),
+            routine.matches(&format!("PAGE(__read_{name})")).count(),
+            "every reader CALL in __stage_{name} re-sets the entry page (the reader leaves PCLATH on the table page)"
+        );
+    }
     assert!(
         asm.contains("CALL __stage_a") && asm.contains("__stage_a:"),
         "per-string staging routine is called and emitted:\n{asm}"

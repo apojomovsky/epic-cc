@@ -7955,11 +7955,15 @@ pub fn select_with_locs(
                 .expect("isel: staged const with no staging buffer in map");
             out.push(format!("__stage_{}:", g.name));
             locs.push(None);
-            out.push(format!("    MOVLW PAGE(__read_{})", g.name));
-            locs.push(None);
-            out.push("    MOVWF PCLATH".to_string());
-            locs.push(None);
+            // The reader sets PCLATH to HIGH(base) on entry, which can
+            // differ from its own entry page (straddling table), so every
+            // CALL re-sets the entry page: a single hoisted set would
+            // misbranch from the second byte on.
             for i in 0..g.bytes.len() {
+                out.push(format!("    MOVLW PAGE(__read_{})", g.name));
+                locs.push(None);
+                out.push("    MOVWF PCLATH".to_string());
+                locs.push(None);
                 out.push(format!("    MOVLW 0x{i:02X}"));
                 locs.push(None);
                 out.push(format!("    CALL __read_{}", g.name));

@@ -196,6 +196,18 @@ fn staged_const_call_args_share_one_buffer() {
         asm.contains("__stage_a:"),
         "per-string staging routine is emitted:\n{asm}"
     );
+    for name in ["a", "b"] {
+        let start = asm
+            .find(&format!("__stage_{name}:\n"))
+            .expect("staging routine label");
+        let end = asm[start..].find("\n    RETURN").expect("routine end") + start;
+        let routine = &asm[start..end];
+        assert_eq!(
+            routine.matches(&format!("CALL __read_{name}")).count(),
+            routine.matches(&format!("PAGE(__read_{name})")).count(),
+            "every reader CALL in __stage_{name} re-sets the entry page (the reader leaves PCLATH on the table page)"
+        );
+    }
     assert!(
         asm.contains("MOVWF 0x26"),
         "param slot takes the staging buffer address:\n{asm}"
