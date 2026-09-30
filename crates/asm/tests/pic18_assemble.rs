@@ -422,3 +422,20 @@ fn omitted_access_bit_follows_the_file_address() {
     let words = assemble_pic18("    CLRF 0x100\n    end\n");
     assert_eq!(words[0], 0x6A00 | 0x0100 | 0x00);
 }
+
+#[test]
+fn label_starting_with_end_does_not_truncate() {
+    let src =
+        "    org 0x0000\n    goto main\nmain:\n    nop\nendpoint:\n    nop\n    nop\n    end\n";
+    let words = assemble_pic18(src);
+    assert_eq!(words.len(), 5, "goto (2 words) plus three nops");
+}
+
+#[test]
+fn end_directive_stops_with_trailing_text() {
+    for tail in ["", "   ", " ; done", "\t"] {
+        let src = format!("    org 0x0000\n    nop\n    end{tail}\n    nop\n");
+        let words = assemble_pic18(&src);
+        assert_eq!(words.len(), 1, "end{tail:?} still terminates");
+    }
+}
