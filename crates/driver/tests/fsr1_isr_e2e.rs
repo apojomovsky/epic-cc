@@ -75,7 +75,10 @@ fn run() {
     // with h's frame slot (0x10) for its walk, so trigger only when FSR0L
     // holds exactly that. A bare nonzero check also fires in `__start`,
     // which seeds FSR0 for its zero-clear loop while g_out is still unset,
-    // and the test would pass without ever preempting the copy.
+    // and the test would pass without ever preempting the copy. The exact
+    // match is precise for this layout: pre-window FSR0L takes only 0x00
+    // then the clear loops' 0x2C-and-up range, so 0x10 fires at the copy's
+    // seed step and nowhere earlier.
     let mut steps = 0;
     let mut fired = false;
     while steps < 4000 {

@@ -1243,15 +1243,11 @@ impl<'m> Gen<'m> {
         None
     }
 
-    /// Per-function store-source pre-scan (epic-cc#723). A
-    /// `store Ty %r DST` whose `%r` is a single-use same-block `Load`
-    /// or simple-ALU `Bin` folds away the temp slot: the producer arm
-    /// writes the store's direct destination instead, and the store
-    /// arm skips the already-emitted copy. The discipline mirrors the
-    /// lane pre-scan: function-wide use count excludes the folding
-    /// store, and the producer-to-store span holds no memory behavior,
-    /// so access count and order are preserved and volatile copies
-    /// keep their semantics. General slot coalescing stays #752; phi
+    /// Per-function store-source pre-scan (epic-cc#723): a single-use
+    /// same-block `Load` or simple-ALU `Bin` feeding `store Ty %r DST`
+    /// writes the destination directly, and the store is skipped. The
+    /// span holds no memory behavior, so volatile access count and
+    /// order are preserved. General slot coalescing stays #752; phi
     /// writebacks and indirect destinations stay staged.
     fn find_store_forwards(g: &Gen, f: &Func) -> (HashMap<String, u16>, HashSet<String>) {
         let mut uses: HashMap<String, usize> = HashMap::new();
@@ -1298,10 +1294,12 @@ impl<'m> Gen<'m> {
                     | Inst::Store(_)
                     | Inst::Memcpy(_)
                     | Inst::VaStart(_)
+                    | Inst::VaArg(_)
                     | Inst::Load(_)
                     | Inst::Br(_)
                     | Inst::BrCond(_)
-                    | Inst::Switch(_) => false,
+                    | Inst::Switch(_)
+                    | Inst::Ret(_, _) => false,
                     _ => true,
                 });
                 if !span_clean {
