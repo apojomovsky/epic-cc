@@ -9158,16 +9158,26 @@ pub fn select_with_locs(
                     // globals have no assembler label to resolve, epic-cc#443);
                     // a flash target (function or const table) keeps its
                     // link-time label literal (epic-cc#154).
-                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        let half = g.refs.iter().filter(|(o, s)| *o < i && s == f).count() % 2;
+                    if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                        let half = g
+                            .refs
+                            .iter()
+                            .filter(|(o, s, b)| *o < i && s == f && b == a)
+                            .count()
+                            % 2;
                         match addrs.get(f) {
-                            Some(&a) => {
-                                let byte = if half == 0 { a & 0xFF } else { (a >> 8) & 0xFF };
+                            Some(&base) => {
+                                let v = base.wrapping_add(*a);
+                                let byte = if half == 0 { v & 0xFF } else { (v >> 8) & 0xFF };
                                 init.push(format!("    MOVLW 0x{byte:02X}"));
                             }
                             None => {
                                 let lit = if half == 0 { "LOW" } else { "HIGH" };
-                                init.push(format!("    MOVLW {lit}({f})"));
+                                if *a == 0 {
+                                    init.push(format!("    MOVLW {lit}({f})"));
+                                } else {
+                                    init.push(format!("    MOVLW {lit}({f}+{a})"));
+                                }
                             }
                         }
                     } else {
@@ -9232,21 +9242,31 @@ pub fn select_with_locs(
             // `addrs` right here (RAM globals have no assembler label to
             // resolve, epic-cc#443); a flash target (function or const
             // table) keeps its link-time label literal (epic-cc#154).
-            if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+            if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
                 if !chunk.is_empty() {
                     out.push(format!("    db {}", chunk.join(", ")));
                     locs.push(None);
                     chunk.clear();
                 }
-                let half = g.refs.iter().filter(|(o, s)| *o < i && s == f).count() % 2;
+                let half = g
+                    .refs
+                    .iter()
+                    .filter(|(o, s, b)| *o < i && s == f && b == a)
+                    .count()
+                    % 2;
                 match addrs.get(f) {
-                    Some(&a) => {
-                        let byte = if half == 0 { a & 0xFF } else { (a >> 8) & 0xFF };
+                    Some(&base) => {
+                        let v = base.wrapping_add(*a);
+                        let byte = if half == 0 { v & 0xFF } else { (v >> 8) & 0xFF };
                         out.push(format!("    db 0x{byte:02X}"));
                     }
                     None => {
                         let lit = if half == 0 { "LOW" } else { "HIGH" };
-                        out.push(format!("    db {lit}({f})"));
+                        if *a == 0 {
+                            out.push(format!("    db {lit}({f})"));
+                        } else {
+                            out.push(format!("    db {lit}({f}+{a})"));
+                        }
                     }
                 }
                 locs.push(None);

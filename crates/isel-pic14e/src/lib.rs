@@ -6116,20 +6116,26 @@ fn window_align(base: usize, size: usize) -> usize {
 /// pointer VALUE. A RAM target resolves through `addrs` right here
 /// (RAM globals have no assembler label to resolve, epic-cc#451); a
 /// flash target (function or const table) keeps its link-time label
-/// literal (epic-cc#154). Mirrors isel's `ref_byte_operand`.
-fn ref_byte_operand(addrs: &HashMap<String, u16>, offset: usize, target: &str) -> String {
+/// literal (epic-cc#154). Mirrors isel's `ref_byte_operand`, including
+/// the `add` byte addend (epic-cc#460).
+fn ref_byte_operand(addrs: &HashMap<String, u16>, offset: usize, target: &str, add: u16) -> String {
     match addrs.get(target) {
         Some(&a) => {
+            let v = a.wrapping_add(add);
             let byte = if offset % 2 == 0 {
-                a & 0xFF
+                v & 0xFF
             } else {
-                (a >> 8) & 0xFF
+                (v >> 8) & 0xFF
             };
             format!("0x{byte:02X}")
         }
         None => {
             let lit = if offset % 2 == 0 { "LOW" } else { "HIGH" };
-            format!("{lit}({target})")
+            if add == 0 {
+                format!("{lit}({target})")
+            } else {
+                format!("{lit}({target}+{add})")
+            }
         }
     }
 }
@@ -6271,8 +6277,8 @@ pub fn select_with_locs(
             if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f)));
+                    if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f, *a)));
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
@@ -6354,8 +6360,8 @@ pub fn select_with_locs(
             if addrs.contains_key(&g.name) && g.needs_ram_init() {
                 let base = addrs[&g.name];
                 for (i, b) in g.bytes.iter().enumerate() {
-                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f)));
+                    if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                        init.push(format!("    MOVLW {}", ref_byte_operand(addrs, i, f, *a)));
                     } else {
                         init.push(format!("    MOVLW 0x{b:02X}"));
                     }
@@ -6384,8 +6390,8 @@ pub fn select_with_locs(
                 if addrs.contains_key(&g.name) && g.needs_ram_init() {
                     let base = addrs[&g.name];
                     for (idx, b) in g.bytes.iter().enumerate() {
-                        if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == idx) {
-                            init.push(format!("    MOVLW {}", ref_byte_operand(addrs, idx, f)));
+                        if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == idx) {
+                            init.push(format!("    MOVLW {}", ref_byte_operand(addrs, idx, f, *a)));
                         } else {
                             init.push(format!("    MOVLW 0x{b:02X}"));
                         }
@@ -6597,19 +6603,24 @@ pub fn select_with_locs(
                                 // epic-cc#154, epic-cc#454). This must match
                                 // the non-ISR emitter above, or word counts
                                 // agree while values differ.
-                                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                                if let Some((_, f, ad)) = g.refs.iter().find(|(o, _, _)| *o == i) {
                                     match addrs.get(f) {
                                         Some(&a) => {
+                                            let v = a.wrapping_add(*ad);
                                             let byte = if i % 2 == 0 {
-                                                a & 0xFF
+                                                v & 0xFF
                                             } else {
-                                                (a >> 8) & 0xFF
+                                                (v >> 8) & 0xFF
                                             };
                                             init.push(format!("    MOVLW 0x{byte:02X}"));
                                         }
                                         None => {
                                             let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                                            init.push(format!("    MOVLW {lit}({f})"));
+                                            if *ad == 0 {
+                                                init.push(format!("    MOVLW {lit}({f})"));
+                                            } else {
+                                                init.push(format!("    MOVLW {lit}({f}+{ad})"));
+                                            }
                                         }
                                     }
                                 } else {
@@ -6804,8 +6815,8 @@ pub fn select_with_locs(
             out.push(format!("{}:", g.name));
             locs.push(None);
             for (i, b) in g.bytes[..256].iter().enumerate() {
-                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f)));
+                if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f, *a)));
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }
@@ -6823,8 +6834,8 @@ pub fn select_with_locs(
                 locs.push(None);
                 for (i, b) in g.bytes[start..end.min(size)].iter().enumerate() {
                     let abs = start + i;
-                    if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == abs) {
-                        out.push(format!("    RETLW {}", ref_byte_operand(addrs, abs, f)));
+                    if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == abs) {
+                        out.push(format!("    RETLW {}", ref_byte_operand(addrs, abs, f, *a)));
                     } else {
                         out.push(format!("    RETLW 0x{b:02X}"));
                     }
@@ -6864,8 +6875,8 @@ pub fn select_with_locs(
             out.push(format!("{}:", g.name));
             locs.push(None);
             for (i, b) in g.bytes[..size].iter().enumerate() {
-                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
-                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f)));
+                if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
+                    out.push(format!("    RETLW {}", ref_byte_operand(addrs, i, f, *a)));
                 } else {
                     out.push(format!("    RETLW 0x{b:02X}"));
                 }

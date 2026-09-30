@@ -837,9 +837,22 @@ fn sym_addr(sym: &std::collections::HashMap<String, usize>, tok: &str) -> usize 
     if let Some(&v) = sym.get(t) {
         return v;
     }
-    // Split a trailing `+N` / `-N`, where `N` is decimal or `0x`-hex:
-    // scan from the end past hex digits, stepping over the `x` of a
-    // `0x` offset so `sym+0x1` still splits at the `+` (epic-cc#610).
+    if let Some(v) = sym_offset(sym, t) {
+        return v;
+    }
+    if let Some(n) = parse_num_opt(t) {
+        return n;
+    }
+    panic!("asm: unresolvable file operand {t:?}");
+}
+
+/// Split a trailing `+N` / `-N`, where `N` is decimal or `0x`-hex, and
+/// evaluate `sym +/- N` through the symbol table. Scans from the end
+/// past hex digits, stepping over the `x` of a `0x` offset so `sym+0x1`
+/// still splits at the `+` (epic-cc#610). Shared by file operands and
+/// the `LOW(`/`HIGH(` literal forms (a vtable slot address arrives as
+/// `LOW(_ZTV4Base+4)`, epic-cc#460).
+fn sym_offset(sym: &std::collections::HashMap<String, usize>, t: &str) -> Option<usize> {
     let mut cut = None;
     for (i, c) in t.char_indices().rev() {
         if c == '+' || c == '-' {
@@ -856,13 +869,10 @@ fn sym_addr(sym: &std::collections::HashMap<String, usize>, tok: &str) -> usize 
     if let Some((i, op)) = cut {
         let (name, off) = (&t[..i], &t[i + 1..]);
         if let (Some(&base), Some(n)) = (sym.get(name), parse_num_opt(off)) {
-            return if op == '+' { base + n } else { base - n };
+            return Some(if op == '+' { base + n } else { base - n });
         }
     }
-    if let Some(n) = parse_num_opt(t) {
-        return n;
-    }
-    panic!("asm: unresolvable file operand {t:?}");
+    None
 }
 
 fn parse_num(s: &str) -> usize {
@@ -907,11 +917,16 @@ fn parse_lit(s: &str, sym: &std::collections::HashMap<String, usize>) -> usize {
         ("UPPER(", 0xFF, 16),
     ] {
         if let Some(inner) = strip_fn(s, name) {
-            // A label operand resolves through the symbol table; a number
-            // operand (`0x` hex or decimal) evaluates on the value itself. A
-            // name that is neither (a typo'd label) keeps the loud "label not
-            // found" panic.
+            // A label operand resolves through the symbol table, with a
+            // trailing `+N`/`-N` evaluated first (a vtable slot address
+            // arrives as `LOW(_ZTV4Base+4)`); a number operand (`0x` hex
+            // or decimal) evaluates on the value itself. A name that is
+            // neither (a typo'd label) keeps the loud "label not found"
+            // panic.
             if let Some(&v) = sym.get(inner) {
+                return (v >> shift) & mask;
+            }
+            if let Some(v) = sym_offset(sym, inner) {
                 return (v >> shift) & mask;
             }
             if let Some(n) = parse_num_opt(inner) {

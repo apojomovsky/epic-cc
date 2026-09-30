@@ -3613,19 +3613,24 @@ pub fn select_with_locs(
                 // target resolves through `addrs` right here (RAM
                 // globals have no assembler label, epic-cc#452); a
                 // flash target keeps its link-time label literal.
-                if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+                if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
                     match addrs.get(f) {
-                        Some(&a) => {
+                        Some(&base) => {
+                            let v = base.wrapping_add(*a);
                             let byte = if i % 2 == 0 {
-                                a & 0xFF
+                                v & 0xFF
                             } else {
-                                (a >> 8) & 0xFF
+                                (v >> 8) & 0xFF
                             };
                             init.push(format!("    MOVLW 0x{byte:02X}"));
                         }
                         None => {
                             let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                            init.push(format!("    MOVLW {lit}({f})"));
+                            if *a == 0 {
+                                init.push(format!("    MOVLW {lit}({f})"));
+                            } else {
+                                init.push(format!("    MOVLW {lit}({f}+{a})"));
+                            }
                         }
                     }
                 } else {
@@ -3816,19 +3821,24 @@ pub fn select_with_locs(
             // resolves through `addrs` right here (RAM globals have no
             // assembler label, epic-cc#452); a flash target (function or
             // const table) keeps its link-time label literal.
-            if let Some((_, f)) = g.refs.iter().find(|(o, _)| *o == i) {
+            if let Some((_, f, a)) = g.refs.iter().find(|(o, _, _)| *o == i) {
                 match addrs.get(f) {
-                    Some(&a) => {
+                    Some(&base) => {
+                        let v = base.wrapping_add(*a);
                         let byte = if i % 2 == 0 {
-                            a & 0xFF
+                            v & 0xFF
                         } else {
-                            (a >> 8) & 0xFF
+                            (v >> 8) & 0xFF
                         };
                         out.push(format!("    RETLW 0x{byte:02X}"));
                     }
                     None => {
                         let lit = if i % 2 == 0 { "LOW" } else { "HIGH" };
-                        out.push(format!("    RETLW {lit}({f})"));
+                        if *a == 0 {
+                            out.push(format!("    RETLW {lit}({f})"));
+                        } else {
+                            out.push(format!("    RETLW {lit}({f}+{a})"));
+                        }
                     }
                 }
             } else {

@@ -357,3 +357,15 @@ fn end_directive_stops_with_trailing_text() {
         assert_eq!(words.len(), 1, "end{tail:?} still terminates");
     }
 }
+
+#[test]
+fn low_high_label_plus_offset_operands_resolve() {
+    // `LOW(label+K)`/`HIGH(label+K)` (a C++ vtable slot address,
+    // epic-cc#460): the offset evaluates before the half split, so a
+    // low-byte carry reaches the high half. mytable sits at word 0x1FE:
+    // +4 lands on 0x202, LOW = 0x02, HIGH = 0x02.
+    let src = "    org 0x01F8\n    nop\n    nop\n    nop\n    nop\n    nop\n    nop\nmytable:\n    addlw LOW(mytable+4)\n    addlw HIGH(mytable+4)\n    end\n";
+    let words = assemble(src);
+    assert_eq!(words[0x1FE], 0x3E00 | 0x02, "ADDLW LOW(mytable+4)");
+    assert_eq!(words[0x1FF], 0x3E00 | 0x02, "ADDLW HIGH(mytable+4)");
+}

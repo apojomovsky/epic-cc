@@ -9221,7 +9221,7 @@ fn const_table_ram_ref_materializes_the_alloc_address() {
     for g in &mut m.globals {
         if g.name == "map" {
             g.bytes = vec![0x00, 0x00, 0x04];
-            g.refs = vec![(0, "holding_regs".into()), (1, "holding_regs".into())];
+            g.refs = vec![(0, "holding_regs".into(), 0), (1, "holding_regs".into(), 0)];
         }
     }
     // The map itself lives in flash (no alloc address): table path.
@@ -9249,7 +9249,7 @@ fn const_table_function_ref_keeps_the_label_literal() {
     for g in &mut m.globals {
         if g.name == "vt" {
             g.bytes = vec![0x00, 0x00];
-            g.refs = vec![(0, "f0".into()), (1, "f0".into())];
+            g.refs = vec![(0, "f0".into(), 0), (1, "f0".into(), 0)];
         }
     }
     let asm = select(&PIC16F877A, &m, &addrs(&[("vt", 0x30)]));
@@ -9271,7 +9271,7 @@ fn const_init_ram_ref_materializes_the_alloc_address() {
     for g in &mut m.globals {
         if g.name == "map" {
             g.bytes = vec![0x00, 0x00, 0x04];
-            g.refs = vec![(0, "holding_regs".into()), (1, "holding_regs".into())];
+            g.refs = vec![(0, "holding_regs".into(), 0), (1, "holding_regs".into(), 0)];
         }
     }
     let asm = select(
@@ -9302,7 +9302,10 @@ fn chunked_table_ram_ref_uses_absolute_offsets() {
     );
     for g in &mut m.globals {
         if g.name == "big" {
-            g.refs = vec![(260, "holding_regs".into()), (261, "holding_regs".into())];
+            g.refs = vec![
+                (260, "holding_regs".into(), 0),
+                (261, "holding_regs".into(), 0),
+            ];
         }
     }
     let asm = select(&PIC16F877A, &m, &addrs(&[("holding_regs", 0x21)]));
