@@ -580,3 +580,31 @@ fn switch_terminator_roundtrips() {
     // stable fixed point
     assert_eq!(serialize(&parse(&out)), out);
 }
+
+#[test]
+fn volatile_load_store_roundtrip() {
+    let text = "global flag i8\nfn main(void) ()\n  block entry:\n    store volatile i8 1 @flag\n    %v = load volatile i8 @flag\n    ret void\n";
+    let m = parse(text);
+    let out = serialize(&m);
+    assert!(
+        out.contains("store volatile i8 1 @flag"),
+        "store keeps marker\n---\n{out}"
+    );
+    assert!(
+        out.contains("%v = load volatile i8 @flag"),
+        "load keeps marker\n---\n{out}"
+    );
+    // stable fixed point
+    assert_eq!(serialize(&parse(&out)), out);
+}
+
+#[test]
+fn plain_load_store_gain_no_marker() {
+    let text = "global flag i8\nfn main(void) ()\n  block entry:\n    store i8 1 @flag\n    %v = load i8 @flag\n    ret void\n";
+    let out = serialize(&parse(text));
+    assert!(
+        !out.contains("volatile"),
+        "plain accesses stay plain\n---\n{out}"
+    );
+    assert_eq!(serialize(&parse(&out)), out);
+}
