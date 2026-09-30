@@ -2100,10 +2100,11 @@ fn pic18_two_region_device_keeps_the_globals_above_the_overlay() {
 /// below 0x100 would otherwise put `__add_f32`'s 22 bytes across it.
 #[test]
 fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
-    // Counts are calibrated for the homed layout (epic-cc#830): main's
-    // frame end lands at 0xEE, so `__add_f32`'s derived base is 0xEE and
-    // its 22-byte frame would span 0xEE..0x104, crossing the boundary; it
-    // must snap to 0x100.
+    // Counts are calibrated for this fixture: main's frame end lands at
+    // 0xF1, so `__add_f32`'s derived base is 0xF1 and its 22-byte frame
+    // would span 0xF1..0x107, crossing the boundary; it must snap to
+    // 0x100. Arg homing (epic-cc#830) does not move this frame: a homed
+    // value keeps its caller slot.
     let mut src = String::from("global sink i8\nglobal in float\n");
     src.push_str("fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14\n");
     src.push_str("fn main(void) ()\n  block entry:\n");
@@ -2132,8 +2133,7 @@ fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
 /// already was).
 #[test]
 fn pic18_routine_frame_does_not_snap_back_to_the_region_start() {
-    // Counts are calibrated for the homed layout (epic-cc#830): 216 snaps
-    // to 0x100, 240 clears it without a snap.
+    // k=216 snaps to 0x100, k=240 clears it without a snap (measured).
     for k in [216usize, 240] {
         let mut src = String::from("global sink i8\nglobal in float\n");
         src.push_str(
