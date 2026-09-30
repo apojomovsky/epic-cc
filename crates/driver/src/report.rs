@@ -34,10 +34,12 @@ pub fn line_table_text(device: &Device, asm: &str, locs: &[Option<SrcLoc>]) -> S
 
 /// The address map file: `global <name> 0xNN`, `const <name>` (flash, no
 /// RAM address), `staged <name>` (shared-buffer staging, epic-cc#790),
-/// and `local <key> 0xNN` where `<key>` is the driver's `{func}::{name}`
-/// HashMap key, all sorted deterministically. The map is
-/// the artifact a user reads when a program does not fit and they have to
-/// decide what to cut.
+/// `local <key> 0xNN` where `<key>` is the driver's `{func}::{name}`
+/// HashMap key, all sorted deterministically, then the alloc scalars the
+/// e2e tests assert on: `total-bank0`, per-bank `bank-used <i>`, and the
+/// ISR save bases present on that program (`isr-low-save`, `isr-save`,
+/// `isr-hi-save`, epic-cc#814). The map is the artifact a user reads when
+/// a program does not fit and they have to decide what to cut.
 pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
     let mut out = String::new();
     out.push_str(&format!("; epic-cc map for {}\n", device.name));
@@ -60,6 +62,19 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
     locals.sort();
     for key in locals {
         out.push_str(&format!("local {key} 0x{:02X}\n", layout.locals[key]));
+    }
+    out.push_str(&format!("total-bank0 0x{:02X}\n", layout.total_bank0));
+    for (i, &used) in layout.bank_used.iter().enumerate() {
+        out.push_str(&format!("bank-used {i} 0x{used:02X}\n"));
+    }
+    for (kind, slot) in [
+        ("isr-low-save", layout.isr_low_save),
+        ("isr-save", layout.isr_save),
+        ("isr-hi-save", layout.isr_hi_save),
+    ] {
+        if let Some(addr) = slot {
+            out.push_str(&format!("{kind} 0x{addr:02X}\n"));
+        }
     }
     out
 }

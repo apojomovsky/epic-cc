@@ -1,90 +1,120 @@
 //! epic-cc#493 regression: an ISR that seeds the FSRs must not corrupt the
 //! preempted main context's in-flight copy pointer.
 //!
-//! main's `g_storage = *h` lowers to an indirect-source walk: FSR0 is
-//! seeded with the source pointer and advanced byte by byte, so the
-//! pointer is live across the copy's instructions. Since epic-cc#723 the
-//! load/store temp is folded away, so main holds no FSR1 loop; the
-//! fixture's handler still copies its own struct through an FSR0/FSR1
-//! loop, and epic-cc#477's FSR save/restore in every ISR prologue and
-//! epilogue is what lets the preempted walk resume. An interrupt taken
-//! inside main's window and served without that restore would resume
-//! main against the ISR's pointer.
-use std::collections::HashMap;
+//! main's `g_storage = *h` lowers to a POSTINC walk: FSR1 is seeded with
+//! h's frame slot and advanced byte by byte, so the pointer is live
+//! across the copy's instructions. The fixture's handler copies its own
+//! struct through an FSR0/FSR1 loop, and epic-cc#477's FSR save/restore
+//! in every ISR prologue and epilogue is what lets the preempted walk
+//! resume. An interrupt taken inside main's window and served without
+//! that restore would resume main against the ISR's pointer.
 use std::process::Command;
 
+/// Globals' RAM addresses, read off the compiler's own `--map` output.
+/// Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts (see array_e2e's `map_addr`).
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
+
+/// Sorted RAM addresses of one function's frame locals (`local
+/// {func}::{name} 0xNN` lines of the same `--map` output).
+fn frame_addrs(map: &str, fname: &str) -> Vec<u16> {
+    let prefix = format!("local {fname}::");
+    let mut addrs: Vec<u16> = map
+        .lines()
+        .filter(|l| l.starts_with(&prefix))
+        .map(|l| {
+            let addr = l.rsplit(' ').next().expect("map local has an address");
+            u16::from_str_radix(addr.trim_start_matches("0x"), 16).expect("map address is hex")
+        })
+        .collect();
+    addrs.sort();
+    addrs
+}
+
 fn run() {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("clang env");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("resdir env");
-    let ll = Command::new(&clang)
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-g",
-            "-resource-dir",
-            &resdir,
-            "-o",
-            "-",
             "tests/fixtures/fsr1_isr.c",
+            "-o",
+            "tests/fixtures/fsr1_isr.hex",
+            "--map",
+            "tests/fixtures/fsr1_isr.map",
+            "--device",
+            "p18f4550",
         ])
         .output()
-        .expect("run clang");
+        .expect("run driver");
     assert!(
-        ll.status.success(),
-        "clang: {}",
-        String::from_utf8_lossy(&ll.stderr)
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let mut m = irparse::parse_ll(&String::from_utf8(ll.stdout).unwrap());
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC18F4550, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel_pic18::select_with_locs(
-        &device::PIC18F4550,
-        &m,
-        &addrs,
-        layout.isr_low_save,
-        layout.isr_save,
-        layout.isr_hi_save,
-    )
-    .0;
-    let sym = |n: &str| *addrs.get(n).unwrap_or_else(|| panic!("no {n}")) as usize;
-
+    let asm_out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/fsr1_isr.c",
+            "-o",
+            "tests/fixtures/fsr1_isr.asm",
+            "--device",
+            "p18f4550",
+            "--emit",
+            "asm",
+        ])
+        .output()
+        .expect("run driver for asm");
+    assert!(
+        asm_out.status.success(),
+        "driver asm: {}",
+        String::from_utf8_lossy(&asm_out.stderr)
+    );
+    let asm = std::fs::read_to_string("tests/fixtures/fsr1_isr.asm").unwrap();
+    let _ = std::fs::remove_file("tests/fixtures/fsr1_isr.asm");
+    let map = std::fs::read_to_string("tests/fixtures/fsr1_isr.map").expect("read map");
+    let _ = std::fs::remove_file("tests/fixtures/fsr1_isr.map");
+    let sym = |n: &str| map_addr(&map, n);
     // The handler must actually seed FSR1, or this test proves nothing.
     assert!(
         asm.contains("0xFE1"),
         "the ISR must seed/save FSR1 for this fixture to exercise the window:\n{asm}"
     );
 
-    let words = asm::assemble_pic18(&asm);
-    let mut p = pic14_sim::Pic18::new(words);
+    let hex = std::fs::read_to_string("tests/fixtures/fsr1_isr.hex").unwrap();
+    let prog = pic14_sim::parse_hex_pic18(&hex);
+    let mut p = pic14_sim::Pic18::new(prog);
     // The ISR's source struct carries a distinguishable pattern.
     for (i, b) in [0xAAu8, 0xBB, 0xCC, 0xDD].iter().enumerate() {
         p.ram_mut()[sym("isr_src") + i] = *b;
     }
 
-    // Interrupt while main's copy is in flight: store_handle seeds FSR0
-    // with h's frame slot (0x10) for its walk, so trigger only when FSR0L
-    // holds exactly that. A bare nonzero check also fires in `__start`,
-    // which seeds FSR0 for its zero-clear loop while g_out is still unset,
-    // and the test would pass without ever preempting the copy. The exact
-    // match is precise for this layout: pre-window FSR0L takes only 0x00
-    // then the clear loops' 0x2C-and-up range, so 0x10 fires at the copy's
-    // seed step and nowhere earlier.
+    // Interrupt while main's copy is in flight: store_handle seeds FSR1
+    // with h's address for its POSTINC walk, so trigger only when FSR1L
+    // holds exactly the address the param slot points at. h is
+    // store_handle's only param and params sit at the frame base, so the
+    // slot is the lowest `store_handle::` address in the map; main
+    // materializes &h into it at the call site. A bare nonzero check is
+    // not enough: the test would pass without ever preempting the copy.
+    // The exact match is precise: FSR1L takes this value only at the
+    // copy's seed step (startup never seeds FSR1, the handler's own seeds
+    // differ, and the nonzero guard skips the zeroed reset state), so it
+    // fires there and nowhere earlier.
+    let h_slot = frame_addrs(&map, "store_handle")
+        .into_iter()
+        .min()
+        .expect("store_handle has a frame slot");
+    let g_out = sym("g_out");
     let mut steps = 0;
     let mut fired = false;
     while steps < 4000 {
         p.step();
         steps += 1;
-        if p.ram()[0xFE9] == 0x10 && p.ram()[sym("g_out")] == 0 {
+        let f = p.ram()[0xFE1];
+        if f != 0 && f == p.ram()[h_slot as usize] && p.ram()[g_out] == 0 {
             p.fire_interrupt();
             p.run(20_000);
             fired = true;

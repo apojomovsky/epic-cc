@@ -6,53 +6,64 @@
 //! instruction boundary. ADR-013 saves TBLPTR for this same read sequence
 //! but TABLAT was in no save set; before this fix a handler whose own const
 //! read emits TBLRD resumed main against the handler's byte.
-use std::collections::HashMap;
 use std::process::Command;
 
+/// Globals' RAM addresses, read off the compiler's own `--map` output.
+/// Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts (see array_e2e's `map_addr`).
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
+
 fn run() {
-    let clang = std::env::var("PIC8_CLANG_UNWRAPPED").expect("clang env");
-    let resdir = std::env::var("PIC8_CLANG_RESOURCE_DIR").expect("resdir env");
-    let ll = Command::new(&clang)
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
-            "-target",
-            "msp430",
-            "-O1",
-            "-S",
-            "-emit-llvm",
-            "-ffreestanding",
-            "-nostdinc",
-            "-g",
-            "-resource-dir",
-            &resdir,
-            "-o",
-            "-",
             "tests/fixtures/tablat_isr.c",
+            "-o",
+            "tests/fixtures/tablat_isr.hex",
+            "--map",
+            "tests/fixtures/tablat_isr.map",
+            "--device",
+            "p18f4550",
         ])
         .output()
-        .expect("run clang");
+        .expect("run driver");
     assert!(
-        ll.status.success(),
-        "clang: {}",
-        String::from_utf8_lossy(&ll.stderr)
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    let mut m = irparse::parse_ll(&String::from_utf8(ll.stdout).unwrap());
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC18F4550, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel_pic18::select_with_locs(
-        &device::PIC18F4550,
-        &m,
-        &addrs,
-        layout.isr_low_save,
-        layout.isr_save,
-        layout.isr_hi_save,
-    )
-    .0;
-    let sym = |n: &str| *addrs.get(n).unwrap_or_else(|| panic!("no {n}")) as usize;
+    let asm_out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/tablat_isr.c",
+            "-o",
+            "tests/fixtures/tablat_isr.asm",
+            "--device",
+            "p18f4550",
+            "--emit",
+            "asm",
+        ])
+        .output()
+        .expect("run driver for asm");
+    assert!(
+        asm_out.status.success(),
+        "driver asm: {}",
+        String::from_utf8_lossy(&asm_out.stderr)
+    );
+    let asm = std::fs::read_to_string("tests/fixtures/tablat_isr.asm").unwrap();
+    let _ = std::fs::remove_file("tests/fixtures/tablat_isr.asm");
+    let map = std::fs::read_to_string("tests/fixtures/tablat_isr.map").expect("read map");
+    let _ = std::fs::remove_file("tests/fixtures/tablat_isr.map");
+    let sym = |n: &str| map_addr(&map, n);
+
+    let hex = std::fs::read_to_string("tests/fixtures/tablat_isr.hex").unwrap();
+    let prog = pic14_sim::parse_hex_pic18(&hex);
+    let mut p = pic14_sim::Pic18::new(prog);
 
     // Both contexts must actually read flash, or this proves nothing.
     assert!(
@@ -64,8 +75,6 @@ fn run() {
         "the const read's consumer moves TABLAT:\n{asm}"
     );
 
-    let words = asm::assemble_pic18(&asm);
-    let mut p = pic14_sim::Pic18::new(words);
     // idx/isr_idx arrive via the fixture's init stores (epic-cc#561):
     // __start clears zero-initialized globals, so sim-side seeds would
     // not survive.

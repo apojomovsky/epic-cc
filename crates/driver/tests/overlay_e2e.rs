@@ -5,87 +5,69 @@
 //! (overlay), and total_bank0 < locals_size(big_a) + locals_size(big_b) +
 //! locals_size(main).
 
-use std::collections::HashMap;
 use std::process::Command;
 
-use ir::{Inst, Module};
-
-/// Width of every local (params + defined values, each name once, icmp -> i1)
-/// of `fname` — the same rule alloc uses to size frames.
-fn local_widths(m: &Module, fname: &str) -> HashMap<String, u8> {
-    let f = m.funcs.iter().find(|f| f.name == fname).expect("function");
-    let mut widths: HashMap<String, u8> = HashMap::new();
-    for p in &f.params {
-        widths.insert(p.name.clone(), p.width);
-    }
-    for b in &f.blocks {
-        for inst in &b.insts {
-            let (name, w) = match inst {
-                Inst::Load(l) => (l.dst.clone(), l.ty.bytes()),
-                Inst::Bin(b) => (b.dst.clone(), b.ty.bytes()),
-                Inst::Zext(z) => (z.dst.clone(), z.to.bytes()),
-                Inst::Trunc(t) => (t.dst.clone(), t.to.bytes()),
-                Inst::IntToPtr(p) => (p.dst.clone(), p.to.bytes()),
-                Inst::Icmp(i) => (i.dst.clone(), 1),
-                Inst::Select(s) => (s.dst.clone(), s.ty.bytes()),
-                Inst::Call(c) => match (&c.dst, &c.ty) {
-                    (Some(d), Some(t)) => (d.clone(), t.bytes()),
-                    _ => continue,
-                },
-                Inst::Phi(p) => (p.dst.clone(), p.ty.bytes()),
-                _ => continue,
-            };
-            widths.insert(name, w);
-        }
-    }
-    widths
+/// Sorted RAM addresses of one function's frame locals, read off the
+/// compiler's own `--map` output (`local {func}::{name} 0xNN` lines).
+/// Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts (see array_e2e's `map_addr`).
+fn frame_addrs(map: &str, fname: &str) -> Vec<u16> {
+    let prefix = format!("local {fname}::");
+    let mut addrs: Vec<u16> = map
+        .lines()
+        .filter(|l| l.starts_with(&prefix))
+        .map(|l| {
+            let addr = l.rsplit(' ').next().expect("map local has an address");
+            u16::from_str_radix(addr.trim_start_matches("0x"), 16).expect("map address is hex")
+        })
+        .collect();
+    assert!(!addrs.is_empty(), "function {fname} has map locals");
+    addrs.sort();
+    addrs
 }
 
-/// The map's span for a function: max(addr + width) - min(addr) over its
-/// locals — the bytes of simultaneous locals its frame demands.
-fn map_span(layout: &alloc::AllocLayout, fname: &str, widths: &HashMap<String, u8>) -> u16 {
-    let prefix = format!("{fname}::");
-    let mut min_addr: Option<u16> = None;
-    let mut max_end: u16 = 0;
-    for (key, &addr) in &layout.locals {
-        if let Some(name) = key.strip_prefix(&prefix) {
-            let w = u16::from(*widths.get(name).expect("local width"));
-            min_addr = Some(min_addr.map_or(u16::from(addr), |m| m.min(u16::from(addr))));
-            max_end = max_end.max(u16::from(addr) + w);
-        }
-    }
-    max_end - min_addr.expect("function has map locals")
+/// Widthless lower bound on a frame's span: max(addr) - min(addr) + 1.
+/// Every local is at least 1 byte, so the true span (which adds each
+/// value's width) only grows from here. Sound for the >= 16 guards: a
+/// folded-away fixture collapses to ~2, far below 16, so the bound
+/// cannot pass a broken fixture.
+fn span_lo(addrs: &[u16]) -> u16 {
+    addrs[addrs.len() - 1] - addrs[0] + 1
 }
 
-/// The lowest address of a function's frame (its base).
-fn base_of(layout: &alloc::AllocLayout, fname: &str) -> u16 {
-    let prefix = format!("{fname}::");
-    layout
-        .locals
-        .iter()
-        .filter(|(k, _)| k.starts_with(&prefix))
-        .map(|(_, &a)| u16::from(a))
-        .min()
-        .expect("function has map locals")
+/// One alloc scalar off the `--map` output (see size_map_e2e).
+fn map_scalar(map: &str, kind: &str) -> u16 {
+    let prefix = format!("{kind} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {kind} in:\n{map}"));
+    u16::from_str_radix(line[prefix.len()..].trim(), 16).expect("map scalar is hex")
 }
 
-/// Run clang + the full IR pipeline on the overlay fixture, exactly as the
-/// driver does, and return the alloc layout.
-fn overlay_layout() -> (Module, alloc::AllocLayout) {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/overlay.c"),
-        &driver::clang::Options::default(),
+/// Run the driver on the overlay fixture for its HEX and map.
+fn build_overlay() -> (String, String) {
+    let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
+        .args([
+            "tests/fixtures/overlay.c",
+            "-o",
+            "tests/fixtures/overlay.hex",
+            "--device",
+            "p16f877a",
+            "--map",
+            "tests/fixtures/overlay.map",
+        ])
+        .output()
+        .expect("run driver");
+    assert!(
+        out.status.success(),
+        "driver: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    (m, layout)
+    let hex = std::fs::read_to_string("tests/fixtures/overlay.hex").unwrap();
+    let map = std::fs::read_to_string("tests/fixtures/overlay.map").expect("read map");
+    let _ = std::fs::remove_file("tests/fixtures/overlay.map");
+    (hex, map)
 }
 
 #[test]
@@ -119,32 +101,34 @@ fn overlay_runs_correctly() {
 
 #[test]
 fn overlay_frames_share_ram() {
-    let (m, layout) = overlay_layout();
+    let (_hex, map) = build_overlay();
+    let (a, b, m) = (
+        frame_addrs(&map, "big_a"),
+        frame_addrs(&map, "big_b"),
+        frame_addrs(&map, "main"),
+    );
 
     // The critical .ll property: each sibling carries >= 16 bytes of
     // simultaneous i16 locals (else -O1 folded the program away).
-    let span_a = map_span(&layout, "big_a", &local_widths(&m, "big_a"));
-    let span_b = map_span(&layout, "big_b", &local_widths(&m, "big_b"));
-    let span_main = map_span(&layout, "main", &local_widths(&m, "main"));
+    let (span_a, span_b, span_main) = (span_lo(&a), span_lo(&b), span_lo(&m));
     assert!(span_a >= 16 && span_b >= 16,
         "each sibling must carry >= 16 bytes of simultaneous locals (got big_a={span_a}, big_b={span_b})");
 
     // (b) sibling frames overlay: identical base region (never co-live).
-    assert_eq!(
-        base_of(&layout, "big_a"),
-        base_of(&layout, "big_b"),
-        "big_a and big_b must share a base address"
-    );
+    assert_eq!(a[0], b[0], "big_a and big_b must share a base address");
 
     // main's frame is disjoint and sits before the shared sibling region.
-    assert!(base_of(&layout, "main") + span_main <= base_of(&layout, "big_a"));
+    // main's values are i8/i16 (the fixture has no wider type), so its
+    // true span exceeds the widthless bound by at most 1.
+    assert!(m[0] + span_main + 1 <= a[0]);
 
     // Overlay wins: total bank-0 demand < sum of the three demands.
+    // Lower-bound spans only shrink the sum, so passing against them
+    // implies passing against the true spans.
     let sum_demands = span_a + span_b + span_main;
+    let total_bank0 = map_scalar(&map, "total-bank0");
     assert!(
-        layout.total_bank0 < sum_demands,
-        "total_bank0 {} must be < sum of individual demands {}",
-        layout.total_bank0,
-        sum_demands
+        total_bank0 < sum_demands,
+        "total_bank0 {total_bank0} must be < sum of individual demands {sum_demands}"
     );
 }
