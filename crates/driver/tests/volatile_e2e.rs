@@ -41,7 +41,7 @@ fn run_driver(fixture: &str, device: &str, emit: &str, out: &Path, extra: &[&str
     );
 }
 
-fn build(fixture: &str, device: &str, stem: &str) -> Build {
+fn build(fixture: &str, device: &str, stem: &str, asm_extra: &[&str]) -> Build {
     let dir = std::env::temp_dir().join(format!("volatile_{stem}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let hex_path = dir.join("p.hex");
@@ -54,7 +54,7 @@ fn build(fixture: &str, device: &str, stem: &str) -> Build {
         &hex_path,
         &["--map", map_path.to_str().unwrap()],
     );
-    run_driver(fixture, device, "asm", &asm_path, &[]);
+    run_driver(fixture, device, "asm", &asm_path, asm_extra);
     Build {
         hex: std::fs::read_to_string(&hex_path).unwrap(),
         map: std::fs::read_to_string(&map_path).unwrap(),
@@ -85,6 +85,7 @@ fn volatile_double_write_keeps_all_four_stores_in_order() {
             "tests/fixtures/volatile_double_write.c",
             dev,
             &format!("a_{dev}"),
+            &[],
         );
         let ee = addr(&b.map, "ee");
         let w = if dev.starts_with("p16") {
@@ -141,6 +142,7 @@ fn volatile_read_after_write_reloads_from_memory() {
             "tests/fixtures/volatile_read_after_write.c",
             dev,
             &format!("b_{dev}"),
+            &[],
         );
         let shadow = addr(&b.map, "port_shadow");
         let flag = addr(&b.map, "flag");
@@ -183,6 +185,7 @@ fn volatile_poll_flag_reloads_inside_the_loop() {
             "tests/fixtures/volatile_poll_flag.c",
             dev,
             &format!("c_{dev}"),
+            &[],
         );
         let ready = addr(&b.map, "ready");
         let done = addr(&b.map, "done");
@@ -237,23 +240,39 @@ fn volatile_poll_flag_reloads_inside_the_loop() {
 #[test]
 fn volatile_isr_ticks_rereads_both_bytes() {
     for dev in ["p16f877a", "p18f4550"] {
+        // The asm half compiles with outlining off so both snapshots stay
+        // inline in main: with outlining the reads live in the shared
+        // routine and whole-file counts cannot tell them from the ISR's
+        // own reads. The sim halves run the default pipeline.
         let b = build(
             "tests/fixtures/volatile_isr_ticks.c",
             dev,
             &format!("d_{dev}"),
+            &["--no-outline"],
         );
         let ticks = addr(&b.map, "ticks");
         let lo = addr(&b.map, "lo");
         let hi = addr(&b.map, "hi");
         let is_pic14 = dev.starts_with("p16");
+        // Counts cover main's region only: the ISR reads the same bytes,
+        // so whole-file totals cannot tell main's re-reads from its own.
+        let start = pos(&b.asm, "main:", "main");
+        let tail = &b.asm[start..];
+        let end = ["\n__start:", "\n__pa0:", "\n    end", "\nend"]
+            .iter()
+            .filter_map(|t| tail.find(t))
+            .min()
+            .map(|i| i + start)
+            .unwrap_or(b.asm.len());
+        let main_asm = &b.asm[start..end];
         if is_pic14 {
             assert!(
-                b.asm.matches(&format!("MOVF 0x{ticks:02X}, W")).count() >= 2,
+                main_asm.matches(&format!("MOVF 0x{ticks:02X}, W")).count() >= 2,
                 "low byte read per snapshot on {dev}:\n{}",
                 b.asm
             );
             assert!(
-                b.asm
+                main_asm
                     .matches(&format!("MOVF 0x{:02X}, W", ticks + 1))
                     .count()
                     >= 2,
@@ -262,12 +281,15 @@ fn volatile_isr_ticks_rereads_both_bytes() {
             );
         } else {
             assert!(
-                b.asm.matches(&format!("MOVFF 0x{ticks:03X}")).count() >= 2,
+                main_asm.matches(&format!("MOVFF 0x{ticks:03X}")).count() >= 2,
                 "low byte read per snapshot on {dev}:\n{}",
                 b.asm
             );
             assert!(
-                b.asm.matches(&format!("MOVFF 0x{:03X}", ticks + 1)).count() >= 2,
+                main_asm
+                    .matches(&format!("MOVFF 0x{:03X}", ticks + 1))
+                    .count()
+                    >= 2,
                 "high byte read per snapshot on {dev}:\n{}",
                 b.asm
             );
@@ -333,6 +355,7 @@ fn volatile_bank_order_keeps_program_order() {
             "tests/fixtures/volatile_bank_order.c",
             dev,
             &format!("e_{dev}"),
+            &[],
         );
         let seq = addr(&b.map, "seq");
         if dev.starts_with("p16") {
@@ -350,6 +373,17 @@ fn volatile_bank_order_keeps_program_order() {
                 "writes in program order on {dev}:\n{}",
                 b.asm
             );
+            // The middle store rides bank 1: its select must sit between
+            // the first and second write, and bank 0 must be back before
+            // the third. Without these the three identical MOVWF lines
+            // pass even with a dropped or reordered BANKSEL.
+            let sel_up = b.asm[wf[0]..wf[1]]
+                .find("BSF STATUS, 5")
+                .unwrap_or_else(|| panic!("bank 1 select before middle store:\n{}", b.asm));
+            let sel_down = b.asm[wf[1]..wf[2]]
+                .find("BCF STATUS, 5")
+                .unwrap_or_else(|| panic!("bank 0 select before third store:\n{}", b.asm));
+            let _ = (sel_up, sel_down);
             let load = pos(&b.asm, "MOVF 0x05, W", "final re-read");
             let seq_store = pos(&b.asm, &format!("MOVWF 0x{seq:02X}"), "seq store");
             assert!(
@@ -363,11 +397,22 @@ fn volatile_bank_order_keeps_program_order() {
             assert_eq!(p.ram()[seq], 0x02, "seq on {dev}");
         } else {
             let w1 = pos(&b.asm, "MOVWF 0x081,A", "first SFR store");
-            let mid = pos(&b.asm, "CLRF 0x082,A", "second SFR store");
-            let w2 = b.asm[mid + 1..]
+            let w2 = b.asm[w1 + 1..]
                 .find("MOVWF 0x081,A")
-                .map(|i| i + mid + 1)
+                .map(|i| i + w1 + 1)
                 .unwrap_or_else(|| panic!("third store missing:\n{}", b.asm));
+            // Either zero-store lowering names the middle address; the
+            // order assertion must not pin the opcode.
+            let mid_text = &b.asm[w1..w2];
+            let mid = mid_text
+                .find("0x082")
+                .map(|i| i + w1)
+                .unwrap_or_else(|| panic!("middle store to 0x082 missing:\n{}", b.asm));
+            assert!(
+                mid_text.contains("CLRF 0x082,A") || mid_text.contains("MOVLW 0x00"),
+                "middle store writes zero:\n{}",
+                b.asm
+            );
             assert!(
                 w1 < mid && mid < w2,
                 "writes in program order on {dev}:\n{}",
