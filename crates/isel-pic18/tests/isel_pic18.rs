@@ -7108,6 +7108,57 @@ fn materializing_signed_icmp_uses_sign_check_not_overflow() {
     }
 }
 
+/// A signed compare over a load from an SFR global fuses to the signed
+/// chain but keeps slot reads: the rewrite to a direct global read is
+/// declined, so the side-effecting register is read exactly once (the
+/// load's own fill) and the sign check plus lanes read the slot.
+#[test]
+fn fused_signed_icmp_over_sfr_global_reads_it_once() {
+    let m = parse(
+        "global sfr i16\nglobal b i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    \
+         %1 = load i16 @sfr\n    %2 = load i16 @b\n    %3 = icmp slt i16 %1, %2\n    \
+         br i1 %3 10 20\n  block 10:\n    store i8 1 @out\n    ret void\n  \
+         block 20:\n    store i8 0 @out\n    ret void\n",
+    );
+    let mut pairs = vec![("sfr", 0xF80), ("b", 0x24), ("out", 0x28)];
+    pairs.push(("main::1", 0x30));
+    pairs.push(("main::2", 0x34));
+    let addrs = addrs(&pairs);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    // Fused (no result byte) but the SFR appears exactly once: the
+    // load's fill. Every lane reads the slot instead.
+    assert!(
+        !asm.contains("INCF 0x38") && !asm.contains("CLRF 0x38"),
+        "sfr-backed slt was not fused:\n{asm}"
+    );
+    let body = asm.split("main:").nth(1).expect("main block");
+    let sfr_lines: Vec<&str> = body
+        .lines()
+        .filter(|l| l.contains("0xF80") || l.contains("0xF81"))
+        .filter(|l| !l.trim_start().starts_with("LFSR"))
+        .collect();
+    // One fill per byte, nothing else: the sign check plus lanes read
+    // the slots, so the harness LFSR line aside, the register is read
+    // exactly as often as the IR load reads it.
+    assert_eq!(sfr_lines.len(), 2, "SFR global read more than once:\n{asm}");
+    assert!(
+        sfr_lines
+            .iter()
+            .all(|l| l.trim_start().starts_with("MOVFF")),
+        "SFR global read outside its fill:\n{asm}"
+    );
+    let words = asm::assemble_pic18(&asm);
+    // Sim models the SFR address as plain RAM here; the check is the
+    // read count above, behavior just confirms the lowering answers.
+    let mut p = pic14_sim::Pic18::new(words.clone());
+    step_past_start(&mut p, start_steps(&asm));
+    p.ram_mut()[0xF80] = 0xFF;
+    p.ram_mut()[0xF81] = 0xFF;
+    p.ram_mut()[0x24] = 0x00;
+    p.ram_mut()[0x25] = 0x00;
+    p.run(300);
+    assert_eq!(p.ram()[0x28], 1, "sfr -1 < 0:\n{asm}");
+}
 /// The 32-bit chain, fused, over the derived lane patterns that decide the
 /// high lane last (the shape a high-to-low chain gets wrong).
 #[test]
