@@ -221,10 +221,24 @@ fn rrncf_rotates_right_without_carry() {
 }
 
 #[test]
-fn subfwb_subtracts_with_borrow() {
+fn subfwb_subtracts_w_minus_f_with_borrow() {
     // MOVLW 5; MOVWF 0x20,A -> ram=5. MOVLW 2. SUBFWB 0x20,F,A with C
-    // initially clear (borrow-in=1): 5 - 2 - 1 = 2.
+    // initially clear (borrow-in=1): W - f - 1 = 2 - 5 - 1 = 0xFC.
+    // Hardware-confirmed against `gpasm -p p18f4550` bytes plus MPLAB SIM
+    // (epic-cc#632).
     let words = vec![0x0E05, 0x6E20, 0x0E02, 0x5620];
+    let mut p = Pic18::new(words);
+    p.run(10);
+    assert_eq!(p.ram()[0x20], 0xFC);
+}
+
+#[test]
+fn subwfb_subtracts_f_minus_w_with_borrow() {
+    // MOVLW 5; MOVWF 0x20,A -> ram=5. MOVLW 2. SUBWFB 0x20,F,A with C
+    // clear (borrow-in=1): f - W - 1 = 5 - 2 - 1 = 2. Same opcode pair as
+    // SUBFWB above with the operands reversed, which is what makes the two
+    // distinct (epic-cc#632).
+    let words = vec![0x0E05, 0x6E20, 0x0E02, 0x5A20];
     let mut p = Pic18::new(words);
     p.run(10);
     assert_eq!(p.ram()[0x20], 2);
