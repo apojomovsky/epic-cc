@@ -2280,3 +2280,38 @@ fn main_context_guard_touch_passes() {
     let m2 = legalize(m);
     assert!(m2.funcs.iter().any(|f| f.name == "main"));
 }
+
+/// RAII preservation (#459): destructor calls on every exit path survive
+/// the pass unchanged in count and target. Void callees never qualify
+/// for call-site sinking, and with no ISR present no copy exists to
+/// duplicate into.
+#[test]
+fn cleanup_calls_survive_legalize_unchanged() {
+    let m = parse(
+        "fn dtor(i8) (0=i8)\n\
+           block entry:\n\
+             ret void\n\
+         fn work(i8) (0=i8)\n\
+           block entry:\n\
+             call void @dtor(i8 %0)\n\
+             call void @dtor(i8 %0)\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @work(i8 1)\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    let work = m2.funcs.iter().find(|f| f.name == "work").expect("work");
+    let calls = work
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .filter(|i| matches!(i, Inst::Call(c) if c.func == "dtor"))
+        .count();
+    assert_eq!(calls, 2, "both cleanup calls must survive");
+    assert!(
+        m2.funcs.iter().any(|f| f.name == "dtor"),
+        "called dtor def must stay"
+    );
+}
