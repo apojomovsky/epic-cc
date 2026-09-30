@@ -1209,7 +1209,7 @@ fn parses_isr_marker_and_inttoptr() {
         "isr marker header\n---\n{out}"
     );
     assert!(
-        out.contains("store i8 85 0x06"),
+        out.contains("store volatile i8 85 0x06"),
         "literal ptr store\n---\n{out}"
     );
     let m2 = ir::parse(&out);

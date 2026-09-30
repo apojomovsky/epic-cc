@@ -48,6 +48,14 @@ fn strip_attrs(s: &str) -> String {
     out
 }
 
+/// True when a `load`/`store` first operand carries the LLVM `volatile`
+/// marker (`load volatile i8, ...`). Reads the raw operand before
+/// `strip_attrs` erases the marker; matches whole tokens only, so a
+/// symbol containing the substring never trips it.
+fn has_volatile_marker(arg: &str) -> bool {
+    arg.split_whitespace().any(|t| t == "volatile")
+}
+
 fn ty_of(s: &str, loc: Option<&SrcLoc>) -> Ty {
     // Attribute-decorated operand types arrive whole (`ptr noundef`,
     // `range(i16 -255, 256)`): key off the leading type token.
@@ -427,7 +435,7 @@ fn decode_named_struct(
     types: &StructTypes,
     refs: &mut Vec<(usize, String)>,
 ) -> Vec<u8> {
-    let name = ty.trim().trim_start_matches('%');
+    let name = struct_key(ty);
     let info = types
         .get(name)
         .unwrap_or_else(|| panic!("irparse: unknown struct type {ty:?}"));
@@ -1065,7 +1073,7 @@ fn ty_size_align(t: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> (u16, u8
         (size as u16, ea)
     } else if let Some(n) = t.strip_prefix('%') {
         let info = types
-            .get(n)
+            .get(struct_key(n))
             .unwrap_or_else(|| panic!("{}irparse: unknown struct type {t}", loc_prefix(loc)));
         (u16::from(info.size), info.align)
     } else if t.starts_with('{') || t.starts_with("<{") {
@@ -1101,7 +1109,9 @@ fn ty_size_align_opt(t: &str, types: &StructTypes) -> Option<(u16, u8)> {
         }
         Some((size as u16, ea))
     } else if let Some(n) = t.strip_prefix('%') {
-        types.get(n).map(|s| (u16::from(s.size), s.align))
+        types
+            .get(struct_key(n))
+            .map(|s| (u16::from(s.size), s.align))
     } else {
         match t {
             "i1" | "i8" | "i6" => Some((1, 1)),
@@ -1140,10 +1150,25 @@ fn compute_struct(fields: &[String], types: &StructTypes, packed: bool) -> Optio
     })
 }
 
-/// Collect `%struct.X = type { ... }` and `%union.X = type { ... }`
+/// Normalize a struct-table key: strip the leading `%`, then the quotes
+/// clang puts around names containing `::` (`%"class.ns::Y"`). Each side
+/// strips independently: the table builder consumes the opening quote
+/// with its prefix match, so stored fragments keep only the trailing
+/// one. Unquoted names pass through unchanged, so C shapes behave
+/// exactly as before.
+fn struct_key(tok: &str) -> &str {
+    let t = tok.trim().trim_start_matches('%');
+    let t = t.strip_prefix('"').unwrap_or(t);
+    t.strip_suffix('"').unwrap_or(t)
+}
+
+/// Collect `%struct.X = type { ... }`, `%union.X`, and the C++ `%class.X`
 /// declarations into a resolved size/layout table (fixpoint over
 /// forward/recursive struct references). clang normalizes a union to its
 /// largest member plus trailing padding, so the same layout rules apply.
+/// Namespaced classes arrive quoted (`%"class.ns::Y" = type ...`); the
+/// table keys the bare name and every lookup normalizes through
+/// `struct_key`, so all spellings meet at one entry (epic-cc#799).
 fn build_struct_table(src: &str) -> StructTypes {
     let mut decls: Vec<(String, Vec<String>, bool)> = Vec::new();
     for line in src.lines() {
@@ -1152,11 +1177,23 @@ fn build_struct_table(src: &str) -> StructTypes {
             ("struct.", rest)
         } else if let Some(rest) = l.strip_prefix("%union.") {
             ("union.", rest)
+        } else if let Some(rest) = l.strip_prefix("%class.") {
+            ("class.", rest)
+        } else if let Some(q) = l.strip_prefix("%\"") {
+            if let Some(rest) = q.strip_prefix("struct.") {
+                ("struct.", rest)
+            } else if let Some(rest) = q.strip_prefix("union.") {
+                ("union.", rest)
+            } else if let Some(rest) = q.strip_prefix("class.") {
+                ("class.", rest)
+            } else {
+                continue;
+            }
         } else {
             continue;
         };
         let eq = rest.find('=').unwrap();
-        let name = format!("{}{}", kind, rest[..eq].trim());
+        let name = format!("{}{}", kind, struct_key(&rest[..eq]));
         let ty_str = rest[eq + 1..]
             .trim()
             .strip_prefix("type ")
@@ -1196,6 +1233,75 @@ fn build_struct_table(src: &str) -> StructTypes {
         );
     }
     types
+}
+
+/// Collect `@alias = ... alias <ty>, <targetty> @target` lines into an
+/// alias-to-target map (both names bare, no `@`). clang++ emits these for
+/// C1/D1 constructor and D1/D2 destructor pairs; the pinned clang calls
+/// the C2/D2 target directly at -O0 and -O1 in every probe so far, which
+/// makes this tolerance-only, but -O0 is documented to call the alias and
+/// the top-level loop otherwise drops the line silently (epic-cc#799).
+/// Call targets resolve through this map in a post-pass over the parsed
+/// functions, so no instruction parser changes shape for it.
+fn build_alias_map(src: &str) -> HashMap<String, String> {
+    let mut aliases = HashMap::new();
+    for line in src.lines() {
+        let l = line.trim();
+        if !l.starts_with('@') {
+            continue;
+        }
+        let Some(eq) = l.find('=') else { continue };
+        let after = l[eq + 1..].trim();
+        if !after.split_whitespace().any(|t| t == "alias") {
+            continue;
+        }
+        let name = l[1..eq].trim().trim_matches('"').to_string();
+        let target = after
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("")
+            .trim_start_matches('@')
+            .trim_matches('"')
+            .trim_end_matches(',')
+            .to_string();
+        aliases.insert(name, target);
+    }
+    aliases
+}
+
+/// Resolve C1/D1 alias call targets to their C2/D2 definitions and reject
+/// calls outside the EC++ subset, naming the rule (epic-cc#799). Heap
+/// `new`/`delete` (`_Znw*`/`_Zna*`/`_Zdl*`/`_Zda*`, scalar and array forms)
+/// are banned even though the PIC18 arena heap exists: EC++ has no heap.
+/// `_ZThn*` thunk calls are the multiple-inheritance shape the `define`
+/// arm never saw (e.g. declared but defined in another TU).
+fn resolve_aliases_and_reject(funcs: &mut [Func], aliases: &HashMap<String, String>) {
+    for f in funcs {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                let Inst::Call(c) = inst else { continue };
+                if let Some(target) = aliases.get(&c.func) {
+                    c.func = target.clone();
+                }
+                if c.func.starts_with("_Znw")
+                    || c.func.starts_with("_Zna")
+                    || c.func.starts_with("_Zdl")
+                    || c.func.starts_with("_Zda")
+                {
+                    panic!(
+                        "irparse: heap new/delete are not in the EC++ subset (call to @{})",
+                        c.func
+                    );
+                }
+                if c.func.starts_with("_ZThn") {
+                    panic!(
+                        "irparse: multiple inheritance is not in the EC++ subset (thunk call @{})",
+                        c.func
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// Generates fresh registers for synthesized (materialized) GEP insts.
@@ -1807,7 +1913,7 @@ fn struct_field(cur: &str, idx: usize, types: &StructTypes) -> (u16, String) {
     let cur = cur.trim();
     if let Some(name) = cur.strip_prefix('%') {
         let info = types
-            .get(name)
+            .get(struct_key(name))
             .unwrap_or_else(|| panic!("irparse: unknown struct type {cur}"));
         assert!(
             idx < info.fields.len(),
@@ -2068,7 +2174,7 @@ fn parse_call_arg(
             if let Some(rest) = t.strip_prefix("byval(") {
                 let inner = rest.trim_end_matches(')');
                 let info = types
-                    .get(inner.trim_start_matches('%'))
+                    .get(struct_key(inner))
                     .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
                 byval = Some(byval_size(info, inner));
             } else if t.starts_with("sret(") {
@@ -2105,7 +2211,7 @@ fn parse_call_arg(
                     if let Some(rest) = t.strip_prefix("byval(") {
                         let inner = rest.trim_end_matches(')');
                         let info = types
-                            .get(inner.trim_start_matches('%'))
+                            .get(struct_key(inner))
                             .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
                         byval = Some(byval_size(info, inner));
                     } else if t.starts_with("sret(") {
@@ -2172,7 +2278,7 @@ fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
                 if let Some(rest) = t.strip_prefix("byval(") {
                     let inner = rest.trim_end_matches(')');
                     let info = types
-                        .get(inner.trim_start_matches('%'))
+                        .get(struct_key(inner))
                         .unwrap_or_else(|| panic!("irparse: unknown byval type {inner}"));
                     byval = Some(byval_size(info, inner));
                 } else if t.starts_with("sret(") {
@@ -2180,12 +2286,15 @@ fn parse_param(p: &str, types: &StructTypes, loc: Option<&SrcLoc>) -> Param {
                 } else if t.starts_with('%') {
                     name = t.trim_start_matches('%').to_string();
                 } else if t.starts_with("initializes")
+                    || t.starts_with("dereferenceable(")
                     || t.starts_with("range(")
                     || t.starts_with("align(")
                     || t.starts_with("captures(")
                     || t.starts_with('#')
                 {
-                    // paren group / attr-group ref
+                    // paren group / attr-group ref (`dereferenceable(N)` rides
+                    // on C++ `this` and reference params, epic-cc#799; the
+                    // call-arg path already tolerates both spellings)
                 } else {
                     panic!(
                         "{}irparse: unsupported param type token {t:?} in {p:?}",
@@ -2247,6 +2356,7 @@ pub fn parse_ll(src: &str) -> Module {
 /// target, keeps the compare-chain expansion.
 pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
     let types = build_struct_table(src);
+    let aliases = build_alias_map(src);
     let mut fresh = Fresh::new(src);
     let attr_map = build_attr_map(src);
     let dbg = build_debug_info(src);
@@ -2396,11 +2506,9 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
                 .next()
                 .filter(|t| t.starts_with('%'))
             {
-                let info = types
-                    .get(struct_tok.trim_start_matches('%'))
-                    .unwrap_or_else(|| {
-                        panic!("irparse: unknown struct type {struct_tok} for @{name}")
-                    });
+                let info = types.get(struct_key(struct_tok)).unwrap_or_else(|| {
+                    panic!("irparse: unknown struct type {struct_tok} for @{name}")
+                });
                 let size = u16::from(info.size);
                 let init = rest[struct_tok.len()..].trim();
                 let bytes = if init.starts_with("zeroinitializer") {
@@ -2477,6 +2585,9 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
             let at = line.find('@').unwrap();
             let open = line[at..].find('(').unwrap() + at;
             let name = line[at + 1..open].trim().to_string();
+            if name.starts_with("_ZThn") {
+                panic!("irparse: multiple inheritance is not in the EC++ subset (thunk {name})");
+            }
             let params_str = balanced_inner(&line[open + 1..]).unwrap();
             let head = strip_attrs(&line[..at]);
             let isr = head.split_whitespace().any(|t| t == "msp430_intrcc");
@@ -2760,6 +2871,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
             }
         }
     }
+    resolve_aliases_and_reject(&mut funcs, &aliases);
     Module {
         globals,
         funcs,
@@ -2975,6 +3087,7 @@ fn parse_inst(
         }
         "load" => {
             let args = split_top_level(&rest["load".len()..], ',');
+            let volatile = has_volatile_marker(args[0]);
             let ty = ty_of(strip_attrs(args[0]).trim(), cur.as_ref());
             let ptr = parse_ptr_operand(args[1], types, fresh, &mut out, cur.as_ref());
             out.push(Inst::Load(Load {
@@ -2982,6 +3095,7 @@ fn parse_inst(
                 ty,
                 ptr,
                 ptr_ty: strip_attrs(args[0]).trim().starts_with("ptr"),
+                volatile,
                 loc: cur.clone(),
             }));
         }
@@ -3004,6 +3118,7 @@ fn parse_inst(
                 ty,
                 val,
                 ptr,
+                volatile: has_volatile_marker(args[0]),
                 loc: cur.clone(),
             }));
         }

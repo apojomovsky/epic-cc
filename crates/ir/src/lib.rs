@@ -68,6 +68,11 @@ pub struct Load {
     /// a ptr arg pass all read those bytes). False for value loads
     /// (i1/i8/i16/f32), which lower as plain copies.
     pub ptr_ty: bool,
+    /// LLVM `volatile` marker (memory-mapped registers, ISR-shared flags).
+    /// Every backend pass treats memory accesses conservatively today, so
+    /// this changes no lowering; it preserves that property once a pass
+    /// learns to elide or reorder accesses (epic-cc#799, epic-cc#812).
+    pub volatile: bool,
     pub loc: Option<SrcLoc>,
 } // ptr = "@name" or "%name"
 #[derive(Clone, Debug)]
@@ -75,6 +80,8 @@ pub struct Store {
     pub ty: Ty,
     pub val: Val,
     pub ptr: String,
+    /// LLVM `volatile` marker, same contract as `Load::volatile`.
+    pub volatile: bool,
     pub loc: Option<SrcLoc>,
 }
 #[derive(Clone, Debug)]
@@ -870,9 +877,13 @@ fn inst_str(i: &Inst) -> String {
             } else {
                 ty_str(l.ty)
             };
-            format!("%{} = load {} {}", l.dst, t, l.ptr)
+            let v = if l.volatile { "volatile " } else { "" };
+            format!("%{} = load {v}{t} {}", l.dst, l.ptr)
         }
-        Inst::Store(s) => format!("store {} {} {}", ty_str(s.ty), val_str(&s.val), s.ptr),
+        Inst::Store(s) => {
+            let v = if s.volatile { "volatile " } else { "" };
+            format!("store {v}{} {} {}", ty_str(s.ty), val_str(&s.val), s.ptr)
+        }
         Inst::Bin(b) => format!(
             "%{} = {} {} {} {}",
             b.dst,
@@ -1601,10 +1612,15 @@ fn parse_inst(line: &str) -> Inst {
     }
     if let Some(rest) = line.strip_prefix("store ") {
         let parts: Vec<&str> = rest.split_whitespace().collect();
+        let (volatile, parts) = match parts.as_slice() {
+            ["volatile", rest @ ..] => (true, rest),
+            _ => (false, parts.as_slice()),
+        };
         return Inst::Store(Store {
             ty: parse_ty(parts[0]),
             val: parse_val(parts[1]),
             ptr: parts[2].to_string(),
+            volatile,
             loc: None,
         });
     }
@@ -1729,7 +1745,11 @@ fn parse_inst(line: &str) -> Inst {
     }
     if let Some(rest) = body.strip_prefix("load ") {
         let mut it = rest.split_whitespace();
-        let ty_tok = it.next().unwrap();
+        let first = it.next().unwrap();
+        let (volatile, ty_tok) = match first {
+            "volatile" => (true, it.next().unwrap()),
+            t => (false, t),
+        };
         let ptr_ty = ty_tok == "ptr";
         let t = parse_ty(ty_tok);
         let ptr = it.next().unwrap().to_string();
@@ -1738,6 +1758,7 @@ fn parse_inst(line: &str) -> Inst {
             ty: t,
             ptr,
             ptr_ty,
+            volatile,
             loc: None,
         });
     }

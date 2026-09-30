@@ -519,6 +519,7 @@ mod tests {
             ty: Ty::I16,
             val: Val::Global("f".to_string()),
             ptr: "%a".to_string(),
+            volatile: false,
             loc: None,
         }));
         for (g, k) in [("g2", 2u16), ("g3", 6u16), ("g4", 10u16)] {
@@ -534,6 +535,7 @@ mod tests {
                 ty,
                 val: Val::Const(0x01020304),
                 ptr: format!("%{g}"),
+                volatile: false,
                 loc: None,
             }));
         }
@@ -576,6 +578,7 @@ mod tests {
                 dst: "v".to_string(),
                 ty: Ty::I64,
                 ptr: "@c".to_string(),
+                volatile: false,
                 ptr_ty: false,
                 loc: None,
             }),
@@ -583,6 +586,7 @@ mod tests {
                 ty: Ty::I64,
                 val: Val::Reg("v".to_string()),
                 ptr: "%a".to_string(),
+                volatile: false,
                 loc: None,
             }),
         ]));
@@ -626,6 +630,7 @@ mod tests {
                 dst: "v".to_string(),
                 ty: Ty::I64,
                 ptr: "@c".to_string(),
+                volatile: false,
                 ptr_ty: false,
                 loc: None,
             }),
@@ -633,12 +638,14 @@ mod tests {
                 ty: Ty::I64,
                 val: Val::Reg("v".to_string()),
                 ptr: "%a".to_string(),
+                volatile: false,
                 loc: None,
             }),
             Inst::Store(Store {
                 ty: Ty::I64,
                 val: Val::Reg("v".to_string()),
                 ptr: "%b".to_string(),
+                volatile: false,
                 loc: None,
             }),
         ]));
@@ -674,6 +681,7 @@ mod tests {
             ty: Ty::I16,
             val: Val::Global("f".to_string()),
             ptr: "%a".to_string(),
+            volatile: false,
             loc: None,
         }));
         for (g, k, ty, val) in [
@@ -692,6 +700,7 @@ mod tests {
                 ty,
                 val,
                 ptr: format!("%{g}"),
+                volatile: false,
                 loc: None,
             }));
         }
@@ -737,12 +746,14 @@ mod tests {
                 ty: Ty::I32,
                 val: Val::Const(1),
                 ptr: "%a".to_string(),
+                volatile: false,
                 loc: None,
             }),
             Inst::Store(Store {
                 ty: Ty::I32,
                 val: Val::Reg("x".to_string()),
                 ptr: "%a".to_string(),
+                volatile: false,
                 loc: None,
             }),
         ]));
@@ -776,6 +787,7 @@ mod tests {
                 ty: Ty::I32,
                 val: Val::Const(0x01020304),
                 ptr: format!("%{g}"),
+                volatile: false,
                 loc: None,
             }));
         }
@@ -814,6 +826,7 @@ mod tests {
             ty: Ty::I16,
             val: Val::Global("f".to_string()),
             ptr: "%a".to_string(),
+            volatile: false,
             loc: None,
         }));
         for (g, k, ty) in [
@@ -832,6 +845,7 @@ mod tests {
                 ty,
                 val: Val::Const(0),
                 ptr: format!("%{g}"),
+                volatile: false,
                 loc: None,
             }));
         }
@@ -867,6 +881,7 @@ mod tests {
             ty: Ty::I16,
             val: Val::Global("f".to_string()),
             ptr: "%a".to_string(),
+            volatile: false,
             loc: None,
         }));
         for (g, k, ty, val) in [
@@ -885,6 +900,7 @@ mod tests {
                 ty,
                 val,
                 ptr: format!("%{g}"),
+                volatile: false,
                 loc: None,
             }));
         }
