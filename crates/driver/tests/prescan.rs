@@ -332,3 +332,67 @@ fn delay_use_ignores_directive_lines() {
     )]))
     .is_none());
 }
+
+#[test]
+fn finds_epic_config_after_a_char_literal_holding_a_quote() {
+    let found = find_epic_config(&src(&[(
+        "main.c",
+        "char q = '\"';\nEPIC_CONFIG(\"osc=hspll\");\n",
+    )]));
+    assert_eq!(found.as_deref(), Some("osc=hspll"));
+}
+
+#[test]
+fn finds_pragma_config_after_a_char_literal_holding_a_quote() {
+    let found = pragma_in("char q = '\"';\n#pragma config FOSC = HS\n");
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].value, "HS");
+    assert_eq!(found[0].line, 2);
+}
+
+#[test]
+fn finds_xtal_freq_after_a_char_literal_holding_a_quote() {
+    let found = driver::prescan::find_xtal_freq(&src(&[(
+        "main.c",
+        "char q = '\"';\n#define _XTAL_FREQ 4000000\n",
+    )]))
+    .unwrap();
+    assert_eq!(found.value, Some(4_000_000));
+}
+
+#[test]
+fn finds_delay_use_after_a_char_literal_holding_a_quote() {
+    let hit = driver::prescan::find_delay_use(&src(&[(
+        "main.c",
+        "char q = '\"';\nvoid main(void) { __delay_ms(10); }\n",
+    )]))
+    .unwrap();
+    assert_eq!(hit.name, "__delay_ms");
+    assert_eq!(hit.line, 2);
+}
+
+#[test]
+fn skips_an_escaped_quote_inside_a_char_literal() {
+    let found = find_epic_config(&src(&[(
+        "main.c",
+        "char q = '\\'';\nEPIC_CONFIG(\"osc=hspll\");\n",
+    )]));
+    assert_eq!(found.as_deref(), Some("osc=hspll"));
+}
+
+#[test]
+fn an_unterminated_quote_does_not_swallow_the_next_line() {
+    let found = find_epic_config(&src(&[(
+        "main.c",
+        "char q = ';\nEPIC_CONFIG(\"osc=hspll\");\n",
+    )]));
+    assert_eq!(found.as_deref(), Some("osc=hspll"));
+}
+
+#[test]
+fn xtal_freq_still_accepts_digit_separators() {
+    let found =
+        driver::prescan::find_xtal_freq(&src(&[("main.c", "#define _XTAL_FREQ 4'000'000\n")]))
+            .unwrap();
+    assert_eq!(found.value, Some(4_000_000));
+}
