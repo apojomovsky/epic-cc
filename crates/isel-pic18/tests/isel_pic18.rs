@@ -7511,3 +7511,60 @@ fn bitmask_lane_across_store_reads_loaded_slot() {
     );
     assert_lane_domain(&asm, 0x20, 0x21, &|f, o| if f == 1 { o | 0x04 } else { o });
 }
+
+#[test]
+fn i32_sub_emits_subwf_then_subwfb_borrow_chain() {
+    // epic-cc#632: the multi-byte borrow chain is `a - b - borrow`, which
+    // on PIC18 is `SUBWFB`, not `SUBFWB` (`W - f - borrow`). The wrong
+    // mnemonic passed every sim gate because the simulator decoded both
+    // opcodes with one formula; MPLAB SIM follows the datasheet. Pin the
+    // emitted text so a regression points at the emitter, not at USART.
+    let m = parse(
+        "global a i32\nglobal b i32\nglobal out i32\n\
+         fn main(void) ()\n  block entry:\n    %1 = load i32 @a\n    %2 = load i32 @b\n\
+         %3 = sub i32 %1, %2\n    store i32 %3 @out\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("a", 0x20),
+        ("b", 0x24),
+        ("out", 0x28),
+        ("main::1", 0x30),
+        ("main::2", 0x34),
+        ("main::3", 0x38),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("SUBWF "), "byte 0 subtract:\n{asm}");
+    assert_eq!(
+        asm.matches("SUBWFB").count(),
+        3,
+        "bytes 1-3 borrow subtracts:\n{asm}"
+    );
+    assert!(
+        !asm.contains("SUBFWB"),
+        "no reversed-operand borrow op:\n{asm}"
+    );
+}
+
+#[test]
+fn udiv_u32_recipe_subtracts_with_subwfb_borrow_chain() {
+    // epic-cc#632: the runtime divide's `rem -= den` chain needs the
+    // borrow-in form `SUBWFB` (f - W - borrow); `SUBFWB` computes the
+    // reversed `W - f - borrow` and silently corrupts every quotient
+    // whose borrow crosses a byte boundary.
+    let m = parse(
+        "fn __udiv_u32(i16) (num=i32, den=i32)\n  block entry:\n    %__scr = alloca 7\n    ret i16 0\n\
+         fn main(void) ()\n  block entry:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("__udiv_u32::num", 0x20),
+        ("__udiv_u32::den", 0x24),
+        ("__udiv_u32::__scr", 0x30),
+    ]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("SUBWF "), "lane 0 plain subtract:\n{asm}");
+    assert!(asm.contains("SUBWFB"), "borrow-in lanes use SUBWFB:\n{asm}");
+    assert!(
+        !asm.contains("SUBFWB"),
+        "no reversed-operand borrow op:\n{asm}"
+    );
+}
