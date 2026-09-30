@@ -31,7 +31,7 @@ fn with_bytes(mut m: Module, name: &str, bytes: &[u8]) -> Module {
 fn with_refs(mut m: Module, name: &str, refs: &[(usize, &str)]) -> Module {
     for g in &mut m.globals {
         if g.name == name {
-            g.refs = refs.iter().map(|(o, f)| (*o, f.to_string())).collect();
+            g.refs = refs.iter().map(|(o, f)| (*o, f.to_string(), 0)).collect();
         }
     }
     m

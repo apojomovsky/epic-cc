@@ -629,12 +629,15 @@ pub struct Global {
     pub size: u16,
     pub bytes: Vec<u8>,
     /// Byte offsets into `bytes` holding a global's address (a `ptr @fn`
-    /// function label or a `ptr @ram` RAM-global field). The table
-    /// emitters and the const-to-RAM init materialize the address's low
-    /// and high byte at these offsets, not the placeholder zero bytes: a
-    /// label literal for flash targets, resolved numeric bytes for RAM
-    /// targets (epic-cc#154, epic-cc#443).
-    pub refs: Vec<(usize, String)>,
+    /// function label or a `ptr @ram` RAM-global field). Each entry is
+    /// `(blob offset, target name, byte addend into the target)`: the
+    /// table emitters and the const-to-RAM init materialize
+    /// `(address + addend)` low and high bytes at the offset, not the
+    /// placeholder zero bytes. Plain references carry addend 0; a vptr
+    /// initializer folds its constant GEP to `(vtable, slot offset),
+    /// so the slot address (not the table base) is what the dispatch
+    /// load reads (epic-cc#154, epic-cc#443, epic-cc#460).
+    pub refs: Vec<(usize, String, u16)>,
     pub addr: Option<u16>,
 }
 

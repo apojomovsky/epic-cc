@@ -2964,7 +2964,7 @@ fn drop_dead_isr_originals(
     }
     let mut live: HashSet<String> = HashSet::new();
     for g in globals {
-        for (_, name) in &g.refs {
+        for (_, name, _) in &g.refs {
             if spell.contains_key(name.as_str()) {
                 live.insert(name.clone());
             }
@@ -3084,8 +3084,9 @@ fn fill_indirect_callees(
             .is_some_and(|orig| stored.contains(orig))
     };
     // Address-taken set: every `Val::Global(f)` where `f` is a defined
-    // function. Non-const globals with `ptr` initializers are zeroinit and
-    // contribute nothing; const fp tables panic at parse: outside this scope.
+    // function. Non-const globals with `ptr` initializers are zeroinit
+    // and contribute nothing; const fp tables (including C++ vtables,
+    // epic-cc#460) decode with refs and join through the loop below.
     let defined: HashSet<String> = m.funcs.iter().map(|f| f.name.clone()).collect();
     let mut addr_taken: HashSet<String> = HashSet::new();
     for f in &m.funcs {
@@ -3099,7 +3100,7 @@ fn fill_indirect_callees(
     // flash: the functions are address-taken, so an indirect call through
     // a loaded field can dispatch them (epic-cc#154).
     for g in &m.globals {
-        for (_, f) in &g.refs {
+        for (_, f, _) in &g.refs {
             addr_taken.insert(f.clone());
         }
     }

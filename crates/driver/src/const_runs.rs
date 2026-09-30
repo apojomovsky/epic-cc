@@ -321,7 +321,7 @@ fn table_store_runs(m: &mut Module) {
                 }
                 let n = run.len();
                 let mut bytes: Vec<u8> = Vec::with_capacity(n);
-                let mut refs: Vec<(usize, String)> = Vec::new();
+                let mut refs: Vec<(usize, String, u16)> = Vec::new();
                 let mut cheap = 0usize;
                 for member in &run.members {
                     for rb in &member.bytes {
@@ -332,7 +332,7 @@ fn table_store_runs(m: &mut Module) {
                             }
                             RunByte::Lit(v) => bytes.push(*v),
                             RunByte::Ref(sym) => {
-                                refs.push((bytes.len(), sym.clone()));
+                                refs.push((bytes.len(), sym.clone(), 0));
                                 bytes.push(0);
                             }
                         }
@@ -712,7 +712,10 @@ mod tests {
             .find(|g| g.is_const && g.name.starts_with("__tbl.init.main."));
         let tbl = tbl.expect("a table must be synthesized");
         assert_eq!(tbl.bytes.len(), 12);
-        assert_eq!(tbl.refs, vec![(0, "f".to_string()), (1, "f".to_string())]);
+        assert_eq!(
+            tbl.refs,
+            vec![(0, "f".to_string(), 0), (1, "f".to_string(), 0)]
+        );
         assert_eq!(tbl.bytes[2], 0x04, "little-endian literal layout");
         let insts = &m.funcs[1].blocks[0].insts;
         let copies: Vec<_> = insts

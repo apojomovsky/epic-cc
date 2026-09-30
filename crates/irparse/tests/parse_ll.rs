@@ -2292,7 +2292,7 @@ fn scalar_pointer_initializer_records_both_address_halves() {
     let g = m.globals.iter().find(|g| g.name == "p").expect("p");
     assert_eq!(
         g.refs,
-        vec![(0usize, "x".to_string()), (1, "x".to_string())],
+        vec![(0usize, "x".to_string(), 0), (1, "x".to_string(), 0)],
         "a ptr global records a ref at each address half"
     );
     assert!(g.needs_ram_init(), "a pointer initializer needs its write");

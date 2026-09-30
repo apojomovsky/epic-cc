@@ -333,11 +333,112 @@ fn strip_self_type<'a>(ty: &str, value: &'a str) -> &'a str {
 /// `zeroinitializer`, a scalar, a `c"..."` or `[...]` array value, or a
 /// nested `{ ... }` struct value (possibly self-type-prefixed). Unknown
 /// shapes panic: invariant holds every global initializer takes one form.
+/// Byte offset and field type of struct field `idx`, mirroring the layout
+/// walk in the struct decoders (packed records skip alignment rounding).
+fn struct_field_offset(
+    fields: &[String],
+    packed: bool,
+    idx: usize,
+    types: &StructTypes,
+) -> (u16, String) {
+    let mut off: u16 = 0;
+    for (i, f) in fields.iter().enumerate() {
+        if f.is_empty() {
+            continue;
+        }
+        let (fsize, falign) = ty_size_align(f, types, None);
+        if !packed {
+            off = round_up(off, falign);
+        }
+        if i == idx {
+            return (off, f.clone());
+        }
+        off += fsize;
+    }
+    panic!("irparse: struct field index {idx} out of range");
+}
+
+/// Fold a constant `getelementptr` initializer (a C++ vptr slot address)
+/// to its `(base global, byte offset)`. Only constant `iNN` indices
+/// fold; anything else panics loudly rather than emitting a wrong
+/// address. The operand list is the last paren group (attribute lists
+/// like `inrange(a, b)` ride ahead of it), which is safe because
+/// constant indices carry no parens of their own.
+fn fold_const_gep(value: &str, types: &StructTypes) -> (String, u16) {
+    let g = value.trim().strip_prefix("ptr ").unwrap_or(value.trim());
+    let g = g
+        .strip_prefix("getelementptr")
+        .unwrap_or_else(|| panic!("SPIKE LIMIT: non-constant pointer initializer {value:?}"));
+    let open = g
+        .rfind('(')
+        .unwrap_or_else(|| panic!("SPIKE LIMIT: malformed getelementptr initializer {value:?}"));
+    let args = balanced_inner(&g[open + 1..])
+        .unwrap_or_else(|| panic!("SPIKE LIMIT: unbalanced getelementptr parens in {value:?}"));
+    let parts = split_top_level(args, ',');
+    let mut cur = parts[0].trim().to_string();
+    let base = parts[1]
+        .trim()
+        .split_whitespace()
+        .next_back()
+        .unwrap_or("")
+        .trim_start_matches('@')
+        .to_string();
+    let mut off: u16 = 0;
+    let mut first = true;
+    for p in &parts[2..] {
+        let k: u16 = p
+            .trim()
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("")
+            .parse()
+            .unwrap_or_else(|_| panic!("SPIKE LIMIT: non-constant GEP index {p:?} in {value:?}"));
+        if first {
+            let (sz, _) = ty_size_align(&cur, types, None);
+            off += k * sz;
+            first = false;
+            continue;
+        }
+        let t = cur.trim().to_string();
+        if t.starts_with('[') {
+            let close = matching_bracket(&t).expect("array type must balance");
+            let elem = t[1..close].splitn(2, 'x').nth(1).unwrap().trim();
+            let (esz, _) = ty_size_align(elem, types, None);
+            off += k * esz;
+            cur = elem.to_string();
+        } else if t.starts_with('{') || t.starts_with("<{") || t.starts_with('%') {
+            let (fields, packed) = if t.starts_with('%') {
+                let info = types
+                    .get(struct_key(&t))
+                    .unwrap_or_else(|| panic!("irparse: unknown struct type {t} in {value:?}"));
+                (info.fields.clone(), info.packed)
+            } else {
+                let inner = brace_inner(&t).expect("struct type must balance");
+                (
+                    split_top_level(inner, ',')
+                        .iter()
+                        .map(|s| s.trim().to_string())
+                        .collect(),
+                    packed_braces(&t),
+                )
+            };
+            let (foff, fty) = struct_field_offset(&fields, packed, k as usize, types);
+            off += foff;
+            cur = fty;
+        } else {
+            panic!("SPIKE LIMIT: GEP descends into scalar {t:?} in {value:?}");
+        }
+    }
+    (base, off)
+}
+
+/// Decode one constant of a literal or named type into its flat
+/// little-endian blob, appending `(byte offset, target, addend)` refs.
 fn decode_typed_value(
     ty: &str,
     value: &str,
     types: &StructTypes,
-    refs: &mut Vec<(usize, String)>,
+    refs: &mut Vec<(usize, String, u16)>,
 ) -> Vec<u8> {
     let ty = ty.trim();
     let value = strip_self_type(ty, value).trim();
@@ -359,15 +460,18 @@ fn decode_typed_value(
         let bytes = if elem == "i8" && value.starts_with('c') && value.contains('"') {
             parse_string_literal(value)
         } else if value.starts_with('[') {
-            // Non-scalar element type (nested struct, named struct, or a
-            // further-nested array, epic-cc#444): each element recurses
-            // through decode_typed_value rather than the scalar
-            // parse_array_elements path, since only decode_typed_value knows
-            // how to unwrap the element's own self-type prefix.
+            // Non-scalar element type (nested struct, named struct, a
+            // further-nested array (epic-cc#444), or a `ptr` table as in a
+            // C++ vtable `{ [3 x ptr] }` (epic-cc#460)): each element
+            // recurses through decode_typed_value rather than the scalar
+            // parse_array_elements path, since only decode_typed_value
+            // knows how to unwrap the element's own self-type prefix and
+            // record function-address refs.
             if elem.starts_with('{')
                 || elem.starts_with("<{")
                 || elem.starts_with('%')
                 || elem.starts_with('[')
+                || elem == "ptr"
             {
                 let inner_list = value
                     .strip_prefix('[')
@@ -382,7 +486,7 @@ fn decode_typed_value(
                     let base = out.len();
                     let mut elt_refs = Vec::new();
                     out.extend(decode_typed_value(elem, elt, types, &mut elt_refs));
-                    refs.extend(elt_refs.into_iter().map(|(o, f)| (base + o, f)));
+                    refs.extend(elt_refs.into_iter().map(|(o, f, a)| (base + o, f, a)));
                 }
                 out
             } else {
@@ -406,6 +510,18 @@ fn decode_typed_value(
     if ty.starts_with('%') {
         return decode_named_struct(ty, value, types, refs);
     }
+    // A vptr slot address (`ptr getelementptr ... @vtable, ... K ...`):
+    // fold the constant GEP to its base and byte offset (epic-cc#460).
+    if value.trim_start().starts_with("ptr getelementptr")
+        || value.trim_start().starts_with("getelementptr")
+    {
+        let (base, add) = fold_const_gep(value, types);
+        let w = ty_of(ty, None).bytes() as usize;
+        for o in 0..w {
+            refs.push((o, base.clone(), add));
+        }
+        return vec![0u8; w];
+    }
     // Scalar value: `i8 65`, `i16 -5`, `float 1.500000e+00`.
     let (_, v) = value.split_once(' ').unwrap_or(("", value));
     let w = ty_of(ty, None).bytes() as usize;
@@ -420,7 +536,7 @@ fn decode_typed_value(
         // epic-cc#154, epic-cc#443).
         Val::Global(g) => {
             for o in 0..w {
-                refs.push((o, g.clone()));
+                refs.push((o, g.clone(), 0));
             }
             vec![0u8; w]
         }
@@ -437,7 +553,7 @@ fn decode_literal_struct(
     ty: &str,
     init: &str,
     types: &StructTypes,
-    refs: &mut Vec<(usize, String)>,
+    refs: &mut Vec<(usize, String, u16)>,
 ) -> Vec<u8> {
     let inner = brace_inner(ty).expect("literal struct type must be `{ ... }`");
     let ty_fields: Vec<&str> = split_top_level(inner, ',')
@@ -473,7 +589,11 @@ fn decode_literal_struct(
             if !v.is_empty() {
                 let mut frefs = Vec::new();
                 let fbytes = decode_typed_value(f, v, types, &mut frefs);
-                refs.extend(frefs.into_iter().map(|(o, g)| (usize::from(off) + o, g)));
+                refs.extend(
+                    frefs
+                        .into_iter()
+                        .map(|(o, g, a)| (usize::from(off) + o, g, a)),
+                );
                 assert_eq!(
                     fbytes.len(),
                     fsize as usize,
@@ -494,7 +614,7 @@ fn decode_named_struct(
     ty: &str,
     init: &str,
     types: &StructTypes,
-    refs: &mut Vec<(usize, String)>,
+    refs: &mut Vec<(usize, String, u16)>,
 ) -> Vec<u8> {
     let name = struct_key(ty);
     let info = types
@@ -541,7 +661,11 @@ fn decode_named_struct(
             if !val.is_empty() {
                 let mut frefs = Vec::new();
                 let fbytes = decode_typed_value(f, val, types, &mut frefs);
-                refs.extend(frefs.into_iter().map(|(o, g)| (usize::from(off) + o, g)));
+                refs.extend(
+                    frefs
+                        .into_iter()
+                        .map(|(o, g, a)| (usize::from(off) + o, g, a)),
+                );
                 assert_eq!(
                     fbytes.len(),
                     fsize as usize,
@@ -2562,7 +2686,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
 
         // Global definitions: "@name = ... global|constant <ty> ..."
         if line.starts_with('@') {
-            let mut refs: Vec<(usize, String)> = Vec::new();
+            let mut refs: Vec<(usize, String, u16)> = Vec::new();
             let eq = line.find('=').unwrap();
             let name = line[1..eq].trim().to_string();
             if name.starts_with("llvm.") {
@@ -2572,7 +2696,15 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
             let (is_const, rest) = if let Some(i) = after.find("global ") {
                 (false, &after[i + "global ".len()..])
             } else if let Some(i) = after.find("constant ") {
-                (true, &after[i + "constant ".len()..])
+                // A C++ vtable (`_ZTV*`, Itanium ABI prefix) decodes
+                // RAM-resident: the slot load dereferences its address
+                // through a runtime pointer, which the data-memory
+                // indirect lowering serves but a flash table cannot
+                // (runtime TBLRD is future work, filed separately).
+                // Nothing writes it after `__start`, so the 6 bytes
+                // per vtable are init-only RAM (epic-cc#460).
+                let vtable = name.starts_with("_ZTV");
+                (!vtable, &after[i + "constant ".len()..])
             } else {
                 continue;
             };

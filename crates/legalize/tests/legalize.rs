@@ -2315,3 +2315,37 @@ fn cleanup_calls_survive_legalize_unchanged() {
         "called dtor def must stay"
     );
 }
+
+/// A vtable slot ref (pos, target, addend) feeds the address-taken set
+/// through the const global, not an instruction: the indirect dispatch
+/// call collects the slot target as a callee (epic-cc#460). The canonical
+/// text carries no refs, so the test injects the decoded shape directly.
+#[test]
+fn fills_indirect_callees_from_vtable_refs() {
+    let mut m = parse(
+        "global vt i8\n\
+         fn tick(i8) (0=i8)\n  block entry:\n    ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %f = load i8 @vt\n\
+             call void @1(i8 %f)\n\
+             ret void\n",
+    );
+    for g in &mut m.globals {
+        if g.name == "vt" {
+            g.refs = vec![(4, "tick".to_string(), 0)];
+        }
+    }
+    let m2 = legalize(m);
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let call = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            ir::Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("indirect call");
+    assert_eq!(call.callees, vec!["tick".to_string()]);
+}
