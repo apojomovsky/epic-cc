@@ -11,6 +11,42 @@ pub enum Emit {
     Hex,
 }
 
+/// Optimization profile. The spellings match what PIC users already type;
+/// `-Os` is the default and keeps today's size-first pipeline byte for
+/// byte. Profiles select our own passes only: clang stays pinned at `-O1`
+/// (the input-format contract), whatever the profile says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OptLevel {
+    /// Whole-program constants folded, control flow untouched: no loop
+    /// restructure, no cross-function folding, no code factoring. The IR
+    /// stays closest to clang's output, for debugger stepping and
+    /// miscompile bisection, while real programs still fit in flash.
+    O0,
+    /// The curated pass list without any cross-function folding, code
+    /// factoring still on: bisects the always-inline step of `-Os`.
+    O1,
+    /// Speed: no code factoring, and single-call-site callees fold even
+    /// into `main`/ISR roots within a frame budget. Costs flash and
+    /// possibly RAM; later speed levers land here.
+    O2,
+    /// Today's pipeline exactly: curated passes, single-call-site folds
+    /// into ordinary callers, code factoring on.
+    #[default]
+    Os,
+}
+
+impl OptLevel {
+    /// The report/JSON spelling (`-Os` renders `"Os"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OptLevel::O0 => "O0",
+            OptLevel::O1 => "O1",
+            OptLevel::O2 => "O2",
+            OptLevel::Os => "Os",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Cli {
     pub inputs: Vec<String>,
@@ -28,6 +64,8 @@ pub struct Cli {
     pub report: Option<String>,
     /// Board clock in Hz (`board_build.f_cpu`); the last-resort D-4 source.
     pub f_cpu: Option<u64>,
+    /// Optimization profile (`-O0`/`-O1`/`-O2`/`-Os`); `-Os` default.
+    pub opt_level: OptLevel,
     /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
     pub outline: bool,
     /// PIC14 pooled flash string table (epic-cc#815); `--const-pool`
@@ -50,8 +88,12 @@ usage: epic-cc [options] <input.c|input.cpp>...
                        {func}::{name} locals) into <file>
   --line-table <file>  write the address-to-source-line table into <file>
                        (one `file:line:col <addr>` record per word)
+  -O0 | -O1 | -O2 | -Os  optimization profile (default: -Os, today's
+                       size-first pipeline byte for byte; -O0 folds
+                       constants only, for stepping and bisection; -O2
+                       trades flash for speed: no factoring, folding
+                       into main/ISR within budget)
   -v                   echo the clang and llvm-link commands
-  --sidecar <file>     write the ELF+DWARF sidecar for gdb into <file>
   --no-outline         PIC18: keep repeated code inline instead of sharing it
                        (smaller flash by default; opt out for timing-critical
                        code or stepping through inline copies)
@@ -96,6 +138,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut report = None;
     let mut f_cpu: Option<u64> = None;
     let mut outline = true;
+    let mut opt_level = OptLevel::default();
     let mut const_pool = false;
     let mut i = 0;
     while i < argv.len() {
@@ -181,6 +224,13 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
                     .cloned()
                     .ok_or("epic-cc: --line-table needs a value")?,
             );
+        } else if matches!(a, "-O0" | "-O1" | "-O2" | "-Os") {
+            opt_level = match a {
+                "-O0" => OptLevel::O0,
+                "-O1" => OptLevel::O1,
+                "-O2" => OptLevel::O2,
+                _ => OptLevel::Os,
+            };
         } else if a == "-v" {
             verbose = true;
         } else if a == "--no-outline" {
@@ -228,6 +278,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         verbose,
         map,
         line_table,
+        opt_level,
         outline,
         const_pool,
     })

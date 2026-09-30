@@ -61,6 +61,14 @@ fn an_unconfigured_pic18_build_claims_no_configuration() {
 }
 
 #[test]
+fn a_build_reports_the_opt_profile_that_built_it() {
+    // The `--report` contract (ADR-025 plus the profiles ADR): tools
+    // acting on the report see which `-O` profile produced it.
+    let json = build_report("profile", "tests/fixtures/add.c", "p16f877a");
+    assert!(json.contains("\"opt_level\": \"Os\""), "{json}");
+}
+
+#[test]
 fn decoding_matches_values_through_a_scattered_mask() {
     // 628A `osc` owns mask 0x13 (FOSC<2> sits at bit 4), so a shift alone
     // cannot recover its value; every value must round-trip anyway.
