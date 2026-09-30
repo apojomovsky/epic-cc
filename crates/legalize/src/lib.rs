@@ -2322,6 +2322,25 @@ fn duplicate_isr_shared(
         !hi_ctx.contains("main"),
         "isel/legalize: the high-ISR context must not reach main; re-entrant main is unsupported"
     );
+    // EC++ function-local statics (epic-cc#458): irparse trivializes the
+    // guard acquire/release into a plain init-once load/xor/store over
+    // the `_ZGV*` word, which is not re-entrant. A guard first-touched
+    // from ISR context would double-initialize, so reaching one from
+    // either ISR context panics. Main-context touches are fine, and
+    // inlining a guarded helper into `main` keeps it in the main context.
+    for f in &m.funcs {
+        let touches_guard = f.blocks.iter().flat_map(|b| &b.insts).any(|i| match i {
+            Inst::Load(l) => l.ptr.starts_with("@_ZGV"),
+            Inst::Store(s) => s.ptr.starts_with("@_ZGV"),
+            _ => false,
+        });
+        if touches_guard && (lo_ctx.contains(&f.name) || hi_ctx.contains(&f.name)) {
+            panic!(
+                "legalize: function-local static in `{}` is reachable from ISR context; the init-once guard cannot be trusted there",
+                f.name
+            );
+        }
+    }
     // A helper shared with (reachable from) another live context needs
     // that context's own copy: the high ISR can preempt the low one
     // (and main) mid-call, so frames must be disjoint along every
