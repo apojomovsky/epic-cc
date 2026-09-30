@@ -2100,10 +2100,10 @@ fn pic18_two_region_device_keeps_the_globals_above_the_overlay() {
 /// below 0x100 would otherwise put `__add_f32`'s 22 bytes across it.
 #[test]
 fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
-    // main's 216 live i8 locals end at 0xEB: arg homing (epic-cc#830) folds
-    // the two 4-byte arg loads into the callee slots, freeing 4 frame bytes,
-    // so `__add_f32`'s derived base is 0xEB and its 22-byte frame would
-    // span 0xEB..0x100, crossing the boundary; it must snap to 0x100.
+    // Counts are calibrated for the homed layout (epic-cc#830): main's
+    // frame end lands at 0xEE, so `__add_f32`'s derived base is 0xEE and
+    // its 22-byte frame would span 0xEE..0x104, crossing the boundary; it
+    // must snap to 0x100.
     let mut src = String::from("global sink i8\nglobal in float\n");
     src.push_str("fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14\n");
     src.push_str("fn main(void) ()\n  block entry:\n");
@@ -2132,8 +2132,8 @@ fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
 /// already was).
 #[test]
 fn pic18_routine_frame_does_not_snap_back_to_the_region_start() {
-    // Counts cover the 4 frame bytes arg homing (epic-cc#830) folds into
-    // the callee slots: 216 snaps to 0x100, 240 clears it without a snap.
+    // Counts are calibrated for the homed layout (epic-cc#830): 216 snaps
+    // to 0x100, 240 clears it without a snap.
     for k in [216usize, 240] {
         let mut src = String::from("global sink i8\nglobal in float\n");
         src.push_str(
@@ -2581,5 +2581,39 @@ fn pass_through_chains_resolve_to_the_final_param_slot() {
     assert_eq!(
         out.locals["mid::p"], out.locals["inner::q"],
         "a chained param must reach the final param slot"
+    );
+}
+
+#[test]
+fn second_homed_source_in_one_caller_keeps_its_slot() {
+    // Two single-use defs homed to one param slot would let the later
+    // defining write clobber the earlier call's value on the divergent
+    // arm, with both site copies skipped: exactly one may home.
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(i1) (c=i1)\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             %b = add i8 3, 4\n\
+             br i1 %c, label %t, label %f\n\
+           block t:\n\
+             call void @callee(i8 %b)\n\
+             br label %done\n\
+           block f:\n\
+             call void @callee(i8 %a)\n\
+             br label %done\n\
+           block done:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    let ahomed = out.locals["main::a"] == out.locals["callee::p"];
+    let bhomed = out.locals["main::b"] == out.locals["callee::p"];
+    assert!(
+        ahomed != bhomed,
+        "exactly one same-caller source may home (a={ahomed}, b={bhomed})"
     );
 }

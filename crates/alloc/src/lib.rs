@@ -1350,6 +1350,17 @@ fn entry_path_ok(
     }
     true
 }
+/// One admitted call site, before the same-caller selection. `def` and
+/// `call` are linear (block, position) points; two candidates with
+/// overlapping windows could write one param slot inside each other's
+/// window (sibling callee params can alias one address), so one is kept.
+struct HomeCand {
+    def: (usize, usize),
+    call: (usize, usize),
+    src: (String, String),
+    tgt: (String, String),
+}
+
 /// Caller-computed call args (epic-cc#830): `(caller, value)` to
 /// `(callee, param)` when the value's defining write can target the
 /// callee's param slot, deleting the call-site copy. Sources are
@@ -1386,7 +1397,12 @@ fn home_args(
             Inst::Load(_) | Inst::Bin(_) | Inst::Icmp(_) | Inst::Call(_)
         ) || matches!(inst, Inst::Select(s) if !s.ptr)
     };
-    let mut homed: HashMap<(String, String), (String, String)> = HashMap::new();
+    // One writer per param slot at a time (epic-cc#830 review): sibling
+    // callees' first params can alias one address, so a second homed def
+    // landing inside an earlier site's def-to-call window would clobber
+    // the value that site is about to read. Defs are not calls, so the
+    // per-site window checks cannot see it; selection is per caller below.
+    let mut cands: Vec<HomeCand> = Vec::new();
     for f in &m.funcs {
         let order = block_order(f);
         let idx: HashMap<&str, usize> = order
@@ -1517,9 +1533,12 @@ fn home_args(
                         if !entry_path_ok(&succ, &order, bi, pos) {
                             continue;
                         }
-                        homed
-                            .entry((f.name.clone(), r.clone()))
-                            .or_insert((callee.name.clone(), p.name.clone()));
+                        cands.push(HomeCand {
+                            def: (0, 0),
+                            call: (bi, pos),
+                            src: (f.name.clone(), r.clone()),
+                            tgt: (callee.name.clone(), p.name.clone()),
+                        });
                         continue;
                     }
                     if resolved.contains_key(&ssa_key(&f.name, r)) {
@@ -1566,14 +1585,41 @@ fn home_args(
                             continue;
                         }
                     }
-                    homed
-                        .entry((f.name.clone(), r.clone()))
-                        .or_insert((callee.name.clone(), p.name.clone()));
+                    cands.push(HomeCand {
+                        def: (db, dp),
+                        call: (bi, pos),
+                        src: (f.name.clone(), r.clone()),
+                        tgt: (callee.name.clone(), p.name.clone()),
+                    });
                 }
             }
         }
     }
-    homed
+    // Same-caller selection. Only two shapes can fight over one address:
+    // two candidates on the same callee param, or two candidates on
+    // different callees (sibling frames share RAM, so their equal-offset
+    // params can coincide). Distinct params of one callee are distinct
+    // slots, so a call's own args never collide. A reader must see its
+    // own write, so a colliding writer inside that window, in either
+    // direction, is dropped. First in linear order wins, deterministically.
+    let mut sel: HashMap<(String, String), (String, String)> = HashMap::new();
+    let mut kept: Vec<&HomeCand> = Vec::new();
+    'cand: for c in &cands {
+        for k in &kept {
+            let same_callee = k.tgt.0 == c.tgt.0;
+            if k.src.0 != c.src.0 || (same_callee && k.tgt.1 != c.tgt.1) {
+                continue;
+            }
+            let in_window =
+                |x: (usize, usize), w: ((usize, usize), (usize, usize))| w.0 <= x && x <= w.1;
+            if in_window(c.def, (k.def, k.call)) || in_window(k.def, (c.def, c.call)) {
+                continue 'cand;
+            }
+        }
+        kept.push(c);
+        sel.insert(c.src.clone(), c.tgt.clone());
+    }
+    sel
 }
 
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
