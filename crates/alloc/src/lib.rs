@@ -379,7 +379,12 @@ fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
 /// immediately reusable. Greedy first-fit coloring reuses the lowest slot
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
-fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLayout {
+fn frame_layout(
+    f: &ir::Func,
+    resolved: &PtrResolution,
+    va_size: u16,
+    homed: &HashSet<String>,
+) -> FrameLayout {
     let order = block_order(f);
     let idx: HashMap<&str, usize> = order
         .iter()
@@ -422,6 +427,12 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
                 order_idx += 1;
             }
         }
+    }
+    // Homed call args (epic-cc#830) hold no caller slot: their bytes live
+    // in the callee's param slot from the defining write. Dropping keeps
+    // relative placement order, so the coloring of the rest is unchanged.
+    for h in homed {
+        defs.remove(h);
     }
 
     // uses: value name -> set of (block, position). A phi's incoming values
@@ -1062,6 +1073,509 @@ fn va_sizes(m: &Module) -> HashMap<String, u16> {
     sizes
 }
 
+/// Cross-block homing ownership (epic-cc#830): the def block dominates the
+/// call block, both run at most once, and no block on any path between
+/// holds a call. Any interleaving call could write an overlapping sibling
+/// frame, so doubt rejects the site.
+fn cross_block_ok(
+    succ: &HashMap<usize, Vec<usize>>,
+    order: &[&ir::Block],
+    def_block: usize,
+    def_pos: usize,
+    call_block: usize,
+    call_pos: usize,
+) -> bool {
+    let n = order.len();
+    let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, ss) in succ {
+        for s in ss {
+            preds.entry(*s).or_default().push(*i);
+        }
+    }
+    // Iterative dominators from the entry; unreachable blocks keep the
+    // full set, which admits nothing through them.
+    let mut dom: Vec<HashSet<usize>> = vec![(0..n).collect(); n];
+    dom[0] = HashSet::from([0]);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for i in 1..n {
+            let mut d: Option<HashSet<usize>> = None;
+            for p in preds.get(&i).map(Vec::as_slice).unwrap_or(&[]) {
+                d = Some(match d {
+                    None => dom[*p].clone(),
+                    Some(d) => d.intersection(&dom[*p]).copied().collect(),
+                });
+            }
+            if let Some(mut d) = d {
+                d.insert(i);
+                if d != dom[i] {
+                    dom[i] = d;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if !dom[call_block].contains(&def_block) {
+        return false;
+    }
+    // At most once each: a repeated call would read a slot the callee
+    // itself may have rewritten, and a repeated def needs path order the
+    // dominance alone does not give inside a loop.
+    let self_reachable = |x: usize| -> bool {
+        let mut stack = succ.get(&x).cloned().unwrap_or_default();
+        let mut seen: HashSet<usize> = HashSet::new();
+        while let Some(b) = stack.pop() {
+            if b == x {
+                return true;
+            }
+            if seen.insert(b) {
+                stack.extend(succ.get(&b).cloned().unwrap_or_default());
+            }
+        }
+        false
+    };
+    if self_reachable(def_block) || self_reachable(call_block) {
+        return false;
+    }
+    if order[def_block].insts[def_pos + 1..]
+        .iter()
+        .any(|x| matches!(x, ir::Inst::Call(_)))
+    {
+        return false;
+    }
+    if order[call_block].insts[..call_pos]
+        .iter()
+        .any(|x| matches!(x, ir::Inst::Call(_)))
+    {
+        return false;
+    }
+    // Blocks on some def-to-call path: forward-reachable from the def and
+    // backward-reaching the call. Loops among them are covered because any
+    // call inside rejects, whatever the iteration order.
+    let mut fwd: HashSet<usize> = HashSet::from([def_block]);
+    let mut stack = vec![def_block];
+    while let Some(b) = stack.pop() {
+        for s in succ.get(&b).cloned().unwrap_or_default() {
+            if fwd.insert(s) {
+                stack.push(s);
+            }
+        }
+    }
+    let mut bwd: HashSet<usize> = HashSet::from([call_block]);
+    stack = vec![call_block];
+    while let Some(b) = stack.pop() {
+        for p in preds.get(&b).cloned().unwrap_or_default() {
+            if bwd.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    for b in fwd.intersection(&bwd) {
+        if *b == def_block || *b == call_block {
+            continue;
+        }
+        if order[*b]
+            .insts
+            .iter()
+            .any(|x| matches!(x, ir::Inst::Call(_)))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+/// Phi homing ownership (epic-cc#830): the phi and the call share the
+/// merge block, every predecessor carries an incoming arm, the merge runs
+/// at most once, and no block on any arm-to-call path holds a call.
+/// Incoming values keep their own slots; only the copy destinations move
+/// to the param slot, so the arms need no check beyond the path rule.
+fn phi_home_ok(
+    succ: &HashMap<usize, Vec<usize>>,
+    order: &[&ir::Block],
+    idx: &HashMap<&str, usize>,
+    phi: &ir::Phi,
+    merge: usize,
+    phi_pos: usize,
+    call_pos: usize,
+) -> bool {
+    if phi.incoming.is_empty() || phi_pos >= call_pos {
+        return false;
+    }
+    let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, ss) in succ {
+        for s in ss {
+            preds.entry(*s).or_default().push(*i);
+        }
+    }
+    let merge_preds = preds.get(&merge).cloned().unwrap_or_default();
+    for mp in &merge_preds {
+        if !phi
+            .incoming
+            .iter()
+            .any(|(_, pred)| idx.get(pred.as_str()) == Some(mp))
+        {
+            return false;
+        }
+    }
+    let self_reachable = |x: usize| -> bool {
+        let mut stack = succ.get(&x).cloned().unwrap_or_default();
+        let mut seen: HashSet<usize> = HashSet::new();
+        while let Some(b) = stack.pop() {
+            if b == x {
+                return true;
+            }
+            if seen.insert(b) {
+                stack.extend(succ.get(&b).cloned().unwrap_or_default());
+            }
+        }
+        false
+    };
+    if self_reachable(merge) {
+        return false;
+    }
+    if order[merge].insts[..call_pos]
+        .iter()
+        .any(|x| matches!(x, ir::Inst::Call(_)))
+    {
+        return false;
+    }
+    let mut bwd: HashSet<usize> = HashSet::from([merge]);
+    let mut stack = vec![merge];
+    while let Some(b) = stack.pop() {
+        for p in preds.get(&b).cloned().unwrap_or_default() {
+            if bwd.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    for mp in &merge_preds {
+        let mut fwd: HashSet<usize> = HashSet::from([*mp]);
+        let mut stack = vec![*mp];
+        while let Some(b) = stack.pop() {
+            for s in succ.get(&b).cloned().unwrap_or_default() {
+                if fwd.insert(s) {
+                    stack.push(s);
+                }
+            }
+        }
+        for b in fwd.intersection(&bwd) {
+            if *b == *mp || *b == merge {
+                continue;
+            }
+            if order[*b]
+                .insts
+                .iter()
+                .any(|x| matches!(x, ir::Inst::Call(_)))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Entry-path ownership for homed caller params (epic-cc#830): the call
+/// runs at most once and no block on any entry-to-call path holds a call
+/// (the call block contributes only its prefix: later calls read dead
+/// bytes). Callers refresh the param slot at every call site, so only the
+/// window from function entry needs proving.
+fn entry_path_ok(
+    succ: &HashMap<usize, Vec<usize>>,
+    order: &[&ir::Block],
+    call_block: usize,
+    call_pos: usize,
+) -> bool {
+    let self_reachable = |x: usize| -> bool {
+        let mut stack = succ.get(&x).cloned().unwrap_or_default();
+        let mut seen: HashSet<usize> = HashSet::new();
+        while let Some(b) = stack.pop() {
+            if b == x {
+                return true;
+            }
+            if seen.insert(b) {
+                stack.extend(succ.get(&b).cloned().unwrap_or_default());
+            }
+        }
+        false
+    };
+    if self_reachable(call_block) {
+        return false;
+    }
+    let mut preds: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (i, ss) in succ {
+        for s in ss {
+            preds.entry(*s).or_default().push(*i);
+        }
+    }
+    let mut fwd: HashSet<usize> = HashSet::from([0]);
+    let mut stack = vec![0];
+    while let Some(b) = stack.pop() {
+        for s in succ.get(&b).cloned().unwrap_or_default() {
+            if fwd.insert(s) {
+                stack.push(s);
+            }
+        }
+    }
+    if !fwd.contains(&call_block) {
+        return true;
+    }
+    let mut bwd: HashSet<usize> = HashSet::from([call_block]);
+    stack = vec![call_block];
+    while let Some(b) = stack.pop() {
+        for p in preds.get(&b).cloned().unwrap_or_default() {
+            if bwd.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    for b in fwd.intersection(&bwd) {
+        if *b == call_block {
+            if order[*b].insts[..call_pos]
+                .iter()
+                .any(|x| matches!(x, ir::Inst::Call(_)))
+            {
+                return false;
+            }
+            continue;
+        }
+        if order[*b]
+            .insts
+            .iter()
+            .any(|x| matches!(x, ir::Inst::Call(_)))
+        {
+            return false;
+        }
+    }
+    true
+}
+/// Caller-computed call args (epic-cc#830): `(caller, value)` to
+/// `(callee, param)` when the value's defining write can target the
+/// callee's param slot, deleting the call-site copy. Sources are
+/// single-use scalar regs (plain defs, call results, phis, caller
+/// params), width-equal, with a clobber-free window the per-shape check
+/// proves: no call between, callee out of ISR reach and unable to reach
+/// back. Sibling frames share RAM, so any intervening call rejects.
+fn home_args(
+    m: &Module,
+    edges: &HashMap<String, Vec<String>>,
+    resolved: &PtrResolution,
+) -> HashMap<(String, String), (String, String)> {
+    let funcs: HashMap<&str, &ir::Func> = m.funcs.iter().map(|f| (f.name.as_str(), f)).collect();
+    let mut called_by: HashMap<&str, Vec<&str>> = HashMap::new();
+    for (p, cs) in edges {
+        for c in cs {
+            called_by.entry(c.as_str()).or_default().push(p.as_str());
+        }
+    }
+    let isr_reachable: HashSet<String> = m
+        .funcs
+        .iter()
+        .filter(|f| f.isr && !called_by.contains_key(f.name.as_str()))
+        .flat_map(|r| reachable(&[r.name.as_str()], edges))
+        .collect();
+    // A def isel emits as compute-then-store to the dst slot. A call
+    // result lands the same way (retval bytes to the dst slot on both
+    // cores), so chaining calls home too. Casts and freezes stay out:
+    // the coalescer already folds a dead-after one into its source slot,
+    // so homing only resurrects its copy at the param address.
+    let homable = |inst: &Inst| -> bool {
+        matches!(
+            inst,
+            Inst::Load(_) | Inst::Bin(_) | Inst::Icmp(_) | Inst::Call(_)
+        ) || matches!(inst, Inst::Select(s) if !s.ptr)
+    };
+    let mut homed: HashMap<(String, String), (String, String)> = HashMap::new();
+    for f in &m.funcs {
+        let order = block_order(f);
+        let idx: HashMap<&str, usize> = order
+            .iter()
+            .enumerate()
+            .map(|(i, b)| (b.label.as_str(), i))
+            .collect();
+        let block_len: Vec<u16> = order.iter().map(|b| b.insts.len() as u16).collect();
+        // Use positions mirror frame_layout's `uses`: phi incoming counts
+        // at the predecessor end, so exactly one entry means the call arg
+        // is the value's only read in any form.
+        let mut uses: HashMap<String, Vec<(usize, u16)>> = HashMap::new();
+        for (i, b) in order.iter().enumerate() {
+            for (pos, inst) in b.insts.iter().enumerate() {
+                if let ir::Inst::Phi(p) = inst {
+                    for (v, pred) in &p.incoming {
+                        let vn = ir::val_name(v);
+                        if vn.is_empty() {
+                            continue;
+                        }
+                        let pi = idx[pred.as_str()];
+                        uses.entry(vn).or_default().push((pi, block_len[pi]));
+                    }
+                    continue;
+                }
+                for v in ir::read_vals(inst) {
+                    if v.is_empty() {
+                        continue;
+                    }
+                    uses.entry(v).or_default().push((i, pos as u16));
+                }
+                if let ir::Inst::Gep(g) = inst {
+                    uses.entry(g.dst.clone()).or_default().push((i, pos as u16));
+                }
+            }
+        }
+        // Successor map for the cross-block ownership check below,
+        // mirroring frame_layout's construction.
+        let norm = |t: &str| {
+            t.strip_prefix("label ")
+                .unwrap_or(t)
+                .trim_start_matches('%')
+                .to_string()
+        };
+        let mut succ: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (i, ob) in order.iter().enumerate() {
+            let mut ss = Vec::new();
+            for inst in &ob.insts {
+                match inst {
+                    ir::Inst::Br(br) => ss.push(idx[&norm(&br.target)[..]]),
+                    ir::Inst::BrCond(bc) => {
+                        ss.push(idx[&norm(&bc.t)[..]]);
+                        ss.push(idx[&norm(&bc.f)[..]]);
+                    }
+                    ir::Inst::Switch(sw) => {
+                        ss.push(idx[&norm(&sw.default)[..]]);
+                        for (_, l) in &sw.cases {
+                            ss.push(idx[&norm(l)[..]]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            succ.insert(i, ss);
+        }
+        let params: HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        for (bi, b) in order.iter().enumerate() {
+            for (pos, inst) in b.insts.iter().enumerate() {
+                let ir::Inst::Call(c) = inst else { continue };
+                if !c.callees.is_empty() {
+                    continue;
+                }
+                let Some(callee) = funcs.get(c.func.as_str()) else {
+                    continue;
+                };
+                if callee.name == f.name {
+                    continue;
+                }
+                if reachable(&[callee.name.as_str()], edges).contains(&f.name) {
+                    continue;
+                }
+                if isr_reachable.contains(&callee.name) {
+                    continue;
+                }
+                let named = callee.params.len();
+                for (i, arg) in c.args.iter().enumerate() {
+                    if i >= named {
+                        continue;
+                    }
+                    let Some(aty) = arg.ty else { continue };
+                    if arg.byval.is_some() || arg.sret {
+                        continue;
+                    }
+                    let p = &callee.params[i];
+                    if p.byval.is_some() || p.sret {
+                        continue;
+                    }
+                    if p.width != aty.bytes() {
+                        continue;
+                    }
+                    let ir::Val::Reg(r) = &arg.val else { continue };
+                    // A caller param passed straight through homes like a
+                    // def at entry: callers refresh its slot at every call
+                    // site, so only the entry-to-call window needs proving.
+                    // Byval/sret/pointer params route through custom
+                    // emission, never a plain slot copy.
+                    if params.contains(r.as_str()) {
+                        let fp = f
+                            .params
+                            .iter()
+                            .find(|x| x.name == *r)
+                            .expect("alloc: param source");
+                        if fp.byval.is_some() || fp.sret || fp.ptr {
+                            continue;
+                        }
+                        if fp.width != aty.bytes() {
+                            continue;
+                        }
+                        if resolved.contains_key(&ssa_key(&f.name, r)) {
+                            continue;
+                        }
+                        if uses
+                            .get(r)
+                            .map_or(true, |u| u.len() != 1 || u[0] != (bi, pos as u16))
+                        {
+                            continue;
+                        }
+                        if !entry_path_ok(&succ, &order, bi, pos) {
+                            continue;
+                        }
+                        homed
+                            .entry((f.name.clone(), r.clone()))
+                            .or_insert((callee.name.clone(), p.name.clone()));
+                        continue;
+                    }
+                    if resolved.contains_key(&ssa_key(&f.name, r)) {
+                        continue;
+                    }
+                    if uses
+                        .get(r)
+                        .map_or(true, |u| u.len() != 1 || u[0] != (bi, pos as u16))
+                    {
+                        continue;
+                    }
+                    // The single static def may sit in another block; a
+                    // cross-block one needs the ownership check below.
+                    let mut def: Option<(usize, usize, u8)> = None;
+                    for (db, ob) in order.iter().enumerate() {
+                        for (dp, dinst) in ob.insts.iter().enumerate() {
+                            if let Some((n, w)) = def_width(dinst, resolved, &f.name) {
+                                if n == *r {
+                                    def = Some((db, dp, w));
+                                }
+                            }
+                        }
+                    }
+                    let Some((db, dp, w)) = def else { continue };
+                    if w != p.width {
+                        continue;
+                    }
+                    if let ir::Inst::Phi(phi) = &order[db].insts[dp] {
+                        if db != bi || !phi_home_ok(&succ, &order, &idx, phi, bi, dp, pos) {
+                            continue;
+                        }
+                    } else {
+                        if !homable(&order[db].insts[dp]) {
+                            continue;
+                        }
+                        if db == bi {
+                            if order[db].insts[dp + 1..pos]
+                                .iter()
+                                .any(|x| matches!(x, ir::Inst::Call(_)))
+                            {
+                                continue;
+                            }
+                        } else if !cross_block_ok(&succ, &order, db, dp, bi, pos) {
+                            continue;
+                        }
+                    }
+                    homed
+                        .entry((f.name.clone(), r.clone()))
+                        .or_insert((callee.name.clone(), p.name.clone()));
+                }
+            }
+        }
+    }
+    homed
+}
+
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
@@ -1083,22 +1597,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // open. Nothing here depends on where the globals land, which is what
     // lets PIC18 place the overlay BELOW them (step 5's caller).
 
-    // 1. locals_widths(f) = the liveness-overlay slot widths of f's params
-    // and defined values, in allocation order (the order `frame_end` walks
-    // and the locals placement reproduces). Values whose live ranges never
-    // overlap share a slot, so a frame shrinks from the width sum to the
-    // peak simultaneous demand. locals_size(f) is the colored frame's byte
-    // size (epic-cc#172).
-    let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
-    let mut locals_size: HashMap<String, u16> = HashMap::new();
-    let va_sizes = va_sizes(m);
-    for f in &m.funcs {
-        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
-        locals_widths.insert(f.name.clone(), fl.widths);
-        locals_size.insert(f.name.clone(), fl.size);
-    }
-
-    // 2. Call graph from the edge text.
+    // 1. Call graph from the edge text. Parsed before the frames: the
+    // arg-homing admit below reads it, and coloring reads the admit.
     let mut edges: HashMap<String, Vec<String>> = HashMap::new(); // caller -> callees
     let mut callees: HashSet<String> = HashSet::new();
     for line in edges_text.lines() {
@@ -1131,6 +1631,50 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         } else {
             panic!("alloc: unrecognized callgraph line: {line}");
         }
+    }
+    // Caller-computed call args (epic-cc#830): homed defs hold no caller
+    // slot, so the frames shrink before the bases derive from them. A
+    // homed target that is itself a homed source (pass-through chains)
+    // resolves to the final address; mutual pass-throughs with no base
+    // slot drop out and keep their caller slots.
+    let homed = home_args(m, &edges, &resolved);
+    let mut final_tgt: HashMap<(String, String), (String, String)> = HashMap::new();
+    for (src, mut tgt) in homed.clone() {
+        let mut seen: HashSet<(String, String)> = HashSet::from([src.clone()]);
+        while homed.contains_key(&tgt) && seen.insert(tgt.clone()) {
+            tgt = homed[&tgt].clone();
+        }
+        if !homed.contains_key(&tgt) {
+            final_tgt.insert(src, tgt);
+        }
+    }
+    let mut homed_src: HashMap<&str, HashSet<String>> = HashMap::new();
+    for ((caller, val), _) in &final_tgt {
+        homed_src
+            .entry(caller.as_str())
+            .or_default()
+            .insert(val.clone());
+    }
+    let homed_of = |f: &str| -> HashSet<String> { homed_src.get(f).cloned().unwrap_or_default() };
+
+    // 2. locals_widths(f) = the liveness-overlay slot widths of f's params
+    // and defined values, in allocation order (the order `frame_end` walks
+    // and the locals placement reproduces). Values whose live ranges never
+    // overlap share a slot, so a frame shrinks from the width sum to the
+    // peak simultaneous demand. locals_size(f) is the colored frame's byte
+    // size (epic-cc#172).
+    let mut locals_widths: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut locals_size: HashMap<String, u16> = HashMap::new();
+    let va_sizes = va_sizes(m);
+    for f in &m.funcs {
+        let fl = frame_layout(
+            f,
+            &resolved,
+            floored_va_size(f, &va_sizes),
+            &homed_of(&f.name),
+        );
+        locals_widths.insert(f.name.clone(), fl.widths);
+        locals_size.insert(f.name.clone(), fl.size);
     }
 
     // 3. Topological order (recursion is rejected by callgraph; panics
@@ -2169,7 +2713,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let win_end = device.access_bank.map(|(_, hi)| hi + 1);
     for f in &m.funcs {
         let b = base[&f.name];
-        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
+        let fl = frame_layout(
+            f,
+            &resolved,
+            floored_va_size(f, &va_sizes),
+            &homed_of(&f.name),
+        );
         // The frame end the coloring's own slot order produces; every callee
         // base is derived from it (`frame_end` over `locals_widths`), so a
         // permutation that moved it would silently rebase the callees.
@@ -2197,6 +2746,19 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             locals.insert(key.clone(), slot_addr[slot]);
             local_width.insert(key, fl.widths[slot]);
         }
+    }
+    // Homed call args take the resolved callee param slot address: the
+    // defining write lands there, so the site copy is a self-copy.
+    // Widths match by admit, so one address covers every byte.
+    for ((caller, val), (callee, param)) in &final_tgt {
+        let target = format!("{callee}::{param}");
+        let addr = locals
+            .get(&target)
+            .copied()
+            .unwrap_or_else(|| panic!("alloc: homed target {target} has no slot"));
+        let key = format!("{caller}::{val}");
+        locals.insert(key.clone(), addr);
+        local_width.insert(key, local_width[&target]);
     }
 
     // 7b. Per-bank high-water marks and the ISR region span. Every placed
