@@ -1958,7 +1958,7 @@ fn isr_adjacency(m: &Module) -> (HashMap<String, Vec<String>>, HashSet<String>) 
                     }
                 }
                 let mut taken = HashSet::new();
-                collect_global_vals(inst, &mut taken);
+                ir::collect_global_vals(inst, &mut taken);
                 for g in taken {
                     adj.entry(f.name.clone()).or_default().push(g);
                 }
@@ -2960,7 +2960,7 @@ fn drop_dead_isr_originals(
                     }
                 }
                 let mut found: HashSet<String> = HashSet::new();
-                collect_global_vals(inst, &mut found);
+                ir::collect_global_vals(inst, &mut found);
                 for g in found {
                     if spell.contains_key(g.as_str()) {
                         live.insert(g);
@@ -3072,7 +3072,7 @@ fn fill_indirect_callees(
     for f in &m.funcs {
         for b in &f.blocks {
             for inst in &b.insts {
-                collect_global_vals(inst, &mut addr_taken);
+                ir::collect_global_vals(inst, &mut addr_taken);
             }
         }
     }
@@ -3287,64 +3287,6 @@ fn fill_indirect_callees(
                 }
             }
         }
-    }
-}
-
-/// Collect every `Val::Global` in `inst` into `out` (the address-taken set).
-fn collect_global_vals(inst: &Inst, out: &mut HashSet<String>) {
-    fn push(v: &Val, out: &mut HashSet<String>) {
-        if let Val::Global(g) = v {
-            out.insert(g.clone());
-        }
-    }
-    match inst {
-        Inst::Store(s) => push(&s.val, out),
-        Inst::Bin(b) => {
-            push(&b.a, out);
-            push(&b.b, out);
-        }
-        Inst::Ret(Some((_, v)), _) => push(v, out),
-        Inst::Zext(z) => push(&z.val, out),
-        Inst::Sext(x) => push(&x.val, out),
-        Inst::Trunc(t) => push(&t.val, out),
-        Inst::IntToPtr(p) => push(&p.val, out),
-        Inst::Icmp(i) => {
-            push(&i.a, out);
-            push(&i.b, out);
-        }
-        Inst::Select(s) => {
-            push(&s.cond, out);
-            push(&s.a, out);
-            push(&s.b, out);
-        }
-        Inst::Call(c) => {
-            for arg in &c.args {
-                push(&arg.val, out);
-            }
-        }
-        Inst::Phi(p) => {
-            for (v, _) in &p.incoming {
-                push(v, out);
-            }
-        }
-        Inst::Memcpy(mc) => {
-            push(&mc.dst, out);
-            push(&mc.src, out);
-            if let MemLen::Reg(v) = &mc.len {
-                push(v, out);
-            }
-        }
-        Inst::Freeze(fr) => push(&fr.val, out),
-        Inst::FloatBin(fb) => {
-            push(&fb.a, out);
-            push(&fb.b, out);
-        }
-        Inst::Fcmp(fc) => {
-            push(&fc.a, out);
-            push(&fc.b, out);
-        }
-        Inst::FloatConv(fc) => push(&fc.val, out),
-        _ => {}
     }
 }
 

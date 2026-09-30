@@ -12,6 +12,7 @@ iselcore = { path = "../iselcore" }
 peephole = { path = "../peephole" }
 
 [dev-dependencies]
+alloc = { path = "../alloc" }
 pic14-sim = { path = "../sim" }
 asm = { path = "../asm" }
 legalize = { path = "../legalize" }

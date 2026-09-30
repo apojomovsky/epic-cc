@@ -4,7 +4,7 @@
 pub mod delay;
 
 use ir::{GepBase, Inst, Module};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Map key for a local value: `{func}::{name}` (IR value names without `%`).
 /// Matches the keys `alloc` emits in its overlay layout, so a callee's param
@@ -38,14 +38,16 @@ impl Slot {
     }
 }
 
-/// Parse alloc address-map text into `HashMap<String, u16>`.
+/// Parse alloc address-map text into addresses plus the staged-const set.
 /// `global <name> 0xNN` and `local <func> <name> 0xNN` lines become entries
 /// (locals keyed `{func}::{name}`); `const <name>` lines name flash globals
 /// with no RAM address and skip: isel reads their bytes from the `Module`.
-/// Both backends share this parser over alloc output: nothing in it is
-/// PIC14-specific.
-pub fn parse_map(text: &str) -> HashMap<String, u16> {
+/// `staged <name>` lines name consts isel stages through the shared buffer
+/// (epic-cc#790). Both backends share this parser over alloc output:
+/// nothing in it is PIC14-specific.
+pub fn parse_map(text: &str) -> (HashMap<String, u16>, HashSet<String>) {
     let mut addrs = HashMap::new();
+    let mut staged = HashSet::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with(';') {
@@ -56,6 +58,13 @@ pub fn parse_map(text: &str) -> HashMap<String, u16> {
         match kw {
             "const" => {
                 // Flash global: no RAM address; nothing to record.
+            }
+            "staged" => {
+                staged.insert(
+                    it.next()
+                        .unwrap_or_else(|| panic!("iselcore: malformed map line: {line}"))
+                        .to_string(),
+                );
             }
             "global" => {
                 let name = it
@@ -86,7 +95,7 @@ pub fn parse_map(text: &str) -> HashMap<String, u16> {
             _ => panic!("iselcore: unexpected map line: {line}"),
         }
     }
-    addrs
+    (addrs, staged)
 }
 
 /// Where a pointer's bytes ultimately live, once every `gep` in its chain

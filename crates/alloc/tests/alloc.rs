@@ -1,4 +1,5 @@
 use alloc::{allocate, map_text, AllocLayout};
+use device::PIC16F1939;
 use device::PIC16F877A;
 use device::PIC18F4550;
 use ir::parse;
@@ -403,7 +404,7 @@ fn const_select_arms_are_copied_to_ram_when_the_select_does_not_fold() {
     );
     m.globals[0].size = 4; // a: [4 x i8]
     m.globals[1].size = 4; // b: [4 x i8]
-    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
     assert!(
         out.globals.contains_key("a"),
         "const select arm @a must be copied to RAM"
@@ -429,7 +430,7 @@ fn a_single_const_select_arm_is_copied_to_ram() {
              ret void\n",
     );
     m.globals[0].size = 4; // a: [4 x i8]
-    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    let out = allocate(&PIC18F4550, &m, "depth 1\n");
     assert!(
         out.globals.contains_key("a"),
         "const select arm @a must be copied to RAM"
@@ -456,7 +457,7 @@ fn const_direct_ptr_call_arg_is_copied_to_ram() {
              ret void\n",
     );
     m.globals[0].size = 2; // c: [2 x i8], like menu-demo .str
-    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    let out = allocate(&PIC18F4550, &m, "edge main f\n");
     assert!(
         out.globals.contains_key("c"),
         "const ptr call arg @c must be copied to RAM"
@@ -540,7 +541,7 @@ fn const_to_ram_set_holds_only_pointer_path_consts() {
     );
     m.globals[0].size = 2; // used: [2 x i8]
     m.globals[1].size = 4; // table: [4 x i8]
-    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    let out = allocate(&PIC18F4550, &m, "edge main f\n");
     assert!(
         out.globals.contains_key("used"),
         "const ptr call arg @used must be copied to RAM"
@@ -583,6 +584,332 @@ fn const_large_ptr_call_arg_stays_in_flash() {
     assert!(
         out.const_globals.contains("big"),
         "large const @big must stay in the flash set"
+    );
+}
+
+#[test]
+fn staged_const_call_args_share_one_buffer() {
+    // Small cores (epic-cc#790): directly named const call args stage
+    // through one shared buffer instead of per-copy RAM. The buffer sizes
+    // to the largest staged const: after (1B) at 0x20, 5 bytes of stage,
+    // then f::p (2B param), so bank 0 holds 8 bytes.
+    let mut m = parse(
+        "const c i8\n\
+         const big i8\n\
+         global after i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             call void @f(@big)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 5; // big: [5 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        !out.globals.contains_key("c"),
+        "staged const @c must get no RAM copy"
+    );
+    assert!(
+        !out.globals.contains_key("big"),
+        "staged const @big must get no RAM copy"
+    );
+    assert!(
+        out.const_globals.contains("c") && out.const_globals.contains("big"),
+        "staged consts stay in the flash set"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "one shared staging buffer must be placed"
+    );
+    assert_eq!(
+        out.bank_used[0], 8,
+        "buffer sizes to the largest staged const (1 + 5 + 2 param)"
+    );
+}
+
+#[test]
+fn staged_const_with_derived_use_keeps_its_copy() {
+    // A const reached both directly and through a GEP chain keeps its RAM
+    // copy: the derived path needs a real address isel can name.
+    let mut m = parse(
+        "const c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %g = gep @c +1\n\
+             call void @f(@c)\n\
+             call void @f(%g)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 4; // c: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "derived-reached const @c must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
+
+#[test]
+fn staged_direct_select_arms_share_one_buffer() {
+    // Directly named select arms stage like direct call args: no per-arm
+    // RAM copies, one buffer sized to the larger arm.
+    let mut m = parse(
+        "const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %s = select i1 %c, ptr @a, ptr @b\n\
+             call void @f(%s)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 3; // a: [3 x i8]
+    m.globals[1].size = 4; // b: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        !out.globals.contains_key("a") && !out.globals.contains_key("b"),
+        "staged select arms must get no RAM copies"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "one shared staging buffer must be placed"
+    );
+}
+
+#[test]
+fn staged_const_call_arg_on_pic14e() {
+    // The staging rule covers both small GPR cores; two consts stage,
+    // while a lone one keeps its copy (see the count rule).
+    let mut m = parse(
+        "const c i8\n\
+         const d i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             call void @f(@d)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 3; // d: [3 x i8]
+    let out = allocate(&PIC16F1939, &m, "edge main f\n");
+    assert!(
+        !out.globals.contains_key("c") && !out.globals.contains_key("d"),
+        "staged consts must get no RAM copies"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "one shared staging buffer must be placed"
+    );
+}
+
+#[test]
+fn lone_const_call_arg_keeps_its_copy() {
+    // One const's copy is cheaper than a buffer: no staging, no buffer.
+    let mut m = parse(
+        "const c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "lone const @c must be copied to RAM"
+    );
+    assert!(
+        !out.globals.contains_key("__const_stage"),
+        "no staging buffer without a paying set"
+    );
+}
+
+#[test]
+fn multi_const_call_keeps_copies() {
+    // One call naming two staged consts would leave both params reading
+    // the last copy: demote both to per-copies, no buffer.
+    let mut m = parse(
+        "const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@a, @b)\n\
+             ret void\n\
+         fn f(void) (p=ptr, q=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 4; // a: [4 x i8]
+    m.globals[1].size = 4; // b: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("a") && out.globals.contains_key("b"),
+        "shared-call consts must be copied to RAM"
+    );
+    assert!(
+        !out.globals.contains_key("__const_stage"),
+        "no staging buffer without a paying set"
+    );
+}
+
+#[test]
+fn multi_use_select_keeps_copies() {
+    // A select dst consumed twice cannot stage: the second use would read
+    // a re-staged buffer. Demote both arms to per-copies.
+    let mut m = parse(
+        "const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %s = select i1 %c, ptr @a, ptr @b\n\
+             call void @f(%s)\n\
+             call void @f(%s)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 4; // a: [4 x i8]
+    m.globals[1].size = 4; // b: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("a") && out.globals.contains_key("b"),
+        "multi-use select arms must be copied to RAM"
+    );
+    assert!(
+        !out.globals.contains_key("__const_stage"),
+        "no staging buffer without a paying set"
+    );
+}
+
+#[test]
+fn cross_block_select_use_keeps_copies() {
+    // A select consumed in another block cannot stage: control flow could
+    // re-stage between. Demote both arms to per-copies.
+    let mut m = parse(
+        "const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %s = select i1 %c, ptr @a, ptr @b\n\
+             br label %next\n\
+           block next:\n\
+             call void @f(%s)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 4; // a: [4 x i8]
+    m.globals[1].size = 4; // b: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\n");
+    assert!(
+        out.globals.contains_key("a") && out.globals.contains_key("b"),
+        "cross-block select arms must be copied to RAM"
+    );
+    assert!(
+        !out.globals.contains_key("__const_stage"),
+        "no staging buffer without a paying set"
+    );
+}
+
+#[test]
+fn isr_const_use_keeps_copies() {
+    // Uses under an ISR could run between another site's staging and its
+    // call: demote them. Main's own pair still stages with its buffer.
+    let mut m = parse(
+        "const c i8\n\
+         const d i8\n\
+         const e i8\n\
+         fn handler(void) [isr] ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @f(@d)\n\
+             call void @f(@e)\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 2; // d: [2 x i8]
+    m.globals[2].size = 2; // e: [2 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main f\nedge handler f\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "ISR-reached const @c must be copied to RAM"
+    );
+    assert!(
+        !out.globals.contains_key("d") && !out.globals.contains_key("e"),
+        "main's own pair still stages"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "one shared staging buffer must be placed"
+    );
+}
+
+#[test]
+fn addrtaken_const_use_keeps_copies() {
+    // A function passed as a value could run under an ISR dispatch the
+    // call graph cannot see: demote its const uses, as with ISR roots.
+    let mut m = parse(
+        "const c i8\n\
+         const d i8\n\
+         const e i8\n\
+         fn cb(void) ()\n\
+           block entry:\n\
+             call void @f(@c)\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @t(@cb)\n\
+             call void @f(@d)\n\
+             call void @f(@e)\n\
+             ret void\n\
+         fn t(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n\
+         fn f(void) (p=ptr)\n\
+           block entry:\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 2; // d: [2 x i8]
+    m.globals[2].size = 2; // e: [2 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main t\nedge main f\nedge cb f\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "address-taken const @c must be copied to RAM"
+    );
+    assert!(
+        !out.globals.contains_key("d") && !out.globals.contains_key("e"),
+        "main's own pair still stages"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "one shared staging buffer must be placed"
     );
 }
 

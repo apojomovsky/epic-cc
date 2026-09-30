@@ -11,7 +11,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let src = fs::read_to_string(&args[1]).expect("read input");
     let map = fs::read_to_string(&args[2]).expect("read map");
-    let addrs = parse_map(&map);
+    let (addrs, _) = parse_map(&map);
     let asm = select(&device::PIC12F509, &ir::parse(&src), &addrs);
     fs::write(&args[3], asm).expect("write output");
 }

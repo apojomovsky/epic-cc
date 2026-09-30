@@ -1469,13 +1469,24 @@ fn parse_map_accepts_const_lines() {
     // alloc's map text lists const globals as `const <name>` (no address —
     // their bytes live in flash). parse_map must accept the line without
     // recording an address, and keep parsing the lines after it.
-    let addrs = isel::parse_map("global in 0x20\nconst table\nlocal main i 0x29\n");
+    let (addrs, staged) = isel::parse_map("global in 0x20\nconst table\nlocal main i 0x29\n");
     assert_eq!(addrs.get("in"), Some(&0x20u16));
     assert_eq!(addrs.get("main::i"), Some(&0x29u16));
     assert!(
         !addrs.contains_key("table"),
         "const globals have no RAM address"
     );
+    assert!(staged.is_empty(), "no staged lines means an empty set");
+}
+
+#[test]
+fn parse_map_round_trips_staged_lines() {
+    // alloc's map text lists staged consts as `staged <name>`; the set
+    // travels to isel instead of defaulting to empty (epic-cc#790).
+    let (addrs, staged) = isel::parse_map("const a\nstaged a\nstaged b\nglobal x 0x20\n");
+    assert!(!addrs.contains_key("a") && !addrs.contains_key("b"));
+    assert!(staged.contains("a") && staged.contains("b"));
+    assert_eq!(staged.len(), 2);
 }
 
 #[test]
@@ -9397,5 +9408,55 @@ fn cmp_eq_against_zero_skips_the_xor() {
     assert!(
         !asm.contains("MOVWF 0x70"),
         "no dead scratch store (epic-cc#750):\n{asm}"
+    );
+}
+
+#[test]
+fn staged_const_call_args_deliver_table_bytes_in_sim() {
+    // epic-cc#790: two directly named const call args stage through one
+    // shared buffer on small cores. The callee memcpys through its param
+    // slot (the generic pointer path); the last call (b = C,D,0) wins.
+    let mut m = parse(
+        "const a i8\n\
+         const b i8\n\
+         global out i8\n\
+         fn callee(void) (p=ptr)\n\
+           block entry:\n\
+             memcpy @out %p 3\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @callee(@a)\n\
+             call void @callee(@b)\n\
+             ret void\n",
+    );
+    m.globals[0].size = 3;
+    m.globals[0].bytes = vec![65, 66, 0];
+    m.globals[1].size = 3;
+    m.globals[1].bytes = vec![67, 68, 0];
+    m.globals[2].size = 3;
+    m.globals[2].bytes = vec![0, 0, 0];
+    let layout = alloc::allocate(&PIC16F877A, &m, "edge main callee\n");
+    assert!(
+        !layout.globals.contains_key("a") && !layout.globals.contains_key("b"),
+        "staged consts get no RAM copies"
+    );
+    let out_base = layout.globals["out"];
+    let mut addrs = layout.globals.clone();
+    addrs.extend(layout.locals.clone());
+    let asm = isel::select_with_locs(&PIC16F877A, &m, &addrs, &layout.staged_consts).0;
+    assert!(
+        asm.contains("CALL __stage_a") && asm.contains("__stage_a:"),
+        "per-string staging routine is called and emitted:\n{asm}"
+    );
+    use pic14_sim::Pic14;
+    let words = asm::assemble(&asm);
+    let mut p = Pic14::new(words);
+    p.run(200_000);
+    assert!(p.halted(), "program must SLEEP-halt:\n{asm}");
+    assert_eq!(
+        &p.ram()[out_base as usize..out_base as usize + 3],
+        &[67, 68, 0],
+        "callee must observe the staged table bytes"
     );
 }

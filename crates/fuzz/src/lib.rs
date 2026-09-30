@@ -2499,13 +2499,14 @@ fn run_ir_pic(prog: &IrProgram, device: &device::Device) -> Result<u32, Failure>
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14 => {
-                let asm = isel::select(device, &m, &addrs);
+                let (asm, _) = isel::select_with_locs(device, &m, &addrs, &layout.staged_consts);
                 let asm = banking::assign_banks(device, &asm);
                 let asm = peephole::optimize(&asm);
                 asm::assemble_file_to_hex(device, &asm)
             }
             device::Core::Pic14e => {
-                let asm = isel_pic14e::select(device, &m, &addrs);
+                let (asm, _) =
+                    isel_pic14e::select_with_locs(device, &m, &addrs, &layout.staged_consts);
                 let asm = schedule::schedule(device, &asm);
                 let asm = banking::assign_banks(device, &asm);
                 let asm = peephole::optimize(&asm);
