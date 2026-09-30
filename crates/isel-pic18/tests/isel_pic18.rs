@@ -116,6 +116,21 @@ fn i32_add_emits_a_four_byte_carry_chain() {
         3,
         "bytes 1-3 carry adds:\n{asm}"
     );
+    // Since epic-cc#723 the add computes straight into `@out`
+    // (0x028-0x02B): every destination byte lands, the dead temp
+    // (0x038-0x03B) stays untouched.
+    for a in 0x028..=0x02Bu16 {
+        assert!(
+            asm.contains(&format!("MOVWF 0x{a:03X},A")),
+            "destination byte written:\n{asm}"
+        );
+    }
+    for a in 0x038..=0x03Bu16 {
+        assert!(
+            !asm.contains(&format!("MOVWF 0x{a:03X}")),
+            "dead temp byte untouched:\n{asm}"
+        );
+    }
 }
 
 #[test]
@@ -2474,8 +2489,12 @@ fn runtime_inttoptr_derefs_through_fsr0_indf0() {
         "FSR0 loaded from the address slot:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0xFEF,"),
-        "access through INDF0 (0xFEF), folded straight to its store since epic-cc#723:\n{asm}"
+        asm.contains("MOVFF 0xFEF, 0x021"),
+        "INDF0 folds straight into `@out` (0x021), not the dead temp:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0xFEF, 0x027"),
+        "dead temp 0x027 untouched:\n{asm}"
     );
 }
 
@@ -2497,8 +2516,12 @@ fn runtime_ptr_select_derefs_through_fsr0() {
         "FSR0 loaded from the address slot:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0xFEF,"),
-        "access through INDF0 (0xFEF), folded straight to its store since epic-cc#723:\n{asm}"
+        asm.contains("MOVFF 0xFEF, 0x021"),
+        "INDF0 folds straight into `@out` (0x021), not the dead temp:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0xFEF, 0x027"),
+        "dead temp 0x027 untouched:\n{asm}"
     );
 }
 
@@ -2525,8 +2548,12 @@ fn runtime_ptr_phi_derefs_through_slot_after_phi_copies() {
         "FSR0 loaded from the phi dst slot:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0xFEF,"),
-        "access through INDF0 (0xFEF), folded straight to its store since epic-cc#723:\n{asm}"
+        asm.contains("MOVFF 0xFEF, 0x021"),
+        "INDF0 folds straight into `@out` (0x021), not the dead temp:\n{asm}"
+    );
+    assert!(
+        !asm.contains("MOVFF 0xFEF, 0x029"),
+        "dead temp 0x029 untouched:\n{asm}"
     );
 }
 
@@ -2803,8 +2830,12 @@ fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
     let addrs = addrs(&[("arr", 0x100), ("out", 0x110), ("main::v", 0x111)]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
-        asm.contains("MOVFF 0x102,"),
-        "arr[2] must read directly from base+2 (0x102), no FSR machinery:\n{asm}"
+        asm.contains("MOVFF 0x102, 0x110"),
+        "arr[2] folds straight into `@out` (0x110), no FSR machinery:\n{asm}"
+    );
+    assert!(
+        !asm.contains(", 0x111"),
+        "dead temp 0x111 untouched:\n{asm}"
     );
     assert!(
         // Scoped to main's body: `__start`'s zero-clear (epic-cc#561)
