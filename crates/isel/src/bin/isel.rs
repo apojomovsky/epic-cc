@@ -4,7 +4,7 @@ use std::fs;
 /// `isel <in.ir> <in.map> <out.asm>`
 ///
 /// The address map is a text file with `global <name> 0xNN`,
-/// `local <func> <name> 0xNN`, `const <name>` (no address — flash), and
+/// `local <func> <name> 0xNN`, `const <name>` (no address, flash), and
 /// `staged <name>` (stage through the shared buffer) lines (produced by
 /// the `alloc` stage). Locals are keyed `{func}::{name}`, matching the
 /// keys isel looks up.

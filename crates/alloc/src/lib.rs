@@ -1673,16 +1673,11 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             }
         }
     }
-    // Staging eligibility (epic-cc#790): a directly triggered const stages
-    // through one shared buffer instead of a per-copy, unless sharing the
-    // buffer is unsafe (demotions below fall back to copies).
-    //
-    // Unsafe shapes: a call naming two staged values; a staged select
-    // without its single consuming call in-block and ordered after it;
-    // uses in ISR-reachable or address-taken functions; and lone consts,
-    // whose copy is cheaper than a buffer.
-    // isel stages the explicit set below, so no rule crosses the crate
-    // boundary. Pinned consts keep their address and their copy.
+    // Staging eligibility (epic-cc#790): directly triggered consts share
+    // one buffer instead of per-copies, unless sharing is unsafe. Unsafe:
+    // multi-value calls, orphan selects, ISR or address-taken uses, lone
+    // consts (a copy is cheaper than a buffer), escaping callees (Pass C).
+    // isel stages the explicit set below. Pinned consts keep their copy.
     let small_core = matches!(device.core, device::Core::Pic14 | device::Core::Pic14e);
     let mut staged: HashSet<String> = HashSet::new();
     let mut stage_max: u16 = 0;
@@ -1795,16 +1790,11 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             }
         }
         // Pass C (callee escape): the buffer is re-copied before every
-        // consuming call, so a callee that keeps the address alive (stores
-        // it, returns it, or forwards it into another call) would read a
-        // clobbered buffer. Taint the params receiving staged values at
-        // their arg positions (positions past the params are variadic
-        // extras: immediate byte copies, never the address) and propagate
-        // through GEPs, selects, and phis. Immediate dereferences (loads,
-        // stores, and memcpys through the pointer) and address compares
-        // consume the value in-call and stay safe; any other tainted read
-        // escapes. An indirect call with staged values has an unknown
-        // callee and demotes what it stages.
+        // consuming call, so a callee keeping the address alive (store,
+        // return, forward) would read a clobbered buffer. Taint staged
+        // params through GEPs, selects, and phis; dereferences and address
+        // compares consume, any other tainted read escapes. Indirect calls
+        // demote (unknown callee).
         for c in &calls {
             if excluded.contains(&c.func) {
                 continue;
