@@ -324,3 +324,36 @@ fn align_and_table_keep_chunked_labels_at_low_zero() {
     );
     assert_eq!(words[probe + 2], 0x3002, "HIGH(t_1) = 2 (t_1 at 0x200)");
 }
+
+#[test]
+fn label_starting_with_end_does_not_truncate() {
+    let src = "    org 0x0000\n    goto main\nmain:\n    movlw 0x01\n    movwf 0x20\nendpoint:\n    movlw 0x02\n    movwf 0x21\n    return\n    end\n";
+    let words = assemble(src);
+    assert_eq!(words.len(), 6);
+    assert_eq!(words[0], 0x2801, "goto main");
+    assert_eq!(words[1], 0x3001, "movlw 0x01");
+    assert_eq!(words[2], 0x00A0, "movwf 0x20");
+    assert_eq!(words[3], 0x3002, "movlw 0x02");
+    assert_eq!(words[4], 0x00A1, "movwf 0x21");
+    assert_eq!(words[5], 0x0008, "return");
+}
+
+#[test]
+fn labels_starting_with_list_or_radix_survive() {
+    let src =
+        "    org 0x0000\n    goto listener\nlistener:\n    nop\nradix_table:\n    nop\n    end\n";
+    let words = assemble(src);
+    assert_eq!(words.len(), 3);
+    assert_eq!(words[0], 0x2801, "goto listener");
+    assert_eq!(words[1], 0x0000, "nop under listener:");
+    assert_eq!(words[2], 0x0000, "nop under radix_table:");
+}
+
+#[test]
+fn end_directive_stops_with_trailing_text() {
+    for tail in ["", "   ", " ; done", "\t"] {
+        let src = format!("    org 0x0000\n    nop\n    end{tail}\n    nop\n");
+        let words = assemble(&src);
+        assert_eq!(words.len(), 1, "end{tail:?} still terminates");
+    }
+}
