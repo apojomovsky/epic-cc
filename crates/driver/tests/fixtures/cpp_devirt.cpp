@@ -1,7 +1,3 @@
-#ifndef SEL
-#define SEL 0
-#endif
-
 // Dispatch sequences stay sim-only until the `mdb` replay lands with
 // #832 (docs/40 §5).
 
@@ -13,23 +9,15 @@ class Base {
 
 class Derived : public Base {
   public:
-    unsigned char tick() override { return v + 1; }
+    unsigned char tick() override { return v + 7; }
 };
 
-class More : public Base {
-  public:
-    unsigned char tick() override { return v + 2; }
-};
-
-Base g_b;
 Derived g_d;
-More g_m;
 
-volatile unsigned char in_sel = SEL;
 volatile unsigned char out_val;
 
 int main() {
-    Base* p = (in_sel == 0) ? (Base*)&g_b : (in_sel == 1) ? (Base*)&g_d : (Base*)&g_m;
+    Base* p = &g_d;
     out_val = p->tick();
     return 0;
 }
