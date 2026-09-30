@@ -664,9 +664,10 @@ fn call_copies_args_to_callee_params_and_reads_retval() {
         "copy %2 into add::y:\n{asm}"
     );
     assert!(asm.contains("    CALL add"), "CALL add:\n{asm}");
-    // Retval copy: fixed retval slots 0x71/0x72 -> %3 (0x2D/0x2E).
+    // Retval copy: fixed retval slots 0x71/0x72 -> %3 (0x2D/0x2E),
+    // high byte first, with the hi load elided (W holds it).
     assert!(
-        asm.contains("MOVF 0x71, W\n    MOVWF 0x2D\n    MOVF 0x72, W\n    MOVWF 0x2E"),
+        asm.contains("MOVWF 0x2E\n    MOVF 0x71, W\n    MOVWF 0x2D"),
         "copy retval into %3:\n{asm}"
     );
 }
@@ -2811,10 +2812,12 @@ fn byval_call_copies_struct_bytes_into_param_slot() {
         );
     }
     assert!(asm.contains("    CALL sum"), "CALL sum:\n{asm}");
-    // Retval copy: fixed retval 0x71 -> %2 (0x29).
+    // Retval copy: the i8 return is already in W after the CALL
+    // (same page, no restore), so the reload elides and only the
+    // store into %2 (0x29) remains.
     assert!(
-        asm.contains("MOVF 0x71, W\n    MOVWF 0x29"),
-        "retval copy into %2:\n{asm}"
+        asm.contains("CALL sum\n    MOVWF 0x29"),
+        "elided retval copy into %2:\n{asm}"
     );
 }
 
@@ -4624,12 +4627,51 @@ fn same_page_call_skips_restore() {
 }
 
 #[test]
+fn multibyte_call_copy_elides_hi_load() {
+    // The copy runs high byte first, so the hi load elides (W holds the
+    // last retval byte) and only the lo load emits. 0x00FF + 1 = 0x0100
+    // exercises both bytes through the sim.
+    let ir = "global in i16\nglobal out i16\n\
+         fn dbl(i16) (x)\n  block entry:\n\
+           %r = add i16 %x, 1\n    ret i16 %r\n\
+         fn main(void) ()\n  block entry:\n\
+           %1 = load i16 @in\n    %2 = call i16 @dbl(i16 %1)\n    store i16 %2 @out\n    ret void\n";
+    let map = vec![
+        ("in".to_string(), 0x20u16),
+        ("out".to_string(), 0x22),
+        ("main::1".to_string(), 0x25),
+        ("main::2".to_string(), 0x27),
+        ("dbl::x".to_string(), 0x2B),
+        ("dbl::r".to_string(), 0x2D),
+    ];
+    let asm = select(&PIC16F877A, &parse(ir), &addrs(&map_refs(&map)));
+    assert!(
+        asm.contains("CALL dbl\n    MOVWF 0x28\n    MOVF 0x71, W\n    MOVWF 0x27"),
+        "two-byte copy elides only the hi load:\n{asm}"
+    );
+    let got = sim_run_bytes(ir, &map, &[(0x20, 0xFF), (0x21, 0x00)], 0x22, 2);
+    assert_eq!(&got[..], &[0x00, 0x01], "0x00FF + 1 must be 0x0100");
+}
+
+#[test]
+fn guarded_call_keeps_retval_reload() {
+    // Float recipes predate the return-in-W invariant (epic-cc#775), so
+    // `call_returns_in_w` skips the seed: the copy runs high byte first
+    // but every load stays, even on the same page with no restore.
+    let (ir, map) = float_routine_module("__add_f32");
+    let asm = select(&PIC16F877A, &parse(&ir), &addrs(&map_refs(&map)));
+    assert!(
+        asm.contains("CALL __add_f32\n    MOVF 0x74, W\n    MOVWF 0x37\n    MOVF 0x73, W\n    MOVWF 0x36\n    MOVF 0x72, W\n    MOVWF 0x35\n    MOVF 0x71, W\n    MOVWF 0x34"),
+        "guarded call keeps every retval load:\n{asm}"
+    );
+}
+
+#[test]
 fn same_page_const_read_skips_restore() {
     // A const-table read (`CALL __read_t`) gets the same discipline: the
     // caller sets PAGE(__read_t) before the CALL. main and the table both
-    // land in page 0, so the restore is skipped — the returned byte is
-    // stashed in the fixed scratch (0x70) across the reader's PCLATH write
-    // and reloaded into W (no restore pair between).
+    // land in page 0, so the restore is skipped and the park reload
+    // elides too, the byte travels CALL to scratch to slot in W.
     let m = module_with_globals(
         "global in i8\nglobal out i8\nconst t i8\nfn main(void) ()\n  block entry:\n\
            %i = load i8 @in\n    %p = gep @t +0 +1*%i\n    %v = load i8 %p\n\
@@ -4649,10 +4691,10 @@ fn same_page_const_read_skips_restore() {
         asm.contains("MOVLW PAGE(__read_t)\n    MOVWF PCLATH"),
         "set before CALL __read_t:\n{asm}"
     );
-    // Same-page read: CALL, stash the byte, reload — no restore pair.
+    // Same-page read: CALL, stash the byte, no restore, no reload.
     assert!(
-        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVF 0x70, W"),
-        "same-page read with no restore, byte preserved:\n{asm}"
+        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVWF 0x26"),
+        "same-page read with no restore and no reload:\n{asm}"
     );
     assert!(
         !asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
@@ -4711,30 +4753,27 @@ fn org_pads_function_across_page_boundary() {
         label_addr(&asm, "main") < 0x800,
         "main stays in page 0:\n{asm}"
     );
-    // The main -> helper CALL is cross-page (page 0 -> page 1), so this
-    // call KEEPS the restore — the caller's intra-function GOTOs need its
+    // The main -> helper CALL is cross-page (page 0 -> page 1): the i8
+    // retval copy runs ahead of the restore while W is still live, and
+    // the restore follows. The caller's intra-function GOTOs need its
     // own page back.
     assert!(
-        asm.contains("CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
-        "cross-page call keeps the restore:\n{asm}"
+        asm.contains("CALL helper\n    MOVWF 0x26\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page call copies retval ahead of the restore:\n{asm}"
     );
 }
 
 #[test]
 fn multi_page_module_runs_in_sim() {
-    // M11 load-bearing SIM: main (padded to fill page 0) calls helper which
-    // the greedy assignment moves to page 1 via `.org 0x800`. The discipline
-    // is exercised in BOTH directions: the cross-page calls (main -> helper,
-    // main -> `__read_t` — the table lands in page 1 too) keep the restore —
-    // main's post-call GOTO proves PCLATH is back on PAGE(main) — while the
-    // same-page calls inside helper (helper -> `__read_t`, helper -> helper2,
-    // all of page 1) SKIP the restore — helper's post-call GOTO proves
-    // PCLATH still holds page 1, so the elision cannot break the caller's
-    // intra-function branches. helper(x) = x == 0 ? 100 : x, plus
-    // t[x] + 1 (helper2(x) = x + 1); main: r = helper(in);
-    // r2 = r == 0 ? r+1 : r; out = r2 + t[in].
+    // M11 load-bearing SIM: main (padded to fill page 0) calls helper in
+    // page 1 (via `.org 0x800`). Cross-page calls keep the restore after
+    // the retval copy; same-page calls inside helper skip restore and
+    // reload. helper(x) = x == 0 ? 100 : x, plus t[x] + 1; main: r =
+    // helper(in); r2 = r == 0 ? r+1 : r; out = r2 + t[in].
     let mut pad = String::new();
-    for _ in 0..666 {
+    // Pads main to fill page 0: the count tracks main's emitted size,
+    // so re-tune it when the call sequences change length.
+    for _ in 0..667 {
         pad.push_str("    %a = add i8 %a, 1\n");
     }
     let m = module_with_globals(
@@ -4800,19 +4839,23 @@ fn multi_page_module_runs_in_sim() {
         t >= 0x800 && t < 0x1000,
         "table must land in page 1 (base 0x{t:03X}):\n{asm}"
     );
-    // Same-page calls inside helper (page 1 -> page 1) lose the restore...
+    // Same-page calls inside helper (page 1 -> page 1) lose the restore
+    // AND the reload: the i8 return is already in W, so only the store
+    // remains; the table byte stays in W across the skipped restore and
+    // lands directly in its slot...
     assert!(
-        asm.contains("CALL helper2\n    MOVF 0x71, W"),
-        "same-page helper2 call must not restore before the retval copy:\n{asm}"
+        asm.contains("CALL helper2\n    MOVWF 0x36"),
+        "same-page helper2 call elides the retval reload:\n{asm}"
     );
     assert!(
-        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVF 0x70, W"),
-        "same-page table read must not restore:\n{asm}"
+        asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVWF 0x34"),
+        "same-page table read elides the park reload:\n{asm}"
     );
-    // ...while main's cross-page calls (page 0 -> page 1) keep it.
+    // ...while main's cross-page calls (page 0 -> page 1) keep the
+    // restore after the retval copy, and the table park across it.
     assert!(
-        asm.contains("CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
-        "cross-page helper call keeps the restore:\n{asm}"
+        asm.contains("CALL helper\n    MOVWF 0x27\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page helper call copies retval ahead of the restore:\n{asm}"
     );
     assert!(
         asm.contains("CALL __read_t\n    MOVWF 0x70\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
@@ -4939,10 +4982,11 @@ fn exact_boundary_function_stays_anchored_after_elision() {
         2,
         "exactly __start's set + the helper restore:\n{asm}"
     );
-    // The cross-page helper call keeps the restore (page 0 -> page 1).
+    // The cross-page helper call copies retval ahead of the restore
+    // (page 0 -> page 1).
     assert!(
-        asm.contains("CALL helper\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
-        "cross-page helper call keeps the restore:\n{asm}"
+        asm.contains("CALL helper\n    MOVWF 0x26\n    MOVLW PAGE(main)\n    MOVWF PCLATH"),
+        "cross-page helper call copies retval ahead of the restore:\n{asm}"
     );
     // Load-bearing sim: helper's intra-function GOTO (after the cross-page
     // CALL) branches in page 1. in == 0 -> helper(0) = 100 (then arm) and
@@ -5823,9 +5867,10 @@ fn i32_call_copies_four_arg_and_retval_bytes() {
         "copy %2 hi byte into addm::y:\n{asm}"
     );
     assert!(asm.contains("    CALL addm"), "CALL addm:\n{asm}");
-    // Retval copy: 0x71/0x72/0x73/0x74 -> %3 (0x38..0x3B).
+    // Retval copy: 0x71/0x72/0x73/0x74 -> %3 (0x38..0x3B), high byte
+    // first, with the hi load elided (W holds it).
     assert!(
-        asm.contains("    MOVF 0x71, W\n    MOVWF 0x38\n    MOVF 0x72, W\n    MOVWF 0x39\n    MOVF 0x73, W\n    MOVWF 0x3A\n    MOVF 0x74, W\n    MOVWF 0x3B"),
+        asm.contains("    MOVWF 0x3B\n    MOVF 0x73, W\n    MOVWF 0x3A\n    MOVF 0x72, W\n    MOVWF 0x39\n    MOVF 0x71, W\n    MOVWF 0x38"),
         "copy 4 retval bytes into %3:\n{asm}"
     );
 }
