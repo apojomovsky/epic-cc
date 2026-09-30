@@ -1656,9 +1656,13 @@ fn home_args(
                 continue;
             }
             let succ = &succ_of[&c.src.0];
+            // Same-block order is inclusive: two writers recorded at the
+            // same point (two params, a param and an entry-position def,
+            // two phis sharing a predecessor) both write the slot, and
+            // whichever runs second wins, so they collide.
             let reaches = |from: (usize, usize), to: (usize, usize)| -> bool {
                 if from.0 == to.0 {
-                    return from.1 < to.1;
+                    return from.1 <= to.1;
                 }
                 let mut seen: HashSet<usize> = HashSet::new();
                 let mut stack = succ.get(&from.0).cloned().unwrap_or_default();

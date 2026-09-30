@@ -2740,3 +2740,36 @@ fn sibling_callee_writers_do_not_both_home() {
         "sibling-frame writers must not both home (a={a}, bb={bb})"
     );
 }
+
+#[test]
+fn two_params_homed_to_one_slot_do_not_both_home() {
+    // Two single-use params of one function, each forwarded from its own
+    // arm of a branch. Both write points are recorded at entry, so they
+    // tie: without an inclusive same-block test neither collides and the
+    // shared slot is written twice per execution.
+    let m = parse(
+        "global out i8\n\
+         fn g(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn f(i1) (c=i1, p1=i8, p2=i8)\n\
+           block entry:\n\
+             br i1 %c, label %1, label %2\n\
+           block 1:\n\
+             call void @g(i8 %p1)\n\
+             br label %3\n\
+           block 2:\n\
+             call void @g(i8 %p2)\n\
+             br label %3\n\
+           block 3:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge f g\n");
+    let p1 = out.locals["f::p1"] == out.locals["g::p"];
+    let p2 = out.locals["f::p2"] == out.locals["g::p"];
+    assert!(
+        !(p1 && p2),
+        "tied writes to one slot must not both home (p1={p1}, p2={p2})"
+    );
+}
