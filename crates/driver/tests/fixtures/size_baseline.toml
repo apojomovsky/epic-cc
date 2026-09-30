@@ -156,11 +156,11 @@ ram_bytes = 755
 [[entry]]
 name = "hal-pic18-control-demo-18f4550"
 device = "18F4550"
-flash_words = 10069
+flash_words = 9962
 ram_bytes = 977
 
 [[entry]]
 name = "hal-pic18-pid-18f4550"
 device = "18F4550"
-flash_words = 3372
+flash_words = 3309
 ram_bytes = 500
