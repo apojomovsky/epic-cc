@@ -392,7 +392,7 @@ impl<'m> Gen<'m> {
         }
         let mut alu_parts = alu.split_whitespace();
         const ZSET: [&str; 10] = [
-            "ADDWF", "ADDWFC", "SUBWF", "SUBFWB", "ANDWF", "IORWF", "XORWF", "MOVF", "COMF", "NEGF",
+            "ADDWF", "ADDWFC", "SUBWF", "SUBWFB", "ANDWF", "IORWF", "XORWF", "MOVF", "COMF", "NEGF",
         ];
         if !ZSET.contains(&alu_parts.next().unwrap_or("")) {
             return false;
@@ -4013,7 +4013,7 @@ impl<'m> Gen<'m> {
                                     (ir::BinOp::Add, false) => "ADDWF",
                                     (ir::BinOp::Add, true) => "ADDWFC",
                                     (ir::BinOp::Sub, false) => "SUBWF",
-                                    (ir::BinOp::Sub, true) => "SUBFWB",
+                                    (ir::BinOp::Sub, true) => "SUBWFB",
                                     (ir::BinOp::And, _) => "ANDWF",
                                     (ir::BinOp::Or, _) => "IORWF",
                                     (ir::BinOp::Xor, _) => "XORWF",
@@ -4078,14 +4078,14 @@ impl<'m> Gen<'m> {
                     self.emit_load_w(&b.b, i, false);
                     // Byte 0 of add/sub is a plain ADDWF/SUBWF; every byte
                     // past it must fold in the carry/borrow from the
-                    // previous byte via ADDWFC/SUBFWB. and/or/xor apply
+                    // previous byte via ADDWFC/SUBWFB. and/or/xor apply
                     // independently per byte and never use the carry form.
                     let carry = i > 0 && matches!(b.op, ir::BinOp::Add | ir::BinOp::Sub);
                     let mne = match (b.op, carry) {
                         (ir::BinOp::Add, false) => "ADDWF",
                         (ir::BinOp::Add, true) => "ADDWFC",
                         (ir::BinOp::Sub, false) => "SUBWF",
-                        (ir::BinOp::Sub, true) => "SUBFWB",
+                        (ir::BinOp::Sub, true) => "SUBWFB",
                         (ir::BinOp::And, _) => "ANDWF",
                         (ir::BinOp::Or, _) => "IORWF",
                         (ir::BinOp::Xor, _) => "XORWF",
@@ -5599,8 +5599,8 @@ impl<'m> Gen<'m> {
                 if ra == 0 { "A" } else { "B" }
             ));
         }
-        // rem -= den: SUBWF then SUBFWB (borrow-in); beyond den_bytes the
-        // divisor byte is implicitly 0, folded with MOVLW 0 + SUBFWB.
+        // rem -= den: SUBWF then SUBWFB (borrow-in); beyond den_bytes the
+        // divisor byte is implicitly 0, folded with MOVLW 0 + SUBWFB.
         for i in 0..u16::from(rem_bytes) {
             if i < u16::from(den_bytes) {
                 let (da, df) = self.operand(den + i);
@@ -5612,7 +5612,7 @@ impl<'m> Gen<'m> {
                 self.emit("    MOVLW 0x00".to_string());
             }
             let (ra, rf) = self.operand(rem_base + i);
-            let mne = if i == 0 { "SUBWF" } else { "SUBFWB" };
+            let mne = if i == 0 { "SUBWF" } else { "SUBWFB" };
             self.emit(format!(
                 "    {mne} 0x{rf:03X},F,{}",
                 if ra == 0 { "A" } else { "B" }

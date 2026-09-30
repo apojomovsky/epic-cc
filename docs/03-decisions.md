@@ -41,6 +41,7 @@ one-line index entry here, e.g.:
 - ADR-041: PIC18 carries provable callee exit banks across calls (buffered reverse-topological emission, exit-bank map from recorded return ends, unknown clears), 2026-09-22
 - ADR-042: PIC18 factors repeated code on the final listing (`outline` stage, on by default, size over cycles), 2026-09-24
 - ADR-043: Generated device headers and a real `xc.h` (registry `sfrs` to `pic<part>.h`, variadic `__interrupt`, delays over `_delay`; bare bits deferred to #707), 2026-09-26
+- ADR-044: PIC18 borrow chains use `SUBWFB`, never `SUBFWB`; the simulator decodes the two opcodes separately, 2026-09-30
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 
