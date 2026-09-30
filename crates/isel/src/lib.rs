@@ -150,6 +150,11 @@ struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
     device: &'m Device,
+    /// Flash consts staged through the shared buffer (epic-cc#790): the
+    /// explicit set alloc computed, threaded from the driver. A const with
+    /// no RAM address stages at its use sites; everything else keeps
+    /// today's paths.
+    staged: &'m HashSet<String>,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)`: GEP chains fully collapsed (base
     /// `Reg` replaced by the base's own entry), plus the seeded pointer
@@ -1955,6 +1960,31 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Copy flash const `name` into the shared staging buffer and write the
+    /// buffer's address into `dst` (2 bytes): staged consts have no RAM
+    /// address on small cores (epic-cc#790). The bytes move inside the
+    /// per-string `__stage_<name>` routine (emitted with the const tables:
+    /// inline copies would overflow single functions' pages); the site only
+    /// calls it. Membership in `self.staged` (precomputed below) decides.
+    fn emit_stage_const_to_slot(&mut self, name: &str, dst: u16) {
+        assert!(
+            self.staged.contains(name),
+            "isel: staging unlisted const @{name}"
+        );
+        self.emit(format!("    MOVLW PAGE(__stage_{name})"));
+        self.emit("    MOVWF PCLATH".to_string());
+        self.emit(format!("    CALL __stage_{name}"));
+        self.emit_pclath_restore(&format!("__stage_{name}"));
+        let stage = *self
+            .addrs
+            .get("__const_stage")
+            .expect("isel: staged const with no staging buffer in map");
+        self.emit(format!("    MOVLW 0x{:02X}", (stage & 0xFF) as u8));
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
+        self.emit(format!("    MOVLW 0x{:02X}", ((stage >> 8) & 0xFF) as u8));
+        self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+    }
+
     /// Copy the two-byte ADDRESS VALUE of `val` into the slot at `dst`:
     /// a `Const` literal writes the constant bytes, a `Global` writes its
     /// link-time address as two literals, a `Reg` reads the two bytes of
@@ -1971,6 +2001,12 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
             }
             Val::Global(g) => {
+                if self.staged.contains(g) {
+                    // No RAM address on small cores: copy the table through
+                    // the shared buffer and pass the buffer instead.
+                    self.emit_stage_const_to_slot(g, dst);
+                    return;
+                }
                 if self.is_function(g) || self.global_is_const(g) {
                     // A function's address and a flash const table's address
                     // are both link-time label literals (epic-cc#645: a
@@ -2527,6 +2563,10 @@ impl<'m> Gen<'m> {
                             self.emit(format!("    MOVWF 0x{:02X}", pa));
                             self.emit(format!("    MOVLW HIGH({g})"));
                             self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                        } else if self.staged.contains(g) {
+                            // No RAM address on small cores: copy the table
+                            // through the shared buffer into the param slot.
+                            self.emit_stage_const_to_slot(g, pa);
                         } else {
                             if self.global_is_const(g) {
                                 let size = self.global_size(g);
@@ -7218,8 +7258,11 @@ fn measure_end_org(text: &str) -> usize {
 /// functions so a forward call target's page is known; pass B re-emits with
 /// same-page restores skipped (the pads pin the page bases, so the elision
 /// never moves a function off its assigned page).
+/// Unit tests drive this with hand-built maps: nothing stages without an
+/// explicit set, so hand-mapped const call args keep today's behavior
+/// (a RAM copy if mapped, a loud panic if address-less).
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
-    select_with_locs(device, m, addrs).0
+    select_with_locs(device, m, addrs, &HashSet::new()).0
 }
 // A ref byte's operand: a RAM target's address half straight from the
 // alloc map (RAM globals have no assembler label to resolve, epic-cc#450
@@ -7250,6 +7293,7 @@ pub fn select_with_locs(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
+    staged: &HashSet<String>,
 ) -> (String, Vec<Option<SrcLoc>>) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
@@ -7396,6 +7440,7 @@ pub fn select_with_locs(
                 m,
                 addrs,
                 device,
+                staged: &staged,
                 resolved: &resolved,
                 scratch,
                 retval_lo,
@@ -7687,6 +7732,7 @@ pub fn select_with_locs(
                     m,
                     addrs,
                     device,
+                    staged: &staged,
                     resolved: &resolved,
                     scratch,
                     retval_lo,
@@ -7863,6 +7909,12 @@ pub fn select_with_locs(
                 format!("reader entry of const {}", g.name),
             );
             claim(g.name.clone(), format!("base label of const {}", g.name));
+            if staged.contains(&g.name) {
+                claim(
+                    format!("__stage_{}", g.name),
+                    format!("staging routine of const {}", g.name),
+                );
+            }
             // Chunk count matches the emitter: a 256-byte table still emits
             // the empty chunk 1 + `_hi` reader.
             let n_chunks = if g.bytes.len() >= 256 {
@@ -7892,6 +7944,36 @@ pub fn select_with_locs(
     }
     let mut addr = section_start;
     for g in consts {
+        // Staged consts (epic-cc#790) get a per-string routine beside
+        // their table: straight-line code with explicit PCLATH sets, so
+        // placement needs no page planning beyond the section's own, and
+        // both passes emit it identically (no page-dependent elision
+        // inside). Every staged use re-copies through it before its call.
+        if staged.contains(&g.name) {
+            let stage = *addrs
+                .get("__const_stage")
+                .expect("isel: staged const with no staging buffer in map");
+            out.push(format!("__stage_{}:", g.name));
+            locs.push(None);
+            // The reader sets PCLATH to HIGH(base) on entry, which can
+            // differ from its own entry page (straddling table), so every
+            // CALL re-sets the entry page: a single hoisted set would
+            // misbranch from the second byte on.
+            for i in 0..g.bytes.len() {
+                out.push(format!("    MOVLW PAGE(__read_{})", g.name));
+                locs.push(None);
+                out.push("    MOVWF PCLATH".to_string());
+                locs.push(None);
+                out.push(format!("    MOVLW 0x{i:02X}"));
+                locs.push(None);
+                out.push(format!("    CALL __read_{}", g.name));
+                locs.push(None);
+                out.push(format!("    MOVWF 0x{:02X}", stage + i as u16));
+                locs.push(None);
+            }
+            out.push("    RETURN".to_string());
+            locs.push(None);
+        }
         assert!(
             !g.bytes.is_empty(),
             "isel: const @{} has no table bytes",

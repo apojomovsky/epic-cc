@@ -33,8 +33,9 @@ pub fn line_table_text(device: &Device, asm: &str, locs: &[Option<SrcLoc>]) -> S
 }
 
 /// The address map file: `global <name> 0xNN`, `const <name>` (flash, no
-/// RAM address), and `local <key> 0xNN` where `<key>` is the driver's
-/// `{func}::{name}` HashMap key, all sorted deterministically. The map is
+/// RAM address), `staged <name>` (shared-buffer staging, epic-cc#790),
+/// and `local <key> 0xNN` where `<key>` is the driver's `{func}::{name}`
+/// HashMap key, all sorted deterministically. The map is
 /// the artifact a user reads when a program does not fit and they have to
 /// decide what to cut.
 pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
@@ -49,6 +50,11 @@ pub fn map_text(device: &Device, layout: &AllocLayout) -> String {
     consts.sort();
     for name in consts {
         out.push_str(&format!("const {name}\n"));
+    }
+    let mut staged: Vec<&String> = layout.staged_consts.iter().collect();
+    staged.sort();
+    for name in staged {
+        out.push_str(&format!("staged {name}\n"));
     }
     let mut locals: Vec<&String> = layout.locals.keys().collect();
     locals.sort();

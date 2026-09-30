@@ -37,6 +37,11 @@ pub struct AllocLayout {
     pub locals: HashMap<String, u16>,
     pub total_bank0: u16,
     pub const_globals: HashSet<String>,
+    /// Consts staged through the shared `__const_stage` buffer instead of
+    /// per-copies (epic-cc#790): isel stages exactly these at their use
+    /// sites. Empty on cores that copy, and whenever the set would not
+    /// pay for its buffer.
+    pub staged_consts: HashSet<String>,
     /// Per-bank high-water bytes (both main and ISR contexts): the highest
     /// allocated address in each GPR bank minus the bank start, floored at
     /// 0. The allocator places sequentially from each bank start, so this
@@ -1406,6 +1411,34 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut fixed: Vec<(String, u16, u16)> = Vec::new(); // (name, addr, size)
     let mut floating: Vec<&ir::Global> = Vec::new();
     let mut const_to_ram: HashSet<String> = HashSet::new();
+    // Direct triggers: a const global named outright as a plain call arg
+    // or an unfolding select arm. Derived triggers: reached through a
+    // GEP/reg chain. The split feeds staging below.
+    let mut const_direct: HashSet<String> = HashSet::new();
+    let mut const_derived: HashSet<String> = HashSet::new();
+    // Staging site records (epic-cc#790): per-call direct consts and reg
+    // args, per-select dst with direct const arms, operand users per
+    // (func, reg) with block positions, direct call edges, and functions
+    // referenced as values. The passes below demote sharing-unsafe
+    // triggers back to copies.
+    struct CallSite {
+        func: String,
+        callee: String,
+        indirect: bool,
+        direct: Vec<(usize, String)>,
+        regs: Vec<(usize, String)>,
+    }
+    struct SelSite {
+        func: String,
+        block: usize,
+        inst: usize,
+        dst: String,
+        arms: Vec<String>,
+    }
+    let mut calls: Vec<CallSite> = Vec::new();
+    let mut sels: Vec<SelSite> = Vec::new();
+    let mut users: HashMap<(String, String), Vec<(usize, usize, bool)>> = HashMap::new();
+    let mut addr_taken: HashSet<String> = HashSet::new();
     {
         use ir::GepBase;
         let mut func_gep: HashMap<String, HashMap<String, GepBase>> = HashMap::new();
@@ -1443,8 +1476,56 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 }
                 None
             };
-            for b in &f.blocks {
-                for inst in &b.insts {
+            for (bi, b) in f.blocks.iter().enumerate() {
+                for (ii, inst) in b.insts.iter().enumerate() {
+                    // Operand users and address-taken globals for the
+                    // staging soundness rules below. Calls record their
+                    // own arg kinds in the branch beneath; every other
+                    // instruction contributes read_vals uses.
+                    ir::collect_global_vals(inst, &mut addr_taken);
+                    match inst {
+                        ir::Inst::Gep(g) => {
+                            if let ir::GepBase::Global(name) = &g.base {
+                                addr_taken.insert(name.clone());
+                            }
+                        }
+                        ir::Inst::Load(l) => {
+                            if let Some(name) = l.ptr.strip_prefix('@') {
+                                addr_taken.insert(name.to_string());
+                            }
+                        }
+                        ir::Inst::Store(s) => {
+                            if let Some(name) = s.ptr.strip_prefix('@') {
+                                addr_taken.insert(name.to_string());
+                            }
+                            if let ir::Val::Global(g) = &s.val {
+                                addr_taken.insert(g.clone());
+                            }
+                        }
+                        ir::Inst::Asm(a) => {
+                            for op in &a.operands {
+                                if let Some(name) = op.ptr.strip_prefix('@') {
+                                    addr_taken.insert(name.to_string());
+                                }
+                            }
+                        }
+                        ir::Inst::Call(_) => {}
+                        _ => {}
+                    }
+                    // Every non-call instruction contributes read_vals uses
+                    // (the call branch beneath records its own arg kinds).
+                    // Gep/Load/Store/Asm regs count here too: a hidden extra
+                    // use must break select single-use (epic-cc#790 review).
+                    if !matches!(inst, ir::Inst::Call(_)) {
+                        for v in ir::read_vals(inst) {
+                            if !v.is_empty() {
+                                users
+                                    .entry((f.name.clone(), v))
+                                    .or_default()
+                                    .push((bi, ii, false));
+                            }
+                        }
+                    }
                     if let ir::Inst::Call(c) = inst {
                         for arg in &c.args {
                             if arg.ty.is_none() {
@@ -1456,6 +1537,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                                             {
                                                 if gl.size <= 255 {
                                                     const_to_ram.insert(g.clone());
+                                                    // Byval/sret args copy
+                                                    // bulk: never staging
+                                                    // candidates (epic-cc#790).
+                                                    if arg.byval.is_none() && !arg.sret {
+                                                        const_direct.insert(g.clone());
+                                                    }
                                                 }
                                             }
                                         }
@@ -1466,7 +1553,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                                                 m.globals.iter().find(|gl| gl.name == base)
                                             {
                                                 if gl.size <= 255 {
-                                                    const_to_ram.insert(base);
+                                                    const_to_ram.insert(base.clone());
+                                                    const_derived.insert(base);
                                                 }
                                             }
                                         }
@@ -1475,6 +1563,48 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                                 }
                             }
                         }
+                    }
+                    if let ir::Inst::Call(c) = inst {
+                        // Staging site records (epic-cc#790): reg args for
+                        // select-def lookup with their plain-arg kind,
+                        // direct edges for ISR reachability, and the site.
+                        let mut direct: Vec<(usize, String)> = Vec::new();
+                        let mut regs: Vec<(usize, String)> = Vec::new();
+                        for (i, arg) in c.args.iter().enumerate() {
+                            let plain = arg.ty.is_none() && arg.byval.is_none() && !arg.sret;
+                            match &arg.val {
+                                ir::Val::Global(g) => {
+                                    if plain
+                                        && m.globals.iter().any(|gl| &gl.name == g && gl.is_const)
+                                    {
+                                        direct.push((i, g.clone()));
+                                    }
+                                }
+                                ir::Val::Reg(r) => {
+                                    users
+                                        .entry((f.name.clone(), r.clone()))
+                                        .or_default()
+                                        .push((bi, ii, plain));
+                                    if plain {
+                                        regs.push((i, r.clone()));
+                                    }
+                                }
+                                ir::Val::Const(_) => {}
+                            }
+                        }
+                        if !c.callees.is_empty() {
+                            users
+                                .entry((f.name.clone(), c.func.clone()))
+                                .or_default()
+                                .push((bi, ii, false));
+                        }
+                        calls.push(CallSite {
+                            func: f.name.clone(),
+                            callee: c.func.clone(),
+                            indirect: !c.callees.is_empty(),
+                            direct,
+                            regs,
+                        });
                     }
                     // A pointer select whose arms are const globals is a runtime
                     // address VALUE when the arms do not fold to a common base
@@ -1505,18 +1635,308 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                         // (ccp_sel shape, const stays in flash); different
                         // bases, or a const arm against a RAM/runtime arm,
                         // seed the select and need each const arm in RAM.
-                        let (ba, bb) = (const_base(&s.a), const_base(&s.b));
-                        if ba != bb {
-                            for g in [ba, bb].into_iter().flatten() {
+                        let arms = [
+                            (const_base(&s.a), matches!(s.a, ir::Val::Global(_))),
+                            (const_base(&s.b), matches!(s.b, ir::Val::Global(_))),
+                        ];
+                        if arms[0].0 != arms[1].0 {
+                            let mut direct_arms: Vec<String> = Vec::new();
+                            for (base, is_direct) in arms {
+                                let Some(g) = base else { continue };
+                                // A GEP/reg-derived arm needs a real address
+                                // and keeps a RAM copy; a directly named arm
+                                // stages on small cores (below).
                                 if let Some(gl) = m.globals.iter().find(|gl| gl.name == g) {
                                     if gl.size <= 255 {
-                                        const_to_ram.insert(g);
+                                        const_to_ram.insert(g.clone());
+                                        if is_direct {
+                                            const_direct.insert(g.clone());
+                                            direct_arms.push(g.clone());
+                                        } else {
+                                            const_derived.insert(g);
+                                        }
                                     }
                                 }
+                            }
+                            if !direct_arms.is_empty() {
+                                sels.push(SelSite {
+                                    func: f.name.clone(),
+                                    block: bi,
+                                    inst: ii,
+                                    dst: s.dst.clone(),
+                                    arms: direct_arms,
+                                });
                             }
                         }
                     }
                 }
+            }
+        }
+    }
+    // Staging eligibility (epic-cc#790): directly triggered consts share
+    // one buffer instead of per-copies, unless sharing is unsafe. Unsafe:
+    // multi-value calls, orphan selects, ISR or address-taken uses, lone
+    // consts (a copy is cheaper than a buffer), escaping callees (Pass C).
+    // isel stages the explicit set below. Pinned consts keep their copy.
+    let small_core = matches!(device.core, device::Core::Pic14 | device::Core::Pic14e);
+    let mut staged: HashSet<String> = HashSet::new();
+    let mut stage_max: u16 = 0;
+    if small_core {
+        let func_idx: HashMap<&str, usize> = m
+            .funcs
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.name.as_str(), i))
+            .collect();
+        // Functions excluded from staging: ISR handlers, everything they
+        // can reach over direct calls, and any address-taken function
+        // (which an ISR dispatch could target through a pointer).
+        let mut excluded: HashSet<String> = HashSet::new();
+        let mut stack: Vec<String> = m
+            .funcs
+            .iter()
+            .filter(|f| f.isr)
+            .map(|f| f.name.clone())
+            .collect();
+        while let Some(f) = stack.pop() {
+            if !excluded.insert(f.clone()) {
+                continue;
+            }
+            if let Some(cs) = edges.get(&f) {
+                stack.extend(cs.iter().cloned());
+            }
+        }
+        for g in &addr_taken {
+            if func_idx.contains_key(g.as_str()) {
+                excluded.insert(g.clone());
+            }
+        }
+        // Reg definitions that are candidate selects, for resolving call
+        // args back to their staging select.
+        let mut sel_of: HashMap<(String, String), usize> = HashMap::new();
+        for (i, s) in sels.iter().enumerate() {
+            sel_of.insert((s.func.clone(), s.dst.clone()), i);
+        }
+        // Demoted consts fall back to per-copies (already in const_to_ram).
+        let mut demote: HashSet<String> = HashSet::new();
+        // Triggers in excluded functions never stage.
+        for c in &calls {
+            if excluded.contains(&c.func) {
+                demote.extend(c.direct.iter().map(|(_, g)| g.clone()));
+            }
+        }
+        for s in &sels {
+            if excluded.contains(&s.func) {
+                demote.extend(s.arms.iter().cloned());
+            }
+        }
+        // Pass A (calls): one call staging two values would leave both
+        // params reading the last copy. Count distinct direct consts plus
+        // one per feeding candidate select (a select stages at most one
+        // arm per execution); two or more demotes everything involved.
+        // Same-const repeats stage identical bytes and stay.
+        for c in &calls {
+            if excluded.contains(&c.func) {
+                continue;
+            }
+            let mut units: HashSet<String> = HashSet::new();
+            let mut sel_units: HashSet<usize> = HashSet::new();
+            for (_, d) in &c.direct {
+                units.insert(d.clone());
+            }
+            for (_, r) in &c.regs {
+                if let Some(&si) = sel_of.get(&(c.func.clone(), r.clone())) {
+                    sel_units.insert(si);
+                }
+            }
+            let mut foreign = 0;
+            for &si in &sel_units {
+                if sels[si].arms.iter().any(|a| !units.contains(a)) {
+                    foreign += 1;
+                }
+            }
+            if units.len() + foreign >= 2 {
+                demote.extend(units);
+                for &si in &sel_units {
+                    demote.extend(sels[si].arms.iter().cloned());
+                }
+            }
+        }
+        // Pass B (selects): a select stages its arms only with its single
+        // consuming call in the same block, ordered after it, and no other
+        // call or select between (any of which could re-stage first).
+        for s in &sels {
+            if s.arms.iter().all(|a| demote.contains(a)) {
+                continue;
+            }
+            let mut ok = !excluded.contains(&s.func);
+            if ok {
+                match users.get(&(s.func.clone(), s.dst.clone())) {
+                    Some(us) if us.len() == 1 => {
+                        let (ub, ui, plain) = us[0];
+                        ok = plain && ub == s.block && ui > s.inst;
+                        if ok {
+                            let blocks = &m.funcs[func_idx[s.func.as_str()]].blocks;
+                            ok = !blocks[s.block].insts[s.inst + 1..ui]
+                                .iter()
+                                .any(|i| matches!(i, ir::Inst::Call(_) | ir::Inst::Select(_)));
+                        }
+                    }
+                    _ => ok = false,
+                }
+            }
+            if !ok {
+                demote.extend(s.arms.iter().cloned());
+            }
+        }
+        // Pass C (callee escape): the buffer is re-copied before every
+        // consuming call, so a callee keeping the address alive (store,
+        // return, forward) would read a clobbered buffer. Taint staged
+        // params through GEPs, selects, and phis; dereferences and address
+        // compares consume, any other tainted read escapes. Indirect calls
+        // demote (unknown callee).
+        for c in &calls {
+            if excluded.contains(&c.func) {
+                continue;
+            }
+            let mut involved: Vec<String> = Vec::new();
+            let mut taint_args: Vec<usize> = Vec::new();
+            for (i, g) in &c.direct {
+                if !demote.contains(g) {
+                    involved.push(g.clone());
+                    taint_args.push(*i);
+                }
+            }
+            for (i, r) in &c.regs {
+                if let Some(&si) = sel_of.get(&(c.func.clone(), r.clone())) {
+                    if sels[si].arms.iter().any(|a| !demote.contains(a)) {
+                        involved.extend(
+                            sels[si]
+                                .arms
+                                .iter()
+                                .filter(|a| !demote.contains(*a))
+                                .cloned(),
+                        );
+                        taint_args.push(*i);
+                    }
+                }
+            }
+            if involved.is_empty() {
+                continue;
+            }
+            let mut escape = c.indirect;
+            if !escape {
+                if let Some(&fi) = func_idx.get(c.callee.as_str()) {
+                    let callee = &m.funcs[fi];
+                    let mut tainted: HashSet<String> = HashSet::new();
+                    for &i in &taint_args {
+                        if let Some(p) = callee.params.get(i) {
+                            tainted.insert(p.name.clone());
+                        }
+                    }
+                    let mut changed = true;
+                    while changed && !tainted.is_empty() {
+                        changed = false;
+                        for b in &callee.blocks {
+                            for inst in &b.insts {
+                                let hit = |v: &ir::Val| matches!(v, ir::Val::Reg(r) if tainted.contains(r));
+                                let dst: Option<&str> = match inst {
+                                    ir::Inst::Gep(g) => {
+                                        let used = matches!(&g.base, ir::GepBase::Reg(r) if tainted.contains(r))
+                                            || g.terms.iter().any(|(_, r)| tainted.contains(r));
+                                        if used {
+                                            Some(g.dst.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    ir::Inst::Select(s) => {
+                                        if hit(&s.a) || hit(&s.b) {
+                                            Some(s.dst.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    ir::Inst::Phi(p) => {
+                                        if p.incoming.iter().any(|(v, _)| hit(v)) {
+                                            Some(p.dst.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(d) = dst {
+                                    changed |= tainted.insert(d.to_string());
+                                }
+                            }
+                        }
+                    }
+                    'scan: for b in &callee.blocks {
+                        for inst in &b.insts {
+                            let safe: Vec<String> = match inst {
+                                ir::Inst::Load(l) => {
+                                    vec![l.ptr.strip_prefix('%').unwrap_or(&l.ptr).to_string()]
+                                }
+                                ir::Inst::Store(s) => {
+                                    vec![s.ptr.strip_prefix('%').unwrap_or(&s.ptr).to_string()]
+                                }
+                                ir::Inst::Select(s) => {
+                                    vec![ir::val_name(&s.a), ir::val_name(&s.b)]
+                                }
+                                ir::Inst::Phi(p) => {
+                                    p.incoming.iter().map(|(v, _)| ir::val_name(v)).collect()
+                                }
+                                ir::Inst::Gep(g) => {
+                                    let mut vs = Vec::new();
+                                    if let ir::GepBase::Reg(r) = &g.base {
+                                        vs.push(r.clone());
+                                    }
+                                    vs.extend(g.terms.iter().map(|(_, r)| r.clone()));
+                                    vs
+                                }
+                                ir::Inst::Memcpy(m) => {
+                                    vec![ir::val_name(&m.dst), ir::val_name(&m.src)]
+                                }
+                                ir::Inst::Icmp(_) | ir::Inst::Fcmp(_) => ir::read_vals(inst),
+                                _ => Vec::new(),
+                            };
+                            if ir::read_vals(inst)
+                                .iter()
+                                .any(|u| !u.is_empty() && tainted.contains(u) && !safe.contains(u))
+                            {
+                                escape = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                } else {
+                    escape = true;
+                }
+            }
+            if escape {
+                demote.extend(involved);
+            }
+        }
+
+        // Survivors stage: direct-only, unpinned, small enough, paying.
+        for gname in &const_direct {
+            if const_derived.contains(gname) || demote.contains(gname) {
+                continue;
+            }
+            if let Some(gl) = m.globals.iter().find(|gl| &gl.name == gname) {
+                if gl.addr.is_none() && gl.size <= 255 {
+                    staged.insert(gname.clone());
+                    stage_max = stage_max.max(gl.size);
+                }
+            }
+        }
+        if staged.len() < 2 {
+            staged.clear();
+            stage_max = 0;
+        } else {
+            for gname in &staged {
+                const_to_ram.remove(gname);
             }
         }
     }
@@ -1532,6 +1952,23 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         } else {
             floating.push(g);
         }
+    }
+    // The shared staging buffer: one mutable RAM global sized to the
+    // largest staged string. Every staged use re-copies before its call,
+    // so the buffer is never read stale and needs no startup init (its
+    // zero bytes already report no init).
+    let mut stage_holder: Vec<ir::Global> = Vec::new();
+    if stage_max > 0 {
+        stage_holder.push(ir::Global {
+            name: "__const_stage".to_string(),
+            ty: ir::Ty::I8,
+            is_const: false,
+            size: stage_max,
+            bytes: vec![0u8; stage_max as usize],
+            refs: Vec::new(),
+            addr: None,
+        });
+        floating.extend(stage_holder.iter());
     }
     // Floating globals are placed with the same sequential -> bin-pack
     // strategy as before, but pinned addresses are respected and the
@@ -1689,13 +2126,13 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // device's GPR start (mirrors isel's layout computation). The
     // scratch/retval bytes live in the device's fixed common RAM, so the
     // first frame base follows the globals directly.
-    let end_of_globals =
-        m.globals
-            .iter()
-            .fold(device.gpr_start(), |end, g| match globals.get(&g.name) {
-                Some(&a) => end.max(physical_end(device, a, u16::from(g.size))),
-                None => end,
-            });
+    let end_of_globals = m.globals.iter().chain(stage_holder.iter()).fold(
+        device.gpr_start(),
+        |end, g| match globals.get(&g.name) {
+            Some(&a) => end.max(physical_end(device, a, u16::from(g.size))),
+            None => end,
+        },
+    );
 
     // The overlay's start: the GPR start when the frames were placed ahead
     // of the globals, the first byte past them otherwise.
@@ -1780,7 +2217,10 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     }
     for (i, &(start, end)) in device.ram_banks.iter().enumerate() {
         let mut hi: Option<u16> = None;
-        for g in &m.globals {
+        // The synthetic staging buffer lives outside `m.globals`: chain
+        // it in exactly like `end_of_globals` does, or the report
+        // undercounts RAM by the buffer.
+        for g in m.globals.iter().chain(stage_holder.iter()) {
             if let Some(&a) = globals.get(&g.name) {
                 // A bank-straddling global's physical end skips common RAM
                 // (docs/33 §D-2), so the per-bank high-water must use
@@ -1820,6 +2260,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         locals,
         total_bank0,
         const_globals,
+        staged_consts: staged,
         bank_used,
         isr_bytes,
         has_isr: !isr_names.is_empty(),
@@ -1895,9 +2336,10 @@ fn def_width(inst: &Inst, resolved: &PtrResolution, fname: &str) -> Option<(Stri
 }
 
 /// Render the layout as `global <name> 0xNN`, `const <name>` (no address:
-/// the global lives in flash), and `local <func> <name> 0xNN` lines,
-/// deterministically sorted by key. The internal alloc<->isel contract
-/// (the alloc bin and alloc tests consume it); the driver's user-facing
+/// the global lives in flash), `staged <name>` (shared-buffer staging),
+/// and `local <func> <name> 0xNN` lines, deterministically sorted by key.
+/// The internal alloc<->isel contract (the alloc bin and alloc tests
+/// consume it); the driver's user-facing
 /// map file renders the same facts with the unsplit `{func}::{name}` key
 /// (driver::report::map_text).
 pub fn map_text(l: &AllocLayout) -> String {
@@ -1911,6 +2353,11 @@ pub fn map_text(l: &AllocLayout) -> String {
     consts.sort();
     for name in consts {
         out.push_str(&format!("const {name}\n"));
+    }
+    let mut staged: Vec<&String> = l.staged_consts.iter().collect();
+    staged.sort();
+    for name in staged {
+        out.push_str(&format!("staged {name}\n"));
     }
     let mut locals: Vec<&String> = l.locals.keys().collect();
     locals.sort();

@@ -152,3 +152,65 @@ fn const_table_function_ref_keeps_the_label_literal() {
     );
     assemble_pic14e(&asm);
 }
+
+#[test]
+fn staged_const_call_args_share_one_buffer() {
+    // epic-cc#790: directly named const call args stage through one
+    // shared buffer instead of per-copy RAM. The hand map mirrors
+    // alloc: consts stay in flash, `__const_stage` is placed RAM.
+    let m = with_bytes(
+        with_bytes(
+            parse(
+                "const a i8\n\
+                 const b i8\n\
+                 global out i8\n\
+                 fn callee(void) (p=ptr)\n\
+                   block entry:\n\
+                     ret void\n\
+                 fn main(void) ()\n\
+                   block entry:\n\
+                     call void @callee(@a)\n\
+                     call void @callee(@b)\n\
+                     ret void\n",
+            ),
+            "a",
+            &[65, 66, 0],
+        ),
+        "b",
+        &[67, 68, 0],
+    );
+    let staged: std::collections::HashSet<String> =
+        ["a".to_string(), "b".to_string()].into_iter().collect();
+    let asm = isel_pic14e::select_with_locs(
+        &PIC16F1937,
+        &m,
+        &addrs(&[("out", 0x20), ("__const_stage", 0x23), ("callee::p", 0x26)]),
+        &staged,
+    )
+    .0;
+    assert!(
+        asm.contains("CALL __stage_a") && asm.contains("CALL __stage_b"),
+        "both const args stage through their routines:\n{asm}"
+    );
+    assert!(
+        asm.contains("__stage_a:"),
+        "per-string staging routine is emitted:\n{asm}"
+    );
+    for name in ["a", "b"] {
+        let start = asm
+            .find(&format!("__stage_{name}:\n"))
+            .expect("staging routine label");
+        let end = asm[start..].find("\n    RETURN").expect("routine end") + start;
+        let routine = &asm[start..end];
+        assert_eq!(
+            routine.matches(&format!("CALL __read_{name}")).count(),
+            routine.matches(&format!("PAGE(__read_{name})")).count(),
+            "every reader CALL in __stage_{name} re-sets the entry page (the reader leaves PCLATH on the table page)"
+        );
+    }
+    assert!(
+        asm.contains("MOVWF 0x26"),
+        "param slot takes the staging buffer address:\n{asm}"
+    );
+    assemble_pic14e(&asm);
+}

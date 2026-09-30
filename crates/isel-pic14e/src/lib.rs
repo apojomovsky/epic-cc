@@ -117,6 +117,10 @@ struct Gen<'m> {
     m: &'m Module,
     addrs: &'m HashMap<String, u16>,
     device: &'m Device,
+    /// Flash consts staged through the shared buffer (precomputed below):
+    /// a const with no RAM address used directly as a plain call arg or
+    /// direct select arm (epic-cc#790).
+    staged: &'m HashSet<String>,
     /// Every pointer reg in the module, keyed `{func}::{reg}`, resolved to
     /// its folded `(base, k, terms)`: GEP chains fully collapsed (base
     /// `Reg` replaced by the base's own entry), plus the seeded pointer
@@ -1601,6 +1605,30 @@ impl<'m> Gen<'m> {
         )
     }
 
+    /// Copy flash const `name` into the shared staging buffer and write the
+    /// buffer's address into `dst` (2 bytes): staged consts have no RAM
+    /// address (epic-cc#790). The bytes move inside the per-string
+    /// `__stage_<name>` routine (emitted with the const tables); the site
+    /// only calls it. Membership in `self.staged` (precomputed) decides.
+    fn emit_stage_const_to_slot(&mut self, name: &str, dst: u16) {
+        assert!(
+            self.staged.contains(name),
+            "isel: staging unlisted const @{name}"
+        );
+        self.emit(format!("    MOVLW PAGE(__stage_{name})"));
+        self.emit("    MOVWF PCLATH".to_string());
+        self.emit(format!("    CALL __stage_{name}"));
+        self.emit_pclath_restore(&format!("__stage_{name}"));
+        let stage = *self
+            .addrs
+            .get("__const_stage")
+            .expect("isel: staged const with no staging buffer in map");
+        self.emit(format!("    MOVLW 0x{:02X}", (stage & 0xFF) as u8));
+        self.emit(format!("    MOVWF 0x{dst:02X}"));
+        self.emit(format!("    MOVLW 0x{:02X}", ((stage >> 8) & 0xFF) as u8));
+        self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
+    }
+
     /// Copies the two-byte address value of `val` into `dst`. Handles
     /// literals, link-time addresses, and runtime address slots
     /// (epic-cc#147). A computed address with terms panics: it names no
@@ -1614,6 +1642,12 @@ impl<'m> Gen<'m> {
                 self.emit(format!("    MOVWF 0x{:02X}", dst + 1));
             }
             Val::Global(g) => {
+                if self.staged.contains(g) {
+                    // No RAM address: copy the table through the shared
+                    // buffer and pass the buffer instead.
+                    self.emit_stage_const_to_slot(g, dst);
+                    return;
+                }
                 if self.is_function(g) {
                     self.emit(format!("    MOVLW LOW({g})"));
                     self.emit(format!("    MOVWF 0x{:02X}", dst));
@@ -2050,6 +2084,10 @@ impl<'m> Gen<'m> {
                             self.emit(format!("    MOVWF 0x{:02X}", pa));
                             self.emit(format!("    MOVLW HIGH({g})"));
                             self.emit(format!("    MOVWF 0x{:02X}", pa + 1));
+                        } else if self.staged.contains(g) {
+                            // No RAM address: copy the table through the
+                            // shared buffer into the param slot.
+                            self.emit_stage_const_to_slot(g, pa);
                         } else {
                             if self.global_is_const(g) {
                                 let size = self.global_size(g);
@@ -6138,7 +6176,7 @@ fn measure_end_org(text: &str) -> usize {
 /// over post-banking sizes. Measures in pass A, then elides same-page
 /// restores in pass B with pinned bases.
 pub fn select(device: &Device, m: &Module, addrs: &HashMap<String, u16>) -> String {
-    select_with_locs(device, m, addrs).0
+    select_with_locs(device, m, addrs, &HashSet::new()).0
 }
 
 /// Extends `select` with per-line source locations for the driver address
@@ -6147,6 +6185,7 @@ pub fn select_with_locs(
     device: &Device,
     m: &Module,
     addrs: &HashMap<String, u16>,
+    staged: &HashSet<String>,
 ) -> (String, Vec<Option<SrcLoc>>) {
     let mut out: Vec<String> = Vec::new();
     let mut locs: Vec<Option<SrcLoc>> = Vec::new();
@@ -6276,6 +6315,7 @@ pub fn select_with_locs(
                 m,
                 addrs,
                 device,
+                staged: &staged,
                 resolved: &resolved,
                 scratch,
                 retval_lo,
@@ -6520,6 +6560,7 @@ pub fn select_with_locs(
                     m,
                     addrs,
                     device,
+                    staged: &staged,
                     resolved: &resolved,
                     scratch,
                     retval_lo,
@@ -6651,6 +6692,12 @@ pub fn select_with_locs(
                 format!("reader entry of const {}", g.name),
             );
             claim(g.name.clone(), format!("base label of const {}", g.name));
+            if staged.contains(&g.name) {
+                claim(
+                    format!("__stage_{}", g.name),
+                    format!("staging routine of const {}", g.name),
+                );
+            }
             // Matches chunk counts with the reader: small tables emit one,
             // large tables emit ceiling division with at least two.
             let n_chunks = if g.bytes.len() >= 256 {
@@ -6685,6 +6732,34 @@ pub fn select_with_locs(
             "isel: const @{} has no table bytes",
             g.name
         );
+        // Staged consts (epic-cc#790) get a per-string routine beside
+        // their table: explicit PCLATH sets, straight-line code, no
+        // page-dependent elision inside, so both passes agree.
+        if staged.contains(&g.name) {
+            let stage = *addrs
+                .get("__const_stage")
+                .expect("isel: staged const with no staging buffer in map");
+            out.push(format!("__stage_{}:", g.name));
+            locs.push(None);
+            // The reader sets PCLATH to HIGH(base) on entry, which can
+            // differ from its own entry page (straddling table), so every
+            // CALL re-sets the entry page: a single hoisted set would
+            // misbranch from the second byte on.
+            for i in 0..g.bytes.len() {
+                out.push(format!("    MOVLW PAGE(__read_{})", g.name));
+                locs.push(None);
+                out.push("    MOVWF PCLATH".to_string());
+                locs.push(None);
+                out.push(format!("    MOVLW 0x{i:02X}"));
+                locs.push(None);
+                out.push(format!("    CALL __read_{}", g.name));
+                locs.push(None);
+                out.push(format!("    MOVWF 0x{:02X}", stage + i as u16));
+                locs.push(None);
+            }
+            out.push("    RETURN".to_string());
+            locs.push(None);
+        }
         let size = g.bytes.len();
         // Keeps the two-chunk shape for 256-byte tables: the dispatch tests
         // the chunk bit, so chunk 1 stays present. Larger tables divide by
