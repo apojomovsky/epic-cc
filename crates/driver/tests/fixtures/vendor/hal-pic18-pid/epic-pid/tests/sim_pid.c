@@ -5,7 +5,7 @@
  * the real `epic_pid_update` API, checking (a) every output stays in
  * [out_min, out_max] and the anti-windup invariant holds, (b) convergence
  * to the setpoint, and (c) epic_pid_set_gains takes effect. Reports PASS/FAIL
- * over the harness USART (see pic16f87xa-hal/src/mdb/pic16_harness_mdb.c).
+ * over the harness USART (see hal/pic14/16f87xa/src/mdb/pic16_harness_mdb.c).
  */
 
 #include "pid.h"

@@ -3,9 +3,9 @@
 Generated from the tree, not by hand. Every epic-cc number below was measured by `size_regression_e2e.rs` on this commit.
 
 - Date (UTC): 2026-09-30
-- Commit: 5294ba7
+- Commit: 383bae0
 - Baseline: crates/driver/tests/fixtures/size_baseline.toml (checked in)
-- Menu-demo listing: 8993 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
+- Menu-demo listing: 9616 words (assembler input; far-branch expansion and PCL padding account for the residual to the driver total)
 
 ## Micro benches (flash / RAM)
 
@@ -41,24 +41,25 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 | add-18f4550 | 18F4550 | 18 | 8 | = / = |
 | hal-pic16-blink-16f877a | 16F877A | 471 | 47 | = / = |
 | hal-pic18-blink-18f4550 | 18F4550 | 331 | 34 | = / = |
-| hal-pic16-encoder-full-16f877a | 16F877A | 5448 | 326 | = / = |
-| hal-pic18-menu-demo-18f4550 | 18F4550 | 9006 | 755 | = / = |
+| hal-pic16-encoder-full-16f877a | 16F877A | 5460 | 326 | = / = |
+| hal-pic18-menu-demo-18f4550 | 18F4550 | 9629 | 779 | = / = |
 | hal-pic18-control-demo-18f4550 | 18F4550 | 9962 | 977 | = / = |
 | hal-pic18-pid-18f4550 | 18F4550 | 3309 | 500 | = / = |
+| hal-pic18-bridge-demo-18f4550 | 18F4550 | 14026 | 1312 | = / = |
 
 ## Menu-demo clusters (listing words)
 
 | cluster | ours |
 |---|---|
-| menu_demo_init +7 folded | 1511 |
-| redraw | 509 |
-| main | 382 |
-| redraw_status | 356 |
-| EPIC_USART_Init | 334 |
+| menu_demo_init +7 folded | 1705 |
+| redraw | 523 |
+| main | 385 |
+| redraw_status | 367 |
+| EPIC_USART_Init | 329 |
 | epic_taskmgr_run +1 folded | 328 |
 | epic_dispatch_all_irqs_isr | 287 |
-| epic_dispatch_all_irqs +5 folded | 272 |
-| gpio4_send | 235 |
+| epic_dispatch_all_irqs +5 folded | 263 |
+| gpio4_send | 263 |
 | menu_demo_task_heartbeat +1 folded | 226 |
 | menu_demo_task_ui | 211 |
 | __epic_config | 196 |
@@ -66,14 +67,14 @@ Generated from the tree, not by hand. Every epic-cc number below was measured by
 
 Top profiler categories on the same listing:
 
-- `shared-code`: 1321 (14.7%)
-- `struct-copy-movff`: 1234 (13.7%)
-- `data-move`: 1229 (13.7%)
-- `branch`: 726 (8.1%)
-- `scalar-alu`: 493 (5.5%)
-- `cond-branch`: 482 (5.4%)
-- `literal-load`: 464 (5.2%)
-- `slot-copy`: 442 (4.9%)
+- `shared-code`: 1537 (16.0%)
+- `data-move`: 1323 (13.8%)
+- `struct-copy-movff`: 1284 (13.4%)
+- `branch`: 769 (8.0%)
+- `scalar-alu`: 537 (5.6%)
+- `cond-branch`: 530 (5.5%)
+- `literal-load`: 507 (5.3%)
+- `slot-copy`: 456 (4.7%)
 
 ## Regenerating
 
