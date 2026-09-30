@@ -7,7 +7,7 @@
 
 use std::process::Command;
 
-fn cycles_for(device: &device::Device, device_name: &str, c_file: &str) -> u64 {
+fn cycles_for(device: &'static device::Device, device_name: &str, c_file: &str) -> u64 {
     let hex_path = std::env::temp_dir().join(format!(
         "delay_{device_name}_{c_file}_{}.hex",
         std::process::id()
@@ -27,7 +27,10 @@ fn cycles_for(device: &device::Device, device_name: &str, c_file: &str) -> u64 {
     let _ = std::fs::remove_file(&hex_path);
     let cycles = match device.core {
         device::Core::Pic14 => {
-            let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
+            // The device's own bank map: `Pic14::new` is 877A geometry,
+            // where the F74/873A home window reads as common RAM and a
+            // missing bank-0 pin would simulate clean (epic-cc#800).
+            let mut p = pic14_sim::Pic14::with_device(device, pic14_sim::parse_hex(&hex));
             p.run(200_000);
             assert!(p.halted(), "delay program must halt on {device_name}");
             p.cycles()
@@ -58,7 +61,7 @@ fn cycles_for(device: &device::Device, device_name: &str, c_file: &str) -> u64 {
     cycles
 }
 
-fn delay_is_exact_on(device: &device::Device, device_name: &str) {
+fn delay_is_exact_on(device: &'static device::Device, device_name: &str) {
     let base = cycles_for(device, device_name, "delay_empty");
     assert_eq!(
         cycles_for(device, device_name, "delay") - base,
@@ -123,7 +126,7 @@ fn assert_banked_selects(asm: &str, device_name: &str) {
     );
 }
 
-fn delay_beside_bank1_traffic_is_exact_on(device: &device::Device, device_name: &str) {
+fn delay_beside_bank1_traffic_is_exact_on(device: &'static device::Device, device_name: &str) {
     // epic-cc#800: ga[60] + gb[40] exceed bank 0's 79 bytes, so gb lands
     // in bank 1 on both parts (a single 90-byte array fits nowhere on
     // the 873A) and the delay prologue carries the selects delay-only
@@ -131,6 +134,12 @@ fn delay_beside_bank1_traffic_is_exact_on(device: &device::Device, device_name: 
     // inside the loop.
     let asm = asm_for(device_name, "delay_bank1");
     assert_banked_selects(&asm, device_name);
+    for pin in ["BCF 0x03,5", "BCF 0x03,6"] {
+        assert!(
+            asm.lines().any(|l| l.trim() == pin),
+            "the bank-0 pin {pin} must survive to the final asm on {device_name}:\n{asm}"
+        );
+    }
     let base = cycles_for(device, device_name, "delay_bank1_empty");
     assert_eq!(
         cycles_for(device, device_name, "delay_bank1") - base,
@@ -185,7 +194,7 @@ fn delay_rejects_a_runtime_count() {
     );
 }
 
-fn delay_beside_a_callback_is_exact_on(device: &device::Device, device_name: &str) {
+fn delay_beside_a_callback_is_exact_on(device: &'static device::Device, device_name: &str) {
     // An address-taken callback with the same arity and width as `_delay`
     // must not divert the call into indirect dispatch: legalize keeps its
     // candidate list empty and the loop stays exact.
