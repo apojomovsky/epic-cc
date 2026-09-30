@@ -45,17 +45,23 @@ fn map_scalar(map: &str, kind: &str) -> u16 {
     u16::from_str_radix(line[prefix.len()..].trim(), 16).expect("map scalar is hex")
 }
 
-/// Run the driver on the overlay fixture for its HEX and map.
+/// Run the driver on the overlay fixture for its HEX and map. Both land
+/// in the temp dir, not the fixtures dir: `overlay_runs_correctly` in
+/// the same binary builds the same fixture path in parallel.
 fn build_overlay() -> (String, String) {
+    let dir = std::env::temp_dir().join(format!("epic-cc-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let hex_path = dir.join("overlay.hex");
+    let map_path = dir.join("overlay.map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/overlay.c",
             "-o",
-            "tests/fixtures/overlay.hex",
+            hex_path.to_str().unwrap(),
             "--device",
             "p16f877a",
             "--map",
-            "tests/fixtures/overlay.map",
+            map_path.to_str().unwrap(),
         ])
         .output()
         .expect("run driver");
@@ -64,9 +70,10 @@ fn build_overlay() -> (String, String) {
         "driver: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let hex = std::fs::read_to_string("tests/fixtures/overlay.hex").unwrap();
-    let map = std::fs::read_to_string("tests/fixtures/overlay.map").expect("read map");
-    let _ = std::fs::remove_file("tests/fixtures/overlay.map");
+    let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).expect("read map");
+    let _ = std::fs::remove_file(&hex_path);
+    let _ = std::fs::remove_file(&map_path);
     (hex, map)
 }
 

@@ -92,17 +92,11 @@ fn run() {
         p.ram_mut()[sym("isr_src") + i] = *b;
     }
 
-    // Interrupt while main's copy is in flight: store_handle seeds FSR1
-    // with h's address for its POSTINC walk, so trigger only when FSR1L
-    // holds exactly the address the param slot points at. h is
-    // store_handle's only param and params sit at the frame base, so the
-    // slot is the lowest `store_handle::` address in the map; main
-    // materializes &h into it at the call site. A bare nonzero check is
-    // not enough: the test would pass without ever preempting the copy.
-    // The exact match is precise: FSR1L takes this value only at the
-    // copy's seed step (startup never seeds FSR1, the handler's own seeds
-    // differ, and the nonzero guard skips the zeroed reset state), so it
-    // fires there and nowhere earlier.
+    // Fire only while main's copy is in flight: FSR1L must hold the
+    // address h's slot points at (params sit at the frame base, so the
+    // lowest `store_handle::` map address; main stores &h there). The
+    // value occurs only at the copy's seed step, and the nonzero guard
+    // skips the zeroed reset state.
     let h_slot = frame_addrs(&map, "store_handle")
         .into_iter()
         .min()
