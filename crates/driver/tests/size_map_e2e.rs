@@ -14,27 +14,23 @@ fn fixture_add() -> String {
     format!("{}/tests/fixtures/add.c", env!("CARGO_MANIFEST_DIR"))
 }
 
-/// Run the full pipeline on add.c exactly as the driver does and return the
-/// alloc layout, so the report can be checked against the allocator's own
-/// facts.
-fn add_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/add.c"),
-        &driver::clang::Options::default(),
-    );
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg))
+/// One alloc scalar off the compiler's own `--map` output: the hex after
+/// `total-bank0 0x`, `bank-used <i> 0x`, and friends. Rebuilding the
+/// pipeline here instead would be a second copy of `main.rs` that
+/// silently drifts (see array_e2e's `map_addr`).
+fn map_scalar(map: &str, kind: &str) -> u16 {
+    let prefix = format!("{kind} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {kind} in:\n{map}"));
+    u16::from_str_radix(line[prefix.len()..].trim(), 16).expect("map scalar is hex")
 }
 
 #[test]
 fn size_report_matches_hex_and_layout() {
     let hex_path = tmp("add.hex");
+    let map_path = tmp("report.map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             &fixture_add(),
@@ -42,6 +38,8 @@ fn size_report_matches_hex_and_layout() {
             hex_path.to_str().unwrap(),
             "--device",
             "p16f877a",
+            "--map",
+            map_path.to_str().unwrap(),
         ])
         .output()
         .expect("run driver");
@@ -61,17 +59,17 @@ fn size_report_matches_hex_and_layout() {
         .map(|i| i + 1)
         .unwrap_or(0);
 
-    let layout = add_layout();
+    let map = std::fs::read_to_string(&map_path).expect("read map");
     let report = String::from_utf8_lossy(&out.stderr);
     assert!(
         report.contains(&format!("flash: {flash_used}/8192 words")),
         "flash line missing or wrong: {report}"
     );
-    // RAM: the report's bank lines must match the layout's bank_used and
-    // the device's bank sizes.
-    for (i, &used) in layout.bank_used.iter().enumerate() {
-        let (start, end) = device::PIC16F877A.ram_banks[i];
+    // RAM: the report's bank lines must match the map's bank-used scalars
+    // and the device's bank sizes.
+    for (i, &(start, end)) in device::PIC16F877A.ram_banks.iter().enumerate() {
         let total = end - start + 1;
+        let used = map_scalar(&map, &format!("bank-used {i}"));
         assert!(
             report.contains(&format!("bank {i}: {used}/{total} bytes")),
             "bank {i} line missing or wrong: {report}"
@@ -83,6 +81,7 @@ fn size_report_matches_hex_and_layout() {
         "RAM line must state the overlay definition: {report}"
     );
     let _ = std::fs::remove_file(&hex_path);
+    let _ = std::fs::remove_file(&map_path);
 }
 
 #[test]
@@ -107,20 +106,22 @@ fn map_file_matches_the_allocator_map() {
         String::from_utf8_lossy(&out.stderr)
     );
     let written = std::fs::read_to_string(&map_path).unwrap();
-    assert_eq!(
-        written,
-        driver::report::map_text(&device::PIC16F877A, &add_layout())
-    );
     // The map is the allocator's own addresses, in the driver's HashMap
-    // key form ({func}::{name} locals), sorted deterministically. add.c
-    // has two globals and two i8 locals, so the exact lines are pinned.
+    // key form ({func}::{name} locals), sorted deterministically, then
+    // the alloc scalars (epic-cc#814). add.c has two globals and two i8
+    // locals and no ISR, so the exact lines are pinned.
     assert_eq!(
         written,
         "; epic-cc map for p16f877a\n\
          global in 0x20\n\
          global out 0x21\n\
          local main::1 0x22\n\
-         local main::2 0x23\n"
+         local main::2 0x23\n\
+         total-bank0 0x02\n\
+         bank-used 0 0x04\n\
+         bank-used 1 0x00\n\
+         bank-used 2 0x00\n\
+         bank-used 3 0x00\n"
     );
     let _ = std::fs::remove_file(&hex_path);
     let _ = std::fs::remove_file(&map_path);
