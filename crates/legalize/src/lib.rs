@@ -2865,15 +2865,12 @@ fn duplicate_isr_shared(
     )
 }
 
-/// Respell provably dead call arguments pointing at a duplicated ISR
-/// original to its single copy, then drop originals with no remaining
-/// use. An argument is dead exactly when the defined callee never reads
-/// that parameter slot (`ir::read_vals` over its body); the copy shares
-/// the signature, so the respelled value is equally unobservable. Only
-/// single-spelling originals qualify: a dual-priority duplicate has two
-/// live copies and no single respell target. Anything else keeps the
-/// original: a direct call, any other `Val::Global` use, a use from a
-/// global initializer, an undefined callee, or a read parameter slot.
+/// Respell dead call arguments pointing at a duplicated ISR original to
+/// its single copy, then drop originals with no remaining use. Runs
+/// before the candidate filler, so it never lists a removed function;
+/// single-spelling originals only, since a dual-priority duplicate has
+/// no single respell target. An indirect call target counts as a read:
+/// `callees` is still empty this early, so `read_vals` cannot see it.
 fn drop_dead_isr_originals(
     funcs: &mut Vec<Func>,
     globals: &[Global],
@@ -2894,6 +2891,7 @@ fn drop_dead_isr_originals(
     if spell.is_empty() {
         return;
     }
+    let defined: HashSet<&str> = funcs.iter().map(|f| f.name.as_str()).collect();
     let mut reads: HashMap<String, HashSet<String>> = HashMap::new();
     let mut params: HashMap<String, Vec<String>> = HashMap::new();
     for f in funcs.iter() {
@@ -2905,6 +2903,11 @@ fn drop_dead_isr_originals(
                         u.insert(v);
                     }
                 }
+                if let Inst::Call(c) = inst {
+                    if !defined.contains(c.func.as_str()) {
+                        u.insert(c.func.clone());
+                    }
+                }
             }
         }
         reads.insert(f.name.clone(), u);
@@ -2914,10 +2917,14 @@ fn drop_dead_isr_originals(
         );
     }
     for f in funcs.iter_mut() {
+        let caller_params = params[&f.name].clone();
         for b in &mut f.blocks {
             for inst in &mut b.insts {
                 let Inst::Call(c) = inst else { continue };
                 if !params.contains_key(&c.func) {
+                    continue;
+                }
+                if caller_params.contains(&c.func) {
                     continue;
                 }
                 for (pi, arg) in c.args.iter_mut().enumerate() {

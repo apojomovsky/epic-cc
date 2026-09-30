@@ -558,6 +558,54 @@ fn drops_dead_main_context_twin_after_const_propagated_register() {
         "dead argument must respell to the copy"
     );
 }
+/// A callback passed to a main-context dispatcher that calls through its
+/// parameter is live even when the same callback is stored into an
+/// ISR-read global elsewhere: the argument must stay on the original and
+/// the original must survive, or main-context execution would run the
+/// ISR-context copy.
+#[test]
+fn keeps_callback_dispatched_through_a_main_context_parameter() {
+    let m = parse(
+        "global g_cb i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @dispatch(i16 @cb)\n\
+             ret void\n\
+         fn dispatch(void) (fp=i16)\n\
+           block entry:\n\
+             call void @fp()\n\
+             ret void\n\
+         fn holder(void) ()\n\
+           block entry:\n\
+             store i16 @cb @g_cb\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %1 = load i16 @g_cb\n\
+             call void @1()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"cb_isr"), "copy missing: {names:?}");
+    assert!(names.contains(&"cb"), "live original must stay: {names:?}");
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let call = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("main call");
+    assert_eq!(
+        call.args[0].val,
+        ir::Val::Global("cb".to_string()),
+        "dispatched argument must stay on the original"
+    );
+}
 
 /// A callback stored by main into a global the ISR does NOT read stays
 /// main-only: no `_isr` copy, no ISR candidate, main's store untouched.
