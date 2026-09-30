@@ -9447,7 +9447,14 @@ fn staged_const_call_args_deliver_table_bytes_in_sim() {
     let out_base = layout.globals["out"];
     let mut addrs = layout.globals.clone();
     addrs.extend(layout.locals.clone());
-    let asm = isel::select_with_locs(&PIC16F877A, &m, &addrs, &layout.staged_consts).0;
+    let asm = isel::select_with_locs(
+        &PIC16F877A,
+        &m,
+        &addrs,
+        &layout.staged_consts,
+        &isel::ConstPool::empty(),
+    )
+    .0;
     for name in ["a", "b"] {
         let start = asm
             .find(&format!("__stage_{name}:\n"))

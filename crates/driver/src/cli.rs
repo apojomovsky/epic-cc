@@ -30,6 +30,10 @@ pub struct Cli {
     pub f_cpu: Option<u64>,
     /// PIC18 code factoring (docs/44); `--no-outline` turns it off.
     pub outline: bool,
+    /// PIC14 pooled flash string table (epic-cc#815); `--const-pool`
+    /// turns it on. Off by default: the pool is additive, so unflagged
+    /// output stays bit-identical.
+    pub const_pool: bool,
 }
 
 pub const USAGE: &str = "\
@@ -51,6 +55,10 @@ usage: epic-cc [options] <input.c|input.cpp>...
   --no-outline         PIC18: keep repeated code inline instead of sharing it
                        (smaller flash by default; opt out for timing-critical
                        code or stepping through inline copies)
+  --const-pool         PIC14: also emit address-taken const bytes as one
+                       pooled flash table alongside the per-const tables
+                       (epic-cc#815; addresses still resolve per-const
+                       until epic-cc#816)
   --report <file>      write the build report as JSON into <file>: flash and
                        RAM use, the clock, and every config field's value
   --f-cpu <hz>         board clock in Hz, the last-resort D-4 source: it must
@@ -88,6 +96,7 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
     let mut report = None;
     let mut f_cpu: Option<u64> = None;
     let mut outline = true;
+    let mut const_pool = false;
     let mut i = 0;
     while i < argv.len() {
         let a = argv[i].as_str();
@@ -176,6 +185,8 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
             verbose = true;
         } else if a == "--no-outline" {
             outline = false;
+        } else if a == "--const-pool" {
+            const_pool = true;
         } else if a == "--sidecar" {
             i += 1;
             sidecar = Some(
@@ -218,5 +229,6 @@ pub fn parse_args(argv: &[String]) -> Result<Cli, String> {
         map,
         line_table,
         outline,
+        const_pool,
     })
 }

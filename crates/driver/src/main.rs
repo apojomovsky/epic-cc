@@ -533,7 +533,18 @@ fn main() {
     addrs.extend(layout.globals.iter().map(|(k, &v)| (k.clone(), v)));
     addrs.extend(layout.locals.iter().map(|(k, &v)| (k.clone(), v)));
     let (asm, mut locs) = match device.core {
-        device::Core::Pic14 => isel::select_with_locs(device, &m, &addrs, &layout.staged_consts),
+        device::Core::Pic14 => {
+            // Pooled string table (epic-cc#815): additive and default
+            // off, so unflagged output stays bit-identical. The pool
+            // forms over alloc's address-taken set; emission reuses the
+            // per-const table path inside isel.
+            let pool = if cli.const_pool {
+                isel::build_pool(&m, &layout.address_taken_consts)
+            } else {
+                isel::ConstPool::empty()
+            };
+            isel::select_with_locs(device, &m, &addrs, &layout.staged_consts, &pool)
+        }
         device::Core::Pic18 => isel_pic18::select_with_locs(
             device,
             &m,
