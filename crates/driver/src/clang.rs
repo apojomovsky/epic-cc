@@ -54,6 +54,13 @@ pub struct Options {
     /// `<{ ... }>` types clang prints, so nothing past the front end needs
     /// the flag (epic-cc#166).
     pub packed_structs: bool,
+    /// `.cpp` input (epic-cc#457, EC++ subset): compile as C++ with the
+    /// subset enforced. The driver invokes the already-resolved `clang`
+    /// binary (the release bundle ships no `clang++`); `-x c++` selects
+    /// the language explicitly and `-fno-exceptions -fno-rtti` enforce
+    /// the EC++ ban with frontend errors. Always on for this path, never
+    /// a user flag.
+    pub cpp: bool,
 }
 
 impl Options {
@@ -91,6 +98,15 @@ pub fn apply_options(cmd: &mut Command, opts: &Options) {
     if opts.packed_structs {
         cmd.arg("-fpack-struct");
     }
+    if opts.cpp {
+        cmd.args(["-x", "c++", "-fno-exceptions", "-fno-rtti"]);
+    }
+}
+
+/// True for EC++ inputs: a case-insensitive `.cpp` extension (epic-cc#457).
+/// Every other path (including the shipped C runtime helpers) compiles as C.
+pub fn is_cpp_input(path: &str) -> bool {
+    path.to_ascii_lowercase().ends_with(".cpp")
 }
 
 /// Read the dev-container env pair (`PIC8_CLANG_UNWRAPPED` +
@@ -208,6 +224,7 @@ mod tests {
             header_dir: Some(PathBuf::from("/tmp/hdr")),
             fosc_hz: Some(20_000_000),
             packed_structs: false,
+            cpp: false,
         };
         apply_options(&mut cmd, &opts);
         let dbg = format!("{cmd:?}");
@@ -234,5 +251,38 @@ mod tests {
         let mut cmd = base_cmd(Path::new("clang"), Path::new("/res"));
         apply_options(&mut cmd, &Options::default());
         assert!(!format!("{cmd:?}").contains("-fpack-struct"));
+    }
+
+    #[test]
+    fn options_add_cpp_subset_flags_only_when_cpp() {
+        let mut cmd = base_cmd(Path::new("clang"), Path::new("/res"));
+        apply_options(
+            &mut cmd,
+            &Options {
+                cpp: true,
+                ..Default::default()
+            },
+        );
+        let dbg = format!("{cmd:?}");
+        for flag in ["-x", "c++", "-fno-exceptions", "-fno-rtti"] {
+            assert!(dbg.contains(flag), "missing {flag} in {dbg}");
+        }
+        let mut cmd = base_cmd(Path::new("clang"), Path::new("/res"));
+        apply_options(&mut cmd, &Options::default());
+        let dbg = format!("{cmd:?}");
+        assert!(
+            !dbg.contains("-fno-exceptions"),
+            "C path adds no subset flags: {dbg}"
+        );
+        assert!(!dbg.contains("c++"), "C path stays C: {dbg}");
+    }
+
+    #[test]
+    fn cpp_input_matches_extension_only() {
+        assert!(is_cpp_input("prog.cpp"));
+        assert!(is_cpp_input("prog.CPP"));
+        assert!(!is_cpp_input("prog.c"));
+        assert!(!is_cpp_input("prog.cc"));
+        assert!(!is_cpp_input("prog.cpp.bak"));
     }
 }

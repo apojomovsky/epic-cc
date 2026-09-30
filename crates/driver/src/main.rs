@@ -270,7 +270,9 @@ fn main() {
         }
     }
 
-    // 1. clang: one invocation per translation unit.
+    // 1. clang: one invocation per translation unit. `.cpp` units compile
+    // as C++ through the same `clang` binary (the bundle ships no
+    // `clang++`; `-x c++` selects the language explicitly, epic-cc#457).
     let clang_opts = clang::Options {
         includes: cli.includes.clone(),
         defines: driver::predef::xc8_predefines(device.core, device.name)
@@ -280,6 +282,7 @@ fn main() {
         header_dir: Some(header_dir.clone()),
         fosc_hz: Some(fosc_hz),
         packed_structs: device.core == device::Core::Pic18,
+        cpp: false,
     };
     let mut units = Vec::new();
     let mut dep_paths = Vec::new();
@@ -287,7 +290,9 @@ fn main() {
         let ll_path = tmp.join(format!("{n:03}.ll"));
         let dep_path = tmp.join(format!("{n:03}.d"));
         let mut cmd = clang::base_cmd(&clang, &resdir);
-        clang::apply_options(&mut cmd, &clang_opts);
+        let mut tu_opts = clang_opts.clone();
+        tu_opts.cpp = clang::is_cpp_input(input);
+        clang::apply_options(&mut cmd, &tu_opts);
         cmd.args(["-MD", "-MF", dep_path.to_str().unwrap()]);
         cmd.args(["-o", ll_path.to_str().unwrap(), input]);
         if cli.verbose {

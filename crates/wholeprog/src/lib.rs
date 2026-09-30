@@ -5,19 +5,42 @@
 use ir::{Inst, Module, SrcLoc};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Validates the merged module and hands it on unchanged.
+/// Validates the merged module and hands it on.
+///
+/// Maps the C++ entry first: a lone `_Z4mainv` (what `int main()` lowers
+/// to on the `.cpp` path, epic-cc#457) with no plain `main` is renamed to
+/// `main`, so every stage past this boundary keeps its single-entry
+/// spelling. A `main` plus a `_Z4mainv` still counts two and fails.
 ///
 /// Panics when the entry invariant breaks: empty module, missing or duplicate
 /// `main`, or a call target with no definition.
-pub fn merge(m: Module) -> Module {
+pub fn merge(mut m: Module) -> Module {
+    map_cpp_entry(&mut m);
     assert!(!m.funcs.is_empty(), "wholeprog: no functions in module");
     check_entry(&m);
     check_calls_resolved(&m);
     m
 }
 
+fn map_cpp_entry(m: &mut Module) {
+    if m.funcs.iter().any(|f| f.name == "main") {
+        return;
+    }
+    if m.funcs.iter().filter(|f| f.name == "_Z4mainv").count() == 1 {
+        m.funcs
+            .iter_mut()
+            .find(|f| f.name == "_Z4mainv")
+            .expect("counted one above")
+            .name = "main".to_string();
+    }
+}
+
 fn check_entry(m: &Module) {
-    let mains = m.funcs.iter().filter(|f| f.name == "main").count();
+    let mains = m
+        .funcs
+        .iter()
+        .filter(|f| f.name == "main" || f.name == "_Z4mainv")
+        .count();
     assert_eq!(
         mains, 1,
         "wholeprog: expected exactly one `main`, found {mains}"
