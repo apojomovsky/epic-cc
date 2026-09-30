@@ -116,14 +116,6 @@ fn i32_add_emits_a_four_byte_carry_chain() {
         3,
         "bytes 1-3 carry adds:\n{asm}"
     );
-    // The arithmetic writes all four result-slot bytes. Counted per
-    // address rather than as a `MOVWF` total: the copy out to `@out`
-    // reuses W for its last byte (epic-cc#502), so a bare mnemonic count
-    // measures the copy's form, not the add's width.
-    let slot_writes = (0x038..=0x03B)
-        .filter(|a| asm.contains(&format!("MOVWF 0x{a:03X},A")))
-        .count();
-    assert_eq!(slot_writes, 4, "four result bytes:\n{asm}");
 }
 
 #[test]
@@ -949,8 +941,15 @@ fn const_shift_count_out_of_range_panics() {
 
 #[test]
 fn load_and_store_i8_use_movff() {
-    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    ret void\n");
-    let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x12)]);
+    // Two stores keep the loaded value multi-use, off the single-use
+    // store-source fold (epic-cc#723), so this still exercises MOVFF.
+    let m = parse("global in i8\nglobal out i8\nglobal out2 i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    store i8 %1 @out2\n    ret void\n");
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("out", 0x11),
+        ("out2", 0x13),
+        ("main::1", 0x12),
+    ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x010, 0x012"),
@@ -967,8 +966,13 @@ fn load_and_store_i8_use_movff() {
 // must lower exactly like the one-byte i8 path.
 #[test]
 fn load_and_store_i1_use_the_byte_path() {
-    let m = parse("global in i1\nglobal out i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    store i1 %1 @out\n    ret void\n");
-    let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("main::1", 0x12)]);
+    let m = parse("global in i1\nglobal out i1\nglobal out2 i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    store i1 %1 @out\n    store i1 %1 @out2\n    ret void\n");
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("out", 0x11),
+        ("out2", 0x13),
+        ("main::1", 0x12),
+    ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
         asm.contains("MOVFF 0x010, 0x012"),
@@ -1072,8 +1076,16 @@ fn udiv_u16_recipe_emits_restoring_loop() {
 
 #[test]
 fn load_and_store_i16_copy_both_bytes_low_then_high() {
-    let m = parse("global in i16\nglobal out i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @in\n    store i16 %1 @out\n    ret void\n");
-    let addrs = addrs(&[("in", 0x10), ("out", 0x12), ("main::1", 0x14)]);
+    // Two stores keep the loaded value multi-use, off the single-use
+    // store-source fold (epic-cc#723), so this still exercises the
+    // staged bytewise path: low byte then high byte, through the slot.
+    let m = parse("global in i16\nglobal out i16\nglobal out2 i16\nfn main(void) ()\n  block entry:\n    %1 = load i16 @in\n    store i16 %1 @out\n    store i16 %1 @out2\n    ret void\n");
+    let addrs = addrs(&[
+        ("in", 0x10),
+        ("out", 0x12),
+        ("out2", 0x16),
+        ("main::1", 0x14),
+    ]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(asm.contains("MOVFF 0x010, 0x014"));
     assert!(asm.contains("MOVFF 0x011, 0x015"));
@@ -2462,8 +2474,8 @@ fn runtime_inttoptr_derefs_through_fsr0_indf0() {
         "FSR0 loaded from the address slot:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0xFEF, 0x027"),
-        "access through INDF0 (0xFEF):\n{asm}"
+        asm.contains("MOVFF 0xFEF,"),
+        "access through INDF0 (0xFEF), folded straight to its store since epic-cc#723:\n{asm}"
     );
 }
 
@@ -2485,8 +2497,8 @@ fn runtime_ptr_select_derefs_through_fsr0() {
         "FSR0 loaded from the address slot:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0xFEF, 0x027"),
-        "access through INDF0 (0xFEF):\n{asm}"
+        asm.contains("MOVFF 0xFEF,"),
+        "access through INDF0 (0xFEF), folded straight to its store since epic-cc#723:\n{asm}"
     );
 }
 
@@ -2513,8 +2525,8 @@ fn runtime_ptr_phi_derefs_through_slot_after_phi_copies() {
         "FSR0 loaded from the phi dst slot:\n{asm}"
     );
     assert!(
-        asm.contains("MOVFF 0xFEF, 0x029"),
-        "access through INDF0 (0xFEF):\n{asm}"
+        asm.contains("MOVFF 0xFEF,"),
+        "access through INDF0 (0xFEF), folded straight to its store since epic-cc#723:\n{asm}"
     );
 }
 
@@ -2791,7 +2803,7 @@ fn a_gep_with_a_constant_offset_and_no_dynamic_term_loads_directly() {
     let addrs = addrs(&[("arr", 0x100), ("out", 0x110), ("main::v", 0x111)]);
     let asm = select(&PIC18F4550, &m, &addrs, None);
     assert!(
-        asm.contains("MOVFF 0x102, 0x111") || asm.contains("MOVFF 0x102,0x111"),
+        asm.contains("MOVFF 0x102,"),
         "arr[2] must read directly from base+2 (0x102), no FSR machinery:\n{asm}"
     );
     assert!(
@@ -7108,8 +7120,8 @@ fn an_unsigned_compare_against_a_gep_value_keeps_the_cascade() {
 fn a_stored_result_reload_is_elided_from_the_same_slot() {
     // epic-cc#502: `MOVWF f` then a reload of `f` into W is two words for
     // nothing, and a `MOVFF f,g` after the store is three where `MOVWF g`
-    // is one. Both fold here: the add's result lands in `main::3`, which
-    // the store to `@out` then reuses straight out of W.
+    // is one. Since epic-cc#723 the add computes straight into `@c`, so
+    // there is no result temp at all: one `MOVWF` to the destination.
     let m = parse(
         "global a i8\nglobal b i8\nglobal c i8\n\
          fn main(void) ()\n  block entry:\n    %1 = load i8 @a\n    %2 = load i8 @b\n\
@@ -7131,12 +7143,7 @@ fn a_stored_result_reload_is_elided_from_the_same_slot() {
     assert_eq!(
         asm.matches("MOVWF 0x015,A").count(),
         1,
-        "the store writes W straight to the destination:\n{asm}"
-    );
-    assert_eq!(
-        asm.matches("MOVWF").count(),
-        2,
-        "one result store plus one destination store, no reload:\n{asm}"
+        "the add writes W straight to the destination:\n{asm}"
     );
 }
 

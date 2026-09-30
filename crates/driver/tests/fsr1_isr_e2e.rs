@@ -1,12 +1,15 @@
-//! epic-cc#493 regression: an ISR that seeds FSR1 must not corrupt the
-//! preempted main context's in-flight FSR1 copy pointer.
+//! epic-cc#493 regression: an ISR that seeds the FSRs must not corrupt the
+//! preempted main context's in-flight copy pointer.
 //!
-//! main's `g_storage = *h` lowers to an indirect-source memcpy: FSR1 is
-//! seeded with the source pointer and read byte by byte, so the pointer is
-//! live across the copy's instructions. epic-cc#477 added FSR1L/FSR1H to
-//! every ISR prologue/epilogue; before that, an interrupt taken inside that
-//! window and served by an ISR whose code also seeds FSR1 (the fixture's
-//! handler copies its own struct) resumed main against the ISR's pointer.
+//! main's `g_storage = *h` lowers to an indirect-source walk: FSR0 is
+//! seeded with the source pointer and advanced byte by byte, so the
+//! pointer is live across the copy's instructions. Since epic-cc#723 the
+//! load/store temp is folded away, so main holds no FSR1 loop; the
+//! fixture's handler still copies its own struct through an FSR0/FSR1
+//! loop, and epic-cc#477's FSR save/restore in every ISR prologue and
+//! epilogue is what lets the preempted walk resume. An interrupt taken
+//! inside main's window and served without that restore would resume
+//! main against the ISR's pointer.
 use std::collections::HashMap;
 use std::process::Command;
 
@@ -68,15 +71,17 @@ fn run() {
         p.ram_mut()[sym("isr_src") + i] = *b;
     }
 
-    // Interrupt while main's copy is in flight: FSR1 holds main's source
-    // pointer and PRODL is irrelevant here, so trigger on the seeded FSR1
-    // high byte being main's (0x00 at this layout) and g_out still unset.
+    // Interrupt while main's copy is in flight: store_handle seeds FSR0
+    // with h's frame slot (0x10) for its walk, so trigger only when FSR0L
+    // holds exactly that. A bare nonzero check also fires in `__start`,
+    // which seeds FSR0 for its zero-clear loop while g_out is still unset,
+    // and the test would pass without ever preempting the copy.
     let mut steps = 0;
     let mut fired = false;
     while steps < 4000 {
         p.step();
         steps += 1;
-        if p.ram()[0xFE1] != 0 && p.ram()[sym("g_out")] == 0 {
+        if p.ram()[0xFE9] == 0x10 && p.ram()[sym("g_out")] == 0 {
             p.fire_interrupt();
             p.run(20_000);
             fired = true;

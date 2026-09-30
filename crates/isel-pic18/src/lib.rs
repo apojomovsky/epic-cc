@@ -231,6 +231,14 @@ struct Gen<'m> {
     /// `lane_consumed` holds skipped intermediate dsts.
     bit_lanes: HashMap<String, BitLane>,
     lane_consumed: HashSet<String>,
+    /// Single-use store-source folds from the per-function pre-scan
+    /// (epic-cc#723). `store_fwd` maps a folded producer reg (a
+    /// single-use load or simple-ALU binop) to its store's direct
+    /// destination slot, which the producer writes instead of its dead
+    /// temp; `store_consumed` holds those producer regs so the store
+    /// arm skips the already-emitted copy.
+    store_fwd: HashMap<String, u16>,
+    store_consumed: HashSet<String>,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -1208,6 +1216,155 @@ impl<'m> Gen<'m> {
             }
         }
         (lanes, consumed)
+    }
+
+    /// Static RAM base for a load/store pointer: a mapped global, or a
+    /// statically resolved object slot (alloca, byval). SFR literals,
+    /// flash tables, address-holding sret slots and dynamic pointers
+    /// have no static object range and return `None`.
+    fn static_base(g: &Gen, func: &str, ptr: &str) -> Option<u16> {
+        if let Some(gb) = ptr.strip_prefix('@') {
+            return g.addrs.get(gb).copied();
+        }
+        if let Some(r) = ptr.strip_prefix('%') {
+            let (base, k, terms) = g.resolved.get(&ssa_key(func, r))?;
+            if !terms.is_empty() {
+                return None;
+            }
+            return match base {
+                Base::Global(name) => g.addrs.get(name).map(|a| a.wrapping_add(*k)),
+                Base::Slot(slot, sret) if !sret => g
+                    .addrs
+                    .get(&ssa_key(func, slot))
+                    .map(|a| a.wrapping_add(*k)),
+                Base::Slot(_, _) => None,
+            };
+        }
+        None
+    }
+
+    /// Per-function store-source pre-scan (epic-cc#723). A
+    /// `store Ty %r DST` whose `%r` is a single-use same-block `Load`
+    /// or simple-ALU `Bin` folds away the temp slot: the producer arm
+    /// writes the store's direct destination instead, and the store
+    /// arm skips the already-emitted copy. The discipline mirrors the
+    /// lane pre-scan: function-wide use count excludes the folding
+    /// store, and the producer-to-store span holds no memory behavior,
+    /// so access count and order are preserved and volatile copies
+    /// keep their semantics. General slot coalescing stays #752; phi
+    /// writebacks and indirect destinations stay staged.
+    fn find_store_forwards(g: &Gen, f: &Func) -> (HashMap<String, u16>, HashSet<String>) {
+        let mut uses: HashMap<String, usize> = HashMap::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for r in ir::read_vals(inst) {
+                    if r.is_empty() {
+                        continue;
+                    }
+                    *uses.entry(r).or_insert(0) += 1;
+                }
+            }
+        }
+        let mut fwd: HashMap<String, u16> = HashMap::new();
+        let mut consumed: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for (si, inst) in b.insts.iter().enumerate() {
+                let Inst::Store(s) = inst else { continue };
+                let Val::Reg(r) = &s.val else { continue };
+                if uses.get(r).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                if g.lane_consumed.contains(r) || g.bit_lanes.contains_key(r) {
+                    continue;
+                }
+                let Some(dst) = Self::static_base(g, &f.name, &s.ptr) else {
+                    continue;
+                };
+                let Some(pi) = b.insts[..si].iter().rposition(|i| match i {
+                    Inst::Load(l) => &l.dst == r,
+                    Inst::Bin(q) => &q.dst == r,
+                    _ => false,
+                }) else {
+                    continue;
+                };
+                // The folded write moves earlier to the producer, so the
+                // span holds no memory behavior at all: a gap load could
+                // observe the destination before the staged write lands,
+                // and any write, call, blob or terminator could observe
+                // or disturb either side.
+                let span_clean = b.insts[pi + 1..si].iter().all(|i| match i {
+                    Inst::Call(_)
+                    | Inst::Asm(_)
+                    | Inst::Store(_)
+                    | Inst::Memcpy(_)
+                    | Inst::VaStart(_)
+                    | Inst::Load(_)
+                    | Inst::Br(_)
+                    | Inst::BrCond(_)
+                    | Inst::Switch(_) => false,
+                    _ => true,
+                });
+                if !span_clean {
+                    continue;
+                }
+                let n = s.ty.bytes();
+                match &b.insts[pi] {
+                    Inst::Load(l) => {
+                        if l.ty.bytes() != n || l.ptr_ty {
+                            continue;
+                        }
+                        if l.ptr.starts_with("0x") {
+                            continue;
+                        }
+                        if let Some(gb) = l.ptr.strip_prefix('@') {
+                            if g.global_is_const(gb) {
+                                continue;
+                            }
+                        }
+                        // A multi-byte copy interleaves reads and writes
+                        // per byte, where the staged form reads everything
+                        // first: allow identical ranges (a self-copy) and
+                        // provably disjoint ones, single bytes always.
+                        if n > 1 {
+                            let disjoint = match Self::static_base(g, &f.name, &l.ptr) {
+                                Some(sbase) => {
+                                    let (slo, shi, dlo, dhi) = (
+                                        u32::from(sbase),
+                                        u32::from(sbase) + u32::from(n),
+                                        u32::from(dst),
+                                        u32::from(dst) + u32::from(n),
+                                    );
+                                    slo == dlo || shi <= dlo || dhi <= slo
+                                }
+                                None => false,
+                            };
+                            if !disjoint {
+                                continue;
+                            }
+                        }
+                    }
+                    Inst::Bin(q) => {
+                        if q.ty.bytes() != n {
+                            continue;
+                        }
+                        if !matches!(
+                            q.op,
+                            ir::BinOp::Add
+                                | ir::BinOp::Sub
+                                | ir::BinOp::And
+                                | ir::BinOp::Or
+                                | ir::BinOp::Xor
+                        ) {
+                            continue;
+                        }
+                    }
+                    _ => continue,
+                }
+                fwd.insert(r.clone(), dst);
+                consumed.insert(r.clone());
+            }
+        }
+        (fwd, consumed)
     }
 
     fn substitute_asm(&self, template: &str, operands: &[ir::AsmOperand]) -> String {
@@ -3368,6 +3525,10 @@ impl<'m> Gen<'m> {
                 // stays sound only while that byte is 0/1: the same
                 // exactly-0/1 premise the Zext and Sext arms state.
                 let dst = self.slot_addr(self.cur_func, &l.dst).direct();
+                // A folded store's destination replaces the dead temp
+                // (epic-cc#723): the source setup and walk below address
+                // `dst`, so every shape copies straight into place.
+                let dst = self.store_fwd.get(&l.dst).copied().unwrap_or(dst);
                 // Literal-pointer (SFR) load: `inttoptr` form, a direct
                 // physical address: MOVFF copies byte-wise with no access
                 // bit and no BSR involvement.
@@ -3435,6 +3596,13 @@ impl<'m> Gen<'m> {
                 }
             }
             Inst::Store(s) => {
+                // A folded store already emitted at its producer
+                // (epic-cc#723): the value sits in place, skip the copy.
+                if let Val::Reg(r) = &s.val {
+                    if self.store_consumed.contains(r) {
+                        return;
+                    }
+                }
                 // Same i1-in-memory story as the Load arm above (epic-cc#462);
                 // `trunc` normalizes an i1 byte to 0/1, so the stored byte
                 // keeps the convention every i1 consumer relies on.
@@ -3532,6 +3700,9 @@ impl<'m> Gen<'m> {
                 // panic below.
                 let av = self.val_addr(&b.a).direct();
                 let dst = self.slot_addr(self.cur_func, &b.dst).direct();
+                // A folded store's destination replaces the dead temp
+                // (epic-cc#723): the op below computes straight into place.
+                let dst = self.store_fwd.get(&b.dst).copied().unwrap_or(dst);
                 if matches!(b.op, ir::BinOp::Shl | ir::BinOp::LShr | ir::BinOp::AShr) {
                     let width = i64::from(n) * 8;
                     let k = match &b.b {
@@ -3820,7 +3991,6 @@ impl<'m> Gen<'m> {
                 // the INCFSZ/BTFSS carry fold for bytes 1..n.
                 if let Val::Const(k) = b.a {
                     let n = b.ty.bytes();
-                    let dst = self.slot_addr(self.cur_func, &b.dst).direct();
                     match b.op {
                         ir::BinOp::Add | ir::BinOp::And | ir::BinOp::Or | ir::BinOp::Xor => {
                             // Commutative: `k op x` == `x op k`, reuse the
@@ -3865,7 +4035,6 @@ impl<'m> Gen<'m> {
                             // so an interrupt mid-sequence cannot clobber a live local before
                             // `COMF`/`ADDLW` overwrite `STATUS`.
                             let aa = self.val_addr(&b.b).direct();
-                            let dst = self.slot_addr(self.cur_func, &b.dst).direct();
                             let (aacc0, af0) = self.operand(aa);
                             let abank0 = if aacc0 == 0 { "A" } else { "B" };
                             self.emit(format!("    MOVF 0x{af0:03X},W,{abank0}"));
@@ -8204,6 +8373,8 @@ pub fn select_with_locs(
             cur_loc: None,
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
+            store_fwd: HashMap::new(),
+            store_consumed: HashSet::new(),
             out: Vec::new(),
             locs: Vec::new(),
         };
@@ -8212,6 +8383,12 @@ pub fn select_with_locs(
         let (bit_lanes, lane_consumed) = Gen::find_bit_lanes(&g, f);
         g.bit_lanes = bit_lanes;
         g.lane_consumed = lane_consumed;
+        // Single-use store sources for this function (epic-cc#723): the
+        // producer arms below write folded destinations instead of dead
+        // temps, and the store arm skips the already-emitted copy.
+        let (store_fwd, store_consumed) = Gen::find_store_forwards(&g, f);
+        g.store_fwd = store_fwd;
+        g.store_consumed = store_consumed;
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -8832,6 +9009,8 @@ pub fn select_with_locs(
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
+                store_fwd: HashMap::new(),
+                store_consumed: HashSet::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9143,6 +9322,8 @@ mod tests {
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
+                store_fwd: HashMap::new(),
+                store_consumed: HashSet::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9170,6 +9351,8 @@ mod tests {
                 cur_loc: None,
                 bit_lanes: HashMap::new(),
                 lane_consumed: HashSet::new(),
+                store_fwd: HashMap::new(),
+                store_consumed: HashSet::new(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9212,6 +9395,8 @@ mod p3_gen_tests {
             cur_loc: None,
             bit_lanes: HashMap::new(),
             lane_consumed: HashSet::new(),
+            store_fwd: HashMap::new(),
+            store_consumed: HashSet::new(),
             out: Vec::new(),
             locs: Vec::new(),
         }
