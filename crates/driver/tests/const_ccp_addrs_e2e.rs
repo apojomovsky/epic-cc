@@ -10,52 +10,31 @@
 //! The table stays `const` in source and must land in flash: the alloc map
 //! classifies `addrs` as a const global with no RAM address.
 
-use std::collections::HashMap;
 use std::process::Command;
 
-fn ccp_addrs_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/const_ccp_addrs.c"),
-        &driver::clang::Options::default(),
-    );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-    let _ = peephole::optimize(&asm);
-    layout
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn const_ccp_addrs_selects_run_correctly() {
-    let layout = ccp_addrs_layout();
-    let addr = |n: &str| *layout.globals.get(n).expect(n) as usize;
-
-    // The table is const (flash): no RAM allocation, classified as const.
-    assert!(
-        !layout.globals.contains_key("addrs"),
-        "addrs must stay in flash (no RAM address)"
-    );
-    assert!(
-        layout.const_globals.contains("addrs"),
-        "addrs must be classified as a const global"
-    );
-
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/const_ccp_addrs.c",
             "-o",
             "tests/fixtures/const_ccp_addrs.hex",
+            "--map",
+            "tests/fixtures/const_ccp_addrs.map",
             "--device",
             "p16f877a",
         ])
@@ -68,6 +47,20 @@ fn const_ccp_addrs_selects_run_correctly() {
     );
 
     let hex = std::fs::read_to_string("tests/fixtures/const_ccp_addrs.hex").unwrap();
+    let map = std::fs::read_to_string("tests/fixtures/const_ccp_addrs.map").unwrap();
+    let _ = std::fs::remove_file("tests/fixtures/const_ccp_addrs.map");
+    let addr = |n: &str| map_addr(&map, n);
+
+    // The table is const (flash): no RAM allocation, classified as const.
+    assert!(
+        !map.lines().any(|l| l.starts_with("global addrs 0x")),
+        "addrs must stay in flash (no RAM address)"
+    );
+    assert!(
+        map.lines().any(|l| l.trim() == "const addrs"),
+        "addrs must be classified as a const global"
+    );
+
     let prog = pic14_sim::parse_hex(&hex);
 
     // inst = 0 -> element 0 (0x15, 0x16, 0x17, 0x01), both the inlined

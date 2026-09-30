@@ -11,45 +11,31 @@
 //! The 16-byte spans of buf1/buf2/buf3 fit one FSR window (0x20..0x80), so
 //! the per-byte FSR recomputes stay window-legal at every index.
 
-use std::collections::HashMap;
 use std::process::Command;
 
-fn dyn_memcpy_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/dynamic_memcpy.c"),
-        &driver::clang::Options::default(),
-    );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-    let _ = peephole::optimize(&asm);
-    layout
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn dynamic_length_memcpy_runs_correctly() {
-    let layout = dyn_memcpy_layout();
-    let in_addr = *layout.globals.get("in").expect("in global") as usize;
-    let out_addr = *layout.globals.get("out").expect("out global") as usize;
-    let buf1 = *layout.globals.get("buf1").expect("buf1 global") as usize;
-    let buf3 = *layout.globals.get("buf3").expect("buf3 global") as usize;
-
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/dynamic_memcpy.c",
             "-o",
             "tests/fixtures/dynamic_memcpy.hex",
+            "--map",
+            "tests/fixtures/dynamic_memcpy.map",
             "--device",
             "p16f877a",
         ])
@@ -62,11 +48,18 @@ fn dynamic_length_memcpy_runs_correctly() {
     );
 
     let hex = std::fs::read_to_string("tests/fixtures/dynamic_memcpy.hex").unwrap();
+    let map = std::fs::read_to_string("tests/fixtures/dynamic_memcpy.map").expect("read map");
+    let _ = std::fs::remove_file("tests/fixtures/dynamic_memcpy.map");
+    let in_addr = map_addr(&map, "in");
+    let out_addr = map_addr(&map, "out");
+    let buf1 = map_addr(&map, "buf1");
+    let buf2 = map_addr(&map, "buf2");
+    let buf3 = map_addr(&map, "buf3");
+
     let prog = pic14_sim::parse_hex(&hex);
     let mut p = pic14_sim::Pic14::new(prog);
     // RAM globals are not initialized by the pipeline (the simulator starts
     // zeroed, like float_e2e's `in`); seed buf2's pattern — the copy source.
-    let buf2 = *layout.globals.get("buf2").expect("buf2 global") as usize;
     for i in 0..16 {
         p.ram_mut()[buf2 + i] = (i as u8).wrapping_mul(0x37);
     }

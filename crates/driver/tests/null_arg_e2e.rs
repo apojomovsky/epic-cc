@@ -6,12 +6,29 @@
 
 use std::process::Command;
 
+/// `g_out`'s RAM address, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
+
 #[test]
 fn null_function_arg_compiles_and_runs() {
     let hex_path = std::env::temp_dir().join(format!("null_arg_{}.hex", std::process::id()));
+    let map_path = hex_path.with_extension("map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--target", "16F877A", "-o"])
         .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
         .arg("tests/fixtures/null_arg.c")
         .output()
         .expect("run epic-cc");
@@ -22,36 +39,11 @@ fn null_function_arg_compiles_and_runs() {
     );
     let produced = std::fs::read_to_string(&hex_path).expect("read hex");
     let _ = std::fs::remove_file(&hex_path);
+    let map = std::fs::read_to_string(&map_path).expect("read map");
+    let _ = std::fs::remove_file(&map_path);
+    let out_addr = map_addr(&map, "g_out");
     let prog = pic14_sim::parse_hex(&produced);
     let mut sim = pic14_sim::Pic14::new(prog);
     sim.run(50_000);
-    // g_out: the first global after the (4-byte) g_cb pointer; locate via
-    // the allocator the same way the other e2e tests do.
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let tmp = std::env::temp_dir().join(format!("nullarg-{}", std::process::id()));
-    let header_dir = tmp.join("include");
-    std::fs::create_dir_all(&header_dir).expect("create header dir");
-    std::fs::write(header_dir.join("stdint.h"), driver::stdint_h::STDINT_H)
-        .expect("write stdint.h");
-    let opts = driver::clang::Options {
-        includes: Vec::new(),
-        defines: Vec::new(),
-        header_dir: Some(header_dir),
-        fosc_hz: None,
-        packed_structs: false,
-    };
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/null_arg.c"),
-        &opts,
-    );
-    let _ = std::fs::remove_dir_all(&tmp);
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    let out_addr = *layout.globals.get("g_out").expect("g_out") as usize;
     assert_eq!(sim.ram()[out_addr], 7, "g_out == 7 for a NULL callback");
 }

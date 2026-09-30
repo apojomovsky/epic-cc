@@ -16,6 +16,20 @@
 use std::collections::HashMap;
 use std::process::Command;
 
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
+
 /// Run the pipeline stages the driver runs, returning the layout and the
 /// emitted (pre-banking) assembly.
 fn compile_fixture() -> (alloc::AllocLayout, String) {
@@ -218,11 +232,15 @@ fn each_isr_routine_copy_matches_its_original_body() {
 fn the_program_still_computes_mains_results() {
     // A no-interrupt sanity run: the duplication must not disturb the
     // ordinary path. in_a = 47, in_b = 5 -> out = 235, out_q = 9.
+    let hex_path = "tests/fixtures/interrupt_mul.hex";
+    let map_path = "tests/fixtures/interrupt_mul.map";
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/interrupt_mul.c",
             "-o",
-            "tests/fixtures/interrupt_mul.hex",
+            hex_path,
+            "--map",
+            map_path,
             "--device",
             "p16f877a",
         ])
@@ -234,15 +252,10 @@ fn the_program_still_computes_mains_results() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let (layout, _asm) = compile_fixture();
-    let addr = |g: &str| {
-        *layout
-            .globals
-            .get(g)
-            .unwrap_or_else(|| panic!("no global {g}")) as usize
-    };
-
-    let hex = std::fs::read_to_string("tests/fixtures/interrupt_mul.hex").unwrap();
+    let hex = std::fs::read_to_string(hex_path).unwrap();
+    let map = std::fs::read_to_string(map_path).expect("read map");
+    let _ = std::fs::remove_file(map_path);
+    let addr = |g: &str| map_addr(&map, g);
     let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
     p.ram_mut()[addr("in_a")] = 47;
     p.ram_mut()[addr("in_b")] = 5;

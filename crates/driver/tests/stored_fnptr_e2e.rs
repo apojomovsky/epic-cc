@@ -10,16 +10,32 @@
 //!              -> g_seen = *g_payload = 0xAB
 //!   g_sel == 0 -> nothing; g_seen stays 0
 
-use std::collections::HashMap;
 use std::process::Command;
+
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
 
 fn run_one(device_name: &str, device: &device::Device, sel: u8) {
     let hex_path = format!("tests/fixtures/stored_fnptr_{device_name}.hex");
+    let map_path = format!("tests/fixtures/stored_fnptr_{device_name}.map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/stored_fnptr.c",
             "-o",
             &hex_path,
+            "--map",
+            &map_path,
             "--device",
             device_name,
             // `g_sel`'s input rides in as a real initializer (`volatile
@@ -37,29 +53,10 @@ fn run_one(device_name: &str, device: &device::Device, sel: u8) {
         String::from_utf8_lossy(&out.stderr)
     );
     let hex = std::fs::read_to_string(&hex_path).unwrap();
-
-    // Resolve the `g_sel`/`g_seen` global addresses from the same alloc
-    // layout the driver used.
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/stored_fnptr.c"),
-        &driver::clang::Options {
-            defines: vec![format!("G_SEL={sel}")],
-            ..driver::clang::Options::default()
-        },
-    );
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let sel_addr = *layout.globals.get("g_sel").unwrap() as usize;
-    let seen_addr = *layout.globals.get("g_seen").unwrap() as usize;
+    let map = std::fs::read_to_string(&map_path).unwrap();
+    let _ = std::fs::remove_file(&map_path);
+    let sel_addr = map_addr(&map, "g_sel");
+    let seen_addr = map_addr(&map, "g_seen");
 
     match device.core {
         device::Core::Pic14 => {

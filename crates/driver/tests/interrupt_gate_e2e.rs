@@ -2,49 +2,34 @@
 //! whole driver pipeline and the simulator honours INTCON. A request made
 //! while GIE is clear stays pending; it is taken only once main unmasks, and
 //! it is taken exactly once. See `fixtures/interrupt_gate.c`.
-use std::collections::HashMap;
 use std::process::Command;
 
-fn gate_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/interrupt_gate.c"),
-        &driver::clang::Options::default(),
-    );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    callgraph::check_depth(&cg, 8);
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-    let _ = peephole::optimize(&asm);
-    layout
+/// `stage` and `isr_ran`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn a_masked_request_is_deferred_until_main_sets_gie() {
-    let layout = gate_layout();
-    let addr = |g: &str| {
-        *layout
-            .globals
-            .get(g)
-            .unwrap_or_else(|| panic!("no global {g}")) as usize
-    };
-    let (stage, isr_ran) = (addr("stage"), addr("isr_ran"));
+    let hex_path = "tests/fixtures/interrupt_gate.hex";
+    let map_path = "tests/fixtures/interrupt_gate.map";
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/interrupt_gate.c",
             "-o",
-            "tests/fixtures/interrupt_gate.hex",
+            hex_path,
+            "--map",
+            map_path,
             "--device",
             "p16f877a",
         ])
@@ -56,7 +41,10 @@ fn a_masked_request_is_deferred_until_main_sets_gie() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let hex = std::fs::read_to_string("tests/fixtures/interrupt_gate.hex").unwrap();
+    let hex = std::fs::read_to_string(hex_path).unwrap();
+    let map = std::fs::read_to_string(map_path).expect("read map");
+    let _ = std::fs::remove_file(map_path);
+    let (stage, isr_ran) = (map_addr(&map, "stage"), map_addr(&map, "isr_ran"));
     let mut p = pic14_sim::Pic14::new(pic14_sim::parse_hex(&hex));
 
     // Run into the masked window (stage == 1) and request the interrupt.

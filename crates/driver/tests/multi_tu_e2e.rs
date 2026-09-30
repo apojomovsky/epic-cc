@@ -12,56 +12,24 @@ const INPUTS: [&str; 3] = [
     "tests/fixtures/multi_tu_b.c",
 ];
 
-/// Reproduce the driver's own front half (clang per unit, llvm-link merge,
-/// sanitize) plus `alloc`, so the test can find `total`'s RAM address the
-/// same way `array_e2e.rs` and `banked_e2e.rs` do for a single unit.
-fn multi_tu_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let llvm_link = driver::clang_discovery::resolve_llvm_link(&clang).expect("resolve_llvm_link");
-
-    let tmp = std::env::temp_dir().join(format!("epiccc-multi-tu-test-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    let mut units = Vec::new();
-    for (n, input) in INPUTS.iter().enumerate() {
-        let ll_path = tmp.join(format!("{n:03}.ll"));
-        driver::clang::compile_to_file(
-            &clang,
-            &resdir,
-            std::path::Path::new(input),
-            &ll_path,
-            &driver::clang::Options::default(),
-        );
-        units.push(ll_path);
-    }
-
-    let merged_path = tmp.join("merged.ll");
-    let mut cmd = Command::new(&llvm_link);
-    cmd.arg("-S");
-    for u in &units {
-        cmd.arg(u);
-    }
-    cmd.args(["-o", merged_path.to_str().unwrap()]);
-    let out = cmd.output().expect("run llvm-link");
-    assert!(
-        out.status.success(),
-        "llvm-link: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let ll_text =
-        irparse::sanitize_symbols(&std::fs::read_to_string(&merged_path).expect("read merged .ll"));
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg))
+/// `total`'s RAM address, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn compiles_three_translation_units_end_to_end() {
-    let layout = multi_tu_layout();
-    let total_addr = *layout.globals.get("total").expect("total global") as usize;
+    let hex_path = "tests/fixtures/multi_tu.hex";
+    let map_path = "tests/fixtures/multi_tu.map";
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
@@ -69,7 +37,9 @@ fn compiles_three_translation_units_end_to_end() {
             "tests/fixtures/multi_tu_a.c",
             "tests/fixtures/multi_tu_b.c",
             "-o",
-            "tests/fixtures/multi_tu.hex",
+            hex_path,
+            "--map",
+            map_path,
             "--device",
             "p16f877a",
         ])
@@ -81,7 +51,10 @@ fn compiles_three_translation_units_end_to_end() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let hex = std::fs::read_to_string("tests/fixtures/multi_tu.hex").unwrap();
+    let hex = std::fs::read_to_string(hex_path).unwrap();
+    let map = std::fs::read_to_string(map_path).expect("read map");
+    let _ = std::fs::remove_file(map_path);
+    let total_addr = map_addr(&map, "total");
     let prog = pic14_sim::parse_hex(&hex);
     let mut p = pic14_sim::Pic14::new(prog);
     p.run(2000);

@@ -4,43 +4,33 @@
 //! The e2e compiles the fixture, runs it in the sim with `g_idx` set to
 //! each row, and asserts the guard dispatch: row 0's guard is non-null and
 //! returns 1 (g_count < 2), row 1's guard is null and out stays 0.
-use std::collections::HashMap;
 use std::process::Command;
 
-fn layout_for() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/const_fnptr_struct.c"),
-        &driver::clang::Options::default(),
-    );
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-    let _ = peephole::optimize(&asm);
-    layout
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn const_fnptr_struct_dispatches_the_guard() {
-    let layout = layout_for();
-    let idx_addr = *layout.globals.get("g_idx").expect("g_idx") as usize;
-    let out_addr = *layout.globals.get("out").expect("out") as usize;
-
     let hex_path = "tests/fixtures/const_fnptr_struct.hex";
+    let map_path = "tests/fixtures/const_fnptr_struct.map";
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/const_fnptr_struct.c",
             "-o",
             hex_path,
+            "--map",
+            map_path,
             "--device",
             "p16f877a",
         ])
@@ -52,6 +42,10 @@ fn const_fnptr_struct_dispatches_the_guard() {
         String::from_utf8_lossy(&out.stderr)
     );
     let hex = std::fs::read_to_string(hex_path).unwrap();
+    let map = std::fs::read_to_string(map_path).expect("read map");
+    let _ = std::fs::remove_file(map_path);
+    let idx_addr = map_addr(&map, "g_idx");
+    let out_addr = map_addr(&map, "out");
     let prog = pic14_sim::parse_hex(&hex);
 
     // Row 0: guard non-null -> out = guard(0) = 1.

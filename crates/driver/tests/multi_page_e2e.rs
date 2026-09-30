@@ -91,11 +91,25 @@
 //! The simulation below is the ground truth; the intermediate values come
 //! from evaluating the exact emitted IR with a Python evaluator (documented
 //! in the task report). `in` is the i16 global at 0x20-0x21 (290 = 0x0122);
-//! `out` is the u8 global at 0x22 (read from the alloc layout, not
+//! `out` is the u8 global at 0x22 (read off `--map` below, not
 //! hardcoded).
 
 use std::collections::HashMap;
 use std::process::Command;
+
+/// `out`'s RAM address, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
 
 /// Run the exact driver pipeline in-process and return (final asm, layout).
 fn multi_page_pipeline() -> (String, alloc::AllocLayout) {
@@ -150,8 +164,7 @@ fn label_addrs(asm: &str) -> HashMap<String, usize> {
 
 #[test]
 fn multi_page_program_compiles_and_runs_correctly() {
-    let (asm, layout) = multi_page_pipeline();
-    let out_addr = *layout.globals.get("out").expect("out global") as usize;
+    let (asm, _layout) = multi_page_pipeline();
 
     // The final assembled layout: every label's page == the page the isel
     // greedy assignment put it in (no post-banking straddle). Folded-in
@@ -235,11 +248,15 @@ fn multi_page_program_compiles_and_runs_correctly() {
     );
 
     // ---- run the driver and simulate ----
+    let hex_path = "tests/fixtures/multi_page.hex";
+    let map_path = "tests/fixtures/multi_page.map";
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/multi_page.c",
             "-o",
-            "tests/fixtures/multi_page.hex",
+            hex_path,
+            "--map",
+            map_path,
             "--device",
             "p16f877a",
         ])
@@ -251,7 +268,10 @@ fn multi_page_program_compiles_and_runs_correctly() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let hex = std::fs::read_to_string("tests/fixtures/multi_page.hex").unwrap();
+    let hex = std::fs::read_to_string(hex_path).unwrap();
+    let map = std::fs::read_to_string(map_path).expect("read map");
+    let _ = std::fs::remove_file(map_path);
+    let out_addr = map_addr(&map, "out");
     let prog = pic14_sim::parse_hex(&hex);
     let mut p = pic14_sim::Pic14::new(prog);
     p.ram_mut()[0x20] = 0x22; // in low byte = 290 & 0xFF

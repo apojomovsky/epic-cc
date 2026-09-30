@@ -12,12 +12,24 @@
 //! `g_toggle_count`, the observable counter the test reads from the
 //! address map.
 
-use std::process::Command;
-
 // PIC16F877A SFRs (DS39582B, via the vendored hal_pic16.h).
 const INTCON: usize = 0x0B;
 const TMR0IF: u8 = 0x04; // INTCON bit 2
 const PORTB: usize = 0x06;
+
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
 
 fn fixture(path: &str) -> String {
     format!("tests/fixtures/hal-pic16/{path}")
@@ -25,13 +37,17 @@ fn fixture(path: &str) -> String {
 
 /// Run the real `epic-cc` binary over the given slice sources (with the
 /// config TU, exercising CC-3) targeting the 877A. Returns the parsed
-/// program words for the simulator.
-fn compile_slice(sources: &[&str], tag: &str) -> Vec<u16> {
+/// program words plus the `--map` text so the e2e can locate observable
+/// globals by name.
+fn compile_slice(sources: &[&str], tag: &str) -> (Vec<u16>, String) {
     let hex_path = std::env::temp_dir().join(format!("hal_pic16_{tag}_{}.hex", std::process::id()));
+    let map_path = hex_path.with_extension("map");
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--target", "16F877A", "-I", "tests/fixtures/hal-pic16"])
         .arg("-o")
         .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
         .arg(fixture("hal_pic16_config.c"))
         .args(sources.iter().map(|s| fixture(s)))
         .output()
@@ -42,88 +58,10 @@ fn compile_slice(sources: &[&str], tag: &str) -> Vec<u16> {
         String::from_utf8_lossy(&out.stderr)
     );
     let produced = std::fs::read_to_string(&hex_path).expect("read produced hex");
+    let map = std::fs::read_to_string(&map_path).expect("read map");
     let _ = std::fs::remove_file(&hex_path);
-    pic14_sim::parse_hex(&produced)
-}
-
-/// Rebuild the address map the driver computes for the slice, mirroring
-/// `crates/driver/src/main.rs` (the same pattern
-/// `hal_pic18_slice_e2e.rs` uses) so the e2e can locate observable
-/// globals by name.
-fn header_dir() -> std::path::PathBuf {
-    let ns = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let tid = format!("{:?}", std::thread::current().id());
-    let dir = std::env::temp_dir()
-        .join(format!(
-            "hal-slice-test-{}-{}-{}",
-            std::process::id(),
-            tid,
-            ns
-        ))
-        .join("include");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("stdint.h"), driver::stdint_h::STDINT_H).unwrap();
-    std::fs::write(dir.join("stdbool.h"), driver::stdbool_h::STDBOOL_H).unwrap();
-    std::fs::write(dir.join("stddef.h"), driver::stddef_h::STDDEF_H).unwrap();
-    std::fs::write(dir.join("string.h"), driver::string_h::STRING_H).unwrap();
-    std::fs::write(dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H).unwrap();
-    dir
-}
-
-fn slice_layout(sources: &[&str]) -> alloc::AllocLayout {
-    use driver::clang_discovery;
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let llvm_link = clang_discovery::resolve_llvm_link(&clang).expect("resolve_llvm_link");
-    let hdir = header_dir();
-
-    let tid = format!("{:?}", std::thread::current().id());
-    let tmp = std::env::temp_dir().join(format!("epiccc-hal-slice-{}-{}", std::process::id(), tid));
-    std::fs::create_dir_all(&tmp).unwrap();
-
-    let mut units = Vec::new();
-    for (n, input) in sources.iter().enumerate() {
-        let ll_path = tmp.join(format!("{n:03}.ll"));
-        driver::clang::compile_to_file(
-            &clang,
-            &resdir,
-            std::path::Path::new(&fixture(input)),
-            &ll_path,
-            &driver::clang::Options {
-                includes: vec![
-                    "tests/fixtures/hal-pic16".to_string(),
-                    hdir.to_str().unwrap().to_string(),
-                ],
-                header_dir: Some(hdir.clone()),
-                ..Default::default()
-            },
-        );
-        units.push(ll_path);
-    }
-
-    let merged_path = tmp.join("merged.ll");
-    let mut cmd = Command::new(&llvm_link);
-    cmd.arg("-S");
-    for u in &units {
-        cmd.arg(u);
-    }
-    cmd.args(["-o", merged_path.to_str().unwrap()]);
-    let out = cmd.output().expect("run llvm-link");
-    assert!(
-        out.status.success(),
-        "llvm-link: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let ll_text =
-        irparse::sanitize_symbols(&std::fs::read_to_string(&merged_path).expect("read merged .ll"));
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg))
+    let _ = std::fs::remove_file(&map_path);
+    (pic14_sim::parse_hex(&produced), map)
 }
 
 #[test]
@@ -136,19 +74,12 @@ fn callback_blink_toggles_rb0_on_tmr0_overflow() {
         "hal_pic16_dispatch.c",
         "hal_pic16_vector.c",
     ];
-    let layout = slice_layout(&sources);
-    let count_addr = *layout
-        .globals
-        .get("g_toggle_count")
-        .expect("g_toggle_count") as usize;
-    let seen_addr = *layout.globals.get("g_rb_seen").expect("g_rb_seen") as usize;
-    let readback_addr = *layout
-        .globals
-        .get("g_irq_readback")
-        .expect("g_irq_readback") as usize;
-    let idx_addr = *layout.globals.get("g_irq_idx").expect("g_irq_idx") as usize;
+    let (prog, map) = compile_slice(&sources, "blink");
+    let count_addr = map_addr(&map, "g_toggle_count");
+    let seen_addr = map_addr(&map, "g_rb_seen");
+    let readback_addr = map_addr(&map, "g_irq_readback");
+    let idx_addr = map_addr(&map, "g_irq_idx");
 
-    let prog = compile_slice(&sources, "blink");
     let mut sim = pic14_sim::Pic14::new(prog);
 
     // RAM globals are not initialized by the pipeline (the simulator
@@ -209,10 +140,9 @@ fn rb_change_callback_fires_with_portb_byte() {
         "hal_pic16_dispatch.c",
         "hal_pic16_vector.c",
     ];
-    let layout = slice_layout(&sources);
-    let seen_addr = *layout.globals.get("g_rb_seen").expect("g_rb_seen") as usize;
+    let (prog, map) = compile_slice(&sources, "rb");
+    let seen_addr = map_addr(&map, "g_rb_seen");
 
-    let prog = compile_slice(&sources, "rb");
     let mut sim = pic14_sim::Pic14::new(prog);
 
     // Run past init (the RB callback registration), then drive an RB

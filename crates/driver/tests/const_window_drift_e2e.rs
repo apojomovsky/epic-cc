@@ -21,53 +21,38 @@
 //! __epic_config of 69 bytes at base 0x3E8 crosses its 256-byte window`);
 //! after the fix it assembles and the sim runs.
 
-use std::collections::HashMap;
 use std::process::Command;
+
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
 
 fn fixture() -> &'static str {
     "tests/fixtures/const_window_drift.c"
 }
 
-/// Rebuild the alloc layout for the fixture so the test can locate the
-/// observable globals by name (the same pattern `const_table_e2e.rs` and
-/// the hal-pic16 slice e2e use). The fixture's `stdint.h`/`epic-cc.h`
-/// come from the driver's materialised header dir, exactly like main.rs.
-fn fixture_layout() -> HashMap<String, u16> {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let tmp = std::env::temp_dir().join(format!("cwdrift-{}", std::process::id()));
-    let header_dir = tmp.join("include");
-    std::fs::create_dir_all(&header_dir).expect("create header dir");
-    std::fs::write(header_dir.join("epic-cc.h"), driver::epic_cc_h::EPIC_CC_H)
-        .expect("write epic-cc.h");
-    std::fs::write(header_dir.join("stdint.h"), driver::stdint_h::STDINT_H)
-        .expect("write stdint.h");
-    let opts = driver::clang::Options {
-        includes: vec!["tests/fixtures".to_string()],
-        defines: Vec::new(),
-        header_dir: Some(header_dir),
-        fosc_hz: None,
-        packed_structs: false,
-    };
-    let ll_text =
-        driver::clang::compile_to_stdout(&clang, &resdir, std::path::Path::new(fixture()), &opts);
-    let _ = std::fs::remove_dir_all(&tmp);
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    layout.globals.clone()
-}
-
 /// Compile the fixture with the real `epic-cc` binary and return the
-/// parsed program words.
-fn compile_fixture() -> Vec<u16> {
+/// parsed program words plus the observable globals' `--map` addresses.
+fn compile_fixture() -> (Vec<u16>, usize, usize) {
     let hex_path =
         std::env::temp_dir().join(format!("const_window_drift_{}.hex", std::process::id()));
+    let map_path = hex_path.with_extension("map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--target", "16F877A", "-I", "tests/fixtures"])
         .arg("-o")
         .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
         .arg(fixture())
         .output()
         .expect("run epic-cc");
@@ -77,16 +62,17 @@ fn compile_fixture() -> Vec<u16> {
         String::from_utf8_lossy(&out.stderr)
     );
     let produced = std::fs::read_to_string(&hex_path).expect("read produced hex");
+    let map = std::fs::read_to_string(&map_path).expect("read map");
     let _ = std::fs::remove_file(&hex_path);
-    pic14_sim::parse_hex(&produced)
+    let _ = std::fs::remove_file(&map_path);
+    let g_idx = map_addr(&map, "g_idx");
+    let g_out = map_addr(&map, "g_out");
+    (pic14_sim::parse_hex(&produced), g_idx, g_out)
 }
 
 #[test]
 fn config_table_near_window_top_assembles_and_runs() {
-    let prog = compile_fixture();
-    let globals = fixture_layout();
-    let g_idx = *globals.get("g_idx").expect("g_idx global") as usize;
-    let g_out = *globals.get("g_out").expect("g_out global") as usize;
+    let (prog, g_idx, g_out) = compile_fixture();
 
     let mut p = pic14_sim::Pic14::new(prog.clone());
     p.ram_mut()[g_idx] = 0; // small blocks: only block 0 runs

@@ -9,33 +9,31 @@
 
 use std::process::Command;
 
-fn layout_for(device: &device::Device) -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/bitfields.c"),
-        &driver::clang::Options::default(),
-    );
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    alloc::allocate(device, &m, &callgraph::edges_text(&cg))
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 fn run_on(device: &device::Device, device_name: &str) {
-    let layout = layout_for(device);
-    let out_addr = *layout.globals.get("out").expect("out global") as usize;
-    let out2_addr = *layout.globals.get("out2").expect("out2 global") as usize;
-
     let hex_path = std::env::temp_dir().join(format!(
         "bitfields_{device_name}_{}.hex",
         std::process::id()
     ));
+    let map_path = hex_path.with_extension("map");
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["--device", device_name, "-o"])
         .arg(&hex_path)
+        .arg("--map")
+        .arg(&map_path)
         .arg("tests/fixtures/bitfields.c")
         .output()
         .expect("run driver");
@@ -45,7 +43,11 @@ fn run_on(device: &device::Device, device_name: &str) {
         String::from_utf8_lossy(&out.stderr)
     );
     let hex = std::fs::read_to_string(&hex_path).unwrap();
+    let map = std::fs::read_to_string(&map_path).expect("read map");
+    let _ = std::fs::remove_file(&map_path);
     let _ = std::fs::remove_file(&hex_path);
+    let out_addr = map_addr(&map, "out");
+    let out2_addr = map_addr(&map, "out2");
 
     match device.core {
         device::Core::Pic14 => {

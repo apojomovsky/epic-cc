@@ -6,7 +6,7 @@
 //! correctly in the simulator.
 //!
 //! `in_a`, `in_min`, `in_max`, `in_b`, `out` are globals; their addresses
-//! come from the same alloc layout the driver used.
+//! come off the compiler's own `--map` output below.
 //!
 //! Hand computation (in_a = -3000, in_min = -1000, in_max = 1000,
 //! in_b = 15), traced against the emitted IR in fixtures/pid_clamp.c:
@@ -20,46 +20,34 @@
 //! multiply on PIC14), and the `llvm.abs` intrinsic's `i1 false` immarg
 //! exercises the irparse call-arg fix.
 
-use std::collections::HashMap;
 use std::process::Command;
 
-fn pid_clamp_layout() -> alloc::AllocLayout {
-    let (clang, resdir) = driver::clang::pic_clang_from_env();
-    let ll_text = driver::clang::compile_to_stdout(
-        &clang,
-        &resdir,
-        std::path::Path::new("tests/fixtures/pid_clamp.c"),
-        &driver::clang::Options::default(),
-    );
-
-    let mut m = irparse::parse_ll(&ll_text);
-    m = wholeprog::merge(m);
-    m = legalize::legalize(m);
-    let cg = callgraph::build(&m);
-    let layout = alloc::allocate(&device::PIC16F877A, &m, &callgraph::edges_text(&cg));
-    let mut addrs: HashMap<String, u16> = HashMap::new();
-    addrs.extend(layout.globals.clone());
-    addrs.extend(layout.locals.clone());
-    let asm = isel::select(&device::PIC16F877A, &m, &addrs);
-    let asm = banking::assign_banks(&device::PIC16F877A, &asm);
-    let _ = peephole::optimize(&asm);
-    layout
+/// `in_a`, `in_min`, `in_max`, `in_b` and `out`'s RAM addresses, read off
+/// the compiler's own `--map` output. Rebuilding the pipeline here instead
+/// would be a second copy of `main.rs` that silently drifts: the PIC18 path
+/// alone parses with switches preserved, and once the frames sit below the
+/// globals a difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
 }
 
 #[test]
 fn pid_clamp_runs_correctly() {
-    let layout = pid_clamp_layout();
-    let a_addr = *layout.globals.get("in_a").expect("in_a global") as usize;
-    let min_addr = *layout.globals.get("in_min").expect("in_min global") as usize;
-    let max_addr = *layout.globals.get("in_max").expect("in_max global") as usize;
-    let b_addr = *layout.globals.get("in_b").expect("in_b global") as usize;
-    let out_addr = *layout.globals.get("out").expect("out global") as usize;
+    let hex_path = "tests/fixtures/pid_clamp.hex";
+    let map_path = "tests/fixtures/pid_clamp.map";
 
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args([
             "tests/fixtures/pid_clamp.c",
             "-o",
-            "tests/fixtures/pid_clamp.hex",
+            hex_path,
+            "--map",
+            map_path,
             "--device",
             "p16f877a",
         ])
@@ -71,7 +59,14 @@ fn pid_clamp_runs_correctly() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let hex = std::fs::read_to_string("tests/fixtures/pid_clamp.hex").unwrap();
+    let hex = std::fs::read_to_string(hex_path).unwrap();
+    let map = std::fs::read_to_string(map_path).expect("read map");
+    let _ = std::fs::remove_file(map_path);
+    let a_addr = map_addr(&map, "in_a");
+    let min_addr = map_addr(&map, "in_min");
+    let max_addr = map_addr(&map, "in_max");
+    let b_addr = map_addr(&map, "in_b");
+    let out_addr = map_addr(&map, "out");
     let prog = pic14_sim::parse_hex(&hex);
     let mut p = pic14_sim::Pic14::new(prog);
     let i16 = |v: i16| (v as u16).to_le_bytes();

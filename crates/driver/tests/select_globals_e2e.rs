@@ -7,6 +7,20 @@
 //!   - ok_flag = 0: out = 'F' (0x46)
 use std::process::Command;
 
+/// `in` and `out`'s RAM addresses, read off the compiler's own `--map`
+/// output. Rebuilding the pipeline here instead would be a second copy of
+/// `main.rs` that silently drifts: the PIC18 path alone parses with
+/// switches preserved, and once the frames sit below the globals a
+/// difference that far upstream moves every global address.
+fn map_addr(map: &str, name: &str) -> usize {
+    let prefix = format!("global {name} 0x");
+    let line = map
+        .lines()
+        .find(|l| l.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no map entry for {name} in:\n{map}"));
+    usize::from_str_radix(line[prefix.len()..].trim(), 16).expect("map address is hex")
+}
+
 /// Compile `fixture` for `device` and run it in the sim with `ok_flag`
 /// compiled in as a real initializer for each `(flag, expected_out)` pair,
 /// asserting `out` and `halted`. The flag rides in via `-D OK_FLAG=n`
@@ -19,31 +33,24 @@ fn run_fixture(
     cases: &[(u8, u8)],
 ) {
     for &(flag, expected) in cases {
-        let (clang, resdir) = driver::clang::pic_clang_from_env();
-        let ll_text = driver::clang::compile_to_stdout(
-            &clang,
-            &resdir,
-            std::path::Path::new(fixture),
-            &driver::clang::Options {
-                defines: vec![format!("OK_FLAG={flag}")],
-                ..driver::clang::Options::default()
-            },
-        );
-        let mut m = irparse::parse_ll(&ll_text);
-        m = wholeprog::merge(m);
-        m = legalize::legalize(m);
-        let cg = callgraph::build(&m);
-        let layout = alloc::allocate(device, &m, &callgraph::edges_text(&cg));
-        let out_addr = *layout.globals.get("out").expect("out") as usize;
-
         let stem = std::path::Path::new(fixture)
             .file_stem()
             .expect("fixture file name")
             .to_str()
             .expect("fixture name utf8");
         let hex_path = format!("tests/fixtures/{stem}_{device_name}_{flag}.hex");
+        let map_path = format!("tests/fixtures/{stem}_{device_name}_{flag}.map");
         let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
-            .args([fixture, "-o", &hex_path, "--device", device_name, "-D"])
+            .args([
+                fixture,
+                "-o",
+                &hex_path,
+                "--map",
+                &map_path,
+                "--device",
+                device_name,
+                "-D",
+            ])
             .arg(format!("OK_FLAG={flag}"))
             .output()
             .expect("run driver");
@@ -53,6 +60,9 @@ fn run_fixture(
             String::from_utf8_lossy(&out.stderr)
         );
         let hex = std::fs::read_to_string(&hex_path).expect("read hex");
+        let map = std::fs::read_to_string(&map_path).expect("read map");
+        let _ = std::fs::remove_file(&map_path);
+        let out_addr = map_addr(&map, "out");
 
         match device.core {
             device::Core::Pic14 => {
