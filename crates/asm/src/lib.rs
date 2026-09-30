@@ -23,6 +23,17 @@ fn insert_label(symbols: &mut std::collections::HashMap<String, usize>, name: &s
     }
 }
 
+/// A line is a bare directive `name` only when it is exactly `name` or
+/// `name` followed by whitespace (comment already stripped, line
+/// trimmed). A label such as `endpoint:` or `listener:` starts with a
+/// directive name but is not one.
+fn is_directive(line: &str, name: &str) -> bool {
+    line == name
+        || line
+            .strip_prefix(name)
+            .is_some_and(|rest| rest.starts_with([' ', '\t']))
+}
+
 fn assemble_first_pass(
     src: &str,
 ) -> (
@@ -39,7 +50,7 @@ fn assemble_first_pass(
         if line.is_empty() {
             continue;
         }
-        if line.starts_with("list") || line.starts_with("radix") {
+        if is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
         if let Some(rest) = line.strip_prefix("org ") {
@@ -57,7 +68,7 @@ fn assemble_first_pass(
             org = target;
             continue;
         }
-        if line.strip_prefix("end").is_some() {
+        if is_directive(line, "end") {
             break;
         }
         // Handle `label: instruction` on one line (e.g. `my_label: nop` from module asm).
@@ -184,10 +195,10 @@ pub fn assemble_pic18(src: &str) -> Vec<u16> {
         if line.is_empty() {
             continue;
         }
-        if line.starts_with("list") || line.starts_with("radix") {
+        if is_directive(line, "list") || is_directive(line, "radix") {
             continue;
         }
-        if line.strip_prefix("end").is_some() {
+        if is_directive(line, "end") {
             break;
         }
         if let Some(eq) = line.find(" equ ") {
