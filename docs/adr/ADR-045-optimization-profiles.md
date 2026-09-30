@@ -68,8 +68,10 @@ already type.
 
 ## Consequences
 
-- `-Os` output is identical to pre-change on all rows; the proof is the
-  ladder passing with no `-Os` baseline touched.
+- `-Os` output is identical to pre-change on all rows: the ladder passes
+  with no `-Os` baseline touched, and a baseline-vs-branch driver diff
+  (383bae0 vs this change, default flags) is byte-identical HEX on the
+  menu and encoder demos plus five small rows.
 - `-O2` costs flash on factoring-friendly PIC18 programs and can cost
   RAM anywhere the aggressive tier fires; both are baselined, not
   regretted.
