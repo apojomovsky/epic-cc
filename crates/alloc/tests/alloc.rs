@@ -2100,16 +2100,17 @@ fn pic18_two_region_device_keeps_the_globals_above_the_overlay() {
 /// below 0x100 would otherwise put `__add_f32`'s 22 bytes across it.
 #[test]
 fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
-    // main's 212 live i8 locals end at 0xEB, so `__add_f32`'s derived base
-    // is 0xEB and its 22-byte frame would span 0xEB..0x100, crossing the
-    // boundary; it must snap to 0x100.
+    // main's 216 live i8 locals end at 0xEB: arg homing (epic-cc#830) folds
+    // the two 4-byte arg loads into the callee slots, freeing 4 frame bytes,
+    // so `__add_f32`'s derived base is 0xEB and its 22-byte frame would
+    // span 0xEB..0x100, crossing the boundary; it must snap to 0x100.
     let mut src = String::from("global sink i8\nglobal in float\n");
     src.push_str("fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14\n");
     src.push_str("fn main(void) ()\n  block entry:\n");
-    for i in 0..212 {
+    for i in 0..216 {
         src.push_str(&format!("    %v{i} = add i8 1, 2\n"));
     }
-    for i in 0..212 {
+    for i in 0..216 {
         src.push_str(&format!("    store i8 %v{i}, ptr @sink\n"));
     }
     src.push_str(
@@ -2131,7 +2132,9 @@ fn pic18_routine_frame_snaps_to_the_next_bsr_bank() {
 /// already was).
 #[test]
 fn pic18_routine_frame_does_not_snap_back_to_the_region_start() {
-    for k in [210usize, 212] {
+    // Counts cover the 4 frame bytes arg homing (epic-cc#830) folds into
+    // the callee slots: 216 snaps to 0x100, 240 clears it without a snap.
+    for k in [216usize, 240] {
         let mut src = String::from("global sink i8\nglobal in float\n");
         src.push_str(
             "fn __add_f32(float) (a=i32, b=i32)\n  block entry:\n    %__scr = alloca 14\n",
@@ -2276,5 +2279,307 @@ fn the_hottest_slot_sits_at_the_frame_base() {
         out.locals["f::v43"] > 0x5F,
         "a cold value spills past the window: {:#x}",
         out.locals["f::v43"]
+    );
+}
+
+/// Caller-computed call args (epic-cc#830): a single-use scalar def lands
+/// in the callee's param slot, so the site copy is a self-copy isel skips.
+fn homing_module(extra_main: &str) -> ir::Module {
+    parse(&format!(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = add i8 1, 2\n\
+             {extra_main}\
+             call void @callee(i8 %v)\n\
+             ret void\n"
+    ))
+}
+
+#[test]
+fn single_use_scalar_arg_homes_into_the_callee_param_slot() {
+    let out = allocate(&PIC16F877A, &homing_module(""), "edge main callee\n");
+    assert_eq!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "the def must target the param slot"
+    );
+}
+
+#[test]
+fn multi_use_arg_value_keeps_its_caller_slot() {
+    let out = allocate(
+        &PIC16F877A,
+        &homing_module("store i8 %v, ptr @out\n"),
+        "edge main callee\n",
+    );
+    assert_ne!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a twice-read value cannot live in the param slot"
+    );
+}
+
+#[test]
+fn call_between_def_and_use_blocks_homing() {
+    // Any intervening call rejects: a sibling callee's frame shares the
+    // param slot's RAM, so the copy must stay.
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn other(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = add i8 1, 2\n\
+             call void @other()\n\
+             call void @callee(i8 %v)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\nedge main other\n");
+    assert_ne!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a call between def and call must keep the copy"
+    );
+}
+
+#[test]
+fn isr_reachable_callee_blocks_homing() {
+    // The ISR can preempt main between the early write and the call, so a
+    // callee the ISR reaches keeps its site copies.
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @callee(i8 1)\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = add i8 1, 2\n\
+             call void @callee(i8 %v)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\nedge isr callee\n");
+    assert_ne!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "an ISR-reachable callee must keep its site copies"
+    );
+}
+
+#[test]
+fn width_mismatched_arg_keeps_its_caller_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i16)\n\
+           block entry:\n\
+             store i16 %p, ptr @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = add i8 1, 2\n\
+             call void @callee(i8 %v)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    assert_ne!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a narrow arg cannot cover a wide param slot"
+    );
+}
+
+#[test]
+fn call_result_arg_homes_into_the_callee_param_slot() {
+    // A call result lands through the retval bytes into its dst slot on
+    // both cores, so chaining calls homes the same way a plain def does.
+    let m = parse(
+        "global out i8\n\
+         fn gen(i8) ()\n\
+           block entry:\n\
+             %g = add i8 1, 2\n\
+             ret i8 %g\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %x = call i8 @gen()\n\
+             call void @callee(i8 %x)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main gen\nedge main callee\n");
+    assert_eq!(
+        out.locals["main::x"], out.locals["callee::p"],
+        "a chained call result must target the param slot"
+    );
+}
+
+#[test]
+fn cross_block_def_homes_with_a_clean_path() {
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(i1) (c=i1)\n\
+           block entry:\n\
+             %v = add i8 1, 2\n\
+             br i1 %c, label %t, label %f\n\
+           block t:\n\
+             call void @callee(i8 %v)\n\
+             br label %done\n\
+           block f:\n\
+             br label %done\n\
+           block done:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    assert_eq!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a dominated call with no call between must home"
+    );
+}
+
+#[test]
+fn call_on_the_path_blocks_cross_block_homing() {
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn other(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v = add i8 1, 2\n\
+             br label %mid\n\
+           block mid:\n\
+             call void @other()\n\
+             br label %tail\n\
+           block tail:\n\
+             call void @callee(i8 %v)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\nedge main other\n");
+    assert_ne!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a call on the def-to-call path must keep the copy"
+    );
+}
+
+#[test]
+fn phi_arg_homes_into_the_callee_param_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(i1) (c=i1)\n\
+           block entry:\n\
+             br i1 %c, label %t, label %f\n\
+           block t:\n\
+             %x = add i8 1, 2\n\
+             br label %m\n\
+           block f:\n\
+             %y = add i8 3, 4\n\
+             br label %m\n\
+           block m:\n\
+             %v = phi i8 %x t %y f\n\
+             call void @callee(i8 %v)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    assert_eq!(
+        out.locals["main::v"], out.locals["callee::p"],
+        "a phi feeding one call must target the param slot"
+    );
+}
+
+#[test]
+fn passed_through_param_homes_into_the_callee_param_slot() {
+    // Callers refresh a param slot at every call site, so a single-use
+    // param homes like a def at entry over a call-free entry path.
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn mid(i8) (q=i8)\n\
+           block entry:\n\
+             call void @callee(i8 %q)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge mid callee\n");
+    assert_eq!(
+        out.locals["mid::q"], out.locals["callee::p"],
+        "a passed-through param must target the param slot"
+    );
+}
+
+#[test]
+fn call_before_the_use_blocks_param_homing() {
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn other(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn mid(i8) (q=i8)\n\
+           block entry:\n\
+             call void @other()\n\
+             call void @callee(i8 %q)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge mid callee\nedge mid other\n");
+    assert_ne!(
+        out.locals["mid::q"], out.locals["callee::p"],
+        "an entry-prefix call may clobber the param slot"
+    );
+}
+
+#[test]
+fn pass_through_chains_resolve_to_the_final_param_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn inner(void) (q=i8)\n\
+           block entry:\n\
+             store i8 %q, ptr @out\n\
+             ret void\n\
+         fn mid(i8) (p=i8)\n\
+           block entry:\n\
+             call void @inner(i8 %p)\n\
+             ret void\n\
+         fn outer(void) ()\n\
+           block entry:\n\
+             %v = add i8 1, 2\n\
+             call void @mid(i8 %v)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge outer mid\nedge mid inner\n");
+    assert_eq!(
+        out.locals["outer::v"], out.locals["inner::q"],
+        "a chained def must reach the final param slot"
+    );
+    assert_eq!(
+        out.locals["mid::p"], out.locals["inner::q"],
+        "a chained param must reach the final param slot"
     );
 }

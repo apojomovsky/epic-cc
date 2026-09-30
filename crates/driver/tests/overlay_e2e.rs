@@ -5,6 +5,7 @@
 //! (overlay), and total_bank0 < locals_size(big_a) + locals_size(big_b) +
 //! locals_size(main).
 
+use std::collections::HashSet;
 use std::process::Command;
 
 /// Sorted RAM addresses of one function's frame locals, read off the
@@ -117,17 +118,23 @@ fn overlay_frames_share_ram() {
 
     // The critical .ll property: each sibling carries >= 16 bytes of
     // simultaneous i16 locals (else -O1 folded the program away).
-    let (span_a, span_b, span_main) = (span_lo(&a), span_lo(&b), span_lo(&m));
+    let (span_a, span_b) = (span_lo(&a), span_lo(&b));
     assert!(span_a >= 16 && span_b >= 16,
         "each sibling must carry >= 16 bytes of simultaneous locals (got big_a={span_a}, big_b={span_b})");
 
     // (b) sibling frames overlay: identical base region (never co-live).
     assert_eq!(a[0], b[0], "big_a and big_b must share a base address");
 
-    // main's frame is disjoint and sits before the shared sibling region.
-    // main's values are i8/i16 (the fixture has no wider type), so its
-    // true span exceeds the widthless bound by at most 1.
-    assert!(m[0] + span_main + 1 <= a[0]);
+    // Homed call args (epic-cc#830) live in their callee's param slot by
+    // design: a main address shared with a sibling frame is a homed arg,
+    // not a frame overlap. Disjointness holds over main-owned slots, and
+    // main keeps owned slots below the sibling base or the homing moved
+    // nothing worth keeping.
+    let sib: HashSet<u16> = a.iter().chain(b.iter()).copied().collect();
+    let owned: Vec<u16> = m.iter().copied().filter(|x| !sib.contains(x)).collect();
+    assert!(!owned.is_empty(), "main must keep owned frame slots");
+    let span_main = span_lo(&owned);
+    assert!(owned[0] + span_main + 1 <= a[0]);
 
     // Overlay wins: total bank-0 demand < sum of the three demands.
     // Lower-bound spans only shrink the sum, so passing against them
