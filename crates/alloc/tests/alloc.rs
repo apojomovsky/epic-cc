@@ -498,7 +498,8 @@ fn const_gep_ptr_call_arg_is_copied_to_ram() {
 fn const_gep_select_arm_is_copied_to_ram() {
     // The select branch walks the same reg chain: a GEP-derived arm keeps
     // the select from folding, so the const base is copied like a call arg.
-    // Offset +0: only a zero-offset GEP seeds as a runtime value in iselcore.
+    // Offset +0: only a zero-offset GEP seeds as a runtime value in
+    // iselcore; the nonzero cross-base shape is epic-cc#781, not this pin.
     let mut m = parse(
         "const c i8\n\
          global b i8\n\
