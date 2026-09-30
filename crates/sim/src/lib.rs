@@ -2475,10 +2475,21 @@ impl Pic18 {
                 self.set_zn(r);
                 self.write_d_at(d, op, r);
             }
-            0x5400 | 0x5800 => {
-                // SUBFWB / SUBWFB: f - W - !C, computed as f + !W + C (the
-                // ALU adder with W inverted; both mnemonics share this
-                // computation).
+            0x5400 => {
+                // SUBFWB: W - f - !C, computed as W + !f + C (the ALU
+                // adder with f inverted). Distinct from SUBWFB: the
+                // operands are reversed, so sharing one formula for
+                // both opcodes silently accepts isel's wrong mnemonic
+                // (epic-cc#632).
+                let fv = self.read_phys(op);
+                let cin = self.get_c() as u8;
+                let r = self.addc_flags(self.w, !fv, cin);
+                self.set_zn(r);
+                self.write_d_at(d, op, r);
+            }
+            0x5800 => {
+                // SUBWFB: f - W - !C, computed as f + !W + C (the ALU
+                // adder with W inverted).
                 let fv = self.read_phys(op);
                 let cin = self.get_c() as u8;
                 let r = self.addc_flags(fv, !self.w, cin);
@@ -2831,7 +2842,7 @@ impl Pic18 {
         self.ram[self.status_addr()] & 0x01 != 0
     }
     /// `a + b + cin`, setting C/DC/OV for the 3-operand add and returning
-    /// the wrapped result. Used by ADDWFC and (with `b` inverted) by
+    /// the wrapped result. Used by ADDWFC and (with one operand inverted) by
     /// SUBFWB/SUBWFB, which PIC18's ALU computes as an add-with-carry.
     fn addc_flags(&mut self, a: u8, b: u8, cin: u8) -> u8 {
         let sum: u16 = a as u16 + b as u16 + cin as u16;
