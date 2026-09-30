@@ -1423,8 +1423,10 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // triggers back to copies.
     struct CallSite {
         func: String,
-        direct: Vec<String>,
-        regs: Vec<String>,
+        callee: String,
+        indirect: bool,
+        direct: Vec<(usize, String)>,
+        regs: Vec<(usize, String)>,
     }
     struct SelSite {
         func: String,
@@ -1566,16 +1568,16 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                         // Staging site records (epic-cc#790): reg args for
                         // select-def lookup with their plain-arg kind,
                         // direct edges for ISR reachability, and the site.
-                        let mut direct: Vec<String> = Vec::new();
-                        let mut regs: Vec<String> = Vec::new();
-                        for arg in &c.args {
+                        let mut direct: Vec<(usize, String)> = Vec::new();
+                        let mut regs: Vec<(usize, String)> = Vec::new();
+                        for (i, arg) in c.args.iter().enumerate() {
                             let plain = arg.ty.is_none() && arg.byval.is_none() && !arg.sret;
                             match &arg.val {
                                 ir::Val::Global(g) => {
                                     if plain
                                         && m.globals.iter().any(|gl| &gl.name == g && gl.is_const)
                                     {
-                                        direct.push(g.clone());
+                                        direct.push((i, g.clone()));
                                     }
                                 }
                                 ir::Val::Reg(r) => {
@@ -1584,7 +1586,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                                         .or_default()
                                         .push((bi, ii, plain));
                                     if plain {
-                                        regs.push(r.clone());
+                                        regs.push((i, r.clone()));
                                     }
                                 }
                                 ir::Val::Const(_) => {}
@@ -1598,6 +1600,8 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                         }
                         calls.push(CallSite {
                             func: f.name.clone(),
+                            callee: c.func.clone(),
+                            indirect: !c.callees.is_empty(),
                             direct,
                             regs,
                         });
@@ -1723,7 +1727,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         // Triggers in excluded functions never stage.
         for c in &calls {
             if excluded.contains(&c.func) {
-                demote.extend(c.direct.iter().cloned());
+                demote.extend(c.direct.iter().map(|(_, g)| g.clone()));
             }
         }
         for s in &sels {
@@ -1742,10 +1746,10 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             }
             let mut units: HashSet<String> = HashSet::new();
             let mut sel_units: HashSet<usize> = HashSet::new();
-            for d in &c.direct {
+            for (_, d) in &c.direct {
                 units.insert(d.clone());
             }
-            for r in &c.regs {
+            for (_, r) in &c.regs {
                 if let Some(&si) = sel_of.get(&(c.func.clone(), r.clone())) {
                     sel_units.insert(si);
                 }
@@ -1790,6 +1794,141 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
                 demote.extend(s.arms.iter().cloned());
             }
         }
+        // Pass C (callee escape): the buffer is re-copied before every
+        // consuming call, so a callee that keeps the address alive (stores
+        // it, returns it, or forwards it into another call) would read a
+        // clobbered buffer. Taint the params receiving staged values at
+        // their arg positions (positions past the params are variadic
+        // extras: immediate byte copies, never the address) and propagate
+        // through GEPs, selects, and phis. Immediate dereferences (loads,
+        // stores, and memcpys through the pointer) and address compares
+        // consume the value in-call and stay safe; any other tainted read
+        // escapes. An indirect call with staged values has an unknown
+        // callee and demotes what it stages.
+        for c in &calls {
+            if excluded.contains(&c.func) {
+                continue;
+            }
+            let mut involved: Vec<String> = Vec::new();
+            let mut taint_args: Vec<usize> = Vec::new();
+            for (i, g) in &c.direct {
+                if !demote.contains(g) {
+                    involved.push(g.clone());
+                    taint_args.push(*i);
+                }
+            }
+            for (i, r) in &c.regs {
+                if let Some(&si) = sel_of.get(&(c.func.clone(), r.clone())) {
+                    if sels[si].arms.iter().any(|a| !demote.contains(a)) {
+                        involved.extend(
+                            sels[si]
+                                .arms
+                                .iter()
+                                .filter(|a| !demote.contains(*a))
+                                .cloned(),
+                        );
+                        taint_args.push(*i);
+                    }
+                }
+            }
+            if involved.is_empty() {
+                continue;
+            }
+            let mut escape = c.indirect;
+            if !escape {
+                if let Some(&fi) = func_idx.get(c.callee.as_str()) {
+                    let callee = &m.funcs[fi];
+                    let mut tainted: HashSet<String> = HashSet::new();
+                    for &i in &taint_args {
+                        if let Some(p) = callee.params.get(i) {
+                            tainted.insert(p.name.clone());
+                        }
+                    }
+                    let mut changed = true;
+                    while changed && !tainted.is_empty() {
+                        changed = false;
+                        for b in &callee.blocks {
+                            for inst in &b.insts {
+                                let hit = |v: &ir::Val| matches!(v, ir::Val::Reg(r) if tainted.contains(r));
+                                let dst: Option<&str> = match inst {
+                                    ir::Inst::Gep(g) => {
+                                        let used = matches!(&g.base, ir::GepBase::Reg(r) if tainted.contains(r))
+                                            || g.terms.iter().any(|(_, r)| tainted.contains(r));
+                                        if used {
+                                            Some(g.dst.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    ir::Inst::Select(s) => {
+                                        if hit(&s.a) || hit(&s.b) {
+                                            Some(s.dst.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    ir::Inst::Phi(p) => {
+                                        if p.incoming.iter().any(|(v, _)| hit(v)) {
+                                            Some(p.dst.as_str())
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(d) = dst {
+                                    changed |= tainted.insert(d.to_string());
+                                }
+                            }
+                        }
+                    }
+                    'scan: for b in &callee.blocks {
+                        for inst in &b.insts {
+                            let safe: Vec<String> = match inst {
+                                ir::Inst::Load(l) => {
+                                    vec![l.ptr.strip_prefix('%').unwrap_or(&l.ptr).to_string()]
+                                }
+                                ir::Inst::Store(s) => {
+                                    vec![s.ptr.strip_prefix('%').unwrap_or(&s.ptr).to_string()]
+                                }
+                                ir::Inst::Select(s) => {
+                                    vec![ir::val_name(&s.a), ir::val_name(&s.b)]
+                                }
+                                ir::Inst::Phi(p) => {
+                                    p.incoming.iter().map(|(v, _)| ir::val_name(v)).collect()
+                                }
+                                ir::Inst::Gep(g) => {
+                                    let mut vs = Vec::new();
+                                    if let ir::GepBase::Reg(r) = &g.base {
+                                        vs.push(r.clone());
+                                    }
+                                    vs.extend(g.terms.iter().map(|(_, r)| r.clone()));
+                                    vs
+                                }
+                                ir::Inst::Memcpy(m) => {
+                                    vec![ir::val_name(&m.dst), ir::val_name(&m.src)]
+                                }
+                                ir::Inst::Icmp(_) | ir::Inst::Fcmp(_) => ir::read_vals(inst),
+                                _ => Vec::new(),
+                            };
+                            if ir::read_vals(inst)
+                                .iter()
+                                .any(|u| !u.is_empty() && tainted.contains(u) && !safe.contains(u))
+                            {
+                                escape = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                } else {
+                    escape = true;
+                }
+            }
+            if escape {
+                demote.extend(involved);
+            }
+        }
+
         // Survivors stage: direct-only, unpinned, small enough, paying.
         for gname in &const_direct {
             if const_derived.contains(gname) || demote.contains(gname) {

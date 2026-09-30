@@ -771,6 +771,143 @@ fn multi_const_call_keeps_copies() {
 }
 
 #[test]
+fn escaping_const_call_arg_keeps_its_copy() {
+    // A callee that stores its param keeps the buffer address alive past
+    // the next staging: the stored const demotes to a per-copy while the
+    // readers still share the buffer.
+    let mut m = parse(
+        "const c i8\n\
+         const a i8\n\
+         const b i8\n\
+         global sink i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @save(@c)\n\
+             call void @read(@a)\n\
+             call void @read(@b)\n\
+             ret void\n\
+         fn save(void) (p=ptr)\n\
+           block entry:\n\
+             store ptr %p, ptr @sink\n\
+             ret void\n\
+         fn read(void) (q=ptr)\n\
+           block entry:\n\
+             %v = load i8 %q\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 3; // a: [3 x i8]
+    m.globals[2].size = 4; // b: [4 x i8]
+    m.globals[3].size = 2; // sink: one pointer
+    let out = allocate(&PIC16F877A, &m, "edge main save\nedge main read\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "stored const @c must keep its RAM copy"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "stored const @c must leave the flash set"
+    );
+    assert!(
+        !out.globals.contains_key("a") && !out.globals.contains_key("b"),
+        "reader consts must still stage with no RAM copies"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "readers still pay for the shared buffer"
+    );
+}
+
+#[test]
+fn forwarded_const_call_arg_keeps_its_copy() {
+    // A callee that forwards its param into another call hands the buffer
+    // address onward: the forwarded const demotes to a per-copy while the
+    // readers still share the buffer.
+    let mut m = parse(
+        "const c i8\n\
+         const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @fwd(@c)\n\
+             call void @read(@a)\n\
+             call void @read(@b)\n\
+             ret void\n\
+         fn fwd(void) (p=ptr)\n\
+           block entry:\n\
+             call void @inner(%p)\n\
+             ret void\n\
+         fn inner(void) (r=ptr)\n\
+           block entry:\n\
+             %v = load i8 %r\n\
+             ret void\n\
+         fn read(void) (q=ptr)\n\
+           block entry:\n\
+             %w = load i8 %q\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 3; // a: [3 x i8]
+    m.globals[2].size = 4; // b: [4 x i8]
+    let out = allocate(
+        &PIC16F877A,
+        &m,
+        "edge main fwd\nedge main read\nedge fwd inner\n",
+    );
+    assert!(
+        out.globals.contains_key("c"),
+        "forwarded const @c must keep its RAM copy"
+    );
+    assert!(
+        !out.globals.contains_key("a") && !out.globals.contains_key("b"),
+        "reader consts must still stage with no RAM copies"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "readers still pay for the shared buffer"
+    );
+}
+
+#[test]
+fn indirect_const_call_arg_keeps_its_copy() {
+    // An indirect call has no visible callee, so the address could survive
+    // anywhere: the const demotes to a per-copy while the direct-call
+    // readers still share the buffer.
+    let mut m = parse(
+        "const c i8\n\
+         const a i8\n\
+         const b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %fp = add i16 1, 2\n\
+             call void %fp(@c) callees read\n\
+             call void @read(@a)\n\
+             call void @read(@b)\n\
+             ret void\n\
+         fn read(void) (q=ptr)\n\
+           block entry:\n\
+             %v = load i8 %q\n\
+             ret void\n",
+    );
+    m.globals[0].size = 2; // c: [2 x i8]
+    m.globals[1].size = 3; // a: [3 x i8]
+    m.globals[2].size = 4; // b: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "edge main read\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "indirect-call const @c must keep its RAM copy"
+    );
+    assert!(
+        !out.globals.contains_key("a") && !out.globals.contains_key("b"),
+        "reader consts must still stage with no RAM copies"
+    );
+    assert!(
+        out.globals.contains_key("__const_stage"),
+        "readers still pay for the shared buffer"
+    );
+}
+
+#[test]
 fn multi_use_select_keeps_copies() {
     // A select dst consumed twice cannot stage: the second use would read
     // a re-staged buffer. Demote both arms to per-copies.
