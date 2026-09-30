@@ -143,4 +143,8 @@ jobs:
 
       - name: Fix target dir ownership (container runs as root)
         if: always()
-        run: sudo chown -R "$(id -u):$(id -g)" target scratch
+        run: |
+          for d in target scratch; do
+            [ -e "$d" ] || continue
+            sudo chown -R "$(id -u):$(id -g)" "$d"
+          done
