@@ -5,8 +5,10 @@
 
 use std::process::Command;
 
-fn asm_for(extra: &[&str]) -> String {
-    let asm_path = std::env::temp_dir().join(format!("pool_{}.asm", std::process::id()));
+fn asm_for(tag: &str, extra: &[&str]) -> String {
+    // Unique path per test: the suite runs tests in parallel and two
+    // tests sharing one temp file delete each other's output.
+    let asm_path = std::env::temp_dir().join(format!("pool_{tag}_{}.asm", std::process::id()));
     let out = Command::new(env!("CARGO_BIN_EXE_epic-cc"))
         .args(["tests/fixtures/pool_strings.c", "-o"])
         .arg(&asm_path)
@@ -68,7 +70,7 @@ fn tables(asm: &str) -> Vec<(String, Vec<u8>)> {
 
 #[test]
 fn pool_emits_byte_identical_concatenation() {
-    let asm = asm_for(&["--const-pool"]);
+    let asm = asm_for("concat", &["--const-pool"]);
     let all = tables(&asm);
     let (pool, per_const): (Vec<_>, Vec<_>) = all
         .into_iter()
@@ -114,8 +116,8 @@ fn pool_is_additive_unflagged_output_unchanged() {
     // Strip every pool trace (chunk spans, reader entries, name
     // references) from the flagged listing: the remainder must equal
     // the unflagged listing byte for byte.
-    let flagged = asm_for(&["--const-pool"]);
-    let plain = asm_for(&[]);
+    let flagged = asm_for("additive-flagged", &["--const-pool"]);
+    let plain = asm_for("additive-plain", &[]);
     let mut stripped: Vec<&str> = Vec::new();
     let mut lines = flagged.lines().peekable();
     let mut in_pool_data = false;
