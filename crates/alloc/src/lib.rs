@@ -379,12 +379,7 @@ fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
 /// immediately reusable. Greedy first-fit coloring reuses the lowest slot
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
-fn frame_layout(
-    f: &ir::Func,
-    resolved: &PtrResolution,
-    va_size: u16,
-    homed: &HashSet<String>,
-) -> FrameLayout {
+fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLayout {
     let order = block_order(f);
     let idx: HashMap<&str, usize> = order
         .iter()
@@ -428,12 +423,9 @@ fn frame_layout(
             }
         }
     }
-    // Homed call args (epic-cc#830) hold no caller slot: their bytes live
-    // in the callee's param slot from the defining write. Dropping keeps
-    // relative placement order, so the coloring of the rest is unchanged.
-    for h in homed {
-        defs.remove(h);
-    }
+    // Every def keeps its caller slot (epic-cc#830): dropping a homed
+    // value's slot shrinks the caller frame, which rebases its callees and
+    // spends more bank-select words than the deleted copies save.
 
     // uses: value name -> set of (block, position). A phi's incoming values
     // are used at the END of their predecessor (isel emits the incoming
@@ -1350,15 +1342,19 @@ fn entry_path_ok(
     }
     true
 }
-/// One admitted call site, before the same-caller selection. `def` and
-/// `call` are linear (block, position) points; two candidates with
-/// overlapping windows could write one param slot inside each other's
-/// window (sibling callee params can alias one address), so one is kept.
+/// One admitted call site, before the same-caller selection. `def` is the
+/// defining write (the merge block for a phi, whose real writes are the
+/// per-edge copies, so `phi_preds` names those predecessor blocks). Two
+/// candidates whose writes can land inside each other's window could
+/// clobber one shared slot, so one of them is kept.
 struct HomeCand {
     def: (usize, usize),
     call: (usize, usize),
     src: (String, String),
     tgt: (String, String),
+    /// Write points when the def is a phi: its per-edge copies sit at the
+    /// END of each predecessor block, not at the merge. Empty otherwise.
+    phi_preds: Vec<(usize, usize)>,
 }
 
 /// Caller-computed call args (epic-cc#830): `(caller, value)` to
@@ -1399,10 +1395,11 @@ fn home_args(
     };
     // One writer per param slot at a time (epic-cc#830 review): sibling
     // callees' first params can alias one address, so a second homed def
-    // landing inside an earlier site's def-to-call window would clobber
-    // the value that site is about to read. Defs are not calls, so the
-    // per-site window checks cannot see it; selection is per caller below.
+    // reaching an earlier site's call would clobber the value that site
+    // reads. Defs are not calls, so the per-site window checks cannot see
+    // it; selection below is CFG-aware per caller.
     let mut cands: Vec<HomeCand> = Vec::new();
+    let mut succ_of: HashMap<String, HashMap<usize, Vec<usize>>> = HashMap::new();
     for f in &m.funcs {
         let order = block_order(f);
         let idx: HashMap<&str, usize> = order
@@ -1468,6 +1465,7 @@ fn home_args(
             }
             succ.insert(i, ss);
         }
+        succ_of.insert(f.name.clone(), succ.clone());
         let params: HashSet<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
         for (bi, b) in order.iter().enumerate() {
             for (pos, inst) in b.insts.iter().enumerate() {
@@ -1538,6 +1536,7 @@ fn home_args(
                             call: (bi, pos),
                             src: (f.name.clone(), r.clone()),
                             tgt: (callee.name.clone(), p.name.clone()),
+                            phi_preds: Vec::new(),
                         });
                         continue;
                     }
@@ -1566,9 +1565,18 @@ fn home_args(
                     if w != p.width {
                         continue;
                     }
+                    let mut phi_pred_blocks: Vec<(usize, usize)> = Vec::new();
                     if let ir::Inst::Phi(phi) = &order[db].insts[dp] {
                         if db != bi || !phi_home_ok(&succ, &order, &idx, phi, bi, dp, pos) {
                             continue;
+                        }
+                        // The phi's real writes are its per-edge copies at
+                        // the END of each predecessor block, not the merge
+                        // point the def tuple names.
+                        for (_, pred) in &phi.incoming {
+                            if let Some(&pi) = idx.get(pred.as_str()) {
+                                phi_pred_blocks.push((pi, block_len[pi] as usize));
+                            }
                         }
                     } else {
                         if !homable(&order[db].insts[dp]) {
@@ -1590,33 +1598,98 @@ fn home_args(
                         call: (bi, pos),
                         src: (f.name.clone(), r.clone()),
                         tgt: (callee.name.clone(), p.name.clone()),
+                        phi_preds: phi_pred_blocks,
                     });
                 }
             }
         }
     }
-    // Same-caller selection. Only two shapes can fight over one address:
-    // two candidates on the same callee param, or two candidates on
-    // different callees (sibling frames share RAM, so their equal-offset
-    // params can coincide). Distinct params of one callee are distinct
-    // slots, so a call's own args never collide. A reader must see its
-    // own write, so a colliding writer inside that window, in either
-    // direction, is dropped. First in linear order wins, deterministically.
+    // Same-caller selection. A kept writer's read at its call must see its
+    // own write, so no other writer that can clobber that address may sit
+    // inside the window. Only two writers can share an address: the same
+    // target slot, or two callee frames that can overlay (siblings do;
+    // distinct params of one callee never do, all params being entry-live).
+    // Collisions are judged on FINAL addresses, because a pass-through
+    // chain sends a site's bytes to a deeper param slot.
+    let imm: HashMap<(String, String), (String, String)> = cands
+        .iter()
+        .map(|c| (c.src.clone(), c.tgt.clone()))
+        .collect();
+    let final_of = |mut tgt: (String, String)| -> Option<(String, String)> {
+        let mut seen: HashSet<(String, String)> = HashSet::from([tgt.clone()]);
+        while let Some(next) = imm.get(&tgt) {
+            if !seen.insert(next.clone()) {
+                return None;
+            }
+            tgt = next.clone();
+        }
+        Some(tgt)
+    };
     let mut sel: HashMap<(String, String), (String, String)> = HashMap::new();
-    let mut kept: Vec<&HomeCand> = Vec::new();
+    let mut kept: Vec<(&HomeCand, (String, String))> = Vec::new();
     'cand: for c in &cands {
-        for k in &kept {
-            let same_callee = k.tgt.0 == c.tgt.0;
-            if k.src.0 != c.src.0 || (same_callee && k.tgt.1 != c.tgt.1) {
+        let Some(cfinal) = final_of(c.tgt.clone()) else {
+            continue;
+        };
+        // A phi writes at its pred ends, an ordinary def at its own point.
+        let writes = |x: &HomeCand| -> Vec<(usize, usize)> {
+            if x.phi_preds.is_empty() {
+                vec![x.def]
+            } else {
+                x.phi_preds.clone()
+            }
+        };
+        let cw = writes(c);
+        for (k, kfinal) in &kept {
+            if k.src.0 != c.src.0 {
                 continue;
             }
-            let in_window =
-                |x: (usize, usize), w: ((usize, usize), (usize, usize))| w.0 <= x && x <= w.1;
-            if in_window(c.def, (k.def, k.call)) || in_window(k.def, (c.def, c.call)) {
+            // Two writers can share one address only when their frames can
+            // overlay: different callees always can (sibling frames share
+            // a base), two different params of one callee never can (all
+            // params are entry-live, so coloring gives them distinct
+            // slots). A chain link is not its param slot: its bytes go to
+            // a deeper frame, so a link always goes to the window test.
+            let unchained_distinct =
+                c.tgt.0 == k.tgt.0 && c.tgt.1 != k.tgt.1 && c.tgt == cfinal && k.tgt == *kfinal;
+            if unchained_distinct && c.tgt != k.tgt {
+                continue;
+            }
+            let succ = &succ_of[&c.src.0];
+            let reaches = |from: (usize, usize), to: (usize, usize)| -> bool {
+                if from.0 == to.0 {
+                    return from.1 < to.1;
+                }
+                let mut seen: HashSet<usize> = HashSet::new();
+                let mut stack = succ.get(&from.0).cloned().unwrap_or_default();
+                while let Some(b) = stack.pop() {
+                    if b == to.0 {
+                        return true;
+                    }
+                    if seen.insert(b) {
+                        stack.extend(succ.get(&b).cloned().unwrap_or_default());
+                    }
+                }
+                false
+            };
+            // A violation is one candidate's write landing between the
+            // other's write and its call: the reader would see the
+            // clobberer instead of its own value. `mine` owns the window,
+            // `theirs` is the intruder.
+            let kw = writes(k);
+            let clobbered = |mine: &[(usize, usize)],
+                             theirs: &[(usize, usize)],
+                             call: (usize, usize)|
+             -> bool {
+                theirs
+                    .iter()
+                    .any(|t| mine.iter().any(|m| reaches(*m, *t)) && reaches(*t, call))
+            };
+            if clobbered(&kw, &cw, k.call) || clobbered(&cw, &kw, c.call) {
                 continue 'cand;
             }
         }
-        kept.push(c);
+        kept.push((c, cfinal));
         sel.insert(c.src.clone(), c.tgt.clone());
     }
     sel
@@ -1678,11 +1751,11 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             panic!("alloc: unrecognized callgraph line: {line}");
         }
     }
-    // Caller-computed call args (epic-cc#830): homed defs hold no caller
-    // slot, so the frames shrink before the bases derive from them. A
-    // homed target that is itself a homed source (pass-through chains)
-    // resolves to the final address; mutual pass-throughs with no base
-    // slot drop out and keep their caller slots.
+    // Caller-computed call args (epic-cc#830). The caller keeps its own
+    // slot for the value: only the copy at the call site is deleted, so
+    // no frame rebases. A homed target that is itself a homed source
+    // (pass-through chains) resolves to the final address; mutual
+    // pass-throughs with no base slot drop out.
     let homed = home_args(m, &edges, &resolved);
     let mut final_tgt: HashMap<(String, String), (String, String)> = HashMap::new();
     for (src, mut tgt) in homed.clone() {
@@ -1694,14 +1767,6 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
             final_tgt.insert(src, tgt);
         }
     }
-    let mut homed_src: HashMap<&str, HashSet<String>> = HashMap::new();
-    for ((caller, val), _) in &final_tgt {
-        homed_src
-            .entry(caller.as_str())
-            .or_default()
-            .insert(val.clone());
-    }
-    let homed_of = |f: &str| -> HashSet<String> { homed_src.get(f).cloned().unwrap_or_default() };
 
     // 2. locals_widths(f) = the liveness-overlay slot widths of f's params
     // and defined values, in allocation order (the order `frame_end` walks
@@ -1713,12 +1778,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut locals_size: HashMap<String, u16> = HashMap::new();
     let va_sizes = va_sizes(m);
     for f in &m.funcs {
-        let fl = frame_layout(
-            f,
-            &resolved,
-            floored_va_size(f, &va_sizes),
-            &homed_of(&f.name),
-        );
+        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
         locals_widths.insert(f.name.clone(), fl.widths);
         locals_size.insert(f.name.clone(), fl.size);
     }
@@ -2759,12 +2819,7 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let win_end = device.access_bank.map(|(_, hi)| hi + 1);
     for f in &m.funcs {
         let b = base[&f.name];
-        let fl = frame_layout(
-            f,
-            &resolved,
-            floored_va_size(f, &va_sizes),
-            &homed_of(&f.name),
-        );
+        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
         // The frame end the coloring's own slot order produces; every callee
         // base is derived from it (`frame_end` over `locals_widths`), so a
         // permutation that moved it would silently rebase the callees.

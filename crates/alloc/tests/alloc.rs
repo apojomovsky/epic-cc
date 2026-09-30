@@ -2617,3 +2617,126 @@ fn second_homed_source_in_one_caller_keeps_its_slot() {
         "exactly one same-caller source may home (a={ahomed}, b={bhomed})"
     );
 }
+
+#[test]
+fn cross_block_writers_to_one_slot_do_not_both_home() {
+    // Linear order is not execution order. Order is [entry, 1, 2, 3, 5, 6]:
+    // %a's window is (entry, block 1), %bb's is (block 2, block 3), so a
+    // linear-tuple test sees them disjoint. But block 2 dominates block 3
+    // and reaches block 1, so entry -> 2 -> 1 clobbers the slot with %bb
+    // before block 1's call reads %a. Exactly one site may home.
+    let m = parse(
+        "global out i8\n\
+         fn callee(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(i1) (c=i1)\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             br i1 %c, label %2, label %6\n\
+           block 2:\n\
+             %bb = add i8 3, 4\n\
+             br i1 %c, label %1, label %3\n\
+           block 1:\n\
+             call void @callee(i8 %a)\n\
+             br label %5\n\
+           block 3:\n\
+             call void @callee(i8 %bb)\n\
+             br label %5\n\
+           block 6:\n\
+             br label %5\n\
+           block 5:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main callee\n");
+    let a = out.locals["main::a"] == out.locals["callee::p"];
+    let bb = out.locals["main::bb"] == out.locals["callee::p"];
+    assert!(
+        !(a && bb),
+        "reachable writers must not both home (a={a}, bb={bb})"
+    );
+}
+
+#[test]
+fn chained_sites_converging_on_one_slot_do_not_both_home() {
+    // Two args of one call go to different params of g, but g forwards
+    // each straight into h's single param. Immediate targets differ
+    // (g::p1, g::p2) while the final address is one slot, so selecting on
+    // immediate targets would keep both and let the second def clobber
+    // the first read.
+    let m = parse(
+        "global out i8\n\
+         fn h(void) (q=i8)\n\
+           block entry:\n\
+             store i8 %q, ptr @out\n\
+             ret void\n\
+         fn g(i1) (c=i1, p1=i8, p2=i8)\n\
+           block entry:\n\
+             br i1 %c, label %2, label %3\n\
+           block 2:\n\
+             call void @h(i8 %p1)\n\
+             br label %4\n\
+           block 3:\n\
+             call void @h(i8 %p2)\n\
+             br label %4\n\
+           block 4:\n\
+             ret void\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %v1 = add i8 1, 2\n\
+             %v2 = add i8 3, 4\n\
+             call void @g(i1 1, i8 %v1, i8 %v2)\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main g\nedge g h\n");
+    let v1 = out.locals["main::v1"] == out.locals["h::q"];
+    let v2 = out.locals["main::v2"] == out.locals["h::q"];
+    assert!(
+        !(v1 && v2),
+        "chained writers to one final slot must not both home (v1={v1}, v2={v2})"
+    );
+}
+
+#[test]
+fn sibling_callee_writers_do_not_both_home() {
+    // Two different single-param callees share RAM (sibling frames overlay,
+    // first param at offset zero), so a second homed def reaching the
+    // first site's call clobbers the shared slot even though the callee
+    // names differ.
+    let m = parse(
+        "global out i8\n\
+         fn c1(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn c2(void) (p=i8)\n\
+           block entry:\n\
+             store i8 %p, ptr @out\n\
+             ret void\n\
+         fn main(i1) (c=i1)\n\
+           block entry:\n\
+             %a = add i8 1, 2\n\
+             br i1 %c, label %2, label %6\n\
+           block 2:\n\
+             %bb = add i8 3, 4\n\
+             br i1 %c, label %1, label %3\n\
+           block 1:\n\
+             call void @c1(i8 %a)\n\
+             br label %5\n\
+           block 3:\n\
+             call void @c2(i8 %bb)\n\
+             br label %5\n\
+           block 6:\n\
+             br label %5\n\
+           block 5:\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "edge main c1\nedge main c2\n");
+    let a = out.locals["main::a"] == out.locals["c1::p"];
+    let bb = out.locals["main::bb"] == out.locals["c2::p"];
+    assert!(
+        !(a && bb),
+        "sibling-frame writers must not both home (a={a}, bb={bb})"
+    );
+}
