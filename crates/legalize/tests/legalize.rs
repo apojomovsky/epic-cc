@@ -502,6 +502,62 @@ fn fills_cross_context_stored_callback_candidates() {
         "main store must point at the _isr copy"
     );
 }
+/// Dead main-context twin drop (epic-cc#780): the const-propagated
+/// registration shape, where the callee stores constant `@cb` into an
+/// ISR-read global while main still passes `@cb` into the callee's now
+/// ignored parameter. The store rewrite moves the only live reference to
+/// `cb_isr`; the dead argument respells to the copy and the original is
+/// dropped, so the backend never emits it.
+#[test]
+fn drops_dead_main_context_twin_after_const_propagated_register() {
+    let m = parse(
+        "global g_cb i16\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             call void @register(i16 @cb)\n\
+             ret void\n\
+         fn register(void) (cb=i16)\n\
+           block entry:\n\
+             store i16 @cb @g_cb\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             %1 = load i16 @g_cb\n\
+             call void @1()\n\
+             ret void\n\
+         fn cb(void) ()\n  block entry:\n    ret void\n",
+    );
+    let m2 = legalize(m);
+    let names: Vec<&str> = m2.funcs.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"cb_isr"), "copy missing: {names:?}");
+    assert!(!names.contains(&"cb"), "dead original must go: {names:?}");
+    let isr = m2.funcs.iter().find(|f| f.name == "isr").unwrap();
+    let call = isr
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("isr call");
+    assert_eq!(call.callees, vec!["cb_isr".to_string()]);
+    let main = m2.funcs.iter().find(|f| f.name == "main").unwrap();
+    let reg_call = main
+        .blocks
+        .iter()
+        .flat_map(|b| &b.insts)
+        .find_map(|i| match i {
+            Inst::Call(c) => Some(c),
+            _ => None,
+        })
+        .expect("main call");
+    assert_eq!(
+        reg_call.args[0].val,
+        ir::Val::Global("cb_isr".to_string()),
+        "dead argument must respell to the copy"
+    );
+}
 
 /// A callback stored by main into a global the ISR does NOT read stays
 /// main-only: no `_isr` copy, no ISR candidate, main's store untouched.

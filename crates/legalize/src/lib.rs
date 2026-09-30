@@ -44,8 +44,8 @@
 use std::collections::{HashMap, HashSet};
 
 use ir::{
-    Alloca, Bin, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Icmp, Inst,
-    IntToPtr, MemLen, Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
+    Alloca, Bin, BinOp, Block, Call, CallArg, FBinOp, FloatConvOp, Func, Gep, GepBase, Global,
+    Icmp, Inst, IntToPtr, MemLen, Module, Param, Select, Sext, Trunc, Ty, Val, Zext,
 };
 
 pub fn legalize(m: Module) -> Module {
@@ -2846,6 +2846,13 @@ fn duplicate_isr_shared(
             }
         }
     }
+    // Dead main-context twin drop (epic-cc#780): const-prop can fold a
+    // registration argument into the callee, so the callee stores constant
+    // `@f` while the caller still passes `@f` into a now-ignored param.
+    // The store rewrite moves the only live reference to the copy; respell
+    // the dead arguments and drop originals with no remaining use, before
+    // the candidate filler runs so it never lists a removed function.
+    drop_dead_isr_originals(&mut funcs, &m.globals, &shared_lo_set, &shared_hi_set);
     (
         Module {
             globals: m.globals,
@@ -2856,6 +2863,106 @@ fn duplicate_isr_shared(
         stored_hi,
         spellings,
     )
+}
+
+/// Respell provably dead call arguments pointing at a duplicated ISR
+/// original to its single copy, then drop originals with no remaining
+/// use. An argument is dead exactly when the defined callee never reads
+/// that parameter slot (`ir::read_vals` over its body); the copy shares
+/// the signature, so the respelled value is equally unobservable. Only
+/// single-spelling originals qualify: a dual-priority duplicate has two
+/// live copies and no single respell target. Anything else keeps the
+/// original: a direct call, any other `Val::Global` use, a use from a
+/// global initializer, an undefined callee, or a read parameter slot.
+fn drop_dead_isr_originals(
+    funcs: &mut Vec<Func>,
+    globals: &[Global],
+    shared_lo: &HashSet<&str>,
+    shared_hi: &HashSet<&str>,
+) {
+    let mut spell: HashMap<&str, &str> = HashMap::new();
+    for f in shared_lo.iter() {
+        if !shared_hi.contains(*f) {
+            spell.insert(*f, LO_SUFFIX);
+        }
+    }
+    for f in shared_hi.iter() {
+        if !shared_lo.contains(*f) {
+            spell.insert(*f, HI_SUFFIX);
+        }
+    }
+    if spell.is_empty() {
+        return;
+    }
+    let mut reads: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut params: HashMap<String, Vec<String>> = HashMap::new();
+    for f in funcs.iter() {
+        let mut u: HashSet<String> = HashSet::new();
+        for b in &f.blocks {
+            for inst in &b.insts {
+                for v in ir::read_vals(inst) {
+                    if !v.is_empty() {
+                        u.insert(v);
+                    }
+                }
+            }
+        }
+        reads.insert(f.name.clone(), u);
+        params.insert(
+            f.name.clone(),
+            f.params.iter().map(|p| p.name.clone()).collect(),
+        );
+    }
+    for f in funcs.iter_mut() {
+        for b in &mut f.blocks {
+            for inst in &mut b.insts {
+                let Inst::Call(c) = inst else { continue };
+                if !params.contains_key(&c.func) {
+                    continue;
+                }
+                for (pi, arg) in c.args.iter_mut().enumerate() {
+                    let Val::Global(g) = &arg.val else { continue };
+                    let Some(sfx) = spell.get(g.as_str()) else {
+                        continue;
+                    };
+                    let ps = &params[&c.func];
+                    if pi >= ps.len() {
+                        continue;
+                    }
+                    if !reads[&c.func].contains(&ps[pi]) {
+                        arg.val = Val::Global(format!("{g}{sfx}"));
+                    }
+                }
+            }
+        }
+    }
+    let mut live: HashSet<String> = HashSet::new();
+    for g in globals {
+        for (_, name) in &g.refs {
+            if spell.contains_key(name.as_str()) {
+                live.insert(name.clone());
+            }
+        }
+    }
+    for f in funcs.iter() {
+        for b in &f.blocks {
+            for inst in &b.insts {
+                if let Inst::Call(c) = inst {
+                    if spell.contains_key(c.func.as_str()) {
+                        live.insert(c.func.clone());
+                    }
+                }
+                let mut found: HashSet<String> = HashSet::new();
+                collect_global_vals(inst, &mut found);
+                for g in found {
+                    if spell.contains_key(g.as_str()) {
+                        live.insert(g);
+                    }
+                }
+            }
+        }
+    }
+    funcs.retain(|f| !(spell.contains_key(f.name.as_str()) && !live.contains(&f.name)));
 }
 
 /// Rewrite every `Val::Global(f)` in `inst` to `Val::Global(f+suffix)`
