@@ -41,6 +41,7 @@ its own:
 -I../hal-pic18-base/pic18fxx5x-hal/include
 -I../hal-pic18-base/epic-common/include
 -I../hal-pic18-base/epic-math/include
+-I../hal-pic18-base/epic-math/tests
 -I../hal-pic18-base/epic-pid/include
 -I../hal-pic18-base/epic-tick/include
 -I../hal-pic18-base/epic-serial/include

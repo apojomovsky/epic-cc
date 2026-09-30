@@ -568,6 +568,7 @@ fn cases() -> Vec<Case> {
                 "vendor/hal-pic18-base/pic18fxx5x-hal/include",
                 "vendor/hal-pic18-base/epic-common/include",
                 "vendor/hal-pic18-base/epic-math/include",
+                "vendor/hal-pic18-base/epic-math/tests",
                 "vendor/hal-pic18-base/epic-pid/include",
                 "vendor/hal-pic18-base/epic-tick/include",
                 "vendor/hal-pic18-base/epic-serial/include",
