@@ -475,6 +475,7 @@ fn const_gep_ptr_call_arg_is_copied_to_ram() {
         "const c i8\n\
          fn main(void) ()\n\
            block entry:\n\
+             %g = gep @c +1\n\
              call void @f(%g)\n\
              ret void\n\
          fn f(void) (p=ptr)\n\
@@ -482,20 +483,37 @@ fn const_gep_ptr_call_arg_is_copied_to_ram() {
              ret void\n",
     );
     m.globals[0].size = 4; // c: [4 x i8]
-    m.funcs[0].blocks[0].insts.insert(
-        0,
-        ir::Inst::Gep(ir::Gep {
-            dst: "g".into(),
-            base: ir::GepBase::Global("c".into()),
-            k: 1,
-            terms: vec![],
-            loc: None,
-        }),
-    );
     let out = allocate(&PIC16F877A, &m, "edge main f\n");
     assert!(
         out.globals.contains_key("c"),
         "const base @c behind a GEP call arg must be copied to RAM"
+    );
+    assert!(
+        !out.const_globals.contains("c"),
+        "copied const @c must leave the flash set"
+    );
+}
+
+#[test]
+fn const_gep_select_arm_is_copied_to_ram() {
+    // The select branch walks the same reg chain: a GEP-derived arm keeps
+    // the select from folding, so the const base is copied like a call arg.
+    // Offset +0: only a zero-offset GEP seeds as a runtime value in iselcore.
+    let mut m = parse(
+        "const c i8\n\
+         global b i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %d = icmp eq i8 1, 1\n\
+             %g = gep @c +0
+             %s = select i1 %d, ptr %g, ptr @b\n\
+             ret void\n",
+    );
+    m.globals[0].size = 4; // c: [4 x i8]
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert!(
+        out.globals.contains_key("c"),
+        "const base @c behind a GEP select arm must be copied to RAM"
     );
     assert!(
         !out.const_globals.contains("c"),
