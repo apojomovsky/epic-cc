@@ -206,6 +206,13 @@ struct Gen<'m> {
     /// must flip the skip polarity, not just skip the MOVF. `None` for
     /// composites (`C&&!Z`, `!C||Z`), whose dst is not a single flag.
     z_rel: Option<(u8, &'static str)>,
+    /// SSA names holding a just-materialized 0/1 byte. A value temp has
+    /// no address, so no call, ISR, or pointer write can reach its slot;
+    /// overlapping liveness never shares it (the allocator's invariant).
+    /// `emit_cond_branch` tests such a cond with `BTFSC slot,0` and no
+    /// reload, at any distance. Never removed: entries die with the
+    /// per-function `Gen`.
+    bool_temps: HashSet<String>,
     /// The source location of the instruction currently being emitted, or
     /// `None` for compiler-generated glue (prologue, `__start`, const init,
     /// runtime routines). `emit` records it on the line it pushes, so the
@@ -3328,6 +3335,7 @@ impl<'m> Gen<'m> {
                         self.emit_materialize(mat, da);
                     }
                 }
+                self.bool_temps.insert(ic.dst.clone());
             }
             Inst::Select(s) => {
                 if s.ptr {
@@ -6356,6 +6364,110 @@ fn emit_isr_epilogue(
     g.emit("    RETFIE".to_string());
 }
 
+/// A branch testing one bit of a RAM slot directly: an adjacent
+/// `and`-single-bit, `icmp eq/ne 0`, `brcond` triple whose middle values
+/// are branch-only collapses to `BTFSS slot,bit`, skipping the AND, the
+/// compare, and the i1 materialize. The snapshot needs 2+ uses (a
+/// single-use temp may never reach its slot: the deferred store drops
+/// it), and common RAM is excluded (shared with the ISR frame).
+struct BitTestCollapse {
+    and_dst: String,
+    icmp_dst: String,
+    slot: u16,
+    bit: u8,
+}
+
+fn find_bit_test_collapse(
+    g: &Gen,
+    func: &str,
+    b: &ir::Block,
+    phi_copies: &HashMap<(String, String), Vec<(String, Ty, Val)>>,
+) -> Option<BitTestCollapse> {
+    let n = b.insts.len();
+    if n < 3 {
+        return None;
+    }
+    let (and, icmp, br) = match (&b.insts[n - 3], &b.insts[n - 2], &b.insts[n - 1]) {
+        (Inst::Bin(and), Inst::Icmp(icmp), Inst::BrCond(br)) => (and, icmp, br),
+        _ => return None,
+    };
+    if and.op != BinOp::And {
+        return None;
+    }
+    if icmp.pred != "eq" && icmp.pred != "ne" {
+        return None;
+    }
+    let a_is_zero = matches!(&icmp.a, Val::Const(0));
+    let b_is_zero = matches!(&icmp.b, Val::Const(0));
+    let a_name = if a_is_zero {
+        match &icmp.b {
+            Val::Reg(r) => r,
+            _ => return None,
+        }
+    } else if b_is_zero {
+        match &icmp.a {
+            Val::Reg(r) => r,
+            _ => return None,
+        }
+    } else {
+        return None;
+    };
+    if a_name != &and.dst {
+        return None;
+    }
+    let Val::Reg(r_name) = &br.cond else {
+        return None;
+    };
+    if r_name != &icmp.dst {
+        return None;
+    }
+    let (x_name, mask) = match (&and.a, &and.b) {
+        (Val::Reg(x), Val::Const(m)) => (x, *m),
+        (Val::Const(m), Val::Reg(x)) => (x, *m),
+        _ => return None,
+    };
+    if mask <= 0 || mask & (mask - 1) != 0 {
+        return None;
+    }
+    let bit = mask.trailing_zeros();
+    if bit >= u32::from(and.ty.bytes()) * 8 {
+        return None;
+    }
+    let uses = |name: &str| g.use_count.get(&ssa_key(func, name)).copied().unwrap_or(0);
+    if uses(&icmp.dst) != 1 || uses(&and.dst) != 1 || uses(x_name) < 2 {
+        return None;
+    }
+    if phi_copies.contains_key(&(b.label.clone(), br.t.clone())) {
+        return None;
+    }
+    if phi_copies.contains_key(&(b.label.clone(), br.f.clone())) {
+        return None;
+    }
+    let slot = g.slot_addr(func, x_name).direct();
+    let in_gpr = g
+        .device
+        .ram_banks
+        .iter()
+        .any(|w| slot >= w.0 && slot <= w.1);
+    let in_common = g
+        .device
+        .common_ram
+        .is_some_and(|w| slot >= w.0 && slot <= w.1);
+    let in_ret = g
+        .device
+        .fixed_retval
+        .is_some_and(|w| slot >= w.0 && slot <= w.1);
+    if !in_gpr || in_common || in_ret {
+        return None;
+    }
+    Some(BitTestCollapse {
+        and_dst: and.dst.clone(),
+        icmp_dst: icmp.dst.clone(),
+        slot: slot + u16::from((bit / 8) as u8),
+        bit: (bit % 8) as u8,
+    })
+}
+
 /// Emit one function's body into `g.out`: runtime routines get their recipe
 /// body; ordinary functions get the block labels, phi copies, and
 /// terminators. Shared by both emission passes: pass A measures the body
@@ -6508,11 +6620,21 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
             }
         }
         let mut terminator = None;
+        let collapse = find_bit_test_collapse(g, &f.name, b, &phi_copies);
         for i in &b.insts {
             match i {
                 Inst::Phi(_) => {} // eliminated; copies emitted at pred ends
                 Inst::Br(_) | Inst::BrCond(_) | Inst::Ret(..) => terminator = Some(i),
-                _ => g.emit_inst(i),
+                _ => {
+                    let skipped = match i {
+                        Inst::Bin(bin) => collapse.as_ref().is_some_and(|c| c.and_dst == bin.dst),
+                        Inst::Icmp(ic) => collapse.as_ref().is_some_and(|c| c.icmp_dst == ic.dst),
+                        _ => false,
+                    };
+                    if !skipped {
+                        g.emit_inst(i);
+                    }
+                }
             }
         }
         if let Some(t) = terminator {
@@ -6556,6 +6678,29 @@ fn emit_func_body<'m>(g: &mut Gen<'m>, f: &'m ir::Func) {
                                     // live relation when set, else the MOVF's Z.
                                     Some((bit, skip)) => {
                                         g.emit(format!("    {skip} STATUS, {bit} ; Z"));
+                                        g.emit(format!("    GOTO {lf}"));
+                                        g.emit(format!("    GOTO {lt}"));
+                                    }
+                                    // Collapsed bit test: the AND, compare,
+                                    // and materialize never emitted. A
+                                    // pending deferred AND store has no
+                                    // consumer left, so drop it; W still
+                                    // holds its value, which nothing reads.
+                                    None if collapse.is_some() => {
+                                        let c = collapse.as_ref().unwrap();
+                                        let and_slot = g.slot_addr(&f.name, &c.and_dst).direct();
+                                        if g.deferred_store == Some(and_slot) {
+                                            g.deferred_store = None;
+                                            g.deferred_uses = 0;
+                                        }
+                                        g.emit(format!("    BTFSS 0x{:02X}, {}", c.slot, c.bit));
+                                        g.emit(format!("    GOTO {lf}"));
+                                        g.emit(format!("    GOTO {lt}"));
+                                    }
+                                    // A 0/1 cond's bit 0 is its value, so a
+                                    // set bit means taken: no MOVF reload.
+                                    None if g.bool_temps.contains(r) => {
+                                        g.emit(format!("    BTFSS 0x{ca:02X}, 0"));
                                         g.emit(format!("    GOTO {lf}"));
                                         g.emit(format!("    GOTO {lt}"));
                                     }
@@ -7248,6 +7393,7 @@ pub fn select_with_locs(
                 scratch,
                 retval_lo,
                 cur_func: &f.name,
+                bool_temps: HashSet::new(),
                 tmp: &mut tmp,
                 page_of: None,
                 w_holds: None,
@@ -7538,6 +7684,7 @@ pub fn select_with_locs(
                     scratch,
                     retval_lo,
                     cur_func: &f.name,
+                    bool_temps: HashSet::new(),
                     tmp: &mut tmp,
                     page_of: Some(&pages),
                     w_holds: None,

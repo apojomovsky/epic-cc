@@ -531,17 +531,85 @@ fn brcond_and_select_emit_skip_lines() {
     ]);
     let asm = select(&PIC16F877A, &m, &addrs);
     // %1=0x25, %c=0x26, %s=0x27, scratch=0x22 (end_of_globals: 0x20+1, 0x21+1 -> 0x22).
-    // brcond: cond==0 -> main_Lend (f), cond!=0 -> main_Lthen (t).
-    assert!(asm.contains("MOVF 0x26, W"), "brcond reads cond:\n{asm}");
-    assert!(asm.contains("BTFSC STATUS, 2"), "brcond Z test:\n{asm}");
-    assert!(asm.contains("GOTO main_Lend"), "brcond f:\n{asm}");
-    assert!(asm.contains("GOTO main_Lthen"), "brcond t:\n{asm}");
+    // brcond: cond==0 -> main_Lend (f), cond!=0 -> main_Lthen (t). %c is an
+    // icmp 0/1 byte used twice (select, branch), so no collapse; the
+    // branch still tests its bit 0 with no reload.
+    assert_branch(&asm, "BTFSS 0x26, 0", "main_Lend", "main_Lthen");
     // select: test cond, jump to else, copy a=10 then b=20.
     assert!(asm.contains("GOTO tmp0"), "select else jump:\n{asm}");
     assert!(asm.contains("MOVLW 0x0A"), "select copy a:\n{asm}");
     assert!(asm.contains("MOVWF 0x27"), "select dst:\n{asm}");
     assert!(asm.contains("GOTO tmp1"), "select end jump:\n{asm}");
     assert!(asm.contains("MOVLW 0x14"), "select copy b:\n{asm}");
+}
+
+/// The emitted lines after a bit-test skip must be the false-target GOTO
+/// then the true-target GOTO, in that order: asserting presence alone
+/// cannot catch an inverted branch.
+fn assert_branch(asm: &str, skip: &str, f: &str, t: &str) {
+    let lines: Vec<&str> = asm.lines().map(str::trim_start).collect();
+    let pos = lines.iter().position(|l| *l == skip).expect(skip);
+    assert_eq!(lines[pos + 1], format!("GOTO {f}"), "branch f:\n{asm}");
+    assert_eq!(lines[pos + 2], format!("GOTO {t}"), "branch t:\n{asm}");
+}
+
+#[test]
+fn brcond_on_bool_byte_at_distance_skips_reload() {
+    // An unrelated store sits between the icmp materialize and its
+    // branch, clearing the adjacent-only trackers; the 0/1 byte still
+    // branches with no reload.
+    let m = parse(
+        "global in i8\nglobal out i8\nglobal other i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %c = icmp eq i8 %1, 1\n    store i8 %1 @other\n    br i1 %c then end\n  block then:\n    store i8 %1 @out\n    br end\n  block end:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("other", 0x22),
+        ("main::1", 0x25),
+        ("main::c", 0x26),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_branch(&asm, "BTFSS 0x26, 0", "main_Lend", "main_Lthen");
+    assert!(asm.contains("MOVWF 0x22"), "other store kept:\n{asm}");
+}
+
+#[test]
+fn brcond_on_non_bool_byte_still_reloads() {
+    // A trunc-normalized cond is not an icmp materialize: the branch
+    // must reload and test Z as before.
+    let m = parse(
+        "global in i16\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i16 @in\n    %t = trunc i16 %1 to i1\n    br i1 %t then end\n  block then:\n    store i8 1 @out\n    br end\n  block end:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x22),
+        ("main::1", 0x25),
+        ("main::t", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert!(asm.contains("MOVF 0x27, W"), "brcond reloads cond:\n{asm}");
+    assert!(asm.contains("BTFSC STATUS, 2"), "brcond Z test:\n{asm}");
+}
+
+#[test]
+fn brcond_collapses_adjacent_and_icmp_triple() {
+    // Adjacent and-single-bit, icmp-eq-0, brcond with a shared snapshot:
+    // the AND, the compare, and the materialize all vanish, leaving the
+    // direct bit test.
+    let m = parse(
+        "global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %f = load i8 @in\n    %a = and i8 %f, 4\n    %c = icmp eq i8 %a, 0\n    br i1 %c then end\n  block then:\n    store i8 %f @out\n    br end\n  block end:\n    ret void\n",
+    );
+    let addrs = addrs(&[
+        ("in", 0x20),
+        ("out", 0x21),
+        ("main::f", 0x25),
+        ("main::a", 0x26),
+        ("main::c", 0x27),
+    ]);
+    let asm = select(&PIC16F877A, &m, &addrs);
+    assert_branch(&asm, "BTFSS 0x25, 2", "main_Lend", "main_Lthen");
+    assert!(!asm.contains("ANDLW 0x04"), "AND skipped:\n{asm}");
+    assert!(!asm.contains("MOVWF 0x27"), "materialize skipped:\n{asm}");
 }
 
 #[test]
