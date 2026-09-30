@@ -36,6 +36,7 @@ const USER_PATTERNS: &[&str] = &[
     "exceeds device flash",
     "not supported",
     "unsupported",
+    "init-once guard",
 ];
 
 /// Whether a panic payload is a deliberate user error, not a bug.
@@ -237,7 +238,7 @@ mod tests {
             "isel: post-banking page-fit failure: f spans pages (0x1000-0x1800)"
         ));
         assert!(is_user_error(
-            "asm: program of 8200 words exceeds device flash (highest address 0x4000)"
+            "legalize: function-local static in `touch` is reachable from ISR context; the init-once guard cannot be trusted there"
         ));
     }
 

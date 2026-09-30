@@ -2238,3 +2238,45 @@ fn delay_call_collects_no_callees() {
         .expect("_delay call");
     assert!(call.callees.is_empty(), "_delay must keep no callees");
 }
+
+/// EC++ function-local statics (#458): the trivialized guard sequence is
+/// not re-entrant, so a guard reachable from ISR context panics loudly
+/// instead of double-initializing. Here the ISR calls the guarded helper
+/// transitively.
+#[test]
+#[should_panic(expected = "init-once guard cannot be trusted")]
+fn isr_context_touching_guard_panics_loudly() {
+    let m = parse(
+        "global _ZGVg i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             ret void\n\
+         fn helper(void) ()\n\
+           block entry:\n\
+             %t = load i8 @_ZGVg\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             call void @helper()\n\
+             ret void\n",
+    );
+    let _ = legalize(m);
+}
+
+/// The same guard touched from the main context only is fine, even with
+/// an unrelated ISR present.
+#[test]
+fn main_context_guard_touch_passes() {
+    let m = parse(
+        "global _ZGVg i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %t = load i8 @_ZGVg\n\
+             ret void\n\
+         fn isr(void) [isr] ()\n\
+           block entry:\n\
+             ret void\n",
+    );
+    let m2 = legalize(m);
+    assert!(m2.funcs.iter().any(|f| f.name == "main"));
+}

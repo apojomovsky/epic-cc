@@ -56,6 +56,67 @@ fn has_volatile_marker(arg: &str) -> bool {
     arg.split_whitespace().any(|t| t == "volatile")
 }
 
+/// Lower a `__cxa_guard_acquire`/`__cxa_guard_release` call to the
+/// trivialized init-once sequence (epic-cc#458). The guard word starts
+/// zeroed, so acquire reads its first byte inverted into the call's i16
+/// result (nonzero means run the init) and release marks it done. The
+/// `i16` result width is the target's `int` width, pinned by the driver.
+/// The frontend-emitted `icmp`/`br` around the call is untouched.
+fn lower_guard_call(
+    func: &str,
+    args_str: &str,
+    dst: Option<String>,
+    fresh: &mut Fresh,
+    cur: Option<SrcLoc>,
+    out: &mut Vec<Inst>,
+) {
+    let guard = args_str
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .next_back()
+        .unwrap_or("")
+        .trim_start_matches('@');
+    let ptr = format!("@{guard}");
+    if func == "__cxa_guard_acquire" {
+        let t0 = fresh.tmp();
+        let t1 = fresh.tmp();
+        let d = dst.expect("irparse: guard acquire must define a value");
+        out.push(Inst::Load(Load {
+            dst: t0.clone(),
+            ty: Ty::I8,
+            ptr: ptr.clone(),
+            ptr_ty: false,
+            volatile: false,
+            loc: cur.clone(),
+        }));
+        out.push(Inst::Bin(Bin {
+            dst: t1.clone(),
+            op: BinOp::Xor,
+            ty: Ty::I8,
+            a: Val::Reg(t0),
+            b: Val::Const(1),
+            loc: cur.clone(),
+        }));
+        out.push(Inst::Zext(Zext {
+            dst: d,
+            from: Ty::I8,
+            val: Val::Reg(t1),
+            to: Ty::I16,
+            loc: cur,
+        }));
+    } else {
+        out.push(Inst::Store(Store {
+            ty: Ty::I8,
+            val: Val::Const(1),
+            ptr,
+            volatile: false,
+            loc: cur,
+        }));
+    }
+}
+
 fn ty_of(s: &str, loc: Option<&SrcLoc>) -> Ty {
     // Attribute-decorated operand types arrive whole (`ptr noundef`,
     // `range(i16 -255, 256)`): key off the leading type token.
@@ -1304,6 +1365,98 @@ fn resolve_aliases_and_reject(funcs: &mut [Func], aliases: &HashMap<String, Stri
     }
 }
 
+/// Collect `@llvm.global_ctors` entries as `(priority, function)` in
+/// priority order (epic-cc#458). Each entry is `{ i32 <prio>, ptr @f,
+/// ptr <data> }`; an empty table (`[0 x ...] zeroinitializer`, what -O1
+/// leaves when every ctor folded) yields no entries. Names are bare
+/// (no `@`), matching `Func.name`.
+fn build_ctor_list(src: &str) -> Vec<String> {
+    let mut entries: Vec<(i32, String)> = Vec::new();
+    for line in src.lines() {
+        let l = line.trim();
+        if !l.starts_with("@llvm.global_ctors") {
+            continue;
+        }
+        for seg in l.split('{') {
+            let s = seg.trim();
+            if !s.starts_with("i32 ") {
+                continue;
+            }
+            let mut it = s.split(',');
+            let prio: i32 = it
+                .next()
+                .unwrap_or("")
+                .trim()
+                .strip_prefix("i32 ")
+                .unwrap_or("")
+                .trim()
+                .parse()
+                .unwrap_or(i32::MAX);
+            let name = it
+                .next()
+                .unwrap_or("")
+                .trim()
+                .strip_prefix("ptr @")
+                .unwrap_or("")
+                .trim_matches('"')
+                .to_string();
+            if prio != i32::MAX && !name.is_empty() {
+                entries.push((prio, name));
+            }
+        }
+    }
+    entries.sort();
+    entries.into_iter().map(|(_, name)| name).collect()
+}
+
+/// Run static constructors before `main` and erase `__cxa_atexit` calls
+/// (epic-cc#458). The entry is `main`, or the lone C++ `_Z4mainv` when
+/// no plain `main` exists yet: irparse runs before wholeprog's rename,
+/// so the rule mirrors `wholeprog::map_cpp_entry`. With no entry the
+/// pass does nothing and wholeprog's entry check fires as today.
+/// Erasure is what the reset model requires: reset clears RAM and
+/// reruns constructors, so prior dtors must not run.
+fn run_ctors_and_erase_atexit(funcs: &mut [Func], ctors: &[String]) {
+    for f in funcs.iter_mut() {
+        for b in f.blocks.iter_mut() {
+            b.insts.retain(|i| match i {
+                Inst::Call(c) => c.func != "__cxa_atexit",
+                _ => true,
+            });
+        }
+    }
+    if ctors.is_empty() {
+        return;
+    }
+    let idx = funcs.iter().position(|f| f.name == "main").or_else(|| {
+        let mut hits = funcs
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.name == "_Z4mainv");
+        match (hits.next(), hits.next()) {
+            (Some((i, _)), None) => Some(i),
+            _ => None,
+        }
+    });
+    let Some(idx) = idx else {
+        return;
+    };
+    let calls: Vec<Inst> = ctors
+        .iter()
+        .map(|c| {
+            Inst::Call(Call {
+                dst: None,
+                ty: None,
+                func: c.clone(),
+                args: Vec::new(),
+                callees: Vec::new(),
+                loc: None,
+            })
+        })
+        .collect();
+    funcs[idx].blocks[0].insts.splice(0..0, calls);
+}
+
 /// Generates fresh registers for synthesized (materialized) GEP insts.
 /// Pre-seeds with every `%name` in the module so `__gep<N>` avoids collision.
 struct Fresh {
@@ -1362,6 +1515,18 @@ impl Fresh {
         loop {
             self.counter += 1;
             let n = format!("__scmp{}", self.counter);
+            if !self.used.contains(&n) {
+                self.used.insert(n.clone());
+                return n;
+            }
+        }
+    }
+    /// Fresh SSA temporary for synthesized (non-GEP) instructions: the
+    /// guard-init lowering's load/xor pair (epic-cc#458).
+    fn tmp(&mut self) -> String {
+        loop {
+            self.counter += 1;
+            let n = format!("__tmp{}", self.counter);
             if !self.used.contains(&n) {
                 self.used.insert(n.clone());
                 return n;
@@ -2357,6 +2522,7 @@ pub fn parse_ll(src: &str) -> Module {
 pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
     let types = build_struct_table(src);
     let aliases = build_alias_map(src);
+    let ctors = build_ctor_list(src);
     let mut fresh = Fresh::new(src);
     let attr_map = build_attr_map(src);
     let dbg = build_debug_info(src);
@@ -2872,6 +3038,7 @@ pub fn parse_ll_opts(src: &str, preserve_dense_switches: bool) -> Module {
         }
     }
     resolve_aliases_and_reject(&mut funcs, &aliases);
+    run_ctors_and_erase_atexit(&mut funcs, &ctors);
     Module {
         globals,
         funcs,
@@ -3158,7 +3325,9 @@ fn parse_inst(
                 .trim_start_matches('%')
                 .to_string();
             let args_str = balanced_inner(&body[open + 1..]).unwrap();
-            if func.starts_with("llvm.memcpy.p0.p0") {
+            if func == "__cxa_guard_acquire" || func == "__cxa_guard_release" {
+                lower_guard_call(&func, &args_str, dst.clone(), fresh, cur.clone(), &mut out);
+            } else if func.starts_with("llvm.memcpy.p0.p0") {
                 let a = split_top_level(args_str, ',');
                 let dst = parse_call_ptr_val(a[0], types, fresh, &mut out, cur.as_ref());
                 let src = parse_call_ptr_val(a[1], types, fresh, &mut out, cur.as_ref());
