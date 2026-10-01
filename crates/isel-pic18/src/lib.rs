@@ -406,6 +406,11 @@ impl<'m> Gen<'m> {
     /// Falls back to the staged `emit_copy_byte` otherwise, so a long run
     /// of ordinary copies still drains as one LFSR-seeded loop.
     fn emit_copy_byte_or_w(&mut self, src: u16, dst: u16) {
+        // A homed call arg (epic-cc#830) already lives at `dst`: the
+        // W shortcut below would emit a redundant one-word self-store.
+        if src == dst {
+            return;
+        }
         if self.w_holds == Some(src) && !self.global_addrs.contains(&src) {
             // The shortcut still writes `dst`, and a byte write to a
             // pointer slot must invalidate a tracked FSR0 grounded in it;
