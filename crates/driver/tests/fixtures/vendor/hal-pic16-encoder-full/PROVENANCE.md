@@ -1,8 +1,7 @@
 # Provenance
 
 Vendored from `apojomovsky/epic-hal` at commit
-`67849038f1337303b8cf17b003da3bb1740fc3aa` (origin/master on
-2026-09-30): the `epic-encoder` module's full example on `PIC16F87XA`
+`51a048421ca28ebf539251957b895946ade680b8` (origin/master on 2026-10-01): the `epic-encoder` module's full example on `PIC16F87XA`
 (target `16F877A`), exactly the combination epic-cc#193 used to
 measure and fix the codegen-density gap, refreshed for the size
 ladder (epic-cc#836).

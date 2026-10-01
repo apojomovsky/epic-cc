@@ -1,8 +1,7 @@
 # Provenance
 
 Vendored from `apojomovsky/epic-hal` at commit
-`67849038f1337303b8cf17b003da3bb1740fc3aa` (origin/master on
-2026-09-30), the `epic-control-demo` module's sim variant on
+`51a048421ca28ebf539251957b895946ade680b8` (origin/master on 2026-10-01), the `epic-control-demo` module's sim variant on
 `18F4550` (epic-cc toolchain file set), for the size ladder
 (epic-cc#836).
 

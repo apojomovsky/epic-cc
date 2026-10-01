@@ -1,8 +1,7 @@
 # Provenance
 
 Shared snapshot from `apojomovsky/epic-hal` at commit
-`67849038f1337303b8cf17b003da3bb1740fc3aa` (origin/master on
-2026-09-30): every file below is byte-identical to that commit
+`51a048421ca28ebf539251957b895946ade680b8` (origin/master on 2026-10-01): every file below is byte-identical to that commit
  (epic-cc#836). The PIC18 demo fixtures that use it
 (`hal-pic18-menu-demo`, `hal-pic18-control-demo`, `hal-pic18-pid`,
 `hal-pic18-bridge-demo` on `18F4550`, epic-cc toolchain file sets)
