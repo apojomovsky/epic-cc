@@ -37,12 +37,15 @@ gated off. The probes stayed out of the tree.
 
 Fixed is 4 bytes of retval/flag plus the 12-byte ISR save on every
 demo; all four have an ISR. Menu, control, and pid place the overlay
-frames-first below the globals. Bridge keeps globals-first:
-pinned peripheral mirrors starting at `0x010` (`EPIC_PLACE` timer, SSP,
-USART, and ADC handle storage the bridge demo owns) sit inside any
-frames-first overlay span, so the fallback fires and the overlay starts
-at `0x399`. Order moves no demand, only its position, so this costs
-bridge nothing; it only explains the shape.
+frames-first below the globals. Bridge keeps globals-first: the only
+pinned global in any demo is `g_tasks` at `0x110`
+(`.epicat.0x110`, the task table), and a pin inside the overlay span
+forces the fallback. Menu's frames-first span ends at `0x010` + 229 =
+`0x0F5`, below the pin, so it stays; bridge's would reach `0x010` + 391
+= `0x197`, swallowing the pin, so the `g.addr < top` filter fires and
+the overlay starts above the globals at `0x399`. Order moves no demand,
+only its position, so this costs bridge nothing; it only explains the
+shape.
 
 - menu (208): main 10/0, menu_demo_init 119/55, redraw 19/0,
   redraw_status 23/0, epic_lcd_print 10/0, gpio4_delay_us 9/0,
@@ -60,12 +63,14 @@ bridge nothing; it only explains the shape.
 
 ## Attribution and priced levers
 
-Full-interval objects (byval/sret params, allocas, va regions take a
-whole-function slot today) on the deepest path: menu 65B, control 10B,
-pid 0B, bridge 85B. Whole-program totals are 129/118/32/180B. Filed as
-the precise-live-ranges ticket; the numbers are upper bounds, since a
-byval copy co-live with its caller needs an ABI design (#737), not only
-coloring.
+Full-interval objects (allocas and va regions take a whole-function
+slot today) on the deepest path: menu 65B, control 10B, pid 0B, bridge
+85B. Whole-program totals are 129/118/32/180B. Byval has 0 sites in all
+four post-opt modules and sret params hold about 2B per divmod helper
+off every depth path (#737), so the filed precise-live-ranges ticket
+prices alloca and va only. The numbers are upper bounds: part of menu's
+55B is the 22B CCP-handle alloca #795 proved live across its call and
+therefore unshrinkable by interval work.
 
 The remaining path width is simultaneous liveness under linear block
 order, concentrated in a few named frames: console_rx_byte 86B,
@@ -85,20 +90,23 @@ Flag globals: 11/11/10/10 one-byte scalars per demo, all `unsigned
 char`, no C `bool`. Packing every flag bit saves at most about 10B per
 demo; the realistic set (dirty/done bits, not ring indices) is smaller.
 Narrowing candidates are the 3/18/14/3 `unsigned short` scalars plus
-peripheral mirrors, pending range proofs. One ticket covers both, priced
+peripheral-storage scalars, pending range proofs. One ticket covers both, priced
 small on purpose.
 
-Not levers, recorded so nobody re-prices them: GEP-base propagation
-ablates to 0-1B per demo. Routine rounding leaves no gap anywhere (no
-frame base sits past its callers' physical ends). The four-byte retval
-region is owned by open ticket #738, which is RAM-neutral. The
+Not levers, recorded so nobody re-prices them: init-once subtree
+sharing is withdrawn (#794: shared callees couple via max-caller-end,
+control share 0), and the 21B menu gap is a live-across-call alloca,
+not slack (#795). GEP-base propagation ablates to 0-1B per demo.
+Routine rounding leaves no gap anywhere (no frame base sits past its
+callers' physical ends). The four-byte retval region is owned by open
+ticket #738, which is RAM-neutral. The
 const-to-RAM survivors (`.str` 2B menu, `.str.17` 2B control, two 15B
 pid strings) are the set #779 pinned as required; the 12B `s_fmt_buf`
 copies are writable format scratch, which is source demand.
 
 ## Recommendation (filed as tickets)
 
-- Precise live ranges for byval, sret, alloca, and va slots
+- Precise live ranges for alloca and va slots
   (path bounds 65/10/0/85B, whole-program 129/118/32/180B).
 - Shrink the named wide frames (86/59/87/64/40/27B upper bounds;
   loop extension measured at 1-16B inside those).
