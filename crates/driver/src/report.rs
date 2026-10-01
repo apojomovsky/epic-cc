@@ -255,12 +255,17 @@ pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
 /// common-RAM scratch (1, always) + the touched retval bytes from
 /// `fixed_uses`, plus the ISR save area (9) when the program has an ISR.
 /// PIC18's touched retval/flag bytes (the flag shares byte 0), plus the
-/// ISR save area (12) when present. Layout constants live in isel
+/// ISR save area (12) when present. Every ISR prologue saves and
+/// restores all 4 retval bytes, so `has_isr` forces the full count even
+/// when the scan finds nothing. Layout constants live in isel
 /// (crates/isel/src/lib.rs, crates/isel-pic18/src/lib.rs).
 pub fn fixed_bytes(device: &Device, has_isr: bool, uses: &FixedUses) -> u16 {
+    // The retval bytes the scan found, or all 4: the ISR prologue saves
+    // and restores the whole region on every entry, touched or not.
+    let touched = if has_isr { 4 } else { uses.retval_bytes.min(4) };
     match device.core {
         device::Core::Pic14 | device::Core::Pic14e => {
-            let base = 1 + u16::from(uses.retval_bytes.min(4)); // scratch + retval
+            let base = 1 + u16::from(touched); // scratch + retval
             if has_isr {
                 // The ISR save area (W/STATUS/PCLATH/FSR/retval x4/scratch
                 // = 9 bytes) sits right after the retval region.
@@ -272,7 +277,7 @@ pub fn fixed_bytes(device: &Device, has_isr: bool, uses: &FixedUses) -> u16 {
         device::Core::Pic18 => {
             // The flag bit lives in retval byte 0, so it only raises an
             // otherwise empty count to 1.
-            let base = u16::from(uses.retval_bytes.min(4)).max(u16::from(uses.flag));
+            let base = u16::from(touched).max(u16::from(uses.flag));
             if has_isr {
                 base + 12
             } else {
@@ -421,7 +426,7 @@ pub fn report_json(
         })
         .collect();
     format!(
-        "{{\n  \"version\": 1,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
+        "{{\n  \"version\": 2,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
         json_str(device.name),
         device.flash_words,
         device.config.base_byte_addr,

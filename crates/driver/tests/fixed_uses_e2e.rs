@@ -32,6 +32,10 @@ fn cases() -> Vec<Case> {
         ("shift", "size-bench/bench-shift.c"),
         ("struct-copy", "size-bench/bench-struct-copy.c"),
         ("delay", "delay.c"),
+        // An ISR prologue saves all 4 retval bytes even with no valued
+        // call in the module: the one shape the IR scan cannot see, so
+        // `fixed_bytes` forces the full count under `has_isr`.
+        ("fsr1-isr", "fsr1_isr.c"),
     ];
     let pic14 = [
         ("add", "add.c"),

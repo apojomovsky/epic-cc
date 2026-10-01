@@ -139,7 +139,7 @@ ram_bytes = 14
 name = "hal-pic16-blink-16f877a"
 device = "16F877A"
 flash_words = 471
-ram_bytes = 44
+ram_bytes = 47
 
 [[entry]]
 name = "hal-pic18-blink-18f4550"
