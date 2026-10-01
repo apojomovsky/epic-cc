@@ -7,127 +7,133 @@
 name = "add-16f877a"
 device = "16F877A"
 flash_words = 12
-ram_bytes = 9
+ram_bytes = 5
 
 [[entry]]
 name = "add-18f4550"
 device = "18F4550"
 flash_words = 18
-ram_bytes = 8
+ram_bytes = 4
 
 [[entry]]
 name = "bench-shift-18f4550"
 device = "18F4550"
 flash_words = 88
-ram_bytes = 26
+ram_bytes = 22
 
 [[entry]]
 name = "bench-wide-const-18f4550"
 device = "18F4550"
 flash_words = 23
-ram_bytes = 10
+ram_bytes = 6
 
 [[entry]]
 name = "bench-zero-init-18f4550"
 device = "18F4550"
 flash_words = 25
-ram_bytes = 16
+ram_bytes = 12
 
 [[entry]]
 name = "bench-struct-copy-18f4550"
 device = "18F4550"
 flash_words = 37
-ram_bytes = 51
+ram_bytes = 47
 
 [[entry]]
 name = "bench-switch-18f4550"
 device = "18F4550"
 flash_words = 66
-ram_bytes = 9
+ram_bytes = 5
 
 [[entry]]
 name = "bench-bool-18f4550"
 device = "18F4550"
 flash_words = 37
+ram_bytes = 5
+
+[[entry]]
+name = "bench-const-sub-18f4550"
+device = "18F4550"
+flash_words = 29
 ram_bytes = 9
 
 [[entry]]
 name = "bench-dead-store-18f4550"
 device = "18F4550"
 flash_words = 19
-ram_bytes = 8
+ram_bytes = 4
 
 [[entry]]
 name = "bench-w-roundtrip-18f4550"
 device = "18F4550"
 flash_words = 20
-ram_bytes = 10
+ram_bytes = 6
 
 [[entry]]
 name = "bench-bank-18f4550"
 device = "18F4550"
 flash_words = 33
-ram_bytes = 15
+ram_bytes = 11
 
 [[entry]]
 name = "bench-handle-init-18f4550"
 device = "18F4550"
 flash_words = 23
-ram_bytes = 9
+ram_bytes = 5
 
 [[entry]]
 name = "bench-switch-calls-18f4550"
 device = "18F4550"
 flash_words = 49
-ram_bytes = 10
+ram_bytes = 6
 
 [[entry]]
 name = "bench-u32-loop-18f4550"
 device = "18F4550"
 flash_words = 68
-ram_bytes = 23
+ram_bytes = 19
 
 [[entry]]
 name = "bench-u16-dec-18f4550"
 device = "18F4550"
 flash_words = 109
-ram_bytes = 33
+ram_bytes = 31
 
 [[entry]]
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
 flash_words = 109
-ram_bytes = 99
+ram_bytes = 95
 
 [[entry]]
 name = "bench-struct-scan-16f877a"
 device = "16F877A"
 flash_words = 168
-ram_bytes = 108
+ram_bytes = 104
 
 [[entry]]
 name = "bench-plusw-18f4550"
 device = "18F4550"
 flash_words = 42
-ram_bytes = 27
+ram_bytes = 23
 
 [[entry]]
 name = "bench-branch-computed-18f4550"
 device = "18F4550"
 flash_words = 42
-ram_bytes = 9
+ram_bytes = 5
 
 [[entry]]
 name = "bench-bitmask-18f4550"
 device = "18F4550"
 flash_words = 64
-ram_bytes = 20
+ram_bytes = 16
 
 [[entry]]
 name = "bench-hoist-18f4550"
 device = "18F4550"
 flash_words = 116
-ram_bytes = 18
+ram_bytes = 14
 
 [[entry]]
 name = "hal-pic16-blink-16f877a"
@@ -139,7 +145,7 @@ ram_bytes = 47
 name = "hal-pic18-blink-18f4550"
 device = "18F4550"
 flash_words = 331
-ram_bytes = 34
+ram_bytes = 32
 
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
@@ -170,28 +176,28 @@ name = "add-16f877a"
 device = "16F877A"
 profile = "O2"
 flash_words = 12
-ram_bytes = 9
+ram_bytes = 5
 
 [[entry]]
 name = "add-18f4550"
 device = "18F4550"
 profile = "O2"
 flash_words = 18
-ram_bytes = 8
+ram_bytes = 4
 
 [[entry]]
 name = "bench-struct-scan-18f4550"
 device = "18F4550"
 profile = "O2"
 flash_words = 131
-ram_bytes = 99
+ram_bytes = 95
 
 [[entry]]
 name = "bench-struct-scan-16f877a"
 device = "16F877A"
 profile = "O2"
 flash_words = 168
-ram_bytes = 108
+ram_bytes = 104
 
 [[entry]]
 name = "hal-pic16-encoder-full-16f877a"
@@ -204,5 +210,5 @@ ram_bytes = 339
 name = "hal-pic18-menu-demo-18f4550"
 device = "18F4550"
 profile = "O2"
-flash_words = 10291
+flash_words = 10117
 ram_bytes = 785

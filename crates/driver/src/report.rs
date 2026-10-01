@@ -2,14 +2,17 @@
 //!
 //! "RAM used" is the bytes of RAM the program's allocation occupies: the
 //! per-bank high-water marks from the overlay layout plus the fixed
-//! scratch/retval/ISR-save region isel reserves. Overlay allocation makes
-//! this less obvious than on a stack machine, since a byte can be live in
-//! several frames, so the report states the definition on the line.
+//! scratch/retval/ISR-save bytes the emitted code can touch. The fixed
+//! part counts use, not reservation: a program with no calls leaves the
+//! retval region idle, like the ISR save area with no ISR. Overlay
+//! allocation makes this less obvious than on a stack machine, since a
+//! byte can be live in several frames, so the report states the
+//! definition on the line.
 
 use super::sidecar;
 use alloc::AllocLayout;
 use device::Device;
-use ir::SrcLoc;
+use ir::{BinOp, Inst, MemLen, Module, SrcLoc, Val};
 use irparse::DebugVars;
 
 /// The address-to-source-line table: one `file:line:col <addr>` record per
@@ -122,15 +125,147 @@ pub fn var_table_text(device: &Device, layout: &AllocLayout, vars: &DebugVars) -
     out
 }
 
-/// The fixed bytes isel reserves outside the overlay: PIC14's common-RAM
-/// scratch (1) + retval (4), plus the ISR save area (9) when the program
-/// has an ISR. PIC18's access-bank retval/flag region (4), plus the ISR
-/// save area (12) when the program has an ISR. These are isel's layout
-/// constants (crates/isel/src/lib.rs, crates/isel-pic18/src/lib.rs).
-pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
+/// How much of the fixed region the emitted program can touch.
+/// `retval_bytes` is the widest touched retval byte count; `flag` is the
+/// PIC18 borrow-chain spill bit in retval byte 0 (it shares the byte, so
+/// it only ever raises the count to 1). PIC14 scratch stays out: it is
+/// always counted, its uses are too broad to mirror cheaply.
+pub struct FixedUses {
+    pub retval_bytes: u8,
+    pub flag: bool,
+}
+
+/// The fixed bytes the module's lowering can touch, per core. Every arm
+/// mirrors an isel emission site, so a site missing here undercounts RAM:
+/// the `fixed_uses` e2e test scans emitted asm for fixed-range refs over
+/// the fixture corpus and fails any row the scan beats. Verbatim inline
+/// asm is outside the model: it can name any byte, fixed or otherwise.
+/// Each predicate fires on shapes that MIGHT touch, so misses default
+/// to counted.
+///
+/// PIC18 (isel-pic18): valued calls load `retval_lo..`, `Ret` stores the
+/// same width, the `k - a` chain parks C0 in the flag bit, `_delay`
+/// counts in `retval_lo..`. Mul/div/float bodies write their own result,
+/// covered by their return. i64 never reaches a backend (irparse rejects
+/// it), so widths above 4 cap in `fixed_bytes`.
+///
+/// PIC14/PIC14E (isel, isel-pic14e): same call/return widths, plus the
+/// dynamic-memcpy counters (2, constant lengths unroll), the `_delay`
+/// counters, the large-const-table index (1, tables over 255 bytes), and
+/// the signed-wide-compare spill (1, unsigned chains fold in place).
+pub fn fixed_uses(module: &Module, core: device::Core) -> FixedUses {
+    let mut retval: u8 = 0;
+    let mut flag = false;
+    let mut delay: u8 = 0;
+    let mut memcpy = false;
+    let mut big_table = false;
+    let mut wide_icmp = false;
+    for f in &module.funcs {
+        if let Some(t) = f.ret {
+            retval = retval.max(t.bytes());
+        }
+        for b in &f.blocks {
+            for inst in &b.insts {
+                match inst {
+                    Inst::Ret(Some((t, _)), _) => {
+                        retval = retval.max(t.bytes());
+                    }
+                    Inst::Call(c) => {
+                        if let Some(t) = c.ty {
+                            retval = retval.max(t.bytes());
+                        }
+                        if c.func == "_delay" && c.callees.is_empty() {
+                            match c.args.as_slice() {
+                                [a] => match a.val {
+                                    Val::Const(n) if n >= 0 => {
+                                        let plan = iselcore::delay::plan_delay(n as u64);
+                                        let d = plan.nests.iter().map(Vec::len).max().unwrap_or(0)
+                                            as u8;
+                                        delay = delay.max(d);
+                                    }
+                                    // isel rejects these shapes, so the
+                                    // build fails before any report prints.
+                                    _ => delay = delay.max(3),
+                                },
+                                _ => delay = delay.max(3),
+                            }
+                        } else if c.func == "_delay" {
+                            delay = delay.max(3);
+                        }
+                    }
+                    Inst::Bin(bin) => {
+                        if core == device::Core::Pic18
+                            && bin.op == BinOp::Sub
+                            && bin.ty.bytes() > 1
+                            && matches!(bin.a, Val::Const(_))
+                        {
+                            flag = true;
+                        }
+                    }
+                    Inst::Memcpy(m) => {
+                        // A constant length unrolls per byte with no
+                        // counters; only the dynamic loop borrows them.
+                        if matches!(m.len, MemLen::Reg(_)) {
+                            memcpy = true;
+                        }
+                    }
+                    Inst::Icmp(ic) => {
+                        // Only the signed high byte spills into the temp;
+                        // unsigned wide chains fold in place.
+                        if ic.ty.bytes() > 1
+                            && matches!(ic.pred.as_str(), "slt" | "sle" | "sgt" | "sge")
+                        {
+                            wide_icmp = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    if module.globals.iter().any(|g| g.is_const && g.size > 255) {
+        big_table = true;
+    }
+    match core {
+        device::Core::Pic18 => FixedUses {
+            retval_bytes: retval.max(delay),
+            flag,
+        },
+        device::Core::Pic14 | device::Core::Pic14e => {
+            let mut r = retval.max(delay);
+            if memcpy {
+                r = r.max(2);
+            }
+            if big_table || wide_icmp {
+                r = r.max(1);
+            }
+            FixedUses {
+                retval_bytes: r,
+                flag: false,
+            }
+        }
+        device::Core::PicBaseline => FixedUses {
+            retval_bytes: 4,
+            flag: true,
+        },
+    }
+}
+
+/// The fixed bytes the program occupies outside the overlay: PIC14's
+/// common-RAM scratch (1, always) + the touched retval bytes from
+/// `fixed_uses`, plus the ISR save area (9) when the program has an ISR.
+/// PIC18's touched retval/flag bytes (the flag shares byte 0), plus the
+/// ISR save area (12) when present. Every ISR prologue saves and
+/// restores all 4 retval bytes, so `has_isr` forces the full count even
+/// when the scan finds nothing. Layout constants live in isel
+/// (crates/isel/src/lib.rs, crates/isel-pic18/src/lib.rs).
+pub fn fixed_bytes(device: &Device, has_isr: bool, uses: &FixedUses) -> u16 {
+    // The retval bytes the scan found, or all 4: the ISR prologue saves
+    // and restores the whole region on every entry, touched or not.
+    let touched = if has_isr { 4 } else { uses.retval_bytes.min(4) };
     match device.core {
         device::Core::Pic14 | device::Core::Pic14e => {
-            let base = 1 + 4; // scratch + retval
+            let base = 1 + u16::from(touched); // scratch + retval
             if has_isr {
                 // The ISR save area (W/STATUS/PCLATH/FSR/retval x4/scratch
                 // = 9 bytes) sits right after the retval region.
@@ -140,7 +275,9 @@ pub fn fixed_bytes(device: &Device, has_isr: bool) -> u16 {
             }
         }
         device::Core::Pic18 => {
-            let base = 4; // retval + flag bit
+            // The flag bit lives in retval byte 0, so it only raises an
+            // otherwise empty count to 1.
+            let base = u16::from(touched).max(u16::from(uses.flag));
             if has_isr {
                 base + 12
             } else {
@@ -193,14 +330,14 @@ pub fn fixed_total(device: &Device) -> u16 {
 
 /// RAM `(used, total)` in bytes: every GPR bank plus the fixed region, the
 /// same definition the size report states on its RAM line.
-pub fn ram_usage(device: &Device, layout: &AllocLayout) -> (u16, u16) {
+pub fn ram_usage(device: &Device, layout: &AllocLayout, uses: &FixedUses) -> (u16, u16) {
     let total = device
         .ram_banks
         .iter()
         .map(|&(s, e)| e - s + 1)
         .sum::<u16>()
         + fixed_total(device);
-    let used = layout.bank_used.iter().sum::<u16>() + fixed_bytes(device, layout.has_isr);
+    let used = layout.bank_used.iter().sum::<u16>() + fixed_bytes(device, layout.has_isr, uses);
     (used, total)
 }
 
@@ -249,12 +386,13 @@ fn json_str(s: &str) -> String {
 pub fn report_json(
     device: &Device,
     layout: &AllocLayout,
+    uses: &FixedUses,
     flash_used: usize,
     config: Option<&[u8]>,
     clock_hz: u64,
     opt_level: &str,
 ) -> String {
-    let (ram_used, ram_total) = ram_usage(device, layout);
+    let (ram_used, ram_total) = ram_usage(device, layout, uses);
     // With no configuration the HEX carries no config words, so the part
     // keeps its erased state. The baseline is that state on PIC14-family
     // parts; on PIC18 it is gpasm's all-ones fill, not the silicon default
@@ -291,7 +429,7 @@ pub fn report_json(
         })
         .collect();
     format!(
-        "{{\n  \"version\": 1,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"opt_level\": \"{opt_level}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
+        "{{\n  \"version\": 2,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"opt_level\": \"{opt_level}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
         json_str(device.name),
         device.flash_words,
         device.config.base_byte_addr,
@@ -301,7 +439,12 @@ pub fn report_json(
 
 /// Render the size report. `flash_used` is the program's assembled word
 /// count (before config-word insertion); `layout` carries the RAM facts.
-pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> String {
+pub fn render_size(
+    device: &Device,
+    layout: &AllocLayout,
+    uses: &FixedUses,
+    flash_used: usize,
+) -> String {
     let mut out = String::new();
     out.push_str(&format!("epic-cc: program size for {}:\n", device.name));
     out.push_str(&format!(
@@ -309,7 +452,7 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         device.flash_words,
         flash_used as f64 * 100.0 / device.flash_words as f64
     ));
-    let (ram_used, ram_total) = ram_usage(device, layout);
+    let (ram_used, ram_total) = ram_usage(device, layout, uses);
     out.push_str(&format!(
         "  RAM: {ram_used}/{ram_total} bytes ({:.1}%) (overlay: a byte can be live in several frames; used = the bytes of RAM the program's allocation occupies)\n",
         ram_used as f64 * 100.0 / ram_total as f64
@@ -319,7 +462,7 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         let total = end - start + 1;
         out.push_str(&format!("    bank {i}: {used}/{total} bytes\n"));
     }
-    let fixed = fixed_bytes(device, layout.has_isr);
+    let fixed = fixed_bytes(device, layout.has_isr, uses);
     let fixed_total = fixed_total(device);
     let fixed_name = match device.core {
         device::Core::Pic14 => "common",
@@ -337,4 +480,180 @@ pub fn render_size(device: &Device, layout: &AllocLayout, flash_used: usize) -> 
         ));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ir::{Bin, Block, Call, CallArg, Func, Global, Icmp, MemLen, Memcpy, Ty};
+
+    fn void_main(insts: Vec<Inst>) -> Module {
+        Module {
+            globals: vec![],
+            funcs: vec![Func {
+                name: "main".to_string(),
+                ret: None,
+                params: vec![],
+                blocks: vec![Block {
+                    label: "entry".to_string(),
+                    insts,
+                }],
+                isr: false,
+                irq_priority: 0,
+                naked: false,
+                variadic: false,
+            }],
+            module_asm: vec![],
+        }
+    }
+
+    fn pic18() -> device::Core {
+        device::Core::Pic18
+    }
+
+    fn pic14() -> device::Core {
+        device::Core::Pic14
+    }
+
+    #[test]
+    fn empty_program_touches_no_fixed_bytes() {
+        let m = void_main(vec![]);
+        let u18 = fixed_uses(&m, pic18());
+        assert_eq!((u18.retval_bytes, u18.flag), (0, false));
+        let u14 = fixed_uses(&m, pic14());
+        assert_eq!((u14.retval_bytes, u14.flag), (0, false));
+    }
+
+    #[test]
+    fn call_and_return_widths_size_retval() {
+        let call = Inst::Call(Call {
+            dst: Some("r".to_string()),
+            ty: Some(Ty::I16),
+            func: "f".to_string(),
+            args: vec![],
+            callees: vec![],
+            loc: None,
+        });
+        let ret = Inst::Ret(Some((Ty::I16, Val::Reg("r".to_string()))), None);
+        let m = void_main(vec![call, ret]);
+        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, 2);
+        assert_eq!(fixed_uses(&m, pic14()).retval_bytes, 2);
+    }
+
+    #[test]
+    fn wide_const_sub_sets_pic18_flag_only() {
+        let sub = Inst::Bin(Bin {
+            dst: "r".to_string(),
+            op: BinOp::Sub,
+            ty: Ty::I16,
+            a: Val::Const(7),
+            b: Val::Reg("x".to_string()),
+            loc: None,
+        });
+        let m = void_main(vec![sub]);
+        assert!(fixed_uses(&m, pic18()).flag);
+        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, 0);
+        assert!(!fixed_uses(&m, pic14()).flag);
+    }
+
+    #[test]
+    fn narrow_const_sub_sets_no_flag() {
+        let sub = Inst::Bin(Bin {
+            dst: "r".to_string(),
+            op: BinOp::Sub,
+            ty: Ty::I8,
+            a: Val::Const(7),
+            b: Val::Reg("x".to_string()),
+            loc: None,
+        });
+        assert!(!fixed_uses(&void_main(vec![sub]), pic18()).flag);
+    }
+
+    #[test]
+    fn dynamic_memcpy_touches_pic14_retval() {
+        let reg = Inst::Memcpy(Memcpy {
+            dst: Val::Reg("d".to_string()),
+            src: Val::Reg("s".to_string()),
+            len: MemLen::Reg(Val::Reg("n".to_string())),
+            loc: None,
+        });
+        assert_eq!(fixed_uses(&void_main(vec![reg]), pic14()).retval_bytes, 2);
+        let fixed = Inst::Memcpy(Memcpy {
+            dst: Val::Reg("d".to_string()),
+            src: Val::Reg("s".to_string()),
+            len: MemLen::Const(4),
+            loc: None,
+        });
+        assert_eq!(fixed_uses(&void_main(vec![fixed]), pic14()).retval_bytes, 0);
+    }
+
+    #[test]
+    fn signed_wide_icmp_touches_pic14_retval() {
+        let cmp = Inst::Icmp(Icmp {
+            dst: "c".to_string(),
+            pred: "slt".to_string(),
+            ty: Ty::I16,
+            a: Val::Reg("x".to_string()),
+            b: Val::Reg("y".to_string()),
+            loc: None,
+        });
+        assert_eq!(
+            fixed_uses(&void_main(vec![cmp.clone()]), pic14()).retval_bytes,
+            1
+        );
+        assert_eq!(fixed_uses(&void_main(vec![cmp]), pic18()).retval_bytes, 0);
+        let unsigned = Inst::Icmp(Icmp {
+            dst: "c".to_string(),
+            pred: "ult".to_string(),
+            ty: Ty::I16,
+            a: Val::Reg("x".to_string()),
+            b: Val::Reg("y".to_string()),
+            loc: None,
+        });
+        assert_eq!(
+            fixed_uses(&void_main(vec![unsigned]), pic14()).retval_bytes,
+            0
+        );
+    }
+
+    #[test]
+    fn big_const_table_touches_pic14_retval() {
+        let m = Module {
+            globals: vec![Global {
+                name: "tab".to_string(),
+                ty: Ty::I8,
+                is_const: true,
+                size: 300,
+                bytes: vec![],
+                refs: vec![],
+                addr: None,
+            }],
+            funcs: vec![],
+            module_asm: vec![],
+        };
+        assert_eq!(fixed_uses(&m, pic14()).retval_bytes, 1);
+        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, 0);
+    }
+
+    #[test]
+    fn const_delay_counts_its_nests() {
+        let delay = Inst::Call(Call {
+            dst: None,
+            ty: None,
+            func: "_delay".to_string(),
+            args: vec![CallArg {
+                ty: Some(Ty::I16),
+                val: Val::Const(1000),
+                byval: None,
+                sret: false,
+            }],
+            callees: vec![],
+            loc: None,
+        });
+        let m = void_main(vec![delay]);
+        let plan = iselcore::delay::plan_delay(1000);
+        let depth = plan.nests.iter().map(Vec::len).max().unwrap_or(0) as u8;
+        assert_eq!(fixed_uses(&m, pic18()).retval_bytes, depth);
+        assert_eq!(fixed_uses(&m, pic14()).retval_bytes, depth);
+    }
 }

@@ -12,10 +12,10 @@
   bank, the fixed common/access-bank region, and the disjoint ISR region.
 * **"RAM used" is defined on the report line**: the bytes of RAM the
   program's allocation occupies, i.e. the per-bank high-water marks from
-  the overlay layout plus the fixed scratch/retval/ISR-save region isel
-  reserves. Overlay makes "used" non-obvious (a byte can be live in
-  several frames), so the report states the definition rather than making
-  a reader guess.
+  the overlay layout plus the fixed scratch/retval/ISR-save bytes the
+  emitted code can touch. Overlay makes "used" non-obvious (a byte can
+  be live in several frames), so the report states the definition rather
+  than making a reader guess.
 * `--map <file>` writes the **symbol-to-address map**: `global <name>
   0xNN`, `const <name>` (flash-resident, no RAM address), and `local
   <key> 0xNN` where `<key>` is the driver's `{func}::{name}` HashMap key
@@ -45,7 +45,7 @@ a change that removes or re-means one bumps `version`.
 
 | Key | Meaning |
 |---|---|
-| `version` | Format version, `1`. |
+| `version` | Format version, `2` (`1` counted the whole fixed reservation). |
 | `device`, `core` | Canonical device name; `pic14`, `pic14e`, `pic18` or `pic-baseline`. |
 | `flash_words.used`, `.total` | Program words before config insertion, and the device's flash, both in words (a board's `maximum_size` is bytes, two per word). |
 | `ram_bytes.used`, `.total` | The RAM line's definition above, in bytes. |
@@ -53,6 +53,20 @@ a change that removes or re-means one bumps `version`.
 | `config.source` | `program`: the build set a configuration. `erased`: it set none, so the part keeps its erased state, which `bytes` then holds (PIC14, PIC14E, baseline, where the registry's baseline is the datasheet erased value). `unset`: none set on PIC18, whose registry baseline is gpasm's all-ones fill rather than the silicon default, so `bytes` and every field are `null`. |
 | `config.base_byte_addr`, `.bytes` | The config region's first byte address (`0x400E` on the 877A, word `0x2007` times two) and its bytes in order. |
 | `config.fields.<name>` | Each registry field's value by canonical name; `null` when the bits match no modeled value (a don't-care encoding such as PIC18 FOSC `111x`), in which case `bytes` is the fact. Bits the registry does not model as fields, such as the 12F629/675 bandgap BG1:BG0 (config bits 13:12), are only in `bytes`, and an `erased` report shows their erased value, not the factory calibration. |
+
+## Amendment 2026-09-30: fixed region counted by use (epic-cc#837)
+
+`ram_bytes.used` no longer charges the whole fixed reservation. The
+driver scans the post-legalize module for the shapes each backend lowers
+through the fixed region (call and return widths, the PIC18 const-sub
+flag bit, `_delay` counters, dynamic-memcpy counters, large const
+tables, signed wide compares; `fixed_uses` in `crates/driver/src/
+report.rs`) and counts only those bytes, plus the full 4-byte retval
+save under `has_isr` (every ISR prologue saves and restores all 4).
+PIC14 scratch stays always counted. The emitted code is byte-identical,
+so this is version `2` by the rule above: the `opt_level` key from the
+profiles track plus smaller `ram_bytes.used` on programs that leave
+fixed bytes idle.
 
 ## Rationale
 

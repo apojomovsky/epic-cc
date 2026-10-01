@@ -36,7 +36,7 @@ fn a_configured_build_reports_its_resolved_fields_and_clock() {
     assert!(json.contains("\"source\": \"program\""), "{json}");
     assert!(json.contains("\"lvp\": \"off\""), "{json}");
     assert!(json.contains("\"clock_hz\": 4000000"), "{json}");
-    assert!(json.contains("\"version\": 1"), "{json}");
+    assert!(json.contains("\"version\": 2"), "{json}");
 }
 
 #[test]
