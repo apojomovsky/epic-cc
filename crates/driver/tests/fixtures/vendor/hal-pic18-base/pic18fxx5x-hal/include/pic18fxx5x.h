@@ -93,7 +93,7 @@
 #define EPIC_FAMILY_RAM_BYTES   PIC18FXX5X_FAMILY_RAM_BYTES
 
 /** Status enum and bit macros are architecture-blind, shared across
- *  every 8-bit PIC family; see epic-common/include/core/hal_status.h. */
+ *  every 8-bit PIC family; see common/include/core/hal_status.h. */
 #include "core/hal_status.h"
 
 /**

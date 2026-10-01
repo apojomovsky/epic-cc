@@ -1,0 +1,34 @@
+name: hal-fixture-drift
+
+# Weekly guard for the vendored epic-hal snapshots the size ladder
+# compiles (epic-cc#836). PR CI never touches epic-hal: the normal
+# suite stays offline. This job clones the public epic-hal repo and
+# runs scripts/check-hal-fixture-drift.py, which fails when a
+# vendored file differs from the pinned commit (exit 1) or when the
+# pin itself lags epic-hal origin/master (exit 2). Either failure
+# means someone owes a re-vendor ticket, not a fix to this job.
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          path: epic-cc
+
+      - uses: actions/checkout@v5
+        with:
+          repository: apojomovsky/epic-hal
+          ref: master
+          path: epic-hal
+
+      - name: Check vendored fixtures against pinned epic-hal
+        run: python3 epic-cc/scripts/check-hal-fixture-drift.py --hal-root epic-hal

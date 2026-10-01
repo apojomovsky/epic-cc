@@ -1,55 +1,65 @@
 # Provenance
 
-Vendored from `apojomovsky/epic-hal` on 2026-09-03, the `epic-encoder`
-module's full example on `PIC16F87XA` (target `16F877A`), exactly the
-combination epic-cc#193 used to measure and fix the codegen-density gap:
-`gpio+timer0+timer2+ssp+usart+irq+wdt+dispatch+tick+encoder+serial+the
-example TU`.
+Vendored from `apojomovsky/epic-hal` at commit
+`51a048421ca28ebf539251957b895946ade680b8` (origin/master on 2026-10-01): the `epic-encoder` module's full example on `PIC16F87XA`
+(target `16F877A`), exactly the combination epic-cc#193 used to
+measure and fix the codegen-density gap, refreshed for the size
+ladder (epic-cc#836).
 
-This is a **snapshot**, not a live sync: epic-cc's own CI must not depend
-on epic-hal's current state, so nothing here updates automatically when
-epic-hal changes. Re-vendor deliberately (re-run the same file list
-below against a current epic-hal checkout) when the drift between this
-snapshot and real epic-hal code becomes a concern, e.g. epic-hal adds a
-new codegen shape this snapshot doesn't exercise.
+This is a **snapshot**, not a live sync: epic-cc's own CI must not
+depend on epic-hal's current state, so nothing here updates
+automatically when epic-hal changes. Re-vendor deliberately
+(re-run the same file list below against a current epic-hal
+checkout) when the drift between this snapshot and real epic-hal
+code becomes a concern, e.g. epic-hal adds a new codegen shape
+this snapshot doesn't exercise.
+`scripts/check-hal-fixture-drift.py --hal-root <epic-hal checkout>`
+fails when any file below differs from the pinned commit, and
+reports when the pin itself lags that checkout; see its header.
 
-**Re-vendored 2026-09-03** (`epic-serial/include/epic_serial.h`,
-`epic-serial/src/epic_serial.c` only): apojomovsky/epic-hal#123/#124,
-the `printf`-literal staging buffer consolidation (epic-cc#206).
+Vendored layout mirrors the upstream tree (`hal/pic14/...`,
+`common/...`, `lib/...`), after epic-hal#316 grouped the root
+into `common/`, `hal/<arch>/`, `lib/` and `demos/`, and the PIC14
+HAL consolidated the per-part drivers into the shared
+`hal/pic14/core` slice plus the part table in `hal/pic14/16f87xa`.
 
-Source files (paths relative to the epic-hal repo root):
+Source files (paths relative to this directory):
 
 ```
-pic16f87xa-hal/src/peripherals/pic16f87xa_gpio.c
-pic16f87xa-hal/src/peripherals/pic16f87xa_timer0.c
-pic16f87xa-hal/src/peripherals/pic16f87xa_timer2.c
-pic16f87xa-hal/src/peripherals/pic16f87xa_ssp.c
-pic16f87xa-hal/src/peripherals/pic16f87xa_usart.c
-pic16f87xa-hal/src/core/pic16_irq.c
-pic16f87xa-hal/src/core/pic16f87xa_wdt_sleep.c
-pic16f87xa-hal/src/epiccc/pic16f87xa_wdt_sleep_epiccc.c
-pic16f87xa-hal/src/epiccc/pic16_isr_vector.c
-pic16f87xa-hal/src/epiccc/pic16_irq_dispatch_epiccc.c
-epic-common/src/core/epic_harness_target.c
-epic-tick/src/epic_tick.c
-epic-encoder/src/encoder.c
-epic-serial/src/epic_serial.c
-epic-encoder/examples/example_encoder.c
+hal/pic14/core/src/peripherals/pic14_gpio.c
+hal/pic14/core/src/peripherals/pic14_timer0.c
+hal/pic14/core/src/peripherals/pic14_timer2.c
+hal/pic14/core/src/peripherals/pic14_ssp.c
+hal/pic14/core/src/peripherals/pic14_usart.c
+hal/pic14/core/src/core/pic14_irq.c
+hal/pic14/core/src/core/pic14_wdt_sleep.c
+hal/pic14/16f87xa/src/core/pic16_irq_table.c
+hal/pic14/core/src/epiccc/pic14_wdt_sleep_epiccc.c
+hal/pic14/core/src/epiccc/pic16_isr_vector.c
+hal/pic14/core/src/epiccc/pic16_irq_dispatch_epiccc.c
+common/src/core/epic_harness_target.c
+lib/tick/src/epic_tick.c
+lib/encoder/src/encoder.c
+lib/serial/src/epic_serial.c
+lib/encoder/examples/example_encoder.c
 ```
 
-Plus the full `include/` tree of each of `pic16f87xa-hal`, `epic-common`,
-`epic-tick`, `epic-encoder`, `epic-serial` (headers only, copied
-wholesale rather than hand-picked to avoid missing a transitive include).
+Plus the full `include/` tree of each of `hal/pic14/core`,
+`hal/pic14/16f87xa`, `common`, `lib/tick`, `lib/encoder`,
+`lib/serial` (headers only, copied wholesale rather than
+hand-picked to avoid missing a transitive include).
 
-`config.c` is a hand-written copy of the `EPIC_CONFIG(...)` translation
-unit `scripts/epic_build.py` generates for this module/device in
-epic-hal, not vendored from a file (it doesn't exist as a checked-in
-file there).
+`config.c` is a hand-written copy of the `EPIC_CONFIG(...)`
+translation unit `scripts/epic_build.py` generates for this
+module/device in epic-hal, not vendored from a file (it doesn't
+exist as a checked-in file there).
 
 Include order used to compile this fixture (device `16F877A`):
 
 ```
--Ipic16f87xa-hal/include/epiccc -Ipic16f87xa-hal/include
--Iepic-common/include -Iepic-tick/include
--Iepic-encoder/include -Iepic-serial/include
+-Ihal/pic14/16f87xa/include/epiccc -Ihal/pic14/16f87xa/include
+-Ihal/pic14/core/include -Icommon/include -Ilib/tick/include
+-Ilib/encoder/include -Ilib/serial/include
 ```
+
+Defines: `PIC16F877A`, `FOSC_HZ=20000000`, `__EPIC_CC__`.

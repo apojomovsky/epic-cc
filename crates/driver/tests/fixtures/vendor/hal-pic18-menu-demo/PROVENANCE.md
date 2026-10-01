@@ -1,8 +1,8 @@
 # Provenance
 
-Vendored from `apojomovsky/epic-hal` on 2026-09-25 (commit `879834c`),
-the `epic-menu-demo` module's sim variant on `18F4550` (epic-cc
-toolchain file set), for the size ladder (epic-cc#677).
+Vendored from `apojomovsky/epic-hal` at commit
+`51a048421ca28ebf539251957b895946ade680b8` (origin/master on 2026-10-01), the `epic-menu-demo` module's sim variant on `18F4550`
+(epic-cc toolchain file set), for the size ladder (epic-cc#836).
 
 This is a **snapshot**, not a live sync: epic-cc's own CI must not
 depend on epic-hal's current state, so nothing here updates

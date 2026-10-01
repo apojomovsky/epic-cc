@@ -50,14 +50,7 @@
  */
 static void send_cmd(epic_lcd_t *lcd, uint8_t cmd)
 {
-#ifdef __EPIC_CC__
-    /* The ops-pointer chain hits an epic-cc iselcore gep gap (no gep
-     * for pointer); the epic-cc footprint probe links the module
-     * without the transport dispatch. XC8 keeps the real ops calls. */
-    (void)lcd; (void)cmd;
-#else
     lcd->ops->send(lcd->ops_ctx, 0, cmd);
-#endif
 }
 
 /**
@@ -68,11 +61,7 @@ static void send_cmd(epic_lcd_t *lcd, uint8_t cmd)
  */
 static void send_data(epic_lcd_t *lcd, uint8_t data)
 {
-#ifdef __EPIC_CC__
-    (void)lcd; (void)data;
-#else
     lcd->ops->send(lcd->ops_ctx, 1, data);
-#endif
 }
 
 /**
@@ -82,11 +71,7 @@ static void send_data(epic_lcd_t *lcd, uint8_t data)
  */
 static void cmd_short_wait(epic_lcd_t *lcd)
 {
-#ifdef __EPIC_CC__
-    (void)lcd;
-#else
     lcd->ops->delay_us(lcd->ops_ctx, DELAY_CMD_US);
-#endif
 }
 
 /**
@@ -96,11 +81,7 @@ static void cmd_short_wait(epic_lcd_t *lcd)
  */
 static void cmd_long_wait(epic_lcd_t *lcd)
 {
-#ifdef __EPIC_CC__
-    (void)lcd;
-#else
     lcd->ops->delay_us(lcd->ops_ctx, DELAY_CLEAR_US);
-#endif
 }
 
 /* Row-address defaults for the standard HD44780 layout.
@@ -132,45 +113,20 @@ void epic_lcd_init(epic_lcd_t *lcd, const epic_lcd_ops_t *ops, void *ops_ctx,
     lcd->display_ctrl = 0u;
     lcd->entry_mode   = ENTRY_INCREMENT;
 
-#ifdef __EPIC_CC__
-    /* The const-table memcpy hits an epic-cc isel gap (no address for
-     * @default_row_addr); a loop compiles. XC8 keeps the memcpy. */
-    for (uint8_t i = 0u; i < EPIC_LCD_MAX_ROWS; i++)
-    {
-        lcd->row_addr[i] = config->row_addr[i];
-    }
-    if (config->row_addr[0] == 0u)
-    {
-        for (uint8_t i = 0u; i < EPIC_LCD_MAX_ROWS; i++)
-        {
-            lcd->row_addr[i] = default_row_addr[i];
-        }
-    }
-#else
     memcpy(lcd->row_addr, config->row_addr, EPIC_LCD_MAX_ROWS);
     if (config->row_addr[0] == 0u)
     {
         memcpy(lcd->row_addr, default_row_addr, EPIC_LCD_MAX_ROWS);
     }
-#endif
 
     /* HD44780 8-bit init sequence per datasheet §13; the 4-bit transport
      * handles its own sub-sequence internally, so this always sends the
      * 8-bit-form Function Set regardless of the active transport. */
 
-#ifdef __EPIC_CC__
-    /* lcd is already used above (ops/cols/rows/row_addr); the delay
-     * ops are stubbed, so nothing else to do here. */
-#else
     lcd->ops->delay_ms(lcd->ops_ctx, DELAY_INIT_MS);
-#endif
 
     send_cmd(lcd, CMD_FUNCTION_SET | FS_8BIT | FS_2LINE);
-#ifdef __EPIC_CC__
-    /* lcd is already used above; the delay ops are stubbed. */
-#else
     lcd->ops->delay_us(lcd->ops_ctx, DELAY_INIT4_US);
-#endif
 
     send_cmd(lcd, CMD_FUNCTION_SET | FS_8BIT | FS_2LINE);
     cmd_short_wait(lcd);

@@ -168,10 +168,13 @@ fn both_dispatch_contexts_list_the_stored_usart_copies() {
             "{name} dispatcher must list the TX and taskmgr copies; got {sites:?}"
         );
     }
+    // The harness no longer defines an `s_tx_cplt` stub (upstream sets a
+    // null TX callback and TXEN explicitly), so the tick overflow is the
+    // remaining main-only original.
     assert!(
-        main_sites.iter().any(|c| {
-            c.contains(&"epic_tick_on_overflow".to_string()) && c.contains(&"s_tx_cplt".to_string())
-        }),
-        "main dispatcher keeps the main-only originals; got {main_sites:?}"
+        main_sites
+            .iter()
+            .any(|c| c.contains(&"epic_tick_on_overflow".to_string())),
+        "main dispatcher keeps the main-only original; got {main_sites:?}"
     );
 }
