@@ -66,8 +66,9 @@ shape.
 Full-interval objects (allocas and va regions take a whole-function
 slot today) on the deepest path: menu 65B, control 10B, pid 0B, bridge
 85B. Whole-program totals are 129/118/32/180B. Byval has 0 sites in all
-four post-opt modules and sret params hold about 2B per divmod helper
-off every depth path (#737), so the filed precise-live-ranges ticket
+four post-opt modules (menu per #737 phase-1, all four by direct grep)
+and sret params hold about 2B per divmod helper off every depth path,
+so the filed precise-live-ranges ticket
 prices alloca and va only. The numbers are upper bounds: part of menu's
 55B is the 22B CCP-handle alloca #795 proved live across its call and
 therefore unshrinkable by interval work.
