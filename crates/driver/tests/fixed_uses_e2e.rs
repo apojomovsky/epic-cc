@@ -4,10 +4,13 @@
 //! what the program uses (the PlatformIO pre-flash check reads it). This
 //! test compiles a shape-covering corpus (valued calls, the PIC18
 //! const-sub flag chain, `_delay`, memcpy, wide compares, large const
-//! tables, plus the small-program floor rows) and asserts the reported
-//! `fixed:`/`common:` bytes cover every fixed-range reference in the
-//! emitted asm. It guards the dangerous direction only: overcounting is
-//! safe and stays visible in the size baseline, not here.
+//! tables, ISRs, plus the small-program floor rows) and asserts the
+//! reported `fixed:`/`common:` bytes cover every fixed-range reference
+//! in the emitted asm. It guards the dangerous direction only:
+//! overcounting is safe and stays visible in the size baseline, not here.
+//! ISR rows carry `has_isr`: the prologue saves all 4 retval bytes with
+//! no IR shape to scan, so the report forces the full count, and the
+//! assertion prices the ISR base (12/9) plus the 4 the same way.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,6 +19,7 @@ struct Case {
     name: &'static str,
     device: &'static str,
     fixture: &'static str,
+    has_isr: bool,
 }
 
 fn cases() -> Vec<Case> {
@@ -32,10 +36,6 @@ fn cases() -> Vec<Case> {
         ("shift", "size-bench/bench-shift.c"),
         ("struct-copy", "size-bench/bench-struct-copy.c"),
         ("delay", "delay.c"),
-        // An ISR prologue saves all 4 retval bytes even with no valued
-        // call in the module: the one shape the IR scan cannot see, so
-        // `fixed_bytes` forces the full count under `has_isr`.
-        ("fsr1-isr", "fsr1_isr.c"),
     ];
     let pic14 = [
         ("add", "add.c"),
@@ -51,17 +51,34 @@ fn cases() -> Vec<Case> {
             name: n,
             device: "18F4550",
             fixture: f,
+            has_isr: false,
         })
         .collect();
     out.extend(pic14.iter().map(|(n, f)| Case {
         name: n,
         device: "16F877A",
         fixture: f,
+        has_isr: false,
     }));
     out.push(Case {
         name: "add",
         device: "16F1937",
         fixture: "add.c",
+        has_isr: false,
+    });
+    // ISR rows: the prologue's 4-byte retval save has no IR shape, so
+    // these are the rows that fail if the `has_isr` forcing regresses.
+    out.push(Case {
+        name: "fsr1-isr",
+        device: "18F4550",
+        fixture: "fsr1_isr.c",
+        has_isr: true,
+    });
+    out.push(Case {
+        name: "isr-ticks",
+        device: "16F877A",
+        fixture: "volatile_isr_ticks.c",
+        has_isr: true,
     });
     out
 }
@@ -163,16 +180,24 @@ fn fixed_report_covers_emitted_touches() {
         let (report, _) = compile(&c, false);
         let (_, asm) = compile(&c, true);
         let reported = reported_fixed(&report);
+        // The ISR base rides along untouched by the scan: price it from
+        // the case, so an ISR row fails if the `has_isr` forcing drops
+        // the retval term the prologue always touches.
+        let isr_base = match (c.device, c.has_isr) {
+            (_, false) => 0,
+            ("18F4550", true) => 12,
+            _ => 9,
+        };
         let (touched, floor) = match c.device {
             "18F4550" => (touched_pic18(&asm), 0),
             _ => (touched_pic14(&asm), 1),
         };
         println!(
-            "{}-{}: reported fixed {reported}, touched retval {}",
-            c.device, c.name, touched
+            "{}-{}: reported fixed {reported}, touched retval {touched}",
+            c.device, c.name
         );
         assert!(
-            reported >= floor + touched,
+            reported >= floor + isr_base + touched,
             "{} ({}): reported fixed {reported} below touched {touched}:\n{asm}",
             c.name,
             c.device
