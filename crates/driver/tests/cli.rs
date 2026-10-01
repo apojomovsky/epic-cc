@@ -138,3 +138,34 @@ fn rejects_a_bad_or_zero_f_cpu() {
     .unwrap();
     assert_eq!(c.f_cpu, Some(4_000_000));
 }
+
+#[test]
+fn parses_all_four_opt_levels() {
+    use driver::cli::OptLevel;
+    for (flag, want) in [
+        ("-O0", OptLevel::O0),
+        ("-O1", OptLevel::O1),
+        ("-O2", OptLevel::O2),
+        ("-Os", OptLevel::Os),
+    ] {
+        let c = parse_args(&args(&["a.c", "--device", "p16f877a", flag])).unwrap();
+        assert_eq!(c.opt_level, want, "{flag}");
+    }
+}
+
+#[test]
+fn opt_level_defaults_to_os_and_last_flag_wins() {
+    use driver::cli::OptLevel;
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a"])).unwrap();
+    assert_eq!(c.opt_level, OptLevel::Os);
+    let c = parse_args(&args(&["a.c", "--device", "p16f877a", "-O2", "-O0"])).unwrap();
+    assert_eq!(c.opt_level, OptLevel::O0);
+}
+
+#[test]
+fn rejects_an_unknown_opt_level() {
+    let e = parse_args(&args(&["a.c", "--device", "p16f877a", "-O3"])).unwrap_err();
+    assert!(e.contains("-O3"), "{e}");
+    let e = parse_args(&args(&["a.c", "--device", "p16f877a", "-O"])).unwrap_err();
+    assert!(e.contains("-O"), "{e}");
+}

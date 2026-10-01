@@ -42,6 +42,7 @@ one-line index entry here, e.g.:
 - ADR-042: PIC18 factors repeated code on the final listing (`outline` stage, on by default, size over cycles), 2026-09-24
 - ADR-043: Generated device headers and a real `xc.h` (registry `sfrs` to `pic<part>.h`, variadic `__interrupt`, delays over `_delay`; bare bits deferred to #707), 2026-09-26
 - ADR-044: PIC18 borrow chains use `SUBWFB`, never `SUBFWB`; the simulator decodes the two opcodes separately, 2026-09-30
+- ADR-045: Optimization profiles `-O0`/`-O1`/`-O2`/`-Os` (`-Os` default, byte-identical; `-O2` is speed: no factoring, folding into main/ISR within budget), 2026-09-30
 
 ## ADR-001 -- clang as an out-of-process front end; custom PIC14 backend
 

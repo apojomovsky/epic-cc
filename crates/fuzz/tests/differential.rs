@@ -12,8 +12,9 @@ use std::collections::HashMap;
 
 use device;
 use fuzz::{
-    generate, generate_float, generate_ir, generate_signed, run_differential, run_ir_differential,
-    FailureKind, Input, IrProgram, Program, TYPEDEF_PROLOGUE,
+    generate, generate_float, generate_ir, generate_signed, run_differential,
+    run_differential_with_profile, run_ir_differential, FailureKind, Input, IrProgram, Program,
+    TYPEDEF_PROLOGUE,
 };
 
 /// The brief's tiny program: one u8 volatile input, one scalar expression.
@@ -333,6 +334,21 @@ fn generator_corpus_differential_clean() {
         let prog = generate(seed);
         run_differential(&prog, &device::PIC16F877A)
             .unwrap_or_else(|e| panic!("generated seed {seed} not differential-clean: {e}"));
+    }
+}
+
+#[test]
+fn generator_corpus_differential_clean_under_o2() {
+    // The `-O2` slice of the differential gate (epic-cc#839): the same
+    // fast integer seeds, compiled with the speed profile (no factoring,
+    // aggressive inline tier). Profiles change shaping, never semantics,
+    // so every seed stays clean. Float/signed/IR corpora under `-O2`
+    // ride in a follow-up; the fast integer slice pays the CI budget here.
+    for seed in 0..8 {
+        let prog = generate(seed);
+        run_differential_with_profile(&prog, &device::PIC16F877A, Some("O2")).unwrap_or_else(|e| {
+            panic!("generated seed {seed} not differential-clean under -O2: {e}")
+        });
     }
 }
 

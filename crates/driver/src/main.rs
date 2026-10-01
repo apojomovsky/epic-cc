@@ -7,8 +7,11 @@
 //! `isel`/`isel-pic14e` -> `schedule` -> `banking` -> `peephole` ->
 //! page-fit verification -> `asm` (banking emits `MOVLB`/`BSR` on PIC14E,
 //! RP-bit `BANKSEL` on classic PIC14); PIC18 runs `isel-pic18` ->
-//! `outline` (code factoring, `--no-outline` skips it) -> `asm` (no
-//! banking/peephole/paging).
+//! `outline` (code factoring, on under `-O1`/`-Os`, skipped under
+//! `-O0`/`-O2` and by `--no-outline`) -> `asm` (no
+//! banking/peephole/paging). The `-O` profile (`cli::OptLevel`) selects
+//! the whole-program passes (`wholeprog_opt`) and the factoring default;
+//! clang stays pinned at `-O1` under every profile.
 //!
 //! Multiple `.c` inputs are each run through clang separately, then merged
 //! with `llvm-link` before `irparse` ever sees them (docs/31 §7): the
@@ -440,11 +443,16 @@ fn main() {
     // crates/driver/src/wholeprog_opt.rs for the pass list and why it
     // preserves the overlay allocator's frame boundaries.
     let opt_path = tmp.join("merged_opt.ll");
-    let merged_ll_text =
-        match driver::wholeprog_opt::run(&opt_bin, &merged_path, &opt_path, device.core) {
-            Ok(text) => text,
-            Err(msg) => diag::error(&format!("whole-program opt: {msg}")),
-        };
+    let merged_ll_text = match driver::wholeprog_opt::run(
+        &opt_bin,
+        &merged_path,
+        &opt_path,
+        device.core,
+        cli.opt_level,
+    ) {
+        Ok(text) => text,
+        Err(msg) => diag::error(&format!("whole-program opt: {msg}")),
+    };
 
     let ll_text = irparse::sanitize_symbols(&merged_ll_text);
     let canonical_spec = ll_text
@@ -594,7 +602,17 @@ fn main() {
         // Code factoring shares repeated runs as leaf bodies; its own
         // budget check adds one return level to the IR depth, so it backs
         // off rather than overflow the stack (docs/44, epic-cc#662).
-        device::Core::Pic18 if cli.outline => {
+        // Factoring trades calls for flash, so the speed profiles skip
+        // it: `-O0` keeps the listing closest to source for stepping,
+        // `-O2` keeps it inline for speed. `--no-outline` forces it off
+        // under any profile.
+        device::Core::Pic18
+            if cli.outline
+                && !matches!(
+                    cli.opt_level,
+                    driver::cli::OptLevel::O0 | driver::cli::OptLevel::O2
+                ) =>
+        {
             let opts = outline::Options {
                 stack_depth: device.stack_depth as usize,
                 ir_depth: cg.max_depth,
@@ -683,6 +701,7 @@ fn main() {
             program_words.len(),
             config_bytes.as_deref(),
             fosc_hz,
+            cli.opt_level.as_str(),
         );
         std::fs::write(report_path, json).expect("write report");
     }

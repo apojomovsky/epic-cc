@@ -60,10 +60,10 @@
 //! PIC14 backend used to miscompile those, reading an `alloca`'s bytes
 //! where the walk needed its frame address, which is fixed (epic-cc#647),
 //! so both cores run it now.
+use crate::cli::OptLevel;
 
 use std::path::Path;
 use std::process::Command;
-
 /// The curated, RAM-safe pass list (see module docs for why each pass is
 /// here and none of them inline across a call boundary).
 ///
@@ -78,6 +78,15 @@ use std::process::Command;
 /// in place of its frame address (epic-cc#647).
 const PASSES: &str =
     "internalize,ipsccp,instcombine,simplifycfg,dce,loop-reduce,instcombine,simplifycfg,dce";
+/// The `-O0` pipeline: whole-program constants folded, control flow
+/// untouched. Skipping `opt` entirely was measured and rejected: the menu
+/// demo then reaches 18227 words and no longer fits the 18F4550's 16384
+/// words of flash, so an `-O0` that builds nothing real is no use to the
+/// debugger track. `internalize`/`ipsccp` plus local cleanup only fold
+/// cross-TU constant arguments (the `FOSC_HZ` period search is the big
+/// one); they never restructure a loop, fold a call, or share a body, so
+/// the IR keeps the source's control flow for stepping and bisection.
+const PASSES_O0: &str = "internalize,ipsccp,instcombine,simplifycfg,dce";
 
 /// Symbols `internalize` must never touch:
 ///
@@ -252,7 +261,15 @@ fn noinline_functions(lines: &[&str], funcs: &[FuncSpan]) -> std::collections::H
 /// same as before, so this list is unconditionally safe to always-inline,
 /// no RAM/flash trade to weigh, unlike a fold into `main`/an ISR (that
 /// shape is the `-O2` "aggressive" tier's job, not this one, epic-cc#204).
-fn always_inline_candidates(ll_text: &str) -> Vec<String> {
+///
+/// With `aggressive`, entry callers count too, but only for small
+/// callees: at most `MAX_ENTRY_INLINE_LINES` IR lines. The fold still
+/// duplicates the body exactly once (one call site), so flash barely
+/// moves, while the callee's frame becomes permanent RAM in a root that
+/// never returns. The line cap bounds that RAM cost to small helpers;
+/// a large single-use driver stays out of line on purpose.
+const MAX_ENTRY_INLINE_LINES: usize = 100;
+fn always_inline_candidates(ll_text: &str, aggressive: bool) -> Vec<String> {
     let lines: Vec<&str> = ll_text.lines().collect();
     let funcs = function_spans(&lines);
     let defined: std::collections::HashSet<&str> = funcs.iter().map(|f| f.name.as_str()).collect();
@@ -321,8 +338,16 @@ fn always_inline_candidates(ll_text: &str) -> Vec<String> {
                 return None;
             }
             let caller = sites[0];
-            if caller == usize::MAX || funcs[caller].is_entry {
+            if caller == usize::MAX {
                 return None;
+            }
+            if funcs[caller].is_entry {
+                if !aggressive {
+                    return None;
+                }
+                if f.end - f.start + 1 > MAX_ENTRY_INLINE_LINES {
+                    return None;
+                }
             }
             Some(f.name.clone())
         })
@@ -381,12 +406,20 @@ fn mark_always_inline(ll_text: &str, candidates: &[String]) -> String {
 
 /// Run the curated whole-program cleanup over `merged_path` (the
 /// `llvm-link` output), writing the result to `out_path`. Returns the
-/// optimized `.ll` text.
+/// optimized `.ll` text. The profile selects the pipeline, not clang's
+/// flags (clang stays at `-O1` under every profile): `-O0` folds
+/// whole-program constants only (`PASSES_O0`, control flow untouched, for
+/// stepping and bisection); `-O1` runs the base `PASSES` with no
+/// cross-function folding; `-Os` adds the single-call-site folds into
+/// ordinary callers (today's pipeline exactly); `-O2` additionally folds
+/// small single-call-site callees into `main`/ISR roots and leaves code
+/// factoring to the driver (which disables it under `-O2`).
 pub fn run(
     opt_bin: &Path,
     merged_path: &Path,
     out_path: &Path,
     core: device::Core,
+    opt_level: OptLevel,
 ) -> Result<String, String> {
     let ll_text = std::fs::read_to_string(merged_path)
         .map_err(|e| format!("read {}: {e}", merged_path.display()))?;
@@ -398,7 +431,15 @@ pub fn run(
         // still gets the plain merged IR.
         return Ok(ll_text);
     }
-    let candidates = always_inline_candidates(&ll_text);
+    // `-O0` folds constants but restructures nothing; `-O1` runs the base
+    // list with no folding at all; `-O2` folds small single-call-site
+    // callees even into `main`/ISR roots; `-Os` keeps today's folds into
+    // ordinary callers only.
+    let candidates = match opt_level {
+        OptLevel::O0 | OptLevel::O1 => Vec::new(),
+        OptLevel::O2 => always_inline_candidates(&ll_text, true),
+        OptLevel::Os => always_inline_candidates(&ll_text, false),
+    };
     let marked = mark_always_inline(&ll_text, &candidates);
     // Both cores run LSR now (epic-cc#647 fixed the PIC14 alloca-address
     // defect that gated it, epic-cc#645 measured the gains), so the base
@@ -406,7 +447,11 @@ pub fn run(
     // core-agnostic by design, and a future core-specific deviation has its
     // hook here.
     let _ = core;
-    let base = PASSES;
+    let base = if opt_level == OptLevel::O0 {
+        PASSES_O0
+    } else {
+        PASSES
+    };
     let passes = if candidates.is_empty() {
         base.to_string()
     } else {
@@ -524,7 +569,7 @@ define internal void @helper() #0 {
 }
 ";
         assert_eq!(
-            always_inline_candidates(ll),
+            always_inline_candidates(ll, false),
             vec!["helper".to_string()],
             "driver's one caller is main, so driver stays; helper's one caller is driver, an ordinary function, so helper is a safe fold"
         );
@@ -545,7 +590,7 @@ define internal void @shared() #0 {
   ret void
 }
 ";
-        assert!(always_inline_candidates(ll).is_empty());
+        assert!(always_inline_candidates(ll, false).is_empty());
     }
 
     #[test]
@@ -561,7 +606,7 @@ define internal void @cb() #0 {
 @table = internal global [1 x ptr] [ptr @cb]
 ";
         assert!(
-            always_inline_candidates(ll).is_empty(),
+            always_inline_candidates(ll, false).is_empty(),
             "cb is also stored in a global table, folding its one direct call would leave a dangling indirect path"
         );
     }
@@ -580,8 +625,45 @@ attributes #0 = { nounwind }
 attributes #1 = { noinline nounwind }
 ";
         assert!(
-            always_inline_candidates(ll).is_empty(),
+            always_inline_candidates(ll, false).is_empty(),
             "helper is noinline, LLVM rejects noinline+alwaysinline on the same function"
+        );
+    }
+
+    #[test]
+    fn aggressive_folds_a_small_single_call_site_callee_into_main() {
+        let ll = "\
+define dso_local i16 @main() #0 {
+  tail call void @driver()
+  ret i16 0
+}
+define internal void @driver() #0 {
+  ret void
+}
+:";
+        assert!(
+            always_inline_candidates(ll, false).is_empty(),
+            "the default tier never folds into main: its frame never returns"
+        );
+        assert_eq!(
+            always_inline_candidates(ll, true),
+            vec!["driver".to_string()],
+            "the aggressive tier folds a small one-caller helper into main"
+        );
+    }
+
+    #[test]
+    fn aggressive_leaves_a_large_single_call_site_callee_out_of_line() {
+        let mut ll = String::from(
+            "define dso_local i16 @main() #0 {\n  tail call void @big()\n  ret i16 0\n}\ndefine internal void @big() #0 {\n",
+        );
+        for _ in 0..(MAX_ENTRY_INLINE_LINES + 10) {
+            ll.push_str("  %x = add i16 0, 1\n");
+        }
+        ll.push_str("  ret void\n}\n");
+        assert!(
+            always_inline_candidates(&ll, true).is_empty(),
+            "folding a large body into main would pin its whole frame in RAM permanently"
         );
     }
 

@@ -27,13 +27,18 @@ def stem(name):
 
 
 def parse_baseline(text):
-    """The [[entry]] subset of TOML size_baseline.toml uses, nothing more."""
+    """The [[entry]] subset of TOML size_baseline.toml uses, nothing more.
+
+    Only `-Os` rows (no `profile` key, or `profile = "Os"`): `-O2` rows
+    share their names, and joining `-Os` measurements against them would
+    print phantom deltas (epic-cc#839).
+    """
     entries = {}
     cur = {}
     for raw in text.splitlines():
         line = raw.strip()
         if line == "[[entry]]":
-            if cur:
+            if cur and cur.get("profile", "Os") == "Os":
                 entries[cur["name"]] = cur
             cur = {}
         elif cur is not None and "=" in line and not line.startswith("#"):
@@ -45,7 +50,7 @@ def parse_baseline(text):
             else:
                 value = int(value)
             cur[key] = value
-    if cur:
+    if cur and cur.get("profile", "Os") == "Os":
         entries[cur["name"]] = cur
     return entries
 

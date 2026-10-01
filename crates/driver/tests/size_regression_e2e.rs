@@ -38,6 +38,18 @@
 //! not have, and the vendored `hal-pic18-menu-demo` case (epic-cc#469)
 //! is the PIC18 counterpart, the largest whole-program PIC18 entry.
 //! See each fixture's `PROVENANCE.md` for where it comes from.
+//! Profiles (epic-cc#839): every case also compiles under `-O2`, which
+//! must succeed on all rows (the speed profile builds the whole ladder).
+//! Flash/RAM numbers are additionally recorded and gated for the
+//! `O2_BASELINED` subset: the smallest and largest row on each core plus
+//! the loop-shape bench that pins LSR under `-O2`. Gating `-O2` numbers
+//! on every row would double the strict number surface future speed work
+//! must re-baseline without adding signal, so the remaining rows get
+//! `-O2` build coverage only (success asserted, numbers shown in the
+//! step summary as build-only). Baseline entries carry `profile`; rows
+//! without one are `-Os`. `STRICT_SIZE_BASELINE` applies to each gated
+//! profile independently. `SIZE_BASELINE_ONLY` matches `name` for `-Os`
+//! rows and `name@O2` for `-O2` rows.
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -47,9 +59,35 @@ use std::process::Command;
 struct BaselineEntry {
     name: String,
     device: String,
+    /// The `-O` profile these numbers were measured under (`"Os"` or
+    /// `"O2"`). Absent in older files, which are all `-Os`. Skipped on
+    /// serialize for `-Os` so re-baselining never rewrites those rows.
+    #[serde(default = "os_profile", skip_serializing_if = "is_os_profile")]
+    profile: String,
     flash_words: u32,
     ram_bytes: u32,
 }
+
+fn os_profile() -> String {
+    "Os".to_string()
+}
+
+fn is_os_profile(s: &String) -> bool {
+    s == "Os"
+}
+
+/// Rows whose `-O2` numbers are recorded and gated, not just built: the
+/// smallest and largest ladder row on each core, plus the loop-shape
+/// bench that pins LSR under `-O2`. Every other row still compiles
+/// under `-O2` (build coverage), without a gated number.
+const O2_BASELINED: &[&str] = &[
+    "add-16f877a",
+    "add-18f4550",
+    "bench-struct-scan-18f4550",
+    "bench-struct-scan-16f877a",
+    "hal-pic16-encoder-full-16f877a",
+    "hal-pic18-menu-demo-18f4550",
+];
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct Baseline {
@@ -103,6 +141,18 @@ fn parse_only_filter(valid: &[String]) -> Option<std::collections::HashSet<Strin
 /// gate, and the gain lands when its owner re-baselines. A new case not in
 /// the filter is skipped, not added. Returns rows to save plus updated and
 /// skipped report lines; updated lines carry old->new values for the PR body.
+///
+/// Rows are keyed by `(name, profile)`: `-Os` rows keep the bare `name`
+/// key, `-O2` rows use `name@O2`, so the filter and the report tell the
+/// two profiles apart.
+fn entry_key(name: &str, profile: &str) -> String {
+    if profile == "Os" {
+        name.to_string()
+    } else {
+        format!("{name}@{profile}")
+    }
+}
+
 fn merge_baseline(
     baseline: &Baseline,
     measured: &[BaselineEntry],
@@ -112,22 +162,26 @@ fn merge_baseline(
     let mut updated = Vec::new();
     let mut skipped = Vec::new();
     for m in measured {
-        let base = baseline.entry.iter().find(|e| e.name == m.name);
-        if filter.is_some_and(|f| !f.contains(&m.name)) {
+        let key = entry_key(&m.name, &m.profile);
+        let base = baseline
+            .entry
+            .iter()
+            .find(|e| e.name == m.name && e.profile == m.profile);
+        if filter.is_some_and(|f| !f.contains(&key)) {
             match base {
                 Some(b) => {
                     to_save.push(b.clone());
                     if b.flash_words != m.flash_words || b.ram_bytes != m.ram_bytes {
                         skipped.push(format!(
-                            "SKIPPED (not in SIZE_BASELINE_ONLY) {}: measured flash {} RAM {}, kept baseline flash {} RAM {}",
-                            m.name, m.flash_words, m.ram_bytes, b.flash_words, b.ram_bytes
+                            "SKIPPED (not in SIZE_BASELINE_ONLY) {key}: measured flash {} RAM {}, kept baseline flash {} RAM {}",
+                            m.flash_words, m.ram_bytes, b.flash_words, b.ram_bytes
                         ));
                     }
                 }
                 None => {
                     skipped.push(format!(
-                        "SKIPPED (not in SIZE_BASELINE_ONLY) {}: new case, not added (measured flash {} RAM {})",
-                        m.name, m.flash_words, m.ram_bytes
+                        "SKIPPED (not in SIZE_BASELINE_ONLY) {key}: new case, not added (measured flash {} RAM {})",
+                        m.flash_words, m.ram_bytes
                     ));
                 }
             }
@@ -139,15 +193,15 @@ fn merge_baseline(
             }
             Some(b) => {
                 updated.push(format!(
-                    "UPDATED {}: flash {}->{} RAM {}->{}",
-                    m.name, b.flash_words, m.flash_words, b.ram_bytes, m.ram_bytes
+                    "UPDATED {key}: flash {}->{} RAM {}->{}",
+                    b.flash_words, m.flash_words, b.ram_bytes, m.ram_bytes
                 ));
                 to_save.push(m.clone());
             }
             None => {
                 updated.push(format!(
-                    "UPDATED {}: new entry (flash {} RAM {})",
-                    m.name, m.flash_words, m.ram_bytes
+                    "UPDATED {key}: new entry (flash {} RAM {})",
+                    m.flash_words, m.ram_bytes
                 ));
                 to_save.push(m.clone());
             }
@@ -545,15 +599,22 @@ fn cases() -> Vec<Case> {
     ]
 }
 
-/// Run `epic-cc` for `c` and return its size-report stderr text.
-fn measure(c: &Case) -> String {
+/// Run `epic-cc` for `c` under `profile` (`"Os"` is the default flags,
+/// anything else is passed as `-O<profile>`) and return its size-report
+/// stderr text. A failing profile build fails the test: every profile
+/// must build every ladder row.
+fn measure(c: &Case, profile: &str) -> String {
     let hex_path = std::env::temp_dir().join(format!(
-        "size-regression-{}-{}.hex",
+        "size-regression-{}-{}-{}.hex",
         c.name,
+        profile,
         std::process::id()
     ));
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_epic-cc"));
     cmd.args(["--target", c.device]);
+    if profile != "Os" {
+        cmd.arg(format!("-{profile}"));
+    }
     for inc in &c.includes {
         cmd.arg("-I").arg(inc);
     }
@@ -566,9 +627,10 @@ fn measure(c: &Case) -> String {
     let _ = std::fs::remove_file(&hex_path);
     assert!(
         out.status.success(),
-        "epic-cc {} ({}): {}",
+        "epic-cc {} ({} -O{}): {}",
         c.name,
         c.device,
+        profile,
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stderr).into_owned()
@@ -649,6 +711,53 @@ fn print_report_json(measured: &[BaselineEntry], cases: &[Case]) {
     println!("SIZE_REPORT_JSON_END");
 }
 
+/// Gate one measured `(flash, ram)` pair against its baseline entry:
+/// growth fails, and under `strict` so does headroom. Skipped entirely
+/// on update runs (which record instead of asserting).
+fn check_gated(
+    key: &str,
+    flash_words: u32,
+    ram_bytes: u32,
+    base: Option<&BaselineEntry>,
+    update: bool,
+    strict: bool,
+    failures: &mut Vec<String>,
+) {
+    if update {
+        return;
+    }
+    let Some(base) = base else {
+        failures.push(format!(
+            "{key}: no baseline entry (run with UPDATE_SIZE_BASELINE=1 to add one)"
+        ));
+        return;
+    };
+    if flash_words > base.flash_words {
+        failures.push(format!(
+            "{key}: flash grew {} -> {} words (+{})",
+            base.flash_words,
+            flash_words,
+            flash_words - base.flash_words
+        ));
+    }
+    if ram_bytes > base.ram_bytes {
+        failures.push(format!(
+            "{key}: RAM grew {} -> {} bytes (+{})",
+            base.ram_bytes,
+            ram_bytes,
+            ram_bytes - base.ram_bytes
+        ));
+    }
+    if strict {
+        if let Some(msg) = drift_report(key, "flash", base.flash_words, flash_words) {
+            failures.push(msg);
+        }
+        if let Some(msg) = drift_report(key, "RAM", base.ram_bytes, ram_bytes) {
+            failures.push(msg);
+        }
+    }
+}
+
 #[test]
 fn flash_and_ram_do_not_regress() {
     let update = std::env::var("UPDATE_SIZE_BASELINE").is_ok();
@@ -657,79 +766,105 @@ fn flash_and_ram_do_not_regress() {
     // a perf change may shrink a program without re-baselining mid-iteration.
     let strict = std::env::var("STRICT_SIZE_BASELINE").is_ok();
     let baseline = load_baseline();
-    let mut measured = Vec::new();
+    let mut measured_os = Vec::new();
+    let mut measured_o2 = Vec::new();
     let mut rows = Vec::new();
     let mut failures = Vec::new();
 
     let cases = cases();
     // Validate the filter before measuring: a typo must fail fast, not
-    // after minutes of compiling every case.
-    let valid: Vec<String> = cases.iter().map(|c| c.name.to_string()).collect();
+    // after minutes of compiling every case. `-O2` rows filter as
+    // `name@O2`, `-Os` rows as the bare name.
+    let mut valid: Vec<String> = cases.iter().map(|c| c.name.to_string()).collect();
+    for c in &cases {
+        valid.push(entry_key(c.name, "O2"));
+    }
     let filter = update.then(|| parse_only_filter(&valid)).flatten();
     for c in &cases {
-        let report = measure(c);
+        // `-Os`: today's gate, unchanged semantics.
+        let report = measure(c, "Os");
         let flash_words = parse_after(&report, "flash: ");
         let ram_bytes = parse_after(&report, "RAM: ");
-        let base = baseline.entry.iter().find(|e| e.name == c.name).cloned();
-
-        if let Some(base) = &base {
-            if !update {
-                if flash_words > base.flash_words {
-                    failures.push(format!(
-                        "{}: flash grew {} -> {} words (+{})",
-                        c.name,
-                        base.flash_words,
-                        flash_words,
-                        flash_words - base.flash_words
-                    ));
-                }
-                if ram_bytes > base.ram_bytes {
-                    failures.push(format!(
-                        "{}: RAM grew {} -> {} bytes (+{})",
-                        c.name,
-                        base.ram_bytes,
-                        ram_bytes,
-                        ram_bytes - base.ram_bytes
-                    ));
-                }
-                if strict {
-                    if let Some(msg) = drift_report(c.name, "flash", base.flash_words, flash_words)
-                    {
-                        failures.push(msg);
-                    }
-                    if let Some(msg) = drift_report(c.name, "RAM", base.ram_bytes, ram_bytes) {
-                        failures.push(msg);
-                    }
-                }
-            }
-        } else if !update {
-            failures.push(format!(
-                "{}: no baseline entry (run with UPDATE_SIZE_BASELINE=1 to add one)",
-                c.name
-            ));
-        }
-
+        let base = baseline
+            .entry
+            .iter()
+            .find(|e| e.name == c.name && e.profile == "Os")
+            .cloned();
+        check_gated(
+            c.name,
+            flash_words,
+            ram_bytes,
+            base.as_ref(),
+            update,
+            strict,
+            &mut failures,
+        );
         rows.push(Row {
-            name: c.name,
+            name: c.name.to_string(),
             device: c.device,
             flash_words,
             flash_baseline: base.as_ref().map(|b| b.flash_words),
             ram_bytes,
             ram_baseline: base.as_ref().map(|b| b.ram_bytes),
+            gated: true,
         });
-        measured.push(BaselineEntry {
+        measured_os.push(BaselineEntry {
             name: c.name.to_string(),
             device: c.device.to_string(),
+            profile: "Os".to_string(),
             flash_words,
             ram_bytes,
+        });
+
+        // `-O2`: every row must build; numbers gate only the baselined
+        // subset (plus any row that already carries an `-O2` entry, so a
+        // recorded number is never silently ignored).
+        let report = measure(c, "O2");
+        let flash_words = parse_after(&report, "flash: ");
+        let ram_bytes = parse_after(&report, "RAM: ");
+        let base = baseline
+            .entry
+            .iter()
+            .find(|e| e.name == c.name && e.profile == "O2")
+            .cloned();
+        let key = entry_key(c.name, "O2");
+        let gated = O2_BASELINED.contains(&c.name) || base.is_some();
+        if gated {
+            check_gated(
+                &key,
+                flash_words,
+                ram_bytes,
+                base.as_ref(),
+                update,
+                strict,
+                &mut failures,
+            );
+            measured_o2.push(BaselineEntry {
+                name: c.name.to_string(),
+                device: c.device.to_string(),
+                profile: "O2".to_string(),
+                flash_words,
+                ram_bytes,
+            });
+        }
+        rows.push(Row {
+            name: key,
+            device: c.device,
+            flash_words,
+            flash_baseline: base.as_ref().map(|b| b.flash_words),
+            ram_bytes,
+            ram_baseline: base.as_ref().map(|b| b.ram_bytes),
+            gated,
         });
     }
     write_step_summary(&rows);
     if std::env::var("SIZE_REPORT_JSON").is_ok() {
-        print_report_json(&measured, &cases);
+        print_report_json(&measured_os, &cases);
         return;
     }
 
+    let mut measured = measured_os;
+    measured.extend(measured_o2);
     if update {
         let (to_save, updated, skipped) = merge_baseline(&baseline, &measured, filter.as_ref());
         save_baseline(&Baseline { entry: to_save });
@@ -756,19 +891,22 @@ fn flash_and_ram_do_not_regress() {
 /// One ladder entry's measured-vs-baseline numbers, for the step-summary
 /// table. `*_baseline` is `None` for a case with no recorded baseline yet
 /// (only possible with `UPDATE_SIZE_BASELINE=1`, which is about to add
-/// one).
+/// one), or for an `-O2` row outside the baselined subset (`gated` false),
+/// where the build is covered but the number is not.
 struct Row {
-    name: &'static str,
+    name: String,
     device: &'static str,
     flash_words: u32,
     flash_baseline: Option<u32>,
     ram_bytes: u32,
     ram_baseline: Option<u32>,
+    gated: bool,
 }
 
-fn signed_delta(current: u32, baseline: Option<u32>) -> String {
+fn signed_delta(current: u32, baseline: Option<u32>, gated: bool) -> String {
     match baseline {
-        None => "(new)".to_string(),
+        None if gated => "(new)".to_string(),
+        None => "build only".to_string(),
         Some(b) => {
             let d = current as i64 - b as i64;
             if d > 0 {
@@ -803,12 +941,12 @@ fn write_step_summary(rows: &[Row]) {
             r.flash_baseline
                 .map(|b| format!(" / {b}"))
                 .unwrap_or_default(),
-            signed_delta(r.flash_words, r.flash_baseline),
+            signed_delta(r.flash_words, r.flash_baseline, r.gated),
             r.ram_bytes,
             r.ram_baseline
                 .map(|b| format!(" / {b}"))
                 .unwrap_or_default(),
-            signed_delta(r.ram_bytes, r.ram_baseline),
+            signed_delta(r.ram_bytes, r.ram_baseline, r.gated),
         ));
     }
     use std::io::Write;
@@ -860,6 +998,7 @@ fn merge_baseline_scoped_filter_keeps_foreign_rows() {
             BaselineEntry {
                 name: "a".into(),
                 device: "d".into(),
+                profile: "Os".into(),
                 flash_words: 100,
                 ram_bytes: 10,
             },
@@ -867,6 +1006,7 @@ fn merge_baseline_scoped_filter_keeps_foreign_rows() {
                 name: "b".into(),
                 device: "d".into(),
                 flash_words: 200,
+                profile: "Os".into(),
                 ram_bytes: 20,
             },
         ],
@@ -876,6 +1016,7 @@ fn merge_baseline_scoped_filter_keeps_foreign_rows() {
             name: "a".into(),
             device: "d".into(),
             flash_words: 110,
+            profile: "Os".into(),
             ram_bytes: 10,
         },
         BaselineEntry {
@@ -883,6 +1024,7 @@ fn merge_baseline_scoped_filter_keeps_foreign_rows() {
             device: "d".into(),
             flash_words: 190,
             ram_bytes: 20,
+            profile: "Os".into(),
         },
     ];
     let filter: std::collections::HashSet<String> = ["a".to_string()].into_iter().collect();
@@ -914,6 +1056,7 @@ fn merge_baseline_skips_new_case_outside_filter() {
         name: "new-case".into(),
         device: "d".into(),
         flash_words: 50,
+        profile: "Os".into(),
         ram_bytes: 5,
     }];
     let filter: std::collections::HashSet<String> = ["other".to_string()].into_iter().collect();
@@ -935,6 +1078,7 @@ fn merge_baseline_without_filter_rewrites_changed_rows() {
             name: "a".into(),
             device: "d".into(),
             flash_words: 100,
+            profile: "Os".into(),
             ram_bytes: 10,
         }],
     };
@@ -942,10 +1086,48 @@ fn merge_baseline_without_filter_rewrites_changed_rows() {
         name: "a".into(),
         device: "d".into(),
         flash_words: 105,
+        profile: "Os".into(),
         ram_bytes: 10,
     }];
     let (saved, updated, skipped) = merge_baseline(&baseline, &measured, None);
     assert_eq!(saved[0].flash_words, 105);
     assert_eq!(updated.len(), 1);
     assert!(skipped.is_empty());
+}
+
+#[test]
+fn merge_baseline_keys_o2_rows_apart_from_os_rows() {
+    let baseline = Baseline {
+        entry: vec![BaselineEntry {
+            name: "a".into(),
+            device: "d".into(),
+            profile: "Os".into(),
+            flash_words: 100,
+            ram_bytes: 10,
+        }],
+    };
+    let measured = vec![
+        BaselineEntry {
+            name: "a".into(),
+            device: "d".into(),
+            profile: "Os".into(),
+            flash_words: 100,
+            ram_bytes: 10,
+        },
+        BaselineEntry {
+            name: "a".into(),
+            device: "d".into(),
+            profile: "O2".into(),
+            flash_words: 120,
+            ram_bytes: 12,
+        },
+    ];
+    let (saved, updated, _) = merge_baseline(&baseline, &measured, None);
+    assert_eq!(saved.len(), 2, "both profiles survive the merge");
+    assert_eq!(updated.len(), 1, "only the new O2 row is an update");
+    assert!(
+        updated[0].contains("a@O2"),
+        "the O2 row reports under its profile key: {}",
+        updated[0]
+    );
 }
