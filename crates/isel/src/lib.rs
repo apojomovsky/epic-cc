@@ -2734,7 +2734,16 @@ impl<'m> Gen<'m> {
                 }
             } else {
                 let aty = arg.ty.expect("isel: scalar call arg must carry a type");
-                self.emit_move_val_to_slot(&arg.val, aty, pa);
+                // A homed call arg (epic-cc#830) already lives at `pa`: the
+                // defining write targeted the callee slot, so the copy is
+                // dead. Skipping the load is safe: call sites store outside
+                // flag-live windows (see `emit_move_val_to_slot`).
+                let homed = matches!(&arg.val, Val::Reg(_))
+                    && aty.bytes() == callee.params[i].width
+                    && matches!(self.val_addr(&arg.val), Slot::Direct(sa) if sa == pa);
+                if !homed {
+                    self.emit_move_val_to_slot(&arg.val, aty, pa);
+                }
                 // Conversion ABI: the four conversion routines take
                 // their value in a fixed 4-byte `val` slot, but i8/i16
                 // sources are copied by their own width: the leftover

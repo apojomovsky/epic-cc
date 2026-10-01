@@ -2413,12 +2413,25 @@ fn ir_fold_lines(ir_reg: &str, c_local: &str, width: u8, reg: &mut u32) -> (Vec<
 /// or a host and PIC checksum mismatch. The reducer preserves the
 /// classification (`FailureKind`).
 pub fn run_differential(program: &Program, device: &device::Device) -> Result<u32, Failure> {
+    run_differential_with_profile(program, device, None)
+}
+
+/// Same as `run_differential`, but the PIC side compiles under
+/// `-O<profile>` when `profile` is `Some` (`"O2"` today). Profiles change
+/// shaping, never semantics, so a differential-clean seed stays clean:
+/// this is the `-O2` slice of the differential gate (epic-cc#839). The
+/// host side is profile-independent. `None` is the default flags.
+pub fn run_differential_with_profile(
+    program: &Program,
+    device: &device::Device,
+    profile: Option<&str>,
+) -> Result<u32, Failure> {
     let dir = WorkDir::new();
     let c_path = dir.path.join("prog.c");
     std::fs::write(&c_path, &program.c_source)
         .map_err(|e| Failure::new(FailureKind::Harness, format!("write prog.c: {e}")))?;
 
-    let pic = run_pic(program, &c_path, &dir, device)?;
+    let pic = run_pic(program, &c_path, &dir, device, profile)?;
     let host = run_host(program, &c_path, &dir)?;
 
     if pic == host {
@@ -2604,10 +2617,11 @@ fn run_pic(
     c_path: &Path,
     dir: &WorkDir,
     device: &device::Device,
+    profile: Option<&str>,
 ) -> Result<u32, Failure> {
     let hex_path = dir.path.join("prog.hex");
     let map_path = dir.path.join("prog.map");
-    run_driver(c_path, &hex_path, &map_path, device)?;
+    run_driver(c_path, &hex_path, &map_path, device, profile)?;
     let layout = driver_globals(&map_path)?;
     let checksum_addr = *layout.get(&program.checksum_name).ok_or_else(|| {
         Failure::new(
@@ -3127,16 +3141,21 @@ fn run_driver(
     hex_path: &Path,
     map_path: &Path,
     device: &device::Device,
+    profile: Option<&str>,
 ) -> Result<(), Failure> {
     let (clang, resdir) = pic_clang().map_err(|e| Failure::new(FailureKind::Harness, e))?;
     let driver = driver_binary(device).map_err(|e| Failure::new(FailureKind::Harness, e))?;
-    let out = Command::new(&driver)
-        .arg(c_path)
+    let mut cmd = Command::new(&driver);
+    cmd.arg(c_path)
         .arg("-o")
         .arg(hex_path)
         .arg("--map")
         .arg(map_path)
-        .args(["--device", device.name])
+        .args(["--device", device.name]);
+    if let Some(p) = profile {
+        cmd.arg(format!("-{p}"));
+    }
+    let out = cmd
         .env("PIC8_CLANG_UNWRAPPED", &clang)
         .env("PIC8_CLANG_RESOURCE_DIR", &resdir)
         .output()

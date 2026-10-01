@@ -380,7 +380,9 @@ fn json_str(s: &str) -> String {
 
 /// The `--report` file: the build's facts as JSON for tools that act on
 /// them (the PlatformIO size bar and pre-flash checks, docs/46 D-7, D-9).
-/// The format is a contract; ADR-025 defines every key and null.
+/// The format is a contract; ADR-025 defines every key and null, and the
+/// optimization-profiles ADR adds `opt_level` (the `-O` profile that
+/// built this report, `"O0"`/`"O1"`/`"O2"`/`"Os"`).
 pub fn report_json(
     device: &Device,
     layout: &AllocLayout,
@@ -388,6 +390,7 @@ pub fn report_json(
     flash_used: usize,
     config: Option<&[u8]>,
     clock_hz: u64,
+    opt_level: &str,
 ) -> String {
     let (ram_used, ram_total) = ram_usage(device, layout, uses);
     // With no configuration the HEX carries no config words, so the part
@@ -426,7 +429,7 @@ pub fn report_json(
         })
         .collect();
     format!(
-        "{{\n  \"version\": 2,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
+        "{{\n  \"version\": 2,\n  \"device\": {},\n  \"core\": \"{core}\",\n  \"opt_level\": \"{opt_level}\",\n  \"flash_words\": {{ \"used\": {flash_used}, \"total\": {} }},\n  \"ram_bytes\": {{ \"used\": {ram_used}, \"total\": {ram_total} }},\n  \"clock_hz\": {clock},\n  \"config\": {{\n    \"source\": \"{source}\",\n    \"base_byte_addr\": {},\n    \"bytes\": {byte_list},\n    \"fields\": {{\n{}\n    }}\n  }}\n}}\n",
         json_str(device.name),
         device.flash_words,
         device.config.base_byte_addr,

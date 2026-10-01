@@ -63,9 +63,9 @@ flag bit, `_delay` counters, dynamic-memcpy counters, large const
 tables, signed wide compares; `fixed_uses` in `crates/driver/src/
 report.rs`) and counts only those bytes, plus the full 4-byte retval
 save under `has_isr` (every ISR prologue saves and restores all 4).
-PIC14 scratch stays always counted. Nothing else in the report moves,
-and the emitted code is byte-identical, so this is version `2` by the
-rule above: same keys, smaller `ram_bytes.used` on programs that leave
+PIC14 scratch stays always counted. The emitted code is byte-identical,
+so this is version `2` by the rule above: the `opt_level` key from the
+profiles track plus smaller `ram_bytes.used` on programs that leave
 fixed bytes idle.
 
 ## Rationale
