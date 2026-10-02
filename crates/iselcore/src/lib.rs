@@ -630,3 +630,344 @@ fn select_arm_is_runtime_value(v: &ir::Val, resolved: &PtrResolution, fname: &st
         },
     }
 }
+
+/// How one `Load` keeps its byte out of an overlay slot (epic-cc#863).
+/// `Direct` feeds a single ALU op, which reads the source global as its
+/// memory operand. `ThreadW` feeds two or more stores, which write back
+/// the byte the load left in W, naming source then destinations. Both
+/// preserve the single volatile read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoadFold {
+    Direct(String),
+    ThreadW(String, Vec<String>),
+}
+
+/// Producer regs needing no overlay slot. `loads` maps a folded load to
+/// its source (and stores). `forwarded` maps a single-use `Load`/`Bin`
+/// result computed straight into a store destination to that store's
+/// global. `alloc` drops both sets; `isel-pic18` skips their staged
+/// copies. One predicate serves both so a dropped slot is never read.
+#[derive(Clone, Debug, Default)]
+pub struct ValueFolds {
+    pub loads: HashMap<String, LoadFold>,
+    pub forwarded: HashMap<String, String>,
+}
+
+impl ValueFolds {
+    /// Every reg with no slot: folded loads plus forwarded producers.
+    pub fn unplaced(&self) -> HashSet<String> {
+        let mut out: HashSet<String> = self.forwarded.keys().cloned().collect();
+        out.extend(self.loads.keys().cloned());
+        out
+    }
+}
+
+/// A gap instruction the fold may move a global read past: a pure lane
+/// copy with no memory behavior. Anything reading or writing memory, or
+/// calling out, disqualifies the fold.
+fn fold_gap_pure(inst: &Inst) -> bool {
+    matches!(
+        inst,
+        Inst::Zext(_)
+            | Inst::Sext(_)
+            | Inst::Trunc(_)
+            | Inst::Freeze(_)
+            | Inst::Select(_)
+            | Inst::Gep(_)
+            | Inst::IntToPtr(_)
+            | Inst::Alloca(_)
+            | Inst::Phi(_)
+    )
+}
+
+/// The `Store`/`Load`/call span test `isel-pic18` folds under
+/// (epic-cc#723): no memory behavior may sit between producer and
+/// consumer, since the folded access moves to the producer.
+fn fold_span_clean(insts: &[Inst]) -> bool {
+    insts.iter().all(|i| match i {
+        Inst::Call(_)
+        | Inst::Asm(_)
+        | Inst::Store(_)
+        | Inst::Memcpy(_)
+        | Inst::VaStart(_)
+        | Inst::VaArg(_)
+        | Inst::Load(_)
+        | Inst::Br(_)
+        | Inst::BrCond(_)
+        | Inst::Switch(_)
+        | Inst::Ret(_, _) => false,
+        _ => true,
+    })
+}
+
+/// Load and store folds for one function, shared by `alloc` (slot
+/// placement) and `isel-pic18` (copy elision). Three shapes, each
+/// preserving volatile access count and order:
+///
+/// - a single-use load feeding one ALU `Bin` operand reads the source
+///   global as the memory operand (`LoadFold::Direct`, except into
+///   `Or`: those binops feed the boolean lanes);
+/// - a load feeding only stores leaves the byte in W for each store
+///   (`LoadFold::ThreadW`, single bytes only);
+/// - a single-use load or ALU `Bin` feeding a store computes into the
+///   store destination (`forwarded`, the epic-cc#723 subset with
+///   direct-global sources and destinations).
+///
+/// `access_safe` names the globals a direct access reads or writes with
+/// no bank select. A folded direct read replaces a bankless `MOVFF`, so
+/// a banked source would cost a `MOVLB` word. `alloc` passes the set
+/// from its no-fold placement, `isel-pic18` from the final map; the two
+/// agree on every dropped slot (argued at the `alloc` call site).
+/// `None` folds nothing, for `alloc`'s bounding pass.
+///
+/// The `forwarded` subset under-approximates `isel-pic18`: address-only
+/// cases (derived pointers, wide staged copies) and lane-eaten
+/// producers stay placed, and `isel-pic18` may still fold them. A
+/// dropped slot is therefore never read. Loads adjacent to an `Icmp`
+/// stay out: a bit lane may read the source directly itself, which
+/// would double a volatile read.
+pub fn find_value_folds(
+    f: &ir::Func,
+    m: &Module,
+    resolved: &PtrResolution,
+    access_safe: Option<&HashSet<String>>,
+) -> ValueFolds {
+    let mut out = ValueFolds::default();
+    let Some(safe) = access_safe else {
+        return out;
+    };
+    let mut uses: HashMap<String, usize> = HashMap::new();
+    for b in &f.blocks {
+        for inst in &b.insts {
+            for r in ir::read_vals(inst) {
+                if r.is_empty() {
+                    continue;
+                }
+                *uses.entry(r).or_insert(0) += 1;
+            }
+        }
+    }
+    // A load source both stages read as RAM: a known mutable global.
+    // Flash consts read through TBLRD, so they never fold.
+    let ram_source = |ptr: &str| -> Option<String> {
+        let g = ptr.strip_prefix('@')?;
+        let known = m.globals.iter().find(|x| x.name == g)?;
+        if known.is_const {
+            return None;
+        }
+        Some(g.to_string())
+    };
+    // Def site of a load/binop producer: (block, inst), function-wide.
+    let mut def_at: HashMap<&str, (usize, usize)> = HashMap::new();
+    for (bi, b) in f.blocks.iter().enumerate() {
+        for (ii, inst) in b.insts.iter().enumerate() {
+            match inst {
+                Inst::Load(l) => {
+                    def_at.insert(l.dst.as_str(), (bi, ii));
+                }
+                Inst::Bin(q) => {
+                    def_at.insert(q.dst.as_str(), (bi, ii));
+                }
+                _ => {}
+            }
+        }
+    }
+    // Shape 1: single-use load into one ALU operand.
+    for b in &f.blocks {
+        for (ci, inst) in b.insts.iter().enumerate() {
+            let Inst::Bin(q) = inst else { continue };
+            // `Or` stays staged: its binops feed the boolean lanes, whose
+            // accumulator reads the slot. Folding it would starve the lane.
+            if !matches!(
+                q.op,
+                ir::BinOp::Add | ir::BinOp::Sub | ir::BinOp::And | ir::BinOp::Xor
+            ) {
+                continue;
+            }
+            let n = q.ty.bytes();
+            for operand in [&q.a, &q.b] {
+                let ir::Val::Reg(r) = operand else { continue };
+                if uses.get(r).copied().unwrap_or(0) != 1 {
+                    continue;
+                }
+                let Some(&(bi, pi)) = def_at.get(r.as_str()) else {
+                    continue;
+                };
+                if f.blocks[bi].label != b.label || pi >= ci {
+                    continue;
+                }
+                let Inst::Load(l) = &f.blocks[bi].insts[pi] else {
+                    continue;
+                };
+                let Some(g) = ram_source(&l.ptr) else {
+                    continue;
+                };
+                // A banked source would trade its bankless `MOVFF` for a
+                // `MOVLB` word. Only access-bank sources fold.
+                if !safe.contains(&g) {
+                    continue;
+                }
+                if l.ptr_ty || l.ty.bytes() != n {
+                    continue;
+                }
+                if resolved.contains_key(&ssa_key(&f.name, r)) {
+                    continue;
+                }
+                // A lane may claim an icmp-adjacent load as its direct
+                // field, reading the source a second time. Stay out.
+                if matches!(b.insts.get(pi + 1), Some(Inst::Icmp(_))) {
+                    continue;
+                }
+                if !f.blocks[bi].insts[pi + 1..ci].iter().all(fold_gap_pure) {
+                    continue;
+                }
+                out.loads.insert(r.clone(), LoadFold::Direct(g));
+            }
+        }
+    }
+    // Shape 2: one load fanned out to stores only. W carries the byte:
+    // the gap holds nothing but the consuming stores, each of which
+    // preserves W.
+    for b in f.blocks.iter() {
+        for (pi, inst) in b.insts.iter().enumerate() {
+            let Inst::Load(l) = inst else { continue };
+            let Some(g) = ram_source(&l.ptr) else {
+                continue;
+            };
+            if l.ptr_ty || l.ty.bytes() != 1 {
+                continue;
+            }
+            if resolved.contains_key(&ssa_key(&f.name, &l.dst)) {
+                continue;
+            }
+            if uses.get(&l.dst).copied().unwrap_or(0) < 2 {
+                continue;
+            }
+            // Both the read and every write go direct, so the source
+            // must be bank-select free; destinations check below.
+            if !safe.contains(&g) {
+                continue;
+            }
+            let mut last = pi;
+            let mut ok = true;
+            let mut dsts: Vec<String> = Vec::new();
+            for (si, other) in b.insts.iter().enumerate() {
+                if si == pi {
+                    continue;
+                }
+                let used_here = ir::read_vals(other).contains(&l.dst);
+                if si < pi && used_here {
+                    ok = false;
+                    break;
+                }
+                if si > pi && used_here {
+                    let Inst::Store(s) = other else {
+                        ok = false;
+                        break;
+                    };
+                    if !matches!(&s.val, ir::Val::Reg(v) if v == &l.dst) {
+                        ok = false;
+                        break;
+                    }
+                    if !s.ptr.starts_with('@') || s.ty.bytes() != 1 {
+                        ok = false;
+                        break;
+                    }
+                    // A banked destination would trade its bankless
+                    // `MOVFF` for a `MOVLB` word. Only access-bank
+                    // destinations thread.
+                    let dst = s.ptr.strip_prefix('@').expect("checked @-form above");
+                    if !safe.contains(dst) {
+                        ok = false;
+                        break;
+                    }
+                    dsts.push(dst.to_string());
+                    last = last.max(si);
+                }
+            }
+            if !ok {
+                continue;
+            }
+            // Uses in other blocks, or any gap instruction that is not
+            // one of the consuming stores, keep the staged copy.
+            let elsewhere = uses.get(&l.dst).copied().unwrap_or(0)
+                != b.insts
+                    .iter()
+                    .filter(|i| ir::read_vals(i).contains(&l.dst))
+                    .count();
+            if elsewhere {
+                continue;
+            }
+            if !b.insts[pi + 1..last].iter().all(|i| match i {
+                Inst::Store(s) => matches!(&s.val, ir::Val::Reg(v) if v == &l.dst),
+                _ => false,
+            }) {
+                continue;
+            }
+            out.loads.insert(l.dst.clone(), LoadFold::ThreadW(g, dsts));
+        }
+    }
+    // Shape 3: single-use load/binop into a direct-global store. The
+    // epic-cc#723 subset `alloc` can verify without addresses: wide
+    // staged copies and non-global destinations stay placed.
+    for b in &f.blocks {
+        for (si, inst) in b.insts.iter().enumerate() {
+            let Inst::Store(s) = inst else { continue };
+            let ir::Val::Reg(r) = &s.val else { continue };
+            if uses.get(r).copied().unwrap_or(0) != 1 {
+                continue;
+            }
+            let Some(dst) = s.ptr.strip_prefix('@') else {
+                continue;
+            };
+            let Some(known) = m.globals.iter().find(|x| x.name == dst) else {
+                continue;
+            };
+            if known.is_const {
+                continue;
+            }
+            let Some(&(pbi, pi)) = def_at.get(r.as_str()) else {
+                continue;
+            };
+            if f.blocks[pbi].label != b.label || pi >= si {
+                continue;
+            }
+            // A lane target or a lane-eaten intermediate keeps its
+            // slot: `Or` binops feed the boolean lanes, and a load
+            // feeding an adjacent compare may become a lane field.
+            match &f.blocks[pbi].insts[pi] {
+                Inst::Load(l) => {
+                    if l.ty.bytes() != s.ty.bytes() || l.ptr_ty {
+                        continue;
+                    }
+                    if ram_source(&l.ptr).is_none() {
+                        continue;
+                    }
+                    if l.ty.bytes() != 1 {
+                        continue;
+                    }
+                    if matches!(b.insts.get(pi + 1), Some(Inst::Icmp(_))) {
+                        continue;
+                    }
+                }
+                Inst::Bin(q) => {
+                    if q.ty.bytes() != s.ty.bytes() {
+                        continue;
+                    }
+                    if !matches!(
+                        q.op,
+                        ir::BinOp::Add | ir::BinOp::Sub | ir::BinOp::And | ir::BinOp::Xor
+                    ) {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+            if !fold_span_clean(&f.blocks[pbi].insts[pi + 1..si]) {
+                continue;
+            }
+            out.forwarded.insert(r.clone(), dst.to_string());
+        }
+    }
+    out
+}
