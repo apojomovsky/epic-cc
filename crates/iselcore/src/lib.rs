@@ -700,32 +700,15 @@ fn fold_span_clean(insts: &[Inst]) -> bool {
     })
 }
 
-/// Load and store folds for one function, shared by `alloc` (slot
-/// placement) and `isel-pic18` (copy elision). Three shapes, each
-/// preserving volatile access count and order:
+/// Load/store folds for one function, shared by `alloc` and
+/// `isel-pic18` (epic-cc#863). Single-use loads feeding ALU operands
+/// read the source global (`Direct`, never into `Or`), loads feeding
+/// only stores ride W (`ThreadW`), and single-use producers feeding
+/// stores compute into the destination (`forwarded`).
 ///
-/// - a single-use load feeding one ALU `Bin` operand reads the source
-///   global as the memory operand (`LoadFold::Direct`, except into
-///   `Or`: those binops feed the boolean lanes);
-/// - a load feeding only stores leaves the byte in W for each store
-///   (`LoadFold::ThreadW`, single bytes only);
-/// - a single-use load or ALU `Bin` feeding a store computes into the
-///   store destination (`forwarded`, the epic-cc#723 subset with
-///   direct-global sources and destinations).
-///
-/// `access_safe` names the globals a direct access reads or writes with
-/// no bank select. A folded direct read replaces a bankless `MOVFF`, so
-/// a banked source would cost a `MOVLB` word. `alloc` passes the set
-/// from its no-fold placement, `isel-pic18` from the final map; the two
-/// agree on every dropped slot (argued at the `alloc` call site).
-/// `None` folds nothing, for `alloc`'s bounding pass.
-///
-/// The `forwarded` subset under-approximates `isel-pic18`: address-only
-/// cases (derived pointers, wide staged copies) and lane-eaten
-/// producers stay placed, and `isel-pic18` may still fold them. A
-/// dropped slot is therefore never read. Loads adjacent to an `Icmp`
-/// stay out: a bit lane may read the source directly itself, which
-/// would double a volatile read.
+/// `access_safe` names globals needing no bank select; `None` folds
+/// nothing. Lane-eaten producers and icmp-adjacent loads stay out,
+/// so a dropped slot is never read twice or by a lane.
 pub fn find_value_folds(
     f: &ir::Func,
     m: &Module,
