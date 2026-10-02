@@ -23,9 +23,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use device::Device;
+use device::{Core, Device};
 use ir::{Inst, Module};
-use iselcore::{resolve_pointers, ssa_key, Base, PtrResolution};
+use iselcore::{find_value_folds, resolve_pointers, ssa_key, Base, PtrResolution, ValueFolds};
 
 /// Complete address map: globals keyed by name, locals keyed `{func}::{name}`,
 /// plus the total overlay span (in bytes) across all banks. `const_globals`
@@ -379,7 +379,12 @@ fn block_order(f: &ir::Func) -> Vec<&ir::Block> {
 /// immediately reusable. Greedy first-fit coloring reuses the lowest slot
 /// whose interval is disjoint; the slot's width grows to the widest
 /// occupant.
-fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLayout {
+fn frame_layout(
+    f: &ir::Func,
+    resolved: &PtrResolution,
+    va_size: u16,
+    unplaced: &HashSet<String>,
+) -> FrameLayout {
     let order = block_order(f);
     let idx: HashMap<&str, usize> = order
         .iter()
@@ -607,8 +612,14 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
     // point interval, immediately reusable. A memory object spans the whole
     // function (its slot is a RAM region, live from entry to exit), so it
     // never aliases anything.
+    // A folded or forwarded producer (epic-cc#863) needs no slot: isel
+    // reads the source or computes into the store destination, so no
+    // interval enters coloring and no address leaves placement.
     let mut vals: Vec<(&String, (usize, u16), (usize, u16), u8, usize)> = Vec::new();
     for (v, &(d, p_d, w, o, mem)) in &defs {
+        if unplaced.contains(v) {
+            continue;
+        }
         let (lo, hi) = if mem {
             (
                 (0usize, 0u16),
@@ -864,6 +875,9 @@ fn frame_layout(f: &ir::Func, resolved: &PtrResolution, va_size: u16) -> FrameLa
     // `frame_end`, which on a split-bank device can move a callee's base.
     let mut heat: Vec<u32> = vec![0; widths.len()];
     for (v, &(_, _, _, _, mem)) in &defs {
+        if unplaced.contains(v) {
+            continue;
+        }
         let slot = slot_of[v];
         let reads = if mem {
             0
@@ -1699,7 +1713,42 @@ fn home_args(
     sel
 }
 
+/// Whole-program overlay address allocation (entry point used by the
+/// driver, the `alloc` binary, and tests). On PIC18 with fitting frames
+/// it pairs two passes (epic-cc#863): a bounding pass with every slot
+/// placed, whose globals name the access-safe fold set, then the gated
+/// pass that drops those slots. Other cores, and layouts that fall back
+/// to globals-first, take the bounding pass as the result.
 pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
+    let (nofold, fit) = allocate_inner(device, m, edges_text, None);
+    if device.core != Core::Pic18 || !fit {
+        return nofold;
+    }
+    let Some((_, hi)) = device.access_bank else {
+        return nofold;
+    };
+    // Same bank test `isel-pic18` applies to the final map, so its
+    // folds agree with these drops on every placed slot.
+    let safe: HashSet<String> = m
+        .globals
+        .iter()
+        .filter(|g| !g.is_const && nofold.globals.get(&g.name).is_some_and(|a| *a <= hi))
+        .map(|g| g.name.clone())
+        .collect();
+    allocate_inner(device, m, edges_text, Some(&safe)).0
+}
+
+/// Address allocation with a value-fold gate (epic-cc#863). `None`
+/// places every slot; `Some` drops the access-safe folds it names. The
+/// public `allocate` pairs a bounding pass with the gated one. The
+/// `bool` reports whether the frames fit below the globals; when they
+/// do not, the globals-first fallback owns the layout instead.
+fn allocate_inner(
+    device: &Device,
+    m: &Module,
+    edges_text: &str,
+    gate: Option<&HashSet<String>>,
+) -> (AllocLayout, bool) {
     // The va region size frame_layout reserves: the widest call site, with
     // a one-byte floor so a variadic function whose call sites pass no
     // extra args still has a base address for its va_start (epic-cc#391).
@@ -1715,6 +1764,25 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     // slot materializes its two address bytes into the dst slot, so the
     // dst needs a RAM slot; a folded select is virtual and defines none.
     let resolved = resolve_pointers(m);
+    // Value folds (epic-cc#863): producers needing no slot, computed by
+    // the predicate `isel-pic18` shares, so a dropped slot is never
+    // read. Other cores keep every slot: their backends still address
+    // staged copies. The gate names access-safe globals; `None` folds
+    // nothing, for the bounding pass.
+    let folds: HashMap<String, ValueFolds> = if device.core == Core::Pic18 {
+        m.funcs
+            .iter()
+            .map(|f| (f.name.clone(), find_value_folds(f, m, &resolved, gate)))
+            .collect()
+    } else {
+        HashMap::new()
+    };
+    let unplaced: HashMap<String, HashSet<String>> = folds
+        .iter()
+        .map(|(f, folds)| (f.clone(), folds.unplaced()))
+        .collect();
+    let no_fold: HashSet<String> = HashSet::new();
+    let unplaced_in = |name: &str| unplaced.get(name).unwrap_or(&no_fold);
 
     // Steps 1-5 shape the frame overlay over a region whose start is still
     // open. Nothing here depends on where the globals land, which is what
@@ -1782,7 +1850,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let mut locals_size: HashMap<String, u16> = HashMap::new();
     let va_sizes = va_sizes(m);
     for f in &m.funcs {
-        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
+        let fl = frame_layout(
+            f,
+            &resolved,
+            floored_va_size(f, &va_sizes),
+            unplaced_in(&f.name),
+        );
         locals_widths.insert(f.name.clone(), fl.widths);
         locals_size.insert(f.name.clone(), fl.size);
     }
@@ -2785,6 +2858,39 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         device.gpr_start()
     };
     globals.extend(floating_map);
+    // Value-fold placement check (epic-cc#863): every dropped slot's
+    // globals must be bank-select free in the final map, or `isel-pic18`
+    // declines the fold and reads a slot that is not there. The gated
+    // pass only shrinks the overlay, so globals never move up out of
+    // the access bank; a violation panics rather than miscompiling.
+    if gate.is_some() {
+        let hi = device.access_bank.map(|(_, hi)| hi).unwrap_or(u16::MAX);
+        let placed = |g: &str| globals.get(g).is_some_and(|a| *a <= hi);
+        for folds in folds.values() {
+            for fold in folds.loads.values() {
+                match fold {
+                    iselcore::LoadFold::Direct(g) => {
+                        assert!(placed(g), "alloc: folded source @{g} left the access bank");
+                    }
+                    iselcore::LoadFold::ThreadW(g, dsts) => {
+                        assert!(
+                            placed(g),
+                            "alloc: threaded source @{g} left the access bank"
+                        );
+                        for d in dsts {
+                            assert!(placed(d), "alloc: threaded store @{d} left the access bank");
+                        }
+                    }
+                }
+            }
+            for dst in folds.forwarded.values() {
+                assert!(
+                    globals.contains_key(dst),
+                    "alloc: forwarded store to unmapped @{dst}"
+                );
+            }
+        }
+    }
 
     // end_of_globals = max over the address map of the physical end (addr +
     // width, or the bank-straddling physical end on PIC14E), floored at the
@@ -2823,7 +2929,12 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
     let win_end = device.access_bank.map(|(_, hi)| hi + 1);
     for f in &m.funcs {
         let b = base[&f.name];
-        let fl = frame_layout(f, &resolved, floored_va_size(f, &va_sizes));
+        let fl = frame_layout(
+            f,
+            &resolved,
+            floored_va_size(f, &va_sizes),
+            unplaced_in(&f.name),
+        );
         // The frame end the coloring's own slot order produces; every callee
         // base is derived from it (`frame_end` over `locals_widths`), so a
         // permutation that moved it would silently rebase the callees.
@@ -2933,20 +3044,23 @@ pub fn allocate(device: &Device, m: &Module, edges_text: &str) -> AllocLayout {
         .max()
         .unwrap_or(0);
 
-    AllocLayout {
-        globals,
-        locals,
-        total_bank0,
-        const_globals,
-        staged_consts: staged,
-        address_taken_consts,
-        bank_used,
-        isr_bytes,
-        has_isr: !isr_names.is_empty(),
-        isr_low_save,
-        isr_save,
-        isr_hi_save,
-    }
+    (
+        AllocLayout {
+            globals,
+            locals,
+            total_bank0,
+            const_globals,
+            staged_consts: staged,
+            address_taken_consts,
+            bank_used,
+            isr_bytes,
+            has_isr: !isr_names.is_empty(),
+            isr_low_save,
+            isr_save,
+            isr_hi_save,
+        },
+        frames_fit,
+    )
 }
 
 /// The value a defining instruction writes: `(name, byte width)`, or `None`
