@@ -218,6 +218,15 @@ mechanical rules fails the ritual and blocks the push.
   (,).** The commit-msg hook rejects both. Use a comma, a colon, or a
   period instead. Git history is the record; the commit message is
   yours.
+- **Breaking changes carry the `!` marker** (`feat!: ...`,
+  `fix(scope)!: ...`). Breaking means a change to any of these surfaces:
+  CLI flags and behaviour, the accepted C dialect, intrinsics, pragmas,
+  device headers, config syntax. Reviewers reject a breaking change without
+  the marker. The marker drives the release bump (minor before 1.0, major
+  after) and the Breaking notes section.
+- **Version truth is `crates/driver/Cargo.toml`.** `cut-release.yml` bumps
+  it to the release tag on every cut, and release bundles report it from
+  `epic-cc --version`. Nothing else carries the version.
 - **PR bodies use real newlines.** ``gh pr create --body-file`` or a
   heredoc, never ``--body "line\nnext"``. Literal ``\n`` is rejected by
   takeoff and by ``.github/workflows/pr-body.yml`` (epic-cc#129).
