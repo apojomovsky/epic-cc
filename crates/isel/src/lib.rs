@@ -7240,8 +7240,9 @@ fn line_is_word(raw: &str) -> bool {
 /// Slice lines into chunks at the entry labels: one (entry, lines, locs)
 /// per chunk. Placement sizes banked chunks and pass B emits raw chunks
 /// through this single splitter, so the two agree by construction. Lines
-/// before the first entry (none in practice: bodies open with the
-/// function label) join the first chunk.
+/// before the first entry cannot execute (bodies open with the function
+/// label) and are dropped; measurement attributes them to the first
+/// block instead, the safe direction.
 fn split_at_entries(
     entries: &[String],
     lines: &[String],
