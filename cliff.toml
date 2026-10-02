@@ -11,12 +11,25 @@ body = """
 {% else %}\
 ## [Unreleased]
 {% endif %}\
-{% for group, commits in commits | group_by(attribute="group") %}
-### {{ group | upper_first }}
-{% for commit in commits %}
+{% set ordered = ["Breaking", "Features", "Fixes", "Performance", "Compatibility"] %} \
+{% for name in ordered %}\
+{% set selected = commits | filter(attribute="group", value=name) %}\
+{% if selected | length > 0 %}
+### {{ name }}
+{% for commit in selected %}
 - {{ commit.message | upper_first }}\
 {% if commit.remote.pr_number %} (#{{ commit.remote.pr_number }}){% endif %}\
 {% endfor %}
+{% endif %}\
+{% endfor %}\
+{% for group, cs in commits | group_by(attribute="group") %}\
+{% if group not in ordered %}
+### {{ group | upper_first }}
+{% for commit in cs %}
+- {{ commit.message | upper_first }}\
+{% if commit.remote.pr_number %} (#{{ commit.remote.pr_number }}){% endif %}\
+{% endfor %}
+{% endif %}\
 {% endfor %}
 """
 trim = true
@@ -30,8 +43,9 @@ commit_preprocessors = [
   { pattern = '(?m)^(.+?)\s*\(#[0-9]+\)$', replace = "${1}" },
 ]
 commit_parsers = [
+  { message = "^\\w+(\\([^)]*\\))?!:", group = "Breaking" },
   { message = "^feat", group = "Features" },
-  { message = "^fix", group = "Bug Fixes" },
+  { message = "^fix", group = "Fixes" },
   { message = "^perf", group = "Performance" },
   { message = "^refactor", group = "Refactor" },
   { message = "^docs", group = "Documentation" },
@@ -45,3 +59,7 @@ filter_commits = false
 tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 topo_order = false
 sort_commits = "oldest"
+
+[bump]
+features_always_bump_minor = true
+breaking_always_bump_major = false
