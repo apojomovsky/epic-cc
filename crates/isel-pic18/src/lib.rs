@@ -239,6 +239,10 @@ struct Gen<'m> {
     /// arm skips the already-emitted copy.
     store_fwd: HashMap<String, u16>,
     store_consumed: HashSet<String>,
+    /// Value folds from the shared per-function pre-scan (epic-cc#863):
+    /// loads whose byte never stages to a slot. `alloc` drops those
+    /// slots; the load arm skips them and consumers read the source.
+    w_folds: iselcore::ValueFolds,
     out: Vec<String>,
     /// One source location per emitted line, index-aligned with `out`.
     /// `None` marks a compiler-generated line (no source instruction).
@@ -1454,7 +1458,12 @@ impl<'m> Gen<'m> {
     }
     fn val_addr(&self, v: &Val) -> Slot {
         match v {
-            Val::Reg(r) => self.slot_addr(self.cur_func, r),
+            // A directly folded load (epic-cc#863) reads its source
+            // global: the slot is gone, so every reader resolves here.
+            Val::Reg(r) => match self.w_folds.loads.get(r) {
+                Some(iselcore::LoadFold::Direct(g)) => Slot::Direct(self.global_addr(g)),
+                _ => self.slot_addr(self.cur_func, r),
+            },
             Val::Global(g) => Slot::Direct(
                 *self
                     .addrs
@@ -3546,6 +3555,19 @@ impl<'m> Gen<'m> {
                 if self.lane_consumed.contains(&l.dst) {
                     return;
                 }
+                // A folded load never stages (epic-cc#863): the consumer
+                // reads the source global directly, or the byte rides W
+                // to its stores. `alloc` dropped the slot, so nothing
+                // below may look it up.
+                if let Some(fold) = self.w_folds.loads.get(&l.dst).cloned() {
+                    match fold {
+                        iselcore::LoadFold::Direct(_) => return,
+                        iselcore::LoadFold::ThreadW(g, _) => {
+                            self.emit_w_load(self.global_addr(&g), false);
+                            return;
+                        }
+                    }
+                }
                 // An i1 global is real: clang's own -O1 GlobalOpt narrows an
                 // internal flag only ever written 0/1 down to `global i1`
                 // (epic-cc#462). i1 is one byte in the byte model, so the
@@ -3553,11 +3575,15 @@ impl<'m> Gen<'m> {
                 // arm copies an SFR byte raw (MOVFF cannot mask), which
                 // stays sound only while that byte is 0/1: the same
                 // exactly-0/1 premise the Zext and Sext arms state.
-                let dst = self.slot_addr(self.cur_func, &l.dst).direct();
                 // A folded store's destination replaces the dead temp
                 // (epic-cc#723): the source setup and walk below address
-                // `dst`, so every shape copies straight into place.
-                let dst = self.store_fwd.get(&l.dst).copied().unwrap_or(dst);
+                // `dst`, so every shape copies straight into place. The
+                // lookup stays lazy: a forwarded producer has no slot.
+                let dst = self
+                    .store_fwd
+                    .get(&l.dst)
+                    .copied()
+                    .unwrap_or_else(|| self.slot_addr(self.cur_func, &l.dst).direct());
                 // Literal-pointer (SFR) load: `inttoptr` form, a direct
                 // physical address: MOVFF copies byte-wise with no access
                 // bit and no BSR involvement.
@@ -3670,6 +3696,25 @@ impl<'m> Gen<'m> {
                         "isel-pic18: ROM is not writable: store through const global {ptr_val:?}"
                     );
                 }
+                // A W-threaded store (epic-cc#863): the folded load left
+                // the byte in W, so each store writes it back out with no
+                // slot read. The predicate allows only direct-global
+                // single-byte stores with a stores-only gap, which W
+                // survives (`MOVWF` preserves it; the ISR restores it).
+                if let Val::Reg(r) = &s.val {
+                    if matches!(
+                        self.w_folds.loads.get(r),
+                        Some(iselcore::LoadFold::ThreadW(_, _))
+                    ) {
+                        let dst = s.ptr.strip_prefix('@').unwrap_or_else(|| {
+                            panic!("isel-pic18: ThreadW store through non-global {:?}", s.ptr)
+                        });
+                        let dst = self.global_addr(dst);
+                        self.invalidate_fsr0_if_slot_written(dst, 1);
+                        self.emit_w_store(dst);
+                        return;
+                    }
+                }
                 // Direct values cover the whole slot through one setup.
                 // Indirect bytes seed FSR0 once and walk POSTINC0 (same
                 // single-loop ordering contract as the Load arm above,
@@ -3728,10 +3773,14 @@ impl<'m> Gen<'m> {
                 // Without this arm a shift would hit the `(other, _)`
                 // panic below.
                 let av = self.val_addr(&b.a).direct();
-                let dst = self.slot_addr(self.cur_func, &b.dst).direct();
                 // A folded store's destination replaces the dead temp
                 // (epic-cc#723): the op below computes straight into place.
-                let dst = self.store_fwd.get(&b.dst).copied().unwrap_or(dst);
+                // The lookup stays lazy: a forwarded producer has no slot.
+                let dst = self
+                    .store_fwd
+                    .get(&b.dst)
+                    .copied()
+                    .unwrap_or_else(|| self.slot_addr(self.cur_func, &b.dst).direct());
                 if matches!(b.op, ir::BinOp::Shl | ir::BinOp::LShr | ir::BinOp::AShr) {
                     let width = i64::from(n) * 8;
                     let k = match &b.b {
@@ -8540,6 +8589,7 @@ pub fn select_with_locs(
             lane_consumed: HashSet::new(),
             store_fwd: HashMap::new(),
             store_consumed: HashSet::new(),
+            w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
         };
@@ -8554,6 +8604,17 @@ pub fn select_with_locs(
         let (store_fwd, store_consumed) = Gen::find_store_forwards(&g, f);
         g.store_fwd = store_fwd;
         g.store_consumed = store_consumed;
+        // Value folds for this function (epic-cc#863): loads whose byte
+        // never stages. Same predicate `alloc` places by, over the same
+        // bank test on the final map, so a skipped load reads an
+        // address both stages agree on.
+        let access_safe: HashSet<String> =
+            g.m.globals
+                .iter()
+                .filter(|x| g.addrs.get(&x.name).is_some_and(|a| *a <= g.access_bank_hi))
+                .map(|x| x.name.clone())
+                .collect();
+        g.w_folds = iselcore::find_value_folds(f, g.m, g.resolved, Some(&access_safe));
         // Index-based label scheme, matching `isel::select` exactly
         // (`crates/isel/src/lib.rs:4085-4094`): the first block in
         // `f.blocks` gets the bare function name (so `CALL`/`GOTO @func`
@@ -9176,6 +9237,7 @@ pub fn select_with_locs(
                 lane_consumed: HashSet::new(),
                 store_fwd: HashMap::new(),
                 store_consumed: HashSet::new(),
+                w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9509,6 +9571,7 @@ mod tests {
                 lane_consumed: HashSet::new(),
                 store_fwd: HashMap::new(),
                 store_consumed: HashSet::new(),
+                w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9538,6 +9601,7 @@ mod tests {
                 lane_consumed: HashSet::new(),
                 store_fwd: HashMap::new(),
                 store_consumed: HashSet::new(),
+                w_folds: iselcore::ValueFolds::default(),
                 out: Vec::new(),
                 locs: Vec::new(),
             };
@@ -9582,6 +9646,7 @@ mod p3_gen_tests {
             lane_consumed: HashSet::new(),
             store_fwd: HashMap::new(),
             store_consumed: HashSet::new(),
+            w_folds: iselcore::ValueFolds::default(),
             out: Vec::new(),
             locs: Vec::new(),
         }

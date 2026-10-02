@@ -429,3 +429,258 @@ fn seeds_a_ptr_phi_over_a_folded_select() {
     assert_eq!(*k, 0);
     assert!(terms.is_empty());
 }
+
+#[test]
+fn single_use_load_into_add_folds_direct() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = add i8 %1 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        matches!(folds.loads.get("1"), Some(iselcore::LoadFold::Direct(g)) if g == "in"),
+        "load folds to its global: {:?}",
+        folds.loads
+    );
+    assert!(
+        folds.forwarded.contains_key("2"),
+        "bin result forwards to the store"
+    );
+}
+
+#[test]
+fn two_loads_into_add_folds_only_the_adjacent_one() {
+    // `%1` stays staged: its gap holds `%2`'s load, and moving its read
+    // past another load would reorder two volatile reads. Widening the
+    // gap to co-folding loads is a follow-up; each fold alone is sound.
+    let m = parse(
+        "global a i8\n\
+         global b i8\n\
+         global c i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = load i8 @b\n\
+             %3 = add i8 %2 %1\n\
+             store i8 %3 @c\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.loads.contains_key("1"),
+        "gapped load stays staged: {:?}",
+        folds.loads
+    );
+    assert!(
+        matches!(folds.loads.get("2"), Some(iselcore::LoadFold::Direct(g)) if g == "b"),
+        "adjacent load folds: {:?}",
+        folds.loads
+    );
+    assert!(
+        folds.forwarded.contains_key("3"),
+        "add result forwards to the store"
+    );
+}
+
+#[test]
+fn load_fanned_to_two_stores_threads_w() {
+    let m = parse(
+        "global in i8\n\
+         global slot i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             store i8 %1 @slot\n\
+             store i8 %1 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        matches!(folds.loads.get("1"), Some(iselcore::LoadFold::ThreadW(g, _)) if g == "in"),
+        "load threads W: {:?}",
+        folds.loads
+    );
+    assert!(
+        folds.forwarded.is_empty(),
+        "multi-use result never forwards"
+    );
+}
+
+#[test]
+fn multi_use_load_into_bin_stays_staged() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         global out2 i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = add i8 %1 1\n\
+             %3 = add i8 %1 2\n\
+             store i8 %2 @out\n\
+             store i8 %3 @out2\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(!folds.loads.contains_key("1"), "two bin uses keep the slot");
+}
+
+#[test]
+fn const_source_load_never_folds() {
+    let m = parse(
+        "const k i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @k\n\
+             %2 = add i8 %1 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(!folds.loads.contains_key("1"), "flash reads keep the slot");
+    assert!(folds.forwarded.contains_key("2"), "the bin still forwards");
+}
+
+#[test]
+fn or_producer_never_mirrors_forward() {
+    // `Or` binops feed the boolean lanes, whose target keeps its slot:
+    // the mirror stays out even where `isel-pic18` itself would fold.
+    let m = parse(
+        "global a i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @a\n\
+             %2 = or i8 %1 3\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.forwarded.contains_key("2"),
+        "or keeps its slot for the lanes"
+    );
+}
+
+#[test]
+fn load_before_compare_never_folds() {
+    // An icmp-adjacent load may become a lane field reading the source
+    // directly; folding it too would read a volatile source twice.
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %c = icmp eq i8 %1 0\n\
+             %2 = add i8 %1 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        folds.loads.is_empty(),
+        "icmp-adjacent load keeps its slot: {:?}",
+        folds.loads
+    );
+}
+
+#[test]
+fn load_into_or_stays_staged_for_the_lanes() {
+    let m = parse(
+        "global f i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @f\n\
+             %2 = or i8 %1 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> =
+        m.globals.iter().map(|g| g.name.clone()).collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.loads.contains_key("1"),
+        "or operands keep their slot"
+    );
+    assert!(
+        !folds.forwarded.contains_key("2"),
+        "or results never mirror forward"
+    );
+}
+
+#[test]
+fn banked_source_stays_staged() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = add i8 %1 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let safe: std::collections::HashSet<String> = m
+        .globals
+        .iter()
+        .filter(|g| g.name != "in")
+        .map(|g| g.name.clone())
+        .collect();
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, Some(&safe));
+    assert!(
+        !folds.loads.contains_key("1"),
+        "banked source keeps its slot"
+    );
+    assert!(folds.forwarded.contains_key("2"), "the bin still forwards");
+}
+
+#[test]
+fn no_gate_folds_nothing() {
+    let m = parse(
+        "global in i8\n\
+         global out i8\n\
+         fn main(void) ()\n\
+           block entry:\n\
+             %1 = load i8 @in\n\
+             %2 = add i8 %1 1\n\
+             store i8 %2 @out\n\
+             ret void\n",
+    );
+    let r = resolve_pointers(&m);
+    let folds = iselcore::find_value_folds(&m.funcs[0], &m, &r, None);
+    assert!(folds.loads.is_empty(), "bounding pass folds nothing");
+    assert!(folds.forwarded.is_empty(), "bounding pass forwards nothing");
+}

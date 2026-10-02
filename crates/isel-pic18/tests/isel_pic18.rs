@@ -956,11 +956,14 @@ fn const_shift_count_out_of_range_panics() {
 
 #[test]
 fn load_and_store_i8_use_movff() {
-    // Two stores keep the loaded value multi-use, off the single-use
-    // store-source fold (epic-cc#723), so this still exercises MOVFF.
-    let m = parse("global in i8\nglobal out i8\nglobal out2 i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    store i8 %1 @out2\n    ret void\n");
+    // A const store between the load and its stores breaks the
+    // stores-only gap, off the W-thread fold (epic-cc#863), so the
+    // value stages through its slot exactly like the single-use
+    // store-source fold never did (epic-cc#723).
+    let m = parse("global in i8\nglobal flag i8\nglobal out i8\nglobal out2 i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 0 @flag\n    store i8 %1 @out\n    store i8 %1 @out2\n    ret void\n");
     let addrs = addrs(&[
         ("in", 0x10),
+        ("flag", 0x14),
         ("out", 0x11),
         ("out2", 0x13),
         ("main::1", 0x12),
@@ -976,14 +979,31 @@ fn load_and_store_i8_use_movff() {
     );
 }
 
+#[test]
+fn threaded_fanout_stores_ride_w() {
+    // Adjacent stores of one load (epic-cc#863): the load moves the
+    // byte into W once, each store writes it back out, and no slot is
+    // addressed, so the map carries none.
+    let m = parse("global in i8\nglobal out i8\nglobal out2 i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    store i8 %1 @out\n    store i8 %1 @out2\n    ret void\n");
+    let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("out2", 0x13)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVF 0x010,W,A"), "load into W:\n{asm}");
+    assert!(asm.contains("MOVWF 0x011,A"), "first store:\n{asm}");
+    assert!(asm.contains("MOVWF 0x013,A"), "second store:\n{asm}");
+    assert!(!asm.contains("MOVFF"), "no staged copy survives:\n{asm}");
+}
+
 // clang's own -O1 GlobalOpt narrows an internal flag only ever written 0/1
 // down to `global i1` (epic-cc#462), so i1 reaches isel as a memory type and
 // must lower exactly like the one-byte i8 path.
 #[test]
 fn load_and_store_i1_use_the_byte_path() {
-    let m = parse("global in i1\nglobal out i1\nglobal out2 i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    store i1 %1 @out\n    store i1 %1 @out2\n    ret void\n");
+    // Same stores-only-gap break as the i8 MOVFF test above: the i1
+    // value stages through its slot on the one-byte path.
+    let m = parse("global in i1\nglobal flag i1\nglobal out i1\nglobal out2 i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    store i1 0 @flag\n    store i1 %1 @out\n    store i1 %1 @out2\n    ret void\n");
     let addrs = addrs(&[
         ("in", 0x10),
+        ("flag", 0x14),
         ("out", 0x11),
         ("out2", 0x13),
         ("main::1", 0x12),
@@ -999,6 +1019,30 @@ fn load_and_store_i1_use_the_byte_path() {
     );
 }
 
+#[test]
+fn threaded_i1_fanout_rides_w() {
+    // The i1 path threads W exactly like i8: one read, two writes.
+    let m = parse("global in i1\nglobal out i1\nglobal out2 i1\nfn main(void) ()\n  block entry:\n    %1 = load i1 @in\n    store i1 %1 @out\n    store i1 %1 @out2\n    ret void\n");
+    let addrs = addrs(&[("in", 0x10), ("out", 0x11), ("out2", 0x13)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVF 0x010,W,A"), "load into W:\n{asm}");
+    assert!(asm.contains("MOVWF 0x011,A"), "first store:\n{asm}");
+    assert!(asm.contains("MOVWF 0x013,A"), "second store:\n{asm}");
+}
+
+#[test]
+fn single_use_load_into_add_reads_the_global() {
+    // The add's `a` side addresses `@in` itself (epic-cc#863): neither
+    // the load temp nor the forwarded binop temp is in the map, and
+    // neither may be looked up.
+    let m = parse("global in i8\nglobal out i8\nfn main(void) ()\n  block entry:\n    %1 = load i8 @in\n    %2 = add i8 %1 1\n    store i8 %2 @out\n    ret void\n");
+    let addrs = addrs(&[("in", 0x10), ("out", 0x11)]);
+    let asm = select(&PIC18F4550, &m, &addrs, None);
+    assert!(asm.contains("MOVLW 0x01"), "constant side:\n{asm}");
+    assert!(asm.contains("ADDWF 0x010,W,A"), "add reads @in:\n{asm}");
+    assert!(asm.contains("MOVWF 0x011,A"), "result to @out:\n{asm}");
+    assert!(!asm.contains("MOVFF"), "no staged copy survives:\n{asm}");
+}
 #[test]
 fn store_an_i1_constant_writes_the_byte_value() {
     let m = parse(
