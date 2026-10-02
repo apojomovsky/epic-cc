@@ -72,7 +72,9 @@ jobs:
           components: rustfmt, clippy, rust-src
 
       - name: Build epic-cc
-        run: cargo build --release -p driver
+        run: |
+          $env:EPIC_CC_VERSION = $env:GITHUB_REF_NAME -replace '^v',''
+          cargo build --release -p driver
 
       - name: Download and extract LLVM 20.1.8 MSVC bundle
         run: |
@@ -161,5 +163,5 @@ jobs:
           sha256sum linux-bundle/*.zip windows-bundle/*.zip > SHA256SUMS
           gh release create "$GITHUB_REF_NAME" \
             linux-bundle/*.zip windows-bundle/*.zip SHA256SUMS \
-            --title "epic-cc ${GITHUB_REF_NAME#v}" \
+            --title "epic-cc $GITHUB_REF_NAME" \
             --notes-file ../notes.md
