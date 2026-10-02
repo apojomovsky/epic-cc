@@ -164,8 +164,8 @@ ram_bytes = 51
 name = "speed-divmod-u32-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 2028
-flash_words = 177
+cycles = 1972
+flash_words = 191
 ram_bytes = 51
 
 [[entry]]
@@ -434,8 +434,8 @@ ram_bytes = 53
 name = "speed-pid-step-18f4550"
 device = "18F4550"
 profile = "O2"
-cycles = 353
-flash_words = 245
+cycles = 297
+flash_words = 259
 ram_bytes = 53
 
 [[entry]]
