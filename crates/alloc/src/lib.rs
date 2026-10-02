@@ -647,8 +647,8 @@ fn frame_layout(
     // breaks ties in the coloring, so same-start values keep the documented
     // params-first, instruction-order layout. A memory object (an alloca or
     // a byval/sret param) is a RAM region the code reads and writes through
-    // derived pointers, not a value with a def-use range: its slot must stay
-    // reserved for the whole function, so it gets a full-function interval.
+    // derived pointers, not a plain value: the escape scan below decides
+    // whether it keeps a full-function interval or colors from its uses.
     let mut defs: HashMap<String, (usize, u16, u8, usize, bool)> = HashMap::new();
     let mut order_idx = 0usize;
     for p in &f.params {
@@ -660,9 +660,7 @@ fn frame_layout(
     }
     // The va region: the contiguous frame bytes a variadic callee's extra
     // args land in, one region per variadic function, sized to the widest
-    // call site. Full-function interval like any memory object: the
-    // callee's `va_arg` reads are live across the whole body and the
-    // caller's arg copies happen at each call point.
+    // call site. It colors from entry through its last va_arg/va_start.
     if va_size > 0 {
         defs.insert("__va".to_string(), (0, 0, va_size as u8, order_idx, true));
         order_idx += 1;
@@ -743,6 +741,103 @@ fn frame_layout(
             }
         }
     }
+    // Precise object ranges (epic-cc#853): an alloca's bytes are touched
+    // only through pointers derived from it. Every folded chain resolves
+    // to its object, so each use of a resolving value is a use of the
+    // object; the va region's uses are its va_arg/va_start points.
+    let mut alloca_set: HashSet<String> = HashSet::new();
+    for b in &order {
+        for inst in &b.insts {
+            if let ir::Inst::Alloca(a) = inst {
+                alloca_set.insert(a.dst.clone());
+            }
+        }
+    }
+    let base_obj = |r: &str| -> Option<String> {
+        match resolved.get(&ssa_key(&f.name, r)) {
+            Some((Base::Slot(obj, _), _, _)) if alloca_set.contains(obj) => Some(obj.clone()),
+            _ => None,
+        }
+    };
+    // An object whose address escapes (stored to RAM, returned, or merged
+    // into a reseeded select/phi whose uses resolve elsewhere) keeps the
+    // full-function interval below. Call args stay uses: the callee only
+    // touches the bytes during the call.
+    let mut escaped: HashSet<String> = HashSet::new();
+    for b in &order {
+        for inst in &b.insts {
+            match inst {
+                ir::Inst::Store(s) => {
+                    if let ir::Val::Reg(r) = &s.val {
+                        if let Some(o) = base_obj(r) {
+                            escaped.insert(o);
+                        }
+                    }
+                }
+                ir::Inst::Ret(Some((_, v)), _) => {
+                    if let ir::Val::Reg(r) = v {
+                        if let Some(o) = base_obj(r) {
+                            escaped.insert(o);
+                        }
+                    }
+                }
+                ir::Inst::Phi(p) => {
+                    let dst_base = match resolved.get(&ssa_key(&f.name, &p.dst)) {
+                        Some((Base::Slot(o, _), _, _)) => Some(o.clone()),
+                        _ => None,
+                    };
+                    for (v, _) in &p.incoming {
+                        if let ir::Val::Reg(r) = v {
+                            if let Some(o) = base_obj(r) {
+                                if dst_base.as_ref() != Some(&o) {
+                                    escaped.insert(o);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    // Folded chains the GEP propagation cannot see (pointer selects, call
+    // args) still resolve to the object, so sweep their uses onto it. A
+    // select that does not fold never resolves: iselcore panics on the
+    // unresolvable chain before layout runs, so no escape check is needed.
+    let mut extra: Vec<(String, (usize, u16))> = Vec::new();
+    for (v, us) in &uses {
+        if v.is_empty() {
+            continue;
+        }
+        if let Some(o) = base_obj(v) {
+            if *v != o {
+                extra.extend(us.iter().map(|&u| (o.clone(), u)));
+            }
+        }
+    }
+    for (o, u) in extra {
+        uses.entry(o).or_default().insert(u);
+    }
+    if va_size > 0 {
+        for (i, b) in order.iter().enumerate() {
+            for (pos, inst) in b.insts.iter().enumerate() {
+                if matches!(inst, ir::Inst::VaArg(_) | ir::Inst::VaStart(_)) {
+                    uses.entry("__va".to_string())
+                        .or_default()
+                        .insert((i, pos as u16));
+                }
+            }
+        }
+    }
+    // Full-function holdouts: byval/sret params plus escaped allocas.
+    // Every other memory object colors from its bounded range.
+    let mut fixed: HashSet<String> = HashSet::new();
+    for p in &f.params {
+        if p.byval.is_some() || p.sret {
+            fixed.insert(p.name.clone());
+        }
+    }
+    fixed.extend(escaped.into_iter());
 
     // Loop-aware liveness: a value used in a loop body is live across the
     // back-edge, so its slot is occupied at the body's end and the header's
@@ -799,7 +894,9 @@ fn frame_layout(
     }
     let mut def_set: Vec<HashSet<String>> = vec![HashSet::new(); order.len()];
     for (v, &(d, _, _, _, mem)) in &defs {
-        if !mem {
+        // A bounded object kills like a value, so liveness above its def
+        // never drags its range back to the entry.
+        if !mem || !fixed.contains(v) {
             def_set[d].insert(v.clone());
         }
     }
@@ -857,9 +954,9 @@ fn frame_layout(
     // Live interval per value: [min(def, uses, pred ends), max(...)] in
     // linear order. A loop-carried value (use before def in linear order)
     // spans the loop, so it cannot alias a co-live value; a dead def is a
-    // point interval, immediately reusable. A memory object spans the whole
+    // point interval, immediately reusable. A fixed object spans the whole
     // function (its slot is a RAM region, live from entry to exit), so it
-    // never aliases anything.
+    // never aliases anything. A bounded object colors like a value.
 
     // Dead defs reaching alloc in the driver e2e suite are effectful only
     // (calls, volatile loads, va_arg, memory objects). isel does not DCE, so
@@ -873,7 +970,7 @@ fn frame_layout(
         if unplaced.contains(v) {
             continue;
         }
-        let (lo, hi) = if mem {
+        let (lo, hi) = if mem && fixed.contains(v) {
             (
                 (0usize, 0u16),
                 (
