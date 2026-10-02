@@ -591,17 +591,20 @@ fn cycle_counts_do_not_regress() {
     // Validate the filter before measuring: a typo must fail fast, not
     // after minutes of compiling every case. `-O2` rows filter as
     // `name@O2`, `-Os` rows as the bare name.
-    let mut valid: Vec<String> = cases.iter().map(|c| c.name.clone()).collect();
+    let mut valid = Vec::new();
     for c in &cases {
-        valid.push(entry_key(&c.name, "O2"));
-    }
-    // ISR cases expand to two rows each (`-latency`, `-roundtrip`), so
-    // those keys are valid filter targets too.
-    for c in cases.iter().filter(|c| c.kind == Kind::Isr) {
-        for suffix in ["-latency", "-roundtrip"] {
-            let n = format!("{}{suffix}", c.name);
-            valid.push(n.clone());
-            valid.push(entry_key(&n, "O2"));
+        // ISR cases measure two rows each (`-latency`, `-roundtrip`),
+        // so only the suffixed keys are valid targets: the bare case
+        // name matches no measured row.
+        if c.kind == Kind::Isr {
+            for suffix in ["-latency", "-roundtrip"] {
+                let n = format!("{}{suffix}", c.name);
+                valid.push(n.clone());
+                valid.push(entry_key(&n, "O2"));
+            }
+        } else {
+            valid.push(c.name.clone());
+            valid.push(entry_key(&c.name, "O2"));
         }
     }
     let filter = update.then(|| parse_only_filter(&valid)).flatten();
