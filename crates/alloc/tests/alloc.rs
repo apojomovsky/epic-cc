@@ -2002,9 +2002,9 @@ fn store_through_local_pointer_keeps_it_live() {
         out.locals["f::__scr"], out.locals["f::c"],
         "store through __scr clobbers live c"
     );
-    // The alloca is a memory object: its slot is reserved for the whole
-    // function, so e (dead after its store) still cannot reuse it.
-    assert_ne!(out.locals["f::e"], out.locals["f::__scr"]);
+    // The alloca's range ends at its last store through it, so e (defined
+    // after, epic-cc#853) reuses its slot.
+    assert_eq!(out.locals["f::e"], out.locals["f::__scr"]);
 }
 
 /// An asm operand reading a local keeps it live: the prefixed operand form
@@ -3495,4 +3495,132 @@ fn pooled_const_select_arm_keeps_its_copy() {
         "select-arm pooled const keeps its copy: {:?}",
         pooled.globals.keys().collect::<Vec<_>>()
     );
+}
+
+/// Two allocas with disjoint spans share one slot: the first is dead after
+/// its last store through it, so the second reuses the bytes (epic-cc#853).
+#[test]
+fn disjoint_allocas_share_one_slot() {
+    let m = parse(
+        "fn f(void) ()\n\
+           block entry:\n\
+             %a = alloca 2\n\
+             %g1 = gep %a +0\n\
+             store i8 1 %g1\n\
+             %b = alloca 2\n\
+             %g2 = gep %b +0\n\
+             store i8 2 %g2\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["f::a"], out.locals["f::b"]);
+}
+
+/// A returned alloca address outlives the function: the caller may read the
+/// bytes after return, so the alloca keeps its full-function interval and a
+/// value used mid-body cannot share its slot.
+#[test]
+fn returned_alloca_address_keeps_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         fn f(ptr) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @tab\n\
+             ret ptr %g\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// A stored alloca address can be reloaded and dereferenced later: the
+/// reload resolves to a fresh slot, so the store escapes the alloca and it
+/// keeps its full-function interval.
+#[test]
+fn stored_alloca_address_keeps_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(void) ()\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             %g = gep %buf +0\n\
+             store i8 1 %g\n\
+             store ptr %g @tab\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// A pointer phi over an alloca reseeds as a fresh slot: uses past the
+/// merge resolve elsewhere, so the alloca arm escapes and keeps its
+/// full-function interval, or the store through the phi would clobber a
+/// value sharing the slot.
+#[test]
+fn phi_reseeded_alloca_keeps_full_interval() {
+    let m = parse(
+        "global tab i8\n\
+         global out i8\n\
+         fn f(i1) (c=i1)\n\
+           block entry:\n\
+             %buf = alloca 2\n\
+             br i1 %c, label %l, label %r\n\
+           block l:\n\
+             br label %m\n\
+           block r:\n\
+             br label %m\n\
+           block m:\n\
+             %p = phi ptr %buf l @tab r\n\
+             store i8 1 %p\n\
+             %z = add i8 3, 4\n\
+             store i8 %z @out\n\
+             ret void\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["f::buf"], out.locals["f::z"]);
+}
+
+/// The va region ends at its last va_arg: a value defined after shares the
+/// region's slot (epic-cc#853).
+#[test]
+fn va_region_dead_after_last_va_arg_shares_its_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn vprintf(i16) (fmt, ...)\n\
+           block entry:\n\
+             %ap = alloca 1\n\
+             va_start ap\n\
+             %9 = va_arg ptr ap i16\n\
+             %x = add i8 1, 2\n\
+             store i8 %x @out\n\
+             ret i16 %9\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_eq!(out.locals["vprintf::__va"], out.locals["vprintf::x"]);
+}
+
+/// A value live across the va span cannot share the region's slot: the
+/// va_arg reads would clobber it.
+#[test]
+fn value_live_across_va_span_keeps_its_slot() {
+    let m = parse(
+        "global out i8\n\
+         fn vprintf(i16) (fmt, ...)\n\
+           block entry:\n\
+             %ap = alloca 1\n\
+             va_start ap\n\
+             %v = add i8 1, 2\n\
+             %9 = va_arg ptr ap i16\n\
+             %w = add i8 %v, 1\n\
+             store i8 %w @out\n\
+             ret i16 %9\n",
+    );
+    let out = allocate(&PIC16F877A, &m, "depth 1\n");
+    assert_ne!(out.locals["vprintf::__va"], out.locals["vprintf::v"]);
 }
