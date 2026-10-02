@@ -559,14 +559,21 @@ fn main() {
             chunks = c;
             (asm, locs)
         }
-        device::Core::Pic18 => isel_pic18::select_with_locs(
-            device,
-            &m,
-            &addrs,
-            layout.isr_low_save,
-            layout.isr_save,
-            layout.isr_hi_save,
-        ),
+        device::Core::Pic18 => {
+            // The POSTINC copy loop trades cycles for flash, so the speed
+            // profile drains staged runs as straight MOVFFs (epic-cc#883).
+            let copy_loop = !matches!(cli.opt_level, driver::cli::OptLevel::O2);
+            let opts = isel_pic18::Options { copy_loop };
+            isel_pic18::select_with_opts(
+                device,
+                &m,
+                &addrs,
+                layout.isr_low_save,
+                layout.isr_save,
+                layout.isr_hi_save,
+                opts,
+            )
+        }
         device::Core::Pic14e => {
             isel_pic14e::select_with_locs(device, &m, &addrs, &layout.staged_consts)
         }
